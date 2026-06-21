@@ -1180,7 +1180,7 @@ mod tests {
     /// pass it can't back up. Device-bound probes degrade to "skip" when no hardware is present.
     #[test]
     fn diagnostics_yield_verdicts_without_hardware() {
-        let rt = AppRuntime::load();
+        let mut rt = AppRuntime::load();
         let probes = rt.run_diagnostics();
         assert!(!probes.is_empty(), "diagnostics must report something");
         // every probe is one of the three known verdicts.
@@ -1241,7 +1241,7 @@ mod tests {
             assert_eq!(r.layer, "base");
             assert!(matches!(
                 r.kind,
-                "input" | "hotkey" | "gesture" | "radial" | "app" | "mic" | "hold"
+                "input" | "hotkey" | "gesture" | "radial" | "app" | "mic" | "hold" | "cast"
             ));
         }
     }
@@ -1298,7 +1298,7 @@ mod tests {
     /// Writes-paused blocks every device setter without touching hardware.
     #[test]
     fn paused_writes_block_setters() {
-        let mut rt = AppRuntime::load();
+        let rt = AppRuntime::load();
         let saved = neuron::writes::writes_paused();
         neuron::writes::set_writes_paused(true);
         assert_eq!(rt.apply_dpi(1600), "writes paused");
