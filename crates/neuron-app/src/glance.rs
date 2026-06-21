@@ -1465,10 +1465,7 @@ mod imp {
     /// glass + the corner bracket; collapsed = the bracket alone. The bracket's arm thickness encodes
     /// the constellation's window count; hover runs it white-hot.
     unsafe fn paint_frame(t: &mut Tile, count: usize, sz: (i32, i32)) {
-        use windows_sys::Win32::Graphics::Gdi::{
-            CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, SelectObject, BITMAPINFO,
-            BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
-        };
+        use windows_sys::Win32::Graphics::Gdi::{DeleteDC, DeleteObject};
         unsafe {
             if sz != t.fsize || t.fdc.is_null() {
                 if !t.fbmp.is_null() {
@@ -1479,30 +1476,14 @@ mod imp {
                     DeleteDC(t.fdc);
                     t.fdc = std::ptr::null_mut();
                 }
-                let mut bmi: BITMAPINFO = std::mem::zeroed();
-                bmi.bmiHeader = BITMAPINFOHEADER {
-                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                    biWidth: sz.0,
-                    biHeight: -sz.1,
-                    biPlanes: 1,
-                    biBitCount: 32,
-                    biCompression: BI_RGB,
-                    biSizeImage: 0,
-                    biXPelsPerMeter: 0,
-                    biYPelsPerMeter: 0,
-                    biClrUsed: 0,
-                    biClrImportant: 0,
+                // re-allocate the backing DIB at the new size via the shared seam (the ONE
+                // CreateDIBSection); the live pixel pointer is re-resolved below per paint.
+                let dib = match crate::surface::Dib::new(sz.0, sz.1) {
+                    Some(d) => d,
+                    None => return,
                 };
-                let dc = CreateCompatibleDC(std::ptr::null_mut());
-                let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
-                let bmp =
-                    CreateDIBSection(dc, &bmi, DIB_RGB_COLORS, &mut bits, std::ptr::null_mut(), 0);
-                if dc.is_null() || bmp.is_null() || bits.is_null() {
-                    return;
-                }
-                SelectObject(dc, bmp as _);
-                t.fdc = dc;
-                t.fbmp = bmp as _;
+                t.fdc = dib.dc;
+                t.fbmp = dib.bmp as _;
                 t.fsize = sz;
             }
             // resolve the live pixel pointer from the kept bitmap
@@ -1580,45 +1561,19 @@ mod imp {
         }
     }
 
-    /// Position + size + blend the frame in ONE UpdateLayeredWindow call (atomic on screen).
+    /// Position + size + blend the frame in ONE UpdateLayeredWindow call (atomic on screen) — via
+    /// the shared `surface::present_dc` seam (the one BLENDFUNCTION, AC_SRC_OVER + AC_SRC_ALPHA).
     unsafe fn blend_frame(t: &Tile, pos: (i32, i32), sz: (i32, i32), alpha: u8) {
         use windows_sys::Win32::Foundation::POINT;
         use windows_sys::Win32::Graphics::Gdi::{GetDC, ReleaseDC};
-        use windows_sys::Win32::UI::WindowsAndMessaging::{UpdateLayeredWindow, ULW_ALPHA};
-        const AC_SRC_OVER: u8 = 0;
-        const AC_SRC_ALPHA: u8 = 1;
-        #[repr(C)]
-        struct Blend {
-            op: u8,
-            flags: u8,
-            alpha: u8,
-            format: u8,
-        }
         unsafe {
             if t.fdc.is_null() {
                 return;
             }
             let screen = GetDC(std::ptr::null_mut());
-            let src = POINT { x: 0, y: 0 };
             let dst = POINT { x: pos.0, y: pos.1 };
             let size = windows_sys::Win32::Foundation::SIZE { cx: sz.0, cy: sz.1 };
-            let blend = Blend {
-                op: AC_SRC_OVER,
-                flags: 0,
-                alpha,
-                format: AC_SRC_ALPHA,
-            };
-            UpdateLayeredWindow(
-                t.frame,
-                screen,
-                &dst,
-                &size,
-                t.fdc,
-                &src,
-                0,
-                &blend as *const Blend as *const _,
-                ULW_ALPHA,
-            );
+            crate::surface::present_dc(t.frame, screen, t.fdc, Some(dst), size, alpha);
             ReleaseDC(std::ptr::null_mut(), screen);
         }
     }

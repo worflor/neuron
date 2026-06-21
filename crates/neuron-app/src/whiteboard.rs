@@ -1038,18 +1038,11 @@ mod imp {
     use std::sync::mpsc::Receiver;
     use std::time::Instant;
     use windows_sys::Win32::Foundation::{POINT, SIZE};
-    use windows_sys::Win32::Graphics::Gdi::{
-        CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC,
-        SelectObject, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
-        BLENDFUNCTION, DIB_RGB_COLORS, HBITMAP,
-    };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetSystemMetrics,
-        PeekMessageW, RegisterClassW, SetWindowPos, ShowWindow, TranslateMessage,
-        UpdateLayeredWindow, HWND_TOPMOST, MSG, PM_REMOVE, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+        DispatchMessageW, GetSystemMetrics, PeekMessageW, SetWindowPos, ShowWindow,
+        TranslateMessage, HWND_TOPMOST, MSG, PM_REMOVE, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
         SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SW_HIDE, SW_SHOWNOACTIVATE,
-        ULW_ALPHA, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-        WS_EX_TRANSPARENT, WS_POPUP,
+        WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
     };
 
     /// How close (px) the eraser must pass to a stroke's polyline to take it.
@@ -1070,68 +1063,23 @@ mod imp {
                 GetSystemMetrics(SM_CXVIRTUALSCREEN).max(1),
                 GetSystemMetrics(SM_CYVIRTUALSCREEN).max(1),
             );
-            let cls: Vec<u16> = "NeuronWhiteboard\0".encode_utf16().collect();
-            let wc = WNDCLASSW {
-                style: 0,
-                lpfnWndProc: Some(DefWindowProcW),
-                cbClsExtra: 0,
-                cbWndExtra: 0,
-                hInstance: std::ptr::null_mut(),
-                hIcon: std::ptr::null_mut(),
-                hCursor: std::ptr::null_mut(),
-                hbrBackground: std::ptr::null_mut(),
-                lpszMenuName: std::ptr::null(),
-                lpszClassName: cls.as_ptr(),
-            };
-            RegisterClassW(&wc);
-            let hwnd = CreateWindowExW(
+            // the canvas: one virtual-screen-sized click-through layered window + its top-down BGRA
+            // DIB, presented per frame at the virtual-screen origin (vx, vy).
+            let surf = match crate::surface::LayeredSurface::new(&crate::surface::SurfaceSpec::new(
+                "NeuronWhiteboard",
                 WS_EX_LAYERED
                     | WS_EX_TRANSPARENT
                     | WS_EX_TOPMOST
                     | WS_EX_NOACTIVATE
                     | WS_EX_TOOLWINDOW,
-                cls.as_ptr(),
-                std::ptr::null(),
-                WS_POPUP,
-                vx,
-                vy,
                 w,
                 h,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null(),
-            );
-            if hwnd.is_null() {
-                return;
-            }
-            let screen = GetDC(std::ptr::null_mut());
-            let mem = CreateCompatibleDC(screen);
-            let mut bmi: BITMAPINFO = std::mem::zeroed();
-            bmi.bmiHeader = BITMAPINFOHEADER {
-                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: w,
-                biHeight: -h,
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: BI_RGB,
-                biSizeImage: 0,
-                biXPelsPerMeter: 0,
-                biYPelsPerMeter: 0,
-                biClrUsed: 0,
-                biClrImportant: 0,
+            )) {
+                Some(s) => s,
+                None => return,
             };
-            let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
-            let dib = CreateDIBSection(
-                screen,
-                &bmi,
-                DIB_RGB_COLORS,
-                &mut bits,
-                std::ptr::null_mut(),
-                0,
-            ) as HBITMAP;
-            let old = SelectObject(mem, dib as _);
-            let px = bits as *mut u32;
+            let hwnd = surf.hwnd();
+            let px = surf.bits();
             let count = (w * h) as usize;
             std::ptr::write_bytes(px, 0, count);
 
@@ -1180,20 +1128,13 @@ mod imp {
             let mut ping_wheel: Option<(i32, i32, i32, u32)> = None;
             let mut overlay_was = false; // an overlay drew last frame — gives it one clean exit
 
-            let present = |hwnd, mem, dirty: bool| {
+            let present = |dirty: bool| {
                 if !dirty {
                     return;
                 }
-                let src = POINT { x: 0, y: 0 };
                 let pos = POINT { x: vx, y: vy };
                 let size = SIZE { cx: w, cy: h };
-                let blend = BLENDFUNCTION {
-                    BlendOp: AC_SRC_OVER as u8,
-                    BlendFlags: 0,
-                    SourceConstantAlpha: 255,
-                    AlphaFormat: AC_SRC_ALPHA as u8,
-                };
-                UpdateLayeredWindow(hwnd, screen, &pos, &size, mem, &src, 0, &blend, ULW_ALPHA);
+                surf.present(Some(pos), size, 255);
             };
 
             // event-driven: BLOCK on the channel (zero idle cost), batch what's queued, redraw once.
@@ -1856,7 +1797,7 @@ mod imp {
                     shown = false;
                 }
                 if shown {
-                    present(hwnd, mem, dirty || full);
+                    present(dirty || full);
                 }
                 // pump so the window stays healthy
                 let mut msg: MSG = std::mem::zeroed();
@@ -1868,11 +1809,9 @@ mod imp {
                     break 'run; // the channel closing ends the loop; the label documents intent
                 }
             }
-            SelectObject(mem, old);
-            DeleteObject(dib as _);
-            DeleteDC(mem);
-            ReleaseDC(std::ptr::null_mut(), screen);
-            DestroyWindow(hwnd);
+            // surf's Drop restores the bitmap, deletes the DIB + mem DC, releases the screen DC,
+            // and destroys the window — exactly the old inline teardown order.
+            drop(surf);
         }
     }
 
@@ -3433,44 +3372,18 @@ mod palette {
     /// together and the parked spot is remembered (board.toml).
     fn palette_thread(rx: Receiver<PCmd>) {
         use windows_sys::Win32::UI::WindowsAndMessaging::{
-            CreateWindowExW, DispatchMessageW, GetCursorPos, LoadCursorW, PeekMessageW,
-            RegisterClassW, SetWindowPos, ShowWindow, TranslateMessage, HWND_TOPMOST, MSG,
-            PM_REMOVE, SWP_NOACTIVATE, SW_HIDE, SW_SHOWNOACTIVATE, WNDCLASSW, WS_EX_LAYERED,
-            WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+            DispatchMessageW, GetCursorPos, PeekMessageW, SetWindowPos, ShowWindow,
+            TranslateMessage, HWND_TOPMOST, MSG, PM_REMOVE, SWP_NOACTIVATE, SW_HIDE,
+            SW_SHOWNOACTIVATE,
         };
         unsafe {
-            let cls: Vec<u16> = "NeuronPalette\0".encode_utf16().collect();
-            let wc = WNDCLASSW {
-                style: 0,
-                lpfnWndProc: Some(pal_proc),
-                cbClsExtra: 0,
-                cbWndExtra: 0,
-                hInstance: std::ptr::null_mut(),
-                hIcon: std::ptr::null_mut(),
-                hCursor: LoadCursorW(std::ptr::null_mut(), 32512 as _), // IDC_ARROW
-                hbrBackground: std::ptr::null_mut(),
-                lpszMenuName: std::ptr::null(),
-                lpszClassName: cls.as_ptr(),
+            // the palette window + its DIB live in one LayeredSurface (the drag hit-test proc +
+            // arrow cursor + ex_style captured by Surface::new).
+            let surface = match Surface::new() {
+                Some(s) => s,
+                None => return,
             };
-            RegisterClassW(&wc);
-            let hwnd = CreateWindowExW(
-                WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
-                cls.as_ptr(),
-                std::ptr::null(),
-                WS_POPUP,
-                0,
-                0,
-                W,
-                H,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null(),
-            );
-            if hwnd.is_null() {
-                return;
-            }
-            let surface = Surface::new(hwnd);
+            let hwnd = surface.hwnd();
             let its = items();
             let mut ctx: Option<(slint::Weak<AppWindow>, Arc<Mutex<BoardState>>)> = None;
             let mut visible = false;
@@ -3780,64 +3693,47 @@ mod palette {
     /// rendered with the actual media engine (`imp::brush_alpha`) — the dock shows the ink
     /// you'll actually get, in your current colour.
     struct Surface {
-        hwnd: windows_sys::Win32::Foundation::HWND,
+        surf: crate::surface::LayeredSurface,
         mem: windows_sys::Win32::Graphics::Gdi::HDC,
-        dib: windows_sys::Win32::Graphics::Gdi::HBITMAP,
         bits: *mut u32,
     }
 
     impl Surface {
-        fn new(hwnd: windows_sys::Win32::Foundation::HWND) -> Self {
-            use windows_sys::Win32::Graphics::Gdi::{
-                CreateCompatibleDC, CreateDIBSection, GetDC, ReleaseDC, SelectObject, BITMAPINFO,
-                BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP,
+        /// Build the palette's layered window (a draggable, non-click-through topmost popup with the
+        /// drag hit-test proc + arrow cursor) and its W×H BGRA DIB. `None` only if the window can't
+        /// be created (the thread then bails).
+        fn new() -> Option<Self> {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{
+                LoadCursorW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
             };
             unsafe {
-                let screen = GetDC(std::ptr::null_mut());
-                let mem = CreateCompatibleDC(screen);
-                let mut bmi: BITMAPINFO = std::mem::zeroed();
-                bmi.bmiHeader = BITMAPINFOHEADER {
-                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                    biWidth: W,
-                    biHeight: -H,
-                    biPlanes: 1,
-                    biBitCount: 32,
-                    biCompression: BI_RGB,
-                    biSizeImage: 0,
-                    biXPelsPerMeter: 0,
-                    biYPelsPerMeter: 0,
-                    biClrUsed: 0,
-                    biClrImportant: 0,
-                };
-                let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
-                let dib = CreateDIBSection(
-                    screen,
-                    &bmi,
-                    DIB_RGB_COLORS,
-                    &mut bits,
-                    std::ptr::null_mut(),
-                    0,
-                ) as HBITMAP;
-                SelectObject(mem, dib as _);
-                ReleaseDC(std::ptr::null_mut(), screen);
-                Surface {
-                    hwnd,
-                    mem,
-                    dib,
-                    bits: bits as *mut u32,
-                }
+                let mut spec = crate::surface::SurfaceSpec::new(
+                    "NeuronPalette",
+                    WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+                    W,
+                    H,
+                );
+                spec.wndproc = Some(pal_proc);
+                spec.cursor = LoadCursorW(std::ptr::null_mut(), 32512 as _); // IDC_ARROW
+                let surf = crate::surface::LayeredSurface::new(&spec)?;
+                let mem = surf.mem();
+                let bits = surf.bits();
+                Some(Surface { surf, mem, bits })
             }
         }
 
+        #[inline]
+        fn hwnd(&self) -> windows_sys::Win32::Foundation::HWND {
+            self.surf.hwnd()
+        }
+
         fn paint(&self, its: &[(RECT, Item)], hover: Option<Item>, st: &BoardState, sca: u32) {
-            use windows_sys::Win32::Foundation::{POINT, SIZE};
+            use windows_sys::Win32::Foundation::SIZE;
             use windows_sys::Win32::Graphics::Gdi::{
-                CreateFontW, CreateSolidBrush, DeleteObject, Ellipse, FillRect, FrameRect, GetDC,
-                ReleaseDC, SelectObject, SetBkMode, SetTextColor, TextOutW, AC_SRC_ALPHA,
-                AC_SRC_OVER, BLENDFUNCTION, CLEARTYPE_QUALITY, DEFAULT_CHARSET, FW_BOLD,
-                TRANSPARENT,
+                CreateFontW, CreateSolidBrush, DeleteObject, Ellipse, FillRect, FrameRect,
+                SelectObject, SetBkMode, SetTextColor, TextOutW, CLEARTYPE_QUALITY, DEFAULT_CHARSET,
+                FW_BOLD, TRANSPARENT,
             };
-            use windows_sys::Win32::UI::WindowsAndMessaging::{UpdateLayeredWindow, ULW_ALPHA};
             unsafe {
                 let dc = self.mem;
                 std::ptr::write_bytes(self.bits, 0, (W * H) as usize);
@@ -4226,41 +4122,16 @@ mod palette {
                     }
                 }
 
-                // present (position unchanged: null dst point keeps the window where it is)
-                let screen = GetDC(std::ptr::null_mut());
-                let src = POINT { x: 0, y: 0 };
+                // present (position unchanged: None dst point keeps the window where it is); the
+                // window-wide constant alpha is the fade level `sca`.
                 let size = SIZE { cx: W, cy: H };
-                let blend = BLENDFUNCTION {
-                    BlendOp: AC_SRC_OVER as u8,
-                    BlendFlags: 0,
-                    SourceConstantAlpha: sca.min(255) as u8,
-                    AlphaFormat: AC_SRC_ALPHA as u8,
-                };
-                UpdateLayeredWindow(
-                    self.hwnd,
-                    screen,
-                    std::ptr::null(),
-                    &size,
-                    self.mem,
-                    &src,
-                    0,
-                    &blend,
-                    ULW_ALPHA,
-                );
-                ReleaseDC(std::ptr::null_mut(), screen);
+                self.surf.present(None, size, sca.min(255) as u8);
             }
         }
     }
 
-    impl Drop for Surface {
-        fn drop(&mut self) {
-            use windows_sys::Win32::Graphics::Gdi::{DeleteDC, DeleteObject};
-            unsafe {
-                DeleteObject(self.dib as _);
-                DeleteDC(self.mem);
-            }
-        }
-    }
+    // Teardown is the wrapped `LayeredSurface`'s `Drop` (DIB + mem DC + screen DC + window) — the
+    // palette thread loops forever, so this only runs if the thread itself ends.
 
     /// 0xRRGGBB -> COLORREF (GDI wants 0x00BBGGRR).
     fn rgb(c: u32) -> u32 {

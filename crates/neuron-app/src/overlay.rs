@@ -352,21 +352,19 @@ mod imp {
     use std::thread::JoinHandle;
     use std::time::Duration;
 
-    use windows_sys::Win32::Foundation::{HWND, POINT, SIZE};
+    use windows_sys::Win32::Foundation::{POINT, SIZE};
     use windows_sys::Win32::Graphics::Gdi::{
-        CreateCompatibleDC, CreateDIBSection, CreateFontW, DeleteDC, DeleteObject, GetDC,
-        GetMonitorInfoW, GetTextExtentPoint32W, MonitorFromPoint, ReleaseDC, SelectObject,
-        SetBkMode, SetTextColor, TextOutW, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER,
-        BI_RGB, BLENDFUNCTION, CLEARTYPE_QUALITY, DEFAULT_CHARSET, DIB_RGB_COLORS, FW_NORMAL,
+        CreateCompatibleDC, CreateDIBSection, CreateFontW, DeleteDC, DeleteObject,
+        GetMonitorInfoW, GetTextExtentPoint32W, MonitorFromPoint, SelectObject,
+        SetBkMode, SetTextColor, TextOutW, BITMAPINFO, BITMAPINFOHEADER,
+        BI_RGB, CLEARTYPE_QUALITY, DEFAULT_CHARSET, DIB_RGB_COLORS, FW_NORMAL,
         HBITMAP, MONITORINFO, MONITOR_DEFAULTTONEAREST, TRANSPARENT,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos,
-        PeekMessageW, RegisterClassW, SetWindowPos, ShowWindow, TranslateMessage,
-        UpdateLayeredWindow, HWND_NOTOPMOST, HWND_TOPMOST, MSG, PM_REMOVE, SWP_NOACTIVATE,
-        SWP_NOMOVE, SWP_NOSIZE, SW_HIDE,
-        SW_SHOWNOACTIVATE, ULW_ALPHA, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-        WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+        DispatchMessageW, GetCursorPos, PeekMessageW, SetWindowPos, ShowWindow, TranslateMessage,
+        HWND_NOTOPMOST, HWND_TOPMOST, MSG, PM_REMOVE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+        SW_HIDE, SW_SHOWNOACTIVATE, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+        WS_EX_TOPMOST, WS_EX_TRANSPARENT,
     };
 
     // The overlay buffer is generously larger than the radial menu so the cast TRAIL can run far
@@ -1033,24 +1031,25 @@ mod imp {
 
     fn render_thread(rx: std::sync::mpsc::Receiver<Cmd>) {
         unsafe {
-            let hwnd = match create_window() {
-                Some(h) => h,
+            // the overlay's layered window + its W×H top-down BGRA DIB live in one LayeredSurface;
+            // the bespoke render loop (dirty-tile compositing, the per-frame present, the
+            // NOTOPMOST→TOPMOST topmost flip) stays exactly as it was below — only the
+            // window/DIB/present plumbing moved into the seam.
+            let surf = match crate::surface::LayeredSurface::new(&crate::surface::SurfaceSpec::new(
+                "NeuronSpellOverlay",
+                WS_EX_LAYERED
+                    | WS_EX_TRANSPARENT
+                    | WS_EX_TOPMOST
+                    | WS_EX_NOACTIVATE
+                    | WS_EX_TOOLWINDOW,
+                W,
+                H,
+            )) {
+                Some(s) => s,
                 None => return,
             };
-            let screen = GetDC(std::ptr::null_mut());
-            let mem = CreateCompatibleDC(screen);
-            let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
-            let bmi = dib_header();
-            let dib = CreateDIBSection(
-                screen,
-                &bmi,
-                DIB_RGB_COLORS,
-                &mut bits,
-                std::ptr::null_mut(),
-                0,
-            ) as HBITMAP;
-            let old = SelectObject(mem, dib as _);
-            let px = bits as *mut u32;
+            let hwnd = surf.hwnd();
+            let px = surf.bits();
 
             let mut buf = Buffers::new();
             let mut points: Vec<(f32, f32)> = Vec::new();
@@ -2594,19 +2593,12 @@ mod imp {
                     prev_proc = proc;
                     full_redraw = false;
 
-                    let src = POINT { x: 0, y: 0 };
                     let pos = POINT {
                         x: origin.x,
                         y: origin.y,
                     };
                     let size = SIZE { cx: W, cy: H };
-                    let blend = BLENDFUNCTION {
-                        BlendOp: AC_SRC_OVER as u8,
-                        BlendFlags: 0,
-                        SourceConstantAlpha: 255,
-                        AlphaFormat: AC_SRC_ALPHA as u8,
-                    };
-                    UpdateLayeredWindow(hwnd, screen, &pos, &size, mem, &src, 0, &blend, ULW_ALPHA);
+                    surf.present(Some(pos), size, 255);
                     // STAY on top: a topmost window still loses the z-race when the taskbar, a game,
                     // or another topmost re-asserts. Re-flip to the front of the band a few times a
                     // second so a corner notification (or a weave) never sinks behind the shell. The
@@ -2672,11 +2664,9 @@ mod imp {
                 std::thread::sleep(Duration::from_millis(target.saturating_sub(elapsed)));
             }
 
-            SelectObject(mem, old);
-            DeleteObject(dib as _);
-            DeleteDC(mem);
-            ReleaseDC(std::ptr::null_mut(), screen);
-            DestroyWindow(hwnd);
+            // surf's Drop restores the bitmap, deletes the DIB + mem DC, releases the screen DC,
+            // and destroys the window — exactly the old inline teardown order.
+            drop(surf);
         }
     }
 
@@ -4180,42 +4170,6 @@ mod imp {
             }
         }
         splat_glow(&mut buf.glow, CX, CY, 24.0, 0.09 * breathe);
-    }
-
-    unsafe fn create_window() -> Option<HWND> {
-        let cls_name: Vec<u16> = "NeuronSpellOverlay\0".encode_utf16().collect();
-        let wc = WNDCLASSW {
-            style: 0,
-            lpfnWndProc: Some(DefWindowProcW),
-            cbClsExtra: 0,
-            cbWndExtra: 0,
-            hInstance: std::ptr::null_mut(),
-            hIcon: std::ptr::null_mut(),
-            hCursor: std::ptr::null_mut(),
-            hbrBackground: std::ptr::null_mut(),
-            lpszMenuName: std::ptr::null(),
-            lpszClassName: cls_name.as_ptr(),
-        };
-        RegisterClassW(&wc);
-        let hwnd = CreateWindowExW(
-            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
-            cls_name.as_ptr(),
-            std::ptr::null(),
-            WS_POPUP,
-            0,
-            0,
-            W,
-            H,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null(),
-        );
-        if hwnd.is_null() {
-            None
-        } else {
-            Some(hwnd)
-        }
     }
 
     fn dib_header() -> BITMAPINFO {

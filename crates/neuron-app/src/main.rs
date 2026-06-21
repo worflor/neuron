@@ -36,6 +36,7 @@ mod prof_log;
 mod purge;
 mod runtime;
 mod sound;
+mod surface;
 mod teleport;
 mod tray;
 mod ui;

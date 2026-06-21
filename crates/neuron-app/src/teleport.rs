@@ -649,15 +649,11 @@ fn scry_thread(rx: std::sync::mpsc::Receiver<ScryCmd>) {
         DwmRegisterThumbnail, DwmUnregisterThumbnail, DwmUpdateThumbnailProperties,
         DWM_THUMBNAIL_PROPERTIES, DWM_TNP_RECTDESTINATION, DWM_TNP_VISIBLE,
     };
-    use windows_sys::Win32::Graphics::Gdi::{
-        CreateCompatibleDC, CreateDIBSection, GetDC, SelectObject, AC_SRC_ALPHA, AC_SRC_OVER,
-        BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DIB_RGB_COLORS, HBITMAP,
-    };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DispatchMessageW, LoadCursorW, PeekMessageW,
-        RegisterClassW, SetWindowPos, ShowWindow, TranslateMessage, UpdateLayeredWindow,
-        HWND_TOPMOST, MSG, PM_REMOVE, SWP_NOACTIVATE, SW_HIDE, SW_SHOWNOACTIVATE, ULW_ALPHA,
-        WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+        RegisterClassW, SetWindowPos, ShowWindow, TranslateMessage, HWND_TOPMOST, MSG, PM_REMOVE,
+        SWP_NOACTIVATE, SW_HIDE, SW_SHOWNOACTIVATE, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+        WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
     };
     unsafe {
         let cls: Vec<u16> = "NeuronScry\0".encode_utf16().collect();
@@ -694,34 +690,19 @@ fn scry_thread(rx: std::sync::mpsc::Receiver<ScryCmd>) {
         let marker = spawn_marker();
         // the SPARKLE FRAME around the portal (item 15b): one max-size DIB, repainted per frame at
         // the live portal size and pushed via UpdateLayeredWindow. Created once; the thread owns it.
-        let frame_win = spawn_frame();
-        let frame_screen = GetDC(std::ptr::null_mut());
-        let frame_mem = CreateCompatibleDC(frame_screen);
-        let mut fbmi: BITMAPINFO = std::mem::zeroed();
-        fbmi.bmiHeader = BITMAPINFOHEADER {
-            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: SCRY_FRAME_W,
-            biHeight: -SCRY_FRAME_H,
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: BI_RGB,
-            biSizeImage: 0,
-            biXPelsPerMeter: 0,
-            biYPelsPerMeter: 0,
-            biClrUsed: 0,
-            biClrImportant: 0,
+        // A click-through, transparent, topmost layered popup whose DIB is the FULL max frame size,
+        // presented at the live portal size each paint.
+        let frame_surf = match crate::surface::LayeredSurface::new(&crate::surface::SurfaceSpec::new(
+            "NeuronScryFrame",
+            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+            SCRY_FRAME_W,
+            SCRY_FRAME_H,
+        )) {
+            Some(s) => s,
+            None => return,
         };
-        let mut fbits: *mut core::ffi::c_void = std::ptr::null_mut();
-        let fdib = CreateDIBSection(
-            frame_screen,
-            &fbmi,
-            DIB_RGB_COLORS,
-            &mut fbits,
-            std::ptr::null_mut(),
-            0,
-        ) as HBITMAP;
-        SelectObject(frame_mem, fdib as _);
-        let fpx = fbits as *mut u32;
+        let frame_win = frame_surf.hwnd();
+        let fpx = frame_surf.bits();
         let mut thumb: isize = 0;
         // the portal's live geometry — what Aim maps source-fractions through.
         let mut portal: Option<(i32, i32, i32, i32)> = None; // (x, y, w, h)
@@ -826,24 +807,7 @@ fn scry_thread(rx: std::sync::mpsc::Receiver<ScryCmd>) {
                         cx: pw + 2 * SCRY_FRAME_B,
                         cy: ph + 2 * SCRY_FRAME_B,
                     };
-                    let fsrc = POINT { x: 0, y: 0 };
-                    let fblend = BLENDFUNCTION {
-                        BlendOp: AC_SRC_OVER as u8,
-                        BlendFlags: 0,
-                        SourceConstantAlpha: 255,
-                        AlphaFormat: AC_SRC_ALPHA as u8,
-                    };
-                    UpdateLayeredWindow(
-                        frame_win,
-                        frame_screen,
-                        &fpos,
-                        &fsize,
-                        frame_mem,
-                        &fsrc,
-                        0,
-                        &fblend,
-                        ULW_ALPHA,
-                    );
+                    frame_surf.present(Some(fpos), fsize, 255);
                 }
             }
             let mut msg: MSG = std::mem::zeroed();
@@ -896,76 +860,22 @@ unsafe fn work_area(p: (i32, i32)) -> (i32, i32, i32, i32) {
 #[cfg(windows)]
 unsafe fn spawn_marker() -> windows_sys::Win32::Foundation::HWND {
     unsafe {
-        use windows_sys::Win32::Foundation::{POINT, SIZE};
-        use windows_sys::Win32::Graphics::Gdi::{
-            CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC,
-            SelectObject, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
-            BLENDFUNCTION, DIB_RGB_COLORS, HBITMAP,
-        };
+        use crate::surface::{LayeredSurface, SurfaceSpec};
+        use windows_sys::Win32::Foundation::SIZE;
         use windows_sys::Win32::UI::WindowsAndMessaging::{
-            CreateWindowExW, DefWindowProcW, RegisterClassW, UpdateLayeredWindow, ULW_ALPHA,
-            WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-            WS_EX_TRANSPARENT, WS_POPUP,
+            WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
         };
-        let cls: Vec<u16> = "NeuronScryMark\0".encode_utf16().collect();
-        let wc = WNDCLASSW {
-            style: 0,
-            lpfnWndProc: Some(DefWindowProcW),
-            cbClsExtra: 0,
-            cbWndExtra: 0,
-            hInstance: std::ptr::null_mut(),
-            hIcon: std::ptr::null_mut(),
-            hCursor: std::ptr::null_mut(),
-            hbrBackground: std::ptr::null_mut(),
-            lpszMenuName: std::ptr::null(),
-            lpszClassName: cls.as_ptr(),
-        };
-        RegisterClassW(&wc);
-        let hwnd = CreateWindowExW(
+        let surf = match LayeredSurface::new(&SurfaceSpec::new(
+            "NeuronScryMark",
             WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
-            cls.as_ptr(),
-            std::ptr::null(),
-            WS_POPUP,
-            0,
-            0,
             MARK,
             MARK,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null(),
-        );
-        if hwnd.is_null() {
-            return hwnd;
-        }
-        // paint the pip once (premultiplied ARGB): phosphor ring + white core, soft falloff.
-        let screen = GetDC(std::ptr::null_mut());
-        let mem = CreateCompatibleDC(screen);
-        let mut bmi: BITMAPINFO = std::mem::zeroed();
-        bmi.bmiHeader = BITMAPINFOHEADER {
-            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: MARK,
-            biHeight: -MARK,
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: BI_RGB,
-            biSizeImage: 0,
-            biXPelsPerMeter: 0,
-            biYPelsPerMeter: 0,
-            biClrUsed: 0,
-            biClrImportant: 0,
+        )) {
+            Some(s) => s,
+            None => return std::ptr::null_mut(),
         };
-        let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
-        let dib = CreateDIBSection(
-            screen,
-            &bmi,
-            DIB_RGB_COLORS,
-            &mut bits,
-            std::ptr::null_mut(),
-            0,
-        ) as HBITMAP;
-        let old = SelectObject(mem, dib as _);
-        let px = bits as *mut u32;
+        // paint the pip once (premultiplied ARGB): phosphor ring + white core, soft falloff.
+        let px = surf.bits();
         let c = (MARK / 2) as f32;
         // the ring wears the user's live WEAVE colour (settings-driven); the core stays white.
         let (ar, ag, ab) = crate::weave::overlay_accent();
@@ -983,21 +893,14 @@ unsafe fn spawn_marker() -> windows_sys::Win32::Foundation::HWND {
                 *px.add((y * MARK + x) as usize) = (a << 24) | (r << 16) | (g << 8) | b;
             }
         }
-        let src = POINT { x: 0, y: 0 };
-        let pos = POINT { x: 0, y: 0 };
-        let size = SIZE { cx: MARK, cy: MARK };
-        let blend = BLENDFUNCTION {
-            BlendOp: AC_SRC_OVER as u8,
-            BlendFlags: 0,
-            SourceConstantAlpha: 255,
-            AlphaFormat: AC_SRC_ALPHA as u8,
-        };
-        UpdateLayeredWindow(hwnd, screen, &pos, &size, mem, &src, 0, &blend, ULW_ALPHA);
-        SelectObject(mem, old);
-        DeleteObject(dib as _);
-        DeleteDC(mem);
-        ReleaseDC(std::ptr::null_mut(), screen);
-        hwnd
+        // present at the origin, then hand back the live window (the DIB+DC are torn down; the
+        // marker window survives and is re-positioned per frame by the scry thread).
+        surf.present(
+            Some(windows_sys::Win32::Foundation::POINT { x: 0, y: 0 }),
+            SIZE { cx: MARK, cy: MARK },
+            255,
+        );
+        surf.into_hwnd()
     }
 }
 
@@ -1005,46 +908,6 @@ const SCRY_FRAME_B: i32 = 16; // sparkle-border margin around the portal
 const SCRY_FRAME_W: i32 = 640 + 2 * SCRY_FRAME_B; // the portal is capped ≤ 640×420 in Show
 const SCRY_FRAME_H: i32 = 420 + 2 * SCRY_FRAME_B;
 
-/// Build the scry portal's SPARKLE-FRAME window: a layered, click-through, transparent topmost
-/// popup, repainted per frame with the Directed-Intent rim + travelling sparkles AROUND the portal
-/// (item 15b — the magic on the glance's OWN border, not just the minimap cell it grew from).
-#[cfg(windows)]
-unsafe fn spawn_frame() -> windows_sys::Win32::Foundation::HWND {
-    unsafe {
-        use windows_sys::Win32::UI::WindowsAndMessaging::{
-            CreateWindowExW, DefWindowProcW, RegisterClassW, WNDCLASSW, WS_EX_LAYERED,
-            WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
-        };
-        let cls: Vec<u16> = "NeuronScryFrame\0".encode_utf16().collect();
-        let wc = WNDCLASSW {
-            style: 0,
-            lpfnWndProc: Some(DefWindowProcW),
-            cbClsExtra: 0,
-            cbWndExtra: 0,
-            hInstance: std::ptr::null_mut(),
-            hIcon: std::ptr::null_mut(),
-            hCursor: std::ptr::null_mut(),
-            hbrBackground: std::ptr::null_mut(),
-            lpszMenuName: std::ptr::null(),
-            lpszClassName: cls.as_ptr(),
-        };
-        RegisterClassW(&wc);
-        CreateWindowExW(
-            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
-            cls.as_ptr(),
-            std::ptr::null(),
-            WS_POPUP,
-            0,
-            0,
-            SCRY_FRAME_W,
-            SCRY_FRAME_H,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null(),
-        )
-    }
-}
 
 /// Paint the sparkle frame into `px` (a premultiplied-ARGB DIB of stride `SCRY_FRAME_W`) for the
 /// live portal size `pw×ph`: a glowing phosphor rim hugging the portal's edge that drifts through a
