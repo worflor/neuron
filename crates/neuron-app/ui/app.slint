@@ -87,6 +87,11 @@ component PanelSlot inherits Rectangle {
 // children declared inside the component, and ours arrive via @children — without this binding
 // the viewport never outgrows the glass and the wheel is dead (the off-screen-rows bug).
 component PanelPage inherits Flickable {
+    // WHEEL-ONLY scroll. A Flickable's drag-to-flick gesture is all-or-nothing and competes with every
+    // child control — a click-drag that began on a swatch / button / slider got hijacked into a page
+    // scroll. `interactive: false` drops the drag gesture; the mouse wheel still scrolls (Slint exempts
+    // Wheel events from this gate), which is the right primary on a mouse-driven desktop anyway.
+    interactive: false;
     viewport-width: self.width;
     viewport-height: max(self.height, body.preferred-height);
     body := VerticalLayout {

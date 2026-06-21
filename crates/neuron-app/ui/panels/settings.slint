@@ -203,6 +203,7 @@ export component SettingsPanel inherits VerticalLayout {
 
     // the page itself scrolls (PanelPage) — no inner whole-panel Flickable.
     VerticalLayout {
+        vertical-stretch: 1;   // fill the page height so the ABOUT footer (below) can pin to the bottom
         VerticalLayout {
             spacing: 22px;
 
@@ -742,8 +743,15 @@ export component SettingsPanel inherits VerticalLayout {
                 }
             }
 
+        }
+        // pin the nameplate to the bottom: this spacer keeps the section gap (≥22px) AND soaks up any
+        // extra height on a tall window, so ABOUT sits flush above the status strip instead of floating
+        // in mid-void. On a short window it collapses to its 22px floor and the page simply scrolls.
+        Rectangle { vertical-stretch: 1; min-height: 22px; }
+        // ── ABOUT — the instrument's nameplate (version + where it lives), pinned to the bottom ──
+        VerticalLayout {
+            spacing: 22px;
             Divider {}
-            // ── ABOUT — the instrument's nameplate (version + where it lives) ──
             HorizontalLayout {
                 spacing: 8px;
                 VerticalLayout {
@@ -754,7 +762,6 @@ export component SettingsPanel inherits VerticalLayout {
                 }
                 Rectangle {}
             }
-            Rectangle { height: 24px; }
         }
     }
 }
