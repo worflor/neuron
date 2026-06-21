@@ -1004,6 +1004,38 @@ pub fn macros_dir() -> PathBuf {
     PathBuf::from("macros").join("scripts")
 }
 
+/// Exemplar macros shipped with the binary (id, source). Written to disk on a truly-fresh install
+/// so a new user has a working `neuron.ask` macro to read, run, and copy from.
+pub const DEFAULT_MACROS: &[(&str, &str)] =
+    &[("beacon_demo", include_str!("defaults/beacon_demo.py"))];
+
+/// Seed the bundled exemplar macros into THIS install's macros dir, once.
+///
+/// Gated on a one-time MARKER file (`.defaults_seeded`), NOT on the dir's existence — the macros
+/// dir can already exist (empty, or holding the user's own macros) and we still want a fresh
+/// install to receive the bundled exemplar(s). The marker is what makes a DELETE stick: once we've
+/// seeded, the marker is present, so a user who removes the exemplar (SYSTEM panel's delete control)
+/// never sees it resurrect. Delete the marker to opt back into re-seeding.
+///
+/// Best-effort: IO errors are swallowed, matching the rest of this module's persistence.
+pub fn seed_default_macros() {
+    let dir = macros_dir();
+    let marker = dir.join(".defaults_seeded");
+    if marker.exists() {
+        return;
+    }
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    for (id, src) in DEFAULT_MACROS {
+        let _ = std::fs::write(dir.join(format!("{id}.py")), src);
+    }
+    let _ = std::fs::write(
+        &marker,
+        b"neuron seeded its bundled default macros here once. delete this file to re-seed.\n",
+    );
+}
+
 fn macro_path(id: &str) -> PathBuf {
     macros_dir().join(format!("{}.py", sanitize_id(id)))
 }
@@ -1112,6 +1144,15 @@ pub fn list_macros() -> Vec<String> {
 /// Load a macro's source from disk by id.
 pub fn load_macro(id: &str) -> Option<String> {
     std::fs::read_to_string(macro_path(id)).ok()
+}
+
+/// Delete a macro's source file (`macros/scripts/<id>.py`) by id.
+///
+/// Removing the file is sufficient: the warm sidecar re-syncs its registry from disk on its next
+/// spawn, so there's no separate deregister step. The id is sanitised to the same on-disk stem used
+/// when the file was written.
+pub fn delete_macro(id: &str) -> std::io::Result<()> {
+    std::fs::remove_file(macro_path(id))
 }
 
 #[cfg(test)]

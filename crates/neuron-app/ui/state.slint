@@ -53,10 +53,14 @@ export global State {
     // at startup + after a macro save. `test-beacon` MOCK-fires one (real ask, no real-world effects).
     in-out property <[BeaconMacro]> beacon-macros;
     callback test-beacon(string);                     // macro id → mock-fire it so its real beacon rises
+    callback delete-beacon(string);                   // macro id → delete its .py from disk (refreshes registry)
 
     // ── navigation ───────────────────────────────────────────────────────
     in-out property <int> page: 0;                   // selected section (0..3: DEVICE LIGHTING INPUT SYSTEM)
     in-out property <int> input-view: 0;             // INPUT depth: 0 = DIRECT (bindings), 1 = WEAVE (spellweaving)
+    // a cross-panel "jump to the macro editor" request: set by the SYSTEM→BEACONS "author a macro"
+    // link, consumed ONCE by the INPUT→DIRECT page Flickable (app.slint), which scrolls to MACRO.
+    in-out property <bool> macro-jump-pending: false;
     in-out property <string> gesture-predict: "";    // live "what the stroke is becoming" (chip highlight)
     callback try-teleport();                         // prime teleport on a plain hold (no rhythm needed)
     callback try-whiteboard();                       // open a whiteboard session right now
@@ -201,6 +205,13 @@ export global State {
     // smart (tap latches, hold is momentary) | one-shot (next press only). Persisted in feel.toml.
     in-out property <string> hypershift-mode: "hold";
     callback set-hypershift-mode(string);
+    // the FEEL timing windows (feel.toml), in ms — the press grammar's forgiveness knobs:
+    //   hold = tap↔hold cutoff · gap = max silence between phrase presses · coyote = post-release tail.
+    // Seeded from FeelConfig at startup; one callback mirrors set-hypershift-mode (load → set → save → reload).
+    in-out property <int> feel-hold-ms: 200;
+    in-out property <int> feel-gap-ms: 280;
+    in-out property <int> feel-coyote-ms: 120;
+    callback set-feel-timing(int, int, int);          // hold_ms, gap_ms, coyote_ms
     // GRAPH VIEW — the spine as a node board (triggers → actions, macro chains as step nodes).
     // Timings ride on the connections; angles are shown at each chip. Layout persists.
     in-out property <bool> graph-view: false;
@@ -249,11 +260,19 @@ export global State {
     in-out property <string> macro-name: "";          // the macro's name (file stem + registry id)
     in-out property <string> macro-source: "";
     in-out property <[string]> macro-dryrun;          // defs found (after check) / log lines (after test)
-    in-out property <string> macro-status: "Write a Python macro: def macro(ctx): ...";
+    in-out property <string> macro-status: "";
     in-out property <bool> macro-busy: false;
+    // does the editor source contain a neuron.ask() — gates the self-surfacing "test asks" button.
+    // Computed in Rust (Slint 1.16 has no string.contains) via note-macro-source on every edit.
+    in-out property <bool> macro-has-ask: false;
     callback macro-check(string);                     // ast.parse only — no execution
     callback macro-save(string, string);              // (name, source) -> persist + register warm
     callback macro-test(string, string);              // (name, source) -> register + run once now
+    // (name, source) -> register the LIVE editor source + fire_mock so ONLY its neuron.ask() beacons
+    // rise (input disarmed — nothing real runs), the SAME pipeline as SYSTEM→BEACONS' test. A safe way
+    // to discover + learn the ask/beacon syntax by seeing it work.
+    callback test-asks(string, string);
+    callback note-macro-source(string);               // editor source edited -> Rust recomputes macro-has-ask
 
     // ── Spellweaving (merged gesture + radial: two facets of the cast engine) ─
     in-out property <[GlyphChip]> glyphs;             // the vault, each chip carrying its bound action
@@ -371,7 +390,9 @@ export global State {
     callback set-phoenix(bool);
     // ── NOTIFICATIONS — state-change confirmation cards (System page) ──
     in-out property <bool> notif-enabled: true;
-    in-out property <string> notif-placement: "top-right"; // off/top-left/top-right/bottom-left/bottom-right/inline
+    in-out property <string> notif-placement: "top-right"; // off/top-left/top-right/bottom-left/bottom-right/inline/custom
+    in-out property <float> notif-x: 1.0;                 // hand-placed card anchor, fraction of the work-area (0..1)
+    in-out property <float> notif-y: 0.0;
     in-out property <bool> notif-audio: true;
     in-out property <bool> notif-dpi: true;
     in-out property <bool> notif-scroll: true;
@@ -381,6 +402,7 @@ export global State {
     in-out property <bool> notif-layer: true;
     callback set-notif-enabled(bool);
     callback set-notif-placement(string);
+    callback set-notif-pos(float, float);                 // a free hand-placed spot (Rust snaps an exact preset back to its slug)
     callback set-notif-audio(bool);
     in-out property <float> notif-volume: 0.7;            // audio cue volume 0..1
     in-out property <string> notif-sound: "pulse";        // voice palette: pulse / warm / glass

@@ -217,12 +217,15 @@ pub enum WeaveMode {
     /// A NOTIFICATION CARD — a state-change confirmation, drawn in the exact `Signal` card grammar
     /// (see `draw_card`) but PLACED by the notification engine and shown on its OWN overlay
     /// instance, so it never clobbers a live weave. `title` rides the accent; `body` is the value /
-    /// old→new line beneath. `place`: 0 top-left · 1 top-right · 2 bottom-left · 3 bottom-right ·
-    /// 4 in-line (top-centre, exactly the beacon's strip).
+    /// old→new line beneath. Placed by the free `(nx, ny)` anchor below — the four corner presets
+    /// resolve to {0,1}², and the in-line preset (0.5, 0) snaps onto the Signal/beacon strip.
     Notify {
         title: String,
         body: String,
-        place: u8,
+        /// the card anchor as a fraction of the monitor work-area: (0,0) top-left … (1,1)
+        /// bottom-right, (0.5,0) top-centre. Hand-placeable, not a fixed corner code.
+        nx: f32,
+        ny: f32,
         /// Draw the grounded squircle panel (app-card chrome) behind the content; false = the
         /// floating spell look (soft lozenge only).
         panel: bool,
@@ -337,7 +340,7 @@ mod stub {
             SpellOverlay
         }
         pub fn begin(&self, _mode: WeaveMode) {}
-        pub fn push(&self, _pts: &[(f32, f32)]) {}
+        pub fn push(&self, _pts: Vec<(f32, f32)>) {}
         pub fn hint(&self, _hint: Option<GlyphHint>) {}
         pub fn recognized(&self, _hit: bool) {}
         pub fn end(&self) {}
@@ -378,6 +381,19 @@ mod imp {
     const H: i32 = 1600;
     const CX: f32 = (W / 2) as f32;
     const CY: f32 = (H / 2) as f32;
+    // INVARIANT (enforced below): the card is drawn at buffer x = CX, and the in-line notification
+    // preset relies on CX being the screen midpoint so `window_x + CX` lands exactly where Signal's
+    // `(l+r)/2` does. Keep CX == W/2 — decoupling it would silently drift the inline notification off
+    // the beacon strip while the corner presets stayed correct (see `place_window`'s Notify arm).
+    const _: () = assert!(
+        CX == (W / 2) as f32,
+        "CX must equal W/2: the in-line notification placement depends on it (see place_window)"
+    );
+    // The beacon/Signal strip's window-Y offset. Shared by BOTH the `Signal` arm and the in-line
+    // notification arm of `place_window` (one source of truth) so they can't drift apart — an inline
+    // notification must land exactly where a beacon ask does. (The card's BUFFER anchor is already
+    // shared too: Signal and Notify both draw via `draw_card`, so only this window-Y could diverge.)
+    const STRIP_Y: i32 = 14;
     // colour lives in the spellweaving material now (crate::weave) — the accent (the old phosphor),
     // the honey body ramp, and the warn red are all theme data, not constants here.
 
@@ -603,9 +619,13 @@ mod imp {
         pub fn begin(&self, mode: WeaveMode) {
             let _ = self.tx.send(Cmd::Begin(mode));
         }
-        /// Feed the accumulated stroke (points relative to the anchor, in mouse units).
-        pub fn push(&self, pts: &[(f32, f32)]) {
-            let _ = self.tx.send(Cmd::Push(pts.to_vec()));
+        /// Feed the accumulated stroke (points relative to the anchor, in mouse units), MOVING the
+        /// already-owned `Vec` straight across the `Cmd` channel — ONE allocation per tick. Every
+        /// caller (the per-tick weave/teleport/ask drain, the editor recorder) builds its `rel`
+        /// `Vec` once and hands it over by value, so the old per-tick double allocation — build
+        /// then `.to_vec()` inside here — is gone.
+        pub fn push(&self, pts: Vec<(f32, f32)>) {
+            let _ = self.tx.send(Cmd::Push(pts));
         }
         /// Update the live next-glyph prediction (Glyph mode only) WITHOUT resetting the trail.
         pub fn hint(&self, hint: Option<GlyphHint>) {
@@ -1107,6 +1127,9 @@ mod imp {
             // optional frame-time probe — set NEURON_OVERLAY_PROFILE to print per-frame render ms
             // every 60 frames. Off by default; measure, don't guess.
             let profile = std::env::var_os("NEURON_OVERLAY_PROFILE").is_some();
+            // the slow-frame diagnostic gate (NEURON_PROFILE) — cached once so neither the per-frame
+            // `dbg_cover` tile scan nor the slow-frame eprintln pays a per-frame env lookup.
+            let slow_profile = std::env::var_os("NEURON_PROFILE").is_some();
             let (mut prof_us, mut prof_max, mut prof_n) = (0u128, 0u128, 0u32);
 
             loop {
@@ -1324,6 +1347,10 @@ mod imp {
                             visible = true;
                             ShowWindow(hwnd, SW_SHOWNOACTIVATE);
                         }
+                        // Sets ONLY the trail points — deliberately does NOT touch the live glyph
+                        // hint. beacon's predict-throttle relies on the last `Cmd::Hint` persisting
+                        // across the Pushes between recomputes; clearing it here would make the
+                        // forecast flicker/stale. (`Cmd::Hint` updates it; `Cmd::Begin` resets it.)
                         Cmd::Push(p) => points = p,
                         Cmd::Hint(h) => {
                             // update the live prediction in place (Glyph mode) — never touches the
@@ -2421,7 +2448,11 @@ mod imp {
                                                       // taps) land in the cleared moat or drawn content — never stale memory.
                     let mut comp = proc.clone();
                     comp.or_with(&prev_proc);
-                    dbg_cover = comp.on.iter().filter(|&&b| b).count();
+                    // dbg_cover is read ONLY by the NEURON_PROFILE slow-frame eprintln below; the
+                    // ~2500-entry tile-cover scan is otherwise pure waste, so only count when profiling.
+                    if slow_profile {
+                        dbg_cover = comp.on.iter().filter(|&&b| b).count();
+                    }
                     for ti in 0..(TW * TH) as usize {
                         if !comp.on[ti] {
                             continue;
@@ -2622,7 +2653,7 @@ mod imp {
                 // frames now land on the ≤60fps cadence and never wait longer than the render itself.
                 let target: u64 = if idle_beacon { 33 } else { 16 };
                 let dur = frame_start.elapsed(); // render cost, excluding the cap sleep below
-                if std::env::var_os("NEURON_PROFILE").is_some()
+                if slow_profile
                     && visible
                     && (dur.as_millis() >= 8 || dbg_painted > 2000)
                 {
@@ -3259,31 +3290,40 @@ mod imp {
     ///   * the signal strip: top-center of the cursor's monitor (where game notices live).
     unsafe fn place_window(mode: &WeaveMode, cur: POINT, card_half: f32) -> POINT {
         let (l, t, r, b) = monitor_work(cur);
+        // The Signal/beacon strip window — top-centre of the cursor's monitor, where game notices
+        // live. The in-line notification preset reuses this VERBATIM (it IS the strip), so the two
+        // are bit-for-bit identical from ONE source of truth — no fractional-rounding path that could
+        // drift the inline card ≤1px off Signal's X.
+        let strip = POINT {
+            x: ((l + r) / 2 - W / 2).clamp(l, (r - W).max(l)),
+            y: t + STRIP_Y,
+        };
         match mode {
-            WeaveMode::Signal { .. } => POINT {
-                x: ((l + r) / 2 - W / 2).clamp(l, (r - W).max(l)),
-                y: t + 14,
-            },
+            WeaveMode::Signal { .. } => strip,
             // The notification card draws at buffer (CX, 30) — the very same anchor as Signal — so
             // its visual box is x∈[CX-half, CX+half], y∈[14,70]. Position the WINDOW so that box
-            // lands in the chosen screen corner with a margin; `place` 4 is in-line (the Signal
-            // placement). Off-screen pixels are transparent, so a 1600² window resting mostly off
-            // the corner costs nothing.
-            WeaveMode::Notify { place, .. } => {
+            // lands at the fractional (nx,ny) anchor with a margin: the four corner presets resolve
+            // to {0,1}² and land pixel-identically to their old corner codes, any free spot between
+            // just works. The IN-LINE preset (0.5, 0) is special — it IS the Signal/beacon strip, so
+            // it returns `strip` verbatim (the generic top-edge math would land it ~10px high AND
+            // could round ≤1px off Signal's X). Off-screen pixels are transparent, so a 1600² window
+            // resting mostly off-corner costs nothing.
+            WeaveMode::Notify { nx, ny, .. } => {
+                if (*nx - 0.5).abs() < 1e-3 && *ny <= 1e-3 {
+                    return strip; // in-line === the beacon strip, bit-for-bit
+                }
                 let pad = 18;
                 let cx = CX as i32;
                 let h = (card_half.ceil() as i32).max(8);
-                let (top, bot) = (14, 70); // the card's visual top / bottom in buffer space
-                match place {
-                    0 => POINT { x: (l + pad) - (cx - h), y: (t + pad) - top }, // top-left
-                    1 => POINT { x: (r - pad) - (cx + h), y: (t + pad) - top }, // top-right
-                    2 => POINT { x: (l + pad) - (cx - h), y: (b - pad) - bot }, // bottom-left
-                    3 => POINT { x: (r - pad) - (cx + h), y: (b - pad) - bot }, // bottom-right
-                    _ => POINT {
-                        x: ((l + r) / 2 - W / 2).clamp(l, (r - W).max(l)),
-                        y: t + 14,
-                    }, // in-line: the Signal placement
-                }
+                let (top, bot) = (14, 70);
+                let (cardw, cardh) = (2 * h, bot - top);
+                let lx_min = l + pad;
+                let lx_max = (r - pad - cardw).max(lx_min);
+                let lx = lx_min + (((lx_max - lx_min) as f32) * nx.clamp(0.0, 1.0)).round() as i32;
+                let ty_min = t + pad;
+                let ty_max = (b - pad - cardh).max(ty_min);
+                let ty = ty_min + (((ty_max - ty_min) as f32) * ny.clamp(0.0, 1.0)).round() as i32;
+                POINT { x: lx - (cx - h), y: ty - top }
             }
             // NOT clamped to the monitor: the buffer is bigger than most monitors, so clamping
             // would pin the anchor to the monitor's centre instead of the cursor. Letting the window

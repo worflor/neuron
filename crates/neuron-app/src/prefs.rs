@@ -38,9 +38,18 @@ pub struct Prefs {
     #[serde(default = "default_true")]
     pub notif_enabled: bool,
     /// Where the card appears: "off" · "top-left" · "top-right" · "bottom-left" · "bottom-right" ·
-    /// "inline" (top-centre, exactly the beacon's strip). Default "top-right".
+    /// "inline" (top-centre) · "custom" (a free, hand-dragged spot — see `notif_x`/`notif_y`).
+    /// Default "top-right".
     #[serde(default = "default_notif_placement")]
     pub notif_placement: String,
+    /// The card's hand-placed anchor as a fraction of the monitor work-area (0..1, x then y), used
+    /// when `notif_placement` is "custom". The named presets resolve to canonical corners/edges
+    /// regardless of these, so an older file (or one set to a preset) still lands correctly.
+    /// Default top-right (1, 0).
+    #[serde(default = "default_notif_x")]
+    pub notif_x: f32,
+    #[serde(default = "default_notif_y")]
+    pub notif_y: f32,
     /// Play the audio cue alongside (or, with placement "off", instead of) the card. Default ON. The
     /// cross-platform synth lands next; the switch is live now so the preference persists.
     #[serde(default = "default_true")]
@@ -103,15 +112,55 @@ fn default_notif_placement() -> String {
     "top-right".to_string()
 }
 
-/// The valid placement slugs, in segment order (index 0 is "off").
-pub const NOTIF_PLACEMENTS: [&str; 6] = [
+/// Default free-placement anchor — top-right (matches the default preset).
+fn default_notif_x() -> f32 {
+    1.0
+}
+fn default_notif_y() -> f32 {
+    0.0
+}
+
+/// The valid placement slugs ("custom" = a free hand-placed spot; "off" = no card).
+pub const NOTIF_PLACEMENTS: [&str; 7] = [
     "off",
     "top-left",
     "top-right",
     "bottom-left",
     "bottom-right",
     "inline",
+    "custom",
 ];
+
+/// The canonical anchor (0..1) for a NAMED preset slug, or `None` for "custom" / "off" / junk.
+pub fn notif_canonical(slug: &str) -> Option<(f32, f32)> {
+    match slug {
+        "top-left" => Some((0.0, 0.0)),
+        "top-right" => Some((1.0, 0.0)),
+        "bottom-left" => Some((0.0, 1.0)),
+        "bottom-right" => Some((1.0, 1.0)),
+        "inline" => Some((0.5, 0.0)),
+        _ => None,
+    }
+}
+
+/// The preset slug an EXACT anchor lands on (so a drag that snaps to a corner keeps its name), or
+/// `None` for a genuinely free spot (which is stored as "custom").
+fn notif_preset_slug(x: f32, y: f32) -> Option<&'static str> {
+    let near = |a: f32, b: f32| (a - b).abs() < 0.001;
+    if near(x, 0.0) && near(y, 0.0) {
+        Some("top-left")
+    } else if near(x, 1.0) && near(y, 0.0) {
+        Some("top-right")
+    } else if near(x, 0.0) && near(y, 1.0) {
+        Some("bottom-left")
+    } else if near(x, 1.0) && near(y, 1.0) {
+        Some("bottom-right")
+    } else if near(x, 0.5) && near(y, 0.0) {
+        Some("inline")
+    } else {
+        None
+    }
+}
 
 impl Default for Prefs {
     fn default() -> Self {
@@ -123,6 +172,8 @@ impl Default for Prefs {
             phoenix: true,
             notif_enabled: true,
             notif_placement: default_notif_placement(),
+            notif_x: default_notif_x(),
+            notif_y: default_notif_y(),
             notif_audio: true,
             notif_dpi: true,
             notif_scroll: true,
@@ -157,16 +208,21 @@ impl Prefs {
         std::fs::write(Self::path(), body).map_err(|e| e.to_string())
     }
 
-    /// The placement as the overlay's `place` code (0 top-left · 1 top-right · 2 bottom-left ·
-    /// 3 bottom-right · 4 in-line), or `None` when no card should show ("off" / junk).
-    pub fn notif_place_code(&self) -> Option<u8> {
-        match self.notif_placement.as_str() {
-            "top-left" => Some(0),
-            "top-right" => Some(1),
-            "bottom-left" => Some(2),
-            "bottom-right" => Some(3),
-            "inline" => Some(4),
-            _ => None,
+    /// The card's anchor as a fraction of the monitor work-area (0..1). A named preset resolves to
+    /// its canonical corner/edge (so an older file — or one hand-edited to a preset — always lands
+    /// right); "custom" reads the free `notif_x`/`notif_y`; "off" still yields a position (its last
+    /// spot) for the UI puck — `notif_place_xy` is what gates whether a card actually shows.
+    pub fn notif_xy(&self) -> (f32, f32) {
+        notif_canonical(&self.notif_placement)
+            .unwrap_or((self.notif_x.clamp(0.0, 1.0), self.notif_y.clamp(0.0, 1.0)))
+    }
+
+    /// The card anchor (0..1) when a card SHOULD show, or `None` for "off" (audio-only / nothing).
+    pub fn notif_place_xy(&self) -> Option<(f32, f32)> {
+        if self.notif_placement == "off" {
+            None
+        } else {
+            Some(self.notif_xy())
         }
     }
 
@@ -313,10 +369,42 @@ pub fn set_notif_placement(slug: &str) -> String {
     }
     let mut p = Prefs::load();
     p.notif_placement = slug.to_string();
+    // a named preset also pins the free anchor to its canonical spot, so "off" remembers a real
+    // place and the UI puck can never disagree with the slug.
+    if let Some((x, y)) = notif_canonical(slug) {
+        p.notif_x = x;
+        p.notif_y = y;
+    }
     match p.save() {
         Ok(()) => format!("notification placement → {slug}"),
         Err(e) => format!("save failed: {e}"),
     }
+}
+
+/// Persist a HAND-PLACED card anchor (0..1, fractions of the work-area). An exact preset spot keeps
+/// its named slug (so the UI lights that preset and the readout reads "top-right"); anything else is
+/// a free "custom" position. This is the single write path the draggable placer commits through.
+pub fn set_notif_pos(x: f32, y: f32) -> String {
+    let x = x.clamp(0.0, 1.0);
+    let y = y.clamp(0.0, 1.0);
+    let mut p = Prefs::load();
+    p.notif_placement = notif_preset_slug(x, y).unwrap_or("custom").to_string();
+    p.notif_x = x;
+    p.notif_y = y;
+    let slug = p.notif_placement.clone();
+    match p.save() {
+        Ok(()) => format!(
+            "notification placement → {slug} ({:.0}%, {:.0}%)",
+            x * 100.0,
+            y * 100.0
+        ),
+        Err(e) => format!("save failed: {e}"),
+    }
+}
+
+/// The resolved card anchor (0..1) for the UI puck.
+pub fn notif_pos() -> (f32, f32) {
+    Prefs::load().notif_xy()
 }
 
 /// Read the notification audio-cue flag (default ON).

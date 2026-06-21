@@ -20,7 +20,7 @@ import { DevicePanel } from "panels/device.slint";
 import { LightingPanel } from "panels/lighting.slint";
 import { BindingsPanel } from "panels/bindings.slint";
 import { SpellweavingPanel } from "panels/spellweaving.slint";
-import { ProfilesPanel } from "panels/profiles.slint";
+import { ProfilesMenu } from "panels/profiles.slint";
 import { SettingsPanel } from "panels/settings.slint";
 import { ImportWizard } from "panels/import.slint";
 
@@ -244,9 +244,22 @@ export component AppWindow inherits Window {
                         PanelSlot { active: State.page == 1; PanelPage { LightingPanel {} } }
                         // INPUT — one section, two depths: DIRECT (plain binds) / WEAVE (the
                         // held-stroke engine). Same spine, same action palette, one home.
-                        PanelSlot { active: State.page == 2 && State.input-view == 0; PanelPage { BindingsPanel {} } }
+                        PanelSlot { active: State.page == 2 && State.input-view == 0; bp_page := PanelPage { bp := BindingsPanel {} } }
                         PanelSlot { active: State.page == 2 && State.input-view == 1; PanelPage { SpellweavingPanel {} } }
                         PanelSlot { active: State.page == 3; PanelPage { SettingsPanel {} } }
+                        // "author a macro" (SYSTEM→BEACONS) lands here: once INPUT→DIRECT is active,
+                        // defer one frame (so the panel has laid out + macro-y is valid), then scroll
+                        // the page to the MACRO editor and clear the request. One-shot — clearing the
+                        // flag stops the timer, and viewport-y is set imperatively (not bound), so the
+                        // wheel still scrolls freely afterwards.
+                        Timer {
+                            interval: 16ms;
+                            running: State.macro-jump-pending && State.page == 2 && State.input-view == 0;
+                            triggered => {
+                                bp_page.viewport-y = -max(0px, min(bp.macro-y, bp_page.viewport-height - bp_page.height));
+                                State.macro-jump-pending = false;
+                            }
+                        }
                     }
                 }
             }
@@ -349,31 +362,35 @@ export component AppWindow inherits Window {
     // ── press-to-bind capture overlay (shown over any panel during a capture) ──
     CaptureOverlay {}
 
-    // ── PROFILES sheet — a global affordance, not a section. A profile is the act of saving /
-    // restoring the state of the other sections, so it opens from the header wherever you are
-    // (tune on DEVICE, save here; import lands here). ESC or the scrim closes it. ──
-    // settles in over Theme.settle (opacity) instead of teleporting — modals obey the same motion
-    // law as panel switches. visible-gated so it fully unmounts after the fade-out.
+    // ── PROFILES dropdown — a global affordance, not a section, and NOT a full-screen takeover. A
+    // profile is the act of saving / restoring the other sections, so it drops from the header pill
+    // wherever you are. A light backdrop focuses it + click-anywhere-outside (or ESC) closes it; it
+    // fades + slides down on open, obeying the same motion law as everything else. ──
     Rectangle {
-        opacity: State.profile-sheet-open ? 1.0 : 0.0;
-        visible: State.profile-sheet-open || self.opacity > 0.01;
-        animate opacity { duration: Theme.settle; }
-        background: Theme.scrim;
+        visible: State.profile-sheet-open || drop.opacity > 0.01;
+        // a LIGHT scrim — focuses the menu and catches outside clicks, without the heavy modal blackout
+        background: State.profile-sheet-open ? #0000006e : #00000000;
+        animate background { duration: Theme.settle; }
         TouchArea { clicked => { State.profile-sheet-open = false; } }
-        Rectangle {
-            width: min(1020px, parent.width - Theme.modal-inset);
-            height: min(660px, parent.height - Theme.modal-inset);
-            x: (parent.width - self.width) / 2;
-            y: (parent.height - self.height) / 2;
+        drop := Rectangle {
+            width: 440px;
+            // content-sized but capped to the glass; the menu scrolls inside if it ever outgrows it
+            height: min(menu.preferred-height, parent.height - 80px);
+            x: parent.width - self.width - Theme.pad-page;     // right-aligned under the header pill
+            y: State.profile-sheet-open ? 50px : 42px;         // a gentle slide-down on open
+            opacity: State.profile-sheet-open ? 1.0 : 0.0;
             background: Theme.bg-2;
             border-radius: Theme.radius;
             border-width: Theme.hair;
             border-color: Theme.line;
             clip: true;
-            TouchArea {} // swallow clicks — the scrim closes, the sheet doesn't
-            VerticalLayout {
-                padding: 18px;
-                PanelPage { ProfilesPanel {} }
+            animate opacity, y { duration: Theme.settle; easing: ease-out; }
+            TouchArea {}   // swallow clicks inside — only the backdrop closes
+            Flickable {
+                interactive: false;   // wheel-only, like the panels
+                viewport-width: self.width;
+                viewport-height: menu.preferred-height;
+                menu := ProfilesMenu { width: parent.viewport-width; }
             }
         }
     }

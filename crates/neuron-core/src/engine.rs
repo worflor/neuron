@@ -128,6 +128,17 @@ impl Rule {
     }
 }
 
+/// The on-disk shape of a `profiles/*.rules.toml` spine sidecar: a flat `[[rules]]` array. This
+/// is the ONE definition for that schema — the migration importer (CLI + GUI), the GUI bindings
+/// editor, and the daemon's sidecar loader all share it instead of each re-declaring an identical
+/// `struct RuleDoc { rules: Vec<Rule> }`. The field is named `rules` and `#[serde(default)]`, so a
+/// missing/empty array degrades to no rules and every existing `.rules.toml` parses unchanged.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct RuleDoc {
+    #[serde(default)]
+    pub rules: Vec<Rule>,
+}
+
 /// The unified dispatcher. Holds the base [`Rule`] set plus any named **HyperShift layers**
 /// (parallel rule sets), and tracks which layers are currently *held*. On a [`Trigger`] it finds
 /// every matching rule — across the base layer and all active held layers — and runs its action.

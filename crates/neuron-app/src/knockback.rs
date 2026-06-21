@@ -28,8 +28,7 @@
 //! weave service stands down and a low-level guard keeps taps from leaking into the game).
 //! ESC leaves; the weave stays in the brain.
 
-use crate::ui::{AppWindow, State};
-use slint::ComponentHandle;
+use crate::ui::AppWindow;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -92,17 +91,11 @@ pub fn toggle(weak: &slint::Weak<AppWindow>) {
     }
 }
 
-fn post_status(weak: &slint::Weak<AppWindow>, line: String) {
-    let w = weak.clone();
-    let _ = slint::invoke_from_event_loop(move || {
-        if let Some(app) = w.upgrade() {
-            let st = app.global::<State>();
-            st.set_status_line(line.into());
-            st.set_status_kind("info".into());
-            st.set_status_stale(false);
-        }
-    });
-}
+// the live-readout poster is shared with the weave service — one definition lives in `beacon`.
+// re-exported here so the session's `super::post_status` call sites keep resolving unchanged.
+// (gated to match its only consumer, the `#[cfg(windows)]` session `imp` module.)
+#[cfg(windows)]
+use crate::beacon::post_status;
 
 #[cfg(windows)]
 mod imp {

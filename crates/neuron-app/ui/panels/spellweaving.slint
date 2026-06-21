@@ -500,13 +500,53 @@ export component SpellweavingPanel inherits VerticalLayout {
             // is a second wheel (same wedge count) shown only while a HyperShift layer is held; off by default.
             HorizontalLayout {
                 spacing: 8px;
-                Button {
-                    text: State.hyper-radial-on ? "HyperShift radial: ON" : "HyperShift radial: off";
-                    clicked => { State.set-hyper-radial-on(!State.hyper-radial-on); }
-                }
-                if State.hyper-radial-on : Button {
-                    text: State.radial-edit-hyper ? "editing: HYPERSHIFT" : "editing: base";
-                    clicked => { State.set-radial-edit-hyper(!State.radial-edit-hyper); }
+                // HYPERSHIFT RADIAL — ON/off on the left; when ON it APPENDS an inline base⇄HYPER flip
+                // in the SAME shell (a hairline splits the two zones — one control, not two buttons).
+                Rectangle {
+                    horizontal-stretch: 0;
+                    height: Theme.row-h;
+                    clip: true;
+                    border-radius: Theme.radius-sm;
+                    border-width: Theme.hair;
+                    border-color: State.hyper-radial-on ? Theme.accent-line
+                        : (hmain.has-hover ? Theme.text-faint : Theme.line);
+                    background: State.hyper-radial-on ? Theme.bg-2 : transparent;
+                    animate border-color, background { duration: Theme.quick; }
+                    HorizontalLayout {
+                        // MAIN zone — toggle the HyperShift radial on/off
+                        Rectangle {
+                            background: hmain.has-hover ? Theme.well : transparent;
+                            animate background { duration: Theme.quick; }
+                            HorizontalLayout {
+                                padding-left: 13px;
+                                padding-right: State.hyper-radial-on ? 11px : 13px;
+                                Text {
+                                    text: State.hyper-radial-on ? "HyperShift radial: ON" : "HyperShift radial: off";
+                                    color: State.hyper-radial-on ? Theme.accent : (hmain.has-hover ? Theme.text : Theme.text-mid);
+                                    font-family: Theme.mono; font-size: Theme.fs-small; font-weight: 700;
+                                    letter-spacing: 1.2px; vertical-alignment: center;
+                                }
+                            }
+                            hmain := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { State.set-hyper-radial-on(!State.hyper-radial-on); } }
+                        }
+                        // INLINE flip zone — only while ON: a hairline + the live edit target; tap flips it
+                        if State.hyper-radial-on : Rectangle { width: 1px; background: Theme.line; }
+                        if State.hyper-radial-on : Rectangle {
+                            background: hflip.has-hover ? Theme.well : transparent;
+                            animate background { duration: Theme.quick; }
+                            HorizontalLayout {
+                                padding-left: 11px; padding-right: 12px;
+                                Text {
+                                    text: State.radial-edit-hyper ? "HYPER" : "base";
+                                    color: State.radial-edit-hyper ? Theme.accent : (hflip.has-hover ? Theme.text-mid : Theme.text-dim);
+                                    font-family: Theme.mono; font-size: Theme.fs-small;
+                                    font-weight: State.radial-edit-hyper ? 700 : 500;
+                                    letter-spacing: 1.4px; vertical-alignment: center;
+                                }
+                            }
+                            hflip := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { State.set-radial-edit-hyper(!State.radial-edit-hyper); } }
+                        }
+                    }
                 }
                 Button {
                     text: State.capturing-gesture ? "flick now…" : "test wheel";
@@ -515,13 +555,6 @@ export component SpellweavingPanel inherits VerticalLayout {
                     clicked => { State.preview-radial(); }
                 }
                 Rectangle {}
-            }
-            if State.hyper-radial-on : Mono {
-                text: State.radial-edit-hyper
-                    ? "authoring the HyperShift wheel — flick these while holding HyperShift"
-                    : "base wheel — toggle to author the HyperShift set";
-                color: Theme.text-faint;
-                wrap: word-wrap;
             }
             wheel := Rectangle {
                 // FIXED height (was min-height) — this is the resize-on-click fix. As a min-only cell the
@@ -533,13 +566,18 @@ export component SpellweavingPanel inherits VerticalLayout {
                 property <length> cx: self.width / 2;
                 property <length> cy: self.height / 2;
                 property <length> r: min(self.width, self.height) / 2 - 40px;
-                // outer ring
+                // outer ring — lights ACCENT when HyperShift radial is enabled (stronger + an accent
+                // wash while authoring the HyperShift set), so the wheel itself says which layer it is.
                 Rectangle {
                     width: wheel.r * 2 + 32px; height: self.width;
                     x: wheel.cx - self.width / 2; y: wheel.cy - self.height / 2;
                     border-radius: self.width / 2;
-                    background: Theme.bg-2;
-                    border-width: 1px; border-color: Theme.line;
+                    background: (State.hyper-radial-on && State.radial-edit-hyper) ? State.weave-accent-col.with-alpha(0.08) : Theme.bg-2;
+                    border-width: (State.hyper-radial-on && State.radial-edit-hyper) ? 2px : 1px;
+                    border-color: State.hyper-radial-on
+                        ? (State.radial-edit-hyper ? State.weave-accent-col : State.weave-accent-col.with-alpha(0.5))
+                        : Theme.line;
+                    animate background, border-color, border-width { duration: Theme.quick; }
                 }
                 // TRUE PIE SLICES — each wedge an annular sector from the hub gap to the rim,
                 // spanning exactly the arc the engine commits ((i±0.5)/n, round semantics: wedge

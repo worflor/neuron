@@ -1836,12 +1836,7 @@ fn import_export_cmd(file: &str, apply: bool) -> Result<()> {
     Ok(())
 }
 
-/// On-disk shape for an imported spine rule set (a sidecar next to the profile TOML).
-#[derive(serde::Serialize, serde::Deserialize)]
-struct RuleDoc {
-    #[serde(default)]
-    rules: Vec<neuron::engine::Rule>,
-}
+use neuron::engine::RuleDoc;
 
 fn rules_sidecar_path(name: &str) -> std::path::PathBuf {
     std::path::PathBuf::from("profiles").join(format!("{name}.rules.toml"))

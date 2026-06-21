@@ -335,6 +335,8 @@ pub fn install(app: &AppWindow) -> SharedRt {
     refresh_devices(app, &shared);
     refresh_rules(app, &shared);
     refresh_pockets(app);
+    // a truly-fresh install gets the bundled exemplar macro before the registry first reads disk.
+    neuron::macros::macro_host::seed_default_macros();
     refresh_beacon_macros(app);
     refresh_profiles(app, &shared);
     refresh_app_rules(app, &shared);
@@ -353,12 +355,14 @@ pub fn install(app: &AppWindow) -> SharedRt {
     st.set_cast_trigger_label(neuron::capture::vk_name(shared.borrow().rt.cast.trigger).into());
     // the activation rhythm + HyperShift stance come from persisted config too.
     sync_activation_view(&st, &shared.borrow().rt.cast.activation);
-    st.set_hypershift_mode(
-        neuron::feel::FeelConfig::load()
-            .hypershift
-            .describe()
-            .into(),
-    );
+    {
+        let feel = neuron::feel::FeelConfig::load();
+        st.set_hypershift_mode(feel.hypershift.describe().into());
+        // the FEEL timing windows seed from the same persisted config as every other setting.
+        st.set_feel_hold_ms(feel.hold_ms as i32);
+        st.set_feel_gap_ms(feel.gap_ms as i32);
+        st.set_feel_coyote_ms(feel.coyote_ms as i32);
+    }
 
     // ── Device ───────────────────────────────────────────────────────────
     bind(app, &shared, |app, sh| {
@@ -1918,6 +1922,95 @@ pub fn install(app: &AppWindow) -> SharedRt {
             });
         });
     });
+    // TEST ASKS (macro editor): the SAFE, learn-by-doing companion to "test run". Registers the LIVE
+    // editor source + fire_mock so ONLY its neuron.ask() beacons rise (input forced disarmed — no real
+    // effects), reusing the EXACT SYSTEM→BEACONS pipeline. A curious user discovers the ask/beacon
+    // system by seeing it: write an ask, click, watch the strip rise, answer it. No explanatory wall.
+    bind(app, &shared, |app, _sh| {
+        let w = app.as_weak();
+        app.global::<State>().on_test_asks(move |name, source| {
+            let source = source.to_string();
+            // belt-and-suspenders: the button only shows once an ask exists, but guard regardless.
+            if !source.contains("neuron.ask") {
+                if let Some(app) = w.upgrade() {
+                    app.global::<State>().set_macro_status(
+                        "add a neuron.ask(\"…\") (the 'ask' chip), then Test asks previews its beacon".into(),
+                    );
+                }
+                return;
+            }
+            let id = {
+                let n = name.trim();
+                if n.is_empty() { "draft".to_string() } else { n.to_string() }
+            };
+            // ONE test beacon at a time — shares the serial-sidecar gate with the SYSTEM panel's test.
+            if crate::beacon::TEST_BEACON_INFLIGHT.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                if let Some(app) = w.upgrade() {
+                    app.global::<State>().set_status_line(
+                        "a test beacon is already waiting — answer it before testing another".into(),
+                    );
+                }
+                return;
+            }
+            if let Some(app) = w.upgrade() {
+                app.global::<State>().set_macro_status(
+                    "previewing your asks — answer the beacon at your cursor (nothing real runs)".into(),
+                );
+            }
+            let back = w.clone();
+            std::thread::spawn(move || {
+                let host = neuron::macros::macro_host();
+                let _ = host.register(&id, &source);
+                let ctx = neuron::macros::Context::capture();
+                let result = host.fire_mock(&id, &ctx);
+                // a failed dispatch raises no beacon, so release the shared gate here (else it'd stay
+                // locked until the next real beacon clears it).
+                if !result.contains("dispatched") {
+                    crate::beacon::TEST_BEACON_INFLIGHT
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
+                }
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(app) = back.upgrade() {
+                        app.global::<State>()
+                            .set_macro_status(format!("ask preview \u{00b7} {result}").into());
+                    }
+                });
+            });
+        });
+    });
+    // editor source changed -> recompute whether it contains an ask (gates the self-surfacing "test
+    // asks" button). The check lives here in Rust because Slint 1.16 has no string.contains.
+    bind(app, &shared, |app, _sh| {
+        let w = app.as_weak();
+        app.global::<State>().on_note_macro_source(move |s| {
+            if let Some(app) = w.upgrade() {
+                app.global::<State>().set_macro_has_ask(s.contains("neuron.ask"));
+            }
+        });
+    });
+    // DELETE BEACON (SYSTEM panel): remove a macro's .py from disk, then refresh the registry so the
+    // row vanishes. The warm sidecar re-syncs from disk on its next spawn, so file removal is enough.
+    bind(app, &shared, |app, _sh| {
+        let w = app.as_weak();
+        app.global::<State>().on_delete_beacon(move |id| {
+            let id = id.trim().to_string();
+            if id.is_empty() {
+                return;
+            }
+            if let Some(app) = w.upgrade() {
+                let st = app.global::<State>();
+                match neuron::macros::macro_host::delete_macro(&id) {
+                    Ok(()) => {
+                        refresh_beacon_macros(&app);
+                        st.set_status_line(format!("deleted macro {id}").into());
+                    }
+                    Err(e) => {
+                        st.set_status_line(format!("delete failed: {e}").into());
+                    }
+                }
+            }
+        });
+    });
     // TEST: register the current source under its name and run it ONCE against the live context.
     bind(app, &shared, |app, _sh| {
         let w = app.as_weak();
@@ -2377,6 +2470,25 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 let msg = crate::prefs::set_notif_placement(slug.as_str());
                 let st = app.global::<State>();
                 st.set_notif_placement(crate::prefs::notif_placement().into());
+                let (x, y) = crate::prefs::notif_pos();
+                st.set_notif_x(x);
+                st.set_notif_y(y);
+                st.set_status_line(msg.into());
+            }
+        });
+    });
+    // a free, hand-dragged spot from the mock-screen placer — Rust canonicalises an exact preset
+    // spot back to its slug, anything else persists as "custom"; the resolved (x,y) flows back.
+    bind(app, &shared, |app, _sh| {
+        let w = app.as_weak();
+        app.global::<State>().on_set_notif_pos(move |x, y| {
+            if let Some(app) = w.upgrade() {
+                let msg = crate::prefs::set_notif_pos(x, y);
+                let st = app.global::<State>();
+                st.set_notif_placement(crate::prefs::notif_placement().into());
+                let (rx, ry) = crate::prefs::notif_pos();
+                st.set_notif_x(rx);
+                st.set_notif_y(ry);
                 st.set_status_line(msg.into());
             }
         });
@@ -2707,6 +2819,42 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 }
             }
         });
+    });
+
+    // ── FEEL timing windows (feel.toml) ───────────────────────────────────
+    // Mirrors the stance picker exactly: load FeelConfig → set the three ms fields → save →
+    // request_reload so the live engine adopts the new windows on its next tick. The three GUI
+    // props are re-pinned to the persisted values so the sliders never drift from disk. (The only
+    // clamp here is a 0 floor; the upper bound is enforced by the sliders' `maximum` in bindings.slint.)
+    bind(app, &shared, |app, _sh| {
+        let w = app.as_weak();
+        app.global::<State>()
+            .on_set_feel_timing(move |hold_ms, gap_ms, coyote_ms| {
+                if let Some(app) = w.upgrade() {
+                    let st = app.global::<State>();
+                    let mut cfg = neuron::feel::FeelConfig::load();
+                    cfg.hold_ms = hold_ms.max(0) as u64;
+                    cfg.gap_ms = gap_ms.max(0) as u64;
+                    cfg.coyote_ms = coyote_ms.max(0) as u64;
+                    match cfg.save() {
+                        Ok(()) => {
+                            st.set_feel_hold_ms(cfg.hold_ms as i32);
+                            st.set_feel_gap_ms(cfg.gap_ms as i32);
+                            st.set_feel_coyote_ms(cfg.coyote_ms as i32);
+                            // the live engine adopts the new timing on its next tick.
+                            crate::dispatch::request_reload();
+                            st.set_status_line(
+                                format!(
+                                    "feel timing -> hold {}ms · gap {}ms · coyote {}ms",
+                                    cfg.hold_ms, cfg.gap_ms, cfg.coyote_ms
+                                )
+                                .into(),
+                            );
+                        }
+                        Err(e) => st.set_status_line(format!("feel timing not saved: {e}").into()),
+                    }
+                }
+            });
     });
 
     // ── cast trigger press-to-bind (the hold button) ──────────────────────
@@ -3219,6 +3367,11 @@ pub fn install(app: &AppWindow) -> SharedRt {
     // NOTIFICATIONS — seed every control from the saved prefs.
     st.set_notif_enabled(crate::prefs::notif_enabled());
     st.set_notif_placement(crate::prefs::notif_placement().into());
+    {
+        let (x, y) = crate::prefs::notif_pos();
+        st.set_notif_x(x);
+        st.set_notif_y(y);
+    }
     st.set_notif_audio(crate::prefs::notif_audio());
     st.set_notif_volume(crate::prefs::notif_volume());
     st.set_notif_sound(crate::prefs::notif_sound().into());
@@ -4595,7 +4748,7 @@ fn weave_capture(
     overlay.begin(mode);
     let path = neuron::glyph::capture_phrase(trigger, phrase, feel, 600, |pts| {
         let rel: Vec<(f32, f32)> = pts.iter().map(|c| (c.re as f32, c.im as f32)).collect();
-        overlay.push(&rel);
+        overlay.push(rel);
         on_pts(pts);
     });
     overlay.recognized(recognized(&path));

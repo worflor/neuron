@@ -84,6 +84,51 @@ component LayerLine inherits Rectangle {
     }
 }
 
+// EFFECT PALETTE — the effect chips as a tidy grid with FULL labels (never the old crushed, elided
+// row). Column count ADAPTS to the available width against a target chip size, so chips stay the same
+// comfortable size in BOTH the narrow ADD-LAYER column and the wide per-layer EFFECT picker — the two
+// read as one system. Pass `selected` to light the active chip (the EFFECT picker); leave it "" for the
+// ADD palette. Gaps sit only BETWEEN cells (arithmetic placement, the MATERIAL-grid pattern).
+component EffectGrid inherits Rectangle {
+    in property <[string]> effects;
+    in property <string> selected: "";        // the active effect (lights accent); "" = none (the add palette)
+    callback pick(string);
+    property <length> gap: 6px;
+    property <length> target: 104px;          // a chip's comfortable width; columns derive from it + the live width
+    property <int> cols: max(1, floor((self.width + self.gap) / (self.target + self.gap)));
+    property <length> cw: (self.width - (self.cols - 1) * self.gap) / self.cols;
+    property <length> ch: 32px;
+    property <int> rows: ceil(self.effects.length / self.cols);
+    // rows = ceil(len/cols) (Slint `/` is float, so this is a true ceiling for ANY count — never
+    // clips a non-multiple last row). max(0,…) keeps an empty grid (rows = 0, e.g. no device) from
+    // contributing a negative trailing-gap term.
+    height: self.rows * self.ch + max(0, self.rows - 1) * self.gap;
+    for et[i] in root.effects : chip := Rectangle {
+        property <bool> on: et == root.selected;
+        x: mod(i, root.cols) * (root.cw + root.gap);
+        y: floor(i / root.cols) * (root.ch + root.gap);
+        width: root.cw;
+        height: root.ch;
+        border-radius: Theme.radius-sm;
+        background: self.on ? Theme.accent-glow : (eta.has-hover ? Theme.well : Theme.bg-2);
+        border-width: Theme.hair;
+        border-color: self.on ? Theme.accent-line : (eta.has-hover ? Theme.text-faint : Theme.line);
+        animate background, border-color { duration: Theme.quick; }
+        HorizontalLayout {
+            padding-left: 8px; padding-right: 8px;
+            Text {
+                text: et;
+                color: chip.on ? Theme.accent : (eta.has-hover ? Theme.text : Theme.text-mid);
+                font-family: Theme.mono; font-size: Theme.fs-small;
+                horizontal-alignment: center; vertical-alignment: center;
+                overflow: elide;
+                animate color { duration: Theme.quick; }
+            }
+        }
+        eta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.pick(et); } }
+    }
+}
+
 // LIGHTING — the open effects engine, render-first. The HERO is the device itself: an
 // auto-generated picture of the selected peripheral (chassis + its real LED topology) whose
 // cells are LIVE — apply an effect and the render runs it with the SAME frame math the device
@@ -250,24 +295,20 @@ export component LightingPanel inherits VerticalLayout {
                 removed => { State.remove-layer(i); }
             }
             if State.light-layers.length == 0 : VerticalLayout {
-                padding-top: 4px; spacing: 4px;
+                padding-top: 6px; padding-bottom: 2px; spacing: 6px;
                 Mono { text: "no layers yet"; color: Theme.text-dim; }
                 Mono {
-                    text: "Neuron isn't driving this device's lighting — and it can't read another app's live theme (no per-LED read-back). add an effect to author your own.";
+                    text: "Neuron isn't driving this device's lighting — and it can't read another app's live theme (no per-LED read-back). pick an effect below to author your own.";
                     color: Theme.text-faint;
                     wrap: word-wrap;
                 }
             }
             Divider {}
             Mono { text: "ADD LAYER"; color: Theme.text-dim; }
-            HorizontalLayout {
-                spacing: 5px;
-                for et in root.effect-types : Pill {
-                    text: et;
-                    clickable: true;
-                    clicked => { State.add-layer(et); }
-                }
-                Rectangle {}
+            // the ADD palette — the shared EffectGrid with no selection (clicking ADDS that effect)
+            EffectGrid {
+                effects: root.effect-types;
+                pick(et) => { State.add-layer(et); }
             }
             // bring a Synapse theme across — we parse .ChromaEffects directly (frame → PAINT, effect → layer)
             HorizontalLayout {
@@ -300,16 +341,11 @@ export component LightingPanel inherits VerticalLayout {
             if State.selected-layer >= 0 && State.selected-layer < State.light-layers.length : VerticalLayout {
                 spacing: 13px;
                 property <LayerRow> sel: State.light-layers[State.selected-layer];
-                // EFFECT
-                HorizontalLayout {
-                    spacing: 5px;
-                    for et in root.effect-types : Pill {
-                        text: et;
-                        clickable: true;
-                        selected: sel.effect == et;
-                        clicked => { State.set-layer-effect(State.selected-layer, et); }
-                    }
-                    Rectangle {}
+                // EFFECT — the same palette grid as ADD LAYER, with this layer's active effect lit accent
+                EffectGrid {
+                    effects: root.effect-types;
+                    selected: sel.effect;
+                    pick(et) => { State.set-layer-effect(State.selected-layer, et); }
                 }
                 // COLOUR — only effects that read it
                 if sel.uses-color : VerticalLayout {

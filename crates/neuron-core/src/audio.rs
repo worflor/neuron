@@ -10,9 +10,35 @@
 //! Hand-rolled COM (no `windows` crate, no extra deps): `windows-sys` ships the plain COM
 //! *functions* (`CoCreateInstance`, ...) but no interface vtables, so we declare the five we
 //! need ourselves. First-principles, and the binary stays tiny.
+//!
+//! ## Shape — the whole OS-audio-control surface behind a per-OS SEAM
+//! The OS-audio-control surface — the stateful handles ([`VolumeCtl`], [`MeterCtl`]) AND the
+//! free verbs ([`endpoints`], the resolvers, [`flip_output`], …) — is split the way `surface.rs`
+//! / `overlay.rs` split theirs: the Win32 COM body lives in `mod imp` and an inert `mod stub`
+//! stands in off-Windows, with `pub use imp::*` / `pub use stub::*` selecting one. The shared,
+//! platform-neutral DATA ([`Endpoint`], [`Flow`]) stays at the top level so both backends speak
+//! the same vocabulary. The Windows COM bodies are byte-for-byte the same — only relocated from
+//! the old `mod win` into `mod imp`.
+//!
+//! Why this seam and not the `wm.rs` trait: `wm.rs` routes an OPAQUE handle (`isize`) through a
+//! zero-sized backend, so a trait fits. Audio's handles are STATEFUL — `VolumeCtl`/`MeterCtl`
+//! own a live COM pointer the caller holds across calls — so, exactly like `SpellOverlay` /
+//! `LayeredSurface`, the cleanest seam is two modules each defining the handle TYPE, picked by
+//! cfg. `mod stub` is ALWAYS compiled (not cfg-gated): its no-op bodies need no platform API, so
+//! they're type-checked on every build (incl. Windows) — a stub body that fails to compile is
+//! caught at once. CAVEAT vs the `wm.rs` trait: surface PARITY is by-convention here, not
+//! compiler-enforced. A trait makes a backend implement an exact method set, so a missing verb
+//! breaks the Windows build; these are two independent modules selected by `pub use`, so adding a
+//! verb to `imp` WITHOUT a matching `stub` entry still compiles on Windows and surfaces only as a
+//! missing symbol on a non-Windows build. MAINTENANCE: after changing this surface, run
+//! `cargo check -p neuron --target x86_64-unknown-linux-gnu` to confirm `stub` still mirrors `imp`.
+//! A real ALSA/Pulse (Linux) or CoreAudio (macOS) backend is then a single `mod` of the same names.
 
 #[cfg(windows)]
-pub use win::*;
+pub use imp::*;
+
+#[cfg(not(windows))]
+pub use stub::*;
 
 /// One audio endpoint (a capture or render device) as the OS sees it.
 #[derive(Clone, Debug)]
@@ -32,6 +58,7 @@ pub enum Flow {
 
 impl Flow {
     /// EDataFlow value expected by `IMMDeviceEnumerator::EnumAudioEndpoints`.
+    #[cfg_attr(not(windows), allow(dead_code))]
     fn edata(self) -> i32 {
         match self {
             Flow::Render => 0,
@@ -46,29 +73,8 @@ impl Flow {
     }
 }
 
-#[cfg(not(windows))]
-pub fn endpoints(_flow: Flow) -> Vec<Endpoint> {
-    Vec::new()
-}
-
-/// A live signal-level meter on an audio endpoint — the **peak sample value** (0.0..=1.0) the OS
-/// computes for whatever is currently playing/recording. This is the real audio signal (not the
-/// volume *setting* `VolumeCtl` reads), so it drives the `audiometer` lighting effect: the keyboard
-/// dances to the sound coming out of the speakers. Windows-only; a no-op stub elsewhere.
-#[cfg(not(windows))]
-pub struct MeterCtl;
-#[cfg(not(windows))]
-impl MeterCtl {
-    pub fn open_default_render() -> Option<Self> {
-        None
-    }
-    pub fn peak(&self) -> f32 {
-        0.0
-    }
-}
-
 #[cfg(windows)]
-mod win {
+mod imp {
     use super::{Endpoint, Flow};
     use std::ffi::c_void;
     use windows_sys::core::{GUID, HRESULT};
@@ -723,42 +729,98 @@ mod win {
     }
 }
 
-#[cfg(not(windows))]
-pub fn flip_output(_names: &[String]) -> String {
-    "output flip: windows-only".into()
-}
+/// The inert OS-audio-control backend — ALWAYS compiled (NOT cfg-gated), exactly like
+/// `wm.rs`'s `stub::Null`: the no-op bodies touch no platform API, so compiling them on every
+/// target costs nothing and keeps the off-Windows surface type-checked on each build (drift in
+/// the inert form can't hide until someone cross-compiles). Off-Windows there is no Core-Audio /
+/// ALSA / CoreAudio backend wired yet, so every read answers empty/None/0.0/false and every act
+/// is a no-op — an HONEST silent surface, not a fake. A real Linux/macOS backend replaces this
+/// `mod` with one that implements the same names. `#![allow(dead_code)]`: on Windows nothing in
+/// this module is reached (the live surface is `mod imp`), so its items would otherwise warn.
+mod stub {
+    #![allow(dead_code)]
+    use super::{Endpoint, Flow};
 
-#[cfg(not(windows))]
-pub fn flip_candidates(_names: &[String]) -> Vec<Endpoint> {
-    Vec::new()
-}
+    /// Enumerate active endpoints of one flow — none, with no audio backend on this platform.
+    pub fn endpoints(_flow: Flow) -> Vec<Endpoint> {
+        Vec::new()
+    }
 
-#[cfg(not(windows))]
-pub fn set_default(_id: &str) -> bool {
-    false
-}
+    /// A live handle to one endpoint's volume control. Inert off-Windows: there is no Core-Audio
+    /// here, so `open` never resolves a handle and every verb no-ops on the reads' resting values.
+    pub struct VolumeCtl;
 
-#[cfg(not(windows))]
-pub fn default_render_id() -> Option<String> {
-    None
-}
+    impl VolumeCtl {
+        /// No audio backend → no handle to open.
+        pub fn open(_id: &str) -> Option<Self> {
+            None
+        }
+        pub fn get_volume(&self) -> f32 {
+            0.0
+        }
+        pub fn set_volume(&self, _scalar: f32) -> bool {
+            false
+        }
+        pub fn nudge(&self, _delta: f32) -> f32 {
+            0.0
+        }
+        pub fn get_mute(&self) -> bool {
+            false
+        }
+        pub fn set_mute(&self, _mute: bool) -> bool {
+            false
+        }
+        pub fn toggle_mute(&self) -> bool {
+            false
+        }
+    }
 
-#[cfg(not(windows))]
-pub fn find_render(_needle: &str) -> Option<Endpoint> {
-    None
-}
+    /// A live signal-level meter on an audio endpoint — the **peak sample value** (0.0..=1.0) the
+    /// OS computes for whatever is currently playing/recording. This is the real audio signal (not
+    /// the volume *setting* `VolumeCtl` reads), so it drives the `audiometer` lighting effect: the
+    /// keyboard dances to the sound coming out of the speakers. A no-op stub off-Windows — it never
+    /// opens, so the effect idles near-dark (an honest silent meter).
+    pub struct MeterCtl;
 
-#[cfg(not(windows))]
-pub fn resolve_render(_device: Option<&str>) -> Option<Endpoint> {
-    None
-}
+    impl MeterCtl {
+        pub fn open_default_render() -> Option<Self> {
+            None
+        }
+        pub fn peak(&self) -> f32 {
+            0.0
+        }
+    }
 
-#[cfg(not(windows))]
-pub fn find_capture(_needle: &str) -> Option<Endpoint> {
-    None
-}
+    pub fn find_capture(_needle: &str) -> Option<Endpoint> {
+        None
+    }
 
-#[cfg(not(windows))]
-pub fn resolve_capture(_device: Option<&str>) -> Option<Endpoint> {
-    None
+    pub fn resolve_capture(_device: Option<&str>) -> Option<Endpoint> {
+        None
+    }
+
+    pub fn find_render(_needle: &str) -> Option<Endpoint> {
+        None
+    }
+
+    pub fn resolve_render(_device: Option<&str>) -> Option<Endpoint> {
+        None
+    }
+
+    pub fn default_render_id() -> Option<String> {
+        None
+    }
+
+    pub fn flip_candidates(_names: &[String]) -> Vec<Endpoint> {
+        Vec::new()
+    }
+
+    pub fn set_default(_id: &str) -> bool {
+        false
+    }
+
+    /// OUTPUT FLIP off-Windows: nothing to flip — say so plainly.
+    pub fn flip_output(_names: &[String]) -> String {
+        "no audio backend on this platform".into()
+    }
 }

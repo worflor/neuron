@@ -926,12 +926,7 @@ pub fn vk_to_palette(vk: i32, mods: &[&str]) -> (&'static str, String) {
     }
 }
 
-/// On-disk shape for the GUI-authored spine rules sidecar (mirrors the importer's `RuleDoc`).
-#[derive(serde::Serialize, serde::Deserialize, Default)]
-struct RuleDoc {
-    #[serde(default)]
-    rules: Vec<Rule>,
-}
+use neuron::engine::RuleDoc;
 
 /// The path the GUI's authored binds live at — read by `controls::load_rule_sidecars`.
 pub fn gui_rules_path() -> std::path::PathBuf {

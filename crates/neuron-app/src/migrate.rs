@@ -164,18 +164,15 @@ pub fn apply(imp: &Imported) -> Result<String, String> {
     Ok(format!("imported {}", wrote.join(", ")))
 }
 
-/// On-disk shape for the imported spine rule set (mirrors the CLI's sidecar).
-#[derive(serde::Serialize)]
-struct RuleDoc<'a> {
-    rules: &'a [neuron::engine::Rule],
-}
-
 /// Write the imported rules to `profiles/<name>.rules.toml`. Returns the path written.
 fn save_rules_sidecar(name: &str, rules: &[neuron::engine::Rule]) -> Result<String, String> {
+    use neuron::engine::RuleDoc;
     let dir = std::path::PathBuf::from("profiles");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let path = dir.join(format!("{name}.rules.toml"));
-    let doc = RuleDoc { rules };
+    let doc = RuleDoc {
+        rules: rules.to_vec(),
+    };
     let body = toml::to_string_pretty(&doc).map_err(|e| e.to_string())?;
     std::fs::write(&path, body).map_err(|e| e.to_string())?;
     Ok(path.display().to_string())

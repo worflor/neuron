@@ -430,6 +430,15 @@ fn live_weave(
     let verb_done: std::cell::RefCell<Option<String>> = std::cell::RefCell::new(None);
     // the WEAVE DIAL's aim: the stroke's current net displacement (which wedge the wheel turns)
     let weave_aim = std::cell::Cell::new((0.0f64, 0.0f64));
+    // LIVE-PREDICT THROTTLE (gesture mode): re-running `analyze` + `vault.predict` (a fresh DTW
+    // matrix per template over the WHOLE growing stroke) on EVERY drain tick (~60-125 Hz) is
+    // mostly redundant — the becoming-glyph HINT barely changes tick-to-tick. Gate the recompute
+    // to at most ~60 ms, OR sooner if the tip moves a min straight-line distance from the last (so a fast
+    // flick still firms up promptly). Between recomputes the last-sent hint stays live in the
+    // render thread (a Push never clears it), so the displayed forecast is identical to what an
+    // unthrottled recompute would have shown — only the wasted DTW passes are skipped.
+    let last_predict_at = std::cell::Cell::new(None::<std::time::Instant>);
+    let last_predict_tip = std::cell::Cell::new((0.0f64, 0.0f64));
     // the ANALOG DIAL (instrument 3): the live value 0..1, the last stroke point (for per-frame
     // velocity), and a smoothed turn-speed (drives the gauge's pulse + coarse/fine label).
     let dial = std::cell::RefCell::new(crate::dialweave::Dial::default());
@@ -545,7 +554,7 @@ fn live_weave(
                             (-1, -1),
                             Some((carry_rect.get(), (gx, gy))),
                         ));
-                        overlay.push(&[(gx, gy)]);
+                        overlay.push(vec![(gx, gy)]);
                         carry_paint.set(std::time::Instant::now());
                     }
                     if r_up > 0 {
@@ -644,7 +653,7 @@ fn live_weave(
         let c_editor = EDITOR_WEAVE.load(Ordering::SeqCst);
         let c_gen = crate::dispatch::reload_generation() != gen;
         let c_instr = INSTRUMENT_REQ.load(Ordering::SeqCst) != 0; // a try-button yanks the wait
-        // knockback claimed or released its drum key mid-wait → re-arm with the right slots.
+                                                                  // knockback claimed or released its drum key mid-wait → re-arm with the right slots.
         let c_kb = crate::knockback::owned_vk() != kb_vk.unwrap_or(0);
         // a "fire via the spine" rhythm just activated: end the capture AT ONCE (no drawing
         // session) so we inject Trigger::Cast right after — the rhythm IS the whole gesture.
@@ -743,7 +752,7 @@ fn live_weave(
                     let d = pts.last().map(|c| (c.re, c.im)).unwrap_or((0.0, 0.0));
                     ghost_d.set(d); // the scry dwell clock reads this
                     let o = s.project(s.cursor.0, s.cursor.1);
-                    overlay.push(&[(
+                    overlay.push(vec![(
                         o.0 + d.0 as f32 * crate::teleport::GHOST_GAIN,
                         o.1 + d.1 as f32 * crate::teleport::GHOST_GAIN,
                     )]);
@@ -798,43 +807,61 @@ fn live_weave(
                 // flick is reaching for (west = output flip, east = bluetooth). No state changes
                 // until release — a glance must never act mid-look.
                 let rel: Vec<(f32, f32)> = pts.iter().map(|c| (c.re as f32, c.im as f32)).collect();
-                overlay.push(&rel);
+                overlay.push(rel);
             }
             _ => {
                 let rel: Vec<(f32, f32)> = pts.iter().map(|c| (c.re as f32, c.im as f32)).collect();
                 if let Some(c) = pts.last() {
                     weave_aim.set((c.re, c.im)); // the dial aims where the stroke is
                 }
-                overlay.push(&rel);
+                overlay.push(rel);
                 // ── LIVE NEXT-GLYPH PREDICTION (gesture mode): name + icon + shape-ghost of the
                 // intent the stroke is becoming, firming up as it commits (phone-autocomplete) ──
+                // THROTTLED: recompute only on the first eligible tick, then at most every ~60 ms
+                // OR once the tip has moved a minimum straight-line distance from the last predict.
+                // Between recomputes the prior hint stays live (a Push never clears it), so the
+                // forecast shown is byte-identical to an unthrottled recompute at the moments it
+                // DOES recompute — only redundant DTW passes are skipped.
                 if matches!(cast.mode, neuron::cast::Mode::Gesture) && pts.len() >= 8 {
-                    let word = neuron::glyph::analyze(pts, &vault.config);
-                    if let Some((name, score, _ru)) = vault.predict(&word) {
-                        let thr = vault.config.threshold.max(1e-6);
-                        let conf = (1.0 - score / (thr * 1.6)).clamp(0.0, 1.0) as f32;
-                        let locked = score <= thr;
-                        let action = cast.gestures.get(&name).cloned().unwrap_or_default();
-                        let mut view = wedge_view(&action);
-                        // the gesture NAME is what it's becoming; keep the action's icon (the intent)
-                        if matches!(view.glyph, crate::overlay::WedgeGlyph::Blank) {
-                            view = crate::overlay::WedgeView {
-                                glyph: crate::overlay::WedgeGlyph::Mark,
-                                title: name.clone(),
-                                value: None,
-                                tone: crate::overlay::Tone::Plain,
-                                meter: None,
-                            };
-                        } else {
-                            view.title = name.clone();
+                    let tip = pts.last().map(|c| (c.re, c.im)).unwrap_or((0.0, 0.0));
+                    let due = match last_predict_at.get() {
+                        None => true, // the first eligible tick always predicts, exactly as before
+                        Some(at) => {
+                            let lt = last_predict_tip.get();
+                            let moved = ((tip.0 - lt.0).powi(2) + (tip.1 - lt.1).powi(2)).sqrt();
+                            at.elapsed().as_millis() >= 60 || moved >= 24.0
                         }
-                        let ghost = vault.exemplar(&name).to_vec();
-                        overlay.hint(Some(crate::overlay::GlyphHint {
-                            view,
-                            confidence: conf,
-                            locked,
-                            ghost,
-                        }));
+                    };
+                    if due {
+                        last_predict_at.set(Some(std::time::Instant::now()));
+                        last_predict_tip.set(tip);
+                        let word = neuron::glyph::analyze(pts, &vault.config);
+                        if let Some((name, score, _ru)) = vault.predict(&word) {
+                            let thr = vault.config.threshold.max(1e-6);
+                            let conf = (1.0 - score / (thr * 1.6)).clamp(0.0, 1.0) as f32;
+                            let locked = score <= thr;
+                            let action = cast.gestures.get(&name).cloned().unwrap_or_default();
+                            let mut view = wedge_view(&action);
+                            // the gesture NAME is what it's becoming; keep the action's icon (the intent)
+                            if matches!(view.glyph, crate::overlay::WedgeGlyph::Blank) {
+                                view = crate::overlay::WedgeView {
+                                    glyph: crate::overlay::WedgeGlyph::Mark,
+                                    title: name.clone(),
+                                    value: None,
+                                    tone: crate::overlay::Tone::Plain,
+                                    meter: None,
+                                };
+                            } else {
+                                view.title = name.clone();
+                            }
+                            let ghost = vault.exemplar(&name).to_vec();
+                            overlay.hint(Some(crate::overlay::GlyphHint {
+                                view,
+                                confidence: conf,
+                                locked,
+                                ghost,
+                            }));
+                        }
                     }
                 }
             }
@@ -1656,7 +1683,7 @@ fn aim_tick(
         // re-pushing the ghost keeps the drag visually continuous. the depth pips ride along so
         // the "scroll descends here" affordance appears the moment overlapping windows are aimed.
         overlay.begin(s.map_mode_aim(hot, hot_realm, depth_pips));
-        overlay.push(&[(gx, gy)]);
+        overlay.push(vec![(gx, gy)]);
     }
     if sel_h != 0
         && bloomed.get() != sel_h
@@ -1786,7 +1813,7 @@ fn present(
                     });
                 }
                 let rel: Vec<(f32, f32)> = pts.iter().map(|c| (c.re as f32, c.im as f32)).collect();
-                ov.push(&rel);
+                ov.push(rel);
             },
         );
         if stop.load(Ordering::SeqCst) {
@@ -1918,7 +1945,9 @@ fn mirror_count(weak: &slint::Weak<AppWindow>, shared: &Shared) {
     });
 }
 
-fn post_status(weak: &slint::Weak<AppWindow>, line: String) {
+/// Post a one-line status to the live readout (shared by the weave service and sibling sessions
+/// like knockback — one definition, one behaviour).
+pub(crate) fn post_status(weak: &slint::Weak<AppWindow>, line: String) {
     let w = weak.clone();
     let _ = slint::invoke_from_event_loop(move || {
         if let Some(app) = w.upgrade() {

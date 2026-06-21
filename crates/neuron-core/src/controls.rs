@@ -180,14 +180,34 @@ pub fn listen_until(
     win::listen(seconds, stop, esc_stops, on_event, on_tick);
 }
 
+/// Inert non-Windows twin of [`listen_until`] (IDENTICAL signature). There is no Raw-Input source
+/// off-Windows yet, so `on_event` is NEVER called (no hardware edges to diff). But the resident
+/// worker's tick drives reload / inject / profile-apply commands, so this still pumps `on_tick`
+/// every ~50 ms (matching the Windows path's `tick % 10` throttle cadence) until `stop` is set or
+/// the optional `seconds` budget elapses. `esc_stops` is meaningless without a key source and is
+/// ignored. This keeps the GUI's config plumbing live cross-platform while input itself is dormant.
+///
+/// NOTE (seam tradeoff): `listen_until` is ONE function with a single stable signature, so a
+/// `#[cfg]` pair (Win32 body + inert body) is the right tool here — unlike the multi-primitive
+/// window-manager seam, which needed a trait to abstract 22 separate Win32 calls. Both arms keep
+/// byte-identical signatures so the caller is platform-agnostic.
 #[cfg(not(windows))]
 pub fn listen_until(
-    _seconds: Option<u64>,
-    _stop: &std::sync::atomic::AtomicBool,
+    seconds: Option<u64>,
+    stop: &std::sync::atomic::AtomicBool,
     _esc_stops: bool,
     _on_event: impl FnMut(&ControlEvent),
-    _on_tick: impl FnMut(),
+    mut on_tick: impl FnMut(),
 ) {
+    use std::time::Instant;
+    let start = Instant::now();
+    while seconds.map_or(true, |s| start.elapsed().as_secs() < s) {
+        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
+        on_tick();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 }
 
 // ─────────────────────────── the live spine: configs -> one Engine ───────────────────────────
@@ -700,11 +720,7 @@ pub fn load_rule_sidecars_except(excluded_file_name: &str) -> Vec<Rule> {
 }
 
 fn load_rule_sidecars_with(include: impl Fn(&str) -> bool) -> Vec<Rule> {
-    #[derive(serde::Deserialize, Default)]
-    struct RuleDoc {
-        #[serde(default)]
-        rules: Vec<Rule>,
-    }
+    use crate::engine::RuleDoc;
     let mut out = Vec::new();
     let Ok(rd) = std::fs::read_dir("profiles") else {
         return out;
@@ -1422,7 +1438,7 @@ mod win {
             let mut n_input = 0u32;
             let mut n_hid = 0u32;
             let start = Instant::now();
-            while seconds.is_none_or(|s| start.elapsed().as_secs() < s) {
+            while seconds.map_or(true, |s| start.elapsed().as_secs() < s) {
                 // A GUI worker thread (or any caller of `listen_until`) flips this to tear the
                 // loop down cleanly from another thread; the CLI passes a flag that is never set.
                 if stop.load(std::sync::atomic::Ordering::Relaxed) {

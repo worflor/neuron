@@ -976,8 +976,10 @@ mod tests {
         assert_eq!(PHOSPHOR.hex(), "#4af2b0");
         let mid = PHOSPHOR.lerp(TWIN, 0.5);
         assert!(mid != PHOSPHOR && mid != TWIN);
+        // a 120° hue rotation of a saturated colour must actually move it (the fields are u8,
+        // so a `<= 255` bound is vacuously true — assert the real behaviour instead).
         let r = PHOSPHOR.rotate_hue(120.0);
-        assert!(r.r <= 255 && r.g <= 255 && r.b <= 255);
+        assert!(r != PHOSPHOR, "120° rotation should change a saturated colour");
     }
 
     #[test]

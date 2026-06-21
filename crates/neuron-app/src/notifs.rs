@@ -89,12 +89,13 @@ fn decide(c: &Confirmation) -> Option<Act> {
     if !p.notif_enabled || !p.notif_kind_on(c.kind) {
         return None;
     }
-    let card = p.notif_place_code().map(|place| {
+    let card = p.notif_place_xy().map(|(nx, ny)| {
         let (title, body) = format_card(c);
         crate::overlay::WeaveMode::Notify {
             title,
             body,
-            place,
+            nx,
+            ny,
             panel: p.notif_panel,
         }
     });
@@ -222,7 +223,7 @@ pub fn fire_test() -> String {
     if !p.notif_enabled {
         return "notifications are off — enable them first".into();
     }
-    if p.notif_place_code().is_none() && !p.notif_audio {
+    if p.notif_place_xy().is_none() && !p.notif_audio {
         return "placement and audio are both off — turn one on to test".into();
     }
     // the kinds a user can act on (macro is opt-in per binding, never a global test).

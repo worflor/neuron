@@ -180,40 +180,26 @@ impl LiveRuntime {
     pub fn start(weak: slint::Weak<AppWindow>, armed: bool) -> Self {
         let id = NEXT_LIVE_ID.fetch_add(1, Ordering::SeqCst);
         let stop = Arc::new(AtomicBool::new(false));
-        #[cfg(not(windows))]
-        {
-            let _ = weak;
-            let _ = armed;
-            return LiveRuntime {
-                id,
-                stop,
-                handle: None,
-                armed: false,
-            };
-        }
-        #[cfg(windows)]
-        {
-            let worker_stop = stop.clone();
-            let (tx, rx) = channel();
+        let worker_stop = stop.clone();
+        let (tx, rx) = channel();
+        *LIVE_TX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((id, tx));
+        neuron::action::arm_input(armed);
+        let handle = std::thread::Builder::new()
+            .name("neuron-live-dispatch".into())
+            .spawn(move || run_worker(weak, worker_stop, rx))
+            .ok();
+        if handle.is_none() {
             *LIVE_TX
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((id, tx));
-            neuron::action::arm_input(armed);
-            let handle = std::thread::Builder::new()
-                .name("neuron-live-dispatch".into())
-                .spawn(move || run_worker(weak, worker_stop, rx))
-                .ok();
-            if handle.is_none() {
-                *LIVE_TX
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-            }
-            LiveRuntime {
-                id,
-                stop,
-                handle,
-                armed,
-            }
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        }
+        LiveRuntime {
+            id,
+            stop,
+            handle,
+            armed,
         }
     }
 
@@ -249,7 +235,13 @@ impl Drop for LiveRuntime {
 }
 
 /// The worker body: arm input, install the gaming hook, build the engine, run the listen loop.
-#[cfg(windows)]
+///
+/// PLATFORM-NEUTRAL: every callee here is portable or cfg-seamed at its source —
+/// [`neuron::controls::listen_until`] (Win32 Raw-Input pump on Windows, an inert tick-only loop
+/// off-Windows), [`neuron::hook`] (LL gaming hook on Windows, inert stubs off-Windows), and
+/// [`neuron::app_focus::AppFocusSwitch`] (foreground polling on Windows, `None` off-Windows). On a
+/// non-Windows host the loop still arms/builds the engine and processes reload/inject/profile
+/// commands on the tick — only hardware input edges are dormant (no source yet).
 fn run_worker(weak: slint::Weak<AppWindow>, stop: Arc<AtomicBool>, live_rx: Receiver<LiveCommand>) {
     use neuron::controls::{self, HoldEdges, InputEdge, MIC_TAP};
     use std::cell::RefCell;
@@ -532,20 +524,13 @@ fn run_worker(weak: slint::Weak<AppWindow>, stop: Arc<AtomicBool>, live_rx: Rece
     drop(hook);
 }
 
-#[cfg(not(windows))]
-fn run_worker(
-    _weak: slint::Weak<AppWindow>,
-    _stop: Arc<AtomicBool>,
-    _live_rx: Receiver<LiveCommand>,
-) {
-}
-
 // ── MOMENTARY MIC: the held push-to-talk / push-to-mute edge handling ─────────────────────────
 type MomentaryMap =
     std::cell::RefCell<std::collections::HashMap<neuron::engine::Trigger, (Option<String>, bool)>>;
 
-/// Open the mic VolumeCtl for a momentary action's (optional) device.
-#[cfg(windows)]
+/// Open the mic VolumeCtl for a momentary action's (optional) device. Cross-platform via the
+/// `audio` seam: off-Windows `VolumeCtl::open` returns `None` (no audio backend), so the whole
+/// momentary path falls through to a no-op without any cfg gating here.
 fn open_mic(device: &Option<String>) -> Option<neuron::audio::VolumeCtl> {
     neuron::audio::resolve_capture(device.as_deref())
         .and_then(|e| neuron::audio::VolumeCtl::open(&e.id))
@@ -553,7 +538,7 @@ fn open_mic(device: &Option<String>) -> Option<neuron::audio::VolumeCtl> {
 
 /// A trigger's DOWN edge: if it binds a momentary mic, capture the resting mute-state, flip the mic
 /// for the hold, and remember what to restore. Idempotent (a repeat down without an up is ignored).
-#[cfg(windows)]
+/// Off-Windows `open_mic` finds no handle, so this is a no-op — one definition, every target.
 fn momentary_press(
     rt: &std::cell::RefCell<neuron::controls::Runtime>,
     held: &MomentaryMap,
@@ -574,7 +559,6 @@ fn momentary_press(
 }
 
 /// A trigger's UP edge: restore the mic to its resting state.
-#[cfg(windows)]
 fn momentary_release(held: &MomentaryMap, trigger: &neuron::engine::Trigger) {
     if let Some((device, restore)) = held.borrow_mut().remove(trigger) {
         if let Some(ctl) = open_mic(&device) {
@@ -585,7 +569,6 @@ fn momentary_release(held: &MomentaryMap, trigger: &neuron::engine::Trigger) {
 
 /// Restore EVERY held mic and clear the map — the safety net for a config swap / daemon stop, so a
 /// momentary can never strand the mic flipped.
-#[cfg(windows)]
 fn momentary_release_all(held: &MomentaryMap) {
     for (_, (device, restore)) in held.borrow_mut().drain() {
         if let Some(ctl) = open_mic(&device) {
@@ -598,7 +581,6 @@ fn momentary_release_all(held: &MomentaryMap) {
 /// CLI daemon's `fire_trigger`. Runs every matching rule's host action, routes any daemon [`Intent`]
 /// (DPI / scroll / profile) to real device/profile state, single-presses a Turbo, and records the
 /// outcome into the shared status for the UI readout.
-#[cfg(windows)]
 fn fire_trigger(
     devices: &mut neuron::device::DeviceSession<'_>,
     rt: &mut neuron::controls::Runtime,
@@ -626,12 +608,10 @@ fn fire_trigger(
     Some(outcome)
 }
 
-#[cfg(windows)]
 struct AppIntentRunner<'a, 'reg> {
     devices: &'a mut neuron::device::DeviceSession<'reg>,
 }
 
-#[cfg(windows)]
 impl IntentRunner for AppIntentRunner<'_, '_> {
     fn run_intent(&mut self, intent: &neuron::action::Intent) -> String {
         run_intent(self.devices, intent)
@@ -641,7 +621,6 @@ impl IntentRunner for AppIntentRunner<'_, '_> {
 /// Carry out a daemon [`Intent`] against live device/profile state — the GUI port of the CLI's
 /// `run_intent`. The stateless Action layer has no device handle, so DPI/scroll/profile work lands
 /// here. Returns a short result line for the status readout.
-#[cfg(windows)]
 fn run_intent(
     devices: &mut neuron::device::DeviceSession<'_>,
     intent: &neuron::action::Intent,
@@ -697,7 +676,6 @@ fn run_intent(
         .unwrap_or_else(|| "instrument routed".into())
 }
 
-#[cfg(windows)]
 fn apply_profile_live(
     devices: &mut neuron::device::DeviceSession<'_>,
     name: &str,
@@ -720,7 +698,6 @@ fn apply_profile_live(
 
 /// Publish the current held-layer set into the status (so the header SHIFT pill reflects live
 /// HyperShift). Only posts when it changed (cheap on the hot path).
-#[cfg(windows)]
 fn publish_held(
     rt: &std::cell::RefCell<neuron::controls::Runtime>,
     status: &Arc<Mutex<LiveStatus>>,
@@ -761,7 +738,8 @@ pub fn set_gaming_policy(policy: neuron::writes::GamingMode) {
 
 /// (Re)install or uninstall the gaming-mode hook to match the current shared policy. Thin wrapper
 /// over `neuron::hook::reconcile`, which is idempotent and won't thrash an already-installed hook.
-#[cfg(windows)]
+/// Portable: `reconcile` is itself cfg-seamed (installs the LL hook on Windows, keeps the desired-
+/// policy carrier coherent + installs nothing off-Windows), so this helper compiles on all targets.
 fn install_gaming_hook(slot: &mut Option<neuron::hook::Hook>) {
     neuron::hook::reconcile(slot);
 }

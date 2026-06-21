@@ -453,6 +453,18 @@ component ChannelStrip inherits VerticalLayout {
 
 export component BindingsPanel inherits VerticalLayout {
     spacing: 0;
+    // The MACRO·PYTHON editor's vertical offset from the panel top — the cross-panel "author a
+    // macro" jump scrolls the page Flickable to this so the link lands ON the editor (see app.slint).
+    out property <length> macro-y: macro_row.absolute-position.y - root.absolute-position.y;
+    // the "add" chips below the macro editor call this — append a ready-to-edit helper line, seeding
+    // the `def macro(ctx):` wrapper when the box is empty, so a non-coder can build a working macro by
+    // clicking while a power user just types over it. Multi-line snippets arrive pre-indented.
+    function add-step(snippet: string) {
+        State.macro-source = State.macro-source == ""
+            ? "def macro(ctx):\n    \{snippet}"
+            : "\{State.macro-source}\n    \{snippet}";
+        State.note-macro-source(State.macro-source);
+    }
     property <string> edge-timing-input: "";
     // the stance segment is string-keyed in the engine but index-keyed in the Segment widget
     property <int> stance-idx: State.hypershift-mode == "hold" ? 0
@@ -707,10 +719,88 @@ export component BindingsPanel inherits VerticalLayout {
                 }
             }
 
+            // ── FEEL TIMING — the press grammar's forgiveness windows (feel.toml) ──
+            // hold = the tap↔hold cutoff (also smart-stance's tap-vs-momentary line) · gap = max
+            // silence between phrase presses before the rhythm dies · coyote = post-release tail
+            // that still counts. One callback mirrors the stance picker: load → set → save → reload.
+            HorizontalLayout {
+                spacing: 16px;
+                VerticalLayout { alignment: center; horizontal-stretch: 0; Mono { text: "FEEL TIMING"; color: Theme.text-dim; } }
+                // HOLD
+                VerticalLayout {
+                    alignment: center;
+                    horizontal-stretch: 1;
+                    HorizontalLayout {
+                        spacing: 7px;
+                        VerticalLayout { alignment: center; Mono { text: "hold"; color: Theme.text-faint; } }
+                        VerticalLayout {
+                            alignment: center;
+                            horizontal-stretch: 1;
+                            Slider {
+                                compact: true;
+                                minimum: 80;
+                                maximum: 600;
+                                step: 10;
+                                value: State.feel-hold-ms;
+                                wheel: false;   // each change rewrites feel.toml + reloads — never on a stray wheel
+                                changed(v) => { State.set-feel-timing(v, State.feel-gap-ms, State.feel-coyote-ms); }
+                            }
+                        }
+                        VerticalLayout { alignment: center; min-width: 48px; Mono { text: State.feel-hold-ms + "ms"; color: Theme.text; horizontal-alignment: right; } }
+                    }
+                }
+                // GAP
+                VerticalLayout {
+                    alignment: center;
+                    horizontal-stretch: 1;
+                    HorizontalLayout {
+                        spacing: 7px;
+                        VerticalLayout { alignment: center; Mono { text: "gap"; color: Theme.text-faint; } }
+                        VerticalLayout {
+                            alignment: center;
+                            horizontal-stretch: 1;
+                            Slider {
+                                compact: true;
+                                minimum: 40;
+                                maximum: 400;
+                                step: 10;
+                                value: State.feel-gap-ms;
+                                wheel: false;
+                                changed(v) => { State.set-feel-timing(State.feel-hold-ms, v, State.feel-coyote-ms); }
+                            }
+                        }
+                        VerticalLayout { alignment: center; min-width: 48px; Mono { text: State.feel-gap-ms + "ms"; color: Theme.text; horizontal-alignment: right; } }
+                    }
+                }
+                // COYOTE
+                VerticalLayout {
+                    alignment: center;
+                    horizontal-stretch: 1;
+                    HorizontalLayout {
+                        spacing: 7px;
+                        VerticalLayout { alignment: center; Mono { text: "coyote"; color: Theme.text-faint; } }
+                        VerticalLayout {
+                            alignment: center;
+                            horizontal-stretch: 1;
+                            Slider {
+                                compact: true;
+                                minimum: 0;
+                                maximum: 200;
+                                step: 10;
+                                value: State.feel-coyote-ms;
+                                wheel: false;
+                                changed(v) => { State.set-feel-timing(State.feel-hold-ms, State.feel-gap-ms, v); }
+                            }
+                        }
+                        VerticalLayout { alignment: center; min-width: 48px; Mono { text: State.feel-coyote-ms + "ms"; color: Theme.text; horizontal-alignment: right; } }
+                    }
+                }
+            }
+
             Divider {}
 
             // ── audio actions (folded-in Audio: mic + output) + macro authoring ──
-            HorizontalLayout {
+            macro_row := HorizontalLayout {
                 spacing: Theme.gap-col;
                 // AUDIO — the Core-Audio chain as a tiny mixing console: capture (MIC) over render
                 // (OUT), two identical channel strips. Each is also bindable on the spine
@@ -762,7 +852,9 @@ export component BindingsPanel inherits VerticalLayout {
                     horizontal-stretch: 1;
                     spacing: 11px;
                     HorizontalLayout {
-                        SectionTitle { text: "MACRO · PYTHON"; }
+                        spacing: 8px;
+                        SectionTitle { text: "MACRO"; }
+                        VerticalLayout { alignment: center; Mono { text: "a script you bind to a trigger"; color: Theme.text-faint; font-size: Theme.fs-small; } }
                         Rectangle {}
                         if State.macro-busy : Pill { text: "WORKING"; live: true; }
                     }
@@ -770,16 +862,30 @@ export component BindingsPanel inherits VerticalLayout {
                         spacing: 7px;
                         VerticalLayout { alignment: center; Mono { text: "NAME"; color: Theme.text-dim; } }
                         Field {
-                            field-width: 180px;
-                            placeholder: "macro name (e.g. paste_clean)";
+                            field-width: 200px;
+                            placeholder: "name it · e.g. paste_clean";
                             text <=> State.macro-name;
                         }
                         Rectangle {}
                     }
+                    // BUILD BY CLICKING — a toolbar: each chip drops a ready-to-edit line into the
+                    // editor below (the first click adds the `def macro(ctx):` wrapper); or just type.
+                    HorizontalLayout {
+                        spacing: 6px;
+                        VerticalLayout { alignment: center; Mono { text: "add"; color: Theme.text-faint; font-size: Theme.fs-small; } }
+                        Pill { text: "type text"; clickable: true; clicked => { root.add-step("neuron.type_text(\"hello\")"); } }
+                        Pill { text: "hotkey"; clickable: true; clicked => { root.add-step("neuron.hotkey(\"ctrl\", \"c\")"); } }
+                        Pill { text: "clipboard"; clickable: true; clicked => { root.add-step("neuron.clipboard_set(\"text\")"); } }
+                        Pill { text: "run app"; clickable: true; clicked => { root.add-step("neuron.run(\"notepad\")"); } }
+                        Pill { text: "ask"; clickable: true; clicked => { root.add-step("if neuron.ask(\"ready?\"):\n        neuron.notify(\"go\")"); } }
+                        Pill { text: "notify"; clickable: true; clicked => { root.add-step("neuron.notify(\"done\")"); } }
+                        Rectangle {}
+                    }
                     CodeArea {
                         height: 150px;
-                        placeholder: "# real CPython — full power. def macro(ctx): is the entry.\n# import neuron  ->  ctx + key/type_text/clipboard_set/mouse/run/hotkey\n# or reach past it: import ctypes, subprocess … anything a program can do.\n\ndef macro(ctx):\n    neuron.clipboard_set((ctx.selection or '').upper())\n    neuron.hotkey('ctrl', 'v')";
+                        placeholder: "def macro(ctx):\n    neuron.type_text(\"hello!\")";
                         text <=> State.macro-source;
+                        edited(s) => { State.note-macro-source(s); }
                     }
                     HorizontalLayout {
                         spacing: 7px;
@@ -788,27 +894,28 @@ export component BindingsPanel inherits VerticalLayout {
                             busy: State.macro-busy;
                             clicked => { State.macro-check(State.macro-source); }
                         }
-                        Button {
-                            text: "save + register";
-                            primary: true;
+                        // SURFACES ITSELF once the macro contains an ask — previews JUST its beacon(s)
+                        // via the SYSTEM→BEACONS pipeline (disarmed, nothing real runs): learn asks by
+                        // seeing them, no docs in your face.
+                        if (State.macro-has-ask) : Button {
+                            text: "test asks";
                             busy: State.macro-busy;
-                            clicked => { State.macro-save(State.macro-name, State.macro-source); }
+                            clicked => { State.test-asks(State.macro-name, State.macro-source); }
                         }
                         Button {
-                            // the explicit execution verb — runs the macro once, now
+                            // runs it once for real — danger-tinted; SAFE-mode keeps its input harmless
                             text: "test run";
                             danger: true;
                             busy: State.macro-busy;
                             clicked => { State.macro-test(State.macro-name, State.macro-source); }
                         }
                         Rectangle {}
-                    }
-                    // one calm wrapping note instead of two hard lines clipping at the column edge
-                    Text {
-                        text: "warm CPython sidecar — full raw power (SAFE-mode gates the helper input, not raw ctypes). neuron.ask(\"deploy?\") pauses for a yes/no flick at your cursor; neuron.notify(\"done\") posts a status.";
-                        color: Theme.text-faint;
-                        font-family: Theme.mono; font-size: Theme.fs-small;
-                        wrap: word-wrap;
+                        Button {
+                            text: "save";
+                            primary: true;
+                            busy: State.macro-busy;
+                            clicked => { State.macro-save(State.macro-name, State.macro-source); }
+                        }
                     }
                     Mono { text: State.macro-status; color: Theme.text-mid; }
                     // after check: the defs found. after test: the macro's print()/traceback log.

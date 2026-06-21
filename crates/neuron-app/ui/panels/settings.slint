@@ -178,6 +178,196 @@ component Def inherits HorizontalLayout {
     VerticalLayout { horizontal-stretch: 1; Mono { text: root.desc; color: Theme.text-dim; wrap: word-wrap; } }
 }
 
+// SOUND PULSE — a sound-wave AURA that pulses OUT around the notification CARD (the puck). Toggling the
+// audio cue fires a strong pulse (rings bloom outward on ON, retreat inward on OFF); nudging the VOLUME
+// fires a soft one — and every pulse's reach scales with the volume, so the card itself reacts to the cue.
+// Re-triggerable (animation-tick driven) and gated by `live`, so it's perfectly still at rest.
+component RingPulse inherits Rectangle {
+    in property <bool> audio;
+    in property <float> amp;          // 0..1, the live volume
+    property <duration> t0;
+    property <bool> live: false;
+    property <bool> outward: true;    // ON blooms out, OFF retreats in
+    property <float> strength: 1.0;   // a toggle is a strong pulse; a volume nudge is soft
+    // 0→1 over the pulse, frozen (and dependency-free, so no repaint) when not live
+    property <float> p: root.live ? max(0.0, min(1.0, (animation-tick() - root.t0) / 660ms)) : 1.0;
+    Timer { interval: 700ms; running: root.live; triggered => { root.live = false; } }
+    function fire(out: bool, strong: float) {
+        root.outward = out;
+        root.strength = strong;
+        root.t0 = animation-tick();
+        root.live = true;
+    }
+    changed audio => { root.fire(root.audio, 1.0); }   // toggle: strong, direction = new state
+    changed amp => { root.fire(true, 0.5); }            // volume: a soft outward nudge
+    background: transparent;
+    // three concentric rings, staggered, each tracing the card's rounded rect and blooming outward
+    for k in [0, 1, 2] : Rectangle {
+        property <float> rp: max(0.0, min(1.0, root.p * 1.34 - k * 0.17));
+        property <float> ef: root.outward ? (1.0 - (1.0 - self.rp) * (1.0 - self.rp)) : (1.0 - self.rp);
+        property <length> grow: (8px + 20px * root.amp * root.strength) * self.ef;
+        x: -self.grow;
+        y: -self.grow;
+        width: parent.width + 2 * self.grow;
+        height: parent.height + 2 * self.grow;
+        border-radius: Theme.radius-sm + self.grow;   // trace the CARD's corner, blooming outward
+        background: transparent;
+        border-width: 1.5px;
+        border-color: Theme.accent.with-alpha((1.0 - self.rp) * 0.5 * root.strength);
+    }
+}
+
+// NOTIFICATION PLACER — a mock monitor you drop the confirmation card onto. Drag it anywhere; it's
+// MAGNETICALLY drawn to a 3×3 grid of clean spots (the named corners/edges + their centres), but you
+// can release on any free pixel ("custom"). The five NAMED presets light when the card rests on them;
+// "off" dims the screen (audio-only). Everything commits through ONE call — set-notif-pos(x,y) — and
+// Rust canonicalises an exact spot back to its preset slug. (The page Flickable is interactive:false,
+// so this drag never fights a page scroll.)
+component NotifPlacer inherits Rectangle {
+    property <bool> off: State.notif-placement == "off";
+    property <length> inset: 16px;          // keeps the card off the very bezel
+    property <length> puck-w: 62px;
+    property <length> puck-h: 22px;
+    property <length> track-w: self.width - 2 * self.inset - self.puck-w;   // travel for the card's left edge
+    property <length> track-h: self.height - 2 * self.inset - self.puck-h;
+    property <bool> dragging: false;
+    property <float> drag-x;
+    property <float> drag-y;
+    // the live anchor the puck shows: the drag while dragging, else the saved truth
+    property <float> ax: self.dragging ? self.drag-x : State.notif-x;
+    property <float> ay: self.dragging ? self.drag-y : State.notif-y;
+
+    // per-axis magnet: snap to 0 / 0.5 / 1 within a threshold, free everywhere else
+    pure function snap1(v: float) -> float {
+        if (v < 0.12) { return 0.0; }
+        if (v > 0.88) { return 1.0; }
+        if (v > 0.4 && v < 0.6) { return 0.5; }
+        return v;
+    }
+    // pointer (relative to the screen) → the snapped normalised anchor (the card's CENTRE follows you)
+    function place-at(mx: length, my: length) {
+        self.drag-x = self.snap1(max(0.0, min(1.0, (mx - self.puck-w / 2 - self.inset) / self.track-w)));
+        self.drag-y = self.snap1(max(0.0, min(1.0, (my - self.puck-h / 2 - self.inset) / self.track-h)));
+    }
+
+    min-width: 348px; max-width: 348px;   // pin the mock screen's width (can't also set `width`)
+    height: 196px;
+    border-radius: 7px;
+    background: @linear-gradient(180deg, #0a0c11 0%, #060709 100%);   // a faint screen sheen
+    border-width: Theme.hair;
+    border-color: Theme.line;
+    clip: true;
+    opacity: root.off ? 0.4 : 1.0;
+    animate opacity { duration: Theme.quick; }
+
+    // faint screen structure — the centre cross the magnet pulls toward
+    Rectangle { x: parent.width / 2 - 0.5px; y: root.inset; width: 1px; height: parent.height - 2 * root.inset; background: Theme.line-soft; }
+    Rectangle { x: root.inset; y: parent.height / 2 - 0.5px; width: parent.width - 2 * root.inset; height: 1px; background: Theme.line-soft; }
+
+    // the five NAMED preset SNAP DOTS — quiet little targets, NOT card-like boxes. The one the card is
+    // parked on hides (the card itself marks the spot), so a resting card never sits inside a stray square.
+    for ps in [
+        {nx: 0.0, ny: 0.0}, {nx: 0.5, ny: 0.0}, {nx: 1.0, ny: 0.0},
+        {nx: 0.0, ny: 1.0}, {nx: 1.0, ny: 1.0},
+    ] : Rectangle {
+        property <bool> lit: root.ax > ps.nx - 0.01 && root.ax < ps.nx + 0.01
+            && root.ay > ps.ny - 0.01 && root.ay < ps.ny + 0.01;
+        width: 6px; height: 6px; border-radius: 3px;
+        x: root.inset + root.puck-w / 2 - self.width / 2 + ps.nx * root.track-w;
+        y: root.inset + root.puck-h / 2 - self.height / 2 + ps.ny * root.track-h;
+        background: Theme.text-faint.with-alpha(0.5);
+        opacity: self.lit ? 0.0 : 1.0;
+        animate opacity { duration: Theme.quick; }
+    }
+
+    // the sound-wave AURA — rings bloom from around the CARD itself (and follow it as it moves),
+    // clipped to the screen. Pulses on audio toggle + volume; see RingPulse.
+    sound := RingPulse {
+        x: root.inset + root.ax * root.track-w;
+        y: root.inset + root.ay * root.track-h;
+        width: root.puck-w; height: root.puck-h;
+        audio: State.notif-audio; amp: State.notif-volume;
+        animate x, y { duration: Theme.press-throw; easing: ease-out; }
+    }
+
+    // THE CARD — the confirmation card in miniature; drag it anywhere
+    puck := Rectangle {
+        width: root.puck-w; height: root.puck-h;
+        x: root.inset + root.ax * root.track-w;
+        y: root.inset + root.ay * root.track-h;
+        border-radius: Theme.radius-sm;
+        // mirrors the real card: a grounded squircle (fill + border) when "card background" is ON, and
+        // the background REMOVED when it's OFF — the card floats as just its content (lamp + lines). The
+        // off state fades to the SAME hue at zero alpha (never `transparent`), so it dissolves cleanly.
+        background: State.notif-panel ? (root.dragging ? Theme.well-hi : Theme.well) : Theme.well.with-alpha(0);
+        border-width: Theme.hair;
+        border-color: State.notif-panel ? (root.dragging ? Theme.accent : Theme.accent-line) : Theme.accent-line.with-alpha(0);
+        animate x, y { duration: Theme.press-throw; easing: ease-out; }   // a weighty magnetic settle
+        animate background, border-color { duration: Theme.quick; }
+        HorizontalLayout {
+            padding-left: 7px; padding-right: 7px; spacing: 6px;
+            VerticalLayout { alignment: center; Rectangle { width: 5px; height: 5px; border-radius: 3px; background: Theme.accent; } }
+            VerticalLayout {
+                alignment: center; spacing: 3px;
+                Rectangle { height: 2px; width: 28px; border-radius: 1px; background: Theme.text-faint; }
+                Rectangle { height: 2px; width: 18px; border-radius: 1px; background: Theme.line; }
+            }
+        }
+    }
+
+    // the whole screen is the drag surface: press to place, drag to move, magnetic on the grid
+    ta := TouchArea {
+        mouse-cursor: root.dragging ? MouseCursor.grabbing : MouseCursor.grab;
+        moved => { if (root.dragging) { root.place-at(self.mouse-x, self.mouse-y); } }
+        pointer-event(e) => {
+            if (e.kind == PointerEventKind.down) {
+                root.dragging = true;
+                root.place-at(self.mouse-x, self.mouse-y);
+            } else if (e.kind == PointerEventKind.up) {
+                if (root.dragging) {
+                    // optimistic local write first so the puck doesn't flicker when `dragging` clears,
+                    // then persist (Rust re-pushes the same resolved x/y + the preset/custom slug).
+                    State.notif-x = root.drag-x;
+                    State.notif-y = root.drag-y;
+                    State.set-notif-pos(root.drag-x, root.drag-y);
+                    root.dragging = false;
+                }
+            }
+        }
+    }
+}
+
+// One "which change earns a card" row — a full-width toggle chip (name + what it is + a lit dot), so
+// the event TYPES read as a tidy stack beside the placer instead of a cramped pill row.
+component NotifTypeChip inherits Rectangle {
+    in property <string> label;
+    in property <string> desc;
+    in property <bool> on;
+    callback toggled();
+    height: 24px;
+    border-radius: Theme.radius-sm;
+    background: root.on ? Theme.accent-glow : (ta.has-hover ? Theme.well : Theme.bg-2);
+    border-width: Theme.hair;
+    border-color: root.on ? Theme.accent-line : (ta.has-hover ? Theme.text-faint : Theme.line);
+    animate background, border-color { duration: Theme.quick; }
+    HorizontalLayout {
+        padding-left: 10px; padding-right: 10px; spacing: 9px;
+        VerticalLayout {
+            alignment: center;
+            Text { text: root.label; color: root.on ? Theme.accent : Theme.text-mid; font-family: Theme.mono; font-size: Theme.fs-small; font-weight: 700; vertical-alignment: center; }
+        }
+        VerticalLayout {
+            alignment: center; horizontal-stretch: 1;
+            Text { text: root.desc; color: Theme.text-faint; font-family: Theme.mono; font-size: Theme.fs-small; vertical-alignment: center; overflow: elide; }
+        }
+        VerticalLayout {
+            alignment: center;
+            Rectangle { width: 5px; height: 5px; border-radius: 3px; background: root.on ? Theme.accent : Theme.text-faint; animate background { duration: Theme.quick; } }
+        }
+    }
+    ta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.toggled(); } }
+}
+
 export component SettingsPanel inherits VerticalLayout {
     spacing: 0;
     // curated accent hues — a quiet phosphor spread (the default first). Picking one recolours the
@@ -260,7 +450,21 @@ export component SettingsPanel inherits VerticalLayout {
                     }
                     Mono { text: "double-clicking the tray icon always opens the window."; color: Theme.text-faint; wrap: word-wrap; }
                     Divider {}
-                    SectionTitle { text: "BEACONS"; }
+                    // BEACONS header: the section title plus a right-aligned quick-jump to the macro
+                    // authoring area (INPUT → DIRECT, where MACRO · PYTHON lives) so the registry and
+                    // the place you write/edit these macros are one click apart.
+                    HorizontalLayout {
+                        alignment: space-between;
+                        SectionTitle { text: "BEACONS"; }
+                        VerticalLayout {
+                            alignment: center;
+                            Pill {
+                                text: "author a macro →";
+                                clickable: true;
+                                clicked => { State.macro-jump-pending = true; State.input-view = 0; State.goto-page(2); }
+                            }
+                        }
+                    }
                     // condensed: WHAT a beacon is + how you answer one. The old paragraph also described
                     // an on/off "wait for fullscreen" option that has no control — dropped; the live
                     // registry below is the real surface (a macro's beacon, visible the moment it exists).
@@ -280,18 +484,24 @@ export component SettingsPanel inherits VerticalLayout {
                         color: Theme.text-faint;
                         wrap: word-wrap;
                     }
-                    // one row per macro that calls neuron.ask: a live lamp (lit while THAT macro's beacon
-                    // is on screen now), the macro + its question(s), and a TEST that mock-fires it — the
-                    // real ask rises, but input is disarmed for that fire so none of its real actions run.
-                    for m in State.beacon-macros : HorizontalLayout {
+                    // one row per macro that calls neuron.ask: the dot = a steady "armed beacon macro"
+                    // light that brightens while its ask is on screen, the macro + its question(s), a
+                    // TEST that mock-fires it (the real ask rises, but input is disarmed for that fire so
+                    // none of its real actions run), and a two-click-confirm delete of its .py.
+                    for m in State.beacon-macros : row := HorizontalLayout {
                         spacing: 8px;
+                        // first click ARMS the delete (relabels + reddens); second click (while armed)
+                        // actually deletes. No timeout — it simply stays armed until clicked again.
+                        property <bool> armed: false;
                         VerticalLayout {
                             alignment: center;
                             Rectangle {
                                 width: 6px; height: 6px; border-radius: 1px;
-                                background: (State.beacon-active && State.beacon-macro == m.name)
-                                    ? Theme.accent : Theme.text-faint;
-                                animate background { duration: Theme.quick; }
+                                background: Theme.accent;
+                                // ~0.3 = a soft always-on "this is a loaded/armed beacon macro" light;
+                                // 1.0 = its ask is on screen right now.
+                                opacity: (State.beacon-active && State.beacon-macro == m.name) ? 1.0 : 0.3;
+                                animate opacity { duration: Theme.quick; }
                             }
                         }
                         VerticalLayout {
@@ -304,6 +514,21 @@ export component SettingsPanel inherits VerticalLayout {
                         VerticalLayout {
                             alignment: center;
                             Button { text: "test"; clicked => { State.test-beacon(m.name); } }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            Pill {
+                                text: row.armed ? "sure?" : "×";
+                                tint: row.armed ? Theme.warn : Theme.text-faint;
+                                clickable: true;
+                                clicked => {
+                                    if (row.armed) {
+                                        State.delete-beacon(m.name);
+                                    } else {
+                                        row.armed = true;
+                                    }
+                                }
+                            }
                         }
                     }
                     Divider {}
@@ -584,24 +809,56 @@ export component SettingsPanel inherits VerticalLayout {
                             checked: State.notif-enabled;
                             toggled(v) => { State.set-notif-enabled(v); }
                         }
-                        // placement — where the card lands (OFF = no card)
-                        HorizontalLayout {
-                            spacing: 12px;
-                            VerticalLayout { alignment: center; Mono { text: "WHERE"; color: Theme.text-dim; } }
-                            Segment {
-                                options: ["OFF", "TOP L", "TOP R", "BOT L", "BOT R", "INLINE"];
-                                min-seg: 56px;
-                                index: (State.notif-placement == "off" ? 0
-                                    : State.notif-placement == "top-left" ? 1
-                                    : State.notif-placement == "top-right" ? 2
-                                    : State.notif-placement == "bottom-left" ? 3
-                                    : State.notif-placement == "bottom-right" ? 4
-                                    : 5);
-                                picked(i) => { State.set-notif-placement(
-                                    i == 0 ? "off" : i == 1 ? "top-left" : i == 2 ? "top-right"
-                                    : i == 3 ? "bottom-left" : i == 4 ? "bottom-right" : "inline"); }
+                        // placement — a mock monitor you drop the card onto (drag anywhere; the named
+                        // presets pull it in magnetically; OFF dims it to audio-only). The card TYPES —
+                        // which changes earn a card — fill the space to the right of the screen.
+                        VerticalLayout {
+                            spacing: 9px;
+                            HorizontalLayout {
+                                spacing: 10px;
+                                VerticalLayout { alignment: center; Mono { text: "WHERE"; color: Theme.text-dim; } }
+                                VerticalLayout {
+                                    alignment: center;
+                                    Mono {
+                                        text: State.notif-placement == "off" ? "off · audio only"
+                                            : State.notif-placement == "custom" ? "custom placement"
+                                            : State.notif-placement;
+                                        color: State.notif-placement == "off" ? Theme.text-faint : Theme.text-mid;
+                                    }
+                                }
+                                Rectangle {}
+                                VerticalLayout {
+                                    alignment: center;
+                                    Pill {
+                                        text: "off";
+                                        clickable: true;
+                                        selected: State.notif-placement == "off";
+                                        clicked => {
+                                            if (State.notif-placement == "off") {
+                                                State.set-notif-pos(State.notif-x, State.notif-y);   // re-enable at the remembered spot
+                                            } else {
+                                                State.set-notif-placement("off");
+                                            }
+                                        }
+                                    }
+                                }
                             }
-                            Rectangle {}
+                            HorizontalLayout {
+                                spacing: Theme.gap-col;
+                                NotifPlacer {}
+                                // the card TYPES — a tidy stack sized to the screen's height
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    spacing: 6px;
+                                    Mono { text: "WHICH CHANGES EARN A CARD"; color: Theme.text-dim; }
+                                    NotifTypeChip { label: "dpi"; desc: "pointer DPI"; on: State.notif-dpi; toggled => { State.set-notif-event("dpi", !State.notif-dpi); } }
+                                    NotifTypeChip { label: "sensitivity"; desc: "scroll modes"; on: State.notif-scroll; toggled => { State.set-notif-event("scroll", !State.notif-scroll); } }
+                                    NotifTypeChip { label: "polling"; desc: "report rate"; on: State.notif-polling; toggled => { State.set-notif-event("polling", !State.notif-polling); } }
+                                    NotifTypeChip { label: "brightness"; desc: "LED brightness"; on: State.notif-brightness; toggled => { State.set-notif-event("brightness", !State.notif-brightness); } }
+                                    NotifTypeChip { label: "profile"; desc: "active profile"; on: State.notif-profile; toggled => { State.set-notif-event("profile", !State.notif-profile); } }
+                                    NotifTypeChip { label: "layer"; desc: "HyperShift layer"; on: State.notif-layer; toggled => { State.set-notif-event("layer", !State.notif-layer); } }
+                                }
+                            }
                         }
                         // card background — the grounded squircle (app-card chrome) vs the floating spell.
                         Toggle {
@@ -643,22 +900,6 @@ export component SettingsPanel inherits VerticalLayout {
                                     index: (State.notif-sound == "warm" ? 1 : State.notif-sound == "glass" ? 2 : 0);
                                     picked(i) => { State.set-notif-sound(i == 1 ? "warm" : i == 2 ? "glass" : "pulse"); }
                                 }
-                                Rectangle {}
-                            }
-                        }
-                        // which events earn a card — lit CHIPS, not a wall of switches. Tap to toggle:
-                        // a chip glows accent when that change will raise a card, dark when it won't.
-                        VerticalLayout {
-                            spacing: 7px;
-                            Mono { text: "WHICH CHANGES EARN A CARD"; color: Theme.text-dim; }
-                            HorizontalLayout {
-                                spacing: 8px;
-                                Pill { text: "dpi"; clickable: true; selected: State.notif-dpi; clicked => { State.set-notif-event("dpi", !State.notif-dpi); } }
-                                Pill { text: "sensitivity"; clickable: true; selected: State.notif-scroll; clicked => { State.set-notif-event("scroll", !State.notif-scroll); } }
-                                Pill { text: "polling"; clickable: true; selected: State.notif-polling; clicked => { State.set-notif-event("polling", !State.notif-polling); } }
-                                Pill { text: "brightness"; clickable: true; selected: State.notif-brightness; clicked => { State.set-notif-event("brightness", !State.notif-brightness); } }
-                                Pill { text: "profile"; clickable: true; selected: State.notif-profile; clicked => { State.set-notif-event("profile", !State.notif-profile); } }
-                                Pill { text: "layer"; clickable: true; selected: State.notif-layer; clicked => { State.set-notif-event("layer", !State.notif-layer); } }
                                 Rectangle {}
                             }
                         }
