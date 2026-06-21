@@ -37,7 +37,8 @@ Thumbs.db
 /backups/
 /macros/
 /reference/
-/profiles/
+profiles/
+__neuron_test_*.toml
 
 # Live user config — the app writes these from defaults; personal binds don't belong in source.
 # (covers both the repo root and the per-crate dev copies)
