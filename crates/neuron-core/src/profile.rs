@@ -359,7 +359,7 @@ impl ApplyReport {
 }
 
 /// All connected devices that have a `[lighting]` block (the lighting canvas spans them).
-fn lit_devices(reg: &Registry) -> Vec<(DeviceDef, u16, Vec<u16>)> {
+fn lit_devices(reg: &Registry) -> Vec<(DeviceDef, u16, transport::DevicePath)> {
     let mut out = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
     if let Ok(infos) = transport::enumerate() {

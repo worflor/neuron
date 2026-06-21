@@ -2,7 +2,7 @@
 
 use crate::protocol::{Report, Status, BUF_LEN};
 use crate::registry::{CommandSpec, DeviceDef};
-use crate::transport::{self, Transport};
+use crate::transport::{self, DevicePath, Transport};
 use anyhow::{bail, Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -15,7 +15,7 @@ pub struct Device {
 
 impl Device {
     /// Open a specific enumerated control interface path for `(def, pid)`.
-    pub fn open_path(def: DeviceDef, pid: u16, path: &[u16]) -> Result<Self> {
+    pub fn open_path(def: DeviceDef, pid: u16, path: &DevicePath) -> Result<Self> {
         let transport = transport::open_path(path)?;
         Ok(Device {
             def,

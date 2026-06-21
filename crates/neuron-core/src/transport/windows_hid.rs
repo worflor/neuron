@@ -2,7 +2,7 @@
 //! open the control collection with dwDesiredAccess = 0 (Windows blocks GENERIC_R/W on a
 //! mouse, but HidD_Get/SetFeature use FILE_ANY_ACCESS IOCTLs, so access=0 works).
 
-use super::{HidDeviceInfo, Transport};
+use super::{DevicePath, HidDeviceInfo, Transport};
 use anyhow::{bail, Result};
 use std::ffi::c_void;
 use std::ptr;
@@ -64,7 +64,9 @@ unsafe fn query(path: &[u16]) -> Option<HidDeviceInfo> {
                     usage_page: caps.UsagePage,
                     usage: caps.Usage,
                     feature_len: caps.FeatureReportByteLength,
-                    path: path.to_vec(),
+                    // `path` is the NUL-terminated wide buffer from `wide_from_ptr`; store it as the
+                    // opaque key (NUL stripped) — `WinHid::open` re-adds it via `to_wide_nul`.
+                    path: DevicePath::from_wide(path),
                 });
             }
             HidD_FreePreparsedData(pp);
@@ -139,10 +141,13 @@ pub struct WinHid {
 }
 
 impl WinHid {
-    pub fn open(path: &[u16]) -> Result<Self> {
+    pub fn open(path: &DevicePath) -> Result<Self> {
+        // Re-add the NUL terminator `CreateFileW` requires (centralized in `to_wide_nul`). This
+        // reproduces the exact wide buffer the enumeration path passed to `CreateFileW`.
+        let wide = path.to_wide_nul();
         unsafe {
             let h = CreateFileW(
-                path.as_ptr(),
+                wide.as_ptr(),
                 0,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 ptr::null(),
