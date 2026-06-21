@@ -1,0 +1,64 @@
+# neuron-app — the resident GUI + tray app (Slint, software renderer, near-zero idle, event
+# loop alive with no window shown). The ONE long-lived process: tray icon, global hotkey loops,
+# device-runtime daemon, lazily-created Slint window. Depends on neuron-core for all logic
+# (in-process, no IPC).
+#
+# Dependency set (added by the GUI agent, coordinated with Integration):
+#   slint + slint-build  — declarative UI; software renderer; winit-backed event loop that
+#                           stays alive with no window shown (tray-resident).
+#   tray-icon            — the 90%-surface system-tray menu.
+#   global-hotkey        — OS-wide hotkeys (profile quick-switch, HyperShift toggle).
+#   image                — decode the embedded tray icon PNG at startup.
+[package]
+name = "neuron-app"
+description = "Neuron resident app — tray + Slint GUI for the anti-Synapse."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "neuron-app"
+path = "src/main.rs"
+
+[dependencies]
+neuron = { path = "../neuron-core" }
+serde.workspace = true
+toml.workspace = true
+anyhow.workspace = true
+slint = { version = "1.16", default-features = false, features = ["compat-1-2", "std", "backend-winit", "renderer-software"] }
+tray-icon = "0.24"
+global-hotkey = "0.8"
+image = { version = "0.25", default-features = false, features = ["png", "gif"] }
+cpal.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# Lock the main thread's COM apartment to STA before winit/tray-icon/Core-Audio touch COM —
+# winit's OleInitialize needs STA, while tray-icon + neuron-core's audio request MTA. Initializing
+# STA first wins; their later MTA requests fail harmlessly (RPC_E_CHANGED_MODE, ignored) yet work.
+windows-sys = { version = "0.59", features = [
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",                  # ShellExecuteW — summon LAUNCHES an app (Win+R resolution) when none is open
+    # control center — glance system state (no elevation): net medium + SSID + bluetooth presence
+    "Win32_NetworkManagement_IpHelper",# GetAdaptersAddresses — ethernet vs wifi + the online route
+    "Win32_NetworkManagement_Ndis",    # IF_OPER_STATUS / NET_LUID (IP_ADAPTER_ADDRESSES struct deps)
+    "Win32_Networking_WinSock",        # SOCKET_ADDRESS (IP_ADAPTER_ADDRESSES struct deps)
+    "Win32_NetworkManagement_WiFi",    # WlanOpenHandle/QueryInterface — the connected SSID
+    "Win32_Devices_Bluetooth",         # BluetoothFindFirstRadio — is a BT radio present (toggle seam)
+    # lifecycle armor (flight recorder + crash recovery):
+    "Win32_System_Threading",          # GetCurrentThreadId for flight-event attribution
+    "Win32_System_Recovery",           # RegisterApplicationRestart — the OS respawns us after a crash
+    "Win32_System_Diagnostics_Debug",  # SetUnhandledExceptionFilter — native faults leave a breadcrumb
+    "Win32_System_Kernel",             # EXCEPTION_POINTERS/CONTEXT for the SEH breadcrumb filter
+    # synapse purge (settings button): stop the respawning services, then terminate every process
+    "Win32_System_Diagnostics_ToolHelp", # CreateToolhelp32Snapshot — enumerate live processes by name
+    "Win32_System_Services",           # SCM: stop RzActionSvc/Razer Synapse Service/… so they can't respawn
+    "Win32_Security",                  # OpenProcessToken/TokenElevation — are we the elevated SYSTEM-killer
+] }
+
+[build-dependencies]
+slint-build = "1.16"

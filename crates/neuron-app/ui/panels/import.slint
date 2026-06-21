@@ -1,0 +1,151 @@
+import { Theme } from "../theme.slint";
+import { Card, SectionTitle, Label, Button, Field, Pill, Mono, Divider, Readout, PanelHead } from "../widgets/controls.slint";
+import { State } from "../state.slint";
+import { ImportLine } from "../models.slint";
+
+// IMPORT WIZARD — a one-time FLOW, not a nav seat. Launched as a modal overlay from Settings
+// (ESC or a click on the void closes it — the shell handles both). Ingests Synapse's plaintext
+// Export ZIPs via neuron-core import::import_export, previews the parsed features GROUPED BY WHAT
+// THEY ARE — scalar settings as one readout strip, bindings as trigger→action rows, skipped items
+// honestly under NOT MIGRATED — then applies the normalized Profile + spine Rules.
+
+export component ImportWizard inherits Card {
+    background: Theme.bg-2;
+    // the card swallows clicks so only the void around it closes the flow
+    TouchArea {}
+    VerticalLayout {
+        padding: 26px;
+        spacing: 14px;
+        // the shared PanelHead — same tick/label metrics as every other panel header
+        PanelHead {
+            label: "IMPORT FROM SYNAPSE";
+            caption: "one-time migration — plaintext, no crypto, no cloud · ESC closes";
+            VerticalLayout { width: 72px; alignment: center; Button { text: "close"; clicked => { State.import-open = false; } } }
+        }
+        Divider {}
+
+        HorizontalLayout {
+            spacing: 8px;
+            Field {
+                placeholder: "path to .synapse3 / .ChromaEffects";
+                field-width: 360px;
+                text <=> State.import-path;
+                accepted(t) => { State.parse-import(t); }
+            }
+            Button { text: "browse"; clicked => { State.browse-import(); } }
+            Button {
+                text: "parse";
+                primary: true;
+                clicked => { State.parse-import(State.import-path); }
+            }
+        }
+        // a parse that produced nothing-to-apply reads as caution, not normal info
+        Mono {
+            text: State.import-status;
+            color: !State.import-ready && State.import-path != "" && State.import-status != "" ? Theme.danger : Theme.text-mid;
+        }
+
+        Flickable {
+            viewport-width: self.width;   // bound the width so the word-wrap guidance Label reflows
+            VerticalLayout {
+                spacing: 10px;
+
+                // the guidance lives INSIDE the scroll region so it can never starve the apply bar at
+                // the min window — you act at the top, the detail scrolls with the preview
+                Label { text: "Synapse's in-app Export produces plaintext ZIPs (fake .synapse3 / .ChromaEffects extensions). Neuron reads them directly — settings, bindings, and static lighting migrate losslessly. Encrypted/cloud profiles are intentionally not touched."; }
+
+                // ── SETTINGS — the scalar values as a wrapping readout GRID (one row would overflow
+                // horizontally once there are more than a handful) ──
+                if State.import-perf.length > 0 : HorizontalLayout {
+                    SectionTitle { text: "SETTINGS"; }
+                    Rectangle {}
+                    Mono { text: State.import-perf.length + " value(s)"; color: Theme.text-faint; }
+                }
+                if State.import-perf.length > 0 : Rectangle {
+                    property <int> cols: 3;
+                    property <length> colw: self.width / self.cols;
+                    height: ceil(State.import-perf.length / self.cols) * 42px;
+                    for line[i] in State.import-perf : Readout {
+                        key: line.label;
+                        value: line.detail;
+                        x: mod(i, parent.cols) * parent.colw;
+                        y: floor(i / parent.cols) * 42px;
+                        width: parent.colw - 8px;
+                    }
+                }
+
+                // ── BINDINGS — trigger → action rows (what they will become) ──
+                if State.import-bindings.length > 0 : HorizontalLayout {
+                    SectionTitle { text: "BINDINGS"; }
+                    Rectangle {}
+                    Mono { text: State.import-bindings.length + " migrate"; color: Theme.text-faint; }
+                }
+                for line in State.import-bindings : Rectangle {
+                    height: 30px;
+                    border-radius: Theme.radius-sm;
+                    background: Theme.well;
+                    border-width: Theme.hair; border-color: Theme.line;
+                    HorizontalLayout {
+                        padding-left: 12px; padding-right: 12px; spacing: 8px;
+                        Text {
+                            text: line.label;
+                            color: Theme.text;
+                            font-size: Theme.fs-body; font-family: Theme.mono; font-weight: 600;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                        Text { text: "→"; color: Theme.text-faint; vertical-alignment: center; }
+                        Text {
+                            text: line.detail;
+                            color: Theme.text-mid;
+                            font-size: Theme.fs-body; font-family: Theme.mono;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                        Rectangle {}
+                    }
+                }
+
+                // ── NOT MIGRATED — honest about what stays behind ─────────
+                if State.import-notes.length > 0 : HorizontalLayout {
+                    SectionTitle { text: "NOT MIGRATED"; }
+                    Rectangle {}
+                    Mono { text: State.import-notes.length + " note(s)"; color: Theme.text-faint; }
+                }
+                for line in State.import-notes : HorizontalLayout {
+                    spacing: 7px;
+                    Text { text: "–"; color: Theme.warn; font-family: Theme.mono; vertical-alignment: center; }
+                    Mono { text: line.detail; color: Theme.text-dim; }
+                    Rectangle {}
+                }
+
+                if State.import-preview.length == 0 : Rectangle {
+                    height: 80px;
+                    VerticalLayout {
+                        alignment: center; spacing: 5px;
+                        Mono { text: "no file parsed yet"; color: Theme.text-dim; horizontal-alignment: center; }
+                        Mono { text: "choose a Synapse export above, then parse"; color: Theme.text-faint; horizontal-alignment: center; }
+                    }
+                }
+            }
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            Mono {
+                text: "applies to CONFIG FILES only — nothing touches a device until you apply the profile";
+                color: Theme.text-faint;
+                vertical-alignment: center;
+                overflow: elide;
+                horizontal-stretch: 1;
+            }
+            Rectangle {}
+            Button {
+                text: "apply import";
+                primary: true;
+                // a file-only write: the device-writes gate has no business here
+                enabled: State.import-ready;
+                clicked => { State.apply-import(); }
+            }
+        }
+    }
+}

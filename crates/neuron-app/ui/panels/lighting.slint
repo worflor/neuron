@@ -1,0 +1,434 @@
+import { Theme } from "../theme.slint";
+import { Card, SectionTitle, Label, Button, Field, Mono, Divider, PanelHead, Contact, Pill, Slider, Segment } from "../widgets/controls.slint";
+import { DeviceRender } from "../widgets/render.slint";
+import { State } from "../state.slint";
+import { EffectRow, LayerRow } from "../models.slint";
+
+// One row of the LAYERS stack — the whole row selects the layer; the lamp toggles it in the
+// composite, the arrows restack it, the ✕ removes it. The lit effect name + colour swatch read the
+// layer at a glance.
+component LayerLine inherits Rectangle {
+    in property <LayerRow> lr;
+    in property <int> index;
+    in property <bool> selected;
+    callback clicked();
+    callback toggled();
+    callback up();
+    callback down();
+    callback removed();
+    height: 34px;
+    border-radius: Theme.radius-sm;
+    background: selected ? Theme.bg-2 : (ta.has-hover ? Theme.well : transparent);
+    border-width: Theme.hair;
+    border-color: selected ? Theme.accent-line : Theme.line;
+    animate background, border-color { duration: Theme.quick; }
+    ta := TouchArea { clicked => { root.clicked(); } }
+    HorizontalLayout {
+        padding-left: 8px; padding-right: 6px; spacing: 7px;
+        // enabled lamp — click to mute/unmute the layer in the composite
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 15px; height: 15px; border-radius: 3px;
+                border-width: Theme.hair;
+                border-color: root.lr.enabled ? Theme.accent-line : Theme.line;
+                background: root.lr.enabled ? Theme.accent-glow : transparent;
+                animate background, border-color { duration: Theme.quick; }
+                TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.toggled(); } }
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 14px; height: 14px; border-radius: 3px;
+                background: root.lr.col; border-width: Theme.hair; border-color: Theme.line;
+                opacity: root.lr.enabled ? 1.0 : 0.4;
+                animate opacity { duration: Theme.quick; }
+            }
+        }
+        Text {
+            text: root.lr.effect;
+            color: root.lr.enabled ? (root.selected ? Theme.text : Theme.text-mid) : Theme.text-faint;
+            font-size: Theme.fs-body; font-family: Theme.mono; font-weight: 700;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+        }
+        if root.lr.blend != "normal" : VerticalLayout { alignment: center; Mono { text: root.lr.blend; color: Theme.text-faint; } }
+        if root.lr.region-count > 0 : VerticalLayout { alignment: center; Mono { text: "▦ " + root.lr.region-count; color: Theme.text-faint; } }
+        // restack ↑↓ — index 0 is the bottom; "up" raises it in the composite
+        VerticalLayout {
+            alignment: center;
+            Text {
+                text: "↑"; color: Theme.text-faint; font-size: Theme.fs-body; font-family: Theme.mono;
+                vertical-alignment: center;
+                TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.up(); } }
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            Text {
+                text: "↓"; color: Theme.text-faint; font-size: Theme.fs-body; font-family: Theme.mono;
+                vertical-alignment: center;
+                TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.down(); } }
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            Text {
+                text: "✕"; color: Theme.text-faint; font-size: Theme.fs-small; font-family: Theme.mono;
+                vertical-alignment: center;
+                xta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.removed(); } }
+            }
+        }
+    }
+}
+
+// LIGHTING — the open effects engine, render-first. The HERO is the device itself: an
+// auto-generated picture of the selected peripheral (chassis + its real LED topology) whose
+// cells are LIVE — apply an effect and the render runs it with the SAME frame math the device
+// does (a ~20Hz GUI mirror of render_frame; honest "~ live" badge because it's a reconstruction,
+// not a read-back). Two modes:
+//   EFFECTS — browse the firmware/computed banks; selecting previews+applies onto the render.
+//   PAINT   — the per-LED editor, painted DIRECTLY on the render (left paint, right erase,
+//             drag sweeps), then pushed to the device's custom-frame channel.
+// Honest accent: phosphor marks what the DEVICE is running; a hairline marks the cursor.
+
+export component LightingPanel inherits VerticalLayout {
+    spacing: 0;
+    // does the currently-selected effect take a colour at all?
+    property <bool> colour-relevant: State.selected-effect < 0
+        || State.selected-effect >= State.effects.length
+        || State.effects[State.selected-effect].uses-color;
+    // the swatch palette — one source of truth (hex string drives State, colour drives the fill)
+    property <[{hex: string, col: color}]> swatches: [
+        {hex: "4AF2B0", col: #4AF2B0}, {hex: "FFFFFF", col: #FFFFFF}, {hex: "FF3B30", col: #FF3B30},
+        {hex: "FF9500", col: #FF9500}, {hex: "FFD60A", col: #FFD60A}, {hex: "30D158", col: #30D158},
+        {hex: "0A84FF", col: #0A84FF}, {hex: "BF5AF2", col: #BF5AF2},
+    ];
+    // the generator effects a layer can be — the open FrameGen set (custom-frame streamed)
+    property <[string]> effect-types: ["static", "breathing", "spectrum", "colorwheel", "wave", "fire", "starlight", "reactive", "audiometer"];
+
+    // the live mirror: while an effect is applied/animating (and the user isn't painting),
+    // re-render the frame onto the device render at ~20Hz — the same math the device runs.
+    Timer {
+        interval: 50ms;
+        running: !State.light-paint-mode && State.grid-rows > 0 && State.sel-can-light;   // EFFECTS = the live composite mirror
+        triggered => { State.preview-tick(); }
+    }
+
+    PanelHead {
+        label: "LIGHTING";
+        caption: State.selected-device-name + " · layered effect studio — the matrix previews the composite you build";
+        // the write kill-switch surfaces here too (animate/push gate on it — say why they're dead)
+        if State.writes-paused : VerticalLayout { alignment: center; Pill { text: "WRITES PAUSED"; tint: Theme.danger; } }
+        VerticalLayout { width: 8px; }
+        VerticalLayout {
+            width: 184px;   // size to the two contacts so the segment doesn't balloon across the head
+            alignment: center;
+            HorizontalLayout {
+                spacing: 4px;
+                Contact {
+                    label: "EFFECTS";
+                    active: !State.light-paint-mode;
+                    clicked => { State.light-paint-mode = false; }
+                }
+                Contact {
+                    label: "PAINT";
+                    active: State.light-paint-mode;
+                    clicked => { State.light-paint-mode = true; }
+                }
+            }
+        }
+    }
+    Rectangle { height: Theme.hair; background: Theme.line; }
+    Rectangle { height: Theme.lead-in; }
+
+    // ── HERO: the device itself, lit live ─────────────────────────────────
+    // honest empty state: no lit device selected -> a dim chassis ghost, no fake LEDs. Same height
+    // as the live render so connecting a device doesn't jump the whole page 100px.
+    // a NON-lighting channel (a mic/output, or any device with no [lighting] block) has no RGB to
+    // tune — say so plainly instead of showing the previously-selected device's stale matrix.
+    if !State.sel-can-light : Rectangle {
+        height: 320px;
+        background: Theme.bg-2;
+        border-radius: Theme.radius;
+        border-width: Theme.hair; border-color: Theme.line;
+        VerticalLayout {
+            alignment: center;
+            spacing: 6px;
+            Mono {
+                text: State.selected-device-name == "—" ? "no device selected" : State.selected-device-name + " has no lighting";
+                color: Theme.text-dim; horizontal-alignment: center;
+            }
+            Mono {
+                text: State.selected-device-name == "—" ? "connect a Razer device, or pick a channel on DEVICE"
+                    : "this channel has no addressable RGB — pick a keyboard or mouse on DEVICE to tune lighting";
+                color: Theme.text-faint; horizontal-alignment: center; wrap: word-wrap;
+            }
+        }
+    }
+    if State.sel-can-light && State.grid-rows == 0 : Rectangle {
+        height: 320px;
+        background: Theme.bg-2;
+        border-radius: Theme.radius;
+        border-width: Theme.hair; border-color: Theme.line;
+        VerticalLayout {
+            alignment: center;
+            spacing: 6px;
+            Mono { text: "no lit device selected"; color: Theme.text-dim; horizontal-alignment: center; }
+            Mono { text: "connect one, or pick another channel on DEVICE"; color: Theme.text-faint; horizontal-alignment: center; }
+        }
+    }
+    if State.sel-can-light && State.grid-rows > 0 : VerticalLayout {
+        spacing: 6px;
+        HorizontalLayout {
+            Mono {
+                text: State.selected-device-name + " · " + State.grid-rows + " × " + State.grid-cols + " led";
+                color: Theme.text-faint;
+                overflow: elide;            // a long device name yields before colliding with the badge
+                horizontal-stretch: 1;
+            }
+            // honest about WHAT this is: ~ on the device only while we're streaming; otherwise it's a
+            // local preview of the composite — never a read-back of the device's current lighting.
+            if State.compositing : Mono {
+                text: "~ live on device";
+                color: Theme.accent-dim;
+            }
+            if !State.compositing && !State.light-paint-mode && !State.light-region-edit : Mono {
+                text: "preview only · not on your device";
+                color: Theme.text-faint;
+            }
+            if State.light-region-edit : Mono {
+                text: "paint the selected layer's region · L add · R remove";
+                color: Theme.accent;
+            }
+            if State.light-paint-mode : Mono {
+                text: "L paint · R erase · drag sweeps";
+                color: Theme.text-faint;
+            }
+        }
+        DeviceRender {
+            height: 280px;
+            rows: State.grid-rows;
+            cols: State.grid-cols;
+            px: State.grid-px;
+            kind: State.grid-kind;
+            editable: State.light-paint-mode || State.light-region-edit;
+            paint(i) => {
+                if (State.light-region-edit) { State.paint-region(i); }
+                else { State.paint-cell(i); }
+            }
+            erase(i) => {
+                if (State.light-region-edit) { State.erase-region(i); }
+                else { State.erase-cell(i); }
+            }
+        }
+    }
+    Rectangle { height: Theme.lead-in; }
+
+    // ── below the render: EFFECTS = the layer COMPOSITOR · PAINT = the per-LED editor ──────
+    if !State.light-paint-mode && State.sel-can-light : HorizontalLayout {
+        spacing: Theme.gap-col;
+        // ── the LAYERS stack — add · restack · mute · remove · apply ──────
+        VerticalLayout {
+            width: 330px;
+            spacing: 8px;
+            HorizontalLayout {
+                SectionTitle { text: "LAYERS"; }
+                Rectangle {}
+                Mono { text: State.light-layers.length + (State.light-layers.length == 1 ? " layer" : " layers"); color: Theme.text-faint; }
+            }
+            for lr[i] in State.light-layers : LayerLine {
+                lr: lr;
+                index: i;
+                selected: i == State.selected-layer;
+                clicked => { State.select-layer(i); }
+                toggled => { State.toggle-layer(i); }
+                up => { State.move-layer(i, 1); }
+                down => { State.move-layer(i, -1); }
+                removed => { State.remove-layer(i); }
+            }
+            if State.light-layers.length == 0 : VerticalLayout {
+                padding-top: 4px; spacing: 4px;
+                Mono { text: "no layers yet"; color: Theme.text-dim; }
+                Mono {
+                    text: "Neuron isn't driving this device's lighting — and it can't read another app's live theme (no per-LED read-back). add an effect to author your own.";
+                    color: Theme.text-faint;
+                    wrap: word-wrap;
+                }
+            }
+            Divider {}
+            Mono { text: "ADD LAYER"; color: Theme.text-dim; }
+            HorizontalLayout {
+                spacing: 5px;
+                for et in root.effect-types : Pill {
+                    text: et;
+                    clickable: true;
+                    clicked => { State.add-layer(et); }
+                }
+                Rectangle {}
+            }
+            // bring a Synapse theme across — we parse .ChromaEffects directly (frame → PAINT, effect → layer)
+            HorizontalLayout {
+                spacing: 7px;
+                Button { text: "import .ChromaEffects"; clicked => { State.import-light-file(); } }
+                Rectangle {}
+            }
+            Rectangle { height: 2px; }
+            HorizontalLayout {
+                spacing: 7px;
+                Button {
+                    text: State.compositing ? "restart" : "apply live";
+                    primary: true;
+                    enabled: State.light-layers.length > 0 && !State.writes-paused;
+                    clicked => { State.composite-apply(); }
+                }
+                Button { text: "stop"; danger: true; enabled: State.compositing; clicked => { State.composite-stop(); } }
+                Rectangle {}
+            }
+        }
+
+        // ── the SELECTED LAYER editor ────────────────────────────────────
+        VerticalLayout {
+            horizontal-stretch: 1;
+            spacing: 13px;
+            if State.selected-layer < 0 || State.selected-layer >= State.light-layers.length : VerticalLayout {
+                padding-top: 8px;
+                Mono { text: "select a layer to tune its effect, colour, motion, blend and region"; color: Theme.text-faint; wrap: word-wrap; }
+            }
+            if State.selected-layer >= 0 && State.selected-layer < State.light-layers.length : VerticalLayout {
+                spacing: 13px;
+                property <LayerRow> sel: State.light-layers[State.selected-layer];
+                // EFFECT
+                HorizontalLayout {
+                    spacing: 5px;
+                    for et in root.effect-types : Pill {
+                        text: et;
+                        clickable: true;
+                        selected: sel.effect == et;
+                        clicked => { State.set-layer-effect(State.selected-layer, et); }
+                    }
+                    Rectangle {}
+                }
+                // COLOUR — only effects that read it
+                if sel.uses-color : VerticalLayout {
+                    spacing: 9px;
+                    SectionTitle { text: "COLOUR"; }
+                    HorizontalLayout {
+                        spacing: 9px;
+                        Rectangle { width: 30px; height: 30px; border-radius: Theme.radius-sm; border-width: Theme.hair; border-color: Theme.line; background: sel.col; }
+                        Field {
+                            field-width: 120px;
+                            placeholder: "4AF2B0";
+                            text: sel.color;
+                            edited(t) => { State.set-layer-color(State.selected-layer, t); }
+                        }
+                        Rectangle {}
+                    }
+                    HorizontalLayout {
+                        spacing: 6px;
+                        for sw in root.swatches : Rectangle {
+                            width: 24px; height: 24px; border-radius: Theme.radius-sm;
+                            border-width: Theme.hair;
+                            border-color: sw.hex == sel.color ? Theme.accent-line : (cswta.has-hover ? Theme.text-faint : Theme.line-soft);
+                            background: sw.col;
+                            animate border-color { duration: Theme.quick; }
+                            cswta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { State.set-layer-color(State.selected-layer, sw.hex); } }
+                        }
+                        Rectangle {}
+                    }
+                }
+                if !sel.uses-color : Mono { text: sel.effect + " generates its own colour"; color: Theme.text-faint; }
+                // MOTION — speed (and direction for directional effects)
+                Slider {
+                    caption: "SPEED";
+                    minimum: 0.25; maximum: 4.0; value: sel.speed; step: 0.05; unit: "×";
+                    changed(v) => { State.set-layer-speed(State.selected-layer, v); }
+                }
+                if sel.directional : VerticalLayout {
+                    spacing: 6px;
+                    Mono { text: "DIRECTION"; color: Theme.text-dim; }
+                    Segment {
+                        options: ["→", "←", "↑", "↓"];
+                        index: sel.direction;
+                        min-seg: 48px;
+                        picked(i) => { State.set-layer-direction(State.selected-layer, i); }
+                    }
+                }
+                // BLEND
+                VerticalLayout {
+                    spacing: 6px;
+                    Mono { text: "BLEND with the layers beneath"; color: Theme.text-dim; }
+                    Segment {
+                        options: ["normal", "add", "screen"];
+                        index: sel.blend == "add" ? 1 : (sel.blend == "screen" ? 2 : 0);
+                        min-seg: 84px;
+                        picked(i) => { State.set-layer-blend(State.selected-layer, i == 1 ? "add" : (i == 2 ? "screen" : "normal")); }
+                    }
+                }
+                // REGION — paint which cells the layer covers
+                VerticalLayout {
+                    spacing: 6px;
+                    Mono { text: "REGION"; color: Theme.text-dim; }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Button {
+                            text: State.light-region-edit ? "done" : "paint region";
+                            primary: State.light-region-edit;
+                            clicked => { State.light-region-edit = !State.light-region-edit; }
+                        }
+                        VerticalLayout { alignment: center; Mono { text: sel.region-count == 0 ? "whole device" : sel.region-count + " cells"; color: Theme.text-faint; } }
+                        Rectangle {}
+                        Button { text: "whole device"; enabled: sel.region-count > 0; clicked => { State.clear-layer-region(State.selected-layer); } }
+                    }
+                }
+            }
+        }
+    }
+    // ── PAINT — the per-LED frame editor (a distinct authoring mode) ──────
+    if State.light-paint-mode && State.sel-can-light : HorizontalLayout {
+        spacing: Theme.gap-col;
+        VerticalLayout {
+            horizontal-stretch: 1;
+            spacing: 12px;
+            VerticalLayout {
+                spacing: 9px;
+                SectionTitle { text: "BRUSH"; }
+                HorizontalLayout {
+                    spacing: 9px;
+                    Rectangle { width: 30px; height: 30px; border-radius: Theme.radius-sm; border-width: Theme.hair; border-color: Theme.line; background: State.brush-color; }
+                    Field {
+                        field-width: 120px;
+                        placeholder: "4AF2B0";
+                        text: State.light-color;
+                        invalid: !State.light-color-valid;
+                        edited(t) => { State.light-color = t; State.color-changed(t); }
+                    }
+                    Rectangle {}
+                }
+                HorizontalLayout {
+                    spacing: 6px;
+                    for sw in root.swatches : Rectangle {
+                        width: 24px; height: 24px; border-radius: Theme.radius-sm;
+                        border-width: Theme.hair;
+                        border-color: sw.hex == State.light-color ? Theme.accent-line : (pswta.has-hover ? Theme.text-faint : Theme.line-soft);
+                        background: sw.col;
+                        animate border-color { duration: Theme.quick; }
+                        pswta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { State.light-color = sw.hex; State.color-changed(sw.hex); } }
+                    }
+                    Rectangle {}
+                }
+            }
+            HorizontalLayout {
+                spacing: 7px;
+                Button { text: "fill"; clicked => { State.fill-grid(); } }
+                Button { text: "clear"; danger: true; clicked => { State.clear-grid(); } }
+                Button { text: "import .ChromaEffects"; clicked => { State.import-light-file(); } }
+                Button { text: "push frame"; primary: true; enabled: !State.writes-paused; clicked => { State.push-frame(); } }
+                Rectangle {}
+            }
+            Rectangle {}
+        }
+    }
+}

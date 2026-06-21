@@ -1,0 +1,183 @@
+import { Theme } from "../theme.slint";
+
+// DEVICE RENDER — the auto-generated picture of the peripheral itself, LEDs live.
+//
+// Built procedurally from what the registry actually knows (rows × cols + the device kind) and
+// NOTHING it doesn't: a keyboard is a bezel around a keycap lattice, a mouse with a handful of
+// LED zones is a chassis with placed zone pads — never fake key legends or invented geometry.
+// The cells are bound to the live frame model (`px`), so whatever the device is running (an
+// applied effect mirrored through the SAME render_frame math, or the user's painted frame) is
+// what this draws. Painting happens directly on the render: one TouchArea over the lattice
+// (per-cell areas would grab the pointer and kill drag-sweeps), left paints, right erases.
+//
+// Ink rules: chassis = hairline monochrome (structure, never accent); the LEDs are the only
+// colour, with a soft under-bloom (an oversized translucent twin — cheap in the software
+// renderer, reads as light not paint).
+
+export component DeviceRender inherits Rectangle {
+    in property <int> rows;
+    in property <int> cols;
+    in property <[color]> px;          // row-major live frame (the one source of light)
+    in property <string> kind;         // registry icon hint: "keyboard" | "mouse" | other
+    in property <bool> editable: false; // PAINT mode — pointer paints cells
+    callback paint(int);
+    callback erase(int);
+
+    // a mouse with a handful of LEDs is ZONES on a body, not a lattice (honest geometry).
+    property <bool> zone-mode: root.kind == "mouse" && root.rows * root.cols <= 4;
+
+    background: transparent;
+
+    // ── keyboard / generic chassis + lattice ─────────────────────────────
+    if !root.zone-mode : Rectangle {
+        // bezel — the instrument's body. Stroke only; the void shows through.
+        x: parent.width * 4%;
+        y: parent.height * 4%;
+        width: parent.width * 92%;
+        height: parent.height * 92%;
+        border-radius: 10px;
+        border-width: Theme.hair;
+        border-color: Theme.line;
+        background: Theme.bg-2;
+
+        // a faint inner field line — where the keys live
+        field := Rectangle {
+            x: 12px;
+            y: 12px;
+            width: parent.width - 24px;
+            height: parent.height - 24px;
+            border-radius: 6px;
+            border-width: Theme.hair;
+            border-color: Theme.line-soft;
+            background: transparent;
+
+            property <length> pad: 10px;
+            property <length> gap: 3px;
+            property <length> cell: max(2px, min(
+                (self.width - 2 * self.pad - (root.cols - 1) * self.gap) / max(1, root.cols),
+                (self.height - 2 * self.pad - (root.rows - 1) * self.gap) / max(1, root.rows)));
+            // center the lattice in the field so odd aspect ratios don't pile keys in a corner
+            property <length> ox: (self.width - root.cols * self.cell - (root.cols - 1) * self.gap) / 2;
+            property <length> oy: (self.height - root.rows * self.cell - (root.rows - 1) * self.gap) / 2;
+
+            // under-bloom: an oversized translucent twin behind each cap — lit caps glow,
+            // unlit caps (the dark well colour) vanish into the void. No comparisons needed.
+            for p[i] in root.px : Rectangle {
+                property <int> gr: floor(i / root.cols);
+                property <int> gc: mod(i, root.cols);
+                x: field.ox + gc * (field.cell + field.gap) - 4px;
+                y: field.oy + gr * (field.cell + field.gap) - 4px;
+                width: field.cell + 8px;
+                height: field.cell + 8px;
+                border-radius: field.cell / 2;
+                background: p.with-alpha(0.16);
+            }
+            // the keycaps themselves
+            for p[i] in root.px : Rectangle {
+                property <int> gr: floor(i / root.cols);
+                property <int> gc: mod(i, root.cols);
+                x: field.ox + gc * (field.cell + field.gap);
+                y: field.oy + gr * (field.cell + field.gap);
+                width: field.cell;
+                height: field.cell;
+                border-radius: max(1px, field.cell / 4);
+                background: p;
+                border-width: Theme.hair;
+                border-color: brush.has-hover && root.editable && i == brush.hover-cell
+                    ? Theme.text-faint : Theme.line-soft;
+            }
+
+            brush := TouchArea {
+                enabled: root.editable;
+                mouse-cursor: root.editable ? MouseCursor.crosshair : MouseCursor.default;
+                property <int> hover-cell: self.cell-at(self.mouse-x, self.mouse-y);
+                function cell-at(mx: length, my: length) -> int {
+                    return clamp(floor((my - field.oy) / (field.cell + field.gap)), 0, root.rows - 1) * root.cols
+                         + clamp(floor((mx - field.ox) / (field.cell + field.gap)), 0, root.cols - 1);
+                }
+                pointer-event(ev) => {
+                    if (ev.kind == PointerEventKind.down) {
+                        if (ev.button == PointerEventButton.right) {
+                            root.erase(self.cell-at(self.mouse-x, self.mouse-y));
+                        } else if (ev.button == PointerEventButton.left) {
+                            root.paint(self.cell-at(self.mouse-x, self.mouse-y));
+                        }
+                    }
+                }
+                moved => { if (self.pressed) { root.paint(self.cell-at(self.mouse-x, self.mouse-y)); } }
+            }
+        }
+    }
+
+    // ── mouse chassis + zone pads (≤4 LEDs — zones, not a lattice) ───────
+    if root.zone-mode : Rectangle {
+        body := Rectangle {
+            // the mouse body — a tall capsule, centered
+            width: min(parent.width * 38%, parent.height * 64%);
+            height: parent.height * 86%;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            border-radius: self.width / 2.2;
+            border-width: Theme.hair;
+            border-color: Theme.line;
+            background: Theme.bg-2;
+
+            // button split line (upper third) + wheel slot — silhouette cues, ink only
+            Rectangle {
+                x: parent.width / 2;
+                y: parent.height * 4%;
+                width: Theme.hair;
+                height: parent.height * 24%;
+                background: Theme.line;
+            }
+
+            // zone pads — one per LED, placed where mouse zones actually live
+            // (0 = scroll wheel, 1 = logo, 2/3 = side strips). Colour = the live frame.
+            // bloom twins first (light sits UNDER the pad, not as a wash over it)…
+            for p[i] in root.px : Rectangle {
+                property <length> pw: body.width * 26%;
+                width: self.pw + 10px;
+                height: (i == 0 ? body.height * 12% : self.pw) + 10px;
+                x: (i == 2 ? body.width * 12% : i == 3 ? body.width * 62% : (body.width - self.pw) / 2) - 5px;
+                y: (i == 0 ? body.height * 10%
+                    : i == 1 ? body.height * 52%
+                    : body.height * 36%) - 5px;
+                border-radius: self.width / 2;
+                background: p.with-alpha(0.16);
+            }
+            // …then the pads themselves
+            for p[i] in root.px : Rectangle {
+                property <length> pw: body.width * 26%;
+                width: self.pw;
+                height: i == 0 ? body.height * 12% : self.pw;
+                x: (i == 2 ? body.width * 12% : i == 3 ? body.width * 62% : (body.width - self.width) / 2);
+                y: i == 0 ? body.height * 10%
+                    : i == 1 ? body.height * 52%
+                    : body.height * 36%;
+                border-radius: i == 0 ? 4px : self.width / 2;
+                background: p;
+                border-width: Theme.hair;
+                border-color: zta.has-hover && root.editable ? Theme.text-faint : Theme.line-soft;
+                zta := TouchArea {
+                    enabled: root.editable;
+                    mouse-cursor: root.editable ? MouseCursor.crosshair : MouseCursor.default;
+                    pointer-event(ev) => {
+                        if (ev.kind == PointerEventKind.down) {
+                            if (ev.button == PointerEventButton.right) { root.erase(i); }
+                            else if (ev.button == PointerEventButton.left) { root.paint(i); }
+                        }
+                    }
+                }
+            }
+        }
+        // honesty note: zone positions are approximate (the registry knows counts, not microns)
+        Text {
+            text: "~ zones approximate";
+            color: Theme.text-faint;
+            font-size: Theme.fs-small;
+            font-family: Theme.mono;
+            x: parent.width - self.width - 6px;
+            y: parent.height - self.height - 4px;
+        }
+    }
+}

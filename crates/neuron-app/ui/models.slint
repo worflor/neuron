@@ -1,0 +1,213 @@
+// The typed data contract between Rust and the view. These structs mirror neuron-core's config
+// types closely enough that the Rust glue is a thin map (Profile, Rule, DeviceDef, LightingDef)
+// — no serde-over-IPC, just direct field copies into Slint models.
+
+// One enumerated device on the Device panel.
+export struct DeviceRow {
+    name: string,
+    codename: string,
+    pid: string,        // "00a8"
+    mode: string,       // link-mode personality (wired/dongle/...)
+    connected: bool,
+    // best-effort live reads; "—" when unread/asleep
+    firmware: string,
+    dpi: string,
+    polling: string,
+    brightness: string,
+    battery: string,    // "" if no battery
+    battery_frac: float, // 0..1 for the drawn cell gauge; -1 = no battery / unread
+    charging: bool,
+    storage: string,    // "" if no onboard pool
+    icon: string,       // glyph hint: "mouse" | "keyboard" | "device" | "mic" | "output"
+    // emergent device unification — the list is HID peripherals AND audio endpoints (mic/output).
+    kind: string,       // "mouse" | "keyboard" | "device" (HID) | "mic" | "output" (Core Audio)
+    id: string,         // selection key: pid-hex for HID, the Core-Audio endpoint id for audio
+    detail: string,     // audio subtitle ("microphone · 62%" / "output · muted"); "" for HID
+    // registry-driven CAPABILITY flags (from the device descriptor) — the panel gates each control on
+    // these, so a keyboard shows no DPI fader and a wired board shows no battery/idle.
+    cap-dpi: bool,      // DPI fader · DPI stages · sniper · lift-off
+    cap-poll: bool,     // polling contacts · in-game polling
+    cap-light: bool,    // brightness fader
+    cap-scroll: bool,   // scroll-wheel stages
+    cap-store: bool,    // persist-to-onboard
+    cap-idle: bool,     // idle-off timer (wireless)
+}
+
+// A spine rule row (Bindings / HyperShift / Radial / Gesture editors all render these).
+export struct RuleRow {
+    trigger: string,    // Trigger::describe()
+    action: string,     // Action::describe()
+    layer: string,      // "base" | "hypershift" | ""
+    kind: string,       // "input" | "hotkey" | "gesture" | "radial" | "app" | "mic" | "hold"
+    removable: bool,    // GUI-authored (gui.rules.toml) -> deletable; toml-sourced -> read-only
+}
+
+// A saved profile card. The captured values ride as separate readout fields (data as the hero,
+// not one prose summary string).
+export struct ProfileRow {
+    name: string,
+    summary: string,
+    dpi: string,        // "1600" or "800/1600/3200" (the cycle wins when present); "" = none
+    polling: string,    // "1000 Hz"; "" = none
+    lighting: string,   // effect name; "" = none
+    active: bool,
+}
+
+// An app-aware auto-switch rule.
+export struct AppRuleRow {
+    app: string,
+    profile: string,
+}
+
+// A named lighting effect available on the selected device. `idx` is the index into the FULL
+// effects model (the apply callbacks key on it), so the two display banks (firmware / computed)
+// can be filtered Rust-side without losing the original identity.
+export struct EffectRow {
+    idx: int,
+    name: string,
+    native: bool,       // firmware-native vs Neuron-emulated
+    uses_color: bool,
+}
+
+// One layer of the lighting COMPOSITOR — an effect generator bound to its own colour, motion,
+// region and blend. The stack composites bottom-to-top into the frame the device runs. The region
+// (which cells it paints) lives Rust-side; `region_count` is its size (0 = the whole device).
+export struct LayerRow {
+    effect: string,      // "static" / "breathing" / "spectrum" / "wave" / "fire"
+    color: string,       // hex RRGGBB
+    col: color,          // parsed, for the swatch
+    speed: float,        // 0.25 .. 4.0 (1 = default rate)
+    direction: int,      // 0 → · 1 ← · 2 ↑ · 3 ↓
+    blend: string,       // "normal" / "add" / "screen"
+    uses_color: bool,    // does this effect read the colour (vs cycling its own hue)?
+    directional: bool,   // does direction matter (wave) ?
+    enabled: bool,
+    region_count: int,   // painted cells; 0 = whole device
+}
+
+// One spellweaving MATERIAL in the gallery — a living preview swatch (rendered Rust-side from the
+// real shader, so the tile IS the material) + its name and vibe blurb. `slug` is the stable id the
+// picker persists. Selection is derived in the view (slug == State.weave-material), not stored here.
+export struct MaterialCard {
+    name: string,
+    slug: string,
+    blurb: string,
+    swatch: image,
+}
+
+// One tunable KNOB a spellweaving material surfaces — a generic, data-driven control. The material
+// declares its own knobs (label + range); the UI renders a slider per row, and editing reshapes the
+// live substance. Adding a knob to a material is data, never new UI.
+export struct KnobRow {
+    label: string,
+    value: float,
+    min: float,
+    max: float,
+}
+
+// One watched worker on the RELIABILITY panel — a flight-recorder heartbeat made visible.
+// `state`: "beat" (running, fresh) | "rest" (deliberately not running) | "stall" (running but silent
+// past the deadline — a wedged/dead thread). `detail` is the live age readout ("12 ms ago" / "at rest").
+export struct OrganRow {
+    name: string,
+    state: string,
+    detail: string,
+}
+
+// One sector of the radial preview.
+export struct RadialSector {
+    label: string,
+    action: string,
+}
+
+// One recorded glyph in the vault — name plus its bound action (the chips must show what a
+// glyph DOES, not just what it's called).
+export struct GlyphChip {
+    name: string,
+    action: string,     // bound Action::describe(); "" = unbound
+    bound: bool,
+}
+
+// One CAST RHYTHM map row — a "N taps then hold" press-pattern on the cast trigger, a first-class
+// Trigger::Cast bound to any Action. `taps` is the tap count (the row identity); `label` is the
+// rhythm in symbols (● tap · ▬ hold); `desc` is the bound Action::describe(); `bound` = != Noop.
+export struct RhythmBindRow {
+    taps: int,
+    label: string,
+    desc: string,
+    bound: bool,
+}
+
+// One portable clipboard ("pocket"). `sigil` is the emergent content-mark as a Path `commands`
+// string in normalized [-1,1] space (deterministic from the bytes); `summary` is the legible
+// readout ("240 chars" / "3 files" / "1920×1080 image"); `kind` drives the accent + label.
+export struct PocketCard {
+    name: string,       // "" = the default pocket
+    summary: string,    // PocketView::summary
+    kind: string,       // "empty" | "text" | "files" | "image" | "other"
+    sigil: string,      // Path commands in [-1,1] (empty when the pocket is empty)
+    durable: bool,      // persisted to disk
+    filled: bool,       // holds content right now
+}
+
+// One imported feature line in the migration wizard preview. `category` groups the preview:
+// "perf" (scalar settings) | "lighting" | "binding" | "note" (not migrated).
+export struct ImportLine {
+    label: string,
+    detail: string,
+    ok: bool,
+    category: string,
+}
+
+// One diagnostics probe in the Settings test-bench — a live capability probe + its verdict.
+export struct DiagRow {
+    name: string,        // the capability being proven (e.g. "device round-trip")
+    detail: string,      // what it did / what it found (raw, transparent)
+    state: string,       // "pass" | "fail" | "skip" | "pending"
+}
+
+// One node on the bindings GRAPH — a trigger, an action, or one step of a macro chain.
+// Positions are canvas-space floats (draggable; persisted to profiles/graph-layout.toml).
+export struct GraphNode {
+    key: string,        // stable identity for layout persistence
+    kind: string,       // "trigger" | "action" | "step"
+    label: string,
+    sub: string,        // second line: layer tag / hold time / provenance
+    x: float,
+    y: float,
+}
+
+// One connection on the bindings graph. `timing` rides ON the line (the chip at its midpoint);
+// editable edges (GUI-authored turbo rates + macro step delays) open the timing editor.
+export struct GraphEdge {
+    a: int,             // source node index
+    b: int,             // target node index
+    timing: string,     // "instant" | "120 ms" | "12 cps" | "—"
+    tkind: string,      // "" (fixed) | "turbo" | "delay"
+    editable: bool,
+    rule: int,          // GUI rule index the timing edits (-1 = read-only)
+    step: int,          // sequence step index for tkind=="delay" (-1 otherwise)
+}
+
+// One entry in the Action palette (the typed action a bind / wedge / glyph resolves to). `id` keys
+// the Rust action builder; `param_hint` labels the single parameter field (empty = no parameter).
+// `header: true` rows are SECTION TITLES interleaved by the glue (press & type / audio / device /
+// instruments / …) — rendered as structure, never selectable.
+export struct ActionChoice {
+    id: string,          // builder id ("key", "turbo", "teleport", …); "" on header rows
+    label: string,       // human label shown in the picker (the group name on header rows)
+    param_hint: string,  // placeholder for the parameter field ("" if the action takes none)
+    header: bool,        // section title row (not a choice)
+    required: bool,      // a blank param won't commit (the param IS the payload)
+    tier: int,           // maturity 0=placeholder · 1-4=WIP · 5=done — shown as a small badge
+}
+
+// One macro that raises a BEACON — i.e. its source calls `neuron.ask(…)`. The SYSTEM panel's BEACONS
+// section lists these so a beacon-using macro is visible at a glance, and a "test" mock-fires it so
+// the real ask appears with none of the macro's real-world actions. `asks` is its question(s),
+// " · "-joined and verbatim. Whether a row is firing right now is derived in the view (the live
+// beacon-text names the macro), never stored here.
+export struct BeaconMacro {
+    name: string,
+    asks: string,
+}

@@ -1,0 +1,391 @@
+// Neuron — the resident GUI shell. "Precision instrument, not a skinned app."
+//
+// The chrome is an instrument fascia: a quiet top rail with a small monospace SECTION SELECTOR on
+// the left (numbered channels, the active one lit phosphor) and a live SIGNAL CLUSTER on the right
+// (profile / shift / link / gate — accent ONLY when something is actually live). No icon-rail, no
+// kinetic word-nav, no oversized display type. A hairline separates the fascia from the work area;
+// a mono status strip runs along the bottom like a scope's readout line.
+//
+// Keyboard: 1..6 switch channels (mirroring the numbered ticks), ESC backs out of any modal.
+// Panel switches SETTLE (110ms opacity + a 4px drop) — mechanical, not bouncy, never instant-teleport.
+//
+// Tray-resident: this window is created once and hidden on close; the event loop lives on regardless
+// (see the Rust runtime). One window, one process, direct typed calls into neuron-core.
+
+import { Theme } from "theme.slint";
+import { State } from "state.slint";
+import { Pill, Mono, CaptureOverlay } from "widgets/controls.slint";
+
+import { DevicePanel } from "panels/device.slint";
+import { LightingPanel } from "panels/lighting.slint";
+import { BindingsPanel } from "panels/bindings.slint";
+import { SpellweavingPanel } from "panels/spellweaving.slint";
+import { ProfilesPanel } from "panels/profiles.slint";
+import { SettingsPanel } from "panels/settings.slint";
+import { ImportWizard } from "panels/import.slint";
+
+// State drives every panel; Theme is exported too so Rust can swap the live accent (APPEARANCE).
+export { State }
+export { Theme }
+
+// One entry in the section selector — a numbered channel. Quiet mono; the active one is lit phosphor
+// with a short underscore tick. No size-jump, no pan: it just changes state (mechanical, not kinetic).
+component NavEntry inherits Rectangle {
+    in property <string> label;
+    in property <int> index;
+    in property <bool> active;
+    callback clicked();
+    horizontal-stretch: 0;
+    height: 26px;
+    border-radius: Theme.radius-sm;
+    background: active ? Theme.accent-glow : (ta.has-hover ? Theme.well : transparent);
+    border-width: Theme.hair;
+    border-color: active ? Theme.accent-line : transparent;
+    animate background, border-color { duration: Theme.quick; }
+    HorizontalLayout {
+        padding-left: 9px;
+        padding-right: 11px;
+        spacing: 7px;
+        // channel index — dim tick that lights with the active entry
+        Text {
+            text: (root.index + 1);
+            // the channel address lifts WITH the label on hover — half-lit read as a glitch before
+            color: root.active ? Theme.accent : (ta.has-hover ? Theme.text-dim : Theme.text-faint);
+            font-size: Theme.fs-small;
+            font-family: Theme.mono;
+            vertical-alignment: center;
+        }
+        Text {
+            text: root.label;
+            color: root.active ? Theme.accent : (ta.has-hover ? Theme.text-mid : Theme.text-dim);
+            font-size: Theme.fs-nav;
+            font-family: Theme.mono;
+            font-weight: root.active ? 700 : 500;
+            letter-spacing: 1.4px;
+            vertical-alignment: center;
+        }
+    }
+    ta := TouchArea { clicked => { root.clicked(); } }
+}
+
+// One settling panel slot — the channel switch is a mechanical contact: the leaving panel drops
+// out, the arriving one settles in over Theme.settle (110ms). visible gates painting so the five
+// hidden panels cost nothing in the software renderer.
+component PanelSlot inherits Rectangle {
+    in property <bool> active;
+    opacity: root.active ? 1.0 : 0.0;
+    visible: root.active || self.opacity > 0.01;
+    y: root.active ? 0px : 4px;
+    animate opacity, y { duration: Theme.settle; }
+    @children
+}
+
+// Every channel scrolls — the window must work at ANY size, never "fullscreen it to see the rest".
+// Vertical-only: the viewport is pinned to the page width and the panel (a VerticalLayout) sizes
+// its own height; the wheel scrolls when content exceeds the glass and is inert when it doesn't.
+// The viewport is measured EXPLICITLY through the named body: a Flickable only auto-sizes from
+// children declared inside the component, and ours arrive via @children — without this binding
+// the viewport never outgrows the glass and the wheel is dead (the off-screen-rows bug).
+component PanelPage inherits Flickable {
+    viewport-width: self.width;
+    viewport-height: max(self.height, body.preferred-height);
+    body := VerticalLayout {
+        width: parent.viewport-width;
+        height: parent.viewport-height;
+        @children
+    }
+}
+
+export component AppWindow inherits Window {
+    title: "Neuron";
+    // Pages scroll (see PanelPage), so the minimum is "still comfortable", not "fits everything".
+    min-width: 900px;
+    min-height: 560px;
+    preferred-width: 1240px;
+    preferred-height: 800px;
+    background: Theme.bg;
+    default-font-size: Theme.fs-body;
+    default-font-family: Theme.mono;
+    forward-focus: keys;
+
+    // The four warranted sections — user INTENTS, not feature taxonomy: make it feel right /
+    // make it look right / make input do things / set it up + prove it works. PROFILES is a
+    // global affordance (the header sheet), not a seat. Index == State.page.
+    property <[string]> sections: ["DEVICE", "LIGHTING", "INPUT", "SYSTEM"];
+    // ARMING REAL INPUT deserves friction: first click on the SAFE pill arms the question,
+    // a second click within 2.5s commits. Disarming (ARMED -> SAFE) is always one click.
+    property <bool> arm-confirm: false;
+    Timer {
+        interval: 2500ms;
+        running: root.arm-confirm;
+        triggered => { root.arm-confirm = false; }
+    }
+
+    keys := FocusScope {
+        key-pressed(e) => {
+            if (e.text == Key.Escape) {
+                // back out of one transient state per press, most-modal first…
+                if (State.capture-active) { State.cancel-capture(); return accept; }
+                if (State.import-open) { State.import-open = false; return accept; }
+                if (State.profile-sheet-open) { State.profile-sheet-open = false; return accept; }
+                if (root.arm-confirm) { root.arm-confirm = false; return accept; }
+                if (State.editing-sector >= 0) { State.editing-sector = -1; return accept; }
+                if (State.gesture-bind-target != "") { State.gesture-bind-target = ""; return accept; }
+                if (State.selected-edge >= 0) { State.selected-edge = -1; return accept; }
+                // …nothing matched: pull focus back to nav (so ESC backs OUT of a focused text field
+                // instead of stranding keyboard nav) and `reject` so Slint's own fallback can still
+                // close an open Picker/ActionPicker popup.
+                keys.focus();
+                return reject;
+            }
+            if (!State.import-open && !State.capture-active && !State.profile-sheet-open) {
+                if (e.text == "1") { State.page = 0; return accept; }
+                if (e.text == "2") { State.page = 1; return accept; }
+                if (e.text == "3") { State.page = 2; return accept; }
+                if (e.text == "4") { State.page = 3; return accept; }
+            }
+            return reject;
+        }
+
+        VerticalLayout {
+            padding: 0;
+
+            // ── instrument fascia: section selector + live signal cluster ─────
+            Rectangle {
+                height: 56px;
+                background: Theme.bg;
+                HorizontalLayout {
+                    padding-left: Theme.pad-page;
+                    padding-right: Theme.pad-page;
+                    spacing: 0;
+                    // wordmark — quiet, mono, the instrument's name plate
+                    VerticalLayout {
+                        alignment: center;
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Rectangle {
+                                width: 6px; height: 6px; border-radius: 1px;
+                                y: (parent.height - self.height) / 2;
+                                background: State.runtime-active ? Theme.accent : Theme.text-faint;
+                                animate background { duration: Theme.settle; }
+                            }
+                            Text {
+                                text: "NEURON";
+                                color: Theme.text;
+                                font-size: 13px;
+                                font-family: Theme.mono;
+                                font-weight: 700;
+                                letter-spacing: 3px;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+                    Rectangle { width: 26px; }
+                    // the section selector
+                    HorizontalLayout {
+                        alignment: start;
+                        spacing: 4px;
+                        for s[i] in root.sections : NavEntry {
+                            label: s;
+                            index: i;
+                            active: State.page == i;
+                            clicked => { State.page = i; }
+                        }
+                    }
+                    Rectangle {}  // push the right cluster over
+                    // The right cluster is ONE affordance, not a row of tags: the PROFILE sheet
+                    // trigger (plus a quiet "shift" word while a layer is held — a state, not a
+                    // badge). The link lamp is the wordmark dot; gate/paused/beacon live on the
+                    // scope strip below, where modes belong.
+                    VerticalLayout {
+                        alignment: center;
+                        HorizontalLayout {
+                            alignment: end;
+                            spacing: 10px;
+                            // show WHICH layer(s) are held when the runtime names them, not a static word
+                            if State.hypershift-on : Text {
+                                text: State.live-held != "" ? State.live-held : "shift";
+                                color: Theme.accent;
+                                font-size: Theme.fs-small;
+                                font-family: Theme.mono;
+                                letter-spacing: Theme.track-4;
+                                vertical-alignment: center;
+                            }
+                            // PROFILE — opens the profiles sheet (save/apply/rules from anywhere).
+                            Pill {
+                                text: State.active-profile == "—" ? "NO PROFILE" : State.active-profile;
+                                live: State.active-profile != "—";
+                                clickable: true;
+                                clicked => { State.profile-sheet-open = true; }
+                            }
+                        }
+                    }
+                }
+            }
+            // fascia hairline
+            Rectangle { height: Theme.hair; background: Theme.line; }
+
+            // ── work area (content floats on the void) ────────────────────────
+            Rectangle {
+                background: Theme.bg;
+                clip: true;
+                VerticalLayout {
+                    padding-left: Theme.pad-page;
+                    padding-right: Theme.pad-page;
+                    padding-top: 14px;
+                    padding-bottom: 14px;
+                    Rectangle {
+                        PanelSlot { active: State.page == 0; PanelPage { DevicePanel {} } }
+                        PanelSlot { active: State.page == 1; PanelPage { LightingPanel {} } }
+                        // INPUT — one section, two depths: DIRECT (plain binds) / WEAVE (the
+                        // held-stroke engine). Same spine, same action palette, one home.
+                        PanelSlot { active: State.page == 2 && State.input-view == 0; PanelPage { BindingsPanel {} } }
+                        PanelSlot { active: State.page == 2 && State.input-view == 1; PanelPage { SpellweavingPanel {} } }
+                        PanelSlot { active: State.page == 3; PanelPage { SettingsPanel {} } }
+                    }
+                }
+            }
+
+            // ── status strip (the scope readout line) ─────────────────────────
+            Rectangle {
+                height: 26px;
+                background: Theme.bg-2;
+                Rectangle { x: 0; y: 0; width: parent.width; height: Theme.hair; background: Theme.line; }
+                HorizontalLayout {
+                    padding-left: Theme.pad-page;
+                    padding-right: Theme.pad-page;
+                    spacing: 8px;
+                    // a caret marking the readout line — phosphor for info, alarm red for failures
+                    Text {
+                        text: "›";
+                        color: State.status-kind == "err" ? Theme.danger : Theme.accent;
+                        font-size: Theme.fs-mono;
+                        font-family: Theme.mono;
+                        vertical-alignment: center;
+                        animate color { duration: Theme.settle; }
+                    }
+                    Text {
+                        text: State.status-line;
+                        // freshness is honest: an aged message dims instead of posing as current
+                        color: State.status-stale ? Theme.text-faint
+                            : State.status-kind == "err" ? Theme.danger
+                            : Theme.text-mid;
+                        font-size: Theme.fs-mono;
+                        font-family: Theme.mono;
+                        vertical-alignment: center;
+                        overflow: elide;
+                        animate color { duration: Theme.settle; }
+                    }
+                    Rectangle {}
+                    // ── mode readouts — gates and live states belong on the scope line ──
+                    // BEACON: a macro is asking at the cursor (count includes queued asks).
+                    if State.beacon-count > 0 : Mono {
+                        text: State.beacon-count > 1 ? "beacon ×" + State.beacon-count : "beacon";
+                        color: Theme.accent;
+                    }
+                    if State.beacon-count > 0 : Rectangle { width: 14px; }
+                    // WRITES PAUSED: the global device-write kill-switch — click = go to its gate.
+                    if State.writes-paused : Rectangle {
+                        width: pw.width; height: parent.height;
+                        pw := Mono { text: "writes paused"; color: Theme.danger; vertical-alignment: center; }
+                        TouchArea {
+                            mouse-cursor: MouseCursor.pointer;
+                            clicked => { State.page = 3; }
+                        }
+                    }
+                    if State.writes-paused : Rectangle { width: 14px; }
+                    // THE GATE: armed/safe. SAFE -> ARMED takes a confirming second click (real
+                    // keystrokes are consequential); ARMED -> SAFE disarms instantly.
+                    Rectangle {
+                        width: gate.width; height: parent.height;
+                        gate := Mono {
+                            text: State.input-armed ? "armed" : root.arm-confirm ? "arm?" : "safe";
+                            color: State.input-armed ? Theme.accent
+                                : root.arm-confirm ? Theme.warn
+                                : Theme.text-dim;
+                            vertical-alignment: center;
+                        }
+                        TouchArea {
+                            mouse-cursor: MouseCursor.pointer;
+                            clicked => {
+                                if (State.input-armed || root.arm-confirm) {
+                                    State.toggle-input-armed();
+                                    root.arm-confirm = false;
+                                } else {
+                                    root.arm-confirm = true;
+                                }
+                            }
+                        }
+                    }
+                    Rectangle { width: 14px; }
+                    // live dispatch readout — last trigger fired + total count (the headline's own
+                    // dedicated slot; it never stomps the status message on the left)
+                    if State.live-fired > 0 : Mono {
+                        text: "fired " + State.live-fired + " · " + State.live-last-trigger
+                            + " → " + State.live-last-action;
+                        color: Theme.accent-dim;
+                        overflow: elide;
+                        min-width: 0;   // elide a long trigger→action instead of shoving `focus` off-edge
+                    }
+                    Rectangle { width: 14px; }
+                    // the focus readout is the last thing to yield: it absorbs slack and elides first
+                    Mono {
+                        text: "focus " + State.focused-app;
+                        color: Theme.text-faint;
+                        overflow: elide;
+                        min-width: 0;
+                        horizontal-stretch: 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // ── press-to-bind capture overlay (shown over any panel during a capture) ──
+    CaptureOverlay {}
+
+    // ── PROFILES sheet — a global affordance, not a section. A profile is the act of saving /
+    // restoring the state of the other sections, so it opens from the header wherever you are
+    // (tune on DEVICE, save here; import lands here). ESC or the scrim closes it. ──
+    // settles in over Theme.settle (opacity) instead of teleporting — modals obey the same motion
+    // law as panel switches. visible-gated so it fully unmounts after the fade-out.
+    Rectangle {
+        opacity: State.profile-sheet-open ? 1.0 : 0.0;
+        visible: State.profile-sheet-open || self.opacity > 0.01;
+        animate opacity { duration: Theme.settle; }
+        background: Theme.scrim;
+        TouchArea { clicked => { State.profile-sheet-open = false; } }
+        Rectangle {
+            width: min(1020px, parent.width - Theme.modal-inset);
+            height: min(660px, parent.height - Theme.modal-inset);
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: Theme.bg-2;
+            border-radius: Theme.radius;
+            border-width: Theme.hair;
+            border-color: Theme.line;
+            clip: true;
+            TouchArea {} // swallow clicks — the scrim closes, the sheet doesn't
+            VerticalLayout {
+                padding: 18px;
+                PanelPage { ProfilesPanel {} }
+            }
+        }
+    }
+
+    // ── Import wizard overlay (a FLOW launched from Settings, not a nav seat) ──
+    // ESC closes it (the FocusScope above), and so does a click on the void around the card.
+    Rectangle {
+        opacity: State.import-open ? 1.0 : 0.0;
+        visible: State.import-open || self.opacity > 0.01;
+        animate opacity { duration: Theme.settle; }
+        background: Theme.scrim;
+        TouchArea { clicked => { State.import-open = false; } }
+        ImportWizard {
+            width: min(760px, parent.width - Theme.modal-inset);
+            height: min(640px, parent.height - Theme.modal-inset);
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+        }
+    }
+}

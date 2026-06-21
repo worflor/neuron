@@ -1,0 +1,760 @@
+import { Theme } from "../theme.slint";
+import { Card, SectionTitle, Label, Button, Toggle, Pill, Mono, Divider, PanelHead, Field, Slider, Segment } from "../widgets/controls.slint";
+import { State } from "../state.slint";
+import { DiagRow } from "../models.slint";
+
+// One accent customiser — a live-preview swatch + label, a row of preset hues, and a hex field.
+// Picking a swatch (or entering a hex) recolours its target live AND persists (the `pick` callback
+// does both). Used identically for the INTERFACE accent and the WEAVE accent — teaching by symmetry.
+component AccentPicker inherits VerticalLayout {
+    in property <string> label;
+    in property <string> hint;
+    in property <color> current;       // the LIVE colour, for the preview swatch
+    in property <string> value;        // the saved bare-RRGGBB, for the selected-swatch mark + field
+    in property <[{hex: string, col: color}]> swatches;
+    callback pick(string);             // bare RRGGBB (no '#')
+    // is THIS picker's field the one being typed into? gates the (shared) live preview to the active
+    // picker — only one field holds focus. On focus-in, prime the preview from the current text so the
+    // swatch starts truthful instead of showing a stale value from a prior edit.
+    property <bool> editing: fld.has-focus;
+    changed editing => { if (root.editing) { State.preview-hex(fld.text); } }
+    spacing: 9px;
+    HorizontalLayout {
+        spacing: 10px;
+        // live preview swatch — the colour RIGHT NOW, and while you enter a custom hex it morphs to the
+        // value you're typing the instant it's a complete, valid 6 digits (Rust parses; nothing commits).
+        Rectangle {
+            width: 26px; height: 26px; border-radius: Theme.radius-sm;
+            border-width: Theme.hair; border-color: Theme.line;
+            background: root.editing && State.hex-preview-ok ? State.hex-preview-col : root.current;
+            animate background { duration: Theme.quick; }
+        }
+        VerticalLayout {
+            alignment: center;
+            Text {
+                text: root.label;
+                color: Theme.text-dim; font-family: Theme.mono; font-size: Theme.fs-small;
+                font-weight: 700; letter-spacing: 1.2px;
+            }
+        }
+        Rectangle {}
+        fld := Field {
+            field-width: 110px;
+            placeholder: "4af2b0";
+            text: root.value;
+            // danger hairline ONLY when it's genuinely wrong (bad char / overlong) — a half-typed value stays neutral
+            invalid: root.editing && State.hex-preview-bad;
+            edited(t) => { State.preview-hex(t); }   // live preview as you type — no commit, no recolour
+            accepted(t) => { root.pick(t); }         // Enter commits: recolours + persists
+        }
+    }
+    // the PRISM — appears while the field holds focus: drag across for hue, down for brightness;
+    // release commits (the same prism the cast disperses into, used to choose its colour).
+    if root.editing : Rectangle {
+        height: 54px;
+        border-radius: Theme.radius-sm;
+        border-width: Theme.hair;
+        border-color: Theme.line;
+        clip: true;
+        background: @linear-gradient(90deg, #ff3b5c, #ff8f1f, #ffd60a, #34d65a, #20c9d6, #2f7bff, #8a5cff, #ff3b5c);
+        // brightness wash — bright at the top, dimming toward the bottom
+        Rectangle {
+            x: 0; y: 0; width: parent.width; height: parent.height;
+            background: @linear-gradient(180deg, #00000000, #00000000 42%, #00000099);
+        }
+        prism := TouchArea {
+            mouse-cursor: MouseCursor.crosshair;
+            moved => { State.preview-hue(self.mouse-x / self.width, 1 - self.mouse-y / self.height); }
+            pointer-event(e) => {
+                if (e.kind == PointerEventKind.down) {
+                    State.preview-hue(self.mouse-x / self.width, 1 - self.mouse-y / self.height);
+                }
+                if (e.kind == PointerEventKind.up) {
+                    root.pick(State.hue-pick-hex);
+                }
+            }
+        }
+    }
+    HorizontalLayout {
+        spacing: 6px;
+        for sw in root.swatches : Rectangle {
+            width: 26px; height: 26px; border-radius: Theme.radius-sm;
+            border-width: Theme.hair;
+            border-color: sw.hex == root.value ? Theme.accent-line : (sta.has-hover ? Theme.text-faint : Theme.line-soft);
+            background: sw.col;
+            animate border-color { duration: Theme.quick; }
+            // pick commits; prime the preview too so the swatch matches even if the field keeps focus
+            sta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.pick(sw.hex); State.preview-hex(sw.hex); } }
+        }
+        Rectangle {}
+    }
+    // the hint wraps within the column (a Mono ran off the 380px edge — "…connected mark ti" clipped)
+    if root.hint != "" : Text {
+        text: root.hint;
+        color: Theme.text-faint;
+        font-family: Theme.mono;
+        font-size: Theme.fs-small;
+        wrap: word-wrap;
+    }
+}
+
+// SETTINGS — startup, the global writes-paused safety gate, the SAFE-MODE / arm-input switch, the
+// Import WIZARD launcher (a flow), and DIAGNOSTICS: the in-app test BENCH. Nine probe stations in
+// a grid you sweep with one glance, a segmented verdict bar that settles when a run lands, every
+// detail line raw and transparent. This is the user's "prove it works to me" surface.
+
+component DiagCell inherits Rectangle {
+    in property <DiagRow> d;
+    border-radius: Theme.radius;
+    // the frame + ground make a verdict scannable at a glance, not just the tiny lamp
+    background: d.state == "pass" ? Theme.accent-glow
+        : d.state == "fail" ? Theme.danger-glow
+        : Theme.bg-2;
+    border-width: Theme.hair;
+    border-color: d.state == "fail" ? Theme.danger-line
+        : d.state == "pass" ? Theme.accent-line
+        : d.state == "skip" ? Theme.warn-line
+        : Theme.line;
+    VerticalLayout {
+        padding: 12px;
+        spacing: 6px;
+        HorizontalLayout {
+            spacing: 7px;
+            // verdict lamp — a square station light (skip is a real verdict: warn, not faint)
+            Rectangle {
+                width: 6px; height: 6px; border-radius: 1px;
+                y: (parent.height - self.height) / 2;
+                background: root.d.state == "pass" ? Theme.accent
+                    : root.d.state == "fail" ? Theme.danger
+                    : root.d.state == "skip" ? Theme.warn
+                    : Theme.text-faint;
+            }
+            Text {
+                text: root.d.name;
+                color: Theme.text;
+                font-size: Theme.fs-small;
+                font-family: Theme.mono;
+                font-weight: 700;
+                letter-spacing: 0.8px;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+            Rectangle {}
+            Text {
+                // the VERDICT, tracked-out caps — the thing the eye hunts reads as a verdict
+                text: root.d.state == "pass" ? "PASS"
+                    : root.d.state == "fail" ? "FAIL"
+                    : root.d.state == "skip" ? "SKIP" : "—";
+                color: root.d.state == "pass" ? Theme.accent-dim
+                    : root.d.state == "fail" ? Theme.danger
+                    : root.d.state == "skip" ? Theme.warn
+                    : Theme.text-faint;
+                font-size: Theme.fs-small;
+                font-family: Theme.mono;
+                font-weight: 700;
+                letter-spacing: Theme.track-2;
+                vertical-alignment: center;
+            }
+        }
+        Text {
+            text: root.d.detail;
+            color: Theme.text-dim;
+            font-size: Theme.fs-small;
+            font-family: Theme.mono;
+            wrap: word-wrap;
+            overflow: elide;
+        }
+    }
+}
+
+// A definition row: a fixed-width TERM beside its meaning, so a set of modes reads as a scannable
+// stack with the terms aligned down the left, never one run-on sentence.
+component Def inherits HorizontalLayout {
+    in property <string> term;
+    in property <string> desc;
+    in property <length> term-w: 72px;
+    spacing: 12px;
+    VerticalLayout { width: root.term-w; Mono { text: root.term; color: Theme.text-mid; } }
+    VerticalLayout { horizontal-stretch: 1; Mono { text: root.desc; color: Theme.text-dim; wrap: word-wrap; } }
+}
+
+export component SettingsPanel inherits VerticalLayout {
+    spacing: 0;
+    // curated accent hues — a quiet phosphor spread (the default first). Picking one recolours the
+    // whole instrument live; the hex field takes any RRGGBB for a bespoke tint.
+    property <[{hex: string, col: color}]> accent-swatches: [
+        {hex: "4af2b0", col: #4af2b0}, {hex: "5ac8fa", col: #5ac8fa}, {hex: "0a84ff", col: #0a84ff},
+        {hex: "bf5af2", col: #bf5af2}, {hex: "ff375f", col: #ff375f}, {hex: "ff9f0a", col: #ff9f0a},
+        {hex: "ffd60a", col: #ffd60a}, {hex: "30d158", col: #30d158},
+    ];
+    // animate the material gallery swatches only while SYSTEM is open (~16fps — the shaders run
+    // Rust-side; idle pages cost nothing). The cast itself runs at its own 60fps on the overlay.
+    Timer {
+        interval: 60ms;
+        running: State.page == 5;
+        triggered => { State.material-preview-tick(); }
+    }
+    PanelHead {
+        label: "SYSTEM";
+        caption: "startup · safety gates · migration · prove it works";
+    }
+    Rectangle { height: Theme.hair; background: Theme.line; }
+    Rectangle { height: Theme.lead-in; }
+
+    // the page itself scrolls (PanelPage) — no inner whole-panel Flickable.
+    VerticalLayout {
+        VerticalLayout {
+            spacing: 22px;
+
+            HorizontalLayout {
+                spacing: Theme.gap-col;
+                // ── startup + the two safety gates ────────────────────────
+                VerticalLayout {
+                    width: 380px;
+                    spacing: 13px;
+                    // SAFETY GATES LEAD — the two consequential switches, each with a live state pill
+                    // so a paused / armed gate is impossible to miss in a stack of plain toggles.
+                    SectionTitle { text: "SAFETY"; }
+                    // SAFE-MODE: the process-wide input-arm gate. DISARMED = real SendInput is a
+                    // no-op (key remaps / macros simulate only). ARMED = remaps fire for real.
+                    HorizontalLayout {
+                        spacing: 10px;
+                        VerticalLayout { alignment: center; Mono { text: "ARM"; color: Theme.text-dim; } }
+                        Segment {
+                            options: ["OBSERVE", "DEVICE", "INPUT", "LIVE"];
+                            index: State.arm-stance;
+                            min-seg: 60px;
+                            picked(i) => { State.set-arm-stance(i); }
+                        }
+                        Rectangle {}
+                    }
+                    // one stance over both gates, as a scannable list rather than a paragraph.
+                    VerticalLayout {
+                        spacing: 5px;
+                        Def { term: "OBSERVE"; desc: "reads only. no input synthesis, no device writes."; }
+                        Def { term: "DEVICE"; desc: "device writes on. input synthesis stays off."; }
+                        Def { term: "INPUT"; desc: "remaps and macros fire for real. no device writes."; }
+                        Def { term: "LIVE"; desc: "everything on."; }
+                    }
+                    Mono { text: "the two header pills mirror these gates."; color: Theme.text-faint; }
+                    Mono { text: "every device write is backed up, then read back to confirm it landed. reads always work."; color: Theme.text-faint; wrap: word-wrap; }
+                    Divider {}
+                    SectionTitle { text: "STARTUP"; }
+                    HorizontalLayout {
+                        spacing: 10px;
+                        VerticalLayout { alignment: center; Mono { text: "ON LAUNCH"; color: Theme.text-dim; } }
+                        Segment {
+                            options: ["MANUAL", "BOOT → TRAY", "BOOT → WINDOW"];
+                            index: State.launch-mode;
+                            min-seg: 96px;
+                            picked(i) => { State.set-launch-mode(i); }
+                        }
+                        Rectangle {}
+                    }
+                    VerticalLayout {
+                        spacing: 5px;
+                        Def { term-w: 124px; term: "MANUAL"; desc: "you launch it yourself."; }
+                        Def { term-w: 124px; term: "BOOT → TRAY"; desc: "starts with Windows, stays in the tray."; }
+                        Def { term-w: 124px; term: "BOOT → WINDOW"; desc: "starts with Windows, opens the window."; }
+                    }
+                    Mono { text: "double-clicking the tray icon always opens the window."; color: Theme.text-faint; wrap: word-wrap; }
+                    Divider {}
+                    SectionTitle { text: "BEACONS"; }
+                    // condensed: WHAT a beacon is + how you answer one. The old paragraph also described
+                    // an on/off "wait for fullscreen" option that has no control — dropped; the live
+                    // registry below is the real surface (a macro's beacon, visible the moment it exists).
+                    Mono {
+                        text: "a running macro can pause and ask you yes or no. neuron.ask(\"…\") raises a quiet strip; hold the cast trigger and flick to answer:";
+                        color: Theme.text-dim;
+                        wrap: word-wrap;
+                    }
+                    VerticalLayout {
+                        spacing: 4px;
+                        Def { term-w: 26px; term: "→"; desc: "yes"; }
+                        Def { term-w: 26px; term: "←"; desc: "no"; }
+                        Def { term-w: 26px; term: "↕"; desc: "pass"; }
+                    }
+                    if State.beacon-macros.length == 0 : Mono {
+                        text: "no macro asks defined yet. add neuron.ask(\"…\") to one and it shows up here.";
+                        color: Theme.text-faint;
+                        wrap: word-wrap;
+                    }
+                    // one row per macro that calls neuron.ask: a live lamp (lit while THAT macro's beacon
+                    // is on screen now), the macro + its question(s), and a TEST that mock-fires it — the
+                    // real ask rises, but input is disarmed for that fire so none of its real actions run.
+                    for m in State.beacon-macros : HorizontalLayout {
+                        spacing: 8px;
+                        VerticalLayout {
+                            alignment: center;
+                            Rectangle {
+                                width: 6px; height: 6px; border-radius: 1px;
+                                background: (State.beacon-active && State.beacon-macro == m.name)
+                                    ? Theme.accent : Theme.text-faint;
+                                animate background { duration: Theme.quick; }
+                            }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            horizontal-stretch: 1;
+                            spacing: 2px;
+                            Mono { text: m.name; color: Theme.text-mid; overflow: elide; }
+                            if m.asks != "" : Mono { text: "asks  " + m.asks; color: Theme.text-faint; overflow: elide; }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            Button { text: "test"; clicked => { State.test-beacon(m.name); } }
+                        }
+                    }
+                    Divider {}
+                    // APPEARANCE — make it yours. The accent isn't decoration; it's the live signal the
+                    // whole instrument reads by, so this is a real instrument setting, not chrome.
+                    SectionTitle { text: "APPEARANCE"; }
+                    AccentPicker {
+                        label: "INTERFACE";
+                        hint: "one phosphor. every live, active, or connected mark takes its colour from this.";
+                        current: Theme.accent;
+                        value: State.ui-accent;
+                        swatches: root.accent-swatches;
+                        pick(h) => { State.set-ui-accent(h); }
+                    }
+                    AccentPicker {
+                        label: "WEAVE";
+                        hint: "the cast is white light. this is the colour it breaks into at the edges, where its prism fire centres and the rim sits. phosphor is the house look.";
+                        current: State.weave-accent-col;
+                        value: State.weave-accent;
+                        swatches: root.accent-swatches;
+                        pick(h) => { State.set-weave-accent(h); }
+                    }
+                    // MATERIAL — the cast's physics. Each tile is the REAL shader, live: pick the one
+                    // your weave is poured from. The swatch animates so you see the substance breathe.
+                    VerticalLayout {
+                        spacing: 4px;
+                        Text {
+                            text: "MATERIAL";
+                            color: Theme.text-dim; font-family: Theme.mono; font-size: Theme.fs-small;
+                            font-weight: 700; letter-spacing: 1.2px;
+                        }
+                        material-grid := Rectangle {
+                            property <length> gap: 10px;
+                            property <length> cw: (self.width - self.gap) / 2;       // two columns
+                            property <length> th: self.cw * 0.6 + 54px;              // tile = swatch (5:3) + name + a TWO-line blurb (was 38px = 1 line → wrapped blurbs clipped)
+                            property <int> rows: ceil(State.material-cards.length / 2);
+                            height: self.rows * self.th + max(0, self.rows - 1) * self.gap;  // gaps go BETWEEN rows only — no trailing gap eating space before TUNE
+                            for c[i] in State.material-cards : card := Rectangle {
+                                property <bool> sel: c.slug == State.weave-material;
+                                x: mod(i, 2) * (material-grid.cw + material-grid.gap);
+                                y: floor(i / 2) * (material-grid.th + material-grid.gap);
+                                width: material-grid.cw;
+                                height: material-grid.th;
+                                border-radius: Theme.radius;
+                                background: self.sel ? Theme.accent-glow : (mta.has-hover ? Theme.well : Theme.bg-2);
+                                border-width: Theme.hair;
+                                border-color: self.sel ? Theme.accent-line : (mta.has-hover ? Theme.text-faint : Theme.line);
+                                animate background, border-color { duration: Theme.quick; }
+                                clip: true;
+                                VerticalLayout {
+                                    padding: 5px;
+                                    spacing: 4px;
+                                    alignment: start;       // pin to top so the tiny slack is uniform across tiles, never a lopsided bottom gap
+                                    Image {
+                                        source: c.swatch;
+                                        width: parent.width - 10px;
+                                        height: self.width * 0.6;
+                                        image-fit: fill;
+                                    }
+                                    Text {
+                                        text: c.name;
+                                        color: card.sel ? Theme.accent : Theme.text-mid;
+                                        font-family: Theme.mono; font-size: Theme.fs-small; font-weight: 700;
+                                        overflow: elide;
+                                    }
+                                    Text {
+                                        text: c.blurb;
+                                        color: Theme.text-faint; font-family: Theme.mono; font-size: Theme.fs-small;
+                                        wrap: word-wrap;
+                                    }
+                                }
+                                mta := TouchArea {
+                                    mouse-cursor: MouseCursor.pointer;
+                                    clicked => { State.set-weave-material(c.slug); }
+                                }
+                            }
+                        }
+                        // TUNE — the selected material's own knobs (the recipe declares them; the UI
+                        // just renders a slider per row). Reshape the live substance — truly yours.
+                        if State.weave-knobs.length > 0 : VerticalLayout {
+                            padding-top: 2px;
+                            spacing: 7px;
+                            HorizontalLayout {
+                                Text {
+                                    text: "TUNE";
+                                    color: Theme.text-dim; font-family: Theme.mono; font-size: Theme.fs-small;
+                                    font-weight: 700; letter-spacing: 1.2px; vertical-alignment: center;
+                                }
+                                Rectangle {}
+                                rta := TouchArea {
+                                    width: rl.preferred-width; height: 18px;
+                                    mouse-cursor: MouseCursor.pointer;
+                                    clicked => { State.reset-weave-material(); }
+                                    rl := Text {
+                                        text: "reset";
+                                        color: rta.has-hover ? Theme.text-mid : Theme.text-faint;
+                                        font-family: Theme.mono; font-size: Theme.fs-small; vertical-alignment: center;
+                                    }
+                                }
+                            }
+                            for k[i] in State.weave-knobs : HorizontalLayout {
+                                spacing: 9px;
+                                VerticalLayout {
+                                    alignment: center;
+                                    width: 96px;
+                                    Text {
+                                        text: k.label;
+                                        color: Theme.text-dim; font-family: Theme.mono; font-size: Theme.fs-small;
+                                        overflow: elide;
+                                    }
+                                }
+                                VerticalLayout {
+                                    alignment: center;
+                                    horizontal-stretch: 1;
+                                    Slider {
+                                        compact: true;
+                                        minimum: k.min; maximum: k.max; value: k.value;
+                                        step: (k.max - k.min) / 100;
+                                        wheel: false;
+                                        changed(v) => { State.set-weave-knob(i, v); }
+                                    }
+                                }
+                                VerticalLayout {
+                                    alignment: center;
+                                    width: 42px;
+                                    Text {
+                                        text: round(k.value * 100) / 100;
+                                        color: Theme.text-mid; font-family: Theme.mono; font-size: Theme.fs-small;
+                                        horizontal-alignment: right;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ── RIGHT COLUMN = DATA & PROOF ───────────────────────────────
+                // A clean split from the left's BEHAVIOUR & FEEL: this side is where your config lives,
+                // how a Synapse export migrates in, and the live "prove it works" bench. The bench is the
+                // hero (it stretches to fill), so config sits as a tight utility block above it.
+                VerticalLayout {
+                    horizontal-stretch: 1;
+                    spacing: 13px;
+                    SectionTitle { text: "CONFIG & MIGRATION"; }
+                    Label { text: "every setting is plain, hand-editable TOML and JSON in the run folder: bindings.toml, cast.toml, apps.toml, gestures.json, plus profiles/ and backups/."; }
+                    HorizontalLayout {
+                        spacing: 7px;
+                        Button { text: "open config folder"; clicked => { State.open-config-dir(); } }
+                        Button {
+                            text: "import from Synapse…";
+                            clicked => { State.import-open = true; }
+                        }
+                        Rectangle {}
+                    }
+                    Mono { text: "import is a one-time flow. it reads the plaintext export, normalises it, then applies it."; color: Theme.text-faint; wrap: word-wrap; }
+
+                    // PURGE SYNAPSE — once you've migrated in, evict Razer's resident slopware. Disables +
+                    // stops the respawning SYSTEM services then terminates the whole Razer process tree.
+                    // alignment:start so the lone action sizes to its LABEL instead of stretching the column
+                    // (a single button in a default-stretch row eats the whole width).
+                    HorizontalLayout {
+                        alignment: start;
+                        Button {
+                            text: "purge Synapse";
+                            clicked => { State.purge-synapse(); }
+                        }
+                    }
+                    Mono {
+                        text: State.purge-status == "" ? "kills every Razer Synapse process + stops its services so they can't respawn. asks for admin." : State.purge-status;
+                        color: State.purge-status == "" ? Theme.text-faint : Theme.text;
+                        wrap: word-wrap;
+                    }
+
+                    Divider {}
+
+                    // ── RELIABILITY — the flight recorder, surfaced ───────────
+                    // Always-on, crash-surviving: uptime, every worker's live heartbeat, the on-disk
+                    // crash record, and the phoenix auto-restart. The machine showing its own vitals.
+                    HorizontalLayout {
+                        VerticalLayout {
+                            spacing: 3px;
+                            SectionTitle { text: "RELIABILITY"; }
+                            Mono { text: "the flight recorder. always on, survives crashes."; color: Theme.text-faint; }
+                        }
+                        Rectangle {}
+                        VerticalLayout {
+                            alignment: center;
+                            HorizontalLayout {
+                                spacing: 6px;
+                                Mono { text: "UPTIME"; color: Theme.text-faint; }
+                                Mono { text: State.uptime; color: Theme.text; }
+                            }
+                        }
+                    }
+                    // worker heartbeats — a lamp per organ (green beating · dim at rest · red stalled)
+                    VerticalLayout {
+                        spacing: 7px;
+                        for o in State.organs : HorizontalLayout {
+                            spacing: 10px;
+                            Rectangle {
+                                width: 6px; height: 6px; border-radius: 1px;
+                                y: (parent.height - self.height) / 2;
+                                background: o.state == "beat" ? Theme.accent
+                                    : o.state == "stall" ? Theme.danger
+                                    : Theme.text-faint;
+                                animate background { duration: Theme.quick; }
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                width: 120px;
+                                Text {
+                                    text: o.name;
+                                    color: o.state == "stall" ? Theme.danger : Theme.text-mid;
+                                    font-family: Theme.mono; font-size: Theme.fs-small; font-weight: 700;
+                                    letter-spacing: Theme.track-2;
+                                }
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                Text {
+                                    text: o.detail;
+                                    color: o.state == "stall" ? Theme.danger : Theme.text-faint;
+                                    font-family: Theme.mono; font-size: Theme.fs-small;
+                                }
+                            }
+                            Rectangle {}
+                        }
+                    }
+                    // the crash record — honest about whether this app has ever fallen over
+                    Text {
+                        text: State.crash-summary;
+                        color: State.crash-present ? Theme.warn : Theme.text-faint;
+                        font-family: Theme.mono; font-size: Theme.fs-small;
+                        wrap: word-wrap;
+                    }
+                    // phoenix — bare toggle (switch = state, flush-right) with the feature name carried
+                    // as a quiet sub-note, exactly like the audio-cue row. Not a parenthetical.
+                    VerticalLayout {
+                        spacing: 3px;
+                        Toggle {
+                            caption: "auto-restart on crash";
+                            checked: State.phoenix;
+                            toggled(v) => { State.set-phoenix(v); }
+                        }
+                        Mono { text: "PHOENIX. Windows relaunches Neuron if it crashes or hangs."; color: Theme.text-faint; }
+                    }
+                    HorizontalLayout {
+                        spacing: 7px;
+                        Button { text: "write flight dump"; clicked => { State.write-flight-dump(); } }
+                        Button { text: "open crash log"; clicked => { State.open-crash-log(); } }
+                        Rectangle {}
+                    }
+
+                    Divider {}
+
+                    // ── NOTIFICATIONS — state-change confirmation cards ───────
+                    HorizontalLayout {
+                        spacing: 10px;
+                        VerticalLayout {
+                            alignment: center;
+                            spacing: 3px;
+                            SectionTitle { text: "NOTIFICATIONS"; }
+                            Mono { text: "confirms what you change. never announces."; color: Theme.text-faint; }
+                        }
+                        Rectangle {}
+                        VerticalLayout {
+                            alignment: center;
+                            Button { text: "test"; primary: true; clicked => { State.test-notification(); } }
+                        }
+                    }
+                    // the body groups as one block with an even rhythm; tight sub-groups bind a control
+                    // to its own caption (toggle↔note, label↔chips) instead of the loose section gap.
+                    VerticalLayout {
+                        spacing: 12px;
+                        // master switch — the toggle IS the state; no redundant lamp beside it.
+                        Toggle {
+                            caption: "notifications";
+                            checked: State.notif-enabled;
+                            toggled(v) => { State.set-notif-enabled(v); }
+                        }
+                        // placement — where the card lands (OFF = no card)
+                        HorizontalLayout {
+                            spacing: 12px;
+                            VerticalLayout { alignment: center; Mono { text: "WHERE"; color: Theme.text-dim; } }
+                            Segment {
+                                options: ["OFF", "TOP L", "TOP R", "BOT L", "BOT R", "INLINE"];
+                                min-seg: 56px;
+                                index: (State.notif-placement == "off" ? 0
+                                    : State.notif-placement == "top-left" ? 1
+                                    : State.notif-placement == "top-right" ? 2
+                                    : State.notif-placement == "bottom-left" ? 3
+                                    : State.notif-placement == "bottom-right" ? 4
+                                    : 5);
+                                picked(i) => { State.set-notif-placement(
+                                    i == 0 ? "off" : i == 1 ? "top-left" : i == 2 ? "top-right"
+                                    : i == 3 ? "bottom-left" : i == 4 ? "bottom-right" : "inline"); }
+                            }
+                            Rectangle {}
+                        }
+                        // card background — the grounded squircle (app-card chrome) vs the floating spell.
+                        Toggle {
+                            caption: "card background";
+                            checked: State.notif-panel;
+                            toggled(v) => { State.set-notif-panel(v); }
+                        }
+                        // sound — toggle, then (when on) volume + the voice picker.
+                        VerticalLayout {
+                            spacing: 8px;
+                            Toggle {
+                                caption: "audio cue";
+                                checked: State.notif-audio;
+                                toggled(v) => { State.set-notif-audio(v); }
+                            }
+                            if State.notif-audio : HorizontalLayout {
+                                spacing: 12px;
+                                VerticalLayout { alignment: center; width: 52px; Mono { text: "VOLUME"; color: Theme.text-dim; } }
+                                VerticalLayout {
+                                    alignment: center;
+                                    horizontal-stretch: 1;
+                                    Slider {
+                                        compact: true;
+                                        minimum: 0.0;
+                                        maximum: 1.0;
+                                        value: State.notif-volume;
+                                        step: 0.05;
+                                        wheel: false;
+                                        changed(v) => { State.set-notif-volume(v); }
+                                    }
+                                }
+                            }
+                            if State.notif-audio : HorizontalLayout {
+                                spacing: 12px;
+                                VerticalLayout { alignment: center; width: 52px; Mono { text: "VOICE"; color: Theme.text-dim; } }
+                                Segment {
+                                    options: ["PULSE", "WARM", "GLASS"];
+                                    min-seg: 64px;
+                                    index: (State.notif-sound == "warm" ? 1 : State.notif-sound == "glass" ? 2 : 0);
+                                    picked(i) => { State.set-notif-sound(i == 1 ? "warm" : i == 2 ? "glass" : "pulse"); }
+                                }
+                                Rectangle {}
+                            }
+                        }
+                        // which events earn a card — lit CHIPS, not a wall of switches. Tap to toggle:
+                        // a chip glows accent when that change will raise a card, dark when it won't.
+                        VerticalLayout {
+                            spacing: 7px;
+                            Mono { text: "WHICH CHANGES EARN A CARD"; color: Theme.text-dim; }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                Pill { text: "dpi"; clickable: true; selected: State.notif-dpi; clicked => { State.set-notif-event("dpi", !State.notif-dpi); } }
+                                Pill { text: "sensitivity"; clickable: true; selected: State.notif-scroll; clicked => { State.set-notif-event("scroll", !State.notif-scroll); } }
+                                Pill { text: "polling"; clickable: true; selected: State.notif-polling; clicked => { State.set-notif-event("polling", !State.notif-polling); } }
+                                Pill { text: "brightness"; clickable: true; selected: State.notif-brightness; clicked => { State.set-notif-event("brightness", !State.notif-brightness); } }
+                                Pill { text: "profile"; clickable: true; selected: State.notif-profile; clicked => { State.set-notif-event("profile", !State.notif-profile); } }
+                                Pill { text: "layer"; clickable: true; selected: State.notif-layer; clicked => { State.set-notif-event("layer", !State.notif-layer); } }
+                                Rectangle {}
+                            }
+                        }
+                    }
+
+                    Divider {}
+
+                    // ── DIAGNOSTICS — the in-app test bench ───────────────────
+                    HorizontalLayout {
+                        spacing: 10px;
+                        VerticalLayout {
+                            alignment: center;
+                            spacing: 3px;
+                            SectionTitle { text: "DIAGNOSTICS"; }
+                            Mono { text: "fires every capability live, so you can prove it works."; color: Theme.text-faint; }
+                        }
+                        Rectangle {}
+                        // the run trigger sizes to its own label (no fixed-width slot floating in space)
+                        VerticalLayout {
+                            alignment: center;
+                            Button {
+                                text: "run diagnostics";
+                                primary: true;
+                                busy: State.diag-running;
+                                clicked => { State.run-diagnostics(); }
+                            }
+                        }
+                    }
+                    // segmented verdict bar — pass/fail/skip as proportional widths, settling mechanically.
+                    // The bar shows once a run lands; the summary line is ALWAYS present (rendered once).
+                    VerticalLayout {
+                        spacing: 5px;
+                        if State.diag-pass + State.diag-fail + State.diag-skip > 0 : Rectangle {
+                            height: 6px;
+                            border-radius: 1px;
+                            clip: true;
+                            property <int> total: max(1, State.diag-pass + State.diag-fail + State.diag-skip);
+                            // absolute segments (no inner layout — it would feed back into this width)
+                            property <length> w-pass: self.width * State.diag-pass / self.total;
+                            property <length> w-fail: self.width * State.diag-fail / self.total;
+                            Rectangle {
+                                x: 0; width: parent.w-pass; height: parent.height;
+                                background: Theme.accent;
+                                animate width { duration: Theme.settle; }
+                            }
+                            Rectangle {
+                                x: parent.w-pass + 1px; width: parent.w-fail; height: parent.height;
+                                background: Theme.danger;
+                                animate width { duration: Theme.settle; }
+                            }
+                            // the skip remainder ONLY when there are skips — no phantom sliver at 0
+                            if State.diag-skip > 0 : Rectangle {
+                                x: parent.w-pass + parent.w-fail + 2px;
+                                width: max(0px, parent.width - parent.w-pass - parent.w-fail - 2px);
+                                height: parent.height;
+                                background: Theme.text-faint;
+                                animate width { duration: Theme.settle; }
+                            }
+                        }
+                        Mono { text: State.diag-summary; color: Theme.text-mid; }
+                    }
+                    // the bench grid — 3 stations per row, arithmetic placement (no lazy list). It
+                    // STRETCHES to absorb the column's slack (so config packs tight at the top and the
+                    // "prove it works" grid fills the rest), with a 3-row floor so the 9 stations always show.
+                    bench := Rectangle {
+                        vertical-stretch: 1;
+                        property <length> cw: (self.width - 20px) / 3;
+                        min-height: ceil(max(3, State.diagnostics.length) / 3) * 96px;
+                        for d[i] in State.diagnostics : DiagCell {
+                            d: d;
+                            x: mod(i, 3) * (bench.cw + 10px);
+                            y: floor(i / 3) * 96px;
+                            width: bench.cw;
+                            height: 86px;
+                        }
+                        if State.diagnostics.length == 0 : VerticalLayout {
+                            alignment: center; spacing: 5px;
+                            Mono { text: "no probes have run"; color: Theme.text-dim; horizontal-alignment: center; }
+                            Mono { text: "press run diagnostics to fire every capability live"; color: Theme.text-faint; horizontal-alignment: center; }
+                        }
+                    }
+                }
+            }
+
+            Divider {}
+            // ── ABOUT — the instrument's nameplate (version + where it lives) ──
+            HorizontalLayout {
+                spacing: 8px;
+                VerticalLayout {
+                    spacing: 3px;
+                    SectionTitle { text: "ABOUT"; }
+                    Mono { text: "neuron " + (State.app-version == "" ? "unknown" : State.app-version); color: Theme.text-mid; }
+                    Mono { text: State.run-dir == "" ? "" : State.run-dir; color: Theme.text-faint; overflow: elide; }
+                }
+                Rectangle {}
+            }
+            Rectangle { height: 24px; }
+        }
+    }
+}

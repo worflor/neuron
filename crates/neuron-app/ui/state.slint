@@ -1,0 +1,429 @@
+// The single shared State global — every property the Rust runtime pushes into the view, and
+// every callback the view invokes back. One global = the Rust glue binds one object and the panels
+// read/write `State.*`. This is the GUI's whole API to the engine.
+//
+// NAVIGATION (the void/Zune cull): SIX warranted panels, indexed 0..5 —
+//   0 Device   1 Lighting   2 Bindings   3 Spellweaving   4 Profiles   5 Settings
+// Audio (mic = Actions), Radial (folded into Spellweaving), Import (a wizard flow), and the
+// Dashboard/Performance split all stopped being top-level seats.
+
+import {
+    DeviceRow, RuleRow, ProfileRow, AppRuleRow, EffectRow, RadialSector, GlyphChip, ImportLine,
+    DiagRow, ActionChoice, GraphNode, GraphEdge, LayerRow, OrganRow, MaterialCard, KnobRow,
+    PocketCard, BeaconMacro, RhythmBindRow
+} from "models.slint";
+
+export global State {
+    // ── global runtime status (mirrored in the header + tray) ────────────
+    in-out property <bool> writes-paused: false;     // the device-write safety gate switch
+    in-out property <bool> input-armed: false;       // SAFE-MODE gate: real SendInput is a no-op unless ARMED
+    // ARM STANCE — one selector over the two gates above (the header pills still read the bools live):
+    // 0 OBSERVE (paused + safe) · 1 DEVICE (writes on, safe) · 2 INPUT (synth on, paused) · 3 LIVE (both).
+    in-out property <int> arm-stance: 0;
+    callback set-arm-stance(int);
+    in-out property <bool> hypershift-on: false;     // software hold-layer active
+    in-out property <bool> runtime-active: false;    // the LIVE dispatch loop is running
+    in-out property <string> active-profile: "—";
+    // ABOUT nameplate — set once at startup by the runtime (version from CARGO_PKG_VERSION, run dir)
+    in-out property <string> app-version: "";
+    in-out property <string> run-dir: "";
+    in-out property <string> status-line: "ready";   // the live status readout
+    in-out property <string> status-kind: "info";    // "info" | "err" — failures get the alarm tint
+    in-out property <bool> status-stale: false;      // message has aged out (dim it — freshness is honest)
+    in-out property <string> focused-app: "—";       // app-aware switch input
+
+    // ── LIVE DISPATCH readouts (pushed from the worker thread) ───────────
+    in-out property <string> live-last-trigger: "—"; // last trigger the engine fired
+    in-out property <string> live-last-action: "—";  // its action result line
+    in-out property <string> live-held: "";          // currently-held HyperShift layer(s)
+    in-out property <int> live-fired: 0;             // total triggers dispatched this session
+
+    // ── press-to-bind capture (shared overlay) ───────────────────────────
+    in-out property <bool> capture-active: false;     // a press-to-bind capture is in flight
+    in-out property <string> capture-prompt: "";      // "press the control you want…"
+    callback cancel-capture();
+
+    // ── BEACON (two-part macros: a python macro is asking yes/no) ────────
+    in-out property <bool> beacon-active: false;      // a prompt is presented at the cursor
+    in-out property <string> beacon-text: "";         // "macro · question"
+    in-out property <string> beacon-macro: "";        // the id of the macro presenting right now ("" = none)
+    in-out property <string> beacon-hint: "";         // the answer gesture, spelled out
+    in-out property <int> beacon-count: 0;            // presented + queued prompts
+    // the macros whose source calls neuron.ask — the SYSTEM panel's live BEACONS registry. Refreshed
+    // at startup + after a macro save. `test-beacon` MOCK-fires one (real ask, no real-world effects).
+    in-out property <[BeaconMacro]> beacon-macros;
+    callback test-beacon(string);                     // macro id → mock-fire it so its real beacon rises
+
+    // ── navigation ───────────────────────────────────────────────────────
+    in-out property <int> page: 0;                   // selected section (0..3: DEVICE LIGHTING INPUT SYSTEM)
+    in-out property <int> input-view: 0;             // INPUT depth: 0 = DIRECT (bindings), 1 = WEAVE (spellweaving)
+    in-out property <string> gesture-predict: "";    // live "what the stroke is becoming" (chip highlight)
+    callback try-teleport();                         // prime teleport on a plain hold (no rhythm needed)
+    callback try-whiteboard();                       // open a whiteboard session right now
+    in-out property <bool> profile-sheet-open: false; // the PROFILES sheet (a global affordance, not a section)
+
+    // ── Device (merged Dashboard + Performance) ──────────────────────────
+    in-out property <[DeviceRow]> devices;
+    in-out property <int> selected-device: 0;        // index into devices
+    in-out property <string> selected-device-name: "—"; // the channel every per-device panel tunes
+    // the selected device's KIND drives which control cards the panel shows (a mic shows volume/mute,
+    // a mouse shows DPI/polling/sniper). "" = nothing selected. Set on refresh + on select.
+    in-out property <string> selected-device-kind: ""; // mouse | keyboard | device | mic | output
+    // the SELECTED device's capabilities (from its descriptor) — the panel shows a control only when
+    // the device can actually do it. Set on selection from the chosen row's cap-* flags.
+    in-out property <bool> sel-can-dpi: false;
+    in-out property <bool> sel-can-poll: false;
+    in-out property <bool> sel-can-light: false;
+    in-out property <bool> sel-can-scroll: false;
+    in-out property <bool> sel-can-store: false;
+    in-out property <bool> sel-can-idle: false;
+    // audio-endpoint controls (shown when the selected device is a mic/output): act on the selected
+    // endpoint by its id, NOT the system default.
+    in-out property <float> device-volume: 50;       // 0..100
+    in-out property <bool> device-muted: false;
+    callback set-device-volume(float);
+    callback toggle-device-mute();
+    callback refresh-devices();
+    callback select-device(int);
+    callback backup-device(string);                  // pid
+    in-out property <float> dpi: 1600;
+    in-out property <float> polling-hz: 1000;
+    in-out property <float> brightness: 75;
+    in-out property <bool> persist-to-onboard: false;
+    callback set-persist(bool);                      // the ONE write path into the runtime's persist flag
+    callback apply-dpi(float);
+    callback apply-polling(float);
+    callback apply-brightness(float);
+
+    // ── EVERY perf control Synapse buries (Device panel) ─────────────────
+    // DPI STAGE LIST — the cycle, applied as a full table (writes::set_dpi_stages).
+    in-out property <string> dpi-stages: "800/1600/3200";  // editable "/"-separated list
+    in-out property <[int]> dpi-stage-nums: [800, 1600, 3200]; // parsed stages (chips + fader detents)
+    in-out property <int> dpi-active-stage: 0;
+    in-out property <bool> dpi-stages-valid: true;
+    in-out property <string> dpi-stages-note: "3 stages ready";
+    callback dpi-stages-edited(string);              // re-parse the list into dpi-stage-nums
+    callback apply-dpi-stages(string, int);
+    // SCROLL / HyperScroll stages (gated until class 0x0B is hardware-verified).
+    in-out property <string> scroll-stages: "tactile/free";
+    in-out property <bool> scroll-stages-valid: true;
+    in-out property <string> scroll-stages-note: "2 modes ready";
+    callback scroll-stages-edited(string);
+    callback apply-scroll-stages(string);
+    // SNIPER / hold-to-precision-DPI — bind a button (press-to-bind) + target DPI.
+    in-out property <string> sniper-button: "—";
+    in-out property <float> sniper-dpi: 400;
+    callback capture-sniper-button();
+    callback save-sniper(float);
+    // SLEEP / idle-off timer (seconds). Read-back shown; write verify-gated (NEURON_IDLE_WRITE).
+    in-out property <float> idle-secs: 300;
+    in-out property <string> idle-secs-text: "300";
+    in-out property <bool> idle-secs-valid: true;
+    in-out property <string> idle-secs-note: "300s ready";
+    in-out property <string> idle-readout: "—";       // live read of the current device value
+    callback idle-edited(string);
+    callback apply-idle(float);
+    // IN-GAME polling (wired/dongle split). Verify-gated (NEURON_INGAME_POLL_WRITE).
+    in-out property <float> ingame-wired-hz: 1000;
+    in-out property <float> ingame-dongle-hz: 1000;
+    callback apply-ingame-polling(float, float);
+    // GAMING MODE / disable-alt-tab (host-side LL hook, no device write).
+    // KEY GUARD — a multi-select of OS chords to swallow mid-game (one control, grows by chord, not
+    // by a new toggle each time). Each bool is one chip; `apply-gaming-mode` rebuilds the live policy.
+    in-out property <bool> disable-alt-tab: false;
+    in-out property <bool> disable-win: false;
+    in-out property <bool> disable-alt-f4: false;
+    in-out property <bool> disable-alt-esc: false;
+    callback apply-gaming-mode();
+    // LIFT-OFF distance + DEBOUNCE — honest hardware-pending stubs (greyed, [gated]).
+    in-out property <bool> lod-supported: false;       // false until the opcode is RE'd
+    in-out property <bool> debounce-supported: false;
+    in-out property <string> perf-status: "";          // last perf-control result line
+
+    // ── Lighting ─────────────────────────────────────────────────────────
+    in-out property <[EffectRow]> effects;            // the full set (tray + apply key on idx order)
+    in-out property <[EffectRow]> effects-fw;          // firmware-native bank (display)
+    in-out property <[EffectRow]> effects-sw;          // Neuron-computed bank (display)
+    in-out property <int> selected-effect: -1;       // the cursor (browsing) — hairline, never accent
+    in-out property <int> applied-effect: -1;        // what the DEVICE is actually running — the accent
+    in-out property <string> light-color: "4AF2B0";  // hex RRGGBB (the phosphor accent default)
+    in-out property <bool> light-color-valid: true;  // live parse verdict for the hex field
+    in-out property <color> brush-color: #4af2b0;     // parsed brush colour (Rust keeps in sync)
+    in-out property <int> grid-rows: 0;
+    in-out property <int> grid-cols: 0;
+    in-out property <[color]> grid-px;               // rows*cols, row-major
+    in-out property <string> grid-kind: "";          // registry icon hint ("keyboard"/"mouse"/…)
+    in-out property <bool> light-paint-mode: false;  // EFFECTS (live render) vs PAINT (per-LED)
+    in-out property <bool> animating: false;
+    callback preview-tick();                         // mirror the applied effect onto the render
+    callback apply-effect(int);                      // effect index -> set on device
+    callback animate-effect(int);                    // stream it live
+    callback stop-animation();
+    callback color-changed(string);
+    callback paint-cell(int);                        // index into grid-px (paint w/ current color)
+    callback erase-cell(int);                        // paint the off colour (right-click erase)
+    callback clear-grid();                           // whole frame -> off
+    callback fill-grid();                            // whole frame -> brush colour
+    callback push-frame();                           // send the painted grid to the device
+
+    // ── Lighting COMPOSITOR — the layered effect studio ──────────────────
+    in-out property <[LayerRow]> light-layers;       // the stack (index 0 = bottom)
+    in-out property <int> selected-layer: -1;        // which layer the editor + region paint act on
+    in-out property <bool> light-region-edit: false; // paint the selected layer's region on the render
+    in-out property <bool> compositing: false;       // the stack is streaming live to the device
+    callback add-layer(string);                      // append a layer of the given effect, select it
+    callback remove-layer(int);
+    callback select-layer(int);
+    callback move-layer(int, int);                   // (index, dir) — restack: dir -1 down / +1 up
+    callback toggle-layer(int);                      // enable/disable in the composite
+    callback set-layer-effect(int, string);
+    callback set-layer-color(int, string);
+    callback set-layer-speed(int, float);
+    callback set-layer-direction(int, int);
+    callback set-layer-blend(int, string);
+    callback clear-layer-region(int);                // region -> whole device
+    callback paint-region(int);                      // render cell -> add to selected layer's region
+    callback erase-region(int);                      // render cell -> remove from region
+    callback composite-apply();                      // stream the composite live to the device
+    callback composite-stop();
+    callback import-light-file();                    // pick a .ChromaEffects / .synapse3 → frame or layer
+
+    // ── Bindings (remap + HyperShift + macros + mic-as-Actions) ──────────
+    in-out property <[RuleRow]> rules;
+    in-out property <[RuleRow]> hypershift-rules;
+    // POCKETS — portable clipboards. Each carries its emergent content-sigil + legible summary;
+    // rebuilt from neuron-core only when a pocket actually changes (a generation counter).
+    in-out property <[PocketCard]> pockets;
+    callback reload-bindings();
+    callback remove-rule(int);                        // remove a GUI-authored BASE rule by row index
+    callback remove-hyper-rule(int);                  // remove a GUI-authored HYPERSHIFT rule by row index
+    // the HyperShift STANCE — hold (momentary, Razer's only mode) | latch (tap on/off) |
+    // smart (tap latches, hold is momentary) | one-shot (next press only). Persisted in feel.toml.
+    in-out property <string> hypershift-mode: "hold";
+    callback set-hypershift-mode(string);
+    // GRAPH VIEW — the spine as a node board (triggers → actions, macro chains as step nodes).
+    // Timings ride on the connections; angles are shown at each chip. Layout persists.
+    in-out property <bool> graph-view: false;
+    in-out property <[GraphNode]> graph-nodes;
+    in-out property <[GraphEdge]> graph-edges;
+    in-out property <int> selected-edge: -1;
+    callback move-node(int, float, float);            // node index, new canvas x/y (while dragging)
+    callback node-dropped();                          // drag ended — persist the layout
+    callback set-edge-timing(int, string);            // edge index, new value (ms or cps)
+    in-out property <int> editable-count: 0;          // how many of `rules` are GUI-authored (the tail)
+    in-out property <int> editable-hyper-count: 0;    // same for the hypershift column
+    // PRESS-TO-BIND a new spine rule: capture the HID control you press, pick an Action, write it to
+    // the GUI rules sidecar (profiles/gui.rules.toml). No hardcoded buttons.
+    in-out property <string> bind-trigger-label: "—"; // friendly name of the captured trigger
+    in-out property <bool> bind-trigger-ready: false; // a trigger has been captured
+    in-out property <bool> bind-hypershift: false;    // author this on the HyperShift layer
+    // the action being authored — picked from a typed list with one parameter field
+    in-out property <[ActionChoice]> action-choices;  // the Action palette (key / run / mic / dpi / …)
+    in-out property <int> action-choice: 0;           // selected action index
+    in-out property <string> action-param: "";        // the action's parameter (key name / cmd / delta)
+    in-out property <[string]> param-suggestions;     // clickable fills for the param (windows / profiles / macros)
+    callback action-choice-changed();                  // the picker moved — recompute suggestions
+    callback capture-action-param();                   // press-to-fill: capture a key/chord/button into the param
+    callback record-action-keys();                     // toggle the key-sequence recorder (REC ⇄ STOP)
+    in-out property <bool> recording-keys: false;      // a sequence take is rolling
+    callback capture-trigger();                        // start HID control capture for a new bind
+    callback add-binding();                            // commit the captured trigger + chosen action
+    // mic gain/mute are surfaced here as Actions (no longer a top-level Audio panel)
+    in-out property <string> mic-name: "—";
+    in-out property <float> mic-gain: 100;
+    in-out property <bool> mic-muted: false;
+    callback set-mic-gain(float);
+    callback toggle-mic-mute();
+    callback refresh-mic();
+    // OUTPUT (render) side — headphones / sound card / speakers volume + mute (Core Audio, generic).
+    // The matching bindable Actions are out-gain / out-mute in the palette.
+    in-out property <string> out-name: "—";
+    in-out property <float> out-gain: 100;
+    in-out property <bool> out-muted: false;
+    callback set-out-gain(float);
+    callback toggle-out-mute();
+    callback refresh-out();
+    // macro authoring: write PYTHON -> check (syntax) -> save+register -> test run.
+    // A macro is real CPython run warm by the Macro Host sidecar (full power: ctypes/subprocess/
+    // anything). `def macro(ctx):` is the entry; `import neuron` gives ctx + key/clipboard/mouse/run.
+    in-out property <string> macro-name: "";          // the macro's name (file stem + registry id)
+    in-out property <string> macro-source: "";
+    in-out property <[string]> macro-dryrun;          // defs found (after check) / log lines (after test)
+    in-out property <string> macro-status: "Write a Python macro: def macro(ctx): ...";
+    in-out property <bool> macro-busy: false;
+    callback macro-check(string);                     // ast.parse only — no execution
+    callback macro-save(string, string);              // (name, source) -> persist + register warm
+    callback macro-test(string, string);              // (name, source) -> register + run once now
+
+    // ── Spellweaving (merged gesture + radial: two facets of the cast engine) ─
+    in-out property <[GlyphChip]> glyphs;             // the vault, each chip carrying its bound action
+    in-out property <bool> capturing-gesture: false;
+    in-out property <string> gesture-status: "idle";
+    in-out property <string> radial-status: "";       // wheel-side feedback (lives BY the wheel)
+    in-out property <[float]> trail;                 // normalized live/last trail (x,y interleaved)
+    callback record-gesture();
+    callback clear-gestures();
+    callback delete-gesture(string);                  // remove ONE glyph (template + its binding)
+    callback rename-gesture(string, string);          // (old, new) — keeps the cast binding attached
+    // cast trigger (the hold button) — press-to-bind, NEVER hardcoded (seeded from cast.toml)
+    in-out property <string> cast-trigger-label: "—";
+    callback capture-cast-trigger();
+    // the ACTIVATION RHYTHM on that trigger — a feel::Phrase ("hold", "tap hold", "tap tap", …).
+    // Presets cover the sane ones; record-activation captures YOUR rhythm and normalizes it.
+    in-out property <string> activation-pattern: "hold";
+    in-out property <string> activation-display: "▬";   // the rhythm as symbols (● tap · ▬ hold · ⇄ toggle)
+    in-out property <bool> recording-activation: false;
+    callback set-activation(string);
+    callback record-activation();
+    // bind a recorded glyph -> an Action (uses the shared action palette)
+    in-out property <string> gesture-bind-target: ""; // the glyph name being bound
+    callback bind-gesture(string);                     // open the action picker for this glyph
+    callback commit-gesture-bind();                    // write the glyph->action into cast.toml
+    // ── THE RHYTHM MAP — each cast rhythm (N taps then hold) is a first-class Trigger::Cast bound
+    // to any Action, remappable here. taps = the tap count (1 = tap-hold, 2 = tap-tap-hold, …);
+    // label = the rhythm in symbols; desc = the bound action; bound = action != Noop. The weave
+    // (plain hold) is NOT in this list — it keeps its own row + rhythm recorder above.
+    in-out property <[RhythmBindRow]> rhythm-binds;
+    in-out property <int> rhythm-bind-target: -1;      // which rhythm's taps is being bound (-1 = none)
+    callback bind-rhythm(int);                          // open the action picker for this rhythm (by taps)
+    callback commit-rhythm-bind();                      // write the chosen action into cast.toml's rhythm_actions
+    callback delete-rhythm(int);                        // unbind a rhythm (remove the RhythmBind by taps)
+    in-out property <int> radial-sectors: 8;
+    in-out property <int> radial-max: 16;             // COMPUTED cap: 2π·deadzone / hand-jitter (no manual cap)
+    in-out property <[RadialSector]> radial-items;
+    in-out property <int> radial-preview-sector: -1; // hovered/active wedge
+    callback set-sector-count(int);
+    // SPELL ASSIST — recognition FORGIVENESS (continuous): how far past the strict gate a near-miss
+    // may sit and still snap to the closest spell (clear-winner only). 0 = off (strict). The engine's
+    // `assist` margin IS this value (0.0..0.6), so it's a slider, not an on/off — a bool would throw
+    // the dimension away.
+    in-out property <float> weave-assist: 0.35;
+    callback set-weave-assist(float);
+    callback preview-radial();                         // hold-trigger + flick to test the wheel (same overlay)
+    // per-sector radial action editor: pick a wedge, choose an Action, write cast.toml
+    callback edit-sector(int);                         // open the action picker for sector i
+    callback commit-sector-action();                   // write the chosen action into the sector
+    in-out property <int> editing-sector: -1;          // which sector the action picker targets
+    // HYPERSHIFT RADIAL — a parallel wedge set (same sectors) shown only while HyperShift is held.
+    // Off by default; reuses the SAME editor — `radial-edit-hyper` just retargets which set is shown/written.
+    in-out property <bool> hyper-radial-on: false;     // enable the HyperShift radial swap (persists to cast.toml)
+    callback set-hyper-radial-on(bool);
+    in-out property <bool> radial-edit-hyper: false;   // the editor is authoring the HyperShift set (vs base)
+    callback set-radial-edit-hyper(bool);
+
+    // ── Profiles & App-Rules (active-profile switch is a global element) ──
+    in-out property <[ProfileRow]> profiles;
+    in-out property <[string]> profile-names;          // the legal targets for an app rule
+    in-out property <[AppRuleRow]> app-rules;
+    in-out property <int> active-app-rule: -1;         // which rule the FOCUSED app matches right now
+    in-out property <bool> profile-name-exists: false; // typed save-name collides (save = overwrite)
+    callback profile-name-edited(string);              // glue answers profile-name-exists
+    callback apply-profile(string);
+    callback save-current-profile(string);
+    callback delete-profile(string);
+    callback add-app-rule(string, string);           // app-needle, profile
+    callback remove-app-rule(int);
+
+    // ── Settings: startup + gate + theme + Import WIZARD (a flow) + DIAGNOSTICS ─
+    // LAUNCH behaviour — one selector instead of two booleans (autostart + minimized) that could
+    // express a dead combo. 0 = Manual (no autostart) · 1 = Boot to tray (autostart, resident) ·
+    // 2 = Boot with window (autostart, window shown).
+    in-out property <int> launch-mode: 0;
+    callback set-launch-mode(int);
+    // APPEARANCE — the user's two tunable colours (bare RRGGBB), mirrored from app.toml at startup.
+    // `set-ui-accent` recolours the whole instrument live (Theme.accent + derived) and persists;
+    // `set-weave-accent` retints the spellweaving cast/glyph/sigil and persists.
+    in-out property <string> ui-accent: "4af2b0";
+    in-out property <string> weave-accent: "4af2b0";
+    in-out property <color> weave-accent-col: #4af2b0;   // parsed weave colour (Rust keeps in sync), for the preview swatch
+    callback set-ui-accent(string);
+    callback set-weave-accent(string);
+    // LIVE hex preview — Rust parses the in-progress field text WITHOUT committing (no persist, no
+    // recolour), so entering a custom hex shows the colour the instant it's complete instead of leaving
+    // you blind until Enter. Shared is fine: only one field has focus at a time, and the picker gates the
+    // swatch on its own focus. (Enter still commits — we never recolour the whole UI mid-keystroke.)
+    callback preview-hex(string);
+    in-out property <color> hex-preview-col;
+    in-out property <bool>  hex-preview-ok;     // a COMPLETE valid 6-digit hex → morph the live swatch
+    in-out property <bool>  hex-preview-bad;    // clearly wrong (non-hex char / overlong) → danger hairline; mid-typing stays neutral
+    // PRISM picker — hue (0..1 across) + brightness (0..1 down) → live preview. The bare RRGGBB it's
+    // pointing at lands in `hue-pick-hex` so a pointer-release can commit it through the normal `pick`.
+    callback preview-hue(float, float);
+    in-out property <string> hue-pick-hex;
+    // the spellweaving MATERIAL gallery — live preview swatches the user picks the cast's physics from.
+    in-out property <[MaterialCard]> material-cards;
+    in-out property <string> weave-material: "directed-intent";
+    callback set-weave-material(string);
+    callback material-preview-tick();                     // re-render the gallery swatches (animated)
+    // the SELECTED material's tunable knobs — the UI renders a slider per row; editing reshapes the
+    // live substance. Generic + data-driven: a material declares its own knobs.
+    in-out property <[KnobRow]> weave-knobs;
+    callback set-weave-knob(int, float);
+    callback reset-weave-material();                       // knobs back to the recipe defaults
+
+    // RELIABILITY — the flight recorder surfaced. Uptime, per-organ heartbeats, the crash record, and
+    // the phoenix auto-restart switch. Refreshed ~1s by the main heartbeat tick.
+    in-out property <string> uptime: "—";
+    in-out property <[OrganRow]> organs;
+    in-out property <string> crash-summary: "no crashes recorded";
+    in-out property <bool> crash-present: false;          // a dump exists on disk (colour the readout)
+    in-out property <bool> phoenix: true;                 // OS auto-restart armed (next-launch pref)
+    callback set-phoenix(bool);
+    // ── NOTIFICATIONS — state-change confirmation cards (System page) ──
+    in-out property <bool> notif-enabled: true;
+    in-out property <string> notif-placement: "top-right"; // off/top-left/top-right/bottom-left/bottom-right/inline
+    in-out property <bool> notif-audio: true;
+    in-out property <bool> notif-dpi: true;
+    in-out property <bool> notif-scroll: true;
+    in-out property <bool> notif-polling: true;
+    in-out property <bool> notif-brightness: true;
+    in-out property <bool> notif-profile: true;
+    in-out property <bool> notif-layer: true;
+    callback set-notif-enabled(bool);
+    callback set-notif-placement(string);
+    callback set-notif-audio(bool);
+    in-out property <float> notif-volume: 0.7;            // audio cue volume 0..1
+    in-out property <string> notif-sound: "pulse";        // voice palette: pulse / warm / glass
+    callback set-notif-volume(float);
+    callback set-notif-sound(string);
+    in-out property <bool> notif-panel: true;            // grounded squircle card vs floating spell
+    callback set-notif-panel(bool);
+    callback set-notif-event(string, bool);               // (event-slug, on)
+    callback test-notification();                          // fire a real test card of a random allowed kind
+    callback write-flight-dump();                         // append a live snapshot to neuron-crash.log
+    callback open-crash-log();                            // open neuron-crash.log in the default viewer
+    callback toggle-writes-paused();
+    callback toggle-input-armed();                    // SAFE-MODE: arm/disarm real input synthesis
+    callback open-config-dir();
+
+    // PURGE SYNAPSE — kill every Razer Synapse process + stop its respawning services. Razer's
+    // slopware is a hydra (Synapse 3 esp.); this button stops the SYSTEM services first then sweeps
+    // the process table. Needs elevation, so it may trigger a UAC prompt.
+    callback purge-synapse();
+    in-out property <string> purge-status: "";            // result line shown under the button
+
+    // Import is a wizard flow launched from Settings, not a nav seat.
+    in-out property <bool> import-open: false;        // the wizard overlay is showing
+    in-out property <string> import-path;
+    in-out property <[ImportLine]> import-preview;     // the full parse (apply gates on this)
+    in-out property <[ImportLine]> import-perf;        // scalar settings + lighting (readout strip)
+    in-out property <[ImportLine]> import-bindings;    // trigger → action rows
+    in-out property <[ImportLine]> import-notes;       // honestly NOT migrated
+    in-out property <string> import-status: "Pick a Synapse export (.synapse3 / .ChromaEffects).";
+    in-out property <bool> import-ready: false;       // a successful parse to apply
+    callback browse-import();
+    callback parse-import(string);
+    callback apply-import();
+
+    // Diagnostics = the in-app test bench ("prove it works to me"): fire each capability live.
+    in-out property <[DiagRow]> diagnostics;
+    in-out property <bool> diag-running: false;
+    in-out property <int> diag-pass: 0;               // the segmented verdict bar's three widths
+    in-out property <int> diag-fail: 0;
+    in-out property <int> diag-skip: 0;
+    in-out property <string> diag-summary: "Run diagnostics to prove every capability live.";
+    callback run-diagnostics();
+
+    // generic: jump to a page (the ONE audited navigation entrypoint for tray + cross-panel links)
+    callback goto-page(int);
+}

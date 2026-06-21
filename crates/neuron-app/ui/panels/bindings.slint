@@ -1,0 +1,827 @@
+import { Theme } from "../theme.slint";
+import { Card, SectionTitle, Label, Button, Field, CodeArea, Pill, Mono, Divider, Slider, Toggle, PanelHead, ActionPicker, Segment, InputHead } from "../widgets/controls.slint";
+import { State } from "../state.slint";
+import { RuleRow, GraphNode, GraphEdge, PocketCard } from "../models.slint";
+
+// One portable clipboard, shown as its EMERGENT content-sigil (a mark drawn deterministically
+// from the bytes — same content, same sigil; different content, different sigil) over the legible
+// summary. The sigil is the abstract fingerprint; the name + summary are the instant read. Kind
+// tints it from the weave palette so the type reads at a glance too.
+component PocketCardEl inherits Rectangle {
+    in property <PocketCard> p;
+    property <color> tint: p.kind == "image" ? #f2a04a
+        : p.kind == "files" ? #4ab8f2
+        : p.kind == "other" ? Theme.text
+        : Theme.accent;
+    width: 128px;
+    height: 104px;
+    border-radius: Theme.radius;
+    background: Theme.bg-2;
+    border-width: Theme.hair;
+    border-color: p.filled ? root.tint : Theme.line;
+    animate border-color { duration: Theme.quick; }
+    VerticalLayout {
+        padding: 8px;
+        spacing: 3px;
+        // the emergent mark (square + centred so the rosette isn't stretched), or an empty marker
+        Rectangle {
+            height: 50px;
+            if p.filled : Path {
+                width: 50px;
+                height: 50px;
+                x: (parent.width - self.width) / 2;
+                commands: p.sigil;
+                viewbox-x: -1.12;
+                viewbox-y: -1.12;
+                viewbox-width: 2.24;
+                viewbox-height: 2.24;
+                stroke: root.tint;
+                stroke-width: 1.3px;
+                fill: transparent;
+            }
+            if !p.filled : Text {
+                text: "empty";
+                color: Theme.text-faint;
+                font-family: Theme.mono;
+                font-size: Theme.fs-small;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+        HorizontalLayout {
+            spacing: 4px;
+            Text {
+                text: p.name == "" ? "(default)" : p.name;
+                color: Theme.text;
+                font-family: Theme.mono;
+                font-size: Theme.fs-small;
+                font-weight: 700;
+                overflow: elide;
+                horizontal-stretch: 1;
+            }
+            // a filled dot marks a pocket kept on disk (survives a restart)
+            Rectangle {
+                y: 4px;
+                width: 5px;
+                height: 5px;
+                border-radius: 2.5px;
+                background: p.durable ? root.tint : transparent;
+                border-width: p.durable ? 0 : Theme.hair;
+                border-color: Theme.line;
+            }
+        }
+        Text {
+            text: p.summary;
+            color: Theme.text-faint;
+            font-family: Theme.mono;
+            font-size: Theme.fs-small;
+            overflow: elide;
+        }
+    }
+}
+
+// ── GRAPH VIEW — the spine as a node board (Unity/Unreal-style "systems you build") ─────────
+// Triggers, actions, and macro steps are NODES; the binding is the WIRE. Timing rides ON the
+// wire (the chip at its midpoint — macro step delays and turbo rates are editable there), and
+// every chip states its connection's angle in degrees. Drag nodes anywhere; layout persists.
+
+component GraphNodeEl inherits Rectangle {
+    in property <GraphNode> n;
+    in property <int> idx;
+    x: root.n.x * 1px;
+    y: root.n.y * 1px;
+    width: 178px;
+    height: 52px;
+    border-radius: Theme.radius;
+    background: drag.has-hover ? Theme.well-hi : Theme.well;
+    border-width: Theme.hair;
+    border-color: root.n.kind == "trigger" ? Theme.accent-line
+        : (drag.has-hover ? Theme.text-faint : Theme.line);
+    animate background, border-color { duration: Theme.quick; }
+    property <bool> dragged: false;
+    drag := TouchArea {
+        mouse-cursor: MouseCursor.grab;
+        moved => {
+            if (self.pressed) {
+                root.dragged = true;
+                State.move-node(root.idx,
+                    root.n.x + (self.mouse-x - self.pressed-x) / 1px,
+                    root.n.y + (self.mouse-y - self.pressed-y) / 1px);
+            }
+        }
+        pointer-event(ev) => {
+            if (ev.kind == PointerEventKind.down) { root.dragged = false; }
+            // persist the layout ONLY if the node actually moved — a plain click shouldn't write disk
+            if (ev.kind == PointerEventKind.up && root.dragged) { State.node-dropped(); }
+        }
+    }
+    VerticalLayout {
+        padding: 9px;
+        spacing: 3px;
+        HorizontalLayout {
+            spacing: 6px;
+            Text {
+                text: root.n.kind == "trigger" ? "IN" : root.n.kind == "step" ? "STEP" : "DO";
+                color: root.n.kind == "trigger" ? Theme.accent-dim : Theme.text-faint;
+                font-size: Theme.fs-small;
+                font-family: Theme.mono;
+                font-weight: 700;
+                vertical-alignment: center;
+            }
+            Text {
+                text: root.n.label;
+                color: Theme.text;
+                font-size: Theme.fs-body;
+                font-family: Theme.mono;
+                font-weight: 600;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+        }
+        Mono { text: root.n.sub; color: Theme.text-faint; font-size: Theme.fs-small; overflow: elide; }
+    }
+}
+
+component GraphEdgeEl inherits Rectangle {
+    in property <GraphEdge> e;
+    in property <int> idx;
+    // ports: source node's right-center → target node's left-center
+    property <float> ax: State.graph-nodes[root.e.a].x + 178;
+    property <float> ay: State.graph-nodes[root.e.a].y + 26;
+    property <float> bx: State.graph-nodes[root.e.b].x;
+    property <float> by: State.graph-nodes[root.e.b].y + 26;
+    property <float> ddx: root.bx - root.ax;
+    property <float> ddy: root.by - root.ay;
+    property <float> len: Math.sqrt(root.ddx * root.ddx + root.ddy * root.ddy);
+    property <angle> ang: Math.atan2(root.ddy, root.ddx);
+    // the connection's bearing, stated plainly (0° = east, counted clockwise on screen)
+    property <int> deg: Math.round(mod(root.ang / 1deg + 360, 360));
+    property <bool> sel: State.selected-edge == root.idx;
+    // the wire — a vector hairline from port to port
+    Path {
+        x: 0;
+        y: 0;
+        width: 1800px;
+        height: 1000px;
+        viewbox-x: 0;
+        viewbox-y: 0;
+        viewbox-width: 1800;
+        viewbox-height: 1000;
+        commands: "M " + root.ax + " " + root.ay + " L " + root.bx + " " + root.by;
+        stroke: root.sel ? Theme.accent : Theme.line;
+        stroke-width: 1px;
+    }
+    // port contacts
+    Rectangle {
+        x: root.ax * 1px - 2px; y: root.ay * 1px - 2px;
+        width: 4px; height: 4px; border-radius: 1px;
+        background: root.sel ? Theme.accent : Theme.text-faint;
+    }
+    Rectangle {
+        x: root.bx * 1px - 2px; y: root.by * 1px - 2px;
+        width: 4px; height: 4px; border-radius: 1px;
+        background: root.sel ? Theme.accent : Theme.text-faint;
+    }
+    // the chip at the wire's midpoint: timing · angle (click to tune editable timings)
+    chip := Rectangle {
+        x: (root.ax + root.bx) / 2 * 1px - self.width / 2;
+        y: (root.ay + root.by) / 2 * 1px - 11px;
+        height: 22px;
+        border-radius: Theme.radius-sm;
+        background: root.sel ? Theme.accent-glow : Theme.bg-2;
+        border-width: Theme.hair;
+        border-color: root.sel ? Theme.accent-line : (cta.has-hover ? Theme.text-faint : Theme.line);
+        animate background, border-color { duration: Theme.quick; }
+        cta := TouchArea { clicked => { State.selected-edge = root.idx; } }
+        HorizontalLayout {
+            padding-left: 7px;
+            padding-right: 7px;
+            spacing: 5px;
+            Text {
+                text: root.e.timing;
+                color: root.e.editable ? (root.sel ? Theme.accent : Theme.text-mid) : Theme.text-dim;
+                font-size: Theme.fs-small;
+                font-family: Theme.mono;
+                font-weight: 700;
+                vertical-alignment: center;
+            }
+            Text {
+                text: root.deg + "°";
+                color: Theme.text-faint;
+                font-size: Theme.fs-small;
+                font-family: Theme.mono;
+                vertical-alignment: center;
+            }
+        }
+    }
+}
+
+// BINDINGS — the unified spine, drawn as the PATCH BAY it is. Every row is a routed signal:
+// trigger jack → signal path → action jack, with a kind tag and a lamp that lights when the live
+// engine actually fires that trigger (real dispatch data, not decoration — pressing the bound
+// button visibly closes its contact on this board). Audio is folded in here: mic gain/mute are
+// just Actions. And the macro console: write Rust -> dry-run (fires NOTHING) -> compile & verify
+// (the cert surfaced; compiling never executes) -> run once (the one explicit execution verb).
+
+component RuleLine inherits Rectangle {
+    in property <RuleRow> r;
+    callback remove();
+    height: 40px;
+    border-radius: Theme.radius-sm;
+    background: transparent;
+    // the live lamp: this rule's trigger was the engine's last dispatch
+    property <bool> fired: State.live-last-trigger == root.r.trigger;
+    HorizontalLayout {
+        spacing: 0;
+        // kind cell — monochrome code + the fire lamp above it (accent ONLY when it fires)
+        Rectangle {
+            width: 34px;
+            VerticalLayout {
+                alignment: center;
+                spacing: 3px;
+                Rectangle {
+                    width: 4px; height: 4px; border-radius: 1px;
+                    x: (parent.width - self.width) / 2;
+                    background: root.fired ? Theme.accent : Theme.line;
+                    animate background { duration: Theme.settle; }
+                }
+                Text {
+                    text: root.r.kind == "gesture" ? "GST"
+                        : root.r.kind == "radial" ? "RAD"
+                        : root.r.kind == "hotkey" ? "HK"
+                        : root.r.kind == "app" ? "APP"
+                        : root.r.kind == "mic" ? "MIC"
+                        : root.r.kind == "hold" ? "HLD"
+                        : "IN";
+                    color: Theme.text-faint;
+                    font-size: Theme.fs-small;
+                    font-family: Theme.mono;
+                    font-weight: 700;
+                    horizontal-alignment: center;
+                }
+            }
+        }
+        // trigger jack — the short index; capped so the ACTION (the long field) gets the slack
+        Rectangle {
+            width: 30%;
+            height: 30px;
+            y: (parent.height - self.height) / 2;
+            border-radius: Theme.radius-sm;
+            background: Theme.well;
+            border-width: Theme.hair;
+            border-color: root.fired ? Theme.accent-line : Theme.line;
+            animate border-color { duration: Theme.settle; }
+            HorizontalLayout {
+                padding-left: 10px; padding-right: 8px;
+                Text {
+                    text: root.r.trigger;
+                    color: Theme.text;
+                    font-size: Theme.fs-body; font-family: Theme.mono; font-weight: 600;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+            }
+        }
+        // the signal path — a hairline with a node at each end; lights when the contact closes.
+        // fixed (not stretch) so the slack flows to the action jack, not into the connector.
+        Rectangle {
+            width: 44px;
+            Rectangle {
+                x: 4px; width: parent.width - 8px; height: 1px;
+                y: (parent.height - self.height) / 2;
+                background: root.fired ? Theme.accent : Theme.line;
+                animate background { duration: Theme.settle; }
+            }
+            Rectangle {
+                x: 2px; width: 3px; height: 3px;
+                y: (parent.height - self.height) / 2;
+                background: root.fired ? Theme.accent : Theme.text-faint;
+            }
+            Rectangle {
+                x: parent.width - 5px; width: 3px; height: 3px;
+                y: (parent.height - self.height) / 2;
+                background: root.fired ? Theme.accent : Theme.text-faint;
+            }
+        }
+        // action jack — the payload (what the binding DOES): the wide field AND the bright one
+        Rectangle {
+            horizontal-stretch: 1;
+            min-width: 120px;
+            height: 30px;
+            y: (parent.height - self.height) / 2;
+            border-radius: Theme.radius-sm;
+            background: Theme.well;
+            border-width: Theme.hair;
+            border-color: root.fired ? Theme.accent-line : Theme.line;
+            animate border-color { duration: Theme.settle; }
+            HorizontalLayout {
+                padding-left: 10px; padding-right: 8px;
+                Text {
+                    text: root.r.action;
+                    color: Theme.text;
+                    font-size: Theme.fs-body; font-family: Theme.mono;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+            }
+        }
+        Rectangle { width: 8px; }
+        // provenance: GUI rows are removable; toml rows say where they live instead of offering a
+        // delete that can only fail. Sized for the WIDER state so the right edge never goes ragged.
+        Rectangle {
+            width: 54px;
+            if root.r.removable : HorizontalLayout {
+                alignment: end;
+                VerticalLayout { alignment: center; Button { text: "del"; danger: true; clicked => { root.remove(); } } }
+            }
+            if !root.r.removable : HorizontalLayout {
+                alignment: end;
+                VerticalLayout { alignment: center; Pill { text: "TOML"; tint: Theme.text-faint; } }
+            }
+        }
+    }
+}
+
+component RuleList inherits VerticalLayout {
+    in property <string> title;
+    in property <[RuleRow]> rules;
+    in property <string> empty-hint;
+    callback remove(int);
+    spacing: 7px;
+    HorizontalLayout {
+        spacing: 8px;
+        // the column's group rail — two physical rows of jacks
+        Rectangle { width: 2px; height: 14px; y: 1px; background: Theme.line; }
+        SectionTitle { text: root.title; }
+        Rectangle {}
+        Mono { text: root.rules.length + (root.rules.length == 1 ? " rule" : " rules"); color: Theme.text-faint; }
+    }
+    if root.rules.length == 0 : Rectangle {
+        height: 64px;
+        VerticalLayout {
+            alignment: center;
+            Mono { text: root.empty-hint; color: Theme.text-faint; horizontal-alignment: center; }
+        }
+    }
+    for r[i] in root.rules : RuleLine {
+        r: r;
+        remove => { root.remove(i); }
+    }
+}
+
+// One AUDIO CHANNEL STRIP — a mixer channel made instrument: a status lamp + channel tag + endpoint
+// name on top, then one tactile control line (fader · live %, an illuminated MUTE key, a quiet
+// re-read). MIC (capture) and OUT (render) are the SAME strip so the chain reads as one console;
+// muting lights the key red (a real alarm state), live stays quiet phosphor. Replaces the two heavy
+// stacked blocks (giant fader readout + caption-switch mute + competing refresh button).
+component ChannelStrip inherits VerticalLayout {
+    in property <string> tag;        // "MIC" / "OUT"
+    in property <string> device;     // resolved endpoint name
+    in property <float> level;       // 0..100 (gain / volume)
+    in property <bool> muted;
+    callback set-level(float);
+    callback toggle-mute();
+    spacing: 8px;
+    // identity: lamp (green live / red muted) · channel tag · device (dim, elides)
+    HorizontalLayout {
+        spacing: 8px;
+        Rectangle {
+            width: 6px; height: 6px; border-radius: 1px;
+            y: (parent.height - self.height) / 2;
+            background: root.muted ? Theme.danger : Theme.accent;
+            animate background { duration: Theme.quick; }
+        }
+        Text {
+            text: root.tag;
+            color: Theme.text-mid;
+            font-family: Theme.mono; font-size: Theme.fs-small; font-weight: 700;
+            letter-spacing: Theme.track-2; vertical-alignment: center;
+        }
+        Text {
+            text: root.device;
+            color: Theme.text-faint;
+            font-family: Theme.mono; font-size: Theme.fs-small;
+            vertical-alignment: center; overflow: elide;
+            horizontal-stretch: 1;
+        }
+    }
+    // the control line — fader · value · MUTE key · re-read
+    HorizontalLayout {
+        spacing: 10px;
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 1;
+            Slider {
+                compact: true;
+                minimum: 0; maximum: 100; value: root.level; step: 2;
+                wheel: false;          // writes the live endpoint — never on a stray page-scroll
+                // a muted channel's fader greys out (it isn't doing anything) — tactile honesty
+                tint: root.muted ? Theme.text-faint : Theme.accent;
+                changed(v) => { root.set-level(v); }
+            }
+        }
+        // the live value — mono, fixed cell so the fader never twitches at the 2→3 digit jump
+        VerticalLayout {
+            alignment: center;
+            width: 44px;
+            Text {
+                text: round(root.level) + "%";
+                color: root.muted ? Theme.text-faint : Theme.text;
+                font-family: Theme.mono; font-size: Theme.fs-data; font-weight: 600;
+                horizontal-alignment: right; vertical-alignment: center;
+            }
+        }
+        // MUTE — one illuminated key; lit danger-red when muted, a quiet contact when live
+        Rectangle {
+            width: 58px; height: 26px; border-radius: Theme.radius-sm;
+            background: root.muted ? Theme.danger-glow : (mta.has-hover ? Theme.well : transparent);
+            border-width: Theme.hair;
+            border-color: root.muted ? Theme.danger.with-alpha(0.6) : (mta.has-hover ? Theme.text-faint : Theme.line);
+            animate background, border-color { duration: Theme.quick; }
+            Text {
+                text: "MUTE"; x: 0; width: 100%;
+                horizontal-alignment: center; vertical-alignment: center;
+                color: root.muted ? Theme.danger : Theme.text-dim;
+                font-family: Theme.mono; font-size: Theme.fs-small; font-weight: 700;
+                letter-spacing: Theme.track-2;
+                animate color { duration: Theme.quick; }
+            }
+            mta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.toggle-mute(); } }
+        }
+    }
+}
+
+export component BindingsPanel inherits VerticalLayout {
+    spacing: 0;
+    property <string> edge-timing-input: "";
+    // the stance segment is string-keyed in the engine but index-keyed in the Segment widget
+    property <int> stance-idx: State.hypershift-mode == "hold" ? 0
+        : State.hypershift-mode == "latch" ? 1
+        : State.hypershift-mode == "smart" ? 2 : 3;
+    // the INPUT head — the shared InputHead so the DIRECT⇄WEAVE segment lives ONCE (no more two
+    // files kept byte-identical by hand); this depth's right-hand extras arrive as its children.
+    InputHead {
+        caption: "plain binds · trigger → action";
+        // LIST ⇄ GRAPH — the same spine, two presentations
+        VerticalLayout {
+            width: 150px;   // size to the two contacts so the segment doesn't balloon across the head slot
+            alignment: center;
+            Segment {
+                options: ["LIST", "GRAPH"];
+                index: State.graph-view ? 1 : 0;
+                picked(i) => { State.graph-view = (i == 1); State.selected-edge = -1; }
+            }
+        }
+        VerticalLayout { width: 8px; }
+        VerticalLayout {
+            width: 80px;   // size to the label so the head action doesn't balloon (same idiom as re-scan/backup)
+            alignment: center;
+            Button { text: "reload"; clicked => { State.reload-bindings(); } }
+        }
+    }
+    Rectangle { height: Theme.hair; background: Theme.line; }
+    Rectangle { height: Theme.lead-in; }
+
+    // the page itself scrolls (PanelPage) — no inner whole-panel Flickable, or the two would
+    // fight over the wheel and the outer viewport would mis-size around this one.
+    VerticalLayout {
+        VerticalLayout {
+            spacing: 22px;
+
+            // ── the two rule layers (LIST view) ───────────────────────────
+            if !State.graph-view : HorizontalLayout {
+                spacing: Theme.gap-col;
+                VerticalLayout {
+                    horizontal-stretch: 1;
+                    RuleList {
+                        title: "BASE LAYER";
+                        rules: State.rules;
+                        empty-hint: "no base rules yet — loaded from bindings.toml + cast.toml";
+                        remove(i) => { State.remove-rule(i); }
+                    }
+                }
+                VerticalLayout {
+                    horizontal-stretch: 1;
+                    RuleList {
+                        title: "HYPERSHIFT LAYER";
+                        rules: State.hypershift-rules;
+                        empty-hint: "hold a layer trigger to activate the second tier";
+                        remove(i) => { State.remove-hyper-rule(i); }
+                    }
+                }
+            }
+
+            // ── the node board (GRAPH view) ───────────────────────────────
+            if State.graph-view : VerticalLayout {
+                spacing: 8px;
+                Rectangle {
+                    height: 460px;
+                    clip: true;
+                    border-radius: Theme.radius;
+                    border-width: Theme.hair;
+                    border-color: Theme.line;
+                    background: Theme.bg-2;
+                    Flickable {
+                        viewport-width: 1800px;
+                        viewport-height: 1000px;
+                        board := Rectangle {
+                            // a faint bench grid so distances read at a glance
+                            for gx in 18 : Rectangle {
+                                x: gx * 100px; width: 1px; height: 1000px;
+                                background: Theme.line-soft;
+                            }
+                            for gy in 10 : Rectangle {
+                                y: gy * 100px; width: 1800px; height: 1px;
+                                background: Theme.line-soft;
+                            }
+                            // wires under nodes
+                            for e[i] in State.graph-edges : GraphEdgeEl { e: e; idx: i; }
+                            for n[i] in State.graph-nodes : GraphNodeEl { n: n; idx: i; }
+                            if State.graph-nodes.length == 0 : VerticalLayout {
+                                x: 40px; y: 40px;
+                                Mono { text: "no rules to draw yet — add a binding below, or author a macro"; }
+                            }
+                        }
+                    }
+                }
+                // the selected wire's timing editor — chips on the board open it
+                if State.selected-edge >= 0 : HorizontalLayout {
+                    spacing: 8px;
+                    VerticalLayout {
+                        alignment: center;
+                        Mono {
+                            text: "wire " + State.graph-nodes[State.graph-edges[State.selected-edge].a].label
+                                + " → " + State.graph-nodes[State.graph-edges[State.selected-edge].b].label
+                                + "  ·  " + State.graph-edges[State.selected-edge].timing;
+                            color: Theme.accent;
+                            overflow: elide;
+                        }
+                    }
+                    if State.graph-edges[State.selected-edge].editable : HorizontalLayout {
+                        spacing: 7px;
+                        Field {
+                            field-width: 110px;
+                            placeholder: State.graph-edges[State.selected-edge].tkind == "turbo" ? "cps" : "ms";
+                            text <=> root.edge-timing-input;
+                            accepted(t) => {
+                                State.set-edge-timing(State.selected-edge, t);
+                                root.edge-timing-input = "";
+                            }
+                        }
+                        Button {
+                            text: "set";
+                            primary: true;
+                            enabled: root.edge-timing-input != "";
+                            clicked => {
+                                State.set-edge-timing(State.selected-edge, root.edge-timing-input);
+                                root.edge-timing-input = "";
+                            }
+                        }
+                    }
+                    if !State.graph-edges[State.selected-edge].editable : VerticalLayout {
+                        alignment: center;
+                        Mono { text: "fixed timing — toml-sourced rules edit in their file"; color: Theme.text-faint; }
+                    }
+                    Rectangle {}
+                    Button { text: "close"; clicked => { State.selected-edge = -1; } }
+                }
+                Mono {
+                    text: "drag nodes anywhere (layout persists) · click a wire's chip to tune its timing · chips state timing and the wire's angle";
+                    color: Theme.text-faint;
+                }
+            }
+
+            Divider {}
+
+            // ── POCKETS — portable clipboards, each with its emergent content-sigil ──
+            VerticalLayout {
+                spacing: 9px;
+                HorizontalLayout {
+                    SectionTitle { text: "POCKETS"; }
+                    Rectangle {}
+                    Mono {
+                        text: "portable clipboards · bind a `pocket` action to stash \u{21c4} restore (carries any data)";
+                        color: Theme.text-faint;
+                    }
+                }
+                if State.pockets.length == 0 : Mono {
+                    text: "none yet \u{2014} bind a `pocket` action, then activate it with something on your clipboard";
+                    color: Theme.text-faint;
+                }
+                if State.pockets.length > 0 : HorizontalLayout {
+                    spacing: 8px;
+                    for pk in State.pockets : PocketCardEl { p: pk; }
+                    Rectangle {} // soak up the slack so cards stay left-packed
+                }
+            }
+
+            Divider {}
+
+            // ── ADD BINDING (press-to-bind a control -> a typed Action) ────
+            VerticalLayout {
+                spacing: 11px;
+                HorizontalLayout {
+                    SectionTitle { text: "ADD BINDING"; }
+                    Rectangle {}
+                    Mono { text: "press the control — never hardcoded · re-binding replaces"; color: Theme.text-faint; }
+                }
+                HorizontalLayout {
+                    spacing: 10px;
+                    // captured trigger readout + press-to-bind button
+                    VerticalLayout {
+                        width: 300px;
+                        spacing: 7px;
+                        Mono { text: "TRIGGER"; color: Theme.text-dim; }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Rectangle {
+                                horizontal-stretch: 1;
+                                height: 30px;
+                                border-radius: Theme.radius-sm;
+                                background: Theme.well;
+                                border-width: Theme.hair;
+                                border-color: State.bind-trigger-ready ? Theme.accent-line : Theme.line;
+                                HorizontalLayout {
+                                    padding-left: 11px;
+                                    Text {
+                                        text: State.bind-trigger-label;
+                                        color: State.bind-trigger-ready ? Theme.accent : Theme.text-dim;
+                                        font-family: Theme.mono; font-size: Theme.fs-body;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                    }
+                                }
+                            }
+                            Button { text: "press-to-bind"; primary: true; clicked => { State.capture-trigger(); } }
+                        }
+                        Toggle {
+                            caption: "on HyperShift layer";
+                            checked: State.bind-hypershift;
+                            toggled(v) => { State.bind-hypershift = v; }
+                        }
+                    }
+                    // the action palette + commit (gated until the action is COMPLETE)
+                    VerticalLayout {
+                        horizontal-stretch: 1;
+                        spacing: 7px;
+                        Mono { text: "ACTION"; color: Theme.text-dim; }
+                        picker := ActionPicker {}
+                        HorizontalLayout {
+                            Rectangle {}
+                            Button {
+                                text: "add binding";
+                                primary: true;
+                                enabled: State.bind-trigger-ready && picker.param-ok;
+                                clicked => { State.add-binding(); }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Divider {}
+
+            // ── HYPERSHIFT STANCE — how the layer trigger behaves ─────────
+            // A layer is a stance, not a button. Razer ships hold-only (toggle has been a
+            // years-old community ask); games solved this long ago — so Neuron offers the set.
+            // Lives BELOW the rules: it tunes how the second layer engages; the rules are the page.
+            HorizontalLayout {
+                spacing: 10px;
+                VerticalLayout { alignment: center; Mono { text: "HYPERSHIFT STANCE"; color: Theme.text-dim; } }
+                Segment {
+                    options: ["HOLD", "LATCH", "SMART", "1-SHOT"];
+                    index: root.stance-idx;
+                    min-seg: 60px;
+                    picked(i) => { State.set-hypershift-mode(i == 0 ? "hold" : i == 1 ? "latch" : i == 2 ? "smart" : "one-shot"); }
+                }
+                Rectangle {}
+                VerticalLayout {
+                    alignment: center;
+                    Mono {
+                        text: State.hypershift-mode == "latch" ? "tap on · tap off"
+                            : State.hypershift-mode == "smart" ? "tap latches · hold is momentary"
+                            : State.hypershift-mode == "one-shot" ? "next press is shifted, then drops"
+                            : "live while held (Razer's behaviour)";
+                        color: Theme.text-faint;
+                    }
+                }
+            }
+
+            Divider {}
+
+            // ── audio actions (folded-in Audio: mic + output) + macro authoring ──
+            HorizontalLayout {
+                spacing: Theme.gap-col;
+                // AUDIO — the Core-Audio chain as a tiny mixing console: capture (MIC) over render
+                // (OUT), two identical channel strips. Each is also bindable on the spine
+                // (mic-gain/mic-mute · out-gain/out-mute) — the faders just mirror those live endpoints.
+                VerticalLayout {
+                    width: 340px;
+                    spacing: 14px;
+                    HorizontalLayout {
+                        SectionTitle { text: "AUDIO"; }
+                        Rectangle {}
+                        // one quiet re-read for both endpoints (a mic/output was plugged or switched)
+                        VerticalLayout {
+                            alignment: center;
+                            rta := TouchArea {
+                                width: rl.preferred-width; height: 20px;
+                                mouse-cursor: MouseCursor.pointer;
+                                clicked => { State.refresh-mic(); State.refresh-out(); }
+                                rl := Text {
+                                    text: "re-read";
+                                    color: rta.has-hover ? Theme.text-mid : Theme.text-faint;
+                                    font-family: Theme.mono; font-size: Theme.fs-small; letter-spacing: Theme.track-2;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+                    }
+                    ChannelStrip {
+                        tag: "MIC";
+                        device: State.mic-name;
+                        level: State.mic-gain;
+                        muted: State.mic-muted;
+                        set-level(v) => { State.mic-gain = v; State.set-mic-gain(v); }
+                        toggle-mute => { State.toggle-mic-mute(); }
+                    }
+                    Divider {}
+                    ChannelStrip {
+                        tag: "OUT";
+                        device: State.out-name;
+                        level: State.out-gain;
+                        muted: State.out-muted;
+                        set-level(v) => { State.out-gain = v; State.set-out-gain(v); }
+                        toggle-mute => { State.toggle-out-mute(); }
+                    }
+                    Mono { text: "Core Audio · bind gain / mute on the spine"; color: Theme.text-faint; }
+                }
+
+                // ── macro authoring (PYTHON -> check -> save+register -> test run) ──
+                VerticalLayout {
+                    horizontal-stretch: 1;
+                    spacing: 11px;
+                    HorizontalLayout {
+                        SectionTitle { text: "MACRO · PYTHON"; }
+                        Rectangle {}
+                        if State.macro-busy : Pill { text: "WORKING"; live: true; }
+                    }
+                    HorizontalLayout {
+                        spacing: 7px;
+                        VerticalLayout { alignment: center; Mono { text: "NAME"; color: Theme.text-dim; } }
+                        Field {
+                            field-width: 180px;
+                            placeholder: "macro name (e.g. paste_clean)";
+                            text <=> State.macro-name;
+                        }
+                        Rectangle {}
+                    }
+                    CodeArea {
+                        height: 150px;
+                        placeholder: "# real CPython — full power. def macro(ctx): is the entry.\n# import neuron  ->  ctx + key/type_text/clipboard_set/mouse/run/hotkey\n# or reach past it: import ctypes, subprocess … anything a program can do.\n\ndef macro(ctx):\n    neuron.clipboard_set((ctx.selection or '').upper())\n    neuron.hotkey('ctrl', 'v')";
+                        text <=> State.macro-source;
+                    }
+                    HorizontalLayout {
+                        spacing: 7px;
+                        Button {
+                            text: "check";
+                            busy: State.macro-busy;
+                            clicked => { State.macro-check(State.macro-source); }
+                        }
+                        Button {
+                            text: "save + register";
+                            primary: true;
+                            busy: State.macro-busy;
+                            clicked => { State.macro-save(State.macro-name, State.macro-source); }
+                        }
+                        Button {
+                            // the explicit execution verb — runs the macro once, now
+                            text: "test run";
+                            danger: true;
+                            busy: State.macro-busy;
+                            clicked => { State.macro-test(State.macro-name, State.macro-source); }
+                        }
+                        Rectangle {}
+                    }
+                    // one calm wrapping note instead of two hard lines clipping at the column edge
+                    Text {
+                        text: "warm CPython sidecar — full raw power (SAFE-mode gates the helper input, not raw ctypes). neuron.ask(\"deploy?\") pauses for a yes/no flick at your cursor; neuron.notify(\"done\") posts a status.";
+                        color: Theme.text-faint;
+                        font-family: Theme.mono; font-size: Theme.fs-small;
+                        wrap: word-wrap;
+                    }
+                    Mono { text: State.macro-status; color: Theme.text-mid; }
+                    // after check: the defs found. after test: the macro's print()/traceback log.
+                    if State.macro-dryrun.length > 0 : Card {
+                        VerticalLayout {
+                            padding: 11px;
+                            spacing: 3px;
+                            // a Python traceback has long lines — wrap so the tail doesn't bleed off-edge
+                            for line in State.macro-dryrun : Mono { text: line; wrap: word-wrap; }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

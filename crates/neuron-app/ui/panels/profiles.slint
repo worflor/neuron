@@ -1,0 +1,320 @@
+import { Theme } from "../theme.slint";
+import { Card, SectionTitle, Label, Button, Field, Picker, Pill, Mono, Divider, Readout, PanelHead } from "../widgets/controls.slint";
+import { State } from "../state.slint";
+import { ProfileRow, AppRuleRow } from "../models.slint";
+
+// PROFILES & App-Rules — named setting bundles (profile::Profile) you switch by hand or auto by
+// focused app (profile::AppRules). Profiles are the things the user reaches for most, so each is
+// an instrument CARD in a 2-column grid: the whole card applies it, the captured values read as a
+// readout strip (data as the hero, not one prose string), and delete is a two-step armed contact.
+// The app-rule column is a live ROUTING surface: source (focused app) → the lit rule → profile.
+
+component ProfileCard inherits Rectangle {
+    in property <ProfileRow> p;
+    in property <bool> armed;            // delete armed on THIS card
+    callback apply();
+    callback arm-delete();
+    callback confirm-delete();
+    height: 96px;
+    border-radius: Theme.radius;
+    background: cta.has-hover ? Theme.well : Theme.bg-2;
+    border-width: Theme.hair;
+    border-color: root.p.active ? Theme.accent-line : (cta.has-hover ? Theme.text-faint : Theme.line);
+    animate background, border-color { duration: Theme.quick; }
+    // the channel-armed index tick — the active profile's only colour; settles, never teleports
+    Rectangle {
+        x: 0; width: 2px; y: 12px; height: parent.height - 24px;
+        background: root.p.active ? Theme.accent : transparent;
+        animate background { duration: Theme.quick; }
+    }
+    cta := TouchArea {
+        mouse-cursor: MouseCursor.pointer;
+        clicked => { root.apply(); }
+    }
+    VerticalLayout {
+        padding: 14px;
+        padding-left: 16px;
+        spacing: 8px;
+        HorizontalLayout {
+            spacing: 8px;
+            Text {
+                text: root.p.name;
+                color: root.p.active ? Theme.accent : Theme.text;
+                font-size: Theme.fs-data; font-weight: 700; font-family: Theme.mono;
+                vertical-alignment: center;
+                overflow: elide;
+                animate color { duration: Theme.quick; }
+            }
+            Rectangle {}
+            if root.p.active : Pill { text: "ACTIVE"; live: true; }
+            // delete: a quiet glyph that surfaces on hover; first click arms, second commits. The
+            // cell RESERVES the armed width so arming never reflows the profile name beside it.
+            Rectangle {
+                width: 64px;
+                HorizontalLayout {
+                    alignment: end;
+                    Rectangle {
+                        width: root.armed ? 64px : 22px;
+                        height: 22px;
+                        border-radius: Theme.radius-sm;
+                        background: root.armed ? Theme.danger.with-alpha(0.15) : transparent;
+                        border-width: Theme.hair;
+                        border-color: root.armed ? Theme.danger : transparent;
+                        opacity: cta.has-hover || root.armed ? 1 : 0;
+                        animate opacity, width, background, border-color { duration: Theme.quick; }
+                        Text {
+                            text: root.armed ? "delete?" : "✕";
+                            color: Theme.danger;
+                            font-size: Theme.fs-small;
+                            font-family: Theme.mono;
+                            font-weight: 700;
+                            vertical-alignment: center;
+                            horizontal-alignment: center;
+                        }
+                        TouchArea {
+                            // only clickable when actually revealed — an opacity:0 TouchArea is still
+                            // hit-tested in Slint, so without this, clicking the empty top-right of a
+                            // card silently armed/deleted the profile.
+                            enabled: cta.has-hover || root.armed;
+                            mouse-cursor: MouseCursor.pointer;
+                            clicked => {
+                                if (root.armed) { root.confirm-delete(); } else { root.arm-delete(); }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        HorizontalLayout {
+            spacing: 18px;
+            if root.p.dpi != "" : Readout { key: "DPI"; value: root.p.dpi; }
+            if root.p.polling != "" : Readout { key: "POLL"; value: root.p.polling; }
+            if root.p.lighting != "" : Readout { key: "LIGHT"; value: root.p.lighting; }
+            if root.p.dpi == "" && root.p.polling == "" && root.p.lighting == "" : VerticalLayout {
+                alignment: center;
+                Mono { text: root.p.summary; color: Theme.text-faint; }
+            }
+            Rectangle {}
+        }
+    }
+}
+
+export component ProfilesPanel inherits VerticalLayout {
+    spacing: 0;
+    property <string> new-profile-name;
+    property <string> rule-app;
+    property <int> rule-profile-idx: 0;
+    // name-keyed delete arming (an index can drift when the model refreshes mid-arm)
+    property <string> armed-delete: "";
+    Timer {
+        interval: 2500ms;
+        running: root.armed-delete != "";
+        triggered => { root.armed-delete = ""; }
+    }
+    // does the typed name collide with an existing profile? (save = overwrite, said out loud)
+    property <bool> name-exists: false;
+
+    PanelHead {
+        label: "PROFILES";
+        caption: "named look + feel bundles · apply by hand or by focused app";
+        // mirror the HEADER pill exactly (continuity — it's the pill the user clicked to get here)
+        Pill {
+            text: State.active-profile == "—" ? "NO PROFILE" : State.active-profile;
+            live: State.active-profile != "—";
+        }
+    }
+    Rectangle { height: Theme.hair; background: Theme.line; }
+    Rectangle { height: Theme.lead-in; }
+
+    HorizontalLayout {
+        spacing: Theme.gap-col;
+
+        // ── saved profiles: the card grid ─────────────────────────────────
+        VerticalLayout {
+            horizontal-stretch: 1;
+            spacing: 12px;
+            HorizontalLayout {
+                SectionTitle { text: "SAVED"; }
+                Rectangle {}
+                Mono { text: State.profiles.length + (State.profiles.length == 1 ? " profile" : " profiles"); color: Theme.text-faint; }
+            }
+            Flickable {
+                vertical-stretch: 1;
+                min-height: 160px;
+                // one column when the panel is narrow (min window) so cards never crush below ~280px
+                property <int> cols: self.width < 460px ? 1 : 2;
+                property <int> rows: ceil(State.profiles.length / self.cols);
+                // card(96) + gap(12) BETWEEN rows only — was rows*108, which baked a trailing 12px of dead scroll below the last card
+                viewport-height: self.rows * 96px + max(0, self.rows - 1) * 12px;
+                cards := Rectangle {
+                    property <int> cols: parent.cols;
+                    property <length> gw: (self.width - (self.cols - 1) * 12px) / self.cols;
+                    for p[i] in State.profiles : ProfileCard {
+                        p: p;
+                        armed: root.armed-delete == p.name;
+                        x: mod(i, cards.cols) * (cards.gw + 12px);
+                        y: floor(i / cards.cols) * 108px;
+                        width: cards.gw;
+                        apply => { root.armed-delete = ""; State.apply-profile(p.name); }
+                        arm-delete => { root.armed-delete = p.name; }
+                        confirm-delete => { root.armed-delete = ""; State.delete-profile(p.name); }
+                    }
+                }
+                if State.profiles.length == 0 : VerticalLayout {
+                    padding-top: 18px;
+                    spacing: 5px;
+                    Mono { text: "no profiles saved yet"; color: Theme.text-dim; }
+                    Mono { text: "tune the device, then capture the state below"; color: Theme.text-faint; }
+                }
+            }
+            Divider {}
+            VerticalLayout {
+                spacing: 6px;
+                HorizontalLayout {
+                    spacing: 8px;
+                    Field {
+                        field-width: 200px;
+                        placeholder: "new profile name";
+                        text <=> root.new-profile-name;
+                        // glue answers whether this name already exists (overwrite, said out loud)
+                        edited(t) => { State.profile-name-edited(t); }
+                        accepted(t) => {
+                            if (t != "") {
+                                State.save-current-profile(t);
+                                root.new-profile-name = "";
+                                State.profile-name-edited("");
+                            }
+                        }
+                    }
+                    Button {
+                        // the Field already shows the name — don't bake it into the label (a long name
+                    // made this sized-to-label button overflow the column)
+                    text: State.profile-name-exists ? "overwrite" : "save current state";
+                        primary: true;
+                        danger: State.profile-name-exists;
+                        enabled: root.new-profile-name != "";
+                        clicked => {
+                            State.save-current-profile(root.new-profile-name);
+                            root.new-profile-name = "";
+                            State.profile-name-edited("");
+                        }
+                    }
+                }
+                Mono {
+                    text: "captures a LIVE device read-back — dpi + stages · polling · brightness · idle · lighting · gaming-mode";
+                    color: Theme.text-faint;
+                }
+            }
+        }
+
+        // ── app rules: the routing surface ────────────────────────────────
+        VerticalLayout {
+            width: 330px;
+            spacing: 12px;
+            SectionTitle { text: "APP AUTO-SWITCH"; }
+            // SOURCE cell — the live input signal this routing surface switches on
+            Rectangle {
+                height: 30px;
+                border-radius: Theme.radius-sm;
+                background: Theme.well;
+                border-width: Theme.hair; border-color: Theme.line;
+                HorizontalLayout {
+                    padding-left: 11px; padding-right: 11px; spacing: 8px;
+                    Mono { text: "FOCUS"; color: Theme.text-faint; vertical-alignment: center; }
+                    Text {
+                        text: State.focused-app;
+                        color: Theme.text-mid;
+                        font-size: Theme.fs-body; font-family: Theme.mono;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                    Rectangle {}
+                }
+            }
+            Flickable {
+                vertical-stretch: 1;
+                min-height: 120px;
+                VerticalLayout {
+                    spacing: 6px;
+                    for r[i] in State.app-rules : rrow := Rectangle {
+                        height: 34px;
+                        border-radius: Theme.radius-sm;
+                        background: Theme.well;
+                        border-width: Theme.hair;
+                        property <bool> routing: i == State.active-app-rule;
+                        border-color: self.routing ? Theme.accent-line : Theme.line;
+                        animate border-color { duration: Theme.settle; }
+                        rowta := TouchArea {}   // row-level hover (so the delete can stay quiet at rest)
+                        HorizontalLayout {
+                            padding-left: 11px; padding-right: 8px; spacing: 8px;
+                            // the closed-contact lamp: THIS rule is currently winning
+                            VerticalLayout {
+                                alignment: center;
+                                Rectangle {
+                                    width: 5px; height: 5px; border-radius: 3px;
+                                    background: rrow.routing ? Theme.accent : Theme.line;
+                                    animate background { duration: Theme.settle; }
+                                }
+                            }
+                            Text { text: r.app; color: Theme.text; font-size: Theme.fs-body; font-family: Theme.mono; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+                            Text {
+                                text: "→";
+                                color: i == State.active-app-rule ? Theme.accent : Theme.text-faint;
+                                vertical-alignment: center;
+                                animate color { duration: Theme.settle; }
+                            }
+                            Text { text: r.profile; color: Theme.text-mid; font-size: Theme.fs-body; font-family: Theme.mono; vertical-alignment: center; overflow: elide; }
+                            // delete stays quiet until you're on the row (a calmer resting list) — and
+                            // is NOT clickable while invisible (opacity:0 is still hit-tested; without
+                            // `enabled` a click on the empty row edge deleted the rule).
+                            Button {
+                                text: "del"; danger: true;
+                                enabled: rowta.has-hover;
+                                opacity: rowta.has-hover ? 1 : 0;
+                                clicked => { State.remove-app-rule(i); }
+                            }
+                        }
+                    }
+                    if State.app-rules.length == 0 : VerticalLayout {
+                        padding-top: 8px; spacing: 5px;
+                        Mono { text: "no app rules"; color: Theme.text-dim; }
+                        Mono { text: "match the focused app to a saved profile below"; color: Theme.text-faint; }
+                    }
+                }
+            }
+            Divider {}
+            HorizontalLayout {
+                spacing: 7px;
+                Field {
+                    placeholder: "app substring (e.g. valorant)";
+                    field-width: 220px;
+                    text <=> root.rule-app;
+                }
+                Button {
+                    // one press grabs the thing you're looking at — no typing exe names
+                    text: "use focus";
+                    enabled: State.focused-app != "—" && State.focused-app != "";
+                    clicked => { root.rule-app = State.focused-app; }
+                }
+            }
+            // the target is one of the SAVED profiles — a picker over the legal values, not free
+            // text a typo can silently kill
+            if State.profile-names.length == 0 : Mono { text: "save a profile first to route apps to it"; color: Theme.text-faint; }
+            Picker {
+                options: State.profile-names;
+                index: root.rule-profile-idx;
+                changed(i) => { root.rule-profile-idx = i; }
+            }
+            Button {
+                text: "add rule";
+                primary: true;
+                enabled: root.rule-app != "" && State.profile-names.length > 0;
+                clicked => {
+                    State.add-app-rule(root.rule-app,
+                        State.profile-names[min(root.rule-profile-idx, State.profile-names.length - 1)]);
+                    root.rule-app = "";
+                }
+            }
+        }
+    }
+}

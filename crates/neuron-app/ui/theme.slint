@@ -1,0 +1,98 @@
+// Neuron design system — "PRECISION INSTRUMENT, not a skinned app."
+//
+// Reference: Teenage Engineering × Dieter Rams × a dark oscilloscope / modular-synth panel — high-end
+// studio gear, not a media player. The drama left; the void stayed. The machine IS the design: raw
+// values (HID bytes / DPI / hex / Hz) set beautifully in monospace, hairline structure, live readouts
+// everywhere. Transparency made aesthetic.
+//
+// Rules this file encodes:
+//   * TRUE VOID black but QUIET — no graphite gray, no giant kinetic headers. Content sits on void.
+//   * MONOSPACE-FORWARD — data is the hero. The default font is the mono; prose is the exception.
+//   * ONE restrained signal accent — a single phosphor hue, used ONLY for live/active/connected, like
+//     an instrument readout. Never decoration. Everything else is monochrome ink on black.
+//   * Motion MECHANICAL not bouncy — controls settle (short, linear-ish); nothing animates AT you.
+//   * Dense but breathing — hairlines and negative space do the structuring, not boxes.
+
+export global Theme {
+    // ── ground / void ────────────────────────────────────────────────────
+    // True near-black. The faintest cool tint keeps it from looking like a dead LCD, no graphite.
+    out property <color> bg:        #040506;   // the void (app ground)
+    out property <color> bg-2:      #070809;   // a barely-raised plane (instrument bezel)
+    out property <color> well:      #0c0d10;   // input wells / pressed surfaces / data cells
+    out property <color> well-hi:   #121419;   // a hovered/active cell
+    out property <color> line:      #181b21;   // hairline — the primary structuring element
+    out property <color> line-soft: #0f1116;   // faintest grid line / cell border
+
+    // ── ink (monochrome on void) ─────────────────────────────────────────
+    out property <color> text:       #e8ecf1;  // primary readout — bright but not white-hot
+    out property <color> text-mid:   #9aa1ac;  // body / live values
+    out property <color> text-dim:   #5d646f;  // labels / inactive selector entries
+    out property <color> text-faint: #353b44;  // units / hints / dim chrome / grid ticks
+
+    // ── the ONE accent (phosphor) + minimal signal pair ──────────────────
+    // A cold green-cyan phosphor — the colour of a powered oscilloscope trace. Reads as "live".
+    // The accent is the app's ONE user-tunable colour: it's `in-out` so the SYSTEM panel (and Rust at
+    // startup, from the saved preference) can swap it live. Everything accent-tinted DERIVES from it —
+    // change this one value and the whole instrument recolours coherently (no stale hardcoded siblings).
+    in-out property <color> accent:    #4af2b0;  // LIVE / active / connected — the only colour
+    out property <color> accent-dim:   root.accent.darker(0.4);     // a quieted accent (related-but-idle ticks)
+    out property <color> accent-ink:   root.accent.darker(0.93);    // ink that sits ON an accent fill (near-black)
+    out property <color> accent-glow:  root.accent.with-alpha(0.1); // a 10% accent wash for the active-cell ground
+    out property <color> accent-line:  root.accent.with-alpha(0.27);// accent at hairline strength (active borders)
+    // Two restrained status hues — ONLY true alarm/caution states, never layout.
+    out property <color> warn:        #f2b34a;  // battery low / caution / gated-but-armed
+    out property <color> danger:      #f25a6b;  // paused / disarmed / fail / danger
+    // the status hues at hairline / wash strength — frames + grounds for caution/alarm cells
+    // (mirrors the accent-line / accent-glow pair, so a failed probe reads like a lit-but-bad station)
+    out property <color> warn-line:   #f2b34a45;
+    out property <color> danger-line: #f25a6b45;
+    out property <color> danger-glow: #f25a6b1a;
+    // the dim poured behind a modal overlay (one value for every sheet — was d8 vs cc)
+    out property <color> scrim:       #000000d8;
+
+    // ── type — monospace is the default; data is the hero ────────────────
+    // Headers are SMALL and quiet (a panel label, not a swooshy display word). No 72px hero.
+    out property <length> fs-panel:  15px;  // the panel's own label (small, mono, tracked-out)
+    out property <length> fs-readout: 26px; // the single big number a panel is "about" (e.g. DPI)
+    out property <length> fs-title:  13px;  // sub-section titles (small caps feel via tracking)
+    out property <length> fs-body:   12px;
+    out property <length> fs-data:   13px;  // tabular numeric values — slightly larger than body
+    out property <length> fs-small:  10px;  // units / pills / ticks
+    out property <length> fs-nav:    12px;  // the section selector entries
+    out property <length> fs-mono:   12px;  // alias kept for the status strip + dense readouts
+    // The whole UI is monospace-forward. `sans` exists only for the rare paragraph of guidance.
+    out property <string> mono: "Consolas";
+    out property <string> sans: "Segoe UI";
+    // letter-spacing scale — the tracked-out-caps texture, named (was 8 raw values across the panels)
+    out property <length> track-1: 0.4px;  // tightest — 13–14px mono headers / names
+    out property <length> track-2: 0.8px;  // pills / segment chips / probe names
+    out property <length> track-3: 1.2px;  // readout keys
+    out property <length> track-4: 1.4px;  // section titles / contacts / nav entries
+    out property <length> track-5: 3px;    // panel labels / the wordmark
+
+    // ── geometry — sparse, instrument-tight ──────────────────────────────
+    out property <length> radius:    4px;    // instrument corners are tight, not pill-soft
+    out property <length> radius-sm: 3px;
+    out property <length> pad-page:  22px;   // page margin — breathing without squandering glass
+    out property <length> gap:       12px;
+    out property <length> gap-col:   24px;   // the two-column panel gutter (device/lighting/bindings/…)
+    out property <length> lead-in:   16px;   // a panel's hairline → its first content
+    out property <length> hair:      1px;    // the hairline weight, named for intent
+    // canonical interactive heights — a control row, a segment/contact, a nav/menu row
+    out property <length> row-h:     30px;
+    out property <length> row-h-sm:  28px;
+    out property <length> seg-h:     26px;
+    out property <length> dot:       5px;    // the phosphor lamp dot (a live contact)
+    out property <length> dot-lg:    6px;    // the larger station / wordmark lamp
+    out property <length> modal-inset: 70px; // a modal card's margin from the window edge
+    out property <float>  dim-gated: 0.55;   // an inactive / gated section's opacity
+
+    // ── motion — settle, don't bounce ────────────────────────────────────
+    // Short and near-linear: a readout updating, a contact closing. Nothing eases AT the user.
+    out property <duration> settle: 110ms;
+    out property <duration> quick:  80ms;
+    out property <duration> press-throw: 60ms;      // a key's travel on press
+    // ── timing — a confirm window (not motion) ───────────────────────────
+    // The two-click arm/confirm timeout: click to arm, click again within this to commit.
+    out property <duration> confirm-window: 2500ms;
+}

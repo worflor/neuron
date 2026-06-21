@@ -1,0 +1,835 @@
+import { Theme } from "../theme.slint";
+import { Card, SectionTitle, Label, Button, Field, Slider, ContactRow, Toggle, Pill, Mono, Divider, Readout, PanelHead } from "../widgets/controls.slint";
+import { State } from "../state.slint";
+import { DeviceRow } from "../models.slint";
+
+// DEVICE — the merged overview + performance surface. Left: the enumerated devices as instrument
+// channels, each a strip of live readouts pulled straight from neuron-core capability::*, led by a
+// hairline silhouette of the instrument itself. Right: the real "feel" controls acting on the
+// SELECTED channel — seeded from live device reads, with the DPI fader carrying the stage table as
+// detent ticks and polling as the discrete contacts the hardware actually takes. ADVANCED splits
+// into two trust zones: LIVE (verified writes) and GATED (verify-gated, honest [gated]).
+
+// A hairline device silhouette — the channel's strongest spatial identifier, drawn (stroke-only
+// Path), monochrome ink, never accent. Every silhouette is drawn centred in the 26×26 box so the
+// glyph column reads as one consistent stack. kind: mouse | keyboard | mic | output | (else).
+component DeviceGlyph inherits Path {
+    in property <string> kind;
+    in property <color> ink: Theme.text-faint;
+    width: 26px;
+    height: 26px;
+    stroke: root.ink;
+    stroke-width: 1px;
+    fill: transparent;
+    commands: root.kind == "mouse"
+        // capsule body + the scroll split line
+        ? "M 8 3 A 5 5 0 0 1 18 3 L 18 17 A 5 5 0 0 1 8 17 Z M 13 3 L 13 9"
+        : root.kind == "keyboard"
+        // bezel + key ticks + spacebar
+        ? "M 2 8 L 24 8 L 24 19 L 2 19 Z M 5 11.5 L 7 11.5 M 9 11.5 L 11 11.5 M 13 11.5 L 15 11.5 M 17 11.5 L 19 11.5 M 7 15.5 L 19 15.5"
+        : root.kind == "mic"
+        // a microphone: pill capsule, the cradle arc, stem + base — centred on x=13
+        ? "M 10 5 A 3 3 0 0 1 16 5 L 16 12 A 3 3 0 0 1 10 12 Z M 7 11 A 6 6 0 0 0 19 11 M 13 17 L 13 21 M 9 21 L 17 21"
+        : root.kind == "output"
+        // a speaker: driver box + cone + two sound waves — centred on x=13
+        ? "M 5 10 L 9 10 L 14 5 L 14 21 L 9 16 L 5 16 Z M 17 9 A 4 4 0 0 1 17 17 M 19 6 A 7.5 7.5 0 0 1 19 20"
+        // generic: a chassis with a port notch
+        : "M 4 5 L 22 5 L 22 21 L 4 21 Z M 9 10 L 17 10";
+}
+
+// Online sheen: an invisible moving clip window reveals an accent duplicate of the
+// exact glyph/text, so the light lives on the ink rather than washing the card.
+component SheenGlyph inherits Rectangle {
+    in property <string> kind;
+    in property <bool> live;
+    in property <color> ink: Theme.text-faint;
+    width: 26px;
+    height: 26px;
+    background: transparent;
+    property <length> band-width: 9px;
+    property <length> band-x: root.live ? root.width + 4px : -root.band-width - 4px;
+
+    DeviceGlyph {
+        kind: root.kind;
+        ink: root.ink;
+    }
+    Rectangle {
+        x: root.band-x;
+        y: 0px;
+        width: root.band-width;
+        height: parent.height;
+        clip: true;
+        background: transparent;
+        opacity: root.live ? 1.0 : 0.0;
+        animate x, opacity { duration: 340ms; }
+        DeviceGlyph {
+            x: -parent.x;
+            kind: root.kind;
+            ink: Theme.accent;
+        }
+    }
+    Rectangle {
+        x: root.band-x + root.band-width * 0.42;
+        y: 0px;
+        width: 2px;
+        height: parent.height;
+        clip: true;
+        background: transparent;
+        opacity: root.live ? 0.92 : 0.0;
+        animate x, opacity { duration: 340ms; }
+        DeviceGlyph {
+            x: -parent.x;
+            kind: root.kind;
+            ink: Theme.text;
+        }
+    }
+}
+
+component SheenText inherits Rectangle {
+    in property <string> value;
+    in property <bool> live;
+    in property <color> ink: Theme.text-mid;
+    in property <length> size: Theme.fs-data;
+    in property <int> weight: 700;
+    in property <length> tracking: Theme.track-1;
+    horizontal-stretch: 1;
+    height: root.size + 4px;
+    background: transparent;
+    clip: true;
+    property <length> band-width: min(58px, max(24px, root.width * 0.18));
+    property <length> band-x: root.live ? root.width + 8px : -root.band-width - 8px;
+
+    Text {
+        width: parent.width;
+        height: parent.height;
+        text: root.value;
+        color: root.ink;
+        font-size: root.size;
+        font-weight: root.weight;
+        font-family: Theme.mono;
+        letter-spacing: root.tracking;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+    Rectangle {
+        x: root.band-x;
+        y: 0px;
+        width: root.band-width;
+        height: parent.height;
+        clip: true;
+        background: transparent;
+        opacity: root.live ? 1.0 : 0.0;
+        animate x, opacity { duration: 340ms; }
+        Text {
+            x: -parent.x;
+            width: root.width;
+            height: root.height;
+            text: root.value;
+            color: Theme.accent;
+            font-size: root.size;
+            font-weight: root.weight;
+            font-family: Theme.mono;
+            letter-spacing: root.tracking;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+    Rectangle {
+        x: root.band-x + root.band-width * 0.54;
+        y: 0px;
+        width: 3px;
+        height: parent.height;
+        clip: true;
+        background: transparent;
+        opacity: root.live ? 0.82 : 0.0;
+        animate x, opacity { duration: 340ms; }
+        Text {
+            x: -parent.x;
+            width: root.width;
+            height: root.height;
+            text: root.value;
+            color: Theme.text;
+            font-size: root.size;
+            font-weight: root.weight;
+            font-family: Theme.mono;
+            letter-spacing: root.tracking;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+}
+
+// One device channel — flat strip; a phosphor index tick marks the selected one.
+component DeviceLine inherits Rectangle {
+    in property <DeviceRow> d;
+    in property <bool> selected;
+    callback clicked();
+    callback backup();
+    height: 84px;
+    clip: true;
+    border-radius: Theme.radius;
+    background: selected ? Theme.bg-2 : (ta.has-hover ? Theme.well : transparent);
+    border-width: Theme.hair;
+    border-color: selected ? Theme.line : transparent;
+    animate background, border-color { duration: Theme.quick; }
+    property <bool> sheen-live: root.d.connected && ta.has-hover;
+    // accent index tick on the selected channel — the only colour; settles in with the row
+    Rectangle {
+        x: 0; width: 2px; y: 12px; height: parent.height - 24px;
+        background: root.selected ? Theme.accent : transparent;
+        animate background { duration: Theme.quick; }
+    }
+    ta := TouchArea { clicked => { root.clicked(); } }
+    // CARD CONTENT — a flow row: [glyph] [main: identity over data] [backup]. The layout engine places
+    // `backup` (the trailing child) flush-right against the card's ACTUAL laid-out width — there is no
+    // parent.width arithmetic that can diverge from the rendered width (the flaw that put `backup`
+    // ~50px past the card border in every absolute-positioned attempt). `main` (stretch:1) eats the
+    // slack so `backup` lands at one identical x; the data strip is a preferred-0 Flickable (min 0,
+    // preferred 0) so it can neither push `backup` nor inflate the card, and the header elides — so the
+    // card's intrinsic width stays tiny and the deck VBox stretches every card to the uniform column
+    // width. Same shape as the profiles app-rule rows (flow list, trailing action at one x).
+    HorizontalLayout {
+        padding-left: 18px; padding-right: 14px; padding-top: 12px; padding-bottom: 12px;
+        spacing: 14px;
+
+        // ── the device's identity glyph ───────────────────────────────────
+        VerticalLayout {
+            alignment: center;
+            SheenGlyph {
+                kind: root.d.icon;
+                ink: root.selected ? Theme.text-mid : Theme.text-faint;
+                live: root.sheen-live;
+            }
+        }
+
+        // ── main: identity header over the data strip ─────────────────────
+        VerticalLayout {
+            horizontal-stretch: 1;
+            alignment: center;
+            spacing: 9px;
+            // header: name + pid/link mode; online state is shown as ink-local hover sheen
+            HorizontalLayout {
+                spacing: 8px;
+                VerticalLayout {
+                    alignment: center; spacing: 3px;
+                    horizontal-stretch: 1;
+                    SheenText {
+                        value: root.d.name;
+                        live: root.sheen-live;
+                        ink: root.selected ? Theme.text : Theme.text-mid;
+                        size: Theme.fs-data;
+                        weight: 700;
+                        tracking: Theme.track-1;
+                    }
+                    SheenText {
+                        value: root.d.pid != ""
+                            ? "pid " + root.d.pid + (root.d.mode != "" ? " · " + root.d.mode : "")
+                            : root.d.detail;
+                        live: root.sheen-live;
+                        ink: Theme.text-faint;
+                        size: Theme.fs-small;
+                        weight: 400;
+                        tracking: 0px;
+                    }
+                }
+            }
+            // data strip — most-glanced first: DPI · POLL · BATT · LIGHT · ONBOARD · FW. A preferred-0
+            // Flickable: it neither pushes `backup` (min 0) nor inflates the card (preferred 0); it clips
+            // the trailing (least-glanced) readouts when the card is tight. The PAGE owns scrolling.
+            if root.d.pid != "" : Flickable {
+                height: 30px;
+                interactive: false;
+                // NO viewport-width binding: the content lays out at its natural width and the Flickable
+                // CLIPS it at its own (main-allocated) width. Binding viewport-width to self.width made
+                // the Flickable's preferred track its content, so a readout-heavy device leaked ~360px
+                // into `main` and squeezed the trailing `backup` button (its label overflowed its box).
+                    HorizontalLayout {
+                        spacing: 13px;
+                    Readout { key: "DPI"; value: root.d.dpi; }
+                    Readout { key: "POLL"; value: root.d.polling; }
+                    if root.d.battery != "" : VerticalLayout {
+                        alignment: center; spacing: 3px;
+                        Text {
+                            text: "BATT";
+                            color: Theme.text-faint;
+                            font-size: Theme.fs-small;
+                            font-family: Theme.mono;
+                            letter-spacing: Theme.track-3;
+                        }
+                        HorizontalLayout {
+                            spacing: 6px;
+                            // the drawn cell gauge — a level is a gauge, not a string
+                            VerticalLayout {
+                                alignment: center;
+                                Rectangle {
+                                    width: 30px; height: 8px;
+                                    border-width: Theme.hair;
+                                    border-color: Theme.line;
+                                    border-radius: 1px;
+                                    Rectangle {
+                                        x: 1px; y: 1px;
+                                        height: parent.height - 2px;
+                                        width: max(0px, (parent.width - 2px) * max(0.0, root.d.battery-frac));
+                                        background: root.d.charging ? Theme.accent
+                                            : root.d.battery-frac < 0.2 ? Theme.warn
+                                            : Theme.text-dim;
+                                        animate background { duration: Theme.quick; }
+                                    }
+                                }
+                            }
+                            Text {
+                                text: root.d.battery;
+                                color: root.d.charging ? Theme.accent : Theme.text-mid;
+                                animate color { duration: Theme.quick; }
+                                font-size: Theme.fs-data;
+                                font-weight: 600;
+                                font-family: Theme.mono;
+                                vertical-alignment: center;
+                            }
+                            if root.d.charging : Text {
+                                text: "CHG";
+                                color: Theme.accent;
+                                font-size: Theme.fs-small;
+                                font-family: Theme.mono;
+                                letter-spacing: Theme.track-2;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+                    Readout { key: "LIGHT"; value: root.d.brightness; }
+                    if root.d.storage != "" : Readout { key: "ONBOARD"; value: root.d.storage; }
+                    Readout { key: "FW"; value: root.d.firmware; }
+                    Rectangle {}
+                }
+            }
+        }
+
+        // ── backup — the trailing flow child, a FIXED-width column so the layout engine can never
+        // squeeze it (explicit width = min==max==width, immune to any shrink). `main` (stretch:1) eats
+        // all slack, so this sits flush-right at the identical x on every device, full label intact. ──
+        if root.d.pid != "" : VerticalLayout {
+            width: 72px;
+            alignment: center;
+            Button { text: "backup"; clicked => { root.backup(); } }
+        }
+    }
+}
+
+export component DevicePanel inherits VerticalLayout {
+    spacing: 0;
+
+    PanelHead {
+        label: "DEVICE";
+        caption: "live device readout · pick a channel to tune";
+        if State.writes-paused : VerticalLayout { alignment: center; Pill { text: "WRITES PAUSED"; tint: Theme.danger; } }
+        VerticalLayout { width: 8px; }
+        // explicit width so the action sizes to its LABEL and sits flush-right, instead of a stretch:1
+        // Button ballooning to fill the head slot (the over-long "re-scan"). Same idiom as `backup`.
+        VerticalLayout {
+            width: 90px;
+            alignment: center;
+            Button { text: "re-scan"; primary: true; clicked => { State.refresh-devices(); } }
+        }
+    }
+    Rectangle { height: Theme.hair; background: Theme.line; }
+    Rectangle { height: Theme.lead-in; }
+
+    HorizontalLayout {
+        spacing: Theme.gap-col;
+        vertical-stretch: 1;   // fill the page height so each column is a FIXED footprint (static UI)
+
+        // ── device channels ───────────────────────────────────────────────
+        VerticalLayout {
+            spacing: 8px;
+            horizontal-stretch: 2;
+            preferred-width: 440px;
+            alignment: start;   // top-pack the channel cards (the column now fills the height)
+            // a width FLOOR for the list. The cards now report ~0 preferred width (their content lives
+            // in a preferred-0 Flickable so it can't inflate the column), which is what stops the row
+            // overflowing into FEEL — but it also means the column would otherwise collapse toward
+            // FEEL's larger preferred. This floor keeps the list the wide 2/3 it's meant to be: 440 +
+            // FEEL's 340 + the 24 gutter = 804, inside the 856 work area at the 900px-min window.
+            min-width: 440px;
+            if State.devices.length == 0 : VerticalLayout {
+                padding-top: 24px; spacing: 6px;
+                Mono { text: "no recognized Razer devices."; color: Theme.text-dim; }
+                Mono { text: "plug one in and press re-scan"; }
+            }
+            // The cards stack in a plain VerticalLayout (the page-level PanelPage Flickable owns the
+            // vertical scroll). The trick that makes this work where every prior attempt failed: a
+            // DeviceLine's children are ABSOLUTELY positioned (the identity/data clip + the geometry-
+            // pinned backup, both keyed off parent.width), so the card imposes NO min-width of its own
+            // → it reports 0 → the VerticalLayout stretches EVERY card to the identical column width
+            // with zero overflow. No explicit card width (that was circular: card.width = deck.width fed
+            // the card's own width back into the deck and inflated the row past its slot). Same shape as
+            // the profiles app-rule rows — a flow list with a trailing action that sits at one x.
+            VerticalLayout {
+                spacing: 5px;
+                for d[i] in State.devices : DeviceLine {
+                    d: d;
+                    selected: i == State.selected-device;
+                    clicked => { State.select-device(i); }
+                    backup => { State.backup-device(d.pid); }
+                }
+            }
+        }
+
+        // ── feel + ADVANCED controls for the selected device ──────────────
+        VerticalLayout {
+            horizontal-stretch: 1;
+            min-width: 340px;
+            preferred-width: 340px;
+            // a FIXED-footprint inspector — the selected device's controls scroll WITHIN this pane, so
+            // switching mouse / keyboard / mic never resizes the panel (a good UI is a static surface).
+            Flickable {
+                viewport-width: self.width;
+                viewport-height: max(self.height, ibody.preferred-height);
+                ibody := VerticalLayout {
+                    width: parent.viewport-width;
+                    // top-pack at NATURAL size — never stretch the cards to fill the taller pane (that
+                    // was the empty-gap / resizing artifact); the pane stays fixed, content scrolls.
+                    alignment: start;
+            // the controls act on a SELECTED channel — with none, don't present live-looking controls
+            if State.devices.length == 0 : VerticalLayout {
+                padding-top: 24px;
+                Mono { text: "no channel — plug in a Razer device to tune it"; color: Theme.text-faint; }
+            }
+            // AUDIO endpoint (mic / output) selected — its own volume + mute card (acts on THIS
+            // endpoint, not the system default).
+            if (State.selected-device-kind == "mic" || State.selected-device-kind == "output") : VerticalLayout {
+                spacing: 16px;
+                Card {
+                    VerticalLayout {
+                        padding: 18px;
+                        spacing: 14px;
+                        HorizontalLayout {
+                            SectionTitle { text: State.selected-device-kind == "mic" ? "MICROPHONE" : "OUTPUT"; }
+                            Rectangle {}
+                            Mono { text: State.selected-device-name; color: Theme.text-faint; overflow: elide; }
+                        }
+                        Mono { text: "the selected endpoint's live level (Core Audio) — moves THIS device, not the system default"; color: Theme.text-faint; wrap: word-wrap; }
+                        Slider {
+                            caption: "VOLUME";
+                            minimum: 0; maximum: 100; value: State.device-volume; step: 2;
+                            // readout tracks the drag; the endpoint write (a COM round-trip) fires ONCE
+                            // on release, not per drag-tick — same "one write per gesture" rule as sniper.
+                            changed(v) => { State.device-volume = v; }
+                            released(v) => { State.set-device-volume(v); }
+                        }
+                        HorizontalLayout {
+                            Button { text: State.device-muted ? "unmute" : "mute"; clicked => { State.toggle-device-mute(); } }
+                            Rectangle {}
+                            VerticalLayout { alignment: center; Pill { text: State.device-muted ? "MUTED" : "LIVE"; live: !State.device-muted; tint: Theme.warn; } }
+                        }
+                    }
+                }
+            }
+            // HID peripheral (mouse / keyboard) selected — the FEEL + ADVANCED control stack.
+            if (State.selected-device-kind == "mouse" || State.selected-device-kind == "keyboard" || State.selected-device-kind == "device") : VerticalLayout {
+                spacing: 16px;
+                if (State.sel-can-dpi || State.sel-can-poll || State.sel-can-light || State.sel-can-store) : Card {
+                    VerticalLayout {
+                        padding: 18px;
+                        spacing: 14px;
+                        HorizontalLayout {
+                            SectionTitle { text: "FEEL"; }
+                            Rectangle {}
+                            Mono { text: State.selected-device-name; color: Theme.text-faint; overflow: elide; }
+                        }
+                        Mono { text: "seeded from the device · applied to the selected channel"; color: Theme.text-faint; wrap: word-wrap; }
+                        // the stage table rides the fader as detent ticks — the cycle, on the control
+                        if State.sel-can-dpi : VerticalLayout { spacing: 14px;
+                        Slider {
+                            caption: "DPI";
+                            minimum: 100; maximum: 30000; value: State.dpi;
+                            step: 50;
+                            detents: State.dpi-stage-nums;
+                            changed(v) => { State.dpi = v; }
+                        }
+                        HorizontalLayout {
+                            spacing: 10px;
+                            Mono { text: "ticks mark the stage cycle · scroll for ±50"; color: Theme.text-faint; wrap: word-wrap; horizontal-stretch: 1; min-width: 0px; }
+                            Button {
+                                text: "apply dpi"; primary: true;
+                                enabled: !State.writes-paused;
+                                clicked => { State.apply-dpi(State.dpi); }
+                            }
+                        }
+                        Divider {}
+                        }
+                        // polling is 4 legal rates — discrete contacts, applied on press (the lit
+                        // contact IS the device state; no fake-continuous fader, no phantom 643 Hz)
+                        // POLLING is a 4-state contact pick — its readout sits at DATA scale, not the
+                        // 26px hero slot (DPI is the panel's one hero, on its fader's readout)
+                        if State.sel-can-poll : VerticalLayout { spacing: 14px;
+                        HorizontalLayout {
+                            Text {
+                                text: "POLLING";
+                                color: Theme.text-dim;
+                                font-size: Theme.fs-small;
+                                font-family: Theme.mono;
+                                letter-spacing: Theme.track-2;
+                                vertical-alignment: center;
+                            }
+                            Rectangle {}
+                            HorizontalLayout {
+                                spacing: 3px;
+                                Text {
+                                    text: round(State.polling-hz);
+                                    color: Theme.text;
+                                    font-size: Theme.fs-data;
+                                    font-weight: 600;
+                                    font-family: Theme.mono;
+                                    vertical-alignment: center;
+                                }
+                                Text {
+                                    text: "Hz";
+                                    color: Theme.text-faint;
+                                    font-size: Theme.fs-small;
+                                    font-family: Theme.mono;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+                        ContactRow {
+                            options: [125, 250, 500, 1000];
+                            value: round(State.polling-hz);
+                            enabled: !State.writes-paused;
+                            picked(hz) => { State.apply-polling(hz); }
+                        }
+                        Divider {}
+                        }
+                        if State.sel-can-light : VerticalLayout { spacing: 14px;
+                        Slider {
+                            caption: "BRIGHTNESS";
+                            minimum: 0; maximum: 100; value: State.brightness; unit: "%";
+                            step: 5;
+                            changed(v) => { State.brightness = v; }
+                        }
+                        HorizontalLayout {
+                            Rectangle { horizontal-stretch: 1; }
+                            Button {
+                                text: "apply"; primary: true;
+                                enabled: !State.writes-paused;
+                                clicked => { State.apply-brightness(State.brightness); }
+                            }
+                        }
+                        }
+                        if State.sel-can-store : Divider {}
+                        if State.sel-can-store : VerticalLayout { spacing: 14px;
+                        Toggle {
+                            caption: "persist to onboard memory";
+                            checked: State.persist-to-onboard;
+                            toggled(v) => { State.persist-to-onboard = v; State.set-persist(v); }
+                        }
+                        Mono { text: "onboard VARSTORE · matrix mice only — the \"no software\" dream"; color: Theme.text-faint; wrap: word-wrap; }
+                        }
+                    }
+                }
+
+                // ── ADVANCED · LIVE — verified writes, no gate ─────────────
+                if State.sel-can-dpi : Card {
+                    VerticalLayout {
+                        padding: 18px;
+                        spacing: 13px;
+                        SectionTitle { text: "ADVANCED · LIVE"; }
+                        if State.perf-status != "" : Mono { text: State.perf-status; color: Theme.text-mid; wrap: word-wrap; }
+
+                        // DPI STAGE LIST (the cycle) — table + the active stage as contacts
+                        HorizontalLayout {
+                            Mono { text: "DPI STAGES"; color: Theme.text-dim; }
+                            Rectangle { horizontal-stretch: 1; min-width: 8px; }
+                            Mono {
+                                text: State.dpi-stages-note;
+                                color: State.dpi-stages-valid ? Theme.text-faint : Theme.danger;
+                                overflow: elide;
+                                min-width: 0px;
+                            }
+                        }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Field {
+                                field-width: 260px;
+                                placeholder: "800/1600/3200/6400";
+                                text <=> State.dpi-stages;
+                                invalid: !State.dpi-stages-valid;
+                                edited(t) => { State.dpi-stages-edited(t); }
+                                accepted(t) => { State.apply-dpi-stages(t, State.dpi-active-stage); }
+                            }
+                            Button {
+                                text: "apply stages";
+                                primary: true;
+                                enabled: !State.writes-paused && State.dpi-stages-valid;
+                                clicked => { State.apply-dpi-stages(State.dpi-stages, State.dpi-active-stage); }
+                            }
+                        }
+                        // pick which stage is ACTIVE — the second half of the feature, reachable
+                        HorizontalLayout {
+                            spacing: 6px;
+                            Mono { text: "active"; color: Theme.text-faint; }
+                            for s[i] in State.dpi-stage-nums : Pill {
+                                text: (i + 1) + ":" + s;
+                                selected: i == State.dpi-active-stage;
+                                clickable: true;
+                                clicked => { State.dpi-active-stage = i; }
+                            }
+                            Rectangle { horizontal-stretch: 1; min-width: 8px; }
+                            Mono {
+                                text: State.dpi-stage-nums.length > 0
+                                    ? "will write stage " + (State.dpi-active-stage + 1)
+                                    : "no stage";
+                                color: Theme.text-faint;
+                                overflow: elide;
+                                min-width: 0px;
+                            }
+                        }
+                        Divider {}
+
+                        // SNIPER / hold-to-precision-DPI
+                        HorizontalLayout {
+                            Mono { text: "SNIPER PRECISION"; color: Theme.text-dim; }
+                            Rectangle { horizontal-stretch: 1; min-width: 8px; }
+                            Mono {
+                                text: State.sniper-button == "—" ? "no hold button bound" : "hold " + State.sniper-button;
+                                color: State.sniper-button == "—" ? Theme.text-faint : Theme.accent;
+                                overflow: elide;
+                                min-width: 0px;
+                            }
+                        }
+                        Button { text: "capture hold button"; clicked => { State.capture-sniper-button(); } }
+                        Slider {
+                            caption: "PRECISION DPI";
+                            minimum: 100; maximum: 30000; value: State.sniper-dpi;
+                            step: 50;
+                            detents: State.dpi-stage-nums;
+                            changed(v) => { State.sniper-dpi = v; }
+                            // ONE config write per gesture, not one per drag-tick
+                            released(v) => { State.save-sniper(v); }
+                        }
+                        if State.dpi-stage-nums.length > 0 : HorizontalLayout {
+                            spacing: 6px;
+                            Mono { text: "presets"; color: Theme.text-faint; }
+                            for s in State.dpi-stage-nums : Pill {
+                                text: "" + s;
+                                selected: s == State.sniper-dpi;
+                                clickable: true;
+                                clicked => {
+                                    State.sniper-dpi = s;
+                                    State.save-sniper(s);
+                                }
+                            }
+                            Rectangle {}
+                        }
+                    }
+                }
+
+                // KEY GUARD — a host-side LL-hook OS-chord swallow (no device write), so it is NOT a
+                // mouse feature and is NOT gated on DPI: a keyboard gamer needs Alt+Tab/Win swallowed
+                // mid-game just as much. Its own card, shown for ANY selected HID. Grows by chord.
+                Card {
+                    VerticalLayout {
+                        padding: 18px;
+                        spacing: 13px;
+                        SectionTitle { text: "KEY GUARD"; }
+                        Mono { text: "host-side · swallow OS chords mid-game (no device write)"; color: Theme.text-faint; wrap: word-wrap; }
+                        HorizontalLayout {
+                            spacing: 7px;
+                            for g in [
+                                { l: "Alt+Tab", on: State.disable-alt-tab },
+                                { l: "Win", on: State.disable-win },
+                                { l: "Alt+F4", on: State.disable-alt-f4 },
+                                { l: "Alt+Esc", on: State.disable-alt-esc },
+                            ] : Rectangle {
+                                height: 28px;
+                                horizontal-stretch: 1;
+                                border-radius: Theme.radius-sm;
+                                background: g.on ? Theme.accent-glow : (gta.has-hover ? Theme.well : transparent);
+                                border-width: Theme.hair;
+                                border-color: g.on ? Theme.accent-line : (gta.has-hover ? Theme.text-faint : Theme.line);
+                                animate background, border-color { duration: Theme.quick; }
+                                Text {
+                                    text: g.l;
+                                    x: 0; width: 100%;
+                                    horizontal-alignment: center; vertical-alignment: center;
+                                    color: g.on ? Theme.accent : Theme.text-dim;
+                                    font-size: Theme.fs-small; font-weight: 700; font-family: Theme.mono;
+                                }
+                                gta := TouchArea {
+                                    mouse-cursor: MouseCursor.pointer;
+                                    clicked => {
+                                        if (g.l == "Alt+Tab") { State.disable-alt-tab = !State.disable-alt-tab; }
+                                        else if (g.l == "Win") { State.disable-win = !State.disable-win; }
+                                        else if (g.l == "Alt+F4") { State.disable-alt-f4 = !State.disable-alt-f4; }
+                                        else { State.disable-alt-esc = !State.disable-alt-esc; }
+                                        State.apply-gaming-mode();
+                                    }
+                                }
+                            }
+                        }
+                        Mono { text: "lit = swallowed while a gaming profile is active · reversible (lifts on profile change)"; color: Theme.text-faint; }
+                    }
+                }
+
+                // ── ADVANCED · GATED — verify-gated writes (each row names its gate) ──
+                if State.sel-can-dpi : Card {
+                    VerticalLayout {
+                        padding: 18px;
+                        spacing: 14px;
+                        HorizontalLayout {
+                            SectionTitle { text: "GATED DEVICE WRITES"; }
+                            Rectangle {}
+                            Pill { text: "verify first"; tint: Theme.text-faint; }
+                        }
+                        Mono {
+                            text: "these paths are implemented but held behind per-feature gates until a USBPcap round-trip confirms the opcode on real hardware";
+                            color: Theme.text-faint;
+                            wrap: word-wrap;
+                        }
+                        VerticalLayout {
+                            spacing: 14px;
+
+                            // SCROLL / HyperScroll stages (class 0x0B — hardware-verify pending)
+                            HorizontalLayout {
+                                Mono { text: "HYPERSCROLL CYCLE"; color: Theme.text-dim; }
+                                Rectangle { horizontal-stretch: 1; min-width: 8px; }
+                                Pill { text: "NEURON_HYPERSCROLL_WRITE"; tint: Theme.text-faint; }
+                            }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                Field {
+                                    field-width: 260px;
+                                    placeholder: "tactile/free";
+                                    text <=> State.scroll-stages;
+                                    invalid: !State.scroll-stages-valid;
+                                    edited(t) => { State.scroll-stages-edited(t); }
+                                    accepted(t) => { State.apply-scroll-stages(t); }
+                                }
+                                Button {
+                                    text: "apply wheel cycle";
+                                    enabled: !State.writes-paused && State.scroll-stages-valid;
+                                    clicked => { State.apply-scroll-stages(State.scroll-stages); }
+                                }
+                            }
+                            HorizontalLayout {
+                                spacing: 6px;
+                                Mono { text: State.scroll-stages-note; color: State.scroll-stages-valid ? Theme.text-faint : Theme.danger; overflow: elide; min-width: 0px; }
+                                Rectangle { horizontal-stretch: 1; min-width: 8px; }
+                                Pill { text: "tactile/free"; clickable: true; clicked => { State.scroll-stages = "tactile/free"; State.scroll-stages-edited(State.scroll-stages); } }
+                                Pill { text: "tactile"; clickable: true; clicked => { State.scroll-stages = "tactile"; State.scroll-stages-edited(State.scroll-stages); } }
+                                Pill { text: "free"; clickable: true; clicked => { State.scroll-stages = "free"; State.scroll-stages-edited(State.scroll-stages); } }
+                            }
+                            Divider {}
+
+                            // SLEEP / idle timer
+                            HorizontalLayout {
+                                Mono { text: "LIGHT SLEEP TIMER"; color: Theme.text-dim; }
+                                Rectangle { horizontal-stretch: 1; min-width: 8px; }
+                                Mono { text: "device " + State.idle-readout; color: Theme.text-faint; overflow: elide; }
+                                Pill { text: "NEURON_IDLE_WRITE"; tint: Theme.text-faint; }
+                            }
+                            // field + live status on one line; the apply key drops to its OWN line so its
+                            // verb is never clipped by the field/status in the narrow fixed panel.
+                            VerticalLayout {
+                                spacing: 8px;
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    Field {
+                                        field-width: 160px;
+                                        placeholder: "300";
+                                        text <=> State.idle-secs-text;
+                                        invalid: !State.idle-secs-valid;
+                                        edited(t) => { State.idle-edited(t); }
+                                        accepted(t) => { State.apply-idle(State.idle-secs); }
+                                    }
+                                    Mono {
+                                        text: State.idle-secs-note;
+                                        color: State.idle-secs-valid ? Theme.text-faint : Theme.danger;
+                                        overflow: elide;
+                                        min-width: 0px;
+                                    }
+                                }
+                                HorizontalLayout {
+                                    Rectangle { horizontal-stretch: 1; }
+                                    Button {
+                                        text: "apply sleep timer";
+                                        enabled: !State.writes-paused && State.idle-secs-valid;
+                                        clicked => { State.apply-idle(State.idle-secs); }
+                                    }
+                                }
+                            }
+                            HorizontalLayout {
+                                spacing: 6px;
+                                Mono { text: "presets"; color: Theme.text-faint; }
+                                for p in [
+                                    { l: "never", s: "0" },
+                                    { l: "1m", s: "60" },
+                                    { l: "5m", s: "300" },
+                                    { l: "15m", s: "900" },
+                                    { l: "1h", s: "3600" },
+                                ] : Pill {
+                                    text: p.l;
+                                    selected: State.idle-secs-text == p.s;
+                                    clickable: true;
+                                    clicked => {
+                                        State.idle-secs-text = p.s;
+                                        State.idle-edited(State.idle-secs-text);
+                                    }
+                                }
+                            }
+                            Divider {}
+
+                            // IN-GAME polling — HyperPolling tiers are powers-of-two contacts,
+                            // not a fader where 125..1000 crush into the leftmost 11%.
+                            HorizontalLayout {
+                                Mono { text: "IN-GAME POLLING"; color: Theme.text-dim; }
+                                Rectangle { horizontal-stretch: 1; min-width: 8px; }
+                                Mono { text: round(State.ingame-wired-hz) + "/" + round(State.ingame-dongle-hz) + " Hz"; color: Theme.text-faint; overflow: elide; }
+                                Pill { text: "NEURON_INGAME_POLL_WRITE"; tint: Theme.text-faint; }
+                            }
+                            Mono { text: "wired"; color: Theme.text-faint; }
+                            ContactRow {
+                                options: [125, 250, 500, 1000, 2000, 4000, 8000];
+                                value: round(State.ingame-wired-hz);
+                                enabled: !State.writes-paused;
+                                picked(hz) => { State.ingame-wired-hz = hz; }
+                            }
+                            Mono { text: "dongle"; color: Theme.text-faint; }
+                            ContactRow {
+                                options: [125, 250, 500, 1000, 2000, 4000];
+                                value: round(State.ingame-dongle-hz);
+                                enabled: !State.writes-paused;
+                                picked(hz) => { State.ingame-dongle-hz = hz; }
+                            }
+                            HorizontalLayout {
+                                Rectangle { horizontal-stretch: 1; }
+                                Button {
+                                    text: "apply polling pair";
+                                    enabled: !State.writes-paused;
+                                    clicked => { State.apply-ingame-polling(State.ingame-wired-hz, State.ingame-dongle-hz); }
+                                }
+                            }
+                            Divider {}
+
+                            // LIFT-OFF DISTANCE + DEBOUNCE — honest hardware-pending stubs
+                            Mono { text: "SENSOR TIMING"; color: Theme.text-dim; }
+                            HorizontalLayout {
+                                Mono { text: "lift-off distance"; color: Theme.text-faint; }
+                                Rectangle {}
+                                Pill { text: "no opcode"; tint: Theme.text-faint; }
+                            }
+                            HorizontalLayout {
+                                Mono { text: "debounce"; color: Theme.text-faint; }
+                                Rectangle {}
+                                Pill { text: "no opcode"; tint: Theme.text-faint; }
+                            }
+                            Mono { text: "not wired until a Synapse capture reveals class/id/payload; showing fake controls here would be dishonest"; color: Theme.text-faint; wrap: word-wrap; }
+                        }
+                    }
+                }
+            }
+                }   // ibody
+            }       // inspector Flickable
+        }
+    }
+}
+

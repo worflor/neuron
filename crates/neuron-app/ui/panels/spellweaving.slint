@@ -1,0 +1,695 @@
+import { Theme } from "../theme.slint";
+import { Card, SectionTitle, Label, Button, Field, Slider, Pill, Mono, Divider, PanelHead, ActionPicker, Segment, InputHead } from "../widgets/controls.slint";
+import { State } from "../state.slint";
+import { RadialSector, GlyphChip } from "../models.slint";
+
+// SPELLWEAVING — one held-stroke engine; radial is a SUBSET of it, not a sibling. LEFT: the rich
+// weave — draw a glyph, the eigenmotion engine recognizes it (+ the vault, where every chip shows
+// what its glyph is BOUND to). RIGHT: the simplest weave — a radial flick, where only net
+// direction matters (a sector pick). Same trigger, same capture, one resolver reads a stroke as
+// the simple weave (flick) or the rich weave (glyph).
+
+export component SpellweavingPanel inherits VerticalLayout {
+    spacing: 0;
+    // two-step arm for "clear vault" — recorded glyphs are irreplaceable training data.
+    property <bool> clear-armed: false;
+    Timer {
+        interval: Theme.confirm-window;
+        running: root.clear-armed;
+        triggered => { root.clear-armed = false; }
+    }
+    // rename buffer for the bind card
+    property <string> rename-to: "";
+    // activation preset is string-keyed in the engine, index-keyed in the Segment widget
+    property <int> activation-idx: State.activation-pattern == "hold" ? 0
+        : State.activation-pattern == "tap hold" ? 1
+        : State.activation-pattern == "tap tap hold" ? 2 : 3;
+
+    // the INPUT head — the shared InputHead, so the DIRECT⇄WEAVE segment lives ONCE and is
+    // guaranteed to match the DIRECT depth instead of being kept byte-identical by hand.
+    InputHead {
+        caption: "spellweaving · the held-stroke engine";
+        if State.capturing-gesture : Pill { text: "CAPTURING"; live: true; }
+        // these captures run with the GUI live (no scrim) — surface the escape hatch (the worker
+        // honours a global ESC) so a recording can't feel like a stuck state
+        if State.capturing-gesture || State.recording-activation : VerticalLayout {
+            alignment: center;
+            Mono { text: "ESC cancels"; color: Theme.text-faint; }
+        }
+    }
+    Rectangle { height: Theme.hair; background: Theme.line; }
+    Rectangle { height: Theme.lead-in; }
+
+    // ── one trigger, several rhythms: a MAP of what each press-pattern fires ──────────
+    // The engine already routes rhythms to different gestures (hold→weave, tap-hold→teleport,
+    // 2tap-hold→whiteboard, via the cast ModeSlots). Surface THAT as a scannable map instead of a
+    // lone rhythm picker + stray "try" buttons, so the model is obvious: one key, many rhythms.
+    Mono {
+        text: "One trigger, several rhythms — each press-pattern fires its own gesture.   ( ● tap · ▬ hold )";
+        color: Theme.text-dim;
+    }
+    Rectangle { height: 12px; }
+
+    // TRIGGER — a COMPACT field (capped, never spans the row) + a smart bind button.
+    HorizontalLayout {
+        spacing: 12px;
+        VerticalLayout { alignment: center; width: 78px; Mono { text: "TRIGGER"; color: Theme.text-dim; } }
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                min-width: 196px;
+                max-width: 300px;   // <- compact: the field hugs a sane size, never eats the whole row
+                height: 30px;
+                border-radius: Theme.radius-sm;
+                background: Theme.well;
+                border-width: Theme.hair;
+                border-color: State.cast-trigger-label != "—" ? Theme.accent-line : Theme.line;
+                HorizontalLayout {
+                    padding-left: 12px; padding-right: 12px; spacing: 9px;
+                    VerticalLayout { alignment: center; Rectangle { width: 6px; height: 6px; border-radius: 3px; background: State.cast-trigger-label != "—" ? Theme.accent : Theme.line; } }
+                    VerticalLayout {
+                        alignment: center;
+                        horizontal-stretch: 1;
+                        Text {
+                            text: State.cast-trigger-label != "—" ? State.cast-trigger-label : "nothing bound yet";
+                            color: State.cast-trigger-label != "—" ? Theme.accent : Theme.text-faint;
+                            font-family: Theme.mono; font-size: Theme.fs-body; vertical-alignment: center;
+                            overflow: elide;
+                        }
+                    }
+                }
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            Button {
+                text: State.cast-trigger-label != "—" ? "rebind" : "press to bind";
+                primary: State.cast-trigger-label == "—";
+                clicked => { State.capture-cast-trigger(); }
+            }
+        }
+        // the stretch lives AFTER the controls — that's why the field stays small on the left
+        Rectangle { horizontal-stretch: 1; }
+    }
+    Rectangle { height: 14px; }
+
+    // RHYTHM MAP — a row per press-pattern: the rhythm, then what it fires. The weave's rhythm is
+    // editable inline (segment + record); teleport/whiteboard ride their fixed rhythms with a TRY.
+    HorizontalLayout {
+        spacing: 12px;
+        VerticalLayout { alignment: start; width: 78px; padding-top: 11px; Mono { text: "RHYTHMS"; color: Theme.text-dim; } }
+        VerticalLayout {
+            horizontal-stretch: 1;
+            spacing: 6px;
+
+            // hold → WEAVE (primary, accent; its rhythm is the editable one)
+            Rectangle {
+                height: 40px;
+                border-radius: Theme.radius-sm;
+                background: Theme.bg-2;
+                border-width: Theme.hair;
+                border-color: Theme.accent-line;
+                HorizontalLayout {
+                    padding-left: 13px; padding-right: 9px; spacing: 11px;
+                    VerticalLayout { alignment: center; width: 84px;
+                        Text {
+                            text: State.recording-activation ? "···" : State.activation-display;
+                            color: Theme.accent; font-family: Theme.mono; font-size: Theme.fs-data; font-weight: 700;
+                            letter-spacing: 2px; vertical-alignment: center;
+                        }
+                    }
+                    VerticalLayout { alignment: center; Mono { text: "→"; color: Theme.text-faint; } }
+                    VerticalLayout { alignment: center; horizontal-stretch: 1;
+                        Text { text: "open the weave — draw a glyph or flick the radial"; color: Theme.text; font-family: Theme.mono; font-size: Theme.fs-body; vertical-alignment: center; overflow: elide; }
+                    }
+                    VerticalLayout { alignment: center;
+                        Segment {
+                            options: ["hold", "tap·hold", "2tap·hold", "2tap ⇄"];
+                            index: root.activation-idx;
+                            min-seg: 56px;
+                            picked(i) => { State.set-activation(i == 0 ? "hold" : i == 1 ? "tap hold" : i == 2 ? "tap tap hold" : "tap tap"); }
+                        }
+                    }
+                    VerticalLayout { alignment: center;
+                        Button {
+                            text: State.recording-activation ? "perform…" : "record";
+                            enabled: !State.recording-activation && !State.capturing-gesture;
+                            clicked => { State.record-activation(); }
+                        }
+                    }
+                }
+            }
+
+            // each NON-weave rhythm is a first-class Trigger::Cast bound to any Action — remappable
+            // here, inline (click a row → an ActionPicker drops beneath it, just like the glyphs).
+            // The defaults (tap·hold → teleport) are seeded from cast.toml's rhythm_actions.
+            for rb in State.rhythm-binds : VerticalLayout {
+                spacing: 6px;
+                Rectangle {
+                    height: 40px;
+                    border-radius: Theme.radius-sm;
+                    property <bool> target: State.rhythm-bind-target == rb.taps;
+                    background: self.target ? Theme.accent-glow : (rhyrow-ta.has-hover ? Theme.well : Theme.bg-2);
+                    border-width: Theme.hair;
+                    border-color: self.target ? Theme.accent-line : (rhyrow-ta.has-hover ? Theme.text-faint : Theme.line);
+                    animate background, border-color { duration: Theme.quick; }
+                    rhyrow-ta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { State.bind-rhythm(rb.taps); } }
+                    HorizontalLayout {
+                        padding-left: 13px; padding-right: 9px; spacing: 11px;
+                        VerticalLayout { alignment: center; width: 84px;
+                            Text { text: rb.label; color: rb.bound ? Theme.text-mid : Theme.text-faint; font-family: Theme.mono; font-size: Theme.fs-data; font-weight: 700; letter-spacing: 2px; vertical-alignment: center; }
+                        }
+                        VerticalLayout { alignment: center; Mono { text: "→"; color: Theme.text-faint; } }
+                        VerticalLayout { alignment: center; horizontal-stretch: 1;
+                            Text { text: rb.bound ? rb.desc : "unbound — click to bind"; color: rb.bound ? Theme.text : Theme.text-faint; font-family: Theme.mono; font-size: Theme.fs-body; vertical-alignment: center; overflow: elide; }
+                        }
+                        // a teleport / whiteboard rhythm keeps its TRY shortcut (opens the instrument now).
+                        if rb.desc == "teleport" : VerticalLayout { alignment: center; Button { text: "try"; clicked => { State.try-teleport(); } } }
+                        if rb.desc == "whiteboard" : VerticalLayout { alignment: center; Button { text: "try"; clicked => { State.try-whiteboard(); } } }
+                    }
+                }
+                // INLINE editor — opens beneath THIS rhythm's row when it's the selected target.
+                if State.rhythm-bind-target == rb.taps : Card {
+                    VerticalLayout {
+                        padding: 12px; spacing: 9px;
+                        HorizontalLayout {
+                            Mono { text: "rhythm  " + rb.label; color: Theme.accent; }
+                            Rectangle {}
+                            Button {
+                                text: "unbind";
+                                danger: true;
+                                clicked => { State.delete-rhythm(rb.taps); }
+                            }
+                        }
+                        Mono { text: "BIND → ACTION"; color: Theme.text-dim; }
+                        rhy-picker := ActionPicker {}
+                        HorizontalLayout {
+                            spacing: 7px;
+                            Button {
+                                text: "set"; primary: true;
+                                enabled: rhy-picker.param-ok;
+                                clicked => { State.commit-rhythm-bind(); }
+                            }
+                            Button { text: "cancel"; clicked => { State.rhythm-bind-target = -1; } }
+                            Rectangle {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Rectangle { height: Theme.lead-in; }
+
+    HorizontalLayout {
+        spacing: Theme.gap-col;
+
+        // ── gesture trail + vault ─────────────────────────────────────────
+        VerticalLayout {
+            horizontal-stretch: 1;
+            spacing: 12px;
+            SectionTitle { text: "GLYPH · the rich weave"; }
+            canvas := Rectangle {
+                background: Theme.bg-2;
+                border-radius: Theme.radius;
+                clip: true;
+                min-height: 260px;
+                // faint grid backdrop
+                for gx in 8 : Rectangle {
+                    x: parent.width / 8 * gx; width: 1px; height: parent.height;
+                    background: Theme.line-soft;
+                }
+                for gy in 6 : Rectangle {
+                    y: parent.height / 6 * gy; width: parent.width; height: 1px;
+                    background: Theme.line-soft;
+                }
+                // honest empty state — what this surface is, and how to make something appear
+                if State.trail.length == 0 : VerticalLayout {
+                    alignment: center;
+                    spacing: 5px;
+                    Mono {
+                        text: State.capturing-gesture
+                            ? "weaving — draw while holding the trigger"
+                            : "your last stroke renders here";
+                        color: Theme.text-dim;
+                        horizontal-alignment: center;
+                    }
+                    if !State.capturing-gesture : Mono {
+                        text: "hold " + State.cast-trigger-label + " and draw, or press Record glyph";
+                        color: Theme.text-faint;
+                        horizontal-alignment: center;
+                    }
+                }
+                // the trail: each point a glowing accent dot, brighter toward the head
+                for k in (State.trail.length / 2) : Rectangle {
+                    property <int> idx: k;
+                    property <float> tx: State.trail[idx * 2];
+                    property <float> ty: State.trail[idx * 2 + 1];
+                    property <float> frac: idx / max(1, (State.trail.length / 2) - 1);
+                    width: 6px + 6px * frac;
+                    height: self.width;
+                    border-radius: self.width / 2;
+                    x: tx * (canvas.width - self.width);
+                    y: ty * (canvas.height - self.height);
+                    background: State.weave-accent-col.with-alpha(0.2 + 0.7 * frac);
+                }
+                // floating RECORD — a compact pill in the canvas's top-right (a Button inherits
+                // Rectangle, which fills its parent unless sized, so it MUST hug its own content via
+                // `width: bar.preferred-width`, else it spans the whole surface). A hollow ring at
+                // rest; a filled accent lamp while recording.
+                Rectangle {
+                    x: parent.width - self.width - 12px;
+                    y: 12px;
+                    width: recbar.preferred-width;
+                    height: 28px;
+                    border-radius: Theme.radius-sm;
+                    background: State.capturing-gesture ? Theme.accent-glow : (rta.has-hover ? Theme.well : Theme.bg-2);
+                    border-width: Theme.hair;
+                    border-color: State.capturing-gesture ? Theme.accent-line : (rta.has-hover ? Theme.text-faint : Theme.line);
+                    animate background, border-color { duration: Theme.quick; }
+                    rta := TouchArea {
+                        enabled: !State.capturing-gesture;
+                        mouse-cursor: MouseCursor.pointer;
+                        clicked => { State.record-gesture(); }
+                    }
+                    recbar := HorizontalLayout {
+                        padding-left: 11px; padding-right: 13px; spacing: 7px;
+                        VerticalLayout {
+                            alignment: center;
+                            Rectangle {
+                                width: 8px; height: 8px; border-radius: 4px;
+                                background: State.capturing-gesture ? Theme.accent : transparent;
+                                border-width: 1.5px;
+                                border-color: State.capturing-gesture ? Theme.accent : Theme.text-dim;
+                                animate background, border-color { duration: Theme.quick; }
+                            }
+                        }
+                        Text {
+                            text: State.capturing-gesture ? "recording" : "record";
+                            color: State.capturing-gesture ? Theme.accent : Theme.text-mid;
+                            font-family: Theme.mono; font-size: Theme.fs-small; font-weight: 700;
+                            letter-spacing: 0.8px;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+            HorizontalLayout {
+                Mono { text: State.gesture-status; }
+                Rectangle {}
+                Mono { text: State.glyphs.length + " glyph" + (State.glyphs.length == 1 ? "" : "s"); }
+            }
+            // vault — each glyph a full-width ROW (name + what it's bound to), a VERTICAL list so it
+            // obeys the page's vertical-only scroll (the old horizontal strip hid glyphs off-edge with
+            // no cue). Lamp = bound (a live rule); a left accent bar = the stroke is BECOMING this glyph.
+            VerticalLayout {
+                spacing: 5px;
+                for g in State.glyphs : VerticalLayout {
+                    spacing: 6px;
+                    Rectangle {
+                        height: 40px;
+                        border-radius: Theme.radius-sm;
+                        property <bool> becoming: State.capturing-gesture && g.name == State.gesture-predict;
+                        property <bool> target: g.name == State.gesture-bind-target;
+                        background: self.target || self.becoming ? Theme.accent-glow
+                            : (gta.has-hover ? Theme.well : Theme.bg-2);
+                        border-width: Theme.hair;
+                        border-color: self.target || self.becoming ? Theme.accent-line
+                            : (gta.has-hover ? Theme.text-faint : Theme.line);
+                        animate background, border-color { duration: Theme.quick; }
+                        gta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { State.bind-gesture(g.name); } }
+                        // the live PREDICTION reads distinctly from a steady editor selection
+                        Rectangle {
+                            x: 0; width: 2px; y: 6px; height: parent.height - 12px;
+                            background: parent.becoming ? Theme.accent : transparent;
+                            animate background { duration: Theme.quick; }   // fade with the parent row's glow (line above), not a snap against it
+                        }
+                        HorizontalLayout {
+                            padding-left: 11px; padding-right: 11px; spacing: 10px;
+                            // bound lamp — a glyph wired to an action genuinely is a live rule
+                            VerticalLayout {
+                                alignment: center;
+                                Rectangle {
+                                    width: 5px; height: 5px; border-radius: 3px;
+                                    background: g.bound ? Theme.accent : Theme.line;
+                                }
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                horizontal-stretch: 1;
+                                Text {
+                                    text: g.name;
+                                    color: g.bound ? Theme.text : Theme.text-mid;
+                                    font-size: Theme.fs-body; font-family: Theme.mono; font-weight: 600;
+                                    overflow: elide;
+                                }
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                Mono {
+                                    text: g.bound ? "→ " + g.action : "unbound";
+                                    color: g.bound ? Theme.text-dim : Theme.text-faint;
+                                    overflow: elide;
+                                }
+                            }
+                        }
+                    }
+                    // INLINE editor — opens directly beneath THIS glyph's row when it's the selected
+                    // target, so a clicked glyph expands IN PLACE (never appended at the list's bottom).
+                    if g.name == State.gesture-bind-target : Card {
+                        VerticalLayout {
+                            padding: 12px; spacing: 9px;
+                            HorizontalLayout {
+                                Mono { text: "glyph '" + State.gesture-bind-target + "'"; color: Theme.accent; }
+                                Rectangle {}
+                                Button {
+                                    text: "delete glyph";
+                                    danger: true;
+                                    clicked => { State.delete-gesture(State.gesture-bind-target); }
+                                }
+                            }
+                            Mono { text: "BIND → ACTION"; color: Theme.text-dim; }
+                            spicker := ActionPicker {}
+                            HorizontalLayout {
+                                spacing: 7px;
+                                Button {
+                                    text: "set"; primary: true;
+                                    enabled: spicker.param-ok;
+                                    clicked => { State.commit-gesture-bind(); }
+                                }
+                                Button { text: "cancel"; clicked => { State.gesture-bind-target = ""; } }
+                                Rectangle {}
+                            }
+                            Divider {}
+                            HorizontalLayout {
+                                spacing: 7px;
+                                Field {
+                                    field-width: 180px;
+                                    placeholder: "rename to…";
+                                    text <=> root.rename-to;
+                                    accepted(t) => {
+                                        if (t != "") {
+                                            State.rename-gesture(State.gesture-bind-target, t);
+                                            root.rename-to = "";
+                                        }
+                                    }
+                                }
+                                Button {
+                                    text: "rename";
+                                    enabled: root.rename-to != "";
+                                    clicked => {
+                                        State.rename-gesture(State.gesture-bind-target, root.rename-to);
+                                        root.rename-to = "";
+                                    }
+                                }
+                                Rectangle {}
+                            }
+                        }
+                    }
+                }
+                if State.glyphs.length == 0 : Rectangle {
+                    height: 56px;
+                    VerticalLayout {
+                        alignment: center;
+                        Mono { text: "no glyphs recorded yet — press Record glyph"; color: Theme.text-faint; horizontal-alignment: center; }
+                    }
+                }
+            }
+            HorizontalLayout {
+                spacing: 8px;
+                // (record glyph now floats over the canvas, top-right)
+                // two-step armed clear: the vault is irreplaceable recorded data
+                Button {
+                    text: root.clear-armed ? "erase " + State.glyphs.length + " glyphs?" : "clear vault";
+                    danger: true;
+                    enabled: State.glyphs.length > 0 && !State.capturing-gesture;
+                    clicked => {
+                        if (root.clear-armed) {
+                            root.clear-armed = false;
+                            State.clear-gestures();
+                        } else {
+                            root.clear-armed = true;
+                        }
+                    }
+                }
+                Rectangle {}
+                // SPELL ASSIST — recognition FORGIVENESS, a continuous level (0 = strict, higher = a
+                // near-miss snaps to the closest spell, clear-winner only). Casts show "(assist)" when it
+                // helped. The engine's `assist` margin IS this slider — a bool would throw the dimension out.
+                VerticalLayout { alignment: center; horizontal-stretch: 0; Mono { text: "ASSIST"; color: Theme.text-dim; } }
+                VerticalLayout {
+                    alignment: center;
+                    width: 104px;
+                    Slider {
+                        compact: true;
+                        minimum: 0;
+                        maximum: 60;
+                        step: 5;
+                        value: State.weave-assist * 100;
+                        wheel: false;
+                        changed(v) => { State.set-weave-assist(v / 100); }
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    min-width: 36px;
+                    Mono {
+                        text: State.weave-assist <= 0.001 ? "off" : round(State.weave-assist * 100) + "%";
+                        color: State.weave-assist <= 0.001 ? Theme.text-dim : Theme.text;
+                        horizontal-alignment: right;
+                    }
+                }
+            }
+        }
+
+        // ── radial wheel ──────────────────────────────────────────────────
+        VerticalLayout {
+            width: 380px;
+            spacing: 12px;
+            alignment: start;   // pack from the top so the pinned wheel stays put; the wedge-detail Card
+                                // and status line grow into the slack BELOW, never displacing the wheel
+            SectionTitle { text: "RADIAL · the simple weave"; }
+            // wedge count — ONE tight row: label · fader · live readout. The cap stays COMPUTED,
+            // not decreed (a wedge is only pickable if its arc at the commit radius beats the
+            // hand's lateral jitter → max = 2π·reach / jitter), and the math stays on the panel.
+            HorizontalLayout {
+                spacing: 9px;
+                VerticalLayout {
+                    alignment: center;
+                    Mono { text: "WEDGES"; color: Theme.text-dim; }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    horizontal-stretch: 1;
+                    Slider {
+                        compact: true;
+                        minimum: 3;
+                        maximum: State.radial-max;
+                        step: 1;
+                        value: State.radial-sectors;
+                        wheel: false;   // each change rewrites cast.toml + reloads — never on a stray wheel
+                        changed(v) => { State.set-sector-count(v); }
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    min-width: 46px;   // stable width so the fader doesn't twitch at the 1→2 digit jump
+                    Mono { text: State.radial-sectors + "/" + State.radial-max; color: Theme.text; horizontal-alignment: right; }
+                }
+            }
+            // HYPERSHIFT RADIAL toggle + the live test button, side by side above the wheel. HyperShift
+            // is a second wheel (same wedge count) shown only while a HyperShift layer is held; off by default.
+            HorizontalLayout {
+                spacing: 8px;
+                Button {
+                    text: State.hyper-radial-on ? "HyperShift radial: ON" : "HyperShift radial: off";
+                    clicked => { State.set-hyper-radial-on(!State.hyper-radial-on); }
+                }
+                if State.hyper-radial-on : Button {
+                    text: State.radial-edit-hyper ? "editing: HYPERSHIFT" : "editing: base";
+                    clicked => { State.set-radial-edit-hyper(!State.radial-edit-hyper); }
+                }
+                Button {
+                    text: State.capturing-gesture ? "flick now…" : "test wheel";
+                    primary: true;
+                    enabled: !State.capturing-gesture;
+                    clicked => { State.preview-radial(); }
+                }
+                Rectangle {}
+            }
+            if State.hyper-radial-on : Mono {
+                text: State.radial-edit-hyper
+                    ? "authoring the HyperShift wheel — flick these while holding HyperShift"
+                    : "base wheel — toggle to author the HyperShift set";
+                color: Theme.text-faint;
+                wrap: word-wrap;
+            }
+            wheel := Rectangle {
+                // FIXED height (was min-height) — this is the resize-on-click fix. As a min-only cell the
+                // wheel was the elastic the column stretched into; clicking a slice inserted the wedge-
+                // detail Card below, the column stole that height back from the wheel, and r/cx/cy (all
+                // derived from wheel size) recomputed → the ENTIRE radial rescaled and re-centred. Pinned,
+                // the wheel never changes; the detail Card simply appears beneath it, nothing above moves.
+                height: 340px;
+                property <length> cx: self.width / 2;
+                property <length> cy: self.height / 2;
+                property <length> r: min(self.width, self.height) / 2 - 40px;
+                // outer ring
+                Rectangle {
+                    width: wheel.r * 2 + 32px; height: self.width;
+                    x: wheel.cx - self.width / 2; y: wheel.cy - self.height / 2;
+                    border-radius: self.width / 2;
+                    background: Theme.bg-2;
+                    border-width: 1px; border-color: Theme.line;
+                }
+                // TRUE PIE SLICES — each wedge an annular sector from the hub gap to the rim,
+                // spanning exactly the arc the engine commits ((i±0.5)/n, round semantics: wedge
+                // 0 is CENTERED on North). The picked wedge fills phosphor; the rest are hairline
+                // geometry. The label chips on top stay the click targets.
+                for it[i] in State.radial-items : Path {
+                    property <float> n: max(1, State.radial-sectors);
+                    property <float> a0: ((i - 0.5) / self.n) * 6.2831853 - 1.5707963;
+                    property <float> a1: ((i + 0.5) / self.n) * 6.2831853 - 1.5707963;
+                    property <float> cxf: wheel.cx / 1px;
+                    property <float> cyf: wheel.cy / 1px;
+                    property <float> ri: 34;                     // inner radius (hub + breathing gap)
+                    property <float> ro: wheel.r / 1px + 16;     // outer radius (meets the ring)
+                    property <bool> on: i == State.radial-preview-sector;
+                    width: 100%; height: 100%;
+                    viewbox-width: wheel.width / 1px;
+                    viewbox-height: wheel.height / 1px;
+                    fill: self.on ? State.weave-accent-col.with-alpha(0.18) : transparent;
+                    stroke: self.on ? State.weave-accent-col.with-alpha(0.27) : Theme.line-soft;
+                    stroke-width: 1px;
+                    MoveTo { x: cxf + cos(a0 * 1rad) * ri; y: cyf + sin(a0 * 1rad) * ri; }
+                    LineTo { x: cxf + cos(a0 * 1rad) * ro; y: cyf + sin(a0 * 1rad) * ro; }
+                    ArcTo {
+                        x: cxf + cos(a1 * 1rad) * ro; y: cyf + sin(a1 * 1rad) * ro;
+                        radius-x: ro; radius-y: ro; sweep: true;
+                    }
+                    LineTo { x: cxf + cos(a1 * 1rad) * ri; y: cyf + sin(a1 * 1rad) * ri; }
+                    ArcTo {
+                        x: cxf + cos(a0 * 1rad) * ri; y: cyf + sin(a0 * 1rad) * ri;
+                        radius-x: ri; radius-y: ri; sweep: false;
+                    }
+                    Close {}
+                }
+                // hub — a DRAWN mark (no dingbat); its inner ring lights accent only while capturing,
+                // so accent stays a live signal, not a static ornament
+                Rectangle {
+                    width: 50px; height: 50px; border-radius: 25px;
+                    x: wheel.cx - 25px; y: wheel.cy - 25px;
+                    background: Theme.well;
+                    border-width: 1px; border-color: State.weave-accent-col.with-alpha(0.4);
+                    Rectangle {
+                        width: 16px; height: 16px; border-radius: 8px;
+                        x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+                        background: transparent;
+                        border-width: 1px;
+                        border-color: State.capturing-gesture ? State.weave-accent-col : Theme.text-dim;
+                        animate border-color { duration: Theme.quick; }
+                    }
+                }
+                // wedge labels at each slice's center (sector 0 = North, clockwise) — the click
+                // targets, riding their slices.
+                for it[i] in State.radial-items : node := Rectangle {
+                    property <float> ang: (i / State.radial-sectors) * 6.2831853 - 1.5707963;
+                    property <bool> on: i == State.radial-preview-sector;
+                    // chips shrink as wedges multiply, so they don't collide near N/S at high counts
+                    width: State.radial-sectors > 8 ? 46px : 62px;
+                    height: State.radial-sectors > 8 ? 28px : 34px;
+                    border-radius: Theme.radius-sm;
+                    x: wheel.cx + wheel.r * cos(self.ang * 1rad) - self.width / 2;
+                    y: wheel.cy + wheel.r * sin(self.ang * 1rad) - self.height / 2;
+                    // the label rides its slice as bare text at rest — a contact box (glow + outline)
+                    // only materialises on hover or when picked.
+                    //
+                    // The "weird black boxes": the OFF state faded to `transparent`, which is rgba(0,0,0,0)
+                    // — BLACK at zero alpha. Animating a colour TO it drags the RGB toward black as the
+                    // alpha falls, so every select/deselect flashed a dark box over the slice for ~80ms
+                    // (the Paths use `transparent` too but never animate, so they never flash). Fading to
+                    // the accent hue at ZERO alpha keeps it a clean, same-hue, alpha-only wash.
+                    background: (self.on || nta.has-hover) ? State.weave-accent-col.with-alpha(0.1) : State.weave-accent-col.with-alpha(0);
+                    border-width: 1px;
+                    border-color: (self.on || nta.has-hover) ? State.weave-accent-col.with-alpha(0.27) : State.weave-accent-col.with-alpha(0);
+                    animate background, border-color { duration: Theme.quick; }
+                    nta := TouchArea {
+                        mouse-cursor: MouseCursor.pointer;
+                        clicked => {
+                            // wheel navigation is not edit continuation: moving the cursor off the
+                            // wedge being edited closes the stale editor instead of re-aiming it.
+                            if (State.editing-sector != i) { State.editing-sector = -1; }
+                            State.radial-preview-sector = i;
+                        }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 1px;
+                        Text {
+                            text: it.label;
+                            color: node.on ? State.weave-accent-col : (nta.has-hover ? Theme.text-mid : Theme.text-dim);
+                            font-size: Theme.fs-small;
+                            font-weight: 700;
+                            font-family: Theme.mono;
+                            vertical-alignment: center;
+                            horizontal-alignment: center;
+                            overflow: elide;
+                        }
+                        // the wedge index — hidden at high counts to give the label room
+                        if State.radial-sectors <= 8 : Text {
+                            text: i;
+                            color: node.on ? State.weave-accent-col : Theme.text-faint;
+                            font-size: Theme.fs-small;
+                            font-family: Theme.mono;
+                            vertical-alignment: center;
+                            horizontal-alignment: center;
+                        }
+                    }
+                }
+            }
+            // the test-how-to hint sits between the wheel and the wedge-action editor below.
+            Mono { text: "hold trigger, flick a direction"; color: Theme.text-faint; }
+            // the wheel's OWN status line — feedback lands beside the thing being tested
+            if State.radial-status != "" : Mono { text: State.radial-status; color: Theme.text-mid; }
+            // selected wedge -> action: show its current action + edit it
+            if State.radial-preview-sector >= 0 && State.radial-preview-sector < State.radial-items.length : Card {
+                VerticalLayout {
+                    padding: 12px;
+                    spacing: 8px;
+                    Mono {
+                        text: "wedge " + State.radial-preview-sector + " ("
+                            + State.radial-items[State.radial-preview-sector].label + ")";
+                        color: Theme.accent;
+                    }
+                    Mono { text: "ACTION"; color: Theme.text-dim; }
+                    Text {
+                        text: State.radial-items[State.radial-preview-sector].action;
+                        color: Theme.text-mid; font-family: Theme.mono; font-size: Theme.fs-mono;
+                        overflow: elide;
+                    }
+                    // editing this wedge: show the action palette + Set
+                    if State.editing-sector == State.radial-preview-sector : VerticalLayout {
+                        spacing: 8px;
+                        rpicker := ActionPicker {}
+                        HorizontalLayout {
+                            spacing: 7px;
+                            Button {
+                                text: "set"; primary: true;
+                                enabled: rpicker.param-ok;
+                                clicked => { State.commit-sector-action(); }
+                            }
+                            Button { text: "cancel"; clicked => { State.editing-sector = -1; } }
+                            Rectangle {}
+                        }
+                    }
+                    if State.editing-sector != State.radial-preview-sector : HorizontalLayout {
+                        Button {
+                            text: "edit action";
+                            clicked => { State.edit-sector(State.radial-preview-sector); }
+                        }
+                        Rectangle {}
+                    }
+                }
+            }
+        }
+    }
+}
