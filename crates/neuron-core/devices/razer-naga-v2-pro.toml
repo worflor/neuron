@@ -112,12 +112,14 @@ class = 0x0F
 id = 0x04
 size = 0x03
 
-# Lighting brightness: arg[0]=varstore, arg[1]=led_id (0x05 backlight). response arg[2]=0..255. Set = 0x0F/0x04.
+# Lighting brightness READ. Must query the SAME led region set_brightness WRITES (0x04, the visible
+# region) — querying 0x05 (backlight) read an untouched region, so the GUI snapped the slider back to
+# a stale value after every apply. arg[0]=varstore, arg[1]=led_id (0x04 visible). response arg[2]=0..255.
 [commands.brightness]
 class = 0x0F
 id = 0x84
 size = 0x03
-args = [0x00, 0x05]
+args = [0x00, 0x04]
 
 [commands.battery_level]
 class = 0x07
