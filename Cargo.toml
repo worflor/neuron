@@ -1,0 +1,84 @@
+# Neuron — open, lightweight control for Razer devices. The anti-Synapse.
+#
+# Cargo WORKSPACE. The engine lives in `neuron-core` (a headless, UI-agnostic library);
+# `neuron-cli` is the thin command-line client; `neuron-app` is the resident GUI/tray app
+# (Slint, built out by the GUI agent). One process model — no internal IPC.
+#
+# FROZEN: this file and every crate Cargo.toml are owned by the Integration agent only.
+# Subsystem agents add code, not dependencies — all anticipated deps are already declared.
+[workspace]
+resolver = "2"
+members = [
+    "crates/engram",
+    "crates/neuron-core",
+    "crates/neuron-cli",
+    "crates/neuron-app",
+]
+
+# Shared metadata so every crate stays in lockstep.
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+# Shared dependency versions — declare once, reference with `.workspace = true` in members.
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+quick-xml = "0.36"
+# Cross-platform real-time audio output (WASAPI/CoreAudio/ALSA) for the notification tone synth —
+# the synthesis itself is hand-rolled in neuron-core::tone; cpal is just the device handoff.
+cpal = "0.15"
+
+# Lean by design: the anti-Synapse should be a small static binary.
+#
+# panic = "unwind" (NOT abort) is a LIFECYCLE decision: with abort, any Rust panic anywhere
+# kills the resident app instantly — no Drop guards (device handles, cursor locks, click-guard
+# disarm, gated-write restore), no catch_unwind shells, no graceful teardown. For an app whose
+# whole ethos is "never leave the desk in a state you didn't ask for", unwinding is worth the
+# ~small size cost. The panic hook still logs every panic to neuron-crash.log.
+[profile.release]
+# Tuned for a 12-thread build that still optimizes hard. The old config (opt-level="z" + fat
+# `lto=true` + codegen-units=1) bought a SINGLE-THREADED finale: fat LTO merges all bitcode into
+# one module and optimizes it serially, and cgu=1 gives that stage nothing to parallelize — so 11
+# of 12 threads idled through the slowest phase. ThinLTO does the SAME cross-module inlining via a
+# parallel summary/call-graph index (each module optimized concurrently), landing within ~1-3% of
+# fat LTO's runtime, while cgu=16 unleashes that parallelism. opt-level 3 (speed, not "z" size)
+# also drops the extra shrink passes. Net: near-identical optimization, the finale now spread
+# across every core. CPU-specific codegen is intentionally opt-in via external RUSTFLAGS, not a
+# repository default, so release artifacts stay portable.
+opt-level = 3
+lto = "thin"
+strip = true
+codegen-units = 16
+
+[profile.release-fast]
+inherits = "release"
+opt-level = 3
+lto = "thin"
+strip = true
+codegen-units = 16
+
+[profile.release-size]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+strip = true
+codegen-units = 1
+
+# DEBUG builds: optimize the two crates that carry the hot SOFTWARE-RENDER loop, even in `dev`.
+# The overlay composites ~0.5M pixels/frame for a weave; at opt-level 0 the per-pixel bounds-checks
+# and un-vectorized float math run ~6–7x slower than release (measured on a large radial cast:
+# ~140ms/frame debug vs ~22ms release), which makes the spellweave crawl in a `cargo run` build.
+# Optimizing ONLY `neuron-app` (overlay + weave) and `neuron` (engine math) keeps the debug run
+# usable without touching release at all. Everything else — and full debuginfo — stays default, so
+# the rest of the workspace still compiles fast and stays debuggable.
+[profile.dev.package.neuron-app]
+opt-level = 3
+
+[profile.dev.package.neuron]
+opt-level = 3

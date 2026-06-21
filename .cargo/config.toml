@@ -1,0 +1,7 @@
+# Keep checked-in builds portable. For local silicon-tuned builds, set this outside the repo:
+#
+#   $env:RUSTFLAGS="-C target-cpu=native"
+#   cargo build --profile release-fast -p neuron-app
+#
+# Do not make `target-cpu=native` the repository default: it produces binaries tied to the
+# builder's CPU and undermines the cross-platform/distributable architecture.
