@@ -1,0 +1,28 @@
+# neuron-cli — the thin command-line client. All logic lives in neuron-core; this is a
+# throwaway front-end that wires subcommands to engine calls.
+#
+# FROZEN MANIFEST (Integration agent only).
+[package]
+name = "neuron-cli"
+description = "Neuron command-line client — the anti-Synapse CLI."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "neuron"
+path = "src/main.rs"
+
+[dependencies]
+neuron = { path = "../neuron-core" }
+anyhow.workspace = true
+clap.workspace = true
+toml.workspace = true
+serde.workspace = true
+
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.59"
+features = [
+    "Win32_Foundation",
+    "Win32_UI_Input_KeyboardAndMouse",
+]
