@@ -1,0 +1,193 @@
+# Device definition — Razer Naga V2 Pro (Razer internal codename: Aria, AriaT1V2).
+# All device-specific wiring lives here as DATA. Adding a new Razer device = drop a
+# new file like this in devices/. No recompile. Command codes verified live over the
+# 2.4 GHz dongle (PID 00A8) against Synapse's own logged values.
+
+name = "Razer Naga V2 Pro"
+codename = "Aria"
+vendor_id = 0x1532
+transaction_id = 0x1F
+
+# The device changes USB PID per link mode.
+[[modes]]
+name = "wired"
+product_id = 0x00A7
+[[modes]]
+name = "dongle"
+product_id = 0x00A8
+[[modes]]
+name = "bluetooth"
+product_id = 0x00A9
+
+# How to pick the vendor control pipe out of the composite device's many HID collections.
+[control_interface]
+usage_page = 0x0001            # Generic Desktop
+usage = 0x0002                # Mouse
+feature_report_len = 91       # 1 report-id byte + 90-byte razer_report
+
+# Command map: { class, id, size }. Capabilities reference these by name.
+[commands.firmware_version]
+class = 0x00
+id = 0x81
+size = 0x02
+
+[commands.serial]
+class = 0x00
+id = 0x82
+size = 0x16
+
+[commands.device_mode]
+class = 0x00
+id = 0x84
+size = 0x02
+
+# Polling rate: response arg[0] is the divisor (1=1000Hz, 2=500, 4=250, 8=125).
+[commands.polling_rate]
+class = 0x00
+id = 0x85
+size = 0x01
+
+# Set polling rate: args = [divisor].
+[commands.set_polling]
+class = 0x00
+id = 0x05
+size = 0x01
+
+# DPI: arg[0]=varstore(0); response [vs, X_hi, X_lo, Y_hi, Y_lo] big-endian.
+[commands.dpi]
+class = 0x04
+id = 0x85
+size = 0x07
+
+# DPI stage table: response [vs, active_idx, count, {stage_id, X_hi, X_lo, Y_hi, Y_lo, 0, 0} * count].
+[commands.dpi_stages]
+class = 0x04
+id = 0x83
+size = 0x26
+
+# Active DPI stage LIST (0x04/0x86): the user's CONFIGURED stages (count = how many they cycle,
+# e.g. 2 = [800, 30000]); 0x04/0x83 is the full hardware slot table (5). Same layout.
+[commands.dpi_stages_active]
+class = 0x04
+id = 0x86
+size = 0x26
+
+# Set DPI: args = [varstore, X_hi, X_lo, Y_hi, Y_lo, 0, 0].
+[commands.set_dpi]
+class = 0x04
+id = 0x05
+size = 0x07
+
+# Set the DPI stage list — OpenRazer-confirmed (razer_chroma_misc_set_dpi_stages, PR#1138) +
+# HARDWARE-PROVEN live on this Naga. payload [store, active(1-based), count,
+# {stage_id, X_hi,X_lo,Y_hi,Y_lo, 0,0} * count]; read-back verified against 0x04/0x86.
+[commands.set_dpi_stages]
+class = 0x04
+id = 0x06
+size = 0x26
+
+# Hi-res polling (>1000Hz path). Set 0x00/0x40 = [arg0, code]; get 0x00/0xC0.
+# code: 0x01=8000 0x02=4000 0x04=2000 0x08=1000 0x10=500 0x20=250 0x40=125 Hz (OpenRazer polling2).
+[commands.set_polling2]
+class = 0x00
+id = 0x40
+size = 0x02
+
+[commands.polling2]
+class = 0x00
+id = 0xC0
+size = 0x01
+
+# Scroll active-stage select — CAPTURED LIVE from Synapse via USBPcap (class 0x15/0x00, size 0x02,
+# payload [store(0x01=persist), stage]). NOT class 0x0B (those getters are unrelated). The per-stage
+# tension/steps curves are host-side software, not a device write.
+[commands.set_scroll_stage]
+class = 0x15
+id = 0x00
+size = 0x02
+
+# Set lighting brightness: args = [varstore, led(0x04 visible region), level 0..255].
+[commands.set_brightness]
+class = 0x0F
+id = 0x04
+size = 0x03
+
+# Lighting brightness: arg[0]=varstore, arg[1]=led_id (0x05 backlight). response arg[2]=0..255. Set = 0x0F/0x04.
+[commands.brightness]
+class = 0x0F
+id = 0x84
+size = 0x03
+args = [0x00, 0x05]
+
+[commands.battery_level]
+class = 0x07
+id = 0x80
+size = 0x02
+
+[commands.charging_status]
+class = 0x07
+id = 0x84
+size = 0x02
+
+# Onboard storage / macro module = class 0x06.
+# storage_info 06/8E → [vs, MaxMacros, MaxStorage(4B BE), Avail(4B BE), Recycle(4B BE)].
+[commands.storage_info]
+class = 0x06
+id = 0x8E
+size = 0x20
+
+# item counts: [macros, profiles, ...] — best-effort decode.
+[commands.storage_counts]
+class = 0x06
+id = 0x80
+size = 0x20
+
+[commands.storage_directory]
+class = 0x06
+id = 0x8D
+size = 0x20
+
+# Current lighting state (region 0x04): [varstore, led, effect, param, brightness, ...].
+# Used to verify a lighting write actually landed.
+[commands.lighting_state]
+class = 0x0F
+id = 0x82
+size = 0x20
+
+# --- Unified lighting: MATRIX dialect (class 0x0F, the newer era) ---------------------
+# CONFIRMED LIVE: visible LED region = 0x04 (region 0x05 is non-visible); effect setter
+# 0x0F/0x02; effect-ids below; colour effects use a `00 00 01` preamble then RGB (extended
+# matrix). Driver mode (00/04 = 0x03) is REQUIRED for host effects to render — Razer gates
+# host control behind it (Synapse flips it; so does `neuron mode driver`).
+[lighting]
+protocol = "matrix"
+rows = 1
+cols = 2                       # ~2 LED zones (exact per-LED count TBD; effects don't need it)
+varstore = 0x00               # NOSTORE = volatile (safest)
+led_id = 0x04                 # the VISIBLE region (confirmed)
+
+[lighting.effects]            # native firmware effects: name -> effect-id byte (confirmed live)
+off = 0x00
+static = 0x01                 # solid colour (verified: red rendered)
+breathing = 0x02
+wave = 0x03                   # moving rainbow gradient (verified)
+spectrum = 0x04
+reactive = 0x05               # off until input (looks dark when idle)
+
+[lighting.effect]             # set effect: args = [varstore, led] + id (+ 00 00 01 + RGB for colour)
+class = 0x0F
+id = 0x02
+size = 0x0C
+args = [0x00, 0x04]
+
+[lighting.custom_frame]       # paint per-LED frame rows
+class = 0x0F
+id = 0x03
+size = 0x40
+args = [0x00, 0x04]
+
+[lighting.brightness]         # set brightness: args = [varstore, led] + level
+class = 0x0F
+id = 0x04
+size = 0x03
+args = [0x00, 0x04]

@@ -1,0 +1,81 @@
+# Device definition — Razer BlackWidow Chroma V2 (older era: legacy lighting, NO onboard
+# storage). Confirmed live: razer_report on usage 0001/0002, classes 0x00/0x02/0x03 only,
+# serial IO1735F09002641, device mode 0x03. This file exists mainly to drive the keyboard's
+# legacy (class 0x03) lighting through the SAME unified model as the matrix-era mouse.
+
+name = "Razer BlackWidow Chroma V2"
+codename = "BlackWidow Chroma V2"
+vendor_id = 0x1532
+transaction_id = 0x1F
+
+[[modes]]
+name = "wired"
+product_id = 0x0221
+
+[control_interface]
+usage_page = 0x0001
+usage = 0x0002
+feature_report_len = 91
+
+[commands.firmware_version]
+class = 0x00
+id = 0x81
+size = 0x02
+
+[commands.serial]
+class = 0x00
+id = 0x82
+size = 0x16
+
+[commands.device_mode]
+class = 0x00
+id = 0x84
+size = 0x02
+
+# Legacy lighting getters — CONFIRMED live (03/88 current state, 03/89 capabilities).
+[commands.lighting_state]
+class = 0x03
+id = 0x88
+size = 0x06
+
+[commands.lighting_caps]
+class = 0x03
+id = 0x89
+size = 0x07
+
+# --- Unified lighting: LEGACY dialect (class 0x03, the older era) ----------------------
+# Setter opcodes/effect-ids below are the standard legacy Chroma values and are PROVISIONAL
+# pending a gated round-trip verify; the getters above are confirmed. The dry-run preview
+# shows the exact bytes before anything is ever sent.
+[lighting]
+protocol = "legacy"
+rows = 6
+cols = 22                      # BlackWidow key matrix
+varstore = 0x00               # no onboard storage on this board -> volatile only
+led_id = 0x00
+
+[lighting.effects]            # native legacy effects: name -> effect-id byte (provisional)
+off = 0x00
+wave = 0x01
+reactive = 0x02
+breathing = 0x03
+spectrum = 0x04
+static = 0x06
+
+[lighting.effect]             # legacy "set led effect": args = effect-id [+ color]
+class = 0x03
+id = 0x0A
+size = 0x08
+args = []
+
+[lighting.custom_frame]       # legacy custom row paint: [0xFF frame-id, row, start, stop, RGB...]
+class = 0x03
+id = 0x0B
+size = 0x46
+args = [0xFF]                 # frame-id prefix (confirmed via OpenRazer + live)
+
+[lighting.brightness]
+class = 0x03
+id = 0x01
+size = 0x03
+args = [0x01, 0x05]

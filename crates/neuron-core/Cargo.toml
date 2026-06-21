@@ -1,0 +1,71 @@
+# neuron-core — the headless engine. All device protocol, capabilities, lighting/effects,
+# gestures/radial/cast, profiles, the unified Trigger->Action spine, the macro engine, device
+# writes, and Synapse migration. UI-agnostic: the CLI and the GUI both `use neuron::*`.
+#
+# FROZEN MANIFEST. Every anticipated dependency is already here so subsystem agents never edit
+# this file. (Integration agent only.)
+[package]
+name = "neuron"
+description = "Open, lightweight control for Razer devices. The anti-Synapse."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "neuron"
+path = "src/lib.rs"
+
+[features]
+# Compile-time gate for the HyperScroll (class 0x0B) stage WRITE in writes.rs. The byte layout is
+# a structural reconstruction not yet confirmed on hardware, so the write is off by default. Enable
+# with `--features hyperscroll-write` once the round-trip is verified on the Naga. (The
+# `NEURON_HYPERSCROLL_WRITE` env var is kept as a runtime escape hatch so the write can be probed
+# without a rebuild — either gate opens it.)
+hyperscroll-write = []
+# Compile-time gate for the LED idle/power-timeout WRITE (0x07/0x03, writes.rs::set_idle_secs). The
+# READ (0x07/0x83) is proven; the SET is derived & not yet hardware-confirmed, so it is off by
+# default. Enable with `--features idle-power-write` once verified (or `NEURON_IDLE_WRITE` at runtime).
+idle-power-write = []
+# Compile-time gate for the in-game (wired/dongle) polling-rate WRITE (0x00/0x06,
+# writes.rs::set_in_game_polling). Derived from the proven single-rate setter; off by default until
+# the dual-rate round-trip is hardware-verified (or `NEURON_INGAME_POLL_WRITE` at runtime).
+ingame-poll-write = []
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+anyhow.workspace = true
+
+# The Whisper Engram trajectory codec (vendored from the user's Prism suite) — the rhythm
+# familiar's brain in KNOCKBACK: every exchange is an Engram block; the twin's knockback is
+# `predict_all` run one beat past the player's motif. Real, tested physics, not a sim.
+engram = { path = "../engram" }
+
+# Synapse migration (import.rs): the official Export format is a ZIP with a fake extension
+# (.synapse3 / .ChromaEffects) — unzip it.
+zip.workspace = true
+# Synapse migration (import.rs): parse the plaintext XML inside the export (DeviceInfo.xml,
+# Features/*.xml mappings + lighting).
+quick-xml.workspace = true
+
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.59"
+features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Graphics_Gdi",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_HumanInterfaceDevice",
+    "Win32_Storage_FileSystem",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_Com",
+    "Win32_System_Shutdown",  # LockWorkStation — the `system · lock` action
+    "Win32_System_Power",     # SetSuspendState — the `system · sleep` action
+    "Win32_System_Threading",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+]

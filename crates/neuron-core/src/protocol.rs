@@ -1,0 +1,122 @@
+//! The Razer vendor wire format: the 90-byte `razer_report`, its CRC, and status codes.
+//!
+//! Framing (verified live): a HID *feature report* of 91 bytes = 1 report-id byte (0x00)
+//! followed by the 90-byte report. CRC = XOR of report bytes [2..=87], i.e. buffer
+//! bytes [3..=88], stored at buffer[89]. Reserved trailing byte = 0.
+
+/// Length of the on-wire report (excludes the leading HID report-id byte).
+pub const REPORT_LEN: usize = 90;
+/// Full HID feature buffer length (report-id byte + report).
+pub const BUF_LEN: usize = REPORT_LEN + 1;
+
+/// Device-side processing status returned in the reply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Status {
+    New,
+    Busy,
+    Success,
+    Fail,
+    Timeout,
+    Unsupported,
+    Other(u8),
+}
+
+impl Status {
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            0 => Status::New,
+            1 => Status::Busy,
+            2 => Status::Success,
+            3 => Status::Fail,
+            4 => Status::Timeout,
+            5 => Status::Unsupported,
+            o => Status::Other(o),
+        }
+    }
+}
+
+/// A decoded Razer report. Argument payload is the 80-byte body.
+#[derive(Clone, Copy)]
+pub struct Report {
+    pub status: u8,
+    pub transaction_id: u8,
+    pub data_size: u8,
+    pub class: u8,
+    pub id: u8,
+    pub args: [u8; 80],
+}
+
+impl Report {
+    /// Build an outgoing command (status 0, no remaining packets, zero args).
+    pub fn command(transaction_id: u8, class: u8, id: u8, size: u8) -> Self {
+        Report {
+            status: 0,
+            transaction_id,
+            data_size: size,
+            class,
+            id,
+            args: [0; 80],
+        }
+    }
+
+    /// Serialize into the 91-byte HID feature buffer (with report-id and CRC).
+    pub fn to_buf(&self) -> [u8; BUF_LEN] {
+        let mut b = [0u8; BUF_LEN];
+        b[0] = 0x00; // HID report id
+        b[1] = self.status; // report[0]
+        b[2] = self.transaction_id; // report[1]
+                                    // b[3..=4] remaining_packets = 0; b[5] protocol_type = 0
+        b[6] = self.data_size; // report[5]
+        b[7] = self.class; // report[6]
+        b[8] = self.id; // report[7]
+        b[9..89].copy_from_slice(&self.args); // report[8..=87]
+        b[89] = crc(&b); // report[88]
+                         // b[90] reserved = 0
+        b
+    }
+
+    /// Parse a 91-byte reply buffer.
+    pub fn from_buf(b: &[u8; BUF_LEN]) -> Self {
+        let mut args = [0u8; 80];
+        args.copy_from_slice(&b[9..89]);
+        Report {
+            status: b[1],
+            transaction_id: b[2],
+            data_size: b[6],
+            class: b[7],
+            id: b[8],
+            args,
+        }
+    }
+
+    pub fn status(&self) -> Status {
+        Status::from_u8(self.status)
+    }
+}
+
+/// Razer CRC: XOR of buffer bytes [3..=88].
+pub fn crc(buf: &[u8; BUF_LEN]) -> u8 {
+    buf[3..=88].iter().fold(0u8, |c, &b| c ^ b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn roundtrip_and_crc() {
+        let r = Report::command(0x1F, 0x00, 0x81, 0x02);
+        let buf = r.to_buf();
+        assert_eq!(buf[0], 0x00);
+        assert_eq!(buf[2], 0x1F);
+        assert_eq!(buf[6], 0x02);
+        assert_eq!(buf[7], 0x00);
+        assert_eq!(buf[8], 0x81);
+        // crc over [3..=88]; for this command only buf[6],[7],[8] are nonzero
+        assert_eq!(buf[89], 0x02 ^ 0x81); // crc = data_size ^ class(0x00) ^ id
+        let back = Report::from_buf(&buf);
+        assert_eq!(back.class, 0x00);
+        assert_eq!(back.id, 0x81);
+        assert_eq!(back.data_size, 0x02);
+    }
+}
