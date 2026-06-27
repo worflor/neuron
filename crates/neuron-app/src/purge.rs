@@ -17,11 +17,14 @@
 //!
 //!   * SERVICES ARE DISCOVERED, NOT LISTED. We `EnumServicesStatusExW` the entire SCM and keep the
 //!     ones whose binary path is under a Razer directory (or whose display name says "Razer"). Those
-//!     are the respawn engine — we DISABLE them (start-type → disabled, so they can't come back now or
-//!     after a reboot) and then stop them, before sweeping the processes.
+//!     are the respawn engine — we DEMOTE them (start-type → demand-start / Manual, so they stop
+//!     auto-running at boot) and then stop them, before sweeping the processes. We deliberately do NOT
+//!     set them to *disabled*: disabled is a permanent brick — Synapse's own launcher can never start
+//!     its backend again, so opening Synapse loops forever on a failed service start. Demand-start
+//!     evicts the resident slopware (gone from boot) while leaving Synapse openable on demand.
 //!
-//! Order matters: disable+stop the services first (kills the respawn engine and a disabled service
-//! won't restart from a kill), then snapshot and `TerminateProcess` the rat tree, twice, to catch
+//! Order matters: demote+stop the services first (kills the respawn engine, and a demand-start service
+//! won't auto-restart at boot), then snapshot and `TerminateProcess` the rat tree, twice, to catch
 //! anything mid-spawn when the first snapshot was taken.
 //!
 //! Razer services run as SYSTEM, so a full purge needs elevation; if we're not elevated we relaunch
@@ -47,7 +50,7 @@ use windows_sys::Win32::System::Services::{
     ChangeServiceConfigW, CloseServiceHandle, ControlService, EnumServicesStatusExW, OpenSCManagerW,
     OpenServiceW, QueryServiceConfigW, QueryServiceStatus, ENUM_SERVICE_STATUS_PROCESSW, QUERY_SERVICE_CONFIGW,
     SC_ENUM_PROCESS_INFO, SC_MANAGER_CONNECT, SC_MANAGER_ENUMERATE_SERVICE, SERVICE_CHANGE_CONFIG,
-    SERVICE_CONTROL_STOP, SERVICE_DISABLED, SERVICE_NO_CHANGE, SERVICE_QUERY_CONFIG,
+    SERVICE_CONTROL_STOP, SERVICE_DEMAND_START, SERVICE_NO_CHANGE, SERVICE_QUERY_CONFIG,
     SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_STATE_ALL, SERVICE_STATUS, SERVICE_STOP,
     SERVICE_STOP_PENDING, SERVICE_WIN32,
 };
@@ -62,7 +65,7 @@ pub enum Outcome {
     Done {
         killed: u32,
         stopped: u32,
-        disabled: u32,
+        demoted: u32, // services set to demand-start (Manual) — evicted from boot, still launchable
     },
     /// Not elevated — a UAC'd second instance was launched to do the kill. The user sees the prompt.
     Elevating,
@@ -275,7 +278,7 @@ fn terminate(pid: u32) -> bool {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SERVICES — enumerate the whole SCM, keep Razer's, disable + stop them
+// SERVICES — enumerate the whole SCM, keep Razer's, demote to manual + stop them
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// A discovered Razer service. `key` is what OpenServiceW wants; the rest is for the report.
@@ -383,8 +386,9 @@ fn discover_services(scm: HANDLE) -> Vec<Svc> {
     found
 }
 
-/// Disable (start-type → disabled, so it can't restart now or on reboot) then gracefully stop one
-/// service. Returns (stopped, disabled). Needs elevation to bite on a SYSTEM service.
+/// Demote (start-type → demand-start / Manual, so it stops auto-running at boot but can still be
+/// started on demand) then gracefully stop one service. Returns (stopped, demoted). Needs elevation
+/// to bite on a SYSTEM service.
 fn neutralize_service(scm: HANDLE, key: &str) -> (bool, bool) {
     unsafe {
         let wkey = wide(key);
@@ -396,12 +400,14 @@ fn neutralize_service(scm: HANDLE, key: &str) -> (bool, bool) {
         if svc.is_null() {
             return (false, false);
         }
-        // DISABLE FIRST: a disabled service won't be auto-restarted by the SCM when we stop/kill it,
-        // and it stays gone across reboots. SERVICE_NO_CHANGE leaves type/error-control untouched.
-        let disabled = ChangeServiceConfigW(
+        // DEMOTE FIRST: a demand-start service won't be auto-started by the SCM at boot, so the respawn
+        // engine stays down across reboots — but, unlike SERVICE_DISABLED, it can still be launched on
+        // demand, so Synapse's own launcher can bring its backend up again (no permanent brick / no
+        // "loads forever" loop). SERVICE_NO_CHANGE leaves type/error-control untouched.
+        let demoted = ChangeServiceConfigW(
             svc,
             SERVICE_NO_CHANGE,
-            SERVICE_DISABLED,
+            SERVICE_DEMAND_START,
             SERVICE_NO_CHANGE,
             std::ptr::null(),
             std::ptr::null(),
@@ -433,7 +439,7 @@ fn neutralize_service(scm: HANDLE, key: &str) -> (bool, bool) {
             }
         }
         CloseServiceHandle(svc);
-        (stopped, disabled)
+        (stopped, demoted)
     }
 }
 
@@ -441,10 +447,10 @@ fn neutralize_service(scm: HANDLE, key: &str) -> (bool, bool) {
 // ORCHESTRATION
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// The full purge: disable+stop Razer services (the respawn engine), then sweep the rat process tree
-/// twice. Returns (killed, stopped, disabled). Requires elevation for SYSTEM services/processes.
+/// The full purge: demote+stop Razer services (the respawn engine), then sweep the rat process tree
+/// twice. Returns (killed, stopped, demoted). Requires elevation for SYSTEM services/processes.
 fn do_purge() -> (u32, u32, u32) {
-    let (mut stopped, mut disabled) = (0u32, 0u32);
+    let (mut stopped, mut demoted) = (0u32, 0u32);
     unsafe {
         let scm = OpenSCManagerW(
             std::ptr::null(),
@@ -455,7 +461,7 @@ fn do_purge() -> (u32, u32, u32) {
             for s in discover_services(scm) {
                 let (st, di) = neutralize_service(scm, &s.key);
                 stopped += st as u32;
-                disabled += di as u32;
+                demoted += di as u32;
             }
             CloseServiceHandle(scm);
         }
@@ -475,7 +481,7 @@ fn do_purge() -> (u32, u32, u32) {
             std::thread::sleep(std::time::Duration::from_millis(150));
         }
     }
-    (killed, stopped, disabled)
+    (killed, stopped, demoted)
 }
 
 /// Relaunch ourselves elevated (UAC) with `flag`. Returns false if we couldn't.
@@ -504,11 +510,11 @@ fn relaunch_elevated(flag: &str) -> bool {
 /// a UAC'd elevated instance to do it (Razer services are SYSTEM).
 pub fn request() -> Outcome {
     if is_elevated() {
-        let (killed, stopped, disabled) = do_purge();
+        let (killed, stopped, demoted) = do_purge();
         Outcome::Done {
             killed,
             stopped,
-            disabled,
+            demoted,
         }
     } else if relaunch_elevated("--purge-synapse") {
         Outcome::Elevating
@@ -521,7 +527,7 @@ pub fn request() -> Outcome {
 /// breadcrumb next to the exe, and exits — it never opens the GUI.
 pub fn run_purge_and_log() {
     use std::io::Write as _;
-    let (killed, stopped, disabled) = do_purge();
+    let (killed, stopped, demoted) = do_purge();
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -529,7 +535,7 @@ pub fn run_purge_and_log() {
     {
         let _ = writeln!(
             f,
-            "[purge] disabled {disabled} + stopped {stopped} Razer service(s), terminated {killed} process(es)"
+            "[purge] demoted {demoted} to manual + stopped {stopped} Razer service(s), terminated {killed} process(es)"
         );
     }
 }
@@ -573,7 +579,7 @@ pub fn scan_and_log() {
             r.path
         ));
     }
-    report.push_str("-- SERVICES (would disable + stop) --\n");
+    report.push_str("-- SERVICES (would demote to manual + stop) --\n");
     for s in &svcs {
         report.push_str(&format!(
             "  {:<7}  {}  [{}]  {}\n",

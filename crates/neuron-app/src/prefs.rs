@@ -6,10 +6,33 @@
 //!
 //! `start-with-Windows` stays in `autostart.rs` (it's a registry Run value, not a file pref).
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
+
+/// The persisted lighting state for ONE device — the applied effect/layer stack (or data mode) plus
+/// the chosen stream fps. Saved per-device (keyed by pid) so a board resumes its own effect after a
+/// relaunch instead of sitting frozen on the device's last held frame. Every field defaults, so an
+/// older/partial record still loads.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct DeviceLight {
+    /// The chosen streaming fps for this board (the user's pick — restored verbatim on launch, so the
+    /// per-device default only applies when nothing's saved). 0 = unset (fall back to the default).
+    #[serde(default)]
+    pub fps: u32,
+    /// The active DATA-mode slug (e.g. "mouse-battery"), mutually exclusive with `layers`. `None` =
+    /// no data mode (an effect stack, or nothing, owns the board).
+    #[serde(default)]
+    pub data: Option<String>,
+    /// The applied compositor stack — empty when a data mode owns the board, or nothing's applied.
+    /// Serialises as `[[lighting.<pid>.layers]]` array-of-tables; each layer is flat (see `LayerDef`).
+    #[serde(default)]
+    pub layers: Vec<neuron::effects::LayerDef>,
+}
 
 /// On-disk GUI preferences. All fields default so a missing/partial file still loads.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Prefs {
     /// Start resident in the tray with NO window shown. Defaults to true (lean, tray-first).
     #[serde(default = "default_true")]
@@ -68,6 +91,19 @@ pub struct Prefs {
     pub notif_profile: bool,
     #[serde(default = "default_true")]
     pub notif_layer: bool,
+    /// Macro/BEACON notify card — the fire-and-forget `neuron.notify()` card a macro posts. Default
+    /// ON. (This gates only the NOTIFY card; a macro's ASK prompt is never gated — you must see it to
+    /// answer.)
+    #[serde(default = "default_true")]
+    pub notif_macro: bool,
+    /// Device battery / charge cards — low/critical thresholds, charging engage·disengage, fully
+    /// charged. Default ON; turn off if you don't want power notifications.
+    #[serde(default = "default_true")]
+    pub notif_battery: bool,
+    /// Swappable SIDE-PLATE attach/detach cards (the device pushes its plate strap-code; no getter).
+    /// Default ON — a rare, deliberate hardware action you generally want confirmed.
+    #[serde(default = "default_true")]
+    pub notif_side_plate: bool,
     /// Audio-cue master volume, 0..1. Default 0.7.
     #[serde(default = "default_notif_volume")]
     pub notif_volume: f32,
@@ -78,6 +114,36 @@ pub struct Prefs {
     /// look. Default ON.
     #[serde(default = "default_true")]
     pub notif_panel: bool,
+    /// How MULTIPLE live notifications present: "stack" (a reflowing column of up to 4 cards growing
+    /// away from the corner, newest nearest, a `+N` tail past 4), "latest" (exactly one card, a new
+    /// note crossfade-SWAPS it), or "digest" (one SUMMARY card — a count + a row of the distinct
+    /// source glyphs + the latest line — when >1 is live, a plain single card otherwise). Default
+    /// "stack". (The settings UI to pick this is a later pass; the engine reads it now.)
+    #[serde(default = "default_stack_mode")]
+    pub notif_stack: String,
+    /// LIGHTING — the persisted applied effect/layer stack + chosen fps, keyed by device pid (4-digit
+    /// hex). Lets each lit board resume its effect across a relaunch. Empty by default; ONLY the
+    /// lighting page writes it. Declared LAST: it serialises as `[lighting.<pid>]` sub-tables, and TOML
+    /// forbids a scalar after a table, so every flat pref above must come first.
+    #[serde(default)]
+    pub lighting: BTreeMap<String, DeviceLight>,
+}
+
+/// The default multi-notification presentation — the reflowing column (newest nearest the corner).
+fn default_stack_mode() -> String {
+    "stack".to_string()
+}
+
+/// How multiple live notifications present (see [`Prefs::notif_stack`]). Parsed from the pref string;
+/// anything unknown falls back to [`StackMode::Stack`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StackMode {
+    /// A reflowing column of up to 4 cards (newest nearest the corner), a `+N` tail past that.
+    Stack,
+    /// Exactly one card; a new note crossfade-swaps the outgoing for the incoming.
+    Latest,
+    /// One summary card (count + distinct-source glyph row + latest line) when >1 is live.
+    Digest,
 }
 
 fn default_true() -> bool {
@@ -181,12 +247,22 @@ impl Default for Prefs {
             notif_brightness: true,
             notif_profile: true,
             notif_layer: true,
+            notif_macro: true,
+            notif_battery: true,
+            notif_side_plate: true,
             notif_volume: default_notif_volume(),
             notif_sound: default_notif_sound(),
             notif_panel: true,
+            notif_stack: default_stack_mode(),
+            lighting: BTreeMap::new(),
         }
     }
 }
+
+// Cached prefs for the hot read path (the notif engine reads these every animation tick). Invalidated
+// by `save()`; see `Prefs::load_cached`.
+static PREFS_CACHE: OnceLock<Mutex<Prefs>> = OnceLock::new();
+static PREFS_DIRTY: AtomicBool = AtomicBool::new(true);
 
 impl Prefs {
     /// The prefs file path (run-directory-relative, like the rest of the config).
@@ -205,7 +281,23 @@ impl Prefs {
     /// Persist the prefs back to `app.toml`. Returns a status line.
     pub fn save(&self) -> Result<(), String> {
         let body = toml::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(Self::path(), body).map_err(|e| e.to_string())
+        std::fs::write(Self::path(), body).map_err(|e| e.to_string())?;
+        PREFS_DIRTY.store(true, Ordering::Release); // invalidate the load_cached() copy
+        Ok(())
+    }
+
+    /// Like [`load`](Self::load), but CACHED — reloads from disk only after a `save` flips the dirty
+    /// flag. The notification engine reads prefs every animation tick; this stops it re-parsing
+    /// app.toml ~95×/card while a card animates (idle cost stays zero — the engine blocks when empty).
+    pub fn load_cached() -> Prefs {
+        let cell = PREFS_CACHE.get_or_init(|| Mutex::new(Prefs::load()));
+        if PREFS_DIRTY.swap(false, Ordering::AcqRel) {
+            let fresh = Prefs::load();
+            *cell.lock().unwrap() = fresh.clone();
+            fresh
+        } else {
+            cell.lock().unwrap().clone()
+        }
     }
 
     /// The card's anchor as a fraction of the monitor work-area (0..1). A named preset resolves to
@@ -226,8 +318,18 @@ impl Prefs {
         }
     }
 
-    /// Is this confirmation kind gated ON? (Macro is opt-in at the binding, so if it emitted at all
-    /// it's honoured here.)
+    /// How multiple live notifications present, parsed to the [`StackMode`] enum (unknown → Stack).
+    pub fn notif_stack_mode(&self) -> StackMode {
+        match self.notif_stack.as_str() {
+            "latest" => StackMode::Latest,
+            "digest" => StackMode::Digest,
+            _ => StackMode::Stack,
+        }
+    }
+
+    /// Is this confirmation kind gated ON? (A macro's NOTIFY card is opt-in at the binding AND honours
+    /// the `notif_macro` gate here; a macro's ASK prompt is never routed through this gate.)
+    #[inline]
     pub fn notif_kind_on(&self, kind: neuron::confirm::Kind) -> bool {
         use neuron::confirm::Kind;
         match kind {
@@ -237,7 +339,9 @@ impl Prefs {
             Kind::Brightness => self.notif_brightness,
             Kind::Profile => self.notif_profile,
             Kind::Layer => self.notif_layer,
-            Kind::Macro => true,
+            Kind::Macro => self.notif_macro,
+            Kind::Battery => self.notif_battery,
+            Kind::SidePlate => self.notif_side_plate,
         }
     }
 }
@@ -422,7 +526,7 @@ pub fn set_notif_audio(v: bool) -> String {
     }
 }
 
-/// Read one per-event gate by slug (dpi/scroll/polling/brightness/profile/layer).
+/// Read one per-event gate by slug (dpi/scroll/polling/brightness/profile/layer/macro).
 pub fn notif_event(slug: &str) -> bool {
     let p = Prefs::load();
     match slug {
@@ -432,6 +536,9 @@ pub fn notif_event(slug: &str) -> bool {
         "brightness" => p.notif_brightness,
         "profile" => p.notif_profile,
         "layer" => p.notif_layer,
+        "macro" => p.notif_macro,
+        "battery" => p.notif_battery,
+        "side_plate" => p.notif_side_plate,
         _ => false,
     }
 }
@@ -446,10 +553,31 @@ pub fn set_notif_event(slug: &str, v: bool) -> String {
         "brightness" => p.notif_brightness = v,
         "profile" => p.notif_profile = v,
         "layer" => p.notif_layer = v,
+        "macro" => p.notif_macro = v,
+        "battery" => p.notif_battery = v,
+        "side_plate" => p.notif_side_plate = v,
         _ => return format!("unknown notify event '{slug}'"),
     }
     match p.save() {
         Ok(()) => format!("notify {slug} {}", if v { "on" } else { "off" }),
+        Err(e) => format!("save failed: {e}"),
+    }
+}
+
+/// Read the WHEN-SEVERAL-LAND presentation mode ("stack" | "latest" | "digest").
+pub fn notif_stack() -> String {
+    Prefs::load().notif_stack
+}
+
+/// Persist the WHEN-SEVERAL-LAND presentation mode, returning a user-facing status line.
+pub fn set_notif_stack(mode: &str) -> String {
+    if !matches!(mode, "stack" | "latest" | "digest") {
+        return format!("unknown stack mode '{mode}'");
+    }
+    let mut p = Prefs::load();
+    p.notif_stack = mode.to_string();
+    match p.save() {
+        Ok(()) => format!("when several land: {mode}"),
         Err(e) => format!("save failed: {e}"),
     }
 }
@@ -508,6 +636,32 @@ pub fn set_notif_panel(v: bool) -> String {
     }
 }
 
+/// The map key for a device's lighting state — its pid as 4-digit lowercase hex (the same handle the
+/// runtime keys the selected device by). `0` (no device) has no key.
+pub fn light_key(pid: u16) -> String {
+    format!("{pid:04x}")
+}
+
+/// Read the saved lighting state for a device pid, or `None` if nothing's persisted for it.
+pub fn device_light(pid: u16) -> Option<DeviceLight> {
+    if pid == 0 {
+        return None;
+    }
+    Prefs::load().lighting.get(&light_key(pid)).cloned()
+}
+
+/// Persist a device's lighting state (upsert by pid), preserving every sibling pref. Pid `0` is a
+/// no-op (nothing selected). Cheap by design — call it on user lighting changes, NEVER per animation
+/// frame.
+pub fn set_device_light(pid: u16, state: DeviceLight) -> Result<(), String> {
+    if pid == 0 {
+        return Ok(());
+    }
+    let mut p = Prefs::load();
+    p.lighting.insert(light_key(pid), state);
+    p.save()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -539,6 +693,92 @@ mod tests {
         let msg = set_start_minimized(true);
         assert!(msg.contains("enabled"), "unexpected: {msg}");
         assert!(start_minimized(), "true must persist + reload");
+    }
+
+    /// Lighting state persists per-device and reloads losslessly (fps + a multi-layer stack).
+    #[test]
+    fn device_light_round_trips() {
+        let _g = cwd_guard();
+        let pid = 0x0226u16;
+        let state = DeviceLight {
+            fps: 12,
+            data: None,
+            layers: vec![
+                neuron::effects::LayerDef {
+                    effect: "fire".into(),
+                    color: neuron::lighting::Rgb::new(255, 90, 0),
+                    speed: 2.0,
+                    region: vec![5, 2, 9],
+                    blend: neuron::effects::Blend::Add,
+                    ..Default::default()
+                },
+                neuron::effects::LayerDef {
+                    effect: "static".into(),
+                    color: neuron::lighting::Rgb::new(0x4A, 0xF2, 0xB0),
+                    ..Default::default()
+                },
+            ],
+        };
+        set_device_light(pid, state.clone()).expect("save lighting");
+        let back = device_light(pid).expect("lighting reloads");
+        assert_eq!(back.fps, 12);
+        assert!(back.data.is_none());
+        assert_eq!(back.layers.len(), 2);
+        assert_eq!(back.layers[0].effect, "fire");
+        assert_eq!(back.layers[0].region, vec![5, 2, 9]);
+        assert_eq!(back.layers[0].blend, neuron::effects::Blend::Add);
+        assert_eq!(back.layers[1].color, neuron::lighting::Rgb::new(0x4A, 0xF2, 0xB0));
+        // a different (unsaved) device has no state — keying is real.
+        assert!(device_light(0x00A8).is_none());
+    }
+
+    /// A data-mode lighting state (no layers) persists too.
+    #[test]
+    fn device_light_data_mode_round_trips() {
+        let _g = cwd_guard();
+        let pid = 0x0226u16;
+        set_device_light(
+            pid,
+            DeviceLight {
+                fps: 6,
+                data: Some("mouse-battery".into()),
+                layers: vec![],
+            },
+        )
+        .expect("save");
+        let back = device_light(pid).expect("reload");
+        assert_eq!(back.data.as_deref(), Some("mouse-battery"));
+        assert!(back.layers.is_empty());
+    }
+
+    /// An OLD app.toml with NO `[lighting]` section still loads (back-compat) — the map defaults empty,
+    /// every other pref reads through, and a lighting write doesn't disturb the siblings.
+    #[test]
+    fn old_config_without_lighting_loads() {
+        let _g = cwd_guard();
+        std::fs::write(
+            Prefs::path(),
+            "start_minimized = false\nui_accent = \"ff8800\"\n",
+        )
+        .unwrap();
+        let p = Prefs::load();
+        assert!(!p.start_minimized);
+        assert_eq!(p.ui_accent, "ff8800");
+        assert!(p.lighting.is_empty(), "missing section defaults to empty");
+        // writing lighting must preserve the pre-existing siblings.
+        set_device_light(
+            0x0226,
+            DeviceLight {
+                fps: 30,
+                data: None,
+                layers: vec![],
+            },
+        )
+        .unwrap();
+        let p = Prefs::load();
+        assert!(!p.start_minimized, "sibling pref survives the lighting write");
+        assert_eq!(p.ui_accent, "ff8800");
+        assert_eq!(p.lighting.get(&light_key(0x0226)).map(|d| d.fps), Some(30));
     }
 
     /// The accent write must not clobber sibling prefs in app.toml (load-modify-save discipline).

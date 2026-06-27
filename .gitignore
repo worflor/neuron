@@ -1,6 +1,11 @@
 # Rust build output
 /target/
 
+# Bundled-CPython cache: build.rs downloads + verifies the python-build-standalone tarball(s) here
+# (one per build target, ~46 MB each) so incremental/offline builds skip the network. Generated,
+# never source — must not be committed.
+/vendor/
+
 # Runtime diagnostics and crash artifacts
 *.dmp
 *.mdmp
@@ -36,6 +41,10 @@ Thumbs.db
 /runtime/
 /backups/
 /macros/
+# the app's RUNTIME macro store (seeded default copies + the `.defaults_seeded` marker) — generated on
+# first launch; the SOURCE defaults live in neuron-core/src/macros/defaults/. Committing the marker
+# would suppress seeding on every fresh checkout, so keep this dir out of version control.
+crates/neuron-app/macros/
 /reference/
 profiles/
 __neuron_test_*.toml

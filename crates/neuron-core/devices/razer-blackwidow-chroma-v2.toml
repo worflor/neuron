@@ -6,7 +6,14 @@
 name = "Razer BlackWidow Chroma V2"
 codename = "BlackWidow Chroma V2"
 vendor_id = 0x1532
-transaction_id = 0x1F
+# SPLIT-BRAIN device: this board needs DIFFERENT transaction_ids per command family
+# (verified against OpenRazer razerkbd_driver.c CHROMA_V2 + live `neuron probe`).
+#   - device DEFAULT = 0xFF: getters (firmware/serial 0x00/0x81-82), device-mode
+#     (0x00/0x04 + 0x00/0x84), brightness (0x03/0x01), Game/Macro LED + LED-effect state.
+#     (These "pass by luck" at any tx since simple getters ignore the tx field.)
+#   - lighting EFFECT (0x03/0x0A) + CUSTOM-FRAME (0x03/0x0B) = 0x3F (per-command override below).
+# Was a single global 0x1F, which silently NO-OP'd lighting writes (they DON'T ignore tx).
+transaction_id = 0xFF
 
 [[modes]]
 name = "wired"
@@ -47,6 +54,9 @@ size = 0x07
 # Setter opcodes/effect-ids below are the standard legacy Chroma values and are PROVISIONAL
 # pending a gated round-trip verify; the getters above are confirmed. The dry-run preview
 # shows the exact bytes before anything is ever sent.
+# PROVISIONAL — still pending the parent's LIVE hardware verify (lighting the keyboard red to
+# confirm the 0x3F tx actually renders). The split-brain tx fix (0xFF default + 0x3F lighting)
+# is derived from OpenRazer + the live probe, NOT yet confirmed on this physical board.
 [lighting]
 protocol = "legacy"
 rows = 6
@@ -67,15 +77,20 @@ class = 0x03
 id = 0x0A
 size = 0x08
 args = []
+transaction_id = 0x3F        # CHROMA_V2 lighting tx (OpenRazer); default 0xFF no-ops the write
 
 [lighting.custom_frame]       # legacy custom row paint: [0xFF frame-id, row, start, stop, RGB...]
 class = 0x03
 id = 0x0B
 size = 0x46
 args = [0xFF]                 # frame-id prefix (confirmed via OpenRazer + live)
+transaction_id = 0x3F        # CHROMA_V2 lighting tx (OpenRazer); default 0xFF no-ops the write
 
+# Standard LED brightness (OpenRazer razer_chroma_standard_set_led_brightness): class 0x03 /
+# id 0x03, args [VARSTORE=0x01, BACKLIGHT_LED=0x05, level]. The V2 uses the device-default tx
+# (0xFF) for brightness — NOT the 0x3F lighting tx. (Was id 0x01: wrong opcode, silently no-op'd.)
 [lighting.brightness]
 class = 0x03
-id = 0x01
+id = 0x03
 size = 0x03
 args = [0x01, 0x05]

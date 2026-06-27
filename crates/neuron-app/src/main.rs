@@ -25,6 +25,7 @@ mod filedlg;
 mod flight;
 mod glance;
 mod glue;
+mod hidwatch;
 mod knockback;
 mod mic;
 mod migrate;
@@ -293,13 +294,35 @@ fn main() {
     // Register the confirmation sink (the core's structural one-way door) and hand its receiver to a
     // dedicated engine thread that owns its OWN overlay window. State-change confirmations from the
     // verified commit points (DPI / profile / polling / brightness / layer) flow here; the engine
-    // gates them on the live prefs and renders the chosen card. No card can be fired except as the
-    // byproduct of a committed change — there is no "announce" path.
+    // gates them on the live prefs and renders the chosen card. The CORE model stays change-only (no
+    // "announce" path in `confirm`); the ONE app-layer exception is a macro's own `neuron.notify()`
+    // (the user's code talking), posted as a Kind::Macro card via `notifs::post_macro` onto this same
+    // surface — the notif unification: everything informational is a card, only the ask wheel (which
+    // you answer) stays a separate radial.
     {
-        let (tx, rx) = std::sync::mpsc::channel::<neuron::confirm::Confirmation>();
-        neuron::confirm::set_sink(Some(tx));
-        std::thread::spawn(move || notifs::run(rx));
+        // ONE pipeline: the engine drains a single `Note` channel carrying confirmations, macro
+        // notifies, AND the beacon's ask announcement (only the answer wheel stays a separate
+        // surface). `confirm::set_sink` stays PURE — it still speaks `Confirmation`; a tiny forwarder
+        // thread maps each into a `Note::Confirm`, so the core never learns the engine's enum.
+        let (note_tx, note_rx) = std::sync::mpsc::channel::<notifs::Note>();
+        notifs::set_note_sink(note_tx.clone()); // backs post_macro / post_ask / clear_ask
+        let (conf_tx, conf_rx) = std::sync::mpsc::channel::<neuron::confirm::Confirmation>();
+        neuron::confirm::set_sink(Some(conf_tx));
+        std::thread::spawn(move || {
+            while let Ok(c) = conf_rx.recv() {
+                if note_tx.send(notifs::Note::Confirm(c)).is_err() {
+                    break; // the engine went away
+                }
+            }
+        });
+        std::thread::spawn(move || notifs::run(note_rx));
     }
+
+    // ── HID EVENT LISTENER ────────────────────────────────────────────────
+    // Listen for the device-pushed reports Synapse reads (onboard DPI/scroll-stage button → "now X")
+    // and turn them into confirmations — so onboard changes earn a Neuron card, event-driven, no poll.
+    // (NEURON_HIDWATCH=1 also dumps raw reports for decoding new devices.)
+    hidwatch::start();
 
     // ── CURTAIN LOOK ──────────────────────────────────────────────────
     // Teach the core curtain (the panic privacy screen) how to paint itself: the user's LIVE weave
@@ -427,6 +450,16 @@ fn main() {
                         // all organs beating again — arm for the next (different) episode.
                         *stall_name.borrow_mut() = None;
                     }
+                }
+
+                // SIDE PLATE: the swappable plate is push-only (no getter), so the selected mouse's
+                // readout follows the last plate the device pushed (recorded in the confirmation core
+                // by hidwatch). Cheap last-known read; only writes on a change. The instant swap
+                // feedback is the confirmation card — this keeps the DEVICE-page readout honest.
+                if slow_due {
+                    crate::glue::refresh_selected_plate(app);
+                    // and the DEVICE-LIST row the plate belongs under — patched in place, not rebuilt.
+                    crate::glue::refresh_plated_row(app);
                 }
 
                 // LINK lamp: lights only while the live loop is alive.

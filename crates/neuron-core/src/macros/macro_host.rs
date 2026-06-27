@@ -25,6 +25,7 @@
 //! Nothing here ever blocks the input/UI thread: [`fire_async`] dispatches and returns; the
 //! blocking [`invoke`]/[`check`] are for the GUI "test run" + CLI only, always with a hard budget.
 
+use crate::macros::node::MacroNode;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{BufReader, Read, Write};
@@ -58,8 +59,9 @@ type BeaconSlot = Arc<Mutex<Option<Sender<BeaconEvent>>>>;
 /// whatever UI installed itself via [`MacroHost::beacon_events`].
 #[derive(Debug, Clone)]
 pub enum BeaconEvent {
-    /// A macro is asking a yes/no question. Answer with [`MacroHost::answer`] — `Some(true)` = yes,
-    /// `Some(false)` = no, `None` = dismissed (the macro's `ask` returns its `default`).
+    /// A macro is prompting the user to pick one of `options` — the ANSWER WHEEL. N=2 is yes/no, N≥3
+    /// a radial menu, N=1 a confirm; all one path. Answer with [`MacroHost::answer`] — `Some(i)` =
+    /// option `i`, `None` = passed/dismissed (the macro's prompt returns its `default`).
     Ask {
         /// The prompt id to answer with (sidecar-allocated; unique per ask).
         pid: u64,
@@ -67,7 +69,9 @@ pub enum BeaconEvent {
         macro_id: String,
         /// The question, verbatim.
         text: String,
-        /// Optional context shown UNDER the answer wheel (`neuron.ask(..., description=)`); "" = none.
+        /// The ordered option labels — the wheel's wedges (`["yes","no"]` for a plain `ask`).
+        options: Vec<String>,
+        /// Optional context shown UNDER the answer wheel (`description=`); "" = none.
         detail: String,
         /// The sidecar-side timeout, if the macro set one — the UI should retire the prompt itself
         /// at this deadline (the sidecar already has; an answer after it is ignored).
@@ -80,6 +84,34 @@ pub enum BeaconEvent {
     /// A macro's fire-and-forget status line (`neuron.notify("…")`) — show it, don't block.
     Notify { macro_id: String, text: String },
 }
+
+/// Why a [`MacroHost::parse_macro`] could not produce a node tree. A `SyntaxError` in the source is
+/// the EXPECTED case (a half-typed macro) and carries the offending line + message verbatim from
+/// Python's `ast`; everything else (no python runtime, sidecar pipe broken, timeout) is a `Host`
+/// error. The constructor UI surfaces `Syntax` inline at the line and treats `Host` as "try again".
+#[derive(Clone, Debug, PartialEq)]
+pub enum ParseError {
+    /// The source didn't parse. `line` is the 1-based line (0 if Python gave none); `msg` is
+    /// Python's syntax-error message.
+    Syntax { line: u32, msg: String },
+    /// The sidecar/runtime couldn't service the request (no python, pipe broken, did not answer).
+    Host { msg: String },
+}
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseError::Syntax { line, msg } => write!(f, "syntax error (line {line}): {msg}"),
+            ParseError::Host { msg } => write!(f, "{msg}"),
+        }
+    }
+}
+
+impl std::error::Error for ParseError {}
+
+/// The outcome of parsing a macro's Python source into the typed node tree: the macro body as an
+/// ordered `Vec<MacroNode>` on success, or a [`ParseError`].
+pub type ParseResult = Result<Vec<MacroNode>, ParseError>;
 
 /// Hard ceiling on a single blocking macro invocation (test-run / CLI). The input path uses
 /// [`fire_async`] and never waits at all.
@@ -291,13 +323,13 @@ impl MacroHost {
         rx
     }
 
-    /// Answer an open prompt: `Some(true)` = yes, `Some(false)` = no, `None` = dismissed (the
-    /// macro's `ask` returns its `default`). An unknown/expired pid is ignored by the sidecar —
+    /// Answer an open prompt: `Some(i)` = the user picked option `i`, `None` = passed/dismissed (the
+    /// macro's prompt returns its `default`). An unknown/expired pid is ignored by the sidecar —
     /// answering late is always safe.
-    pub fn answer(&self, pid: u64, yes: Option<bool>) {
+    pub fn answer(&self, pid: u64, choice: Option<usize>) {
         let mut g = self.inner.lock().unwrap();
         if let Some(s) = g.session.as_mut() {
-            let _ = s.send(&json!({"t": "answer", "pid": pid, "yes": yes}));
+            let _ = s.send(&json!({"t": "answer", "pid": pid, "choice": choice}));
         }
     }
 
@@ -315,10 +347,12 @@ impl MacroHost {
         }
     }
 
-    /// Whether a usable Python runtime + host scripts were found (else the macro tier is disabled
-    /// and reports it honestly; the rest of Neuron works fully without Python).
+    /// Whether the BUNDLED Python runtime + host scripts can be materialized (else the macro tier
+    /// is disabled and reports it honestly; the rest of Neuron works fully without Python). Since
+    /// the interpreter is shipped in the binary, this only fails on a real IO problem (no writable
+    /// data dir / extraction error), not on a missing system Python.
     pub fn available(&self) -> bool {
-        resolve_python().is_some() && host_script().is_some()
+        resolve_runtime().is_ok()
     }
 
     /// Register (or replace) a macro by id with its python `source` and PERSIST it to disk. Blocks
@@ -430,6 +464,59 @@ impl MacroHost {
             Err(_) => {
                 shared.pending.lock().unwrap().remove(&rid);
                 Err("sidecar did not answer".into())
+            }
+        }
+    }
+
+    /// Parse a macro's Python `source` into the typed [`MacroNode`] tree (the macro body — the
+    /// statements inside `def macro(ctx):`). The sidecar's `ast` does the real parsing; this just
+    /// frames the request and deserializes the reply. The DUAL of [`crate::macros::nodes_to_source`]
+    /// (nodes -> source, in Rust): together they make the visual constructor's mapping two-way.
+    ///
+    /// A `SyntaxError` in the source is the EXPECTED half-typed case and comes back as
+    /// [`ParseError::Syntax`] with the line + message — it never panics or kills the sidecar. No
+    /// python runtime / broken pipe / no answer -> [`ParseError::Host`]. Bounded by [`FIRE_BUDGET`];
+    /// like [`check`](MacroHost::check), do NOT call from the input/UI thread.
+    pub fn parse_macro(&self, source: &str) -> ParseResult {
+        let (rx, shared, rid, sent) = {
+            let mut g = self.inner.lock().unwrap();
+            self.ensure_locked(&mut g).map_err(host_err)?;
+            let s = g.session.as_mut().unwrap();
+            let rid = s.shared.next_rid.fetch_add(1, Ordering::Relaxed);
+            let (tx, rx) = channel();
+            let shared = Arc::clone(&s.shared);
+            shared.pending.lock().unwrap().insert(rid, tx);
+            let ok = s.send(&json!({"t": "parse", "rid": rid, "source": source}));
+            (rx, shared, rid, ok)
+        };
+        if !sent {
+            shared.pending.lock().unwrap().remove(&rid);
+            return Err(host_err("sidecar pipe broken"));
+        }
+        match rx.recv_timeout(FIRE_BUDGET) {
+            Ok(v) if v.get("ok").and_then(Value::as_bool) == Some(true) => {
+                let nodes = v.get("nodes").cloned().unwrap_or(Value::Null);
+                serde_json::from_value::<Vec<MacroNode>>(nodes).map_err(|e| {
+                    host_err(format!("sidecar returned malformed node JSON: {e}"))
+                })
+            }
+            // a parse that ran but found a SyntaxError -> the structured {line, msg} error.
+            Ok(v) => {
+                let err = v.get("error");
+                let line = err
+                    .and_then(|e| e.get("line"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as u32;
+                let msg = err
+                    .and_then(|e| e.get("msg"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("syntax error")
+                    .to_string();
+                Err(ParseError::Syntax { line, msg })
+            }
+            Err(_) => {
+                shared.pending.lock().unwrap().remove(&rid);
+                Err(host_err("sidecar did not answer"))
             }
         }
     }
@@ -645,14 +732,11 @@ impl MacroHost {
 /// `log` is the persistent MacroHost-level ring this session feeds (so its output outlives it);
 /// `beacon` is the Macro Host-level prompt-listener slot the reader routes ask/notify frames to.
 fn spawn_session(armed: bool, log: LogRing, beacon: BeaconSlot) -> Result<Session, String> {
-    let py = resolve_python()
-        .ok_or("no python runtime found (bundle runtime/python or install python)")?;
-    let host = host_script().ok_or("Macro Host script not found (runtime/host/neuron_host.py)")?;
-    let host_dir = host.parent().map(PathBuf::from).unwrap_or_default();
+    let rt = resolve_runtime()?;
 
-    let mut cmd = Command::new(&py);
-    cmd.arg(&host)
-        .current_dir(&host_dir) // so `import neuron` finds runtime/host/neuron.py
+    let mut cmd = Command::new(&rt.python);
+    cmd.arg(&rt.host_script)
+        .current_dir(&rt.host_dir) // so `import neuron` finds the co-located host/neuron.py
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -764,6 +848,143 @@ fn beacon_deliver(beacon: &BeaconSlot, ev: BeaconEvent) -> bool {
     }
 }
 
+/// The device registry, loaded ONCE for macro device-verbs (`neuron.dpi/profile/…`) and cached, so a
+/// macro spamming acts never re-reads the registry TOMLs.
+fn act_registry() -> Option<&'static crate::registry::Registry> {
+    static R: std::sync::OnceLock<Option<crate::registry::Registry>> = std::sync::OnceLock::new();
+    R.get_or_init(|| crate::registry::Registry::load().ok())
+        .as_ref()
+}
+
+/// Open the first connected device that satisfies `cap` (for a macro's read-back / brightness verb).
+fn open_capable(cap: crate::registry::Capability) -> Option<crate::device::Device> {
+    let reg = act_registry()?;
+    reg.devices
+        .iter()
+        .filter(|d| d.supports(cap))
+        .find_map(|d| {
+            d.product_ids()
+                .find_map(|pid| crate::device::Device::open(d.clone(), pid).ok())
+        })
+}
+
+/// Run a macro's device/profile/system VERB. Writes go through the SHARED intent path — so
+/// `neuron.dpi(1600)` is the exact same write (and confirmation card) as a bound trigger or the CLI,
+/// one source of truth. Reads (`battery`/`current_dpi`/`active_profile`/`scroll_stage`) let a macro
+/// SENSE live state and react. Audio + brightness reuse the same Core-Audio / capability code the
+/// bound actions use. Returns `(ok, message)` — for a read, the message IS the value.
+fn run_act(verb: &str, arg: &Value) -> (bool, String) {
+    use crate::action::{Direction, Intent};
+    use crate::capability as cap;
+
+    // ── SENSE: read-back verbs (never gated — reading state has no side effect) ──────────────────
+    match verb {
+        "active_profile" => return (true, crate::profile::active()),
+        "scroll_stage" => return (true, crate::writes::scroll_stage_cursor().to_string()),
+        "battery" => {
+            return match open_capable(crate::registry::Capability::Battery) {
+                Some(d) => match cap::battery_percent(&d) {
+                    Ok(p) => (true, format!("{}|{}", p, cap::charging(&d).unwrap_or(false))),
+                    Err(e) => (false, format!("battery read failed: {e}")),
+                },
+                None => (false, "no battery-capable device".into()),
+            }
+        }
+        "current_dpi" => {
+            return match open_capable(crate::registry::Capability::Dpi) {
+                Some(d) => match cap::dpi(&d) {
+                    Ok((x, _)) => (true, x.to_string()),
+                    Err(e) => (false, format!("dpi read failed: {e}")),
+                },
+                None => (false, "no dpi-capable device".into()),
+            }
+        }
+        _ => {}
+    }
+
+    // ── AUDIO: the system mixer (mic capture + output render), via Core Audio ────────────────────
+    if let Some((render, gain)) = match verb {
+        "mic_mute" => Some((false, false)),
+        "out_mute" => Some((true, false)),
+        "mic_gain" => Some((false, true)),
+        "out_gain" => Some((true, true)),
+        _ => None,
+    } {
+        let ep = if render {
+            crate::audio::resolve_render(None)
+        } else {
+            crate::audio::resolve_capture(None)
+        };
+        let Some(ep) = ep else {
+            return (false, "no audio endpoint".into());
+        };
+        let Some(ctl) = crate::audio::VolumeCtl::open(&ep.id) else {
+            return (false, "audio endpoint unavailable".into());
+        };
+        if gain {
+            let v = ctl.nudge(arg.as_f64().unwrap_or(0.0) as f32 / 100.0);
+            return (true, format!("{} vol -> {}%", ep.name, (v * 100.0).round() as i32));
+        }
+        let s = match arg.as_str().unwrap_or("toggle") {
+            "on" => {
+                ctl.set_mute(true);
+                true
+            }
+            "off" => {
+                ctl.set_mute(false);
+                false
+            }
+            _ => ctl.toggle_mute(),
+        };
+        return (true, format!("{} mute -> {}", ep.name, if s { "ON" } else { "off" }));
+    }
+
+    // ── BRIGHTNESS: lighting brightness write ────────────────────────────────────────────────────
+    if verb == "brightness" {
+        let Some(pct) = arg.as_u64() else {
+            return (false, "brightness(pct): pct must be a number".into());
+        };
+        let pct = pct.min(100) as u8;
+        return match open_capable(crate::registry::Capability::SetBrightness) {
+            Some(d) => match cap::set_brightness(&d, pct, cap::Store::Persist) {
+                Ok(()) => (true, format!("brightness -> {pct}%")),
+                Err(e) => (false, format!("brightness failed: {e}")),
+            },
+            None => (false, "no brightness-capable device".into()),
+        };
+    }
+
+    // ── device + profile INTENTS (shared path — the same write a bound trigger uses) ─────────────
+    let dir = if arg.as_str() == Some("down") || arg.as_i64() == Some(-1) {
+        Direction::Down
+    } else {
+        Direction::Up
+    };
+    let intent = match verb {
+        "dpi" => match arg.as_u64() {
+            Some(n) => Intent::DpiSet(n.clamp(100, 30_000) as u16),
+            None => return (false, "dpi(n): n must be a number".into()),
+        },
+        "dpi_cycle" => Intent::DpiCycle(dir),
+        "scroll_cycle" => Intent::ScrollStageCycle(dir),
+        "profile" => match arg.as_str() {
+            Some(s) if !s.is_empty() => Intent::ProfileSwitch(s.to_string()),
+            _ => return (false, "profile(name): name must be a non-empty string".into()),
+        },
+        "profile_cycle" => Intent::ProfileCycle(dir),
+        other => return (false, format!("unknown device verb '{other}'")),
+    };
+    let Some(reg) = act_registry() else {
+        return (false, "device registry failed to load".into());
+    };
+    let mut devices = crate::device::DeviceSession::new(reg);
+    let mut cursor = crate::intent::ProcessProfileCursor;
+    match crate::intent::run_shared_intent(&mut devices, &mut cursor, &intent) {
+        Some(msg) => (true, msg),
+        None => (false, "that action isn't available to macros".into()),
+    }
+}
+
 /// Read protocol frames off the sidecar's stdout and route them. On EOF/error -> mark the link
 /// dead (which wakes `ensure`'s warm-wait and fails every in-flight waiter). `stdin` is the weak
 /// write-end used ONLY for the no-UI prompt auto-answer (so an asking macro is never stranded).
@@ -800,23 +1021,39 @@ fn reader_loop(
                 st.dead = false;
                 shared.cv.notify_all();
             }
-            Some("result") | Some("checked") | Some("pong") | Some("registered") => {
-                if let Some(rid) = v.get("rid").and_then(Value::as_u64) {
-                    if let Some(tx) = shared.pending.lock().unwrap().remove(&rid) {
-                        let _ = tx.send(v.clone());
-                    } else if v.get("t").and_then(Value::as_str) == Some("result") {
-                        // an async fire result (no waiter) -> surface to the log.
-                        if v.get("ok").and_then(Value::as_bool) == Some(false) {
-                            if let Some(e) = v.get("error").and_then(Value::as_str) {
-                                shared.push_log(format!(
-                                    "[macro error] {}",
-                                    e.lines().next().unwrap_or(e)
-                                ));
+            Some("result") | Some("checked") | Some("pong") | Some("registered")
+            | Some("parsed") => {
+                // Hand the frame to its waiter if one is registered. A `result` with NO waiter —
+                // whether the rid is null (a fire-and-forget `invoke(wait=False)` child, dispatched
+                // with `rid: None`) OR a numeric rid nobody is waiting on (a top-level `fire_async`,
+                // or an `invoke` that already timed out) — still carries the macro's stdout/traceback,
+                // so it must be surfaced to the macro log, never dropped. (Before, a null rid
+                // short-circuited this whole arm, so an async-INVOKED child that crashed failed
+                // INVISIBLY — its traceback reached no one.)
+                let waiter = v
+                    .get("rid")
+                    .and_then(Value::as_u64)
+                    .and_then(|rid| shared.pending.lock().unwrap().remove(&rid));
+                if let Some(tx) = waiter {
+                    let _ = tx.send(v.clone());
+                } else if v.get("t").and_then(Value::as_str) == Some("result") {
+                    // an async fire result (no waiter) -> surface to the log.
+                    if v.get("ok").and_then(Value::as_bool) == Some(false) {
+                        // the FULL traceback, every line — a crash must stay debuggable, not be
+                        // reduced to its "Traceback (most recent call last):" banner (the real
+                        // exception is on the LAST line).
+                        if let Some(e) = v.get("error").and_then(Value::as_str) {
+                            let mut lines = e.lines();
+                            if let Some(first) = lines.next() {
+                                shared.push_log(format!("[macro error] {first}"));
                             }
-                        } else if let Some(l) = v.get("log").and_then(Value::as_str) {
-                            for line in l.lines() {
+                            for line in lines {
                                 shared.push_log(line.to_string());
                             }
+                        }
+                    } else if let Some(l) = v.get("log").and_then(Value::as_str) {
+                        for line in l.lines() {
+                            shared.push_log(line.to_string());
                         }
                     }
                 }
@@ -839,6 +1076,14 @@ fn reader_loop(
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
+                // the answer wheel's wedges — the macro's option labels. Absent/empty (a bare ask)
+                // falls back to yes/no, so the simplest prompt needs nothing extra on the wire.
+                let options: Vec<String> = v
+                    .get("options")
+                    .and_then(Value::as_array)
+                    .map(|a| a.iter().filter_map(|o| o.as_str().map(str::to_string)).collect())
+                    .filter(|v: &Vec<String>| !v.is_empty())
+                    .unwrap_or_else(|| vec!["yes".into(), "no".into()]);
                 let timeout_ms = v
                     .get("timeout")
                     .and_then(Value::as_f64)
@@ -849,6 +1094,7 @@ fn reader_loop(
                         pid,
                         macro_id: macro_id.clone(),
                         text: text.clone(),
+                        options,
                         detail,
                         timeout_ms,
                     },
@@ -859,7 +1105,7 @@ fn reader_loop(
                     if let Some(stdin) = stdin.upgrade() {
                         let _ = send_frame(
                             &mut *stdin.lock().unwrap(),
-                            &json!({"t": "answer", "pid": pid, "yes": Value::Null}),
+                            &json!({"t": "answer", "pid": pid, "choice": Value::Null}),
                         );
                     }
                     shared.push_log(format!(
@@ -887,12 +1133,42 @@ fn reader_loop(
                 shared.push_log(format!("[{macro_id}] {text}"));
                 beacon_deliver(&beacon, BeaconEvent::Notify { macro_id, text });
             }
+            Some("act") => {
+                // a macro called a device verb (neuron.dpi/profile/…). Run the SHARED intent — the
+                // exact write (+ confirmation card) a bound trigger uses — OFF the reader thread so a
+                // device round-trip never stalls result/answer routing, then hand the macro back the
+                // outcome it's blocking on.
+                let rid = v.get("rid").and_then(Value::as_u64);
+                let verb = v
+                    .get("verb")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let arg = v.get("arg").cloned().unwrap_or(Value::Null);
+                let stdin = stdin.clone();
+                std::thread::spawn(move || {
+                    let (ok, msg) = run_act(&verb, &arg);
+                    if let Some(stdin) = stdin.upgrade() {
+                        let _ = send_frame(
+                            &mut *stdin.lock().unwrap(),
+                            &json!({"t": "act_result", "rid": rid, "ok": ok, "msg": msg}),
+                        );
+                    }
+                });
+            }
             _ => {}
         }
     }
     // every open prompt died with this sidecar — clear any UI queue before reporting the death.
     beacon_deliver(&beacon, BeaconEvent::RetireAll);
     shared.mark_dead();
+}
+
+/// Build a [`ParseError::Host`] from any displayable message (the non-syntax failure path).
+fn host_err(msg: impl std::fmt::Display) -> ParseError {
+    ParseError::Host {
+        msg: msg.to_string(),
+    }
 }
 
 /// Marshal the captured Context (+ live arm state) into the json the host's `Ctx` reads.
@@ -908,93 +1184,29 @@ fn ctx_json(ctx: &crate::macros::context::Context, armed: bool) -> Value {
     })
 }
 
-// ── runtime resolution (bundled-first, system fallback) ─────────────────────────────────────────
+// ── runtime resolution (bundled CPython; operator override) ─────────────────────────────────────
 
-/// Candidate roots that may CONTAIN a `runtime/` dir: an explicit override, then the exe dir and a
-/// few ancestors (covers `target/debug` -> repo), then the cwd and ancestors. First hit wins, so a
-/// shipped `runtime/` beside the exe is preferred and a dev checkout still resolves the repo's.
-fn runtime_roots() -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-    if let Ok(p) = std::env::var("NEURON_RUNTIME") {
-        roots.push(PathBuf::from(p));
-    }
-    let mut add_ancestors = |start: Option<PathBuf>| {
-        if let Some(mut p) = start {
-            for _ in 0..4 {
-                roots.push(p.clone());
-                if !p.pop() {
-                    break;
-                }
-            }
-        }
-    };
-    add_ancestors(
-        std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(PathBuf::from)),
-    );
-    add_ancestors(std::env::current_dir().ok());
-    roots
-}
-
-/// The bundled python interpreter if present (runtime/python/python(.exe)), or an explicit
-/// `NEURON_PYTHON`. PATH/system Python fallback is opt-in with `NEURON_ALLOW_SYSTEM_PYTHON=1`.
-pub fn resolve_python() -> Option<PathBuf> {
+/// Resolve the [`Runtime`] the sidecar spawns from. Two tiers, in order:
+///   1. **`NEURON_PYTHON`** — an explicit interpreter path the operator names (a venv/pyenv they
+///      WANT used). Still honoured for power users; the host scripts are taken from the bundled,
+///      app-materialized `host/` dir either way (so the protocol scripts are always the right ones).
+///   2. **the BUNDLED runtime** — the interpreter `neuron` ships in its own binary and materializes
+///      into the user's data dir ([`crate::macros::ensure_runtime`]). The default ship path: a
+///      known-good CPython, zero user setup, no system-PATH probing, no env-var hacks.
+///
+/// There is NO system-PATH discovery: `neuron` carries its own Python, so the macro tier never
+/// depends on what (if anything) the user has installed. An `Err` here means a real IO failure
+/// materializing the bundle, surfaced verbatim — never a silent fallback.
+fn resolve_runtime() -> Result<crate::macros::Runtime, String> {
+    let mut rt = crate::macros::ensure_runtime()?;
+    // Operator override: an explicit interpreter wins, but it drives the SAME bundled host scripts.
     if let Ok(p) = std::env::var("NEURON_PYTHON") {
         let pb = PathBuf::from(p);
         if pb.exists() {
-            return Some(pb);
+            rt.python = pb;
         }
     }
-    let exe = if cfg!(windows) {
-        "python.exe"
-    } else {
-        "python3"
-    };
-    for root in runtime_roots() {
-        let p = root.join("runtime").join("python").join(exe);
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    // system fallback — first interpreter on PATH that runs.
-    if std::env::var_os("NEURON_ALLOW_SYSTEM_PYTHON").is_none() {
-        return None;
-    }
-    for cand in if cfg!(windows) {
-        ["python", "py", "python3"].as_slice()
-    } else {
-        ["python3", "python"].as_slice()
-    } {
-        if Command::new(cand)
-            .arg("--version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-        {
-            return Some(PathBuf::from(cand));
-        }
-    }
-    None
-}
-
-/// Path to the resident host script (runtime/host/neuron_host.py).
-pub fn host_script() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("NEURON_MACRO_HOST") {
-        let pb = PathBuf::from(p);
-        if pb.exists() {
-            return Some(pb);
-        }
-    }
-    for root in runtime_roots() {
-        let p = root.join("runtime").join("host").join("neuron_host.py");
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    None
+    Ok(rt)
 }
 
 // ── macro persistence (macros/scripts/<id>.py) ──────────────────────────────────────────────────
@@ -1146,6 +1358,14 @@ pub fn load_macro(id: &str) -> Option<String> {
     std::fs::read_to_string(macro_path(id)).ok()
 }
 
+/// Free-function convenience over [`MacroHost::parse_macro`] on the process-global host (mirrors how
+/// `register`/`scan_macro_dir` are reachable both as methods and module functions). Parses macro
+/// `source` into the typed [`MacroNode`] tree; pair with [`crate::macros::nodes_to_source`] for the
+/// inverse. Do NOT call from the input/UI thread (it can block up to [`FIRE_BUDGET`]).
+pub fn parse_macro(source: &str) -> ParseResult {
+    macro_host().parse_macro(source)
+}
+
 /// Delete a macro's source file (`macros/scripts/<id>.py`) by id.
 ///
 /// Removing the file is sufficient: the warm sidecar re-syncs its registry from disk on its next
@@ -1178,10 +1398,25 @@ mod tests {
     }
 
     #[test]
-    fn runtime_roots_include_cwd_and_exe() {
-        // resolution must at least consider the cwd (where a dev runtime/ lives).
-        let roots = runtime_roots();
-        assert!(!roots.is_empty());
+    fn bundled_runtime_materializes() {
+        // The sidecar runs from the app-bundled CPython: resolving it must succeed (it extracts the
+        // embedded interpreter on first call). This also proves availability no longer depends on a
+        // system Python.
+        let rt = resolve_runtime().expect("bundled runtime materializes");
+        assert!(rt.python.exists(), "bundled python binary should exist");
+        assert!(
+            rt.host_script.ends_with("neuron_host.py"),
+            "host entry script is neuron_host.py"
+        );
+        assert_eq!(
+            rt.host_script.parent(),
+            Some(rt.host_dir.as_path()),
+            "host script must be co-located in host_dir (so `import neuron` resolves the sibling)"
+        );
+        assert!(
+            rt.host_dir.join("neuron.py").exists(),
+            "neuron.py must be co-located with neuron_host.py"
+        );
     }
 
     #[test]

@@ -117,6 +117,9 @@ struct Prompt {
     pid: u64,
     macro_id: String,
     text: String,
+    /// The answer wheel's options (the wedges) — `["yes","no"]` for a plain ask, N labels for a
+    /// `choose`, one for a `confirm`. The whole prompt system is this list + the radial core.
+    options: Vec<String>,
     detail: String,
 }
 
@@ -153,6 +156,7 @@ pub fn start(weak: slint::Weak<AppWindow>) {
                             pid,
                             macro_id,
                             text,
+                            options,
                             detail,
                             ..
                         } => {
@@ -161,6 +165,7 @@ pub fn start(weak: slint::Weak<AppWindow>) {
                                 pid,
                                 macro_id,
                                 text,
+                                options,
                                 detail,
                             });
                             cv.notify_all();
@@ -189,7 +194,10 @@ pub fn start(weak: slint::Weak<AppWindow>) {
                             mirror_count(&weak, &shared);
                         }
                         BeaconEvent::Notify { macro_id, text } => {
-                            // fire-and-forget status: show it where live telemetry lives.
+                            // fire-and-forget status: the over-game CARD (the same surface as
+                            // confirmations — gated by the Kind::Macro notif pref) AND the in-app
+                            // status line / macro-log readout.
+                            crate::notifs::post_macro(&macro_id, &text);
                             let w = weak.clone();
                             let line = format!("{macro_id}: {text}");
                             let _ = slint::invoke_from_event_loop(move || {
@@ -1716,13 +1724,29 @@ fn aim_tick(
     false
 }
 
-/// One committed flick of the answer wheel. `Pass` is the third verdict — "not now": the macro's
-/// `ask` returns its `default`, deliberately, without the user having to pick a side.
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-enum Flick {
-    Yes,
-    No,
-    Pass,
+/// The screen-direction arrow (one of 8) pointing along `bearing` (`atan2(dy, dx)`, dy DOWN) — so the
+/// answer hint shows which way to flick each option. Generic over N: yes/no reads "← yes · → no", a
+/// 4-way reads "← a · ↓ b · → c · ↑ d", no special-casing.
+fn dir_arrow(bearing: f64) -> &'static str {
+    use std::f64::consts::PI;
+    let sect = ((bearing.rem_euclid(2.0 * PI) / (PI / 4.0)).round() as usize) % 8;
+    [
+        "\u{2192}", "\u{2198}", "\u{2193}", "\u{2199}", "\u{2190}", "\u{2196}", "\u{2191}", "\u{2197}",
+    ][sect]
+}
+
+/// The answer-hint line for the prompt CARD + the readout: each option with its flick arrow, then
+/// pass. ONE source for both the announcement-card grammar and the UI readout hint, derived from the
+/// same `wedge_bearing` the wheel and the verdict use — so the hint can never disagree with the geometry.
+fn answer_hint(options: &[String]) -> String {
+    let n = options.len().max(1);
+    let mut parts: Vec<String> = options
+        .iter()
+        .enumerate()
+        .map(|(i, o)| format!("{} {}", dir_arrow(neuron::radial::wedge_bearing(i, n)), o))
+        .collect();
+    parts.push("pass".to_string());
+    parts.join(" \u{00b7} ")
 }
 
 /// Present ONE prompt, SIGNAL-FIRST — a beacon never forces a wheel open:
@@ -1765,16 +1789,26 @@ fn present(
     let phrase = neuron::feel::Phrase::hold(); // answering is always the plain hold — predictable
     let deadzone = cast.deadzone;
     let trigger_name = neuron::capture::vk_name(cast.trigger);
-    let signal = crate::overlay::WeaveMode::Signal {
-        label: p.text.clone(),
-        hint: format!(
-            "hold {trigger_name} \u{00b7} \u{2190} yes \u{00b7} \u{2192} no \u{00b7} \u{2195} pass"
-        ),
-    };
+    // built as its two REAL parts — how to engage, then the answer set — separated by a line break, so
+    // the wrapper keeps the options together on their own row instead of splitting the list mid-way.
+    // (Not a hardcoded row: it's the grammar's actual structure; the wrapper just honours the '\n'.)
+    let grammar = format!("hold {trigger_name}\n{}", answer_hint(&p.options));
 
-    overlay.begin(signal.clone());
+    // THE ONE PIPELINE — the ask ANNOUNCEMENT is now a PERSISTENT slot in the notifs stack (the same
+    // surface as confirmations + macro notifies), NOT a separate Signal overlay. It lives until a
+    // ClearAsk removes it. A drop guard clears it on EVERY exit (answered / passed / timeout / retire
+    // / stop / superseded) so a card can never strand. Only the interactive WHEEL (drawn on engage,
+    // below) stays on the beacon's own overlay — the one thing that stays separate.
+    crate::notifs::post_ask(p.pid, &p.macro_id, &p.text, &grammar);
+    struct ClearAsk(u64);
+    impl Drop for ClearAsk {
+        fn drop(&mut self) {
+            crate::notifs::clear_ask(self.0);
+        }
+    }
+    let _ask_card = ClearAsk(p.pid);
 
-    let verdict: Option<Flick> = loop {
+    let verdict: Option<usize> = loop {
         // stand down while the editor owns the trigger (recording a glyph / testing the wheel):
         // the ask keeps waiting — its strip stays up, its timeout still retires it via `stop`.
         while EDITOR_WEAVE.load(Ordering::SeqCst) && !stop.load(Ordering::SeqCst) {
@@ -1788,6 +1822,7 @@ fn present(
         let ov = &overlay;
         let label = p.text.clone();
         let detail = p.detail.clone();
+        let options = p.options.clone();
         let cancel = || {
             // BEAT the weave heartbeat + renew the click-guard deadman while the ask blocks — the
             // same as live_weave's predicate. The presenter is busy HERE during an ask (live_weave
@@ -1810,6 +1845,7 @@ fn present(
                     ov.begin(crate::overlay::WeaveMode::Ask {
                         label: label.clone(),
                         detail: detail.clone(),
+                        options: options.clone(),
                     });
                 }
                 let rel: Vec<(f32, f32)> = pts.iter().map(|c| (c.re as f32, c.im as f32)).collect();
@@ -1819,14 +1855,17 @@ fn present(
         if stop.load(Ordering::SeqCst) {
             break None; // retired (timeout / respawn / superseded) — no answer is sent
         }
-        match ask_answer(&path, deadzone) {
-            Some(flick) => break Some(flick),
+        let (dx, dy) = neuron::radial::net_displacement(&path);
+        let committed = (dx * dx + dy * dy).sqrt() >= deadzone;
+        match neuron::radial::pick_wedge(dx, dy, deadzone, p.options.len()) {
+            Some(idx) => break Some(idx), // a committed flick into an option wedge
+            None if committed => break None, // committed into a gap = a deliberate PASS → default
             None => {
-                // a bail: ESC, a motionless release, an under-deadzone flick, or an editor
-                // stand-down. The beacon keeps waiting — back to the quiet strip. (The sleep
-                // keeps a held ESC from spinning the capture loop hot.)
+                // a bail: ESC, a motionless release, an under-deadzone flick (held, thought, let go),
+                // or an editor stand-down. The persistent ask CARD stays up — only fade the WHEEL if
+                // it opened. (The sleep keeps a held ESC from spinning the capture loop hot.)
                 if engaged.get() {
-                    overlay.begin(signal.clone());
+                    overlay.end();
                 }
                 std::thread::sleep(std::time::Duration::from_millis(120));
                 continue;
@@ -1835,24 +1874,19 @@ fn present(
     };
 
     match verdict {
-        Some(flick) => {
-            let answer = match flick {
-                Flick::Yes => Some(true),
-                Flick::No => Some(false),
-                Flick::Pass => None,
-            };
-            macro_host().answer(p.pid, answer);
-            overlay.recognized(answer.is_some());
-            let line = match flick {
-                Flick::Yes => format!("beacon \u{2192} YES \u{00b7} {}", p.text),
-                Flick::No => format!("beacon \u{2192} NO \u{00b7} {}", p.text),
-                Flick::Pass => format!("beacon passed \u{00b7} {}", p.text),
-            };
-            post_status(weak, line);
+        Some(idx) => {
+            macro_host().answer(p.pid, Some(idx));
+            overlay.recognized(true);
+            let picked = p.options.get(idx).map(String::as_str).unwrap_or("?");
+            post_status(weak, format!("beacon \u{2192} {picked} \u{00b7} {}", p.text));
         }
         None => {
+            // passed, or retired without a flick (timeout / supersede / link loss). Hand the macro
+            // its default NOW so an abandoned prompt never pins the worker until the full sidecar-side
+            // timeout — harmless if the sidecar already timed out or died (an expired pid is ignored).
+            macro_host().answer(p.pid, None);
             overlay.recognized(false);
-            post_status(weak, format!("beacon expired \u{00b7} {}", p.text));
+            post_status(weak, format!("beacon passed \u{00b7} {}", p.text));
         }
     }
     // the flare/fizzle fades on its own render thread — the overlay is persistent (the
@@ -1861,25 +1895,10 @@ fn present(
     mirror_active(weak, shared, None);
 }
 
-/// The ask verdict rule — THE single place a flick becomes a verdict, and by construction the
-/// same quadrant rule the overlay highlights with: horizontal-dominant WEST = YES, EAST = NO,
-/// vertical-dominant = PASS, under the deadzone = no verdict (bail). Pure so it's testable
-/// without input. (YES sits on the LEFT — flick toward your accent.)
-fn ask_answer(path: &[neuron::glyph::C], deadzone: f64) -> Option<Flick> {
-    let (dx, dy) = neuron::radial::net_displacement(path);
-    if (dx * dx + dy * dy).sqrt() < deadzone {
-        return None;
-    }
-    Some(if dx.abs() > dy.abs() {
-        if dx < 0.0 {
-            Flick::Yes
-        } else {
-            Flick::No
-        }
-    } else {
-        Flick::Pass
-    })
-}
+// The verdict rule now lives in ONE place for every prompt: `neuron::radial::pick_wedge` (the radial
+// core, specialized for answering). The beacon verdict AND the overlay highlight both read it, so they
+// can never disagree; N=2 reproduces the legacy WEST=yes / EAST=no / vertical=pass exactly (proven by
+// `radial::tests::prompt_wheel_is_exactly_yes_no_pass_at_n2`).
 
 /// Mirror the presented prompt (or its absence) into the UI: the header pill + the readout.
 fn mirror_active(weak: &slint::Weak<AppWindow>, shared: &Shared, p: Option<&Prompt>) {
@@ -1887,7 +1906,7 @@ fn mirror_active(weak: &slint::Weak<AppWindow>, shared: &Shared, p: Option<&Prom
         Some(p) => (
             true,
             format!("{} \u{00b7} {}", p.macro_id, p.text),
-            "hold the cast trigger \u{00b7} \u{2192} yes \u{00b7} \u{2190} no \u{00b7} \u{2195} pass".to_string(),
+            "hold the cast trigger\n\u{2192} yes \u{00b7} \u{2190} no \u{00b7} \u{2195} pass".to_string(),
             p.macro_id.clone(),
         ),
         None => (false, String::new(), String::new(), String::new()),
@@ -1961,64 +1980,37 @@ pub(crate) fn post_status(weak: &slint::Weak<AppWindow>, line: String) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use neuron::glyph::C;
 
     fn path(dx: f64, dy: f64) -> Vec<C> {
         vec![C::new(0.0, 0.0), C::new(dx / 2.0, dy / 2.0), C::new(dx, dy)]
     }
 
-    /// WEST = YES, east = NO, vertical = PASS, deadzone = bail — the one verdict rule, exactly as
-    /// the overlay lights (quadrants on |dx| vs |dy|). YES is on the LEFT.
-    #[test]
-    fn ask_answer_maps_the_quadrants() {
-        assert_eq!(
-            ask_answer(&path(-80.0, 0.0), 40.0),
-            Some(Flick::Yes),
-            "west flick = yes"
-        );
-        assert_eq!(
-            ask_answer(&path(80.0, 0.0), 40.0),
-            Some(Flick::No),
-            "east flick = no"
-        );
-        assert_eq!(
-            ask_answer(&path(-70.0, -50.0), 40.0),
-            Some(Flick::Yes),
-            "WNW = yes (west-dominant)"
-        );
-        assert_eq!(
-            ask_answer(&path(70.0, 50.0), 40.0),
-            Some(Flick::No),
-            "ESE = no (east-dominant)"
-        );
-        assert_eq!(
-            ask_answer(&path(0.0, -120.0), 40.0),
-            Some(Flick::Pass),
-            "up = pass"
-        );
-        assert_eq!(
-            ask_answer(&path(10.0, 110.0), 40.0),
-            Some(Flick::Pass),
-            "down = pass"
-        );
-        assert_eq!(
-            ask_answer(&path(50.0, -60.0), 40.0),
-            Some(Flick::Pass),
-            "vertical-dominant diagonal = pass"
-        );
+    /// The yes/no prompt (N=2) is the radial core's `pick_wedge`: WEST = yes(0), east = no(1),
+    /// vertical/gap = pass (None), exactly as the overlay lights and the legacy rule did. YES on the
+    /// LEFT. (The pure geometry is proven in `neuron::radial::tests`; here we cover the beacon's own
+    /// path → net_displacement → pick_wedge usage.)
+    fn pick2(dx: f64, dy: f64) -> Option<usize> {
+        let (x, y) = neuron::radial::net_displacement(&path(dx, dy));
+        neuron::radial::pick_wedge(x, y, 40.0, 2)
     }
 
-    /// A flick under the deadzone (or no motion at all) must never commit a verdict — a bail
-    /// re-arms the wheel; nothing resolves a beacon by accident.
     #[test]
-    fn ask_answer_deadzone_is_a_bail() {
-        assert_eq!(
-            ask_answer(&path(10.0, 5.0), 40.0),
-            None,
-            "tiny flick = bail"
-        );
-        assert_eq!(ask_answer(&[], 40.0), None, "empty path = bail");
-        assert_eq!(ask_answer(&path(0.0, 0.0), 40.0), None, "no motion = bail");
+    fn yes_no_prompt_maps_the_quadrants() {
+        assert_eq!(pick2(-80.0, 0.0), Some(0), "west flick = yes");
+        assert_eq!(pick2(80.0, 0.0), Some(1), "east flick = no");
+        assert_eq!(pick2(-70.0, -50.0), Some(0), "WNW = yes (west-dominant)");
+        assert_eq!(pick2(70.0, 50.0), Some(1), "ESE = no (east-dominant)");
+        assert_eq!(pick2(0.0, -120.0), None, "up = pass");
+        assert_eq!(pick2(10.0, 110.0), None, "down = pass");
+        assert_eq!(pick2(50.0, -60.0), None, "vertical-dominant diagonal = pass");
+    }
+
+    /// Under the deadzone (or no motion) never picks a wedge. The beacon separates this BAIL (re-arm,
+    /// the prompt stays up) from a committed gap-flick (a deliberate PASS) by the flick magnitude.
+    #[test]
+    fn under_deadzone_picks_nothing() {
+        assert_eq!(pick2(10.0, 5.0), None, "tiny flick");
+        assert_eq!(neuron::radial::pick_wedge(0.0, 0.0, 40.0, 2), None, "no motion");
     }
 }

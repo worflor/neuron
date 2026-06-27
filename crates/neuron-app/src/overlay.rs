@@ -141,6 +141,19 @@ pub enum WedgeGlyph {
     Screen,
     /// CURTAIN — a draped curtain (rod + folds + scalloped hem): the panic privacy screen.
     Curtain,
+    /// POLLING — a frequency mark: three rising bars (a tiny ▮▮▮ spectrum), the report-rate cue
+    /// on a notification card.
+    Pulse,
+    /// BRIGHTNESS — a sun: a small filled disc with radiating rays, the light-level cue.
+    Sun,
+    /// BATTERY — a battery cell (rounded body + terminal nub + charge bars): the power/charge cue.
+    Battery,
+    /// ASK — a question mark: a clean procedural prompt mark (a curling head over a baseline dot),
+    /// the beacon's ask-announcement chip.
+    Ask,
+    /// SIDE PLATE — a swappable hardware module: a chip frame with a small grid of button pips, the
+    /// side-plate attach/detach cue. Reads as "a hardware piece", distinct from the battery cell.
+    SidePlate,
     Blank,
 }
 
@@ -208,28 +221,27 @@ pub enum WeaveMode {
     },
     Ask {
         label: String,
+        /// The answer wheel's options (the wedges) — the prompt IS this list + the radial core. N=2
+        /// is yes/no, N≥3 a radial menu, N=1 a confirm; the renderer draws whatever it's given.
+        options: Vec<String>,
         detail: String,
     },
-    Signal {
-        label: String,
-        hint: String,
-    },
-    /// A NOTIFICATION CARD — a state-change confirmation, drawn in the exact `Signal` card grammar
-    /// (see `draw_card`) but PLACED by the notification engine and shown on its OWN overlay
-    /// instance, so it never clobbers a live weave. `title` rides the accent; `body` is the value /
-    /// old→new line beneath. Placed by the free `(nx, ny)` anchor below — the four corner presets
-    /// resolve to {0,1}², and the in-line preset (0.5, 0) snaps onto the Signal/beacon strip.
-    Notify {
-        title: String,
-        body: String,
-        /// the card anchor as a fraction of the monitor work-area: (0,0) top-left … (1,1)
-        /// bottom-right, (0.5,0) top-centre. Hand-placeable, not a fixed corner code.
-        nx: f32,
-        ny: f32,
-        /// Draw the grounded squircle panel (app-card chrome) behind the content; false = the
-        /// floating spell look (soft lozenge only).
-        panel: bool,
-    },
+    /// THE MULTI-NOTIFICATION SURFACE — an identity-coalesced STACK of state-change confirmation +
+    /// macro-notify cards, drawn in the card grammar (`draw_notify_stack`, reusing the beacon ask's
+    /// `card_frame`/`chip_box` chrome) and PLACED by the notification engine on its OWN overlay
+    /// instance, so it never clobbers a live weave. The engine ([`crate::notifs`]) holds the live set
+    /// and pushes the WHOLE list here each tick (via [`SpellOverlay::stack`]), with every slot's
+    /// animation already eased off its clock — the overlay is a pure renderer of the given frame.
+    /// Three presentations (a reflowing column / a single-card swap / a digest summary) all share the
+    /// card chrome; the content reads as a value HIERARCHY (per-type `glyph` + small dim title + LARGE
+    /// value wrapping to ≤3 lines + the track-bar + tiny dim prev). ALL colour is the live material
+    /// accent — the type identity rides the GLYPH alone, never a hardcoded per-kind colour.
+    ///
+    /// A fieldless MARKER: the live stack's content (slots / mode / corner / digest / tail) all flow
+    /// through [`Cmd::Stack`] into the render thread's cached state (so text rasters survive across the
+    /// engine's 60fps pushes); this variant only tells the render loop "the surface is a notification
+    /// stack" for its cover / draw / placement arms. (The ask wheel + Signal strip are untouched.)
+    NotifyStack,
     /// the DIAL — an analog knob the eigenmotion stroke drives. A 270° arc fills to `fill` (0..1);
     /// `value` is the reading ("62%"), `device` the endpoint being turned ("Headset"), `mic` picks
     /// the target icon (mic vs speaker), `muted` rings it red, and `glow` (0..1) pulses with how
@@ -309,6 +321,82 @@ pub enum WeaveMode {
     },
 }
 
+/// One card in a [`WeaveMode::NotifyStack`]. Carries the card's content (the same value-hierarchy
+/// the single `Notify` card draws) PLUS the per-slot animation the engine has already eased off its
+/// own clock — the overlay just rasterizes the text (cached by `ident`+`rev`) and draws at the given
+/// `y`/`alpha`/`scale`/`collapse`. The engine owns ALL timing; this struct is one rendered frame of
+/// one card.
+#[derive(Clone, Debug)]
+pub struct NotifySlot {
+    /// the coalesce key — also the overlay's raster cache key (re-rasterize when `rev` changes).
+    pub ident: String,
+    /// bumped by the engine whenever this slot's text content changes, so the overlay knows to
+    /// re-rasterize (and not on every 60fps push) — "rasterize per content-change, not per frame".
+    pub rev: u64,
+    pub title: String,
+    pub value: String,
+    /// the old reading, already prefixed for its grammar ("was 800" / "← chill"); "" = none.
+    pub prev: String,
+    pub glyph: WedgeGlyph,
+    /// ranged-change direction for the ↑/↓ cue: -1 down, 0 none, +1 up.
+    pub dir: i8,
+    /// the new value's position on its 0..1 track (the track-bar fill); `< 0` = none (discrete).
+    pub fill: f32,
+    /// the OLD value's position on the same track (the tick); `< 0` = unknown/none.
+    pub prev_fill: f32,
+    /// Draw the grounded squircle panel behind the card (vs the floating lozenge).
+    pub panel: bool,
+    /// THE ASK card: a beacon's `neuron.ask(...)` announcement, drawn in the ASK layout (the `?`/Ask
+    /// glyph + the prominent question + the answer-grammar row) instead of the value-hierarchy. It's
+    /// a persistent slot in the same stack — the one informational pipeline — and only the answer
+    /// WHEEL is a separate surface. `false` for every confirmation / macro-notify card.
+    pub is_ask: bool,
+    /// the slot's animated TOP-offset from the column's corner edge, in px (the engine's eased
+    /// reflow target — neighbours glide when one enters/leaves). 0 = nearest the corner.
+    pub y: f32,
+    /// entry/exit fade 0..1 (eased: 0 just-spawned/just-gone, 1 settled).
+    pub alpha: f32,
+    /// coalesce-bump scale (≈1.0 settled, up to ~1.06 on a fresh update pulse).
+    pub scale: f32,
+    /// exit height-collapse 0..1 (0 = full height, 1 = fully collapsed so the column closes the gap).
+    pub collapse: f32,
+    /// a transient value-FLASH 0..1 (a brief bright pulse on the value when this slot coalesced).
+    pub bump: f32,
+}
+
+/// The DIGEST summary card's view (see [`WeaveMode::NotifyStack`]). Drawn only in digest mode when
+/// >1 note is live: a big COUNT, a ROW of the distinct source glyphs (deduped by kind), and the
+/// latest note's title/value line. Its own alpha/scale animate the calm-count reveal.
+#[derive(Clone, Debug)]
+pub struct DigestView {
+    /// how many notes are live (0 = no digest; render the single live slot as a plain card instead).
+    pub count: u32,
+    /// the DISTINCT source glyphs, deduped by kind, in first-seen order (the "what fired" row).
+    pub glyphs: Vec<WedgeGlyph>,
+    /// the latest note's title (the noun line under the count).
+    pub title: String,
+    /// the latest note's value (the headline line).
+    pub value: String,
+    /// the summary card's fade 0..1.
+    pub alpha: f32,
+    /// the expand-on-settle reveal 0..1 (the glyph row + line slide open as the count lands).
+    pub reveal: f32,
+}
+
+impl DigestView {
+    /// The empty digest — no summary (the lone live slot is drawn as a plain card).
+    pub fn none() -> Self {
+        DigestView {
+            count: 0,
+            glyphs: Vec::new(),
+            title: String::new(),
+            value: String::new(),
+            alpha: 0.0,
+            reveal: 0.0,
+        }
+    }
+}
+
 /// One beat on the [`WeaveMode::Twin`] stage. Stage-relative position; `rgb` in 0..=1; `kind`:
 /// 0 = player construct, 1 = twin construct, 2 = twin flourish (warmer, +1 facet),
 /// 3 = the open blueprint (unbuilt wireframe — answer here), 4 = materializing (the strike
@@ -332,7 +420,7 @@ pub use stub::SpellOverlay;
 
 #[cfg(not(windows))]
 mod stub {
-    use super::{GlyphHint, WeaveMode};
+    use super::{DigestView, GlyphHint, NotifySlot, WeaveMode};
     /// No-op overlay until the per-OS body lands (see module docs).
     pub struct SpellOverlay;
     impl SpellOverlay {
@@ -343,13 +431,22 @@ mod stub {
         pub fn push(&self, _pts: Vec<(f32, f32)>) {}
         pub fn hint(&self, _hint: Option<GlyphHint>) {}
         pub fn recognized(&self, _hit: bool) {}
+        pub fn stack(
+            &self,
+            _slots: Vec<NotifySlot>,
+            _mode: u8,
+            _corner: (f32, f32),
+            _d: DigestView,
+            _tail: u32,
+        ) {
+        }
         pub fn end(&self) {}
     }
 }
 
 #[cfg(windows)]
 mod imp {
-    use super::{GlyphHint, Tone, WeaveMode, WedgeGlyph};
+    use super::{DigestView, GlyphHint, NotifySlot, Tone, WeaveMode, WedgeGlyph};
     use std::f32::consts::TAU;
     use std::sync::mpsc::{channel, Sender};
     use std::thread::JoinHandle;
@@ -381,19 +478,13 @@ mod imp {
     const H: i32 = 1600;
     const CX: f32 = (W / 2) as f32;
     const CY: f32 = (H / 2) as f32;
-    // INVARIANT (enforced below): the card is drawn at buffer x = CX, and the in-line notification
-    // preset relies on CX being the screen midpoint so `window_x + CX` lands exactly where Signal's
-    // `(l+r)/2` does. Keep CX == W/2 — decoupling it would silently drift the inline notification off
-    // the beacon strip while the corner presets stayed correct (see `place_window`'s Notify arm).
+    // INVARIANT (enforced below): every cursor-anchored weave (the ask wheel, the radial, the dial,
+    // …) draws around buffer (CX, CY) and `place_window` centres the window on the cursor as
+    // `cur - W/2`, so the anchor lands exactly under the cursor only while CX == W/2. Keep them equal.
     const _: () = assert!(
         CX == (W / 2) as f32,
-        "CX must equal W/2: the in-line notification placement depends on it (see place_window)"
+        "CX must equal W/2: the cursor-anchored weaves depend on it (see place_window)"
     );
-    // The beacon/Signal strip's window-Y offset. Shared by BOTH the `Signal` arm and the in-line
-    // notification arm of `place_window` (one source of truth) so they can't drift apart — an inline
-    // notification must land exactly where a beacon ask does. (The card's BUFFER anchor is already
-    // shared too: Signal and Notify both draw via `draw_card`, so only this window-Y could diverge.)
-    const STRIP_Y: i32 = 14;
     // colour lives in the spellweaving material now (crate::weave) — the accent (the old phosphor),
     // the honey body ramp, and the warn red are all theme data, not constants here.
 
@@ -595,6 +686,12 @@ mod imp {
         Push(Vec<(f32, f32)>),
         Hint(Option<GlyphHint>),
         Recognized(bool),
+        /// Update the live notification STACK in place (the engine's per-tick frame): the whole slot
+        /// list + its presentation mode + the real placement `(nx, ny)` + the digest view. Unlike
+        /// `Begin` this does NOT reset the frame clock or re-anchor at the cursor — the engine drives
+        /// the animation and the overlay keeps its breath/topmost cadence, re-rasterizing a slot only
+        /// when its `rev` moved.
+        Stack(Vec<NotifySlot>, u8, (f32, f32), DigestView, u32),
         End,
         Quit,
     }
@@ -634,6 +731,22 @@ mod imp {
         /// Flare on a recognized glyph / committed radial pick, or a soft fizzle on a miss.
         pub fn recognized(&self, hit: bool) {
             let _ = self.tx.send(Cmd::Recognized(hit));
+        }
+        /// Push one engine FRAME of the notification stack: the live slots (each with its animation
+        /// state already eased), the presentation `mode` (0 stack / 1 latest / 2 digest), the user's
+        /// REAL placement `(nx, ny)` fractions (NOT a snapped corner — the column block is centred on
+        /// `nx` and grows from `ny`), and the digest view. Called ~60Hz by the engine while any note
+        /// is alive; the overlay renders exactly this, re-rasterizing a slot's text only when `rev`
+        /// changed.
+        pub fn stack(
+            &self,
+            slots: Vec<NotifySlot>,
+            mode: u8,
+            place: (f32, f32),
+            digest: DigestView,
+            tail: u32,
+        ) {
+            let _ = self.tx.send(Cmd::Stack(slots, mode, place, digest, tail));
         }
         /// Begin the fade-out, then hide.
         pub fn end(&self) {
@@ -1079,14 +1192,20 @@ mod imp {
             // ask/signal captions, rasterized once per Begin (the question + the YES/NO/PASS rims).
             let mut ask_label: Option<TextRaster> = None;
             let mut ask_detail: Option<TextRaster> = None; // optional context under the wheel
-            let mut ask_yes: Option<TextRaster> = None;
-            let mut ask_no: Option<TextRaster> = None;
             let mut ask_pass: Option<TextRaster> = None;
-            let mut sig_label: Option<TextRaster> = None;
-            let mut sig_hint: Option<TextRaster> = None;
-            // the notification card's title + value line, rasterized once per Begin (same as Signal).
-            let mut notify_label: Option<TextRaster> = None;
-            let mut notify_hint: Option<TextRaster> = None;
+            // one rasterized label per option wedge (yes/no, or the N choose labels) — the wheel is data.
+            let mut ask_opts: Vec<Option<TextRaster>> = Vec::new();
+            // the MULTI-notification STACK: the live cards (rasters cached by ident+rev across the
+            // engine's 60fps pushes), the presentation mode (0 stack / 1 latest / 2 digest), the
+            // corner anchor, and the rasterized digest summary. Driven by `Cmd::Stack`, NOT `Begin`,
+            // so the engine owns the animation and the overlay keeps its own clock.
+            let mut stack_cards: Vec<NotifyR> = Vec::new();
+            let mut stack_mode_kind: u8 = 0;
+            // the user's REAL placement fractions (nx, ny) — the column is centred on nx (clamped
+            // on-screen) and grows from ny (top half → down, bottom half → up). NOT a snapped corner.
+            let mut stack_place: (f32, f32) = (0.5, 0.0);
+            let mut stack_digest: Option<DigestR> = None;
+            let mut stack_tail: u32 = 0; // Stack-mode overflow count (the "+N more" tail)
             // the wheel's live instrument cards (icon + value + title), rasterized once per Begin
             let mut wedge_views: Vec<WedgeR> = Vec::new();
             // the second tier: per-wedge fan option rasters (index = sector; empty = no fan)
@@ -1149,13 +1268,8 @@ mod imp {
                             // ask/signal modes carry captions: rasterize once, composite per frame.
                             ask_label = None;
                             ask_detail = None;
-                            ask_yes = None;
-                            ask_no = None;
                             ask_pass = None;
-                            sig_label = None;
-                            sig_hint = None;
-                            notify_label = None;
-                            notify_hint = None;
+                            ask_opts.clear();
                             wedge_views.clear();
                             fan_labels.clear();
                             dial_value = None;
@@ -1164,22 +1278,31 @@ mod imp {
                             ctl_ssid = None;
                             glyph_hint_title = None;
                             match &m {
-                                WeaveMode::Ask { label, detail } => {
+                                WeaveMode::Ask {
+                                    label,
+                                    options,
+                                    detail,
+                                } => {
                                     ask_label = rasterize_text(&ellipsize(label, 52), 17);
                                     if !detail.trim().is_empty() {
                                         ask_detail = rasterize_text(&ellipsize(detail, 72), 12);
                                     }
-                                    ask_yes = rasterize_text("YES", 13);
-                                    ask_no = rasterize_text("NO", 13);
-                                    ask_pass = rasterize_text("PASS", 12);
-                                }
-                                WeaveMode::Signal { label, hint } => {
-                                    sig_label = rasterize_text(&ellipsize(label, 56), 16);
-                                    sig_hint = rasterize_text(&ellipsize(hint, 64), 12);
-                                }
-                                WeaveMode::Notify { title, body, .. } => {
-                                    notify_label = rasterize_text(&ellipsize(title, 56), 16);
-                                    notify_hint = rasterize_text(&ellipsize(body, 64), 12);
+                                    ask_pass = rasterize_text("pass", 12);
+                                    // scale the per-label char budget to the wheel — fewer chars for
+                                    // more wedges — so adjacent labels never overlap around the ring
+                                    // (chord between neighbours = 2·r·sin(π/n) at the label radius).
+                                    let n = options.len().max(1);
+                                    let budget = if n <= 1 {
+                                        16
+                                    } else {
+                                        ((2.0 * 93.0 * (std::f64::consts::PI / n as f64).sin() / 8.0)
+                                            as usize)
+                                            .clamp(5, 16)
+                                    };
+                                    ask_opts = options
+                                        .iter()
+                                        .map(|o| rasterize_text(&ellipsize(o, budget), 13))
+                                        .collect();
                                 }
                                 WeaveMode::Radial { widgets, fans, .. } => {
                                     // each wedge → a render-ready card (icon kept procedural; the
@@ -1299,16 +1422,7 @@ mod imp {
                             if !same_kind {
                                 let mut cur = POINT { x: 0, y: 0 };
                                 GetCursorPos(&mut cur);
-                                // notifications need their card width to land flush in a corner.
-                                let ch = if let WeaveMode::Notify { .. } = &mode {
-                                    card_half(
-                                        notify_label.as_ref().map(|t| t.w).unwrap_or(0) as f32,
-                                        notify_hint.as_ref().map(|t| t.w).unwrap_or(0) as f32,
-                                    )
-                                } else {
-                                    0.0
-                                };
-                                origin = place_window(&mode, cur, ch);
+                                origin = place_window(&mode, cur);
                                 // move, then force to the VERY TOP of the topmost band (above the
                                 // taskbar/shell): a plain HWND_TOPMOST on an already-topmost window
                                 // won't reorder it above other topmost windows, so drop topmost and
@@ -1384,6 +1498,142 @@ mod imp {
                                 }
                             } else {
                                 flare = 0.3;
+                            }
+                        }
+                        Cmd::Stack(slots, smode, place, digest, tail) => {
+                            // ONE engine frame of the notification stack. Reconcile the rasters
+                            // against the new slot list — reuse a cached card when its ident+rev are
+                            // unchanged (re-cut text only when the engine bumped `rev`), so the 60fps
+                            // push costs no rasterization once content is steady. The animation
+                            // (y/alpha/scale/collapse/bump) is copied EVERY push — it changes per
+                            // frame, the text does not.
+                            let mut next: Vec<NotifyR> = Vec::with_capacity(slots.len());
+                            for s in &slots {
+                                // find a reusable cached card (same ident, same rev)
+                                let reuse_pos = stack_cards
+                                    .iter()
+                                    .position(|c| c.ident == s.ident && c.rev == s.rev);
+                                let mut card = if let Some(p) = reuse_pos {
+                                    stack_cards.swap_remove(p) // take ownership of the cached rasters
+                                } else {
+                                    // new ident OR changed content → rasterize. value LARGE (22px,
+                                    // the headline), title small (13px), the body wrapped to ≤3 rows
+                                    // (15px) so a meatier line breathes, prev tiny (11px).
+                                    // ASK card: the question is the PROMINENT line (the value, drawn
+                                    // big) and the grammar is its own legible row (carried in `prev`,
+                                    // wider ellipsis since it's a full grammar line, not a tiny "was
+                                    // X"). The body wrap is skipped for an ask (its layout is fixed:
+                                    // question row + grammar row), so an ask card is a clean 2-row
+                                    // prompt, not a 3-line value block.
+                                    let is_ask = s.is_ask;
+                                    NotifyR {
+                                        ident: s.ident.clone(),
+                                        rev: s.rev,
+                                        glyph: s.glyph,
+                                        dir: s.dir,
+                                        fill: s.fill,
+                                        prev_fill: s.prev_fill,
+                                        panel: s.panel,
+                                        is_ask,
+                                        title: rasterize_text(&ellipsize(&s.title, 24), 13),
+                                        value: rasterize_text(
+                                            &ellipsize(&s.value, if is_ask { 26 } else { 18 }),
+                                            if is_ask { 16 } else { 22 },
+                                        ),
+                                        body: if is_ask {
+                                            // the answer GRAMMAR, WRAPPED to lines that fit the card
+                                            // width — never spilling past the edge — each its own row.
+                                            wrap_lines(&s.prev, 30, 3)
+                                                .iter()
+                                                .filter_map(|l| rasterize_text(l, 13))
+                                                .collect()
+                                        } else {
+                                            wrap_lines(&s.value, 28, 3)
+                                                .iter()
+                                                .filter_map(|l| rasterize_text(l, 15))
+                                                .collect()
+                                        },
+                                        prev: if is_ask || s.prev.is_empty() {
+                                            None
+                                        } else {
+                                            rasterize_text(&ellipsize(&s.prev, 24), 11)
+                                        },
+                                        y: s.y,
+                                        alpha: s.alpha,
+                                        scale: s.scale,
+                                        collapse: s.collapse,
+                                        bump: s.bump,
+                                    }
+                                };
+                                // refresh the per-frame draw + animation fields (cheap copies)
+                                card.glyph = s.glyph;
+                                card.dir = s.dir;
+                                card.fill = s.fill;
+                                card.prev_fill = s.prev_fill;
+                                card.panel = s.panel;
+                                card.is_ask = s.is_ask;
+                                card.y = s.y;
+                                card.alpha = s.alpha;
+                                card.scale = s.scale;
+                                card.collapse = s.collapse;
+                                card.bump = s.bump;
+                                next.push(card);
+                            }
+                            stack_cards = next;
+                            stack_mode_kind = smode;
+                            stack_place = place;
+                            stack_tail = tail;
+                            // the digest summary — re-rasterize the count/line only when they change.
+                            stack_digest = if digest.count == 0 {
+                                None
+                            } else {
+                                let keep = stack_digest.as_ref().is_some_and(|d| {
+                                    d.count == digest.count
+                                        && d.glyphs == digest.glyphs
+                                });
+                                let reuse = if keep { stack_digest.take() } else { None };
+                                let (count_txt, title, value) = match reuse {
+                                    Some(d) => (d.count_txt, d.title, d.value),
+                                    None => (
+                                        rasterize_text(&format!("{}", digest.count), 30),
+                                        rasterize_text(&ellipsize(&digest.title, 24), 13),
+                                        rasterize_text(&ellipsize(&digest.value, 22), 18),
+                                    ),
+                                };
+                                Some(DigestR {
+                                    count: digest.count,
+                                    glyphs: digest.glyphs.clone(),
+                                    count_txt,
+                                    title,
+                                    value,
+                                    alpha: digest.alpha,
+                                    reveal: digest.reveal,
+                                })
+                            };
+                            // the window must SIZE to the stack's bounding box and sit at the chosen
+                            // monitor corner; recompute the origin and only move when it changed (so
+                            // a steady stack doesn't thrash SetWindowPos every frame).
+                            let mut cur = POINT { x: 0, y: 0 };
+                            GetCursorPos(&mut cur);
+                            let new_origin = stack_origin(place, cur);
+                            let switched = !matches!(mode, WeaveMode::NotifyStack);
+                            mode = WeaveMode::NotifyStack;
+                            if switched || new_origin.x != origin.x || new_origin.y != origin.y {
+                                origin = new_origin;
+                                SetWindowPos(
+                                    hwnd, HWND_NOTOPMOST, origin.x, origin.y, W, H, SWP_NOACTIVATE,
+                                );
+                                SetWindowPos(
+                                    hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                                );
+                                full_redraw = true;
+                            }
+                            if !visible {
+                                visible = true;
+                                fade = 1.0;
+                                fading = false;
+                                ShowWindow(hwnd, SW_SHOWNOACTIVATE);
                             }
                         }
                         Cmd::End => {
@@ -1481,23 +1731,43 @@ mod imp {
                     // ring); the marched stroke + its ghost + the rune-ring bands + embers are the only
                     // things that run far — and they're CURVES, so their cover is O(stroke length).
                     let mut lit = TileSet::new();
-                    if matches!(mode, WeaveMode::Signal { .. }) {
-                        // the idle SIGNAL strip is a ONE-LINE band near the top — not anchor-centred,
-                        // but tiny. It used to `fill_all()`, which made the per-frame CLEAR a whole-buffer
-                        // ~10MB memset (and the composite walk every tile) EVERY frame — that was the
-                        // beacon's lag, the one thing a glyph stroke (a tight O(stroke) cover) never paid.
-                        // Bound the cover to the strip's actual box so it's as cheap as any other weave.
-                        let lw = sig_label.as_ref().map(|t| t.w).unwrap_or(0) as f32;
-                        let hw = sig_hint.as_ref().map(|t| t.w).unwrap_or(0) as f32;
-                        let half = card_half(lw, hw); // SINGLE source of truth — see `draw_card`
-                        lit.set_box(CX - half, 8.0, CX + half, 80.0);
-                    } else if matches!(mode, WeaveMode::Notify { .. }) {
-                        // the notification card — the same grammar and the same bounded cover as the
-                        // Signal strip; only `place_window` differs, putting it in a corner.
-                        let lw = notify_label.as_ref().map(|t| t.w).unwrap_or(0) as f32;
-                        let hw = notify_hint.as_ref().map(|t| t.w).unwrap_or(0) as f32;
-                        let half = card_half(lw, hw);
-                        lit.set_box(CX - half, 8.0, CX + half, 80.0);
+                    if matches!(mode, WeaveMode::NotifyStack) {
+                        // the STACK column — mark only the boxes the live cards actually occupy (each
+                        // card's animated y + its body-driven height), so the cover scales with the
+                        // column, not the buffer. The x-span is the fixed card block; y grows DOWN for
+                        // a top corner, UP for a bottom corner (the engine's `y` is the distance from
+                        // the corner edge). A small margin covers the feather + the bump scale-up.
+                        let top_corner = stack_place.1 < 0.5;
+                        let xl = STACK_AX - STACK_HALF - 6.0;
+                        let xr = STACK_AX + STACK_HALF + 6.0;
+                        let anchor = if top_corner { STACK_AY_TOP } else { STACK_AY_BOT };
+                        let card_h = |c: &NotifyR| notify_layout(c).height * (1.0 - c.collapse);
+                        for c in &stack_cards {
+                            let h = card_h(c) + 8.0;
+                            if top_corner {
+                                let y0 = anchor + c.y;
+                                lit.set_box(xl, y0 - 4.0, xr, y0 + h);
+                            } else {
+                                let y1 = anchor - c.y;
+                                lit.set_box(xl, y1 - h, xr, y1 + 4.0);
+                            }
+                        }
+                        // the digest summary occupies its own taller box at the anchor.
+                        if stack_digest.is_some() {
+                            if top_corner {
+                                lit.set_box(xl, anchor - 4.0, xr, anchor + 96.0);
+                            } else {
+                                lit.set_box(xl, anchor - 96.0, xr, anchor + 4.0);
+                            }
+                        }
+                        // the +N tail pill, when the stack overflowed (cover a row past the last card).
+                        // (Marked generously: the tail sits just beyond the deepest card.)
+                        let deepest = stack_cards.iter().map(|c| c.y + card_h(c)).fold(0.0, f32::max);
+                        if top_corner {
+                            lit.set_box(xl, anchor + deepest, xr, anchor + deepest + STACK_TAIL_H + 8.0);
+                        } else {
+                            lit.set_box(xl, anchor - deepest - STACK_TAIL_H - 8.0, xr, anchor - deepest);
+                        }
                     } else {
                         // the fixed footprint (matches the old ±290 floor, rounded to tiles).
                         lit.set_box(CX - 290.0, CY - 290.0, CX + 290.0, CY + 290.0);
@@ -1582,11 +1852,11 @@ mod imp {
                     }
 
                     // anchor charge-glow: a soft channeling pool, gentle deterministic breathe.
-                    // (not for the signal strip — a quiet notice has no channeling anchor — and
+                    // (not for the notification stack — a quiet notice has no channeling anchor — and
                     // not for the knockback stage, whose anchor is the FAMILIAR, not the cursor.)
                     if !matches!(
                         mode,
-                        WeaveMode::Signal { .. } | WeaveMode::Twin { .. } | WeaveMode::Notify { .. }
+                        WeaveMode::Twin { .. } | WeaveMode::NotifyStack
                     ) {
                         let breathe = 0.85 + 0.15 * ((frame as f32) * 0.12).sin();
                         splat_glow(&mut buf.glow, CX, CY, 26.0, 0.16 * charge * breathe);
@@ -2124,27 +2394,14 @@ mod imp {
                             }
                         }
                         WeaveMode::Ask { .. } => {
-                            // the beacon: answered by COLOR — accent WEST = yes, material east = no,
-                            // VERTICAL = pass (the macro gets its default; "not now" must always
-                            // be one flick away). Idle it breathes; the aimed zone goes hot. The
-                            // quadrant rule (|dx| vs |dy|) is the EXACT rule the beacon service
-                            // commits with, so highlight and answer can never disagree.
+                            // the PROMPT: the radial core specialized for answering. ONE wheel for
+                            // yes/no (N=2: accent WEST = yes, material east = no, vertical = pass), an
+                            // N-way choose, or a confirm — the wedges ARE the option list. The highlight
+                            // reads `radial::pick_wedge`, the SAME rule the beacon commits with, so what
+                            // lights up and what the macro receives can never disagree.
                             let aim = points.last().copied().unwrap_or((0.0, 0.0));
-                            let live = if aim.0.abs() + aim.1.abs() < 6.0 {
-                                -1 // deadzone — nothing aimed yet
-                            } else if aim.0.abs() > aim.1.abs() {
-                                if aim.0 < 0.0 {
-                                    0
-                                } else {
-                                    1
-                                } // west = yes, east = no
-                            } else {
-                                2 // vertical-dominant = pass
-                            };
-                            let aim_south = aim.1 > 0.0;
-                            // YES wears the user's weave accent (the affirm colour); pull it once here.
                             let accent = crate::weave::live_material().accent;
-                            ask_wheel(&mut buf, live, aim_south, frame, flare, accent);
+                            prompt_wheel(&mut buf, &ask_opts, aim, frame, flare, accent);
                             // ALL beacon text is the WEAVE MATERIAL: the glow channel is what runs
                             // through weave::shade() (fire body, honey ramp, the user's accent rim) —
                             // the white channel is the raw un-materialized hot core. So every label
@@ -2157,39 +2414,26 @@ mod imp {
                                 blit_mask(&mut buf.white, t, CX, CY - 118.0, 0.34);
                             }
                             let rad = (CX - 26.0).min(150.0);
-                            if let Some(t) = &ask_yes {
-                                // YES on the WEST (left) — the accent (prism body + white core), so
-                                // label and its west arc agree: affirm is your colour, on the left.
-                                let hot = if live == 0 { 1.0 } else { 0.55 };
-                                let lx = CX - rad * 0.62;
-                                text_pocket(&mut buf, t, lx, CY, 0.30);
-                                blit_mask(&mut buf.pr, t, lx, CY, hot * accent.0);
-                                blit_mask(&mut buf.pg, t, lx, CY, hot * accent.1);
-                                blit_mask(&mut buf.pb, t, lx, CY, hot * accent.2);
-                                blit_mask(&mut buf.white, t, lx, CY, hot * 0.28);
-                            }
-                            if let Some(t) = &ask_no {
-                                // NO on the EAST (right) — THE MATERIAL ITSELF, glow into the body so
-                                // the label shades like the raw cast substance, matching its east arc.
-                                let hot = if live == 1 { 1.0 } else { 0.55 };
-                                let nx = CX + rad * 0.62;
-                                text_pocket(&mut buf, t, nx, CY, 0.30);
-                                blit_mask(&mut buf.glow, t, nx, CY, hot);
-                                blit_mask(&mut buf.white, t, nx, CY, hot * 0.28);
-                            }
-                            // the PASS caption appears exactly when relevant: beside the aimed pole.
-                            if live == 2 {
+                            // PASS caption — when the aim is a COMMITTED flick into a gap (no wedge), it
+                            // appears where you're pointing, neutral-white (it isn't a verdict, so it
+                            // wears neither accent nor material). At N=2 the gaps ARE the vertical axis,
+                            // so this is the old "flick up/down to pass" feel, now emergent for any N.
+                            let am = (aim.0 * aim.0 + aim.1 * aim.1).sqrt();
+                            if am >= 6.0
+                                && neuron::radial::pick_wedge(
+                                    aim.0 as f64,
+                                    aim.1 as f64,
+                                    6.0,
+                                    ask_opts.len(),
+                                )
+                                .is_none()
+                            {
                                 if let Some(t) = &ask_pass {
-                                    let py = if aim_south {
-                                        CY + rad - 24.0
-                                    } else {
-                                        CY - rad + 24.0
-                                    };
-                                    text_pocket(&mut buf, t, CX, py, 0.30);
-                                    // PASS is neutral white — it isn't a verdict, so it wears neither
-                                    // your accent nor the material. The white channel isn't dispersed,
-                                    // so it stays clean (no amber fringe).
-                                    blit_mask(&mut buf.white, t, CX, py, 0.7);
+                                    let ang = (aim.1).atan2(aim.0) as f32;
+                                    let (px, py) =
+                                        (CX + ang.cos() * (rad - 24.0), CY + ang.sin() * (rad - 24.0));
+                                    text_pocket(&mut buf, t, px, py, 0.30);
+                                    blit_mask(&mut buf.white, t, px, py, 0.7);
                                 }
                             }
                             // DESCRIPTION: arbitrary context the macro passed (neuron.ask(description=)),
@@ -2328,39 +2572,21 @@ mod imp {
                                 );
                             }
                         }
-                        WeaveMode::Signal { .. } => {
-                            // the quiet stage — the beacon's ask rendered in the one card grammar the
-                            // whole product speaks (see `draw_card`). Anchored to the top strip
-                            // (horizontal centre, title baseline at y=30) where game notices live;
-                            // Signal skips the dusk, so the card itself is what lifts the line off
-                            // bright content — the very same pixels the notification engine will
-                            // later place in a corner.
+                        WeaveMode::NotifyStack => {
+                            // THE MULTI-NOTIFICATION SURFACE — the engine has already eased every
+                            // slot's animation; here we just paint the given frame. ALL colour is the
+                            // live material accent; per-type identity rides the glyph. The three modes
+                            // (stack column / latest swap / digest summary) all share the card chrome.
                             let accent = crate::weave::live_material().accent;
-                            draw_card(
+                            draw_notify_stack(
                                 &mut buf,
-                                CX,
-                                30.0,
                                 frame,
                                 accent,
-                                sig_label.as_ref(),
-                                sig_hint.as_ref(),
-                                false, // the beacon strip stays the floating spell, no panel
-                            );
-                        }
-                        WeaveMode::Notify { panel, .. } => {
-                            // a state-change confirmation, in the same card grammar as Signal, on this
-                            // overlay's OWN instance — `place_window` puts it in a corner. `panel`
-                            // (user-toggled) picks the grounded squircle vs the floating lozenge.
-                            let accent = crate::weave::live_material().accent;
-                            draw_card(
-                                &mut buf,
-                                CX,
-                                30.0,
-                                frame,
-                                accent,
-                                notify_label.as_ref(),
-                                notify_hint.as_ref(),
-                                *panel,
+                                stack_mode_kind,
+                                stack_place,
+                                &stack_cards,
+                                stack_digest.as_ref(),
+                                stack_tail,
                             );
                         }
                     }
@@ -2397,7 +2623,7 @@ mod imp {
 
                     // ── the dusk + the aura: contrast WITHOUT panels — the room dims like
                     // smoke around the cast, and every emission casts its own soft shadow ──
-                    if !matches!(mode, WeaveMode::Signal { .. } | WeaveMode::Notify { .. }) {
+                    if !matches!(mode, WeaveMode::NotifyStack) {
                         let dusk_r: f32 = match &mode {
                             WeaveMode::Map { .. } => 268.0,
                             WeaveMode::Radial { .. } | WeaveMode::Ask { .. } => 235.0,
@@ -2641,12 +2867,12 @@ mod imp {
                     }
                 }
 
-                // an idle beacon (signal strip / un-engaged ask) breathes at half rate — it can
-                // sit for minutes, so don't burn 60fps on a slow pulse.
+                // an idle beacon (an un-engaged ask wheel) breathes at half rate — it can sit for
+                // minutes, so don't burn 60fps on a slow pulse.
                 let idle_beacon = visible
                     && !fading
                     && points.is_empty()
-                    && matches!(mode, WeaveMode::Ask { .. } | WeaveMode::Signal { .. });
+                    && matches!(mode, WeaveMode::Ask { .. });
                 // FRAME CAP, not an additive delay. The old `sleep(16)` ran ON TOP of the render, so
                 // a T-ms frame took T+16ms — a 15ms render became a 31ms frame (32fps), which IS the
                 // lag, independent of any pass cost. Sleep only the REMAINDER of the target period:
@@ -2659,13 +2885,12 @@ mod imp {
                 {
                     let m = match &mode {
                         WeaveMode::Ask { .. } => "Ask",
-                        WeaveMode::Signal { .. } => "Signal",
                         WeaveMode::Radial { .. } => "Radial",
                         WeaveMode::Glyph { .. } => "Glyph",
                         WeaveMode::Dial { .. } => "Dial",
                         WeaveMode::Map { .. } => "Map",
                         WeaveMode::Twin { .. } => "Twin",
-                        WeaveMode::Notify { .. } => "Notify",
+                        WeaveMode::NotifyStack => "NotifyStack",
                         _ => "other",
                     };
                     eprintln!(
@@ -2823,109 +3048,515 @@ mod imp {
         );
     }
 
-    /// The card's half-width from its title/grammar raster widths — the SINGLE source of truth for
-    /// the lozenge, the hairline, and the dirty-tile cover, so the strip's footprint can never drift
-    /// out from under its own pixels (a clip waiting to happen back when this lived in two places).
-    fn card_half(lw: f32, hw: f32) -> f32 {
-        ((lw + 26.0).max(hw)) / 2.0 + 16.0
-    }
+    // ── CARD geometry — shared by every stack card (the value-hierarchy card AND the ask card draw
+    // off these), so each card's chip + gap + margins are one single source of truth and can never
+    // disagree across the column. ──
+    const NOTIFY_GLYPH_R: f32 = 13.0; // the icon's scale INSIDE the chip
+    const NOTIFY_CHIP_HALF: f32 = 19.0; // the glyph CHIP's half-size (a rounded-square badge)
+    const NOTIFY_GLYPH_BOX: f32 = NOTIFY_CHIP_HALF * 2.0 + 6.0; // the chip's horizontal footprint
+    const NOTIFY_GAP: f32 = 14.0; // chip → text-block gap
+    const NOTIFY_TAB: f32 = 4.0; // the signature accent tab on the left edge
+    const NOTIFY_ARROW: f32 = 15.0; // width reserved beside a ranged value for the ↑/↓ cue
 
-    /// The one card grammar the whole product speaks — the soft NOTIFICATION CARD the beacon's
-    /// Signal wears today and the notification engine will place in any corner tomorrow. A dark
-    /// lozenge lifts the line off whatever's behind it (Signal skips the dusk, so the card itself is
-    /// what earns its legibility over a bright game), a pulsing accent pip says "this is live", the
-    /// title rides the accent with a white-hot core, an optional grammar/value line sits quieter
-    /// beneath, and a hairline accent baseline gives it a lit edge. Anchored at `ax` (horizontal
-    /// centre) / `ay` (the title's baseline), so the SAME pixels draw at the top strip or in a
-    /// corner; `frame` breathes the pip at ~1Hz, `accent` is the live material's accent.
-    fn draw_card(
+    // ── STACK geometry — the multi-notification column. A FIXED card width keeps the column from
+    // reflowing sideways as content changes (only the y-reflow animates); a fixed buffer ANCHOR lets
+    // the window sit at the chosen monitor corner with the column growing into the (transparent)
+    // off-corner space. One source of truth for the cover, the draw, and `place_window`. ──
+    const STACK_HALF: f32 = 158.0; // each card's half-width (a roomy, stable column width)
+    const STACK_CARD_GAP: f32 = 8.0; // vertical gap between stacked cards
+    const STACK_PAD: f32 = 18.0; // inset of the column from the monitor corner
+    // card HEIGHT + row y's now live in ONE place — `notifs::card_layout` (the box is the sum of its
+    // rows, so content can't overflow it). The constants that used to be mirrored here are gone.
+    const STACK_TAIL_H: f32 = 26.0; // the "+N more" tail pill's height (the engine caps live at 4)
+    // the column's fixed buffer ANCHOR: x is the card-block centre; y is the corner edge (the card
+    // edge nearest the chosen vertical). The window is placed (see `stack_origin`) so STACK_AX lands
+    // at the screen point the placement's `nx` picks (clamped on-screen) and STACK_AY_{TOP,BOT} lands
+    // inset by STACK_PAD; the column then grows AWAY from it (down for top, up for bottom).
+    const STACK_AX: f32 = STACK_HALF + 4.0; // column centre x in the buffer
+    const STACK_AY_TOP: f32 = 6.0; // the top corner's anchor y (column grows downward)
+    const STACK_AY_BOT: f32 = (H as f32) - 6.0; // the bottom corner's anchor y (grows upward)
+
+    /// THE MULTI-NOTIFICATION SURFACE — paints one engine frame of the notification stack. The engine
+    /// has already eased each slot's animation (y / alpha / scale / collapse / bump), so this is a
+    /// pure renderer: lay the cards out as a COLUMN from the corner anchor (top corner → downward,
+    /// bottom corner → upward), reusing the card chrome (`card_frame`/`chip_box`) per card. `mode`
+    /// picks the presentation: 0 = the column (newest nearest the corner, a `+N` tail past 4), 1 =
+    /// Latest (one card; the swap is two slots crossfading, drawn by their alphas), 2 = Digest (the
+    /// summary card when >1 is live, else the lone card plain). ALL colour is the live material accent.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_notify_stack(
         buf: &mut Buffers,
-        ax: f32,
-        ay: f32,
         frame: u32,
         accent: (f32, f32, f32),
-        label: Option<&TextRaster>,
-        hint: Option<&TextRaster>,
-        panel: bool,
+        mode: u8,
+        place: (f32, f32),
+        cards: &[NotifyR],
+        digest: Option<&DigestR>,
+        tail: u32,
     ) {
-        let pulse = 0.55 + 0.45 * ((frame as f32) * 0.07).sin();
-        let lw = label.map(|t| t.w).unwrap_or(0) as f32;
-        let hw = hint.map(|t| t.w).unwrap_or(0) as f32;
-        let half = card_half(lw, hw);
-        if panel {
-            // GROUNDED: the app's card chrome — a defined squircle (dark fill + accent hairline edge)
-            // so the line reads as a real notification card over any bright game.
-            panel_box(buf, ax, ay + 12.0, half - 1.0, 30.0, 12.0, accent);
-        } else {
-            // FLOATING: a soft dark lozenge that lifts the line off the content with no hard edge.
-            shade_pocket(buf, ax, ay + 12.0, half - 2.0, 27.0, 0.58);
-        }
-        // the pip — a pulsing accent bead + white-hot core, just left of the title.
-        let px = ax - lw / 2.0 - 16.0;
-        splat_prism(buf, px, ay, 5.5, 0.9 * pulse, accent);
-        splat_white(&mut buf.white, px, ay, 2.0, 0.5 * pulse);
-        // the title — accent body + white core, centred. (ACCENT prism, undispersed: glow ran this
-        // thin text through the material's aberration and fringed it amber.)
-        if let Some(t) = label {
-            blit_mask(&mut buf.pr, t, ax, ay, 0.95 * accent.0);
-            blit_mask(&mut buf.pg, t, ax, ay, 0.95 * accent.1);
-            blit_mask(&mut buf.pb, t, ax, ay, 0.95 * accent.2);
-            blit_mask(&mut buf.white, t, ax, ay, 0.36);
-        }
-        // the grammar — quieter, centred beneath.
-        if let Some(t) = hint {
-            blit_mask(&mut buf.pr, t, ax, ay + 24.0, 0.5 * accent.0);
-            blit_mask(&mut buf.pg, t, ax, ay + 24.0, 0.5 * accent.1);
-            blit_mask(&mut buf.pb, t, ax, ay + 24.0, 0.5 * accent.2);
-            blit_mask(&mut buf.white, t, ax, ay + 24.0, 0.1);
-        }
-        // the hairline accent baseline — only the FLOATING card needs a drawn lit edge; the panel
-        // already has a real border.
-        if !panel {
-            let bw = (half - 12.0).max(8.0);
-            let n = (bw / 1.4) as i32;
-            for k in 0..=n {
-                let x = ax - bw + (k as f32 / n as f32) * (2.0 * bw);
-                splat_prism(buf, x, ay + 36.0, 1.1, 0.3, accent);
+        // growth direction from the placement's vertical fraction: top half grows DOWN, bottom up.
+        let top_corner = place.1 < 0.5;
+        let anchor = if top_corner { STACK_AY_TOP } else { STACK_AY_BOT };
+        let card_full_h = |c: &NotifyR| notify_layout(c).height;
+        // DIGEST (mode 2) with a live summary → draw the one summary card and nothing else.
+        if mode == 2 {
+            if let Some(d) = digest {
+                draw_digest_card(buf, anchor, top_corner, frame, accent, d);
+                return;
             }
+        }
+        // STACK / LATEST / lone-DIGEST: a column of cards. Each card's `y` is its eased distance from
+        // the corner edge; its body grows the card's height. Newest is `y` smallest (nearest corner).
+        let mut deepest = 0.0f32;
+        for c in cards {
+            let h = card_full_h(c) * (1.0 - c.collapse);
+            deepest = deepest.max(c.y + h);
+            if c.alpha <= 0.004 {
+                continue;
+            }
+            // the card body's vertical CENTRE in the buffer (top corner grows down, bottom grows up).
+            let cy_body = if top_corner {
+                anchor + c.y + h * 0.5
+            } else {
+                anchor - c.y - h * 0.5
+            };
+            draw_stack_card(buf, STACK_AX, cy_body, h, frame, accent, c);
+        }
+        // the +N TAIL pill (Stack mode only): a quiet "+N more" past the deepest visible card, so an
+        // overflowing burst reads as "...and N others" without a fifth full card crowding the column.
+        if tail > 0 {
+            let pill_cy = if top_corner {
+                anchor + deepest + STACK_CARD_GAP + STACK_TAIL_H * 0.5
+            } else {
+                anchor - deepest - STACK_CARD_GAP - STACK_TAIL_H * 0.5
+            };
+            draw_tail_pill(buf, STACK_AX, pill_cy, frame, accent, tail);
         }
     }
 
-    /// A grounded NOTIFICATION PANEL — the app's card chrome rendered in the overlay's compositor: a
-    /// rounded-rect (squircle) of dark shade with a quiet accent hairline hugging the inner edge.
-    /// Defined corners + a lit rim read as a real UI card (so the cast doesn't just float over a
-    /// bright game), while the pip / title / value drawn on top keep the magic. `rx`/`ry` are the
-    /// half-extents, `radius` the corner round. (The fill is the same `shade` channel the dusk uses,
-    /// so it lands ~50% dark — a semi-opaque card, which suits an over-game overlay better than an
-    /// opaque box would.)
-    fn panel_box(buf: &mut Buffers, cx: f32, cy: f32, rx: f32, ry: f32, radius: f32, accent: (f32, f32, f32)) {
+    /// THE +N TAIL PILL — a quiet rounded chip ("+N more") closing a stack that overflowed past the
+    /// visible cards. A short `card_frame` body with a small accent count; never a full card. ALL
+    /// colour is the live material accent.
+    fn draw_tail_pill(buf: &mut Buffers, cx: f32, cy: f32, frame: u32, accent: (f32, f32, f32), n: u32) {
+        let breath = 0.82 + 0.18 * ((frame as f32) * 0.05).sin();
+        card_frame(buf, cx, cy, STACK_HALF - 1.0, STACK_TAIL_H * 0.5, 9.0, accent, breath, false);
+        // SAFETY: same GDI text rasterization the render thread does everywhere; we're on that thread.
+        if let Some(t) = unsafe { rasterize_text(&format!("+{n} more"), 13) } {
+            let bx = cx; // centred in the pill
+            blit_mask(&mut buf.pr, &t, bx, cy, 0.66 * accent.0);
+            blit_mask(&mut buf.pg, &t, bx, cy, 0.66 * accent.1);
+            blit_mask(&mut buf.pb, &t, bx, cy, 0.66 * accent.2);
+            blit_mask(&mut buf.white, &t, bx, cy, 0.08);
+        }
+    }
+
+    /// One card's resolved geometry from the SINGLE layout spec (`notifs::card_layout`) — the box
+    /// height and every row's y come from here, so the renderer can never draw past the box it sized.
+    fn notify_layout(c: &NotifyR) -> crate::notifs::CardLayout {
+        crate::notifs::card_layout(crate::notifs::CardShape {
+            is_ask: c.is_ask,
+            lines: c.body.len().max(1),
+            has_track: c.fill >= 0.0,
+            has_prev: c.prev.is_some(),
+        })
+    }
+
+    /// Draw ONE stack card at body-centre (cx, cy) with full height `h`. A confirmation/macro card is
+    /// the value-hierarchy (glyph chip + title + a value that WRAPS to ≤3 body lines + the track-bar +
+    /// prev); an ASK card (`c.is_ask`) is the prompt layout (Ask glyph + prominent question + the
+    /// answer-grammar row). Every element is dimmed by the slot's `alpha`, the chrome swells a hair on
+    /// the coalesce `scale` bump, with a brief white value-FLASH on `bump`. ALL colour is the live
+    /// material accent.
+    fn draw_stack_card(
+        buf: &mut Buffers,
+        cx: f32,
+        cy: f32,
+        h: f32,
+        frame: u32,
+        accent: (f32, f32, f32),
+        c: &NotifyR,
+    ) {
+        let a = c.alpha.clamp(0.0, 1.0);
+        // the coalesce BUMP: a quick ~1.06× pop on the chrome (the text stays put — re-rastering it
+        // per frame would be waste) + a brighter tab breath, so a card that just updated visibly
+        // "lands" again. `scale` rides 1.0→~1.06→1.0 over BUMP_MS (the engine's easing).
+        let pop = (c.scale - 1.0).max(0.0);
+        let breath = (0.82 + 0.18 * ((frame as f32) * 0.05).sin()) * (1.0 + pop * 2.5);
+        let half = STACK_HALF;
+        let ry = (h * 0.5).max(8.0);
+        // CHROME — the same crafted frame, its half-extents nudged out by the bump pop and its tab
+        // breath lifted by the slot alpha so an entering card's tab fades up with it.
+        let grow = pop * 6.0; // px the frame swells at the bump's peak
+        card_frame(buf, cx, cy, half - 1.0 + grow, ry + grow, 12.0, accent, breath * a, c.panel);
+        // the accent border itself also fades with alpha: re-tint a quiet wash so a fading card dims
+        // its hairline too (card_frame's border is at full accent; layer a small dimming isn't easy,
+        // so we accept the chrome at full and fade the CONTENT — the dominant visual — by alpha).
+        // LAYOUT — left-anchored block past the tab + glyph chip (fixed column width).
+        let lw = c.title.as_ref().map(|t| t.w).unwrap_or(0) as f32;
+        let vw = c.value.as_ref().map(|t| t.w).unwrap_or(0) as f32;
+        let bw = c.body.iter().map(|t| t.w as f32).fold(0.0, f32::max);
+        let pw = c.prev.as_ref().map(|t| t.w).unwrap_or(0) as f32;
+        let arrow = if c.dir != 0 { NOTIFY_ARROW } else { 0.0 };
+        let text_w = lw.max(vw + arrow).max(bw).max(pw);
+        let gx = cx - half + NOTIFY_TAB + NOTIFY_GLYPH_BOX / 2.0 + 4.0; // chip centre
+        let tx = cx - half + NOTIFY_TAB + NOTIFY_GLYPH_BOX + NOTIFY_GAP + 4.0; // text block left
+        // EVERY row y comes from the ONE layout spec that sized the box, so content fits by construction.
+        let lay = notify_layout(c);
+        let top = cy - ry;
+        // the glyph chip — vertically centred on the card body.
+        chip_box(buf, gx, cy, NOTIFY_CHIP_HALF, 7.0, accent);
+        draw_wedge_glyph(buf, c.glyph, gx, cy, NOTIFY_GLYPH_R, Tone::Plain, frame, 0.92 * a);
+        // ── THE ASK SLOT — same chrome + Ask glyph chip as above, but the ask LAYOUT (a prompt, not
+        // a value-hierarchy): the QUESTION prominent and the answer GRAMMAR on its OWN legible row,
+        // the content/typography of `draw_ask_card` reused but drawn here AS a stack slot. It reads as
+        // "awaiting you" — a gentle persistent accent (no glow blob, no track-bar). Persistent: the
+        // engine never expires it, so it just sits here until a ClearAsk fades it out.
+        if c.is_ask {
+            // TOP-anchored from the card's inner top edge so the prompt scales cleanly when the
+            // grammar wraps to a second row (the card height grows with `body.len()`).
+            let qy = top + lay.body0_cy;
+            // the QUESTION — the prominent line (a clean accent fill + a thin white legibility core).
+            if let Some(t) = &c.value {
+                let bx = tx + t.w as f32 / 2.0;
+                blit_mask(&mut buf.pr, t, bx, qy, 0.95 * accent.0 * a);
+                blit_mask(&mut buf.pg, t, bx, qy, 0.95 * accent.1 * a);
+                blit_mask(&mut buf.pb, t, bx, qy, 0.95 * accent.2 * a);
+                blit_mask(&mut buf.white, t, bx, qy, 0.18 * a);
+            }
+            // the answer GRAMMAR — wrapped to fit (carried in `body`), each line its own readable row
+            // under the question. Quieter than the question, but never spills past the card edge.
+            for (li, t) in c.body.iter().enumerate() {
+                let gyy = top + lay.grammar0_cy + li as f32 * lay.body_step;
+                let bx = tx + t.w as f32 / 2.0;
+                blit_mask(&mut buf.pr, t, bx, gyy, 0.62 * accent.0 * a);
+                blit_mask(&mut buf.pg, t, bx, gyy, 0.62 * accent.1 * a);
+                blit_mask(&mut buf.pb, t, bx, gyy, 0.62 * accent.2 * a);
+                blit_mask(&mut buf.white, t, bx, gyy, 0.08 * a);
+            }
+            return;
+        }
+        // title near the top, then the body lines, then track + prev — every y from `lay`.
+        let ty = top + lay.title_cy;
+        if let Some(t) = &c.title {
+            let bx = tx + t.w as f32 / 2.0;
+            blit_mask(&mut buf.pr, t, bx, ty, 0.58 * accent.0 * a);
+            blit_mask(&mut buf.pg, t, bx, ty, 0.58 * accent.1 * a);
+            blit_mask(&mut buf.pb, t, bx, ty, 0.58 * accent.2 * a);
+            blit_mask(&mut buf.white, t, bx, ty, 0.10 * a);
+        }
+        // the VALUE — wrapped body lines, the headline. The FIRST line carries the ↑/↓ cue + a brief
+        // white flash on a coalesce bump; the eye lands here.
+        let value_top = top + lay.body0_cy;
+        if c.body.is_empty() {
+            // no body raster (shouldn't happen) — fall back to the single value raster.
+            if let Some(t) = &c.value {
+                let bx = tx + t.w as f32 / 2.0;
+                blit_mask(&mut buf.pr, t, bx, value_top, accent.0 * a);
+                blit_mask(&mut buf.pg, t, bx, value_top, accent.1 * a);
+                blit_mask(&mut buf.pb, t, bx, value_top, accent.2 * a);
+                blit_mask(&mut buf.white, t, bx, value_top, (0.16 + 0.5 * c.bump) * a);
+            }
+        } else {
+            for (li, t) in c.body.iter().enumerate() {
+                let ly = value_top + li as f32 * lay.body_step;
+                let bx = tx + t.w as f32 / 2.0;
+                blit_mask(&mut buf.pr, t, bx, ly, accent.0 * a);
+                blit_mask(&mut buf.pg, t, bx, ly, accent.1 * a);
+                blit_mask(&mut buf.pb, t, bx, ly, accent.2 * a);
+                // the value flash rides the first line only.
+                let core = if li == 0 { 0.16 + 0.5 * c.bump } else { 0.12 };
+                blit_mask(&mut buf.white, t, bx, ly, core * a);
+                if li == 0 && c.dir != 0 {
+                    let axx = bx + t.w as f32 / 2.0 + NOTIFY_ARROW * 0.5;
+                    draw_dir_arrow(
+                        buf,
+                        axx,
+                        ly,
+                        NOTIFY_ARROW * 0.46,
+                        c.dir,
+                        (accent.0 * a, accent.1 * a, accent.2 * a),
+                    );
+                }
+            }
+        }
+        // the track-bar (ranged only), under the body block.
+        let has_bar = c.fill >= 0.0;
+        let track_y = top + lay.track_cy;
+        if has_bar {
+            track_bar(
+                buf,
+                tx,
+                tx + text_w,
+                track_y,
+                c.fill,
+                c.prev_fill,
+                (accent.0 * a, accent.1 * a, accent.2 * a),
+            );
+        }
+        // prev — tiny + dim, trailing under the value/track.
+        if let Some(t) = &c.prev {
+            let py = top + lay.prev_cy;
+            let bx = tx + t.w as f32 / 2.0;
+            blit_mask(&mut buf.glow, t, bx, py, 0.40 * a);
+            blit_mask(&mut buf.white, t, bx, py, 0.05 * a);
+        }
+    }
+
+    /// THE DIGEST CARD — the calm-during-chaos summary (>1 note live): a big COUNT on the left, a ROW
+    /// of the DISTINCT source glyphs (deduped by kind — DPI reticle + macro terminal + …) so you learn
+    /// WHAT fired at a glance, and the latest note's title/value line. An expand-on-settle `reveal`
+    /// slides the glyph row + line open as the count lands. ALL colour is the live material accent.
+    fn draw_digest_card(
+        buf: &mut Buffers,
+        anchor: f32,
+        top_corner: bool,
+        frame: u32,
+        accent: (f32, f32, f32),
+        d: &DigestR,
+    ) {
+        let a = d.alpha.clamp(0.0, 1.0);
+        let rv = d.reveal.clamp(0.0, 1.0);
+        let breath = 0.82 + 0.18 * ((frame as f32) * 0.05).sin();
+        let h = 84.0;
+        let ry = h * 0.5;
+        let cx = STACK_AX;
+        let cy = if top_corner { anchor + ry } else { anchor - ry };
+        let half = STACK_HALF;
+        card_frame(buf, cx, cy, half - 1.0, ry, 12.0, accent, breath * a, true);
+        // the COUNT — a large accent numeral on the left (a growing badge).
+        let count_cx = cx - half + 34.0;
+        if let Some(t) = &d.count_txt {
+            let by = cy - 12.0;
+            blit_mask(&mut buf.pr, t, count_cx, by, accent.0 * a);
+            blit_mask(&mut buf.pg, t, count_cx, by, accent.1 * a);
+            blit_mask(&mut buf.pb, t, count_cx, by, accent.2 * a);
+            blit_mask(&mut buf.white, t, count_cx, by, 0.18 * a);
+        }
+        // the GLYPH ROW — the distinct source icons, each in a small chip, sliding open with reveal.
+        let row_x0 = cx - half + 60.0;
+        let row_y = cy - 14.0;
+        let step = 26.0;
+        for (i, g) in d.glyphs.iter().enumerate() {
+            let gx = row_x0 + i as f32 * step * rv;
+            let ga = a * rv;
+            chip_box(buf, gx, row_y, 11.0, 4.0, accent);
+            draw_wedge_glyph(buf, *g, gx, row_y, 8.0, Tone::Plain, frame, 0.9 * ga);
+        }
+        // the LATEST LINE — the most recent note's title + value, under the glyph row (revealing).
+        let line_y = cy + 16.0;
+        let line_a = a * rv;
+        let lx = row_x0;
+        if let Some(t) = &d.title {
+            let bx = lx + t.w as f32 / 2.0;
+            blit_mask(&mut buf.pr, t, bx, line_y - 9.0, 0.58 * accent.0 * line_a);
+            blit_mask(&mut buf.pg, t, bx, line_y - 9.0, 0.58 * accent.1 * line_a);
+            blit_mask(&mut buf.pb, t, bx, line_y - 9.0, 0.58 * accent.2 * line_a);
+        }
+        if let Some(t) = &d.value {
+            let bx = lx + t.w as f32 / 2.0;
+            blit_mask(&mut buf.pr, t, bx, line_y + 8.0, accent.0 * line_a);
+            blit_mask(&mut buf.pg, t, bx, line_y + 8.0, accent.1 * line_a);
+            blit_mask(&mut buf.pb, t, bx, line_y + 8.0, accent.2 * line_a);
+            blit_mask(&mut buf.white, t, bx, line_y + 8.0, 0.14 * line_a);
+        }
+    }
+
+    /// THE CARD FRAME — the notification card's crafted chrome: a crisp dark SDF rounded-rect
+    /// (~1px feather, NOT a glow), a quiet accent hairline hugging the inner edge,
+    /// and the signature ACCENT TAB — a short rounded bar down the left edge that makes the card read
+    /// as a deliberate instrument rather than a floating lozenge. `panel` (grounded) fills a hair
+    /// darker and squarer; the floating card is lighter and softer-cornered, but both share the same
+    /// defined geometry. `accent` (the live material accent) is the whole chrome colour — border, tab,
+    /// and fill tint; `breath` (0..1) gently lifts the tab.
+    #[allow(clippy::too_many_arguments)]
+    fn card_frame(
+        buf: &mut Buffers,
+        cx: f32,
+        cy: f32,
+        rx: f32,
+        ry: f32,
+        radius: f32,
+        accent: (f32, f32, f32),
+        breath: f32,
+        panel: bool,
+    ) {
         let (rx, ry) = (rx.max(2.0), ry.max(2.0));
         let r = radius.min(rx).min(ry);
-        let pad = 2.0; // anti-alias feather + a hair of border reach
+        let pad = 2.0;
         let x0 = ((cx - rx - pad).floor() as i32).max(0);
         let x1 = ((cx + rx + pad).ceil() as i32).min(W - 1);
         let y0 = ((cy - ry - pad).floor() as i32).max(0);
         let y1 = ((cy + ry + pad).ceil() as i32).min(H - 1);
+        // grounded panel sits darker (a real card over a game); floating a little lighter.
+        let fill_k = if panel { 0.88 } else { 0.62 };
+        let edge_k = if panel { 0.50 } else { 0.42 };
+        // the accent TAB lives just inside the left edge: a thin rounded bar, ~55% of the body height.
+        let tab_h = ry * 0.55;
+        let tab_x = cx - rx + 4.0; // its centre x, a hair in from the rim
+        let tab_hw = NOTIFY_TAB * 0.5; // half-width
         for yy in y0..=y1 {
             let row = (yy * W) as usize;
-            let dy = ((yy as f32 - cy).abs() - (ry - r)).max(0.0);
+            let fy = yy as f32;
+            let dy = ((fy - cy).abs() - (ry - r)).max(0.0);
             for xx in x0..=x1 {
-                let dx = ((xx as f32 - cx).abs() - (rx - r)).max(0.0);
+                let fx = xx as f32;
+                let dx = ((fx - cx).abs() - (rx - r)).max(0.0);
                 let d = (dx * dx + dy * dy).sqrt() - r; // signed distance to the rounded-rect edge
+                let i = row + xx as usize;
                 // fill: dark inside, a ~1px feather across the edge for clean corners.
-                let fill = (0.5 - d).clamp(0.0, 1.0);
-                if fill > 0.001 {
-                    buf.shade[row + xx as usize] += 0.85 * fill;
+                let fillv = (0.5 - d).clamp(0.0, 1.0);
+                if fillv > 0.001 {
+                    buf.shade[i] += fill_k * fillv;
                 }
                 // border: a quiet accent hairline hugging just inside the edge.
                 let edge = (1.0 - (d + 0.9).abs()).clamp(0.0, 1.0);
                 if edge > 0.001 {
-                    let i = row + xx as usize;
-                    buf.pr[i] += edge * accent.0 * 0.45;
-                    buf.pg[i] += edge * accent.1 * 0.45;
-                    buf.pb[i] += edge * accent.2 * 0.45;
+                    let bc = edge * edge_k;
+                    buf.pr[i] += bc * accent.0;
+                    buf.pg[i] += bc * accent.1;
+                    buf.pb[i] += bc * accent.2;
+                }
+                // the signature accent TAB — a crisp rounded bar (its own little SDF) on the left.
+                let tdx = (fx - tab_x).abs() - (tab_hw - 1.0);
+                let tdy = (fy - cy).abs() - (tab_h - 1.0);
+                let td = (tdx.max(0.0).powi(2) + tdy.max(0.0).powi(2)).sqrt() - 1.0;
+                let tabv = (0.6 - td).clamp(0.0, 1.0);
+                if tabv > 0.001 {
+                    let tb = tabv * (0.55 + 0.30 * breath);
+                    buf.pr[i] += tb * accent.0;
+                    buf.pg[i] += tb * accent.1;
+                    buf.pb[i] += tb * accent.2;
                 }
             }
+        }
+    }
+
+    /// THE GLYPH CHIP — a precise hairline-bordered badge for the card's type glyph: a crisp SDF
+    /// rounded square with a faint accent-tinted dark fill and a clean accent hairline border, centred
+    /// at (cx, cy). A designed home for the mark (no glow halo); the icon is drawn crisp on top by the
+    /// caller. `half` is its half-size, `radius` the corner round, `accent` the live material accent.
+    fn chip_box(buf: &mut Buffers, cx: f32, cy: f32, half: f32, radius: f32, accent: (f32, f32, f32)) {
+        let half = half.max(2.0);
+        let r = radius.min(half);
+        let pad = 2.0;
+        let x0 = ((cx - half - pad).floor() as i32).max(0);
+        let x1 = ((cx + half + pad).ceil() as i32).min(W - 1);
+        let y0 = ((cy - half - pad).floor() as i32).max(0);
+        let y1 = ((cy + half + pad).ceil() as i32).min(H - 1);
+        for yy in y0..=y1 {
+            let row = (yy * W) as usize;
+            let dy = ((yy as f32 - cy).abs() - (half - r)).max(0.0);
+            for xx in x0..=x1 {
+                let dx = ((xx as f32 - cx).abs() - (half - r)).max(0.0);
+                let d = (dx * dx + dy * dy).sqrt() - r;
+                let i = row + xx as usize;
+                // fill: a touch darker than the card so the chip reads as inset; an accent whisper in it.
+                let fillv = (0.5 - d).clamp(0.0, 1.0);
+                if fillv > 0.001 {
+                    buf.shade[i] += 0.32 * fillv;
+                    buf.pr[i] += fillv * accent.0 * 0.06;
+                    buf.pg[i] += fillv * accent.1 * 0.06;
+                    buf.pb[i] += fillv * accent.2 * 0.06;
+                }
+                // border: a clean accent hairline.
+                let edge = (1.0 - (d + 0.9).abs()).clamp(0.0, 1.0);
+                if edge > 0.001 {
+                    buf.pr[i] += edge * accent.0 * 0.55;
+                    buf.pg[i] += edge * accent.1 * 0.55;
+                    buf.pb[i] += edge * accent.2 * 0.55;
+                }
+            }
+        }
+    }
+
+    /// THE TRACK-BAR — the card's signature instrument detail (ranged changes only). A thin crisp SDF
+    /// rail from `bx0` to `bx1` at row `cy`: a dim accent track (the range), a bright accent FILL from
+    /// the left to `fill` (the new reading's place on the range), a clean cap dot at the fill head, and
+    /// — when `prev_fill >= 0` — a small TICK at the old reading, so the move along the range reads at
+    /// a glance (DPI 800→30000 shows a tick low-left and a fill nearly full). All SDF/stroke, no glow.
+    fn track_bar(
+        buf: &mut Buffers,
+        bx0: f32,
+        bx1: f32,
+        cy: f32,
+        fill: f32,
+        prev_fill: f32,
+        accent: (f32, f32, f32),
+    ) {
+        let bx1 = bx1.max(bx0 + 6.0);
+        let w = bx1 - bx0;
+        let fill = fill.clamp(0.0, 1.0);
+        let half_h = 1.6; // the rail's half-thickness — a hairline bar
+        let x0 = (bx0.floor() as i32 - 1).max(0);
+        let x1 = (bx1.ceil() as i32 + 1).min(W - 1);
+        let y0 = ((cy - half_h - 2.0).floor() as i32).max(0);
+        let y1 = ((cy + half_h + 2.0).ceil() as i32).min(H - 1);
+        let fx = bx0 + w * fill; // the fill head
+        for yy in y0..=y1 {
+            let row = (yy * W) as usize;
+            let dy = (yy as f32 - cy).abs() - half_h;
+            for xx in x0..=x1 {
+                let fxx = xx as f32;
+                // horizontal SDF: inside the rail's x-span, rounded ends.
+                let dxl = bx0 - fxx;
+                let dxr = fxx - bx1;
+                let dx = dxl.max(dxr).max(0.0);
+                let d = (dx * dx + dy.max(0.0) * dy.max(0.0)).sqrt() - 0.6;
+                let cov = (0.6 - d).clamp(0.0, 1.0);
+                if cov <= 0.001 {
+                    continue;
+                }
+                let i = row + xx as usize;
+                if fxx <= fx {
+                    // the FILL — a clean bright accent segment.
+                    buf.pr[i] += cov * accent.0 * 0.95;
+                    buf.pg[i] += cov * accent.1 * 0.95;
+                    buf.pb[i] += cov * accent.2 * 0.95;
+                } else {
+                    // the unfilled TRACK — a dim accent rail.
+                    buf.pr[i] += cov * accent.0 * 0.22;
+                    buf.pg[i] += cov * accent.1 * 0.22;
+                    buf.pb[i] += cov * accent.2 * 0.22;
+                }
+            }
+        }
+        // a small crisp cap at the fill head so the reading's position is defined.
+        splat_prism(buf, fx, cy, 2.3, 0.85, accent);
+        splat_white(&mut buf.white, fx, cy, 1.1, 0.18);
+        // the PREV TICK — a short bright vertical mark at the old reading, in white so it stands clear
+        // of both the hue fill and the dim track (the "where it was" against "where it is").
+        if prev_fill >= 0.0 {
+            let px = bx0 + w * prev_fill.clamp(0.0, 1.0);
+            vline(&mut buf.white, (px, cy - 3.4), (px, cy + 3.4), 1.0, 0.6);
+            // an accent underglow on the tick so it still belongs to the bar's palette.
+            vline(&mut buf.pr, (px, cy - 3.0), (px, cy + 3.0), 1.4, accent.0 * 0.35);
+            vline(&mut buf.pg, (px, cy - 3.0), (px, cy + 3.0), 1.4, accent.1 * 0.35);
+            vline(&mut buf.pb, (px, cy - 3.0), (px, cy + 3.0), 1.4, accent.2 * 0.35);
+        }
+    }
+
+    /// A small procedural ↑ (up, `dir > 0`) or ↓ (down) arrow centred at (cx, cy), in the prism
+    /// `rgb` — the notification card's ranged-direction cue. `s` is the half-height; the stem is a
+    /// short vertical line capped by an arrowhead at the pointing end.
+    fn draw_dir_arrow(buf: &mut Buffers, cx: f32, cy: f32, s: f32, dir: i8, rgb: (f32, f32, f32)) {
+        let sr = 1.7;
+        let b = 0.95;
+        let put = |buf: &mut Buffers, a: (f32, f32), c: (f32, f32)| {
+            // draw the segment into all three prism channels (an undispersed hue stroke)
+            vline(&mut buf.pr, a, c, sr, b * rgb.0);
+            vline(&mut buf.pg, a, c, sr, b * rgb.1);
+            vline(&mut buf.pb, a, c, sr, b * rgb.2);
+        };
+        let (top, bot) = (cy - s, cy + s);
+        put(buf, (cx, top), (cx, bot)); // the stem
+        if dir > 0 {
+            // ↑ : head at the top
+            put(buf, (cx - s * 0.6, top + s * 0.55), (cx, top));
+            put(buf, (cx + s * 0.6, top + s * 0.55), (cx, top));
+        } else {
+            // ↓ : head at the bottom
+            put(buf, (cx - s * 0.6, bot - s * 0.55), (cx, bot));
+            put(buf, (cx + s * 0.6, bot - s * 0.55), (cx, bot));
         }
     }
 
@@ -2972,123 +3603,95 @@ mod imp {
     /// Idle (no aim) it breathes gently — a beacon, not an alarm. An aimed zone goes hot.
     /// `live`: -1 = nothing aimed, 0 = yes, 1 = no, 2 = pass; `aim_south` picks the pass pole.
     /// `accent` = the weave material's accent (linear rgb) — YES's substance.
-    fn ask_wheel(
+    /// THE prompt wheel — the radial core rendered for ANSWERING. One wedge per option (a rim arc + an
+    /// anchor node + its label) placed by `radial::wedge_bearing`, the aimed one lit via the SAME
+    /// `radial::pick_wedge` the beacon commits with (so highlight and verdict can't disagree). Option 0
+    /// wears the user's ACCENT (the affirm colour), the rest the raw weave MATERIAL — so N=2 is the
+    /// familiar accent-yes (west) / material-no (east), and an N-way choose reads as one accent option
+    /// among material ones, told apart by their labels. Pass = a committed flick into a gap (drawn by
+    /// the caller). One renderer; the simple and the rich both fall out.
+    fn prompt_wheel(
         buf: &mut Buffers,
-        live: i32,
-        aim_south: bool,
+        labels: &[Option<TextRaster>],
+        aim: (f32, f32),
         frame: u32,
         flare: f32,
         accent: (f32, f32, f32),
     ) {
+        let n = labels.len();
+        if n == 0 {
+            return;
+        }
         let rad = (CX - 26.0).min(150.0);
         let breathe = 0.72 + 0.28 * ((frame as f32) * 0.06).sin();
-        let idle = live < 0;
-        // rim arcs: angle measured clockwise from North. The colored arcs live in the east/west
-        // QUADRANTS (45°..135° and 225°..315°) — the poles stay clear, they belong to PASS.
-        // DENSE sampling (was 160 → beaded dots; 480 overlaps the 2.8-px splats into a smooth,
-        // continuous arc that reads like the radial menu's ring, not a string of pearls).
-        for k in 0..480 {
-            let a = (k as f32 / 480.0) * TAU; // clockwise-from-North
-            let (x, y) = (CX + a.sin() * rad, CY - a.cos() * rad);
-            let east = (TAU / 8.0..3.0 * TAU / 8.0).contains(&a);
-            let west = (5.0 * TAU / 8.0..7.0 * TAU / 8.0).contains(&a);
-            if !east && !west {
-                continue;
-            }
-            let mine = if east { live == 1 } else { live == 0 };
-            let base = if idle {
-                0.30 * breathe
-            } else if mine {
-                0.62
-            } else {
-                0.14
-            };
-            if east {
-                // EAST = NO = THE MATERIAL ITSELF — the raw cast substance, glow straight into the
-                // body so it shades like any weave (fire/air/glass/whatever). No tint, no intent.
-                splat(&mut buf.glow, x, y, 2.8, base);
-            } else {
-                // WEST = YES wears the user's ACCENT, into the prism (added directly + picked up by
-                // the aura glow). The contrast IS the point: your colour says yes (left), the bare
-                // magic says no (right).
-                splat_prism(buf, x, y, 2.8, base, accent);
-            }
-        }
-        // anchor nodes at the east/west rim (the targets you flick toward).
-        let (ex, wx) = (CX + rad, CX - rad);
-        let yes_hot = live == 0;
-        let no_hot = live == 1;
-        // EAST node = NO = the raw material
-        splat(
-            &mut buf.glow,
-            ex,
-            CY,
-            if no_hot { 13.0 } else { 8.0 },
-            if no_hot { 0.95 + flare } else { 0.35 * breathe },
-        );
-        if no_hot {
-            splat(&mut buf.white, ex, CY, 5.0, 0.8);
-        }
-        // WEST node = YES = your accent
-        splat_prism(
-            buf,
-            wx,
-            CY,
-            if yes_hot { 13.0 } else { 8.0 },
-            if yes_hot {
-                0.95 + flare
-            } else {
-                0.35 * breathe
-            },
-            accent,
-        );
-        if yes_hot {
-            splat(&mut buf.white, wx, CY, 5.0, 0.8);
-        }
-        // PASS ticks at the poles: barely-there until aimed (discoverable by fidgeting, silent
-        // otherwise). The aimed pole brightens neutral-white — no color, it's not a verdict.
-        let pass_hot = live == 2;
-        let (ny, sy) = (CY - rad, CY + rad);
-        splat(
-            &mut buf.white,
-            CX,
-            ny,
-            if pass_hot && !aim_south { 6.5 } else { 3.0 },
-            if pass_hot && !aim_south { 0.55 } else { 0.10 },
-        );
-        splat(
-            &mut buf.white,
-            CX,
-            sy,
-            if pass_hot && aim_south { 6.5 } else { 3.0 },
-            if pass_hot && aim_south { 0.55 } else { 0.10 },
-        );
-        // the aimed zone grows a spine from center toward its node.
-        if live == 0 || live == 1 {
-            let dir = if live == 0 { -1.0 } else { 1.0 }; // YES grows WEST, NO grows EAST
-            let steps = 20;
-            for j in 0..=steps {
-                let u = j as f32 / steps as f32;
-                let x = CX + dir * rad * u;
-                let b = 0.5 * (0.3 + u);
-                if live == 0 {
-                    splat_prism(buf, x, CY, 4.5, b, accent); // YES spine (west) — your accent
+        let aimed_mag = (aim.0 * aim.0 + aim.1 * aim.1).sqrt();
+        let idle = aimed_mag < 6.0;
+        // the aimed wedge — a small threshold so it lights as you move, well before the commit radius.
+        let live = neuron::radial::pick_wedge(aim.0 as f64, aim.1 as f64, 6.0, n);
+        let half = (neuron::radial::wedge_arc(n) as f32) * 0.5;
+        for i in 0..n {
+            let b = neuron::radial::wedge_bearing(i, n) as f32; // atan2(dy,dx): E=0, S=+, W=±π, N=−
+            let is_accent = i == 0;
+            let hot = live == Some(i);
+            // the rim arc spanning this wedge (dense splats → a continuous arc, not beads).
+            let span = half * 2.0;
+            let samples = ((span / TAU) * 480.0).ceil().max(6.0) as usize;
+            for k in 0..samples {
+                let a = b - half + span * (k as f32 / (samples.max(2) - 1) as f32);
+                let (x, y) = (CX + a.cos() * rad, CY + a.sin() * rad);
+                let base = if idle {
+                    0.30 * breathe
+                } else if hot {
+                    0.62
                 } else {
-                    splat(&mut buf.glow, x, CY, 4.5, b); // NO spine (east) — the raw material
+                    0.14
+                };
+                if is_accent {
+                    splat_prism(buf, x, y, 2.8, base, accent);
+                } else {
+                    splat(&mut buf.glow, x, y, 2.8, base);
                 }
             }
-        } else if pass_hot {
-            let dir = if aim_south { 1.0 } else { -1.0 };
-            let steps = 20;
-            for j in 0..=steps {
-                let u = j as f32 / steps as f32;
-                splat(
-                    &mut buf.white,
-                    CX,
-                    CY + dir * rad * u,
-                    3.0,
-                    0.25 * (0.3 + u),
-                );
+            // the anchor node (the target you flick toward) + a spine from centre when it's aimed.
+            let (nx, ny) = (CX + b.cos() * rad, CY + b.sin() * rad);
+            let node_r = if hot { 13.0 } else { 8.0 };
+            let node_a = if hot { 0.95 + flare } else { 0.35 * breathe };
+            if is_accent {
+                splat_prism(buf, nx, ny, node_r, node_a, accent);
+            } else {
+                splat(&mut buf.glow, nx, ny, node_r, node_a);
+                if hot {
+                    splat(&mut buf.white, nx, ny, 5.0, 0.8);
+                }
+            }
+            if hot {
+                let steps = 20;
+                for j in 0..=steps {
+                    let u = j as f32 / steps as f32;
+                    let (sx, sy) = (CX + b.cos() * rad * u, CY + b.sin() * rad * u);
+                    let sb = 0.5 * (0.3 + u);
+                    if is_accent {
+                        splat_prism(buf, sx, sy, 4.5, sb, accent);
+                    } else {
+                        splat(&mut buf.glow, sx, sy, 4.5, sb);
+                    }
+                }
+            }
+            // the option LABEL, just inside its node — accent (prism+core) for option 0, else the
+            // material (glow+core), so a label always shades like the wedge it names.
+            if let Some(t) = &labels[i] {
+                let (lx, ly) = (CX + b.cos() * rad * 0.62, CY + b.sin() * rad * 0.62);
+                let lhot = if hot { 1.0 } else { 0.55 };
+                text_pocket(buf, t, lx, ly, 0.30);
+                if is_accent {
+                    blit_mask(&mut buf.pr, t, lx, ly, lhot * accent.0);
+                    blit_mask(&mut buf.pg, t, lx, ly, lhot * accent.1);
+                    blit_mask(&mut buf.pb, t, lx, ly, lhot * accent.2);
+                    blit_mask(&mut buf.white, t, lx, ly, lhot * 0.28);
+                } else {
+                    blit_mask(&mut buf.glow, t, lx, ly, lhot);
+                    blit_mask(&mut buf.white, t, lx, ly, lhot * 0.28);
+                }
             }
         }
     }
@@ -3232,6 +3835,100 @@ mod imp {
         }
     }
 
+    /// WRAP `s` to ≤`lines` rows, honouring EXPLICIT '\n' breaks FIRST — each segment is wrapped within
+    /// the remaining budget, so STRUCTURED text (a grammar's "engage\noptions") keeps its groups on
+    /// their own rows instead of greedily splitting a list mid-way. Plain text (no '\n') wraps exactly
+    /// as one greedy block, unchanged.
+    fn wrap_lines(s: &str, cols: usize, lines: usize) -> Vec<String> {
+        let lines = lines.max(1);
+        let mut out: Vec<String> = Vec::new();
+        for seg in s.split('\n') {
+            if out.len() >= lines {
+                break;
+            }
+            out.extend(wrap_one(seg, cols, lines - out.len()));
+        }
+        out
+    }
+
+    /// Greedy word-wrap of ONE line (no '\n') to ≤`lines` rows of ≤`cols` chars (hard char-break for an
+    /// over-long word), ellipsizing the LAST row if the text still overruns.
+    fn wrap_one(s: &str, cols: usize, lines: usize) -> Vec<String> {
+        let cols = cols.max(1);
+        let lines = lines.max(1);
+        if s.trim().is_empty() {
+            return Vec::new();
+        }
+        let mut out: Vec<String> = Vec::new();
+        let mut cur = String::new();
+        let mut cur_len = 0usize;
+        // greedy fit of whitespace-split words; a single over-long word is hard-split at the column.
+        for word in s.split_whitespace() {
+            let wlen = word.chars().count();
+            if cur_len == 0 {
+                if wlen <= cols {
+                    cur = word.to_string();
+                    cur_len = wlen;
+                } else {
+                    // hard-break the giant word across rows
+                    let mut chars = word.chars().peekable();
+                    while chars.peek().is_some() {
+                        let chunk: String = chars.by_ref().take(cols).collect();
+                        out.push(chunk);
+                        if out.len() >= lines {
+                            break;
+                        }
+                    }
+                    if out.len() >= lines {
+                        break;
+                    }
+                    cur.clear();
+                    cur_len = 0;
+                }
+            } else if cur_len + 1 + wlen <= cols {
+                cur.push(' ');
+                cur.push_str(word);
+                cur_len += 1 + wlen;
+            } else {
+                out.push(std::mem::take(&mut cur));
+                cur_len = 0;
+                if out.len() >= lines {
+                    break;
+                }
+                // re-process this word as the start of the next row
+                if wlen <= cols {
+                    cur = word.to_string();
+                    cur_len = wlen;
+                } else {
+                    let mut chars = word.chars().peekable();
+                    while chars.peek().is_some() {
+                        let chunk: String = chars.by_ref().take(cols).collect();
+                        out.push(chunk);
+                        if out.len() >= lines {
+                            break;
+                        }
+                    }
+                    if out.len() >= lines {
+                        break;
+                    }
+                }
+            }
+        }
+        if out.len() < lines && !cur.is_empty() {
+            out.push(cur);
+        }
+        // if there's leftover content we couldn't fit, ellipsize the final row.
+        let consumed: usize = out.iter().map(|l| l.chars().count()).sum::<usize>();
+        let total = s.split_whitespace().map(|w| w.chars().count()).sum::<usize>();
+        if out.len() >= lines && consumed < total {
+            if let Some(last) = out.last_mut() {
+                *last = ellipsize(last, cols);
+            }
+        }
+        out.truncate(lines);
+        out
+    }
+
     /// The cursor's monitor work area (left, top, right, bottom) — full-virtual-screen fallback.
     /// An AUTO-HIDE taskbar reserves NO work area (rcWork == rcMonitor), so a bottom-corner card would
     /// land where the bar pops up and read as "behind the taskbar". We reserve the taskbar's OWN edge
@@ -3283,57 +3980,62 @@ mod imp {
         }
     }
 
-    /// Where the overlay window goes — THE positioning logic, one rule per mode:
-    ///   * weaves (glyph/radial/ask): centered on the cursor, clamped fully inside the cursor's
-    ///     monitor work area (the wheel must always be entirely on-glass — the cursor is locked
-    ///     during a weave, so a slight inset near an edge costs nothing and reads as intentional);
-    ///   * the signal strip: top-center of the cursor's monitor (where game notices live).
-    unsafe fn place_window(mode: &WeaveMode, cur: POINT, card_half: f32) -> POINT {
-        let (l, t, r, b) = monitor_work(cur);
-        // The Signal/beacon strip window — top-centre of the cursor's monitor, where game notices
-        // live. The in-line notification preset reuses this VERBATIM (it IS the strip), so the two
-        // are bit-for-bit identical from ONE source of truth — no fractional-rounding path that could
-        // drift the inline card ≤1px off Signal's X.
-        let strip = POINT {
-            x: ((l + r) / 2 - W / 2).clamp(l, (r - W).max(l)),
-            y: t + STRIP_Y,
-        };
-        match mode {
-            WeaveMode::Signal { .. } => strip,
-            // The notification card draws at buffer (CX, 30) — the very same anchor as Signal — so
-            // its visual box is x∈[CX-half, CX+half], y∈[14,70]. Position the WINDOW so that box
-            // lands at the fractional (nx,ny) anchor with a margin: the four corner presets resolve
-            // to {0,1}² and land pixel-identically to their old corner codes, any free spot between
-            // just works. The IN-LINE preset (0.5, 0) is special — it IS the Signal/beacon strip, so
-            // it returns `strip` verbatim (the generic top-edge math would land it ~10px high AND
-            // could round ≤1px off Signal's X). Off-screen pixels are transparent, so a 1600² window
-            // resting mostly off-corner costs nothing.
-            WeaveMode::Notify { nx, ny, .. } => {
-                if (*nx - 0.5).abs() < 1e-3 && *ny <= 1e-3 {
-                    return strip; // in-line === the beacon strip, bit-for-bit
-                }
-                let pad = 18;
-                let cx = CX as i32;
-                let h = (card_half.ceil() as i32).max(8);
-                let (top, bot) = (14, 70);
-                let (cardw, cardh) = (2 * h, bot - top);
-                let lx_min = l + pad;
-                let lx_max = (r - pad - cardw).max(lx_min);
-                let lx = lx_min + (((lx_max - lx_min) as f32) * nx.clamp(0.0, 1.0)).round() as i32;
-                let ty_min = t + pad;
-                let ty_max = (b - pad - cardh).max(ty_min);
-                let ty = ty_min + (((ty_max - ty_min) as f32) * ny.clamp(0.0, 1.0)).round() as i32;
-                POINT { x: lx - (cx - h), y: ty - top }
-            }
-            // NOT clamped to the monitor: the buffer is bigger than most monitors, so clamping
-            // would pin the anchor to the monitor's centre instead of the cursor. Letting the window
-            // extend off-screen (the off pixels are transparent) keeps CX/CY exactly under the cursor
-            // even casting at a screen edge — which is what frees the draw area to the whole estate.
-            _ => POINT {
-                x: cur.x - W / 2,
-                y: cur.y - H / 2,
-            },
+    /// Where a WEAVE overlay window goes — centered on the cursor (glyph / radial / ask wheel / dial
+    /// / map / control / twin). The notification STACK is placed separately by [`stack_origin`] (it
+    /// carries the placement fractions the fieldless `NotifyStack` marker doesn't), never through here.
+    ///
+    /// NOT clamped to the monitor: the buffer is bigger than most monitors, so clamping would pin the
+    /// anchor to the monitor's centre instead of the cursor. Letting the window extend off-screen (the
+    /// off pixels are transparent) keeps CX/CY exactly under the cursor even casting at a screen edge
+    /// — which is what frees the draw area to the whole estate.
+    unsafe fn place_window(_mode: &WeaveMode, cur: POINT) -> POINT {
+        POINT {
+            x: cur.x - W / 2,
+            y: cur.y - H / 2,
         }
+    }
+
+    /// THE NOTIFICATION STACK's window origin — honours the user's REAL placement `(nx, ny)`, NOT a
+    /// snapped corner, so a centre placement renders a CENTRED column and a corner placement hugs that
+    /// corner (the same free placement the single card had).
+    ///
+    /// X — the card block (buffer x∈[STACK_AX-STACK_HALF, STACK_AX+STACK_HALF]) is CENTRED on
+    /// `nx`: its screen centre lands at `l + nx*(r-l)`, then the whole block is CLAMPED inside
+    /// `[l+pad, r-pad]` so it never runs off-screen (nx≈0.5 → centred, nx≈1 → hugs the right,
+    /// nx≈0 → hugs the left). We keep STACK_AX as the buffer centre and shift the WINDOW (like the
+    /// single card did via `place_window`), so the cover/draw never move in the buffer.
+    ///
+    /// Y — the block's anchor lands at the EXACT `t + ny*(b-t)` (free, like x), and the GROWTH
+    /// direction comes from the half: the top half (`ny<0.5`) anchors its top edge there + grows DOWN,
+    /// the bottom half anchors its bottom edge there + grows UP. So ny≈0 hugs the top, ny≈1 the bottom,
+    /// ny≈0.5 sits mid-screen — never snapped to an edge. (The inline preset — nx≈0.5 / ny≈0 — is a
+    /// top-centre strip, where game notices live.)
+    /// Sized to the cursor's monitor work area.
+    unsafe fn stack_origin(place: (f32, f32), cur: POINT) -> POINT {
+        let (l, t, r, b) = monitor_work(cur);
+        let pad = STACK_PAD as i32;
+        let (nx, ny) = (place.0.clamp(0.0, 1.0), place.1);
+        // x: centre the block on nx, then clamp the block fully inside [l+pad, r-pad]. `win_x` is the
+        // window's left so that block centre (win_x + STACK_AX) hits the desired screen centre.
+        let half = STACK_HALF.round() as i32;
+        let want_centre = (l as f32 + nx * (r - l) as f32).round() as i32;
+        let lo_centre = l + pad + half; // leftmost centre keeping the block on-screen
+        let hi_centre = (r - pad - half).max(lo_centre); // rightmost (degenerate-safe)
+        let centre = want_centre.clamp(lo_centre, hi_centre);
+        let win_x = centre - STACK_AX.round() as i32;
+        // y: honour the EXACT `ny` (like x honours nx) — anchor the block at `t + ny*(b-t)`, choosing
+        // the GROWTH direction by half (top grows DOWN from its top anchor, bottom grows UP from its
+        // bottom anchor). Clamped on-screen. (Was binary top/bottom-EDGE: every custom vertical spot
+        // snapped to an edge — a centre placement landed at the bottom instead of centred.)
+        let want_y = (t as f32 + ny.clamp(0.0, 1.0) * (b - t) as f32)
+            .round()
+            .clamp((t + pad) as f32, (b - pad) as f32) as i32;
+        let win_y = if ny < 0.5 {
+            want_y - STACK_AY_TOP.round() as i32
+        } else {
+            want_y - STACK_AY_BOT.round() as i32
+        };
+        POINT { x: win_x, y: win_y }
     }
 
     /// The radial wheel: N spokes + an outer arc; the aimed wedge `live` lights white-hot.
@@ -3348,6 +4050,48 @@ mod imp {
     struct FanR {
         label: Option<TextRaster>,
         active: bool,
+    }
+
+    /// A render-ready notification card in the STACK: the rasterized text (title small, value LARGE,
+    /// the body wrapped to up to 3 lines, the prev tiny) cached by `ident`+`rev`, plus a COPY of the
+    /// slot's animation/draw data for this frame. The rasters survive across the engine's 60fps
+    /// pushes (re-cut only when `rev` moves), so per-frame cost stays bounded — text is rasterized
+    /// per content-change, never per frame.
+    struct NotifyR {
+        ident: String,
+        rev: u64,
+        glyph: WedgeGlyph,
+        dir: i8,
+        fill: f32,
+        prev_fill: f32,
+        panel: bool,
+        /// the ASK slot: drawn in the ask layout (question + grammar row) instead of the
+        /// value-hierarchy. See [`NotifySlot::is_ask`].
+        is_ask: bool,
+        title: Option<TextRaster>,
+        value: Option<TextRaster>,
+        /// the body, WRAPPED to ≤3 lines then ellipsized — the meatier macro line that breathes.
+        /// EMPTY for an ask card (its layout is the fixed question+grammar rows).
+        body: Vec<TextRaster>,
+        prev: Option<TextRaster>,
+        // this frame's eased animation (copied from the pushed `NotifySlot`).
+        y: f32,
+        alpha: f32,
+        scale: f32,
+        collapse: f32,
+        bump: f32,
+    }
+
+    /// The rasterized DIGEST summary: the count, the latest line, cached by content; its glyph row +
+    /// animation come straight off the pushed `DigestView` each frame.
+    struct DigestR {
+        count: u32,
+        glyphs: Vec<WedgeGlyph>,
+        count_txt: Option<TextRaster>,
+        title: Option<TextRaster>,
+        value: Option<TextRaster>,
+        alpha: f32,
+        reveal: f32,
     }
 
     // ── tiny vector primitives: every icon is line-art splatted into a glow channel ──
@@ -3687,14 +4431,21 @@ mod imp {
                     varc(m, cx, cy, 0.86 * r * pulse, 0.0, TAU, sr, 0.4 * b);
                 }
                 WedgeGlyph::Target => {
-                    varc(m, cx, cy, 0.6 * r, 0.0, TAU, sr, 0.8 * b);
-                    vline(m, (cx - 0.85 * r, cy), (cx + 0.85 * r, cy), sr, 0.7 * b);
-                    vline(m, (cx, cy - 0.85 * r), (cx, cy + 0.85 * r), sr, 0.7 * b);
+                    // a real RETICLE — an outer ring, four gapped crosshair ticks reaching the rim
+                    // (with a clear gap around the centre), and a bright centre dot (the precise aim).
+                    varc(m, cx, cy, 0.62 * r, 0.0, TAU, sr, 0.85 * b);
+                    let (g_in, g_out) = (0.30 * r, 0.92 * r); // the gap and the outer reach
+                    vline(m, (cx, cy - g_in), (cx, cy - g_out), sr, 0.8 * b); // N
+                    vline(m, (cx, cy + g_in), (cx, cy + g_out), sr, 0.8 * b); // S
+                    vline(m, (cx - g_in, cy), (cx - g_out, cy), sr, 0.8 * b); // W
+                    vline(m, (cx + g_in, cy), (cx + g_out, cy), sr, 0.8 * b); // E
+                    splat(m, cx, cy, 0.15 * r, b); // the centre dot
                 }
                 WedgeGlyph::Scroll => {
-                    arrowhead(m, (cx, cy - 0.6 * r), (0.0, -1.0), 0.32 * r, sr, b);
-                    arrowhead(m, (cx, cy + 0.6 * r), (0.0, 1.0), 0.32 * r, sr, b);
-                    vline(m, (cx, cy - 0.3 * r), (cx, cy + 0.3 * r), sr, 0.5 * b);
+                    // a clean two-way scroll cue: a short central rail capped by an up + down arrowhead.
+                    arrowhead(m, (cx, cy - 0.62 * r), (0.0, -1.0), 0.34 * r, sr, b);
+                    arrowhead(m, (cx, cy + 0.62 * r), (0.0, 1.0), 0.34 * r, sr, b);
+                    vline(m, (cx, cy - 0.34 * r), (cx, cy + 0.34 * r), sr, 0.6 * b);
                 }
                 WedgeGlyph::Ghost => {
                     // a clipboard with a scalloped (ghostly) hem
@@ -3846,6 +4597,90 @@ mod imp {
                     vline(m, (cx, bp), (mx, cy + 0.35 * r), sr, b); // lower right diagonal
                     vline(m, (mx, cy + 0.35 * r), (cx - 0.3 * r, cy - 0.35 * r), sr, b);
                     // cross up-left
+                }
+                WedgeGlyph::Pulse => {
+                    // a frequency mark — three rising bars (a tiny ▮▮▮ spectrum): the report rate.
+                    // Bars stand on a shared baseline, each taller than the last (low → high freq).
+                    let base = cy + 0.6 * r;
+                    let bars = [(-0.55_f32, 0.4_f32), (0.0, 0.75), (0.55, 1.15)];
+                    for (bx, hh) in bars {
+                        let x = cx + bx * r;
+                        vline(m, (x, base), (x, base - hh * r), sr, b);
+                    }
+                    // a faint baseline tying them together
+                    vline(m, (cx - 0.78 * r, base), (cx + 0.78 * r, base), sr, 0.45 * b);
+                }
+                WedgeGlyph::Sun => {
+                    // a sun — a filled disc with eight radiating rays: the brightness / light cue.
+                    splat(m, cx, cy, 0.34 * r, b); // the disc body
+                    varc(m, cx, cy, 0.36 * r, 0.0, TAU, sr, 0.8 * b); // its rim
+                    for k in 0..8 {
+                        let a = (k as f32 / 8.0) * TAU;
+                        let (ux, uy) = (a.cos(), a.sin());
+                        vline(
+                            m,
+                            (cx + ux * 0.55 * r, cy + uy * 0.55 * r),
+                            (cx + ux * 0.92 * r, cy + uy * 0.92 * r),
+                            sr,
+                            0.85 * b,
+                        );
+                    }
+                }
+                WedgeGlyph::Battery => {
+                    // a battery cell — a rounded body, the positive terminal nub on the right, and two
+                    // charge bars inside (the fill). Pure strokes, like the rest of the icon set.
+                    let (l, rt, tp, bt) = (cx - 0.7 * r, cx + 0.5 * r, cy - 0.42 * r, cy + 0.42 * r);
+                    vline(m, (l, tp), (rt, tp), sr, b); // top
+                    vline(m, (l, bt), (rt, bt), sr, b); // bottom
+                    vline(m, (l, tp), (l, bt), sr, b); // left
+                    vline(m, (rt, tp), (rt, bt), sr, b); // right
+                    // terminal nub
+                    vline(m, (rt, cy - 0.18 * r), (cx + 0.66 * r, cy - 0.18 * r), sr, b);
+                    vline(m, (rt, cy + 0.18 * r), (cx + 0.66 * r, cy + 0.18 * r), sr, b);
+                    vline(m, (cx + 0.66 * r, cy - 0.18 * r), (cx + 0.66 * r, cy + 0.18 * r), sr, b);
+                    // two charge bars inside
+                    vline(m, (cx - 0.40 * r, tp + 0.16 * r), (cx - 0.40 * r, bt - 0.16 * r), sr, 0.85 * b);
+                    vline(m, (cx - 0.10 * r, tp + 0.16 * r), (cx - 0.10 * r, bt - 0.16 * r), sr, 0.85 * b);
+                }
+                WedgeGlyph::Ask => {
+                    // a question mark — a curling hook over a baseline dot. The head is a ~3/4 arc
+                    // opening down-left, dropping into a short vertical stem; a separate dot sits
+                    // below (the classic '?' silhouette), all in clean procedural strokes.
+                    let hcy = cy - 0.28 * r; // the hook's centre, sat high
+                    let hr = 0.34 * r; // its radius
+                    // the curl: from the lower-left, up and over the top, down the right side
+                    // (angles y-down: PI = west, -PI/2 = north, 0 = east, ~0.35PI = lower-right).
+                    varc(
+                        m,
+                        cx,
+                        hcy,
+                        hr,
+                        std::f32::consts::PI * 0.92,
+                        -std::f32::consts::PI * 0.30,
+                        sr,
+                        b,
+                    );
+                    // the stem dropping from the hook's lower-right tail to the body's mid-line.
+                    let tail_x = cx + hr * (std::f32::consts::PI * 0.30).cos();
+                    let tail_y = hcy + hr * (-std::f32::consts::PI * 0.30).sin();
+                    vline(m, (tail_x, tail_y), (cx, cy + 0.20 * r), sr, b);
+                    // the baseline dot.
+                    splat(m, cx, cy + 0.56 * r, 0.13 * r, b);
+                }
+                WedgeGlyph::SidePlate => {
+                    // a swappable side PLATE — a rounded chip frame with a 2×2 grid of button pips
+                    // (the side buttons the plate carries). A "hardware module" read, distinct from the
+                    // battery cell (no terminal nub) and the single profile dot (a grid, not one mark).
+                    let (l, rt, tp, bt) = (cx - 0.62 * r, cx + 0.62 * r, cy - 0.72 * r, cy + 0.72 * r);
+                    vline(m, (l, tp), (rt, tp), sr, b); // top
+                    vline(m, (l, bt), (rt, bt), sr, b); // bottom
+                    vline(m, (l, tp), (l, bt), sr, b); // left
+                    vline(m, (rt, tp), (rt, bt), sr, b); // right
+                    for gx in [-0.28_f32, 0.28] {
+                        for gy in [-0.34_f32, 0.34] {
+                            splat(m, cx + gx * r, cy + gy * r, 0.12 * r, 0.9 * b);
+                        }
+                    }
                 }
                 _ => {
                     // generic hollow diamond (Mark + any unhandled) — never blank

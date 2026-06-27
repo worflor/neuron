@@ -1,0 +1,72 @@
+// The GUIDE content registry — the data behind the in-app help popup. Each guide is pure DATA: an id
+// (matched against State.guide-active-id), a title, and a list of sections (a bold heading + a body
+// paragraph; bodies respect "\n"). The GuidePopup (app.slint) renders the active guide straight off
+// this model, so adding help is data + a dropped GuideButton — never new UI.
+//
+// To add a guide: append a GuideEntry below, then drop `GuideButton { guide-id: "<your-id>"; }` next
+// to the relevant header. That's it — the popup, the tooltip<->sticky window, the X, and the scroll
+// all come for free.
+
+// One section of a guide — a bold heading over a body paragraph.
+export struct GuideSection {
+    head: string,
+    body: string,
+}
+
+// One whole guide — selected by `id`, titled in the popup's title bar, bodied by its sections.
+export struct GuideEntry {
+    id: string,
+    title: string,
+    sections: [GuideSection],
+}
+
+export global GuideContent {
+    // The WORKSHOP guide is a BUILD guide that SCAFFOLDS: it climbs gently from "anyone can write this"
+    // (plain keystrokes) → "it reacts to me" (ctx as input) → the deep power (drive the device, sense,
+    // remember, compose), then bookends with the no-code + no-ceiling escape valves. Every section is a
+    // paste-able recipe, never engine exposition. The order is the lesson — keep the ramp intact.
+    out property <[GuideEntry]> guides: [
+        {
+            id: "macros",
+            title: "MACROS \u{00b7} WORKSHOP",
+            sections: [
+                {
+                    head: "Your first macro",
+                    body: "A macro is a tiny Python function \u{2014} `def macro(ctx):` \u{2014} and its body runs every time you press the control you bind it to. That's the whole idea:\n\n    def macro(ctx):\n        neuron.type_text(\"on my way!\")\n\nPaste it, bind it here, press. Testing in this Workshop is DISARMED \u{2014} you see what a macro WOULD do (its asks, its notifies) but nothing actually types or clicks, so there's no way to break anything while you learn.",
+                },
+                {
+                    head: "The everyday verbs",
+                    body: "Most macros are just the keystrokes + clicks you'd rather not do by hand:\n\n    neuron.type_text(\"...\")      # type a string\n    neuron.hotkey(\"ctrl\", \"s\")    # a chord\n    neuron.key(\"enter\")           # one key\n    neuron.click(\"right\")         # a mouse click\n    neuron.run(\"notepad\")         # launch or shell out\n\nAlso handy: type_ghost (organic slow typing that lands in chats + games), scroll, mouse_to, clipboard_get / clipboard_set, focus(title), sleep(ms). String a few together and you've automated a routine.",
+                },
+                {
+                    head: "Make it react to your world",
+                    body: "Now they get smart. `ctx` is a snapshot of the instant you pressed \u{2014} use it as INPUT and ONE macro adapts to where you are:\n\n    def macro(ctx):\n        neuron.type_text(ctx.selection.upper())   # SHOUT the highlighted text\n\n    def macro(ctx):\n        if \"code\" in ctx.app:         # only in your editor\n            neuron.hotkey(\"ctrl\", \"/\")\n\nFields: ctx.app, ctx.title, ctx.selection, ctx.clipboard, ctx.cwd. Same press, different result depending on your world.",
+                },
+                {
+                    head: "Loop yourself in",
+                    body: "A macro can pause and ask you \u{2014} a small radial pops at your cursor, blocking ONLY this macro, never your input:\n\n    if neuron.ask(\"deploy?\"):           # yes / no\n        ...\n    pick = neuron.choose(\"profile?\",    # a menu\n        [\"gaming\", \"work\", \"quiet\"])\n    if neuron.confirm(\"about to wipe\"):  # a breakpoint\n        return                          # swipe to stop; ignore = go\n\nFlick to answer, or ignore it to take the default. confirm is a one-swipe \u{201c}pause to review\u{201d}: leave it be and the macro simply proceeds.",
+                },
+                {
+                    head: "Now drive Neuron itself",
+                    body: "Comfortable? Here's the deep end \u{2014} and it's still three lines. A macro can drive the whole app + your device, exactly like a bound action, so you can build a one-press \u{201c}scene\u{201d}:\n\n    def macro(ctx):\n        neuron.profile(\"gaming\")\n        neuron.dpi(1600)\n        neuron.mic_mute(\"off\")\n\nVerbs: dpi \u{00b7} dpi_cycle \u{00b7} scroll_cycle \u{00b7} profile \u{00b7} profile_cycle \u{00b7} brightness \u{00b7} mic_mute \u{00b7} out_mute \u{00b7} mic_gain \u{00b7} out_gain. Each is the real, confirmed write \u{2014} the same as flipping it in the UI.",
+                },
+                {
+                    head: "Sense, then decide",
+                    body: "Macros can READ live state and branch on it:\n\n    def macro(ctx):\n        b = neuron.battery()\n        if b and b[\"percent\"] < 15:\n            neuron.profile(\"powersave\")\n\nReaders: battery() (percent + charging) \u{00b7} current_dpi() \u{00b7} active_profile() \u{00b7} scroll_stage().",
+                },
+                {
+                    head: "Give it a memory",
+                    body: "store / load persist per-macro across restarts \u{2014} the trick behind toggles + counters:\n\n    def macro(ctx):                 # a DPI toggle\n        on = not neuron.load(\"on\", False)\n        neuron.store(\"on\", on)\n        neuron.dpi(3200 if on else 800)\n        neuron.notify(\"sniper \" + (\"on\" if on else \"off\"))",
+                },
+                {
+                    head: "Build big from small",
+                    body: "Keep each macro ONE job, then compose. invoke() runs another by name; NEURON_OPTIONS exposes real GUI knobs so one macro serves many uses:\n\n    def macro(ctx):\n        neuron.invoke(\"mute_all\")             # run + wait\n        if neuron.invoke(\"is_clean\"):         # use its result\n            neuron.invoke(\"deploy\", wait=False)\n\n        speed = neuron.option(\"speed\", \"fast\") # a declared option's value",
+                },
+                {
+                    head: "No ceiling \u{2014} and no need to code",
+                    body: "Two escape valves, opposite ways. DON'T want to write Python? Every macro is ALSO a drag-and-drop block tree (Action + Flow steps) that round-trips to code losslessly. Want MORE than the toolkit? Underneath it's real CPython in its own process \u{2014} import anything, open files, call Win32 via ctypes, hit the network. A crash only takes down that sidecar (auto-respawned); your input never stutters. Start small \u{2014} the ceiling is very far up.",
+                },
+            ],
+        },
+    ];
+}

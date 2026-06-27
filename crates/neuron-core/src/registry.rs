@@ -14,6 +14,13 @@ pub struct CommandSpec {
     pub size: u8,
     #[serde(default)]
     pub args: Vec<u8>,
+    /// Optional per-command transaction_id override. Most commands use the device-default
+    /// [`DeviceDef::transaction_id`]; a few command families (e.g. the Chroma V2's lighting
+    /// EFFECT / CUSTOM-FRAME writes, which need 0x3F while its getters use 0xFF) wire a
+    /// different tx. When `None`, the device default is used — so devices that set no override
+    /// are byte-identical to before.
+    #[serde(default)]
+    pub transaction_id: Option<u8>,
 }
 
 /// One USB link-mode personality (wired / dongle / bluetooth) with its PID.
@@ -44,6 +51,15 @@ pub struct DeviceDef {
     /// Optional unified-lighting wiring (the device-specific dialect of class 0x03 / 0x0F).
     #[serde(default)]
     pub lighting: Option<crate::lighting::LightingDef>,
+    /// Optional swappable SIDE-PLATE id→label map (e.g. the Naga V2 Pro's magnetic side plates).
+    /// The plate is detected ONLY via a device-PUSHED HID report (`05 0e <strap_id>`) on the input
+    /// interface — there is NO feature-getter (a full getter sweep + swap-diff confirmed zero
+    /// change), so the report itself IS the detection (decoded in the app's `hidwatch`). This table
+    /// is the DATA half of that: hardware strap-code → human label. Keys are the strap-codes as
+    /// strings (TOML table keys are strings); `0`/none = "detached", handled in code, so it need not
+    /// appear here. Devices without swappable plates simply omit the table.
+    #[serde(default)]
+    pub side_plates: Option<BTreeMap<String, String>>,
 }
 
 impl DeviceDef {
@@ -59,6 +75,23 @@ impl DeviceDef {
     pub fn matches_control(&self, usage_page: u16, usage: u16, feature_len: u16) -> bool {
         let c = &self.control_interface;
         c.usage_page == usage_page && c.usage == usage && c.feature_report_len == feature_len
+    }
+
+    /// Does this device have a swappable SIDE-PLATE map (a `[side_plates]` table)? The push-only
+    /// plate detection (see [`DeviceDef::side_plates`]) is the gate for surfacing the plate readout.
+    pub fn has_side_plates(&self) -> bool {
+        self.side_plates.is_some()
+    }
+
+    /// Resolve a side-plate hardware strap-code to its human label via the `[side_plates]` DATA map
+    /// (never a hardcoded id→label table in logic). `None` for an unknown code or a device with no
+    /// plates — the caller decides how to degrade (the decode site shows a transparent "plate N").
+    /// Strap-code `0` (none/detached) is handled at the call site, so it is absent from the map.
+    pub fn side_plate_label(&self, id: u8) -> Option<&str> {
+        self.side_plates
+            .as_ref()?
+            .get(&id.to_string())
+            .map(|s| s.as_str())
     }
 
     /// Does this device's registry expose a command under `name`? The registry-driven answer to
@@ -329,6 +362,26 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn side_plates_map_is_data_driven_and_graceful() {
+        let (naga, bw) = builtins();
+        // the Naga V2 Pro ships the swappable side-plate map; the keyboard has none.
+        assert!(naga.has_side_plates());
+        assert!(!bw.has_side_plates());
+        // id → label resolves straight from the [side_plates] TOML table (the DATA, not logic).
+        // These are hardware STRAP-CODES (verified live), NOT button counts.
+        assert_eq!(naga.side_plate_label(1), Some("2-button"));
+        assert_eq!(naga.side_plate_label(3), Some("12-button"));
+        assert_eq!(naga.side_plate_label(4), Some("6-button"));
+        // an UNKNOWN strap-code degrades gracefully to None (the decode site shows "plate N", never
+        // a wrong label). 0/detached is intentionally absent (handled in code).
+        assert_eq!(naga.side_plate_label(0), None);
+        assert_eq!(naga.side_plate_label(2), None);
+        assert_eq!(naga.side_plate_label(9), None);
+        // a device with no plate map never claims one.
+        assert_eq!(bw.side_plate_label(3), None);
     }
 
     #[test]

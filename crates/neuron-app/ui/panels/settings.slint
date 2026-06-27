@@ -1,102 +1,7 @@
 import { Theme } from "../theme.slint";
-import { Card, SectionTitle, Label, Button, Toggle, Pill, Mono, Divider, PanelHead, Field, Slider, Segment } from "../widgets/controls.slint";
+import { Card, SectionTitle, Label, Button, Toggle, Pill, Mono, Divider, PanelHead, Slider, Segment, ColorPicker, Palette } from "../widgets/controls.slint";
 import { State } from "../state.slint";
 import { DiagRow } from "../models.slint";
-
-// One accent customiser — a live-preview swatch + label, a row of preset hues, and a hex field.
-// Picking a swatch (or entering a hex) recolours its target live AND persists (the `pick` callback
-// does both). Used identically for the INTERFACE accent and the WEAVE accent — teaching by symmetry.
-component AccentPicker inherits VerticalLayout {
-    in property <string> label;
-    in property <string> hint;
-    in property <color> current;       // the LIVE colour, for the preview swatch
-    in property <string> value;        // the saved bare-RRGGBB, for the selected-swatch mark + field
-    in property <[{hex: string, col: color}]> swatches;
-    callback pick(string);             // bare RRGGBB (no '#')
-    // is THIS picker's field the one being typed into? gates the (shared) live preview to the active
-    // picker — only one field holds focus. On focus-in, prime the preview from the current text so the
-    // swatch starts truthful instead of showing a stale value from a prior edit.
-    property <bool> editing: fld.has-focus;
-    changed editing => { if (root.editing) { State.preview-hex(fld.text); } }
-    spacing: 9px;
-    HorizontalLayout {
-        spacing: 10px;
-        // live preview swatch — the colour RIGHT NOW, and while you enter a custom hex it morphs to the
-        // value you're typing the instant it's a complete, valid 6 digits (Rust parses; nothing commits).
-        Rectangle {
-            width: 26px; height: 26px; border-radius: Theme.radius-sm;
-            border-width: Theme.hair; border-color: Theme.line;
-            background: root.editing && State.hex-preview-ok ? State.hex-preview-col : root.current;
-            animate background { duration: Theme.quick; }
-        }
-        VerticalLayout {
-            alignment: center;
-            Text {
-                text: root.label;
-                color: Theme.text-dim; font-family: Theme.mono; font-size: Theme.fs-small;
-                font-weight: 700; letter-spacing: 1.2px;
-            }
-        }
-        Rectangle {}
-        fld := Field {
-            field-width: 110px;
-            placeholder: "4af2b0";
-            text: root.value;
-            // danger hairline ONLY when it's genuinely wrong (bad char / overlong) — a half-typed value stays neutral
-            invalid: root.editing && State.hex-preview-bad;
-            edited(t) => { State.preview-hex(t); }   // live preview as you type — no commit, no recolour
-            accepted(t) => { root.pick(t); }         // Enter commits: recolours + persists
-        }
-    }
-    // the PRISM — appears while the field holds focus: drag across for hue, down for brightness;
-    // release commits (the same prism the cast disperses into, used to choose its colour).
-    if root.editing : Rectangle {
-        height: 54px;
-        border-radius: Theme.radius-sm;
-        border-width: Theme.hair;
-        border-color: Theme.line;
-        clip: true;
-        background: @linear-gradient(90deg, #ff3b5c, #ff8f1f, #ffd60a, #34d65a, #20c9d6, #2f7bff, #8a5cff, #ff3b5c);
-        // brightness wash — bright at the top, dimming toward the bottom
-        Rectangle {
-            x: 0; y: 0; width: parent.width; height: parent.height;
-            background: @linear-gradient(180deg, #00000000, #00000000 42%, #00000099);
-        }
-        prism := TouchArea {
-            mouse-cursor: MouseCursor.crosshair;
-            moved => { State.preview-hue(self.mouse-x / self.width, 1 - self.mouse-y / self.height); }
-            pointer-event(e) => {
-                if (e.kind == PointerEventKind.down) {
-                    State.preview-hue(self.mouse-x / self.width, 1 - self.mouse-y / self.height);
-                }
-                if (e.kind == PointerEventKind.up) {
-                    root.pick(State.hue-pick-hex);
-                }
-            }
-        }
-    }
-    HorizontalLayout {
-        spacing: 6px;
-        for sw in root.swatches : Rectangle {
-            width: 26px; height: 26px; border-radius: Theme.radius-sm;
-            border-width: Theme.hair;
-            border-color: sw.hex == root.value ? Theme.accent-line : (sta.has-hover ? Theme.text-faint : Theme.line-soft);
-            background: sw.col;
-            animate border-color { duration: Theme.quick; }
-            // pick commits; prime the preview too so the swatch matches even if the field keeps focus
-            sta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.pick(sw.hex); State.preview-hex(sw.hex); } }
-        }
-        Rectangle {}
-    }
-    // the hint wraps within the column (a Mono ran off the 380px edge — "…connected mark ti" clipped)
-    if root.hint != "" : Text {
-        text: root.hint;
-        color: Theme.text-faint;
-        font-family: Theme.mono;
-        font-size: Theme.fs-small;
-        wrap: word-wrap;
-    }
-}
 
 // SETTINGS — startup, the global writes-paused safety gate, the SAFE-MODE / arm-input switch, the
 // Import WIZARD launcher (a flow), and DIAGNOSTICS: the in-app test BENCH. Nine probe stations in
@@ -120,14 +25,20 @@ component DiagCell inherits Rectangle {
         spacing: 6px;
         HorizontalLayout {
             spacing: 7px;
-            // verdict lamp — a square station light (skip is a real verdict: warn, not faint)
+            // verdict lamp — a square station light. SHAPE, not just hue, carries the verdict so the
+            // lamp alone reads under deuteranopia (amber skip vs red fail are hue-twins): pass/fail
+            // are SOLID-filled squares, skip/warn a HOLLOW ring (border only), idle a faint solid.
+            // So the indistinguishable amber-vs-red pair separates as hollow-vs-filled, not by hue.
             Rectangle {
+                property <bool> hollow: root.d.state == "skip";
                 width: 6px; height: 6px; border-radius: 1px;
                 y: (parent.height - self.height) / 2;
-                background: root.d.state == "pass" ? Theme.accent
+                background: self.hollow ? transparent
+                    : root.d.state == "pass" ? Theme.accent
                     : root.d.state == "fail" ? Theme.danger
-                    : root.d.state == "skip" ? Theme.warn
                     : Theme.text-faint;
+                border-width: self.hollow ? 1.5px : 0px;
+                border-color: Theme.warn;
             }
             Text {
                 text: root.d.name;
@@ -253,7 +164,7 @@ component NotifPlacer inherits Rectangle {
     min-width: 348px; max-width: 348px;   // pin the mock screen's width (can't also set `width`)
     height: 196px;
     border-radius: 7px;
-    background: @linear-gradient(180deg, #0a0c11 0%, #060709 100%);   // a faint screen sheen
+    background: @linear-gradient(180deg, Theme.bg-2 0%, Theme.bg 100%);   // a faint screen sheen
     border-width: Theme.hair;
     border-color: Theme.line;
     clip: true;
@@ -301,12 +212,13 @@ component NotifPlacer inherits Rectangle {
         // off state fades to the SAME hue at zero alpha (never `transparent`), so it dissolves cleanly.
         background: State.notif-panel ? (root.dragging ? Theme.well-hi : Theme.well) : Theme.well.with-alpha(0);
         border-width: Theme.hair;
-        border-color: State.notif-panel ? (root.dragging ? Theme.accent : Theme.accent-line) : Theme.accent-line.with-alpha(0);
+        // the card wears the WEAVE colour (what a real notification actually shows), NOT the interface accent
+        border-color: State.notif-panel ? (root.dragging ? State.weave-accent-col : State.weave-accent-col.with-alpha(0.27)) : State.weave-accent-col.with-alpha(0);
         animate x, y { duration: Theme.press-throw; easing: ease-out; }   // a weighty magnetic settle
         animate background, border-color { duration: Theme.quick; }
         HorizontalLayout {
             padding-left: 7px; padding-right: 7px; spacing: 6px;
-            VerticalLayout { alignment: center; Rectangle { width: 5px; height: 5px; border-radius: 3px; background: Theme.accent; } }
+            VerticalLayout { alignment: center; Rectangle { width: 5px; height: 5px; border-radius: 3px; background: State.weave-accent-col; } }
             VerticalLayout {
                 alignment: center; spacing: 3px;
                 Rectangle { height: 2px; width: 28px; border-radius: 1px; background: Theme.text-faint; }
@@ -368,15 +280,692 @@ component NotifTypeChip inherits Rectangle {
     ta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.toggled(); } }
 }
 
+// The WHEN-SEVERAL-LAND preview — a mock "screen corner" that shows how multiple cards behave in the
+// chosen mode: STACK = a depth-stacked column (newest in front, brightest; older recede); LATEST = one
+// card; DIGEST = one card with a count + a row of source glyphs. A glanceable picture of the live mode.
+component NotifStackMock inherits Rectangle {
+    in property <string> mode;
+    width: 150px;
+    height: 96px;
+    border-radius: Theme.radius;
+    background: Theme.bg-2;
+    border-width: Theme.hair;
+    border-color: Theme.line;
+    clip: true;
+    property <length> cw: 96px;
+    property <length> pad: 9px;
+    // STACK — three cards, newest front (bright), older receding (dimmer + narrower).
+    if root.mode == "stack" : Rectangle {
+        x: parent.width - root.cw - root.pad;
+        y: root.pad;
+        width: root.cw;
+        for i in 3 : Rectangle {
+            y: i * 23px;
+            width: root.cw * (1.0 - i * 0.07);
+            x: root.cw - self.width;
+            height: 19px;
+            border-radius: Theme.radius-sm;
+            background: Theme.well;
+            border-width: Theme.hair;
+            border-color: State.weave-accent-col.with-alpha(0.27);
+            opacity: 1.0 - i * 0.3;
+            HorizontalLayout {
+                padding-left: 5px; padding-right: 5px; spacing: 5px;
+                VerticalLayout { alignment: center; Rectangle { width: 6px; height: 6px; border-radius: 1px; background: State.weave-accent-col; } }
+                VerticalLayout {
+                    alignment: center; horizontal-stretch: 1; spacing: 3px;
+                    Rectangle { height: 3px; width: 68%; border-radius: 1px; background: Theme.text-faint; }
+                    Rectangle { height: 3px; width: 42%; border-radius: 1px; background: Theme.line; }
+                }
+            }
+        }
+    }
+    // LATEST — a single card.
+    if root.mode == "latest" : Rectangle {
+        x: parent.width - root.cw - root.pad;
+        y: root.pad;
+        width: root.cw;
+        height: 19px;
+        border-radius: Theme.radius-sm;
+        background: Theme.well;
+        border-width: Theme.hair;
+        border-color: State.weave-accent-col.with-alpha(0.27);
+        HorizontalLayout {
+            padding-left: 5px; padding-right: 5px; spacing: 5px;
+            VerticalLayout { alignment: center; Rectangle { width: 6px; height: 6px; border-radius: 1px; background: State.weave-accent-col; } }
+            VerticalLayout {
+                alignment: center; horizontal-stretch: 1; spacing: 3px;
+                Rectangle { height: 3px; width: 68%; border-radius: 1px; background: Theme.text-faint; }
+                Rectangle { height: 3px; width: 42%; border-radius: 1px; background: Theme.line; }
+            }
+        }
+    }
+    // DIGEST — one card: a big count + a row of source glyphs + a line.
+    if root.mode == "digest" : Rectangle {
+        x: parent.width - root.cw - root.pad;
+        y: root.pad;
+        width: root.cw;
+        height: 30px;
+        border-radius: Theme.radius-sm;
+        background: Theme.well;
+        border-width: Theme.hair;
+        border-color: State.weave-accent-col.with-alpha(0.27);
+        HorizontalLayout {
+            padding-left: 6px; padding-right: 6px; spacing: 6px;
+            VerticalLayout { alignment: center; Text { text: "3"; color: State.weave-accent-col; font-family: Theme.mono; font-weight: 700; font-size: Theme.fs-body; } }
+            VerticalLayout {
+                alignment: center; horizontal-stretch: 1; spacing: 4px;
+                HorizontalLayout {
+                    spacing: 3px;
+                    for d in 3 : Rectangle { width: 5px; height: 5px; border-radius: 1px; background: State.weave-accent-col; }
+                    Rectangle {}
+                }
+                Rectangle { height: 3px; width: 70%; border-radius: 1px; background: Theme.text-faint; }
+            }
+        }
+    }
+}
+
+// SNAP TAP STAGE — "THE DIVERGENCE". The self-demonstrating visual for the Snap Tap mechanical
+// advantage, reimagined as a TWO-PLAYER RACE on the same input. Two stacked full-width lanes are fed
+// the IDENTICAL counter-strafe sequence (the shared [A] [D] keycaps drive both): the upper RAW lane is
+// the dim, normal-SOCD player; the lower SNAP lane is the glowing accent player. On the snap the accent
+// player flips to D INSTANTLY while the dim one STALLS in the SOCD dead-zone — and the glowing LEAD-GAP
+// spanning the horizontal distance between them is the hero element: the edge, quantified. Same trigger,
+// one's already there, one's stuck. No text — accent=winner / dim=laggard carries it.
+//
+//   [A] ........... shared input lights both lanes ........... [D]
+//   raw   o..........|..  (stalls in the dead-zone)  — dim hollow ring, frozen
+//   snap  *======================>(O)  halo + comet  — accent, snapped to D, instant
+//              |---- LEAD-GAP (glows) ----|             the advantage, made visible
+//
+// PHASES (one Timer tick each; the snap flips fast then HOLDS the rest of the tick — that held frame
+// after the instant flip is what sells "instant"):
+//   0  ready   — both markers at A (left), keys up (a breath before the beat)
+//   1  strafe  — A pressed ([A] lit on both lanes); both markers hold the A end (they agree)
+//   2  SNAP    — D tapped while A held ([A]+[D] lit): accent SNAPS to D (instant) + halo + comet streak;
+//               dim STALLS in the dead-zone with a warning pulse; the LEAD-GAP blooms between them
+//   3  catchup — dim limps over to D (slow, too late); the lead-gap collapses; a soft accent pulse at D
+//   4  reset   — keys up; both ease back to A, then loop
+// `live` gates the Timer so it only animates while the option is REVEALED (sealed = perfectly still).
+component SnapTapStage inherits Rectangle {
+    in property <bool> live: false;        // REVEALED → the demo plays; LOCKED → frozen
+    property <int> phase: 0;
+
+    // ── INTERACTIVE DRIVE — once revealed, you can press-and-hold the [A]/[D] caps and drive the race
+    // yourself: the snap lane snaps to the last-pressed instantly while the raw lane stalls in the
+    // dead-zone when both are held. Purely illustrative — works on any device (only the ENABLE step is
+    // gated). While `interactive`, positions DERIVE from the held keys; an idle Timer hands control back
+    // to the auto-loop after a quiet beat, and the auto-loop only advances `phase` while !interactive. ──
+    property <bool> a-held: false;         // [A] cap currently pressed (mouse-down)
+    property <bool> d-held: false;         // [D] cap currently pressed
+    property <int> last-key: 0;            // 0 = A, 1 = D — the snap lane resolves to this when both held
+    property <bool> interactive: false;    // the user is driving (vs the auto-loop)
+
+    // ── the SHARED full-width lane geometry — both rails span MOST of the card (A=left, D=right) ──
+    property <length> inset: 30px;         // rail end ← card edge; keeps markers off the keycaps
+    property <length> rail-x0: self.inset;
+    property <length> rail-w: self.width - 2 * self.inset;
+    // marker centre x for a normalised position p (0 = A end, 1 = D end), in card coords.
+    pure function mx(p: float) -> length { root.rail-x0 + p * root.rail-w }
+    // the two stacked rails' y centres (and the keycap row above), inside the ~150px host.
+    property <length> caps-y: 26px;        // the shared input-cue keycap row
+    property <length> rail-t-y: 76px;      // upper rail — RAW (dim)
+    property <length> rail-b-y: 124px;     // lower rail — SNAP TAP (accent, the hero)
+
+    // the ACCENT (snap-tap) player's normalised position 0(A) .. 1(D).
+    //   INTERACTIVE: snap to last-pressed — both held → last-key; only D → D; only A → A; neither → rest.
+    //   AUTO:        the phased loop (ready/strafe→A, SNAP/catchup→D, reset→A).
+    property <float> accent-pos: root.interactive
+        ? ( (root.a-held && root.d-held) ? (root.last-key == 1 ? 1.0 : 0.0)
+            : root.d-held ? 1.0
+            : root.a-held ? 0.0
+            : 0.5 )                        // rest at centre
+        : ( root.phase == 0 ? 0.0 :        // ready  → A
+            root.phase == 1 ? 0.0 :        // strafe → A (agrees)
+            root.phase == 2 ? 1.0 :        // SNAP   → D (instant)
+            root.phase == 3 ? 1.0 :        // catchup→ holds D
+            0.0 );                          // reset  → A
+    // the DIM (raw SOCD) player: STALLS dead-centre when both are held (the dead-zone), else follows.
+    //   INTERACTIVE: both held → 0.5 (stall); only D → D; only A → A; neither → rest.
+    //   AUTO:        agrees on strafe, stalls on the snap, then limps to D.
+    property <float> dim-pos: root.interactive
+        ? ( (root.a-held && root.d-held) ? 0.5
+            : root.d-held ? 1.0
+            : root.a-held ? 0.0
+            : 0.5 )                        // rest at centre
+        : ( root.phase == 0 ? 0.0 :        // ready  → A
+            root.phase == 1 ? 0.0 :        // strafe → A (agrees)
+            root.phase == 2 ? 0.5 :        // STALLS dead-centre — the neutral dead-zone the edge removes
+            root.phase == 3 ? 1.0 :        // limps over (too late)
+            0.0 );                          // reset  → A
+    // which key is "pressed" (lights BOTH lanes' shared cue). Interactive → the real held state; auto →
+    // the scripted sequence (A held through 1,2,3; D tapped 2,3).
+    property <bool> a-down: root.interactive ? root.a-held : (root.phase == 1 || root.phase == 2 || root.phase == 3);
+    property <bool> d-down: root.interactive ? root.d-held : (root.phase == 2 || root.phase == 3);
+    // THE SNAP — drives the accent's crisp easing, the halo bloom, the comet, the gap, the warn dead-zone.
+    // Interactive: both keys held = the live SOCD conflict (raw stalls, snap holds last). Auto: phase 2.
+    property <bool> snapping: root.interactive ? (root.a-held && root.d-held) : (root.phase == 2);
+    // the lead-gap is "live" (visible) whenever the accent is meaningfully ahead of the dim marker.
+    property <bool> gap-open: root.interactive ? (root.a-held && root.d-held) : (root.phase == 2);
+
+    height: 150px;
+    border-radius: Theme.radius;
+    background: Theme.bg-2;
+    border-width: Theme.hair;
+    border-color: Theme.line;
+    clip: true;
+
+    // the loop: 5 phases. The snap (2) flips fast then holds the rest of its tick; 0 + 4 give it air.
+    // It keeps ticking while the user drives (so its phase stays warm) but only ADVANCES the phase when
+    // !interactive — manual driving never fights the auto-loop, and when control hands back the loop
+    // resumes from where it was, easing smoothly into the next beat.
+    Timer {
+        interval: 820ms;
+        running: root.live;
+        triggered => { if (!root.interactive) { root.phase = mod(root.phase + 1, 5); } }
+    }
+    // IDLE-RESUME — a single-shot countdown restarted on every press/release while driving. When it
+    // fires (a quiet beat after the last input) control eases back to the auto-loop. `start-driving()`
+    // arms interactivity + (re)starts it; releasing a cap also restarts it so a held pose still resumes.
+    idle-timer := Timer {
+        interval: 2500ms;
+        running: false;
+        triggered => { root.interactive = false; self.stop(); }
+    }
+    function start-driving(key: int) {
+        root.last-key = key;
+        root.interactive = true;
+        idle-timer.restart();
+    }
+    function bump-idle() { idle-timer.restart(); }
+
+    // ── the two RAILS — faint full-width tracks the markers ride; end stops at A and D ──
+    for r in [
+        { ry: root.rail-t-y, c: Theme.line },                    // RAW rail (dim)
+        { ry: root.rail-b-y, c: Theme.accent-line },             // SNAP rail (accent hairline)
+    ] : Rectangle {
+        x: root.rail-x0; y: r.ry - 1px;
+        width: root.rail-w; height: 2px; border-radius: 1px;
+        background: r.c;
+        // end stops — short ticks at the A end and D end of each rail
+        for ex in [0.0, 1.0] : Rectangle {
+            x: ex * root.rail-w - 1px; y: -4px;
+            width: 2px; height: 10px; border-radius: 1px;
+            background: Theme.text-faint.with-alpha(0.6);
+        }
+    }
+    // the DEAD-ZONE on the RAW rail — the neutral trap where opposing inputs cancel. The dim player falls
+    // in and STALLS dead-centre; the SNAP-TAP rail has NONE. Faintly present, it flares warn as the marker
+    // is caught in it on the snap — naming the exact stall the advantage removes (no text needed).
+    Rectangle {
+        x: root.mx(0.38); y: root.rail-t-y - 9px;
+        width: root.mx(0.62) - root.mx(0.38); height: 18px;
+        border-radius: Theme.radius-sm;
+        background: Theme.warn.with-alpha(root.snapping ? 0.16 : 0.06);
+        border-width: Theme.hair;
+        border-color: Theme.warn.with-alpha(root.snapping ? 0.55 : 0.22);
+        animate background, border-color { duration: 300ms; easing: ease-out; }
+    }
+
+    // ── the LEAD-GAP — THE SIGNATURE. A glowing accent band bridging the two lanes' x-positions:
+    // from where the dim player STALLED to where the accent player SNAPPED. It blooms on the snap = the
+    // edge made visible ("this far ahead"), then collapses as the dim one finally limps over on catchup.
+    Rectangle {
+        // span horizontally from the dim marker (left edge of the gap) to the accent marker (right edge),
+        // spanning vertically between the two rails so it visibly connects laggard → winner.
+        x: root.mx(root.dim-pos);
+        y: root.rail-t-y;
+        width: max(0px, root.mx(root.accent-pos) - root.mx(root.dim-pos));
+        height: root.rail-b-y - root.rail-t-y;
+        border-radius: Theme.radius-sm;
+        background: Theme.accent-glow;
+        border-width: Theme.hair;
+        border-color: Theme.accent-line;
+        opacity: root.gap-open ? 1.0 : 0.0;
+        // bloom fast with the snap; fade as it collapses on catchup. width follows the markers' easing.
+        animate x { duration: root.snapping ? 90ms : 360ms; easing: root.snapping ? ease-out : ease-in-out; }
+        animate width { duration: root.snapping ? 90ms : 360ms; easing: root.snapping ? ease-out : ease-in-out; }
+        animate opacity { duration: root.gap-open ? 140ms : 280ms; easing: ease-out; }
+        // MEASUREMENT TICKS — faint vertical hairlines stepping across the gap, brightening toward the
+        // winning (D, right) edge: the lead reads as QUANTIFIED ("this many steps ahead"), not a blob.
+        // Evenly spaced by fraction so they ride the gap as it blooms/collapses; the directional ramp
+        // gives a soft shimmer toward D. Hidden when the gap is too narrow to subdivide cleanly.
+        for tk in [0.2, 0.4, 0.6, 0.8] : Rectangle {
+            x: parent.width * tk - self.width / 2;
+            y: 2px; width: 1px; height: parent.height - 4px;
+            border-radius: 0.5px;
+            background: Theme.accent;
+            // ramp brighter toward D — the lead, measured off; only when the gap is wide enough to read.
+            opacity: (root.gap-open && parent.width > 24px) ? (0.18 + tk * 0.34) : 0.0;
+            animate opacity { duration: 220ms; easing: ease-out; }
+        }
+        // a brighter inner edge on the winning (right) side — the leading front of the advantage.
+        Rectangle {
+            x: parent.width - self.width; width: 2px; height: parent.height;
+            border-radius: 1px; background: Theme.accent;
+            opacity: root.gap-open ? 0.7 : 0.0;
+            animate opacity { duration: 200ms; }
+        }
+    }
+
+    // ── the COMET STREAK — a thin accent bar racing A→D across the SNAP rail on the instant reversal,
+    // then gone. Sits behind the accent marker and punctuates the exact moment it crosses the lane.
+    Rectangle {
+        x: root.mx(0.0);
+        y: root.rail-b-y - 1px;
+        width: root.snapping ? root.rail-w : 0px;
+        height: 2px; border-radius: 1px;
+        background: Theme.accent;
+        opacity: root.snapping ? 0.9 : 0.0;
+        // appear with the flip (fast), then fade — a comet tail behind the accent marker.
+        animate width { duration: root.snapping ? 90ms : 0ms; easing: ease-out; }
+        animate opacity { duration: root.snapping ? 120ms : 260ms; easing: ease-out; }
+    }
+
+    // ── the RAW (dim) marker — normal SOCD, a HOLLOW ring on the upper rail; the laggard. ──
+    Rectangle {
+        x: root.mx(root.dim-pos) - self.width / 2;
+        y: root.rail-t-y - self.height / 2;
+        width: 13px; height: 13px; border-radius: 7px;
+        background: transparent;
+        border-width: 1.5px;
+        // tints WARN when caught in the dead-zone on the snap (trapped); dim otherwise — the stall while
+        // the accent is already at D IS the pitch.
+        border-color: root.snapping ? Theme.warn : Theme.text-faint.with-alpha(0.9);
+        animate border-color { duration: 300ms; easing: ease-out; }
+        // ALWAYS moves with weight (slow) — so on the snap it visibly LAGS, stuck in the dead-zone.
+        animate x { duration: 380ms; easing: ease-in-out; }
+        opacity: root.snapping ? 1.0 : 0.6;
+        animate opacity { duration: Theme.settle; }
+        // a faint WARNING PULSE ring at the stuck spot on the snap — "frozen here, weighty, late".
+        Rectangle {
+            x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+            width: root.snapping ? 32px : 13px; height: self.width; border-radius: self.width / 2;
+            background: transparent;
+            border-width: 1.5px;
+            border-color: Theme.warn;
+            opacity: root.snapping ? 0.8 : 0.0;
+            animate width, opacity { duration: 360ms; easing: ease-out; }
+        }
+    }
+
+    // ── the SNAP TAP (accent) marker — the winner; solid, glowing, on the lower rail. ──
+    Rectangle {
+        x: root.mx(root.accent-pos) - self.width / 2;
+        y: root.rail-b-y - self.height / 2;
+        width: 14px; height: 14px; border-radius: 7px;
+        background: Theme.accent;
+        // crisp instant reversal on the snap (~85ms ease-out); weighty glide otherwise — the edge's feel.
+        animate x {
+            duration: root.snapping ? 85ms : 360ms;
+            easing: root.snapping ? ease-out : ease-in-out;
+        }
+        // a steady accent halo (the glow that marks it as the hero), blooming bolder on the snap instant
+        // and giving a soft confirming pulse at D on catchup ("snap-tap arrived first").
+        Rectangle {
+            x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+            width: root.snapping ? 38px : (root.phase == 3 ? 30px : 22px);
+            height: self.width; border-radius: self.width / 2;
+            background: Theme.accent-glow;
+            border-width: 1.5px;
+            border-color: Theme.accent;
+            opacity: root.snapping ? 1.0 : (root.phase == 3 ? 0.7 : (root.phase == 0 || root.phase == 4 ? 0.0 : 0.5));
+            animate width, opacity { duration: 320ms; easing: ease-out; }
+        }
+    }
+
+    // ── the SHARED INPUT CUE — [A] far left, [D] far right. Now LIVE: press-and-hold to drive the race.
+    // Each cap lights (accent + depress) when its key is down, lifts/brightens a hair on hover (so it
+    // reads as pressable BEFORE the click), and its TouchArea feeds a-held/d-held + last-key + the idle
+    // timer. Works regardless of device support — it's the illustrative demo, not the gated feature. ──
+    for kc in [
+        { lbl: "A", key: 0, nx: 0.0 },
+        { lbl: "D", key: 1, nx: 1.0 },
+    ] : Rectangle {
+        property <bool> down: kc.key == 0 ? root.a-down : root.d-down;
+        x: root.mx(kc.nx) - self.width / 2;
+        // pressed → dips (depresses) a hair; hovered (not pressed) → lifts a hair — both tactile.
+        y: root.caps-y - self.height / 2
+            + (self.down ? 1px : (cap-ta.has-hover ? -1px : 0px));
+        width: 28px; height: 28px;
+        border-radius: Theme.radius-sm;
+        background: self.down ? Theme.accent-glow : (cap-ta.has-hover ? Theme.well : Theme.well.with-alpha(0.6));
+        border-width: Theme.hair;
+        border-color: self.down ? Theme.accent-line : (cap-ta.has-hover ? Theme.text-faint : Theme.line);
+        animate background, border-color, y { duration: Theme.quick; easing: ease-out; }
+        Text {
+            text: kc.lbl;
+            // hover pre-brightens the glyph (text-mid) before it lights accent on press.
+            color: parent.down ? Theme.accent : (cap-ta.has-hover ? Theme.text-mid : Theme.text-dim);
+            font-family: Theme.mono; font-size: Theme.fs-small; font-weight: 700;
+            horizontal-alignment: center; vertical-alignment: center;
+            width: parent.width; height: parent.height;
+            animate color { duration: Theme.quick; }
+        }
+        cap-ta := TouchArea {
+            mouse-cursor: MouseCursor.pointer;
+            pointer-event(e) => {
+                if (e.kind == PointerEventKind.down) {
+                    if (kc.key == 0) { root.a-held = true; } else { root.d-held = true; }
+                    root.start-driving(kc.key);   // arm interactivity + (re)start the idle countdown
+                } else if (e.kind == PointerEventKind.up || e.kind == PointerEventKind.cancel) {
+                    if (kc.key == 0) { root.a-held = false; } else { root.d-held = false; }
+                    root.bump-idle();             // releasing still resumes after a quiet beat
+                }
+            }
+        }
+    }
+}
+
+// MECH ADVANTAGE — the reusable two-step-consent card for an opt-in, edge-giving device feature.
+// LOCKED: the stage visual is dimmed + sealed (a lock glyph), with a "click to reveal ▸" affordance —
+// you can tell something powerful is here. REVEALED: the visual plays its demo and a clear TOGGLE
+// appears with a quiet ⚠ warn accent (the legality acknowledgment IS the consent click, not a
+// paragraph). If the device can't do it, the toggle stays GATED ("needs a supporting device") —
+// honest, like the other gates. The stage visual is passed in as the `stage` content.
+component MechAdvantage inherits Rectangle {
+    in property <string> name;             // the option name (e.g. "snap tap")
+    in property <string> tagline;          // one short line shown REVEALED (what the edge is)
+    in property <bool> supported;          // a capable device is connected (else GATED)
+    in-out property <bool> revealed;       // step 1 done
+    in-out property <bool> enabled;        // step 2: the feature is on
+    // shared invite-hover: the reveal ROW writes here so the SEAL (a sibling, out of the row's `if`
+    // scope) can light its lock too — hovering either invites the unseal.
+    property <bool> row-hover: false;
+    callback reveal();                     // step 1 click
+    callback set-enabled(bool);            // step 2 toggle
+
+    border-radius: Theme.radius;
+    background: Theme.bg-2;
+    border-width: Theme.hair;
+    border-color: root.enabled ? Theme.accent-line : Theme.line;
+    animate border-color { duration: Theme.quick; }
+    clip: true;
+
+    VerticalLayout {
+        padding: 12px;
+        spacing: 10px;
+        // header: the option name + a state word on the right (sealed / ready / ON / gated)
+        HorizontalLayout {
+            spacing: 8px;
+            VerticalLayout {
+                alignment: center;
+                Text {
+                    text: root.name;
+                    color: root.enabled ? Theme.accent : Theme.text-mid;
+                    font-family: Theme.mono; font-size: Theme.fs-small; font-weight: 700;
+                    letter-spacing: Theme.track-2;
+                    animate color { duration: Theme.quick; }
+                }
+            }
+            Rectangle {}
+            VerticalLayout {
+                alignment: center;
+                Text {
+                    text: !root.supported ? "GATED"
+                        : root.enabled ? "ON"
+                        : root.revealed ? "READY"
+                        : "SEALED";
+                    color: !root.supported ? Theme.warn
+                        : root.enabled ? Theme.accent
+                        : Theme.text-faint;
+                    font-family: Theme.mono; font-size: Theme.fs-small; font-weight: 700;
+                    letter-spacing: Theme.track-2;
+                    vertical-alignment: center;
+                }
+            }
+        }
+
+        // ── the STAGE — the demo visual, with a LOCKED overlay until revealed ──
+        stage-host := Rectangle {
+            height: 150px;
+            // the passed-in stage visual fills this host (a layout stretches the child to full width)
+            VerticalLayout { @children }
+            // the SEAL — a dim scrim + lock glyph over the visual until step 1. Fades on reveal.
+            // Hovering the sealed stage (or the reveal row) gives the lock a "press me" affordance: it
+            // lifts a hair + gains a faint accent glow, then settles back on leave. The seal is itself
+            // clickable (so the whole sealed card invites the unseal, not just the row).
+            seal := Rectangle {
+                // shared invite-hover: this scrim OR the reveal row below it.
+                property <bool> invite: !root.revealed && (seal-ta.has-hover || root.row-hover);
+                width: parent.width; height: parent.height;
+                border-radius: Theme.radius;
+                background: Theme.bg-2.with-alpha(0.82);
+                opacity: root.revealed ? 0.0 : 1.0;
+                visible: root.revealed ? false : true;
+                // the UNSEAL — a deliberate fade rather than a blink (the lock scales down a touch as it
+                // goes, like a key turning, then the scrim clears).
+                animate opacity { duration: Theme.settle; easing: ease-in-out; }
+                // a faint accent halo behind the lock on hover — the "something powerful here" tell.
+                Rectangle {
+                    x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+                    width: 64px; height: 64px; border-radius: 32px;
+                    background: Theme.accent-glow;
+                    opacity: parent.invite ? 0.9 : 0.0;
+                    animate opacity { duration: Theme.settle; easing: ease-out; }
+                }
+                // a small procedural LOCK (shackle arc approximated by a rounded-top body + a keyhole).
+                // A fixed-footprint wrapper keeps the layout still; the glyph inside scales/lifts.
+                VerticalLayout {
+                    alignment: center;
+                    HorizontalLayout {
+                        alignment: center;
+                        Rectangle {
+                            width: 34px; height: 34px;   // stable footprint — no layout shift
+                            lock := Rectangle {
+                                // a unit length that scales the whole glyph: full size sealed, a touch
+                                // smaller as it unseals (the "turn"), drawn from a 34u design grid.
+                                property <length> u: (root.revealed ? 0.8px : 1px) * (seal.invite ? 1.06 : 1.0);
+                                width: 34 * self.u; height: 34 * self.u;
+                                x: (parent.width - self.width) / 2;
+                                // lift a hair on invite-hover — the "press me" affordance.
+                                y: (parent.height - self.height) / 2 + (seal.invite ? -2px : 0px);
+                                animate width, height, y { duration: Theme.settle; easing: ease-in-out; }
+                                // shackle — a hollow rounded rect, bottom hidden behind the body
+                                Rectangle {
+                                    x: 9 * lock.u; y: 3 * lock.u; width: 16 * lock.u; height: 16 * lock.u;
+                                    border-radius: 8 * lock.u;
+                                    border-width: 2px;
+                                    // brightens toward accent on invite — it reads as armed/pressable.
+                                    border-color: seal.invite ? Theme.accent : Theme.text-dim;
+                                    animate border-color { duration: Theme.settle; }
+                                }
+                                // body
+                                Rectangle {
+                                    x: 6 * lock.u; y: 13 * lock.u; width: 22 * lock.u; height: 17 * lock.u;
+                                    border-radius: 3 * lock.u;
+                                    background: seal.invite ? Theme.accent : Theme.text-dim;
+                                    animate background { duration: Theme.settle; }
+                                }
+                                // keyhole
+                                Rectangle {
+                                    x: 15 * lock.u; y: 19 * lock.u; width: 4 * lock.u; height: 4 * lock.u;
+                                    border-radius: 2 * lock.u;
+                                    background: Theme.bg-2;
+                                }
+                            }
+                        }
+                    }
+                }
+                // the sealed stage is itself the unseal target — the whole card invites the click.
+                seal-ta := TouchArea {
+                    mouse-cursor: MouseCursor.pointer;
+                    clicked => { root.reveal(); }
+                }
+            }
+        }
+
+        // ── the GATE ROW — step 1 (reveal) or step 2 (enable), depending on state ──
+        // The demo is ALWAYS revealable (it's illustrative — you should be able to watch what the
+        // feature does even on a board that can't run it). Only the ENABLE step is device-gated.
+        if !root.revealed : Rectangle {
+            height: 24px;
+            border-radius: Theme.radius-sm;
+            background: rta.has-hover ? Theme.well : Theme.bg-2;
+            border-width: Theme.hair;
+            border-color: rta.has-hover ? Theme.text-faint : Theme.line;
+            animate background, border-color { duration: Theme.quick; }
+            HorizontalLayout {
+                alignment: center;
+                Text {
+                    text: "click to reveal ▸";
+                    color: rta.has-hover ? Theme.text-mid : Theme.text-dim;
+                    font-family: Theme.mono; font-size: Theme.fs-small; font-weight: 700;
+                    vertical-alignment: center;
+                }
+            }
+            rta := TouchArea {
+                mouse-cursor: MouseCursor.pointer;
+                clicked => { root.reveal(); }
+                // mirror hover up so the SEAL's lock lights too (the row and seal invite together).
+                changed has-hover => { root.row-hover = self.has-hover; }
+            }
+        }
+        // REVEALED → the tagline, then step 2: the enable toggle (supported) or the honest gate (not).
+        if root.revealed : VerticalLayout {
+            spacing: 8px;
+            if root.tagline != "" : Text {
+                text: root.tagline;
+                color: Theme.text-faint;
+                font-family: Theme.mono; font-size: Theme.fs-small;
+                wrap: word-wrap;
+            }
+            // supported → the ⚠ legality accent + the enable toggle
+            if root.supported : HorizontalLayout {
+                spacing: 8px;
+                // ⚠ — the legality acknowledgment as a quiet accent, NOT a paragraph
+                VerticalLayout {
+                    alignment: center;
+                    Text {
+                        text: "⚠";
+                        color: Theme.warn;
+                        font-family: Theme.mono; font-size: Theme.fs-body;
+                        vertical-alignment: center;
+                    }
+                }
+                Rectangle {}
+                VerticalLayout {
+                    alignment: center;
+                    Toggle {
+                        caption: "enable";
+                        checked: root.enabled;
+                        toggled(v) => { root.set-enabled(v); }
+                    }
+                }
+            }
+            // unsupported → the honest gate, consistent with the other "needs hardware" lines
+            if !root.supported : Text {
+                text: "needs a supporting device";
+                color: Theme.text-faint;
+                font-family: Theme.mono; font-size: Theme.fs-small;
+                wrap: word-wrap;
+            }
+        }
+    }
+}
+
+// A small per-kind PING icon (16px), drawn from rectangles + rounded-rect "circles" — no fonts, so it
+// matches the overlay's procedural glyph vocabulary. `ink` tints it accent (earns a ping) or dim.
+component PingIcon inherits Rectangle {
+    in property <string> slug;
+    in property <bool> on;
+    width: 16px;
+    height: 16px;
+    property <color> ink: root.on ? Theme.accent : Theme.text-dim;
+    // DPI — a reticle: two rings + a centre dot
+    if root.slug == "dpi" : Rectangle {
+        Rectangle { x: 1px; y: 1px; width: 14px; height: 14px; border-radius: 7px; border-width: 1.5px; border-color: root.ink; }
+        Rectangle { x: 5px; y: 5px; width: 6px; height: 6px; border-radius: 3px; border-width: 1.5px; border-color: root.ink; }
+        Rectangle { x: 7px; y: 7px; width: 2px; height: 2px; border-radius: 1px; background: root.ink; }
+    }
+    // SENSITIVITY — a scroll wheel: a vertical capsule + a centre notch
+    if root.slug == "scroll" : Rectangle {
+        Rectangle { x: 4.5px; y: 1px; width: 7px; height: 14px; border-radius: 3.5px; border-width: 1.5px; border-color: root.ink; }
+        Rectangle { x: 7px; y: 3.5px; width: 2px; height: 4px; border-radius: 1px; background: root.ink; }
+    }
+    // POLLING — three rising bars (the frequency), sharing a 14.5px baseline so the staircase
+    // reads cleanly and the tallest bar matches the 13px footprint the rest of the set uses
+    if root.slug == "polling" : Rectangle {
+        Rectangle { x: 2px; y: 8.5px; width: 2.5px; height: 6px; border-radius: 1px; background: root.ink; }
+        Rectangle { x: 6.75px; y: 5px; width: 2.5px; height: 9.5px; border-radius: 1px; background: root.ink; }
+        Rectangle { x: 11.5px; y: 1.5px; width: 2.5px; height: 13px; border-radius: 1px; background: root.ink; }
+    }
+    // BRIGHTNESS — a sun: a filled core + four rays, pulled in to a centred 13px footprint
+    if root.slug == "brightness" : Rectangle {
+        Rectangle { x: 5px; y: 5px; width: 6px; height: 6px; border-radius: 3px; background: root.ink; }
+        Rectangle { x: 7.25px; y: 1.5px; width: 1.5px; height: 2.5px; border-radius: 0.75px; background: root.ink; }
+        Rectangle { x: 7.25px; y: 12px; width: 1.5px; height: 2.5px; border-radius: 0.75px; background: root.ink; }
+        Rectangle { x: 1.5px; y: 7.25px; width: 2.5px; height: 1.5px; border-radius: 0.75px; background: root.ink; }
+        Rectangle { x: 12px; y: 7.25px; width: 2.5px; height: 1.5px; border-radius: 0.75px; background: root.ink; }
+    }
+    // PROFILE — a person: head + shoulders, filling a centred 13px footprint
+    if root.slug == "profile" : Rectangle {
+        Rectangle { x: 5.5px; y: 1.5px; width: 5px; height: 5px; border-radius: 2.5px; background: root.ink; }
+        Rectangle { x: 3px; y: 8px; width: 10px; height: 6.5px; border-radius: 3px; background: root.ink; }
+    }
+    // LAYER — three stacked bars (depth), spread to a centred 12.5px footprint with even gaps
+    if root.slug == "layer" : Rectangle {
+        Rectangle { x: 2px; y: 1.5px; width: 12px; height: 3px; border-radius: 1.5px; background: root.ink; opacity: 0.5; }
+        Rectangle { x: 2px; y: 6.25px; width: 12px; height: 3px; border-radius: 1.5px; background: root.ink; opacity: 0.75; }
+        Rectangle { x: 2px; y: 11px; width: 12px; height: 3px; border-radius: 1.5px; background: root.ink; }
+    }
+    // BEACON — a broadcast: a centre dot + two rings
+    if root.slug == "beacon" : Rectangle {
+        Rectangle { x: 1px; y: 1px; width: 14px; height: 14px; border-radius: 7px; border-width: 1.25px; border-color: root.ink; opacity: 0.5; }
+        Rectangle { x: 5px; y: 5px; width: 6px; height: 6px; border-radius: 3px; border-width: 1.25px; border-color: root.ink; opacity: 0.82; }
+        Rectangle { x: 7px; y: 7px; width: 2px; height: 2px; border-radius: 1px; background: root.ink; }
+    }
+    // BATTERY — a body + nub + fill, a touch taller (10px) so it stops reading as squat next to
+    // the 13–14px ring icons; still clearly battery-proportioned (wide, rounded, centred)
+    if root.slug == "battery" : Rectangle {
+        Rectangle { x: 1px; y: 3px; width: 12px; height: 10px; border-radius: 1.5px; border-width: 1.5px; border-color: root.ink; }
+        Rectangle { x: 13px; y: 5.5px; width: 2px; height: 5px; border-radius: 0.75px; background: root.ink; }
+        Rectangle { x: 3px; y: 5.5px; width: 5px; height: 5px; border-radius: 0.75px; background: root.ink; }
+    }
+    // SIDE PLATE — a swappable plate: a rounded panel + two button dots (nods to the 2/6/12-button plates)
+    if root.slug == "side_plate" : Rectangle {
+        Rectangle { x: 3px; y: 1.5px; width: 10px; height: 13px; border-radius: 2.5px; border-width: 1.5px; border-color: root.ink; }
+        Rectangle { x: 6.75px; y: 5px; width: 2.5px; height: 2.5px; border-radius: 1.25px; background: root.ink; }
+        Rectangle { x: 6.75px; y: 9px; width: 2.5px; height: 2.5px; border-radius: 1.25px; background: root.ink; }
+    }
+}
+
+// One PING-kind card for the grid — a compact icon + label + what-it-is, lit when the kind earns a
+// ping. Replaces the old full-width rows so the kinds tile 4-per-row instead of wasting the width.
+component PingCard inherits Rectangle {
+    in property <string> slug;
+    in property <string> label;
+    in property <string> desc;
+    in property <bool> on;
+    callback toggled();
+    horizontal-stretch: 1;
+    height: 54px;
+    border-radius: Theme.radius-sm;
+    background: root.on ? Theme.accent-glow : (ta.has-hover ? Theme.well : Theme.bg-2);
+    border-width: Theme.hair;
+    border-color: root.on ? Theme.accent-line : (ta.has-hover ? Theme.text-faint : Theme.line);
+    animate background, border-color { duration: Theme.quick; }
+    // icon ABOVE a centred label + tag — stacking gives the text the card's FULL width (the old
+    // side-by-side icon stole ~half the room, so every desc elided and the two lines crammed). Roomy.
+    VerticalLayout {
+        alignment: center;
+        spacing: 5px;
+        padding-left: 6px; padding-right: 6px;
+        HorizontalLayout { alignment: center; PingIcon { slug: root.slug; on: root.on; } }
+        VerticalLayout {
+            spacing: 2px;
+            Text { text: root.label; color: root.on ? Theme.accent : Theme.text-mid; font-family: Theme.mono; font-size: Theme.fs-small; font-weight: 700; horizontal-alignment: center; overflow: elide; }
+            Text { text: root.desc; color: Theme.text-faint; font-family: Theme.mono; font-size: Theme.fs-small; horizontal-alignment: center; overflow: elide; }
+        }
+    }
+    ta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.toggled(); } }
+}
+
 export component SettingsPanel inherits VerticalLayout {
     spacing: 0;
-    // curated accent hues — a quiet phosphor spread (the default first). Picking one recolours the
-    // whole instrument live; the hex field takes any RRGGBB for a bespoke tint.
-    property <[{hex: string, col: color}]> accent-swatches: [
-        {hex: "4af2b0", col: #4af2b0}, {hex: "5ac8fa", col: #5ac8fa}, {hex: "0a84ff", col: #0a84ff},
-        {hex: "bf5af2", col: #bf5af2}, {hex: "ff375f", col: #ff375f}, {hex: "ff9f0a", col: #ff9f0a},
-        {hex: "ffd60a", col: #ffd60a}, {hex: "30d158", col: #30d158},
-    ];
+    // the curated accent hues live ONCE in `Palette.accent` (controls.slint), shared with the LIGHTING
+    // colour picker so the two never drift. The ColorPickers below pull straight from it.
     // animate the material gallery swatches only while SYSTEM is open (~16fps — the shaders run
     // Rust-side; idle pages cost nothing). The cast itself runs at its own 60fps on the overlay.
     Timer {
@@ -386,7 +975,7 @@ export component SettingsPanel inherits VerticalLayout {
     }
     PanelHead {
         label: "SYSTEM";
-        caption: "startup · safety gates · migration · prove it works";
+        caption: "set it up, keep it safe, make it yours · prove it works";
     }
     Rectangle { height: Theme.hair; background: Theme.line; }
     Rectangle { height: Theme.lead-in; }
@@ -400,55 +989,65 @@ export component SettingsPanel inherits VerticalLayout {
             HorizontalLayout {
                 spacing: Theme.gap-col;
                 // ── startup + the two safety gates ────────────────────────
+                // alignment:start so this rail PACKS its sections at the top. Without it the column
+                // defaults to Stretch, and because the row's height is driven by the (much taller)
+                // right column the leftover height is distributed INTO the growable children — landing
+                // as ~150px of dead space inside APPEARANCE (between the INTERFACE picker and WEAVE).
+                // Start leaves the slack as harmless empty space below the last section instead.
                 VerticalLayout {
                     width: 380px;
                     spacing: 13px;
-                    // SAFETY GATES LEAD — the two consequential switches, each with a live state pill
-                    // so a paused / armed gate is impossible to miss in a stack of plain toggles.
-                    SectionTitle { text: "SAFETY"; }
-                    // SAFE-MODE: the process-wide input-arm gate. DISARMED = real SendInput is a
-                    // no-op (key remaps / macros simulate only). ARMED = remaps fire for real.
-                    HorizontalLayout {
-                        spacing: 10px;
-                        VerticalLayout { alignment: center; Mono { text: "ARM"; color: Theme.text-dim; } }
-                        Segment {
-                            options: ["OBSERVE", "DEVICE", "INPUT", "LIVE"];
-                            index: State.arm-stance;
-                            min-seg: 60px;
-                            picked(i) => { State.set-arm-stance(i); }
-                        }
-                        Rectangle {}
-                    }
-                    // one stance over both gates, as a scannable list rather than a paragraph.
+                    alignment: start;
+                    // SAFETY & STARTUP — the two session preferences, unified into one section. SAFETY
+                    // is the real 2×2 (device-writes × input-fires) shown as two HONEST switches with a
+                    // live posture readout — no more opaque OBSERVE/DEVICE/INPUT/LIVE tiers; the two
+                    // gates ARE the model (bound straight to the authoritative bools the header pills
+                    // read). STARTUP is the launch mode below it.
+                    SectionTitle { text: "SAFETY & STARTUP"; }
+                    // ── GATES — device writes (DPI/lighting persist) · input & macros (remaps fire) ──
                     VerticalLayout {
-                        spacing: 5px;
-                        Def { term: "OBSERVE"; desc: "reads only. no input synthesis, no device writes."; }
-                        Def { term: "DEVICE"; desc: "device writes on. input synthesis stays off."; }
-                        Def { term: "INPUT"; desc: "remaps and macros fire for real. no device writes."; }
-                        Def { term: "LIVE"; desc: "everything on."; }
-                    }
-                    Mono { text: "the two header pills mirror these gates."; color: Theme.text-faint; }
-                    Mono { text: "every device write is backed up, then read back to confirm it landed. reads always work."; color: Theme.text-faint; wrap: word-wrap; }
-                    Divider {}
-                    SectionTitle { text: "STARTUP"; }
-                    HorizontalLayout {
-                        spacing: 10px;
-                        VerticalLayout { alignment: center; Mono { text: "ON LAUNCH"; color: Theme.text-dim; } }
-                        Segment {
-                            options: ["MANUAL", "BOOT → TRAY", "BOOT → WINDOW"];
-                            index: State.launch-mode;
-                            min-seg: 96px;
-                            picked(i) => { State.set-launch-mode(i); }
+                        spacing: 7px;
+                        Mono { text: "GATES"; color: Theme.text-dim; font-size: Theme.fs-small; letter-spacing: Theme.track-2; }
+                        Toggle {
+                            caption: "device writes";
+                            checked: !State.writes-paused;
+                            toggled(v) => { State.toggle-writes-paused(); }
                         }
-                        Rectangle {}
+                        Toggle {
+                            caption: "input & macros";
+                            checked: State.input-armed;
+                            toggled(v) => { State.toggle-input-armed(); }
+                        }
+                        // the live posture — the four corners of the 2×2 spoken plainly, one line
+                        Mono {
+                            text: !State.writes-paused && State.input-armed ? "› live — device + input both on"
+                                : !State.writes-paused && !State.input-armed ? "› tuning hardware — remaps & macros held"
+                                : State.writes-paused && State.input-armed ? "› remaps & macros live — hardware untouched"
+                                : "› observing — reads only, nothing fires";
+                            color: Theme.text-faint;
+                            wrap: word-wrap;
+                        }
                     }
+                    // ── ON LAUNCH — labels are self-explanatory; one contextual line replaces the stack ──
                     VerticalLayout {
-                        spacing: 5px;
-                        Def { term-w: 124px; term: "MANUAL"; desc: "you launch it yourself."; }
-                        Def { term-w: 124px; term: "BOOT → TRAY"; desc: "starts with Windows, stays in the tray."; }
-                        Def { term-w: 124px; term: "BOOT → WINDOW"; desc: "starts with Windows, opens the window."; }
+                        spacing: 7px;
+                        Mono { text: "ON LAUNCH"; color: Theme.text-dim; font-size: Theme.fs-small; letter-spacing: Theme.track-2; }
+                        HorizontalLayout {
+                            Segment {
+                                options: ["MANUAL", "BOOT → TRAY", "BOOT → WINDOW"];
+                                index: State.launch-mode;
+                                min-seg: 96px;
+                                picked(i) => { State.set-launch-mode(i); }
+                            }
+                            Rectangle {}
+                        }
+                        Mono {
+                            text: State.launch-mode == 1 ? "› starts with Windows, stays in the tray"
+                                : State.launch-mode == 2 ? "› starts with Windows, opens the window"
+                                : "› you launch it yourself";
+                            color: Theme.text-faint;
+                        }
                     }
-                    Mono { text: "double-clicking the tray icon always opens the window."; color: Theme.text-faint; wrap: word-wrap; }
                     Divider {}
                     // BEACONS header: the section title plus a right-aligned quick-jump to the macro
                     // authoring area (INPUT → DIRECT, where MACRO · PYTHON lives) so the registry and
@@ -535,129 +1134,134 @@ export component SettingsPanel inherits VerticalLayout {
                     // APPEARANCE — make it yours. The accent isn't decoration; it's the live signal the
                     // whole instrument reads by, so this is a real instrument setting, not chrome.
                     SectionTitle { text: "APPEARANCE"; }
-                    AccentPicker {
+                    ColorPicker {
                         label: "INTERFACE";
-                        hint: "one phosphor. every live, active, or connected mark takes its colour from this.";
+                        hint: "the app's accent. everything live, active, or connected lights up in this.";
                         current: Theme.accent;
                         value: State.ui-accent;
-                        swatches: root.accent-swatches;
+                        swatches: Palette.accent;
                         pick(h) => { State.set-ui-accent(h); }
                     }
-                    AccentPicker {
-                        label: "WEAVE";
-                        hint: "the cast is white light. this is the colour it breaks into at the edges, where its prism fire centres and the rim sits. phosphor is the house look.";
-                        current: State.weave-accent-col;
-                        value: State.weave-accent;
-                        swatches: root.accent-swatches;
-                        pick(h) => { State.set-weave-accent(h); }
-                    }
-                    // MATERIAL — the cast's physics. Each tile is the REAL shader, live: pick the one
-                    // your weave is poured from. The swatch animates so you see the substance breathe.
+                    // WEAVE and its MATERIAL are one substance — same colour, same cast — so they live as
+                    // a single block on the picker's own 9px rhythm. The old colour-hint is gone; MATERIAL's
+                    // header takes its slot, so this reads as "the weave material", not a separate section.
                     VerticalLayout {
-                        spacing: 4px;
-                        Text {
-                            text: "MATERIAL";
-                            color: Theme.text-dim; font-family: Theme.mono; font-size: Theme.fs-small;
-                            font-weight: 700; letter-spacing: 1.2px;
+                        spacing: 9px;
+                        ColorPicker {
+                            label: "WEAVE";
+                            current: State.weave-accent-col;
+                            value: State.weave-accent;
+                            swatches: Palette.accent;
+                            pick(h) => { State.set-weave-accent(h); }
                         }
-                        material-grid := Rectangle {
-                            property <length> gap: 10px;
-                            property <length> cw: (self.width - self.gap) / 2;       // two columns
-                            property <length> th: self.cw * 0.6 + 54px;              // tile = swatch (5:3) + name + a TWO-line blurb (was 38px = 1 line → wrapped blurbs clipped)
-                            property <int> rows: ceil(State.material-cards.length / 2);
-                            height: self.rows * self.th + max(0, self.rows - 1) * self.gap;  // gaps go BETWEEN rows only — no trailing gap eating space before TUNE
-                            for c[i] in State.material-cards : card := Rectangle {
-                                property <bool> sel: c.slug == State.weave-material;
-                                x: mod(i, 2) * (material-grid.cw + material-grid.gap);
-                                y: floor(i / 2) * (material-grid.th + material-grid.gap);
-                                width: material-grid.cw;
-                                height: material-grid.th;
-                                border-radius: Theme.radius;
-                                background: self.sel ? Theme.accent-glow : (mta.has-hover ? Theme.well : Theme.bg-2);
-                                border-width: Theme.hair;
-                                border-color: self.sel ? Theme.accent-line : (mta.has-hover ? Theme.text-faint : Theme.line);
-                                animate background, border-color { duration: Theme.quick; }
-                                clip: true;
-                                VerticalLayout {
-                                    padding: 5px;
-                                    spacing: 4px;
-                                    alignment: start;       // pin to top so the tiny slack is uniform across tiles, never a lopsided bottom gap
-                                    Image {
-                                        source: c.swatch;
-                                        width: parent.width - 10px;
-                                        height: self.width * 0.6;
-                                        image-fit: fill;
-                                    }
-                                    Text {
-                                        text: c.name;
-                                        color: card.sel ? Theme.accent : Theme.text-mid;
-                                        font-family: Theme.mono; font-size: Theme.fs-small; font-weight: 700;
-                                        overflow: elide;
-                                    }
-                                    Text {
-                                        text: c.blurb;
-                                        color: Theme.text-faint; font-family: Theme.mono; font-size: Theme.fs-small;
-                                        wrap: word-wrap;
-                                    }
-                                }
-                                mta := TouchArea {
-                                    mouse-cursor: MouseCursor.pointer;
-                                    clicked => { State.set-weave-material(c.slug); }
-                                }
+                        // MATERIAL — the cast's physics. Each tile is the REAL shader, live: pick the one
+                        // your weave is poured from. The swatch animates so you see the substance breathe.
+                        VerticalLayout {
+                            spacing: 4px;
+                            Text {
+                                text: "MATERIAL";
+                                color: Theme.text-dim; font-family: Theme.mono; font-size: Theme.fs-small;
+                                font-weight: 700; letter-spacing: 1.2px;
                             }
-                        }
-                        // TUNE — the selected material's own knobs (the recipe declares them; the UI
-                        // just renders a slider per row). Reshape the live substance — truly yours.
-                        if State.weave-knobs.length > 0 : VerticalLayout {
-                            padding-top: 2px;
-                            spacing: 7px;
-                            HorizontalLayout {
-                                Text {
-                                    text: "TUNE";
-                                    color: Theme.text-dim; font-family: Theme.mono; font-size: Theme.fs-small;
-                                    font-weight: 700; letter-spacing: 1.2px; vertical-alignment: center;
-                                }
-                                Rectangle {}
-                                rta := TouchArea {
-                                    width: rl.preferred-width; height: 18px;
-                                    mouse-cursor: MouseCursor.pointer;
-                                    clicked => { State.reset-weave-material(); }
-                                    rl := Text {
-                                        text: "reset";
-                                        color: rta.has-hover ? Theme.text-mid : Theme.text-faint;
-                                        font-family: Theme.mono; font-size: Theme.fs-small; vertical-alignment: center;
+                            material-grid := Rectangle {
+                                property <length> gap: 10px;
+                                property <length> cw: (self.width - self.gap) / 2;       // two columns
+                                property <length> th: self.cw * 0.6 + 54px;              // tile = swatch (5:3) + name + a TWO-line blurb (was 38px = 1 line → wrapped blurbs clipped)
+                                property <int> rows: ceil(State.material-cards.length / 2);
+                                height: self.rows * self.th + max(0, self.rows - 1) * self.gap;  // gaps go BETWEEN rows only — no trailing gap eating space before TUNE
+                                for c[i] in State.material-cards : card := Rectangle {
+                                    property <bool> sel: c.slug == State.weave-material;
+                                    x: mod(i, 2) * (material-grid.cw + material-grid.gap);
+                                    y: floor(i / 2) * (material-grid.th + material-grid.gap);
+                                    width: material-grid.cw;
+                                    height: material-grid.th;
+                                    border-radius: Theme.radius;
+                                    background: self.sel ? Theme.accent-glow : (mta.has-hover ? Theme.well : Theme.bg-2);
+                                    border-width: Theme.hair;
+                                    border-color: self.sel ? Theme.accent-line : (mta.has-hover ? Theme.text-faint : Theme.line);
+                                    animate background, border-color { duration: Theme.quick; }
+                                    clip: true;
+                                    VerticalLayout {
+                                        padding: 5px;
+                                        spacing: 4px;
+                                        alignment: start;       // pin to top so the tiny slack is uniform across tiles, never a lopsided bottom gap
+                                        Image {
+                                            source: c.swatch;
+                                            width: parent.width - 10px;
+                                            height: self.width * 0.6;
+                                            image-fit: fill;
+                                        }
+                                        Text {
+                                            text: c.name;
+                                            color: card.sel ? Theme.accent : Theme.text-mid;
+                                            font-family: Theme.mono; font-size: Theme.fs-small; font-weight: 700;
+                                            overflow: elide;
+                                        }
+                                        Text {
+                                            text: c.blurb;
+                                            color: Theme.text-faint; font-family: Theme.mono; font-size: Theme.fs-small;
+                                            wrap: word-wrap;
+                                        }
+                                    }
+                                    mta := TouchArea {
+                                        mouse-cursor: MouseCursor.pointer;
+                                        clicked => { State.set-weave-material(c.slug); }
                                     }
                                 }
                             }
-                            for k[i] in State.weave-knobs : HorizontalLayout {
-                                spacing: 9px;
-                                VerticalLayout {
-                                    alignment: center;
-                                    width: 96px;
+                            // TUNE — the selected material's own knobs (the recipe declares them; the UI
+                            // just renders a slider per row). Reshape the live substance — truly yours.
+                            if State.weave-knobs.length > 0 : VerticalLayout {
+                                padding-top: 2px;
+                                spacing: 7px;
+                                HorizontalLayout {
                                     Text {
-                                        text: k.label;
+                                        text: "TUNE";
                                         color: Theme.text-dim; font-family: Theme.mono; font-size: Theme.fs-small;
-                                        overflow: elide;
+                                        font-weight: 700; letter-spacing: 1.2px; vertical-alignment: center;
+                                    }
+                                    Rectangle {}
+                                    rta := TouchArea {
+                                        width: rl.preferred-width; height: 18px;
+                                        mouse-cursor: MouseCursor.pointer;
+                                        clicked => { State.reset-weave-material(); }
+                                        rl := Text {
+                                            text: "reset";
+                                            color: rta.has-hover ? Theme.text-mid : Theme.text-faint;
+                                            font-family: Theme.mono; font-size: Theme.fs-small; vertical-alignment: center;
+                                        }
                                     }
                                 }
-                                VerticalLayout {
-                                    alignment: center;
-                                    horizontal-stretch: 1;
-                                    Slider {
-                                        compact: true;
-                                        minimum: k.min; maximum: k.max; value: k.value;
-                                        step: (k.max - k.min) / 100;
-                                        wheel: false;
-                                        changed(v) => { State.set-weave-knob(i, v); }
+                                for k[i] in State.weave-knobs : HorizontalLayout {
+                                    spacing: 9px;
+                                    VerticalLayout {
+                                        alignment: center;
+                                        width: 96px;
+                                        Text {
+                                            text: k.label;
+                                            color: Theme.text-dim; font-family: Theme.mono; font-size: Theme.fs-small;
+                                            overflow: elide;
+                                        }
                                     }
-                                }
-                                VerticalLayout {
-                                    alignment: center;
-                                    width: 42px;
-                                    Text {
-                                        text: round(k.value * 100) / 100;
-                                        color: Theme.text-mid; font-family: Theme.mono; font-size: Theme.fs-small;
-                                        horizontal-alignment: right;
+                                    VerticalLayout {
+                                        alignment: center;
+                                        horizontal-stretch: 1;
+                                        Slider {
+                                            compact: true;
+                                            minimum: k.min; maximum: k.max; value: k.value;
+                                            step: (k.max - k.min) / 100;
+                                            wheel: false;
+                                            changed(v) => { State.set-weave-knob(i, v); }
+                                        }
+                                    }
+                                    VerticalLayout {
+                                        alignment: center;
+                                        width: 42px;
+                                        Text {
+                                            text: round(k.value * 100) / 100;
+                                            color: Theme.text-mid; font-family: Theme.mono; font-size: Theme.fs-small;
+                                            horizontal-alignment: right;
+                                        }
                                     }
                                 }
                             }
@@ -685,8 +1289,10 @@ export component SettingsPanel inherits VerticalLayout {
                     }
                     Mono { text: "import is a one-time flow. it reads the plaintext export, normalises it, then applies it."; color: Theme.text-faint; wrap: word-wrap; }
 
-                    // PURGE SYNAPSE — once you've migrated in, evict Razer's resident slopware. Disables +
-                    // stops the respawning SYSTEM services then terminates the whole Razer process tree.
+                    // PURGE SYNAPSE — once you've migrated in, evict Razer's resident slopware. Demotes its
+                    // respawning SYSTEM services to manual-start (gone from boot, but Synapse can still be
+                    // opened on demand — NOT disabled, which would brick it) then stops them and terminates
+                    // the whole Razer process tree.
                     // alignment:start so the lone action sizes to its LABEL instead of stretching the column
                     // (a single button in a default-stretch row eats the whole width).
                     HorizontalLayout {
@@ -697,9 +1303,216 @@ export component SettingsPanel inherits VerticalLayout {
                         }
                     }
                     Mono {
-                        text: State.purge-status == "" ? "kills every Razer Synapse process + stops its services so they can't respawn. asks for admin." : State.purge-status;
+                        text: State.purge-status == "" ? "kills every Razer Synapse process + sets its services to manual so they stop auto-running at boot. Synapse still opens if you want it. asks for admin." : State.purge-status;
                         color: State.purge-status == "" ? Theme.text-faint : Theme.text;
                         wrap: word-wrap;
+                    }
+
+                    Divider {}
+
+                    // ── NOTIFICATIONS — state-change confirmation cards ───────
+                    HorizontalLayout {
+                        spacing: 10px;
+                        VerticalLayout {
+                            alignment: center;
+                            spacing: 3px;
+                            SectionTitle { text: "NOTIFICATIONS"; }
+                            Mono { text: "a heads-up when something changes."; color: Theme.text-faint; }
+                        }
+                        Rectangle {}
+                        VerticalLayout {
+                            alignment: center;
+                            Button { text: "test"; primary: true; clicked => { State.test-notification(); } }
+                        }
+                    }
+                    // the body groups as one block with an even rhythm; tight sub-groups bind a control
+                    // to its own caption (toggle↔note, label↔chips) instead of the loose section gap.
+                    VerticalLayout {
+                        spacing: 12px;
+                        // master switch — the toggle IS the state; no redundant lamp beside it.
+                        Toggle {
+                            caption: "notifications";
+                            checked: State.notif-enabled;
+                            toggled(v) => { State.set-notif-enabled(v); }
+                        }
+                        // placement — a mock monitor you drop the card onto (drag anywhere; the named
+                        // presets pull it in magnetically; OFF dims it to audio-only). The card TYPES —
+                        // what earns a ping — fill the space to the right of the screen.
+                        VerticalLayout {
+                            spacing: 9px;
+                            HorizontalLayout {
+                                spacing: 10px;
+                                VerticalLayout { alignment: center; Mono { text: "WHERE"; color: Theme.text-dim; } }
+                                VerticalLayout {
+                                    alignment: center;
+                                    Mono {
+                                        text: State.notif-placement == "off" ? "off · audio only"
+                                            : State.notif-placement == "custom" ? "custom placement"
+                                            : State.notif-placement;
+                                        color: State.notif-placement == "off" ? Theme.text-faint : Theme.text-mid;
+                                    }
+                                }
+                                Rectangle {}
+                                VerticalLayout {
+                                    alignment: center;
+                                    Pill {
+                                        text: "off";
+                                        clickable: true;
+                                        selected: State.notif-placement == "off";
+                                        clicked => {
+                                            if (State.notif-placement == "off") {
+                                                State.set-notif-pos(State.notif-x, State.notif-y);   // re-enable at the remembered spot
+                                            } else {
+                                                State.set-notif-placement("off");
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            HorizontalLayout {
+                                spacing: Theme.gap-col;
+                                NotifPlacer {}
+                                // the card TYPES — a tidy grid beside the placer. alignment:start keeps the
+                                // header + grid TOP-aligned with the placer (no stretch-spread gap below it).
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    alignment: start;
+                                    spacing: 10px;   // header → grid block (distinct from the tighter inter-row gutter below)
+                                    Mono { text: "WHAT EARNS A PING"; color: Theme.text-dim; }
+                                    // 3-per-row grid — each kind a compact icon card (9 kinds → 3 even rows),
+                                    // grouped by domain: pointer/report · physical hardware · software/session.
+                                    // One spacing token governs BOTH axes (rows here, columns below) so the
+                                    // gutters read as a single even grid, not a stack of loose rows.
+                                    VerticalLayout {
+                                        spacing: 6px;
+                                        // row 1 — POINTER / REPORT
+                                        HorizontalLayout {
+                                            spacing: 6px;
+                                            PingCard { slug: "dpi"; label: "dpi"; desc: "pointer DPI"; on: State.notif-dpi; toggled => { State.set-notif-event("dpi", !State.notif-dpi); } }
+                                            PingCard { slug: "scroll"; label: "sensitivity"; desc: "scroll modes"; on: State.notif-scroll; toggled => { State.set-notif-event("scroll", !State.notif-scroll); } }
+                                            PingCard { slug: "polling"; label: "polling"; desc: "report rate"; on: State.notif-polling; toggled => { State.set-notif-event("polling", !State.notif-polling); } }
+                                        }
+                                        // row 2 — PHYSICAL HARDWARE (LED · power · plate)
+                                        HorizontalLayout {
+                                            spacing: 6px;
+                                            PingCard { slug: "brightness"; label: "brightness"; desc: "LED level"; on: State.notif-brightness; toggled => { State.set-notif-event("brightness", !State.notif-brightness); } }
+                                            PingCard { slug: "battery"; label: "battery"; desc: "charge"; on: State.notif-battery; toggled => { State.set-notif-event("battery", !State.notif-battery); } }
+                                            PingCard { slug: "side_plate"; label: "side plate"; desc: "swap detect"; on: State.notif-side-plate; toggled => { State.set-notif-event("side_plate", !State.notif-side-plate); } }
+                                        }
+                                        // row 3 — SOFTWARE / SESSION
+                                        HorizontalLayout {
+                                            spacing: 6px;
+                                            PingCard { slug: "profile"; label: "profile"; desc: "active"; on: State.notif-profile; toggled => { State.set-notif-event("profile", !State.notif-profile); } }
+                                            PingCard { slug: "layer"; label: "layer"; desc: "HyperShift"; on: State.notif-layer; toggled => { State.set-notif-event("layer", !State.notif-layer); } }
+                                            PingCard { slug: "beacon"; label: "beacon"; desc: "macro notify"; on: State.notif-macro; toggled => { State.set-notif-event("macro", !State.notif-macro); } }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // WHEN SEVERAL LAND — how multiple live cards behave at once: a tidy column
+                        // (stack), one newest card (latest), or one counted summary (digest). The mock
+                        // previews the chosen mode; only the ASK wheel ever sits outside this system.
+                        VerticalLayout {
+                            spacing: 9px;
+                            HorizontalLayout {
+                                spacing: 10px;
+                                VerticalLayout { alignment: center; Mono { text: "WHEN SEVERAL LAND"; color: Theme.text-dim; } }
+                                VerticalLayout {
+                                    alignment: center;
+                                    Mono {
+                                        text: State.notif-stack == "latest" ? "newest only"
+                                            : State.notif-stack == "digest" ? "one summary when it's busy"
+                                            : "a tidy column — see each";
+                                        color: Theme.text-mid;
+                                    }
+                                }
+                                Rectangle {}
+                            }
+                            HorizontalLayout {
+                                spacing: Theme.gap-col;
+                                NotifStackMock { mode: State.notif-stack; }
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    spacing: 6px;
+                                    NotifTypeChip { label: "stack"; desc: "a column — see each"; on: State.notif-stack == "stack"; toggled => { State.set-notif-stack("stack"); } }
+                                    NotifTypeChip { label: "latest"; desc: "newest only, one card"; on: State.notif-stack == "latest"; toggled => { State.set-notif-stack("latest"); } }
+                                    NotifTypeChip { label: "digest"; desc: "one summary, counted"; on: State.notif-stack == "digest"; toggled => { State.set-notif-stack("digest"); } }
+                                }
+                            }
+                        }
+                        // card background — the grounded squircle (app-card chrome) vs the floating spell.
+                        Toggle {
+                            caption: "card background";
+                            checked: State.notif-panel;
+                            toggled(v) => { State.set-notif-panel(v); }
+                        }
+                        // sound — toggle, then (when on) volume + the voice picker.
+                        VerticalLayout {
+                            spacing: 8px;
+                            Toggle {
+                                caption: "audio cue";
+                                checked: State.notif-audio;
+                                toggled(v) => { State.set-notif-audio(v); }
+                            }
+                            if State.notif-audio : HorizontalLayout {
+                                spacing: 12px;
+                                VerticalLayout { alignment: center; width: 52px; Mono { text: "VOLUME"; color: Theme.text-dim; } }
+                                VerticalLayout {
+                                    alignment: center;
+                                    horizontal-stretch: 1;
+                                    Slider {
+                                        compact: true;
+                                        minimum: 0.0;
+                                        maximum: 1.0;
+                                        value: State.notif-volume;
+                                        step: 0.05;
+                                        wheel: false;
+                                        changed(v) => { State.set-notif-volume(v); }
+                                    }
+                                }
+                            }
+                            if State.notif-audio : HorizontalLayout {
+                                spacing: 12px;
+                                VerticalLayout { alignment: center; width: 52px; Mono { text: "VOICE"; color: Theme.text-dim; } }
+                                Segment {
+                                    options: ["PULSE", "WARM", "GLASS"];
+                                    min-seg: 64px;
+                                    index: (State.notif-sound == "warm" ? 1 : State.notif-sound == "glass" ? 2 : 0);
+                                    picked(i) => { State.set-notif-sound(i == 1 ? "warm" : i == 2 ? "glass" : "pulse"); }
+                                }
+                                Rectangle {}
+                            }
+                        }
+                    }
+
+                    Divider {}
+
+                    // ── MECHANICAL ADVANTAGES — opt-in, edge-giving device features ──
+                    // A preferences category (sibling to the notification stages): each option is one
+                    // self-demonstrating visual stage behind a TWO-STEP consent (reveal, then enable).
+                    // No text hints yapping — the stage shows what it does; the consent click + a quiet
+                    // ⚠ carries the legality. Honest-gated when the connected device can't do it.
+                    HorizontalLayout {
+                        spacing: 10px;
+                        VerticalLayout {
+                            alignment: center;
+                            spacing: 3px;
+                            SectionTitle { text: "MECHANICAL ADVANTAGES"; }
+                            Mono { text: "opt-in, edge-giving. unseal to see what it does."; color: Theme.text-faint; }
+                        }
+                        Rectangle {}
+                    }
+                    MechAdvantage {
+                        name: "snap tap";
+                        tagline: "opposing inputs resolve to the last pressed — instant counter-strafe, no stall.";
+                        supported: State.snap-tap-supported;
+                        revealed: State.snap-tap-revealed;
+                        enabled: State.snap-tap-enabled;
+                        reveal => { State.snap-tap-revealed = true; }
+                        set-enabled(v) => { State.set-snap-tap(v); }
+                        // the stage visual — plays only once REVEALED (sealed = perfectly still)
+                        SnapTapStage { live: State.snap-tap-revealed; }
                     }
 
                     Divider {}
@@ -784,129 +1597,6 @@ export component SettingsPanel inherits VerticalLayout {
 
                     Divider {}
 
-                    // ── NOTIFICATIONS — state-change confirmation cards ───────
-                    HorizontalLayout {
-                        spacing: 10px;
-                        VerticalLayout {
-                            alignment: center;
-                            spacing: 3px;
-                            SectionTitle { text: "NOTIFICATIONS"; }
-                            Mono { text: "confirms what you change. never announces."; color: Theme.text-faint; }
-                        }
-                        Rectangle {}
-                        VerticalLayout {
-                            alignment: center;
-                            Button { text: "test"; primary: true; clicked => { State.test-notification(); } }
-                        }
-                    }
-                    // the body groups as one block with an even rhythm; tight sub-groups bind a control
-                    // to its own caption (toggle↔note, label↔chips) instead of the loose section gap.
-                    VerticalLayout {
-                        spacing: 12px;
-                        // master switch — the toggle IS the state; no redundant lamp beside it.
-                        Toggle {
-                            caption: "notifications";
-                            checked: State.notif-enabled;
-                            toggled(v) => { State.set-notif-enabled(v); }
-                        }
-                        // placement — a mock monitor you drop the card onto (drag anywhere; the named
-                        // presets pull it in magnetically; OFF dims it to audio-only). The card TYPES —
-                        // which changes earn a card — fill the space to the right of the screen.
-                        VerticalLayout {
-                            spacing: 9px;
-                            HorizontalLayout {
-                                spacing: 10px;
-                                VerticalLayout { alignment: center; Mono { text: "WHERE"; color: Theme.text-dim; } }
-                                VerticalLayout {
-                                    alignment: center;
-                                    Mono {
-                                        text: State.notif-placement == "off" ? "off · audio only"
-                                            : State.notif-placement == "custom" ? "custom placement"
-                                            : State.notif-placement;
-                                        color: State.notif-placement == "off" ? Theme.text-faint : Theme.text-mid;
-                                    }
-                                }
-                                Rectangle {}
-                                VerticalLayout {
-                                    alignment: center;
-                                    Pill {
-                                        text: "off";
-                                        clickable: true;
-                                        selected: State.notif-placement == "off";
-                                        clicked => {
-                                            if (State.notif-placement == "off") {
-                                                State.set-notif-pos(State.notif-x, State.notif-y);   // re-enable at the remembered spot
-                                            } else {
-                                                State.set-notif-placement("off");
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            HorizontalLayout {
-                                spacing: Theme.gap-col;
-                                NotifPlacer {}
-                                // the card TYPES — a tidy stack sized to the screen's height
-                                VerticalLayout {
-                                    horizontal-stretch: 1;
-                                    spacing: 6px;
-                                    Mono { text: "WHICH CHANGES EARN A CARD"; color: Theme.text-dim; }
-                                    NotifTypeChip { label: "dpi"; desc: "pointer DPI"; on: State.notif-dpi; toggled => { State.set-notif-event("dpi", !State.notif-dpi); } }
-                                    NotifTypeChip { label: "sensitivity"; desc: "scroll modes"; on: State.notif-scroll; toggled => { State.set-notif-event("scroll", !State.notif-scroll); } }
-                                    NotifTypeChip { label: "polling"; desc: "report rate"; on: State.notif-polling; toggled => { State.set-notif-event("polling", !State.notif-polling); } }
-                                    NotifTypeChip { label: "brightness"; desc: "LED brightness"; on: State.notif-brightness; toggled => { State.set-notif-event("brightness", !State.notif-brightness); } }
-                                    NotifTypeChip { label: "profile"; desc: "active profile"; on: State.notif-profile; toggled => { State.set-notif-event("profile", !State.notif-profile); } }
-                                    NotifTypeChip { label: "layer"; desc: "HyperShift layer"; on: State.notif-layer; toggled => { State.set-notif-event("layer", !State.notif-layer); } }
-                                }
-                            }
-                        }
-                        // card background — the grounded squircle (app-card chrome) vs the floating spell.
-                        Toggle {
-                            caption: "card background";
-                            checked: State.notif-panel;
-                            toggled(v) => { State.set-notif-panel(v); }
-                        }
-                        // sound — toggle, then (when on) volume + the voice picker.
-                        VerticalLayout {
-                            spacing: 8px;
-                            Toggle {
-                                caption: "audio cue";
-                                checked: State.notif-audio;
-                                toggled(v) => { State.set-notif-audio(v); }
-                            }
-                            if State.notif-audio : HorizontalLayout {
-                                spacing: 12px;
-                                VerticalLayout { alignment: center; width: 52px; Mono { text: "VOLUME"; color: Theme.text-dim; } }
-                                VerticalLayout {
-                                    alignment: center;
-                                    horizontal-stretch: 1;
-                                    Slider {
-                                        compact: true;
-                                        minimum: 0.0;
-                                        maximum: 1.0;
-                                        value: State.notif-volume;
-                                        step: 0.05;
-                                        wheel: false;
-                                        changed(v) => { State.set-notif-volume(v); }
-                                    }
-                                }
-                            }
-                            if State.notif-audio : HorizontalLayout {
-                                spacing: 12px;
-                                VerticalLayout { alignment: center; width: 52px; Mono { text: "VOICE"; color: Theme.text-dim; } }
-                                Segment {
-                                    options: ["PULSE", "WARM", "GLASS"];
-                                    min-seg: 64px;
-                                    index: (State.notif-sound == "warm" ? 1 : State.notif-sound == "glass" ? 2 : 0);
-                                    picked(i) => { State.set-notif-sound(i == 1 ? "warm" : i == 2 ? "glass" : "pulse"); }
-                                }
-                                Rectangle {}
-                            }
-                        }
-                    }
-
-                    Divider {}
-
                     // ── DIAGNOSTICS — the in-app test bench ───────────────────
                     HorizontalLayout {
                         spacing: 10px;
@@ -914,7 +1604,7 @@ export component SettingsPanel inherits VerticalLayout {
                             alignment: center;
                             spacing: 3px;
                             SectionTitle { text: "DIAGNOSTICS"; }
-                            Mono { text: "fires every capability live, so you can prove it works."; color: Theme.text-faint; }
+                            Mono { text: "a live run of every capability."; color: Theme.text-faint; }
                         }
                         Rectangle {}
                         // the run trigger sizes to its own label (no fixed-width slot floating in space)
@@ -966,12 +1656,12 @@ export component SettingsPanel inherits VerticalLayout {
                     // "prove it works" grid fills the rest), with a 3-row floor so the 9 stations always show.
                     bench := Rectangle {
                         vertical-stretch: 1;
-                        property <length> cw: (self.width - 20px) / 3;
-                        min-height: ceil(max(3, State.diagnostics.length) / 3) * 96px;
+                        property <length> cw: (self.width - 30px) / 4;
+                        min-height: ceil(max(4, State.diagnostics.length) / 4) * 96px;
                         for d[i] in State.diagnostics : DiagCell {
                             d: d;
-                            x: mod(i, 3) * (bench.cw + 10px);
-                            y: floor(i / 3) * 96px;
+                            x: mod(i, 4) * (bench.cw + 10px);
+                            y: floor(i / 4) * 96px;
                             width: bench.cw;
                             height: 86px;
                         }

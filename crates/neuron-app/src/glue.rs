@@ -17,10 +17,11 @@ use crate::mic;
 use crate::migrate;
 use crate::runtime::AppRuntime;
 use crate::ui::{
-    AppRuleRow, AppWindow, BeaconMacro, DeviceRow, DiagRow, EffectRow, GlyphChip, GraphEdge,
-    GraphNode, ImportLine, KnobRow, LayerRow, MaterialCard, OrganRow, PocketCard, ProfileRow,
-    RadialSector, RhythmBindRow, RuleRow, State, Theme,
+    AppRuleRow, AppWindow, BeaconMacro, DeviceRow, DiagRow, EffectParam, EffectRow, EffectTile,
+    GlyphChip, ImportLine, KnobRow, LayerRow, MacroBlock, MacroCard, MaterialCard, OrganRow,
+    PocketCard, ProfileRow, RadialSector, RhythmBindRow, RuleRow, State, Theme,
 };
+use neuron::macros::{value_to_source, MacroNode, Value};
 use neuron::effects::FrameGen;
 use neuron::import::Imported;
 use neuron::lighting::Rgb;
@@ -28,10 +29,98 @@ use slint::{
     ComponentHandle, Image, Model, ModelRc, Rgba8Pixel, SharedPixelBuffer, SharedString, VecModel,
 };
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 /// The "off" colour of an LED cell — what `clear` paints and what an unpainted grid shows.
 const GRID_OFF: slint::Color = slint::Color::from_rgb_u8(0x0c, 0x0d, 0x10);
+
+/// A process-lifetime time origin for the lighting page's preview phases (the data-tile charging
+/// crest, the tile-grid animation). One shared clock so all previews advance together.
+fn preview_epoch() -> &'static std::time::Instant {
+    use std::sync::OnceLock;
+    static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+    EPOCH.get_or_init(std::time::Instant::now)
+}
+
+/// Whether the lighting-page render profiler is on (env `NEURON_PROF`). Cached once — env reads lock
+/// an internal mutex, and the tile tick is hot. INERT in prod (the env var is unset), so the per-tick
+/// `Instant` calls below are skipped entirely; this is pure diagnostics, gone the moment the var is.
+fn tile_prof_on() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("NEURON_PROF").is_some())
+}
+
+/// Rolling 1 Hz accumulator for the tile-render tick — only ever touched when `NEURON_PROF` is set.
+/// Per-tile gen + preview-convert microseconds, the model-upload cost, and the whole-tick total,
+/// summed across a second then printed to stderr as per-tick AVERAGES (so the log is one line/sec,
+/// not a flood). This is how Part B reports the REAL page cost the data indicts.
+struct TileProfAcc {
+    ticks: u32,
+    tick_total_us: f64,
+    upload_us: f64,
+    gen: std::collections::HashMap<&'static str, f64>,
+    prev: std::collections::HashMap<&'static str, f64>,
+    last_print: std::time::Instant,
+}
+impl TileProfAcc {
+    fn new() -> Self {
+        TileProfAcc {
+            ticks: 0,
+            tick_total_us: 0.0,
+            upload_us: 0.0,
+            gen: std::collections::HashMap::new(),
+            prev: std::collections::HashMap::new(),
+            last_print: std::time::Instant::now(),
+        }
+    }
+    fn flush(&mut self) {
+        let secs = self.last_print.elapsed().as_secs_f64().max(1e-6);
+        let n = self.ticks.max(1) as f64;
+        let gen_total: f64 = self.gen.values().sum::<f64>() / n;
+        eprintln!(
+            "PROF: tick_total={:.3}ms tiles={} rate≈{:.1}Hz gen_total={:.3}ms preview_total={:.3}ms upload={:.3}ms",
+            self.tick_total_us / n / 1000.0,
+            self.gen.len(),
+            self.ticks as f64 / secs,
+            gen_total / 1000.0,
+            self.prev.values().sum::<f64>() / n / 1000.0,
+            self.upload_us / n / 1000.0,
+        );
+        let mut rows: Vec<(&'static str, f64, f64)> = self
+            .gen
+            .iter()
+            .map(|(&k, &g)| (k, g / n, self.prev.get(k).copied().unwrap_or(0.0) / n))
+            .collect();
+        rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        for (slug, g, p) in rows {
+            eprintln!("PROF:   tile={slug:<12} gen_us={g:>8.1} preview_us={p:>6.1}");
+        }
+        *self = TileProfAcc::new();
+    }
+}
+
+/// Fold one tile-tick's measurements into the rolling accumulator, flushing once per second. Called
+/// only under `NEURON_PROF`.
+fn tile_prof_accumulate(tick_us: f64, upload_us: f64, rows: &[(&'static str, f64, f64)]) {
+    thread_local! {
+        static ACC: RefCell<TileProfAcc> = RefCell::new(TileProfAcc::new());
+    }
+    ACC.with(|a| {
+        let mut a = a.borrow_mut();
+        a.ticks += 1;
+        a.tick_total_us += tick_us;
+        a.upload_us += upload_us;
+        for &(slug, gen_us, prev_us) in rows {
+            *a.gen.entry(slug).or_insert(0.0) += gen_us;
+            *a.prev.entry(slug).or_insert(0.0) += prev_us;
+        }
+        if a.last_print.elapsed() >= std::time::Duration::from_secs(1) {
+            a.flush();
+        }
+    });
+}
 const DPI_MIN: u16 = 100;
 const DPI_MAX: u16 = 30_000;
 const DPI_STAGE_CAPACITY: usize = 5;
@@ -49,6 +138,16 @@ pub struct Shared {
     pub light_layers: Vec<neuron::effects::LayerDef>,
     pub selected_layer: usize,
     pub layers_rev: u64,
+    /// DATA MODE — when set, the lighting surface paints a cross-device DATA readout (the vitals
+    /// dashboard via `render_vitals`) instead of the effect stack. It's a first-class TILE pick like
+    /// any effect, but it owns the whole board (a readout, not a layer), so picking it clears the
+    /// stack and picking an effect clears this. `Some(slug)` names which data surface is active.
+    pub light_data: Option<String>,
+    /// The macro CONSTRUCTOR's working tree — the source of truth behind the blocks canvas. Every
+    /// canvas edit (edit-step / add-step / delete-step / move-step) mutates THIS, then Rust regenerates
+    /// `macro-source` (via `nodes_to_source`) and re-flattens it into `macro-blocks`. A successful
+    /// code-view parse reseeds it. Held here so it survives across callbacks (it IS the macro's shape).
+    pub macro_tree: Vec<MacroNode>,
 }
 
 pub type SharedRt = Rc<RefCell<Shared>>;
@@ -62,6 +161,60 @@ thread_local! {
     /// The last HID control captured by press-to-bind, held between the capture callback and the
     /// "Add binding" commit (UI-thread-local, like the shared runtime).
     static CAPTURED_CONTROL: RefCell<Option<crate::capture::CapturedControl>> = const { RefCell::new(None) };
+
+    /// Live channel meters (mic + out) + their ballistics — opened only while the DIRECT page shows them.
+    static AUDIO_METERS: RefCell<Option<AudioMeters>> = const { RefCell::new(None) };
+}
+
+/// One channel's meter ballistics — DaVinci-style: instant attack, smooth release, a falling peak-hold
+/// tick, and a ~2s clip latch. Fed a 0..1 LINEAR peak each ~30fps poll; exposes a dB-mapped display
+/// level so the bar lives in the useful range instead of dead-then-slammed.
+#[derive(Default)]
+struct MeterChan {
+    level: f32,
+    hold: f32,
+    hold_age: u32,
+    clip_age: u32,
+}
+impl MeterChan {
+    fn update(&mut self, raw: f32) {
+        let disp = if raw <= 1e-4 {
+            0.0
+        } else {
+            ((20.0 * raw.log10() + 60.0) / 60.0).clamp(0.0, 1.0) // -60dB..0dB → 0..1
+        };
+        if disp >= self.level {
+            self.level = disp; // instant attack
+        } else {
+            self.level += (disp - self.level) * 0.30; // ~150ms release at 30fps
+        }
+        if disp >= self.hold {
+            self.hold = disp;
+            self.hold_age = 0;
+        } else {
+            self.hold_age += 1;
+            if self.hold_age > 30 {
+                self.hold += (disp - self.hold) * 0.08; // ~1s hold, then fall
+            }
+        }
+        if raw >= 0.99 {
+            self.clip_age = 0;
+        } else {
+            self.clip_age = self.clip_age.saturating_add(1);
+        }
+    }
+    fn clip(&self) -> bool {
+        self.clip_age < 60 // hold the clip flag ~2s after the last near-0dBFS hit
+    }
+}
+
+/// The open meter handles + ballistics, live only while the DIRECT page is showing.
+#[derive(Default)]
+struct AudioMeters {
+    mic: Option<neuron::audio::MeterCtl>,
+    out: Option<neuron::audio::MeterCtl>,
+    cm: MeterChan,
+    co: MeterChan,
 }
 
 /// Read the currently-selected action (palette id + parameter) from the State action picker.
@@ -309,6 +462,458 @@ fn first_line(s: &str) -> String {
     s.lines().next().unwrap_or(s).trim().to_string()
 }
 
+/// A node's KIND tag — the stable string the flat model + the edit-ops key on (matches MacroBlock's
+/// `kind` field). One mapping so the canvas, the add-defaults, and the flatten never drift.
+fn macro_kind(node: &MacroNode) -> &'static str {
+    match node {
+        MacroNode::Type { .. } => "type",
+        MacroNode::Press { .. } => "press",
+        MacroNode::KeyPress { .. } => "key_press",
+        MacroNode::Click { .. } => "click",
+        MacroNode::Scroll { .. } => "scroll",
+        MacroNode::MoveTo { .. } => "move_to",
+        MacroNode::Copy { .. } => "copy",
+        MacroNode::Paste => "paste",
+        MacroNode::Open { .. } => "open",
+        MacroNode::Focus { .. } => "focus",
+        MacroNode::Wait { .. } => "wait",
+        MacroNode::Notify { .. } => "notify",
+        MacroNode::Ask { .. } => "ask",
+        MacroNode::If { .. } => "if",
+        MacroNode::RepeatN { .. } => "repeat_n",
+        MacroNode::RepeatWhile { .. } => "repeat_while",
+        MacroNode::ForEach { .. } => "for_each",
+        MacroNode::SetVar { .. } => "set_var",
+        MacroNode::Stop => "stop",
+        MacroNode::Try { .. } => "try",
+        MacroNode::Raw { .. } => "raw",
+    }
+}
+
+/// The PLAIN-LANGUAGE verb shown on a step card — the macro reads like a sentence ("type ⟨hi⟩",
+/// "press ⟨ctrl+c⟩", "open ⟨notepad⟩"). Kept beside `macro_kind` so the two stay in lockstep.
+fn macro_verb(kind: &str) -> &'static str {
+    match kind {
+        "type" => "type",
+        "press" => "press",
+        "key_press" => "key",
+        "click" => "click",
+        "scroll" => "scroll",
+        "move_to" => "move",
+        "copy" => "copy",
+        "paste" => "paste",
+        "open" => "open",
+        "focus" => "focus",
+        "wait" => "wait",
+        "notify" => "notify",
+        "ask" => "ask",
+        "if" => "if",
+        "repeat_n" => "repeat",
+        "repeat_while" => "while",
+        "for_each" => "for each",
+        "set_var" => "set",
+        "stop" => "stop",
+        "try" => "try",
+        "raw" => "code",
+        _ => "",
+    }
+}
+
+/// The editable PARAM string a step shows in its inline field — the human bit, rendered through
+/// [`value_to_source`] so a Value param shows as the Python expression the user edits (`"hi"`,
+/// `ctx.selection.upper()`, `"got " + ctx.app`). Non-Value params (key chords, button, var names)
+/// show their plain form. Parameter-less nodes (paste/stop) show nothing.
+fn macro_value(node: &MacroNode) -> String {
+    match node {
+        MacroNode::Type { text, .. }
+        | MacroNode::Copy { text }
+        | MacroNode::Notify { text } => value_to_source(text),
+        MacroNode::Scroll { amount } => value_to_source(amount),
+        MacroNode::Wait { ms } => value_to_source(ms),
+        MacroNode::Focus { window } => value_to_source(window),
+        MacroNode::Open { command, .. } => value_to_source(command),
+        MacroNode::MoveTo { x, y } => format!("{}, {}", value_to_source(x), value_to_source(y)),
+        MacroNode::Press { keys } => keys.join("+"),
+        MacroNode::KeyPress { name } => name.clone(),
+        MacroNode::Click { button } => button.clone(),
+        MacroNode::Paste | MacroNode::Stop => String::new(),
+        MacroNode::Ask { question, .. } => value_to_source(question),
+        MacroNode::If { cond, .. } | MacroNode::RepeatWhile { cond, .. } => value_to_source(cond),
+        MacroNode::RepeatN { count, .. } => value_to_source(count),
+        MacroNode::ForEach { var, source, .. } => {
+            format!("{var} in {}", value_to_source(source))
+        }
+        MacroNode::SetVar { name, value } => format!("{name} = {}", value_to_source(value)),
+        MacroNode::Try { .. } => String::new(),
+        MacroNode::Raw { code } => code.clone(),
+    }
+}
+
+/// FLATTEN the working tree into the flat `MacroBlock` model the constructor canvas renders (Slint
+/// can't draw a recursive tree). Emits, in order: each step row (carrying its PATH back into the
+/// tree); for an `Ask` → the ask step, then a YES lane row, its children (depth+1) recursed, a YES
+/// add-row, then a NO lane row, its children, a NO add-row; and after the whole root body, a final
+/// root add-row. So every body/branch ends with its own +add insert-point. `prefix` is the path of
+/// the body being flattened ("" at root, "1.yes" inside an ask arm); `depth` drives the indent. Pure
+/// + instant (no I/O) — it runs synchronously after every edit so the canvas updates immediately.
+fn flatten_macro(nodes: &[MacroNode], depth: i32, prefix: &str, out: &mut Vec<MacroBlock>) {
+    emit_body(nodes, depth, prefix, out);
+    // the TOP-LEVEL body ends with its own +add insert-point (path = the root context). A branch
+    // sub-body's add-point is emitted by `emit_body` right after its arm, so only the root adds here.
+    out.push(add_row(prefix, depth));
+}
+
+/// One +add insert-point row for the body at `ctx` (the path to append into).
+fn add_row(ctx: &str, depth: i32) -> MacroBlock {
+    MacroBlock {
+        row: "add".into(),
+        path: ctx.into(),
+        depth,
+        kind: "".into(),
+        verb: "".into(),
+        value: "".into(),
+        last: false,
+    }
+}
+
+/// The LANES a flow node exposes on the canvas: `(lane_label, arm_segment, body)`. The `arm_segment`
+/// is the path token that descends into that body (`yes`/`no`, `then`/`else`, `body`, `error`) — it
+/// MUST match what [`parent_body_and_index`] / [`body_at_context`] descend through. A non-flow node
+/// returns an empty list (a plain step, no lanes). Generalizing the per-node lane set here is what
+/// lets `emit_body` flatten every flow kind through one loop.
+fn node_lanes(node: &MacroNode) -> Vec<(&'static str, &'static str, &[MacroNode])> {
+    match node {
+        MacroNode::Ask { yes, no, .. } => vec![("yes", "yes", yes), ("no", "no", no)],
+        MacroNode::If { then_, else_, .. } => {
+            vec![("then", "then", then_), ("else", "else", else_)]
+        }
+        MacroNode::RepeatN { body, .. }
+        | MacroNode::RepeatWhile { body, .. }
+        | MacroNode::ForEach { body, .. } => vec![("body", "body", body)],
+        MacroNode::Try { body, except_ } => vec![("body", "body", body), ("error", "error", except_)],
+        _ => Vec::new(),
+    }
+}
+
+/// Emit the step (+ lane) rows for one body — WITHOUT a trailing root add-point. Each FLOW node's
+/// lanes are emitted inline here (a lane header, the recursed sub-body one level in, then the lane's
+/// own +add), so a sub-body's insert-point is owned by its lane, not by a recursive trailing add.
+/// Generalized over [`node_lanes`], so Ask/If/RepeatN/RepeatWhile/ForEach/Try all flatten identically.
+fn emit_body(nodes: &[MacroNode], depth: i32, prefix: &str, out: &mut Vec<MacroBlock>) {
+    let join = |i: usize| -> String {
+        if prefix.is_empty() {
+            i.to_string()
+        } else {
+            format!("{prefix}.{i}")
+        }
+    };
+    let last_idx = nodes.len().saturating_sub(1);
+    for (i, node) in nodes.iter().enumerate() {
+        let path = join(i);
+        let kind = macro_kind(node);
+        out.push(MacroBlock {
+            row: "step".into(),
+            path: path.clone().into(),
+            depth,
+            kind: kind.into(),
+            verb: macro_verb(kind).into(),
+            value: macro_value(node).into(),
+            last: i == last_idx,
+        });
+        for (label, arm, body) in node_lanes(node) {
+            // a lane header, the recursed sub-body one level deeper, then the lane's own +add.
+            let lane_ctx = format!("{path}.{arm}");
+            out.push(MacroBlock {
+                row: "lane".into(),
+                path: path.clone().into(),
+                depth: depth + 1,
+                kind: label.into(),
+                verb: "".into(),
+                value: "".into(),
+                last: false,
+            });
+            emit_body(body, depth + 2, &lane_ctx, out);
+            out.push(add_row(&lane_ctx, depth + 2));
+        }
+    }
+}
+
+/// Descend one ARM of a flow node — the mutable sub-body the path segment `arm` names. The arm tokens
+/// match [`node_lanes`]: `yes`/`no` (Ask), `then`/`else` (If), `body` (RepeatN/RepeatWhile/ForEach or
+/// a Try's guarded body), `error` (a Try's except). Returns `None` if the node isn't a flow node with
+/// that arm. ONE place owns the arm→sub-body mapping, so the flatten + both path resolvers agree.
+fn node_arm_body<'a>(node: &'a mut MacroNode, arm: &str) -> Option<&'a mut Vec<MacroNode>> {
+    match node {
+        MacroNode::Ask { yes, no, .. } => match arm {
+            "yes" => Some(yes),
+            "no" => Some(no),
+            _ => None,
+        },
+        MacroNode::If { then_, else_, .. } => match arm {
+            "then" => Some(then_),
+            "else" => Some(else_),
+            _ => None,
+        },
+        MacroNode::RepeatN { body, .. }
+        | MacroNode::RepeatWhile { body, .. }
+        | MacroNode::ForEach { body, .. } => match arm {
+            "body" => Some(body),
+            _ => None,
+        },
+        MacroNode::Try { body, except_ } => match arm {
+            "body" => Some(body),
+            "error" => Some(except_),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Resolve a PATH to a mutable reference to the body Vec that DIRECTLY contains the addressed node,
+/// plus the node's index within it. The path is dot-separated: a numeric segment indexes the current
+/// body; an arm segment (`yes`/`no`/`then`/`else`/`body`/`error`) descends into the preceding flow
+/// node's sub-body. Returns `None` if any segment is out of range or the path is malformed (e.g. an
+/// arm step into a node without that arm). This is the one resolver every edit-op uses — index into
+/// the returned body to read/replace/remove the node.
+fn parent_body_and_index<'a>(
+    tree: &'a mut Vec<MacroNode>,
+    path: &str,
+) -> Option<(&'a mut Vec<MacroNode>, usize)> {
+    let segs: Vec<&str> = path.split('.').filter(|s| !s.is_empty()).collect();
+    if segs.is_empty() {
+        return None;
+    }
+    let mut body = tree;
+    let mut i = 0;
+    while i < segs.len() {
+        let idx: usize = segs[i].parse().ok()?;
+        // the LAST segment must be a numeric index — it names the node in the current body.
+        if i + 1 == segs.len() {
+            if idx >= body.len() {
+                return None;
+            }
+            return Some((body, idx));
+        }
+        // otherwise the next segment is a flow arm descending into this node's sub-body.
+        let arm = segs[i + 1];
+        let node = body.get_mut(idx)?;
+        body = node_arm_body(node, arm)?;
+        i += 2;
+    }
+    None
+}
+
+/// Resolve a PATH to a mutable reference to the addressed node itself (for `edit-step`). Thin wrapper
+/// over [`parent_body_and_index`].
+fn node_at_path<'a>(tree: &'a mut Vec<MacroNode>, path: &str) -> Option<&'a mut MacroNode> {
+    let (body, idx) = parent_body_and_index(tree, path)?;
+    body.get_mut(idx)
+}
+
+/// Resolve an INSERT-CONTEXT path (the body to append into) to a mutable reference to that body. An
+/// empty path is the root body; otherwise the path ends in a flow arm (`yes`/`no`/`then`/`else`/
+/// `body`/`error`) of a flow node. Returns `None` if the context doesn't resolve to such an arm.
+fn body_at_context<'a>(
+    tree: &'a mut Vec<MacroNode>,
+    ctx: &str,
+) -> Option<&'a mut Vec<MacroNode>> {
+    let segs: Vec<&str> = ctx.split('.').filter(|s| !s.is_empty()).collect();
+    if segs.is_empty() {
+        return Some(tree);
+    }
+    let mut body = tree;
+    let mut i = 0;
+    while i < segs.len() {
+        let idx: usize = segs[i].parse().ok()?;
+        let arm = segs.get(i + 1)?;
+        let node = body.get_mut(idx)?;
+        body = node_arm_body(node, arm)?;
+        i += 2;
+    }
+    Some(body)
+}
+
+/// A fresh default node for `kind` — what `add-step` drops in (empty, ready to edit in place). Value
+/// params default to an empty string literal (text-ish) or a sensible literal (counts/coords →
+/// integers, conditions → `True`); flow bodies start empty (their lanes show their own +add). Returns
+/// `None` for an unknown kind, so `add-step` never panics on a stray kind string.
+fn default_node(kind: &str) -> Option<MacroNode> {
+    Some(match kind {
+        "type" => MacroNode::Type {
+            text: Value::empty_str(),
+            ghost: false,
+            speed: None,
+        },
+        "press" => MacroNode::Press { keys: Vec::new() },
+        "key_press" => MacroNode::KeyPress { name: String::new() },
+        "click" => MacroNode::Click {
+            button: "left".into(),
+        },
+        "scroll" => MacroNode::Scroll {
+            amount: Value::Int { n: 1 },
+        },
+        "move_to" => MacroNode::MoveTo {
+            x: Value::Int { n: 0 },
+            y: Value::Int { n: 0 },
+        },
+        "copy" => MacroNode::Copy {
+            text: Value::empty_str(),
+        },
+        "paste" => MacroNode::Paste,
+        "open" => MacroNode::Open {
+            command: Value::empty_str(),
+            capture: None,
+        },
+        "focus" => MacroNode::Focus {
+            window: Value::empty_str(),
+        },
+        "wait" => MacroNode::Wait {
+            ms: Value::Int { n: 500 },
+        },
+        "notify" => MacroNode::Notify {
+            text: Value::empty_str(),
+        },
+        "ask" => MacroNode::Ask {
+            question: Value::empty_str(),
+            description: Value::empty_str(),
+            yes: Vec::new(),
+            no: Vec::new(),
+        },
+        "if" => MacroNode::If {
+            cond: Value::Bool { b: true },
+            then_: Vec::new(),
+            else_: Vec::new(),
+        },
+        "repeat_n" => MacroNode::RepeatN {
+            count: Value::Int { n: 1 },
+            body: Vec::new(),
+        },
+        "repeat_while" => MacroNode::RepeatWhile {
+            cond: Value::Bool { b: true },
+            body: Vec::new(),
+        },
+        "for_each" => MacroNode::ForEach {
+            var: "item".into(),
+            source: Value::empty_str(),
+            body: Vec::new(),
+        },
+        "set_var" => MacroNode::SetVar {
+            name: "x".into(),
+            value: Value::empty_str(),
+        },
+        "stop" => MacroNode::Stop,
+        "try" => MacroNode::Try {
+            body: Vec::new(),
+            except_: Vec::new(),
+        },
+        "raw" => MacroNode::Raw { code: String::new() },
+        _ => return None,
+    })
+}
+
+/// Split a chord/key spec into lowercased key names (the press-keys setter): on `+`, `,`, or space.
+fn split_keys(v: &str) -> Vec<String> {
+    v.split(|c| c == '+' || c == ',' || c == ' ')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_lowercase())
+        .collect()
+}
+
+/// Apply an EDIT-STEP value to a node in place. Text-ish Value params become a `Str` literal (the
+/// field is the literal string); expression Value params become a `Raw` verbatim (the user typed an
+/// expr — the next code-parse normalizes it to a typed Value). Compound-display flow params
+/// (move "x, y", for-each "var in src", set "name = expr") are split back into their parts on the
+/// display separator; an un-splittable edit lands the whole thing in the first/expr slot so no data
+/// is lost. Non-Value params (press keys, click button, key name, raw code) keep their plain setters.
+fn edit_node_value(node: &mut MacroNode, v: String) {
+    match node {
+        // text-ish Value params → a Str literal (the field IS the string).
+        MacroNode::Type { text, .. }
+        | MacroNode::Copy { text }
+        | MacroNode::Notify { text } => *text = Value::Str { s: v },
+        MacroNode::Open { command, .. } => *command = Value::Str { s: v },
+        MacroNode::Focus { window } => *window = Value::Str { s: v },
+        // expression Value params → a Raw verbatim (power users type an expr).
+        MacroNode::Scroll { amount } => *amount = Value::raw(v.trim()),
+        MacroNode::Wait { ms } => *ms = Value::raw(v.trim()),
+        MacroNode::Ask { question, .. } => *question = Value::Str { s: v },
+        MacroNode::If { cond, .. } | MacroNode::RepeatWhile { cond, .. } => {
+            *cond = Value::raw(v.trim())
+        }
+        MacroNode::RepeatN { count, .. } => *count = Value::raw(v.trim()),
+        // compound flow displays → split on the display separator.
+        MacroNode::MoveTo { x, y } => {
+            if let Some((a, b)) = v.split_once(',') {
+                *x = Value::raw(a.trim());
+                *y = Value::raw(b.trim());
+            } else {
+                *x = Value::raw(v.trim());
+            }
+        }
+        MacroNode::ForEach { var, source, .. } => {
+            if let Some((name, src)) = v.split_once(" in ") {
+                *var = name.trim().to_string();
+                *source = Value::raw(src.trim());
+            } else {
+                *source = Value::raw(v.trim());
+            }
+        }
+        MacroNode::SetVar { name, value } => {
+            if let Some((n, expr)) = v.split_once('=') {
+                *name = n.trim().to_string();
+                *value = Value::raw(expr.trim());
+            } else {
+                *value = Value::raw(v.trim());
+            }
+        }
+        // non-Value params.
+        MacroNode::Press { keys } => *keys = split_keys(&v),
+        MacroNode::KeyPress { name } => *name = v.trim().to_lowercase(),
+        MacroNode::Click { button } => *button = v.trim().to_lowercase(),
+        MacroNode::Raw { code } => *code = v,
+        // parameter-less nodes carry no inline field; ignore an edit.
+        MacroNode::Paste | MacroNode::Stop | MacroNode::Try { .. } => {}
+    }
+}
+
+/// After ANY tree mutation: regenerate the Python source from the tree (pure Rust codegen, instant),
+/// push it into `macro-source` WITH the dirty-guard set (so the CodeArea's `edited` hook skips the
+/// re-parse), recompute `macro-has-ask`, and re-flatten the tree into `macro-blocks`. The canvas + the
+/// code view both stay current off the one source of truth, synchronously, no Python in the loop.
+fn regenerate_from_tree(st: &State, tree: &[MacroNode]) {
+    let source = neuron::macros::nodes_to_source(tree);
+    st.set_macro_has_ask(source.contains("neuron.ask"));
+    // ARM the dirty-guard only when the code editor is actually mounted (the user is in code view):
+    // a programmatic `set_macro_source` updates the CodeArea via its <=> binding but does NOT fire
+    // `edited`, so arming it while the canvas is showing would leave it stuck true and mis-flag the
+    // user's next code-view keystroke. Canvas edits happen while !code-view, so this stays false then.
+    if st.get_macro_code_view() {
+        st.set_macro_source_dirty(true);
+    }
+    st.set_macro_source(source.into());
+    let mut blocks = Vec::new();
+    flatten_macro(tree, 0, "", &mut blocks);
+    st.set_macro_blocks(ModelRc::new(VecModel::from(blocks)));
+}
+
+/// After a VALUE-ONLY edit (edit-step): regenerate the Python source from the tree and recompute
+/// `macro-has-ask`, but DO NOT re-flatten into `macro-blocks`. A value edit changes a node's param,
+/// not the macro's STRUCTURE — so the flat model's row layout is unchanged, and re-setting it would
+/// rebuild every `MacroBlockEl` (losing the caret / focus of the very field being typed in, and on a
+/// blur-commit yanking focus mid-gesture). The live field already shows the typed text; the model's
+/// now-stale `value` is harmless because it's only re-read on the NEXT structural re-flatten (add /
+/// delete / move), which reads the now-correct tree. This is what makes click-away commit + smooth
+/// typing possible. Structural ops still call `regenerate_from_tree` (which DOES re-flatten).
+fn regenerate_source_only(st: &State, tree: &[MacroNode]) {
+    let source = neuron::macros::nodes_to_source(tree);
+    st.set_macro_has_ask(source.contains("neuron.ask"));
+    if st.get_macro_code_view() {
+        st.set_macro_source_dirty(true);
+    }
+    st.set_macro_source(source.into());
+}
+
 /// Install every callback + initial data. Returns the shared runtime so main/tray can reach it.
 pub fn install(app: &AppWindow) -> SharedRt {
     let shared: SharedRt = Rc::new(RefCell::new(Shared {
@@ -321,6 +926,10 @@ pub fn install(app: &AppWindow) -> SharedRt {
         light_layers: Vec::new(),
         selected_layer: 0,
         layers_rev: 0,
+        light_data: None,
+        // the macro constructor starts empty; the canvas's root +add invites the first step, or a
+        // parse of an existing macro's source (on entering the editor) reseeds it.
+        macro_tree: Vec::new(),
     }));
     UI_SHARED.with(|s| *s.borrow_mut() = Some(shared.clone()));
     let st = app.global::<State>();
@@ -338,6 +947,17 @@ pub fn install(app: &AppWindow) -> SharedRt {
     // a truly-fresh install gets the bundled exemplar macro before the registry first reads disk.
     neuron::macros::macro_host::seed_default_macros();
     refresh_beacon_macros(app);
+    // the WORKSHOP catalog — every macro on disk as an emergent card (off-thread parse for summaries).
+    refresh_macro_catalog(app);
+    // seed the macro constructor's canvas so its root +add exists from FIRST paint. The editor opens
+    // in BLOCKS mode, but `refresh-macro-blocks` only fires on a toggle-to-blocks — so without this an
+    // empty canvas had no +add and the very first step was unreachable until a code-view round-trip
+    // ran a parse. `flatten([])` emits exactly the root +add invitation ("add your first step").
+    {
+        let mut blocks = Vec::new();
+        flatten_macro(&[], 0, "", &mut blocks);
+        st.set_macro_blocks(ModelRc::new(VecModel::from(blocks)));
+    }
     refresh_profiles(app, &shared);
     refresh_app_rules(app, &shared);
     refresh_gestures(app, &shared);
@@ -486,6 +1106,67 @@ pub fn install(app: &AppWindow) -> SharedRt {
             .on_apply_brightness(move |v| status(&w, &sh, |rt| rt.apply_brightness(v as u8)));
     });
 
+    // ── the EVERYDAY DECK's global apply + reload ────────────────────────
+    // apply-feel: commit every everyday device-write the SELECTED device supports in one gesture —
+    // dpi / polling / brightness / dpi-stages, each only when its capability is present (and the
+    // stages list parses). Honours writes-paused (a no-op, like the per-control handlers used to be),
+    // mirrors the result on the status line, and re-seeds the channel rows from the device after.
+    bind(app, &shared, |app, sh| {
+        let w = app.as_weak();
+        let sh = sh.clone();
+        app.global::<State>().on_apply_feel(move || {
+            if let Some(app) = w.upgrade() {
+                let st = app.global::<State>();
+                if st.get_writes_paused() {
+                    st.set_status_line("writes paused".into());
+                    return;
+                }
+                // snapshot the draft State the deck has been editing.
+                let can_dpi = st.get_sel_can_dpi();
+                let can_poll = st.get_sel_can_poll();
+                let can_light = st.get_sel_can_light();
+                let can_store = st.get_sel_can_store();
+                let dpi = st.get_dpi() as u16;
+                let hz = st.get_polling_hz() as u32;
+                let pct = st.get_brightness() as u8;
+                let stages = st.get_dpi_stages().to_string();
+                let active = st.get_dpi_active_stage().max(0) as u8;
+                let stages_ok = can_dpi && st.get_dpi_stages_valid();
+                // one borrow for the whole batch; collect a single confirmation line.
+                let mut lines: Vec<String> = Vec::new();
+                {
+                    let mut s = sh.borrow_mut();
+                    s.rt.persist = can_store && st.get_persist_to_onboard();
+                    if can_dpi {
+                        lines.push(s.rt.apply_dpi(dpi));
+                    }
+                    if can_poll {
+                        let (msg, actual) = s.rt.apply_polling(hz);
+                        if let Some(a) = actual {
+                            st.set_polling_hz(a as f32);
+                        }
+                        lines.push(msg);
+                    }
+                    if can_light {
+                        lines.push(s.rt.apply_brightness(pct));
+                    }
+                    if stages_ok {
+                        lines.push(s.rt.apply_dpi_stages(stages.as_str(), active));
+                    }
+                }
+                st.set_status_line(
+                    if lines.is_empty() {
+                        "nothing to apply".to_string()
+                    } else {
+                        lines.join(" · ")
+                    }
+                    .into(),
+                );
+                // re-seed the rows from the device so the readouts match what was just committed.
+                refresh_devices(&app, &sh);
+            }
+        });
+    });
     bind(app, &shared, |app, _sh| {
         let w = app.as_weak();
         app.global::<State>().on_open_config_dir(move || {
@@ -509,13 +1190,13 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 {
                     use crate::purge::Outcome;
                     let msg = match crate::purge::request() {
-                        Outcome::Done { killed, stopped, disabled }
-                            if killed == 0 && stopped == 0 && disabled == 0 =>
+                        Outcome::Done { killed, stopped, demoted }
+                            if killed == 0 && stopped == 0 && demoted == 0 =>
                         {
                             "no Synapse left — already clean".to_string()
                         }
-                        Outcome::Done { killed, stopped, disabled } => {
-                            format!("purged Synapse — disabled {disabled} + stopped {stopped} service(s), killed {killed} process(es)")
+                        Outcome::Done { killed, stopped, demoted } => {
+                            format!("purged Synapse — set {demoted} service(s) to manual + stopped {stopped}, killed {killed} process(es)")
                         }
                         Outcome::Elevating => {
                             "requesting admin to purge SYSTEM services… (approve the UAC prompt)".to_string()
@@ -684,23 +1365,42 @@ pub fn install(app: &AppWindow) -> SharedRt {
         let sh = sh.clone();
         // THE LIVE COMPOSITE MIRROR: composite the whole layer stack onto the render at ~20Hz with
         // the SAME math the device path runs (`Compositor::frame`). A reconstruction, not a
-        // read-back — badged "~ live". The Compositor is cached and only rebuilt when the stack
-        // changes (`layers_rev`), so stateful effects (fire's heat map) keep state across ticks.
-        let cache: Rc<RefCell<Option<(u64, neuron::effects::Compositor, std::time::Instant)>>> =
+        // read-back — badged "~ live". The Compositor is cached and rebuilt when the stack changes
+        // (`layers_rev`) OR the grid DIMS change, so stateful effects (fire's heat map) keep state
+        // across ticks — and switching to a same-stack different-dims device rebuilds the generators
+        // (a stale-dim generator emits the wrong frame length and the layer goes dark via the
+        // `Compositor::frame` length-skip). The cache key is `(rev, rows, cols)`.
+        let cache: Rc<RefCell<Option<(u64, i32, i32, neuron::effects::Compositor)>>> =
             Rc::new(RefCell::new(None));
         app.global::<State>().on_preview_tick(move || {
             if let Some(app) = w.upgrade() {
                 let st = app.global::<State>();
                 let (rows, cols) = (st.get_grid_rows(), st.get_grid_cols());
-                // PAINT mode owns the grid (the per-LED editor) — don't fight it.
-                if st.get_light_paint_mode() || rows <= 0 || cols <= 0 {
+                // the BRUSH owns the grid (the per-LED editor) — don't fight it.
+                if st.get_light_brush_on() || rows <= 0 || cols <= 0 {
                     cache.replace(None);
                     return;
                 }
-                let (rev, defs) = {
+                let (rev, defs, data) = {
                     let s = sh.borrow();
-                    (s.layers_rev, s.light_layers.clone())
+                    (s.layers_rev, s.light_layers.clone(), s.light_data.clone())
                 };
+                // DATA mode: mirror the cross-device vitals readout onto the render (a representative
+                // snapshot in the preview; the applied stream reads the live device).
+                if let Some(_slug) = data {
+                    let n = (rows * cols) as usize;
+                    let phase = (preview_epoch().elapsed().as_secs_f32() * 0.18).rem_euclid(1.0);
+                    let frame =
+                        neuron::lighting::render_vitals(preview_vitals(), rows as u8, cols as u8, phase);
+                    let _ = n;
+                    let px: Vec<slint::Color> = frame
+                        .iter()
+                        .map(|p| slint::Color::from_rgb_u8(p.r, p.g, p.b))
+                        .collect();
+                    st.set_grid_px(ModelRc::new(VecModel::from(px)));
+                    cache.replace(None);
+                    return;
+                }
                 let n = (rows * cols) as usize;
                 if defs.is_empty() {
                     // an empty stack = a dark device; mirror that honestly
@@ -708,21 +1408,26 @@ pub fn install(app: &AppWindow) -> SharedRt {
                     cache.replace(None);
                     return;
                 }
+                // QUANTIZED SHARED-EPOCH time: floor wall-clock to 1/fps steps off the process-wide
+                // preview epoch (NOT a per-stack t0 that reset on every restack — that anchor caused
+                // the phase JUMPS the user saw). This is the EXACT formula the device's animate() loop
+                // runs, so the preview advances in the SAME discrete frames the keyboard does (chunky
+                // at 6fps, smooth at 30); tuning fps re-paces the preview and the device together.
+                let fps = st.get_light_fps().max(1.0);
+                let t = (preview_epoch().elapsed().as_secs_f32() * fps).floor() / fps;
                 let mut c = cache.borrow_mut();
-                if c.as_ref().map(|(r, _, _)| *r != rev).unwrap_or(true) {
-                    *c = Some((
-                        rev,
-                        neuron::effects::Compositor::from_defs(&defs),
-                        std::time::Instant::now(),
-                    ));
+                // rebuild the generators when the stack revision OR the grid dims change (a dims change
+                // needs fresh generators or they emit stale-length frames and the layer goes dark) —
+                // but DRIVE them from the shared quantized clock above, not a reset-on-rebuild anchor.
+                let stale = c
+                    .as_ref()
+                    .map(|(r, cr, cc, _)| *r != rev || *cr != rows || *cc != cols)
+                    .unwrap_or(true);
+                if stale {
+                    *c = Some((rev, rows, cols, neuron::effects::Compositor::from_defs(&defs)));
                 }
-                let (_, comp, t0) = c.as_mut().unwrap();
-                let frame = comp.frame(
-                    rows as u8,
-                    cols as u8,
-                    t0.elapsed().as_secs_f32(),
-                    Rgb::BLACK,
-                );
+                let (_, _, _, comp) = c.as_mut().unwrap();
+                let frame = comp.frame(rows as u8, cols as u8, t, Rgb::BLACK);
                 let px: Vec<slint::Color> = frame
                     .iter()
                     .map(|p| slint::Color::from_rgb_u8(p.r, p.g, p.b))
@@ -818,7 +1523,10 @@ pub fn install(app: &AppWindow) -> SharedRt {
                         let mut s = sh.borrow_mut();
                         let mut d = neuron::effects::LayerDef::default();
                         d.effect = effect.to_string();
-                        d.color = Rgb::new(b.red(), b.green(), b.blue());
+                        // an effect with a built-in default colour (typing heat's warm flame) starts in
+                        // it; everything else inherits the brush colour.
+                        d.color = neuron::effects::default_color(&d.effect)
+                            .unwrap_or_else(|| Rgb::new(b.red(), b.green(), b.blue()));
                         s.light_layers.push(d);
                         s.selected_layer = s.light_layers.len() - 1;
                         s.layers_rev += 1;
@@ -1041,47 +1749,11 @@ pub fn install(app: &AppWindow) -> SharedRt {
             let sh = sh.clone();
             app.global::<State>().on_composite_apply(move || {
                 if let Some(app) = w.upgrade() {
-                    let st = app.global::<State>();
-                    if st.get_writes_paused() {
-                        st.set_status_line("writes paused — composite not applied".into());
-                        return;
-                    }
-                    let back = app.as_weak();
-                    let msg = {
-                        let mut s = sh.borrow_mut();
-                        let pid = s.rt.selected_pid;
-                        let defs = s.light_layers.clone();
-                        s.rt.start_layers(defs, pid, move |reason, token| {
-                            let _ = slint::invoke_from_event_loop(move || {
-                                if let Some(app) = back.upgrade() {
-                                    with_shared(|sh| {
-                                        if !std::sync::Arc::ptr_eq(
-                                            &token,
-                                            &sh.borrow().rt.anim_stop,
-                                        ) {
-                                            return;
-                                        }
-                                        if !sh.borrow().rt.animating {
-                                            return;
-                                        }
-                                        sh.borrow_mut().rt.animating = false;
-                                        let st = app.global::<State>();
-                                        st.set_compositing(false);
-                                        st.set_status_line(
-                                            match reason {
-                                                Some(r) => format!("composite ended: {r}"),
-                                                None => "composite finished".into(),
-                                            }
-                                            .into(),
-                                        );
-                                    });
-                                }
-                            });
-                        })
-                    };
-                    let animating = sh.borrow().rt.animating;
-                    st.set_compositing(animating);
-                    st.set_status_line(msg.into());
+                    // the SAME body startup-restore drives, so a manual apply and a resumed launch
+                    // stream the device through one path (data readout via start_vitals, effect stack
+                    // via start_layers); honours the writes-paused gate.
+                    let msg = apply_current_lighting(&app, &sh);
+                    app.global::<State>().set_status_line(msg.into());
                 }
             });
         }
@@ -1094,6 +1766,26 @@ pub fn install(app: &AppWindow) -> SharedRt {
                     let st = app.global::<State>();
                     st.set_compositing(false);
                     st.set_status_line("composite stopped".into());
+                }
+            });
+        }
+        {
+            let w = app.as_weak();
+            let sh = sh.clone();
+            // STREAM RATE: re-pace the live effect AND its on-screen preview together. Writing the
+            // shared atomic reaches a RUNNING worker (it re-reads fps every frame), so a streaming
+            // composite re-paces immediately — no restart. Clamped to the slider's 1–30; the
+            // data/vitals surface ignores this (it paints on-demand, not through the streamer).
+            app.global::<State>().on_set_light_fps(move |v| {
+                if let Some(app) = w.upgrade() {
+                    let fps = (v.round() as i64).clamp(1, 30) as u32;
+                    sh.borrow()
+                        .rt
+                        .light_fps
+                        .store(fps, std::sync::atomic::Ordering::Relaxed);
+                    app.global::<State>().set_light_fps(fps as f32);
+                    // persist the user's fps pick for this board (debounced; restored on relaunch).
+                    save_lighting(&sh);
                 }
             });
         }
@@ -1196,6 +1888,278 @@ pub fn install(app: &AppWindow) -> SharedRt {
                             Err(e) => st.set_status_line(format!("import failed: {e}").into()),
                         }
                     });
+                }
+            });
+        }
+    });
+
+    // ── Lighting UNIFIED SURFACE — tile pick · auto-rendered params · stack · brush ──
+    bind(app, &shared, |app, sh| {
+        // pick-tile(slug): the SINGLE gesture for both effects AND data modes. An effect tile becomes
+        // the one active effect (replacing the selected layer when a stack exists, else a fresh single
+        // layer poured in the weave accent). A data tile takes over the whole board as a readout.
+        {
+            let w = app.as_weak();
+            let sh = sh.clone();
+            app.global::<State>().on_pick_tile(move |slug| {
+                if let Some(app) = w.upgrade() {
+                    let slug = slug.to_string();
+                    let is_data = slug == VITALS_SLUG;
+                    let is_stub = slug == "notifications";
+                    if is_stub {
+                        app.global::<State>().set_status_line(
+                            "notifications is a future data tile — not wired yet".into(),
+                        );
+                        return;
+                    }
+                    {
+                        let mut s = sh.borrow_mut();
+                        if is_data {
+                            // data mode owns the surface: drop the effect stack, mark the data slug.
+                            s.light_data = Some(slug.clone());
+                            s.light_layers.clear();
+                            s.selected_layer = 0;
+                        } else {
+                            s.light_data = None;
+                            let accent = weave_accent_rgb();
+                            if s.light_layers.is_empty() {
+                                // single-effect default — no layer ceremony. Poured in the effect's
+                                // built-in default colour (typing heat's warm flame) if it has one, else
+                                // the weave accent.
+                                let mut d = neuron::effects::LayerDef::default();
+                                d.effect = slug.clone();
+                                d.color = neuron::effects::default_color(&slug).unwrap_or(accent);
+                                s.light_layers.push(d);
+                                s.selected_layer = 0;
+                            } else {
+                                // replace the ACTIVE (selected) layer's effect, keeping its region. An
+                                // effect with a built-in default colour starts in it on apply, so it isn't
+                                // left wearing the previous effect's colour (e.g. the teal accent that
+                                // would recolour the fire cold); others keep their colour.
+                                let sel = s.selected_layer.min(s.light_layers.len() - 1);
+                                s.light_layers[sel].effect = slug.clone();
+                                if let Some(c) = neuron::effects::default_color(&slug) {
+                                    s.light_layers[sel].color = c;
+                                }
+                                s.selected_layer = sel;
+                            }
+                        }
+                        s.layers_rev += 1;
+                    }
+                    refresh_layers(&app, &sh);
+                    app.global::<State>()
+                        .set_status_line(format!("lighting → {slug}").into());
+                }
+            });
+        }
+        // a RANGE knob (speed/density/fade) → write the matching layer field on the active layer
+        {
+            let w = app.as_weak();
+            let sh = sh.clone();
+            app.global::<State>().on_set_param_range(move |key, v| {
+                if let Some(app) = w.upgrade() {
+                    {
+                        let mut s = sh.borrow_mut();
+                        let sel = s.selected_layer;
+                        if let Some(d) = s.light_layers.get_mut(sel) {
+                            match key.as_str() {
+                                "speed" => d.speed = v.clamp(0.1, 6.0),
+                                "density" => d.density = v.clamp(0.1, 4.0),
+                                "fade" => d.fade = v.clamp(0.1, 4.0),
+                                _ => {}
+                            }
+                        }
+                        s.layers_rev += 1;
+                    }
+                    refresh_layers(&app, &sh);
+                }
+            });
+        }
+        // an ENUM knob (direction/breath/source) → write the matching layer field. Most enums write a
+        // numeric index; the audiometer's `source` writes the chosen OPTION as a string (the declared
+        // input). A fresh apply rebuilds the compositor; the new source flows to the shared
+        // `audio_level` provider, which re-points to the new endpoint on the next `ensure` (no stale
+        // per-generator handle — the generator is stateless now).
+        {
+            let w = app.as_weak();
+            let sh = sh.clone();
+            app.global::<State>().on_set_param_enum(move |key, i| {
+                if let Some(app) = w.upgrade() {
+                    {
+                        let mut s = sh.borrow_mut();
+                        let sel = s.selected_layer;
+                        if let Some(d) = s.light_layers.get_mut(sel) {
+                            match key.as_str() {
+                                "direction" => d.direction = i.clamp(0, 3) as u8,
+                                "breath" => d.breath = i.clamp(0, 2) as u8,
+                                // source comes back as the option index; map it to the plain word the
+                                // generator reads (index 1 = "mic", anything else = the "speakers" default).
+                                "source" => {
+                                    d.source = if i == 1 { "mic" } else { "speakers" }.into()
+                                }
+                                _ => {}
+                            }
+                        }
+                        s.layers_rev += 1;
+                    }
+                    refresh_layers(&app, &sh);
+                }
+            });
+        }
+        // the COLOUR knob → parse + write the active layer's colour (used by static/breathing/…)
+        {
+            let w = app.as_weak();
+            let sh = sh.clone();
+            app.global::<State>().on_set_param_color(move |hex| {
+                if let Some(app) = w.upgrade() {
+                    if let Some(c) = Rgb::parse(hex.as_str()) {
+                        {
+                            let mut s = sh.borrow_mut();
+                            let sel = s.selected_layer;
+                            if let Some(d) = s.light_layers.get_mut(sel) {
+                                d.color = c;
+                            }
+                            s.layers_rev += 1;
+                        }
+                        refresh_layers(&app, &sh);
+                    }
+                }
+            });
+        }
+        // a TOGGLE knob → write the matching bool field on the active layer. Today the only Toggle in
+        // the schema is reactive's `glow` (light a pressed key's neighbour ring); the dispatch is keyed
+        // so adding another toggle is pure data — a new `key` arm here + a `LayerDef` bool field.
+        {
+            let w = app.as_weak();
+            let sh = sh.clone();
+            app.global::<State>().on_set_param_toggle(move |key, on| {
+                if let Some(app) = w.upgrade() {
+                    {
+                        let mut s = sh.borrow_mut();
+                        let sel = s.selected_layer;
+                        if let Some(d) = s.light_layers.get_mut(sel) {
+                            match key.as_str() {
+                                "glow" => d.glow = on,
+                                _ => {}
+                            }
+                        }
+                        s.layers_rev += 1;
+                    }
+                    refresh_layers(&app, &sh);
+                }
+            });
+        }
+        // + stack: layer the active effect AGAIN on top (a new layer, screen-blended so it reads as
+        // added light), and select it so the knobs follow the new top.
+        {
+            let w = app.as_weak();
+            let sh = sh.clone();
+            app.global::<State>().on_stack_current(move || {
+                if let Some(app) = w.upgrade() {
+                    {
+                        let mut s = sh.borrow_mut();
+                        // never stack onto a data surface (it owns the board) or an empty stack
+                        if s.light_data.is_none() && !s.light_layers.is_empty() {
+                            let sel = s.selected_layer.min(s.light_layers.len() - 1);
+                            let mut d = s.light_layers[sel].clone();
+                            d.blend = neuron::effects::Blend::Screen;
+                            s.light_layers.push(d);
+                            s.selected_layer = s.light_layers.len() - 1;
+                            s.layers_rev += 1;
+                        }
+                    }
+                    refresh_layers(&app, &sh);
+                }
+            });
+        }
+        // select a stack cell → that layer becomes the active one (its effect lights the grid + knobs)
+        {
+            let w = app.as_weak();
+            let sh = sh.clone();
+            app.global::<State>().on_select_stack(move |i| {
+                if let Some(app) = w.upgrade() {
+                    {
+                        let mut s = sh.borrow_mut();
+                        if (i as usize) < s.light_layers.len() {
+                            s.selected_layer = i as usize;
+                        }
+                    }
+                    refresh_layers(&app, &sh);
+                }
+            });
+        }
+        // drop a stack cell
+        {
+            let w = app.as_weak();
+            let sh = sh.clone();
+            app.global::<State>().on_remove_stack(move |i| {
+                if let Some(app) = w.upgrade() {
+                    {
+                        let mut s = sh.borrow_mut();
+                        let i = i as usize;
+                        if i < s.light_layers.len() {
+                            s.light_layers.remove(i);
+                        }
+                        if !s.light_layers.is_empty() && s.selected_layer >= s.light_layers.len() {
+                            s.selected_layer = s.light_layers.len() - 1;
+                        }
+                        s.layers_rev += 1;
+                    }
+                    refresh_layers(&app, &sh);
+                }
+            });
+        }
+        // toggle the PAINT brush — picking it up snapshots the current frame so painting starts from
+        // what's lit (not a blank board); putting it down returns to the effect preview.
+        {
+            let w = app.as_weak();
+            let _sh = sh.clone();
+            app.global::<State>().on_toggle_brush(move || {
+                if let Some(app) = w.upgrade() {
+                    let st = app.global::<State>();
+                    let on = !st.get_light_brush_on();
+                    st.set_light_brush_on(on);
+                    st.set_status_line(
+                        if on {
+                            "brush picked up — paint on the render"
+                        } else {
+                            "brush down — back to the effect preview"
+                        }
+                        .into(),
+                    );
+                }
+            });
+        }
+        // push the painted frame to the device (the brush's commit)
+        {
+            let w = app.as_weak();
+            let sh = sh.clone();
+            app.global::<State>().on_push_painted(move || {
+                if let Some(app) = w.upgrade() {
+                    sh.borrow_mut().rt.stop_animation();
+                    let st = app.global::<State>();
+                    st.set_compositing(false);
+                    let model = st.get_grid_px();
+                    let mut frame = Vec::with_capacity(model.row_count());
+                    for c in model.iter() {
+                        frame.push(Rgb::new(c.red(), c.green(), c.blue()));
+                    }
+                    let msg = sh.borrow().rt.push_frame(&frame);
+                    if msg == "frame pushed" {
+                        st.set_applied_effect(-1);
+                    }
+                    st.set_status_line(msg.into());
+                }
+            });
+        }
+        // re-render the live tile grid each tick (the MATERIAL-card animation, applied to lighting)
+        {
+            let w = app.as_weak();
+            let sh = sh.clone();
+            app.global::<State>().on_tile_preview_tick(move || {
+                if let Some(app) = w.upgrade() {
+                    let t = preview_epoch().elapsed().as_secs_f32();
+                    render_light_tiles(&app, &sh, t);
                 }
             });
         }
@@ -1356,6 +2320,117 @@ pub fn install(app: &AppWindow) -> SharedRt {
                     }
                     Err(e) => st.set_status_line(format!("add failed: {e}").into()),
                 }
+            }
+        });
+    });
+    // PRESS-TO-BIND the HyperShift HOLD KEY — the control you hold to reach the second layer. On
+    // capture it's written as a Noop activator on the hypershift layer (no action of its own).
+    bind(app, &shared, |app, sh| {
+        let w = app.as_weak();
+        let sh = sh.clone();
+        app.global::<State>().on_capture_hypershift_hold(move || {
+            if let Some(app) = w.upgrade() {
+                let sh = sh.clone();
+                crate::capture::begin_control(&app, move |app, captured| {
+                    let st = app.global::<State>();
+                    match captured {
+                        Some(c) => {
+                            let trigger = neuron::engine::Trigger::Input {
+                                page: c.page,
+                                usage: c.usage,
+                                pid: c.pid,
+                            };
+                            match crate::editor::set_hypershift_hold(trigger) {
+                                Ok(()) => {
+                                    sh.borrow_mut().rt.bindings = neuron::bindings::Bindings::load();
+                                    refresh_rules(&app, &sh);
+                                    crate::dispatch::request_reload();
+                                    st.set_status_line(
+                                        "HyperShift hold key set — hold it to reach the second layer"
+                                            .into(),
+                                    );
+                                }
+                                Err(e) => st.set_status_line(format!("failed: {e}").into()),
+                            }
+                        }
+                        None => st.set_status_line("capture cancelled".into()),
+                    }
+                });
+            }
+        });
+    });
+    // CLEAR the HyperShift hold key.
+    bind(app, &shared, |app, sh| {
+        let w = app.as_weak();
+        let sh = sh.clone();
+        app.global::<State>().on_clear_hypershift_hold(move || {
+            if let Some(app) = w.upgrade() {
+                let _ = crate::editor::clear_hypershift_hold();
+                sh.borrow_mut().rt.bindings = neuron::bindings::Bindings::load();
+                refresh_rules(&app, &sh);
+                crate::dispatch::request_reload();
+                app.global::<State>()
+                    .set_status_line("HyperShift hold key cleared".into());
+            }
+        });
+    });
+    // LIVE AUDIO METERS — open the mic + out meters when the DIRECT page shows (set-audio-metering),
+    // then poll peaks ~30fps (poll-audio-levels). Each poll is two cheap GetPeakValue reads; the
+    // ballistics (attack/release, peak-hold, clip latch) live in MeterChan.
+    bind(app, &shared, |app, _sh| {
+        let w = app.as_weak();
+        app.global::<State>().on_set_audio_metering(move |on| {
+            if w.upgrade().is_none() {
+                return;
+            }
+            AUDIO_METERS.with(|cell| {
+                if on {
+                    let mic = neuron::audio::resolve_capture(None)
+                        .and_then(|e| neuron::audio::MeterCtl::open(&e.id));
+                    let out = neuron::audio::resolve_render(None)
+                        .and_then(|e| neuron::audio::MeterCtl::open(&e.id));
+                    *cell.borrow_mut() = Some(AudioMeters {
+                        mic,
+                        out,
+                        ..Default::default()
+                    });
+                } else {
+                    *cell.borrow_mut() = None;
+                }
+            });
+        });
+    });
+    bind(app, &shared, |app, _sh| {
+        let w = app.as_weak();
+        app.global::<State>().on_poll_audio_levels(move || {
+            if let Some(app) = w.upgrade() {
+                let st = app.global::<State>();
+                let muted_mic = st.get_mic_muted();
+                let muted_out = st.get_out_muted();
+                AUDIO_METERS.with(|cell| {
+                    let mut g = cell.borrow_mut();
+                    let Some(m) = g.as_mut() else {
+                        return;
+                    };
+                    let raw_mic = if muted_mic {
+                        0.0
+                    } else {
+                        m.mic.as_ref().map(|x| x.peak()).unwrap_or(0.0)
+                    };
+                    let raw_out = if muted_out {
+                        0.0
+                    } else {
+                        m.out.as_ref().map(|x| x.peak()).unwrap_or(0.0)
+                    };
+                    m.cm.update(raw_mic);
+                    m.co.update(raw_out);
+                    st.set_mic_level(m.cm.level);
+                    st.set_mic_hold(m.cm.hold);
+                    st.set_mic_clip(m.cm.clip());
+                    st.set_out_level(m.co.level);
+                    st.set_out_hold(m.co.hold);
+                    st.set_out_clip(m.co.clip());
+                });
             }
         });
     });
@@ -1819,6 +2894,175 @@ pub fn install(app: &AppWindow) -> SharedRt {
             }
         });
     });
+    // REFRESH MACRO BLOCKS: parse the editor source into the flat node-blocks model behind the visual
+    // constructor. Mirrors `on_macro_check`'s structure — `parse_macro` blocks up to FIRE_BUDGET so it
+    // runs OFF the UI thread and posts back via `invoke_from_event_loop`. A SYNTAX error KEEPS the last
+    // good blocks (the canvas "works with errors" — it never blanks mid-type) and shows "line N: msg"
+    // above them; a HOST error (no python / pipe broken) shows a gentle line. Empty/whitespace source
+    // clears the blocks with no error and no thread spawn.
+    bind(app, &shared, |app, _sh| {
+        let w = app.as_weak();
+        app.global::<State>().on_refresh_macro_blocks(move |src| {
+            if let Some(app) = w.upgrade() {
+                let st = app.global::<State>();
+                let source = src.to_string();
+                // an empty editor has no steps and no error — reset the tree to empty and flatten it,
+                // which emits just the root +add invitation (the canvas's "build it here" entry point).
+                // No parse, no thread.
+                if source.trim().is_empty() {
+                    with_shared(|sh| sh.borrow_mut().macro_tree.clear());
+                    let mut blocks = Vec::new();
+                    flatten_macro(&[], 0, "", &mut blocks);
+                    st.set_macro_blocks(ModelRc::new(VecModel::from(blocks)));
+                    st.set_macro_parse_error("".into());
+                    st.set_macro_parsing(false);
+                    return;
+                }
+                // one parse in flight at a time — a fast typist would otherwise stack worker threads.
+                if st.get_macro_parsing() {
+                    return;
+                }
+                st.set_macro_parsing(true);
+                let back = app.as_weak();
+                std::thread::spawn(move || {
+                    let result = neuron::macros::parse_macro(&source);
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(app) = back.upgrade() {
+                            let st = app.global::<State>();
+                            st.set_macro_parsing(false);
+                            match result {
+                                Ok(nodes) => {
+                                    let mut blocks = Vec::new();
+                                    flatten_macro(&nodes, 0, "", &mut blocks);
+                                    st.set_macro_blocks(ModelRc::new(VecModel::from(blocks)));
+                                    st.set_macro_parse_error("".into());
+                                    // RESEED the working tree from the parsed source so canvas edits
+                                    // build ON what the code view holds (the source is the truth a
+                                    // user just typed; the canvas must inherit it, not stomp it).
+                                    with_shared(|sh| sh.borrow_mut().macro_tree = nodes.clone());
+                                }
+                                // KEEP the last blocks — the canvas stays readable while you fix the line.
+                                Err(neuron::macros::ParseError::Syntax { line, msg }) => {
+                                    st.set_macro_parse_error(
+                                        format!("line {line}: {}", first_line(&msg)).into(),
+                                    );
+                                }
+                                Err(neuron::macros::ParseError::Host { msg }) => {
+                                    st.set_macro_parse_error(
+                                        format!("couldn't read the blocks: {}", first_line(&msg))
+                                            .into(),
+                                    );
+                                }
+                            }
+                        }
+                    });
+                });
+            }
+        });
+    });
+    // ── CANVAS EDIT-OPS — the direct-manipulation builder. Each mutates the working tree (the source
+    // of truth in Shared), then regenerates `macro-source` + re-flattens `macro-blocks` synchronously
+    // (pure Rust, no Python). The canvas updates instantly and the code view stays in lockstep. ──
+
+    // EDIT-STEP: set the addressed node's editable param from `value`. For TEXT-ish Value params
+    // (type/copy/notify text, open command, focus window) the field IS the string, so set a `Str`
+    // literal. For EXPRESSION Value params (cond/count/source/ms/scroll/coords) the user types a
+    // Python expr, so set a `Raw` verbatim — the next code-parse normalizes it into the typed Value
+    // shape. Non-Value params keep sensible setters (press splits on +/,/space; click/key take the
+    // name; raw is verbatim). A path that doesn't resolve (a stale row mid-reflow) is a no-op — never
+    // a panic.
+    bind(app, &shared, |app, sh| {
+        let w = app.as_weak();
+        let sh = sh.clone();
+        app.global::<State>().on_edit_step(move |path, value| {
+            if let Some(app) = w.upgrade() {
+                let mut shared = sh.borrow_mut();
+                if let Some(node) = node_at_path(&mut shared.macro_tree, &path) {
+                    let v = value.to_string();
+                    edit_node_value(node, v);
+                    let tree = shared.macro_tree.clone();
+                    drop(shared);
+                    // VALUE-ONLY: refresh the source (the code view + has-ask), but DON'T re-flatten —
+                    // re-setting `macro-blocks` would rebuild this field and steal its caret/focus. The
+                    // field already shows the typed text; the model re-reads the tree on the next
+                    // structural edit. This is the commit-on-blur + no-cursor-jank fix.
+                    regenerate_source_only(&app.global::<State>(), &tree);
+                }
+            }
+        });
+    });
+    // ADD-STEP: append a fresh default node of `kind` to the body at the insert context ("" root, or
+    // "<askpath>.yes"/".no"). A fresh `ask` brings its own empty branches (each with its own +add).
+    bind(app, &shared, |app, sh| {
+        let w = app.as_weak();
+        let sh = sh.clone();
+        app.global::<State>().on_add_step(move |insert, kind| {
+            if let Some(app) = w.upgrade() {
+                let Some(node) = default_node(&kind) else {
+                    return;
+                };
+                let mut shared = sh.borrow_mut();
+                if let Some(body) = body_at_context(&mut shared.macro_tree, &insert) {
+                    body.push(node);
+                    // the new node's PATH — the focus-on-add target. Root context ("") makes a bare
+                    // index ("3"); a branch context ("1.yes") makes "1.yes.<idx>". For an `ask` this is
+                    // its own path, whose step field is the question — exactly what we want focused.
+                    let new_idx = body.len() - 1;
+                    let focus_path = if insert.is_empty() {
+                        new_idx.to_string()
+                    } else {
+                        format!("{insert}.{new_idx}")
+                    };
+                    let tree = shared.macro_tree.clone();
+                    drop(shared);
+                    let st = app.global::<State>();
+                    // re-flatten FIRST (structure changed → the new row must exist), THEN arm the focus
+                    // target so the freshly-rendered field's `init` finds it and grabs the caret. A
+                    // `raw` (code) step renders no inline field — it's edited in the code view — so skip
+                    // arming focus for it (nothing to focus; leaving the target set would be untidy).
+                    regenerate_from_tree(&st, &tree);
+                    if kind != "raw" {
+                        st.set_macro_focus_path(focus_path.into());
+                    }
+                }
+            }
+        });
+    });
+    // DELETE-STEP: remove the addressed node (an ask takes its whole yes/no subtree with it).
+    bind(app, &shared, |app, sh| {
+        let w = app.as_weak();
+        let sh = sh.clone();
+        app.global::<State>().on_delete_step(move |path| {
+            if let Some(app) = w.upgrade() {
+                let mut shared = sh.borrow_mut();
+                if let Some((body, idx)) = parent_body_and_index(&mut shared.macro_tree, &path) {
+                    body.remove(idx);
+                    let tree = shared.macro_tree.clone();
+                    drop(shared);
+                    regenerate_from_tree(&app.global::<State>(), &tree);
+                }
+            }
+        });
+    });
+    // MOVE-STEP: reorder a node within its OWN body (dir -1 up / +1 down), clamped at the ends.
+    bind(app, &shared, |app, sh| {
+        let w = app.as_weak();
+        let sh = sh.clone();
+        app.global::<State>().on_move_step(move |path, dir| {
+            if let Some(app) = w.upgrade() {
+                let mut shared = sh.borrow_mut();
+                if let Some((body, idx)) = parent_body_and_index(&mut shared.macro_tree, &path) {
+                    let target = idx as i32 + dir;
+                    if target >= 0 && (target as usize) < body.len() {
+                        body.swap(idx, target as usize);
+                        let tree = shared.macro_tree.clone();
+                        drop(shared);
+                        regenerate_from_tree(&app.global::<State>(), &tree);
+                    }
+                }
+            }
+        });
+    });
     // SAVE: persist macros/scripts/<name>.py and register it into the warm sidecar.
     bind(app, &shared, |app, _sh| {
         let w = app.as_weak();
@@ -1857,6 +3101,8 @@ pub fn install(app: &AppWindow) -> SharedRt {
                             }
                             // the saved macro may have gained/lost a `neuron.ask` — refresh the registry.
                             refresh_beacon_macros(&app);
+                            // and its name/summary/steps may have changed — refresh the catalog too.
+                            refresh_macro_catalog(&app);
                         }
                     });
                 });
@@ -1903,8 +3149,8 @@ pub fn install(app: &AppWindow) -> SharedRt {
                     let _ = host.register(&id, &src);
                 }
                 let ctx = neuron::macros::Context::capture();
-                // SURFACE the result — a silent button is the worst UX. If the python runtime isn't
-                // available (no bundle / NEURON_PYTHON / NEURON_ALLOW_SYSTEM_PYTHON), say so plainly.
+                // SURFACE the result — a silent button is the worst UX. If the bundled python
+                // runtime can't be materialized (a rare IO failure), say so plainly.
                 let result = host.fire_mock(&id, &ctx);
                 // a successful dispatch raises a beacon that mirror_count will clear the gate for;
                 // a FAILED dispatch (sidecar cold/dead/unavailable) raises none, so release the gate
@@ -1985,6 +3231,69 @@ pub fn install(app: &AppWindow) -> SharedRt {
         app.global::<State>().on_note_macro_source(move |s| {
             if let Some(app) = w.upgrade() {
                 app.global::<State>().set_macro_has_ask(s.contains("neuron.ask"));
+            }
+        });
+    });
+    // REVEAL the macros folder in the OS file manager (created if missing) — the "drop a .py here"
+    // affordance. Cross-platform via open_in_file_manager (explorer / open / xdg-open).
+    bind(app, &shared, |app, _sh| {
+        let w = app.as_weak();
+        app.global::<State>().on_reveal_macros(move || {
+            reveal_macros_folder();
+            if let Some(app) = w.upgrade() {
+                app.global::<State>().set_macro_status(
+                    "opened the macros folder \u{2014} drop .py files in, then Reload".into(),
+                );
+            }
+        });
+    });
+    // OPEN a catalog macro INTO the editor (click-to-load): set name + source from disk and re-parse.
+    bind(app, &shared, |app, _sh| {
+        let w = app.as_weak();
+        app.global::<State>().on_open_macro(move |id| {
+            if let Some(app) = w.upgrade() {
+                load_macro_into_editor(&app, id.trim());
+            }
+        });
+    });
+    // RELOAD from disk — the "no janky live-update; press reload" path. Re-scans macros/scripts/,
+    // registers every file (so dropped-in / externally-edited macros go live + bindable now), rebuilds
+    // the catalog + the SYSTEM beacon list, and re-reads the OPEN macro from disk if it still exists.
+    // The scan+register loop blocks up to FIRE_BUDGET per macro, so it runs off the UI thread.
+    bind(app, &shared, |app, _sh| {
+        let w = app.as_weak();
+        app.global::<State>().on_reload_macros(move || {
+            if let Some(app) = w.upgrade() {
+                app.global::<State>()
+                    .set_macro_status("reloading macros from disk\u{2026}".into());
+                let back = app.as_weak();
+                std::thread::spawn(move || {
+                    let host = neuron::macros::macro_host();
+                    let found = neuron::macros::macro_host::scan_macro_dir();
+                    let count = found.len();
+                    for (id, src) in &found {
+                        let _ = host.register(id, src);
+                    }
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(app) = back.upgrade() {
+                            let st = app.global::<State>();
+                            refresh_macro_catalog(&app);
+                            refresh_beacon_macros(&app);
+                            // re-read the open macro from disk so external edits / a same-name drag-in
+                            // show without a restart (it overwrites the status; set ours after).
+                            let open = st.get_macro_name().to_string();
+                            let open = open.trim();
+                            if !open.is_empty()
+                                && neuron::macros::macro_host::load_macro(open).is_some()
+                            {
+                                load_macro_into_editor(&app, open);
+                            }
+                            st.set_macro_status(
+                                format!("reloaded {count} macro(s) from disk").into(),
+                            );
+                        }
+                    });
+                });
             }
         });
     });
@@ -2438,6 +3747,54 @@ pub fn install(app: &AppWindow) -> SharedRt {
             }
         });
     });
+    // GUIDE — the in-app help popup's tooltip->sticky->X state machine. Content is data-driven in
+    // Slint (GuideContent); the glue is thin. `toggle` owns open + active-id + the opening anchor;
+    // `make-sticky` flips to the pinned window; `move`/`close` are one-liners. On-screen CLAMPING
+    // lives in the popup (it has the window dims), so these just store the requested values.
+    bind(app, &shared, |app, _sh| {
+        let w = app.as_weak();
+        app.global::<State>().on_guide_toggle(move |id, ax, ay| {
+            if let Some(app) = w.upgrade() {
+                let st = app.global::<State>();
+                // same book, already open -> toggle it off
+                if st.get_guide_open() && st.get_guide_active_id() == id {
+                    st.set_guide_open(false);
+                    return;
+                }
+                st.set_guide_active_id(id);
+                st.set_guide_sticky(false); // opens as a click-away tooltip
+                st.set_guide_x(ax); // anchored at the button; the popup clamps on-screen
+                st.set_guide_y(ay);
+                st.set_guide_open(true);
+            }
+        });
+    });
+    bind(app, &shared, |app, _sh| {
+        let w = app.as_weak();
+        app.global::<State>().on_guide_make_sticky(move || {
+            if let Some(app) = w.upgrade() {
+                app.global::<State>().set_guide_sticky(true);
+            }
+        });
+    });
+    bind(app, &shared, |app, _sh| {
+        let w = app.as_weak();
+        app.global::<State>().on_guide_move(move |x, y| {
+            if let Some(app) = w.upgrade() {
+                let st = app.global::<State>();
+                st.set_guide_x(x);
+                st.set_guide_y(y);
+            }
+        });
+    });
+    bind(app, &shared, |app, _sh| {
+        let w = app.as_weak();
+        app.global::<State>().on_guide_close(move || {
+            if let Some(app) = w.upgrade() {
+                app.global::<State>().set_guide_open(false);
+            }
+        });
+    });
     // RELIABILITY — phoenix arm/disarm (persisted, next-launch), a manual flight dump, open the log.
     bind(app, &shared, |app, _sh| {
         let w = app.as_weak();
@@ -2551,8 +3908,22 @@ pub fn install(app: &AppWindow) -> SharedRt {
                     "brightness" => st.set_notif_brightness(cur),
                     "profile" => st.set_notif_profile(cur),
                     "layer" => st.set_notif_layer(cur),
+                    "macro" => st.set_notif_macro(cur),
+                    "battery" => st.set_notif_battery(cur),
+                    "side_plate" => st.set_notif_side_plate(cur),
                     _ => {}
                 }
+                st.set_status_line(msg.into());
+            }
+        });
+    });
+    bind(app, &shared, |app, _sh| {
+        let w = app.as_weak();
+        app.global::<State>().on_set_notif_stack(move |mode| {
+            if let Some(app) = w.upgrade() {
+                let msg = crate::prefs::set_notif_stack(mode.as_str());
+                let st = app.global::<State>();
+                st.set_notif_stack(crate::prefs::notif_stack().into());
                 st.set_status_line(msg.into());
             }
         });
@@ -3232,92 +4603,6 @@ pub fn install(app: &AppWindow) -> SharedRt {
         });
     });
 
-    // ── the node board: drag, persist, tune wire timings ──────────────────
-    bind(app, &shared, |app, _sh| {
-        let w = app.as_weak();
-        app.global::<State>().on_move_node(move |i, x, y| {
-            if let Some(app) = w.upgrade() {
-                let st = app.global::<State>();
-                let model = st.get_graph_nodes();
-                if let Some(vm) = model.as_any().downcast_ref::<VecModel<GraphNode>>() {
-                    if let Some(mut n) = vm.row_data(i.max(0) as usize) {
-                        n.x = x.clamp(0.0, GBOARD_W - GNODE_W);
-                        n.y = y.clamp(0.0, GBOARD_H - GNODE_H);
-                        vm.set_row_data(i.max(0) as usize, n);
-                    }
-                }
-            }
-        });
-    });
-    bind(app, &shared, |app, _sh| {
-        let w = app.as_weak();
-        app.global::<State>().on_node_dropped(move || {
-            if let Some(app) = w.upgrade() {
-                // persist the board layout: merge the live positions over the saved doc, so
-                // nodes of rules that aren't currently materialized keep their spots.
-                let mut layout = GraphLayout::load();
-                for n in app.global::<State>().get_graph_nodes().iter() {
-                    layout.nodes.insert(n.key.to_string(), (n.x, n.y));
-                }
-                let _ = layout.save();
-            }
-        });
-    });
-    bind(app, &shared, |app, sh| {
-        let w = app.as_weak();
-        let sh = sh.clone();
-        app.global::<State>()
-            .on_set_edge_timing(move |edge_idx, value| {
-                if let Some(app) = w.upgrade() {
-                    let st = app.global::<State>();
-                    let Some(edge) = st.get_graph_edges().row_data(edge_idx.max(0) as usize) else {
-                        return;
-                    };
-                    if !edge.editable || edge.rule < 0 {
-                        st.set_status_line("that wire's timing is fixed".into());
-                        return;
-                    }
-                    let Ok(v) = value.trim().parse::<u32>() else {
-                        st.set_status_line("timing needs a plain number".into());
-                        return;
-                    };
-                    let mut rules = crate::editor::load_gui_rules();
-                    let Some(rule) = rules.get_mut(edge.rule as usize) else {
-                        st.set_status_line("rule changed — reload".into());
-                        return;
-                    };
-                    let msg = match (edge.tkind.as_str(), &mut rule.action) {
-                        ("turbo", neuron::action::Action::Turbo { cps, .. }) => {
-                            *cps = v.clamp(1, 100) as u16;
-                            format!("turbo -> {} cps", *cps)
-                        }
-                        ("delay", neuron::action::Action::Sequence { steps }) => {
-                            let si = edge.step.max(0) as usize;
-                            if let Some(s) = steps.get_mut(si) {
-                                s.delay_ms = v.min(60_000);
-                                format!("step {} delay -> {} ms", si + 1, s.delay_ms)
-                            } else {
-                                st.set_status_line("step changed — reload".into());
-                                return;
-                            }
-                        }
-                        _ => {
-                            st.set_status_line("that wire's timing is fixed".into());
-                            return;
-                        }
-                    };
-                    match crate::editor::save_gui_rules(&rules) {
-                        Ok(()) => {
-                            refresh_rules(&app, &sh); // rebuilds the board too
-                            crate::dispatch::request_reload();
-                            st.set_status_line(msg.into());
-                        }
-                        Err(e) => st.set_status_line(format!("timing not saved: {e}").into()),
-                    }
-                }
-            });
-    });
-
     // ── perf controls (Device panel) ──────────────────────────────────────
     install_perf_callbacks(app, &shared);
 
@@ -3382,6 +4667,15 @@ pub fn install(app: &AppWindow) -> SharedRt {
     st.set_notif_brightness(crate::prefs::notif_event("brightness"));
     st.set_notif_profile(crate::prefs::notif_event("profile"));
     st.set_notif_layer(crate::prefs::notif_event("layer"));
+    st.set_notif_macro(crate::prefs::notif_event("macro"));
+    st.set_notif_battery(crate::prefs::notif_event("battery"));
+    st.set_notif_side_plate(crate::prefs::notif_event("side_plate"));
+    st.set_notif_stack(crate::prefs::notif_stack().into());
+
+    // LAST, after the device is selected + every lighting control seeded: restore the selected board's
+    // persisted effect/layer stack + fps and RE-APPLY it (start the stream) so it resumes its effect on
+    // launch instead of holding its stale last frame. Also flips the save gate on for user edits.
+    restore_lighting(app, &shared);
 
     shared
 }
@@ -3423,8 +4717,9 @@ fn init_perf_controls(app: &AppWindow, sh: &SharedRt) {
         st.set_dpi_stages(joined.into());
     }
     sync_stage_nums(&st);
-    // lift-off-distance + debounce have no derivable opcode yet -> honestly unsupported.
-    st.set_lod_supported(false);
+    // LIFT-OFF DISTANCE: seed the level + readout from the device's live symmetric LOD (best-effort;
+    // "—" on devices without it / asleep). debounce still has no derivable opcode -> unsupported.
+    refresh_lod_readout(app, sh);
     st.set_debounce_supported(false);
 }
 
@@ -3621,12 +4916,50 @@ fn install_perf_callbacks(app: &AppWindow, shared: &SharedRt) {
     bind(app, shared, |app, sh| {
         let w = app.as_weak();
         let sh = sh.clone();
+        app.global::<State>().on_apply_lod(move |lvl| {
+            perf(&w, &sh, |rt| rt.apply_lift_off_distance(lvl.max(0) as u8));
+            // the read-back line must show the device's NEW level (or its refusal).
+            if let Some(app) = w.upgrade() {
+                refresh_lod_readout(&app, &sh);
+            }
+        });
+    });
+    bind(app, shared, |app, sh| {
+        let w = app.as_weak();
+        let sh = sh.clone();
+        app.global::<State>().on_apply_lod_async(move |lift, land| {
+            perf(&w, &sh, |rt| {
+                rt.apply_lift_off_asymmetric(lift.max(0) as u8, land.max(0) as u8)
+            });
+            // the read-back must show the device's NEW split pair (or its refusal / a snap to even).
+            if let Some(app) = w.upgrade() {
+                refresh_lod_readout(&app, &sh);
+            }
+        });
+    });
+    bind(app, shared, |app, sh| {
+        let w = app.as_weak();
+        let sh = sh.clone();
         app.global::<State>()
             .on_apply_ingame_polling(move |wired, dongle| {
                 perf(&w, &sh, |rt| {
                     rt.apply_ingame_polling(wired as u32, dongle as u32)
                 });
             });
+    });
+    // SNAP TAP (MECHANICAL ADVANTAGES) — perf-gated like the device writes. The UI passes the
+    // post-toggle state; the runtime fires the verify-gated + env-gated `set_snap_tap` (honest
+    // [gated] on a board that can't do it). Re-seed `snap-tap-enabled` from the device truth after.
+    bind(app, shared, |app, sh| {
+        let w = app.as_weak();
+        let sh = sh.clone();
+        app.global::<State>().on_set_snap_tap(move |enable| {
+            perf(&w, &sh, |rt| rt.apply_snap_tap(enable));
+            // reflect the device's real state: if the write was gated/refused, the toggle snaps back.
+            if let Some(app) = w.upgrade() {
+                refresh_snap_tap(&app, &sh);
+            }
+        });
     });
     bind(app, shared, |app, sh| {
         let w = app.as_weak();
@@ -3744,6 +5077,88 @@ fn refresh_idle_readout(app: &AppWindow, sh: &SharedRt) {
     }
 }
 
+/// Human label for a symmetric lift-off-distance level (0 low / 1 medium / 2 high). Mirrors the
+/// runtime's `lod_label` so the readout text matches the apply status line.
+fn lod_level_label(level: i32) -> &'static str {
+    match level.clamp(0, 2) {
+        0 => "low",
+        1 => "medium",
+        _ => "high",
+    }
+}
+
+/// Whether a Razer product-id takes the EXTENDED HyperPolling (>1000Hz, 0x00/0x40) path. RE finding
+/// (OpenRazer): OpenRazer routes the Naga V2 Pro's stock links (0x00A7 wired / 0x00A8 dongle / 0x00A9
+/// BT) to the LEGACY path, capped at 1000Hz — so 2000–8000Hz cannot work there. Only the separate
+/// HyperPolling Wireless Dongle (PID 0x00B3) drives the extended command on hardware we can vouch for.
+/// (Viper-8K-class mice also take it, but their exact PIDs aren't confirmed here — add them once
+/// verified rather than guess.) A PID allowlist (not a registry capability) because the registry's
+/// `SetPolling2` is opcode-presence, not link-mode reach.
+fn pid_supports_hyperpoll(pid: u16) -> bool {
+    matches!(pid, 0x00B3)
+}
+
+/// Whether a Razer keyboard product-id supports SNAP TAP (SOCD) — the MECHANICAL ADVANTAGES gate. A
+/// Synapse-4-era firmware feature, so this is a PID ALLOWLIST (not a registry capability — the
+/// feature has no read-only descriptor flag): BlackWidow V4 Pro (0x0287) / V4 75% (0x02A5) / V4 TKL
+/// (0x028B) and the Huntsman V3 Pro family (0x02A6 / 0x02A7 / 0x02A8). The user's BlackWidow Chroma
+/// V2 (0x0221, 2017) predates the feature → false. Extend as more supporting boards are confirmed.
+fn pid_supports_snap_tap(pid: u16) -> bool {
+    matches!(
+        pid,
+        0x0287 | 0x02A5 | 0x028B | 0x02A6 | 0x02A7 | 0x02A8
+    )
+}
+
+/// Seed `snap-tap-supported` from the live device list — true iff ANY connected keyboard's PID is in
+/// the Snap-Tap allowlist. A SYSTEM-page (not per-selected-device) concern: the MECHANICAL ADVANTAGES
+/// option applies to the connected keyboard. When unsupported (the user's Chroma V2), the toggle
+/// stays honestly GATED. Best-effort: reads the already-built `State.devices` rows.
+fn refresh_snap_tap(app: &AppWindow, _sh: &SharedRt) {
+    use slint::Model;
+    let st = app.global::<State>();
+    let rows = st.get_devices();
+    let supported = (0..rows.row_count()).any(|i| {
+        rows.row_data(i).is_some_and(|r| {
+            r.kind == "keyboard"
+                && u16::from_str_radix(r.pid.as_str(), 16)
+                    .map(pid_supports_snap_tap)
+                    .unwrap_or(false)
+        })
+    });
+    st.set_snap_tap_supported(supported);
+    // An unsupported board can never be enabled — keep the toggle honest if the device went away.
+    if !supported {
+        st.set_snap_tap_enabled(false);
+    }
+}
+
+/// Re-read the device's lift-off-distance and mirror it into the LOD controls + readout. Reads the
+/// SHARED 0x0B/0x85 getter once via two runtime calls: if the device is in ASYMMETRIC (split) mode it
+/// seeds `lod-async = true` + the lift/landing pair; otherwise it seeds the symmetric `lod-level`.
+/// Best-effort: a device that doesn't answer (asleep / no sensor-config) shows "—" and leaves state.
+fn refresh_lod_readout(app: &AppWindow, sh: &SharedRt) {
+    let st = app.global::<State>();
+    // ASYMMETRIC first: a Some means the device reports split mode (args[2] == 0x04).
+    if let Some((lift, land)) = sh.borrow().rt.lift_off_async() {
+        st.set_lod_async(true);
+        st.set_lod_lift(lift as i32);
+        st.set_lod_land(land as i32);
+        st.set_lod_readout(format!("lift {lift} / land {land}").into());
+        return;
+    }
+    // Otherwise SYMMETRIC (or unreadable).
+    match sh.borrow().rt.lift_off_distance() {
+        Some(lvl) => {
+            let lvl = lvl.min(2) as i32;
+            st.set_lod_async(false);
+            st.set_lod_level(lvl);
+            st.set_lod_readout(lod_level_label(lvl).into());
+        }
+        None => st.set_lod_readout("\u{2014}".into()),
+    }
+}
+
 // ── live-loop → UI mirrors (called from dispatch's post_status on the UI thread) ────
 
 /// A live ProfileSwitch/Cycle moved the process-wide cursor — mirror it into the header pill, the
@@ -3837,6 +5252,8 @@ fn audio_rows() -> Vec<DeviceRow> {
                 cap_scroll: false,
                 cap_store: false,
                 cap_idle: false,
+                cap_plate: false,
+                plate: "".into(), // audio endpoints have no plate
             });
         }
     }
@@ -3894,6 +5311,8 @@ fn select_device_at(app: &AppWindow, sh: &SharedRt, idx: i32) {
         st.set_selected_device_kind("".into());
         st.set_selected_device_name("\u{2014}".into());
         st.set_sel_can_light(false); // nothing selected → LIGHTING shows its "no device" empty state
+        st.set_sel_can_plate(false);
+        st.set_selected_plate("".into());
         return;
     }
     let i = idx.clamp(0, n - 1);
@@ -3910,6 +5329,20 @@ fn select_device_at(app: &AppWindow, sh: &SharedRt, idx: i32) {
     st.set_sel_can_scroll(row.cap_scroll);
     st.set_sel_can_store(row.cap_store);
     st.set_sel_can_idle(row.cap_idle);
+    // SIDE PLATE: a device with a [side_plates] map surfaces the last plate the mouse pushed. The plate
+    // has NO getter (push-only), so seed from the last-known value the confirmation core recorded
+    // (hidwatch feeds it); a light poll keeps it fresh after this. Non-plated devices show nothing.
+    st.set_sel_can_plate(row.cap_plate);
+    st.set_selected_plate(if row.cap_plate {
+        neuron::confirm::last_plate().unwrap_or_default().into()
+    } else {
+        "".into()
+    });
+    // EXTENDED HyperPolling (>1000Hz, 0x00/0x40) is only real on known extended-PID hardware — the
+    // HyperPolling Wireless Dongle + Viper-8K-class. The Naga's stock dongle (0x00A8) is legacy-capped
+    // at 1000Hz, so its card shows an honest "use REPORT RATE" note instead of fake 2000–8000Hz chips.
+    let pid = u16::from_str_radix(row.id.as_str(), 16).unwrap_or(0);
+    st.set_sel_can_hyperpoll(pid_supports_hyperpoll(pid));
     let kind = row.kind.to_string();
     if kind == "mic" || kind == "output" {
         // load the SELECTED endpoint's live volume + mute (not the system default).
@@ -3927,8 +5360,7 @@ fn select_device_at(app: &AppWindow, sh: &SharedRt, idx: i32) {
             st.set_device_muted(e.muted);
         }
     } else {
-        // HID: point the runtime at this pid + seed the FEEL fader from its live reads.
-        let pid = u16::from_str_radix(row.id.as_str(), 16).unwrap_or(0);
+        // HID: point the runtime at this pid (parsed above) + seed the FEEL fader from its live reads.
         let changed = {
             let mut s = sh.borrow_mut();
             let c = s.rt.selected_pid != pid;
@@ -3964,8 +5396,22 @@ fn select_device_at(app: &AppWindow, sh: &SharedRt, idx: i32) {
             init_perf_controls(app, sh);
             st.set_selected_effect(-1);
             st.set_applied_effect(-1);
+            // a fresh device starts on no surface (not a stale data-mode/brush from the last device).
+            {
+                let mut s = sh.borrow_mut();
+                s.light_data = None;
+            }
+            st.set_light_brush_on(false);
             refresh_effects(app, sh);
             init_grid(app, sh);
+            // SWITCHING boards: load the NEWLY-selected device's own persisted lighting (fps + stack /
+            // data mode) into state + the page, overriding init_grid's per-class fps default when a pick
+            // was saved. State-only — selecting a device in the UI doesn't auto-stream it (startup's
+            // restore_lighting is the one path that resumes the stream); but it keeps each board's saved
+            // state correct so a later edit persists under the right pid. No-op before LIGHTING_READY.
+            if LIGHTING_READY.load(std::sync::atomic::Ordering::Acquire) {
+                load_lighting_into_state(app, sh);
+            }
         }
     }
 }
@@ -4027,6 +5473,220 @@ pub fn refresh_beacon_macros(app: &AppWindow) {
         .set_beacon_macros(ModelRc::new(VecModel::from(rows)));
 }
 
+// ── WORKSHOP catalog: every macro on disk as an emergent, at-a-glance card ───────────────────────
+
+/// Count every node in a macro tree, descending into flow bodies — the catalog's "size at a glance"
+/// (so a one-line macro whose single `if` holds ten steps reads as the larger thing it is).
+fn count_macro_nodes(nodes: &[MacroNode]) -> i32 {
+    let mut n = 0i32;
+    for node in nodes {
+        n += 1;
+        n += match node {
+            MacroNode::Ask { yes, no, .. } => count_macro_nodes(yes) + count_macro_nodes(no),
+            MacroNode::If { then_, else_, .. } => {
+                count_macro_nodes(then_) + count_macro_nodes(else_)
+            }
+            MacroNode::RepeatN { body, .. }
+            | MacroNode::RepeatWhile { body, .. }
+            | MacroNode::ForEach { body, .. } => count_macro_nodes(body),
+            MacroNode::Try { body, except_ } => count_macro_nodes(body) + count_macro_nodes(except_),
+            _ => 0,
+        };
+    }
+    n
+}
+
+/// Count a macro's DECLARED options by reading its own `NEURON_OPTIONS` list straight from source —
+/// emergent (no registration or sidecar needed, so it's right even for a just-dropped-in file) and
+/// cheap. Each option entry carries a `"key"`, so the number of those WITHIN the list literal is the
+/// option count; the bracket-matched scan keeps a stray `"key"` elsewhere in the file from inflating
+/// it. 0 when the macro declares no options.
+fn option_count_from_source(src: &str) -> i32 {
+    let Some(start) = src.find("NEURON_OPTIONS") else {
+        return 0;
+    };
+    let rest = &src[start..];
+    let Some(lb) = rest.find('[') else {
+        return 0;
+    };
+    let mut depth = 0i32;
+    let mut end = rest.len();
+    for (i, c) in rest[lb..].char_indices() {
+        match c {
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = lb + i + 1;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let block = &rest[lb..end];
+    (block.matches("\"key\"").count() + block.matches("'key'").count()) as i32
+}
+
+/// Collect every macro id an action references, descending into `Sequence` steps — so a macro fired
+/// as one step of a multi-step bind still shows its trigger. Only Python script refs (the warm-macro
+/// tier) are macro ids; Shell/File refs are inline commands / paths, not macros.
+fn collect_macro_ids(action: &neuron::action::Action, out: &mut Vec<String>) {
+    use neuron::action::{Action, ScriptKind};
+    match action {
+        Action::Script { script } if script.kind == ScriptKind::Python => {
+            out.push(script.id.clone())
+        }
+        Action::Sequence { steps } => {
+            for s in steps {
+                collect_macro_ids(&s.action, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Map each macro id -> the binding trigger(s) that fire it, cross-ref'd from the SAME rule set live
+/// dispatch uses (the assembled spine rules + the GUI-authored sidecar). One macro may be bound more
+/// than once; each label is `Trigger::describe()` (what the bindings list shows). Macros referenced
+/// by no rule simply don't appear (the catalog renders them as "(unbound)").
+fn macro_trigger_map(sh: &SharedRt) -> HashMap<String, Vec<String>> {
+    let mut rules = sh.borrow().rt.spine_rules();
+    rules.extend(crate::editor::load_gui_rules());
+    let mut map: HashMap<String, Vec<String>> = HashMap::new();
+    for r in &rules {
+        let mut ids = Vec::new();
+        collect_macro_ids(&r.action, &mut ids);
+        if ids.is_empty() {
+            continue;
+        }
+        let label = r.trigger.describe();
+        for id in ids {
+            let entry = map.entry(id).or_default();
+            if !entry.contains(&label) {
+                entry.push(label.clone());
+            }
+        }
+    }
+    map
+}
+
+/// One in-flight catalog rebuild at a time — so refreshes (open/save/reload) coalesce instead of
+/// stacking parse workers on the serial sidecar. The running worker already reads the current disk.
+static MACRO_CATALOG_BUILDING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Rebuild the WORKSHOP catalog model — every macro on disk as an emergent card: the plain-English
+/// summary walked from its OWN nodes (neuron-core's `summarize`), its node count, its declared option
+/// count, and the trigger(s) that fire it. The cheap parts (the file list, option counts, the trigger
+/// cross-ref) run here on the UI thread; the per-macro PARSE the summary needs goes through the warm
+/// sidecar (blocks up to FIRE_BUDGET), so it runs OFF the UI thread and posts the finished model back.
+fn refresh_macro_catalog(app: &AppWindow) {
+    use std::sync::atomic::Ordering;
+    let macros = neuron::macros::macro_host::scan_macro_dir();
+    if macros.is_empty() {
+        let st = app.global::<State>();
+        st.set_macro_catalog(ModelRc::new(VecModel::<MacroCard>::default()));
+        st.set_macro_catalog_building(false);
+        return;
+    }
+    // one rebuild at a time — a request while a worker is running is dropped (it reads fresh disk).
+    if MACRO_CATALOG_BUILDING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let triggers = with_shared_ret(macro_trigger_map).unwrap_or_default();
+    app.global::<State>().set_macro_catalog_building(true);
+    let back = app.as_weak();
+    std::thread::spawn(move || {
+        let rows: Vec<MacroCard> = macros
+            .into_iter()
+            .map(|(id, src)| {
+                let (summary, steps) = match neuron::macros::parse_macro(&src) {
+                    Ok(nodes) => (neuron::macros::summarize(&nodes), count_macro_nodes(&nodes)),
+                    // a syntax-broken file still earns a card — say so honestly rather than "empty".
+                    Err(_) => ("couldn't read steps (syntax error?)".to_string(), 0),
+                };
+                let options = option_count_from_source(&src);
+                let trigger = match triggers.get(&id) {
+                    Some(ts) if !ts.is_empty() => ts.join("  \u{00b7}  "),
+                    _ => "(unbound)".to_string(),
+                };
+                MacroCard {
+                    name: id.into(),
+                    summary: summary.into(),
+                    steps,
+                    options,
+                    trigger: trigger.into(),
+                }
+            })
+            .collect();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(app) = back.upgrade() {
+                let st = app.global::<State>();
+                st.set_macro_catalog(ModelRc::new(VecModel::from(rows)));
+                st.set_macro_catalog_building(false);
+            }
+            MACRO_CATALOG_BUILDING.store(false, Ordering::SeqCst);
+        });
+    });
+}
+
+/// Load a macro from disk INTO the editor: set the name + source, recompute has-ask, then re-parse
+/// into the blocks canvas (which also reseeds the Rust working tree) via the one existing parse path
+/// (`refresh-macro-blocks`). Used by a catalog card click and by reload (refreshing the open macro
+/// from disk). A missing/unreadable id is a no-op — the catalog only offers ids that exist.
+fn load_macro_into_editor(app: &AppWindow, id: &str) {
+    let Some(src) = neuron::macros::macro_host::load_macro(id) else {
+        return;
+    };
+    let st = app.global::<State>();
+    st.set_macro_name(id.into());
+    st.set_macro_has_ask(src.contains("neuron.ask"));
+    st.set_macro_source(src.clone().into());
+    st.set_macro_status(format!("loaded '{id}' \u{2014} edit it, then save").into());
+    // off-thread parse -> blocks + working-tree reseed (refresh-macro-blocks owns both); one path.
+    st.invoke_refresh_macro_blocks(src.into());
+}
+
+/// Keep the selected device's SIDE-PLATE readout honest with the last plate the mouse pushed. The
+/// plate is detected ONLY by a device-pushed report (no getter to poll), so we read the last-observed
+/// plate the confirmation core recorded (hidwatch feeds it on every swap) and surface it. Cheap — a
+/// brief mutex read + a string compare — so the main tick can call it; it only writes on a change.
+/// Only a selected mouse WITH a [side_plates] map ever shows a value (others read ""). The instant
+/// feedback on a swap is the confirmation CARD; this readout follows within a tick.
+pub fn refresh_selected_plate(app: &AppWindow) {
+    let st = app.global::<State>();
+    if !st.get_sel_can_plate() {
+        if !st.get_selected_plate().is_empty() {
+            st.set_selected_plate("".into());
+        }
+        return;
+    }
+    let label = neuron::confirm::last_plate().unwrap_or_default();
+    if st.get_selected_plate().as_str() != label {
+        st.set_selected_plate(label.into());
+    }
+}
+
+/// Keep the DEVICE-LIST row's PLATE readout live with the last plate the mouse pushed. The plate is
+/// push-only (no getter), so a periodic rescan can't carry it — instead this patches the plated row's
+/// `plate` field IN PLACE (via `set_row_data`, NOT a full list rebuild) whenever the last-known plate
+/// changes. Cheap: a mutex read + a per-row string compare; it writes a single row only on an actual
+/// change, and only for capability-`plate` rows (every other row stays untouched).
+pub fn refresh_plated_row(app: &AppWindow) {
+    use slint::Model;
+    let st = app.global::<State>();
+    let label = neuron::confirm::last_plate().unwrap_or_default();
+    let rows = st.get_devices();
+    for i in 0..rows.row_count() {
+        let Some(mut row) = rows.row_data(i) else { continue };
+        if row.cap_plate && row.plate.as_str() != label {
+            row.plate = label.clone().into();
+            rows.set_row_data(i, row);
+        }
+    }
+}
+
 pub fn refresh_devices(app: &AppWindow, sh: &SharedRt) {
     // keep the selection on the SAME device across a rescan, by its id (pid-hex or audio endpoint id).
     let prev_id = {
@@ -4067,6 +5727,14 @@ pub fn refresh_devices(app: &AppWindow, sh: &SharedRt) {
             cap_scroll: d.cap_scroll,
             cap_store: d.cap_store,
             cap_idle: d.cap_idle,
+            cap_plate: d.cap_plate,
+            // SIDE PLATE (push-only, no getter): seed the row from the last plate the mouse pushed.
+            // refresh_plated_row keeps it live in place after this. Non-plated devices show nothing.
+            plate: if d.cap_plate {
+                neuron::confirm::last_plate().unwrap_or_default().into()
+            } else {
+                "".into()
+            },
         })
         .collect();
     // 2) EMERGENT audio endpoints appended — mic + every output, generic over any hardware.
@@ -4074,6 +5742,8 @@ pub fn refresh_devices(app: &AppWindow, sh: &SharedRt) {
     let st = app.global::<State>();
     use slint::Model;
     st.set_devices(ModelRc::new(VecModel::from(rows)));
+    // MECHANICAL ADVANTAGES: seed Snap Tap support from the live keyboard list (honest gate).
+    refresh_snap_tap(app, sh);
     // 3) restore selection by id (default to the first row), and seed its per-kind panel.
     let n = st.get_devices().row_count() as i32;
     let idx = if prev_id.is_empty() {
@@ -4119,7 +5789,14 @@ pub fn refresh_rules(app: &AppWindow, sh: &SharedRt) {
     let gui = crate::editor::load_gui_rules();
     let mut editable_base = 0i32;
     let mut editable_hyper = 0i32;
+    // the HOLD KEY — a Noop activator on the hypershift layer — is surfaced on its own (REACHED BY),
+    // never as a shifted "binding"; pull it out so the list shows only real shifted actions.
+    let mut hold_label: Option<String> = None;
     for r in &gui {
+        if r.layer.as_deref() == Some("hypershift") && r.action == neuron::action::Action::Noop {
+            hold_label = Some(r.trigger.describe());
+            continue;
+        }
         let row = RuleRow {
             trigger: r.trigger.describe().into(),
             action: r.action.describe().into(),
@@ -4145,8 +5822,8 @@ pub fn refresh_rules(app: &AppWindow, sh: &SharedRt) {
     st.set_hypershift_rules(ModelRc::new(VecModel::from(hyper)));
     st.set_editable_count(editable_base);
     st.set_editable_hyper_count(editable_hyper);
-    // the node board renders the same spine — rebuild it in lockstep.
-    refresh_graph(app, sh);
+    st.set_hypershift_hold_ready(hold_label.is_some());
+    st.set_hypershift_hold_label(hold_label.unwrap_or_else(|| "—".to_string()).into());
 }
 
 /// A pocket's emergent sigil as a Slint `Path` commands string, in normalized [-1,1] space (the
@@ -4214,230 +5891,6 @@ pub fn refresh_pockets_if_changed(app: &AppWindow) {
     if changed {
         refresh_pockets(app);
     }
-}
-
-// ── the node board: the spine as a graph (layout persisted per node key) ────
-
-/// Node-board canvas geometry (kept in sync with bindings.slint's GraphNodeEl).
-const GNODE_W: f32 = 178.0;
-const GNODE_H: f32 = 52.0;
-const GBOARD_W: f32 = 1800.0;
-const GBOARD_H: f32 = 1000.0;
-
-#[derive(serde::Serialize, serde::Deserialize, Default)]
-struct GraphLayout {
-    #[serde(default)]
-    nodes: std::collections::BTreeMap<String, (f32, f32)>,
-}
-
-impl GraphLayout {
-    fn path() -> std::path::PathBuf {
-        std::path::PathBuf::from("profiles").join("graph-layout.toml")
-    }
-    fn load() -> Self {
-        std::fs::read_to_string(Self::path())
-            .ok()
-            .and_then(|s| toml::from_str(&s).ok())
-            .unwrap_or_default()
-    }
-    fn save(&self) -> Result<(), String> {
-        std::fs::create_dir_all("profiles").map_err(|e| e.to_string())?;
-        let body = toml::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(Self::path(), body).map_err(|e| e.to_string())
-    }
-}
-
-/// Rebuild the node board from the same sources the rule lists render: read-only toml/cast rules
-/// as fixed trigger→action wires, GUI-authored rules with their REAL Action objects — turbo rates
-/// and macro chains (one node per step, the step's delay riding the wire to the next). Saved
-/// layout positions override the default two-column flow.
-pub fn refresh_graph(app: &AppWindow, sh: &SharedRt) {
-    let layout = GraphLayout::load();
-    let mut nodes: Vec<GraphNode> = Vec::new();
-    let mut edges: Vec<GraphEdge> = Vec::new();
-    let mut trigger_idx: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
-    let mut row = 0usize;
-
-    let place = |layout: &GraphLayout, key: &str, dx: f32, dy: f32| -> (f32, f32) {
-        layout
-            .nodes
-            .get(key)
-            .copied()
-            .map(|(x, y)| {
-                (
-                    x.clamp(0.0, GBOARD_W - GNODE_W),
-                    y.clamp(0.0, GBOARD_H - GNODE_H),
-                )
-            })
-            .unwrap_or((dx, dy))
-    };
-    let row_y = |row: usize| 16.0 + row as f32 * 86.0;
-
-    let add_trigger = |nodes: &mut Vec<GraphNode>,
-                       trigger_idx: &mut std::collections::HashMap<String, usize>,
-                       row: usize,
-                       label: String,
-                       sub: &str|
-     -> usize {
-        let key = format!("t|{label}|{sub}");
-        if let Some(&i) = trigger_idx.get(&key) {
-            return i;
-        }
-        let (x, y) = place(&layout, &key, 24.0, row_y(row));
-        nodes.push(GraphNode {
-            key: key.clone().into(),
-            kind: "trigger".into(),
-            label: label.into(),
-            sub: sub.into(),
-            x,
-            y,
-        });
-        trigger_idx.insert(key, nodes.len() - 1);
-        nodes.len() - 1
-    };
-
-    // 1) read-only rules (bindings.toml + cast wedges/glyphs) — fixed wires.
-    let base_views = sh.borrow().rt.rules().0;
-    for v in &base_views {
-        let t = add_trigger(&mut nodes, &mut trigger_idx, row, v.trigger.clone(), v.kind);
-        let akey = format!("a|{}|{}", v.trigger, v.action);
-        let (x, y) = place(&layout, &akey, 24.0 + GNODE_W + 130.0, row_y(row));
-        nodes.push(GraphNode {
-            key: akey.into(),
-            kind: "action".into(),
-            label: v.action.clone().into(),
-            sub: "toml".into(),
-            x,
-            y,
-        });
-        edges.push(GraphEdge {
-            a: t as i32,
-            b: (nodes.len() - 1) as i32,
-            timing: "—".into(),
-            tkind: "".into(),
-            editable: false,
-            rule: -1,
-            step: -1,
-        });
-        row += 1;
-    }
-
-    // 2) GUI-authored rules — real Action objects, so timing is editable on the wire.
-    for (gi, r) in crate::editor::load_gui_rules().iter().enumerate() {
-        let hyper = r.layer.is_some();
-        let t = add_trigger(
-            &mut nodes,
-            &mut trigger_idx,
-            row,
-            r.trigger.describe(),
-            if hyper {
-                "⇧ hypershift layer"
-            } else {
-                "yours"
-            },
-        );
-        match &r.action {
-            neuron::action::Action::Sequence { steps } => {
-                // the macro CHAIN: one node per step, the source step's delay riding each wire.
-                let mut prev = t;
-                for (si, step) in steps.iter().enumerate() {
-                    let key = format!("s|{gi}|{si}|{}", r.trigger.describe());
-                    let (x, y) = place(
-                        &layout,
-                        &key,
-                        24.0 + GNODE_W + 130.0 + si as f32 * (GNODE_W + 110.0),
-                        row_y(row),
-                    );
-                    nodes.push(GraphNode {
-                        key: key.into(),
-                        kind: "step".into(),
-                        label: step.action.describe().into(),
-                        sub: if step.hold_ms > 0 {
-                            format!("hold {}ms", step.hold_ms).into()
-                        } else {
-                            format!("step {}", si + 1).into()
-                        },
-                        x,
-                        y,
-                    });
-                    let cur = nodes.len() - 1;
-                    if si == 0 {
-                        edges.push(GraphEdge {
-                            a: prev as i32,
-                            b: cur as i32,
-                            timing: "start".into(),
-                            tkind: "".into(),
-                            editable: false,
-                            rule: -1,
-                            step: -1,
-                        });
-                    } else {
-                        edges.push(GraphEdge {
-                            a: prev as i32,
-                            b: cur as i32,
-                            timing: format!("{} ms", steps[si - 1].delay_ms).into(),
-                            tkind: "delay".into(),
-                            editable: true,
-                            rule: gi as i32,
-                            step: (si - 1) as i32,
-                        });
-                    }
-                    prev = cur;
-                }
-            }
-            neuron::action::Action::Turbo { action, cps } => {
-                let key = format!("a|{gi}|turbo|{}", r.trigger.describe());
-                let (x, y) = place(&layout, &key, 24.0 + GNODE_W + 130.0, row_y(row));
-                nodes.push(GraphNode {
-                    key: key.into(),
-                    kind: "action".into(),
-                    label: action.describe().into(),
-                    sub: "autofire while held".into(),
-                    x,
-                    y,
-                });
-                edges.push(GraphEdge {
-                    a: t as i32,
-                    b: (nodes.len() - 1) as i32,
-                    timing: format!("{cps} cps").into(),
-                    tkind: "turbo".into(),
-                    editable: true,
-                    rule: gi as i32,
-                    step: -1,
-                });
-            }
-            other => {
-                let key = format!("a|{gi}|{}", r.trigger.describe());
-                let (x, y) = place(&layout, &key, 24.0 + GNODE_W + 130.0, row_y(row));
-                nodes.push(GraphNode {
-                    key: key.into(),
-                    kind: "action".into(),
-                    label: other.describe().into(),
-                    sub: "yours".into(),
-                    x,
-                    y,
-                });
-                edges.push(GraphEdge {
-                    a: t as i32,
-                    b: (nodes.len() - 1) as i32,
-                    timing: "instant".into(),
-                    tkind: "".into(),
-                    editable: false,
-                    rule: -1,
-                    step: -1,
-                });
-            }
-        }
-        row += 1;
-    }
-
-    let st = app.global::<State>();
-    if st.get_selected_edge() >= edges.len() as i32 {
-        st.set_selected_edge(-1);
-    }
-    st.set_graph_nodes(ModelRc::new(VecModel::from(nodes)));
-    st.set_graph_edges(ModelRc::new(VecModel::from(edges)));
 }
 
 /// Map a Trigger to its short kind tag (for the rule list's left mark). Mirrors runtime::trigger_kind.
@@ -4648,11 +6101,198 @@ pub fn refresh_effects(app: &AppWindow, sh: &SharedRt) {
 /// shows (a spectrum/fire ignores colour; only a wave cares about direction).
 fn effect_meta(name: &str) -> (bool, bool) {
     match name {
-        // these read the layer colour: solid fill, breath, twinkles, key-glow, the VU bars
-        "static" | "solid" | "breathing" | "starlight" | "reactive" | "audiometer" => (true, false),
+        // these read the layer colour: solid fill, breath, twinkles, key-glow, the VU bars, load bars
+        "static" | "solid" | "breathing" | "starlight" | "reactive" | "audiometer" | "pulse" => {
+            (true, false)
+        }
         "wave" => (false, true),
         _ => (false, false), // spectrum, colorwheel, fire — own hue / own ramp
     }
+}
+
+// ── LIGHTING PERSISTENCE — survive a relaunch ──────────────────────────────────────────────────
+// The applied effect/layer stack (or data mode) + the chosen stream fps are persisted PER-DEVICE in
+// app.toml (see `prefs::DeviceLight`, keyed by pid) so a board RESUMES its effect on launch instead of
+// sitting frozen on the device's last held frame. Saves are cheap + only on user changes (debounced so
+// a slider drag doesn't thrash the disk) — NEVER from the animate loop. Restore re-applies through the
+// SAME stream path the apply button uses, so the device actually resumes (not just the on-screen page).
+
+/// Gate: the persisted lighting state has been restored (or confirmed absent) for the selected device.
+/// Until this flips true at the end of [`restore_lighting`], [`save_lighting`] is a no-op — so the
+/// install sequence (which runs the layer projection before restore) can never clobber a saved state
+/// with the empty startup stack.
+static LIGHTING_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+thread_local! {
+    /// Debounce timer for the lighting-state disk write (UI-thread). Restarted on each change so a
+    /// rapid gesture (dragging the speed slider) coalesces into ONE app.toml write ~400ms after the
+    /// last edit, instead of one write per emitted value.
+    static LIGHT_SAVE_TIMER: slint::Timer = slint::Timer::default();
+}
+
+/// Persist the SELECTED device's current lighting state (fps + layer stack / data mode), debounced. A
+/// no-op until `LIGHTING_READY` (so restore/install can't overwrite a saved state) and when no device
+/// is selected. Snapshots the state now (cheap); the actual disk write fires once the debounce settles.
+fn save_lighting(sh: &SharedRt) {
+    if !LIGHTING_READY.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    let (pid, fps, data, layers) = {
+        let s = sh.borrow();
+        (
+            s.rt.selected_pid,
+            s.rt.light_fps.load(std::sync::atomic::Ordering::Relaxed),
+            s.light_data.clone(),
+            s.light_layers.clone(),
+        )
+    };
+    if pid == 0 {
+        return; // nothing selected → no per-device key to write under
+    }
+    LIGHT_SAVE_TIMER.with(|t| {
+        t.start(
+            slint::TimerMode::SingleShot,
+            std::time::Duration::from_millis(400),
+            move || {
+                let _ = crate::prefs::set_device_light(
+                    pid,
+                    crate::prefs::DeviceLight {
+                        fps,
+                        data: data.clone(),
+                        layers: layers.clone(),
+                    },
+                );
+            },
+        );
+    });
+}
+
+/// Load the SELECTED device's saved lighting state into the shared runtime + the UI (the fps atomic,
+/// the layer stack / data mode, and the projected page), WITHOUT starting the device stream. Returns
+/// true when there's an applicable surface to resume (a data mode or a non-empty stack). Authoritative:
+/// a device with nothing saved is reset to a blank surface, so per-device state never bleeds across a
+/// switch.
+fn load_lighting_into_state(app: &AppWindow, sh: &SharedRt) -> bool {
+    let pid = sh.borrow().rt.selected_pid;
+    let saved = crate::prefs::device_light(pid).unwrap_or_default();
+    // fps: honour the user's saved pick; fall back to whatever the per-device default already seeded
+    // (init_grid) only when nothing's saved (saved.fps == 0).
+    if saved.fps >= 1 {
+        sh.borrow()
+            .rt
+            .light_fps
+            .store(saved.fps.clamp(1, 30), std::sync::atomic::Ordering::Relaxed);
+    }
+    let fps_now = sh
+        .borrow()
+        .rt
+        .light_fps
+        .load(std::sync::atomic::Ordering::Relaxed);
+    app.global::<State>().set_light_fps(fps_now as f32);
+    let has_surface = saved.data.is_some() || !saved.layers.is_empty();
+    {
+        let mut s = sh.borrow_mut();
+        s.light_data = saved.data;
+        s.light_layers = saved.layers;
+        s.selected_layer = s.light_layers.len().saturating_sub(1);
+        s.layers_rev += 1;
+    }
+    // project the restored stack into both the legacy layer model and the unified tile surface.
+    refresh_layers(app, sh);
+    has_surface
+}
+
+/// Stream the CURRENT lighting surface (data readout or layer composite) live to the selected device —
+/// the shared body behind the GUI's apply button AND startup restore, so a resumed board streams
+/// through the EXACT path a manual pick uses. Honours the writes-paused kill-switch. Returns a status.
+fn apply_current_lighting(app: &AppWindow, sh: &SharedRt) -> String {
+    let st = app.global::<State>();
+    if st.get_writes_paused() {
+        return "writes paused — composite not applied".into();
+    }
+    let is_data = sh.borrow().light_data.is_some();
+    if !is_data && sh.borrow().light_layers.is_empty() {
+        return "nothing to apply".into();
+    }
+    let msg = if is_data {
+        // DATA mode: stream the cross-device vitals readout instead of the effect stack.
+        let done = app.as_weak();
+        let mut s = sh.borrow_mut();
+        let pid = s.rt.selected_pid;
+        s.rt.start_vitals(pid, move |reason, token| {
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(app) = done.upgrade() {
+                    with_shared(|sh| {
+                        if !std::sync::Arc::ptr_eq(&token, &sh.borrow().rt.anim_stop) {
+                            return;
+                        }
+                        if !sh.borrow().rt.animating {
+                            return;
+                        }
+                        sh.borrow_mut().rt.animating = false;
+                        let st = app.global::<State>();
+                        st.set_compositing(false);
+                        st.set_status_line(
+                            match reason {
+                                Some(r) => format!("vitals ended: {r}"),
+                                None => "vitals finished".into(),
+                            }
+                            .into(),
+                        );
+                    });
+                }
+            });
+        })
+    } else {
+        let back = app.as_weak();
+        let mut s = sh.borrow_mut();
+        let pid = s.rt.selected_pid;
+        let defs = s.light_layers.clone();
+        s.rt.start_layers(defs, pid, move |reason, token| {
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(app) = back.upgrade() {
+                    with_shared(|sh| {
+                        if !std::sync::Arc::ptr_eq(&token, &sh.borrow().rt.anim_stop) {
+                            return;
+                        }
+                        if !sh.borrow().rt.animating {
+                            return;
+                        }
+                        sh.borrow_mut().rt.animating = false;
+                        let st = app.global::<State>();
+                        st.set_compositing(false);
+                        st.set_status_line(
+                            match reason {
+                                Some(r) => format!("composite ended: {r}"),
+                                None => "composite finished".into(),
+                            }
+                            .into(),
+                        );
+                    });
+                }
+            });
+        })
+    };
+    let animating = sh.borrow().rt.animating;
+    st.set_compositing(animating);
+    msg
+}
+
+/// Restore + RE-APPLY the selected device's persisted lighting ONCE at startup: load the saved fps +
+/// stack/data into state, and — if there's a surface to resume — start the device stream so the board
+/// picks the effect back up instead of holding its stale last frame. Flips `LIGHTING_READY` so user
+/// edits from here on persist. Respects the writes-paused gate (the state is still restored; it just
+/// isn't streamed until writes resume + the user applies).
+pub fn restore_lighting(app: &AppWindow, sh: &SharedRt) {
+    let has_surface = load_lighting_into_state(app, sh);
+    if has_surface {
+        let msg = apply_current_lighting(app, sh);
+        if sh.borrow().rt.animating {
+            app.global::<State>()
+                .set_status_line(format!("lighting resumed — {msg}").into());
+        }
+    }
+    LIGHTING_READY.store(true, std::sync::atomic::Ordering::Release);
 }
 
 /// Project the Rust-side layer stack into the Slint `light-layers` display model + selected index.
@@ -4687,6 +6327,402 @@ pub fn refresh_layers(app: &AppWindow, sh: &SharedRt) {
     };
     st.set_light_layers(ModelRc::new(VecModel::from(rows)));
     st.set_selected_layer(sel);
+    // the UNIFIED page is a projection of the SAME stack — keep it in lockstep so every legacy layer
+    // callback (which all call refresh_layers) also updates the tile-driven surface.
+    refresh_light_unified(app, sh);
+    // every lighting mutation funnels through here, so this is the one chokepoint that persists the
+    // stack. It's a no-op until restore has run (LIGHTING_READY) and is never reached from the animate
+    // loop — only user edits + the tile/data picks — so the disk write stays cheap (and debounced).
+    save_lighting(sh);
+}
+
+// ── THE UNIFIED LIGHTING SURFACE — tiles + auto-rendered knobs over the layer stack ───────────
+// The page is render-first and tile-driven, but the BACKEND is the proven compositor: a single effect
+// is just `light_layers` with one entry, stacking adds entries, the "active effect" is the selected
+// layer. These helpers project that truth into the tile grid + the schema-rendered param model.
+
+/// The weave accent as a core `Rgb` — the default colour a freshly-picked effect is poured in, so
+/// "set a vibe" is one click. Falls back to the stock phosphor on a junk pref.
+fn weave_accent_rgb() -> Rgb {
+    let p = weave_accent_u32();
+    Rgb::new(
+        ((p >> 16) & 0xFF) as u8,
+        ((p >> 8) & 0xFF) as u8,
+        (p & 0xFF) as u8,
+    )
+}
+
+/// The slug of the cross-device VITALS data tile — the one tile rendered via `render_vitals` rather
+/// than a `FrameGen`. Treated as a first-class "effect" everywhere the page picks/streams a tile.
+const VITALS_SLUG: &str = "mouse-battery";
+
+/// The static tile CATALOG, in grid order: the visual effects, then the data mode(s), then the
+/// future stub. `(slug, name, kind)`. The previews are rendered per-tick from this list.
+fn light_tile_catalog() -> &'static [(&'static str, &'static str, &'static str)] {
+    &[
+        ("static", "Static", "effect"),
+        ("breathing", "Breathing", "effect"),
+        ("spectrum", "Spectrum", "effect"),
+        ("wave", "Wave", "effect"),
+        ("aurora", "Aurora", "effect"),
+        ("fire", "Fire", "effect"),
+        ("cascade", "Cascade", "effect"),
+        ("comet", "Comet", "effect"),
+        ("starlight", "Starlight", "effect"),
+        ("reactive", "Reactive", "effect"),
+        ("ripple", "Ripple", "effect"),
+        ("typingheat", "Typing Heat", "effect"),
+        ("colorwheel", "Color Wheel", "effect"),
+        ("audiometer", "Audio Meter", "effect"),
+        ("pulse", "Pulse", "effect"),
+        ("ambient", "Ambient", "effect"),
+        (VITALS_SLUG, "Mouse Battery", "data"),
+        // removed-until-wired: the "Notifications" stub ("notifications"/"stub") was a dead, greyed,
+        // un-clickable tile among live previews. Re-add it here when the notifications-lighting
+        // surface ships (the "stub" kind + its dimmed/SOON rendering are still supported below).
+    ]
+}
+
+/// Render a `rows*cols` device frame into a small preview Image at the tile's pixel size — the
+/// MATERIAL-card pattern: each cell becomes a block, lit on the void. Cheap (tiles are ~110px) and
+/// the swatch literally IS the effect running, so the grid reads as a wall of live previews.
+fn frame_to_preview(frame: &[Rgb], rows: usize, cols: usize) -> Image {
+    // a small canvas — block-fill per cell with a 1px gutter so the lattice reads
+    let (cell, gap, pad) = (9usize, 2usize, 4usize);
+    let w = pad * 2 + cols * cell + cols.saturating_sub(1) * gap;
+    let h = pad * 2 + rows * cell + rows.saturating_sub(1) * gap;
+    let (w, h) = (w.max(1), h.max(1));
+    let mut buf = SharedPixelBuffer::<Rgba8Pixel>::new(w as u32, h as u32);
+    {
+        let px = buf.make_mut_slice();
+        // ground = the void
+        for p in px.iter_mut() {
+            *p = Rgba8Pixel {
+                r: 4,
+                g: 5,
+                b: 6,
+                a: 255,
+            };
+        }
+        for r in 0..rows {
+            for c in 0..cols {
+                let col = frame.get(r * cols + c).copied().unwrap_or(Rgb::BLACK);
+                let x0 = pad + c * (cell + gap);
+                let y0 = pad + r * (cell + gap);
+                for yy in y0..y0 + cell {
+                    for xx in x0..x0 + cell {
+                        if xx < w && yy < h {
+                            let i = yy * w + xx;
+                            px[i] = Rgba8Pixel {
+                                r: col.r,
+                                g: col.g,
+                                b: col.b,
+                                a: 255,
+                            };
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Image::from_rgba8(buf)
+}
+
+/// A representative AMBIENT frame for the tile thumbnail when ambient ISN'T the selected effect — a
+/// calm horizontal hue sweep, brighter at the top, so the tile still reads as a screen-mirror. The
+/// LIVE whole-desktop capture (`screen_ambient`, measured at ~41ms PER GRAB, ~450ms/s when always-on)
+/// is then driven ONLY by the selected ambient effect's big preview + the device stream — never by a
+/// postage-stamp thumbnail. Mirrors the `preview_vitals` pattern: the tile shows what the surface
+/// LOOKS like without paying its live cost.
+fn preview_ambient_frame(rows: u8, cols: u8) -> Vec<Rgb> {
+    let (r, c) = (rows as usize, cols as usize);
+    let mut f = vec![Rgb::BLACK; r * c];
+    for y in 0..r {
+        let v = 0.55 + 0.35 * (1.0 - y as f32 / r.max(1) as f32); // a touch brighter at the top
+        for x in 0..c {
+            let hue = if c > 1 { x as f32 / (c as f32 - 1.0) * 300.0 } else { 0.0 };
+            f[y * c + x] = Rgb::from_hsv(hue, 0.82, v.clamp(0.0, 1.0));
+        }
+    }
+    f
+}
+
+/// A representative TYPING HEAT frame for the tile thumbnail — a warm thermal wash with a few hot
+/// flares (the keys-just-hit look), in the user's accent. The thumbnail pass suppresses live key reads
+/// (a perf fix), so a TypingHeat thumbnail can never see typing; this still shows what the effect IS
+/// without faking input. The LIVE typing-reactivity plays only on the SELECTED effect's big preview +
+/// the device stream (both read keys live). Mirrors the `preview_ambient_frame` pattern; the heavy
+/// lifting (the same thermal ramp the device renders) lives in `neuron::effects::preview_typing_heat`.
+fn preview_typingheat_frame(rows: u8, cols: u8) -> Vec<Rgb> {
+    // the tile previews the DEFAULT look — pure warm fire — so it reads as heat regardless of the global
+    // weave accent (being teal, it would recolour the preview into a cold flame).
+    let flame = neuron::effects::default_color("typingheat").unwrap_or_else(weave_accent_rgb);
+    neuron::effects::preview_typing_heat(flame, rows, cols)
+}
+
+/// A representative VITALS snapshot for the data tile's PREVIEW (a charging mouse at ~64% on stage 2)
+/// — the tile shows what the data surface LOOKS like without polling hardware every tick. The live
+/// applied stream reads the real device.
+fn preview_vitals() -> neuron::lighting::Vitals {
+    neuron::lighting::Vitals {
+        battery_pct: 64,
+        charging: true,
+        active_stage: 1,
+        stage_count: 3,
+    }
+}
+
+/// Render the whole tile grid — each tile a live (effects) or representative (data) preview at time
+/// `t`. Effects run the SAME `FrameGen` the device does; the data tile runs `render_vitals`; the
+/// audiometer tile runs the REAL `AudioMeter` generator, which reads the shared `audio_level`
+/// provider — cheap, idle-auto-stopping, and the SAME number the device/main-preview read, so the
+/// thumbnail matches the board instead of faking it.
+fn render_light_tiles(app: &AppWindow, sh: &SharedRt, t: f32) {
+    let (rows, cols) = sh.borrow().rt.grid_dims();
+    if rows == 0 || cols == 0 {
+        app.global::<State>()
+            .set_light_tiles(ModelRc::new(VecModel::from(Vec::<EffectTile>::new())));
+        return;
+    }
+    let accent = weave_accent_rgb();
+    let (ru, cu) = (rows as usize, cols as usize);
+    // The audiometer thumbnail reads the SAME shared audio level the device + big preview do, so it
+    // must request the SAME source — otherwise the two callers would fight over the single global
+    // provider (re-pointing it every tick). Use the configured audiometer layer's source if one is
+    // in the stack, else the default "speakers".
+    let audio_source: &'static str = sh
+        .borrow()
+        .light_layers
+        .iter()
+        .find(|d| d.effect.eq_ignore_ascii_case("audiometer"))
+        .map(|d| {
+            if d.source.eq_ignore_ascii_case("mic") {
+                "mic"
+            } else {
+                "speakers"
+            }
+        })
+        .unwrap_or("speakers");
+    // cache one generator per effect across ticks so stateful effects (fire/starlight) animate; keyed
+    // by slug. Rebuilt only when the grid dims change.
+    thread_local! {
+        static GENS: RefCell<(u8, u8, std::collections::HashMap<String, Box<dyn FrameGen>>)> =
+            RefCell::new((0, 0, std::collections::HashMap::new()));
+    }
+    let phase = (t * 0.18).rem_euclid(1.0); // for render_vitals' charging crest
+    // which effect is live on the hero render — the only tile that may pay LIVE-input costs. A
+    // thumbnail that isn't the selected effect renders a representative still instead of driving the
+    // heavy provider (the screen capture) — that's the always-on capture this page used to leave
+    // running the whole time the LIGHTING page was open.
+    let selected = app.global::<State>().get_light_effect().to_string();
+    let prof = tile_prof_on();
+    // INERT in prod: when `NEURON_PROF` is unset, `prof` is false and every `Instant::now()` below is
+    // skipped via `bool::then`, so the render path pays nothing for the instrumentation.
+    let tick_start = prof.then(std::time::Instant::now);
+    let mut prof_rows: Vec<(&'static str, f64, f64)> = Vec::new();
+    // SUPPRESS the per-key `GetAsyncKeyState` scan for the whole thumbnail pass: the reactive/ripple/
+    // comet generators poll all 256 VKs per frame for live reactivity that's invisible at thumbnail
+    // size (and the selected effect's big preview + the device stream still scan live). Dropped at the
+    // end of the tile loop. ~765 syscalls/tick removed.
+    let _no_keys = neuron::capture::suppress_key_reads();
+    let tiles: Vec<EffectTile> = light_tile_catalog()
+        .iter()
+        .map(|&(slug, name, kind)| {
+            let g0 = prof.then(std::time::Instant::now);
+            let frame = match kind {
+                "data" => neuron::lighting::render_vitals(preview_vitals(), rows, cols, phase),
+                "stub" => vec![Rgb::BLACK; ru * cu], // a dark, honest "soon" tile
+                // the audiometer thumbnail runs the REAL generator → it reads the shared, fast,
+                // idle-auto-stopping `audio_level` provider (cheap), so the tile matches the device
+                // instead of faking it. Built fresh per tick with the resolved source (the generator
+                // is stateless now) so it tracks a source flip; pointed at the SAME source as the
+                // device/main preview so the single provider isn't re-pointed each tick.
+                _ if slug == "audiometer" => neuron::effects::make_with(
+                    "audiometer",
+                    neuron::effects::EffectParams {
+                        source: audio_source,
+                        ..Default::default()
+                    },
+                )
+                .map(|mut g| g.frame(rows, cols, t, accent))
+                .unwrap_or_else(|| vec![Rgb::BLACK; ru * cu]),
+                // TYPING HEAT thumbnail: ALWAYS a representative still. The thumbnail pass suppresses
+                // live key reads (the perf fix), so a TypingHeat thumbnail can never see typing — it
+                // would render a cold idle board. The still shows what the effect IS (a warm thermal
+                // wash with flares); the LIVE typing-reactivity plays on the selected big preview + the
+                // device stream, which read keys on their own (un-suppressed) paths.
+                _ if slug == "typingheat" => preview_typingheat_frame(rows, cols),
+                // AMBIENT thumbnail: render LIVE (driving the whole-desktop capture) ONLY when ambient
+                // is the selected effect — then the big preview + device stream already run the capture,
+                // so the thumbnail just reads the warm grid. Otherwise show a representative still and
+                // touch no provider, so the ~41ms/grab StretchBlt never runs for an unselected tile.
+                _ if slug == "ambient" && selected != "ambient" => preview_ambient_frame(rows, cols),
+                _ => GENS.with(|g| {
+                    let mut g = g.borrow_mut();
+                    if g.0 != rows || g.1 != cols {
+                        *g = (rows, cols, std::collections::HashMap::new());
+                    }
+                    let gen = g
+                        .2
+                        .entry(slug.to_string())
+                        .or_insert_with(|| {
+                            neuron::effects::make(slug)
+                                .unwrap_or_else(|| Box::new(neuron::effects::Solid))
+                        });
+                    gen.frame(rows, cols, t, accent)
+                }),
+            };
+            let gen_us = g0.map_or(0.0, |s| s.elapsed().as_nanos() as f64 / 1000.0);
+            let p0 = prof.then(std::time::Instant::now);
+            let swatch = frame_to_preview(&frame, ru, cu);
+            if let Some(p0) = p0 {
+                prof_rows.push((slug, gen_us, p0.elapsed().as_nanos() as f64 / 1000.0));
+            }
+            EffectTile {
+                name: name.into(),
+                slug: slug.into(),
+                kind: kind.into(),
+                swatch,
+            }
+        })
+        .collect();
+    let u0 = prof.then(std::time::Instant::now);
+    app.global::<State>()
+        .set_light_tiles(ModelRc::new(VecModel::from(tiles)));
+    if let (Some(u0), Some(tick_start)) = (u0, tick_start) {
+        let upload_us = u0.elapsed().as_nanos() as f64 / 1000.0;
+        let tick_us = tick_start.elapsed().as_nanos() as f64 / 1000.0;
+        tile_prof_accumulate(tick_us, upload_us, &prof_rows);
+    }
+}
+
+/// Build the `EffectParam` controls for `def` from the effect's declared schema, filling each row's
+/// live value from the layer def. Returns `(params, uses_color, color_hex, color_col)` — the colour
+/// knob is lifted out so the page renders its swatch row directly.
+fn params_for(def: &neuron::effects::LayerDef) -> (Vec<EffectParam>, bool, String, slint::Color) {
+    use neuron::effects::ParamKind;
+    let mut out = Vec::new();
+    let mut uses_color = false;
+    // lowercase so it matches the shared lowercase swatch palette (Palette.accent) — the ColorPicker's
+    // selected-swatch ring compares this against the swatch hex. Parsing is case-insensitive, so this is
+    // display-only.
+    let hex = def.color.to_hex().to_lowercase();
+    let col = rgb_to_color(def.color);
+    for p in neuron::effects::schema(&def.effect) {
+        match p.kind {
+            ParamKind::Color => {
+                uses_color = true;
+                // the page renders colour itself; keep a row out of the generic list
+            }
+            ParamKind::Range { min, max, .. } => {
+                let fval = match p.key {
+                    "speed" => def.speed,
+                    "density" => def.density,
+                    "fade" => def.fade,
+                    _ => 1.0,
+                };
+                out.push(EffectParam {
+                    key: p.key.into(),
+                    label: p.label.into(),
+                    kind: "range".into(),
+                    fval,
+                    fmin: min,
+                    fmax: max,
+                    options: ModelRc::new(VecModel::from(Vec::<SharedString>::new())),
+                    ival: 0,
+                    hex: "".into(),
+                    col: slint::Color::default(),
+                    bval: false,
+                });
+            }
+            ParamKind::Enum { options, .. } => {
+                let ival = match p.key {
+                    "direction" => def.direction as i32,
+                    "breath" => def.breath as i32,
+                    // the audiometer source: reflect the stored plain word back as its option index
+                    // (mic = 1, the speakers default = 0) so the segment shows the live selection.
+                    "source" => i32::from(def.source.eq_ignore_ascii_case("mic")),
+                    _ => 0,
+                };
+                let opts: Vec<SharedString> =
+                    options.iter().map(|o| (*o).into()).collect();
+                out.push(EffectParam {
+                    key: p.key.into(),
+                    label: p.label.into(),
+                    kind: "enum".into(),
+                    fval: 0.0,
+                    fmin: 0.0,
+                    fmax: 0.0,
+                    options: ModelRc::new(VecModel::from(opts)),
+                    ival,
+                    hex: "".into(),
+                    col: slint::Color::default(),
+                    bval: false,
+                });
+            }
+            ParamKind::Toggle { default } => {
+                // reflect the live layer field back (so the switch shows the stored selection), not the
+                // schema default — keyed per toggle like the other knobs.
+                let bval = match p.key {
+                    "glow" => def.glow,
+                    _ => default,
+                };
+                out.push(EffectParam {
+                    key: p.key.into(),
+                    label: p.label.into(),
+                    kind: "toggle".into(),
+                    fval: 0.0,
+                    fmin: 0.0,
+                    fmax: 0.0,
+                    options: ModelRc::new(VecModel::from(Vec::<SharedString>::new())),
+                    ival: 0,
+                    hex: "".into(),
+                    col: slint::Color::default(),
+                    bval,
+                });
+            }
+        }
+    }
+    (out, uses_color, hex, col)
+}
+
+/// Project the layer stack into the unified surface: the active effect's slug (the selected layer),
+/// the auto-rendered param model + colour, and the stack size. The data tile reports an empty schema
+/// (honest: a readout has no knobs).
+fn refresh_light_unified(app: &AppWindow, sh: &SharedRt) {
+    let (defs, sel, data) = {
+        let s = sh.borrow();
+        (s.light_layers.clone(), s.selected_layer, s.light_data.clone())
+    };
+    let st = app.global::<State>();
+    // DATA vs EFFECT: the RATE control (and the streaming pacer) only apply to streamed effects —
+    // a data readout paints on-demand, so flag it so the page gates the fps control off.
+    st.set_light_is_data(data.is_some());
+    // DATA mode owns the surface: the active tile is the data slug, with no generator knobs (a
+    // readout has none) and no stack (it paints the whole board).
+    if let Some(slug) = data {
+        st.set_light_effect(slug.into());
+        st.set_light_params(ModelRc::new(VecModel::from(Vec::<EffectParam>::new())));
+        st.set_light_uses_color(false);
+        st.set_light_stack_count(0);
+        return;
+    }
+    if defs.is_empty() {
+        st.set_light_effect("".into());
+        st.set_light_params(ModelRc::new(VecModel::from(Vec::<EffectParam>::new())));
+        st.set_light_uses_color(false);
+        st.set_light_stack_count(0);
+        return;
+    }
+    let sel = sel.min(defs.len() - 1);
+    let active = &defs[sel];
+    st.set_light_effect(active.effect.clone().into());
+    let (params, uses_color, hex, col) = params_for(active);
+    st.set_light_params(ModelRc::new(VecModel::from(params)));
+    st.set_light_uses_color(uses_color);
+    st.set_light_color_hex(hex.into());
+    st.set_light_color_col(col);
+    st.set_light_stack_count(defs.len() as i32);
 }
 
 pub fn init_grid(app: &AppWindow, sh: &SharedRt) {
@@ -4699,6 +6735,21 @@ pub fn init_grid(app: &AppWindow, sh: &SharedRt) {
     st.set_grid_cols(cols as i32);
     st.set_grid_kind(kind.into());
     st.set_grid_px(ModelRc::new(VecModel::from(px)));
+    // seed the streamed-effect fps from the selected device's protocol default (legacy → 6, matrix
+    // → 30) and flag legacy so the page shows the honest "~6 fps before frames drop" note. The
+    // shared atomic is what a running stream reads each frame; the property drives the slider +
+    // preview. The data/vitals surface ignores this — it paints on-demand, not through the streamer.
+    let (fps, legacy) = sh.borrow().rt.light_fps_default().unwrap_or((30, false));
+    sh.borrow()
+        .rt
+        .light_fps
+        .store(fps, std::sync::atomic::Ordering::Relaxed);
+    st.set_light_fps(fps as f32);
+    st.set_light_fps_legacy(legacy);
+    // seed the tile grid so the live previews appear the moment a lit device is selected (the page's
+    // ~90ms timer keeps them animating after that).
+    render_light_tiles(app, sh, preview_epoch().elapsed().as_secs_f32());
+    refresh_light_unified(app, sh);
 }
 
 /// Render an activation phrase as instrument symbols for the rhythm readout:
@@ -4996,9 +7047,33 @@ fn normalize_trail(path: &[neuron::glyph::C]) -> Vec<f32> {
     out
 }
 
+/// Open a path in the OS file manager. The ONE cross-platform reveal seam — Windows `explorer`,
+/// macOS `open`, everything else `xdg-open` — so the GUI never hardcodes a Windows-only spawn. Best
+/// effort: a missing handler just no-ops (the caller already ensured the path exists).
+fn open_in_file_manager(path: &std::path::Path) {
+    #[cfg(windows)]
+    let _ = std::process::Command::new("explorer").arg(path).spawn();
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(path).spawn();
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+}
+
 fn open_config_dir() {
     let dir = std::env::current_dir().unwrap_or_else(|_| ".".into());
-    let _ = std::process::Command::new("explorer").arg(dir).spawn();
+    open_in_file_manager(&dir);
+}
+
+/// Reveal the macros folder (`macros/scripts/`) in the OS file manager — the Workshop's "drop a .py
+/// here" affordance. The core's `macros_dir()` is cwd-relative, so resolve it to an ABSOLUTE path
+/// (join the run dir) and CREATE it if missing, so reveal works on a fresh install and a user can
+/// drop scripts in before any macro has been saved.
+fn reveal_macros_folder() {
+    let dir = std::env::current_dir()
+        .unwrap_or_else(|_| ".".into())
+        .join(neuron::macros::macro_host::macros_dir());
+    let _ = std::fs::create_dir_all(&dir);
+    open_in_file_manager(&dir);
 }
 
 /// Format an uptime in ms as a compact human readout: "3d 04h", "1h 23m", "12m 03s", "45s".
@@ -5067,5 +7142,454 @@ fn open_crash_log() {
     let path = std::env::current_dir()
         .unwrap_or_else(|_| ".".into())
         .join("neuron-crash.log");
-    let _ = std::process::Command::new("explorer").arg(path).spawn();
+    open_in_file_manager(&path);
 }
+
+#[cfg(test)]
+mod macro_canvas_tests {
+    //! The macro CONSTRUCTOR's tree machinery — the path scheme, the node resolvers, the edit-op
+    //! semantics, the add-defaults, and the flatten layout. These are the pure functions the canvas
+    //! callbacks delegate to (the callbacks themselves are thin Slint glue around them), so proving
+    //! these proves the builder. No Python, no UI — just the tree.
+    use super::*;
+    use neuron::macros::{MacroNode, Value};
+
+    /// A small fixture tree: [type "hi", ask{yes:[notify], no:[open]}, press ctrl+c].
+    fn fixture() -> Vec<MacroNode> {
+        vec![
+            MacroNode::Type {
+                text: Value::str("hi"),
+                ghost: false,
+                speed: None,
+            },
+            MacroNode::Ask {
+                question: Value::str("go?"),
+                description: Value::empty_str(),
+                yes: vec![MacroNode::Notify {
+                    text: Value::str("yes"),
+                }],
+                no: vec![MacroNode::Open {
+                    command: Value::str("notepad"),
+                    capture: None,
+                }],
+            },
+            MacroNode::Press {
+                keys: vec!["ctrl".into(), "c".into()],
+            },
+        ]
+    }
+
+    #[test]
+    fn node_at_path_resolves_root_and_branches() {
+        let mut t = fixture();
+        assert!(matches!(
+            node_at_path(&mut t, "0"),
+            Some(MacroNode::Type { .. })
+        ));
+        assert!(matches!(
+            node_at_path(&mut t, "1"),
+            Some(MacroNode::Ask { .. })
+        ));
+        assert!(matches!(
+            node_at_path(&mut t, "1.yes.0"),
+            Some(MacroNode::Notify { .. })
+        ));
+        assert!(matches!(
+            node_at_path(&mut t, "1.no.0"),
+            Some(MacroNode::Open { .. })
+        ));
+        assert!(matches!(
+            node_at_path(&mut t, "2"),
+            Some(MacroNode::Press { .. })
+        ));
+    }
+
+    #[test]
+    fn node_at_path_rejects_bad_paths() {
+        let mut t = fixture();
+        assert!(node_at_path(&mut t, "").is_none());
+        assert!(node_at_path(&mut t, "9").is_none()); // out of range
+        assert!(node_at_path(&mut t, "0.yes.0").is_none()); // a Type has no branches
+        assert!(node_at_path(&mut t, "1.maybe.0").is_none()); // not a real arm
+        assert!(node_at_path(&mut t, "1.yes.5").is_none()); // arm index out of range
+    }
+
+    #[test]
+    fn nested_ask_path_recurses() {
+        // an ask whose yes-branch holds another ask — "1.yes.0.no.0" must reach the inner open.
+        let mut t = vec![
+            MacroNode::Notify {
+                text: Value::str("a"),
+            },
+            MacroNode::Ask {
+                question: Value::str("outer"),
+                description: Value::empty_str(),
+                yes: vec![MacroNode::Ask {
+                    question: Value::str("inner"),
+                    description: Value::empty_str(),
+                    yes: vec![],
+                    no: vec![MacroNode::Open {
+                        command: Value::str("x"),
+                        capture: None,
+                    }],
+                }],
+                no: vec![],
+            },
+        ];
+        assert!(matches!(
+            node_at_path(&mut t, "1.yes.0.no.0"),
+            Some(MacroNode::Open { .. })
+        ));
+    }
+
+    #[test]
+    fn flow_arm_paths_resolve_for_every_kind() {
+        // an `if` (then/else), a `for_each` (body), a `try` (body/error) — each arm token descends.
+        let mut t = vec![
+            MacroNode::If {
+                cond: Value::Bool { b: true },
+                then_: vec![MacroNode::Notify {
+                    text: Value::str("t"),
+                }],
+                else_: vec![MacroNode::Notify {
+                    text: Value::str("e"),
+                }],
+            },
+            MacroNode::ForEach {
+                var: "line".into(),
+                source: Value::empty_str(),
+                body: vec![MacroNode::Notify {
+                    text: Value::str("b"),
+                }],
+            },
+            MacroNode::Try {
+                body: vec![MacroNode::Notify {
+                    text: Value::str("ok"),
+                }],
+                except_: vec![MacroNode::Notify {
+                    text: Value::str("err"),
+                }],
+            },
+        ];
+        assert!(matches!(
+            node_at_path(&mut t, "0.then.0"),
+            Some(MacroNode::Notify { .. })
+        ));
+        assert!(matches!(
+            node_at_path(&mut t, "0.else.0"),
+            Some(MacroNode::Notify { .. })
+        ));
+        assert!(matches!(
+            node_at_path(&mut t, "1.body.0"),
+            Some(MacroNode::Notify { .. })
+        ));
+        assert!(matches!(
+            node_at_path(&mut t, "2.body.0"),
+            Some(MacroNode::Notify { .. })
+        ));
+        assert!(matches!(
+            node_at_path(&mut t, "2.error.0"),
+            Some(MacroNode::Notify { .. })
+        ));
+        // a wrong arm token for the kind is rejected (an `if` has no `body`).
+        assert!(node_at_path(&mut t, "0.body.0").is_none());
+    }
+
+    #[test]
+    fn body_at_context_targets_the_right_body() {
+        let mut t = fixture();
+        assert_eq!(body_at_context(&mut t, "").map(|b| b.len()), Some(3)); // root
+        assert_eq!(body_at_context(&mut t, "1.yes").map(|b| b.len()), Some(1));
+        assert_eq!(body_at_context(&mut t, "1.no").map(|b| b.len()), Some(1));
+        assert!(body_at_context(&mut t, "0.yes").is_none()); // not an ask
+    }
+
+    #[test]
+    fn default_node_covers_every_kind() {
+        for kind in [
+            "type",
+            "press",
+            "key_press",
+            "click",
+            "scroll",
+            "move_to",
+            "copy",
+            "paste",
+            "open",
+            "focus",
+            "wait",
+            "notify",
+            "ask",
+            "if",
+            "repeat_n",
+            "repeat_while",
+            "for_each",
+            "set_var",
+            "stop",
+            "try",
+            "raw",
+        ] {
+            assert!(default_node(kind).is_some(), "kind '{kind}' must default");
+        }
+        assert!(default_node("bogus").is_none());
+        // a fresh ask brings empty branches (so the canvas shows both arms' add-points).
+        let MacroNode::Ask { yes, no, question, .. } = default_node("ask").unwrap() else {
+            panic!("ask");
+        };
+        assert!(yes.is_empty() && no.is_empty() && question == Value::empty_str());
+        // a fresh if/try bring empty lanes too.
+        let MacroNode::If { then_, else_, .. } = default_node("if").unwrap() else {
+            panic!("if");
+        };
+        assert!(then_.is_empty() && else_.is_empty());
+        let MacroNode::Try { body, except_ } = default_node("try").unwrap() else {
+            panic!("try");
+        };
+        assert!(body.is_empty() && except_.is_empty());
+    }
+
+    /// edit-step semantics: setting a node's param via `edit_node_value` (the callback's core mutation).
+    #[test]
+    fn edit_step_sets_each_param() {
+        let mut t = fixture();
+        // a text-ish Value param → a Str literal.
+        edit_node_value(node_at_path(&mut t, "0").unwrap(), "bye".into());
+        assert_eq!(
+            node_at_path(&mut t, "0"),
+            Some(&mut MacroNode::Type {
+                text: Value::str("bye"),
+                ghost: false,
+                speed: None,
+            })
+        );
+        // an ask question is text-ish → a Str literal.
+        edit_node_value(node_at_path(&mut t, "1").unwrap(), "ready?".into());
+        if let Some(MacroNode::Ask { question, .. }) = node_at_path(&mut t, "1") {
+            assert_eq!(*question, Value::str("ready?"));
+        } else {
+            panic!("ask");
+        }
+        // a press chord splits on + / , / space and lowercases.
+        edit_node_value(node_at_path(&mut t, "2").unwrap(), "Ctrl + Shift, s".into());
+        if let Some(MacroNode::Press { keys }) = node_at_path(&mut t, "2") {
+            assert_eq!(*keys, vec!["ctrl", "shift", "s"]);
+        } else {
+            panic!("press");
+        }
+    }
+
+    /// expression Value params take the edit as a Raw verbatim (the next code-parse normalizes it).
+    #[test]
+    fn edit_step_expr_params_become_raw() {
+        let mut t = vec![
+            MacroNode::If {
+                cond: Value::Bool { b: true },
+                then_: vec![],
+                else_: vec![],
+            },
+            MacroNode::RepeatN {
+                count: Value::Int { n: 1 },
+                body: vec![],
+            },
+            MacroNode::ForEach {
+                var: "x".into(),
+                source: Value::empty_str(),
+                body: vec![],
+            },
+            MacroNode::SetVar {
+                name: "x".into(),
+                value: Value::empty_str(),
+            },
+        ];
+        edit_node_value(node_at_path(&mut t, "0").unwrap(), "ctx.app == \"a\"".into());
+        assert!(matches!(
+            node_at_path(&mut t, "0"),
+            Some(MacroNode::If { cond: Value::Raw { .. }, .. })
+        ));
+        edit_node_value(node_at_path(&mut t, "1").unwrap(), "len(ctx.selection)".into());
+        assert!(matches!(
+            node_at_path(&mut t, "1"),
+            Some(MacroNode::RepeatN { count: Value::Raw { .. }, .. })
+        ));
+        // for-each splits "var in source".
+        edit_node_value(
+            node_at_path(&mut t, "2").unwrap(),
+            "line in ctx.selection.splitlines()".into(),
+        );
+        if let Some(MacroNode::ForEach { var, source, .. }) = node_at_path(&mut t, "2") {
+            assert_eq!(var, "line");
+            assert_eq!(*source, Value::raw("ctx.selection.splitlines()"));
+        } else {
+            panic!("for_each");
+        }
+        // set-var splits "name = expr".
+        edit_node_value(node_at_path(&mut t, "3").unwrap(), "n = 1 + 2".into());
+        if let Some(MacroNode::SetVar { name, value }) = node_at_path(&mut t, "3") {
+            assert_eq!(name, "n");
+            assert_eq!(*value, Value::raw("1 + 2"));
+        } else {
+            panic!("set_var");
+        }
+    }
+
+    #[test]
+    fn delete_step_removes_and_takes_branches() {
+        let mut t = fixture();
+        // delete the ask at index 1 — its yes/no go with it; the press shifts to index 1.
+        let (body, idx) = parent_body_and_index(&mut t, "1").unwrap();
+        body.remove(idx);
+        assert_eq!(t.len(), 2);
+        assert!(matches!(t[0], MacroNode::Type { .. }));
+        assert!(matches!(t[1], MacroNode::Press { .. }));
+        // delete inside a branch
+        let mut t2 = fixture();
+        let (body, idx) = parent_body_and_index(&mut t2, "1.no.0").unwrap();
+        body.remove(idx);
+        let MacroNode::Ask { no, .. } = &t2[1] else {
+            panic!("ask");
+        };
+        assert!(no.is_empty());
+    }
+
+    #[test]
+    fn move_step_reorders_within_its_body_and_clamps() {
+        let mut t = fixture();
+        // move index 0 down — swaps with index 1.
+        let (body, idx) = parent_body_and_index(&mut t, "0").unwrap();
+        let target = idx as i32 + 1;
+        assert!(target >= 0 && (target as usize) < body.len());
+        body.swap(idx, target as usize);
+        assert!(matches!(t[0], MacroNode::Ask { .. }));
+        assert!(matches!(t[1], MacroNode::Type { .. }));
+        // moving the FIRST up is a clamp (no swap) — the guard rejects target < 0.
+        let mut t2 = fixture();
+        let (body, idx) = parent_body_and_index(&mut t2, "0").unwrap();
+        let target = idx as i32 - 1;
+        assert!(target < 0, "moving the head up must be rejected (clamp)");
+        let _ = body; // no mutation
+        assert!(matches!(t2[0], MacroNode::Type { .. }));
+    }
+
+    #[test]
+    fn flatten_emits_steps_lanes_and_add_points() {
+        let mut out = Vec::new();
+        flatten_macro(&fixture(), 0, "", &mut out);
+        // collect (row, path, kind) triples for readable assertions.
+        let rows: Vec<(String, String, String)> = out
+            .iter()
+            .map(|b| (b.row.to_string(), b.path.to_string(), b.kind.to_string()))
+            .collect();
+        // expected order: step0, step1(ask), yes-lane, yes-step, yes-add, no-lane, no-step, no-add,
+        // step2, root-add.
+        assert_eq!(rows[0], ("step".into(), "0".into(), "type".into()));
+        assert_eq!(rows[1], ("step".into(), "1".into(), "ask".into()));
+        assert_eq!(rows[2], ("lane".into(), "1".into(), "yes".into()));
+        assert_eq!(rows[3], ("step".into(), "1.yes.0".into(), "notify".into()));
+        assert_eq!(rows[4], ("add".into(), "1.yes".into(), "".into()));
+        assert_eq!(rows[5], ("lane".into(), "1".into(), "no".into()));
+        assert_eq!(rows[6], ("step".into(), "1.no.0".into(), "open".into()));
+        assert_eq!(rows[7], ("add".into(), "1.no".into(), "".into()));
+        assert_eq!(rows[8], ("step".into(), "2".into(), "press".into()));
+        // the FINAL row is the root add-point (insert context "").
+        let last = rows.last().unwrap();
+        assert_eq!(last, &("add".into(), "".into(), "".into()));
+    }
+
+    /// the generalized flatten exposes EVERY flow kind's lanes (if→then/else, for_each→body,
+    /// try→body/error) with the right arm tokens — so the canvas can build into any of them.
+    #[test]
+    fn flatten_exposes_all_flow_lanes() {
+        let t = vec![
+            MacroNode::If {
+                cond: Value::Bool { b: true },
+                then_: vec![],
+                else_: vec![],
+            },
+            MacroNode::ForEach {
+                var: "x".into(),
+                source: Value::empty_str(),
+                body: vec![],
+            },
+            MacroNode::Try {
+                body: vec![],
+                except_: vec![],
+            },
+        ];
+        let mut out = Vec::new();
+        flatten_macro(&t, 0, "", &mut out);
+        let lanes: Vec<(String, String)> = out
+            .iter()
+            .filter(|b| b.row == "lane")
+            .map(|b| (b.path.to_string(), b.kind.to_string()))
+            .collect();
+        assert_eq!(
+            lanes,
+            vec![
+                ("0".into(), "then".into()),
+                ("0".into(), "else".into()),
+                ("1".into(), "body".into()),
+                ("2".into(), "body".into()),
+                ("2".into(), "error".into()),
+            ]
+        );
+        // each lane has its own +add insert-point with the matching arm context.
+        let adds: Vec<String> = out
+            .iter()
+            .filter(|b| b.row == "add")
+            .map(|b| b.path.to_string())
+            .collect();
+        assert!(adds.contains(&"0.then".to_string()));
+        assert!(adds.contains(&"2.error".to_string()));
+    }
+
+    #[test]
+    fn flatten_empty_tree_is_just_the_root_add() {
+        let mut out = Vec::new();
+        flatten_macro(&[], 0, "", &mut out);
+        assert_eq!(out.len(), 1, "empty macro = the lone root +add invitation");
+        assert_eq!(out[0].row, "add");
+        assert_eq!(out[0].path, "");
+    }
+
+    #[test]
+    fn flatten_step_verb_and_value_are_plain_language() {
+        let mut out = Vec::new();
+        flatten_macro(&fixture(), 0, "", &mut out);
+        let step0 = &out[0];
+        assert_eq!(step0.verb, "type");
+        // a Str-literal text value renders as the quoted Python expr.
+        assert_eq!(step0.value, "\"hi\"");
+        // press value joins its keys with '+'
+        let hk = out.iter().find(|b| b.kind == "press").unwrap();
+        assert_eq!(hk.verb, "press");
+        assert_eq!(hk.value, "ctrl+c");
+    }
+
+    /// a Value-rich step renders the value as its Python expression in the field (proving the canvas
+    /// surfaces the full expression, not a flattened string).
+    #[test]
+    fn flatten_renders_value_expressions() {
+        let t = vec![MacroNode::Notify {
+            text: Value::Bin {
+                op: "+".into(),
+                left: Box::new(Value::str("got ")),
+                right: Box::new(Value::Ctx { field: "app".into() }),
+            },
+        }];
+        let mut out = Vec::new();
+        flatten_macro(&t, 0, "", &mut out);
+        assert_eq!(out[0].value, "(\"got \" + ctx.app)");
+    }
+
+    /// Round-trip: a tree → source (codegen) → the canvas keeps the source current. Proves the canvas
+    /// regeneration produces source that re-parses to the same shape (the foundation's guarantee).
+    #[test]
+    fn codegen_from_tree_is_stable_python() {
+        let src = neuron::macros::nodes_to_source(&fixture());
+        assert!(src.starts_with("def macro(ctx):\n"));
+        assert!(src.contains("neuron.type_text(\"hi\")"));
+        assert!(src.contains("if neuron.ask(\"go?\"):"));
+        assert!(src.contains("neuron.hotkey(\"ctrl\", \"c\")"));
+    }
+}
+

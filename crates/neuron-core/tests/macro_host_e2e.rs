@@ -20,17 +20,9 @@ fn pid_of(line: &str) -> Option<String> {
 
 #[test]
 fn macro_host_warm_persists_and_isolates_errors() {
-    // The shipped host scripts live at <repo>/runtime/host; point the runtime there regardless of
-    // the test's cwd. CARGO_MANIFEST_DIR = crates/neuron-core, so the repo root is two up.
-    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .canonicalize()
-        .expect("repo root");
-    std::env::set_var("NEURON_RUNTIME", &repo);
-    std::env::set_var("NEURON_ALLOW_SYSTEM_PYTHON", "1");
-
-    // Isolate the macros/scripts dir into a private temp cwd so we never touch the repo's.
+    // The interpreter + host scripts are BUNDLED in the binary and materialized on first use, so
+    // there's nothing to point at — just isolate the macros/scripts dir into a private temp cwd so
+    // we never touch the repo's.
     let tmp = std::env::temp_dir().join(format!("neuron_macro_host_e2e_{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
     let prev = std::env::current_dir().unwrap();
@@ -38,7 +30,7 @@ fn macro_host_warm_persists_and_isolates_errors() {
 
     let host = macro_host();
     if !host.available() {
-        eprintln!("skipping Macro Host e2e: no python runtime resolved");
+        eprintln!("skipping Macro Host e2e: bundled python runtime did not materialize");
         std::env::set_current_dir(prev).ok();
         let _ = std::fs::remove_dir_all(&tmp);
         return;

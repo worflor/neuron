@@ -97,6 +97,48 @@ pub fn sector_for(dx: f64, dy: f64, n: usize) -> usize {
     ((ang / step).round() as usize) % n
 }
 
+// ── PROMPT geometry: the ask/choose answer wheel, the radial core specialized for ANSWERING ──────
+// A macro prompt (yes/no, an N-way choose, a single confirm) is ONE engine: N options at bearings,
+// flick to commit one, no-commit = pass. It differs from the comms-wheel only in that ANSWERING needs
+// a deliberate PASS — so options anchor at WEST and own a capped arc, leaving gaps for pass. At N=2
+// that cap (90°) leaves the whole vertical axis as pass: byte-for-byte the legacy west=yes / east=no /
+// vertical=pass rule. At N≥4 the arcs tile the circle and pass narrows to the deadzone. ONE rule; the
+// simple and the rich both fall out, and `max_sectors` still bounds how many wedges stay honest.
+
+/// The screen-space bearing (radians, `atan2(dy, dx)` with dy DOWN-positive: east=0, south=+π/2,
+/// west=±π, north=−π/2) of prompt option `i` of `n`. Option 0 sits at WEST; the rest step clockwise.
+pub fn wedge_bearing(i: usize, n: usize) -> f64 {
+    std::f64::consts::PI - (i as f64) * (TAU / n.max(1) as f64)
+}
+
+/// A prompt wedge's arc width (radians) — capped at 90° so small wheels keep deliberate pass gaps,
+/// shrinking to tile the circle as `n` grows. A SINGLE option (a confirm) owns the WHOLE circle, so
+/// any committed flick confirms it — a release without a flick still passes via the deadzone.
+pub fn wedge_arc(n: usize) -> f64 {
+    if n <= 1 {
+        return TAU;
+    }
+    (TAU / n as f64).min(std::f64::consts::FRAC_PI_2)
+}
+
+/// Resolve a prompt flick `(dx, dy)` to a chosen option index, or `None` = PASS (under the deadzone,
+/// or in a gap between wedges → the macro's default). The single source of truth both the beacon
+/// verdict and the overlay highlight read, so they can never disagree. Pure + testable.
+pub fn pick_wedge(dx: f64, dy: f64, deadzone: f64, n: usize) -> Option<usize> {
+    if n == 0 || (dx * dx + dy * dy).sqrt() < deadzone {
+        return None;
+    }
+    let ang = dy.atan2(dx);
+    let half = wedge_arc(n) / 2.0;
+    (0..n).find(|&i| ang_dist(ang, wedge_bearing(i, n)) <= half)
+}
+
+/// Smallest absolute angle (radians, in `[0, π]`) between two bearings.
+fn ang_dist(a: f64, b: f64) -> f64 {
+    let d = (a - b).rem_euclid(TAU);
+    d.min(TAU - d)
+}
+
 /// The stroke's INTENT direction — attention-weighted over the WHOLE path, recency dominant.
 /// Each displacement increment is weighted by `exp(-s/τ)` where `s` is its arc distance from
 /// the stroke's END and `τ` is 30% of the total arc: the latest motion speaks loudest, the
@@ -323,5 +365,58 @@ mod tests {
         assert_eq!(m.sectors, 8);
         assert_eq!(m.label(0), "N");
         assert_eq!(m.label(4), "S");
+    }
+
+    #[test]
+    fn prompt_wheel_is_exactly_yes_no_pass_at_n2() {
+        // THE emergence proof: the N=2 prompt wheel reproduces the legacy ask rule byte-for-byte —
+        // west=yes(0), east=no(1), the whole vertical axis = pass, under-deadzone = pass.
+        let dz = 40.0;
+        assert_eq!(pick_wedge(-100.0, 0.0, dz, 2), Some(0), "west = yes");
+        assert_eq!(pick_wedge(100.0, 0.0, dz, 2), Some(1), "east = no");
+        assert_eq!(pick_wedge(0.0, -100.0, dz, 2), None, "up = pass");
+        assert_eq!(pick_wedge(0.0, 100.0, dz, 2), None, "down = pass");
+        assert_eq!(pick_wedge(6.0, -2.0, dz, 2), None, "under deadzone = pass");
+        // the legacy quadrant rule was |dx|>|dy| → commit, else pass — the 90° cap IS that rule:
+        assert_eq!(pick_wedge(-100.0, -60.0, dz, 2), Some(0), "horizontal-dominant WNW = yes");
+        assert_eq!(pick_wedge(-60.0, -100.0, dz, 2), None, "vertical-dominant NNW = pass");
+    }
+
+    #[test]
+    fn prompt_wheel_fans_out_for_more_options() {
+        let dz = 40.0;
+        // N=4: west, south, east, north — clockwise from west.
+        assert_eq!(pick_wedge(-100.0, 0.0, dz, 4), Some(0), "west");
+        assert_eq!(pick_wedge(0.0, 100.0, dz, 4), Some(1), "south");
+        assert_eq!(pick_wedge(100.0, 0.0, dz, 4), Some(2), "east");
+        assert_eq!(pick_wedge(0.0, -100.0, dz, 4), Some(3), "north");
+        // every wedge centre commits to a distinct option, for any clean N (the wheel stays honest).
+        for n in [2usize, 3, 4, 5, 6, 8] {
+            let hits: std::collections::HashSet<_> = (0..n)
+                .map(|i| {
+                    let b = wedge_bearing(i, n);
+                    pick_wedge(b.cos() * 100.0, b.sin() * 100.0, dz, n)
+                })
+                .collect();
+            assert_eq!(hits.len(), n, "N={n}: each centre picks a distinct option");
+            assert!(hits.iter().all(Option::is_some), "N={n}: every centre commits");
+        }
+    }
+
+    #[test]
+    fn single_option_confirms_on_any_committed_flick() {
+        // a 1-option prompt (confirm) owns the whole circle: any committed direction picks it, while a
+        // release under the deadzone still passes. No arbitrary "flick west to confirm".
+        let dz = 40.0;
+        for (dx, dy) in [
+            (-100.0, 0.0),
+            (100.0, 0.0),
+            (0.0, -100.0),
+            (0.0, 100.0),
+            (70.0, 70.0),
+        ] {
+            assert_eq!(pick_wedge(dx, dy, dz, 1), Some(0), "any committed flick confirms");
+        }
+        assert_eq!(pick_wedge(6.0, -2.0, dz, 1), None, "under-deadzone = pass");
     }
 }

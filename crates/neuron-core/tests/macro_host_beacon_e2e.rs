@@ -15,13 +15,8 @@ use std::time::{Duration, Instant};
 
 #[test]
 fn beacon_protocol_round_trips_without_a_gui() {
-    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .canonicalize()
-        .expect("repo root");
-    std::env::set_var("NEURON_RUNTIME", &repo);
-    std::env::set_var("NEURON_ALLOW_SYSTEM_PYTHON", "1");
+    // The interpreter + host scripts are BUNDLED in the binary and materialized on first use, so
+    // there's nothing to point at — just isolate the macros dir into a private temp cwd.
     let tmp = std::env::temp_dir().join(format!("neuron_beacon_e2e_{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
     let prev = std::env::current_dir().unwrap();
@@ -29,7 +24,7 @@ fn beacon_protocol_round_trips_without_a_gui() {
 
     let host = macro_host();
     if !host.available() {
-        eprintln!("skipping beacon e2e: no python runtime resolved");
+        eprintln!("skipping beacon e2e: bundled python runtime did not materialize");
         std::env::set_current_dir(prev).ok();
         let _ = std::fs::remove_dir_all(&tmp);
         return;
@@ -67,8 +62,10 @@ fn beacon_protocol_round_trips_without_a_gui() {
     let rx = host.beacon_events();
     let (seen_tx, seen_rx) = std::sync::mpsc::channel();
     let answerer = std::thread::spawn(move || {
-        // three scripted verdicts, in firing order: yes, no, dismiss.
-        for verdict in [Some(true), Some(false), None] {
+        // three scripted verdicts, in firing order: yes, no, dismiss. The answer wheel takes an
+        // OPTION INDEX (Option<usize>): index 0 = "yes" (-> ask True), index 1 = "no" (-> ask False),
+        // None = dismissed (-> the macro's default).
+        for verdict in [Some(0usize), Some(1usize), None] {
             loop {
                 match rx.recv_timeout(Duration::from_secs(10)) {
                     Ok(BeaconEvent::Ask {
@@ -229,7 +226,7 @@ fn beacon_protocol_round_trips_without_a_gui() {
         "both macros' prompts must be open at once: {open:?}"
     );
     for (pid, text) in &open {
-        host.answer(*pid, Some(text == "question A")); // A -> yes, B -> no
+        host.answer(*pid, Some(if text == "question A" { 0 } else { 1 })); // A -> yes(0), B -> no(1)
     }
     std::thread::sleep(Duration::from_millis(600));
     let log = host.drain_log();
@@ -262,7 +259,7 @@ fn beacon_protocol_round_trips_without_a_gui() {
             rx.recv_timeout(Duration::from_millis(250)).is_err(),
             "round {round}: a second ask leaked out while one was still open (not serial)"
         );
-        host.answer(pid, Some(false));
+        host.answer(pid, Some(1usize)); // "no"
     }
     std::thread::sleep(Duration::from_millis(600));
     let log = host.drain_log();

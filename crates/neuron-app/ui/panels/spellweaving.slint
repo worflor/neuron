@@ -153,7 +153,7 @@ export component SpellweavingPanel inherits VerticalLayout {
                     border-width: Theme.hair;
                     border-color: self.target ? Theme.accent-line : (rhyrow-ta.has-hover ? Theme.text-faint : Theme.line);
                     animate background, border-color { duration: Theme.quick; }
-                    rhyrow-ta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { State.bind-rhythm(rb.taps); } }
+                    rhyrow-ta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { if (State.rhythm-bind-target == rb.taps) { State.rhythm-bind-target = -1; } else { State.bind-rhythm(rb.taps); } } }
                     HorizontalLayout {
                         padding-left: 13px; padding-right: 9px; spacing: 11px;
                         VerticalLayout { alignment: center; width: 84px;
@@ -316,7 +316,7 @@ export component SpellweavingPanel inherits VerticalLayout {
                         border-color: self.target || self.becoming ? Theme.accent-line
                             : (gta.has-hover ? Theme.text-faint : Theme.line);
                         animate background, border-color { duration: Theme.quick; }
-                        gta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { State.bind-gesture(g.name); } }
+                        gta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { if (State.gesture-bind-target == g.name) { State.gesture-bind-target = ""; } else { State.bind-gesture(g.name); } } }
                         // the live PREDICTION reads distinctly from a steady editor selection
                         Rectangle {
                             x: 0; width: 2px; y: 6px; height: parent.height - 12px;
@@ -653,10 +653,16 @@ export component SpellweavingPanel inherits VerticalLayout {
                     nta := TouchArea {
                         mouse-cursor: MouseCursor.pointer;
                         clicked => {
-                            // wheel navigation is not edit continuation: moving the cursor off the
-                            // wedge being edited closes the stale editor instead of re-aiming it.
-                            if (State.editing-sector != i) { State.editing-sector = -1; }
-                            State.radial-preview-sector = i;
+                            // re-click the already-selected wedge → COLLAPSE (close the editor + clear the
+                            // preview wash); otherwise select it. Wheel navigation is not edit continuation:
+                            // aiming a DIFFERENT wedge closes the stale editor instead of re-aiming it.
+                            if (State.radial-preview-sector == i) {
+                                State.radial-preview-sector = -1;
+                                State.editing-sector = -1;
+                            } else {
+                                if (State.editing-sector != i) { State.editing-sector = -1; }
+                                State.radial-preview-sector = i;
+                            }
                         }
                     }
                     VerticalLayout {

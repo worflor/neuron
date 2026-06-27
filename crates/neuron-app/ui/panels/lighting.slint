@@ -1,470 +1,468 @@
 import { Theme } from "../theme.slint";
-import { Card, SectionTitle, Label, Button, Field, Mono, Divider, PanelHead, Contact, Pill, Slider, Segment } from "../widgets/controls.slint";
+import { Card, SectionTitle, Label, Button, Field, Mono, Divider, PanelHead, Contact, Pill, Slider, Segment, Toggle, SplitToggle, ColorPicker, Palette } from "../widgets/controls.slint";
 import { DeviceRender } from "../widgets/render.slint";
 import { State } from "../state.slint";
-import { EffectRow, LayerRow } from "../models.slint";
+import { EffectTile, EffectParam } from "../models.slint";
 
-// One row of the LAYERS stack — the whole row selects the layer; the lamp toggles it in the
-// composite, the arrows restack it, the ✕ removes it. The lit effect name + colour swatch read the
-// layer at a glance.
-component LayerLine inherits Rectangle {
-    in property <LayerRow> lr;
-    in property <int> index;
+// LIGHTING — ONE spatial surface. The render IS the page: the live device picture is the calm centre,
+// the truth, and the paint surface. Everything orbits it.
+//
+// The paradigm is a single GRID of live-preview TILES — visual effects AND data modes together, each
+// tile a tiny running preview of itself (the MATERIAL-card pattern). Picking a tile is one gesture: it
+// plays on the render instantly and auto-renders one control per declared param inline (the weave-TUNE
+// pattern — the effect's schema is DATA, the UI renders a control per row, zero per-effect UI code).
+//
+// Depth is spatial, not a menu. A single effect is the default (no layer ceremony). STACKING another
+// effect is an optional, visible act — a light composite strip, never an add/select/restack list.
+// PER-KEY PAINT is a brush you pick up ON the render (a gesture), never a top-level mode. There is no
+// EFFECTS/PAINT toggle and no "advanced" drawer — knobs appear by relevance, not behind a reveal.
+//
+// SPATIAL COMPOSITION: the render is the calm hero up top (centred, constrained — it never stretches
+// into a banner). Beneath it the page fills the width with TWO things side by side: the live tile
+// GALLERY (LEFT, elastic — it widens its tiles to use whatever space the window gives) and, the moment
+// a tile is picked, that effect's CONTEXTUAL controls slide in on the RIGHT (a fixed inspector column).
+// With nothing picked the inspector takes no width at all and the gallery owns the whole row — so the
+// page is a composed gallery, never a sparse one with a stranded empty third.
+
+// One TILE in the grid — a live (or representative) preview swatch + its name, the MATERIAL-card
+// pattern. `data` tiles (mouse battery) and the `stub` (notifications, future) read as first-class
+// siblings of the effects; picking any of them is the SAME gesture.
+component EffectTileCard inherits Rectangle {
+    in property <EffectTile> tile;
     in property <bool> selected;
-    callback clicked();
-    callback toggled();
-    callback up();
-    callback down();
-    callback removed();
-    height: 34px;
-    border-radius: Theme.radius-sm;
-    background: selected ? Theme.bg-2 : (ta.has-hover ? Theme.well : transparent);
+    in property <bool> dimmed;       // a stub (future) — shown, but visibly not-yet-wired
+    callback picked();
+    border-radius: Theme.radius;
+    // ACTIVE > hover > rest. The selected tile wears a clear accent ground + line; a hovered tile
+    // lifts to the well with a faint ink edge; everything else rests on the bezel plane.
+    background: root.selected ? Theme.accent-glow
+        : (ta.has-hover && !root.dimmed ? Theme.well-hi : Theme.bg-2);
     border-width: Theme.hair;
-    border-color: selected ? Theme.accent-line : Theme.line;
+    border-color: root.selected ? Theme.accent-line
+        : (ta.has-hover && !root.dimmed ? Theme.text-faint : Theme.line);
     animate background, border-color { duration: Theme.quick; }
-    ta := TouchArea { clicked => { root.clicked(); } }
-    HorizontalLayout {
-        padding-left: 8px; padding-right: 6px; spacing: 7px;
-        // enabled lamp — click to mute/unmute the layer in the composite
-        VerticalLayout {
-            alignment: center;
-            Rectangle {
-                width: 15px; height: 15px; border-radius: 3px;
-                border-width: Theme.hair;
-                border-color: root.lr.enabled ? Theme.accent-line : Theme.line;
-                background: root.lr.enabled ? Theme.accent-glow : transparent;
-                animate background, border-color { duration: Theme.quick; }
-                TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.toggled(); } }
+    clip: true;
+    opacity: root.dimmed ? 0.55 : 1.0;
+    // a hovered tile rises a hair — a tactile pickup cue, settled not bouncy
+    property <length> lift: (ta.has-hover && !root.dimmed && !root.selected) ? 1px : 0px;
+    VerticalLayout {
+        padding: 6px;
+        spacing: 6px;
+        alignment: start;
+        y: -root.lift;
+        animate y { duration: Theme.quick; }
+        // the live preview — the tile IS the effect, running (or a representative still for the stub).
+        // Bigger now (0.58 of width) so the running preview is the prominent thing, not the label.
+        Rectangle {
+            height: parent.width * 0.58;
+            border-radius: Theme.radius-sm;
+            background: Theme.bg;
+            border-width: Theme.hair;
+            // the active tile's preview gets a faint accent frame so the lit show reads as chosen
+            border-color: root.selected ? Theme.accent-line : Theme.line-soft;
+            animate border-color { duration: Theme.quick; }
+            clip: true;
+            Image {
+                source: root.tile.swatch;
+                width: parent.width; height: parent.height;
+                image-fit: fill;
             }
-        }
-        VerticalLayout {
-            alignment: center;
-            Rectangle {
-                width: 14px; height: 14px; border-radius: 3px;
-                background: root.lr.col; border-width: Theme.hair; border-color: Theme.line;
-                opacity: root.lr.enabled ? 1.0 : 0.4;
-                animate opacity { duration: Theme.quick; }
+            // a tiny corner glyph marks a DATA tile (it shows your device, not a light show)
+            if root.tile.kind == "data" : Mono {
+                text: "DATA"; color: Theme.accent-dim; font-size: Theme.fs-small;
+                x: parent.width - self.width - 5px; y: 4px;
             }
+            // removed-until-wired: the "SOON" stub-tile glyph (kind == "stub"). Restore this branch
+            // when the notifications-lighting surface ships and the stub tile returns to the catalog.
         }
         Text {
-            text: root.lr.effect;
-            color: root.lr.enabled ? (root.selected ? Theme.text : Theme.text-mid) : Theme.text-faint;
-            font-size: Theme.fs-body; font-family: Theme.mono; font-weight: 700;
-            vertical-alignment: center;
+            text: root.tile.name;
+            color: root.selected ? Theme.accent : (ta.has-hover && !root.dimmed ? Theme.text-mid : Theme.text-dim);
+            font-family: Theme.mono; font-size: Theme.fs-small; font-weight: 700;
+            letter-spacing: Theme.track-1;
             overflow: elide;
-            horizontal-stretch: 1;
+            animate color { duration: Theme.quick; }
         }
-        if root.lr.blend != "normal" : VerticalLayout { alignment: center; Mono { text: root.lr.blend; color: Theme.text-faint; } }
-        if root.lr.region-count > 0 : VerticalLayout { alignment: center; Mono { text: "▦ " + root.lr.region-count; color: Theme.text-faint; } }
-        // restack ↑↓ — index 0 is the bottom; "up" raises it in the composite
-        VerticalLayout {
-            alignment: center;
-            Text {
-                text: "↑"; color: Theme.text-faint; font-size: Theme.fs-body; font-family: Theme.mono;
-                vertical-alignment: center;
-                TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.up(); } }
-            }
-        }
-        VerticalLayout {
-            alignment: center;
-            Text {
-                text: "↓"; color: Theme.text-faint; font-size: Theme.fs-body; font-family: Theme.mono;
-                vertical-alignment: center;
-                TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.down(); } }
-            }
-        }
-        VerticalLayout {
-            alignment: center;
-            Text {
-                text: "✕"; color: Theme.text-faint; font-size: Theme.fs-small; font-family: Theme.mono;
-                vertical-alignment: center;
-                xta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.removed(); } }
-            }
-        }
+    }
+    ta := TouchArea {
+        mouse-cursor: root.dimmed ? MouseCursor.default : MouseCursor.pointer;
+        clicked => { if (!root.dimmed) { root.picked(); } }
     }
 }
 
-// EFFECT PALETTE — the effect chips as a tidy grid with FULL labels (never the old crushed, elided
-// row). Column count ADAPTS to the available width against a target chip size, so chips stay the same
-// comfortable size in BOTH the narrow ADD-LAYER column and the wide per-layer EFFECT picker — the two
-// read as one system. Pass `selected` to light the active chip (the EFFECT picker); leave it "" for the
-// ADD palette. Gaps sit only BETWEEN cells (arithmetic placement, the MATERIAL-grid pattern).
-component EffectGrid inherits Rectangle {
-    in property <[string]> effects;
-    in property <string> selected: "";        // the active effect (lights accent); "" = none (the add palette)
-    callback pick(string);
-    property <length> gap: 6px;
-    property <length> target: 104px;          // a chip's comfortable width; columns derive from it + the live width
-    property <int> cols: max(1, floor((self.width + self.gap) / (self.target + self.gap)));
-    property <length> cw: (self.width - (self.cols - 1) * self.gap) / self.cols;
-    property <length> ch: 32px;
-    property <int> rows: ceil(self.effects.length / self.cols);
-    // rows = ceil(len/cols) (Slint `/` is float, so this is a true ceiling for ANY count — never
-    // clips a non-multiple last row). max(0,…) keeps an empty grid (rows = 0, e.g. no device) from
-    // contributing a negative trailing-gap term.
-    height: self.rows * self.ch + max(0, self.rows - 1) * self.gap;
-    for et[i] in root.effects : chip := Rectangle {
-        property <bool> on: et == root.selected;
-        x: mod(i, root.cols) * (root.cw + root.gap);
-        y: floor(i / root.cols) * (root.ch + root.gap);
-        width: root.cw;
-        height: root.ch;
-        border-radius: Theme.radius-sm;
-        background: self.on ? Theme.accent-glow : (eta.has-hover ? Theme.well : Theme.bg-2);
-        border-width: Theme.hair;
-        border-color: self.on ? Theme.accent-line : (eta.has-hover ? Theme.text-faint : Theme.line);
-        animate background, border-color { duration: Theme.quick; }
-        HorizontalLayout {
-            padding-left: 8px; padding-right: 8px;
-            Text {
-                text: et;
-                color: chip.on ? Theme.accent : (eta.has-hover ? Theme.text : Theme.text-mid);
-                font-family: Theme.mono; font-size: Theme.fs-small;
-                horizontal-alignment: center; vertical-alignment: center;
-                overflow: elide;
-                animate color { duration: Theme.quick; }
+// One auto-rendered PARAM control. The effect's schema declares the row's `kind`; this renders the
+// matching control (range→slider, enum→segment, color→swatch+field, toggle→switch). Adding a knob to
+// an effect is DATA in effects::schema — never new UI here.
+component ParamControl inherits VerticalLayout {
+    in property <EffectParam> p;
+    spacing: 6px;
+    // RANGE → a labelled inline slider (label · track · readout), the weave-knobs row shape
+    if root.p.kind == "range" : HorizontalLayout {
+        spacing: 9px;
+        VerticalLayout {
+            alignment: center; width: 78px;
+            Text { text: root.p.label; color: Theme.text-dim; font-family: Theme.mono; font-size: Theme.fs-small; overflow: elide; }
+        }
+        VerticalLayout {
+            alignment: center; horizontal-stretch: 1;
+            Slider {
+                compact: true; wheel: false;
+                minimum: root.p.fmin; maximum: root.p.fmax; value: root.p.fval;
+                step: (root.p.fmax - root.p.fmin) / 100;
+                changed(v) => { State.set-param-range(root.p.key, v); }
             }
         }
-        eta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.pick(et); } }
+        VerticalLayout {
+            alignment: center; width: 40px;
+            Text {
+                text: round(root.p.fval * 100) / 100;
+                color: Theme.text-mid; font-family: Theme.mono; font-size: Theme.fs-small;
+                horizontal-alignment: right;
+            }
+        }
     }
+    // ENUM → a pick-one segment (direction, breath flavour)
+    if root.p.kind == "enum" : VerticalLayout {
+        spacing: 6px;
+        Mono { text: root.p.label; color: Theme.text-dim; }
+        Segment {
+            options: root.p.options;
+            index: root.p.ival;
+            min-seg: 52px;
+            picked(i) => { State.set-param-enum(root.p.key, i); }
+        }
+    }
+    // TOGGLE → a switch
+    if root.p.kind == "toggle" : Toggle {
+        caption: root.p.label;
+        checked: root.p.bval;
+        toggled(v) => { State.set-param-toggle(root.p.key, v); }
+    }
+    // COLOR is rendered by the page (it owns the swatch palette) — handled inline there, not here.
 }
-
-// LIGHTING — the open effects engine, render-first. The HERO is the device itself: an
-// auto-generated picture of the selected peripheral (chassis + its real LED topology) whose
-// cells are LIVE — apply an effect and the render runs it with the SAME frame math the device
-// does (a ~20Hz GUI mirror of render_frame; honest "~ live" badge because it's a reconstruction,
-// not a read-back). Two modes:
-//   EFFECTS — browse the firmware/computed banks; selecting previews+applies onto the render.
-//   PAINT   — the per-LED editor, painted DIRECTLY on the render (left paint, right erase,
-//             drag sweeps), then pushed to the device's custom-frame channel.
-// Honest accent: phosphor marks what the DEVICE is running; a hairline marks the cursor.
 
 export component LightingPanel inherits VerticalLayout {
     spacing: 0;
-    // does the currently-selected effect take a colour at all?
-    property <bool> colour-relevant: State.selected-effect < 0
-        || State.selected-effect >= State.effects.length
-        || State.effects[State.selected-effect].uses-color;
-    // the swatch palette — one source of truth (hex string drives State, colour drives the fill)
-    property <[{hex: string, col: color}]> swatches: [
-        {hex: "4AF2B0", col: #4AF2B0}, {hex: "FFFFFF", col: #FFFFFF}, {hex: "FF3B30", col: #FF3B30},
-        {hex: "FF9500", col: #FF9500}, {hex: "FFD60A", col: #FFD60A}, {hex: "30D158", col: #30D158},
-        {hex: "0A84FF", col: #0A84FF}, {hex: "BF5AF2", col: #BF5AF2},
-    ];
-    // the generator effects a layer can be — the open FrameGen set (custom-frame streamed)
-    property <[string]> effect-types: ["static", "breathing", "spectrum", "colorwheel", "wave", "fire", "starlight", "reactive", "audiometer"];
 
-    // the live mirror: while an effect is applied/animating (and the user isn't painting),
-    // re-render the frame onto the device render at ~20Hz — the same math the device runs.
+    // the curated quick swatches live ONCE in `Palette.accent` (controls.slint), shared with the SYSTEM
+    // accent picker so the two never drift — both the COLOUR ColorPicker and the PAINT swatch row use it.
+
+    // the live mirror: while an effect/data tile is active and the brush is down, re-render the frame
+    // onto the device render at the DEVICE's rate (the same math + time base the device runs) so the
+    // preview steps in the same discrete frames the keyboard does. Honest "~ live"/"preview" badge.
     Timer {
-        interval: 50ms;
-        running: !State.light-paint-mode && State.grid-rows > 0 && State.sel-can-light;   // EFFECTS = the live composite mirror
+        interval: max(33ms, 1000ms / max(1.0, State.light-fps));
+        running: !State.light-brush-on && State.sel-can-light && State.grid-rows > 0 && State.light-effect != "";
         triggered => { State.preview-tick(); }
+    }
+    // animate the GRID swatches a touch slower (each tile is a Rust-side render — cheap but not free).
+    Timer {
+        interval: 90ms;
+        running: State.sel-can-light && State.grid-rows > 0;
+        triggered => { State.tile-preview-tick(); }
     }
 
     PanelHead {
         label: "LIGHTING";
-        caption: State.selected-device-name + " · layered effect studio — the matrix previews the composite you build";
-        // the write kill-switch surfaces here too (animate/push gate on it — say why they're dead)
+        caption: State.selected-device-name;
         if State.writes-paused : VerticalLayout { alignment: center; Pill { text: "WRITES PAUSED"; tint: Theme.danger; } }
-        VerticalLayout { width: 8px; }
-        VerticalLayout {
-            width: 184px;   // size to the two contacts so the segment doesn't balloon across the head
-            alignment: center;
-            HorizontalLayout {
-                spacing: 4px;
-                Contact {
-                    label: "EFFECTS";
-                    active: !State.light-paint-mode;
-                    clicked => { State.light-paint-mode = false; }
-                }
-                Contact {
-                    label: "PAINT";
-                    active: State.light-paint-mode;
-                    clicked => { State.light-paint-mode = true; }
-                }
-            }
-        }
     }
     Rectangle { height: Theme.hair; background: Theme.line; }
     Rectangle { height: Theme.lead-in; }
 
-    // ── HERO: the device itself, lit live ─────────────────────────────────
-    // honest empty state: no lit device selected -> a dim chassis ghost, no fake LEDs. Same height
-    // as the live render so connecting a device doesn't jump the whole page 100px.
-    // a NON-lighting channel (a mic/output, or any device with no [lighting] block) has no RGB to
-    // tune — say so plainly instead of showing the previously-selected device's stale matrix.
+    // ── no-lighting empty states — honest, terse, real info ───────────────
     if !State.sel-can-light : Rectangle {
-        height: 320px;
-        background: Theme.bg-2;
-        border-radius: Theme.radius;
+        height: 300px;
+        background: Theme.bg-2; border-radius: Theme.radius;
         border-width: Theme.hair; border-color: Theme.line;
         VerticalLayout {
-            alignment: center;
-            spacing: 6px;
+            alignment: center; spacing: 6px;
             Mono {
                 text: State.selected-device-name == "—" ? "no device selected" : State.selected-device-name + " has no lighting";
                 color: Theme.text-dim; horizontal-alignment: center;
             }
             Mono {
-                text: State.selected-device-name == "—" ? "connect a Razer device, or pick a channel on DEVICE"
-                    : "this channel has no addressable RGB — pick a keyboard or mouse on DEVICE to tune lighting";
+                text: State.selected-device-name == "—" ? "pick a Razer device on DEVICE"
+                    : "no addressable RGB on this channel — pick a keyboard or mouse on DEVICE";
                 color: Theme.text-faint; horizontal-alignment: center; wrap: word-wrap;
             }
         }
     }
     if State.sel-can-light && State.grid-rows == 0 : Rectangle {
-        height: 320px;
-        background: Theme.bg-2;
-        border-radius: Theme.radius;
+        height: 300px;
+        background: Theme.bg-2; border-radius: Theme.radius;
         border-width: Theme.hair; border-color: Theme.line;
         VerticalLayout {
-            alignment: center;
-            spacing: 6px;
+            alignment: center; spacing: 6px;
             Mono { text: "no lit device selected"; color: Theme.text-dim; horizontal-alignment: center; }
             Mono { text: "connect one, or pick another channel on DEVICE"; color: Theme.text-faint; horizontal-alignment: center; }
         }
     }
+
+    // ── THE SURFACE: render hero (centred) → gallery + contextual inspector ─
     if State.sel-can-light && State.grid-rows > 0 : VerticalLayout {
-        spacing: 6px;
-        HorizontalLayout {
-            Mono {
-                text: State.selected-device-name + " · " + State.grid-rows + " × " + State.grid-cols + " led";
-                color: Theme.text-faint;
-                overflow: elide;            // a long device name yields before colliding with the badge
-                horizontal-stretch: 1;
-            }
-            // honest about WHAT this is: ~ on the device only while we're streaming; otherwise it's a
-            // local preview of the composite — never a read-back of the device's current lighting.
-            if State.compositing : Mono {
-                text: "~ live on device";
-                color: Theme.accent-dim;
-            }
-            if !State.compositing && !State.light-paint-mode && !State.light-region-edit : Mono {
-                text: "preview only · not on your device";
-                color: Theme.text-faint;
-            }
-            if State.light-region-edit : Mono {
-                text: "paint the selected layer's region · L add · R remove";
-                color: Theme.accent;
-            }
-            if State.light-paint-mode : Mono {
-                text: "L paint · R erase · drag sweeps";
-                color: Theme.text-faint;
-            }
-        }
-        DeviceRender {
-            height: 280px;
-            rows: State.grid-rows;
-            cols: State.grid-cols;
-            px: State.grid-px;
-            kind: State.grid-kind;
-            editable: State.light-paint-mode || State.light-region-edit;
-            paint(i) => {
-                if (State.light-region-edit) { State.paint-region(i); }
-                else { State.paint-cell(i); }
-            }
-            erase(i) => {
-                if (State.light-region-edit) { State.erase-region(i); }
-                else { State.erase-cell(i); }
-            }
-        }
-    }
-    Rectangle { height: Theme.lead-in; }
+        spacing: Theme.lead-in;
 
-    // ── below the render: EFFECTS = the layer COMPOSITOR · PAINT = the per-LED editor ──────
-    if !State.light-paint-mode && State.sel-can-light : HorizontalLayout {
-        spacing: Theme.gap-col;
-        // ── the LAYERS stack — add · restack · mute · remove · apply ──────
+        // ── HERO: the render, centred + constrained so it stays a calm SUBJECT, not a banner. ──
         VerticalLayout {
-            width: 330px;
-            spacing: 8px;
+            alignment: start;
+            spacing: 7px;
+            // status strip — the device geometry on the left, the honest "what this is" on the right.
             HorizontalLayout {
-                SectionTitle { text: "LAYERS"; }
-                Rectangle {}
-                Mono { text: State.light-layers.length + (State.light-layers.length == 1 ? " layer" : " layers"); color: Theme.text-faint; }
-            }
-            for lr[i] in State.light-layers : LayerLine {
-                lr: lr;
-                index: i;
-                selected: i == State.selected-layer;
-                clicked => { State.select-layer(i); }
-                toggled => { State.toggle-layer(i); }
-                up => { State.move-layer(i, 1); }
-                down => { State.move-layer(i, -1); }
-                removed => { State.remove-layer(i); }
-            }
-            if State.light-layers.length == 0 : VerticalLayout {
-                padding-top: 6px; padding-bottom: 2px; spacing: 6px;
-                Mono { text: "no layers yet"; color: Theme.text-dim; }
                 Mono {
-                    text: "Neuron isn't driving this device's lighting — and it can't read another app's live theme (no per-LED read-back). pick an effect below to author your own.";
+                    text: State.selected-device-name + " · " + State.grid-rows + " × " + State.grid-cols + " led";
                     color: Theme.text-faint;
-                    wrap: word-wrap;
+                    overflow: elide; horizontal-stretch: 1;
                 }
-            }
-            Divider {}
-            Mono { text: "ADD LAYER"; color: Theme.text-dim; }
-            // the ADD palette — the shared EffectGrid with no selection (clicking ADDS that effect)
-            EffectGrid {
-                effects: root.effect-types;
-                pick(et) => { State.add-layer(et); }
-            }
-            // bring a Synapse theme across — we parse .ChromaEffects directly (frame → PAINT, effect → layer)
-            HorizontalLayout {
-                spacing: 7px;
-                Button { text: "import .ChromaEffects"; clicked => { State.import-light-file(); } }
-                Rectangle {}
-            }
-            Rectangle { height: 2px; }
-            HorizontalLayout {
-                spacing: 7px;
-                Button {
-                    text: State.compositing ? "restart" : "apply live";
-                    primary: true;
-                    enabled: State.light-layers.length > 0 && !State.writes-paused;
-                    clicked => { State.composite-apply(); }
+                if State.compositing : Mono { text: "~ live on device"; color: Theme.accent-dim; }
+                if !State.compositing && !State.light-brush-on && State.light-effect != "" : Mono {
+                    text: "preview only"; color: Theme.text-faint;
                 }
-                Button { text: "stop"; danger: true; enabled: State.compositing; clicked => { State.composite-stop(); } }
-                Rectangle {}
+                if State.light-brush-on : Mono { text: "brush down · L paint · R erase · drag sweeps"; color: Theme.accent; }
+            }
+            // the render itself — capped to a comfortable subject width and centred on the void so it
+            // reads as the page's calm subject instead of stretching edge-to-edge into a banner.
+            HorizontalLayout {
+                alignment: center;
+                Rectangle {
+                    width: min(parent.width, 760px);
+                    height: 280px;
+                    DeviceRender {
+                        width: 100%; height: 100%;
+                        rows: State.grid-rows;
+                        cols: State.grid-cols;
+                        px: State.grid-px;
+                        kind: State.grid-kind;
+                        editable: State.light-brush-on;
+                        paint(i) => { State.paint-cell(i); }
+                        erase(i) => { State.erase-cell(i); }
+                    }
+                }
             }
         }
 
-        // ── the SELECTED LAYER editor ────────────────────────────────────
-        VerticalLayout {
-            horizontal-stretch: 1;
-            spacing: 13px;
-            if State.selected-layer < 0 || State.selected-layer >= State.light-layers.length : VerticalLayout {
-                padding-top: 8px;
-                Mono { text: "select a layer to tune its effect, colour, motion, blend and region"; color: Theme.text-faint; wrap: word-wrap; }
-            }
-            if State.selected-layer >= 0 && State.selected-layer < State.light-layers.length : VerticalLayout {
-                spacing: 13px;
-                property <LayerRow> sel: State.light-layers[State.selected-layer];
-                // EFFECT — the same palette grid as ADD LAYER, with this layer's active effect lit accent
-                EffectGrid {
-                    effects: root.effect-types;
-                    selected: sel.effect;
-                    pick(et) => { State.set-layer-effect(State.selected-layer, et); }
+        // ── GALLERY + INSPECTOR — fills the width. The gallery is elastic (it widens its tiles to
+        // use the room); the inspector slides in only once a tile is picked, and takes no width at
+        // all when nothing is — so the empty page is a full-width gallery, never a stranded third. ──
+        HorizontalLayout {
+            spacing: State.light-effect == "" ? 0px : Theme.gap-col;
+
+            // ── the ONE grid of live-preview tiles (effects + data + stub) ──
+            VerticalLayout {
+                horizontal-stretch: 1;
+                spacing: 11px;
+                HorizontalLayout {
+                    SectionTitle { text: "EFFECTS & DATA"; }
+                    Rectangle {}
+                    Button { text: "import .ChromaEffects"; clicked => { State.import-light-file(); } }
                 }
-                // COLOUR — only effects that read it
-                if sel.uses-color : VerticalLayout {
+                // the grid — a RESPONSIVE column count (the tiles stay a comfortable size and the row
+                // adds columns as the window widens), arithmetic placement (the MATERIAL-grid pattern).
+                tilegrid := Rectangle {
+                    property <length> gap: 9px;
+                    // aim ~150px wide tiles; clamp the column count to 3..6 so they never get tiny on a
+                    // wide window nor cramped on a narrow one.
+                    property <int> cols: clamp(floor((self.width + self.gap) / (150px + self.gap)), 3, 6);
+                    property <length> cw: (self.width - (self.cols - 1) * self.gap) / self.cols;
+                    property <length> th: self.cw * 0.58 + 42px;   // preview (0.58 of width) + name row + padding
+                    property <int> nrows: ceil(State.light-tiles.length / self.cols);
+                    height: self.nrows * self.th + max(0, self.nrows - 1) * self.gap;
+                    for t[i] in State.light-tiles : EffectTileCard {
+                        tile: t;
+                        selected: t.slug == State.light-effect;
+                        dimmed: t.kind == "stub";
+                        x: mod(i, tilegrid.cols) * (tilegrid.cw + tilegrid.gap);
+                        y: floor(i / tilegrid.cols) * (tilegrid.th + tilegrid.gap);
+                        width: tilegrid.cw;
+                        height: tilegrid.th;
+                        picked => { State.pick-tile(t.slug); }
+                    }
+                }
+            }
+
+            // ── the active tile's CONTEXTUAL controls — a fixed inspector column that appears the
+            // instant a tile is picked (the page coming alive in place). No width when nothing's on. ──
+            if State.light-effect != "" : VerticalLayout {
+                width: 332px;
+                horizontal-stretch: 0;
+                spacing: 14px;
+
+                // RATE — the streamed effect's frame pacing. Drives BOTH the live device stream AND
+                // this preview, so what you see steps at the keyboard's TRUE rate. Gated to EFFECT
+                // mode: a DATA readout paints on-demand, so it has no rate to tune.
+                if !State.light-is-data : VerticalLayout {
+                    spacing: 6px;
+                    HorizontalLayout {
+                        SectionTitle { text: "RATE"; }
+                        Rectangle {}
+                        Mono { text: round(State.light-fps) + " fps"; color: Theme.text-mid; }
+                    }
+                    Slider {
+                        compact: true; wheel: false;
+                        minimum: 1; maximum: 30; step: 1;
+                        value: State.light-fps;
+                        changed(v) => { State.set-light-fps(v); }
+                    }
+                    if State.light-fps-legacy : Mono {
+                        text: "legacy board · ~6 fps before frames drop";
+                        color: Theme.text-faint; wrap: word-wrap;
+                    }
+                }
+
+                // COLOUR — only when the active effect declares a colour knob (default = weave accent).
+                // The SHARED prism-based ColorPicker (same component the SYSTEM page uses for its accents):
+                // a swatch / hex Enter COMMITS via set-param-color, and dragging the PRISM (or typing)
+                // fires `preview` — also set-param-color — so the running effect RECOLOURS live as you
+                // drag, the render updating in real time before you ever release.
+                if State.light-uses-color : VerticalLayout {
                     spacing: 9px;
                     SectionTitle { text: "COLOUR"; }
-                    HorizontalLayout {
-                        spacing: 9px;
-                        Rectangle { width: 30px; height: 30px; border-radius: Theme.radius-sm; border-width: Theme.hair; border-color: Theme.line; background: sel.col; }
-                        Field {
-                            field-width: 120px;
-                            placeholder: "4AF2B0";
-                            text: sel.color;
-                            edited(t) => { State.set-layer-color(State.selected-layer, t); }
-                        }
-                        Rectangle {}
-                    }
-                    HorizontalLayout {
-                        spacing: 6px;
-                        for sw in root.swatches : Rectangle {
-                            width: 24px; height: 24px; border-radius: Theme.radius-sm;
-                            border-width: Theme.hair;
-                            border-color: sw.hex == sel.color ? Theme.accent-line : (cswta.has-hover ? Theme.text-faint : Theme.line-soft);
-                            background: sw.col;
-                            animate border-color { duration: Theme.quick; }
-                            cswta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { State.set-layer-color(State.selected-layer, sw.hex); } }
-                        }
-                        Rectangle {}
+                    ColorPicker {
+                        current: State.light-color-col;
+                        value: State.light-color-hex;
+                        swatches: Palette.accent;
+                        pick(h) => { State.set-param-color(h); }
+                        preview(h) => { State.set-param-color(h); }   // live recolour while dragging the prism
                     }
                 }
-                if !sel.uses-color : Mono { text: sel.effect + " generates its own colour"; color: Theme.text-faint; }
-                // MOTION — speed (and direction for directional effects)
-                Slider {
-                    caption: "SPEED";
-                    minimum: 0.25; maximum: 4.0; value: sel.speed; step: 0.05; unit: "×";
-                    changed(v) => { State.set-layer-speed(State.selected-layer, v); }
-                }
-                if sel.directional : VerticalLayout {
-                    spacing: 6px;
-                    Mono { text: "DIRECTION"; color: Theme.text-dim; }
-                    Segment {
-                        options: ["→", "←", "↑", "↓"];
-                        index: sel.direction;
-                        min-seg: 48px;
-                        picked(i) => { State.set-layer-direction(State.selected-layer, i); }
-                    }
-                }
-                // BLEND
-                VerticalLayout {
-                    spacing: 6px;
-                    Mono { text: "BLEND with the layers beneath"; color: Theme.text-dim; }
-                    Segment {
-                        options: ["normal", "add", "screen"];
-                        index: sel.blend == "add" ? 1 : (sel.blend == "screen" ? 2 : 0);
-                        min-seg: 84px;
-                        picked(i) => { State.set-layer-blend(State.selected-layer, i == 1 ? "add" : (i == 2 ? "screen" : "normal")); }
-                    }
-                }
-                // REGION — paint which cells the layer covers
-                VerticalLayout {
-                    spacing: 6px;
-                    Mono { text: "REGION"; color: Theme.text-dim; }
-                    HorizontalLayout {
-                        spacing: 8px;
-                        Button {
-                            text: State.light-region-edit ? "done" : "paint region";
-                            primary: State.light-region-edit;
-                            clicked => { State.light-region-edit = !State.light-region-edit; }
-                        }
-                        VerticalLayout { alignment: center; Mono { text: sel.region-count == 0 ? "whole device" : sel.region-count + " cells"; color: Theme.text-faint; } }
-                        Rectangle {}
-                        Button { text: "whole device"; enabled: sel.region-count > 0; clicked => { State.clear-layer-region(State.selected-layer); } }
-                    }
-                }
-            }
-        }
-    }
-    // ── PAINT — the per-LED frame editor (a distinct authoring mode) ──────
-    if State.light-paint-mode && State.sel-can-light : HorizontalLayout {
-        spacing: Theme.gap-col;
-        VerticalLayout {
-            horizontal-stretch: 1;
-            spacing: 12px;
-            VerticalLayout {
-                spacing: 9px;
-                SectionTitle { text: "BRUSH"; }
-                HorizontalLayout {
+
+                // TUNE — the rest of the schema's knobs, auto-rendered (range/enum/toggle). A data tile
+                // (mouse battery) declares none, so this whole block simply doesn't appear — honest.
+                if State.light-params.length > 0 : VerticalLayout {
                     spacing: 9px;
-                    Rectangle { width: 30px; height: 30px; border-radius: Theme.radius-sm; border-width: Theme.hair; border-color: Theme.line; background: State.brush-color; }
-                    Field {
-                        field-width: 120px;
-                        placeholder: "4AF2B0";
-                        text: State.light-color;
-                        invalid: !State.light-color-valid;
-                        edited(t) => { State.light-color = t; State.color-changed(t); }
+                    SectionTitle { text: "TUNE"; }
+                    for cp in State.light-params : VerticalLayout {
+                        // skip colour (rendered above); render every other declared param
+                        if cp.kind != "color" : ParamControl { p: cp; }
                     }
-                    Rectangle {}
                 }
+                // a data tile is honest about being a readout, not a tunable light show
+                if State.light-params.length == 0 && !State.light-uses-color : Mono {
+                    text: "a live DATA surface — it paints your device's vitals, no knobs.";
+                    color: Theme.text-faint; wrap: word-wrap;
+                }
+
+                Divider {}
+
+                // ── STACK — the optional spatial composite (light, not a list) ──
+                VerticalLayout {
+                    spacing: 8px;
+                    HorizontalLayout {
+                        SectionTitle { text: "STACK"; }
+                        Rectangle {}
+                        Mono {
+                            text: State.light-stack-count <= 1 ? "single" : State.light-stack-count + " layers";
+                            color: Theme.text-faint;
+                        }
+                    }
+                    // the composite strip — one cell per stacked effect, bottom→top left→right. The
+                    // active cell is lit; tapping a cell makes it the active effect (knobs follow); ✕ drops it.
+                    if State.light-stack-count > 1 : HorizontalLayout {
+                        spacing: 6px;
+                        for li in State.light-stack-count : cell := Rectangle {
+                            property <bool> on: li == State.selected-layer;
+                            height: 30px; min-width: 60px; horizontal-stretch: 1;
+                            border-radius: Theme.radius-sm;
+                            background: cell.on ? Theme.accent-glow : (sta.has-hover ? Theme.well-hi : Theme.bg-2);
+                            border-width: Theme.hair;
+                            border-color: cell.on ? Theme.accent-line : (sta.has-hover ? Theme.text-faint : Theme.line);
+                            animate background, border-color { duration: Theme.quick; }
+                            HorizontalLayout {
+                                padding-left: 9px; padding-right: 7px; spacing: 5px;
+                                VerticalLayout {
+                                    alignment: center; horizontal-stretch: 1;
+                                    Mono { text: "L" + (li + 1); color: cell.on ? Theme.accent : Theme.text-mid; }
+                                }
+                                VerticalLayout {
+                                    alignment: center;
+                                    Text {
+                                        text: "✕";
+                                        color: xta.has-hover ? Theme.danger : Theme.text-faint;
+                                        font-family: Theme.mono; font-size: Theme.fs-small;
+                                        vertical-alignment: center;
+                                        animate color { duration: Theme.quick; }
+                                        xta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { State.remove-stack(li); } }
+                                    }
+                                }
+                            }
+                            sta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { State.select-stack(li); } }
+                        }
+                    }
+                    Button {
+                        text: "+ stack this effect";
+                        clicked => { State.stack-current(); }
+                    }
+                }
+
+                Divider {}
+
+                // ── PAINT — a brush you pick up ON the render (a gesture, not a mode) ──
+                VerticalLayout {
+                    spacing: 9px;
+                    HorizontalLayout {
+                        SectionTitle { text: "PAINT"; }
+                        Rectangle {}
+                        Button {
+                            text: State.light-brush-on ? "put brush down" : "pick up brush";
+                            primary: State.light-brush-on;
+                            clicked => { State.toggle-brush(); }
+                        }
+                    }
+                    if State.light-brush-on : VerticalLayout {
+                        spacing: 9px;
+                        HorizontalLayout {
+                            spacing: 9px;
+                            Rectangle {
+                                width: 30px; height: 30px; border-radius: Theme.radius-sm;
+                                border-width: Theme.hair; border-color: Theme.line;
+                                background: State.brush-color;
+                            }
+                            Field {
+                                field-width: 120px;
+                                placeholder: "4AF2B0";
+                                text: State.light-color;
+                                invalid: !State.light-color-valid;
+                                edited(t) => { State.light-color = t; State.color-changed(t); }
+                            }
+                            Rectangle {}
+                        }
+                        HorizontalLayout {
+                            spacing: 6px;
+                            for sw in Palette.accent : Rectangle {
+                                width: 26px; height: 26px; border-radius: Theme.radius-sm;
+                                border-width: Theme.hair;
+                                border-color: sw.hex == State.light-color ? Theme.accent-line : (pswta.has-hover ? Theme.text-faint : Theme.line-soft);
+                                background: sw.col;
+                                animate border-color { duration: Theme.quick; }
+                                pswta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { State.light-color = sw.hex; State.color-changed(sw.hex); } }
+                            }
+                            Rectangle {}
+                        }
+                        HorizontalLayout {
+                            spacing: 7px;
+                            Button { text: "fill"; clicked => { State.fill-grid(); } }
+                            Button { text: "clear"; danger: true; clicked => { State.clear-grid(); } }
+                            Button { text: "push frame"; primary: true; enabled: !State.writes-paused; clicked => { State.push-painted(); } }
+                            Rectangle {}
+                        }
+                    }
+                }
+
+                Divider {}
+
+                // ── APPLY — push the live surface to the device ──
                 HorizontalLayout {
-                    spacing: 6px;
-                    for sw in root.swatches : Rectangle {
-                        width: 24px; height: 24px; border-radius: Theme.radius-sm;
-                        border-width: Theme.hair;
-                        border-color: sw.hex == State.light-color ? Theme.accent-line : (pswta.has-hover ? Theme.text-faint : Theme.line-soft);
-                        background: sw.col;
-                        animate border-color { duration: Theme.quick; }
-                        pswta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { State.light-color = sw.hex; State.color-changed(sw.hex); } }
+                    spacing: 7px;
+                    Button {
+                        text: State.compositing ? "restart" : "apply live";
+                        primary: true;
+                        enabled: !State.writes-paused;
+                        clicked => { State.composite-apply(); }
                     }
+                    Button { text: "stop"; danger: true; enabled: State.compositing; clicked => { State.composite-stop(); } }
                     Rectangle {}
                 }
             }
-            HorizontalLayout {
-                spacing: 7px;
-                Button { text: "fill"; clicked => { State.fill-grid(); } }
-                Button { text: "clear"; danger: true; clicked => { State.clear-grid(); } }
-                Button { text: "import .ChromaEffects"; clicked => { State.import-light-file(); } }
-                Button { text: "push frame"; primary: true; enabled: !State.writes-paused; clicked => { State.push-frame(); } }
-                Rectangle {}
-            }
-            Rectangle {}
         }
     }
 }

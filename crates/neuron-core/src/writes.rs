@@ -451,33 +451,46 @@ pub fn set_idle_secs(d: &Device, secs: u32) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------------------------
-// 2c. IN-GAME POLLING RATE — Synapse `InGamePollingRate` (separate wired vs dongle rates).
-//     Polling class 0x00 (set_polling = 0x00/0x05). The dual-rate variant (0x00/0x06, DERIVED)
-//     carries [wired_div, dongle_div]; verify-gated + hardware-flagged.
+// 2c. HYPERPOLLING (hi-res polling, >1000Hz) — the EXTENDED rate path.
+//     Polling class 0x00. The proven legacy REPORT RATE (≤1000Hz) is `capability::set_polling_hz`
+//     (0x00/0x05). THIS is the EXTENDED HyperPolling command:
+//       SET 0x00/0x40 (data_size 2, args=[0x00, bitmask]); GET 0x00/0xC0.
+//     bitmask: 8000→0x01 4000→0x02 2000→0x04 1000→0x08 500→0x10 250→0x20 125→0x40 (OpenRazer polling2).
+//
+//     RE FINDING (HIGH confidence, OpenRazer): the OLD opcode here (0x00/0x06) was a NONEXISTENT
+//     command (the device times out on it). 0x00/0x40 is the real one. BUT OpenRazer routes the Naga
+//     V2 Pro (PID 0x00A8) to the LEGACY path — capped at 1000Hz over its stock dongle. Only the
+//     separate HyperPolling Wireless Dongle (PID 0x00B3) + Viper-8K-class mice take the extended path,
+//     so on the Naga 2000–8000Hz simply cannot work. The caller gates this on an extended-PID
+//     allowlist (`sel-can-hyperpoll`); this write stays ENV-gated (`NEURON_INGAME_POLL_WRITE`) too
+//     because we can't confirm the round-trip without a 0x00B3 puck.
 // ---------------------------------------------------------------------------------------------
 
 const CLASS_POLLING: u8 = 0x00;
-const ID_INGAME_POLL_GET: u8 = 0x86;
-const ID_INGAME_POLL_SET: u8 = 0x06;
-const INGAME_POLL_SIZE: u8 = 0x02;
+/// EXTENDED HyperPolling getter (hi-res rate read). Reply `args[0]` = the rate bitmask.
+const ID_HYPERPOLL_GET: u8 = 0xC0;
+/// EXTENDED HyperPolling setter (hi-res rate write). args = `[0x00, bitmask]`.
+const ID_HYPERPOLL_SET: u8 = 0x40;
+const HYPERPOLL_SET_SIZE: u8 = 0x02;
+const HYPERPOLL_GET_SIZE: u8 = 0x01;
 
-/// Independent gate for the DERIVED dual-rate in-game polling write. Off by default; the
-/// `ingame-poll-write` Cargo feature or `NEURON_INGAME_POLL_WRITE` env opens it. The plain
-/// single-rate `set_polling` (0x00/0x05) is proven and lives in `capability`; THIS is the
-/// wired-vs-dongle split, which is the unconfirmed part.
+/// Independent gate for the EXTENDED HyperPolling write. Off by default; the `ingame-poll-write`
+/// Cargo feature or `NEURON_INGAME_POLL_WRITE` env opens it. The plain single-rate `set_polling`
+/// (0x00/0x05, ≤1000Hz) is proven and lives in `capability`; THIS is the >1000Hz path, which we
+/// can't confirm without a HyperPolling dongle (PID 0x00B3).
 pub fn ingame_poll_write_enabled() -> bool {
     cfg!(feature = "ingame-poll-write") || std::env::var_os("NEURON_INGAME_POLL_WRITE").is_some()
 }
 
 pub(crate) fn ingame_poll_write_disabled_message() -> &'static str {
-    "in-game (wired/dongle) polling write is gated off (set opcode 0x00/0x06 not yet \
-     hardware-verified). Set NEURON_INGAME_POLL_WRITE=1 to enable, then verify the 0x00/0x86 \
-     round-trip on an awake mouse. (Integration: promote to an `ingame-poll-write` Cargo feature.) \
-     The plain single-rate `capability::set_polling_hz` (0x00/0x05) is proven if you only need one rate."
+    "HyperPolling (hi-res >1000Hz) write is gated off (extended opcode 0x00/0x40 needs a HyperPolling \
+     dongle, PID 0x00B3, to confirm). Set NEURON_INGAME_POLL_WRITE=1 to enable, then verify the \
+     0x00/0xC0 bitmask round-trip on extended hardware. (Integration: promote to an `ingame-poll-write` \
+     Cargo feature.) The plain single-rate `capability::set_polling_hz` (0x00/0x05) is proven up to 1000Hz."
 }
 
 /// Map a polling rate in Hz to the Razer divisor byte (1=1000, 2=500, 4=250, 8=125). Same snapping
-/// as `capability::set_polling_hz`. Pure & unit-testable.
+/// as `capability::set_polling_hz`. The LEGACY (≤1000Hz, 0x00/0x05) encoding. Pure & unit-testable.
 pub fn polling_divisor(hz: u32) -> u8 {
     match hz {
         h if h >= 1000 => 1,
@@ -487,72 +500,240 @@ pub fn polling_divisor(hz: u32) -> u8 {
     }
 }
 
-/// Build the in-game (dual-rate) polling SET payload: `[wired_div, dongle_div]`. Pure & testable.
-pub fn build_in_game_polling_payload(wired_hz: u32, dongle_hz: u32) -> Vec<u8> {
-    vec![polling_divisor(wired_hz), polling_divisor(dongle_hz)]
+/// Map a polling rate in Hz to the EXTENDED HyperPolling bitmask byte (OpenRazer polling2):
+/// 8000→0x01, 4000→0x02, 2000→0x04, 1000→0x08, 500→0x10, 250→0x20, 125→0x40. An unrecognised rate
+/// snaps DOWN to the nearest supported tier (so a stray value never writes an undefined bitmask).
+/// Pure & unit-testable.
+pub fn hyperpoll_bitmask(hz: u32) -> u8 {
+    match hz {
+        h if h >= 8000 => 0x01,
+        h if h >= 4000 => 0x02,
+        h if h >= 2000 => 0x04,
+        h if h >= 1000 => 0x08,
+        h if h >= 500 => 0x10,
+        h if h >= 250 => 0x20,
+        _ => 0x40,
+    }
 }
 
-/// Write the in-game (wired vs dongle) polling rates, GATED + verify-gated + hardware-flagged.
+/// Build the EXTENDED HyperPolling SET payload: `[0x00, bitmask]` (the 0x00/0x40 command). Pure &
+/// testable. The leading `0x00` is the fixed arg0; the bitmask is [`hyperpoll_bitmask`] of the rate.
+pub fn build_in_game_polling_payload(hz: u32) -> Vec<u8> {
+    vec![0x00, hyperpoll_bitmask(hz)]
+}
+
+/// Write the EXTENDED HyperPolling (hi-res >1000Hz) rate, GATED + verify-gated + hardware-flagged.
 ///
-/// CONFIDENCE: single-rate polling (0x00/0x05) is proven; the SEPARATE wired/dongle pair is a
-/// Synapse feature (`InGamePollingRate`, GUID 8997620a) whose opcode (0x00/0x06) is *derived* and
-/// UNCONFIRMED. Gated by [`ingame_poll_write_enabled`]; `verify_getter` re-reads 0x00/0x86 and
-/// confirms the two divisor bytes echo back.
+/// CONFIDENCE: the OLD opcode (0x00/0x06) was NONEXISTENT (timed out); 0x00/0x40 is the OpenRazer-
+/// confirmed extended command (HIGH confidence). It is a SINGLE device-wide hi-res rate (the prior
+/// "wired vs dongle split" was the wrong 0x06 model), so the wired tier is the rate written — the
+/// `dongle_hz` arg is kept for call-site compatibility and ignored. Gated by
+/// [`ingame_poll_write_enabled`] (we can't confirm without a 0x00B3 dongle); `verify_getter` re-reads
+/// 0x00/0xC0 and confirms the bitmask echoes back, so a wrong opcode errors rather than "working".
 ///
-/// HARDWARE-VERIFY: set `NEURON_INGAME_POLL_WRITE=1`, write distinct wired/dongle rates on an awake
-/// mouse, re-read 0x00/0x86 and confirm the `[wired_div, dongle_div]` echo. Adjust if it doesn't.
-pub fn set_in_game_polling(d: &Device, wired_hz: u32, dongle_hz: u32) -> Result<()> {
-    let payload = build_in_game_polling_payload(wired_hz, dongle_hz);
+/// HARDWARE-VERIFY: on a HyperPolling dongle (PID 0x00B3) / Viper-8K-class mouse, set
+/// `NEURON_INGAME_POLL_WRITE=1`, write a hi-res rate, re-read 0x00/0xC0 and confirm the bitmask echo.
+pub fn set_in_game_polling(d: &Device, wired_hz: u32, _dongle_hz: u32) -> Result<()> {
+    let payload = build_in_game_polling_payload(wired_hz);
     if !ingame_poll_write_enabled() {
         bail!(ingame_poll_write_disabled_message());
     }
     ensure_driver(d);
     d.exec_dynamic(
         CLASS_POLLING,
-        ID_INGAME_POLL_SET,
-        INGAME_POLL_SIZE,
+        ID_HYPERPOLL_SET,
+        HYPERPOLL_SET_SIZE,
         &payload,
     )
-    .map_err(|e| anyhow::anyhow!("in-game polling write (0x00/0x06) was not accepted: {e}"))?;
+    .map_err(|e| anyhow::anyhow!("HyperPolling write (0x00/0x40) was not accepted: {e}"))?;
+    // The getter reflects only the bitmask byte; verify it at args[0].
     verify_getter(
         d,
         CLASS_POLLING,
-        ID_INGAME_POLL_GET,
-        INGAME_POLL_SIZE,
+        ID_HYPERPOLL_GET,
+        HYPERPOLL_GET_SIZE,
         0,
-        &payload,
+        &[payload[1]],
     )?;
     Ok(())
 }
 
 // ---------------------------------------------------------------------------------------------
-// 2e. LIFT-OFF DISTANCE & DEBOUNCE — "feel" controls with NO known opcode.
-//     These are real sensor/switch tuning knobs the GUI's feel controls want, but UNLIKE the
-//     DPI/idle/polling writes above there is no proven OR derivable read for them on this hardware
-//     (no class/id observed in any discover/probe sweep; not in the decoded Synapse exports). We do
-//     NOT fabricate an opcode — that would be a blind write to an unknown register on the user's
-//     device, exactly what the safety gates forbid. Honest `bail!`-stubs with a clear RE TODO so a
-//     GUI caller surfaces "[unsupported — needs RE]" rather than silently doing the wrong thing.
+// 2e. LIFT-OFF DISTANCE & DEBOUNCE — sensor/switch "feel" controls.
+//     LIFT-OFF DISTANCE is now a REAL verify-gated write (symmetric low/med/high), reverse-engineered
+//     from razerctl and cross-checked against OpenRazer (HIGH confidence). DEBOUNCE still has no
+//     proven OR derivable opcode on this hardware, so it stays an honest `bail!`-stub.
 // ---------------------------------------------------------------------------------------------
 
-/// Set the sensor LIFT-OFF DISTANCE (how high the mouse can be raised before it stops tracking),
-/// in millimetres (typically 1mm or 2mm on Razer sensors). HONEST STUB — no opcode known.
+/// Sensor lift-off-distance class (the Razer "sensor config" class). SET = 0x0B/0x0B (symmetric LOD),
+/// GET = 0x0B/0x85. razerctl-derived, OpenRazer-cross-checked. Note this is the SAME class byte as
+/// HyperScroll (CLASS_HYPERSCROLL above) — the class is shared; the id distinguishes the command.
+const CLASS_SENSOR: u8 = 0x0B;
+const ID_LOD_SET: u8 = 0x0B;
+const ID_LOD_GET: u8 = 0x85;
+/// SET payload size for symmetric LOD: `[0x00, 0x04, 0x01, level]` (4 bytes).
+const LOD_SET_SIZE: u8 = 0x04;
+/// GET payload size for LOD: a 1-byte request; the reply carries `[.., .., mode, level, ..]`.
+const LOD_GET_SIZE: u8 = 0x01;
+/// The "symmetric" LOD mode byte the getter reports at `args[2]` (vs the asymmetric lift/landing mode).
+const LOD_MODE_SYMMETRIC: u8 = 0x01;
+/// The "asymmetric" (separate lift vs landing) mode byte the getter reports at `args[2]`.
+const LOD_MODE_ASYMMETRIC: u8 = 0x04;
+
+// ── ASYMMETRIC lift-off (separate LIFT vs LANDING) — the Focus-Pro-30K flex. Same class 0x0B as
+// symmetric, but a 3-step handshake: enable async (0x0B/0x03) → step2 (0x0B/0x0B) → set lift+landing
+// (0x0B/0x05). razerctl-derived (HIGH confidence on the bytes); the Naga V2 Pro shares the Focus Pro
+// 30K sensor, and the SHARED 0x0B/0x85 read-back is the safety net (HARDWARE-CONFIRMED for symmetric).
+const ID_LOD_ASYNC_ENABLE: u8 = 0x03;
+const ID_LOD_ASYNC_STEP2: u8 = 0x0B;
+const ID_LOD_ASYNC_SET: u8 = 0x05;
+/// SET payload size for the async enable step: `[0x00, 0x04, 0x01]` (3 bytes).
+const LOD_ASYNC_ENABLE_SIZE: u8 = 0x03;
+/// SET payload size for the async step2 / set-lift-landing steps: 4 bytes.
+const LOD_ASYNC_SET_SIZE: u8 = 0x04;
+/// LIFT (lift-off) level range when asymmetric: 2..=26 (written as `value - 1` on the wire).
+const LOD_LIFT_MIN: u8 = 2;
+const LOD_LIFT_MAX: u8 = 26;
+/// LANDING level range when asymmetric: 1..=25 (written as `value - 1` on the wire).
+const LOD_LAND_MIN: u8 = 1;
+const LOD_LAND_MAX: u8 = 25;
+
+/// Set the sensor LIFT-OFF DISTANCE (how high the mouse can be raised before it stops tracking) to a
+/// symmetric `level`: 0 = low, 1 = medium, 2 = high. Verify-gated (no env gate).
 ///
-/// CONFIDENCE: NONE yet. Unlike DPI/idle/polling, lift-off distance has no observed getter in any
-/// `discover`/`probe` sweep of the Naga and does not appear in the decoded `.synapse3` exports, so
-/// there is no read to invert into a verify-gated write. Razer's LOD control is believed to live on
-/// the sensor-config class, but the exact class/id + payload are UNKNOWN. Refusing here (rather than
-/// guessing a register) is the safe posture — a wrong blind write could disturb the sensor config.
+/// CONFIDENCE: HARDWARE-CONFIRMED on the Naga V2 Pro (2026-06 — `low` and `high` both written and the
+/// 0x0B/0x85 read-back echoed each). razerctl-derived, cross-checked vs OpenRazer. The getter
+/// read-back is the safety net: a wrong write (or a device lacking the sensor class) returns an error,
+/// never a false success — so this needs no env flag (same trust tier as `set_dpi_stages`).
 ///
-/// TODO (RE): capture one USBPcap of Synapse's mouse "Calibration / Lift-off distance" control
-/// changing LOD, recover the {class, id, payload(mm or raw)} encoding, then implement this exactly
-/// like [`set_idle_secs`] — driver-mode -> volatile -> read-back verify — and drop this stub.
-pub fn set_lift_off_distance(_d: &Device, _mm: u8) -> Result<()> {
-    bail!(
-        "lift-off-distance write is unsupported: no opcode known for this device (no getter observed \
-         in discover/probe, absent from Synapse exports). NOT faked. TODO: USBPcap-capture Synapse's \
-         Lift-off-distance control to recover the {{class,id,payload}}, then implement verify-gated like set_idle_secs."
+/// PROTOCOL (symmetric LOD — args[2] = 0x01 is the "even" mode):
+/// * SET: `class=0x0B, id=0x0B, data_size=0x04, args=[0x00, 0x04, 0x01, level]`, `level ∈ {0,1,2}`.
+/// * GET: `class=0x0B, id=0x85, data_size=0x01`; reply `args[2]` = mode (0x01 = symmetric),
+///   `args[3]` = level. So we verify the getter echoes `[0x01, level]` at byte 2.
+///
+/// This is the SYMMETRIC ("even") path; the SPLIT (separate lift vs landing) path is
+/// [`set_lift_off_asymmetric`] — writing symmetric here also flips the device back OUT of async mode
+/// (args[2] returns to 0x01), so this doubles as the "back to even" setter.
+pub fn set_lift_off_distance(d: &Device, level: u8) -> Result<()> {
+    if writes_paused() {
+        bail!("[writes paused]");
+    }
+    let lvl = level.min(2);
+    ensure_driver(d);
+    d.exec_dynamic(CLASS_SENSOR, ID_LOD_SET, LOD_SET_SIZE, &[0x00, 0x04, 0x01, lvl])
+        .map_err(|e| anyhow::anyhow!("lift-off-distance write (0x0B/0x0B) was not accepted: {e}"))?;
+    verify_getter(
+        d,
+        CLASS_SENSOR,
+        ID_LOD_GET,
+        LOD_GET_SIZE,
+        2,
+        &[LOD_MODE_SYMMETRIC, lvl],
+    )?;
+    Ok(())
+}
+
+/// Read the device's current symmetric LIFT-OFF DISTANCE level (0 = low / 1 = medium / 2 = high) —
+/// the read side of [`set_lift_off_distance`], proven via the same 0x0B/0x85 getter the write
+/// verifies against. Reads are never gated.
+///
+/// If the device reports the symmetric mode (`args[2] == 0x01`) we return `args[3]` (the level). If
+/// it reports the ASYMMETRIC lift/landing mode instead, there is no single symmetric level to show,
+/// so we fall back to `0` (treat as low) for the symmetric readout. Use [`lift_off_async`] to read the
+/// split lift/landing pair when the device is in async mode.
+pub fn lift_off_distance(d: &Device) -> Result<u8> {
+    let args = d.exec_dynamic(CLASS_SENSOR, ID_LOD_GET, LOD_GET_SIZE, &[])?;
+    if args[2] == LOD_MODE_SYMMETRIC {
+        Ok(args[3])
+    } else {
+        Ok(0)
+    }
+}
+
+/// Read the device's ASYMMETRIC lift-off pair `(lift, landing)` when it is in async (split) mode, via
+/// the SHARED 0x0B/0x85 getter. Returns `Some((lift, landing))` only when the getter reports the
+/// asymmetric mode (`args[2] == 0x04`); `None` when symmetric / unreadable / asleep. Reads are never
+/// gated. The wire stores `value-1`, so we add 1 back to recover the user-facing level (lift 2..=26,
+/// landing 1..=25). The companion to [`lift_off_distance`] (which reads the symmetric level).
+pub fn lift_off_async(d: &Device) -> Option<(u8, u8)> {
+    let args = d.exec_dynamic(CLASS_SENSOR, ID_LOD_GET, LOD_GET_SIZE, &[]).ok()?;
+    if args[2] == LOD_MODE_ASYMMETRIC {
+        Some((args[4].saturating_add(1), args[5].saturating_add(1)))
+    } else {
+        None
+    }
+}
+
+/// Set the sensor lift-off distance ASYMMETRICALLY — separate LIFT (lift-off) and LANDING distances,
+/// the Focus-Pro-30K-class flex. Verify-gated (no env gate); `writes_paused`-guarded.
+///
+/// CONFIDENCE: razerctl-derived (HIGH confidence on the byte sequence). The Naga V2 Pro shares the
+/// Focus Pro 30K sensor with the mice razerctl was reversed against, and the SHARED 0x0B/0x85
+/// read-back — the same getter symmetric LOD is HARDWARE-CONFIRMED against on this Naga — is the safety
+/// net: if the device doesn't echo `mode=async, lift, landing`, this returns an error rather than a
+/// false success (same trust tier as `set_dpi_stages` / `set_lift_off_distance`).
+///
+/// PROTOCOL (all class 0x0B, tx 0x1f via `exec_dynamic`):
+/// 1. ENABLE async:  `id=0x03, size=3, args=[0x00, 0x04, 0x01]`
+/// 2. STEP2:         `id=0x0B, size=4, args=[0x00, 0x04, 0x04, 0x00]`
+/// 3. SET lift+land: `id=0x05, size=4, args=[0x00, 0x04, lift-1, landing-1]`
+///    (LIFT range 2..=26, LANDING range 1..=25 — abstract level indices, NOT mm; written as value-1.)
+/// Then VERIFY by reading the shared getter `0x0B/0x85 size 1` once and confirming
+/// `args[2]==0x04 && args[4]==lift-1 && args[5]==landing-1`. (To go BACK to even/symmetric, call
+/// [`set_lift_off_distance`], which writes args[2]=0x01 — or send the documented disable-async
+/// `id=0x03, size=3, args=[0x00, 0x04, 0x40]` first; a symmetric SET already flips the mode back.)
+pub fn set_lift_off_asymmetric(d: &Device, lift: u8, landing: u8) -> Result<()> {
+    if writes_paused() {
+        bail!("[writes paused]");
+    }
+    let lift = lift.clamp(LOD_LIFT_MIN, LOD_LIFT_MAX);
+    let landing = landing.clamp(LOD_LAND_MIN, LOD_LAND_MAX);
+    ensure_driver(d);
+
+    // 1) enable async.
+    d.exec_dynamic(
+        CLASS_SENSOR,
+        ID_LOD_ASYNC_ENABLE,
+        LOD_ASYNC_ENABLE_SIZE,
+        &[0x00, 0x04, 0x01],
     )
+    .map_err(|e| anyhow::anyhow!("async-LOD enable (0x0B/0x03) was not accepted: {e}"))?;
+    // 2) step2.
+    d.exec_dynamic(
+        CLASS_SENSOR,
+        ID_LOD_ASYNC_STEP2,
+        LOD_ASYNC_SET_SIZE,
+        &[0x00, 0x04, 0x04, 0x00],
+    )
+    .map_err(|e| anyhow::anyhow!("async-LOD step2 (0x0B/0x0B) was not accepted: {e}"))?;
+    // 3) set lift + landing (each level written as value-1).
+    d.exec_dynamic(
+        CLASS_SENSOR,
+        ID_LOD_ASYNC_SET,
+        LOD_ASYNC_SET_SIZE,
+        &[0x00, 0x04, lift - 1, landing - 1],
+    )
+    .map_err(|e| anyhow::anyhow!("async-LOD set (0x0B/0x05) was not accepted: {e}"))?;
+
+    // VERIFY via the shared getter. `verify_getter` only checks a CONTIGUOUS slice, but the mode
+    // (args[2]) and the lift/landing pair (args[4], args[5]) are non-contiguous, so do a manual read
+    // + explicit checks and error clearly on any mismatch — the write is never silently trusted.
+    let got = d
+        .exec_dynamic(CLASS_SENSOR, ID_LOD_GET, LOD_GET_SIZE, &[])
+        .map_err(|e| anyhow::anyhow!("read-back of 0x0B/0x85 (async LOD) failed: {e}"))?;
+    let (want_lift, want_land) = (lift - 1, landing - 1);
+    if got[2] != LOD_MODE_ASYMMETRIC || got[4] != want_lift || got[5] != want_land {
+        bail!(
+            "VERIFY FAILED on async LOD (0x0B/0x85): wrote mode=04 lift={:02X} landing={:02X} but \
+             device reports mode={:02X} lift={:02X} landing={:02X} — write NOT trusted",
+            want_lift,
+            want_land,
+            got[2],
+            got[4],
+            got[5],
+        );
+    }
+    Ok(())
 }
 
 /// Set the switch DEBOUNCE time (the de-bounce window that rejects mechanical switch chatter / double
@@ -570,6 +751,114 @@ pub fn set_debounce_ms(_d: &Device, _ms: u8) -> Result<()> {
          discover/probe, absent from Synapse exports). NOT faked. TODO: USBPcap-capture Synapse's \
          Debounce control to recover the {{class,id,payload}}, then implement verify-gated like set_idle_secs."
     )
+}
+
+// ---------------------------------------------------------------------------------------------
+// 2f. SNAP TAP (SOCD resolution) — the "mechanical advantage". A Synapse-4-era keyboard feature
+//     that resolves opposing key-pairs (e.g. A vs D) to the LAST pressed (instant counter-strafe,
+//     no stall). Decoded by OpenRazer issue #2754: SET class 0x02 / id 0x27, GET id 0xA7,
+//     data_size 0x0F, up to 4 SOCD key-pairs. It HAS a getter (0xA7) → verify-gatable like
+//     `set_idle_secs`. Env-gated (`NEURON_SNAP_TAP_WRITE`) until confirmed on a supporting board —
+//     the user's BlackWidow Chroma V2 (2017, PID 0x0221) predates the feature and cannot do it.
+// ---------------------------------------------------------------------------------------------
+
+/// Snap Tap (SOCD) class + ids — OpenRazer #2754. SET 0x02/0x27, GET 0x02/0xA7, payload 0x0F bytes.
+const CLASS_SNAP_TAP: u8 = 0x02;
+const ID_SNAP_TAP_SET: u8 = 0x27;
+const ID_SNAP_TAP_GET: u8 = 0xA7;
+/// Snap Tap payload size (0x0F = 15): `[enable, count, {key_a, key_b} * 4 (8 bytes), pad..]`.
+const SNAP_TAP_SIZE: u8 = 0x0F;
+/// Up to four SOCD key-pairs fit the 0x0F-byte report (1 enable + 1 count + 4*2 pair bytes = 10).
+const SNAP_TAP_MAX_PAIRS: usize = 4;
+/// HID usage IDs for the default counter-strafe pair — `A` (0x04) and `D` (0x07), USB HID keyboard
+/// usage page. The default SOCD pair Synapse seeds for counter-strafing.
+pub const SNAP_TAP_KEY_A: u8 = 0x04;
+pub const SNAP_TAP_KEY_D: u8 = 0x07;
+
+/// One SOCD key-pair: two HID usage IDs whose opposing presses resolve to the last pressed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SnapTapPair {
+    /// First key's HID usage ID (e.g. 0x04 = `A`).
+    pub a: u8,
+    /// Second key's HID usage ID (e.g. 0x07 = `D`).
+    pub b: u8,
+}
+
+impl SnapTapPair {
+    /// The default counter-strafe pair, `A`/`D`.
+    pub fn ad() -> Self {
+        SnapTapPair {
+            a: SNAP_TAP_KEY_A,
+            b: SNAP_TAP_KEY_D,
+        }
+    }
+}
+
+/// Whether the Snap Tap (SOCD) device-write path is enabled. Off by default; the `snap-tap-write`
+/// Cargo feature or the `NEURON_SNAP_TAP_WRITE` env var opens it. The builder + verify path are
+/// always compiled & tested; only the device write is gated — and only on a board that actually
+/// supports the feature (the UI gates that with a supported-PID allowlist; here we won't fire blind).
+pub fn snap_tap_write_enabled() -> bool {
+    cfg!(feature = "snap-tap-write") || std::env::var_os("NEURON_SNAP_TAP_WRITE").is_some()
+}
+
+pub(crate) fn snap_tap_write_disabled_message() -> &'static str {
+    "Snap Tap (SOCD) write is gated off (Synapse-4-era feature; the user's BlackWidow Chroma V2 \
+     can't do it, and the class 0x02/0x27 layout from OpenRazer #2754 needs confirming on a \
+     supporting board). Set NEURON_SNAP_TAP_WRITE=1 on a V4-class keyboard to enable, then verify \
+     the 0x02/0xA7 round-trip. (Integration: promote to a `snap-tap-write` Cargo feature.)"
+}
+
+/// Build the Snap Tap (SOCD) SET payload from a list of key-pairs — OpenRazer #2754's layout:
+/// `[enable, count, {key_a, key_b} * count, 0-pad to SNAP_TAP_SIZE]`. `enable` is 0/1; `count` is
+/// how many pairs follow. Pure (no I/O) so the byte layout is unit-testable with the write gated off.
+/// An empty pair list writes `enable=0, count=0` (the "disable Snap Tap" payload).
+pub fn build_snap_tap_payload(pairs: &[SnapTapPair], enable: bool) -> Result<Vec<u8>> {
+    if pairs.len() > SNAP_TAP_MAX_PAIRS {
+        bail!(
+            "too many Snap Tap pairs: {} (the 0x0F report holds at most {SNAP_TAP_MAX_PAIRS})",
+            pairs.len()
+        );
+    }
+    let mut buf = vec![0u8; SNAP_TAP_SIZE as usize];
+    let on = enable && !pairs.is_empty();
+    buf[0] = on as u8;
+    buf[1] = if on { pairs.len() as u8 } else { 0 };
+    if on {
+        for (i, p) in pairs.iter().enumerate() {
+            buf[2 + i * 2] = p.a;
+            buf[2 + i * 2 + 1] = p.b;
+        }
+    }
+    Ok(buf)
+}
+
+/// Write the Snap Tap (SOCD) key-pair config, GATED + verify-gated. Off by default: refuses unless
+/// [`snap_tap_write_enabled`] (the user's Chroma V2 can't do it, and the layout still needs live
+/// confirmation on a supporting board). `writes_paused`-guarded like the other live writes.
+///
+/// CONFIDENCE: the {class 0x02, SET id 0x27, GET id 0xA7, size 0x0F, up-to-4 pairs} layout is from
+/// OpenRazer issue #2754 (MEDIUM confidence — decoded, not yet round-tripped here). Because it has a
+/// getter (0xA7), it IS verify-gatable: `verify_getter` re-reads 0x02/0xA7 and confirms the
+/// `[enable, count, pairs..]` we wrote echo back, so a wrong layout errors rather than "working".
+///
+/// HARDWARE-VERIFY: on a Snap-Tap-capable keyboard (BlackWidow V4 Pro/TKL, Huntsman V3), set
+/// `NEURON_SNAP_TAP_WRITE=1`, write the A/D pair, then re-read 0x02/0xA7 and confirm the echo. If it
+/// doesn't echo, the layout/opcode is wrong — adjust [`build_snap_tap_payload`] and re-verify.
+pub fn set_snap_tap(d: &Device, pairs: &[SnapTapPair], enable: bool) -> Result<()> {
+    if writes_paused() {
+        bail!("[writes paused]");
+    }
+    let payload = build_snap_tap_payload(pairs, enable)?;
+    if !snap_tap_write_enabled() {
+        bail!(snap_tap_write_disabled_message());
+    }
+    ensure_driver(d);
+    d.exec_dynamic(CLASS_SNAP_TAP, ID_SNAP_TAP_SET, SNAP_TAP_SIZE, &payload)
+        .map_err(|e| anyhow::anyhow!("Snap Tap write (0x02/0x27) was not accepted: {e}"))?;
+    // The getter echoes the same [enable, count, pairs..] layout; verify the whole written body.
+    verify_getter(d, CLASS_SNAP_TAP, ID_SNAP_TAP_GET, SNAP_TAP_SIZE, 0, &payload)?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1012,10 +1301,25 @@ mod tests {
     }
 
     #[test]
-    fn in_game_polling_payload_pairs_divisors() {
-        // wired 1000Hz (div 1), dongle 500Hz (div 2).
-        assert_eq!(build_in_game_polling_payload(1000, 500), vec![0x01, 0x02]);
-        assert_eq!(build_in_game_polling_payload(125, 1000), vec![0x08, 0x01]);
+    fn hyperpoll_bitmask_maps_extended_tiers() {
+        // OpenRazer polling2 encoding: higher Hz = lower bit. Unrecognised rates snap DOWN.
+        assert_eq!(hyperpoll_bitmask(8000), 0x01);
+        assert_eq!(hyperpoll_bitmask(4000), 0x02);
+        assert_eq!(hyperpoll_bitmask(2000), 0x04);
+        assert_eq!(hyperpoll_bitmask(1000), 0x08);
+        assert_eq!(hyperpoll_bitmask(500), 0x10);
+        assert_eq!(hyperpoll_bitmask(250), 0x20);
+        assert_eq!(hyperpoll_bitmask(125), 0x40);
+        assert_eq!(hyperpoll_bitmask(60), 0x40, "below the floor snaps to 125Hz");
+        assert_eq!(hyperpoll_bitmask(3000), 0x04, "between tiers snaps DOWN to 2000Hz");
+    }
+
+    #[test]
+    fn in_game_polling_payload_is_extended_bitmask() {
+        // The 0x00/0x40 command: [0x00, bitmask]. 8000Hz -> 0x01, 1000Hz -> 0x08.
+        assert_eq!(build_in_game_polling_payload(8000), vec![0x00, 0x01]);
+        assert_eq!(build_in_game_polling_payload(1000), vec![0x00, 0x08]);
+        assert_eq!(build_in_game_polling_payload(125), vec![0x00, 0x40]);
     }
 
     #[test]
@@ -1059,6 +1363,56 @@ mod tests {
         set_writes_paused(false);
         assert!(!writes_paused());
         set_writes_paused(saved);
+    }
+
+    #[test]
+    fn snap_tap_payload_layout_default_ad_pair() {
+        // OpenRazer #2754: [enable, count, {a, b} * count, pad]. The default A/D counter-strafe pair.
+        let p = build_snap_tap_payload(&[SnapTapPair::ad()], true).unwrap();
+        assert_eq!(p.len(), SNAP_TAP_SIZE as usize, "buffer is the full 0x0F report");
+        assert_eq!(p[0], 0x01, "enable");
+        assert_eq!(p[1], 0x01, "one pair");
+        assert_eq!(&p[2..4], &[SNAP_TAP_KEY_A, SNAP_TAP_KEY_D], "A=0x04, D=0x07");
+        assert!(p[4..].iter().all(|&b| b == 0), "remainder zero-padded");
+    }
+
+    #[test]
+    fn snap_tap_payload_disable_zeroes_pairs() {
+        // enable=false (or an empty list) writes the OFF payload: [0, 0, 0..] — never a stray pair.
+        let off = build_snap_tap_payload(&[SnapTapPair::ad()], false).unwrap();
+        assert_eq!(off[0], 0x00, "disabled");
+        assert_eq!(off[1], 0x00, "no pairs counted when disabled");
+        assert!(off[2..].iter().all(|&b| b == 0));
+        let empty = build_snap_tap_payload(&[], true).unwrap();
+        assert_eq!(empty[0], 0x00, "an empty pair list is the disable payload");
+        assert_eq!(empty[1], 0x00);
+    }
+
+    #[test]
+    fn snap_tap_payload_packs_multiple_pairs() {
+        let pairs = [
+            SnapTapPair { a: 0x04, b: 0x07 }, // A / D
+            SnapTapPair { a: 0x1A, b: 0x16 }, // W / S
+        ];
+        let p = build_snap_tap_payload(&pairs, true).unwrap();
+        assert_eq!(p[1], 2, "two pairs");
+        assert_eq!(&p[2..6], &[0x04, 0x07, 0x1A, 0x16]);
+    }
+
+    #[test]
+    fn snap_tap_payload_rejects_overflow() {
+        // The 0x0F report holds at most 4 pairs.
+        let many = vec![SnapTapPair::ad(); 5];
+        assert!(build_snap_tap_payload(&many, true).is_err());
+    }
+
+    #[test]
+    fn snap_tap_write_gated_off_by_default() {
+        // Default build: no env, no feature -> the device write is gated off (the safe posture). The
+        // BUILDER above still works + is tested; only the device-write boundary is held.
+        std::env::remove_var("NEURON_SNAP_TAP_WRITE");
+        #[cfg(not(feature = "snap-tap-write"))]
+        assert!(!snap_tap_write_enabled());
     }
 
     #[test]

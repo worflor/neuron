@@ -42,6 +42,9 @@ export global Theme {
     // Two restrained status hues — ONLY true alarm/caution states, never layout.
     out property <color> warn:        #f2b34a;  // battery low / caution / gated-but-armed
     out property <color> danger:      #f25a6b;  // paused / disarmed / fail / danger
+    // a middle "caution" amber-orange, sitting between warn and danger — for a graded scale that
+    // wants a third rung (e.g. the maturity-tier badge: warn → caution → danger as it drops).
+    out property <color> caution:     #d2733a;  // warmer/redder than warn, not yet alarm
     // the status hues at hairline / wash strength — frames + grounds for caution/alarm cells
     // (mirrors the accent-line / accent-glow pair, so a failed probe reads like a lit-but-bad station)
     out property <color> warn-line:   #f2b34a45;
@@ -49,6 +52,8 @@ export global Theme {
     out property <color> danger-glow: #f25a6b1a;
     // the dim poured behind a modal overlay (one value for every sheet — was d8 vs cc)
     out property <color> scrim:       #000000d8;
+    // a LIGHTER scrim — focuses a dropdown / popover (catches outside clicks) without a full blackout
+    out property <color> scrim-soft:  #0000006e;
 
     // ── type — monospace is the default; data is the hero ────────────────
     // Headers are SMALL and quiet (a panel label, not a swooshy display word). No 72px hero.

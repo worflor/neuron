@@ -423,6 +423,75 @@ enum LightingCmd {
         #[arg(long)]
         store: bool,
     },
+    /// CROSS-DEVICE DATA SURFACE — paint the MOUSE's live vitals (battery / charge / active DPI
+    /// stage) onto the KEYBOARD's LED matrix. One process speaking BOTH devices: the mouse is the
+    /// data source, the keyboard the sink. Loops ~1s, repainting (on-demand, ACK'd) only when the
+    /// state changes. Runs until ESC unless `--seconds N` is given.
+    Mirror {
+        /// stop after N seconds (default: run until ESC)
+        #[arg(long)]
+        seconds: Option<u64>,
+    },
+    /// HARDWARE RE-VERIFY the key map: walk the keyboard key by key (reading order), lighting ONLY
+    /// each key's mapped cell in a bright accent so you can confirm the LIT key matches its printed
+    /// name — and flag any that don't, for a map correction. Uses the ACK'd on-demand custom-frame
+    /// paint (not streaming). Prints `lighting: <KEY> (row N, col M)` per key; ESC stops early.
+    Keytest {
+        /// keyboard PID (hex); default = the BlackWidow Chroma V2 (0221)
+        #[arg(long, default_value = "0221")]
+        pid: String,
+        /// how long to hold each key lit, in milliseconds
+        #[arg(long, default_value_t = 700)]
+        dwell: u64,
+        /// accent colour as RRGGBB (default: a bright cyan)
+        #[arg(long)]
+        color: Option<String>,
+    },
+    /// REVERSE-ENGINEER wide-key LED footprints: walk EVERY cell of the matrix — (row, col) for row
+    /// in 0..rows, col in 0..cols, INCLUDING the unmapped "gap" cells the keymap/keytest skip — and
+    /// light ONLY that one cell in a bright accent via the ACK'd on-demand custom-frame paint (not
+    /// streaming). Note which cells a wide key (space, shift, enter, backspace) physically spans, so
+    /// you can map real footprints from hardware truth. Prints `cell (row N, col M)` per cell; ESC
+    /// stops early; clears the board at the end.
+    Cellsweep {
+        /// keyboard PID (hex); default = the BlackWidow Chroma V2 (0221)
+        #[arg(long, default_value = "0221")]
+        pid: String,
+        /// how long to hold each cell lit, in milliseconds
+        #[arg(long, default_value_t = 500)]
+        dwell: u64,
+        /// sweep ONLY this row (0-based) instead of the whole matrix — e.g. scan row 5 for the space bar
+        #[arg(long)]
+        row: Option<u8>,
+        /// accent colour as RRGGBB (default: a bright cyan)
+        #[arg(long)]
+        color: Option<String>,
+    },
+    /// BLOCK-VERIFY a wide key's span: light a CONTIGUOUS BLOCK of cells (row N, colA..=colB) ALL AT
+    /// ONCE and HOLD, so you can confirm on hardware which cells a wide key physically covers. Paints
+    /// every cell in the block simultaneously via the ACK'd on-demand custom-frame paint (not
+    /// streaming), prints `lit: row N, cols A..=B (K cells)`, holds (ESC-interruptible, or `--seconds`),
+    /// then clears. E.g. `neuron lighting cells --row 5 --from 4 --to 10` lights exactly the space bar.
+    Cells {
+        /// the row to light (0-based)
+        #[arg(long)]
+        row: u8,
+        /// first column of the block, inclusive (0-based)
+        #[arg(long)]
+        from: u8,
+        /// last column of the block, inclusive (0-based)
+        #[arg(long)]
+        to: u8,
+        /// keyboard PID (hex); default = the BlackWidow Chroma V2 (0221)
+        #[arg(long, default_value = "0221")]
+        pid: String,
+        /// block colour as RRGGBB (default: a bright cyan)
+        #[arg(long)]
+        color: Option<String>,
+        /// hold for N seconds (default: hold until ESC)
+        #[arg(long)]
+        seconds: Option<u64>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1221,6 +1290,24 @@ fn lighting_cmd(reg: &Registry, action: Option<LightingCmd>) -> Result<()> {
             emulate,
             store,
         ),
+        Some(LightingCmd::Mirror { seconds }) => lighting_mirror(reg, seconds),
+        Some(LightingCmd::Keytest { pid, dwell, color }) => {
+            lighting_keytest(reg, &pid, dwell, color.as_deref())
+        }
+        Some(LightingCmd::Cellsweep {
+            pid,
+            dwell,
+            row,
+            color,
+        }) => lighting_cellsweep(reg, &pid, dwell, row, color.as_deref()),
+        Some(LightingCmd::Cells {
+            row,
+            from,
+            to,
+            pid,
+            color,
+            seconds,
+        }) => lighting_cells(reg, &pid, row, from, to, color.as_deref(), seconds),
     }
 }
 
@@ -1264,8 +1351,347 @@ fn lighting_run(
         "streaming '{name}' on {} — {seconds}s @ {fps}fps (open-effects engine)...",
         def.name
     );
-    lights.animate(&mut *generator, color, fps, seconds, || false)?;
+    lights.animate(&mut *generator, color, || fps as u32, seconds, || false)?;
     println!("done.");
+    Ok(())
+}
+
+/// Read the mouse's current active DPI stage as (active_idx 0-based, stage_count). The active stage
+/// is the reply to the GET dpi-stages command `0x04/0x86` (`dpi_stages_active`): `args[1]` is the
+/// active index, `args[2]` the count — live-confirmed. Falls back to `dpi_stages` (0x04/0x83) if the
+/// user-configured-stage getter isn't present. Returns None if neither answers (e.g. asleep mouse).
+fn read_active_dpi_stage(d: &Device) -> Option<(u8, u8)> {
+    let s = d
+        .run("dpi_stages_active")
+        .or_else(|_| d.run("dpi_stages"))
+        .ok()?;
+    let active = decode_dpi_active(&s).unwrap_or(0);
+    let count = decode_dpi_stages(&s).len() as u8;
+    Some((active, count))
+}
+
+/// Read the mouse's full live vitals: battery %, charging, and the active DPI stage. Each read is
+/// independent + best-effort — a wireless mouse can be asleep, so a failed sub-read falls back to the
+/// last known value rather than aborting the whole surface.
+fn read_mouse_vitals(d: &Device, last: Option<lighting::Vitals>) -> lighting::Vitals {
+    let prev = last.unwrap_or(lighting::Vitals {
+        battery_pct: 0,
+        charging: false,
+        active_stage: 0,
+        stage_count: 0,
+    });
+    let battery_pct = cap::battery_percent(d).unwrap_or(prev.battery_pct);
+    let charging = cap::charging(d).unwrap_or(prev.charging);
+    let (active_stage, stage_count) =
+        read_active_dpi_stage(d).unwrap_or((prev.active_stage, prev.stage_count));
+    lighting::Vitals {
+        battery_pct,
+        charging,
+        active_stage,
+        stage_count,
+    }
+}
+
+/// CROSS-DEVICE DATA SURFACE — the on-thesis flagship. neuron is ONE process speaking BOTH the Naga
+/// (data SOURCE) and the BlackWidow (data SINK), so it can paint the mouse's live battery / charge /
+/// active-DPI-stage onto the keyboard's LED matrix — a cross-device layer Synapse (siloed) and
+/// OpenRazer (no cross-device layer) structurally cannot do.
+///
+/// The loop runs at ~1s cadence: read the mouse vitals -> render the vitals frame (`render_vitals`,
+/// the SAME reusable core the GUI will call) -> paint it to the keyboard via the ACK'd custom-frame
+/// path (`Lights::paint` -> `apply_lighting`), NOT the fast stream. The slow legacy V2 is repainted
+/// ON-DEMAND — only when the vitals changed (or, while charging, each tick so the cyan sweep animates).
+fn lighting_mirror(reg: &Registry, seconds: Option<u64>) -> Result<()> {
+    use std::time::{Duration, Instant};
+
+    // SINK: the keyboard — the first custom-frame-capable lit device. (lit_devices yields every lit
+    // device; we want one that can paint a per-LED frame, which is the keyboard's legacy matrix.)
+    let (kbd_def, kbd_pid) = lit_devices(reg)?
+        .into_iter()
+        .find(|(d, _)| d.lighting.as_ref().unwrap().custom_frame.is_some())
+        .ok_or_else(|| {
+            anyhow::anyhow!("no custom-frame-capable lit device found (is the keyboard connected?)")
+        })?;
+    let kbd_l = kbd_def.lighting.clone().unwrap();
+    let (rows, cols) = (kbd_l.rows, kbd_l.cols);
+    let kbd = Device::open(kbd_def.clone(), kbd_pid)?;
+    let lights = lighting::Lights::new(&kbd, kbd_l);
+    lights.ensure_control()?; // take host control of the keyboard (driver mode) once.
+
+    // SOURCE: the mouse — the first device exposing the battery getter. Handle it being absent/asleep
+    // gracefully: without it we can't mirror, so report clearly instead of painting a phantom surface.
+    let mouse = open_with_command(reg, "battery_level").map_err(|e| {
+        anyhow::anyhow!(
+            "no battery-capable mouse found to mirror from ({e}). The keyboard ({}) is ready as the \
+             sink — connect/wake the Naga and re-run.",
+            kbd_def.name
+        )
+    })?;
+
+    println!(
+        "MIRROR — painting {} vitals onto {} ({rows}x{cols} matrix). ~1s cadence; {}.",
+        mouse.def.name,
+        kbd_def.name,
+        match seconds {
+            Some(n) => format!("{n}s then stop"),
+            None => "ESC to stop".into(),
+        }
+    );
+
+    let start = Instant::now();
+    let mut last: Option<lighting::Vitals> = None;
+    let mut phase: f32 = 0.0;
+    loop {
+        if key_down(0x1B) || seconds.is_some_and(|s| start.elapsed().as_secs() >= s) {
+            break;
+        }
+        let v = read_mouse_vitals(&mouse, last);
+        let changed = last != Some(v);
+        // Repaint when the vitals changed, on the first tick, OR every tick while charging (so the
+        // cyan charging sweep animates). A stable, discharging surface is left untouched — the slow
+        // board isn't hammered.
+        if changed || last.is_none() || v.charging {
+            phase = (phase + 0.18) % 1.0; // advance the charging sweep
+            let frame = lighting::render_vitals(v, rows, cols, phase);
+            match lights.paint_frame(&frame) {
+                Ok(()) => println!(
+                    "  battery {}%{} \u{00b7} stage {}/{} \u{2192} painted{}",
+                    v.battery_pct,
+                    if v.charging { " (charging)" } else { "" },
+                    v.active_stage + 1,
+                    v.stage_count.max(1),
+                    if changed { " [changed]" } else { "" }
+                ),
+                Err(e) => println!("  paint failed: {e}"),
+            }
+            last = Some(v);
+        }
+        std::thread::sleep(Duration::from_millis(1000));
+    }
+    println!("stopped.");
+    Ok(())
+}
+
+/// OPTIONAL developer aid — re-verify the standard Razer key map by eye (NEVER a required user step).
+/// Walks [`lighting::razer_keyboard_keys`] in reading order and lights ONLY each key's mapped cell (a
+/// single-cell custom frame, painted through the ACK'd on-demand path — `Lights::paint_frame` ->
+/// `apply_lighting`, NOT the fast stream), holding it for `dwell` ms so the user can eyeball whether the
+/// LIT key matches its printed name. Any mismatch is a map entry to correct in
+/// [`lighting::razer_key_cell`]. ESC interrupts between (and during) keys.
+fn lighting_keytest(reg: &Registry, pid: &str, dwell: u64, color: Option<&str>) -> Result<()> {
+    use std::time::{Duration, Instant};
+    let want = parse_hex16(pid)?;
+    let accent = match color {
+        Some(s) => Rgb::parse(s).ok_or_else(|| anyhow::anyhow!("bad colour '{s}', want RRGGBB"))?,
+        None => Rgb::new(0, 200, 255), // bright cyan accent
+    };
+    let (def, pid) = lit_devices(reg)?
+        .into_iter()
+        .find(|(d, p)| *p == want && d.lighting.as_ref().unwrap().custom_frame.is_some())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no custom-frame-capable lit device with pid {want:04x} (is the keyboard connected?)"
+            )
+        })?;
+    let l = def.lighting.clone().unwrap();
+    let (rows, cols) = (l.rows as usize, l.cols as usize);
+    let n = rows * cols;
+    let d = Device::open(def.clone(), pid)?;
+    let lights = lighting::Lights::new(&d, l);
+    lights.ensure_control()?; // take host control (driver mode) once so the paint renders.
+
+    let keys = lighting::razer_keyboard_keys();
+    println!(
+        "KEYTEST — walking {} keys on {} ({rows}x{cols}). Each key's mapped cell lights for {dwell}ms; \
+         watch for any key whose LIT POSITION doesn't match its name. ESC to stop.\n",
+        keys.len(),
+        def.name
+    );
+    let mut stopped = false;
+    'walk: for &name in keys {
+        if key_down(0x1B) {
+            stopped = true;
+            break;
+        }
+        let Some((ry, cx)) = lighting::razer_key_cell(name) else {
+            continue;
+        };
+        let (ry, cx) = (ry as usize, cx as usize);
+        if ry >= rows || cx >= cols {
+            continue; // a cell outside this board's matrix — skip rather than paint out of bounds.
+        }
+        let mut frame = vec![Rgb::BLACK; n];
+        frame[ry * cols + cx] = accent;
+        lights.paint_frame(&frame)?;
+        println!("lighting: {name} (row {ry}, col {cx})");
+        // dwell, staying interruptible: poll ESC in small slices instead of one blocking sleep.
+        let until = Instant::now() + Duration::from_millis(dwell);
+        while Instant::now() < until {
+            if key_down(0x1B) {
+                stopped = true;
+                break 'walk;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    // always clear the board at the end (interrupted or complete).
+    lights.paint_frame(&vec![Rgb::BLACK; n])?;
+    println!("\n{} — board cleared.", if stopped { "stopped (ESC)" } else { "done" });
+    Ok(())
+}
+
+/// REVERSE-ENGINEER wide-key LED footprints. Walks the FULL device matrix — every `(row, col)` for
+/// row in `0..rows`, col in `0..cols`, INCLUDING the unmapped "gap" cells under wide keys that the
+/// keymap and [`lighting_keytest`] skip — lighting ONLY that single cell in a bright accent via the
+/// ACK'd on-demand custom-frame paint (`Lights::paint_frame` -> `apply_lighting`, NOT the fast
+/// stream), holding each for `dwell` ms so the user can note which cells a wide key (space, the
+/// shifts, enter, backspace) physically spans. `--row` restricts the sweep to one row (e.g. row 5
+/// for the space bar) so you needn't walk all the cells. ESC interrupts between/during cells; the
+/// board is cleared at the end.
+fn lighting_cellsweep(
+    reg: &Registry,
+    pid: &str,
+    dwell: u64,
+    only_row: Option<u8>,
+    color: Option<&str>,
+) -> Result<()> {
+    use std::time::{Duration, Instant};
+    let want = parse_hex16(pid)?;
+    let accent = match color {
+        Some(s) => Rgb::parse(s).ok_or_else(|| anyhow::anyhow!("bad colour '{s}', want RRGGBB"))?,
+        None => Rgb::new(0, 200, 255), // bright cyan accent (same as keytest)
+    };
+    let (def, pid) = lit_devices(reg)?
+        .into_iter()
+        .find(|(d, p)| *p == want && d.lighting.as_ref().unwrap().custom_frame.is_some())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no custom-frame-capable lit device with pid {want:04x} (is the keyboard connected?)"
+            )
+        })?;
+    let l = def.lighting.clone().unwrap();
+    let (rows, cols) = (l.rows as usize, l.cols as usize);
+    let n = rows * cols;
+    let d = Device::open(def.clone(), pid)?;
+    let lights = lighting::Lights::new(&d, l);
+    lights.ensure_control()?; // take host control (driver mode) once so the paint renders.
+
+    // which rows to walk: a single requested row, or all of them.
+    let row_range = match only_row {
+        Some(r) => {
+            let r = r as usize;
+            if r >= rows {
+                bail!("row {r} is out of range — this matrix has {rows} rows (0..{})", rows - 1);
+            }
+            r..r + 1
+        }
+        None => 0..rows,
+    };
+    let cell_count = row_range.len() * cols;
+    println!(
+        "CELLSWEEP — walking {cell_count} cell(s) of {} ({rows}x{cols}{}). Each cell lights for \
+         {dwell}ms; note which cells a wide key (space/shift/enter/backspace) spans. ESC to stop.\n",
+        def.name,
+        match only_row {
+            Some(r) => format!(", row {r} only"),
+            None => String::new(),
+        }
+    );
+    let mut stopped = false;
+    'walk: for ry in row_range {
+        for cx in 0..cols {
+            if key_down(0x1B) {
+                stopped = true;
+                break 'walk;
+            }
+            let mut frame = vec![Rgb::BLACK; n];
+            frame[ry * cols + cx] = accent;
+            lights.paint_frame(&frame)?;
+            println!("cell (row {ry}, col {cx})");
+            // dwell, staying interruptible: poll ESC in small slices instead of one blocking sleep.
+            let until = Instant::now() + Duration::from_millis(dwell);
+            while Instant::now() < until {
+                if key_down(0x1B) {
+                    stopped = true;
+                    break 'walk;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+    // always clear the board at the end (interrupted or complete).
+    lights.paint_frame(&vec![Rgb::BLACK; n])?;
+    println!("\n{} — board cleared.", if stopped { "stopped (ESC)" } else { "done" });
+    Ok(())
+}
+
+/// BLOCK-VERIFY a wide key's LED span: light a CONTIGUOUS BLOCK of cells (row N, colA..=colB) ALL AT
+/// ONCE and HOLD, so the cells a wide key physically covers can be confirmed on hardware. Paints the
+/// whole block simultaneously through the ACK'd on-demand custom-frame path (`Lights::paint_frame` ->
+/// `apply_lighting`, NOT the fast stream), holds it (ESC-interruptible, or `--seconds N`), then clears
+/// the board. E.g. `--row 5 --from 4 --to 10` lights exactly the space bar (7 cells).
+fn lighting_cells(
+    reg: &Registry,
+    pid: &str,
+    row: u8,
+    from: u8,
+    to: u8,
+    color: Option<&str>,
+    seconds: Option<u64>,
+) -> Result<()> {
+    use std::time::{Duration, Instant};
+    let want = parse_hex16(pid)?;
+    let accent = match color {
+        Some(s) => Rgb::parse(s).ok_or_else(|| anyhow::anyhow!("bad colour '{s}', want RRGGBB"))?,
+        None => Rgb::new(0, 200, 255), // bright cyan accent (same as keytest/cellsweep)
+    };
+    let (lo, hi) = (from.min(to), from.max(to)); // tolerate --from/--to given in either order
+    let (def, pid) = lit_devices(reg)?
+        .into_iter()
+        .find(|(d, p)| *p == want && d.lighting.as_ref().unwrap().custom_frame.is_some())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no custom-frame-capable lit device with pid {want:04x} (is the keyboard connected?)"
+            )
+        })?;
+    let l = def.lighting.clone().unwrap();
+    let (rows, cols) = (l.rows as usize, l.cols as usize);
+    let n = rows * cols;
+    let row_u = row as usize;
+    if row_u >= rows {
+        bail!("row {row} is out of range — this matrix has {rows} rows (0..{})", rows - 1);
+    }
+    if hi as usize >= cols {
+        bail!("col {hi} is out of range — this matrix has {cols} cols (0..{})", cols - 1);
+    }
+    let d = Device::open(def.clone(), pid)?;
+    let lights = lighting::Lights::new(&d, l);
+    lights.ensure_control()?; // take host control (driver mode) once so the paint renders.
+
+    // paint the whole contiguous block at once and hold it.
+    let mut frame = vec![Rgb::BLACK; n];
+    for cx in lo as usize..=hi as usize {
+        frame[row_u * cols + cx] = accent;
+    }
+    lights.paint_frame(&frame)?;
+    let k = (hi - lo) as usize + 1;
+    println!(
+        "CELLS — {} ({rows}x{cols}). lit: row {row}, cols {lo}..={hi} ({k} cells). holding ({}).",
+        def.name,
+        match seconds {
+            Some(s) => format!("{s}s then clear"),
+            None => "ESC to clear".into(),
+        }
+    );
+
+    // hold the block lit: ESC-interruptible, or until --seconds elapses, polling in small slices.
+    let start = Instant::now();
+    while !key_down(0x1B) && !seconds.is_some_and(|s| start.elapsed().as_secs() >= s) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // clear the board on the way out.
+    lights.paint_frame(&vec![Rgb::BLACK; n])?;
+    println!("board cleared.");
     Ok(())
 }
 
@@ -1427,6 +1853,8 @@ fn lighting_effect(
                 class: l.effect.class,
                 id: l.effect.id,
                 args: rb.clone(),
+                tx: l.effect.transaction_id,
+                size: None, // --raw is a transparent probe: data_size = exactly the bytes given
             })
         } else {
             l.native_effect_report(eff, color)
@@ -1515,17 +1943,32 @@ fn lighting_effect(
                 d.apply_lighting(rep)?;
             }
             println!("ACKed.");
-            // verify-after-write: re-read state, confirm the effect-id we sent is reflected.
-            if let Ok(st) = d.run("lighting_state") {
-                match rep.args.get(2).copied() {
-                    Some(want) if st[2] == want => {
-                        println!("     verified: device state shows effect 0x{:02X}.", st[2])
+            // verify-after-write — but only where the getter is REAL. The matrix era (Naga,
+            // 0x0F/0x82) returns a true effect-state whose arg[2] is the effect-id we wrote, so
+            // we read it back. The LEGACY board (Chroma V2) has NO reliable lighting getter: its
+            // 0x03/0x0A matrix-effect write does NOT update the old per-LED-effect registers
+            // (0x03/0x82, 0x03/0x88 return junk), so a "verify" there would be a lie. Be honest:
+            // legacy writes are ACK-confirmed only.
+            match l.protocol {
+                lighting::Protocol::Matrix => {
+                    if let Ok(st) = d.run("lighting_state") {
+                        // matrix args = [varstore, led, effect_id, ...]; effect-id is arg[2].
+                        match rep.args.get(2).copied() {
+                            Some(want) if st[2] == want => {
+                                println!("     verified: device state shows effect 0x{:02X}.", st[2])
+                            }
+                            Some(want) => println!(
+                                "     ? state shows effect 0x{:02X} but we wrote 0x{want:02X} — check region/mode.",
+                                st[2]
+                            ),
+                            None => {}
+                        }
                     }
-                    Some(want) => println!(
-                        "     ? state shows effect 0x{:02X} but we wrote 0x{want:02X} — check region/mode.",
-                        st[2]
-                    ),
-                    None => {}
+                }
+                lighting::Protocol::Legacy => {
+                    println!(
+                        "     ACK-confirmed (no read-back: this board exposes no reliable lighting getter)."
+                    );
                 }
             }
         }
@@ -1850,14 +2293,9 @@ fn macro_cmd(action: MacroCmd) -> Result<()> {
     use neuron::macros::macro_host;
     match action {
         MacroCmd::Prelude => {
-            // print the host-module reference straight from the shipped neuron.py docstring/source.
-            match macro_host::host_script()
-                .and_then(|h| h.parent().map(|d| d.join("neuron.py")))
-                .and_then(|p| std::fs::read_to_string(p).ok())
-            {
-                Some(src) => print!("{src}"),
-                None => println!("neuron host module not found (runtime/host/neuron.py)"),
-            }
+            // print the host-module reference straight from the BUNDLED neuron.py source (embedded
+            // in the binary — always matches the interpreter this build ships, no disk lookup).
+            print!("{}", neuron::macros::pyruntime::host_module_source());
         }
         MacroCmd::List => {
             let dir = macro_host::macros_dir();
@@ -1930,8 +2368,10 @@ fn macro_cmd(action: MacroCmd) -> Result<()> {
                                     .to_ascii_lowercase()
                                     .as_str()
                                 {
-                                    "y" | "yes" => Some(true),
-                                    "n" | "no" => Some(false),
+                                    // answer() now takes the chosen OPTION INDEX; the default ask is
+                                    // ["yes","no"] (beacon: west=yes=0, east=no=1), so y→0, n→1.
+                                    "y" | "yes" => Some(0_usize),
+                                    "n" | "no" => Some(1_usize),
                                     _ => None,
                                 },
                                 Err(_) => None,
@@ -2059,6 +2499,48 @@ fn decode_dpi_active(s: &[u8]) -> Option<u8> {
     s.get(1).copied()
 }
 
+// ── "never fake success" input guards ─────────────────────────────────────────────────────────
+// Pure validators run BEFORE any device write, so an out-of-range / no-op value is rejected with a
+// clear error instead of being written (or silently clamped) and then reported as if it took. These
+// are the inverse of Synapse's "looks applied" lie — neuron never claims a write it didn't make.
+
+/// Hard DPI ceiling — the Focus Pro 30K's max; mirrors the cycle/intent clamp band (100..30_000).
+const DPI_CEILING: u16 = 30_000;
+/// A sane DPI floor — Razer sensors bottom out around 100.
+const DPI_FLOOR: u16 = 100;
+
+/// Reject a DPI the device can't honour. `capability::set_dpi` has no clamp, so writing e.g. 65000
+/// would PERSIST garbage and THEN print MISMATCH; bail before the write instead.
+fn validate_dpi(v: u16) -> Result<()> {
+    if !(DPI_FLOOR..=DPI_CEILING).contains(&v) {
+        bail!("DPI {v} is out of range ({DPI_FLOOR}..={DPI_CEILING}) — refusing to write a value the device can't honour");
+    }
+    Ok(())
+}
+
+/// Reject scroll stage 0 — wheel stages are 1-based, so 0 is a no-op the device ignores (we'd write
+/// `[store, 0x00]` and falsely print "stage 0 active"). Caller passes the user's 1-based stage.
+fn validate_scroll_stage(s: u8) -> Result<()> {
+    if s == 0 {
+        bail!("scroll stage is 1-based — stage 0 is not a real stage (try `neuron scroll 1`)");
+    }
+    Ok(())
+}
+
+/// Reject a DPI-stages `--active` outside the stage list. `writes` silently clamps it, so `--active 9`
+/// on 2 stages would write stage 2 yet echo "active 9"; bail instead of clamping-and-lying. `active`
+/// is the user's 1-based value; `count` is the number of stages supplied.
+fn validate_dpi_stages_active(active: u8, count: usize) -> Result<()> {
+    if active < 1 || (active as usize) > count {
+        bail!(
+            "--active {active} is out of range — there {} only {count} stage{} (use 1..={count})",
+            if count == 1 { "is" } else { "are" },
+            if count == 1 { "" } else { "s" }
+        );
+    }
+    Ok(())
+}
+
 /// Apply a DPI stage LIST (the cycle) to the mouse via the verify-gated `set_dpi_stages` write.
 /// With no values, just decode + print the current configured stages (read-only).
 fn dpi_stages_cmd(reg: &Registry, stages: &[u16], active: u8, persist: bool) -> Result<()> {
@@ -2095,6 +2577,12 @@ fn dpi_stages_cmd(reg: &Registry, stages: &[u16], active: u8, persist: bool) -> 
     }
 
     // active is 1-based on the CLI (matching Synapse's stage numbering); the write API is 0-based.
+    // Reject an out-of-range active up front — writes::set_dpi_stages would silently clamp it and we'd
+    // echo the raw (lying) value. Also reject any DPI the device can't honour.
+    validate_dpi_stages_active(active, stages.len())?;
+    for &v in stages {
+        validate_dpi(v)?;
+    }
     let active_idx = active.saturating_sub(1);
     let st: Vec<DpiStage> = stages.iter().map(|&v| DpiStage::symmetric(v)).collect();
     let store = cap::Store::from_persist(persist);
@@ -2126,6 +2614,8 @@ fn scroll_cmd(reg: &Registry, stage: Option<u8>, volatile: bool) -> Result<()> {
             println!("  (the device exposes no getter for the active scroll stage — set-only.)");
         }
         Some(s) => {
+            // stages are 1-based; reject 0 before writing a no-op the device silently ignores.
+            validate_scroll_stage(s)?;
             // Synapse sends store=persist for this command; default to that, --volatile opts out.
             let store = if volatile {
                 cap::Store::Volatile
@@ -2717,6 +3207,11 @@ fn open_with_command(reg: &Registry, cmd: &str) -> Result<Device> {
 }
 
 fn dpi_cmd(reg: &Registry, value: Option<u16>) -> Result<()> {
+    // validate BEFORE opening/writing — cap::set_dpi has no clamp, so an out-of-range value would
+    // PERSIST garbage then print MISMATCH. Bail with a clear message instead of half-succeeding.
+    if let Some(v) = value {
+        validate_dpi(v)?;
+    }
     let d = open_with_command(reg, "dpi")?;
     if let Some(v) = value {
         ensure_driver(&d);
@@ -3412,6 +3907,38 @@ mod tests {
             Cmd::DpiStages { stages, .. } => assert!(stages.is_empty()),
             _ => panic!("expected DpiStages"),
         }
+    }
+
+    // ── "never fake success" guards: validate BEFORE the write ───────────────────────────────
+
+    #[test]
+    fn validate_dpi_accepts_in_range_rejects_out_of_range() {
+        assert!(validate_dpi(100).is_ok(), "floor is valid");
+        assert!(validate_dpi(1600).is_ok());
+        assert!(validate_dpi(30_000).is_ok(), "ceiling is valid");
+        // the bug case: 65000 must be rejected, not written-then-MISMATCH.
+        assert!(validate_dpi(65_000).is_err(), "above the 30k ceiling");
+        assert!(validate_dpi(0).is_err(), "below the floor");
+        assert!(validate_dpi(50).is_err(), "below the 100 floor");
+    }
+
+    #[test]
+    fn validate_scroll_stage_rejects_zero() {
+        // stages are 1-based; 0 is a no-op the device ignores — must be an error, not a fake success.
+        assert!(validate_scroll_stage(0).is_err());
+        assert!(validate_scroll_stage(1).is_ok());
+        assert!(validate_scroll_stage(2).is_ok());
+    }
+
+    #[test]
+    fn validate_dpi_stages_active_rejects_out_of_range() {
+        // the bug case: --active 9 on 2 stages was clamped-and-lied; now it bails.
+        assert!(validate_dpi_stages_active(9, 2).is_err(), "9 > 2 stages");
+        assert!(validate_dpi_stages_active(0, 2).is_err(), "active is 1-based");
+        assert!(validate_dpi_stages_active(3, 2).is_err(), "one past the end");
+        assert!(validate_dpi_stages_active(1, 2).is_ok());
+        assert!(validate_dpi_stages_active(2, 2).is_ok(), "last stage");
+        assert!(validate_dpi_stages_active(1, 1).is_ok());
     }
 
     // ── clap parsing: existing commands stay intact ──────────────────────────────────────────

@@ -81,16 +81,53 @@ pub fn vk_name(vk: i32) -> String {
     }
 }
 
+use std::cell::Cell;
+
+thread_local! {
+    /// While set on a thread, [`key_down`] reports every key as UP *without* the per-key
+    /// `GetAsyncKeyState` syscall. Why: the lighting page's TILE GRID re-renders ~16 effect
+    /// thumbnails every ~90ms, and three of them (reactive/ripple/comet) scan all 256 virtual-keys
+    /// per frame — ~765 `GetAsyncKeyState` syscalls per tick (measured ~180µs *each effect*) purely
+    /// to drive live keyboard reactivity in postage-stamp previews that don't need it. The SELECTED
+    /// effect's big preview and the device stream still scan live on their own paths; only the
+    /// thumbnail pass suppresses it. Thread-local, so worker-thread capture loops are unaffected.
+    static SUPPRESS_KEY_READS: Cell<bool> = const { Cell::new(false) };
+}
+
+/// RAII guard returned by [`suppress_key_reads`]: live key reads on THIS thread report UP until it
+/// drops (panic-safe). Scope it around a hot render that does not need real key state.
+pub struct KeyReadGuard(());
+impl Drop for KeyReadGuard {
+    fn drop(&mut self) {
+        SUPPRESS_KEY_READS.with(|s| s.set(false));
+    }
+}
+
+/// Suppress live keyboard reads on the current thread for the lifetime of the returned guard — so a
+/// hot, reactivity-irrelevant render (the lighting tile grid) skips the per-key `GetAsyncKeyState`
+/// syscalls entirely. See [`SUPPRESS_KEY_READS`].
+pub fn suppress_key_reads() -> KeyReadGuard {
+    SUPPRESS_KEY_READS.with(|s| s.set(true));
+    KeyReadGuard(())
+}
+
 /// Read the current pressed state of one virtual-key. Reads only (never injects), so it is safe
-/// regardless of the input-arm gate.
+/// regardless of the input-arm gate. Returns `false` immediately (no syscall) while a
+/// [`suppress_key_reads`] guard is active on this thread.
 #[cfg(windows)]
 pub fn key_down(vk: i32) -> bool {
+    if SUPPRESS_KEY_READS.with(|s| s.get()) {
+        return false;
+    }
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
     // SAFETY: GetAsyncKeyState is a pure read of the async key state for a valid VK in 0..256.
     unsafe { (GetAsyncKeyState(vk) as u16 & 0x8000) != 0 }
 }
 #[cfg(not(windows))]
 pub fn key_down(_vk: i32) -> bool {
+    if SUPPRESS_KEY_READS.with(|s| s.get()) {
+        return false;
+    }
     false
 }
 

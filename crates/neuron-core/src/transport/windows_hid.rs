@@ -22,6 +22,20 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 
 const HIDP_OK: i32 = 0x0011_0000; // HIDP_STATUS_SUCCESS
+const GENERIC_READ_FLAG: u32 = 0x8000_0000; // GENERIC_READ — declared locally to dodge windows-sys path churn
+
+// `ReadFile` isn't exported under this windows-sys feature set; declare it directly. It lives in
+// kernel32, which this crate already links (CreateFileW et al.), so the symbol resolves.
+#[link(name = "kernel32")]
+extern "system" {
+    fn ReadFile(
+        handle: HANDLE,
+        buf: *mut c_void,
+        len: u32,
+        read: *mut u32,
+        overlapped: *mut c_void,
+    ) -> i32;
+}
 
 unsafe fn wide_from_ptr(p: *const u16) -> Vec<u16> {
     let mut v = Vec::new();
@@ -164,6 +178,66 @@ impl WinHid {
 }
 
 impl Drop for WinHid {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.handle);
+        }
+    }
+}
+
+/// A read handle for one collection's device-initiated input reports. Opened with `GENERIC_READ`
+/// (which `ReadFile` needs) — so it FAILS on the OS-protected mouse/keyboard collections and only
+/// succeeds on the vendor collections where Razer's event reports (DPI/stage changes) ride.
+pub struct WinHidReader {
+    handle: HANDLE,
+}
+
+// The handle is a raw OS pointer; we own it solely here and close it on drop, so it's safe to move
+// to the listener thread that owns this reader.
+unsafe impl Send for WinHidReader {}
+
+impl WinHidReader {
+    pub fn open(path: &DevicePath) -> Result<Self> {
+        let wide = path.to_wide_nul();
+        unsafe {
+            let h = CreateFileW(
+                wide.as_ptr(),
+                GENERIC_READ_FLAG,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                ptr::null(),
+                OPEN_EXISTING,
+                0,
+                ptr::null_mut(),
+            );
+            if h == INVALID_HANDLE_VALUE {
+                bail!("CreateFile (read) failed — collection is OS-protected or busy");
+            }
+            Ok(WinHidReader { handle: h })
+        }
+    }
+}
+
+impl super::InputReader for WinHidReader {
+    fn read(&self, buf: &mut [u8]) -> Result<usize> {
+        unsafe {
+            let mut got: u32 = 0;
+            // synchronous (handle opened without FILE_FLAG_OVERLAPPED) — blocks until a report lands.
+            if ReadFile(
+                self.handle,
+                buf.as_mut_ptr() as *mut c_void,
+                buf.len() as u32,
+                &mut got,
+                ptr::null_mut(),
+            ) == 0
+            {
+                bail!("ReadFile failed");
+            }
+            Ok(got as usize)
+        }
+    }
+}
+
+impl Drop for WinHidReader {
     fn drop(&mut self) {
         unsafe {
             CloseHandle(self.handle);

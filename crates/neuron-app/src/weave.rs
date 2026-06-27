@@ -70,15 +70,16 @@ impl Surface {
             Surface::MoltenResolve => "Molten Resolve",
         }
     }
-    /// A one-line vibe caption.
+    /// A one-line vibe caption — the state of mind, not the shader. Each names its element by
+    /// feel (glass/water/flame/air/spark/stone) without spelling out the physics behind it.
     pub fn blurb(self) -> &'static str {
         match self {
-            Surface::DirectedIntent => "white intent · cut-glass prism fire",
-            Surface::FluidThought => "water · refraction + flowing caustics",
-            Surface::MaterializedDesire => "fire · blackbody embers + rising sparks",
-            Surface::GentleBreeze => "air · curl-flow wisps carrying motes of light",
-            Surface::SuddenInsight => "electric · branching plasma, crackling",
-            Surface::MoltenResolve => "lava · dark crust split by white-hot cracks",
+            Surface::DirectedIntent => "will, focused through glass until it breaks into fire",
+            Surface::FluidThought => "a mind that moves like water, bending the light it carries",
+            Surface::MaterializedDesire => "want made flame, embers rising off the heat",
+            Surface::GentleBreeze => "a quiet breath, carrying motes of light on the air",
+            Surface::SuddenInsight => "the spark before the thought, forking bright through the dark",
+            Surface::MoltenResolve => "cooled stone, cracked open by the fire still beneath",
         }
     }
     /// Resolve a slug back to a surface (unknown → the house Directed Intent).

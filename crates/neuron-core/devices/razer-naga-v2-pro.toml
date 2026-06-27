@@ -121,6 +121,17 @@ id = 0x84
 size = 0x03
 args = [0x00, 0x04]
 
+# Swappable SIDE PLATES (the magnetic side panels). The mouse PUSHES a HID report on its input
+# interface when a plate is attached/detached: buf[0]=0x05, buf[1]=0x0e, buf[2]=<strap_id>. There is
+# NO feature-getter (a full getter sweep + swap-diff confirmed zero change), so this push IS the
+# detection — decoded in the app's hidwatch, de-dup'd on change to absorb the brief mid-seat
+# transient. This table is the DATA half: hardware STRAP-CODE → human label (verified live off the
+# wire; these are strap codes, NOT button counts). 0x00 (none/detached) is handled in code.
+[side_plates]
+1 = "2-button"
+3 = "12-button"
+4 = "6-button"
+
 [commands.battery_level]
 class = 0x07
 id = 0x80

@@ -14,6 +14,7 @@
 
 import { Theme } from "theme.slint";
 import { State } from "state.slint";
+import { GuideContent } from "guides.slint";
 import { Pill, Mono, CaptureOverlay } from "widgets/controls.slint";
 
 import { DevicePanel } from "panels/device.slint";
@@ -133,10 +134,10 @@ export component AppWindow inherits Window {
                 if (State.capture-active) { State.cancel-capture(); return accept; }
                 if (State.import-open) { State.import-open = false; return accept; }
                 if (State.profile-sheet-open) { State.profile-sheet-open = false; return accept; }
+                if (State.guide-open) { State.guide-close(); return accept; }
                 if (root.arm-confirm) { root.arm-confirm = false; return accept; }
                 if (State.editing-sector >= 0) { State.editing-sector = -1; return accept; }
                 if (State.gesture-bind-target != "") { State.gesture-bind-target = ""; return accept; }
-                if (State.selected-edge >= 0) { State.selected-edge = -1; return accept; }
                 // …nothing matched: pull focus back to nav (so ESC backs OUT of a focused text field
                 // instead of stranding keyboard nav) and `reject` so Slint's own fallback can still
                 // close an open Picker/ActionPicker popup.
@@ -240,7 +241,11 @@ export component AppWindow inherits Window {
                     padding-top: 14px;
                     padding-bottom: 14px;
                     Rectangle {
-                        PanelSlot { active: State.page == 0; PanelPage { DevicePanel {} } }
+                        // DEVICE owns its OWN inner inspector Flickable (fixed-footprint pane, scrolls
+                        // internally) — so it must NOT also be wrapped in the page-level PanelPage, or the
+                        // two nested Flickables break hit-testing on the inner's scrolled content (clicking
+                        // ▸ advanced / sniper / persist did nothing once scrolled). One Flickable only.
+                        PanelSlot { active: State.page == 0; DevicePanel {} }
                         PanelSlot { active: State.page == 1; PanelPage { LightingPanel {} } }
                         // INPUT — one section, two depths: DIRECT (plain binds) / WEAVE (the
                         // held-stroke engine). Same spine, same action palette, one home.
@@ -369,7 +374,7 @@ export component AppWindow inherits Window {
     Rectangle {
         visible: State.profile-sheet-open || drop.opacity > 0.01;
         // a LIGHT scrim — focuses the menu and catches outside clicks, without the heavy modal blackout
-        background: State.profile-sheet-open ? #0000006e : #00000000;
+        background: State.profile-sheet-open ? Theme.scrim-soft : transparent;
         animate background { duration: Theme.settle; }
         TouchArea { clicked => { State.profile-sheet-open = false; } }
         drop := Rectangle {
@@ -408,6 +413,196 @@ export component AppWindow inherits Window {
             height: min(640px, parent.height - Theme.modal-inset);
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
+        }
+    }
+
+    // ── GUIDE popup — the reusable in-app help surface (a "book button" opens it). By default it's a
+    // CLICK-AWAY TOOLTIP: a transparent full-window catcher behind the card closes it on an outside
+    // click. DRAG the title bar and it PROMOTES to a STICKY, draggable window with an X (the catcher
+    // is gone — the app stays fully live). Content is data-driven (GuideContent), picked by
+    // State.guide-active-id. Lives at the window root, above every page, so it belongs to no panel.
+    // When closed it isn't painted or hit-tested (visible gate), so it never steals the page's clicks.
+    Rectangle {
+        visible: State.guide-open || gcard.opacity > 0.01;
+        background: transparent;   // no scrim — a tooltip / floating window, not a modal blackout
+        // CLICK-AWAY catcher — TOOLTIP mode only. Going sticky removes it (no more click-away).
+        if State.guide-open && !State.guide-sticky : TouchArea {
+            width: 100%;
+            height: 100%;
+            clicked => { State.guide-close(); }
+        }
+        gcard := Rectangle {
+            // anchored at the book button, CLAMPED so the WHOLE card stays on-screen. The upper bound
+            // (winSize - cardSize - margin) pulls the card UP/LEFT when a low/right anchor would run it
+            // off the bottom/right edge — i.e. a button low on the page opens the card upward. The
+            // `max(margin, …)` keeps lo ≤ hi on a window too small for the card.
+            x: clamp(State.guide-x, Theme.pad-page / 2, max(Theme.pad-page / 2, parent.width - self.width - Theme.pad-page / 2));
+            y: clamp(State.guide-y, Theme.pad-page / 2, max(Theme.pad-page / 2, parent.height - self.height - Theme.pad-page / 2));
+            width: 360px;
+            // a comfortable readable height, capped to 70% of the glass. NOT derived from the inner
+            // content's preferred-height: that lives inside the Flickable, whose geometry doesn't
+            // propagate out to this ancestor binding (it reads ~0 and collapses the card). The body
+            // Flickable FILLS this height and scrolls its content via viewport-height instead.
+            height: min(420px, parent.height * 0.7);
+            opacity: State.guide-open ? 1.0 : 0.0;
+            background: Theme.bg-2;
+            border-radius: Theme.radius;
+            border-width: Theme.hair;
+            border-color: Theme.line;
+            clip: true;
+            animate opacity { duration: Theme.settle; easing: ease-out; }
+            // the title-bar grab offset captured at pointer-down (for the drag delta)
+            property <length> grab-x;
+            property <length> grab-y;
+            property <bool> tb-down: false;
+            // BASE swallow — a click anywhere ON the card is absorbed here (declared FIRST, so the
+            // title-bar drag + the X, declared after, still win their own regions) so a click inside
+            // the tooltip never reaches the click-away catcher behind it. The scroll-event swallow
+            // catches any WHEEL the inner Flickable didn't consume (content fits, or it's at a scroll
+            // edge), so spinning the wheel over the popup can never scroll the page BEHIND it.
+            TouchArea {
+                scroll-event(e) => {
+                    accept
+                }
+            }
+            VerticalLayout {
+                // ── TITLE BAR — the drag handle (a drag promotes to sticky) + title + an X ─────
+                bar := Rectangle {
+                    height: 34px;
+                    background: Theme.well;
+                    // the drag surface BEHIND the title/X (a Text doesn't grab events; the X's own
+                    // TouchArea, declared later, sits above and wins its corner) — NotifPlacer pattern.
+                    drag := TouchArea {
+                        mouse-cursor: MouseCursor.move;
+                        pointer-event(e) => {
+                            if (e.kind == PointerEventKind.down) {
+                                gcard.grab-x = self.mouse-x;
+                                gcard.grab-y = self.mouse-y;
+                                gcard.tb-down = true;
+                            } else if (e.kind == PointerEventKind.up) {
+                                gcard.tb-down = false;
+                            }
+                        }
+                        moved => {
+                            if (gcard.tb-down) {
+                                // a title-bar drag PROMOTES the tooltip to a pinned window…
+                                if (!State.guide-sticky) { State.guide-make-sticky(); }
+                                // …and follows the cursor. The delta is taken off the LIVE clamped
+                                // card position (gcard.x/y), so edge-clamping can't desync the grab.
+                                State.guide-move(
+                                    gcard.x + self.mouse-x - gcard.grab-x,
+                                    gcard.y + self.mouse-y - gcard.grab-y);
+                            }
+                        }
+                    }
+                    HorizontalLayout {
+                        padding-left: 12px;
+                        padding-right: 6px;
+                        spacing: 9px;
+                        // a faint grip affordance — two columns of dots
+                        VerticalLayout {
+                            alignment: center;
+                            HorizontalLayout {
+                                spacing: 2px;
+                                for gxc in [0, 1] : VerticalLayout {
+                                    spacing: 2px;
+                                    for gyc in [0, 1, 2] : Rectangle {
+                                        width: 2px; height: 2px; border-radius: 1px;
+                                        background: Theme.text-faint;
+                                    }
+                                }
+                            }
+                        }
+                        // the active guide's title (only the matching guide renders)
+                        VerticalLayout {
+                            alignment: center;
+                            horizontal-stretch: 1;
+                            for g in GuideContent.guides : Rectangle {
+                                if g.id == State.guide-active-id : Text {
+                                    text: g.title;
+                                    color: Theme.text;
+                                    font-family: Theme.mono;
+                                    font-size: Theme.fs-title;
+                                    font-weight: 700;
+                                    letter-spacing: Theme.track-2;
+                                    overflow: elide;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+                        // ── X — always shown; a clear close affordance (the \u{00d7} glyph pattern) ──
+                        VerticalLayout {
+                            alignment: center;
+                            Rectangle {
+                                width: 22px; height: 22px;
+                                border-radius: Theme.radius-sm;
+                                background: xta.has-hover ? Theme.well-hi : transparent;
+                                animate background { duration: Theme.quick; }
+                                Text {
+                                    text: "\u{00d7}";
+                                    color: xta.has-hover ? Theme.text : Theme.text-dim;
+                                    font-family: Theme.mono;
+                                    font-size: Theme.fs-data;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                    animate color { duration: Theme.quick; }
+                                }
+                                xta := TouchArea {
+                                    mouse-cursor: MouseCursor.pointer;
+                                    clicked => { State.guide-close(); }
+                                }
+                            }
+                        }
+                    }
+                }
+                // a hairline under the bar
+                Rectangle { height: Theme.hair; background: Theme.line; }
+                // ── CONTENT — the active guide's sections, scrollable (wheel-only, like the panels) ──
+                // The Flickable absorbs the card's remaining height (the VBox stretches it past the
+                // fixed title bar + hairline). viewport-height = the REAL content height (the inner
+                // body VBox's preferred-height, measured INSIDE the Flickable where it's valid — the
+                // PanelPage pattern), so it scrolls when the guide outgrows the card.
+                Flickable {
+                    interactive: true;   // capture the wheel HERE so scrolling the popup never scrolls the page behind it
+                    viewport-width: self.width;
+                    viewport-height: body.preferred-height;   // the REAL content height → scrolls when the guide outgrows the card
+                    body := VerticalLayout {
+                        width: parent.viewport-width;
+                        height: parent.viewport-height;
+                        alignment: start;   // pack sections from the top; slack (if any) sits at the bottom
+                        padding: 16px;
+                        spacing: 0px;
+                        // a LAYOUT wrapper, not a bare Rectangle: a Rectangle doesn't size to its
+                        // children, so `body.preferred-height` read ~0 and the Flickable thought it had
+                        // nothing to scroll (the wheel fell through to the page). A VerticalLayout adopts
+                        // the section block's REAL height, so the popup scrolls when the guide is long.
+                        for g in GuideContent.guides : VerticalLayout {
+                            if g.id == State.guide-active-id : VerticalLayout {
+                                spacing: 16px;
+                                for s in g.sections : VerticalLayout {
+                                    spacing: 5px;
+                                    Text {
+                                        text: s.head;
+                                        color: Theme.accent;
+                                        font-family: Theme.mono;
+                                        font-size: Theme.fs-body;
+                                        font-weight: 700;
+                                        letter-spacing: Theme.track-1;
+                                        wrap: word-wrap;
+                                    }
+                                    Text {
+                                        text: s.body;
+                                        color: Theme.text-mid;
+                                        font-family: Theme.sans;
+                                        font-size: Theme.fs-body;
+                                        wrap: word-wrap;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }

@@ -2,15 +2,15 @@
 // every callback the view invokes back. One global = the Rust glue binds one object and the panels
 // read/write `State.*`. This is the GUI's whole API to the engine.
 //
-// NAVIGATION (the void/Zune cull): SIX warranted panels, indexed 0..5 —
-//   0 Device   1 Lighting   2 Bindings   3 Spellweaving   4 Profiles   5 Settings
-// Audio (mic = Actions), Radial (folded into Spellweaving), Import (a wizard flow), and the
-// Dashboard/Performance split all stopped being top-level seats.
+// NAVIGATION (the void/Zune cull): FOUR top-level sections, indexed 0..3 —
+//   0 Device   1 Lighting   2 Input   3 System
+// Bindings + Spellweaving fold under INPUT (DIRECT/WEAVE); Profiles is a sheet; Audio (mic =
+// Actions), Radial (folded into Spellweaving), and Import (a wizard flow) aren't top-level seats.
 
 import {
     DeviceRow, RuleRow, ProfileRow, AppRuleRow, EffectRow, RadialSector, GlyphChip, ImportLine,
-    DiagRow, ActionChoice, GraphNode, GraphEdge, LayerRow, OrganRow, MaterialCard, KnobRow,
-    PocketCard, BeaconMacro, RhythmBindRow
+    DiagRow, ActionChoice, LayerRow, OrganRow, MaterialCard, KnobRow,
+    PocketCard, BeaconMacro, RhythmBindRow, MacroBlock, MacroCard, EffectTile, EffectParam
 } from "models.slint";
 
 export global State {
@@ -66,6 +66,20 @@ export global State {
     callback try-whiteboard();                       // open a whiteboard session right now
     in-out property <bool> profile-sheet-open: false; // the PROFILES sheet (a global affordance, not a section)
 
+    // ── GUIDE — the in-app help system (a "book button" opens a popup). The popup is a CLICK-AWAY
+    // TOOLTIP by default; DRAG its title bar and it promotes to a STICKY, draggable window with an X.
+    // Content is data-driven (GuideContent in guides.slint) and selected by `guide-active-id`, so a
+    // new guide = add data + drop a GuideButton (no new wiring). The popup lives at the window root.
+    in-out property <bool> guide-open: false;        // the popup is showing
+    in-out property <string> guide-active-id;        // which guide (matches a GuideContent.guides[].id)
+    in-out property <bool> guide-sticky: false;      // false = tooltip (click-away closes) · true = pinned window
+    in-out property <length> guide-x;                // popup top-left (the popup clamps it on-screen)
+    in-out property <length> guide-y;
+    callback guide-toggle(string, length, length);   // (id, anchor-x, anchor-y) — open at the button, or toggle off if same
+    callback guide-make-sticky();                    // promote tooltip -> pinned (the instant a title-bar drag begins)
+    callback guide-move(length, length);             // (x, y) — reposition the pinned popup
+    callback guide-close();                          // hide it
+
     // ── Device (merged Dashboard + Performance) ──────────────────────────
     in-out property <[DeviceRow]> devices;
     in-out property <int> selected-device: 0;        // index into devices
@@ -81,6 +95,16 @@ export global State {
     in-out property <bool> sel-can-scroll: false;
     in-out property <bool> sel-can-store: false;
     in-out property <bool> sel-can-idle: false;
+    // the selected device has swappable SIDE PLATES (a [side_plates] map). When true, the DEVICE page
+    // surfaces the last plate the mouse pushed. The plate is push-only (no getter) — see selected-plate.
+    in-out property <bool> sel-can-plate: false;
+    // the last side-plate label the mouse pushed ("12-button" / "6-button" / "detached"); "" = unknown
+    // yet. Seeded on selection from the last-known plate; kept fresh by a light poll while the app runs.
+    in-out property <string> selected-plate: "";
+    // EXTENDED HyperPolling (>1000Hz, the 0x00/0x40 path) — true ONLY for known extended PIDs (the
+    // HyperPolling Wireless Dongle + Viper-8K-class). The Naga's stock dongle is legacy-capped at
+    // 1000Hz, so this is false for it and the HYPERPOLLING card shows an honest "use REPORT RATE" note.
+    in-out property <bool> sel-can-hyperpoll: false;
     // audio-endpoint controls (shown when the selected device is a mic/output): act on the selected
     // endpoint by its id, NOT the system default.
     in-out property <float> device-volume: 50;       // 0..100
@@ -98,6 +122,16 @@ export global State {
     callback apply-dpi(float);
     callback apply-polling(float);
     callback apply-brightness(float);
+    // the EVERYDAY DECK's global commit — one gesture for the whole FEEL tier instead of a per-control
+    // apply on each row. `apply-feel` writes every everyday capability the selected device supports
+    // (dpi / polling / brightness / dpi-stages) in one go. (Revert is just SCAN — `refresh-devices`
+    // re-seeds the controls from the device. The gated ADVANCED writes stay deliberate / per-control;
+    // sniper auto-saves; persist is immediate — none ride this.)
+    callback apply-feel();
+    // the FEEL deck's ADVANCED reveal (gated hardware writes) open state. A global, not a local element
+    // property on the conditional deck VerticalLayout — that write proved unreliable (clicking the
+    // disclosure did nothing). Persists across reselects, which is fine.
+    in-out property <bool> feel-adv-open: false;
 
     // ── EVERY perf control Synapse buries (Device panel) ─────────────────
     // DPI STAGE LIST — the cycle, applied as a full table (writes::set_dpi_stages).
@@ -139,8 +173,19 @@ export global State {
     in-out property <bool> disable-alt-f4: false;
     in-out property <bool> disable-alt-esc: false;
     callback apply-gaming-mode();
-    // LIFT-OFF distance + DEBOUNCE — honest hardware-pending stubs (greyed, [gated]).
-    in-out property <bool> lod-supported: false;       // false until the opcode is RE'd
+    // LIFT-OFF distance — REAL verify-gated write (symmetric low/med/high). Verify-gated +
+    // env-gated (NEURON_LOD_WRITE) until confirmed on hardware; the read-back is the safety net.
+    in-out property <int> lod-level: 0;                // 0 low / 1 medium / 2 high
+    in-out property <string> lod-readout: "—";         // live read of the current device level
+    callback apply-lod(int);
+    // ASYMMETRIC LIFT-OFF (separate lift vs landing) — the Focus-Pro-30K flex. `lod-async` picks
+    // even (false) vs split (true); the split pair rides lod-lift (2..26) / lod-land (1..25).
+    // Verify-gated (writes::set_lift_off_asymmetric re-reads 0x0B/0x85). razerctl-derived.
+    in-out property <bool> lod-async: false;           // false = even (symmetric), true = split
+    in-out property <int> lod-lift: 8;                 // lift-off level 2..26 (async mode)
+    in-out property <int> lod-land: 8;                 // landing level 1..25 (async mode)
+    callback apply-lod-async(int, int);
+    // DEBOUNCE — honest hardware-pending stub (greyed, [gated]); no opcode known.
     in-out property <bool> debounce-supported: false;
     in-out property <string> perf-status: "";          // last perf-control result line
 
@@ -150,7 +195,7 @@ export global State {
     in-out property <[EffectRow]> effects-sw;          // Neuron-computed bank (display)
     in-out property <int> selected-effect: -1;       // the cursor (browsing) — hairline, never accent
     in-out property <int> applied-effect: -1;        // what the DEVICE is actually running — the accent
-    in-out property <string> light-color: "4AF2B0";  // hex RRGGBB (the phosphor accent default)
+    in-out property <string> light-color: "4af2b0";  // hex RRGGBB (the phosphor accent default; lowercase to match Palette.accent)
     in-out property <bool> light-color-valid: true;  // live parse verdict for the hex field
     in-out property <color> brush-color: #4af2b0;     // parsed brush colour (Rust keeps in sync)
     in-out property <int> grid-rows: 0;
@@ -192,6 +237,45 @@ export global State {
     callback composite-stop();
     callback import-light-file();                    // pick a .ChromaEffects / .synapse3 → frame or layer
 
+    // ── Lighting UNIFIED SURFACE — the render-first, tile-driven page ─────
+    // ONE grid of live-preview tiles (effects AND data modes together); picking one plays it on the
+    // render and auto-renders its declared params inline (the weave-knobs pattern). The layer stack
+    // (above) is the backend; this is the calm front: a single effect is the default, stacking is an
+    // optional spatial act, paint is a brush you pick up — no mode toggle, no layers list.
+    in-out property <[EffectTile]> light-tiles;       // the grid (effects + data + stub), each a live swatch
+    in-out property <string> light-effect: "";        // the active tile's slug (lights the tile, drives the knobs); "" = none
+    in-out property <[EffectParam]> light-params;     // the active effect's auto-rendered param controls (range/enum/toggle)
+    // the active effect's COLOUR knob, lifted out of the schema so the page renders its swatch row
+    // (Rust knows the schema when it builds light-params, so this avoids a model-scan in the view).
+    in-out property <bool> light-uses-color: false;   // does the active effect declare a colour knob?
+    in-out property <string> light-color-hex: "4af2b0"; // the active effect's colour, RRGGBB
+    in-out property <color> light-color-col: #4af2b0;   // parsed, for the swatch fill
+    // STREAM RATE — the frame-rate the live effect runs at, driving BOTH the device stream AND this
+    // page's preview (they tick together). Seeded per-device on selection (legacy → 6, matrix → 30);
+    // the user tunes from there. `light-is-data` gates the control off for DATA readouts (no rate).
+    in-out property <float> light-fps: 30;
+    in-out property <bool> light-fps-legacy: false;   // selected board is a slow legacy keyboard (~6 fps)
+    in-out property <bool> light-is-data: false;      // active tile is a DATA readout, not a tunable effect
+    callback set-light-fps(float);                     // re-pace the live stream + preview together (1–30)
+    callback tile-preview-tick();                     // re-render the grid swatches (animated, ~throttled)
+    callback pick-tile(string);                       // slug → make it the active single effect, play on render + show knobs
+    callback set-param-range(string, float);          // (param key, value) — a slider edit
+    callback set-param-enum(string, int);             // (param key, index) — a segment edit
+    callback set-param-color(string);                 // (hex) — the colour swatch/field
+    callback set-param-toggle(string, bool);          // (param key, on) — a switch edit
+    // STACK — the optional spatial composite. `light-stack-count` is how many effects are layered
+    // (1 = the simple single-effect default; >1 = you stacked). A light strip shows the stack; +stack
+    // adds the active effect as another layer; tapping a strip cell selects that layer as the active one.
+    in-out property <int> light-stack-count: 0;
+    callback stack-current();                          // add the active effect as another layer on top
+    callback select-stack(int);                        // make stack layer `i` the active (knobs follow it)
+    callback remove-stack(int);                        // drop stack layer `i`
+    // PAINT — a brush you pick up ON the render (not a top-level mode). Off = effects play; on = your
+    // pointer paints cells in the brush colour over the current frame.
+    in-out property <bool> light-brush-on: false;     // is the per-key brush picked up?
+    callback toggle-brush();                           // pick up / put down the paint brush
+    callback push-painted();                           // commit the painted frame to the device
+
     // ── Bindings (remap + HyperShift + macros + mic-as-Actions) ──────────
     in-out property <[RuleRow]> rules;
     in-out property <[RuleRow]> hypershift-rules;
@@ -205,6 +289,12 @@ export global State {
     // smart (tap latches, hold is momentary) | one-shot (next press only). Persisted in feel.toml.
     in-out property <string> hypershift-mode: "hold";
     callback set-hypershift-mode(string);
+    // the HyperShift HOLD KEY — the control you hold to REACH the second layer (a Noop activator rule
+    // on the layer; Rust surfaces it + filters it out of the shifted list). "—" / not-ready when unset.
+    in-out property <string> hypershift-hold-label: "—";
+    in-out property <bool> hypershift-hold-ready: false;
+    callback capture-hypershift-hold();               // press-to-bind the hold key
+    callback clear-hypershift-hold();
     // the FEEL timing windows (feel.toml), in ms — the press grammar's forgiveness knobs:
     //   hold = tap↔hold cutoff · gap = max silence between phrase presses · coyote = post-release tail.
     // Seeded from FeelConfig at startup; one callback mirrors set-hypershift-mode (load → set → save → reload).
@@ -212,15 +302,6 @@ export global State {
     in-out property <int> feel-gap-ms: 280;
     in-out property <int> feel-coyote-ms: 120;
     callback set-feel-timing(int, int, int);          // hold_ms, gap_ms, coyote_ms
-    // GRAPH VIEW — the spine as a node board (triggers → actions, macro chains as step nodes).
-    // Timings ride on the connections; angles are shown at each chip. Layout persists.
-    in-out property <bool> graph-view: false;
-    in-out property <[GraphNode]> graph-nodes;
-    in-out property <[GraphEdge]> graph-edges;
-    in-out property <int> selected-edge: -1;
-    callback move-node(int, float, float);            // node index, new canvas x/y (while dragging)
-    callback node-dropped();                          // drag ended — persist the layout
-    callback set-edge-timing(int, string);            // edge index, new value (ms or cps)
     in-out property <int> editable-count: 0;          // how many of `rules` are GUI-authored (the tail)
     in-out property <int> editable-hyper-count: 0;    // same for the hypershift column
     // PRESS-TO-BIND a new spine rule: capture the HID control you press, pick an Action, write it to
@@ -254,6 +335,18 @@ export global State {
     callback set-out-gain(float);
     callback toggle-out-mute();
     callback refresh-out();
+    // LIVE METERS — the channel strips' DaVinci-style peak preview. `*-level` is the dB-mapped,
+    // ballistic level (0..1); `*-hold` is the falling peak-hold tick; `*-clip` latches on a near-0dBFS
+    // hit. Rust opens the meters while the DIRECT page is visible (set-audio-metering) and pushes these
+    // ~30fps (poll-audio-levels). They cost nothing when that page isn't showing.
+    in-out property <float> mic-level: 0.0;
+    in-out property <float> mic-hold: 0.0;
+    in-out property <bool>  mic-clip: false;
+    in-out property <float> out-level: 0.0;
+    in-out property <float> out-hold: 0.0;
+    in-out property <bool>  out-clip: false;
+    callback set-audio-metering(bool);   // open/close the meters as the audio page shows/hides
+    callback poll-audio-levels();        // ~30fps: read peaks → ballistics → the six props above
     // macro authoring: write PYTHON -> check (syntax) -> save+register -> test run.
     // A macro is real CPython run warm by the Macro Host sidecar (full power: ctypes/subprocess/
     // anything). `def macro(ctx):` is the entry; `import neuron` gives ctx + key/clipboard/mouse/run.
@@ -265,6 +358,41 @@ export global State {
     // does the editor source contain a neuron.ask() — gates the self-surfacing "test asks" button.
     // Computed in Rust (Slint 1.16 has no string.contains) via note-macro-source on every edit.
     in-out property <bool> macro-has-ask: false;
+    // NODE-BLOCKS CANVAS — the DIRECT-MANIPULATION macro constructor. `macro-code-view` is the two-
+    // position switch: false = the blocks canvas (you build the macro by touch), true = the raw Python
+    // editor (the CodeArea). The TRUE source of truth is a `Vec<MacroNode>` held in the Rust glue; the
+    // canvas mutates THAT tree via the edit-ops below, then Rust regenerates `macro-source` (pure Rust
+    // codegen, instant) and re-flattens into `macro-blocks` synchronously — so the canvas + code view
+    // never drift. `macro-blocks` is the flat display model (steps + lanes + add-points; see MacroBlock).
+    //
+    // EDIT-OPS — each mutates the Rust tree, regenerates the source, re-flattens, all instant (no Python):
+    //   edit-step(path, value)   set the addressed node's param
+    //   add-step(insert, kind)   append a default node of `kind` to the body at `insert`
+    //   delete-step(path)        remove the addressed node (an ask takes its branches with it)
+    //   move-step(path, dir)     reorder within the node's own body (-1 up / +1 down, clamped)
+    //
+    // BIDIRECTIONAL SYNC (no loops): a canvas edit regenerates the source AND sets `macro-source-dirty`
+    // so the code editor's `edited` hook knows that change came from codegen and skips the re-parse. A
+    // change the USER types in code view leaves the flag false → `refresh-macro-blocks` re-parses OFF the
+    // UI thread (parse_macro blocks up to FIRE_BUDGET) and, on Ok, RESEEDS the tree + repopulates blocks;
+    // on a syntax error it KEEPS the last good blocks (the canvas never blanks) + shows "line N: msg".
+    in-out property <bool> macro-code-view: true;    // CODE-first by default; false = the blocks canvas
+    in-out property <[MacroBlock]> macro-blocks;
+    in-out property <string> macro-parse-error: "";  // "" = ok; else "line N: msg" shown inline
+    in-out property <bool> macro-parsing: false;     // a parse is in flight (show a subtle spinner)
+    // set true by Rust whenever IT regenerates `macro-source` from the tree (a canvas edit / a parse
+    // reseed). The CodeArea's `edited` hook reads + clears it: if it was set, the keystroke was codegen,
+    // not a human — skip the re-parse so an edit doesn't loop back through the parser.
+    in-out property <bool> macro-source-dirty: false;
+    // FOCUS-ON-ADD: set by Rust to the path of a just-added step (or its question field for an `ask`).
+    // The rendered step field, on `init`, focuses itself if its path matches, then clears this — so a
+    // fresh step is ready to type into with no second click. "" = no pending focus target.
+    in-out property <string> macro-focus-path: "";
+    callback edit-step(string, string);              // (path, value) -> set the node's param
+    callback add-step(string, string);               // (insert-context, kind) -> append a default node
+    callback delete-step(string);                    // (path) -> remove the node
+    callback move-step(string, int);                 // (path, dir) -> reorder within its body
+    callback refresh-macro-blocks(string);           // (source) -> parse off-thread -> reseed tree + set macro-blocks/-error
     callback macro-check(string);                     // ast.parse only — no execution
     callback macro-save(string, string);              // (name, source) -> persist + register warm
     callback macro-test(string, string);              // (name, source) -> register + run once now
@@ -273,6 +401,15 @@ export global State {
     // to discover + learn the ask/beacon syntax by seeing it work.
     callback test-asks(string, string);
     callback note-macro-source(string);               // editor source edited -> Rust recomputes macro-has-ask
+    // THE WORKSHOP CATALOG — every macro on disk, read emergently so users understand their macros
+    // without opening the code. Each card carries the plain-English summary (from its nodes), its size,
+    // its option count, and the trigger(s) that fire it (cross-ref'd from the loaded rules). Rebuilt on
+    // editor open, on reload, and on save. Clicking a card loads that macro into the editor.
+    in-out property <[MacroCard]> macro-catalog;
+    in-out property <bool> macro-catalog-building: false;  // a catalog rebuild is parsing off-thread
+    callback open-macro(string);                       // (id) -> load that macro's source into the editor
+    callback reveal-macros();                          // open the macros folder in the OS file manager (made if missing)
+    callback reload-macros();                          // re-scan disk -> register dropped-in macros -> rebuild catalog + reload the open macro
 
     // ── Spellweaving (merged gesture + radial: two facets of the cast engine) ─
     in-out property <[GlyphChip]> glyphs;             // the vault, each chip carrying its bound action
@@ -400,6 +537,11 @@ export global State {
     in-out property <bool> notif-brightness: true;
     in-out property <bool> notif-profile: true;
     in-out property <bool> notif-layer: true;
+    in-out property <bool> notif-macro: true;            // macro/beacon notify card (the ASK prompt is never gated)
+    in-out property <bool> notif-battery: true;          // device battery / charge cards (low/critical, charging, full)
+    in-out property <bool> notif-side-plate: true;       // swappable side-plate swap-detect card
+    in-out property <string> notif-stack: "stack";       // WHEN SEVERAL LAND: stack | latest | digest
+    callback set-notif-stack(string);
     callback set-notif-enabled(bool);
     callback set-notif-placement(string);
     callback set-notif-pos(float, float);                 // a free hand-placed spot (Rust snaps an exact preset back to its slug)
@@ -412,15 +554,26 @@ export global State {
     callback set-notif-panel(bool);
     callback set-notif-event(string, bool);               // (event-slug, on)
     callback test-notification();                          // fire a real test card of a random allowed kind
+
+    // ── MECHANICAL ADVANTAGES — opt-in, edge-giving device features behind a two-step consent ──
+    // Snap Tap (SOCD): resolves opposing key-pairs (A/D) to the last pressed → instant counter-strafe.
+    // Each option carries its own consent state: `revealed` (step 1, locked→visual) + `enabled`
+    // (step 2, the toggle). `supported` is seeded by Rust from a Synapse-4 keyboard PID allowlist —
+    // false on the user's BlackWidow Chroma V2, so the toggle stays honestly GATED there.
+    in-out property <bool> snap-tap-supported: false;     // a supporting (Synapse-4-era) keyboard is connected
+    in-out property <bool> snap-tap-revealed: false;      // step 1 done: the stage visual is unsealed
+    in-out property <bool> snap-tap-enabled: false;       // step 2: the feature is on (the device write)
+    callback set-snap-tap(bool);                          // enable/disable (perf-gated runtime write)
     callback write-flight-dump();                         // append a live snapshot to neuron-crash.log
     callback open-crash-log();                            // open neuron-crash.log in the default viewer
     callback toggle-writes-paused();
     callback toggle-input-armed();                    // SAFE-MODE: arm/disarm real input synthesis
     callback open-config-dir();
 
-    // PURGE SYNAPSE — kill every Razer Synapse process + stop its respawning services. Razer's
-    // slopware is a hydra (Synapse 3 esp.); this button stops the SYSTEM services first then sweeps
-    // the process table. Needs elevation, so it may trigger a UAC prompt.
+    // PURGE SYNAPSE — kill every Razer Synapse process + demote its respawning services to manual.
+    // Razer's slopware is a hydra (Synapse 3 esp.); this button sets the SYSTEM services to demand-start
+    // (gone from boot, but still launchable — never *disabled*, which permanently bricks Synapse) and
+    // stops them, then sweeps the process table. Needs elevation, so it may trigger a UAC prompt.
     callback purge-synapse();
     in-out property <string> purge-status: "";            // result line shown under the button
 

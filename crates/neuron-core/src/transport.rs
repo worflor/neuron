@@ -60,6 +60,16 @@ pub trait Transport {
     fn get_feature(&self, buf: &mut [u8]) -> Result<()>;
 }
 
+/// A read channel for device-INITIATED input reports — the unsolicited reports a device pushes on
+/// its own (e.g. a Razer mouse announcing "DPI is now X" when you press its onboard DPI button).
+/// Feature reports are pull (request/response); these are push, so they need their own handle opened
+/// with read access. `read` blocks until one report arrives (or the handle is closed). `Send` so a
+/// listener thread can own it.
+pub trait InputReader: Send {
+    /// Block for the next input report; returns the number of bytes written into `buf`.
+    fn read(&self, buf: &mut [u8]) -> Result<usize>;
+}
+
 #[cfg(windows)]
 mod windows_hid;
 
@@ -73,6 +83,14 @@ pub fn open_path(path: &DevicePath) -> Result<Box<dyn Transport>> {
     Ok(Box::new(windows_hid::WinHid::open(path)?))
 }
 
+/// Open a collection for READING its device-initiated input reports. Fails on OS-protected
+/// collections (the mouse/keyboard top-level collections deny `GENERIC_READ`); succeeds on the
+/// vendor collections where event reports actually ride.
+#[cfg(windows)]
+pub fn open_reader(path: &DevicePath) -> Result<Box<dyn InputReader>> {
+    Ok(Box::new(windows_hid::WinHidReader::open(path)?))
+}
+
 #[cfg(not(windows))]
 pub fn enumerate() -> Result<Vec<HidDeviceInfo>> {
     anyhow::bail!("transport not implemented on this platform yet (hidapi backend pending)")
@@ -80,5 +98,10 @@ pub fn enumerate() -> Result<Vec<HidDeviceInfo>> {
 
 #[cfg(not(windows))]
 pub fn open_path(_path: &DevicePath) -> Result<Box<dyn Transport>> {
+    anyhow::bail!("transport not implemented on this platform yet (hidapi backend pending)")
+}
+
+#[cfg(not(windows))]
+pub fn open_reader(_path: &DevicePath) -> Result<Box<dyn InputReader>> {
     anyhow::bail!("transport not implemented on this platform yet (hidapi backend pending)")
 }

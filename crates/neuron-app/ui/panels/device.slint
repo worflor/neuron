@@ -1,5 +1,5 @@
 import { Theme } from "../theme.slint";
-import { Card, SectionTitle, Label, Button, Field, Slider, ContactRow, Toggle, Pill, Mono, Divider, Readout, PanelHead } from "../widgets/controls.slint";
+import { Card, SectionTitle, Label, Button, Field, Slider, ContactRow, Toggle, Pill, Mono, Divider, Readout, PanelHead, SplitButton, SplitToggle } from "../widgets/controls.slint";
 import { State } from "../state.slint";
 import { DeviceRow } from "../models.slint";
 
@@ -159,6 +159,87 @@ component SheenText inherits Rectangle {
     }
 }
 
+// ── FEEL-pane grammar ─────────────────────────────────────────────────────
+// Small, local building blocks so every capability in the inspector reads on ONE rhythm — a quiet
+// labelled header, a consistent apply, and an honest (but elegant) "verify-gated" marker — instead
+// of the old scatter of loose sliders, raw env-var tags, and dev-speak paragraphs.
+
+// A capability heading inside a card — a small mono term on the left, an optional live readout on the
+// right (the current value / state), and an optional GATE marker. One look for DPI, REPORT RATE,
+// BRIGHTNESS, WHEEL MODE, SLEEP, … so the pane scans as a stack of like things.
+component CapHead inherits HorizontalLayout {
+    in property <string> term;
+    in property <string> readout: "";
+    in property <color> readout-ink: Theme.text-faint;
+    in property <bool> gated: false;
+    spacing: 8px;
+    VerticalLayout {
+        alignment: center;
+        Text {
+            text: root.term;
+            color: Theme.text-dim;
+            font-size: Theme.fs-small;
+            font-family: Theme.mono;
+            font-weight: 700;
+            letter-spacing: Theme.track-2;
+            vertical-alignment: center;
+        }
+    }
+    Rectangle { horizontal-stretch: 1; min-width: 8px; }
+    if root.readout != "" : VerticalLayout {
+        alignment: center;
+        Text {
+            text: root.readout;
+            color: root.readout-ink;
+            font-size: Theme.fs-small;
+            font-family: Theme.mono;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+    // the honesty marker — a single quiet caution dot in the SAME warn hue as the card's "verify-gated"
+    // pill (one vocabulary), NOT a second pill (the card header already wears the legend). It just says
+    // "this row is a real, verify-gated hardware write" at a glance, without leaking the write-path name.
+    if root.gated : VerticalLayout {
+        alignment: center;
+        Rectangle {
+            width: Theme.dot; height: Theme.dot; border-radius: 1px;
+            background: Theme.warn.with-alpha(0.6);
+        }
+    }
+}
+
+// One gated capability's standard footer note — a single quiet line in user-facing language. Keeps
+// the honesty (we never fake a working write) but trims the paragraph of dev jargon to one sentence.
+component GateNote inherits Mono {
+    color: Theme.text-faint;
+    wrap: word-wrap;
+}
+
+// A COMPACT FEEL TILE — one everyday capability boxed into a small well so the deck reads as a 2-up
+// grid of at-a-glance instruments instead of a stack of full-width rows (the "scroll dump" the deck
+// used to be). A faint hairline well, a tracked-out term up top, the control beneath. Tiles size to
+// content within their grid cell; the caller drops the control as @children.
+component FeelTile inherits Rectangle {
+    in property <string> term;
+    in property <string> readout: "";
+    in property <color> readout-ink: Theme.text-faint;
+    background: Theme.well.with-alpha(0.5);
+    border-radius: Theme.radius-sm;
+    border-width: Theme.hair;
+    border-color: Theme.line;
+    VerticalLayout {
+        padding: 11px;
+        spacing: 9px;
+        CapHead {
+            term: root.term;
+            readout: root.readout;
+            readout-ink: root.readout-ink;
+        }
+        @children
+    }
+}
+
 // One device channel — flat strip; a phosphor index tick marks the selected one.
 component DeviceLine inherits Rectangle {
     in property <DeviceRow> d;
@@ -298,6 +379,9 @@ component DeviceLine inherits Rectangle {
                     }
                     Readout { key: "LIGHT"; value: root.d.brightness; }
                     if root.d.storage != "" : Readout { key: "ONBOARD"; value: root.d.storage; }
+                    // SIDE PLATE — push-only readout under the mouse it belongs to (capability-gated,
+                    // shown only once a plate has actually been reported, so it's never a lie).
+                    if root.d.cap-plate && root.d.plate != "" : Readout { key: "PLATE"; value: root.d.plate; }
                     Readout { key: "FW"; value: root.d.firmware; }
                     Rectangle {}
                 }
@@ -320,15 +404,27 @@ export component DevicePanel inherits VerticalLayout {
 
     PanelHead {
         label: "DEVICE";
-        caption: "live device readout · pick a channel to tune";
+        caption: "live device readout";
         if State.writes-paused : VerticalLayout { alignment: center; Pill { text: "WRITES PAUSED"; tint: Theme.danger; } }
         VerticalLayout { width: 8px; }
-        // explicit width so the action sizes to its LABEL and sits flush-right, instead of a stretch:1
-        // Button ballooning to fill the head slot (the over-long "re-scan"). Same idiom as `backup`.
+        // SCAN ⇄ APPLY as one joined control (the DIRECT/WEAVE split-button idiom). SCAN re-reads every
+        // device (and so doubles as the FEEL deck's revert — it re-seeds the drafts from the hardware);
+        // APPLY commits the selected device's FEEL drafts in one write. APPLY lights only when a tunable
+        // HID is selected (a mic/output or empty selection leaves it quiet); SCAN is always live.
         VerticalLayout {
-            width: 90px;
+            width: 150px;
             alignment: center;
-            Button { text: "re-scan"; primary: true; clicked => { State.refresh-devices(); } }
+            SplitButton {
+                left-text: "scan";
+                right-text: "apply";
+                right-primary: true;
+                right-enabled: !State.writes-paused
+                    && (State.selected-device-kind == "mouse"
+                        || State.selected-device-kind == "keyboard"
+                        || State.selected-device-kind == "device");
+                left-clicked => { State.refresh-devices(); }
+                right-clicked => { State.apply-feel(); }
+            }
         }
     }
     Rectangle { height: Theme.hair; background: Theme.line; }
@@ -376,19 +472,32 @@ export component DevicePanel inherits VerticalLayout {
 
         // ── feel + ADVANCED controls for the selected device ──────────────
         VerticalLayout {
-            horizontal-stretch: 1;
-            min-width: 340px;
-            preferred-width: 340px;
-            // a FIXED-footprint inspector — the selected device's controls scroll WITHIN this pane, so
-            // switching mouse / keyboard / mic never resizes the panel (a good UI is a static surface).
+            // TRULY fixed width (min == max) so the panel is a constant footprint the content can NEVER
+            // resize — toggling ADVANCED, content fitting-vs-scrolling, and focus re-layout all left it
+            // visibly shifting before this. 410 fits the widest row (the 7-chip hyperpolling) and still
+            // leaves the device list above its floor at the 900px-min window. The list (stretch) eats the
+            // rest. This is the "fixed-footprint inspector" the design always intended.
+            horizontal-stretch: 0;
+            min-width: 410px;
+            preferred-width: 410px;
+            max-width: 410px;
             Flickable {
+                // WHEEL-ONLY, exactly like the page-level PanelPage. A plain (drag-to-flick) Flickable
+                // HIJACKS a click-drag that begins on a child control into a scroll — that competition is
+                // why controls in this pane (the ▸ advanced disclosure especially) clicked inconsistently
+                // once it had scrolled, while working fine maximized (nothing to scroll). `interactive:
+                // false` drops the drag gesture; the mouse wheel still scrolls.
+                interactive: false;
                 viewport-width: self.width;
                 viewport-height: max(self.height, ibody.preferred-height);
                 ibody := VerticalLayout {
                     width: parent.viewport-width;
-                    // top-pack at NATURAL size — never stretch the cards to fill the taller pane (that
-                    // was the empty-gap / resizing artifact); the pane stays fixed, content scrolls.
+                    // fill the viewport (match PanelPage's body) so the scroll geometry is exact; cards
+                    // still sit at NATURAL size, top-packed (alignment:start) — no stretch / empty-gap.
+                    height: parent.viewport-height;
                     alignment: start;
+                    // a little breathing room under the last element at max-scroll.
+                    padding-bottom: 18px;
             // the controls act on a SELECTED channel — with none, don't present live-looking controls
             if State.devices.length == 0 : VerticalLayout {
                 padding-top: 24px;
@@ -427,198 +536,168 @@ export component DevicePanel inherits VerticalLayout {
             // HID peripheral (mouse / keyboard) selected — the FEEL + ADVANCED control stack.
             if (State.selected-device-kind == "mouse" || State.selected-device-kind == "keyboard" || State.selected-device-kind == "device") : VerticalLayout {
                 spacing: 16px;
+
+                // ── FEEL — the EVERYDAY DECK: one cohesive, dense, at-a-glance card. DPI is the hero
+                // (its stage cycle folded in beneath the fader); the rest live as a compact 2-up tile
+                // grid. NO per-control applies — ONE global [ reload | apply ] commits the whole tier
+                // (sniper auto-saves + persist is immediate, so they ride their own writes, not apply).
                 if (State.sel-can-dpi || State.sel-can-poll || State.sel-can-light || State.sel-can-store) : Card {
                     VerticalLayout {
                         padding: 18px;
                         spacing: 14px;
+                        // header: FEEL · device name (the apply lives up top, joined to SCAN in the head)
                         HorizontalLayout {
                             SectionTitle { text: "FEEL"; }
                             Rectangle {}
-                            Mono { text: State.selected-device-name; color: Theme.text-faint; overflow: elide; }
-                        }
-                        Mono { text: "seeded from the device · applied to the selected channel"; color: Theme.text-faint; wrap: word-wrap; }
-                        // the stage table rides the fader as detent ticks — the cycle, on the control
-                        if State.sel-can-dpi : VerticalLayout { spacing: 14px;
-                        Slider {
-                            caption: "DPI";
-                            minimum: 100; maximum: 30000; value: State.dpi;
-                            step: 50;
-                            detents: State.dpi-stage-nums;
-                            changed(v) => { State.dpi = v; }
-                        }
-                        HorizontalLayout {
-                            spacing: 10px;
-                            Mono { text: "ticks mark the stage cycle · scroll for ±50"; color: Theme.text-faint; wrap: word-wrap; horizontal-stretch: 1; min-width: 0px; }
-                            Button {
-                                text: "apply dpi"; primary: true;
-                                enabled: !State.writes-paused;
-                                clicked => { State.apply-dpi(State.dpi); }
+                            VerticalLayout {
+                                alignment: center;
+                                spacing: 2px;
+                                Mono { text: State.selected-device-name; color: Theme.text-faint; overflow: elide; }
+                                // SIDE PLATE — the swappable plate the mouse last reported (push-only;
+                                // no getter). Shown only for a device with plates AND a known value, so
+                                // it's never a lie. A small honest "side plate · 12-button" readout.
+                                if State.sel-can-plate && State.selected-plate != "" : Mono {
+                                    text: "side plate · " + State.selected-plate;
+                                    color: Theme.text-mid;
+                                    overflow: elide;
+                                }
                             }
                         }
-                        Divider {}
-                        }
-                        // polling is 4 legal rates — discrete contacts, applied on press (the lit
-                        // contact IS the device state; no fake-continuous fader, no phantom 643 Hz)
-                        // POLLING is a 4-state contact pick — its readout sits at DATA scale, not the
-                        // 26px hero slot (DPI is the panel's one hero, on its fader's readout)
-                        if State.sel-can-poll : VerticalLayout { spacing: 14px;
-                        HorizontalLayout {
-                            Text {
-                                text: "POLLING";
-                                color: Theme.text-dim;
-                                font-size: Theme.fs-small;
-                                font-family: Theme.mono;
-                                letter-spacing: Theme.track-2;
-                                vertical-alignment: center;
+
+                        // ── DPI HERO — the big value + fader (detents = the stage cycle), with the
+                        // active-stage cycle (the stages field + i+1:stage active pills) folded in
+                        // beneath it as one hero block. No per-control apply: the global apply commits.
+                        if State.sel-can-dpi : VerticalLayout {
+                            spacing: 9px;
+                            Slider {
+                                caption: "DPI";
+                                minimum: 100; maximum: 30000; value: State.dpi;
+                                step: 50;
+                                detents: State.dpi-stage-nums;
+                                changed(v) => { State.dpi = v; }
                             }
-                            Rectangle {}
+                            // the stage cycle, folded under the fader — the list + which stage is active.
                             HorizontalLayout {
-                                spacing: 3px;
-                                Text {
-                                    text: round(State.polling-hz);
-                                    color: Theme.text;
-                                    font-size: Theme.fs-data;
-                                    font-weight: 600;
-                                    font-family: Theme.mono;
-                                    vertical-alignment: center;
+                                spacing: 8px;
+                                Field {
+                                    field-width: 220px;
+                                    placeholder: "800/1600/3200/6400";
+                                    text <=> State.dpi-stages;
+                                    invalid: !State.dpi-stages-valid;
+                                    edited(t) => { State.dpi-stages-edited(t); }
+                                    // draft only — Enter just confirms the text; the global apply commits
+                                    // it (an immediate apply here would write stages while DPI/rate/etc.
+                                    // stay pending, which contradicts the one-apply deck).
+                                    accepted(t) => { State.dpi-stages-edited(t); }
                                 }
-                                Text {
-                                    text: "Hz";
-                                    color: Theme.text-faint;
-                                    font-size: Theme.fs-small;
-                                    font-family: Theme.mono;
-                                    vertical-alignment: center;
-                                }
-                            }
-                        }
-                        ContactRow {
-                            options: [125, 250, 500, 1000];
-                            value: round(State.polling-hz);
-                            enabled: !State.writes-paused;
-                            picked(hz) => { State.apply-polling(hz); }
-                        }
-                        Divider {}
-                        }
-                        if State.sel-can-light : VerticalLayout { spacing: 14px;
-                        Slider {
-                            caption: "BRIGHTNESS";
-                            minimum: 0; maximum: 100; value: State.brightness; unit: "%";
-                            step: 5;
-                            changed(v) => { State.brightness = v; }
-                        }
-                        HorizontalLayout {
-                            Rectangle { horizontal-stretch: 1; }
-                            Button {
-                                text: "apply"; primary: true;
-                                enabled: !State.writes-paused;
-                                clicked => { State.apply-brightness(State.brightness); }
-                            }
-                        }
-                        }
-                        if State.sel-can-store : Divider {}
-                        if State.sel-can-store : VerticalLayout { spacing: 14px;
-                        Toggle {
-                            caption: "persist to onboard memory";
-                            checked: State.persist-to-onboard;
-                            toggled(v) => { State.persist-to-onboard = v; State.set-persist(v); }
-                        }
-                        Mono { text: "onboard VARSTORE · matrix mice only — the \"no software\" dream"; color: Theme.text-faint; wrap: word-wrap; }
-                        }
-                    }
-                }
-
-                // ── ADVANCED · LIVE — verified writes, no gate ─────────────
-                if State.sel-can-dpi : Card {
-                    VerticalLayout {
-                        padding: 18px;
-                        spacing: 13px;
-                        SectionTitle { text: "ADVANCED · LIVE"; }
-                        if State.perf-status != "" : Mono { text: State.perf-status; color: Theme.text-mid; wrap: word-wrap; }
-
-                        // DPI STAGE LIST (the cycle) — table + the active stage as contacts
-                        HorizontalLayout {
-                            Mono { text: "DPI STAGES"; color: Theme.text-dim; }
-                            Rectangle { horizontal-stretch: 1; min-width: 8px; }
-                            Mono {
-                                text: State.dpi-stages-note;
-                                color: State.dpi-stages-valid ? Theme.text-faint : Theme.danger;
-                                overflow: elide;
-                                min-width: 0px;
-                            }
-                        }
-                        HorizontalLayout {
-                            spacing: 8px;
-                            Field {
-                                field-width: 260px;
-                                placeholder: "800/1600/3200/6400";
-                                text <=> State.dpi-stages;
-                                invalid: !State.dpi-stages-valid;
-                                edited(t) => { State.dpi-stages-edited(t); }
-                                accepted(t) => { State.apply-dpi-stages(t, State.dpi-active-stage); }
-                            }
-                            Button {
-                                text: "apply stages";
-                                primary: true;
-                                enabled: !State.writes-paused && State.dpi-stages-valid;
-                                clicked => { State.apply-dpi-stages(State.dpi-stages, State.dpi-active-stage); }
-                            }
-                        }
-                        // pick which stage is ACTIVE — the second half of the feature, reachable
-                        HorizontalLayout {
-                            spacing: 6px;
-                            Mono { text: "active"; color: Theme.text-faint; }
-                            for s[i] in State.dpi-stage-nums : Pill {
-                                text: (i + 1) + ":" + s;
-                                selected: i == State.dpi-active-stage;
-                                clickable: true;
-                                clicked => { State.dpi-active-stage = i; }
-                            }
-                            Rectangle { horizontal-stretch: 1; min-width: 8px; }
-                            Mono {
-                                text: State.dpi-stage-nums.length > 0
-                                    ? "will write stage " + (State.dpi-active-stage + 1)
-                                    : "no stage";
-                                color: Theme.text-faint;
-                                overflow: elide;
-                                min-width: 0px;
-                            }
-                        }
-                        Divider {}
-
-                        // SNIPER / hold-to-precision-DPI
-                        HorizontalLayout {
-                            Mono { text: "SNIPER PRECISION"; color: Theme.text-dim; }
-                            Rectangle { horizontal-stretch: 1; min-width: 8px; }
-                            Mono {
-                                text: State.sniper-button == "—" ? "no hold button bound" : "hold " + State.sniper-button;
-                                color: State.sniper-button == "—" ? Theme.text-faint : Theme.accent;
-                                overflow: elide;
-                                min-width: 0px;
-                            }
-                        }
-                        Button { text: "capture hold button"; clicked => { State.capture-sniper-button(); } }
-                        Slider {
-                            caption: "PRECISION DPI";
-                            minimum: 100; maximum: 30000; value: State.sniper-dpi;
-                            step: 50;
-                            detents: State.dpi-stage-nums;
-                            changed(v) => { State.sniper-dpi = v; }
-                            // ONE config write per gesture, not one per drag-tick
-                            released(v) => { State.save-sniper(v); }
-                        }
-                        if State.dpi-stage-nums.length > 0 : HorizontalLayout {
-                            spacing: 6px;
-                            Mono { text: "presets"; color: Theme.text-faint; }
-                            for s in State.dpi-stage-nums : Pill {
-                                text: "" + s;
-                                selected: s == State.sniper-dpi;
-                                clickable: true;
-                                clicked => {
-                                    State.sniper-dpi = s;
-                                    State.save-sniper(s);
+                                VerticalLayout {
+                                    alignment: center; horizontal-stretch: 1; min-width: 0px;
+                                    Mono {
+                                        text: State.dpi-stages-note;
+                                        color: State.dpi-stages-valid ? Theme.text-faint : Theme.danger;
+                                        overflow: elide; min-width: 0px;
+                                    }
                                 }
                             }
-                            Rectangle {}
+                            // pick which stage is ACTIVE — the cycle's second half, the i+1:stage pills.
+                            HorizontalLayout {
+                                spacing: 6px;
+                                Mono { text: "stage"; color: Theme.text-faint; }
+                                for s[i] in State.dpi-stage-nums : Pill {
+                                    // compact stage NUMBER — the per-stage DPI values already live in the
+                                    // field above, and "i:value" chips overflowed + ellipsized ("1:8…")
+                                    // once a device exposed 5 stages with a wide value.
+                                    text: "" + (i + 1);
+                                    selected: i == State.dpi-active-stage;
+                                    clickable: true;
+                                    clicked => { State.dpi-active-stage = i; }
+                                }
+                                Rectangle { horizontal-stretch: 1; min-width: 8px; }
+                            }
+                        }
+
+                        // ── the compact tile cluster. REPORT RATE · BRIGHTNESS ride a 2-up row, each
+                        // stretching so a single-capability device fills the width instead of leaving a
+                        // dead half-cell. SNIPER + PERSIST sit full-width below: sniper's capture + fader
+                        // + presets want the room, and pairing the tall sniper with the short persist in
+                        // one cell read lopsided.
+                        VerticalLayout {
+                            spacing: 10px;
+                            if State.sel-can-poll || State.sel-can-light : HorizontalLayout {
+                                spacing: 10px;
+                                // REPORT RATE — DRAFT only now: pick sets State.polling-hz (the global
+                                // apply commits it via apply-polling), no per-press device write.
+                                if State.sel-can-poll : FeelTile {
+                                    horizontal-stretch: 1;
+                                    term: "REPORT RATE";
+                                    readout: round(State.polling-hz) + " Hz";
+                                    readout-ink: Theme.text-mid;
+                                    ContactRow {
+                                        options: [125, 250, 500, 1000];
+                                        value: round(State.polling-hz);
+                                        enabled: !State.writes-paused;
+                                        picked(hz) => { State.polling-hz = hz; }
+                                    }
+                                }
+                                // BRIGHTNESS — a compact fader, no per-control apply (global apply commits).
+                                if State.sel-can-light : FeelTile {
+                                    horizontal-stretch: 1;
+                                    term: "BRIGHTNESS";
+                                    readout: round(State.brightness) + "%";
+                                    readout-ink: Theme.text-mid;
+                                    Slider {
+                                        compact: true;
+                                        minimum: 0; maximum: 100; value: State.brightness;
+                                        step: 5;
+                                        changed(v) => { State.brightness = v; }
+                                    }
+                                }
+                            }
+                            // SNIPER — capture + precision DPI + presets, full-width (the tallest tile). A
+                            // CONFIG write (auto-saves on release), NOT part of the global apply.
+                            if State.sel-can-dpi : FeelTile {
+                                term: "SNIPER";
+                                readout: State.sniper-button == "—" ? "no button" : "hold " + State.sniper-button;
+                                readout-ink: State.sniper-button == "—" ? Theme.text-faint : Theme.accent;
+                                HorizontalLayout {
+                                    Button { text: "capture hold button"; clicked => { State.capture-sniper-button(); } }
+                                    Rectangle {}
+                                }
+                                Slider {
+                                    caption: "PRECISION DPI";
+                                    minimum: 100; maximum: 30000; value: State.sniper-dpi;
+                                    step: 50;
+                                    detents: State.dpi-stage-nums;
+                                    changed(v) => { State.sniper-dpi = v; }
+                                    // ONE config write per gesture, not one per drag-tick
+                                    released(v) => { State.save-sniper(v); }
+                                }
+                                if State.dpi-stage-nums.length > 0 : HorizontalLayout {
+                                    spacing: 6px;
+                                    Mono { text: "presets"; color: Theme.text-faint; }
+                                    for s in State.dpi-stage-nums : Pill {
+                                        text: "" + s;
+                                        selected: s == State.sniper-dpi;
+                                        clickable: true;
+                                        clicked => {
+                                            State.sniper-dpi = s;
+                                            State.save-sniper(s);
+                                        }
+                                    }
+                                    Rectangle {}
+                                }
+                            }
+                            // PERSIST — the onboard-memory toggle, full-width + slim. An IMMEDIATE write
+                            // (set-persist), NOT part of the global apply.
+                            if State.sel-can-store : FeelTile {
+                                term: "PERSIST";
+                                Toggle {
+                                    caption: "to onboard memory";
+                                    checked: State.persist-to-onboard;
+                                    toggled(v) => { State.persist-to-onboard = v; State.set-persist(v); }
+                                }
+                                Mono { text: "settings ride on the mouse with no app running. matrix mice only."; color: Theme.text-faint; wrap: word-wrap; }
+                            }
                         }
                     }
                 }
@@ -631,7 +710,7 @@ export component DevicePanel inherits VerticalLayout {
                         padding: 18px;
                         spacing: 13px;
                         SectionTitle { text: "KEY GUARD"; }
-                        Mono { text: "host-side · swallow OS chords mid-game (no device write)"; color: Theme.text-faint; wrap: word-wrap; }
+                        Mono { text: "swallow OS chords mid-game so they can't yank you out (host-side, no device write)."; color: Theme.text-faint; wrap: word-wrap; }
                         HorizontalLayout {
                             spacing: 7px;
                             for g in [
@@ -666,34 +745,55 @@ export component DevicePanel inherits VerticalLayout {
                                 }
                             }
                         }
-                        Mono { text: "lit = swallowed while a gaming profile is active · reversible (lifts on profile change)"; color: Theme.text-faint; }
+                        // wrap (was clipped at "…reversible (lif") — a chord guard lifts on profile change.
+                        Mono { text: "lit = swallowed while a gaming profile is active. reversible — lifts when the profile changes."; color: Theme.text-faint; wrap: word-wrap; }
                     }
                 }
 
-                // ── ADVANCED · GATED — verify-gated writes (each row names its gate) ──
-                if State.sel-can-dpi : Card {
+                // ── ADVANCED — a quiet disclosure line; the deep / gated HARDWARE WRITES live behind it,
+                // collapsed by default so the everyday deck stays the at-a-glance surface. These stay
+                // OUT of the global apply: each keeps its own deliberate per-control apply.
+                // ── ADVANCED — a quiet, FULL-WIDTH clickable disclosure line; the deep / gated HARDWARE
+                // WRITES live behind it, collapsed by default so the everyday deck stays the at-a-glance
+                // surface. The whole row is the hit target (can't be missed), and the open flag is a
+                // global (State.feel-adv-open). These stay OUT of the global apply: each keeps its own
+                // deliberate per-control apply.
+                if State.sel-can-dpi : Rectangle {
+                    height: 26px;
+                    adv-ta := TouchArea {
+                        mouse-cursor: MouseCursor.pointer;
+                        clicked => { State.feel-adv-open = !State.feel-adv-open; }
+                    }
+                    Text {
+                        x: 0; width: 100%; height: 100%;
+                        text: (State.feel-adv-open ? "▾ " : "▸ ") + "advanced · gated hardware writes";
+                        color: adv-ta.has-hover ? Theme.text-mid : Theme.text-faint;
+                        font-family: Theme.mono; font-size: Theme.fs-small;
+                        horizontal-alignment: left; vertical-alignment: center;
+                    }
+                }
+
+                // ── HARDWARE WRITES — real device paths, held until verified on the wire ──
+                // Same controls as before, but the raw write-path tags + dev paragraphs are gone:
+                // the card wears ONE quiet "verify-gated" marker and each verify-gated row echoes it
+                // with the same warn dot, so the trust zone reads as one system. We keep the controls
+                // honest, not faked. (DEBOUNCE is the lone exception: firmware-fixed, not verify-gated.)
+                if State.sel-can-dpi && State.feel-adv-open : Card {
                     VerticalLayout {
                         padding: 18px;
-                        spacing: 14px;
+                        spacing: 16px;
                         HorizontalLayout {
-                            SectionTitle { text: "GATED DEVICE WRITES"; }
+                            SectionTitle { text: "HARDWARE WRITES"; }
                             Rectangle {}
-                            Pill { text: "verify first"; tint: Theme.text-faint; }
+                            Pill { text: "verify-gated"; tint: Theme.warn; }
                         }
-                        Mono {
-                            text: "these paths are implemented but held behind per-feature gates until a USBPcap round-trip confirms the opcode on real hardware";
-                            color: Theme.text-faint;
-                            wrap: word-wrap;
-                        }
-                        VerticalLayout {
-                            spacing: 14px;
+                        GateNote { text: "real device paths, ready but held until the command is confirmed on your hardware — so nothing fires blind."; }
+                        if State.perf-status != "" : Mono { text: State.perf-status; color: Theme.text-mid; wrap: word-wrap; }
 
-                            // SCROLL / HyperScroll stages (class 0x0B — hardware-verify pending)
-                            HorizontalLayout {
-                                Mono { text: "HYPERSCROLL CYCLE"; color: Theme.text-dim; }
-                                Rectangle { horizontal-stretch: 1; min-width: 8px; }
-                                Pill { text: "NEURON_HYPERSCROLL_WRITE"; tint: Theme.text-faint; }
-                            }
+                        // WHEEL MODE — HyperScroll stages (class 0x0B — hardware-verify pending)
+                        VerticalLayout {
+                            spacing: 9px;
+                            CapHead { term: "WHEEL MODE"; gated: true; }
                             HorizontalLayout {
                                 spacing: 8px;
                                 Field {
@@ -705,7 +805,7 @@ export component DevicePanel inherits VerticalLayout {
                                     accepted(t) => { State.apply-scroll-stages(t); }
                                 }
                                 Button {
-                                    text: "apply wheel cycle";
+                                    text: "apply";
                                     enabled: !State.writes-paused && State.scroll-stages-valid;
                                     clicked => { State.apply-scroll-stages(State.scroll-stages); }
                                 }
@@ -718,43 +818,39 @@ export component DevicePanel inherits VerticalLayout {
                                 Pill { text: "tactile"; clickable: true; clicked => { State.scroll-stages = "tactile"; State.scroll-stages-edited(State.scroll-stages); } }
                                 Pill { text: "free"; clickable: true; clicked => { State.scroll-stages = "free"; State.scroll-stages-edited(State.scroll-stages); } }
                             }
-                            Divider {}
+                        }
+                        Divider {}
 
-                            // SLEEP / idle timer
-                            HorizontalLayout {
-                                Mono { text: "LIGHT SLEEP TIMER"; color: Theme.text-dim; }
-                                Rectangle { horizontal-stretch: 1; min-width: 8px; }
-                                Mono { text: "device " + State.idle-readout; color: Theme.text-faint; overflow: elide; }
-                                Pill { text: "NEURON_IDLE_WRITE"; tint: Theme.text-faint; }
+                        // SLEEP TIMER / idle-off timer
+                        VerticalLayout {
+                            spacing: 9px;
+                            CapHead {
+                                term: "SLEEP TIMER";
+                                readout: "now " + State.idle-readout;
+                                gated: true;
                             }
                             // field + live status on one line; the apply key drops to its OWN line so its
                             // verb is never clipped by the field/status in the narrow fixed panel.
-                            VerticalLayout {
+                            HorizontalLayout {
                                 spacing: 8px;
-                                HorizontalLayout {
-                                    spacing: 8px;
-                                    Field {
-                                        field-width: 160px;
-                                        placeholder: "300";
-                                        text <=> State.idle-secs-text;
-                                        invalid: !State.idle-secs-valid;
-                                        edited(t) => { State.idle-edited(t); }
-                                        accepted(t) => { State.apply-idle(State.idle-secs); }
-                                    }
-                                    Mono {
-                                        text: State.idle-secs-note;
-                                        color: State.idle-secs-valid ? Theme.text-faint : Theme.danger;
-                                        overflow: elide;
-                                        min-width: 0px;
-                                    }
+                                Field {
+                                    field-width: 160px;
+                                    placeholder: "300";
+                                    text <=> State.idle-secs-text;
+                                    invalid: !State.idle-secs-valid;
+                                    edited(t) => { State.idle-edited(t); }
+                                    accepted(t) => { State.apply-idle(State.idle-secs); }
                                 }
-                                HorizontalLayout {
-                                    Rectangle { horizontal-stretch: 1; }
-                                    Button {
-                                        text: "apply sleep timer";
-                                        enabled: !State.writes-paused && State.idle-secs-valid;
-                                        clicked => { State.apply-idle(State.idle-secs); }
-                                    }
+                                Mono {
+                                    text: State.idle-secs-note;
+                                    color: State.idle-secs-valid ? Theme.text-faint : Theme.danger;
+                                    overflow: elide;
+                                    min-width: 0px;
+                                }
+                                Button {
+                                    text: "apply";
+                                    enabled: !State.writes-paused && State.idle-secs-valid;
+                                    clicked => { State.apply-idle(State.idle-secs); }
                                 }
                             }
                             HorizontalLayout {
@@ -776,53 +872,120 @@ export component DevicePanel inherits VerticalLayout {
                                     }
                                 }
                             }
-                            Divider {}
+                        }
+                        Divider {}
 
-                            // IN-GAME polling — HyperPolling tiers are powers-of-two contacts,
-                            // not a fader where 125..1000 crush into the leftmost 11%.
-                            HorizontalLayout {
-                                Mono { text: "IN-GAME POLLING"; color: Theme.text-dim; }
-                                Rectangle { horizontal-stretch: 1; min-width: 8px; }
-                                Mono { text: round(State.ingame-wired-hz) + "/" + round(State.ingame-dongle-hz) + " Hz"; color: Theme.text-faint; overflow: elide; }
-                                Pill { text: "NEURON_INGAME_POLL_WRITE"; tint: Theme.text-faint; }
+                        // HYPERPOLLING — the EXTENDED (>1000Hz) rate path (0x00/0x40). Only REAL on the
+                        // separate HyperPolling Wireless Dongle / Viper-8K-class hardware; the Naga's stock
+                        // dongle is legacy-capped at 1000Hz. When the selected device CAN'T reach the
+                        // extended tiers we show an honest line instead of fake 2000–8000Hz chips.
+                        VerticalLayout {
+                            spacing: 9px;
+                            CapHead {
+                                term: "HYPERPOLLING";
+                                readout: State.sel-can-hyperpoll ? round(State.ingame-wired-hz) + " Hz" : "1000 Hz max";
+                                gated: State.sel-can-hyperpoll;
                             }
-                            Mono { text: "wired"; color: Theme.text-faint; }
-                            ContactRow {
-                                options: [125, 250, 500, 1000, 2000, 4000, 8000];
+                            if !State.sel-can-hyperpoll : GateNote {
+                                text: "this mouse polls up to 1000 Hz — set it in REPORT RATE above. 2000–8000 Hz HyperPolling needs Razer's separate HyperPolling Wireless Dongle.";
+                            }
+                            if State.sel-can-hyperpoll : GateNote {
+                                text: "the EXTENDED hi-res rate (>1000 Hz) for HyperPolling hardware — distinct from the live REPORT RATE up top.";
+                            }
+                            if State.sel-can-hyperpoll : ContactRow {
+                                options: [1000, 2000, 4000, 8000];
                                 value: round(State.ingame-wired-hz);
                                 enabled: !State.writes-paused;
                                 picked(hz) => { State.ingame-wired-hz = hz; }
                             }
-                            Mono { text: "dongle"; color: Theme.text-faint; }
-                            ContactRow {
-                                options: [125, 250, 500, 1000, 2000, 4000];
-                                value: round(State.ingame-dongle-hz);
-                                enabled: !State.writes-paused;
-                                picked(hz) => { State.ingame-dongle-hz = hz; }
-                            }
-                            HorizontalLayout {
+                            if State.sel-can-hyperpoll : HorizontalLayout {
                                 Rectangle { horizontal-stretch: 1; }
                                 Button {
-                                    text: "apply polling pair";
+                                    text: "apply";
                                     enabled: !State.writes-paused;
                                     clicked => { State.apply-ingame-polling(State.ingame-wired-hz, State.ingame-dongle-hz); }
                                 }
                             }
-                            Divider {}
+                        }
+                        Divider {}
 
-                            // LIFT-OFF DISTANCE + DEBOUNCE — honest hardware-pending stubs
-                            Mono { text: "SENSOR TIMING"; color: Theme.text-dim; }
-                            HorizontalLayout {
-                                Mono { text: "lift-off distance"; color: Theme.text-faint; }
-                                Rectangle {}
-                                Pill { text: "no opcode"; tint: Theme.text-faint; }
+                        // SENSOR TIMING — lift-off distance (REAL verify-gated write) + debounce (firmware-fixed).
+                        VerticalLayout {
+                            spacing: 9px;
+                            CapHead { term: "SENSOR TIMING"; gated: true; }
+                            // LIFT-OFF DISTANCE — even (symmetric low/med/high) OR split (separate LIFT vs
+                            // LANDING, the Focus-Pro-30K flex). Both are real verify-gated writes.
+                            CapHead { term: "LIFT-OFF DISTANCE"; readout: State.lod-readout; gated: true; }
+                            // even / split mode picker — flipping it doesn't write; the controls below do.
+                            SplitToggle {
+                                options: ["even", "split"];
+                                index: State.lod-async ? 1 : 0;
+                                picked(i) => { State.lod-async = i == 1; }
                             }
+                            // EVEN (symmetric) — the low/medium/high pills.
+                            if !State.lod-async : HorizontalLayout {
+                                spacing: 6px;
+                                Pill {
+                                    text: "low";
+                                    selected: State.lod-level == 0;
+                                    clickable: true;
+                                    clicked => { State.lod-level = 0; State.apply-lod(0); }
+                                }
+                                Pill {
+                                    text: "medium";
+                                    selected: State.lod-level == 1;
+                                    clickable: true;
+                                    clicked => { State.lod-level = 1; State.apply-lod(1); }
+                                }
+                                Pill {
+                                    text: "high";
+                                    selected: State.lod-level == 2;
+                                    clickable: true;
+                                    clicked => { State.lod-level = 2; State.apply-lod(2); }
+                                }
+                            }
+                            // SPLIT (asymmetric) — two compact faders (LIFT 2..26 / LANDING 1..25), each with
+                            // a readout, applying the PAIR on release (one write per gesture, like sniper).
+                            if State.lod-async : VerticalLayout {
+                                spacing: 6px;
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    Mono { text: "lift"; color: Theme.text-faint; }
+                                    Rectangle { horizontal-stretch: 1; }
+                                    Mono { text: round(State.lod-lift); color: Theme.text-mid; }
+                                }
+                                Slider {
+                                    compact: true;
+                                    minimum: 2; maximum: 26; value: State.lod-lift; step: 1;
+                                    wheel: false;
+                                    enabled: !State.writes-paused;
+                                    changed(v) => { State.lod-lift = v; }
+                                    released(v) => { State.lod-lift = v; State.apply-lod-async(State.lod-lift, State.lod-land); }
+                                }
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    Mono { text: "landing"; color: Theme.text-faint; }
+                                    Rectangle { horizontal-stretch: 1; }
+                                    Mono { text: round(State.lod-land); color: Theme.text-mid; }
+                                }
+                                Slider {
+                                    compact: true;
+                                    minimum: 1; maximum: 25; value: State.lod-land; step: 1;
+                                    wheel: false;
+                                    enabled: !State.writes-paused;
+                                    changed(v) => { State.lod-land = v; }
+                                    released(v) => { State.lod-land = v; State.apply-lod-async(State.lod-lift, State.lod-land); }
+                                }
+                            }
+                            // DEBOUNCE — no getter and no settable opcode; it's fixed in the firmware,
+                            // NOT verify-gated. An honest "fixed in firmware" statement (text-faint, no
+                            // caution) — distinct from the warn-dot verify-gated rows, never a fake knob.
                             HorizontalLayout {
                                 Mono { text: "debounce"; color: Theme.text-faint; }
                                 Rectangle {}
-                                Pill { text: "no opcode"; tint: Theme.text-faint; }
+                                Pill { text: "fixed in firmware"; tint: Theme.text-faint; }
                             }
-                            Mono { text: "not wired until a Synapse capture reveals class/id/payload; showing fake controls here would be dishonest"; color: Theme.text-faint; wrap: word-wrap; }
+                            GateNote { text: "lift-off distance (even or split) is a real, verify-gated write; debounce is fixed in the mouse's firmware — there's no setting to expose."; }
                         }
                     }
                 }

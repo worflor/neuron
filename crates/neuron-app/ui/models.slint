@@ -31,6 +31,8 @@ export struct DeviceRow {
     cap-scroll: bool,   // scroll-wheel stages
     cap-store: bool,    // persist-to-onboard
     cap-idle: bool,     // idle-off timer (wireless)
+    cap-plate: bool,    // swappable side plates (push-detected; surfaces the side-plate readout)
+    plate: string,      // last side plate the mouse pushed ("12-button"…); "" if none/non-plated
 }
 
 // A spine rule row (Bindings / HyperShift / Radial / Gesture editors all render these).
@@ -67,6 +69,39 @@ export struct EffectRow {
     name: string,
     native: bool,       // firmware-native vs Neuron-emulated
     uses_color: bool,
+}
+
+// One TILE in the LIGHTING grid — an effect (or a data mode) shown as a small LIVE preview swatch,
+// the MATERIAL-card pattern applied to lighting. `slug` is the stable id the picker passes back;
+// `kind` groups the tile ("effect" | "data" | "stub"); `swatch` is the rendered preview image (the
+// tile IS the effect, running). Selection is derived in the view (slug == State.light-effect).
+export struct EffectTile {
+    name: string,        // human label ("Breathing", "Mouse Battery")
+    slug: string,        // generator/data id ("breathing", "mouse-battery")
+    kind: string,        // "effect" | "data" | "stub"
+    swatch: image,       // a live (or representative) preview of this tile, rendered Rust-side
+}
+
+// One auto-rendered PARAM control for the selected effect — the weave-knobs pattern applied to
+// lighting. The effect DECLARES its schema (effects::schema) as data; the UI renders one control per
+// row keyed off `kind`. `key` is the stable id the setter keys on; the value lives in the field the
+// kind uses (fval for range, ival for enum/colour-index-less, bval for toggle, hex/col for colour).
+export struct EffectParam {
+    key: string,         // "speed" | "direction" | "color" | "density" | "fade" | "breath" | …
+    label: string,       // human label ("speed", "direction")
+    kind: string,        // "range" | "enum" | "color" | "toggle"
+    // range
+    fval: float,
+    fmin: float,
+    fmax: float,
+    // enum (segment) — the option labels; ival = chosen index
+    options: [string],
+    ival: int,
+    // color
+    hex: string,
+    col: color,
+    // toggle
+    bval: bool,
 }
 
 // One layer of the lighting COMPOSITOR — an effect generator bound to its own colour, motion,
@@ -166,29 +201,6 @@ export struct DiagRow {
     state: string,       // "pass" | "fail" | "skip" | "pending"
 }
 
-// One node on the bindings GRAPH — a trigger, an action, or one step of a macro chain.
-// Positions are canvas-space floats (draggable; persisted to profiles/graph-layout.toml).
-export struct GraphNode {
-    key: string,        // stable identity for layout persistence
-    kind: string,       // "trigger" | "action" | "step"
-    label: string,
-    sub: string,        // second line: layer tag / hold time / provenance
-    x: float,
-    y: float,
-}
-
-// One connection on the bindings graph. `timing` rides ON the line (the chip at its midpoint);
-// editable edges (GUI-authored turbo rates + macro step delays) open the timing editor.
-export struct GraphEdge {
-    a: int,             // source node index
-    b: int,             // target node index
-    timing: string,     // "instant" | "120 ms" | "12 cps" | "—"
-    tkind: string,      // "" (fixed) | "turbo" | "delay"
-    editable: bool,
-    rule: int,          // GUI rule index the timing edits (-1 = read-only)
-    step: int,          // sequence step index for tkind=="delay" (-1 otherwise)
-}
-
 // One entry in the Action palette (the typed action a bind / wedge / glyph resolves to). `id` keys
 // the Rust action builder; `param_hint` labels the single parameter field (empty = no parameter).
 // `header: true` rows are SECTION TITLES interleaved by the glue (press & type / audio / device /
@@ -202,6 +214,27 @@ export struct ActionChoice {
     tier: int,           // maturity 0=placeholder · 1-4=WIP · 5=done — shown as a small badge
 }
 
+// One flattened ROW of the macro CONSTRUCTOR canvas — the direct-manipulation builder's display
+// model. Slint can't render a recursive tree, so the Rust glue (`flatten_macro` in glue.rs) flattens
+// the working `Vec<MacroNode>` into a flat list that fully describes the UI: real STEPS, branch-arm
+// LANE labels, and the +add INSERT points are all rows here. The canvas mutates the tree by passing
+// `path` back to the edit-op callbacks (edit-step / add-step / delete-step / move-step), so this model
+// is no longer render-only — every row carries the address the edit needs.
+//
+// PATH scheme (the address back into the Rust tree):
+//   "0", "1", …            an index in the root body
+//   "1.yes.0" / "1.no.2"   into an Ask node's yes/no branch, then index (recurse: "1.yes.0.no.1")
+// An `add` row's `path` is the INSERT CONTEXT — the body to append into: "" (root), "1.yes", "1.no".
+export struct MacroBlock {
+    row: string,    // "step" (a real node) | "lane" (an ask branch-arm header) | "add" (an insert point)
+    path: string,   // step: the node's path · lane: the owning ask's path · add: the insert context ("" root, "1.yes", "1.no")
+    depth: int,     // indent level for nesting (0 = top; branch children deeper)
+    kind: string,   // step: "type_text"|"hotkey"|"clipboard"|"run"|"notify"|"ask"|"raw" · lane: "yes"|"no" · add: ""
+    verb: string,   // step: the plain-language label ("type" / "press" / "copy" / "open" / "notify" / "ask" / "code")
+    value: string,  // step: the editable param (text / "ctrl+c" / target / question / raw code); "" for lane/add
+    last: bool,     // step: is this the last row at its level (spine end-cap)
+}
+
 // One macro that raises a BEACON — i.e. its source calls `neuron.ask(…)`. The SYSTEM panel's BEACONS
 // section lists these so a beacon-using macro is visible at a glance, and a "test" mock-fires it so
 // the real ask appears with none of the macro's real-world actions. `asks` is its question(s),
@@ -210,4 +243,18 @@ export struct ActionChoice {
 export struct BeaconMacro {
     name: string,
     asks: string,
+}
+
+// One macro on disk, as the WORKSHOP catalog reads it — an EMERGENT, at-a-glance card so a user
+// understands a macro without opening its code. Everything here is derived from the file + the loaded
+// rules (no hardcoded names or descriptions): `summary` is the plain-English walk of the macro's own
+// nodes (neuron-core's `summarize`), `steps` its node count, `options` its declared NEURON_OPTIONS
+// count, and `trigger` the binding(s) that fire it ("(unbound)" when nothing does). Clicking a card
+// loads that macro (by `name`, the file stem / registry id) into the editor.
+export struct MacroCard {
+    name: string,     // the macro id (file stem) — also the editor name + the load key
+    summary: string,  // emergent plain-English "what it does", from its nodes
+    steps: int,       // total node count (depth-included) — a size-at-a-glance
+    options: int,     // declared options (its NEURON_OPTIONS entries)
+    trigger: string,  // the binding(s) that fire it, or "(unbound)"
 }

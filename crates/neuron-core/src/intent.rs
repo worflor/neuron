@@ -31,7 +31,7 @@ impl ProfileCursor for ProcessProfileCursor {
 /// active-stage getter and there's no per-profile stage count yet, so this is the common enabled-stage
 /// count (tactile / free-spin / smart-reel); the resident cursor wraps within it. Make profile-driven
 /// when a stage-count source lands.
-const SCROLL_STAGE_COUNT: u8 = 3;
+pub const SCROLL_STAGE_COUNT: u8 = 3;
 
 /// The next DPI for a [`Intent::DpiCycle`]: WITH `stages` it's the next stage's value (snap current to
 /// the nearest stage, step, wrap); WITHOUT, a ±200 nudge so a stage-less setup still moves. Pure +
@@ -114,16 +114,16 @@ pub fn run_shared_intent(
             // The device is set-only (no active-stage getter), so we step a RESIDENT cursor and WRITE
             // the wire-confirmed stage-select (0x15/0x00, ungated). No more "pending" — it cycles for
             // real. The device's first stage is 1; we wrap over `SCROLL_STAGE_COUNT`.
-            let next = crate::writes::cycle_scroll_stage(
-                crate::writes::scroll_stage_cursor(),
-                dir.step(),
-                SCROLL_STAGE_COUNT,
-            );
+            let prev = crate::writes::scroll_stage_cursor();
+            let next = crate::writes::cycle_scroll_stage(prev, dir.step(), SCROLL_STAGE_COUNT);
             match devices.with_writable("set_scroll_stage", |d| {
                 crate::writes::set_scroll_stage(d, next, cap::Store::Volatile)
             }) {
                 Ok(()) => {
                     crate::writes::set_scroll_stage_cursor(next);
+                    // confirm past the committed stage-select — a true old→new (we held the prior
+                    // cursor). Was missing, so cycling sensitivity earned no card.
+                    crate::confirm::scroll(next as u32, SCROLL_STAGE_COUNT as u32, Some(prev as u32));
                     format!("scroll stage {} -> {next}", dir.label())
                 }
                 Err(e) => format!("scroll stage skipped ({e})"),

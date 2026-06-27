@@ -20,7 +20,7 @@ use neuron::lighting::{Effect, Lights, Rgb};
 use neuron::profile::{AppRule, AppRules, Profile};
 use neuron::registry::{DeviceDef, Registry};
 use neuron::transport;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
 /// A snapshot of one enumerated device's live state, ready to map into a `DeviceRow`.
@@ -54,6 +54,7 @@ pub struct DeviceState {
     pub cap_scroll: bool, // SetScrollStage — scroll-wheel stages
     pub cap_store: bool, // Storage — persist-to-onboard
     pub cap_idle: bool, // Battery (wireless proxy) — the idle-off timer
+    pub cap_plate: bool, // has a [side_plates] map — surfaces the push-detected side-plate readout
 }
 
 /// The resident runtime state. UI-thread owned (held in an `Rc<RefCell<_>>` by the glue).
@@ -71,6 +72,11 @@ pub struct AppRuntime {
     /// Set while a lighting animation thread is running; the thread polls it to stop.
     pub anim_stop: Arc<AtomicBool>,
     pub animating: bool,
+    /// Streaming frame-rate for live lighting EFFECTS, shared with the animation worker so the GUI's
+    /// fps control can re-pace a RUNNING stream without restarting it (the worker reads this every
+    /// frame via `animate`'s fps closure). Seeded per-device on selection (legacy → 6, matrix → 30).
+    /// The data/vitals surface ignores this — it paints on-demand, not through the streaming loop.
+    pub light_fps: Arc<AtomicU32>,
     /// The host-side gaming-mode suppression policy from the last-applied profile (Alt+Tab/Win/
     /// Alt+F4). A GUI-hosted daemon LL-keyboard hook consults this; carried so apply stays the
     /// canonical source. Empty by default (nothing suppressed).
@@ -98,6 +104,7 @@ impl AppRuntime {
             selected_pid: 0,
             anim_stop: Arc::new(AtomicBool::new(false)),
             animating: false,
+            light_fps: Arc::new(AtomicU32::new(30)),
             gaming_mode: neuron::writes::GamingMode::default(),
         }
     }
@@ -184,7 +191,13 @@ impl AppRuntime {
             Ok(d) => {
                 let _ = d.run("device_mode"); // wake / ensure reachable
                 match cap::set_dpi(&d, dpi, dpi, self.store()) {
-                    Ok(_) => format!("DPI -> {dpi}"),
+                    Ok(_) => {
+                        // confirmation fires past the committed write — same as apply_polling /
+                        // apply_brightness (was missing here, so GUI DPI changes earned no card).
+                        // Absolute set → no prior read, so no old→new (matches Intent::DpiSet).
+                        neuron::confirm::dpi(dpi as u32, None);
+                        format!("DPI -> {dpi}")
+                    }
                     Err(e) => format!("DPI failed: {e}"),
                 }
             }
@@ -377,6 +390,71 @@ impl AppRuntime {
         }
     }
 
+    /// Apply the symmetric LIFT-OFF DISTANCE level (0 low / 1 medium / 2 high) — verify-gated
+    /// (`writes::set_lift_off_distance` re-reads 0x0B/0x85) + env-gated (NEURON_LOD_WRITE).
+    pub fn apply_lift_off_distance(&self, level: u8) -> String {
+        if self.writes_paused() {
+            return "writes paused".into();
+        }
+        let label = lod_label(level);
+        match self.open_selected() {
+            Ok(d) => match neuron::writes::set_lift_off_distance(&d, level) {
+                Ok(()) => format!("lift-off distance -> {label}"),
+                Err(e) => format!("lift-off distance [gated]: {e}"),
+            },
+            Err(e) => format!("no device: {e}"),
+        }
+    }
+
+    /// Read the device's current symmetric LIFT-OFF DISTANCE level (0..2) — the read side of
+    /// `apply_lift_off_distance` (0x0B/0x85). `None` if no device / asleep / unsupported.
+    pub fn lift_off_distance(&self) -> Option<u8> {
+        let d = self.open_selected().ok()?;
+        neuron::writes::lift_off_distance(&d).ok()
+    }
+
+    /// Apply the ASYMMETRIC LIFT-OFF distance — separate LIFT (2..=26) and LANDING (1..=25) levels —
+    /// verify-gated (`writes::set_lift_off_asymmetric` re-reads the shared 0x0B/0x85 getter and
+    /// confirms mode=async + the pair). The split / Focus-Pro-30K flex; mirrors `apply_lift_off_distance`.
+    pub fn apply_lift_off_asymmetric(&self, lift: u8, landing: u8) -> String {
+        if self.writes_paused() {
+            return "writes paused".into();
+        }
+        match self.open_selected() {
+            Ok(d) => match neuron::writes::set_lift_off_asymmetric(&d, lift, landing) {
+                Ok(()) => format!("lift-off split -> lift {lift} / landing {landing}"),
+                Err(e) => format!("lift-off split [gated]: {e}"),
+            },
+            Err(e) => format!("no device: {e}"),
+        }
+    }
+
+    /// Read the device's current ASYMMETRIC lift-off pair `(lift, landing)` (1-based levels) — the
+    /// read side of `apply_lift_off_asymmetric`. `Some` only when the device is in async (split) mode;
+    /// `None` if symmetric / no device / asleep / unsupported.
+    pub fn lift_off_async(&self) -> Option<(u8, u8)> {
+        let d = self.open_selected().ok()?;
+        neuron::writes::lift_off_async(&d)
+    }
+
+    /// Apply Snap Tap (SOCD) on/off — the MECHANICAL ADVANTAGES "edge" write. Verify-gated +
+    /// env-gated (`writes::set_snap_tap` re-reads 0x02/0xA7; `NEURON_SNAP_TAP_WRITE` opens the
+    /// boundary). Uses the default A/D counter-strafe pair. Honest `[gated]` on hardware that can't
+    /// do it (the user's BlackWidow Chroma V2), exactly like the LOD / idle / in-game-polling writes.
+    pub fn apply_snap_tap(&self, enable: bool) -> String {
+        if self.writes_paused() {
+            return "writes paused".into();
+        }
+        let pairs = [neuron::writes::SnapTapPair::ad()];
+        match self.open_selected() {
+            Ok(d) => match neuron::writes::set_snap_tap(&d, &pairs, enable) {
+                Ok(()) => format!("snap tap -> {}", if enable { "on" } else { "off" }),
+                Err(e) => format!("snap tap [gated]: {e}"),
+            },
+            Err(e) => format!("no device: {e}"),
+        }
+    }
+
     // ── lighting ─────────────────────────────────────────────────────────
 
     /// Effects available on the selected device (native first, then emulated).
@@ -405,6 +483,18 @@ impl AppRuntime {
     /// the lighting render draws around the LED lattice. Empty when nothing is selected.
     pub fn grid_kind(&self) -> &'static str {
         self.selected_def().map(|d| icon_for(&d)).unwrap_or("")
+    }
+
+    /// The DEFAULT streaming fps for the selected lit device + whether it's a slow LEGACY board:
+    /// legacy boards default to 6 (they drop frames above ~6), matrix devices to 30. `None` when the
+    /// selection has no lighting. Seeds the GUI fps control on selection — the user tunes from there.
+    pub fn light_fps_default(&self) -> Option<(u32, bool)> {
+        self.selected_def()
+            .and_then(|d| d.lighting)
+            .map(|l| match l.protocol {
+                neuron::lighting::Protocol::Legacy => (6, true),
+                neuron::lighting::Protocol::Matrix => (30, false),
+            })
     }
 
     pub fn apply_effect(&self, name: &str, color: Rgb) -> String {
@@ -488,6 +578,7 @@ impl AppRuntime {
         self.anim_stop = Arc::new(AtomicBool::new(false));
         self.animating = true;
         let stop = self.anim_stop.clone();
+        let fps_src = self.light_fps.clone();
         let label = name.to_string();
         let name = name.to_string();
         std::thread::spawn(move || {
@@ -513,7 +604,9 @@ impl AppRuntime {
                                 .animate(
                                     gen.as_mut(),
                                     Some(color),
-                                    30,
+                                    // LIVE fps: read the shared atomic each frame so the GUI's fps
+                                    // control re-paces this running stream without a restart.
+                                    || fps_src.load(Ordering::Relaxed),
                                     86_400, // until stopped
                                     // the kill-switch covers the streaming path too: pausing
                                     // writes terminates the generator, not just future starts.
@@ -553,6 +646,7 @@ impl AppRuntime {
         self.anim_stop = Arc::new(AtomicBool::new(false));
         self.animating = true;
         let stop = self.anim_stop.clone();
+        let fps_src = self.light_fps.clone();
         std::thread::spawn(move || {
             let outcome: Result<(), String> = (|| {
                 let reg = Registry::load().map_err(|e| format!("registry: {e}"))?;
@@ -572,7 +666,9 @@ impl AppRuntime {
                             let mut comp = neuron::effects::Compositor::from_defs(&defs);
                             let lights = Lights::new(&d, ldef);
                             lights
-                                .animate(&mut comp, None, 30, 86_400, || {
+                                // LIVE fps: read the shared atomic each frame so the GUI's fps
+                                // control re-paces this running composite without a restart.
+                                .animate(&mut comp, None, || fps_src.load(Ordering::Relaxed), 86_400, || {
                                     stop.load(Ordering::SeqCst) || neuron::writes::writes_paused()
                                 })
                                 .map_err(|e| format!("animate: {e}"))?;
@@ -590,6 +686,93 @@ impl AppRuntime {
     pub fn stop_animation(&mut self) {
         self.anim_stop.store(true, Ordering::SeqCst);
         self.animating = false;
+    }
+
+    /// Start the cross-device VITALS surface on a worker thread — the GUI mirror of the CLI's
+    /// `lighting mirror`. SINK = the selected lit, custom-frame-capable device (the keyboard); SOURCE
+    /// = the first battery-capable mouse. Reads the mouse's live battery/charge/DPI-stage and paints
+    /// `render_vitals` onto the keyboard ON-DEMAND (repaint only on change, or each tick while charging
+    /// so the cyan crest animates). Same generation-token contract as `start_layers`. Returns a status.
+    pub fn start_vitals(
+        &mut self,
+        sink_pid: u16,
+        on_done: impl FnOnce(Option<String>, Arc<AtomicBool>) + Send + 'static,
+    ) -> String {
+        if self.writes_paused() {
+            return "writes paused".into();
+        }
+        self.anim_stop.store(true, Ordering::SeqCst);
+        self.anim_stop = Arc::new(AtomicBool::new(false));
+        self.animating = true;
+        let stop = self.anim_stop.clone();
+        std::thread::spawn(move || {
+            let outcome: Result<(), String> = (|| {
+                let reg = Registry::load().map_err(|e| format!("registry: {e}"))?;
+                let infos = transport::enumerate().map_err(|e| format!("enumerate: {e}"))?;
+                // open the SINK (the selected custom-frame keyboard)
+                let mut sink = None;
+                let mut source = None;
+                for i in &infos {
+                    if let Some(def) = reg.find_by_pid(i.vid, i.pid) {
+                        let lit_frame = def
+                            .lighting
+                            .as_ref()
+                            .map(|l| l.custom_frame.is_some())
+                            .unwrap_or(false);
+                        if sink.is_none()
+                            && lit_frame
+                            && def.matches_control(i.usage_page, i.usage, i.feature_len)
+                            && (sink_pid == 0 || i.pid == sink_pid)
+                        {
+                            if let Ok(d) = Device::open(def.clone(), i.pid) {
+                                sink = Some(d);
+                            }
+                        }
+                        // SOURCE: a battery-capable device (the mouse). Don't reuse the sink.
+                        if source.is_none()
+                            && def.commands.contains_key("battery_level")
+                            && def.matches_control(i.usage_page, i.usage, i.feature_len)
+                        {
+                            if let Ok(d) = Device::open(def.clone(), i.pid) {
+                                source = Some(d);
+                            }
+                        }
+                    }
+                }
+                let sink = sink.ok_or_else(|| {
+                    "no custom-frame keyboard selected to paint vitals onto".to_string()
+                })?;
+                let source = source.ok_or_else(|| {
+                    "no battery-capable mouse found to read vitals from (wake the Naga)".to_string()
+                })?;
+                let ldef = sink
+                    .def
+                    .lighting
+                    .clone()
+                    .ok_or_else(|| "sink has no lighting".to_string())?;
+                let (rows, cols) = (ldef.rows, ldef.cols);
+                let lights = Lights::new(&sink, ldef);
+                lights
+                    .ensure_control()
+                    .map_err(|e| format!("control failed: {e}"))?;
+                let mut last: Option<neuron::lighting::Vitals> = None;
+                let mut phase: f32 = 0.0;
+                while !stop.load(Ordering::SeqCst) && !neuron::writes::writes_paused() {
+                    let v = read_vitals(&source, last);
+                    let changed = last != Some(v);
+                    if changed || last.is_none() || v.charging {
+                        phase = (phase + 0.18) % 1.0;
+                        let frame = neuron::lighting::render_vitals(v, rows, cols, phase);
+                        let _ = lights.paint_frame(&frame);
+                        last = Some(v);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1000));
+                }
+                Ok(())
+            })();
+            on_done(outcome.err(), stop);
+        });
+        "mirroring vitals".into()
     }
 
     // ── spine: rules from the loaded config ──────────────────────────────
@@ -896,9 +1079,10 @@ impl AppRuntime {
             ),
         ));
 
-        // 7) macro runtime — the Python Macro Host's interpreter + host scripts resolve. Read-only
-        //    (does NOT spawn the sidecar — that warms lazily on the first real macro), so running
-        //    diagnostics is cheap. "skip" honestly when no python is available.
+        // 7) macro runtime — the Python Macro Host's interpreter + host scripts resolve. Does NOT
+        //    SPAWN the sidecar (that warms lazily on the first real macro); it DOES extract the
+        //    interpreter on the very first call, but startup warms it on a background thread, so by the
+        //    time diagnostics run it's resolved and cheap. "skip" honestly when no python is available.
         if neuron::macros::macro_host().available() {
             out.push(DiagProbe::pass(
                 "macro runtime",
@@ -991,6 +1175,34 @@ pub fn pending_diagnostic_stations() -> Vec<DiagProbe> {
         .collect()
 }
 
+/// Read a source device's live vitals (battery %, charge, active DPI stage) for the cross-device
+/// data surface — the GUI mirror of the CLI's `read_mouse_vitals`. Each sub-read is best-effort: an
+/// asleep wireless mouse falls back to the last value rather than aborting the surface. The active
+/// DPI stage comes from the `dpi_stages_active` (or `dpi_stages`) getter reply: `s[1]` = active index,
+/// `s[2]` = stage count (live-confirmed in the CLI).
+fn read_vitals(d: &Device, last: Option<neuron::lighting::Vitals>) -> neuron::lighting::Vitals {
+    let prev = last.unwrap_or(neuron::lighting::Vitals {
+        battery_pct: 0,
+        charging: false,
+        active_stage: 0,
+        stage_count: 0,
+    });
+    let battery_pct = cap::battery_percent(d).unwrap_or(prev.battery_pct);
+    let charging = cap::charging(d).unwrap_or(prev.charging);
+    let (active_stage, stage_count) = d
+        .run("dpi_stages_active")
+        .or_else(|_| d.run("dpi_stages"))
+        .ok()
+        .map(|s| (s[1], s[2]))
+        .unwrap_or((prev.active_stage, prev.stage_count));
+    neuron::lighting::Vitals {
+        battery_pct,
+        charging,
+        active_stage,
+        stage_count,
+    }
+}
+
 /// A flat rule row for the view (kept here so the glue maps it 1:1 to the Slint struct).
 pub struct RuleView {
     pub trigger: String,
@@ -1054,6 +1266,7 @@ fn read_device_state(def: &DeviceDef, pid: u16) -> DeviceState {
         cap_scroll: def.supports(neuron::registry::Capability::SetScrollStage),
         cap_store: def.supports(neuron::registry::Capability::Storage),
         cap_idle: def.supports(neuron::registry::Capability::Battery),
+        cap_plate: def.has_side_plates(),
     };
     if let Ok(d) = Device::open(def.clone(), pid) {
         // any successful read marks the device reachable
@@ -1075,15 +1288,32 @@ fn read_device_state(def: &DeviceDef, pid: u16) -> DeviceState {
             st.brightness_n = Some(br);
         }
         if let Ok(b) = cap::battery_percent(&d) {
-            st.charging = cap::charging(&d).unwrap_or(false);
+            // charge falls back to the LAST-KNOWN state on a read blip (never a phantom "unplugged"),
+            // so a battery edge is never lost to a charge-read failure, yet no spurious charge card.
+            let charging = cap::charging(&d)
+                .ok()
+                .or_else(|| neuron::vitals::last_charging(pid))
+                .unwrap_or(false);
+            st.charging = charging;
             st.battery = format!("{b}%");
             st.battery_frac = Some((b as f32 / 100.0).clamp(0.0, 1.0));
+            // passive scan (from_event = false): feed the edge-detector off this read we already did.
+            neuron::vitals::observe(pid, b, charging, false);
         }
         if let Ok(s) = cap::storage(&d) {
             st.storage = format!("{}% free", s.pct_remaining());
         }
     }
     st
+}
+
+/// Human label for a symmetric lift-off-distance level (0 low / 1 medium / 2 high).
+fn lod_label(level: u8) -> &'static str {
+    match level.min(2) {
+        0 => "low",
+        1 => "medium",
+        _ => "high",
+    }
 }
 
 /// Format a DPI stage list for a status line ("800/1600/3200").

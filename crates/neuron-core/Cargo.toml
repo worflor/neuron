@@ -10,6 +10,11 @@ description = "Open, lightweight control for Razer devices. The anti-Synapse."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+# Bundles a private CPython into the binary: build.rs downloads (and sha256-verifies against the
+# release's SHA256SUMS manifest) a python-build-standalone tarball for the build target, caches it
+# under vendor/pbs-cache/, and hands its path to the crate via NEURON_PY_TARBALL, which
+# macros/pyruntime.rs `include_bytes!`s. No system Python dependency at runtime.
+build = "build.rs"
 
 [lib]
 name = "neuron"
@@ -30,6 +35,11 @@ idle-power-write = []
 # writes.rs::set_in_game_polling). Derived from the proven single-rate setter; off by default until
 # the dual-rate round-trip is hardware-verified (or `NEURON_INGAME_POLL_WRITE` at runtime).
 ingame-poll-write = []
+# Compile-time gate for the Snap Tap (SOCD) WRITE (0x02/0x27, writes.rs::set_snap_tap). A Synapse-4-era
+# keyboard feature; the layout is from OpenRazer #2754 and has a getter (0xA7) for verify, but it is
+# off by default (the user's BlackWidow Chroma V2 can't do it). Enable with `--features snap-tap-write`
+# on a supporting board once the round-trip is confirmed (or `NEURON_SNAP_TAP_WRITE` at runtime).
+snap-tap-write = []
 
 [dependencies]
 serde.workspace = true
@@ -48,6 +58,28 @@ zip.workspace = true
 # Synapse migration (import.rs): parse the plaintext XML inside the export (DeviceInfo.xml,
 # Features/*.xml mappings + lighting).
 quick-xml.workspace = true
+
+# Bundled-CPython MATERIALIZATION (macros/pyruntime.rs). The interpreter tarball is embedded at
+# compile time (include_bytes!) and unpacked into the user's data dir on first use. tar + flate2
+# are pure-Rust so extraction is identical on Windows/macOS/Linux (no shelling out to a system
+# tar/gzip). `dirs` resolves the per-user data-local dir cross-platform.
+tar = "0.4"
+flate2 = "1"
+dirs = "6"
+
+# Build-time only: fetch + verify the python-build-standalone tarball for the build target.
+# `ureq` is a small blocking HTTP client (rustls — no OpenSSL); `sha2` checks the download against
+# the release's SHA256SUMS manifest. Neither ships in the final binary.
+#
+# `tar` + `flate2` are REUSED from [dependencies] (identical versions) to STREAM-SLIM the upstream
+# install_only tarball at build time — drop debug symbols (.pdb), pip/ensurepip/venv, the test
+# suite, idlelib/lib2to3/turtledemo, and __pycache__ dupes — then embed the slimmed tar.gz. Listing
+# them here adds NO new crate to the graph (same crates, already resolved), just a build-script edge.
+[build-dependencies]
+ureq = "3"
+sha2 = "0.10"
+tar = "0.4"
+flate2 = "1"
 
 [target.'cfg(windows)'.dependencies.windows-sys]
 version = "0.59"

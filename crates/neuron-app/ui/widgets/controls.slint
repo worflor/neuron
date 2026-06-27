@@ -463,6 +463,13 @@ export component Field inherits Rectangle {
     out property <bool> has-focus: ti.has-focus;
     callback accepted(string);
     callback edited(string);
+    // imperative focus — a caller (e.g. the macro canvas's focus-on-add) puts the caret here so the
+    // user types immediately. Named `focus-field` because `focus` is a reserved element builtin.
+    // Lands the cursor at the END of any existing text (good for an empty just-added field).
+    public function focus-field() {
+        ti.focus();
+        ti.set-selection-offsets(root.text.character-count, root.text.character-count);
+    }
     // a data cell PREFERS its field-width but is NOT rigid: it carries the row's horizontal-stretch so
     // a tight inspector row shrinks THE FIELD (down to a usable floor) and leaves the action button at
     // its full label — never shoving the verb off the edge. Capped at field-width (max == preferred) so
@@ -673,6 +680,8 @@ export component ActionPicker inherits VerticalLayout {
             ? State.action-choices[State.action-choice].required : false;
     // the commit buttons gate on this: a REQUIRED action must have a param; optional ones may be blank.
     out property <bool> param-ok: !root.cur-required || State.action-param != "";
+    // the chosen action's display label — exposed so an inline binder can preview the wire it forges.
+    out property <string> action-label: root.cur-label;
     spacing: 8px;
     Rectangle {
         height: 30px;
@@ -754,10 +763,11 @@ export component ActionPicker inherits VerticalLayout {
                                     text: c.tier;
                                     width: 12px;
                                     horizontal-alignment: center;
+                                    // warm→red as the tier drops: warn (WIP) → caution → danger (placeholder).
                                     color: c.tier >= 5 ? Theme.text-faint
-                                        : c.tier >= 3 ? #cf9b3e
-                                        : c.tier >= 1 ? #d2733a
-                                        : #d2503a;
+                                        : c.tier >= 3 ? Theme.warn
+                                        : c.tier >= 1 ? Theme.caution
+                                        : Theme.danger;
                                     font-family: Theme.mono;
                                     font-size: Theme.fs-small;
                                     font-weight: 700;
@@ -948,9 +958,9 @@ export component PanelHead inherits HorizontalLayout {
 }
 
 // A SEGMENT — a row of mutually-exclusive choice contacts, STRING-keyed by index, the active one
-// lit. The string sibling of ContactRow (which is int-only). One home for LIST/GRAPH, HYPERSHIFT
-// STANCE, ACTIVATION presets, DIRECT/WEAVE — so the same switch can't drift in look across four
-// hand-rolls. The lit contact IS the choice; accent marks it, nothing else.
+// lit. The string sibling of ContactRow (which is int-only). One home for the HYPERSHIFT STANCE +
+// ACTIVATION presets — so the same switch can't drift in look. (Joined 2-way switches like
+// DIRECT/WEAVE are SplitToggle now.) The lit contact IS the choice; accent marks it, nothing else.
 export component Segment inherits HorizontalLayout {
     in property <[string]> options;
     in property <int> index;
@@ -977,10 +987,129 @@ export component Segment inherits HorizontalLayout {
     }
 }
 
+// A SPLIT TOGGLE — the JOINED sibling of Segment: the choices sit under ONE rounded outline with a
+// hairline split between them (no gaps), the active half lit. Same API as Segment (options/index/
+// picked). For 2-way mode switches that should read as a SINGLE control — BASE·HYPERSHIFT,
+// DIRECT·WEAVE — the way the macro blocks·code toggle does, instead of two separate pills. The
+// caller sets `width` (the halves stretch to fill it equally, so sizing is robust).
+export component SplitToggle inherits Rectangle {
+    in property <[string]> options;
+    in property <int> index;
+    callback picked(int);
+    height: Theme.row-h-sm;
+    border-radius: Theme.radius-sm;
+    border-width: Theme.hair;
+    border-color: Theme.line;
+    clip: true;   // square the inner halves to the rounded outline
+    HorizontalLayout {
+        spacing: 0;
+        for opt[i] in root.options : seg := Rectangle {
+            horizontal-stretch: 1;
+            property <bool> on: i == root.index;
+            background: seg.on ? Theme.accent-glow : (sta.has-hover ? Theme.well : transparent);
+            animate background { duration: Theme.quick; }
+            // the split — a hairline at the seam (every half but the first)
+            if i > 0 : Rectangle { x: 0; width: Theme.hair; background: Theme.line; }
+            Text {
+                text: opt;
+                vertical-alignment: center; horizontal-alignment: center;
+                color: seg.on ? Theme.accent : (sta.has-hover ? Theme.text-mid : Theme.text-dim);
+                font-size: Theme.fs-small; font-weight: 700; font-family: Theme.mono;
+                letter-spacing: Theme.track-2;
+            }
+            sta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.picked(i); } }
+        }
+    }
+}
+
+// A SPLIT BUTTON — the ACTION sibling of SplitToggle: two DISTINCT action halves fused into one pill
+// with a hairline divider between them — the joined `[ reload | apply ]` deck control. Unlike
+// SplitToggle (which selects one of two states), neither half is "on"; each is a button that fires its
+// own callback and hover-highlights independently. `right-primary` dresses the right half (apply) in the
+// accent fill so the commit half reads as the primary action. Same height / radius / hairline /
+// typography as SplitToggle so the two read as siblings. When `enabled` is false the whole control goes
+// quiet + inert (matching a disabled key).
+export component SplitButton inherits Rectangle {
+    in property <string> left-text;
+    in property <string> right-text;
+    in property <bool> right-primary: false;
+    in property <bool> enabled: true;
+    // the right (apply) half can be gated on its own — e.g. SCAN always lives, APPLY only when a
+    // tunable device is selected. Left half follows `enabled`; right half needs both.
+    in property <bool> right-enabled: true;
+    property <bool> r-on: root.enabled && root.right-enabled;
+    callback left-clicked();
+    callback right-clicked();
+    height: Theme.row-h-sm;
+    border-radius: Theme.radius-sm;
+    border-width: Theme.hair;
+    border-color: root.enabled ? Theme.line : Theme.line-soft;
+    clip: true;   // square the inner halves to the rounded outline
+    HorizontalLayout {
+        spacing: 0;
+        // ── LEFT half — a ghost action (reload) ───────────────────────────
+        lseg := Rectangle {
+            horizontal-stretch: 1;
+            background: !root.enabled ? transparent
+                : lta.pressed ? Theme.well-hi
+                : lta.has-hover ? Theme.well
+                : transparent;
+            animate background { duration: Theme.quick; }
+            HorizontalLayout {
+                padding-left: 13px; padding-right: 13px;
+                Text {
+                    text: root.left-text;
+                    vertical-alignment: center; horizontal-alignment: center;
+                    color: !root.enabled ? Theme.text-faint
+                        : lta.has-hover ? Theme.text : Theme.text-mid;
+                    font-size: Theme.fs-small; font-weight: 700; font-family: Theme.mono;
+                    letter-spacing: Theme.track-2;
+                    animate color { duration: Theme.quick; }
+                }
+            }
+            lta := TouchArea {
+                enabled: root.enabled;
+                mouse-cursor: root.enabled ? MouseCursor.pointer : MouseCursor.default;
+                clicked => { root.left-clicked(); }
+            }
+        }
+        // the split — a hairline at the seam
+        Rectangle { width: Theme.hair; background: root.enabled ? Theme.line : Theme.line-soft; }
+        // ── RIGHT half — the commit action (apply), accent-dressed when right-primary ──
+        rseg := Rectangle {
+            horizontal-stretch: 1;
+            background: !root.r-on ? transparent
+                : rta.pressed ? Theme.well-hi
+                : (root.right-primary && rta.has-hover) ? Theme.accent-glow
+                : rta.has-hover ? Theme.well
+                : (root.right-primary ? Theme.bg-2 : transparent);
+            animate background { duration: Theme.quick; }
+            HorizontalLayout {
+                padding-left: 13px; padding-right: 13px;
+                Text {
+                    text: root.right-text;
+                    vertical-alignment: center; horizontal-alignment: center;
+                    color: !root.r-on ? Theme.text-faint
+                        : root.right-primary ? Theme.accent
+                        : (rta.has-hover ? Theme.text : Theme.text-mid);
+                    font-size: Theme.fs-small; font-weight: 700; font-family: Theme.mono;
+                    letter-spacing: Theme.track-2;
+                    animate color { duration: Theme.quick; }
+                }
+            }
+            rta := TouchArea {
+                enabled: root.r-on;
+                mouse-cursor: root.r-on ? MouseCursor.pointer : MouseCursor.default;
+                clicked => { root.right-clicked(); }
+            }
+        }
+    }
+}
+
 // The INPUT HEAD — the DIRECT⇄WEAVE depth spine, defined ONCE. Both INPUT depths (bindings, spell-
 // weaving) mount this, so the depth segment is guaranteed to land at the same pixel in both instead
 // of being kept byte-identical across two files by hand. `caption` is the per-depth subtitle; the
-// per-depth right-hand extras (LIST/GRAPH+reload, the CAPTURING pill) arrive via @children.
+// per-depth right-hand extras (reload, the CAPTURING pill) arrive via @children.
 export component InputHead inherits HorizontalLayout {
     in property <string> caption;
     height: 46px;
@@ -1012,7 +1141,7 @@ export component InputHead inherits HorizontalLayout {
     // hugs right. If no child has a stretch factor, Slint spreads slack across EVERY child, so the
     // whole row re-spaces (and the segment visibly moves) whenever the extras change width.
     Rectangle { horizontal-stretch: 1; }
-    // per-depth extras (LIST/GRAPH + reload, the CAPTURING pill) — they grow LEFTWARD off the segment
+    // per-depth extras (reload, the CAPTURING pill) — they grow LEFTWARD off the segment
     VerticalLayout {
         horizontal-stretch: 0;
         alignment: center;
@@ -1023,11 +1152,176 @@ export component InputHead inherits HorizontalLayout {
     VerticalLayout {
         horizontal-stretch: 0;
         alignment: center;
-        Segment {
+        SplitToggle {
+            width: 132px;
             options: ["DIRECT", "WEAVE"];
             index: State.input-view;
-            min-seg: 64px;
             picked(i) => { State.input-view = i; }
         }
+    }
+}
+
+// THE BOOK BUTTON — opens an in-app GUIDE popup anchored at itself. The glyph is an open book drawn
+// from Rectangles (no font): two page covers flanking a thin spine, with faint page lines. Quiet at
+// rest (text-dim), accent on hover OR while ITS guide is the one on screen. Drop one beside any header
+// with a `guide-id` and the popup (app.slint) renders that guide off GuideContent (guides.slint) —
+// adding help is data, never new chrome. It anchors the popup at its own bottom-left (absolute coords).
+export component GuideButton inherits Rectangle {
+    in property <string> guide-id;
+    // lit while hovered OR while this exact guide is open
+    property <bool> active: State.guide-open && State.guide-active-id == root.guide-id;
+    property <color> ink: (root.active || gta.has-hover) ? Theme.accent : Theme.text-dim;
+    property <color> ink-faint: (root.active || gta.has-hover) ? Theme.accent.with-alpha(0.5) : Theme.text-faint;
+    width: 24px;
+    height: 22px;
+    border-radius: Theme.radius-sm;
+    background: gta.has-hover ? Theme.well : transparent;
+    animate background { duration: Theme.quick; }
+    // a help "chip" — a bold "?" in a rounded outline (the universal "explain this" mark), lit in the
+    // accent on hover / while this guide is open. Crisper + more confident than a tiny drawn book.
+    Rectangle {
+        width: 17px;
+        height: 17px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        border-radius: 5px;
+        border-width: Theme.hair;
+        border-color: root.ink-faint;
+        animate border-color { duration: Theme.quick; }
+        Text {
+            text: "?";
+            color: root.ink;
+            font-family: Theme.mono;
+            font-size: Theme.fs-data;
+            font-weight: 800;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            animate color { duration: Theme.quick; }
+        }
+    }
+    gta := TouchArea {
+        mouse-cursor: MouseCursor.pointer;
+        // anchor the popup at this button's BOTTOM-LEFT in window coords; the popup clamps on-screen
+        clicked => {
+            State.guide-toggle(root.guide-id, root.absolute-position.x, root.absolute-position.y + root.height);
+        }
+    }
+}
+
+// The ONE curated swatch palette — the system's accent hues. SHARED by every ColorPicker (the SYSTEM
+// page's interface + weave accents AND the LIGHTING page's effect colour) so the pickers offer the
+// exact same presets and never drift. The default (phosphor green) leads. Bare lowercase RRGGBB drives
+// the setter; the parsed `col` fills the chip. This is the single home for those literals.
+export global Palette {
+    out property <[{hex: string, col: color}]> accent: [
+        {hex: "4af2b0", col: #4af2b0}, {hex: "5ac8fa", col: #5ac8fa}, {hex: "0a84ff", col: #0a84ff},
+        {hex: "bf5af2", col: #bf5af2}, {hex: "ff375f", col: #ff375f}, {hex: "ff9f0a", col: #ff9f0a},
+        {hex: "ffd60a", col: #ffd60a}, {hex: "30d158", col: #30d158},
+    ];
+}
+
+// The reusable PRISM-BASED COLOUR PICKER — the rich picker shared by the SYSTEM page (interface +
+// weave accents) and the LIGHTING page (the effect's colour knob). A live-preview swatch + label, a
+// row of preset hue swatches, a hex Field, AND the PRISM: a 2D pad where dragging across picks HUE,
+// down picks BRIGHTNESS, and release COMMITS. `pick(hex)` commits a bare RRGGBB; `preview(hex)` fires
+// continuously while dragging the prism / typing so the parent can show the colour LIVE before commit
+// (lighting recolours the running effect in real time). The prism's HSV→hex math is the shared
+// State.preview-hue → State.hue-pick-hex helper — never reinvented here. (Extracted from the SYSTEM
+// page's old local AccentPicker so the two pages can't drift.)
+export component ColorPicker inherits VerticalLayout {
+    in property <string> label;
+    in property <string> hint;
+    in property <color> current;       // the LIVE committed colour, for the preview swatch
+    in property <string> value;        // the saved bare-RRGGBB, for the selected-swatch mark + field
+    in property <[{hex: string, col: color}]> swatches;
+    callback pick(string);             // COMMIT a bare RRGGBB (no '#')
+    callback preview(string);          // LIVE, uncommitted bare RRGGBB while dragging the prism / typing
+    // is THIS picker's field the one being typed into? gates the (shared) live preview swatch to the
+    // active picker — only one field holds focus. On focus-in, prime the preview from the current text
+    // so the swatch starts truthful instead of showing a stale value from a prior edit.
+    property <bool> editing: fld.has-focus;
+    changed editing => { if (root.editing) { State.preview-hex(fld.text); } }
+    spacing: 9px;
+    HorizontalLayout {
+        spacing: 10px;
+        // live preview swatch — the colour RIGHT NOW, and while you enter/drag a custom value it morphs
+        // to that value the instant it's a complete, valid colour (Rust parses; nothing commits yet).
+        Rectangle {
+            width: 26px; height: 26px; border-radius: Theme.radius-sm;
+            border-width: Theme.hair; border-color: Theme.line;
+            background: root.editing && State.hex-preview-ok ? State.hex-preview-col : root.current;
+            animate background { duration: Theme.quick; }
+        }
+        VerticalLayout {
+            alignment: center;
+            if root.label != "" : Text {
+                text: root.label;
+                color: Theme.text-dim; font-family: Theme.mono; font-size: Theme.fs-small;
+                font-weight: 700; letter-spacing: 1.2px;
+            }
+        }
+        Rectangle {}
+        fld := Field {
+            field-width: 110px;
+            placeholder: "4af2b0";
+            text: root.value;
+            // danger hairline ONLY when it's genuinely wrong (bad char / overlong) — a half-typed value stays neutral
+            invalid: root.editing && State.hex-preview-bad;
+            edited(t) => { State.preview-hex(t); root.preview(t); }   // live preview as you type
+            accepted(t) => { root.pick(t); }                          // Enter commits: recolours + persists
+        }
+    }
+    // the PRISM — appears while the field holds focus: drag across for hue, down for brightness;
+    // release commits. The HSV→hex math is State.preview-hue → State.hue-pick-hex (the shared helper),
+    // so the picker and the cast's colour come out of the SAME prism maths.
+    if root.editing : Rectangle {
+        height: 54px;
+        border-radius: Theme.radius-sm;
+        border-width: Theme.hair;
+        border-color: Theme.line;
+        clip: true;
+        background: @linear-gradient(90deg, #ff3b5c, #ff8f1f, #ffd60a, #34d65a, #20c9d6, #2f7bff, #8a5cff, #ff3b5c);
+        // brightness wash — bright at the top, dimming toward the bottom
+        Rectangle {
+            x: 0; y: 0; width: parent.width; height: parent.height;
+            background: @linear-gradient(180deg, #00000000, #00000000 42%, #00000099);
+        }
+        prism := TouchArea {
+            mouse-cursor: MouseCursor.crosshair;
+            moved => {
+                State.preview-hue(self.mouse-x / self.width, 1 - self.mouse-y / self.height);
+                root.preview(State.hue-pick-hex);
+            }
+            pointer-event(e) => {
+                if (e.kind == PointerEventKind.down) {
+                    State.preview-hue(self.mouse-x / self.width, 1 - self.mouse-y / self.height);
+                    root.preview(State.hue-pick-hex);
+                }
+                if (e.kind == PointerEventKind.up) {
+                    root.pick(State.hue-pick-hex);
+                }
+            }
+        }
+    }
+    HorizontalLayout {
+        spacing: 6px;
+        for sw in root.swatches : Rectangle {
+            width: 26px; height: 26px; border-radius: Theme.radius-sm;
+            border-width: Theme.hair;
+            border-color: sw.hex == root.value ? Theme.accent-line : (sta.has-hover ? Theme.text-faint : Theme.line-soft);
+            background: sw.col;
+            animate border-color { duration: Theme.quick; }
+            // pick commits; prime the preview too so the swatch matches even if the field keeps focus
+            sta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.pick(sw.hex); State.preview-hex(sw.hex); } }
+        }
+        Rectangle {}
+    }
+    // the hint wraps within the column (a Mono ran off the edge before)
+    if root.hint != "" : Text {
+        text: root.hint;
+        color: Theme.text-faint;
+        font-family: Theme.mono;
+        font-size: Theme.fs-small;
+        wrap: word-wrap;
     }
 }

@@ -327,7 +327,7 @@ pub fn activate(slot: &str, persist: bool) -> String {
         format!(" {slot}")
     };
 
-    let (live, live_empty) = match imp::read_clip_state() {
+    let (live, live_empty) = match read_clip_state() {
         // The clipboard holds something we can't snapshot (a handle-only format with no DIB/HGLOBAL
         // twin). Moving would either lose it (on a stash) or clobber it (on a restore), so we refuse
         // and change nothing — the same "never destroy what you didn't ask to" rule the device
@@ -354,7 +354,7 @@ pub fn activate(slot: &str, persist: bool) -> String {
     // The whole semantics: an unconditional exchange. clipboard <- old pocket; pocket <- old live.
     let new_pocket = live; // what was on the clipboard now rests in the pocket
     let to_clipboard = std::mem::take(&mut entry.pocket); // what was pocketed goes to the clipboard
-    imp::set_clipboard(&to_clipboard);
+    set_clipboard(&to_clipboard);
 
     entry.durable |= persist;
     let durable = entry.durable;
@@ -658,6 +658,128 @@ enum ClipState {
     /// Clipboard has content, but none of it is in a form we can snapshot (handle-only formats).
     Uncarryable,
     Carryable(Pocket),
+}
+
+// ---- test seam: an injectable in-memory clipboard (OFF by default) ----------------------------
+//
+// Production reads/writes the OS clipboard (the `imp` module below). To let the integration tests
+// exercise the FULL `activate()` move path — stash / restore / swap / persist / refuse-uncarryable —
+// WITHOUT ever touching (or mutating) the user's real clipboard, a test can install an in-memory
+// clipboard here; `activate()`'s reads and writes then hit that cell instead of the OS. It is OFF
+// unless a test explicitly installs it, so production behavior is byte-for-byte unchanged. This is a
+// test seam, not public API (`#[doc(hidden)]`).
+
+/// What the in-memory test clipboard holds (mirrors [`ClipState`] but owns its payload).
+enum FakeClip {
+    Empty,
+    Uncarryable,
+    Carryable(Pocket),
+}
+
+static FAKE_CLIP: OnceLock<Mutex<Option<FakeClip>>> = OnceLock::new();
+
+fn fake_clip() -> &'static Mutex<Option<FakeClip>> {
+    FAKE_CLIP.get_or_init(|| Mutex::new(None))
+}
+
+/// Read the clipboard state — the in-memory test clipboard if one is installed, else the OS.
+fn read_clip_state() -> ClipState {
+    if let Some(fake) = fake_clip().lock().unwrap().as_ref() {
+        return match fake {
+            FakeClip::Empty => ClipState::Empty,
+            FakeClip::Uncarryable => ClipState::Uncarryable,
+            FakeClip::Carryable(p) => ClipState::Carryable(p.clone()),
+        };
+    }
+    imp::read_clip_state()
+}
+
+/// Write the clipboard — the in-memory test clipboard if installed, else the OS.
+fn set_clipboard(p: &Pocket) -> bool {
+    let mut g = fake_clip().lock().unwrap();
+    if g.is_some() {
+        *g = Some(if p.is_empty() {
+            FakeClip::Empty
+        } else {
+            FakeClip::Carryable(p.clone())
+        });
+        return true;
+    }
+    drop(g);
+    imp::set_clipboard(p)
+}
+
+/// TEST SEAM — drive [`activate`] against an in-memory clipboard so the move path is provable
+/// non-destructively (it never touches the real OS clipboard). OFF in production unless installed.
+#[doc(hidden)]
+pub mod testclip {
+    use super::{fake_clip, load_all, slots, ClipFormat, FakeClip, Pocket, Slot};
+
+    const CF_UNICODETEXT: u32 = 13;
+
+    fn utf16le(s: &str) -> Vec<u8> {
+        let mut b: Vec<u8> = s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        b.extend_from_slice(&[0, 0]); // NUL terminator
+        b
+    }
+
+    /// A single-format CF_UNICODETEXT text pocket — for seeding the fake clipboard or a slot.
+    pub fn text_pocket(s: &str) -> Pocket {
+        Pocket {
+            formats: vec![ClipFormat {
+                id: CF_UNICODETEXT,
+                bytes: utf16le(s),
+            }],
+        }
+    }
+
+    /// Install an EMPTY in-memory clipboard (routes `activate()` away from the OS).
+    pub fn install_empty() {
+        *fake_clip().lock().unwrap() = Some(FakeClip::Empty);
+    }
+    /// Install an in-memory clipboard holding `s` as text.
+    pub fn install_text(s: &str) {
+        *fake_clip().lock().unwrap() = Some(FakeClip::Carryable(text_pocket(s)));
+    }
+    /// Install an in-memory clipboard holding an arbitrary multi-format payload.
+    pub fn install_pocket(p: Pocket) {
+        *fake_clip().lock().unwrap() = Some(if p.is_empty() {
+            FakeClip::Empty
+        } else {
+            FakeClip::Carryable(p)
+        });
+    }
+    /// Install an in-memory clipboard whose content can't be carried (handle-only, no twin).
+    pub fn install_uncarryable() {
+        *fake_clip().lock().unwrap() = Some(FakeClip::Uncarryable);
+    }
+    /// What currently sits on the in-memory clipboard (None if empty / uncarryable / not installed).
+    pub fn current() -> Option<Pocket> {
+        match fake_clip().lock().unwrap().as_ref() {
+            Some(FakeClip::Carryable(p)) => Some(p.clone()),
+            _ => None,
+        }
+    }
+    /// Uninstall the in-memory clipboard (restore OS-clipboard routing).
+    pub fn uninstall() {
+        *fake_clip().lock().unwrap() = None;
+    }
+    /// Clear the in-memory pocket store (the slot map) for test isolation.
+    pub fn reset_store() {
+        slots().lock().unwrap().clear();
+    }
+    /// Seed one slot's pocket directly into the store (durable flag set), bypassing `activate()`.
+    pub fn seed_slot(slot: &str, pocket: Pocket, durable: bool) {
+        slots()
+            .lock()
+            .unwrap()
+            .insert(slot.to_string(), Slot { pocket, durable });
+    }
+    /// Re-read the durable pockets from disk into the store (re-runs `load_all`, for tests that
+    /// write `.pocket` files directly and then want them loaded).
+    pub fn reload_disk() {
+        *slots().lock().unwrap() = load_all();
+    }
 }
 
 #[cfg(windows)]

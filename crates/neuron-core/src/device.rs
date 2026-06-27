@@ -66,7 +66,23 @@ impl Device {
     /// arguments (effect-id, colour, frame data) are computed at runtime, not fixed in TOML.
     /// SETTERS go through here; callers gate writes.
     pub fn exec_dynamic(&self, class: u8, id: u8, size: u8, args: &[u8]) -> Result<[u8; 80]> {
-        let mut req = Report::command(self.def.transaction_id, class, id, size);
+        self.exec_dynamic_tx(self.def.transaction_id, class, id, size, args)
+    }
+
+    /// Like [`exec_dynamic`](Self::exec_dynamic) but with an explicit `transaction_id`, for the
+    /// (few) command families a device wires to a non-default tx — e.g. the Chroma V2's lighting
+    /// EFFECT/CUSTOM-FRAME writes need 0x3F while its getters/brightness use the device default.
+    /// `exec_dynamic` delegates here with `self.def.transaction_id`, so every device that sets no
+    /// per-command override is byte-identical to before.
+    pub fn exec_dynamic_tx(
+        &self,
+        transaction_id: u8,
+        class: u8,
+        id: u8,
+        size: u8,
+        args: &[u8],
+    ) -> Result<[u8; 80]> {
+        let mut req = Report::command(transaction_id, class, id, size);
         for (i, b) in args.iter().enumerate() {
             if i < req.args.len() {
                 req.args[i] = *b;
@@ -106,8 +122,12 @@ impl Device {
     /// Apply a built lighting command (gated write path). Sends the dynamic-arg report and
     /// waits for the device's SUCCESS ack. The arg count is the protocol data-size.
     pub fn apply_lighting(&self, rep: &crate::lighting::Report) -> Result<()> {
-        let size = rep.args.len().min(80) as u8;
-        self.exec_dynamic(rep.class, rep.id, size, &rep.args)?;
+        // data_size: prefer the report's explicit size (legacy class-0x03 commands need
+        // OpenRazer's FIXED value, e.g. custom-frame 0x46) — else derive it from the arg
+        // count (the matrix path, byte-identical to before).
+        let size = rep.size.unwrap_or_else(|| rep.args.len().min(80) as u8);
+        let tx = rep.tx.unwrap_or(self.def.transaction_id);
+        self.exec_dynamic_tx(tx, rep.class, rep.id, size, &rep.args)?;
         Ok(())
     }
 
@@ -116,8 +136,9 @@ impl Device {
     /// it and the device ignores every subsequent write (frozen frame). A single drain both
     /// satisfies that and keeps the per-command cost ~1-2ms, so frame streaming stays smooth.
     pub fn send_lighting_fast(&self, rep: &crate::lighting::Report) {
-        let size = rep.args.len().min(80) as u8;
-        let mut req = Report::command(self.def.transaction_id, rep.class, rep.id, size);
+        let size = rep.size.unwrap_or_else(|| rep.args.len().min(80) as u8);
+        let tx = rep.tx.unwrap_or(self.def.transaction_id);
+        let mut req = Report::command(tx, rep.class, rep.id, size);
         for (i, b) in rep.args.iter().enumerate() {
             if i < req.args.len() {
                 req.args[i] = *b;

@@ -18,9 +18,13 @@
 
 pub mod context;
 pub mod macro_host;
+pub mod node;
+pub mod pyruntime;
 
 pub use context::Context;
-pub use macro_host::{macro_host, BeaconEvent, MacroHost};
+pub use macro_host::{macro_host, parse_macro, BeaconEvent, MacroHost, ParseError, ParseResult};
+pub use node::{nodes_to_source, py_str_literal, summarize, value_to_source, MacroNode, Value};
+pub use pyruntime::{ensure_runtime, Runtime};
 
 use crate::action::{ScriptKind, ScriptRef};
 use std::process::{Child, Command};

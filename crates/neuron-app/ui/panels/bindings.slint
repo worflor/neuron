@@ -1,7 +1,7 @@
 import { Theme } from "../theme.slint";
-import { Card, SectionTitle, Label, Button, Field, CodeArea, Pill, Mono, Divider, Slider, Toggle, PanelHead, ActionPicker, Segment, InputHead } from "../widgets/controls.slint";
+import { Card, SectionTitle, Label, Button, Field, CodeArea, Pill, Mono, Divider, Slider, Toggle, PanelHead, ActionPicker, Segment, InputHead, GuideButton } from "../widgets/controls.slint";
 import { State } from "../state.slint";
-import { RuleRow, GraphNode, GraphEdge, PocketCard } from "../models.slint";
+import { RuleRow, PocketCard, MacroBlock, MacroCard } from "../models.slint";
 
 // One portable clipboard, shown as its EMERGENT content-sigil (a mark drawn deterministically
 // from the bytes — same content, same sigil; different content, different sigil) over the legible
@@ -9,8 +9,9 @@ import { RuleRow, GraphNode, GraphEdge, PocketCard } from "../models.slint";
 // tints it from the weave palette so the type reads at a glance too.
 component PocketCardEl inherits Rectangle {
     in property <PocketCard> p;
-    property <color> tint: p.kind == "image" ? #f2a04a
-        : p.kind == "files" ? #4ab8f2
+    // kind tints from the weave palette so the type reads at a glance AND recolours with the accent.
+    property <color> tint: p.kind == "image" ? Theme.warn
+        : p.kind == "files" ? Theme.accent
         : p.kind == "other" ? Theme.text
         : Theme.accent;
     width: 128px;
@@ -80,138 +81,61 @@ component PocketCardEl inherits Rectangle {
     }
 }
 
-// ── GRAPH VIEW — the spine as a node board (Unity/Unreal-style "systems you build") ─────────
-// Triggers, actions, and macro steps are NODES; the binding is the WIRE. Timing rides ON the
-// wire (the chip at its midpoint — macro step delays and turbo rates are editable there), and
-// every chip states its connection's angle in degrees. Drag nodes anywhere; layout persists.
-
-component GraphNodeEl inherits Rectangle {
-    in property <GraphNode> n;
-    in property <int> idx;
-    x: root.n.x * 1px;
-    y: root.n.y * 1px;
-    width: 178px;
-    height: 52px;
+// One EMERGENT macro card in the WORKSHOP catalog — name, the plain-English summary of what it does
+// (walked from its own nodes in Rust), its size + option count, and the trigger(s) that fire it. The
+// whole card is a click-to-load button into the editor; the currently-open macro is lit (accent). All
+// content is read from disk + the macro's nodes + the loaded rules — no hardcoded names/descriptions.
+component MacroCardEl inherits Rectangle {
+    in property <MacroCard> c;
+    // the macro currently open in the editor reads as selected (subtle accent ground + border).
+    property <bool> current: c.name == State.macro-name && c.name != "";
+    property <bool> unbound: c.trigger == "(unbound)";
+    height: body.preferred-height;
     border-radius: Theme.radius;
-    background: drag.has-hover ? Theme.well-hi : Theme.well;
+    background: root.current ? Theme.accent-glow : (ta.has-hover ? Theme.well-hi : Theme.bg-2);
     border-width: Theme.hair;
-    border-color: root.n.kind == "trigger" ? Theme.accent-line
-        : (drag.has-hover ? Theme.text-faint : Theme.line);
+    border-color: root.current ? Theme.accent-line : Theme.line;
     animate background, border-color { duration: Theme.quick; }
-    property <bool> dragged: false;
-    drag := TouchArea {
-        mouse-cursor: MouseCursor.grab;
-        moved => {
-            if (self.pressed) {
-                root.dragged = true;
-                State.move-node(root.idx,
-                    root.n.x + (self.mouse-x - self.pressed-x) / 1px,
-                    root.n.y + (self.mouse-y - self.pressed-y) / 1px);
-            }
-        }
-        pointer-event(ev) => {
-            if (ev.kind == PointerEventKind.down) { root.dragged = false; }
-            // persist the layout ONLY if the node actually moved — a plain click shouldn't write disk
-            if (ev.kind == PointerEventKind.up && root.dragged) { State.node-dropped(); }
-        }
+    ta := TouchArea {
+        mouse-cursor: MouseCursor.pointer;
+        clicked => { State.open-macro(root.c.name); }
     }
-    VerticalLayout {
-        padding: 9px;
-        spacing: 3px;
+    body := VerticalLayout {
+        padding: 10px;
+        spacing: 5px;
         HorizontalLayout {
-            spacing: 6px;
+            spacing: 8px;
             Text {
-                text: root.n.kind == "trigger" ? "IN" : root.n.kind == "step" ? "STEP" : "DO";
-                color: root.n.kind == "trigger" ? Theme.accent-dim : Theme.text-faint;
-                font-size: Theme.fs-small;
+                text: root.c.name;
+                color: root.current ? Theme.accent : Theme.text;
                 font-family: Theme.mono;
                 font-weight: 700;
+                font-size: Theme.fs-body;
+                horizontal-stretch: 1;
+                overflow: elide;
                 vertical-alignment: center;
             }
-            Text {
-                text: root.n.label;
-                color: Theme.text;
-                font-size: Theme.fs-body;
-                font-family: Theme.mono;
-                font-weight: 600;
-                vertical-alignment: center;
+            // the binding(s) that fire it — dim when nothing does ("(unbound)"), accent when bound.
+            Mono {
+                text: root.c.trigger;
+                color: root.unbound ? Theme.text-faint : Theme.accent-dim;
+                font-size: Theme.fs-small;
+                horizontal-alignment: right;
                 overflow: elide;
             }
         }
-        Mono { text: root.n.sub; color: Theme.text-faint; font-size: Theme.fs-small; overflow: elide; }
-    }
-}
-
-component GraphEdgeEl inherits Rectangle {
-    in property <GraphEdge> e;
-    in property <int> idx;
-    // ports: source node's right-center → target node's left-center
-    property <float> ax: State.graph-nodes[root.e.a].x + 178;
-    property <float> ay: State.graph-nodes[root.e.a].y + 26;
-    property <float> bx: State.graph-nodes[root.e.b].x;
-    property <float> by: State.graph-nodes[root.e.b].y + 26;
-    property <float> ddx: root.bx - root.ax;
-    property <float> ddy: root.by - root.ay;
-    property <float> len: Math.sqrt(root.ddx * root.ddx + root.ddy * root.ddy);
-    property <angle> ang: Math.atan2(root.ddy, root.ddx);
-    // the connection's bearing, stated plainly (0° = east, counted clockwise on screen)
-    property <int> deg: Math.round(mod(root.ang / 1deg + 360, 360));
-    property <bool> sel: State.selected-edge == root.idx;
-    // the wire — a vector hairline from port to port
-    Path {
-        x: 0;
-        y: 0;
-        width: 1800px;
-        height: 1000px;
-        viewbox-x: 0;
-        viewbox-y: 0;
-        viewbox-width: 1800;
-        viewbox-height: 1000;
-        commands: "M " + root.ax + " " + root.ay + " L " + root.bx + " " + root.by;
-        stroke: root.sel ? Theme.accent : Theme.line;
-        stroke-width: 1px;
-    }
-    // port contacts
-    Rectangle {
-        x: root.ax * 1px - 2px; y: root.ay * 1px - 2px;
-        width: 4px; height: 4px; border-radius: 1px;
-        background: root.sel ? Theme.accent : Theme.text-faint;
-    }
-    Rectangle {
-        x: root.bx * 1px - 2px; y: root.by * 1px - 2px;
-        width: 4px; height: 4px; border-radius: 1px;
-        background: root.sel ? Theme.accent : Theme.text-faint;
-    }
-    // the chip at the wire's midpoint: timing · angle (click to tune editable timings)
-    chip := Rectangle {
-        x: (root.ax + root.bx) / 2 * 1px - self.width / 2;
-        y: (root.ay + root.by) / 2 * 1px - 11px;
-        height: 22px;
-        border-radius: Theme.radius-sm;
-        background: root.sel ? Theme.accent-glow : Theme.bg-2;
-        border-width: Theme.hair;
-        border-color: root.sel ? Theme.accent-line : (cta.has-hover ? Theme.text-faint : Theme.line);
-        animate background, border-color { duration: Theme.quick; }
-        cta := TouchArea { clicked => { State.selected-edge = root.idx; } }
-        HorizontalLayout {
-            padding-left: 7px;
-            padding-right: 7px;
-            spacing: 5px;
-            Text {
-                text: root.e.timing;
-                color: root.e.editable ? (root.sel ? Theme.accent : Theme.text-mid) : Theme.text-dim;
-                font-size: Theme.fs-small;
-                font-family: Theme.mono;
-                font-weight: 700;
-                vertical-alignment: center;
-            }
-            Text {
-                text: root.deg + "°";
-                color: Theme.text-faint;
-                font-size: Theme.fs-small;
-                font-family: Theme.mono;
-                vertical-alignment: center;
-            }
+        // the emergent "what it does", in words — the whole point: understand it without the code.
+        Mono {
+            text: root.c.summary;
+            color: Theme.text-mid;
+            font-size: Theme.fs-small;
+            wrap: word-wrap;
+        }
+        // size + declared options, at a glance.
+        Mono {
+            text: "\{root.c.steps} steps  \u{00b7}  \{root.c.options} options";
+            color: Theme.text-faint;
+            font-size: Theme.fs-small;
         }
     }
 }
@@ -346,13 +270,16 @@ component RuleList inherits VerticalLayout {
     in property <string> title;
     in property <[RuleRow]> rules;
     in property <string> empty-hint;
+    // ACTIVE-LAYER WASH — the HYPER layer lights its title + group rail accent (the DIRECT analogue
+    // of WEAVE's wheel-wash), so the layer you're authoring is unmistakable. Base stays neutral.
+    in property <bool> accent: false;
     callback remove(int);
     spacing: 7px;
     HorizontalLayout {
         spacing: 8px;
-        // the column's group rail — two physical rows of jacks
-        Rectangle { width: 2px; height: 14px; y: 1px; background: Theme.line; }
-        SectionTitle { text: root.title; }
+        // the column's group rail — two physical rows of jacks; lights accent for the active HYPER layer
+        Rectangle { width: 2px; height: 14px; y: 1px; background: root.accent ? Theme.accent : Theme.line; animate background { duration: Theme.quick; } }
+        SectionTitle { text: root.title; color: root.accent ? Theme.accent : Theme.text-dim; }
         Rectangle {}
         Mono { text: root.rules.length + (root.rules.length == 1 ? " rule" : " rules"); color: Theme.text-faint; }
     }
@@ -379,6 +306,9 @@ component ChannelStrip inherits VerticalLayout {
     in property <string> device;     // resolved endpoint name
     in property <float> level;       // 0..100 (gain / volume)
     in property <bool> muted;
+    in property <float> meter;       // 0..1 LIVE dB-mapped signal level (the preview)
+    in property <float> phold;       // 0..1 falling peak-hold tick
+    in property <bool> clipping;     // a recent near-0dBFS hit (latched ~2s)
     callback set-level(float);
     callback toggle-mute();
     spacing: 8px;
@@ -409,8 +339,8 @@ component ChannelStrip inherits VerticalLayout {
     HorizontalLayout {
         spacing: 10px;
         VerticalLayout {
-            alignment: center;
             horizontal-stretch: 1;
+            spacing: 6px;
             Slider {
                 compact: true;
                 minimum: 0; maximum: 100; value: root.level; step: 2;
@@ -418,6 +348,37 @@ component ChannelStrip inherits VerticalLayout {
                 // a muted channel's fader greys out (it isn't doing anything) — tactile honesty
                 tint: root.muted ? Theme.text-faint : Theme.accent;
                 changed(v) => { root.set-level(v); }
+            }
+            // LIVE METER — the dB-mapped peak of what the channel is hearing/playing, phosphor→amber→red
+            // by level, with a falling peak-hold tick (red on a clip). Greys to empty when muted.
+            Rectangle {
+                // the clip THRESHOLD, shared by the danger zone AND the positional notch below, so
+                // "clipping" reads as the fill crossing a FIXED marker (position), not by hue alone —
+                // amber "hot" vs red "clipping" are deuteranopia hue-twins, so a notch makes it spatial.
+                property <float> clip-at: 0.93;
+                height: 4px;
+                border-radius: 2px;
+                background: Theme.line-soft;
+                clip: true;
+                Rectangle {
+                    x: 0; y: 0; height: parent.height;
+                    width: parent.width * (root.muted ? 0.0 : root.meter);
+                    background: root.meter > parent.clip-at ? Theme.danger : (root.meter > 0.8 ? Theme.warn : Theme.accent);
+                }
+                // CLIP NOTCH — a fixed tick at the clip threshold. The fill reaching/passing it is the
+                // positional "now clipping" signal, legible with no colour discrimination at all.
+                Rectangle {
+                    y: 0; height: parent.height; width: 1px;
+                    x: parent.width * parent.clip-at - self.width / 2;
+                    background: Theme.bg;
+                    opacity: root.muted ? 0.0 : 0.85;
+                }
+                Rectangle {
+                    y: 0; height: parent.height; width: 2px;
+                    x: parent.width * (root.muted ? 0.0 : root.phold) - self.width / 2;
+                    background: root.clipping ? Theme.danger : Theme.text;
+                    opacity: (root.muted || root.phold <= 0.02) ? 0.0 : 0.9;
+                }
             }
         }
         // the live value — mono, fixed cell so the fader never twitches at the 2→3 digit jump
@@ -451,42 +412,424 @@ component ChannelStrip inherits VerticalLayout {
     }
 }
 
+// The kind ICON shown on a step card — one glyph per kind, computed in the view (the model carries
+// `kind`, not the glyph, so the mapping lives where it's drawn). ⌨ press · T type · ⎘ copy · ▶ open.
+component KindIcon inherits Text {
+    in property <string> kind;
+    in property <bool> accent;
+    text: root.kind == "type_text" ? "T"
+        : root.kind == "hotkey" ? "\u{2328}"      // ⌨
+        : root.kind == "clipboard" ? "\u{2398}"   // ⎘
+        : root.kind == "run" ? "\u{25B6}"         // ▶
+        : root.kind == "notify" ? "!"
+        : root.kind == "ask" ? "?"
+        : root.kind == "raw" ? "\u{2039}/\u{203a}" // ‹/›
+        : "";
+    color: root.accent ? Theme.accent : Theme.text-dim;
+    font-family: Theme.mono;
+    font-size: Theme.fs-data;
+    font-weight: 700;
+    horizontal-alignment: center;
+    vertical-alignment: center;
+    width: 18px;
+}
+
+// A quiet hover-revealed row control on a step card — ↑ / ↓ / ✕. Small square hit target, mono glyph,
+// brightens on hover; `danger` tints the delete red.
+component RowGlyph inherits Rectangle {
+    in property <string> glyph;
+    in property <bool> danger: false;
+    out property <bool> hovered: g-ta.has-hover;   // lets a parent card hold its hover while you reach a control
+    callback clicked();
+    width: 22px;
+    height: 22px;
+    border-radius: Theme.radius-sm;
+    background: g-ta.has-hover ? Theme.well : transparent;
+    animate background { duration: Theme.quick; }
+    g-ta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.clicked(); } }
+    Text {
+        text: root.glyph;
+        color: root.danger ? (g-ta.has-hover ? Theme.danger : Theme.danger.with-alpha(0.6))
+            : (g-ta.has-hover ? Theme.text : Theme.text-faint);
+        font-family: Theme.mono;
+        font-size: Theme.fs-body;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        animate color { duration: Theme.quick; }
+    }
+}
+
+// One chip in the add-picker — a small mono kind label that adds a step on click.
+component AddChip inherits Rectangle {
+    in property <string> label;
+    callback clicked();
+    height: 24px;
+    min-width: chip-lbl.preferred-width + 18px;
+    max-width: chip-lbl.preferred-width + 18px;
+    border-radius: Theme.radius-sm;
+    background: chip-ta.has-hover ? Theme.accent-glow : Theme.bg-2;
+    border-width: Theme.hair;
+    border-color: chip-ta.has-hover ? Theme.accent-line : Theme.line;
+    animate background, border-color { duration: Theme.quick; }
+    chip-ta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.clicked(); } }
+    chip-lbl := Text {
+        text: root.label;
+        color: chip-ta.has-hover ? Theme.accent : Theme.text-mid;
+        font-family: Theme.mono;
+        font-size: Theme.fs-small;
+        font-weight: 700;
+        letter-spacing: Theme.track-1;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+// ── THE CONSTRUCTOR CANVAS ROW — the direct-manipulation macro builder, by touch ──────────────
+// One flat MacroBlock renders here as one of three rows, all left-anchored to a vertical SPINE so the
+// macro reads as a connected flow (a node dot per row hangs off the rail, so even the 4px row gaps
+// read as one routed line):
+//   • STEP — a clean rounded card that reads like a sentence: a kind ICON · the plain VERB · the param
+//     as an inline editable Field. Editing COMMITS on Enter AND on blur (focus-loss) — `edit-step`
+//     mutates the tree + regenerates the source only (NO re-flatten), so the caret never jumps and a
+//     click-away can't lose the text. `raw` ("code") shows mono, not a field — an escape hatch to the
+//     code view. On HOVER two quiet controls reveal: ↑/↓ (move-step) and ✕ (delete-step). An `ask`
+//     card is accent-tinted so the branch head reads at a glance. The spine END-CAPS after the `last`
+//     step of a body (a terminal node) instead of running into the add-row.
+//   • LANE — an ask branch-arm header ("if yes" / "if no"); the spine FORKS into it via a curved
+//     elbow wire (a Path) down-and-into the lane. Accent for yes, dim for no.
+//   • ADD — an inviting "＋ add a step" that, on click, expands a compact chip picker (type · press ·
+//     copy · open · ask · notify · code) — each chip calls add-step(insert, kind), which auto-focuses
+//     the new step's field. Collapses after a pick. The ONLY way to add a step now.
+component MacroBlockEl inherits Rectangle {
+    in property <MacroBlock> b;
+    property <bool> is-step: root.b.row == "step";
+    property <bool> is-lane: root.b.row == "lane";
+    property <bool> is-add: root.b.row == "add";
+    property <bool> is-ask: root.b.kind == "ask";
+    property <bool> is-raw: root.b.kind == "raw";
+    property <bool> is-yes: root.b.kind == "yes";
+    // a per-row toggle: the add-picker is collapsed to "＋ add a step" until clicked.
+    property <bool> picker-open: false;
+    // is this the EMPTY-state root add (the only row on a blank macro)? Then the +add becomes a warm,
+    // unmissable CTA — it's the first thing a new user sees.
+    property <bool> empty-cta: root.is-add && root.b.depth == 0 && State.macro-blocks.length <= 1;
+    // nesting indent — each depth steps in 20px past the spine gutter.
+    property <length> indent: root.b.depth * 20px;
+    // the placeholder for a step's inline field, by kind — reads like the sentence it completes.
+    property <string> ph:
+        root.b.kind == "type" ? "what to type"
+        : root.b.kind == "press" ? "ctrl+c"
+        : root.b.kind == "key_press" ? "enter"
+        : root.b.kind == "click" ? "left"
+        : root.b.kind == "scroll" ? "notches (e.g. -3)"
+        : root.b.kind == "move_to" ? "x, y"
+        : root.b.kind == "copy" ? "text to copy"
+        : root.b.kind == "open" ? "app or command"
+        : root.b.kind == "focus" ? "window title"
+        : root.b.kind == "wait" ? "milliseconds"
+        : root.b.kind == "notify" ? "message"
+        : root.b.kind == "ask" ? "the question"
+        : root.b.kind == "if" ? "condition"
+        : root.b.kind == "repeat_n" ? "count"
+        : root.b.kind == "repeat_while" ? "condition"
+        : root.b.kind == "for_each" ? "var in source"
+        : root.b.kind == "set_var" ? "name = value"
+        : "";
+
+    height: self.preferred-height;
+
+    HorizontalLayout {
+        padding-left: root.indent;
+        spacing: 0;
+
+        // ── THE SPINE GUTTER — a 12px rail column. Each row hangs a NODE off it so the flow reads as
+        // one routed line even across the row gaps. A step draws the through-rail (capped on `last`);
+        // a lane forks in via a curved elbow; an add hangs a small open node on a stub. ──
+        Rectangle {
+            width: 12px;
+
+            // STEP rail: a vertical hairline through the row, plus a node dot at the card's center.
+            // The `last` step caps the rail at its center (a terminal end-cap) instead of bleeding on.
+            if root.is-step : Rectangle {
+                // upper half of the rail — always present (connects up to the previous row)
+                Rectangle {
+                    x: 4px; width: Theme.hair;
+                    y: 0; height: parent.height / 2;
+                    background: root.is-yes ? Theme.accent-line : Theme.line;
+                }
+                // lower half — suppressed on the last step so the spine ends cleanly above the add-row
+                if !root.b.last : Rectangle {
+                    x: 4px; width: Theme.hair;
+                    y: parent.height / 2; height: parent.height / 2;
+                    background: root.is-yes ? Theme.accent-line : Theme.line;
+                }
+                // the node — accent on an ask (the fork head) / yes-arm, quiet otherwise
+                Rectangle {
+                    x: 2px; y: (parent.height - self.height) / 2;
+                    width: 5px; height: 5px; border-radius: 1px;
+                    background: (root.is-ask || root.is-yes) ? Theme.accent : Theme.text-faint;
+                }
+            }
+
+            // LANE fork: a curved elbow wire from the parent spine (top of the gutter) sweeping
+            // down-and-right into the lane label. Accent for the yes arm, dim for no.
+            if root.is-lane : Path {
+                x: 0; y: 0; width: 100%; height: 100%;
+                viewbox-x: 0; viewbox-y: 0; viewbox-width: 12; viewbox-height: 22;
+                // start at the rail (x=4) up top, curve down to the lane row's vertical center (y≈11),
+                // exiting rightward toward the label — a soft quarter-elbow.
+                commands: "M 4 0 L 4 4 C 4 9 4 11 9 11";
+                stroke: root.is-yes ? Theme.accent-line : Theme.line;
+                stroke-width: 1px;
+                fill: transparent;
+            }
+
+            // ADD node: a short stub from the top + a small OPEN node, so the insert-point reads as
+            // hanging off the flow (not floating free). Quiet — it's an invitation, not a step.
+            if root.is-add : Rectangle {
+                Rectangle {
+                    x: 4px; width: Theme.hair;
+                    y: 0; height: parent.height / 2;
+                    background: Theme.line-soft;
+                }
+                Rectangle {
+                    x: 2px; y: (parent.height - self.height) / 2;
+                    width: 5px; height: 5px; border-radius: 1px;
+                    background: transparent;
+                    border-width: Theme.hair;
+                    border-color: root.empty-cta ? Theme.accent-line : Theme.line;
+                }
+            }
+        }
+
+        // ── STEP CARD ──────────────────────────────────────────────────────────────────────
+        if root.is-step : card := Rectangle {
+            // "hovered" stays true while the cursor crosses from the card onto its ↑/↓/✕ controls (each
+            // a child TouchArea that would otherwise steal card-ta's hover). Without this OR, reaching a
+            // control flipped the hover off, the controls vanished, the row reflowed → flicker.
+            property <bool> hovered: card-ta.has-hover || mvup.hovered || mvdn.hovered || mvdel.hovered;
+            horizontal-stretch: 1;
+            border-radius: Theme.radius-sm;
+            background: card.hovered ? Theme.well-hi : Theme.well;
+            border-width: Theme.hair;
+            // hover lifts the border so the card feels touchable; an ask keeps its accent frame.
+            border-color: root.is-ask ? Theme.accent-line
+                : (card.hovered ? Theme.text-faint : Theme.line);
+            animate background, border-color { duration: Theme.quick; }
+            // a row-wide hover sensor BEHIND the controls — reveals ↑/↓/✕ without stealing field clicks.
+            card-ta := TouchArea { }
+            HorizontalLayout {
+                padding-left: 10px;
+                padding-right: 8px;
+                padding-top: 7px;
+                padding-bottom: 7px;
+                spacing: 8px;
+                VerticalLayout {
+                    alignment: center;
+                    KindIcon { kind: root.b.kind; accent: root.is-ask; }
+                }
+                // the plain-language verb — the sentence's lead word.
+                VerticalLayout {
+                    alignment: center;
+                    Text {
+                        text: root.b.verb;
+                        color: root.is-ask ? Theme.accent : Theme.text-mid;
+                        font-family: Theme.mono;
+                        font-size: Theme.fs-body;
+                        font-weight: 700;
+                        letter-spacing: Theme.track-1;
+                    }
+                }
+                // the PARAM — inline-editable for everything but raw; raw shows mono + an escape hatch.
+                // COMMIT on Enter (accepted) AND on blur (has-focus → false): edit-step mutates the
+                // tree + regenerates the SOURCE ONLY (no re-flatten), so the caret never resets and a
+                // click-away can never lose the typed value. On `init`, if this row is the just-added
+                // step (macro-focus-path), it grabs the caret so you type immediately (focus-on-add).
+                if !root.is-raw : Field {
+                    field-width: 1000px;   // greedy: the field IS the row's elastic cell (caps at this)
+                    placeholder: root.ph;
+                    text: root.b.value;
+                    accepted(t) => { State.edit-step(root.b.path, t); }
+                    changed has-focus => {
+                        // commit on blur — the user clicked away / tabbed off without pressing Enter.
+                        if (!self.has-focus) { State.edit-step(root.b.path, self.text); }
+                    }
+                    init => {
+                        if (State.macro-focus-path == root.b.path) {
+                            State.macro-focus-path = "";
+                            self.focus-field();
+                        }
+                    }
+                }
+                if root.is-raw : VerticalLayout {
+                    alignment: center;
+                    horizontal-stretch: 1;
+                    Text {
+                        text: root.b.value == "" ? "(empty)" : root.b.value;
+                        color: Theme.text-mid;
+                        font-family: Theme.mono;
+                        font-size: Theme.fs-data;
+                        wrap: word-wrap;
+                    }
+                }
+                if root.is-raw : VerticalLayout {
+                    alignment: center;
+                    Text {
+                        text: "edit in code view";
+                        color: Theme.text-faint;
+                        font-family: Theme.mono;
+                        font-size: Theme.fs-small;
+                        vertical-alignment: center;
+                    }
+                }
+                // QUIET ROW CONTROLS — reorder ↑/↓, delete ✕. ALWAYS laid out (revealing them never
+                // reflows the row) and only faded in while the card or a control is hovered. Each one
+                // feeds card.hovered, so crossing from the card onto a control can't drop the hover.
+                HorizontalLayout {
+                    spacing: 2px;
+                    opacity: card.hovered ? 1 : 0;
+                    animate opacity { duration: Theme.quick; }
+                    mvup := RowGlyph { glyph: "\u{2191}"; clicked => { State.move-step(root.b.path, -1); } }   // ↑
+                    mvdn := RowGlyph { glyph: "\u{2193}"; clicked => { State.move-step(root.b.path, 1); } }    // ↓
+                    mvdel := RowGlyph { glyph: "\u{00D7}"; danger: true; clicked => { State.delete-step(root.b.path); } } // ✕
+                }
+            }
+        }
+
+        // ── LANE HEADER (if yes / if no) ────────────────────────────────────────────────────
+        // The fork wire lives in the spine gutter (above); here is just the arm label, set in from
+        // where the elbow lands so the wire visibly flows INTO the word.
+        if root.is-lane : Rectangle {
+            horizontal-stretch: 1;
+            height: 22px;
+            HorizontalLayout {
+                padding-left: 4px;
+                spacing: 0;
+                VerticalLayout {
+                    alignment: center;
+                    Text {
+                        text: root.is-yes ? "if yes" : "if no";
+                        color: root.is-yes ? Theme.accent : Theme.text-dim;
+                        font-family: Theme.mono;
+                        font-size: Theme.fs-small;
+                        font-weight: 700;
+                        letter-spacing: Theme.track-2;
+                    }
+                }
+                Rectangle {}
+            }
+        }
+
+        // ── ADD POINT — "＋ add a step", expands to the chip picker on click ──────────────────
+        if root.is-add : Rectangle {
+            horizontal-stretch: 1;
+            // the empty-state CTA is taller + warmer so it can't be missed; nested adds stay compact.
+            height: root.empty-cta ? 36px : 28px;
+            // collapsed invitation
+            if !root.picker-open : Rectangle {
+                border-radius: Theme.radius-sm;
+                // the empty-state CTA gets a warm accent wash + frame (an inviting first action);
+                // a nested add stays a quiet dashed-feeling stub until hovered.
+                background: root.empty-cta
+                    ? (add-ta.has-hover ? Theme.accent-glow : Theme.well)
+                    : (add-ta.has-hover ? Theme.well : transparent);
+                border-width: Theme.hair;
+                border-color: root.empty-cta
+                    ? (add-ta.has-hover ? Theme.accent : Theme.accent-line)
+                    : (add-ta.has-hover ? Theme.text-faint : Theme.line-soft);
+                animate background, border-color { duration: Theme.quick; }
+                add-ta := TouchArea {
+                    mouse-cursor: MouseCursor.pointer;
+                    clicked => { root.picker-open = true; }
+                }
+                HorizontalLayout {
+                    padding-left: 11px;
+                    padding-right: 11px;
+                    spacing: 8px;
+                    Text {
+                        text: "\u{ff0b}";   // ＋
+                        color: root.empty-cta ? Theme.accent
+                            : (add-ta.has-hover ? Theme.accent : Theme.text-faint);
+                        font-family: Theme.mono;
+                        font-size: root.empty-cta ? Theme.fs-data : Theme.fs-body;
+                        font-weight: 700;
+                        vertical-alignment: center;
+                    }
+                    Text {
+                        text: root.empty-cta ? "add your first step" : "add a step";
+                        color: root.empty-cta ? Theme.text
+                            : (add-ta.has-hover ? Theme.text-mid : Theme.text-faint);
+                        font-family: Theme.mono;
+                        font-size: root.empty-cta ? Theme.fs-body : Theme.fs-small;
+                        font-weight: root.empty-cta ? 700 : 400;
+                        letter-spacing: Theme.track-1;
+                        vertical-alignment: center;
+                    }
+                    Rectangle {}
+                }
+            }
+            // expanded chip row — one chip per kind; a pick adds + collapses.
+            if root.picker-open : HorizontalLayout {
+                spacing: 5px;
+                VerticalLayout {
+                    alignment: center;
+                    HorizontalLayout {
+                        spacing: 5px;
+                        AddChip { label: "type"; clicked => { State.add-step(root.b.path, "type"); root.picker-open = false; } }
+                        AddChip { label: "press"; clicked => { State.add-step(root.b.path, "press"); root.picker-open = false; } }
+                        AddChip { label: "copy"; clicked => { State.add-step(root.b.path, "copy"); root.picker-open = false; } }
+                        AddChip { label: "open"; clicked => { State.add-step(root.b.path, "open"); root.picker-open = false; } }
+                        AddChip { label: "ask"; clicked => { State.add-step(root.b.path, "ask"); root.picker-open = false; } }
+                        AddChip { label: "notify"; clicked => { State.add-step(root.b.path, "notify"); root.picker-open = false; } }
+                        AddChip { label: "code"; clicked => { State.add-step(root.b.path, "raw"); root.picker-open = false; } }
+                    }
+                }
+                Rectangle {}
+                // a quiet bail-out so an opened picker can close without adding.
+                VerticalLayout {
+                    alignment: center;
+                    RowGlyph { glyph: "\u{00D7}"; clicked => { root.picker-open = false; } }
+                }
+            }
+        }
+    }
+}
+
 export component BindingsPanel inherits VerticalLayout {
     spacing: 0;
     // The MACRO·PYTHON editor's vertical offset from the panel top — the cross-panel "author a
     // macro" jump scrolls the page Flickable to this so the link lands ON the editor (see app.slint).
     out property <length> macro-y: macro_row.absolute-position.y - root.absolute-position.y;
-    // the "add" chips below the macro editor call this — append a ready-to-edit helper line, seeding
-    // the `def macro(ctx):` wrapper when the box is empty, so a non-coder can build a working macro by
-    // clicking while a power user just types over it. Multi-line snippets arrive pre-indented.
-    function add-step(snippet: string) {
-        State.macro-source = State.macro-source == ""
-            ? "def macro(ctx):\n    \{snippet}"
-            : "\{State.macro-source}\n    \{snippet}";
-        State.note-macro-source(State.macro-source);
-    }
-    property <string> edge-timing-input: "";
     // the stance segment is string-keyed in the engine but index-keyed in the Segment widget
     property <int> stance-idx: State.hypershift-mode == "hold" ? 0
         : State.hypershift-mode == "latch" ? 1
         : State.hypershift-mode == "smart" ? 2 : 3;
-    // the INPUT head — the shared InputHead so the DIRECT⇄WEAVE segment lives ONCE (no more two
-    // files kept byte-identical by hand); this depth's right-hand extras arrive as its children.
+    // THE LAYER FLIP — author one layer at a time (0 = base, 1 = hypershift), WEAVE-style.
+    property <int> view-layer: 0;
+    property <bool> add-open: false;     // the inline "+ bind a control" expander
+    property <bool> feel-open: false;    // the tucked-away feel/forgiveness sliders
+    // HYPERSHIFT, the WEAVE-lean way — opt-in, config tucked.
+    property <bool> hyper-open: false;    // the user explicitly opened the HyperShift editor
+    property <bool> config-open: false;   // the ⚙ disclosure (hold key / stance / feel)
+    // REVEALED — show the lean base|HYPER bar (never the bare CTA) once HyperShift exists in ANY
+    // form: the user opened it, a hold key is set, or shifted binds already exist (auto-enable so
+    // existing setup is never hidden). When NOT revealed it's a single quiet CTA — its whole footprint.
+    property <bool> hyper-revealed: root.hyper-open || State.hypershift-hold-ready || State.editable-hyper-count > 0;
+    // LIVE AUDIO METERS — only while THIS (DIRECT) page is the one showing. `changed` opens/closes the
+    // meters (so the mic is never held when you're elsewhere); the Timer polls peaks ~30fps. Zero cost
+    // on any other page.
+    property <bool> audio-active: State.page == 2 && State.input-view == 0;
+    changed audio-active => { State.set-audio-metering(self.audio-active); }
+    Timer {
+        interval: 33ms;
+        running: root.audio-active;
+        triggered => { State.poll-audio-levels(); }
+    }
+    // the INPUT head — the shared InputHead (DIRECT⇄WEAVE lives once); just a quiet reload extra here.
     InputHead {
-        caption: "plain binds · trigger → action";
-        // LIST ⇄ GRAPH — the same spine, two presentations
+        caption: "plain binds — a control fires an action";
         VerticalLayout {
-            width: 150px;   // size to the two contacts so the segment doesn't balloon across the head slot
-            alignment: center;
-            Segment {
-                options: ["LIST", "GRAPH"];
-                index: State.graph-view ? 1 : 0;
-                picked(i) => { State.graph-view = (i == 1); State.selected-edge = -1; }
-            }
-        }
-        VerticalLayout { width: 8px; }
-        VerticalLayout {
-            width: 80px;   // size to the label so the head action doesn't balloon (same idiom as re-scan/backup)
+            width: 80px;
             alignment: center;
             Button { text: "reload"; clicked => { State.reload-bindings(); } }
         }
@@ -500,363 +843,481 @@ export component BindingsPanel inherits VerticalLayout {
         VerticalLayout {
             spacing: 22px;
 
-            // ── the two rule layers (LIST view) ───────────────────────────
-            if !State.graph-view : HorizontalLayout {
-                spacing: Theme.gap-col;
-                VerticalLayout {
-                    horizontal-stretch: 1;
-                    RuleList {
-                        title: "BASE LAYER";
-                        rules: State.rules;
-                        empty-hint: "no base rules yet — loaded from bindings.toml + cast.toml";
-                        remove(i) => { State.remove-rule(i); }
-                    }
-                }
-                VerticalLayout {
-                    horizontal-stretch: 1;
-                    RuleList {
-                        title: "HYPERSHIFT LAYER";
-                        rules: State.hypershift-rules;
-                        empty-hint: "hold a layer trigger to activate the second tier";
-                        remove(i) => { State.remove-hyper-rule(i); }
-                    }
-                }
+            // ════════ ALTITUDE 1 · THE INPUT MAP ════════
+            // the model, in one line (the teaching spine, like WEAVE's "one trigger, several rhythms")
+            Mono {
+                text: "Your controls, two layers deep — the base is always live; hold your HyperShift key for the second.";
+                color: Theme.text-dim;
+                wrap: word-wrap;
             }
-
-            // ── the node board (GRAPH view) ───────────────────────────────
-            if State.graph-view : VerticalLayout {
+            // ── the HYPERSHIFT BAR — opt-in, WEAVE-lean. A joined hairline-split shell, just like
+            //    the WEAVE radial's "HyperShift radial: off"→ON control. Two states:
+            //      · NOT revealed → a single quiet CTA (the whole HyperShift footprint for non-users)
+            //      · revealed     → HyperShift label · base|HYPER edit-flip · ⚙ configure (+ collapse
+            //                       only while nothing is set up yet)
+            HorizontalLayout {
                 spacing: 8px;
-                Rectangle {
-                    height: 460px;
+                // ── COLLAPSED CTA — fresh user, nothing set up. Click to open the editor. ──
+                if !root.hyper-revealed : Rectangle {
+                    horizontal-stretch: 0;
+                    height: Theme.row-h;
                     clip: true;
-                    border-radius: Theme.radius;
+                    border-radius: Theme.radius-sm;
                     border-width: Theme.hair;
-                    border-color: Theme.line;
+                    border-color: ctata.has-hover ? Theme.accent-line : Theme.line;
+                    background: ctata.has-hover ? Theme.well : transparent;
+                    animate border-color, background { duration: Theme.quick; }
+                    HorizontalLayout {
+                        padding-left: 13px; padding-right: 13px; spacing: 8px;
+                        VerticalLayout { alignment: center; Text { text: "\u{2726}"; color: ctata.has-hover ? Theme.accent : Theme.text-dim; font-family: Theme.mono; font-size: Theme.fs-body; animate color { duration: Theme.quick; } } }
+                        VerticalLayout { alignment: center; Text { text: "HyperShift \u{00b7} a second layer, held"; color: ctata.has-hover ? Theme.text : Theme.text-mid; font-family: Theme.mono; font-size: Theme.fs-small; font-weight: 700; letter-spacing: 1.2px; vertical-alignment: center; animate color { duration: Theme.quick; } } }
+                        VerticalLayout { alignment: center; Text { text: "set up \u{25b8}"; color: ctata.has-hover ? Theme.accent : Theme.text-faint; font-family: Theme.mono; font-size: Theme.fs-small; vertical-alignment: center; animate color { duration: Theme.quick; } } }
+                    }
+                    // opening the editor also drops the config open — a fresh user lands straight on
+                    // the hold-key row (the one thing they MUST set for the layer to ever trigger).
+                    ctata := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.hyper-open = true; root.config-open = true; } }
+                }
+
+                // ── REVEALED — the joined shell: label · base|HYPER flip · ⚙ configure ──
+                // "setup exists" = a hold key OR shifted binds; only the open-but-empty case offers a ×.
+                if root.hyper-revealed : shell := Rectangle {
+                    property <bool> setup-exists: State.hypershift-hold-ready || State.editable-hyper-count > 0;
+                    horizontal-stretch: 0;
+                    height: Theme.row-h;
+                    clip: true;
+                    border-radius: Theme.radius-sm;
+                    border-width: Theme.hair;
+                    border-color: Theme.accent-line;
                     background: Theme.bg-2;
-                    Flickable {
-                        viewport-width: 1800px;
-                        viewport-height: 1000px;
-                        board := Rectangle {
-                            // a faint bench grid so distances read at a glance
-                            for gx in 18 : Rectangle {
-                                x: gx * 100px; width: 1px; height: 1000px;
-                                background: Theme.line-soft;
+                    HorizontalLayout {
+                        // label zone — what this shell is
+                        Rectangle {
+                            HorizontalLayout {
+                                padding-left: 13px; padding-right: 12px; spacing: 7px;
+                                VerticalLayout { alignment: center; Text { text: "\u{2726}"; color: Theme.accent; font-family: Theme.mono; font-size: Theme.fs-body; } }
+                                VerticalLayout { alignment: center; Text { text: "HyperShift"; color: Theme.text-mid; font-family: Theme.mono; font-size: Theme.fs-small; font-weight: 700; letter-spacing: 1.2px; vertical-alignment: center; } }
                             }
-                            for gy in 10 : Rectangle {
-                                y: gy * 100px; width: 1800px; height: 1px;
-                                background: Theme.line-soft;
+                        }
+                        Rectangle { width: 1px; background: Theme.line; }
+                        // base | HYPER edit-flip — the active side lit accent (WEAVE's base|HYPER)
+                        Rectangle {
+                            background: bflip.has-hover ? Theme.well : transparent;
+                            animate background { duration: Theme.quick; }
+                            HorizontalLayout {
+                                padding-left: 12px; padding-right: 11px;
+                                Text {
+                                    text: "base";
+                                    color: root.view-layer == 0 ? Theme.accent : (bflip.has-hover ? Theme.text-mid : Theme.text-dim);
+                                    font-family: Theme.mono; font-size: Theme.fs-small;
+                                    font-weight: root.view-layer == 0 ? 700 : 500;
+                                    letter-spacing: 1.4px; vertical-alignment: center;
+                                }
                             }
-                            // wires under nodes
-                            for e[i] in State.graph-edges : GraphEdgeEl { e: e; idx: i; }
-                            for n[i] in State.graph-nodes : GraphNodeEl { n: n; idx: i; }
-                            if State.graph-nodes.length == 0 : VerticalLayout {
-                                x: 40px; y: 40px;
-                                Mono { text: "no rules to draw yet — add a binding below, or author a macro"; }
+                            bflip := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.view-layer = 0; root.add-open = false; } }
+                        }
+                        Rectangle { width: 1px; background: Theme.line; }
+                        Rectangle {
+                            background: hflip.has-hover ? Theme.well : transparent;
+                            animate background { duration: Theme.quick; }
+                            HorizontalLayout {
+                                padding-left: 11px; padding-right: 12px;
+                                Text {
+                                    text: "HYPER";
+                                    color: root.view-layer == 1 ? Theme.accent : (hflip.has-hover ? Theme.text-mid : Theme.text-dim);
+                                    font-family: Theme.mono; font-size: Theme.fs-small;
+                                    font-weight: root.view-layer == 1 ? 700 : 500;
+                                    letter-spacing: 1.4px; vertical-alignment: center;
+                                }
                             }
+                            hflip := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.view-layer = 1; root.add-open = false; } }
+                        }
+                        Rectangle { width: 1px; background: Theme.line; }
+                        // ⚙ configure — toggles the hold/stance/feel disclosure. Accent while open OR
+                        // while it needs attention (revealed but no hold key — won't actually trigger):
+                        // the label itself becomes the nudge, so a user can't miss that a hold key is owed.
+                        cog := Rectangle {
+                            property <bool> needs-key: !State.hypershift-hold-ready;
+                            property <bool> lit: root.config-open || self.needs-key;
+                            background: cogta.has-hover ? Theme.well : transparent;
+                            animate background { duration: Theme.quick; }
+                            HorizontalLayout {
+                                padding-left: 12px; padding-right: 12px; spacing: 6px;
+                                VerticalLayout { alignment: center; Text { text: "\u{2699}"; color: cog.lit ? Theme.accent : (cogta.has-hover ? Theme.text-mid : Theme.text-dim); font-family: Theme.mono; font-size: Theme.fs-body; vertical-alignment: center; animate color { duration: Theme.quick; } } }
+                                VerticalLayout {
+                                    alignment: center;
+                                    Text {
+                                        text: cog.needs-key ? "set a hold key to reach this layer" : "configure";
+                                        color: cog.lit ? Theme.accent : (cogta.has-hover ? Theme.text-mid : Theme.text-dim);
+                                        font-family: Theme.mono; font-size: Theme.fs-small; vertical-alignment: center;
+                                        animate color { duration: Theme.quick; }
+                                    }
+                                }
+                            }
+                            cogta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.config-open = !root.config-open; } }
+                        }
+                        // collapse × — ONLY while opened-but-empty (never hide real work)
+                        if !shell.setup-exists : Rectangle { width: 1px; background: Theme.line; }
+                        if !shell.setup-exists : Rectangle {
+                            background: xta.has-hover ? Theme.well : transparent;
+                            animate background { duration: Theme.quick; }
+                            HorizontalLayout {
+                                padding-left: 10px; padding-right: 11px;
+                                VerticalLayout { alignment: center; Text { text: "\u{00d7}"; color: xta.has-hover ? Theme.text : Theme.text-faint; font-family: Theme.mono; font-size: Theme.fs-body; vertical-alignment: center; animate color { duration: Theme.quick; } } }
+                            }
+                            xta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.hyper-open = false; root.config-open = false; root.view-layer = 0; root.add-open = false; } }
                         }
                     }
                 }
-                // the selected wire's timing editor — chips on the board open it
-                if State.selected-edge >= 0 : HorizontalLayout {
-                    spacing: 8px;
-                    VerticalLayout {
-                        alignment: center;
-                        Mono {
-                            text: "wire " + State.graph-nodes[State.graph-edges[State.selected-edge].a].label
-                                + " → " + State.graph-nodes[State.graph-edges[State.selected-edge].b].label
-                                + "  ·  " + State.graph-edges[State.selected-edge].timing;
-                            color: Theme.accent;
-                            overflow: elide;
-                        }
-                    }
-                    if State.graph-edges[State.selected-edge].editable : HorizontalLayout {
-                        spacing: 7px;
-                        Field {
-                            field-width: 110px;
-                            placeholder: State.graph-edges[State.selected-edge].tkind == "turbo" ? "cps" : "ms";
-                            text <=> root.edge-timing-input;
-                            accepted(t) => {
-                                State.set-edge-timing(State.selected-edge, t);
-                                root.edge-timing-input = "";
-                            }
-                        }
-                        Button {
-                            text: "set";
-                            primary: true;
-                            enabled: root.edge-timing-input != "";
-                            clicked => {
-                                State.set-edge-timing(State.selected-edge, root.edge-timing-input);
-                                root.edge-timing-input = "";
-                            }
-                        }
-                    }
-                    if !State.graph-edges[State.selected-edge].editable : VerticalLayout {
-                        alignment: center;
-                        Mono { text: "fixed timing — toml-sourced rules edit in their file"; color: Theme.text-faint; }
-                    }
-                    Rectangle {}
-                    Button { text: "close"; clicked => { State.selected-edge = -1; } }
-                }
-                Mono {
-                    text: "drag nodes anywhere (layout persists) · click a wire's chip to tune its timing · chips state timing and the wire's angle";
-                    color: Theme.text-faint;
-                }
+                Rectangle {}
             }
 
-            Divider {}
-
-            // ── POCKETS — portable clipboards, each with its emergent content-sigil ──
-            VerticalLayout {
-                spacing: 9px;
-                HorizontalLayout {
-                    SectionTitle { text: "POCKETS"; }
-                    Rectangle {}
+            // ── ⚙ CONFIG DISCLOSURE — the hold key, stance, and feel, tucked out of the way ──
+            if root.hyper-revealed && root.config-open : Card {
+                VerticalLayout {
+                    padding: 14px;
+                    spacing: 13px;
                     Mono {
-                        text: "portable clipboards · bind a `pocket` action to stash \u{21c4} restore (carries any data)";
+                        text: "Hold your HyperShift key and your controls do their HyperShift binding instead of the base one.";
                         color: Theme.text-faint;
+                        wrap: word-wrap;
                     }
-                }
-                if State.pockets.length == 0 : Mono {
-                    text: "none yet \u{2014} bind a `pocket` action, then activate it with something on your clipboard";
-                    color: Theme.text-faint;
-                }
-                if State.pockets.length > 0 : HorizontalLayout {
-                    spacing: 8px;
-                    for pk in State.pockets : PocketCardEl { p: pk; }
-                    Rectangle {} // soak up the slack so cards stay left-packed
-                }
-            }
-
-            Divider {}
-
-            // ── ADD BINDING (press-to-bind a control -> a typed Action) ────
-            VerticalLayout {
-                spacing: 11px;
-                HorizontalLayout {
-                    SectionTitle { text: "ADD BINDING"; }
-                    Rectangle {}
-                    Mono { text: "press the control — never hardcoded · re-binding replaces"; color: Theme.text-faint; }
-                }
-                HorizontalLayout {
-                    spacing: 10px;
-                    // captured trigger readout + press-to-bind button
-                    VerticalLayout {
-                        width: 300px;
-                        spacing: 7px;
-                        Mono { text: "TRIGGER"; color: Theme.text-dim; }
-                        HorizontalLayout {
-                            spacing: 8px;
+                    // REACHED BY — the hold key (without it, the layer never triggers)
+                    HorizontalLayout {
+                        spacing: 10px;
+                        VerticalLayout { alignment: center; width: 92px; Mono { text: "REACHED BY"; color: Theme.text-dim; } }
+                        VerticalLayout {
+                            alignment: center; horizontal-stretch: 1;
                             Rectangle {
-                                horizontal-stretch: 1;
                                 height: 30px;
                                 border-radius: Theme.radius-sm;
                                 background: Theme.well;
                                 border-width: Theme.hair;
-                                border-color: State.bind-trigger-ready ? Theme.accent-line : Theme.line;
+                                border-color: State.hypershift-hold-ready ? Theme.accent-line : Theme.line;
                                 HorizontalLayout {
-                                    padding-left: 11px;
-                                    Text {
-                                        text: State.bind-trigger-label;
-                                        color: State.bind-trigger-ready ? Theme.accent : Theme.text-dim;
-                                        font-family: Theme.mono; font-size: Theme.fs-body;
-                                        vertical-alignment: center;
-                                        overflow: elide;
+                                    padding-left: 11px; padding-right: 11px; spacing: 9px;
+                                    VerticalLayout { alignment: center; Rectangle { width: 6px; height: 6px; border-radius: 3px; background: State.hypershift-hold-ready ? Theme.accent : Theme.line; } }
+                                    VerticalLayout {
+                                        alignment: center; horizontal-stretch: 1;
+                                        Text {
+                                            text: State.hypershift-hold-ready ? State.hypershift-hold-label : "no hold key — press-to-bind the control you'll hold";
+                                            color: State.hypershift-hold-ready ? Theme.accent : Theme.text-faint;
+                                            font-family: Theme.mono; font-size: Theme.fs-body; vertical-alignment: center; overflow: elide;
+                                        }
                                     }
                                 }
                             }
-                            Button { text: "press-to-bind"; primary: true; clicked => { State.capture-trigger(); } }
                         }
-                        Toggle {
-                            caption: "on HyperShift layer";
-                            checked: State.bind-hypershift;
-                            toggled(v) => { State.bind-hypershift = v; }
+                        VerticalLayout { alignment: center; Button { text: State.hypershift-hold-ready ? "rebind" : "press-to-bind"; primary: !State.hypershift-hold-ready; clicked => { State.capture-hypershift-hold(); } } }
+                        if State.hypershift-hold-ready : VerticalLayout { alignment: center; Button { text: "clear"; danger: true; clicked => { State.clear-hypershift-hold(); } } }
+                    }
+                    // BEHAVES AS — the stance, now contextual to the layer it tunes
+                    HorizontalLayout {
+                        spacing: 10px;
+                        VerticalLayout { alignment: center; width: 92px; Mono { text: "BEHAVES AS"; color: Theme.text-dim; } }
+                        VerticalLayout {
+                            alignment: center; horizontal-stretch: 0;
+                            Segment {
+                                options: ["HOLD", "LATCH", "SMART", "1-SHOT"];
+                                index: root.stance-idx;
+                                min-seg: 60px;
+                                picked(i) => { State.set-hypershift-mode(i == 0 ? "hold" : i == 1 ? "latch" : i == 2 ? "smart" : "one-shot"); }
+                            }
+                        }
+                        Rectangle {}
+                        VerticalLayout {
+                            alignment: center;
+                            Mono {
+                                text: State.hypershift-mode == "latch" ? "tap on · tap off"
+                                    : State.hypershift-mode == "smart" ? "tap latches · hold is momentary"
+                                    : State.hypershift-mode == "one-shot" ? "next press is shifted, then drops"
+                                    : "live while held (Razer's behaviour)";
+                                color: Theme.text-faint;
+                            }
                         }
                     }
-                    // the action palette + commit (gated until the action is COMPLETE)
+                    // feel / forgiveness — the 3 press-grammar dials, tucked behind a disclosure
                     VerticalLayout {
-                        horizontal-stretch: 1;
-                        spacing: 7px;
-                        Mono { text: "ACTION"; color: Theme.text-dim; }
-                        picker := ActionPicker {}
+                        spacing: 10px;
                         HorizontalLayout {
+                            VerticalLayout {
+                                alignment: center; horizontal-stretch: 0;
+                                ftog := TouchArea {
+                                    width: ftl.preferred-width; height: 18px;
+                                    mouse-cursor: MouseCursor.pointer;
+                                    clicked => { root.feel-open = !root.feel-open; }
+                                    ftl := Text {
+                                        text: (root.feel-open ? "▾ " : "▸ ") + "feel · the press-grammar forgiveness windows";
+                                        color: ftog.has-hover ? Theme.text-mid : Theme.text-faint;
+                                        font-family: Theme.mono; font-size: Theme.fs-small; vertical-alignment: center;
+                                    }
+                                }
+                            }
                             Rectangle {}
+                        }
+                        if root.feel-open : HorizontalLayout {
+                            spacing: 16px;
+                            VerticalLayout {
+                                alignment: center; horizontal-stretch: 1;
+                                HorizontalLayout {
+                                    spacing: 7px;
+                                    VerticalLayout { alignment: center; Mono { text: "hold"; color: Theme.text-faint; } }
+                                    VerticalLayout { alignment: center; horizontal-stretch: 1;
+                                        Slider { compact: true; minimum: 80; maximum: 600; step: 10; value: State.feel-hold-ms; wheel: false; changed(v) => { State.set-feel-timing(v, State.feel-gap-ms, State.feel-coyote-ms); } }
+                                    }
+                                    VerticalLayout { alignment: center; min-width: 48px; Mono { text: State.feel-hold-ms + "ms"; color: Theme.text; horizontal-alignment: right; } }
+                                }
+                            }
+                            VerticalLayout {
+                                alignment: center; horizontal-stretch: 1;
+                                HorizontalLayout {
+                                    spacing: 7px;
+                                    VerticalLayout { alignment: center; Mono { text: "gap"; color: Theme.text-faint; } }
+                                    VerticalLayout { alignment: center; horizontal-stretch: 1;
+                                        Slider { compact: true; minimum: 40; maximum: 400; step: 10; value: State.feel-gap-ms; wheel: false; changed(v) => { State.set-feel-timing(State.feel-hold-ms, v, State.feel-coyote-ms); } }
+                                    }
+                                    VerticalLayout { alignment: center; min-width: 48px; Mono { text: State.feel-gap-ms + "ms"; color: Theme.text; horizontal-alignment: right; } }
+                                }
+                            }
+                            VerticalLayout {
+                                alignment: center; horizontal-stretch: 1;
+                                HorizontalLayout {
+                                    spacing: 7px;
+                                    VerticalLayout { alignment: center; Mono { text: "coyote"; color: Theme.text-faint; } }
+                                    VerticalLayout { alignment: center; horizontal-stretch: 1;
+                                        Slider { compact: true; minimum: 0; maximum: 200; step: 10; value: State.feel-coyote-ms; wheel: false; changed(v) => { State.set-feel-timing(State.feel-hold-ms, State.feel-gap-ms, v); } }
+                                    }
+                                    VerticalLayout { alignment: center; min-width: 48px; Mono { text: State.feel-coyote-ms + "ms"; color: Theme.text; horizontal-alignment: right; } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ── the active layer's binds (LIST) ──
+            VerticalLayout {
+                spacing: 11px;
+                RuleList {
+                    title: root.view-layer == 0 ? "BASE BINDS" : "HYPERSHIFT BINDS";
+                    accent: root.view-layer == 1;
+                    rules: root.view-layer == 0 ? State.rules : State.hypershift-rules;
+                    empty-hint: root.view-layer == 0
+                        ? "no base binds yet — press-to-bind a control below"
+                        : "no shifted binds yet — bind a control while you're on this layer";
+                    remove(i) => { if (root.view-layer == 0) { State.remove-rule(i); } else { State.remove-hyper-rule(i); } }
+                }
+                // INLINE "+ bind a control" — the press-to-bind flow, in place. New binds land on the
+                // layer you're viewing, so there's no "on HyperShift layer" checkbox to forget.
+                if !root.add-open : Rectangle {
+                    height: 34px;
+                    border-radius: Theme.radius-sm;
+                    background: addta.has-hover ? Theme.well : Theme.bg-2;
+                    border-width: Theme.hair;
+                    border-color: addta.has-hover ? Theme.accent-line : Theme.line;
+                    animate background, border-color { duration: Theme.quick; }
+                    addta := TouchArea {
+                        mouse-cursor: MouseCursor.pointer;
+                        clicked => { State.bind-hypershift = (root.view-layer == 1); root.add-open = true; }
+                    }
+                    HorizontalLayout {
+                        padding-left: 12px; padding-right: 12px; spacing: 8px;
+                        VerticalLayout { alignment: center; Text { text: "＋"; color: Theme.accent; font-family: Theme.mono; font-size: Theme.fs-body; font-weight: 700; } }
+                        VerticalLayout { alignment: center; Text { text: root.view-layer == 1 ? "bind a control to the HyperShift layer" : "bind a control"; color: addta.has-hover ? Theme.text-mid : Theme.text-faint; font-family: Theme.mono; font-size: Theme.fs-body; } }
+                        Rectangle {}
+                    }
+                }
+                if root.add-open : Card {
+                    VerticalLayout {
+                        padding: 13px;
+                        spacing: 12px;
+                        // header — a live accent lamp + which layer this wire lands on, close at the edge
+                        HorizontalLayout {
+                            spacing: 8px;
+                            VerticalLayout { alignment: center; Rectangle { width: Theme.dot; height: Theme.dot; border-radius: Theme.dot / 2; background: Theme.accent; } }
+                            VerticalLayout { alignment: center; Mono { text: root.view-layer == 1 ? "bind a control · on HYPERSHIFT" : "bind a control · on BASE"; color: Theme.accent; } }
+                            Rectangle {}
+                            VerticalLayout { alignment: center; Button { text: "close"; clicked => { root.add-open = false; } } }
+                        }
+                        // the wire you're forging, read left→right like the node board: a TRIGGER end, the
+                        // arrow (faint until the circuit completes, then phosphor), and the ACTION it fires.
+                        HorizontalLayout {
+                            spacing: 10px;
+                            // ── the trigger end — the whole well is the press-to-bind target ──
+                            VerticalLayout {
+                                width: 280px;
+                                spacing: 7px;
+                                Mono { text: "TRIGGER"; color: Theme.text-dim; }
+                                Rectangle {
+                                    height: 30px;
+                                    border-radius: Theme.radius-sm;
+                                    background: slotta.has-hover ? Theme.well-hi : Theme.well;
+                                    border-width: Theme.hair;
+                                    border-color: State.bind-trigger-ready ? Theme.accent-line
+                                        : slotta.has-hover ? Theme.text-faint : Theme.line;
+                                    animate background, border-color { duration: Theme.quick; }
+                                    HorizontalLayout {
+                                        padding-left: 11px; padding-right: 10px; spacing: 8px;
+                                        Text {
+                                            horizontal-stretch: 1;
+                                            text: State.bind-trigger-ready ? State.bind-trigger-label : "press-to-bind a key or button";
+                                            color: State.bind-trigger-ready ? Theme.accent
+                                                : slotta.has-hover ? Theme.text-mid : Theme.text-faint;
+                                            font-family: Theme.mono; font-size: Theme.fs-body;
+                                            vertical-alignment: center; overflow: elide;
+                                        }
+                                        // a quiet "you can change it" hint once a trigger is captured
+                                        if State.bind-trigger-ready : Text {
+                                            text: "REBIND";
+                                            color: slotta.has-hover ? Theme.accent : Theme.text-faint;
+                                            font-family: Theme.mono; font-size: Theme.fs-small;
+                                            font-weight: 700; letter-spacing: Theme.track-4;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                    slotta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { State.capture-trigger(); } }
+                                }
+                            }
+                            // ── the wire's arrow — lights phosphor the instant both ends connect ──
+                            VerticalLayout {
+                                width: 22px;
+                                spacing: 7px;
+                                Mono { text: " "; }   // a label-height spacer, so the arrow drops onto the control row
+                                VerticalLayout {
+                                    alignment: center;
+                                    height: 30px;
+                                    Text {
+                                        text: "→";
+                                        color: (State.bind-trigger-ready && picker.param-ok) ? Theme.accent : Theme.text-faint;
+                                        font-family: Theme.mono; font-size: 16px; font-weight: 700;
+                                        horizontal-alignment: center; vertical-alignment: center;
+                                        animate color { duration: Theme.settle; }
+                                    }
+                                }
+                            }
+                            // ── the action end ──
+                            VerticalLayout {
+                                horizontal-stretch: 1;
+                                spacing: 7px;
+                                Mono { text: "ACTION"; color: Theme.text-dim; }
+                                picker := ActionPicker {}
+                            }
+                        }
+                        // commit — a live readout of the wire (lit when both ends connect) + the key that lays it
+                        HorizontalLayout {
+                            spacing: 10px;
+                            VerticalLayout {
+                                alignment: center;
+                                horizontal-stretch: 1;
+                                Text {
+                                    text: (State.bind-trigger-ready ? State.bind-trigger-label : "—")
+                                        + "  →  " + picker.action-label
+                                        + (State.action-param != "" ? "  ·  " + State.action-param : "");
+                                    color: (State.bind-trigger-ready && picker.param-ok) ? Theme.accent-dim : Theme.text-faint;
+                                    font-family: Theme.mono; font-size: Theme.fs-small;
+                                    overflow: elide;
+                                    animate color { duration: Theme.settle; }
+                                }
+                            }
                             Button {
                                 text: "add binding";
                                 primary: true;
                                 enabled: State.bind-trigger-ready && picker.param-ok;
-                                clicked => { State.add-binding(); }
+                                clicked => { State.bind-hypershift = (root.view-layer == 1); State.add-binding(); }
                             }
                         }
                     }
                 }
             }
 
-            Divider {}
-
-            // ── HYPERSHIFT STANCE — how the layer trigger behaves ─────────
-            // A layer is a stance, not a button. Razer ships hold-only (toggle has been a
-            // years-old community ask); games solved this long ago — so Neuron offers the set.
-            // Lives BELOW the rules: it tunes how the second layer engages; the rules are the page.
+            // ════════ ALTITUDE 2 · THE WORKSHOP ════════
+            Rectangle { height: 6px; }
+            Rectangle { height: Theme.hair; background: Theme.line; }
             HorizontalLayout {
-                spacing: 10px;
-                VerticalLayout { alignment: center; Mono { text: "HYPERSHIFT STANCE"; color: Theme.text-dim; } }
-                Segment {
-                    options: ["HOLD", "LATCH", "SMART", "1-SHOT"];
-                    index: root.stance-idx;
-                    min-seg: 60px;
-                    picked(i) => { State.set-hypershift-mode(i == 0 ? "hold" : i == 1 ? "latch" : i == 2 ? "smart" : "one-shot"); }
-                }
+                spacing: 8px;
+                Rectangle { width: 3px; height: 14px; border-radius: 1px; y: 1px; background: Theme.accent; }
+                SectionTitle { text: "WORKSHOP"; }
+                VerticalLayout { alignment: center; Mono { text: "the things you bind to — build them here"; color: Theme.text-faint; font-size: Theme.fs-small; } }
                 Rectangle {}
-                VerticalLayout {
-                    alignment: center;
-                    Mono {
-                        text: State.hypershift-mode == "latch" ? "tap on · tap off"
-                            : State.hypershift-mode == "smart" ? "tap latches · hold is momentary"
-                            : State.hypershift-mode == "one-shot" ? "next press is shifted, then drops"
-                            : "live while held (Razer's behaviour)";
-                        color: Theme.text-faint;
-                    }
-                }
             }
 
-            // ── FEEL TIMING — the press grammar's forgiveness windows (feel.toml) ──
-            // hold = the tap↔hold cutoff (also smart-stance's tap-vs-momentary line) · gap = max
-            // silence between phrase presses before the rhythm dies · coyote = post-release tail
-            // that still counts. One callback mirrors the stance picker: load → set → save → reload.
-            HorizontalLayout {
-                spacing: 16px;
-                VerticalLayout { alignment: center; horizontal-stretch: 0; Mono { text: "FEEL TIMING"; color: Theme.text-dim; } }
-                // HOLD
-                VerticalLayout {
-                    alignment: center;
-                    horizontal-stretch: 1;
-                    HorizontalLayout {
-                        spacing: 7px;
-                        VerticalLayout { alignment: center; Mono { text: "hold"; color: Theme.text-faint; } }
-                        VerticalLayout {
-                            alignment: center;
-                            horizontal-stretch: 1;
-                            Slider {
-                                compact: true;
-                                minimum: 80;
-                                maximum: 600;
-                                step: 10;
-                                value: State.feel-hold-ms;
-                                wheel: false;   // each change rewrites feel.toml + reloads — never on a stray wheel
-                                changed(v) => { State.set-feel-timing(v, State.feel-gap-ms, State.feel-coyote-ms); }
-                            }
-                        }
-                        VerticalLayout { alignment: center; min-width: 48px; Mono { text: State.feel-hold-ms + "ms"; color: Theme.text; horizontal-alignment: right; } }
-                    }
-                }
-                // GAP
-                VerticalLayout {
-                    alignment: center;
-                    horizontal-stretch: 1;
-                    HorizontalLayout {
-                        spacing: 7px;
-                        VerticalLayout { alignment: center; Mono { text: "gap"; color: Theme.text-faint; } }
-                        VerticalLayout {
-                            alignment: center;
-                            horizontal-stretch: 1;
-                            Slider {
-                                compact: true;
-                                minimum: 40;
-                                maximum: 400;
-                                step: 10;
-                                value: State.feel-gap-ms;
-                                wheel: false;
-                                changed(v) => { State.set-feel-timing(State.feel-hold-ms, v, State.feel-coyote-ms); }
-                            }
-                        }
-                        VerticalLayout { alignment: center; min-width: 48px; Mono { text: State.feel-gap-ms + "ms"; color: Theme.text; horizontal-alignment: right; } }
-                    }
-                }
-                // COYOTE
-                VerticalLayout {
-                    alignment: center;
-                    horizontal-stretch: 1;
-                    HorizontalLayout {
-                        spacing: 7px;
-                        VerticalLayout { alignment: center; Mono { text: "coyote"; color: Theme.text-faint; } }
-                        VerticalLayout {
-                            alignment: center;
-                            horizontal-stretch: 1;
-                            Slider {
-                                compact: true;
-                                minimum: 0;
-                                maximum: 200;
-                                step: 10;
-                                value: State.feel-coyote-ms;
-                                wheel: false;
-                                changed(v) => { State.set-feel-timing(State.feel-hold-ms, State.feel-gap-ms, v); }
-                            }
-                        }
-                        VerticalLayout { alignment: center; min-width: 48px; Mono { text: State.feel-coyote-ms + "ms"; color: Theme.text; horizontal-alignment: right; } }
-                    }
-                }
-            }
-
-            Divider {}
-
-            // ── audio actions (folded-in Audio: mic + output) + macro authoring ──
-            macro_row := HorizontalLayout {
-                spacing: Theme.gap-col;
-                // AUDIO — the Core-Audio chain as a tiny mixing console: capture (MIC) over render
-                // (OUT), two identical channel strips. Each is also bindable on the spine
-                // (mic-gain/mic-mute · out-gain/out-mute) — the faders just mirror those live endpoints.
-                VerticalLayout {
-                    width: 340px;
-                    spacing: 14px;
-                    HorizontalLayout {
-                        SectionTitle { text: "AUDIO"; }
-                        Rectangle {}
-                        // one quiet re-read for both endpoints (a mic/output was plugged or switched)
-                        VerticalLayout {
-                            alignment: center;
-                            rta := TouchArea {
-                                width: rl.preferred-width; height: 20px;
-                                mouse-cursor: MouseCursor.pointer;
-                                clicked => { State.refresh-mic(); State.refresh-out(); }
-                                rl := Text {
-                                    text: "re-read";
-                                    color: rta.has-hover ? Theme.text-mid : Theme.text-faint;
-                                    font-family: Theme.mono; font-size: Theme.fs-small; letter-spacing: Theme.track-2;
-                                    vertical-alignment: center;
-                                }
-                            }
-                        }
-                    }
-                    ChannelStrip {
-                        tag: "MIC";
-                        device: State.mic-name;
-                        level: State.mic-gain;
-                        muted: State.mic-muted;
-                        set-level(v) => { State.mic-gain = v; State.set-mic-gain(v); }
-                        toggle-mute => { State.toggle-mic-mute(); }
-                    }
-                    Divider {}
-                    ChannelStrip {
-                        tag: "OUT";
-                        device: State.out-name;
-                        level: State.out-gain;
-                        muted: State.out-muted;
-                        set-level(v) => { State.out-gain = v; State.set-out-gain(v); }
-                        toggle-mute => { State.toggle-out-mute(); }
-                    }
-                    Mono { text: "Core Audio · bind gain / mute on the spine"; color: Theme.text-faint; }
-                }
-
-                // ── macro authoring (PYTHON -> check -> save+register -> test run) ──
-                VerticalLayout {
-                    horizontal-stretch: 1;
-                    spacing: 11px;
+            // MACRO — the star: full width, CODE-first (blocks is the toggle). Carries macro_row for
+            // the cross-panel "author a macro" jump (see app.slint).
+            macro_row := VerticalLayout {
+                horizontal-stretch: 1;
+                spacing: 11px;
                     HorizontalLayout {
                         spacing: 8px;
                         SectionTitle { text: "MACRO"; }
+                        // the book button — opens the macro/Workshop guide popup, anchored here
+                        VerticalLayout { alignment: center; GuideButton { guide-id: "macros"; } }
                         VerticalLayout { alignment: center; Mono { text: "a script you bind to a trigger"; color: Theme.text-faint; font-size: Theme.fs-small; } }
                         Rectangle {}
+                        if State.macro-parsing && !State.macro-code-view : Pill { text: "READING"; live: true; }
                         if State.macro-busy : Pill { text: "WORKING"; live: true; }
+                        // BLOCKS ⇄ CODE — the same macro, two presentations: a visual node-blocks canvas
+                        // or the raw Python. Switching TO blocks re-parses the current source so the
+                        // canvas reflects whatever the code view holds.
+                        // a single SPLIT BUTTON — two joined halves under ONE rounded outline (a hairline
+                        // split between them), the active side lit. Not two pills with a gap.
+                        VerticalLayout {
+                            width: 160px;
+                            alignment: center;
+                            Rectangle {
+                                height: Theme.row-h-sm;
+                                border-radius: Theme.radius-sm;
+                                border-width: Theme.hair;
+                                border-color: Theme.line;
+                                clip: true;   // square the inner halves to the rounded outline
+                                HorizontalLayout {
+                                    spacing: 0;
+                                    blk := Rectangle {
+                                        horizontal-stretch: 1;
+                                        property <bool> on: !State.macro-code-view;
+                                        background: blk.on ? Theme.accent-glow : (blka.has-hover ? Theme.well : transparent);
+                                        animate background { duration: Theme.quick; }
+                                        // the blocks icon is DRAWN (not a font glyph — Consolas lacks the grid
+                                        // glyphs): two tiny stacked cards = the step blocks, to match ‹/› code.
+                                        HorizontalLayout {
+                                            alignment: center;
+                                            spacing: 6px;
+                                            VerticalLayout {
+                                                alignment: center;
+                                                spacing: 2px;
+                                                Rectangle { width: 12px; height: 4px; border-radius: 1px; background: blk.on ? Theme.accent : (blka.has-hover ? Theme.text-mid : Theme.text-dim); }
+                                                Rectangle { width: 12px; height: 4px; border-radius: 1px; background: blk.on ? Theme.accent : (blka.has-hover ? Theme.text-mid : Theme.text-dim); }
+                                            }
+                                            Text {
+                                                text: "blocks";
+                                                vertical-alignment: center;
+                                                color: blk.on ? Theme.accent : (blka.has-hover ? Theme.text-mid : Theme.text-dim);
+                                                font-size: Theme.fs-small; font-weight: 700; font-family: Theme.mono; letter-spacing: Theme.track-2;
+                                            }
+                                        }
+                                        blka := TouchArea {
+                                            mouse-cursor: MouseCursor.pointer;
+                                            clicked => { State.macro-code-view = false; State.refresh-macro-blocks(State.macro-source); }
+                                        }
+                                    }
+                                    Rectangle { width: Theme.hair; background: Theme.line; }   // the split
+                                    cod := Rectangle {
+                                        horizontal-stretch: 1;
+                                        property <bool> on: State.macro-code-view;
+                                        background: cod.on ? Theme.accent-glow : (coda.has-hover ? Theme.well : transparent);
+                                        animate background { duration: Theme.quick; }
+                                        Text {
+                                            text: "‹/› code";
+                                            vertical-alignment: center; horizontal-alignment: center;
+                                            color: cod.on ? Theme.accent : (coda.has-hover ? Theme.text-mid : Theme.text-dim);
+                                            font-size: Theme.fs-small; font-weight: 700; font-family: Theme.mono; letter-spacing: Theme.track-2;
+                                        }
+                                        coda := TouchArea {
+                                            mouse-cursor: MouseCursor.pointer;
+                                            clicked => { State.macro-code-view = true; }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                     HorizontalLayout {
                         spacing: 7px;
@@ -868,24 +1329,53 @@ export component BindingsPanel inherits VerticalLayout {
                         }
                         Rectangle {}
                     }
-                    // BUILD BY CLICKING — a toolbar: each chip drops a ready-to-edit line into the
-                    // editor below (the first click adds the `def macro(ctx):` wrapper); or just type.
-                    HorizontalLayout {
+                    // THE CONSTRUCTOR — two presentations of the same macro, switched by the header's
+                    // blocks⇄code segment. The BLOCKS canvas IS the builder: every row is built by touch
+                    // (inline field edits, hover ↑/↓/✕, the +add picker), each mutating the Rust working
+                    // tree which regenerates the source + re-flattens instantly. The CODE view is the same
+                    // macro as raw Python; typing there reseeds the tree on the toggle back (or via the
+                    // dirty-guard). The old top chip toolbar is gone — its job moved INTO the canvas.
+                    if !State.macro-code-view : VerticalLayout {
                         spacing: 6px;
-                        VerticalLayout { alignment: center; Mono { text: "add"; color: Theme.text-faint; font-size: Theme.fs-small; } }
-                        Pill { text: "type text"; clickable: true; clicked => { root.add-step("neuron.type_text(\"hello\")"); } }
-                        Pill { text: "hotkey"; clickable: true; clicked => { root.add-step("neuron.hotkey(\"ctrl\", \"c\")"); } }
-                        Pill { text: "clipboard"; clickable: true; clicked => { root.add-step("neuron.clipboard_set(\"text\")"); } }
-                        Pill { text: "run app"; clickable: true; clicked => { root.add-step("neuron.run(\"notepad\")"); } }
-                        Pill { text: "ask"; clickable: true; clicked => { root.add-step("if neuron.ask(\"ready?\"):\n        neuron.notify(\"go\")"); } }
-                        Pill { text: "notify"; clickable: true; clicked => { root.add-step("neuron.notify(\"done\")"); } }
-                        Rectangle {}
+                        // a syntax/host error rides ABOVE the canvas and KEEPS the last-good rows visible
+                        // — you fix the line while still seeing the structure ("works with errors").
+                        if State.macro-parse-error != "" : Mono {
+                            text: State.macro-parse-error;
+                            color: Theme.warn;
+                            font-size: Theme.fs-small;
+                            wrap: word-wrap;
+                        }
+                        // the canvas — steps, branch lanes, and +add points, all on one spine. When
+                        // empty it's just the root +add, which renders as a warm "add your first step"
+                        // CTA (see MacroBlockEl.empty-cta), so no separate empty-state line is needed.
+                        VerticalLayout {
+                            spacing: 4px;
+                            for b in State.macro-blocks : MacroBlockEl { b: b; }
+                        }
+                        // a quiet alternative pointer when the macro is empty — the canvas CTA is the
+                        // primary call; this just notes the code-view escape hatch below it.
+                        if State.macro-blocks.length <= 1 : Mono {
+                            text: "\u{2026} or switch to code view to write Python directly";
+                            color: Theme.text-faint;
+                            font-size: Theme.fs-small;
+                        }
                     }
-                    CodeArea {
+                    if State.macro-code-view : CodeArea {
                         height: 150px;
                         placeholder: "def macro(ctx):\n    neuron.type_text(\"hello!\")";
                         text <=> State.macro-source;
-                        edited(s) => { State.note-macro-source(s); }
+                        // BIDIRECTIONAL dirty-guard: a change Rust made from the tree (a canvas edit /
+                        // a parse reseed) sets macro-source-dirty — that keystroke is codegen, not a
+                        // human, so clear the flag and DON'T re-note (which would loop). A genuine human
+                        // edit leaves the flag false → note it (gates "test asks"); the live re-parse
+                        // into blocks happens on the toggle back to the canvas (refresh-macro-blocks).
+                        edited(s) => {
+                            if (State.macro-source-dirty) {
+                                State.macro-source-dirty = false;
+                            } else {
+                                State.note-macro-source(s);
+                            }
+                        }
                     }
                     HorizontalLayout {
                         spacing: 7px;
@@ -893,6 +1383,17 @@ export component BindingsPanel inherits VerticalLayout {
                             text: "check";
                             busy: State.macro-busy;
                             clicked => { State.macro-check(State.macro-source); }
+                        }
+                        // open the macros/scripts/ folder (made if missing) — drop .py files in here.
+                        Button {
+                            text: "reveal";
+                            clicked => { State.reveal-macros(); }
+                        }
+                        // re-read disk: register dropped-in / externally-edited macros, refresh the
+                        // catalog, and reload the open macro. The "press reload" (no live-watch) path.
+                        Button {
+                            text: "reload";
+                            clicked => { State.reload-macros(); }
                         }
                         // SURFACES ITSELF once the macro contains an ask — previews JUST its beacon(s)
                         // via the SYSTEM→BEACONS pipeline (disarmed, nothing real runs): learn asks by
@@ -927,7 +1428,100 @@ export component BindingsPanel inherits VerticalLayout {
                             for line in State.macro-dryrun : Mono { text: line; wrap: word-wrap; }
                         }
                     }
+                    // THE CATALOG — every macro on disk, read EMERGENTLY so you understand them without
+                    // opening the code: name, the plain-English summary, size + options, and the
+                    // trigger(s) that fire each. Click a card to load it into the editor above (the open
+                    // one is lit). Flows in the page scroll, so a long list scrolls with the panel.
+                    VerticalLayout {
+                        spacing: 7px;
+                        HorizontalLayout {
+                            spacing: 8px;
+                            SectionTitle { text: "ALL MACROS"; }
+                            VerticalLayout { alignment: center; Mono { text: "click one to open it"; color: Theme.text-faint; font-size: Theme.fs-small; } }
+                            Rectangle {}
+                            if State.macro-catalog-building : Pill { text: "READING"; live: true; }
+                        }
+                        if State.macro-catalog.length == 0 && !State.macro-catalog-building : Mono {
+                            text: "no macros yet \u{2014} build one above, or Reveal the folder, drop a .py in, then Reload";
+                            color: Theme.text-faint;
+                            font-size: Theme.fs-small;
+                            wrap: word-wrap;
+                        }
+                        VerticalLayout {
+                            spacing: 5px;
+                            for c in State.macro-catalog : MacroCardEl { c: c; }
+                        }
+                    }
                 }
+
+            Divider {}
+
+            // POCKETS — portable clipboards, each with its emergent content-sigil
+            VerticalLayout {
+                spacing: 9px;
+                SectionTitle { text: "POCKETS"; }
+                if State.pockets.length == 0 : Mono {
+                    text: "none yet \u{2014} bind a `pocket` action, then activate it with something on your clipboard";
+                    color: Theme.text-faint;
+                }
+                if State.pockets.length > 0 : HorizontalLayout {
+                    spacing: 8px;
+                    for pk in State.pockets : PocketCardEl { p: pk; }
+                    Rectangle {}
+                }
+            }
+
+            Divider {}
+
+            // AUDIO — the Core-Audio chain as a tiny mixing console (also bindable on the spine).
+            HorizontalLayout {
+                VerticalLayout {
+                    width: 340px;
+                    spacing: 14px;
+                    HorizontalLayout {
+                        SectionTitle { text: "AUDIO"; }
+                        Rectangle {}
+                        VerticalLayout {
+                            alignment: center;
+                            rta := TouchArea {
+                                width: rl.preferred-width; height: 20px;
+                                mouse-cursor: MouseCursor.pointer;
+                                clicked => { State.refresh-mic(); State.refresh-out(); }
+                                rl := Text {
+                                    text: "re-read";
+                                    color: rta.has-hover ? Theme.text-mid : Theme.text-faint;
+                                    font-family: Theme.mono; font-size: Theme.fs-small; letter-spacing: Theme.track-2;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+                    }
+                    ChannelStrip {
+                        tag: "MIC";
+                        device: State.mic-name;
+                        level: State.mic-gain;
+                        muted: State.mic-muted;
+                        meter: State.mic-level;
+                        phold: State.mic-hold;
+                        clipping: State.mic-clip;
+                        set-level(v) => { State.mic-gain = v; State.set-mic-gain(v); }
+                        toggle-mute => { State.toggle-mic-mute(); }
+                    }
+                    Divider {}
+                    ChannelStrip {
+                        tag: "OUT";
+                        device: State.out-name;
+                        level: State.out-gain;
+                        muted: State.out-muted;
+                        meter: State.out-level;
+                        phold: State.out-hold;
+                        clipping: State.out-clip;
+                        set-level(v) => { State.out-gain = v; State.set-out-gain(v); }
+                        toggle-mute => { State.toggle-out-mute(); }
+                    }
+                    Mono { text: "Core Audio · bind gain / mute on the spine"; color: Theme.text-faint; }
+                }
+                Rectangle {}
             }
         }
     }

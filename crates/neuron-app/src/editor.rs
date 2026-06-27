@@ -57,7 +57,7 @@ pub const ACTION_PALETTE: &[(&str, &str, &str, &str, bool, u8)] = &[
         "w:180 ~90 a space  ·  :hold ~pause, ms",
         "press & type",
         true,
-        5,
+        4,
     ),
     (
         "ghost-paste",
@@ -65,7 +65,7 @@ pub const ACTION_PALETTE: &[(&str, &str, &str, &str, bool, u8)] = &[
         "instant · fast · normal",
         "clipboard",
         false,
-        5,
+        4,
     ),
     (
         "pocket",
@@ -73,7 +73,7 @@ pub const ACTION_PALETTE: &[(&str, &str, &str, &str, bool, u8)] = &[
         "name · keep = persist",
         "clipboard",
         false,
-        5,
+        4,
     ),
     ("macro", "python macro", "macro name", "run & code", true, 4),
     (
@@ -1008,7 +1008,10 @@ pub fn remove_gui_rule_in_tier(n: usize, hypershift: bool) -> Result<(), String>
     // find the flat index of the n-th rule whose layer-tier matches.
     let mut seen = 0usize;
     for (i, r) in rules.iter().enumerate() {
-        if r.layer.is_some() == hypershift {
+        // the Noop activator on the hypershift layer is the HOLD KEY — surfaced + removed separately
+        // (clear_hypershift_hold) and filtered OUT of the shifted list, so skip it to keep indices aligned.
+        let is_hold_key = hypershift && r.layer.is_some() && r.action == Action::Noop;
+        if r.layer.is_some() == hypershift && !is_hold_key {
             if seen == n {
                 return remove_gui_rule(i);
             }
@@ -1016,6 +1019,30 @@ pub fn remove_gui_rule_in_tier(n: usize, hypershift: bool) -> Result<(), String>
         }
     }
     Err("no such GUI rule in that tier".into())
+}
+
+/// The HyperShift HOLD KEY — the control you hold to REACH the second layer. Stored as a `Noop` rule
+/// on the "hypershift" layer: the engine activates a layer for ANY input with a rule on it, so a Noop
+/// rule is a pure activator (it holds the layer, does nothing itself). Exactly one hold key — setting
+/// a new one replaces the old.
+pub fn set_hypershift_hold(trigger: Trigger) -> Result<(), String> {
+    let mut rules = load_gui_rules();
+    rules.retain(|r| !(r.layer.as_deref() == Some("hypershift") && r.action == Action::Noop));
+    let mut rule = Rule::new(trigger, Action::Noop);
+    rule.layer = Some("hypershift".to_string());
+    rules.push(rule);
+    save_gui_rules(&rules)
+}
+
+/// Clear the HyperShift hold key (drop its Noop activator). Idempotent.
+pub fn clear_hypershift_hold() -> Result<(), String> {
+    let mut rules = load_gui_rules();
+    let before = rules.len();
+    rules.retain(|r| !(r.layer.as_deref() == Some("hypershift") && r.action == Action::Noop));
+    if rules.len() == before {
+        return Ok(());
+    }
+    save_gui_rules(&rules)
 }
 
 /// Serialize a [`CastConfig`] back to `cast.toml` (the radial wedges + glyph spells). `CastConfig`

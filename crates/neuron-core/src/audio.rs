@@ -521,14 +521,58 @@ mod imp {
             }
         }
 
-        /// The current peak sample value (0.0..=1.0) since the last read — the live loudness.
-        pub fn peak(&self) -> f32 {
+        /// Open the meter on an EXACT endpoint id (capture OR render) — so a channel strip can show
+        /// the live level of the specific device it controls, not just the default output. Mirror of
+        /// [`VolumeCtl::open`], activating the meter interface instead of the volume one.
+        pub fn open(id: &str) -> Option<Self> {
+            com_init();
+            let en = create_enumerator();
+            if en.is_null() {
+                return None;
+            }
+            unsafe {
+                let evt = vtbl::<ImmDeviceEnumeratorVtbl>(en);
+                let wid = to_wide(id);
+                let mut dev: *mut c_void = std::ptr::null_mut();
+                let hr = ((*evt).get_device)(en, wid.as_ptr(), &mut dev);
+                release(en);
+                if hr < 0 || dev.is_null() {
+                    return None;
+                }
+                let meter = activate_meter(dev);
+                release(dev);
+                if meter.is_null() {
+                    None
+                } else {
+                    Some(MeterCtl { meter })
+                }
+            }
+        }
+
+        /// The current peak sample value (0.0..=1.0) since the last read — the live loudness, or
+        /// `None` if the OS rejected the call. CAPTURING the HRESULT is the point: when the endpoint
+        /// is invalidated (the default device changed, the endpoint went to sleep) `GetPeakValue`
+        /// returns a failure HRESULT (e.g. `AUDCLNT_E_DEVICE_INVALIDATED`); a caller that discards it
+        /// reads 0.0 forever with a dead handle. The sampler uses this to DROP and re-open on failure
+        /// so a device change self-heals instead of zeroing the meter permanently.
+        pub fn try_peak(&self) -> Option<f32> {
             unsafe {
                 let vt = vtbl::<IAudioMeterInformationVtbl>(self.meter);
                 let mut p = 0f32;
-                let _ = ((*vt).get_peak_value)(self.meter, &mut p);
-                p.clamp(0.0, 1.0)
+                let hr = ((*vt).get_peak_value)(self.meter, &mut p);
+                if hr < 0 {
+                    None
+                } else {
+                    Some(p.clamp(0.0, 1.0))
+                }
             }
+        }
+
+        /// The current peak sample value (0.0..=1.0), or 0.0 on failure — the lenient read kept for
+        /// callers that don't distinguish "silent" from "handle dead". The live sampler uses the
+        /// error-aware [`try_peak`](Self::try_peak) instead so it can re-open an invalidated handle.
+        pub fn peak(&self) -> f32 {
+            self.try_peak().unwrap_or(0.0)
         }
     }
 
@@ -784,6 +828,14 @@ mod stub {
 
     impl MeterCtl {
         pub fn open_default_render() -> Option<Self> {
+            None
+        }
+        pub fn open(_id: &str) -> Option<Self> {
+            None
+        }
+        /// Error-aware read mirror of `imp` — never opens here, so it's never actually called, but
+        /// the surface must match (the maintenance contract in this file's header).
+        pub fn try_peak(&self) -> Option<f32> {
             None
         }
         pub fn peak(&self) -> f32 {
