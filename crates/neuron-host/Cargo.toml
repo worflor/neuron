@@ -1,16 +1,19 @@
 # neuron-host — the protocol-host kernel: ownership arbiter, signal bus,
-# declaration journal, and the damped restart governor.
+# declaration journal, damped restart governor, host shell, and protocol
+# adapters (pure state machines; sockets live in the process shell).
 #
-# Deliberately PURE STD: no dependencies, no I/O, no platform code. Everything
-# in this crate is a deterministic state machine that can be exhaustively
-# unit-tested with an injected clock. Wire protocols, sockets, and device
-# writes live in adapters OUTSIDE this crate and talk to it through plain
-# function calls (later: one actor thread + channels).
+# KERNEL modules (arbiter/bus/journal/governor/shell/writer) are PURE STD:
+# deterministic state machines, exhaustively unit-tested with injected clocks.
+# Adapters may use the ALREADY-DECLARED workspace deps (serde/serde_json for
+# the Chroma REST JSON bodies) — no NEW workspace dependencies introduced,
+# honoring the workspace manifest's dependency freeze.
 [package]
 name = "neuron-host"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Protocol-host kernel: ownership arbiter, signal bus, declaration journal, damped restart governor"
+description = "Protocol-host kernel: ownership arbiter, signal bus, declaration journal, damped restart governor, protocol adapters"
 
 [dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

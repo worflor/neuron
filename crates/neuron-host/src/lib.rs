@@ -27,27 +27,43 @@
 //! *can* crash, and because state lives behind one owner there is no shared
 //! mutex to poison.
 
+pub mod adapters;
+pub mod api;
 pub mod arbiter;
 pub mod bus;
 pub mod governor;
 pub mod journal;
+pub mod shell;
+pub mod writer;
 
+use api::SurfaceInfo;
 use arbiter::Arbiter;
 use bus::Bus;
 use journal::Journal;
 
-/// The kernel: one struct owning the three state machines. Thread/actor wiring
-/// is a later, thin shell — everything interesting is synchronous and testable
-/// right here.
+/// The kernel: one struct owning the three state machines plus surface
+/// identity metadata. Thread/actor wiring is the thin [`shell`] — everything
+/// interesting is synchronous and testable right here. Adapters talk to it
+/// through [`api::HostApi`], which Kernel implements directly.
 pub struct Kernel {
     pub arbiter: Arbiter,
     pub bus: Bus,
     pub journal: Journal,
+    /// Declared surfaces, in declaration order (adapters enumerate these).
+    pub(crate) infos: Vec<SurfaceInfo>,
+    /// Next SourceId to issue; 0 is reserved for journal::CONFIG_SOURCE.
+    pub(crate) next_source: u64,
 }
 
 impl Kernel {
     pub fn new() -> Self {
-        Kernel { arbiter: Arbiter::new(), bus: Bus::new(), journal: Journal::new() }
+        Kernel {
+            arbiter: Arbiter::new(),
+            bus: Bus::new(),
+            journal: Journal::new(),
+            infos: Vec::new(),
+            next_source: 1,
+        }
     }
 
     /// Rebirth: fold the journal's declarations into a fresh arbiter. The
@@ -55,7 +71,7 @@ impl Kernel {
     /// log — proven by `journal::tests::replay_reproduces_state`.
     pub fn from_journal(journal: Journal) -> Self {
         let arbiter = journal.replay();
-        Kernel { arbiter, bus: Bus::new(), journal }
+        Kernel { arbiter, bus: Bus::new(), journal, infos: Vec::new(), next_source: 1 }
     }
 }
 
