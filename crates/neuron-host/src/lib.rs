@@ -33,6 +33,7 @@ pub mod arbiter;
 pub mod bus;
 pub mod governor;
 pub mod journal;
+pub mod net;
 pub mod shell;
 pub mod writer;
 

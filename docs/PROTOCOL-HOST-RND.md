@@ -561,6 +561,20 @@ macro engine are just two of its subscribers.
 ---
 
 ## 8. Working notes / housekeeping
+
+### 8.1 Progress ledger
+- **DONE (this branch):** kernel (arbiter/bus/journal/governor, 26 tests) →
+  `api.rs` HostApi seam (Kernel sync + HostHandle channel impls) → `shell.rs`
+  actor w/ rebirth-from-seed + governor pacing + observable sweep →
+  `writer.rs` single-writer w/ dedup + deadline pacing + MockSink →
+  `adapters/openrgb.rs` full server codec (v0..v5, byte-verified) →
+  `net.rs` TCP pump (loopback-only, disconnect releases footprint,
+  bind-failure = single-instance signal) → capstone tests: in-process full
+  path AND real-TCP-socket round trip. 47 tests green.
+- **IN FLIGHT:** Chroma REST adapter (delegated build against §4.2/§11 spec).
+- **NEXT:** Chroma HTTP pump (54235) → journal disk format → neuron-core
+  bridge (registry→SurfaceInfo, real HID FrameSink behind the one writer) →
+  OpenRGB client mode → authed control plane.
 - Worktree `../neuron-rnd` on `rnd/protocol-host`. Master is source-of-truth; an
   agent is finishing WIP there. First commit here = snapshot of that WIP so we
   build against current reality; expect to rebase/merge when it lands on master.
