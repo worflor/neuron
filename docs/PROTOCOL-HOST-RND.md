@@ -571,10 +571,20 @@ macro engine are just two of its subscribers.
   `net.rs` TCP pump (loopback-only, disconnect releases footprint,
   bind-failure = single-instance signal) → capstone tests: in-process full
   path AND real-TCP-socket round trip. 47 tests green.
-- **IN FLIGHT:** Chroma REST adapter (delegated build against §4.2/§11 spec).
-- **NEXT:** Chroma HTTP pump (54235) → journal disk format → neuron-core
-  bridge (registry→SurfaceInfo, real HID FrameSink behind the one writer) →
-  OpenRGB client mode → authed control plane.
+- **DONE:** `adapters/chroma.rs` — Chroma REST server state machine (the
+  delegated agent died mid-flight without writing; built directly instead):
+  sessions with kernel-issued owners, 15s-TTL layers refreshed by effect
+  writes + heartbeats, BGR/COLORREF decode, grid mapping w/ honest crop,
+  CHROMA_NONE / STATIC / CUSTOM / CUSTOM_KEY / CUSTOM2, firmware effect
+  names refused not faked, missing device kinds answered NOT_FOUND, 30s
+  bookkeeping prune. Exact session-URI base + init/heartbeat reply field
+  set marked UNVERIFIED vs live RzSDKServer (safe: we mint what we parse;
+  reply with a superset) — capture/replay against a real Chroma game will
+  true them up. 59 tests green total.
+- **NEXT:** Chroma HTTP pump (54235, hand-rolled minimal HTTP/1.1) →
+  neuron-core bridge (registry→SurfaceInfo, real HID FrameSink behind the
+  one writer) → journal disk format (when it has its consumer) → OpenRGB
+  client mode → authed control plane.
 - Worktree `../neuron-rnd` on `rnd/protocol-host`. Master is source-of-truth; an
   agent is finishing WIP there. First commit here = snapshot of that WIP so we
   build against current reality; expect to rebase/merge when it lands on master.
