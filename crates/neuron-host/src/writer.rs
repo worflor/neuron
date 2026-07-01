@@ -30,7 +30,22 @@ use crate::arbiter::Rgb;
 /// open-inside-the-thread pattern.
 pub trait FrameSink {
     fn write(&mut self, frame: &[Option<Rgb>]);
+
+    /// Drop any device-state cache: the next `write` must repaint EVERYTHING.
+    /// Called periodically by the writer because fire-and-forget HID writes
+    /// can be silently dropped by the device — dedup then believes a row is
+    /// current while the silicon disagrees, and on static content the torn
+    /// frame would stick forever (observed live on the legacy BlackWidow:
+    /// half red, half stale). Default no-op for stateless sinks.
+    fn refresh(&mut self) {}
 }
+
+/// Forced-refresh cadence in writer ticks: dedup is an OPTIMIZATION, not a
+/// truth source, so every N ticks the writer resends the full frame even if
+/// nothing changed — the self-healing repaint that un-tears a board which
+/// silently dropped writes. At the legacy 6fps that's ~10s to heal, at
+/// matrix 30fps ~2s; cheap either way (a handful of feature reports).
+pub const REFRESH_TICKS: u64 = 64;
 
 /// The dedup core — pure, so it's testable without threads or clocks.
 pub struct WriterCore {
@@ -50,6 +65,11 @@ impl WriterCore {
         }
         self.last = Some(frame.to_vec());
         true
+    }
+
+    /// Forget the cache: the next offer is guaranteed to report "changed".
+    pub fn reset(&mut self) {
+        self.last = None;
     }
 }
 
@@ -86,7 +106,15 @@ impl Writer {
                 let mut core = WriterCore::new();
                 let mut next = Instant::now();
                 let mut faults: u64 = 0;
+                let mut ticks: u64 = 0;
                 while !stop_flag.load(Ordering::Relaxed) {
+                    ticks += 1;
+                    // Periodic forced repaint: drop both dedup caches so this
+                    // tick resends everything (see FrameSink::refresh).
+                    if ticks % REFRESH_TICKS == 0 {
+                        core.reset();
+                        sink.refresh();
+                    }
                     // The writer must be un-killable by its collaborators: a
                     // panicking sink (device driver edge case) or handle can
                     // cost at most THIS frame — the loop, and the device's

@@ -198,6 +198,13 @@ impl FrameSink for HidSink {
             if let Some(rep) = self.light.row_report(&px, row) {
                 dev.send_lighting_fast(&rep);
                 sent = true;
+                // Legacy boards have slow HID: a tight burst of row writes can
+                // overrun them and rows get silently DROPPED (observed live:
+                // a half-red half-stale torn frame). Breathe between rows;
+                // matrix boards keep the full-rate path.
+                if matches!(self.light.protocol, Protocol::Legacy) {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
             }
         }
         if sent {
@@ -206,6 +213,13 @@ impl FrameSink for HidSink {
         let buf = self.last.get_or_insert_with(Vec::new);
         buf.clear();
         buf.extend_from_slice(&px);
+    }
+
+    /// Writer-driven periodic repaint (see [`FrameSink::refresh`]): forget
+    /// what we believe is on the board so the next write resends every row —
+    /// the self-healing pass that un-tears a board that dropped writes.
+    fn refresh(&mut self) {
+        self.last = None;
     }
 }
 

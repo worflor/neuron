@@ -300,6 +300,10 @@ fn run_worker(weak: slint::Weak<AppWindow>, stop: Arc<AtomicBool>, live_rx: Rece
     // its output key while the control is held (so a macro key / remapped button acts like the real
     // key — hold = hold, the OS auto-repeats), which the stateless tap-only action can't express.
     let held_keys: KeyHoldMap = RefCell::new(std::collections::HashMap::new());
+    // SNIPER held state: trigger -> the DPI to RESTORE on release (snapshotted at press, so it
+    // respects whatever stage the mouse was on). A held device write the stateless dispatch can't
+    // express — the edge loop owns the drop on DOWN and the restore on UP, like the momentary mic.
+    let sniper: SniperMap = RefCell::new(std::collections::HashMap::new());
     let turbos = RefCell::new(TurboRuntime::new());
 
     // ── THE IMMORTAL LISTENER ── this worker is the organ that fires every cast and remap; if it
@@ -345,12 +349,15 @@ fn run_worker(weak: slint::Weak<AppWindow>, stop: Arc<AtomicBool>, live_rx: Rece
                                 }
                                 // momentary mic: capture the rest state + flip while held.
                                 momentary_press(&rt, &momentary, &trigger);
+                                // sniper: snapshot the live DPI + drop to precision while held.
+                                sniper_press(&devices, &rt, &sniper, &trigger);
                             }
                             InputEdge::Up(trigger) => {
                                 rt.borrow_mut().release_for_input(&trigger);
                                 turbos.borrow_mut().release(&trigger);
                                 key_remap_release(&held_keys, &trigger); // release the held output key
                                 momentary_release(&momentary, &trigger); // restore the mic on release
+                                sniper_release(&devices, &sniper, &trigger); // restore the DPI on release
                             }
                         }
                     }
@@ -399,6 +406,7 @@ fn run_worker(weak: slint::Weak<AppWindow>, stop: Arc<AtomicBool>, live_rx: Rece
                         reload_pending = false;
                         momentary_release_all(&momentary); // a held mic can't survive a config swap
                         key_remap_release_all(&held_keys); // nor a held remapped key
+                        sniper_release_all(&devices, &sniper); // nor a held sniper (restore the DPI)
                         *rt.borrow_mut() = controls::build_runtime();
                         exec.borrow_mut().clear();
                         devices.borrow_mut().clear();
@@ -531,13 +539,16 @@ fn run_worker(weak: slint::Weak<AppWindow>, stop: Arc<AtomicBool>, live_rx: Rece
         );
         momentary_release_all(&momentary); // never strand a held mic across a respawn
         key_remap_release_all(&held_keys); // nor a held remapped key
+        sniper_release_all(&devices, &sniper); // nor a held sniper (restore the DPI)
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
 
     // teardown: restore any mic a momentary action was holding (the loop ended mid-hold) + release
-    // any remapped key still held, the hook drops here (uninstalls), input disarms in LiveRuntime::stop.
+    // any remapped key still held + restore any sniper DPI still dropped, the hook drops here
+    // (uninstalls), input disarms in LiveRuntime::stop.
     momentary_release_all(&momentary);
     key_remap_release_all(&held_keys);
+    sniper_release_all(&devices, &sniper);
     drop(hook);
 }
 
@@ -591,6 +602,65 @@ fn momentary_release_all(held: &MomentaryMap) {
         if let Some(ctl) = open_mic(&device) {
             ctl.set_mute(restore);
         }
+    }
+}
+
+// ── SNIPER: the held hold-to-precision-DPI edge handling (mirrors the momentary mic) ───────────
+type SniperMap = std::cell::RefCell<std::collections::HashMap<Trigger, u16>>;
+
+/// A trigger's DOWN edge: if it binds a [`neuron::action::Action::Sniper`], snapshot the LIVE DPI,
+/// drop to the precision DPI (VOLATILE — never flashed onboard, so it reverts on its own), and
+/// remember the base to restore. Idempotent (a repeat down without an up is ignored). The snapshot +
+/// drop are ONE `with_writable` op so a stale handle recovers once. No device / unsupported → a
+/// silent no-op (the mouse is untouched, and nothing is recorded so the up edge is a no-op too).
+fn sniper_press(
+    devices: &std::cell::RefCell<neuron::device::DeviceSession<'_>>,
+    rt: &std::cell::RefCell<neuron::controls::Runtime>,
+    held: &SniperMap,
+    trigger: &Trigger,
+) {
+    if held.borrow().contains_key(trigger) {
+        return;
+    }
+    let Some(dpi) = rt.borrow().sniper_dpi_for(trigger) else {
+        return;
+    };
+    let base = devices.borrow_mut().with_writable("set_dpi", |d| {
+        let (base_x, _) = neuron::capability::dpi(d)?;
+        neuron::capability::set_dpi(d, dpi, dpi, neuron::capability::Store::Volatile)?;
+        Ok(base_x)
+    });
+    if let Ok(base_x) = base {
+        held.borrow_mut().insert(trigger.clone(), base_x);
+    }
+}
+
+/// A trigger's UP edge: restore the snapshotted base DPI (volatile) and forget the hold, so a
+/// re-press re-snapshots. A no-op if this trigger wasn't holding a sniper.
+fn sniper_release(
+    devices: &std::cell::RefCell<neuron::device::DeviceSession<'_>>,
+    held: &SniperMap,
+    trigger: &Trigger,
+) {
+    if let Some(base) = held.borrow_mut().remove(trigger) {
+        let _ = devices.borrow_mut().with_writable("set_dpi", |d| {
+            neuron::capability::set_dpi(d, base, base, neuron::capability::Store::Volatile)
+        });
+    }
+}
+
+/// Restore EVERY held sniper and clear the map — the safety net for a config swap / daemon stop, so
+/// a held sniper can never STRAND the mouse at the precision DPI. Drains first (releasing the map
+/// borrow) so each device write can re-borrow the session.
+fn sniper_release_all(
+    devices: &std::cell::RefCell<neuron::device::DeviceSession<'_>>,
+    held: &SniperMap,
+) {
+    let bases: Vec<u16> = held.borrow_mut().drain().map(|(_, base)| base).collect();
+    for base in bases {
+        let _ = devices.borrow_mut().with_writable("set_dpi", |d| {
+            neuron::capability::set_dpi(d, base, base, neuron::capability::Store::Volatile)
+        });
     }
 }
 
