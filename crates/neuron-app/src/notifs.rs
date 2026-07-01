@@ -664,9 +664,25 @@ const ASK_Q_H: f32 = 18.0; // 16px question row
 const GAP_Q_GRAMMAR: f32 = 3.0;
 const ASK_GRAMMAR_H: f32 = 15.0; // 13px grammar row
 
+// ── the ICON CHIP — the square badge in the left column. Its geometry lives HERE, with the row spec,
+// so the box is SIZED to fit it and the chip is POSITIONED relative to the headline — never a fixed
+// badge dropped into a box that knows nothing about it (the old bug: a 38px chip in a 42px box → 2px
+// of clearance). Because these feed the SAME layout pass as the text rows, changing a font size or
+// adding a row makes the chip's clearance and alignment follow automatically; there is no second,
+// hand-tuned copy of these numbers to drift out of sync. ──
+pub const CHIP_HALF: f32 = 19.0; // chip half-size → a 38px rounded-square badge
+pub const CHIP_GLYPH_R: f32 = 13.0; // the glyph's scale inside the chip
+const CHIP_MARGIN: f32 = 9.0; // the MINIMUM clearance kept between the chip and the card's top/bottom
+const CONTENT_INSET: f32 = 11.0; // left inset to the icon column (clears the accent tab + a breath)
+const ICON_TEXT_GAP: f32 = 17.0; // gap from the chip's right edge to the text column
+/// The chip CENTRE's x, as an offset from the card's left inner edge (constant — same for every card).
+pub const CHIP_DX: f32 = CONTENT_INSET + CHIP_HALF;
+/// The text column's LEFT x, as an offset from the card's left inner edge.
+pub const TEXT_DX: f32 = CONTENT_INSET + 2.0 * CHIP_HALF + ICON_TEXT_GAP;
+
 /// What a card contains — drives the layout. `lines` = body rows (confirmation: wrapped value;
 /// ask: grammar rows).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct CardShape {
     pub is_ask: bool,
     pub lines: usize,
@@ -674,12 +690,15 @@ pub struct CardShape {
     pub has_prev: bool,
 }
 
-/// The resolved geometry — the box `height` plus each row's y-centre measured DOWN FROM THE CARD'S
-/// TOP INNER EDGE (`cy - height/2`). The renderer draws title at `top + title_cy`, etc. Unused rows
-/// for a given shape are left at 0 (their `has_*`/`lines` gate the draw).
+/// The resolved geometry — the box `height`, the icon chip's centre, and each row's y-centre, all
+/// measured DOWN FROM THE CARD'S TOP INNER EDGE (`cy - height/2`). The renderer draws the chip at
+/// `top + chip_cy` and title at `top + title_cy`, etc. — it owns NO geometry of its own, so it can
+/// never disagree with the box this sizes. Unused rows for a shape are harmless (their `has_*`/`lines`
+/// gate the draw).
 #[derive(Clone, Copy, Default)]
 pub struct CardLayout {
     pub height: f32,
+    pub chip_cy: f32, // the icon chip's CENTRE y — anchored to the headline cluster, box-fitted
     pub title_cy: f32,
     pub body0_cy: f32, // first body line (confirmation) OR the question (ask)
     pub body_step: f32,
@@ -696,10 +715,18 @@ pub fn card_layout(shape: CardShape) -> CardLayout {
         body_step: if shape.is_ask { ASK_GRAMMAR_H } else { BODY_H },
         ..Default::default()
     };
+    // ── 1. lay the TEXT column out from a provisional top (PAD_TOP below y=0), and remember the
+    // HEADLINE CLUSTER extent — the title+value (confirmation) or the question (ask). The chip anchors
+    // to THAT cluster, so whatever secondary rows (track / prev / grammar) hang below never drag the
+    // icon off the headline it belongs to. ──
     let mut y = PAD_TOP;
+    let cluster_top = y;
+    let cluster_bot;
     if shape.is_ask {
-        l.body0_cy = y + ASK_Q_H / 2.0; // the question
-        y += ASK_Q_H + GAP_Q_GRAMMAR;
+        l.body0_cy = y + ASK_Q_H / 2.0; // the question — the cluster
+        y += ASK_Q_H;
+        cluster_bot = y;
+        y += GAP_Q_GRAMMAR;
         l.grammar0_cy = y + ASK_GRAMMAR_H / 2.0;
         y += ASK_GRAMMAR_H * shape.lines.max(1) as f32;
     } else {
@@ -707,6 +734,7 @@ pub fn card_layout(shape: CardShape) -> CardLayout {
         y += TITLE_H + GAP_TITLE_BODY;
         l.body0_cy = y + BODY_H / 2.0;
         y += BODY_H * shape.lines.max(1) as f32;
+        cluster_bot = y; // title + value lines = the cluster
         if shape.has_track {
             y += GAP_BODY_TRACK;
             l.track_cy = y + TRACK_H / 2.0;
@@ -718,7 +746,25 @@ pub fn card_layout(shape: CardShape) -> CardLayout {
             y += PREV_H;
         }
     }
-    l.height = y + PAD_BOT;
+    let text_bot = y + PAD_BOT; // the text column's full extent (its top is 0)
+
+    // ── 2. anchor the chip to the cluster's centre, then size the box as the UNION of the text column
+    // and the chip+margin. Whichever is taller sets each edge: a SHORT card can never squish the chip
+    // (the chip floor wins → a guaranteed CHIP_MARGIN of air); a TALL card keeps that same margin (the
+    // text wins, the chip rides the headline). This single rule replaces every per-variant tuning. ──
+    let chip_cy = (cluster_top + cluster_bot) / 2.0;
+    let top = 0.0_f32.min(chip_cy - CHIP_HALF - CHIP_MARGIN);
+    let bot = text_bot.max(chip_cy + CHIP_HALF + CHIP_MARGIN);
+
+    // ── 3. normalise so the box's top inner edge is 0 — shift every row + the chip down by -top. ──
+    let shift = -top;
+    l.height = bot - top;
+    l.chip_cy = chip_cy + shift;
+    l.title_cy += shift;
+    l.body0_cy += shift;
+    l.track_cy += shift;
+    l.prev_cy += shift;
+    l.grammar0_cy += shift;
     l
 }
 
@@ -1118,9 +1164,13 @@ pub fn fire_test() -> String {
 /// Emit a representative confirmation for `kind` via the real typed constructors.
 fn emit_sample(kind: Kind) {
     use neuron::confirm;
+    // A reserved pseudo-pid for the self-test, chosen OUTSIDE both the real-Razer-PID space (all low —
+    // e.g. 0x0226) AND the audio-endpoint fallback pid 0 (glue's `…unwrap_or(0)`), so its per-device
+    // de-dup baseline collides with nothing and a test fire can never suppress a genuine settings card.
+    const TEST_PID: u16 = 0xFFFF;
     match kind {
-        Kind::Dpi => confirm::dpi(1600, Some(800)),
-        Kind::Scroll => confirm::scroll(3, 5, Some(2)),
+        Kind::Dpi => confirm::dpi(TEST_PID, 1600, Some(800)),
+        Kind::Scroll => confirm::scroll(TEST_PID, 3, 5, Some(2)),
         Kind::Polling => confirm::polling(1000, Some(500)),
         Kind::Brightness => confirm::brightness(70, Some(40)),
         Kind::Profile => confirm::profile("gaming", Some("chill")),
@@ -1158,6 +1208,85 @@ mod tests {
             title: title.into(),
             ident: "battery".into(),
             prev: Some("80".into()),
+        }
+    }
+
+    /// Every card shape the engine can render — confirmations (±track, ±prev, 1..=3 value lines) and
+    /// asks (1..=3 grammar rows). The layout's whole promise is that it stays consistent across ALL of
+    /// these with no per-variant tuning, so the audit drives the audit: assert the invariants on every
+    /// one. (Heights aside, this is the contract that kept the chip from ever squishing again.)
+    fn all_shapes() -> Vec<CardShape> {
+        let mut v = Vec::new();
+        for lines in 1..=3usize {
+            for has_track in [false, true] {
+                for has_prev in [false, true] {
+                    v.push(CardShape { is_ask: false, lines, has_track, has_prev });
+                }
+            }
+            v.push(CardShape { is_ask: true, lines, has_track: false, has_prev: false });
+        }
+        v
+    }
+
+    #[test]
+    fn card_layout_never_squishes_the_chip() {
+        // the squish bug was a fixed 38px chip in a box sized from text alone (down to 42px → 2px of
+        // clearance). The self-sizing box must now keep AT LEAST the design margin on BOTH edges of the
+        // chip, for every shape — that's the floor that can never be crossed again.
+        let eps = 0.01_f32;
+        for s in all_shapes() {
+            let l = card_layout(s);
+            let top_clear = l.chip_cy - CHIP_HALF;
+            let bot_clear = l.height - (l.chip_cy + CHIP_HALF);
+            assert!(top_clear >= CHIP_MARGIN - eps, "{s:?}: chip top clearance {top_clear:.1} < {CHIP_MARGIN}");
+            assert!(bot_clear >= CHIP_MARGIN - eps, "{s:?}: chip bottom clearance {bot_clear:.1} < {CHIP_MARGIN}");
+        }
+    }
+
+    #[test]
+    fn chip_stays_anchored_to_the_headline() {
+        // the icon must badge the HEADLINE (title+value, or the question) the SAME way on every shape,
+        // so a track bar or a second grammar row can never drag it off — the drift the audit found.
+        let eps = 0.01_f32;
+        for s in all_shapes() {
+            let l = card_layout(s);
+            let headline_cy = if s.is_ask {
+                l.body0_cy // the question
+            } else {
+                let title_top = l.title_cy - TITLE_H / 2.0;
+                let value_bot = l.body0_cy - BODY_H / 2.0 + BODY_H * s.lines.max(1) as f32;
+                (title_top + value_bot) / 2.0
+            };
+            assert!(
+                (l.chip_cy - headline_cy).abs() < eps,
+                "{s:?}: chip at {:.1} drifted off headline centre {:.1}",
+                l.chip_cy,
+                headline_cy
+            );
+        }
+    }
+
+    #[test]
+    fn box_contains_every_row_with_its_bottom_pad() {
+        // the banner's promise: the box is the SUM of its content, so the last row never spills the
+        // border. Assert at least PAD_BOT below the lowest drawn row, for every shape.
+        let eps = 0.01_f32;
+        for s in all_shapes() {
+            let l = card_layout(s);
+            let last_bot = if s.is_ask {
+                l.grammar0_cy - ASK_GRAMMAR_H / 2.0 + ASK_GRAMMAR_H * s.lines.max(1) as f32
+            } else if s.has_prev {
+                l.prev_cy + PREV_H / 2.0
+            } else if s.has_track {
+                l.track_cy + TRACK_H / 2.0
+            } else {
+                l.body0_cy - BODY_H / 2.0 + BODY_H * s.lines.max(1) as f32
+            };
+            assert!(
+                l.height - last_bot >= PAD_BOT - eps,
+                "{s:?}: only {:.1}px below the last row (< PAD_BOT {PAD_BOT})",
+                l.height - last_bot
+            );
         }
     }
 

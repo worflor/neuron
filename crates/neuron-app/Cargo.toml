@@ -1,11 +1,12 @@
-# neuron-app — the resident GUI + tray app (Slint, software renderer, near-zero idle, event
-# loop alive with no window shown). The ONE long-lived process: tray icon, global hotkey loops,
+# neuron-app — the resident GUI + tray app (Slint, GPU/femtovg renderer — draws ONLY while the window
+# is shown; tray-hidden = no compute, just a held GL context; event loop alive with no window shown). The ONE long-lived process: tray icon, global hotkey loops,
 # device-runtime daemon, lazily-created Slint window. Depends on neuron-core for all logic
 # (in-process, no IPC).
 #
 # Dependency set (added by the GUI agent, coordinated with Integration):
-#   slint + slint-build  — declarative UI; software renderer; winit-backed event loop that
-#                           stays alive with no window shown (tray-resident).
+#   slint + slint-build  — declarative UI; GPU (femtovg) renderer — only draws while the window is
+#                           shown (tray-hidden = no per-frame compute, just a held GL context);
+#                           winit-backed event loop stays alive with no window shown (tray-resident).
 #   tray-icon            — the 90%-surface system-tray menu.
 #   global-hotkey        — OS-wide hotkeys (profile quick-switch, HyperShift toggle).
 #   image                — decode the embedded tray icon PNG at startup.
@@ -22,10 +23,19 @@ path = "src/main.rs"
 
 [dependencies]
 neuron = { path = "../neuron-core" }
+# strokelab (dev stroke dump) serializes the full eigenmotion bundle as JSON and runs the raw stroke
+# through the engram trajectory codec for the macro+micro oscillator decomposition.
+engram = { path = "../engram" }
 serde.workspace = true
+serde_json = "1"
 toml.workspace = true
 anyhow.workspace = true
-slint = { version = "1.16", default-features = false, features = ["compat-1-2", "std", "backend-winit", "renderer-software"] }
+# BOTH renderers compiled: femtovg (GPU) is preferred for the instant-feeling UI on a real GPU, but
+# renderer-software is the fallback so a VM / RDP / headless / bad-driver host (no usable GL context)
+# can still open the window. main.rs selects femtovg-first with a software fallback before the first
+# AppWindow::new(); the winit backend ALSO auto-falls-back to software at window creation if GL init
+# fails — but it can only do that if the software renderer is compiled in, hence this feature.
+slint = { version = "1.16", default-features = false, features = ["compat-1-2", "std", "backend-winit", "renderer-femtovg", "renderer-software"] }
 tray-icon = "0.24"
 global-hotkey = "0.8"
 image = { version = "0.25", default-features = false, features = ["png", "gif"] }

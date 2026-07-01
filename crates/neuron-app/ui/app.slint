@@ -438,7 +438,7 @@ export component AppWindow inherits Window {
             // `max(margin, …)` keeps lo ≤ hi on a window too small for the card.
             x: clamp(State.guide-x, Theme.pad-page / 2, max(Theme.pad-page / 2, parent.width - self.width - Theme.pad-page / 2));
             y: clamp(State.guide-y, Theme.pad-page / 2, max(Theme.pad-page / 2, parent.height - self.height - Theme.pad-page / 2));
-            width: 360px;
+            width: 384px;   // wide enough that a ~44-char mono code line fits the cell without wrapping
             // a comfortable readable height, capped to 70% of the glass. NOT derived from the inner
             // content's preferred-height: that lives inside the Flickable, whose geometry doesn't
             // propagate out to this ancestor binding (it reads ~0 and collapses the card). The body
@@ -578,9 +578,9 @@ export component AppWindow inherits Window {
                         // the section block's REAL height, so the popup scrolls when the guide is long.
                         for g in GuideContent.guides : VerticalLayout {
                             if g.id == State.guide-active-id : VerticalLayout {
-                                spacing: 16px;
+                                spacing: 18px;
                                 for s in g.sections : VerticalLayout {
-                                    spacing: 5px;
+                                    spacing: 8px;
                                     Text {
                                         text: s.head;
                                         color: Theme.accent;
@@ -590,12 +590,35 @@ export component AppWindow inherits Window {
                                         letter-spacing: Theme.track-1;
                                         wrap: word-wrap;
                                     }
-                                    Text {
-                                        text: s.body;
-                                        color: Theme.text-mid;
-                                        font-family: Theme.sans;
-                                        font-size: Theme.fs-body;
-                                        wrap: word-wrap;
+                                    // each block is PROSE (quiet sans, the exception in a mono UI) or a
+                                    // CODE CELL (mono on a well, hairline-framed — the same surface as the
+                                    // macro editor, so a snippet here looks like where it'll be pasted).
+                                    for b in s.blocks : VerticalLayout {
+                                        if !b.code : Text {
+                                            text: b.text;
+                                            color: Theme.text-mid;
+                                            font-family: Theme.sans;
+                                            font-size: Theme.fs-body;
+                                            wrap: word-wrap;
+                                        }
+                                        if b.code : Rectangle {
+                                            background: Theme.well;
+                                            border-radius: Theme.radius-sm;
+                                            border-width: Theme.hair;
+                                            border-color: Theme.line;
+                                            clip: true;
+                                            HorizontalLayout {
+                                                padding: 10px;
+                                                Text {
+                                                    text: b.text;
+                                                    color: Theme.text;
+                                                    font-family: Theme.mono;
+                                                    font-size: Theme.fs-data;
+                                                    wrap: no-wrap;   // preserve indentation + comment alignment
+                                                }
+                                                Rectangle {}   // soak leftover width so the cell spans the card
+                                            }
+                                        }
                                     }
                                 }
                             }

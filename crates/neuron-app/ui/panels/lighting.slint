@@ -90,36 +90,55 @@ component EffectTileCard inherits Rectangle {
     }
 }
 
+// One labelled compact slider row — the weave-knobs row shape (label · track · readout). THE single
+// slider instrument the editor uses everywhere: the SPECTRUM editor's continuous knobs (motion
+// speed/depth/chaos, frame hold/fade) AND the auto-rendered TUNE param ranges (via ParamControl). One
+// shape, not two that rhyme. `unit` is appended to the readout (""/"s"); `label-w` sizes the label cell
+// (wider for the longer TUNE param names); the change is live.
+component SpecSlider inherits HorizontalLayout {
+    in property <string> label;
+    in property <length> label-w: 66px;
+    in property <float> minimum;
+    in property <float> maximum;
+    in property <float> step: 0.02;
+    in property <float> value;
+    in property <string> unit: "";
+    callback changed(float);
+    spacing: 9px;
+    VerticalLayout { alignment: center; width: root.label-w; Mono { text: root.label; color: Theme.text-dim; overflow: elide; } }
+    VerticalLayout {
+        alignment: center; horizontal-stretch: 1;
+        Slider {
+            compact: true; wheel: false;
+            minimum: root.minimum; maximum: root.maximum; step: root.step; value: root.value;
+            changed(v) => { root.changed(v); }
+        }
+    }
+    VerticalLayout {
+        alignment: center; width: 42px;
+        Mono {
+            text: round(root.value * 100) / 100 + root.unit;
+            color: Theme.text-mid; horizontal-alignment: right;
+        }
+    }
+}
+
 // One auto-rendered PARAM control. The effect's schema declares the row's `kind`; this renders the
 // matching control (range→slider, enum→segment, color→swatch+field, toggle→switch). Adding a knob to
 // an effect is DATA in effects::schema — never new UI here.
 component ParamControl inherits VerticalLayout {
     in property <EffectParam> p;
     spacing: 6px;
-    // RANGE → a labelled inline slider (label · track · readout), the weave-knobs row shape
-    if root.p.kind == "range" : HorizontalLayout {
-        spacing: 9px;
-        VerticalLayout {
-            alignment: center; width: 78px;
-            Text { text: root.p.label; color: Theme.text-dim; font-family: Theme.mono; font-size: Theme.fs-small; overflow: elide; }
-        }
-        VerticalLayout {
-            alignment: center; horizontal-stretch: 1;
-            Slider {
-                compact: true; wheel: false;
-                minimum: root.p.fmin; maximum: root.p.fmax; value: root.p.fval;
-                step: (root.p.fmax - root.p.fmin) / 100;
-                changed(v) => { State.set-param-range(root.p.key, v); }
-            }
-        }
-        VerticalLayout {
-            alignment: center; width: 40px;
-            Text {
-                text: round(root.p.fval * 100) / 100;
-                color: Theme.text-mid; font-family: Theme.mono; font-size: Theme.fs-small;
-                horizontal-alignment: right;
-            }
-        }
+    // RANGE → the shared SpecSlider row (label · track · readout) — the same instrument the SPECTRUM
+    // editor uses, with a wider label cell for the longer param names.
+    if root.p.kind == "range" : SpecSlider {
+        label: root.p.label;
+        label-w: 78px;
+        minimum: root.p.fmin;
+        maximum: root.p.fmax;
+        step: (root.p.fmax - root.p.fmin) / 100;
+        value: root.p.fval;
+        changed(v) => { State.set-param-range(root.p.key, v); }
     }
     // ENUM → a pick-one segment (direction, breath flavour)
     if root.p.kind == "enum" : VerticalLayout {
@@ -141,6 +160,329 @@ component ParamControl inherits VerticalLayout {
     // COLOR is rendered by the page (it owns the swatch palette) — handled inline there, not here.
 }
 
+// THE SPECTRUM EDITOR — the active layer's COLOUR PROGRAM (a layer = PATTERN × SPECTRUM; the pattern's
+// knobs auto-render in TUNE, this block owns the colour). Three stacked instruments over the phase-3
+// State spectrum surface: the GRADIENT STRIP (the active palette's stops), the MOTION row (the palette's
+// intra-frame animation), and the collapsible TIMELINE (the keyframe sequence). Every control writes
+// straight through a State.* callback — the glue applies it to the layer, and the live preview + the
+// per-device persistence follow. No colour is hardcoded: stops carry their own hex/col, the picker is
+// the shared prism, and the strip's gradient fill is a Rust-rendered swatch (the active frame's image).
+component SpectrumEditor inherits VerticalLayout {
+    spacing: 12px;
+    // which stop the picker edits — the AUTHORITATIVE cursor lives in State (`light-sel-stop`) so the
+    // glue can select a stop after an insert: click/drag in the strip write it; `add-stop`'s glue points
+    // it at the just-inserted stop. Clamped to the live count here so a delete never strands the picker.
+    property <int> stop-idx: min(max(0, State.light-sel-stop), max(0, State.light-stops.length - 1));
+    // the active frame (the scrubber position) the strip + motion + per-frame controls all edit. INVARIANT:
+    // `frame-idx` is a valid index ONLY when the sequence has a frame — an empty seq yields 0, and EVERY
+    // reader/writer that indexes `light-seq[frame-idx]` (the strip Image, `ease-idx`, and the per-frame
+    // hold / crossfade / ease controls) is gated on the SAME condition — `State.light-seq.length > 0`, the
+    // real model length and the single source of truth — so the index is never dereferenced when empty and
+    // no phantom-frame write is possible. `tl-open` is the timeline's open/collapsed disclosure ONLY; it
+    // never guards indexing.
+    property <int> frame-idx: State.light-seq.length > 0
+        ? min(max(0, State.light-active-frame), State.light-seq.length - 1)
+        : 0;
+    // the surface speaks strings (motion / loop / ease); the Segments speak indices — map both ways.
+    property <int> motion-idx:
+        State.light-motion == "drift" ? 1 :
+        State.light-motion == "cycle" ? 2 :
+        State.light-motion == "breathe" ? 3 :
+        State.light-motion == "flow" ? 4 : 0;
+    property <int> loop-idx:
+        State.light-loop == "once" ? 0 :
+        State.light-loop == "pingpong" ? 2 : 1;
+    property <int> interp-idx: State.light-interp == "hsv" ? 1 : 0;
+    // gated on a non-empty sequence so the index is never dereferenced on an empty model (stated
+    // invariant, not Slint's silent default-struct fallback). Empty → linear (0), the harmless default.
+    property <int> ease-idx: State.light-seq.length > 0
+        ? (State.light-seq[root.frame-idx].ease == "smooth" ? 1
+            : State.light-seq[root.frame-idx].ease == "snap" ? 2 : 0)
+        : 0;
+    // the timeline is collapsed for a single palette; it expands on demand or when a sequence exists.
+    property <bool> tl-open: false;
+
+    // ── GRADIENT STRIP — the active palette's stops ──────────────────────
+    VerticalLayout {
+        spacing: 9px;
+        HorizontalLayout {
+            SectionTitle { text: "SPECTRUM"; }
+            Rectangle {}
+            Mono {
+                text: State.light-stops.length + (State.light-stops.length == 1 ? " stop" : " stops");
+                color: Theme.text-faint;
+            }
+        }
+        // the strip: the Rust-rendered gradient of the ACTIVE frame's palette, with draggable stop
+        // handles overlaid. Click empty track → add a stop there; click a handle → select it; drag →
+        // reposition. The image is the live fill; the handles are the live model — they update together.
+        strip := Rectangle {
+            height: 34px;
+            border-radius: Theme.radius-sm;
+            border-width: Theme.hair;
+            border-color: Theme.line;
+            background: Theme.well;
+            clip: true;
+            // the live gradient fill — the ACTIVE frame's palette swatch. Gated on a non-empty sequence
+            // so the index is never dereferenced when the model is empty (stated invariant, not fallback).
+            if State.light-seq.length > 0 : Image {
+                source: State.light-seq[root.frame-idx].swatch;
+                width: 100%; height: 100%;
+                image-fit: fill;
+            }
+            // an empty-track click inserts a stop at that fraction (the glue samples the colour there).
+            // Declared BEFORE the handles so the handles (later siblings) win the hit-test on themselves.
+            add-ta := TouchArea {
+                mouse-cursor: MouseCursor.crosshair;
+                clicked => { State.add-stop(clamp(self.mouse-x / strip.width, 0.0, 1.0)); }
+            }
+            for s[i] in State.light-stops : handle := Rectangle {
+                property <bool> on: i == root.stop-idx;
+                width: 16px;
+                height: parent.height;
+                x: clamp(s.at * strip.width - self.width / 2, 0px, strip.width - self.width);
+                background: handle.on ? Theme.accent-glow : transparent;
+                border-width: handle.on ? Theme.hair : 0px;
+                border-color: Theme.accent-line;
+                border-radius: 2px;
+                // the colour chip — a grounded, ringed marker (bigger than the old 9px speck) so it reads
+                // as a handle you grab, not a dot floating on the gradient. The selected one is larger with
+                // a crisp white ring; the rest carry a subtle ring that keeps them legible on any colour.
+                Rectangle {
+                    width: handle.on ? 14px : 11px; height: self.width; border-radius: self.width / 2;
+                    y: 4px; x: (parent.width - self.width) / 2;
+                    background: s.col;
+                    border-width: handle.on ? 1.5px : 1px;
+                    border-color: handle.on ? Theme.text : Theme.text-faint;
+                }
+                // the stem — ONLY the SELECTED stop drops a cursor line down the strip, marking the column
+                // it controls. Unselected stops are just their chip, so the gradient stays clean instead of
+                // a forest of thin tendrils (the part that read as "spooky").
+                if handle.on : Rectangle {
+                    width: 2px;
+                    height: parent.height - 19px;
+                    y: 19px; x: (parent.width - self.width) / 2;
+                    background: Theme.accent;
+                }
+                hta := TouchArea {
+                    mouse-cursor: MouseCursor.ew-resize;
+                    clicked => { State.light-sel-stop = i; }
+                    // strip-space pointer = the handle's own x + the pointer's x within the handle; the
+                    // grab holds past the 13px once pressed, so a full-width drag tracks the cursor.
+                    moved => {
+                        if (self.pressed) {
+                            State.light-sel-stop = i;
+                            State.move-stop(i, clamp((handle.x + self.mouse-x) / strip.width, 0.0, 1.0));
+                        }
+                    }
+                }
+            }
+        }
+        // +/- stops + the active-stop readout
+        HorizontalLayout {
+            spacing: 7px;
+            Button { text: "+ stop"; clicked => { State.add-stop(0.5); } }
+            Button {
+                text: "- stop"; danger: true;
+                enabled: State.light-stops.length > 1;
+                clicked => { State.remove-stop(root.stop-idx); }
+            }
+            Rectangle {}
+            Mono { text: "stop " + (root.stop-idx + 1); color: Theme.text-faint; }
+        }
+        // the selected stop's colour — the SHARED prism picker (the SAME component the SYSTEM accents
+        // use). `pick` commits the hex; `preview` recolours the stop live so the strip + the board
+        // update in real time as the prism is dragged. Both route through set-stop-color(idx, hex).
+        if State.light-stops.length > 0 : ColorPicker {
+            current: State.light-stops[root.stop-idx].col;
+            value: State.light-stops[root.stop-idx].hex;
+            swatches: Palette.accent;
+            pick(h) => { State.set-stop-color(root.stop-idx, h); }
+            preview(h) => { State.set-stop-color(root.stop-idx, h); }
+        }
+        // BLEND — how colour interpolates between stops. Only meaningful with 2+ stops (a gradient to
+        // blend): RGB is predictable, HSV takes the shortest hue path so the blend stays vivid (no muddy
+        // midpoint). Defaults to RGB, so no existing preset's look changes unless the user opts in.
+        if State.light-stops.length > 1 : VerticalLayout {
+            spacing: 6px;
+            Mono { text: "blend"; color: Theme.text-dim; }
+            Segment {
+                options: ["RGB", "HSV"];
+                index: root.interp-idx;
+                min-seg: 52px;
+                picked(i) => { State.set-interp(i == 1 ? "hsv" : "rgb"); }
+            }
+        }
+    }
+
+    Divider {}
+
+    // ── MOTION ROW — the palette's intra-frame animation ─────────────────
+    VerticalLayout {
+        spacing: 9px;
+        SectionTitle { text: "MOTION"; }
+        Segment {
+            options: ["HOLD", "DRIFT", "CYCLE", "BREATHE", "FLOW"];
+            index: root.motion-idx;
+            min-seg: 52px;
+            picked(i) => {
+                State.set-motion(i == 1 ? "drift" : i == 2 ? "cycle" : i == 3 ? "breathe" : i == 4 ? "flow" : "hold");
+            }
+        }
+        // speed paces every motion but Hold (which has nothing to move) — hidden honestly for Hold.
+        if State.light-motion != "hold" : SpecSlider {
+            label: "speed"; minimum: 0; maximum: 3; step: 0.02;
+            value: State.light-motion-speed;
+            changed(v) => { State.set-motion-speed(v); }
+        }
+        // depth only shapes the breathe dip
+        if State.light-motion == "breathe" : SpecSlider {
+            label: "depth"; minimum: 0; maximum: 1; step: 0.02;
+            value: State.light-motion-depth;
+            changed(v) => { State.set-motion-depth(v); }
+        }
+        // chaos only shapes the flow octaves
+        if State.light-motion == "flow" : SpecSlider {
+            label: "chaos"; minimum: 0; maximum: 1; step: 0.02;
+            value: State.light-motion-chaos;
+            changed(v) => { State.set-motion-chaos(v); }
+        }
+    }
+
+    Divider {}
+
+    // ── TIMELINE / SEQUENCER — the keyframe track (collapsed at seq-len 1) ─
+    VerticalLayout {
+        spacing: 9px;
+        HorizontalLayout {
+            SectionTitle { text: "TIMELINE"; }
+            Rectangle {}
+            Mono {
+                text: State.light-seq.length <= 1 ? "single frame" : State.light-seq.length + " frames";
+                color: Theme.text-faint;
+            }
+        }
+        // collapsed (a single palette): the one affordance that turns it into a sequence.
+        if State.light-seq.length <= 1 && !root.tl-open : HorizontalLayout {
+            Button { text: "+ sequence this palette"; clicked => { State.add-frame(); root.tl-open = true; } }
+            Rectangle {}
+        }
+        // DISCLOSURE only — `tl-open` (manual open) or an existing sequence (auto-open) decides whether the
+        // expanded track shows. It does NOT guard indexing: every `light-seq[frame-idx]` reader inside is
+        // separately gated on `light-seq.length > 0` (the per-frame timing block below), so opening the
+        // timeline on a momentarily-empty model can never dereference a phantom frame.
+        if root.tl-open || State.light-seq.length > 1 : VerticalLayout {
+            spacing: 9px;
+            // the keyframe track — palette swatches laid out arithmetically inside a clipped band (NO
+            // nested Flickable: two Flickables break the inner's hit-testing — app.slint's lesson). The
+            // band auto-scrolls to keep the active frame centred; clicking a chip scrubs/selects it, and
+            // the board render above is its live preview.
+            track := Rectangle {
+                height: 50px;
+                clip: true;
+                background: Theme.bg;
+                border-radius: Theme.radius-sm;
+                border-width: Theme.hair;
+                border-color: Theme.line;
+                // total content width (chip 57 + gap 7 = 64 each, no trailing gap) and the scroll that
+                // brings the active chip into view, clamped so it never overscrolls past either end.
+                property <length> total: max(0px, State.light-seq.length * 64px - 7px);
+                property <length> scroll:
+                    clamp((self.width - 57px) / 2 - root.frame-idx * 64px,
+                          min(0px, self.width - self.total), 0px);
+                for f[i] in State.light-seq : chip := Rectangle {
+                    property <bool> on: i == root.frame-idx;
+                    x: 5px + i * 64px + track.scroll;
+                    y: 4px;
+                    width: 57px;
+                    height: parent.height - 8px;
+                    border-radius: Theme.radius-sm;
+                    border-width: Theme.hair;
+                    border-color: chip.on ? Theme.accent-line : (cta.has-hover ? Theme.text-faint : Theme.line);
+                    background: chip.on ? Theme.accent-glow : Theme.bg-2;
+                    animate border-color, background { duration: Theme.quick; }
+                    clip: true;
+                    VerticalLayout {
+                        padding: 4px; spacing: 3px;
+                        Rectangle {
+                            height: 20px; border-radius: 2px; clip: true;
+                            Image { source: f.swatch; width: 100%; height: 100%; image-fit: fill; }
+                        }
+                        Mono {
+                            text: "F" + (i + 1);
+                            color: chip.on ? Theme.accent : Theme.text-dim;
+                            horizontal-alignment: center; font-size: Theme.fs-small;
+                        }
+                    }
+                    cta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { State.select-frame(i); } }
+                }
+            }
+            // add a keyframe (a clone of the active) / delete the active one
+            HorizontalLayout {
+                spacing: 7px;
+                Button { text: "+ keyframe"; clicked => { State.add-frame(); } }
+                Rectangle {}
+                Button {
+                    text: "delete frame"; danger: true;
+                    enabled: State.light-seq.length > 1;
+                    clicked => { State.remove-frame(root.frame-idx); }
+                }
+            }
+            // the active frame's timing — dwell (hold) → crossfade-in (fade) → the fade ease — with the
+            // reorder arrows on its header so a frame moves earlier/later in the sequence. INDEX GUARD:
+            // gated on `light-seq.length > 0` (the SAME guard the strip Image + ease-idx use) — these
+            // controls READ + WRITE `light-seq[frame-idx]`, so they render only when the frame exists.
+            // `frame-idx` is clamped into 0..length-1 whenever the sequence is non-empty (see above).
+            if State.light-seq.length > 0 : VerticalLayout {
+                spacing: 9px;
+                HorizontalLayout {
+                    Mono { text: "frame " + (root.frame-idx + 1); color: Theme.text-dim; }
+                    Rectangle {}
+                    Button {
+                        text: "◂"; enabled: State.light-seq.length > 1 && root.frame-idx > 0;
+                        clicked => { State.move-frame(root.frame-idx, -1); }
+                    }
+                    Button {
+                        text: "▸"; enabled: State.light-seq.length > 1 && root.frame-idx < State.light-seq.length - 1;
+                        clicked => { State.move-frame(root.frame-idx, 1); }
+                    }
+                }
+                SpecSlider {
+                    label: "hold"; minimum: 0; maximum: 10; step: 0.1; unit: "s";
+                    value: State.light-seq[root.frame-idx].hold;
+                    changed(v) => { State.set-frame-hold(root.frame-idx, v); }
+                }
+                SpecSlider {
+                    label: "crossfade"; minimum: 0; maximum: 5; step: 0.1; unit: "s";
+                    value: State.light-seq[root.frame-idx].fade;
+                    changed(v) => { State.set-frame-fade(root.frame-idx, v); }
+                }
+                VerticalLayout {
+                    spacing: 6px;
+                    Mono { text: "fade ease"; color: Theme.text-dim; }
+                    Segment {
+                        options: ["LINEAR", "SMOOTH", "SNAP"];
+                        index: root.ease-idx;
+                        min-seg: 52px;
+                        picked(i) => { State.set-frame-ease(root.frame-idx, i == 1 ? "smooth" : i == 2 ? "snap" : "linear"); }
+                    }
+                }
+            }
+            // playback mode — how the scrubber runs the sequence at render time.
+            VerticalLayout {
+                spacing: 6px;
+                Mono { text: "playback"; color: Theme.text-dim; }
+                Segment {
+                    options: ["ONCE", "LOOP", "PINGPONG"];
+                    index: root.loop-idx;
+                    min-seg: 52px;
+                    picked(i) => { State.set-loop(i == 0 ? "once" : i == 2 ? "pingpong" : "loop"); }
+                }
+            }
+        }
+    }
+}
+
 export component LightingPanel inherits VerticalLayout {
     spacing: 0;
 
@@ -151,14 +493,21 @@ export component LightingPanel inherits VerticalLayout {
     // onto the device render at the DEVICE's rate (the same math + time base the device runs) so the
     // preview steps in the same discrete frames the keyboard does. Honest "~ live"/"preview" badge.
     Timer {
-        interval: max(33ms, 1000ms / max(1.0, State.light-fps));
-        running: !State.light-brush-on && State.sel-can-light && State.grid-rows > 0 && State.light-effect != "";
+        // a PREVIEW only needs to read as live — cap it at 20fps (a 50ms floor) instead of chasing the
+        // device's 30. The device STREAM keeps its own rate; this Timer is just the on-screen mirror.
+        interval: max(50ms, 1000ms / max(1.0, State.light-fps));
+        // GATE on the lighting page being VISIBLE — PanelSlot keeps every page instantiated (just faded),
+        // so without `window-shown && page == 1` this hero render ran every frame even while you were on
+        // another tab or the window was hidden in the tray. Render nothing you can't see.
+        running: State.window-shown && State.page == 1
+            && !State.light-brush-on && State.sel-can-light && State.grid-rows > 0 && State.light-effect != "";
         triggered => { State.preview-tick(); }
     }
-    // animate the GRID swatches a touch slower (each tile is a Rust-side render — cheap but not free).
+    // the GRID swatches animate a touch slower still (each tile is a Rust-side render — cheap but not
+    // free), and ONLY while the lighting page is actually on screen (same gate as the hero).
     Timer {
-        interval: 90ms;
-        running: State.sel-can-light && State.grid-rows > 0;
+        interval: 120ms;
+        running: State.window-shown && State.page == 1 && State.sel-can-light && State.grid-rows > 0;
         triggered => { State.tile-preview-tick(); }
     }
 
@@ -183,7 +532,7 @@ export component LightingPanel inherits VerticalLayout {
             }
             Mono {
                 text: State.selected-device-name == "—" ? "pick a Razer device on DEVICE"
-                    : "no addressable RGB on this channel — pick a keyboard or mouse on DEVICE";
+                    : "no addressable RGB on this channel · pick a keyboard or mouse on DEVICE";
                 color: Theme.text-faint; horizontal-alignment: center; wrap: word-wrap;
             }
         }
@@ -309,22 +658,11 @@ export component LightingPanel inherits VerticalLayout {
                     }
                 }
 
-                // COLOUR — only when the active effect declares a colour knob (default = weave accent).
-                // The SHARED prism-based ColorPicker (same component the SYSTEM page uses for its accents):
-                // a swatch / hex Enter COMMITS via set-param-color, and dragging the PRISM (or typing)
-                // fires `preview` — also set-param-color — so the running effect RECOLOURS live as you
-                // drag, the render updating in real time before you ever release.
-                if State.light-uses-color : VerticalLayout {
-                    spacing: 9px;
-                    SectionTitle { text: "COLOUR"; }
-                    ColorPicker {
-                        current: State.light-color-col;
-                        value: State.light-color-hex;
-                        swatches: Palette.accent;
-                        pick(h) => { State.set-param-color(h); }
-                        preview(h) => { State.set-param-color(h); }   // live recolour while dragging the prism
-                    }
-                }
+                // SPECTRUM — the active layer's full colour program (gradient stops + motion + a
+                // collapsible keyframe timeline). Shown only when the layer carries an editable 1-D
+                // spectrum: hidden for the Screen pattern (Ambient is full-colour, the spectrum is
+                // bypassed) and for a DATA readout. Every control binds to the State spectrum surface.
+                if State.light-has-spectrum : SpectrumEditor {}
 
                 // TUNE — the rest of the schema's knobs, auto-rendered (range/enum/toggle). A data tile
                 // (mouse battery) declares none, so this whole block simply doesn't appear — honest.
@@ -336,9 +674,10 @@ export component LightingPanel inherits VerticalLayout {
                         if cp.kind != "color" : ParamControl { p: cp; }
                     }
                 }
-                // a data tile is honest about being a readout, not a tunable light show
-                if State.light-params.length == 0 && !State.light-uses-color : Mono {
-                    text: "a live DATA surface — it paints your device's vitals, no knobs.";
+                // a data tile is honest about being a readout, not a tunable light show (a layer that
+                // carries a spectrum is never this — it shows the SPECTRUM editor above)
+                if State.light-params.length == 0 && !State.light-has-spectrum : Mono {
+                    text: "a live DATA surface that paints your device's vitals, no knobs.";
                     color: Theme.text-faint; wrap: word-wrap;
                 }
 
@@ -367,25 +706,35 @@ export component LightingPanel inherits VerticalLayout {
                             border-width: Theme.hair;
                             border-color: cell.on ? Theme.accent-line : (sta.has-hover ? Theme.text-faint : Theme.line);
                             animate background, border-color { duration: Theme.quick; }
+                            // SELECT covers the whole cell but is declared FIRST so it sits BENEATH the ✕'s
+                            // own touch (the last sibling) — a cell-wide TouchArea declared LAST was on top
+                            // and swallowed every click, so the ✕ could never fire (the "can't remove" bug).
+                            sta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { State.select-stack(li); } }
                             HorizontalLayout {
-                                padding-left: 9px; padding-right: 7px; spacing: 5px;
+                                padding-left: 9px; padding-right: 5px; spacing: 5px;
                                 VerticalLayout {
                                     alignment: center; horizontal-stretch: 1;
                                     Mono { text: "L" + (li + 1); color: cell.on ? Theme.accent : Theme.text-mid; }
                                 }
-                                VerticalLayout {
-                                    alignment: center;
+                                // drop this layer — a real, always-visible button (was a near-invisible faint
+                                // glyph) with a comfortable hit target, red on hover. Declared LAST so its
+                                // touch wins the corner over the cell-wide select beneath.
+                                Rectangle {
+                                    width: 22px;
+                                    background: xta.has-hover ? Theme.danger : transparent;
+                                    border-radius: 3px;
+                                    animate background { duration: Theme.quick; }
                                     Text {
-                                        text: "✕";
-                                        color: xta.has-hover ? Theme.danger : Theme.text-faint;
-                                        font-family: Theme.mono; font-size: Theme.fs-small;
-                                        vertical-alignment: center;
+                                        // U+00D7 (×) — the dingbat U+2715 (✕) isn't in the mono font.
+                                        text: "\u{00d7}";
+                                        color: xta.has-hover ? Theme.text : (cell.on ? Theme.accent : Theme.text-dim);
+                                        font-family: Theme.mono; font-size: Theme.fs-data;
+                                        horizontal-alignment: center; vertical-alignment: center;
                                         animate color { duration: Theme.quick; }
-                                        xta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { State.remove-stack(li); } }
                                     }
+                                    xta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { State.remove-stack(li); } }
                                 }
                             }
-                            sta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { State.select-stack(li); } }
                         }
                     }
                     Button {

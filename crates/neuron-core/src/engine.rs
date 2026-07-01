@@ -59,10 +59,19 @@ impl Trigger {
     /// A short human description (for `show`, logs, and the GUI rule list).
     pub fn describe(&self) -> String {
         match self {
-            Trigger::Input { page, usage, pid } => match pid {
-                Some(p) => format!("input 0x{page:02X}/0x{usage:02X} @pid {p:04x}"),
-                None => format!("input 0x{page:02X}/0x{usage:02X}"),
-            },
+            Trigger::Input { page, usage, pid } => {
+                // a friendly, layout-independent control name ("F13", "Button 4", "Left Ctrl") instead
+                // of raw hex — the ONE place a HID control becomes rule-list text.
+                let name = crate::controls::control_label(*page, *usage);
+                // Macro keys are device-any logical controls riding a synthetic edge-bucket pid; the
+                // name already says which key, so the pid is noise — never tack it on for them.
+                match pid {
+                    Some(p) if *page != crate::controls::RAZER_MACRO_PAGE => {
+                        format!("{name} @pid {p:04x}")
+                    }
+                    _ => name,
+                }
+            }
             Trigger::Hotkey { vk, mods } => format!("hotkey vk=0x{vk:02X} mods=0b{mods:04b}"),
             Trigger::Gesture { name } => format!("gesture '{name}'"),
             Trigger::RadialSector { menu, sector } => format!("radial '{menu}' sector {sector}"),

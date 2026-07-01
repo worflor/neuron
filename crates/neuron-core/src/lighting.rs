@@ -119,8 +119,25 @@ impl<'de> serde::Deserialize<'de> for Rgb {
     }
 }
 
-/// The superset of named effects across both eras. A device runs an effect natively if its
-/// registry `effects` map names it; otherwise Neuron emulates it via streamed frames.
+// ── TWO COEXISTING LIGHTING MODELS (by design, NOT leftover dead code) ─────────────────────
+//
+// Neuron drives lighting through two DISTINCT, intentionally-separate models — keep both:
+//
+//   (b) the FIRMWARE EFFECT model — this `Effect` enum + `native_effect_report` + `set_effect`.
+//       A NAMED effect (off/static/breathing/…) set by its real effect-id byte and run ON-DEVICE by
+//       the firmware (survives Synapse removal; persists onboard on matrix devices). Where a board
+//       lacks an effect natively, `render_frame` host-EMULATES that SAME named effect as one computed
+//       frame. It's a one-shot "set this effect" — used by the CLI `effect` cmd + runtime `apply_effect`.
+//
+//   (a) the PATTERN × SPECTRUM model — `Compositor::render` (in `pattern.rs`), STREAMED here by
+//       `Lights::animate`. A live stack of programmable Pattern × Spectrum layers composited to custom
+//       frames at the device's true rate — the GUI lighting studio + the CLI `animate` cmd drive this.
+//
+// (b) is a hardware capability addressed over the protocol; (a) is host-rendered. Different things for
+// different jobs, so they COEXIST — neither supersedes the other, and neither is the other's leftover.
+
+/// The superset of named effects across both eras (model (b) above). A device runs an effect natively
+/// if its registry `effects` map names it; otherwise Neuron emulates it via a computed frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Effect {
     Off,
@@ -198,7 +215,11 @@ pub struct LightingDef {
     /// effect name -> firmware effect-id byte (the device's NATIVE effect set).
     #[serde(default)]
     pub effects: BTreeMap<String, u8>,
-    /// effect-id that displays a written custom frame (CUSTOMFRAME, 0x05 per OpenRazer).
+    /// Effect-id that DISPLAYS a written custom frame. PER-ERA (this is the easy one to get wrong):
+    /// OpenRazer's *standard* matrix (legacy keyboards) uses 0x05 (CUSTOMFRAME) — the default — but the
+    /// *extended* matrix (newer mice, class 0x0F) uses **0x08**, and on those devices 0x05 often means a
+    /// real native effect (REACTIVE on the Naga), so leaving the default there sets reactive every frame
+    /// and the stream flickers. Extended-matrix devices MUST set `custom_id = 0x08` in their TOML.
     #[serde(default = "default_custom_id")]
     pub custom_id: u8,
     /// command to set a whole-device effect.
@@ -625,6 +646,23 @@ pub fn razer_key_cell(name: &str) -> Option<(u8, u8)> {
     })
 }
 
+/// The Razer macro-key NAMES, indexed by held-state bit / report order: `MACRO_KEY_NAMES[i]` is the name
+/// for the i-th macro key, resolved to a cell through the existing [`razer_key_cell`] ("M1"=(1,0) …
+/// "M6"=(0,0)). The board's Driver-Mode `0x04` report numbers them sequentially (see [`macro_code_index`]).
+/// A name with no cell on a given board simply lights nothing (graceful), so this stays forward-safe if a
+/// board reports more or fewer macro keys.
+pub const MACRO_KEY_NAMES: [&str; 6] = ["M1", "M2", "M3", "M4", "M5", "M6"];
+
+/// The held-state index (0-based) for a Razer Driver-Mode macro report CODE: `0x20`→0 (M1), `0x21`→1
+/// (M2) … `0x25`→5 (M6). Any other code — including FN (`0x01`) and released (`0x00`) — returns `None`.
+/// The sequential `0x20..=0x25` numbering is the Razer PROTOCOL convention (matches OpenRazer's
+/// `razer_raw_event`), not a per-board fact. Pairs with [`MACRO_KEY_NAMES`] to map a held code to its cell.
+pub fn macro_code_index(code: u8) -> Option<usize> {
+    // `then` (lazy) not `then_some` (eager): `code - 0x20` underflows u8 for codes below 0x20
+    // (e.g. released 0x00, FN 0x01) and would panic in debug if evaluated unconditionally.
+    (0x20..=0x25).contains(&code).then(|| (code - 0x20) as usize)
+}
+
 /// The full key map walked in reading order (row 0 → row 5, left → right), one CANONICAL name per
 /// physical key (no aliases). This is the order `neuron lighting keytest` lights the board in, and the
 /// list the duplicate-cell test iterates. Every name here resolves through [`razer_key_cell`].
@@ -1037,15 +1075,14 @@ impl<'a> Lights<'a> {
         Ok(())
     }
 
-    /// Stream any frame generator smoothly (fire-and-forget writes, consistent timing). The
-    /// generator decides the visuals; the backend handles control, translation, and streaming.
-    /// `fps` is a CLOSURE read once PER FRAME (not a fixed value) so a running stream can be
-    /// re-paced live — the GUI's fps control writes a shared atomic this closure reads. `secs`
-    /// bounds the run by wall clock; `stop()` aborts early. This is the open-effects engine live.
+    /// Stream a [`Compositor`](crate::pattern::Compositor) smoothly (fire-and-forget writes, consistent
+    /// timing). The compositor (a stack of Pattern × Spectrum layers) decides the visuals; the backend
+    /// handles control, translation, and streaming. `fps` is a CLOSURE read once PER FRAME (not a fixed
+    /// value) so a running stream can be re-paced live — the GUI's fps control writes a shared atomic
+    /// this closure reads. `secs` bounds the run by wall clock; `stop()` aborts early.
     pub fn animate(
         &self,
-        generator: &mut dyn crate::effects::FrameGen,
-        color: Option<Rgb>,
+        comp: &mut crate::pattern::Compositor,
         fps: impl Fn() -> u32,
         secs: u64,
         mut stop: impl FnMut() -> bool,
@@ -1053,7 +1090,6 @@ impl<'a> Lights<'a> {
         use std::time::{Duration, Instant};
         self.ensure_control()?;
         let display = self.def.custom_display_report();
-        let base = color.unwrap_or(Rgb::new(0, 255, 0));
         let cols = self.def.cols as usize;
         // TUNABLE rate: `fps()` is read EVERY frame (not captured once) so the user can re-pace a
         // RUNNING stream without restarting it. It's clamped only to a sane absolute range — the
@@ -1072,7 +1108,7 @@ impl<'a> Lights<'a> {
         // the moving rows. `last_frame = None` until the first paint (and on any fps change, which
         // re-quantizes the phase) forces a FULL resend so the board is never left partially stale.
         // Both work buffers (`changed`, the cache) are reused across ticks — the only per-frame
-        // Vec<Rgb> we can't avoid is the generator's own `frame()` output (the trait owns it).
+        // Vec<Rgb> we can't avoid is the Compositor's `render()` output (it owns the composited frame).
         let mut last_frame: Option<Vec<Rgb>> = None;
         let mut changed: Vec<usize> = Vec::new();
         let mut last_fps: u32 = 0; // fps is clamped to 1..=60, so 0 forces a full first paint.
@@ -1086,7 +1122,7 @@ impl<'a> Lights<'a> {
             // smooth at 30). Wall-clock (not frame_index/fps) keeps the phase CONTINUOUS when fps is
             // re-tuned mid-stream — frame_index/fps would jump the moment the divisor changed.
             let elapsed = (run_start.elapsed().as_secs_f32() * fps as f32).floor() / fps as f32;
-            let frame = generator.frame(self.def.rows, self.def.cols, elapsed, base);
+            let frame = comp.render(self.def.rows, self.def.cols, elapsed);
 
             // Which rows differ from what's already on the board? A live fps change re-quantizes the
             // phase, so drop the cache (prev = None) → resend everything that tick.

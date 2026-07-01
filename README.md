@@ -103,23 +103,25 @@ razer's lighting hardware speaks two dialects, and neuron confirmed both live: t
 - **per-key custom frames** painted at the device's *true* LED count, one report per matrix row, never downsampled. you can paint directly on the device in the GUI.
 - **an open effects engine** that computes frames host-side for anything the firmware lacks.
 
-that last one is the fun part. an effect is a `FrameGen` — a trait with exactly one method:
+that last one is the fun part, and it just got rebuilt from the ground up. a custom effect is two halves that compose — a **pattern** and a **spectrum**:
 
 ```rust
-fn frame(&mut self, rows: u8, cols: u8, t: f32, base: Rgb) -> Vec<Rgb>;
+trait Pattern { fn field(&mut self, rows: u8, cols: u8, t: f32) -> Field; }
 ```
 
-it gets the matrix size, a time, and a base colour, and returns one frame. "add an effect" means writing a struct that implements that and adding one arm to the registry. the built-ins:
+the **pattern** is the shape and motion — a heat sim, a scroll, a keypress ripple, an aurora flow field — and for each cell it emits just a position and a brightness (or, for the screen ambilight, colour directly). the **spectrum** is the colour, and it's no longer a single value you set: it's a whole *program* — a gradient of N stops, with its own motion, played across a keyframe timeline. the pattern says *where* light lands and how bright; the spectrum says *what colour* at that spot and time; compose them (`cell = spectrum.at(t, u) × intensity`) and one small set of shapes × colour-programs explodes into every look — a fire pattern wearing an ocean spectrum, a wave that cycles, an aurora over a sunset.
 
-| effect | what it does |
+"add a pattern" is one registry entry + the impl — the factory, the tuning knobs, and the tile all derive from that single entry, and a half-registration won't even compile. "add a look" is pure *data*: a preset is just a pattern plus a spectrum, no code at all. and the spectrum scales with how far you reach — one stop is a solid colour, two is a gradient, add motion (drift / cycle / breathe / flow) and it animates, add keyframes and it sequences over time — serialising down to the tightest shape that still describes it (a bare hex for a solid, an array for a gradient, a table only when you ask for more). the built-in presets:
+
+| preset | pattern × spectrum |
 |---|---|
-| `fire` | a real upward heat sim — seeded hot at the base, diffused and cooled per tick, run through a black→red→orange→white ramp |
-| `starlight` | random stars twinkling in and fading out |
-| `matrix` | digital rain — a white-hot head and a fading tail per column |
-| `colourwheel` | a hue wheel rotating across the board |
-| `reactive` | lights the key you pressed (it hashes each press to a stable cell, since the device exposes no key→LED map) |
-| `audio` | drives the board off your output *or your mic's* live peak |
-| `load` | live CPU and RAM painted across the keys |
+| `fire` | a real upward heat sim, run through a *recolourable* ember→white gradient — paint it blue and it's cold fire |
+| `typing heat` | every keypress deposits radial heat that cools the way heat actually does — radiatively, lingering — over an incandescent ramp |
+| `aurora` | a multi-octave flow field under an animated, settable aurora palette |
+| `wave` / `cycle` | a rolling, or board-wide, hue — a two-colour gradient or the full spectrum, your call |
+| `cascade` / `comet` | rain and shooting streaks with real head→tail gradients (type the key a comet's head sits on to *break* it) |
+| `starlight` / `reactive` / `ripple` | stars twinkling and fading, the key you pressed lighting up, rings spreading from each strike |
+| `audio meter` / `pulse` | your live output *or mic* peak, or live CPU and RAM, painted low→high |
 | `ambient` | the whole board as an ambilight, mirroring your screen |
 
 and since a frame is just data, it doesn't have to come from an effect at all. **`lighting mirror`** paints one device's live *state* onto another's LEDs! your mouse's battery gauge and active DPI-stage rendered across the keyboard's number row. synapse silos every device and openrazer has no cross-device layer :P

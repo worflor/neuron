@@ -1020,10 +1020,10 @@ export component SettingsPanel inherits VerticalLayout {
                         }
                         // the live posture — the four corners of the 2×2 spoken plainly, one line
                         Mono {
-                            text: !State.writes-paused && State.input-armed ? "› live — device + input both on"
-                                : !State.writes-paused && !State.input-armed ? "› tuning hardware — remaps & macros held"
-                                : State.writes-paused && State.input-armed ? "› remaps & macros live — hardware untouched"
-                                : "› observing — reads only, nothing fires";
+                            text: !State.writes-paused && State.input-armed ? "› live · device + input both on"
+                                : !State.writes-paused && !State.input-armed ? "› tuning hardware · remaps & macros held"
+                                : State.writes-paused && State.input-armed ? "› remaps & macros live · hardware untouched"
+                                : "› observing · reads only, nothing fires";
                             color: Theme.text-faint;
                             wrap: word-wrap;
                         }
@@ -1423,7 +1423,7 @@ export component SettingsPanel inherits VerticalLayout {
                                     Mono {
                                         text: State.notif-stack == "latest" ? "newest only"
                                             : State.notif-stack == "digest" ? "one summary when it's busy"
-                                            : "a tidy column — see each";
+                                            : "a tidy column · see each";
                                         color: Theme.text-mid;
                                     }
                                 }
@@ -1435,7 +1435,7 @@ export component SettingsPanel inherits VerticalLayout {
                                 VerticalLayout {
                                     horizontal-stretch: 1;
                                     spacing: 6px;
-                                    NotifTypeChip { label: "stack"; desc: "a column — see each"; on: State.notif-stack == "stack"; toggled => { State.set-notif-stack("stack"); } }
+                                    NotifTypeChip { label: "stack"; desc: "a column · see each"; on: State.notif-stack == "stack"; toggled => { State.set-notif-stack("stack"); } }
                                     NotifTypeChip { label: "latest"; desc: "newest only, one card"; on: State.notif-stack == "latest"; toggled => { State.set-notif-stack("latest"); } }
                                     NotifTypeChip { label: "digest"; desc: "one summary, counted"; on: State.notif-stack == "digest"; toggled => { State.set-notif-stack("digest"); } }
                                 }
@@ -1505,7 +1505,7 @@ export component SettingsPanel inherits VerticalLayout {
                     }
                     MechAdvantage {
                         name: "snap tap";
-                        tagline: "opposing inputs resolve to the last pressed — instant counter-strafe, no stall.";
+                        tagline: "opposing inputs resolve to the last pressed: instant counter-strafe, no stall.";
                         supported: State.snap-tap-supported;
                         revealed: State.snap-tap-revealed;
                         enabled: State.snap-tap-enabled;

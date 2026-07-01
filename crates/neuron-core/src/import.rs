@@ -16,14 +16,14 @@
 //! * `*.ChromaEffects` — one XML: `Mode` basic (named effect + palette) or advanced (per-cell /
 //!   per-layer). An advanced stack maps WHOLE onto Neuron's compositor — every animated layer
 //!   (fire/wave/spectrum/colorwheel/starlight, and the live `reactive`/`audiometer`) has a host
-//!   FrameGen — and a static layer survives losslessly as the per-LED paint frame.
+//!   Pattern × Spectrum — and a static layer survives losslessly as the per-LED paint frame.
 //!
 //! ## Normalization (drop the noise)
 //! Mappings: drop identity binds (a key that maps to its own default scancode = Synapse's default
 //! fill, not user intent) and the HyperShift identity fill; split base vs `IsHyperShift`; resolve
 //! DKM/HID/Mouse input -> a friendly [`crate::engine::Trigger`] + typed [`crate::action::Action`].
 //! Lighting: `basic` -> a named effect + colour on the [`Profile`]; `advanced` -> a Neuron
-//! compositor layer stack (one [`crate::effects::LayerDef`] per animated layer) plus, if present, a
+//! compositor layer stack (one [`crate::pattern::LayerDef`] per animated layer) plus, if present, a
 //! lossless static per-LED frame.
 //!
 //! Output: a normalized [`Imported`] bundle (a [`crate::profile::Profile`] + a `Vec<Rule>` of
@@ -114,10 +114,10 @@ pub struct Imported {
     /// Non-fatal notes (skipped layers, unrecognized GUIDs, fields Neuron can't yet store) for
     /// transparency in the import wizard.
     pub notes: Vec<String>,
-    /// An ADVANCED Chroma composite, mapped onto Neuron compositor layers (fire→fire,
-    /// colorwheel→spectrum, …). Animated Synapse stacks ARE the compositor — so they come across
-    /// as a live layer stack instead of being flattened/dropped. Empty for basic/static imports.
-    pub lighting_layers: Vec<crate::effects::LayerDef>,
+    /// An ADVANCED Chroma composite, mapped onto Neuron Pattern × Spectrum layers (fire→heat,
+    /// colorwheel→radial, …). Animated Synapse stacks ARE the compositor — so they come across as a
+    /// live layer stack instead of being flattened/dropped. Empty for basic/static imports.
+    pub lighting_layers: Vec<crate::pattern::LayerDef>,
 }
 
 impl Imported {
@@ -435,11 +435,11 @@ fn ingest_lighting(xml: &str, out: &mut Imported) {
     }
 
     // ADVANCED: a layered composite. Synapse advanced stacks ARE Neuron's compositor — so we map
-    // each EffectLayer onto a Neuron layer (fire→fire, colorwheel→colorwheel, wave→wave,
-    // breathing→breathing, and the live reactive→reactive / audiometer→audiometer), instead of
-    // dropping the lot. A STATIC layer is captured losslessly as the per-LED frame (the paint
-    // canvas). Only a name we genuinely don't generate is NOTED — never silently discarded.
-    let mut mapped: Vec<crate::effects::LayerDef> = Vec::new();
+    // each EffectLayer onto a Neuron Pattern × Spectrum layer (fire→heat, colorwheel→radial, wave→axis,
+    // breathing→uniform+breathe, and the live reactive→ignite / audiometer→meter), instead of dropping
+    // the lot. A STATIC layer is captured losslessly as the per-LED frame (the paint canvas). Only a
+    // name we genuinely don't generate is NOTED — never silently discarded.
+    let mut mapped: Vec<crate::pattern::LayerDef> = Vec::new();
     let mut unsupported: Vec<String> = Vec::new();
     let mut static_name: Option<String> = None;
     for block in split_blocks(xml, "EffectLayer") {
@@ -451,15 +451,20 @@ fn ingest_lighting(xml: &str, out: &mut Imported) {
             continue;
         }
         match map_synapse_effect(&eff) {
-            Some(gen) => {
-                let color = first_rzcolor(&block).unwrap_or(Rgb::new(0x4A, 0xF2, 0xB0));
-                mapped.push(crate::effects::LayerDef {
-                    effect: gen.to_string(),
-                    color,
-                    // SCREEN combines lit layers (so a stack reads as light, not the top one only)
-                    blend: crate::effects::Blend::Screen,
-                    ..Default::default()
-                });
+            Some(slug) => {
+                // build the preset's Pattern × Spectrum layer; a colour-driven effect (one carrying a
+                // single meaningful hue) is RE-TINTED to the imported RzColor so the user's hue survives —
+                // recolouring the stops, NOT replacing the spectrum, so an effect whose motion lives in its
+                // spectrum (breathing → Breathe) keeps animating instead of flattening to a static colour.
+                let mut layer = crate::pattern::preset_layer(slug).unwrap_or_default();
+                if synapse_effect_is_colored(&eff) {
+                    if let Some(c) = first_rzcolor(&block) {
+                        layer.spectrum = layer.spectrum.recolored(c);
+                    }
+                }
+                // SCREEN combines lit layers (so a stack reads as light, not the top one only)
+                layer.blend = crate::effects::Blend::Screen;
+                mapped.push(layer);
             }
             None => unsupported.push(eff),
         }
@@ -475,7 +480,7 @@ fn ingest_lighting(xml: &str, out: &mut Imported) {
     }
     if !unsupported.is_empty() {
         out.note(format!(
-            "{} layer(s) have no host generator yet [{}] — re-author them as a Neuron FrameGen",
+            "{} layer(s) have no host pattern yet [{}] — re-author them as a Neuron pattern",
             unsupported.len(),
             unsupported.join(", ")
         ));
@@ -505,14 +510,15 @@ fn ingest_lighting(xml: &str, out: &mut Imported) {
     }
 }
 
-/// Map a Synapse advanced-layer effect name to a Neuron FrameGen. Every animated Synapse layer now
-/// has a host generator — including the input/audio-driven ones (`reactive` polls the live keyboard,
-/// `audiometer` the live output peak) — so a full Synapse stack comes across whole, nothing dropped.
-/// `None` only for a name we genuinely don't generate yet.
+/// Map a Synapse advanced-layer effect name to a Neuron PRESET slug (a Pattern × Spectrum look — see
+/// [`crate::pattern::presets`]). Every animated Synapse layer now has a host pattern — including the
+/// input/audio-driven ones (`reactive`→ignite polls the live keyboard, `audiometer`→meter the live
+/// output peak) — so a full Synapse stack comes across whole, nothing dropped. `None` only for a name
+/// we genuinely don't generate yet.
 fn map_synapse_effect(name: &str) -> Option<&'static str> {
     match name.to_lowercase().as_str() {
         "breathing" => Some("breathing"),
-        "spectrum" | "spectrumcycling" => Some("spectrum"),
+        "spectrum" | "spectrumcycling" => Some("cycle"),
         "colorwheel" | "wheel" => Some("colorwheel"),
         "wave" => Some("wave"),
         "fire" => Some("fire"),
@@ -521,6 +527,16 @@ fn map_synapse_effect(name: &str) -> Option<&'static str> {
         "audiometer" | "audio" | "vu" => Some("audiometer"),
         _ => None,
     }
+}
+
+/// Whether a Synapse advanced-layer effect carries a meaningful SINGLE colour (so its imported RzColor
+/// should become the layer's solid spectrum). The rainbow/ramp effects (wave/colorwheel/cycle/fire) own
+/// their palette, so their imported colour is ignored.
+fn synapse_effect_is_colored(name: &str) -> bool {
+    matches!(
+        name.to_lowercase().as_str(),
+        "breathing" | "reactive" | "starlight" | "stars"
+    )
 }
 
 /// Extract a lossless per-LED colour frame from a static `advanced` [`EffectLayer`]. Finds the
@@ -1398,37 +1414,46 @@ mod tests {
         </EffectLayers></LightingEffects>"#;
         let mut out = Imported::default();
         ingest_lighting(xml, &mut out);
-        let effs: Vec<&str> = out
+        // each Synapse effect maps onto its preset's PATTERN: fire→heat, reactive→ignite,
+        // audiometer→meter, colorwheel→radial.
+        let pats: Vec<&str> = out
             .lighting_layers
             .iter()
-            .map(|l| l.effect.as_str())
+            .map(|l| l.pattern.as_str())
             .collect();
         assert_eq!(
-            effs,
-            vec!["fire", "reactive", "audiometer", "colorwheel"],
-            "all 4 animated layers mapped"
+            pats,
+            vec!["heat", "ignite", "meter", "radial"],
+            "all 4 animated layers mapped to their patterns"
+        );
+        // the colour-driven reactive layer took the imported green as a solid spectrum.
+        assert_eq!(
+            out.lighting_layers[1].spectrum,
+            crate::spectrum::Spectrum::solid(Rgb::new(0, 255, 0)),
+            "reactive recoloured to the imported RzColor"
         );
         assert_eq!(out.profile.lighting.as_deref(), Some("composite"));
-        // none are unsupported -> no "no host generator" note.
+        // none are unsupported -> no "no host pattern" note.
         assert!(
-            !out.notes.iter().any(|n| n.contains("no host generator")),
+            !out.notes.iter().any(|n| n.contains("no host pattern")),
             "nothing dropped; notes={:?}",
             out.notes
         );
-        // each generator name resolves to a real FrameGen.
-        for e in &effs {
+        // every mapped layer builds a real pattern.
+        for l in &out.lighting_layers {
             assert!(
-                crate::effects::make(e).is_some(),
-                "{e} resolves to a generator"
+                crate::pattern::make_pattern(&l.pattern).is_some(),
+                "{} resolves to a pattern",
+                l.pattern
             );
         }
     }
 
     /// `map_synapse_effect` resolves every Synapse advanced effect name (case-insensitive) to a
-    /// host generator — the guarantee behind "nothing dropped".
+    /// Neuron preset slug — the guarantee behind "nothing dropped".
     #[test]
     fn synapse_effect_names_all_resolve() {
-        for (synapse, neuron) in [
+        for (synapse, slug) in [
             ("Fire", "fire"),
             ("Reactive", "reactive"),
             ("Audiometer", "audiometer"),
@@ -1437,17 +1462,17 @@ mod tests {
             ("Starlight", "starlight"),
             ("Wave", "wave"),
             ("Breathing", "breathing"),
-            ("Spectrum", "spectrum"),
-            ("SpectrumCycling", "spectrum"),
+            ("Spectrum", "cycle"),
+            ("SpectrumCycling", "cycle"),
         ] {
             assert_eq!(
                 map_synapse_effect(synapse),
-                Some(neuron),
-                "{synapse} -> {neuron}"
+                Some(slug),
+                "{synapse} -> {slug}"
             );
             assert!(
-                crate::effects::make(neuron).is_some(),
-                "{neuron} is a real generator"
+                crate::pattern::preset_by_slug(slug).is_some(),
+                "{slug} is a real preset"
             );
         }
     }
@@ -1796,12 +1821,12 @@ mod tests {
             !out.lighting_layers.is_empty(),
             "advanced stack mapped to compositor layers"
         );
-        // every mapped layer resolves to a real generator (nothing left dangling).
+        // every mapped layer builds a real pattern (nothing left dangling).
         for l in &out.lighting_layers {
             assert!(
-                crate::effects::make(&l.effect).is_some(),
+                crate::pattern::make_pattern(&l.pattern).is_some(),
                 "layer {} resolves",
-                l.effect
+                l.pattern
             );
         }
         assert_eq!(

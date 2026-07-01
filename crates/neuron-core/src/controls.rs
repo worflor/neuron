@@ -28,6 +28,95 @@ impl ControlEvent {
 /// page so it can never collide with a real usage.
 pub const MIC_TAP: (u16, u16) = (0xF000, 0x01);
 
+/// Synthetic usage page for Razer macro keys (HID private-use range — can never collide with a real
+/// usage page). A Razer keyboard in Driver Mode pushes a vendor input report (id `0x04`) carrying the
+/// ARRAY of currently-held macro-key codes; each code becomes the *usage* on this page. So a board
+/// with N macro keys yields N bindable controls with NO per-device table — the count EMERGES from
+/// what the hardware reports. Decoded by the keyboard macro reader, labelled by [`control_label`].
+pub const RAZER_MACRO_PAGE: u16 = 0xFF1A;
+
+// ── injected HID input sources (broadcast) ──────────────────────────────────────────────────────
+// Raw Input only delivers the OS-cooked collections (keyboard/mouse/consumer). Vendor input that
+// rides a SEPARATE readable collection — Razer macro keys via the `0x04` report, and any future
+// descriptor-parsed controls — is read by dedicated threads and BROADCAST here. Every active
+// `listen_until` registers a sink and drains it into the SAME `on_event` path as Raw Input, so an
+// injected control is captured (press-to-bind) and dispatched identically to a native one. Broadcast
+// (not a single channel) because capture + live-dispatch run concurrent listens that must BOTH see it.
+static INJECT: std::sync::Mutex<Vec<(u64, std::sync::mpsc::Sender<ControlEvent>)>> =
+    std::sync::Mutex::new(Vec::new());
+static INJECT_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Events injected BEFORE any listen loop has registered its drain — buffered (not dropped) so the
+/// FIRST macro keypress after launch survives the startup race: the macro-key reader (`macrokeys`)
+/// can begin calling [`inject_event`] before the live-dispatch listener reaches [`inject_register`]
+/// (which it only calls once inside its Raw-Input loop). Without this, those early edges hit an empty
+/// sink list and vanished. Drained into the first sink that registers, so no edge is lost and none is
+/// delivered twice. Bounded — only the brief startup window (or a host that never opens a listener,
+/// e.g. non-Windows) ever leaves events here, and the oldest are dropped past the cap.
+static INJECT_PENDING: std::sync::Mutex<Vec<ControlEvent>> = std::sync::Mutex::new(Vec::new());
+/// How many pre-registration events to retain (oldest dropped past this). A handful of macro-key
+/// edges more than covers the sub-second gap before the listener arms.
+const INJECT_PENDING_MAX: usize = 64;
+
+/// Broadcast a control event from an injected HID source (e.g. the macro-key reader) to every active
+/// listen loop. Sinks whose loop has ended (the send fails) are pruned. Callable from any thread.
+///
+/// If NO listen loop has registered a drain yet, the event is BUFFERED into [`INJECT_PENDING`] rather
+/// than dropped, and the first sink to register replays it (see [`inject_register`]) — so the very
+/// first macro keypress after launch is never lost to the startup race.
+pub fn inject_event(ev: ControlEvent) {
+    let mut sinks = INJECT.lock().unwrap_or_else(|e| e.into_inner());
+    if sinks.is_empty() {
+        // No drain exists yet — hold the edge until one registers (INJECT lock still held, so a
+        // concurrent inject_register either sees this in PENDING or runs after we push a sink).
+        let mut pending = INJECT_PENDING.lock().unwrap_or_else(|e| e.into_inner());
+        pending.push(ev);
+        if pending.len() > INJECT_PENDING_MAX {
+            // Past the cap, drop the OLDEST — deliberately, not the newest: a listener that arms very
+            // late should replay RECENT edges, never a flood of stale ones from seconds ago. Overflow
+            // only happens when no listener ever arms (non-Windows, or no device connected), where the
+            // buffered events have no consumer anyway — so this is benign, but surface it under debug.
+            let overflow = pending.len() - INJECT_PENDING_MAX;
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "[controls] inject buffer at cap ({INJECT_PENDING_MAX}); dropped {overflow} stale pre-listener edge(s)"
+            );
+            pending.drain(..overflow);
+        }
+        return;
+    }
+    sinks.retain(|(_, tx)| tx.send(ev.clone()).is_ok());
+}
+
+/// Register a drain for one listen loop; the loop drains the receiver each tick into `on_event`,
+/// then [`inject_unregister`]s on exit. Returns the registration id + the receiver. Any events that
+/// arrived before ANY sink existed are seeded into this fresh receiver first (see [`INJECT_PENDING`]),
+/// so the first listener to arm picks up the startup-race edges before its first live tick.
+fn inject_register() -> (u64, std::sync::mpsc::Receiver<ControlEvent>) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let id = INJECT_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    // Hold the INJECT lock across the pending drain (same lock order as inject_event: INJECT then
+    // PENDING) so the handoff is atomic — an inject_event racing us either buffered into PENDING
+    // (we drain it here) or will broadcast to the sink we're about to push. Never lost, never doubled.
+    let mut sinks = INJECT.lock().unwrap_or_else(|e| e.into_inner());
+    for ev in INJECT_PENDING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .drain(..)
+    {
+        let _ = tx.send(ev);
+    }
+    sinks.push((id, tx));
+    (id, rx)
+}
+
+/// Drop a listen loop's drain registration (its receiver is gone).
+fn inject_unregister(id: u64) {
+    INJECT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|(i, _)| *i != id);
+}
+
 /// Friendly name for the common control usages we expect (printing only).
 pub fn usage_name(page: u16, usage: u16) -> &'static str {
     match (page, usage) {
@@ -45,8 +134,76 @@ pub fn usage_name(page: u16, usage: u16) -> &'static str {
     }
 }
 
-/// Usage pages we decode from each report.
-pub const PROBE_PAGES: [u16; 2] = [0x0C, 0x0B]; // Consumer, Telephony
+/// HID Keyboard/Keypad (page 0x07) usage → a human key name. LAYOUT-INDEPENDENT by construction: a
+/// usage names the PHYSICAL key (usage 0x04 is the QWERTY-`A` position on US, AZERTY, or Dvorak
+/// alike), so a binding survives a layout switch. Covers the standard 104-key set + F13–F24; an
+/// unmapped usage falls through to a hex id in [`control_label`].
+fn kbd_usage_name(usage: u16) -> Option<&'static str> {
+    Some(match usage {
+        0x04..=0x1D => [
+            "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q",
+            "R", "S", "T", "U", "V", "W", "X", "Y", "Z",
+        ][(usage - 0x04) as usize],
+        0x1E => "1", 0x1F => "2", 0x20 => "3", 0x21 => "4", 0x22 => "5",
+        0x23 => "6", 0x24 => "7", 0x25 => "8", 0x26 => "9", 0x27 => "0",
+        0x28 => "Enter", 0x29 => "Esc", 0x2A => "Backspace", 0x2B => "Tab", 0x2C => "Space",
+        0x2D => "-", 0x2E => "=", 0x2F => "[", 0x30 => "]", 0x31 => "\\",
+        0x33 => ";", 0x34 => "'", 0x35 => "`", 0x36 => ",", 0x37 => ".", 0x38 => "/",
+        0x39 => "Caps Lock",
+        0x3A..=0x45 => [
+            "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12",
+        ][(usage - 0x3A) as usize],
+        0x46 => "Print Screen", 0x47 => "Scroll Lock", 0x48 => "Pause",
+        0x49 => "Insert", 0x4A => "Home", 0x4B => "Page Up",
+        0x4C => "Delete", 0x4D => "End", 0x4E => "Page Down",
+        0x4F => "Right", 0x50 => "Left", 0x51 => "Down", 0x52 => "Up",
+        0x53 => "Num Lock", 0x54 => "Numpad /", 0x55 => "Numpad *",
+        0x56 => "Numpad -", 0x57 => "Numpad +", 0x58 => "Numpad Enter",
+        0x59..=0x61 => [
+            "Numpad 1", "Numpad 2", "Numpad 3", "Numpad 4", "Numpad 5", "Numpad 6", "Numpad 7",
+            "Numpad 8", "Numpad 9",
+        ][(usage - 0x59) as usize],
+        0x62 => "Numpad 0", 0x63 => "Numpad .", 0x65 => "Menu",
+        0x68..=0x73 => [
+            "F13", "F14", "F15", "F16", "F17", "F18", "F19", "F20", "F21", "F22", "F23", "F24",
+        ][(usage - 0x68) as usize],
+        0xE0 => "Left Ctrl", 0xE1 => "Left Shift", 0xE2 => "Left Alt", 0xE3 => "Left Win",
+        0xE4 => "Right Ctrl", 0xE5 => "Right Shift", 0xE6 => "Right Alt", 0xE7 => "Right Win",
+        _ => return None,
+    })
+}
+
+/// THE human label for ANY captured control — the one place a `(page, usage)` becomes UI text.
+/// Keyboard keys read by name, mouse/gamepad buttons as "Button N", consumer/telephony via
+/// [`usage_name`], and anything unmapped falls back to an EXACT hex id — so even a weird controller
+/// or an exotic key stays bindable and legible, never blank.
+pub fn control_label(page: u16, usage: u16) -> String {
+    match page {
+        0x07 => kbd_usage_name(usage)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("Key 0x{usage:02X}")),
+        0xFF07 => format!("Scancode 0x{usage:03X}"),
+        0x09 => format!("Button {usage}"),
+        // Razer macro keys: the protocol code → a stable name. M1=0x20.. (EMERGENT: any code the
+        // board reports labels itself), FN=0x01, and an unknown code stays bindable as raw hex.
+        RAZER_MACRO_PAGE => match usage {
+            0x01 => "Macro FN".to_string(),
+            0x20..=0x4F => format!("Macro M{}", usage - 0x1F),
+            _ => format!("Macro 0x{usage:02X}"),
+        },
+        _ => match usage_name(page, usage) {
+            "?" => format!("0x{page:02X}/0x{usage:02X}"),
+            name => name.to_string(),
+        },
+    }
+}
+
+/// Usage pages we decode from each HID report. Beyond the original Consumer/Telephony, we now also
+/// read Generic-Desktop (0x01), Keyboard (0x07, for HID keyboards that report a collection), and
+/// Button (0x09, gamepads / multi-button mice / oddball controllers) — so ANY device's controls are
+/// bindable, not just the headset knob. (Standard keyboards/mice arrive as their own Raw-Input types,
+/// handled separately; an empty page just decodes to nothing, so a comprehensive list is free.)
+pub const PROBE_PAGES: [u16; 5] = [0x01, 0x07, 0x09, 0x0B, 0x0C];
 
 #[cfg(windows)]
 pub fn watch(seconds: u64) {
@@ -424,6 +581,20 @@ impl Runtime {
         None
     }
 
+    /// If this trigger binds a plain [`crate::action::Action::Key`] (an input→key REMAP), its key
+    /// string — so the daemon's edge loop can HOLD the output key while the input is held (key down
+    /// on DOWN, key up on UP), the way a real key behaves. `None` if no key remap binds this input
+    /// (it then dispatches normally as a one-shot). Mirrors [`momentary_mic_for`] — both express a
+    /// held action the stateless [`crate::action::Action`] layer (which can only tap) cannot.
+    pub fn key_remap_for(&self, trigger: &Trigger) -> Option<String> {
+        for rule in self.engine.resolve(trigger) {
+            if let crate::action::Action::Key { key } = &rule.action {
+                return Some(key.clone());
+            }
+        }
+        None
+    }
+
     /// Handle an input DOWN edge for HyperShift, in the configured STANCE:
     ///   * `Hold` — the layer lives while the input is held (Razer's behaviour).
     ///   * `Latch` — this press toggles the layer on/off; the up edge is ignored.
@@ -752,6 +923,34 @@ mod spine_tests {
     use crate::engine::Trigger;
     use crate::profile::{AppRule, AppRules};
 
+    #[test]
+    fn control_label_names_any_control_legibly() {
+        // keyboard keys read by their PHYSICAL name (layout-independent); buttons + media too; and
+        // anything unmapped still yields an exact, never-blank id — so a weird controller is legible.
+        assert_eq!(control_label(0x07, 0x04), "A");
+        assert_eq!(control_label(0x07, 0x68), "F13");
+        assert_eq!(control_label(0x07, 0xE0), "Left Ctrl");
+        assert_eq!(control_label(0x07, 0x99), "Key 0x99"); // unmapped keyboard usage
+        assert_eq!(control_label(0x09, 4), "Button 4");
+        assert_eq!(control_label(0x0C, 0xE9), "Volume Up");
+        assert_eq!(control_label(0xFF07, 0x42), "Scancode 0x042");
+        assert_eq!(control_label(0x42, 0x99), "0x42/0x99"); // unknown page → exact hex
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn scancode_maps_physical_keys_layout_independently() {
+        use super::win::scancode_to_usage;
+        // the scancode is the PHYSICAL key, so these hold on US, AZERTY, or Dvorak alike.
+        assert_eq!(scancode_to_usage(0x1E, false), Some(0x04), "A-position key -> usage 0x04");
+        assert_eq!(scancode_to_usage(0x3B, false), Some(0x3A), "F1");
+        assert_eq!(scancode_to_usage(0x1C, false), Some(0x28), "Enter");
+        assert_eq!(scancode_to_usage(0x39, false), Some(0x2C), "Space");
+        assert_eq!(scancode_to_usage(0x48, true), Some(0x52), "E0 -> Up arrow");
+        assert_eq!(scancode_to_usage(0x1D, true), Some(0xE4), "E0 -> Right Ctrl");
+        assert_eq!(scancode_to_usage(0x99, false), None, "unmapped -> raw fallback");
+    }
+
     fn bind(page: u16, usage: u16, action: &str) -> Binding {
         Binding {
             desc: String::new(),
@@ -765,6 +964,32 @@ mod spine_tests {
             mode: None,
             cmd: None,
         }
+    }
+
+    #[test]
+    fn injected_event_before_any_listener_is_buffered_then_delivered() {
+        // The startup race (issue: first macro keypress dropped): the macro-key reader can push an
+        // injected control BEFORE the live-dispatch listener registers its drain. The event must be
+        // BUFFERED and handed to the first sink that registers — so no first keypress is lost.
+        // (No listen loop runs in tests, so INJECT starts empty here, exercising the buffer path.)
+        let ev = ControlEvent {
+            pid: "f042".into(),
+            hits: vec![(RAZER_MACRO_PAGE, 0x20)],
+            raw: vec![0x04, 0x20],
+        };
+        inject_event(ev.clone()); // arrives with no listener yet → buffered, not dropped
+        let (id, rx) = inject_register(); // a listener arms — it must inherit the buffered edge
+        let got = rx
+            .try_recv()
+            .expect("the pre-registration macro keypress was delivered to the new sink");
+        assert_eq!(got.hits, ev.hits, "the buffered keypress survived the race");
+        // and once a sink exists, further injects broadcast straight through (no second buffering).
+        inject_event(ev.clone());
+        assert!(
+            rx.try_recv().is_ok(),
+            "post-registration events broadcast directly to the live sink"
+        );
+        inject_unregister(id);
     }
 
     #[test]
@@ -1290,12 +1515,67 @@ mod win {
     use windows_sys::Win32::UI::Input::{
         GetRawInputData, GetRawInputDeviceInfoW, RegisterRawInputDevices, HRAWINPUT, RAWINPUT,
         RAWINPUTDEVICE, RAWINPUTHEADER, RIDEV_INPUTSINK, RIDI_DEVICENAME, RIDI_PREPARSEDDATA,
-        RID_INPUT, RIM_TYPEHID,
+        RID_INPUT, RIM_TYPEHID, RIM_TYPEKEYBOARD, RIM_TYPEMOUSE,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DestroyWindow, DispatchMessageW, PeekMessageW, TranslateMessage, MSG,
-        PM_REMOVE, WM_INPUT,
+        CreateWindowExW, DestroyWindow, DispatchMessageW, GetForegroundWindow, PeekMessageW,
+        TranslateMessage, MSG, PM_REMOVE, WM_INPUT,
     };
+
+    // RAWKEYBOARD.Flags bits (windows-sys doesn't name them).
+    const RI_KEY_BREAK: u16 = 0x01; // this report is a key-UP (release)
+    const RI_KEY_E0: u16 = 0x02; // the extended (E0) scancode prefix
+
+    /// The device PID (`pid_XXXX` segment) from a Raw-Input device path, as a 4-hex lowercase string
+    /// ("" if absent) — the same key the capture + dispatch already tag triggers with.
+    fn pid_from_path(path: &str) -> String {
+        path.to_lowercase()
+            .split("pid_")
+            .nth(1)
+            .map(|s| s.chars().take(4).collect::<String>())
+            .unwrap_or_default()
+    }
+
+    /// PS/2 scan-code set 1 (`RAWKEYBOARD.MakeCode`) → HID Keyboard/Keypad (page 0x07) usage. The
+    /// scancode is the PHYSICAL key, so this is LAYOUT-INDEPENDENT (the A-position key → usage 0x04 on
+    /// US / AZERTY / Dvorak alike). `e0` is the extended-key prefix. `None` for an unmapped code — the
+    /// caller then keeps it as a raw `(0xFF07, code)` so even an exotic key stays bindable.
+    pub(crate) fn scancode_to_usage(make: u16, e0: bool) -> Option<u16> {
+        Some(if e0 {
+            match make {
+                0x1C => 0x58, 0x1D => 0xE4, 0x35 => 0x54, 0x38 => 0xE6,
+                0x47 => 0x4A, 0x48 => 0x52, 0x49 => 0x4B, 0x4B => 0x50, 0x4D => 0x4F,
+                0x4F => 0x4D, 0x50 => 0x51, 0x51 => 0x4E, 0x52 => 0x49, 0x53 => 0x4C,
+                0x5B => 0xE3, 0x5C => 0xE7, 0x5D => 0x65,
+                _ => return None,
+            }
+        } else {
+            match make {
+                0x01 => 0x29,
+                0x02..=0x0A => 0x1E + (make - 0x02),
+                0x0B => 0x27, 0x0C => 0x2D, 0x0D => 0x2E, 0x0E => 0x2A, 0x0F => 0x2B,
+                0x10 => 0x14, 0x11 => 0x1A, 0x12 => 0x08, 0x13 => 0x15, 0x14 => 0x17,
+                0x15 => 0x1C, 0x16 => 0x18, 0x17 => 0x0C, 0x18 => 0x12, 0x19 => 0x13,
+                0x1A => 0x2F, 0x1B => 0x30, 0x1C => 0x28, 0x1D => 0xE0,
+                0x1E => 0x04, 0x1F => 0x16, 0x20 => 0x07, 0x21 => 0x09, 0x22 => 0x0A,
+                0x23 => 0x0B, 0x24 => 0x0D, 0x25 => 0x0E, 0x26 => 0x0F,
+                0x27 => 0x33, 0x28 => 0x34, 0x29 => 0x35, 0x2A => 0xE1, 0x2B => 0x31,
+                0x2C => 0x1D, 0x2D => 0x1B, 0x2E => 0x06, 0x2F => 0x19, 0x30 => 0x05,
+                0x31 => 0x11, 0x32 => 0x10, 0x33 => 0x36, 0x34 => 0x37, 0x35 => 0x38,
+                0x36 => 0xE5, 0x37 => 0x55, 0x38 => 0xE2, 0x39 => 0x2C, 0x3A => 0x39,
+                0x3B..=0x44 => 0x3A + (make - 0x3B),
+                0x45 => 0x53, 0x46 => 0x47,
+                0x47 => 0x5F, 0x48 => 0x60, 0x49 => 0x61, 0x4A => 0x56,
+                0x4B => 0x5C, 0x4C => 0x5D, 0x4D => 0x5E, 0x4E => 0x57,
+                0x4F => 0x59, 0x50 => 0x5A, 0x51 => 0x5B, 0x52 => 0x62, 0x53 => 0x63,
+                0x57 => 0x44, 0x58 => 0x45,
+                0x64 => 0x68, 0x65 => 0x69, 0x66 => 0x6A, 0x67 => 0x6B,
+                0x68 => 0x6C, 0x69 => 0x6D, 0x6A => 0x6E, 0x6B => 0x6F,
+                0x6C => 0x70, 0x6D => 0x71, 0x6E => 0x72, 0x76 => 0x73,
+                _ => return None,
+            }
+        })
+    }
 
     unsafe fn device_path(hdev: isize) -> String {
         let mut size: u32 = 0;
@@ -1401,26 +1681,24 @@ mod win {
                 return;
             }
 
-            // Register the control usage pages: Consumer (knob/media) + Telephony (mute).
+            // Register EVERY input collection so any control on any device is visible — keyboard,
+            // mouse, gamepad/joystick, AND the original Consumer (knob/media) + Telephony (mute).
+            // `RIDEV_INPUTSINK` = receive even when not foreground (the whole point of a binder).
+            let rid = |page: u16, usage: u16| RAWINPUTDEVICE {
+                usUsagePage: page,
+                usUsage: usage,
+                dwFlags: RIDEV_INPUTSINK,
+                hwndTarget: hwnd,
+            };
             let rids = [
-                RAWINPUTDEVICE {
-                    usUsagePage: 0x0C,
-                    usUsage: 0x01,
-                    dwFlags: RIDEV_INPUTSINK,
-                    hwndTarget: hwnd,
-                },
-                RAWINPUTDEVICE {
-                    usUsagePage: 0x0B,
-                    usUsage: 0x05,
-                    dwFlags: RIDEV_INPUTSINK,
-                    hwndTarget: hwnd,
-                },
-                RAWINPUTDEVICE {
-                    usUsagePage: 0x0B,
-                    usUsage: 0x01,
-                    dwFlags: RIDEV_INPUTSINK,
-                    hwndTarget: hwnd,
-                },
+                rid(0x01, 0x06), // keyboard
+                rid(0x01, 0x07), // keypad
+                rid(0x01, 0x02), // mouse
+                rid(0x01, 0x05), // game pad
+                rid(0x01, 0x04), // joystick
+                rid(0x0C, 0x01), // consumer (media / knob)
+                rid(0x0B, 0x05), // telephony headset
+                rid(0x0B, 0x01), // telephony (mute)
             ];
             if RegisterRawInputDevices(
                 rids.as_ptr(),
@@ -1435,6 +1713,18 @@ mod win {
 
             let header = std::mem::size_of::<RAWINPUTHEADER>() as u32;
             let dbg = std::env::var("NEURON_DEBUG").is_ok();
+            // Keyboard/mouse Raw-Input arrives as TRANSITIONS (one key down/up), but the edge detector
+            // wants a SNAPSHOT of what's currently down per device (like a HID report). So we keep the
+            // live down-set per device path and emit the whole set on each change — exactly the shape
+            // the HID path already produces. (HID devices report their own full state, so they skip this.)
+            let mut down_sets: std::collections::HashMap<String, Vec<(u16, u16)>> =
+                std::collections::HashMap::new();
+            // Foreground window at the last tick — a change means we may have MISSED transitions (see
+            // the focus-loss flush below). 0 = not yet sampled, so the first tick never flushes.
+            let mut last_fg: isize = 0;
+            // Injected HID sources (the Razer macro-key reader) broadcast ControlEvents here; we
+            // drain them into the SAME on_event below, so they bind + dispatch like native input.
+            let (inject_id, inject_rx) = super::inject_register();
             let mut n_input = 0u32;
             let mut n_hid = 0u32;
             let start = Instant::now();
@@ -1473,30 +1763,24 @@ mod win {
                             );
                             if got != u32::MAX && got > 0 {
                                 let ri = &*(buf.as_ptr() as *const RAWINPUT);
-                                if ri.header.dwType == RIM_TYPEHID {
-                                    n_hid += 1;
-                                    let hdev = ri.header.hDevice as isize;
-                                    let path = device_path(hdev);
-                                    if dbg {
+                                let hdev = ri.header.hDevice as isize;
+                                match ri.header.dwType {
+                                    // ── ANY HID device: gamepad, multi-button mouse, the headset knob,
+                                    // an oddball controller. No vendor filter, every probed page decoded.
+                                    RIM_TYPEHID => {
+                                        n_hid += 1;
+                                        let path = device_path(hdev);
                                         let n =
                                             (ri.data.hid.dwSizeHid * ri.data.hid.dwCount) as usize;
-                                        let bytes = std::slice::from_raw_parts(
-                                            ri.data.hid.bRawData.as_ptr(),
-                                            n.min(16),
-                                        );
-                                        let hex: String =
-                                            bytes.iter().map(|b| format!("{b:02X} ")).collect();
-                                        eprintln!("    [dbg] HID ev {n}B  {hex}  dev={path}");
-                                    }
-                                    if path.to_lowercase().contains("vid_1532") {
-                                        let pid = path
-                                            .to_lowercase()
-                                            .split("pid_")
-                                            .nth(1)
-                                            .map(|s| s.chars().take(4).collect::<String>())
-                                            .unwrap_or_default();
-                                        let n =
-                                            (ri.data.hid.dwSizeHid * ri.data.hid.dwCount) as usize;
+                                        if dbg {
+                                            let bytes = std::slice::from_raw_parts(
+                                                ri.data.hid.bRawData.as_ptr(),
+                                                n.min(16),
+                                            );
+                                            let hex: String =
+                                                bytes.iter().map(|b| format!("{b:02X} ")).collect();
+                                            eprintln!("    [dbg] HID ev {n}B  {hex}  dev={path}");
+                                        }
                                         let mut report = std::slice::from_raw_parts(
                                             ri.data.hid.bRawData.as_ptr(),
                                             n,
@@ -1509,13 +1793,89 @@ mod win {
                                                 hits.push((page, u));
                                             }
                                         }
-                                        let ev = ControlEvent {
-                                            pid,
+                                        on_event(&ControlEvent {
+                                            pid: pid_from_path(&path),
                                             hits,
                                             raw: report,
-                                        };
-                                        on_event(&ev);
+                                        });
                                     }
+                                    // ── ANY keyboard: read the SCANCODE (the physical key — layout-proof,
+                                    // never the VKey) → a HID 0x07 usage, and emit the device's full
+                                    // currently-down set (the edge detector diffs snapshots).
+                                    RIM_TYPEKEYBOARD => {
+                                        let kb = &ri.data.keyboard;
+                                        // skip Windows' synthetic shim events (key-overrun / the fake
+                                        // shift injected around the numpad) — no real key behind them.
+                                        if kb.VKey != 0xFF && kb.MakeCode != 0 {
+                                            let e0 = (kb.Flags & RI_KEY_E0) != 0;
+                                            let up = (kb.Flags & RI_KEY_BREAK) != 0;
+                                            let key = match scancode_to_usage(kb.MakeCode, e0) {
+                                                Some(u) => (0x07u16, u),
+                                                None => (
+                                                    0xFF07u16,
+                                                    kb.MakeCode | if e0 { 0x100 } else { 0 },
+                                                ),
+                                            };
+                                            let path = device_path(hdev);
+                                            let set = down_sets.entry(path.clone()).or_default();
+                                            let changed = if up {
+                                                let before = set.len();
+                                                set.retain(|&k| k != key);
+                                                set.len() != before
+                                            } else if !set.contains(&key) {
+                                                set.push(key);
+                                                true
+                                            } else {
+                                                false // auto-repeat: already down, no new edge
+                                            };
+                                            if changed {
+                                                on_event(&ControlEvent {
+                                                    pid: pid_from_path(&path),
+                                                    hits: set.clone(),
+                                                    raw: Vec::new(),
+                                                });
+                                            }
+                                        }
+                                    }
+                                    // ── ANY mouse: the 5 standard buttons (L/R/M + 2 side) as Button-page
+                                    // usages, same down-set snapshot model as the keyboard.
+                                    RIM_TYPEMOUSE => {
+                                        let flags =
+                                            ri.data.mouse.Anonymous.Anonymous.usButtonFlags;
+                                        if flags != 0 {
+                                            // (down-bit, up-bit, button number) for buttons 1..=5
+                                            const BTN: [(u16, u16, u16); 5] = [
+                                                (0x0001, 0x0002, 1),
+                                                (0x0004, 0x0008, 2),
+                                                (0x0010, 0x0020, 3),
+                                                (0x0040, 0x0080, 4),
+                                                (0x0100, 0x0200, 5),
+                                            ];
+                                            let path = device_path(hdev);
+                                            let set = down_sets.entry(path.clone()).or_default();
+                                            let mut changed = false;
+                                            for &(d, u, n) in &BTN {
+                                                let key = (0x09u16, n);
+                                                if flags & d != 0 && !set.contains(&key) {
+                                                    set.push(key);
+                                                    changed = true;
+                                                }
+                                                if flags & u != 0 {
+                                                    let before = set.len();
+                                                    set.retain(|&k| k != key);
+                                                    changed |= set.len() != before;
+                                                }
+                                            }
+                                            if changed {
+                                                on_event(&ControlEvent {
+                                                    pid: pid_from_path(&path),
+                                                    hits: set.clone(),
+                                                    raw: Vec::new(),
+                                                });
+                                            }
+                                        }
+                                    }
+                                    _ => {}
                                 }
                             }
                         }
@@ -1523,9 +1883,43 @@ mod win {
                     TranslateMessage(&msg);
                     DispatchMessageW(&msg);
                 }
+                // FOCUS-LOSS SAFETY NET (the down-set's teardown, mirroring the engine's focus-loss
+                // release_all): a key/button released while another app — or the secure desktop /
+                // lock screen, where Raw Input pauses — held focus may never reach this background
+                // sink. That leaves a PHANTOM "still down" in the synthesized down-set, which then
+                // SWALLOWS that control's next press (the snapshot already thinks it's held) and can
+                // strand a held HyperShift layer or remapped output key. Keyboard/mouse arrive as
+                // transitions and can't self-correct (HID devices send a full snapshot each frame, so
+                // they do and aren't tracked here). When the foreground window changes we can no longer
+                // trust the down-set, so flush it: emit an all-released report per device (the edge
+                // detector raises the Up edges → layers/remaps/momentary all release), then forget the
+                // stale state so the next real press registers cleanly.
+                let fg = GetForegroundWindow() as isize;
+                if last_fg != 0 && fg != last_fg && !down_sets.is_empty() {
+                    let stale: Vec<String> = down_sets
+                        .iter()
+                        .filter(|(_, set)| !set.is_empty())
+                        .map(|(path, _)| path.clone())
+                        .collect();
+                    down_sets.clear();
+                    for path in stale {
+                        on_event(&ControlEvent {
+                            pid: pid_from_path(&path),
+                            hits: Vec::new(),
+                            raw: Vec::new(),
+                        });
+                    }
+                }
+                last_fg = fg;
+                // Drain injected events (Razer macro keys + future HID readers) through the same
+                // on_event path as Raw Input — captured to bind, dispatched to fire, identically.
+                for ev in inject_rx.try_iter() {
+                    on_event(&ev);
+                }
                 on_tick();
                 std::thread::sleep(Duration::from_millis(5));
             }
+            super::inject_unregister(inject_id);
             if dbg {
                 eprintln!("    [dbg] WM_INPUT msgs={n_input}  HID events={n_hid}");
             }

@@ -764,8 +764,17 @@ pub fn capture_phrase(
     max_pts: usize,
     on_progress: impl FnMut(&[C]),
 ) -> Vec<C> {
-    raw_input::capture_phrase(trigger_vk, phrase, cfg, max_pts, &|| false, on_progress)
-        .unwrap_or_default()
+    raw_input::capture_phrase(
+        trigger_vk,
+        phrase,
+        cfg,
+        max_pts,
+        &|| false,
+        &mut Vec::new(),
+        false,
+        on_progress,
+    )
+    .unwrap_or_default()
 }
 
 /// [`capture_phrase`] with an external CANCEL predicate: when `stop()` turns true (checked every
@@ -782,8 +791,53 @@ pub fn capture_phrase_until(
     stop: &(impl Fn() -> bool + ?Sized),
     on_progress: impl FnMut(&[C]),
 ) -> Vec<C> {
-    raw_input::capture_phrase(trigger_vk, phrase, cfg, max_pts, stop, on_progress)
-        .unwrap_or_default()
+    raw_input::capture_phrase(
+        trigger_vk,
+        phrase,
+        cfg,
+        max_pts,
+        stop,
+        &mut Vec::new(),
+        false,
+        on_progress,
+    )
+    .unwrap_or_default()
+}
+
+/// Like [`capture_phrase_until`], but also returns **per-sample timestamps** (ms since boot, from
+/// each motion event's `WM_INPUT` `msg.time`), index-aligned with the returned points. This is the
+/// research-capture surface ([`crate::gwyph`] / strokelab): real inter-sample Δt for eigenmotion
+/// analysis, which the recognizer never needed and so the normal path doesn't collect. Run it with
+/// a `max_pts` high enough that the buffer never thins (`compact` would desync points from stamps).
+#[cfg(windows)]
+pub fn capture_phrase_until_stamped(
+    trigger_vk: i32,
+    phrase: &crate::feel::Phrase,
+    cfg: &crate::feel::FeelConfig,
+    max_pts: usize,
+    stop: &(impl Fn() -> bool + ?Sized),
+    on_progress: impl FnMut(&[C]),
+) -> (Vec<C>, Vec<u32>) {
+    let mut stamps = Vec::new();
+    let pts = raw_input::capture_phrase(
+        trigger_vk,
+        phrase,
+        cfg,
+        max_pts,
+        stop,
+        &mut stamps,
+        true,
+        on_progress,
+    )
+    .unwrap_or_default();
+    // stamps must be EXACTLY 1:1 with points. On any mismatch — a cancelled capture that left
+    // stamps populated while returning no points, or `compact` thinning points on a pathologically
+    // long stroke — drop them entirely, so the consumer records `null` rather than misaligned times
+    // (truncating to length would masquerade as aligned and emit a wrong per-sample timeline).
+    if stamps.len() != pts.len() {
+        stamps.clear();
+    }
+    (pts, stamps)
 }
 
 #[cfg(not(windows))]
@@ -821,6 +875,18 @@ pub fn capture_phrase_until(
     _on_progress: impl FnMut(&[C]),
 ) -> Vec<C> {
     Vec::new()
+}
+
+#[cfg(not(windows))]
+pub fn capture_phrase_until_stamped(
+    _trigger_vk: i32,
+    _phrase: &crate::feel::Phrase,
+    _cfg: &crate::feel::FeelConfig,
+    _max_pts: usize,
+    _stop: &(impl Fn() -> bool + ?Sized),
+    _on_progress: impl FnMut(&[C]),
+) -> (Vec<C>, Vec<u32>) {
+    (Vec::new(), Vec::new())
 }
 
 /// One activation slot the multi-instrument watcher listens for: `id` is returned on activation,
@@ -1027,7 +1093,20 @@ mod raw_input {
 
     /// Drain pending WM_INPUT; push accumulated absolute positions. Returns true if any
     /// motion arrived. `acc` is the running (x,y) integral of relative deltas.
-    unsafe fn drain(hwnd: HWND, acc: &mut (f64, f64), pts: &mut Vec<C>) -> bool {
+    ///
+    /// When `want_stamps`, each pushed point also appends its source WM_INPUT's `msg.time` (ms
+    /// since boot, the OS's per-event timestamp) to `stamps`, kept index-aligned with `pts` — the
+    /// research-capture path ([`super::capture_phrase_until_stamped`]) reads it for true Δt. The
+    /// normal path passes `false` (and a throwaway buffer), so its behaviour is unchanged. NB:
+    /// `compact()` would desync the two, so a stamped capture must run with a `max_pts` high enough
+    /// never to thin (the research caller does).
+    unsafe fn drain(
+        hwnd: HWND,
+        acc: &mut (f64, f64),
+        pts: &mut Vec<C>,
+        stamps: &mut Vec<u32>,
+        want_stamps: bool,
+    ) -> bool {
         crate::prof::bump(&crate::prof::CAPTURE_POLL);
         let header = std::mem::size_of::<RAWINPUTHEADER>() as u32;
         let mut moved = false;
@@ -1060,6 +1139,9 @@ mod raw_input {
                                 acc.0 += dx;
                                 acc.1 += dy;
                                 pts.push(C::new(acc.0, acc.1));
+                                if want_stamps {
+                                    stamps.push(msg.time);
+                                }
                                 moved = true;
                             }
                             // wheel notches feed the depth dial (usButtonData is a signed
@@ -1136,7 +1218,7 @@ mod raw_input {
             let mut pre: Vec<C> = Vec::new();
 
             let activated: (u32, Vec<C>) = 'wait: loop {
-                drain(hwnd, &mut acc, &mut pre);
+                drain(hwnd, &mut acc, &mut pre, &mut Vec::new(), false);
                 if pre.len() > 256 {
                     // bound the prebuffer (idle mouse noise between presses means nothing)
                     pre.drain(..pre.len() - 256);
@@ -1225,7 +1307,7 @@ mod raw_input {
                     DestroyWindow(hwnd);
                     return None;
                 }
-                if drain(hwnd, &mut acc, &mut pts) {
+                if drain(hwnd, &mut acc, &mut pts, &mut Vec::new(), false) {
                     if pts.len() >= max_pts {
                         compact(&mut pts);
                     }
@@ -1238,7 +1320,7 @@ mod raw_input {
                 if super::key_down(vk) {
                     break;
                 }
-                if drain(hwnd, &mut acc, &mut pts) {
+                if drain(hwnd, &mut acc, &mut pts, &mut Vec::new(), false) {
                     if pts.len() >= max_pts {
                         compact(&mut pts);
                     }
@@ -1257,6 +1339,8 @@ mod raw_input {
         cfg: &crate::feel::FeelConfig,
         max_pts: usize,
         stop: &(impl Fn() -> bool + ?Sized),
+        stamps_out: &mut Vec<u32>,
+        want_stamps: bool,
         mut on_progress: impl FnMut(&[C]),
     ) -> Result<Vec<C>, ()> {
         use crate::feel::{PhraseWatcher, Watch};
@@ -1270,7 +1354,7 @@ mod raw_input {
             let t0 = Instant::now();
             let mut watcher = PhraseWatcher::new(phrase.clone(), cfg);
             let toggle = loop {
-                drain(hwnd, &mut acc, &mut sink);
+                drain(hwnd, &mut acc, &mut sink, &mut Vec::new(), false);
                 sink.clear();
                 if super::key_down(0x1B) || stop() {
                     // ESC (or an external cancel) aborts — quietly, instantly.
@@ -1305,13 +1389,33 @@ mod raw_input {
                 // SAFETY DEADMAN (see capture_slots): a 30s cap so a stuck key-state can't spin
                 // here forever with the cursor LOCKED (frozen mouse + dead modes until restart).
                 let hold_start = Instant::now();
+                let mut last_motion = Instant::now();
                 while super::key_down(trigger_vk) {
-                    if stop() || hold_start.elapsed() > Duration::from_secs(30) {
+                    if stop() {
                         // retired mid-weave: the stroke must NOT commit (its owner withdrew it).
                         DestroyWindow(hwnd);
                         return Ok(Vec::new());
                     }
-                    if drain(hwnd, &mut acc, &mut pts) {
+                    // SAFETY DEADMAN. NORMAL path: a hard 30s from press — a stuck key can't spin here
+                    // with the cursor LOCKED, and a 30s hold isn't a real flick, so discard. RESEARCH
+                    // path (want_stamps): there is NO cap on ACTIVE drawing — the deadman is 30s of NO
+                    // MOTION (a stuck key or a long mid-stroke pause), and it COMMITS the captured
+                    // stroke rather than losing a long deliberate trace. The stuck-cursor bound holds
+                    // either way (a wedged key produces no motion → releases in 30s).
+                    let timed_out = if want_stamps {
+                        last_motion.elapsed() > Duration::from_secs(30)
+                    } else {
+                        hold_start.elapsed() > Duration::from_secs(30)
+                    };
+                    if timed_out {
+                        if want_stamps {
+                            break; // commit what we have → coyote tail → Ok(pts)
+                        }
+                        DestroyWindow(hwnd);
+                        return Ok(Vec::new());
+                    }
+                    if drain(hwnd, &mut acc, &mut pts, stamps_out, want_stamps) {
+                        last_motion = Instant::now();
                         if pts.len() >= max_pts {
                             compact(&mut pts);
                         }
@@ -1326,7 +1430,7 @@ mod raw_input {
                     if super::key_down(trigger_vk) {
                         break; // spam: the user is already starting the next weave
                     }
-                    if drain(hwnd, &mut acc, &mut pts) {
+                    if drain(hwnd, &mut acc, &mut pts, stamps_out, want_stamps) {
                         if pts.len() >= max_pts {
                             compact(&mut pts);
                         }
@@ -1338,7 +1442,7 @@ mod raw_input {
                 // ── toggle capture: runs until the NEXT tap of the trigger (or ESC) ──
                 // First let the activating press release (its motion already counts).
                 while super::key_down(trigger_vk) {
-                    if drain(hwnd, &mut acc, &mut pts) {
+                    if drain(hwnd, &mut acc, &mut pts, stamps_out, want_stamps) {
                         if pts.len() >= max_pts {
                             compact(&mut pts);
                         }
@@ -1347,15 +1451,35 @@ mod raw_input {
                     std::thread::sleep(Duration::from_millis(2));
                 }
                 // capture until the closing tap's DOWN edge (responsive close) or ESC.
+                // SAFETY DEADMAN (mirrors the hold branch): a 60s cap so a closing tap that never
+                // registers — a flickered/missed key edge mid-stroke — can't strand this loop with the
+                // cursor LOCKED. 60s is far longer than any real glyph, even a deliberately slow one.
+                let toggle_start = Instant::now();
+                let mut last_motion = Instant::now();
                 loop {
                     if stop() {
+                        DestroyWindow(hwnd);
+                        return Ok(Vec::new());
+                    }
+                    // deadman (see the hold branch): research path commits on 30s idle, normal path
+                    // discards on a hard 60s cap.
+                    let timed_out = if want_stamps {
+                        last_motion.elapsed() > Duration::from_secs(30)
+                    } else {
+                        toggle_start.elapsed() > Duration::from_secs(60)
+                    };
+                    if timed_out {
+                        if want_stamps {
+                            break; // commit
+                        }
                         DestroyWindow(hwnd);
                         return Ok(Vec::new());
                     }
                     if super::key_down(0x1B) || super::key_down(trigger_vk) {
                         break;
                     }
-                    if drain(hwnd, &mut acc, &mut pts) {
+                    if drain(hwnd, &mut acc, &mut pts, stamps_out, want_stamps) {
+                        last_motion = Instant::now();
                         if pts.len() >= max_pts {
                             compact(&mut pts);
                         }

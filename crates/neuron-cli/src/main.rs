@@ -1311,8 +1311,11 @@ fn lighting_cmd(reg: &Registry, action: Option<LightingCmd>) -> Result<()> {
     }
 }
 
-/// Animate an emulated effect: set custom-frame mode once, then stream computed frames. This
-/// is the open-effects engine running live — every effect is just `render_frame` over time.
+/// Animate a PRESET live: set custom-frame mode once, then stream the composited Pattern × Spectrum.
+/// `name` is a preset slug (the same looks the GUI tile grid offers); `--color`, when given, repaints a
+/// colour-driven look (one whose spectrum is a solid) in that single colour — the rainbow/ramp looks own
+/// their palette and ignore it. This is the open-effects engine running live: one `Compositor::render`
+/// per frame.
 fn lighting_run(
     reg: &Registry,
     name: &str,
@@ -1321,16 +1324,26 @@ fn lighting_run(
     fps: u64,
     pid_filter: Option<&str>,
 ) -> Result<()> {
-    let mut generator = neuron::effects::make(name).ok_or_else(|| {
+    let mut layer = neuron::pattern::preset_layer(name).ok_or_else(|| {
         anyhow::anyhow!(
-            "unknown effect '{name}' (try: {})",
-            neuron::effects::BUILTINS.join(", ")
+            "unknown look '{name}' (try: {})",
+            neuron::pattern::presets()
+                .iter()
+                .map(|p| p.slug)
+                .collect::<Vec<_>>()
+                .join(", ")
         )
     })?;
-    let color = match color {
-        Some(s) => Some(Rgb::parse(s).ok_or_else(|| anyhow::anyhow!("bad colour '{s}'"))?),
-        None => None,
-    };
+    // a colour override repaints a colour-driven look (its spectrum is a single solid stop) as that
+    // colour; a palette/ramp look keeps its own spectrum (the colour is intrinsic).
+    if let Some(s) = color {
+        let c = Rgb::parse(s).ok_or_else(|| anyhow::anyhow!("bad colour '{s}'"))?;
+        if layer.spectrum.is_solid() {
+            layer.spectrum = neuron::spectrum::Spectrum::solid(c);
+        } else {
+            eprintln!("note: '{name}' owns its palette — --color ignored");
+        }
+    }
     let want = match pid_filter {
         Some(s) => Some(parse_hex16(s)?),
         None => None,
@@ -1344,14 +1357,15 @@ fn lighting_run(
     let l = def.lighting.clone().unwrap();
     let d = Device::open(def.clone(), pid)?;
 
-    // The orchestration (driver mode, frame streaming, fire-and-forget) is the backend's job;
-    // the visuals are the generator's. The CLI just wires them together.
+    // The orchestration (driver mode, frame streaming, fire-and-forget) is the backend's job; the
+    // visuals are the compositor's (a single-layer stack here). The CLI just wires them together.
     let lights = lighting::Lights::new(&d, l);
     println!(
-        "streaming '{name}' on {} — {seconds}s @ {fps}fps (open-effects engine)...",
+        "streaming '{name}' on {} — {seconds}s @ {fps}fps (Pattern × Spectrum engine)...",
         def.name
     );
-    lights.animate(&mut *generator, color, || fps as u32, seconds, || false)?;
+    let mut comp = neuron::pattern::Compositor::from_defs(&[layer]);
+    lights.animate(&mut comp, || fps as u32, seconds, || false)?;
     println!("done.");
     Ok(())
 }

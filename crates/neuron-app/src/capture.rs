@@ -239,7 +239,7 @@ pub fn begin_control(
     st.set_capture_active(true);
     CAPTURE_ACTIVE.store(true, Ordering::Relaxed);
     st.set_capture_prompt(
-        "press the device control (knob / mute / media / mic-tap) — ESC to cancel".into(),
+        "press the device control (knob / mute / media / macro key / mic-tap) — ESC to cancel".into(),
     );
 
     std::thread::Builder::new()
@@ -309,7 +309,22 @@ fn capture_control_until(stop: &AtomicBool) -> Option<CapturedControl> {
         true, // interactive press-to-bind — ESC cancels, as the panel says
         |ev| {
             if let Some(&(page, usage)) = ev.hits.first() {
-                let pid = u16::from_str_radix(&ev.pid, 16).ok();
+                // The LEFT mouse button operates this dialog (the "cancel" button + the scrim-click
+                // dismiss). It is not a bindable "device control", so never capture it here —
+                // otherwise clicking cancel binds mouse-1 instead of cancelling. Side buttons (2-5),
+                // the knob, media keys, mic-tap and macro keys all still capture normally.
+                if (page, usage) == (0x09, 1) {
+                    return;
+                }
+                // Macro keys are LOGICAL controls (M5 is M5 on any board) riding a synthetic
+                // edge-bucket pid; bind them DEVICE-ANY so the label stays clean ("Macro M5", no
+                // @pid) and a replug/keyboard-swap keeps the binding. Every other control keeps its
+                // real device pid (a knob on headset A is not the knob on headset B).
+                let pid = if page == neuron::controls::RAZER_MACRO_PAGE {
+                    None
+                } else {
+                    u16::from_str_radix(&ev.pid, 16).ok()
+                };
                 found.set(Some(CapturedControl { page, usage, pid }));
                 stop.store(true, Ordering::Relaxed);
             }

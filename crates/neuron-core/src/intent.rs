@@ -77,12 +77,14 @@ pub fn run_shared_intent(
             // Clamp to the device's sane range (same band the cycle uses) so a stray config value
             // can't ask the mouse for an impossible sensitivity.
             let dpi = (*dpi).clamp(100, 30_000);
-            match devices.with_writable("set_dpi", |d| cap::set_dpi(d, dpi, dpi, cap::Store::Persist))
-            {
-                Ok(()) => {
+            match devices.with_writable("set_dpi", |d| {
+                cap::set_dpi(d, dpi, dpi, cap::Store::Persist)?;
+                Ok(d.pid) // carry the acting device's pid for the per-device confirm de-dup
+            }) {
+                Ok(pid) => {
                     // confirmation fires ONLY past the committed write (set is absolute — no prior
                     // read, so no old→new).
-                    crate::confirm::dpi(dpi as u32, None);
+                    crate::confirm::dpi(pid, dpi as u32, None);
                     format!("DPI -> {dpi}")
                 }
                 Err(e) => format!("DPI set failed: {e}"),
@@ -99,12 +101,12 @@ pub fn run_shared_intent(
                 let cur = cap::dpi(d).map(|(x, _)| x)?;
                 let next = next_dpi(cur, dir.step(), &stages);
                 cap::set_dpi(d, next, next, cap::Store::Volatile)?;
-                Ok((cur, next))
+                Ok((d.pid, cur, next))
             });
             match result {
-                Ok((cur, next)) => {
+                Ok((pid, cur, next)) => {
                     // the read-back gave us the prior DPI too — a true old→new confirmation.
-                    crate::confirm::dpi(next as u32, Some(cur as u32));
+                    crate::confirm::dpi(pid, next as u32, Some(cur as u32));
                     format!("DPI cycle {} -> {next}", dir.label())
                 }
                 Err(e) => format!("DPI cycle skipped ({e})"),
@@ -117,13 +119,14 @@ pub fn run_shared_intent(
             let prev = crate::writes::scroll_stage_cursor();
             let next = crate::writes::cycle_scroll_stage(prev, dir.step(), SCROLL_STAGE_COUNT);
             match devices.with_writable("set_scroll_stage", |d| {
-                crate::writes::set_scroll_stage(d, next, cap::Store::Volatile)
+                crate::writes::set_scroll_stage(d, next, cap::Store::Volatile)?;
+                Ok(d.pid) // carry the acting device's pid for the per-device confirm de-dup
             }) {
-                Ok(()) => {
+                Ok(pid) => {
                     crate::writes::set_scroll_stage_cursor(next);
                     // confirm past the committed stage-select — a true old→new (we held the prior
                     // cursor). Was missing, so cycling sensitivity earned no card.
-                    crate::confirm::scroll(next as u32, SCROLL_STAGE_COUNT as u32, Some(prev as u32));
+                    crate::confirm::scroll(pid, next as u32, SCROLL_STAGE_COUNT as u32, Some(prev as u32));
                     format!("scroll stage {} -> {next}", dir.label())
                 }
                 Err(e) => format!("scroll stage skipped ({e})"),

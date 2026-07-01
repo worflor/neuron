@@ -3051,10 +3051,10 @@ mod imp {
     // ── CARD geometry — shared by every stack card (the value-hierarchy card AND the ask card draw
     // off these), so each card's chip + gap + margins are one single source of truth and can never
     // disagree across the column. ──
-    const NOTIFY_GLYPH_R: f32 = 13.0; // the icon's scale INSIDE the chip
-    const NOTIFY_CHIP_HALF: f32 = 19.0; // the glyph CHIP's half-size (a rounded-square badge)
-    const NOTIFY_GLYPH_BOX: f32 = NOTIFY_CHIP_HALF * 2.0 + 6.0; // the chip's horizontal footprint
-    const NOTIFY_GAP: f32 = 14.0; // chip → text-block gap
+    // The chip's SIZE and horizontal placement now live in ONE place — `notifs` (`CHIP_HALF`,
+    // `CHIP_GLYPH_R`, `CHIP_DX`, `TEXT_DX`) — right beside the vertical row spec that sizes the box, so
+    // the renderer reads them and the two halves of the layout can never drift apart. Only the
+    // render-only details stay here:
     const NOTIFY_TAB: f32 = 4.0; // the signature accent tab on the left edge
     const NOTIFY_ARROW: f32 = 15.0; // width reserved beside a ranged value for the ↑/↓ cue
 
@@ -3198,14 +3198,17 @@ mod imp {
         let pw = c.prev.as_ref().map(|t| t.w).unwrap_or(0) as f32;
         let arrow = if c.dir != 0 { NOTIFY_ARROW } else { 0.0 };
         let text_w = lw.max(vw + arrow).max(bw).max(pw);
-        let gx = cx - half + NOTIFY_TAB + NOTIFY_GLYPH_BOX / 2.0 + 4.0; // chip centre
-        let tx = cx - half + NOTIFY_TAB + NOTIFY_GLYPH_BOX + NOTIFY_GAP + 4.0; // text block left
-        // EVERY row y comes from the ONE layout spec that sized the box, so content fits by construction.
+        // chip-centre + text-left x come from the shared spec (one source of truth with the box sizing).
+        let chip_cx = cx - half + crate::notifs::CHIP_DX;
+        let tx = cx - half + crate::notifs::TEXT_DX; // text block left
+        // EVERY position comes from the ONE layout spec that sized the box, so content fits by construction.
         let lay = notify_layout(c);
         let top = cy - ry;
-        // the glyph chip — vertically centred on the card body.
-        chip_box(buf, gx, cy, NOTIFY_CHIP_HALF, 7.0, accent);
-        draw_wedge_glyph(buf, c.glyph, gx, cy, NOTIFY_GLYPH_R, Tone::Plain, frame, 0.92 * a);
+        // the glyph chip — at the spec's `chip_cy`, anchored to the HEADLINE cluster (not the box
+        // centre), so it keeps the same relationship to the title/value on every card shape.
+        let chip_y = top + lay.chip_cy;
+        chip_box(buf, chip_cx, chip_y, crate::notifs::CHIP_HALF, 7.0, accent);
+        draw_wedge_glyph(buf, c.glyph, chip_cx, chip_y, crate::notifs::CHIP_GLYPH_R, Tone::Plain, frame, 0.92 * a);
         // ── THE ASK SLOT — same chrome + Ask glyph chip as above, but the ask LAYOUT (a prompt, not
         // a value-hierarchy): the QUESTION prominent and the answer GRAMMAR on its OWN legible row,
         // the content/typography of `draw_ask_card` reused but drawn here AS a stack slot. It reads as
@@ -3323,8 +3326,9 @@ mod imp {
         let cy = if top_corner { anchor + ry } else { anchor - ry };
         let half = STACK_HALF;
         card_frame(buf, cx, cy, half - 1.0, ry, 12.0, accent, breath * a, true);
-        // the COUNT — a large accent numeral on the left (a growing badge).
-        let count_cx = cx - half + 34.0;
+        // the COUNT — a large accent numeral on the left, sitting in the SAME icon column a stack
+        // card's chip occupies (shared `CHIP_DX`), so collapsing Stack→Digest doesn't shift the left edge.
+        let count_cx = cx - half + crate::notifs::CHIP_DX;
         if let Some(t) = &d.count_txt {
             let by = cy - 12.0;
             blit_mask(&mut buf.pr, t, count_cx, by, accent.0 * a);
@@ -3333,7 +3337,9 @@ mod imp {
             blit_mask(&mut buf.white, t, count_cx, by, 0.18 * a);
         }
         // the GLYPH ROW — the distinct source icons, each in a small chip, sliding open with reveal.
-        let row_x0 = cx - half + 60.0;
+        // Starts at the SAME text column a stack card uses (`TEXT_DX`), so the digest's content lines up
+        // with the cards it summarises.
+        let row_x0 = cx - half + crate::notifs::TEXT_DX;
         let row_y = cy - 14.0;
         let step = 26.0;
         for (i, g) in d.glyphs.iter().enumerate() {

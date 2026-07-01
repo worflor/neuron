@@ -131,10 +131,14 @@ impl Device {
         Ok(())
     }
 
-    /// Fast streaming write: send the report and drain the reply ONCE (no busy-poll retry loop).
-    /// The razer_report protocol requires the response to be read before the next command — skip
-    /// it and the device ignores every subsequent write (frozen frame). A single drain both
-    /// satisfies that and keeps the per-command cost ~1-2ms, so frame streaming stays smooth.
+    /// Fast streaming write: send the report, wait the device's round-trip, then drain the reply ONCE
+    /// (no busy-poll retry loop). The razer_report protocol requires the response to be read before the
+    /// next command — skip it and the device ignores every subsequent write (frozen frame). It ALSO
+    /// requires giving the link time to carry the command: on a 2.4 GHz dongle the SET round-trips
+    /// host→dongle→mouse→back, and reading/firing again before that completes overruns the device and
+    /// DROPS frames — the lighting FLICKER. `stream_wait_us` (registry data; ~31ms for the Naga's
+    /// wireless receiver, 0 for wired boards) is exactly OpenRazer's per-receiver `wait_us`. Wired/legacy
+    /// boards keep their ~1-2ms cost; the wireless mouse trades a lower ceiling (~16fps) for stability.
     pub fn send_lighting_fast(&self, rep: &crate::lighting::Report) {
         let size = rep.size.unwrap_or_else(|| rep.args.len().min(80) as u8);
         let tx = rep.tx.unwrap_or(self.def.transaction_id);
@@ -145,8 +149,11 @@ impl Device {
             }
         }
         if self.transport.set_feature(&req.to_buf()).is_ok() {
+            if self.def.stream_wait_us > 0 {
+                std::thread::sleep(Duration::from_micros(self.def.stream_wait_us));
+            }
             let mut b = [0u8; BUF_LEN];
-            let _ = self.transport.get_feature(&mut b); // drain the reply; don't wait/retry
+            let _ = self.transport.get_feature(&mut b); // drain the reply; don't busy-retry
         }
     }
 

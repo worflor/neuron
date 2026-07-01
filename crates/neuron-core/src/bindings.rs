@@ -268,6 +268,27 @@ mod tests {
     }
 
     #[test]
+    fn macro_key_binding_round_trips() {
+        // Razer macro keys bind on the synthetic page 0xFF1A; the GUI binds them DEVICE-ANY (pid
+        // None), a hand-written one may pin a device. Both must survive a TOML round-trip so the
+        // binding persists across a restart (page + usage carry "which macro key").
+        let any = bind(0xFF1A, 0x20, "mic-mute"); // M1, device-any (pid None by default)
+        let mut pinned = bind(0xFF1A, 0x24, "mic-mute"); // M5, device-pinned
+        pinned.pid = Some("f221".into());
+        let original = Bindings {
+            bindings: vec![any, pinned],
+        };
+        let s = toml::to_string_pretty(&original).unwrap();
+        let parsed: Bindings = toml::from_str(&s).unwrap();
+        assert_eq!(parsed.bindings.len(), 2);
+        assert_eq!(parsed.bindings[0].page, 0xFF1A);
+        assert_eq!(parsed.bindings[0].usage, 0x20);
+        assert_eq!(parsed.bindings[0].pid, None);
+        assert_eq!(parsed.bindings[1].usage, 0x24);
+        assert_eq!(parsed.bindings[1].pid, Some("f221".into()));
+    }
+
+    #[test]
     fn summary_is_human_readable() {
         let mut b = bind(0x0B, 0x2F, "mic-mute");
         b.mode = Some("toggle".into());

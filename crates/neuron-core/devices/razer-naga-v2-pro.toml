@@ -7,6 +7,11 @@ name = "Razer Naga V2 Pro"
 codename = "Aria"
 vendor_id = 0x1532
 transaction_id = 0x1F
+# Wait (µs) between a feature SET and the GET that drains its reply. The 2.4 GHz dongle round-trips
+# the command host→dongle→mouse→back; reading/firing the next write before that finishes overruns the
+# device and DROPS lighting frames (the FLICKER). OpenRazer's "new mouse receiver" value is 31000µs.
+# Streaming writes sleep this; if a board ever wants a different cadence it's a one-line data tweak.
+stream_wait_us = 31000
 
 # The device changes USB PID per link mode.
 [[modes]]
@@ -178,6 +183,11 @@ rows = 1
 cols = 2                       # ~2 LED zones (exact per-LED count TBD; effects don't need it)
 varstore = 0x00               # NOSTORE = volatile (safest)
 led_id = 0x04                 # the VISIBLE region (confirmed)
+# Effect-id that DISPLAYS a written custom frame. The default (0x05) is OpenRazer's *standard*-matrix
+# CUSTOMFRAME — but on this EXTENDED-matrix device 0x05 is REACTIVE, so streaming was painting a row
+# then setting reactive each frame (paint → dark → paint → dark = flicker). OpenRazer's extended-matrix
+# custom-frame effect is 0x08 (`razer_chroma_extended_matrix_effect_custom_frame`). Verified era: 0x0F.
+custom_id = 0x08
 
 [lighting.effects]            # native firmware effects: name -> effect-id byte (confirmed live)
 off = 0x00

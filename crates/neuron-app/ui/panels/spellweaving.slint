@@ -18,6 +18,23 @@ export component SpellweavingPanel inherits VerticalLayout {
         running: root.clear-armed;
         triggered => { root.clear-armed = false; }
     }
+
+    // ── strokelab RICH MODE identity ────────────────────────────────────────────────────────────
+    // Shift+Record captures a FULL stroke to a research file instead of teaching the vault. It gets
+    // its own amber "capture → file" look so it reads as a distinct MODE, not a plain recording:
+    //   rich-armed = Shift is held (preview the mode on the button before you commit)
+    //   rich-live  = a rich capture is actually running (the canvas takes on the research skin)
+    property <color> rich-col: #e6a93c;
+    property <bool> rich-armed: State.shift-armed && !State.capturing-gesture;
+    property <bool> rich-live: State.rich-capturing;
+    property <bool> rich-any: root.rich-armed || root.rich-live;
+    // probe Shift ~9Hz, but ONLY while this weave page is actually on screen (mirrors the lighting
+    // timers' window-shown gate) — a hover hint costs nothing when you can't see it.
+    Timer {
+        interval: 110ms;
+        running: State.window-shown && State.page == 2 && State.input-view == 1;
+        triggered => { State.shift-armed = State.poll-shift(); }
+    }
     // rename buffer for the bind card
     property <string> rename-to: "";
     // activation preset is string-keyed in the engine, index-keyed in the Segment widget
@@ -45,7 +62,7 @@ export component SpellweavingPanel inherits VerticalLayout {
     // 2tap-hold→whiteboard, via the cast ModeSlots). Surface THAT as a scannable map instead of a
     // lone rhythm picker + stray "try" buttons, so the model is obvious: one key, many rhythms.
     Mono {
-        text: "One trigger, several rhythms — each press-pattern fires its own gesture.   ( ● tap · ▬ hold )";
+        text: "One trigger, several rhythms. Each press-pattern fires its own gesture.   ( ● tap · ▬ hold )";
         color: Theme.text-dim;
     }
     Rectangle { height: 12px; }
@@ -120,11 +137,11 @@ export component SpellweavingPanel inherits VerticalLayout {
                     }
                     VerticalLayout { alignment: center; Mono { text: "→"; color: Theme.text-faint; } }
                     VerticalLayout { alignment: center; horizontal-stretch: 1;
-                        Text { text: "open the weave — draw a glyph or flick the radial"; color: Theme.text; font-family: Theme.mono; font-size: Theme.fs-body; vertical-alignment: center; overflow: elide; }
+                        Text { text: "open the weave · draw a glyph or flick the radial"; color: Theme.text; font-family: Theme.mono; font-size: Theme.fs-body; vertical-alignment: center; overflow: elide; }
                     }
                     VerticalLayout { alignment: center;
                         Segment {
-                            options: ["hold", "tap·hold", "2tap·hold", "2tap ⇄"];
+                            options: ["hold", "tap·hold", "2tap·hold", "2tap"];
                             index: root.activation-idx;
                             min-seg: 56px;
                             picked(i) => { State.set-activation(i == 0 ? "hold" : i == 1 ? "tap hold" : i == 2 ? "tap tap hold" : "tap tap"); }
@@ -161,7 +178,7 @@ export component SpellweavingPanel inherits VerticalLayout {
                         }
                         VerticalLayout { alignment: center; Mono { text: "→"; color: Theme.text-faint; } }
                         VerticalLayout { alignment: center; horizontal-stretch: 1;
-                            Text { text: rb.bound ? rb.desc : "unbound — click to bind"; color: rb.bound ? Theme.text : Theme.text-faint; font-family: Theme.mono; font-size: Theme.fs-body; vertical-alignment: center; overflow: elide; }
+                            Text { text: rb.bound ? rb.desc : "unbound · click to bind"; color: rb.bound ? Theme.text : Theme.text-faint; font-family: Theme.mono; font-size: Theme.fs-body; vertical-alignment: center; overflow: elide; }
                         }
                         // a teleport / whiteboard rhythm keeps its TRY shortcut (opens the instrument now).
                         if rb.desc == "teleport" : VerticalLayout { alignment: center; Button { text: "try"; clicked => { State.try-teleport(); } } }
@@ -205,14 +222,35 @@ export component SpellweavingPanel inherits VerticalLayout {
 
         // ── gesture trail + vault ─────────────────────────────────────────
         VerticalLayout {
-            horizontal-stretch: 1;
+            // PIN this column's width with min==max (computed: page width minus the fixed 380px radial pane
+            // and the inter-column gap) instead of horizontal-stretch:1. A Flickable in a DESCENDANT — the
+            // ActionPicker's param-suggestion chips, which only render for actions WITH suggestions (summon a
+            // window / run a command / window·profile·macro ops, controls.slint ~822) — reports a content-
+            // driven, NON-DETERMINISTIC width that defeats the stretch and collapses this column to the chips'
+            // width (the radial then jumps left with a slab of dead space). Actions WITHOUT suggestions
+            // (unbind, sequence, …) never collapse. min==max is the only thing content physically can't
+            // override (the DEVICE-inspector fix in slint-layout-gotchas), so the width is forced regardless
+            // of any child's quirk, while still tracking the window responsively via parent.width.
+            horizontal-stretch: 0;
+            min-width: parent.width - 380px - Theme.gap-col;
+            max-width: parent.width - 380px - Theme.gap-col;
             spacing: 12px;
             SectionTitle { text: "GLYPH · the rich weave"; }
             canvas := Rectangle {
-                background: Theme.bg-2;
+                // RICH MODE skin: a faint amber wash + a lit border, so the surface itself reads as
+                // "research capture → file" the moment a rich stroke begins — not a plain recording.
+                background: root.rich-live ? root.rich-col.with-alpha(0.05) : Theme.bg-2;
                 border-radius: Theme.radius;
+                border-width: root.rich-live ? 1.5px : 0px;
+                border-color: root.rich-col.with-alpha(0.55);
                 clip: true;
-                min-height: 260px;
+                animate background, border-color, border-width { duration: Theme.quick; }
+                // FIXED height (was min-height: 260) — the SAME fix the radial wheel got (see its comment
+                // ~L560). As a min-only cell the canvas was the elastic THIS column stretched into, so
+                // opening a glyph's inline editor below stole the height back from it → the canvas shrank
+                // and the whole page reflowed/squished. Pinned, the editor just appears beneath the row;
+                // nothing above it moves.
+                height: 280px;
                 // faint grid backdrop
                 for gx in 8 : Rectangle {
                     x: parent.width / 8 * gx; width: 1px; height: parent.height;
@@ -228,9 +266,9 @@ export component SpellweavingPanel inherits VerticalLayout {
                     spacing: 5px;
                     Mono {
                         text: State.capturing-gesture
-                            ? "weaving — draw while holding the trigger"
+                            ? (root.rich-live ? "weaving · rich stroke → file" : "weaving · draw while holding the trigger")
                             : "your last stroke renders here";
-                        color: Theme.text-dim;
+                        color: root.rich-live ? root.rich-col : Theme.text-dim;
                         horizontal-alignment: center;
                     }
                     if !State.capturing-gesture : Mono {
@@ -250,7 +288,32 @@ export component SpellweavingPanel inherits VerticalLayout {
                     border-radius: self.width / 2;
                     x: tx * (canvas.width - self.width);
                     y: ty * (canvas.height - self.height);
-                    background: State.weave-accent-col.with-alpha(0.2 + 0.7 * frac);
+                    // the drawn line turns amber in rich mode — the stroke you make IS the research colour.
+                    background: (root.rich-live ? root.rich-col : State.weave-accent-col).with-alpha(0.2 + 0.7 * frac);
+                }
+                // RICH MODE badge — top-left (opposite the record pill), present only while a rich
+                // capture runs, naming the mode + where it's going. The unmissable "different mode" cue.
+                if root.rich-live : Rectangle {
+                    x: 12px;
+                    y: 12px;
+                    width: badgebar.preferred-width;
+                    height: 22px;
+                    border-radius: Theme.radius-sm;
+                    background: root.rich-col.with-alpha(0.14);
+                    border-width: 1px;
+                    border-color: root.rich-col.with-alpha(0.5);
+                    badgebar := HorizontalLayout {
+                        padding-left: 9px; padding-right: 10px; spacing: 6px;
+                        VerticalLayout { alignment: center;
+                            Rectangle { width: 6px; height: 6px; border-radius: 3px; background: root.rich-col; }
+                        }
+                        Text {
+                            text: "RICH STROKE → FILE";
+                            color: root.rich-col;
+                            font-family: Theme.mono; font-size: Theme.fs-small; font-weight: 700;
+                            letter-spacing: 1px; vertical-alignment: center;
+                        }
+                    }
                 }
                 // floating RECORD — a compact pill in the canvas's top-right (a Button inherits
                 // Rectangle, which fills its parent unless sized, so it MUST hug its own content via
@@ -262,12 +325,20 @@ export component SpellweavingPanel inherits VerticalLayout {
                     width: recbar.preferred-width;
                     height: 28px;
                     border-radius: Theme.radius-sm;
-                    background: State.capturing-gesture ? Theme.accent-glow : (rta.has-hover ? Theme.well : Theme.bg-2);
-                    border-width: Theme.hair;
-                    border-color: State.capturing-gesture ? Theme.accent-line : (rta.has-hover ? Theme.text-faint : Theme.line);
+                    // rich mode (Shift held, or capturing to file) recolours the pill amber — the live
+                    // signal that this press does something DIFFERENT than teaching a glyph.
+                    background: root.rich-live ? root.rich-col.with-alpha(0.16)
+                        : root.rich-armed ? root.rich-col.with-alpha(0.10)
+                        : State.capturing-gesture ? Theme.accent-glow
+                        : (rta.has-hover ? Theme.well : Theme.bg-2);
+                    border-width: root.rich-any ? 1px : Theme.hair;
+                    border-color: root.rich-any ? root.rich-col
+                        : State.capturing-gesture ? Theme.accent-line
+                        : (rta.has-hover ? Theme.text-faint : Theme.line);
                     animate background, border-color { duration: Theme.quick; }
                     rta := TouchArea {
-                        enabled: !State.capturing-gesture;
+                        // ALWAYS clickable — a second press toggles recording OFF (record_gesture
+                        // cancels + clears), so a stuck/wedged capture can always be dismissed here.
                         mouse-cursor: MouseCursor.pointer;
                         clicked => { State.record-gesture(); }
                     }
@@ -277,15 +348,17 @@ export component SpellweavingPanel inherits VerticalLayout {
                             alignment: center;
                             Rectangle {
                                 width: 8px; height: 8px; border-radius: 4px;
-                                background: State.capturing-gesture ? Theme.accent : transparent;
+                                background: root.rich-live ? root.rich-col : (State.capturing-gesture ? Theme.accent : transparent);
                                 border-width: 1.5px;
-                                border-color: State.capturing-gesture ? Theme.accent : Theme.text-dim;
+                                border-color: root.rich-any ? root.rich-col : (State.capturing-gesture ? Theme.accent : Theme.text-dim);
                                 animate background, border-color { duration: Theme.quick; }
                             }
                         }
                         Text {
-                            text: State.capturing-gesture ? "recording" : "record";
-                            color: State.capturing-gesture ? Theme.accent : Theme.text-mid;
+                            text: root.rich-live ? "rec → file"
+                                : root.rich-armed ? "rich → file"
+                                : State.capturing-gesture ? "recording" : "record";
+                            color: root.rich-any ? root.rich-col : (State.capturing-gesture ? Theme.accent : Theme.text-mid);
                             font-family: Theme.mono; font-size: Theme.fs-small; font-weight: 700;
                             letter-spacing: 0.8px;
                             vertical-alignment: center;
@@ -294,7 +367,21 @@ export component SpellweavingPanel inherits VerticalLayout {
                 }
             }
             HorizontalLayout {
-                Mono { text: State.gesture-status; }
+                // a rich-SAVE line becomes a click-to-reveal link (amber like the mode, brightens on
+                // hover) that opens the strokes folder; every other status stays plain text.
+                if State.stroke-saved : Rectangle {
+                    width: savelink.preferred-width;
+                    height: savelink.preferred-height;
+                    savelink := Mono {
+                        text: State.gesture-status;
+                        color: savearea.has-hover ? Theme.accent : root.rich-col;
+                    }
+                    savearea := TouchArea {
+                        mouse-cursor: MouseCursor.pointer;
+                        clicked => { State.reveal-strokes(); }
+                    }
+                }
+                if !State.stroke-saved : Mono { text: State.gesture-status; }
                 Rectangle {}
                 Mono { text: State.glyphs.length + " glyph" + (State.glyphs.length == 1 ? "" : "s"); }
             }
@@ -410,7 +497,7 @@ export component SpellweavingPanel inherits VerticalLayout {
                     height: 56px;
                     VerticalLayout {
                         alignment: center;
-                        Mono { text: "no glyphs recorded yet — press Record glyph"; color: Theme.text-faint; horizontal-alignment: center; }
+                        Mono { text: "no glyphs recorded yet · press Record glyph"; color: Theme.text-faint; horizontal-alignment: center; }
                     }
                 }
             }
@@ -463,7 +550,17 @@ export component SpellweavingPanel inherits VerticalLayout {
 
         // ── radial wheel ──────────────────────────────────────────────────
         VerticalLayout {
-            width: 380px;
+            // PIN the width with min==max (NOT a soft `width: 380px`, which the layout overrides). When a
+            // BOUND glyph's inline editor shows its ActionPicker param-suggestion Flickable (the open-window
+            // chips, controls.slint ~822), that Flickable's preferred-width is content-driven + non-
+            // deterministic → it perturbed the stretch:1 GLYPH column's preferred, the HorizontalLayout
+            // re-distributed, and THIS column (hence the wheel, r = min(width,…)) resized/moved. An unbound
+            // glyph has no chips → no Flickable → no perturbation, which is why only BOUND glyphs did it.
+            // min==max is the only thing content physically can't override (the same fix the DEVICE inspector
+            // uses for its fixed-footprint pane — see slint-layout-gotchas).
+            horizontal-stretch: 0;
+            min-width: 380px;
+            max-width: 380px;
             spacing: 12px;
             alignment: start;   // pack from the top so the pinned wheel stays put; the wedge-detail Card
                                 // and status line grow into the slack BELOW, never displacing the wheel

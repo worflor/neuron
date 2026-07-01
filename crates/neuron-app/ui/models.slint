@@ -104,20 +104,25 @@ export struct EffectParam {
     bval: bool,
 }
 
-// One layer of the lighting COMPOSITOR — an effect generator bound to its own colour, motion,
-// region and blend. The stack composites bottom-to-top into the frame the device runs. The region
-// (which cells it paints) lives Rust-side; `region_count` is its size (0 = the whole device).
-export struct LayerRow {
-    effect: string,      // "static" / "breathing" / "spectrum" / "wave" / "fire"
-    color: string,       // hex RRGGBB
-    col: color,          // parsed, for the swatch
-    speed: float,        // 0.25 .. 4.0 (1 = default rate)
-    direction: int,      // 0 → · 1 ← · 2 ↑ · 3 ↓
-    blend: string,       // "normal" / "add" / "screen"
-    uses_color: bool,    // does this effect read the colour (vs cycling its own hue)?
-    directional: bool,   // does direction matter (wave) ?
-    enabled: bool,
-    region_count: int,   // painted cells; 0 = whole device
+// One colour STOP in the active layer's spectrum palette — the gradient-strip editor's unit (a colour
+// at a 0..1 position). `idx` is its address back into the palette (the setters key on it); a single
+// stop is a solid. When the spectrum is a SEQUENCE these are the ACTIVE frame's stops.
+export struct SpectrumStop {
+    idx: int,            // position in the palette (the address the stop setters use)
+    hex: string,         // RRGGBB
+    col: color,          // parsed fill, for the strip + the picker swatch
+    at: float,           // 0..1 position along the gradient
+}
+
+// One KEYFRAME in the active layer's spectrum SEQUENCE — the timeline track's unit. A frame holds its
+// palette for `hold` seconds after crossfading IN from the previous frame over `fade` seconds (eased).
+// `swatch` is a rendered strip of the frame's palette (the timeline chip). seq length 1 = no sequence.
+export struct SpectrumFrame {
+    idx: int,            // position in the sequence (the address the frame setters use)
+    hold: float,         // dwell seconds
+    fade: float,         // crossfade-in seconds
+    ease: string,        // "linear" | "smooth" | "snap"
+    swatch: image,       // a live preview strip of this frame's palette
 }
 
 // One spellweaving MATERIAL in the gallery — a living preview swatch (rendered Rust-side from the

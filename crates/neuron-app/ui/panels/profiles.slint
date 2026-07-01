@@ -176,7 +176,7 @@ export component ProfilesMenu inherits VerticalLayout {
         }
     }
     Rectangle { height: 6px; }
-    Mono { text: "captures a live read-back — dpi · polling · brightness · lighting · idle"; color: Theme.text-faint; font-size: Theme.fs-small; }
+    Mono { text: "captures a live read-back · dpi · polling · brightness · lighting · idle"; color: Theme.text-faint; font-size: Theme.fs-small; }
 
     Rectangle { height: 16px; }
     Divider {}
@@ -240,7 +240,7 @@ export component ProfilesMenu inherits VerticalLayout {
             }
         }
     }
-    if State.app-rules.length == 0 : Mono { text: "no rules yet — match a focused app to a profile"; color: Theme.text-faint; }
+    if State.app-rules.length == 0 : Mono { text: "no rules yet · match a focused app to a profile"; color: Theme.text-faint; }
     Rectangle { height: 9px; }
     // add a rule: the app substring (or grab the focused app), then the target profile
     HorizontalLayout {

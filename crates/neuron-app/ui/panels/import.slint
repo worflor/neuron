@@ -19,7 +19,7 @@ export component ImportWizard inherits Card {
         // the shared PanelHead — same tick/label metrics as every other panel header
         PanelHead {
             label: "IMPORT FROM SYNAPSE";
-            caption: "one-time migration — plaintext, no crypto, no cloud · ESC closes";
+            caption: "one-time migration · plaintext, no crypto, no cloud · ESC closes";
             VerticalLayout { width: 72px; alignment: center; Button { text: "close"; clicked => { State.import-open = false; } } }
         }
         Divider {}
@@ -52,7 +52,7 @@ export component ImportWizard inherits Card {
 
                 // the guidance lives INSIDE the scroll region so it can never starve the apply bar at
                 // the min window — you act at the top, the detail scrolls with the preview
-                Label { text: "Synapse's in-app Export produces plaintext ZIPs (fake .synapse3 / .ChromaEffects extensions). Neuron reads them directly — settings, bindings, and static lighting migrate losslessly. Encrypted/cloud profiles are intentionally not touched."; }
+                Label { text: "Synapse's in-app Export produces plaintext ZIPs (fake .synapse3 / .ChromaEffects extensions). Neuron reads them directly: settings, bindings, and static lighting migrate losslessly. Encrypted/cloud profiles are intentionally not touched."; }
 
                 // ── SETTINGS — the scalar values as a wrapping readout GRID (one row would overflow
                 // horizontally once there are more than a handful) ──
@@ -132,7 +132,7 @@ export component ImportWizard inherits Card {
         HorizontalLayout {
             spacing: 8px;
             Mono {
-                text: "applies to CONFIG FILES only — nothing touches a device until you apply the profile";
+                text: "applies to CONFIG FILES only · nothing touches a device until you apply the profile";
                 color: Theme.text-faint;
                 vertical-alignment: center;
                 overflow: elide;

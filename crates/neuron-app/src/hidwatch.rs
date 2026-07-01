@@ -21,22 +21,28 @@
 //! (otherwise-silent) battery-read failures.
 
 use neuron::transport::DevicePath;
-use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 const RAZER_VID: u16 = 0x1532;
-/// Trailing debounce for a seating side plate. When a plate seats, its strap contact BOUNCES (the
-/// strap-code flickers, esp. `00`↔`01` for the 2-button) before it settles — so we wait this window
-/// of quiet after the LAST `05 0e` report before committing, so only the SETTLED value cards. ~220ms
-/// is comfortably longer than an observed seat bounce yet short enough to feel instant on a clean swap.
-const PLATE_DEBOUNCE: Duration = Duration::from_millis(220);
-/// Generation counter for the plate debounce: every `05 0e` bumps it; a debounce thread commits only
-/// if it is still the latest (no newer report arrived during its wait). A bounce keeps bumping it, so
-/// every superseded value is discarded and only the final, stable one ever reaches `confirm`.
-static PLATE_GEN: AtomicU64 = AtomicU64::new(0);
+/// Settle window for the device-push BATCHER. Every pushed settings-report (dpi / scroll / side plate)
+/// joins a batch and waits this much quiet before the batch is decided. Two jobs in one window:
+///   • absorbs a side plate's seating BOUNCE (the strap flickers `00`↔`01` before it settles) — the
+///     last value per kind wins, so `confirm` only ever sees the settled code; and
+///   • collects the wake/reconnect burst (the device re-announces dpi+scroll+plate together) so the
+///     burst can be recognized and silenced as a STATE SYNC rather than carded as user actions.
+/// ~220ms is comfortably longer than any observed bounce / wake burst yet short enough that a real
+/// change's card still feels immediate.
+const BATCH_SETTLE: Duration = Duration::from_millis(220);
+/// The "a human physically couldn't" threshold. A person cannot change two DISTINCT states within this
+/// span — DPI and scroll are separate buttons, and a plate swap is a multi-second physical act — but
+/// the firmware emits its whole wake-announce within a few ms. So a batch holding ≥2 DISTINCT kinds
+/// whose FIRST reports land inside this span is unambiguously a device sync, never user input → learn
+/// it silently. Kept well under the ~250ms+ a genuine two-button sequence takes, so it can NEVER
+/// false-trigger on real actions; a lone change (one kind) always cards.
+const BURST_SPAN: Duration = Duration::from_millis(150);
 /// Scroll-stage track length — the canonical source is `intent::SCROLL_STAGE_COUNT` (no magic dupe).
 const SCROLL_STAGE_MAX: u32 = neuron::intent::SCROLL_STAGE_COUNT as u32;
 /// How often the hotplug monitor re-enumerates to catch a dongle replug / hub glitch / sleep-wake.
@@ -189,14 +195,14 @@ fn decode(buf: &[u8], pid: u16) {
         0x02 => {
             let dpi = u16::from_be_bytes([buf[2], buf[3]]) as u32;
             if (100..=30_000).contains(&dpi) {
-                neuron::confirm::observe_dpi(dpi);
+                batch_push(pid, Push::Dpi(dpi));
             }
         }
         // Scroll / sensitivity stage changed: stage index in byte[2], bounded by the real stage count.
         0x3a => {
             let stage = buf[2] as u32;
             if (1..=SCROLL_STAGE_MAX).contains(&stage) {
-                neuron::confirm::observe_scroll(stage, SCROLL_STAGE_MAX);
+                batch_push(pid, Push::Scroll(stage));
             }
         }
         // Power/charge poke — STATELESS. Settle the charge state (poll until it latches) then observe
@@ -216,7 +222,7 @@ fn decode(buf: &[u8], pid: u16) {
         // Push-only — there is NO getter (a full getter sweep + swap-diff confirmed zero change), so
         // THIS report is the detection. Resolve the strap-code to a human label via the device's
         // registry `[side_plates]` map (id 0 = detached, handled in `plate_label`), then hand it to the
-        // de-dup'd core observe — which absorbs the brief mid-seat transient (fire only on real change).
+        // batcher — which absorbs the mid-seat bounce AND folds it into the wake-burst sync detection.
         0x0e => {
             let id = buf[2];
             let label = plate_label(pid, id);
@@ -224,9 +230,9 @@ fn decode(buf: &[u8], pid: u16) {
             if verbose() {
                 eprintln!("[hidwatch] pid={pid:04x}: side plate -> {label} (id={id:#04x}) [raw]");
             }
-            // Only the DEBOUNCED (settled) value reaches `confirm` — the seat bounce is absorbed here,
-            // keeping `confirm` pure (no timing there). See `commit_plate_debounced`.
-            commit_plate_debounced(id, label);
+            // Only the SETTLED value reaches `confirm`, and only if the batch isn't a wake-sync burst —
+            // the bounce + the burst are both absorbed in the batcher, keeping `confirm` pure.
+            batch_push(pid, Push::Plate(id, label));
             // SEAM (next phase): a plate change could also drive a per-plate PROFILE auto-switch.
             // Wire it here, off this same de-dup'd edge, so a swap both cards AND switches in one place.
         }
@@ -249,25 +255,134 @@ fn plate_label(pid: u16, id: u8) -> String {
         .unwrap_or_else(|| format!("plate {id}"))
 }
 
-/// Trailing time-debounce for a seating side plate. Each `05 0e` report bumps the generation and
-/// spawns a short-lived thread that sleeps [`PLATE_DEBOUNCE`] and then commits to `confirm` ONLY if it
-/// is still the latest generation — i.e. no newer report arrived during its wait. A seating bounce
-/// (`00→01→00→01`) fires this several times in quick succession; each spawn supersedes the previous,
-/// so all but the FINAL value find a higher generation and exit without committing. The result: a swap
-/// settles to exactly one `observe_side_plate` call carrying the stable value (`confirm` stays pure —
-/// it only ever sees the settled code, never the flicker). Cheap: a handful of short threads per swap.
-fn commit_plate_debounced(id: u8, label: String) {
-    let my_gen = PLATE_GEN.fetch_add(1, Ordering::Relaxed) + 1;
-    thread::Builder::new()
-        .name("neuron-hidwatch-plate".into())
-        .spawn(move || {
-            thread::sleep(PLATE_DEBOUNCE);
-            if PLATE_GEN.load(Ordering::Relaxed) == my_gen {
-                // settled — no newer 05 0e arrived during the window; this is the value to commit.
-                neuron::confirm::observe_side_plate(id as u32, &label);
+/// One device-pushed settings change, on its way into the batch.
+enum Push {
+    Dpi(u32),
+    Scroll(u32),
+    Plate(u8, String), // raw strap-code + its resolved label
+}
+
+/// The pending batch of device-pushed settings reports inside one device's current settle window. One
+/// slot per kind (so a same-kind bounce / rapid re-press collapses to the LATEST value), each
+/// remembering the FIRST instant that kind appeared — that first-seen time is what the burst test
+/// measures. One of these lives PER DEVICE (keyed by pid) so two armed mice never share a batch.
+struct Batch {
+    dpi: Option<(Instant, u32)>,
+    scroll: Option<(Instant, u32)>,
+    plate: Option<(Instant, u8, String)>,
+}
+impl Batch {
+    const EMPTY: Batch = Batch { dpi: None, scroll: None, plate: None };
+}
+
+/// One device's batch plus its settle generation. Every push for THAT device bumps the generation; a
+/// flush acts only if it still holds the latest (a newer push extends the window). Per-pid, so device
+/// A's burst can't cancel device B's pending flush, and a burst is judged within ONE device's window.
+struct BatchState {
+    batch: Batch,
+    generation: u64,
+}
+
+/// The per-pid pending batches, lazily created (a `HashMap` can't initialize a `const` static).
+fn batches() -> &'static Mutex<HashMap<u16, BatchState>> {
+    static B: OnceLock<Mutex<HashMap<u16, BatchState>>> = OnceLock::new();
+    B.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Add a pushed report to `pid`'s batch and (re)arm its settle window. Same-kind repeats overwrite the
+/// VALUE but keep the FIRST-seen instant — so a seating bounce or a rapid DPI re-press stays one kind
+/// at one moment, never a fake "burst". Every push bumps THAT device's generation so only its final
+/// flush acts; a sibling device's batch and generation are untouched.
+fn batch_push(pid: u16, ev: Push) {
+    let my_gen = {
+        let mut map = batches().lock().unwrap();
+        let st = map
+            .entry(pid)
+            .or_insert_with(|| BatchState { batch: Batch::EMPTY, generation: 0 });
+        let now = Instant::now();
+        match ev {
+            Push::Dpi(v) => {
+                let t = st.batch.dpi.map(|(t, _)| t).unwrap_or(now);
+                st.batch.dpi = Some((t, v));
             }
+            Push::Scroll(v) => {
+                let t = st.batch.scroll.map(|(t, _)| t).unwrap_or(now);
+                st.batch.scroll = Some((t, v));
+            }
+            Push::Plate(id, label) => {
+                let t = st.batch.plate.as_ref().map(|(t, _, _)| *t).unwrap_or(now);
+                st.batch.plate = Some((t, id, label));
+            }
+        }
+        st.generation += 1;
+        st.generation
+    };
+    thread::Builder::new()
+        .name("neuron-hidwatch-batch".into())
+        .spawn(move || {
+            thread::sleep(BATCH_SETTLE);
+            // Take + decide under the lock so a report landing in the gap can't be lost: if a newer
+            // push for THIS pid bumped its generation, a later flush owns the batch — this one bows out.
+            let batch = {
+                let mut map = batches().lock().unwrap();
+                let Some(st) = map.get_mut(&pid) else {
+                    return;
+                };
+                if st.generation != my_gen {
+                    return;
+                }
+                std::mem::replace(&mut st.batch, Batch::EMPTY)
+            };
+            flush_batch(pid, batch);
         })
         .ok();
+}
+
+/// Decide a settled batch. The SYNC TEST: ≥2 distinct card-worthy kinds whose first reports landed
+/// within [`BURST_SPAN`] is a device state-announce (a human can't touch two distinct settings that
+/// fast) → learn every value SILENTLY. Otherwise each present kind is a real user action → `observe_*`
+/// it (which still de-dups and cards on a genuine change). A DETACHED plate (id 0) is the "no plate"
+/// beat of a swap, never a state worth announcing, so it never counts toward the burst.
+fn flush_batch(pid: u16, b: Batch) {
+    let mut firsts: Vec<Instant> = Vec::new();
+    if let Some((t, _)) = b.dpi {
+        firsts.push(t);
+    }
+    if let Some((t, _)) = b.scroll {
+        firsts.push(t);
+    }
+    if let Some((t, id, _)) = &b.plate {
+        if *id != 0 {
+            firsts.push(*t);
+        }
+    }
+    let is_sync = firsts.len() >= 2 && {
+        let lo = *firsts.iter().min().unwrap();
+        let hi = *firsts.iter().max().unwrap();
+        hi.duration_since(lo) <= BURST_SPAN
+    };
+
+    if is_sync {
+        if let Some((_, v)) = b.dpi {
+            neuron::confirm::prime_dpi(pid, v);
+        }
+        if let Some((_, v)) = b.scroll {
+            neuron::confirm::prime_scroll(pid, v);
+        }
+        if let Some((_, id, label)) = b.plate {
+            neuron::confirm::prime_side_plate(pid, id as u32, &label);
+        }
+    } else {
+        if let Some((_, v)) = b.dpi {
+            neuron::confirm::observe_dpi(pid, v);
+        }
+        if let Some((_, v)) = b.scroll {
+            neuron::confirm::observe_scroll(pid, v, SCROLL_STAGE_MAX);
+        }
+        if let Some((_, id, label)) = b.plate {
+            neuron::confirm::observe_side_plate(pid, id as u32, &label);
+        }
+    }
 }
 
 /// Open `pid`'s control interface (registry cached) and read battery % + charging. On a charge-read
@@ -327,9 +442,34 @@ mod tests {
     // The Naga V2 Pro's dongle PID — the device that ships the `[side_plates]` map.
     const NAGA_PID: u16 = 0x00A8;
 
-    // The plate debounce generation + `confirm`'s last-plate are process-global; serialize the tests
-    // that drive a real commit so their generations/threads can't interleave and supersede each other.
-    static PLATE_TEST_LOCK: Mutex<()> = Mutex::new(());
+    // The per-pid batches and `confirm`'s per-pid baselines for NAGA_PID, plus the global sink, are
+    // shared across these tests; serialize the tests that drive `decode` (and read the sink) so their
+    // settle threads can't interleave across tests.
+    static BATCH_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    // Drive one device-pushed report through the real decode path. `b1` is the report kind byte.
+    fn feed(b1: u8, b2: u8, b3: u8) {
+        let mut buf = [0u8; 16];
+        buf[0] = 0x05;
+        buf[1] = b1;
+        buf[2] = b2;
+        buf[3] = b3;
+        decode(&buf, NAGA_PID);
+    }
+    fn dpi_report(dpi: u16) {
+        let [hi, lo] = dpi.to_be_bytes();
+        feed(0x02, hi, lo);
+    }
+    fn scroll_report(stage: u8) {
+        feed(0x3a, stage, 0);
+    }
+    fn plate_report(id: u8) {
+        feed(0x0e, id, 0);
+    }
+    // Long enough for the settle thread to fire and finish before we assert.
+    fn settle() {
+        thread::sleep(BATCH_SETTLE + Duration::from_millis(150));
+    }
 
     #[test]
     fn plate_label_resolves_strap_codes_via_registry() {
@@ -343,32 +483,65 @@ mod tests {
     }
 
     #[test]
-    fn decode_routes_05_0e_report_to_plate_observe() {
-        // a 16-byte side-plate report drives the push-only plate detection: 05 0e <strap_id>. The
-        // commit is TRAILING-DEBOUNCED (a seating plate bounces), so it lands AFTER the quiet window,
-        // not synchronously — wait past it, then assert the settled label reached `confirm`.
-        let _g = PLATE_TEST_LOCK.lock().unwrap();
-        let mut buf = [0u8; 16];
-        buf[0] = 0x05;
-        buf[1] = 0x0e;
-        buf[2] = 0x03;
-        decode(&buf, NAGA_PID);
-        thread::sleep(PLATE_DEBOUNCE + Duration::from_millis(120));
-        assert_eq!(neuron::confirm::last_plate().as_deref(), Some("12-button"));
+    fn lone_plate_report_settles_and_reaches_confirm() {
+        // a single 05 0e <strap_id> is ONE kind alone — never a sync burst — so after the settle
+        // window it reaches `confirm` and updates the readout.
+        let _g = BATCH_TEST_LOCK.lock().unwrap();
+        plate_report(0x03); // 12-button
+        settle();
+        assert_eq!(neuron::confirm::last_plate(NAGA_PID).as_deref(), Some("12-button"));
     }
 
     #[test]
-    fn plate_debounce_commits_only_the_settled_value() {
-        // simulate a seating bounce: the 2-button strap flickers detached↔seated before it settles on
-        // seated. Each event supersedes the prior generation, so only the FINAL stable value commits —
-        // the intermediate flicker never reaches `confirm`.
-        let _g = PLATE_TEST_LOCK.lock().unwrap();
-        commit_plate_debounced(0, "detached".into());
-        commit_plate_debounced(1, "2-button".into());
-        commit_plate_debounced(0, "detached".into());
-        commit_plate_debounced(1, "2-button".into()); // settles here
-        thread::sleep(PLATE_DEBOUNCE + Duration::from_millis(120));
-        assert_eq!(neuron::confirm::last_plate().as_deref(), Some("2-button"));
+    fn settle_window_keeps_only_the_last_plate_value() {
+        // a seating bounce: the strap flickers detached↔seated before it settles. Same-kind reports
+        // overwrite the pending value (keeping first-seen), so only the FINAL stable code reaches
+        // `confirm` — the flicker never does, and one kind alone is never mistaken for a sync.
+        let _g = BATCH_TEST_LOCK.lock().unwrap();
+        plate_report(0); // detached
+        plate_report(1); // 2-button
+        plate_report(0); // detached
+        plate_report(1); // settles here
+        settle();
+        assert_eq!(neuron::confirm::last_plate(NAGA_PID).as_deref(), Some("2-button"));
+    }
+
+    #[test]
+    fn wake_burst_is_primed_silently_never_carded() {
+        // THE FIX: a wake/reconnect re-announces dpi + scroll + plate in one tight burst (these decode
+        // calls land within microseconds — far inside BURST_SPAN). That's a STATE SYNC: zero cards,
+        // but the state is still LEARNED (the readout reflects the synced plate).
+        let _g = BATCH_TEST_LOCK.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        neuron::confirm::set_sink(Some(tx));
+        dpi_report(1600);
+        scroll_report(3);
+        plate_report(4); // 6-button
+        settle();
+        neuron::confirm::set_sink(None);
+        let cards: Vec<_> = rx.try_iter().collect();
+        assert!(cards.is_empty(), "a wake-burst must prime silently, got {} card(s)", cards.len());
+        assert_eq!(neuron::confirm::last_plate(NAGA_PID).as_deref(), Some("6-button"));
+    }
+
+    #[test]
+    fn a_lone_change_outside_any_burst_still_cards() {
+        // the other half of foolproof: a single change is a USER action and must still card. Establish
+        // a known baseline first (plate 1), then a DIFFERENT lone plate must produce a card — proving
+        // the burst guard never over-suppresses genuine input.
+        let _g = BATCH_TEST_LOCK.lock().unwrap();
+        plate_report(1); // 2-button — set the baseline (no sink yet)
+        settle();
+        let (tx, rx) = std::sync::mpsc::channel();
+        neuron::confirm::set_sink(Some(tx));
+        plate_report(4); // 6-button, ALONE → a real swap → must card
+        settle();
+        neuron::confirm::set_sink(None);
+        let cards: Vec<_> = rx.try_iter().collect();
+        assert!(
+            cards.iter().any(|c| c.kind == neuron::confirm::Kind::SidePlate),
+            "a lone plate swap must still card; got {cards:?}"
+        );
     }
 
     #[test]

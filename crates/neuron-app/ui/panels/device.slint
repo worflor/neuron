@@ -501,7 +501,7 @@ export component DevicePanel inherits VerticalLayout {
             // the controls act on a SELECTED channel — with none, don't present live-looking controls
             if State.devices.length == 0 : VerticalLayout {
                 padding-top: 24px;
-                Mono { text: "no channel — plug in a Razer device to tune it"; color: Theme.text-faint; }
+                Mono { text: "no channel · plug in a Razer device to tune it"; color: Theme.text-faint; }
             }
             // AUDIO endpoint (mic / output) selected — its own volume + mute card (acts on THIS
             // endpoint, not the system default).
@@ -516,7 +516,7 @@ export component DevicePanel inherits VerticalLayout {
                             Rectangle {}
                             Mono { text: State.selected-device-name; color: Theme.text-faint; overflow: elide; }
                         }
-                        Mono { text: "the selected endpoint's live level (Core Audio) — moves THIS device, not the system default"; color: Theme.text-faint; wrap: word-wrap; }
+                        Mono { text: "the selected endpoint's live level (Core Audio) · moves THIS device, not the system default"; color: Theme.text-faint; wrap: word-wrap; }
                         Slider {
                             caption: "VOLUME";
                             minimum: 0; maximum: 100; value: State.device-volume; step: 2;
@@ -746,7 +746,7 @@ export component DevicePanel inherits VerticalLayout {
                             }
                         }
                         // wrap (was clipped at "…reversible (lif") — a chord guard lifts on profile change.
-                        Mono { text: "lit = swallowed while a gaming profile is active. reversible — lifts when the profile changes."; color: Theme.text-faint; wrap: word-wrap; }
+                        Mono { text: "lit = swallowed while a gaming profile is active. reversible, it lifts when the profile changes."; color: Theme.text-faint; wrap: word-wrap; }
                     }
                 }
 
@@ -787,7 +787,7 @@ export component DevicePanel inherits VerticalLayout {
                             Rectangle {}
                             Pill { text: "verify-gated"; tint: Theme.warn; }
                         }
-                        GateNote { text: "real device paths, ready but held until the command is confirmed on your hardware — so nothing fires blind."; }
+                        GateNote { text: "real device paths, ready but held until the command is confirmed on your hardware, so nothing fires blind."; }
                         if State.perf-status != "" : Mono { text: State.perf-status; color: Theme.text-mid; wrap: word-wrap; }
 
                         // WHEEL MODE — HyperScroll stages (class 0x0B — hardware-verify pending)
@@ -887,10 +887,10 @@ export component DevicePanel inherits VerticalLayout {
                                 gated: State.sel-can-hyperpoll;
                             }
                             if !State.sel-can-hyperpoll : GateNote {
-                                text: "this mouse polls up to 1000 Hz — set it in REPORT RATE above. 2000–8000 Hz HyperPolling needs Razer's separate HyperPolling Wireless Dongle.";
+                                text: "this mouse polls up to 1000 Hz · set it in REPORT RATE above. 2000–8000 Hz HyperPolling needs Razer's separate HyperPolling Wireless Dongle.";
                             }
                             if State.sel-can-hyperpoll : GateNote {
-                                text: "the EXTENDED hi-res rate (>1000 Hz) for HyperPolling hardware — distinct from the live REPORT RATE up top.";
+                                text: "the EXTENDED hi-res rate (>1000 Hz) for HyperPolling hardware, distinct from the live REPORT RATE up top.";
                             }
                             if State.sel-can-hyperpoll : ContactRow {
                                 options: [1000, 2000, 4000, 8000];
@@ -985,7 +985,7 @@ export component DevicePanel inherits VerticalLayout {
                                 Rectangle {}
                                 Pill { text: "fixed in firmware"; tint: Theme.text-faint; }
                             }
-                            GateNote { text: "lift-off distance (even or split) is a real, verify-gated write; debounce is fixed in the mouse's firmware — there's no setting to expose."; }
+                            GateNote { text: "lift-off distance (even or split) is a real, verify-gated write; debounce is fixed in the mouse's firmware, so there's no setting to expose."; }
                         }
                     }
                 }

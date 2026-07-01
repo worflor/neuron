@@ -292,6 +292,10 @@ fn run_worker(weak: slint::Weak<AppWindow>, stop: Arc<AtomicBool>, live_rx: Rece
     // momentary action the stateless dispatch can't express — the edge loop owns its press/release.
     let momentary: RefCell<std::collections::HashMap<Trigger, (Option<String>, bool)>> =
         RefCell::new(std::collections::HashMap::new());
+    // INPUT→KEY REMAP held state: trigger -> the output VKs currently held down. A key remap holds
+    // its output key while the control is held (so a macro key / remapped button acts like the real
+    // key — hold = hold, the OS auto-repeats), which the stateless tap-only action can't express.
+    let held_keys: KeyHoldMap = RefCell::new(std::collections::HashMap::new());
     let turbos = RefCell::new(TurboRuntime::new());
 
     // ── THE IMMORTAL LISTENER ── this worker is the organ that fires every cast and remap; if it
@@ -320,15 +324,20 @@ fn run_worker(weak: slint::Weak<AppWindow>, stop: Arc<AtomicBool>, live_rx: Rece
                                 // Hold any HyperShift layer THIS input activates (tracked per-input so its
                                 // release drops only its own layer), then dispatch the input's action.
                                 rt.borrow_mut().hold_for_input(&trigger);
-                                if let Some(outcome) = fire_trigger(
-                                    &mut devices.borrow_mut(),
-                                    &mut rt.borrow_mut(),
-                                    &mut exec.borrow_mut(),
-                                    &trigger,
-                                    &status,
-                                    &weak,
-                                ) {
-                                    turbos.borrow_mut().start(outcome.turbo);
+                                // An input→key REMAP holds the output key while held (edge-driven, like
+                                // the mic) so it behaves like the real key; every OTHER action fires once.
+                                // Skip fire_trigger when we held a key — firing would ALSO tap it.
+                                if !key_remap_press(&rt, &held_keys, &trigger, &status, &weak) {
+                                    if let Some(outcome) = fire_trigger(
+                                        &mut devices.borrow_mut(),
+                                        &mut rt.borrow_mut(),
+                                        &mut exec.borrow_mut(),
+                                        &trigger,
+                                        &status,
+                                        &weak,
+                                    ) {
+                                        turbos.borrow_mut().start(outcome.turbo);
+                                    }
                                 }
                                 // momentary mic: capture the rest state + flip while held.
                                 momentary_press(&rt, &momentary, &trigger);
@@ -336,6 +345,7 @@ fn run_worker(weak: slint::Weak<AppWindow>, stop: Arc<AtomicBool>, live_rx: Rece
                             InputEdge::Up(trigger) => {
                                 rt.borrow_mut().release_for_input(&trigger);
                                 turbos.borrow_mut().release(&trigger);
+                                key_remap_release(&held_keys, &trigger); // release the held output key
                                 momentary_release(&momentary, &trigger); // restore the mic on release
                             }
                         }
@@ -384,6 +394,7 @@ fn run_worker(weak: slint::Weak<AppWindow>, stop: Arc<AtomicBool>, live_rx: Rece
                     if reload_pending {
                         reload_pending = false;
                         momentary_release_all(&momentary); // a held mic can't survive a config swap
+                        key_remap_release_all(&held_keys); // nor a held remapped key
                         *rt.borrow_mut() = controls::build_runtime();
                         exec.borrow_mut().clear();
                         devices.borrow_mut().clear();
@@ -515,12 +526,14 @@ fn run_worker(weak: slint::Weak<AppWindow>, stop: Arc<AtomicBool>, live_rx: Rece
             0,
         );
         momentary_release_all(&momentary); // never strand a held mic across a respawn
+        key_remap_release_all(&held_keys); // nor a held remapped key
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
 
-    // teardown: restore any mic a momentary action was holding (the loop ended mid-hold), the
-    // hook drops here (uninstalls), input disarms in LiveRuntime::stop.
+    // teardown: restore any mic a momentary action was holding (the loop ended mid-hold) + release
+    // any remapped key still held, the hook drops here (uninstalls), input disarms in LiveRuntime::stop.
     momentary_release_all(&momentary);
+    key_remap_release_all(&held_keys);
     drop(hook);
 }
 
@@ -574,6 +587,58 @@ fn momentary_release_all(held: &MomentaryMap) {
         if let Some(ctl) = open_mic(&device) {
             ctl.set_mute(restore);
         }
+    }
+}
+
+// ── INPUT→KEY REMAP: hold the output key while the control is held (edge-driven, like the mic) ──
+type KeyHoldMap = std::cell::RefCell<std::collections::HashMap<Trigger, Vec<u16>>>;
+
+/// A trigger's DOWN edge: if it binds a plain key output, press-and-HOLD that key and remember the
+/// VKs (so the UP edge releases them). Returns `true` if it held a key — the caller then SKIPS the
+/// one-shot dispatch (firing would tap the same key). Idempotent on a repeat down. Mirrors
+/// [`momentary_press`]; the held output key behaves like the real key (the OS supplies auto-repeat).
+fn key_remap_press(
+    rt: &std::cell::RefCell<neuron::controls::Runtime>,
+    held: &KeyHoldMap,
+    trigger: &Trigger,
+    status: &Arc<Mutex<LiveStatus>>,
+    weak: &slint::Weak<AppWindow>,
+) -> bool {
+    if held.borrow().contains_key(trigger) {
+        return true; // already holding (a repeat down) — still a key remap, don't fire
+    }
+    let Some(key) = rt.borrow().key_remap_for(trigger) else {
+        return false; // not a key remap — let the caller dispatch normally
+    };
+    let vks = neuron::action::press_and_hold(&key);
+    if vks.is_empty() {
+        return false; // unknown key — fall back to normal dispatch (it reports the error)
+    }
+    held.borrow_mut().insert(trigger.clone(), vks);
+    rt.borrow_mut().note_fired(trigger); // a real trigger fired: spend one-shot layers, etc.
+    {
+        let mut s = status.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        s.last_trigger = trigger.describe();
+        s.last_action = format!("hold [{key}]");
+        s.fired += 1;
+        s.active_profile = neuron::profile::active();
+    }
+    post_status(weak, status);
+    true
+}
+
+/// A trigger's UP edge: release the output key it was holding.
+fn key_remap_release(held: &KeyHoldMap, trigger: &Trigger) {
+    if let Some(vks) = held.borrow_mut().remove(trigger) {
+        neuron::action::release_keys(&vks);
+    }
+}
+
+/// Release EVERY held output key and clear the map — the safety net for a config swap / daemon stop,
+/// so a remap can never strand a key down.
+fn key_remap_release_all(held: &KeyHoldMap) {
+    for (_, vks) in held.borrow_mut().drain() {
+        neuron::action::release_keys(&vks);
     }
 }
 

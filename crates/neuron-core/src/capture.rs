@@ -131,6 +131,32 @@ pub fn key_down(_vk: i32) -> bool {
     false
 }
 
+/// Held-state bitmask for the Razer macro keys — bit `i` = the i-th macro key (M(i+1)) currently held.
+/// The macro keys arrive on Razer's Driver-Mode `0x04` HID report (decoded by `neuron-app::macrokeys`),
+/// NOT as Windows virtual-keys, so `GetAsyncKeyState`/[`key_down`] never sees them. This mask is the
+/// macro-key analogue of the OS async key state: SHARED, STATELESS held-state. Each lighting consumer
+/// (the device animate loop AND the GUI hero preview run the same effect at once) keeps its OWN `prev[]`
+/// and detects its own down-edges off this shared state, so neither drains the other — exactly how the
+/// VK path already works (a consume-once queue would let one consumer steal the press from the other).
+static MACRO_HELD: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Store the live macro-key held mask — called by the macro-key reader on EVERY `0x04` report,
+/// including an all-released report (mask `0`), so RELEASES propagate and the next press re-detects.
+pub fn set_macro_held(mask: u8) {
+    MACRO_HELD.store(mask, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the `i`-th macro key (M(i+1)) is currently held — the macro-key analogue of [`key_down`].
+/// Returns `false` (no read) while a [`suppress_key_reads`] guard is active on this thread, the SAME
+/// suppression `key_down` honours, so the lighting tile-grid thumbnails skip the macro scan too. `i ≥ 8`
+/// is always `false` (the mask is 8 bits). Pure read of shared state — safe regardless of the input gate.
+pub fn macro_key_down(i: usize) -> bool {
+    if SUPPRESS_KEY_READS.with(|s| s.get()) {
+        return false;
+    }
+    i < 8 && (MACRO_HELD.load(std::sync::atomic::Ordering::Relaxed) & (1 << i)) != 0
+}
+
 /// Snapshot which of all 256 virtual-keys are currently down — the *baseline* a capture starts
 /// from, so a key already held when capture begins is ignored (we only detect a fresh press).
 #[cfg(windows)]

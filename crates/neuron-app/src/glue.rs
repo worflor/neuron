@@ -18,11 +18,11 @@ use crate::migrate;
 use crate::runtime::AppRuntime;
 use crate::ui::{
     AppRuleRow, AppWindow, BeaconMacro, DeviceRow, DiagRow, EffectParam, EffectRow, EffectTile,
-    GlyphChip, ImportLine, KnobRow, LayerRow, MacroBlock, MacroCard, MaterialCard, OrganRow,
-    PocketCard, ProfileRow, RadialSector, RhythmBindRow, RuleRow, State, Theme,
+    GlyphChip, ImportLine, KnobRow, MacroBlock, MacroCard, MaterialCard, OrganRow,
+    PocketCard, ProfileRow, RadialSector, RhythmBindRow, RuleRow, SpectrumFrame, SpectrumStop,
+    State, Theme,
 };
 use neuron::macros::{value_to_source, MacroNode, Value};
-use neuron::effects::FrameGen;
 use neuron::import::Imported;
 use neuron::lighting::Rgb;
 use slint::{
@@ -131,12 +131,15 @@ const IDLE_MAX_SECS: u32 = u16::MAX as u32;
 pub struct Shared {
     pub rt: AppRuntime,
     pub pending_import: Option<Imported>,
-    /// The lighting COMPOSITOR stack — the Rust-side source of truth (regions live here). The Slint
-    /// `light-layers` model is a display projection of this. `layers_rev` bumps on any change so the
-    /// live preview rebuilds its cached `Compositor` (stateful effects like fire keep their state
-    /// across ticks otherwise).
-    pub light_layers: Vec<neuron::effects::LayerDef>,
+    /// The lighting COMPOSITOR stack — the Rust-side source of truth (regions live here). Each layer is
+    /// a PATTERN (shape) × SPECTRUM (colour). The unified page + the spectrum editor are projections of
+    /// this. `layers_rev` bumps on any change so the live preview rebuilds its cached `Compositor`
+    /// (stateful patterns like fire keep their state across ticks otherwise).
+    pub light_layers: Vec<neuron::pattern::LayerDef>,
     pub selected_layer: usize,
+    /// Which FRAME of the selected layer's spectrum the editor is shaping (the timeline scrubber). 0
+    /// for the common single-frame (non-sequenced) case; clamped to the active spectrum's length.
+    pub active_frame: usize,
     pub layers_rev: u64,
     /// DATA MODE — when set, the lighting surface paints a cross-device DATA readout (the vitals
     /// dashboard via `render_vitals`) instead of the effect stack. It's a first-class TILE pick like
@@ -925,6 +928,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
         // honest "Neuron isn't driving this device yet" until the user builds a composite.
         light_layers: Vec::new(),
         selected_layer: 0,
+        active_frame: 0,
         layers_rev: 0,
         light_data: None,
         // the macro constructor starts empty; the canvas's root +add invites the first step, or a
@@ -1003,6 +1007,12 @@ pub fn install(app: &AppWindow) -> SharedRt {
         let sh = sh.clone();
         app.global::<State>().on_select_device(move |idx| {
             if let Some(app) = w.upgrade() {
+                // close any open inline rule editor: its row index is meaningful only against the
+                // bindings list as it was, and switching the selected device is a context change — an
+                // editor left open could otherwise commit against a wrong/missing row. (Done in the
+                // user-initiated callback, NOT select_device_at, so a background device-list refresh
+                // never yanks the editor shut.)
+                app.global::<State>().set_editing_rule(-1);
                 // ONE selection path: set the kind (which gates the panel) + seed the per-kind
                 // controls. HID points the runtime at the pid; mic/output loads its volume + mute.
                 select_device_at(&app, &sh, idx);
@@ -1268,9 +1278,10 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 let col = brush(&app);
                 let (msg, ok) = {
                     let mut s = sh.borrow_mut();
-                    // kill any running generator first — a 30fps repaint would erase this write
-                    // within a frame and the click would look dead.
-                    s.rt.stop_animation();
+                    // kill THIS board's running generator first — a 30fps repaint would erase this
+                    // write within a frame and the click would look dead. (Other boards are untouched.)
+                    let sel = s.rt.selected_pid;
+                    s.rt.stop_animation(sel);
                     s.rt.persist = st.get_persist_to_onboard();
                     let name = s.rt.effects().get(idx as usize).map(|e| e.0.clone());
                     match name {
@@ -1294,65 +1305,10 @@ pub fn install(app: &AppWindow) -> SharedRt {
     bind(app, &shared, |app, sh| {
         let w = app.as_weak();
         let sh = sh.clone();
-        app.global::<State>().on_animate_effect(move |idx| {
-            if let Some(app) = w.upgrade() {
-                let st = app.global::<State>();
-                let col = brush(&app);
-                let back = app.as_weak();
-                let msg = {
-                    let mut s = sh.borrow_mut();
-                    let pid = s.rt.selected_pid;
-                    let name = s.rt.effects().get(idx as usize).map(|e| e.0.clone());
-                    match name {
-                        Some(n) => s.rt.start_animation(&n, col, pid, move |reason, token| {
-                            // the worker exited (clean stop, device gone, error) — post the truth
-                            // back so the transport never shows a live state for a dead thread.
-                            let _ = slint::invoke_from_event_loop(move || {
-                                if let Some(app) = back.upgrade() {
-                                    with_shared(|sh| {
-                                        // a NEWER animation owns the UI state; this exit is stale.
-                                        if !std::sync::Arc::ptr_eq(
-                                            &token,
-                                            &sh.borrow().rt.anim_stop,
-                                        ) {
-                                            return;
-                                        }
-                                        if !sh.borrow().rt.animating {
-                                            return; // user already stopped it; status said so
-                                        }
-                                        sh.borrow_mut().rt.animating = false;
-                                        let st = app.global::<State>();
-                                        st.set_animating(false);
-                                        st.set_applied_effect(-1);
-                                        st.set_status_line(
-                                            match reason {
-                                                Some(r) => format!("animation ended: {r}"),
-                                                None => "animation finished".into(),
-                                            }
-                                            .into(),
-                                        );
-                                    });
-                                }
-                            });
-                        }),
-                        None => "no effect".into(),
-                    }
-                };
-                let animating = sh.borrow().rt.animating;
-                st.set_animating(animating);
-                if animating {
-                    st.set_applied_effect(idx);
-                }
-                st.set_status_line(msg.into());
-            }
-        });
-    });
-    bind(app, &shared, |app, sh| {
-        let w = app.as_weak();
-        let sh = sh.clone();
         app.global::<State>().on_stop_animation(move || {
             if let Some(app) = w.upgrade() {
-                sh.borrow_mut().rt.stop_animation();
+                let pid = sh.borrow().rt.selected_pid;
+                sh.borrow_mut().rt.stop_animation(pid);
                 let st = app.global::<State>();
                 st.set_animating(false);
                 st.set_applied_effect(-1);
@@ -1370,7 +1326,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
         // across ticks — and switching to a same-stack different-dims device rebuilds the generators
         // (a stale-dim generator emits the wrong frame length and the layer goes dark via the
         // `Compositor::frame` length-skip). The cache key is `(rev, rows, cols)`.
-        let cache: Rc<RefCell<Option<(u64, i32, i32, neuron::effects::Compositor)>>> =
+        let cache: Rc<RefCell<Option<(u64, i32, i32, neuron::pattern::Compositor)>>> =
             Rc::new(RefCell::new(None));
         app.global::<State>().on_preview_tick(move || {
             if let Some(app) = w.upgrade() {
@@ -1424,10 +1380,10 @@ pub fn install(app: &AppWindow) -> SharedRt {
                     .map(|(r, cr, cc, _)| *r != rev || *cr != rows || *cc != cols)
                     .unwrap_or(true);
                 if stale {
-                    *c = Some((rev, rows, cols, neuron::effects::Compositor::from_defs(&defs)));
+                    *c = Some((rev, rows, cols, neuron::pattern::Compositor::from_defs(&defs)));
                 }
                 let (_, _, _, comp) = c.as_mut().unwrap();
-                let frame = comp.frame(rows as u8, cols as u8, t, Rgb::BLACK);
+                let frame = comp.render(rows as u8, cols as u8, t);
                 let px: Vec<slint::Color> = frame
                     .iter()
                     .map(|p| slint::Color::from_rgb_u8(p.r, p.g, p.b))
@@ -1492,8 +1448,9 @@ pub fn install(app: &AppWindow) -> SharedRt {
         let sh = sh.clone();
         app.global::<State>().on_push_frame(move || {
             if let Some(app) = w.upgrade() {
-                // stop the generator BEFORE the write so it can't repaint over the user's frame.
-                sh.borrow_mut().rt.stop_animation();
+                // stop THIS board's generator BEFORE the write so it can't repaint over the frame.
+                let pid = sh.borrow().rt.selected_pid;
+                sh.borrow_mut().rt.stop_animation(pid);
                 let st = app.global::<State>();
                 st.set_animating(false);
                 let model = st.get_grid_px();
@@ -1510,239 +1467,9 @@ pub fn install(app: &AppWindow) -> SharedRt {
         });
     });
 
-    // ── Lighting COMPOSITOR — the layer stack (Rust holds the truth incl. regions) ──
+    // ── Lighting COMPOSITOR — apply / stop / fps / import (the layer stack is edited via the unified
+    // surface + the spectrum editor below; there is no separate legacy layer-list editor) ──
     bind(app, &shared, |app, sh| {
-        // add-layer(effect): append a fresh layer of that effect, inheriting the brush colour
-        {
-            let w = app.as_weak();
-            let sh = sh.clone();
-            app.global::<State>().on_add_layer(move |effect| {
-                if let Some(app) = w.upgrade() {
-                    {
-                        let b = app.global::<State>().get_brush_color();
-                        let mut s = sh.borrow_mut();
-                        let mut d = neuron::effects::LayerDef::default();
-                        d.effect = effect.to_string();
-                        // an effect with a built-in default colour (typing heat's warm flame) starts in
-                        // it; everything else inherits the brush colour.
-                        d.color = neuron::effects::default_color(&d.effect)
-                            .unwrap_or_else(|| Rgb::new(b.red(), b.green(), b.blue()));
-                        s.light_layers.push(d);
-                        s.selected_layer = s.light_layers.len() - 1;
-                        s.layers_rev += 1;
-                    }
-                    refresh_layers(&app, &sh);
-                }
-            });
-        }
-        {
-            let w = app.as_weak();
-            let sh = sh.clone();
-            app.global::<State>().on_remove_layer(move |idx| {
-                if let Some(app) = w.upgrade() {
-                    {
-                        let mut s = sh.borrow_mut();
-                        let i = idx as usize;
-                        if i < s.light_layers.len() {
-                            s.light_layers.remove(i);
-                        }
-                        if !s.light_layers.is_empty() && s.selected_layer >= s.light_layers.len() {
-                            s.selected_layer = s.light_layers.len() - 1;
-                        }
-                        s.layers_rev += 1;
-                    }
-                    refresh_layers(&app, &sh);
-                }
-            });
-        }
-        {
-            let w = app.as_weak();
-            let sh = sh.clone();
-            app.global::<State>().on_select_layer(move |idx| {
-                if let Some(app) = w.upgrade() {
-                    {
-                        let mut s = sh.borrow_mut();
-                        if (idx as usize) < s.light_layers.len() {
-                            s.selected_layer = idx as usize;
-                        }
-                    }
-                    refresh_layers(&app, &sh);
-                }
-            });
-        }
-        {
-            let w = app.as_weak();
-            let sh = sh.clone();
-            app.global::<State>().on_move_layer(move |idx, dir| {
-                if let Some(app) = w.upgrade() {
-                    {
-                        let mut s = sh.borrow_mut();
-                        let i = idx as usize;
-                        let j = i as i32 + dir;
-                        if i < s.light_layers.len() && j >= 0 && (j as usize) < s.light_layers.len()
-                        {
-                            s.light_layers.swap(i, j as usize);
-                            s.selected_layer = j as usize;
-                            s.layers_rev += 1;
-                        }
-                    }
-                    refresh_layers(&app, &sh);
-                }
-            });
-        }
-        {
-            let w = app.as_weak();
-            let sh = sh.clone();
-            app.global::<State>().on_toggle_layer(move |idx| {
-                if let Some(app) = w.upgrade() {
-                    {
-                        let mut s = sh.borrow_mut();
-                        if let Some(d) = s.light_layers.get_mut(idx as usize) {
-                            d.enabled = !d.enabled;
-                        }
-                        s.layers_rev += 1;
-                    }
-                    refresh_layers(&app, &sh);
-                }
-            });
-        }
-        {
-            let w = app.as_weak();
-            let sh = sh.clone();
-            app.global::<State>().on_set_layer_effect(move |idx, eff| {
-                if let Some(app) = w.upgrade() {
-                    {
-                        let mut s = sh.borrow_mut();
-                        if let Some(d) = s.light_layers.get_mut(idx as usize) {
-                            d.effect = eff.to_string();
-                        }
-                        s.layers_rev += 1;
-                    }
-                    refresh_layers(&app, &sh);
-                }
-            });
-        }
-        {
-            let w = app.as_weak();
-            let sh = sh.clone();
-            app.global::<State>().on_set_layer_color(move |idx, hex| {
-                if let Some(app) = w.upgrade() {
-                    if let Some(c) = Rgb::parse(hex.as_str()) {
-                        {
-                            let mut s = sh.borrow_mut();
-                            if let Some(d) = s.light_layers.get_mut(idx as usize) {
-                                d.color = c;
-                            }
-                            s.layers_rev += 1;
-                        }
-                        refresh_layers(&app, &sh);
-                    }
-                }
-            });
-        }
-        {
-            let w = app.as_weak();
-            let sh = sh.clone();
-            app.global::<State>().on_set_layer_speed(move |idx, v| {
-                if let Some(app) = w.upgrade() {
-                    {
-                        let mut s = sh.borrow_mut();
-                        if let Some(d) = s.light_layers.get_mut(idx as usize) {
-                            d.speed = v.clamp(0.1, 6.0);
-                        }
-                        s.layers_rev += 1;
-                    }
-                    refresh_layers(&app, &sh);
-                }
-            });
-        }
-        {
-            let w = app.as_weak();
-            let sh = sh.clone();
-            app.global::<State>()
-                .on_set_layer_direction(move |idx, dir| {
-                    if let Some(app) = w.upgrade() {
-                        {
-                            let mut s = sh.borrow_mut();
-                            if let Some(d) = s.light_layers.get_mut(idx as usize) {
-                                d.direction = (dir.rem_euclid(4)) as u8;
-                            }
-                            s.layers_rev += 1;
-                        }
-                        refresh_layers(&app, &sh);
-                    }
-                });
-        }
-        {
-            let w = app.as_weak();
-            let sh = sh.clone();
-            app.global::<State>().on_set_layer_blend(move |idx, b| {
-                if let Some(app) = w.upgrade() {
-                    {
-                        let mut s = sh.borrow_mut();
-                        if let Some(d) = s.light_layers.get_mut(idx as usize) {
-                            d.blend = neuron::effects::Blend::from_str(b.as_str());
-                        }
-                        s.layers_rev += 1;
-                    }
-                    refresh_layers(&app, &sh);
-                }
-            });
-        }
-        {
-            let w = app.as_weak();
-            let sh = sh.clone();
-            app.global::<State>().on_clear_layer_region(move |idx| {
-                if let Some(app) = w.upgrade() {
-                    {
-                        let mut s = sh.borrow_mut();
-                        if let Some(d) = s.light_layers.get_mut(idx as usize) {
-                            d.region.clear();
-                        }
-                        s.layers_rev += 1;
-                    }
-                    refresh_layers(&app, &sh);
-                }
-            });
-        }
-        // paint/erase a cell into the SELECTED layer's region (driven by the render's paint area)
-        {
-            let w = app.as_weak();
-            let sh = sh.clone();
-            app.global::<State>().on_paint_region(move |cell| {
-                if let Some(app) = w.upgrade() {
-                    {
-                        let mut s = sh.borrow_mut();
-                        let sel = s.selected_layer;
-                        if let Some(d) = s.light_layers.get_mut(sel) {
-                            let c = cell as u32;
-                            if !d.region.contains(&c) {
-                                d.region.push(c);
-                            }
-                        }
-                        s.layers_rev += 1;
-                    }
-                    refresh_layers(&app, &sh);
-                }
-            });
-        }
-        {
-            let w = app.as_weak();
-            let sh = sh.clone();
-            app.global::<State>().on_erase_region(move |cell| {
-                if let Some(app) = w.upgrade() {
-                    {
-                        let mut s = sh.borrow_mut();
-                        let sel = s.selected_layer;
-                        if let Some(d) = s.light_layers.get_mut(sel) {
-                            d.region.retain(|&c| c != cell as u32);
-                        }
-                        s.layers_rev += 1;
-                    }
-                    refresh_layers(&app, &sh);
-                }
-            });
-        }
         // stream the whole composite live to the device
         {
             let w = app.as_weak();
@@ -1762,7 +1489,8 @@ pub fn install(app: &AppWindow) -> SharedRt {
             let sh = sh.clone();
             app.global::<State>().on_composite_stop(move || {
                 if let Some(app) = w.upgrade() {
-                    sh.borrow_mut().rt.stop_animation();
+                    let pid = sh.borrow().rt.selected_pid;
+                    sh.borrow_mut().rt.stop_animation(pid);
                     let st = app.global::<State>();
                     st.set_compositing(false);
                     st.set_status_line("composite stopped".into());
@@ -1779,10 +1507,15 @@ pub fn install(app: &AppWindow) -> SharedRt {
             app.global::<State>().on_set_light_fps(move |v| {
                 if let Some(app) = w.upgrade() {
                     let fps = (v.round() as i64).clamp(1, 30) as u32;
-                    sh.borrow()
-                        .rt
-                        .light_fps
-                        .store(fps, std::sync::atomic::Ordering::Relaxed);
+                    {
+                        let s = sh.borrow();
+                        s.rt
+                            .light_fps
+                            .store(fps, std::sync::atomic::Ordering::Relaxed);
+                        // re-pace ONLY the selected board's live stream — others keep their own fps.
+                        let pid = s.rt.selected_pid;
+                        s.rt.set_anim_fps(pid, fps);
+                    }
                     app.global::<State>().set_light_fps(fps as f32);
                     // persist the user's fps pick for this board (debounced; restored on relaunch).
                     save_lighting(&sh);
@@ -1809,12 +1542,15 @@ pub fn install(app: &AppWindow) -> SharedRt {
                             Ok(imp) => {
                                 if !imp.lighting_layers.is_empty() {
                                     // an ADVANCED animated composite → straight into the layer stack
-                                    let layers = imp.lighting_layers.clone();
+                                    // (the importer already maps each Synapse layer onto a Pattern × Spectrum).
+                                    let layers: Vec<neuron::pattern::LayerDef> =
+                                        imp.lighting_layers.clone();
                                     let n = layers.len();
                                     {
                                         let mut s = sh.borrow_mut();
                                         s.light_layers = layers;
                                         s.selected_layer = s.light_layers.len().saturating_sub(1);
+                                        s.active_frame = 0;
                                         s.layers_rev += 1;
                                     }
                                     st.set_light_paint_mode(false);
@@ -1854,30 +1590,20 @@ pub fn install(app: &AppWindow) -> SharedRt {
                                         .into(),
                                     );
                                 } else if let Some(name) = &imp.profile.lighting {
-                                    // a basic named effect → a compositor layer
-                                    let col = imp
-                                        .profile
-                                        .color
-                                        .as_deref()
-                                        .and_then(Rgb::parse)
-                                        .unwrap_or(Rgb::new(0x4A, 0xF2, 0xB0));
-                                    let eff = if neuron::effects::make(name).is_some() {
-                                        name.clone()
-                                    } else {
-                                        "static".to_string()
-                                    };
+                                    // a basic named effect → a compositor layer (mapped to a pattern preset)
+                                    let col = imp.profile.color.as_deref().and_then(Rgb::parse);
+                                    let d = effect_to_layer(name, col);
+                                    let label = pattern_label(&d.pattern).to_string();
                                     {
                                         let mut s = sh.borrow_mut();
-                                        let mut d = neuron::effects::LayerDef::default();
-                                        d.effect = eff.clone();
-                                        d.color = col;
                                         s.light_layers.push(d);
                                         s.selected_layer = s.light_layers.len() - 1;
+                                        s.active_frame = 0;
                                         s.layers_rev += 1;
                                     }
                                     st.set_light_paint_mode(false);
                                     refresh_layers(&app, &sh);
-                                    st.set_status_line(format!("imported effect '{eff}' as a layer").into());
+                                    st.set_status_line(format!("imported effect '{label}' as a layer").into());
                                 } else {
                                     let note = imp.notes.first().cloned().unwrap_or_default();
                                     st.set_status_line(
@@ -1919,34 +1645,39 @@ pub fn install(app: &AppWindow) -> SharedRt {
                             s.light_data = Some(slug.clone());
                             s.light_layers.clear();
                             s.selected_layer = 0;
+                            s.active_frame = 0;
                         } else {
                             s.light_data = None;
-                            let accent = weave_accent_rgb();
+                            // build the layer this PRESET describes (pattern + its params + spectrum).
+                            let layer = preset_layer(&slug);
                             if s.light_layers.is_empty() {
-                                // single-effect default — no layer ceremony. Poured in the effect's
-                                // built-in default colour (typing heat's warm flame) if it has one, else
-                                // the weave accent.
-                                let mut d = neuron::effects::LayerDef::default();
-                                d.effect = slug.clone();
-                                d.color = neuron::effects::default_color(&slug).unwrap_or(accent);
-                                s.light_layers.push(d);
+                                // single-effect default — no layer ceremony.
+                                s.light_layers.push(layer);
                                 s.selected_layer = 0;
                             } else {
-                                // replace the ACTIVE (selected) layer's effect, keeping its region. An
-                                // effect with a built-in default colour starts in it on apply, so it isn't
-                                // left wearing the previous effect's colour (e.g. the teal accent that
-                                // would recolour the fire cold); others keep their colour.
+                                // replace the ACTIVE (selected) layer's pattern/params/spectrum, keeping
+                                // its spatial REGION + blend + enabled (the look changes, the placement
+                                // stays — picking a tile re-skins the layer you're editing).
                                 let sel = s.selected_layer.min(s.light_layers.len() - 1);
-                                s.light_layers[sel].effect = slug.clone();
-                                if let Some(c) = neuron::effects::default_color(&slug) {
-                                    s.light_layers[sel].color = c;
-                                }
+                                let region = s.light_layers[sel].region.clone();
+                                let blend = s.light_layers[sel].blend;
+                                let enabled = s.light_layers[sel].enabled;
+                                s.light_layers[sel] = neuron::pattern::LayerDef {
+                                    region,
+                                    blend,
+                                    enabled,
+                                    ..layer
+                                };
                                 s.selected_layer = sel;
                             }
+                            s.active_frame = 0;
                         }
                         s.layers_rev += 1;
                     }
                     refresh_layers(&app, &sh);
+                    // structural change (effect / data pick) — persist NOW, not 400ms later, so it
+                    // survives an immediate quit-and-relaunch (the debounce alone could strand it).
+                    flush_lighting_save();
                     app.global::<State>()
                         .set_status_line(format!("lighting → {slug}").into());
                 }
@@ -1962,12 +1693,9 @@ pub fn install(app: &AppWindow) -> SharedRt {
                         let mut s = sh.borrow_mut();
                         let sel = s.selected_layer;
                         if let Some(d) = s.light_layers.get_mut(sel) {
-                            match key.as_str() {
-                                "speed" => d.speed = v.clamp(0.1, 6.0),
-                                "density" => d.density = v.clamp(0.1, 4.0),
-                                "fade" => d.fade = v.clamp(0.1, 4.0),
-                                _ => {}
-                            }
+                            // a continuous knob writes straight into the pattern's param bag (keyed by the
+                            // schema's stable key — speed/density/fade/sensitivity/…); the pattern clamps.
+                            d.params.set(key.as_str(), v);
                         }
                         s.layers_rev += 1;
                     }
@@ -1989,40 +1717,13 @@ pub fn install(app: &AppWindow) -> SharedRt {
                         let mut s = sh.borrow_mut();
                         let sel = s.selected_layer;
                         if let Some(d) = s.light_layers.get_mut(sel) {
-                            match key.as_str() {
-                                "direction" => d.direction = i.clamp(0, 3) as u8,
-                                "breath" => d.breath = i.clamp(0, 2) as u8,
-                                // source comes back as the option index; map it to the plain word the
-                                // generator reads (index 1 = "mic", anything else = the "speakers" default).
-                                "source" => {
-                                    d.source = if i == 1 { "mic" } else { "speakers" }.into()
-                                }
-                                _ => {}
-                            }
+                            // an enum knob stores its chosen INDEX (direction/mode/source/…) in the param
+                            // bag as a whole number; the pattern reads it back with `Params::u8`.
+                            d.params.set(key.as_str(), i.max(0) as f32);
                         }
                         s.layers_rev += 1;
                     }
                     refresh_layers(&app, &sh);
-                }
-            });
-        }
-        // the COLOUR knob → parse + write the active layer's colour (used by static/breathing/…)
-        {
-            let w = app.as_weak();
-            let sh = sh.clone();
-            app.global::<State>().on_set_param_color(move |hex| {
-                if let Some(app) = w.upgrade() {
-                    if let Some(c) = Rgb::parse(hex.as_str()) {
-                        {
-                            let mut s = sh.borrow_mut();
-                            let sel = s.selected_layer;
-                            if let Some(d) = s.light_layers.get_mut(sel) {
-                                d.color = c;
-                            }
-                            s.layers_rev += 1;
-                        }
-                        refresh_layers(&app, &sh);
-                    }
                 }
             });
         }
@@ -2038,14 +1739,251 @@ pub fn install(app: &AppWindow) -> SharedRt {
                         let mut s = sh.borrow_mut();
                         let sel = s.selected_layer;
                         if let Some(d) = s.light_layers.get_mut(sel) {
-                            match key.as_str() {
-                                "glow" => d.glow = on,
-                                _ => {}
+                            // a toggle writes 0/1 into the param bag (e.g. ignite's `glow`); the pattern
+                            // reads it back with `Params::bool`.
+                            d.params.set(key.as_str(), if on { 1.0 } else { 0.0 });
+                        }
+                        s.layers_rev += 1;
+                    }
+                    refresh_layers(&app, &sh);
+                }
+            });
+        }
+        // ── SPECTRUM editor: the active layer's COLOUR program (gradient stops + motion + sequence) ──
+        // Every callback mutates the active layer's spectrum (its ACTIVE frame's palette), then
+        // `refresh_layers` re-projects it back into the State surface (so the strip/motion/timeline
+        // stay in lockstep) + persists. The gradient strip:
+        {
+            let w = app.as_weak();
+            let sh = sh.clone();
+            app.global::<State>().on_set_stop_color(move |idx, hex| {
+                if let (Some(app), Some(c)) = (w.upgrade(), Rgb::parse(hex.as_str())) {
+                    edit_active_palette(&app, &sh, |pal| pal.set_stop_color(idx.max(0) as usize, c));
+                }
+            });
+        }
+        {
+            let w = app.as_weak();
+            let sh = sh.clone();
+            app.global::<State>().on_add_stop(move |at| {
+                if let Some(app) = w.upgrade() {
+                    // insert the stop, capturing the index it sorted into…
+                    let mut inserted = 0usize;
+                    edit_active_palette(&app, &sh, |pal| {
+                        inserted = pal.add_stop(at);
+                    });
+                    // …then SELECT it (after refresh_layers rebuilt light-stops), delivering the
+                    // documented "add a stop, select it" contract: the prism now edits the NEW stop,
+                    // not whatever was selected before the insert sorted into the gradient.
+                    app.global::<State>().set_light_sel_stop(inserted as i32);
+                }
+            });
+        }
+        {
+            let w = app.as_weak();
+            let sh = sh.clone();
+            app.global::<State>().on_remove_stop(move |idx| {
+                if let Some(app) = w.upgrade() {
+                    edit_active_palette(&app, &sh, |pal| pal.remove_stop(idx.max(0) as usize));
+                }
+            });
+        }
+        {
+            let w = app.as_weak();
+            let sh = sh.clone();
+            app.global::<State>().on_move_stop(move |idx, at| {
+                if let Some(app) = w.upgrade() {
+                    edit_active_palette(&app, &sh, |pal| {
+                        pal.move_stop(idx.max(0) as usize, at);
+                    });
+                }
+            });
+        }
+        // the MOTION row — each control writes its State property then rebuilds the active palette's
+        // Motion from all four (kind/speed/depth/chaos), so a switch keeps the other knobs.
+        {
+            let w = app.as_weak();
+            let sh = sh.clone();
+            app.global::<State>().on_set_motion(move |kind| {
+                if let Some(app) = w.upgrade() {
+                    app.global::<State>().set_light_motion(kind);
+                    rebuild_motion(&app, &sh);
+                }
+            });
+        }
+        {
+            let w = app.as_weak();
+            let sh = sh.clone();
+            app.global::<State>().on_set_motion_speed(move |v| {
+                if let Some(app) = w.upgrade() {
+                    app.global::<State>().set_light_motion_speed(v);
+                    rebuild_motion(&app, &sh);
+                }
+            });
+        }
+        {
+            let w = app.as_weak();
+            let sh = sh.clone();
+            app.global::<State>().on_set_motion_depth(move |v| {
+                if let Some(app) = w.upgrade() {
+                    app.global::<State>().set_light_motion_depth(v);
+                    rebuild_motion(&app, &sh);
+                }
+            });
+        }
+        {
+            let w = app.as_weak();
+            let sh = sh.clone();
+            app.global::<State>().on_set_motion_chaos(move |v| {
+                if let Some(app) = w.upgrade() {
+                    app.global::<State>().set_light_motion_chaos(v);
+                    rebuild_motion(&app, &sh);
+                }
+            });
+        }
+        // the INTERPOLATION toggle — set the active palette's gradient colour space (rgb | hsv).
+        {
+            let w = app.as_weak();
+            let sh = sh.clone();
+            app.global::<State>().on_set_interp(move |which| {
+                if let Some(app) = w.upgrade() {
+                    let interp = neuron::spectrum::Interp::from_str(which.as_str());
+                    edit_active_palette(&app, &sh, |pal| pal.interp = interp);
+                }
+            });
+        }
+        // the TIMELINE / sequencer — add/remove/move/select frames + per-frame timing + loop policy.
+        {
+            let w = app.as_weak();
+            let sh = sh.clone();
+            app.global::<State>().on_add_frame(move || {
+                if let Some(app) = w.upgrade() {
+                    {
+                        let mut s = sh.borrow_mut();
+                        let sel = s.selected_layer;
+                        let fr = s.active_frame;
+                        if let Some(d) = s.light_layers.get_mut(sel) {
+                            let fr = fr.min(d.spectrum.seq.len().saturating_sub(1));
+                            if let Some(clone) = d.spectrum.seq.get(fr).cloned() {
+                                d.spectrum.seq.insert(fr + 1, clone);
+                            }
+                        }
+                        let len = s.light_layers.get(sel).map(|d| d.spectrum.seq.len()).unwrap_or(1);
+                        s.active_frame = (s.active_frame + 1).min(len.saturating_sub(1));
+                        s.layers_rev += 1;
+                    }
+                    refresh_layers(&app, &sh);
+                }
+            });
+        }
+        {
+            let w = app.as_weak();
+            let sh = sh.clone();
+            app.global::<State>().on_remove_frame(move |idx| {
+                if let Some(app) = w.upgrade() {
+                    {
+                        let mut s = sh.borrow_mut();
+                        let sel = s.selected_layer;
+                        if let Some(d) = s.light_layers.get_mut(sel) {
+                            let i = idx.max(0) as usize;
+                            if d.spectrum.seq.len() > 1 && i < d.spectrum.seq.len() {
+                                d.spectrum.seq.remove(i);
+                            }
+                        }
+                        let len = s.light_layers.get(sel).map(|d| d.spectrum.seq.len()).unwrap_or(1);
+                        s.active_frame = s.active_frame.min(len.saturating_sub(1));
+                        s.layers_rev += 1;
+                    }
+                    refresh_layers(&app, &sh);
+                }
+            });
+        }
+        {
+            let w = app.as_weak();
+            let sh = sh.clone();
+            app.global::<State>().on_move_frame(move |idx, dir| {
+                if let Some(app) = w.upgrade() {
+                    {
+                        let mut s = sh.borrow_mut();
+                        let sel = s.selected_layer;
+                        let i = idx.max(0) as usize;
+                        if let Some(d) = s.light_layers.get_mut(sel) {
+                            let j = if dir < 0 { i.checked_sub(1) } else { Some(i + 1) };
+                            if let Some(j) = j {
+                                if i < d.spectrum.seq.len() && j < d.spectrum.seq.len() {
+                                    d.spectrum.seq.swap(i, j);
+                                    s.active_frame = j;
+                                }
                             }
                         }
                         s.layers_rev += 1;
                     }
                     refresh_layers(&app, &sh);
+                }
+            });
+        }
+        {
+            let w = app.as_weak();
+            let sh = sh.clone();
+            app.global::<State>().on_select_frame(move |idx| {
+                if let Some(app) = w.upgrade() {
+                    {
+                        let mut s = sh.borrow_mut();
+                        let sel = s.selected_layer;
+                        let len = s.light_layers.get(sel).map(|d| d.spectrum.seq.len()).unwrap_or(1);
+                        s.active_frame = (idx.max(0) as usize).min(len.saturating_sub(1));
+                    }
+                    refresh_layers(&app, &sh);
+                }
+            });
+        }
+        {
+            let w = app.as_weak();
+            let sh = sh.clone();
+            app.global::<State>().on_set_frame_hold(move |idx, v| {
+                if let Some(app) = w.upgrade() {
+                    edit_active_spectrum(&app, &sh, |sp, _| {
+                        if let Some(f) = sp.seq.get_mut(idx.max(0) as usize) {
+                            f.hold = v.max(0.0);
+                        }
+                    });
+                }
+            });
+        }
+        {
+            let w = app.as_weak();
+            let sh = sh.clone();
+            app.global::<State>().on_set_frame_fade(move |idx, v| {
+                if let Some(app) = w.upgrade() {
+                    edit_active_spectrum(&app, &sh, |sp, _| {
+                        if let Some(f) = sp.seq.get_mut(idx.max(0) as usize) {
+                            f.fade = v.max(0.0);
+                        }
+                    });
+                }
+            });
+        }
+        {
+            let w = app.as_weak();
+            let sh = sh.clone();
+            app.global::<State>().on_set_frame_ease(move |idx, ease| {
+                if let Some(app) = w.upgrade() {
+                    edit_active_spectrum(&app, &sh, |sp, _| {
+                        if let Some(f) = sp.seq.get_mut(idx.max(0) as usize) {
+                            f.ease = neuron::spectrum::Ease::from_str(ease.as_str());
+                        }
+                    });
+                }
+            });
+        }
+        {
+            let w = app.as_weak();
+            let sh = sh.clone();
+            app.global::<State>().on_set_loop(move |which| {
+                if let Some(app) = w.upgrade() {
+                    edit_active_spectrum(&app, &sh, |sp, _| {
+                        sp.play = neuron::spectrum::Loop::from_str(which.as_str());
+                    });
                 }
             });
         }
@@ -2069,6 +2007,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                         }
                     }
                     refresh_layers(&app, &sh);
+                    flush_lighting_save(); // a new layer is structural — persist it immediately
                 }
             });
         }
@@ -2078,11 +2017,22 @@ pub fn install(app: &AppWindow) -> SharedRt {
             let sh = sh.clone();
             app.global::<State>().on_select_stack(move |i| {
                 if let Some(app) = w.upgrade() {
-                    {
+                    let changed = {
                         let mut s = sh.borrow_mut();
-                        if (i as usize) < s.light_layers.len() {
-                            s.selected_layer = i as usize;
+                        let i = i as usize;
+                        if i < s.light_layers.len() && i != s.selected_layer {
+                            s.selected_layer = i;
+                            // the new layer has its OWN sequence + stops — start at the top of THAT
+                            // layer so the timeline scrubber + the prism never point at a stale frame /
+                            // stop carried over from the layer we just left (both indices are per-layer).
+                            s.active_frame = 0;
+                            true
+                        } else {
+                            false
                         }
+                    };
+                    if changed {
+                        app.global::<State>().set_light_sel_stop(0);
                     }
                     refresh_layers(&app, &sh);
                 }
@@ -2106,6 +2056,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                         s.layers_rev += 1;
                     }
                     refresh_layers(&app, &sh);
+                    flush_lighting_save(); // removing a layer is structural — persist it immediately
                 }
             });
         }
@@ -2136,7 +2087,8 @@ pub fn install(app: &AppWindow) -> SharedRt {
             let sh = sh.clone();
             app.global::<State>().on_push_painted(move || {
                 if let Some(app) = w.upgrade() {
-                    sh.borrow_mut().rt.stop_animation();
+                    let pid = sh.borrow().rt.selected_pid;
+                    sh.borrow_mut().rt.stop_animation(pid);
                     let st = app.global::<State>();
                     st.set_compositing(false);
                     let model = st.get_grid_px();
@@ -2185,7 +2137,11 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 );
                 sync_activation_view(&st, &sh.borrow().rt.cast.activation);
                 st.set_editing_sector(-1); // drop any in-flight wedge edit targeting the old config
-                                           // the live engine reloads from the same disk truth.
+                // …and any OPEN inline rule editor: a reload rebuilds the rules model from disk and
+                // can reindex the rows, so a surviving `editing-rule` would make the next commit write
+                // into the wrong slot. Closing it (–1) makes a stale commit a safe no-op.
+                st.set_editing_rule(-1);
+                // the live engine reloads from the same disk truth.
                 crate::dispatch::request_reload();
                 let n = neuron::engine::Engine::new(sh.borrow().rt.spine_rules())
                     .rules
@@ -2215,6 +2171,9 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 let gui_idx = (row - first_editable) as usize;
                 match crate::editor::remove_gui_rule_in_tier(gui_idx, false) {
                     Ok(()) => {
+                        // removing a row shifts the editable tail — close the inline editor so a stale
+                        // `editing-rule` can't commit into the wrong slot after the reindex.
+                        st.set_editing_rule(-1);
                         refresh_rules(&app, &sh);
                         crate::dispatch::request_reload();
                         st.set_status_line("binding removed".into());
@@ -2235,11 +2194,58 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 let st = app.global::<State>();
                 match crate::editor::remove_gui_rule_in_tier(row.max(0) as usize, true) {
                     Ok(()) => {
+                        st.set_editing_rule(-1); // close the inline editor — the hyper list reindexed
                         refresh_rules(&app, &sh);
                         crate::dispatch::request_reload();
                         st.set_status_line("binding removed".into());
                     }
                     Err(e) => st.set_status_line(format!("remove failed: {e}").into()),
+                }
+            }
+        });
+    });
+    // REORDER a GUI-authored BASE rule up/down. Same display→tier mapping as remove: the editable
+    // rows are the LAST `editable_count` of the base list, so subtract the read-only provenance count.
+    // Provenance (toml/cast) rows aren't reorderable — they stay anchored above the editable tail.
+    bind(app, &shared, |app, sh| {
+        let w = app.as_weak();
+        let sh = sh.clone();
+        app.global::<State>().on_move_rule(move |row, dir| {
+            if let Some(app) = w.upgrade() {
+                let st = app.global::<State>();
+                let total = st.get_rules().row_count() as i32;
+                let editable = st.get_editable_count();
+                let first_editable = total - editable;
+                if row < first_editable {
+                    return; // a provenance row — not reorderable here
+                }
+                let gui_idx = (row - first_editable) as usize;
+                match crate::editor::move_gui_rule_in_tier(gui_idx, false, dir) {
+                    Ok(()) => {
+                        st.set_editing_rule(-1); // reordering shifts indices — close the inline editor
+                        refresh_rules(&app, &sh);
+                        crate::dispatch::request_reload();
+                    }
+                    Err(e) => st.set_status_line(format!("reorder failed: {e}").into()),
+                }
+            }
+        });
+    });
+    // REORDER a GUI-authored HYPERSHIFT rule. Every hyper row is GUI-authored (AppRuntime contributes
+    // no hyper provenance rows), so the row index IS the tier index — no provenance offset.
+    bind(app, &shared, |app, sh| {
+        let w = app.as_weak();
+        let sh = sh.clone();
+        app.global::<State>().on_move_hyper_rule(move |row, dir| {
+            if let Some(app) = w.upgrade() {
+                let st = app.global::<State>();
+                match crate::editor::move_gui_rule_in_tier(row.max(0) as usize, true, dir) {
+                    Ok(()) => {
+                        st.set_editing_rule(-1); // reordering shifts indices — close the inline editor
+                        refresh_rules(&app, &sh);
+                        crate::dispatch::request_reload();
+                    }
+                    Err(e) => st.set_status_line(format!("reorder failed: {e}").into()),
                 }
             }
         });
@@ -2255,12 +2261,10 @@ pub fn install(app: &AppWindow) -> SharedRt {
                         Some(c) => {
                             // stash the captured (page,usage,pid) for add-binding, show its name.
                             CAPTURED_CONTROL.with(|cell| *cell.borrow_mut() = Some(c));
-                            let name = neuron::capture::usage_name(c.page, c.usage);
-                            let label = if name == "?" {
-                                format!("0x{:02X}/0x{:02X}", c.page, c.usage)
-                            } else {
-                                format!("{name} (0x{:02X}/0x{:02X})", c.page, c.usage)
-                            };
+                            // a friendly, layout-independent control name ("F13", "Button 4",
+                            // "Left Ctrl") — control_label falls back to an exact hex id for anything
+                            // unmapped, so a weird controller still shows something legible.
+                            let label = neuron::controls::control_label(c.page, c.usage);
                             st.set_bind_trigger_label(label.into());
                             st.set_bind_trigger_ready(true);
                             st.set_status_line(
@@ -2320,6 +2324,139 @@ pub fn install(app: &AppWindow) -> SharedRt {
                     }
                     Err(e) => st.set_status_line(format!("add failed: {e}").into()),
                 }
+            }
+        });
+    });
+    // EDIT an existing GUI-authored rule IN PLACE — clicking a removable row opens the SAME wire-editor
+    // inline, seeded from its real trigger + action (edit-shows-current). Only the GUI-authored tail is
+    // editable; a toml/cast row says where it lives and bails. Mirrors the radial sector editor
+    // (preset_picker + an editing sentinel + a commit verb), and closes every other shared-picker editor.
+    bind(app, &shared, |app, _sh| {
+        let w = app.as_weak();
+        app.global::<State>().on_begin_edit_rule(move |row, hyper| {
+            if let Some(app) = w.upgrade() {
+                let st = app.global::<State>();
+                // map the visible row -> the n-th GUI rule of its tier. BASE: the editable tail (toml
+                // rows lead); HYPER: every listed row is GUI-authored, so the row index IS n.
+                let n = if hyper {
+                    row.max(0) as usize
+                } else {
+                    let total = st.get_rules().row_count() as i32;
+                    let first_editable = total - st.get_editable_count();
+                    if row < first_editable {
+                        st.set_status_line(
+                            "that rule comes from bindings.toml / cast.toml — edit it there".into(),
+                        );
+                        return;
+                    }
+                    (row - first_editable) as usize
+                };
+                let Some(rule) = crate::editor::gui_rule_in_tier(n, hyper) else {
+                    st.set_status_line("couldn't find that binding to edit".into());
+                    return;
+                };
+                // seed the action picker from the rule's real action (clears any prior edit's leftovers).
+                preset_picker(&st, &rule.action);
+                // seed the trigger end: an Input trigger is re-capturable (REBIND), so stash it as the
+                // captured control + show its friendly name; anything else shows its describe() readout.
+                let label = match &rule.trigger {
+                    neuron::engine::Trigger::Input { page, usage, pid } => {
+                        CAPTURED_CONTROL.with(|cell| {
+                            *cell.borrow_mut() = Some(crate::capture::CapturedControl {
+                                page: *page,
+                                usage: *usage,
+                                pid: *pid,
+                            })
+                        });
+                        neuron::controls::control_label(*page, *usage)
+                    }
+                    other => {
+                        CAPTURED_CONTROL.with(|cell| *cell.borrow_mut() = None);
+                        other.describe()
+                    }
+                };
+                st.set_bind_trigger_label(label.into());
+                st.set_bind_trigger_ready(true);
+                // one editor owns the shared picker at a time — close the wedge / glyph / rhythm editors.
+                st.set_editing_sector(-1);
+                st.set_gesture_bind_target("".into());
+                st.set_rhythm_bind_target(-1);
+                st.set_editing_rule(row);
+                st.set_editing_rule_hyper(hyper);
+                st.set_status_line(
+                    "editing binding — change the action (or REBIND), then Save".into(),
+                );
+            }
+        });
+    });
+    // COMMIT the in-place edit: validate + build the chosen action, keep (or re-capture) the trigger,
+    // overwrite that exact rule, reload the live engine. Same front-door validation as add-binding.
+    bind(app, &shared, |app, sh| {
+        let w = app.as_weak();
+        let sh = sh.clone();
+        app.global::<State>().on_commit_edit_rule(move || {
+            if let Some(app) = w.upgrade() {
+                let st = app.global::<State>();
+                let row = st.get_editing_rule();
+                if row < 0 {
+                    return;
+                }
+                let hyper = st.get_editing_rule_hyper();
+                let n = if hyper {
+                    row.max(0) as usize
+                } else {
+                    let total = st.get_rules().row_count() as i32;
+                    let first_editable = total - st.get_editable_count();
+                    (row - first_editable).max(0) as usize
+                };
+                let (id, param) = current_action(&st);
+                if let Err(e) = crate::editor::validate_action(&id, &param) {
+                    st.set_status_line(e.into());
+                    return;
+                }
+                let action = crate::editor::build_action(&id, &param);
+                // the trigger: a (re)captured Input control wins; otherwise keep the rule's existing one.
+                let trigger = match CAPTURED_CONTROL.with(|cell| *cell.borrow()) {
+                    Some(c) => neuron::engine::Trigger::Input {
+                        page: c.page,
+                        usage: c.usage,
+                        pid: c.pid,
+                    },
+                    None => match crate::editor::gui_rule_in_tier(n, hyper) {
+                        Some(r) => r.trigger,
+                        None => {
+                            st.set_status_line("that binding is gone — reload and try again".into());
+                            return;
+                        }
+                    },
+                };
+                match crate::editor::edit_gui_rule_in_tier(n, hyper, trigger, action) {
+                    Ok(()) => {
+                        sh.borrow_mut().rt.bindings = neuron::bindings::Bindings::load();
+                        refresh_rules(&app, &sh);
+                        crate::dispatch::request_reload();
+                        CAPTURED_CONTROL.with(|cell| *cell.borrow_mut() = None);
+                        st.set_editing_rule(-1);
+                        st.set_bind_trigger_ready(false);
+                        st.set_bind_trigger_label("—".into());
+                        st.set_status_line("binding updated — live now".into());
+                    }
+                    Err(e) => st.set_status_line(format!("update failed: {e}").into()),
+                }
+            }
+        });
+    });
+    // CANCEL the in-place edit — close the inline editor, drop the captured trigger, leave the rule be.
+    bind(app, &shared, |app, _sh| {
+        let w = app.as_weak();
+        app.global::<State>().on_cancel_edit_rule(move || {
+            if let Some(app) = w.upgrade() {
+                let st = app.global::<State>();
+                CAPTURED_CONTROL.with(|cell| *cell.borrow_mut() = None);
+                st.set_editing_rule(-1);
+                st.set_bind_trigger_ready(false);
+                st.set_bind_trigger_label("—".into());
+                st.set_status_line("edit cancelled".into());
             }
         });
     });
@@ -2441,9 +2578,21 @@ pub fn install(app: &AppWindow) -> SharedRt {
         let sh = sh.clone();
         app.global::<State>().on_record_gesture(move || {
             if let Some(app) = w.upgrade() {
-                record_gesture(&app, &sh);
+                // Shift+Record = strokelab: capture a FULL rich stroke → research file (no vault
+                // entry), instead of teaching a gesture. VK_SHIFT (0x10) read at click time.
+                if neuron::glyph::key_down(0x10) {
+                    record_rich_stroke(&app, &sh);
+                } else {
+                    record_gesture(&app, &sh);
+                }
             }
         });
+    });
+    // live Shift probe for the weave page's rich-mode preview — a ~8Hz Timer on that page asks this
+    // whether Shift is physically down, so the Record button can morph to "rich → file" before a click.
+    bind(app, &shared, |app, _sh| {
+        app.global::<State>()
+            .on_poll_shift(|| neuron::glyph::key_down(0x10));
     });
     bind(app, &shared, |app, sh| {
         let w = app.as_weak();
@@ -2633,6 +2782,10 @@ pub fn install(app: &AppWindow) -> SharedRt {
                                     st.set_disable_alt_tab(policy.disable_alt_tab);
                                     st.set_disable_win(policy.disable_win);
                                     st.set_disable_alt_f4(policy.disable_alt_f4);
+                                    // switching profiles can swap which rules exist (the per-profile
+                                    // sidecar set) — a row index held open in the inline editor may not
+                                    // survive, so close it rather than let it seed from a stale row.
+                                    st.set_editing_rule(-1);
                                     st.set_active_profile(applied.name.clone().into());
                                     with_shared(|sh| {
                                         {
@@ -3236,6 +3389,11 @@ pub fn install(app: &AppWindow) -> SharedRt {
     });
     // REVEAL the macros folder in the OS file manager (created if missing) — the "drop a .py here"
     // affordance. Cross-platform via open_in_file_manager (explorer / open / xdg-open).
+    // REVEAL the strokelab output folder — clicking a "saved strokes/…" line opens ./strokes/.
+    bind(app, &shared, |app, _sh| {
+        app.global::<State>()
+            .on_reveal_strokes(reveal_strokes_folder);
+    });
     bind(app, &shared, |app, _sh| {
         let w = app.as_weak();
         app.global::<State>().on_reveal_macros(move || {
@@ -3253,6 +3411,31 @@ pub fn install(app: &AppWindow) -> SharedRt {
         app.global::<State>().on_open_macro(move |id| {
             if let Some(app) = w.upgrade() {
                 load_macro_into_editor(&app, id.trim());
+            }
+        });
+    });
+    // DELETE from the WORKSHOP catalog card (the ✕, confirmed in the UI by a click-to-arm then a second
+    // click): remove the macro's .py from disk, then refresh the catalog (the card vanishes) + the beacon
+    // list. Same core path as the SYSTEM-panel `on_delete_beacon`, but it re-reads the WORKSHOP grid.
+    bind(app, &shared, |app, _sh| {
+        let w = app.as_weak();
+        app.global::<State>().on_delete_macro(move |id| {
+            let id = id.trim().to_string();
+            if id.is_empty() {
+                return;
+            }
+            if let Some(app) = w.upgrade() {
+                let st = app.global::<State>();
+                match neuron::macros::macro_host::delete_macro(&id) {
+                    Ok(()) => {
+                        refresh_macro_catalog(&app);
+                        refresh_beacon_macros(&app);
+                        st.set_macro_status(format!("deleted macro {id}").into());
+                    }
+                    Err(e) => {
+                        st.set_macro_status(format!("delete failed: {e}").into());
+                    }
+                }
             }
         });
     });
@@ -3512,10 +3695,10 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 let stopped_anim = {
                     let mut s = sh.borrow_mut();
                     // the kill-switch covers the STREAMING path too: a 30fps generator writing
-                    // through "writes PAUSED" would make the gate a lie.
-                    let stopped = paused && s.rt.animating;
+                    // through "writes PAUSED" would make the gate a lie. Stop EVERY board's stream.
+                    let stopped = paused && s.rt.any_animating();
                     if stopped {
-                        s.rt.stop_animation();
+                        s.rt.stop_all_animation();
                     }
                     stopped
                 };
@@ -3582,9 +3765,9 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 let armed = safety.input_armed;
                 let stopped_anim = {
                     let mut s = sh.borrow_mut();
-                    let stop = paused && s.rt.animating;
+                    let stop = paused && s.rt.any_animating();
                     if stop {
-                        s.rt.stop_animation();
+                        s.rt.stop_all_animation();
                     }
                     stop
                 };
@@ -4365,6 +4548,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 preset_picker(&st, &cur);
                 st.set_gesture_bind_target("".into()); // close the glyph editor — one editor owns the shared picker at a time
                 st.set_rhythm_bind_target(-1); // …and the rhythm editor
+                st.set_editing_rule(-1); // …and any inline DIRECT rule edit
                 st.set_editing_sector(i);
                 let n = sh.borrow().rt.cast.sectors.max(1);
                 let compass = neuron::radial::compass(i.max(0) as usize, n);
@@ -4473,6 +4657,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 preset_picker(&st, &cur);
                 st.set_editing_sector(-1); // close the radial editor — one editor owns the shared picker at a time
                 st.set_rhythm_bind_target(-1); // …and the rhythm editor
+                st.set_editing_rule(-1); // …and any inline DIRECT rule edit
                 st.set_gesture_bind_target(name.clone());
                 st.set_status_line(format!("glyph '{name}' — bind, rename, or delete").into());
             }
@@ -4533,6 +4718,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 // one editor owns the shared picker at a time — close the radial + glyph editors.
                 st.set_editing_sector(-1);
                 st.set_gesture_bind_target("".into());
+                st.set_editing_rule(-1); // …and any inline DIRECT rule edit
                 st.set_rhythm_bind_target(taps);
                 st.set_status_line(
                     format!("rhythm {} — pick what it fires", neuron::cast::taps_phrase(taps as u8))
@@ -5167,6 +5353,10 @@ pub fn note_live_profile(app: &AppWindow, name: &str) {
     let st = app.global::<State>();
     if st.get_active_profile() != name {
         st.set_active_profile(name.into());
+        // a live bound ProfileSwitch/Cycle changed the active profile — same reason as the manual
+        // apply path: the rules behind an open inline editor may no longer line up, so close it.
+        // Guarded by the actual-change check so a per-tick status repost never closes the editor.
+        st.set_editing_rule(-1);
     }
     with_shared(|sh| {
         if sh.borrow().rt.active_profile != name {
@@ -5329,19 +5519,21 @@ fn select_device_at(app: &AppWindow, sh: &SharedRt, idx: i32) {
     st.set_sel_can_scroll(row.cap_scroll);
     st.set_sel_can_store(row.cap_store);
     st.set_sel_can_idle(row.cap_idle);
+    // This row's pid (hex id), parsed once — keys both the per-device plate readout and the hyperpoll
+    // gate. Audio endpoints have a non-hex id → 0, and they're never plate/hyperpoll-capable anyway.
+    let pid = u16::from_str_radix(row.id.as_str(), 16).unwrap_or(0);
     // SIDE PLATE: a device with a [side_plates] map surfaces the last plate the mouse pushed. The plate
-    // has NO getter (push-only), so seed from the last-known value the confirmation core recorded
-    // (hidwatch feeds it); a light poll keeps it fresh after this. Non-plated devices show nothing.
+    // has NO getter (push-only), so seed from THIS device's last-known value the confirmation core
+    // recorded (hidwatch feeds it per-pid); a light poll keeps it fresh after this. Others show nothing.
     st.set_sel_can_plate(row.cap_plate);
     st.set_selected_plate(if row.cap_plate {
-        neuron::confirm::last_plate().unwrap_or_default().into()
+        neuron::confirm::last_plate(pid).unwrap_or_default().into()
     } else {
         "".into()
     });
     // EXTENDED HyperPolling (>1000Hz, 0x00/0x40) is only real on known extended-PID hardware — the
     // HyperPolling Wireless Dongle + Viper-8K-class. The Naga's stock dongle (0x00A8) is legacy-capped
     // at 1000Hz, so its card shows an honest "use REPORT RATE" note instead of fake 2000–8000Hz chips.
-    let pid = u16::from_str_radix(row.id.as_str(), 16).unwrap_or(0);
     st.set_sel_can_hyperpoll(pid_supports_hyperpoll(pid));
     let kind = row.kind.to_string();
     if kind == "mic" || kind == "output" {
@@ -5365,9 +5557,8 @@ fn select_device_at(app: &AppWindow, sh: &SharedRt, idx: i32) {
             let mut s = sh.borrow_mut();
             let c = s.rt.selected_pid != pid;
             s.rt.selected_pid = pid;
-            if c && s.rt.animating {
-                s.rt.stop_animation();
-            }
+            // Switching which board you're EDITING no longer stops the others — each board's stream is
+            // independent now, so the keyboard keeps animating while you work on the mouse.
             c
         };
         if let Ok(v) = row.dpi.trim().parse::<f32>() {
@@ -5655,6 +5846,7 @@ fn load_macro_into_editor(app: &AppWindow, id: &str) {
 /// Only a selected mouse WITH a [side_plates] map ever shows a value (others read ""). The instant
 /// feedback on a swap is the confirmation CARD; this readout follows within a tick.
 pub fn refresh_selected_plate(app: &AppWindow) {
+    use slint::Model;
     let st = app.global::<State>();
     if !st.get_sel_can_plate() {
         if !st.get_selected_plate().is_empty() {
@@ -5662,7 +5854,17 @@ pub fn refresh_selected_plate(app: &AppWindow) {
         }
         return;
     }
-    let label = neuron::confirm::last_plate().unwrap_or_default();
+    // The selected device's pid keys its OWN plate readout (per-pid; a sibling mouse's swap can't leak
+    // into this card).
+    let pid = {
+        let i = st.get_selected_device();
+        (i >= 0)
+            .then(|| st.get_devices().row_data(i as usize))
+            .flatten()
+            .and_then(|r| u16::from_str_radix(r.id.as_str(), 16).ok())
+            .unwrap_or(0)
+    };
+    let label = neuron::confirm::last_plate(pid).unwrap_or_default();
     if st.get_selected_plate().as_str() != label {
         st.set_selected_plate(label.into());
     }
@@ -5676,12 +5878,18 @@ pub fn refresh_selected_plate(app: &AppWindow) {
 pub fn refresh_plated_row(app: &AppWindow) {
     use slint::Model;
     let st = app.global::<State>();
-    let label = neuron::confirm::last_plate().unwrap_or_default();
     let rows = st.get_devices();
     for i in 0..rows.row_count() {
         let Some(mut row) = rows.row_data(i) else { continue };
-        if row.cap_plate && row.plate.as_str() != label {
-            row.plate = label.clone().into();
+        if !row.cap_plate {
+            continue;
+        }
+        // Each plated device shows ITS OWN last-known plate (per-pid), never a shared global value, so
+        // two plated mice can't cross-contaminate each other's row readout.
+        let pid = u16::from_str_radix(row.id.as_str(), 16).unwrap_or(0);
+        let label = neuron::confirm::last_plate(pid).unwrap_or_default();
+        if row.plate.as_str() != label {
+            row.plate = label.into();
             rows.set_row_data(i, row);
         }
     }
@@ -5728,10 +5936,11 @@ pub fn refresh_devices(app: &AppWindow, sh: &SharedRt) {
             cap_store: d.cap_store,
             cap_idle: d.cap_idle,
             cap_plate: d.cap_plate,
-            // SIDE PLATE (push-only, no getter): seed the row from the last plate the mouse pushed.
-            // refresh_plated_row keeps it live in place after this. Non-plated devices show nothing.
+            // SIDE PLATE (push-only, no getter): seed the row from THIS device's last pushed plate
+            // (per-pid). refresh_plated_row keeps it live in place after this. Non-plated devices show
+            // nothing.
             plate: if d.cap_plate {
-                neuron::confirm::last_plate().unwrap_or_default().into()
+                neuron::confirm::last_plate(d.pid).unwrap_or_default().into()
             } else {
                 "".into()
             },
@@ -6097,19 +6306,6 @@ pub fn refresh_effects(app: &AppWindow, sh: &SharedRt) {
     st.set_effects_sw(ModelRc::new(VecModel::from(sw)));
 }
 
-/// (uses_color, directional) for an effect generator — drives which per-layer controls the editor
-/// shows (a spectrum/fire ignores colour; only a wave cares about direction).
-fn effect_meta(name: &str) -> (bool, bool) {
-    match name {
-        // these read the layer colour: solid fill, breath, twinkles, key-glow, the VU bars, load bars
-        "static" | "solid" | "breathing" | "starlight" | "reactive" | "audiometer" | "pulse" => {
-            (true, false)
-        }
-        "wave" => (false, true),
-        _ => (false, false), // spectrum, colorwheel, fire — own hue / own ramp
-    }
-}
-
 // ── LIGHTING PERSISTENCE — survive a relaunch ──────────────────────────────────────────────────
 // The applied effect/layer stack (or data mode) + the chosen stream fps are persisted PER-DEVICE in
 // app.toml (see `prefs::DeviceLight`, keyed by pid) so a board RESUMES its effect on launch instead of
@@ -6128,11 +6324,20 @@ thread_local! {
     /// rapid gesture (dragging the speed slider) coalesces into ONE app.toml write ~400ms after the
     /// last edit, instead of one write per emitted value.
     static LIGHT_SAVE_TIMER: slint::Timer = slint::Timer::default();
+    /// The latest pending lighting snapshot the debounce is waiting to write: `(pid, fps, data, layers)`.
+    /// Held ALONGSIDE the timer so the write can be FLUSHED early — on a structural edit or app exit —
+    /// instead of being lost if the app quits before the 400ms settles (the "stacked layers collapse to
+    /// base on relaunch" bug: a stack/re-theme made within the debounce window never reached disk).
+    static LIGHT_PENDING: std::cell::RefCell<
+        Option<(u16, u32, Option<String>, Vec<neuron::pattern::LayerDef>)>,
+    > = std::cell::RefCell::new(None);
 }
 
 /// Persist the SELECTED device's current lighting state (fps + layer stack / data mode), debounced. A
 /// no-op until `LIGHTING_READY` (so restore/install can't overwrite a saved state) and when no device
-/// is selected. Snapshots the state now (cheap); the actual disk write fires once the debounce settles.
+/// is selected. Snapshots the state into `LIGHT_PENDING` now (cheap); the disk write fires once the
+/// debounce settles — OR sooner via [`flush_lighting_save`] (structural edits / app exit), so a quick
+/// quit-and-relaunch can never strand the change.
 fn save_lighting(sh: &SharedRt) {
     if !LIGHTING_READY.load(std::sync::atomic::Ordering::Acquire) {
         return;
@@ -6149,22 +6354,31 @@ fn save_lighting(sh: &SharedRt) {
     if pid == 0 {
         return; // nothing selected → no per-device key to write under
     }
+    LIGHT_PENDING.with(|p| *p.borrow_mut() = Some((pid, fps, data, layers)));
     LIGHT_SAVE_TIMER.with(|t| {
         t.start(
             slint::TimerMode::SingleShot,
             std::time::Duration::from_millis(400),
-            move || {
-                let _ = crate::prefs::set_device_light(
-                    pid,
-                    crate::prefs::DeviceLight {
-                        fps,
-                        data: data.clone(),
-                        layers: layers.clone(),
-                    },
-                );
-            },
+            || flush_lighting_save(),
         );
     });
+}
+
+/// Write any pending lighting snapshot to disk IMMEDIATELY and cancel the debounce. Idempotent and
+/// cheap when nothing's pending. Called three ways: by the debounce timer when it settles; by every
+/// STRUCTURAL edit (stack / remove / tile pick) so a layer change persists the instant it's made,
+/// regardless of how the app later exits; and once after the event loop returns (`main`) so a tray-quit
+/// can't drop a still-debounced knob edit. Must run on the UI thread (the snapshot is thread-local).
+pub fn flush_lighting_save() {
+    LIGHT_SAVE_TIMER.with(|t| t.stop());
+    let pending = LIGHT_PENDING.with(|p| p.borrow_mut().take());
+    if let Some((pid, fps, data, layers)) = pending {
+        if let Err(e) =
+            crate::prefs::set_device_light(pid, crate::prefs::DeviceLight { fps, data, layers })
+        {
+            eprintln!("neuron: lighting save failed ({e})");
+        }
+    }
 }
 
 /// Load the SELECTED device's saved lighting state into the shared runtime + the UI (the fps atomic,
@@ -6223,15 +6437,16 @@ fn apply_current_lighting(app: &AppWindow, sh: &SharedRt) -> String {
             let _ = slint::invoke_from_event_loop(move || {
                 if let Some(app) = done.upgrade() {
                     with_shared(|sh| {
-                        if !std::sync::Arc::ptr_eq(&token, &sh.borrow().rt.anim_stop) {
+                        // ignore a STALE end: this stream was superseded, or already stopped+removed.
+                        if !sh.borrow().rt.anim_is_current(pid, &token) {
                             return;
                         }
-                        if !sh.borrow().rt.animating {
-                            return;
-                        }
-                        sh.borrow_mut().rt.animating = false;
+                        sh.borrow_mut().rt.anim_clear(pid, &token);
                         let st = app.global::<State>();
-                        st.set_compositing(false);
+                        // only clear the indicator if we're VIEWING the board that ended.
+                        if sh.borrow().rt.selected_pid == pid {
+                            st.set_compositing(false);
+                        }
                         st.set_status_line(
                             match reason {
                                 Some(r) => format!("vitals ended: {r}"),
@@ -6252,15 +6467,16 @@ fn apply_current_lighting(app: &AppWindow, sh: &SharedRt) -> String {
             let _ = slint::invoke_from_event_loop(move || {
                 if let Some(app) = back.upgrade() {
                     with_shared(|sh| {
-                        if !std::sync::Arc::ptr_eq(&token, &sh.borrow().rt.anim_stop) {
+                        // ignore a STALE end: this stream was superseded, or already stopped+removed.
+                        if !sh.borrow().rt.anim_is_current(pid, &token) {
                             return;
                         }
-                        if !sh.borrow().rt.animating {
-                            return;
-                        }
-                        sh.borrow_mut().rt.animating = false;
+                        sh.borrow_mut().rt.anim_clear(pid, &token);
                         let st = app.global::<State>();
-                        st.set_compositing(false);
+                        // only clear the indicator if we're VIEWING the board that ended.
+                        if sh.borrow().rt.selected_pid == pid {
+                            st.set_compositing(false);
+                        }
                         st.set_status_line(
                             match reason {
                                 Some(r) => format!("composite ended: {r}"),
@@ -6273,7 +6489,8 @@ fn apply_current_lighting(app: &AppWindow, sh: &SharedRt) -> String {
             });
         })
     };
-    let animating = sh.borrow().rt.animating;
+    let sel = sh.borrow().rt.selected_pid;
+    let animating = sh.borrow().rt.animating(sel);
     st.set_compositing(animating);
     msg
 }
@@ -6287,7 +6504,8 @@ pub fn restore_lighting(app: &AppWindow, sh: &SharedRt) {
     let has_surface = load_lighting_into_state(app, sh);
     if has_surface {
         let msg = apply_current_lighting(app, sh);
-        if sh.borrow().rt.animating {
+        let sel = sh.borrow().rt.selected_pid;
+        if sh.borrow().rt.animating(sel) {
             app.global::<State>()
                 .set_status_line(format!("lighting resumed — {msg}").into());
         }
@@ -6295,44 +6513,19 @@ pub fn restore_lighting(app: &AppWindow, sh: &SharedRt) {
     LIGHTING_READY.store(true, std::sync::atomic::Ordering::Release);
 }
 
-/// Project the Rust-side layer stack into the Slint `light-layers` display model + selected index.
+/// The chokepoint every lighting mutation funnels through: clamp the selection, re-project the stack
+/// into the unified surface (tiles + params + spectrum editor), and persist (debounced).
 pub fn refresh_layers(app: &AppWindow, sh: &SharedRt) {
-    let (defs, sel) = {
+    let (n, sel) = {
         let s = sh.borrow();
-        (s.light_layers.clone(), s.selected_layer)
+        (s.light_layers.len(), s.selected_layer)
     };
-    let rows: Vec<LayerRow> = defs
-        .iter()
-        .map(|d| {
-            let (uses_color, directional) = effect_meta(&d.effect);
-            LayerRow {
-                effect: d.effect.clone().into(),
-                color: d.color.to_hex().into(),
-                col: rgb_to_color(d.color),
-                speed: d.speed,
-                direction: d.direction as i32,
-                blend: d.blend.as_str().into(),
-                uses_color,
-                directional,
-                enabled: d.enabled,
-                region_count: d.region.len() as i32,
-            }
-        })
-        .collect();
     let st = app.global::<State>();
-    let sel = if defs.is_empty() {
-        -1
-    } else {
-        sel.min(defs.len() - 1) as i32
-    };
-    st.set_light_layers(ModelRc::new(VecModel::from(rows)));
-    st.set_selected_layer(sel);
-    // the UNIFIED page is a projection of the SAME stack — keep it in lockstep so every legacy layer
-    // callback (which all call refresh_layers) also updates the tile-driven surface.
+    st.set_selected_layer(if n == 0 { -1 } else { sel.min(n - 1) as i32 });
+    // the unified page + the spectrum editor are projections of the SAME stack — keep them in lockstep.
     refresh_light_unified(app, sh);
-    // every lighting mutation funnels through here, so this is the one chokepoint that persists the
-    // stack. It's a no-op until restore has run (LIGHTING_READY) and is never reached from the animate
-    // loop — only user edits + the tile/data picks — so the disk write stays cheap (and debounced).
+    // It's a no-op until restore has run (LIGHTING_READY) and is never reached from the animate loop —
+    // only user edits + the tile/data picks — so the disk write stays cheap (and debounced).
     save_lighting(sh);
 }
 
@@ -6341,46 +6534,51 @@ pub fn refresh_layers(app: &AppWindow, sh: &SharedRt) {
 // is just `light_layers` with one entry, stacking adds entries, the "active effect" is the selected
 // layer. These helpers project that truth into the tile grid + the schema-rendered param model.
 
-/// The weave accent as a core `Rgb` — the default colour a freshly-picked effect is poured in, so
-/// "set a vibe" is one click. Falls back to the stock phosphor on a junk pref.
-fn weave_accent_rgb() -> Rgb {
-    let p = weave_accent_u32();
-    Rgb::new(
-        ((p >> 16) & 0xFF) as u8,
-        ((p >> 8) & 0xFF) as u8,
-        (p & 0xFF) as u8,
-    )
-}
-
 /// The slug of the cross-device VITALS data tile — the one tile rendered via `render_vitals` rather
-/// than a `FrameGen`. Treated as a first-class "effect" everywhere the page picks/streams a tile.
+/// than a Pattern × Spectrum compositor. Treated as a first-class "effect" where the page picks tiles.
 const VITALS_SLUG: &str = "mouse-battery";
 
-/// The static tile CATALOG, in grid order: the visual effects, then the data mode(s), then the
-/// future stub. `(slug, name, kind)`. The previews are rendered per-tick from this list.
-fn light_tile_catalog() -> &'static [(&'static str, &'static str, &'static str)] {
-    &[
-        ("static", "Static", "effect"),
-        ("breathing", "Breathing", "effect"),
-        ("spectrum", "Spectrum", "effect"),
-        ("wave", "Wave", "effect"),
-        ("aurora", "Aurora", "effect"),
-        ("fire", "Fire", "effect"),
-        ("cascade", "Cascade", "effect"),
-        ("comet", "Comet", "effect"),
-        ("starlight", "Starlight", "effect"),
-        ("reactive", "Reactive", "effect"),
-        ("ripple", "Ripple", "effect"),
-        ("typingheat", "Typing Heat", "effect"),
-        ("colorwheel", "Color Wheel", "effect"),
-        ("audiometer", "Audio Meter", "effect"),
-        ("pulse", "Pulse", "effect"),
-        ("ambient", "Ambient", "effect"),
-        (VITALS_SLUG, "Mouse Battery", "data"),
-        // removed-until-wired: the "Notifications" stub ("notifications"/"stub") was a dead, greyed,
-        // un-clickable tile among live previews. Re-add it here when the notifications-lighting
-        // surface ships (the "stub" kind + its dimmed/SOON rendering are still supported below).
-    ]
+/// The tile CATALOG, in grid order: every PRESET (the single source — [`neuron::pattern::presets`]),
+/// then the data mode(s). `(slug, name, kind)`. Adding a look is a preset entry in core — zero UI code.
+fn light_tile_catalog() -> Vec<(&'static str, &'static str, &'static str)> {
+    let mut v: Vec<(&'static str, &'static str, &'static str)> = neuron::pattern::presets()
+        .iter()
+        .map(|p| (p.slug, p.label, "effect"))
+        .collect();
+    v.push((VITALS_SLUG, "Mouse Battery", "data"));
+    v
+}
+
+/// Build the [`neuron::pattern::LayerDef`] a preset slug describes (the look the tile picker applies),
+/// falling back to a benign default for an unknown slug.
+fn preset_layer(slug: &str) -> neuron::pattern::LayerDef {
+    neuron::pattern::preset_layer(slug).unwrap_or_default()
+}
+
+/// Map a basic (Synapse/profile) effect NAME to a Neuron preset layer — used when an import carries a
+/// `basic` named effect. `col`, when given, repaints a colour-driven look (its spectrum is a solid) in
+/// that colour. Unknown names fall back to a solid `static`.
+fn effect_to_layer(name: &str, col: Option<Rgb>) -> neuron::pattern::LayerDef {
+    // native firmware names → preset slugs (spectrum/spectrumcycling are the "cycle" look).
+    let lower = name.to_lowercase();
+    let slug = match lower.as_str() {
+        "spectrum" | "spectrumcycling" => "cycle",
+        "wheel" => "colorwheel",
+        "stars" => "starlight",
+        other => other,
+    };
+    let mut layer = neuron::pattern::preset_layer(slug).unwrap_or_else(|| preset_layer("static"));
+    if let Some(c) = col {
+        if layer.spectrum.is_solid() {
+            layer.spectrum = neuron::spectrum::Spectrum::solid(c);
+        }
+    }
+    layer
+}
+
+/// A pattern key's human label (for status lines), or the key itself if somehow unknown.
+fn pattern_label(key: &str) -> &str {
+    neuron::pattern::pattern_def(key).map(|d| d.label).unwrap_or(key)
 }
 
 /// Render a `rows*cols` device frame into a small preview Image at the tile's pixel size — the
@@ -6448,16 +6646,34 @@ fn preview_ambient_frame(rows: u8, cols: u8) -> Vec<Rgb> {
 }
 
 /// A representative TYPING HEAT frame for the tile thumbnail — a warm thermal wash with a few hot
-/// flares (the keys-just-hit look), in the user's accent. The thumbnail pass suppresses live key reads
-/// (a perf fix), so a TypingHeat thumbnail can never see typing; this still shows what the effect IS
-/// without faking input. The LIVE typing-reactivity plays only on the SELECTED effect's big preview +
-/// the device stream (both read keys live). Mirrors the `preview_ambient_frame` pattern; the heavy
-/// lifting (the same thermal ramp the device renders) lives in `neuron::effects::preview_typing_heat`.
-fn preview_typingheat_frame(rows: u8, cols: u8) -> Vec<Rgb> {
-    // the tile previews the DEFAULT look — pure warm fire — so it reads as heat regardless of the global
-    // weave accent (being teal, it would recolour the preview into a cold flame).
-    let flame = neuron::effects::default_color("typingheat").unwrap_or_else(weave_accent_rgb);
-    neuron::effects::preview_typing_heat(flame, rows, cols)
+/// flares (the keys-just-hit look). The thumbnail pass suppresses live key reads (a perf fix), so a
+/// Thermal thumbnail can never see typing; this still shows what the effect IS without faking input.
+/// The LIVE typing-reactivity plays only on the SELECTED effect's big preview + the device stream (both
+/// read keys live). It samples the SAME thermal spectrum the device renders, across a synthetic heat
+/// field (a warm bed brightest mid-board, with two hot flares).
+fn preview_thermal_frame(rows: u8, cols: u8) -> Vec<Rgb> {
+    let sp = neuron::pattern::default_spectrum("thermal").unwrap_or_default();
+    let (r, c) = (rows as usize, cols as usize);
+    let mut f = vec![Rgb::BLACK; r * c];
+    let cx = (c as f32 - 1.0) / 2.0;
+    // two fixed "just-pressed" flares so the still reads as live typing without any input.
+    let flares = [(r as f32 * 0.5, c as f32 * 0.35), (r as f32 * 0.4, c as f32 * 0.66)];
+    for y in 0..r {
+        for x in 0..c {
+            // a warm bed: brighter toward the centre column and toward the home rows.
+            let horiz = 1.0 - (x as f32 - cx).abs() / cx.max(1.0);
+            let bed = 0.18 + 0.22 * horiz;
+            // hot flares with a soft radial falloff.
+            let mut hot = 0.0f32;
+            for (fy, fx) in flares {
+                let d = ((y as f32 - fy).powi(2) + (x as f32 - fx).powi(2)).sqrt();
+                hot = hot.max((1.0 - d / 2.6).clamp(0.0, 1.0));
+            }
+            let temp = (bed + 0.75 * hot).clamp(0.0, 1.0);
+            f[y * c + x] = sp.at(0.0, temp);
+        }
+    }
+    f
 }
 
 /// A representative VITALS snapshot for the data tile's PREVIEW (a charging mouse at ~64% on stage 2)
@@ -6473,10 +6689,9 @@ fn preview_vitals() -> neuron::lighting::Vitals {
 }
 
 /// Render the whole tile grid — each tile a live (effects) or representative (data) preview at time
-/// `t`. Effects run the SAME `FrameGen` the device does; the data tile runs `render_vitals`; the
-/// audiometer tile runs the REAL `AudioMeter` generator, which reads the shared `audio_level`
-/// provider — cheap, idle-auto-stopping, and the SAME number the device/main-preview read, so the
-/// thumbnail matches the board instead of faking it.
+/// `t`. Effects run the SAME `Compositor` the device does (one preset layer); the data tile runs
+/// `render_vitals`; the audiometer tile reads the shared `audio_level` provider, pointed at the SAME
+/// source as the device/main-preview so the thumbnail matches the board instead of faking it.
 fn render_light_tiles(app: &AppWindow, sh: &SharedRt, t: f32) {
     let (rows, cols) = sh.borrow().rt.grid_dims();
     if rows == 0 || cols == 0 {
@@ -6484,29 +6699,21 @@ fn render_light_tiles(app: &AppWindow, sh: &SharedRt, t: f32) {
             .set_light_tiles(ModelRc::new(VecModel::from(Vec::<EffectTile>::new())));
         return;
     }
-    let accent = weave_accent_rgb();
     let (ru, cu) = (rows as usize, cols as usize);
-    // The audiometer thumbnail reads the SAME shared audio level the device + big preview do, so it
-    // must request the SAME source — otherwise the two callers would fight over the single global
-    // provider (re-pointing it every tick). Use the configured audiometer layer's source if one is
-    // in the stack, else the default "speakers".
-    let audio_source: &'static str = sh
+    // The audiometer thumbnail must request the SAME source as the device + big preview, else the two
+    // callers fight over the single global provider. Resolve it from the configured meter layer in the
+    // stack (its `source` param index), else the default 0 = speakers.
+    let audio_source: f32 = sh
         .borrow()
         .light_layers
         .iter()
-        .find(|d| d.effect.eq_ignore_ascii_case("audiometer"))
-        .map(|d| {
-            if d.source.eq_ignore_ascii_case("mic") {
-                "mic"
-            } else {
-                "speakers"
-            }
-        })
-        .unwrap_or("speakers");
-    // cache one generator per effect across ticks so stateful effects (fire/starlight) animate; keyed
-    // by slug. Rebuilt only when the grid dims change.
+        .find(|d| d.pattern == "meter")
+        .map(|d| d.params.f32("source", 0.0))
+        .unwrap_or(0.0);
+    // cache one COMPOSITOR per effect across ticks so stateful patterns (heat/sparkle/streak) animate;
+    // keyed by slug. Rebuilt only when the grid dims change.
     thread_local! {
-        static GENS: RefCell<(u8, u8, std::collections::HashMap<String, Box<dyn FrameGen>>)> =
+        static COMPS: RefCell<(u8, u8, std::collections::HashMap<&'static str, neuron::pattern::Compositor>)> =
             RefCell::new((0, 0, std::collections::HashMap::new()));
     }
     let phase = (t * 0.18).rem_euclid(1.0); // for render_vitals' charging crest
@@ -6520,56 +6727,46 @@ fn render_light_tiles(app: &AppWindow, sh: &SharedRt, t: f32) {
     // skipped via `bool::then`, so the render path pays nothing for the instrumentation.
     let tick_start = prof.then(std::time::Instant::now);
     let mut prof_rows: Vec<(&'static str, f64, f64)> = Vec::new();
-    // SUPPRESS the per-key `GetAsyncKeyState` scan for the whole thumbnail pass: the reactive/ripple/
-    // comet generators poll all 256 VKs per frame for live reactivity that's invisible at thumbnail
-    // size (and the selected effect's big preview + the device stream still scan live). Dropped at the
-    // end of the tile loop. ~765 syscalls/tick removed.
+    // SUPPRESS the per-key `GetAsyncKeyState` scan for the whole thumbnail pass: the ignite/ring/
+    // streak/thermal patterns poll all 256 VKs per frame for live reactivity that's invisible at
+    // thumbnail size (and the selected effect's big preview + the device stream still scan live).
+    // Dropped at the end of the tile loop. ~765 syscalls/tick removed.
     let _no_keys = neuron::capture::suppress_key_reads();
     let tiles: Vec<EffectTile> = light_tile_catalog()
-        .iter()
-        .map(|&(slug, name, kind)| {
+        .into_iter()
+        .map(|(slug, name, kind)| {
             let g0 = prof.then(std::time::Instant::now);
             let frame = match kind {
                 "data" => neuron::lighting::render_vitals(preview_vitals(), rows, cols, phase),
                 "stub" => vec![Rgb::BLACK; ru * cu], // a dark, honest "soon" tile
-                // the audiometer thumbnail runs the REAL generator → it reads the shared, fast,
-                // idle-auto-stopping `audio_level` provider (cheap), so the tile matches the device
-                // instead of faking it. Built fresh per tick with the resolved source (the generator
-                // is stateless now) so it tracks a source flip; pointed at the SAME source as the
-                // device/main preview so the single provider isn't re-pointed each tick.
-                _ if slug == "audiometer" => neuron::effects::make_with(
-                    "audiometer",
-                    neuron::effects::EffectParams {
-                        source: audio_source,
-                        ..Default::default()
-                    },
-                )
-                .map(|mut g| g.frame(rows, cols, t, accent))
-                .unwrap_or_else(|| vec![Rgb::BLACK; ru * cu]),
-                // TYPING HEAT thumbnail: ALWAYS a representative still. The thumbnail pass suppresses
-                // live key reads (the perf fix), so a TypingHeat thumbnail can never see typing — it
-                // would render a cold idle board. The still shows what the effect IS (a warm thermal
-                // wash with flares); the LIVE typing-reactivity plays on the selected big preview + the
-                // device stream, which read keys on their own (un-suppressed) paths.
-                _ if slug == "typingheat" => preview_typingheat_frame(rows, cols),
+                // the audiometer thumbnail runs the REAL meter pattern → it reads the shared, fast,
+                // idle-auto-stopping `audio_level` provider (cheap), so the tile matches the device.
+                // Built fresh per tick with the resolved source so it tracks a source flip and points
+                // at the SAME source as the device/main preview (the single provider isn't re-pointed).
+                _ if slug == "audiometer" => {
+                    let mut layer = preset_layer("audiometer");
+                    layer.params.set("source", audio_source);
+                    let mut comp = neuron::pattern::Compositor::from_defs(&[layer]);
+                    comp.render(rows, cols, t)
+                }
+                // TYPING HEAT thumbnail: ALWAYS a representative still — the thumbnail pass suppresses
+                // live key reads, so the thermal field would otherwise sit cold. The still shows what
+                // the effect IS; live typing plays on the selected big preview + the device stream.
+                _ if slug == "typingheat" => preview_thermal_frame(rows, cols),
                 // AMBIENT thumbnail: render LIVE (driving the whole-desktop capture) ONLY when ambient
-                // is the selected effect — then the big preview + device stream already run the capture,
-                // so the thumbnail just reads the warm grid. Otherwise show a representative still and
-                // touch no provider, so the ~41ms/grab StretchBlt never runs for an unselected tile.
+                // is the selected effect — then the big preview + device stream already run the capture.
+                // Otherwise show a representative still and touch no provider (no ~41ms/grab StretchBlt).
                 _ if slug == "ambient" && selected != "ambient" => preview_ambient_frame(rows, cols),
-                _ => GENS.with(|g| {
-                    let mut g = g.borrow_mut();
-                    if g.0 != rows || g.1 != cols {
-                        *g = (rows, cols, std::collections::HashMap::new());
+                _ => COMPS.with(|c| {
+                    let mut c = c.borrow_mut();
+                    if c.0 != rows || c.1 != cols {
+                        *c = (rows, cols, std::collections::HashMap::new());
                     }
-                    let gen = g
+                    let comp = c
                         .2
-                        .entry(slug.to_string())
-                        .or_insert_with(|| {
-                            neuron::effects::make(slug)
-                                .unwrap_or_else(|| Box::new(neuron::effects::Solid))
-                        });
-                    gen.frame(rows, cols, t, accent)
+                        .entry(slug)
+                        .or_insert_with(|| neuron::pattern::Compositor::from_defs(&[preset_layer(slug)]));
+                    comp.render(rows, cols, t)
                 }),
             };
             let gen_us = g0.map_or(0.0, |s| s.elapsed().as_nanos() as f64 / 1000.0);
@@ -6596,56 +6793,31 @@ fn render_light_tiles(app: &AppWindow, sh: &SharedRt, t: f32) {
     }
 }
 
-/// Build the `EffectParam` controls for `def` from the effect's declared schema, filling each row's
-/// live value from the layer def. Returns `(params, uses_color, color_hex, color_col)` — the colour
-/// knob is lifted out so the page renders its swatch row directly.
-fn params_for(def: &neuron::effects::LayerDef) -> (Vec<EffectParam>, bool, String, slint::Color) {
+/// Build the `EffectParam` controls for a layer from its PATTERN's declared schema, filling each row's
+/// live value from the layer's param bag. Patterns carry NO colour params (colour is the Spectrum), so
+/// the colour kind never appears — the SPECTRUM editor is the colour authority.
+fn params_for(def: &neuron::pattern::LayerDef) -> Vec<EffectParam> {
     use neuron::effects::ParamKind;
     let mut out = Vec::new();
-    let mut uses_color = false;
-    // lowercase so it matches the shared lowercase swatch palette (Palette.accent) — the ColorPicker's
-    // selected-swatch ring compares this against the swatch hex. Parsing is case-insensitive, so this is
-    // display-only.
-    let hex = def.color.to_hex().to_lowercase();
-    let col = rgb_to_color(def.color);
-    for p in neuron::effects::schema(&def.effect) {
+    let no_opts = || ModelRc::new(VecModel::from(Vec::<SharedString>::new()));
+    for p in neuron::pattern::pattern_params(&def.pattern) {
         match p.kind {
-            ParamKind::Color => {
-                uses_color = true;
-                // the page renders colour itself; keep a row out of the generic list
-            }
-            ParamKind::Range { min, max, .. } => {
-                let fval = match p.key {
-                    "speed" => def.speed,
-                    "density" => def.density,
-                    "fade" => def.fade,
-                    _ => 1.0,
-                };
-                out.push(EffectParam {
-                    key: p.key.into(),
-                    label: p.label.into(),
-                    kind: "range".into(),
-                    fval,
-                    fmin: min,
-                    fmax: max,
-                    options: ModelRc::new(VecModel::from(Vec::<SharedString>::new())),
-                    ival: 0,
-                    hex: "".into(),
-                    col: slint::Color::default(),
-                    bval: false,
-                });
-            }
-            ParamKind::Enum { options, .. } => {
-                let ival = match p.key {
-                    "direction" => def.direction as i32,
-                    "breath" => def.breath as i32,
-                    // the audiometer source: reflect the stored plain word back as its option index
-                    // (mic = 1, the speakers default = 0) so the segment shows the live selection.
-                    "source" => i32::from(def.source.eq_ignore_ascii_case("mic")),
-                    _ => 0,
-                };
-                let opts: Vec<SharedString> =
-                    options.iter().map(|o| (*o).into()).collect();
+            ParamKind::Color => {} // patterns never declare colour (it lives in the spectrum)
+            ParamKind::Range { min, max, default } => out.push(EffectParam {
+                key: p.key.into(),
+                label: p.label.into(),
+                kind: "range".into(),
+                fval: def.params.f32(p.key, default),
+                fmin: min,
+                fmax: max,
+                options: no_opts(),
+                ival: 0,
+                hex: "".into(),
+                col: slint::Color::default(),
+                bval: false,
+            }),
+            ParamKind::Enum { options, default } => {
+                let opts: Vec<SharedString> = options.iter().map(|o| (*o).into()).collect();
                 out.push(EffectParam {
                     key: p.key.into(),
                     label: p.label.into(),
@@ -6654,75 +6826,216 @@ fn params_for(def: &neuron::effects::LayerDef) -> (Vec<EffectParam>, bool, Strin
                     fmin: 0.0,
                     fmax: 0.0,
                     options: ModelRc::new(VecModel::from(opts)),
-                    ival,
+                    ival: def.params.u8(p.key, default) as i32,
                     hex: "".into(),
                     col: slint::Color::default(),
                     bval: false,
                 });
             }
-            ParamKind::Toggle { default } => {
-                // reflect the live layer field back (so the switch shows the stored selection), not the
-                // schema default — keyed per toggle like the other knobs.
-                let bval = match p.key {
-                    "glow" => def.glow,
-                    _ => default,
-                };
-                out.push(EffectParam {
-                    key: p.key.into(),
-                    label: p.label.into(),
-                    kind: "toggle".into(),
-                    fval: 0.0,
-                    fmin: 0.0,
-                    fmax: 0.0,
-                    options: ModelRc::new(VecModel::from(Vec::<SharedString>::new())),
-                    ival: 0,
-                    hex: "".into(),
-                    col: slint::Color::default(),
-                    bval,
-                });
-            }
+            ParamKind::Toggle { default } => out.push(EffectParam {
+                key: p.key.into(),
+                label: p.label.into(),
+                kind: "toggle".into(),
+                fval: 0.0,
+                fmin: 0.0,
+                fmax: 0.0,
+                options: no_opts(),
+                ival: 0,
+                hex: "".into(),
+                col: slint::Color::default(),
+                bval: def.params.bool(p.key, default),
+            }),
         }
     }
-    (out, uses_color, hex, col)
+    out
 }
 
-/// Project the layer stack into the unified surface: the active effect's slug (the selected layer),
-/// the auto-rendered param model + colour, and the stack size. The data tile reports an empty schema
-/// (honest: a readout has no knobs).
+/// The tile slug to highlight + keep the inspector open for: the preset the active layer EXACTLY
+/// matches, else the first preset using the layer's pattern (so a customised layer still shows a
+/// representative tile and the inspector stays open — `light-effect` must stay non-empty).
+fn tile_slug_for_layer(def: &neuron::pattern::LayerDef) -> &'static str {
+    neuron::pattern::slug_for_layer(def).unwrap_or_else(|| {
+        neuron::pattern::presets()
+            .into_iter()
+            .find(|p| p.pattern == def.pattern)
+            .map(|p| p.slug)
+            .unwrap_or("static")
+    })
+}
+
+/// Project the layer stack into the unified surface: the active tile slug (the selected layer), the
+/// auto-rendered PATTERN param model, the stack size, and the SPECTRUM editor surface. A data readout
+/// (and the full-colour Screen pattern) reports no schema + no spectrum (honest: nothing to edit).
 fn refresh_light_unified(app: &AppWindow, sh: &SharedRt) {
-    let (defs, sel, data) = {
+    let (defs, sel, data, active_frame) = {
         let s = sh.borrow();
-        (s.light_layers.clone(), s.selected_layer, s.light_data.clone())
+        (s.light_layers.clone(), s.selected_layer, s.light_data.clone(), s.active_frame)
     };
     let st = app.global::<State>();
+    let empty_params = || ModelRc::new(VecModel::from(Vec::<EffectParam>::new()));
     // DATA vs EFFECT: the RATE control (and the streaming pacer) only apply to streamed effects —
     // a data readout paints on-demand, so flag it so the page gates the fps control off.
     st.set_light_is_data(data.is_some());
-    // DATA mode owns the surface: the active tile is the data slug, with no generator knobs (a
-    // readout has none) and no stack (it paints the whole board).
+    // DATA mode owns the surface: the active tile is the data slug, with no knobs / no spectrum / no stack.
     if let Some(slug) = data {
         st.set_light_effect(slug.into());
-        st.set_light_params(ModelRc::new(VecModel::from(Vec::<EffectParam>::new())));
-        st.set_light_uses_color(false);
+        st.set_light_params(empty_params());
+        st.set_light_has_spectrum(false);
         st.set_light_stack_count(0);
+        clear_spectrum_surface(app);
         return;
     }
     if defs.is_empty() {
         st.set_light_effect("".into());
-        st.set_light_params(ModelRc::new(VecModel::from(Vec::<EffectParam>::new())));
-        st.set_light_uses_color(false);
+        st.set_light_params(empty_params());
+        st.set_light_has_spectrum(false);
         st.set_light_stack_count(0);
+        clear_spectrum_surface(app);
         return;
     }
     let sel = sel.min(defs.len() - 1);
     let active = &defs[sel];
-    st.set_light_effect(active.effect.clone().into());
-    let (params, uses_color, hex, col) = params_for(active);
-    st.set_light_params(ModelRc::new(VecModel::from(params)));
-    st.set_light_uses_color(uses_color);
-    st.set_light_color_hex(hex.into());
-    st.set_light_color_col(col);
+    st.set_light_effect(tile_slug_for_layer(active).into());
+    st.set_light_params(ModelRc::new(VecModel::from(params_for(active))));
     st.set_light_stack_count(defs.len() as i32);
+    // the SPECTRUM editor — every pattern except the full-colour Screen (Ambient) carries an editable
+    // 1-D spectrum.
+    let has_spectrum = active.pattern != "screen";
+    st.set_light_has_spectrum(has_spectrum);
+    if has_spectrum {
+        project_spectrum(app, &active.spectrum, active_frame);
+    } else {
+        clear_spectrum_surface(app);
+    }
+}
+
+/// Clear the spectrum-editor surface (no stops / no sequence) — used for data + full-colour Screen layers.
+fn clear_spectrum_surface(app: &AppWindow) {
+    let st = app.global::<State>();
+    st.set_light_stops(ModelRc::new(VecModel::from(Vec::<SpectrumStop>::new())));
+    st.set_light_seq(ModelRc::new(VecModel::from(Vec::<SpectrumFrame>::new())));
+    st.set_light_active_frame(0);
+    st.set_light_motion("hold".into());
+    st.set_light_interp("rgb".into());
+}
+
+/// Project a spectrum into the State spectrum-editor surface: the ACTIVE frame's palette stops +
+/// motion, plus the whole sequence (timeline chips), the loop policy, and the scrubber index.
+fn project_spectrum(app: &AppWindow, sp: &neuron::spectrum::Spectrum, active_frame: usize) {
+    use neuron::spectrum::Motion;
+    let st = app.global::<State>();
+    // A Spectrum always carries ≥1 frame (every constructor guarantees it), but guard the index for
+    // REAL instead of leaning on a `.max(1)` that quietly wouldn't protect `seq[fr]` if that invariant
+    // ever broke: clamp, then `get` — an empty seq clears the surface rather than panicking.
+    let fr = active_frame.min(sp.seq.len().saturating_sub(1));
+    let Some(frame) = sp.seq.get(fr) else {
+        clear_spectrum_surface(app);
+        return;
+    };
+    let palette = &frame.palette;
+    // gradient strip — the active frame's stops
+    let stops: Vec<SpectrumStop> = palette
+        .stops
+        .iter()
+        .enumerate()
+        .map(|(i, s)| SpectrumStop {
+            idx: i as i32,
+            hex: s.col.to_hex().to_lowercase().into(),
+            col: rgb_to_color(s.col),
+            at: s.at,
+        })
+        .collect();
+    st.set_light_stops(ModelRc::new(VecModel::from(stops)));
+    // motion row
+    let (kind, speed, depth, chaos) = match palette.motion {
+        Motion::Hold => ("hold", 1.0, 0.5, 0.5),
+        Motion::Drift { speed } => ("drift", speed, 0.5, 0.5),
+        Motion::Cycle { speed } => ("cycle", speed, 0.5, 0.5),
+        Motion::Breathe { speed, depth } => ("breathe", speed, depth, 0.5),
+        Motion::Flow { speed, chaos } => ("flow", speed, 0.5, chaos),
+    };
+    st.set_light_motion(kind.into());
+    st.set_light_motion_speed(speed);
+    st.set_light_motion_depth(depth);
+    st.set_light_motion_chaos(chaos);
+    // gradient interpolation space (rgb default | hsv perceptual)
+    st.set_light_interp(palette.interp.as_str().into());
+    // timeline — one chip per frame (a live strip of its palette)
+    let seq: Vec<SpectrumFrame> = sp
+        .seq
+        .iter()
+        .enumerate()
+        .map(|(i, f)| SpectrumFrame {
+            idx: i as i32,
+            hold: f.hold,
+            fade: f.fade,
+            ease: f.ease.as_str().into(),
+            swatch: palette_strip_image(&f.palette),
+        })
+        .collect();
+    st.set_light_seq(ModelRc::new(VecModel::from(seq)));
+    st.set_light_active_frame(fr as i32);
+    st.set_light_loop(sp.play.as_str().into());
+}
+
+/// Render a small horizontal strip of a palette (the timeline frame chip) — samples the gradient across
+/// the width so a frame reads as its colour program at a glance.
+fn palette_strip_image(palette: &neuron::spectrum::Palette) -> Image {
+    let (w, h) = (96usize, 14usize);
+    let mut buf = SharedPixelBuffer::<Rgba8Pixel>::new(w as u32, h as u32);
+    {
+        let px = buf.make_mut_slice();
+        for x in 0..w {
+            let u = if w > 1 { x as f32 / (w as f32 - 1.0) } else { 0.0 };
+            let c = palette.sample(u);
+            for y in 0..h {
+                px[y * w + x] = Rgba8Pixel { r: c.r, g: c.g, b: c.b, a: 255 };
+            }
+        }
+    }
+    Image::from_rgba8(buf)
+}
+
+/// Mutate the active layer's spectrum (the closure also gets the clamped active-frame index), then
+/// bump the revision + re-project + persist through the one chokepoint.
+fn edit_active_spectrum(
+    app: &AppWindow,
+    sh: &SharedRt,
+    f: impl FnOnce(&mut neuron::spectrum::Spectrum, usize),
+) {
+    {
+        let mut s = sh.borrow_mut();
+        let sel = s.selected_layer;
+        let fr = s.active_frame;
+        if let Some(d) = s.light_layers.get_mut(sel) {
+            let fr = fr.min(d.spectrum.seq.len().saturating_sub(1));
+            f(&mut d.spectrum, fr);
+        }
+        s.layers_rev += 1;
+    }
+    refresh_layers(app, sh);
+}
+
+/// Mutate the active layer's ACTIVE-FRAME palette (the gradient strip / motion editors).
+fn edit_active_palette(app: &AppWindow, sh: &SharedRt, f: impl FnOnce(&mut neuron::spectrum::Palette)) {
+    edit_active_spectrum(app, sh, |sp, fr| {
+        if let Some(frame) = sp.seq.get_mut(fr) {
+            f(&mut frame.palette);
+        }
+    });
+}
+
+/// Rebuild the active palette's Motion from the State motion knobs (kind/speed/depth/chaos) so a
+/// motion-kind switch keeps the other knobs.
+fn rebuild_motion(app: &AppWindow, sh: &SharedRt) {
+    let st = app.global::<State>();
+    let kind = st.get_light_motion().to_string();
+    let speed = st.get_light_motion_speed();
+    let depth = st.get_light_motion_depth();
+    let chaos = st.get_light_motion_chaos();
+    edit_active_palette(app, sh, |pal| {
+        pal.motion = neuron::spectrum::Motion::from_parts(&kind, speed, Some(depth), Some(chaos));
+    });
 }
 
 pub fn init_grid(app: &AppWindow, sh: &SharedRt) {
@@ -6753,7 +7066,8 @@ pub fn init_grid(app: &AppWindow, sh: &SharedRt) {
 }
 
 /// Render an activation phrase as instrument symbols for the rhythm readout:
-/// ● tap · ▬ hold · ⇄ appended to a pure-tap (toggle) phrase.
+/// ● tap · ▬ hold · ↔ appended to a pure-tap (toggle) phrase. (↔ not ⇄: Consolas renders ↔, the
+/// double-bar arrow tofus.)
 fn phrase_symbols(pattern: &str) -> String {
     let phrase =
         neuron::feel::Phrase::parse(pattern).unwrap_or_else(|_| neuron::feel::Phrase::hold());
@@ -6766,7 +7080,7 @@ fn phrase_symbols(pattern: &str) -> String {
         })
         .collect();
     if !phrase.ends_in_hold() {
-        out.push("⇄");
+        out.push("↔");
     }
     out.join(" ")
 }
@@ -6777,6 +7091,11 @@ fn sync_activation_view(st: &State, pattern: &str) {
     st.set_activation_display(phrase_symbols(pattern).into());
 }
 
+/// Set true to ABORT an in-flight weave capture (glyph recorder or radial preview) — the capture
+/// loop polls it like ESC. The record button's toggle raises it to stop a stuck stroke; each fresh
+/// capture lowers it before starting. Global because there is only ever one capture in flight.
+static CANCEL_CAPTURE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// The ONE weave capture path — used by BOTH the glyph recorder and the radial preview, so the
 /// overlay behaves byte-for-byte identically for either facet of spellweaving (the only difference
 /// is the [`crate::overlay::WeaveMode`] passed in). Waits for the configured activation RHYTHM,
@@ -6784,6 +7103,9 @@ fn sync_activation_view(st: &State, pattern: &str) {
 /// `recognized`, and returns the captured path. The sigil's fade-out is DETACHED so the return is
 /// immediate — spamming weaves re-arms within one poll tick, never gated on an animation.
 /// Blocking — call it on a worker thread.
+///
+/// CANCEL: the capture polls [`CANCEL_CAPTURE`] every tick (same path as ESC), so the record button
+/// can stop an in-flight (or wedged) stroke by setting it — see [`record_gesture`]'s toggle.
 fn weave_capture(
     trigger: i32,
     phrase: &neuron::feel::Phrase,
@@ -6797,11 +7119,18 @@ fn weave_capture(
     let _editor = crate::beacon::EditorWeave::engage();
     let overlay = crate::overlay::SpellOverlay::spawn();
     overlay.begin(mode);
-    let path = neuron::glyph::capture_phrase(trigger, phrase, feel, 600, |pts| {
-        let rel: Vec<(f32, f32)> = pts.iter().map(|c| (c.re as f32, c.im as f32)).collect();
-        overlay.push(rel);
-        on_pts(pts);
-    });
+    let path = neuron::glyph::capture_phrase_until(
+        trigger,
+        phrase,
+        feel,
+        600,
+        &|| CANCEL_CAPTURE.load(std::sync::atomic::Ordering::Relaxed),
+        |pts| {
+            let rel: Vec<(f32, f32)> = pts.iter().map(|c| (c.re as f32, c.im as f32)).collect();
+            overlay.push(rel);
+            on_pts(pts);
+        },
+    );
     overlay.recognized(recognized(&path));
     overlay.end();
     // let the sigil fade on its own time — the capture (and the user's next weave) doesn't wait.
@@ -6825,7 +7154,24 @@ fn free_glyph_name(vault: &neuron::gesture::Vault) -> String {
 /// the result back to the UI.
 fn record_gesture(app: &AppWindow, sh: &SharedRt) {
     let st = app.global::<State>();
+    // TOGGLE — a second press while a capture is in flight (or stuck) STOPS it instead of being
+    // ignored: cancel any live capture AND clear the UI, so the recorder can never strand in
+    // "recording". (A worker that died mid-analysis leaves the cursor free but this flag set, with
+    // the old enabled-gate the button was dead; resetting here is the always-available way out.)
+    if st.get_capturing_gesture() {
+        CANCEL_CAPTURE.store(true, std::sync::atomic::Ordering::Relaxed);
+        st.set_capturing_gesture(false);
+        st.set_gesture_predict("".into());
+        st.set_gesture_status("recording stopped".into());
+        return;
+    }
+    // lower any STALE cancel before arming a fresh recording — a prior capture's cancel (or a
+    // toggle-stop) must not abort this one. The REAL race this guards: the worker spawned below
+    // polls this same flag every tick, so a cancel arriving between that spawn and the worker's
+    // first read would (correctly) stop it; clearing here ensures only a NEW cancel can do so.
+    CANCEL_CAPTURE.store(false, std::sync::atomic::Ordering::Relaxed);
     st.set_capturing_gesture(true);
+    st.set_stroke_saved(false); // a normal glyph record clears any prior rich-save reveal link
     let (trigger, phrase) = {
         let s = sh.borrow();
         (s.rt.cast.trigger, s.rt.cast.phrase())
@@ -6936,12 +7282,153 @@ fn record_gesture(app: &AppWindow, sh: &SharedRt) {
     });
 }
 
+/// Like [`weave_capture`], but uses the **timestamped, un-thinned** capture ([`neuron::glyph::
+/// capture_phrase_until_stamped`]) for strokelab research dumps — returns the raw path AND its
+/// per-sample timestamps. Same overlay + cancel wiring, so drawing feels identical to recording.
+#[allow(clippy::too_many_arguments)]
+fn weave_capture_stamped(
+    trigger: i32,
+    phrase: &neuron::feel::Phrase,
+    feel: &neuron::feel::FeelConfig,
+    mode: crate::overlay::WeaveMode,
+    mut on_pts: impl FnMut(&[neuron::glyph::C]),
+) -> (Vec<neuron::glyph::C>, Vec<u32>) {
+    let _editor = crate::beacon::EditorWeave::engage();
+    let overlay = crate::overlay::SpellOverlay::spawn();
+    overlay.begin(mode);
+    let (path, stamps) = neuron::glyph::capture_phrase_until_stamped(
+        trigger,
+        phrase,
+        feel,
+        crate::strokelab::RICH_MAX_PTS,
+        &|| CANCEL_CAPTURE.load(std::sync::atomic::Ordering::Relaxed),
+        |pts| {
+            let rel: Vec<(f32, f32)> = pts.iter().map(|c| (c.re as f32, c.im as f32)).collect();
+            overlay.push(rel);
+            on_pts(pts);
+        },
+    );
+    overlay.recognized(path.len() >= 3);
+    overlay.end();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(350));
+        drop(overlay);
+    });
+    (path, stamps)
+}
+
+/// strokelab: Shift+Record. Capture a FULL rich weave at sensor fidelity (with per-sample
+/// timestamps, never thinned) and write the whole eigenmotion bundle to `./strokes/` — the vault is
+/// NOT touched. The capture path is byte-identical to [`record_gesture`]'s; only the destination
+/// differs (a research file instead of a learned gesture). A second press cancels, same as record.
+fn record_rich_stroke(app: &AppWindow, sh: &SharedRt) {
+    let st = app.global::<State>();
+    // TOGGLE — a press while capturing stops it (mirrors record_gesture; the flag is shared).
+    if st.get_capturing_gesture() {
+        CANCEL_CAPTURE.store(true, std::sync::atomic::Ordering::Relaxed);
+        st.set_capturing_gesture(false);
+        st.set_rich_capturing(false);
+        st.set_gesture_predict("".into());
+        st.set_gesture_status("recording stopped".into());
+        return;
+    }
+    CANCEL_CAPTURE.store(false, std::sync::atomic::Ordering::Relaxed);
+    st.set_capturing_gesture(true);
+    st.set_rich_capturing(true); // drives the panel's distinct "different mode" treatment
+    st.set_stroke_saved(false); // no reveal link until this capture actually writes a file
+    let (trigger, phrase) = {
+        let s = sh.borrow();
+        (s.rt.cast.trigger, s.rt.cast.phrase())
+    };
+    st.set_gesture_status(
+        format!(
+            "RICH STROKE → file · {} and draw — ESC cancels",
+            st.get_cast_trigger_label()
+        )
+        .into(),
+    );
+    let cfg = sh.borrow().rt.vault.config;
+    // a snapshot of the vault rides along so the dump can record what this stroke MATCHED (read
+    // off the existing fingerprints) — research metadata, never a write.
+    let vault = sh.borrow().rt.vault.clone();
+    let w = app.as_weak();
+    let trail_w = app.as_weak();
+    std::thread::spawn(move || {
+        let feel = neuron::feel::FeelConfig::load();
+        let mut last_trail_len = 0usize;
+        let (path, stamps) = weave_capture_stamped(
+            trigger,
+            &phrase,
+            &feel,
+            crate::overlay::WeaveMode::Glyph { hint: None },
+            |pts| {
+                // stream the live trail onto the panel canvas (~every 14 new points), exactly like
+                // record_gesture, so the rich stroke forms on screen as you draw it.
+                if pts.len() >= 4 && pts.len() - last_trail_len >= 14 {
+                    last_trail_len = pts.len();
+                    let trail = normalize_trail(pts);
+                    let ui = trail_w.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(app) = ui.upgrade() {
+                            app.global::<State>()
+                                .set_trail(ModelRc::new(VecModel::from(trail)));
+                        }
+                    });
+                }
+            },
+        );
+        let captured = path.len();
+        let trail = normalize_trail(&path);
+        // write the bundle off the UI thread (file I/O + engram encode can take a beat on a long stroke).
+        let saved = if captured >= 3 {
+            Some(crate::strokelab::dump_stroke(&path, &stamps, &cfg, &vault))
+        } else {
+            None
+        };
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(app) = w.upgrade() {
+                let st = app.global::<State>();
+                st.set_capturing_gesture(false);
+                st.set_rich_capturing(false);
+                st.set_stroke_saved(false); // only a genuine save (below) lights the reveal link
+                st.set_gesture_predict("".into());
+                if captured == 0 {
+                    st.set_gesture_status("cancelled".into());
+                    return;
+                }
+                if captured < 3 {
+                    st.set_gesture_status("too short — try again".into());
+                    return;
+                }
+                st.set_trail(ModelRc::new(VecModel::from(trail)));
+                match saved {
+                    Some(Ok((json, _gwyph, n))) => {
+                        let name = json
+                            .file_name()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "stroke.json".into());
+                        st.set_gesture_status(
+                            format!("saved strokes/{name} ({n} pts) + .gwyph · click to reveal").into(),
+                        );
+                        st.set_stroke_saved(true); // the status line is now a clickable reveal link
+                    }
+                    Some(Err(e)) => {
+                        st.set_gesture_status(format!("stroke save failed: {e}").into());
+                    }
+                    None => st.set_gesture_status("too short — try again".into()),
+                }
+            }
+        });
+    });
+}
+
 /// Test the wheel: hold the cast trigger and flick. Goes through the EXACT same [`weave_capture`]
 /// path as glyph recording — only the overlay mode differs (the sector wheel instead of the rune
 /// ring) — so the radial flick and the rich glyph really are one system. Feedback lands in
 /// `radial-status`, beside the wheel the user is looking at.
 fn preview_radial(app: &AppWindow, sh: &SharedRt) {
     let st = app.global::<State>();
+    CANCEL_CAPTURE.store(false, std::sync::atomic::Ordering::Relaxed); // a prior cancel must not abort this
     st.set_capturing_gesture(true);
     st.set_editing_sector(-1); // a flick is navigation, not an edit continuation
     let (trigger, sectors, deadzone, phrase, widgets) = {
@@ -7072,6 +7559,17 @@ fn reveal_macros_folder() {
     let dir = std::env::current_dir()
         .unwrap_or_else(|_| ".".into())
         .join(neuron::macros::macro_host::macros_dir());
+    let _ = std::fs::create_dir_all(&dir);
+    open_in_file_manager(&dir);
+}
+
+/// Reveal the strokelab output folder (`./strokes/`, cwd-relative like the vault) in the OS file
+/// manager — clicking a "saved strokes/…" line jumps you to the exported `.gwyph` + `.json`. Resolve
+/// to an ABSOLUTE path and create it if missing, so reveal works even before the first capture.
+fn reveal_strokes_folder() {
+    let dir = std::env::current_dir()
+        .unwrap_or_else(|_| ".".into())
+        .join("strokes");
     let _ = std::fs::create_dir_all(&dir);
     open_in_file_manager(&dir);
 }

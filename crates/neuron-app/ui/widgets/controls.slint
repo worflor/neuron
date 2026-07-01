@@ -819,36 +819,56 @@ export component ActionPicker inherits VerticalLayout {
     }
     // suggestion CHIPS: live, clickable fills for the param — open windows for glance
     // (specific titles, then broad exe stems), saved profiles, registered macros.
-    if State.param-suggestions.length > 0 : Flickable {
+    //
+    // WRAPPED in a plain clipped Rectangle (NOT a bare Flickable directly in this VerticalLayout). A
+    // Flickable reports its CONTENT's preferred-width up the layout tree (content-driven + non-
+    // deterministic — see slint-layout-gotchas), so directly here it collapsed the whole `stretch: 1`
+    // GLYPH editor column to the chips' width — only on BOUND glyphs (the ones with suggestions), which
+    // made the radial pane jump left with a slab of dead space. A Rectangle isn't a layout, so its own
+    // preferred-width stays 0 and the Flickable's width can't propagate up to defeat the column's stretch;
+    // the Flickable just fills the Rectangle and scrolls the chips inside it.
+    if State.param-suggestions.length > 0 : Rectangle {
         height: 26px;
-        HorizontalLayout {
-            spacing: 4px;
-            for s in State.param-suggestions : Rectangle {
-                height: 22px;
-                border-radius: Theme.radius-sm;
-                border-width: Theme.hair;
-                border-color: chip.has-hover ? Theme.accent-line : Theme.line;
-                background: chip.has-hover ? Theme.well : Theme.bg-2;
-                animate border-color, background { duration: Theme.quick; }
-                HorizontalLayout {
-                    padding-left: 8px;
-                    padding-right: 8px;
-                    Text {
-                        text: s;
-                        color: chip.has-hover ? Theme.text : Theme.text-mid;
-                        font-family: Theme.mono;
-                        font-size: Theme.fs-small;
-                        vertical-alignment: center;
+        clip: true;
+        Flickable {
+            width: parent.width;
+            height: parent.height;
+            interactive: false;                      // wheel-only, like the page (no drag-hijack)
+            viewport-width: chiprow.preferred-width;
+            viewport-height: self.height;
+            chiprow := HorizontalLayout {
+                spacing: 4px;
+                for s in State.param-suggestions : Rectangle {
+                    height: 22px;
+                    border-radius: Theme.radius-sm;
+                    border-width: Theme.hair;
+                    border-color: chip.has-hover ? Theme.accent-line : Theme.line;
+                    background: chip.has-hover ? Theme.well : Theme.bg-2;
+                    animate border-color, background { duration: Theme.quick; }
+                    HorizontalLayout {
+                        padding-left: 8px;
+                        padding-right: 8px;
+                        Text {
+                            text: s;
+                            color: chip.has-hover ? Theme.text : Theme.text-mid;
+                            font-family: Theme.mono;
+                            font-size: Theme.fs-small;
+                            vertical-alignment: center;
+                        }
                     }
+                    chip := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { State.action-param = s; } }
                 }
-                chip := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { State.action-param = s; } }
             }
         }
     }
     if root.cur-hint != "" : HorizontalLayout {
         spacing: 6px;
         Field {
-            field-width: root.capturable || root.recordable ? 218px : 280px;
+            // capturable/recordable rows carry a CAPTURE/REC button — let the field FILL the column
+            // so the button lands at the right edge (not orphaned mid-row), matching the full-width
+            // dropdown above it. (Field caps at field-width AND shrinks via stretch, so a large value
+            // reads as "fill this column".) A plain param row keeps its own tidy width.
+            field-width: root.capturable || root.recordable ? 1200px : 280px;
             placeholder: root.cur-hint;
             text <=> State.action-param;
         }
@@ -1161,43 +1181,34 @@ export component InputHead inherits HorizontalLayout {
     }
 }
 
-// THE BOOK BUTTON — opens an in-app GUIDE popup anchored at itself. The glyph is an open book drawn
-// from Rectangles (no font): two page covers flanking a thin spine, with faint page lines. Quiet at
-// rest (text-dim), accent on hover OR while ITS guide is the one on screen. Drop one beside any header
-// with a `guide-id` and the popup (app.slint) renders that guide off GuideContent (guides.slint) —
-// adding help is data, never new chrome. It anchors the popup at its own bottom-left (absolute coords).
+// THE GUIDE CHIP — opens an in-app GUIDE popup anchored at itself. A single mono "?" in a tight,
+// hairline-framed cell, using the SAME chip language as Pill / Contact (radius-sm, accent-glow fill +
+// accent-line border when lit) so it reads as a real instrument control, not a bubbly help bauble.
+// Quiet at rest (faint frame, dim "?"), accent on hover OR while ITS guide is the one on screen. Drop
+// one beside any header with a `guide-id` and the popup (app.slint) renders that guide off GuideContent
+// (guides.slint) — adding help is data, never new chrome. It anchors the popup at its own bottom-left.
 export component GuideButton inherits Rectangle {
     in property <string> guide-id;
-    // lit while hovered OR while this exact guide is open
-    property <bool> active: State.guide-open && State.guide-active-id == root.guide-id;
-    property <color> ink: (root.active || gta.has-hover) ? Theme.accent : Theme.text-dim;
-    property <color> ink-faint: (root.active || gta.has-hover) ? Theme.accent.with-alpha(0.5) : Theme.text-faint;
-    width: 24px;
-    height: 22px;
+    // lit while hovered OR while this exact guide is the one on screen
+    property <bool> lit: (State.guide-open && State.guide-active-id == root.guide-id) || gta.has-hover;
+    width: 18px;
+    height: 18px;
     border-radius: Theme.radius-sm;
-    background: gta.has-hover ? Theme.well : transparent;
-    animate background { duration: Theme.quick; }
-    // a help "chip" — a bold "?" in a rounded outline (the universal "explain this" mark), lit in the
-    // accent on hover / while this guide is open. Crisper + more confident than a tiny drawn book.
-    Rectangle {
-        width: 17px;
-        height: 17px;
-        x: (parent.width - self.width) / 2;
-        y: (parent.height - self.height) / 2;
-        border-radius: 5px;
-        border-width: Theme.hair;
-        border-color: root.ink-faint;
-        animate border-color { duration: Theme.quick; }
-        Text {
-            text: "?";
-            color: root.ink;
-            font-family: Theme.mono;
-            font-size: Theme.fs-data;
-            font-weight: 800;
-            horizontal-alignment: center;
-            vertical-alignment: center;
-            animate color { duration: Theme.quick; }
-        }
+    border-width: Theme.hair;
+    background: root.lit ? Theme.accent-glow : transparent;
+    border-color: root.lit ? Theme.accent-line : Theme.line;
+    animate background, border-color { duration: Theme.quick; }
+    Text {
+        text: "?";
+        color: root.lit ? Theme.accent : Theme.text-dim;
+        font-family: Theme.mono;
+        font-size: Theme.fs-data;
+        font-weight: 700;
+        width: 100%;
+        height: 100%;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        animate color { duration: Theme.quick; }
     }
     gta := TouchArea {
         mouse-cursor: MouseCursor.pointer;
@@ -1252,15 +1263,19 @@ export component ColorPicker inherits VerticalLayout {
             background: root.editing && State.hex-preview-ok ? State.hex-preview-col : root.current;
             animate background { duration: Theme.quick; }
         }
-        VerticalLayout {
+        if root.label != "" : VerticalLayout {
             alignment: center;
-            if root.label != "" : Text {
+            Text {
                 text: root.label;
                 color: Theme.text-dim; font-family: Theme.mono; font-size: Theme.fs-small;
                 font-weight: 700; letter-spacing: 1.2px;
             }
         }
-        Rectangle {}
+        // LABELLED (SYSTEM accents): a stretchy gap here right-aligns the field after the label — the
+        // labelled-form rhythm. UNLABELLED (the spectrum stop picker): no gap here, so the swatch + field
+        // read as ONE tight unit and the stretchy spacer trails instead — kills the swatch-far-left /
+        // field-far-right void that made the spectrum row feel broken.
+        if root.label != "" : Rectangle {}
         fld := Field {
             field-width: 110px;
             placeholder: "4af2b0";
@@ -1270,6 +1285,7 @@ export component ColorPicker inherits VerticalLayout {
             edited(t) => { State.preview-hex(t); root.preview(t); }   // live preview as you type
             accepted(t) => { root.pick(t); }                          // Enter commits: recolours + persists
         }
+        if root.label == "" : Rectangle {}
     }
     // the PRISM — appears while the field holds focus: drag across for hue, down for brightness;
     // release commits. The HSV→hex math is State.preview-hue → State.hue-pick-hex (the shared helper),

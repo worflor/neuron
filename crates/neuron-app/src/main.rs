@@ -27,6 +27,7 @@ mod glance;
 mod glue;
 mod hidwatch;
 mod knockback;
+mod macrokeys;
 mod mic;
 mod migrate;
 mod notifs;
@@ -37,6 +38,7 @@ mod prof_log;
 mod purge;
 mod runtime;
 mod sound;
+mod strokelab;
 mod surface;
 mod teleport;
 mod tray;
@@ -209,6 +211,18 @@ fn main() {
         live: None,
     }));
 
+    // ── RENDERER SELECTION (prefer GPU, fall back to software) ────────────
+    // PREFER femtovg (GPU): it's why the UI feels instant on a real GPU — and the user's machine has
+    // one, so this is the path that's taken there. But a VM / RDP / headless / bad-driver host has no
+    // usable OpenGL context, and a GPU-only build can't open its window AT ALL there. So select the
+    // backend BEFORE the first `AppWindow::new()`: ask for femtovg, and if that selection fails, fall
+    // back to the software renderer so the UI ALWAYS opens (slower, but it opens). `select()` sets the
+    // platform on success and does NOT on failure, so the software retry is safe to call afterwards.
+    // (Belt-and-suspenders: even when femtovg is selected here, the winit backend itself auto-falls-
+    // back to software at WINDOW-creation time if GL init then fails — that's why renderer-software is
+    // compiled in. This explicit selection additionally covers an event-loop/init failure at select.)
+    select_renderer_backend();
+
     // Build the window eagerly — WITHOUT showing it — so the LIVE dispatch loop has a stable
     // handle to post status into (the software renderer makes a hidden window's idle cost
     // negligible). Whether it shows is decided below, so a `--tray` boot never flashes a frame.
@@ -323,6 +337,12 @@ fn main() {
     // and turn them into confirmations — so onboard changes earn a Neuron card, event-driven, no poll.
     // (NEURON_HIDWATCH=1 also dumps raw reports for decoding new devices.)
     hidwatch::start();
+
+    // ── MACRO KEYS ────────────────────────────────────────────────────────
+    // Put Razer keyboards into Driver Mode and read their vendor macro-key report (id 0x04), injecting
+    // each held key as a bindable control — so dedicated macro keys (M1..M5/FN/…) work like any other.
+    // Capability-driven + emergent: any Razer keyboard, however many macro keys (see macrokeys.rs).
+    macrokeys::start();
 
     // ── CURTAIN LOOK ──────────────────────────────────────────────────
     // Teach the core curtain (the panic privacy screen) how to paint itself: the user's LIVE weave
@@ -551,9 +571,41 @@ fn main() {
 
     // Run the loop tray-resident. `quit_event_loop` (tray Quit) is the only exit.
     slint::run_event_loop_until_quit().expect("event loop failed");
-    // keep the timer + tray alive for the whole loop
+    // Drop the UI tick timer FIRST, then flush. `flush_lighting_save` already stops its OWN debounce
+    // timer (LIGHT_SAVE_TIMER) and runs single-threaded after the loop has ended, so no UI-timer tick
+    // can fire during it — its RefCell borrow is uncontended. Dropping the tick timer here is belt-
+    // and-suspenders, making the no-tick-during-flush invariant structural rather than incidental.
     drop(timer);
+    // Flush any still-debounced lighting save before teardown — a quit must never strand the last
+    // edit. Structural edits (stack/remove/tile-pick) already persist immediately; this catches a
+    // knob (speed/stop/timing) tweaked within the 400ms debounce window right before quitting.
+    glue::flush_lighting_save();
+    // keep the tray alive for the whole loop
     drop(tray);
+}
+
+/// Choose the Slint renderer backend BEFORE any window is created: prefer femtovg (GPU), fall back to
+/// the software renderer if femtovg can't be selected. Keeps the GPU path on a GPU machine while
+/// guaranteeing the UI opens on a host with no usable OpenGL context (VM / RDP / headless / bad
+/// drivers). Both renderers are compiled in (see Cargo.toml). Never panics — a host where even the
+/// software backend can't be set is one no renderer choice could rescue, so we log and let the later
+/// `AppWindow::new()` surface the failure honestly.
+fn select_renderer_backend() {
+    if let Err(gpu_err) = slint::BackendSelector::new()
+        .renderer_name("femtovg".into())
+        .select()
+    {
+        eprintln!(
+            "neuron: GPU (femtovg) renderer unavailable ({gpu_err}); falling back to software renderer"
+        );
+        flight::trace("life", "femtovg unavailable — software fallback", 0);
+        if let Err(sw_err) = slint::BackendSelector::new()
+            .renderer_name("software".into())
+            .select()
+        {
+            eprintln!("neuron: software renderer also unavailable ({sw_err}); the UI may not open");
+        }
+    }
 }
 
 /// Create the window + install glue if not already present — WITHOUT showing it. Quick actions
@@ -568,10 +620,15 @@ fn build_window(resident: &Rc<RefCell<Resident>>) {
     // Closing the window hides it (the loop lives on, tray-resident). The handle + glue are
     // retained so runtime state (selected device, paused gate, parsed import) survives a
     // reopen; the software renderer makes a hidden window's idle cost negligible.
+    let close_w = app.as_weak();
     app.window().on_close_requested(move || {
         // end any in-flight press-to-bind before hiding to tray — otherwise the capture worker keeps
         // the dispatcher gated (binds dead) while hidden, and you'd return to a stuck capture overlay.
         crate::capture::cancel();
+        // hidden to tray → the lighting page's render timers stand down (no compute while unseen).
+        if let Some(a) = close_w.upgrade() {
+            a.global::<State>().set_window_shown(false);
+        }
         slint::CloseRequestResponse::HideWindow
     });
 
@@ -586,6 +643,7 @@ fn show_window(resident: &Rc<RefCell<Resident>>) {
     if let Some(app) = resident.borrow().window.as_ref() {
         let _ = app.show();
         app.window().set_minimized(false);
+        app.global::<State>().set_window_shown(true); // on screen now → page animation timers may run
     }
     // RAISE over whatever owns the foreground. A bare `show()` lands BEHIND a borderless-fullscreen
     // game, so "Open Neuron" reads as "nothing happened". Force it forward like a summon does.

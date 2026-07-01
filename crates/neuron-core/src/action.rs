@@ -1572,6 +1572,47 @@ fn press_key(name: &str) -> String {
     format!("key '{name}': windows-only")
 }
 
+/// Press and HOLD a key combo (modifiers + key), returning the VKs now held in press order — so the
+/// caller releases them on the trigger's UP edge via [`release_keys`]. The held twin of
+/// [`press_key`]'s tap: an input→key REMAP holds the output key while the control is held, so it
+/// behaves like the real key (Windows supplies the auto-repeat). Empty result = unknown key (no-op).
+/// (Distinct from the timed `hold_key(name, hold_ms)` above, which is a single press-wait-release.)
+#[cfg(windows)]
+pub fn press_and_hold(name: &str) -> Vec<u16> {
+    let (mods, key) = parse_combo(name);
+    let Some(vk) = vk_for(&key) else {
+        return Vec::new();
+    };
+    let mut held = Vec::with_capacity(mods.len() + 1);
+    unsafe {
+        for m in &mods {
+            win_key::down(*m);
+            held.push(*m);
+        }
+        win_key::down(vk);
+    }
+    held.push(vk);
+    held
+}
+
+/// Release keys held by [`hold_key`], in reverse press order (the key first, then the modifiers).
+#[cfg(windows)]
+pub fn release_keys(vks: &[u16]) {
+    unsafe {
+        for &vk in vks.iter().rev() {
+            win_key::up(vk);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub fn press_and_hold(_name: &str) -> Vec<u16> {
+    Vec::new()
+}
+
+#[cfg(not(windows))]
+pub fn release_keys(_vks: &[u16]) {}
+
 #[cfg(windows)]
 fn press_media(key: MediaKind) -> String {
     unsafe { win_key::tap(key.vk()) };

@@ -9,8 +9,9 @@
 
 import {
     DeviceRow, RuleRow, ProfileRow, AppRuleRow, EffectRow, RadialSector, GlyphChip, ImportLine,
-    DiagRow, ActionChoice, LayerRow, OrganRow, MaterialCard, KnobRow,
-    PocketCard, BeaconMacro, RhythmBindRow, MacroBlock, MacroCard, EffectTile, EffectParam
+    DiagRow, ActionChoice, OrganRow, MaterialCard, KnobRow,
+    PocketCard, BeaconMacro, RhythmBindRow, MacroBlock, MacroCard, EffectTile, EffectParam,
+    SpectrumStop, SpectrumFrame
 } from "models.slint";
 
 export global State {
@@ -58,6 +59,9 @@ export global State {
     // ── navigation ───────────────────────────────────────────────────────
     in-out property <int> page: 0;                   // selected section (0..3: DEVICE LIGHTING INPUT SYSTEM)
     in-out property <int> input-view: 0;             // INPUT depth: 0 = DIRECT (bindings), 1 = WEAVE (spellweaving)
+    // is the WINDOW actually on screen (vs hidden in the tray)? main.rs flips it on show/close, so a
+    // page's animation timers can stand down when nothing's visible — no rendering an unseen page.
+    in-out property <bool> window-shown: false;
     // a cross-panel "jump to the macro editor" request: set by the SYSTEM→BEACONS "author a macro"
     // link, consumed ONCE by the INPUT→DIRECT page Flickable (app.slint), which scrolls to MACRO.
     in-out property <bool> macro-jump-pending: false;
@@ -206,7 +210,6 @@ export global State {
     in-out property <bool> animating: false;
     callback preview-tick();                         // mirror the applied effect onto the render
     callback apply-effect(int);                      // effect index -> set on device
-    callback animate-effect(int);                    // stream it live
     callback stop-animation();
     callback color-changed(string);
     callback paint-cell(int);                        // index into grid-px (paint w/ current color)
@@ -215,24 +218,9 @@ export global State {
     callback fill-grid();                            // whole frame -> brush colour
     callback push-frame();                           // send the painted grid to the device
 
-    // ── Lighting COMPOSITOR — the layered effect studio ──────────────────
-    in-out property <[LayerRow]> light-layers;       // the stack (index 0 = bottom)
-    in-out property <int> selected-layer: -1;        // which layer the editor + region paint act on
-    in-out property <bool> light-region-edit: false; // paint the selected layer's region on the render
+    // ── Lighting COMPOSITOR — the layered effect studio (a layer = PATTERN × SPECTRUM) ──
+    in-out property <int> selected-layer: -1;        // which stacked layer the inspector + spectrum editor act on
     in-out property <bool> compositing: false;       // the stack is streaming live to the device
-    callback add-layer(string);                      // append a layer of the given effect, select it
-    callback remove-layer(int);
-    callback select-layer(int);
-    callback move-layer(int, int);                   // (index, dir) — restack: dir -1 down / +1 up
-    callback toggle-layer(int);                      // enable/disable in the composite
-    callback set-layer-effect(int, string);
-    callback set-layer-color(int, string);
-    callback set-layer-speed(int, float);
-    callback set-layer-direction(int, int);
-    callback set-layer-blend(int, string);
-    callback clear-layer-region(int);                // region -> whole device
-    callback paint-region(int);                      // render cell -> add to selected layer's region
-    callback erase-region(int);                      // render cell -> remove from region
     callback composite-apply();                      // stream the composite live to the device
     callback composite-stop();
     callback import-light-file();                    // pick a .ChromaEffects / .synapse3 → frame or layer
@@ -245,11 +233,6 @@ export global State {
     in-out property <[EffectTile]> light-tiles;       // the grid (effects + data + stub), each a live swatch
     in-out property <string> light-effect: "";        // the active tile's slug (lights the tile, drives the knobs); "" = none
     in-out property <[EffectParam]> light-params;     // the active effect's auto-rendered param controls (range/enum/toggle)
-    // the active effect's COLOUR knob, lifted out of the schema so the page renders its swatch row
-    // (Rust knows the schema when it builds light-params, so this avoids a model-scan in the view).
-    in-out property <bool> light-uses-color: false;   // does the active effect declare a colour knob?
-    in-out property <string> light-color-hex: "4af2b0"; // the active effect's colour, RRGGBB
-    in-out property <color> light-color-col: #4af2b0;   // parsed, for the swatch fill
     // STREAM RATE — the frame-rate the live effect runs at, driving BOTH the device stream AND this
     // page's preview (they tick together). Seeded per-device on selection (legacy → 6, matrix → 30);
     // the user tunes from there. `light-is-data` gates the control off for DATA readouts (no rate).
@@ -261,7 +244,6 @@ export global State {
     callback pick-tile(string);                       // slug → make it the active single effect, play on render + show knobs
     callback set-param-range(string, float);          // (param key, value) — a slider edit
     callback set-param-enum(string, int);             // (param key, index) — a segment edit
-    callback set-param-color(string);                 // (hex) — the colour swatch/field
     callback set-param-toggle(string, bool);          // (param key, on) — a switch edit
     // STACK — the optional spatial composite. `light-stack-count` is how many effects are layered
     // (1 = the simple single-effect default; >1 = you stacked). A light strip shows the stack; +stack
@@ -276,6 +258,57 @@ export global State {
     callback toggle-brush();                           // pick up / put down the paint brush
     callback push-painted();                           // commit the painted frame to the device
 
+    // ── Lighting SPECTRUM editor — the active layer's COLOUR PROGRAM (the other half of a layer) ──
+    // A layer = PATTERN (shape, the knobs above) × SPECTRUM (colour, this block). The active layer is
+    // the selected stack layer; these project its spectrum and every edit writes straight back into it
+    // (live preview + persistence follow). Phase-4 builds the gradient strip / motion row / timeline
+    // against THIS surface — every callback here is fully implemented in the glue.
+    //
+    // does the active layer carry an editable 1-D spectrum? false for the Screen pattern (Ambient is
+    // full-colour, the spectrum is bypassed) and for a DATA readout — the editor hides for those.
+    in-out property <bool> light-has-spectrum: false;
+    // GRADIENT STRIP — the active palette's stops (the ACTIVE frame's stops when sequenced). A single
+    // stop is a solid; click a stop → the shared ColorPicker; +/- add/remove; drag → reposition.
+    in-out property <[SpectrumStop]> light-stops;
+    // which gradient stop the prism edits — AUTHORITATIVE here (not a view-local cursor) so the glue
+    // can SELECT a stop after a structural edit: `add-stop` sets this to the just-inserted stop's
+    // post-sort index, delivering the documented "add a stop, select it" contract. The strip writes it
+    // directly on click/drag; the editor clamps it into 0..length-1 so a delete never strands the picker.
+    in-out property <int> light-sel-stop: 0;
+    callback set-stop-color(int, string);              // (stop idx, hex) — recolour a stop
+    callback add-stop(float);                          // (at 0..1) — insert a stop (colour sampled there), select it
+    callback remove-stop(int);                         // (stop idx) — delete (a palette never drops below 1 stop)
+    callback move-stop(int, float);                    // (stop idx, at 0..1) — reposition along the gradient
+    // MOTION row — the active palette's intra-frame animation. `speed` always applies; `depth` only to
+    // breathe, `chaos` only to flow (the UI shows the relevant knob by `light-motion`).
+    in-out property <string> light-motion: "hold";     // hold | drift | cycle | breathe | flow
+    in-out property <float> light-motion-speed: 1.0;
+    in-out property <float> light-motion-depth: 0.5;   // breathe dip 0..1
+    in-out property <float> light-motion-chaos: 0.5;   // flow octaves 0..1
+    callback set-motion(string);                       // kind — keeps speed/depth/chaos across a switch
+    callback set-motion-speed(float);
+    callback set-motion-depth(float);
+    callback set-motion-chaos(float);
+    // GRADIENT INTERPOLATION — how colour blends between stops. "rgb" (default, predictable) | "hsv"
+    // (perceptual: the shortest hue path, so 2-stop+ gradients stay vivid). Per active-frame palette.
+    in-out property <string> light-interp: "rgb";      // rgb | hsv
+    callback set-interp(string);                        // rgb | hsv — the gradient colour space
+    // TIMELINE / sequencer — the keyframe track. The model `light-seq` is the SINGLE source of truth for
+    // the frame count: `light-seq.length` 1 = no sequence (the timeline collapses); >1 = a sequence, with
+    // `light-active-frame` the frame the strip + motion above are editing (the scrubber). (There is no
+    // redundant length int — every reader/guard reads `light-seq.length`, so the two can never drift.)
+    in-out property <[SpectrumFrame]> light-seq;
+    in-out property <int> light-active-frame: 0;
+    in-out property <string> light-loop: "loop";       // once | loop | pingpong
+    callback add-frame();                              // append a keyframe (clone of the active), select it
+    callback remove-frame(int);                        // (frame idx) — delete (collapses to a palette at len 1)
+    callback move-frame(int, int);                     // (frame idx, dir -1 earlier / +1 later) — reorder
+    callback select-frame(int);                        // (frame idx) — make it the active frame (strip/motion edit it)
+    callback set-frame-hold(int, float);               // (frame idx, dwell seconds)
+    callback set-frame-fade(int, float);               // (frame idx, crossfade-in seconds)
+    callback set-frame-ease(int, string);              // (frame idx, linear | smooth | snap)
+    callback set-loop(string);                         // once | loop | pingpong
+
     // ── Bindings (remap + HyperShift + macros + mic-as-Actions) ──────────
     in-out property <[RuleRow]> rules;
     in-out property <[RuleRow]> hypershift-rules;
@@ -285,6 +318,8 @@ export global State {
     callback reload-bindings();
     callback remove-rule(int);                        // remove a GUI-authored BASE rule by row index
     callback remove-hyper-rule(int);                  // remove a GUI-authored HYPERSHIFT rule by row index
+    callback move-rule(int, int);                     // reorder a GUI-authored BASE rule: (row, dir -1 up / +1 down)
+    callback move-hyper-rule(int, int);               // reorder a GUI-authored HYPERSHIFT rule: (row, dir)
     // the HyperShift STANCE — hold (momentary, Razer's only mode) | latch (tap on/off) |
     // smart (tap latches, hold is momentary) | one-shot (next press only). Persisted in feel.toml.
     in-out property <string> hypershift-mode: "hold";
@@ -320,6 +355,15 @@ export global State {
     in-out property <bool> recording-keys: false;      // a sequence take is rolling
     callback capture-trigger();                        // start HID control capture for a new bind
     callback add-binding();                            // commit the captured trigger + chosen action
+    // EDIT an existing GUI-authored rule IN PLACE: clicking it opens the same wire-editor inline,
+    // seeded from its current trigger + action (edit-shows-current). `editing-rule` is the list ROW
+    // being edited (-1 = none); `editing-rule-hyper` says which layer's list it lives in (the DIRECT
+    // page reuses one RuleList per layer, so the row index alone is ambiguous without it).
+    in-out property <int> editing-rule: -1;
+    in-out property <bool> editing-rule-hyper: false;
+    callback begin-edit-rule(int, bool);               // (row, hyper) open the inline editor for that rule
+    callback commit-edit-rule();                        // save the in-place edit (trigger + action)
+    callback cancel-edit-rule();                         // close the inline editor without saving
     // mic gain/mute are surfaced here as Actions (no longer a top-level Audio panel)
     in-out property <string> mic-name: "—";
     in-out property <float> mic-gain: 100;
@@ -408,12 +452,24 @@ export global State {
     in-out property <[MacroCard]> macro-catalog;
     in-out property <bool> macro-catalog-building: false;  // a catalog rebuild is parsing off-thread
     callback open-macro(string);                       // (id) -> load that macro's source into the editor
+    callback delete-macro(string);                     // (id) -> delete its .py from disk, refresh catalog + beacons
     callback reveal-macros();                          // open the macros folder in the OS file manager (made if missing)
     callback reload-macros();                          // re-scan disk -> register dropped-in macros -> rebuild catalog + reload the open macro
 
     // ── Spellweaving (merged gesture + radial: two facets of the cast engine) ─
     in-out property <[GlyphChip]> glyphs;             // the vault, each chip carrying its bound action
     in-out property <bool> capturing-gesture: false;
+    // strokelab: a RICH (Shift+Record) capture is in flight — the full stroke is written to a research
+    // file instead of teaching the vault. Drives the panel's distinct "different mode" amber treatment.
+    in-out property <bool> rich-capturing: false;
+    // live Shift state, polled by the weave page while it's on-screen — previews the rich-mode
+    // affordance on the Record button the instant Shift goes down, before you commit to a capture.
+    in-out property <bool> shift-armed: false;
+    callback poll-shift() -> bool;                    // glue → is Shift physically down right now?
+    // true only when `gesture-status` is a rich-save confirmation — turns that line into a clickable
+    // link that reveals the strokes folder in the OS file manager. Cleared at the start of any capture.
+    in-out property <bool> stroke-saved: false;
+    callback reveal-strokes();                         // open ./strokes/ in Explorer (made if missing)
     in-out property <string> gesture-status: "idle";
     in-out property <string> radial-status: "";       // wheel-side feedback (lives BY the wheel)
     in-out property <[float]> trail;                 // normalized live/last trail (x,y interleaved)
@@ -427,7 +483,7 @@ export global State {
     // the ACTIVATION RHYTHM on that trigger — a feel::Phrase ("hold", "tap hold", "tap tap", …).
     // Presets cover the sane ones; record-activation captures YOUR rhythm and normalizes it.
     in-out property <string> activation-pattern: "hold";
-    in-out property <string> activation-display: "▬";   // the rhythm as symbols (● tap · ▬ hold · ⇄ toggle)
+    in-out property <string> activation-display: "▬";   // the rhythm as symbols (● tap · ▬ hold · ↔ toggle)
     in-out property <bool> recording-activation: false;
     callback set-activation(string);
     callback record-activation();

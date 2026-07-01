@@ -423,7 +423,7 @@ fn activation_rhythm_sets_and_persists() {
     );
     // a pure-tap phrase reads as a toggle in the symbol readout.
     st.invoke_set_activation("tap tap".into());
-    assert_eq!(st.get_activation_display(), "● ● ⇄");
+    assert_eq!(st.get_activation_display(), "● ● ↔");
     // garbage is refused loudly and changes nothing.
     st.invoke_set_activation("bonk".into());
     assert_eq!(st.get_activation_pattern(), "tap tap");

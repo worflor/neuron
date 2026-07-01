@@ -45,6 +45,15 @@ pub struct DeviceDef {
     pub codename: String,
     pub vendor_id: u16,
     pub transaction_id: u8,
+    /// Microseconds the transport must WAIT between a feature-report SET and the GET that drains its
+    /// reply — the command's round-trip + processing time. A wireless dongle is SLOW here: reading the
+    /// reply (or firing the next command) before that completes OVERRUNS the device and drops frames —
+    /// the lighting FLICKER. OpenRazer calibrates this per receiver (a "new mouse receiver" like the
+    /// Naga V2 Pro's dongle ≈ 31000µs; a wired board ≈ 0). The fast streaming write
+    /// ([`crate::device::Device::send_lighting_fast`]) sleeps this. `0` (the default) = no wait, correct
+    /// for wired/legacy boards, which are paced slowly anyway.
+    #[serde(default)]
+    pub stream_wait_us: u64,
     pub modes: Vec<Mode>,
     pub control_interface: ControlInterface,
     pub commands: BTreeMap<String, CommandSpec>,

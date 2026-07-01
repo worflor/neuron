@@ -1,7 +1,8 @@
 //! Part A — deterministic micro-bench of the lighting render path (NO GUI).
 //!
 //! Times, in MICROSECONDS, with a warmup then N≈2000 iterations (avg · p50 · max):
-//!   * each of the 15 tile effects' `FrameGen::frame(6, 22, t, base)` individually, and
+//!   * each PRESET's full layer render (`Compositor::render(6, 22, t)` over a single-layer stack —
+//!     the Pattern emits a field, the Spectrum colours it, the compositor blends), and
 //!   * each live provider's steady-state getter (`audio_level::level`, `sys_stats::cpu/ram`,
 //!     `screen_ambient::grid`) — `ensure()`d and warmed first, since the getter is what the
 //!     render path calls every tile.
@@ -15,32 +16,12 @@
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use neuron::effects::{self, EffectParams};
-use neuron::lighting::Rgb;
+use neuron::pattern::{self, Compositor};
 
 const ROWS: u8 = 6;
 const COLS: u8 = 22;
 const N: usize = 2000;
 const WARMUP: usize = 200;
-
-/// The 15 effect tiles the lighting grid renders every tick (the catalog minus the data tile).
-const EFFECTS: &[&str] = &[
-    "static",
-    "breathing",
-    "spectrum",
-    "wave",
-    "aurora",
-    "fire",
-    "cascade",
-    "comet",
-    "starlight",
-    "reactive",
-    "ripple",
-    "colorwheel",
-    "audiometer",
-    "pulse",
-    "ambient",
-];
 
 struct Stat {
     name: String,
@@ -72,15 +53,13 @@ fn bench<F: FnMut(f32)>(name: &str, mut f: F) -> Stat {
 #[test]
 #[ignore = "perf micro-bench; run explicitly with --ignored --nocapture"]
 fn part_a_lighting_microbench() {
-    let base = Rgb::new(74, 242, 176); // a representative weave accent
     let mut stats: Vec<Stat> = Vec::new();
 
-    // ── 1) the 15 effects' frame() ──
-    for &slug in EFFECTS {
-        let mut gen = effects::make_with(slug, EffectParams::default())
-            .unwrap_or_else(|| panic!("effect '{slug}' should resolve"));
-        let s = bench(&format!("effect:{slug}"), |t| {
-            black_box(gen.frame(ROWS, COLS, t, base));
+    // ── 1) every preset's full layer render() ──
+    for preset in pattern::presets() {
+        let mut comp = Compositor::from_defs(&[preset.to_layer()]);
+        let s = bench(&format!("preset:{}", preset.slug), |t| {
+            black_box(comp.render(ROWS, COLS, t));
         });
         stats.push(s);
     }
@@ -116,8 +95,8 @@ fn part_a_lighting_microbench() {
     println!("{}", "-".repeat(78));
     let sum_effects: f64 = stats
         .iter()
-        .filter(|s| s.name.starts_with("effect:"))
+        .filter(|s| s.name.starts_with("preset:"))
         .map(|s| s.avg_us)
         .sum();
-    println!("sum of all 15 effects' avg frame() = {sum_effects:.3} us\n");
+    println!("sum of all presets' avg render() = {sum_effects:.3} us\n");
 }

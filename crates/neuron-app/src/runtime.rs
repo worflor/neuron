@@ -20,6 +20,7 @@ use neuron::lighting::{Effect, Lights, Rgb};
 use neuron::profile::{AppRule, AppRules, Profile};
 use neuron::registry::{DeviceDef, Registry};
 use neuron::transport;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
@@ -57,6 +58,18 @@ pub struct DeviceState {
     pub cap_plate: bool, // has a [side_plates] map — surfaces the push-detected side-plate readout
 }
 
+/// One live lighting stream's controls, owned PER-DEVICE in [`AppRuntime::anim`]: the stop flag its
+/// worker polls each frame, and the fps it reads (only the layer compositor uses fps; the vitals
+/// surface paints on-demand and ignores it).
+pub struct AnimStream {
+    pub stop: Arc<AtomicBool>,
+    pub fps: Arc<AtomicU32>,
+    /// FPS-PACED (the layer compositor, reads `fps` live each frame) vs paint-on-demand (the vitals
+    /// surface, which ignores `fps`). The fps slider only writes paced streams, so it can never silently
+    /// land on a vitals stream's unused `fps` when vitals is the board's current entry in [`anim`].
+    pub fps_paced: bool,
+}
+
 /// The resident runtime state. UI-thread owned (held in an `Rc<RefCell<_>>` by the glue).
 pub struct AppRuntime {
     pub registry: Registry,
@@ -69,13 +82,15 @@ pub struct AppRuntime {
     pub persist: bool,
     /// Currently selected device pid (for per-device panels). 0 = none.
     pub selected_pid: u16,
-    /// Set while a lighting animation thread is running; the thread polls it to stop.
-    pub anim_stop: Arc<AtomicBool>,
-    pub animating: bool,
-    /// Streaming frame-rate for live lighting EFFECTS, shared with the animation worker so the GUI's
-    /// fps control can re-pace a RUNNING stream without restarting it (the worker reads this every
-    /// frame via `animate`'s fps closure). Seeded per-device on selection (legacy → 6, matrix → 30).
-    /// The data/vitals surface ignores this — it paints on-demand, not through the streaming loop.
+    /// Live lighting streams, keyed by device pid. Each board gets its OWN stop flag + fps, so
+    /// starting, stopping, or re-pacing one board's lighting NEVER touches another's — and switching
+    /// which board you're editing leaves the others streaming. (This was a single global flag + bool,
+    /// which made every apply/stop/device-switch tear down whatever one stream happened to be live.)
+    pub anim: HashMap<u16, AnimStream>,
+    /// The fps the GUI slider shows for the SELECTED board (seeded on selection: legacy → 6, matrix →
+    /// 30). On apply it SEEDS that board's stream fps; moving the slider re-paces the selected board's
+    /// live stream. Each running stream owns its own fps copy (in `anim`), so re-pacing or selecting a
+    /// different board can't change another board's speed. The data/vitals surface ignores fps.
     pub light_fps: Arc<AtomicU32>,
     /// The host-side gaming-mode suppression policy from the last-applied profile (Alt+Tab/Win/
     /// Alt+F4). A GUI-hosted daemon LL-keyboard hook consults this; carried so apply stays the
@@ -102,8 +117,7 @@ impl AppRuntime {
             active_profile: "—".into(),
             persist: false,
             selected_pid: 0,
-            anim_stop: Arc::new(AtomicBool::new(false)),
-            animating: false,
+            anim: HashMap::new(),
             light_fps: Arc::new(AtomicU32::new(30)),
             gaming_mode: neuron::writes::GamingMode::default(),
         }
@@ -195,7 +209,8 @@ impl AppRuntime {
                         // confirmation fires past the committed write — same as apply_polling /
                         // apply_brightness (was missing here, so GUI DPI changes earned no card).
                         // Absolute set → no prior read, so no old→new (matches Intent::DpiSet).
-                        neuron::confirm::dpi(dpi as u32, None);
+                        // Per-device de-dup keyed by the device we just opened + wrote.
+                        neuron::confirm::dpi(d.pid, dpi as u32, None);
                         format!("DPI -> {dpi}")
                     }
                     Err(e) => format!("DPI failed: {e}"),
@@ -551,88 +566,12 @@ impl AppRuntime {
         }
     }
 
-    /// Start streaming a named effect generator on a worker thread (re-opens its own device).
-    /// The thread stops when `anim_stop` flips OR the process-wide writes gate pauses. `on_done`
-    /// runs when the worker exits for ANY reason, carrying `Some(reason)` on an error/early exit
-    /// and `None` on a clean stop — plus this run's stop-Arc as a GENERATION TOKEN, so a stale
-    /// worker's exit can be told apart from the run that currently owns the UI state
-    /// (`Arc::ptr_eq` against the runtime's current `anim_stop`). Returns a status line.
-    pub fn start_animation(
-        &mut self,
-        name: &str,
-        color: Rgb,
-        pid: u16,
-        on_done: impl FnOnce(Option<String>, Arc<AtomicBool>) + Send + 'static,
-    ) -> String {
-        if self.writes_paused() {
-            return "writes paused".into();
-        }
-        if neuron::effects::make(name).is_none() {
-            return format!("no generator '{name}'");
-        }
-        // Retire any in-flight generator: flip ITS flag, then mint a fresh one for this run.
-        // Order is load-bearing — the old worker keeps its clone (permanently true), the new
-        // worker clones the fresh Arc below. Without this, a second "animate" click re-armed the
-        // OLD thread's stop flag and two 30fps writers interleaved frames on one device.
-        self.anim_stop.store(true, Ordering::SeqCst);
-        self.anim_stop = Arc::new(AtomicBool::new(false));
-        self.animating = true;
-        let stop = self.anim_stop.clone();
-        let fps_src = self.light_fps.clone();
-        let label = name.to_string();
-        let name = name.to_string();
-        std::thread::spawn(move || {
-            let outcome: Result<(), String> = (|| {
-                let reg = Registry::load().map_err(|e| format!("registry: {e}"))?;
-                let infos = transport::enumerate().map_err(|e| format!("enumerate: {e}"))?;
-                for i in &infos {
-                    if let Some(def) = reg.find_by_pid(i.vid, i.pid) {
-                        if def.matches_control(i.usage_page, i.usage, i.feature_len)
-                            && (pid == 0 || i.pid == pid)
-                        {
-                            let d = Device::open(def.clone(), i.pid)
-                                .map_err(|e| format!("open failed: {e}"))?;
-                            let ldef = d
-                                .def
-                                .lighting
-                                .clone()
-                                .ok_or_else(|| "device has no lighting".to_string())?;
-                            let mut gen = neuron::effects::make(&name)
-                                .ok_or_else(|| format!("no generator '{name}'"))?;
-                            let lights = Lights::new(&d, ldef);
-                            lights
-                                .animate(
-                                    gen.as_mut(),
-                                    Some(color),
-                                    // LIVE fps: read the shared atomic each frame so the GUI's fps
-                                    // control re-paces this running stream without a restart.
-                                    || fps_src.load(Ordering::Relaxed),
-                                    86_400, // until stopped
-                                    // the kill-switch covers the streaming path too: pausing
-                                    // writes terminates the generator, not just future starts.
-                                    || {
-                                        stop.load(Ordering::SeqCst)
-                                            || neuron::writes::writes_paused()
-                                    },
-                                )
-                                .map_err(|e| format!("animate: {e}"))?;
-                            return Ok(());
-                        }
-                    }
-                }
-                Err("device not found".into())
-            })();
-            on_done(outcome.err(), stop);
-        });
-        format!("animating {label}")
-    }
-
-    /// Stream the LAYER COMPOSITOR live — the same worker contract as `start_animation`, but the
-    /// generator is a `Compositor` built from the whole layer stack instead of one named effect.
+    /// Stream the LAYER COMPOSITOR live on a worker thread (re-opens its own device). The compositor is
+    /// built from the whole layer stack (Pattern × Spectrum layers).
     /// The layered composite is inherently the custom-frame path (it streams blended frames).
     pub fn start_layers(
         &mut self,
-        defs: Vec<neuron::effects::LayerDef>,
+        defs: Vec<neuron::pattern::LayerDef>,
         pid: u16,
         on_done: impl FnOnce(Option<String>, Arc<AtomicBool>) + Send + 'static,
     ) -> String {
@@ -642,11 +581,22 @@ impl AppRuntime {
         if defs.is_empty() {
             return "no layers".into();
         }
-        self.anim_stop.store(true, Ordering::SeqCst);
-        self.anim_stop = Arc::new(AtomicBool::new(false));
-        self.animating = true;
-        let stop = self.anim_stop.clone();
-        let fps_src = self.light_fps.clone();
+        // stop only THIS board's prior stream (if any) — other boards keep streaming.
+        if let Some(a) = self.anim.get(&pid) {
+            a.stop.store(true, Ordering::SeqCst);
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        // this stream's OWN fps copy, seeded from the GUI's current value — so re-pacing or selecting
+        // another board can never change THIS stream's speed.
+        let fps_src = Arc::new(AtomicU32::new(self.light_fps.load(Ordering::Relaxed)));
+        self.anim.insert(
+            pid,
+            AnimStream {
+                stop: stop.clone(),
+                fps: fps_src.clone(),
+                fps_paced: true, // the layer compositor reads fps live each frame
+            },
+        );
         std::thread::spawn(move || {
             let outcome: Result<(), String> = (|| {
                 let reg = Registry::load().map_err(|e| format!("registry: {e}"))?;
@@ -663,12 +613,12 @@ impl AppRuntime {
                                 .lighting
                                 .clone()
                                 .ok_or_else(|| "device has no lighting".to_string())?;
-                            let mut comp = neuron::effects::Compositor::from_defs(&defs);
+                            let mut comp = neuron::pattern::Compositor::from_defs(&defs);
                             let lights = Lights::new(&d, ldef);
                             lights
                                 // LIVE fps: read the shared atomic each frame so the GUI's fps
                                 // control re-paces this running composite without a restart.
-                                .animate(&mut comp, None, || fps_src.load(Ordering::Relaxed), 86_400, || {
+                                .animate(&mut comp, || fps_src.load(Ordering::Relaxed), 86_400, || {
                                     stop.load(Ordering::SeqCst) || neuron::writes::writes_paused()
                                 })
                                 .map_err(|e| format!("animate: {e}"))?;
@@ -683,9 +633,59 @@ impl AppRuntime {
         "compositing".into()
     }
 
-    pub fn stop_animation(&mut self) {
-        self.anim_stop.store(true, Ordering::SeqCst);
-        self.animating = false;
+    /// Stop ONE board's lighting stream (the board the GUI is acting on). Others keep streaming.
+    pub fn stop_animation(&mut self, pid: u16) {
+        if let Some(a) = self.anim.remove(&pid) {
+            a.stop.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Stop EVERY live lighting stream (the writes-paused kill-switch / shutdown).
+    pub fn stop_all_animation(&mut self) {
+        for (_, a) in self.anim.drain() {
+            a.stop.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Is `pid`'s lighting stream currently live?
+    pub fn animating(&self, pid: u16) -> bool {
+        self.anim.contains_key(&pid)
+    }
+
+    /// Is ANY board's lighting stream live?
+    pub fn any_animating(&self) -> bool {
+        !self.anim.is_empty()
+    }
+
+    /// Is `token` still `pid`'s CURRENT stop flag (not superseded by a newer start)? A worker's
+    /// completion callback uses this to ignore a STALE end (its stream was already replaced/stopped).
+    pub fn anim_is_current(&self, pid: u16, token: &Arc<AtomicBool>) -> bool {
+        self.anim
+            .get(&pid)
+            .is_some_and(|a| Arc::ptr_eq(&a.stop, token))
+    }
+
+    /// Drop `pid`'s stream entry IF `token` is still the current one — a worker that ended ON ITS OWN
+    /// (error / time cap) cleaning up after itself, without clobbering a stream that replaced it.
+    pub fn anim_clear(&mut self, pid: u16, token: &Arc<AtomicBool>) {
+        if self
+            .anim
+            .get(&pid)
+            .is_some_and(|a| Arc::ptr_eq(&a.stop, token))
+        {
+            self.anim.remove(&pid);
+        }
+    }
+
+    /// Re-pace `pid`'s live stream (the fps slider) without restarting it. No-op if it isn't streaming
+    /// OR if the current stream is the paint-on-demand vitals surface (whose `fps` is unused) — so the
+    /// slider can never silently write into a non-paced stream that happens to share the board's pid.
+    pub fn set_anim_fps(&self, pid: u16, fps: u32) {
+        if let Some(a) = self.anim.get(&pid) {
+            if a.fps_paced {
+                a.fps.store(fps, Ordering::Relaxed);
+            }
+        }
     }
 
     /// Start the cross-device VITALS surface on a worker thread — the GUI mirror of the CLI's
@@ -701,10 +701,19 @@ impl AppRuntime {
         if self.writes_paused() {
             return "writes paused".into();
         }
-        self.anim_stop.store(true, Ordering::SeqCst);
-        self.anim_stop = Arc::new(AtomicBool::new(false));
-        self.animating = true;
-        let stop = self.anim_stop.clone();
+        // keyed by the SINK board (the keyboard) so only ITS prior stream is replaced.
+        if let Some(a) = self.anim.get(&sink_pid) {
+            a.stop.store(true, Ordering::SeqCst);
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        self.anim.insert(
+            sink_pid,
+            AnimStream {
+                stop: stop.clone(),
+                fps: Arc::new(AtomicU32::new(1)), // vitals paints on-demand; fps unused
+                fps_paced: false,
+            },
+        );
         std::thread::spawn(move || {
             let outcome: Result<(), String> = (|| {
                 let reg = Registry::load().map_err(|e| format!("registry: {e}"))?;

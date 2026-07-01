@@ -15,7 +15,7 @@ use std::sync::{Mutex, OnceLock};
 /// the chosen stream fps. Saved per-device (keyed by pid) so a board resumes its own effect after a
 /// relaunch instead of sitting frozen on the device's last held frame. Every field defaults, so an
 /// older/partial record still loads.
-#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DeviceLight {
     /// The chosen streaming fps for this board (the user's pick — restored verbatim on launch, so the
     /// per-device default only applies when nothing's saved). 0 = unset (fall back to the default).
@@ -26,13 +26,14 @@ pub struct DeviceLight {
     #[serde(default)]
     pub data: Option<String>,
     /// The applied compositor stack — empty when a data mode owns the board, or nothing's applied.
-    /// Serialises as `[[lighting.<pid>.layers]]` array-of-tables; each layer is flat (see `LayerDef`).
+    /// Serialises as `[[lighting.<pid>.layers]]` array-of-tables; each layer is flat (a pattern key,
+    /// optional params, a tiered spectrum, region, blend, enabled — see `pattern::LayerDef`).
     #[serde(default)]
-    pub layers: Vec<neuron::effects::LayerDef>,
+    pub layers: Vec<neuron::pattern::LayerDef>,
 }
 
 /// On-disk GUI preferences. All fields default so a missing/partial file still loads.
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Prefs {
     /// Start resident in the tray with NO window shown. Defaults to true (lean, tray-first).
     #[serde(default = "default_true")]
@@ -270,12 +271,83 @@ impl Prefs {
         PathBuf::from("app.toml")
     }
 
-    /// Load the prefs (defaults if the file is absent or unparseable — never errors).
+    /// Load the prefs (never errors). An absent file yields all-defaults silently (normal first run).
+    /// A file that EXISTS but doesn't fully parse is SALVAGED field-by-field rather than discarded: one
+    /// bad value (a typo'd number, a hand-edit, a type that shifted during pre-release shaping) defaults
+    /// only ITSELF while every sibling pref — accents, safety/notification gates, the lighting stack —
+    /// is kept. Each salvaged-to-default part warns by name, so a corrupt config is visible, not a
+    /// silent reset. `load` NEVER writes: a partially-bad file keeps its good values and stays on disk
+    /// untouched (only `save` writes).
     pub fn load() -> Self {
-        std::fs::read_to_string(Self::path())
-            .ok()
-            .and_then(|s| toml::from_str(&s).ok())
-            .unwrap_or_default()
+        let Ok(s) = std::fs::read_to_string(Self::path()) else {
+            return Prefs::default(); // absent file → defaults (first run; nothing to warn about)
+        };
+        // Fast path: a clean whole-struct parse (the overwhelmingly common case).
+        if let Ok(p) = toml::from_str::<Prefs>(&s) {
+            return p;
+        }
+        // Something didn't fit the struct. Re-parse to a raw table and rebuild field-by-field so one
+        // corrupt value can't nuke the rest. If it isn't even valid TOML, fall back to all-defaults —
+        // still WITHOUT touching the file (only `save` writes).
+        match toml::from_str::<toml::Table>(&s) {
+            Ok(table) => Self::from_table_salvaging(&table),
+            Err(e) => {
+                eprintln!("neuron: app.toml is not valid TOML ({e}); using defaults (file left intact)");
+                Prefs::default()
+            }
+        }
+    }
+
+    /// Rebuild [`Prefs`] from a parsed TOML table, salvaging field by field: each pref that fails to
+    /// deserialize (wrong type, out-of-range, …) falls back to its OWN default while every sibling that
+    /// parses is kept; a missing field defaults silently, a present-but-bad one warns by name. This is
+    /// the resilient slow path [`load`](Self::load) drops to when a whole-struct parse fails.
+    fn from_table_salvaging(table: &toml::Table) -> Self {
+        let mut p = Prefs::default();
+        // Each pref: if present, deserialize it on its own; on failure keep the default and warn. The
+        // target type (so `try_into` knows what to build) is inferred from the assigned field.
+        macro_rules! salvage {
+            ($key:literal, $field:ident) => {
+                if let Some(v) = table.get($key) {
+                    match v.clone().try_into() {
+                        Ok(parsed) => p.$field = parsed,
+                        Err(e) => eprintln!(
+                            "neuron: app.toml `{}` is malformed ({e}); keeping the default",
+                            $key
+                        ),
+                    }
+                }
+            };
+        }
+        salvage!("start_minimized", start_minimized);
+        salvage!("ui_accent", ui_accent);
+        salvage!("weave_accent", weave_accent);
+        salvage!("weave_material", weave_material);
+        salvage!("phoenix", phoenix);
+        salvage!("notif_enabled", notif_enabled);
+        salvage!("notif_placement", notif_placement);
+        salvage!("notif_x", notif_x);
+        salvage!("notif_y", notif_y);
+        salvage!("notif_audio", notif_audio);
+        salvage!("notif_dpi", notif_dpi);
+        salvage!("notif_scroll", notif_scroll);
+        salvage!("notif_polling", notif_polling);
+        salvage!("notif_brightness", notif_brightness);
+        salvage!("notif_profile", notif_profile);
+        salvage!("notif_layer", notif_layer);
+        salvage!("notif_macro", notif_macro);
+        salvage!("notif_battery", notif_battery);
+        salvage!("notif_side_plate", notif_side_plate);
+        salvage!("notif_volume", notif_volume);
+        salvage!("notif_sound", notif_sound);
+        salvage!("notif_panel", notif_panel);
+        salvage!("notif_stack", notif_stack);
+        // `lighting` is a per-device map — salvage it board-by-board so one corrupt record drops only
+        // itself, not every other saved stack.
+        if let Some(v) = table.get("lighting") {
+            p.lighting = salvage_lighting(v);
+        }
+        p
     }
 
     /// Persist the prefs back to `app.toml`. Returns a status line.
@@ -344,6 +416,36 @@ impl Prefs {
             Kind::SidePlate => self.notif_side_plate,
         }
     }
+}
+
+/// Salvage the per-device lighting map: parse it whole first, and only if that fails fall to a
+/// board-by-board rebuild, so a single corrupt device record defaults only itself and every other
+/// saved stack survives. A `lighting` value that isn't a table at all yields an empty map. Drops are
+/// warned by device key, never silent.
+fn salvage_lighting(v: &toml::Value) -> BTreeMap<String, DeviceLight> {
+    // whole-map fast path
+    let whole: Result<BTreeMap<String, DeviceLight>, _> = v.clone().try_into();
+    if let Ok(map) = whole {
+        return map;
+    }
+    let mut out = BTreeMap::new();
+    match v.as_table() {
+        Some(table) => {
+            for (pid, light) in table {
+                let parsed: Result<DeviceLight, _> = light.clone().try_into();
+                match parsed {
+                    Ok(d) => {
+                        out.insert(pid.clone(), d);
+                    }
+                    Err(e) => eprintln!(
+                        "neuron: app.toml `[lighting.{pid}]` is malformed ({e}); dropping that board's saved lighting"
+                    ),
+                }
+            }
+        }
+        None => eprintln!("neuron: app.toml `lighting` is not a table; dropping all saved lighting"),
+    }
+    out
 }
 
 /// Convenience: read just the start-minimized flag (the one `main` consults at launch).
@@ -700,21 +802,28 @@ mod tests {
     fn device_light_round_trips() {
         let _g = cwd_guard();
         let pid = 0x0226u16;
+        let mut params = neuron::pattern::Params::default();
+        params.set("speed", 2.0);
         let state = DeviceLight {
             fps: 12,
             data: None,
             layers: vec![
-                neuron::effects::LayerDef {
-                    effect: "fire".into(),
-                    color: neuron::lighting::Rgb::new(255, 90, 0),
-                    speed: 2.0,
+                neuron::pattern::LayerDef {
+                    pattern: "heat".into(),
+                    params,
+                    spectrum: neuron::spectrum::Spectrum::gradient(vec![
+                        neuron::lighting::Rgb::new(180, 0, 0),
+                        neuron::lighting::Rgb::new(255, 255, 220),
+                    ]),
                     region: vec![5, 2, 9],
                     blend: neuron::effects::Blend::Add,
-                    ..Default::default()
+                    enabled: true,
                 },
-                neuron::effects::LayerDef {
-                    effect: "static".into(),
-                    color: neuron::lighting::Rgb::new(0x4A, 0xF2, 0xB0),
+                neuron::pattern::LayerDef {
+                    pattern: "uniform".into(),
+                    spectrum: neuron::spectrum::Spectrum::solid(neuron::lighting::Rgb::new(
+                        0x4A, 0xF2, 0xB0,
+                    )),
                     ..Default::default()
                 },
             ],
@@ -724,12 +833,123 @@ mod tests {
         assert_eq!(back.fps, 12);
         assert!(back.data.is_none());
         assert_eq!(back.layers.len(), 2);
-        assert_eq!(back.layers[0].effect, "fire");
+        assert_eq!(back.layers[0].pattern, "heat");
+        assert_eq!(back.layers[0].params.f32("speed", 0.0), 2.0);
         assert_eq!(back.layers[0].region, vec![5, 2, 9]);
         assert_eq!(back.layers[0].blend, neuron::effects::Blend::Add);
-        assert_eq!(back.layers[1].color, neuron::lighting::Rgb::new(0x4A, 0xF2, 0xB0));
+        assert_eq!(
+            back.layers[1].spectrum,
+            neuron::spectrum::Spectrum::solid(neuron::lighting::Rgb::new(0x4A, 0xF2, 0xB0))
+        );
         // a different (unsaved) device has no state — keying is real.
         assert!(device_light(0x00A8).is_none());
+    }
+
+    /// A MULTI-layer stack where higher layers carry TABLE-tier spectra (motion / positioned stops)
+    /// round-trips through the real save/load. Regression guard for "stacked layers collapse to base on
+    /// relaunch" — the collapse was a save-flush TIMING bug (now flushed on structural edits + on exit),
+    /// not serde, but this pins the data path so the table-tier stack can never silently fail to persist.
+    #[test]
+    fn multi_layer_table_spectrum_stack_round_trips() {
+        let _g = cwd_guard();
+        use neuron::lighting::Rgb;
+        use neuron::spectrum::{Motion, Palette, Spectrum, Stop};
+        let pid = 0x0221u16;
+        let thermal = Spectrum::from_palette(Palette::new(
+            vec![
+                Stop::new(Rgb::new(6, 7, 18), 0.0),
+                Stop::new(Rgb::new(190, 22, 0), 0.32),
+                Stop::new(Rgb::new(255, 255, 255), 1.0),
+            ],
+            Motion::Hold,
+        ));
+        let aurora = Spectrum::from_palette(Palette::new(
+            vec![
+                Stop::new(Rgb::new(0, 255, 128), 0.0),
+                Stop::new(Rgb::new(128, 0, 255), 1.0),
+            ],
+            Motion::Flow { speed: 1.0, chaos: 0.5 },
+        ));
+        let state = DeviceLight {
+            fps: 30,
+            data: None,
+            layers: vec![
+                neuron::pattern::LayerDef {
+                    pattern: "thermal".into(),
+                    spectrum: thermal,
+                    blend: neuron::effects::Blend::Screen,
+                    ..Default::default()
+                },
+                neuron::pattern::LayerDef {
+                    pattern: "flow".into(),
+                    spectrum: aurora,
+                    blend: neuron::effects::Blend::Add,
+                    ..Default::default()
+                },
+            ],
+        };
+        set_device_light(pid, state.clone()).expect("save multi-layer stack");
+        let back = device_light(pid).expect("reload");
+        assert_eq!(back.layers.len(), 2, "BOTH stacked layers must survive");
+        assert_eq!(
+            back.layers, state.layers,
+            "each layer's distinct table-tier spectrum must round-trip (no collapse to base)"
+        );
+    }
+
+    /// The field-by-field salvage list in `from_table_salvaging` must stay in LOCKSTEP with the struct:
+    /// add a pref but forget its `salvage!` line and the resilient slow path would silently drop it on a
+    /// corrupt config. This pins it both ways — the struct literal below forces every field to be named
+    /// (a NEW field won't compile until it's added here), and at runtime we flip them all off-default,
+    /// corrupt ONE so the fast whole-struct parse fails (forcing the salvage path), and assert every
+    /// OTHER field survived. A field that reverts ⇒ its `salvage!` line is missing.
+    #[test]
+    fn salvage_preserves_every_field_when_one_is_corrupt() {
+        let _g = cwd_guard();
+        let d = Prefs::default();
+        let want = Prefs {
+            start_minimized: !d.start_minimized,
+            ui_accent: "ff0000".into(),
+            weave_accent: "00ff00".into(),
+            weave_material: "test-mat".into(),
+            phoenix: !d.phoenix,
+            notif_enabled: !d.notif_enabled,
+            notif_placement: "test-place".into(),
+            notif_x: 0.25,
+            notif_y: 0.5,
+            notif_audio: !d.notif_audio,
+            notif_dpi: !d.notif_dpi,
+            notif_scroll: !d.notif_scroll,
+            notif_polling: !d.notif_polling,
+            notif_brightness: !d.notif_brightness,
+            notif_profile: !d.notif_profile,
+            notif_layer: !d.notif_layer,
+            notif_macro: !d.notif_macro,
+            notif_battery: !d.notif_battery,
+            notif_side_plate: !d.notif_side_plate,
+            notif_volume: 0.125,
+            notif_sound: "test-sound".into(),
+            notif_panel: !d.notif_panel,
+            notif_stack: "test-stack".into(),
+            lighting: d.lighting.clone(),
+        };
+        let body = toml::to_string_pretty(&want).unwrap();
+        // corrupt one scalar's TYPE (string field → bool) so the whole-struct parse fails and the
+        // field-by-field salvage runs. The anchor is an exact string literal (no float formatting risk).
+        let corrupted = body.replacen("notif_sound = \"test-sound\"", "notif_sound = true", 1);
+        assert_ne!(
+            corrupted, body,
+            "corruption anchor missing — the serialized form drifted"
+        );
+        std::fs::write(Prefs::path(), corrupted).unwrap();
+        let got = Prefs::load();
+        // only the corrupted field defaults; EVERY other field must have survived the salvage.
+        let mut expect = want;
+        expect.notif_sound = d.notif_sound.clone();
+        assert_eq!(
+            got, expect,
+            "a field reverted to default → its `salvage!` line is missing from from_table_salvaging"
+        );
     }
 
     /// A data-mode lighting state (no layers) persists too.
@@ -779,6 +999,141 @@ mod tests {
         assert!(!p.start_minimized, "sibling pref survives the lighting write");
         assert_eq!(p.ui_accent, "ff8800");
         assert_eq!(p.lighting.get(&light_key(0x0226)).map(|d| d.fps), Some(30));
+    }
+
+    /// RESILIENCE: ONE malformed field must not nuke the whole config. A file with several good values
+    /// plus one bad one (a string where a float is wanted) loads everything else verbatim and defaults
+    /// ONLY the bad field — the old all-or-nothing parse would have discarded the lot.
+    #[test]
+    fn one_bad_field_keeps_the_rest() {
+        let _g = cwd_guard();
+        std::fs::write(
+            Prefs::path(),
+            // notif_volume is malformed (a string, not an f32); everything else is valid.
+            "start_minimized = false\n\
+             ui_accent = \"ff8800\"\n\
+             notif_enabled = false\n\
+             notif_sound = \"warm\"\n\
+             notif_volume = \"loud\"\n",
+        )
+        .unwrap();
+        let p = Prefs::load();
+        // the good siblings all survive
+        assert!(!p.start_minimized, "good bool survives a bad sibling");
+        assert_eq!(p.ui_accent, "ff8800", "good string survives");
+        assert!(!p.notif_enabled, "good gate survives");
+        assert_eq!(p.notif_sound, "warm", "good slug survives");
+        // only the malformed field falls back to its own default
+        assert_eq!(
+            p.notif_volume,
+            default_notif_volume(),
+            "only the bad field defaults"
+        );
+    }
+
+    /// RESILIENCE: a fully-valid (non-default) config round-trips through save→load unchanged, including
+    /// the lighting map — the salvage path must never disturb a clean file.
+    #[test]
+    fn valid_config_round_trips_unchanged() {
+        let _g = cwd_guard();
+        let mut want = Prefs::default();
+        want.start_minimized = false;
+        want.ui_accent = "ff8800".into();
+        want.weave_accent = "00aaff".into();
+        want.notif_enabled = false;
+        want.notif_placement = "bottom-left".into();
+        want.notif_x = 0.0;
+        want.notif_y = 1.0;
+        want.notif_volume = 0.33;
+        want.notif_sound = "glass".into();
+        want.notif_stack = "digest".into();
+        want.lighting.insert(
+            light_key(0x0226),
+            DeviceLight {
+                fps: 24,
+                data: Some("mouse-battery".into()),
+                layers: vec![],
+            },
+        );
+        want.save().expect("save");
+        let got = Prefs::load();
+        assert!(!got.start_minimized);
+        assert_eq!(got.ui_accent, "ff8800");
+        assert_eq!(got.weave_accent, "00aaff");
+        assert!(!got.notif_enabled);
+        assert_eq!(got.notif_placement, "bottom-left");
+        assert_eq!(got.notif_x, 0.0);
+        assert_eq!(got.notif_y, 1.0);
+        assert_eq!(got.notif_volume, 0.33);
+        assert_eq!(got.notif_sound, "glass");
+        assert_eq!(got.notif_stack, "digest");
+        assert_eq!(
+            got.lighting.get(&light_key(0x0226)).map(|d| d.fps),
+            Some(24)
+        );
+        assert_eq!(
+            got.lighting
+                .get(&light_key(0x0226))
+                .and_then(|d| d.data.as_deref()),
+            Some("mouse-battery")
+        );
+    }
+
+    /// RESILIENCE: a file that sets only SOME fields defaults exactly the missing ones (the serde-default
+    /// fast path) — present values read through, absent ones fall back, nothing else is touched.
+    #[test]
+    fn missing_fields_default_just_those() {
+        let _g = cwd_guard();
+        std::fs::write(Prefs::path(), "ui_accent = \"123456\"\n").unwrap();
+        let p = Prefs::load();
+        assert_eq!(p.ui_accent, "123456", "the present field reads through");
+        assert!(p.start_minimized, "missing bool defaults true");
+        assert_eq!(p.weave_accent, default_accent(), "missing string defaults");
+        assert_eq!(p.notif_volume, default_notif_volume(), "missing f32 defaults");
+        assert!(p.lighting.is_empty(), "missing map defaults empty");
+    }
+
+    /// RESILIENCE: a garbage (non-TOML) file yields all-defaults without panicking, and an empty file
+    /// (valid TOML — an empty table) does too.
+    #[test]
+    fn garbage_or_empty_file_yields_defaults() {
+        let _g = cwd_guard();
+        std::fs::write(Prefs::path(), "this is not [valid toml = = @@@\n").unwrap();
+        let p = Prefs::load();
+        assert!(p.start_minimized, "garbage → default");
+        assert_eq!(p.ui_accent, default_accent(), "garbage → default accent");
+
+        std::fs::write(Prefs::path(), "").unwrap();
+        let p = Prefs::load();
+        assert!(p.start_minimized, "empty → default");
+        assert_eq!(p.ui_accent, default_accent(), "empty → default accent");
+    }
+
+    /// RESILIENCE: within the lighting map, ONE corrupt device record drops only itself — the other
+    /// boards' saved stacks AND the sibling top-level prefs all survive.
+    #[test]
+    fn one_bad_lighting_device_keeps_others() {
+        let _g = cwd_guard();
+        std::fs::write(
+            Prefs::path(),
+            "ui_accent = \"abcabc\"\n\
+             [lighting.0226]\n\
+             fps = 12\n\
+             [lighting.00a8]\n\
+             fps = \"fast\"\n", // malformed: fps must be an integer
+        )
+        .unwrap();
+        let p = Prefs::load();
+        assert_eq!(p.ui_accent, "abcabc", "top-level sibling survives bad lighting");
+        assert_eq!(
+            p.lighting.get("0226").map(|d| d.fps),
+            Some(12),
+            "the good board survives"
+        );
+        assert!(
+            !p.lighting.contains_key("00a8"),
+            "only the corrupt board is dropped"
+        );
     }
 
     /// The accent write must not clobber sibling prefs in app.toml (load-modify-save discipline).

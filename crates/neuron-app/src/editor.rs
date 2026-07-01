@@ -1021,6 +1021,87 @@ pub fn remove_gui_rule_in_tier(n: usize, hypershift: bool) -> Result<(), String>
     Err("no such GUI rule in that tier".into())
 }
 
+/// Reorder: move the `n`-th GUI-authored rule of a tier by `dir` (-1 = up / earlier, +1 = down /
+/// later) among its tier siblings, then save. Uses the SAME tier-index mapping as
+/// [`remove_gui_rule_in_tier`] (the hold-key Noop is filtered out so `n` lines up with the row
+/// index). A move past either end is a CLAMPED no-op (not an error). Order is the display order, so
+/// this is purely how a user ARRANGES their binds — it never changes what fires (each trigger is its
+/// own rule), it just rewrites the row sequence in `gui.rules.toml`.
+pub fn move_gui_rule_in_tier(n: usize, hypershift: bool, dir: i32) -> Result<(), String> {
+    let mut rules = load_gui_rules();
+    // flat-vec indices of this tier's rows, in display order (hold-key excluded, exactly as the
+    // remover/inverse do — so swapping among them matches what the list shows).
+    let tier: Vec<usize> = rules
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| {
+            let is_hold_key = hypershift && r.layer.is_some() && r.action == Action::Noop;
+            r.layer.is_some() == hypershift && !is_hold_key
+        })
+        .map(|(i, _)| i)
+        .collect();
+    if n >= tier.len() {
+        return Err("no such GUI rule in that tier".into());
+    }
+    let target = n as i32 + dir;
+    if target < 0 || target as usize >= tier.len() {
+        return Ok(()); // clamped at the ends — a no-op
+    }
+    // swap the two tier rows' FLAT positions: other-tier rows keep their place, and because the
+    // display follows flat order, the n-th and target-th tier rows exchange in the list.
+    rules.swap(tier[n], tier[target as usize]);
+    save_gui_rules(&rules)
+}
+
+/// Fetch a clone of the `n`-th GUI-authored rule of a tier (base vs hypershift) — the inverse lookup
+/// of [`remove_gui_rule_in_tier`], so an editor opening on a row can read its real trigger + action.
+/// Skips the hold-key Noop activator exactly as the remover does, so `n` lines up with the row index.
+pub fn gui_rule_in_tier(n: usize, hypershift: bool) -> Option<Rule> {
+    let rules = load_gui_rules();
+    let mut seen = 0usize;
+    for r in &rules {
+        let is_hold_key = hypershift && r.layer.is_some() && r.action == Action::Noop;
+        if r.layer.is_some() == hypershift && !is_hold_key {
+            if seen == n {
+                return Some(r.clone());
+            }
+            seen += 1;
+        }
+    }
+    None
+}
+
+/// Edit the `n`-th GUI-authored rule of a tier IN PLACE — overwrite its trigger + action, then save.
+/// Pairs with [`gui_rule_in_tier`] (same indexing) for inline rule editing: unlike [`add_gui_rule`]
+/// (which keys off the trigger), this targets the exact row, so a TRIGGER change rebinds that one rule
+/// without leaving the original behind or stacking a duplicate.
+pub fn edit_gui_rule_in_tier(
+    n: usize,
+    hypershift: bool,
+    trigger: Trigger,
+    action: Action,
+) -> Result<(), String> {
+    let mut rules = load_gui_rules();
+    let mut seen = 0usize;
+    let mut target: Option<usize> = None;
+    for (i, r) in rules.iter().enumerate() {
+        let is_hold_key = hypershift && r.layer.is_some() && r.action == Action::Noop;
+        if r.layer.is_some() == hypershift && !is_hold_key {
+            if seen == n {
+                target = Some(i);
+                break;
+            }
+            seen += 1;
+        }
+    }
+    let Some(i) = target else {
+        return Err("no such GUI rule in that tier".into());
+    };
+    rules[i].trigger = trigger;
+    rules[i].action = action;
+    save_gui_rules(&rules)
+}
+
 /// The HyperShift HOLD KEY — the control you hold to REACH the second layer. Stored as a `Noop` rule
 /// on the "hypershift" layer: the engine activates a layer for ANY input with a rule on it, so a Noop
 /// rule is a pure activator (it holds the layer, does nothing itself). Exactly one hold key — setting
