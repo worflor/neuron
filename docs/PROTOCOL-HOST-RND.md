@@ -731,3 +731,51 @@ deadline pacing) — pattern.rs is untouched; the arbiter sits ABOVE it.
   structurally. Chroma REST adapter lands here (leases prove themselves).
 - **Phase 4:** control plane (authed, sealed-consent verbs) + published neuron
   protocol spec + GUI-as-client migration begins.
+
+---
+
+## 11. Wire-format appendix (implementation-day details)
+
+Extra precision captured during research, for when each adapter is built:
+
+- **obs-websocket v5 auth**: Hello(op0) carries `{challenge, salt}`; Identify
+  (op1) auth string = `b64(sha256(b64(sha256(password+salt)) + challenge))`,
+  plus an `eventSubscriptions` bitmask. Then Request=op6 / RequestResponse=op7 /
+  Event=op5.
+- **Discord IPC**: named pipe `\\?\pipe\discord-ipc-{0..9}` (Unix: socket in
+  `$XDG_RUNTIME_DIR`/`$TMPDIR`, try indices 0..9 — stable/PTB/canary bind
+  different ones). HANDSHAKE `{v:1, client_id}` → READY. Voice events only for
+  users sharing your channel; official discord-rpc repo is archived but the
+  wire protocol is current (community "hard-mode" doc).
+- **VTube Studio**: `ws://localhost:8001`, `apiName: "VTubeStudioPublicAPI"`,
+  UDP 47779 discovery broadcast every 2s; one-time token consent then stored
+  token. `InjectParameterDataRequest` values decay ~1s (resend; mode set/add).
+- **Twitch EventSub WS**: `wss://eventsub.wss.twitch.tv/ws` → session_welcome
+  `{session_id}` → create subs via Helix within 10s. **User access token
+  required (app tokens rejected on WS transport)** — Device Code flow. Scopes:
+  `channel:read:redemptions`, `bits:read`, `moderator:read:followers`,
+  `channel:read:subscriptions`; raids need none.
+- **HWiNFO shared memory**: mapping `Global\HWiNFO_SENS_SM2`, mutex
+  `Global\HWiNFO_SM2_MUTEX`, magic `'SiWH'`; fixed-offset sensor+reading
+  sections (namazso's gist documents the layout). Version-check the header
+  before trusting offsets. RTSS: `RTSSSharedMemoryV2`, `dwFrameTime` in µs.
+- **Companion Satellite**: plain-text TCP 16622 (WS 16623 in v3.5+);
+  `ADD-DEVICE DEVICEID=.. PRODUCT_NAME=.. KEYS_TOTAL=.. KEYS_PER_ROW=..`;
+  Companion streams `KEY-STATE` bitmaps back; client reports `KEY-PRESS` /
+  `KEY-ROTATE`.
+- **X-Plane RREF**: UDP 49000; request = `struct.pack("<4sxii400s", b'RREF',
+  freq_hz, client_index, dataref_path)`; response = repeated `(i32 index,
+  f32 value)` pairs; `freq=0` unsubscribes; array datarefs per-element.
+- **CS2/Dota GSI cfg fields**: `uri`, `timeout`, `buffer` (0.0 on localhost),
+  `throttle`, `heartbeat`, `auth` token, plus `data` subtree booleans; file at
+  `game/csgo/cfg/gamestate_integration_<name>.cfg`.
+- **F1 UDP PacketHeader**: `packetFormat u16, gameYear, gameMajor/Minor,
+  packetVersion, packetId (13 types), sessionUID u64, sessionTime f32,
+  frameIdentifier, playerCarIndex` — little-endian, no padding.
+- **Elite paths**: `%userprofile%\Saved Games\Frontier Developments\Elite
+  Dangerous\` — `Status.json` (Flags/Flags2 bitfields, Pips, Fuel, Cargo,
+  LegalState, rewritten every few seconds) + append-only ndjson Journal.
+
+*(History note: a background agent left a truncated parallel ledger at
+docs/rnd/PROTOCOLS.md during the research session; its unique details were
+folded in here and the orphan removed — one canonical doc, no drift.)*
