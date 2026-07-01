@@ -581,10 +581,53 @@ macro engine are just two of its subscribers.
   set marked UNVERIFIED vs live RzSDKServer (safe: we mint what we parse;
   reply with a superset) — capture/replay against a real Chroma game will
   true them up. 59 tests green total.
-- **NEXT:** Chroma HTTP pump (54235, hand-rolled minimal HTTP/1.1) →
-  neuron-core bridge (registry→SurfaceInfo, real HID FrameSink behind the
-  one writer) → journal disk format (when it has its consumer) → OpenRGB
-  client mode → authed control plane.
+- **DONE: two adversarial spec audits** (Sonnet, primary sources re-fetched).
+  Verdict: OpenRGB byte layout fully conformant (every field order + version
+  gate MATCHed against RGBController.cpp + openrgb-python walk-through). Real
+  bugs found + FIXED: (1) OpenRGB must ANSWER profile-list(150)/plugin-list
+  (200) with empty lists or openrgb-python's constructor blocks 10s and
+  raises (Home Assistant dies with it); (2) keyboard CHROMA_CUSTOM2 param is
+  an OBJECT {color:8×24, key:6×22} — flat-array-only parsing 400'd every
+  spec-correct modern payload (accept both shapes now); (3) batch
+  {"effects":[...]} bodies supported with results arrays; (4) POST stores +
+  returns id, PUT applies (SDK create/apply split; a preloading game must
+  not flash each created effect — python-chroma-rest-server applies on POST,
+  we deliberately follow the Unity-client contract instead); (5) RZRESULT
+  4319 DEVICE_NOT_AVAILABLE for missing device kinds (was 1168); (6) session
+  prune aligned to the 15s contract (a lapsed session 404s, no resurrection);
+  (7) session ids minted port-plausible (≥54236 — official sessionid doubles
+  as a per-session port in some client flows; future pump can bind them);
+  (8) /chromasdk root accepted without /razer prefix; (9) session-info GET;
+  (10) grid_to_cells bounds-guarded (mis-declared surface degrades, never
+  panics). DEFERRED (documented): DEVICE_LIST_UPDATED push on hotplug (pump
+  plumbing), OpenRGB reference-strict data_size validation (we're more
+  lenient, safe), CUSTOM_KEY key-code translation, audit-1's claim that the
+  real server accepts CHROMA_WAVE-style names over REST (audit-2's read of
+  the official docs says only the five custom/static names exist — capture/
+  replay against a live RzSDKServer settles it).
+- **DONE: the neuron-core bridge** (`bridge.rs`, feature `bridge` — kernel
+  stays pure-std by default; `neuron` is an INTERNAL workspace path dep).
+  Registry TOMLs → SurfaceInfo (kind = honest heuristic: DPI ⇒ mouse, ≥4-row
+  matrix ⇒ keyboard — an explicit TOML `kind` field is the right future fix);
+  `HidSink` = the one place bytes reach a device, mirroring Lights::animate's
+  proven step (changed rows → row_report → send_lighting_fast → latch), gated
+  by writes_paused (SAFE-mode parity), row-level dedup, lazy open ON the
+  writer thread with decimated retry (= replug recovery; never herd a
+  sleeping mouse). Writer now takes a SINK FACTORY (the recipe crosses the
+  thread, never the handle — Device is not Send and now structurally never
+  needs to be). Legacy boards honestly clamped to 6fps (they drop writes
+  above it), matrix to 30. Writer loop is panic-walled (a faulting sink costs
+  one frame, never the thread). `examples/host_serve.rs` = run against real
+  hardware + real OpenRGB port. 67 tests green incl. bridge tests over the
+  real embedded device TOMLs.
+- **⚠ note:** the WIP snapshot needed the gitignored `runtime/` dir copied
+  from the main tree (neuron-core include_str!s the Python host files);
+  remember this for fresh worktrees.
+- **NEXT:** run host_serve against the real Naga/BlackWidow (NOT while the
+  app's own lighting streams run — that's the pre-inversion double-writer
+  case; coordinate or pause the app's streams first) → Chroma HTTP pump
+  (54235) → journal disk format (with its consumer) → OpenRGB client mode →
+  authed control plane → the writer inversion (app becomes a host client).
 - Worktree `../neuron-rnd` on `rnd/protocol-host`. Master is source-of-truth; an
   agent is finishing WIP there. First commit here = snapshot of that WIP so we
   build against current reality; expect to rebase/merge when it lands on master.

@@ -17,3 +17,17 @@ description = "Protocol-host kernel: ownership arbiter, signal bus, declaration 
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+# The neuron-core bridge (feature-gated so the kernel itself stays pure-std;
+# an INTERNAL workspace path dep, not a new external dependency).
+neuron = { path = "../neuron-core", optional = true }
+anyhow = { workspace = true, optional = true }
+
+[features]
+# Real-hardware bridge: registry discovery -> surfaces, HID frame sinks
+# behind the single writer. Off by default; the kernel + adapters build
+# and test with zero deps beyond serde.
+bridge = ["dep:neuron", "dep:anyhow"]
+
+[[example]]
+name = "host_serve"
+required-features = ["bridge"]

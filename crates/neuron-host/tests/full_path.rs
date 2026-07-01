@@ -46,9 +46,11 @@ fn wire_bytes_to_device_frames_with_clean_fallback() {
     )
     .expect("base claim");
 
-    // The single writer for this device, feeding a mock sink at 50 fps.
+    // The single writer for this device, feeding a mock sink at 50 fps (the
+    // factory runs on the writer thread — where a real HID sink is born).
     let sink = MockSink::new();
-    let _writer = Writer::spawn(host.handle(), "kbd", 50, sink.clone());
+    let writer_sink = sink.clone();
+    let _writer = Writer::spawn(host.handle(), "kbd", 50, move || writer_sink);
 
     assert!(
         eventually(&sink, Duration::from_secs(2), |f| f

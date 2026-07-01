@@ -58,6 +58,8 @@ pub mod ids {
     pub const REQUEST_PROTOCOL_VERSION: u32 = 40;
     pub const SET_CLIENT_NAME: u32 = 50;
     pub const DEVICE_LIST_UPDATED: u32 = 100;
+    pub const REQUEST_PROFILE_LIST: u32 = 150;
+    pub const REQUEST_PLUGIN_LIST: u32 = 200;
     pub const UPDATELEDS: u32 = 1050;
     pub const UPDATEZONELEDS: u32 = 1051;
     pub const UPDATESINGLELED: u32 = 1052;
@@ -376,9 +378,23 @@ impl OrgbConn {
             ids::SETCUSTOMMODE => {
                 // We are always in "Direct"; nothing to switch. No reply.
             }
+            ids::REQUEST_PROFILE_LIST | ids::REQUEST_PLUGIN_LIST => {
+                // MUST be answered (audit finding): openrgb-python's
+                // constructor BLOCKS on these when the negotiated version
+                // unlocks them (profiles at v>=2, plugins at v>=4) — silence
+                // means a 10s timeout and OpenRGBDisconnected, taking Home
+                // Assistant down with it. The reference server replies even
+                // when the lists are empty; both replies share the shape
+                // [u32 data_size (counts itself)][u16 count], count = 0 here.
+                let mut payload = Vec::with_capacity(6);
+                payload.extend_from_slice(&6u32.to_le_bytes());
+                payload.extend_from_slice(&0u16.to_le_bytes());
+                out.extend_from_slice(&packet(0, pkt_id, &payload));
+            }
             _ => {
-                // Unknown/unsupported (profiles, plugins, mode updates): the
-                // reference server ignores what it can't serve; so do we.
+                // Truly reply-less commands (rescan, profile save/load/delete,
+                // zone resize, mode updates): the reference server sends no
+                // reply for these either; silence is conformant.
             }
         }
     }
@@ -649,6 +665,23 @@ mod tests {
         assert_eq!(k.resolve("kbd", now()).unwrap()[0], None, "unknown zone ignored");
         c.feed(&packet(0, ids::UPDATEZONELEDS, &mk(0)), &mut k, now());
         assert_eq!(k.resolve("kbd", now()).unwrap()[0], Some(Rgb(9, 9, 9)));
+    }
+
+    #[test]
+    fn profile_and_plugin_lists_are_answered_with_empty_lists() {
+        // Audit CRITICAL: openrgb-python's constructor BLOCKS on these two
+        // when the negotiated version unlocks them; silence = 10s timeout +
+        // OpenRGBDisconnected (and Home Assistant fails with it). The
+        // reference server replies even when empty; shape = [u32 size][u16 0].
+        let mut k = kernel_with_kbd();
+        let mut c = OrgbConn::new(&mut k);
+        for id in [ids::REQUEST_PROFILE_LIST, ids::REQUEST_PLUGIN_LIST] {
+            let reply = c.feed(&packet(0, id, &[]), &mut k, now());
+            assert_eq!(u32le(&reply[8..12]), id);
+            assert_eq!(u32le(&reply[12..16]), 6, "payload is exactly [u32 6][u16 0]");
+            assert_eq!(u32le(&reply[16..20]), 6, "data_size counts itself");
+            assert_eq!(u16le(&reply[20..22]), 0, "empty list");
+        }
     }
 
     #[test]

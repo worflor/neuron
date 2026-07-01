@@ -3386,6 +3386,8 @@ dependencies = [
 name = "neuron-host"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "neuron",
  "serde",
  "serde_json",
 ]

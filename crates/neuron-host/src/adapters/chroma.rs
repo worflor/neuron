@@ -1,37 +1,44 @@
 //! Razer Chroma SDK REST server adapter — the flagship port.
 //!
 //! Chroma-enabled games open a session against `localhost:54235`, heartbeat it
-//! every ~1s, and PUT lighting effects per device. Crucially, the native
+//! every ~1s, and drive lighting effects per device. Crucially, the native
 //! `RzChromaSDK64.dll` is itself just a client of this same REST server — so
 //! one server catches BOTH native-SDK and REST games, with no DLL hijacking
 //! and no anti-cheat exposure (R&D doc §4.1).
 //!
 //! This module is a PURE request→response state machine: no sockets, no
 //! threads, no clock reads — the HTTP pump lives elsewhere and time arrives
-//! as a parameter. Session teardown needs no timers at all: every session
-//! layer is claimed with a 15-second TTL lease, and every effect write or
-//! heartbeat refreshes it. A game that crashes simply stops refreshing, its
-//! lease lapses, and the user's base lighting returns — the protocol's own
-//! 15s-inactivity contract, enforced by the arbiter instead of by cleanup
-//! code (§5.1: teardown is the default path).
+//! as a parameter. Session teardown needs no timers: every session layer is
+//! claimed with a 15-second TTL lease, and every effect write or heartbeat
+//! refreshes it. A game that crashes simply stops refreshing, its lease
+//! lapses, and the user's base lighting returns — the protocol's own 15s
+//! inactivity contract, enforced by the arbiter instead of by cleanup code
+//! (§5.1: teardown is the default path).
 //!
-//! ## Verified vs unverified wire details
-//! Verified by the research pass (Razer REST portal docs, RazerApi.md,
-//! python-chroma-rest-server):
-//! - endpoints: `POST /razer/chromasdk` (init), `PUT …/heartbeat`,
-//!   `PUT/POST …/{device}` effects, `DELETE …` (uninit); ~1s heartbeats,
-//!   15s inactivity timeout;
-//! - effect names `CHROMA_NONE/STATIC/CUSTOM/CUSTOM_KEY/CUSTOM2`; keyboard
-//!   grid 6×22 (CUSTOM) / 8×24 (CUSTOM2); colors are COLORREF-style BGR ints
-//!   (`0x00BBGGRR`: R = v&0xFF, G = v>>8, B = v>>16);
-//! - responses carry `{"result": <code>}` with 0 = success (RZRESULT reuses
-//!   Windows error codes: 87 invalid parameter, 1168 not found).
+//! ## Conformance status (two adversarial audit passes, primary sources)
+//! Verified MATCH: endpoints + ~1s heartbeat + 15s timeout (Razer REST portal
+//! index), BGR/COLORREF decode (python-chroma-rest-server `Color.from_long_bgr`),
+//! effect names + param shapes incl. keyboard CUSTOM2's OBJECT param
+//! (`{"color": 8×24, "key": 6×22}` — keyboard docs) vs mouse CUSTOM2's flat
+//! 9×7 array (mouse docs), batch `{"effects": [...]}` bodies
+//! (python-chroma-rest-server `resource.py`), RZRESULT codes 0/87/1168/4319
+//! (`RzErrors.h`), init reply field names (`PostChromaSdkResponse`: Sessionid,
+//! Uri — we reply a superset).
 //!
-//! UNVERIFIED against a live RzSDKServer (flagged for the capture/replay
-//! harness): the exact session-URI base and the exact init/heartbeat reply
-//! field set. Both are safe here because we mint the URIs we later parse, and
-//! we reply with a superset (`sessionid` + `session` + `uri`; `result` +
-//! `tick`) so clients reading either field are served.
+//! Deliberate decisions where sources disagree (capture/replay will settle):
+//! - **POST stores an effect (returns `id`) without applying; PUT applies.**
+//!   The official SDK's create/apply split (UnityChromaSDK flow) — and a
+//!   preload-style client creating many effects up front must not flash each
+//!   one on creation. python-chroma-rest-server applies on POST; we follow
+//!   the SDK contract instead.
+//! - Firmware effect names over REST (CHROMA_WAVE etc.): the official REST
+//!   device pages document only NONE/STATIC/CUSTOM/CUSTOM_KEY/CUSTOM2, so we
+//!   refuse others with INVALID_PARAMETER rather than fake them.
+//! - Session ids are minted in a port-plausible range (≥54236): the official
+//!   init reply's sessionid doubles as a per-session PORT in some client
+//!   flows; a future pump can bind those ports, and ids like 1,2,3 would be
+//!   maximally wrong for such clients. We also accept paths with or without
+//!   the `/razer` prefix.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -40,23 +47,31 @@ use crate::api::{HostApi, LeaseSpec, SurfaceInfo, SurfaceKind};
 use crate::arbiter::{band, Content, LayerId, Rgb, SourceId};
 use crate::bus::Value;
 
-/// The Chroma SDK's own session contract.
+/// The Chroma SDK's own session contract: 15s of silence = dead. Layer leases
+/// AND session bookkeeping both use it, so a stalled game's session dies at
+/// the same moment its paint does (parity with the real server, which refuses
+/// the session after the timeout — the app must re-init).
 pub const SESSION_TTL: Duration = Duration::from_secs(15);
-/// Bookkeeping prune horizon (belt-and-braces beside the lease: the arbiter
-/// already stopped painting at 15s; this just drops our session map entry).
-const PRUNE_AFTER: Duration = Duration::from_secs(30);
 
-/// RZRESULT codes (Windows error codes, as the SDK reuses them).
+/// First minted session id — in port-space above the SDK's own 54235 (see
+/// module docs).
+const FIRST_SESSION_ID: u64 = 54236;
+
+/// RZRESULT codes (Windows error codes, as the SDK reuses them — RzErrors.h).
 mod rz {
     pub const SUCCESS: i64 = 0;
     pub const INVALID_PARAMETER: i64 = 87;
     pub const NOT_FOUND: i64 = 1168;
+    /// "Device not available or supported" — the correct code when no surface
+    /// of the requested kind exists (audit: python-chroma-rest-server maps its
+    /// no-device case to exactly this).
+    pub const DEVICE_NOT_AVAILABLE: i64 = 4319;
 }
 
 pub struct HttpRequest {
     /// "GET" | "POST" | "PUT" | "DELETE" (uppercase).
     pub method: String,
-    /// Path only, e.g. "/razer/chromasdk/sess/3/keyboard".
+    /// Path only, e.g. "/razer/chromasdk/sess/54236/keyboard".
     pub path: String,
     pub body: Vec<u8>,
 }
@@ -75,12 +90,32 @@ impl HttpResponse {
     fn result(code: i64) -> HttpResponse {
         HttpResponse::json(200, serde_json::json!({ "result": code }))
     }
+
+    fn err(status: u16, code: i64) -> HttpResponse {
+        HttpResponse::json(status, serde_json::json!({ "result": code }))
+    }
+}
+
+/// What a stored/applied effect does to its device.
+#[derive(Clone)]
+enum Action {
+    /// CHROMA_NONE: release the session's layer on that device.
+    Clear,
+    Paint(Content),
+}
+
+#[derive(Clone)]
+struct StoredEffect {
+    device: String,
+    action: Action,
 }
 
 struct Session {
     owner: SourceId,
     /// device endpoint ("keyboard", …) → its live layer.
     layers: HashMap<String, LayerId>,
+    /// POST-created effects awaiting PUT-apply, keyed by minted id.
+    effects: HashMap<String, StoredEffect>,
     last_seen: Instant,
     title: String,
     heartbeats: u64,
@@ -90,11 +125,12 @@ struct Session {
 pub struct ChromaServer {
     sessions: HashMap<u64, Session>,
     next_id: u64,
+    next_effect: u64,
 }
 
 impl ChromaServer {
     pub fn new() -> ChromaServer {
-        ChromaServer { sessions: HashMap::new(), next_id: 1 }
+        ChromaServer { sessions: HashMap::new(), next_id: FIRST_SESSION_ID, next_effect: 1 }
     }
 
     pub fn handle(
@@ -105,47 +141,49 @@ impl ChromaServer {
     ) -> HttpResponse {
         self.prune(host, now);
         let segs: Vec<&str> = req.path.split('/').filter(|s| !s.is_empty()).collect();
-        // Root: ["razer", "chromasdk"].
-        let root = segs.len() == 2 && segs[0] == "razer" && segs[1] == "chromasdk";
+        // Root: "/razer/chromasdk" (canonical) or "/chromasdk" (the shape the
+        // official init reply's uri uses).
+        let root = matches!(segs.as_slice(), ["razer", "chromasdk"] | ["chromasdk"]);
         if root {
             return match req.method.as_str() {
                 "GET" => HttpResponse::json(
                     200,
                     serde_json::json!({
                         "result": rz::SUCCESS,
-                        "version": env!("CARGO_PKG_VERSION"),
-                        "core": "neuron-host",
+                        // Chroma-plausible version string; our real identity
+                        // rides alongside so nothing is misrepresented.
+                        "version": "3.0",
+                        "core": concat!("neuron-host ", env!("CARGO_PKG_VERSION")),
                     }),
                 ),
                 "POST" => self.init(req, host, now),
-                _ => HttpResponse::result(rz::INVALID_PARAMETER),
+                _ => HttpResponse::err(400, rz::INVALID_PARAMETER),
             };
         }
         // Session ops: any path containing ".../sess/{id}[/{rest}]".
         if let Some(pos) = segs.iter().position(|s| *s == "sess") {
             let Some(id) = segs.get(pos + 1).and_then(|s| s.parse::<u64>().ok()) else {
-                return HttpResponse::json(404, serde_json::json!({ "result": rz::NOT_FOUND }));
+                return HttpResponse::err(404, rz::NOT_FOUND);
             };
             let rest = &segs[pos + 2..];
             return match (req.method.as_str(), rest) {
+                ("GET", []) => self.session_info(id),
                 ("DELETE", []) => self.uninit(id, host),
                 ("PUT", ["heartbeat"]) => self.heartbeat(id, host, now),
-                ("PUT" | "POST", [device]) => self.effect(id, device, &req.body, host, now),
-                _ => HttpResponse::json(404, serde_json::json!({ "result": rz::NOT_FOUND })),
+                ("PUT", ["effect"]) => self.apply_stored(id, &req.body, host, now),
+                ("DELETE", ["effect"]) => self.free_stored(id, &req.body, now),
+                ("POST", [device]) => self.create(id, device, &req.body, host, now),
+                ("PUT", [device]) => self.apply_now(id, device, &req.body, host, now),
+                _ => HttpResponse::err(404, rz::NOT_FOUND),
             };
         }
-        HttpResponse::json(404, serde_json::json!({ "result": rz::NOT_FOUND }))
+        HttpResponse::err(404, rz::NOT_FOUND)
     }
 
     /// `POST /razer/chromasdk` — open a session for an app.
-    fn init(
-        &mut self,
-        req: &HttpRequest,
-        host: &mut dyn HostApi,
-        now: Instant,
-    ) -> HttpResponse {
+    fn init(&mut self, req: &HttpRequest, host: &mut dyn HostApi, now: Instant) -> HttpResponse {
         let Ok(info) = serde_json::from_slice::<serde_json::Value>(&req.body) else {
-            return HttpResponse::json(400, serde_json::json!({ "result": rz::INVALID_PARAMETER }));
+            return HttpResponse::err(400, rz::INVALID_PARAMETER);
         };
         let title = info
             .get("title")
@@ -157,7 +195,14 @@ impl ChromaServer {
         let owner = host.next_source();
         self.sessions.insert(
             id,
-            Session { owner, layers: HashMap::new(), last_seen: now, title: title.clone(), heartbeats: 0 },
+            Session {
+                owner,
+                layers: HashMap::new(),
+                effects: HashMap::new(),
+                last_seen: now,
+                title: title.clone(),
+                heartbeats: 0,
+            },
         );
         host.publish("host.chroma.session", Value::Text(title));
         // We mint this URI and we parse it — self-consistent by construction.
@@ -172,6 +217,19 @@ impl ChromaServer {
         )
     }
 
+    fn session_info(&self, id: u64) -> HttpResponse {
+        match self.sessions.get(&id) {
+            Some(s) => HttpResponse::json(
+                200,
+                serde_json::json!({
+                    "result": rz::SUCCESS,
+                    "info": { "title": s.title, "heartbeats": s.heartbeats },
+                }),
+            ),
+            None => HttpResponse::err(404, rz::NOT_FOUND),
+        }
+    }
+
     fn uninit(&mut self, id: u64, host: &mut dyn HostApi) -> HttpResponse {
         match self.sessions.remove(&id) {
             Some(s) => {
@@ -179,13 +237,13 @@ impl ChromaServer {
                 host.publish("host.chroma.closed", Value::Text(s.title));
                 HttpResponse::result(rz::SUCCESS)
             }
-            None => HttpResponse::json(404, serde_json::json!({ "result": rz::NOT_FOUND })),
+            None => HttpResponse::err(404, rz::NOT_FOUND),
         }
     }
 
     fn heartbeat(&mut self, id: u64, host: &mut dyn HostApi, now: Instant) -> HttpResponse {
         let Some(s) = self.sessions.get_mut(&id) else {
-            return HttpResponse::json(404, serde_json::json!({ "result": rz::NOT_FOUND }));
+            return HttpResponse::err(404, rz::NOT_FOUND);
         };
         s.last_seen = now;
         s.heartbeats += 1;
@@ -193,14 +251,11 @@ impl ChromaServer {
             // A swept layer here is fine: the next effect write re-claims.
             let _ = host.refresh(*layer, now);
         }
-        HttpResponse::json(
-            200,
-            serde_json::json!({ "result": rz::SUCCESS, "tick": s.heartbeats }),
-        )
+        HttpResponse::json(200, serde_json::json!({ "result": rz::SUCCESS, "tick": s.heartbeats }))
     }
 
-    /// `PUT/POST …/sess/{id}/{device}` — apply an effect.
-    fn effect(
+    /// `PUT …/{device}` — parse and apply immediately (single or batch body).
+    fn apply_now(
         &mut self,
         id: u64,
         device: &str,
@@ -208,104 +263,219 @@ impl ChromaServer {
         host: &mut dyn HostApi,
         now: Instant,
     ) -> HttpResponse {
-        let Some(kind) = device_kind(device) else {
-            return HttpResponse::json(404, serde_json::json!({ "result": rz::NOT_FOUND }));
+        let (surface, effects) = match self.parse_request(id, device, body, host) {
+            Ok(v) => v,
+            Err(resp) => return resp,
         };
-        if !self.sessions.contains_key(&id) {
-            return HttpResponse::json(404, serde_json::json!({ "result": rz::NOT_FOUND }));
+        let mut results = Vec::new();
+        for action in &effects {
+            let code = self.apply(id, device, &surface, action.clone(), host, now);
+            results.push(serde_json::json!({ "result": code }));
         }
-        let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
-            return HttpResponse::json(400, serde_json::json!({ "result": rz::INVALID_PARAMETER }));
-        };
-        let Some(effect) = v.get("effect").and_then(|e| e.as_str()) else {
-            return HttpResponse::json(400, serde_json::json!({ "result": rz::INVALID_PARAMETER }));
-        };
-
-        // Truthful capability answer: no surface of this kind → NOT_FOUND,
-        // not a silent success (§5.4).
-        let Some(surface) = host.surfaces().into_iter().find(|s| s.kind == kind) else {
-            return HttpResponse::json(200, serde_json::json!({ "result": rz::NOT_FOUND }));
-        };
-
-        let content = match effect {
-            "CHROMA_NONE" => {
-                let s = self.sessions.get_mut(&id).expect("checked above");
-                s.last_seen = now;
-                if let Some(layer) = s.layers.remove(device) {
-                    host.release(layer);
-                }
-                return HttpResponse::result(rz::SUCCESS);
-            }
-            "CHROMA_STATIC" => {
-                let Some(color) =
-                    v.pointer("/param/color").and_then(|c| c.as_u64()).map(|c| bgr(c as u32))
-                else {
-                    return HttpResponse::json(
-                        400,
-                        serde_json::json!({ "result": rz::INVALID_PARAMETER }),
-                    );
-                };
-                Content::Fill(color)
-            }
-            "CHROMA_CUSTOM" | "CHROMA_CUSTOM2" => {
-                let Some(grid) = v.get("param").and_then(parse_grid) else {
-                    return HttpResponse::json(
-                        400,
-                        serde_json::json!({ "result": rz::INVALID_PARAMETER }),
-                    );
-                };
-                Content::Cells(grid_to_cells(&grid, &surface))
-            }
-            "CHROMA_CUSTOM_KEY" => {
-                // The "key" grid carries 0x01000000-flagged key codes for
-                // key-translation; we honor the color grid now and note the
-                // key-code remap as a later refinement.
-                let Some(grid) = v.pointer("/param/color").and_then(parse_grid) else {
-                    return HttpResponse::json(
-                        400,
-                        serde_json::json!({ "result": rz::INVALID_PARAMETER }),
-                    );
-                };
-                Content::Cells(grid_to_cells(&grid, &surface))
-            }
-            _ => {
-                // Firmware-side effect names (WAVE/BREATHING/…) are the
-                // device's business; a REST server that pretends to run them
-                // would be lying. Refuse honestly.
-                return HttpResponse::json(
-                    400,
-                    serde_json::json!({ "result": rz::INVALID_PARAMETER }),
-                );
-            }
-        };
-
-        let s = self.sessions.get_mut(&id).expect("checked above");
-        s.last_seen = now;
-        // set-or-claim; a swept layer (game stalled >15s then resumed) is
-        // re-claimed transparently.
-        if let Some(layer) = s.layers.get(device) {
-            if host.set_content(*layer, content.clone(), now) {
-                return HttpResponse::result(rz::SUCCESS);
-            }
+        if let Some(s) = self.sessions.get_mut(&id) {
+            s.last_seen = now;
         }
-        match host.claim(&surface.key, s.owner, band::SESSION, LeaseSpec::Ttl(SESSION_TTL), content, now)
-        {
-            Some(layer) => {
-                s.layers.insert(device.to_string(), layer);
-                HttpResponse::result(rz::SUCCESS)
-            }
-            None => HttpResponse::json(200, serde_json::json!({ "result": rz::NOT_FOUND })),
+        match results.len() {
+            1 => HttpResponse::json(200, results.pop().unwrap()),
+            _ => HttpResponse::json(
+                200,
+                serde_json::json!({ "result": rz::SUCCESS, "results": results }),
+            ),
         }
     }
 
-    /// Drop bookkeeping for sessions silent past the prune horizon. Their
-    /// layers already stopped painting at 15s (lease); this releases the
-    /// owner and our map entry so a dead game doesn't accumulate state.
+    /// `POST …/{device}` — store effect(s), return id(s), do NOT apply (the
+    /// SDK's create/apply split; see module docs).
+    fn create(
+        &mut self,
+        id: u64,
+        device: &str,
+        body: &[u8],
+        host: &mut dyn HostApi,
+        now: Instant,
+    ) -> HttpResponse {
+        let (_, effects) = match self.parse_request(id, device, body, host) {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
+        let batch = effects.len() > 1;
+        let mut results = Vec::new();
+        let mut only_id = String::new();
+        {
+            let s = self.sessions.get_mut(&id).expect("parse_request checked the session");
+            s.last_seen = now;
+            for action in effects {
+                let eid = format!("neuron-{:08x}", self.next_effect);
+                self.next_effect += 1;
+                s.effects
+                    .insert(eid.clone(), StoredEffect { device: device.to_string(), action });
+                results.push(serde_json::json!({ "result": rz::SUCCESS, "id": eid }));
+                only_id = eid;
+            }
+        }
+        if batch {
+            HttpResponse::json(200, serde_json::json!({ "result": rz::SUCCESS, "results": results }))
+        } else {
+            HttpResponse::json(200, serde_json::json!({ "result": rz::SUCCESS, "id": only_id }))
+        }
+    }
+
+    /// `PUT …/effect` — apply previously created effect(s) by id.
+    fn apply_stored(
+        &mut self,
+        id: u64,
+        body: &[u8],
+        host: &mut dyn HostApi,
+        now: Instant,
+    ) -> HttpResponse {
+        if !self.sessions.contains_key(&id) {
+            return HttpResponse::err(404, rz::NOT_FOUND);
+        }
+        let Some(ids) = parse_effect_ids(body) else {
+            return HttpResponse::err(400, rz::INVALID_PARAMETER);
+        };
+        let mut results = Vec::new();
+        for eid in &ids {
+            let stored = self.sessions.get(&id).and_then(|s| s.effects.get(eid)).cloned();
+            let code = match stored {
+                Some(e) => {
+                    // The stored effect targets whatever surface serves its
+                    // device kind NOW — honest against hotplug between create
+                    // and apply.
+                    match surface_for(host, &e.device) {
+                        Some(surface) => self.apply(id, &e.device, &surface, e.action, host, now),
+                        None => rz::DEVICE_NOT_AVAILABLE,
+                    }
+                }
+                None => rz::NOT_FOUND,
+            };
+            results.push(serde_json::json!({ "id": eid, "result": code }));
+        }
+        if let Some(s) = self.sessions.get_mut(&id) {
+            s.last_seen = now;
+        }
+        match results.len() {
+            1 => HttpResponse::json(200, results.pop().unwrap()),
+            _ => HttpResponse::json(
+                200,
+                serde_json::json!({ "result": rz::SUCCESS, "results": results }),
+            ),
+        }
+    }
+
+    /// `DELETE …/effect` — free stored effect(s) by id.
+    fn free_stored(&mut self, id: u64, body: &[u8], now: Instant) -> HttpResponse {
+        let Some(s) = self.sessions.get_mut(&id) else {
+            return HttpResponse::err(404, rz::NOT_FOUND);
+        };
+        let Some(ids) = parse_effect_ids(body) else {
+            return HttpResponse::err(400, rz::INVALID_PARAMETER);
+        };
+        s.last_seen = now;
+        // Remove every known id even when some are unknown (no short-circuit
+        // — a mixed batch must not leave later effects allocated).
+        let mut all_known = true;
+        for eid in &ids {
+            if s.effects.remove(eid).is_none() {
+                all_known = false;
+            }
+        }
+        HttpResponse::result(if all_known { rz::SUCCESS } else { rz::NOT_FOUND })
+    }
+
+    /// Shared request front: session exists, device kind is served, body
+    /// parses into one-or-many actions (batch `{"effects": [...]}` bodies
+    /// per the reference server).
+    fn parse_request(
+        &mut self,
+        id: u64,
+        device: &str,
+        body: &[u8],
+        host: &mut dyn HostApi,
+    ) -> Result<(SurfaceInfo, Vec<Action>), HttpResponse> {
+        let Some(kind) = device_kind(device) else {
+            return Err(HttpResponse::err(404, rz::NOT_FOUND));
+        };
+        if !self.sessions.contains_key(&id) {
+            return Err(HttpResponse::err(404, rz::NOT_FOUND));
+        }
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
+            return Err(HttpResponse::err(400, rz::INVALID_PARAMETER));
+        };
+        // Truthful capability answer: no surface of this kind → say so with
+        // the SDK's own code for it, don't fake success (§5.4).
+        let Some(surface) = host.surfaces().into_iter().find(|s| s.kind == kind) else {
+            return Err(HttpResponse::json(
+                200,
+                serde_json::json!({ "result": rz::DEVICE_NOT_AVAILABLE }),
+            ));
+        };
+        let items: Vec<&serde_json::Value> = match v.get("effects").and_then(|e| e.as_array()) {
+            Some(batch) => batch.iter().collect(),
+            None => vec![&v],
+        };
+        let mut actions = Vec::with_capacity(items.len());
+        for item in items {
+            match parse_effect(item, &surface) {
+                Some(a) => actions.push(a),
+                None => return Err(HttpResponse::err(400, rz::INVALID_PARAMETER)),
+            }
+        }
+        Ok((surface, actions))
+    }
+
+    /// Apply one action to the session's layer on `device`: set-or-claim; a
+    /// swept layer (game stalled past the TTL then resumed) is re-claimed
+    /// transparently.
+    fn apply(
+        &mut self,
+        id: u64,
+        device: &str,
+        surface: &SurfaceInfo,
+        action: Action,
+        host: &mut dyn HostApi,
+        now: Instant,
+    ) -> i64 {
+        let Some(s) = self.sessions.get_mut(&id) else { return rz::NOT_FOUND };
+        match action {
+            Action::Clear => {
+                if let Some(layer) = s.layers.remove(device) {
+                    host.release(layer);
+                }
+                rz::SUCCESS
+            }
+            Action::Paint(content) => {
+                if let Some(layer) = s.layers.get(device) {
+                    if host.set_content(*layer, content.clone(), now) {
+                        return rz::SUCCESS;
+                    }
+                }
+                match host.claim(
+                    &surface.key,
+                    s.owner,
+                    band::SESSION,
+                    LeaseSpec::Ttl(SESSION_TTL),
+                    content,
+                    now,
+                ) {
+                    Some(layer) => {
+                        s.layers.insert(device.to_string(), layer);
+                        rz::SUCCESS
+                    }
+                    None => rz::DEVICE_NOT_AVAILABLE,
+                }
+            }
+        }
+    }
+
+    /// Drop sessions silent past the TTL — the same 15s the real server
+    /// enforces (a stalled game must re-init, matching reference behavior;
+    /// its layers already stopped painting at the same instant via the lease).
     fn prune(&mut self, host: &mut dyn HostApi, now: Instant) {
         let dead: Vec<u64> = self
             .sessions
             .iter()
-            .filter(|(_, s)| now.duration_since(s.last_seen) > PRUNE_AFTER)
+            .filter(|(_, s)| now.duration_since(s.last_seen) > SESSION_TTL)
             .map(|(id, _)| *id)
             .collect();
         for id in dead {
@@ -335,13 +505,57 @@ fn device_kind(device: &str) -> Option<SurfaceKind> {
     })
 }
 
+fn surface_for(host: &mut dyn HostApi, device: &str) -> Option<SurfaceInfo> {
+    let kind = device_kind(device)?;
+    host.surfaces().into_iter().find(|s| s.kind == kind)
+}
+
+/// One effect object → an action. Shapes per the official device docs:
+/// - `CHROMA_STATIC`: `param.color` BGR int.
+/// - `CHROMA_CUSTOM`: `param` = grid array.
+/// - `CHROMA_CUSTOM_KEY`: `param` = `{color: grid, key: grid}` (key-code
+///   translation is a later refinement; the color grid is honored).
+/// - `CHROMA_CUSTOM2`: keyboard = OBJECT `{color: 8×24, key: 6×22}`; mouse =
+///   flat 9×7 ARRAY. We accept either shape (array first, then /param/color)
+///   so both device families parse — the audit's top finding.
+fn parse_effect(v: &serde_json::Value, surface: &SurfaceInfo) -> Option<Action> {
+    let effect = v.get("effect").and_then(|e| e.as_str())?;
+    match effect {
+        "CHROMA_NONE" => Some(Action::Clear),
+        "CHROMA_STATIC" => {
+            let color = v.pointer("/param/color").and_then(|c| c.as_u64())?;
+            Some(Action::Paint(Content::Fill(bgr(color as u32))))
+        }
+        "CHROMA_CUSTOM" | "CHROMA_CUSTOM2" | "CHROMA_CUSTOM_KEY" => {
+            let grid = v
+                .get("param")
+                .and_then(parse_grid)
+                .or_else(|| v.pointer("/param/color").and_then(parse_grid))?;
+            Some(Action::Paint(Content::Cells(grid_to_cells(&grid, surface))))
+        }
+        // Firmware-side effect names (WAVE/BREATHING/…) are not part of the
+        // REST surface per the official device docs; refusing beats faking.
+        _ => None,
+    }
+}
+
+/// `{"id": "..."}` or `{"ids": ["...", ...]}`.
+fn parse_effect_ids(body: &[u8]) -> Option<Vec<String>> {
+    let v = serde_json::from_slice::<serde_json::Value>(body).ok()?;
+    if let Some(one) = v.get("id").and_then(|i| i.as_str()) {
+        return Some(vec![one.to_string()]);
+    }
+    let ids = v.get("ids")?.as_array()?;
+    ids.iter().map(|i| i.as_str().map(String::from)).collect()
+}
+
 /// COLORREF-style BGR int → Rgb (R = v&0xFF, G = v>>8, B = v>>16).
 fn bgr(v: u32) -> Rgb {
     Rgb((v & 0xFF) as u8, ((v >> 8) & 0xFF) as u8, ((v >> 16) & 0xFF) as u8)
 }
 
-/// Effect param → rows of BGR ints. Accepts a grid (array of arrays — the
-/// keyboard shape) or a flat array (linear devices).
+/// Effect param → rows of BGR ints. Accepts a grid (array of arrays) or a
+/// flat array (linear devices).
 fn parse_grid(v: &serde_json::Value) -> Option<Vec<Vec<u32>>> {
     let arr = v.as_array()?;
     if arr.is_empty() {
@@ -349,9 +563,7 @@ fn parse_grid(v: &serde_json::Value) -> Option<Vec<Vec<u32>>> {
     }
     if arr[0].is_array() {
         arr.iter()
-            .map(|row| {
-                row.as_array()?.iter().map(|c| c.as_u64().map(|c| c as u32)).collect()
-            })
+            .map(|row| row.as_array()?.iter().map(|c| c.as_u64().map(|c| c as u32)).collect())
             .collect()
     } else {
         Some(vec![arr.iter().filter_map(|c| c.as_u64().map(|c| c as u32)).collect()])
@@ -361,14 +573,17 @@ fn parse_grid(v: &serde_json::Value) -> Option<Vec<Vec<u32>>> {
 /// Map a source grid onto a surface. Grid targets map (row, col)→row*cols+col
 /// with honest cropping (a 6×22 effect on a smaller board paints what fits);
 /// linear targets fill index-by-index. Unpainted cells stay `None` so lower
-/// layers show through per-LED.
+/// layers show through per-LED. Bounds-guarded so a mis-declared SurfaceInfo
+/// (leds < rows*cols) degrades instead of panicking.
 fn grid_to_cells(grid: &[Vec<u32>], surface: &SurfaceInfo) -> Vec<Option<Rgb>> {
     let mut cells = vec![None; surface.leds];
     match surface.grid {
         Some(g) => {
             for (r, row) in grid.iter().enumerate().take(g.rows) {
                 for (c, v) in row.iter().enumerate().take(g.cols) {
-                    cells[r * g.cols + c] = Some(bgr(*v));
+                    if let Some(cell) = cells.get_mut(r * g.cols + c) {
+                        *cell = Some(bgr(*v));
+                    }
                 }
             }
         }
@@ -396,11 +611,7 @@ mod tests {
         HttpRequest { method: method.into(), path: path.into(), body: body.to_string().into_bytes() }
     }
 
-    fn open_session(
-        srv: &mut ChromaServer,
-        k: &mut Kernel,
-        now: Instant,
-    ) -> (u64, String) {
+    fn open_session(srv: &mut ChromaServer, k: &mut Kernel, now: Instant) -> u64 {
         let r = srv.handle(
             &req("POST", "/razer/chromasdk", serde_json::json!({ "title": "Test Game" })),
             k,
@@ -408,17 +619,35 @@ mod tests {
         );
         assert_eq!(r.status, 200);
         let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
-        let id = v["sessionid"].as_u64().expect("session id");
-        let uri = v["uri"].as_str().expect("uri").to_string();
-        (id, uri)
+        v["sessionid"].as_u64().expect("session id")
+    }
+
+    fn put_static(srv: &mut ChromaServer, k: &mut Kernel, id: u64, color: u32, now: Instant) {
+        let r = srv.handle(
+            &req(
+                "PUT",
+                &format!("/razer/chromasdk/sess/{id}/keyboard"),
+                serde_json::json!({ "effect": "CHROMA_STATIC", "param": { "color": color } }),
+            ),
+            k,
+            now,
+        );
+        assert_eq!(r.status, 200);
     }
 
     #[test]
-    fn init_returns_a_parseable_session() {
+    fn init_returns_port_plausible_session_and_routable_uri() {
         let mut k = kernel();
         let mut srv = ChromaServer::new();
-        let (id, uri) = open_session(&mut srv, &mut k, Instant::now());
-        assert!(uri.contains(&format!("/sess/{id}")), "uri {uri} must route back to the session");
+        let r = srv.handle(
+            &req("POST", "/razer/chromasdk", serde_json::json!({ "title": "Test Game" })),
+            &mut k,
+            Instant::now(),
+        );
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        let id = v["sessionid"].as_u64().unwrap();
+        assert!(id >= 54236, "session ids double as ports in official client flows: {id}");
+        assert!(v["uri"].as_str().unwrap().contains(&format!("/sess/{id}")));
     }
 
     #[test]
@@ -426,19 +655,9 @@ mod tests {
         let mut k = kernel();
         let mut srv = ChromaServer::new();
         let now = Instant::now();
-        let (id, _) = open_session(&mut srv, &mut k, now);
-        // 0x00FF0000 in COLORREF/BGR is BLUE, not red — the classic mixup the
-        // adapter must get right.
-        let r = srv.handle(
-            &req(
-                "PUT",
-                &format!("/razer/chromasdk/sess/{id}/keyboard"),
-                serde_json::json!({ "effect": "CHROMA_STATIC", "param": { "color": 0x00FF0000u32 } }),
-            ),
-            &mut k,
-            now,
-        );
-        assert_eq!(r.status, 200);
+        let id = open_session(&mut srv, &mut k, now);
+        // 0x00FF0000 in COLORREF/BGR is BLUE, not red — the classic mixup.
+        put_static(&mut srv, &mut k, id, 0x00FF0000, now);
         let frame = k.resolve("kbd", now).unwrap();
         assert!(frame.iter().all(|c| *c == Some(Rgb(0, 0, 255))), "0x00FF0000 = pure blue");
     }
@@ -448,8 +667,7 @@ mod tests {
         let mut k = kernel();
         let mut srv = ChromaServer::new();
         let now = Instant::now();
-        let (id, _) = open_session(&mut srv, &mut k, now);
-        // A 6×22 grid, all zero except row 1 col 2 = 0x0000FF (red).
+        let id = open_session(&mut srv, &mut k, now);
         let mut grid = vec![vec![0u32; 22]; 6];
         grid[1][2] = 0x0000FF;
         srv.handle(
@@ -467,21 +685,121 @@ mod tests {
     }
 
     #[test]
-    fn heartbeats_keep_the_session_alive_past_the_ttl() {
+    fn keyboard_custom2_object_param_is_accepted() {
+        // The audit's top finding: keyboard CUSTOM2 param is an OBJECT
+        // {color: 8x24, key: 6x22}, not a flat array. A spec-correct payload
+        // must not 400.
         let mut k = kernel();
         let mut srv = ChromaServer::new();
-        let t0 = Instant::now();
-        let (id, _) = open_session(&mut srv, &mut k, t0);
-        srv.handle(
+        let now = Instant::now();
+        let id = open_session(&mut srv, &mut k, now);
+        let mut color = vec![vec![0u32; 24]; 8];
+        color[0][0] = 0x0000FF; // red at (0,0)
+        let key = vec![vec![0u32; 22]; 6];
+        let r = srv.handle(
             &req(
                 "PUT",
+                &format!("/razer/chromasdk/sess/{id}/keyboard"),
+                serde_json::json!({ "effect": "CHROMA_CUSTOM2", "param": { "color": color, "key": key } }),
+            ),
+            &mut k,
+            now,
+        );
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(v["result"].as_i64(), Some(rz::SUCCESS), "object-shaped CUSTOM2 must work");
+        // 8x24 source cropped onto the 6x22 surface: (0,0) survives.
+        assert_eq!(k.resolve("kbd", now).unwrap()[0], Some(Rgb(255, 0, 0)));
+    }
+
+    #[test]
+    fn batch_effects_apply_in_sequence_with_results() {
+        let mut k = kernel();
+        let mut srv = ChromaServer::new();
+        let now = Instant::now();
+        let id = open_session(&mut srv, &mut k, now);
+        let r = srv.handle(
+            &req(
+                "PUT",
+                &format!("/razer/chromasdk/sess/{id}/keyboard"),
+                serde_json::json!({ "effects": [
+                    { "effect": "CHROMA_STATIC", "param": { "color": 0x0000FF } },
+                    { "effect": "CHROMA_STATIC", "param": { "color": 0xFF0000 } },
+                ] }),
+            ),
+            &mut k,
+            now,
+        );
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(v["results"].as_array().map(|a| a.len()), Some(2));
+        // Applied in sequence: the last one is showing.
+        assert_eq!(k.resolve("kbd", now).unwrap()[0], Some(Rgb(0, 0, 255)));
+    }
+
+    #[test]
+    fn post_stores_without_applying_and_put_effect_applies() {
+        let mut k = kernel();
+        let mut srv = ChromaServer::new();
+        let now = Instant::now();
+        let id = open_session(&mut srv, &mut k, now);
+        // POST: create the effect. Nothing paints yet — a preloading game
+        // must not flash every variant it creates.
+        let r = srv.handle(
+            &req(
+                "POST",
                 &format!("/razer/chromasdk/sess/{id}/keyboard"),
                 serde_json::json!({ "effect": "CHROMA_STATIC", "param": { "color": 255 } }),
             ),
             &mut k,
-            t0,
+            now,
         );
-        // Heartbeat every 10s out to t0+40s.
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        let eid = v["id"].as_str().expect("created effect id").to_string();
+        assert!(k.resolve("kbd", now).unwrap()[0].is_none(), "POST must not apply");
+        // PUT …/effect with the id applies it.
+        let r = srv.handle(
+            &req(
+                "PUT",
+                &format!("/razer/chromasdk/sess/{id}/effect"),
+                serde_json::json!({ "id": eid }),
+            ),
+            &mut k,
+            now,
+        );
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(v["result"].as_i64(), Some(rz::SUCCESS));
+        assert_eq!(k.resolve("kbd", now).unwrap()[0], Some(Rgb(255, 0, 0)));
+        // DELETE …/effect frees it; a second apply now reports NOT_FOUND.
+        let r = srv.handle(
+            &req(
+                "DELETE",
+                &format!("/razer/chromasdk/sess/{id}/effect"),
+                serde_json::json!({ "id": eid }),
+            ),
+            &mut k,
+            now,
+        );
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(v["result"].as_i64(), Some(rz::SUCCESS));
+        let r = srv.handle(
+            &req(
+                "PUT",
+                &format!("/razer/chromasdk/sess/{id}/effect"),
+                serde_json::json!({ "id": eid }),
+            ),
+            &mut k,
+            now,
+        );
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(v["result"].as_i64(), Some(rz::NOT_FOUND));
+    }
+
+    #[test]
+    fn heartbeats_keep_the_session_alive_past_the_ttl() {
+        let mut k = kernel();
+        let mut srv = ChromaServer::new();
+        let t0 = Instant::now();
+        let id = open_session(&mut srv, &mut k, t0);
+        put_static(&mut srv, &mut k, id, 255, t0);
         let mut t = t0;
         for _ in 0..4 {
             t += Duration::from_secs(10);
@@ -496,24 +814,24 @@ mod tests {
     }
 
     #[test]
-    fn a_dead_game_stops_painting_at_the_ttl() {
+    fn a_dead_game_stops_painting_and_its_session_dies_at_the_ttl() {
         let mut k = kernel();
         let mut srv = ChromaServer::new();
         let t0 = Instant::now();
-        let (id, _) = open_session(&mut srv, &mut k, t0);
-        srv.handle(
-            &req(
-                "PUT",
-                &format!("/razer/chromasdk/sess/{id}/keyboard"),
-                serde_json::json!({ "effect": "CHROMA_STATIC", "param": { "color": 255 } }),
-            ),
-            &mut k,
-            t0,
-        );
+        let id = open_session(&mut srv, &mut k, t0);
+        put_static(&mut srv, &mut k, id, 255, t0);
         assert!(k.resolve("kbd", t0 + Duration::from_secs(14)).unwrap()[0].is_some());
-        // No heartbeat, no goodbye — 16s later the paint is GONE, with no
-        // cleanup code having run anywhere. Teardown is the default path.
-        assert!(k.resolve("kbd", t0 + Duration::from_secs(16)).unwrap()[0].is_none());
+        // 16s of silence: the paint is gone (lease) AND the session is dead
+        // (parity with the real server — the app must re-init, a late
+        // heartbeat must not resurrect it).
+        let t1 = t0 + Duration::from_secs(16);
+        assert!(k.resolve("kbd", t1).unwrap()[0].is_none());
+        let r = srv.handle(
+            &req("PUT", &format!("/razer/chromasdk/sess/{id}/heartbeat"), serde_json::json!({})),
+            &mut k,
+            t1,
+        );
+        assert_eq!(r.status, 404, "a lapsed session must not heartbeat back to life");
     }
 
     #[test]
@@ -521,30 +839,15 @@ mod tests {
         let mut k = kernel();
         let mut srv = ChromaServer::new();
         let now = Instant::now();
-        let (id, _) = open_session(&mut srv, &mut k, now);
-        srv.handle(
-            &req(
-                "PUT",
-                &format!("/razer/chromasdk/sess/{id}/keyboard"),
-                serde_json::json!({ "effect": "CHROMA_STATIC", "param": { "color": 255 } }),
-            ),
+        let id = open_session(&mut srv, &mut k, now);
+        put_static(&mut srv, &mut k, id, 255, now);
+        let r = srv.handle(
+            &req("DELETE", &format!("/razer/chromasdk/sess/{id}"), serde_json::json!({})),
             &mut k,
             now,
         );
-        let r = srv.handle(&req("DELETE", &format!("/razer/chromasdk/sess/{id}"), serde_json::json!({})), &mut k, now);
         assert_eq!(r.status, 200);
         assert!(k.resolve("kbd", now).unwrap()[0].is_none());
-        // The session is gone: further effects 404.
-        let r = srv.handle(
-            &req(
-                "PUT",
-                &format!("/razer/chromasdk/sess/{id}/keyboard"),
-                serde_json::json!({ "effect": "CHROMA_STATIC", "param": { "color": 255 } }),
-            ),
-            &mut k,
-            now,
-        );
-        assert_eq!(r.status, 404);
     }
 
     #[test]
@@ -552,23 +855,16 @@ mod tests {
         let mut k = kernel();
         let mut srv = ChromaServer::new();
         let now = Instant::now();
-        let (a, _) = open_session(&mut srv, &mut k, now);
-        let (b, _) = open_session(&mut srv, &mut k, now);
-        let paint = |srv: &mut ChromaServer, k: &mut Kernel, id: u64, color: u32| {
-            srv.handle(
-                &req(
-                    "PUT",
-                    &format!("/razer/chromasdk/sess/{id}/keyboard"),
-                    serde_json::json!({ "effect": "CHROMA_STATIC", "param": { "color": color } }),
-                ),
-                k,
-                now,
-            );
-        };
-        paint(&mut srv, &mut k, a, 0x0000FF); // red
-        paint(&mut srv, &mut k, b, 0xFF0000); // blue
+        let a = open_session(&mut srv, &mut k, now);
+        let b = open_session(&mut srv, &mut k, now);
+        put_static(&mut srv, &mut k, a, 0x0000FF, now); // red
+        put_static(&mut srv, &mut k, b, 0xFF0000, now); // blue
         assert_eq!(k.resolve("kbd", now).unwrap()[0], Some(Rgb(0, 0, 255)), "later claim wins");
-        srv.handle(&req("DELETE", &format!("/razer/chromasdk/sess/{b}"), serde_json::json!({})), &mut k, now);
+        srv.handle(
+            &req("DELETE", &format!("/razer/chromasdk/sess/{b}"), serde_json::json!({})),
+            &mut k,
+            now,
+        );
         assert_eq!(k.resolve("kbd", now).unwrap()[0], Some(Rgb(255, 0, 0)), "first shows through");
     }
 
@@ -577,7 +873,7 @@ mod tests {
         let mut k = kernel();
         let mut srv = ChromaServer::new();
         let now = Instant::now();
-        let (id, _) = open_session(&mut srv, &mut k, now);
+        let id = open_session(&mut srv, &mut k, now);
         let r = srv.handle(
             &HttpRequest {
                 method: "PUT".into(),
@@ -592,11 +888,11 @@ mod tests {
     }
 
     #[test]
-    fn missing_device_kind_answers_honestly() {
+    fn missing_device_kind_answers_with_device_not_available() {
         let mut k = kernel(); // keyboard only — no mouse declared
         let mut srv = ChromaServer::new();
         let now = Instant::now();
-        let (id, _) = open_session(&mut srv, &mut k, now);
+        let id = open_session(&mut srv, &mut k, now);
         let r = srv.handle(
             &req(
                 "PUT",
@@ -607,7 +903,11 @@ mod tests {
             now,
         );
         let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
-        assert_eq!(v["result"].as_i64(), Some(rz::NOT_FOUND), "no mouse → say so, don't fake it");
+        assert_eq!(
+            v["result"].as_i64(),
+            Some(rz::DEVICE_NOT_AVAILABLE),
+            "RZRESULT_DEVICE_NOT_AVAILABLE (4319) is the SDK's code for this"
+        );
     }
 
     #[test]
@@ -615,16 +915,8 @@ mod tests {
         let mut k = kernel();
         let mut srv = ChromaServer::new();
         let now = Instant::now();
-        let (id, _) = open_session(&mut srv, &mut k, now);
-        srv.handle(
-            &req(
-                "PUT",
-                &format!("/razer/chromasdk/sess/{id}/keyboard"),
-                serde_json::json!({ "effect": "CHROMA_STATIC", "param": { "color": 255 } }),
-            ),
-            &mut k,
-            now,
-        );
+        let id = open_session(&mut srv, &mut k, now);
+        put_static(&mut srv, &mut k, id, 255, now);
         let r = srv.handle(
             &req(
                 "PUT",
@@ -639,19 +931,35 @@ mod tests {
     }
 
     #[test]
-    fn silent_sessions_are_pruned_from_bookkeeping() {
+    fn session_info_get_answers_while_alive() {
         let mut k = kernel();
         let mut srv = ChromaServer::new();
-        let t0 = Instant::now();
-        let (id, _) = open_session(&mut srv, &mut k, t0);
-        // 31s of silence, then ANY request prunes it; the old id now 404s.
-        let t1 = t0 + Duration::from_secs(31);
+        let now = Instant::now();
+        let id = open_session(&mut srv, &mut k, now);
         let r = srv.handle(
-            &req("PUT", &format!("/razer/chromasdk/sess/{id}/heartbeat"), serde_json::json!({})),
+            &req("GET", &format!("/razer/chromasdk/sess/{id}"), serde_json::json!({})),
             &mut k,
-            t1,
+            now,
         );
-        assert_eq!(r.status, 404, "pruned session must not heartbeat back to life");
+        assert_eq!(r.status, 200);
+        let r = srv.handle(
+            &req("GET", "/razer/chromasdk/sess/99999", serde_json::json!({})),
+            &mut k,
+            now,
+        );
+        assert_eq!(r.status, 404);
+    }
+
+    #[test]
+    fn unprefixed_chromasdk_root_is_accepted() {
+        let mut k = kernel();
+        let mut srv = ChromaServer::new();
+        let r = srv.handle(
+            &req("GET", "/chromasdk", serde_json::json!({})),
+            &mut k,
+            Instant::now(),
+        );
+        assert_eq!(r.status, 200);
     }
 
     #[test]
@@ -659,7 +967,7 @@ mod tests {
         let mut k = kernel();
         let mut srv = ChromaServer::new();
         let now = Instant::now();
-        let (id, _) = open_session(&mut srv, &mut k, now);
+        let id = open_session(&mut srv, &mut k, now);
         let r = srv.handle(
             &req(
                 "PUT",

@@ -22,7 +22,13 @@ use crate::arbiter::Rgb;
 /// Where resolved frames go. `None` cells are "unclaimed" — the sink decides
 /// the fallback (a real device sink will typically leave the firmware's
 /// latched state alone, the onboard-first answer).
-pub trait FrameSink: Send {
+///
+/// Deliberately NOT `Send`: sinks are BORN on the writer thread (see
+/// [`Writer::spawn`]'s factory parameter), so a device handle inside a sink
+/// never exists outside the one thread that owns it — the one-writer
+/// guarantee enforced by construction, matching neuron-core's own
+/// open-inside-the-thread pattern.
+pub trait FrameSink {
     fn write(&mut self, frame: &[Option<Rgb>]);
 }
 
@@ -60,11 +66,14 @@ pub struct Writer {
 }
 
 impl Writer {
-    pub fn spawn(
+    /// `make_sink` runs ON the writer thread — the factory is what crosses
+    /// the thread boundary (recipes are `Send`), never the sink itself, so a
+    /// sink may own thread-affine things like HID handles.
+    pub fn spawn<S: FrameSink + 'static>(
         mut api: impl HostApi + Send + 'static,
         surface: impl Into<String>,
         fps: u32,
-        mut sink: impl FrameSink + 'static,
+        make_sink: impl FnOnce() -> S + Send + 'static,
     ) -> Writer {
         let surface = surface.into();
         let stop = Arc::new(AtomicBool::new(false));
@@ -72,14 +81,32 @@ impl Writer {
         let thread = thread::Builder::new()
             .name(format!("neuron-writer-{surface}"))
             .spawn(move || {
+                let mut sink = make_sink();
                 let dt = Duration::from_secs(1) / fps.clamp(1, 60);
                 let mut core = WriterCore::new();
                 let mut next = Instant::now();
+                let mut faults: u64 = 0;
                 while !stop_flag.load(Ordering::Relaxed) {
-                    let now = Instant::now();
-                    if let Some(frame) = api.resolve(&surface, now) {
-                        if core.offer(&frame) {
-                            sink.write(&frame);
+                    // The writer must be un-killable by its collaborators: a
+                    // panicking sink (device driver edge case) or handle can
+                    // cost at most THIS frame — the loop, and the device's
+                    // one-writer guarantee, survive. Faults are counted and
+                    // logged on first occurrence, not silently eaten.
+                    let step = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let now = Instant::now();
+                        if let Some(frame) = api.resolve(&surface, now) {
+                            if core.offer(&frame) {
+                                sink.write(&frame);
+                            }
+                        }
+                    }));
+                    if step.is_err() {
+                        faults += 1;
+                        if faults == 1 {
+                            eprintln!(
+                                "neuron-writer-{surface}: sink/handle fault contained; \
+                                 writer continues"
+                            );
                         }
                     }
                     next += dt;

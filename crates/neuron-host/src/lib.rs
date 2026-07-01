@@ -30,6 +30,8 @@
 pub mod adapters;
 pub mod api;
 pub mod arbiter;
+#[cfg(feature = "bridge")]
+pub mod bridge;
 pub mod bus;
 pub mod governor;
 pub mod journal;
