@@ -107,9 +107,14 @@ Reddit threads.
    warning** (false-low-on-wake is the real hatred). Sleep/threshold sliders
    themselves are niche/rarely-touched — don't over-invest. (Memory:
    "vitals 1Hz wakes a sleeping mouse" is the same failure class — fix it.)
-3. **Audio-reactive lighting (visualizer)** — moderate-loved.
+3. **Audio-reactive lighting (visualizer)** — moderate-loved. **CORRECTION
+   (lifecycle map): already exists in-tree** — `neuron-core/src/audio_level.rs`
+   (~60Hz peak sampler, lock-free atomic, auto-stops ~2s unread) feeds a readout
+   pattern. Gap is polish/exposure, not existence.
 4. **Ambient/screen-mirror lighting** — niche but high-delight (SignalRGB's
-   headline paid feature).
+   headline paid feature). **CORRECTION: also already exists** —
+   `neuron-core/src/screen_ambient.rs` (~18Hz desktop grab → 22×6 zone grid,
+   auto-stop) + readout pattern. Same: polish, not existence.
 5. **Gaming Mode / Win-key lock** — table-stakes; ship with a visible on-state.
 6. **DPI sniper/clutch button** — essential FPS; make it first-class.
 7. **Rapid Trigger / adjustable actuation** — *the* top competitive-keyboard demand
@@ -568,6 +573,161 @@ macro engine are just two of its subscribers.
   *macro-backend-v2* (`act`/run_act), *refine-pass-backlog* (flagged races).
 - Section 9 below (neuron lifecycle map) is being filled by a read-only agent.
 
-## 9. Neuron runtime lifecycle map
-> *(pending — populated from the read-only lifecycle-mapping agent; see §6.7 for
-> the target host topology this must attach to.)*
+## 9. Neuron runtime lifecycle map (from read-only code survey, 2026-07-01)
+
+> Full agent reports lived in temp task files; this section is the durable
+> distillation. All `file:line` refs are against the snapshot commit on this
+> branch (`snapshot: carry in-flight master WIP`).
+
+### 9.1 Startup (neuron-app/src/main.rs:72-610, exact order)
+cwd-pin to exe dir → prof_log → one-shot CLI exits (--weave-proof /
+--purge-synapse / --scan-synapse) → **panic hook** (neuron-crash.log + flight
+dump) → **SEH filter + RegisterApplicationRestart** ("phoenix": Windows relaunches
+`--tray --respawned` after crash/hang, gated on prefs) → OleInitialize(STA) →
+renderer select (femtovg GPU, software fallback) → **build_window (eager, hidden)
+→ glue::install → AppRuntime::load()** (registry/bindings/cast/profiles/rules/
+vault from disk; ends with `restore_lighting()` re-applying saved layer stacks
+through the live compositor stream, then flips LIGHTING_READY) → tray (seeded
+from resident runtime) → arm gate set **before** worker start → **dispatch::
+LiveRuntime::start** → macro-host warm (detached) → notification engine (Note
+channel + confirm sink + forwarder + notifs::run w/ own overlay) → hidwatch →
+macrokeys → curtain painter → beacon::start → show window → **60ms Slint tick**
+(tray/hotkey pump + cadence-gated: status 250ms, reliability 1s, vitals ≤1Hz,
+organ-stall watch via flight heartbeats) → run_event_loop_until_quit. Quit path:
+drop tick timer → `flush_lighting_save()` → drop tray.
+
+**⚠ NO single-instance guard exists.** Two neuron-app.exe instances can run,
+each spawning workers + HID handles. (§10 fixes this *via the host itself*.)
+
+### 9.2 Thread/worker inventory (the load-bearing ones)
+- **`neuron-live-dispatch`** (dispatch.rs:193) — THE input/dispatch engine:
+  Raw-Input pump + WH_KEYBOARD_LL on one thread, HoldEdges → Engine::resolve →
+  DispatchExecutor → TurboRuntime; owns a `DeviceSession`. Fed by
+  `mpsc<LiveCommand>` behind `static LIVE_TX` (Reload/Inject/ToggleHyperShift/
+  ReconcileGamingHook/ApplyProfile). **Immortal listener**: catch_unwind +
+  reopen-after-250ms; ESC never stops it. **The ONLY cleanly-joined worker**
+  (stop atomic + join in Drop). Status posted to UI via invoke_from_event_loop.
+  The AUDIT's status-mutex-poison HIGH is **already fixed** in this tree (all
+  sites use `unwrap_or_else(PoisonError::into_inner)`) — AUDIT.md is stale.
+- **`neuron-beacon-router` / `neuron-weave-presenter`** (beacon.rs:149/225) —
+  drain MacroHost beacon events; presenter is the single cast-trigger owner
+  (beacon asks OR live spellweave), per-cycle catch_unwind, never joined.
+- **`neuron-audio-cache`** (beacon.rs:1280) — 400ms Core-Audio snapshot so
+  dispatch never does COM inline.
+- **notifs engine + confirm→note forwarder** (main.rs:316-333) — single-consumer
+  sinks: `NOTE_SINK` and `confirm::set_sink` are each **OnceLock, one subscriber
+  max** — already occupied by the app's own engine.
+- **hidwatch / macrokeys readers + monitors** — blocking reads per device
+  collection; hotplug = **20s re-enumeration polling** (no WM_DEVICECHANGE).
+  macrokeys injects ControlEvents via `controls::INJECT`
+  (`Mutex<Vec<(u64,Sender)>>` broadcast + 64-deep pre-registration buffer) —
+  **the one existing broadcast-bus pattern in the codebase.**
+- **Lighting anim thread, per-pid, per-apply** (runtime.rs:619-651) — opens its
+  OWN Device, `Compositor::from_defs`, `Lights::animate` at fps from a shared
+  AtomicU32 (live re-pace, clamp 1..30), row-dedup + deadline pacing;
+  stop-token generation guard (`anim_is_current`) against stale completions.
+- **MacroHost** (OnceLock singleton) — CPython sidecar, 3-pipe framed-JSON;
+  `fire_async` is **non-queueing drop-or-warm** (the flagged backpressure gap);
+  crash Breaker (4 crashes/30s → 20s cooldown); `run_act` verb table at
+  macro_host.rs:876 = the `act` protocol responder.
+- **Pull-providers with auto-stop** (neuron-core): `audio_level.rs` (~60Hz,
+  stops ~2s unread), `screen_ambient.rs` (~18Hz, 22×6 grid), `sys_stats.rs`
+  (1Hz) → readout patterns in pattern.rs. **Precedent for bus providers: lazy,
+  self-stopping, lock-free publication.**
+- Flight recorder (flight.rs): 1024-slot static seqlock ring + per-organ
+  heartbeat atomics; UI tick surfaces organ stalls. Not a thread.
+
+### 9.3 Device I/O — one wire funnel, MANY independent writers
+All writes converge on `Device::exec_dynamic_tx` (set_feature → busy-poll
+get_feature, echo-filter on class/id) or `send_lighting_fast` (fire → settle
+sleep → **drain ONE reply, no echo check** ← device.rs:156, the race mechanism)
+— but over **independently-opened handles**. Windows HID opens are
+FILE_SHARE_READ|WRITE, so nothing prevents concurrent handles to one device.
+**Seven concurrent writer domains today:** (1) UI-thread `open_selected()` per
+setter call; (2) live-dispatch `DeviceSession`; (3) per-pid anim threads;
+(4) hidwatch battery one-shots; (5) vitals pump; (6) macro `act` responders;
+(7) any neuron-cli process. Ad-hoc mitigations exist (profile apply stops all
+streams + sleeps 350ms; push_frame stops the stream first;
+`apply_with_session(paint_lighting=false)`) but hidwatch/vitals/act have **no**
+coordination with a live stream. Serialization is per-handle only.
+**→ The host must NOT become writer domain #8. Short-term: route through
+LiveCommand + start_layers. End-state: the kernel's one-writer-per-device
+absorbs all seven (§10).**
+
+### 9.4 Lighting pipeline facts the host must respect
+- `pattern::Compositor::from_defs(&[LayerDef])` → pure `render(rows, cols, t)`;
+  wrong-length pattern outputs are skipped (benign degradation).
+- **Shared render clock**: process-global `render_epoch()` + `quantized_t(elapsed,
+  fps)` used by BOTH the device stream and the GUI preview → "the preview
+  provably matches the board." Protocol-driven frames must join this clock.
+- Row-level dedup vs last-sent frame (static effect ≈ zero HID traffic after
+  first paint — the firmware latches); deadline pacing (`next += dt`, no
+  catch-up bursts). Legacy boards: class 0x03, fixed data_size, tx 0x3F, ~6fps
+  cap; Matrix: class 0x0F, `custom_id=0x08` (0x05 = reactive-flicker bug).
+- Persistence: layer edits debounce 400ms (`LIGHT_SAVE_TIMER`) →
+  `prefs::set_device_light(pid, {fps, layers})`; `restore_lighting` on install;
+  gated by LIGHTING_READY against startup clobber.
+- `vitals` is already a *pattern layer* fed by `lighting::publish_vitals` — the
+  cross-device mirror composes with the ordinary stack, not a side paint path.
+
+### 9.5 Existing attach points (precedents to follow)
+- **Act/execute**: new `LiveCommand` variants; `inject_trigger(Trigger)`
+  (dispatch.rs:83) and `apply_profile` (request/reply mpsc + timeout,
+  dispatch.rs:128) are the exact shape for a server RPC → reuses the worker's
+  serialized DeviceSession/Engine/Turbo. Casts already compose with HyperShift/
+  turbo/SAFE identically to hardware via this path.
+- **Lighting**: call `AppRuntime::start_layers` (accepts Vec<LayerDef> + pid +
+  completion) rather than reimplement streaming.
+- **Registry/capability**: `Registry::load()` is cheap + immutable — servers can
+  hold their own copy read-only.
+- **Safety gates**: `safety.rs` process-global atomics (`input_armed`,
+  `writes_paused`) — read for status; route effectful changes through the live
+  worker to keep tray/UI projections in sync (tdd.md "multiple sources of
+  runtime truth" risk).
+- **Event stream**: NO formal bus. To stream events to protocol clients,
+  broadcast-ify NOTE_SINK/confirm (`Option<Sender>` → `Vec<Sender>`) following
+  the `controls::INJECT` pattern.
+- Teardown reality: only LiveRuntime + macro-host pipes tear down
+  deterministically; everything else is process-lifetime. Lighting is left
+  latched in firmware on exit **by design** (survives without the app — the
+  onboard-first ethos already in action).
+
+---
+
+## 10. Grounded integration plan (map → target topology)
+
+### 10.1 The inversion (end-state)
+**The GUI becomes client #1 of the host.** The host owns: kernel (arbiter + bus
++ journal) + the single device-writer task per device + the protocol adapters.
+The Slint app, the CLI, and every external client speak the same surface. This
+also *solves the missing single-instance guard for free*: binding the localhost
+port/pipe IS the instance lock — a second launch detects the bind failure and
+becomes a client of the running host instead.
+
+### 10.2 How the kernel wraps (not replaces) today's compositor
+The existing `LayerDef` stack (user's configured lighting) becomes the content
+of ONE pinned arbiter layer at `band::BASE`. Protocol sessions (Chroma game,
+OpenRGB client) claim leased layers above it. The arbiter resolves; the winner's
+frame feeds the existing `Lights::animate` machinery (shared clock, row dedup,
+deadline pacing) — pattern.rs is untouched; the arbiter sits ABOVE it.
+
+### 10.3 Phases
+- **Phase 0 (this branch, now):** `crates/neuron-host` — pure-std kernel:
+  arbiter (owner/priority/lease/scope, resolve, sweep), bus (retained values +
+  prefix subscribe + dead-sub pruning, generalizing controls::INJECT), journal
+  (declaration log → replay → identical state), governor (AR(2)-damped restart
+  control, Jury-criterion stability check, escalation ledger). Zero deps, zero
+  I/O, fully unit-tested. **No workspace dep additions (manifest is FROZEN for
+  deps; member-list add only).**
+- **Phase 1:** host process shell — kernel on its own thread (actor: one owner,
+  channels in/out, nothing to poison), OpenRGB server+client adapter against a
+  MOCK sink; capture/replay harness for protocol correctness.
+- **Phase 2:** attach to the app the *safe* way: adapter-driven lighting goes
+  through `start_layers`-shaped calls; acts go through new `LiveCommand`
+  variants. Host is NOT a new device-writer domain.
+- **Phase 3:** the writer inversion — one writer task per device inside the
+  host; anim threads, GUI one-shot opens, vitals, hidwatch battery reads all
+  become kernel clients; `send_lighting_fast`'s unchecked reply-drain race dies
+  structurally. Chroma REST adapter lands here (leases prove themselves).
+- **Phase 4:** control plane (authed, sealed-consent verbs) + published neuron
+  protocol spec + GUI-as-client migration begins.

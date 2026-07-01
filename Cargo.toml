@@ -11,6 +11,7 @@ resolver = "2"
 members = [
     "crates/engram",
     "crates/neuron-core",
+    "crates/neuron-host",
     "crates/neuron-cli",
     "crates/neuron-app",
 ]

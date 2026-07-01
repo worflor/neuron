@@ -1,0 +1,129 @@
+//! neuron-host — the kernel of the protocol host.
+//!
+//! Every RGB-ecosystem conflict in the wild (Synapse-vs-SignalRGB "bad rave"
+//! flicker, lighting frozen on after a game exits, "close the other app before
+//! this one can see the device") is the same root bug: multiple sources writing
+//! one device with no model of who owns it *right now*, so it's last-writer-wins
+//! at the firmware. This crate is the fix, built from first principles:
+//!
+//! - [`arbiter`] — every source paints through a layer that carries an owner, a
+//!   priority, and a **lease**. Resolution is a pure function; lease expiry — not
+//!   adapter goodwill — releases a dead session's claim. Teardown is the default
+//!   path, not code someone remembered to write.
+//! - [`bus`] — named signals (`cs2.health`, `gpu.temp`, `obs.scene`) with
+//!   retained last-values and prefix subscriptions: normalize once, bind
+//!   anywhere. Generalizes the `controls::INJECT` broadcast pattern.
+//! - [`journal`] — durable state is a small replayable declaration log, the
+//!   codec lesson (a rich stream reduces to a tiny seed and reconstructs):
+//!   rebirth is a replay, so death is cheap.
+//! - [`governor`] — restart control as a damped AR(2) system, the same
+//!   `z[n] = K·z[n-1] − G·z[n-2]` recurrence as the eigenmotion stack. Spectral
+//!   radius < 1 (checked at construction) means a restart storm is impossible by
+//!   construction, not by tuning folklore.
+//!
+//! The kernel owns NO sockets, NO device handles, NO threads. Adapters (Chroma
+//! REST, OpenRGB TCP, telemetry listeners) and the single device-writer live
+//! outside and talk to it; because it holds no I/O it has almost nothing that
+//! *can* crash, and because state lives behind one owner there is no shared
+//! mutex to poison.
+
+pub mod arbiter;
+pub mod bus;
+pub mod governor;
+pub mod journal;
+
+use arbiter::Arbiter;
+use bus::Bus;
+use journal::Journal;
+
+/// The kernel: one struct owning the three state machines. Thread/actor wiring
+/// is a later, thin shell — everything interesting is synchronous and testable
+/// right here.
+pub struct Kernel {
+    pub arbiter: Arbiter,
+    pub bus: Bus,
+    pub journal: Journal,
+}
+
+impl Kernel {
+    pub fn new() -> Self {
+        Kernel { arbiter: Arbiter::new(), bus: Bus::new(), journal: Journal::new() }
+    }
+
+    /// Rebirth: fold the journal's declarations into a fresh arbiter. The
+    /// returned kernel is byte-for-byte equivalent to the one that recorded the
+    /// log — proven by `journal::tests::replay_reproduces_state`.
+    pub fn from_journal(journal: Journal) -> Self {
+        let arbiter = journal.replay();
+        Kernel { arbiter, bus: Bus::new(), journal }
+    }
+}
+
+impl Default for Kernel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arbiter::{band, Content, Lease, ReleaseWhy, Rgb, SourceId};
+    use std::time::{Duration, Instant};
+
+    /// The flagship story, end to end: a Chroma-style game session claims the
+    /// keyboard above the user's base lighting, its heartbeat lapses, and the
+    /// base shows through again — with the release OBSERVABLE. No flicker
+    /// window, no stuck lighting, no code that "remembers" to clean up.
+    #[test]
+    fn teardown_is_the_default_path() {
+        let mut k = Kernel::new();
+        let now = Instant::now();
+        k.arbiter.declare_surface("kbd", 6);
+
+        // The user's configured lighting: a pinned base layer.
+        let base = SourceId(1);
+        k.arbiter
+            .claim("kbd", base, band::BASE, Lease::Pinned, Content::Fill(Rgb(0, 255, 0)))
+            .unwrap();
+
+        // A game connects (Chroma session): leased, 15s heartbeat, higher band.
+        let game = SourceId(2);
+        let session = k
+            .arbiter
+            .claim(
+                "kbd",
+                game,
+                band::SESSION,
+                Lease::heartbeat(Duration::from_secs(15), now),
+                Content::Fill(Rgb(255, 0, 0)),
+            )
+            .unwrap();
+
+        // While the game heartbeats, it owns the surface.
+        let frame = k.arbiter.resolve("kbd", now).unwrap();
+        assert!(frame.iter().all(|c| *c == Some(Rgb(255, 0, 0))));
+
+        // Heartbeats keep it alive past the original deadline.
+        let t1 = now + Duration::from_secs(10);
+        assert!(k.arbiter.refresh(session, t1));
+        let t2 = t1 + Duration::from_secs(10);
+        let frame = k.arbiter.resolve("kbd", t2).unwrap();
+        assert!(frame.iter().all(|c| *c == Some(Rgb(255, 0, 0))));
+
+        // The game exits without saying goodbye (the realistic case). The lease
+        // lapses; resolve falls back BEFORE any sweep runs — there is no stale
+        // window where a dead session still paints.
+        let t3 = t2 + Duration::from_secs(16);
+        let frame = k.arbiter.resolve("kbd", t3).unwrap();
+        assert!(frame.iter().all(|c| *c == Some(Rgb(0, 255, 0))));
+
+        // And the release is observable: sweep reports who lapsed and why, so
+        // the host can log it / notify clients — teardown you can SEE.
+        let released = k.arbiter.sweep(t3);
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0].layer, session);
+        assert_eq!(released[0].owner, game);
+        assert_eq!(released[0].why, ReleaseWhy::Expired);
+    }
+}
