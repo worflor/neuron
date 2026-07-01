@@ -135,7 +135,10 @@ pub fn run_shared_intent(
         ProfileSwitch(name) => match Profile::load(name) {
             Ok(p) => {
                 let prev = cursor.active_profile();
-                let rep = p.apply_with_session(devices);
+                // paint_lighting = false: an auto-switch applies device SETTINGS; lighting is left to
+                // the caller's live compositor (the GUI streams it) so we never fight a running stream
+                // for the device here. (Lighting-on-auto-switch in a headless daemon is a follow-up.)
+                let rep = p.apply_with_session(devices, false);
                 cursor.set_active_profile(name);
                 // ONE confirmation for the action you took (switching profiles), not one per field
                 // the profile applied — those are its consequence, not a separate act.
@@ -154,7 +157,7 @@ pub fn run_shared_intent(
             match Profile::load(&name) {
                 Ok(p) => {
                     let prev = cursor.active_profile();
-                    let rep = p.apply_with_session(devices);
+                    let rep = p.apply_with_session(devices, false); // settings only (see ProfileSwitch)
                     cursor.set_active_profile(&name);
                     crate::confirm::profile(&name, Some(&prev));
                     format!("profile cycle {} -> {name}: {}", dir.label(), rep.summary())

@@ -35,12 +35,12 @@ use std::rc::Rc;
 /// The "off" colour of an LED cell — what `clear` paints and what an unpainted grid shows.
 const GRID_OFF: slint::Color = slint::Color::from_rgb_u8(0x0c, 0x0d, 0x10);
 
-/// A process-lifetime time origin for the lighting page's preview phases (the data-tile charging
-/// crest, the tile-grid animation). One shared clock so all previews advance together.
-fn preview_epoch() -> &'static std::time::Instant {
-    use std::sync::OnceLock;
-    static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
-    EPOCH.get_or_init(std::time::Instant::now)
+/// The lighting page's preview clock — the SAME process-global epoch the device `animate` loop
+/// quantises against ([`neuron::pattern::render_epoch`]), so the on-screen mirror and the board advance
+/// in lockstep (the tile-grid animation rides it too). Delegating keeps exactly ONE render epoch in the
+/// process, shared by every animated surface — the preview provably steps in the board's frames.
+fn preview_epoch() -> std::time::Instant {
+    neuron::pattern::render_epoch()
 }
 
 /// Whether the lighting-page render profiler is on (env `NEURON_PROF`). Cached once — env reads lock
@@ -141,11 +141,6 @@ pub struct Shared {
     /// for the common single-frame (non-sequenced) case; clamped to the active spectrum's length.
     pub active_frame: usize,
     pub layers_rev: u64,
-    /// DATA MODE — when set, the lighting surface paints a cross-device DATA readout (the vitals
-    /// dashboard via `render_vitals`) instead of the effect stack. It's a first-class TILE pick like
-    /// any effect, but it owns the whole board (a readout, not a layer), so picking it clears the
-    /// stack and picking an effect clears this. `Some(slug)` names which data surface is active.
-    pub light_data: Option<String>,
     /// The macro CONSTRUCTOR's working tree — the source of truth behind the blocks canvas. Every
     /// canvas edit (edit-step / add-step / delete-step / move-step) mutates THIS, then Rust regenerates
     /// `macro-source` (via `nodes_to_source`) and re-flattens it into `macro-blocks`. A successful
@@ -930,7 +925,6 @@ pub fn install(app: &AppWindow) -> SharedRt {
         selected_layer: 0,
         active_frame: 0,
         layers_rev: 0,
-        light_data: None,
         // the macro constructor starts empty; the canvas's root +add invites the first step, or a
         // parse of an existing macro's source (on entering the editor) reseeds it.
         macro_tree: Vec::new(),
@@ -1337,40 +1331,35 @@ pub fn install(app: &AppWindow) -> SharedRt {
                     cache.replace(None);
                     return;
                 }
-                let (rev, defs, data) = {
+                // Read the CHEAP signals first — the stack revision, whether the stack is empty, and the
+                // fps (the shared atomic the device stream seeds from, NOT a separate Slint property read,
+                // so preview + board are paced by the same value). The full `light_layers` clone is
+                // DEFERRED to the rebuild branch below: at ~20Hz it's wasteful to deep-clone every layer's
+                // spectrum/params each frame when the compositor is cached and only rebuilds on a change.
+                let (rev, is_empty, fps) = {
                     let s = sh.borrow();
-                    (s.layers_rev, s.light_layers.clone(), s.light_data.clone())
+                    (
+                        s.layers_rev,
+                        s.light_layers.is_empty(),
+                        s.rt.light_fps.load(std::sync::atomic::Ordering::Relaxed),
+                    )
                 };
-                // DATA mode: mirror the cross-device vitals readout onto the render (a representative
-                // snapshot in the preview; the applied stream reads the live device).
-                if let Some(_slug) = data {
-                    let n = (rows * cols) as usize;
-                    let phase = (preview_epoch().elapsed().as_secs_f32() * 0.18).rem_euclid(1.0);
-                    let frame =
-                        neuron::lighting::render_vitals(preview_vitals(), rows as u8, cols as u8, phase);
-                    let _ = n;
-                    let px: Vec<slint::Color> = frame
-                        .iter()
-                        .map(|p| slint::Color::from_rgb_u8(p.r, p.g, p.b))
-                        .collect();
-                    st.set_grid_px(ModelRc::new(VecModel::from(px)));
-                    cache.replace(None);
-                    return;
-                }
+                // The vitals readout is no longer a special surface — it's just a `vitals` LAYER in the
+                // stack, so it renders through the SAME compositor path below (reading the live provider
+                // the heartbeat feeds), exactly like every effect.
                 let n = (rows * cols) as usize;
-                if defs.is_empty() {
+                if is_empty {
                     // an empty stack = a dark device; mirror that honestly
                     st.set_grid_px(ModelRc::new(VecModel::from(vec![GRID_OFF; n])));
                     cache.replace(None);
                     return;
                 }
-                // QUANTIZED SHARED-EPOCH time: floor wall-clock to 1/fps steps off the process-wide
-                // preview epoch (NOT a per-stack t0 that reset on every restack — that anchor caused
-                // the phase JUMPS the user saw). This is the EXACT formula the device's animate() loop
-                // runs, so the preview advances in the SAME discrete frames the keyboard does (chunky
-                // at 6fps, smooth at 30); tuning fps re-paces the preview and the device together.
-                let fps = st.get_light_fps().max(1.0);
-                let t = (preview_epoch().elapsed().as_secs_f32() * fps).floor() / fps;
+                // QUANTIZED SHARED-CLOCK time: the ONE `quantized_t` helper off the process-global
+                // `render_epoch` the device's animate() loop ALSO uses — same epoch + same formula, so
+                // the preview advances in the SAME discrete frames the keyboard does (chunky at 6fps,
+                // smooth at 30), and a restack can't jump the phase. Tuning fps (the shared atomic above)
+                // re-paces the preview and the board together.
+                let t = neuron::pattern::quantized_t(preview_epoch().elapsed().as_secs_f32(), fps);
                 let mut c = cache.borrow_mut();
                 // rebuild the generators when the stack revision OR the grid dims change (a dims change
                 // needs fresh generators or they emit stale-length frames and the layer goes dark) —
@@ -1380,6 +1369,9 @@ pub fn install(app: &AppWindow) -> SharedRt {
                     .map(|(r, cr, cc, _)| *r != rev || *cr != rows || *cc != cols)
                     .unwrap_or(true);
                 if stale {
+                    // ONLY on a real rebuild (the stack revision or the grid dims changed) do we clone the
+                    // stack into fresh generators — the clone deferred from the cheap read above.
+                    let defs = sh.borrow().light_layers.clone();
                     *c = Some((rev, rows, cols, neuron::pattern::Compositor::from_defs(&defs)));
                 }
                 let (_, _, _, comp) = c.as_mut().unwrap();
@@ -1443,72 +1435,28 @@ pub fn install(app: &AppWindow) -> SharedRt {
             }
         });
     });
+    // ── Lighting COMPOSITOR — fps / import (the layer stack is edited via the unified surface + the
+    // spectrum editor below, and AUTO-STREAMS on every edit: `refresh_layers` → `schedule_lighting_apply`
+    // debounce-restreams the current stack, so there is no manual apply/stop transport. Auto-apply
+    // supersedes the old "apply live"/"restart" button; the global writes-pause gate is the one deliberate
+    // "stop writing" (a page-local stop would just be undone by the next edit). fps stays special — it
+    // re-paces the RUNNING stream in place, no restart, so it doesn't route through auto-apply, below) ──
     bind(app, &shared, |app, sh| {
-        let w = app.as_weak();
-        let sh = sh.clone();
-        app.global::<State>().on_push_frame(move || {
-            if let Some(app) = w.upgrade() {
-                // stop THIS board's generator BEFORE the write so it can't repaint over the frame.
-                let pid = sh.borrow().rt.selected_pid;
-                sh.borrow_mut().rt.stop_animation(pid);
-                let st = app.global::<State>();
-                st.set_animating(false);
-                let model = st.get_grid_px();
-                let mut frame = Vec::with_capacity(model.row_count());
-                for c in model.iter() {
-                    frame.push(Rgb::new(c.red(), c.green(), c.blue()));
-                }
-                let msg = sh.borrow().rt.push_frame(&frame);
-                if msg == "frame pushed" {
-                    st.set_applied_effect(-1); // the device now shows the custom frame, not an effect
-                }
-                st.set_status_line(msg.into());
-            }
-        });
-    });
-
-    // ── Lighting COMPOSITOR — apply / stop / fps / import (the layer stack is edited via the unified
-    // surface + the spectrum editor below; there is no separate legacy layer-list editor) ──
-    bind(app, &shared, |app, sh| {
-        // stream the whole composite live to the device
         {
             let w = app.as_weak();
             let sh = sh.clone();
-            app.global::<State>().on_composite_apply(move || {
-                if let Some(app) = w.upgrade() {
-                    // the SAME body startup-restore drives, so a manual apply and a resumed launch
-                    // stream the device through one path (data readout via start_vitals, effect stack
-                    // via start_layers); honours the writes-paused gate.
-                    let msg = apply_current_lighting(&app, &sh);
-                    app.global::<State>().set_status_line(msg.into());
-                }
-            });
-        }
-        {
-            let w = app.as_weak();
-            let sh = sh.clone();
-            app.global::<State>().on_composite_stop(move || {
-                if let Some(app) = w.upgrade() {
-                    let pid = sh.borrow().rt.selected_pid;
-                    sh.borrow_mut().rt.stop_animation(pid);
-                    let st = app.global::<State>();
-                    st.set_compositing(false);
-                    st.set_status_line("composite stopped".into());
-                }
-            });
-        }
-        {
-            let w = app.as_weak();
-            let sh = sh.clone();
-            // STREAM RATE: re-pace the live effect AND its on-screen preview together. Writing the
-            // shared atomic reaches a RUNNING worker (it re-reads fps every frame), so a streaming
-            // composite re-paces immediately — no restart. Clamped to the slider's 1–30; the
-            // data/vitals surface ignores this (it paints on-demand, not through the streamer).
+            // STREAM RATE: re-pace the live effect AND its on-screen preview together off ONE source —
+            // the shared `light_fps` atomic. Writing it reaches a RUNNING worker (it re-reads fps each
+            // frame) so a streaming composite re-paces immediately (no restart), AND it's the value the
+            // preview loop reads, so the mirror keeps pace too. The Slint property is only a DISPLAY echo
+            // (reflecting the 1–30 clamp back to the slider), never a source. Vitals now streams like any
+            // effect, so the rate applies to it as well. Clamped to the slider's 1–30 (= `animate`'s).
             app.global::<State>().on_set_light_fps(move |v| {
                 if let Some(app) = w.upgrade() {
                     let fps = (v.round() as i64).clamp(1, 30) as u32;
                     {
                         let s = sh.borrow();
+                        // the single in-memory source of truth: the preview reads it, new streams seed it.
                         s.rt
                             .light_fps
                             .store(fps, std::sync::atomic::Ordering::Relaxed);
@@ -1516,6 +1464,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                         let pid = s.rt.selected_pid;
                         s.rt.set_anim_fps(pid, fps);
                     }
+                    // display echo only — reflect the clamped value back to the slider.
                     app.global::<State>().set_light_fps(fps as f32);
                     // persist the user's fps pick for this board (debounced; restored on relaunch).
                     save_lighting(&sh);
@@ -1540,12 +1489,24 @@ pub fn install(app: &AppWindow) -> SharedRt {
                         }
                         match neuron::import::import_export(std::path::Path::new(&path)) {
                             Ok(imp) => {
-                                if !imp.lighting_layers.is_empty() {
-                                    // an ADVANCED animated composite → straight into the layer stack
-                                    // (the importer already maps each Synapse layer onto a Pattern × Spectrum).
-                                    let layers: Vec<neuron::pattern::LayerDef> =
-                                        imp.lighting_layers.clone();
+                                // Lighting now flows as ONE representation: the profile's compositor stack
+                                // (`Vec<LayerDef>`). Import pours that stack straight into the live
+                                // compositor. If the stack carries a `custom` hand-painted/imported frame
+                                // layer, ALSO drop its cells on the paint canvas so the user can edit it.
+                                let layers: Vec<neuron::pattern::LayerDef> =
+                                    imp.profile.lighting.clone();
+                                if layers.is_empty() {
+                                    let note = imp.notes.first().cloned().unwrap_or_default();
+                                    st.set_status_line(
+                                        format!("no lighting in that export{}", if note.is_empty() { String::new() } else { format!(" — {note}") }).into(),
+                                    );
+                                } else {
                                     let n = layers.len();
+                                    // the raw cells of a `custom` layer, if one rode in (edit on the canvas).
+                                    let custom_cells: Option<Vec<[u8; 3]>> = layers
+                                        .iter()
+                                        .find(|l| l.pattern == "custom")
+                                        .map(|l| l.frame.clone());
                                     {
                                         let mut s = sh.borrow_mut();
                                         s.light_layers = layers;
@@ -1553,62 +1514,25 @@ pub fn install(app: &AppWindow) -> SharedRt {
                                         s.active_frame = 0;
                                         s.layers_rev += 1;
                                     }
-                                    st.set_light_paint_mode(false);
-                                    refresh_layers(&app, &sh);
-                                    let drop = imp
-                                        .notes
-                                        .iter()
-                                        .find(|nt| nt.contains("no host generator"))
-                                        .cloned()
-                                        .unwrap_or_default();
-                                    st.set_status_line(
-                                        format!(
-                                            "imported {n} layer(s) from your theme{}",
-                                            if drop.is_empty() { String::new() } else { format!(" · {drop}") }
-                                        )
-                                        .into(),
-                                    );
-                                } else if let Some(frame) = &imp.profile.lighting_frame {
-                                    // a lossless per-LED frame → the PAINT canvas (push to apply)
-                                    let (rows, cols) = (st.get_grid_rows(), st.get_grid_cols());
-                                    let n = (rows.max(0) * cols.max(0)) as usize;
-                                    let mut px: Vec<slint::Color> = frame
-                                        .iter()
-                                        .take(n)
-                                        .map(|c| slint::Color::from_rgb_u8(c[0], c[1], c[2]))
-                                        .collect();
-                                    while px.len() < n {
-                                        px.push(GRID_OFF);
+                                    if let Some(cells) = custom_cells {
+                                        // paint the custom frame onto the canvas + enter paint mode.
+                                        let (rows, cols) = (st.get_grid_rows(), st.get_grid_cols());
+                                        let count = (rows.max(0) * cols.max(0)) as usize;
+                                        let mut px: Vec<slint::Color> = cells
+                                            .iter()
+                                            .take(count)
+                                            .map(|c| slint::Color::from_rgb_u8(c[0], c[1], c[2]))
+                                            .collect();
+                                        while px.len() < count {
+                                            px.push(GRID_OFF);
+                                        }
+                                        st.set_grid_px(ModelRc::new(VecModel::from(px)));
+                                        st.set_light_paint_mode(true);
+                                    } else {
+                                        st.set_light_paint_mode(false);
                                     }
-                                    st.set_grid_px(ModelRc::new(VecModel::from(px)));
-                                    st.set_light_paint_mode(true);
-                                    st.set_status_line(
-                                        format!(
-                                            "imported {} per-LED cell(s) onto the canvas — push frame to apply",
-                                            frame.len()
-                                        )
-                                        .into(),
-                                    );
-                                } else if let Some(name) = &imp.profile.lighting {
-                                    // a basic named effect → a compositor layer (mapped to a pattern preset)
-                                    let col = imp.profile.color.as_deref().and_then(Rgb::parse);
-                                    let d = effect_to_layer(name, col);
-                                    let label = pattern_label(&d.pattern).to_string();
-                                    {
-                                        let mut s = sh.borrow_mut();
-                                        s.light_layers.push(d);
-                                        s.selected_layer = s.light_layers.len() - 1;
-                                        s.active_frame = 0;
-                                        s.layers_rev += 1;
-                                    }
-                                    st.set_light_paint_mode(false);
                                     refresh_layers(&app, &sh);
-                                    st.set_status_line(format!("imported effect '{label}' as a layer").into());
-                                } else {
-                                    let note = imp.notes.first().cloned().unwrap_or_default();
-                                    st.set_status_line(
-                                        format!("no lighting in that export{}", if note.is_empty() { String::new() } else { format!(" — {note}") }).into(),
-                                    );
+                                    st.set_status_line(format!("imported {n} layer(s)").into());
                                 }
                             }
                             Err(e) => st.set_status_line(format!("import failed: {e}").into()),
@@ -1621,62 +1545,70 @@ pub fn install(app: &AppWindow) -> SharedRt {
 
     // ── Lighting UNIFIED SURFACE — tile pick · auto-rendered params · stack · brush ──
     bind(app, &shared, |app, sh| {
-        // pick-tile(slug): the SINGLE gesture for both effects AND data modes. An effect tile becomes
-        // the one active effect (replacing the selected layer when a stack exists, else a fresh single
-        // layer poured in the weave accent). A data tile takes over the whole board as a readout.
+        // pick-tile(slug): the ONE gesture for every tile — effects AND the vitals readout alike, now
+        // that vitals is just a preset. A tile becomes the one active effect (replacing the selected
+        // layer when a stack exists, else a fresh single layer), landing in the SAME stack path.
         {
             let w = app.as_weak();
             let sh = sh.clone();
             app.global::<State>().on_pick_tile(move |slug| {
                 if let Some(app) = w.upgrade() {
                     let slug = slug.to_string();
-                    let is_data = slug == VITALS_SLUG;
-                    let is_stub = slug == "notifications";
-                    if is_stub {
+                    // the notifications DATA tile is a future surface — not wired yet.
+                    if slug == "notifications" {
                         app.global::<State>().set_status_line(
                             "notifications is a future data tile — not wired yet".into(),
                         );
                         return;
                     }
-                    {
+                    // build the layer this PRESET describes (pattern + its params + spectrum) and pour it
+                    // into the stack. Vitals is just another preset now — no data-mode fork.
+                    let readout = {
                         let mut s = sh.borrow_mut();
-                        if is_data {
-                            // data mode owns the surface: drop the effect stack, mark the data slug.
-                            s.light_data = Some(slug.clone());
-                            s.light_layers.clear();
+                        let layer = preset_layer(&slug);
+                        if s.light_layers.is_empty() {
+                            // single-effect default — no layer ceremony.
+                            s.light_layers.push(layer);
                             s.selected_layer = 0;
-                            s.active_frame = 0;
                         } else {
-                            s.light_data = None;
-                            // build the layer this PRESET describes (pattern + its params + spectrum).
-                            let layer = preset_layer(&slug);
-                            if s.light_layers.is_empty() {
-                                // single-effect default — no layer ceremony.
-                                s.light_layers.push(layer);
-                                s.selected_layer = 0;
+                            // replace the ACTIVE (selected) layer's pattern/params/spectrum, keeping its
+                            // spatial REGION + enabled (the look changes, the placement stays — picking a
+                            // tile re-skins the layer you're editing). BLEND is normally preserved too, but
+                            // a READOUT (vitals) overlay DEPENDS on its Screen blend to show the effect
+                            // through its empty cells — so a readout pick adopts the PRESET's blend instead
+                            // of the layer's old one (a non-readout pick keeps preserving the current blend).
+                            let sel = s.selected_layer.min(s.light_layers.len() - 1);
+                            let region = s.light_layers[sel].region.clone();
+                            let enabled = s.light_layers[sel].enabled;
+                            let blend = if neuron::pattern::pattern_is_readout(&layer.pattern) {
+                                layer.blend
                             } else {
-                                // replace the ACTIVE (selected) layer's pattern/params/spectrum, keeping
-                                // its spatial REGION + blend + enabled (the look changes, the placement
-                                // stays — picking a tile re-skins the layer you're editing).
-                                let sel = s.selected_layer.min(s.light_layers.len() - 1);
-                                let region = s.light_layers[sel].region.clone();
-                                let blend = s.light_layers[sel].blend;
-                                let enabled = s.light_layers[sel].enabled;
-                                s.light_layers[sel] = neuron::pattern::LayerDef {
-                                    region,
-                                    blend,
-                                    enabled,
-                                    ..layer
-                                };
-                                s.selected_layer = sel;
-                            }
-                            s.active_frame = 0;
+                                s.light_layers[sel].blend
+                            };
+                            s.light_layers[sel] = neuron::pattern::LayerDef {
+                                region,
+                                blend,
+                                enabled,
+                                ..layer
+                            };
+                            s.selected_layer = sel;
                         }
+                        s.active_frame = 0;
                         s.layers_rev += 1;
+                        let sel = s.selected_layer;
+                        s.light_layers
+                            .get(sel)
+                            .map(|l| neuron::pattern::pattern_is_readout(&l.pattern))
+                            .unwrap_or(false)
+                    };
+                    // a READOUT (vitals) layer needs live source data to show anything — kick a prompt,
+                    // forced publish so the preview lights at once instead of waiting for the heartbeat.
+                    if readout {
+                        sh.borrow().rt.pump_vitals(true);
                     }
                     refresh_layers(&app, &sh);
-                    // structural change (effect / data pick) — persist NOW, not 400ms later, so it
-                    // survives an immediate quit-and-relaunch (the debounce alone could strand it).
+                    // structural change (a tile pick) — persist NOW, not 400ms later, so it survives an
+                    // immediate quit-and-relaunch (the debounce alone could strand it).
                     flush_lighting_save();
                     app.global::<State>()
                         .set_status_line(format!("lighting → {slug}").into());
@@ -1996,8 +1928,8 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 if let Some(app) = w.upgrade() {
                     {
                         let mut s = sh.borrow_mut();
-                        // never stack onto a data surface (it owns the board) or an empty stack
-                        if s.light_data.is_none() && !s.light_layers.is_empty() {
+                        // never stack onto an empty stack (there's nothing to duplicate on top).
+                        if !s.light_layers.is_empty() {
                             let sel = s.selected_layer.min(s.light_layers.len() - 1);
                             let mut d = s.light_layers[sel].clone();
                             d.blend = neuron::effects::Blend::Screen;
@@ -2049,9 +1981,15 @@ pub fn install(app: &AppWindow) -> SharedRt {
                         let i = i as usize;
                         if i < s.light_layers.len() {
                             s.light_layers.remove(i);
-                        }
-                        if !s.light_layers.is_empty() && s.selected_layer >= s.light_layers.len() {
-                            s.selected_layer = s.light_layers.len() - 1;
+                            // removing a layer BELOW the selection shifts it down one; removing the
+                            // selection (or above) only needs a clamp. The pure helper does both — and
+                            // returns 0 for an emptied stack — so the tracked selection can't drift one
+                            // layer too high (the old bare clamp missed the below-the-selection case).
+                            s.selected_layer = neuron::pattern::selection_after_remove(
+                                i,
+                                s.selected_layer,
+                                s.light_layers.len(),
+                            );
                         }
                         s.layers_rev += 1;
                     }
@@ -2070,6 +2008,11 @@ pub fn install(app: &AppWindow) -> SharedRt {
                     let st = app.global::<State>();
                     let on = !st.get_light_brush_on();
                     st.set_light_brush_on(on);
+                    // the brush and the PLACE gesture are exclusive render modes — picking up one drops
+                    // the other so the render never has two live pointer gestures fighting.
+                    if on {
+                        st.set_light_place_on(false);
+                    }
                     st.set_status_line(
                         if on {
                             "brush picked up — paint on the render"
@@ -2081,26 +2024,129 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 }
             });
         }
-        // push the painted frame to the device (the brush's commit)
+        // toggle the PLACE gesture — a sibling to the brush (mutually exclusive). On = a drag on the
+        // render defines the selected layer's region; off = normal. Entering place drops the brush.
+        {
+            let w = app.as_weak();
+            let _sh = sh.clone();
+            app.global::<State>().on_toggle_place(move || {
+                if let Some(app) = w.upgrade() {
+                    let st = app.global::<State>();
+                    let on = !st.get_light_place_on();
+                    st.set_light_place_on(on);
+                    if on {
+                        st.set_light_brush_on(false);
+                    }
+                    st.set_status_line(
+                        if on {
+                            "place mode — drag a rectangle to set this layer's area"
+                        } else {
+                            "done placing"
+                        }
+                        .into(),
+                    );
+                }
+            });
+        }
+        // set-layer-region(r0,c0,r1,c1): the PLACE gesture's commit — the dragged rectangle (inclusive
+        // corner cells, already normalised by the render) becomes the SELECTED layer's region. Compute the
+        // row-major indices the compositor masks by, write them onto the layer, then re-project + persist
+        // so the placement composites live, shows in the STACK badge, and survives relaunch. A rect that
+        // covers the WHOLE board stores an EMPTY region — the canonical "full board" the compositor treats
+        // as region-less — so a full-board drag and a Reset converge honestly.
+        {
+            let w = app.as_weak();
+            let sh = sh.clone();
+            app.global::<State>().on_set_layer_region(move |r0, c0, r1, c1| {
+                if let Some(app) = w.upgrade() {
+                    let committed = {
+                        let mut s = sh.borrow_mut();
+                        let (rows, cols) = s.rt.grid_dims();
+                        let sel = s.selected_layer;
+                        if rows == 0 || cols == 0 || sel >= s.light_layers.len() {
+                            None
+                        } else {
+                            // the pure core does the clamp + order + whole-board→empty math; an empty
+                            // result is the canonical full-board (region-less) placement.
+                            let region = neuron::pattern::region_from_rect(r0, c0, r1, c1, rows, cols);
+                            let full = region.is_empty();
+                            // the placed block's extent for the status readout is the region's bbox (the
+                            // whole board when the region is empty / full-board).
+                            let bbox = neuron::pattern::Bounds::from_region(&region, rows, cols);
+                            s.light_layers[sel].region = region;
+                            s.layers_rev += 1;
+                            Some((bbox.rows as i32, bbox.cols as i32, full))
+                        }
+                    };
+                    if let Some((rext, cext, full)) = committed {
+                        refresh_layers(&app, &sh);
+                        flush_lighting_save(); // placement is structural — persist immediately
+                        app.global::<State>().set_status_line(
+                            if full {
+                                "layer placed on the full board".to_string()
+                            } else {
+                                format!("layer placed · {rext}×{cext} block")
+                            }
+                            .into(),
+                        );
+                    }
+                }
+            });
+        }
+        // reset-layer-region: clear the SELECTED layer's region → it fills the whole board again.
+        {
+            let w = app.as_weak();
+            let sh = sh.clone();
+            app.global::<State>().on_reset_layer_region(move || {
+                if let Some(app) = w.upgrade() {
+                    let cleared = {
+                        let mut s = sh.borrow_mut();
+                        let sel = s.selected_layer;
+                        // clear only when there IS a layer AND it currently has a region (else no-op).
+                        let should = s
+                            .light_layers
+                            .get(sel)
+                            .map(|d| !d.region.is_empty())
+                            .unwrap_or(false);
+                        if should {
+                            s.light_layers[sel].region.clear();
+                            s.layers_rev += 1;
+                        }
+                        should
+                    };
+                    if cleared {
+                        refresh_layers(&app, &sh);
+                        flush_lighting_save();
+                        app.global::<State>()
+                            .set_status_line("placement reset — full board".into());
+                    }
+                }
+            });
+        }
+        // "push" the painted frame — a pure COMMIT now, not a device write. The painted grid becomes the
+        // one `custom` layer; auto-apply (refresh_layers → schedule_lighting_apply) streams it to the board
+        // as a StaticFrame — the identical pixels — so the old one-shot `rt.push_frame` write AND the
+        // explicit stop_animation it needed are gone (the stream renders the committed frame; nothing to
+        // race against). Kept: the user-facing "committed" feedback + clearing any stale effect accent.
         {
             let w = app.as_weak();
             let sh = sh.clone();
             app.global::<State>().on_push_painted(move || {
                 if let Some(app) = w.upgrade() {
-                    let pid = sh.borrow().rt.selected_pid;
-                    sh.borrow_mut().rt.stop_animation(pid);
                     let st = app.global::<State>();
-                    st.set_compositing(false);
                     let model = st.get_grid_px();
                     let mut frame = Vec::with_capacity(model.row_count());
                     for c in model.iter() {
                         frame.push(Rgb::new(c.red(), c.green(), c.blue()));
                     }
-                    let msg = sh.borrow().rt.push_frame(&frame);
-                    if msg == "frame pushed" {
-                        st.set_applied_effect(-1);
-                    }
-                    st.set_status_line(msg.into());
+                    // the painted frame is a first-class `custom` layer (survives relaunch, rides a captured
+                    // profile); committing COLLAPSES the stack to it (a full opaque frame occludes beneath).
+                    commit_custom_layer(&sh, &frame);
+                    st.set_applied_effect(-1); // the board now shows the custom frame, not an indexed effect
+                    // re-project (gallery drops any stale tile highlight, STACK reads "single") — and the
+                    // auto-apply hooked in refresh_layers streams the committed frame live to the device.
+                    refresh_layers(&app, &sh);
+                    st.set_status_line("frame committed — streaming to the board".into());
                 }
             });
         }
@@ -2770,8 +2816,23 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 let profile_name = name.to_string();
                 let persist = st.get_persist_to_onboard();
                 st.set_status_line(format!("applying '{profile_name}'...").into());
+                // FREE the device before apply: a live lighting stream holds the keyboard open and
+                // writes it every frame, so apply's own device writes (brightness/DPI/…) fight it —
+                // two writers stall each other and apply blows its deadline. Snapshot the current
+                // look, stop the stream(s), then apply on a quiet device; lighting restarts after.
+                let prev_lighting = with_shared_ret(|sh| {
+                    let s = sh.borrow();
+                    let prev = s.light_layers.clone();
+                    for a in s.rt.anim.values() {
+                        a.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    prev
+                })
+                .unwrap_or_default();
                 let back = app.as_weak();
                 std::thread::spawn(move || {
+                    // let the anim thread(s) notice the stop and release the device handle first.
+                    std::thread::sleep(std::time::Duration::from_millis(350));
                     let result = crate::dispatch::apply_profile(profile_name, persist);
                     let _ = slint::invoke_from_event_loop(move || {
                         if let Some(app) = back.upgrade() {
@@ -2782,6 +2843,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                                     st.set_disable_alt_tab(policy.disable_alt_tab);
                                     st.set_disable_win(policy.disable_win);
                                     st.set_disable_alt_f4(policy.disable_alt_f4);
+                                    st.set_disable_alt_esc(policy.disable_alt_esc);
                                     // switching profiles can swap which rules exist (the per-profile
                                     // sidecar set) — a row index held open in the inline editor may not
                                     // survive, so close it rather than let it seed from a stale row.
@@ -2796,10 +2858,54 @@ pub fn install(app: &AppWindow) -> SharedRt {
                                         }
                                         refresh_profiles(&app, sh);
                                         refresh_devices(&app, sh);
+                                        // Restart lighting on the now-freed device: the profile's stack
+                                        // if it sets one, else the look that was streaming before apply —
+                                        // so an empty-lighting profile keeps the current look (not dark)
+                                        // and the stream we stopped for the apply always comes back.
+                                        let stack = neuron::profile::Profile::load(&applied.name)
+                                            .map(|p| p.lighting)
+                                            .ok()
+                                            .filter(|l| !l.is_empty())
+                                            .unwrap_or_else(|| prev_lighting.clone());
+                                        if !stack.is_empty() {
+                                            {
+                                                let mut s = sh.borrow_mut();
+                                                s.light_layers = stack;
+                                                s.selected_layer =
+                                                    s.light_layers.len().saturating_sub(1);
+                                                s.active_frame = 0;
+                                                s.layers_rev += 1;
+                                            }
+                                            st.set_light_paint_mode(false);
+                                            // suppress the edit-debounce: this path streams EXPLICITLY just
+                                            // below, so a redundant 250ms re-stream on top of it is wasteful.
+                                            {
+                                                let _suppress = SuppressApply::new();
+                                                refresh_layers(&app, sh); // project + persist
+                                            }
+                                            flush_lighting_save(); // structural — persist now
+                                            let _ = apply_current_lighting(&app, sh); // stream live
+                                        }
                                     });
                                     st.set_status_line(applied.summary.into());
                                 }
-                                Err(e) => st.set_status_line(e.into()),
+                                Err(e) => {
+                                    // apply failed — bring back the look that was streaming before, so a
+                                    // failed apply never leaves the board frozen with its stream stopped.
+                                    if !prev_lighting.is_empty() {
+                                        with_shared(|sh| {
+                                            {
+                                                let mut s = sh.borrow_mut();
+                                                s.light_layers = prev_lighting.clone();
+                                                s.selected_layer =
+                                                    s.light_layers.len().saturating_sub(1);
+                                                s.layers_rev += 1;
+                                            }
+                                            let _ = apply_current_lighting(&app, sh);
+                                        });
+                                    }
+                                    st.set_status_line(e.into());
+                                }
                             }
                         }
                     });
@@ -2819,9 +2925,12 @@ pub fn install(app: &AppWindow) -> SharedRt {
                     st.get_brightness() as u8,
                 );
                 let msg = {
+                    // the captured profile carries the LIVE compositor stack (core can't read a
+                    // LayerDef stack back from the device's effect registers).
+                    let lighting = sh.borrow().light_layers.clone();
                     let mut s = sh.borrow_mut();
                     s.rt.persist = st.get_persist_to_onboard();
-                    s.rt.save_profile_from_devices(name.as_str(), dpi, hz, br)
+                    s.rt.save_profile_from_devices(name.as_str(), dpi, hz, br, lighting)
                 };
                 refresh_profiles(&app, &sh);
                 st.set_status_line(msg.into());
@@ -2842,18 +2951,34 @@ pub fn install(app: &AppWindow) -> SharedRt {
             }
         });
     });
+    // recompute the zero-typing suggestion from LIVE state whenever the profiles sheet opens — so a
+    // DPI/effect tuned since the last focus-change (its only other refresh point) isn't shown stale.
+    bind(app, &shared, |app, _sh| {
+        let w = app.as_weak();
+        app.global::<State>().on_refresh_profile_suggestion(move || {
+            if let Some(app) = w.upgrade() {
+                let focused = app.global::<State>().get_focused_app().to_string();
+                refresh_profile_suggestion(&app, &focused);
+            }
+        });
+    });
     // live answer for "does this save-name already exist?" (overwrite, said before the click)
     bind(app, &shared, |app, sh| {
         let w = app.as_weak();
         let sh = sh.clone();
         app.global::<State>().on_profile_name_edited(move |name| {
             if let Some(app) = w.upgrade() {
+                // Collide on the actual on-disk KEY (sanitized + case-folded), NOT the raw name —
+                // `Profile::path` sanitizes non-[A-Za-z0-9-_] → `_` and Windows is case-insensitive,
+                // so "my game/2" ≡ "my_game_2" and "Valorant" ≡ "valorant" all hit the same .toml.
+                // Comparing raw names lets the button read "capture" while the save clobbers a file.
+                let key = neuron::profile::Profile::file_key(name.as_str());
                 let exists = sh
                     .borrow()
                     .rt
                     .profiles
                     .iter()
-                    .any(|p| p.name == name.as_str());
+                    .any(|p| neuron::profile::Profile::file_key(&p.name) == key);
                 app.global::<State>().set_profile_name_exists(exists);
             }
         });
@@ -3711,6 +3836,14 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 if stopped_anim {
                     st.set_animating(false);
                     st.set_applied_effect(-1);
+                    st.set_compositing(false); // streams stopped — the board is no longer live
+                }
+                // AUTO-APPLY: un-pausing RESUMES the selected board's current stack once. Pausing stopped
+                // the stream (above) and the manual apply button is gone, so this toggle is what brings
+                // lighting back. A no-op on an empty stack; `apply_current_lighting` reads the now-armed
+                // gate (which we just set). `paused` is the NEW state, so `!paused` is the pause→arm edge.
+                if !paused {
+                    let _ = apply_current_lighting(&app, &sh);
                 }
                 st.set_status_line(
                     if stopped_anim {
@@ -3763,6 +3896,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 let safety = mode.state();
                 let paused = safety.writes_paused;
                 let armed = safety.input_armed;
+                let was_paused = neuron::writes::writes_paused(); // the gate BEFORE this stance move
                 let stopped_anim = {
                     let mut s = sh.borrow_mut();
                     let stop = paused && s.rt.any_animating();
@@ -3776,10 +3910,16 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 if stopped_anim {
                     st.set_animating(false);
                     st.set_applied_effect(-1);
+                    st.set_compositing(false); // streams stopped — the board is no longer live
                 }
                 st.set_writes_paused(paused);
                 st.set_input_armed(armed);
                 st.set_arm_stance(m);
+                // AUTO-APPLY: crossing paused → armed RESUMES the selected board's stack once (parity with
+                // the writes-pause toggle; the manual apply button is gone). A no-op on an empty stack.
+                if was_paused && !paused {
+                    let _ = apply_current_lighting(&app, &sh);
+                }
                 st.set_status_line(
                     match m {
                         1 => "arm → DEVICE (device writes on, input safe)",
@@ -5153,12 +5293,12 @@ fn install_perf_callbacks(app: &AppWindow, shared: &SharedRt) {
         app.global::<State>().on_apply_gaming_mode(move || {
             if let Some(app) = w.upgrade() {
                 let st = app.global::<State>();
-                let mut policy = neuron::writes::GamingMode::from_profile(
+                let policy = neuron::writes::GamingMode::from_profile(
                     st.get_disable_alt_tab(),
                     st.get_disable_win(),
                     st.get_disable_alt_f4(),
+                    st.get_disable_alt_esc(),
                 );
-                policy.disable_alt_esc = st.get_disable_alt_esc(); // live-only guard (no profile source)
                 sh.borrow_mut().rt.gaming_mode = policy;
                 // push the policy to the live dispatch thread so its LL hook (de)activates.
                 crate::dispatch::set_gaming_policy(policy);
@@ -5385,6 +5525,8 @@ pub fn note_focused_app(app: &AppWindow, focused: &str) {
     if st.get_active_app_rule() != idx {
         st.set_active_app_rule(idx);
     }
+    // keep the save-name suggestion in step with what the user is actually in right now.
+    refresh_profile_suggestion(app, focused);
 }
 
 /// `with_shared` that returns a value (None if the shared runtime isn't installed).
@@ -5587,21 +5729,22 @@ fn select_device_at(app: &AppWindow, sh: &SharedRt, idx: i32) {
             init_perf_controls(app, sh);
             st.set_selected_effect(-1);
             st.set_applied_effect(-1);
-            // a fresh device starts on no surface (not a stale data-mode/brush from the last device).
-            {
-                let mut s = sh.borrow_mut();
-                s.light_data = None;
-            }
+            // a fresh device starts with the brush down (not a stale per-LED editor from the last board);
+            // its own persisted stack is loaded by load_lighting_into_state below.
             st.set_light_brush_on(false);
             refresh_effects(app, sh);
             init_grid(app, sh);
             // SWITCHING boards: load the NEWLY-selected device's own persisted lighting (fps + stack /
             // data mode) into state + the page, overriding init_grid's per-class fps default when a pick
-            // was saved. State-only — selecting a device in the UI doesn't auto-stream it (startup's
-            // restore_lighting is the one path that resumes the stream); but it keeps each board's saved
-            // state correct so a later edit persists under the right pid. No-op before LIGHTING_READY.
+            // was saved, THEN resume it on the board. Under auto-apply the selected device's lighting is
+            // always the live one and the manual apply button is gone — so the switch itself is what brings
+            // the new board's saved stack live (immediate, like restore; not the 250ms edit-debounce).
+            // Honours writes-pause + an empty stack (both make `apply_current_lighting` a silent no-op).
+            // Gated on LIGHTING_READY so the INITIAL install-time selection stays state-only — restore_
+            // lighting owns that first stream (and flips the gate).
             if LIGHTING_READY.load(std::sync::atomic::Ordering::Acquire) {
                 load_lighting_into_state(app, sh);
+                let _ = apply_current_lighting(app, sh);
             }
         }
     }
@@ -6143,7 +6286,26 @@ pub fn refresh_profiles(app: &AppWindow, sh: &SharedRt) {
                         .map(|h| format!("{h} Hz"))
                         .unwrap_or_default()
                         .into(),
-                    lighting: p.lighting.clone().unwrap_or_default().into(),
+                    brightness: p
+                        .brightness
+                        .map(|b| format!("{b}%"))
+                        .unwrap_or_default()
+                        .into(),
+                    // the lighting badge is the ONE lighting label (Profile::lighting_label): "custom"
+                    // for a painted/imported frame, the preset name ("wave") for a lone procedural
+                    // layer, "N fx" for a taller stack — identical to summary()/the LIVE row.
+                    lighting: p.lighting_label().into(),
+                    idle: p
+                        .idle_secs
+                        .map(|s| format!("{s}s"))
+                        .unwrap_or_default()
+                        .into(),
+                    in_game: p
+                        .in_game_polling
+                        .map(|(wired, dongle)| format!("{wired}/{dongle}Hz"))
+                        .unwrap_or_default()
+                        .into(),
+                    gaming: p.has_gaming(),
                     active: p.name == active,
                 }
             })
@@ -6156,6 +6318,77 @@ pub fn refresh_profiles(app: &AppWindow, sh: &SharedRt) {
     let st = app.global::<State>();
     st.set_profiles(ModelRc::new(VecModel::from(rows)));
     st.set_profile_names(ModelRc::new(VecModel::from(names)));
+    drop(s);
+    // seed the low-friction save name (a device page write already told us what we're tuning —
+    // never make the user re-type it) from the focused app, else a value descriptor.
+    let focused = st.get_focused_app().to_string();
+    refresh_profile_suggestion(app, &focused);
+}
+
+/// The bare app name for a save-name suggestion: the focused executable's filename, minus ".exe"
+/// and ONLY the Unreal packaging suffix ("…-Win64-Shipping" → peel the config tag then the platform
+/// tag as EXACT suffixes). NEVER a general hyphen/underscore cut — real names carry those
+/// ("Counter-Strike", "Apex_Legends" must survive whole, or zero-typing capture mis-names them).
+fn app_stem(focused: &str) -> &str {
+    let base = focused
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(focused)
+        .trim_end_matches(".exe")
+        .trim_end_matches(".EXE");
+    let base = ["-Shipping", "-Development", "-Test", "-DebugGame"]
+        .iter()
+        .find_map(|&s| base.strip_suffix(s))
+        .unwrap_or(base);
+    let base = ["-Win64", "-Win32", "-WinGDK", "-WinArm64", "-Linux", "-Mac"]
+        .iter()
+        .find_map(|&s| base.strip_suffix(s))
+        .unwrap_or(base);
+    base.trim()
+}
+
+/// Compute a non-colliding suggested profile name so "capture" needs zero typing: prefer the
+/// focused app's bare name, else a value descriptor (dpi·effect), else "profile N". Never collides
+/// with an existing profile (so the capture button stays "capture", never a surprise "overwrite").
+pub fn refresh_profile_suggestion(app: &AppWindow, focused: &str) {
+    let st = app.global::<State>();
+    let existing: Vec<String> =
+        with_shared_ret(|sh| sh.borrow().rt.profiles.iter().map(|p| p.name.clone()).collect())
+            .unwrap_or_default();
+    // de-collide on the on-disk KEY (sanitized + case-folded), the same key the overwrite check and
+    // `Profile::path` use — so a "free" suggestion can't map to an existing profile's file.
+    let taken = |n: &str| {
+        let key = neuron::profile::Profile::file_key(n);
+        existing
+            .iter()
+            .any(|e| neuron::profile::Profile::file_key(e) == key)
+    };
+
+    // 1. the focused app's bare name (see `app_stem`: filename minus ".exe" + the Unreal packaging
+    //    suffix only — never a general hyphen/underscore cut that would maim a real name).
+    let base = app_stem(focused);
+    let mut seed = if !base.is_empty() && base != "—" {
+        base.to_string()
+    } else {
+        // 2. a value descriptor from what's live right now.
+        let dpi = st.get_dpi() as i32;
+        let eff = st.get_light_effect().to_string();
+        if !eff.is_empty() {
+            format!("{dpi} {eff}")
+        } else {
+            format!("{dpi} dpi")
+        }
+    };
+    // 3. de-collide: "valorant", "valorant 2", ...
+    if taken(&seed) {
+        let root = seed.clone();
+        let mut n = 2;
+        while taken(&format!("{root} {n}")) {
+            n += 1;
+        }
+        seed = format!("{root} {n}");
+    }
+    st.set_profile_name_suggested(seed.into());
 }
 
 pub fn refresh_app_rules(app: &AppWindow, sh: &SharedRt) {
@@ -6324,37 +6557,60 @@ thread_local! {
     /// rapid gesture (dragging the speed slider) coalesces into ONE app.toml write ~400ms after the
     /// last edit, instead of one write per emitted value.
     static LIGHT_SAVE_TIMER: slint::Timer = slint::Timer::default();
-    /// The latest pending lighting snapshot the debounce is waiting to write: `(pid, fps, data, layers)`.
+    /// The latest pending lighting snapshot the debounce is waiting to write: `(pid, fps, layers)`.
     /// Held ALONGSIDE the timer so the write can be FLUSHED early — on a structural edit or app exit —
     /// instead of being lost if the app quits before the 400ms settles (the "stacked layers collapse to
     /// base on relaunch" bug: a stack/re-theme made within the debounce window never reached disk).
     static LIGHT_PENDING: std::cell::RefCell<
-        Option<(u16, u32, Option<String>, Vec<neuron::pattern::LayerDef>)>,
+        Option<(u16, u32, Vec<neuron::pattern::LayerDef>)>,
     > = std::cell::RefCell::new(None);
+    /// Debounce timer for the AUTO-APPLY device re-stream (UI-thread), mirroring `LIGHT_SAVE_TIMER`.
+    /// Restarted on each lighting edit so a burst (a knob drag) coalesces into ONE re-stream ~250ms after
+    /// the last change instead of thrashing the board once per emitted value. See `schedule_lighting_apply`.
+    static LIGHT_APPLY_TIMER: slint::Timer = slint::Timer::default();
+    /// When set, `refresh_layers` PROJECTS + persists but does NOT schedule an auto-apply. Held by the pure
+    /// STATE-LOAD / explicit-stream paths (device switch, profile apply) whose callers stream immediately
+    /// themselves — so the debounced re-stream can't fire a redundant second write on top of their direct
+    /// `apply_current_lighting`. A scoped [`SuppressApply`] guard sets/clears it (restore-safe).
+    static SUPPRESS_LIGHT_APPLY: std::cell::Cell<bool> = std::cell::Cell::new(false);
 }
 
-/// Persist the SELECTED device's current lighting state (fps + layer stack / data mode), debounced. A
-/// no-op until `LIGHTING_READY` (so restore/install can't overwrite a saved state) and when no device
-/// is selected. Snapshots the state into `LIGHT_PENDING` now (cheap); the disk write fires once the
-/// debounce settles — OR sooner via [`flush_lighting_save`] (structural edits / app exit), so a quick
-/// quit-and-relaunch can never strand the change.
+/// Scope guard: suppress `refresh_layers`' auto-apply for the duration (used by load/profile-apply paths
+/// that project the stack then stream EXPLICITLY, so the debounce doesn't double-fire). Restores the prior
+/// value on drop, so it's safe even if nested or if the guarded body unwinds.
+struct SuppressApply(bool);
+impl SuppressApply {
+    fn new() -> Self {
+        SuppressApply(SUPPRESS_LIGHT_APPLY.with(|s| s.replace(true)))
+    }
+}
+impl Drop for SuppressApply {
+    fn drop(&mut self) {
+        SUPPRESS_LIGHT_APPLY.with(|s| s.set(self.0));
+    }
+}
+
+/// Persist the SELECTED device's current lighting state (fps + layer stack), debounced. A no-op until
+/// `LIGHTING_READY` (so restore/install can't overwrite a saved state) and when no device is selected.
+/// Snapshots the state into `LIGHT_PENDING` now (cheap); the disk write fires once the debounce settles
+/// — OR sooner via [`flush_lighting_save`] (structural edits / app exit), so a quick quit-and-relaunch
+/// can never strand the change.
 fn save_lighting(sh: &SharedRt) {
     if !LIGHTING_READY.load(std::sync::atomic::Ordering::Acquire) {
         return;
     }
-    let (pid, fps, data, layers) = {
+    let (pid, fps, layers) = {
         let s = sh.borrow();
         (
             s.rt.selected_pid,
             s.rt.light_fps.load(std::sync::atomic::Ordering::Relaxed),
-            s.light_data.clone(),
             s.light_layers.clone(),
         )
     };
     if pid == 0 {
         return; // nothing selected → no per-device key to write under
     }
-    LIGHT_PENDING.with(|p| *p.borrow_mut() = Some((pid, fps, data, layers)));
+    LIGHT_PENDING.with(|p| *p.borrow_mut() = Some((pid, fps, layers)));
     LIGHT_SAVE_TIMER.with(|t| {
         t.start(
             slint::TimerMode::SingleShot,
@@ -6372,23 +6628,25 @@ fn save_lighting(sh: &SharedRt) {
 pub fn flush_lighting_save() {
     LIGHT_SAVE_TIMER.with(|t| t.stop());
     let pending = LIGHT_PENDING.with(|p| p.borrow_mut().take());
-    if let Some((pid, fps, data, layers)) = pending {
-        if let Err(e) =
-            crate::prefs::set_device_light(pid, crate::prefs::DeviceLight { fps, data, layers })
-        {
+    if let Some((pid, fps, layers)) = pending {
+        if let Err(e) = crate::prefs::set_device_light(
+            pid,
+            crate::prefs::DeviceLight { fps, layers, ..Default::default() },
+        ) {
             eprintln!("neuron: lighting save failed ({e})");
         }
     }
 }
 
 /// Load the SELECTED device's saved lighting state into the shared runtime + the UI (the fps atomic,
-/// the layer stack / data mode, and the projected page), WITHOUT starting the device stream. Returns
-/// true when there's an applicable surface to resume (a data mode or a non-empty stack). Authoritative:
-/// a device with nothing saved is reset to a blank surface, so per-device state never bleeds across a
-/// switch.
+/// the layer stack, and the projected page), WITHOUT starting the device stream. A legacy data-mode save
+/// is MIGRATED into a `vitals` layer here (`DeviceLight::migrated`), so a pre-unification save resumes
+/// with zero user action. Returns true when there's a non-empty stack to resume. Authoritative: a device
+/// with nothing saved is reset to a blank surface, so per-device state never bleeds across a switch.
 fn load_lighting_into_state(app: &AppWindow, sh: &SharedRt) -> bool {
     let pid = sh.borrow().rt.selected_pid;
-    let saved = crate::prefs::device_light(pid).unwrap_or_default();
+    // `.migrated()` folds a legacy `data = "mouse-battery"` record into a vitals LAYER (one-way compat).
+    let saved = crate::prefs::device_light(pid).unwrap_or_default().migrated();
     // fps: honour the user's saved pick; fall back to whatever the per-device default already seeded
     // (init_grid) only when nothing's saved (saved.fps == 0).
     if saved.fps >= 1 {
@@ -6403,62 +6661,37 @@ fn load_lighting_into_state(app: &AppWindow, sh: &SharedRt) -> bool {
         .light_fps
         .load(std::sync::atomic::Ordering::Relaxed);
     app.global::<State>().set_light_fps(fps_now as f32);
-    let has_surface = saved.data.is_some() || !saved.layers.is_empty();
+    let has_surface = !saved.layers.is_empty();
     {
         let mut s = sh.borrow_mut();
-        s.light_data = saved.data;
         s.light_layers = saved.layers;
         s.selected_layer = s.light_layers.len().saturating_sub(1);
         s.layers_rev += 1;
     }
-    // project the restored stack into both the legacy layer model and the unified tile surface.
-    refresh_layers(app, sh);
+    // project the restored stack into both the legacy layer model and the unified tile surface. SUPPRESS
+    // auto-apply here: a pure state-load must not itself stream (this fn's contract) — the CALLERS decide
+    // when to stream (restore + device-switch each do an immediate `apply_current_lighting`), so the
+    // debounce can't fire a redundant second write on top of that direct apply.
+    {
+        let _suppress = SuppressApply::new();
+        refresh_layers(app, sh);
+    }
     has_surface
 }
 
-/// Stream the CURRENT lighting surface (data readout or layer composite) live to the selected device —
-/// the shared body behind the GUI's apply button AND startup restore, so a resumed board streams
-/// through the EXACT path a manual pick uses. Honours the writes-paused kill-switch. Returns a status.
+/// Stream the CURRENT lighting composite live to the selected device — the shared body behind the GUI's
+/// apply button AND startup restore, so a resumed board streams through the EXACT path a manual pick
+/// uses. Vitals rides this too (it's just a `vitals` layer in the stack now, not a sidecar). Honours the
+/// writes-paused kill-switch. Returns a status.
 fn apply_current_lighting(app: &AppWindow, sh: &SharedRt) -> String {
     let st = app.global::<State>();
     if st.get_writes_paused() {
         return "writes paused — composite not applied".into();
     }
-    let is_data = sh.borrow().light_data.is_some();
-    if !is_data && sh.borrow().light_layers.is_empty() {
+    if sh.borrow().light_layers.is_empty() {
         return "nothing to apply".into();
     }
-    let msg = if is_data {
-        // DATA mode: stream the cross-device vitals readout instead of the effect stack.
-        let done = app.as_weak();
-        let mut s = sh.borrow_mut();
-        let pid = s.rt.selected_pid;
-        s.rt.start_vitals(pid, move |reason, token| {
-            let _ = slint::invoke_from_event_loop(move || {
-                if let Some(app) = done.upgrade() {
-                    with_shared(|sh| {
-                        // ignore a STALE end: this stream was superseded, or already stopped+removed.
-                        if !sh.borrow().rt.anim_is_current(pid, &token) {
-                            return;
-                        }
-                        sh.borrow_mut().rt.anim_clear(pid, &token);
-                        let st = app.global::<State>();
-                        // only clear the indicator if we're VIEWING the board that ended.
-                        if sh.borrow().rt.selected_pid == pid {
-                            st.set_compositing(false);
-                        }
-                        st.set_status_line(
-                            match reason {
-                                Some(r) => format!("vitals ended: {r}"),
-                                None => "vitals finished".into(),
-                            }
-                            .into(),
-                        );
-                    });
-                }
-            });
-        })
-    } else {
+    let msg = {
         let back = app.as_weak();
         let mut s = sh.borrow_mut();
         let pid = s.rt.selected_pid;
@@ -6495,11 +6728,55 @@ fn apply_current_lighting(app: &AppWindow, sh: &SharedRt) -> String {
     msg
 }
 
+/// AUTO-APPLY — the one debounced chokepoint that keeps the board tracking the UI. Every lighting edit
+/// funnels through [`refresh_layers`], which calls this; it (re)starts a single-shot ~250ms timer so a
+/// burst of edits (a knob drag) COALESCES into ONE device re-stream after the quiet settles, instead of
+/// restarting the stream on every emitted value. The fire re-streams the CURRENT stack via the shared
+/// [`apply_current_lighting`] engine (the same one restore + device-switch use), and each re-stream
+/// SUPERSEDES the last — the superseded stream's end callback is swallowed by `anim_is_current`, so a
+/// rapid re-apply never spams "composite ended". Silent by design: it sets the `compositing` indicator
+/// but no status line (the edit handler already narrated the change).
+///
+/// No-op unless lighting has been restored ([`LIGHTING_READY`] — so startup restore, not this, owns the
+/// first apply), writes are armed (`!writes_paused` — the one deliberate "stop"), and the load/profile
+/// paths haven't [`SuppressApply`]-suppressed it. fps is deliberately NOT routed here: it re-paces the
+/// running stream in place (`set_anim_fps`), no restart. The gate is re-checked at fire time (writes may
+/// have paused during the quiet window).
+fn schedule_lighting_apply(app: &AppWindow, sh: &SharedRt) {
+    if !LIGHTING_READY.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    if SUPPRESS_LIGHT_APPLY.with(|s| s.get()) {
+        return;
+    }
+    if app.global::<State>().get_writes_paused() {
+        return;
+    }
+    let back = app.as_weak();
+    let sh = sh.clone();
+    LIGHT_APPLY_TIMER.with(|t| {
+        t.start(
+            slint::TimerMode::SingleShot,
+            std::time::Duration::from_millis(250),
+            move || {
+                if let Some(app) = back.upgrade() {
+                    // re-check the kill-switch: writes may have paused during the debounce window, and
+                    // `apply_current_lighting` also refuses when paused — but bail early to skip the work.
+                    if app.global::<State>().get_writes_paused() {
+                        return;
+                    }
+                    let _ = apply_current_lighting(&app, &sh); // discard the status — auto-apply is silent
+                }
+            },
+        );
+    });
+}
+
 /// Restore + RE-APPLY the selected device's persisted lighting ONCE at startup: load the saved fps +
 /// stack/data into state, and — if there's a surface to resume — start the device stream so the board
 /// picks the effect back up instead of holding its stale last frame. Flips `LIGHTING_READY` so user
 /// edits from here on persist. Respects the writes-paused gate (the state is still restored; it just
-/// isn't streamed until writes resume + the user applies).
+/// isn't streamed until writes resume — un-pausing re-applies the stack; there is no manual apply now).
 pub fn restore_lighting(app: &AppWindow, sh: &SharedRt) {
     let has_surface = load_lighting_into_state(app, sh);
     if has_surface {
@@ -6513,8 +6790,34 @@ pub fn restore_lighting(app: &AppWindow, sh: &SharedRt) {
     LIGHTING_READY.store(true, std::sync::atomic::Ordering::Release);
 }
 
+/// Commit the painted canvas as a FIRST-CLASS `custom` layer (survives relaunch, rides into a captured
+/// profile) rather than a transient device-only write. A pushed frame is a FULL, opaque snapshot of
+/// every LED, so anything beneath it is occluded dead weight — the push therefore COLLAPSES the stack
+/// to the single layer it now IS. What you painted becomes the lighting, whole and unified: no ghost
+/// effect riding invisibly underneath. The caller follows with `refresh_layers`, whose AUTO-APPLY streams
+/// this custom layer to the board as a StaticFrame — so the commit IS the paint reaching the device, with
+/// no separate one-shot write (the old `rt.push_frame` path this used to ride alongside is gone).
+fn commit_custom_layer(sh: &SharedRt, frame: &[Rgb]) {
+    let cells: Vec<[u8; 3]> = frame.iter().map(|c| [c.r, c.g, c.b]).collect();
+    {
+        let mut s = sh.borrow_mut();
+        s.light_layers = vec![neuron::pattern::LayerDef {
+            pattern: "custom".into(),
+            frame: cells,
+            ..Default::default()
+        }];
+        s.selected_layer = 0;
+        s.layers_rev += 1;
+    }
+    save_lighting(sh);
+}
+
 /// The chokepoint every lighting mutation funnels through: clamp the selection, re-project the stack
-/// into the unified surface (tiles + params + spectrum editor), and persist (debounced).
+/// into the unified surface (tiles + params + spectrum editor), persist (debounced), AND auto-apply the
+/// stack to the board (debounced). Because EVERY edit path routes here — tile pick, param knobs, the whole
+/// spectrum editor, stack add/select/remove, place/reset region, import, paint commit — this one hook is
+/// what makes lighting AUTO-STREAM: no manual apply. Both side effects are debounced + gated (see
+/// `save_lighting` / `schedule_lighting_apply`), so a knob drag collapses to one disk write + one restream.
 pub fn refresh_layers(app: &AppWindow, sh: &SharedRt) {
     let (n, sel) = {
         let s = sh.borrow();
@@ -6527,6 +6830,9 @@ pub fn refresh_layers(app: &AppWindow, sh: &SharedRt) {
     // It's a no-op until restore has run (LIGHTING_READY) and is never reached from the animate loop —
     // only user edits + the tile/data picks — so the disk write stays cheap (and debounced).
     save_lighting(sh);
+    // …and push the edit to the physical board — debounced, gated on LIGHTING_READY + !writes_paused, and
+    // skipped when a load/profile path suppressed it (those stream explicitly). fps doesn't route here.
+    schedule_lighting_apply(app, sh);
 }
 
 // ── THE UNIFIED LIGHTING SURFACE — tiles + auto-rendered knobs over the layer stack ───────────
@@ -6534,51 +6840,25 @@ pub fn refresh_layers(app: &AppWindow, sh: &SharedRt) {
 // is just `light_layers` with one entry, stacking adds entries, the "active effect" is the selected
 // layer. These helpers project that truth into the tile grid + the schema-rendered param model.
 
-/// The slug of the cross-device VITALS data tile — the one tile rendered via `render_vitals` rather
-/// than a Pattern × Spectrum compositor. Treated as a first-class "effect" where the page picks tiles.
-const VITALS_SLUG: &str = "mouse-battery";
-
-/// The tile CATALOG, in grid order: every PRESET (the single source — [`neuron::pattern::presets`]),
-/// then the data mode(s). `(slug, name, kind)`. Adding a look is a preset entry in core — zero UI code.
+/// The tile CATALOG, in grid order: every PRESET (the single source — [`neuron::pattern::presets`]).
+/// `(slug, name, kind)` — `kind` is `"data"` for a READOUT preset (vitals: it shows your device, not a
+/// light show, so the tile draws a "DATA" corner glyph) and `"effect"` for every decorative preset.
+/// Registry-driven (`pattern_is_readout`), so a new readout preset self-marks. Adding a look is a preset
+/// entry in core — zero UI code.
 fn light_tile_catalog() -> Vec<(&'static str, &'static str, &'static str)> {
-    let mut v: Vec<(&'static str, &'static str, &'static str)> = neuron::pattern::presets()
+    neuron::pattern::presets()
         .iter()
-        .map(|p| (p.slug, p.label, "effect"))
-        .collect();
-    v.push((VITALS_SLUG, "Mouse Battery", "data"));
-    v
+        .map(|p| {
+            let kind = if neuron::pattern::pattern_is_readout(p.pattern) { "data" } else { "effect" };
+            (p.slug, p.label, kind)
+        })
+        .collect()
 }
 
 /// Build the [`neuron::pattern::LayerDef`] a preset slug describes (the look the tile picker applies),
 /// falling back to a benign default for an unknown slug.
 fn preset_layer(slug: &str) -> neuron::pattern::LayerDef {
     neuron::pattern::preset_layer(slug).unwrap_or_default()
-}
-
-/// Map a basic (Synapse/profile) effect NAME to a Neuron preset layer — used when an import carries a
-/// `basic` named effect. `col`, when given, repaints a colour-driven look (its spectrum is a solid) in
-/// that colour. Unknown names fall back to a solid `static`.
-fn effect_to_layer(name: &str, col: Option<Rgb>) -> neuron::pattern::LayerDef {
-    // native firmware names → preset slugs (spectrum/spectrumcycling are the "cycle" look).
-    let lower = name.to_lowercase();
-    let slug = match lower.as_str() {
-        "spectrum" | "spectrumcycling" => "cycle",
-        "wheel" => "colorwheel",
-        "stars" => "starlight",
-        other => other,
-    };
-    let mut layer = neuron::pattern::preset_layer(slug).unwrap_or_else(|| preset_layer("static"));
-    if let Some(c) = col {
-        if layer.spectrum.is_solid() {
-            layer.spectrum = neuron::spectrum::Spectrum::solid(c);
-        }
-    }
-    layer
-}
-
-/// A pattern key's human label (for status lines), or the key itself if somehow unknown.
-fn pattern_label(key: &str) -> &str {
-    neuron::pattern::pattern_def(key).map(|d| d.label).unwrap_or(key)
 }
 
 /// Render a `rows*cols` device frame into a small preview Image at the tile's pixel size — the
@@ -6737,8 +7017,20 @@ fn render_light_tiles(app: &AppWindow, sh: &SharedRt, t: f32) {
         .map(|(slug, name, kind)| {
             let g0 = prof.then(std::time::Instant::now);
             let frame = match kind {
-                "data" => neuron::lighting::render_vitals(preview_vitals(), rows, cols, phase),
                 "stub" => vec![Rgb::BLACK; ru * cu], // a dark, honest "soon" tile
+                // the VITALS readout tile renders through the SAME proportional renderer the APPLIED layer
+                // uses (`pattern::render_vitals_bounds` over the full board) — NOT the key-anchored
+                // `lighting::render_vitals` — so the swatch matches the composited surface at any grid size
+                // (a zone/mouse grid included) instead of reading ~all-black off a real keyboard's keys.
+                // Fed a REPRESENTATIVE snapshot (a charging mouse) so the gallery reads the look without
+                // polling hardware per thumbnail; the live big-preview + device stream read the heartbeat feed.
+                _ if slug == "vitals" => neuron::pattern::render_vitals_bounds(
+                    preview_vitals(),
+                    rows,
+                    cols,
+                    neuron::pattern::Bounds::board(rows, cols),
+                    phase,
+                ),
                 // the audiometer thumbnail runs the REAL meter pattern → it reads the shared, fast,
                 // idle-auto-stopping `audio_level` provider (cheap), so the tile matches the device.
                 // Built fresh per tick with the resolved source so it tracks a source flip and points
@@ -6854,6 +7146,12 @@ fn params_for(def: &neuron::pattern::LayerDef) -> Vec<EffectParam> {
 /// matches, else the first preset using the layer's pattern (so a customised layer still shows a
 /// representative tile and the inspector stays open — `light-effect` must stay non-empty).
 fn tile_slug_for_layer(def: &neuron::pattern::LayerDef) -> &'static str {
+    // a hand-painted frame is its OWN thing — no representative preset tile (it's reached via the brush,
+    // not the gallery). Keep `light-effect` non-empty with a dedicated sentinel so the inspector + PAINT
+    // tools stay open, instead of mis-highlighting an unrelated preset (the fallthrough would pick "static").
+    if def.pattern == "custom" {
+        return "custom";
+    }
     neuron::pattern::slug_for_layer(def).unwrap_or_else(|| {
         neuron::pattern::presets()
             .into_iter()
@@ -6863,44 +7161,87 @@ fn tile_slug_for_layer(def: &neuron::pattern::LayerDef) -> &'static str {
     })
 }
 
+/// A layer's DISPLAY NAME for the STACK selector — the preset label behind it (e.g. "Vitals",
+/// "Breathing", "Heat"), so each stack cell is identifiable (the vitals readout included). Falls back to
+/// the pattern's own label, then its raw key. A hand-painted frame reads as "Painted".
+fn layer_label(def: &neuron::pattern::LayerDef) -> String {
+    if def.pattern == "custom" {
+        return "Painted".into();
+    }
+    let slug = tile_slug_for_layer(def);
+    neuron::pattern::presets()
+        .into_iter()
+        .find(|p| p.slug == slug)
+        .map(|p| p.label.to_string())
+        .or_else(|| neuron::pattern::pattern_def(&def.pattern).map(|d| d.label.to_string()))
+        .unwrap_or_else(|| def.pattern.clone())
+}
+
+/// Project the SELECTED layer's PLACEMENT into the State surface: the honest badge (`light-place-label`
+/// + `light-layer-placed`) and the render's persistent outline corners (`light-place-r0..c1`, inclusive
+/// grid cells; -1 = full board). An empty region reads as the whole board (no outline); a sub-region's
+/// bounding box drives the badge size + the outline corners.
+fn project_placement(app: &AppWindow, region: &[u32], rows: u8, cols: u8) {
+    let st = app.global::<State>();
+    if region.is_empty() {
+        st.set_light_layer_placed(false);
+        st.set_light_place_label("full board".into());
+        st.set_light_place_r0(-1);
+        st.set_light_place_c0(-1);
+        st.set_light_place_r1(-1);
+        st.set_light_place_c1(-1);
+        return;
+    }
+    let b = neuron::pattern::Bounds::from_region(region, rows, cols);
+    st.set_light_layer_placed(true);
+    st.set_light_place_label(format!("{}×{} block", b.rows, b.cols).into());
+    st.set_light_place_r0(b.row0 as i32);
+    st.set_light_place_c0(b.col0 as i32);
+    st.set_light_place_r1(b.row0 as i32 + b.rows as i32 - 1);
+    st.set_light_place_c1(b.col0 as i32 + b.cols as i32 - 1);
+}
+
 /// Project the layer stack into the unified surface: the active tile slug (the selected layer), the
-/// auto-rendered PATTERN param model, the stack size, and the SPECTRUM editor surface. A data readout
-/// (and the full-colour Screen pattern) reports no schema + no spectrum (honest: nothing to edit).
+/// auto-rendered PATTERN param model, the stack size, and the SPECTRUM editor surface. A full-colour
+/// pattern (Screen / custom / the vitals readout) reports no spectrum (honest: nothing to edit).
 fn refresh_light_unified(app: &AppWindow, sh: &SharedRt) {
-    let (defs, sel, data, active_frame) = {
+    let (defs, sel, active_frame, (grows, gcols)) = {
         let s = sh.borrow();
-        (s.light_layers.clone(), s.selected_layer, s.light_data.clone(), s.active_frame)
+        (s.light_layers.clone(), s.selected_layer, s.active_frame, s.rt.grid_dims())
     };
     let st = app.global::<State>();
     let empty_params = || ModelRc::new(VecModel::from(Vec::<EffectParam>::new()));
-    // DATA vs EFFECT: the RATE control (and the streaming pacer) only apply to streamed effects —
-    // a data readout paints on-demand, so flag it so the page gates the fps control off.
-    st.set_light_is_data(data.is_some());
-    // DATA mode owns the surface: the active tile is the data slug, with no knobs / no spectrum / no stack.
-    if let Some(slug) = data {
-        st.set_light_effect(slug.into());
-        st.set_light_params(empty_params());
-        st.set_light_has_spectrum(false);
-        st.set_light_stack_count(0);
-        clear_spectrum_surface(app);
-        return;
-    }
     if defs.is_empty() {
         st.set_light_effect("".into());
         st.set_light_params(empty_params());
         st.set_light_has_spectrum(false);
+        st.set_light_is_readout(false); // no selection → not a readout (the RATE control always applies now)
         st.set_light_stack_count(0);
+        st.set_light_stack_labels(ModelRc::new(VecModel::from(Vec::<SharedString>::new())));
+        project_placement(app, &[], 0, 0); // no layer → full-board readout, no outline
         clear_spectrum_surface(app);
         return;
     }
     let sel = sel.min(defs.len() - 1);
     let active = &defs[sel];
     st.set_light_effect(tile_slug_for_layer(active).into());
+    // the selected layer's honesty flag: a READOUT (vitals) is a live device gauge, not a tunable light
+    // show — the inspector swaps the tunable-effect knobs for a short "what this is" note. Registry-driven
+    // (no pattern-key string-matching); an empty stack has no selection, so it's false in the branch above.
+    st.set_light_is_readout(neuron::pattern::pattern_is_readout(&active.pattern));
     st.set_light_params(ModelRc::new(VecModel::from(params_for(active))));
     st.set_light_stack_count(defs.len() as i32);
-    // the SPECTRUM editor — every pattern except the full-colour Screen (Ambient) carries an editable
-    // 1-D spectrum.
-    let has_spectrum = active.pattern != "screen";
+    // STACK selector labels — each layer's display name (bottom→top) so the strip reads as its effects /
+    // readouts and the user can SEE + pick which layer to place (the vitals readout included).
+    let labels: Vec<SharedString> = defs.iter().map(|d| layer_label(d).into()).collect();
+    st.set_light_stack_labels(ModelRc::new(VecModel::from(labels)));
+    // the SELECTED layer's placement — the honest badge (`light-place-label`) + the render's persistent
+    // outline corners. An empty region reads as the whole board; a sub-rect drives the outline.
+    project_placement(app, &active.region, grows, gcols);
+    // the SPECTRUM editor — capability-driven (registry `has_spectrum`), so the full-colour patterns
+    // (Screen/Ambient, a hand-painted `custom` frame, the vitals readout) that own their pixels directly
+    // hide the ramp editor, and every scalar pattern shows it — no app-side pattern-key string-matching.
+    let has_spectrum = neuron::pattern::pattern_has_spectrum(&active.pattern);
     st.set_light_has_spectrum(has_spectrum);
     if has_spectrum {
         project_spectrum(app, &active.spectrum, active_frame);
@@ -7096,6 +7437,11 @@ fn sync_activation_view(st: &State, pattern: &str) {
 /// capture lowers it before starting. Global because there is only ever one capture in flight.
 static CANCEL_CAPTURE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Monotonic capture generation — bumped (on the UI thread) each time a capture claims the UI flags.
+/// `run_guarded`'s RAII cleanup only clears the flags when its generation is still the latest, so an
+/// OLD worker's deferred cleanup can't clobber a NEWER capture that started right after it.
+static CAPTURE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The ONE weave capture path — used by BOTH the glyph recorder and the radial preview, so the
 /// overlay behaves byte-for-byte identically for either facet of spellweaving (the only difference
 /// is the [`crate::overlay::WeaveMode`] passed in). Waits for the configured activation RHYTHM,
@@ -7150,6 +7496,80 @@ fn free_glyph_name(vault: &neuron::gesture::Vault) -> String {
         .expect("unbounded range yields a free name")
 }
 
+/// The armor EVERY GUI capture worker runs inside — the resilience the live cast-weave already has
+/// (beacon.rs:272 wraps its cycle the same way). It makes a stranded "recording" state structurally
+/// impossible, so no capture worker can ever leave the UI wedged:
+///
+///   1. RAII cleanup. `CaptureFlags::drop` clears `capturing-gesture` / `rich-capturing` /
+///      `gesture-predict` on EVERY exit of `body` — normal return, early return, OR panic (Drop runs
+///      during unwind; the crate is deliberately `panic = "unwind"`, see the root Cargo.toml). The
+///      flags become a CONSEQUENCE of this call's lifetime, not a bool someone must remember to reset
+///      on each path (the fragility that stranded the recorder on a mid-stroke panic).
+///   2. Panic containment. A panic in `body` is caught, traced to the flight log (so it localizes like
+///      every other weave event), and surfaced as a friendly status instead of silently killing the
+///      worker thread.
+///
+/// `w` is the UI handle for the drop-cleanup + the failure status; `body` is the worker's real work
+/// (capture → analyze → save → status), which owns its own weak(s) for the happy-path UI posts.
+/// Which status line a capture worker's panic message lands in — so a radial-wheel failure surfaces
+/// by the wheel (`radial-status`), not in the glyph panel (`gesture-status`) the user wasn't looking at.
+#[derive(Clone, Copy)]
+enum CaptureChannel {
+    Gesture,
+    Radial,
+}
+
+fn run_guarded(
+    w: slint::Weak<AppWindow>,
+    channel: CaptureChannel,
+    generation: u64,
+    body: impl FnOnce() + Send + 'static,
+) {
+    struct CaptureFlags {
+        w: slint::Weak<AppWindow>,
+        generation: u64,
+    }
+    impl Drop for CaptureFlags {
+        fn drop(&mut self) {
+            let (w, generation) = (self.w.clone(), self.generation);
+            let _ = slint::invoke_from_event_loop(move || {
+                // GENERATION GUARD: only clear if THIS capture is still the latest. A newer capture
+                // that started right after us (the cancel-then-restart race: a sync cancel frees the
+                // flag, the next capture claims it) already owns these flags, and our stale deferred
+                // cleanup must not flip it back to not-capturing. The bump (entry point) and this
+                // check both run on the UI thread, so the event loop serializes them either way.
+                if CAPTURE_GEN.load(std::sync::atomic::Ordering::SeqCst) != generation {
+                    return;
+                }
+                if let Some(app) = w.upgrade() {
+                    let st = app.global::<State>();
+                    st.set_capturing_gesture(false);
+                    st.set_rich_capturing(false);
+                    st.set_gesture_predict("".into());
+                }
+            });
+        }
+    }
+    let _flags = CaptureFlags {
+        w: w.clone(),
+        generation,
+    };
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).is_err() {
+        crate::flight::trace("weave", "GUI capture worker panicked \u{2014} recovered", 0);
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(app) = w.upgrade() {
+                let st = app.global::<State>();
+                let msg: slint::SharedString = "capture hiccup \u{2014} nothing saved, try again".into();
+                match channel {
+                    CaptureChannel::Gesture => st.set_gesture_status(msg),
+                    CaptureChannel::Radial => st.set_radial_status(msg),
+                }
+            }
+        });
+    }
+    // `_flags` drops HERE — clearing the capture flags whether `body` returned or unwound.
+}
+
 /// Capture a gesture on a worker thread (blocking hold-to-draw), analyze it, store it, and post
 /// the result back to the UI.
 fn record_gesture(app: &AppWindow, sh: &SharedRt) {
@@ -7172,6 +7592,7 @@ fn record_gesture(app: &AppWindow, sh: &SharedRt) {
     CANCEL_CAPTURE.store(false, std::sync::atomic::Ordering::Relaxed);
     st.set_capturing_gesture(true);
     st.set_stroke_saved(false); // a normal glyph record clears any prior rich-save reveal link
+    let capture_gen = CAPTURE_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
     let (trigger, phrase) = {
         let s = sh.borrow();
         (s.rt.cast.trigger, s.rt.cast.phrase())
@@ -7197,7 +7618,7 @@ fn record_gesture(app: &AppWindow, sh: &SharedRt) {
     let vault = sh.borrow().rt.vault.clone();
     let w = app.as_weak();
     let predict_w = app.as_weak();
-    std::thread::spawn(move || {
+    std::thread::spawn(move || run_guarded(w.clone(), CaptureChannel::Gesture, capture_gen, move || {
         let feel = neuron::feel::FeelConfig::load();
         let mut last_pred_len = 0usize;
         let path = weave_capture(
@@ -7209,7 +7630,10 @@ fn record_gesture(app: &AppWindow, sh: &SharedRt) {
                 // throttle: every ~14 new points (≈80ms of motion) stream the LIVE TRAIL onto
                 // the panel canvas and re-run the autopredict — the panel is the instrument
                 // (the stroke forms on it as you draw), not a replay after the fact.
-                if pts.len() >= 4 && pts.len() - last_pred_len >= 14 {
+                // SATURATING: `compact()` can SHRINK the buffer mid-stroke (it thins to ~half when it
+                // hits max_pts), so `pts.len()` is NOT monotonic — a plain `-` underflowed usize and
+                // panicked the worker (the stranded-recorder bug). Saturating makes a shrink a no-op tick.
+                if pts.len() >= 4 && pts.len().saturating_sub(last_pred_len) >= 14 {
                     last_pred_len = pts.len();
                     let trail = normalize_trail(pts);
                     let predicted = if !vault.templates.is_empty() && pts.len() >= 8 {
@@ -7253,8 +7677,7 @@ fn record_gesture(app: &AppWindow, sh: &SharedRt) {
         let _ = slint::invoke_from_event_loop(move || {
             if let Some(app) = w.upgrade() {
                 let st = app.global::<State>();
-                st.set_capturing_gesture(false);
-                st.set_gesture_predict("".into()); // the stroke is over — nothing is "becoming"
+                // capturing-gesture + gesture-predict are cleared by run_guarded's RAII guard on exit
                 if captured == 0 {
                     // a cancel is a cancel — not a user failure.
                     st.set_gesture_status("cancelled".into());
@@ -7279,7 +7702,7 @@ fn record_gesture(app: &AppWindow, sh: &SharedRt) {
                 );
             }
         });
-    });
+    }));
 }
 
 /// Like [`weave_capture`], but uses the **timestamped, un-thinned** capture ([`neuron::glyph::
@@ -7336,6 +7759,7 @@ fn record_rich_stroke(app: &AppWindow, sh: &SharedRt) {
     st.set_capturing_gesture(true);
     st.set_rich_capturing(true); // drives the panel's distinct "different mode" treatment
     st.set_stroke_saved(false); // no reveal link until this capture actually writes a file
+    let capture_gen = CAPTURE_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
     let (trigger, phrase) = {
         let s = sh.borrow();
         (s.rt.cast.trigger, s.rt.cast.phrase())
@@ -7353,7 +7777,7 @@ fn record_rich_stroke(app: &AppWindow, sh: &SharedRt) {
     let vault = sh.borrow().rt.vault.clone();
     let w = app.as_weak();
     let trail_w = app.as_weak();
-    std::thread::spawn(move || {
+    std::thread::spawn(move || run_guarded(w.clone(), CaptureChannel::Gesture, capture_gen, move || {
         let feel = neuron::feel::FeelConfig::load();
         let mut last_trail_len = 0usize;
         let (path, stamps) = weave_capture_stamped(
@@ -7364,7 +7788,8 @@ fn record_rich_stroke(app: &AppWindow, sh: &SharedRt) {
             |pts| {
                 // stream the live trail onto the panel canvas (~every 14 new points), exactly like
                 // record_gesture, so the rich stroke forms on screen as you draw it.
-                if pts.len() >= 4 && pts.len() - last_trail_len >= 14 {
+                // SATURATING (see record_gesture): a shrinking buffer must never underflow the throttle.
+                if pts.len() >= 4 && pts.len().saturating_sub(last_trail_len) >= 14 {
                     last_trail_len = pts.len();
                     let trail = normalize_trail(pts);
                     let ui = trail_w.clone();
@@ -7388,10 +7813,8 @@ fn record_rich_stroke(app: &AppWindow, sh: &SharedRt) {
         let _ = slint::invoke_from_event_loop(move || {
             if let Some(app) = w.upgrade() {
                 let st = app.global::<State>();
-                st.set_capturing_gesture(false);
-                st.set_rich_capturing(false);
+                // capturing-gesture / rich-capturing / gesture-predict cleared by run_guarded's guard
                 st.set_stroke_saved(false); // only a genuine save (below) lights the reveal link
-                st.set_gesture_predict("".into());
                 if captured == 0 {
                     st.set_gesture_status("cancelled".into());
                     return;
@@ -7419,7 +7842,7 @@ fn record_rich_stroke(app: &AppWindow, sh: &SharedRt) {
                 }
             }
         });
-    });
+    }));
 }
 
 /// Test the wheel: hold the cast trigger and flick. Goes through the EXACT same [`weave_capture`]
@@ -7431,6 +7854,7 @@ fn preview_radial(app: &AppWindow, sh: &SharedRt) {
     CANCEL_CAPTURE.store(false, std::sync::atomic::Ordering::Relaxed); // a prior cancel must not abort this
     st.set_capturing_gesture(true);
     st.set_editing_sector(-1); // a flick is navigation, not an edit continuation
+    let capture_gen = CAPTURE_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
     let (trigger, sectors, deadzone, phrase, widgets) = {
         let s = sh.borrow();
         let sectors = s.rt.cast.sectors.max(1);
@@ -7465,7 +7889,7 @@ fn preview_radial(app: &AppWindow, sh: &SharedRt) {
         items: Vec::new(),
     };
     let w = app.as_weak();
-    std::thread::spawn(move || {
+    std::thread::spawn(move || run_guarded(w.clone(), CaptureChannel::Radial, capture_gen, move || {
         let feel = neuron::feel::FeelConfig::load();
         let menu_for_hit = menu.clone();
         let path = weave_capture(
@@ -7484,7 +7908,7 @@ fn preview_radial(app: &AppWindow, sh: &SharedRt) {
         let _ = slint::invoke_from_event_loop(move || {
             if let Some(app) = w.upgrade() {
                 let st = app.global::<State>();
-                st.set_capturing_gesture(false);
+                // (capturing-gesture is cleared by run_guarded's RAII guard on worker exit)
                 match pick {
                     Some(s) => {
                         st.set_radial_preview_sector(s as i32);
@@ -7500,7 +7924,7 @@ fn preview_radial(app: &AppWindow, sh: &SharedRt) {
                 }
             }
         });
-    });
+    }));
 }
 
 /// Map a captured complex path into normalized interleaved (x,y) in 0..1 for the trail canvas,
@@ -7641,6 +8065,26 @@ fn open_crash_log() {
         .unwrap_or_else(|_| ".".into())
         .join("neuron-crash.log");
     open_in_file_manager(&path);
+}
+
+#[cfg(test)]
+mod suggestion_tests {
+    use super::app_stem;
+
+    #[test]
+    fn app_stem_peels_ue_packaging_but_keeps_real_hyphens() {
+        // Unreal packaging suffixes are peeled (config tag, then platform tag)…
+        assert_eq!(
+            app_stem("C:\\Games\\FN\\FortniteClient-Win64-Shipping.exe"),
+            "FortniteClient"
+        );
+        assert_eq!(app_stem("PubgClient-Win64-Test.exe"), "PubgClient");
+        assert_eq!(app_stem("Game-WinGDK-Shipping.exe"), "Game");
+        // …but a real name's OWN hyphens/underscores survive whole (the bug this guards).
+        assert_eq!(app_stem("Counter-Strike.exe"), "Counter-Strike");
+        assert_eq!(app_stem("Apex_Legends.exe"), "Apex_Legends");
+        assert_eq!(app_stem("chrome.exe"), "chrome");
+    }
 }
 
 #[cfg(test)]

@@ -54,7 +54,7 @@ export component SpellweavingPanel inherits VerticalLayout {
             Mono { text: "ESC cancels"; color: Theme.text-faint; }
         }
     }
-    Rectangle { height: Theme.hair; background: Theme.line; }
+    Divider {}
     Rectangle { height: Theme.lead-in; }
 
     // ── one trigger, several rhythms: a MAP of what each press-pattern fires ──────────
@@ -69,7 +69,7 @@ export component SpellweavingPanel inherits VerticalLayout {
 
     // TRIGGER — a COMPACT field (capped, never spans the row) + a smart bind button.
     HorizontalLayout {
-        spacing: 12px;
+        spacing: Theme.gap;
         VerticalLayout { alignment: center; width: 78px; Mono { text: "TRIGGER"; color: Theme.text-dim; } }
         VerticalLayout {
             alignment: center;
@@ -113,7 +113,7 @@ export component SpellweavingPanel inherits VerticalLayout {
     // RHYTHM MAP — a row per press-pattern: the rhythm, then what it fires. The weave's rhythm is
     // editable inline (segment + record); teleport/whiteboard ride their fixed rhythms with a TRY.
     HorizontalLayout {
-        spacing: 12px;
+        spacing: Theme.gap;
         VerticalLayout { alignment: start; width: 78px; padding-top: 11px; Mono { text: "RHYTHMS"; color: Theme.text-dim; } }
         VerticalLayout {
             horizontal-stretch: 1;
@@ -234,7 +234,7 @@ export component SpellweavingPanel inherits VerticalLayout {
             horizontal-stretch: 0;
             min-width: parent.width - 380px - Theme.gap-col;
             max-width: parent.width - 380px - Theme.gap-col;
-            spacing: 12px;
+            spacing: Theme.gap;
             SectionTitle { text: "GLYPH · the rich weave"; }
             canvas := Rectangle {
                 // RICH MODE skin: a faint amber wash + a lit border, so the surface itself reads as
@@ -360,7 +360,7 @@ export component SpellweavingPanel inherits VerticalLayout {
                                 : State.capturing-gesture ? "recording" : "record";
                             color: root.rich-any ? root.rich-col : (State.capturing-gesture ? Theme.accent : Theme.text-mid);
                             font-family: Theme.mono; font-size: Theme.fs-small; font-weight: 700;
-                            letter-spacing: 0.8px;
+                            letter-spacing: Theme.track-2;
                             vertical-alignment: center;
                         }
                     }
@@ -561,7 +561,7 @@ export component SpellweavingPanel inherits VerticalLayout {
             horizontal-stretch: 0;
             min-width: 380px;
             max-width: 380px;
-            spacing: 12px;
+            spacing: Theme.gap;
             alignment: start;   // pack from the top so the pinned wheel stays put; the wedge-detail Card
                                 // and status line grow into the slack BELOW, never displacing the wheel
             SectionTitle { text: "RADIAL · the simple weave"; }
@@ -621,7 +621,7 @@ export component SpellweavingPanel inherits VerticalLayout {
                                     text: State.hyper-radial-on ? "HyperShift radial: ON" : "HyperShift radial: off";
                                     color: State.hyper-radial-on ? Theme.accent : (hmain.has-hover ? Theme.text : Theme.text-mid);
                                     font-family: Theme.mono; font-size: Theme.fs-small; font-weight: 700;
-                                    letter-spacing: 1.2px; vertical-alignment: center;
+                                    letter-spacing: Theme.track-3; vertical-alignment: center;
                                 }
                             }
                             hmain := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { State.set-hyper-radial-on(!State.hyper-radial-on); } }
@@ -629,7 +629,7 @@ export component SpellweavingPanel inherits VerticalLayout {
                         // INLINE flip zone — only while ON: a hairline + the live edit target; tap flips it
                         if State.hyper-radial-on : Rectangle { width: 1px; background: Theme.line; }
                         if State.hyper-radial-on : Rectangle {
-                            background: hflip.has-hover ? Theme.well : transparent;
+                            background: State.radial-edit-hyper ? Theme.accent-glow : (hflip.has-hover ? Theme.well : transparent);
                             animate background { duration: Theme.quick; }
                             HorizontalLayout {
                                 padding-left: 11px; padding-right: 12px;
@@ -638,7 +638,7 @@ export component SpellweavingPanel inherits VerticalLayout {
                                     color: State.radial-edit-hyper ? Theme.accent : (hflip.has-hover ? Theme.text-mid : Theme.text-dim);
                                     font-family: Theme.mono; font-size: Theme.fs-small;
                                     font-weight: State.radial-edit-hyper ? 700 : 500;
-                                    letter-spacing: 1.4px; vertical-alignment: center;
+                                    letter-spacing: Theme.track-4; vertical-alignment: center;
                                 }
                             }
                             hflip := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { State.set-radial-edit-hyper(!State.radial-edit-hyper); } }

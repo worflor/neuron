@@ -341,7 +341,7 @@ mod tests {
 
     #[test]
     fn alt_tab_swallowed_only_when_alt_held_and_policy_on() {
-        let policy = GamingMode::from_profile(true, false, false); // disable Alt+Tab only
+        let policy = GamingMode::from_profile(true, false, false, false); // disable Alt+Tab only
                                                                    // Tab alone (no Alt) is never an app-switch -> pass through.
         assert!(!decide(&policy, down(VK_TAB), Mods { alt: false }));
         // Alt held + Tab down -> swallow.
@@ -353,7 +353,7 @@ mod tests {
 
     #[test]
     fn win_key_swallowed_per_policy() {
-        let policy = GamingMode::from_profile(false, true, false); // disable Win only
+        let policy = GamingMode::from_profile(false, true, false, false); // disable Win only
         assert!(decide(&policy, down(VK_LWIN), Mods::default()));
         assert!(decide(&policy, down(VK_RWIN), Mods::default()));
         // Win-up is never swallowed (no stuck key).
@@ -368,7 +368,7 @@ mod tests {
 
     #[test]
     fn alt_f4_swallowed_only_when_alt_held_and_policy_on() {
-        let policy = GamingMode::from_profile(false, false, true); // disable Alt+F4 only
+        let policy = GamingMode::from_profile(false, false, true, false); // disable Alt+F4 only
         assert!(!decide(&policy, down(VK_F4), Mods { alt: false })); // bare F4 passes
         assert!(decide(&policy, down(VK_F4), Mods { alt: true })); // Alt+F4 swallowed
                                                                    // Alt+Tab is NOT swallowed by an Alt+F4-only policy.
@@ -376,8 +376,19 @@ mod tests {
     }
 
     #[test]
+    fn alt_esc_swallowed_only_when_alt_held_and_policy_on() {
+        let policy = GamingMode::from_profile(false, false, false, true); // disable Alt+Esc only
+        assert!(!decide(&policy, down(VK_ESCAPE), Mods { alt: false })); // bare Esc passes
+        assert!(decide(&policy, down(VK_ESCAPE), Mods { alt: true })); // Alt+Esc swallowed
+                                                                       // chord-specific: an Alt+Esc-only policy leaves Alt+Tab alone.
+        assert!(!decide(&policy, down(VK_TAB), Mods { alt: true }));
+        // policy off -> Alt+Esc passes through.
+        assert!(!decide(&GamingMode::default(), down(VK_ESCAPE), Mods { alt: true }));
+    }
+
+    #[test]
     fn key_up_is_never_swallowed() {
-        let all = GamingMode::from_profile(true, true, true);
+        let all = GamingMode::from_profile(true, true, true, false);
         assert!(!decide(&all, up(VK_TAB), Mods { alt: true }));
         assert!(!decide(&all, up(VK_F4), Mods { alt: true }));
         assert!(!decide(&all, up(VK_LWIN), Mods::default()));
@@ -385,7 +396,7 @@ mod tests {
 
     #[test]
     fn ordinary_keys_pass_through_even_in_gaming_mode() {
-        let all = GamingMode::from_profile(true, true, true);
+        let all = GamingMode::from_profile(true, true, true, false);
         // 'A' (0x41), with and without Alt, is never suppressed.
         assert!(!decide(&all, down(0x41), Mods { alt: false }));
         assert!(!decide(&all, down(0x41), Mods { alt: true }));
@@ -413,7 +424,7 @@ mod tests {
     #[test]
     fn end_to_end_alt_tab_via_tracked_state() {
         // Simulate the event stream the hook sees: Alt down, then Tab down.
-        let policy = GamingMode::from_profile(true, false, false);
+        let policy = GamingMode::from_profile(true, false, false, false);
         let mut m = Mods::default();
         let e_alt = down(VK_LMENU);
         m = track(m, e_alt);
@@ -432,7 +443,7 @@ mod tests {
     fn desired_policy_carrier_roundtrips() {
         // Restore whatever was set so this test stays order-independent for the process-global cell.
         let saved = super::policy();
-        super::set_policy(GamingMode::from_profile(true, false, true));
+        super::set_policy(GamingMode::from_profile(true, false, true, false));
         let p = super::policy();
         assert!(p.disable_alt_tab && !p.disable_win && p.disable_alt_f4);
         assert!(p.any());

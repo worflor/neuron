@@ -168,7 +168,7 @@ component ParamControl inherits VerticalLayout {
 // per-device persistence follow. No colour is hardcoded: stops carry their own hex/col, the picker is
 // the shared prism, and the strip's gradient fill is a Rust-rendered swatch (the active frame's image).
 component SpectrumEditor inherits VerticalLayout {
-    spacing: 12px;
+    spacing: Theme.gap;
     // which stop the picker edits — the AUTHORITATIVE cursor lives in State (`light-sel-stop`) so the
     // glue can select a stop after an insert: click/drag in the strip write it; `add-stop`'s glue points
     // it at the just-inserted stop. Clamped to the live count here so a delete never strands the picker.
@@ -486,6 +486,10 @@ component SpectrumEditor inherits VerticalLayout {
 export component LightingPanel inherits VerticalLayout {
     spacing: 0;
 
+    // a mouse with a handful of LEDs is drawn as ZONES, not a lattice (see DeviceRender.zone-mode) — the
+    // place-a-region gesture needs a grid to drag on, so it's hidden for those honest few-zone devices.
+    property <bool> zone-mode: State.grid-kind == "mouse" && State.grid-rows * State.grid-cols <= 4;
+
     // the curated quick swatches live ONCE in `Palette.accent` (controls.slint), shared with the SYSTEM
     // accent picker so the two never drift — both the COLOUR ColorPicker and the PAINT swatch row use it.
 
@@ -516,7 +520,7 @@ export component LightingPanel inherits VerticalLayout {
         caption: State.selected-device-name;
         if State.writes-paused : VerticalLayout { alignment: center; Pill { text: "WRITES PAUSED"; tint: Theme.danger; } }
     }
-    Rectangle { height: Theme.hair; background: Theme.line; }
+    Divider {}
     Rectangle { height: Theme.lead-in; }
 
     // ── no-lighting empty states — honest, terse, real info ───────────────
@@ -550,7 +554,7 @@ export component LightingPanel inherits VerticalLayout {
 
     // ── THE SURFACE: render hero (centred) → gallery + contextual inspector ─
     if State.sel-can-light && State.grid-rows > 0 : VerticalLayout {
-        spacing: Theme.lead-in;
+        spacing: Theme.section-gap;
 
         // ── HERO: the render, centred + constrained so it stays a calm SUBJECT, not a banner. ──
         VerticalLayout {
@@ -568,6 +572,7 @@ export component LightingPanel inherits VerticalLayout {
                     text: "preview only"; color: Theme.text-faint;
                 }
                 if State.light-brush-on : Mono { text: "brush down · L paint · R erase · drag sweeps"; color: Theme.accent; }
+                if State.light-place-on : Mono { text: "place mode · drag a rectangle to set this layer's area"; color: Theme.accent; }
             }
             // the render itself — capped to a comfortable subject width and centred on the void so it
             // reads as the page's calm subject instead of stretching edge-to-edge into a banner.
@@ -585,6 +590,14 @@ export component LightingPanel inherits VerticalLayout {
                         editable: State.light-brush-on;
                         paint(i) => { State.paint-cell(i); }
                         erase(i) => { State.erase-cell(i); }
+                        // PLACE gesture — a sibling to the brush (mutually exclusive). The committed region
+                        // corners drive the persistent placement outline; a drag commits a fresh rect.
+                        placing: State.light-place-on;
+                        place-r0: State.light-place-r0;
+                        place-c0: State.light-place-c0;
+                        place-r1: State.light-place-r1;
+                        place-c1: State.light-place-c1;
+                        place-region(r0, c0, r1, c1) => { State.set-layer-region(r0, c0, r1, c1); }
                     }
                 }
             }
@@ -637,9 +650,9 @@ export component LightingPanel inherits VerticalLayout {
                 spacing: 14px;
 
                 // RATE — the streamed effect's frame pacing. Drives BOTH the live device stream AND
-                // this preview, so what you see steps at the keyboard's TRUE rate. Gated to EFFECT
-                // mode: a DATA readout paints on-demand, so it has no rate to tune.
-                if !State.light-is-data : VerticalLayout {
+                // this preview, so what you see steps at the keyboard's TRUE rate. Unconditional now:
+                // vitals streams like any effect (no more paint-on-demand readout), so every layer paces.
+                VerticalLayout {
                     spacing: 6px;
                     HorizontalLayout {
                         SectionTitle { text: "RATE"; }
@@ -674,10 +687,16 @@ export component LightingPanel inherits VerticalLayout {
                         if cp.kind != "color" : ParamControl { p: cp; }
                     }
                 }
-                // a data tile is honest about being a readout, not a tunable light show (a layer that
-                // carries a spectrum is never this — it shows the SPECTRUM editor above)
-                if State.light-params.length == 0 && !State.light-has-spectrum : Mono {
-                    text: "a live DATA surface that paints your device's vitals, no knobs.";
+                // a READOUT layer (vitals) is honest about being a live device gauge, not a tunable light
+                // show — it has a rate + a placement but no colour ramp or knobs, so point at what it IS.
+                if State.light-is-readout : Mono {
+                    text: "a live device readout — battery / charge. place it anywhere on the render.";
+                    color: Theme.text-faint; wrap: word-wrap;
+                }
+                // a hand-painted `custom` frame owns its pixels directly — no ramp, no knobs. It's edited
+                // with the brush on the render, so the inspector just points there instead of faking knobs.
+                if State.light-effect == "custom" : Mono {
+                    text: "a hand-painted frame — pick up the brush on the render to edit its pixels.";
                     color: Theme.text-faint; wrap: word-wrap;
                 }
 
@@ -695,8 +714,10 @@ export component LightingPanel inherits VerticalLayout {
                         }
                     }
                     // the composite strip — one cell per stacked effect, bottom→top left→right. The
-                    // active cell is lit; tapping a cell makes it the active effect (knobs follow); ✕ drops it.
-                    if State.light-stack-count > 1 : HorizontalLayout {
+                    // active cell is lit; tapping a cell makes it the active effect (knobs follow); ✕ drops
+                    // it. Shown at >=1 layer (not just >1) so it doubles as the layer SELECTOR the PLACE
+                    // gesture needs — the user picks which layer (an effect OR the vitals readout) to place.
+                    if State.light-stack-count >= 1 : HorizontalLayout {
                         spacing: 6px;
                         for li in State.light-stack-count : cell := Rectangle {
                             property <bool> on: li == State.selected-layer;
@@ -714,7 +735,13 @@ export component LightingPanel inherits VerticalLayout {
                                 padding-left: 9px; padding-right: 5px; spacing: 5px;
                                 VerticalLayout {
                                     alignment: center; horizontal-stretch: 1;
-                                    Mono { text: "L" + (li + 1); color: cell.on ? Theme.accent : Theme.text-mid; }
+                                    // the layer's display name (e.g. "Vitals", "Heat") so each cell is
+                                    // identifiable — falls back to L{n} until the labels model catches up.
+                                    Mono {
+                                        text: li < State.light-stack-labels.length ? State.light-stack-labels[li] : "L" + (li + 1);
+                                        color: cell.on ? Theme.accent : Theme.text-mid;
+                                        overflow: elide;
+                                    }
                                 }
                                 // drop this layer — a real, always-visible button (was a near-invisible faint
                                 // glyph) with a comfortable hit target, red on hover. Declared LAST so its
@@ -739,6 +766,9 @@ export component LightingPanel inherits VerticalLayout {
                     }
                     Button {
                         text: "+ stack this effect";
+                        // an empty stack has nothing to stack ONTO — picking a tile seeds the first layer
+                        // instead, so this stays disabled until at least one layer exists.
+                        enabled: State.light-stack-count >= 1;
                         clicked => { State.stack-current(); }
                     }
                 }
@@ -799,18 +829,45 @@ export component LightingPanel inherits VerticalLayout {
 
                 Divider {}
 
-                // ── APPLY — push the live surface to the device ──
-                HorizontalLayout {
-                    spacing: 7px;
-                    Button {
-                        text: State.compositing ? "restart" : "apply live";
-                        primary: true;
-                        enabled: !State.writes-paused;
-                        clicked => { State.composite-apply(); }
+                // ── PLACE — position THIS layer as a sprite: a drag on the render sets its region (a
+                // sibling gesture to the brush, never the same mode). Any layer — an effect or the vitals
+                // readout — becomes freely placeable + resizable; moving/resizing is just another drag,
+                // Reset returns it to the full board. Hidden for few-zone mice (no lattice to drag on), and
+                // gated on having a layer to place — an empty stack has nothing to position. ──
+                if !root.zone-mode && State.light-stack-count >= 1 : VerticalLayout {
+                    spacing: 9px;
+                    HorizontalLayout {
+                        SectionTitle { text: "PLACE"; }
+                        Rectangle {}
+                        // the honest placement readout — "full board" or the sub-rect size — always shown.
+                        Mono {
+                            text: State.light-place-label;
+                            color: State.light-layer-placed ? Theme.accent : Theme.text-faint;
+                        }
                     }
-                    Button { text: "stop"; danger: true; enabled: State.compositing; clicked => { State.composite-stop(); } }
-                    Rectangle {}
+                    HorizontalLayout {
+                        spacing: 7px;
+                        Button {
+                            text: State.light-place-on ? "done placing" : "place on the render";
+                            primary: State.light-place-on;
+                            clicked => { State.toggle-place(); }
+                        }
+                        Rectangle {}
+                        Button {
+                            text: "reset placement"; danger: true;
+                            enabled: State.light-layer-placed;
+                            clicked => { State.reset-layer-region(); }
+                        }
+                    }
+                    if State.light-place-on : Mono {
+                        text: "drag a rectangle on the render — the enclosed keys become this layer's area.";
+                        color: Theme.text-faint; wrap: word-wrap;
+                    }
                 }
+                // No APPLY transport: lighting AUTO-STREAMS. Every edit debounce-applies the current stack
+                // to the board (see glue::schedule_lighting_apply); "~ live on device" above is the honest
+                // readout, and the one deliberate "stop writing" is the global writes-pause gate (header /
+                // Settings) — a page-local stop would be undone by the very next edit, so it's gone.
             }
         }
     }

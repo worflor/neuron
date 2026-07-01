@@ -1,5 +1,5 @@
 import { Theme } from "../theme.slint";
-import { SectionTitle, Button, Field, Picker, Pill, Mono, Divider } from "../widgets/controls.slint";
+import { SectionTitle, Button, Field, Picker, Pill, Mono, Divider, PanelHead } from "../widgets/controls.slint";
 import { State } from "../state.slint";
 import { ProfileRow, AppRuleRow } from "../models.slint";
 
@@ -44,8 +44,14 @@ component ProfileMenuRow inherits Rectangle {
                 spacing: 10px;
                 if root.p.dpi != "" : Mono { text: "dpi " + root.p.dpi; color: Theme.text-faint; font-size: Theme.fs-small; }
                 if root.p.polling != "" : Mono { text: "poll " + root.p.polling; color: Theme.text-faint; font-size: Theme.fs-small; }
+                if root.p.brightness != "" : Mono { text: "bright " + root.p.brightness; color: Theme.text-faint; font-size: Theme.fs-small; }
                 if root.p.lighting != "" : Mono { text: "light " + root.p.lighting; color: Theme.text-faint; font-size: Theme.fs-small; }
-                if root.p.dpi == "" && root.p.polling == "" && root.p.lighting == "" : Mono { text: root.p.summary; color: Theme.text-faint; font-size: Theme.fs-small; overflow: elide; }
+                if root.p.idle != "" : Mono { text: "idle " + root.p.idle; color: Theme.text-faint; font-size: Theme.fs-small; }
+                if root.p.in-game != "" : Mono { text: "in-game " + root.p.in-game; color: Theme.text-faint; font-size: Theme.fs-small; }
+                if root.p.gaming : Mono { text: "gaming"; color: Theme.warn; font-size: Theme.fs-small; }
+                // every real field has its OWN badge above, so the summary fallback is now purely the
+                // "(empty)" guard: it shows only when the row is genuinely blank (no field, no gaming).
+                if root.p.dpi == "" && root.p.polling == "" && root.p.brightness == "" && root.p.lighting == "" && root.p.idle == "" && root.p.in-game == "" && !root.p.gaming : Mono { text: root.p.summary; color: Theme.text-faint; font-size: Theme.fs-small; overflow: elide; }
                 Rectangle {}
             }
         }
@@ -64,7 +70,7 @@ component ProfileMenuRow inherits Rectangle {
                 opacity: cta.has-hover || root.armed ? 1.0 : 0.0;
                 animate opacity, width, background, border-color { duration: Theme.quick; }
                 Text {
-                    text: root.armed ? "delete?" : "✕";
+                    text: root.armed ? "delete?" : "\u{00d7}";
                     color: Theme.danger; font-family: Theme.mono; font-size: Theme.fs-small; font-weight: 700;
                     horizontal-alignment: center; vertical-alignment: center;
                 }
@@ -83,6 +89,16 @@ export component ProfilesMenu inherits VerticalLayout {
     spacing: 0;
     padding: 16px;
     property <string> new-profile-name;
+    // what a capture actually names: the typed name if any, else the pre-filled suggestion (zero typing).
+    property <string> effective-name: root.new-profile-name != "" ? root.new-profile-name : State.profile-name-suggested;
+    // The overwrite check must follow the name that will ACTUALLY be saved (effective-name), NOT the
+    // raw typed field. Otherwise the nasty case — capture TWICE under the zero-typing suggestion: the
+    // first save turns that suggestion into a real profile name, so the second click overwrites it,
+    // yet the button still reads "capture" (the check saw only the empty field). So re-answer it on
+    // init, whenever effective-name changes (typing OR a fresh suggestion), and after every save (the
+    // profiles list just changed under us). One source of truth: always check effective-name.
+    init => { State.profile-name-edited(root.effective-name); }
+    changed effective-name => { State.profile-name-edited(root.effective-name); }
     property <string> rule-app;
     property <int> rule-profile-idx: 0;
     // name-keyed delete arming (an index can drift when the model refreshes mid-arm)
@@ -93,191 +109,199 @@ export component ProfilesMenu inherits VerticalLayout {
         triggered => { root.armed-delete = ""; }
     }
 
-    // ── header: the name + the live active state (mirrors the pill that opened it) ──
-    HorizontalLayout {
-        spacing: 8px;
-        VerticalLayout {
-            alignment: center;
-            Text {
-                text: "PROFILES";
-                color: Theme.text; font-family: Theme.mono; font-size: Theme.fs-title;
-                font-weight: 700; letter-spacing: Theme.track-4;
-            }
-        }
-        Rectangle {}
-        VerticalLayout {
-            alignment: center;
-            Pill {
-                text: State.active-profile == "—" ? "none active" : State.active-profile;
-                live: State.active-profile != "—";
-            }
+    // ── header — the standard page frame (label + caption + a live active-state pill in the slot) ──
+    PanelHead {
+        label: "PROFILES";
+        caption: "apply a saved profile, or capture the live device + lighting";
+        // right-hand signal slot — the active profile's name, or nothing at all when none is active
+        // (an absent pill says "none" more quietly than a badge that has to spell it out).
+        if State.active-profile != "—" : Pill {
+            text: State.active-profile;
+            live: true;
         }
     }
-    Rectangle { height: 4px; }
-    Mono { text: "apply a saved bundle, or capture the live device state"; color: Theme.text-faint; }
-    Rectangle { height: 15px; }
-
-    // ── SAVED — the primary list (pick one to apply) ──
-    HorizontalLayout {
-        SectionTitle { text: "SAVED"; }
-        Rectangle {}
-        Mono { text: State.profiles.length + (State.profiles.length == 1 ? " profile" : " profiles"); color: Theme.text-faint; }
-    }
-    Rectangle { height: 8px; }
-    VerticalLayout {
-        spacing: 6px;
-        for p in State.profiles : ProfileMenuRow {
-            p: p;
-            armed: root.armed-delete == p.name;
-            apply => { root.armed-delete = ""; State.apply-profile(p.name); State.profile-sheet-open = false; }
-            arm-delete => { root.armed-delete = p.name; }
-            confirm-delete => { root.armed-delete = ""; State.delete-profile(p.name); }
-        }
-    }
-    if State.profiles.length == 0 : Rectangle {
-        height: 66px;
-        border-radius: Theme.radius;
-        background: Theme.bg-2;
-        border-width: Theme.hair;
-        border-color: Theme.line;
-        VerticalLayout {
-            alignment: center; spacing: 4px;
-            Mono { text: "no profiles yet"; color: Theme.text-dim; horizontal-alignment: center; }
-            Mono { text: "tune your device, then capture it below"; color: Theme.text-faint; horizontal-alignment: center; }
-        }
-    }
-    Rectangle { height: 11px; }
-    // capture the live state into a new bundle (the inviting primary write)
-    HorizontalLayout {
-        spacing: 8px;
-        Field {
-            field-width: 290px;
-            placeholder: "name this profile";
-            text <=> root.new-profile-name;
-            edited(t) => { State.profile-name-edited(t); }
-            accepted(t) => {
-                if (t != "") {
-                    State.save-current-profile(t);
-                    root.new-profile-name = "";
-                    State.profile-name-edited("");
-                }
-            }
-        }
-        Button {
-            text: State.profile-name-exists ? "overwrite" : "capture";
-            primary: !State.profile-name-exists;
-            danger: State.profile-name-exists;
-            enabled: root.new-profile-name != "";
-            clicked => {
-                State.save-current-profile(root.new-profile-name);
-                root.new-profile-name = "";
-                State.profile-name-edited("");
-            }
-        }
-    }
-    Rectangle { height: 6px; }
-    Mono { text: "captures a live read-back · dpi · polling · brightness · lighting · idle"; color: Theme.text-faint; font-size: Theme.fs-small; }
-
-    Rectangle { height: 16px; }
     Divider {}
-    Rectangle { height: 16px; }
+    Rectangle { height: Theme.lead-in; }
 
-    // ── AUTO-SWITCH — route the focused app to a saved profile ──
-    SectionTitle { text: "AUTO-SWITCH BY APP"; }
-    Rectangle { height: 8px; }
-    // SOURCE — the live focused-app signal this routing switches on
-    Rectangle {
-        height: 28px;
-        border-radius: Theme.radius-sm;
-        background: Theme.well;
-        border-width: Theme.hair; border-color: Theme.line;
+    // content — one vertical rhythm driven by layout spacing (no hand-tuned spacer rectangles)
+    VerticalLayout {
+        spacing: Theme.gap;
+
+        // ── SAVED — the primary list (pick one to apply) ──
         HorizontalLayout {
-            padding-left: 11px; padding-right: 11px; spacing: 8px;
-            VerticalLayout { alignment: center; Mono { text: "FOCUS"; color: Theme.text-faint; font-size: Theme.fs-small; } }
-            VerticalLayout {
-                alignment: center; horizontal-stretch: 1;
-                Text { text: State.focused-app; color: Theme.text-mid; font-family: Theme.mono; font-size: Theme.fs-body; vertical-alignment: center; overflow: elide; }
+            SectionTitle { text: "SAVED"; }
+            Rectangle {}
+            Mono { text: State.profiles.length + (State.profiles.length == 1 ? " profile" : " profiles"); color: Theme.text-faint; }
+        }
+        VerticalLayout {
+            spacing: 6px;
+            for p in State.profiles : ProfileMenuRow {
+                p: p;
+                armed: root.armed-delete == p.name;
+                apply => { root.armed-delete = ""; State.apply-profile(p.name); State.profile-sheet-open = false; }
+                arm-delete => { root.armed-delete = p.name; }
+                confirm-delete => { root.armed-delete = ""; State.delete-profile(p.name); }
             }
         }
-    }
-    Rectangle { height: 8px; }
-    VerticalLayout {
-        spacing: 6px;
-        for r[i] in State.app-rules : rr := Rectangle {
-            height: 34px;
+        // the live device read-back a capture freezes — the dpi/polling/brightness/lighting you already
+        // dialed in on the Device and Lighting pages, surfaced so a capture is a confirmation, not data
+        // entry. No section chrome or empty-state box: it reads as the "capture a new one" input beneath
+        // the SAVED list (the 0-profiles count already states the emptiness).
+        Rectangle {
+            height: 30px;
             border-radius: Theme.radius-sm;
             background: Theme.well;
-            border-width: Theme.hair;
-            property <bool> routing: i == State.active-app-rule;
-            border-color: self.routing ? Theme.accent-line : Theme.line;
-            animate border-color { duration: Theme.settle; }
-            rowta := TouchArea {}   // row-level hover so the delete stays quiet at rest
+            border-width: Theme.hair; border-color: Theme.line;
             HorizontalLayout {
-                padding-left: 11px; padding-right: 7px; spacing: 8px;
-                // the closed-contact lamp: THIS rule is currently winning
-                VerticalLayout {
-                    alignment: center;
-                    Rectangle {
-                        width: 5px; height: 5px; border-radius: 3px;
-                        background: rr.routing ? Theme.accent : Theme.line;
-                        animate background { duration: Theme.settle; }
+                padding-left: 11px; padding-right: 11px; spacing: 14px;
+                VerticalLayout { alignment: center; Mono { text: "LIVE"; color: Theme.accent-dim; font-size: Theme.fs-small; } }
+                VerticalLayout { alignment: center; Mono { text: round(State.dpi) + " dpi"; color: Theme.text-mid; } }
+                VerticalLayout { alignment: center; Mono { text: round(State.polling-hz) + " Hz"; color: Theme.text-mid; } }
+                VerticalLayout { alignment: center; Mono { text: round(State.brightness) + "%"; color: Theme.text-mid; } }
+                if State.light-effect != "" : VerticalLayout { alignment: center; Mono { text: State.light-effect; color: Theme.text-mid; } }
+                if State.gaming-live : VerticalLayout { alignment: center; Mono { text: "gaming"; color: Theme.warn; font-size: Theme.fs-small; } }
+                Rectangle {}
+            }
+        }
+        // name + capture: the name is pre-filled from what you're doing right now (the focused app, else a
+        // value descriptor) — an empty field captures under that suggestion, so it's usually one click.
+        HorizontalLayout {
+            spacing: 8px;
+            Field {
+                field-width: 290px;
+                placeholder: State.profile-name-suggested != "" ? "profile name (default: " + State.profile-name-suggested + ")" : "profile name";
+                text <=> root.new-profile-name;
+                // (the `changed effective-name` handler above answers the overwrite check — typing
+                // updates new-profile-name → effective-name → that handler, so no per-edit call here)
+                accepted(t) => {
+                    if (root.effective-name != "") {
+                        State.save-current-profile(root.effective-name);
+                        root.new-profile-name = "";
+                        State.profile-name-edited(root.effective-name); // re-check vs the now-updated list
                     }
                 }
-                Text { text: r.app; color: Theme.text; font-size: Theme.fs-body; font-family: Theme.mono; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
-                Text {
-                    text: "→";
-                    color: rr.routing ? Theme.accent : Theme.text-faint;
-                    vertical-alignment: center;
-                    animate color { duration: Theme.settle; }
-                }
-                Text { text: r.profile; color: Theme.text-mid; font-size: Theme.fs-body; font-family: Theme.mono; vertical-alignment: center; overflow: elide; }
-                Button {
-                    text: "del"; danger: true;
-                    enabled: rowta.has-hover;
-                    opacity: rowta.has-hover ? 1.0 : 0.0;
-                    clicked => { State.remove-app-rule(i); }
+            }
+            Button {
+                text: State.profile-name-exists ? "overwrite" : "capture";
+                primary: !State.profile-name-exists;
+                danger: State.profile-name-exists;
+                enabled: root.effective-name != "";
+                clicked => {
+                    State.save-current-profile(root.effective-name);
+                    root.new-profile-name = "";
+                    State.profile-name-edited(root.effective-name); // re-check vs the now-updated list
                 }
             }
         }
-    }
-    if State.app-rules.length == 0 : Mono { text: "no rules yet · match a focused app to a profile"; color: Theme.text-faint; }
-    Rectangle { height: 9px; }
-    // add a rule: the app substring (or grab the focused app), then the target profile
-    HorizontalLayout {
-        spacing: 7px;
-        Field {
-            field-width: 240px;
-            placeholder: "app substring (e.g. valorant)";
-            text <=> root.rule-app;
-        }
-        Button {
-            text: "use focus";
-            enabled: State.focused-app != "—" && State.focused-app != "";
-            clicked => { root.rule-app = State.focused-app; }
-        }
-    }
-    Rectangle { height: 7px; }
-    HorizontalLayout {
-        spacing: 7px;
-        VerticalLayout {
-            horizontal-stretch: 1;
-            Picker {
-                options: State.profile-names;
-                index: root.rule-profile-idx;
-                changed(i) => { root.rule-profile-idx = i; }
+
+        Divider {}
+
+        // ── AUTO-SWITCH — route the focused app to a saved profile ──
+        SectionTitle { text: "AUTO-SWITCH BY APP"; }
+        // nothing to route to yet — reveal the whole apparatus only once a profile exists (no dead fields).
+        // Only in the fully-empty state — with orphaned rules still listed below, "save a profile
+        // first" would contradict the visible routes; there the del buttons speak for themselves.
+        if State.profiles.length == 0 && State.app-rules.length == 0 : Mono { text: "save a profile first to route apps to it"; color: Theme.text-faint; }
+        // Show the apparatus when there are rules OR profiles: a rule stays visible + deletable even
+        // after the last profile is removed (rules aren't pruned on profile delete), so an orphaned
+        // rule is never stranded with no UI path to remove it.
+        if State.app-rules.length > 0 || State.profiles.length > 0 : VerticalLayout {
+            spacing: Theme.gap;
+            // SOURCE — the live focused-app signal this routing switches on
+            Rectangle {
+                height: 28px;
+                border-radius: Theme.radius-sm;
+                background: Theme.well;
+                border-width: Theme.hair; border-color: Theme.line;
+                HorizontalLayout {
+                    padding-left: 11px; padding-right: 11px; spacing: 8px;
+                    VerticalLayout { alignment: center; Mono { text: "FOCUS"; color: Theme.text-faint; font-size: Theme.fs-small; } }
+                    VerticalLayout {
+                        alignment: center; horizontal-stretch: 1;
+                        Text { text: State.focused-app; color: Theme.text-mid; font-family: Theme.mono; font-size: Theme.fs-body; vertical-alignment: center; overflow: elide; }
+                    }
+                }
+            }
+            VerticalLayout {
+                spacing: 6px;
+                for r[i] in State.app-rules : rr := Rectangle {
+                    height: 34px;
+                    border-radius: Theme.radius-sm;
+                    background: Theme.well;
+                    border-width: Theme.hair;
+                    property <bool> routing: i == State.active-app-rule;
+                    border-color: self.routing ? Theme.accent-line : Theme.line;
+                    animate border-color { duration: Theme.settle; }
+                    rowta := TouchArea {}   // row-level hover so the delete stays quiet at rest
+                    HorizontalLayout {
+                        padding-left: 11px; padding-right: 7px; spacing: 8px;
+                        // the closed-contact lamp: THIS rule is currently winning
+                        VerticalLayout {
+                            alignment: center;
+                            Rectangle {
+                                width: 5px; height: 5px; border-radius: 3px;
+                                background: rr.routing ? Theme.accent : Theme.line;
+                                animate background { duration: Theme.settle; }
+                            }
+                        }
+                        Text { text: r.app; color: Theme.text; font-size: Theme.fs-body; font-family: Theme.mono; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+                        Text {
+                            text: "→";
+                            color: rr.routing ? Theme.accent : Theme.text-faint;
+                            vertical-alignment: center;
+                            animate color { duration: Theme.settle; }
+                        }
+                        Text { text: r.profile; color: Theme.text-mid; font-size: Theme.fs-body; font-family: Theme.mono; vertical-alignment: center; overflow: elide; }
+                        Button {
+                            text: "del"; danger: true;
+                            enabled: rowta.has-hover;
+                            opacity: rowta.has-hover ? 1.0 : 0.0;
+                            clicked => { State.remove-app-rule(i); }
+                        }
+                    }
+                }
+            }
+            if State.app-rules.length == 0 : Mono { text: "no rules yet · match a focused app to a profile"; color: Theme.text-faint; }
+            // add a rule — gated on having a profile to route to (no dead-end picker). The existing
+            // rules above render unconditionally, so they stay deletable even with zero profiles.
+            if State.profiles.length > 0 : VerticalLayout {
+                spacing: Theme.gap;
+                // the app substring (or grab the focused app), then the target profile
+                HorizontalLayout {
+                    spacing: 7px;
+                    Field {
+                        field-width: 240px;
+                        placeholder: "app substring (e.g. valorant)";
+                        text <=> root.rule-app;
+                    }
+                    Button {
+                        text: "use focus";
+                        enabled: State.focused-app != "—" && State.focused-app != "";
+                        clicked => { root.rule-app = State.focused-app; }
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 7px;
+                    VerticalLayout {
+                        horizontal-stretch: 1;
+                        Picker {
+                            options: State.profile-names;
+                            index: root.rule-profile-idx;
+                            changed(i) => { root.rule-profile-idx = i; }
+                        }
+                    }
+                    Button {
+                        text: "+ add rule";
+                        primary: true;
+                        enabled: root.rule-app != "" && State.profile-names.length > 0;
+                        clicked => {
+                            State.add-app-rule(root.rule-app,
+                                State.profile-names[min(root.rule-profile-idx, State.profile-names.length - 1)]);
+                            root.rule-app = "";
+                        }
+                    }
+                }
             }
         }
-        Button {
-            text: "+ add rule";
-            primary: true;
-            enabled: root.rule-app != "" && State.profile-names.length > 0;
-            clicked => {
-                State.add-app-rule(root.rule-app,
-                    State.profile-names[min(root.rule-profile-idx, State.profile-names.length - 1)]);
-                root.rule-app = "";
-            }
-        }
     }
-    if State.profile-names.length == 0 : Rectangle { height: 7px; }
-    if State.profile-names.length == 0 : Mono { text: "save a profile first to route apps to it"; color: Theme.text-faint; font-size: Theme.fs-small; }
 }

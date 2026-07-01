@@ -29,6 +29,8 @@ use crate::spectrum::{self, Motion, Palette, Spectrum, Stop};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::f32::consts::{PI, TAU};
+use std::sync::OnceLock;
+use std::time::Instant;
 
 // ─────────────────────────────────────── Field & Pattern ─────────────────────────────────
 
@@ -82,11 +84,127 @@ impl Field {
     }
 }
 
+// ─────────────────────────────────── Bounds (the sprite substrate) ───────────────────────
+
+/// The sub-rectangle (origin + size) a layer occupies on the board — the placement substrate a
+/// bounds-aware pattern renders relative to. `(row0, col0)` is the top-left cell; `rows`×`cols` the
+/// extent. Derived from a layer's region mask ([`Bounds::from_region`]); a region-less (whole-board)
+/// layer gets [`Bounds::board`]. Most patterns ignore it and just fill `rows`×`cols`; a placement-aware
+/// one (the `vitals` readout) scales its drawing to fit whatever rect it was handed, so it reads right
+/// at any size from a two-cell strip to the full board.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Bounds {
+    pub row0: u8,
+    pub col0: u8,
+    pub rows: u8,
+    pub cols: u8,
+}
+
+impl Bounds {
+    /// The whole board — origin `(0, 0)`, full extent. The placement a region-less layer occupies.
+    pub fn board(rows: u8, cols: u8) -> Bounds {
+        Bounds { row0: 0, col0: 0, rows, cols }
+    }
+
+    /// The bounding box of a region's cells on a `rows`×`cols` board (each index → `(r, c)` row-major).
+    /// An empty region covers the whole board, so it maps to [`Bounds::board`]. Indices at/past the end
+    /// of the board are skipped (defensive); if none are in range the result also falls back to the full
+    /// board. Scattered cells collapse to the single ENCLOSING rectangle (the bbox), never the literal
+    /// cells — the placement is a rectangle, the region mask still carves the exact shape on top.
+    pub fn from_region(region: &[u32], rows: u8, cols: u8) -> Bounds {
+        if region.is_empty() || rows == 0 || cols == 0 {
+            return Bounds::board(rows, cols);
+        }
+        let c = cols as u32;
+        let n = rows as u32 * c;
+        let (mut r0, mut c0, mut r1, mut c1) = (u32::MAX, u32::MAX, 0u32, 0u32);
+        let mut any = false;
+        for &i in region {
+            if i >= n {
+                continue; // an out-of-board index can't define the placement — ignore it.
+            }
+            let (r, col) = (i / c, i % c);
+            r0 = r0.min(r);
+            c0 = c0.min(col);
+            r1 = r1.max(r);
+            c1 = c1.max(col);
+            any = true;
+        }
+        if !any {
+            return Bounds::board(rows, cols);
+        }
+        Bounds {
+            row0: r0 as u8,
+            col0: c0 as u8,
+            rows: (r1 - r0 + 1) as u8,
+            cols: (c1 - c0 + 1) as u8,
+        }
+    }
+}
+
+// ─────────────────── pure stack / placement helpers (extracted from the app glue) ───────────────────
+//
+// Small, side-effect-free index math the GUI's lighting glue leans on. Kept in core (not trapped in a
+// Slint closure) so the fiddly cases — a remove BELOW the selection, a whole-board place rect — are
+// unit-tested once here rather than re-derived (and mis-derived) at the call site.
+
+/// The selected-layer index after removing layer `removed` from a stack, given the prior `selected`
+/// index and the NEW length `new_len` (AFTER the removal). Removing a layer BELOW the selection shifts
+/// everything above it down one, so the selection must DECREMENT to stay on the same layer; removing the
+/// selection itself (or anything above it) leaves the index put, only clamped to the new last layer. An
+/// emptied stack (`new_len == 0`) has no selection → `0`. Pure, so the glue can't get the below-the-
+/// selection case wrong (the old single-clamp left `selected` pointing one layer too high).
+pub fn selection_after_remove(removed: usize, selected: usize, new_len: usize) -> usize {
+    if new_len == 0 {
+        return 0;
+    }
+    let sel = if removed < selected { selected.saturating_sub(1) } else { selected };
+    sel.min(new_len - 1)
+}
+
+/// The row-major cell indices a PLACE rectangle covers on a `rows`×`cols` board — the pure geometry the
+/// app's place-gesture commit runs. The two corners `(r0,c0)`–`(r1,c1)` may arrive in ANY order and off
+/// the board; they're clamped to `[0,rows-1]`×`[0,cols-1]` and ordered (lo,hi). A rect covering the WHOLE
+/// board returns an EMPTY vec — the canonical "region-less / full board" the [`Compositor`] treats as no
+/// mask (so a full-board drag and a Reset converge honestly). Otherwise the enclosed cells, row-major. A
+/// degenerate board (`rows`/`cols` == 0) yields empty. Pure, so the placement math is tested away from Slint.
+pub fn region_from_rect(r0: i32, c0: i32, r1: i32, c1: i32, rows: u8, cols: u8) -> Vec<u32> {
+    if rows == 0 || cols == 0 {
+        return Vec::new();
+    }
+    let (rmax, cmax) = (rows as i32 - 1, cols as i32 - 1);
+    let rlo = r0.min(r1).clamp(0, rmax);
+    let rhi = r0.max(r1).clamp(0, rmax);
+    let clo = c0.min(c1).clamp(0, cmax);
+    let chi = c0.max(c1).clamp(0, cmax);
+    // a whole-board rect stores as EMPTY (region-less) — the canonical full board the compositor masks by.
+    if rlo == 0 && clo == 0 && rhi == rmax && chi == cmax {
+        return Vec::new();
+    }
+    let mut v = Vec::with_capacity(((rhi - rlo + 1) * (chi - clo + 1)) as usize);
+    for r in rlo..=rhi {
+        for c in clo..=chi {
+            v.push((r as u32) * cols as u32 + c as u32);
+        }
+    }
+    v
+}
+
 /// A stateful shape-and-motion generator. One instance per layer; `field` is called once per tick.
 pub trait Pattern {
     /// Apply the layer's param values. Called once when the layer is built and again when a knob
     /// changes. The default ignores params (for patterns that declare none).
     fn configure(&mut self, _params: &Params) {}
+
+    /// Receive the layer's raw per-LED cells. Custom / static-frame layers paint these directly;
+    /// procedural patterns ignore them (defaulted, mirroring how [`configure`](Pattern::configure) is).
+    fn set_frame(&mut self, _cells: &[[u8; 3]]) {}
+
+    /// Receive the placement rect this layer occupies; placement-aware patterns render relative to it,
+    /// the rest ignore it, defaulted like [`set_frame`](Pattern::set_frame). The compositor computes it
+    /// from the layer's region ([`Bounds::from_region`]) and calls this once per tick before [`field`]
+    /// (Pattern::field), so a bounds-aware pattern always sees its current rect.
+    fn set_bounds(&mut self, _b: Bounds) {}
 
     /// Emit this tick's field for a `rows`×`cols` matrix at elapsed time `t` (seconds).
     fn field(&mut self, rows: u8, cols: u8, t: f32) -> Field;
@@ -167,6 +285,12 @@ pub struct LayerDef {
     pub region: Vec<u32>,
     pub blend: Blend,
     pub enabled: bool,
+    /// Raw per-LED cells for a `custom` (hand-painted / imported) static-frame layer — one `[R, G, B]`
+    /// per LED, row-major. Empty (and omitted from TOML) for every procedural pattern; the `custom`
+    /// pattern reads it via [`Pattern::set_frame`]. This is how an imported/painted frame becomes a
+    /// first-class layer in the stack rather than a per-profile sidecar.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub frame: Vec<[u8; 3]>,
 }
 
 impl Default for LayerDef {
@@ -178,6 +302,7 @@ impl Default for LayerDef {
             region: Vec::new(),
             blend: Blend::Normal,
             enabled: true,
+            frame: Vec::new(),
         }
     }
 }
@@ -187,6 +312,7 @@ impl LayerDef {
     pub fn make_pattern(&self) -> Option<Box<dyn Pattern>> {
         let mut p = make_pattern(&self.pattern)?;
         p.configure(&self.params);
+        p.set_frame(&self.frame);
         Some(p)
     }
 }
@@ -217,6 +343,14 @@ pub struct PatternDef {
     pub params: fn() -> Vec<Param>,
     pub default_spectrum: fn() -> Spectrum,
     pub tile: TileMeta,
+    /// Does this pattern colour THROUGH the 1-D [`Spectrum`] (i.e. it emits a [`Field::Scalar`])? `true`
+    /// for every scalar shape; `false` for the full-colour patterns that emit [`Field::Color`] directly
+    /// and ignore the spectrum (`screen`, `custom`, `vitals`). The app reads this to hide the spectrum
+    /// editor for full-colour layers instead of branching on the pattern key by hand.
+    pub has_spectrum: bool,
+    /// Is this a device-telemetry READOUT (data rendered as a gauge) rather than a decorative effect?
+    /// `true` only for `vitals`. Lets the app surface / group it distinctly without string-matching keys.
+    pub readout: bool,
 }
 
 /// The registry — the SINGLE source of truth for every pattern. The factory ([`make_pattern`]), the
@@ -227,7 +361,9 @@ pub struct PatternDef {
 /// [`Spectrum`], chosen per preset — see [`presets`]): `uniform` (Static/Breathing/Cycle), `axis`
 /// (Wave), `radial` (Color Wheel), `heat` (Fire), `streak` (Cascade rain + Comet), `sparkle`
 /// (Starlight), `ignite` (Reactive), `ring` (Ripple), `flow` (Aurora), `thermal` (Typing Heat),
-/// `meter` (Audio Meter + Pulse) and `screen` (Ambient — the full-colour exception).
+/// `meter` (Audio Meter + Pulse) and `screen` (Ambient — the full-colour exception). Plus two
+/// full-colour non-effect layers: `custom` (a painted/imported frame) and `vitals` (the device's live
+/// battery/charge readout as a compositable, resolution-independent gauge).
 static REGISTRY: &[PatternDef] = &[
     PatternDef {
         key: "uniform",
@@ -239,6 +375,8 @@ static REGISTRY: &[PatternDef] = &[
             blurb: "one colour across the whole board",
             live_input: false,
         },
+        has_spectrum: true,
+        readout: false,
     },
     PatternDef {
         key: "axis",
@@ -250,6 +388,8 @@ static REGISTRY: &[PatternDef] = &[
             blurb: "a gradient scrolling along an axis (the wave shape)",
             live_input: false,
         },
+        has_spectrum: true,
+        readout: false,
     },
     PatternDef {
         key: "radial",
@@ -261,6 +401,8 @@ static REGISTRY: &[PatternDef] = &[
             blurb: "a hue wheel turning around the centre",
             live_input: false,
         },
+        has_spectrum: true,
+        readout: false,
     },
     PatternDef {
         key: "heat",
@@ -272,6 +414,8 @@ static REGISTRY: &[PatternDef] = &[
             blurb: "an upward fire — heat rises, flickers and cools",
             live_input: false,
         },
+        has_spectrum: true,
+        readout: false,
     },
     PatternDef {
         key: "streak",
@@ -283,6 +427,8 @@ static REGISTRY: &[PatternDef] = &[
             blurb: "falling rain or streaking comets, tail to head",
             live_input: false,
         },
+        has_spectrum: true,
+        readout: false,
     },
     PatternDef {
         key: "sparkle",
@@ -294,6 +440,8 @@ static REGISTRY: &[PatternDef] = &[
             blurb: "random twinkles igniting and fading like stars",
             live_input: false,
         },
+        has_spectrum: true,
+        readout: false,
     },
     PatternDef {
         key: "ignite",
@@ -305,6 +453,8 @@ static REGISTRY: &[PatternDef] = &[
             blurb: "lights the key you press, then fades",
             live_input: true,
         },
+        has_spectrum: true,
+        readout: false,
     },
     PatternDef {
         key: "ring",
@@ -316,6 +466,8 @@ static REGISTRY: &[PatternDef] = &[
             blurb: "a keypress sends a ring rippling outward",
             live_input: true,
         },
+        has_spectrum: true,
+        readout: false,
     },
     PatternDef {
         key: "flow",
@@ -327,6 +479,8 @@ static REGISTRY: &[PatternDef] = &[
             blurb: "a slow aurora flow drifting over the board",
             live_input: false,
         },
+        has_spectrum: true,
+        readout: false,
     },
     PatternDef {
         key: "thermal",
@@ -338,6 +492,8 @@ static REGISTRY: &[PatternDef] = &[
             blurb: "your typing rendered as a living heat map",
             live_input: true,
         },
+        has_spectrum: true,
+        readout: false,
     },
     PatternDef {
         key: "meter",
@@ -349,6 +505,8 @@ static REGISTRY: &[PatternDef] = &[
             blurb: "a live meter — audio level or system load",
             live_input: true,
         },
+        has_spectrum: true,
+        readout: false,
     },
     PatternDef {
         key: "screen",
@@ -360,6 +518,36 @@ static REGISTRY: &[PatternDef] = &[
             blurb: "the board mirrors the colours on your screen",
             live_input: true,
         },
+        has_spectrum: false,
+        readout: false,
+    },
+    PatternDef {
+        key: "custom",
+        label: "Custom",
+        make: || Box::new(StaticFrame::default()),
+        params: Vec::new,
+        default_spectrum: || Spectrum::solid(Rgb::new(0, 0, 0)),
+        tile: TileMeta {
+            blurb: "a hand-painted or imported per-key frame",
+            live_input: false,
+        },
+        has_spectrum: false,
+        readout: false,
+    },
+    PatternDef {
+        key: "vitals",
+        label: "Vitals",
+        make: || Box::new(Vitals::default()),
+        params: Vec::new,
+        // A Color (full-colour) pattern — it paints its own gauge colours and IGNORES the spectrum; the
+        // registry still requires a non-empty default, so a solid accent stands in (never sampled).
+        default_spectrum: || Spectrum::solid(ACCENT),
+        tile: TileMeta {
+            blurb: "the device's live battery & charge as a gauge",
+            live_input: true,
+        },
+        has_spectrum: false,
+        readout: true,
     },
 ];
 
@@ -395,6 +583,40 @@ pub fn default_spectrum(key: &str) -> Option<Spectrum> {
 /// Every registered pattern key, in registry order.
 pub fn pattern_keys() -> Vec<&'static str> {
     REGISTRY.iter().map(|d| d.key).collect()
+}
+
+/// Does this pattern colour through the 1-D [`Spectrum`] (a [`Field::Scalar`] pattern), so the spectrum
+/// editor is meaningful for it? Registry-driven. An unknown key assumes `true` — the safe default
+/// (show the editor rather than silently hide it). `false` for the full-colour patterns (`screen`,
+/// `custom`, `vitals`). Replaces app-side string-matching on the pattern key.
+pub fn pattern_has_spectrum(key: &str) -> bool {
+    pattern_def(key).map(|d| d.has_spectrum).unwrap_or(true)
+}
+
+/// Is this pattern a device-telemetry READOUT (a gauge, not a decorative effect)? Registry-driven;
+/// `true` only for `vitals`, unknown → `false`. Replaces app-side string-matching on the pattern key.
+pub fn pattern_is_readout(key: &str) -> bool {
+    pattern_def(key).map(|d| d.readout).unwrap_or(false)
+}
+
+// ─────────────────────────────────── the render clock (one epoch, one formula) ─────────────
+
+/// The process-global RENDER CLOCK epoch — one shared `Instant` every animated surface quantises
+/// against, so the GUI preview and the device stream advance in the SAME discrete frames (the preview
+/// provably mirrors the board). Both call [`quantized_t`] with `render_epoch().elapsed()`; a device
+/// stream keeps its own start only for the run-duration bound + pacing, never for the phase. Shared and
+/// unchanging, so a stream restart can't jump the phase.
+pub fn render_epoch() -> Instant {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    *EPOCH.get_or_init(Instant::now)
+}
+
+/// Quantise an elapsed time (seconds) to whole `1/fps` steps — floor `elapsed·fps` back to `/fps`. The
+/// ONE render-clock formula the GUI preview and the device `animate` loop both run, so their phases step
+/// identically (chunky at 6 fps, smooth at 30). `fps` is floored to ≥1 (a 0 would divide by zero).
+pub fn quantized_t(elapsed_secs: f32, fps: u32) -> f32 {
+    let fps = fps.max(1) as f32;
+    (elapsed_secs * fps).floor() / fps
 }
 
 // shared param-schema constructors (reused across pattern defs so the ranges read consistently)
@@ -1801,6 +2023,30 @@ impl Pattern for Screen {
     }
 }
 
+// ───────────────────────────────── Custom (the static-frame layer) ──────────────────────────────
+
+/// Custom: a hand-painted or imported per-key frame promoted to a first-class layer. Like [`Screen`]
+/// it's inherently full-colour, so it's the other [`Field::Color`] exception — it emits its raw cells
+/// DIRECTLY, bypassing the 1-D spectrum. The cells arrive once via [`Pattern::set_frame`] (from the
+/// layer's `frame`); a matrix bigger than the frame pads with black, a smaller one truncates.
+#[derive(Default)]
+struct StaticFrame {
+    cells: Vec<Rgb>,
+}
+
+impl Pattern for StaticFrame {
+    fn set_frame(&mut self, cells: &[[u8; 3]]) {
+        self.cells = cells.iter().map(|c| Rgb::new(c[0], c[1], c[2])).collect();
+    }
+
+    fn field(&mut self, rows: u8, cols: u8, _t: f32) -> Field {
+        let n = rows as usize * cols as usize;
+        let mut px = self.cells.clone();
+        px.resize(n, Rgb::new(0, 0, 0));
+        Field::Color(px)
+    }
+}
+
 /// The pure Ambient renderer (no capture I/O) — maps each board cell to its matching SCREEN ZONE and
 /// eases the previous frame toward it (gentle temporal smoothing). `ease` is the per-frame lerp factor,
 /// `boost` the saturation amount. Deterministic + testable; an all-black grid → a dark board (honest).
@@ -1832,6 +2078,104 @@ fn render_ambient(
         }
     }
     out
+}
+
+// ─────────────────────────────── Vitals (the device-telemetry readout) ──────────────────────────
+
+/// Vitals: the device's live battery / charge state as a first-class, COMPOSITABLE layer — the
+/// cross-device data surface ([`crate::lighting::render_vitals`]) rebuilt as a resolution-independent
+/// [`Pattern`]. Where that surface anchors onto MEANINGFUL physical keys (the number row, the F-keys)
+/// and so only reads right on a full keyboard, this pattern fills whatever rect the layer occupies (its
+/// [`Bounds`], from the region) with a PROPORTIONAL battery gauge — a `battery_color` fill scaled to the
+/// placement, a charging crest sweeping the lit run — so it reads correctly at any size from a two-cell
+/// strip to the whole board. Inherently full-colour, so it's a [`Field::Color`] pattern (spectrum-free,
+/// like [`Screen`]/`Custom`). The snapshot comes from a SHARED feed ([`crate::lighting::publish_vitals`])
+/// the app pushes; before the first publish the board idles pure BLACK (a live-input pattern with no
+/// source) — and its preset overlays with [`Blend::Screen`], for which black is the identity, so an idle
+/// or empty-gauge cell falls through to the effect beneath instead of punching an opaque black hole.
+///
+/// Private (built only via the registry factory, like `Custom`/[`StaticFrame`]) so its name can't
+/// collide with the [`crate::lighting::Vitals`] SNAPSHOT it renders in a downstream glob import.
+#[derive(Default)]
+struct Vitals {
+    /// The rect this layer occupies, delivered by [`Pattern::set_bounds`] each tick. `None` until the
+    /// compositor sets it (e.g. a bare `field` call in a test) — then the whole board is assumed.
+    bounds: Option<Bounds>,
+}
+
+impl Pattern for Vitals {
+    fn set_bounds(&mut self, b: Bounds) {
+        self.bounds = Some(b);
+    }
+
+    fn field(&mut self, rows: u8, cols: u8, t: f32) -> Field {
+        let n = rows as usize * cols as usize;
+        // No published snapshot yet → idle dark: a live readout with no source is honestly BLACK. (Unlike
+        // the audio meter, which idles at its spectrum's LOW colour — that's a Scalar field; vitals is a
+        // Color field of black.) When this layer is OVERLAID its preset defaults to `Blend::Screen`, for
+        // which black is the identity, so these idle/empty cells fall THROUGH to the effect beneath.
+        let v = match crate::lighting::latest_vitals() {
+            Some(v) => v,
+            None => return Field::Color(vec![Rgb::BLACK; n]),
+        };
+        let bounds = self.bounds.unwrap_or_else(|| Bounds::board(rows, cols));
+        // CREST_RATE: charging-crest sweeps per second — a calm travelling highlight along the lit run.
+        const CREST_RATE: f32 = 0.6;
+        let phase = (t * CREST_RATE).rem_euclid(1.0);
+        Field::Color(render_vitals_bounds(v, rows, cols, bounds, phase))
+    }
+}
+
+/// The resolution-independent VITALS readout — the [`Vitals`] pattern's renderer, and the reason the
+/// data surface becomes a real layer. Draws a PROPORTIONAL battery gauge into the `bounds` sub-rect of
+/// an otherwise-black `rows*cols` board: the leftmost `round(pct% × bounds.cols)` columns of the rect
+/// fill with [`battery_color`](crate::lighting::battery_color) (RED low → AMBER mid → GREEN full) across
+/// the rect's full height, a non-zero battery always lighting ≥1 column (1% ≠ empty); while charging, a
+/// bright cyan crest ([`VITALS_CYAN`](crate::lighting::VITALS_CYAN)) sweeps the lit run (`phase` 0..1).
+/// It reuses the cross-device surface's MATH (the fill colour, the ≥1-lit rule, the crest lerp) but
+/// places it PROPORTIONALLY, so it fills a 1×2 strip or the full board equally well — where the
+/// key-anchored [`render_vitals`](crate::lighting::render_vitals) needs a real keyboard to read right.
+/// Pure — no I/O, fully unit-testable. (DPI-stage pips stay in the key-anchored surface; a pip strip
+/// doesn't generalise below the F-key count, so the proportional layer leads with the battery gauge.)
+///
+/// `pub` because the app's lighting-page renders the vitals TILE thumbnail through this SAME renderer
+/// (over `Bounds::board`) instead of the key-anchored [`render_vitals`](crate::lighting::render_vitals),
+/// so the swatch matches the APPLIED layer at any grid size rather than reading ~all-black off-keyboard.
+pub fn render_vitals_bounds(v: crate::lighting::Vitals, rows: u8, cols: u8, b: Bounds, phase: f32) -> Vec<Rgb> {
+    let (br, bc) = (rows as usize, cols as usize);
+    let mut f = vec![Rgb::BLACK; br * bc];
+    let (w, h) = (b.cols as usize, b.rows as usize);
+    if br == 0 || bc == 0 || w == 0 || h == 0 {
+        return f;
+    }
+    // BATTERY GAUGE — round(pct% × width) columns lit; any non-zero battery lights ≥1 (1% ≠ empty).
+    let pct = v.battery_pct.min(100) as f32;
+    let lit = if v.battery_pct == 0 {
+        0
+    } else {
+        ((pct / 100.0 * w as f32).round() as usize).clamp(1, w)
+    };
+    let fill = crate::lighting::battery_color(v.battery_pct);
+    // The charging crest travels across the lit run; ~2-column-wide bright cyan peak.
+    let crest = phase * lit.max(1) as f32;
+    for col in 0..lit {
+        let color = if v.charging {
+            let d = (col as f32 - crest).abs();
+            let glow = (1.0 - d / 2.0).clamp(0.0, 1.0);
+            Rgb::lerp(fill, crate::lighting::VITALS_CYAN, 0.30 + 0.70 * glow)
+        } else {
+            fill
+        };
+        // Paint the full height of the rect for this column, offset to the placement origin + clipped.
+        for row in 0..h {
+            let rr = b.row0 as usize + row;
+            let cc = b.col0 as usize + col;
+            if rr < br && cc < bc {
+                f[rr * bc + cc] = color;
+            }
+        }
+    }
+    f
 }
 
 // ─────────────────────────── default-spectrum constructors (per pattern) ───────────────────────
@@ -1918,8 +2262,14 @@ impl Preset {
             params: (self.params)(),
             spectrum: (self.spectrum)(),
             region: Vec::new(),
-            blend: Blend::Normal,
+            // A READOUT overlay (vitals) defaults to Screen, not Normal: black is Screen's identity, so
+            // its empty-gauge-track + no-data cells fall THROUGH to the effect beneath instead of punching
+            // an opaque black hole. Standalone over the black board Screen and Normal look identical, so
+            // this only changes the OVERLAID case (for the better). Registry-driven — vitals is the only
+            // readout, and a future readout preset inherits the right blend for free.
+            blend: if pattern_is_readout(self.pattern) { Blend::Screen } else { Blend::Normal },
             enabled: true,
+            frame: Vec::new(),
         }
     }
 }
@@ -1944,6 +2294,7 @@ pub fn presets() -> Vec<Preset> {
         Preset { slug: "audiometer", label: "Audio Meter", pattern: "meter", params: pp_audio, spectrum: meter_spectrum },
         Preset { slug: "pulse", label: "Pulse", pattern: "meter", params: pp_load, spectrum: sp_pulse },
         Preset { slug: "ambient", label: "Ambient", pattern: "screen", params: pp_none, spectrum: sp_solid_accent },
+        Preset { slug: "vitals", label: "Vitals", pattern: "vitals", params: pp_none, spectrum: sp_solid_accent },
     ]
 }
 
@@ -2091,6 +2442,11 @@ impl Compositor {
             if !layer.enabled {
                 continue;
             }
+            // Hand the pattern its placement rect (the region's bbox, or the whole board when
+            // region-less) BEFORE it renders, so a bounds-aware pattern fills exactly its sub-rect. The
+            // region mask below still gives the exact-shape transparency; this only sizes the drawing.
+            let bbox = Bounds::from_region(&layer.region, rows, cols);
+            layer.pattern.set_bounds(bbox);
             let field = layer.pattern.field(rows, cols, t);
             if field.len() != n {
                 continue; // a misbehaving pattern can't corrupt the stack
@@ -2136,6 +2492,12 @@ mod tests {
             let mut p = (d.make)();
             let f = p.field(6, 22, 0.0);
             assert_eq!(f.len(), 6 * 22, "{}: field must fill rows*cols", d.key);
+
+            // capability honesty: a full-colour pattern (Field::Color) bypasses the spectrum, so it
+            // MUST declare has_spectrum = false — the flag and the real field kind can never drift.
+            if matches!(f, Field::Color(_)) {
+                assert!(!d.has_spectrum, "{}: a Color pattern must not claim a spectrum", d.key);
+            }
 
             // params: well-formed (unique non-empty keys; NO colour params — colour is the spectrum)
             let params = (d.params)();
@@ -2304,6 +2666,7 @@ mod tests {
             region: vec![3, 1, 2],
             blend: Blend::Add,
             enabled: false,
+            frame: Vec::new(),
         };
         let j = serde_json::to_string(&def).unwrap();
         let back: LayerDef = serde_json::from_str(&j).unwrap();
@@ -2362,7 +2725,10 @@ mod tests {
         ] {
             assert!(keys.contains(&k), "registry is missing the '{k}' pattern");
         }
-        assert_eq!(keys.len(), 12, "exactly the twelve shapes are registered");
+        // the twelve procedural shapes + the `custom` static-frame layer + the `vitals` readout.
+        assert!(keys.contains(&"custom"), "registry is missing the 'custom' layer type");
+        assert!(keys.contains(&"vitals"), "registry is missing the 'vitals' readout");
+        assert_eq!(keys.len(), 14, "the twelve shapes plus the custom frame layer plus the vitals readout");
     }
 
     // ── presets are pure, valid data (the tile grid) ────────────────────────────────────────────
@@ -2810,5 +3176,328 @@ mod tests {
             ..Default::default()
         }]);
         assert!(off.render(2, 2, 0.0).iter().all(|&c| c == Rgb::BLACK));
+    }
+
+    // ── Bounds (the sprite substrate) + set_bounds wiring ─────────────────────────────────────────
+
+    #[test]
+    fn bounds_from_region_is_the_enclosing_bbox() {
+        // empty region → the whole board.
+        assert_eq!(Bounds::from_region(&[], 6, 22), Bounds::board(6, 22));
+        assert_eq!(Bounds::board(6, 22), Bounds { row0: 0, col0: 0, rows: 6, cols: 22 });
+        // a contiguous 2×2 block at (1,1) on a 4×4 board (cells 5,6,9,10) → exactly that rect.
+        assert_eq!(
+            Bounds::from_region(&[5, 6, 9, 10], 4, 4),
+            Bounds { row0: 1, col0: 1, rows: 2, cols: 2 }
+        );
+        // scattered cells collapse to the single ENCLOSING bbox: (0,1) and (3,2) on a 4×4 board.
+        assert_eq!(
+            Bounds::from_region(&[1, 14], 4, 4),
+            Bounds { row0: 0, col0: 1, rows: 4, cols: 2 }
+        );
+        // a single cell → a 1×1 rect at that cell.
+        assert_eq!(Bounds::from_region(&[10], 4, 4), Bounds { row0: 2, col0: 2, rows: 1, cols: 1 });
+        // out-of-board indices are ignored; all-out-of-range falls back to the full board.
+        assert_eq!(Bounds::from_region(&[999], 4, 4), Bounds::board(4, 4));
+    }
+
+    #[test]
+    fn compositor_hands_each_layer_its_region_bbox() {
+        use std::cell::Cell as StdCell;
+        use std::rc::Rc;
+
+        // A probe pattern that records the last Bounds the compositor handed it.
+        struct Probe(Rc<StdCell<Option<Bounds>>>);
+        impl Pattern for Probe {
+            fn set_bounds(&mut self, b: Bounds) {
+                self.0.set(Some(b));
+            }
+            fn field(&mut self, rows: u8, cols: u8, _t: f32) -> Field {
+                Field::Scalar(vec![Cell::new(0.0, 0.0); rows as usize * cols as usize])
+            }
+        }
+
+        // a region carving a 2×2 block at (1,1) on a 4×4 board → the layer's bbox is that rect.
+        let seen = Rc::new(StdCell::new(None));
+        let mut comp = Compositor {
+            layers: vec![Layer {
+                pattern: Box::new(Probe(seen.clone())),
+                spectrum: Spectrum::solid(Rgb::new(1, 2, 3)),
+                region: vec![5, 6, 9, 10],
+                blend: Blend::Normal,
+                enabled: true,
+            }],
+        };
+        let _ = comp.render(4, 4, 0.0);
+        assert_eq!(seen.get(), Some(Bounds { row0: 1, col0: 1, rows: 2, cols: 2 }));
+
+        // a region-less layer is handed the whole board.
+        let seen2 = Rc::new(StdCell::new(None));
+        let mut comp2 = Compositor {
+            layers: vec![Layer {
+                pattern: Box::new(Probe(seen2.clone())),
+                spectrum: Spectrum::solid(Rgb::new(1, 2, 3)),
+                region: Vec::new(),
+                blend: Blend::Normal,
+                enabled: true,
+            }],
+        };
+        let _ = comp2.render(4, 4, 0.0);
+        assert_eq!(seen2.get(), Some(Bounds::board(4, 4)));
+    }
+
+    // ── capability flags (registry-driven; no app-side key string-matching) ───────────────────────
+
+    #[test]
+    fn capability_flags_are_registry_driven() {
+        // scalar shapes colour through the spectrum; the full-colour patterns don't.
+        assert!(pattern_has_spectrum("uniform"));
+        assert!(pattern_has_spectrum("meter"));
+        assert!(!pattern_has_spectrum("screen"));
+        assert!(!pattern_has_spectrum("custom"));
+        assert!(!pattern_has_spectrum("vitals"));
+        // only vitals is a data readout.
+        assert!(pattern_is_readout("vitals"));
+        assert!(!pattern_is_readout("meter"));
+        assert!(!pattern_is_readout("screen"));
+        // unknown keys take the safe defaults (show the editor; not a readout).
+        assert!(pattern_has_spectrum("nope"));
+        assert!(!pattern_is_readout("nope"));
+    }
+
+    // ── Vitals — the resolution-independent readout + its live feed ───────────────────────────────
+
+    #[test]
+    fn vitals_readout_fills_bounds_proportionally() {
+        use crate::lighting::{battery_color, Vitals as VSnap};
+        // FULL board, 100% → every column of the board lights the green fill (charging off).
+        let full = render_vitals_bounds(
+            VSnap { battery_pct: 100, charging: false, active_stage: 0, stage_count: 1 },
+            2, 10, Bounds::board(2, 10), 0.0,
+        );
+        assert_eq!(full.len(), 20);
+        assert!(full.iter().all(|&c| c == battery_color(100)), "100% fills the whole rect");
+        // 50% lights the left half (round(0.5×10)=5 columns) across BOTH rows; the rest dark.
+        let half = render_vitals_bounds(
+            VSnap { battery_pct: 50, charging: false, active_stage: 0, stage_count: 1 },
+            2, 10, Bounds::board(2, 10), 0.0,
+        );
+        for row in 0..2 {
+            for col in 0..5 {
+                assert_eq!(half[row * 10 + col], battery_color(50), "col {col} lit");
+            }
+            for col in 5..10 {
+                assert_eq!(half[row * 10 + col], Rgb::BLACK, "col {col} dark");
+            }
+        }
+        // 0% → nothing lit anywhere.
+        let empty = render_vitals_bounds(
+            VSnap { battery_pct: 0, charging: false, active_stage: 0, stage_count: 1 },
+            2, 10, Bounds::board(2, 10), 0.0,
+        );
+        assert!(empty.iter().all(|&c| c == Rgb::BLACK), "0% lights nothing");
+    }
+
+    #[test]
+    fn vitals_readout_is_resolution_independent_and_offset() {
+        use crate::lighting::Vitals as VSnap;
+        // A TINY 1×2 strip still reads: 50% lights exactly one of its two cells (proportional, not a
+        // fixed sprite) — the "looks correct from 1×2 up" guarantee.
+        let tiny = render_vitals_bounds(
+            VSnap { battery_pct: 50, charging: false, active_stage: 0, stage_count: 1 },
+            1, 2, Bounds::board(1, 2), 0.0,
+        );
+        assert_eq!(tiny.len(), 2);
+        assert_ne!(tiny[0], Rgb::BLACK, "the one lit cell");
+        assert_eq!(tiny[1], Rgb::BLACK, "the other stays dark at 50% of two cells");
+        // ANY non-zero battery lights ≥1 cell even on a tiny strip (1% ≠ empty).
+        let one = render_vitals_bounds(
+            VSnap { battery_pct: 1, charging: false, active_stage: 0, stage_count: 1 },
+            1, 2, Bounds::board(1, 2), 0.0,
+        );
+        assert_ne!(one[0], Rgb::BLACK, "1% still lights one cell");
+        // A sub-rect placement paints ONLY inside its bounds, at the right origin: (1,1)+2×2 on a 4×4
+        // board at 100% lights (1,1),(1,2),(2,1),(2,2) and nothing outside.
+        let sub = render_vitals_bounds(
+            VSnap { battery_pct: 100, charging: false, active_stage: 0, stage_count: 1 },
+            4, 4, Bounds { row0: 1, col0: 1, rows: 2, cols: 2 }, 0.0,
+        );
+        for i in 0..16usize {
+            let (r, c) = (i / 4, i % 4);
+            let inside = (1..=2).contains(&r) && (1..=2).contains(&c);
+            if inside {
+                assert_ne!(sub[i], Rgb::BLACK, "cell {i} inside the rect lights");
+            } else {
+                assert_eq!(sub[i], Rgb::BLACK, "cell {i} outside the rect stays dark");
+            }
+        }
+    }
+
+    #[test]
+    fn vitals_readout_charging_alters_the_lit_run() {
+        use crate::lighting::Vitals as VSnap;
+        let off = render_vitals_bounds(
+            VSnap { battery_pct: 60, charging: false, active_stage: 0, stage_count: 1 },
+            2, 10, Bounds::board(2, 10), 0.0,
+        );
+        let on = render_vitals_bounds(
+            VSnap { battery_pct: 60, charging: true, active_stage: 0, stage_count: 1 },
+            2, 10, Bounds::board(2, 10), 0.0,
+        );
+        assert!(off != on, "charging shifts the lit run toward the cyan crest");
+    }
+
+    #[test]
+    fn vitals_pattern_gates_on_a_published_source() {
+        // Serialised: the vitals feed is a process-global, so don't race a test that also publishes.
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // No source published → the board idles dark (a Color field of black), like the quiet meter.
+        crate::lighting::clear_vitals();
+        let mut p = make_pattern("vitals").expect("vitals pattern builds");
+        p.set_bounds(Bounds::board(2, 6));
+        match p.field(2, 6, 0.0) {
+            Field::Color(px) => {
+                assert_eq!(px.len(), 12);
+                assert!(px.iter().all(|&c| c == Rgb::BLACK), "no source → a dark board");
+            }
+            _ => panic!("vitals emits a Color field"),
+        }
+        // Publish a full battery → the readout now lights the board.
+        crate::lighting::publish_vitals(crate::lighting::Vitals {
+            battery_pct: 100,
+            charging: false,
+            active_stage: 0,
+            stage_count: 1,
+        });
+        match p.field(2, 6, 0.0) {
+            Field::Color(px) => {
+                assert!(px.iter().any(|&c| c != Rgb::BLACK), "a published source lights the readout");
+            }
+            _ => panic!("vitals emits a Color field"),
+        }
+        // Leave the global clean for any other test.
+        crate::lighting::clear_vitals();
+    }
+
+    #[test]
+    fn vitals_overlay_screen_lets_the_base_show_through() {
+        // Serialised: the vitals feed is a process-global, so don't race a publisher.
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (rows, cols) = (2u8, 8u8);
+        let base_col = Rgb::new(30, 90, 180);
+        // a solid-lit base beneath a Screen-blended vitals overlay (the vitals preset's default blend).
+        let base = LayerDef {
+            pattern: "uniform".into(),
+            spectrum: Spectrum::solid(base_col),
+            ..Default::default()
+        };
+        let vitals = preset_by_slug("vitals").expect("vitals preset").to_layer();
+        assert_eq!(vitals.blend, Blend::Screen, "the vitals preset overlays with Screen");
+
+        // NO published data → the whole vitals layer is black; Screen's identity is black, so the base
+        // shows THROUGH everywhere — not a black hole punched over the effect.
+        crate::lighting::clear_vitals();
+        let mut comp = Compositor::from_defs(&[base.clone(), vitals.clone()]);
+        let out = comp.render(rows, cols, 0.0);
+        assert!(out.iter().all(|&c| c == base_col), "no-data vitals overlay leaves the base intact");
+
+        // WITH data → the LIT gauge cells modify the output; the empty-track cells pass the base through.
+        crate::lighting::publish_vitals(crate::lighting::Vitals {
+            battery_pct: 50, charging: false, active_stage: 0, stage_count: 1,
+        });
+        let mut comp = Compositor::from_defs(&[base.clone(), vitals.clone()]);
+        let out = comp.render(rows, cols, 0.0);
+        // 50% over 8 cols → the left 4 columns light (screened over the base); the right 4 pass through.
+        let lit = crate::lighting::battery_color(50);
+        let screened = crate::effects::blend_px(base_col, lit, Blend::Screen);
+        assert_ne!(screened, base_col, "a lit gauge cell must differ from the bare base");
+        for row in 0..rows as usize {
+            for col in 0..4usize {
+                assert_eq!(out[row * cols as usize + col], screened, "lit gauge cell modifies the base");
+            }
+            for col in 4..cols as usize {
+                assert_eq!(out[row * cols as usize + col], base_col, "empty-track cell passes the base through");
+            }
+        }
+        crate::lighting::clear_vitals();
+    }
+
+    #[test]
+    fn vitals_readout_single_lit_column_and_crest() {
+        use crate::lighting::{battery_color, Vitals as VSnap};
+        // A rect exactly ONE column wide at 100% lights exactly one column (the lit == 1 path). Not
+        // charging → the flat fill across the column's full height.
+        let flat = render_vitals_bounds(
+            VSnap { battery_pct: 100, charging: false, active_stage: 0, stage_count: 1 },
+            3, 1, Bounds::board(3, 1), 0.0,
+        );
+        assert_eq!(flat.len(), 3);
+        assert!(flat.iter().all(|&c| c == battery_color(100)), "the one column lights the full-height fill");
+        // charging drives the crest lerp over that single lit column (the `lit.max(1)` crest path) → a
+        // different, cyan-shifted colour, and crucially no panic when only one column is lit.
+        let charging = render_vitals_bounds(
+            VSnap { battery_pct: 100, charging: true, active_stage: 0, stage_count: 1 },
+            3, 1, Bounds::board(3, 1), 0.0,
+        );
+        assert!(charging.iter().all(|&c| c != Rgb::BLACK), "the lit column stays lit while charging");
+        assert!(charging != flat, "charging crest-shifts the single lit column");
+    }
+
+    #[test]
+    fn vitals_readout_bounds_exceeding_the_board_are_clipped() {
+        use crate::lighting::Vitals as VSnap;
+        // A placement rect larger than / hanging off the board must CLIP, never index out of bounds.
+        let (rows, cols) = (2u8, 3u8);
+        let px = render_vitals_bounds(
+            VSnap { battery_pct: 100, charging: true, active_stage: 0, stage_count: 1 },
+            rows, cols,
+            Bounds { row0: 1, col0: 2, rows: 9, cols: 9 }, // extends far past the 2×3 board
+            0.4,
+        );
+        assert_eq!(px.len(), rows as usize * cols as usize, "output is always board-sized");
+        // Only the single in-board cell of the oversized rect (row 1, col 2) can light; the rest of the
+        // rect is clipped away. (100% over a 9-wide rect lights all 9 cols, but only col 2 exists here.)
+        for i in 0..px.len() {
+            let (r, c) = (i / cols as usize, i % cols as usize);
+            if r == 1 && c == 2 {
+                assert_ne!(px[i], Rgb::BLACK, "the one in-board cell of the oversized rect lights");
+            } else {
+                assert_eq!(px[i], Rgb::BLACK, "clipped / out-of-rect cells stay dark");
+            }
+        }
+    }
+
+    // ── pure stack / placement helpers ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn selection_after_remove_tracks_the_selection() {
+        // remove BELOW the selection → it decrements to stay on the same layer (len 3 → 2, sel 2 → 1).
+        assert_eq!(selection_after_remove(0, 2, 2), 1, "remove below → decrement");
+        // remove AT the selection (not the last) → index stays, now a different layer (len 3 → 2, sel 1).
+        assert_eq!(selection_after_remove(1, 1, 2), 1, "remove at → clamp only");
+        // remove the LAST, which was selected → clamp down to the new last (len 3 → 2, sel 2 → 1).
+        assert_eq!(selection_after_remove(2, 2, 2), 1, "remove selected last → clamp to new last");
+        // remove ABOVE the selection → nothing shifts (len 3 → 2, sel 0 stays 0).
+        assert_eq!(selection_after_remove(2, 0, 2), 0, "remove above → unchanged");
+        // remove-to-empty → no selection, 0.
+        assert_eq!(selection_after_remove(0, 0, 0), 0, "emptied stack → 0");
+    }
+
+    #[test]
+    fn region_from_rect_math() {
+        // whole-board rect → EMPTY (the canonical region-less full board).
+        assert!(region_from_rect(0, 0, 3, 5, 4, 6).is_empty(), "full board stores empty");
+        // a single cell → exactly that row-major index.
+        assert_eq!(region_from_rect(1, 2, 1, 2, 4, 6), vec![1 * 6 + 2]);
+        // a rect (rows 1..=2, cols 2..=3) on a 4×6 board → the four enclosed cells, row-major.
+        assert_eq!(region_from_rect(1, 2, 2, 3, 4, 6), vec![1 * 6 + 2, 1 * 6 + 3, 2 * 6 + 2, 2 * 6 + 3]);
+        // out-of-order corners describe the SAME rect (the corners get ordered).
+        assert_eq!(region_from_rect(2, 3, 1, 2, 4, 6), region_from_rect(1, 2, 2, 3, 4, 6));
+        // corners off the board are CLAMPED in — a fully-overhanging rect clamps to the whole board → empty.
+        assert!(region_from_rect(-5, -5, 99, 99, 4, 6).is_empty(), "clamps to the whole board → empty");
+        // a partially-overhanging rect clamps to a sub-rect (rows 2..=3, cols 4..=5), not the full board.
+        assert_eq!(region_from_rect(2, 4, 99, 99, 4, 6), vec![2 * 6 + 4, 2 * 6 + 5, 3 * 6 + 4, 3 * 6 + 5]);
+        // a degenerate board → empty, no panic.
+        assert!(region_from_rect(0, 0, 0, 0, 0, 0).is_empty());
     }
 }

@@ -114,10 +114,6 @@ pub struct Imported {
     /// Non-fatal notes (skipped layers, unrecognized GUIDs, fields Neuron can't yet store) for
     /// transparency in the import wizard.
     pub notes: Vec<String>,
-    /// An ADVANCED Chroma composite, mapped onto Neuron Pattern × Spectrum layers (fire→heat,
-    /// colorwheel→radial, …). Animated Synapse stacks ARE the compositor — so they come across as a
-    /// live layer stack instead of being flattened/dropped. Empty for basic/static imports.
-    pub lighting_layers: Vec<crate::pattern::LayerDef>,
 }
 
 impl Imported {
@@ -303,6 +299,8 @@ fn ingest_feature(feat: FeatureGuid, xml: &str, out: &mut Imported) {
             out.profile.disable_alt_tab = on("DisableAltTabState");
             out.profile.disable_win = on("DisableWinState") || on("DisableWindowsKeyState");
             out.profile.disable_alt_f4 = on("DisableAltF4State");
+            // Deliberately the three SYNAPSE chords, not `has_gaming()`: Synapse has no Alt+Esc guard,
+            // so an import never sets it — and the note below reports exactly what Synapse carried.
             if out.profile.disable_alt_tab || out.profile.disable_win || out.profile.disable_alt_f4
             {
                 out.note(format!(
@@ -418,28 +416,48 @@ fn parse_dpi_stages(xml: &str) -> Vec<DpiStage> {
 
 // ─────────────────────────────────────── lighting ingestion ──────────────────────────────────
 
-/// Normalize a `LightingEffects` block into `Profile.lighting` + the compositor layer stack.
-/// `basic` -> the named effect + its first palette colour. `advanced` -> map each animated
-/// `EffectLayer` onto a Neuron compositor layer (fire→fire, colorwheel→colorwheel, reactive→reactive,
-/// audiometer→audiometer, …) AND capture any static layer losslessly as the per-LED paint frame —
-/// nothing is dropped now that every Synapse effect has a host generator.
+/// Normalize a `LightingEffects` block into `Profile.lighting` — the ONE representation, a
+/// `Vec<LayerDef>` stack. `basic` -> a single mapped layer (a preset when the named effect has one,
+/// else a solid `uniform` in the imported colour). `advanced` -> map each animated `EffectLayer` onto a
+/// Neuron compositor layer (fire→heat, colorwheel→radial, reactive→ignite, audiometer→meter, …) AND
+/// capture any static layer losslessly as a `custom` per-LED frame layer — nothing is dropped now that
+/// every Synapse effect has a host generator (or a custom frame).
 fn ingest_lighting(xml: &str, out: &mut Imported) {
     let mode = scalar(xml, "Mode").unwrap_or_default().to_lowercase();
     if mode == "basic" {
+        // BASIC named effect -> ONE LayerDef. We reuse the existing effect→preset path
+        // (`map_synapse_effect` + `pattern::preset_layer`), re-tinting a colour-driven preset to the
+        // imported RzColor. A name with no preset (e.g. "static") falls back to a solid `uniform` in the
+        // imported colour (or the house accent when none was carried).
         let effect = scalar(xml, "Effect").unwrap_or_else(|| "static".to_string());
-        out.profile.lighting = Some(effect.to_lowercase());
-        if let Some(c) = first_rzcolor(xml) {
-            out.profile.color = Some(c.to_hex());
-        }
+        let color = first_rzcolor(xml);
+        let layer = map_synapse_effect(&effect)
+            .and_then(crate::pattern::preset_layer)
+            .map(|mut l| {
+                if synapse_effect_is_colored(&effect) {
+                    if let Some(c) = color {
+                        l.spectrum = l.spectrum.recolored(c);
+                    }
+                }
+                l
+            })
+            .unwrap_or_else(|| crate::pattern::LayerDef {
+                pattern: "uniform".into(),
+                spectrum: crate::spectrum::Spectrum::solid(
+                    color.unwrap_or_else(|| Rgb::new(0x4A, 0xF2, 0xB0)),
+                ),
+                ..Default::default()
+            });
+        out.profile.lighting = vec![layer];
         return;
     }
 
     // ADVANCED: a layered composite. Synapse advanced stacks ARE Neuron's compositor — so we map
     // each EffectLayer onto a Neuron Pattern × Spectrum layer (fire→heat, colorwheel→radial, wave→axis,
     // breathing→uniform+breathe, and the live reactive→ignite / audiometer→meter), instead of dropping
-    // the lot. A STATIC layer is captured losslessly as the per-LED frame (the paint canvas). Only a
-    // name we genuinely don't generate is NOTED — never silently discarded.
-    let mut mapped: Vec<crate::pattern::LayerDef> = Vec::new();
+    // the lot. A STATIC layer is captured losslessly as a `custom` per-LED frame layer. Only a name we
+    // genuinely don't generate is NOTED — never silently discarded.
+    let mut layers: Vec<crate::pattern::LayerDef> = Vec::new();
     let mut unsupported: Vec<String> = Vec::new();
     let mut static_name: Option<String> = None;
     for block in split_blocks(xml, "EffectLayer") {
@@ -447,7 +465,7 @@ fn ingest_lighting(xml: &str, out: &mut Imported) {
             continue;
         };
         if eff.to_lowercase() == "static" {
-            static_name = Some(eff); // handled below as a lossless per-LED frame
+            static_name = Some(eff); // handled below as a lossless `custom` frame layer
             continue;
         }
         match map_synapse_effect(&eff) {
@@ -464,19 +482,17 @@ fn ingest_lighting(xml: &str, out: &mut Imported) {
                 }
                 // SCREEN combines lit layers (so a stack reads as light, not the top one only)
                 layer.blend = crate::effects::Blend::Screen;
-                mapped.push(layer);
+                layers.push(layer);
             }
             None => unsupported.push(eff),
         }
     }
-    let had_layers = !mapped.is_empty();
+    let had_layers = !layers.is_empty();
     if had_layers {
-        out.profile.lighting = Some("composite".to_string());
         out.note(format!(
             "advanced composite imported as {} Neuron layer(s)",
-            mapped.len()
+            layers.len()
         ));
-        out.lighting_layers = mapped;
     }
     if !unsupported.is_empty() {
         out.note(format!(
@@ -485,24 +501,25 @@ fn ingest_lighting(xml: &str, out: &mut Imported) {
             unsupported.join(", ")
         ));
     }
-    // a static layer survives LOSSLESS as the per-LED frame (paint canvas), independent of the stack
+    // a static layer survives LOSSLESS as a `custom` frame layer in the stack (the unified representation)
+    let mut had_frame = false;
     if let Some(name) = static_name {
         let frame = static_layer_frame(xml, &name);
         if !frame.is_empty() {
-            if out.profile.lighting.is_none() {
-                out.profile.lighting = Some("static".to_string());
-            }
-            if let Some(first) = frame.first() {
-                out.profile.color = Some(Rgb::new(first[0], first[1], first[2]).to_hex());
-            }
             let n = frame.len();
-            out.profile.lighting_frame = Some(frame);
+            layers.push(crate::pattern::LayerDef {
+                pattern: "custom".into(),
+                frame,
+                ..Default::default()
+            });
+            had_frame = true;
             out.note(format!(
                 "static layer imported losslessly ({n} per-LED cell(s))"
             ));
         }
     }
-    if !had_layers && out.profile.lighting_frame.is_none() {
+    out.profile.lighting = layers;
+    if !had_layers && !had_frame {
         out.note(
             "no host-renderable lighting in this composite — only reactive/audio layers"
                 .to_string(),
@@ -1415,9 +1432,10 @@ mod tests {
         let mut out = Imported::default();
         ingest_lighting(xml, &mut out);
         // each Synapse effect maps onto its preset's PATTERN: fire→heat, reactive→ignite,
-        // audiometer→meter, colorwheel→radial.
+        // audiometer→meter, colorwheel→radial — landing directly in the profile's layer stack.
         let pats: Vec<&str> = out
-            .lighting_layers
+            .profile
+            .lighting
             .iter()
             .map(|l| l.pattern.as_str())
             .collect();
@@ -1428,11 +1446,10 @@ mod tests {
         );
         // the colour-driven reactive layer took the imported green as a solid spectrum.
         assert_eq!(
-            out.lighting_layers[1].spectrum,
+            out.profile.lighting[1].spectrum,
             crate::spectrum::Spectrum::solid(Rgb::new(0, 255, 0)),
             "reactive recoloured to the imported RzColor"
         );
-        assert_eq!(out.profile.lighting.as_deref(), Some("composite"));
         // none are unsupported -> no "no host pattern" note.
         assert!(
             !out.notes.iter().any(|n| n.contains("no host pattern")),
@@ -1440,7 +1457,7 @@ mod tests {
             out.notes
         );
         // every mapped layer builds a real pattern.
-        for l in &out.lighting_layers {
+        for l in &out.profile.lighting {
             assert!(
                 crate::pattern::make_pattern(&l.pattern).is_some(),
                 "{} resolves to a pattern",
@@ -1484,8 +1501,14 @@ mod tests {
             <Colors><RzColor><Green>255</Green></RzColor></Colors></LightingEffects>"#;
         let mut out = Imported::default();
         ingest_lighting(xml, &mut out);
-        assert_eq!(out.profile.lighting.as_deref(), Some("static"));
-        assert_eq!(out.profile.color.as_deref(), Some("00FF00"), "pure green");
+        // a basic "static" effect has no preset -> one solid `uniform` layer in the imported colour.
+        assert_eq!(out.profile.lighting.len(), 1);
+        assert_eq!(out.profile.lighting[0].pattern, "uniform");
+        assert_eq!(
+            out.profile.lighting[0].spectrum,
+            crate::spectrum::Spectrum::solid(Rgb::new(0, 255, 0)),
+            "pure green"
+        );
     }
 
     // ── Phase-2 fixes: real-file ground truth ──────────────────────────────────────────────────
@@ -1778,8 +1801,8 @@ mod tests {
         );
     }
 
-    /// Fix #6d: an advanced STATIC frame imports losslessly into Profile.lighting_frame (one
-    /// [R,G,B] per painted cell) instead of flattening to a single dominant colour.
+    /// Fix #6d: an advanced STATIC frame imports losslessly as a first-class `custom` layer in the
+    /// profile's lighting stack (one [R,G,B] per painted cell) instead of flattening to one colour.
     #[test]
     fn advanced_static_frame_is_lossless() {
         let xml = r#"<LightingEffects><Mode>advanced</Mode><EffectLayers>
@@ -1791,16 +1814,17 @@ mod tests {
         </EffectLayers></LightingEffects>"#;
         let mut out = Imported::default();
         ingest_lighting(xml, &mut out);
-        assert_eq!(out.profile.lighting.as_deref(), Some("static"));
+        // one custom layer whose frame is the per-LED cells, verbatim.
+        let custom = out
+            .profile
+            .lighting
+            .iter()
+            .find(|l| l.pattern == "custom")
+            .expect("static layer became a custom layer");
         assert_eq!(
-            out.profile.lighting_frame,
-            Some(vec![[255, 0, 0], [0, 255, 0], [0, 0, 255]]),
-            "per-LED frame preserved losslessly"
-        );
-        assert_eq!(
-            out.profile.color.as_deref(),
-            Some("FF0000"),
-            "first cell as fallback swatch"
+            custom.frame,
+            vec![[255, 0, 0], [0, 255, 0], [0, 0, 255]],
+            "per-LED frame preserved losslessly on the custom layer"
         );
     }
 
@@ -1818,25 +1842,20 @@ mod tests {
         let mut out = Imported::default();
         ingest_lighting(&xml, &mut out);
         assert!(
-            !out.lighting_layers.is_empty(),
+            !out.profile.lighting.is_empty(),
             "advanced stack mapped to compositor layers"
         );
         // every mapped layer builds a real pattern (nothing left dangling).
-        for l in &out.lighting_layers {
+        for l in &out.profile.lighting {
             assert!(
                 crate::pattern::make_pattern(&l.pattern).is_some(),
                 "layer {} resolves",
                 l.pattern
             );
         }
-        assert_eq!(
-            out.profile.lighting.as_deref(),
-            Some("composite"),
-            "composite mode set"
-        );
         assert!(
-            out.profile.lighting_frame.is_none(),
-            "no static layer -> no per-LED frame"
+            !out.profile.lighting.iter().any(|l| l.pattern == "custom"),
+            "no static layer -> no custom frame layer"
         );
         assert!(
             !out.notes.iter().any(|n| n.contains("no host generator")),

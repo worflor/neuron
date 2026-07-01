@@ -134,7 +134,11 @@ pub fn apply_profile(name: String, persist: bool) -> Result<ProfileApplyResult, 
     }) {
         return Err("live profile apply unavailable".into());
     }
-    rx.recv_timeout(Duration::from_secs(8))
+    // A profile apply writes several device settings, each a verify-gated HID round-trip. On a WIRELESS
+    // board (dongle latency + a possibly-asleep device) those add up well past a few seconds — an 8s
+    // deadline spuriously "timed out" a save that was merely slow, and the GUI then reverted lighting to
+    // the pre-apply look. 20s lets a slow apply actually land (it still returns the instant it finishes).
+    rx.recv_timeout(Duration::from_secs(20))
         .map_err(|_| format!("profile '{name}' apply timed out"))?
 }
 
@@ -752,7 +756,9 @@ fn apply_profile_live(
     let mut profile =
         neuron::profile::Profile::load(name).map_err(|e| format!("profile '{name}': {e}"))?;
     profile.persist = persist;
-    let report = profile.apply_with_session(devices);
+    // paint_lighting = false: the GUI streams the profile's lighting stack via its live compositor
+    // (on_apply_profile), so painting it here too would fight that stream for the device and stall.
+    let report = profile.apply_with_session(devices, false);
     neuron::profile::set_active(name);
     Ok(ProfileApplyResult {
         name: name.to_string(),
@@ -859,7 +865,7 @@ mod tests {
     #[test]
     fn gaming_policy_roundtrips() {
         let saved = neuron::hook::policy();
-        set_gaming_policy(neuron::writes::GamingMode::from_profile(true, false, false));
+        set_gaming_policy(neuron::writes::GamingMode::from_profile(true, false, false, false));
         assert!(neuron::hook::policy().disable_alt_tab);
         // reset so we don't leak state into other tests.
         set_gaming_policy(neuron::writes::GamingMode::default());

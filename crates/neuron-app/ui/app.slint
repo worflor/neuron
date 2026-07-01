@@ -37,7 +37,7 @@ component NavEntry inherits Rectangle {
     in property <bool> active;
     callback clicked();
     horizontal-stretch: 0;
-    height: 26px;
+    height: Theme.seg-h;
     border-radius: Theme.radius-sm;
     background: active ? Theme.accent-glow : (ta.has-hover ? Theme.well : transparent);
     border-width: Theme.hair;
@@ -62,11 +62,11 @@ component NavEntry inherits Rectangle {
             font-size: Theme.fs-nav;
             font-family: Theme.mono;
             font-weight: root.active ? 700 : 500;
-            letter-spacing: 1.4px;
+            letter-spacing: Theme.track-4;
             vertical-alignment: center;
         }
     }
-    ta := TouchArea { clicked => { root.clicked(); } }
+    ta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.clicked(); } }
 }
 
 // One settling panel slot — the channel switch is a mechanical contact: the leaving panel drops
@@ -170,7 +170,7 @@ export component AppWindow inherits Window {
                         HorizontalLayout {
                             spacing: 8px;
                             Rectangle {
-                                width: 6px; height: 6px; border-radius: 1px;
+                                width: Theme.dot-lg; height: Theme.dot-lg; border-radius: 1px;
                                 y: (parent.height - self.height) / 2;
                                 background: State.runtime-active ? Theme.accent : Theme.text-faint;
                                 animate background { duration: Theme.settle; }
@@ -178,10 +178,10 @@ export component AppWindow inherits Window {
                             Text {
                                 text: "NEURON";
                                 color: Theme.text;
-                                font-size: 13px;
+                                font-size: Theme.fs-title;
                                 font-family: Theme.mono;
                                 font-weight: 700;
-                                letter-spacing: 3px;
+                                letter-spacing: Theme.track-5;
                                 vertical-alignment: center;
                             }
                         }
@@ -222,7 +222,7 @@ export component AppWindow inherits Window {
                                 text: State.active-profile == "—" ? "NO PROFILE" : State.active-profile;
                                 live: State.active-profile != "—";
                                 clickable: true;
-                                clicked => { State.profile-sheet-open = true; }
+                                clicked => { State.refresh-profile-suggestion(); State.profile-sheet-open = true; }
                             }
                         }
                     }

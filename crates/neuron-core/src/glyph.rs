@@ -488,11 +488,97 @@ fn smooth(z: &[C], passes: usize) -> Vec<C> {
     cur
 }
 
-/// Normalize a raw path for recognition: resample to **uniform spacing relative to the
-/// gesture's own size** (`spacing = bbox_diag / cfg.resample`) then lightly smooth.
-/// Speed-invariant (uniform spacing), size-invariant (spacing scales with the gesture),
-/// and short strokes in a compound gesture keep proportional representation — unlike a
-/// fixed-count resample, which lets a long loop swallow a short stroke.
+// ── curvature-arc resampling (the eigenmotion's native coordinate) ───────────────────────────
+// Uniform arc-length is the WRONG coordinate for this engine. The recurrence z[n]=K·z[n-1]−G·z[n-2]
+// is *exact* for constant-angular-rate motion (a circular arc at equal Δθ), so it wants resolution
+// where the path TURNS and needs almost none where it's straight (there K=2, G=1 is already exact).
+// So we resample in `ds + k·|dθ|·mean_step` — arc length blended with turning — which packs samples
+// into cusps and loops and leaves straight runs sparse. Because `dθ` is scale-free and `ds` scales
+// with size, this stays size/speed/translation-invariant, exactly like plain arc length.
+
+/// How hard a bend "pulls" extra samples relative to plain arc length (the `k` above). Higher =
+/// more resolution concentrated in cusps/loops.
+const CURV_K: f64 = 6.0;
+/// Sample-budget growth per full turn (2π) of accumulated turning, on top of the arc-length base.
+const CURV_GROWTH: f64 = 0.5;
+/// Ceiling on that growth (× the arc-length base) so a pathological scribble can't explode the count.
+const CURV_GROWTH_CAP: usize = 3;
+
+/// Per-step curvature-arc weights over `p`: each step's arc length plus `CURV_K·|turn|·mean_step`
+/// (turn = exterior angle at the step's start vertex). Returns `(weights, total_turning)` with
+/// `weights.len() == p.len()-1`. Uniformly resampling in the cumulative weight ([`resample_weighted`])
+/// advances faster through bends, so more samples land where the path curves.
+fn curvature_arc_weights(p: &[C]) -> (Vec<f64>, f64) {
+    let m = p.len();
+    if m < 2 {
+        return (Vec::new(), 0.0);
+    }
+    let mut w: Vec<f64> = (1..m).map(|i| p[i].sub(p[i - 1]).abs()).collect();
+    let mean_step = w.iter().sum::<f64>() / w.len() as f64 + 1e-9;
+    let mut total_turn = 0.0;
+    for i in 1..m - 1 {
+        let (v0, v1) = (p[i].sub(p[i - 1]), p[i + 1].sub(p[i]));
+        if v0.abs() < 1e-9 || v1.abs() < 1e-9 {
+            continue;
+        }
+        let mut dth = v1.arg() - v0.arg();
+        while dth > std::f64::consts::PI {
+            dth -= std::f64::consts::TAU;
+        }
+        while dth < -std::f64::consts::PI {
+            dth += std::f64::consts::TAU;
+        }
+        total_turn += dth.abs();
+        w[i] += CURV_K * dth.abs() * mean_step; // charge the turn to the step leaving vertex i
+    }
+    (w, total_turn)
+}
+
+/// Resample `points` to `n` points equidistant in a cumulative WEIGHT parameter (one weight per step,
+/// `weights.len() == points.len()-1`). [`resample_uniform`] is the special case where each weight is
+/// the step's arc length; a curvature-arc weighting biases the spacing toward bends. Endpoints exact.
+fn resample_weighted(points: &[C], weights: &[f64], n: usize) -> Vec<C> {
+    let m = points.len();
+    if m < 2 || n < 2 || weights.len() != m - 1 {
+        return points.to_vec();
+    }
+    let mut cum = vec![0.0f64; m];
+    for i in 1..m {
+        cum[i] = cum[i - 1] + weights[i - 1].max(0.0);
+    }
+    let total = cum[m - 1];
+    if total <= 1e-9 {
+        return vec![points[0]; n];
+    }
+    let step = total / (n - 1) as f64;
+    let mut out = Vec::with_capacity(n);
+    out.push(points[0]);
+    let mut j = 1usize;
+    for k in 1..n - 1 {
+        let target = step * k as f64;
+        while j < m - 1 && cum[j] < target {
+            j += 1;
+        }
+        let seg = cum[j] - cum[j - 1];
+        let t = if seg > 1e-12 {
+            (target - cum[j - 1]) / seg
+        } else {
+            0.0
+        };
+        out.push(C::new(
+            points[j - 1].re + t * (points[j].re - points[j - 1].re),
+            points[j - 1].im + t * (points[j].im - points[j - 1].im),
+        ));
+    }
+    out.push(points[m - 1]);
+    out
+}
+
+/// Normalize a raw path for recognition: **curvature-arc resample** (samples concentrate where the
+/// path turns — the oscillator's native coordinate) then lightly smooth. Size-, speed-, and
+/// translation-invariant like plain arc-length resampling, but it stops blunting the cusps/loops of
+/// complex strokes — the shredded-into-tiny-blocks jaggedness — because the detail actually gets
+/// sampled. `cfg.resample` still sets the base density; the turning term adds resolution on top.
 pub fn prepare(z: &[C], cfg: &GlyphConfig) -> Vec<C> {
     if z.len() < 3 {
         return z.to_vec();
@@ -503,8 +589,19 @@ pub fn prepare(z: &[C], cfg: &GlyphConfig) -> Vec<C> {
         return z.to_vec();
     }
     let spacing = diag / cfg.resample.max(1) as f64;
-    let n = ((arc / spacing).round() as usize).clamp(8, 4096);
-    smooth(&resample_uniform(z, n), 2)
+    let base = ((arc / spacing).round() as usize).clamp(8, 4096);
+    // Stage 1 — CANONICALIZE DENSITY: a dense uniform-arc pre-resample erases the draw-SPEED bias
+    // (raw sample density depends on how fast you moved), so the turning we measure next is a
+    // property of the SHAPE, not the sampling. This is what keeps the whole thing speed-invariant.
+    let h = (base * 10).clamp(400, 8000);
+    let canon = resample_uniform(z, h);
+    // Stage 2 — weight by arc-length + turning, the eigenmotion's native coordinate.
+    let (weights, total_turn) = curvature_arc_weights(&canon);
+    // Stage 3 — grow the budget mildly with total turning (a line keeps `base`; a busy signature
+    // earns up to CURV_GROWTH_CAP× more), then resample uniformly in the curvature-arc weight.
+    let grown = (base as f64 * (1.0 + CURV_GROWTH * total_turn / std::f64::consts::TAU)) as usize;
+    let n = grown.clamp(8, (base * CURV_GROWTH_CAP).max(64));
+    smooth(&resample_weighted(&canon, &weights, n), 2)
 }
 
 /// The full gesture word for recognition: normalize → **fixed overlapping windows** →
@@ -1680,6 +1777,89 @@ mod tests {
             dtw(&small, &big, &cfg()) < 0.06,
             "size: {}",
             dtw(&small, &big, &cfg())
+        );
+    }
+
+    // ── direct witnesses for `prepare` (the curvature-arc resampler) ──────────────────────────
+
+    /// Center + unit-scale a path (longer axis → 1) so differently-sized strokes compare directly.
+    fn unit_box(z: &[C]) -> Vec<C> {
+        let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+        for c in z {
+            x0 = x0.min(c.re);
+            y0 = y0.min(c.im);
+            x1 = x1.max(c.re);
+            y1 = y1.max(c.im);
+        }
+        let (cx, cy) = ((x0 + x1) * 0.5, (y0 + y1) * 0.5);
+        let s = (x1 - x0).max(y1 - y0).max(1e-9);
+        z.iter()
+            .map(|c| C::new((c.re - cx) / s, (c.im - cy) / s))
+            .collect()
+    }
+
+    #[test]
+    fn prepare_preserves_endpoints() {
+        let z = synth_circle(120, 300.0, std::f64::consts::TAU / 120.0);
+        let p = prepare(&z, &cfg());
+        assert!(p.len() >= 8);
+        // resample_weighted pins the true endpoints; smooth() never moves them.
+        assert!(p[0].sub(z[0]).abs() < 1e-9, "start wandered");
+        assert!(
+            p.last().unwrap().sub(*z.last().unwrap()).abs() < bbox_diag(&z) * 0.03,
+            "end wandered"
+        );
+    }
+
+    #[test]
+    fn prepare_speed_and_size_invariant() {
+        use std::f64::consts::TAU;
+        // the SAME circle, drawn small+slow (dense samples) vs big+fast (sparse). The curvature-arc
+        // resample must yield the same SHAPE — the property the recognizer's invariance rests on.
+        let slow_small = prepare(&synth_circle(320, 90.0, TAU / 320.0), &cfg());
+        let fast_big = prepare(&synth_circle(70, 360.0, TAU / 70.0), &cfg());
+        let a = unit_box(&resample_uniform(&slow_small, 64));
+        let b = unit_box(&resample_uniform(&fast_big, 64));
+        let maxd = a
+            .iter()
+            .zip(&b)
+            .map(|(x, y)| x.sub(*y).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(maxd < 0.08, "prepared shape drifted across size/speed: {maxd}");
+    }
+
+    #[test]
+    fn prepare_concentrates_samples_where_the_path_turns() {
+        // a V: two straight arms, one sharp apex. Curvature-arc resampling must PACK samples at the
+        // apex (fine spacing) and leave the arms coarse — the whole point of the change (uniform
+        // arc-length spaces them evenly and blunts the corner).
+        let p = prepare(&synth_vee(160, 5.0), &cfg());
+        let steps: Vec<f64> = (1..p.len()).map(|i| p[i].sub(p[i - 1]).abs()).collect();
+        let mut sorted = steps.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median = sorted[sorted.len() / 2].max(1e-9);
+        let (mut apex, mut max_turn) = (1usize, 0.0);
+        for i in 1..p.len() - 1 {
+            let (v0, v1) = (p[i].sub(p[i - 1]), p[i + 1].sub(p[i]));
+            if v0.abs() < 1e-9 || v1.abs() < 1e-9 {
+                continue;
+            }
+            let mut d = v1.arg() - v0.arg();
+            while d > std::f64::consts::PI {
+                d -= std::f64::consts::TAU;
+            }
+            while d < -std::f64::consts::PI {
+                d += std::f64::consts::TAU;
+            }
+            if d.abs() > max_turn {
+                max_turn = d.abs();
+                apex = i;
+            }
+        }
+        let local = (steps[apex - 1] + steps[apex.min(steps.len() - 1)]) * 0.5;
+        assert!(
+            local < median * 0.7,
+            "apex not densified: local step {local} vs median {median}"
         );
     }
 

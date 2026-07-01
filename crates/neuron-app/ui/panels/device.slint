@@ -260,7 +260,7 @@ component DeviceLine inherits Rectangle {
         background: root.selected ? Theme.accent : transparent;
         animate background { duration: Theme.quick; }
     }
-    ta := TouchArea { clicked => { root.clicked(); } }
+    ta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.clicked(); } }
     // CARD CONTENT — a flow row: [glyph] [main: identity over data] [backup]. The layout engine places
     // `backup` (the trailing child) flush-right against the card's ACTUAL laid-out width — there is no
     // parent.width arithmetic that can diverge from the rendered width (the flaw that put `backup`
@@ -427,7 +427,7 @@ export component DevicePanel inherits VerticalLayout {
             }
         }
     }
-    Rectangle { height: Theme.hair; background: Theme.line; }
+    Divider {}
     Rectangle { height: Theme.lead-in; }
 
     HorizontalLayout {
@@ -448,8 +448,8 @@ export component DevicePanel inherits VerticalLayout {
             min-width: 440px;
             if State.devices.length == 0 : VerticalLayout {
                 padding-top: 24px; spacing: 6px;
-                Mono { text: "no recognized Razer devices."; color: Theme.text-dim; }
-                Mono { text: "plug one in and press re-scan"; }
+                Mono { text: "no recognized Razer devices"; color: Theme.text-dim; }
+                Mono { text: "plug one in and press scan"; }
             }
             // The cards stack in a plain VerticalLayout (the page-level PanelPage Flickable owns the
             // vertical scroll). The trick that makes this work where every prior attempt failed: a
@@ -509,7 +509,7 @@ export component DevicePanel inherits VerticalLayout {
                 spacing: 16px;
                 Card {
                     VerticalLayout {
-                        padding: 18px;
+                        padding: 12px;
                         spacing: 14px;
                         HorizontalLayout {
                             SectionTitle { text: State.selected-device-kind == "mic" ? "MICROPHONE" : "OUTPUT"; }
@@ -543,7 +543,7 @@ export component DevicePanel inherits VerticalLayout {
                 // (sniper auto-saves + persist is immediate, so they ride their own writes, not apply).
                 if (State.sel-can-dpi || State.sel-can-poll || State.sel-can-light || State.sel-can-store) : Card {
                     VerticalLayout {
-                        padding: 18px;
+                        padding: 12px;
                         spacing: 14px;
                         // header: FEEL · device name (the apply lives up top, joined to SCAN in the head)
                         HorizontalLayout {
@@ -707,7 +707,7 @@ export component DevicePanel inherits VerticalLayout {
                 // mid-game just as much. Its own card, shown for ANY selected HID. Grows by chord.
                 Card {
                     VerticalLayout {
-                        padding: 18px;
+                        padding: 12px;
                         spacing: 13px;
                         SectionTitle { text: "KEY GUARD"; }
                         Mono { text: "swallow OS chords mid-game so they can't yank you out (host-side, no device write)."; color: Theme.text-faint; wrap: word-wrap; }
@@ -780,7 +780,7 @@ export component DevicePanel inherits VerticalLayout {
                 // honest, not faked. (DEBOUNCE is the lone exception: firmware-fixed, not verify-gated.)
                 if State.sel-can-dpi && State.feel-adv-open : Card {
                     VerticalLayout {
-                        padding: 18px;
+                        padding: 12px;
                         spacing: 16px;
                         HorizontalLayout {
                             SectionTitle { text: "HARDWARE WRITES"; }
@@ -929,18 +929,21 @@ export component DevicePanel inherits VerticalLayout {
                                     text: "low";
                                     selected: State.lod-level == 0;
                                     clickable: true;
+                                    enabled: !State.writes-paused;
                                     clicked => { State.lod-level = 0; State.apply-lod(0); }
                                 }
                                 Pill {
                                     text: "medium";
                                     selected: State.lod-level == 1;
                                     clickable: true;
+                                    enabled: !State.writes-paused;
                                     clicked => { State.lod-level = 1; State.apply-lod(1); }
                                 }
                                 Pill {
                                     text: "high";
                                     selected: State.lod-level == 2;
                                     clickable: true;
+                                    enabled: !State.writes-paused;
                                     clicked => { State.lod-level = 2; State.apply-lod(2); }
                                 }
                             }

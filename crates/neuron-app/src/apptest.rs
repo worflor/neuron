@@ -682,7 +682,7 @@ fn app_rule_add_then_remove() {
     shared
         .borrow_mut()
         .rt
-        .save_profile_from_devices("__neuron_test_prof", 800, 1000, 50);
+        .save_profile_from_devices("__neuron_test_prof", 800, 1000, 50, Vec::new());
     st.invoke_add_app_rule("__neuron_test_app".into(), "__neuron_test_prof".into());
     let after_add = st.get_app_rules().row_count();
     assert_eq!(after_add, before + 1, "rule added");

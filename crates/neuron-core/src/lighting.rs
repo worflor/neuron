@@ -14,6 +14,7 @@
 use crate::registry::CommandSpec;
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::sync::{Mutex, OnceLock};
 
 /// 24-bit colour.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -839,7 +840,9 @@ pub fn battery_color(pct: u8) -> Rgb {
 }
 
 /// Cyan accent shared by the DPI pips and the charging crest — the "neuron is talking" highlight.
-const VITALS_CYAN: Rgb = Rgb::new(0, 200, 255);
+/// `pub(crate)` so the resolution-independent `vitals` PATTERN renderer (in `crate::pattern`) shares
+/// the exact charging-crest hue rather than duplicating the magic number.
+pub(crate) const VITALS_CYAN: Rgb = Rgb::new(0, 200, 255);
 
 /// Render the cross-device VITALS surface into a `rows*cols` frame (row-major), the SAME shape every
 /// other effect produces — so it paints through the existing `frame_reports` / custom-display path.
@@ -913,6 +916,47 @@ pub fn render_vitals(v: Vitals, rows: u8, cols: u8, phase: f32) -> Vec<Rgb> {
         put(key, color);
     }
     f
+}
+
+// ── the live VITALS feed: the app pushes, the `vitals` lighting pattern pulls ────────────
+//
+// The cross-device surface above is a PURE function of a [`Vitals`] snapshot. To make it a
+// first-class, compositable LAYER (the `vitals` pattern), the render thread needs the freshest
+// snapshot without threading it through every call. This mirrors the pull providers
+// (`audio_level` / `sys_stats` / `screen_ambient`) EXCEPT the direction: device vitals are PUSHED —
+// the app already reads battery/charge/DPI-stage off its own device I/O — so there's no sampler
+// thread here, just a published latest-snapshot the pattern reads each frame. Before the first
+// publish it reads `None`, and the board idles honestly dark (a live-input pattern with no source,
+// like the quiet audio meter).
+
+/// The latest device-vitals snapshot the app has published, or `None` before the first publish.
+fn vitals_slot() -> &'static Mutex<Option<Vitals>> {
+    static V: OnceLock<Mutex<Option<Vitals>>> = OnceLock::new();
+    V.get_or_init(|| Mutex::new(None))
+}
+
+/// Publish the freshest device vitals for the `vitals` lighting pattern to visualise. The app calls
+/// this whenever it reads a source device's battery / charge / DPI-stage (the same reads that feed
+/// the [`crate::vitals`] battery cards); the pattern reads the latest each frame via [`latest_vitals`].
+/// Cheap (one lock, one copy); overwrites the prior snapshot, so only the newest is ever shown.
+pub fn publish_vitals(v: Vitals) {
+    // poison-tolerant (a panic while another thread held the lock must not wedge the vitals feed) — the
+    // snapshot is plain Copy data, so recovering the guard can't observe a torn value.
+    *vitals_slot().lock().unwrap_or_else(|p| p.into_inner()) = Some(v);
+}
+
+/// The most recently published device vitals, or `None` if nothing has been published yet. The
+/// `vitals` pattern reads this per frame and renders dark on `None` (honest: a live readout with no
+/// source). `pub(crate)` — only the pattern pulls it; the app is the writer via [`publish_vitals`].
+pub(crate) fn latest_vitals() -> Option<Vitals> {
+    *vitals_slot().lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Test-only reset of the published snapshot back to `None`, so a test can exercise the no-source
+/// (idle-dark) path deterministically regardless of what other tests have published into the global.
+#[cfg(test)]
+pub(crate) fn clear_vitals() {
+    *vitals_slot().lock().unwrap_or_else(|p| p.into_inner()) = None;
 }
 
 // ── backend facade: one lighting API over both Chroma eras ──────────────────────────────
@@ -1111,17 +1155,22 @@ impl<'a> Lights<'a> {
         // Vec<Rgb> we can't avoid is the Compositor's `render()` output (it owns the composited frame).
         let mut last_frame: Option<Vec<Rgb>> = None;
         let mut changed: Vec<usize> = Vec::new();
-        let mut last_fps: u32 = 0; // fps is clamped to 1..=60, so 0 forces a full first paint.
+        let mut last_fps: u32 = 0; // fps is clamped to 1..=30, so 0 forces a full first paint.
         let run_start = Instant::now();
         let mut next = run_start; // deadline-pacing anchor (separate from the wall-clock phase).
         while !stop() && run_start.elapsed().as_secs_f64() < secs as f64 {
-            let fps = fps().clamp(1, 60);
+            let fps = fps().clamp(1, 30);
             let dt = Duration::from_millis(1000 / fps as u64);
-            // Quantize wall-clock time to 1/fps steps — the SAME formula the GUI preview runs, so the
-            // on-screen mirror steps in the identical discrete frames the device does (chunky at 6fps,
-            // smooth at 30). Wall-clock (not frame_index/fps) keeps the phase CONTINUOUS when fps is
-            // re-tuned mid-stream — frame_index/fps would jump the moment the divisor changed.
-            let elapsed = (run_start.elapsed().as_secs_f32() * fps as f32).floor() / fps as f32;
+            // Quantize the SHARED render clock to 1/fps steps via the ONE helper the GUI preview also
+            // calls (`quantized_t` off the process-global `render_epoch`), so the on-screen mirror steps
+            // in the identical discrete frames the device does (chunky at 6fps, smooth at 30) — same
+            // epoch + same formula ⇒ the preview provably matches the board. Wall-clock (not
+            // frame_index/fps) keeps the phase CONTINUOUS when fps is re-tuned mid-stream, and the shared
+            // epoch (not this stream's start) means a restart can't jump it.
+            let elapsed = crate::pattern::quantized_t(
+                crate::pattern::render_epoch().elapsed().as_secs_f32(),
+                fps,
+            );
             let frame = comp.render(self.def.rows, self.def.cols, elapsed);
 
             // Which rows differ from what's already on the board? A live fps change re-quantizes the

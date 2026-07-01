@@ -282,9 +282,19 @@ enum ProfileCmd {
         #[arg(long)]
         brightness: Option<u8>,
         #[arg(long)]
-        lighting: Option<String>,
+        disable_alt_tab: bool,
         #[arg(long)]
-        color: Option<String>,
+        disable_win: bool,
+        #[arg(long)]
+        disable_alt_f4: bool,
+        #[arg(long)]
+        disable_alt_esc: bool,
+        #[arg(long)]
+        idle_secs: Option<u32>,
+        #[arg(long)]
+        in_game_wired: Option<u32>,
+        #[arg(long)]
+        in_game_dongle: Option<u32>,
         /// flash to onboard memory on apply (survives with no software running)
         #[arg(long)]
         persist: bool,
@@ -929,7 +939,7 @@ fn profile_cmd(reg: &Registry, action: ProfileCmd) -> Result<()> {
         ProfileCmd::List => {
             let names = neuron::profile::list();
             if names.is_empty() {
-                println!("no profiles (create one: neuron profile save <name> --dpi 1600 --lighting wave)");
+                println!("no profiles (create one: neuron profile save <name> --dpi 1600)");
             }
             for n in names {
                 match Profile::load(&n) {
@@ -947,8 +957,13 @@ fn profile_cmd(reg: &Registry, action: ProfileCmd) -> Result<()> {
             dpi,
             polling,
             brightness,
-            lighting,
-            color,
+            disable_alt_tab,
+            disable_win,
+            disable_alt_f4,
+            disable_alt_esc,
+            idle_secs,
+            in_game_wired,
+            in_game_dongle,
             persist,
         } => {
             let p = Profile {
@@ -957,13 +972,20 @@ fn profile_cmd(reg: &Registry, action: ProfileCmd) -> Result<()> {
                 dpi_stages: Vec::new(),
                 polling_hz: polling,
                 brightness,
-                lighting,
-                color,
+                disable_alt_tab,
+                disable_win,
+                disable_alt_f4,
+                disable_alt_esc,
+                idle_secs,
+                in_game_polling: match (in_game_wired, in_game_dongle) {
+                    (Some(w), Some(d)) => Some((w, d)),
+                    _ => None,
+                },
                 persist,
                 ..Default::default()
             };
             if p.is_empty() {
-                bail!("nothing to save — pass at least one of --dpi/--polling/--brightness/--lighting");
+                bail!("nothing to save — pass at least one setting flag (see 'neuron profile save --help')");
             }
             p.save().map_err(anyhow::Error::msg)?;
             println!("saved profile '{name}': {}", p.summary());
@@ -1015,42 +1037,13 @@ fn profile_cmd(reg: &Registry, action: ProfileCmd) -> Result<()> {
 /// Capture the current live device state into a profile — the no-gimmick Synapse import: read
 /// what's actually on the hardware (which Synapse configured) rather than decrypting its files.
 fn profile_capture(reg: &Registry, name: &str) -> Result<()> {
-    let mut p = Profile {
-        name: name.to_string(),
-        ..Default::default()
-    };
-
-    // numeric settings from the DPI-capable device (the mouse)
-    if let Ok(d) = open_with_command(reg, "dpi") {
-        if let Ok((x, _)) = cap::dpi(&d) {
-            p.dpi = Some(x);
-        }
-        // the FULL DPI stage list (what you cycle), not just the active one
-        if let Ok(s) = d.run("dpi_stages") {
-            p.dpi_stages = decode_dpi_stages(&s);
-        }
-        if let Ok(hz) = cap::polling_rate_hz(&d) {
-            p.polling_hz = Some(hz);
-        }
-        if let Ok(b) = cap::brightness_percent(&d) {
-            p.brightness = Some(b);
-        }
-    }
-
-    // current lighting effect from a matrix device (decode the effect-id byte -> effect name)
-    for (def, pid) in lit_devices(reg)? {
-        let l = def.lighting.as_ref().unwrap();
-        if l.protocol == lighting::Protocol::Matrix {
-            if let Ok(d) = Device::open(def.clone(), pid) {
-                if let Ok(st) = d.run("lighting_state") {
-                    if let Some((k, _)) = l.effects.iter().find(|(_, v)| **v == st[2]) {
-                        p.lighting = Some(k.clone());
-                    }
-                }
-            }
-            break;
-        }
-    }
+    let p = neuron::profile::capture_from_devices(
+        reg,
+        name,
+        neuron::writes::GamingMode::default(),
+        false,
+        0, // the CLI is stateless — no selected device; capability-based first match
+    );
 
     if p.is_empty() {
         bail!(
@@ -2267,6 +2260,8 @@ fn import_export_cmd(file: &str, apply: bool) -> Result<()> {
     if imported.profile.is_empty() {
         println!("\n(profile carries no settable fields — skipping profiles/*.toml write)");
     } else {
+        // The lighting stack rides in the profile itself now (the `lighting` layer list), so a plain
+        // save() persists everything in one TOML write — no frame sidecar to reconcile.
         imported
             .profile
             .save()
@@ -2890,7 +2885,7 @@ fn run_listen(reg: &Registry, seconds: Option<u64>, rt: neuron::controls::Runtim
     let mut switcher = neuron::app_focus::AppFocusSwitch::new();
     let mut tick = 0u32;
 
-    // GamingMode suppression hook (Alt+Tab / Win / Alt+F4). Installed HERE — on the thread that
+    // GamingMode suppression hook (Alt+Tab / Win / Alt+F4 / Alt+Esc). Installed HERE — on the thread that
     // pumps the Raw-Input message loop inside `controls::listen` — because a WH_KEYBOARD_LL hook only
     // fires while its installing thread pumps messages. Policy comes from the ONE shared carrier in
     // `neuron::hook` (set by `profile_apply` -> ProfileSwitch intent, and from a one-shot `profile
@@ -4014,28 +4009,12 @@ mod tests {
 
     #[test]
     fn parses_profile_save_flags() {
-        match parse(&[
-            "neuron",
-            "profile",
-            "save",
-            "fps",
-            "--dpi",
-            "1600",
-            "--lighting",
-            "wave",
-        ]) {
+        match parse(&["neuron", "profile", "save", "fps", "--dpi", "1600"]) {
             Cmd::Profile {
-                action:
-                    ProfileCmd::Save {
-                        name,
-                        dpi,
-                        lighting,
-                        ..
-                    },
+                action: ProfileCmd::Save { name, dpi, .. },
             } => {
                 assert_eq!(name, "fps");
                 assert_eq!(dpi, Some(1600));
-                assert_eq!(lighting.as_deref(), Some("wave"));
             }
             _ => panic!("expected Profile Save"),
         }

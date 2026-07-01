@@ -81,10 +81,11 @@ pub fn parse(path: &str) -> ParseResult {
                     category: "perf",
                 });
             }
-            if let Some(l) = &s.lighting {
+            if !s.lighting.is_empty() {
+                // lighting is the compositor STACK now — the ONE label (custom / preset name / N fx).
                 lines.push(PreviewLine {
                     label: "EFFECT".into(),
-                    detail: l.clone(),
+                    detail: s.lighting_label(),
                     ok: true,
                     category: "lighting",
                 });
@@ -144,6 +145,8 @@ pub fn apply(imp: &Imported) -> Result<String, String> {
             n.to_string()
         }
     };
+    // Lighting rides IN the profile now (the `lighting` layer stack) — there's no separate frame to
+    // persist, so a plain `save()` writes everything in one step.
     if !imp.profile.is_empty() {
         let mut p = imp.profile.clone();
         p.name = name.clone();

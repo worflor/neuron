@@ -46,7 +46,7 @@ component DiagCell inherits Rectangle {
                 font-size: Theme.fs-small;
                 font-family: Theme.mono;
                 font-weight: 700;
-                letter-spacing: 0.8px;
+                letter-spacing: Theme.track-2;
                 vertical-alignment: center;
                 overflow: elide;
             }
@@ -84,7 +84,7 @@ component Def inherits HorizontalLayout {
     in property <string> term;
     in property <string> desc;
     in property <length> term-w: 72px;
-    spacing: 12px;
+    spacing: Theme.gap;
     VerticalLayout { width: root.term-w; Mono { text: root.term; color: Theme.text-mid; } }
     VerticalLayout { horizontal-stretch: 1; Mono { text: root.desc; color: Theme.text-dim; wrap: word-wrap; } }
 }
@@ -838,7 +838,7 @@ component MechAdvantage inherits Rectangle {
                 VerticalLayout {
                     alignment: center;
                     Text {
-                        text: "⚠";
+                        text: "!";
                         color: Theme.warn;
                         font-family: Theme.mono; font-size: Theme.fs-body;
                         vertical-alignment: center;
@@ -970,21 +970,21 @@ export component SettingsPanel inherits VerticalLayout {
     // Rust-side; idle pages cost nothing). The cast itself runs at its own 60fps on the overlay.
     Timer {
         interval: 60ms;
-        running: State.page == 5;
+        running: State.page == 3;
         triggered => { State.material-preview-tick(); }
     }
     PanelHead {
         label: "SYSTEM";
         caption: "set it up, keep it safe, make it yours · prove it works";
     }
-    Rectangle { height: Theme.hair; background: Theme.line; }
+    Divider {}
     Rectangle { height: Theme.lead-in; }
 
     // the page itself scrolls (PanelPage) — no inner whole-panel Flickable.
     VerticalLayout {
         vertical-stretch: 1;   // fill the page height so the ABOUT footer (below) can pin to the bottom
         VerticalLayout {
-            spacing: 22px;
+            spacing: Theme.section-gap;
 
             HorizontalLayout {
                 spacing: Theme.gap-col;
@@ -1161,7 +1161,7 @@ export component SettingsPanel inherits VerticalLayout {
                             Text {
                                 text: "MATERIAL";
                                 color: Theme.text-dim; font-family: Theme.mono; font-size: Theme.fs-small;
-                                font-weight: 700; letter-spacing: 1.2px;
+                                font-weight: 700; letter-spacing: Theme.track-3;
                             }
                             material-grid := Rectangle {
                                 property <length> gap: 10px;
@@ -1218,7 +1218,7 @@ export component SettingsPanel inherits VerticalLayout {
                                     Text {
                                         text: "TUNE";
                                         color: Theme.text-dim; font-family: Theme.mono; font-size: Theme.fs-small;
-                                        font-weight: 700; letter-spacing: 1.2px; vertical-alignment: center;
+                                        font-weight: 700; letter-spacing: Theme.track-3; vertical-alignment: center;
                                     }
                                     Rectangle {}
                                     rta := TouchArea {
@@ -1328,7 +1328,7 @@ export component SettingsPanel inherits VerticalLayout {
                     // the body groups as one block with an even rhythm; tight sub-groups bind a control
                     // to its own caption (toggle↔note, label↔chips) instead of the loose section gap.
                     VerticalLayout {
-                        spacing: 12px;
+                        spacing: Theme.gap;
                         // master switch — the toggle IS the state; no redundant lamp beside it.
                         Toggle {
                             caption: "notifications";
@@ -1456,7 +1456,7 @@ export component SettingsPanel inherits VerticalLayout {
                                 toggled(v) => { State.set-notif-audio(v); }
                             }
                             if State.notif-audio : HorizontalLayout {
-                                spacing: 12px;
+                                spacing: Theme.gap;
                                 VerticalLayout { alignment: center; width: 52px; Mono { text: "VOLUME"; color: Theme.text-dim; } }
                                 VerticalLayout {
                                     alignment: center;
@@ -1473,7 +1473,7 @@ export component SettingsPanel inherits VerticalLayout {
                                 }
                             }
                             if State.notif-audio : HorizontalLayout {
-                                spacing: 12px;
+                                spacing: Theme.gap;
                                 VerticalLayout { alignment: center; width: 52px; Mono { text: "VOICE"; color: Theme.text-dim; } }
                                 Segment {
                                     options: ["PULSE", "WARM", "GLASS"];
@@ -1681,7 +1681,7 @@ export component SettingsPanel inherits VerticalLayout {
         Rectangle { vertical-stretch: 1; min-height: 22px; }
         // ── ABOUT — the instrument's nameplate (version + where it lives), pinned to the bottom ──
         VerticalLayout {
-            spacing: 22px;
+            spacing: Theme.section-gap;
             Divider {}
             HorizontalLayout {
                 spacing: 8px;

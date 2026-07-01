@@ -876,9 +876,9 @@ pub struct GamingMode {
     pub disable_alt_tab: bool,
     pub disable_win: bool,
     pub disable_alt_f4: bool,
-    /// Alt+Esc — cycle windows without the switcher overlay (a stealth task-switch). Set live from the
-    /// Key Guard chips (not from a Synapse import, which has no equivalent), so `from_profile` leaves
-    /// it default-false and the runtime/UI sets it directly.
+    /// Alt+Esc — cycle windows without the switcher overlay (a stealth task-switch). The Key Guard's
+    /// fourth toggle; it has no Synapse-import source but IS a native profile field, so `from_profile`
+    /// takes it alongside the other three.
     pub disable_alt_esc: bool,
 }
 
@@ -895,21 +895,54 @@ pub enum Chord {
     AltEsc,
 }
 
+impl Chord {
+    /// Every chord in canonical order — the single source for iterating the suppressible set (so a
+    /// 5th chord is added in ONE place and every label/summary path picks it up).
+    pub const ALL: [Chord; 4] = [Chord::AltTab, Chord::Win, Chord::AltF4, Chord::AltEsc];
+
+    /// The human label for this chord (what the apply summary / UI shows).
+    pub fn label(self) -> &'static str {
+        match self {
+            Chord::AltTab => "Alt+Tab",
+            Chord::Win => "Win",
+            Chord::AltF4 => "Alt+F4",
+            Chord::AltEsc => "Alt+Esc",
+        }
+    }
+}
+
 impl GamingMode {
-    /// Build from the three profile-imported toggles. `disable_alt_esc` is a live-only guard (no
-    /// Synapse equivalent), so it stays false here and is set on the struct directly by the runtime/UI.
-    pub fn from_profile(disable_alt_tab: bool, disable_win: bool, disable_alt_f4: bool) -> Self {
+    /// Build from a profile's four gaming-mode toggles. `disable_alt_esc` has no *Synapse-import*
+    /// source, but it IS a native profile field (the Key Guard's fourth toggle), so a profile carries
+    /// it and apply restores it like the other three — no more special-cased live-only bolt-on.
+    pub fn from_profile(
+        disable_alt_tab: bool,
+        disable_win: bool,
+        disable_alt_f4: bool,
+        disable_alt_esc: bool,
+    ) -> Self {
         GamingMode {
             disable_alt_tab,
             disable_win,
             disable_alt_f4,
-            disable_alt_esc: false,
+            disable_alt_esc,
         }
     }
     /// True if anything is suppressed (so the daemon only installs the hook when needed).
     pub fn any(&self) -> bool {
         self.disable_alt_tab || self.disable_win || self.disable_alt_f4 || self.disable_alt_esc
     }
+    /// The labels of every chord this policy suppresses, in canonical [`Chord::ALL`] order — the ONE
+    /// source of the apply-summary chord list (so the summary can't drift from `suppresses`).
+    pub fn suppressed_labels(&self) -> Vec<&'static str> {
+        Chord::ALL
+            .iter()
+            .copied()
+            .filter(|c| self.suppresses(*c))
+            .map(|c| c.label())
+            .collect()
+    }
+
     /// Whether a given chord should be swallowed under this policy. The host-side enforcement
     /// primitive: the daemon's hook calls this on each candidate chord.
     pub fn suppresses(&self, chord: Chord) -> bool {
@@ -1335,7 +1368,7 @@ mod tests {
 
     #[test]
     fn gaming_mode_suppresses_only_enabled_chords() {
-        let gm = GamingMode::from_profile(true, false, true);
+        let gm = GamingMode::from_profile(true, false, true, false);
         assert!(gm.any());
         assert!(gm.suppresses(Chord::AltTab));
         assert!(!gm.suppresses(Chord::Win));

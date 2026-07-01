@@ -22,6 +22,17 @@ export component DeviceRender inherits Rectangle {
     in property <bool> editable: false; // PAINT mode — pointer paints cells
     callback paint(int);
     callback erase(int);
+    // PLACE mode — a SEPARATE gesture from the brush (only one is `enabled` at a time; the panel makes
+    // them mutually exclusive). A drag defines a RECTANGLE: the press cell is one corner, the cell under
+    // the cursor the opposite one; on release the enclosed cells become the selected layer's region.
+    in property <bool> placing: false;
+    // the SELECTED layer's COMMITTED region as inclusive corner cells — drawn as a persistent placement
+    // outline while placing (so moving/resizing is obvious). place-r0 < 0 = full board (nothing to outline).
+    in property <int> place-r0: -1;
+    in property <int> place-c0: -1;
+    in property <int> place-r1: -1;
+    in property <int> place-c1: -1;
+    callback place-region(int, int, int, int); // (row0, col0, row1, col1) on release — the enclosed rect, normalised
 
     // a mouse with a handful of LEDs is ZONES on a body, not a lattice (honest geometry).
     property <bool> zone-mode: root.kind == "mouse" && root.rows * root.cols <= 4;
@@ -87,6 +98,27 @@ export component DeviceRender inherits Rectangle {
                     ? Theme.text-faint : Theme.line-soft;
             }
 
+            // the PLACEMENT rectangle — the live drag (bright) while placing, else the selected layer's
+            // committed region (persistent), shown ONLY while in place mode so the normal render stays
+            // calm. Reuses the active-cell ink (accent line + glow) and the render's OWN cell math, so it
+            // snaps to the exact lattice the caps sit on. A plain Rectangle never grabs input, so it can't
+            // shadow the placer beneath it.
+            if root.placing && (placer.dragging || root.place-r0 >= 0) : Rectangle {
+                property <bool> live: placer.dragging;                       // dragging wins over the committed outline
+                property <int> r0: self.live ? min(placer.ar, placer.cr) : root.place-r0;
+                property <int> c0: self.live ? min(placer.ac, placer.cc) : root.place-c0;
+                property <int> r1: self.live ? max(placer.ar, placer.cr) : root.place-r1;
+                property <int> c1: self.live ? max(placer.ac, placer.cc) : root.place-c1;
+                x: field.ox + self.c0 * (field.cell + field.gap) - 3px;
+                y: field.oy + self.r0 * (field.cell + field.gap) - 3px;
+                width: (self.c1 - self.c0) * (field.cell + field.gap) + field.cell + 6px;
+                height: (self.r1 - self.r0) * (field.cell + field.gap) + field.cell + 6px;
+                border-radius: Theme.radius-sm;
+                border-width: 1.5px;
+                border-color: Theme.accent;
+                background: Theme.accent-glow;
+            }
+
             brush := TouchArea {
                 enabled: root.editable;
                 mouse-cursor: root.editable ? MouseCursor.crosshair : MouseCursor.default;
@@ -105,6 +137,50 @@ export component DeviceRender inherits Rectangle {
                     }
                 }
                 moved => { if (self.pressed) { root.paint(self.cell-at(self.mouse-x, self.mouse-y)); } }
+            }
+
+            // PLACE gesture — declared LAST so it sits ON TOP when enabled; when disabled a TouchArea is
+            // transparent to input, so the brush beneath still works when NOT placing (only one of the two
+            // is ever `enabled`). Mirrors the brush's cell math (row-at / col-at ≡ cell-at split into axes)
+            // so the dragged rectangle snaps to the same lattice. Commits the enclosed rect on release.
+            placer := TouchArea {
+                enabled: root.placing;
+                mouse-cursor: root.placing ? MouseCursor.crosshair : MouseCursor.default;
+                property <bool> dragging: false;   // a rectangle is being dragged out right now
+                property <int> ar;                 // anchor cell row (the press corner)
+                property <int> ac;                 // anchor cell col
+                property <int> cr;                 // current cell row (the live opposite corner)
+                property <int> cc;                 // current cell col
+                function row-at(my: length) -> int {
+                    return clamp(floor((my - field.oy) / (field.cell + field.gap)), 0, root.rows - 1);
+                }
+                function col-at(mx: length) -> int {
+                    return clamp(floor((mx - field.ox) / (field.cell + field.gap)), 0, root.cols - 1);
+                }
+                pointer-event(ev) => {
+                    if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.left) {
+                        self.ar = self.row-at(self.mouse-y);
+                        self.ac = self.col-at(self.mouse-x);
+                        self.cr = self.ar;
+                        self.cc = self.ac;
+                        self.dragging = true;
+                    } else if (ev.kind == PointerEventKind.up && self.dragging) {
+                        self.dragging = false;
+                        // require actual movement: a stray click (end cell == the anchor) commits NOTHING,
+                        // so it can't collapse the layer to a 1×1 region. A real drag normalises its two
+                        // corners into (min, max) so a drag in ANY direction is a valid rect.
+                        if (self.cr != self.ar || self.cc != self.ac) {
+                            root.place-region(min(self.ar, self.cr), min(self.ac, self.cc),
+                                              max(self.ar, self.cr), max(self.ac, self.cc));
+                        }
+                    }
+                }
+                moved => {
+                    if (self.pressed && self.dragging) {
+                        self.cr = self.row-at(self.mouse-y);
+                        self.cc = self.col-at(self.mouse-x);
+                    }
+                }
             }
         }
     }

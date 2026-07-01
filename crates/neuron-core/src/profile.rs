@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use crate::capability::{self as cap, Store};
 use crate::device::Device;
-use crate::lighting::{self, Effect, Lights, Rgb};
+use crate::lighting::{self, Lights};
 use crate::registry::{DeviceDef, Registry};
 use crate::transport;
 use crate::writes::{self, DpiStage, GamingMode};
@@ -26,20 +26,12 @@ pub struct Profile {
     pub polling_hz: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub brightness: Option<u8>,
-    /// lighting effect name (static/spectrum/wave/...).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub lighting: Option<String>,
-    /// base colour for the effect, "RRGGBB".
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub color: Option<String>,
-    /// A lossless **per-LED static lighting frame** — one `[R, G, B]` per LED, in the device's
-    /// LED order. This is how an *advanced* Synapse Chroma import survives intact: when a static
-    /// `advanced` frame can't be flattened to a named effect + single colour without loss, the
-    /// importer stores the exact cells here. `lighting` may still name "custom"/"static" as the
-    /// effect; when `lighting_frame` is set, apply paints these cells via the custom-frame path.
-    /// (Reactive/animated layers are still dropped — only a static frame is lossless as data.)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub lighting_frame: Option<Vec<[u8; 3]>>,
+    /// The lighting look as ONE representation: a bottom-up stack of compositor layers (each a
+    /// pattern × spectrum, or a `custom` hand-painted/imported per-key frame). Empty = the profile
+    /// doesn't touch lighting. This is the single source of truth — no named-effect string, no frame
+    /// sidecar; `apply` renders the stack once and paints it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lighting: Vec<crate::pattern::LayerDef>,
     /// flash settings to the device's ONBOARD memory (survive with no software running) vs
     /// apply them only to the running session.
     #[serde(default)]
@@ -63,6 +55,11 @@ pub struct Profile {
     /// Gaming-mode: disable Alt+F4 while active.
     #[serde(default, skip_serializing_if = "is_false")]
     pub disable_alt_f4: bool,
+    /// Gaming-mode: disable Alt+Esc (the quiet task-switch that still yanks focus) while active.
+    /// Unlike the other three this has NO Synapse-import source, but it IS a first-class NATIVE
+    /// profile field — the Key Guard's fourth toggle, captured and applied like the rest.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub disable_alt_esc: bool,
 }
 
 /// serde `skip_serializing_if` helper: omit a `false` bool so a profile that doesn't set a
@@ -76,6 +73,15 @@ impl Profile {
         PathBuf::from("profiles").join(format!("{}.toml", sanitize(name)))
     }
 
+    /// The canonical on-disk KEY that two display names collide on: the sanitized filename stem,
+    /// case-folded. `path()` sanitizes (every non-alphanumeric/-/_ → `_`) and Windows' filesystem is
+    /// case-insensitive, so `"my game/2"` and `"my_game_2"` — and `"Valorant"` and `"valorant"` — all
+    /// resolve to the SAME `.toml`. Overwrite/de-collision checks MUST compare this, not the raw name,
+    /// or the "capture vs overwrite" button lies and a save silently clobbers an existing profile.
+    pub fn file_key(name: &str) -> String {
+        sanitize(name).to_lowercase()
+    }
+
     pub fn load(name: &str) -> anyhow::Result<Profile> {
         let p = Self::path(name);
         let s = std::fs::read_to_string(&p)
@@ -83,11 +89,12 @@ impl Profile {
         Ok(toml::from_str(&s)?)
     }
 
+    /// Persist the profile as plain TOML. Lighting lives in the profile itself now (the `lighting`
+    /// layer stack), so there is no sidecar to reconcile — one write, done.
     pub fn save(&self) -> Result<(), String> {
         std::fs::create_dir_all("profiles").map_err(|e| e.to_string())?;
         let s = toml::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(Self::path(&self.name), s).map_err(|e| e.to_string())?;
-        Ok(())
+        std::fs::write(Self::path(&self.name), s).map_err(|e| e.to_string())
     }
 
     /// True if the profile sets nothing (useful guard before save).
@@ -96,13 +103,42 @@ impl Profile {
             && self.dpi_stages.is_empty()
             && self.polling_hz.is_none()
             && self.brightness.is_none()
-            && self.lighting.is_none()
-            && self.lighting_frame.is_none()
+            && self.lighting.is_empty()
             && self.idle_secs.is_none()
             && self.in_game_polling.is_none()
-            && !self.disable_alt_tab
-            && !self.disable_win
-            && !self.disable_alt_f4
+            && !self.has_gaming()
+    }
+
+    /// Whether ANY host-side gaming-mode guard is set — the ONE definition of "this profile suppresses
+    /// system key-chords". `is_empty`, `summary`, and the sheet's saved-row badge all consult this, so
+    /// adding a 5th chord updates one place and no call site can silently forget it. (The LIVE-preview
+    /// mirror of this predicate is `State.gaming-live` in the UI, derived over the same four flags.)
+    pub fn has_gaming(&self) -> bool {
+        self.disable_alt_tab || self.disable_win || self.disable_alt_f4 || self.disable_alt_esc
+    }
+
+    /// A short human label for the lighting stack — the ONE source both `summary()` and the profile
+    /// sheet's row badge consult, so a profile's lighting reads the SAME everywhere (no "1 fx" here vs
+    /// "Axis" there). A hand-painted/imported frame is `"custom"`; a lone procedural layer names its
+    /// PRESET (e.g. `"wave"`, matching the live effect label) — falling back to the pattern label —
+    /// and a taller stack counts its layers. `""` when the profile sets no lighting.
+    pub fn lighting_label(&self) -> String {
+        if self.lighting.is_empty() {
+            String::new()
+        } else if self.lighting.iter().any(|l| l.pattern == "custom") {
+            "custom".to_string()
+        } else if self.lighting.len() == 1 {
+            crate::pattern::slug_for_layer(&self.lighting[0])
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| {
+                    let key = self.lighting[0].pattern.as_str();
+                    crate::pattern::pattern_def(key)
+                        .map(|d| d.label.to_string())
+                        .unwrap_or_else(|| key.to_string())
+                })
+        } else {
+            format!("{} fx", self.lighting.len())
+        }
     }
 
     pub fn summary(&self) -> String {
@@ -119,12 +155,22 @@ impl Profile {
         if let Some(b) = self.brightness {
             parts.push(format!("bright {b}%"));
         }
-        if let Some(l) = &self.lighting {
-            parts.push(match &self.color {
-                Some(c) => format!("light {l}#{c}"),
-                None => format!("light {l}"),
-            });
+        if !self.lighting.is_empty() {
+            parts.push(format!("light {}", self.lighting_label()));
         }
+        if let Some(s) = self.idle_secs {
+            parts.push(format!("idle {s}s"));
+        }
+        if let Some((wired, dongle)) = self.in_game_polling {
+            parts.push(format!("in-game {wired}/{dongle}Hz"));
+        }
+        // host-side gaming suppression is real content — without this a gaming-ONLY profile summarizes
+        // as "(empty)" (a lie that mislabels it in the CLI list + the sheet row, inviting a wrong delete).
+        if self.has_gaming() {
+            parts.push("gaming".into());
+        }
+        // INVARIANT: summary() names every field is_empty() counts, so "(empty)" appears IFF the
+        // profile is truly empty. `summary_matches_is_empty` guards this against future field drift.
         if parts.is_empty() {
             "(empty)".into()
         } else {
@@ -147,12 +193,18 @@ impl Profile {
     /// surfaces as a `skipped`/error note, never a fabricated success.
     pub fn apply(&self, reg: &Registry) -> ApplyReport {
         let mut devices = crate::device::DeviceSession::new(reg);
-        self.apply_with_session(&mut devices)
+        // A one-shot apply (CLI / headless) has no live compositor stream, so it PAINTS the lighting.
+        self.apply_with_session(&mut devices, true)
     }
 
+    /// Apply every set field to the connected devices. `paint_lighting` controls the lighting stage:
+    /// a headless caller (CLI one-shot) passes `true` to render+paint the stack once; the GUI passes
+    /// `false` because it drives lighting through its LIVE compositor stream instead — painting here
+    /// would fight that stream for the device (two writers → a stalled HID write → apply timeout).
     pub fn apply_with_session(
         &self,
         devices: &mut crate::device::DeviceSession<'_>,
+        paint_lighting: bool,
     ) -> ApplyReport {
         let mut r = ApplyReport::default();
         let store = Store::from_persist(self.persist);
@@ -243,45 +295,21 @@ impl Profile {
             }
         }
 
-        // --- Named lighting effect. -----------------------------------------------------------
-        if let Some(light) = &self.lighting {
-            match Effect::from_name(light) {
-                Some(e) => {
-                    let col = self.color.as_deref().and_then(Rgb::parse);
-                    let mut any = false;
-                    for (def, pid, path) in lit_devices(devices.registry()) {
-                        if let Ok(d) = Device::open_path(def.clone(), pid, &path) {
-                            let l = def.lighting.clone().expect("lit device has lighting");
-                            let lights = Lights::new(&d, l);
-                            let _ = lights.ensure_control();
-                            if lights.set_effect(e, col, self.persist).is_ok() {
-                                any = true;
-                            }
-                        }
-                    }
-                    if any {
-                        r.applied.push(format!("lighting {light}"));
-                    } else {
-                        r.skipped.push(format!("lighting {light}: no lit device"));
-                    }
-                }
-                None => r.skipped.push(format!(
-                    "lighting '{light}': animated effect — use `lighting run`, not a profile"
-                )),
-            }
-        }
-
-        // --- Per-LED static frame (lossless `advanced` Chroma import / grid editor). -----------
-        if let Some(frame) = &self.lighting_frame {
+        // --- Lighting: render the layer stack once and paint it onto every lit device. ----------
+        // ONE representation — a static/imported frame is just a `custom` layer, a procedural look is
+        // its pattern×spectrum layers. We composite the stack at t=0 (a profile captures a still, not a
+        // running animation) and paint the resulting canvas.
+        if paint_lighting && !self.lighting.is_empty() {
             let mut any = false;
             for (def, pid, path) in lit_devices(devices.registry()) {
                 if let Ok(d) = Device::open_path(def.clone(), pid, &path) {
                     let l = def.lighting.clone().expect("lit device has lighting");
+                    let cells = crate::pattern::Compositor::from_defs(&self.lighting)
+                        .render(l.rows, l.cols, 0.0);
                     let mut canvas = lighting::Canvas::new(l.rows, l.cols);
-                    let n = canvas.px.len();
-                    for (i, px) in canvas.px.iter_mut().enumerate().take(n) {
-                        if let Some([rr, gg, bb]) = frame.get(i) {
-                            *px = Rgb::new(*rr, *gg, *bb);
+                    for (i, px) in canvas.px.iter_mut().enumerate() {
+                        if let Some(c) = cells.get(i) {
+                            *px = *c;
                         }
                     }
                     let lights = Lights::new(&d, l);
@@ -293,18 +321,19 @@ impl Profile {
             }
             if any {
                 r.applied
-                    .push(format!("lighting frame {} cells", frame.len()));
+                    .push(format!("lighting {} layer(s)", self.lighting.len()));
             } else {
-                r.skipped.push(format!(
-                    "lighting frame {} cells: no lit device",
-                    frame.len()
-                ));
+                r.skipped.push("lighting: no lit device".into());
             }
         }
 
         // --- Gaming-mode: HOST-SIDE policy (no device write). The daemon installs the LL hook. ---
-        r.gaming_mode =
-            GamingMode::from_profile(self.disable_alt_tab, self.disable_win, self.disable_alt_f4);
+        r.gaming_mode = GamingMode::from_profile(
+            self.disable_alt_tab,
+            self.disable_win,
+            self.disable_alt_f4,
+            self.disable_alt_esc,
+        );
 
         r
     }
@@ -331,17 +360,10 @@ impl ApplyReport {
     pub fn summary(&self) -> String {
         let mut parts = self.applied.clone();
         if self.gaming_mode.any() {
-            let mut g = Vec::new();
-            if self.gaming_mode.disable_alt_tab {
-                g.push("Alt+Tab");
-            }
-            if self.gaming_mode.disable_win {
-                g.push("Win");
-            }
-            if self.gaming_mode.disable_alt_f4 {
-                g.push("Alt+F4");
-            }
-            parts.push(format!("gaming-mode (suppress {}, host-side)", g.join("+")));
+            parts.push(format!(
+                "gaming-mode (suppress {}, host-side)",
+                self.gaming_mode.suppressed_labels().join("+")
+            ));
         }
         for s in &self.gated {
             parts.push(format!("{s} [gated]"));
@@ -377,6 +399,98 @@ fn lit_devices(reg: &Registry) -> Vec<(DeviceDef, u16, transport::DevicePath)> {
     out
 }
 
+/// Open the device the caller SELECTED by pid (the GUI passes its `selected_pid` so capture reads the
+/// device the user picked on a multi-device rig). `pid == 0` means "no selection" → returns `None` so
+/// the caller falls back to a capability search; `None` too if that pid isn't a connected, recognized
+/// control device.
+fn open_selected_device(reg: &Registry, pid: u16) -> Option<Device> {
+    if pid == 0 {
+        return None;
+    }
+    for i in transport::enumerate().ok()? {
+        if i.pid == pid {
+            if let Some(def) = reg.find_by_pid(i.vid, i.pid) {
+                if def.matches_control(i.usage_page, i.usage, i.feature_len) {
+                    return Device::open_path(def.clone(), i.pid, &i.path).ok();
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Capture the CURRENT connected-device state into a [`Profile`] — the shared read path both the CLI
+/// `profile save` and the GUI's "capture" button call, so a captured profile is byte-identical no
+/// matter which client took it. Reads only; each capability is best-effort (an absent/asleep device
+/// simply leaves that field `None`). `gaming` carries the host-side Key-Guard toggles (not a device
+/// read) and `persist` records the volatile-vs-onboard intent. `selected_pid` is the GUI's picked
+/// device (0 = no selection → capability-based first match, which is what the stateless CLI passes).
+pub fn capture_from_devices(
+    reg: &Registry,
+    name: &str,
+    gaming: crate::writes::GamingMode,
+    persist: bool,
+    selected_pid: u16,
+) -> Profile {
+    let mut p = Profile {
+        name: name.to_string(),
+        persist,
+        disable_alt_tab: gaming.disable_alt_tab,
+        disable_win: gaming.disable_win,
+        disable_alt_f4: gaming.disable_alt_f4,
+        disable_alt_esc: gaming.disable_alt_esc,
+        ..Default::default()
+    };
+    // Numeric settings come from the SELECTED device when the GUI picked one (so a multi-device rig
+    // captures the device the user is looking at, not whatever enumerates first); with no selection
+    // (the stateless CLI, pid 0) fall back to the first dpi-capable device.
+    let numeric = open_selected_device(reg, selected_pid)
+        .or_else(|| Device::open_with_command(reg, "dpi").ok());
+    if let Some(d) = numeric {
+        if let Ok((x, _)) = crate::capability::dpi(&d) {
+            p.dpi = Some(x);
+        }
+        if let Ok(s) = d.run("dpi_stages") {
+            p.dpi_stages = decode_dpi_stages(&s);
+        }
+        if let Ok(hz) = crate::capability::polling_rate_hz(&d) {
+            p.polling_hz = Some(hz);
+        }
+        if let Ok(b) = crate::capability::brightness_percent(&d) {
+            p.brightness = Some(b);
+        }
+        if let Ok(secs) = crate::capability::idle_timeout_secs(&d) {
+            p.idle_secs = Some(secs as u32);
+        }
+    }
+    // Lighting is NOT captured from raw device state: the profile's lighting is a `Vec<LayerDef>`
+    // stack and core can't synthesize that from a device's current effect register. `p.lighting` stays
+    // at its default (empty) — a captured profile leaves lighting alone unless the caller sets a stack.
+    p
+}
+
+/// Decode a DPI stage-table getter reply into the list of X resolutions (the cycle) — the inverse of
+/// `writes::build_dpi_stages_payload`, matching the device layout
+/// `[varstore, active_idx, count, {stage_id, X_hi, X_lo, Y_hi, Y_lo, 0, 0} * count]`. Zero-DPI
+/// records (empty hardware slots) are skipped. Pure (slice in, Vec out) so it needs no hardware.
+fn decode_dpi_stages(s: &[u8]) -> Vec<u16> {
+    if s.len() < 3 {
+        return Vec::new();
+    }
+    let count = s[2] as usize;
+    let mut out = Vec::new();
+    for i in 0..count {
+        let off = 3 + i * 7;
+        if off + 2 < s.len() {
+            let x = ((s[off + 1] as u16) << 8) | s[off + 2] as u16;
+            if x > 0 {
+                out.push(x);
+            }
+        }
+    }
+    out
+}
+
 /// Names of all saved profiles.
 pub fn list() -> Vec<String> {
     let mut out = Vec::new();
@@ -385,6 +499,13 @@ pub fn list() -> Vec<String> {
             let p = e.path();
             if p.extension().and_then(|x| x.to_str()) == Some("toml") {
                 if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                    // Skip SIDECARS: rules/frame live beside the profile as `<name>.rules.toml` /
+                    // `<name>.frame.toml`, so their file_stem still carries `.rules` / `.frame`. A
+                    // real profile file is `<sanitized>.toml`, and sanitize() maps every `.` to `_`
+                    // — so a dot in the stem means it's a sidecar, never a profile.
+                    if stem.contains('.') {
+                        continue;
+                    }
                     out.push(stem.to_string());
                 }
             }
@@ -508,8 +629,11 @@ mod tests {
             dpi_stages: vec![800, 16000],
             polling_hz: Some(1000),
             brightness: None,
-            lighting: Some("static".into()),
-            color: Some("FF0000".into()),
+            lighting: vec![crate::pattern::LayerDef {
+                pattern: "custom".into(),
+                frame: vec![[255, 0, 0]],
+                ..Default::default()
+            }],
             persist: true,
             ..Default::default()
         };
@@ -523,7 +647,6 @@ mod tests {
             "unset in_game_polling omitted"
         );
         assert!(!s.contains("disable_alt_tab"), "unset bool omitted");
-        assert!(!s.contains("lighting_frame"), "unset frame omitted");
         let back: Profile = toml::from_str(&s).unwrap();
         assert_eq!(back, p);
     }
@@ -548,13 +671,83 @@ mod tests {
         let p = Profile {
             name: "n".into(),
             dpi: Some(800),
-            lighting: Some("wave".into()),
+            lighting: vec![crate::pattern::LayerDef {
+                pattern: "axis".into(),
+                ..Default::default()
+            }],
             ..Default::default()
         };
         let s = p.summary();
         assert!(s.contains("dpi 800"));
-        assert!(s.contains("light wave"));
+        // a lone procedural layer summarises by its pattern label (axis → "Axis").
+        assert!(s.contains("light Axis"), "summary: {s}");
         assert!(!s.contains("Hz"));
+    }
+
+    #[test]
+    fn summary_names_a_gaming_only_profile() {
+        // a profile that only captures host-side gaming suppression is NOT empty and must not
+        // summarize as "(empty)" — it has real behavior (shown in the sheet row + the CLI list).
+        let p = Profile {
+            name: "g".into(),
+            disable_alt_tab: true,
+            ..Default::default()
+        };
+        assert!(!p.is_empty());
+        assert_eq!(p.summary(), "gaming");
+    }
+
+    #[test]
+    fn summary_matches_is_empty() {
+        // the invariant that keeps the sheet + CLI honest: "(empty)" appears IFF is_empty(). Each
+        // case is non-empty in exactly ONE way — the advanced/imported classes that used to mislabel.
+        let cases = [
+            Profile {
+                name: "altesc".into(),
+                disable_alt_esc: true,
+                ..Default::default()
+            },
+            Profile {
+                name: "idle".into(),
+                idle_secs: Some(60),
+                ..Default::default()
+            },
+            Profile {
+                name: "ingame".into(),
+                in_game_polling: Some((1000, 500)),
+                ..Default::default()
+            },
+            Profile {
+                name: "game".into(),
+                disable_win: true,
+                ..Default::default()
+            },
+        ];
+        for p in &cases {
+            assert!(!p.is_empty(), "case '{}' should be non-empty", p.name);
+            assert_ne!(
+                p.summary(),
+                "(empty)",
+                "non-empty '{}' summarized as (empty)",
+                p.name
+            );
+        }
+        // the converse: a truly-empty profile IS "(empty)".
+        let empty = Profile {
+            name: "e".into(),
+            ..Default::default()
+        };
+        assert!(empty.is_empty());
+        assert_eq!(empty.summary(), "(empty)");
+    }
+
+    #[test]
+    fn file_key_collides_on_the_sanitized_case_folded_path() {
+        // distinct DISPLAY names that Profile::path maps to the same .toml must share a file_key —
+        // the key the overwrite/de-collision checks compare, so the button can't mislabel a clobber.
+        assert_eq!(Profile::file_key("my game/2"), Profile::file_key("my_game_2"));
+        assert_eq!(Profile::file_key("Valorant"), Profile::file_key("valorant"));
+        assert_ne!(Profile::file_key("apex"), Profile::file_key("valorant"));
     }
 
     #[test]
@@ -588,15 +781,19 @@ mod tests {
 
     #[test]
     fn new_fields_round_trip() {
-        // The advanced-import fields: idle, in-game polling pair, gaming-mode toggles, per-LED frame.
+        // The advanced-import + native fields: idle, in-game polling pair, all four gaming toggles.
         let p = Profile {
             name: "advanced".into(),
             idle_secs: Some(300),
             in_game_polling: Some((1000, 500)),
             disable_alt_tab: true,
             disable_win: true,
-            lighting: Some("custom".into()),
-            lighting_frame: Some(vec![[255, 0, 0], [0, 255, 0], [0, 0, 255]]),
+            disable_alt_esc: true,
+            lighting: vec![crate::pattern::LayerDef {
+                pattern: "custom".into(),
+                frame: vec![[1, 2, 3], [4, 5, 6]],
+                ..Default::default()
+            }],
             ..Default::default()
         };
         let s = toml::to_string_pretty(&p).unwrap();
@@ -618,7 +815,6 @@ mod tests {
 name = "legacy"
 dpi = 800
 polling_hz = 1000
-lighting = "wave"
 persist = false
 "#;
         let p: Profile = toml::from_str(old).unwrap();
@@ -627,7 +823,39 @@ persist = false
         assert_eq!(p.idle_secs, None);
         assert_eq!(p.in_game_polling, None);
         assert!(!p.disable_alt_tab && !p.disable_win && !p.disable_alt_f4);
-        assert!(p.lighting_frame.is_none());
+        assert!(!p.disable_alt_esc);
+    }
+
+    #[test]
+    fn list_excludes_sidecars() {
+        // list() returns real profiles only — never a `<name>.rules.toml` sidecar sharing the dir. A
+        // real profile's stem never carries a dot (sanitize maps `.`→`_`), so the guard is robust to
+        // whatever else the test dir holds at the time.
+        Profile {
+            name: "t_list_sc".into(),
+            dpi: Some(800),
+            ..Default::default()
+        }
+        .save()
+        .unwrap();
+        // Drop a rules sidecar beside it by hand (list() must skip the `.rules`-stemmed file).
+        std::fs::create_dir_all("profiles").unwrap();
+        std::fs::write(
+            PathBuf::from("profiles").join("t_list_sc.rules.toml"),
+            "rules = []\n",
+        )
+        .unwrap();
+        let names = list();
+        assert!(
+            names.contains(&"t_list_sc".to_string()),
+            "real profile listed: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains('.')),
+            "no sidecar stem leaks into the profile list: {names:?}"
+        );
+        std::fs::remove_file(Profile::path("t_list_sc")).ok();
+        std::fs::remove_file(PathBuf::from("profiles").join("t_list_sc.rules.toml")).ok();
     }
 
     #[test]
@@ -636,13 +864,20 @@ persist = false
             applied: vec!["dpi 1600".into(), "brightness 80%".into()],
             skipped: vec!["lighting wave: no lit device".into()],
             gated: vec!["idle-off 300s: ... gated ...".into()],
-            gaming_mode: GamingMode::from_profile(true, false, true),
+            gaming_mode: GamingMode::from_profile(true, false, true, false),
         };
         let s = r.summary();
         assert!(s.contains("dpi 1600"));
         assert!(s.contains("brightness 80%"));
         assert!(s.contains("gaming-mode (suppress Alt+Tab+Alt+F4, host-side)"));
         assert!(s.contains("[gated]"));
+
+        // Alt+Esc is a first-class label in the summary too (single-sourced via suppressed_labels()).
+        let r2 = ApplyReport {
+            gaming_mode: GamingMode::from_profile(false, false, false, true),
+            ..Default::default()
+        };
+        assert!(r2.summary().contains("Alt+Esc"));
     }
 
     #[test]
@@ -719,11 +954,11 @@ persist = false
 
     #[test]
     fn profile_with_only_new_field_not_empty() {
-        // A profile that sets ONLY a new field (e.g. a per-LED frame, or a gaming-mode toggle) is
-        // not "empty" — is_empty must account for the new lossless fields.
+        // A profile that sets ONLY a new field (e.g. idle-off, or a gaming-mode toggle) is not
+        // "empty" — is_empty must account for every new field, including the native Alt+Esc guard.
         assert!(!Profile {
             name: "f".into(),
-            lighting_frame: Some(vec![[1, 2, 3]]),
+            disable_alt_esc: true,
             ..Default::default()
         }
         .is_empty());

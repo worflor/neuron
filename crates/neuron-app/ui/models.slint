@@ -51,7 +51,11 @@ export struct ProfileRow {
     summary: string,
     dpi: string,        // "1600" or "800/1600/3200" (the cycle wins when present); "" = none
     polling: string,    // "1000 Hz"; "" = none
-    lighting: string,   // effect name; "" = none
+    brightness: string, // "80%"; "" = none
+    lighting: string,   // compositor-stack summary: "custom" (painted/imported frame) or "N fx"; "" = none
+    idle: string,       // LED idle-off timeout "300s"; "" = none
+    in-game: string,    // in-game polling "1000/500Hz" (wired/dongle); "" = none
+    gaming: bool,       // any gaming-mode suppression (alt-tab/win/alt-f4) captured
     active: bool,
 }
 

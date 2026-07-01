@@ -11,25 +11,50 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-/// The persisted lighting state for ONE device — the applied effect/layer stack (or data mode) plus
-/// the chosen stream fps. Saved per-device (keyed by pid) so a board resumes its own effect after a
-/// relaunch instead of sitting frozen on the device's last held frame. Every field defaults, so an
-/// older/partial record still loads.
+/// The persisted lighting state for ONE device — the applied effect/layer stack plus the chosen stream
+/// fps. Saved per-device (keyed by pid) so a board resumes its own effect after a relaunch instead of
+/// sitting frozen on the device's last held frame. Every field defaults, so an older/partial record
+/// still loads (a pre-unification `data` mode migrates via [`DeviceLight::migrated`]).
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DeviceLight {
     /// The chosen streaming fps for this board (the user's pick — restored verbatim on launch, so the
     /// per-device default only applies when nothing's saved). 0 = unset (fall back to the default).
     #[serde(default)]
     pub fps: u32,
-    /// The active DATA-mode slug (e.g. "mouse-battery"), mutually exclusive with `layers`. `None` =
-    /// no data mode (an effect stack, or nothing, owns the board).
-    #[serde(default)]
-    pub data: Option<String>,
-    /// The applied compositor stack — empty when a data mode owns the board, or nothing's applied.
-    /// Serialises as `[[lighting.<pid>.layers]]` array-of-tables; each layer is flat (a pattern key,
-    /// optional params, a tiered spectrum, region, blend, enabled — see `pattern::LayerDef`).
+    /// LEGACY compat shim (pre-unification): an old save's DATA-mode slug (e.g. "mouse-battery").
+    /// Deserialize-ONLY — read from the old `data` key but NEVER re-serialized (`skip_serializing`), so
+    /// it evaporates from disk on the next save. [`DeviceLight::migrated`] folds it into a `vitals`
+    /// LAYER on load, so an existing save resumes as the vitals surface with zero user action. Remove
+    /// once no pre-release save can still carry it.
+    #[serde(default, rename = "data", skip_serializing)]
+    pub legacy_data: Option<String>,
+    /// The applied compositor stack — the SINGLE representation of a board's lighting (a `vitals` readout
+    /// is now just a layer in here, not a sidecar mode). Empty when nothing's applied. Serialises as
+    /// `[[lighting.<pid>.layers]]` array-of-tables; each layer is flat (a pattern key, optional params, a
+    /// tiered spectrum, region, blend, enabled — see `pattern::LayerDef`).
     #[serde(default)]
     pub layers: Vec<neuron::pattern::LayerDef>,
+}
+
+impl DeviceLight {
+    /// Fold a LEGACY data-mode save into the unified layer stack: an old `data = "mouse-battery"` record
+    /// becomes a `vitals` LAYER appended to `layers` (unless one's already present), so a pre-unification
+    /// save resumes as the vitals surface with no user action. One-way + idempotent; the `legacy_data`
+    /// shim is consumed (and it never re-serializes), so the next save drops the old field for good.
+    pub fn migrated(mut self) -> Self {
+        // Only the KNOWN data-mode slug maps to a vitals layer. `.take()` always consumes the shim (so an
+        // unknown/garbled value can't re-serialize), but only `Some("mouse-battery")` folds into a readout
+        // — a stray or future `data` value is dropped, never grafted onto the board. Don't duplicate an
+        // existing vitals layer.
+        if self.legacy_data.take().as_deref() == Some("mouse-battery")
+            && !self.layers.iter().any(|l| l.pattern == "vitals")
+        {
+            if let Some(v) = neuron::pattern::preset_layer("vitals") {
+                self.layers.push(v);
+            }
+        }
+        self
+    }
 }
 
 /// On-disk GUI preferences. All fields default so a missing/partial file still loads.
@@ -806,7 +831,7 @@ mod tests {
         params.set("speed", 2.0);
         let state = DeviceLight {
             fps: 12,
-            data: None,
+            legacy_data: None,
             layers: vec![
                 neuron::pattern::LayerDef {
                     pattern: "heat".into(),
@@ -818,6 +843,7 @@ mod tests {
                     region: vec![5, 2, 9],
                     blend: neuron::effects::Blend::Add,
                     enabled: true,
+                    ..Default::default()
                 },
                 neuron::pattern::LayerDef {
                     pattern: "uniform".into(),
@@ -831,7 +857,7 @@ mod tests {
         set_device_light(pid, state.clone()).expect("save lighting");
         let back = device_light(pid).expect("lighting reloads");
         assert_eq!(back.fps, 12);
-        assert!(back.data.is_none());
+        assert!(back.legacy_data.is_none());
         assert_eq!(back.layers.len(), 2);
         assert_eq!(back.layers[0].pattern, "heat");
         assert_eq!(back.layers[0].params.f32("speed", 0.0), 2.0);
@@ -872,7 +898,7 @@ mod tests {
         ));
         let state = DeviceLight {
             fps: 30,
-            data: None,
+            legacy_data: None,
             layers: vec![
                 neuron::pattern::LayerDef {
                     pattern: "thermal".into(),
@@ -952,23 +978,64 @@ mod tests {
         );
     }
 
-    /// A data-mode lighting state (no layers) persists too.
+    /// A LEGACY data-mode save (`data = "mouse-battery"`) is a deserialize-only compat shim: it loads
+    /// into `legacy_data`, `migrated()` folds it into a `vitals` LAYER, and it NEVER re-serializes — so
+    /// the old field evaporates the next time the board's lighting is written. This is the zero-user-action
+    /// migration path a pre-unification save rides on load.
     #[test]
-    fn device_light_data_mode_round_trips() {
+    fn legacy_data_mode_migrates_to_a_vitals_layer() {
         let _g = cwd_guard();
         let pid = 0x0226u16;
-        set_device_light(
-            pid,
-            DeviceLight {
-                fps: 6,
-                data: Some("mouse-battery".into()),
-                layers: vec![],
-            },
+        // an OLD save carries the data-mode slug under the device's `[lighting.<pid>]` table.
+        std::fs::write(
+            Prefs::path(),
+            format!("[lighting.{}]\nfps = 6\ndata = \"mouse-battery\"\n", light_key(pid)),
         )
-        .expect("save");
-        let back = device_light(pid).expect("reload");
-        assert_eq!(back.data.as_deref(), Some("mouse-battery"));
-        assert!(back.layers.is_empty());
+        .unwrap();
+        let back = device_light(pid).expect("legacy record loads");
+        assert_eq!(
+            back.legacy_data.as_deref(),
+            Some("mouse-battery"),
+            "old `data` deserializes into the legacy_data shim"
+        );
+        assert!(back.layers.is_empty(), "the legacy save has no layers yet");
+        // migration folds the data mode into a `vitals` layer (what load_lighting_into_state applies).
+        let migrated = back.migrated();
+        assert!(migrated.legacy_data.is_none(), "the shim is consumed by migration");
+        assert_eq!(migrated.layers.len(), 1, "a vitals layer replaces the data mode");
+        assert_eq!(migrated.layers[0].pattern, "vitals");
+        // and a re-save drops the old field for good (legacy_data is skip_serializing).
+        set_device_light(pid, migrated).expect("save migrated");
+        assert!(
+            !std::fs::read_to_string(Prefs::path()).unwrap().contains("data ="),
+            "the legacy `data` key must not be re-serialized"
+        );
+    }
+
+    /// `migrated()` is idempotent + guarded: a record that ALREADY carries a `vitals` layer doesn't grow a
+    /// SECOND one even with a stray `legacy_data` shim set — the shim is still consumed (so it can't
+    /// re-serialize), and the existing readout is left untouched. (No filesystem — pure in-memory fold.)
+    #[test]
+    fn migrated_does_not_duplicate_an_existing_vitals_layer() {
+        let mut d = DeviceLight::default();
+        d.layers.push(neuron::pattern::preset_layer("vitals").expect("vitals preset"));
+        d.legacy_data = Some("mouse-battery".into());
+        let m = d.migrated();
+        assert!(m.legacy_data.is_none(), "the shim is consumed regardless");
+        assert_eq!(m.layers.len(), 1, "an existing vitals layer is not duplicated");
+        assert_eq!(m.layers[0].pattern, "vitals");
+    }
+
+    /// Only the known `mouse-battery` slug migrates; any OTHER/unknown legacy `data` value is DROPPED
+    /// (consumed but never folded into a layer) — a forward-compat guard so a future or garbled slug can't
+    /// silently graft a vitals readout onto a board.
+    #[test]
+    fn migrated_drops_an_unknown_legacy_data_value() {
+        let mut d = DeviceLight::default();
+        d.legacy_data = Some("something-else".into());
+        let m = d.migrated();
+        assert!(m.legacy_data.is_none(), "the unknown shim is still consumed");
+        assert!(m.layers.is_empty(), "an unknown data value adds no layer");
     }
 
     /// An OLD app.toml with NO `[lighting]` section still loads (back-compat) — the map defaults empty,
@@ -990,8 +1057,7 @@ mod tests {
             0x0226,
             DeviceLight {
                 fps: 30,
-                data: None,
-                layers: vec![],
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1051,8 +1117,8 @@ mod tests {
             light_key(0x0226),
             DeviceLight {
                 fps: 24,
-                data: Some("mouse-battery".into()),
-                layers: vec![],
+                layers: vec![neuron::pattern::preset_layer("vitals").unwrap()],
+                ..Default::default()
             },
         );
         want.save().expect("save");
@@ -1072,10 +1138,9 @@ mod tests {
             Some(24)
         );
         assert_eq!(
-            got.lighting
-                .get(&light_key(0x0226))
-                .and_then(|d| d.data.as_deref()),
-            Some("mouse-battery")
+            got.lighting.get(&light_key(0x0226)).map(|d| d.layers.len()),
+            Some(1),
+            "the saved vitals layer round-trips (the data mode is now just a layer)"
         );
     }
 

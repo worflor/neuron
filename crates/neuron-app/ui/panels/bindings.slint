@@ -178,9 +178,9 @@ component MacroCardEl inherits Rectangle {
             font-size: Theme.fs-small;
         }
     }
-    // auto-disarm the confirm after ~1.6s — a stray first click never sits armed.
+    // auto-disarm the confirm on the shared clock (Theme.confirm-window) so a stray first click never sits armed.
     Timer {
-        interval: 1600ms;
+        interval: Theme.confirm-window;
         running: root.armed && !root.deleting;
         triggered => { root.armed = false; }
     }
@@ -216,7 +216,7 @@ component WireEditor inherits Card {
     callback close();
     VerticalLayout {
         padding: 13px;
-        spacing: 12px;
+        spacing: Theme.gap;
         // header — a live accent lamp + which layer/mode this wire is, close at the edge
         HorizontalLayout {
             spacing: 8px;
@@ -1036,14 +1036,14 @@ export component BindingsPanel inherits VerticalLayout {
             Button { text: "reload"; clicked => { State.reload-bindings(); } }
         }
     }
-    Rectangle { height: Theme.hair; background: Theme.line; }
+    Divider {}
     Rectangle { height: Theme.lead-in; }
 
     // the page itself scrolls (PanelPage) — no inner whole-panel Flickable, or the two would
     // fight over the wheel and the outer viewport would mis-size around this one.
     VerticalLayout {
         VerticalLayout {
-            spacing: 22px;
+            spacing: Theme.section-gap;
 
             // ════════ ALTITUDE 1 · THE INPUT MAP ════════
             // the model, in one line (the teaching spine, like WEAVE's "one trigger, several rhythms")
@@ -1071,7 +1071,7 @@ export component BindingsPanel inherits VerticalLayout {
                     animate border-color, background { duration: Theme.quick; }
                     HorizontalLayout {
                         padding-left: 13px; padding-right: 13px; spacing: 8px;
-                        VerticalLayout { alignment: center; Text { text: "HyperShift \u{00b7} a second layer, held"; color: ctata.has-hover ? Theme.text : Theme.text-mid; font-family: Theme.mono; font-size: Theme.fs-small; font-weight: 700; letter-spacing: 1.2px; vertical-alignment: center; animate color { duration: Theme.quick; } } }
+                        VerticalLayout { alignment: center; Text { text: "HyperShift \u{00b7} a second layer, held"; color: ctata.has-hover ? Theme.text : Theme.text-mid; font-family: Theme.mono; font-size: Theme.fs-small; font-weight: 700; letter-spacing: Theme.track-3; vertical-alignment: center; animate color { duration: Theme.quick; } } }
                         VerticalLayout { alignment: center; Text { text: "set up \u{25b8}"; color: ctata.has-hover ? Theme.accent : Theme.text-faint; font-family: Theme.mono; font-size: Theme.fs-small; vertical-alignment: center; animate color { duration: Theme.quick; } } }
                     }
                     // opening the editor also drops the config open — a fresh user lands straight on
@@ -1095,13 +1095,13 @@ export component BindingsPanel inherits VerticalLayout {
                         Rectangle {
                             HorizontalLayout {
                                 padding-left: 13px; padding-right: 12px; spacing: 7px;
-                                VerticalLayout { alignment: center; Text { text: "HyperShift"; color: Theme.text-mid; font-family: Theme.mono; font-size: Theme.fs-small; font-weight: 700; letter-spacing: 1.2px; vertical-alignment: center; } }
+                                VerticalLayout { alignment: center; Text { text: "HyperShift"; color: Theme.text-mid; font-family: Theme.mono; font-size: Theme.fs-small; font-weight: 700; letter-spacing: Theme.track-3; vertical-alignment: center; } }
                             }
                         }
                         Rectangle { width: 1px; background: Theme.line; }
                         // base | HYPER edit-flip — the active side lit accent (WEAVE's base|HYPER)
                         Rectangle {
-                            background: bflip.has-hover ? Theme.well : transparent;
+                            background: root.view-layer == 0 ? Theme.accent-glow : (bflip.has-hover ? Theme.well : transparent);
                             animate background { duration: Theme.quick; }
                             HorizontalLayout {
                                 padding-left: 12px; padding-right: 11px;
@@ -1110,14 +1110,14 @@ export component BindingsPanel inherits VerticalLayout {
                                     color: root.view-layer == 0 ? Theme.accent : (bflip.has-hover ? Theme.text-mid : Theme.text-dim);
                                     font-family: Theme.mono; font-size: Theme.fs-small;
                                     font-weight: root.view-layer == 0 ? 700 : 500;
-                                    letter-spacing: 1.4px; vertical-alignment: center;
+                                    letter-spacing: Theme.track-4; vertical-alignment: center;
                                 }
                             }
                             bflip := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.view-layer = 0; root.add-open = false; State.editing-rule = -1; } }
                         }
                         Rectangle { width: 1px; background: Theme.line; }
                         Rectangle {
-                            background: hflip.has-hover ? Theme.well : transparent;
+                            background: root.view-layer == 1 ? Theme.accent-glow : (hflip.has-hover ? Theme.well : transparent);
                             animate background { duration: Theme.quick; }
                             HorizontalLayout {
                                 padding-left: 11px; padding-right: 12px;
@@ -1126,7 +1126,7 @@ export component BindingsPanel inherits VerticalLayout {
                                     color: root.view-layer == 1 ? Theme.accent : (hflip.has-hover ? Theme.text-mid : Theme.text-dim);
                                     font-family: Theme.mono; font-size: Theme.fs-small;
                                     font-weight: root.view-layer == 1 ? 700 : 500;
-                                    letter-spacing: 1.4px; vertical-alignment: center;
+                                    letter-spacing: Theme.track-4; vertical-alignment: center;
                                 }
                             }
                             hflip := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.view-layer = 1; root.add-open = false; State.editing-rule = -1; } }
@@ -1557,7 +1557,7 @@ export component BindingsPanel inherits VerticalLayout {
                             if State.macro-catalog-building : Pill { text: "READING"; live: true; }
                         }
                         if State.macro-catalog.length == 0 && !State.macro-catalog-building : Mono {
-                            text: "no macros yet \u{2014} build one above, or Reveal the folder, drop a .py in, then Reload";
+                            text: "no macros yet · build one above, or Reveal the folder, drop a .py in, then Reload";
                             color: Theme.text-faint;
                             font-size: Theme.fs-small;
                             wrap: word-wrap;
@@ -1597,7 +1597,7 @@ export component BindingsPanel inherits VerticalLayout {
                 spacing: 9px;
                 SectionTitle { text: "POCKETS"; }
                 if State.pockets.length == 0 : Mono {
-                    text: "none yet \u{2014} bind a `pocket` action, then activate it with something on your clipboard";
+                    text: "no pockets yet · bind a `pocket` action, then activate it with something on your clipboard";
                     color: Theme.text-faint;
                 }
                 if State.pockets.length > 0 : HorizontalLayout {

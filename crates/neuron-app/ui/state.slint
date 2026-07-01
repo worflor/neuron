@@ -176,6 +176,10 @@ export global State {
     in-out property <bool> disable-win: false;
     in-out property <bool> disable-alt-f4: false;
     in-out property <bool> disable-alt-esc: false;
+    // The ONE "is any live key-guard active?" predicate — derived over ALL four chips. Every consumer
+    // (the LIVE capture preview, any future badge) reads THIS, so adding a chord above can't leave a
+    // hand-inlined OR behind out of sync. Grows by chord, exactly as the KEY GUARD note above intends.
+    in-out property <bool> gaming-live: disable-alt-tab || disable-win || disable-alt-f4 || disable-alt-esc;
     callback apply-gaming-mode();
     // LIFT-OFF distance — REAL verify-gated write (symmetric low/med/high). Verify-gated +
     // env-gated (NEURON_LOD_WRITE) until confirmed on hardware; the read-back is the safety net.
@@ -216,13 +220,14 @@ export global State {
     callback erase-cell(int);                        // paint the off colour (right-click erase)
     callback clear-grid();                           // whole frame -> off
     callback fill-grid();                            // whole frame -> brush colour
-    callback push-frame();                           // send the painted grid to the device
 
     // ── Lighting COMPOSITOR — the layered effect studio (a layer = PATTERN × SPECTRUM) ──
     in-out property <int> selected-layer: -1;        // which stacked layer the inspector + spectrum editor act on
+    // Lighting AUTO-APPLIES: every edit debounce-streams the current stack to the board (no manual apply
+    // button). `compositing` stays as the honest "is the stack live on the device" indicator — set true
+    // by the auto-apply stream, false when writes pause. There is no composite-apply/stop transport: the
+    // one deliberate "stop writing" is the global writes-pause gate (the header pill / Settings).
     in-out property <bool> compositing: false;       // the stack is streaming live to the device
-    callback composite-apply();                      // stream the composite live to the device
-    callback composite-stop();
     callback import-light-file();                    // pick a .ChromaEffects / .synapse3 → frame or layer
 
     // ── Lighting UNIFIED SURFACE — the render-first, tile-driven page ─────
@@ -235,10 +240,11 @@ export global State {
     in-out property <[EffectParam]> light-params;     // the active effect's auto-rendered param controls (range/enum/toggle)
     // STREAM RATE — the frame-rate the live effect runs at, driving BOTH the device stream AND this
     // page's preview (they tick together). Seeded per-device on selection (legacy → 6, matrix → 30);
-    // the user tunes from there. `light-is-data` gates the control off for DATA readouts (no rate).
+    // the user tunes from there. Applies to EVERY layer now — vitals streams like any effect, so there's
+    // no rate-less readout mode to gate the control off for.
     in-out property <float> light-fps: 30;
     in-out property <bool> light-fps-legacy: false;   // selected board is a slow legacy keyboard (~6 fps)
-    in-out property <bool> light-is-data: false;      // active tile is a DATA readout, not a tunable effect
+    in-out property <bool> light-is-readout: false;   // the SELECTED layer is a live device readout (vitals), not a tunable effect
     callback set-light-fps(float);                     // re-pace the live stream + preview together (1–30)
     callback tile-preview-tick();                     // re-render the grid swatches (animated, ~throttled)
     callback pick-tile(string);                       // slug → make it the active single effect, play on render + show knobs
@@ -257,6 +263,25 @@ export global State {
     in-out property <bool> light-brush-on: false;     // is the per-key brush picked up?
     callback toggle-brush();                           // pick up / put down the paint brush
     callback push-painted();                           // commit the painted frame to the device
+    // PLACE — position THIS layer as a sprite: a drag ON the render defines a RECTANGLE that becomes the
+    // SELECTED layer's spatial REGION, so ANY layer (an effect OR the vitals readout) is freely
+    // placeable + resizable. A SIBLING gesture to the brush, never the same mode (the two are mutually
+    // exclusive on the render). Moving/resizing is just another drag; Reset clears the region → full board.
+    in-out property <bool> light-place-on: false;      // is the place-layer gesture active?
+    in-out property <bool> light-layer-placed: false;  // the selected layer occupies a sub-region (not the full board)
+    in-out property <string> light-place-label: "full board"; // honest placement readout ("full board" / "3×4 block")
+    // the SELECTED layer's committed region as INCLUSIVE corner cells (grid row/col coords) — the render
+    // draws its persistent placement outline from these while placing. r0 < 0 = full board (no outline).
+    in-out property <int> light-place-r0: -1;
+    in-out property <int> light-place-c0: -1;
+    in-out property <int> light-place-r1: -1;
+    in-out property <int> light-place-c1: -1;
+    // the STACK selector's per-layer display names (bottom→top), so each stack cell reads as its effect /
+    // readout (e.g. "Vitals", "Heat") — the user can SEE and pick which layer to place, vitals included.
+    in-out property <[string]> light-stack-labels;
+    callback toggle-place();                           // enter / exit the place-layer gesture
+    callback set-layer-region(int, int, int, int);     // (row0, col0, row1, col1) — commit the dragged rect as the layer's region
+    callback reset-layer-region();                      // clear the region → the layer fills the whole board again
 
     // ── Lighting SPECTRUM editor — the active layer's COLOUR PROGRAM (the other half of a layer) ──
     // A layer = PATTERN (shape, the knobs above) × SPECTRUM (colour, this block). The active layer is
@@ -529,7 +554,9 @@ export global State {
     in-out property <[AppRuleRow]> app-rules;
     in-out property <int> active-app-rule: -1;         // which rule the FOCUSED app matches right now
     in-out property <bool> profile-name-exists: false; // typed save-name collides (save = overwrite)
+    in-out property <string> profile-name-suggested: ""; // glue's low-friction default (focused app / value descriptor); non-colliding
     callback profile-name-edited(string);              // glue answers profile-name-exists
+    callback refresh-profile-suggestion();             // recompute the zero-typing default from LIVE state — called on sheet-open so a value tuned since last focus-change isn't stale
     callback apply-profile(string);
     callback save-current-profile(string);
     callback delete-profile(string);

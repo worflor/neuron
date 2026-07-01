@@ -31,7 +31,7 @@ export component SectionTitle inherits Text {
     font-size: Theme.fs-title;
     font-family: Theme.mono;
     font-weight: 700;
-    letter-spacing: 1.4px;
+    letter-spacing: Theme.track-4;
     vertical-alignment: center;   // it shares header rows with a count Mono / a Pill — centre it like Mono
 }
 
@@ -74,7 +74,7 @@ export component Contact inherits Rectangle {
             font-size: Theme.fs-small;
             font-family: Theme.mono;
             font-weight: root.active ? 700 : 500;
-            letter-spacing: 1.4px;
+            letter-spacing: Theme.track-4;
             vertical-alignment: center;
         }
     }
@@ -90,6 +90,7 @@ export component Pill inherits Rectangle {
     in property <bool> live: false;        // a STATUS LAMP — lit phosphor when on, dark gutter when off
     in property <bool> selected: false;    // a CHOSEN CHIP — lights its whole body, never a reflowing dot
     in property <bool> clickable: false;   // when true, the pill is a button (reports `clicked`)
+    in property <bool> enabled: true;      // when false: dimmed ink + inert (mirrors Button's disabled state)
     callback clicked();
     // "lit" = the phosphor state, from either a live signal OR a chosen-chip selection.
     property <bool> lit: root.live || root.selected;
@@ -109,8 +110,8 @@ export component Pill inherits Rectangle {
         : Theme.line;
     animate background, border-color { duration: Theme.quick; }
     pill-ta := TouchArea {
-        enabled: root.clickable;
-        mouse-cursor: root.clickable ? MouseCursor.pointer : MouseCursor.default;
+        enabled: root.clickable && root.enabled;
+        mouse-cursor: (root.clickable && root.enabled) ? MouseCursor.pointer : MouseCursor.default;
         clicked => { root.clicked(); }
     }
     HorizontalLayout {
@@ -134,11 +135,11 @@ export component Pill inherits Rectangle {
             // able to shrink/truncate when a row IS too tight (a long gate name may elide — by design).
             min-width: 0px;
             overflow: elide;
-            color: root.lit ? Theme.accent : root.tint;
+            color: !root.enabled ? Theme.text-faint : (root.lit ? Theme.accent : root.tint);
             font-size: Theme.fs-small;
             font-family: Theme.mono;
             font-weight: 700;
-            letter-spacing: 0.8px;
+            letter-spacing: Theme.track-2;
             vertical-alignment: center;
         }
     }
@@ -561,7 +562,7 @@ export component Readout inherits VerticalLayout {
         color: Theme.text-faint;
         font-size: Theme.fs-small;
         font-family: Theme.mono;
-        letter-spacing: 1.2px;
+        letter-spacing: Theme.track-3;
     }
     Text {
         text: root.value;
@@ -645,8 +646,9 @@ export component Picker inherits Rectangle {
         }
     }
     ta := TouchArea {
-        mouse-cursor: MouseCursor.pointer;
-        clicked => { popup.show(); }
+        mouse-cursor: root.options.length > 0 ? MouseCursor.pointer : MouseCursor.default;
+        // an empty option set has nothing to pick — don't pop a hollow menu (the dead-dropdown bug).
+        clicked => { if (root.options.length > 0) { popup.show(); } }
         // NO scroll-nudge on the closed control: it silently changed the selection (e.g. re-routed
         // an app-rule's profile) just by scrolling the PAGE over it, and trapped the wheel. Click to
         // open the popup and pick — explicit, not incidental.
@@ -955,7 +957,7 @@ export component PanelHead inherits HorizontalLayout {
                 font-size: Theme.fs-panel;
                 font-family: Theme.mono;
                 font-weight: 700;
-                letter-spacing: 3px;
+                letter-spacing: Theme.track-5;
             }
         }
         if root.caption != "" : Text {
@@ -1268,7 +1270,7 @@ export component ColorPicker inherits VerticalLayout {
             Text {
                 text: root.label;
                 color: Theme.text-dim; font-family: Theme.mono; font-size: Theme.fs-small;
-                font-weight: 700; letter-spacing: 1.2px;
+                font-weight: 700; letter-spacing: Theme.track-3;
             }
         }
         // LABELLED (SYSTEM accents): a stretchy gap here right-aligns the field after the label — the

@@ -381,6 +381,11 @@ fn main() {
     let slow_seen: RefCell<Instant> = RefCell::new(Instant::now() - Duration::from_secs(2));
     let tray_seen: RefCell<Instant> = RefCell::new(Instant::now() - Duration::from_secs(2));
     let status_tick_seen: RefCell<Instant> = RefCell::new(Instant::now() - Duration::from_secs(2));
+    // VITALS pump edge-tracker: true once a `vitals` layer is live, so we FORCE a prompt read on the
+    // rising edge (the surface just lit) and merely throttle-refresh after. false = no vitals surface up.
+    let vitals_seen: RefCell<bool> = RefCell::new(false);
+    // …and a ~1s steady-state gate so the pump enumerates at most ~1Hz while a vitals surface is up.
+    let vitals_pump_seen: RefCell<Instant> = RefCell::new(Instant::now() - Duration::from_secs(2));
     timer.start(
         slint::TimerMode::Repeated,
         Duration::from_millis(60),
@@ -498,6 +503,26 @@ fn main() {
                     if seen.elapsed() >= Duration::from_secs(1) {
                         *seen = Instant::now();
                         crate::glue::refresh_reliability(app);
+                    }
+                }
+                // VITALS provider: while a `vitals` layer is live (previewing or streaming), feed the core
+                // lighting provider so the pattern has fresh battery/charge/stage. Cheap + gated — the read
+                // is off-thread and further throttled to the battery cadence (never waking a sleeping mouse
+                // more than the battery cards do). A FORCED read on the rising edge lights the surface
+                // promptly; steady state re-reads at most ~1Hz (the device read is gated tighter still).
+                if slow_due {
+                    let live = shared.borrow().light_layers.iter().any(|l| l.pattern == "vitals");
+                    let mut was = vitals_seen.borrow_mut();
+                    let rising = live && !*was;
+                    *was = live;
+                    if rising {
+                        shared.borrow().rt.pump_vitals(true); // prompt forced read on activation
+                    } else if live {
+                        let mut seen = vitals_pump_seen.borrow_mut();
+                        if seen.elapsed() >= Duration::from_secs(1) {
+                            *seen = Instant::now();
+                            shared.borrow().rt.pump_vitals(false);
+                        }
                     }
                 }
                 // ARMED pill: the arm gate is a process-global — re-read it so any writer (a future

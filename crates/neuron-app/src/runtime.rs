@@ -59,15 +59,12 @@ pub struct DeviceState {
 }
 
 /// One live lighting stream's controls, owned PER-DEVICE in [`AppRuntime::anim`]: the stop flag its
-/// worker polls each frame, and the fps it reads (only the layer compositor uses fps; the vitals
-/// surface paints on-demand and ignores it).
+/// worker polls each frame, and the fps it reads live. Every stream is the layer compositor now (vitals
+/// is just a `vitals` LAYER in the stack, not a bespoke paint-on-demand surface), so the fps slider
+/// always applies to whatever board is streaming.
 pub struct AnimStream {
     pub stop: Arc<AtomicBool>,
     pub fps: Arc<AtomicU32>,
-    /// FPS-PACED (the layer compositor, reads `fps` live each frame) vs paint-on-demand (the vitals
-    /// surface, which ignores `fps`). The fps slider only writes paced streams, so it can never silently
-    /// land on a vitals stream's unused `fps` when vitals is the board's current entry in [`anim`].
-    pub fps_paced: bool,
 }
 
 /// The resident runtime state. UI-thread owned (held in an `Rc<RefCell<_>>` by the glue).
@@ -538,34 +535,6 @@ impl AppRuntime {
         }
     }
 
-    /// Paint an explicit per-LED frame (row-major) to the device.
-    pub fn push_frame(&self, frame: &[Rgb]) -> String {
-        if self.writes_paused() {
-            return "writes paused".into();
-        }
-        match self.open_selected() {
-            Ok(d) => {
-                let Some(def) = d.def.lighting.clone() else {
-                    return "device has no lighting".into();
-                };
-                let (rows, cols) = (def.rows as usize, def.cols as usize);
-                let mut canvas = neuron::lighting::Canvas::new(def.rows, def.cols);
-                for (i, px) in frame.iter().enumerate().take(rows * cols) {
-                    canvas.px[i] = *px;
-                }
-                let lights = Lights::new(&d, def);
-                if let Err(e) = lights.ensure_control() {
-                    return format!("control failed: {e}");
-                }
-                match lights.paint(&canvas) {
-                    Ok(_) => "frame pushed".into(),
-                    Err(e) => format!("paint failed: {e}"),
-                }
-            }
-            Err(e) => format!("no device: {e}"),
-        }
-    }
-
     /// Stream the LAYER COMPOSITOR live on a worker thread (re-opens its own device). The compositor is
     /// built from the whole layer stack (Pattern × Spectrum layers).
     /// The layered composite is inherently the custom-frame path (it streams blended frames).
@@ -594,7 +563,6 @@ impl AppRuntime {
             AnimStream {
                 stop: stop.clone(),
                 fps: fps_src.clone(),
-                fps_paced: true, // the layer compositor reads fps live each frame
             },
         );
         std::thread::spawn(move || {
@@ -677,111 +645,33 @@ impl AppRuntime {
         }
     }
 
-    /// Re-pace `pid`'s live stream (the fps slider) without restarting it. No-op if it isn't streaming
-    /// OR if the current stream is the paint-on-demand vitals surface (whose `fps` is unused) — so the
-    /// slider can never silently write into a non-paced stream that happens to share the board's pid.
+    /// Re-pace `pid`'s live stream (the fps slider) without restarting it. No-op if it isn't streaming.
+    /// The stream reads its own `fps` copy live each frame, so this just stores the new value — every
+    /// stream is a paced layer compositor now (the old paint-on-demand vitals surface is gone).
     pub fn set_anim_fps(&self, pid: u16, fps: u32) {
         if let Some(a) = self.anim.get(&pid) {
-            if a.fps_paced {
-                a.fps.store(fps, Ordering::Relaxed);
-            }
+            a.fps.store(fps, Ordering::Relaxed);
         }
     }
 
-    /// Start the cross-device VITALS surface on a worker thread — the GUI mirror of the CLI's
-    /// `lighting mirror`. SINK = the selected lit, custom-frame-capable device (the keyboard); SOURCE
-    /// = the first battery-capable mouse. Reads the mouse's live battery/charge/DPI-stage and paints
-    /// `render_vitals` onto the keyboard ON-DEMAND (repaint only on change, or each tick while charging
-    /// so the cyan crest animates). Same generation-token contract as `start_layers`. Returns a status.
-    pub fn start_vitals(
-        &mut self,
-        sink_pid: u16,
-        on_done: impl FnOnce(Option<String>, Arc<AtomicBool>) + Send + 'static,
-    ) -> String {
-        if self.writes_paused() {
-            return "writes paused".into();
+    /// Feed the core lighting VITALS provider so the `vitals` PATTERN (the GUI preview + the streamed
+    /// layer) has fresh battery / charge / DPI-stage — the unified replacement for the old `start_vitals`
+    /// paint loop (gone; vitals is now just a compositor layer streamed through `start_layers`). Call it
+    /// on the ~1s heartbeat while a vitals surface is live. Cheap + gated: the device read runs
+    /// OFF-THREAD and only when the battery-aware throttle (`neuron::vitals::due`) permits, so a sleeping
+    /// mouse is woken no more than the battery cards already wake it (enumeration, which picks the source,
+    /// wakes nothing). `forced` bypasses the throttle once, for a prompt first read on activation. Only a
+    /// single read runs at a time — the 60ms heartbeat can't herd the mouse.
+    pub fn pump_vitals(&self, forced: bool) {
+        static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+        if IN_FLIGHT.swap(true, Ordering::AcqRel) {
+            return; // a read is already running — don't stack another.
         }
-        // keyed by the SINK board (the keyboard) so only ITS prior stream is replaced.
-        if let Some(a) = self.anim.get(&sink_pid) {
-            a.stop.store(true, Ordering::SeqCst);
-        }
-        let stop = Arc::new(AtomicBool::new(false));
-        self.anim.insert(
-            sink_pid,
-            AnimStream {
-                stop: stop.clone(),
-                fps: Arc::new(AtomicU32::new(1)), // vitals paints on-demand; fps unused
-                fps_paced: false,
-            },
-        );
         std::thread::spawn(move || {
-            let outcome: Result<(), String> = (|| {
-                let reg = Registry::load().map_err(|e| format!("registry: {e}"))?;
-                let infos = transport::enumerate().map_err(|e| format!("enumerate: {e}"))?;
-                // open the SINK (the selected custom-frame keyboard)
-                let mut sink = None;
-                let mut source = None;
-                for i in &infos {
-                    if let Some(def) = reg.find_by_pid(i.vid, i.pid) {
-                        let lit_frame = def
-                            .lighting
-                            .as_ref()
-                            .map(|l| l.custom_frame.is_some())
-                            .unwrap_or(false);
-                        if sink.is_none()
-                            && lit_frame
-                            && def.matches_control(i.usage_page, i.usage, i.feature_len)
-                            && (sink_pid == 0 || i.pid == sink_pid)
-                        {
-                            if let Ok(d) = Device::open(def.clone(), i.pid) {
-                                sink = Some(d);
-                            }
-                        }
-                        // SOURCE: a battery-capable device (the mouse). Don't reuse the sink.
-                        if source.is_none()
-                            && def.commands.contains_key("battery_level")
-                            && def.matches_control(i.usage_page, i.usage, i.feature_len)
-                        {
-                            if let Ok(d) = Device::open(def.clone(), i.pid) {
-                                source = Some(d);
-                            }
-                        }
-                    }
-                }
-                let sink = sink.ok_or_else(|| {
-                    "no custom-frame keyboard selected to paint vitals onto".to_string()
-                })?;
-                let source = source.ok_or_else(|| {
-                    "no battery-capable mouse found to read vitals from (wake the Naga)".to_string()
-                })?;
-                let ldef = sink
-                    .def
-                    .lighting
-                    .clone()
-                    .ok_or_else(|| "sink has no lighting".to_string())?;
-                let (rows, cols) = (ldef.rows, ldef.cols);
-                let lights = Lights::new(&sink, ldef);
-                lights
-                    .ensure_control()
-                    .map_err(|e| format!("control failed: {e}"))?;
-                let mut last: Option<neuron::lighting::Vitals> = None;
-                let mut phase: f32 = 0.0;
-                while !stop.load(Ordering::SeqCst) && !neuron::writes::writes_paused() {
-                    let v = read_vitals(&source, last);
-                    let changed = last != Some(v);
-                    if changed || last.is_none() || v.charging {
-                        phase = (phase + 0.18) % 1.0;
-                        let frame = neuron::lighting::render_vitals(v, rows, cols, phase);
-                        let _ = lights.paint_frame(&frame);
-                        last = Some(v);
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(1000));
-                }
-                Ok(())
-            })();
-            on_done(outcome.err(), stop);
+            // contain a fault so a read error can never strand the in-flight latch.
+            let _ = std::panic::catch_unwind(|| publish_source_vitals(forced));
+            IN_FLIGHT.store(false, Ordering::Release);
         });
-        "mirroring vitals".into()
     }
 
     // ── spine: rules from the loaded config ──────────────────────────────
@@ -835,55 +725,30 @@ impl AppRuntime {
         dpi: u16,
         hz: u32,
         brightness: u8,
+        lighting: Vec<neuron::pattern::LayerDef>,
     ) -> String {
         if name.trim().is_empty() {
             return "name required".into();
         }
-        let mut p = Profile {
-            name: name.to_string(),
-            dpi: Some(dpi),
-            polling_hz: Some(hz),
-            brightness: Some(brightness),
-            persist: self.persist,
-            // capture the live gaming-mode policy (host-side, no device read).
-            disable_alt_tab: self.gaming_mode.disable_alt_tab,
-            disable_win: self.gaming_mode.disable_win,
-            disable_alt_f4: self.gaming_mode.disable_alt_f4,
-            ..Default::default()
-        };
+        // Full device read-back now lives in core (shared with the CLI): active DPI + the full stage
+        // list, polling, brightness, idle-off, and the current matrix effect — plus the host-side
+        // gaming-mode policy. An absent/asleep device simply leaves those fields None.
+        let mut p = neuron::profile::capture_from_devices(
+            &self.registry,
+            name,
+            self.gaming_mode,
+            self.persist,
+            self.selected_pid, // respect the device the user picked in the UI (multi-device rigs)
+        );
 
-        // Real device read-back (best-effort; overrides the slider fallbacks when a device answers).
-        if let Ok(d) = self.open_selected() {
-            if let Ok((x, _)) = cap::dpi(&d) {
-                p.dpi = Some(x);
-            }
-            // the FULL DPI stage list (what you cycle), not just the active one.
-            p.dpi_stages = self.read_dpi_stages();
-            if let Ok(hz) = cap::polling_rate_hz(&d) {
-                p.polling_hz = Some(hz);
-            }
-            if let Ok(b) = cap::brightness_percent(&d) {
-                p.brightness = Some(b);
-            }
-            if let Ok(secs) = cap::idle_timeout_secs(&d) {
-                p.idle_secs = Some(secs as u32);
-            }
-        }
+        // The UI slider values are fallbacks only — applied where the device did not answer.
+        p.dpi = p.dpi.or(Some(dpi));
+        p.polling_hz = p.polling_hz.or(Some(hz));
+        p.brightness = p.brightness.or(Some(brightness));
 
-        // current lighting effect from a matrix device (decode the effect-id -> effect name).
-        if let Some(def) = self.selected_def().filter(|d| d.lighting.is_some()) {
-            if let Ok(d) = Device::open(def.clone(), self.selected_pid) {
-                if let Some(l) = def.lighting.as_ref() {
-                    if let Ok(st) = d.run("lighting_state") {
-                        if st.len() > 2 {
-                            if let Some((k, _)) = l.effects.iter().find(|(_, v)| **v == st[2]) {
-                                p.lighting = Some(k.clone());
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        // capture_from_devices can't synthesize a LayerDef stack from raw effect registers, so the
+        // caller hands us the LIVE compositor stack — that's what gets saved as this profile's lighting.
+        p.lighting = lighting;
 
         match p.save() {
             Ok(_) => {
@@ -897,6 +762,8 @@ impl AppRuntime {
     pub fn delete_profile(&mut self, name: &str) -> String {
         let path = Profile::path(name);
         let r = std::fs::remove_file(path);
+        // Lighting lives IN the profile TOML now (the layer stack) — there's no frame sidecar to
+        // reap, so removing the one file is a full delete.
         self.reload_profiles();
         match r {
             Ok(_) => {
@@ -1184,31 +1051,62 @@ pub fn pending_diagnostic_stations() -> Vec<DiagProbe> {
         .collect()
 }
 
-/// Read a source device's live vitals (battery %, charge, active DPI stage) for the cross-device
-/// data surface — the GUI mirror of the CLI's `read_mouse_vitals`. Each sub-read is best-effort: an
-/// asleep wireless mouse falls back to the last value rather than aborting the surface. The active
-/// DPI stage comes from the `dpi_stages_active` (or `dpi_stages`) getter reply: `s[1]` = active index,
-/// `s[2]` = stage count (live-confirmed in the CLI).
-fn read_vitals(d: &Device, last: Option<neuron::lighting::Vitals>) -> neuron::lighting::Vitals {
-    let prev = last.unwrap_or(neuron::lighting::Vitals {
-        battery_pct: 0,
-        charging: false,
-        active_stage: 0,
-        stage_count: 0,
-    });
-    let battery_pct = cap::battery_percent(d).unwrap_or(prev.battery_pct);
-    let charging = cap::charging(d).unwrap_or(prev.charging);
-    let (active_stage, stage_count) = d
-        .run("dpi_stages_active")
-        .or_else(|_| d.run("dpi_stages"))
-        .ok()
-        .map(|s| (s[1], s[2]))
-        .unwrap_or((prev.active_stage, prev.stage_count));
-    neuron::lighting::Vitals {
-        battery_pct,
-        charging,
-        active_stage,
-        stage_count,
+/// Find the source device (the first battery-capable mouse) and PUBLISH its live vitals to the core
+/// lighting provider for the `vitals` pattern to visualise — the GUI's equivalent of the CLI's
+/// `read_mouse_vitals` read, but feeding [`neuron::lighting::publish_vitals`] instead of painting. The
+/// wake-costing OPEN+READ is gated by the battery-aware throttle (`neuron::vitals::due`) so a sleeping
+/// mouse is woken no more than the battery cards do; enumeration (used to pick the source) wakes
+/// nothing. On a good battery read it also feeds `vitals::observe`, so the battery CARDS ride the same
+/// sample; a failed read marks the throttle stale (a quick retry) and leaves the last snapshot warm
+/// (the provider never flickers to dark once fed). `forced` bypasses the throttle once, for a prompt
+/// first paint on activation. Each sub-read is best-effort — an asleep mouse falls back to stage 0 /
+/// last-known charge rather than aborting.
+fn publish_source_vitals(forced: bool) {
+    let Ok(reg) = Registry::load() else { return };
+    let Ok(infos) = transport::enumerate() else { return };
+    for i in &infos {
+        let Some(def) = reg.find_by_pid(i.vid, i.pid) else { continue };
+        // the SOURCE is a battery-capable device (the mouse) reached on its control interface.
+        if !def.commands.contains_key("battery_level")
+            || !def.matches_control(i.usage_page, i.usage, i.feature_len)
+        {
+            continue;
+        }
+        // gate the wake-costing OPEN+READ behind the shared throttle; the enumeration above was free.
+        if !neuron::vitals::due(i.pid, forced) {
+            return;
+        }
+        let Ok(d) = Device::open(def.clone(), i.pid) else {
+            neuron::vitals::mark_stale(i.pid); // couldn't open — retry soon, don't hold the window.
+            return;
+        };
+        match cap::battery_percent(&d) {
+            Ok(battery_pct) => {
+                // charge falls back to the last-known state on a read blip (never a phantom unplugged).
+                let charging = cap::charging(&d)
+                    .ok()
+                    .or_else(|| neuron::vitals::last_charging(i.pid))
+                    .unwrap_or(false);
+                // active DPI stage from the `dpi_stages_active` (or `dpi_stages`) reply: `s[1]` = active
+                // index, `s[2]` = count; length-guarded so a short reply falls back to stage 0.
+                let (active_stage, stage_count) = d
+                    .run("dpi_stages_active")
+                    .or_else(|_| d.run("dpi_stages"))
+                    .ok()
+                    .and_then(|s| Some((*s.get(1)?, *s.get(2)?)))
+                    .unwrap_or((0, 0));
+                neuron::lighting::publish_vitals(neuron::lighting::Vitals {
+                    battery_pct,
+                    charging,
+                    active_stage,
+                    stage_count,
+                });
+                // share the read: keep the battery CARDS fresh off the same sample (passive scan).
+                neuron::vitals::observe(i.pid, battery_pct, charging, false);
+            }
+            Err(_) => neuron::vitals::mark_stale(i.pid), // asleep/blip — retry soon, keep last warm.
+        }
+        return; // one source is enough.
     }
 }
 
