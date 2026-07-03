@@ -581,6 +581,19 @@ impl Runtime {
         None
     }
 
+    /// If this trigger fires a [`crate::action::Action::Sniper`], its precision `dpi` — so the
+    /// daemon's edge loop can snapshot+drop the DPI on DOWN and restore it on UP (a held action the
+    /// stateless dispatch can't express). `None` if no sniper binds this input, or if its `dpi` is 0
+    /// (an un-configured bind — never drop to 0 DPI). Mirrors [`momentary_mic_for`].
+    pub fn sniper_dpi_for(&self, trigger: &Trigger) -> Option<u16> {
+        for rule in self.engine.resolve(trigger) {
+            if let crate::action::Action::Sniper { dpi } = &rule.action {
+                return (*dpi != 0).then_some(*dpi);
+            }
+        }
+        None
+    }
+
     /// If this trigger binds a plain [`crate::action::Action::Key`] (an input→key REMAP), its key
     /// string — so the daemon's edge loop can HOLD the output key while the input is held (key down
     /// on DOWN, key up on UP), the way a real key behaves. `None` if no key remap binds this input
@@ -1526,6 +1539,18 @@ mod win {
     const RI_KEY_BREAK: u16 = 0x01; // this report is a key-UP (release)
     const RI_KEY_E0: u16 = 0x02; // the extended (E0) scancode prefix
 
+    // Raw Input registration is PER-PROCESS and SINGLE-OWNER per (usagePage, usage) pair:
+    // `RegisterRawInputDevices` re-points a pair's delivery at whichever window registered it
+    // LAST. So a TRANSIENT listener (the press-to-bind control capture spawns its own `listen`)
+    // silently STEALS every collection from the resident dispatch pump — and when the transient
+    // window is destroyed, delivery just stops process-wide: the resident window stays alive but
+    // DEAF, forever (the "sniper rebind needs a restart" bug — the rule was fine; the pump never
+    // heard another native edge). The flag heals it: every `listen` teardown raises it, and every
+    // still-running pump re-registers its collections on its next iteration (~5 ms), taking the
+    // wire back. A spurious raise (e.g. the resident pump's own shutdown) costs one redundant
+    // re-registration — a no-op.
+    static REARM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
     /// The device PID (`pid_XXXX` segment) from a Raw-Input device path, as a 4-hex lowercase string
     /// ("" if absent) — the same key the capture + dispatch already tag triggers with.
     fn pid_from_path(path: &str) -> String {
@@ -1740,6 +1765,15 @@ mod win {
                 if esc_stops && (GetAsyncKeyState(0x1B) as u16 & 0x8000) != 0 {
                     break;
                 }
+                // A transient listener ended and left the process registration pointing at its
+                // dead window — take the collections back (see REARM above).
+                if REARM.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                    RegisterRawInputDevices(
+                        rids.as_ptr(),
+                        rids.len() as u32,
+                        std::mem::size_of::<RAWINPUTDEVICE>() as u32,
+                    );
+                }
                 let mut msg: MSG = std::mem::zeroed();
                 while PeekMessageW(&mut msg, hwnd, 0, 0, PM_REMOVE) != 0 {
                     if msg.message == WM_INPUT {
@@ -1924,6 +1958,9 @@ mod win {
                 eprintln!("    [dbg] WM_INPUT msgs={n_input}  HID events={n_hid}");
             }
             DestroyWindow(hwnd);
+            // this instance owned the process's Raw-Input registration — tell any surviving pump
+            // (the resident dispatch listener, if we were a capture) to re-arm and hear again.
+            REARM.store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }
 }

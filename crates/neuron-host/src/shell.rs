@@ -57,12 +57,24 @@ pub enum Cmd {
     Release { id: LayerId },
     ReleaseOwner { owner: SourceId },
     Resolve { surface: String, now: Instant, reply: Sender<Option<Vec<Option<Rgb>>>> },
+    Claims { surface: String, now: Instant, reply: Sender<Vec<Claim>> },
+    Label { owner: SourceId, name: String },
     Publish { path: String, value: Value },
     Subscribe { prefix: String, reply: Sender<Receiver<Signal>> },
     /// Test-only: makes the kernel thread panic, to prove rebirth works.
     #[cfg(test)]
     Poison,
     Shutdown,
+}
+
+/// One alive claim on a surface, as the GUI sees it: who, how strongly, and —
+/// when the adapter told us — by NAME. The ownership truth no last-writer-wins
+/// tool can even ask for.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Claim {
+    pub owner: SourceId,
+    pub priority: i32,
+    pub label: Option<String>,
 }
 
 /// The running host: owns the kernel thread. Dropping it shuts the actor down
@@ -115,6 +127,14 @@ impl HostHandle {
     /// The receiver closes on kernel rebirth — resubscribe on disconnect.
     pub fn subscribe(&self, prefix: &str) -> Option<Receiver<Signal>> {
         self.request(|reply| Cmd::Subscribe { prefix: prefix.into(), reply })
+    }
+
+    /// The alive claims on a surface, topmost first, with adapter-provided
+    /// names attached — the "who is controlling this board" readout. Empty if
+    /// the kernel is gone or the surface unknown.
+    pub fn claims(&self, surface: &str, now: Instant) -> Vec<Claim> {
+        self.request(|reply| Cmd::Claims { surface: surface.into(), now, reply })
+            .unwrap_or_default()
     }
 
     #[cfg(test)]
@@ -182,6 +202,10 @@ impl HostApi for HostHandle {
     fn publish(&mut self, path: &str, value: Value) {
         let _ = self.tx.send(Cmd::Publish { path: path.into(), value });
     }
+
+    fn label_source(&mut self, owner: SourceId, name: &str) {
+        let _ = self.tx.send(Cmd::Label { owner, name: name.into() });
+    }
 }
 
 enum Flow {
@@ -192,14 +216,29 @@ fn run(rx: Receiver<Cmd>) {
     // The rebirth seed: declared surfaces, deduped by key. Deliberately NOT
     // claims — see module docs.
     let mut seed: Vec<SurfaceInfo> = Vec::new();
+    // Source IDs must be unique for the WHOLE life of the host, not per kernel
+    // incarnation. OpenRGB/Chroma sessions live OUTSIDE the actor and keep using
+    // their old owner id across a rebirth (the handle contract: queued commands
+    // are served by the reborn kernel, connections survive). A reborn kernel that
+    // reset its counter to 1 would hand a live session's id to a brand-new
+    // connection — and `release_owner` is owner-wide, so either side's disconnect
+    // or timeout would then drop BOTH sessions' claims. Carry the high-water mark
+    // across rebirths so an id is never reused while its original owner may live.
+    let mut next_source: u64 = 1;
     let mut governor =
         Governor::new(Config::critically_damped(0.8)).expect("default governor config is stable");
     loop {
         let mut kernel = Kernel::new();
+        kernel.next_source = next_source;
         for info in seed.clone() {
             kernel.declare(info);
         }
         let outcome = catch_unwind(AssertUnwindSafe(|| serve(&mut kernel, &rx, &mut seed)));
+        // Preserve the counter across rebirth. Readable even after a fault: the
+        // borrow ends when `catch_unwind` returns, and a panic can't corrupt a
+        // plain `u64` — worst case a fault mid-`next_source()` leaves it one short
+        // of incremented, still >= every id ever issued, so never reused.
+        next_source = kernel.next_source;
         match outcome {
             Ok(Flow::Stop) => break,
             Err(_) => match governor.on_crash(Instant::now()) {
@@ -278,6 +317,20 @@ fn apply(kernel: &mut Kernel, seed: &mut Vec<SurfaceInfo>, cmd: Cmd) {
         Cmd::Resolve { surface, now, reply } => {
             let _ = reply.send(kernel.resolve(&surface, now));
         }
+        Cmd::Claims { surface, now, reply } => {
+            let claims = kernel
+                .arbiter
+                .claims(&surface, now)
+                .into_iter()
+                .map(|(owner, priority)| Claim {
+                    owner,
+                    priority,
+                    label: kernel.label_of(owner).map(str::to_string),
+                })
+                .collect();
+            let _ = reply.send(claims);
+        }
+        Cmd::Label { owner, name } => kernel.label_source(owner, &name),
         Cmd::Publish { path, value } => kernel.publish(&path, value),
         Cmd::Subscribe { prefix, reply } => {
             let _ = reply.send(kernel.bus.subscribe(&prefix));
@@ -293,6 +346,44 @@ mod tests {
     use super::*;
     use crate::api::SurfaceKind;
     use crate::arbiter::band;
+
+    #[test]
+    fn claims_carry_names_and_bands_the_who_wins_readout() {
+        // The emergent config no last-writer-wins tool can represent: name a
+        // session, and read whether it WINS or is SUPPRESSED purely from band
+        // ordering — the exact query the LIGHTING truth strip runs.
+        let host = Host::spawn();
+        let mut h = host.handle();
+        h.declare(SurfaceInfo::grid("kbd", "Board", SurfaceKind::Keyboard, 1, 1));
+        let now = Instant::now();
+
+        let base = h.next_source();
+        let game = h.next_source();
+        h.label_source(game, "Overwatch");
+
+        // Policy = games take over: base at BASE, game session above it.
+        let base_lo =
+            h.claim("kbd", base, band::BASE, LeaseSpec::Pinned, Content::Fill(Rgb(0, 40, 30)), now)
+                .unwrap();
+        h.claim("kbd", game, band::SESSION, LeaseSpec::Pinned, Content::Fill(Rgb(200, 0, 0)), now)
+            .unwrap();
+        let claims = h.claims("kbd", now);
+        assert_eq!(claims[0].owner, game, "the named game is topmost");
+        assert_eq!(claims[0].label.as_deref(), Some("Overwatch"));
+        assert!(claims[0].priority > band::BASE, "game paints above base ⇒ PAINTING");
+
+        // Flip to "my lighting wins": re-pin the base ABOVE sessions. The SAME
+        // named game is still present but now LOSES — the suppressed state,
+        // which no arbiter-less tool can even surface.
+        h.release(base_lo);
+        h.claim("kbd", base, band::OVERRIDE, LeaseSpec::Pinned, Content::Fill(Rgb(0, 40, 30)), now)
+            .unwrap();
+        let claims = h.claims("kbd", now);
+        assert_eq!(claims[0].owner, base, "base at OVERRIDE wins");
+        let game_claim = claims.iter().find(|c| c.owner == game).expect("game still present");
+        assert_eq!(game_claim.label.as_deref(), Some("Overwatch"));
+        assert!(game_claim.priority < band::OVERRIDE, "game below base ⇒ SUPPRESSED, not gone");
+    }
 
     #[test]
     fn round_trip_through_the_actor() {
@@ -369,5 +460,28 @@ mod tests {
         // are never reborn — sessions must re-claim).
         let frame = h.resolve("kbd", Instant::now()).expect("surface exists after rebirth");
         assert_eq!(frame, vec![None]);
+    }
+
+    #[test]
+    fn source_ids_are_not_reused_after_rebirth() {
+        // A surviving session keeps its old owner id across a kernel fault. The
+        // reborn kernel must NOT hand that same id to a new caller, or an
+        // owner-wide `release_owner` from either would drop both.
+        let host = Host::spawn();
+        let mut h = host.handle();
+        let a = h.next_source();
+        let b = h.next_source();
+        assert!(b.0 > a.0, "ids increase within one incarnation");
+
+        h.poison(); // kernel thread panics; governor schedules a rebirth
+
+        // This request queues during the rebirth sleep and is served by the
+        // reborn kernel — so its answer reflects the post-rebirth counter.
+        let c = h.next_source();
+        assert_ne!(c, SourceId(u64::MAX), "kernel answered after rebirth");
+        assert!(
+            c.0 > b.0,
+            "reused a source id across rebirth: {c:?} not above {b:?}"
+        );
     }
 }

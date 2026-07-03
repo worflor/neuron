@@ -11,8 +11,8 @@
 //!     meeting/screenshare survive until you clear or hide them).
 //!
 //! Strokes are vectors (point lists in virtual-screen space) — the `.gwyph` persistence rides
-//! these directly once the codec port lands (docs/gwyph-spec.md; the in-memory model already
-//! matches the format's pen-stroke shape).
+//! these directly once the codec port lands (the in-memory model already matches the format's
+//! pen-stroke shape).
 //!
 //! Honesty rules: the canvas never takes input (WS_EX_TRANSPARENT), drawing reads only the
 //! cursor, and nothing here consults the input-arm gate because nothing synthesizes input.
@@ -2253,7 +2253,11 @@ mod imp {
         };
         let (cr, cg, cb, lum) = crate::weave::shade_surface(&px, m);
         let cov = (rad + 0.5 - d).clamp(0.0, 1.0); // 1px AA at the true rim
-        let p = |v: f32| (v.min(1.0) * 255.0) as u32;
+        // sRGB-encode (sqrt ≈ gamma 2.0) like EVERY other consumer of the material — the overlay
+        // cast, the gallery swatch, the curtain static. Un-encoded linear crushed the dim end
+        // (accent halos, breeze trails) so ink read as white cores on black while the gallery
+        // showed the same material in full colour. Cores still clip to white; text stays crisp.
+        let p = |v: f32| (v.min(1.0).sqrt() * 255.0) as u32;
         // toned the cast way: keep the colour, premultiply by coverage — no luminance divide.
         let col = (p(cr) << 16) | (p(cg) << 8) | p(cb);
         let a = ((lum * cov * 255.0).min(255.0)) as u32;
@@ -2520,7 +2524,7 @@ mod imp {
         frame: u32,
     ) {
         unsafe {
-            let facets = crate::weave::material().facets.max(1) as f32;
+            let facets = crate::weave::live_material().facets.max(1) as f32;
             let phase = frame as f32 * 0.16;
             for (rank, &i) in selected.iter().enumerate() {
                 let Some(s) = strokes.get(i) else { continue };

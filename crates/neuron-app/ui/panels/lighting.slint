@@ -213,9 +213,12 @@ component SpectrumEditor inherits VerticalLayout {
                 color: Theme.text-faint;
             }
         }
-        // the strip: the Rust-rendered gradient of the ACTIVE frame's palette, with draggable stop
-        // handles overlaid. Click empty track → add a stop there; click a handle → select it; drag →
-        // reposition. The image is the live fill; the handles are the live model — they update together.
+        // the strip: the Rust-rendered gradient of the ACTIVE frame's palette, with stop handles
+        // overlaid. ONE touch surface owns every gesture — press grabs the nearest handle (or adds
+        // a stop on open track, glue hit-tests) and the drag repositions it live, full-width, in
+        // one smooth motion. The handles themselves are pure VISUALS: a touch area inside the
+        // `for` dies the instant an edit rebuilds the stops model (every move does), which was the
+        // old one-millimeter-per-grab jank — the strip's own area survives every rebuild.
         strip := Rectangle {
             height: 34px;
             border-radius: Theme.radius-sm;
@@ -230,11 +233,18 @@ component SpectrumEditor inherits VerticalLayout {
                 width: 100%; height: 100%;
                 image-fit: fill;
             }
-            // an empty-track click inserts a stop at that fraction (the glue samples the colour there).
-            // Declared BEFORE the handles so the handles (later siblings) win the hit-test on themselves.
-            add-ta := TouchArea {
-                mouse-cursor: MouseCursor.crosshair;
-                clicked => { State.add-stop(clamp(self.mouse-x / strip.width, 0.0, 1.0)); }
+            strip-ta := TouchArea {
+                mouse-cursor: MouseCursor.ew-resize;
+                pointer-event(ev) => {
+                    if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.left) {
+                        State.strip-press(clamp(self.mouse-x / strip.width, 0.0, 1.0));
+                    }
+                }
+                moved => {
+                    if (self.pressed) {
+                        State.move-stop(State.light-sel-stop, clamp(self.mouse-x / strip.width, 0.0, 1.0));
+                    }
+                }
             }
             for s[i] in State.light-stops : handle := Rectangle {
                 property <bool> on: i == root.stop-idx;
@@ -264,31 +274,20 @@ component SpectrumEditor inherits VerticalLayout {
                     y: 19px; x: (parent.width - self.width) / 2;
                     background: Theme.accent;
                 }
-                hta := TouchArea {
-                    mouse-cursor: MouseCursor.ew-resize;
-                    clicked => { State.light-sel-stop = i; }
-                    // strip-space pointer = the handle's own x + the pointer's x within the handle; the
-                    // grab holds past the 13px once pressed, so a full-width drag tracks the cursor.
-                    moved => {
-                        if (self.pressed) {
-                            State.light-sel-stop = i;
-                            State.move-stop(i, clamp((handle.x + self.mouse-x) / strip.width, 0.0, 1.0));
-                        }
-                    }
-                }
             }
         }
-        // +/- stops + the active-stop readout
+        // add/remove + the active-stop readout. The verbs are ADD/REMOVE, not "+ stop"/"- stop" —
+        // "stop" as a bare button word read like a transport control about to halt the effect.
         HorizontalLayout {
             spacing: 7px;
-            Button { text: "+ stop"; clicked => { State.add-stop(0.5); } }
+            Button { text: "+ add"; clicked => { State.add-stop(0.5); } }
             Button {
-                text: "- stop"; danger: true;
+                text: "− remove"; danger: true;
                 enabled: State.light-stops.length > 1;
                 clicked => { State.remove-stop(root.stop-idx); }
             }
             Rectangle {}
-            Mono { text: "stop " + (root.stop-idx + 1); color: Theme.text-faint; }
+            Mono { text: "stop " + (root.stop-idx + 1) + " of " + State.light-stops.length; color: Theme.text-faint; }
         }
         // the selected stop's colour — the SHARED prism picker (the SAME component the SYSTEM accents
         // use). `pick` commits the hex; `preview` recolours the stop live so the strip + the board
@@ -552,6 +551,43 @@ export component LightingPanel inherits VerticalLayout {
         }
     }
 
+    // ── FOREIGN-OWNER truth strip: a protocol client (a Chroma game, an OpenRGB tool) holds a
+    // layer ABOVE this board's base right now, so the preview below and the physical board
+    // intentionally disagree — say so, plainly, where the user is looking. Clears itself the
+    // moment the client releases (the ~1s claims poll rides the preview tick).
+    if State.light-foreign && State.sel-can-light && State.grid-rows > 0 : Rectangle {
+        background: Theme.bg-2; border-radius: Theme.radius;
+        border-width: Theme.hair; border-color: Theme.line;
+        VerticalLayout {
+            padding: 8px; spacing: 2px;
+            // name the owner when it announced one — "Overwatch is painting this board" turns a
+            // spooky wrong-effect moment into the arbiter doing its job, visibly.
+            Mono {
+                text: (State.light-foreign-app == "" ? "another app" : State.light-foreign-app)
+                    + " is painting this board (via CONNECTIONS)";
+                color: Theme.text-dim;
+            }
+            Mono { text: "your lighting is composed underneath and returns the moment it lets go."; color: Theme.text-faint; }
+        }
+    }
+
+    // ── SUPPRESSED strip: the "my lighting always wins" flip side — a client is CONNECTED but
+    // your base outranks it, so it's here and honestly not showing. No tool without an arbiter
+    // can tell you this; we can, because the session is a first-class, named claim.
+    if State.light-suppressed && State.sel-can-light && State.grid-rows > 0 : Rectangle {
+        background: Theme.bg-2; border-radius: Theme.radius;
+        border-width: Theme.hair; border-color: Theme.line;
+        VerticalLayout {
+            padding: 8px; spacing: 2px;
+            Mono {
+                text: (State.light-foreign-app == "" ? "another app" : State.light-foreign-app)
+                    + " is connected but suppressed — your lighting wins.";
+                color: Theme.text-dim;
+            }
+            Mono { text: "turn off \u{201c}my lighting always wins\u{201d} in SYSTEM to let it take over."; color: Theme.text-faint; }
+        }
+    }
+
     // ── THE SURFACE: render hero (centred) → gallery + contextual inspector ─
     if State.sel-can-light && State.grid-rows > 0 : VerticalLayout {
         spacing: Theme.section-gap;
@@ -666,7 +702,7 @@ export component LightingPanel inherits VerticalLayout {
                         changed(v) => { State.set-light-fps(v); }
                     }
                     if State.light-fps-legacy : Mono {
-                        text: "legacy board · ~6 fps before frames drop";
+                        text: "legacy board · wire-verified to 30 fps";
                         color: Theme.text-faint; wrap: word-wrap;
                     }
                 }

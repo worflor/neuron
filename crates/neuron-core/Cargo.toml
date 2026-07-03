@@ -9,7 +9,7 @@ name = "neuron"
 description = "Open, lightweight control for Razer devices. The anti-Synapse."
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license-file.workspace = true
 # Bundles a private CPython into the binary: build.rs downloads (and sha256-verifies against the
 # release's SHA256SUMS manifest) a python-build-standalone tarball for the build target, caches it
 # under vendor/pbs-cache/, and hands its path to the crate via NEURON_PY_TARBALL, which

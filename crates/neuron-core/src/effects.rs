@@ -44,6 +44,11 @@ pub struct Param {
     pub key: &'static str,
     pub label: &'static str,
     pub kind: ParamKind,
+    /// Conditional VISIBILITY: `Some((other_key, values))` shows this knob only while the layer's
+    /// `other_key` enum currently holds one of `values`. Data-driven honesty — a knob that would
+    /// no-op for the current configuration (e.g. the meter's audio `focus` while a CPU source is
+    /// selected) simply isn't rendered, instead of sitting there dead. `None` = always shown.
+    pub only_when: Option<(&'static str, &'static [u8])>,
 }
 
 // ── BLEND — how a layer's pixels combine with what's beneath them ─────────────────────────
@@ -55,6 +60,12 @@ pub enum Blend {
     Normal, // opaque over (within the region)
     Add,    // additive — stacked glows brighten
     Screen, // lighten — softer than add, never clips ugly
+    /// Sprite/cutout: an unlit (pure-black) cell falls THROUGH to the layer beneath; a lit cell
+    /// REPLACES it at true colour. The readout blend: a data layer (vitals gauge, on-air light)
+    /// must vanish where it has nothing to say AND read its exact colour where it does — Normal
+    /// would punch black holes when idle, Screen would wash the lit colour into whatever effect
+    /// runs underneath (battery red over an aurora reads pink).
+    Cut,
 }
 
 impl Blend {
@@ -62,6 +73,7 @@ impl Blend {
         match s.to_lowercase().as_str() {
             "add" => Blend::Add,
             "screen" => Blend::Screen,
+            "cut" | "cutout" => Blend::Cut,
             _ => Blend::Normal,
         }
     }
@@ -69,6 +81,7 @@ impl Blend {
         match self {
             Blend::Add => "add",
             Blend::Screen => "screen",
+            Blend::Cut => "cut",
             Blend::Normal => "normal",
         }
     }
@@ -86,6 +99,14 @@ pub fn blend_px(under: Rgb, over: Rgb, mode: Blend) -> Rgb {
         Blend::Screen => {
             let s = |a: u8, b: u8| (255 - ((255 - a as u16) * (255 - b as u16) / 255)) as u8;
             Rgb::new(s(under.r, over.r), s(under.g, over.g), s(under.b, over.b))
+        }
+        // Cutout: black = "nothing to say" (fall through); anything lit replaces at true colour.
+        Blend::Cut => {
+            if over == Rgb::BLACK {
+                under
+            } else {
+                over
+            }
         }
     }
 }

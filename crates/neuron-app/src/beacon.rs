@@ -1370,6 +1370,13 @@ fn wedge_view(a: &neuron::action::Action) -> crate::overlay::WedgeView {
             Tone::Plain,
             None,
         ),
+        Action::Sniper { dpi } => mk(
+            WedgeGlyph::Target,
+            "sniper",
+            Some(format!("hold \u{2192} {dpi}")),
+            Tone::Plain,
+            None,
+        ),
         // a VERB, not a readout: "flip output" + the device you're on NOW, so it reads as "press to
         // flip away from <current>" instead of mislabeling the current device as the action itself.
         Action::OutputFlip { .. } => mk(
@@ -1530,6 +1537,42 @@ fn wedge_view(a: &neuron::action::Action) -> crate::overlay::WedgeView {
         Action::Turbo { .. } => mk(WedgeGlyph::Key, "turbo", None, Tone::Plain, None),
         Action::Key { .. } | Action::MouseButton { .. } => {
             mk(WedgeGlyph::Key, &a.describe(), None, Tone::Plain, None)
+        }
+        // OBS — the wedge reads the LIVE broadcast truth from the host's mirror: Active while
+        // the thing it toggles is running, Inert when OBS isn't connected (the wedge never
+        // promises what the host can't deliver right now).
+        Action::Obs { op, arg } => {
+            use neuron::action::ObsOp;
+            let s = crate::host::obs_snapshot();
+            let (title, running) = match op {
+                ObsOp::Stream => ("stream", s.streaming),
+                ObsOp::Record => ("record", s.recording),
+                ObsOp::RecordPause => ("rec pause", s.recording),
+                ObsOp::Replay => ("clip", false),
+                ObsOp::Scene => ("scene", false),
+                ObsOp::Mute => ("obs mute", false),
+            };
+            let detail = if !s.connected {
+                Some("OBS not connected".to_string())
+            } else {
+                match op {
+                    ObsOp::Scene => Some(format!("\u{2192} {arg}")),
+                    ObsOp::Stream if s.streaming => Some("LIVE".to_string()),
+                    ObsOp::Record | ObsOp::RecordPause if s.recording => {
+                        Some("recording".to_string())
+                    }
+                    ObsOp::Mute if !arg.is_empty() => Some(arg.clone()),
+                    _ => None,
+                }
+            };
+            let tone = if !s.connected {
+                Tone::Inert
+            } else if running {
+                Tone::Active
+            } else {
+                Tone::Plain
+            };
+            mk(WedgeGlyph::Media, title, detail, tone, None)
         }
         Action::Noop => WedgeView::blank(),
     }

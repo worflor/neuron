@@ -15,7 +15,7 @@ name = "neuron-app"
 description = "Neuron resident app — tray + Slint GUI for the anti-Synapse."
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license-file.workspace = true
 
 [[bin]]
 name = "neuron-app"
@@ -23,6 +23,11 @@ path = "src/main.rs"
 
 [dependencies]
 neuron = { path = "../neuron-core" }
+# The protocol host: ownership arbiter + OpenRGB/Chroma servers + the neuron-core
+# bridge (the "bridge" feature pulls in the real HID sinks). This is what lets
+# games (Chroma) and RGB tools (OpenRGB) drive the SAME lighting the app edits,
+# with the app's layer stack as the animated base layer underneath.
+neuron-host = { path = "../neuron-host", features = ["bridge"] }
 # strokelab (dev stroke dump) serializes the full eigenmotion bundle as JSON and runs the raw stroke
 # through the engram trajectory codec for the macro+micro oscillator decomposition.
 engram = { path = "../engram" }

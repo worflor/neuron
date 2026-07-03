@@ -185,8 +185,11 @@ impl Effect {
     }
 
     /// Can Neuron synthesize this effect host-side (for emulation on devices lacking it)?
+    /// Reactive needs keypress input from firmware; Starlight's emulation renders a flat static
+    /// fill (see `render_frame`), which is NOT starlight — advertising it would be a silent lie,
+    /// the same reason Reactive is excluded. Both come back if/when a real host animation ships.
     pub fn is_emulatable(self) -> bool {
-        !matches!(self, Effect::Reactive) // reactive needs keypress input from firmware
+        !matches!(self, Effect::Reactive | Effect::Starlight)
     }
 }
 
@@ -290,7 +293,7 @@ impl LightingDef {
     ///     followed by each effect's OWN sub-args, and OpenRazer sends a FIXED per-effect
     ///     `data_size` (static 0x04, off/spectrum 0x01, wave 0x02, reactive 0x05, breathing 0x08).
     ///     We reproduce those byte-for-byte so the board actually repaints instead of ACK-and-ignore.
-    pub fn native_effect_report(&self, e: Effect, color: Option<Rgb>) -> Option<Report> {
+    pub fn native_effect_report(&self, e: Effect, color: Option<Rgb>, persist: bool) -> Option<Report> {
         let id = *self.effects.get(e.name())?;
         match self.protocol {
             Protocol::Matrix => {
@@ -301,6 +304,16 @@ impl LightingDef {
                     // extended-matrix colour effects carry a `00 00 01` (one-colour) preamble,
                     // then RGB — confirmed live on the Naga (static red rendered).
                     args.extend_from_slice(&[0x00, 0x00, 0x01, c.r, c.g, c.b]);
+                }
+                // VARSTORE persists the effect to onboard memory (survives with no software) —
+                // only the Matrix dialect has storage, and its varstore byte is args[0] (the very
+                // prefix this builder laid down above). Owned HERE, inside the translation layer,
+                // so no caller ever needs to know which byte means "store" (the one era leak the
+                // stack audit found: `set_effect` used to reach in and poke args[0] itself).
+                if persist {
+                    if let Some(varstore) = args.first_mut() {
+                        *varstore = 0x01;
+                    }
                 }
                 Some(Report {
                     class: self.effect.class,
@@ -805,8 +818,10 @@ const DPI_PIP_KEYS: [&str; 12] = [
 // This is the reusable core. It is a PURE function — `{battery, charging, stage} -> Vec<Rgb>` for a
 // rows×cols matrix — so the CLI `lighting mirror` loop and (next phase) the GUI lighting page paint
 // the IDENTICAL surface behind the same call. Device lighting is theme-agnostic: raw `Rgb`, never the
-// GUI palette. The legacy V2 is a slow board, so the surface is painted ON-DEMAND when state changes,
-// never streamed.
+// GUI palette. The surface is painted ON-DEMAND when state changes, never streamed — vitals change
+// on the seconds scale, so a paced stream would be pure waste. (Historically this was justified as
+// "the legacy V2 is a slow board" — folklore since falsified by the wire probe; the on-demand
+// design stands on its own merits.)
 
 /// One snapshot of a source device's live vitals — what the data surface visualises.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -959,6 +974,125 @@ pub(crate) fn clear_vitals() {
     *vitals_slot().lock().unwrap_or_else(|p| p.into_inner()) = None;
 }
 
+// ── the live BROADCAST feed: the app pushes, the `onair` lighting pattern pulls ──────────
+//
+// Same push shape as the vitals feed above, for a different truth: the broadcast state OBS
+// announces over its websocket (streaming / recording), mirrored app-side and pushed here on
+// every change. The `onair` pattern reads it per frame, so "you are live" becomes a LAYER the
+// user paints — their region, their spectrum, their blend — instead of a colour forced on them.
+
+/// One snapshot of the broadcast state — what the `onair` pattern visualises. Everything in it
+/// was ANNOUNCED by OBS (resynced at connect), never assumed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Broadcast {
+    /// The websocket to OBS is authenticated — we actually KNOW the flags below. `false` means
+    /// unknown, and the pattern renders dark rather than guessing (a tally that might be wrong
+    /// is worse than none).
+    pub connected: bool,
+    /// The stream is live to the public.
+    pub streaming: bool,
+    /// A recording is running.
+    pub recording: bool,
+}
+
+fn broadcast_slot() -> &'static Mutex<Option<Broadcast>> {
+    static B: OnceLock<Mutex<Option<Broadcast>>> = OnceLock::new();
+    B.get_or_init(|| Mutex::new(None))
+}
+
+/// Publish the freshest broadcast state for the `onair` pattern to visualise. The app's OBS
+/// follower calls this on every announced change, and pushes a disconnected default when the
+/// connection tears down — so the pattern can never render a stale "live".
+pub fn publish_broadcast(b: Broadcast) {
+    *broadcast_slot().lock().unwrap_or_else(|p| p.into_inner()) = Some(b);
+}
+
+/// The most recently published broadcast state (`None` before the first publish — renders dark,
+/// honest). `pub(crate)` — only the pattern pulls it; the app is the writer.
+pub(crate) fn latest_broadcast() -> Option<Broadcast> {
+    *broadcast_slot().lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Test-only reset, mirroring [`clear_vitals`].
+#[cfg(test)]
+pub(crate) fn clear_broadcast() {
+    *broadcast_slot().lock().unwrap_or_else(|p| p.into_inner()) = None;
+}
+
+// ── the live HOLD-STATE feed: the dispatch loop pushes, the `modeheld` pattern pulls ─────
+//
+// Edge-accurate input-mode truth: is a hold layer (HyperShift) engaged, is a sniper hold live?
+// The app's dispatch loop owns those edges (it IS the thing tracking them), pushes here on every
+// tick/edge, and pushes the default when the live loop stops — so the layer can never show a
+// mode that isn't really held.
+
+/// The held input modes the `modeheld` pattern visualises.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HoldState {
+    /// ANY hold layer is engaged (HyperShift and friends — the header SHIFT pill's truth).
+    pub layer: bool,
+    /// A sniper hold is live (DPI dropped until release).
+    pub sniper: bool,
+}
+
+fn hold_slot() -> &'static Mutex<Option<HoldState>> {
+    static H: OnceLock<Mutex<Option<HoldState>>> = OnceLock::new();
+    H.get_or_init(|| Mutex::new(None))
+}
+
+/// Publish the current hold state — the dispatch loop calls this on edges (and cheaply per
+/// tick: one lock, one copy).
+pub fn publish_hold(h: HoldState) {
+    *hold_slot().lock().unwrap_or_else(|p| p.into_inner()) = Some(h);
+}
+
+/// The latest hold state (`None` before the live loop first publishes — renders dark).
+pub(crate) fn latest_hold() -> Option<HoldState> {
+    *hold_slot().lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Test-only reset, mirroring [`clear_vitals`].
+#[cfg(test)]
+pub(crate) fn clear_hold() {
+    *hold_slot().lock().unwrap_or_else(|p| p.into_inner()) = None;
+}
+
+// ── the SIGNAL channels: macros write, the `signal` pattern pulls ────────────────────────
+//
+// Four numbered 0..=1 channels ANY macro can drive (`neuron.signal(2, 0.8)` → the `signal` act
+// verb → here). This is the emergence seam: neuron doesn't enumerate what a light can mean — CI
+// status, a pomodoro, a boss timer, "someone joined voice" — the user's own scripts decide, and
+// the engine renders it wherever they painted that channel's layer. Values persist until
+// overwritten (a CI light STAYS red until a macro turns it green); process-state only, cleared
+// by a relaunch, never persisted.
+
+/// How many macro-drivable signal channels exist (0-indexed here; 1-indexed in the macro API
+/// and the layer's knob).
+pub const SIGNAL_CHANNELS: usize = 4;
+
+fn signal_slots() -> &'static [std::sync::atomic::AtomicU32; SIGNAL_CHANNELS] {
+    static S: OnceLock<[std::sync::atomic::AtomicU32; SIGNAL_CHANNELS]> = OnceLock::new();
+    S.get_or_init(|| std::array::from_fn(|_| std::sync::atomic::AtomicU32::new(0f32.to_bits())))
+}
+
+/// Set a signal channel (0-indexed; out-of-range ignored; value clamped to 0..=1). Lock-free.
+pub fn set_signal(channel: usize, value: f32) {
+    if let Some(slot) = signal_slots().get(channel) {
+        slot.store(
+            value.clamp(0.0, 1.0).to_bits(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+}
+
+/// Read a signal channel (0-indexed; out-of-range reads 0.0). Lock-free, cheap per frame.
+pub fn signal(channel: usize) -> f32 {
+    signal_slots()
+        .get(channel)
+        .map(|s| f32::from_bits(s.load(std::sync::atomic::Ordering::Relaxed)))
+        .unwrap_or(0.0)
+}
+
 // ── backend facade: one lighting API over both Chroma eras ──────────────────────────────
 
 /// A logical RGB surface. Callers paint this; the backend translates it to whichever wire
@@ -995,6 +1129,10 @@ impl Canvas {
 pub struct Lights<'a> {
     dev: &'a crate::device::Device,
     def: LightingDef,
+    /// Driver-mode memo: `true` once [`ensure_control`](Lights::ensure_control) has verified/taken
+    /// host control on this handle, so every render path can call it unconditionally and only the
+    /// first call pays the round-trip.
+    controlled: std::cell::Cell<bool>,
 }
 
 // ── animate-loop helpers: pure, testable row-dedup + deadline pacing ──────────────────────
@@ -1037,6 +1175,15 @@ pub fn changed_rows(prev: Option<&[Rgb]>, cur: &[Rgb], cols: usize) -> Vec<usize
     out
 }
 
+/// THE streaming rate ceiling — the ONE constant every layer of the lighting pipeline clamps fps
+/// against: `Lights::animate`, the host bridge's `CompositorContent` quantization + pace atomic,
+/// the host writer's tick, and the app's `host::set_lighting`. It exists so the render
+/// quantization and the write cadence can never be clamped into DIFFERENT domains (the old split —
+/// writer at 1..=60, everything else at 1..=30 — let a >30 pace burn kernel resolves on frames the
+/// content layer never rendered). 30 is wire-verified on every shipped board (see
+/// `device::tests::live_stream_strategy_probe`).
+pub const MAX_STREAM_FPS: u32 = 30;
+
 /// Deadline-pacing math (pure): given the frame's target `deadline`, the time `now` after its work,
 /// and the frame interval `dt`, return `(updated_deadline, sleep)`. Ahead of schedule → sleep the
 /// remainder up to `deadline`. Overran (`now >= deadline`) → no sleep (`Duration::ZERO`) AND the
@@ -1060,32 +1207,39 @@ pub fn pace(
 
 impl<'a> Lights<'a> {
     pub fn new(dev: &'a crate::device::Device, def: LightingDef) -> Self {
-        Lights { dev, def }
+        Lights { dev, def, controlled: std::cell::Cell::new(false) }
     }
     pub fn def(&self) -> &LightingDef {
         &self.def
     }
 
-    /// Take host control (the driver-mode switch Synapse hides behind). Idempotent.
+    /// Take host control (the driver-mode switch Synapse hides behind). Idempotent AND memoized
+    /// per handle: the first call round-trips the device, later calls are free — so every render
+    /// path below calls it unconditionally. That guarantee matters: OUTSIDE driver mode the
+    /// firmware ACKs lighting writes and silently ignores them, so a path that forgot to take
+    /// control "succeeded" with a dark board (the silent-no-op trap the stack audit found on the
+    /// ACK'd paint/effect paths, which used to rely on callers remembering).
     pub fn ensure_control(&self) -> anyhow::Result<()> {
+        if self.controlled.get() {
+            return Ok(());
+        }
         if self.dev.run("device_mode").map(|m| m[0]).unwrap_or(0) != 0x03 {
             self.dev.exec_dynamic(0x00, 0x04, 0x02, &[0x03, 0x00])?;
         }
+        self.controlled.set(true);
         Ok(())
     }
 
     /// Set an effect: a native firmware effect if the device has it, else emulate it by painting
     /// a computed frame. This is the legacy<->matrix translation core — anything a device lacks
-    /// natively becomes a custom frame, which BOTH protocols support.
+    /// natively becomes a custom frame, which BOTH protocols support. An effect that is neither
+    /// native NOR faithfully emulatable (Reactive, Starlight — see [`Effect::is_emulatable`]) is
+    /// an ERROR, not a silent flat-fill approximation: `set_effect` must agree with `available()`.
     pub fn set_effect(&self, e: Effect, color: Option<Rgb>, persist: bool) -> anyhow::Result<()> {
-        if let Some(mut rep) = self.def.native_effect_report(e, color) {
-            // VARSTORE persists the effect to onboard memory (survives with no software). Only
-            // matrix devices have onboard lighting storage; legacy keyboards have none.
-            if persist && self.def.protocol == Protocol::Matrix && !rep.args.is_empty() {
-                rep.args[0] = 0x01;
-            }
+        self.ensure_control()?;
+        if let Some(rep) = self.def.native_effect_report(e, color, persist) {
             self.dev.apply_lighting(&rep)?;
-        } else {
+        } else if e.is_emulatable() {
             let frame = render_frame(
                 e,
                 self.def.rows,
@@ -1094,6 +1248,11 @@ impl<'a> Lights<'a> {
                 color.unwrap_or(Rgb::new(0, 255, 0)),
             );
             self.paint_px(&frame)?;
+        } else {
+            anyhow::bail!(
+                "effect '{}' is not available on this device (no native support, no faithful emulation)",
+                e.name()
+            );
         }
         Ok(())
     }
@@ -1112,6 +1271,9 @@ impl<'a> Lights<'a> {
     }
 
     fn paint_px(&self, px: &[Rgb]) -> anyhow::Result<()> {
+        // Driver mode is a render-path guarantee, not caller homework (memoized — free after the
+        // first call on this handle). Without it the firmware ACKs every row and paints nothing.
+        self.ensure_control()?;
         for r in self.def.frame_reports(px) {
             self.dev.apply_lighting(&r)?;
         }
@@ -1136,14 +1298,13 @@ impl<'a> Lights<'a> {
         let display = self.def.custom_display_report();
         let cols = self.def.cols as usize;
         // TUNABLE rate: `fps()` is read EVERY frame (not captured once) so the user can re-pace a
-        // RUNNING stream without restarting it. It's clamped only to a sane absolute range — the
-        // legacy "6" is no longer a hard ceiling here, it's just the GUI's per-board DEFAULT. Be
-        // honest, though: legacy standard-matrix boards (e.g. the BlackWidow Chroma V2) have slow
-        // HID — a full-matrix frame is ~7 fire-and-drain feature writes and they physically DROP
-        // writes above ~6fps (the wave froze at 30, animated cleanly at 6 — hardware-confirmed), so
-        // values above ~6 may stutter on them. Matrix boards (the Naga's extended path) hold the
-        // requested rate. The data-surface paints on-demand (not via this loop), so this only paces
-        // continuous EFFECTS.
+        // RUNNING stream without restarting it, clamped to a sane absolute range. The old "legacy
+        // boards drop above ~6fps" belief was FOLKLORE: the live wire probe
+        // (`device::tests::live_stream_strategy_probe`) measured ~1ms per fire-and-drain feature
+        // report on the BlackWidow — a full 7-report frame in <10ms, 30fps sustained clean. The
+        // historical 6fps ceiling came from the ACK'd path (10ms first-poll sleep × 7 reports),
+        // not the silicon. The data-surface paints on-demand (not via this loop), so this only
+        // paces continuous EFFECTS.
         //
         // ROW-LEVEL DEDUP: the device LATCHES and holds its buffer, so a row whose bytes are
         // unchanged needn't be re-sent — it keeps displaying. We cache the last frame we actually
@@ -1159,7 +1320,7 @@ impl<'a> Lights<'a> {
         let run_start = Instant::now();
         let mut next = run_start; // deadline-pacing anchor (separate from the wall-clock phase).
         while !stop() && run_start.elapsed().as_secs_f64() < secs as f64 {
-            let fps = fps().clamp(1, 30);
+            let fps = fps().clamp(1, MAX_STREAM_FPS);
             let dt = Duration::from_millis(1000 / fps as u64);
             // Quantize the SHARED render clock to 1/fps steps via the ONE helper the GUI preview also
             // calls (`quantized_t` off the process-global `render_epoch`), so the on-screen mirror steps
@@ -1167,10 +1328,9 @@ impl<'a> Lights<'a> {
             // epoch + same formula ⇒ the preview provably matches the board. Wall-clock (not
             // frame_index/fps) keeps the phase CONTINUOUS when fps is re-tuned mid-stream, and the shared
             // epoch (not this stream's start) means a restart can't jump it.
-            let elapsed = crate::pattern::quantized_t(
-                crate::pattern::render_epoch().elapsed().as_secs_f32(),
-                fps,
-            );
+            // `render_elapsed()` wraps at 4096s in the duration domain, so the f32 phase stays frame-precise
+            // at any uptime (a raw `.as_secs_f32()` decays to a stutter after ~a day).
+            let elapsed = crate::pattern::quantized_t(crate::pattern::render_elapsed(), fps);
             let frame = comp.render(self.def.rows, self.def.cols, elapsed);
 
             // Which rows differ from what's already on the board? A live fps change re-quantizes the
@@ -1309,28 +1469,28 @@ mod tests {
         let d = legacy_def();
         // STATIC red: 0x03/0x0A, args [STATIC=0x06, FF,00,00], data_size 0x04, tx 0x3F.
         let r = d
-            .native_effect_report(Effect::Static, Some(Rgb::new(0xFF, 0, 0)))
+            .native_effect_report(Effect::Static, Some(Rgb::new(0xFF, 0, 0)), false)
             .unwrap();
         assert_eq!((r.class, r.id), (0x03, 0x0A));
         assert_eq!(r.args, vec![0x06, 0xFF, 0x00, 0x00]);
         assert_eq!(r.size, Some(0x04));
         assert_eq!(r.tx, Some(0x3F));
         // OFF / SPECTRUM: single effect-id byte, data_size 0x01.
-        let off = d.native_effect_report(Effect::Off, None).unwrap();
+        let off = d.native_effect_report(Effect::Off, None, false).unwrap();
         assert_eq!((off.args.clone(), off.size), (vec![0x00], Some(0x01)));
-        let spec = d.native_effect_report(Effect::Spectrum, None).unwrap();
+        let spec = d.native_effect_report(Effect::Spectrum, None, false).unwrap();
         assert_eq!((spec.args.clone(), spec.size), (vec![0x04], Some(0x01)));
         // WAVE: [WAVE, dir=1], data_size 0x02.
-        let w = d.native_effect_report(Effect::Wave, None).unwrap();
+        let w = d.native_effect_report(Effect::Wave, None, false).unwrap();
         assert_eq!((w.args.clone(), w.size), (vec![0x01, 0x01], Some(0x02)));
         // REACTIVE: [REACTIVE, speed=1, r,g,b], data_size 0x05.
         let re = d
-            .native_effect_report(Effect::Reactive, Some(Rgb::new(1, 2, 3)))
+            .native_effect_report(Effect::Reactive, Some(Rgb::new(1, 2, 3)), false)
             .unwrap();
         assert_eq!((re.args.clone(), re.size), (vec![0x02, 0x01, 1, 2, 3], Some(0x05)));
         // BREATHING single: [BREATHING, type=1, r,g,b], data_size 0x08.
         let br = d
-            .native_effect_report(Effect::Breathing, Some(Rgb::new(9, 8, 7)))
+            .native_effect_report(Effect::Breathing, Some(Rgb::new(9, 8, 7)), false)
             .unwrap();
         assert_eq!((br.args.clone(), br.size), (vec![0x03, 0x01, 9, 8, 7], Some(0x08)));
     }
@@ -1364,7 +1524,7 @@ mod tests {
         // byte-identical to before. Guards rule #3 (do not change the Naga).
         let d = matrix_def();
         let r = d
-            .native_effect_report(Effect::Static, Some(Rgb::new(1, 2, 3)))
+            .native_effect_report(Effect::Static, Some(Rgb::new(1, 2, 3)), false)
             .unwrap();
         assert_eq!(r.size, None);
         let reps = d.frame_reports(&[Rgb::new(1, 2, 3), Rgb::new(4, 5, 6)]);
@@ -1376,17 +1536,17 @@ mod tests {
     fn native_effect_args_are_prefix_plus_id_plus_color() {
         let d = matrix_def();
         // spectrum (no colour): args = prefix [00,00] + id 03
-        let r = d.native_effect_report(Effect::Spectrum, None).unwrap();
+        let r = d.native_effect_report(Effect::Spectrum, None, false).unwrap();
         assert_eq!(r.class, 0x0F);
         assert_eq!(r.id, 0x02);
         assert_eq!(r.args, vec![0x00, 0x00, 0x03]);
         // static (colour) on matrix: prefix + id 01 + [00 00 01] preamble + RGB
         let r = d
-            .native_effect_report(Effect::Static, Some(Rgb::new(10, 20, 30)))
+            .native_effect_report(Effect::Static, Some(Rgb::new(10, 20, 30)), false)
             .unwrap();
         assert_eq!(r.args, vec![0x00, 0x00, 0x01, 0x00, 0x00, 0x01, 10, 20, 30]);
         // breathing not in this device's native set
-        assert!(d.native_effect_report(Effect::Breathing, None).is_none());
+        assert!(d.native_effect_report(Effect::Breathing, None, false).is_none());
     }
 
     #[test]

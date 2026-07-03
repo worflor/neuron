@@ -674,7 +674,7 @@ Mitigation:
 
 ### Risk: Docs Drift
 
-`docs/knockback.md` is now a feature implementation/design plan, not the source of truth for the app architecture. The README is product narrative plus user-facing architecture, but it is too broad to serve as implementation TDD.
+`docs/KNOCKBACK.md` is now a feature implementation/design plan, not the source of truth for the app architecture. The README is product narrative plus user-facing architecture, but it is too broad to serve as implementation TDD.
 
 Mitigation:
 
@@ -711,4 +711,4 @@ Neuron is ready to replace Synapse for daily use when these checks are true on t
 ## 11. Related Docs
 
 - `README.md`: product narrative, user-facing feature map, commands, and honesty/status.
-- `docs/knockback.md`: feature design and implementation plan for the rhythm familiar.
+- `docs/KNOCKBACK.md`: feature design and implementation plan for the rhythm familiar.

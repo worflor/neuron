@@ -69,13 +69,15 @@ component NavEntry inherits Rectangle {
     ta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.clicked(); } }
 }
 
-// One settling panel slot — the channel switch is a mechanical contact: the leaving panel drops
-// out, the arriving one settles in over Theme.settle (110ms). visible gates painting so the five
-// hidden panels cost nothing in the software renderer.
+// One settling panel slot — the channel switch is a mechanical contact: the leaving panel CUTS
+// (instant, a selector releasing) and only the arriving one settles in over Theme.settle.
+// Gating `visible` strictly on `active` is also the switch's paint bill halved: the old
+// cross-dissolve (`|| opacity > 0.01`) kept BOTH page trees painting for the whole settle, and
+// on the heavier pages (LIGHTING's live tile grid) that double-paint read as a switch hitch.
 component PanelSlot inherits Rectangle {
     in property <bool> active;
     opacity: root.active ? 1.0 : 0.0;
-    visible: root.active || self.opacity > 0.01;
+    visible: root.active;
     y: root.active ? 0px : 4px;
     animate opacity, y { duration: Theme.settle; }
     @children
@@ -122,7 +124,7 @@ export component AppWindow inherits Window {
     // a second click within 2.5s commits. Disarming (ARMED -> SAFE) is always one click.
     property <bool> arm-confirm: false;
     Timer {
-        interval: 2500ms;
+        interval: Theme.confirm-window;
         running: root.arm-confirm;
         triggered => { root.arm-confirm = false; }
     }
@@ -592,7 +594,8 @@ export component AppWindow inherits Window {
                                     }
                                     // each block is PROSE (quiet sans, the exception in a mono UI) or a
                                     // CODE CELL (mono on a well, hairline-framed — the same surface as the
-                                    // macro editor, so a snippet here looks like where it'll be pasted).
+                                    // macro editor, so a snippet here looks like where it'll be pasted). The
+                                    // code cell is selectable and carries a floating copy button (top-right).
                                     for b in s.blocks : VerticalLayout {
                                         if !b.code : Text {
                                             text: b.text;
@@ -601,7 +604,9 @@ export component AppWindow inherits Window {
                                             font-size: Theme.fs-body;
                                             wrap: word-wrap;
                                         }
-                                        if b.code : Rectangle {
+                                        if b.code : codecell := Rectangle {
+                                            // flipped true for ~1.2s after a copy → swaps the glyph to a ✓
+                                            property <bool> copied;
                                             background: Theme.well;
                                             border-radius: Theme.radius-sm;
                                             border-width: Theme.hair;
@@ -609,14 +614,84 @@ export component AppWindow inherits Window {
                                             clip: true;
                                             HorizontalLayout {
                                                 padding: 10px;
-                                                Text {
+                                                // a READ-ONLY TextInput (not a Text): renders identical to the
+                                                // editor's CodeArea, but the snippet is now SELECTABLE (drag /
+                                                // Ctrl-C) and is the clipboard source the copy button drives.
+                                                codeti := TextInput {
                                                     text: b.text;
+                                                    read-only: true;
                                                     color: Theme.text;
                                                     font-family: Theme.mono;
                                                     font-size: Theme.fs-data;
+                                                    single-line: false;
                                                     wrap: no-wrap;   // preserve indentation + comment alignment
                                                 }
                                                 Rectangle {}   // soak leftover width so the cell spans the card
+                                            }
+                                            // ── floating COPY button — pinned top-right, painted OVER the cell
+                                            // (declared after the layout). The snippet literally says "paste it";
+                                            // this is the one-click path. copy() writes the selection to the OS
+                                            // clipboard via the winit backend, then we drop the highlight so the
+                                            // cell reads clean; the Timer flips the ✓ back to the glyph.
+                                            copybtn := Rectangle {
+                                                x: parent.width - self.width - 6px;
+                                                y: 6px;
+                                                width: 22px;
+                                                height: 22px;
+                                                border-radius: Theme.radius-sm;
+                                                background: cta.has-hover || codecell.copied ? Theme.well-hi
+                                                    : Theme.bg-2.with-alpha(0.75);
+                                                border-width: Theme.hair;
+                                                border-color: cta.has-hover ? Theme.line : Theme.line.with-alpha(0.5);
+                                                animate background, border-color { duration: Theme.quick; }
+                                                // custom copy mark — two offset sheets (front + the L of the sheet
+                                                // behind), hand-authored as SVG path commands so it tints with the
+                                                // theme and brightens on hover. Hidden once copied.
+                                                Path {
+                                                    visible: !codecell.copied;
+                                                    x: 5px;
+                                                    y: 5px;
+                                                    width: 12px;
+                                                    height: 12px;
+                                                    viewbox-width: 24;
+                                                    viewbox-height: 24;
+                                                    fill: transparent;
+                                                    stroke: cta.has-hover ? Theme.text : Theme.text-dim;
+                                                    stroke-width: 1.3px;
+                                                    // front sheet (closed) + the L of the sheet behind (open),
+                                                    // straight-line only — crisp at 12px, on the mono grain
+                                                    commands: "M9 9 H20 V20 H9 Z M6 15 H4 V4 H15 V6";
+                                                    animate stroke { duration: Theme.quick; }
+                                                }
+                                                // the copied ✓ — a hand-drawn check, shown briefly after a copy
+                                                Path {
+                                                    visible: codecell.copied;
+                                                    x: 5px;
+                                                    y: 5px;
+                                                    width: 12px;
+                                                    height: 12px;
+                                                    viewbox-width: 24;
+                                                    viewbox-height: 24;
+                                                    fill: transparent;
+                                                    stroke: Theme.accent;
+                                                    stroke-width: 1.7px;
+                                                    commands: "M5 13 L9 17 L19 6";
+                                                }
+                                                cta := TouchArea {
+                                                    mouse-cursor: MouseCursor.pointer;
+                                                    clicked => {
+                                                        codeti.select-all();
+                                                        codeti.copy();
+                                                        codeti.clear-selection();
+                                                        codecell.copied = true;
+                                                    }
+                                                }
+                                                // single-shot reset — runs only while `copied`, then clears it
+                                                Timer {
+                                                    interval: 1200ms;
+                                                    running: codecell.copied;
+                                                    triggered => { codecell.copied = false; }
+                                                }
                                             }
                                         }
                                     }

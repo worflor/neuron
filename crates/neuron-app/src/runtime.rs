@@ -29,6 +29,10 @@ pub struct DeviceState {
     pub name: String,
     pub codename: String,
     pub pid: u16,
+    /// The PHYSICAL unit this row is (`transport::path_instance`) — the identity that tells two
+    /// identical devices apart. Every control-plane operation the row triggers (opens, setters,
+    /// streams, host lighting) targets this unit, never "the first HID that shares my pid".
+    pub instance: String,
     pub mode: String,
     pub connected: bool,
     pub firmware: String,
@@ -52,6 +56,8 @@ pub struct DeviceState {
     pub cap_dpi: bool,  // SetDpi — DPI fader, DPI stages, sniper, lift-off/debounce
     pub cap_poll: bool, // SetPolling — polling contacts + in-game polling
     pub cap_light: bool, // Lighting — the brightness fader
+    pub cap_bright: bool, // Brightness (the GETTER) — the LIGHT readout; a device that can set but
+    // never report brightness (the legacy BlackWidow) must not show a readout that reads "—" forever
     pub cap_scroll: bool, // SetScrollStage — scroll-wheel stages
     pub cap_store: bool, // Storage — persist-to-onboard
     pub cap_idle: bool, // Battery (wireless proxy) — the idle-off timer
@@ -77,13 +83,18 @@ pub struct AppRuntime {
     pub profiles: Vec<Profile>,
     pub active_profile: String,
     pub persist: bool,
-    /// Currently selected device pid (for per-device panels). 0 = none.
+    /// Currently selected device pid (for per-device panels). 0 = none. The pid names the MODEL/
+    /// link-mode (capability gates, per-model config); `selected_unit` names the physical unit.
     pub selected_pid: u16,
-    /// Live lighting streams, keyed by device pid. Each board gets its OWN stop flag + fps, so
-    /// starting, stopping, or re-pacing one board's lighting NEVER touches another's — and switching
-    /// which board you're editing leaves the others streaming. (This was a single global flag + bool,
-    /// which made every apply/stop/device-switch tear down whatever one stream happened to be live.)
-    pub anim: HashMap<u16, AnimStream>,
+    /// The selected PHYSICAL unit (`transport::path_instance`) — what makes selection precise when
+    /// two identical devices share a pid. Empty = no unit pinned (match by pid alone), which only
+    /// happens before the first scan.
+    pub selected_unit: String,
+    /// Live lighting streams, keyed by physical UNIT (`path_instance`). Each board gets its OWN
+    /// stop flag + fps, so starting, stopping, or re-pacing one board's lighting NEVER touches
+    /// another's — including its identical twin on the same pid — and switching which board you're
+    /// editing leaves the others streaming.
+    pub anim: HashMap<String, AnimStream>,
     /// The fps the GUI slider shows for the SELECTED board (seeded on selection: legacy → 6, matrix →
     /// 30). On apply it SEEDS that board's stream fps; moving the slider re-paces the selected board's
     /// live stream. Each running stream owns its own fps copy (in `anim`), so re-pacing or selecting a
@@ -114,6 +125,7 @@ impl AppRuntime {
             active_profile: "—".into(),
             persist: false,
             selected_pid: 0,
+            selected_unit: String::new(),
             anim: HashMap::new(),
             light_fps: Arc::new(AtomicU32::new(30)),
             gaming_mode: neuron::writes::GamingMode::default(),
@@ -132,13 +144,25 @@ impl AppRuntime {
 
     /// Enumerate every recognized device and read its live state (best-effort; unread fields
     /// show "—" so an asleep wireless mouse still lists). Read-only — always safe.
+    ///
+    /// One row per PHYSICAL UNIT, not per pid: a device's several HID collections collapse to one
+    /// row via `path_instance`, but two identical devices (same pid, two units) get two rows —
+    /// each read through its OWN control path, so the readouts are that unit's truth, never the
+    /// truth of whichever twin enumerated first.
     pub fn scan_devices(&mut self) -> Vec<DeviceState> {
-        let mut out = Vec::new();
         let infos = match transport::enumerate() {
             Ok(v) => v,
-            Err(_) => return out,
+            Err(_) => return Vec::new(),
         };
-        let mut seen = std::collections::BTreeSet::new();
+        // Pass 1 — resolve units before any device I/O: dedupe collections to units, and learn
+        // which pids have duplicate units so naming + vitals routing can be decided up front.
+        struct Unit {
+            def: DeviceDef,
+            pid: u16,
+            path: transport::DevicePath,
+            instance: String,
+        }
+        let mut units: Vec<Unit> = Vec::new();
         for i in &infos {
             let Some(def) = self.registry.find_by_pid(i.vid, i.pid) else {
                 continue;
@@ -146,31 +170,88 @@ impl AppRuntime {
             if !def.matches_control(i.usage_page, i.usage, i.feature_len) {
                 continue;
             }
-            if !seen.insert(i.pid) {
-                continue;
+            let instance = i.instance();
+            if units.iter().any(|u| u.instance == instance) {
+                continue; // another collection of the SAME physical unit
             }
-            let def = def.clone();
-            out.push(read_device_state(&def, i.pid));
+            units.push(Unit {
+                def: def.clone(),
+                pid: i.pid,
+                path: i.path.clone(),
+                instance,
+            });
         }
-        // Selection follows reality: if the selected pid is no longer enumerated (unplugged,
-        // dongle gone) — or nothing was selected yet — adopt the first recognized device so the
-        // per-device panels never target a ghost. pid 0 never matches a row, so this one branch
-        // covers both first-scan auto-pick and stale-pid healing.
-        if !out.iter().any(|d| d.pid == self.selected_pid) {
+        let mut out = Vec::new();
+        for u in units.iter() {
+            // Duplicate group = other units sharing this (codename, pid). Numbering is by
+            // instance ORDER, not enumeration order, so "· 1"/"· 2" stay glued to the same
+            // physical unit across rescans (enumeration order is not stable; instances are).
+            let twins: Vec<&str> = units
+                .iter()
+                .filter(|o| o.pid == u.pid && o.def.codename == u.def.codename)
+                .map(|o| o.instance.as_str())
+                .collect();
+            // The battery edge-detector (`vitals::observe`) is pid-keyed core state; feeding it
+            // from BOTH twins would interleave two batteries into one series and fabricate
+            // charge/drop edges. Route it from the pid's lowest instance only — one stable unit.
+            let feed_vitals =
+                twins.iter().min().copied() == Some(u.instance.as_str());
+            let mut st = read_device_state(&u.def, u.pid, &u.path, feed_vitals);
+            st.instance = u.instance.clone();
+            if twins.len() > 1 {
+                let nth = {
+                    let mut sorted = twins.clone();
+                    sorted.sort_unstable();
+                    sorted.iter().position(|s| *s == u.instance).unwrap_or(0) + 1
+                };
+                st.name = format!("{} · {}", st.name, nth);
+            }
+            out.push(st);
+        }
+        // Selection follows reality: if the selected unit is no longer enumerated (unplugged,
+        // dongle gone) — or nothing was selected yet — adopt the first recognized unit so the
+        // per-device panels never target a ghost. pid 0 / empty unit never match a row, so this
+        // one branch covers both first-scan auto-pick and stale-selection healing.
+        if !out
+            .iter()
+            .any(|d| d.pid == self.selected_pid && d.instance == self.selected_unit)
+        {
             self.selected_pid = out.first().map(|d| d.pid).unwrap_or(0);
+            self.selected_unit = out.first().map(|d| d.instance.clone()).unwrap_or_default();
         }
         out
     }
 
     /// Open the currently-selected device (or the first recognized one).
-    pub fn open_selected(&self) -> anyhow::Result<Device> {
+    ///
+    /// Unit-precise: when a physical unit is pinned (`selected_unit`), only THAT unit's control
+    /// interface matches — two identical devices sharing a pid can never swap under a setter or
+    /// a read. If the pinned unit is gone (unplugged between scans, replugged into another
+    /// port), fall back to pid matching — the same "selection follows reality" healing
+    /// `scan_devices` does, just mid-cycle.
+    ///
+    /// Returns a [`GatedDevice`]: while the handle lives, the device's host
+    /// lighting writer is PARKED (see `crate::host::io_gate`), because a
+    /// streaming writer's `set_feature` clobbers the pending reply of any
+    /// concurrent getter on the device's ONE feature-report channel — the
+    /// race that read every getter as "—" and could fail a read-back verify.
+    /// Derefs to [`Device`], so every getter/setter call site is unchanged.
+    pub fn open_selected(&self) -> anyhow::Result<GatedDevice> {
         let infos = transport::enumerate()?;
-        for i in &infos {
-            if let Some(def) = self.registry.find_by_pid(i.vid, i.pid) {
-                if def.matches_control(i.usage_page, i.usage, i.feature_len)
-                    && (self.selected_pid == 0 || i.pid == self.selected_pid)
-                {
-                    return Device::open_path(def.clone(), i.pid, &i.path);
+        let unit_pass = [false, true]; // pass 0: exact unit; pass 1: pid-only healing
+        for relaxed in unit_pass {
+            for i in &infos {
+                if let Some(def) = self.registry.find_by_pid(i.vid, i.pid) {
+                    if def.matches_control(i.usage_page, i.usage, i.feature_len)
+                        && (self.selected_pid == 0 || i.pid == self.selected_pid)
+                        && (relaxed
+                            || self.selected_unit.is_empty()
+                            || i.instance() == self.selected_unit)
+                    {
+                        let gate = crate::host::io_gate(i.pid);
+                        return Device::open_path(def.clone(), i.pid, &i.path)
+                            .map(|dev| GatedDevice { _gate: gate, dev });
+                    }
                 }
             }
         }
@@ -497,14 +578,17 @@ impl AppRuntime {
         self.selected_def().map(|d| icon_for(&d)).unwrap_or("")
     }
 
-    /// The DEFAULT streaming fps for the selected lit device + whether it's a slow LEGACY board:
-    /// legacy boards default to 6 (they drop frames above ~6), matrix devices to 30. `None` when the
-    /// selection has no lighting. Seeds the GUI fps control on selection — the user tunes from there.
+    /// The DEFAULT streaming fps for the selected lit device + whether it's a LEGACY board (the
+    /// GUI's protocol note). Both protocols now default to 30: the old legacy-6 seed encoded
+    /// "frames drop above ~6" folklore that a live wire probe falsified — the BlackWidow sustains
+    /// 30 fps cleanly under the production write discipline (see `max_fps_for` in the host bridge
+    /// for the measurements). `None` when the selection has no lighting. Seeds the GUI fps control
+    /// on selection — the user tunes from there.
     pub fn light_fps_default(&self) -> Option<(u32, bool)> {
         self.selected_def()
             .and_then(|d| d.lighting)
             .map(|l| match l.protocol {
-                neuron::lighting::Protocol::Legacy => (6, true),
+                neuron::lighting::Protocol::Legacy => (30, true),
                 neuron::lighting::Protocol::Matrix => (30, false),
             })
     }
@@ -538,10 +622,15 @@ impl AppRuntime {
     /// Stream the LAYER COMPOSITOR live on a worker thread (re-opens its own device). The compositor is
     /// built from the whole layer stack (Pattern × Spectrum layers).
     /// The layered composite is inherently the custom-frame path (it streams blended frames).
+    ///
+    /// `unit` is the physical unit's `path_instance` — the stream targets exactly that board.
+    /// Empty = "any board with this pid" (only legitimate for pre-scan callers; the GUI always
+    /// has a unit in hand).
     pub fn start_layers(
         &mut self,
         defs: Vec<neuron::pattern::LayerDef>,
         pid: u16,
+        unit: &str,
         on_done: impl FnOnce(Option<String>, Arc<AtomicBool>) + Send + 'static,
     ) -> String {
         if self.writes_paused() {
@@ -550,21 +639,38 @@ impl AppRuntime {
         if defs.is_empty() {
             return "no layers".into();
         }
-        // stop only THIS board's prior stream (if any) — other boards keep streaming.
-        if let Some(a) = self.anim.get(&pid) {
+        // Stop THIS board's prior LOCAL stream first — before EITHER pipe below — so a board that
+        // was streaming app-side when the host came up (the runtime host toggle) can't end up with
+        // both the old anim thread AND the host writer painting it: the exact double-writer race
+        // the host exists to kill. Other boards keep streaming.
+        if let Some(a) = self.anim.remove(unit) {
             a.stop.store(true, Ordering::SeqCst);
+        }
+        // HOST INTEGRATION: when the protocol host owns this device's writer,
+        // the app must NOT stream on its own thread. Push the stack as the
+        // host's animated BASE layer instead — games/tools paint above it and
+        // it returns when they release. No app-side stream to reconcile, so
+        // on_done is skipped; the "compositing" indicator reads host::has_lighting.
+        if crate::host::active() {
+            let fps = self.light_fps.load(Ordering::Relaxed);
+            if crate::host::set_lighting(pid, unit, defs.clone(), fps) {
+                return "compositing (host)".into();
+            }
+            // Device not bridged by the host — fall through to a local stream
+            // (defs still owned; the clone above is only spent on the host path).
         }
         let stop = Arc::new(AtomicBool::new(false));
         // this stream's OWN fps copy, seeded from the GUI's current value — so re-pacing or selecting
         // another board can never change THIS stream's speed.
         let fps_src = Arc::new(AtomicU32::new(self.light_fps.load(Ordering::Relaxed)));
         self.anim.insert(
-            pid,
+            unit.to_string(),
             AnimStream {
                 stop: stop.clone(),
                 fps: fps_src.clone(),
             },
         );
+        let unit = unit.to_string();
         std::thread::spawn(move || {
             let outcome: Result<(), String> = (|| {
                 let reg = Registry::load().map_err(|e| format!("registry: {e}"))?;
@@ -573,8 +679,9 @@ impl AppRuntime {
                     if let Some(def) = reg.find_by_pid(i.vid, i.pid) {
                         if def.matches_control(i.usage_page, i.usage, i.feature_len)
                             && (pid == 0 || i.pid == pid)
+                            && (unit.is_empty() || i.instance() == unit)
                         {
-                            let d = Device::open(def.clone(), i.pid)
+                            let d = Device::open_path(def.clone(), i.pid, &i.path)
                                 .map_err(|e| format!("open failed: {e}"))?;
                             let ldef = d
                                 .def
@@ -601,9 +708,14 @@ impl AppRuntime {
         "compositing".into()
     }
 
-    /// Stop ONE board's lighting stream (the board the GUI is acting on). Others keep streaming.
-    pub fn stop_animation(&mut self, pid: u16) {
-        if let Some(a) = self.anim.remove(&pid) {
+    /// Stop ONE board's lighting stream (the board the GUI is acting on). Others keep streaming —
+    /// including an identical twin on the same pid (`unit` addresses the one physical board).
+    pub fn stop_animation(&mut self, pid: u16, unit: &str) {
+        // Host-owned base: drop it there (the board latches its last frame).
+        if crate::host::active() {
+            crate::host::clear_lighting(pid, unit);
+        }
+        if let Some(a) = self.anim.remove(unit) {
             a.stop.store(true, Ordering::SeqCst);
         }
     }
@@ -613,43 +725,55 @@ impl AppRuntime {
         for (_, a) in self.anim.drain() {
             a.stop.store(true, Ordering::SeqCst);
         }
+        // Host-owned base layers are streams too — composited through the arbiter, not this map —
+        // so the global stop must drop them as well, or a host-managed board would sail through
+        // the kill-switch/Observe transition with its last frame latched while every local stream
+        // was cut. Mirrors `stop_animation`'s per-board `clear_lighting`; no-op when host inactive.
+        crate::host::clear_all_lighting();
     }
 
-    /// Is `pid`'s lighting stream currently live?
-    pub fn animating(&self, pid: u16) -> bool {
-        self.anim.contains_key(&pid)
+    /// Is this board's lighting stream currently live? (Host base counts — the app
+    /// is compositing that board even though it doesn't own the writer.)
+    pub fn animating(&self, pid: u16, unit: &str) -> bool {
+        self.anim.contains_key(unit) || crate::host::has_lighting(pid, unit)
     }
 
-    /// Is ANY board's lighting stream live?
+    /// Is ANY board's lighting stream live? Local anim threads OR host-composited base layers —
+    /// the same both-sources truth `animating(pid)` reports per board, so the writes-paused/arm
+    /// gates that key off this don't skip their stop/reset when the only live lighting is host-owned.
     pub fn any_animating(&self) -> bool {
-        !self.anim.is_empty()
+        !self.anim.is_empty() || crate::host::any_lighting()
     }
 
-    /// Is `token` still `pid`'s CURRENT stop flag (not superseded by a newer start)? A worker's
+    /// Is `token` still this unit's CURRENT stop flag (not superseded by a newer start)? A worker's
     /// completion callback uses this to ignore a STALE end (its stream was already replaced/stopped).
-    pub fn anim_is_current(&self, pid: u16, token: &Arc<AtomicBool>) -> bool {
+    pub fn anim_is_current(&self, unit: &str, token: &Arc<AtomicBool>) -> bool {
         self.anim
-            .get(&pid)
+            .get(unit)
             .is_some_and(|a| Arc::ptr_eq(&a.stop, token))
     }
 
-    /// Drop `pid`'s stream entry IF `token` is still the current one — a worker that ended ON ITS OWN
-    /// (error / time cap) cleaning up after itself, without clobbering a stream that replaced it.
-    pub fn anim_clear(&mut self, pid: u16, token: &Arc<AtomicBool>) {
+    /// Drop this unit's stream entry IF `token` is still the current one — a worker that ended ON ITS
+    /// OWN (error / time cap) cleaning up after itself, without clobbering a stream that replaced it.
+    pub fn anim_clear(&mut self, unit: &str, token: &Arc<AtomicBool>) {
         if self
             .anim
-            .get(&pid)
+            .get(unit)
             .is_some_and(|a| Arc::ptr_eq(&a.stop, token))
         {
-            self.anim.remove(&pid);
+            self.anim.remove(unit);
         }
     }
 
-    /// Re-pace `pid`'s live stream (the fps slider) without restarting it. No-op if it isn't streaming.
-    /// The stream reads its own `fps` copy live each frame, so this just stores the new value — every
-    /// stream is a paced layer compositor now (the old paint-on-demand vitals surface is gone).
-    pub fn set_anim_fps(&self, pid: u16, fps: u32) {
-        if let Some(a) = self.anim.get(&pid) {
+    /// Re-pace this board's live stream (the fps slider) without restarting it. No-op if it isn't
+    /// streaming. The stream reads its own `fps` copy live each frame, so this just stores the new
+    /// value — every stream is a paced layer compositor now (the old paint-on-demand vitals surface
+    /// is gone).
+    pub fn set_anim_fps(&self, pid: u16, unit: &str, fps: u32) {
+        if crate::host::active() {
+            crate::host::set_fps(pid, unit, fps);
+        }
+        if let Some(a) = self.anim.get(unit) {
             a.fps.store(fps, Ordering::Relaxed);
         }
     }
@@ -733,12 +857,18 @@ impl AppRuntime {
         // Full device read-back now lives in core (shared with the CLI): active DPI + the full stage
         // list, polling, brightness, idle-off, and the current matrix effect — plus the host-side
         // gaming-mode policy. An absent/asleep device simply leaves those fields None.
+        // Park every bridged writer for the fleet-wide read (core walks devices itself, so the
+        // per-open gate can't reach in — same reply-clobber race as the row sweep).
+        let _gates = crate::host::io_gate_all();
         let mut p = neuron::profile::capture_from_devices(
             &self.registry,
             name,
             self.gaming_mode,
             self.persist,
-            self.selected_pid, // respect the device the user picked in the UI (multi-device rigs)
+            // respect the device the user picked in the UI — pid AND physical unit, so a rig
+            // with two identical devices captures the exact board being edited, not its twin.
+            self.selected_pid,
+            &self.selected_unit,
         );
 
         // The UI slider values are fallbacks only — applied where the device did not answer.
@@ -812,35 +942,49 @@ impl AppRuntime {
             app: app.into(),
             profile: profile.into(),
         });
-        self.save_app_rules();
-        format!("rule {app} -> {profile}")
+        // the rule is live the moment it's pushed; but a failed disk write must SAY so, not report a
+        // clean success the user would trust across a restart (where the unsaved rule is gone).
+        match self.save_app_rules() {
+            Ok(()) => format!("rule {app} -> {profile}"),
+            Err(e) => format!("rule {app} -> {profile} — added live but not saved: {e}"),
+        }
     }
 
     pub fn remove_app_rule(&mut self, idx: usize) {
         if idx < self.app_rules.rules.len() {
             self.app_rules.rules.remove(idx);
-            self.save_app_rules();
+            // no status channel on the remove path (the caller shows nothing) — the rule is gone live;
+            // a persist failure is inert here, so it stays swallowed rather than fabricating a report.
+            let _ = self.save_app_rules();
         }
     }
 
-    fn save_app_rules(&self) {
-        if let Ok(s) = toml::to_string_pretty(&self.app_rules) {
-            let _ = std::fs::write(AppRules::path(), s);
-        }
+    fn save_app_rules(&self) -> Result<(), String> {
+        let s = toml::to_string_pretty(&self.app_rules).map_err(|e| e.to_string())?;
+        std::fs::write(AppRules::path(), s).map_err(|e| e.to_string())
     }
 
     // ── backup ───────────────────────────────────────────────────────────
 
-    pub fn backup(&self, pid: u16) -> String {
+    /// Snapshot ONE physical unit's getter space, addressed by its `path_instance` (the row's
+    /// unit id) — so backing up one of two identical devices snapshots the one you clicked.
+    pub fn backup(&self, unit: &str) -> String {
         let infos = match transport::enumerate() {
             Ok(v) => v,
             Err(e) => return format!("enumerate failed: {e}"),
         };
         for i in &infos {
-            if i.pid == pid {
-                if let Some(def) = self.registry.find_by_pid(i.vid, i.pid).cloned() {
-                    return snapshot_device(&def, pid);
+            if i.instance() != unit {
+                continue;
+            }
+            if let Some(def) = self.registry.find_by_pid(i.vid, i.pid).cloned() {
+                if !def.matches_control(i.usage_page, i.usage, i.feature_len) {
+                    continue; // wrong collection of the right unit — keep looking
                 }
+                // the backup sweep reads the ENTIRE getter space — park the
+                // host writer or streaming frames clobber half the replies.
+                let _gate = crate::host::io_gate(i.pid);
+                return snapshot_device(&def, i.pid, &i.path);
             }
         }
         "device not found".into()
@@ -1064,19 +1208,28 @@ pub fn pending_diagnostic_stations() -> Vec<DiagProbe> {
 fn publish_source_vitals(forced: bool) {
     let Ok(reg) = Registry::load() else { return };
     let Ok(infos) = transport::enumerate() else { return };
-    for i in &infos {
-        let Some(def) = reg.find_by_pid(i.vid, i.pid) else { continue };
-        // the SOURCE is a battery-capable device (the mouse) reached on its control interface.
-        if !def.commands.contains_key("battery_level")
-            || !def.matches_control(i.usage_page, i.usage, i.feature_len)
-        {
-            continue;
-        }
+    // Candidate control interfaces, then the LOWEST instance wins — enumeration order is not
+    // stable, and with two identical battery mice an order-dependent pick would alternate which
+    // unit feeds the (pid-keyed) vitals series between calls, fabricating battery edges.
+    let source = infos
+        .iter()
+        .filter(|i| {
+            reg.find_by_pid(i.vid, i.pid).is_some_and(|def| {
+                def.commands.contains_key("battery_level")
+                    && def.matches_control(i.usage_page, i.usage, i.feature_len)
+            })
+        })
+        .min_by_key(|i| i.instance());
+    {
+        let Some(i) = source else { return };
+        let Some(def) = reg.find_by_pid(i.vid, i.pid) else { return };
         // gate the wake-costing OPEN+READ behind the shared throttle; the enumeration above was free.
         if !neuron::vitals::due(i.pid, forced) {
             return;
         }
-        let Ok(d) = Device::open(def.clone(), i.pid) else {
+        // park the host writer for the read (same reply-clobber race as the row sweep)
+        let _gate = crate::host::io_gate(i.pid);
+        let Ok(d) = Device::open_path(def.clone(), i.pid, &i.path) else {
             neuron::vitals::mark_stale(i.pid); // couldn't open — retry soon, don't hold the window.
             return;
         };
@@ -1106,7 +1259,6 @@ fn publish_source_vitals(forced: bool) {
             }
             Err(_) => neuron::vitals::mark_stale(i.pid), // asleep/blip — retry soon, keep last warm.
         }
-        return; // one source is enough.
     }
 }
 
@@ -1130,7 +1282,6 @@ fn rule_view(r: &Rule) -> RuleView {
 fn trigger_kind(t: &Trigger) -> &'static str {
     match t {
         Trigger::Input { .. } => "input",
-        Trigger::Hotkey { .. } => "hotkey",
         Trigger::Gesture { .. } => "gesture",
         Trigger::RadialSector { .. } => "radial",
         Trigger::AppFocus { .. } => "app",
@@ -1140,9 +1291,33 @@ fn trigger_kind(t: &Trigger) -> &'static str {
     }
 }
 
+/// A transiently-opened device plus the host-writer gate that keeps its
+/// feature-report channel exclusive while the handle lives (the writer parks;
+/// frames resume when this drops). Derefs to [`Device`] so the whole
+/// getter/setter surface uses it unchanged — the gate rides along invisibly.
+pub struct GatedDevice {
+    _gate: Option<crate::host::IoGate>,
+    dev: Device,
+}
+
+impl std::ops::Deref for GatedDevice {
+    type Target = Device;
+    fn deref(&self) -> &Device {
+        &self.dev
+    }
+}
+
 /// Read one device's live state (best-effort). Each getter is independent so a partial/asleep
-/// device still yields a row with what it could read.
-fn read_device_state(def: &DeviceDef, pid: u16) -> DeviceState {
+/// device still yields a row with what it could read. Opens the exact control `path` the caller
+/// enumerated — never "some interface with this pid" — so each row of a duplicate pair reads its
+/// own hardware. `feed_vitals` routes the shared battery sample into the pid-keyed edge-detector;
+/// the caller enables it for ONE unit per pid (see `scan_devices`).
+fn read_device_state(
+    def: &DeviceDef,
+    pid: u16,
+    path: &transport::DevicePath,
+    feed_vitals: bool,
+) -> DeviceState {
     let mode = def
         .mode_for(pid)
         .map(|m| m.name.clone())
@@ -1152,6 +1327,7 @@ fn read_device_state(def: &DeviceDef, pid: u16) -> DeviceState {
         name: def.name.clone(),
         codename: def.codename.clone(),
         pid,
+        instance: String::new(), // the caller stamps the unit id it resolved
         mode,
         connected: false,
         firmware: "—".into(),
@@ -1170,12 +1346,17 @@ fn read_device_state(def: &DeviceDef, pid: u16) -> DeviceState {
         cap_dpi: def.supports(neuron::registry::Capability::SetDpi),
         cap_poll: def.supports(neuron::registry::Capability::SetPolling),
         cap_light: def.supports(neuron::registry::Capability::Lighting),
+        cap_bright: def.supports(neuron::registry::Capability::Brightness),
         cap_scroll: def.supports(neuron::registry::Capability::SetScrollStage),
         cap_store: def.supports(neuron::registry::Capability::Storage),
         cap_idle: def.supports(neuron::registry::Capability::Battery),
         cap_plate: def.has_side_plates(),
     };
-    if let Ok(d) = Device::open(def.clone(), pid) {
+    // Park this device's host lighting writer for the whole getter sweep —
+    // without the gate, streaming frames clobber every getter's pending reply
+    // and the row reads all-"—" whenever lighting is live (seen on-desk).
+    let _gate = crate::host::io_gate(pid);
+    if let Ok(d) = Device::open_path(def.clone(), pid, path) {
         // any successful read marks the device reachable
         if let Ok(fw) = cap::firmware(&d) {
             st.firmware = format!("v{fw}");
@@ -1204,8 +1385,12 @@ fn read_device_state(def: &DeviceDef, pid: u16) -> DeviceState {
             st.charging = charging;
             st.battery = format!("{b}%");
             st.battery_frac = Some((b as f32 / 100.0).clamp(0.0, 1.0));
-            // passive scan (from_event = false): feed the edge-detector off this read we already did.
-            neuron::vitals::observe(pid, b, charging, false);
+            // passive scan (from_event = false): feed the edge-detector off this read we already
+            // did — but only from the one designated unit per pid (the detector is pid-keyed;
+            // two twins feeding it would interleave two batteries and fabricate edges).
+            if feed_vitals {
+                neuron::vitals::observe(pid, b, charging, false);
+            }
         }
         if let Ok(s) = cap::storage(&d) {
             st.storage = format!("{}% free", s.pct_remaining());
@@ -1245,10 +1430,12 @@ fn icon_for(def: &DeviceDef) -> &'static str {
 }
 
 /// Snapshot a device's full getter space to a timestamped backup JSON (read-only safety move).
-fn snapshot_device(def: &DeviceDef, pid: u16) -> String {
+/// Opens the exact enumerated control path — the caller resolved the physical unit, so a
+/// re-enumeration here could not swap in an identical twin.
+fn snapshot_device(def: &DeviceDef, pid: u16, path: &transport::DevicePath) -> String {
     use neuron::backup::{GetterSnap, IfaceSnap, Snapshot};
     use neuron::discover;
-    let Ok(d) = Device::open(def.clone(), pid) else {
+    let Ok(d) = Device::open_path(def.clone(), pid, path) else {
         return "device unreachable".into();
     };
     let mut getters = Vec::new();
@@ -1378,7 +1565,7 @@ mod tests {
             assert_eq!(r.layer, "base");
             assert!(matches!(
                 r.kind,
-                "input" | "hotkey" | "gesture" | "radial" | "app" | "mic" | "hold" | "cast"
+                "input" | "gesture" | "radial" | "app" | "mic" | "hold" | "cast"
             ));
         }
     }
@@ -1392,22 +1579,26 @@ mod tests {
         let _cwd = crate::testsupport::cwd_guard("runtime_profile");
         let mut rt = AppRuntime::load();
         let name = format!("__neuron_test_{}", std::process::id());
-        let msg = rt.save_profile_from_devices(&name, 1234, 500, 60);
-        // headless (no device), the slider values become the captured profile; the message reports
-        // the capture either way ("captured" on the full-state path, "saved" historically).
+        let msg = rt.save_profile_from_devices(&name, 1234, 500, 60, vec![]);
+        // the message reports the capture either way ("captured" on the full-state path, "saved"
+        // historically).
         assert!(
             msg.contains("captured") || msg.contains("saved"),
             "unexpected: {msg}"
         );
-        // it shows up in the reloaded list with the values we set.
+        // It shows up in the reloaded list with every core field POPULATED. The values themselves
+        // are deliberately not pinned: capture is a REAL device read-back first, slider fallback
+        // second — on a dev machine with the mouse awake this captures the hardware's live DPI,
+        // headless it captures the slider values. Pinning the fallback numbers made this test
+        // flake with the hardware's sleep state (seen live: awake Naga answered DPI 800).
         let p = rt
             .profiles
             .iter()
             .find(|p| p.name == name)
             .expect("saved profile present");
-        assert_eq!(p.dpi, Some(1234));
-        assert_eq!(p.polling_hz, Some(500));
-        assert_eq!(p.brightness, Some(60));
+        assert!(p.dpi.is_some(), "dpi captured (device read or fallback)");
+        assert!(p.polling_hz.is_some(), "polling captured");
+        assert!(p.brightness.is_some(), "brightness captured");
         // delete it and confirm it's gone.
         let del = rt.delete_profile(&name);
         assert!(del.contains("deleted"), "unexpected: {del}");
@@ -1418,7 +1609,7 @@ mod tests {
     #[test]
     fn empty_profile_name_rejected() {
         let mut rt = AppRuntime::load();
-        let msg = rt.save_profile_from_devices("  ", 800, 1000, 50);
+        let msg = rt.save_profile_from_devices("  ", 800, 1000, 50, vec![]);
         assert!(msg.contains("name required"));
     }
 
@@ -1483,7 +1674,7 @@ mod tests {
         let _cwd = crate::testsupport::cwd_guard("runtime_delete_active");
         let mut rt = AppRuntime::load();
         let name = format!("__neuron_del_{}", std::process::id());
-        rt.save_profile_from_devices(&name, 800, 1000, 50);
+        rt.save_profile_from_devices(&name, 800, 1000, 50, vec![]);
         rt.active_profile = name.clone();
         rt.app_rules.rules.push(AppRule {
             app: "game".into(),
@@ -1507,7 +1698,7 @@ mod tests {
         assert!(missing.contains("no profile"), "unexpected: {missing}");
         assert!(rt.app_rules.rules.is_empty());
         let name = format!("__neuron_rule_{}", std::process::id());
-        rt.save_profile_from_devices(&name, 800, 1000, 50);
+        rt.save_profile_from_devices(&name, 800, 1000, 50, vec![]);
         let ok = rt.add_app_rule("game", &name);
         assert!(ok.contains("rule game ->"), "unexpected: {ok}");
         let dup = rt.add_app_rule("GAME", &name);

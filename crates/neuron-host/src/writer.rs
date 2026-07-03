@@ -11,7 +11,7 @@
 //! a static scene is free) and DEADLINE pacing (`next += dt`, clamped forward
 //! on overrun — a slow frame never causes a catch-up burst).
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -40,12 +40,90 @@ pub trait FrameSink {
     fn refresh(&mut self) {}
 }
 
-/// Forced-refresh cadence in writer ticks: dedup is an OPTIMIZATION, not a
-/// truth source, so every N ticks the writer resends the full frame even if
-/// nothing changed — the self-healing repaint that un-tears a board which
-/// silently dropped writes. At the legacy 6fps that's ~10s to heal, at
-/// matrix 30fps ~2s; cheap either way (a handful of feature reports).
-pub const REFRESH_TICKS: u64 = 64;
+/// Self-heal cadence (writer ticks) while content is FLOWING. Dedup is an
+/// OPTIMIZATION, not a truth source: fire-and-forget HID writes can be
+/// silently dropped by the silicon, and the sink's cache then believes a row
+/// is current while the board disagrees. Drops cluster exactly when frames
+/// flow (busy USB link, busy CPU — a Chroma game mid-match is the worst
+/// case), so while frames are changing the writer forces a full repaint every
+/// 12 ticks — a torn frame lives ≤0.4s at 30fps instead of the old fixed
+/// 64-tick (~2s) window that read as sustained flicker under live clients.
+const ACTIVE_HEAL_TICKS: u64 = 12;
+
+/// The two-shot retransmit after content goes STATIC, in ticks since the last
+/// content change. A drop during the final frames of a stream (or during the
+/// first heal itself) would otherwise stick forever on a latched board, so
+/// the writer repaints twice on a short backoff — then goes fully QUIESCENT:
+/// zero HID traffic on a static scene (the firmware latch holds the frame,
+/// wireless batteries and sleeping mice are left in peace). The old fixed
+/// cadence repainted static boards every ~2s forever; this heals faster AND
+/// idles quieter.
+const QUIET_HEAL_TICKS: [u64; 2] = [8, 24];
+
+/// When to force a full repaint — pure, injected-tick, testable (the
+/// WriterCore discipline). The writer asks `due()` at the top of a tick,
+/// resets both dedup caches when it says so, then reports what the tick did
+/// via `tick(healed, content_changed)`. A heal tick's rewrite is NOT content
+/// evidence (the caches were dropped, `offer` trivially fires), so the caller
+/// must pass `content_changed = false` on heal ticks.
+pub struct HealPolicy {
+    since_change: u64,
+    since_heal: u64,
+}
+
+impl HealPolicy {
+    pub fn new() -> Self {
+        // Born idle: no heals until the first real frame lands (an unclaimed
+        // or never-painted board has nothing to un-tear).
+        HealPolicy { since_change: u64::MAX / 2, since_heal: 0 }
+    }
+
+    /// Should THIS tick drop the dedup caches and repaint in full?
+    pub fn due(&self) -> bool {
+        (self.since_change < QUIET_HEAL_TICKS[0] && self.since_heal >= ACTIVE_HEAL_TICKS)
+            || QUIET_HEAL_TICKS.contains(&self.since_change)
+    }
+
+    /// Record the tick's outcome: whether it healed, and whether the frame
+    /// genuinely changed (heal-forced rewrites don't count).
+    pub fn tick(&mut self, healed: bool, content_changed: bool) {
+        self.since_heal = if healed { 0 } else { self.since_heal.saturating_add(1) };
+        self.since_change = if content_changed && !healed {
+            0
+        } else {
+            self.since_change.saturating_add(1)
+        };
+    }
+}
+
+impl Default for HealPolicy {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The writer's fps ceiling — MUST equal `neuron::lighting::MAX_STREAM_FPS`, the pipeline-wide
+/// clamp domain (render quantization and write cadence must never clamp into different ranges;
+/// the old writer-only 1..=60 window let a >30 pace burn kernel resolves on frames the content
+/// layer never rendered). The kernel builds pure-std (the neuron dep is feature-gated behind
+/// `bridge`), so the value is MIRRORED here and locked by a parity test in the bridge, which
+/// sees both crates.
+pub const MAX_WRITER_FPS: u32 = 30;
+
+/// Deadline-pacing math — the same pure function as `neuron::lighting::pace`, mirrored for the
+/// pure-std kernel build and locked by a bridge parity test. Ahead of schedule → sleep the
+/// remainder; overrun → no sleep AND accumulated lag clamped to one `dt`, preserving sub-frame
+/// cadence phase without catch-up bursts. (The inline predecessor discarded ALL phase on overrun
+/// — exactly the copy-drift the shared helper exists to prevent.)
+pub fn pace(deadline: Instant, now: Instant, dt: Duration) -> (Instant, Duration) {
+    if deadline > now {
+        (deadline, deadline - now)
+    } else {
+        let lag = now - deadline;
+        let clamped = if lag > dt { deadline + (lag - dt) } else { deadline };
+        (clamped, Duration::ZERO)
+    }
+}
 
 /// The dedup core — pure, so it's testable without threads or clocks.
 pub struct WriterCore {
@@ -79,9 +157,61 @@ impl Default for WriterCore {
     }
 }
 
+/// A writer's PAUSE valve — the transient-I/O coordination seam. The device
+/// has ONE feature-report channel; a streaming writer's `set_feature` can
+/// clobber the pending reply of any concurrent getter (opened on its own
+/// transient handle), so readers time out and read "—" while lighting flows.
+/// A reader raises the valve; the writer parks (sets `parked`, stops touching
+/// the sink) until release. Cheap, honest coordination until the full
+/// writer-inversion (all I/O through the writer task) lands.
+///
+/// `pause` is a DEPTH counter, not a flag: gates nest. Overlapping callers
+/// (a sniper press mid profile-apply, two getter sweeps on the same board)
+/// each `engage`/`release` independently, and the writer only resumes when the
+/// LAST guard drops. A bare bool would let the first `release` reopen the
+/// writer while another caller still assumed exclusive access — reintroducing
+/// the exact feature-report race this valve exists to close.
+#[derive(Clone)]
+pub struct WriterPauser {
+    pause: Arc<AtomicUsize>,
+    parked: Arc<AtomicBool>,
+}
+
+impl WriterPauser {
+    /// Raise the valve one level, and wait (bounded ~100ms) until the writer
+    /// confirms it has parked — the bound keeps a dead/stopped writer from
+    /// hanging callers; on timeout the caller proceeds and risks at most the
+    /// old racy behaviour. A nested `engage` on an already-parked writer
+    /// returns as soon as it observes the standing `parked` flag.
+    pub fn engage(&self) {
+        self.pause.fetch_add(1, Ordering::Relaxed);
+        for _ in 0..50 {
+            if self.parked.load(Ordering::Relaxed) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// Drop one level. Frames flow again only when the count reaches zero (the
+    /// writer re-bases its deadline on resume — no catch-up burst). Saturating
+    /// so a stray double-release can never underflow the counter and strand the
+    /// writer parked.
+    pub fn release(&self) {
+        // Atomic saturating decrement: decrement only while positive, so a stray
+        // double-release can never wrap the counter and strand the writer parked.
+        let _ = self
+            .pause
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| (v > 0).then(|| v - 1));
+    }
+}
+
 /// The paced writer thread for one surface. Dropping it stops and joins.
 pub struct Writer {
     stop: Arc<AtomicBool>,
+    /// Depth of live pause gates (0 = flowing). See [`WriterPauser`].
+    pause: Arc<AtomicUsize>,
+    parked: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -90,28 +220,64 @@ impl Writer {
     /// the thread boundary (recipes are `Send`), never the sink itself, so a
     /// sink may own thread-affine things like HID handles.
     pub fn spawn<S: FrameSink + 'static>(
-        mut api: impl HostApi + Send + 'static,
+        api: impl HostApi + Send + 'static,
         surface: impl Into<String>,
         fps: u32,
+        make_sink: impl FnOnce() -> S + Send + 'static,
+    ) -> Writer {
+        Self::spawn_paced(api, surface, Arc::new(AtomicU32::new(fps)), make_sink)
+    }
+
+    /// Like [`Writer::spawn`], but paced by a SHARED fps atomic read once per
+    /// tick — the same live re-pace contract as the app's own anim streams
+    /// (the GUI fps slider writes the atomic; the running writer follows
+    /// without restarting).
+    pub fn spawn_paced<S: FrameSink + 'static>(
+        mut api: impl HostApi + Send + 'static,
+        surface: impl Into<String>,
+        fps: Arc<AtomicU32>,
         make_sink: impl FnOnce() -> S + Send + 'static,
     ) -> Writer {
         let surface = surface.into();
         let stop = Arc::new(AtomicBool::new(false));
         let stop_flag = stop.clone();
+        let pause = Arc::new(AtomicUsize::new(0));
+        let parked = Arc::new(AtomicBool::new(false));
+        let (pause_flag, parked_flag) = (pause.clone(), parked.clone());
         let thread = thread::Builder::new()
             .name(format!("neuron-writer-{surface}"))
             .spawn(move || {
                 let mut sink = make_sink();
-                let dt = Duration::from_secs(1) / fps.clamp(1, 60);
                 let mut core = WriterCore::new();
+                let mut heal = HealPolicy::new();
                 let mut next = Instant::now();
                 let mut faults: u64 = 0;
-                let mut ticks: u64 = 0;
                 while !stop_flag.load(Ordering::Relaxed) {
-                    ticks += 1;
-                    // Periodic forced repaint: drop both dedup caches so this
-                    // tick resends everything (see FrameSink::refresh).
-                    if ticks % REFRESH_TICKS == 0 {
+                    // PARKED? A transient reader (getter sweep, read-back-verified
+                    // setter) holds the pause valve: skip resolve/write entirely —
+                    // the feature-report channel belongs to the reader until
+                    // release. The heal policy's clock freezes (no tick()), and
+                    // the deadline re-bases on resume, so parking never causes a
+                    // catch-up burst or a spurious quiet-heal.
+                    if pause_flag.load(Ordering::Relaxed) > 0 {
+                        parked_flag.store(true, Ordering::Relaxed);
+                        thread::sleep(Duration::from_millis(2));
+                        next = Instant::now();
+                        continue;
+                    }
+                    parked_flag.store(false, Ordering::Relaxed);
+                    // ONE clamp domain across the whole pipeline (MAX_WRITER_FPS ≡ core's
+                    // MAX_STREAM_FPS, parity-tested): the writer must never tick faster than the
+                    // content layer quantizes, or the extra ticks are pure kernel-resolve churn
+                    // on frames that render identically.
+                    let dt =
+                        Duration::from_secs(1) / fps.load(Ordering::Relaxed).clamp(1, MAX_WRITER_FPS);
+                    // Activity-aware forced repaint: drop both dedup caches so
+                    // this tick resends everything (see FrameSink::refresh and
+                    // HealPolicy — fast heals while frames flow, a two-shot
+                    // retransmit when they stop, silence on a static board).
+                    let healing = heal.due();
+                    if healing {
                         core.reset();
                         sink.refresh();
                     }
@@ -125,29 +291,41 @@ impl Writer {
                         if let Some(frame) = api.resolve(&surface, now) {
                             if core.offer(&frame) {
                                 sink.write(&frame);
+                                return true;
                             }
                         }
+                        false
                     }));
-                    if step.is_err() {
-                        faults += 1;
-                        if faults == 1 {
-                            eprintln!(
-                                "neuron-writer-{surface}: sink/handle fault contained; \
-                                 writer continues"
-                            );
+                    match step {
+                        Ok(wrote) => heal.tick(healing, wrote && !healing),
+                        Err(_) => {
+                            heal.tick(healing, false);
+                            faults += 1;
+                            if faults == 1 {
+                                eprintln!(
+                                    "neuron-writer-{surface}: sink/handle fault contained; \
+                                     writer continues"
+                                );
+                            }
                         }
                     }
+                    // Deadline pacing via the SAME pure math `Lights::animate` uses (see `pace`
+                    // above — mirrored for the pure-std kernel, parity-locked in the bridge).
                     next += dt;
-                    let now = Instant::now();
-                    if next > now {
-                        thread::sleep(next - now);
-                    } else {
-                        next = now; // overran — resume from now, never burst to catch up
+                    let (nd, nap) = pace(next, Instant::now(), dt);
+                    next = nd;
+                    if !nap.is_zero() {
+                        thread::sleep(nap);
                     }
                 }
             })
             .expect("spawn writer thread");
-        Writer { stop, thread: Some(thread) }
+        Writer { stop, pause, parked, thread: Some(thread) }
+    }
+
+    /// The pause valve for transient-I/O coordination (see [`WriterPauser`]).
+    pub fn pauser(&self) -> WriterPauser {
+        WriterPauser { pause: self.pause.clone(), parked: self.parked.clone() }
     }
 }
 
@@ -203,6 +381,75 @@ mod tests {
     }
 
     #[test]
+    fn heal_policy_idle_from_birth_never_heals() {
+        // An unclaimed / never-painted board has nothing to un-tear — the
+        // writer must stay silent, not burn HID traffic on a latched frame.
+        let mut p = HealPolicy::new();
+        for _ in 0..200 {
+            let h = p.due();
+            assert!(!h, "no heals before the first content frame");
+            p.tick(h, false);
+        }
+    }
+
+    #[test]
+    fn heal_policy_heals_periodically_while_streaming() {
+        // A live client streaming frames every tick: torn rows must be
+        // bounded by the active cadence, not the old multi-second window.
+        let mut p = HealPolicy::new();
+        let mut heals = 0;
+        for _ in 0..100 {
+            let h = p.due();
+            if h {
+                heals += 1;
+            }
+            p.tick(h, !h); // every non-heal tick carries a real content change
+        }
+        assert!(
+            (6..=10).contains(&heals),
+            "expected a heal roughly every {ACTIVE_HEAL_TICKS} ticks over 100, got {heals}"
+        );
+    }
+
+    #[test]
+    fn heal_policy_two_shot_then_quiescent_after_static() {
+        // One content change, then silence: exactly the two retransmits (a
+        // drop during the last frames must not stick), then full quiet.
+        let mut p = HealPolicy::new();
+        let h0 = p.due();
+        p.tick(h0, true);
+        let mut heals: Vec<u64> = Vec::new();
+        for i in 1..400u64 {
+            let h = p.due();
+            if h {
+                heals.push(i);
+            }
+            p.tick(h, false);
+        }
+        // counters advance at tick END, so the heal lands on the tick AFTER
+        // since_change reaches each threshold — the +1 is bookkeeping, the
+        // cadence is the contract.
+        let expect: Vec<u64> = QUIET_HEAL_TICKS.iter().map(|t| t + 1).collect();
+        assert_eq!(heals, expect, "the two-shot heal, then silence");
+    }
+
+    #[test]
+    fn heal_policy_slow_stream_still_heals_each_cycle() {
+        // Content changing every ~10 ticks (a slow effect): each cycle must
+        // still cross a heal, so a dropped row never outlives one cycle long.
+        let mut p = HealPolicy::new();
+        let mut heals = 0;
+        for i in 0..200u64 {
+            let h = p.due();
+            if h {
+                heals += 1;
+            }
+            p.tick(h, !h && i % 10 == 0);
+        }
+        assert!(heals >= 15, "a slow stream heals about once per cycle, got {heals}");
+    }
+
+    #[test]
     fn mock_sink_records_in_order() {
         let sink = MockSink::new();
         let mut writer_side = sink.clone();
@@ -212,5 +459,64 @@ mod tests {
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[0], vec![Some(Rgb(1, 1, 1))]);
         assert_eq!(frames[1], vec![None]);
+    }
+
+    #[test]
+    fn pause_gates_nest_writer_resumes_only_after_last_release() {
+        use crate::api::{LeaseSpec, SurfaceInfo, SurfaceKind};
+        use crate::arbiter::{band, Content};
+        use crate::shell::Host;
+
+        let host = Host::spawn();
+        let mut h = host.handle();
+        h.declare(SurfaceInfo::grid("kbd", "Board", SurfaceKind::Keyboard, 1, 1));
+        let owner = h.next_source();
+        h.claim("kbd", owner, band::BASE, LeaseSpec::Pinned, Content::Fill(Rgb(1, 2, 3)), Instant::now())
+            .unwrap();
+
+        let sink = MockSink::new();
+        let writer_sink = sink.clone();
+        let writer = Writer::spawn(host.handle(), "kbd", 100, move || writer_sink);
+        let pauser = writer.pauser();
+        // Let the writer come up and flow (parked = false).
+        thread::sleep(Duration::from_millis(50));
+
+        // Two overlapping gates on the SAME writer — the finding's scenario
+        // (e.g. a sniper press mid profile-apply). Both raise the same valve.
+        pauser.engage(); // engage() blocks until the writer confirms it parked
+        assert_eq!(pauser.pause.load(Ordering::Relaxed), 1);
+        assert!(pauser.parked.load(Ordering::Relaxed), "writer parks under the first gate");
+        pauser.engage();
+        assert_eq!(pauser.pause.load(Ordering::Relaxed), 2, "gates nest, not clobber");
+
+        // First release must NOT resume the writer — a second gate is still live.
+        // A bare-bool valve would reopen here and reintroduce the report race.
+        pauser.release();
+        assert_eq!(pauser.pause.load(Ordering::Relaxed), 1);
+        thread::sleep(Duration::from_millis(20)); // ample time to wrongly resume
+        assert!(
+            pauser.parked.load(Ordering::Relaxed),
+            "writer stays parked while any gate is held"
+        );
+
+        // The last release resumes it.
+        pauser.release();
+        assert_eq!(pauser.pause.load(Ordering::Relaxed), 0);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let resumed = loop {
+            if !pauser.parked.load(Ordering::Relaxed) {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert!(resumed, "writer resumes once the last gate drops");
+
+        // Saturating: a stray extra release can't underflow the counter and
+        // strand the writer parked forever.
+        pauser.release();
+        assert_eq!(pauser.pause.load(Ordering::Relaxed), 0, "release saturates at zero");
     }
 }

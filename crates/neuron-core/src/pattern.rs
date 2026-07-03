@@ -191,7 +191,10 @@ pub fn region_from_rect(r0: i32, c0: i32, r1: i32, c1: i32, rows: u8, cols: u8) 
 }
 
 /// A stateful shape-and-motion generator. One instance per layer; `field` is called once per tick.
-pub trait Pattern {
+/// `Send` because a built [`Compositor`] may live on whichever thread drives a device (the app's
+/// per-board anim threads today, the protocol host's writer/kernel threads too) — patterns are plain
+/// data plus atomic reads, so this states a fact rather than adding a burden.
+pub trait Pattern: Send {
     /// Apply the layer's param values. Called once when the layer is built and again when a knob
     /// changes. The default ignores params (for patterns that declare none).
     fn configure(&mut self, _params: &Params) {}
@@ -357,9 +360,9 @@ pub struct PatternDef {
 /// inspector schema ([`pattern_params`]), the default spectra and the tile catalog ALL derive from
 /// this one table. Adding a pattern = ONE entry here + the [`Pattern`] impl — nothing else.
 ///
-/// The twelve shapes the whole effect set collapses to (the colour of each lives in its
+/// The thirteen shapes the whole effect set collapses to (the colour of each lives in its
 /// [`Spectrum`], chosen per preset — see [`presets`]): `uniform` (Static/Breathing/Cycle), `axis`
-/// (Wave), `radial` (Color Wheel), `heat` (Fire), `streak` (Cascade rain + Comet), `sparkle`
+/// (Wave), `radial` (Color Wheel), `heat` (Fire), `rain` (Cascade — rain/matrix), `comet` (Comet), `sparkle`
 /// (Starlight), `ignite` (Reactive), `ring` (Ripple), `flow` (Aurora), `thermal` (Typing Heat),
 /// `meter` (Audio Meter + Pulse) and `screen` (Ambient — the full-colour exception). Plus two
 /// full-colour non-effect layers: `custom` (a painted/imported frame) and `vitals` (the device's live
@@ -418,14 +421,27 @@ static REGISTRY: &[PatternDef] = &[
         readout: false,
     },
     PatternDef {
-        key: "streak",
-        label: "Streak",
-        make: || Box::new(Streak::default()),
+        key: "rain",
+        label: "Rain",
+        make: || Box::new(Rain::default()),
         params: || vec![mode_param(), speed_param(), density_param()],
+        default_spectrum: sp_cascade,
+        tile: TileMeta {
+            blurb: "falling rain — or matrix code streams, white-hot heads",
+            live_input: false,
+        },
+        has_spectrum: true,
+        readout: false,
+    },
+    PatternDef {
+        key: "comet",
+        label: "Comet",
+        make: || Box::new(Comet::default()),
+        params: || vec![speed_param(), density_param()],
         default_spectrum: streak_spectrum,
         tile: TileMeta {
-            blurb: "falling rain or streaking comets, tail to head",
-            live_input: false,
+            blurb: "streaking comets — break one with a keypress",
+            live_input: true,
         },
         has_spectrum: true,
         readout: false,
@@ -499,10 +515,10 @@ static REGISTRY: &[PatternDef] = &[
         key: "meter",
         label: "Meter",
         make: || Box::new(Meter::default()),
-        params: || vec![source_param(), speed_param()],
+        params: || vec![source_param(), focus_param(), speed_param()],
         default_spectrum: meter_spectrum,
         tile: TileMeta {
-            blurb: "a live meter — audio level or system load",
+            blurb: "a live meter — audio loudness or system load",
             live_input: true,
         },
         has_spectrum: true,
@@ -549,6 +565,60 @@ static REGISTRY: &[PatternDef] = &[
         has_spectrum: false,
         readout: true,
     },
+    PatternDef {
+        key: "onair",
+        label: "On Air",
+        make: || Box::new(OnAir::default()),
+        params: || vec![signal_param(), standby_param()],
+        default_spectrum: onair_spectrum,
+        tile: TileMeta {
+            blurb: "lights where you paint it while your stream is live",
+            live_input: true,
+        },
+        // A SCALAR readout — unlike vitals it colours THROUGH the spectrum, so the user paints the
+        // on-air look with the full engine (any colour, gradient, breathe/cycle motion).
+        has_spectrum: true,
+        readout: true,
+    },
+    PatternDef {
+        key: "miclight",
+        label: "Mic Light",
+        make: || Box::new(MicLight::default()),
+        params: || vec![show_param()],
+        default_spectrum: onair_spectrum, // the same warning red as On Air (repaintable, as ever)
+        tile: TileMeta {
+            blurb: "lights where you paint it while your mic is muted (or hot)",
+            live_input: true,
+        },
+        has_spectrum: true,
+        readout: true,
+    },
+    PatternDef {
+        key: "modeheld",
+        label: "Mode Held",
+        make: || Box::new(ModeHeld::default()),
+        params: || vec![held_param()],
+        default_spectrum: || Spectrum::solid(ACCENT),
+        tile: TileMeta {
+            blurb: "lights while a hold layer or sniper is engaged",
+            live_input: true,
+        },
+        has_spectrum: true,
+        readout: true,
+    },
+    PatternDef {
+        key: "signal",
+        label: "Signal",
+        make: || Box::new(SignalLight::default()),
+        params: || vec![channel_param(), style_param()],
+        default_spectrum: sp_pulse, // the green→amber→red urgency ramp `level` reads along
+        tile: TileMeta {
+            blurb: "a light your macros drive: neuron.signal(channel, value)",
+            live_input: true,
+        },
+        has_spectrum: true,
+        readout: true,
+    },
 ];
 
 /// The house default accent (the weave teal) — the neutral colour solid-spectrum patterns start in.
@@ -559,8 +629,12 @@ pub fn registry() -> &'static [PatternDef] {
     REGISTRY
 }
 
-/// Look up a pattern definition by key (case-insensitive).
+/// Look up a pattern definition by key (case-insensitive). The retired `streak` key (the pre-split
+/// rain+comet pattern whose `mode` knob cross-linked the two tiles) aliases to `rain` — a saved
+/// streak layer keeps rendering (mode 0 = rain unchanged; the rare mode-1 comet layer lands on
+/// rain's `matrix` submode and re-picks its own Comet tile in one click).
 pub fn pattern_def(key: &str) -> Option<&'static PatternDef> {
+    let key = if key.eq_ignore_ascii_case("streak") { "rain" } else { key };
     REGISTRY.iter().find(|d| d.key.eq_ignore_ascii_case(key))
 }
 
@@ -603,9 +677,9 @@ pub fn pattern_is_readout(key: &str) -> bool {
 
 /// The process-global RENDER CLOCK epoch — one shared `Instant` every animated surface quantises
 /// against, so the GUI preview and the device stream advance in the SAME discrete frames (the preview
-/// provably mirrors the board). Both call [`quantized_t`] with `render_epoch().elapsed()`; a device
-/// stream keeps its own start only for the run-duration bound + pacing, never for the phase. Shared and
-/// unchanging, so a stream restart can't jump the phase.
+/// provably mirrors the board). Both read the elapsed via [`render_elapsed`] (the wrapped, precision-safe
+/// f32) and quantise it with [`quantized_t`]; a device stream keeps its own start only for the run-duration
+/// bound + pacing, never for the phase. Shared and unchanging, so a stream restart can't jump the phase.
 pub fn render_epoch() -> Instant {
     static EPOCH: OnceLock<Instant> = OnceLock::new();
     *EPOCH.get_or_init(Instant::now)
@@ -619,6 +693,18 @@ pub fn quantized_t(elapsed_secs: f32, fps: u32) -> f32 {
     (elapsed_secs * fps).floor() / fps
 }
 
+/// The render clock's elapsed seconds, WRAPPED at 4096s so the f32 keeps frame-level precision at any
+/// uptime — the ONE choke point every surface reads instead of `render_epoch().elapsed().as_secs_f32()`.
+/// The wrap MUST happen in the integer/duration domain: `elapsed().as_secs_f32() % 4096.0` is already
+/// broken, because after ~a day the f32 has shed sub-frame bits BEFORE the modulo (patterns stutter, then
+/// freeze). We fold in MILLIS (u128, exact) and only then scale to seconds, so the result carries full
+/// ms precision forever. Sibling of weave.rs `seconds()`. The noise/absolute-`t` fields are periodic, so
+/// the one reseed per ~68min is imperceptible; speed-scaled motion now rides dt accumulators (Axis/Radial/
+/// Flow/Meter) and never sees the reseed at all.
+pub fn render_elapsed() -> f32 {
+    (render_epoch().elapsed().as_millis() % 4_096_000) as f32 * 1e-3
+}
+
 // shared param-schema constructors (reused across pattern defs so the ranges read consistently)
 
 /// A `speed` rate knob (the design default is 1.0).
@@ -626,6 +712,7 @@ fn speed_param() -> Param {
     Param {
         key: "speed",
         label: "speed",
+        only_when: None,
         kind: ParamKind::Range {
             min: 0.25,
             max: 4.0,
@@ -639,6 +726,7 @@ fn direction_param() -> Param {
     Param {
         key: "direction",
         label: "direction",
+        only_when: None,
         kind: ParamKind::Enum {
             options: &["→", "←", "↑", "↓"],
             default: 0,
@@ -651,6 +739,7 @@ fn density_param() -> Param {
     Param {
         key: "density",
         label: "density",
+        only_when: None,
         kind: ParamKind::Range {
             min: 0.25,
             max: 3.0,
@@ -664,6 +753,7 @@ fn fade_param() -> Param {
     Param {
         key: "fade",
         label: "fade",
+        only_when: None,
         kind: ParamKind::Range {
             min: 0.25,
             max: 3.0,
@@ -677,6 +767,7 @@ fn sensitivity_param() -> Param {
     Param {
         key: "sensitivity",
         label: "sensitivity",
+        only_when: None,
         kind: ParamKind::Range {
             min: 0.25,
             max: 3.0,
@@ -690,6 +781,7 @@ fn saturation_param() -> Param {
     Param {
         key: "saturation",
         label: "saturation",
+        only_when: None,
         kind: ParamKind::Range {
             min: 1.0,
             max: 3.0,
@@ -698,13 +790,17 @@ fn saturation_param() -> Param {
     }
 }
 
-/// Streak's `mode` — falling rain vs streaking comets (the two streak shapes).
+/// Rain's `mode` — the fall's CHARACTER: `rain` (staggered drops, breathing gaps) or `matrix`
+/// (continuous per-column code streams: varied column speeds, long luminous tails, glyph-shimmer).
+/// The old third occupant of this knob — comet — is its own pattern now: the cross-link that let
+/// the Cascade tile toggle into Comet (and vice versa) hid one effect inside the other.
 fn mode_param() -> Param {
     Param {
         key: "mode",
         label: "mode",
+        only_when: None,
         kind: ParamKind::Enum {
-            options: &["rain", "comet"],
+            options: &["rain", "matrix"],
             default: 0,
         },
     }
@@ -715,6 +811,7 @@ fn glow_param() -> Param {
     Param {
         key: "glow",
         label: "neighbour glow",
+        only_when: None,
         kind: ParamKind::Toggle { default: false },
     }
 }
@@ -725,8 +822,107 @@ fn source_param() -> Param {
     Param {
         key: "source",
         label: "source",
+        only_when: None,
         kind: ParamKind::Enum {
             options: &["speakers", "mic", "cpu", "ram", "load"],
+            default: 0,
+        },
+    }
+}
+
+/// Meter's `focus` — WHERE the audio meter listens (Synapse's tunable sensitivity, done honestly):
+/// `auto` weighs the whole mix and self-frames; `bass`/`mids`/`highs` drive the brightness from that
+/// register alone — `bass` is the classic "pumps with the kick" feel. Gated to the audio sources
+/// (`only_when` source = speakers/mic): the load meters have no registers, so the knob simply
+/// doesn't render there instead of sitting dead.
+fn focus_param() -> Param {
+    Param {
+        key: "focus",
+        label: "focus",
+        only_when: Some(("source", &[0, 1])),
+        kind: ParamKind::Enum {
+            options: &["auto", "bass", "mids", "highs"],
+            default: 0,
+        },
+    }
+}
+
+/// On-Air's `signal` — which OBS-announced truth lights the layer: the live stream, a running
+/// recording, or either. Everything behind this knob was announced by OBS itself (and resynced at
+/// connect), never assumed.
+fn signal_param() -> Param {
+    Param {
+        key: "signal",
+        label: "signal",
+        only_when: None,
+        kind: ParamKind::Enum {
+            options: &["stream", "record", "stream or record"],
+            default: 0,
+        },
+    }
+}
+
+/// On-Air's `standby` — a faint trace while OBS is CONNECTED but the signal is off, so the painted
+/// placement stays visible (and provably armed) without ever reading as "live".
+fn standby_param() -> Param {
+    Param {
+        key: "standby",
+        label: "standby glow",
+        only_when: None,
+        kind: ParamKind::Toggle { default: false },
+    }
+}
+
+/// Mic Light's `show` — which real mute state lights the layer: `muted` (the red-slash
+/// convention — dark means you're live) or `hot mic` (lit = the world can hear you).
+fn show_param() -> Param {
+    Param {
+        key: "show",
+        label: "lights when",
+        only_when: None,
+        kind: ParamKind::Enum {
+            options: &["muted", "hot mic"],
+            default: 0,
+        },
+    }
+}
+
+/// Mode Held's `signal` — which held input mode lights the layer.
+fn held_param() -> Param {
+    Param {
+        key: "signal",
+        label: "signal",
+        only_when: None,
+        kind: ParamKind::Enum {
+            options: &["hold layer", "sniper", "either"],
+            default: 0,
+        },
+    }
+}
+
+/// Signal's `channel` — which macro-drivable channel this layer renders (1-indexed to match
+/// `neuron.signal(channel, value)`).
+fn channel_param() -> Param {
+    Param {
+        key: "channel",
+        label: "channel",
+        only_when: None,
+        kind: ParamKind::Enum {
+            options: &["1", "2", "3", "4"],
+            default: 0,
+        },
+    }
+}
+
+/// Signal's `style` — `level` (the value picks the colour along the spectrum, full brightness)
+/// or `glow` (the value is the brightness of the spectrum across the placement).
+fn style_param() -> Param {
+    Param {
+        key: "style",
+        label: "style",
+        only_when: None,
+        kind: ParamKind::Enum {
+            options: &["level", "glow"],
             default: 0,
         },
     }
@@ -759,6 +955,11 @@ impl Pattern for Uniform {
 pub struct Axis {
     direction: u8,
     speed: f32,
+    // integrated SCROLL phase (Sparkle idiom). The old `t * speed` slid the gradient by the never-reset
+    // epoch × the LIVE speed — so editing speed rescaled the whole accrued shift and TELEPORTED the wave
+    // (a jump proportional to uptime). We integrate speed·dt instead; the value wraps naturally in [0,1).
+    shift_phase: f32,
+    last_t: f32,
 }
 
 impl Pattern for Axis {
@@ -772,7 +973,11 @@ impl Pattern for Axis {
         let mut cells = vec![Cell::default(); r * c];
         // SCROLL_RATE: spectrum-spans per second at speed 1.0 (a calm travelling gradient).
         const SCROLL_RATE: f32 = 0.2;
-        let shift = t * self.speed * SCROLL_RATE;
+        // integrate the shift so a live speed edit can't rescale the accrued phase (a `t * speed` jump).
+        let dt = (t - self.last_t).max(0.0);
+        self.last_t = t;
+        self.shift_phase = (self.shift_phase + dt * self.speed * SCROLL_RATE).rem_euclid(1.0);
+        let shift = self.shift_phase;
         // Half-open [0,1) positions (x/c, not x/(c-1)) so the gradient TILES seamlessly under the
         // scroll wrap — no endpoint collides at exactly 1.0 (which `rem_euclid` would fold to 0.0).
         let cf = c.max(1) as f32;
@@ -800,6 +1005,11 @@ impl Pattern for Axis {
 pub struct Radial {
     direction: u8,
     speed: f32,
+    // integrated SPIN phase (Sparkle idiom). `t * speed` spun by the never-reset epoch × the LIVE speed,
+    // so a speed edit rescaled the accrued angle and JUMPED the wheel (proportional to uptime). Integrate
+    // speed·dir·dt; wraps naturally in [0,1). A live direction flip just reverses the increment (no jump).
+    spin_phase: f32,
+    last_t: f32,
 }
 
 impl Pattern for Radial {
@@ -818,7 +1028,11 @@ impl Pattern for Radial {
         // way, ←/↑ (1/2) the other (a radial wheel has no L/R/U/D axis, so direction reads as cw vs ccw).
         const SPIN_RATE: f32 = 0.15;
         let dir = if matches!(self.direction, 1 | 2) { -1.0 } else { 1.0 };
-        let spin = t * self.speed * SPIN_RATE * dir;
+        // integrate the spin so a live speed edit can't rescale the accrued angle (a `t * speed` jump).
+        let dt = (t - self.last_t).max(0.0);
+        self.last_t = t;
+        self.spin_phase = (self.spin_phase + dt * self.speed * SPIN_RATE * dir).rem_euclid(1.0);
+        let spin = self.spin_phase;
         for y in 0..r {
             for x in 0..c {
                 let dx = x as f32 - cx;
@@ -976,14 +1190,16 @@ impl Pattern for Heat {
             return Field::Scalar(Vec::new());
         }
         // SPEED drives the sim from elapsed time: ~18 steps/sec at speed 1.0, accumulating the fraction.
-        // A static `t` still steps once (never freezes); a time reset (dt<0) steps once; the burst is
-        // capped so a long stall can't run thousands of steps in one frame.
+        // An advancing clock runs exactly what wall-time bought — zero steps on most frames when the
+        // rate sits below the render fps (the old ≥1-per-frame floor tied the flicker to the frame rate
+        // and deadened the knob's low end). A static `t` / time reset (dt ≤ 0) still steps once (never
+        // freezes); the burst is capped so a long stall can't run thousands of steps in one frame.
         const BASE_STEPS_PER_SEC: f32 = 18.0;
         let dt = (t - self.last_t).max(0.0);
         self.last_t = t;
         let spd = self.speed.clamp(0.1, 6.0);
         self.step_acc += dt * BASE_STEPS_PER_SEC * spd;
-        let mut steps = self.step_acc.floor().max(1.0) as u32;
+        let mut steps = if dt > 0.0 { self.step_acc.floor() as u32 } else { 1 };
         self.step_acc -= self.step_acc.floor();
         steps = steps.min(8);
         for _ in 0..steps {
@@ -1014,7 +1230,40 @@ fn fire_flicker(x: usize, t: f32, speed: f32, heat: f32) -> f32 {
     (1.0 - depth + depth * mix).clamp(0.0, 1.0)
 }
 
-// ──────────────────────────── Streak (the Cascade rain + Comet shapes) ─────────────────────────
+// ──────────────────────────── the streak family: Rain (Cascade) + Comet ─────────────────────────
+//
+// One family, TWO patterns. They used to be a single `streak` pattern whose `mode` knob toggled
+// rain ↔ comet — which meant BOTH tiles carried a knob that morphed one effect into the other
+// (Comet hidden inside Cascade's inspector and vice versa). Split so each owns its identity;
+// `mode` now belongs to Rain alone and picks the fall's CHARACTER (rain / matrix).
+
+/// The shared sim-step accumulator the streak family paces with: steps the sim by elapsed-time
+/// accumulation (~`base`/sec at speed 1.0) so the look is fps-independent. An advancing clock runs
+/// EXACTLY the steps wall-time bought — zero on most frames when the rate is below the render fps
+/// (a ≥1-per-frame floor would tie the sim to the frame rate and make slow speeds a lie). A
+/// static/reset clock (dt == 0 — the first frame after init, or a frozen `t`) still steps once so
+/// the sim never freezes. Capped at 8 so a long stall can't run thousands of steps in one frame.
+#[derive(Default)]
+struct StepClock {
+    last_t: f32,
+    acc: f32,
+}
+
+impl StepClock {
+    fn reset(&mut self, t: f32) {
+        self.last_t = t;
+        self.acc = 0.0;
+    }
+
+    fn accrue(&mut self, t: f32, base_per_sec: f32, speed: f32) -> u32 {
+        let dt = (t - self.last_t).max(0.0);
+        self.last_t = t;
+        self.acc += dt * base_per_sec * speed.clamp(0.1, 6.0);
+        let steps = if dt > 0.0 { self.acc.floor() as u32 } else { 1 };
+        self.acc -= self.acc.floor();
+        steps.min(8)
+    }
+}
 
 /// One comet in the parade — a continuous float head `(x, y)` on a unit velocity `(vx, vy)`, plus a
 /// fresh set of per-comet traits so no two are alike. `respawn` is the lifecycle clock: `0.0` = ALIVE
@@ -1031,63 +1280,61 @@ struct CometBody {
     respawn: f32,
 }
 
-/// Streak: bright shapes streaking across the board, tail → head, coloured by the spectrum (default a
-/// tail-colour → white-head gradient). Two modes:
-///   * **rain** (Cascade): each column runs an independent vertical drop — a white-hot head falling with
-///     a fading coloured tail; drops spawn staggered and respawn after a random gap, a living downpour.
-///   * **comet** (Comet): an endless PARADE of varied, cardinal-biased streaks on free velocity vectors
-///     that DON'T wrap — a comet runs off the board, dies, and a fresh DIFFERENT one enters shortly
-///     after; a keypress on a live head BREAKS it (a white-hot burst) and respawns it different.
+/// Rain (the Cascade tile): per-column vertical falls, tail → white-hot head, coloured by the
+/// spectrum. Two characters via `mode`:
+///   * **rain**: each column runs an independent staggered drop — a bright head with a fading tail,
+///     respawning after a breathing gap. A living downpour.
+///   * **matrix**: continuous CODE STREAMS — every column its own pace (rolled per spawn), longer
+///     luminous tails, near-instant re-entry so the board reads as always-flowing glyph columns,
+///     and a per-step glyph SHIMMER (random trail cells re-roll their brightness, the "characters
+///     changing" read). The terminal-rain look.
 ///
-/// `speed` is the fall/travel rate, `density` the population (rain busy-ness / comet count: 1 by default,
-/// up to ~7). Both modes emit per cell `(u, intensity)`: `intensity` is the streak brightness; `u` rises
-/// toward the head (so the head reads as the spectrum's hot/white end, the tail as its cool end). Driven
-/// by a fixed-rate step accumulator so the look is identical at the legacy 6fps and at 30/60fps.
+/// `speed` scales the fall rate, `density` the column population (drizzle → storm). Emits per cell
+/// `(u, intensity)`: the head rides `u → 1` (the spectrum's hot/white end), the tail sits at `u ≈ 0`
+/// fading out. Paced by [`StepClock`] so the look is identical at any frame rate.
 #[derive(Default)]
-pub struct Streak {
+pub struct Rain {
     mode: u8,
     speed: f32,
     density: f32,
     dims: (u8, u8),
     rng: u32,
-    last_t: f32,
-    step_acc: f32,
-    // rain state
+    clock: StepClock,
     level: Vec<f32>,
     head: Vec<f32>,
     active: Vec<bool>,
     wait: Vec<f32>,
-    // comet state
-    comets: Vec<CometBody>,
-    burst: Vec<f32>,
-    prev: Vec<bool>,
+    /// Per-column stream pace (0.6..1.6), re-rolled at every spawn — read by MATRIX mode so each
+    /// code column falls at its own speed (plain rain keeps the uniform fall).
+    col_speed: Vec<f32>,
 }
 
-impl Streak {
+impl Rain {
     fn rand(&mut self) -> f32 {
         xorshift(&mut self.rng)
     }
 
-    // ── rain (Cascade) ──────────────────────────────────────────────────────────────────────────
-
     /// Average respawn gap in sim-steps — shorter at higher density (busier downpour), longer at low.
-    fn rain_gap(&self) -> f32 {
+    fn gap(&self) -> f32 {
         const BASE_GAP_STEPS: f32 = 40.0;
         (BASE_GAP_STEPS / self.density.clamp(0.25, 3.0)).max(2.0)
     }
 
-    fn rain_spawn(&mut self, col: usize) {
+    fn spawn(&mut self, col: usize) {
         self.active[col] = true;
         self.head[col] = -(self.rand() * 3.0);
+        self.col_speed[col] = 0.6 + self.rand(); // matrix reads it; plain rain ignores it
     }
 
-    /// Seed the per-column rain so the board is already raining on the first frame; active probability
-    /// scales with `density` (a dense rain begins nearly full, a sparse one mostly empty).
-    fn rain_init(&mut self, r: usize, c: usize) {
+    /// Seed the per-column fall so the board is alive on the first frame; active probability scales
+    /// with `density`, and MATRIX starts fuller (code walls read wrong half-empty).
+    fn init(&mut self, r: usize, c: usize) {
         let dens = self.density.clamp(0.25, 3.0);
-        let p_active = (0.30 + 0.23 * dens).clamp(0.0, 0.95);
-        let g = self.rain_gap();
+        let base_p = if self.mode == 1 { 0.50 } else { 0.30 };
+        let p_active = (base_p + 0.23 * dens).clamp(0.0, 0.95);
+        let g = self.gap();
         for x in 0..c {
+            self.col_speed[x] = 0.6 + self.rand();
             if self.rand() < p_active {
                 self.active[x] = true;
                 self.head[x] = self.rand() * r as f32;
@@ -1098,15 +1345,32 @@ impl Streak {
         }
     }
 
-    /// Advance the rain one step: fade every trail a notch (the exponential tail), then drop each active
-    /// head one notch (painting white-hot where it lands) or count down a waiting column's respawn gap.
-    fn rain_step(&mut self, r: usize, c: usize) {
-        const DECAY: f32 = 0.80;
-        const ADVANCE: f32 = 0.22;
+    /// Advance one step: fade every trail a notch (the exponential tail), shimmer matrix glyphs,
+    /// then drop each active head (painting white-hot where it lands) or count down a waiting
+    /// column's respawn gap. Mode picks the character constants: matrix falls slightly faster per
+    /// step, keeps longer tails, and re-enters almost immediately (continuous streams) where rain
+    /// breathes between drops.
+    fn step(&mut self, r: usize, c: usize) {
+        let matrix = self.mode == 1;
+        let decay = if matrix { 0.90 } else { 0.80 };
+        let advance = if matrix { 0.30 } else { 0.22 };
         for v in self.level.iter_mut() {
-            *v *= DECAY;
+            *v *= decay;
             if *v < 0.02 {
                 *v = 0.0;
+            }
+        }
+        if matrix {
+            // GLYPH SHIMMER: a few random trail cells re-roll their brightness each step — the
+            // "characters changing" flicker that makes code rain read as code, not just streaks.
+            // Only TRAIL cells (below the head band) shimmer, so heads stay clean white.
+            let n = r * c;
+            for _ in 0..(c / 3).max(1) {
+                let i = ((self.rand() * n as f32) as usize).min(n.saturating_sub(1));
+                let v = self.level[i];
+                if v > 0.06 && v < 0.85 {
+                    self.level[i] = (v * (0.55 + self.rand() * 0.8)).clamp(0.0, 0.85);
+                }
             }
         }
         for x in 0..c {
@@ -1115,22 +1379,106 @@ impl Streak {
                 if h >= 0.0 && (h as usize) < r {
                     self.level[h as usize * c + x] = 1.0;
                 }
-                let nh = h + ADVANCE;
+                let mul = if matrix { self.col_speed[x] } else { 1.0 };
+                let nh = h + advance * mul;
                 self.head[x] = nh;
                 if nh >= r as f32 + 4.0 {
                     self.active[x] = false;
-                    self.wait[x] = self.rain_gap() * (0.5 + self.rand());
+                    let g = self.gap();
+                    // matrix streams re-enter almost at once (a code wall never sits empty);
+                    // rain takes a proper breath between drops.
+                    self.wait[x] =
+                        if matrix { g * (0.1 + 0.3 * self.rand()) } else { g * (0.5 + self.rand()) };
                 }
             } else {
                 self.wait[x] -= 1.0;
                 if self.wait[x] <= 0.0 {
-                    self.rain_spawn(x);
+                    self.spawn(x);
                 }
             }
         }
     }
+}
 
-    // ── comet ───────────────────────────────────────────────────────────────────────────────────
+impl Pattern for Rain {
+    fn configure(&mut self, p: &Params) {
+        self.mode = p.u8("mode", 0);
+        self.speed = p.f32("speed", 1.0);
+        self.density = p.f32("density", 1.0);
+    }
+
+    fn field(&mut self, rows: u8, cols: u8, t: f32) -> Field {
+        let (r, c) = (rows as usize, cols as usize);
+        let n = r * c;
+        if self.dims != (rows, cols) {
+            self.rng = 0x2545_F491;
+            self.dims = (rows, cols);
+            self.clock.reset(t);
+            self.level = vec![0.0; n];
+            self.head = vec![0.0; c];
+            self.active = vec![false; c];
+            self.wait = vec![0.0; c];
+            self.col_speed = vec![1.0; c];
+            if n > 0 {
+                self.init(r, c);
+            }
+        }
+        if n == 0 {
+            return Field::Scalar(Vec::new());
+        }
+
+        // The base rate ANCHORS speed 1.0 at lively rain — 8 steps/sec × 0.22 rows/step ≈ 1.8
+        // rows/sec, a drop crossing a keyboard in ~3.4s. (The previous anchor of 5/sec ≈ 1.1
+        // rows/sec read as molasses at the design default; before THAT, 20/sec was a downpour
+        // nobody ran, shipped pre-slowed to 0.25 on the knob — the knob now spans drizzle→storm
+        // around a default that's actually right.)
+        let steps = self.clock.accrue(t, 8.0, self.speed);
+        for _ in 0..steps {
+            self.step(r, c);
+        }
+        // emit (u, intensity): the tail (v < HEAD_THRESH) sits at u≈0 (the spectrum's tail colour)
+        // with intensity = v; the head ramps u → 1 (the spectrum's white head) at full intensity.
+        const HEAD_THRESH: f32 = 0.9;
+        let cells = self
+            .level
+            .iter()
+            .map(|&v| {
+                if v <= 0.0 {
+                    Cell::new(0.0, 0.0)
+                } else if v >= HEAD_THRESH {
+                    let f = ((v - HEAD_THRESH) / (1.0 - HEAD_THRESH)).clamp(0.0, 1.0);
+                    Cell::new(f, 1.0)
+                } else {
+                    Cell::new(0.0, v)
+                }
+            })
+            .collect();
+        Field::Scalar(cells)
+    }
+}
+
+/// Comet (its own tile — no longer a mode hidden inside Cascade): an endless PARADE of varied,
+/// cardinal-biased streaks on free velocity vectors that DON'T wrap — a comet runs off the board,
+/// dies, and a fresh DIFFERENT one enters shortly after; a keypress on a live head BREAKS it (a
+/// white-hot burst) and respawns it different. `speed` is the travel rate, `density` the parade
+/// size (1 calm streak by default, up to ~7). Emits `(u, intensity)` with `u` rising toward the
+/// head, so the head reads as the spectrum's hot/white end. Paced by [`StepClock`].
+#[derive(Default)]
+pub struct Comet {
+    speed: f32,
+    density: f32,
+    dims: (u8, u8),
+    rng: u32,
+    clock: StepClock,
+    comets: Vec<CometBody>,
+    burst: Vec<f32>,
+    prev: Vec<bool>,
+}
+
+impl Comet {
+    fn rand(&mut self) -> f32 {
+        xorshift(&mut self.rng)
+    }
 
     /// How many comets stream at once: density 1.0 → exactly ONE calm streak; up the knob for a swarm
     /// (up to ~7 at 3.0); never fewer than one. Monotonic — this is how `density` is honoured for comets.
@@ -1257,22 +1605,10 @@ impl Streak {
         }
     }
 
-    /// Steps the sim by elapsed-time accumulation (~`base`/sec at speed 1.0), shared by both modes so the
-    /// look is fps-independent. Returns how many whole steps to run this frame (≥1, capped at 8).
-    fn accrue_steps(&mut self, t: f32, base_per_sec: f32) -> u32 {
-        let dt = (t - self.last_t).max(0.0);
-        self.last_t = t;
-        let spd = self.speed.clamp(0.1, 6.0);
-        self.step_acc += dt * base_per_sec * spd;
-        let steps = self.step_acc.floor().max(1.0) as u32;
-        self.step_acc -= self.step_acc.floor();
-        steps.min(8)
-    }
 }
 
-impl Pattern for Streak {
+impl Pattern for Comet {
     fn configure(&mut self, p: &Params) {
-        self.mode = p.u8("mode", 0);
         self.speed = p.f32("speed", 1.0);
         self.density = p.f32("density", 1.0);
     }
@@ -1283,96 +1619,62 @@ impl Pattern for Streak {
         if self.dims != (rows, cols) {
             self.rng = 0x2545_F491;
             self.dims = (rows, cols);
-            self.last_t = t;
-            self.step_acc = 0.0;
-            self.level = vec![0.0; n];
-            self.head = vec![0.0; c];
-            self.active = vec![false; c];
-            self.wait = vec![0.0; c];
+            self.clock.reset(t);
             self.burst = vec![0.0; n];
             self.comets.clear();
             self.prev = vec![false; KEY_SCAN_SLOTS];
-            if n > 0 && self.mode == 0 {
-                self.rain_init(r, c);
-            }
         }
         if n == 0 {
             return Field::Scalar(Vec::new());
         }
 
-        if self.mode == 1 {
-            // COMET. Reconcile the parade to the density count, scattering fresh comets along their path
-            // so the board is alive immediately (a comet pushed past the far edge simply dies + re-enters).
-            let want = self.comet_count();
-            let span = ((r as f32).powi(2) + (c as f32).powi(2)).sqrt();
-            while self.comets.len() < want {
-                let mut b = self.spawn_body(r, c);
-                let lead = self.rand() * span;
-                b.x += b.vx * lead;
-                b.y += b.vy * lead;
-                self.comets.push(b);
-            }
-            if self.comets.len() > want {
-                self.comets.truncate(want);
-            }
-            let steps = self.accrue_steps(t, 24.0);
-            for _ in 0..steps {
-                self.comet_step(r, c);
-            }
-            // BREAK on fresh key-downs that hit a live head (the same safe down-edge scan reactive uses).
-            let mut hits: Vec<(usize, usize)> = Vec::new();
-            scan_key_presses(&mut self.prev, r, c, |ry, cx| hits.push((ry, cx)));
-            for (ry, cx) in hits {
-                self.break_at(ry as f32, cx as f32, r, c);
-            }
-            // RENDER: each live comet draws its own gradient streak (tail → white-hot head) into the
-            // per-cell field, kept by MAX intensity so overlapping streaks read "lighten"; the break
-            // burst overlays on top (its core drives toward the spectrum's hot/white end).
-            let mut inten = vec![0.0f32; n];
-            let mut ucoord = vec![0.0f32; n];
-            let comets = std::mem::take(&mut self.comets);
-            for b in &comets {
-                if b.respawn <= 0.0 {
-                    draw_comet(&mut inten, &mut ucoord, b, r, c);
-                }
-            }
-            self.comets = comets;
-            for i in 0..n {
-                let v = self.burst[i];
-                if v > 0.0 {
-                    let bi = v.min(1.0);
-                    if bi > inten[i] {
-                        inten[i] = bi;
-                        ucoord[i] = v.min(1.0); // a hot burst reads as the spectrum's white/hot end
-                    }
-                }
-            }
-            let cells = (0..n).map(|i| Cell::new(ucoord[i], inten[i])).collect();
-            return Field::Scalar(cells);
+        // Reconcile the parade to the density count, scattering fresh comets along their path
+        // so the board is alive immediately (a comet pushed past the far edge simply dies + re-enters).
+        let want = self.comet_count();
+        let span = ((r as f32).powi(2) + (c as f32).powi(2)).sqrt();
+        while self.comets.len() < want {
+            let mut b = self.spawn_body(r, c);
+            let lead = self.rand() * span;
+            b.x += b.vx * lead;
+            b.y += b.vy * lead;
+            self.comets.push(b);
         }
-
-        // RAIN (Cascade).
-        let steps = self.accrue_steps(t, 20.0);
+        if self.comets.len() > want {
+            self.comets.truncate(want);
+        }
+        let steps = self.clock.accrue(t, 24.0, self.speed);
         for _ in 0..steps {
-            self.rain_step(r, c);
+            self.comet_step(r, c);
         }
-        // emit (u, intensity): the tail (v < HEAD_THRESH) sits at u≈0 (the spectrum's tail colour) with
-        // intensity = v; the head ramps u → 1 (the spectrum's white head) at full intensity.
-        const HEAD_THRESH: f32 = 0.9;
-        let cells = self
-            .level
-            .iter()
-            .map(|&v| {
-                if v <= 0.0 {
-                    Cell::new(0.0, 0.0)
-                } else if v >= HEAD_THRESH {
-                    let f = ((v - HEAD_THRESH) / (1.0 - HEAD_THRESH)).clamp(0.0, 1.0);
-                    Cell::new(f, 1.0)
-                } else {
-                    Cell::new(0.0, v)
+        // BREAK on fresh key-downs that hit a live head (the same safe down-edge scan reactive uses).
+        let mut hits: Vec<(usize, usize)> = Vec::new();
+        scan_key_presses(&mut self.prev, r, c, |ry, cx| hits.push((ry, cx)));
+        for (ry, cx) in hits {
+            self.break_at(ry as f32, cx as f32, r, c);
+        }
+        // RENDER: each live comet draws its own gradient streak (tail → white-hot head) into the
+        // per-cell field, kept by MAX intensity so overlapping streaks read "lighten"; the break
+        // burst overlays on top (its core drives toward the spectrum's hot/white end).
+        let mut inten = vec![0.0f32; n];
+        let mut ucoord = vec![0.0f32; n];
+        let comets = std::mem::take(&mut self.comets);
+        for b in &comets {
+            if b.respawn <= 0.0 {
+                draw_comet(&mut inten, &mut ucoord, b, r, c);
+            }
+        }
+        self.comets = comets;
+        for i in 0..n {
+            let v = self.burst[i];
+            if v > 0.0 {
+                let bi = v.min(1.0);
+                if bi > inten[i] {
+                    inten[i] = bi;
+                    ucoord[i] = v.min(1.0); // a hot burst reads as the spectrum's white/hot end
                 }
-            })
-            .collect();
+            }
+        }
+        let cells = (0..n).map(|i| Cell::new(ucoord[i], inten[i])).collect();
         Field::Scalar(cells)
     }
 }
@@ -1642,6 +1944,13 @@ impl Pattern for Ring {
 #[derive(Default)]
 pub struct Flow {
     speed: f32,
+    // ONE integrated flow phase (Sparkle idiom). Every drift term is linear in ∫speed·dt, so a single
+    // accumulator feeds all three: the old `t * 0.10 * speed` etc. multiplied the never-reset epoch by the
+    // LIVE speed, so editing speed rescaled every accrued flow and JOLTED the whole field. We wrap `flow_t`
+    // at 1000.0 — where the primary drift terms (×0.10/0.067/0.041) all land on integer sine-cycles, a
+    // seamless reseed — which also keeps `flow_t` from the f32 precision death an unbounded integral hits.
+    flow_t: f32,
+    last_t: f32,
 }
 
 impl Pattern for Flow {
@@ -1657,9 +1966,13 @@ impl Pattern for Flow {
             return Field::Scalar(cells);
         }
         let spd = self.speed.clamp(0.1, 6.0);
-        let t1 = t * 0.10 * spd;
-        let t2 = t * 0.067 * spd;
-        let t3 = t * 0.041 * spd;
+        // integrate one base phase so a live speed edit can't rescale the accrued flows (a `t * spd` jolt).
+        let dt = (t - self.last_t).max(0.0);
+        self.last_t = t;
+        self.flow_t = (self.flow_t + dt * spd).rem_euclid(1000.0);
+        let t1 = self.flow_t * 0.10;
+        let t2 = self.flow_t * 0.067;
+        let t3 = self.flow_t * 0.041;
         for y in 0..r {
             let ny = if r > 1 { y as f32 / (r as f32 - 1.0) } else { 0.5 };
             for x in 0..c {
@@ -1883,23 +2196,51 @@ fn heat_shimmer(x: usize, y: usize, t: f32, temp: f32) -> f32 {
 
 // ──────────────────────── Meter (the Audio Meter + Pulse shapes) ───────────────────────────────
 
-/// Meter: the board is a live METER, its bars coloured by the spectrum. The `source` chooses the signal:
-/// `speakers`/`mic` drive a bottom-up VU bar (per-column shimmer; `u` rises up the bar so the spectrum
-/// reads low → high); `cpu`/`ram` drive a horizontal load bar (`u = load`, so the spectrum's calm→urgent
-/// ramp colours the whole bar by how hard the machine is working); `load` is the combined Pulse view
-/// (CPU on top, RAM on the bottom). The whole board breathes, faster under CPU load. Every signal comes
-/// from a SHARED background provider (audio_level / sys_stats), decoupled from the frame rate. `speed`
-/// scales the audio shimmer + the breath rate. The hard-won Audio-Meter + Pulse, re-expressed.
+/// Meter: the board is a live METER, coloured by the spectrum.
+///
+/// `speakers`/`mic` make the ENTIRE board ONE uniform surface (Synapse's Audio Meter shape — no
+/// spatial fill, no moving edge, nothing to flicker) driven by TWO channels from the shared
+/// [`crate::audio_spectrum`] analysis:
+///   * **colour** (`u`) = the TONE — the log-frequency centroid of the mix, so the gradient is a
+///     register axis: a kick drum slams the board into the gradient's deep end, vocals and synths
+///     live in its middle, cymbals lift it toward the top;
+///   * **brightness** (intensity) = the LOUDNESS — VU-integrated and auto-gained with crest
+///     headroom, so the board pumps with the beat at any listening volume and true silence is an
+///     honestly dark board.
+/// Where Synapse's meter slides one colour by raw amplitude, this hears WHAT is playing, not just
+/// how loud — the EQ depth a single level number can't carry. If no PCM stream can open it
+/// degrades to the OS peak (brightness only, mid-gradient colour).
+///
+/// `cpu`/`ram` drive a horizontal load bar (`u = load`, so a calm→urgent ramp colours the bar by
+/// how hard the machine is working); `load` is the combined Pulse view (CPU on top, RAM on the
+/// bottom), the whole board breathing faster under CPU load.
+///
+/// `focus` is Synapse's tunable sensitivity, done honestly: `auto` listens to the whole mix
+/// (self-framing), `bass`/`mids`/`highs` drive the brightness from that register alone — each with
+/// its own auto-gain, so "bass" pumps with the kick no matter how bright the cymbals are. `speed`
+/// scales the ballistics (brightness attack/release, breath rate) — the responsiveness knob,
+/// Synapse's requested-and-never-shipped "decay". dt-scaled, so a legacy ~6fps board and the 60fps
+/// preview trace the same envelope through the SAME shared providers.
 #[derive(Default)]
 pub struct Meter {
     source: u8,
     speed: f32,
+    focus: u8,
+    // audio-tint state (per instance — each surface keeps its own ballistics but reads the same
+    // shared provider, so the device and the preview agree)
+    bar: f32,
+    last_t: f32,
+    // load-meter breathe PHASE (integrated per-instance). The breathe rate rises with CPU, so the old
+    // `t * rate` form rescaled the WHOLE accrued phase every time load moved — a strobe proportional to
+    // uptime. We integrate rate·dt into this accumulator instead (Sparkle/Heat idiom), wrapping it.
+    breath_phase: f32,
 }
 
 impl Pattern for Meter {
     fn configure(&mut self, p: &Params) {
         self.source = p.u8("source", 0);
         self.speed = p.f32("speed", 1.0);
+        self.focus = p.u8("focus", 0);
     }
 
     fn field(&mut self, rows: u8, cols: u8, t: f32) -> Field {
@@ -1912,61 +2253,82 @@ impl Pattern for Meter {
         match self.source {
             0 | 1 => {
                 let src = if self.source == 1 { "mic" } else { "speakers" };
-                crate::audio_level::ensure(src);
-                let level = crate::audio_level::level().clamp(0.0, 1.0);
-                Field::Scalar(render_audio_meter(level, t, spd, r, c))
+                crate::audio_spectrum::ensure(src);
+                let region = (self.focus as usize).min(crate::audio_spectrum::REGIONS - 1);
+                let (level, tone) = crate::audio_spectrum::signal()
+                    .map(|s| (s.levels[region], s.tone))
+                    .unwrap_or_else(|| {
+                        // no PCM stream (off-platform / exotic endpoint) — the honest OS peak
+                        // instead, with the colour parked mid-gradient (no tone data to hear).
+                        crate::audio_level::ensure(src);
+                        (crate::audio_level::level(), 0.5)
+                    });
+                // dt from the shared render clock (0.25 cap absorbs pauses; covers a 6fps board's 167ms)
+                let dt = (t - self.last_t).clamp(0.0, 0.25);
+                self.last_t = t;
+                self.bar = meter_step_bar(self.bar, level.clamp(0.0, 1.0), dt, spd);
+                Field::Scalar(paint_audio_tint(tone, self.bar, n))
             }
             _ => {
                 crate::sys_stats::ensure();
                 let cpu = crate::sys_stats::cpu();
                 let ram = crate::sys_stats::ram();
-                Field::Scalar(render_load_meter(self.source, cpu, ram, t, spd, r, c))
+                // breathe: the rate rises with CPU, so we INTEGRATE rate·dt into a wrapped phase (never
+                // `t * rate`, which would slew the whole accrued phase on every load change). dt from the
+                // shared render clock (0.25 cap absorbs pauses / a 6fps board's 167ms frame).
+                let dt = (t - self.last_t).clamp(0.0, 0.25);
+                self.last_t = t;
+                let rate = (0.4 + 2.0 * cpu.clamp(0.0, 1.0)) * spd;
+                self.breath_phase = (self.breath_phase + rate * dt).rem_euclid(1.0);
+                let breath = (0.85 + 0.15 * (self.breath_phase * TAU).sin()).clamp(0.0, 1.0);
+                Field::Scalar(render_load_meter(self.source, cpu, ram, breath, r, c))
             }
         }
     }
 }
 
-/// The pure audio-VU renderer — a bottom-up bar whose height is the smoothed `level` with a per-column
-/// shimmer. Each lit cell emits `u = its height fraction` (0 at the bottom → 1 at the crest, so the
-/// spectrum reads low → high) and full intensity; unlit cells are dark. Deterministic + testable.
-fn render_audio_meter(level: f32, t: f32, speed: f32, r: usize, c: usize) -> Vec<Cell> {
-    let mut cells = vec![Cell::new(0.0, 0.0); r * c];
-    for x in 0..c {
-        let phase = x as f32 * 0.7;
-        let shimmer = 0.7 + 0.3 * (t * 5.0 * speed + phase).sin();
-        let bar = (level * shimmer).clamp(0.0, 1.0) * r as f32; // lit rows in this column
-        for y in 0..r {
-            let from_bottom = (r - 1 - y) as f32; // 0 at the bottom row
-            if from_bottom < bar {
-                let frac = if r > 1 { from_bottom / (r as f32 - 1.0) } else { 0.0 };
-                cells[y * c + x] = Cell::new(frac.clamp(0.0, 1.0), 1.0);
-            }
-        }
-    }
-    cells
+// audio-meter ballistics — the taste constants. The provider already VU-integrates the loudness
+// (~150ms), so these only shape the last glide: quick enough to pop on a beat, slow enough that
+// the brightness never strobes. Per-second rates, dt-scaled (frame-rate-independent), scaled by `speed`.
+const BAR_ATTACK: f32 = 15.0; // 1/s — rise rate toward a louder level
+const BAR_RELEASE: f32 = 5.0; // 1/s — sink rate toward a quieter level
+
+/// One ballistic step for the meter level: fast attack toward a louder target, slow release toward
+/// a quieter one, dt- and speed-scaled via an exponential approach (frame-rate-independent).
+fn meter_step_bar(h: f32, target: f32, dt: f32, speed: f32) -> f32 {
+    let rate = if target > h { BAR_ATTACK } else { BAR_RELEASE };
+    let a = 1.0 - (-rate * speed * dt.max(0.0)).exp();
+    (h + (target - h) * a).clamp(0.0, 1.0)
+}
+
+/// The pure audio-meter painter — the two-channel tint: every cell identical, `u = the tone` (the
+/// gradient is a bass→treble register axis) and `intensity = the loudness` (the whole board pumps
+/// with the beat; silence is dark). Deterministic + trivial — which is the point: no spatial edge
+/// exists, so nothing can flicker.
+fn paint_audio_tint(tone: f32, level: f32, n: usize) -> Vec<Cell> {
+    vec![Cell::new(tone.clamp(0.0, 1.0), level.clamp(0.0, 1.0)); n]
 }
 
 /// The pure load-meter renderer — horizontal bars filling left→right in proportion to load, the WHOLE
 /// board breathing (the rate rising with CPU). `source` selects `cpu`/`ram` (one full-board bar) or
 /// `load` (CPU on the top half, RAM on the bottom). Each lit cell emits `u = the zone's load` (so the
 /// spectrum's calm→urgent ramp colours the bar by load) and `intensity = the breath` (the fractional
-/// leading edge dims smoothly). Deterministic + testable.
-fn render_load_meter(source: u8, cpu: f32, ram: f32, t: f32, speed: f32, r: usize, c: usize) -> Vec<Cell> {
+/// leading edge dims smoothly). `breath` is the caller's integrated breathe envelope (a wrapped phase's
+/// sin, in 0..1) — passed in, never re-derived from an absolute clock. Deterministic + testable.
+fn render_load_meter(source: u8, cpu: f32, ram: f32, breath: f32, r: usize, c: usize) -> Vec<Cell> {
     let mut cells = vec![Cell::new(0.0, 0.0); r * c];
     let cpu = cpu.clamp(0.0, 1.0);
     let ram = ram.clamp(0.0, 1.0);
-    let rate = (0.4 + 2.0 * cpu) * speed;
-    let breath = (0.85 + 0.15 * (t * TAU * rate).sin()).clamp(0.0, 1.0);
+    let breath = breath.clamp(0.0, 1.0);
     let mut paint = |y0: usize, y1: usize, load: f32| {
         let filled = load * c as f32;
-        let full = filled.floor() as usize;
-        let frac = filled - filled.floor();
         for y in y0..y1 {
             for x in 0..c {
-                if x < full {
+                let rank = x as f32;
+                if rank + 1.0 <= filled {
                     cells[y * c + x] = Cell::new(load, breath);
-                } else if x == full && frac > 0.0 {
-                    cells[y * c + x] = Cell::new(load, breath * frac);
+                } else if rank < filled {
+                    cells[y * c + x] = Cell::new(load, breath * (filled - rank));
                 }
             }
         }
@@ -2091,8 +2453,9 @@ fn render_ambient(
 /// strip to the whole board. Inherently full-colour, so it's a [`Field::Color`] pattern (spectrum-free,
 /// like [`Screen`]/`Custom`). The snapshot comes from a SHARED feed ([`crate::lighting::publish_vitals`])
 /// the app pushes; before the first publish the board idles pure BLACK (a live-input pattern with no
-/// source) — and its preset overlays with [`Blend::Screen`], for which black is the identity, so an idle
-/// or empty-gauge cell falls through to the effect beneath instead of punching an opaque black hole.
+/// source) — and its preset overlays with [`Blend::Cut`], for which black means "nothing to say", so an
+/// idle or empty-gauge cell falls through to the effect beneath instead of punching an opaque black hole
+/// (and a lit gauge cell lands at TRUE colour, where the old Screen blend washed it into the effect).
 ///
 /// Private (built only via the registry factory, like `Custom`/[`StaticFrame`]) so its name can't
 /// collide with the [`crate::lighting::Vitals`] SNAPSHOT it renders in a downstream glob import.
@@ -2112,8 +2475,8 @@ impl Pattern for Vitals {
         let n = rows as usize * cols as usize;
         // No published snapshot yet → idle dark: a live readout with no source is honestly BLACK. (Unlike
         // the audio meter, which idles at its spectrum's LOW colour — that's a Scalar field; vitals is a
-        // Color field of black.) When this layer is OVERLAID its preset defaults to `Blend::Screen`, for
-        // which black is the identity, so these idle/empty cells fall THROUGH to the effect beneath.
+        // Color field of black.) When this layer is OVERLAID its preset defaults to `Blend::Cut`, for
+        // which black falls THROUGH to the effect beneath (and lit cells replace at true colour).
         let v = match crate::lighting::latest_vitals() {
             Some(v) => v,
             None => return Field::Color(vec![Rgb::BLACK; n]),
@@ -2178,6 +2541,192 @@ pub fn render_vitals_bounds(v: crate::lighting::Vitals, rows: u8, cols: u8, b: B
     f
 }
 
+/// ON AIR — the broadcast truth as a paintable layer, NOT a forced colour. The user places it
+/// (region) and dresses it (spectrum: any colour, gradient, breathe/cycle motion); this pattern
+/// only decides WHEN it shows, from the OBS-announced state the app mirrors into
+/// [`crate::lighting::publish_broadcast`]. Off-signal it renders zero-intensity (black), which its
+/// readout preset composites with [`Blend::Cut`] — so the user's own lighting shows through until
+/// the moment they're actually live. Honest by construction: no feed, or a torn-down OBS
+/// connection, reads as off-air; a tally that might be wrong is worse than none.
+#[derive(Default)]
+struct OnAir {
+    /// Which announced truth lights the layer: 0 = stream, 1 = record, 2 = either.
+    signal: u8,
+    /// Faint placement trace while connected but off-signal (opt-in).
+    standby: bool,
+    bounds: Option<Bounds>,
+}
+
+impl Pattern for OnAir {
+    fn configure(&mut self, params: &Params) {
+        self.signal = params.u8("signal", 0);
+        self.standby = params.bool("standby", false);
+    }
+
+    fn set_bounds(&mut self, b: Bounds) {
+        self.bounds = Some(b);
+    }
+
+    fn field(&mut self, rows: u8, cols: u8, _t: f32) -> Field {
+        let b = crate::lighting::latest_broadcast();
+        let connected = b.is_some_and(|b| b.connected);
+        let live = b.is_some_and(|b| {
+            b.connected
+                && match self.signal {
+                    1 => b.recording,
+                    2 => b.streaming || b.recording,
+                    _ => b.streaming,
+                }
+        });
+        // Full brightness on-signal; a faint opt-in trace while merely connected; dark otherwise.
+        const STANDBY: f32 = 0.10;
+        let intensity = if live {
+            1.0
+        } else if self.standby && connected {
+            STANDBY
+        } else {
+            0.0
+        };
+        placement_field(self.bounds, rows, cols, intensity)
+    }
+}
+
+/// The shared body of the boolean readout layers (on-air / mic light / mode held): a scalar
+/// field at one `intensity` whose `u` spans the PLACEMENT horizontally — so a gradient spectrum
+/// paints across the painted region (a solid spectrum ignores `u`; Motion spectra breathe/cycle
+/// on top). The spectrum does ALL the colour work; these patterns only gate. Zero intensity is
+/// the all-dark field their Cut-blended presets treat as transparent.
+fn placement_field(bounds: Option<Bounds>, rows: u8, cols: u8, intensity: f32) -> Field {
+    let n = rows as usize * cols as usize;
+    if intensity <= 0.0 {
+        return Field::Scalar(vec![Cell::new(0.0, 0.0); n]);
+    }
+    let bounds = bounds.unwrap_or_else(|| Bounds::board(rows, cols));
+    let span = bounds.cols.max(1) as f32 - 1.0;
+    let mut cells = Vec::with_capacity(n);
+    for _r in 0..rows {
+        for c in 0..cols {
+            let u = if span > 0.0 {
+                ((c.saturating_sub(bounds.col0)) as f32 / span).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            cells.push(Cell::new(u, intensity));
+        }
+    }
+    Field::Scalar(cells)
+}
+
+/// MIC LIGHT — "am I muted?" as a paintable layer. The truth comes from the shared
+/// [`crate::mic_state`] provider (the system capture endpoint's real mute state, sampled off the
+/// render path, idle-auto-stopping); the `show` knob picks which state lights it — `muted` (the
+/// red-slash convention) or `hot mic` (lit = the world can hear you). UNKNOWN (no mic resolved)
+/// renders dark, never a guess: a mute indicator that can be wrong is worse than none.
+#[derive(Default)]
+struct MicLight {
+    /// false = light when MUTED (default); true = light when HOT.
+    show_hot: bool,
+    bounds: Option<Bounds>,
+}
+
+impl Pattern for MicLight {
+    fn configure(&mut self, params: &Params) {
+        self.show_hot = params.u8("show", 0) == 1;
+    }
+
+    fn set_bounds(&mut self, b: Bounds) {
+        self.bounds = Some(b);
+    }
+
+    fn field(&mut self, rows: u8, cols: u8, _t: f32) -> Field {
+        crate::mic_state::ensure();
+        let lit = match crate::mic_state::muted() {
+            Some(muted) => {
+                if self.show_hot {
+                    !muted
+                } else {
+                    muted
+                }
+            }
+            None => false,
+        };
+        placement_field(self.bounds, rows, cols, if lit { 1.0 } else { 0.0 })
+    }
+}
+
+/// MODE HELD — the live input mode as a paintable layer: lights while a hold layer (HyperShift)
+/// or a sniper hold is engaged, per the `signal` knob. Fed edge-accurately by the dispatch loop
+/// ([`crate::lighting::publish_hold`]); before the live loop has ever published (or after it
+/// stops and pushes the default) there is no mode to show and the layer is dark. Paint it over
+/// the keys your hold layer rebinds and the board itself tells you which mode you're in.
+#[derive(Default)]
+struct ModeHeld {
+    /// 0 = hold layer, 1 = sniper, 2 = either.
+    signal: u8,
+    bounds: Option<Bounds>,
+}
+
+impl Pattern for ModeHeld {
+    fn configure(&mut self, params: &Params) {
+        self.signal = params.u8("signal", 0);
+    }
+
+    fn set_bounds(&mut self, b: Bounds) {
+        self.bounds = Some(b);
+    }
+
+    fn field(&mut self, rows: u8, cols: u8, _t: f32) -> Field {
+        let lit = crate::lighting::latest_hold().is_some_and(|h| match self.signal {
+            1 => h.sniper,
+            2 => h.layer || h.sniper,
+            _ => h.layer,
+        });
+        placement_field(self.bounds, rows, cols, if lit { 1.0 } else { 0.0 })
+    }
+}
+
+/// SIGNAL — a light your macros drive: renders one of the numbered
+/// [`crate::lighting::signal`] channels (`neuron.signal(2, 0.8)` sets channel 2 to 0.8). The
+/// emergence seam of the data tiles: neuron doesn't know what the light MEANS (CI status, a
+/// pomodoro, a boss timer, "someone joined voice") — the user's script decides, and this layer
+/// renders it wherever they painted it. Two styles: `level` samples the spectrum AT the value
+/// (an urgency ramp: 0.2 reads green, 1.0 reads red on the default gradient) at full
+/// brightness; `glow` spans the spectrum across the placement with the value as brightness.
+/// Zero — every channel's untouched default — is dark either way, so an unused channel costs
+/// nothing and an unconfigured layer never lies.
+#[derive(Default)]
+struct SignalLight {
+    channel: usize,
+    /// false = level (value picks the colour); true = glow (value is the brightness).
+    glow: bool,
+    bounds: Option<Bounds>,
+}
+
+impl Pattern for SignalLight {
+    fn configure(&mut self, params: &Params) {
+        self.channel = params.u8("channel", 0) as usize;
+        self.glow = params.u8("style", 0) == 1;
+    }
+
+    fn set_bounds(&mut self, b: Bounds) {
+        self.bounds = Some(b);
+    }
+
+    fn field(&mut self, rows: u8, cols: u8, _t: f32) -> Field {
+        let v = crate::lighting::signal(self.channel);
+        if v <= 0.0 {
+            return placement_field(self.bounds, rows, cols, 0.0);
+        }
+        if self.glow {
+            return placement_field(self.bounds, rows, cols, v);
+        }
+        // level: every cell samples the spectrum AT the value, full brightness — the value IS
+        // the colour coordinate, so a green→amber→red gradient reads as urgency.
+        let n = rows as usize * cols as usize;
+        Field::Scalar(vec![Cell::new(v, 1.0); n])
+    }
+}
+
 // ─────────────────────────── default-spectrum constructors (per pattern) ───────────────────────
 //
 // A pattern's built-in default spectrum (what a freshly-applied layer starts in before a preset/edit).
@@ -2229,17 +2778,25 @@ fn streak_spectrum() -> Spectrum {
     Spectrum::gradient(vec![ACCENT, Rgb::new(255, 255, 255)])
 }
 
-/// The default meter gradient — the bar colour low → white at the crest (audio). Pulse overrides with a
-/// green → amber → red urgency ramp via its preset.
+/// The default meter gradient — a bass→treble REGISTER axis for the audio tint (`u = tone`): deep
+/// violet where the kick lives, the house accent through the mids, white at the cymbals' end.
+/// Brightness (loudness) is carried by intensity, so no black foot is needed — silence dims the
+/// board to dark whatever the colours. Pulse overrides with a green → amber → red urgency ramp.
 fn meter_spectrum() -> Spectrum {
-    Spectrum::gradient(vec![ACCENT, Rgb::new(255, 255, 255)])
+    Spectrum::gradient(vec![Rgb::new(0x7B, 0x2F, 0xF2), ACCENT, Rgb::new(255, 255, 255)])
+}
+
+/// On-Air's default: the classic tally red — a STARTING point, never a mandate (the whole point of
+/// the layer is that the user repaints it with any spectrum the engine can hold).
+fn onair_spectrum() -> Spectrum {
+    Spectrum::solid(Rgb::new(255, 0, 0))
 }
 
 // ───────────────────────────────────────── PRESETS (pure data) ─────────────────────────────────
 //
 // A preset = { label, pattern key, pattern param values, spectrum }. The tile grid IS this list.
 // Adding a "look" is ONE entry here — zero code. Every effect from the old menu maps to a (pattern +
-// default spectrum) preset; the full collapse of the effect set onto the twelve shapes.
+// default spectrum) preset; the full collapse of the effect set onto the thirteen shapes.
 
 /// One named look: a pattern + its param overrides + a colour [`Spectrum`]. Pure data the (phase-3) tile
 /// grid renders and the editor seeds a fresh layer from. `params`/`spectrum` are fns so the table stays
@@ -2262,19 +2819,20 @@ impl Preset {
             params: (self.params)(),
             spectrum: (self.spectrum)(),
             region: Vec::new(),
-            // A READOUT overlay (vitals) defaults to Screen, not Normal: black is Screen's identity, so
-            // its empty-gauge-track + no-data cells fall THROUGH to the effect beneath instead of punching
-            // an opaque black hole. Standalone over the black board Screen and Normal look identical, so
-            // this only changes the OVERLAID case (for the better). Registry-driven — vitals is the only
-            // readout, and a future readout preset inherits the right blend for free.
-            blend: if pattern_is_readout(self.pattern) { Blend::Screen } else { Blend::Normal },
+            // A READOUT overlay (the vitals gauge, the on-air light) defaults to Cut, not Normal:
+            // black is Cut's "nothing to say", so idle/empty cells fall THROUGH to the effect
+            // beneath, while lit cells land at TRUE colour. (Screen used to carry this job — its
+            // black-identity gave the fall-through, but it WASHED the lit colour into whatever ran
+            // underneath: battery red over an aurora read pink. Cut keeps both halves honest.)
+            // Registry-driven — a future readout preset inherits the right blend for free.
+            blend: if pattern_is_readout(self.pattern) { Blend::Cut } else { Blend::Normal },
             enabled: true,
             frame: Vec::new(),
         }
     }
 }
 
-/// The PRESET catalog — the full effect set collapsed onto the twelve shapes, in grid order. The single
+/// The PRESET catalog — the full effect set collapsed onto the thirteen shapes, in grid order. The single
 /// source for the (phase-3) tile grid. Each is pure data: a pattern key, param overrides, and a spectrum.
 pub fn presets() -> Vec<Preset> {
     vec![
@@ -2285,8 +2843,8 @@ pub fn presets() -> Vec<Preset> {
         Preset { slug: "colorwheel", label: "Color Wheel", pattern: "radial", params: pp_none, spectrum: spectrum::rainbow },
         Preset { slug: "fire", label: "Fire", pattern: "heat", params: pp_none, spectrum: fire_spectrum },
         Preset { slug: "typingheat", label: "Typing Heat", pattern: "thermal", params: pp_none, spectrum: thermal_spectrum },
-        Preset { slug: "cascade", label: "Cascade", pattern: "streak", params: pp_rain, spectrum: sp_cascade },
-        Preset { slug: "comet", label: "Comet", pattern: "streak", params: pp_comet, spectrum: streak_spectrum },
+        Preset { slug: "cascade", label: "Cascade", pattern: "rain", params: pp_rain, spectrum: sp_cascade },
+        Preset { slug: "comet", label: "Comet", pattern: "comet", params: pp_none, spectrum: streak_spectrum },
         Preset { slug: "starlight", label: "Starlight", pattern: "sparkle", params: pp_none, spectrum: sp_starlight },
         Preset { slug: "reactive", label: "Reactive", pattern: "ignite", params: pp_none, spectrum: sp_solid_accent },
         Preset { slug: "ripple", label: "Ripple", pattern: "ring", params: pp_none, spectrum: sp_solid_accent },
@@ -2295,6 +2853,10 @@ pub fn presets() -> Vec<Preset> {
         Preset { slug: "pulse", label: "Pulse", pattern: "meter", params: pp_load, spectrum: sp_pulse },
         Preset { slug: "ambient", label: "Ambient", pattern: "screen", params: pp_none, spectrum: sp_solid_accent },
         Preset { slug: "vitals", label: "Vitals", pattern: "vitals", params: pp_none, spectrum: sp_solid_accent },
+        Preset { slug: "onair", label: "On Air", pattern: "onair", params: pp_none, spectrum: onair_spectrum },
+        Preset { slug: "miclight", label: "Mic Light", pattern: "miclight", params: pp_none, spectrum: onair_spectrum },
+        Preset { slug: "modeheld", label: "Mode Held", pattern: "modeheld", params: pp_none, spectrum: sp_solid_accent },
+        Preset { slug: "signal", label: "Signal", pattern: "signal", params: pp_none, spectrum: sp_pulse },
     ]
 }
 
@@ -2326,17 +2888,10 @@ fn pp_none() -> Params {
     Params::default()
 }
 fn pp_rain() -> Params {
+    // speed stays at the design default 1.0 — the rain's base rate itself is anchored so 1.0 IS the
+    // lively rain (see the step-rate note in `Rain::field`); no pre-slowed override needed.
     let mut p = Params::default();
     p.set("mode", 0.0);
-    // CASCADE falls at 1/4 the design speed by default — full-speed rain reads as choppy/laggy on a
-    // legacy ~6fps board (big per-frame jumps), and even on the GUI preview it was too fast to track.
-    // 0.25 is the slowest the speed knob allows; bump it from there if you want a downpour.
-    p.set("speed", 0.25);
-    p
-}
-fn pp_comet() -> Params {
-    let mut p = Params::default();
-    p.set("mode", 1.0);
     p
 }
 fn pp_audio() -> Params {
@@ -2535,6 +3090,169 @@ mod tests {
         assert!(pattern_def("nope").is_none());
     }
 
+    // ── the ON AIR readout — the broadcast truth as a paintable layer ────────────────────────
+
+    /// The broadcast slot is process-global (like the vitals feed), so the onair tests serialize
+    /// on the same lock the other global-poking tests use.
+    #[test]
+    fn onair_lights_only_when_the_broadcast_says_live_and_never_goes_stale() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        use crate::lighting::{clear_broadcast, publish_broadcast, Broadcast};
+        clear_broadcast();
+        let def = preset_layer("onair").expect("onair preset");
+        assert_eq!(def.blend, Blend::Cut, "a readout preset composites as a cutout");
+        let mut comp = Compositor::from_defs(&[def]);
+        // no feed at all → dark (a readout with no source never guesses)
+        assert!(comp.render(2, 4, 0.0).iter().all(|p| *p == Rgb::BLACK));
+        // connected but off-air → still dark (standby is opt-in)
+        publish_broadcast(Broadcast { connected: true, streaming: false, recording: false });
+        assert!(comp.render(2, 4, 0.1).iter().all(|p| *p == Rgb::BLACK));
+        // live → the layer's OWN spectrum at full brightness (preset default: tally red)
+        publish_broadcast(Broadcast { connected: true, streaming: true, recording: false });
+        assert!(comp.render(2, 4, 0.2).iter().all(|p| *p == Rgb::new(255, 0, 0)));
+        // the teardown publish (disconnected) kills it — a torn-down OBS can NEVER leave a
+        // stale "live" on the board, even though `streaming` was last announced true.
+        publish_broadcast(Broadcast { connected: false, streaming: true, recording: false });
+        assert!(comp.render(2, 4, 0.3).iter().all(|p| *p == Rgb::BLACK));
+        clear_broadcast();
+    }
+
+    #[test]
+    fn onair_signal_knob_picks_which_truth_and_standby_traces_placement() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        use crate::lighting::{clear_broadcast, publish_broadcast, Broadcast};
+        // signal = record: a running RECORDING lights it, a live stream alone does not.
+        let mut def = preset_layer("onair").expect("onair preset");
+        def.params.set("signal", 1.0);
+        let mut comp = Compositor::from_defs(&[def]);
+        publish_broadcast(Broadcast { connected: true, streaming: true, recording: false });
+        assert!(comp.render(1, 4, 0.0).iter().all(|p| *p == Rgb::BLACK));
+        publish_broadcast(Broadcast { connected: true, streaming: false, recording: true });
+        assert!(comp.render(1, 4, 0.1).iter().all(|p| *p == Rgb::new(255, 0, 0)));
+        // standby: connected + off-signal shows a FAINT trace (placement visible, never "live"),
+        // and disconnection extinguishes even that.
+        let mut def = preset_layer("onair").expect("onair preset");
+        def.params.set("standby", 1.0);
+        let mut comp = Compositor::from_defs(&[def]);
+        publish_broadcast(Broadcast { connected: true, streaming: false, recording: false });
+        let px = comp.render(1, 4, 0.2);
+        assert!(px.iter().all(|p| p.r > 0 && p.r < 80 && p.g == 0 && p.b == 0), "faint red trace, got {px:?}");
+        publish_broadcast(Broadcast::default());
+        assert!(comp.render(1, 4, 0.3).iter().all(|p| *p == Rgb::BLACK));
+        clear_broadcast();
+    }
+
+    // ── MIC LIGHT / MODE HELD / SIGNAL — the rest of the data-tile family ────────────────────
+
+    #[test]
+    fn miclight_renders_the_shown_state_and_never_guesses() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let def = preset_layer("miclight").expect("miclight preset");
+        assert_eq!(def.blend, Blend::Cut, "a readout preset composites as a cutout");
+        let mut comp = Compositor::from_defs(&[def]);
+        // UNKNOWN (no mic resolved) → dark, whichever state the knob shows.
+        crate::mic_state::test_set(0);
+        assert!(comp.render(1, 4, 0.0).iter().all(|p| *p == Rgb::BLACK));
+        // muted → the default shows it (red); live → dark.
+        crate::mic_state::test_set(2);
+        assert!(comp.render(1, 4, 0.1).iter().all(|p| *p == Rgb::new(255, 0, 0)));
+        crate::mic_state::test_set(1);
+        assert!(comp.render(1, 4, 0.2).iter().all(|p| *p == Rgb::BLACK));
+        // show = hot mic inverts the gate.
+        let mut def = preset_layer("miclight").expect("miclight preset");
+        def.params.set("show", 1.0);
+        let mut comp = Compositor::from_defs(&[def]);
+        assert!(comp.render(1, 4, 0.3).iter().all(|p| *p == Rgb::new(255, 0, 0)), "hot mic lights when live");
+        crate::mic_state::test_set(2);
+        assert!(comp.render(1, 4, 0.4).iter().all(|p| *p == Rgb::BLACK), "hot mic goes dark when muted");
+        crate::mic_state::test_set(0);
+    }
+
+    #[test]
+    fn modeheld_follows_the_dispatch_hold_state() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        use crate::lighting::{clear_hold, publish_hold, HoldState};
+        clear_hold();
+        let accent = Rgb::new(0x4A, 0xF2, 0xB0);
+        let def = preset_layer("modeheld").expect("modeheld preset");
+        let mut comp = Compositor::from_defs(&[def]);
+        // no live loop has ever published → dark (there is no mode to show)
+        assert!(comp.render(1, 4, 0.0).iter().all(|p| *p == Rgb::BLACK));
+        // a held layer lights the default; releasing it darkens; sniper alone does NOT
+        // light the layer-signal default.
+        publish_hold(HoldState { layer: true, sniper: false });
+        assert!(comp.render(1, 4, 0.1).iter().all(|p| *p == accent));
+        publish_hold(HoldState { layer: false, sniper: true });
+        assert!(comp.render(1, 4, 0.2).iter().all(|p| *p == Rgb::BLACK));
+        // signal = either lights on sniper too; the teardown default darkens everything.
+        let mut def = preset_layer("modeheld").expect("modeheld preset");
+        def.params.set("signal", 2.0);
+        let mut comp = Compositor::from_defs(&[def]);
+        assert!(comp.render(1, 4, 0.3).iter().all(|p| *p == accent));
+        publish_hold(HoldState::default());
+        assert!(comp.render(1, 4, 0.4).iter().all(|p| *p == Rgb::BLACK));
+        clear_hold();
+    }
+
+    #[test]
+    fn signal_layer_renders_its_channel_as_level_or_glow() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        use crate::lighting::set_signal;
+        set_signal(0, 0.0);
+        set_signal(1, 0.0);
+        // level (default): the value picks the colour along the layer's own spectrum — use a
+        // black→white ramp so the expected colour is exact greyscale.
+        let mut def = preset_layer("signal").expect("signal preset");
+        def.spectrum = Spectrum::gradient(vec![Rgb::BLACK, Rgb::new(255, 255, 255)]);
+        let mut comp = Compositor::from_defs(&[def.clone()]);
+        // untouched channel (0.0) → dark: an unused channel costs nothing and never lies.
+        assert!(comp.render(1, 4, 0.0).iter().all(|p| *p == Rgb::BLACK));
+        set_signal(0, 1.0);
+        assert!(comp.render(1, 4, 0.1).iter().all(|p| *p == Rgb::new(255, 255, 255)));
+        // channel isolation: this layer reads channel 1 (knob "2"), which is still zero.
+        def.params.set("channel", 1.0);
+        let mut comp = Compositor::from_defs(&[def.clone()]);
+        assert!(comp.render(1, 4, 0.2).iter().all(|p| *p == Rgb::BLACK));
+        // glow: the value is the BRIGHTNESS of the spectrum (solid white × 0.5 ≈ mid grey).
+        set_signal(1, 0.5);
+        def.spectrum = Spectrum::solid(Rgb::new(255, 255, 255));
+        def.params.set("style", 1.0);
+        let mut comp = Compositor::from_defs(&[def]);
+        let px = comp.render(1, 4, 0.3);
+        assert!(
+            px.iter().all(|p| p.r > 100 && p.r < 155 && p.r == p.g && p.g == p.b),
+            "glow at 0.5 reads ~half-bright, got {px:?}"
+        );
+        // out-of-range values clamp on write, so a wild macro can't overdrive the layer.
+        set_signal(0, 9.0);
+        assert_eq!(crate::lighting::signal(0), 1.0);
+        set_signal(0, 0.0);
+        set_signal(1, 0.0);
+    }
+
+    #[test]
+    fn onair_composites_as_a_cutout_over_the_users_own_lighting() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        use crate::lighting::{clear_broadcast, publish_broadcast, Broadcast};
+        clear_broadcast();
+        // a teal base with an onair layer painted on cells {1, 2} of a 1×4 strip
+        let base = LayerDef { spectrum: Spectrum::solid(Rgb::new(0, 100, 100)), ..Default::default() };
+        let mut tally = preset_layer("onair").expect("onair preset");
+        tally.region = vec![1, 2];
+        let mut comp = Compositor::from_defs(&[base, tally]);
+        // OFF-AIR: the user's own lighting shows EVERYWHERE — the painted region punches no hole.
+        publish_broadcast(Broadcast { connected: true, streaming: false, recording: false });
+        assert!(comp.render(1, 4, 0.0).iter().all(|p| *p == Rgb::new(0, 100, 100)));
+        // LIVE: exactly the painted cells read TRUE red (no screen-wash), the rest stay the base.
+        publish_broadcast(Broadcast { connected: true, streaming: true, recording: false });
+        let px = comp.render(1, 4, 0.1);
+        assert_eq!(px[0], Rgb::new(0, 100, 100));
+        assert_eq!(px[1], Rgb::new(255, 0, 0));
+        assert_eq!(px[2], Rgb::new(255, 0, 0));
+        assert_eq!(px[3], Rgb::new(0, 100, 100));
+        clear_broadcast();
+    }
+
     // ── Field rendering — the per-layer pipeline core ───────────────────────────────────────
 
     #[test]
@@ -2714,21 +3432,24 @@ mod tests {
         assert!(d.params.is_empty());
     }
 
-    // ── the full registry — all twelve shapes present ───────────────────────────────────────────
+    // ── the full registry — all thirteen shapes present ─────────────────────────────────────────
 
     #[test]
-    fn registry_has_the_full_twelve_shapes() {
+    fn registry_has_the_full_thirteen_shapes() {
         let keys = pattern_keys();
         for k in [
-            "uniform", "axis", "radial", "heat", "streak", "sparkle", "ignite", "ring", "flow",
+            "uniform", "axis", "radial", "heat", "rain", "comet", "sparkle", "ignite", "ring", "flow",
             "thermal", "meter", "screen",
         ] {
             assert!(keys.contains(&k), "registry is missing the '{k}' pattern");
         }
-        // the twelve procedural shapes + the `custom` static-frame layer + the `vitals` readout.
+        // the thirteen procedural shapes + the `custom` static-frame layer + the DATA readouts
+        // (`vitals`, `onair`, `miclight`, `modeheld`, `signal`).
         assert!(keys.contains(&"custom"), "registry is missing the 'custom' layer type");
-        assert!(keys.contains(&"vitals"), "registry is missing the 'vitals' readout");
-        assert_eq!(keys.len(), 14, "the twelve shapes plus the custom frame layer plus the vitals readout");
+        for k in ["vitals", "onair", "miclight", "modeheld", "signal"] {
+            assert!(keys.contains(&k), "registry is missing the '{k}' readout");
+        }
+        assert_eq!(keys.len(), 19, "the thirteen shapes + the custom frame layer + the five readouts");
     }
 
     // ── presets are pure, valid data (the tile grid) ────────────────────────────────────────────
@@ -2845,9 +3566,9 @@ mod tests {
     }
 
     #[test]
-    fn streak_rain_fills_and_animates() {
-        let mut s = Streak::default();
-        s.configure(&Params::defaults_for("streak")); // mode default 0 = rain
+    fn rain_fills_and_animates() {
+        let mut s = Rain::default();
+        s.configure(&Params::defaults_for("rain")); // mode default 0 = rain
         let a = scalar(s.field(6, 22, 0.0));
         assert_eq!(a.len(), 6 * 22);
         assert!(a.iter().any(|c| c.intensity > 0.0), "rain lights some cells");
@@ -2857,11 +3578,40 @@ mod tests {
     }
 
     #[test]
-    fn streak_comet_breaks_and_respawns() {
-        let mut s = Streak::default();
+    fn rain_matrix_mode_streams_continuously() {
+        let mut s = Rain::default();
         let mut p = Params::default();
-        p.set("mode", 1.0); // comet
+        p.set("mode", 1.0); // matrix — continuous code streams
         s.configure(&p);
+        let a = scalar(s.field(6, 22, 0.0));
+        assert!(a.iter().any(|c| c.intensity > 0.0), "the code wall is alive from frame one");
+        let b = scalar(s.field(6, 22, 1.0));
+        assert!(a != b, "the streams animate over time");
+        assert!(a.iter().all(|c| (0.0..=1.0).contains(&c.u) && (0.0..=1.0).contains(&c.intensity)));
+        // per-column pace: matrix rolls a distinct speed per stream — the signature variance.
+        let distinct = s.col_speed.windows(2).any(|w| (w[0] - w[1]).abs() > 1e-3);
+        assert!(distinct, "matrix columns fall at their own speeds");
+        // over a long run every stream keeps re-entering (near-continuous columns, no dead board).
+        for k in 2..40 {
+            let _ = s.field(6, 22, k as f32);
+        }
+        let end = scalar(s.field(6, 22, 40.0));
+        assert!(end.iter().any(|c| c.intensity > 0.0), "the code wall never goes dark");
+    }
+
+    #[test]
+    fn legacy_streak_key_aliases_to_rain() {
+        // saved layers from before the split (pattern = "streak") must keep resolving: the alias
+        // lands on rain (mode 0 = identical rain; mode 1 now reads as rain's matrix submode).
+        assert!(make_pattern("streak").is_some(), "the retired key still builds a pattern");
+        assert_eq!(pattern_def("streak").unwrap().key, "rain");
+        assert!(!pattern_params("streak").is_empty(), "the alias serves the schema too");
+    }
+
+    #[test]
+    fn comet_breaks_and_respawns() {
+        let mut s = Comet::default();
+        s.configure(&Params::default());
         let _ = s.field(6, 22, 0.0); // populate the parade (1 comet by default)
         assert!(!s.comets.is_empty(), "the comet parade is populated");
         // place a live comet at a known head, then BREAK it with a press on that cell.
@@ -2894,11 +3644,10 @@ mod tests {
     }
 
     #[test]
-    fn streak_comet_count_scales_with_density() {
+    fn comet_count_scales_with_density() {
         let count = |d: f32| {
-            let mut s = Streak::default();
+            let mut s = Comet::default();
             let mut p = Params::default();
-            p.set("mode", 1.0);
             p.set("density", d);
             s.configure(&p);
             let _ = s.field(6, 22, 0.0);
@@ -2960,7 +3709,7 @@ mod tests {
         // Count ONLY fresh presses landing on M1's cell. No VK resolves to (1,0), so live keyboard
         // state can't pollute this count — only the macro bridge can light it. (Suppression is a
         // thread-local that defaults off, so reads on this fresh test thread are NOT suppressed.)
-        let mut count_m1 = |prev: &mut Vec<bool>| {
+        let count_m1 = |prev: &mut Vec<bool>| {
             let mut hits = 0u32;
             scan_key_presses(prev, rows, cols, |ry, cx| {
                 if (ry, cx) == (m1r, m1c) {
@@ -3061,26 +3810,72 @@ mod tests {
     // ── Meter (Audio Meter + Pulse) — the pure renderers ────────────────────────────────────────
 
     #[test]
-    fn meter_audio_fills_from_the_bottom() {
-        // a loud level lights the bottom rows; u rises up the bar (low → high). Silence → dark.
-        let loud = render_audio_meter(1.0, 0.0, 1.0, 6, 22);
-        assert!(loud[5 * 22].intensity > 0.0, "the bottom row lights when loud");
-        assert_eq!(loud[5 * 22].u, 0.0, "the bottom of the bar samples the spectrum's low end");
-        assert_eq!(loud[0].intensity, 0.0, "the very top stays dark at this level");
-        let silent = render_audio_meter(0.0, 0.0, 1.0, 6, 22);
-        assert!(silent.iter().all(|c| c.intensity == 0.0), "silence → a dark meter");
+    fn meter_bar_ballistics_attack_fast_release_slow() {
+        // one 60fps step toward a transient climbs much further than one step releasing from it.
+        let rise = meter_step_bar(0.0, 1.0, 1.0 / 60.0, 1.0);
+        let fall = 1.0 - meter_step_bar(1.0, 0.0, 1.0 / 60.0, 1.0);
+        assert!(rise > fall * 2.0, "attack ({rise}) far outpaces release ({fall})");
+        // dt-scaling: a 6fps board's single big step lands close to ten 60fps steps (same envelope).
+        let one_big = meter_step_bar(0.0, 1.0, 10.0 / 60.0, 1.0);
+        let mut ten_small = 0.0;
+        for _ in 0..10 {
+            ten_small = meter_step_bar(ten_small, 1.0, 1.0 / 60.0, 1.0);
+        }
+        assert!(
+            (one_big - ten_small).abs() < 0.02,
+            "the exponential approach is frame-rate-independent ({one_big} vs {ten_small})"
+        );
+    }
+
+    #[test]
+    fn meter_focus_knob_is_gated_to_the_audio_sources() {
+        // the `focus` knob (Synapse's tunable sensitivity) is schema-gated: visible only while the
+        // meter's source is an AUDIO one (speakers/mic) — a load meter has no registers, so the
+        // knob must not render there as a dead control.
+        let params = pattern_params("meter");
+        let focus = params.iter().find(|p| p.key == "focus").expect("meter declares focus");
+        assert_eq!(
+            focus.only_when,
+            Some(("source", &[0u8, 1][..])),
+            "focus is visible only for the speakers/mic sources"
+        );
+        // every other meter knob is unconditional.
+        for p in params.iter().filter(|p| p.key != "focus") {
+            assert!(p.only_when.is_none(), "{} is an always-on knob", p.key);
+        }
+    }
+
+    #[test]
+    fn meter_audio_tint_is_one_uniform_surface_tone_by_colour_loudness_by_brightness() {
+        // EVERY cell identical (the uniform Synapse shape — no spatial edge, nothing to flicker):
+        // u = the tone (the gradient's bass→treble register axis), intensity = the loudness.
+        let cells = paint_audio_tint(0.2, 0.8, 6 * 22);
+        assert_eq!(cells.len(), 6 * 22);
+        assert!(cells.iter().all(|&c| c == cells[0]), "the whole board is ONE surface");
+        assert_eq!(cells[0], Cell::new(0.2, 0.8), "colour carries the tone, brightness the loudness");
+        // silence → intensity 0 → an honestly dark board, whatever the tone reads.
+        let dark = paint_audio_tint(0.7, 0.0, 4);
+        assert_eq!(dark[0].intensity, 0.0, "no loudness → no light");
+        // out-of-range inputs clamp.
+        let clamped = paint_audio_tint(7.0, -3.0, 1)[0];
+        assert_eq!((clamped.u, clamped.intensity), (1.0, 0.0));
+        // the default meter gradient is a register axis: bass ≠ mids ≠ treble, treble ends white.
+        let g = meter_spectrum();
+        let (bass, mid, treble) = (g.at(0.0, 0.0), g.at(0.0, 0.5), g.at(0.0, 1.0));
+        assert_ne!(bass, mid, "the kick's register has its own colour");
+        assert_eq!(treble, Rgb::new(255, 255, 255), "the cymbals' end crests white");
     }
 
     #[test]
     fn meter_load_colours_the_bar_by_load() {
         // a CPU bar at 50% fills the left half; every lit cell samples the spectrum at u = the load (so the
         // calm→urgent ramp colours the whole bar by how hard the machine is working).
-        let cells = render_load_meter(2, 0.5, 0.0, 0.0, 1.0, 6, 22);
+        let cells = render_load_meter(2, 0.5, 0.0, 0.85, 6, 22);
         assert!(cells[0].intensity > 0.0, "the bar's left is lit");
         assert!((cells[0].u - 0.5).abs() < 1e-6, "u carries the load level");
         assert_eq!(cells[21].intensity, 0.0, "the unfilled right stays dark");
         // the combined "load" view splits CPU (top) over RAM (bottom).
-        let split = render_load_meter(4, 1.0, 0.0, 0.0, 1.0, 6, 22);
+        let split = render_load_meter(4, 1.0, 0.0, 0.85, 6, 22);
         assert!(split[0].intensity > 0.0, "a maxed CPU lights the top");
         assert_eq!(split[5 * 22].intensity, 0.0, "an idle RAM leaves the bottom dark");
     }
@@ -3203,14 +3998,14 @@ mod tests {
 
     #[test]
     fn compositor_hands_each_layer_its_region_bbox() {
-        use std::cell::Cell as StdCell;
-        use std::rc::Rc;
+        use std::sync::{Arc, Mutex as StdMutex};
 
-        // A probe pattern that records the last Bounds the compositor handed it.
-        struct Probe(Rc<StdCell<Option<Bounds>>>);
+        // A probe pattern that records the last Bounds the compositor handed it. (Arc+Mutex, not
+        // Rc+Cell: `Pattern: Send` — patterns cross onto anim/writer threads.)
+        struct Probe(Arc<StdMutex<Option<Bounds>>>);
         impl Pattern for Probe {
             fn set_bounds(&mut self, b: Bounds) {
-                self.0.set(Some(b));
+                *self.0.lock().unwrap() = Some(b);
             }
             fn field(&mut self, rows: u8, cols: u8, _t: f32) -> Field {
                 Field::Scalar(vec![Cell::new(0.0, 0.0); rows as usize * cols as usize])
@@ -3218,7 +4013,7 @@ mod tests {
         }
 
         // a region carving a 2×2 block at (1,1) on a 4×4 board → the layer's bbox is that rect.
-        let seen = Rc::new(StdCell::new(None));
+        let seen = Arc::new(StdMutex::new(None));
         let mut comp = Compositor {
             layers: vec![Layer {
                 pattern: Box::new(Probe(seen.clone())),
@@ -3229,10 +4024,10 @@ mod tests {
             }],
         };
         let _ = comp.render(4, 4, 0.0);
-        assert_eq!(seen.get(), Some(Bounds { row0: 1, col0: 1, rows: 2, cols: 2 }));
+        assert_eq!(*seen.lock().unwrap(), Some(Bounds { row0: 1, col0: 1, rows: 2, cols: 2 }));
 
         // a region-less layer is handed the whole board.
-        let seen2 = Rc::new(StdCell::new(None));
+        let seen2 = Arc::new(StdMutex::new(None));
         let mut comp2 = Compositor {
             layers: vec![Layer {
                 pattern: Box::new(Probe(seen2.clone())),
@@ -3243,7 +4038,7 @@ mod tests {
             }],
         };
         let _ = comp2.render(4, 4, 0.0);
-        assert_eq!(seen2.get(), Some(Bounds::board(4, 4)));
+        assert_eq!(*seen2.lock().unwrap(), Some(Bounds::board(4, 4)));
     }
 
     // ── capability flags (registry-driven; no app-side key string-matching) ───────────────────────
@@ -3380,40 +4175,40 @@ mod tests {
     }
 
     #[test]
-    fn vitals_overlay_screen_lets_the_base_show_through() {
+    fn vitals_overlay_cuts_out_over_the_base() {
         // Serialised: the vitals feed is a process-global, so don't race a publisher.
         let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let (rows, cols) = (2u8, 8u8);
         let base_col = Rgb::new(30, 90, 180);
-        // a solid-lit base beneath a Screen-blended vitals overlay (the vitals preset's default blend).
+        // a solid-lit base beneath a Cut-blended vitals overlay (the readout preset's default blend).
         let base = LayerDef {
             pattern: "uniform".into(),
             spectrum: Spectrum::solid(base_col),
             ..Default::default()
         };
         let vitals = preset_by_slug("vitals").expect("vitals preset").to_layer();
-        assert_eq!(vitals.blend, Blend::Screen, "the vitals preset overlays with Screen");
+        assert_eq!(vitals.blend, Blend::Cut, "a readout preset overlays as a cutout");
 
-        // NO published data → the whole vitals layer is black; Screen's identity is black, so the base
-        // shows THROUGH everywhere — not a black hole punched over the effect.
+        // NO published data → the whole vitals layer is black; black is Cut's "nothing to say", so
+        // the base shows THROUGH everywhere — not a black hole punched over the effect.
         crate::lighting::clear_vitals();
         let mut comp = Compositor::from_defs(&[base.clone(), vitals.clone()]);
         let out = comp.render(rows, cols, 0.0);
         assert!(out.iter().all(|&c| c == base_col), "no-data vitals overlay leaves the base intact");
 
-        // WITH data → the LIT gauge cells modify the output; the empty-track cells pass the base through.
+        // WITH data → the LIT gauge cells land at TRUE colour (Cut replaces — battery red must
+        // read red, never a screen-wash of red and base); the empty track passes the base through.
         crate::lighting::publish_vitals(crate::lighting::Vitals {
             battery_pct: 50, charging: false, active_stage: 0, stage_count: 1,
         });
         let mut comp = Compositor::from_defs(&[base.clone(), vitals.clone()]);
         let out = comp.render(rows, cols, 0.0);
-        // 50% over 8 cols → the left 4 columns light (screened over the base); the right 4 pass through.
+        // 50% over 8 cols → the left 4 columns light at the gauge colour; the right 4 pass through.
         let lit = crate::lighting::battery_color(50);
-        let screened = crate::effects::blend_px(base_col, lit, Blend::Screen);
-        assert_ne!(screened, base_col, "a lit gauge cell must differ from the bare base");
+        assert_ne!(lit, base_col, "a lit gauge cell must differ from the bare base");
         for row in 0..rows as usize {
             for col in 0..4usize {
-                assert_eq!(out[row * cols as usize + col], screened, "lit gauge cell modifies the base");
+                assert_eq!(out[row * cols as usize + col], lit, "lit gauge cell reads its true colour");
             }
             for col in 4..cols as usize {
                 assert_eq!(out[row * cols as usize + col], base_col, "empty-track cell passes the base through");

@@ -21,13 +21,15 @@ export struct DeviceRow {
     icon: string,       // glyph hint: "mouse" | "keyboard" | "device" | "mic" | "output"
     // emergent device unification — the list is HID peripherals AND audio endpoints (mic/output).
     kind: string,       // "mouse" | "keyboard" | "device" (HID) | "mic" | "output" (Core Audio)
-    id: string,         // selection key: pid-hex for HID, the Core-Audio endpoint id for audio
+    id: string,         // selection key: the PHYSICAL unit (HID path instance — two identical
+                        // devices get two distinct ids); the Core-Audio endpoint id for audio
     detail: string,     // audio subtitle ("microphone · 62%" / "output · muted"); "" for HID
     // registry-driven CAPABILITY flags (from the device descriptor) — the panel gates each control on
     // these, so a keyboard shows no DPI fader and a wired board shows no battery/idle.
     cap-dpi: bool,      // DPI fader · DPI stages · sniper · lift-off
     cap-poll: bool,     // polling contacts · in-game polling
     cap-light: bool,    // brightness fader
+    cap-bright: bool,   // brightness GETTER — the LIGHT readout (a set-only board shows no readout)
     cap-scroll: bool,   // scroll-wheel stages
     cap-store: bool,    // persist-to-onboard
     cap-idle: bool,     // idle-off timer (wireless)
@@ -40,7 +42,7 @@ export struct RuleRow {
     trigger: string,    // Trigger::describe()
     action: string,     // Action::describe()
     layer: string,      // "base" | "hypershift" | ""
-    kind: string,       // "input" | "hotkey" | "gesture" | "radial" | "app" | "mic" | "hold"
+    kind: string,       // "input" | "gesture" | "radial" | "app" | "mic" | "hold" | "cast"
     removable: bool,    // GUI-authored (gui.rules.toml) -> deletable; toml-sourced -> read-only
 }
 
@@ -132,11 +134,29 @@ export struct SpectrumFrame {
 // One spellweaving MATERIAL in the gallery — a living preview swatch (rendered Rust-side from the
 // real shader, so the tile IS the material) + its name and vibe blurb. `slug` is the stable id the
 // picker persists. Selection is derived in the view (slug == State.weave-material), not stored here.
+// A/B swatch slots: the gallery renders at ~10fps on a worker, but the tile
+// GPU-crossfades the two slots (State.material-show-alt flips per frame, the
+// alt image's opacity animates over one frame period), so motion reads as
+// continuous at display rate while the CPU renders a tenth of it.
 export struct MaterialCard {
     name: string,
     slug: string,
     blurb: string,
     swatch: image,
+    swatch-alt: image,
+}
+
+// One WHAT-EARNS-A-PING kind (SYSTEM → NOTIFICATIONS) — DATA-DRIVEN from confirm::Kind::ALL in the
+// glue, so a new confirmation kind grows its card automatically; the copy + display order live in
+// exhaustive Rust matches (the compiler, not a hand-kept slint list, guarantees completeness).
+// `slug` is the pref-gate key the toggle writes; `icon` picks the PingIcon glyph (usually == slug —
+// beacon wears its own glyph over the "macro" gate).
+export struct PingKind {
+    slug: string,
+    icon: string,
+    label: string,
+    desc: string,
+    on: bool,
 }
 
 // One tunable KNOB a spellweaving material surfaces — a generic, data-driven control. The material

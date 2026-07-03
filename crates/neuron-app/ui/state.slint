@@ -9,7 +9,7 @@
 
 import {
     DeviceRow, RuleRow, ProfileRow, AppRuleRow, EffectRow, RadialSector, GlyphChip, ImportLine,
-    DiagRow, ActionChoice, OrganRow, MaterialCard, KnobRow,
+    DiagRow, ActionChoice, OrganRow, MaterialCard, KnobRow, PingKind,
     PocketCard, BeaconMacro, RhythmBindRow, MacroBlock, MacroCard, EffectTile, EffectParam,
     SpectrumStop, SpectrumFrame
 } from "models.slint";
@@ -117,7 +117,7 @@ export global State {
     callback toggle-device-mute();
     callback refresh-devices();
     callback select-device(int);
-    callback backup-device(string);                  // pid
+    callback backup-device(string);                  // unit id (DeviceRow.id)
     in-out property <float> dpi: 1600;
     in-out property <float> polling-hz: 1000;
     in-out property <float> brightness: 75;
@@ -157,6 +157,7 @@ export global State {
     in-out property <float> sniper-dpi: 400;
     callback capture-sniper-button();
     callback save-sniper(float);
+    callback unbind-sniper();       // drop the sniper rule (the split button's right half)
     // SLEEP / idle-off timer (seconds). Read-back shown; write verify-gated (NEURON_IDLE_WRITE).
     in-out property <float> idle-secs: 300;
     in-out property <string> idle-secs-text: "300";
@@ -304,6 +305,9 @@ export global State {
     callback add-stop(float);                          // (at 0..1) — insert a stop (colour sampled there), select it
     callback remove-stop(int);                         // (stop idx) — delete (a palette never drops below 1 stop)
     callback move-stop(int, float);                    // (stop idx, at 0..1) — reposition along the gradient
+    // (at 0..1) — the strip's press gesture: glue hit-tests the nearest stop (grab = select) or
+    // inserts one on open track, then selects it — so the drag that follows always moves light-sel-stop.
+    callback strip-press(float);
     // MOTION row — the active palette's intra-frame animation. `speed` always applies; `depth` only to
     // breathe, `chaos` only to flow (the UI shows the relevant knob by `light-motion`).
     in-out property <string> light-motion: "hold";     // hold | drift | cycle | breathe | flow
@@ -594,6 +598,9 @@ export global State {
     in-out property <string> weave-material: "directed-intent";
     callback set-weave-material(string);
     callback material-preview-tick();                     // re-render the gallery swatches (animated)
+    // which swatch slot is showing (the A/B crossfade phase) — flipped by the glue after each
+    // worker frame lands in the hidden slot; the tile animates the alt slot's opacity on it.
+    in-out property <bool> material-show-alt: false;
     // the SELECTED material's tunable knobs — the UI renders a slider per row; editing reshapes the
     // live substance. Generic + data-driven: a material declares its own knobs.
     in-out property <[KnobRow]> weave-knobs;
@@ -608,21 +615,54 @@ export global State {
     in-out property <bool> crash-present: false;          // a dump exists on disk (colour the readout)
     in-out property <bool> phoenix: true;                 // OS auto-restart armed (next-launch pref)
     callback set-phoenix(bool);
+    // ── CONNECTIONS — the protocol host (System page). Other software paints THROUGH the
+    // arbiter: games speak Chroma (54235), tools speak OpenRGB (6742), composing ABOVE the
+    // configured lighting. Toggles persist to app.toml; the status lines carry PORT TRUTH
+    // (a bind that failed — real Synapse holding the socket — never shows as serving).
+    in-out property <bool> host-enabled: false;            // master switch (default OFF — opt-in)
+    in-out property <bool> host-chroma: true;              // serve Chroma (games) while enabled
+    in-out property <bool> host-openrgb: true;             // serve OpenRGB (tools) while enabled
+    in-out property <bool> host-obs: false;                // connect OUT to OBS (macros drive scenes)
+    in-out property <bool> host-lighting-wins: false;      // WHO WINS: my lighting always wins vs games take over
+    in-out property <string> host-obs-password: "";        // obs-websocket Server Password (masked field)
+    in-out property <string> host-chroma-status: "";       // honest per-protocol readout
+    in-out property <string> host-openrgb-status: "";
+    in-out property <string> host-obs-status: "";
+    // LIVE lamps — true when that protocol is actually up (port bound / OBS authenticated), so the
+    // row lights phosphor the instant it connects. This is the visible "yes, it works" signal.
+    in-out property <bool> host-chroma-live: false;
+    in-out property <bool> host-openrgb-live: false;
+    in-out property <bool> host-obs-live: false;
+    in-out property <string> host-devices-line: "";        // "N device(s) on the arbiter"
+    callback set-host-enabled(bool);
+    callback set-host-chroma(bool);
+    callback set-host-openrgb(bool);
+    callback set-host-obs(bool);
+    callback set-host-lighting-wins(bool);
+    callback set-host-obs-password(string);                 // save + reconnect with the new secret
+    // LIGHTING page truth strip: a client holds a claim above your base on the selected board
+    // (painting now; your effect resumes when it releases).
+    in-out property <bool> light-foreign: false;
+    // the flip side of "who wins": a named client is CONNECTED but your base wins, so it's
+    // here and honestly not showing (the truth no last-writer-wins tool has).
+    in-out property <bool> light-suppressed: false;
+    // best-effort NAME of the client (a Chroma game's title, an OpenRGB client's name) —
+    // "" when unknown; meaningful while light-foreign OR light-suppressed is true.
+    in-out property <string> light-foreign-app: "";
     // ── NOTIFICATIONS — state-change confirmation cards (System page) ──
     in-out property <bool> notif-enabled: true;
     in-out property <string> notif-placement: "top-right"; // off/top-left/top-right/bottom-left/bottom-right/inline/custom
     in-out property <float> notif-x: 1.0;                 // hand-placed card anchor, fraction of the work-area (0..1)
     in-out property <float> notif-y: 0.0;
     in-out property <bool> notif-audio: true;
-    in-out property <bool> notif-dpi: true;
-    in-out property <bool> notif-scroll: true;
-    in-out property <bool> notif-polling: true;
-    in-out property <bool> notif-brightness: true;
-    in-out property <bool> notif-profile: true;
-    in-out property <bool> notif-layer: true;
-    in-out property <bool> notif-macro: true;            // macro/beacon notify card (the ASK prompt is never gated)
-    in-out property <bool> notif-battery: true;          // device battery / charge cards (low/critical, charging, full)
-    in-out property <bool> notif-side-plate: true;       // swappable side-plate swap-detect card
+    // the WHAT-EARNS-A-PING cards, data-driven off confirm::Kind::ALL (see PingKind in models) and
+    // grouped by DOMAIN — three captioned clusters, each rendered as one full-width row, so the
+    // layout can never grow a dangling odd card: a new kind joins its domain's row and the row just
+    // gets denser. Per-kind bool props are GONE; the glue rebuilds these on seed + toggle. Adding a
+    // DOMAIN (rare, deliberate) = one more model here + one caption block in settings.slint.
+    in-out property <[PingKind]> ping-pointer;   // aim & report: dpi · sniper · sensitivity · polling
+    in-out property <[PingKind]> ping-hardware;  // the physical device: brightness · battery · side plate
+    in-out property <[PingKind]> ping-session;   // software state: profile · layer · beacon
     in-out property <string> notif-stack: "stack";       // WHEN SEVERAL LAND: stack | latest | digest
     callback set-notif-stack(string);
     callback set-notif-enabled(bool);

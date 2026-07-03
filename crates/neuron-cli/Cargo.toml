@@ -7,7 +7,7 @@ name = "neuron-cli"
 description = "Neuron command-line client — the anti-Synapse CLI."
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license-file.workspace = true
 
 [[bin]]
 name = "neuron"

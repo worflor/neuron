@@ -32,7 +32,10 @@ pub fn set(enabled: bool) -> String {
             .args(["delete", RUN_KEY, "/v", VALUE, "/f"])
             .output();
         match out {
-            Ok(_) => "start-with-Windows disabled".into(),
+            Ok(o) if o.status.success() => "start-with-Windows disabled".into(),
+            // symmetric with enable: a non-zero `reg delete` (e.g. the value already gone, or denied) is
+            // a FAILURE, not a silent success — don't tell the user it's off when the key may still stand.
+            Ok(_) => "failed to clear autostart".into(),
             Err(e) => format!("autostart error: {e}"),
         }
     }

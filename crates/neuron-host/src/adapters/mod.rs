@@ -8,4 +8,5 @@
 //! against the same code that runs in production.
 
 pub mod chroma;
+pub mod obs;
 pub mod openrgb;

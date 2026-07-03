@@ -51,7 +51,7 @@ pub struct Grid {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SurfaceInfo {
-    /// Stable device key (later: derived from neuron-core's DevicePath/pid).
+    /// Stable device key (the bridge derives it: `codename-{pid:04x}`, see `surface_key`).
     pub key: String,
     /// Human-readable name shown to protocol clients.
     pub name: String,
@@ -111,6 +111,10 @@ pub trait HostApi {
     fn release_owner(&mut self, owner: SourceId);
     fn resolve(&mut self, surface: &str, now: Instant) -> Option<Vec<Option<Rgb>>>;
     fn publish(&mut self, path: &str, value: Value);
+    /// Give a source a human name ("Overwatch", "openrgb: hass") the moment the
+    /// adapter learns it — what turns the GUI's ownership truth from "another
+    /// app" into a NAME. Labels are advisory identity, never authority.
+    fn label_source(&mut self, owner: SourceId, name: &str);
 }
 
 impl HostApi for crate::Kernel {
@@ -163,6 +167,10 @@ impl HostApi for crate::Kernel {
 
     fn release_owner(&mut self, owner: SourceId) {
         let _ = self.arbiter.release_owner(owner);
+        // A released source is gone for good (ids are monotonic, never reused),
+        // so drop its advisory label too — otherwise long connect/disconnect
+        // churn leaks names into `labels` forever.
+        self.labels.remove(&owner);
     }
 
     fn resolve(&mut self, surface: &str, now: Instant) -> Option<Vec<Option<Rgb>>> {
@@ -171,6 +179,10 @@ impl HostApi for crate::Kernel {
 
     fn publish(&mut self, path: &str, value: Value) {
         self.bus.publish(path, value);
+    }
+
+    fn label_source(&mut self, owner: SourceId, name: &str) {
+        self.labels.insert(owner, name.to_string());
     }
 }
 
@@ -189,6 +201,22 @@ mod tests {
         // SourceId(0) is the journal's CONFIG_SOURCE — never issued.
         assert_ne!(a, crate::journal::CONFIG_SOURCE);
         assert_ne!(b, crate::journal::CONFIG_SOURCE);
+    }
+
+    #[test]
+    fn releasing_an_owner_prunes_its_label() {
+        use crate::arbiter::{Content, Rgb};
+        use std::time::Instant;
+        let mut k = Kernel::new();
+        k.declare(SurfaceInfo::grid("kbd", "Board", SurfaceKind::Keyboard, 1, 1));
+        let o = k.next_source();
+        k.label_source(o, "Overwatch");
+        k.claim("kbd", o, band::SESSION, LeaseSpec::Pinned, Content::Fill(Rgb(1, 1, 1)), Instant::now());
+        assert_eq!(k.label_of(o), Some("Overwatch"));
+        // Disconnect: the label must be pruned with the claims — no unbounded
+        // growth across connect/disconnect churn (ids are never reused).
+        k.release_owner(o);
+        assert_eq!(k.label_of(o), None, "label pruned on owner release");
     }
 
     #[test]

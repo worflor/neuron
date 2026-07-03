@@ -104,7 +104,7 @@ export component ProfilesMenu inherits VerticalLayout {
     // name-keyed delete arming (an index can drift when the model refreshes mid-arm)
     property <string> armed-delete: "";
     Timer {
-        interval: 2500ms;
+        interval: Theme.confirm-window;
         running: root.armed-delete != "";
         triggered => { root.armed-delete = ""; }
     }

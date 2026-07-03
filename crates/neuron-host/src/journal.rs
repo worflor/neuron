@@ -147,7 +147,7 @@ mod tests {
     use crate::arbiter::Rgb;
     use std::time::Instant;
 
-    fn resolve_all(a: &Arbiter, key: &str) -> Vec<Option<Rgb>> {
+    fn resolve_all(a: &mut Arbiter, key: &str) -> Vec<Option<Rgb>> {
         a.resolve(key, Instant::now()).unwrap()
     }
 
@@ -157,10 +157,10 @@ mod tests {
         j.record(Decl::Surface { key: "kbd".into(), leds: 3 });
         j.record(base_layer("user-stack", "kbd", Content::Fill(Rgb(10, 20, 30))));
 
-        let a1 = j.replay();
-        let a2 = j.replay();
-        assert_eq!(resolve_all(&a1, "kbd"), resolve_all(&a2, "kbd"));
-        assert_eq!(resolve_all(&a1, "kbd"), vec![Some(Rgb(10, 20, 30)); 3]);
+        let mut a1 = j.replay();
+        let mut a2 = j.replay();
+        assert_eq!(resolve_all(&mut a1, "kbd"), resolve_all(&mut a2, "kbd"));
+        assert_eq!(resolve_all(&mut a1, "kbd"), vec![Some(Rgb(10, 20, 30)); 3]);
     }
 
     #[test]
@@ -169,8 +169,8 @@ mod tests {
         j.record(Decl::Surface { key: "kbd".into(), leds: 1 });
         j.record(base_layer("user-stack", "kbd", Content::Fill(Rgb(1, 1, 1))));
         j.record(base_layer("user-stack", "kbd", Content::Fill(Rgb(2, 2, 2))));
-        let a = j.replay();
-        assert_eq!(resolve_all(&a, "kbd"), vec![Some(Rgb(2, 2, 2))]);
+        let mut a = j.replay();
+        assert_eq!(resolve_all(&mut a, "kbd"), vec![Some(Rgb(2, 2, 2))]);
     }
 
     #[test]
@@ -179,8 +179,8 @@ mod tests {
         j.record(Decl::Surface { key: "kbd".into(), leds: 1 });
         j.record(base_layer("user-stack", "kbd", Content::Fill(Rgb(1, 1, 1))));
         j.record(Decl::DropLayer { name: "user-stack".into() });
-        let a = j.replay();
-        assert_eq!(resolve_all(&a, "kbd"), vec![None]);
+        let mut a = j.replay();
+        assert_eq!(resolve_all(&mut a, "kbd"), vec![None]);
     }
 
     #[test]
@@ -193,15 +193,15 @@ mod tests {
         j.record(Decl::DropLayer { name: "b".into() });
         j.record(Decl::Surface { key: "kbd".into(), leds: 3 });
 
-        let before = j.replay();
+        let mut before = j.replay();
         let len_before = j.len();
         j.compact();
-        let after = j.replay();
+        let mut after = j.replay();
 
         assert!(j.len() < len_before, "compaction must shrink ({} -> {})", len_before, j.len());
-        assert_eq!(resolve_all(&before, "kbd"), resolve_all(&after, "kbd"));
+        assert_eq!(resolve_all(&mut before, "kbd"), resolve_all(&mut after, "kbd"));
         // And the surviving content is the latest write, not the first.
-        assert_eq!(resolve_all(&after, "kbd"), vec![Some(Rgb(2, 2, 2)); 3]);
+        assert_eq!(resolve_all(&mut after, "kbd"), vec![Some(Rgb(2, 2, 2)); 3]);
     }
 
     #[test]
@@ -213,10 +213,10 @@ mod tests {
         j.record(Decl::Surface { key: "kbd".into(), leds: 1 });
         j.record(base_layer("under", "kbd", Content::Fill(Rgb(1, 0, 0))));
         j.record(base_layer("over", "kbd", Content::Fill(Rgb(2, 0, 0))));
-        let a = j.replay();
-        assert_eq!(resolve_all(&a, "kbd"), vec![Some(Rgb(2, 0, 0))]);
+        let mut a = j.replay();
+        assert_eq!(resolve_all(&mut a, "kbd"), vec![Some(Rgb(2, 0, 0))]);
         j.compact();
-        let a = j.replay();
-        assert_eq!(resolve_all(&a, "kbd"), vec![Some(Rgb(2, 0, 0))]);
+        let mut a = j.replay();
+        assert_eq!(resolve_all(&mut a, "kbd"), vec![Some(Rgb(2, 0, 0))]);
     }
 }

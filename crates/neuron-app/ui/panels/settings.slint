@@ -1,7 +1,124 @@
 import { Theme } from "../theme.slint";
-import { Card, SectionTitle, Label, Button, Toggle, Pill, Mono, Divider, PanelHead, Slider, Segment, ColorPicker, Palette } from "../widgets/controls.slint";
+import { Card, SectionTitle, Label, Button, Toggle, Pill, Mono, Divider, PanelHead, Slider, Segment, ColorPicker, Palette, Field } from "../widgets/controls.slint";
 import { State } from "../state.slint";
 import { DiagRow } from "../models.slint";
+
+// ONE mock OBS menu item — a mono label that can wear an accent highlight (the one you click).
+component ObsMenuItem inherits Rectangle {
+    in property <string> label;
+    in property <bool> lit: false;
+    width: txt.preferred-width + 12px;
+    height: 18px;
+    border-radius: 3px;
+    background: lit ? Theme.accent-glow : transparent;
+    border-width: lit ? Theme.hair : 0px;
+    border-color: Theme.accent-line;
+    txt := Mono {
+        x: 6px;
+        text: root.label;
+        color: lit ? Theme.accent : Theme.text-dim;
+        font-size: Theme.fs-small;
+    }
+}
+
+// THE OBS FINDER — a little in-style mock of the OBS window that shows WHERE the setting hides:
+// the MENU BAR (not Settings), the Tools menu, then "WebSocket Server Settings". The exact path
+// that's annoying to find the first time. Pure decoration built from the app's own tokens.
+component ObsFinder inherits Rectangle {
+    background: Theme.bg;
+    border-radius: Theme.radius;
+    border-width: Theme.hair;
+    border-color: Theme.line;
+    clip: true;
+    height: 112px;
+
+    // title bar — a slim chrome strip so it reads as "an app window": a little app mark on the
+    // left, the name, and three window-control dots on the right.
+    Rectangle {
+        x: 0; y: 0; width: parent.width; height: 20px;
+        background: Theme.bg-2;
+        HorizontalLayout {
+            padding-left: 8px; padding-right: 8px; spacing: 6px;
+            VerticalLayout { alignment: center; Rectangle { width: 8px; height: 8px; border-radius: 4px; background: Theme.text-faint; } }
+            Mono { text: "OBS Studio"; color: Theme.text-faint; font-size: Theme.fs-small; }
+            Rectangle { horizontal-stretch: 1; }
+            VerticalLayout {
+                alignment: center;
+                HorizontalLayout {
+                    spacing: 5px;
+                    Rectangle { width: 6px; height: 6px; border-radius: 3px; background: Theme.line; }
+                    Rectangle { width: 6px; height: 6px; border-radius: 3px; background: Theme.line; }
+                    Rectangle { width: 6px; height: 6px; border-radius: 3px; background: Theme.line; }
+                }
+            }
+        }
+    }
+
+    // menu bar — Tools is lit. Laid out left-to-right; the dropdown below points at it.
+    menubar := HorizontalLayout {
+        x: 6px; y: 22px; height: 18px; spacing: 2px; alignment: start;
+        ObsMenuItem { label: "File"; }
+        ObsMenuItem { label: "Edit"; }
+        ObsMenuItem { label: "View"; }
+        ObsMenuItem { label: "Docks"; }
+        ObsMenuItem { label: "Profile"; }
+        tools := ObsMenuItem { label: "Tools"; lit: true; }
+        ObsMenuItem { label: "Help"; }
+    }
+
+    // the drop that falls from Tools → the target item highlighted
+    dropdown := Rectangle {
+        x: menubar.x + tools.x - 4px;
+        y: 42px;
+        width: 172px;
+        background: Theme.bg-2;
+        border-radius: Theme.radius-sm;
+        border-width: Theme.hair;
+        border-color: Theme.accent-line;
+        height: 62px;
+        VerticalLayout {
+            padding: 5px; spacing: 2px;
+            Mono { text: "Auto-Configuration Wizard"; color: Theme.text-faint; font-size: Theme.fs-small; }
+            Rectangle {
+                height: 20px; border-radius: 3px;
+                background: Theme.accent-glow; border-width: Theme.hair; border-color: Theme.accent-line;
+                Mono {
+                    x: 6px; text: "WebSocket Server Settings"; color: Theme.accent;
+                    font-size: Theme.fs-small; vertical-alignment: center; height: parent.height;
+                }
+            }
+            Mono { text: "Scripts"; color: Theme.text-faint; font-size: Theme.fs-small; }
+        }
+    }
+    // a hairline tick joining Tools to its dropdown (the "this opens that" cue)
+    Rectangle {
+        x: dropdown.x + 8px; y: 40px; width: 1px; height: 2px; background: Theme.accent-line;
+    }
+}
+
+// A connection LAMP — a small contact light that reads dark at rest and lights phosphor with a
+// soft halo the instant its protocol is actually up (a port bound, OBS authenticated). The one
+// place a glow is earned: a lamp that is genuinely ON. The fade-in IS the "yes, it connected"
+// signal the eye catches without reading a word.
+component ConnLamp inherits Rectangle {
+    in property <bool> lit;
+    width: 7px;
+    height: 7px;
+    border-radius: 4px;
+    background: root.lit ? Theme.accent : Theme.text-faint.with-alpha(0.4);
+    drop-shadow-color: root.lit ? Theme.accent : transparent;
+    drop-shadow-blur: root.lit ? 6px : 0px;
+    animate background, drop-shadow-blur, drop-shadow-color { duration: Theme.settle; }
+}
+
+// A protocol status line: the live lamp + the honest readout text, vertically aligned.
+component ConnStatus inherits HorizontalLayout {
+    in property <bool> lit;
+    in property <string> text;
+    spacing: 6px;
+    VerticalLayout { alignment: center; ConnLamp { lit: root.lit; } }
+    Mono { text: root.text; color: Theme.text-faint; }
+}
 
 // SETTINGS — startup, the global writes-paused safety gate, the SAFE-MODE / arm-input switch, the
 // Import WIZARD launcher (a flow), and DIAGNOSTICS: the in-app test BENCH. Nine probe stations in
@@ -879,6 +996,16 @@ component PingIcon inherits Rectangle {
         Rectangle { x: 5px; y: 5px; width: 6px; height: 6px; border-radius: 3px; border-width: 1.5px; border-color: root.ink; }
         Rectangle { x: 7px; y: 7px; width: 2px; height: 2px; border-radius: 1px; background: root.ink; }
     }
+    // SNIPER — a scope: one ring, four crosshair ticks breaking its edge, a centre dot (kin to
+    // DPI's reticle — same domain — but unmistakably the aiming instrument, not the setting)
+    if root.slug == "sniper" : Rectangle {
+        Rectangle { x: 2px; y: 2px; width: 12px; height: 12px; border-radius: 6px; border-width: 1.5px; border-color: root.ink; }
+        Rectangle { x: 7.25px; y: 0px; width: 1.5px; height: 4px; border-radius: 0.75px; background: root.ink; }
+        Rectangle { x: 7.25px; y: 12px; width: 1.5px; height: 4px; border-radius: 0.75px; background: root.ink; }
+        Rectangle { x: 0px; y: 7.25px; width: 4px; height: 1.5px; border-radius: 0.75px; background: root.ink; }
+        Rectangle { x: 12px; y: 7.25px; width: 4px; height: 1.5px; border-radius: 0.75px; background: root.ink; }
+        Rectangle { x: 7px; y: 7px; width: 2px; height: 2px; border-radius: 1px; background: root.ink; }
+    }
     // SENSITIVITY — a scroll wheel: a vertical capsule + a centre notch
     if root.slug == "scroll" : Rectangle {
         Rectangle { x: 4.5px; y: 1px; width: 7px; height: 14px; border-radius: 3.5px; border-width: 1.5px; border-color: root.ink; }
@@ -966,10 +1093,13 @@ export component SettingsPanel inherits VerticalLayout {
     spacing: 0;
     // the curated accent hues live ONCE in `Palette.accent` (controls.slint), shared with the LIGHTING
     // colour picker so the two never drift. The ColorPickers below pull straight from it.
-    // animate the material gallery swatches only while SYSTEM is open (~16fps — the shaders run
-    // Rust-side; idle pages cost nothing). The cast itself runs at its own 60fps on the overlay.
+    // animate the material gallery swatches only while SYSTEM is open, and only at ~10fps — the
+    // shaders render Rust-side on a worker, and the tiles GPU-crossfade between consecutive frames
+    // (see the material-grid Images), so the motion reads display-rate smooth at a tenth of the
+    // render cost. The tick period MUST equal the tiles' crossfade duration (100ms): the fade is
+    // what fills the gap between frames. The cast itself runs at its own 60fps on the overlay.
     Timer {
-        interval: 60ms;
+        interval: 100ms;
         running: State.page == 3;
         triggered => { State.material-preview-tick(); }
     }
@@ -1185,11 +1315,27 @@ export component SettingsPanel inherits VerticalLayout {
                                         padding: 5px;
                                         spacing: 4px;
                                         alignment: start;       // pin to top so the tiny slack is uniform across tiles, never a lopsided bottom gap
-                                        Image {
-                                            source: c.swatch;
+                                        // A/B crossfade: each fresh worker frame lands in the HIDDEN
+                                        // slot, then show-alt flips and the alt image GPU-fades over
+                                        // exactly one tick period (100ms — must match the Timer) —
+                                        // a ~10fps CPU render reads as continuous, display-smooth
+                                        // motion, and the shader stays LIVE (knob edits land on the
+                                        // very next frame; nothing is baked).
+                                        Rectangle {
                                             width: parent.width - 10px;
                                             height: self.width * 0.6;
-                                            image-fit: fill;
+                                            Image {
+                                                source: c.swatch;
+                                                width: 100%; height: 100%;
+                                                image-fit: fill;
+                                            }
+                                            Image {
+                                                source: c.swatch-alt;
+                                                width: 100%; height: 100%;
+                                                image-fit: fill;
+                                                opacity: State.material-show-alt ? 1.0 : 0.0;
+                                                animate opacity { duration: 100ms; easing: linear; }
+                                            }
                                         }
                                         Text {
                                             text: c.name;
@@ -1379,32 +1525,48 @@ export component SettingsPanel inherits VerticalLayout {
                                     alignment: start;
                                     spacing: 10px;   // header → grid block (distinct from the tighter inter-row gutter below)
                                     Mono { text: "WHAT EARNS A PING"; color: Theme.text-dim; }
-                                    // 3-per-row grid — each kind a compact icon card (9 kinds → 3 even rows),
-                                    // grouped by domain: pointer/report · physical hardware · software/session.
-                                    // One spacing token governs BOTH axes (rows here, columns below) so the
-                                    // gutters read as a single even grid, not a stack of loose rows.
+                                    // DOMAIN CLUSTERS, data-driven: each caption owns ONE full-width
+                                    // row of exactly its domain's kinds (the glue's exhaustive
+                                    // ping_slot map decides membership), every card stretching to
+                                    // share the row evenly. The layout structurally CANNOT grow a
+                                    // dangling odd card — a new kind joins its domain's row and that
+                                    // row just gets denser; a denser row beside a looser one reads as
+                                    // grouping, not damage. The captions double as the taxonomy the
+                                    // toggles already live in inside your head: aim, metal, software.
                                     VerticalLayout {
-                                        spacing: 6px;
-                                        // row 1 — POINTER / REPORT
-                                        HorizontalLayout {
-                                            spacing: 6px;
-                                            PingCard { slug: "dpi"; label: "dpi"; desc: "pointer DPI"; on: State.notif-dpi; toggled => { State.set-notif-event("dpi", !State.notif-dpi); } }
-                                            PingCard { slug: "scroll"; label: "sensitivity"; desc: "scroll modes"; on: State.notif-scroll; toggled => { State.set-notif-event("scroll", !State.notif-scroll); } }
-                                            PingCard { slug: "polling"; label: "polling"; desc: "report rate"; on: State.notif-polling; toggled => { State.set-notif-event("polling", !State.notif-polling); } }
+                                        spacing: 9px;
+                                        VerticalLayout {
+                                            spacing: 5px;
+                                            Mono { text: "POINTER"; color: Theme.text-faint; font-size: Theme.fs-small; letter-spacing: Theme.track-3; }
+                                            HorizontalLayout {
+                                                spacing: 6px;
+                                                for k in State.ping-pointer : PingCard {
+                                                    slug: k.icon; label: k.label; desc: k.desc; on: k.on;
+                                                    toggled => { State.set-notif-event(k.slug, !k.on); }
+                                                }
+                                            }
                                         }
-                                        // row 2 — PHYSICAL HARDWARE (LED · power · plate)
-                                        HorizontalLayout {
-                                            spacing: 6px;
-                                            PingCard { slug: "brightness"; label: "brightness"; desc: "LED level"; on: State.notif-brightness; toggled => { State.set-notif-event("brightness", !State.notif-brightness); } }
-                                            PingCard { slug: "battery"; label: "battery"; desc: "charge"; on: State.notif-battery; toggled => { State.set-notif-event("battery", !State.notif-battery); } }
-                                            PingCard { slug: "side_plate"; label: "side plate"; desc: "swap detect"; on: State.notif-side-plate; toggled => { State.set-notif-event("side_plate", !State.notif-side-plate); } }
+                                        VerticalLayout {
+                                            spacing: 5px;
+                                            Mono { text: "HARDWARE"; color: Theme.text-faint; font-size: Theme.fs-small; letter-spacing: Theme.track-3; }
+                                            HorizontalLayout {
+                                                spacing: 6px;
+                                                for k in State.ping-hardware : PingCard {
+                                                    slug: k.icon; label: k.label; desc: k.desc; on: k.on;
+                                                    toggled => { State.set-notif-event(k.slug, !k.on); }
+                                                }
+                                            }
                                         }
-                                        // row 3 — SOFTWARE / SESSION
-                                        HorizontalLayout {
-                                            spacing: 6px;
-                                            PingCard { slug: "profile"; label: "profile"; desc: "active"; on: State.notif-profile; toggled => { State.set-notif-event("profile", !State.notif-profile); } }
-                                            PingCard { slug: "layer"; label: "layer"; desc: "HyperShift"; on: State.notif-layer; toggled => { State.set-notif-event("layer", !State.notif-layer); } }
-                                            PingCard { slug: "beacon"; label: "beacon"; desc: "macro notify"; on: State.notif-macro; toggled => { State.set-notif-event("macro", !State.notif-macro); } }
+                                        VerticalLayout {
+                                            spacing: 5px;
+                                            Mono { text: "SESSION"; color: Theme.text-faint; font-size: Theme.fs-small; letter-spacing: Theme.track-3; }
+                                            HorizontalLayout {
+                                                spacing: 6px;
+                                                for k in State.ping-session : PingCard {
+                                                    slug: k.icon; label: k.label; desc: k.desc; on: k.on;
+                                                    toggled => { State.set-notif-event(k.slug, !k.on); }
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -1482,6 +1644,115 @@ export component SettingsPanel inherits VerticalLayout {
                                     picked(i) => { State.set-notif-sound(i == 1 ? "warm" : i == 2 ? "glass" : "pulse"); }
                                 }
                                 Rectangle {}
+                            }
+                        }
+                    }
+
+                    Divider {}
+
+                    // ── CONNECTIONS — games & tools paint THROUGH neuron ─────
+                    // The protocol host: Chroma-enabled games and OpenRGB tools drive the boards
+                    // as layers ABOVE the configured lighting, which returns the instant they
+                    // release. Off by default (opening ports is a conscious opt-in); the status
+                    // lines carry port truth — a socket held by real Synapse never reads green.
+                    VerticalLayout {
+                        spacing: 3px;
+                        SectionTitle { text: "CONNECTIONS"; }
+                        Mono { text: "let games and tools light your devices through Neuron."; color: Theme.text-faint; }
+                    }
+                    VerticalLayout {
+                        spacing: 3px;
+                        Toggle {
+                            caption: "let apps & games control lighting";
+                            checked: State.host-enabled;
+                            toggled(v) => { State.set-host-enabled(v); }
+                        }
+                        Mono { text: "your lighting stays underneath and comes back when they stop."; color: Theme.text-faint; }
+                    }
+                    if State.host-enabled : VerticalLayout {
+                        spacing: 7px;
+                        // What Neuron is actually sharing right now (set the scope before the rows).
+                        if State.host-devices-line != "" : Mono { text: State.host-devices-line; color: Theme.text-faint; }
+                        VerticalLayout {
+                            spacing: 3px;
+                            Toggle {
+                                caption: "chroma (games)";
+                                checked: State.host-chroma;
+                                toggled(v) => { State.set-host-chroma(v); }
+                            }
+                            ConnStatus { lit: State.host-chroma-live; text: State.host-chroma-status; }
+                        }
+                        VerticalLayout {
+                            spacing: 3px;
+                            Toggle {
+                                caption: "openrgb (tools)";
+                                checked: State.host-openrgb;
+                                toggled(v) => { State.set-host-openrgb(v); }
+                            }
+                            ConnStatus { lit: State.host-openrgb-live; text: State.host-openrgb-status; }
+                        }
+                        VerticalLayout {
+                            spacing: 3px;
+                            Toggle {
+                                caption: "obs (scenes & stream)";
+                                checked: State.host-obs;
+                                toggled(v) => { State.set-host-obs(v); }
+                            }
+                            ConnStatus { lit: State.host-obs-live; text: State.host-obs-status; }
+                            // When OBS is on: how to turn its server on, plus the password field.
+                            // Both only matter once you've opted into OBS, so they reveal with it.
+                            if State.host-obs : VerticalLayout {
+                                spacing: 7px;
+                                Mono {
+                                    text: "turn it on inside OBS: open the top menu bar, then Tools, then WebSocket Server Settings.";
+                                    color: Theme.text-faint; wrap: word-wrap;
+                                }
+                                ObsFinder { }
+                                VerticalLayout {
+                                    spacing: 4px;
+                                    HorizontalLayout {
+                                        spacing: 8px;
+                                        VerticalLayout { alignment: center; Mono { text: "password"; color: Theme.text-dim; } }
+                                        Field {
+                                            placeholder: "OBS Server Password";
+                                            secret: true;
+                                            field-width: 240px;
+                                            text: State.host-obs-password;
+                                            edited(v) => { State.host-obs-password = v; }
+                                            accepted(v) => { State.set-host-obs-password(v); }
+                                        }
+                                        Button { text: "save"; clicked => { State.set-host-obs-password(State.host-obs-password); } }
+                                    }
+                                    Mono {
+                                        text: "in that same OBS window, click Show Connect Info to copy it. leave blank if you turned authentication off.";
+                                        color: Theme.text-faint; wrap: word-wrap;
+                                    }
+                                }
+                                // The on-air LIGHT lives in the lighting engine, not here: it's the
+                                // On Air data layer (paint the keys it covers, pick any colour or
+                                // motion), driven by the broadcast state this connection announces.
+                                Mono {
+                                    text: "want an on-air light? add the On Air layer on the LIGHTING page. paint the keys it covers and give it any look; it shows only while you are actually live.";
+                                    color: Theme.text-faint; wrap: word-wrap;
+                                }
+                            }
+                        }
+
+                        // WHO WINS — the config Synapse and OpenRGB can't offer, because they just
+                        // let the last writer win. Here it's one priority-band pick.
+                        Rectangle { height: 1px; }
+                        VerticalLayout {
+                            spacing: 3px;
+                            Toggle {
+                                caption: "my lighting always wins";
+                                checked: State.host-lighting-wins;
+                                toggled(v) => { State.set-host-lighting-wins(v); }
+                            }
+                            Mono {
+                                text: State.host-lighting-wins
+                                    ? "your lighting always shows. a connected game waits underneath."
+                                    : "a connected game takes over. your lighting comes back when it stops.";
+                                color: Theme.text-faint; wrap: word-wrap;
                             }
                         }
                     }

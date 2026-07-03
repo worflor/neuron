@@ -1,7 +1,8 @@
 # Vendored from the user's Whisper Prism suite (the Engram Universal Trajectory Codec).
-# Author: Woflo / MB. Patent pending. This is the user's own work, kept under its own
-# license (LICENSE.md, copied from the Whisper project root) — distinct from Neuron's
-# MIT/Apache dual license. Do NOT relicense; do NOT regress the math.
+# Author: Woflo / MB. Patent pending. This is the user's own work, under the Whisper
+# Protocol License (LICENSE.md, copied from the Whisper project root). Neuron ships under
+# that same license now (repo-root LICENSE.md), so the whole workspace is one license.
+# Do NOT relicense; do NOT regress the math.
 #
 # KNOCKBACK uses this crate as the rhythm-familiar's brain: every exchange is an Engram
 # block; the twin's knockback is `predict_all` run one beat past the player's motif.

@@ -110,10 +110,21 @@ struct StoredEffect {
     action: Action,
 }
 
+/// One session's live paint on one device: the arbiter layer plus the surface
+/// key and last content it was claimed with. The key + content are RETAINED so
+/// a kernel rebirth (which sweeps every lease) can be recovered on the next
+/// heartbeat — re-claiming identical paint — without waiting for the game to
+/// push a fresh effect. See [`ChromaServer::heartbeat`].
+struct DeviceLayer {
+    layer: LayerId,
+    key: String,
+    content: Content,
+}
+
 struct Session {
     owner: SourceId,
     /// device endpoint ("keyboard", …) → its live layer.
-    layers: HashMap<String, LayerId>,
+    layers: HashMap<String, DeviceLayer>,
     /// POST-created effects awaiting PUT-apply, keyed by minted id.
     effects: HashMap<String, StoredEffect>,
     last_seen: Instant,
@@ -131,6 +142,18 @@ pub struct ChromaServer {
 impl ChromaServer {
     pub fn new() -> ChromaServer {
         ChromaServer { sessions: HashMap::new(), next_id: FIRST_SESSION_ID, next_effect: 1 }
+    }
+
+    /// The LIVE sessions (owner + game title), for the host's status readout.
+    /// TTL-filtered with the same 15s contract the prune uses, so a vanished
+    /// game stops being REPORTED at the same moment its paint expires — even
+    /// before the next request-driven prune actually sweeps the entry.
+    pub fn sessions(&self, now: Instant) -> Vec<(SourceId, String)> {
+        self.sessions
+            .values()
+            .filter(|s| now.duration_since(s.last_seen) <= SESSION_TTL)
+            .map(|s| (s.owner, s.title.clone()))
+            .collect()
     }
 
     pub fn handle(
@@ -193,6 +216,9 @@ impl ChromaServer {
         let id = self.next_id;
         self.next_id += 1;
         let owner = host.next_source();
+        // Name the source NOW — the GUI's ownership truth reads "Overwatch is
+        // painting this board", not "another app".
+        host.label_source(owner, &title);
         self.sessions.insert(
             id,
             Session {
@@ -247,9 +273,38 @@ impl ChromaServer {
         };
         s.last_seen = now;
         s.heartbeats += 1;
-        for layer in s.layers.values() {
-            // A swept layer here is fine: the next effect write re-claims.
-            let _ = host.refresh(*layer, now);
+        // Refresh each layer's lease — and use that same probe to detect a kernel
+        // rebirth. A heartbeating session keeps its own lease well within the 15s
+        // TTL, so a layer that `refresh` reports GONE was swept by a contained
+        // fault, not a timeout. Re-claim those from the retained content so a game
+        // that only heartbeats a static effect doesn't go dark after a rebirth
+        // (the old path left it dark until the next effect WRITE, which such a
+        // game never sends).
+        let dead: Vec<String> = s
+            .layers
+            .iter()
+            .filter(|(_, dl)| !host.refresh(dl.layer, now))
+            .map(|(dev, _)| dev.clone())
+            .collect();
+        if !dead.is_empty() {
+            for dev in dead {
+                let (key, content) = {
+                    let dl = &s.layers[&dev];
+                    (dl.key.clone(), dl.content.clone())
+                };
+                if let Some(layer) = host.claim(
+                    &key,
+                    s.owner,
+                    band::SESSION,
+                    LeaseSpec::Ttl(SESSION_TTL),
+                    content.clone(),
+                    now,
+                ) {
+                    s.layers.insert(dev, DeviceLayer { layer, key, content });
+                }
+            }
+            // The reborn kernel's labels map is empty — restore this session's.
+            host.label_source(s.owner, &s.title);
         }
         HttpResponse::json(200, serde_json::json!({ "result": rz::SUCCESS, "tick": s.heartbeats }))
     }
@@ -439,14 +494,17 @@ impl ChromaServer {
         let Some(s) = self.sessions.get_mut(&id) else { return rz::NOT_FOUND };
         match action {
             Action::Clear => {
-                if let Some(layer) = s.layers.remove(device) {
-                    host.release(layer);
+                if let Some(dl) = s.layers.remove(device) {
+                    host.release(dl.layer);
                 }
                 rz::SUCCESS
             }
             Action::Paint(content) => {
-                if let Some(layer) = s.layers.get(device) {
-                    if host.set_content(*layer, content.clone(), now) {
+                if let Some(dl) = s.layers.get_mut(device) {
+                    if host.set_content(dl.layer, content.clone(), now) {
+                        // Keep the retained content current so a rebirth recovery
+                        // re-claims what's actually painted, not a stale frame.
+                        dl.content = content;
                         return rz::SUCCESS;
                     }
                 }
@@ -455,11 +513,14 @@ impl ChromaServer {
                     s.owner,
                     band::SESSION,
                     LeaseSpec::Ttl(SESSION_TTL),
-                    content,
+                    content.clone(),
                     now,
                 ) {
                     Some(layer) => {
-                        s.layers.insert(device.to_string(), layer);
+                        s.layers.insert(
+                            device.to_string(),
+                            DeviceLayer { layer, key: surface.key.clone(), content },
+                        );
                         rz::SUCCESS
                     }
                     None => rz::DEVICE_NOT_AVAILABLE,
@@ -636,6 +697,32 @@ mod tests {
     }
 
     #[test]
+    fn sessions_roster_is_ttl_honest() {
+        let mut k = kernel();
+        let now = Instant::now();
+        let mut srv = ChromaServer::new();
+        assert!(srv.sessions(now).is_empty());
+        let id = open_session(&mut srv, &mut k, now);
+        let live = srv.sessions(now);
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].1, "Test Game", "the roster carries the game's title");
+        // A heartbeat-lapsed session stops being REPORTED at the moment its
+        // lease would lapse — before any request-driven prune actually runs.
+        assert!(
+            srv.sessions(now + SESSION_TTL + Duration::from_secs(1)).is_empty(),
+            "a vanished game must age out of the roster with its lease"
+        );
+        // And an explicit uninit empties it immediately.
+        let r = srv.handle(
+            &req("DELETE", &format!("/razer/chromasdk/sess/{id}"), serde_json::json!({})),
+            &mut k,
+            now,
+        );
+        assert_eq!(r.status, 200);
+        assert!(srv.sessions(now).is_empty());
+    }
+
+    #[test]
     fn init_returns_port_plausible_session_and_routable_uri() {
         let mut k = kernel();
         let mut srv = ChromaServer::new();
@@ -660,6 +747,41 @@ mod tests {
         put_static(&mut srv, &mut k, id, 0x00FF0000, now);
         let frame = k.resolve("kbd", now).unwrap();
         assert!(frame.iter().all(|c| *c == Some(Rgb(0, 0, 255))), "0x00FF0000 = pure blue");
+    }
+
+    #[test]
+    fn heartbeat_recovers_paint_after_kernel_rebirth() {
+        let mut k = kernel();
+        let mut srv = ChromaServer::new();
+        let now = Instant::now();
+        let id = open_session(&mut srv, &mut k, now);
+        put_static(&mut srv, &mut k, id, 0x00FF0000, now); // pure blue
+        assert!(k.resolve("kbd", now).unwrap().iter().all(|c| *c == Some(Rgb(0, 0, 255))));
+        let owner = srv.sessions(now)[0].0;
+
+        // Kernel rebirth: a fresh kernel, surface re-declared, every lease swept
+        // (leases are never reborn). The Chroma session is app-side state — it
+        // survives with its owner id and retained content.
+        let mut reborn = kernel();
+        assert!(
+            reborn.resolve("kbd", now).unwrap().iter().all(|c| c.is_none()),
+            "reborn kernel starts dark"
+        );
+
+        // A game that only HEARTBEATS a static effect (no fresh writes) must still
+        // recover — the old path left it dark until the next effect WRITE.
+        let r = srv.handle(
+            &req("PUT", &format!("/razer/chromasdk/sess/{id}/heartbeat"), serde_json::json!({})),
+            &mut reborn,
+            now,
+        );
+        assert_eq!(r.status, 200);
+        let frame = reborn.resolve("kbd", now).unwrap();
+        assert!(
+            frame.iter().all(|c| *c == Some(Rgb(0, 0, 255))),
+            "heartbeat re-claimed the static effect after rebirth"
+        );
+        assert_eq!(reborn.label_of(owner), Some("Test Game"), "label restored too");
     }
 
     #[test]

@@ -20,9 +20,9 @@
 //!   * **the rim** — a quiet accent-tinted edge concentration (the user's tint is an edge
 //!     identity, never a body).
 //!
-//! Everything tunable lives in [`Material`]; themes are data (`material.toml`), so a reskin is a
-//! file, not a fork. The overlay composites through [`shade`]; future surfaces (glance frames,
-//! whiteboard, UI) draw from the same well.
+//! Everything tunable lives in [`Material`]; a reskin is a chosen [`preset`] surface plus the live
+//! SYSTEM → APPEARANCE accent + knobs, not a fork. The overlay composites through [`shade`]; future
+//! surfaces (glance frames, whiteboard, UI) draw from the same well.
 
 /// WHICH MATERIAL a cast is poured from — each a distinct physical model, not a palette swap. The
 /// engine shades the same density field through whichever surface is chosen, so a glyph cast in
@@ -329,72 +329,13 @@ impl Material {
     }
 }
 
-/// The live material: `material.toml` beside the exe if present (a theme is a FILE), else the house
-/// pour. Read once per process — a theme change is a relaunch, not a hot path.
-pub fn material() -> &'static Material {
-    static M: std::sync::OnceLock<Material> = std::sync::OnceLock::new();
-    M.get_or_init(|| {
-        let mut m = Material::neuron();
-        if let Ok(s) = std::fs::read_to_string("material.toml") {
-            let get = |k: &str| -> Option<String> {
-                s.lines()
-                    .map(str::trim)
-                    .find(|l| l.starts_with(k) && l[k.len()..].trim_start().starts_with('='))
-                    .and_then(|l| l.split('=').nth(1))
-                    .map(|v| v.trim().trim_matches('"').to_string())
-            };
-            let hex = |v: &str| -> Option<(f32, f32, f32)> {
-                let h = v.trim_start_matches('#');
-                if h.len() != 6 {
-                    return None;
-                }
-                let p = |i: usize| {
-                    u8::from_str_radix(&h[i..i + 2], 16)
-                        .ok()
-                        .map(|b| b as f32 / 255.0)
-                };
-                Some((p(0)?, p(2)?, p(4)?))
-            };
-            if let Some(c) = get("accent").as_deref().and_then(hex) {
-                m.accent = c;
-                m.accent_hue = hue_of(c);
-            }
-            if let Some(c) = get("body").as_deref().and_then(hex) {
-                m.body = c;
-            }
-            if let Some(c) = get("white").as_deref().and_then(hex) {
-                m.white = c;
-            }
-            if let Some(v) = get("shoulder").and_then(|v| v.parse().ok()) {
-                m.shoulder = v;
-            }
-            if let Some(v) = get("rim").and_then(|v| v.parse().ok()) {
-                m.rim = v;
-            }
-            if let Some(v) = get("dispersion").and_then(|v| v.parse().ok()) {
-                m.dispersion = v;
-            }
-            if let Some(v) = get("fire").and_then(|v| v.parse().ok()) {
-                m.fire = v;
-            }
-            if let Some(v) = get("spectrum").and_then(|v| v.parse().ok()) {
-                m.spectrum = v;
-            }
-            if let Some(v) = get("facets").and_then(|v| v.parse().ok()) {
-                m.facets = v;
-            }
-        }
-        m
-    })
-}
-
 // ── the LIVE weave accent — the one user-facing colour of the material ───────────────────────
 //
 // In this material colour is never pigment: it is what white light BREAKS INTO at an edge. So the
 // user's "weave colour" can only honestly enter in one place — the ACCENT: the hue the spectral
-// fire centres on (`accent_hue`) plus the quiet rim tint (`accent`). The themed [`material`] stays
-// read-once from `material.toml` (the advanced theme is a FILE); THIS is the live override the
-// SYSTEM → APPEARANCE picker drives, so retinting the cast is instant, not a relaunch. It feeds the
+// fire centres on (`accent_hue`) plus the quiet rim tint (`accent`). The base substance is the chosen
+// [`preset`] surface; THIS is the live override the SYSTEM → APPEARANCE picker drives on top of it, so
+// retinting the cast is instant, not a relaunch. It feeds the
 // fire centre + rim only — body, white-hot cores, facets, dispersion and spectrum width are
 // untouched, so the substance still reads as white intent, just throwing the user's hue at its edges.
 
@@ -728,14 +669,16 @@ fn fbm(mut x: f32, mut y: f32, oct: u32) -> f32 {
     }
     sum / norm.max(1e-6)
 }
-/// Worley F1 + F2 (the two nearest jittered feature points) + the owning cell's hash. Lava cracks
+/// Worley F1 + F2 (the two nearest jittered feature points) + BOTH owning cells' hashes. Lava cracks
 /// live on the cell BOUNDARIES, where F2−F1 → 0 (a point equidistant from two cells) — a connected
-/// fracture network, not isolated dots.
-fn cellular(x: f32, y: f32) -> (f32, f32, f32) {
+/// fracture network, not isolated dots. Returning the F2 cell too gives every SEAM an identity (the
+/// unordered pair of cells it separates), so seams can differ — the escape from uniform-print Worley.
+fn cellular(x: f32, y: f32) -> (f32, f32, f32, f32) {
     let (xi, yi) = (x.floor() as i32, y.floor() as i32);
     let mut f1 = 9.0;
     let mut f2 = 9.0;
-    let mut cell = 0.0;
+    let mut c1 = 0.0;
+    let mut c2 = 0.0;
     for dy in -1..=1 {
         for dx in -1..=1 {
             let (cx, cy) = (xi + dx, yi + dy);
@@ -744,14 +687,16 @@ fn cellular(x: f32, y: f32) -> (f32, f32, f32) {
             let dd = (px - x) * (px - x) + (py - y) * (py - y);
             if dd < f1 {
                 f2 = f1;
+                c2 = c1;
                 f1 = dd;
-                cell = hash2(cx + 99, cy - 77);
+                c1 = hash2(cx + 99, cy - 77);
             } else if dd < f2 {
                 f2 = dd;
+                c2 = hash2(cx + 99, cy - 77);
             }
         }
     }
-    (f1.sqrt(), f2.sqrt(), cell)
+    (f1.sqrt(), f2.sqrt(), c1, c2)
 }
 /// Curl of an fbm potential → a divergence-free flow direction (air streamlines, no sources/sinks).
 fn curl(x: f32, y: f32, t: f32) -> (f32, f32) {
@@ -1026,8 +971,13 @@ fn eval_layer(l: &Layer, p: &Px, m: &Material) -> (f32, f32, f32, f32) {
                                                              // SLOW flow evolution ⇒ kills the fleshy membrane UNDULATION (the swirling sheet read as
                                                              // moving flesh, not fire); the flame rises through a near-stable turbulence instead.
             let (cx, cy) = curl(fx, fy, t * l.speed * 0.12);
-            let warp = l.warp.max(8.0);
-            let n = fbm(fx + cx * warp * 0.05, fy + cy * warp * 0.05, 3); // rising flame field, less warp
+            // honest knobs: `lick` (warp) reaches 0 = smooth gas tongues (the old .max(8.0) floor made
+            // the knob's bottom third dead); `detail` (octaves) is READ — it was hardcoded 3 before.
+            let n = fbm(
+                fx + cx * l.warp * 0.05,
+                fy + cy * l.warp * 0.05,
+                l.detail.clamp(1.0, 5.0) as u32,
+            );
                                                                           // a FAST, SUBTLE brightness flicker (real fire trembles fast) layered on the slow rise — so it
                                                                           // reads as flickering FLAME, not a slow undulating membrane.
             let flicker = 0.86 + 0.14 * fbm(fx * 1.6, fy * 1.6 + t * l.speed * 6.0, 2);
@@ -1057,7 +1007,10 @@ fn eval_layer(l: &Layer, p: &Px, m: &Material) -> (f32, f32, f32, f32) {
             let refr = l.warp; // the "refraction" knob — how hard the skin bends the light beneath it
             let (ex, ey) = curl(x * 0.3, y * 0.3, t * 0.1);
             let caustic = water_caustic(sx + hgx * refr + ex * 0.2, sy + hgy * refr + ey * 0.2, ct);
-            let breakup = 0.7 + 0.3 * fbm(x * l.scale * 2.0, y * l.scale * 2.0 - t * l.speed, 2);
+            // honest knob: `detail` (octaves) is now READ for the break-up — it was hardcoded 2 before (the
+            // recipe's `detail` set nothing). Clamped 1..5; the stock recipe carries 2, so the look holds.
+            let breakup =
+                0.7 + 0.3 * fbm(x * l.scale * 2.0, y * l.scale * 2.0 - t * l.speed, l.detail.clamp(1.0, 5.0) as u32);
             // gate the focused light INSIDE the body so it glows from within — caustics haloing past the
             // rim would blur a cast letter (legibility); inside, the ink glows like lit water. Boosted +
             // sharpened (powf<1 lifts the dim net, the ×1.7 makes the bright veins POP) so the water reads
@@ -1078,41 +1031,64 @@ fn eval_layer(l: &Layer, p: &Px, m: &Material) -> (f32, f32, f32, f32) {
             (cr * i, cg * i, cb * i, i.min(1.0))
         }
         Field::Cracks => {
-            // slow CHURN: warp the Worley lookup so the fissure network wanders/breathes, not a rigid sheet
+            // slow CHURN: a low-freq warp wanders/breathes the whole sheet; a finer JAG warp fractures
+            // the boundaries so cracks run ragged like stress fractures, not curvy cell walls.
             let wt = t * l.speed;
             let wx = fbm(x * l.scale * 0.5, y * l.scale * 0.5 + wt * 0.3, 2) - 0.5;
             let wy = fbm(x * l.scale * 0.5 + 5.2, y * l.scale * 0.5 - wt * 0.3, 2) - 0.5;
-            let (f1, f2, cell) = cellular(
-                x * l.scale + wx * 1.4 + wt,
-                y * l.scale + wy * 1.4 - wt * 0.8,
+            let jx = fbm(x * l.scale * 3.1, y * l.scale * 3.1, 2) - 0.5;
+            let jy = fbm(x * l.scale * 3.1 + 9.4, y * l.scale * 3.1, 2) - 0.5;
+            let (f1, f2, c1, c2) = cellular(
+                x * l.scale + wx * 1.4 + jx * 0.5 + wt,
+                y * l.scale + wy * 1.4 + jy * 0.5 - wt * 0.8,
             );
             let edge = f2 - f1; // 0 at the crack, grows into the crust
-                                // a COOLING GRADIENT across the fissure: a THIN white-hot seam (sharpened), a FAT orange lip
-                                // (radiant heat falls off slowly), a far blood-red bloom — the temperature of cooling lava.
+                                // SEAM HIERARCHY — the print-killer. Uniform Worley (every boundary glowing alike) reads as
+                                // giraffe hide, not geology. Each seam — the unordered PAIR of cells it separates, symmetric
+                                // so both sides agree — draws a LIFE: most are cooling embers, a few are white-hot master
+                                // RIFTS, and the coldest have healed nearly shut (dark hairline scars, relief + a red memory).
+            let life = ((c1 + c2) * 21.7).sin() * 0.5 + 0.5;
+            let ink = p.heat.min(1.0); // a drawn stroke always lands on a LIVING seam, never a scar
+            let vital = smoothstep(0.18, 0.48, life).max(ink);
+            let rift = smoothstep(0.60, 0.80, life).max(ink * 0.8);
+            // heat pools in SEGMENTS along a seam (hot stretches, cool stretches), and the melt in the
+            // rifts visibly CHURNS — the fire beneath is a fluid, not a painted outline.
+            let seg = smoothstep(
+                0.25,
+                0.75,
+                fbm(x * l.scale * 0.8 + 47.0, y * l.scale * 0.8 - wt * 0.6, 2),
+            );
+            let flow =
+                0.75 + 0.45 * fbm(x * l.scale * 2.2 + wt * 2.6, y * l.scale * 2.2 - wt * 1.9, 2);
+            // the COOLING GRADIENT across the fissure: a THIN seam core (sharpened), an orange lip
+            // (radiant heat falls off slowly), a far blood-red bloom — the temperature of cooling lava.
             let mut core = (1.0 - edge * 9.0).clamp(0.0, 1.0).powf(1.5); // knife-line seam
-            let lip = (1.0 - edge * 4.0).clamp(0.0, 1.0).powf(1.1); // wider orange shoulder
-            let bloom = (1.0 - edge * 1.8).clamp(0.0, 1.0).powf(2.2); // reaches further into the dark
+            let lip = (1.0 - edge * 3.6).clamp(0.0, 1.0).powf(1.1); // wider orange shoulder
+            let bloom = (1.0 - edge * 1.5).clamp(0.0, 1.0).powf(2.0); // reaches further into the dark
                                                                       // ink: a thin glyph stroke can fall BETWEEN cells; spine heat guarantees a molten thread so a
                                                                       // drawn line always reads as a glowing crack, never dead basalt.
             core = core.max(p.heat * 0.4);
-            // per-cell TEMPERATURE (some seams run hotter/whiter — breaks the "every crack identical"
-            // tell) + per-cell throb RATE (seams breathe out of phase) + a slow DEEP breath on the far
-            // bloom only (the furnace below swelling), never the steady white seams.
-            let cell_temp = 0.85 + 0.30 * cell;
-            let throb = 0.85 + 0.15 * (t * (0.4 + 0.5 * cell) + cell * 6.283).sin();
-            let deep = 0.8 + 0.2 * (t * 0.11).sin();
-            let temp =
-                ((core * 1.15 + lip * 0.55 + bloom * 0.18 * deep) * throb * cell_temp * l.gain)
-                    .min(1.3);
+            // seam TEMPERATURE: a dull-red scar floor, red-orange ember body, white-hot only where a
+            // master rift runs a hot flowing segment — the blackbody ramp turns that into deep reds
+            // for most of the network and reserves white for the few places the crust is truly open.
+            let deep = 0.8 + 0.2 * (t * 0.11).sin(); // the furnace below, breathing on the far bloom
+            let throb = 0.88 + 0.12 * (t * (0.35 + 0.5 * life) + life * 6.283).sin(); // per-SEAM phase
+            let seam_t = 0.16 + 0.50 * vital * (0.35 + 0.45 * seg) + 0.55 * rift * seg * flow;
+            let temp = ((core * seam_t * 1.15
+                + lip * 0.34 * vital * (0.3 + 0.7 * seg)
+                + bloom * 0.30 * vital * deep)
+                * throb
+                * l.gain)
+                .min(1.3);
             let (mut cr, mut cg, mut cb) = ramp(l.ramp, temp.min(1.0), m);
             let (ar, ag, ab) = m.accent; // accent only in the deepest molten core
-            let kk = (core * core) * 0.35;
+            let kk = (core * core) * 0.35 * (0.4 + 0.6 * vital);
             cr += (ar - cr) * kk;
             cg += (ag - cg) * kk;
             cb += (ab - cb) * kk;
             // crust RELIEF — bump-light a TWO-scale fbm height (coarse slabs + fine grain) so the cooled
-            // rock reads as rough basalt; warm-fill it near seams (lit from below) so it's basalt-beside-
-            // lava, not grey gravel.
+            // rock reads as rough basalt; UNDER-LIGHT it near living seams (radiant heat soaking the
+            // rock) so it's basalt-beside-lava, not grey gravel — and not bare black between lines.
             let hh = |ax: f32, ay: f32| {
                 0.6 * fbm(ax * l.scale * 3.0, ay * l.scale * 3.0, 2)
                     + 0.4 * fbm(ax * l.scale * 1.2, ay * l.scale * 1.2, 2)
@@ -1121,94 +1097,131 @@ fn eval_layer(l: &Layer, p: &Px, m: &Material) -> (f32, f32, f32, f32) {
             let hx = hh(x + 1.5, y) - h;
             let hy = hh(x, y + 1.5) - h;
             let light = (hx * 0.6 - hy * 0.6 + 0.45).clamp(0.0, 1.0);
-            let crust = (0.03 + 0.20 * light) * (1.0 - core) * pres;
-            let warm = 1.0 + lip * 0.6; // rock beside a fissure catches a warm rim-light from the heat
-                                        // SHADOW COLLAR — a thin darkening just outside the seam reads as the crust lip OVER-hanging
-                                        // the throat, so the white core sits BELOW the surface (the cracks feel deep, heat from below).
+            let crust = (0.05 + 0.26 * light) * (1.0 - core) * pres;
+            let under = bloom * vital * 0.6; // the warm glow the living seams cast on their banks
+                                             // SHADOW COLLAR — a thin darkening just outside the seam reads as the crust lip OVER-hanging
+                                             // the throat, so the hot core sits BELOW the surface (the cracks feel deep, heat from below).
             let collar = ((1.0 - edge * 7.0).clamp(0.0, 1.0) - core).max(0.0) * 0.5;
             let cd = (1.0 - collar).max(0.0);
             let i = temp * pres;
             (
-                cr * i + crust * warm * cd,
-                cg * i + crust * 0.92 * cd,
-                cb * i + crust * 0.85 * cd,
-                (i + crust * 0.4).min(1.0),
+                cr * i + crust * (1.0 + under * 1.1) * cd,
+                cg * i + crust * (0.92 + under * 0.30) * cd,
+                cb * i + crust * (0.85 + under * 0.05) * cd,
+                (i + crust * 0.45).min(1.0),
             )
         }
         Field::Wisp => {
-            // GENTLE BREEZE = soft DRIFTING PARTICLES (motes of light/dust carried on the air), over a
-            // near-invisible body — the VFX way to depict gentle wind. Every TEXTURE-in-the-body approach
-            // (fbm fill, sin stripes, LIC streaks) read as a mosaic/zebra; gentle wind is PARTICLES that
-            // drift along a current + curl turbulence, low velocity, fading softly in and out (never pop).
-            let gust = 0.6 + 0.4 * (t * 0.10).sin() * (t * 0.063 + 1.3).sin();
-            // a faint smooth body — a translucent HINT of the stroke (no pattern), so a glyph still reads.
+            // GENTLE BREEZE = the WHIMSICAL wind gesture: a few comet-motes gliding on the current,
+            // each drawing a curved swooshing TRAIL (the hand-drawn wind-swirl of fantasy
+            // illustration — the grandest of them loop the loop), heads glinting as soft four-point
+            // stars. Hard-won constraints, all tried and failed: TEXTURE-in-the-body (fbm fill, sin
+            // stripes, LIC streaks) reads as mosaic/zebra; DENSE particles read as TV static; a
+            // smooth bright fill gels into honey. So: sparse gliding comets, a whisper of body,
+            // and NOTHING pops.
+            //
+            // THE STROBE FIX — drift used to be `t * gust(t) * v`: changing gust rescaled ALL
+            // accumulated drift, so by t≈90s a 2% gust wobble slewed every mote sideways per frame
+            // (the "TV static" flicker). The gust now integrates into a PHASE (∫gust dt — the
+            // product of sines has an analytic integral), so mote velocity == gust(t) exactly:
+            // always gentle, never a jump, at any uptime.
+            let (ga, gb) = (0.10f32, 0.063f32);
+            let gust = 0.6 + 0.4 * (t * ga).sin() * (t * gb + 1.3).sin();
+            let gust_phase = 0.6 * t + 0.2 * ((ga - gb) * t - 1.3).sin() / (ga - gb)
+                - 0.2 * ((ga + gb) * t + 1.3).sin() / (ga + gb);
+            // a faint smooth hint of the stroke (NO pattern) so a glyph still reads — kept to a
+            // whisper so it never gels into the old honey blob; the comets carry the character.
             let body = smoothstep(0.0, 0.6, pres);
-            // the drift field: a gentle prevailing breeze + curl turbulence translates the particle field.
-            let (cfx, cfy) = curl(
-                x * l.scale * 0.5,
-                y * l.scale * 0.5,
-                t * l.speed * gust * 0.3,
-            );
-            let drift = t * l.speed * gust * 24.0; // FASTER than water — air moves quick
-            let (vdx, vdy) = (0.5 + cfx, -0.2 + cfy); // local drift velocity
-            let vl = (vdx * vdx + vdy * vdy).sqrt().max(1e-3);
-            let (ux, uy) = (vdx / vl, vdy / vl); // drift axis — particles trail along it
-            let dx = x + vdx * drift;
-            let dy = y + vdy * drift;
-            // glowing FAIRY-DUST motes on a sparse jittered grid: varied size, a soft glow + a bright
-            // twinkling CORE, stretched into a soft trail along the drift — magic carried on the wind.
-            // FEW, BIG, SOFT glowing motes — not a dense field of tiny hard dots (that reads as TV static).
-            let cell = 34.0; // SPARSE grid — few, distinct motes (dense packing read as TV static)
-            let gx = (dx / cell).floor();
-            let gy = (dy / cell).floor();
-            let mut glow_sum = 0.0f32; // soft accent-coloured halos
-            let mut core_sum = 0.0f32; // gentle glowing centres
-            for oy in -1..=1 {
-                for ox in -1..=1 {
-                    let (cx, cy) = (gx + ox as f32, gy + oy as f32);
+            let sheen = body * 0.045 * l.gain;
+            // the prevailing current — a FIXED axis (the whimsy lives in each mote's sway, which
+            // also replaces the old per-pixel curl(): its 12 value-noise calls are gone).
+            let (ux, uy) = (0.928f32, -0.371f32); // normalize(0.5, -0.2)
+            let dist = gust_phase * l.speed * 24.0;
+            let vel = (gust * l.speed * 24.0).max(0.2); // local wind speed → trail lookback reach
+            let (dx, dy) = (x + ux * dist, y + uy * dist); // wind-riding frame: motes ~static here
+            let cell = 34.0; // SPARSE grid — few, distinct comets (dense packing read as TV static)
+            let (gxi, gyi) = ((dx / cell).floor(), (dy / cell).floor());
+            let mut trail_sum = 0.0f32; // the accent-tinted swoosh ribbons
+            let mut core_sum = 0.0f32; // near-white comet hearts + star glints
+            const NK: i32 = 7; // trail samples past the head — fat and overlapping ⇒ ribbon, not beads
+            const STEP: f32 = 1.6; // seconds of lookback per sample
+            // trails reach upstream (+U in this frame): search a neighbourhood biased that way
+            for oyc in -1..=2 {
+                for oxc in -2..=1 {
+                    let (cx, cy) = (gxi + oxc as f32, gyi + oyc as f32);
                     let h = hash2(cx as i32, cy as i32);
                     if h < 0.55 {
-                        continue; // ~45% of cells ⇒ FEW, distinct motes (more = TV static)
+                        continue; // ~45% occupancy ⇒ FEW, distinct comets (more = TV static)
                     }
                     let h2 = hash2(cx as i32 + 31, cy as i32 - 17);
                     let h3 = hash2(cx as i32 - 9, cy as i32 + 5);
-                    let rad = cell * (0.44 + 0.48 * h3); // BIG soft motes — bold orbs, not fine speckle
-                    let pcx = (cx + 0.15 + 0.7 * h) * cell;
-                    let pcy = (cy + 0.15 + 0.7 * h2) * cell;
-                    let (ddx, ddy) = (dx - pcx, dy - pcy);
-                    // strongly stretch the falloff ALONG the drift ⇒ a long STREAK (dust FLYING on the
-                    // wind, motion-blurred) — light and linear, NOT a round wet droplet (that read watery).
-                    let al = ddx * ux + ddy * uy;
-                    let ac = -ddx * uy + ddy * ux;
-                    let dd = ((al * al * 0.06 + ac * ac).sqrt() / rad).min(1.0); // longer streak along the wind
-                    let s = 1.0 - dd;
-                    let life = 0.5 + 0.5 * (t * l.speed * 1.3 + h * 6.283).sin(); // soft fade in/out (no pop)
-                    let twinkle = 0.7 + 0.3 * (t * l.speed * 4.0 + h2 * 9.0).sin(); // gentle twinkle
-                    glow_sum += s * s * life;
-                    core_sum += s.powi(3) * life * twinkle; // a SOFT glowing centre (not a hard speckle)
+                    let hero = h3 > 0.78; // the rare grand swoosh — bigger, and it closes the loop
+                    let p0x = (cx + 0.15 + 0.7 * h) * cell;
+                    let p0y = (cy + 0.15 + 0.7 * h2) * cell;
+                    // the SWAY that draws the curve: an elliptic wander around the anchor. Radius =
+                    // the swirl knob (l.warp — wired at last; it was dead), rate rides the drift
+                    // knob. Over the trail's lookback the phase advances a good arc, so the ribbon
+                    // BENDS — and a hero's wider, faster sway curls it into the classic wind loop.
+                    let rad_sway = l.warp * (0.35 + 0.75 * h3) * if hero { 1.8 } else { 1.0 };
+                    let om = l.speed * (0.9 + 1.4 * h2);
+                    let ph = h * 6.283;
+                    let r0 = cell * (0.19 + 0.11 * h3) * if hero { 1.4 } else { 1.0 };
+                    // life BREATHES but never hits zero — a mote at full dark that re-lights in
+                    // place reads as a pop; a 0.3 floor keeps every fade a shimmer, not a blink.
+                    let life = 0.30
+                        + 0.70 * (0.5 + 0.5 * (t * (0.15 + l.speed * 0.4) + ph).sin());
+                    for k in 0..=NK {
+                        let tk = t - k as f32 * STEP;
+                        let delta = (vel * k as f32 * STEP).min(46.0); // cap inside the search reach
+                        let ang = om * tk + ph;
+                        let sx = p0x + ux * delta + rad_sway * ang.cos();
+                        let sy = p0y + uy * delta + rad_sway * 0.6 * ang.sin();
+                        let (ox, oy) = (dx - sx, dy - sy);
+                        let rk = r0 * (1.0 + 0.55 * k as f32 / NK as f32); // the tail diffuses wider
+                        let q = 1.0 - (ox * ox + oy * oy) / (rk * rk);
+                        if q <= 0.0 {
+                            continue;
+                        }
+                        let wk = (1.0 - k as f32 / (NK as f32 + 1.0)).powf(1.6) * life;
+                        trail_sum += q * q * wk;
+                        if k == 0 {
+                            // the comet head: a brighter heart + a soft four-point STAR glint (the
+                            // fairy sparkle — bright along the axes, gone off them), twinkling
+                            // gently. Amplitude stays ≥0.7 ⇒ a shimmer, never a strobe.
+                            let tw = 0.85 + 0.15 * (t * 0.9 + h2 * 9.0).sin();
+                            let star = (1.0 - (ox * oy).abs() / (rk * rk * 0.10))
+                                .clamp(0.0, 1.0)
+                                .powi(3)
+                                * q;
+                            core_sum += (q * q * q + star * 0.8) * life * tw;
+                        }
+                    }
                 }
             }
-            let gate = body.max(0.30); // gently confined to the stroke region
-            let g_soft = (glow_sum * gate).min(1.4);
+            let gate = body.max(0.30); // the breeze breathes around the stroke, brightest inside it
+            let g_soft = (trail_sum * gate).min(1.4);
             let g_core = (core_sum * gate).min(1.1);
+            // ink legibility — every material owes the ink a spine core (see Body's heat², Cracks'
+            // molten thread); Breeze was the one surface that ignored `p.heat`, so a thin radial
+            // label could fall between comets and vanish. It answers in character: a soft MOONLIT
+            // air-light down the spine — pale, cool, faintly blue — never a hard white needle.
+            let txt = (p.heat * p.heat * 0.55).min(1.0);
             let (ar, ag, ab) = m.accent;
-            // a SMOOTH whisper of body sheen — a translucent hint of lit air so a thin stroke still reads,
-            // with NO high-frequency noise (the curl-noise "current" I tried read as a TV-STATIC stream). The
-            // flowing streaky MOTES carry ALL the character (distorted particles drifting on the wind); the
-            // body is just a quiet, smooth glow — never a noisy stream, never a solid ribbon.
-            let sheen = body * 0.09 * l.gain;
-            // the few motes GLOW: a saturated accent halo + a near-white twinkling core, each stretched into a
-            // long streak along the drift (a particle FLYING on the breeze) — bold and distinct, not speckle.
+            // the swoosh ribbons wear a saturated accent (the user's colour riding the wind); the
+            // comet hearts and glints stay near-white — starlight, whatever the weave.
             let r = sheen * (0.5 + 0.5 * ar)
-                + (0.35 + 0.65 * ar) * g_soft * l.gain * 1.7
-                + (0.9 + 0.1 * ar) * g_core * 2.5;
+                + (0.35 + 0.65 * ar) * g_soft * l.gain * 1.6
+                + (0.92 + 0.08 * ar) * g_core * 2.2
+                + txt * 0.90;
             let g = sheen * (0.5 + 0.5 * ag)
-                + (0.35 + 0.65 * ag) * g_soft * l.gain * 1.7
-                + (0.9 + 0.1 * ag) * g_core * 2.5;
+                + (0.35 + 0.65 * ag) * g_soft * l.gain * 1.6
+                + (0.92 + 0.08 * ag) * g_core * 2.2
+                + txt * 0.95;
             let b = sheen * (0.55 + 0.45 * ab)
-                + (0.35 + 0.65 * ab) * g_soft * l.gain * 1.7
-                + (0.9 + 0.1 * ab) * g_core * 2.5;
-            let alpha = (sheen + g_soft * 0.75 + g_core * 0.95).min(0.9);
+                + (0.35 + 0.65 * ab) * g_soft * l.gain * 1.6
+                + (0.92 + 0.08 * ab) * g_core * 2.2
+                + txt;
+            let alpha = (sheen + g_soft * 0.7 + g_core * 0.95 + txt).min(0.92);
             (r, g, b, alpha)
         }
         Field::Sparks => {
@@ -1370,7 +1383,7 @@ pub fn preset(surface: Surface) -> Material {
                 field: Field::Caustic,
                 scale: 0.04,
                 speed: 0.20,
-                detail: 3.0,
+                detail: 2.0, // now WIRED to the break-up fbm octaves — 2.0 keeps the stock look byte-identical
                 warp: 2.5,
                 gain: 1.4,
                 ramp: Ramp::AccentHot,
@@ -1468,13 +1481,13 @@ pub fn preset(surface: Surface) -> Material {
             (2, 4)
         }
         Surface::GentleBreeze => {
-            // ONE layer: the Wisp now renders the drifting glowing fairy-dust motes ITSELF (a second
-            // Sparks layer doubled the particles into TV static). drift = speed, swirl = warp.
+            // ONE layer: the Wisp renders the comet-motes and their swooshing trails ITSELF (a second
+            // Sparks layer doubled the particles into TV static). drift = speed; swirl = warp = the
+            // sway radius that bends each trail (0 = straight glides, high = looping curls).
+            // (no `scale`: the Wisp's comet grid is a fixed 34px cell — spatial scale isn't a lever)
             layers[0] = Layer {
                 field: Field::Wisp,
-                scale: 0.02,
                 speed: 0.25,
-                detail: 3.0,
                 warp: 9.0,
                 gain: 1.05,
                 ramp: Ramp::Air,
@@ -1491,8 +1504,10 @@ pub fn preset(surface: Surface) -> Material {
                 label: "swirl",
                 layer: 0,
                 kind: KnobKind::Warp,
+                // capped where the trail search still covers the widest hero loop — past ~14 the
+                // curl can outrun its cell neighbourhood and clip.
                 min: 0.0,
-                max: 20.0,
+                max: 14.0,
             };
             // presence — how strongly the glowing motes read (sheer ambient ↔ legible).
             knobs[2] = Knob {
@@ -1555,18 +1570,18 @@ pub fn preset(surface: Surface) -> Material {
         Surface::MoltenResolve => {
             layers[0] = Layer {
                 field: Field::Cracks,
-                scale: 0.05,
+                scale: 0.034, // a handful of big plates, not a dense reticulation (print tell)
                 speed: 0.05,
                 gain: 1.0,
                 ramp: Ramp::Blackbody,
                 ..Layer::ZERO
             };
             knobs[0] = Knob {
-                label: "cell size",
+                label: "plate size",
                 layer: 0,
                 kind: KnobKind::Scale,
-                min: 0.02,
-                max: 0.12,
+                min: 0.015,
+                max: 0.08,
             };
             knobs[1] = Knob {
                 label: "churn",
@@ -1617,30 +1632,65 @@ pub fn material_preview_rgba(m: &Material, w: usize, h: usize, t: f32) -> Vec<u8
             rf * 0.17,
         ),
     ];
-    let field = |x: f32, y: f32| -> f32 {
-        let mut s = 0.0;
-        for (bx, by, br) in blobs {
-            let dd = ((x - bx) * (x - bx) + (y - by) * (y - by)) / (br * br);
-            s += (-dd * 1.6).exp();
+    // ── FIELD GRID — the whole optimization. The naive path evaluated the
+    // 3-gaussian field 5–7× PER PIXEL (centre + four gradient neighbours +
+    // two dispersion taps), every 60ms, for six tiles: the SYSTEM page's
+    // CPU bill. The field is smooth, so evaluate it ONCE per lattice point
+    // (with a 1px apron for the gradient taps), then read everything off the
+    // grid: the centre and gradient taps are exact (they always fall on
+    // integer coords — the same values the naive code computed), and the two
+    // dispersion taps are clamped bilinear lookups (visually identical on a
+    // smooth field). Plus a far-field cutoff: beyond dd=9 a gaussian
+    // contributes < 6e-7 of a colour step, so most background pixels skip
+    // `exp` entirely. Net: ~5–8× fewer transcendentals, zero visible change.
+    let (gw, gh) = (w + 2, h + 2);
+    let mut grid = vec![0.0f32; gw * gh];
+    for cy in 0..gh {
+        let y = cy as f32 - 1.0;
+        for cx in 0..gw {
+            let x = cx as f32 - 1.0;
+            let mut s = 0.0;
+            for (bx, by, br) in blobs {
+                let dd = ((x - bx) * (x - bx) + (y - by) * (y - by)) / (br * br);
+                if dd < 9.0 {
+                    s += (-dd * 1.6).exp();
+                }
+            }
+            grid[cy * gw + cx] = s;
         }
-        s
+    }
+    // integer-lattice read at field coords (x, y) ∈ [-1, w] × [-1, h], clamped
+    let at = |ix: i32, iy: i32| -> f32 {
+        let cx = (ix + 1).clamp(0, gw as i32 - 1) as usize;
+        let cy = (iy + 1).clamp(0, gh as i32 - 1) as usize;
+        grid[cy * gw + cx]
+    };
+    // clamped bilinear read at fractional coords — the dispersion taps
+    let sample = |x: f32, y: f32| -> f32 {
+        let (fx, fy) = (x.floor(), y.floor());
+        let (tx, ty) = (x - fx, y - fy);
+        let (ix, iy) = (fx as i32, fy as i32);
+        let top = at(ix, iy) + (at(ix + 1, iy) - at(ix, iy)) * tx;
+        let bot = at(ix, iy + 1) + (at(ix + 1, iy + 1) - at(ix, iy + 1)) * tx;
+        top + (bot - top) * ty
     };
     let bg = 6.0 / 255.0; // the tile's near-void ground
     let mut out = vec![0u8; w * h * 4];
     for yy in 0..h {
         for xx in 0..w {
             let (x, y) = (xx as f32, yy as f32);
-            let d = field(x, y).min(1.6);
-            let gx = (field(x + 1.0, y) - field(x - 1.0, y)) * 0.5;
-            let gy = (field(x, y + 1.0) - field(x, y - 1.0)) * 0.5;
+            let (ix, iy) = (xx as i32, yy as i32);
+            let d = at(ix, iy).min(1.6);
+            let gx = (at(ix + 1, iy) - at(ix - 1, iy)) * 0.5;
+            let gy = (at(ix, iy + 1) - at(ix, iy - 1)) * 0.5;
             let grad = (gx * gx + gy * gy).sqrt();
             let heat = (d - 1.0).max(0.0) * 1.4;
             let (ux, uy, fu) = facet(gx, gy, m.facets);
             let off = m.dispersion;
             let (dr, db) = if grad > 0.004 {
                 (
-                    field(x + ux * off, y + uy * off).min(1.6),
-                    field(x - ux * off, y - uy * off).min(1.6),
+                    sample(x + ux * off, y + uy * off).min(1.6),
+                    sample(x - ux * off, y - uy * off).min(1.6),
                 )
             } else {
                 (d, d)
@@ -1831,9 +1881,11 @@ pub fn weave_proof_sheet(t: f32) -> (usize, usize, Vec<u8>) {
                     let cov = (rad + 0.5 - d).clamp(0.0, 1.0);
                     let a = (lum * cov).clamp(0.0, 1.0);
                     let idx = ((oy + ly) * w + (ox + lx)) * 4;
-                    out[idx] = ((cr.min(1.0) * a + bg * (1.0 - a)) * 255.0) as u8;
-                    out[idx + 1] = ((cg.min(1.0) * a + bg * (1.0 - a)) * 255.0) as u8;
-                    out[idx + 2] = ((cb.min(1.0) * a + bg * (1.0 - a)) * 255.0) as u8;
+                    // sRGB-encode like every live consumer (overlay cast, gallery, whiteboard ink)
+                    // so the proof judges what the user actually sees, not crushed linear.
+                    out[idx] = ((cr.min(1.0).sqrt() * a + bg * (1.0 - a)) * 255.0) as u8;
+                    out[idx + 1] = ((cg.min(1.0).sqrt() * a + bg * (1.0 - a)) * 255.0) as u8;
+                    out[idx + 2] = ((cb.min(1.0).sqrt() * a + bg * (1.0 - a)) * 255.0) as u8;
                     out[idx + 3] = 255;
                 }
             }
@@ -1843,8 +1895,9 @@ pub fn weave_proof_sheet(t: f32) -> (usize, usize, Vec<u8>) {
 }
 
 /// Write the proof as an ANIMATED GIF (one screen: every material × every colour, the stroke tapering
-/// through all sizes, looping ~2.4s) + a single PNG still. Rows = materials (DirectedIntent, Fluid
-/// Thought, Materialized Desire, Gentle Breeze, Sudden Insight, Molten Resolve); columns = weave colour.
+/// through all sizes, looping ~2.4s) + a single PNG still + the GALLERY sheet (the metaball swatches
+/// as the MATERIAL page renders them). Rows = materials (DirectedIntent, Fluid Thought, Materialized
+/// Desire, Gentle Breeze, Sudden Insight, Molten Resolve); columns = weave colour.
 pub fn write_proof_sheets() {
     use image::codecs::gif::{GifEncoder, Repeat};
     use image::{Delay, Frame, RgbaImage};
@@ -1872,6 +1925,28 @@ pub fn write_proof_sheets() {
     if let Some(img) = RgbaImage::from_raw(w as u32, h as u32, buf) {
         let _ = img.save("_weave_proof.png");
     }
+    // the GALLERY sheet — the exact metaball swatch the MATERIAL page shows (same renderer, same
+    // 220×132 tile), every material × a few time samples, so the gallery look is judgeable headless.
+    let (tw, th) = (220usize, 132usize);
+    let times = [0.7f32, 2.3, 4.1];
+    let (gw, gh) = (tw * Surface::ALL.len(), th * times.len());
+    let mut sheet = RgbaImage::new(gw as u32, gh as u32);
+    for (ri, &st) in times.iter().enumerate() {
+        for (ci, s) in Surface::ALL.into_iter().enumerate() {
+            let tile = material_preview_rgba(&preset(s), tw, th, st);
+            for yy in 0..th {
+                for xx in 0..tw {
+                    let i = (yy * tw + xx) * 4;
+                    sheet.put_pixel(
+                        (ci * tw + xx) as u32,
+                        (ri * th + yy) as u32,
+                        image::Rgba([tile[i], tile[i + 1], tile[i + 2], 255]),
+                    );
+                }
+            }
+        }
+    }
+    let _ = sheet.save("_weave_gallery.png");
 }
 
 #[cfg(test)]
@@ -1992,7 +2067,7 @@ mod tests {
         // no override: the live material uses the stock phosphor accent (the accent path is opt-in).
         set_weave_surface(Surface::DirectedIntent);
         clear_weave_accent();
-        let base = *material();
+        let base = Material::neuron();
         assert!(
             (live_material().accent_hue - hue_u32(0x4A_F2B0)).abs() < 1e-6,
             "no override = stock phosphor"

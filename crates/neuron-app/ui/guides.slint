@@ -29,10 +29,12 @@ export struct GuideEntry {
 }
 
 export global GuideContent {
-    // The WORKSHOP guide is a BUILD guide that climbs gently: from "anyone can write this" (plain
-    // keystrokes) to "it reacts to me" (ctx as input) to the deep power (drive the device, sense,
-    // remember, compose), then closes with the no-code + no-limit escape hatches. Every section is a
-    // paste-able recipe, never engine exposition. The order is the lesson — keep the ramp intact.
+    // The WORKSHOP guide is a BUILD guide that climbs: your FIRST macro types, your SECOND reacts
+    // (ctx), your THIRD hits an API — then the toolbox, asking, memory, SHARED state across macros
+    // (the librarian pattern), the device verbs, and the no-code / no-limit escape hatches. Every
+    // section is a paste-able recipe grounded in the REAL prelude (runtime/host/neuron.py), never
+    // engine exposition. The order is the lesson — keep the ramp intact. (ctx.selection is always
+    // None on Windows today — never teach it.)
     out property <[GuideEntry]> guides: [
         {
             id: "macros",
@@ -41,9 +43,25 @@ export global GuideContent {
                 {
                     head: "Your first macro",
                     blocks: [
-                        { code: false, text: "A macro is a Python function. Its body runs every time you press the control you bind it to." },
+                        { code: false, text: "A macro is a Python function. It runs every time you press the control you bind it to." },
                         { code: true, text: "def macro(ctx):\n    neuron.type_text(\"on my way!\")" },
-                        { code: false, text: "Paste it, bind it on this page, press the key. Testing in the Workshop is disarmed: you see what a macro would do, its asks and notifications, but nothing types or clicks. You can't break anything while you learn." },
+                        { code: false, text: "Paste it, bind it on this page, press the key. The Workshop tests disarmed: you see everything a macro would do, but nothing actually types or clicks. You can't break anything while you learn." },
+                    ],
+                },
+                {
+                    head: "Your second macro: it reacts",
+                    blocks: [
+                        { code: false, text: "ctx is a snapshot of the moment you pressed. Read it and one key behaves differently wherever you are." },
+                        { code: true, text: "def macro(ctx):\n    # shout whatever you copied\n    s = ctx.clipboard or \"\"\n    neuron.type_text(s.upper())\n\ndef macro(ctx):\n    if \"code\" in ctx.app:    # editor only\n        neuron.hotkey(\"ctrl\", \"/\")" },
+                        { code: false, text: "You get: ctx.app, ctx.title, ctx.clipboard, and ctx.cwd (the folder, when you're in explorer)." },
+                    ],
+                },
+                {
+                    head: "Your third macro: hit an API",
+                    blocks: [
+                        { code: false, text: "The runtime is full CPython with the whole stdlib: urllib, sockets, json, subprocess. Any API you can reach, a keypress can hit." },
+                        { code: true, text: "def macro(ctx):\n    import urllib.request\n    r = urllib.request.urlopen(\n        \"https://wttr.in/?format=%t\")\n    neuron.notify(r.read().decode())" },
+                        { code: false, text: "The weather, on a mouse button. Swap the URL for your CI, your home server, a webhook: notify() puts the answer on screen without stealing focus." },
                     ],
                 },
                 {
@@ -51,15 +69,7 @@ export global GuideContent {
                     blocks: [
                         { code: false, text: "Most macros are just the keystrokes and clicks you'd rather not do by hand." },
                         { code: true, text: "neuron.type_text(\"...\")     # type a string\nneuron.hotkey(\"ctrl\", \"s\")  # a chord\nneuron.key(\"enter\")         # one key\nneuron.click(\"right\")       # a mouse click\nneuron.run(\"notepad\")       # run a program" },
-                        { code: false, text: "Also handy: type_ghost (slow, organic typing that lands in chats and games), scroll, mouse_to, clipboard_get, clipboard_set, focus(title), sleep(ms). Chain a few and you've automated a routine." },
-                    ],
-                },
-                {
-                    head: "Make it react",
-                    blocks: [
-                        { code: false, text: "ctx is a snapshot of the moment you pressed. Read from it and one macro behaves differently depending on where you are." },
-                        { code: true, text: "def macro(ctx):\n    # SHOUT the highlighted text\n    neuron.type_text(ctx.selection.upper())\n\ndef macro(ctx):\n    if \"code\" in ctx.app:    # editor only\n        neuron.hotkey(\"ctrl\", \"/\")" },
-                        { code: false, text: "What you get: ctx.app, ctx.title, ctx.selection, ctx.clipboard, ctx.cwd." },
+                        { code: false, text: "Also handy: type_ghost (slow, organic typing that lands in chats and games), scroll, mouse_to, key_down / key_up (holds), clipboard_get, clipboard_set, focus(title), sleep(ms). And run(cmd, wait=True) hands back (exit code, stdout), so the shell doubles as a sensor." },
                     ],
                 },
                 {
@@ -67,43 +77,47 @@ export global GuideContent {
                     blocks: [
                         { code: false, text: "A macro can stop and ask you. A small radial appears at the cursor and blocks this macro only, never the rest of your input." },
                         { code: true, text: "if neuron.ask(\"deploy?\"):\n    ...\npick = neuron.choose(\"profile?\",\n    [\"gaming\", \"work\", \"quiet\"])\nif neuron.confirm(\"wipe disk\"):\n    return   # swipe = stop, ignore = go" },
-                        { code: false, text: "Flick to answer, or ignore it and take the default. confirm is a one-swipe pause to review: leave it alone and the macro keeps going." },
-                    ],
-                },
-                {
-                    head: "Drive Neuron itself",
-                    blocks: [
-                        { code: false, text: "A macro can drive the app and your device, exactly like a bound action. That's how you build a one-press scene." },
-                        { code: true, text: "def macro(ctx):\n    neuron.profile(\"gaming\")\n    neuron.dpi(1600)\n    neuron.mic_mute(\"off\")" },
-                        { code: false, text: "Verbs: dpi, dpi_cycle, scroll_cycle, profile, profile_cycle, brightness, mic_mute, out_mute, mic_gain, out_gain. Each one is the real write, the same as flipping it in the UI." },
-                    ],
-                },
-                {
-                    head: "Read state, then branch",
-                    blocks: [
-                        { code: false, text: "Macros can read live state and decide based on it." },
-                        { code: true, text: "def macro(ctx):\n    b = neuron.battery()\n    if b and b[\"percent\"] < 15:\n        neuron.profile(\"powersave\")" },
-                        { code: false, text: "Readers: battery() gives percent and charging, plus current_dpi(), active_profile(), scroll_stage()." },
+                        { code: false, text: "Flick to answer, or ignore it and take the default. confirm is a one-swipe pause: leave it alone and the macro keeps going. Asks work even in SAFE mode, and in the terminal when you run headless." },
                     ],
                 },
                 {
                     head: "Give it a memory",
                     blocks: [
-                        { code: false, text: "store and load persist per macro across restarts. That's how you build toggles and counters." },
+                        { code: false, text: "store and load persist per macro across restarts, atomic on disk. forget() wipes, stored() shows everything. Toggles and counters fall out." },
                         { code: true, text: "def macro(ctx):             # a DPI toggle\n    on = not neuron.load(\"on\", False)\n    neuron.store(\"on\", on)\n    neuron.dpi(3200 if on else 800)\n    neuron.notify(\"on\" if on else \"off\")" },
                     ],
                 },
                 {
-                    head: "Compose small macros",
+                    head: "Share state between macros",
                     blocks: [
-                        { code: false, text: "Keep each macro to one job, then wire them together. invoke() runs another by name and hands back its result. option() reads a knob you declared in NEURON_OPTIONS, so one macro can serve several uses." },
-                        { code: true, text: "def macro(ctx):\n    neuron.invoke(\"mute_all\")   # run, wait\n    if neuron.invoke(\"is_clean\"):\n        neuron.invoke(\"deploy\", wait=False)\n    speed = neuron.option(\"spd\", \"fast\")" },
+                        { code: false, text: "Each macro's store is its own, so shared state is a macro that owns the data. Siblings invoke() it: kwargs arrive as its options, and its return value comes back." },
+                        { code: true, text: "def macro(ctx):          # counter.py\n    if neuron.option(\"op\") == \"add\":\n        n = neuron.load(\"n\", 0) + 1\n        neuron.store(\"n\", n)\n    return neuron.load(\"n\", 0)" },
+                        { code: true, text: "def macro(ctx):          # anywhere else\n    n = neuron.invoke(\"counter\", op=\"add\")\n    neuron.notify(f\"count: {n}\")" },
+                        { code: false, text: "invoke runs the sibling inline and waits; wait=False queues it and moves on. A failed invoke returns None instead of raising, and nesting stops at 16 deep. Small macros, wired together, is the whole style." },
+                    ],
+                },
+                {
+                    head: "Drive the device",
+                    blocks: [
+                        { code: false, text: "When you do want the hardware: a macro drives Neuron exactly like a bound action, same verified writes, same confirmation cards. One press, whole setup:" },
+                        { code: true, text: "def macro(ctx):\n    neuron.profile(\"gaming\")\n    neuron.dpi(1600)\n    neuron.mic_mute(\"off\")" },
+                        { code: false, text: "Writes: dpi, dpi_cycle, scroll_cycle, profile, profile_cycle, brightness, mic_mute, out_mute, mic_gain, out_gain. Reads: battery() (percent + charging), current_dpi(), active_profile(), scroll_stage()." },
+                        { code: false, text: "And signal(channel, value) drives the Signal lighting layer: paint it anywhere on the LIGHTING page, then any script can light it. signal(1, 1.0) when CI breaks, signal(1, 0.0) when it heals; the value picks the colour on the layer's gradient and stays until you change it." },
+                    ],
+                },
+                {
+                    head: "Drive OBS, and let OBS drive you",
+                    blocks: [
+                        { code: false, text: "With CONNECTIONS + obs on (SYSTEM page), OBS is bindable with no code at all: the action picker's obs entry does stream, record, pause, replay (\"clip that!\"), scene switches, and input mute from any key, wedge, or gesture. Macros get the same verbs and more: obs_scene(name), obs_stream(), obs_record(), obs_replay(), obs_mute(), and obs_request() for anything else in the obs-websocket API. Reads: obs_scene_name(), obs_streaming(), obs_recording(), obs_connected()." },
+                        { code: false, text: "It runs the other way too. Name a macro on_obs_scene, on_obs_stream, or on_obs_record and Neuron fires it whenever OBS changes that state. Going live can set your profile, your DPI, and your mic in one motion:" },
+                        { code: true, text: "def macro(ctx):          # on_obs_stream.py\n    if neuron.obs_streaming():\n        neuron.profile(\"streaming\")\n        neuron.mic_mute(\"off\")\n    else:\n        neuron.profile(\"default\")" },
                     ],
                 },
                 {
                     head: "No code, or no limits",
                     blocks: [
-                        { code: false, text: "Two ways past the basics. If you'd rather not write Python, every macro is also a drag-and-drop block tree, and it converts back to code without losing anything. If you need more than the toolkit, the engine underneath is real CPython in its own process: import anything, open files, call Win32 through ctypes, hit the network. A crash only takes down that sidecar, which respawns, and your input never stutters." },
+                        { code: false, text: "Rather not write Python? Every macro is also a drag-and-drop block tree, and it converts back to code without losing anything." },
+                        { code: false, text: "Need more? It's real CPython in its own process: import anything, open files and sockets, call Win32 through ctypes, spawn threads, even loop forever as a watcher (a busy macro only ever blocks its own queue). No pip in the bundled runtime: point NEURON_PYTHON at your own interpreter, or sys.path.append a folder. A crash only takes down the sidecar, which respawns; your input never stutters. The helpers respect SAFE mode; raw ctypes is your own rope." },
                     ],
                 },
             ],

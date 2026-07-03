@@ -74,18 +74,16 @@ enum Cmd {
     },
     /// Lighting brightness 0..=100: show, or set
     Brightness { pct: Option<u8> },
-    /// Sniper / on-the-fly DPI: hold a button to drop to a precision DPI, release to snap back.
-    /// First run asks you to PRESS the button you want — nothing hardcoded.
+    /// Sniper / on-the-fly DPI: hold a control to drop to a precision DPI, release to snap back.
+    /// Authors the bind into the shared rule store; the resident neuron app enforces the hold.
+    /// First run asks you to PRESS the control you want — nothing hardcoded.
     Sniper {
-        /// re-bind the hold button (press the one you want)
+        /// re-bind the hold control (press the one you want)
         #[arg(long)]
         bind: bool,
         /// precision DPI while held (default 400, or whatever you last set)
         #[arg(long)]
         dpi: Option<u16>,
-        /// stop after N seconds (default: until ESC)
-        #[arg(long)]
-        seconds: Option<u64>,
     },
     /// Onboard memory: unified pool view (macros + files + profiles share one 124 KB)
     Storage {
@@ -852,7 +850,7 @@ fn main() -> Result<()> {
         } => dpi_stages_cmd(&reg, &stages, active, persist)?,
         Cmd::Scroll { stage, volatile } => scroll_cmd(&reg, stage, volatile)?,
         Cmd::Brightness { pct } => brightness_cmd(&reg, pct)?,
-        Cmd::Sniper { bind, dpi, seconds } => sniper_cmd(&reg, bind, dpi, seconds)?,
+        Cmd::Sniper { bind, dpi } => sniper_cmd(bind, dpi)?,
         Cmd::Storage { raw } => storage_status(&reg, raw)?,
         Cmd::Watch { seconds } => neuron::controls::watch(seconds),
         Cmd::Gesture { action } => gesture_cmd(action)?,
@@ -1042,7 +1040,8 @@ fn profile_capture(reg: &Registry, name: &str) -> Result<()> {
         name,
         neuron::writes::GamingMode::default(),
         false,
-        0, // the CLI is stateless — no selected device; capability-based first match
+        0,  // the CLI is stateless — no selected device; capability-based first match
+        "", // and no selected physical unit either
     );
 
     if p.is_empty() {
@@ -1864,7 +1863,10 @@ fn lighting_effect(
                 size: None, // --raw is a transparent probe: data_size = exactly the bytes given
             })
         } else {
-            l.native_effect_report(eff, color)
+            // persist=false: this is the raw PROBE path — the `store` override below pokes the
+            // varstore byte manually (even on legacy, deliberately) rather than via the
+            // translation layer's Matrix-only persist.
+            l.native_effect_report(eff, color, false)
         }
         .map(|mut rep| {
             // prefix is [varstore, led_id, ...]; allow probing overrides.
@@ -3293,111 +3295,114 @@ fn key_down(_vk: i32) -> bool {
     false
 }
 
-/// Wait for the user to press ANY key/button and return its virtual-key. Ignores keys already
-/// held at start. ESC cancels. This is how you bind a control — you press it, no codes to type.
+// ── SNIPER binding — a held Action on the shared rule spine (profiles/gui.rules.toml) ─────────
+// Sniper is `Trigger::Input -> Action::Sniper { dpi }` in the SAME rule store the GUI authors and
+// the resident app dispatches. This command just authors that one rule; the app enforces the hold
+// (its immortal listener owns the DPI drop/restore, like every other bind). No `sniper.toml`, no
+// standalone GetAsyncKeyState loop — one config, one dispatcher, CLI and GUI can't drift.
+
+fn gui_rules_path() -> std::path::PathBuf {
+    std::path::PathBuf::from("profiles").join("gui.rules.toml")
+}
+
+fn load_gui_rules() -> Vec<neuron::engine::Rule> {
+    std::fs::read_to_string(gui_rules_path())
+        .ok()
+        .and_then(|s| toml::from_str::<neuron::engine::RuleDoc>(&s).ok())
+        .map(|d| d.rules)
+        .unwrap_or_default()
+}
+
+fn save_gui_rules(rules: Vec<neuron::engine::Rule>) -> Result<()> {
+    std::fs::create_dir_all("profiles")?;
+    let doc = neuron::engine::RuleDoc { rules };
+    std::fs::write(gui_rules_path(), toml::to_string_pretty(&doc)?)?;
+    Ok(())
+}
+
+/// Headless press-to-bind: listen for the first HID control (any key / button / knob) and return its
+/// `(page, usage, pid)` — the native `Trigger::Input` form the GUI captures too. ESC or a 30 s
+/// timeout cancels. Skips left-mouse so a stray click can't self-bind.
 #[cfg(windows)]
-fn capture_keypress() -> Option<i32> {
-    use std::time::Duration;
-    let baseline: Vec<bool> = (0..256).map(key_down).collect();
-    loop {
-        if key_down(0x1B) {
-            return None;
-        }
-        for vk in 1..256 {
-            if vk != 0x1B && key_down(vk) && !baseline[vk as usize] {
-                return Some(vk);
+fn capture_sniper_control() -> Option<(u16, u16, Option<u16>)> {
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let stop = AtomicBool::new(false);
+    let found: Cell<Option<(u16, u16, Option<u16>)>> = Cell::new(None);
+    neuron::controls::listen_until(
+        Some(30),
+        &stop,
+        true, // interactive: ESC cancels
+        |ev| {
+            if let Some(&(page, usage)) = ev.hits.first() {
+                if (page, usage) == (0x09, 1) {
+                    return; // left mouse operates the terminal, not a bindable control
+                }
+                let pid = if page == neuron::controls::RAZER_MACRO_PAGE {
+                    None
+                } else {
+                    u16::from_str_radix(&ev.pid, 16).ok()
+                };
+                found.set(Some((page, usage, pid)));
+                stop.store(true, Ordering::Relaxed);
             }
-        }
-        std::thread::sleep(Duration::from_millis(8));
-    }
+        },
+        || {},
+    );
+    found.get()
 }
 #[cfg(not(windows))]
-fn capture_keypress() -> Option<i32> {
+fn capture_sniper_control() -> Option<(u16, u16, Option<u16>)> {
     None
 }
 
-#[derive(Default, serde::Serialize, serde::Deserialize)]
-struct SniperConfig {
-    /// the bound hold button (a virtual-key, learned by pressing it).
-    button: Option<i32>,
-    #[serde(default)]
-    dpi: u16,
-}
+/// Sniper / on-the-fly DPI: author the held `Action::Sniper` rule (hold a control -> precision DPI,
+/// release -> restore). `--bind` — or a first run with nothing bound yet — captures the hold control
+/// by PRESSING it; `--dpi` sets the precision DPI. The bind lives in `profiles/gui.rules.toml` (the
+/// same store the GUI edits) and the resident neuron app enforces the hold. Nothing hardcoded.
+fn sniper_cmd(rebind: bool, dpi_override: Option<u16>) -> Result<()> {
+    use neuron::action::Action;
+    use neuron::engine::{Rule, Trigger};
 
-fn vk_name(vk: i32) -> String {
-    match vk {
-        0x01 => "Left Mouse".into(),
-        0x02 => "Right Mouse".into(),
-        0x04 => "Middle Mouse".into(),
-        0x05 => "Mouse 4 (thumb 1)".into(),
-        0x06 => "Mouse 5 (thumb 2)".into(),
-        v if (0x30..=0x39).contains(&v) => format!("'{}'", (v as u8) as char),
-        v if (0x41..=0x5A).contains(&v) => format!("'{}'", (v as u8) as char),
-        v => format!("VK 0x{v:02X}"),
-    }
-}
-
-/// Sniper / on-the-fly DPI. You bind the hold button by PRESSING it (first run, or `--bind`),
-/// stored in sniper.toml. Hold -> precision DPI, release -> restore. Deterministic: always
-/// leaves the device exactly as it found it.
-fn sniper_cmd(
-    reg: &Registry,
-    rebind: bool,
-    dpi_override: Option<u16>,
-    seconds: Option<u64>,
-) -> Result<()> {
-    use std::time::{Duration, Instant};
-    let path = std::path::PathBuf::from("sniper.toml");
-    let mut cfg: SniperConfig = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| toml::from_str(&s).ok())
-        .unwrap_or_default();
-    if cfg.dpi == 0 {
-        cfg.dpi = 400;
-    }
+    let mut rules = load_gui_rules();
+    let existing = rules
+        .iter()
+        .position(|r| matches!(r.action, Action::Sniper { .. }));
+    let mut dpi = existing
+        .and_then(|i| match rules[i].action {
+            Action::Sniper { dpi } => Some(dpi),
+            _ => None,
+        })
+        .filter(|d| *d != 0)
+        .unwrap_or(400);
     if let Some(d) = dpi_override {
-        cfg.dpi = d;
-    }
-    if rebind || cfg.button.is_none() {
-        println!("Press the button you want as your sniper key (ESC to cancel)...");
-        match capture_keypress() {
-            Some(vk) => {
-                cfg.button = Some(vk);
-                println!("bound to {}.", vk_name(vk));
-            }
-            None => bail!("cancelled — nothing bound"),
+        if d != 0 {
+            dpi = d;
         }
     }
-    std::fs::write(&path, toml::to_string_pretty(&cfg)?)?;
-    let vk = cfg.button.unwrap();
 
-    let d = open_with_command(reg, "dpi")?;
-    ensure_driver(&d);
-    let (base_x, base_y) = cap::dpi(&d)?;
-    println!(
-        "sniper ready: hold {} -> {} DPI, release -> {base_x} DPI. ESC to stop.",
-        vk_name(vk),
-        cfg.dpi
-    );
-    let start = Instant::now();
-    let mut held = false;
-    loop {
-        if key_down(0x1B) || seconds.is_some_and(|s| start.elapsed().as_secs() >= s) {
-            break;
-        }
-        let now = key_down(vk);
-        if now != held {
-            held = now;
-            if now {
-                let _ = cap::set_dpi(&d, cfg.dpi, cfg.dpi, cap::Store::Volatile);
-            } else {
-                let _ = cap::set_dpi(&d, base_x, base_y, cap::Store::Volatile);
-            }
-        }
-        std::thread::sleep(Duration::from_millis(8));
+    if rebind || existing.is_none() {
+        println!("Press the control you want as your sniper hold button (ESC to cancel)...");
+        let Some((page, usage, pid)) = capture_sniper_control() else {
+            bail!("cancelled — sniper unchanged");
+        };
+        let label = neuron::controls::control_label(page, usage);
+        // keep it to exactly ONE sniper rule — a re-bind MOVES the button, never stacks a second.
+        rules.retain(|r| !matches!(r.action, Action::Sniper { .. }));
+        rules.push(Rule::new(Trigger::Input { page, usage, pid }, Action::Sniper { dpi }));
+        save_gui_rules(rules)?;
+        println!("sniper armed: hold {label} -> {dpi} DPI.");
+    } else {
+        let i = existing.unwrap();
+        rules[i].action = Action::Sniper { dpi };
+        let label = match &rules[i].trigger {
+            Trigger::Input { page, usage, .. } => neuron::controls::control_label(*page, *usage),
+            other => other.describe(),
+        };
+        save_gui_rules(rules)?;
+        println!("sniper: hold {label} -> {dpi} DPI.");
     }
-    let _ = cap::set_dpi(&d, base_x, base_y, cap::Store::Volatile); // leave it as found
-    println!("restored to {base_x} DPI.");
+    println!("The neuron app enforces this hold while it runs (the resident dispatcher).");
     Ok(())
 }
 
@@ -3822,7 +3827,7 @@ fn info(d: &Device) -> Result<()> {
 //
 // Pure-logic coverage of the CLI's non-IO surface: clap arg-parsing, the value
 // decoders/formatters, the hex parsing in `probe`, the DPI-stage decode used by `profile capture`
-// and `dpi-stages`, and the vk_name mapping. These tests deliberately touch NO hardware and NEVER
+// and `dpi-stages`. These tests deliberately touch NO hardware and NEVER
 // arm input (`action::input_armed()` stays DISARMED) — they only exercise pure functions and the
 // clap parser, exactly the layers a frontend will rely on having a stable contract for.
 #[cfg(test)]
@@ -4164,38 +4169,6 @@ mod tests {
             assert_eq!(parse_device_mode(s).unwrap(), 0x00, "{s}");
         }
         assert!(parse_device_mode("sideways").is_err());
-    }
-
-    // ── vk_name: press-to-bind friendly names ────────────────────────────────────────────────
-
-    #[test]
-    fn vk_name_maps_mouse_and_keys() {
-        assert_eq!(vk_name(0x01), "Left Mouse");
-        assert_eq!(vk_name(0x02), "Right Mouse");
-        assert_eq!(vk_name(0x04), "Middle Mouse");
-        assert_eq!(vk_name(0x05), "Mouse 4 (thumb 1)");
-        assert_eq!(vk_name(0x06), "Mouse 5 (thumb 2)");
-        assert_eq!(vk_name(0x41), "'A'"); // letter range
-        assert_eq!(vk_name(0x39), "'9'"); // digit range
-        assert_eq!(vk_name(0x12), "VK 0x12"); // fallthrough (Alt)
-    }
-
-    // ── SniperConfig: defaulting / round-trip ────────────────────────────────────────────────
-
-    #[test]
-    fn sniper_config_defaults_and_round_trips() {
-        let cfg = SniperConfig::default();
-        assert_eq!(cfg.button, None);
-        assert_eq!(cfg.dpi, 0);
-        // round-trips through TOML (the on-disk form sniper_cmd reads/writes).
-        let bound = SniperConfig {
-            button: Some(0x05),
-            dpi: 400,
-        };
-        let s = toml::to_string_pretty(&bound).unwrap();
-        let back: SniperConfig = toml::from_str(&s).unwrap();
-        assert_eq!(back.button, Some(0x05));
-        assert_eq!(back.dpi, 400);
     }
 
     // ── the input-safety invariant: tests never arm input ────────────────────────────────────

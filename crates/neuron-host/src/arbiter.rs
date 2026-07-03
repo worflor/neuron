@@ -2,17 +2,22 @@
 //!
 //! A layer here is not just pixels: it carries WHO painted it (owner), HOW MUCH
 //! it matters (priority band), and FOR HOW LONG the claim stands without being
-//! renewed (lease). `resolve` is a pure function of (layers, now) — deterministic,
-//! so there is no flicker-by-race — and an expired lease simply stops winning,
-//! so a session that dies mid-game releases the surface with zero cleanup code
-//! on the adapter's part. `sweep` then reports the lapse so teardown is
-//! *observable*, not silent.
+//! renewed (lease). For `Fill`/`Cells` layers `resolve` is a pure function of
+//! (layers, now) — deterministic, so there is no flicker-by-race. (`Live`
+//! content is the honest exception: it renders per resolve and may sample its
+//! own clock — the app's compositor base deliberately reads the process-global
+//! render epoch so the board stays phase-locked to the GUI preview, trading
+//! away replay determinism for that one layer.) An expired lease simply stops
+//! winning, so a session that dies mid-game releases the surface with zero
+//! cleanup code on the adapter's part. `sweep` then reports the lapse so
+//! teardown is *observable*, not silent.
 //!
 //! Deliberately NOT here: pattern math (that stays in neuron-core's
 //! `pattern::Compositor` — the user's whole configured stack becomes the
 //! *content* of one pinned BASE layer), device byte order (adapters translate;
 //! the kernel speaks RGB), and any notion of time other than the `now` the
-//! caller passes in (injected clock = exhaustively testable).
+//! caller passes in (injected clock = exhaustively testable for the
+//! deterministic content kinds).
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -43,21 +48,127 @@ pub mod band {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Rgb(pub u8, pub u8, pub u8);
 
+/// Animated layer content: rendered fresh on every resolve. This is the seam
+/// that lets neuron-app's own Pattern×Spectrum compositor BE the arbiter's
+/// base layer — the user's configured animation runs *under* protocol
+/// sessions, and returns the instant they release. Implementations do math
+/// only (the kernel stays I/O-free); `Send` because layers live on the kernel
+/// actor thread. `boxed_clone` exists because layer content must be clonable
+/// (journal replay, set-or-claim fallbacks); implementations typically
+/// rebuild from their defs.
+pub trait LiveContent: Send {
+    /// Current cells; `None` = transparent, same contract as [`Content::Cells`].
+    fn render(&mut self, now: Instant) -> Vec<Option<Rgb>>;
+    fn boxed_clone(&self) -> Box<dyn LiveContent>;
+}
+
 /// What a layer paints. `None` cells are transparent: they neither claim nor
 /// color that LED, so lower layers show through per-cell — this is what lets a
 /// game light six keys while the user's base keeps the rest.
-#[derive(Clone, Debug, PartialEq)]
 pub enum Content {
     Fill(Rgb),
     Cells(Vec<Option<Rgb>>),
+    /// Animated content (see [`LiveContent`]). Never equal to anything under
+    /// `PartialEq` — two animations are only "the same" by construction, and
+    /// pretending otherwise would corrupt dedup logic.
+    Live(Box<dyn LiveContent>),
 }
 
-impl Content {
-    fn at(&self, i: usize) -> Option<Rgb> {
+impl Clone for Content {
+    fn clone(&self) -> Content {
         match self {
-            Content::Fill(c) => Some(*c),
-            Content::Cells(v) => v.get(i).copied().flatten(),
+            Content::Fill(c) => Content::Fill(*c),
+            Content::Cells(v) => Content::Cells(v.clone()),
+            Content::Live(l) => Content::Live(l.boxed_clone()),
         }
+    }
+}
+
+impl std::fmt::Debug for Content {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Content::Fill(c) => f.debug_tuple("Fill").field(c).finish(),
+            Content::Cells(v) => f.debug_tuple("Cells").field(v).finish(),
+            Content::Live(_) => f.write_str("Live(..)"),
+        }
+    }
+}
+
+impl PartialEq for Content {
+    fn eq(&self, other: &Content) -> bool {
+        match (self, other) {
+            (Content::Fill(a), Content::Fill(b)) => a == b,
+            (Content::Cells(a), Content::Cells(b)) => a == b,
+            _ => false, // Live never equals — see the variant docs
+        }
+    }
+}
+
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+
+    struct Blink(u8);
+    impl LiveContent for Blink {
+        fn render(&mut self, _now: Instant) -> Vec<Option<Rgb>> {
+            self.0 = self.0.wrapping_add(1);
+            vec![Some(Rgb(self.0, 0, 0)); 2]
+        }
+        fn boxed_clone(&self) -> Box<dyn LiveContent> {
+            Box::new(Blink(self.0))
+        }
+    }
+
+    #[test]
+    fn live_base_animates_under_a_session_and_returns_after_it() {
+        let mut a = Arbiter::new();
+        let t0 = Instant::now();
+        a.declare_surface("kbd", 2);
+        a.claim("kbd", SourceId(1), band::BASE, Lease::Pinned, Content::Live(Box::new(Blink(0))))
+            .unwrap();
+        // The live base advances every resolve.
+        let f1 = a.resolve("kbd", t0).unwrap();
+        let f2 = a.resolve("kbd", t0).unwrap();
+        assert_ne!(f1, f2, "live content must animate across resolves");
+
+        // A session covers it; while covered the base is NOT rendered visibly.
+        let sess = a
+            .claim(
+                "kbd",
+                SourceId(2),
+                band::SESSION,
+                Lease::heartbeat(Duration::from_secs(15), t0),
+                Content::Fill(Rgb(9, 9, 9)),
+            )
+            .unwrap();
+        assert!(a.resolve("kbd", t0).unwrap().iter().all(|c| *c == Some(Rgb(9, 9, 9))));
+
+        // Session releases: the animation is simply THERE again.
+        a.release(sess);
+        let f3 = a.resolve("kbd", t0).unwrap();
+        assert!(f3[0].is_some());
+        assert_ne!(f3.first(), Some(&Some(Rgb(9, 9, 9))));
+    }
+
+    #[test]
+    fn partially_transparent_session_composes_with_live_base() {
+        let mut a = Arbiter::new();
+        let t0 = Instant::now();
+        a.declare_surface("kbd", 2);
+        a.claim("kbd", SourceId(1), band::BASE, Lease::Pinned, Content::Live(Box::new(Blink(0))))
+            .unwrap();
+        // Session paints ONLY led 0; led 1 shows the live base through.
+        a.claim(
+            "kbd",
+            SourceId(2),
+            band::SESSION,
+            Lease::Pinned,
+            Content::Cells(vec![Some(Rgb(9, 9, 9)), None]),
+        )
+        .unwrap();
+        let f = a.resolve("kbd", t0).unwrap();
+        assert_eq!(f[0], Some(Rgb(9, 9, 9)));
+        assert!(f[1].is_some() && f[1] != Some(Rgb(9, 9, 9)), "hole shows the animated base");
     }
 }
 
@@ -239,6 +350,18 @@ impl Arbiter {
         out
     }
 
+    /// The alive claims on a surface, topmost first: `(owner, priority)`.
+    /// This is the GUI's "who is controlling this board right now" truth —
+    /// lease-filtered at `now`, no rendering, no side effects.
+    pub fn claims(&self, surface: &str, now: Instant) -> Vec<(SourceId, i32)> {
+        let Some(s) = self.surfaces.get(surface) else {
+            return Vec::new();
+        };
+        let mut alive: Vec<&Layer> = s.layers.iter().filter(|l| l.lease.alive(now)).collect();
+        alive.sort_by_key(|l| std::cmp::Reverse((l.priority, l.seq)));
+        alive.into_iter().map(|l| (l.owner, l.priority)).collect()
+    }
+
     /// Prune expired leases and report them. Callable at any cadence — resolve
     /// already ignores expired layers, so sweep frequency affects only how soon
     /// the lapse is *reported*, never what gets painted.
@@ -263,20 +386,46 @@ impl Arbiter {
     }
 
     /// The heart: per-LED, the highest-(priority, seq) *alive* layer with an
-    /// opaque cell wins. Pure function of (layers, now) — same inputs, same
-    /// frame, every time. `None` cells in the result mean nothing claims that
-    /// LED at all; the writer decides the fallback (base black, or leave the
-    /// firmware's latched state alone — the onboard-first answer).
-    pub fn resolve(&self, surface: &str, now: Instant) -> Option<Vec<Option<Rgb>>> {
-        let s = self.surfaces.get(surface)?;
-        let mut order: Vec<&Layer> = s.layers.iter().filter(|l| l.lease.alive(now)).collect();
-        order.sort_by_key(|l| std::cmp::Reverse((l.priority, l.seq)));
-        let mut frame = vec![None; s.leds];
-        for (i, cell) in frame.iter_mut().enumerate() {
-            for l in &order {
-                if let Some(c) = l.content.at(i) {
-                    *cell = Some(c);
-                    break;
+    /// opaque cell wins. Deterministic in (layers, now) — same inputs, same
+    /// frame (Live layers render once per resolve at the given `now`).
+    /// `None` cells in the result mean nothing claims that LED at all; the
+    /// writer decides the fallback (an all-None frame skips the device write
+    /// entirely — the firmware's latched state IS the onboard-first answer).
+    /// `&mut` because Live content renders with internal caches; the kernel
+    /// is single-owner (actor), so this costs nothing.
+    pub fn resolve(&mut self, surface: &str, now: Instant) -> Option<Vec<Option<Rgb>>> {
+        let s = self.surfaces.get_mut(surface)?;
+        let mut order: Vec<usize> = (0..s.layers.len())
+            .filter(|&i| s.layers[i].lease.alive(now))
+            .collect();
+        order.sort_by_key(|&i| std::cmp::Reverse((s.layers[i].priority, s.layers[i].seq)));
+        let mut frame: Vec<Option<Rgb>> = vec![None; s.leds];
+        // Walk topmost-first, filling only still-unclaimed cells; each Live
+        // layer renders exactly once per resolve regardless of LED count.
+        for idx in order {
+            if frame.iter().all(|c| c.is_some()) {
+                break; // fully claimed — lower layers can't contribute
+            }
+            let rendered; // keeps a Live render alive for the cell loop below
+            let cells: &[Option<Rgb>] = match &mut s.layers[idx].content {
+                Content::Fill(c) => {
+                    let c = *c;
+                    for cell in frame.iter_mut().filter(|cell| cell.is_none()) {
+                        *cell = Some(c);
+                    }
+                    continue;
+                }
+                Content::Cells(v) => v,
+                Content::Live(l) => {
+                    rendered = l.render(now);
+                    &rendered
+                }
+            };
+            for (i, cell) in frame.iter_mut().enumerate() {
+                if cell.is_none() {
+                    if let Some(c) = cells.get(i).copied().flatten() {
+                        *cell = Some(c);
+                    }
                 }
             }
         }

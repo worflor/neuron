@@ -1043,7 +1043,8 @@ fn kind_anchor(k: Kind) -> i32 {
     match k {
         Kind::Profile => 0,
         Kind::Brightness | Kind::Scroll => 1,
-        Kind::Dpi | Kind::Macro => 2,
+        // sniper shares DPI's pitch home — same aim family, and the card title tells them apart
+        Kind::Dpi | Kind::Sniper | Kind::Macro => 2,
         Kind::Polling => 3,
         Kind::Layer => 4,
         Kind::Battery => 4,
@@ -1116,6 +1117,9 @@ fn kind_glyph(k: Kind) -> crate::overlay::WedgeGlyph {
     use crate::overlay::WedgeGlyph as G;
     match k {
         Kind::Dpi => G::Target,
+        // the same reticle family as DPI on purpose — it IS a precision-aim event; the card's
+        // "Sniper on/off" title carries the distinction, the glyph carries the domain.
+        Kind::Sniper => G::Target,
         Kind::Scroll => G::Scroll,
         Kind::Polling => G::Pulse,
         Kind::Brightness => G::Sun,
@@ -1170,6 +1174,7 @@ fn emit_sample(kind: Kind) {
     const TEST_PID: u16 = 0xFFFF;
     match kind {
         Kind::Dpi => confirm::dpi(TEST_PID, 1600, Some(800)),
+        Kind::Sniper => confirm::sniper(TEST_PID, 400, Some(1600), true),
         Kind::Scroll => confirm::scroll(TEST_PID, 3, 5, Some(2)),
         Kind::Polling => confirm::polling(1000, Some(500)),
         Kind::Brightness => confirm::brightness(70, Some(40)),

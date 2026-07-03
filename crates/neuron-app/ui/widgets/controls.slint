@@ -460,6 +460,9 @@ export component Field inherits Rectangle {
     in-out property <string> text;
     in property <length> field-width: 160px;
     in property <bool> invalid: false;
+    // mask the input (a password field) — dots, never the plaintext. Default off, so every
+    // existing Field is byte-identical.
+    in property <bool> secret: false;
     // expose focus so a caller can react WHILE you type (e.g. live-preview a hex as it's entered)
     out property <bool> has-focus: ti.has-focus;
     callback accepted(string);
@@ -498,6 +501,7 @@ export component Field inherits Rectangle {
             font-family: Theme.mono;
             vertical-alignment: center;
             single-line: true;
+            input-type: root.secret ? InputType.password : InputType.text;
             accepted => { root.accepted(self.text); }
             edited => { root.edited(self.text); }
         }
@@ -1183,10 +1187,11 @@ export component InputHead inherits HorizontalLayout {
     }
 }
 
-// THE GUIDE CHIP — opens an in-app GUIDE popup anchored at itself. A single mono "?" in a tight,
-// hairline-framed cell, using the SAME chip language as Pill / Contact (radius-sm, accent-glow fill +
-// accent-line border when lit) so it reads as a real instrument control, not a bubbly help bauble.
-// Quiet at rest (faint frame, dim "?"), accent on hover OR while ITS guide is the one on screen. Drop
+// THE GUIDE CHIP — opens an in-app GUIDE popup anchored at itself. A tiny hand-drawn BOOK with a "?"
+// resting on its cover, in a tight, hairline-framed cell, using the SAME chip language as Pill / Contact
+// (radius-sm, accent-glow fill + accent-line border when lit) so it reads as a real instrument control,
+// not a bubbly help bauble. Quiet at rest (faint frame, dim glyph), accent on hover OR while ITS guide
+// is the one on screen. Drop
 // one beside any header with a `guide-id` and the popup (app.slint) renders that guide off GuideContent
 // (guides.slint) — adding help is data, never new chrome. It anchors the popup at its own bottom-left.
 export component GuideButton inherits Rectangle {
@@ -1200,11 +1205,25 @@ export component GuideButton inherits Rectangle {
     background: root.lit ? Theme.accent-glow : transparent;
     border-color: root.lit ? Theme.accent-line : Theme.line;
     animate background, border-color { duration: Theme.quick; }
+    // the book — cover + spine, hand-authored as SVG path commands (straight lines only, like the copy
+    // glyph) so it tints with `lit` and stays crisp at 18px. Centred in the chip with a little air.
+    Path {
+        width: 100%;
+        height: 100%;
+        viewbox-width: 24;
+        viewbox-height: 24;
+        fill: transparent;
+        stroke: root.lit ? Theme.accent : Theme.text-dim;
+        stroke-width: 1.1px;
+        commands: "M6 4 H18 V20 H6 Z M9 4 V20";
+        animate stroke { duration: Theme.quick; }
+    }
+    // the "?" resting on the cover (right of the spine) — a crisp font glyph, small so it fits the leaf
     Text {
         text: "?";
         color: root.lit ? Theme.accent : Theme.text-dim;
         font-family: Theme.mono;
-        font-size: Theme.fs-data;
+        font-size: Theme.fs-small;
         font-weight: 700;
         width: 100%;
         height: 100%;

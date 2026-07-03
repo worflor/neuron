@@ -1239,6 +1239,13 @@ mod imp {
             let mut flare_ring = 0f32; // expanding-ring progress 0..1 (>0 while animating)
             let mut charge = 0f32; // anchor charge-up 0..1
             let mut frame: u32 = 0;
+            // How many frame-units the counter advances per loop iteration. The loop renders at
+            // 16ms active but 33ms while an idle beacon breathes (see the FRAME CAP below) — and
+            // every breathe/pulse/twinkle in this file is tuned as `frame * k` AT 60FPS. Stepping
+            // by 2 on the idle cadence keeps the counter advancing at WALL rate, so an idle ask
+            // wheel breathes at its designed speed instead of half of it (and the `frame % 6` /
+            // `frame >> 3` periodic passes keep their wall-clock periods too).
+            let mut frame_step: u32 = 1;
             // the window's top-left on screen — cursor-anchored but CLAMPED to the cursor's
             // monitor (a weave near a screen edge must stay fully on-glass, never half-off).
             let mut origin = POINT { x: 0, y: 0 };
@@ -1658,7 +1665,7 @@ mod imp {
                 }
 
                 if visible {
-                    frame = frame.wrapping_add(1);
+                    frame = frame.wrapping_add(frame_step); // wall-rate: 1 at 16ms, 2 at 33ms
                     // the stage clock: survives re-begins; a stillpoint dilates it (visuals
                     // breathe slower while the rhythm itself stays true).
                     if let WeaveMode::Twin { dilate, .. } = &mode {
@@ -2664,7 +2671,7 @@ mod imp {
                     // edges). Warn stays an urgent red body; prism channels remain explicit
                     // spectral accents; dusk darkens beneath. The user tint is an EDGE now,
                     // never a body — green is a theme, not a substance. ──
-                    // the LIVE material — themed from material.toml, with the user's weave accent (SYSTEM →
+                    // the LIVE material — the chosen preset surface with the user's weave accent (SYSTEM →
                     // APPEARANCE) folded into the fire-centre hue + rim. Fetched ONCE per frame here,
                     // never per-pixel, so a colour swap costs one struct copy and lands next frame.
                     let m = &crate::weave::live_material();
@@ -2878,6 +2885,9 @@ mod imp {
                 // lag, independent of any pass cost. Sleep only the REMAINDER of the target period:
                 // frames now land on the ≤60fps cadence and never wait longer than the render itself.
                 let target: u64 = if idle_beacon { 33 } else { 16 };
+                // the NEXT iteration's frame advance matches the cadence we're about to sleep to,
+                // so `frame` stays a wall-clock ruler at either rate (see frame_step's declaration).
+                frame_step = if idle_beacon { 2 } else { 1 };
                 let dur = frame_start.elapsed(); // render cost, excluding the cap sleep below
                 if slow_profile
                     && visible
@@ -3778,7 +3788,7 @@ mod imp {
         // 2) the sparkle waveform: points walked around the perimeter, each twinkling on its own
         //    hnoise but GATED by a sine that sweeps the rect — a wave of emergence, not static
         //    glitter. Hue is facet-quantized (cut-glass bands, the body's faceting), drifting slow.
-        let facets = crate::weave::material().facets.max(1) as f32;
+        let facets = crate::weave::live_material().facets.max(1) as f32;
         let (w, h) = ((x1 - x0).max(1.0), (y1 - y0).max(1.0));
         let perim = 2.0 * (w + h);
         let n = (perim / 22.0).clamp(8.0, 40.0) as i32; // density scales with cell size

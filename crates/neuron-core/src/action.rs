@@ -163,6 +163,14 @@ pub enum Action {
         #[serde(default)]
         mode: MomentaryMode,
     },
+    /// SNIPER — hold-to-precision DPI, for a HELD trigger: while held the mouse drops to `dpi`
+    /// (a VOLATILE write — never flashed onboard), on release it snaps back to whatever it was.
+    /// Edge-driven like [`Action::MomentaryMic`]: the resident dispatch loop owns the drop on DOWN
+    /// and the restore on UP (a one-shot trigger has nothing to release). Bind to a button/key hold.
+    Sniper {
+        #[serde(default)]
+        dpi: u16,
+    },
     /// OUTPUT FLIP — switch the default audio output device. `devices` (name substrings) is the
     /// set you cycle through (remembered by name, so a disconnected one is simply skipped);
     /// empty = cycle every connected render endpoint. Headset ⇄ speakers in one press.
@@ -204,6 +212,54 @@ pub enum Action {
     /// SLEEP / suspend the machine — `SetSuspendState` (S3 standby). Arm-gated so tests never suspend
     /// the dev's box. Pure host action.
     Sleep,
+    /// OBS — drive OBS Studio as a first-class bindable action (stream / record / record-pause /
+    /// replay-buffer / scene switch / input mute). Routed through the SAME [`crate::obs_hook`]
+    /// seam a macro's `obs_*` verb takes, so bound keys, radial wedges, gestures, sequences, and
+    /// macros are one OBS surface — and it reports "OBS not connected" honestly when the
+    /// CONNECTIONS host (or its obs gate) is off, never a silent no-op. Fire-and-forget into the
+    /// connection's command queue: never blocks the dispatch tick. Arm-gated: accidentally going
+    /// LIVE during a verify pass is the one broadcast mistake that can't be taken back.
+    Obs {
+        #[serde(default)]
+        op: ObsOp,
+        /// The op's argument where one applies: the scene name for `scene`; the OBS input name
+        /// for `mute` (blank = "Mic/Aux"); "start"/"stop" to make stream / record / replay
+        /// one-directional (blank = toggle, or save for replay).
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        arg: String,
+    },
+}
+
+/// What an [`Action::Obs`] does. Each maps to an `obs_*` act verb (see `obs_control`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ObsOp {
+    /// start / stop / toggle the stream (`arg` picks; blank = toggle)
+    #[default]
+    Stream,
+    /// start / stop / toggle recording
+    Record,
+    /// pause ⇄ resume the running recording (one toggle press)
+    RecordPause,
+    /// the replay buffer: blank = SAVE the clip ("clip that!"); `arg` "start"/"stop" runs the buffer
+    Replay,
+    /// switch the program scene to `arg`
+    Scene,
+    /// toggle mute on the OBS input named in `arg` (blank = "Mic/Aux")
+    Mute,
+}
+
+impl ObsOp {
+    pub fn label(self) -> &'static str {
+        match self {
+            ObsOp::Stream => "stream",
+            ObsOp::Record => "record",
+            ObsOp::RecordPause => "record pause",
+            ObsOp::Replay => "replay",
+            ObsOp::Scene => "scene",
+            ObsOp::Mute => "mute",
+        }
+    }
 }
 
 /// What an [`Action::Dial`] turns. Each maps to a live get/set the slide drives continuously.
@@ -701,6 +757,7 @@ impl Action {
             }
             Action::GhostPaste { speed } => format!("ghost-paste ({})", speed.label()),
             Action::MomentaryMic { mode, .. } => format!("momentary mic ({})", mode.label()),
+            Action::Sniper { dpi } => format!("sniper (hold \u{2192} {dpi} DPI)"),
             Action::OutputFlip { devices } => {
                 if devices.is_empty() {
                     "output flip".into()
@@ -721,6 +778,16 @@ impl Action {
             Action::Curtain => "curtain".into(),
             Action::Lock => "lock".into(),
             Action::Sleep => "sleep".into(),
+            Action::Obs { op, arg } => {
+                let a = arg.trim();
+                match (op, a.is_empty()) {
+                    (ObsOp::Scene, _) => format!("obs scene \u{2192} {a}"),
+                    (ObsOp::Mute, true) => "obs mute [Mic/Aux]".into(),
+                    (ObsOp::Mute, false) => format!("obs mute [{a}]"),
+                    (_, true) => format!("obs {}", op.label()),
+                    (_, false) => format!("obs {} {a}", op.label()),
+                }
+            }
         }
     }
 
@@ -856,6 +923,9 @@ impl Action {
             Action::MomentaryMic { mode, .. } => {
                 format!("momentary mic ({}) \u{2014} hold to use", mode.label())
             }
+            // SNIPER is edge-driven (the dispatch loop owns the DPI drop on DOWN, the restore on
+            // UP of a HELD trigger). A one-shot fire has no release to honour, so run_ctx only reports.
+            Action::Sniper { dpi } => format!("sniper ({dpi} DPI) \u{2014} hold to use"),
             // OUTPUT FLIP: set the default render endpoint to the next in the set (host-side,
             // reversible — an OS setting like the mute toggles, not a device write).
             Action::OutputFlip { devices } => out_flip(devices),
@@ -871,7 +941,43 @@ impl Action {
             // test/verify pass can never lock or suspend the developer's machine.
             Action::Lock => lock_workstation(),
             Action::Sleep => sleep_system(),
+            // OBS — through the obs_hook seam, the exact path a macro's obs_* verb takes, so both
+            // tiers are one surface (and one honest failure mode when the host is off).
+            Action::Obs { op, arg } => obs_control(*op, arg),
         }
+    }
+}
+
+/// Fire an OBS control through the [`crate::obs_hook`] seam. Arm-gated like the power verbs —
+/// starting a public stream (or killing one) is exactly the class of side effect SAFE mode
+/// exists for — and honest when nothing is connected: `None` (sink absent, OBS gate off) OR a
+/// `false` from the sink (gate on but the websocket isn't authenticated — closed/reconnecting,
+/// so the command was never sent) both surface "tell the user where the switch is", never a
+/// silent success.
+fn obs_control(op: ObsOp, arg: &str) -> String {
+    if !input_armed() {
+        return format!("obs {} [disarmed]", op.label());
+    }
+    let a = arg.trim();
+    let or = |dflt: &'static str| -> serde_json::Value {
+        if a.is_empty() { dflt.into() } else { a.into() }
+    };
+    let (verb, value): (&str, serde_json::Value) = match op {
+        ObsOp::Stream => ("obs_stream", or("toggle")),
+        ObsOp::Record => ("obs_record", or("toggle")),
+        ObsOp::RecordPause => ("obs_record", "pause".into()),
+        ObsOp::Replay => ("obs_replay", or("save")),
+        ObsOp::Scene => {
+            if a.is_empty() {
+                return "obs scene: name the scene to switch to".into();
+            }
+            ("obs_scene", a.into())
+        }
+        ObsOp::Mute => ("obs_mute", or("Mic/Aux")),
+    };
+    match crate::obs_hook::dispatch(verb, &value) {
+        Some((_, msg)) => msg,
+        None => "OBS not connected (open SYSTEM \u{2192} CONNECTIONS)".into(),
     }
 }
 

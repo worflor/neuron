@@ -103,6 +103,22 @@ pub fn last_action_desc() -> Option<String> {
 /// radial to its HyperShift set; an atomic so it crosses to the overlay loop without a lock.
 static HYPERSHIFT_HELD: AtomicBool = AtomicBool::new(false);
 
+/// Live mirrors of the two hold edges the lighting engine's `modeheld` DATA layer renders: is ANY
+/// hold layer engaged, is a sniper hold live. Written where each edge actually happens (the status
+/// tick / the sniper press+release), then pushed together via [`push_hold_state`] — and pushed as
+/// the default when the live loop stops, so a painted mode light can never outlive the mode.
+static LAYER_HELD: AtomicBool = AtomicBool::new(false);
+static SNIPER_HELD: AtomicBool = AtomicBool::new(false);
+
+/// Push the current hold state into the lighting engine's feed (one lock + copy; cheap enough for
+/// the status tick).
+fn push_hold_state() {
+    neuron::lighting::publish_hold(neuron::lighting::HoldState {
+        layer: LAYER_HELD.load(Ordering::Relaxed),
+        sniper: SNIPER_HELD.load(Ordering::Relaxed),
+    });
+}
+
 /// Flip the software HyperShift latch, returning the NEW state. The SHIFT pill lights from the
 /// engine's real held-layers via the status post — one source of truth, no UI-side write.
 pub fn toggle_hypershift_latch() -> bool {
@@ -320,8 +336,10 @@ fn run_worker(weak: slint::Weak<AppWindow>, stop: Arc<AtomicBool>, live_rx: Rece
                 false,
                 |ev| {
                     // While a press-to-bind capture is in flight, the user is pressing a control to BIND it,
-                    // not to use it — keep the edge tracker in sync but fire NOTHING, so the captured key
-                    // doesn't also run whatever it's currently bound to.
+                    // not to use it — track edges but fire NOTHING, so the captured key doesn't also run
+                    // whatever it's currently bound to. (During a CONTROL capture we mostly see nothing at
+                    // all: the capture's own transient listener steals the process's Raw-Input registration
+                    // until it ends — the resident pump re-arms itself right after; see controls REARM.)
                     let capturing = crate::capture::CAPTURE_ACTIVE.load(Ordering::Relaxed);
                     for edge in edges.borrow_mut().edges(ev) {
                         if capturing {
@@ -549,6 +567,10 @@ fn run_worker(weak: slint::Weak<AppWindow>, stop: Arc<AtomicBool>, live_rx: Rece
     momentary_release_all(&momentary);
     key_remap_release_all(&held_keys);
     sniper_release_all(&devices, &sniper);
+    // the hold feed goes default with the loop — a painted mode light never outlives the mode.
+    LAYER_HELD.store(false, Ordering::Relaxed);
+    SNIPER_HELD.store(false, Ordering::Relaxed);
+    push_hold_state();
     drop(hook);
 }
 
@@ -606,7 +628,9 @@ fn momentary_release_all(held: &MomentaryMap) {
 }
 
 // ── SNIPER: the held hold-to-precision-DPI edge handling (mirrors the momentary mic) ───────────
-type SniperMap = std::cell::RefCell<std::collections::HashMap<Trigger, u16>>;
+/// trigger → (the DPI to RESTORE on release, the device pid it was written to — the pid keys the
+/// confirmation + its echo-absorbing baseline, see `neuron::confirm::sniper`).
+type SniperMap = std::cell::RefCell<std::collections::HashMap<Trigger, (u16, u16)>>;
 
 /// A trigger's DOWN edge: if it binds a [`neuron::action::Action::Sniper`], snapshot the LIVE DPI,
 /// drop to the precision DPI (VOLATILE — never flashed onboard, so it reverts on its own), and
@@ -625,13 +649,27 @@ fn sniper_press(
     let Some(dpi) = rt.borrow().sniper_dpi_for(trigger) else {
         return;
     };
+    // Park the host lighting writers before touching the wire: the DPI
+    // snapshot is an ACK'd READ, and a streaming lighting frame clobbers its
+    // pending reply — the race that made a bound sniper silently no-op from
+    // the day the host started streaming the base layer. Worst case is one
+    // parked frame (~35ms) added to the press edge; a sniper that fires
+    // late-but-always beats one that never does.
+    let _gates = crate::host::io_gate_all();
     let base = devices.borrow_mut().with_writable("set_dpi", |d| {
         let (base_x, _) = neuron::capability::dpi(d)?;
         neuron::capability::set_dpi(d, dpi, dpi, neuron::capability::Store::Volatile)?;
-        Ok(base_x)
+        Ok((base_x, d.pid))
     });
-    if let Ok(base_x) = base {
-        held.borrow_mut().insert(trigger.clone(), base_x);
+    if let Ok((base_x, pid)) = base {
+        held.borrow_mut().insert(trigger.clone(), (base_x, pid));
+        // its OWN confirmation kind (gated separately from plain DPI, default off) — and the
+        // constructor updates the pid's DPI baseline either way, so the mouse's echo of this
+        // write is absorbed instead of carding as a spurious "DPI changed" mid-game.
+        neuron::confirm::sniper(pid, dpi as u32, Some(base_x as u32), true);
+        // the mode-light edge: a sniper hold is now live.
+        SNIPER_HELD.store(true, Ordering::Relaxed);
+        push_hold_state();
     }
 }
 
@@ -642,10 +680,21 @@ fn sniper_release(
     held: &SniperMap,
     trigger: &Trigger,
 ) {
-    if let Some(base) = held.borrow_mut().remove(trigger) {
-        let _ = devices.borrow_mut().with_writable("set_dpi", |d| {
+    // remove OUTSIDE the if-let so the RefMut temporary is dropped before the emptiness re-read
+    // below (an if-let scrutinee's temporary lives for the whole block).
+    let removed = held.borrow_mut().remove(trigger);
+    if let Some((base, pid)) = removed {
+        // same wire discipline as the press: the restore is read-back verified
+        let _gates = crate::host::io_gate_all();
+        let ok = devices.borrow_mut().with_writable("set_dpi", |d| {
             neuron::capability::set_dpi(d, base, base, neuron::capability::Store::Volatile)
         });
+        if ok.is_ok() {
+            neuron::confirm::sniper(pid, base as u32, None, false);
+        }
+        // the mode-light edge: only dark when NO sniper hold remains (two thumbs, one truth).
+        SNIPER_HELD.store(!held.borrow().is_empty(), Ordering::Relaxed);
+        push_hold_state();
     }
 }
 
@@ -656,11 +705,21 @@ fn sniper_release_all(
     devices: &std::cell::RefCell<neuron::device::DeviceSession<'_>>,
     held: &SniperMap,
 ) {
-    let bases: Vec<u16> = held.borrow_mut().drain().map(|(_, base)| base).collect();
-    for base in bases {
-        let _ = devices.borrow_mut().with_writable("set_dpi", |d| {
+    let bases: Vec<(u16, u16)> = held.borrow_mut().drain().map(|(_, held)| held).collect();
+    // the map is drained either way — the mode light must read dark from here on.
+    SNIPER_HELD.store(false, Ordering::Relaxed);
+    push_hold_state();
+    if bases.is_empty() {
+        return;
+    }
+    let _gates = crate::host::io_gate_all(); // park the lighting writers for the restore batch
+    for (base, pid) in bases {
+        let ok = devices.borrow_mut().with_writable("set_dpi", |d| {
             neuron::capability::set_dpi(d, base, base, neuron::capability::Store::Volatile)
         });
+        if ok.is_ok() {
+            neuron::confirm::sniper(pid, base as u32, None, false);
+        }
     }
 }
 
@@ -828,6 +887,9 @@ fn apply_profile_live(
     profile.persist = persist;
     // paint_lighting = false: the GUI streams the profile's lighting stack via its live compositor
     // (on_apply_profile), so painting it here too would fight that stream for the device and stall.
+    // Park every bridged host writer for the write batch — each setter is read-back verified, and
+    // a streaming lighting frame can clobber a verify reply (the same race that blanked readouts).
+    let _gates = crate::host::io_gate_all();
     let report = profile.apply_with_session(devices, false);
     neuron::profile::set_active(name);
     Ok(ProfileApplyResult {
@@ -855,6 +917,9 @@ fn publish_held(
         held.split('+').any(|l| l == "hypershift"),
         Ordering::Relaxed,
     );
+    // and "ANY layer held?" into the lighting engine's hold feed (the `modeheld` layer's truth).
+    LAYER_HELD.store(!held.is_empty(), Ordering::Relaxed);
+    push_hold_state();
     let changed = {
         let mut s = status.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if s.held_layers != held {

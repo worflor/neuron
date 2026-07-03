@@ -3361,6 +3361,7 @@ dependencies = [
  "global-hotkey",
  "image",
  "neuron",
+ "neuron-host",
  "serde",
  "serde_json",
  "slint",

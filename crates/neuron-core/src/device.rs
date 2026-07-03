@@ -297,3 +297,143 @@ impl<'a> DeviceSession<'a> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// LIVE stream-strategy probe — quantifies what one custom-frame report costs on the wire under
+    /// four different SET/GET disciplines, on the real BlackWidow. Run with the app STOPPED (two
+    /// writers on one control pipe corrupt both):
+    /// `cargo test -p neuron --lib device::tests::live_stream_strategy_probe -- --ignored --nocapture`
+    ///
+    /// Background: the stream path (`send_lighting_fast`) does SetFeature + an IMMEDIATE GetFeature
+    /// drain (wired `stream_wait_us` = 0). Razer firmware needs ~600-900µs to process a command
+    /// before it can answer; a too-early GetFeature can stall the control pipe for milliseconds.
+    /// A frame on this board = 7 reports, so per-report waste × 14 transfers decides the real fps
+    /// ceiling — Synapse animates this same board far faster than the ~6fps we HISTORICALLY
+    /// believed was the hardware limit (this probe falsified that: 30fps sustained clean under
+    /// every strategy; the 6 came from the ACK'd path's 10ms poll). Each strategy streams a visible column
+    /// chase at a 30fps target and reports achieved fps + per-call latency; watch the board for
+    /// freezes/stutter, and the ACK'd round-trip after each strategy verifies the device survived.
+    #[test]
+    #[ignore = "live HID probe — BlackWidow attached, neuron-app stopped; run with --nocapture"]
+    fn live_stream_strategy_probe() {
+        use std::time::Instant;
+        let reg = crate::registry::Registry::load().expect("registry loads");
+        let Some(def) = reg.find_by_pid(0x1532, 0x0221) else {
+            eprintln!("skip: no BlackWidow def in the registry");
+            return;
+        };
+        let Ok(dev) = Device::open(def.clone(), 0x0221) else {
+            eprintln!("skip: BlackWidow not connected");
+            return;
+        };
+        let ldef = def.lighting.clone().expect("keyboard def has lighting");
+        let (rows, cols) = (ldef.rows as usize, ldef.cols as usize);
+        let display = ldef.custom_display_report();
+
+        // serialize a lighting Report to the raw 90-byte buffer exactly like send_lighting_fast
+        let raw = |rep: &crate::lighting::Report| -> Vec<u8> {
+            let size = rep.size.unwrap_or_else(|| rep.args.len().min(80) as u8);
+            let tx = rep.tx.unwrap_or(dev.def.transaction_id);
+            let mut req = Report::command(tx, rep.class, rep.id, size);
+            for (i, b) in rep.args.iter().enumerate() {
+                if i < req.args.len() {
+                    req.args[i] = *b;
+                }
+            }
+            req.to_buf().to_vec()
+        };
+
+        // a bright column chase — dropped or frozen frames read as visible stutter on the board
+        let frame_at = |k: usize| -> Vec<crate::lighting::Rgb> {
+            (0..rows * cols)
+                .map(|i| {
+                    if i % cols == k % cols {
+                        crate::lighting::Rgb::new(0, 255, 140)
+                    } else {
+                        crate::lighting::Rgb::new(6, 0, 24)
+                    }
+                })
+                .collect()
+        };
+
+        const FRAMES: usize = 90; // 3s at the 30fps target
+        let budget = Duration::from_millis(33);
+        let ms = |ns: u128| ns as f64 / 1e6;
+        for (name, gap_us, drain) in [
+            ("A  set + get, no gap (CURRENT)", 0u64, true),
+            ("B  set + 800us gap + get      ", 800, true),
+            ("C  set + 900us gap, NO get    ", 900, false),
+            ("D  set only, no gap, no get   ", 0, false),
+        ] {
+            let (mut set_ns, mut get_ns) = (Vec::new(), Vec::new());
+            let (mut set_fail, mut get_fail, mut overruns) = (0u32, 0u32, 0u32);
+            let t_run = Instant::now();
+            let mut next = Instant::now();
+            for k in 0..FRAMES {
+                let f0 = Instant::now();
+                let frame = frame_at(k);
+                let mut bufs: Vec<Vec<u8>> = (0..rows)
+                    .filter_map(|r| ldef.row_report(&frame, r))
+                    .map(|r| raw(&r))
+                    .collect();
+                bufs.push(raw(&display));
+                for buf in &bufs {
+                    let t = Instant::now();
+                    if dev.transport.set_feature(buf).is_err() {
+                        set_fail += 1;
+                    }
+                    set_ns.push(t.elapsed().as_nanos());
+                    if gap_us > 0 {
+                        std::thread::sleep(Duration::from_micros(gap_us));
+                    }
+                    if drain {
+                        let t = Instant::now();
+                        let mut b = [0u8; BUF_LEN];
+                        if dev.transport.get_feature(&mut b).is_err() {
+                            get_fail += 1;
+                        }
+                        get_ns.push(t.elapsed().as_nanos());
+                    }
+                }
+                if f0.elapsed() > budget {
+                    overruns += 1;
+                }
+                next += budget;
+                let now = Instant::now();
+                if next > now {
+                    std::thread::sleep(next - now);
+                } else {
+                    next = now; // overran — don't burst to catch up
+                }
+            }
+            let achieved = FRAMES as f64 / t_run.elapsed().as_secs_f64();
+            let stats = |v: &mut Vec<u128>| -> (f64, f64, f64) {
+                if v.is_empty() {
+                    return (0.0, 0.0, 0.0);
+                }
+                v.sort_unstable();
+                let avg = v.iter().sum::<u128>() as f64 / v.len() as f64 / 1e6;
+                (avg, ms(v[v.len() * 95 / 100]), ms(*v.last().unwrap()))
+            };
+            let (sa, sp, sm) = stats(&mut set_ns);
+            let (ga, gp, gm) = stats(&mut get_ns);
+            // aliveness: an ACK'd round-trip must still succeed (a wedged protocol would fail here)
+            let alive = dev
+                .exec_dynamic_tx(
+                    display.tx.unwrap_or(dev.def.transaction_id),
+                    display.class,
+                    display.id,
+                    display.size.unwrap_or(display.args.len() as u8),
+                    &display.args,
+                )
+                .is_ok();
+            println!(
+                "{name} | {achieved:5.1} fps (target 30) | set avg/p95/max {sa:.2}/{sp:.2}/{sm:.2} ms ({set_fail} fail) | get avg/p95/max {ga:.2}/{gp:.2}/{gm:.2} ms ({get_fail} fail) | overruns {overruns}/{FRAMES} | alive-after {alive}"
+            );
+            std::thread::sleep(Duration::from_millis(400));
+        }
+    }
+}

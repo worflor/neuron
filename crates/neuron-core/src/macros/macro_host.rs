@@ -954,6 +954,42 @@ fn run_act(verb: &str, arg: &Value) -> (bool, String) {
         };
     }
 
+    // ── SIGNAL: drive the lighting engine's macro channels (the `signal` DATA layer) ─────────────
+    // `signal(channel, value)` — channel 1-indexed, value clamped 0..=1 at the engine. Ungated like
+    // `store`: the value is process-state for the compositor (what a painted Signal layer renders);
+    // actual device writes stay behind the writes gate downstream, so SAFE mode still holds.
+    if verb == "signal" {
+        let ch = arg.get("ch").and_then(Value::as_u64);
+        let v = arg.get("value").and_then(Value::as_f64);
+        let (Some(ch), Some(v)) = (ch, v) else {
+            return (false, "signal(channel, value): channel 1-4, value 0..1".into());
+        };
+        if ch == 0 || ch as usize > crate::lighting::SIGNAL_CHANNELS {
+            return (
+                false,
+                format!("signal: channel must be 1-{}", crate::lighting::SIGNAL_CHANNELS),
+            );
+        }
+        crate::lighting::set_signal(ch as usize - 1, v as f32);
+        return (true, format!("signal {ch} -> {:.2}", v.clamp(0.0, 1.0)));
+    }
+
+    // ── OBS (obs-websocket, via the app-installed sink) ──────────────────────────────────────────
+    // Control lives in the app (it owns the protocol host); core routes the verb through the sink
+    // the app installs when CONNECTIONS + OBS are on. Unclaimed when off, so it fails honestly
+    // rather than pretending. WRITE: `obs_scene(name)` / `obs_stream(["toggle"|"start"|"stop"])` /
+    // `obs_record([..|"pause"])` / `obs_replay(["save"|"start"|"stop"])` /
+    // `obs_mute("Mic/Aux")` / `obs_request(type[, data])` (the whole
+    // obs-websocket API). SENSE: `obs_get("scene"|"streaming"|"recording"|"connected")` reads the
+    // app-side mirror of OBS's own events. And the flow runs BOTH ways: the app fires the
+    // `on_obs_scene` / `on_obs_stream` / `on_obs_record` hook macros when OBS itself changes.
+    if verb.starts_with("obs_") {
+        return match crate::obs_hook::dispatch(verb, arg) {
+            Some(r) => r,
+            None => (false, "OBS not connected (open SYSTEM → CONNECTIONS)".into()),
+        };
+    }
+
     // ── device + profile INTENTS (shared path — the same write a bound trigger uses) ─────────────
     let dir = if arg.as_str() == Some("down") || arg.as_i64() == Some(-1) {
         Direction::Down

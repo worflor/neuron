@@ -22,6 +22,12 @@ use std::sync::{Mutex, OnceLock};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Dpi,
+    /// The sniper HOLD engaged/released — technically a DPI write, deliberately NOT [`Kind::Dpi`]:
+    /// the notification model classifies by INTENT, not by which register moved. Turning a knob is
+    /// a settings change you asked to hear about; a held instrument doing its job mid-game is not
+    /// (the slowed crosshair already confirms it). Its own kind = its own gate, so "tell me about
+    /// DPI changes" and "don't ping me mid-clutch" stop being one switch.
+    Sniper,
     Scroll,
     Polling,
     Brightness,
@@ -38,8 +44,9 @@ impl Kind {
     /// Every kind, in declaration order — the canonical list to iterate (config gates, the test
     /// probe, …). Call sites derive from this instead of hardcoding a subset, so a new variant is
     /// picked up everywhere by adding one arm here (and to [`Kind::slug`]).
-    pub const ALL: [Kind; 9] = [
+    pub const ALL: [Kind; 10] = [
         Kind::Dpi,
+        Kind::Sniper,
         Kind::Scroll,
         Kind::Polling,
         Kind::Brightness,
@@ -53,6 +60,7 @@ impl Kind {
     pub fn slug(self) -> &'static str {
         match self {
             Kind::Dpi => "dpi",
+            Kind::Sniper => "sniper",
             Kind::Scroll => "scroll",
             Kind::Polling => "polling",
             Kind::Brightness => "brightness",
@@ -184,6 +192,28 @@ pub fn dpi(pid: u16, value: u32, prev: Option<u32>) {
         },
         title: "DPI".into(),
         ident: "dpi".into(),
+        prev: prev.map(|p| p.to_string()),
+    });
+}
+
+/// The sniper hold engaged (`engaged`, DPI dropped to `value`) or released (DPI restored to
+/// `value`) on device `pid`. ALWAYS updates the pid's DPI baseline — even when the Sniper kind is
+/// gated off downstream — so the device's own echo of the sniper write is absorbed by the ordinary
+/// observed-event dedup and can never misattribute as a plain [`Kind::Dpi`] card (the in-game
+/// "DPI changed!" spam this kind exists to kill). One `ident` for both edges: a hold is one card
+/// that moves, never an on-card stacked on an off-card.
+pub fn sniper(pid: u16, value: u32, prev: Option<u32>, engaged: bool) {
+    with_baseline(pid, |b| b.dpi = value);
+    emit(Confirmation {
+        kind: Kind::Sniper,
+        shape: Shape::Ranged {
+            value: value as f64,
+            min: 100.0,
+            max: 30_000.0,
+            unit: "DPI",
+        },
+        title: if engaged { "Sniper on" } else { "Sniper off" }.into(),
+        ident: "sniper".into(),
         prev: prev.map(|p| p.to_string()),
     });
 }

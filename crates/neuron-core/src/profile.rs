@@ -399,38 +399,54 @@ fn lit_devices(reg: &Registry) -> Vec<(DeviceDef, u16, transport::DevicePath)> {
     out
 }
 
-/// Open the device the caller SELECTED by pid (the GUI passes its `selected_pid` so capture reads the
-/// device the user picked on a multi-device rig). `pid == 0` means "no selection" → returns `None` so
-/// the caller falls back to a capability search; `None` too if that pid isn't a connected, recognized
-/// control device.
-fn open_selected_device(reg: &Registry, pid: u16) -> Option<Device> {
+/// Open the device the caller SELECTED (the GUI passes its `selected_pid` + `selected_unit` so
+/// capture reads the exact physical device the user picked on a multi-device rig — two identical
+/// devices share a pid, and only the unit (`transport::path_instance`) tells them apart). `pid ==
+/// 0` means "no selection" → returns `None` so the caller falls back to a capability search;
+/// `None` too if that pid isn't a connected, recognized control device.
+///
+/// Unit semantics mirror the GUI's `open_selected`: when the named unit is PRESENT, it is the
+/// only acceptable match — a twin must never answer for it. Only when the unit is entirely gone
+/// from the enumeration (unplugged/re-ported since the scan) does the match relax to pid-level,
+/// the same "selection follows reality" healing the app does.
+fn open_selected_device(reg: &Registry, pid: u16, unit: &str) -> Option<Device> {
     if pid == 0 {
         return None;
     }
-    for i in transport::enumerate().ok()? {
-        if i.pid == pid {
-            if let Some(def) = reg.find_by_pid(i.vid, i.pid) {
-                if def.matches_control(i.usage_page, i.usage, i.feature_len) {
-                    return Device::open_path(def.clone(), i.pid, &i.path).ok();
-                }
-            }
+    let infos = transport::enumerate().ok()?;
+    let matches = |i: &transport::HidDeviceInfo| {
+        i.pid == pid
+            && reg
+                .find_by_pid(i.vid, i.pid)
+                .is_some_and(|def| def.matches_control(i.usage_page, i.usage, i.feature_len))
+    };
+    if !unit.is_empty() {
+        if let Some(i) = infos.iter().find(|i| matches(i) && i.instance() == unit) {
+            let def = reg.find_by_pid(i.vid, i.pid)?.clone();
+            return Device::open_path(def, i.pid, &i.path).ok();
         }
+        // named unit not enumerated — heal to pid-level below.
     }
-    None
+    let i = infos.iter().find(|i| matches(i))?;
+    let def = reg.find_by_pid(i.vid, i.pid)?.clone();
+    Device::open_path(def, i.pid, &i.path).ok()
 }
 
 /// Capture the CURRENT connected-device state into a [`Profile`] — the shared read path both the CLI
 /// `profile save` and the GUI's "capture" button call, so a captured profile is byte-identical no
 /// matter which client took it. Reads only; each capability is best-effort (an absent/asleep device
 /// simply leaves that field `None`). `gaming` carries the host-side Key-Guard toggles (not a device
-/// read) and `persist` records the volatile-vs-onboard intent. `selected_pid` is the GUI's picked
-/// device (0 = no selection → capability-based first match, which is what the stateless CLI passes).
+/// read) and `persist` records the volatile-vs-onboard intent. `selected_pid` + `selected_unit`
+/// are the GUI's picked physical device (pid 0 / empty unit = no selection → capability-based
+/// first match, which is what the stateless CLI passes); the unit is what keeps capture on the
+/// exact board the UI is editing when two identical devices share a pid.
 pub fn capture_from_devices(
     reg: &Registry,
     name: &str,
     gaming: crate::writes::GamingMode,
     persist: bool,
     selected_pid: u16,
+    selected_unit: &str,
 ) -> Profile {
     let mut p = Profile {
         name: name.to_string(),
@@ -442,9 +458,10 @@ pub fn capture_from_devices(
         ..Default::default()
     };
     // Numeric settings come from the SELECTED device when the GUI picked one (so a multi-device rig
-    // captures the device the user is looking at, not whatever enumerates first); with no selection
-    // (the stateless CLI, pid 0) fall back to the first dpi-capable device.
-    let numeric = open_selected_device(reg, selected_pid)
+    // captures the device the user is looking at — down to the exact physical unit of a duplicate
+    // pair — not whatever enumerates first); with no selection (the stateless CLI, pid 0) fall back
+    // to the first dpi-capable device.
+    let numeric = open_selected_device(reg, selected_pid, selected_unit)
         .or_else(|| Device::open_with_command(reg, "dpi").ok());
     if let Some(d) = numeric {
         if let Ok((x, _)) = crate::capability::dpi(&d) {

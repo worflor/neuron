@@ -17,9 +17,14 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
 /// Everything that can fire an action. One enum so a single dispatcher serves every input
-/// source — there is no second code path for "a gesture" vs "a button" vs "a hotkey".
+/// source — there is no second code path for "a gesture" vs "a button" vs "a keypress".
 ///
 /// Serde round-trippable so a [`Rule`] (trigger + action) is a config row the GUI reads/writes.
+///
+/// There is deliberately NO hotkey/chord trigger kind. Exclusivity ("swallow the key from other
+/// apps") and modifier-chords are RULE-level properties, not different kinds of trigger: the LL
+/// gaming hook can swallow a key while still yielding its down/up edges, and the dispatch loop
+/// already tracks the live held-down set. So "the thing you pressed" stays one namespace (`Input`).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum Trigger {
@@ -32,9 +37,6 @@ pub enum Trigger {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pid: Option<u16>,
     },
-    /// A global keyboard hotkey — a virtual-key plus modifier flags (Ctrl/Alt/Shift/Win),
-    /// registered OS-wide. `mods` is a small bitset (bit0 Ctrl, bit1 Alt, bit2 Shift, bit3 Win).
-    Hotkey { vk: u16, mods: u8 },
     /// A recognized drawn glyph (spellweaving) — the name of a template in the gesture Vault.
     /// Struct variant (`{ kind = "gesture", name = "..." }`) because `Trigger` is internally
     /// tagged and serde can't serialize a tagged newtype wrapping a `String`.
@@ -72,7 +74,6 @@ impl Trigger {
                     _ => name,
                 }
             }
-            Trigger::Hotkey { vk, mods } => format!("hotkey vk=0x{vk:02X} mods=0b{mods:04b}"),
             Trigger::Gesture { name } => format!("gesture '{name}'"),
             Trigger::RadialSector { menu, sector } => format!("radial '{menu}' sector {sector}"),
             Trigger::AppFocus { app } => format!("app focus '{app}'"),
@@ -159,7 +160,7 @@ pub struct RuleDoc {
 /// tier of mappings that apply **while a hold key is down**. Neuron's cast hold-model is the same
 /// idea. Here it is first-class: a [`Trigger::Hold { layer }`] press makes the named layer
 /// *active*, and while active that layer's rules are dispatched ON TOP of the base. The same
-/// physical input (`Input`/`Hotkey`/…) can therefore mean one thing normally and another while a
+/// physical input (`Input`/…) can therefore mean one thing normally and another while a
 /// layer is held — the software-HyperShift the docs describe, with no firmware write.
 ///
 /// Layer activation is itself just a rule firing: bind a `Trigger::Hold { layer }` and the
@@ -441,10 +442,6 @@ mod tests {
                 page: 7,
                 usage: 4,
                 pid: None,
-            },
-            Trigger::Hotkey {
-                vk: 0x70,
-                mods: 0b0101,
             },
             Trigger::Gesture {
                 name: "circle_cw".into(),
@@ -919,7 +916,7 @@ mod tests {
                 },
                 Action::Noop,
             ),
-            Rule::new(Trigger::Hotkey { vk: 0x70, mods: 0 }, Action::Noop),
+            Rule::new(Trigger::MicTap, Action::Noop),
         ]);
         let ctx = Context::default();
         assert_eq!(
@@ -947,7 +944,7 @@ mod tests {
         );
         assert_eq!(
             engine
-                .dispatch(&Trigger::Hotkey { vk: 0x70, mods: 0 }, &ctx)
+                .dispatch(&Trigger::MicTap, &ctx)
                 .len(),
             1
         );

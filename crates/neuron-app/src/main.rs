@@ -26,6 +26,7 @@ mod flight;
 mod glance;
 mod glue;
 mod hidwatch;
+mod host;
 mod knockback;
 mod macrokeys;
 mod mic;
@@ -196,6 +197,40 @@ fn main() {
     }
     flight::trace("life", "app start", 0);
 
+    // ── POWER-THROTTLING OPT-OUT (Win11 background QoS) ───────────────────
+    // When a fullscreen game has focus, Windows puts unfocused processes on
+    // EcoQoS (efficiency cores, reduced speed) and — on Win11 — IGNORES their
+    // timer-resolution requests, coarsening every `thread::sleep` to ~15.6ms.
+    // This app IS a background process whose whole job is real-time while a
+    // game runs: input dispatch, macro fire, and the paced device-lighting
+    // writers all live on millisecond sleeps. Without this opt-out the host
+    // writer blows its 33ms frame deadlines mid-game and lighting visibly
+    // drops frames ("laggy in Overwatch, fine on the desktop" — diagnosed
+    // live). ControlMask names both policies, StateMask 0 DISABLES them:
+    // full-speed scheduling + honored timer resolution, game or no game. The
+    // deliberate trade is a slightly less-eco idle; a resident input daemon
+    // earns it.
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentProcess, SetProcessInformation, ProcessPowerThrottling,
+            PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+            PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE,
+        };
+        let state = PROCESS_POWER_THROTTLING_STATE {
+            Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+            ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+                | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+            StateMask: 0,
+        };
+        let _ = SetProcessInformation(
+            GetCurrentProcess(),
+            ProcessPowerThrottling,
+            &state as *const _ as *const core::ffi::c_void,
+            std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+        );
+    }
+
     // Establish the main thread's COM apartment as STA up front. winit (drag-and-drop / OLE)
     // requires STA; tray-icon and neuron-core's Core-Audio path both request MTA, and whichever
     // initializes COM first wins the apartment. Doing STA here means winit is satisfied, and the
@@ -222,6 +257,15 @@ fn main() {
     // back to software at WINDOW-creation time if GL init then fails — that's why renderer-software is
     // compiled in. This explicit selection additionally covers an event-loop/init failure at select.)
     select_renderer_backend();
+
+    // Bring up the PROTOCOL HOST (if the CONNECTIONS pref opts in — default OFF)
+    // before the window builds: `build_window` runs `restore_lighting`, and when
+    // the host is active that saved lighting must flow through the arbiter (as
+    // the animated base layer) rather than start an app-owned stream. This is
+    // also what serves Chroma (54235, games) + OpenRGB (6742, tools). The SYSTEM
+    // → CONNECTIONS card toggles it at runtime; `NEURON_HOST` env overrides for
+    // dev. Best-effort: if it can't come up, the app streams lighting itself.
+    host::start();
 
     // Build the window eagerly — WITHOUT showing it — so the LIVE dispatch loop has a stable
     // handle to post status into (the software renderer makes a hidden window's idle cost
@@ -503,6 +547,19 @@ fn main() {
                     if seen.elapsed() >= Duration::from_secs(1) {
                         *seen = Instant::now();
                         crate::glue::refresh_reliability(app);
+                        // HOST BASE RECOVERY: if the protocol-host kernel took a contained fault and
+                        // was reborn, every lease was swept — including the app's own animated base
+                        // layer (leases are never reborn). Re-claim any base whose kernel layer
+                        // vanished so local lighting resumes on its own instead of freezing at its
+                        // last latched frame. UNGATED by page: recovery can't wait for the user to
+                        // open SYSTEM. No-op when the host is off or every base is still alive.
+                        crate::host::heartbeat();
+                        // CONNECTIONS statuses live too: the OBS connect state flips async when OBS
+                        // answers, and a port can free up, so re-read the host's honest status while
+                        // SYSTEM is on screen. Only when the page is up (idle cost stays zero).
+                        if st.get_window_shown() && st.get_page() == 3 {
+                            crate::glue::refresh_host_status(app);
+                        }
                     }
                 }
                 // VITALS provider: while a `vitals` layer is live (previewing or streaming), feed the core
@@ -641,6 +698,12 @@ fn build_window(resident: &Rc<RefCell<Resident>>) {
     }
     let app = AppWindow::new().expect("failed to create window");
     let shared = glue::install(&app);
+
+    // DEV: `NEURON_START_PAGE=<n>` opens directly on that page (0 = bindings, 1 = lighting, …) —
+    // for verify-by-running sessions that need a specific page on screen without driving the nav.
+    if let Some(p) = std::env::var("NEURON_START_PAGE").ok().and_then(|v| v.parse::<i32>().ok()) {
+        app.global::<State>().set_page(p);
+    }
 
     // Closing the window hides it (the loop lives on, tray-resident). The handle + glue are
     // retained so runtime state (selected device, paused gate, parsed import) survives a

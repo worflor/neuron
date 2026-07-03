@@ -582,6 +582,310 @@ mod imp {
         }
     }
 
+    // ── WASAPI PCM capture (the spectrum analyser's input) ──────────────────────────────────
+    //
+    // `MeterCtl` reads ONE number (the OS peak) — enough for a VU bar, useless for a spectrum.
+    // `CaptureCtl` opens a real WASAPI shared-mode capture stream: LOOPBACK on the default render
+    // endpoint ("what my speakers are playing", exactly what Synapse's Audio Meter taps) or a plain
+    // capture stream on a mic endpoint. Same hand-rolled COM discipline as everything above.
+
+    const IID_IAUDIO_CLIENT: GUID = GUID::from_u128(0x1CB9AD4C_DBFA_4C32_B178_C2F568A703B2);
+    const IID_IAUDIO_CAPTURE_CLIENT: GUID = GUID::from_u128(0xC8ADBD64_E71E_48A0_A4DE_185C395CD317);
+
+    const AUDCLNT_SHAREMODE_SHARED: i32 = 0;
+    const AUDCLNT_STREAMFLAGS_LOOPBACK: u32 = 0x0002_0000;
+    /// `AUDCLNT_BUFFERFLAGS_SILENT` — the packet's data is to be TREATED as zeros.
+    const BUFFERFLAGS_SILENT: u32 = 0x2;
+    /// 200ms shared buffer — deep enough that a ~60Hz drain never overruns.
+    const CAPTURE_BUF_HNS: i64 = 2_000_000;
+
+    // IAudioClient — Initialize/GetMixFormat/Start/Stop/GetService; the rest are ABI placeholders.
+    #[repr(C)]
+    struct IAudioClientVtbl {
+        _qi: Ph,
+        _add_ref: Ph,
+        release: unsafe extern "system" fn(*mut c_void) -> u32,
+        initialize: unsafe extern "system" fn(
+            *mut c_void,
+            i32,        // share mode
+            u32,        // stream flags
+            i64,        // buffer duration (hns)
+            i64,        // periodicity (hns)
+            *const u8,  // WAVEFORMATEX*
+            *const GUID,
+        ) -> HRESULT,
+        _get_buffer_size: Ph,
+        _get_stream_latency: Ph,
+        _get_current_padding: Ph,
+        _is_format_supported: Ph,
+        get_mix_format: unsafe extern "system" fn(*mut c_void, *mut *mut u8) -> HRESULT,
+        _get_device_period: Ph,
+        start: unsafe extern "system" fn(*mut c_void) -> HRESULT,
+        stop: unsafe extern "system" fn(*mut c_void) -> HRESULT,
+        _reset: Ph,
+        _set_event_handle: Ph,
+        get_service:
+            unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT,
+    }
+
+    #[repr(C)]
+    struct IAudioCaptureClientVtbl {
+        _qi: Ph,
+        _add_ref: Ph,
+        release: unsafe extern "system" fn(*mut c_void) -> u32,
+        get_buffer: unsafe extern "system" fn(
+            *mut c_void,
+            *mut *mut u8, // data
+            *mut u32,     // frames read
+            *mut u32,     // flags
+            *mut u64,     // device position (unused)
+            *mut u64,     // QPC position (unused)
+        ) -> HRESULT,
+        release_buffer: unsafe extern "system" fn(*mut c_void, u32) -> HRESULT,
+        get_next_packet_size: unsafe extern "system" fn(*mut c_void, *mut u32) -> HRESULT,
+    }
+
+    /// WAVEFORMATEX header, byte-exact (`packed(2)` matches the Win32 layout; 18 bytes). Only ever
+    /// READ from the pointer `GetMixFormat` returns — never constructed or passed by value.
+    #[repr(C, packed(2))]
+    struct WaveFormatEx {
+        tag: u16,
+        channels: u16,
+        rate: u32,
+        _avg_bytes: u32,
+        _block_align: u16,
+        bits: u16,
+        cb_size: u16,
+    }
+
+    const WAVE_FORMAT_PCM: u16 = 1;
+    const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
+    const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
+
+    /// The two shared-mode sample layouts worth decoding (the mixer hands out float32 in practice;
+    /// int16 kept for completeness). Anything else fails the open honestly.
+    #[derive(Clone, Copy, PartialEq)]
+    enum SampleFmt {
+        F32,
+        I16,
+    }
+
+    /// Parse the (rate, channels, sample format) out of a `GetMixFormat` result. For an EXTENSIBLE
+    /// format the tag lives in `SubFormat.Data1` (byte offset 24: the 18-byte header + wValidBits u16
+    /// + dwChannelMask u32) — the standard KSDATAFORMAT subtypes share their GUID tail, so `Data1`
+    /// alone disambiguates float vs PCM.
+    unsafe fn parse_mix_format(p: *const u8) -> Option<(u32, u16, SampleFmt)> {
+        let f = &*(p as *const WaveFormatEx);
+        let (tag, bits, cb) = (f.tag, f.bits, f.cb_size);
+        let eff_tag = if tag == WAVE_FORMAT_EXTENSIBLE && cb >= 22 {
+            std::ptr::read_unaligned(p.add(24) as *const u32) as u16
+        } else {
+            tag
+        };
+        let fmt = match (eff_tag, bits) {
+            (WAVE_FORMAT_IEEE_FLOAT, 32) => SampleFmt::F32,
+            (WAVE_FORMAT_PCM, 16) => SampleFmt::I16,
+            _ => return None,
+        };
+        let (rate, channels) = (f.rate, f.channels);
+        (rate > 0 && channels > 0).then_some((rate, channels, fmt))
+    }
+
+    /// A live shared-mode PCM capture stream on one endpoint — loopback (the sound the speakers are
+    /// playing) or a mic. Drained by [`read_into`](Self::read_into) as mono f32; releases the COM
+    /// objects (stopping the stream) on drop. Created and used on ONE thread (the spectrum sampler),
+    /// like every other handle in this module.
+    pub struct CaptureCtl {
+        client: *mut c_void,
+        capture: *mut c_void,
+        rate: u32,
+        channels: u16,
+        fmt: SampleFmt,
+    }
+
+    impl CaptureCtl {
+        /// Open a LOOPBACK capture on the current default render endpoint — the analyser's
+        /// "speakers" source. `None` if anything in the chain fails to resolve.
+        pub fn open_loopback_default() -> Option<Self> {
+            com_init();
+            let en = create_enumerator();
+            if en.is_null() {
+                return None;
+            }
+            unsafe {
+                let evt = vtbl::<ImmDeviceEnumeratorVtbl>(en);
+                let mut dev: *mut c_void = std::ptr::null_mut();
+                // (Render = 0, eConsole = 0) — the output the user actually hears.
+                let hr = ((*evt).get_default)(en, 0, 0, &mut dev);
+                release(en);
+                if hr < 0 || dev.is_null() {
+                    return None;
+                }
+                let ctl = Self::from_device(dev, true);
+                release(dev);
+                ctl
+            }
+        }
+
+        /// Open a plain capture stream on an EXACT endpoint id (a mic) — the analyser's "mic" source.
+        pub fn open_capture(id: &str) -> Option<Self> {
+            com_init();
+            let en = create_enumerator();
+            if en.is_null() {
+                return None;
+            }
+            unsafe {
+                let evt = vtbl::<ImmDeviceEnumeratorVtbl>(en);
+                let wid = to_wide(id);
+                let mut dev: *mut c_void = std::ptr::null_mut();
+                let hr = ((*evt).get_device)(en, wid.as_ptr(), &mut dev);
+                release(en);
+                if hr < 0 || dev.is_null() {
+                    return None;
+                }
+                let ctl = Self::from_device(dev, false);
+                release(dev);
+                ctl
+            }
+        }
+
+        /// Activate + initialize + start the capture chain on an already-resolved device. Any failure
+        /// releases whatever was acquired and answers `None` — a half-open stream never escapes.
+        unsafe fn from_device(dev: *mut c_void, loopback: bool) -> Option<Self> {
+            let dvt = vtbl::<ImmDeviceVtbl>(dev);
+            let mut client: *mut c_void = std::ptr::null_mut();
+            if ((*dvt).activate)(dev, &IID_IAUDIO_CLIENT, CLSCTX_ALL, std::ptr::null_mut(), &mut client) < 0
+                || client.is_null()
+            {
+                return None;
+            }
+            let cvt = vtbl::<IAudioClientVtbl>(client);
+            let mut fmt_ptr: *mut u8 = std::ptr::null_mut();
+            if ((*cvt).get_mix_format)(client, &mut fmt_ptr) < 0 || fmt_ptr.is_null() {
+                release(client);
+                return None;
+            }
+            let parsed = parse_mix_format(fmt_ptr);
+            let flags = if loopback { AUDCLNT_STREAMFLAGS_LOOPBACK } else { 0 };
+            let hr_init = match parsed {
+                Some(_) => ((*cvt).initialize)(
+                    client,
+                    AUDCLNT_SHAREMODE_SHARED,
+                    flags,
+                    CAPTURE_BUF_HNS,
+                    0,
+                    fmt_ptr,
+                    std::ptr::null(),
+                ),
+                None => -1,
+            };
+            CoTaskMemFree(fmt_ptr as *const c_void);
+            let Some((rate, channels, fmt)) = parsed else {
+                release(client);
+                return None;
+            };
+            if hr_init < 0 {
+                release(client);
+                return None;
+            }
+            let mut capture: *mut c_void = std::ptr::null_mut();
+            if ((*cvt).get_service)(client, &IID_IAUDIO_CAPTURE_CLIENT, &mut capture) < 0
+                || capture.is_null()
+            {
+                release(client);
+                return None;
+            }
+            if ((*cvt).start)(client) < 0 {
+                release(capture);
+                release(client);
+                return None;
+            }
+            Some(CaptureCtl {
+                client,
+                capture,
+                rate,
+                channels,
+                fmt,
+            })
+        }
+
+        /// The stream's sample rate (Hz) — the mix rate the mono samples arrive at.
+        pub fn rate(&self) -> u32 {
+            self.rate
+        }
+
+        /// Drain every packet currently buffered, appending each frame DOWNMIXED to mono f32
+        /// (channel average, ±1.0 range) onto `out`. Returns the number of frames appended — `0` is
+        /// normal (loopback delivers nothing while no stream plays) — or `None` when the endpoint
+        /// died (invalidated/slept), so the caller drops this handle and re-opens, exactly like the
+        /// peak sampler's self-heal.
+        pub fn read_into(&self, out: &mut Vec<f32>) -> Option<usize> {
+            let ch = self.channels as usize;
+            let mut appended = 0usize;
+            unsafe {
+                let vt = vtbl::<IAudioCaptureClientVtbl>(self.capture);
+                loop {
+                    let mut next = 0u32;
+                    if ((*vt).get_next_packet_size)(self.capture, &mut next) < 0 {
+                        return None;
+                    }
+                    if next == 0 {
+                        return Some(appended);
+                    }
+                    let mut data: *mut u8 = std::ptr::null_mut();
+                    let mut frames = 0u32;
+                    let mut flags = 0u32;
+                    if ((*vt).get_buffer)(
+                        self.capture,
+                        &mut data,
+                        &mut frames,
+                        &mut flags,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                    ) < 0
+                    {
+                        return None;
+                    }
+                    let n = frames as usize;
+                    if flags & BUFFERFLAGS_SILENT != 0 || data.is_null() {
+                        out.extend(std::iter::repeat(0.0).take(n));
+                    } else {
+                        match self.fmt {
+                            SampleFmt::F32 => {
+                                let s = std::slice::from_raw_parts(data as *const f32, n * ch);
+                                for f in s.chunks_exact(ch) {
+                                    out.push(f.iter().sum::<f32>() / ch as f32);
+                                }
+                            }
+                            SampleFmt::I16 => {
+                                let s = std::slice::from_raw_parts(data as *const i16, n * ch);
+                                for f in s.chunks_exact(ch) {
+                                    let sum: f32 = f.iter().map(|&v| v as f32).sum();
+                                    out.push(sum / (ch as f32 * 32768.0));
+                                }
+                            }
+                        }
+                    }
+                    if ((*vt).release_buffer)(self.capture, frames) < 0 {
+                        return None;
+                    }
+                    appended += n;
+                }
+            }
+        }
+    }
+
+    impl Drop for CaptureCtl {
+        fn drop(&mut self) {
+            unsafe {
+                let cvt = vtbl::<IAudioClientVtbl>(self.client);
+                let _ = ((*cvt).stop)(self.client);
+                release(self.capture);
+                release(self.client);
+            }
+        }
+    }
+
     /// Find the first capture endpoint whose name contains `needle` (case-insensitive).
     /// This is how a binding resolves "my real mic" to a concrete endpoint id.
     pub fn find_capture(needle: &str) -> Option<Endpoint> {
@@ -840,6 +1144,27 @@ mod stub {
         }
         pub fn peak(&self) -> f32 {
             0.0
+        }
+    }
+
+    /// A live PCM capture stream (loopback / mic) — the spectrum analyser's input. Inert
+    /// off-Windows: it never opens, so the analyser reports "not live" and the meter falls back to
+    /// the (equally inert) peak provider — the board idles honestly dark.
+    pub struct CaptureCtl;
+
+    impl CaptureCtl {
+        pub fn open_loopback_default() -> Option<Self> {
+            None
+        }
+        pub fn open_capture(_id: &str) -> Option<Self> {
+            None
+        }
+        pub fn rate(&self) -> u32 {
+            0
+        }
+        /// Surface mirror of `imp` — unreachable (nothing ever opens), kept for the parity contract.
+        pub fn read_into(&self, _out: &mut Vec<f32>) -> Option<usize> {
+            None
         }
     }
 

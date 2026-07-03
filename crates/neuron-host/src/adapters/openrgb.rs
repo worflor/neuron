@@ -293,6 +293,17 @@ impl OrgbConn {
         out
     }
 
+    /// This connection's kernel-issued owner id — how the host's status readout
+    /// attributes arbiter claims to THIS client, exactly.
+    pub fn owner(&self) -> SourceId {
+        self.owner
+    }
+
+    /// The name the client announced via SET_CLIENT_NAME ("" until it does).
+    pub fn client_name(&self) -> &str {
+        &self.client_name
+    }
+
     /// The socket dropped. Releases this connection's entire paint footprint —
     /// the arbiter falls back to whatever is underneath. The pump MUST call
     /// this; it is the OpenRGB equivalent of the Chroma heartbeat lapse.
@@ -301,6 +312,51 @@ impl OrgbConn {
         self.shadows.clear();
         if !self.client_name.is_empty() {
             host.publish("host.openrgb.disconnected", Value::Text(self.client_name.clone()));
+        }
+    }
+
+    /// Re-establish this connection's paint after a kernel rebirth. A contained
+    /// kernel fault sweeps EVERY lease (leases are never reborn — sessions must
+    /// re-claim), but this TCP connection survives with its old owner id. An
+    /// active client recovers on its next `paint` (set-or-claim), but a SILENT
+    /// one — a config tool that set a colour once and idled — would stay
+    /// "connected but dark" indefinitely. The pump calls this each idle tick:
+    /// any shadowed layer whose lease has vanished (a PINNED OpenRGB claim only
+    /// disappears on a sweep, i.e. a rebirth) is re-claimed from its retained
+    /// cells, and the client label is re-applied (the reborn kernel's labels map
+    /// is empty). A no-op when nothing is painted or every layer is still alive.
+    pub fn reassert(&mut self, host: &mut dyn HostApi, now: Instant) {
+        if self.shadows.is_empty() {
+            return;
+        }
+        // Probe liveness; a false refresh on a Pinned lease means it was swept.
+        let mut dead: Vec<u32> = Vec::new();
+        for (dev_idx, shadow) in &self.shadows {
+            if !host.refresh(shadow.layer, now) {
+                dead.push(*dev_idx);
+            }
+        }
+        if dead.is_empty() {
+            return;
+        }
+        if !self.client_name.is_empty() {
+            host.label_source(self.owner, &self.client_name);
+        }
+        let infos = host.surfaces();
+        for dev_idx in dead {
+            // The dead layer id is gone; drop the stale shadow and re-claim fresh.
+            let cells = self.shadows.remove(&dev_idx).map(|s| s.cells).unwrap_or_default();
+            let Some(info) = infos.get(dev_idx as usize) else { continue };
+            if let Some(layer) = host.claim(
+                &info.key,
+                self.owner,
+                band::SESSION,
+                LeaseSpec::Pinned,
+                Content::Cells(cells.clone()),
+                now,
+            ) {
+                self.shadows.insert(dev_idx, Shadow { layer, cells });
+            }
         }
     }
 
@@ -344,6 +400,10 @@ impl OrgbConn {
             ids::SET_CLIENT_NAME => {
                 let end = payload.iter().position(|b| *b == 0).unwrap_or(payload.len());
                 self.client_name = String::from_utf8_lossy(&payload[..end]).into_owned();
+                if !self.client_name.is_empty() {
+                    // Name the source so the GUI's ownership truth carries it.
+                    host.label_source(self.owner, &self.client_name);
+                }
                 host.publish("host.openrgb.client", Value::Text(self.client_name.clone()));
                 // No reply, per the reference server.
             }
@@ -611,6 +671,39 @@ mod tests {
             frame.iter().all(|c| *c == Some(Rgb(0, 255, 0))),
             "base returns after disconnect — the whole thesis, at wire level"
         );
+    }
+
+    #[test]
+    fn reassert_recovers_a_silent_clients_paint_after_rebirth() {
+        // A client names itself, paints the whole board red, then goes SILENT —
+        // exactly the set-and-forget config tool the finding is about.
+        let mut k = kernel_with_kbd();
+        let mut c = OrgbConn::new(&mut k);
+        c.feed(&packet(0, ids::SET_CLIENT_NAME, b"hass"), &mut k, now());
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(&6u16.to_le_bytes());
+        for _ in 0..6 {
+            payload.extend_from_slice(&[255, 0, 0, 0]);
+        }
+        c.feed(&packet(0, ids::UPDATELEDS, &payload), &mut k, now());
+        assert_eq!(k.resolve("kbd", now()).unwrap()[0], Some(Rgb(255, 0, 0)));
+
+        // Kernel rebirth: a fresh kernel with the surface re-declared but every
+        // lease swept (leases are never reborn). The connection survives with its
+        // owner id — but a bare reborn kernel shows nothing until it re-claims.
+        let mut reborn = kernel_with_kbd();
+        assert_eq!(reborn.resolve("kbd", now()).unwrap()[0], None, "reborn kernel starts dark");
+
+        // The idle pump tick reasserts: a silent client's paint returns on its own,
+        // and its ownership label is restored on the reborn kernel.
+        c.reassert(&mut reborn, now());
+        let frame = reborn.resolve("kbd", now()).unwrap();
+        assert!(
+            frame.iter().all(|cell| *cell == Some(Rgb(255, 0, 0))),
+            "silent client's paint recovers after rebirth without fresh traffic"
+        );
+        assert_eq!(reborn.label_of(c.owner()), Some("hass"), "label restored too");
     }
 
     #[test]

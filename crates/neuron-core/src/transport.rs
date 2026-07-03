@@ -42,6 +42,16 @@ impl DevicePath {
         use std::os::windows::ffi::OsStrExt;
         self.0.encode_wide().chain(std::iter::once(0)).collect()
     }
+
+    /// TEST SEAM — build a `DevicePath` from a plain string, cross-platform (the real
+    /// constructors are Windows-only wide-string ceremony). Lets other crates' tests (e.g.
+    /// neuron-host's `bridge::discover_from` tests) construct synthetic HID paths without
+    /// depending on a platform backend. Not for production use — real paths come from
+    /// `enumerate()`.
+    #[doc(hidden)]
+    pub fn from_str_for_tests(s: &str) -> DevicePath {
+        DevicePath(OsString::from(s))
+    }
 }
 
 /// One enumerated HID collection.
@@ -52,6 +62,50 @@ pub struct HidDeviceInfo {
     pub usage: u16,
     pub feature_len: u16,
     pub path: DevicePath, // platform-opaque handle key
+}
+
+impl HidDeviceInfo {
+    /// The identity of the PHYSICAL unit this collection belongs to — see [`path_instance`].
+    pub fn instance(&self) -> String {
+        path_instance(&self.path.0.to_string_lossy())
+    }
+}
+
+/// Reduce a raw HID device-interface path to the identity of the PHYSICAL device it belongs to —
+/// the thing that tells "two collections of one device" apart from "two identical devices".
+/// This is the app-wide per-UNIT identity: everything that must address one specific physical
+/// unit (the device panel's rows, the selected-device control plane, the host bridge's surface
+/// keys) derives it from here, so they can never disagree.
+///
+/// Heuristic over the Windows HID path shape, e.g.
+/// `\\?\hid#vid_1532&pid_0221&mi_01&col02#8&2f5ca30f&0&0001#{4d1e55b2-f16f-11cf-88cb-001111000030}`:
+/// - `mi_XX` (multiple-interface index) and `colXX` (collection index) are interface-level, not
+///   device-level, so they're stripped — a keyboard's several collections (main + consumer
+///   control + vendor) must collapse to ONE instance.
+/// - the trailing `#{guid}` is the device-interface-CLASS guid (identical for every unit of the
+///   same kind of HID device) — stripped too, it carries no per-unit information.
+/// - what survives — vid/pid plus the container id (`8&2f5ca30f&0&0001`) — is what actually
+///   differs between two identical devices plugged into different USB ports.
+///
+/// Regex-free by design (no new dependency): lowercase + segment filtering only.
+pub fn path_instance(path: &str) -> String {
+    let lower = path.to_ascii_lowercase();
+    // Drop the trailing "#{...}" interface-class guid, if present.
+    let without_guid = match lower.rfind("#{") {
+        Some(i) => &lower[..i],
+        None => lower.as_str(),
+    };
+    without_guid
+        .split('#')
+        .map(|segment| {
+            segment
+                .split('&')
+                .filter(|part| !(part.starts_with("mi_") || part.starts_with("col")))
+                .collect::<Vec<_>>()
+                .join("&")
+        })
+        .collect::<Vec<_>>()
+        .join("#")
 }
 
 /// A feature-report channel to one device.

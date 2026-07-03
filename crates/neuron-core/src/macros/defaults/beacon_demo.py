@@ -1,7 +1,9 @@
-"""A tiny BEACON demo — asks one yes/no WITH context, then acts (mocked when you Test it)."""
+"""A BEACON exemplar that's safe to poke at. It does the one thing neuron.ask is for: pause a running
+macro and ask a yes/no with context, and nothing more. No keystrokes, no clicks, no device writes; it
+just hands your answer back to the log. Read it, Test it, then copy it and slot your own work in."""
 def macro(ctx):
     import neuron
-    if neuron.ask("ship the build?", description="pushes 12 commits to origin/main · CI is green"):
-        neuron.type_text("shipping it!")
-        return "shipped"
-    return "held"
+    # The strip rises at your cursor. Hold the cast trigger and flick to answer (right yes, left no).
+    if neuron.ask("ready?", description="a harmless demo; the answer is all it returns"):
+        return "you flicked yes"   # a real macro would do its thing here instead
+    return "you flicked no"

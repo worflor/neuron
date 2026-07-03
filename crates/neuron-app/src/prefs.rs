@@ -107,6 +107,12 @@ pub struct Prefs {
     /// All default ON (macro-fire is opt-in per binding, never a global gate here).
     #[serde(default = "default_true")]
     pub notif_dpi: bool,
+    /// The sniper hold's own gate — DEFAULT OFF, the one kind that isn't: sniper fires mid-game
+    /// where a card is exactly the wrong garnish, and the slowed crosshair already confirms the
+    /// hold. Opt in here if you want the on/off cards anyway. (Its dedup side-effect — absorbing
+    /// the device's echo so no spurious plain-DPI card fires — happens regardless of this gate.)
+    #[serde(default)]
+    pub notif_sniper: bool,
     #[serde(default = "default_true")]
     pub notif_scroll: bool,
     #[serde(default = "default_true")]
@@ -147,6 +153,38 @@ pub struct Prefs {
     /// "stack". (The settings UI to pick this is a later pass; the engine reads it now.)
     #[serde(default = "default_stack_mode")]
     pub notif_stack: String,
+    /// CONNECTIONS master switch — let other software drive the lighting THROUGH neuron's arbiter
+    /// (games speak Razer Chroma, tools speak OpenRGB), composing ABOVE the configured base stack
+    /// instead of fighting it for the device. Default OFF: turning it on opens two loopback ports
+    /// and changes who may paint the boards — that stays a conscious opt-in (SYSTEM → CONNECTIONS).
+    #[serde(default)]
+    pub host_enabled: bool,
+    /// Serve the Razer Chroma SDK protocol (localhost:54235) — what Chroma-enabled games speak.
+    /// Gated by `host_enabled`; default ON so enabling connections is one switch, not three.
+    #[serde(default = "default_true")]
+    pub host_chroma: bool,
+    /// Serve the OpenRGB SDK protocol (localhost:6742) — what RGB tools / Home Assistant speak.
+    /// Gated by `host_enabled`; default ON, same one-switch reasoning as `host_chroma`.
+    #[serde(default = "default_true")]
+    pub host_openrgb: bool,
+    /// Connect OUT to OBS Studio (obs-websocket, localhost:4455) so macros can drive scenes /
+    /// stream / recording, and OBS events reach the signal bus. Gated by `host_enabled`; default
+    /// OFF — it's an outbound connection to a specific app most users don't run, so it opts in
+    /// separately (unlike the always-useful lighting servers).
+    #[serde(default)]
+    pub host_obs: bool,
+    /// WHO WINS when a game/tool and your own lighting both want a board — the emergent config no
+    /// last-writer-wins tool (Synapse, OpenRGB) can offer, because only an arbiter has the concept.
+    /// `false` (default): games take over (a connected session paints above your base, which returns
+    /// when it releases). `true`: your lighting always wins (your base pins ABOVE sessions, so a
+    /// game connects and is honestly suppressed rather than clobbering you). Applies live.
+    #[serde(default)]
+    pub host_lighting_wins: bool,
+    /// The obs-websocket Server Password (OBS → Tools → WebSocket Server Settings). Empty = a
+    /// passwordless OBS server (auth off). Stored in app.toml like the rest; the `NEURON_OBS_PASSWORD`
+    /// env var, when set, overrides this (a dev/headless escape hatch).
+    #[serde(default)]
+    pub host_obs_password: String,
     /// LIGHTING — the persisted applied effect/layer stack + chosen fps, keyed by device pid (4-digit
     /// hex). Lets each lit board resume its effect across a relaunch. Empty by default; ONLY the
     /// lighting page writes it. Declared LAST: it serialises as `[lighting.<pid>]` sub-tables, and TOML
@@ -268,6 +306,7 @@ impl Default for Prefs {
             notif_y: default_notif_y(),
             notif_audio: true,
             notif_dpi: true,
+            notif_sniper: false, // the one default-off kind — see the field doc
             notif_scroll: true,
             notif_polling: true,
             notif_brightness: true,
@@ -280,6 +319,12 @@ impl Default for Prefs {
             notif_sound: default_notif_sound(),
             notif_panel: true,
             notif_stack: default_stack_mode(),
+            host_enabled: false,
+            host_chroma: true,
+            host_openrgb: true,
+            host_obs: false,
+            host_lighting_wins: false,
+            host_obs_password: String::new(),
             lighting: BTreeMap::new(),
         }
     }
@@ -355,6 +400,7 @@ impl Prefs {
         salvage!("notif_y", notif_y);
         salvage!("notif_audio", notif_audio);
         salvage!("notif_dpi", notif_dpi);
+        salvage!("notif_sniper", notif_sniper);
         salvage!("notif_scroll", notif_scroll);
         salvage!("notif_polling", notif_polling);
         salvage!("notif_brightness", notif_brightness);
@@ -367,6 +413,12 @@ impl Prefs {
         salvage!("notif_sound", notif_sound);
         salvage!("notif_panel", notif_panel);
         salvage!("notif_stack", notif_stack);
+        salvage!("host_enabled", host_enabled);
+        salvage!("host_chroma", host_chroma);
+        salvage!("host_openrgb", host_openrgb);
+        salvage!("host_obs", host_obs);
+        salvage!("host_lighting_wins", host_lighting_wins);
+        salvage!("host_obs_password", host_obs_password);
         // `lighting` is a per-device map — salvage it board-by-board so one corrupt record drops only
         // itself, not every other saved stack.
         if let Some(v) = table.get("lighting") {
@@ -431,6 +483,7 @@ impl Prefs {
         use neuron::confirm::Kind;
         match kind {
             Kind::Dpi => self.notif_dpi,
+            Kind::Sniper => self.notif_sniper,
             Kind::Scroll => self.notif_scroll,
             Kind::Polling => self.notif_polling,
             Kind::Brightness => self.notif_brightness,
@@ -658,6 +711,7 @@ pub fn notif_event(slug: &str) -> bool {
     let p = Prefs::load();
     match slug {
         "dpi" => p.notif_dpi,
+        "sniper" => p.notif_sniper,
         "scroll" => p.notif_scroll,
         "polling" => p.notif_polling,
         "brightness" => p.notif_brightness,
@@ -675,6 +729,7 @@ pub fn set_notif_event(slug: &str, v: bool) -> String {
     let mut p = Prefs::load();
     match slug {
         "dpi" => p.notif_dpi = v,
+        "sniper" => p.notif_sniper = v,
         "scroll" => p.notif_scroll = v,
         "polling" => p.notif_polling = v,
         "brightness" => p.notif_brightness = v,
@@ -759,6 +814,117 @@ pub fn set_notif_panel(v: bool) -> String {
     p.notif_panel = v;
     match p.save() {
         Ok(()) => format!("notification background {}", if v { "on" } else { "off" }),
+        Err(e) => format!("save failed: {e}"),
+    }
+}
+
+/// Read the CONNECTIONS master switch (default OFF — a conscious opt-in).
+pub fn host_enabled() -> bool {
+    Prefs::load().host_enabled
+}
+
+/// Persist the CONNECTIONS master switch, returning a user-facing status line.
+pub fn set_host_enabled(v: bool) -> String {
+    let mut p = Prefs::load();
+    p.host_enabled = v;
+    match p.save() {
+        Ok(()) => format!("connections {}", if v { "open" } else { "closed" }),
+        Err(e) => format!("save failed: {e}"),
+    }
+}
+
+/// Read the Chroma (games) protocol gate (default ON; meaningful only while connections are open).
+pub fn host_chroma() -> bool {
+    Prefs::load().host_chroma
+}
+
+/// Persist the Chroma protocol gate, returning a user-facing status line.
+pub fn set_host_chroma(v: bool) -> String {
+    let mut p = Prefs::load();
+    p.host_chroma = v;
+    match p.save() {
+        Ok(()) => format!("chroma (games) {}", if v { "on" } else { "off" }),
+        Err(e) => format!("save failed: {e}"),
+    }
+}
+
+/// Read the OpenRGB (tools) protocol gate (default ON; meaningful only while connections are open).
+pub fn host_openrgb() -> bool {
+    Prefs::load().host_openrgb
+}
+
+/// Persist the OpenRGB protocol gate, returning a user-facing status line.
+pub fn set_host_openrgb(v: bool) -> String {
+    let mut p = Prefs::load();
+    p.host_openrgb = v;
+    match p.save() {
+        Ok(()) => format!("openrgb (tools) {}", if v { "on" } else { "off" }),
+        Err(e) => format!("save failed: {e}"),
+    }
+}
+
+/// Read the OBS connect gate (default OFF; meaningful only while connections are open).
+pub fn host_obs() -> bool {
+    Prefs::load().host_obs
+}
+
+/// Persist the OBS connect gate, returning a user-facing status line.
+pub fn set_host_obs(v: bool) -> String {
+    let mut p = Prefs::load();
+    p.host_obs = v;
+    match p.save() {
+        Ok(()) => format!("obs {}", if v { "connecting" } else { "disconnected" }),
+        Err(e) => format!("save failed: {e}"),
+    }
+}
+
+/// Read the OBS server password FOR RUNTIME AUTH — env `NEURON_OBS_PASSWORD` overrides the saved
+/// pref (the dev/headless escape hatch). Do NOT use this to seed the UI: an env-only secret must
+/// stay ephemeral (see [`host_obs_password_saved`]).
+pub fn host_obs_password() -> String {
+    std::env::var("NEURON_OBS_PASSWORD").unwrap_or_else(|_| Prefs::load().host_obs_password)
+}
+
+/// The SAVED OBS password only (never the env override) — what the settings field shows and edits.
+/// Keeping the env value out of the UI is what keeps an env-only secret from being surfaced and,
+/// one save-click later, persisted into app.toml.
+pub fn host_obs_password_saved() -> String {
+    Prefs::load().host_obs_password
+}
+
+/// Persist the OBS server password, returning a user-facing status line (never echoes the secret).
+pub fn set_host_obs_password(v: &str) -> String {
+    let mut p = Prefs::load();
+    p.host_obs_password = v.to_string();
+    match p.save() {
+        Ok(()) => {
+            if v.is_empty() {
+                "obs password cleared (assuming auth is off)".into()
+            } else {
+                "obs password saved".into()
+            }
+        }
+        Err(e) => format!("save failed: {e}"),
+    }
+}
+
+/// Read the "who wins" policy (default false = games take over).
+pub fn host_lighting_wins() -> bool {
+    Prefs::load().host_lighting_wins
+}
+
+/// Persist the "who wins" policy, returning a user-facing status line.
+pub fn set_host_lighting_wins(v: bool) -> String {
+    let mut p = Prefs::load();
+    p.host_lighting_wins = v;
+    match p.save() {
+        Ok(()) => {
+            if v {
+                "your lighting always wins (games are suppressed)".into()
+            } else {
+                "games can take over your lighting".into()
+            }
+        }
         Err(e) => format!("save failed: {e}"),
     }
 }
@@ -945,6 +1111,7 @@ mod tests {
             notif_y: 0.5,
             notif_audio: !d.notif_audio,
             notif_dpi: !d.notif_dpi,
+            notif_sniper: !d.notif_sniper,
             notif_scroll: !d.notif_scroll,
             notif_polling: !d.notif_polling,
             notif_brightness: !d.notif_brightness,
@@ -957,6 +1124,12 @@ mod tests {
             notif_sound: "test-sound".into(),
             notif_panel: !d.notif_panel,
             notif_stack: "test-stack".into(),
+            host_enabled: !d.host_enabled,
+            host_chroma: !d.host_chroma,
+            host_openrgb: !d.host_openrgb,
+            host_obs: !d.host_obs,
+            host_lighting_wins: !d.host_lighting_wins,
+            host_obs_password: "test-pw".into(),
             lighting: d.lighting.clone(),
         };
         let body = toml::to_string_pretty(&want).unwrap();

@@ -1,5 +1,7 @@
 # Rust build output
 /target/
+# side target dirs used by review/CI agents (cargo --target-dir into the repo) — pure build cache
+/.review-target/
 
 # Bundled-CPython cache: build.rs downloads + verifies the python-build-standalone tarball(s) here
 # (one per build target, ~46 MB each) so incremental/offline builds skip the network. Generated,
@@ -45,6 +47,8 @@ Thumbs.db
 # first launch; the SOURCE defaults live in neuron-core/src/macros/defaults/. Committing the marker
 # would suppress seeding on every fresh checkout, so keep this dir out of version control.
 crates/neuron-app/macros/
+# compiled-macro cache from the RETIRED rust-dll engine (replaced by the Macro Host) — dead artifacts
+crates/neuron-core/macros/cache/
 /reference/
 profiles/
 __neuron_test_*.toml

@@ -146,6 +146,16 @@ pub const ACTION_PALETTE: &[(&str, &str, &str, &str, bool, u8)] = &[
         false,
         4,
     ),
+    // CONSOLIDATED obs — one entry, the op lives in the param (like system/volume/mute). Needs
+    // SYSTEM → CONNECTIONS with the obs gate on; fires honestly-unavailable otherwise.
+    (
+        "obs",
+        "obs",
+        "(stream) · record · pause · replay · scene name · mute input",
+        "obs",
+        false,
+        5,
+    ),
     (
         "volume",
         "volume",
@@ -288,6 +298,11 @@ pub fn build_action(id: &str, param: &str) -> Action {
             "sleep" | "suspend" => Action::Sleep,
             _ => Action::Lock,
         },
+        // CONSOLIDATED obs — first word picks the op, the rest is its argument:
+        // (blank)/"stream [start|stop]" · "record [start|stop]" · "pause" · "replay [start|stop]"
+        // · "scene <name>" · "mute [input]". Anything unrecognized degrades to the stream toggle
+        // (harmless and visible) rather than Noop (a dead knob).
+        "obs" => build_obs(p),
         "pocket" => {
             // "name" or "name · keep" — the second token enables on-disk persistence.
             let mut parts = p.split('\u{00b7}').map(str::trim);
@@ -585,6 +600,30 @@ fn build_mute(p: &str) -> Action {
     }
 }
 
+/// The consolidated `obs` grammar: first word picks the op, the remainder is its argument.
+/// Tolerant like every builder (the strict front door is `validate_action`): an unrecognized
+/// first word degrades to the stream toggle — visible and harmless, never a dead Noop.
+fn build_obs(p: &str) -> Action {
+    use neuron::action::ObsOp;
+    let (head, rest) = match p.split_once(char::is_whitespace) {
+        Some((h, r)) => (h, r.trim()),
+        None => (p, ""),
+    };
+    let (op, arg) = match head.to_ascii_lowercase().as_str() {
+        "" | "stream" => (ObsOp::Stream, rest),
+        "record" => (ObsOp::Record, rest),
+        "pause" | "record-pause" => (ObsOp::RecordPause, ""),
+        "replay" | "clip" => (ObsOp::Replay, rest),
+        "scene" => (ObsOp::Scene, rest),
+        "mute" => (ObsOp::Mute, rest),
+        _ => (ObsOp::Stream, ""),
+    };
+    Action::Obs {
+        op,
+        arg: arg.to_string(),
+    }
+}
+
 /// Validate a palette selection BEFORE building/committing it — the "no silently-broken rules"
 /// gate every editor flow (add-binding / wedge / glyph) calls first. `build_action` stays tolerant
 /// (it must parse whatever is already on disk); this is the strict front door for NEW input.
@@ -718,6 +757,22 @@ pub fn validate_action(id: &str, param: &str) -> Result<(), String> {
                 ))
             }
         }
+        // obs: the ops that take an argument must actually have one where it's not defaultable —
+        // a scene switch to nowhere would fire "name the scene" forever.
+        "obs" => {
+            let head = p.split_whitespace().next().unwrap_or("");
+            let rest = p[head.len()..].trim();
+            match head.to_ascii_lowercase().as_str() {
+                "scene" if rest.is_empty() => {
+                    Err("obs scene needs a name, like  scene Gameplay".into())
+                }
+                "" | "stream" | "record" | "pause" | "record-pause" | "replay" | "clip"
+                | "scene" | "mute" => Ok(()),
+                other => Err(format!(
+                    "'{other}' isn't an obs op — stream · record · pause · replay · scene name · mute input"
+                )),
+            }
+        }
         _ => Ok(()),
     }
 }
@@ -844,6 +899,31 @@ pub fn action_to_palette(a: &Action) -> (&'static str, String) {
         Action::Curtain => ("curtain", String::new()),
         Action::Lock => ("system", "lock".to_string()),
         Action::Sleep => ("system", "sleep".to_string()),
+        // → the consolidated `obs` entry: op word + argument, matching build_obs's grammar.
+        Action::Obs { op, arg } => (
+            "obs",
+            {
+                use neuron::action::ObsOp;
+                let word = match op {
+                    ObsOp::Stream => "stream",
+                    ObsOp::Record => "record",
+                    ObsOp::RecordPause => "pause",
+                    ObsOp::Replay => "replay",
+                    ObsOp::Scene => "scene",
+                    ObsOp::Mute => "mute",
+                };
+                if arg.is_empty() {
+                    // a bare stream toggle presets to blank (the palette's default)
+                    if *op == ObsOp::Stream {
+                        String::new()
+                    } else {
+                        word.to_string()
+                    }
+                } else {
+                    format!("{word} {arg}")
+                }
+            },
+        ),
         Action::Tether { slot, mode } => (
             "tether",
             match (mode, slot.is_empty()) {
@@ -1179,29 +1259,61 @@ pub fn delete_rhythm_action(cast: &mut CastConfig, taps: u8) -> Result<(), Strin
     save_cast(cast)
 }
 
-/// The sniper config (`sniper.toml`) — the hold-to-precision-DPI binding. Mirrors the CLI's shape so
-/// `neuron sniper` and the GUI share one file.
-#[derive(serde::Serialize, serde::Deserialize, Default)]
-pub struct SniperConfig {
-    pub button: Option<i32>,
-    #[serde(default)]
-    pub dpi: u16,
+// ── SNIPER binding — a held Action on the shared rule spine (NOT a snowflake config) ──────────
+// Sniper is `Trigger::Input -> Action::Sniper { dpi }` in `gui.rules.toml`, exactly like every
+// other authored bind. These helpers keep it to AT MOST ONE rule and let the Device panel + the CLI
+// read/write it through the one store. (Retired the old `sniper.toml` + `SniperConfig`.)
+
+/// The current sniper binding, if any: `(hold trigger, precision dpi)`. The Device panel seeds its
+/// readout from this — never a fictional default — and the CLI reads the same one rule.
+pub fn sniper_binding() -> Option<(Trigger, u16)> {
+    load_gui_rules().into_iter().find_map(|r| match r.action {
+        Action::Sniper { dpi } => Some((r.trigger, dpi)),
+        _ => None,
+    })
 }
 
-impl SniperConfig {
-    pub fn path() -> std::path::PathBuf {
-        std::path::PathBuf::from("sniper.toml")
+/// Author (or RE-bind) the sniper hold button to `trigger` at `dpi`. Clears any existing sniper
+/// rule first, so there is always at most one — a re-bind MOVES the button, never stacks a second.
+pub fn set_sniper_button(trigger: Trigger, dpi: u16) -> Result<(), String> {
+    clear_sniper()?;
+    add_gui_rule(trigger, Action::Sniper { dpi }, false).map(|_| ())
+}
+
+/// Update the precision DPI of the existing sniper binding in place. `Ok(false)` if nothing is bound
+/// yet (the caller then just remembers the pending dpi for the next bind).
+pub fn set_sniper_dpi(dpi: u16) -> Result<bool, String> {
+    let mut rules = load_gui_rules();
+    let mut found = false;
+    for r in rules.iter_mut() {
+        if let Action::Sniper { dpi: d } = &mut r.action {
+            *d = dpi;
+            found = true;
+        }
     }
-    pub fn load() -> Self {
-        std::fs::read_to_string(Self::path())
-            .ok()
-            .and_then(|s| toml::from_str(&s).ok())
-            .unwrap_or_default()
+    if found {
+        save_gui_rules(&rules)?;
     }
-    pub fn save(&self) -> Result<(), String> {
-        let body = toml::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(Self::path(), body).map_err(|e| e.to_string())
+    Ok(found)
+}
+
+/// UNBIND the sniper hold button — the FEEL tile's explicit "turn this off".
+/// Ok even when nothing was bound (unbinding nothing isn't an error). The
+/// caller reloads the live worker, whose release-all safety net restores any
+/// currently-held precision DPI before the rule vanishes.
+pub fn unbind_sniper() -> Result<(), String> {
+    clear_sniper()
+}
+
+/// Remove every sniper rule (used before a re-bind so exactly one ever exists).
+fn clear_sniper() -> Result<(), String> {
+    let mut rules = load_gui_rules();
+    let before = rules.len();
+    rules.retain(|r| !matches!(r.action, Action::Sniper { .. }));
+    if rules.len() != before {
+        save_gui_rules(&rules)?;
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1220,6 +1332,46 @@ mod tests {
                 assert_ne!(a, Action::Noop, "id '{id}' should build a real action");
             }
         }
+    }
+
+    /// The consolidated `obs` grammar: op word + argument, round-tripping through
+    /// `action_to_palette` (edit-shows-current), with the strict front door catching a
+    /// scene switch to nowhere.
+    #[test]
+    fn obs_grammar_round_trips() {
+        use neuron::action::ObsOp;
+        let obs = |op: ObsOp, arg: &str| Action::Obs {
+            op,
+            arg: arg.into(),
+        };
+        // blank = the stream toggle (the palette's default), and it presets back to blank
+        assert_eq!(build_action("obs", ""), obs(ObsOp::Stream, ""));
+        assert_eq!(
+            action_to_palette(&obs(ObsOp::Stream, "")),
+            ("obs", String::new())
+        );
+        // op words parse, with arguments where they apply
+        assert_eq!(build_action("obs", "stream stop"), obs(ObsOp::Stream, "stop"));
+        assert_eq!(build_action("obs", "record"), obs(ObsOp::Record, ""));
+        assert_eq!(build_action("obs", "pause"), obs(ObsOp::RecordPause, ""));
+        assert_eq!(build_action("obs", "replay"), obs(ObsOp::Replay, ""));
+        assert_eq!(
+            build_action("obs", "scene Just Chatting"),
+            obs(ObsOp::Scene, "Just Chatting")
+        );
+        assert_eq!(build_action("obs", "mute Mic/Aux"), obs(ObsOp::Mute, "Mic/Aux"));
+        // and they render back to the same grammar (edit-shows-current)
+        for p in ["stream stop", "record", "pause", "replay", "scene Just Chatting", "mute Mic/Aux"] {
+            let a = build_action("obs", p);
+            let (id, back) = action_to_palette(&a);
+            assert_eq!(id, "obs");
+            assert_eq!(build_action(id, &back), a, "'{p}' must round-trip");
+        }
+        // the strict front door: a scene with no name, or a junk op, never commits
+        assert!(validate_action("obs", "scene").is_err());
+        assert!(validate_action("obs", "twitch").is_err());
+        assert!(validate_action("obs", "").is_ok());
+        assert!(validate_action("obs", "scene Gameplay").is_ok());
     }
 
     /// The new palette entries build the real engine actions — the picker is never narrower
@@ -1934,18 +2086,50 @@ mod tests {
         );
     }
 
-    /// Sniper config round-trips through its own temp file (cwd-guarded, serial-safe).
+    /// The sniper binding lives as a held `Action::Sniper` rule on the shared spine: it round-trips,
+    /// its DPI updates in place, and a re-bind MOVES it (never stacks a second sniper rule).
     #[test]
-    fn sniper_config_roundtrips() {
+    fn sniper_binding_is_one_rule_on_the_spine() {
         let _g = cwd_guard();
-        let cfg = SniperConfig {
-            button: Some(0x06),
-            dpi: 400,
+        let alt = Trigger::Input {
+            page: 0x07,
+            usage: 0xE2,
+            pid: None,
+        }; // Left Alt
+        set_sniper_button(alt.clone(), 400).unwrap();
+        assert_eq!(sniper_binding(), Some((alt.clone(), 400)));
+
+        // the precision DPI updates in place, keeping the same button
+        assert_eq!(set_sniper_dpi(800), Ok(true));
+        assert_eq!(sniper_binding(), Some((alt, 800)));
+
+        // re-binding to a different control moves the sniper — still exactly ONE sniper rule
+        let side = Trigger::Input {
+            page: 0x09,
+            usage: 5,
+            pid: Some(0x1234),
         };
-        cfg.save().unwrap();
-        let back = SniperConfig::load();
-        assert_eq!(back.button, Some(0x06));
-        assert_eq!(back.dpi, 400);
+        set_sniper_button(side.clone(), 800).unwrap();
+        assert_eq!(sniper_binding(), Some((side, 800)));
+        let count = load_gui_rules()
+            .into_iter()
+            .filter(|r| matches!(r.action, Action::Sniper { .. }))
+            .count();
+        assert_eq!(count, 1, "a re-bind must not stack a second sniper rule");
+
+        // unbind removes the rule outright; unbinding again stays Ok (not an error)
+        unbind_sniper().unwrap();
+        assert_eq!(sniper_binding(), None, "unbind must clear the binding");
+        unbind_sniper().unwrap();
+    }
+
+    /// With nothing bound, setting the precision DPI is a no-op that reports `Ok(false)` — the panel
+    /// then just remembers the fader value until a hold button is captured.
+    #[test]
+    fn sniper_dpi_without_a_binding_is_ok_false() {
+        let _g = cwd_guard();
+        assert_eq!(set_sniper_dpi(1200), Ok(false));
+        assert_eq!(sniper_binding(), None);
     }
 
     // ── cwd test isolation ────────────────────────────────────────────────

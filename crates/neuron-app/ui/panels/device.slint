@@ -326,8 +326,10 @@ component DeviceLine inherits Rectangle {
                 // into `main` and squeezed the trailing `backup` button (its label overflowed its box).
                     HorizontalLayout {
                         spacing: 13px;
-                    Readout { key: "DPI"; value: root.d.dpi; }
-                    Readout { key: "POLL"; value: root.d.polling; }
+                    // capability-gated readouts — a keyboard never prints "DPI —", a lightless mouse
+                    // never prints "LIGHT —"; each key shows only where the descriptor says it's real.
+                    if root.d.cap-dpi : Readout { key: "DPI"; value: root.d.dpi; }
+                    if root.d.cap-poll : Readout { key: "POLL"; value: root.d.polling; }
                     if root.d.battery != "" : VerticalLayout {
                         alignment: center; spacing: 3px;
                         Text {
@@ -377,7 +379,10 @@ component DeviceLine inherits Rectangle {
                             }
                         }
                     }
-                    Readout { key: "LIGHT"; value: root.d.brightness; }
+                    // LIGHT keys on the brightness GETTER, not the lighting block — a board that can
+                    // only SET brightness (the legacy BlackWidow) has no number to report, and a
+                    // readout that says "—" forever is a lie of layout.
+                    if root.d.cap-bright : Readout { key: "LIGHT"; value: root.d.brightness; }
                     if root.d.storage != "" : Readout { key: "ONBOARD"; value: root.d.storage; }
                     // SIDE PLATE — push-only readout under the mouse it belongs to (capability-gated,
                     // shown only once a plate has actually been reported, so it's never a lie).
@@ -401,6 +406,16 @@ component DeviceLine inherits Rectangle {
 
 export component DevicePanel inherits VerticalLayout {
     spacing: 0;
+
+    // Which ADVANCED rows the SELECTED device actually earns — straight from the descriptor's
+    // capability flags (see DeviceRow), which is what those flags were always for. WHEEL MODE needs a
+    // stage-scroll wheel, SLEEP a wireless idle timer, and the sensor pair (HYPERPOLLING + LIFT-OFF)
+    // rides the DPI/sensor cap. The disclosure appears only when at least one row is real, so a
+    // device with no advanced writes simply has no advanced drawer instead of an empty ceremony.
+    property <bool> adv-wheel: State.sel-can-scroll;
+    property <bool> adv-sleep: State.sel-can-idle;
+    property <bool> adv-sensor: State.sel-can-dpi;
+    property <bool> adv-any: root.adv-wheel || root.adv-sleep || root.adv-sensor;
 
     PanelHead {
         label: "DEVICE";
@@ -465,7 +480,7 @@ export component DevicePanel inherits VerticalLayout {
                     d: d;
                     selected: i == State.selected-device;
                     clicked => { State.select-device(i); }
-                    backup => { State.backup-device(d.pid); }
+                    backup => { State.backup-device(d.id); }
                 }
             }
         }
@@ -659,8 +674,24 @@ export component DevicePanel inherits VerticalLayout {
                                 term: "SNIPER";
                                 readout: State.sniper-button == "—" ? "no button" : "hold " + State.sniper-button;
                                 readout-ink: State.sniper-button == "—" ? Theme.text-faint : Theme.accent;
-                                HorizontalLayout {
+                                // unbound → one capture verb. Bound → the joined [re-capture | unbind]
+                                // split (the missing "how do I turn this off" affordance — a bind you
+                                // can only overwrite, never remove, is a roach motel).
+                                if State.sniper-button == "—" : HorizontalLayout {
                                     Button { text: "capture hold button"; clicked => { State.capture-sniper-button(); } }
+                                    Rectangle {}
+                                }
+                                if State.sniper-button != "—" : HorizontalLayout {
+                                    VerticalLayout {
+                                        width: 200px;
+                                        alignment: center;
+                                        SplitButton {
+                                            left-text: "re-capture";
+                                            right-text: "unbind";
+                                            left-clicked => { State.capture-sniper-button(); }
+                                            right-clicked => { State.unbind-sniper(); }
+                                        }
+                                    }
                                     Rectangle {}
                                 }
                                 Slider {
@@ -702,10 +733,11 @@ export component DevicePanel inherits VerticalLayout {
                     }
                 }
 
-                // KEY GUARD — a host-side LL-hook OS-chord swallow (no device write), so it is NOT a
-                // mouse feature and is NOT gated on DPI: a keyboard gamer needs Alt+Tab/Win swallowed
-                // mid-game just as much. Its own card, shown for ANY selected HID. Grows by chord.
-                Card {
+                // KEY GUARD — a host-side LL-hook OS-chord swallow (no device write). It guards
+                // KEYBOARD chords, so it lives under the keyboard channel (and generic HIDs — a
+                // keypad is a keyboard at heart), never under a mouse: a page that shows Alt+Tab
+                // lockout on a Naga reads as a bug. Grows by chord.
+                if State.selected-device-kind != "mouse" : Card {
                     VerticalLayout {
                         padding: 12px;
                         spacing: 13px;
@@ -758,7 +790,7 @@ export component DevicePanel inherits VerticalLayout {
                 // surface. The whole row is the hit target (can't be missed), and the open flag is a
                 // global (State.feel-adv-open). These stay OUT of the global apply: each keeps its own
                 // deliberate per-control apply.
-                if State.sel-can-dpi : Rectangle {
+                if root.adv-any : Rectangle {
                     height: 26px;
                     adv-ta := TouchArea {
                         mouse-cursor: MouseCursor.pointer;
@@ -778,20 +810,21 @@ export component DevicePanel inherits VerticalLayout {
                 // the card wears ONE quiet "verify-gated" marker and each verify-gated row echoes it
                 // with the same warn dot, so the trust zone reads as one system. We keep the controls
                 // honest, not faked. (DEBOUNCE is the lone exception: firmware-fixed, not verify-gated.)
-                if State.sel-can-dpi && State.feel-adv-open : Card {
+                if root.adv-any && State.feel-adv-open : Card {
                     VerticalLayout {
                         padding: 12px;
                         spacing: 16px;
                         HorizontalLayout {
                             SectionTitle { text: "HARDWARE WRITES"; }
                             Rectangle {}
-                            Pill { text: "verify-gated"; tint: Theme.warn; }
+                            Pill { text: "VERIFY-GATED"; tint: Theme.warn; }
                         }
                         GateNote { text: "real device paths, ready but held until the command is confirmed on your hardware, so nothing fires blind."; }
                         if State.perf-status != "" : Mono { text: State.perf-status; color: Theme.text-mid; wrap: word-wrap; }
 
-                        // WHEEL MODE — HyperScroll stages (class 0x0B — hardware-verify pending)
-                        VerticalLayout {
+                        // WHEEL MODE — HyperScroll stages (class 0x0B — hardware-verify pending).
+                        // Only a device whose descriptor declares stage-scroll (cap-scroll) shows it.
+                        if root.adv-wheel : VerticalLayout {
                             spacing: 9px;
                             CapHead { term: "WHEEL MODE"; gated: true; }
                             HorizontalLayout {
@@ -819,10 +852,11 @@ export component DevicePanel inherits VerticalLayout {
                                 Pill { text: "free"; clickable: true; clicked => { State.scroll-stages = "free"; State.scroll-stages-edited(State.scroll-stages); } }
                             }
                         }
-                        Divider {}
+                        if root.adv-wheel && (root.adv-sleep || root.adv-sensor) : Divider { }
 
-                        // SLEEP TIMER / idle-off timer
-                        VerticalLayout {
+                        // SLEEP TIMER / idle-off timer — wireless devices only (cap-idle); a wired
+                        // board has no sleep to time out.
+                        if root.adv-sleep : VerticalLayout {
                             spacing: 9px;
                             CapHead {
                                 term: "SLEEP TIMER";
@@ -873,13 +907,13 @@ export component DevicePanel inherits VerticalLayout {
                                 }
                             }
                         }
-                        Divider {}
+                        if root.adv-sleep && root.adv-sensor : Divider { }
 
                         // HYPERPOLLING — the EXTENDED (>1000Hz) rate path (0x00/0x40). Only REAL on the
                         // separate HyperPolling Wireless Dongle / Viper-8K-class hardware; the Naga's stock
                         // dongle is legacy-capped at 1000Hz. When the selected device CAN'T reach the
                         // extended tiers we show an honest line instead of fake 2000–8000Hz chips.
-                        VerticalLayout {
+                        if root.adv-sensor : VerticalLayout {
                             spacing: 9px;
                             CapHead {
                                 term: "HYPERPOLLING";
@@ -907,10 +941,12 @@ export component DevicePanel inherits VerticalLayout {
                                 }
                             }
                         }
-                        Divider {}
+                        if root.adv-sensor : Divider { }
 
-                        // SENSOR TIMING — lift-off distance (REAL verify-gated write) + debounce (firmware-fixed).
-                        VerticalLayout {
+                        // SENSOR TIMING — lift-off distance (REAL verify-gated write) + debounce
+                        // (firmware-fixed). Sensor territory: rides the same DPI/sensor cap as
+                        // HYPERPOLLING, so the divider above pairs with it unconditionally.
+                        if root.adv-sensor : VerticalLayout {
                             spacing: 9px;
                             CapHead { term: "SENSOR TIMING"; gated: true; }
                             // LIFT-OFF DISTANCE — even (symmetric low/med/high) OR split (separate LIFT vs
@@ -986,7 +1022,7 @@ export component DevicePanel inherits VerticalLayout {
                             HorizontalLayout {
                                 Mono { text: "debounce"; color: Theme.text-faint; }
                                 Rectangle {}
-                                Pill { text: "fixed in firmware"; tint: Theme.text-faint; }
+                                Pill { text: "FIXED IN FIRMWARE"; tint: Theme.text-faint; }
                             }
                             GateNote { text: "lift-off distance (even or split) is a real, verify-gated write; debounce is fixed in the mouse's firmware, so there's no setting to expose."; }
                         }

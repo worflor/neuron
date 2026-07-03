@@ -620,6 +620,140 @@ macro engine are just two of its subscribers.
   one frame, never the thread). `examples/host_serve.rs` = run against real
   hardware + real OpenRGB port. 67 tests green incl. bridge tests over the
   real embedded device TOMLs.
+- **DONE: the in-game flicker/lag root-cause pass (2026-07-02).** Symptoms:
+  protocol-client lighting flickered; effects went laggy mid-Overwatch, fine
+  on the desktop. Diagnosis (three roots, all below the arbiter — the lease/
+  priority model audited clean): (1) fire-and-forget HID writes drop under
+  load, the sink's row dedup then caches the lie, and the fixed 64-tick heal
+  left torn frames visible ~2s — continuous tear→heal reads as flicker
+  exactly when a client streams; (2) plain `thread::sleep` pacing with no
+  timer-resolution/priority/EcoQoS handling gets coarsened to ~15.6ms and
+  deprioritized when a fullscreen game has focus → the 33ms frame deadline
+  blows, frames skip (wall-clock `t`, so it chops rather than slows);
+  (3) a Chroma game (Overwatch) legitimately painting above BASE looked like
+  "my effect broke" because nothing named the owner. Fixes: writer.rs
+  `HealPolicy` (activity-aware self-heal: full repaint every 12 ticks while
+  frames flow, a two-shot retransmit at +8/+24 ticks when they stop, then
+  FULL quiescence — faster healing AND quieter idle than the old fixed
+  cadence); bridge.rs `writer_thread_qos` (timeBeginPeriod(1) + ABOVE_NORMAL
+  on each writer thread, raw FFI, no new deps); main.rs process-wide
+  PowerThrottling opt-out (EXECUTION_SPEED + IGNORE_TIMER_RESOLUTION
+  ControlMask, StateMask 0 — HighQoS + honored timers under Game Mode);
+  host.rs/glue/lighting.slint: the truth strip now NAMES the painting client
+  (bus-fed — Chroma session title / OpenRGB client name) so an owned board
+  reads as the arbiter working, not a bug.
+- **DONE: OBS both-directions pass (2026-07-02).** The outbound half (macro
+  verbs → typed ObsCmd → authed websocket) already worked; the inbound half
+  was published-but-unconsumed. Now: (1) `adapters/obs.rs` RESYNCS at
+  Identified (GetStreamStatus/GetRecordStatus/GetCurrentProgramScene;
+  RequestResponse mapped into the same normalized events) — events only
+  announce changes, so a mid-stream (re)connect no longer sits on stale
+  defaults; `Step.send` is a Vec. (2) app-side **OBS follower**
+  (neuron-app/host.rs): one thread subscribes `obs.*`, keeps a mirror
+  (`ObsSnapshot`) for GUI + sensing, holds the **on-air tally** — a red
+  full-board layer at OVERRIDE+1000 on a 2s-TTL lease refreshed each 250ms
+  tick (a dead follower/app CANNOT leave boards stuck red; kernel rebirth
+  re-claims via the refresh-fail path), owner labeled "on-air tally" so the
+  truth strip names it; gated by pref `host_obs_tally` (default OFF) via an
+  atomic. (3) **hook macros**: `on_obs_scene` / `on_obs_stream` /
+  `on_obs_record` fire (async, arm-gated inside the sidecar) on state
+  CHANGES — first observation seeds, so the identify resync never fires
+  go-live rituals for an already-running stream. (4) new act verbs:
+  `obs_get(scene|streaming|recording|connected)` senses the mirror;
+  `obs_request(type[, data])` reaches the whole obs-websocket API via
+  ObsCmd::Raw (was built but unreachable). (5) prelude wrappers
+  (runtime/host/neuron.py): obs_scene/stream/record/mute/request +
+  obs_scene_name/streaming/recording/connected. (6) SYSTEM card: the OBS
+  status line now carries what OBS announced ("connected to OBS · scene:
+  Gameplay · LIVE · recording"); on-air tally toggle in the OBS reveal;
+  Workshop guide gained a "Drive OBS, and let OBS drive you" section.
+  (7) **kernel-rebirth resync**: a reborn kernel starts with an EMPTY bus while
+  the websocket to OBS survives — the follower detects the rebirth (its
+  subscription dies), resubscribes, and sends `ObsCmd::Resync`, which
+  republishes the retained `obs.connected` and re-issues the identify-time
+  trio (`ObsClient::resync_requests`, one builder for both paths). The mirror
+  keeps its last-known truth for the round-trip (no fake "disconnected" blip
+  darkening an onair layer) and converges on what OBS re-announces — truth is
+  re-read from the source, never assumed from memory.
+- **DONE: OBS as a first-class Action + client-visibility pass (2026-07-02).**
+  (1) `Action::Obs { op: ObsOp, arg }` (stream / record / record-pause /
+  replay / scene / mute) — routed through the SAME obs_hook seam macros use,
+  arm-gated (an accidental go-live is unrecoverable), honest "OBS not
+  connected" when the host is off. Palette gained a consolidated `obs` entry
+  (first word = op, rest = argument; strict front door rejects a nameless
+  scene), so OBS binds from keys, wedges, and glyphs with no code. The radial
+  wedge reads the LIVE mirror: Active + "LIVE" while streaming, Inert when
+  disconnected. New sink verbs: obs_record "pause" (ToggleRecordPause),
+  obs_replay save/start/stop (the "clip that!" button); prelude obs_replay().
+  (2) Chroma/OpenRGB rows now name their clients: ChromaHttpServer keeps its
+  state-machine Arc and exposes `sessions()` (TTL-honest — a vanished game
+  stops being reported when its lease would lapse); OrgbServer keeps a
+  connection roster (insert on accept, name on SET_CLIENT_NAME, remove on
+  every exit path incl. contained panics). Status cross-references rosters
+  against arbiter claims per surface: painting (topmost claim) vs waiting
+  underneath (present, not top) vs connected-not-painting-yet. The card reads
+  "Overwatch is painting your keyboard + mouse" from the same leased truth
+  the boards obey. 91 host tests.
+- **DONE: the on-air tally became a DATA LAYER (2026-07-02)** — the forced
+  full-board red was Synapse-grade slop (nobody wants their colour profile
+  stomped); it's now the lighting engine's second DATA tile. New pieces:
+  `Blend::Cut` (cutout/sprite blend: black = "nothing to say" falls through,
+  lit cells REPLACE at true colour — readout presets default to it now, fixing
+  the vitals screen-wash too); `lighting::publish_broadcast/Broadcast` (the
+  vitals-feed shape, pushed by the app's OBS follower on every announced
+  change + a disconnected default at teardown, so an onair layer can never
+  hold a stale "live"); the `onair` pattern (registry `readout: true`,
+  `has_spectrum: true` — a SCALAR readout: the user paints the region and the
+  spectrum, gradients span the placement, Motion breathes/cycles; knobs:
+  `signal` stream/record/either + opt-in `standby` placement trace while
+  connected off-air; renders dark on no-feed/disconnect — a tally that might
+  be wrong is worse than none). The old machinery is deleted (pref
+  host_obs_tally, SYSTEM toggle, follower claims at OVERRIDE+1000); the OBS
+  reveal now points at the LIGHTING page. Tile thumbnail shows a
+  representative live look (the real pattern is honestly dark off-air).
+- **DONE (code-complete, tests authored but NOT yet run — another agent held
+  the build): the data-tile family grew to five (2026-07-02).** Following the
+  on-air pattern ("protocol truths land as paintable data layers"), three new
+  readout tiles, all Scalar+Cut+region/spectrum-driven via the shared
+  `placement_field` helper: (1) **Mic Light** (`miclight`) — the system
+  capture endpoint's REAL mute state via the new `mic_state` provider
+  (audio_level's provider discipline: one ~8Hz sampler, idle auto-stop,
+  ~1s endpoint re-resolution to bound the get_mute dead-handle staleness,
+  platform-neutral because audio.rs is already seamed); knob `show` =
+  muted|hot-mic; UNKNOWN renders dark, never a guess. (2) **Mode Held**
+  (`modeheld`) — hold-layer/sniper truth via `lighting::publish_hold`,
+  pushed edge-accurately from dispatch.rs (status tick for layers,
+  sniper_press/release/release_all for sniper, default pushed at loop
+  teardown so the light can't outlive the mode); knob `signal` =
+  hold-layer|sniper|either. (3) **Signal** (`signal`) — four macro-drivable
+  0..=1 channels (`lighting::set_signal`/`signal`, lock-free atomics,
+  clamped, process-state that persists until overwritten); act verb
+  `signal` + prelude `neuron.signal(channel, value)` (ungated, like store);
+  knobs `channel` 1-4 + `style` level|glow (level: value picks the colour
+  along the spectrum — urgency ramp; glow: value is brightness). Registry
+  count 16→19 (test updated); presets + gated-tile thumbnail arm
+  generalized in glue; Workshop guide documents signal(). VERIFY when the
+  build frees: `cargo test -p neuron --lib pattern` + workspace check.
+- **SPEC'D (2026-07-02): the Chroma SHARED-MEMORY server — the second face.**
+  Live experiment (Python port-trap on 54236-54245 + session-table polling +
+  `tasklist /M`) proved native games DON'T speak our REST face: Overwatch loads
+  Razer's `RzChromaSDK64.dll`, which talks to `RzSDKServer.exe` over **Win32
+  named shared memory + events under `Global\{GUID}`** (DLL imports
+  CreateFileMappingW/OpenFileMappingW/MapViewOfFile/CreateEventW/... and NOTHING
+  else — no COM/HTTP/RPC/pipe). The Razer services are registered but STOPPED
+  (Synapse purge), so the DLL dials a dead server → silent no-op. Fix, per user
+  constraint "NO DLLs": **be the shared-memory server** Razer's own DLL already
+  dials (zero DLLs of ours, nothing in the game process, anti-cheat-safe).
+  Static recon captured the ABI (14 exports), the transport, the object
+  namespace (31 `Global\{GUID}` the DLL references + 2 the server creates =
+  `60C824F3…`/`CB3C8DAE…`, the rendezvous pair we must own), the structs
+  (ChromaAppInfo/AppData/SessionInfo/DeviceChromaData), version 3.37, and the
+  registry app-gating (Overwatch is registered + in the PriorityList). Full spec
+  + the runtime-capture plan (WinObj/handle64/API-Monitor) + the `chroma_shm`
+  adapter design + the elevation fork (`Global\` needs SeCreateGlobalPrivilege)
+  live in **`docs/CHROMA-SHM-RND.md`**. NEXT = the capture session (stop
+  neuron-app to free 54235, start the Razer service, WinObj+API-Monitor while
+  Overwatch paints) to fill the object table + envelope layout, THEN implement.
 - **⚠ note:** the WIP snapshot needed the gitignored `runtime/` dir copied
   from the main tree (neuron-core include_str!s the Python host files);
   remember this for fresh worktrees.
@@ -749,7 +883,7 @@ absorbs all seven (§10).**
   hold their own copy read-only.
 - **Safety gates**: `safety.rs` process-global atomics (`input_armed`,
   `writes_paused`) — read for status; route effectful changes through the live
-  worker to keep tray/UI projections in sync (tdd.md "multiple sources of
+  worker to keep tray/UI projections in sync (TDD.md "multiple sources of
   runtime truth" risk).
 - **Event stream**: NO formal bus. To stream events to protocol clients,
   broadcast-ify NOTE_SINK/confirm (`Option<Sender>` → `Vec<Sender>`) following

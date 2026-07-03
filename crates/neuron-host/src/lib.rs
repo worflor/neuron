@@ -33,14 +33,18 @@ pub mod arbiter;
 #[cfg(feature = "bridge")]
 pub mod bridge;
 pub mod bus;
+pub mod crypto;
 pub mod governor;
 pub mod journal;
 pub mod net;
 pub mod shell;
 pub mod writer;
+pub mod ws;
+
+use std::collections::HashMap;
 
 use api::SurfaceInfo;
-use arbiter::Arbiter;
+use arbiter::{Arbiter, SourceId};
 use bus::Bus;
 use journal::Journal;
 
@@ -56,6 +60,10 @@ pub struct Kernel {
     pub(crate) infos: Vec<SurfaceInfo>,
     /// Next SourceId to issue; 0 is reserved for journal::CONFIG_SOURCE.
     pub(crate) next_source: u64,
+    /// Human names for sources ("Overwatch", "openrgb: hass") — advisory
+    /// identity for the GUI's ownership truth, set by adapters the moment
+    /// they learn who connected. Never authority; never required.
+    pub(crate) labels: HashMap<SourceId, String>,
 }
 
 impl Kernel {
@@ -66,6 +74,7 @@ impl Kernel {
             journal: Journal::new(),
             infos: Vec::new(),
             next_source: 1,
+            labels: HashMap::new(),
         }
     }
 
@@ -74,7 +83,19 @@ impl Kernel {
     /// log — proven by `journal::tests::replay_reproduces_state`.
     pub fn from_journal(journal: Journal) -> Self {
         let arbiter = journal.replay();
-        Kernel { arbiter, bus: Bus::new(), journal, infos: Vec::new(), next_source: 1 }
+        Kernel {
+            arbiter,
+            bus: Bus::new(),
+            journal,
+            infos: Vec::new(),
+            next_source: 1,
+            labels: HashMap::new(),
+        }
+    }
+
+    /// The advisory name for a source, if an adapter provided one.
+    pub fn label_of(&self, owner: SourceId) -> Option<&str> {
+        self.labels.get(&owner).map(String::as_str)
     }
 }
 

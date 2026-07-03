@@ -17,30 +17,126 @@
 //!   dead sessions' pixels forward would be exactly the stuck-lighting bug
 //!   this project exists to kill. (In practice the app's base stack claims
 //!   everything anyway.)
-//! - **Legacy boards are paced at 6fps** regardless of the requested rate —
-//!   they physically drop writes above that (hardware-confirmed on the
-//!   BlackWidow Chroma V2). Asking for more would be flicker, not honesty.
+//! - **Legacy boards stream at full rate.** The old "legacy drops writes above
+//!   ~6fps" belief was FOLKLORE from the ACK'd path's 10ms poll sleep — a live
+//!   wire probe (`neuron::device::tests::live_stream_strategy_probe`) measured
+//!   the BlackWidow Chroma V2 sustaining 30fps clean. Legacy's real quirk is
+//!   burst sensitivity, handled by the sink's 2ms per-row breathe (below), not
+//!   by an fps cap.
 //! - **No hotplug yet**: a device that vanishes goes dormant (decimated
 //!   control-retry, fire-and-forget writes are inherently silent); re-attach
 //!   on replug arrives with the app integration, alongside hidwatch's 20s
 //!   monitor pattern.
 
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
+
 use crate::api::{Grid, HostApi, SurfaceInfo, SurfaceKind};
-use crate::arbiter::Rgb;
+use crate::arbiter::{LiveContent, Rgb};
 use crate::shell::HostHandle;
-use crate::writer::{FrameSink, Writer};
+use crate::writer::{FrameSink, Writer, WriterPauser};
 
 use neuron::device::Device;
 use neuron::lighting::{changed_rows_into, LightingDef, Lights, Protocol, Rgb as CoreRgb};
+use neuron::pattern::{quantized_t, render_elapsed, Compositor, LayerDef};
 use neuron::registry::{Capability, DeviceDef, Registry};
-use neuron::transport::{self, DevicePath};
+use neuron::transport::{self, DevicePath, HidDeviceInfo};
 
-/// Stable surface key: codename + the link-mode PID (wired vs dongle count as
-/// the same *model* but distinct link personalities; two identical devices on
-/// one machine are a future refinement, noted honestly).
+/// The translation layer that makes the integration feel native: the app's
+/// own `Vec<LayerDef>` lighting stack (what the GUI edits, what profiles
+/// carry, what prefs persist) rendered as LIVE arbiter content — through the
+/// SAME `Compositor`, the SAME process-global render epoch, and the SAME
+/// quantized clock as the app's preview, so "the preview provably matches the
+/// board" keeps holding when frames flow through the arbiter instead of a
+/// per-pid anim thread. The fps atomic is shared with the device's writer:
+/// one knob paces both the render quantization and the write cadence, exactly
+/// like the app's streams.
+pub struct CompositorContent {
+    defs: Vec<LayerDef>,
+    rows: u8,
+    cols: u8,
+    fps: Arc<AtomicU32>,
+    comp: Compositor,
+}
+
+impl CompositorContent {
+    pub fn new(defs: Vec<LayerDef>, rows: u8, cols: u8, fps: Arc<AtomicU32>) -> CompositorContent {
+        let comp = Compositor::from_defs(&defs);
+        CompositorContent {
+            defs,
+            rows,
+            cols,
+            fps,
+            comp,
+        }
+    }
+}
+
+impl LiveContent for CompositorContent {
+    fn render(&mut self, _now: Instant) -> Vec<Option<Rgb>> {
+        let fps = self
+            .fps
+            .load(Ordering::Relaxed)
+            .clamp(1, neuron::lighting::MAX_STREAM_FPS);
+        let t = quantized_t(render_elapsed(), fps);
+        self.comp
+            .render(self.rows, self.cols, t)
+            .into_iter()
+            .map(|c| Some(Rgb(c.r, c.g, c.b)))
+            .collect()
+    }
+
+    fn boxed_clone(&self) -> Box<dyn LiveContent> {
+        Box::new(CompositorContent::new(
+            self.defs.clone(),
+            self.rows,
+            self.cols,
+            self.fps.clone(),
+        ))
+    }
+}
+
+/// Stable surface key for the common case: codename + the link-mode PID (wired
+/// vs dongle count as the same *model* but distinct link personalities). Used
+/// as-is when this (codename, pid) is unique among discovered devices; see
+/// [`surface_key_dup`] for what two+ identical units get instead.
 pub fn surface_key(def: &DeviceDef, pid: u16) -> String {
     format!("{}-{:04x}", def.codename, pid)
 }
+
+/// Disambiguated surface key for when two+ physical devices share (codename,
+/// pid) — identical models plugged in together. `instance` is the device's
+/// [`path_instance`]; folding it into the key means NEITHER unit keeps the
+/// ambiguous bare key once a duplicate exists (both get suffixed, not just
+/// the second one seen — enumeration order must not decide who looks "first").
+fn surface_key_dup(def: &DeviceDef, pid: u16, instance: &str) -> String {
+    format!(
+        "{}-{:04x}-{:08x}",
+        def.codename,
+        pid,
+        fnv1a(instance) as u32
+    )
+}
+
+/// Inline FNV-1a (no new dependency, per the workspace's dependency freeze) — a short, stable
+/// suffix to tell identical devices apart in a key. Not a security hash; collisions just mean a
+/// rarer disambiguation failure, not an exploitable one.
+fn fnv1a(s: &str) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in s.bytes() {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+/// The per-UNIT identity lives in core now (`neuron::transport::path_instance`) so the app's
+/// device model and this bridge derive it from the SAME function and can never disagree about
+/// which physical unit a path belongs to. Re-exported to keep this module the vocabulary home
+/// for surface keying.
+pub use neuron::transport::path_instance;
 
 /// Heuristic until the TOMLs carry an explicit kind (see module docs).
 pub fn surface_kind(def: &DeviceDef) -> SurfaceKind {
@@ -53,18 +149,28 @@ pub fn surface_kind(def: &DeviceDef) -> SurfaceKind {
     }
 }
 
-/// A device def → the surface it exposes. `None` for devices without a
-/// lighting block — they aren't paintable surfaces (their tuning/battery
-/// capabilities join the host through the control plane later, not here).
-pub fn surface_info(def: &DeviceDef, pid: u16) -> Option<SurfaceInfo> {
+/// A device def → the surface it exposes, under an already-computed key (see [`discover_from`]
+/// for how the key is chosen). `None` for devices without a lighting block — they aren't
+/// paintable surfaces (their tuning/battery capabilities join the host through the control plane
+/// later, not here).
+fn surface_info_with_key(def: &DeviceDef, key: String) -> Option<SurfaceInfo> {
     let l = def.lighting.as_ref()?;
     Some(SurfaceInfo {
-        key: surface_key(def, pid),
+        key,
         name: def.name.clone(),
         kind: surface_kind(def),
         leds: l.led_count(),
-        grid: Some(Grid { rows: l.rows as usize, cols: l.cols as usize }),
+        grid: Some(Grid {
+            rows: l.rows as usize,
+            cols: l.cols as usize,
+        }),
     })
+}
+
+/// A device def → the surface it exposes, keyed the common way (bare `codename-pid`, see
+/// [`surface_key`]). `None` for devices without a lighting block.
+pub fn surface_info(def: &DeviceDef, pid: u16) -> Option<SurfaceInfo> {
+    surface_info_with_key(def, surface_key(def, pid))
 }
 
 /// One discovered, bridgeable device (control collection matched, lighting
@@ -74,27 +180,81 @@ pub struct Discovered {
     def: DeviceDef,
     pid: u16,
     path: DevicePath,
+    /// The physical unit this surface belongs to ([`path_instance`]) — what
+    /// lets the app address ONE unit of a duplicate pair precisely.
+    instance: String,
 }
 
-/// Enumerate HID, match against the registry, keep exactly one control
-/// collection per physical device.
+/// Enumerate HID and match against the registry — the only I/O in discovery, split out so
+/// [`discover_from`] stays pure and testable with synthetic HID lists.
 pub fn discover(reg: &Registry) -> Vec<Discovered> {
-    let mut out: Vec<Discovered> = Vec::new();
-    let Ok(devices) = transport::enumerate() else {
-        return out;
+    let Ok(hids) = transport::enumerate() else {
+        return Vec::new();
     };
-    for hid in devices {
-        let Some(def) = reg.find_by_pid(hid.vid, hid.pid) else { continue };
+    discover_from(&hids, reg)
+}
+
+/// The pure core of discovery: match against the registry, collapse one physical device's several
+/// HID collections to one entry, and assign every surface a key that's honest about duplicates —
+/// two identical devices never share a bare key (see [`surface_key_dup`]). No I/O, so this is
+/// exhaustively covered by the tests below with synthetic [`HidDeviceInfo`] lists.
+fn discover_from(hids: &[HidDeviceInfo], reg: &Registry) -> Vec<Discovered> {
+    struct Matched {
+        def: DeviceDef,
+        pid: u16,
+        path: DevicePath,
+        instance: String,
+    }
+    let mut matched: Vec<Matched> = Vec::new();
+    for hid in hids {
+        let Some(def) = reg.find_by_pid(hid.vid, hid.pid) else {
+            continue;
+        };
         if !def.matches_control(hid.usage_page, hid.usage, hid.feature_len) {
             continue;
         }
-        let Some(info) = surface_info(def, hid.pid) else { continue };
-        if out.iter().any(|d| d.info.key == info.key) {
-            continue; // composite devices expose several collections; one wins
+        if def.lighting.is_none() {
+            continue; // not a paintable surface
         }
-        out.push(Discovered { info, def: def.clone(), pid: hid.pid, path: hid.path });
+        let instance = path_instance(&hid.path.as_os_str().to_string_lossy());
+        if matched.iter().any(|m| m.instance == instance) {
+            continue; // another collection of the SAME physical device already matched
+        }
+        matched.push(Matched {
+            def: def.clone(),
+            pid: hid.pid,
+            path: hid.path.clone(),
+            instance,
+        });
     }
-    out
+
+    // Group by (codename, pid) so duplicates — identical models plugged in more than once — are
+    // known BEFORE keys are assigned; every member of a duplicate group gets the disambiguated
+    // key, not just the second one seen.
+    let mut counts: HashMap<(String, u16), usize> = HashMap::new();
+    for m in &matched {
+        *counts.entry((m.def.codename.clone(), m.pid)).or_insert(0) += 1;
+    }
+
+    matched
+        .into_iter()
+        .filter_map(|m| {
+            let dup = counts[&(m.def.codename.clone(), m.pid)] > 1;
+            let key = if dup {
+                surface_key_dup(&m.def, m.pid, &m.instance)
+            } else {
+                surface_key(&m.def, m.pid)
+            };
+            let info = surface_info_with_key(&m.def, key)?;
+            Some(Discovered {
+                info,
+                def: m.def,
+                pid: m.pid,
+                path: m.path,
+                instance: m.instance,
+            })
+        })
+        .collect()
 }
 
 /// The HID frame sink: the one place bytes reach this device. Mirrors the
@@ -123,7 +283,10 @@ pub struct HidSink {
 
 impl HidSink {
     pub fn new(def: DeviceDef, pid: u16, path: DevicePath) -> HidSink {
-        let light = def.lighting.clone().expect("bridge only sinks lighting devices");
+        let light = def
+            .lighting
+            .clone()
+            .expect("bridge only sinks lighting devices");
         HidSink {
             def,
             pid,
@@ -138,12 +301,19 @@ impl HidSink {
     }
 }
 
-/// The board's honest maximum stream rate (see module docs).
+/// The board's honest maximum stream rate.
+///
+/// Legacy boards were long capped at 6 fps on "frames drop above ~6" folklore — but a live wire
+/// probe (`device::tests::live_stream_strategy_probe`, BlackWidow Chroma V2) measured the REAL
+/// cost: ~1ms per feature report under the production set+drain discipline, a full 7-report frame
+/// in <10ms, 30 fps sustained for 90 frames with zero failures/overruns and the device healthy
+/// after. The old ceiling came from the ACK'd write path (10ms first-poll sleep × 7 reports ≈
+/// 6 fps), not the silicon — Synapse animates the same board fast, and now so do we. The sink's
+/// per-row breathing (2ms) plus the writer's periodic self-heal repaint guard the burst-drop edge
+/// the old cap was afraid of.
 fn max_fps_for(def: &DeviceDef) -> u32 {
-    match def.lighting.as_ref().map(|l| l.protocol) {
-        Some(Protocol::Legacy) => 6,
-        _ => 30,
-    }
+    let _ = def; // per-device ceilings gone; kept as the seam a future genuinely-slow link plugs into
+    neuron::lighting::MAX_STREAM_FPS
 }
 
 impl FrameSink for HidSink {
@@ -151,6 +321,16 @@ impl FrameSink for HidSink {
         // SAFE-mode parity: the app's process-wide writes-paused kill switch
         // gates this sink exactly like every other device writer.
         if neuron::writes::writes_paused() {
+            return;
+        }
+        // Nothing claims this surface at all → don't touch the silicon. The
+        // firmware's latched frame IS the correct display (onboard-first),
+        // and this is exactly the app's own "stop" semantics: the stream
+        // ends, the board keeps its last frame. A PARTIALLY unclaimed frame
+        // still paints (holes go black, deterministically) — only the
+        // fully-unclaimed case leaves the device alone.
+        if frame.iter().all(|c| c.is_none()) {
+            self.last = None; // whatever comes next repaints in full
             return;
         }
         if self.skips > 0 {
@@ -192,7 +372,12 @@ impl FrameSink for HidSink {
                 None => CoreRgb::BLACK,
             })
             .collect();
-        changed_rows_into(self.last.as_deref(), &px, self.light.cols as usize, &mut self.changed);
+        changed_rows_into(
+            self.last.as_deref(),
+            &px,
+            self.light.cols as usize,
+            &mut self.changed,
+        );
         let mut sent = false;
         for &row in &self.changed {
             if let Some(rep) = self.light.row_report(&px, row) {
@@ -223,11 +408,112 @@ impl FrameSink for HidSink {
     }
 }
 
-/// The running bridge: declared surfaces + their writers. Dropping it stops
-/// and joins every writer (each holding the only handle to its device).
+/// The running bridge: declared surfaces, their writers, and the app-facing
+/// maps (pid → surface key, key → shared fps pace). Dropping it stops and
+/// joins every writer (each holding the only handle to its device).
 pub struct Bridge {
     pub surfaces: Vec<SurfaceInfo>,
+    /// The app speaks pids; protocols speak surface keys. This is the seam — and it's
+    /// deliberately one-to-MANY: two identical devices share a pid while being two distinct
+    /// surfaces. Pid-level callers (profile apply, anything without a unit in hand) iterate
+    /// this; unit-precise callers resolve through [`key_for_unit`](Bridge::key_for_unit).
+    by_pid: HashMap<u16, Vec<String>>,
+    /// Physical unit ([`path_instance`]) → surface key: the PRECISE resolution the app's
+    /// per-unit control plane uses, so an operation aimed at one unit of a duplicate pair
+    /// lands on exactly that unit's surface.
+    by_unit: HashMap<String, String>,
+    /// Per-surface pace shared between the writer AND that surface's
+    /// CompositorContent — the GUI fps slider writes here and both follow.
+    paces: HashMap<String, Arc<AtomicU32>>,
+    grids: HashMap<String, (u8, u8)>,
+    /// Per-surface pause valves — how transient readers (getter sweeps,
+    /// read-back-verified setters) borrow the device's one feature-report
+    /// channel from its streaming writer (see [`WriterPauser`]).
+    pausers: HashMap<String, WriterPauser>,
     _writers: Vec<Writer>,
+}
+
+impl Bridge {
+    /// Every surface this pid maps to — usually one, but two identical devices legitimately
+    /// share a pid (see the `by_pid` doc). Empty slice if the pid isn't bridged at all. For
+    /// callers WITHOUT a unit in hand (pid-level config operations), applying to every surface
+    /// is honest mirroring; anything addressing one physical unit resolves via
+    /// [`key_for_unit`](Bridge::key_for_unit) instead.
+    pub fn keys_for_pid(&self, pid: u16) -> &[String] {
+        self.by_pid.get(&pid).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
+    /// The one surface key belonging to a physical unit ([`path_instance`]) — the precise
+    /// resolution for per-unit operations. `None` when that unit isn't bridged (no lighting
+    /// block, or it appeared after attach); callers must NOT fall back to a pid sibling — that
+    /// would silently retarget a different physical device.
+    pub fn key_for_unit(&self, unit: &str) -> Option<&String> {
+        self.by_unit.get(unit)
+    }
+
+    /// The surface's writer pause valve (see [`WriterPauser`]) — `None` if
+    /// the surface isn't bridged.
+    pub fn pauser(&self, key: &str) -> Option<WriterPauser> {
+        self.pausers.get(key).cloned()
+    }
+
+    pub fn pace(&self, key: &str) -> Option<Arc<AtomicU32>> {
+        self.paces.get(key).cloned()
+    }
+
+    /// Live re-pace, same contract as the app's `set_anim_fps`. `false` if
+    /// the surface isn't bridged.
+    pub fn set_fps(&self, key: &str, fps: u32) -> bool {
+        match self.paces.get(key) {
+            Some(p) => {
+                p.store(
+                    fps.clamp(1, neuron::lighting::MAX_STREAM_FPS),
+                    Ordering::Relaxed,
+                );
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The device's LED matrix shape (rows, cols) — what CompositorContent
+    /// needs to render the app's LayerDefs onto this surface.
+    pub fn grid_of(&self, key: &str) -> Option<(u8, u8)> {
+        self.grids.get(key).copied()
+    }
+}
+
+/// Writer-thread QoS — called ON the writer thread (the sink factory runs
+/// there). A 30fps stream needs ~33ms cycles from `thread::sleep`, but when a
+/// fullscreen game has focus Windows coarsens background timers to ~15.6ms
+/// and deprioritizes the thread — the writer then blows deadlines and drops
+/// frames, which is exactly the "lighting goes laggy in-game, fine on the
+/// desktop" failure. Two counters, both scoped to intent:
+/// - `timeBeginPeriod(1)` — 1ms timer resolution for this process, so paced
+///   sleeps wake on time. Never unwound: the writer lives for the process
+///   (the OS releases it at exit).
+/// - `SetThreadPriority(ABOVE_NORMAL)` — the frame writer outranks bulk
+///   background work but never the input/dispatch spine (which runs at
+///   normal priority on its own latency budget) nor anything time-critical.
+///
+/// Raw `#[link]` FFI, no new deps (the workspace manifest is frozen); a
+/// no-op off Windows.
+fn writer_thread_qos() {
+    #[cfg(windows)]
+    unsafe {
+        #[link(name = "winmm")]
+        extern "system" {
+            fn timeBeginPeriod(u_period: u32) -> u32;
+        }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetCurrentThread() -> isize;
+            fn SetThreadPriority(h_thread: isize, n_priority: i32) -> i32;
+        }
+        const THREAD_PRIORITY_ABOVE_NORMAL: i32 = 1;
+        timeBeginPeriod(1);
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    }
 }
 
 /// Discover, declare, and start one writer per device. `fps` is the requested
@@ -237,23 +523,76 @@ pub struct Bridge {
 pub fn attach(reg: &Registry, host: &HostHandle, fps: u32) -> Bridge {
     let mut surfaces = Vec::new();
     let mut writers = Vec::new();
+    let mut by_pid = HashMap::new();
+    let mut paces = HashMap::new();
+    let mut grids = HashMap::new();
+    let mut pausers = HashMap::new();
+    let mut by_unit = HashMap::new();
     for d in discover(reg) {
         let rate = fps.min(max_fps_for(&d.def));
+        let pace = Arc::new(AtomicU32::new(rate));
         let mut h = host.clone();
         h.declare(d.info.clone());
         let key = d.info.key.clone();
+        by_pid
+            .entry(d.pid)
+            .or_insert_with(Vec::new)
+            .push(key.clone());
+        by_unit.insert(d.instance.clone(), key.clone());
+        paces.insert(key.clone(), pace.clone());
+        if let Some(l) = d.def.lighting.as_ref() {
+            grids.insert(key.clone(), (l.rows, l.cols));
+        }
         surfaces.push(d.info);
         let (def, pid, path) = (d.def, d.pid, d.path);
-        writers.push(Writer::spawn(host.clone(), key, rate, move || {
+        let writer = Writer::spawn_paced(host.clone(), key.clone(), pace, move || {
+            writer_thread_qos();
             HidSink::new(def, pid, path)
-        }));
+        });
+        pausers.insert(key, writer.pauser());
+        writers.push(writer);
     }
-    Bridge { surfaces, _writers: writers }
+    Bridge {
+        surfaces,
+        by_pid,
+        by_unit,
+        paces,
+        grids,
+        pausers,
+        _writers: writers,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The kernel builds pure-std, so `writer.rs` MIRRORS neuron-core's stream ceiling and pure
+    /// pacing math instead of importing them. This test — in the one module that sees BOTH crates
+    /// — is what makes that mirroring safe: any drift in the constant or the pacing behaviour
+    /// fails here instead of shipping as a silent cadence divergence.
+    #[test]
+    fn writer_mirrors_neuron_cores_ceiling_and_pacing() {
+        assert_eq!(
+            crate::writer::MAX_WRITER_FPS,
+            neuron::lighting::MAX_STREAM_FPS,
+            "the writer's fps clamp domain must equal the pipeline-wide MAX_STREAM_FPS"
+        );
+        let t0 = Instant::now();
+        let dt = std::time::Duration::from_millis(33);
+        for (deadline, now) in [
+            (t0 + dt, t0),                                    // ahead of schedule → sleep
+            (t0, t0 + std::time::Duration::from_millis(10)),  // small overrun → absorb
+            (t0, t0 + std::time::Duration::from_millis(100)), // stall → lag clamps to one dt
+            (t0, t0),                                         // exactly on time
+        ] {
+            assert_eq!(
+                crate::writer::pace(deadline, now, dt),
+                neuron::lighting::pace(deadline, now, dt),
+                "writer::pace must behave identically to lighting::pace"
+            );
+        }
+    }
 
     /// The embedded registry (the two real device TOMLs) must map to sane
     /// surfaces — this is the hardware-free proof that the TOML → SurfaceInfo
@@ -263,13 +602,20 @@ mod tests {
         let reg = Registry::load().expect("embedded registry parses");
         assert!(!reg.devices.is_empty());
         for def in &reg.devices {
-            let Some(l) = def.lighting.as_ref() else { continue };
+            let Some(l) = def.lighting.as_ref() else {
+                continue;
+            };
             let pid = def.product_ids().next().expect("every def has a mode");
             let info = surface_info(def, pid).expect("lighting def ⇒ surface");
             assert_eq!(info.leds, l.led_count());
             let g = info.grid.expect("bridged surfaces are grids");
             assert_eq!(g.rows * g.cols, info.leds);
-            assert!(info.key.starts_with(&def.codename), "key {} ~ {}", info.key, def.codename);
+            assert!(
+                info.key.starts_with(&def.codename),
+                "key {} ~ {}",
+                info.key,
+                def.codename
+            );
             assert!(!info.name.is_empty());
         }
     }
@@ -300,12 +646,186 @@ mod tests {
     fn wired_and_dongle_pids_are_distinct_surfaces_of_one_model() {
         let reg = Registry::load().unwrap();
         for def in &reg.devices {
-            let keys: Vec<String> =
-                def.product_ids().map(|pid| surface_key(def, pid)).collect();
+            let keys: Vec<String> = def.product_ids().map(|pid| surface_key(def, pid)).collect();
             let mut dedup = keys.clone();
             dedup.sort();
             dedup.dedup();
-            assert_eq!(keys.len(), dedup.len(), "link modes must not collide: {keys:?}");
+            assert_eq!(
+                keys.len(),
+                dedup.len(),
+                "link modes must not collide: {keys:?}"
+            );
         }
+    }
+
+    #[test]
+    fn path_instance_strips_collection_segments_but_keeps_container_id() {
+        let a = r"\\?\hid#vid_1532&pid_0221&mi_01&col02#8&2f5ca30f&0&0001#{4d1e55b2-f16f-11cf-88cb-001111000030}";
+        // A second collection of the SAME physical device: mi_/col differ, container id doesn't.
+        let a2 = r"\\?\hid#vid_1532&pid_0221&mi_00&col01#8&2f5ca30f&0&0001#{4d1e55b2-f16f-11cf-88cb-001111000030}";
+        assert_eq!(
+            path_instance(a),
+            path_instance(a2),
+            "same physical device must collapse"
+        );
+
+        // A second, physically distinct unit: same collection segment, different container id.
+        let b = r"\\?\hid#vid_1532&pid_0221&mi_01&col02#8&3a9cd410&0&0001#{4d1e55b2-f16f-11cf-88cb-001111000030}";
+        assert_ne!(
+            path_instance(a),
+            path_instance(b),
+            "different container id must stay distinct"
+        );
+    }
+
+    /// Build a synthetic HID enumeration entry for `discover_from` tests — no real transport
+    /// I/O, so discovery's matching/grouping/keying logic is provable without hardware.
+    fn hid(
+        vid: u16,
+        pid: u16,
+        usage_page: u16,
+        usage: u16,
+        feature_len: u16,
+        path: &str,
+    ) -> HidDeviceInfo {
+        HidDeviceInfo {
+            vid,
+            pid,
+            usage_page,
+            usage,
+            feature_len,
+            path: neuron::transport::DevicePath::from_str_for_tests(path),
+        }
+    }
+
+    /// The BlackWidow Chroma V2's control collection shape, straight from its TOML, so synthetic
+    /// entries actually pass `matches_control`.
+    const BW_VID: u16 = 0x1532;
+    const BW_PID: u16 = 0x0221;
+    const BW_USAGE_PAGE: u16 = 0x0001;
+    const BW_USAGE: u16 = 0x0002;
+    const BW_FEATURE_LEN: u16 = 91;
+
+    fn bw_hid(path: &str) -> HidDeviceInfo {
+        hid(
+            BW_VID,
+            BW_PID,
+            BW_USAGE_PAGE,
+            BW_USAGE,
+            BW_FEATURE_LEN,
+            path,
+        )
+    }
+
+    #[test]
+    fn discover_from_collapses_one_devices_collections_to_one_surface() {
+        let reg = Registry::load().unwrap();
+        let hids = vec![
+            // Main + vendor collections of ONE physical keyboard: only mi_/col differ.
+            bw_hid(r"\\?\hid#vid_1532&pid_0221&mi_00&col01#8&2f5ca30f&0&0001#{guid}"),
+            bw_hid(r"\\?\hid#vid_1532&pid_0221&mi_01&col02#8&2f5ca30f&0&0001#{guid}"),
+        ];
+        let out = discover_from(&hids, &reg);
+        assert_eq!(out.len(), 1, "one physical device must yield one surface");
+        assert_eq!(
+            out[0].info.key,
+            surface_key_of(&reg, "BlackWidow Chroma V2", BW_PID)
+        );
+    }
+
+    #[test]
+    fn discover_from_gives_two_identical_devices_distinct_hash_suffixed_keys() {
+        let reg = Registry::load().unwrap();
+        let hids = vec![
+            bw_hid(r"\\?\hid#vid_1532&pid_0221&mi_01&col02#8&2f5ca30f&0&0001#{guid}"),
+            bw_hid(r"\\?\hid#vid_1532&pid_0221&mi_01&col02#8&3a9cd410&0&0001#{guid}"),
+        ];
+        let out = discover_from(&hids, &reg);
+        assert_eq!(
+            out.len(),
+            2,
+            "two physically distinct units must both survive"
+        );
+        let bare = surface_key_of(&reg, "BlackWidow Chroma V2", BW_PID);
+        for d in &out {
+            assert_ne!(
+                d.info.key, bare,
+                "no surface may keep the ambiguous bare key"
+            );
+            assert!(d.info.key.starts_with(&bare), "key {} ~ {bare}", d.info.key);
+        }
+        assert_ne!(
+            out[0].info.key, out[1].info.key,
+            "the two units must get distinct keys"
+        );
+    }
+
+    #[test]
+    fn each_discovered_unit_carries_its_own_instance_for_precise_targeting() {
+        // The app's per-unit control plane resolves `path_instance(row) → surface key` through
+        // `Bridge::key_for_unit` (built from these Discovered entries). That only works if every
+        // Discovered's `instance` is exactly the path_instance of the path it was matched from —
+        // for duplicates AND for the unique case.
+        let reg = Registry::load().unwrap();
+        let paths = [
+            r"\\?\hid#vid_1532&pid_0221&mi_01&col02#8&2f5ca30f&0&0001#{guid}",
+            r"\\?\hid#vid_1532&pid_0221&mi_01&col02#8&3a9cd410&0&0001#{guid}",
+        ];
+        let hids: Vec<_> = paths.iter().map(|p| bw_hid(p)).collect();
+        let out = discover_from(&hids, &reg);
+        assert_eq!(out.len(), 2);
+        for (d, p) in out.iter().zip(paths.iter()) {
+            assert_eq!(
+                d.instance,
+                path_instance(p),
+                "instance must be the unit identity of the path it matched"
+            );
+        }
+        assert_ne!(out[0].instance, out[1].instance);
+        assert_ne!(
+            out[0].info.key, out[1].info.key,
+            "distinct instances must resolve to distinct surface keys — the bijection key_for_unit serves"
+        );
+    }
+
+    #[test]
+    fn discover_from_keeps_bare_keys_for_two_different_models() {
+        let reg = Registry::load().unwrap();
+        let naga = reg
+            .devices
+            .iter()
+            .find(|d| d.codename == "Aria")
+            .expect("Naga def present");
+        let naga_pid = naga.product_ids().next().unwrap();
+        let hids = vec![
+            bw_hid(r"\\?\hid#vid_1532&pid_0221&mi_01&col02#8&2f5ca30f&0&0001#{guid}"),
+            hid(
+                naga.vendor_id,
+                naga_pid,
+                naga.control_interface.usage_page,
+                naga.control_interface.usage,
+                naga.control_interface.feature_report_len,
+                r"\\?\hid#vid_1532&pid_00a7&mi_02&col03#9&1a2b3c4d&0&0002#{guid}",
+            ),
+        ];
+        let out = discover_from(&hids, &reg);
+        assert_eq!(out.len(), 2);
+        assert_eq!(
+            out[0].info.key,
+            surface_key_of(&reg, "BlackWidow Chroma V2", BW_PID)
+        );
+        assert_eq!(out[1].info.key, surface_key_of(&reg, "Aria", naga_pid));
+    }
+
+    /// Look up a def by codename and compute its (unique-case) key the same way production does
+    /// — kept as a helper so the tests above assert against the real `surface_key`, not a
+    /// hand-copied string.
+    fn surface_key_of(reg: &Registry, codename: &str, pid: u16) -> String {
+        let def = reg
+            .devices
+            .iter()
+            .find(|d| d.codename == codename)
+            .expect("def present");
+        surface_key(def, pid)
     }
 }
