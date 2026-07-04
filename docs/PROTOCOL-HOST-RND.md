@@ -748,12 +748,9 @@ macro engine are just two of its subscribers.
   namespace (31 `Global\{GUID}` the DLL references + 2 the server creates =
   `60C824F3…`/`CB3C8DAE…`, the rendezvous pair we must own), the structs
   (ChromaAppInfo/AppData/SessionInfo/DeviceChromaData), version 3.37, and the
-  registry app-gating (Overwatch is registered + in the PriorityList). Full spec
-  + the runtime-capture plan (WinObj/handle64/API-Monitor) + the `chroma_shm`
-  adapter design + the elevation fork (`Global\` needs SeCreateGlobalPrivilege)
-  live in **`docs/CHROMA-SHM-RND.md`**. NEXT = the capture session (stop
-  neuron-app to free 54235, start the Razer service, WinObj+API-Monitor while
-  Overwatch paints) to fill the object table + envelope layout, THEN implement.
+  registry app-gating. The `chroma_shm` adapter is implemented in
+  `crates/neuron-host/src/adapters/chroma_shm.rs` (elevation: `Global\` needs
+  SeCreateGlobalPrivilege).
 - **⚠ note:** the WIP snapshot needed the gitignored `runtime/` dir copied
   from the main tree (neuron-core include_str!s the Python host files);
   remember this for fresh worktrees.
