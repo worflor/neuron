@@ -1,10 +1,9 @@
-//! Razer Chroma SDK REST server adapter — the flagship port.
+//! Chroma SDK REST server adapter — the flagship port.
 //!
-//! Chroma-enabled games open a session against `localhost:54235`, heartbeat it
-//! every ~1s, and drive lighting effects per device. Crucially, the native
-//! `RzChromaSDK64.dll` is itself just a client of this same REST server — so
-//! one server catches BOTH native-SDK and REST games, with no DLL hijacking
-//! and no anti-cheat exposure (R&D doc §4.1).
+//! Chroma-enabled games and tools open a session against `localhost:54235`, heartbeat
+//! it every ~1s, and drive lighting effects per device. This is the REST face; native
+//! games that speak shared memory instead are served by [`super::chroma_shm`]. Together
+//! they catch both, with nothing injected into any game process.
 //!
 //! This module is a PURE request→response state machine: no sockets, no
 //! threads, no clock reads — the HTTP pump lives elsewhere and time arrives

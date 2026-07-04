@@ -623,7 +623,7 @@ export global State {
     in-out property <bool> host-chroma: true;              // serve Chroma (games) while enabled
     in-out property <bool> host-openrgb: true;             // serve OpenRGB (tools) while enabled
     in-out property <bool> host-obs: false;                // connect OUT to OBS (macros drive scenes)
-    in-out property <bool> host-lighting-wins: false;      // WHO WINS: my lighting always wins vs games take over
+    in-out property <bool> host-game-merge: true;          // HOW: merge (screen the game over your lighting) vs replace
     in-out property <string> host-obs-password: "";        // obs-websocket Server Password (masked field)
     in-out property <string> host-chroma-status: "";       // honest per-protocol readout
     in-out property <string> host-openrgb-status: "";
@@ -638,7 +638,7 @@ export global State {
     callback set-host-chroma(bool);
     callback set-host-openrgb(bool);
     callback set-host-obs(bool);
-    callback set-host-lighting-wins(bool);
+    callback set-host-game-merge(bool);
     callback set-host-obs-password(string);                 // save + reconnect with the new secret
     // LIGHTING page truth strip: a client holds a claim above your base on the selected board
     // (painting now; your effect resumes when it releases).

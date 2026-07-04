@@ -4498,18 +4498,17 @@ pub fn install(app: &AppWindow) -> SharedRt {
     // WHO WINS — flip the base-layer band live: re-pin drops mis-banded base layers, then
     // re-applying the current stack re-claims at the new band (one code path). The truth strip
     // on LIGHTING updates on its own next poll.
-    bind(app, &shared, |app, sh| {
+    bind(app, &shared, |app, _sh| {
         let w = app.as_weak();
-        let sh = sh.clone();
-        app.global::<State>().on_set_host_lighting_wins(move |v| {
+        app.global::<State>().on_set_host_game_merge(move |v| {
             if let Some(app) = w.upgrade() {
-                let msg = crate::prefs::set_host_lighting_wins(v);
-                crate::host::repin_policy();
-                // repin_policy DROPPED every base layer whose band no longer matches the new policy —
-                // across ALL boards — so re-claim them all at the new band, not just the selected one.
-                reapply_all_boards(&app, &sh);
+                let msg = crate::prefs::set_host_game_merge(v);
+                // Re-tints the live native game layers to the new blend mode (screen ⇄ over)
+                // by storing into the shared blend cell they read — no respawn, no board
+                // re-claim, the connected game keeps its session; the swap shows next frame.
+                crate::host::apply_protocol_prefs();
                 let st = app.global::<State>();
-                st.set_host_lighting_wins(crate::prefs::host_lighting_wins());
+                st.set_host_game_merge(crate::prefs::host_game_merge());
                 st.set_status_line(msg.into());
             }
         });
@@ -8629,7 +8628,7 @@ pub fn refresh_host_status(app: &AppWindow) {
     st.set_host_chroma(crate::prefs::host_chroma());
     st.set_host_openrgb(crate::prefs::host_openrgb());
     st.set_host_obs(crate::prefs::host_obs());
-    st.set_host_lighting_wins(crate::prefs::host_lighting_wins());
+    st.set_host_game_merge(crate::prefs::host_game_merge());
     // NB: the password field is deliberately NOT touched here. This runs ~1s while the System
     // page is up, and "empty" is indistinguishable from "the user just cleared the field to
     // remove/replace the secret" — reseeding on empty would let the poller fight that edit and
@@ -8682,11 +8681,28 @@ pub fn refresh_host_status(app: &AppWindow) {
             format!("{} is connected, not painting yet", join(&all))
         })
     };
-    st.set_host_chroma_status(
-        client_line(&s.chroma_clients)
-            .unwrap_or_else(|| line(crate::prefs::host_chroma(), s.chroma_serving, 54235))
-            .into(),
-    );
+    // Chroma status, most-specific first: a native game ON THE KEYS reads as pure
+    // telemetry (`overwatch · 3 dev · custom`); else a REST client's line; else the two
+    // faces at rest, each reporting its OWN bind state — the SHM (native) and REST faces
+    // bind independently, so a squatted REST port must not read as served just because the
+    // native server came up.
+    let chroma_status = if let Some(g) = &s.chroma_native_game {
+        format!("{} · {} dev · {}", g.game, g.devices, g.effect)
+    } else {
+        client_line(&s.chroma_clients).unwrap_or_else(|| {
+            if s.chroma_native_serving {
+                if s.chroma_serving {
+                    "native sdk · rest :54235".to_string()
+                } else {
+                    // native up, REST port taken (usually real Synapse) — say so, don't imply :54235 is ours.
+                    "native sdk · rest :54235 busy".to_string()
+                }
+            } else {
+                line(crate::prefs::host_chroma(), s.chroma_serving, 54235)
+            }
+        })
+    };
+    st.set_host_chroma_status(chroma_status.into());
     st.set_host_openrgb_status(
         client_line(&s.openrgb_clients)
             .unwrap_or_else(|| line(crate::prefs::host_openrgb(), s.openrgb_serving, 6742))
@@ -8695,7 +8711,9 @@ pub fn refresh_host_status(app: &AppWindow) {
     // The live lamps: lit only when the gate is on AND it's actually up. Games/tools light when the
     // port is bound; OBS lights when the websocket authenticates. Dark otherwise (off, port busy, or
     // still looking), so the lamp coming on is the honest "it connected" moment.
-    st.set_host_chroma_live(crate::prefs::host_chroma() && s.chroma_serving);
+    st.set_host_chroma_live(
+        crate::prefs::host_chroma() && (s.chroma_serving || s.chroma_native_serving),
+    );
     st.set_host_openrgb_live(crate::prefs::host_openrgb() && s.openrgb_serving);
     st.set_host_obs_live(crate::prefs::host_obs() && s.obs_connected);
     // OBS is an OUTBOUND connection, so its truth is a real connected state: "connected to OBS"

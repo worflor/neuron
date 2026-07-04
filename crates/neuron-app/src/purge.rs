@@ -167,6 +167,20 @@ fn image_path(pid: u32) -> Option<String> {
     }
 }
 
+/// The lowercased executable stem of a live process — e.g. `29764` → `"overwatch"` —
+/// or `None` if it can't be opened/queried. A friendlier label than a raw PID for the
+/// CONNECTIONS readout (the Chroma app registry leaves the exe name blank against our
+/// own server, so we resolve it from the PID instead).
+pub fn process_name(pid: u32) -> Option<String> {
+    let path = image_path(pid)?;
+    let base = path.rsplit(['\\', '/']).next().unwrap_or(&path);
+    let stem = base
+        .strip_suffix(".exe")
+        .or_else(|| base.strip_suffix(".EXE"))
+        .unwrap_or(base);
+    (!stem.is_empty()).then(|| stem.to_lowercase())
+}
+
 /// One Toolhelp pass: every live process with its parent and (best-effort) full image path.
 fn snapshot() -> Vec<Proc> {
     let mut out = Vec::new();

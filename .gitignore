@@ -8,6 +8,14 @@
 # never source — must not be committed.
 /vendor/
 
+# Binary blobs never belong in source. This covers the raw Chroma capture dumps
+# (docs/chroma-shm-capture/) AND the codec's include_bytes! assets under
+# crates/neuron-host/src/adapters/chroma_shm_data/ — they live on disk so the local
+# build/tests resolve them, but stay out of git. If any ever needs committing, force it
+# with `git add -f <path>`.
+*.bin
+/docs/chroma-shm-capture/
+
 # Runtime diagnostics and crash artifacts
 *.dmp
 *.mdmp

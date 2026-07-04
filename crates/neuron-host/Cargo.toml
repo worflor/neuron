@@ -22,12 +22,34 @@ serde_json = { workspace = true }
 neuron = { path = "../neuron-core", optional = true }
 anyhow = { workspace = true, optional = true }
 
+# Win32 FFI for the Chroma SHM server pump (create the named objects, read the
+# device buffers). Already used by neuron-core; only compiled on Windows and
+# only when the `bridge` feature is on — the pure protocol codec needs none of it.
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.59"
+optional = true
+features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+]
+
 [features]
 # Real-hardware bridge: registry discovery -> surfaces, HID frame sinks
 # behind the single writer. Off by default; the kernel + adapters build
 # and test with zero deps beyond serde.
-bridge = ["dep:neuron", "dep:anyhow"]
+bridge = ["dep:neuron", "dep:anyhow", "dep:windows-sys"]
 
 [[example]]
 name = "host_serve"
+required-features = ["bridge"]
+
+[[example]]
+name = "chroma_serve"
+required-features = ["bridge"]
+
+[[example]]
+name = "chroma_paint"
 required-features = ["bridge"]

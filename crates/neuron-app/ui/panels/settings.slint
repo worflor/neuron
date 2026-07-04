@@ -1738,20 +1738,21 @@ export component SettingsPanel inherits VerticalLayout {
                             }
                         }
 
-                        // WHO WINS — the config Synapse and OpenRGB can't offer, because they just
-                        // let the last writer win. Here it's one priority-band pick.
+                        // HOW A GAME COMBINES with your lighting — the config Synapse and OpenRGB
+                        // can't offer, because they just let the last writer win. Here the arbiter
+                        // blends instead: merge screens the game's light over your base.
                         Rectangle { height: 1px; }
                         VerticalLayout {
                             spacing: 3px;
                             Toggle {
-                                caption: "my lighting always wins";
-                                checked: State.host-lighting-wins;
-                                toggled(v) => { State.set-host-lighting-wins(v); }
+                                caption: "merge, don't replace";
+                                checked: State.host-game-merge;
+                                toggled(v) => { State.set-host-game-merge(v); }
                             }
                             Mono {
-                                text: State.host-lighting-wins
-                                    ? "your lighting always shows. a connected game waits underneath."
-                                    : "a connected game takes over. your lighting comes back when it stops.";
+                                text: State.host-game-merge
+                                    ? "a game's light adds over your lighting — its bright keys punch through, yours stays beneath."
+                                    : "a game takes over the keys it paints. your lighting comes back when it stops.";
                                 color: Theme.text-faint; wrap: word-wrap;
                             }
                         }

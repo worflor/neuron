@@ -22,7 +22,10 @@ name = "neuron-app"
 path = "src/main.rs"
 
 [dependencies]
-neuron = { path = "../neuron-core" }
+# idle-power-write: the sleep-timer SET (0x07/0x03) is hardware-confirmed (Naga V2 Pro,
+# 2026-07-02 round-trip), so the app ships with the write enabled; it stays verify-gated
+# (every write re-reads 0x07/0x83 and demands the echo).
+neuron = { path = "../neuron-core", features = ["idle-power-write"] }
 # The protocol host: ownership arbiter + OpenRGB/Chroma servers + the neuron-core
 # bridge (the "bridge" feature pulls in the real HID sinks). This is what lets
 # games (Chroma) and RGB tools (OpenRGB) drive the SAME lighting the app edits,

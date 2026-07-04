@@ -396,7 +396,9 @@ pub fn cycle_scroll_stage(cur: u8, step: i32, count: u8) -> u8 {
 // ---------------------------------------------------------------------------------------------
 // 2b. LED POWER / IDLE-OFF TIMEOUT — Synapse `LedPowerSettings` (IdleStateValue, seconds).
 //     Power class 0x07. Sleep/idle timeout READ observed live at 0x07/0x83 (=300s). The SET
-//     (0x07/0x03, the standard get/set pairing) is DERIVED and verify-gated + hardware-flagged.
+//     (0x07/0x03, the standard get/set pairing) is hardware-CONFIRMED on the Naga V2 Pro
+//     (2026-07-02: wrote 120s, 0x83 echoed 0x0078, restored 300s) — the app + CLI enable the
+//     `idle-power-write` feature, and every write still round-trips through `verify_getter`.
 // ---------------------------------------------------------------------------------------------
 
 /// Power class (battery/sleep live here: battery 0x07/0x80, charging 0x07/0x84, sleep/idle 0x07/0x83).
@@ -406,18 +408,18 @@ const ID_IDLE_SET: u8 = 0x03;
 /// Idle-timeout payload size: a single big-endian u16 seconds value (the observed read width).
 const IDLE_SIZE: u8 = 0x02;
 
-/// Independent gate for the DERIVED idle-timeout write (read 0x07/0x83 is proven; the SET 0x07/0x03
-/// is the standard pairing but UNCONFIRMED on hardware). Off by default; either the
-/// `idle-power-write` Cargo feature or `NEURON_IDLE_WRITE` env opens it. The builder + verify path
-/// are always compiled & tested; only the device write is gated.
+/// Gate for the idle-timeout write. Both directions are hardware-CONFIRMED (read 0x07/0x83 and
+/// the SET 0x07/0x03, Naga V2 Pro round-trip 2026-07-02), so the app + CLI crates enable the
+/// `idle-power-write` Cargo feature; the `NEURON_IDLE_WRITE` env stays as a runtime escape hatch
+/// for builds without it. A bare library build still defaults to no device writes.
 pub fn idle_write_enabled() -> bool {
     cfg!(feature = "idle-power-write") || std::env::var_os("NEURON_IDLE_WRITE").is_some()
 }
 
 pub(crate) fn idle_write_disabled_message() -> &'static str {
-    "LED idle/power-timeout write is gated off (set opcode 0x07/0x03 not yet hardware-verified). \
-     Set NEURON_IDLE_WRITE=1 to enable, then verify the 0x07/0x83 round-trip on an awake \
-     device before trusting it. (Integration: promote to an `idle-power-write` Cargo feature.)"
+    "LED idle/power-timeout write is compiled out (built without the `idle-power-write` feature). \
+     The opcode (0x07/0x03) is hardware-verified; rebuild with the feature — as the app and CLI \
+     do — or set NEURON_IDLE_WRITE=1 to enable at runtime."
 }
 
 /// Build the LED idle/power timeout SET payload: a big-endian u16 of seconds. `0` means "never
@@ -427,17 +429,14 @@ pub fn build_idle_payload(secs: u32) -> Vec<u8> {
     vec![(s >> 8) as u8, s as u8]
 }
 
-/// Write the LED idle-off timeout (seconds), GATED + verify-gated + hardware-flagged.
+/// Write the LED idle-off timeout (seconds), verify-gated.
 ///
-/// CONFIDENCE: the READ (0x07/0x83) is proven live (memory: sleep timeout read = 300s); the SET
-/// opcode (0x07/0x03) is *derived* from the standard Razer get/set pairing (clear the 0x80 read
-/// bit) and is NOT yet confirmed on hardware — hence the [`idle_write_enabled`] gate. `verify_getter`
-/// re-reads 0x07/0x83 and confirms the big-endian seconds we wrote echo back, so a wrong opcode
-/// returns an error rather than silently "working".
-///
-/// HARDWARE-VERIFY: set `NEURON_IDLE_WRITE=1`, write a distinctive value (e.g. 120s) on an awake
-/// device, then re-read 0x07/0x83 and confirm 0x0078. If it doesn't echo, the opcode/layout is
-/// wrong — adjust and re-verify before trusting it.
+/// CONFIDENCE: hardware-CONFIRMED both ways on the Naga V2 Pro (2026-07-02): the READ (0x07/0x83)
+/// was long proven live (=300s), and the SET (0x07/0x03, the standard pairing with the 0x80 read
+/// bit cleared) round-tripped — wrote 120s, 0x83 echoed 0x0078, restored 300s. It also matches
+/// openrazer's known `set_idle_time`. `verify_getter` still re-reads 0x07/0x83 after every write
+/// and confirms the big-endian seconds echo back, so a regression errors rather than silently
+/// "working".
 pub fn set_idle_secs(d: &Device, secs: u32) -> Result<()> {
     let payload = build_idle_payload(secs);
     if !idle_write_enabled() {
@@ -582,8 +581,8 @@ const LOD_MODE_ASYMMETRIC: u8 = 0x04;
 
 // ── ASYMMETRIC lift-off (separate LIFT vs LANDING) — the Focus-Pro-30K flex. Same class 0x0B as
 // symmetric, but a 3-step handshake: enable async (0x0B/0x03) → step2 (0x0B/0x0B) → set lift+landing
-// (0x0B/0x05). razerctl-derived (HIGH confidence on the bytes); the Naga V2 Pro shares the Focus Pro
-// 30K sensor, and the SHARED 0x0B/0x85 read-back is the safety net (HARDWARE-CONFIRMED for symmetric).
+// (0x0B/0x05). razerctl-derived; HARDWARE-CONFIRMED on the Naga V2 Pro (async round-trip + feel test),
+// with the SHARED 0x0B/0x85 read-back as the safety net.
 const ID_LOD_ASYNC_ENABLE: u8 = 0x03;
 const ID_LOD_ASYNC_STEP2: u8 = 0x0B;
 const ID_LOD_ASYNC_SET: u8 = 0x05;
@@ -667,11 +666,12 @@ pub fn lift_off_async(d: &Device) -> Option<(u8, u8)> {
 /// Set the sensor lift-off distance ASYMMETRICALLY — separate LIFT (lift-off) and LANDING distances,
 /// the Focus-Pro-30K-class flex. Verify-gated (no env gate); `writes_paused`-guarded.
 ///
-/// CONFIDENCE: razerctl-derived (HIGH confidence on the byte sequence). The Naga V2 Pro shares the
-/// Focus Pro 30K sensor with the mice razerctl was reversed against, and the SHARED 0x0B/0x85
-/// read-back — the same getter symmetric LOD is HARDWARE-CONFIRMED against on this Naga — is the safety
-/// net: if the device doesn't echo `mode=async, lift, landing`, this returns an error rather than a
-/// false success (same trust tier as `set_dpi_stages` / `set_lift_off_distance`).
+/// CONFIDENCE: HARDWARE-CONFIRMED on the Naga V2 Pro (2026-07 — an async lift/landing pair was
+/// written and the 0x0B/0x85 getter echoed `mode=async, lift, landing`; the physical split verified
+/// by feel — tracking cut out high, re-acquired low). razerctl-derived, cross-checked vs OpenRazer.
+/// The shared 0x0B/0x85 read-back is the safety net: if the device doesn't echo the pair, this
+/// returns an error rather than a false success (same trust tier as `set_dpi_stages` /
+/// `set_lift_off_distance`).
 ///
 /// PROTOCOL (all class 0x0B, tx 0x1f via `exec_dynamic`):
 /// 1. ENABLE async:  `id=0x03, size=3, args=[0x00, 0x04, 0x01]`

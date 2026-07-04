@@ -38,8 +38,7 @@ pub const OPENRGB_ADDR: &str = "127.0.0.1:6742";
 /// obs-websocket's default port.
 pub const OBS_ADDR: &str = "127.0.0.1:4455";
 
-/// The Chroma SDK's well-known REST port — the one `RzChromaSDK64.dll` (and
-/// therefore every Chroma game) talks to.
+/// The Chroma SDK's well-known REST port — the one Chroma clients talk to.
 pub const CHROMA_ADDR: &str = "127.0.0.1:54235";
 
 /// The host ELECTION port — a loopback listener held (never accepted on) for the process

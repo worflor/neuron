@@ -30,13 +30,13 @@
 //! frame until the app re-applies its own stream.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use neuron_host::api::{HostApi, LeaseSpec};
-use neuron_host::arbiter::{band, Content, LayerId, SourceId};
+use neuron_host::arbiter::{band, BlendMode, Content, LayerId, SourceId};
 use neuron_host::bridge::{self, Bridge, CompositorContent};
 use neuron_host::bus::Value;
 use neuron_host::net::{
@@ -74,6 +74,12 @@ struct HostState {
     // and the teardown publish would land on a closed channel.
     orgb: Option<OrgbServer>,
     chroma: Option<ChromaHttpServer>,
+    /// The native Chroma SHM server (games that paint over shared memory) + the bookkeeping for
+    /// its fading game layers (see [`ChromaShm`]). Owns the `Global\` objects the game paints; the
+    /// layers hold `Arc` clones, so the mapping is released once those layers are (drop or
+    /// `release_owner`). No bus interaction on teardown, so its drop position is not
+    /// load-bearing.
+    chroma_shm: Option<ChromaShm>,
     /// OBS connection (outbound). Present only while the OBS gate is on.
     obs: Option<ObsConnection>,
     /// The OBS FOLLOWER — the app-side consumer of the `obs.*` bus signals
@@ -275,6 +281,11 @@ pub struct Status {
     pub active: bool,
     pub devices: usize,
     pub chroma_serving: bool,
+    /// The NATIVE (Win32 SHM) Chroma face — neuron being the Chroma server itself:
+    /// whether it's serving, and (when a game is on the keys) a pure-telemetry readout
+    /// of what it's painting.
+    pub chroma_native_serving: bool,
+    pub chroma_native_game: Option<NativeChroma>,
     pub openrgb_serving: bool,
     /// OBS gate is on AND a connection object exists (attempting/connected).
     pub obs_on: bool,
@@ -293,6 +304,19 @@ pub struct Status {
     /// painting your keyboard" from the same leased truth the boards obey.
     pub chroma_clients: Vec<ClientStatus>,
     pub openrgb_clients: Vec<ClientStatus>,
+}
+
+/// What the native Chroma (SHM) server sees a game painting right now — pure telemetry
+/// (game name, lit device count, effect kind), read straight from the decoded protocol.
+#[derive(Clone, Debug, Default)]
+pub struct NativeChroma {
+    /// The game, resolved from its PID (the Chroma registry leaves the name blank
+    /// against our own server); `"a game"` if the PID can't be named.
+    pub game: String,
+    /// Device classes currently showing a lit frame.
+    pub devices: usize,
+    /// Effect kind the game is painting (`custom`, `static`, `wave`, …).
+    pub effect: String,
 }
 
 /// One connected protocol client, as the CONNECTIONS card reads it.
@@ -388,6 +412,31 @@ pub fn apply_protocol_prefs() {
     match (want_chroma, s.chroma.is_some()) {
         (true, false) => s.chroma = ChromaHttpServer::bind(CHROMA_ADDR, s.handle.clone()).ok(),
         (false, true) => s.chroma = None, // Drop joins the accept loop
+        _ => {}
+    }
+    // The native (SHM) face of the same switch: bring the server up, or release its game
+    // layers (which drops the last `Arc`, unmapping the objects) — so the game lighting
+    // fades away and the user's lighting owns the board again.
+    match (want_chroma, s.chroma_shm.is_some()) {
+        (true, false) => {
+            let mut h = s.handle.clone();
+            s.chroma_shm = spawn_chroma_shm(&s.bridge, &mut h);
+        }
+        (false, true) => {
+            if let Some(shm) = s.chroma_shm.take() {
+                s.handle.release_owner(shm.src);
+            }
+        }
+        // Serving already, but the merge policy flipped live → re-tint the game layers in
+        // place: store the new blend mode into the shared cell they all read. No teardown,
+        // so a connected game keeps its shared-memory session; the swap shows next frame.
+        (true, true) if s.chroma_shm.as_ref().is_some_and(|c| c.merge != crate::prefs::host_game_merge()) => {
+            if let Some(shm) = s.chroma_shm.as_mut() {
+                let merge = crate::prefs::host_game_merge();
+                shm.blend.store(game_blend_mode(merge).to_bits(), Ordering::Relaxed);
+                shm.merge = merge;
+            }
+        }
         _ => {}
     }
     match (want_orgb, s.orgb.is_some()) {
@@ -563,6 +612,194 @@ fn connect_obs(s: &mut HostState) {
     s.obs_follow = Some(ObsFollower::start(s.handle.clone(), follow_control));
 }
 
+/// The live native-Chroma face: the server handle (kept alive so the `Global\` objects
+/// persist) and the ONE source id all its fading game layers are claimed under, so a
+/// runtime toggle can release them as a unit. `Arc<ShmServer>` on Windows; a zero-sized
+/// stand-in elsewhere so the [`HostState`] field type stays uniform.
+#[cfg(windows)]
+type ChromaShmHandle = std::sync::Arc<neuron_host::adapters::chroma_shm::server::ShmServer>;
+#[cfg(not(windows))]
+type ChromaShmHandle = std::sync::Arc<()>;
+
+/// One native-Chroma game layer's re-claim recipe: enough to rebuild an identical
+/// [`ChromaShmLayer`] when its lease lapses (idle expiry or a kernel rebirth), keyed to the
+/// surface it paints. `id` tracks the live arbiter layer for [`refresh`](HostApi::refresh).
+struct ShmLayer {
+    key: String,
+    device_type: u8,
+    leds: usize,
+    id: LayerId,
+}
+
+/// The native-Chroma face's live state. The game layers are **Heartbeat-leased**, NOT Pinned:
+/// [`refresh_chroma_shm`] pushes their deadline out each host tick while a game is connected
+/// (plus the fade-out grace, plus the warm pre-first-game window). Once a game that was live has
+/// been gone longer than that grace, the host stops refreshing — the leases lapse and the arbiter
+/// sweeps the layers, so the user's base lighting returns **structurally** (the crate's one
+/// "no stuck lighting" rule), never by trust in the layer's own alpha ramp. The ramp stays as
+/// the cosmetic crossfade; the lease is the safety net.
+struct ChromaShm {
+    handle: ChromaShmHandle,
+    src: SourceId,
+    /// Per-surface game layers (see [`ShmLayer`]) — empty off Windows.
+    layers: Vec<ShmLayer>,
+    /// The last tick a game was observed connected. Drives the fade-out grace: the host keeps
+    /// refreshing until this ages past [`SHM_FADE_GRACE`], letting the crossfade finish before
+    /// the leases are allowed to lapse. `None` = no game seen yet.
+    last_live: Option<Instant>,
+    /// The blend policy the layers were claimed with (`host_game_merge`): `true` = merge
+    /// (screen), `false` = take over. Tracked so a live policy flip is detected as a change.
+    merge: bool,
+    /// The live blend mode, shared with every game layer (see [`ChromaShmLayer`]). Flipping
+    /// the merge policy stores a new value here — the layers re-tint on the next frame with
+    /// no server teardown, so a connected game keeps its shared-memory session unbroken.
+    blend: Arc<AtomicU8>,
+}
+
+/// The Heartbeat TTL on each game layer. Several host ticks long, so a brief scheduling stall
+/// can't drop a live game's lighting; short enough that a departed game's layer is swept within
+/// a few seconds — the structural backstop under the ≈0.45s cosmetic fade.
+const SHM_LEASE_TTL: Duration = Duration::from_secs(4);
+/// Keep refreshing the game leases this long after a game was last seen, so the layer's own
+/// crossfade-out completes before the leases lapse. Comfortably shorter than [`SHM_LEASE_TTL`].
+const SHM_FADE_GRACE: Duration = Duration::from_millis(1200);
+
+/// Stand up the native Chroma SHM server and claim a self-fading game layer per bridged
+/// surface at `band::SESSION`, all under ONE source. CREATE-ONLY on purpose: we become
+/// the sole Chroma server or we stand down — we never read alongside a live Razer server,
+/// which would double-write the LEDs. Returns `None` silently when disabled, unelevated,
+/// or Razer owns the objects; the layers lie dormant (alpha 0, the user's lighting
+/// untouched) until a game connects, then crossfade in. Windows-only; a stub elsewhere.
+///
+/// The layers are **Heartbeat-leased** (see [`ChromaShm`]) and claimed alive now, so a game
+/// that connects immediately paints without waiting for the first host tick; [`refresh_chroma_shm`]
+/// then keeps them alive only while a game is present.
+/// The blend mode a game layer paints with under the `host_game_merge` policy: merge →
+/// `Screen` (the game's light ADDS over your base — bright keys punch through, your
+/// lighting stays beneath), else `Over` (the game replaces the keys it paints).
+fn game_blend_mode(merge: bool) -> BlendMode {
+    if merge {
+        BlendMode::Screen
+    } else {
+        BlendMode::Over
+    }
+}
+
+#[cfg(windows)]
+fn spawn_chroma_shm(bridge: &Bridge, h: &mut HostHandle) -> Option<ChromaShm> {
+    use neuron_host::adapters::chroma_shm::server::{ChromaShmLayer, ShmServer};
+    use neuron_host::api::SurfaceKind;
+    use std::sync::Arc;
+
+    let server: ChromaShmHandle = Arc::new(ShmServer::create().ok()?);
+    let src = h.next_source();
+    let now = Instant::now();
+    let merge = crate::prefs::host_game_merge();
+    // One shared blend cell for every device layer, so a live merge-policy flip re-tints
+    // them all with a single store — no teardown of the shared-memory objects.
+    let blend = Arc::new(AtomicU8::new(game_blend_mode(merge).to_bits()));
+    let mut layers = Vec::new();
+    for surf in &bridge.surfaces {
+        let device_type = match surf.kind {
+            SurfaceKind::Keyboard => 0x01,
+            SurfaceKind::Mouse => 0x02,
+            SurfaceKind::Headset => 0x04,
+            SurfaceKind::Mousepad => 0x08,
+            SurfaceKind::Keypad => 0x10,
+            SurfaceKind::Generic => 0x80,
+        };
+        let layer =
+            ChromaShmLayer::new(Arc::clone(&server), device_type, surf.leds, Arc::clone(&blend));
+        if let Some(id) = h.claim(
+            &surf.key,
+            src,
+            band::SESSION,
+            LeaseSpec::Ttl(SHM_LEASE_TTL),
+            Content::Live(Box::new(layer)),
+            now,
+        ) {
+            layers.push(ShmLayer {
+                key: surf.key.clone(),
+                device_type,
+                leds: surf.leds,
+                id,
+            });
+        }
+    }
+    Some(ChromaShm { handle: server, src, layers, last_live: None, merge, blend })
+}
+
+#[cfg(not(windows))]
+fn spawn_chroma_shm(_bridge: &Bridge, _h: &mut HostHandle) -> Option<ChromaShm> {
+    None
+}
+
+/// Keep the native-Chroma game layers honest against the arbiter's lease model. Each host tick
+/// it refreshes their Heartbeat leases while a game is live (or within the fade-out grace after
+/// one left, or before any game has yet connected — see `keep` below), and re-claims any that a
+/// lease lapse or kernel rebirth swept. Once a game that WAS live has been gone past the grace,
+/// the host stops refreshing entirely: the leases lapse, the arbiter sweeps the layers, and the
+/// user's base returns — structurally, not by trusting the layer's own alpha ramp. This is the
+/// invariant the arbiter states in one line: everything session-shaped keeps proving it exists
+/// (here, by the game's live PID) or it goes. Windows-only; a no-op stub elsewhere.
+#[cfg(windows)]
+fn refresh_chroma_shm(s: &mut HostState, now: Instant) {
+    use neuron_host::adapters::chroma_shm::server::ChromaShmLayer;
+    use std::sync::Arc;
+    let Some(shm) = s.chroma_shm.as_mut() else { return };
+    if shm.handle.any_client_connected() {
+        shm.last_live = Some(now);
+    }
+    // Whether to keep the leases alive this tick:
+    //   • no game has EVER connected (`last_live` None) → keep warm. A never-live layer paints
+    //     nothing (its alpha is provably 0 with no game input to decode), so holding its lease
+    //     is harmless AND means a game that connects later shows instantly, with no expire/
+    //     re-claim race flashing the base mid-connect.
+    //   • a game is here or left within the fade grace → keep, so the ≈0.45s crossfade finishes.
+    // Otherwise (a game WAS live and is now gone past the grace) stop refreshing: the leases
+    // lapse and the arbiter sweeps the layers. That is exactly the dangerous "stale last frame"
+    // case — a game painted, then left — and it's resolved structurally, not by the alpha ramp.
+    let keep = match shm.last_live {
+        None => true,
+        Some(t) => now.duration_since(t) < SHM_FADE_GRACE,
+    };
+    if !keep {
+        return;
+    }
+    // Clone the handle/src out so the layer loop can borrow `shm.layers` mutably without
+    // aliasing the fields it reads.
+    let handle = Arc::clone(&shm.handle);
+    let src = shm.src;
+    let blend = Arc::clone(&shm.blend);
+    let mut h = s.handle.clone();
+    for l in &mut shm.layers {
+        // A live refresh pushes the deadline out; `false` = the layer was swept (lease lapsed
+        // during a stall, or a kernel rebirth) → re-claim an identical one from its recipe,
+        // sharing the same live blend cell so it tracks the current merge policy.
+        if !h.refresh(l.id, now) {
+            let layer = ChromaShmLayer::new(
+                Arc::clone(&handle),
+                l.device_type,
+                l.leds,
+                Arc::clone(&blend),
+            );
+            if let Some(id) = h.claim(
+                &l.key,
+                src,
+                band::SESSION,
+                LeaseSpec::Ttl(SHM_LEASE_TTL),
+                Content::Live(Box::new(layer)),
+                now,
+            ) {
+                l.id = id;
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn refresh_chroma_shm(_s: &mut HostState, _now: Instant) {}
+
 fn bring_up(g: &mut Option<HostState>) -> bool {
     // THE machine-wide ownership check, ahead of everything else: the protocol ports are the
     // wrong token for it (a Chroma/OpenRGB squatter — usually real Synapse — should only take
@@ -594,11 +831,19 @@ fn bring_up(g: &mut Option<HostState>) -> bool {
     let orgb = crate::prefs::host_openrgb()
         .then(|| OrgbServer::bind(OPENRGB_ADDR, host.handle()).ok())
         .flatten();
+    // The NATIVE face of the same "chroma (games)" feature: native games speak Win32
+    // shared memory, not REST, so serving them means BEING the SHM server — gated by the
+    // same `host_chroma` switch as the REST face above.
+    let chroma_shm = crate::prefs::host_chroma()
+        .then(|| spawn_chroma_shm(&bridge, &mut h))
+        .flatten();
 
     eprintln!(
-        "neuron-host: connections open — {} device(s) bridged, chroma={}, openrgb={}, obs={}",
+        "neuron-host: connections open — {} device(s) bridged, chroma={} (rest={}, native={}), openrgb={}, obs={}",
         bridge.surfaces.len(),
+        chroma.is_some() || chroma_shm.is_some(),
         chroma.is_some(),
+        chroma_shm.is_some(),
         orgb.is_some(),
         crate::prefs::host_obs(),
     );
@@ -610,6 +855,7 @@ fn bring_up(g: &mut Option<HostState>) -> bool {
         _host: host,
         orgb,
         chroma,
+        chroma_shm,
         obs: None,
         obs_follow: None,
         _lock: lock,
@@ -619,6 +865,37 @@ fn bring_up(g: &mut Option<HostState>) -> bool {
     }
     *g = Some(state);
     true
+}
+
+/// Pull the native Chroma face's live telemetry off the SHM server for the readout:
+/// `(serving, what a game is painting)`. Windows-only (the server is); a no-op stub
+/// elsewhere so [`Status`] stays platform-uniform.
+#[cfg(windows)]
+fn native_chroma_status(chroma_shm: &Option<ChromaShm>) -> (bool, Option<NativeChroma>) {
+    match chroma_shm {
+        Some(shm) => {
+            let server = &shm.handle;
+            let game = server
+                .any_client_connected()
+                .then(|| server.live_summary())
+                .flatten()
+                .map(|(devices, effect)| {
+                    let game = server
+                        .registered_apps()
+                        .first()
+                        .and_then(|a| crate::purge::process_name(a.id))
+                        .unwrap_or_else(|| "a game".to_string());
+                    NativeChroma { game, devices, effect: effect.to_lowercase() }
+                });
+            (true, game)
+        }
+        None => (false, None),
+    }
+}
+
+#[cfg(not(windows))]
+fn native_chroma_status(_chroma_shm: &Option<ChromaShm>) -> (bool, Option<NativeChroma>) {
+    (false, None)
 }
 
 fn status_of(g: &Option<HostState>) -> Status {
@@ -643,10 +920,13 @@ fn status_of(g: &Option<HostState>) -> Status {
                 .as_ref()
                 .map(|o| client_statuses(o.clients(), &boards))
                 .unwrap_or_default();
+            let (chroma_native_serving, chroma_native_game) = native_chroma_status(&s.chroma_shm);
             Status {
                 active: true,
                 devices: s.bridge.surfaces.len(),
                 chroma_serving: s.chroma.is_some(),
+                chroma_native_serving,
+                chroma_native_game,
                 openrgb_serving: s.orgb.is_some(),
                 obs_on: s.obs.is_some(),
                 obs_connected: s.obs.as_ref().is_some_and(|c| c.is_connected()),
@@ -902,16 +1182,10 @@ pub fn set_lighting(pid: u16, unit: &str, defs: Vec<LayerDef>, fps: u32) -> bool
         return false;
     }
 
-    // WHO WINS: pin the base ABOVE sessions when the user chose "my lighting
-    // always wins", else at the base band (games take over). The band is a
-    // property of the CLAIM, so a live policy flip must RE-CLAIM, not
-    // set_content — hence we track the band per base layer and re-pin on a
-    // mismatch.
-    let want_band = if crate::prefs::host_lighting_wins() {
-        band::OVERRIDE
-    } else {
-        band::BASE
-    };
+    // The user's lighting is always the BASE layer; games sit ABOVE it at SESSION and
+    // combine per the merge policy (see `game_blend_mode`), never by band. (The band is
+    // still tracked per base layer for the kernel-rebirth recovery path.)
+    let want_band = band::BASE;
     let now = Instant::now();
     let mut any = false;
     for key in keys {
@@ -966,32 +1240,6 @@ pub fn set_lighting(pid: u16, unit: &str, defs: Vec<LayerDef>, fps: u32) -> bool
         }
     }
     any
-}
-
-/// Re-pin every base layer to the current "who wins" band — called live when
-/// the policy toggle flips. Returns the surface keys that need re-applying
-/// (the caller re-runs the app's lighting for each so fresh content lands at
-/// the new band). Kept minimal: it just DROPS mis-banded base layers; the
-/// re-apply does the claim, reusing the one code path.
-pub fn repin_policy() {
-    let mut g = guard();
-    let Some(s) = g.as_mut() else { return };
-    let want = if crate::prefs::host_lighting_wins() {
-        band::OVERRIDE
-    } else {
-        band::BASE
-    };
-    let stale: Vec<String> = s
-        .base
-        .iter()
-        .filter(|(_, b)| b.band != want)
-        .map(|(k, _)| k.clone())
-        .collect();
-    for key in stale {
-        if let Some(b) = s.base.remove(&key) {
-            s.handle.clone().release(b.layer);
-        }
-    }
 }
 
 /// Live re-pace a board's base (the fps slider), no restart. `unit` names the board; empty
@@ -1091,4 +1339,9 @@ pub fn heartbeat() {
             );
         }
     }
+    // The native-Chroma game layers ride the SAME tick: refresh their Heartbeat leases while a
+    // game is live (or fading out), re-claim any a rebirth swept, and let them lapse — base back —
+    // once no game remains. This is what keeps the SESSION-band game layer inside the arbiter's
+    // "session-shaped ⇒ Heartbeat" invariant rather than pinned-forever.
+    refresh_chroma_shm(s, now);
 }

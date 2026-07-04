@@ -369,7 +369,9 @@ every device write is sorted by how sure i am of it:
 | dpi · polling · brightness · lighting writes | **proven** on hardware |
 | dpi-stage table · scroll-stage select | **wire-confirmed** off synapse (USBPcap) + round-tripped |
 | symmetric lift-off distance | **proven**: reads back clean on the Naga |
-| idle/sleep timer · in-game hi-res polling · scroll *curve* table · asymmetric lift-off · snap-tap (SOCD) | **gated** behind `NEURON_*_WRITE` until a capture confirms; payloads unit-tested, still read-back-verified |
+| asymmetric lift-off distance (split lift/landing) | **proven**: set/read round-trip on the Naga (the `0x0B/0x85` getter echoes mode=async + the lift/landing pair; the physical split confirmed by feel) |
+| idle/sleep timer | **proven**: set/read round-trip on the naga (write echoes back on the getter) |
+| in-game hi-res polling · scroll *curve* table · snap-tap (SOCD) | **gated** behind `NEURON_*_WRITE` until a capture confirms; payloads unit-tested, still read-back-verified |
 | debounce · onboard button-remap | **no known opcode**: bails with a "needs RE" note, never a blind write |
 
 things it flat-out doesn't do, so you know before you install:

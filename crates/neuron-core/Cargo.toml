@@ -27,9 +27,10 @@ path = "src/lib.rs"
 # `NEURON_HYPERSCROLL_WRITE` env var is kept as a runtime escape hatch so the write can be probed
 # without a rebuild — either gate opens it.)
 hyperscroll-write = []
-# Compile-time gate for the LED idle/power-timeout WRITE (0x07/0x03, writes.rs::set_idle_secs). The
-# READ (0x07/0x83) is proven; the SET is derived & not yet hardware-confirmed, so it is off by
-# default. Enable with `--features idle-power-write` once verified (or `NEURON_IDLE_WRITE` at runtime).
+# Compile-time gate for the LED idle/power-timeout WRITE (0x07/0x03, writes.rs::set_idle_secs).
+# Both directions are hardware-confirmed on the Naga V2 Pro (2026-07-02: wrote 120s, 0x83 echoed,
+# restored 300s), so the app + CLI enable this feature. It stays a feature (not unconditional) so a
+# bare library build defaults to no device writes; `NEURON_IDLE_WRITE` is the runtime escape hatch.
 idle-power-write = []
 # Compile-time gate for the in-game (wired/dongle) polling-rate WRITE (0x00/0x06,
 # writes.rs::set_in_game_polling). Derived from the proven single-rate setter; off by default until

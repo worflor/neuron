@@ -72,6 +72,20 @@ enum Cmd {
         #[arg(long)]
         volatile: bool,
     },
+    /// Sensor LIFT-OFF DISTANCE (the height the mouse stops tracking). No args reads it;
+    /// `--lift N --landing M` sets an ASYMMETRIC split (separate lift/landing, verify-gated);
+    /// `--sym L` sets a symmetric level (0=low/1=med/2=high) and flips back out of async.
+    Lod {
+        /// asymmetric LIFT level 2..=26 (requires --landing)
+        #[arg(long)]
+        lift: Option<u8>,
+        /// asymmetric LANDING level 1..=25 (requires --lift)
+        #[arg(long)]
+        landing: Option<u8>,
+        /// set a SYMMETRIC level instead (0=low / 1=med / 2=high)
+        #[arg(long)]
+        sym: Option<u8>,
+    },
     /// Lighting brightness 0..=100: show, or set
     Brightness { pct: Option<u8> },
     /// Sniper / on-the-fly DPI: hold a control to drop to a precision DPI, release to snap back.
@@ -849,6 +863,7 @@ fn main() -> Result<()> {
             persist,
         } => dpi_stages_cmd(&reg, &stages, active, persist)?,
         Cmd::Scroll { stage, volatile } => scroll_cmd(&reg, stage, volatile)?,
+        Cmd::Lod { lift, landing, sym } => lod_cmd(&reg, lift, landing, sym)?,
         Cmd::Brightness { pct } => brightness_cmd(&reg, pct)?,
         Cmd::Sniper { bind, dpi } => sniper_cmd(bind, dpi)?,
         Cmd::Storage { raw } => storage_status(&reg, raw)?,
@@ -2610,6 +2625,61 @@ fn dpi_stages_cmd(reg: &Registry, stages: &[u16], active: u8, persist: bool) -> 
     );
     writes::set_dpi_stages(&d, &st, active_idx, store)?;
     println!("  done — write verified against the device's stage-table read-back.");
+    Ok(())
+}
+
+/// Sensor lift-off distance: read the current, or write a symmetric level / asymmetric split.
+/// Every write read-back-verifies (bails on mismatch, never a false success) — the point here is
+/// to HARDWARE-CONFIRM the asymmetric path on the Naga via the shared `0x0B/0x85` getter.
+fn lod_cmd(reg: &Registry, lift: Option<u8>, landing: Option<u8>, sym: Option<u8>) -> Result<()> {
+    // The DPI-capable mouse (the Naga); its sensor class rides the same control interface.
+    let d = open_with_command(reg, "dpi")?;
+    let show = |d: &Device| match writes::lift_off_async(d) {
+        Some((lf, la)) => println!("  LOD now: ASYMMETRIC — lift {lf} / landing {la}"),
+        None => println!(
+            "  LOD now: symmetric level {}",
+            writes::lift_off_distance(d).map(|v| v.to_string()).unwrap_or_else(|_| "?".into())
+        ),
+    };
+    println!("current lift-off state:");
+    show(&d);
+    match (sym, lift, landing) {
+        (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
+            bail!("--sym sets a symmetric level; it can't be combined with --lift/--landing (an asymmetric split). Pass one or the other.");
+        }
+        (Some(level), None, None) => {
+            if level > 2 {
+                bail!("symmetric lift-off level is 0, 1, or 2 (low/med/high); got {level}");
+            }
+            ensure_driver(&d);
+            println!("setting SYMMETRIC lift-off level {level}...");
+            writes::set_lift_off_distance(&d, level)?;
+            println!("  ACCEPTED + read-back VERIFIED (0x0B/0x85 echoed mode=symmetric + level).");
+            show(&d);
+        }
+        (None, Some(lf), Some(la)) => {
+            if !(2..=26).contains(&lf) {
+                bail!("--lift is 2..=26 (Focus Pro level); got {lf}");
+            }
+            if !(1..=25).contains(&la) {
+                bail!("--landing is 1..=25 (Focus Pro level); got {la}");
+            }
+            ensure_driver(&d);
+            println!("setting ASYMMETRIC lift-off: lift {lf} / landing {la}...");
+            // The write itself re-reads 0x0B/0x85 and bails unless the device echoes
+            // mode=async + this exact lift/landing pair — so reaching the line below IS the
+            // hardware round-trip.
+            writes::set_lift_off_asymmetric(&d, lf, la)?;
+            println!("  ACCEPTED + read-back VERIFIED on the shared 0x0B/0x85 getter — hardware round-trip.");
+            show(&d);
+        }
+        (None, Some(_), None) | (None, None, Some(_)) => {
+            bail!("an asymmetric split needs BOTH --lift and --landing (e.g. `neuron lod --lift 12 --landing 3`)");
+        }
+        (None, None, None) => {
+            println!("(pass --lift N --landing M to set a split, or --sym 0|1|2 to set/restore symmetric)");
+        }
+    }
     Ok(())
 }
 

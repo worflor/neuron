@@ -8,5 +8,7 @@
 //! against the same code that runs in production.
 
 pub mod chroma;
+pub mod chroma_analyze;
+pub mod chroma_shm;
 pub mod obs;
 pub mod openrgb;

@@ -173,13 +173,13 @@ pub struct Prefs {
     /// separately (unlike the always-useful lighting servers).
     #[serde(default)]
     pub host_obs: bool,
-    /// WHO WINS when a game/tool and your own lighting both want a board — the emergent config no
-    /// last-writer-wins tool (Synapse, OpenRGB) can offer, because only an arbiter has the concept.
-    /// `false` (default): games take over (a connected session paints above your base, which returns
-    /// when it releases). `true`: your lighting always wins (your base pins ABOVE sessions, so a
-    /// game connects and is honestly suppressed rather than clobbering you). Applies live.
-    #[serde(default)]
-    pub host_lighting_wins: bool,
+    /// HOW a game combines with your own lighting — the emergent config no last-writer-wins tool
+    /// (Synapse, OpenRGB) can offer, because only an arbiter has the concept. `true` (default):
+    /// MERGE — the game's light is SCREENED over your base, so its bright keys punch through while
+    /// your lighting stays underneath, rather than being replaced. `false`: the game takes the keys
+    /// it paints outright. Applies live.
+    #[serde(default = "default_true")]
+    pub host_game_merge: bool,
     /// The obs-websocket Server Password (OBS → Tools → WebSocket Server Settings). Empty = a
     /// passwordless OBS server (auth off). Stored in app.toml like the rest; the `NEURON_OBS_PASSWORD`
     /// env var, when set, overrides this (a dev/headless escape hatch).
@@ -323,7 +323,7 @@ impl Default for Prefs {
             host_chroma: true,
             host_openrgb: true,
             host_obs: false,
-            host_lighting_wins: false,
+            host_game_merge: true,
             host_obs_password: String::new(),
             lighting: BTreeMap::new(),
         }
@@ -417,7 +417,7 @@ impl Prefs {
         salvage!("host_chroma", host_chroma);
         salvage!("host_openrgb", host_openrgb);
         salvage!("host_obs", host_obs);
-        salvage!("host_lighting_wins", host_lighting_wins);
+        salvage!("host_game_merge", host_game_merge);
         salvage!("host_obs_password", host_obs_password);
         // `lighting` is a per-device map — salvage it board-by-board so one corrupt record drops only
         // itself, not every other saved stack.
@@ -908,21 +908,21 @@ pub fn set_host_obs_password(v: &str) -> String {
     }
 }
 
-/// Read the "who wins" policy (default false = games take over).
-pub fn host_lighting_wins() -> bool {
-    Prefs::load().host_lighting_wins
+/// Read the game blend policy (default true = merge/screen over your lighting).
+pub fn host_game_merge() -> bool {
+    Prefs::load().host_game_merge
 }
 
-/// Persist the "who wins" policy, returning a user-facing status line.
-pub fn set_host_lighting_wins(v: bool) -> String {
+/// Persist the game blend policy, returning a user-facing status line.
+pub fn set_host_game_merge(v: bool) -> String {
     let mut p = Prefs::load();
-    p.host_lighting_wins = v;
+    p.host_game_merge = v;
     match p.save() {
         Ok(()) => {
             if v {
-                "your lighting always wins (games are suppressed)".into()
+                "games merge with your lighting (their light adds over it)".into()
             } else {
-                "games can take over your lighting".into()
+                "games replace your lighting on the keys they paint".into()
             }
         }
         Err(e) => format!("save failed: {e}"),
@@ -1128,7 +1128,7 @@ mod tests {
             host_chroma: !d.host_chroma,
             host_openrgb: !d.host_openrgb,
             host_obs: !d.host_obs,
-            host_lighting_wins: !d.host_lighting_wins,
+            host_game_merge: !d.host_game_merge,
             host_obs_password: "test-pw".into(),
             lighting: d.lighting.clone(),
         };
