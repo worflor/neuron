@@ -279,6 +279,13 @@ pub struct HidSink {
     /// every 32nd frame instead of hammering a dead handle — the vitals
     /// lesson (never herd a sleeping mouse).
     skips: u32,
+    /// Round-robin cursor for the ACTIVE (while-flowing) heal: each such heal resends ONE
+    /// row, advancing here, so the un-tear still covers the whole board over `rows` heals but
+    /// WITHOUT a full-board repaint — which on a legacy board is a ~12ms row-by-row stall that
+    /// reads as a periodic flicker under a live game.
+    heal_row: usize,
+    /// Set by `refresh`; the next `write` folds the round-robin heal row in.
+    heal_pending: bool,
 }
 
 impl HidSink {
@@ -297,6 +304,8 @@ impl HidSink {
             last: None,
             changed: Vec::new(),
             skips: 0,
+            heal_row: 0,
+            heal_pending: false,
         }
     }
 }
@@ -329,8 +338,15 @@ impl FrameSink for HidSink {
         // ends, the board keeps its last frame. A PARTIALLY unclaimed frame
         // still paints (holes go black, deterministically) — only the
         // fully-unclaimed case leaves the device alone.
+        //
+        // KEEP `self.last`: the board still shows the last written frame, so
+        // whatever paints next must be a DELTA against it, NOT a full-board
+        // resend. A single all-none tick (a one-frame arbiter gap — e.g. a
+        // heartbeat-leased game layer momentarily dropping out) previously
+        // nulled `last`, forcing the very next frame to repaint every row —
+        // a ~12ms row-by-row wipe on a legacy board = a visible full-board
+        // FLASH. Holding `last` makes that gap invisible.
         if frame.iter().all(|c| c.is_none()) {
-            self.last = None; // whatever comes next repaints in full
             return;
         }
         if self.skips > 0 {
@@ -378,6 +394,17 @@ impl FrameSink for HidSink {
             self.light.cols as usize,
             &mut self.changed,
         );
+        // Heal (round-robin): resend ONE extra row on top of the naturally-changed ones,
+        // advancing the cursor. Over `rows` heals the whole board is re-asserted, so a
+        // silently-dropped row un-tears — but no single heal is ever a full-board repaint.
+        let n_rows = (self.light.rows as usize).max(1);
+        if std::mem::take(&mut self.heal_pending) {
+            let r = self.heal_row % n_rows;
+            self.heal_row = self.heal_row.wrapping_add(1);
+            if !self.changed.contains(&r) {
+                self.changed.push(r);
+            }
+        }
         let mut sent = false;
         for &row in &self.changed {
             if let Some(rep) = self.light.row_report(&px, row) {
@@ -400,11 +427,12 @@ impl FrameSink for HidSink {
         buf.extend_from_slice(&px);
     }
 
-    /// Writer-driven periodic repaint (see [`FrameSink::refresh`]): forget
-    /// what we believe is on the board so the next write resends every row —
-    /// the self-healing pass that un-tears a board that dropped writes.
+    /// Writer-driven un-tear (see [`FrameSink::refresh`]). Arms a SINGLE round-robin row for the
+    /// next write — never `last = None` (a full-board resend), which on a legacy per-row board is
+    /// a ~12ms row-by-row wipe = a visible flash. The writer sweeps the whole board one row per
+    /// tick after content stops, so a dropped static row still un-tears without ever flashing.
     fn refresh(&mut self) {
-        self.last = None;
+        self.heal_pending = true;
     }
 }
 

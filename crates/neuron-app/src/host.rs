@@ -656,10 +656,16 @@ struct ChromaShm {
     blend: Arc<AtomicU8>,
 }
 
-/// The Heartbeat TTL on each game layer. Several host ticks long, so a brief scheduling stall
-/// can't drop a live game's lighting; short enough that a departed game's layer is swept within
-/// a few seconds — the structural backstop under the ≈0.45s cosmetic fade.
-const SHM_LEASE_TTL: Duration = Duration::from_secs(4);
+/// The Heartbeat TTL on each game layer. This lease is refreshed ONLY by the app's UI-thread
+/// heartbeat (~1s), which a fullscreen game occluding neuron's window can stall for seconds at a
+/// time. A too-short TTL then lapses a STILL-LIVE game: the arbiter sweeps its layer, the surface
+/// briefly resolves to the base (a visible full-board dip), then the next heartbeat re-claims —
+/// the periodic in-game flash. So the TTL is generous (survives realistic UI-scheduling jitter);
+/// the ≈0.45s alpha fade — not the lease — does the cosmetic teardown when a game genuinely
+/// leaves, and once the host stops refreshing (game gone past the grace) an alpha-0 layer paints
+/// nothing while it lingers, so a longer structural backstop costs only a few seconds of a
+/// dormant, invisible layer. See also the alpha-preserving re-claim in `refresh_chroma_shm`.
+const SHM_LEASE_TTL: Duration = Duration::from_secs(12);
 /// Keep refreshing the game leases this long after a game was last seen, so the layer's own
 /// crossfade-out completes before the leases lapse. Comfortably shorter than [`SHM_LEASE_TTL`].
 const SHM_FADE_GRACE: Duration = Duration::from_millis(1200);
@@ -708,8 +714,10 @@ fn spawn_chroma_shm(bridge: &Bridge, h: &mut HostHandle) -> Option<ChromaShm> {
             SurfaceKind::Keypad => 0x10,
             SurfaceKind::Generic => 0x80,
         };
+        // First claim: start faded OUT (0.0) so the game crossfades IN over the base when it
+        // first connects — the never-live layer paints nothing until a game appears.
         let layer =
-            ChromaShmLayer::new(Arc::clone(&server), device_type, surf.leds, Arc::clone(&blend));
+            ChromaShmLayer::new(Arc::clone(&server), device_type, surf.leds, Arc::clone(&blend), 0.0);
         if let Some(id) = h.claim(
             &surf.key,
             src,
@@ -747,7 +755,10 @@ fn refresh_chroma_shm(s: &mut HostState, now: Instant) {
     use neuron_host::adapters::chroma_shm::server::ChromaShmLayer;
     use std::sync::Arc;
     let Some(shm) = s.chroma_shm.as_mut() else { return };
-    if shm.handle.any_client_connected() {
+    // Is a native game painting RIGHT NOW? Drives both liveness (below) and the alpha a
+    // re-claimed layer is born at (a swept-mid-paint layer must NOT restart its fade-in).
+    let present = shm.handle.any_client_connected();
+    if present {
         shm.last_live = Some(now);
     }
     // Whether to keep the leases alive this tick:
@@ -777,11 +788,15 @@ fn refresh_chroma_shm(s: &mut HostState, now: Instant) {
         // during a stall, or a kernel rebirth) → re-claim an identical one from its recipe,
         // sharing the same live blend cell so it tracks the current merge policy.
         if !h.refresh(l.id, now) {
+            // Born at the CURRENT on-screen alpha: 1.0 if a game is live (it was swept
+            // mid-paint by a UI-stall lease lapse — DON'T dip the board to black and fade it
+            // back), 0.0 otherwise (fading out, or a never-live kernel-rebirth re-claim).
             let layer = ChromaShmLayer::new(
                 Arc::clone(&handle),
                 l.device_type,
                 l.leds,
                 Arc::clone(&blend),
+                if present { 1.0 } else { 0.0 },
             );
             if let Some(id) = h.claim(
                 &l.key,

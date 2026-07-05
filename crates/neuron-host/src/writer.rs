@@ -30,13 +30,12 @@ use crate::arbiter::Rgb;
 /// open-inside-the-thread pattern.
 pub trait FrameSink {
     fn write(&mut self, frame: &[Option<Rgb>]);
-
-    /// Drop any device-state cache: the next `write` must repaint EVERYTHING.
-    /// Called periodically by the writer because fire-and-forget HID writes
-    /// can be silently dropped by the device — dedup then believes a row is
-    /// current while the silicon disagrees, and on static content the torn
-    /// frame would stick forever (observed live on the legacy BlackWidow:
-    /// half red, half stale). Default no-op for stateless sinks.
+    /// Fold ONE round-robin row into the next write, to un-tear the board after a
+    /// possibly-dropped HID write. Fire-and-forget HID writes can be silently dropped by the
+    /// silicon; dedup then believes a row is current while the board disagrees. Always one row —
+    /// never a full-board resend, which on a legacy per-row board is a ~12ms row-by-row wipe that
+    /// reads as a periodic full-board FLASH. The writer sweeps the whole board one row per tick
+    /// after content stops (see HealPolicy). Default no-op for stateless sinks.
     fn refresh(&mut self) {}
 }
 
@@ -50,20 +49,26 @@ pub trait FrameSink {
 /// 64-tick (~2s) window that read as sustained flicker under live clients.
 const ACTIVE_HEAL_TICKS: u64 = 12;
 
-/// The two-shot retransmit after content goes STATIC, in ticks since the last
-/// content change. A drop during the final frames of a stream (or during the
-/// first heal itself) would otherwise stick forever on a latched board, so
-/// the writer repaints twice on a short backoff — then goes fully QUIESCENT:
-/// zero HID traffic on a static scene (the firmware latch holds the frame,
-/// wireless batteries and sleeping mice are left in peace). The old fixed
-/// cadence repainted static boards every ~2s forever; this heals faster AND
-/// idles quieter.
-const QUIET_HEAL_TICKS: [u64; 2] = [8, 24];
+/// Ticks-since-last-change at which the STATIC-scene heal SWEEP begins. A drop
+/// during the final frames of a stream (or during the first heal itself) would
+/// otherwise stick forever on a latched board, so once content has held still
+/// this long the writer re-asserts the whole final frame — but ROW BY ROW (see
+/// `QUIET_SWEEP_LEN`), never as one full-board resend.
+const QUIET_SWEEP_AT: u64 = 8;
 
-/// When to force a full repaint — pure, injected-tick, testable (the
-/// WriterCore discipline). The writer asks `due()` at the top of a tick,
-/// resets both dedup caches when it says so, then reports what the tick did
-/// via `tick(healed, content_changed)`. A heal tick's rewrite is NOT content
+/// Length of the static-scene heal sweep, in ticks. Once content stops the
+/// writer heals every tick for this many ticks — one round-robin row each — so
+/// the whole latched frame is re-asserted (≥ any keyboard's row count) without
+/// ever flashing a legacy board with a full-board repaint. After the sweep the
+/// writer goes fully QUIESCENT: zero HID traffic on a static scene (the
+/// firmware latch holds the frame; wireless batteries and sleeping mice are
+/// left in peace).
+const QUIET_SWEEP_LEN: u64 = 8;
+
+/// When to re-assert a row — pure, injected-tick, testable (the WriterCore
+/// discipline). The writer asks `due()` at the top of a tick, resets both dedup
+/// caches when it says so, then reports what the tick did via
+/// `tick(healed, content_changed)`. A heal tick's rewrite is NOT content
 /// evidence (the caches were dropped, `offer` trivially fires), so the caller
 /// must pass `content_changed = false` on heal ticks.
 pub struct HealPolicy {
@@ -78,10 +83,21 @@ impl HealPolicy {
         HealPolicy { since_change: u64::MAX / 2, since_heal: 0 }
     }
 
-    /// Should THIS tick drop the dedup caches and repaint in full?
+    /// Should THIS tick re-assert a row? Every heal is a SINGLE round-robin row
+    /// (the sink spreads them) — there is no full-board resend, because on a
+    /// legacy per-row board a full resend is a ~12ms row-by-row wipe that reads
+    /// as a periodic full-board FLASH. Two regimes:
+    ///   • FLOWING (content still changing): re-assert one row every
+    ///     `ACTIVE_HEAL_TICKS`, so a dropped static row un-tears within ~0.4s.
+    ///   • JUST STOPPED (`QUIET_SWEEP_AT`..`+LEN` ticks since the last change):
+    ///     heal every tick — a short one-row-per-tick SWEEP that re-asserts the
+    ///     whole final frame — then go quiescent (silent on a static board).
     pub fn due(&self) -> bool {
-        (self.since_change < QUIET_HEAL_TICKS[0] && self.since_heal >= ACTIVE_HEAL_TICKS)
-            || QUIET_HEAL_TICKS.contains(&self.since_change)
+        if self.since_change < QUIET_SWEEP_AT {
+            self.since_heal >= ACTIVE_HEAL_TICKS
+        } else {
+            self.since_change < QUIET_SWEEP_AT + QUIET_SWEEP_LEN
+        }
     }
 
     /// Record the tick's outcome: whether it healed, and whether the frame
@@ -272,10 +288,12 @@ impl Writer {
                     // on frames that render identically.
                     let dt =
                         Duration::from_secs(1) / fps.load(Ordering::Relaxed).clamp(1, MAX_WRITER_FPS);
-                    // Activity-aware forced repaint: drop both dedup caches so
-                    // this tick resends everything (see FrameSink::refresh and
-                    // HealPolicy — fast heals while frames flow, a two-shot
-                    // retransmit when they stop, silence on a static board).
+                    // Activity-aware row re-assert: drop the writer dedup cache
+                    // so this tick re-offers, and tell the sink to fold in ONE
+                    // round-robin heal row (never a full-board resend — that
+                    // flashes a legacy per-row board). See FrameSink::refresh
+                    // and HealPolicy: fast heals while frames flow, a one-row
+                    // sweep when they stop, silence on a static board.
                     let healing = heal.due();
                     if healing {
                         core.reset();
@@ -412,9 +430,10 @@ mod tests {
     }
 
     #[test]
-    fn heal_policy_two_shot_then_quiescent_after_static() {
-        // One content change, then silence: exactly the two retransmits (a
-        // drop during the last frames must not stick), then full quiet.
+    fn heal_policy_sweep_then_quiescent_after_static() {
+        // One content change, then silence: a CONTIGUOUS sweep of exactly
+        // QUIET_SWEEP_LEN heals (one row each — enough to re-assert the whole
+        // final frame without a full-board resend), then full quiet forever.
         let mut p = HealPolicy::new();
         let h0 = p.due();
         p.tick(h0, true);
@@ -426,17 +445,22 @@ mod tests {
             }
             p.tick(h, false);
         }
-        // counters advance at tick END, so the heal lands on the tick AFTER
-        // since_change reaches each threshold — the +1 is bookkeeping, the
-        // cadence is the contract.
-        let expect: Vec<u64> = QUIET_HEAL_TICKS.iter().map(|t| t + 1).collect();
-        assert_eq!(heals, expect, "the two-shot heal, then silence");
+        assert_eq!(
+            heals.len() as u64,
+            QUIET_SWEEP_LEN,
+            "the static-scene sweep is exactly one heal per row, then silence: {heals:?}"
+        );
+        for w in heals.windows(2) {
+            assert_eq!(w[1], w[0] + 1, "the sweep is contiguous (no full-board double-shot): {heals:?}");
+        }
     }
 
     #[test]
     fn heal_policy_slow_stream_still_heals_each_cycle() {
         // Content changing every ~10 ticks (a slow effect): each cycle must
         // still cross a heal, so a dropped row never outlives one cycle long.
+        // Every heal is a single round-robin row now — the old code turned this
+        // exact case into a periodic full-board FLASH; here it's invisible.
         let mut p = HealPolicy::new();
         let mut heals = 0;
         for i in 0..200u64 {

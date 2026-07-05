@@ -74,7 +74,10 @@ fn main() -> anyhow::Result<()> {
             SurfaceKind::Keypad => 0x10,
             SurfaceKind::Generic => 0x80,
         };
-        let layer = ChromaShmLayer::new(Arc::clone(&server), device_type, s.leds, BlendMode::Over);
+        // A live blend cell (fixed here; the app drives it from the merge-policy UI) and a 0.0
+        // start so the game crossfades IN over the base when it first connects.
+        let blend = Arc::new(std::sync::atomic::AtomicU8::new(BlendMode::Over.to_bits()));
+        let layer = ChromaShmLayer::new(Arc::clone(&server), device_type, s.leds, blend, 0.0);
         let src = h.next_source();
         let _ = h.claim(
             &s.key,

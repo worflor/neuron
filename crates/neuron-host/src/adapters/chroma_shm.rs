@@ -275,7 +275,10 @@ pub fn parse_roster(buf: &[u8]) -> Option<(u32, String)> {
 /// The session table ([`D41D8537`]) and app registry ([`D4E1A960`]) GUIDs.
 pub const SESSION_TABLE: &str = "D41D8537-2D95-4AD2-8A77-51DC00946366";
 pub const APP_REGISTRY: &str = "D4E1A960-872F-4BF8-B09A-9E54F646D7CE";
-/// The client→server and server→client notify events (both pulsed, never held).
+/// The client→server and server→client notify events — the vendor's per-frame handshake pair.
+/// Neuron CREATES them (so a client's opens resolve to our own handles) but deliberately never
+/// pulses them: one-shot activation reaches continuous paint, and pulsing strobes (see the
+/// arbiter block's NO PULSE note). Kept as named consts for the object map + tests.
 pub const NOTIFY_CLIENT_TO_SERVER: &str = "0DB0CEFA-C51E-4255-87FB-2D36A0159896";
 pub const NOTIFY_SERVER_TO_CLIENT: &str = "DA5A60F0-A3C5-4335-A039-BCC6136C61A3";
 
@@ -567,19 +570,49 @@ impl DeviceActivity {
     }
 }
 
-/// The newest record's `(effect_code @+0x04, write_timestamp_ms @+0xb90)` for a device
-/// section — the raw telemetry behind [`ShmServer::device_activity`]. The timestamp is
-/// the frame's `GetTickCount64` low 32 bits (milliseconds since boot), so successive
-/// reads give the game's real update cadence and let neuron tell live from idle.
+/// The record stride (byte gap between consecutive `ff ff` tags), discovered from the
+/// section. Records are a fixed size PER DEVICE — the keyboard's is 0xB98, a mouse's is far
+/// smaller (0x1C0) — so nothing about a record's tail is at a fixed absolute offset. `0`
+/// when a second tag isn't found (a single-record section).
+fn record_stride(section: &[u8]) -> usize {
+    const REC0: usize = 0x08;
+    let mut i = REC0 + 4;
+    while i + 4 <= section.len() {
+        if section[i] == 0xff && section[i + 1] == 0xff && section[i + 3] == 0
+            && (section[i + 2] as usize) < 0x40
+        {
+            return i - REC0;
+        }
+        i += 4;
+    }
+    0
+}
+
+/// The frame timestamp's offset from a record's tag. The `GetTickCount64` write-time is the
+/// LAST 8 bytes of each record, i.e. `stride - 8` — which per device works out to the
+/// keyboard's `0xB90` but a mouse's `0x1B8`. A fixed offset (the old `TIMESTAMP_IN_RECORD`)
+/// only ever worked for the keyboard; every smaller device read `0` there → phase 0 →
+/// garbage colours. Falls back to the keyboard constant if the stride can't be found.
+fn ts_offset(section: &[u8]) -> usize {
+    match record_stride(section) {
+        s if s >= 12 => s - 8,
+        _ => TIMESTAMP_IN_RECORD,
+    }
+}
+
+/// The newest record's `(effect_code @+0x04, write_timestamp_ms)` for a device section —
+/// the raw telemetry behind [`ShmServer::device_activity`]. The timestamp is the frame's
+/// `GetTickCount64` low 32 bits (ms since boot), at [`ts_offset`] into the record, so
+/// successive reads give the game's real update cadence and tell live from idle.
 pub fn newest_record_meta(section: &[u8]) -> Option<(u32, u32)> {
     let ff = newest_slot_ff(section)?;
-    if ff + TIMESTAMP_IN_RECORD + 4 > section.len() {
+    let o = ff + ts_offset(section);
+    if o + 4 > section.len() {
         return None;
     }
     let eff = u32::from_le_bytes([
         section[ff + 4], section[ff + 5], section[ff + 6], section[ff + 7],
     ]);
-    let o = ff + TIMESTAMP_IN_RECORD;
     let ts = u32::from_le_bytes([section[o], section[o + 1], section[o + 2], section[o + 3]]);
     Some((eff, ts))
 }
@@ -588,7 +621,7 @@ pub fn newest_record_meta(section: &[u8]) -> Option<(u32, u32)> {
 /// `phase + 0x183` stays inside the 512-byte [`KEYSTREAM`] (the writer's
 /// `if (0x80 - phase < 4) phase -= 3`).
 fn frame_phase(section: &[u8], ff: usize) -> Option<usize> {
-    let o = ff + TIMESTAMP_IN_RECORD;
+    let o = ff + ts_offset(section);
     if o + 4 > section.len() {
         return None;
     }
@@ -686,8 +719,13 @@ pub mod server {
         FILE_MAP_WRITE, PAGE_READWRITE,
     };
     use windows_sys::Win32::System::Threading::{
-        CreateEventW, CreateMutexW, GetExitCodeProcess, OpenMutexW, OpenProcess,
-        PROCESS_QUERY_LIMITED_INFORMATION,
+        CreateEventW, CreateMutexW, GetExitCodeProcess, OpenEventW, OpenMutexW, OpenProcess,
+        SetEvent, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Module32FirstW, Module32NextW, Process32FirstW, Process32NextW,
+        MODULEENTRY32W, PROCESSENTRY32W, TH32CS_SNAPMODULE, TH32CS_SNAPMODULE32, TH32CS_SNAPPROCESS,
     };
 
     fn wide(s: &str) -> Vec<u16> {
@@ -824,10 +862,21 @@ pub mod server {
                     Kind::Unknown => {}
                 }
             }
-            // Wear the arbitration mask so a real game paints colour against neuron
-            // alone (no vendor arbitration). Must come after the objects exist so
-            // the pulse events resolve to our own server-created handles.
-            let mask = wear_mask(&sa);
+            // Wear the arbitration mask + run the grant/activate arbiter so a real game
+            // paints colour against neuron alone (no vendor arbitration). Must come after
+            // the objects exist so the game's opens resolve to our own server-created
+            // handles; the arbiter writes the grant into these two control sections.
+            let find_sec = |guid: &str| {
+                sections
+                    .iter()
+                    .find(|s| s.guid == guid)
+                    .map(|s| (s.view as usize, s.size))
+                    .unwrap_or((0, 0))
+            };
+            let appreg = find_sec(APP_REGISTRY);
+            let sessinfo = find_sec(SESSION_INFO);
+            let keyboard = device_section(0x01).map(|g| find_sec(g)).unwrap_or((0, 0));
+            let mask = wear_mask(&sa, appreg, sessinfo, keyboard);
             Ok(ShmServer { sections, handles, _sa: Some(sa), _mask: Some(mask) })
         }
 
@@ -868,15 +917,34 @@ pub mod server {
             Ok(ShmServer { sections, handles: Vec::new(), _sa: None, _mask: None })
         }
 
-        fn section_bytes(&self, guid: &str) -> Option<&[u8]> {
+        /// Snapshot a mapped section's current bytes into an OWNED buffer.
+        ///
+        /// A Chroma section is interior-mutable shared memory: the connected game writes it
+        /// cross-process, and our own `chroma-arbiter` thread writes the app-registry /
+        /// SessionInfo pages during activation (see [`write_grant`]). So we must NEVER hand out
+        /// a `&[u8]` borrowed into a live page — a reference whose bytes change underneath it is
+        /// aliasing UB (it lets the compiler assume the bytes are stable / `noalias`), and it is
+        /// exactly the invariant the arbiter's writes would violate. Instead every read takes a
+        /// point-in-time VOLATILE copy and the parsers work on that owned snapshot; the mapped
+        /// page is only ever touched by raw volatile reads here and raw stores in `write_grant`,
+        /// never a Rust reference. A snapshot that races a write lands a torn buffer — the
+        /// record magic-word check + stale-carry in the decoders reject it, the same way they
+        /// already tolerate the game's own mid-write frames. This is what keeps
+        /// `unsafe impl Sync for ShmServer` honest.
+        fn section_bytes(&self, guid: &str) -> Option<Vec<u8>> {
             self.sections.iter().find(|s| s.guid == guid).map(|s| {
-                // SAFETY: `s.view` points at a `s.size`-byte page returned by
-                // `MapViewOfFile` and kept mapped for `self`'s whole lifetime (only
-                // `Drop` unmaps it), so the slice cannot outlive the mapping. We only
-                // ever read it and never hand out a `&mut`, so no aliasing rule is
-                // broken even though a game writes the same page concurrently — torn
-                // reads decode to a stale/None frame, never UB.
-                unsafe { std::slice::from_raw_parts(s.view, s.size) }
+                let mut buf = vec![0u8; s.size];
+                // SAFETY: `s.view` is a `s.size`-byte page from `MapViewOfFile`, kept mapped for
+                // `self`'s whole lifetime (only `Drop` unmaps it). Volatile byte reads snapshot
+                // it WITHOUT forming a `&`/`&mut` into the page, so a concurrent writer (the game
+                // cross-process, or the arbiter thread in-process) can never break a Rust
+                // reference invariant — the copy simply catches whatever bytes are live.
+                unsafe {
+                    for (i, b) in buf.iter_mut().enumerate() {
+                        *b = std::ptr::read_volatile(s.view.add(i));
+                    }
+                }
+                buf
             })
         }
 
@@ -887,7 +955,7 @@ pub mod server {
                 .iter()
                 .filter_map(|(dt, guid)| {
                     let bytes = self.section_bytes(guid)?;
-                    let (h, units) = parse_frame(bytes)?;
+                    let (h, units) = parse_frame(&bytes)?;
                     Some((h.device_type.max(*dt), units))
                 })
                 .collect()
@@ -902,7 +970,7 @@ pub mod server {
                 .iter()
                 .filter_map(|(dt, guid)| {
                     let bytes = self.section_bytes(guid)?;
-                    let (h, units) = parse_frame_decoded(bytes)?;
+                    let (h, units) = parse_frame_decoded(&bytes)?;
                     Some((h.device_type.max(*dt), units))
                 })
                 .collect()
@@ -928,7 +996,7 @@ pub mod server {
                 .iter()
                 .filter_map(|(dt, guid)| {
                     let bytes = self.section_bytes(guid)?;
-                    let (effect_code, timestamp_ms) = newest_record_meta(bytes)?;
+                    let (effect_code, timestamp_ms) = newest_record_meta(&bytes)?;
                     Some(DeviceActivity { device_type: *dt, effect_code, timestamp_ms })
                 })
                 .collect()
@@ -945,8 +1013,8 @@ pub mod server {
             let mut any_effect = None;
             for &(dt, guid) in DEVICE_SECTIONS.iter() {
                 let Some(bytes) = self.section_bytes(guid) else { continue };
-                let Some((effect_code, _)) = newest_record_meta(bytes) else { continue };
-                let Some((_, units)) = parse_frame_decoded(bytes) else { continue };
+                let Some((effect_code, _)) = newest_record_meta(&bytes) else { continue };
+                let Some((_, units)) = parse_frame_decoded(&bytes) else { continue };
                 let is_lit = units
                     .iter()
                     .skip(1)
@@ -969,14 +1037,14 @@ pub mod server {
         pub fn decoded_frame_with_ts(&self, device_type: u8) -> Option<(u32, Vec<ColorUnit>)> {
             let guid = device_section(device_type)?;
             let bytes = self.section_bytes(guid)?;
-            let (_, ts) = newest_record_meta(bytes)?;
-            let (_, units) = parse_frame_decoded(bytes)?;
+            let (_, ts) = newest_record_meta(&bytes)?;
+            let (_, units) = parse_frame_decoded(&bytes)?;
             Some((ts, units))
         }
 
         /// The apps currently registered in the app registry (`D4E1A960`).
         pub fn registered_apps(&self) -> Vec<AppEntry> {
-            self.section_bytes(APP_REGISTRY).map(parse_app_registry).unwrap_or_default()
+            self.section_bytes(APP_REGISTRY).map(|b| parse_app_registry(&b)).unwrap_or_default()
         }
 
         /// True while any Chroma game is actually running — a registered app whose PID
@@ -991,7 +1059,7 @@ pub mod server {
 
         /// The most recent session-table entry, if any (`D41D8537`).
         pub fn latest_session(&self) -> Option<SessionTable> {
-            self.section_bytes(SESSION_TABLE).and_then(parse_session_table)
+            self.section_bytes(SESSION_TABLE).and_then(|b| parse_session_table(&b))
         }
 
         /// True if a specific app (by exe name) holds its `Global\<exe>_rz`
@@ -1028,20 +1096,57 @@ pub mod server {
         ok != 0 && code == STILL_ACTIVE
     }
 
-    // ────────────────────────── the arbitration mask ──────────────────────────
+    // ──────────────────────── the arbitration arbiter ────────────────────────
     //
-    // A shipping game connects to a bare server fine but SELF-MUTES to a near-black frame
-    // unless it believes the vendor arbitration layer is alive. That belief is three HELD
-    // MUTEXES — nothing more. Every handshake event stays present-but-nonsignalled and the
-    // game owns its own; pre-creating or pulsing events instead CORRUPTS the game's init
-    // (it opens ours rather than making its own) and it stops registering. So the mask is
-    // minimal and static: hold these three mutexes, create nothing else, signal nothing.
+    // A shipping game connects to a bare server, but only STREAMS + paints real per-key
+    // colour when it believes the vendor arbitration layer is fully alive AND its session
+    // has been GRANTED + ACTIVATED. Neuron supplies all of it, with zero vendor software,
+    // on one thread — two responsibilities, both STANDING (nothing on a per-frame timer):
+    //   • MASK   — hold the arbitration mutexes (incl. a per-user one) and keep the
+    //     arbiter-ready events SIGNALLED (manual-reset, set once), so the game doesn't
+    //     self-mute to near-black. These are HELD for the server's life, never re-poked.
+    //   • GRANT + ACTIVATE (one-shot per client, see `activate_once`) — the game's session
+    //     worker parks on {B8B918C0}; we write the client PID into the app registry (+0x20c)
+    //     and SessionInfo slot0 {head=0, event-type=8, session-id} (see `write_grant`),
+    //     SetEvent {B8B918C0} to wake the worker, then after a short beat SetEvent the
+    //     per-key ACTIVATE event {A84AF9C8} — the signal that flips the board from a uniform
+    //     muted frame to real per-key colour. Once activated the game streams its own frames;
+    //     we do nothing further but a cheap liveness check on its PID.
+    //
+    // NO PULSE. An earlier design tapped the server→client notify + rendezvous events at
+    // ~60Hz to "keep completing the handshake". That was a DEAD END: it re-drove the session
+    // every tick and the game rendered it as a periodic STROBE (one of the flickers this file
+    // has since hunted down). The one-shot ACTIVATE above is what actually reaches continuous
+    // paint; the notify/rendezvous objects are still CREATED (so the client's opens resolve to
+    // our own objects) but deliberately left un-pulsed. Do not re-add a pulse loop.
+    // The client is found by scanning for a process with the Chroma client DLL loaded.
     // (Two more arbitration mutexes, 153ABAD2 + A114B7A2, are already created in OBJECTS.)
     const MASK_MUTEXES: &[&str] = &[
         "{B1570C3F-8B14-45B0-BCEB-C57ED1F5C589}",
         "{3DD569A2-BC96-425D-ABEF-A5EF21F4B681}",
         "{08B4F43A-DA51-4120-B388-CE0F8CE6F61A}",
     ];
+    /// A per-USER arbitration mutex (suffixed with the interactive username): the vendor
+    /// server creates one per logged-in user, and the game checks for it too.
+    const MASK_PERUSER_MUTEX: &str = "{63D31EEC-008F-43C9-A58E-ED6949B25A6C}";
+    /// Events the game expects the arbitration layer to hold SIGNALLED (manual-reset).
+    const MASK_SIGNALLED_EVENTS: &[&str] = &[
+        "{86E8A3B0-C718-4997-AF5D-C3677E71F5D8}",
+        "{9138EDDD-890B-46E2-8B64-E0037E2B332D}",
+        "{798D9FEC-789F-46FD-B3D9-359C8E81DD11}",
+        "{841EB9A8-6DA7-479E-94DC-C23B95FFDF43}",
+    ];
+    /// The client session worker's wake event — SetEvent to deliver the grant.
+    const SESSION_WORKER_EVENT: &str = "{B8B918C0-9790-47F2-AC7A-F36B8414140C}";
+    /// The per-key ACTIVATION event — SetEvent ~60ms AFTER the grant. This is the signal
+    /// that flips the game from a uniform muted/black frame to painting its real per-key
+    /// colour. Without it the game registers and streams frames, but every key stays the
+    /// muted clear colour (the whole "connects but paints nothing" symptom).
+    const ACTIVATE_EVENT: &str = "{A84AF9C8-EFE0-430D-871C-10DA760C2CCD}";
+    /// The SessionInfo section the grant writes its {event-type, session-id} slots into.
+    const SESSION_INFO: &str = "821AA2A2-8215-4A16-BE9D-7CD8CEBDC398";
+    /// The Chroma client DLL a game loads — the marker we scan processes for.
+    const CHROMA_CLIENT_DLL: &str = "rzchromasdk64.dll";
 
     /// True if a Chroma server already wears the mask (holds the first mask mutex). This
     /// is the honest "another live server owns arbitration — stand down" signal: whoever
@@ -1063,36 +1168,297 @@ pub mod server {
     struct SendHandle(HANDLE);
     unsafe impl Send for SendHandle {}
 
-    /// Holds the arbitration mutexes alive until dropped (which releases them).
+    /// Owns the arbitration objects + the background arbiter thread. Dropping it stops
+    /// the thread (join) THEN releases every held handle — so no tick can fire after the
+    /// sections it writes have been torn down.
     pub struct MaskGuard {
         held: Vec<SendHandle>,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
     }
     impl Drop for MaskGuard {
         fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Some(t) = self.thread.take() {
+                let _ = t.join();
+            }
             for h in &self.held {
                 unsafe { CloseHandle(h.0) };
             }
         }
     }
 
-    /// Create + hold the arbitration mutexes so a game paints against neuron with no
-    /// vendor arbitration process running. No events, no pulsing — they stay
-    /// nonsignalled so the game owns its own handshake events.
-    fn wear_mask(sa: &EveryoneSa) -> MaskGuard {
+    /// Stand up the full arbitration: hold the mutexes + signalled events, then run the
+    /// one-shot grant/activate loop on a background thread (NO pulse — see the arbiter
+    /// block above). `appreg`/`sessinfo` are the mapped `(pointer, size)` of the
+    /// app-registry and SessionInfo sections the grant writes.
+    fn wear_mask(
+        sa: &EveryoneSa,
+        appreg: (usize, usize),
+        sessinfo: (usize, usize),
+        keyboard: (usize, usize),
+    ) -> MaskGuard {
         let mut held = Vec::new();
-        for g in MASK_MUTEXES {
+        // Arbitration mutexes: the three fixed + one per interactive user.
+        let user = std::env::var("USERNAME").unwrap_or_default();
+        let mut mutex_names: Vec<String> = MASK_MUTEXES.iter().map(|s| (*s).to_string()).collect();
+        mutex_names.push(format!("{MASK_PERUSER_MUTEX}{user}"));
+        for g in &mutex_names {
             let w = wide(&format!("Global\\{g}"));
             let h = unsafe { CreateMutexW(sa.ptr(), 0, w.as_ptr()) };
             if !h.is_null() {
                 held.push(SendHandle(h));
             }
         }
-        MaskGuard { held }
+        // Events the game wants held SIGNALLED. Created manual-reset + START signalled and
+        // kept alive in `held` for the server's lifetime. A manual-reset event stays set
+        // until explicitly reset, so there is nothing to re-assert on a timer — re-poking
+        // them would be exactly the periodic tick we want to avoid.
+        for g in MASK_SIGNALLED_EVENTS {
+            let w = wide(&format!("Global\\{g}"));
+            let h = unsafe { CreateEventW(sa.ptr(), 1, 1, w.as_ptr()) }; // manual-reset, START signalled
+            if !h.is_null() {
+                held.push(SendHandle(h));
+            }
+        }
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_thread = std::sync::Arc::clone(&stop);
+        let thread = std::thread::Builder::new()
+            .name("chroma-arbiter".into())
+            .spawn(move || arbiter_loop(appreg, sessinfo, keyboard, stop_thread))
+            .ok();
+        MaskGuard { held, stop, thread }
     }
 
-    // SAFETY: after `create`, the mapped views are stable read-only shared-memory
-    // pages; reading them from any thread is sound and we never mutate through the
-    // server. This lets an `Arc<ShmServer>` back the per-device arbiter layers.
+    /// The arbiter: ACTIVATE the connected game ONCE — write its grant, then fire the
+    /// per-key activation event — and otherwise stay QUIET. It is deliberately NOT a
+    /// heartbeat. Once a game is activated it STAYS activated (its own frames flow), so the
+    /// only ongoing work is a cheap liveness check on the known PID; we never re-poke the
+    /// session. (An earlier "re-activate if the board looks uniform" recheck was removed: it
+    /// occasionally caught the game's own transient clear frame and re-fired the activation
+    /// mid-stream, which the game rendered as a periodic flicker.) The expensive
+    /// process/module scan runs ONLY while no game is activated yet, gated behind a live
+    /// session-worker event so it costs nothing at idle. Re-activation happens only on a
+    /// relaunch (a new PID appears after the old one dies).
+    fn arbiter_loop(
+        appreg: (usize, usize),
+        sessinfo: (usize, usize),
+        _keyboard: (usize, usize),
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        use std::sync::atomic::Ordering;
+        let mut activated: Option<u32> = None; // the PID we've activated
+        while !stop.load(Ordering::Relaxed) {
+            match activated {
+                // Activated: the only ongoing work is a cheap liveness check. A dead PID
+                // (game closed) → drop it so a relaunch is picked up. Nothing is re-poked.
+                Some(pid) => {
+                    if !process_alive(pid) {
+                        activated = None;
+                    }
+                }
+                // No game yet: the (heavier) scan, but only once a client's session worker
+                // is up, so at true idle this is a single cheap event-open.
+                None => {
+                    if session_worker_present() {
+                        if let Some(pid) = find_chroma_client() {
+                            unsafe { activate_once(appreg, sessinfo, pid, pid_session(pid)) };
+                            activated = Some(pid);
+                        }
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2000));
+        }
+    }
+
+    /// The decompile-exact ACTIVATION (mirrors the reference `activate2` sequence): register
+    /// the client in the app registry, seed one session slot, wake the session worker, then
+    /// — after a short beat — fire the per-key [`ACTIVATE_EVENT`]. That last signal is what
+    /// flips the board from a uniform muted frame to the game's real per-key colour.
+    ///
+    /// # Safety
+    /// `appreg`/`sessinfo` must be the live mapped views of the app-registry / SessionInfo
+    /// sections with the given sizes; only this thread writes them.
+    unsafe fn activate_once(appreg: (usize, usize), sessinfo: (usize, usize), pid: u32, sess: u32) {
+        write_grant(appreg, sessinfo, pid, sess);
+        signal_event(SESSION_WORKER_EVENT);
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        signal_event(ACTIVATE_EVENT); // A84AF9C8 → per-key colour
+    }
+
+    /// The MEMORY half of activation: stamp the grant records into the mapped app-registry and
+    /// SessionInfo pages. Split out from [`activate_once`] so the exact byte layout is unit-tested
+    /// without the kernel-event signalling + timing. These are raw stores into interior-mutable
+    /// shared memory; only the single `chroma-arbiter` thread ever writes these bytes, and readers
+    /// snapshot the same pages by volatile copy (see [`ShmServer::section_bytes`]) — so no `&`/
+    /// `&mut` is ever formed into a live page and the `unsafe impl Sync` justification holds.
+    ///
+    /// # Safety
+    /// Each `(ptr, size)` must be either `(0, _)` (skipped) or the live mapped view of the named
+    /// section with at least the asserted size; `ptr` need not be aligned (`write_unaligned`).
+    unsafe fn write_grant(appreg: (usize, usize), sessinfo: (usize, usize), pid: u32, sess: u32) {
+        let (ap, ap_size) = appreg;
+        if ap != 0 && ap_size >= APP_REGISTRY_RECORD0 + 0x10 {
+            let p = ap as *mut u8;
+            std::ptr::write_unaligned(p as *mut u32, 1); // app count = 1
+            std::ptr::write_unaligned(p.add(APP_REGISTRY_RECORD0 + 0x0c) as *mut u32, pid); // PID @ +0x20c
+        }
+        let (sp, sp_size) = sessinfo;
+        if sp != 0 && sp_size >= 12 {
+            let s = sp as *mut u8;
+            std::ptr::write_unaligned(s as *mut u32, 0); // head
+            std::ptr::write_unaligned(s.add(4) as *mut u32, 8); // slot0 event-type 8 (grant access)
+            std::ptr::write_unaligned(s.add(8) as *mut u32, sess); // slot0 session id
+        }
+    }
+
+    #[cfg(test)]
+    mod grant_tests {
+        use super::super::APP_REGISTRY_RECORD0;
+        use super::write_grant;
+
+        fn u32_at(b: &[u8], o: usize) -> u32 {
+            u32::from_le_bytes(b[o..o + 4].try_into().unwrap())
+        }
+
+        #[test]
+        fn write_grant_stamps_appreg_and_sessioninfo() {
+            // The exact byte layout the session worker validates: app count + client PID @ +0x20c,
+            // and SessionInfo slot0 {head=0, event-type=8, session-id}. Owned buffers stand in for
+            // the mapped pages so the raw stores are checkable without a live server.
+            let mut appreg = vec![0u8; APP_REGISTRY_RECORD0 + 0x10];
+            let mut sess = vec![0u8; 12];
+            // SAFETY: both pointers are into live, correctly-sized owned buffers.
+            unsafe {
+                write_grant(
+                    (appreg.as_mut_ptr() as usize, appreg.len()),
+                    (sess.as_mut_ptr() as usize, sess.len()),
+                    0x7A11,
+                    1,
+                );
+            }
+            assert_eq!(u32_at(&appreg, 0), 1, "app count = 1");
+            assert_eq!(u32_at(&appreg, APP_REGISTRY_RECORD0 + 0x0c), 0x7A11, "client PID @ +0x20c");
+            assert_eq!(u32_at(&sess, 0), 0, "session head = 0");
+            assert_eq!(u32_at(&sess, 4), 8, "slot0 event-type 8 (grant access)");
+            assert_eq!(u32_at(&sess, 8), 1, "slot0 session id");
+        }
+
+        #[test]
+        fn write_grant_skips_null_or_undersized_sections() {
+            // The arbiter passes (0, 0) for a section that failed to map, and a short buffer must
+            // be bounds-rejected — write_grant must never store through either.
+            let mut tiny = vec![0u8; 4];
+            // SAFETY: `tiny` is a live 4-byte buffer; the sessinfo arg is the null/skip sentinel.
+            unsafe {
+                write_grant((tiny.as_mut_ptr() as usize, tiny.len()), (0, 0), 0x1234, 1);
+            }
+            assert!(tiny.iter().all(|&b| b == 0), "undersized app-registry left untouched");
+        }
+    }
+
+    /// `SetEvent` a named global event (GUID with braces), if it exists.
+    fn signal_event(guid_braced: &str) {
+        let w = wide(&format!("Global\\{guid_braced}"));
+        let h = unsafe { OpenEventW(0x1F0003, 0, w.as_ptr()) };
+        if !h.is_null() {
+            unsafe {
+                SetEvent(h);
+                CloseHandle(h);
+            }
+        }
+    }
+
+
+    /// True if a client's session worker has created its wake event — a game has inited
+    /// its Chroma SDK and is waiting to be granted. Gates the (heavier) client scan.
+    fn session_worker_present() -> bool {
+        let w = wide(&format!("Global\\{SESSION_WORKER_EVENT}"));
+        let h = unsafe { OpenEventW(0x1F0003, 0, w.as_ptr()) };
+        if h.is_null() {
+            false
+        } else {
+            unsafe { CloseHandle(h) };
+            true
+        }
+    }
+
+    /// The interactive session id for a pid (games run in the console session, usually 1).
+    fn pid_session(pid: u32) -> u32 {
+        let mut sess: u32 = 0;
+        if unsafe { ProcessIdToSessionId(pid, &mut sess) } != 0 {
+            sess
+        } else {
+            1
+        }
+    }
+
+    /// Find a live process with the Chroma client DLL loaded — the game to grant. Returns
+    /// the first match (the common case is a single game); skips processes we can't
+    /// snapshot (bitness / access), which is harmless.
+    fn find_chroma_client() -> Option<u32> {
+        let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if snap == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let mut pe: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+        pe.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut found = None;
+        if unsafe { Process32FirstW(snap, &mut pe) } != 0 {
+            loop {
+                let pid = pe.th32ProcessID;
+                if pid > 4 && process_has_module(pid, CHROMA_CLIENT_DLL) {
+                    found = Some(pid);
+                    break;
+                }
+                if unsafe { Process32NextW(snap, &mut pe) } == 0 {
+                    break;
+                }
+            }
+        }
+        unsafe { CloseHandle(snap) };
+        found
+    }
+
+    /// Whether `pid` has a module named `dll_lower` (lowercase) loaded.
+    fn process_has_module(pid: u32, dll_lower: &str) -> bool {
+        let snap =
+            unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid) };
+        if snap == INVALID_HANDLE_VALUE {
+            return false;
+        }
+        let mut me: MODULEENTRY32W = unsafe { std::mem::zeroed() };
+        me.dwSize = std::mem::size_of::<MODULEENTRY32W>() as u32;
+        let mut hit = false;
+        if unsafe { Module32FirstW(snap, &mut me) } != 0 {
+            loop {
+                let end = me.szModule.iter().position(|&c| c == 0).unwrap_or(me.szModule.len());
+                let name = String::from_utf16_lossy(&me.szModule[..end]).to_lowercase();
+                if name == dll_lower {
+                    hit = true;
+                    break;
+                }
+                if unsafe { Module32NextW(snap, &mut me) } == 0 {
+                    break;
+                }
+            }
+        }
+        unsafe { CloseHandle(snap) };
+        hit
+    }
+
+    // SAFETY: `ShmServer` shares its mapped views across threads (an `Arc<ShmServer>` backs the
+    // per-device arbiter layers, and the `chroma-arbiter` thread activates connected games). The
+    // pages are INTERIOR-MUTABLE shared memory — written by the game cross-process and, during
+    // activation, by the arbiter thread via `write_grant`. Soundness does NOT rest on "never
+    // mutated": it rests on how the memory is TOUCHED. Every read is a volatile snapshot-copy
+    // (`section_bytes`) and every write is a raw store (`write_grant`); we never form a `&`/`&mut`
+    // into a live page, so no Rust reference invariant is ever exposed to a concurrent writer.
+    // Torn reads (a snapshot racing a write) are rejected by the record magic-word check +
+    // stale-carry in the decoders, exactly as they already tolerate the game's mid-write frames.
+    // The one in-process writer is a single thread the `MaskGuard` joins before unmapping, so no
+    // write can outlive the pages. The handles/`Vec`s are otherwise plain owned data.
     unsafe impl Send for ShmServer {}
     unsafe impl Sync for ShmServer {}
 
@@ -1161,18 +1527,24 @@ pub mod server {
     const GAME_IDLE_GRACE: std::time::Duration = std::time::Duration::from_millis(1500);
 
     impl ChromaShmLayer {
+        /// `initial_alpha` seeds the crossfade. A first claim (the game just connected) starts at
+        /// 0.0 so it fades IN over the base. A RE-CLAIM — the same live game whose Heartbeat lease
+        /// lapsed and was swept while it was still painting — starts at 1.0: the game is already
+        /// on screen, so rebuilding the layer at 0.0 would spuriously dim the whole board to black
+        /// and fade it back, a periodic dip. Callers that know the game is present pass 1.0.
         pub fn new(
             server: Arc<ShmServer>,
             device_type: u8,
             leds: usize,
             blend: Arc<AtomicU8>,
+            initial_alpha: f32,
         ) -> Self {
             ChromaShmLayer {
                 server,
                 device_type,
                 leds,
                 last: vec![None; leds],
-                alpha: 0.0,
+                alpha: initial_alpha,
                 last_now: None,
                 present: false,
                 last_present_check: None,
@@ -1271,6 +1643,8 @@ pub mod server {
 
     impl Drop for ShmServer {
         fn drop(&mut self) {
+            // Stop the arbiter thread FIRST — it writes into the sections we unmap below.
+            self._mask.take();
             for s in &self.sections {
                 unsafe {
                     UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
