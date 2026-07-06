@@ -1,3 +1,10 @@
+> **🤖 agent-generated · live context doc**
+> *not official docs.* an LLM wrote this while building neuron. it may be
+> stale, wrong, or slop — or it may be load-bearing and exactly right.
+> code is the source of truth; verify before you lean on it.
+>
+> **kind:** forward build plan / design contract (written for an implementing agent) · **as of:** 2026-07-02 · **trust:** aspirational — parts have shipped, much is still intent; the design brief in the appendix is the binding part, the `file:line` refs drift fast
+
 # KNOCKBACK — implementation plan
 ### The rhythm familiar, built on the Whisper physics codecs
 

@@ -23,7 +23,8 @@ nothing here is a promise or a date. it's the current reality and the direction,
 | notifications / confirmations | 🟢 solid | visual cards plus optional audio, per kind. |
 | lighting engine | 🟡 works, polishing | recently rebuilt: pattern × spectrum, positionable data layers, auto-apply. good already. the live work is ironing out every quirk so it behaves exactly as expected, every time. |
 | macros & beacons | 🟡 works, polishing | a warm CPython sidecar, ask/notify, a persistent key-value store, macro-calls-macro, the block builder. next up: proper docs and a cleaner API around the whole thing, plus closing a memory smell in the python bridge. |
-| GUI rendering | 🟡 works, polishing | leans on the CPU today, and a few areas feel it (the overlay instruments especially). turning on GPU rendering there is a likely upgrade. |
+| GUI rendering | 🟡 works, polishing | the main UI is on the GPU now (femtovg, software fallback so it still opens on a VM or bad-driver box). the overlay instruments (weaves, teleport, whiteboard, curtain) are the exception: layered click-through windows composited pixel-by-pixel on the CPU, and that's the part you can still feel. moving those to the GPU is real work, not a switch. |
+| UI look & feel | 🟡 works, polishing | it's not ugly and it's not good — it just is, right now. everything's legible and does what it says, but the visual design hasn't had a real pass yet. functional, not finished. |
 | on-device memory / onboard storage | 🟠 partial | storage accounting and volatile writes work; full onboard profile-slot persistence and scroll feel-curves aren't done, so "push it all to the mouse and uninstall" isn't fully real yet. |
 | spellweaving at scale (many rich weaves, a full radial menu) | 🟠 under-tested | the engine and the eigenmotion recognition are solid; heavy real-world use with a big glyph vault and a fully populated radial hasn't been lived-in. treat rich setups as experimental for now. |
 | instruments (teleport, tether, whiteboard, glance, window verbs, dial, knockback, control) | 🟠 built, uneven | all present, maturity varies, under-tested. the whiteboard can't save its ink to disk yet. |
@@ -37,7 +38,7 @@ nothing here is a promise or a date. it's the current reality and the direction,
 
 **macros & beacons.** the runtime is real and fast: a warm CPython sidecar in its own process, loaded once with imports already paid, so firing a macro is basically a function call, and a crashing macro can never take the app down. what's thin right now is the documentation and the shape of the API you write against. that's the next push: a proper reference, cleaner helpers, and closing out a memory smell in the python bridge.
 
-**rendering.** most of the app is light, but rendering leans on the CPU today, and in a few spots (the overlay-heavy instruments) you can feel it. GPU rendering for those is a likely upgrade rather than a locked plan.
+**rendering.** the main UI runs on the GPU now (femtovg, with a software fallback so it opens anywhere). the overlay instruments are the holdout: they're layered click-through windows painted pixel-by-pixel on the CPU, and in the overlay-heavy ones you can feel it. moving those to the GPU is real work, not a switch.
 
 **momentary mic.** honest: i've barely touched this. the enum and the dispatch hook exist so the wiring is there, but it is not a finished feature. treat it as absent until this page says otherwise.
 

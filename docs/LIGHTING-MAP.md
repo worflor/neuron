@@ -1,3 +1,10 @@
+> **🤖 agent-generated · live context doc**
+> *not official docs.* an LLM wrote this while building neuron. it may be
+> stale, wrong, or slop — or it may be load-bearing and exactly right.
+> code is the source of truth; verify before you lean on it.
+>
+> **kind:** as-built architecture map (four-sweep audit) · **as of:** 2026-07-02 · **trust:** high — every claim was cited to live code at the time; §5 honestly lists the seams still open
+
 # The Lighting System — Map & Inspection
 
 A rigorous end-to-end map of every path by which bytes reach a device's LEDs, how the Razer

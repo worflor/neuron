@@ -1,3 +1,10 @@
+> **🤖 agent-generated · live context doc**
+> *not official docs.* an LLM wrote this while building neuron. it may be
+> stale, wrong, or slop — or it may be load-bearing and exactly right.
+> code is the source of truth; verify before you lean on it.
+>
+> **kind:** R&D findings + design (protocol-host) · **as of:** 2026-07-04 · **trust:** mixed — §0–8 (thesis, principles, design) are durable; the later survey/lifecycle sections carry `file:line` refs against a branch snapshot and drift
+
 # Neuron Protocol Host — R&D Findings & Design
 
 > **Status:** R&D, branch `rnd/protocol-host`, worktree `../neuron-rnd`.
@@ -435,7 +442,7 @@ the signal bus. **No I/O.** Minimal surface = maximal reliability. Because it ho
 no sockets and does no parsing, it has almost nothing that *can* crash. This is the
 "simple" heart everything else orbits.
 
-**Anti-poison design (fixes the AUDIT's flagged HIGH — status-mutex poison):** the
+**Anti-poison design (no status-mutex poison to worry about):** the
 kernel is a message-passing **actor** — it owns its state on ONE thread, everyone
 talks to it via a channel. There is **no shared `Mutex` to poison.** A panicking
 adapter cannot corrupt kernel state because it never holds a lock on it.
@@ -765,9 +772,10 @@ macro engine are just two of its subscribers.
 - **No co-author trailers, no pushing past local** (user directive, 2026-07-01).
 - Token policy: Fable drives; Sonnet read-only subagents for mapping/exploration;
   Opus subagents for bulk coding when needed.
-- Relevant memory: *cross-platform-seam-plan* (docs/AUDIT.md — 5 trait seams:
-  LayeredSurface/InputSource/WindowManager/AudioControl/DevicePath; HIGH =
-  dispatch status-mutex poison → §6.1 fixes it), *lighting-engine-plan*,
+- Relevant memory: *cross-platform-seam-plan* (5 trait seams:
+  LayeredSurface/InputSource/WindowManager/AudioControl/DevicePath — now the
+  readiness scorecard in docs/TDD.md §9; HIGH = dispatch status-mutex poison →
+  §6.1 fixes it), *lighting-engine-plan*,
   *macro-backend-v2* (`act`/run_act), *refine-pass-backlog* (flagged races).
 - Section 9 below (neuron lifecycle map) is being filled by a read-only agent.
 
@@ -805,8 +813,8 @@ each spawning workers + HID handles. (§10 fixes this *via the host itself*.)
   ReconcileGamingHook/ApplyProfile). **Immortal listener**: catch_unwind +
   reopen-after-250ms; ESC never stops it. **The ONLY cleanly-joined worker**
   (stop atomic + join in Drop). Status posted to UI via invoke_from_event_loop.
-  The AUDIT's status-mutex-poison HIGH is **already fixed** in this tree (all
-  sites use `unwrap_or_else(PoisonError::into_inner)`) — AUDIT.md is stale.
+  The status-mutex-poison risk is handled here (all sites use
+  `unwrap_or_else(PoisonError::into_inner)`).
 - **`neuron-beacon-router` / `neuron-weave-presenter`** (beacon.rs:149/225) —
   drain MacroHost beacon events; presenter is the single cast-trigger owner
   (beacon asks OR live spellweave), per-cycle catch_unwind, never joined.

@@ -20,7 +20,7 @@ the README has an honest map of how much groundwork is already done: **[README â
 - **a lighting effect** is one registry entry plus a `field()` generator. pure math, self-contained, a good first PR.
 - **a preset (a look)** is pure data: an existing pattern plus a spectrum. zero code.
 - **a neuron-host protocol adapter** (OBS, MQTT, WLED, MIDI, ...) is a small codec with a capture-and-replay harness.
-- **bigger chunks** (the linux / mac port, a real vendor abstraction) are described in the README and in `docs/AUDIT.md` / `docs/PROTOCOL-HOST-RND.md`. talk to me before starting one.
+- **bigger chunks** (the linux / mac port, a real vendor abstraction) are described in the README and in `docs/TDD.md` / `docs/PROTOCOL-HOST-RND.md`. talk to me before starting one.
 
 ## the layout
 
@@ -51,6 +51,12 @@ three hard invariants:
 3. **more, never bloat.** neuron does a lot on purpose, but every addition earns its place. replacing slop with slop defeats the whole point.
 
 the diagnostics bench on the system page (also what CI runs) is the "prove it works" surface: read-only and always safe.
+
+## building it (windows gotchas)
+
+- kill the running tray instance before a release build. windows locks the live `.exe` and the build fails.
+- don't run two builds at once. it corrupts the incremental cache (you'll get bogus `LNK2019 anon.*.llvm`); clear `target/debug/incremental` to recover.
+- editing source on windows: don't round-trip repo files through `Get/Set-Content` in powershell 5.1. it re-encodes UTF-8 as ANSI and leaves mojibake. use an editor that keeps UTF-8.
 
 ## sending a change
 

@@ -1,3 +1,10 @@
+> **🤖 agent-generated · live context doc**
+> *not official docs.* an LLM wrote this while building neuron. it may be
+> stale, wrong, or slop — or it may be load-bearing and exactly right.
+> code is the source of truth; verify before you lean on it.
+>
+> **kind:** app-level technical design (the living architecture doc) · **as of:** 2026-06-19 · **trust:** high — broadly matches the tree; the map most worth reading first
+
 # Neuron Technical Design Document
 
 Updated: 2026-06-19
@@ -477,6 +484,8 @@ Device writes follow these constraints:
 - Device reads are best-effort and may honestly return unavailable/asleep state.
 - Profile apply is idempotent and writes only populated profile fields.
 
+**The write gate itself** (`writes.rs`) is three steps, and its whole point is that a write is only "done" once it round-trips on real hardware: (1) flip Razer driver mode `0x03` so host control is accepted (`ensure_driver`); (2) write volatile / `NOSTORE` first so nothing flashes to onboard until it's proven correct; (3) re-read the matching getter and confirm the bytes we set landed (`verify_getter`) — if the device doesn't echo what we wrote, the call **errors** instead of lying that it worked. A control with *no* getter can't be verify-gated at all, which is why a few writes stay behind per-feature `NEURON_*_WRITE` env flags until a live capture confirms their byte layout; the honesty table in the README tracks which are proven / gated / absent.
+
 The GUI and live dispatcher keep write pause state synchronized by not owning duplicate write authority. `glue` updates `neuron-core/src/safety.rs`, while Slint and tray mirror that state as presentation. `safety.rs` is the in-process source of truth for input-armed and writes-paused state; `action.rs` and `writes.rs` are compatibility fronts over that state.
 
 ### 5.6 Macro Flow
@@ -671,6 +680,22 @@ Mitigation:
 - Keep platform capability reporting explicit in the UI and CLI.
 - Replace Windows-specific path identity with an opaque backend-owned device identity before adding macOS/Linux HID backends.
 - Keep platform-specific hooks, Raw Input, purge/admin helpers, and COM audio behind clear modules/features.
+
+**Cross-platform readiness scorecard** (a few of these seams have since landed, so verify each against the tree before relying on it):
+
+| Subsystem | Rating | The one change that unlocks portability |
+|---|---|---|
+| Engine / Trigger spine (`engine.rs`, `controls.rs` core) | **Ready** | Already pure & portable — leave it. |
+| Audio synthesis (`tone.rs`, cpal output `sound.rs`) | **Ready** | Pure FM + cpal; the model to copy. |
+| Resolve pipeline (`cast.rs`, `glyph.rs`, `radial.rs`) | **Ready** | Pure math. |
+| OS audio control (`audio.rs`) | **Needs a seam** | `AudioControl` trait; ~9 stubs → one inert impl. |
+| HID transport (`transport.rs`, `windows_hid.rs`) | **Needs a seam** | Opaque `DevicePath` instead of `Vec<u16>`, then drop in a hidraw/IOKit backend. |
+| Window mgmt (`wm.rs`, `glance.rs`, `teleport.rs`, `whiteboard.rs`) | **Windows-welded** | One `WindowManager` trait + portable cycle/order logic above it. |
+| Layered overlay surface (overlay / teleport / whiteboard / glance) | **Windows-welded** | Extract one `LayeredSurface` type; it becomes the single port target. |
+| Curtain (`curtain.rs`) | **Needs a seam** | `mod imp` / `mod stub` split like `overlay.rs`. |
+| Live input + dispatch worker (`dispatch.rs run_worker`) | **Windows-welded** | `InputSource` trait + platform-neutral edge/turbo/routing loop. |
+
+The *core* is ready; the *driver and surfaces* are welded. Every welded/seam row shares one remedy shape — a minimal trait with the portable logic hoisted above it — and `Transport` + cpal already prove the house can do it.
 
 ### Risk: Docs Drift
 
