@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use std::sync::mpsc::{Receiver, Sender};
 
-use crate::adapters::chroma::{ChromaServer, HttpRequest, HttpResponse};
+use crate::adapters::chroma::{ChromaServer, GameLightingPolicy, HttpRequest, HttpResponse};
 use crate::adapters::obs::{ObsClient, ObsEvent};
 use crate::adapters::openrgb::OrgbConn;
 use crate::api::HostApi;
@@ -258,12 +258,20 @@ pub struct ChromaHttpServer {
 
 impl ChromaHttpServer {
     pub fn bind(addr: &str, handle: HostHandle) -> std::io::Result<ChromaHttpServer> {
+        ChromaHttpServer::bind_with_policy(addr, handle, GameLightingPolicy::new())
+    }
+
+    pub fn bind_with_policy(
+        addr: &str,
+        handle: HostHandle,
+        policy: Arc<GameLightingPolicy>,
+    ) -> std::io::Result<ChromaHttpServer> {
         let listener = TcpListener::bind(addr)?;
         listener.set_nonblocking(true)?;
         let local = listener.local_addr()?;
         let stop = Arc::new(AtomicBool::new(false));
         let stop_flag = stop.clone();
-        let server = Arc::new(Mutex::new(ChromaServer::new()));
+        let server = Arc::new(Mutex::new(ChromaServer::with_policy(policy)));
         let shared = server.clone();
         let accept = thread::Builder::new()
             .name("neuron-chroma-accept".into())

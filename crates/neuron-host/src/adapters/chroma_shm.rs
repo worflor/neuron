@@ -1017,7 +1017,7 @@ pub mod server {
                 let Some((_, units)) = parse_frame_decoded(&bytes) else { continue };
                 let is_lit = units
                     .iter()
-                    .skip(1)
+                    .skip(chroma_grid_lead(dt))
                     .any(|u| { let (r, g, b) = u.rgb(); (r | g | b) != 0 });
                 if is_lit {
                     lit += 1;
@@ -1462,8 +1462,8 @@ pub mod server {
     unsafe impl Send for ShmServer {}
     unsafe impl Sync for ShmServer {}
 
+    use crate::adapters::chroma::GameLightingPolicy;
     use crate::arbiter::{BlendMode, LiveContent, Rgb};
-    use std::sync::atomic::{AtomicU8, Ordering};
     use std::sync::Arc;
     use std::time::Instant;
 
@@ -1479,6 +1479,7 @@ pub mod server {
     /// is skipped (`GRID_LEAD`) so unit *i* maps to LED *i*.
     pub struct ChromaShmLayer {
         server: Arc<ShmServer>,
+        key: String,
         device_type: u8,
         leds: usize,
         /// Last decoded game frame, carried forward on a torn/absent read.
@@ -1498,12 +1499,8 @@ pub mod server {
         /// out when BOTH say the game is gone.
         last_ts: u32,
         last_ts_change: Option<Instant>,
-        /// How this game's colour combines with the user's base beneath it: `Over`
-        /// replaces (the classic "games take over"), `Screen` merges (its light adds
-        /// over your lighting). A shared cell so the host can flip the merge policy
-        /// LIVE — every device layer reads the same atom, so one store re-tints them
-        /// all on the next frame, with no server teardown or claim churn.
-        blend: Arc<AtomicU8>,
+        /// Shared game-lighting policy: blend, intensity, fade, and device scope.
+        policy: Arc<GameLightingPolicy>,
     }
 
     /// How many leading decoded units to skip before physical LED 0, by device CLASS —
@@ -1512,14 +1509,13 @@ pub mod server {
     /// that pad, and the record is otherwise "one unit per LED", so every non-keyboard
     /// class maps unit i → LED i straight. Unverified classes default to 0 so a
     /// mouse/mousepad frame is never shifted a pixel; a real capture can promote it later.
-    fn chroma_grid_lead(device_type: u8) -> usize {
+    pub fn chroma_grid_lead(device_type: u8) -> usize {
         match device_type {
             0x01 => 1, // keyboard — the reserved leading cell, confirmed on hardware
             _ => 0,    // mouse / mousepad / headset / keypad / generic — straight map
         }
     }
     /// Seconds for a full 0↔1 crossfade between base and game lighting.
-    const FADE_SECS: f32 = 0.45;
     /// How often to re-check whether a game process is still alive (a syscall, throttled).
     const PRESENCE_POLL: std::time::Duration = std::time::Duration::from_millis(250);
     /// A frame counts as "fresh" if its timestamp advanced within this window; once it
@@ -1534,13 +1530,15 @@ pub mod server {
         /// and fade it back, a periodic dip. Callers that know the game is present pass 1.0.
         pub fn new(
             server: Arc<ShmServer>,
+            key: String,
             device_type: u8,
             leds: usize,
-            blend: Arc<AtomicU8>,
+            policy: Arc<GameLightingPolicy>,
             initial_alpha: f32,
         ) -> Self {
             ChromaShmLayer {
                 server,
+                key,
                 device_type,
                 leds,
                 last: vec![None; leds],
@@ -1550,7 +1548,7 @@ pub mod server {
                 last_present_check: None,
                 last_ts: 0,
                 last_ts_change: None,
-                blend,
+                policy,
             }
         }
     }
@@ -1593,7 +1591,14 @@ pub mod server {
             let fresh = self
                 .last_ts_change
                 .is_some_and(|t| now.duration_since(t) < GAME_IDLE_GRACE);
-            let target = if has_frame && (self.present || fresh) { 1.0 } else { 0.0 };
+            let target = if has_frame
+                && self.policy.allows_key(&self.key)
+                && (self.present || fresh)
+            {
+                1.0
+            } else {
+                0.0
+            };
 
             // Ramp alpha toward the target by elapsed time (framerate-independent).
             let dt = self
@@ -1602,7 +1607,8 @@ pub mod server {
                 .unwrap_or(0.0)
                 .min(0.25);
             self.last_now = Some(now);
-            let step = if FADE_SECS > 0.0 { dt / FADE_SECS } else { 1.0 };
+            let fade_secs = self.policy.fade_secs();
+            let step = if fade_secs > 0.0 { dt / fade_secs } else { 1.0 };
             if self.alpha < target {
                 self.alpha = (self.alpha + step).min(target);
             } else if self.alpha > target {
@@ -1617,16 +1623,17 @@ pub mod server {
         }
 
         fn alpha(&self) -> f32 {
-            self.alpha
+            self.alpha * self.policy.alpha()
         }
 
         fn blend_mode(&self) -> BlendMode {
-            BlendMode::from_bits(self.blend.load(Ordering::Relaxed))
+            self.policy.blend_mode()
         }
 
         fn boxed_clone(&self) -> Box<dyn LiveContent> {
             Box::new(ChromaShmLayer {
                 server: Arc::clone(&self.server),
+                key: self.key.clone(),
                 device_type: self.device_type,
                 leds: self.leds,
                 last: self.last.clone(),
@@ -1636,7 +1643,7 @@ pub mod server {
                 last_present_check: self.last_present_check,
                 last_ts: self.last_ts,
                 last_ts_change: self.last_ts_change,
-                blend: Arc::clone(&self.blend),
+                policy: Arc::clone(&self.policy),
             })
         }
     }

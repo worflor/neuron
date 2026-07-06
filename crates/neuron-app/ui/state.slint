@@ -8,7 +8,7 @@
 // Actions), Radial (folded into Spellweaving), and Import (a wizard flow) aren't top-level seats.
 
 import {
-    DeviceRow, RuleRow, ProfileRow, AppRuleRow, EffectRow, RadialSector, GlyphChip, ImportLine,
+    DeviceRow, ChromaDeviceRow, ChromaStreamRow, RuleRow, ProfileRow, AppRuleRow, EffectRow, RadialSector, GlyphChip, ImportLine,
     DiagRow, ActionChoice, OrganRow, MaterialCard, KnobRow, PingKind,
     PocketCard, BeaconMacro, RhythmBindRow, MacroBlock, MacroCard, EffectTile, EffectParam,
     SpectrumStop, SpectrumFrame
@@ -623,7 +623,12 @@ export global State {
     in-out property <bool> host-chroma: true;              // serve Chroma (games) while enabled
     in-out property <bool> host-openrgb: true;             // serve OpenRGB (tools) while enabled
     in-out property <bool> host-obs: false;                // connect OUT to OBS (macros drive scenes)
-    in-out property <bool> host-game-merge: true;          // HOW: merge (screen the game over your lighting) vs replace
+    in-out property <int> host-game-mode: 1;               // 0 replace, 1 merge, 2 boost, 3 tint
+    in-out property <float> host-game-intensity: 100;
+    in-out property <float> host-game-fade-ms: 450;
+    in-out property <[ChromaDeviceRow]> host-game-devices;
+    in-out property <bool> host-chroma-detail-open: false;
+    in-out property <[ChromaStreamRow]> host-chroma-streams;
     in-out property <string> host-obs-password: "";        // obs-websocket Server Password (masked field)
     in-out property <string> host-chroma-status: "";       // honest per-protocol readout
     in-out property <string> host-openrgb-status: "";
@@ -638,7 +643,10 @@ export global State {
     callback set-host-chroma(bool);
     callback set-host-openrgb(bool);
     callback set-host-obs(bool);
-    callback set-host-game-merge(bool);
+    callback set-host-game-mode(int);
+    callback set-host-game-intensity(float);
+    callback set-host-game-fade(float);
+    callback set-host-game-device(string, bool);
     callback set-host-obs-password(string);                 // save + reconnect with the new secret
     // LIGHTING page truth strip: a client holds a claim above your base on the selected board
     // (painting now; your effect resumes when it releases).

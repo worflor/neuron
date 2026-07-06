@@ -37,6 +37,21 @@ export struct DeviceRow {
     plate: string,      // last side plate the mouse pushed ("12-button"…); "" if none/non-plated
 }
 
+export struct ChromaDeviceRow {
+    id: string,
+    name: string,
+    enabled: bool,
+}
+
+export struct ChromaStreamRow {
+    device: string,
+    effect: string,
+    detail: string,
+    first: color,
+    second: color,
+    third: color,
+}
+
 // A spine rule row (Bindings / HyperShift / Radial / Gesture editors all render these).
 export struct RuleRow {
     trigger: string,    // Trigger::describe()

@@ -357,7 +357,7 @@ neuron is under the Whisper Protocol License (`LICENSE.md`), the same license as
 
 the full per-feature status (solid to barely-started) lives in [state of the project](docs/STATUS.md); this section is just the device-write ledger.
 
-it's **windows-only right now** because that's what i'm on. the guts are written to port (HID, audio, raw input, overlays, foreground detection all sit behind seams), but the code behind those seams is Windows today; everywhere else honestly says "not supported" instead of faking it. the linux/mac backends still need writing.
+it's **windows-only right now** because that's what i'm on. the guts are written to port (HID, audio, raw input, overlays, foreground detection all sit behind seams), but the code behind those seams is Windows today; everywhere else honestly says "not supported". the linux/mac backends still need writing.
 
 and i'm not pretending this is the most mature or the broadest thing in the space. on linux, [openrazer](https://github.com/openrazer/openrazer) is the real, decade-hardened answer (kernel driver, a couple hundred devices, an actual community), so use it. if you want one panel for every RGB brand under the sun, that's [OpenRGB](https://openrgb.org). neuron is deliberately narrow: one vendor, one desk, gone deep. that narrowness is the point.
 
@@ -376,9 +376,9 @@ every device write is sorted by how sure i am of it:
 
 things it flat-out doesn't do, so you know before you install:
 
-- **doesn't crack synapse's encrypted cloud profiles.** the AES'd account cache is the lock-in, and we don't touch it. the plaintext in-app *export* is what migration reads.
+- **doesn't crack synapse's encrypted cloud profiles.** the AES'd account cache is the lock-in, and we don't touch it. the plaintext in-app *export* is what migration can read.
 - **doesn't sandbox your macros.** full unsandboxed CPython is the point: a macro can do anything a program can. the arm gate guards the *convenience* helpers, not the raw APIs you reach past them into.
-- **no telemetry, no account, no cloud, no per-app reactive RGB nobody asked for.** not "off by default." just absent.
+- **no telemetry, no account, no cloud.**
 
 ## philosophy / non-goals
 

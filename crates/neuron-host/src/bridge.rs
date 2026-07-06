@@ -479,6 +479,10 @@ impl Bridge {
         self.by_unit.get(unit)
     }
 
+    pub fn unit_surfaces(&self) -> Vec<(String, String)> {
+        self.by_unit.iter().map(|(unit, key)| (unit.clone(), key.clone())).collect()
+    }
+
     /// The surface's writer pause valve (see [`WriterPauser`]) — `None` if
     /// the surface isn't bridged.
     pub fn pauser(&self, key: &str) -> Option<WriterPauser> {

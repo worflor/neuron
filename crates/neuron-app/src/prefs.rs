@@ -180,6 +180,21 @@ pub struct Prefs {
     /// it paints outright. Applies live.
     #[serde(default = "default_true")]
     pub host_game_merge: bool,
+    /// How game lighting combines with the user's lighting: "replace",
+    /// "merge", "boost", or "tint".
+    #[serde(default = "default_game_mode")]
+    pub host_game_mode: String,
+    /// Game layer opacity, 0..100. Applies to REST and native Chroma.
+    #[serde(default = "default_game_intensity")]
+    pub host_game_intensity: u8,
+    /// Native Chroma fade time in milliseconds. Kept in the shared policy so
+    /// every Chroma face reads the same settings surface.
+    #[serde(default = "default_game_fade_ms")]
+    pub host_game_fade_ms: u32,
+    /// Physical device ids excluded from game Chroma. Empty means every
+    /// attached lighting-capable device is included, including future hotplug.
+    #[serde(default)]
+    pub host_game_disabled_devices: Vec<String>,
     /// The obs-websocket Server Password (OBS → Tools → WebSocket Server Settings). Empty = a
     /// passwordless OBS server (auth off). Stored in app.toml like the rest; the `NEURON_OBS_PASSWORD`
     /// env var, when set, overrides this (a dev/headless escape hatch).
@@ -212,6 +227,18 @@ pub enum StackMode {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_game_mode() -> String {
+    "merge".to_string()
+}
+
+fn default_game_intensity() -> u8 {
+    100
+}
+
+fn default_game_fade_ms() -> u32 {
+    450
 }
 
 /// Default audio-cue volume — comfortable, not loud.
@@ -324,6 +351,10 @@ impl Default for Prefs {
             host_openrgb: true,
             host_obs: false,
             host_game_merge: true,
+            host_game_mode: default_game_mode(),
+            host_game_intensity: default_game_intensity(),
+            host_game_fade_ms: default_game_fade_ms(),
+            host_game_disabled_devices: Vec::new(),
             host_obs_password: String::new(),
             lighting: BTreeMap::new(),
         }
@@ -352,17 +383,21 @@ impl Prefs {
         let Ok(s) = std::fs::read_to_string(Self::path()) else {
             return Prefs::default(); // absent file → defaults (first run; nothing to warn about)
         };
+        let table = toml::from_str::<toml::Table>(&s).ok();
         // Fast path: a clean whole-struct parse (the overwhelmingly common case).
-        if let Ok(p) = toml::from_str::<Prefs>(&s) {
+        if let Ok(mut p) = toml::from_str::<Prefs>(&s) {
+            if let Some(table) = &table {
+                Self::migrate_game_mode(table, &mut p);
+            }
             return p;
         }
         // Something didn't fit the struct. Re-parse to a raw table and rebuild field-by-field so one
         // corrupt value can't nuke the rest. If it isn't even valid TOML, fall back to all-defaults —
         // still WITHOUT touching the file (only `save` writes).
-        match toml::from_str::<toml::Table>(&s) {
-            Ok(table) => Self::from_table_salvaging(&table),
-            Err(e) => {
-                eprintln!("neuron: app.toml is not valid TOML ({e}); using defaults (file left intact)");
+        match table {
+            Some(table) => Self::from_table_salvaging(&table),
+            None => {
+                eprintln!("neuron: app.toml is not valid TOML; using defaults (file left intact)");
                 Prefs::default()
             }
         }
@@ -418,13 +453,30 @@ impl Prefs {
         salvage!("host_openrgb", host_openrgb);
         salvage!("host_obs", host_obs);
         salvage!("host_game_merge", host_game_merge);
+        salvage!("host_game_mode", host_game_mode);
+        salvage!("host_game_intensity", host_game_intensity);
+        salvage!("host_game_fade_ms", host_game_fade_ms);
+        salvage!("host_game_disabled_devices", host_game_disabled_devices);
         salvage!("host_obs_password", host_obs_password);
         // `lighting` is a per-device map — salvage it board-by-board so one corrupt record drops only
         // itself, not every other saved stack.
         if let Some(v) = table.get("lighting") {
             p.lighting = salvage_lighting(v);
         }
+        Self::migrate_game_mode(table, &mut p);
         p
+    }
+
+    fn migrate_game_mode(table: &toml::Table, p: &mut Prefs) {
+        let parsed_mode = table.get("host_game_mode").and_then(|v| v.as_str());
+        if let Some(mode) = parsed_mode {
+            p.host_game_mode = normalize_game_mode(mode).to_string();
+        } else if let Some(toml::Value::Boolean(merge)) = table.get("host_game_merge") {
+            p.host_game_mode = if *merge { "merge" } else { "replace" }.to_string();
+        } else {
+            p.host_game_mode = normalize_game_mode(&p.host_game_mode).to_string();
+        }
+        p.host_game_merge = p.host_game_mode != "replace";
     }
 
     /// Persist the prefs back to `app.toml`. Returns a status line.
@@ -909,22 +961,86 @@ pub fn set_host_obs_password(v: &str) -> String {
 }
 
 /// Read the game blend policy (default true = merge/screen over your lighting).
-pub fn host_game_merge() -> bool {
-    Prefs::load().host_game_merge
+fn normalize_game_mode(v: &str) -> &'static str {
+    match v {
+        "replace" => "replace",
+        "boost" => "boost",
+        "tint" => "tint",
+        _ => "merge",
+    }
 }
 
-/// Persist the game blend policy, returning a user-facing status line.
-pub fn set_host_game_merge(v: bool) -> String {
+pub fn host_game_mode() -> String {
+    normalize_game_mode(&Prefs::load().host_game_mode).to_string()
+}
+
+pub fn host_game_mode_index() -> i32 {
+    match host_game_mode().as_str() {
+        "replace" => 0,
+        "boost" => 2,
+        "tint" => 3,
+        _ => 1,
+    }
+}
+
+pub fn set_host_game_mode(v: &str) -> String {
     let mut p = Prefs::load();
-    p.host_game_merge = v;
+    let mode = normalize_game_mode(v);
+    p.host_game_mode = mode.to_string();
+    p.host_game_merge = mode != "replace";
     match p.save() {
-        Ok(()) => {
-            if v {
-                "games merge with your lighting (their light adds over it)".into()
-            } else {
-                "games replace your lighting on the keys they paint".into()
-            }
+        Ok(()) => format!("game chroma mode: {mode}"),
+        Err(e) => format!("save failed: {e}"),
+    }
+}
+
+pub fn host_game_intensity() -> u8 {
+    Prefs::load().host_game_intensity.clamp(0, 100)
+}
+
+pub fn set_host_game_intensity(v: u8) -> String {
+    let mut p = Prefs::load();
+    p.host_game_intensity = v.clamp(0, 100);
+    match p.save() {
+        Ok(()) => format!("game chroma intensity: {}%", p.host_game_intensity),
+        Err(e) => format!("save failed: {e}"),
+    }
+}
+
+pub fn host_game_fade_ms() -> u32 {
+    Prefs::load().host_game_fade_ms.clamp(0, 2500)
+}
+
+pub fn set_host_game_fade_ms(v: u32) -> String {
+    let mut p = Prefs::load();
+    p.host_game_fade_ms = v.clamp(0, 2500);
+    match p.save() {
+        Ok(()) => format!("game chroma fade: {} ms", p.host_game_fade_ms),
+        Err(e) => format!("save failed: {e}"),
+    }
+}
+
+pub fn host_game_disabled_devices() -> Vec<String> {
+    Prefs::load().host_game_disabled_devices
+}
+
+pub fn host_game_device_enabled(id: &str) -> bool {
+    !Prefs::load().host_game_disabled_devices.iter().any(|x| x == id)
+}
+
+pub fn set_host_game_device(id: &str, enabled: bool, _attached: Vec<String>) -> String {
+    let mut p = Prefs::load();
+    if enabled {
+        p.host_game_disabled_devices.retain(|x| x != id);
+    } else {
+        if !p.host_game_disabled_devices.iter().any(|x| x == id) {
+            p.host_game_disabled_devices.push(id.to_string());
         }
+    }
+    p.host_game_disabled_devices.sort();
+    p.host_game_disabled_devices.dedup();
+    match p.save() {
+        Ok(()) => "game chroma devices saved".into(),
         Err(e) => format!("save failed: {e}"),
     }
 }
@@ -986,6 +1102,29 @@ mod tests {
         let msg = set_start_minimized(true);
         assert!(msg.contains("enabled"), "unexpected: {msg}");
         assert!(start_minimized(), "true must persist + reload");
+    }
+
+    #[test]
+    fn legacy_host_game_merge_false_migrates_to_replace_mode() {
+        let _g = cwd_guard();
+        std::fs::write(Prefs::path(), "host_game_merge = false\n").unwrap();
+        let prefs = Prefs::load();
+        assert_eq!(prefs.host_game_mode, "replace");
+        assert!(!prefs.host_game_merge);
+        assert_eq!(host_game_mode(), "replace");
+    }
+
+    #[test]
+    fn malformed_host_game_mode_does_not_block_legacy_merge_migration() {
+        let _g = cwd_guard();
+        std::fs::write(
+            Prefs::path(),
+            "host_game_merge = false\nhost_game_mode = false\n",
+        )
+        .unwrap();
+        let prefs = Prefs::load();
+        assert_eq!(prefs.host_game_mode, "replace");
+        assert!(!prefs.host_game_merge);
     }
 
     /// Lighting state persists per-device and reloads losslessly (fps + a multi-layer stack).
@@ -1129,6 +1268,10 @@ mod tests {
             host_openrgb: !d.host_openrgb,
             host_obs: !d.host_obs,
             host_game_merge: !d.host_game_merge,
+            host_game_mode: "boost".into(),
+            host_game_intensity: 65,
+            host_game_fade_ms: 700,
+            host_game_disabled_devices: vec!["unit-a".into(), "unit-b".into()],
             host_obs_password: "test-pw".into(),
             lighting: d.lighting.clone(),
         };

@@ -17,8 +17,8 @@ use crate::mic;
 use crate::migrate;
 use crate::runtime::AppRuntime;
 use crate::ui::{
-    AppRuleRow, AppWindow, BeaconMacro, DeviceRow, DiagRow, EffectParam, EffectRow, EffectTile,
-    GlyphChip, ImportLine, KnobRow, MacroBlock, MacroCard, MaterialCard, OrganRow,
+    AppRuleRow, AppWindow, BeaconMacro, ChromaDeviceRow, ChromaStreamRow, DeviceRow, DiagRow, EffectParam,
+    EffectRow, EffectTile, GlyphChip, ImportLine, KnobRow, MacroBlock, MacroCard, MaterialCard, OrganRow,
     PingKind, PocketCard, ProfileRow, RadialSector, RhythmBindRow, RuleRow, SpectrumFrame,
     SpectrumStop,
     State, Theme,
@@ -4500,16 +4500,54 @@ pub fn install(app: &AppWindow) -> SharedRt {
     // on LIGHTING updates on its own next poll.
     bind(app, &shared, |app, _sh| {
         let w = app.as_weak();
-        app.global::<State>().on_set_host_game_merge(move |v| {
+        app.global::<State>().on_set_host_game_mode(move |i| {
             if let Some(app) = w.upgrade() {
-                let msg = crate::prefs::set_host_game_merge(v);
-                // Re-tints the live native game layers to the new blend mode (screen ⇄ over)
-                // by storing into the shared blend cell they read — no respawn, no board
-                // re-claim, the connected game keeps its session; the swap shows next frame.
+                let mode = match i {
+                    0 => "replace",
+                    2 => "boost",
+                    3 => "tint",
+                    _ => "merge",
+                };
+                let msg = crate::prefs::set_host_game_mode(mode);
                 crate::host::apply_protocol_prefs();
                 let st = app.global::<State>();
-                st.set_host_game_merge(crate::prefs::host_game_merge());
+                st.set_host_game_mode(crate::prefs::host_game_mode_index());
                 st.set_status_line(msg.into());
+            }
+        });
+    });
+    bind(app, &shared, |app, _sh| {
+        let w = app.as_weak();
+        app.global::<State>().on_set_host_game_intensity(move |v| {
+            if let Some(app) = w.upgrade() {
+                let msg = crate::prefs::set_host_game_intensity(v.round() as u8);
+                crate::host::apply_protocol_prefs();
+                let st = app.global::<State>();
+                st.set_host_game_intensity(crate::prefs::host_game_intensity() as f32);
+                st.set_status_line(msg.into());
+            }
+        });
+    });
+    bind(app, &shared, |app, _sh| {
+        let w = app.as_weak();
+        app.global::<State>().on_set_host_game_fade(move |v| {
+            if let Some(app) = w.upgrade() {
+                let msg = crate::prefs::set_host_game_fade_ms(v.round() as u32);
+                crate::host::apply_protocol_prefs();
+                let st = app.global::<State>();
+                st.set_host_game_fade_ms(crate::prefs::host_game_fade_ms() as f32);
+                st.set_status_line(msg.into());
+            }
+        });
+    });
+    bind(app, &shared, |app, _sh| {
+        let w = app.as_weak();
+        app.global::<State>().on_set_host_game_device(move |id, enabled| {
+            if let Some(app) = w.upgrade() {
+                let msg = crate::prefs::set_host_game_device(&id, enabled, Vec::new());
+                crate::host::apply_protocol_prefs();
+                refresh_host_game_devices(&app);
+                app.global::<State>().set_status_line(msg.into());
             }
         });
     });
@@ -6538,6 +6576,7 @@ pub fn refresh_devices(app: &AppWindow, sh: &SharedRt) {
     let st = app.global::<State>();
     use slint::Model;
     st.set_devices(ModelRc::new(VecModel::from(rows)));
+    refresh_host_game_devices(app);
     // MECHANICAL ADVANTAGES: seed Snap Tap support from the live keyboard list (honest gate).
     refresh_snap_tap(app, sh);
     // 3) restore selection by id (default to the first row), and seed its per-kind panel.
@@ -8617,6 +8656,34 @@ fn fmt_uptime(ms: u64) -> String {
 /// CONNECTIONS truth → the System card: pref gates into the toggles, PORT truth into the
 /// per-protocol lines (a bind that failed — real Synapse holding the socket, a second
 /// instance — reads as busy, never green), and the bridged-device count underneath.
+fn refresh_host_game_devices(app: &AppWindow) {
+    let st = app.global::<State>();
+    let status = crate::host::status();
+    let out: Vec<ChromaDeviceRow> = if status.active {
+        status
+            .game_devices
+            .iter()
+            .map(|d| ChromaDeviceRow {
+                id: d.id.clone().into(),
+                name: d.name.clone().into(),
+                enabled: crate::prefs::host_game_device_enabled(&d.id),
+            })
+            .collect()
+    } else {
+        let rows = st.get_devices();
+        (0..rows.row_count())
+            .filter_map(|i| rows.row_data(i))
+            .filter(|d| d.cap_light && d.kind != "mic" && d.kind != "output")
+            .map(|d| ChromaDeviceRow {
+                id: d.id.clone(),
+                name: d.name.clone(),
+                enabled: crate::prefs::host_game_device_enabled(&d.id),
+            })
+            .collect()
+    };
+    st.set_host_game_devices(ModelRc::new(VecModel::from(out)));
+}
+
 pub fn refresh_host_status(app: &AppWindow) {
     let st = app.global::<State>();
     let s = crate::host::status();
@@ -8628,7 +8695,10 @@ pub fn refresh_host_status(app: &AppWindow) {
     st.set_host_chroma(crate::prefs::host_chroma());
     st.set_host_openrgb(crate::prefs::host_openrgb());
     st.set_host_obs(crate::prefs::host_obs());
-    st.set_host_game_merge(crate::prefs::host_game_merge());
+    st.set_host_game_mode(crate::prefs::host_game_mode_index());
+    st.set_host_game_intensity(crate::prefs::host_game_intensity() as f32);
+    st.set_host_game_fade_ms(crate::prefs::host_game_fade_ms() as f32);
+    refresh_host_game_devices(app);
     // NB: the password field is deliberately NOT touched here. This runs ~1s while the System
     // page is up, and "empty" is indistinguishable from "the user just cleared the field to
     // remove/replace the secret" — reseeding on empty would let the poller fight that edit and
@@ -8686,7 +8756,28 @@ pub fn refresh_host_status(app: &AppWindow) {
     // faces at rest, each reporting its OWN bind state — the SHM (native) and REST faces
     // bind independently, so a squatted REST port must not read as served just because the
     // native server came up.
+    let mut chroma_streams = Vec::<ChromaStreamRow>::new();
     let chroma_status = if let Some(g) = &s.chroma_native_game {
+        chroma_streams = g
+            .streams
+            .iter()
+            .map(|stream| {
+                let mut colors = stream.colors.clone();
+                colors.resize(3, (0, 0, 0));
+                ChromaStreamRow {
+                    device: stream.device.clone().into(),
+                    effect: stream.effect.clone().into(),
+                    detail: format!(
+                        "{} / {} lit · boot tick {} ms",
+                        stream.lit, stream.total, stream.timestamp_ms
+                    )
+                    .into(),
+                    first: slint::Color::from_rgb_u8(colors[0].0, colors[0].1, colors[0].2),
+                    second: slint::Color::from_rgb_u8(colors[1].0, colors[1].1, colors[1].2),
+                    third: slint::Color::from_rgb_u8(colors[2].0, colors[2].1, colors[2].2),
+                }
+            })
+            .collect();
         format!("{} · {} dev · {}", g.game, g.devices, g.effect)
     } else {
         client_line(&s.chroma_clients).unwrap_or_else(|| {
@@ -8703,6 +8794,7 @@ pub fn refresh_host_status(app: &AppWindow) {
         })
     };
     st.set_host_chroma_status(chroma_status.into());
+    st.set_host_chroma_streams(ModelRc::new(VecModel::from(chroma_streams)));
     st.set_host_openrgb_status(
         client_line(&s.openrgb_clients)
             .unwrap_or_else(|| line(crate::prefs::host_openrgb(), s.openrgb_serving, 6742))

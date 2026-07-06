@@ -1,7 +1,7 @@
 import { Theme } from "../theme.slint";
 import { Card, SectionTitle, Label, Button, Toggle, Pill, Mono, Divider, PanelHead, Slider, Segment, ColorPicker, Palette, Field } from "../widgets/controls.slint";
 import { State } from "../state.slint";
-import { DiagRow } from "../models.slint";
+import { ChromaStreamRow, DiagRow } from "../models.slint";
 
 // ONE mock OBS menu item — a mono label that can wear an accent highlight (the one you click).
 component ObsMenuItem inherits Rectangle {
@@ -118,6 +118,20 @@ component ConnStatus inherits HorizontalLayout {
     spacing: 6px;
     VerticalLayout { alignment: center; ConnLamp { lit: root.lit; } }
     Mono { text: root.text; color: Theme.text-faint; }
+}
+
+component ChromaStream inherits HorizontalLayout {
+    in property <ChromaStreamRow> stream;
+    spacing: 8px;
+    VerticalLayout { width: 76px; alignment: center; Mono { text: root.stream.device; color: Theme.text-mid; } }
+    VerticalLayout { width: 78px; alignment: center; Mono { text: root.stream.effect; color: Theme.text-faint; } }
+    HorizontalLayout {
+        spacing: 3px;
+        Rectangle { width: 10px; height: 10px; border-radius: 2px; background: root.stream.first; border-width: Theme.hair; border-color: Theme.line; }
+        Rectangle { width: 10px; height: 10px; border-radius: 2px; background: root.stream.second; border-width: Theme.hair; border-color: Theme.line; }
+        Rectangle { width: 10px; height: 10px; border-radius: 2px; background: root.stream.third; border-width: Theme.hair; border-color: Theme.line; }
+    }
+    Mono { text: root.stream.detail; color: Theme.text-faint; }
 }
 
 // SETTINGS — startup, the global writes-paused safety gate, the SAFE-MODE / arm-input switch, the
@@ -1680,7 +1694,18 @@ export component SettingsPanel inherits VerticalLayout {
                                 checked: State.host-chroma;
                                 toggled(v) => { State.set-host-chroma(v); }
                             }
-                            ConnStatus { lit: State.host-chroma-live; text: State.host-chroma-status; }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                ConnStatus { lit: State.host-chroma-live; text: State.host-chroma-status; }
+                                if State.host-chroma-streams.length > 0 : Button {
+                                    text: State.host-chroma-detail-open ? "less" : "more";
+                                    clicked => { State.host-chroma-detail-open = !State.host-chroma-detail-open; }
+                                }
+                            }
+                            if State.host-chroma-detail-open && State.host-chroma-streams.length > 0 : VerticalLayout {
+                                spacing: 4px;
+                                for stream in State.host-chroma-streams : ChromaStream { stream: stream; }
+                            }
                         }
                         VerticalLayout {
                             spacing: 3px;
@@ -1744,15 +1769,63 @@ export component SettingsPanel inherits VerticalLayout {
                         Rectangle { height: 1px; }
                         VerticalLayout {
                             spacing: 3px;
-                            Toggle {
-                                caption: "merge, don't replace";
-                                checked: State.host-game-merge;
-                                toggled(v) => { State.set-host-game-merge(v); }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                VerticalLayout { alignment: center; Mono { text: "FEEL"; color: Theme.text-dim; } }
+                                Segment {
+                                    options: ["REPLACE", "MERGE", "BOOST", "TINT"];
+                                    min-seg: 70px;
+                                    index: State.host-game-mode;
+                                    picked(i) => { State.set-host-game-mode(i); }
+                                }
+                            }
+                            HorizontalLayout {
+                                spacing: 10px;
+                                VerticalLayout { width: 96px; alignment: center; Mono { text: "STRENGTH"; color: Theme.text-dim; } }
+                                Slider {
+                                    compact: true;
+                                    minimum: 0;
+                                    maximum: 100;
+                                    step: 5;
+                                    value: State.host-game-intensity;
+                                    unit: "%";
+                                    wheel: false;
+                                    changed(v) => { State.set-host-game-intensity(v); }
+                                }
+                                Mono { text: Math.round(State.host-game-intensity) + "%"; color: Theme.text-faint; }
+                            }
+                            HorizontalLayout {
+                                spacing: 10px;
+                                VerticalLayout { width: 96px; alignment: center; Mono { text: "FADE"; color: Theme.text-dim; } }
+                                Slider {
+                                    compact: true;
+                                    minimum: 0;
+                                    maximum: 2500;
+                                    step: 50;
+                                    value: State.host-game-fade-ms;
+                                    unit: "ms";
+                                    wheel: false;
+                                    changed(v) => { State.set-host-game-fade(v); }
+                                }
+                                Mono { text: Math.round(State.host-game-fade-ms) + "ms"; color: Theme.text-faint; }
+                            }
+                            HorizontalLayout {
+                                spacing: 9px;
+                                VerticalLayout { width: 96px; alignment: center; Mono { text: "DEVICES"; color: Theme.text-dim; } }
+                                for d in State.host-game-devices : Toggle {
+                                    caption: d.name;
+                                    checked: d.enabled;
+                                    toggled(v) => { State.set-host-game-device(d.id, v); }
+                                }
                             }
                             Mono {
-                                text: State.host-game-merge
-                                    ? "a game's light adds over your lighting — its bright keys punch through, yours stays beneath."
-                                    : "a game takes over the keys it paints. your lighting comes back when it stops.";
+                                text: State.host-game-mode == 0
+                                    ? "game colours take the LEDs they paint."
+                                    : State.host-game-mode == 2
+                                        ? "game colours brighten your lighting for loud moments."
+                                        : State.host-game-mode == 3
+                                            ? "game colours shade your lighting without washing it out."
+                                            : "game colours sit on top while your lighting stays visible.";
                                 color: Theme.text-faint; wrap: word-wrap;
                             }
                         }

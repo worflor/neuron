@@ -40,10 +40,14 @@
 //!   the `/razer` prefix.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
 use crate::api::{HostApi, LeaseSpec, SurfaceInfo, SurfaceKind};
-use crate::arbiter::{band, Content, LayerId, Rgb, SourceId};
+use crate::arbiter::{band, BlendMode, Content, LayerId, LiveContent, Rgb, SourceId};
 use crate::bus::Value;
 
 /// The Chroma SDK's own session contract: 15s of silence = dead. Layer leases
@@ -55,6 +59,108 @@ pub const SESSION_TTL: Duration = Duration::from_secs(15);
 /// First minted session id — in port-space above the SDK's own 54235 (see
 /// module docs).
 const FIRST_SESSION_ID: u64 = 54236;
+
+/// One shared game-lighting policy for every Chroma face. REST and native SHM
+/// both read this at render time, so the settings page describes "game Chroma"
+/// instead of leaking how a given game talks to Neuron.
+#[derive(Debug)]
+pub struct GameLightingPolicy {
+    blend: AtomicU8,
+    intensity: AtomicU8,
+    fade_ms: AtomicU32,
+    surfaces: RwLock<Option<HashSet<String>>>,
+}
+
+impl Default for GameLightingPolicy {
+    fn default() -> Self {
+        Self {
+            blend: AtomicU8::new(BlendMode::Screen.to_bits()),
+            intensity: AtomicU8::new(100),
+            fade_ms: AtomicU32::new(450),
+            surfaces: RwLock::new(None),
+        }
+    }
+}
+
+impl GameLightingPolicy {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub fn update(
+        &self,
+        blend: BlendMode,
+        intensity: u8,
+        fade_ms: u32,
+        surfaces: Option<HashSet<String>>,
+    ) {
+        self.blend.store(blend.to_bits(), Ordering::Relaxed);
+        self.intensity.store(intensity.clamp(0, 100), Ordering::Relaxed);
+        self.fade_ms.store(fade_ms.clamp(0, 2500), Ordering::Relaxed);
+        *self.surfaces.write().unwrap_or_else(|e| e.into_inner()) = surfaces;
+    }
+
+    pub fn blend_mode(&self) -> BlendMode {
+        BlendMode::from_bits(self.blend.load(Ordering::Relaxed))
+    }
+
+    pub fn alpha(&self) -> f32 {
+        self.intensity.load(Ordering::Relaxed) as f32 / 100.0
+    }
+
+    pub fn fade_secs(&self) -> f32 {
+        self.fade_ms.load(Ordering::Relaxed) as f32 / 1000.0
+    }
+
+    pub fn allows_surface(&self, surface: &SurfaceInfo) -> bool {
+        self.allows_key(&surface.key)
+    }
+
+    pub fn allows_key(&self, key: &str) -> bool {
+        self.surfaces
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_none_or(|set| set.contains(key))
+    }
+}
+
+#[derive(Clone)]
+struct PolicyContent {
+    key: String,
+    content: Content,
+    leds: usize,
+    policy: Arc<GameLightingPolicy>,
+}
+
+impl LiveContent for PolicyContent {
+    fn render(&mut self, _now: Instant) -> Vec<Option<Rgb>> {
+        if !self.policy.allows_key(&self.key) {
+            return vec![None; self.leds];
+        }
+        match &self.content {
+            Content::Fill(c) => vec![Some(*c); self.leds],
+            Content::Cells(cells) => cells.clone(),
+            Content::Live(_) => vec![None; self.leds],
+        }
+    }
+
+    fn alpha(&self) -> f32 {
+        if self.policy.allows_key(&self.key) {
+            self.policy.alpha()
+        } else {
+            0.0
+        }
+    }
+
+    fn blend_mode(&self) -> BlendMode {
+        self.policy.blend_mode()
+    }
+
+    fn boxed_clone(&self) -> Box<dyn LiveContent> {
+        Box::new(self.clone())
+    }
+}
 
 /// RZRESULT codes (Windows error codes, as the SDK reuses them — RzErrors.h).
 mod rz {
@@ -100,7 +206,13 @@ impl HttpResponse {
 enum Action {
     /// CHROMA_NONE: release the session's layer on that device.
     Clear,
-    Paint(Content),
+    Paint(Paint),
+}
+
+#[derive(Clone)]
+enum Paint {
+    Fill(Rgb),
+    Grid(Vec<Vec<u32>>),
 }
 
 #[derive(Clone)]
@@ -116,14 +228,14 @@ struct StoredEffect {
 /// push a fresh effect. See [`ChromaServer::heartbeat`].
 struct DeviceLayer {
     layer: LayerId,
-    key: String,
     content: Content,
 }
 
 struct Session {
     owner: SourceId,
     /// device endpoint ("keyboard", …) → its live layer.
-    layers: HashMap<String, DeviceLayer>,
+    layers: HashMap<String, HashMap<String, DeviceLayer>>,
+    paints: HashMap<String, Paint>,
     /// POST-created effects awaiting PUT-apply, keyed by minted id.
     effects: HashMap<String, StoredEffect>,
     last_seen: Instant,
@@ -136,11 +248,16 @@ pub struct ChromaServer {
     sessions: HashMap<u64, Session>,
     next_id: u64,
     next_effect: u64,
+    policy: Arc<GameLightingPolicy>,
 }
 
 impl ChromaServer {
     pub fn new() -> ChromaServer {
-        ChromaServer { sessions: HashMap::new(), next_id: FIRST_SESSION_ID, next_effect: 1 }
+        ChromaServer::with_policy(GameLightingPolicy::new())
+    }
+
+    pub fn with_policy(policy: Arc<GameLightingPolicy>) -> ChromaServer {
+        ChromaServer { sessions: HashMap::new(), next_id: FIRST_SESSION_ID, next_effect: 1, policy }
     }
 
     /// The LIVE sessions (owner + game title), for the host's status readout.
@@ -223,6 +340,7 @@ impl ChromaServer {
             Session {
                 owner,
                 layers: HashMap::new(),
+                paints: HashMap::new(),
                 effects: HashMap::new(),
                 last_seen: now,
                 title: title.clone(),
@@ -279,30 +397,24 @@ impl ChromaServer {
         // that only heartbeats a static effect doesn't go dark after a rebirth
         // (the old path left it dark until the next effect WRITE, which such a
         // game never sends).
-        let dead: Vec<String> = s
-            .layers
-            .iter()
-            .filter(|(_, dl)| !host.refresh(dl.layer, now))
-            .map(|(dev, _)| dev.clone())
-            .collect();
-        if !dead.is_empty() {
-            for dev in dead {
-                let (key, content) = {
-                    let dl = &s.layers[&dev];
-                    (dl.key.clone(), dl.content.clone())
-                };
-                if let Some(layer) = host.claim(
-                    &key,
-                    s.owner,
-                    band::SESSION,
-                    LeaseSpec::Ttl(SESSION_TTL),
-                    content.clone(),
-                    now,
-                ) {
-                    s.layers.insert(dev, DeviceLayer { layer, key, content });
-                }
+        let mut saw_dead = false;
+        for layers in s.layers.values_mut() {
+            let dead: Vec<String> = layers
+                .iter()
+                .filter(|(_, dl)| !host.refresh(dl.layer, now))
+                .map(|(key, _)| key.clone())
+                .collect();
+            saw_dead |= !dead.is_empty();
+            for key in dead {
+                layers.remove(&key);
             }
-            // The reborn kernel's labels map is empty — restore this session's.
+        }
+        let policy = Arc::clone(&self.policy);
+        let devices: Vec<String> = s.paints.keys().cloned().collect();
+        for dev in devices {
+            let _ = Self::reconcile_device(&policy, s, &dev, host, now);
+        }
+        if saw_dead {
             host.label_source(s.owner, &s.title);
         }
         HttpResponse::json(200, serde_json::json!({ "result": rz::SUCCESS, "tick": s.heartbeats }))
@@ -317,13 +429,13 @@ impl ChromaServer {
         host: &mut dyn HostApi,
         now: Instant,
     ) -> HttpResponse {
-        let (surface, effects) = match self.parse_request(id, device, body, host) {
+        let effects = match self.parse_request(id, device, body, host) {
             Ok(v) => v,
             Err(resp) => return resp,
         };
         let mut results = Vec::new();
         for action in &effects {
-            let code = self.apply(id, device, &surface, action.clone(), host, now);
+            let code = self.apply(id, device, action.clone(), host, now);
             results.push(serde_json::json!({ "result": code }));
         }
         if let Some(s) = self.sessions.get_mut(&id) {
@@ -348,7 +460,7 @@ impl ChromaServer {
         host: &mut dyn HostApi,
         now: Instant,
     ) -> HttpResponse {
-        let (_, effects) = match self.parse_request(id, device, body, host) {
+        let effects = match self.parse_request(id, device, body, host) {
             Ok(v) => v,
             Err(resp) => return resp,
         };
@@ -396,10 +508,7 @@ impl ChromaServer {
                     // The stored effect targets whatever surface serves its
                     // device kind NOW — honest against hotplug between create
                     // and apply.
-                    match surface_for(host, &e.device) {
-                        Some(surface) => self.apply(id, &e.device, &surface, e.action, host, now),
-                        None => rz::DEVICE_NOT_AVAILABLE,
-                    }
+                    self.apply(id, &e.device, e.action, host, now)
                 }
                 None => rz::NOT_FOUND,
             };
@@ -446,8 +555,8 @@ impl ChromaServer {
         device: &str,
         body: &[u8],
         host: &mut dyn HostApi,
-    ) -> Result<(SurfaceInfo, Vec<Action>), HttpResponse> {
-        let Some(kind) = device_kind(device) else {
+    ) -> Result<Vec<Action>, HttpResponse> {
+        let Some(_) = device_kind(device) else {
             return Err(HttpResponse::err(404, rz::NOT_FOUND));
         };
         if !self.sessions.contains_key(&id) {
@@ -458,24 +567,24 @@ impl ChromaServer {
         };
         // Truthful capability answer: no surface of this kind → say so with
         // the SDK's own code for it, don't fake success (§5.4).
-        let Some(surface) = host.surfaces().into_iter().find(|s| s.kind == kind) else {
+        if surfaces_for(host, device).is_none() {
             return Err(HttpResponse::json(
                 200,
                 serde_json::json!({ "result": rz::DEVICE_NOT_AVAILABLE }),
             ));
-        };
+        }
         let items: Vec<&serde_json::Value> = match v.get("effects").and_then(|e| e.as_array()) {
             Some(batch) => batch.iter().collect(),
             None => vec![&v],
         };
         let mut actions = Vec::with_capacity(items.len());
         for item in items {
-            match parse_effect(item, &surface) {
+            match parse_effect(item) {
                 Some(a) => actions.push(a),
                 None => return Err(HttpResponse::err(400, rz::INVALID_PARAMETER)),
             }
         }
-        Ok((surface, actions))
+        Ok(actions)
     }
 
     /// Apply one action to the session's layer on `device`: set-or-claim; a
@@ -485,7 +594,6 @@ impl ChromaServer {
         &mut self,
         id: u64,
         device: &str,
-        surface: &SurfaceInfo,
         action: Action,
         host: &mut dyn HostApi,
         now: Instant,
@@ -493,41 +601,73 @@ impl ChromaServer {
         let Some(s) = self.sessions.get_mut(&id) else { return rz::NOT_FOUND };
         match action {
             Action::Clear => {
-                if let Some(dl) = s.layers.remove(device) {
-                    host.release(dl.layer);
+                s.paints.remove(device);
+                if let Some(layers) = s.layers.remove(device) {
+                    for dl in layers.into_values() {
+                        host.release(dl.layer);
+                    }
                 }
                 rz::SUCCESS
             }
-            Action::Paint(content) => {
-                if let Some(dl) = s.layers.get_mut(device) {
-                    if host.set_content(dl.layer, content.clone(), now) {
-                        // Keep the retained content current so a rebirth recovery
-                        // re-claims what's actually painted, not a stale frame.
-                        dl.content = content;
-                        return rz::SUCCESS;
-                    }
-                }
-                match host.claim(
-                    &surface.key,
-                    s.owner,
-                    band::SESSION,
-                    LeaseSpec::Ttl(SESSION_TTL),
-                    content.clone(),
-                    now,
-                ) {
-                    Some(layer) => {
-                        s.layers.insert(
-                            device.to_string(),
-                            DeviceLayer { layer, key: surface.key.clone(), content },
-                        );
-                        rz::SUCCESS
-                    }
-                    None => rz::DEVICE_NOT_AVAILABLE,
-                }
+            Action::Paint(paint) => {
+                s.paints.insert(device.to_string(), paint);
+                let policy = Arc::clone(&self.policy);
+                Self::reconcile_device(&policy, s, device, host, now)
             }
         }
     }
 
+    fn reconcile_device(
+        policy: &Arc<GameLightingPolicy>,
+        s: &mut Session,
+        device: &str,
+        host: &mut dyn HostApi,
+        now: Instant,
+    ) -> i64 {
+        let Some(paint) = s.paints.get(device).cloned() else { return rz::SUCCESS };
+        let Some(surfaces) = surfaces_for(host, device) else {
+            if let Some(layers) = s.layers.remove(device) {
+                for dl in layers.into_values() {
+                    host.release(dl.layer);
+                }
+            }
+            return rz::DEVICE_NOT_AVAILABLE;
+        };
+
+        let live = s.layers.entry(device.to_string()).or_default();
+        let current: std::collections::HashSet<String> =
+            surfaces.iter().map(|surface| surface.key.clone()).collect();
+        let stale: Vec<String> = live.keys().filter(|key| !current.contains(*key)).cloned().collect();
+        for key in stale {
+            if let Some(dl) = live.remove(&key) {
+                host.release(dl.layer);
+            }
+        }
+
+        for surface in surfaces {
+            let content = policy_content(&paint, &surface, Arc::clone(policy));
+            if let Some(dl) = live.get_mut(&surface.key) {
+                if host.set_content(dl.layer, content.clone(), now) {
+                    dl.content = content;
+                    continue;
+                }
+            }
+            if let Some(layer) = host.claim(
+                &surface.key,
+                s.owner,
+                band::SESSION,
+                LeaseSpec::Ttl(SESSION_TTL),
+                content.clone(),
+                now,
+            ) {
+                live.insert(
+                    surface.key.clone(),
+                    DeviceLayer { layer, content },
+                );
+            }
+        }
+        rz::SUCCESS
+    }
     /// Drop sessions silent past the TTL — the same 15s the real server
     /// enforces (a stalled game must re-init, matching reference behavior;
     /// its layers already stopped painting at the same instant via the lease).
@@ -565,9 +705,13 @@ fn device_kind(device: &str) -> Option<SurfaceKind> {
     })
 }
 
-fn surface_for(host: &mut dyn HostApi, device: &str) -> Option<SurfaceInfo> {
+fn surfaces_for(host: &mut dyn HostApi, device: &str) -> Option<Vec<SurfaceInfo>> {
     let kind = device_kind(device)?;
-    host.surfaces().into_iter().find(|s| s.kind == kind)
+    let mut surfaces: Vec<SurfaceInfo> = host.surfaces().into_iter().filter(|s| s.kind == kind).collect();
+    if device == "chromalink" {
+        surfaces.truncate(1);
+    }
+    (!surfaces.is_empty()).then_some(surfaces)
 }
 
 /// One effect object → an action. Shapes per the official device docs:
@@ -578,25 +722,42 @@ fn surface_for(host: &mut dyn HostApi, device: &str) -> Option<SurfaceInfo> {
 /// - `CHROMA_CUSTOM2`: keyboard = OBJECT `{color: 8×24, key: 6×22}`; mouse =
 ///   flat 9×7 ARRAY. We accept either shape (array first, then /param/color)
 ///   so both device families parse — the audit's top finding.
-fn parse_effect(v: &serde_json::Value, surface: &SurfaceInfo) -> Option<Action> {
+fn parse_effect(v: &serde_json::Value) -> Option<Action> {
     let effect = v.get("effect").and_then(|e| e.as_str())?;
     match effect {
         "CHROMA_NONE" => Some(Action::Clear),
         "CHROMA_STATIC" => {
             let color = v.pointer("/param/color").and_then(|c| c.as_u64())?;
-            Some(Action::Paint(Content::Fill(bgr(color as u32))))
+            Some(Action::Paint(Paint::Fill(bgr(color as u32))))
         }
         "CHROMA_CUSTOM" | "CHROMA_CUSTOM2" | "CHROMA_CUSTOM_KEY" => {
             let grid = v
                 .get("param")
                 .and_then(parse_grid)
                 .or_else(|| v.pointer("/param/color").and_then(parse_grid))?;
-            Some(Action::Paint(Content::Cells(grid_to_cells(&grid, surface))))
+            Some(Action::Paint(Paint::Grid(grid)))
         }
         // Firmware-side effect names (WAVE/BREATHING/…) are not part of the
         // REST surface per the official device docs; refusing beats faking.
         _ => None,
     }
+}
+
+fn policy_content(
+    paint: &Paint,
+    surface: &SurfaceInfo,
+    policy: Arc<GameLightingPolicy>,
+) -> Content {
+    let content = match paint {
+        Paint::Fill(color) => Content::Fill(*color),
+        Paint::Grid(grid) => Content::Cells(grid_to_cells(grid, surface)),
+    };
+    Content::Live(Box::new(PolicyContent {
+        key: surface.key.clone(),
+        content,
+        leds: surface.leds,
+        policy,
+    }))
 }
 
 /// `{"id": "..."}` or `{"ids": ["...", ...]}`.
@@ -1029,6 +1190,83 @@ mod tests {
             Some(rz::DEVICE_NOT_AVAILABLE),
             "RZRESULT_DEVICE_NOT_AVAILABLE (4319) is the SDK's code for this"
         );
+    }
+
+    #[test]
+    fn same_kind_surfaces_all_receive_rest_paint() {
+        let mut k = Kernel::new();
+        k.declare(SurfaceInfo::grid("mouse-a", "Mouse A", SurfaceKind::Mouse, 1, 2));
+        k.declare(SurfaceInfo::grid("mouse-b", "Mouse B", SurfaceKind::Mouse, 1, 2));
+        let mut srv = ChromaServer::new();
+        let now = Instant::now();
+        let id = open_session(&mut srv, &mut k, now);
+        let r = srv.handle(
+            &req(
+                "PUT",
+                &format!("/razer/chromasdk/sess/{id}/mouse"),
+                serde_json::json!({ "effect": "CHROMA_STATIC", "param": { "color": 255 } }),
+            ),
+            &mut k,
+            now,
+        );
+        assert_eq!(r.status, 200);
+        assert_eq!(k.resolve("mouse-a", now).unwrap(), vec![Some(Rgb(255, 0, 0)); 2]);
+        assert_eq!(k.resolve("mouse-b", now).unwrap(), vec![Some(Rgb(255, 0, 0)); 2]);
+    }
+
+    #[test]
+    fn chromalink_does_not_fan_out_across_every_generic_surface() {
+        let mut k = Kernel::new();
+        k.declare(SurfaceInfo::grid("generic-a", "Generic A", SurfaceKind::Generic, 1, 2));
+        k.declare(SurfaceInfo::grid("generic-b", "Generic B", SurfaceKind::Generic, 1, 2));
+        let mut srv = ChromaServer::new();
+        let now = Instant::now();
+        let id = open_session(&mut srv, &mut k, now);
+        let r = srv.handle(
+            &req(
+                "PUT",
+                &format!("/razer/chromasdk/sess/{id}/chromalink"),
+                serde_json::json!({ "effect": "CHROMA_STATIC", "param": { "color": 255 } }),
+            ),
+            &mut k,
+            now,
+        );
+        assert_eq!(r.status, 200);
+        let a_lit = k.resolve("generic-a", now).unwrap().iter().any(Option::is_some);
+        let b_lit = k.resolve("generic-b", now).unwrap().iter().any(Option::is_some);
+        assert_ne!(a_lit, b_lit, "chromalink should target one generic surface, not all");
+    }
+
+    #[test]
+    fn rest_policy_scope_hides_and_restores_without_new_effect_write() {
+        let mut k = Kernel::new();
+        k.declare(SurfaceInfo::grid("mouse-a", "Mouse A", SurfaceKind::Mouse, 1, 2));
+        k.declare(SurfaceInfo::grid("mouse-b", "Mouse B", SurfaceKind::Mouse, 1, 2));
+        let policy = GameLightingPolicy::new();
+        policy.update(
+            BlendMode::Over,
+            100,
+            450,
+            Some(["mouse-a".to_string()].into_iter().collect()),
+        );
+        let mut srv = ChromaServer::with_policy(Arc::clone(&policy));
+        let now = Instant::now();
+        let id = open_session(&mut srv, &mut k, now);
+        let r = srv.handle(
+            &req(
+                "PUT",
+                &format!("/razer/chromasdk/sess/{id}/mouse"),
+                serde_json::json!({ "effect": "CHROMA_STATIC", "param": { "color": 255 } }),
+            ),
+            &mut k,
+            now,
+        );
+        assert_eq!(r.status, 200);
+        assert_eq!(k.resolve("mouse-a", now).unwrap(), vec![Some(Rgb(255, 0, 0)); 2]);
+        assert_eq!(k.resolve("mouse-b", now).unwrap(), vec![None; 2]);
+
+        policy.update(BlendMode::Over, 100, 450, None);
+        assert_eq!(k.resolve("mouse-b", now).unwrap(), vec![Some(Rgb(255, 0, 0)); 2]);
     }
 
     #[test]

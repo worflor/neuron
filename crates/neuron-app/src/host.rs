@@ -30,11 +30,15 @@
 //! frame until the app re-applies its own stream.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use neuron_host::adapters::chroma::GameLightingPolicy;
+#[cfg(windows)]
+use neuron_host::adapters::chroma_shm::{server::chroma_grid_lead, ColorUnit};
 use neuron_host::api::{HostApi, LeaseSpec};
 use neuron_host::arbiter::{band, BlendMode, Content, LayerId, SourceId};
 use neuron_host::bridge::{self, Bridge, CompositorContent};
@@ -67,6 +71,7 @@ struct HostState {
     /// at (which follows the "who wins" policy; tracked so a live policy flip
     /// re-pins rather than silently keeping the old band).
     base: HashMap<String, BaseLayer>,
+    game_policy: Arc<GameLightingPolicy>,
     // FIELD ORDER IS LOAD-BEARING: Rust drops fields top-to-bottom, so the
     // protocol I/O (which publishes/uses the kernel bus on teardown — the OBS
     // connection publishes obs.connected=false in its Drop) MUST come before
@@ -280,6 +285,7 @@ fn hook_on_change<T: PartialEq>(hook: &str, prev: &mut Option<T>, now: T) {
 pub struct Status {
     pub active: bool,
     pub devices: usize,
+    pub game_devices: Vec<GameDeviceScope>,
     pub chroma_serving: bool,
     /// The NATIVE (Win32 SHM) Chroma face — neuron being the Chroma server itself:
     /// whether it's serving, and (when a game is on the keys) a pure-telemetry readout
@@ -306,6 +312,12 @@ pub struct Status {
     pub openrgb_clients: Vec<ClientStatus>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct GameDeviceScope {
+    pub id: String,
+    pub name: String,
+}
+
 /// What the native Chroma (SHM) server sees a game painting right now — pure telemetry
 /// (game name, lit device count, effect kind), read straight from the decoded protocol.
 #[derive(Clone, Debug, Default)]
@@ -317,6 +329,17 @@ pub struct NativeChroma {
     pub devices: usize,
     /// Effect kind the game is painting (`custom`, `static`, `wave`, …).
     pub effect: String,
+    pub streams: Vec<NativeChromaStream>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct NativeChromaStream {
+    pub device: String,
+    pub effect: String,
+    pub timestamp_ms: u32,
+    pub lit: usize,
+    pub total: usize,
+    pub colors: Vec<(u8, u8, u8)>,
 }
 
 /// One connected protocol client, as the CONNECTIONS card reads it.
@@ -401,16 +424,67 @@ pub fn set_enabled(on: bool) -> String {
     }
 }
 
+fn game_blend_from_prefs() -> BlendMode {
+    match crate::prefs::host_game_mode().as_str() {
+        "replace" => BlendMode::Over,
+        "boost" => BlendMode::Add,
+        "tint" => BlendMode::Multiply,
+        _ => BlendMode::Screen,
+    }
+}
+
+fn refresh_game_policy(policy: &GameLightingPolicy, bridge: &Bridge) {
+    let disabled: HashSet<String> =
+        crate::prefs::host_game_disabled_devices().into_iter().collect();
+    let disabled_keys: HashSet<String> =
+        disabled.iter().filter_map(|id| bridge.key_for_unit(id).cloned()).collect();
+    let surfaces = (!disabled.is_empty()).then(|| {
+        bridge
+            .surfaces
+            .iter()
+            .filter(|surface| !disabled_keys.contains(&surface.key))
+            .map(|surface| surface.key.clone())
+            .collect::<HashSet<_>>()
+    });
+    policy.update(
+        game_blend_from_prefs(),
+        crate::prefs::host_game_intensity(),
+        crate::prefs::host_game_fade_ms(),
+        surfaces,
+    );
+}
+
+fn game_device_scope(bridge: &Bridge) -> Vec<GameDeviceScope> {
+    let mut out: Vec<GameDeviceScope> = bridge
+        .unit_surfaces()
+        .into_iter()
+        .filter_map(|(id, key)| {
+            let surface = bridge.surfaces.iter().find(|surface| surface.key == key)?;
+            Some(GameDeviceScope { id, name: surface.name.clone() })
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
+    out
+}
+
 /// Re-apply the per-protocol gates while running: bind a newly-enabled server,
 /// drop a newly-disabled one, connect/disconnect OBS. No-op when connections
 /// are closed.
 pub fn apply_protocol_prefs() {
     let mut g = guard();
     let Some(s) = g.as_mut() else { return };
+    refresh_game_policy(&s.game_policy, &s.bridge);
     let want_chroma = crate::prefs::host_chroma();
     let want_orgb = crate::prefs::host_openrgb();
     match (want_chroma, s.chroma.is_some()) {
-        (true, false) => s.chroma = ChromaHttpServer::bind(CHROMA_ADDR, s.handle.clone()).ok(),
+        (true, false) => {
+            s.chroma = ChromaHttpServer::bind_with_policy(
+                CHROMA_ADDR,
+                s.handle.clone(),
+                Arc::clone(&s.game_policy),
+            )
+            .ok()
+        }
         (false, true) => s.chroma = None, // Drop joins the accept loop
         _ => {}
     }
@@ -420,21 +494,11 @@ pub fn apply_protocol_prefs() {
     match (want_chroma, s.chroma_shm.is_some()) {
         (true, false) => {
             let mut h = s.handle.clone();
-            s.chroma_shm = spawn_chroma_shm(&s.bridge, &mut h);
+            s.chroma_shm = spawn_chroma_shm(&s.bridge, &mut h, Arc::clone(&s.game_policy));
         }
         (false, true) => {
             if let Some(shm) = s.chroma_shm.take() {
                 s.handle.release_owner(shm.src);
-            }
-        }
-        // Serving already, but the merge policy flipped live → re-tint the game layers in
-        // place: store the new blend mode into the shared cell they all read. No teardown,
-        // so a connected game keeps its shared-memory session; the swap shows next frame.
-        (true, true) if s.chroma_shm.as_ref().is_some_and(|c| c.merge != crate::prefs::host_game_merge()) => {
-            if let Some(shm) = s.chroma_shm.as_mut() {
-                let merge = crate::prefs::host_game_merge();
-                shm.blend.store(game_blend_mode(merge).to_bits(), Ordering::Relaxed);
-                shm.merge = merge;
             }
         }
         _ => {}
@@ -647,13 +711,8 @@ struct ChromaShm {
     /// refreshing until this ages past [`SHM_FADE_GRACE`], letting the crossfade finish before
     /// the leases are allowed to lapse. `None` = no game seen yet.
     last_live: Option<Instant>,
-    /// The blend policy the layers were claimed with (`host_game_merge`): `true` = merge
-    /// (screen), `false` = take over. Tracked so a live policy flip is detected as a change.
-    merge: bool,
-    /// The live blend mode, shared with every game layer (see [`ChromaShmLayer`]). Flipping
-    /// the merge policy stores a new value here — the layers re-tint on the next frame with
-    /// no server teardown, so a connected game keeps its shared-memory session unbroken.
-    blend: Arc<AtomicU8>,
+    /// Shared game-lighting policy read live by every native Chroma layer.
+    policy: Arc<GameLightingPolicy>,
 }
 
 /// The Heartbeat TTL on each game layer. This lease is refreshed ONLY by the app's UI-thread
@@ -680,30 +739,28 @@ const SHM_FADE_GRACE: Duration = Duration::from_millis(1200);
 /// The layers are **Heartbeat-leased** (see [`ChromaShm`]) and claimed alive now, so a game
 /// that connects immediately paints without waiting for the first host tick; [`refresh_chroma_shm`]
 /// then keeps them alive only while a game is present.
-/// The blend mode a game layer paints with under the `host_game_merge` policy: merge →
-/// `Screen` (the game's light ADDS over your base — bright keys punch through, your
-/// lighting stays beneath), else `Over` (the game replaces the keys it paints).
-fn game_blend_mode(merge: bool) -> BlendMode {
-    if merge {
-        BlendMode::Screen
-    } else {
-        BlendMode::Over
-    }
-}
-
 #[cfg(windows)]
-fn spawn_chroma_shm(bridge: &Bridge, h: &mut HostHandle) -> Option<ChromaShm> {
+fn spawn_chroma_shm(
+    bridge: &Bridge,
+    h: &mut HostHandle,
+    policy: Arc<GameLightingPolicy>,
+) -> Option<ChromaShm> {
     use neuron_host::adapters::chroma_shm::server::{ChromaShmLayer, ShmServer};
     use neuron_host::api::SurfaceKind;
     use std::sync::Arc;
 
-    let server: ChromaShmHandle = Arc::new(ShmServer::create().ok()?);
+    // Log WHY the native face didn't come up instead of swallowing it with `.ok()?` —
+    // the usual cause is an unelevated launch (`Global\` needs SeCreateGlobalPrivilege),
+    // which silently degraded to REST-only and read as "my work vanished after a reboot."
+    let server: ChromaShmHandle = match ShmServer::create() {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            eprintln!("neuron-host: native Chroma (SHM) server not started — {e}");
+            return None;
+        }
+    };
     let src = h.next_source();
     let now = Instant::now();
-    let merge = crate::prefs::host_game_merge();
-    // One shared blend cell for every device layer, so a live merge-policy flip re-tints
-    // them all with a single store — no teardown of the shared-memory objects.
-    let blend = Arc::new(AtomicU8::new(game_blend_mode(merge).to_bits()));
     let mut layers = Vec::new();
     for surf in &bridge.surfaces {
         let device_type = match surf.kind {
@@ -716,8 +773,14 @@ fn spawn_chroma_shm(bridge: &Bridge, h: &mut HostHandle) -> Option<ChromaShm> {
         };
         // First claim: start faded OUT (0.0) so the game crossfades IN over the base when it
         // first connects — the never-live layer paints nothing until a game appears.
-        let layer =
-            ChromaShmLayer::new(Arc::clone(&server), device_type, surf.leds, Arc::clone(&blend), 0.0);
+        let layer = ChromaShmLayer::new(
+            Arc::clone(&server),
+            surf.key.clone(),
+            device_type,
+            surf.leds,
+            Arc::clone(&policy),
+            0.0,
+        );
         if let Some(id) = h.claim(
             &surf.key,
             src,
@@ -734,11 +797,15 @@ fn spawn_chroma_shm(bridge: &Bridge, h: &mut HostHandle) -> Option<ChromaShm> {
             });
         }
     }
-    Some(ChromaShm { handle: server, src, layers, last_live: None, merge, blend })
+    Some(ChromaShm { handle: server, src, layers, last_live: None, policy })
 }
 
 #[cfg(not(windows))]
-fn spawn_chroma_shm(_bridge: &Bridge, _h: &mut HostHandle) -> Option<ChromaShm> {
+fn spawn_chroma_shm(
+    _bridge: &Bridge,
+    _h: &mut HostHandle,
+    _policy: Arc<GameLightingPolicy>,
+) -> Option<ChromaShm> {
     None
 }
 
@@ -781,21 +848,21 @@ fn refresh_chroma_shm(s: &mut HostState, now: Instant) {
     // aliasing the fields it reads.
     let handle = Arc::clone(&shm.handle);
     let src = shm.src;
-    let blend = Arc::clone(&shm.blend);
+    let policy = Arc::clone(&shm.policy);
     let mut h = s.handle.clone();
     for l in &mut shm.layers {
         // A live refresh pushes the deadline out; `false` = the layer was swept (lease lapsed
-        // during a stall, or a kernel rebirth) → re-claim an identical one from its recipe,
-        // sharing the same live blend cell so it tracks the current merge policy.
+        // during a stall or a kernel rebirth) re-claim an identical one from its recipe.
         if !h.refresh(l.id, now) {
             // Born at the CURRENT on-screen alpha: 1.0 if a game is live (it was swept
             // mid-paint by a UI-stall lease lapse — DON'T dip the board to black and fade it
             // back), 0.0 otherwise (fading out, or a never-live kernel-rebirth re-claim).
             let layer = ChromaShmLayer::new(
                 Arc::clone(&handle),
+                l.key.clone(),
                 l.device_type,
                 l.leds,
-                Arc::clone(&blend),
+                Arc::clone(&policy),
                 if present { 1.0 } else { 0.0 },
             );
             if let Some(id) = h.claim(
@@ -835,13 +902,22 @@ fn bring_up(g: &mut Option<HostState>) -> bool {
     let mut h = host.handle();
     let base_owner = h.next_source();
     let bridge = bridge::attach(&reg, &handle, 30);
+    let game_policy = GameLightingPolicy::new();
+    refresh_game_policy(&game_policy, &bridge);
 
     // Per-protocol gates; a failed bind here means a squatter on THAT protocol only (often real
     // Synapse) — a second neuron instance is already excluded by the election above. Each
     // adapter degrades independently to serving=false, shown honestly in the SYSTEM card, never
     // a silent green light.
     let chroma = crate::prefs::host_chroma()
-        .then(|| ChromaHttpServer::bind(CHROMA_ADDR, host.handle()).ok())
+        .then(|| {
+            ChromaHttpServer::bind_with_policy(
+                CHROMA_ADDR,
+                host.handle(),
+                Arc::clone(&game_policy),
+            )
+            .ok()
+        })
         .flatten();
     let orgb = crate::prefs::host_openrgb()
         .then(|| OrgbServer::bind(OPENRGB_ADDR, host.handle()).ok())
@@ -850,7 +926,7 @@ fn bring_up(g: &mut Option<HostState>) -> bool {
     // shared memory, not REST, so serving them means BEING the SHM server — gated by the
     // same `host_chroma` switch as the REST face above.
     let chroma_shm = crate::prefs::host_chroma()
-        .then(|| spawn_chroma_shm(&bridge, &mut h))
+        .then(|| spawn_chroma_shm(&bridge, &mut h, Arc::clone(&game_policy)))
         .flatten();
 
     eprintln!(
@@ -867,6 +943,7 @@ fn bring_up(g: &mut Option<HostState>) -> bool {
         bridge,
         base_owner,
         base: HashMap::new(),
+        game_policy,
         _host: host,
         orgb,
         chroma,
@@ -887,6 +964,36 @@ fn bring_up(g: &mut Option<HostState>) -> bool {
 /// elsewhere so [`Status`] stays platform-uniform.
 #[cfg(windows)]
 fn native_chroma_status(chroma_shm: &Option<ChromaShm>) -> (bool, Option<NativeChroma>) {
+    fn chroma_device_name(device_type: u8) -> &'static str {
+        match device_type {
+            0x01 => "keyboard",
+            0x02 => "mouse",
+            0x04 => "headset",
+            0x08 => "mousepad",
+            0x10 => "keypad",
+            0x20 => "chromalink",
+            _ => "device",
+        }
+    }
+
+    fn dominant_colors(device_type: u8, units: &[ColorUnit]) -> Vec<(u8, u8, u8)> {
+        let mut counts: Vec<((u8, u8, u8), usize)> = Vec::new();
+        for unit in units.iter().skip(chroma_grid_lead(device_type)) {
+            let (r, g, b) = unit.rgb();
+            if (r | g | b) == 0 {
+                continue;
+            }
+            let bucket = (r & 0xf0, g & 0xf0, b & 0xf0);
+            if let Some((_, count)) = counts.iter_mut().find(|(c, _)| *c == bucket) {
+                *count += 1;
+            } else {
+                counts.push((bucket, 1));
+            }
+        }
+        counts.sort_by(|a, b| b.1.cmp(&a.1));
+        counts.into_iter().take(3).map(|(color, _)| color).collect()
+    }
+
     match chroma_shm {
         Some(shm) => {
             let server = &shm.handle;
@@ -900,7 +1007,31 @@ fn native_chroma_status(chroma_shm: &Option<ChromaShm>) -> (bool, Option<NativeC
                         .first()
                         .and_then(|a| crate::purge::process_name(a.id))
                         .unwrap_or_else(|| "a game".to_string());
-                    NativeChroma { game, devices, effect: effect.to_lowercase() }
+                    let streams = server
+                        .device_activity()
+                        .into_iter()
+                        .filter_map(|activity| {
+                            let (_, units) = server.decoded_frame_with_ts(activity.device_type)?;
+                            let lit = units
+                                .iter()
+                                .skip(chroma_grid_lead(activity.device_type))
+                                .filter(|u| {
+                                    let (r, g, b) = u.rgb();
+                                    (r | g | b) != 0
+                                })
+                                .count();
+                            Some(NativeChromaStream {
+                                device: chroma_device_name(activity.device_type).to_string(),
+                                effect: activity.effect().to_lowercase(),
+                                timestamp_ms: activity.timestamp_ms,
+                                lit,
+                                total: units.len().saturating_sub(chroma_grid_lead(activity.device_type)),
+                                colors: dominant_colors(activity.device_type, &units),
+                            })
+                        })
+                        .filter(|stream| stream.lit > 0)
+                        .collect();
+                    NativeChroma { game, devices, effect: effect.to_lowercase(), streams }
                 });
             (true, game)
         }
@@ -939,6 +1070,7 @@ fn status_of(g: &Option<HostState>) -> Status {
             Status {
                 active: true,
                 devices: s.bridge.surfaces.len(),
+                game_devices: game_device_scope(&s.bridge),
                 chroma_serving: s.chroma.is_some(),
                 chroma_native_serving,
                 chroma_native_game,
@@ -1197,9 +1329,7 @@ pub fn set_lighting(pid: u16, unit: &str, defs: Vec<LayerDef>, fps: u32) -> bool
         return false;
     }
 
-    // The user's lighting is always the BASE layer; games sit ABOVE it at SESSION and
-    // combine per the merge policy (see `game_blend_mode`), never by band. (The band is
-    // still tracked per base layer for the kernel-rebirth recovery path.)
+    // The user's lighting is always the BASE layer; games sit above it at SESSION.
     let want_band = band::BASE;
     let now = Instant::now();
     let mut any = false;
