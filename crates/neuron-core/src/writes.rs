@@ -1,20 +1,23 @@
-//! Device write-completion — the firmware-side writes Neuron can't yet do.
+//! Device write-completion — verified firmware writes plus host-side remap helpers.
 //!
-//! Neuron's read side and several setters (DPI/polling/brightness, lighting) already work; this
-//! module is the home for the WRITE primitives still missing for a full Synapse replacement,
-//! all of which are GATED device writes (back up -> write to volatile first -> verify round-trip
-//! byte-for-byte, per the project's safety gates).
+//! Neuron's read side and several setters (DPI/polling/brightness, lighting) already work. This
+//! module owns the write primitives that are safe enough to expose: firmware writes are gated
+//! device operations (back up -> write to volatile first -> verify round-trip byte-for-byte, per
+//! the project's safety gates), while remaps/HyperShift are shaped as host-side
+//! [`crate::engine::Rule`] values consumed by the Engine.
 //!
 //! Scope (the WRITES agent owns this file):
-//! * **Button remap** — the firmware button -> key/action map. The Naga's onboard Mapping class
-//!   is the firmware path; the BlackWidow (no onboard) is host-side. We produce the host-side
-//!   [`crate::engine::Rule`] the Engine consumes today and document/stub the onboard path.
+//! * **Button remap** — produce the host-side [`crate::engine::Rule`] the Engine consumes today.
+//!   No firmware Mapping write API is exposed until the Naga's onboard layout is proven with a
+//!   capture and a verify-gated implementation.
 //! * **DPI-stage apply** — write the full DPI stage LIST (the cycle), not just the active DPI
 //!   (active-stage read = `dpi_stages` class 0x04/0x86; SET = 0x04/0x06, hardware-proven, verified
 //!   against the 0x04/0x86 read-back).
 //! * **Scroll-stage apply** — write HyperScroll wheel stages (class 0x0B; user has two).
-//! * **HyperShift** — write the real onboard HyperShift second-layer mapping on devices with
-//!   onboard memory (the Naga), vs the software hold-layer the cast engine provides today.
+//! * **HyperShift** — produce software hold-layer rules for the cast/Engine path. No onboard
+//!   HyperShift Mapping write API is exposed until the firmware layout is proven.
+//! * **Sensor/power writes** — expose verified LOD, idle, polling, and Snap Tap helpers. Debounce is
+//!   intentionally absent: no opcode/getter has been proven for this hardware yet.
 //!
 //! ## The gate (every write goes through it)
 //! 1. **Driver mode** — Razer gates host control behind device_mode 0x03 (00/04 = [0x03,0x00]).
@@ -558,10 +561,10 @@ pub fn set_in_game_polling(d: &Device, wired_hz: u32, _dongle_hz: u32) -> Result
 }
 
 // ---------------------------------------------------------------------------------------------
-// 2e. LIFT-OFF DISTANCE & DEBOUNCE — sensor/switch "feel" controls.
+// 2e. LIFT-OFF DISTANCE — sensor "feel" control.
 //     LIFT-OFF DISTANCE is now a REAL verify-gated write (symmetric low/med/high), reverse-engineered
-//     from razerctl and cross-checked against OpenRazer (HIGH confidence). DEBOUNCE still has no
-//     proven OR derivable opcode on this hardware, so it stays an honest `bail!`-stub.
+//     from razerctl and cross-checked against OpenRazer (HIGH confidence). Debounce is deliberately
+//     not exposed here until an opcode/getter is proven.
 // ---------------------------------------------------------------------------------------------
 
 /// Sensor lift-off-distance class (the Razer "sensor config" class). SET = 0x0B/0x0B (symmetric LOD),
@@ -734,23 +737,6 @@ pub fn set_lift_off_asymmetric(d: &Device, lift: u8, landing: u8) -> Result<()> 
         );
     }
     Ok(())
-}
-
-/// Set the switch DEBOUNCE time (the de-bounce window that rejects mechanical switch chatter / double
-/// clicks), in milliseconds. HONEST STUB — no opcode known.
-///
-/// CONFIDENCE: NONE yet. Debounce tuning is exposed by Synapse on newer mice but no getter for it was
-/// observed on this Naga and it is absent from the decoded exports, so there is no proven read to
-/// invert. We refuse rather than blind-write an unknown register.
-///
-/// TODO (RE): capture one USBPcap of Synapse changing the "Debounce" value, recover the
-/// {class, id, payload(ms)} encoding, then implement verify-gated exactly like [`set_idle_secs`].
-pub fn set_debounce_ms(_d: &Device, _ms: u8) -> Result<()> {
-    bail!(
-        "debounce write is unsupported: no opcode known for this device (no getter observed in \
-         discover/probe, absent from Synapse exports). NOT faked. TODO: USBPcap-capture Synapse's \
-         Debounce control to recover the {{class,id,payload}}, then implement verify-gated like set_idle_secs."
-    )
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -958,12 +944,11 @@ impl GamingMode {
 // ---------------------------------------------------------------------------------------------
 // 3. BUTTON REMAP.
 //    - Keyboard (BlackWidow 0221): NO onboard => the remap is a host-side Engine `Rule`.
-//    - Mouse (Naga): onboard Mapping class is the firmware path; stubbed cleanly (not derivable
-//      without a USBPcap capture of Synapse writing a Mapping).
+//    - Mouse (Naga): host-side until a firmware Mapping layout is proven.
 // ---------------------------------------------------------------------------------------------
 
-/// A single firmware/host button remap: the physical input (a [`Trigger::Input`] page/usage on this
-/// device) mapped to an action/assignment. Mirrors Synapse's DKM abstraction (physical input ->
+/// A single host button remap: the physical input (a [`Trigger::Input`] page/usage on this
+/// device) mapped to an action. Mirrors Synapse's DKM abstraction (physical input ->
 /// typed assignment) but as a plain, inspectable struct.
 #[derive(Clone, Debug)]
 pub struct ButtonRemap {
@@ -971,7 +956,7 @@ pub struct ButtonRemap {
     pub from: Trigger,
     /// What it should do, as a Neuron [`Action`] (the host-side, Engine-consumable form).
     pub action: Action,
-    /// The firmware assignment bytes, if this is an onboard (mouse) remap. Empty for host-side.
+    /// Reserved for a future firmware-mapping payload; empty for the host-side remap path.
     pub assignment: Vec<u8>,
     /// Whether this lives on the held HyperShift layer (parallel second-tier map) or the base.
     pub hypershift: bool,
@@ -990,8 +975,8 @@ impl ButtonRemap {
 }
 
 /// Register a button remap that the Engine consumes — the HOST-SIDE remap path. Since the keyboard
-/// has no onboard memory (triple-confirmed: no class 0x06/0x0F), and the Naga's onboard Mapping
-/// write isn't yet derivable, the universally-correct shape of a button remap is a spine
+/// has no onboard memory (triple-confirmed: no class 0x06/0x0F), the universally-correct shape
+/// of a button remap is a spine
 /// [`Rule`]: `Trigger::Input -> Action`. This is what `run`/the Engine already dispatches, so this
 /// is a real, working remap today (no device write, no gate needed — it's pure host config).
 ///
@@ -1016,32 +1001,9 @@ pub fn button_remap(source_input: Trigger, action: Action, hypershift: bool) -> 
     }
 }
 
-/// Write a firmware (onboard) button remap to a mouse with onboard memory (the Naga, class 0x02
-/// Mapping). GATED. STUBBED CLEANLY: the Mapping report layout isn't derivable from reads alone —
-/// it needs one USBPcap capture of Synapse writing a single button assignment to recover the
-/// {input-id -> assignment-type, payload} encoding. Until then, use [`button_remap`] (host-side),
-/// which is fully functional.
-///
-/// When the capture lands, this is where the Mapping report gets built and sent through the same
-/// gate as the DPI-stage write (driver-mode -> volatile -> read-back verify against the Mapping
-/// getter). Returning an error keeps callers honest (no fabricated success).
-pub fn apply_button_remap(_d: &Device, remap: &ButtonRemap) -> Result<()> {
-    if remap.assignment.is_empty() {
-        bail!(
-            "this is a host-side remap (no onboard assignment bytes) — register it with \
-             `button_remap` into the Engine instead of writing firmware"
-        );
-    }
-    bail!(
-        "onboard (firmware) button remap via class 0x02 Mapping is not yet derivable from reads — \
-         needs a USBPcap capture of Synapse writing one Mapping to recover the layout. Host-side \
-         remap (button_remap -> Engine Rule) works today and is the recommended path."
-    )
-}
-
 // ---------------------------------------------------------------------------------------------
 // 4. HYPERSHIFT — the held second layer.
-//    Host-side (works today, software HyperShift) + onboard stub (the firmware HyperShift).
+//    Host-side software HyperShift.
 // ---------------------------------------------------------------------------------------------
 
 /// Program/register a HyperShift hold-layer. HOST-SIDE (the software HyperShift, working today):
@@ -1050,8 +1012,6 @@ pub fn apply_button_remap(_d: &Device, remap: &ButtonRemap) -> Result<()> {
 /// active (the cast hold-model + `GetAsyncKeyState` on the layer's trigger VK). This is exactly
 /// how Neuron's cast hold-layer already works — this just shapes the bindings for the Engine.
 ///
-/// The onboard firmware HyperShift (a parallel `IsHyperShift=true` Mapping list flashed to the
-/// Naga) is the persistence upgrade; see [`hypershift_write_onboard`].
 pub fn hypershift_write(layer: &str, remaps: &[ButtonRemap]) -> Result<Vec<Rule>> {
     let mut rules = Vec::with_capacity(remaps.len());
     for r in remaps {
@@ -1065,18 +1025,6 @@ pub fn hypershift_write(layer: &str, remaps: &[ButtonRemap]) -> Result<Vec<Rule>
         rules.push(Rule::new(r.from.clone(), r.action.clone()));
     }
     Ok(rules)
-}
-
-/// Write the onboard HyperShift second-layer mapping (the real firmware HyperShift on devices with
-/// onboard memory, e.g. the Naga). GATED + STUBBED: built on the same class 0x02 Mapping path as
-/// [`apply_button_remap`] (with the `IsHyperShift` flag set per assignment), so it's blocked on the
-/// same USBPcap capture. Until then, [`hypershift_write`] gives a working software HyperShift.
-pub fn hypershift_write_onboard(_d: &Device, _layer: &[ButtonRemap]) -> Result<()> {
-    bail!(
-        "onboard HyperShift write (class 0x02 Mapping with IsHyperShift) shares the Mapping layout \
-         that still needs a USBPcap capture to RE. Software HyperShift (hypershift_write -> Engine \
-         Rules, gated by a Hold layer) works today."
-    )
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1297,11 +1245,7 @@ mod tests {
     }
 
     #[test]
-    fn onboard_button_remap_stub_refuses_host_remap() {
-        // A host-side remap (empty assignment) must be redirected to button_remap, not "succeed".
-        // We can't construct a real Device in a unit test, but the assignment-empty branch is
-        // reachable without one in principle; this documents the contract via the error message
-        // path by constructing the remap and asserting the empty-assignment guard message exists.
+    fn host_button_remap_has_no_firmware_assignment() {
         let remap = ButtonRemap::host(
             Trigger::Input {
                 page: 0x09,

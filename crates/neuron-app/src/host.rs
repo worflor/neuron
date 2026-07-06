@@ -293,8 +293,6 @@ pub struct Status {
     pub chroma_native_serving: bool,
     pub chroma_native_game: Option<NativeChroma>,
     pub openrgb_serving: bool,
-    /// OBS gate is on AND a connection object exists (attempting/connected).
-    pub obs_on: bool,
     /// OBS has actually authenticated (vs merely attempting). Drives the
     /// "connected to OBS" vs "connecting" copy.
     pub obs_connected: bool,
@@ -1075,7 +1073,6 @@ fn status_of(g: &Option<HostState>) -> Status {
                 chroma_native_serving,
                 chroma_native_game,
                 openrgb_serving: s.orgb.is_some(),
-                obs_on: s.obs.is_some(),
                 obs_connected: s.obs.as_ref().is_some_and(|c| c.is_connected()),
                 obs_scene: obs.scene,
                 obs_streaming: obs.streaming,

@@ -15,8 +15,9 @@
 #[cfg(all(windows, feature = "bridge"))]
 fn main() -> anyhow::Result<()> {
     use neuron_host::adapters::chroma_shm::server::{ChromaShmLayer, CreateError, ShmServer};
+    use neuron_host::adapters::chroma::GameLightingPolicy;
     use neuron_host::api::{HostApi, LeaseSpec, SurfaceKind};
-    use neuron_host::arbiter::{band, BlendMode, Content, Rgb};
+    use neuron_host::arbiter::{band, Content, Rgb};
     use neuron_host::bridge;
     use neuron_host::shell::Host;
     use std::sync::Arc;
@@ -56,6 +57,7 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     let mut h = host.handle();
+    let policy = GameLightingPolicy::new();
 
     // A calm base layer so unclaimed LEDs aren't black before a game connects.
     let base = h.next_source();
@@ -74,10 +76,15 @@ fn main() -> anyhow::Result<()> {
             SurfaceKind::Keypad => 0x10,
             SurfaceKind::Generic => 0x80,
         };
-        // A live blend cell (fixed here; the app drives it from the merge-policy UI) and a 0.0
-        // start so the game crossfades IN over the base when it first connects.
-        let blend = Arc::new(std::sync::atomic::AtomicU8::new(BlendMode::Over.to_bits()));
-        let layer = ChromaShmLayer::new(Arc::clone(&server), device_type, s.leds, blend, 0.0);
+        // Start faded out so the game crossfades IN over the base when it first connects.
+        let layer = ChromaShmLayer::new(
+            Arc::clone(&server),
+            s.key.clone(),
+            device_type,
+            s.leds,
+            Arc::clone(&policy),
+            0.0,
+        );
         let src = h.next_source();
         let _ = h.claim(
             &s.key,

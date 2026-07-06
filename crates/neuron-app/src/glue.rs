@@ -1759,13 +1759,6 @@ pub fn install(app: &AppWindow) -> SharedRt {
             app.global::<State>().on_pick_tile(move |slug| {
                 if let Some(app) = w.upgrade() {
                     let slug = slug.to_string();
-                    // the notifications DATA tile is a future surface — not wired yet.
-                    if slug == "notifications" {
-                        app.global::<State>().set_status_line(
-                            "notifications is a future data tile — not wired yet".into(),
-                        );
-                        return;
-                    }
                     // build the layer this PRESET describes (pattern + its params + spectrum) and pour it
                     // into the stack. Vitals is just another preset now — no data-mode fork.
                     let readout = {

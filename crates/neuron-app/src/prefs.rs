@@ -758,24 +758,6 @@ pub fn set_notif_audio(v: bool) -> String {
     }
 }
 
-/// Read one per-event gate by slug (dpi/scroll/polling/brightness/profile/layer/macro).
-pub fn notif_event(slug: &str) -> bool {
-    let p = Prefs::load();
-    match slug {
-        "dpi" => p.notif_dpi,
-        "sniper" => p.notif_sniper,
-        "scroll" => p.notif_scroll,
-        "polling" => p.notif_polling,
-        "brightness" => p.notif_brightness,
-        "profile" => p.notif_profile,
-        "layer" => p.notif_layer,
-        "macro" => p.notif_macro,
-        "battery" => p.notif_battery,
-        "side_plate" => p.notif_side_plate,
-        _ => false,
-    }
-}
-
 /// Persist one per-event gate by slug, returning a user-facing status line.
 pub fn set_notif_event(slug: &str, v: bool) -> String {
     let mut p = Prefs::load();
