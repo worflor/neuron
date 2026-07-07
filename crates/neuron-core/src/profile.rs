@@ -270,7 +270,12 @@ impl Profile {
 
         // --- Brightness. ----------------------------------------------------------------------
         if let Some(b) = self.brightness {
-            match devices.with_writable("set_brightness", |d| cap::set_brightness(d, b, store)) {
+            // brightness is dual-dialect, so it resolves by CAPABILITY (the command-name gate skipped
+            // legacy boards that can only write via the lighting block).
+            match devices
+                .with_writable_cap(crate::registry::Capability::SetBrightness, |d| {
+                    cap::set_brightness(d, b, store)
+                }) {
                 Ok(()) => r.applied.push(format!("brightness {b}%")),
                 Err(e) => r.skipped.push(format!("brightness: {e}")),
             }

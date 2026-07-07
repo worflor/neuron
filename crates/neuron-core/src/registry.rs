@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 /// A single vendor command: class / id / requested data size, plus any fixed leading
 /// argument bytes (e.g. varstore + led_id for lighting).
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
 pub struct CommandSpec {
     pub class: u8,
     pub id: u8,
@@ -24,14 +24,14 @@ pub struct CommandSpec {
 }
 
 /// One USB link-mode personality (wired / dongle / bluetooth) with its PID.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
 pub struct Mode {
     pub name: String,
     pub product_id: u16,
 }
 
 /// How to pick the vendor control collection out of a composite device.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
 pub struct ControlInterface {
     pub usage_page: u16,
     pub usage: u16,
@@ -39,7 +39,7 @@ pub struct ControlInterface {
 }
 
 /// A complete device definition (the unit you add to support a new device).
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 pub struct DeviceDef {
     pub name: String,
     pub codename: String,
@@ -117,6 +117,17 @@ impl DeviceDef {
     /// every required command is present), plus the structural facts (lighting block) that aren't
     /// commands. Purely a *read* over the registry — it changes nothing in the proven write path.
     pub fn supports(&self, cap: Capability) -> bool {
+        // SetBrightness has TWO honest write paths — the matrix top-level command OR the
+        // lighting block's brightness spec (the legacy dialect; see capability::set_brightness).
+        // Either satisfies it, so a legacy keyboard doesn't read as "can't set brightness".
+        if cap == Capability::SetBrightness
+            && self
+                .lighting
+                .as_ref()
+                .is_some_and(|l| l.brightness.is_some())
+        {
+            return true;
+        }
         cap.required_commands().iter().all(|c| self.has_command(c))
             && (!cap.requires_lighting() || self.lighting.is_some())
     }
@@ -241,28 +252,57 @@ pub struct Registry {
     pub devices: Vec<DeviceDef>,
 }
 
+/// Is `def` fully SUBSUMED by already-loaded defs — i.e. does every (vendor, pid) it declares
+/// already resolve? Load order is trust order (builtins → devices/ → devices/auto/), and
+/// `find_by_pid` is first-match-wins per pid — so a fully-covered def is dead weight (the
+/// curated-shadows-auto rule), while a def bringing ANY new pid must load even if its human
+/// name collides (auto defs are NAMED from the USB product string, which legitimately repeats
+/// across revisions and link modes; a name was never an identity).
+fn subsumed(existing: &[DeviceDef], def: &DeviceDef) -> bool {
+    // Every pid this def brings must already be covered by some existing def of the same vendor.
+    // An empty def (no modes) declares no pid and resolves nothing — treat it as subsumed so the
+    // all()-over-empty vacuous-true is the intended answer, not an accident.
+    def.product_ids().all(|pid| {
+        existing
+            .iter()
+            .any(|d| d.vendor_id == def.vendor_id && d.product_ids().any(|p| p == pid))
+    })
+}
+
 impl Registry {
     pub fn load() -> Result<Self> {
         let mut devices = Vec::new();
 
-        // Built-in definitions (embedded so the binary is self-contained).
-        const BUILTINS: &[&str] = &[
-            include_str!("../devices/razer-naga-v2-pro.toml"),
-            include_str!("../devices/razer-blackwidow-chroma-v2.toml"),
-        ];
-        for src in BUILTINS {
-            devices.push(toml::from_str::<DeviceDef>(src)?);
+        // Built-in definitions (embedded so the binary is self-contained). Dev/test escape:
+        // NEURON_PURE_DISCOVERY=1 skips them, forcing EVERY device through the emergent path
+        // (probe → `crate::synth` → devices/auto/) — the live end-to-end test for auto-adoption
+        // on hardware that normally has a curated def. Off (unset) in any real run.
+        if std::env::var("NEURON_PURE_DISCOVERY").map(|v| v != "1").unwrap_or(true) {
+            const BUILTINS: &[&str] = &[
+                include_str!("../devices/razer-naga-v2-pro.toml"),
+                include_str!("../devices/razer-blackwidow-chroma-v2.toml"),
+            ];
+            for src in BUILTINS {
+                devices.push(toml::from_str::<DeviceDef>(src)?);
+            }
         }
 
-        // Optional external definitions: extend coverage without recompiling.
-        if let Ok(rd) = std::fs::read_dir("devices") {
-            for entry in rd.flatten() {
-                let p = entry.path();
-                if p.extension().is_some_and(|x| x == "toml") {
-                    if let Ok(txt) = std::fs::read_to_string(&p) {
-                        if let Ok(def) = toml::from_str::<DeviceDef>(&txt) {
-                            if !devices.iter().any(|d| d.name == def.name) {
-                                devices.push(def);
+        // Optional external definitions: extend coverage without recompiling. Load order is
+        // trust order — `find_by_pid` is first-match-wins, so curated `devices/*.toml` shadow
+        // the auto-synthesized `devices/auto/*.toml` (see `crate::synth`) for the same pid.
+        // Shadowing is BY PID, never by name: a def loads unless it adds no new pid at all
+        // (`subsumed`). Auto defs are named from the USB product string, which repeats across
+        // revisions/link-modes, so a name collision must NOT drop a def that brings a fresh pid.
+        for dir in ["devices", "devices/auto"] {
+            if let Ok(rd) = std::fs::read_dir(dir) {
+                for entry in rd.flatten() {
+                    let p = entry.path();
+                    if p.extension().is_some_and(|x| x == "toml") && p.is_file() {
+                        if let Ok(txt) = std::fs::read_to_string(&p) {
+                            if let Ok(def) = toml::from_str::<DeviceDef>(&txt) {
+                                if !subsumed(&devices, &def) {
+                                    devices.push(def);
+                                }
                             }
                         }
                     }
@@ -322,6 +362,10 @@ mod tests {
         assert!(naga.supports(Capability::Lighting));
         // Keyboard = lighting only; no mouse perf, no onboard storage, no battery.
         assert!(bw.supports(Capability::Lighting));
+        // SetBrightness is satisfied by the LIGHTING BLOCK's brightness spec (the legacy
+        // dialect) — the board has no top-level set_brightness command yet CAN set brightness.
+        assert!(bw.supports(Capability::SetBrightness));
+        assert!(!bw.supports(Capability::Brightness), "no getter — the readout stays hidden");
         assert!(!bw.supports(Capability::SetDpi));
         assert!(!bw.supports(Capability::SetDpiStages));
         assert!(!bw.supports(Capability::SetScrollStage));
@@ -391,6 +435,91 @@ mod tests {
         assert_eq!(naga.side_plate_label(9), None);
         // a device with no plate map never claims one.
         assert_eq!(bw.side_plate_label(3), None);
+    }
+
+    /// A minimal-but-valid DeviceDef: just the identity fields `subsumed`/`find_by_pid` read
+    /// (vendor + a single mode pid), everything else stubbed. Distinct `codename` so end-to-end
+    /// resolution can tell two same-NAMED defs apart — the whole point of the fix.
+    fn mini(name: &str, codename: &str, vid: u16, pid: u16) -> DeviceDef {
+        let src = format!(
+            "name = \"{name}\"\n\
+             codename = \"{codename}\"\n\
+             vendor_id = {vid}\n\
+             transaction_id = 0x1F\n\
+             [[modes]]\n\
+             name = \"wired\"\n\
+             product_id = {pid}\n\
+             [control_interface]\n\
+             usage_page = 1\n\
+             usage = 2\n\
+             feature_report_len = 91\n\
+             [commands]\n"
+        );
+        toml::from_str(&src).unwrap()
+    }
+
+    #[test]
+    fn subsumed_is_by_pid_not_by_name() {
+        let (naga, _) = builtins();
+        // (a) THE review scenario: a def with the SAME human name as the Naga builtin but a pid
+        // the Naga never declares (a new revision / different link-mode pid). Name collides, pid
+        // is fresh — it MUST NOT be dropped.
+        let same_name_new_pid = mini(&naga.name, "Ghost", naga.vendor_id, 0x0999);
+        assert!(
+            !subsumed(&[naga.clone()], &same_name_new_pid),
+            "a fresh pid must load even when the display name collides"
+        );
+
+        // (b) curated-shadows-auto: re-parsing the same builtin brings no new pid → dead weight.
+        let (naga_again, _) = builtins();
+        assert!(
+            subsumed(&[naga.clone()], &naga_again),
+            "a fully-covered def is subsumed (first-match-wins already resolves its pids)"
+        );
+
+        // (c) partial overlap: one already-covered pid + one brand-new pid. It STILL loads — it
+        // brings a new pid, and first-match-wins per pid handles the shared one.
+        let partial: DeviceDef = toml::from_str(&format!(
+            "name = \"partial\"\n\
+             codename = \"Ghost\"\n\
+             vendor_id = {}\n\
+             transaction_id = 0x1F\n\
+             [[modes]]\n\
+             name = \"shared\"\n\
+             product_id = 0x00A7\n\
+             [[modes]]\n\
+             name = \"fresh\"\n\
+             product_id = 0x0999\n\
+             [control_interface]\n\
+             usage_page = 1\n\
+             usage = 2\n\
+             feature_report_len = 91\n\
+             [commands]\n",
+            naga.vendor_id
+        ))
+        .unwrap();
+        assert!(
+            !subsumed(&[naga.clone()], &partial),
+            "a def bringing ANY new pid is not subsumed"
+        );
+    }
+
+    #[test]
+    fn find_by_pid_resolves_both_same_named_defs() {
+        // (d) end-to-end resolution SHAPE: a registry holding the Naga plus a same-named def that
+        // brings a new pid resolves BOTH pids — each to the right def. The old name-dedupe would
+        // have dropped the second def, leaving 0x0999 unresolved ("permanently unadopted").
+        let (naga, _) = builtins();
+        let same_name_new_pid = mini(&naga.name, "Ghost", naga.vendor_id, 0x0999);
+        let reg = Registry {
+            devices: vec![naga.clone(), same_name_new_pid],
+        };
+        // The Naga's own pid resolves to the Naga (first match wins for a shared/curated pid).
+        let a = reg.find_by_pid(naga.vendor_id, 0x00A7).unwrap();
+        assert_eq!(a.codename, "Aria");
+        // The new pid resolves to the second def — proving it was NOT dropped for the name clash.
+        let b = reg.find_by_pid(naga.vendor_id, 0x0999).unwrap();
+        assert_eq!(b.codename, "Ghost");
     }
 
     #[test]

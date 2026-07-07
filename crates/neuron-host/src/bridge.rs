@@ -727,6 +727,7 @@ mod tests {
             usage,
             feature_len,
             path: neuron::transport::DevicePath::from_str_for_tests(path),
+            product: String::new(),
         }
     }
 

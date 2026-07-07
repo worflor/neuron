@@ -56,6 +56,28 @@ impl Device {
         bail!("no connected device supports '{cmd}'")
     }
 
+    /// The SEMANTIC sibling of [`open_with_command`](Self::open_with_command): resolve the first
+    /// connected device that exposes a [`Capability`](crate::registry::Capability), not a single
+    /// literal command name. Some capabilities have MORE THAN ONE wire dialect — `SetBrightness` is
+    /// satisfied by either the matrix top-level `set_brightness` command OR a legacy `[lighting]`
+    /// block's brightness spec (the BlackWidow Chroma V2) — so resolving those by a single command
+    /// name reintroduces the exact dialect leak [`DeviceDef::supports`](crate::registry::DeviceDef::supports)
+    /// exists to prevent: a legacy board that CAN set brightness reads as "no such command" and is
+    /// never selected. Route dual-dialect writes through here so the capability gate decides.
+    pub fn open_with_capability(
+        reg: &crate::registry::Registry,
+        cap: crate::registry::Capability,
+    ) -> Result<Self> {
+        for i in &transport::enumerate()? {
+            if let Some(def) = reg.find_by_pid(i.vid, i.pid) {
+                if def.matches_control(i.usage_page, i.usage, i.feature_len) && def.supports(cap) {
+                    return Device::open_path(def.clone(), i.pid, &i.path);
+                }
+            }
+        }
+        bail!("no connected device supports {cap:?}")
+    }
+
     /// Send a command, then busy-poll for the echoed reply until SUCCESS (or terminal error).
     /// Returns the 80-byte argument payload. Read-only commands are non-mutating.
     pub fn exec(&self, cmd: &CommandSpec) -> Result<[u8; 80]> {
@@ -225,16 +247,28 @@ impl<'a> DeviceSession<'a> {
         self.reg
     }
 
-    /// Resolve and cache the first connected device exposing `cmd`.
-    pub fn open_for(&mut self, cmd: &str) -> Result<&Device> {
-        if !self.by_command.contains_key(cmd) {
-            let dev = Device::open_with_command(self.reg, cmd)?;
-            self.by_command.insert(cmd.to_string(), dev);
+    /// Resolve-and-cache under an arbitrary cache KEY, opening via `resolve` on a miss. The key
+    /// NAMESPACES the `by_command` map so command-name resolution (`open_for`) and capability
+    /// resolution (`with_writable_cap`, key `"cap:…"`) share one cache without colliding: registry
+    /// command names never contain ':', so a `"cap:…"` key can never alias a real command name.
+    fn open_for_key(
+        &mut self,
+        key: &str,
+        resolve: impl Fn(&crate::registry::Registry) -> Result<Device>,
+    ) -> Result<&Device> {
+        if !self.by_command.contains_key(key) {
+            let dev = resolve(self.reg)?;
+            self.by_command.insert(key.to_string(), dev);
         }
         Ok(self
             .by_command
-            .get(cmd)
+            .get(key)
             .expect("device cache was just populated"))
+    }
+
+    /// Resolve and cache the first connected device exposing `cmd`.
+    pub fn open_for(&mut self, cmd: &str) -> Result<&Device> {
+        self.open_for_key(cmd, |reg| Device::open_with_command(reg, cmd))
     }
 
     /// Drop one cached command handle and its driver-mode memo. Use after a transport failure,
@@ -246,17 +280,28 @@ impl<'a> DeviceSession<'a> {
         }
     }
 
-    /// Resolve a write-capable device and run the Razer driver-mode handshake once per device.
-    pub fn writable_for(&mut self, cmd: &str) -> Result<&Device> {
-        let key = {
-            let dev = self.open_for(cmd)?;
+    /// Resolve a write-capable device (under a cache `key`, opened via `resolve`) and run the Razer
+    /// driver-mode handshake once per physical device. The shared core of both the command-name and
+    /// capability writable paths, so they get IDENTICAL cached-handle + driver-memo semantics.
+    fn writable_for_key(
+        &mut self,
+        key: &str,
+        resolve: impl Fn(&crate::registry::Registry) -> Result<Device>,
+    ) -> Result<&Device> {
+        let dk = {
+            let dev = self.open_for_key(key, &resolve)?;
             DeviceKey::from_device(dev)
         };
-        if self.driver_ready.insert(key) {
-            let dev = self.open_for(cmd)?;
+        if self.driver_ready.insert(dk) {
+            let dev = self.open_for_key(key, &resolve)?;
             crate::writes::ensure_driver(dev);
         }
-        self.open_for(cmd)
+        self.open_for_key(key, &resolve)
+    }
+
+    /// Resolve a write-capable device and run the Razer driver-mode handshake once per device.
+    pub fn writable_for(&mut self, cmd: &str) -> Result<&Device> {
+        self.writable_for_key(cmd, |reg| Device::open_with_command(reg, cmd))
     }
 
     /// Run one writable operation, reopening/re-handshaking once if the cached handle failed.
@@ -272,6 +317,32 @@ impl<'a> DeviceSession<'a> {
                 self.writable_for(cmd).and_then(&mut op).with_context(|| {
                     format!("after reopening cached '{cmd}' handle; first failure: {first}")
                 })
+            }
+        }
+    }
+
+    /// Run one writable operation resolved by CAPABILITY, reopening/re-handshaking once if the
+    /// cached handle failed. The capability sibling of [`with_writable`](Self::with_writable): for a
+    /// capability with more than one wire dialect (today only `SetBrightness` — top-level command vs
+    /// legacy lighting-block spec), selecting by a single command name would skip the boards that
+    /// only speak the other dialect. Uses the same stale-handle retry as `with_writable`; the cache
+    /// key `"cap:…"` can't collide with a real command name (registry names never contain ':').
+    pub fn with_writable_cap<T>(
+        &mut self,
+        cap: crate::registry::Capability,
+        mut op: impl FnMut(&Device) -> Result<T>,
+    ) -> Result<T> {
+        let key = format!("cap:{cap:?}");
+        let resolve = move |reg: &crate::registry::Registry| Device::open_with_capability(reg, cap);
+        match self.writable_for_key(&key, &resolve).and_then(&mut op) {
+            Ok(v) => Ok(v),
+            Err(first) => {
+                self.invalidate_command(&key);
+                self.writable_for_key(&key, &resolve)
+                    .and_then(&mut op)
+                    .with_context(|| {
+                        format!("after reopening cached '{key}' handle; first failure: {first}")
+                    })
             }
         }
     }
@@ -301,6 +372,26 @@ impl<'a> DeviceSession<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The exact resolution gap this capability path closes: the legacy BlackWidow has NO top-level
+    /// `set_brightness` command (its brightness lives in the `[lighting]` block), so the command-name
+    /// resolver (`open_with_command`) never selected it — yet it CAN set brightness. `open_with_capability`
+    /// keys off the SAME `def.supports(cap)` predicate, which honors the lighting dialect. Pins that the
+    /// board is SELECTED by the capability gate while the literal command name is absent. No hardware.
+    #[test]
+    fn blackwidow_resolves_setbrightness_by_capability_not_command() {
+        use crate::registry::Capability;
+        let bw: DeviceDef =
+            toml::from_str(include_str!("../devices/razer-blackwidow-chroma-v2.toml")).unwrap();
+        assert!(
+            bw.command("set_brightness").is_none(),
+            "legacy board has no top-level set_brightness command — command-name resolution misses it"
+        );
+        assert!(
+            bw.supports(Capability::SetBrightness),
+            "yet it CAN set brightness via the lighting block, so open_with_capability's predicate selects it"
+        );
+    }
 
     /// LIVE stream-strategy probe — quantifies what one custom-frame report costs on the wire under
     /// four different SET/GET disciplines, on the real BlackWidow. Run with the app STOPPED (two

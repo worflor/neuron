@@ -1113,6 +1113,32 @@ pub fn install(app: &AppWindow) -> SharedRt {
 
     // initial population — every readout seeded from persisted/device truth.
     refresh_devices(app, &shared);
+    // While an unknown device is being LEARNED (background auto-adoption), poll lightly and
+    // re-render the device list so its "learning…" row resolves into the real row the moment
+    // the probe lands — the list otherwise only refreshes on demand, which left the transient
+    // row stale forever. This tick is ALSO the retry cadence's only driver: a failed first probe
+    // (a deep-asleep wireless mouse, silent until user input) leaves a due-retry marker in
+    // `synth_attempted` that `adoption_pending` reports, so the tick's rescan re-probes it — and
+    // the device really does adopt within ~a minute of waking with no user action. Gating on
+    // `adoption_pending` (not `adoption_active`) is what keeps the driver alive across that gap;
+    // idle cost is a per-second in-memory flag check whenever nothing is pending.
+    {
+        let w = app.as_weak();
+        let sh = shared.clone();
+        ADOPT_WATCH_TIMER.with(|t| {
+            t.start(
+                slint::TimerMode::Repeated,
+                std::time::Duration::from_millis(1000),
+                move || {
+                    let Some(app) = w.upgrade() else { return };
+                    let pending = sh.borrow().rt.adoption_pending();
+                    if pending {
+                        refresh_devices(&app, &sh);
+                    }
+                },
+            )
+        });
+    }
     refresh_rules(app, &shared);
     refresh_pockets(app);
     // a truly-fresh install gets the bundled exemplar macro before the registry first reads disk.
@@ -1138,7 +1164,10 @@ pub fn install(app: &AppWindow) -> SharedRt {
     refresh_layers(app, &shared);
     init_grid(app, &shared);
     init_action_palette(app);
-    init_perf_controls(app, &shared);
+    init_perf_controls(app);
+    // startup's auto-selected device gets the same async live-readout sweep a click gets
+    // (no lighting resume — restore_lighting owns the first stream).
+    seed_perf_async(app, &shared, false);
     mic::refresh(app);
     mic::refresh_output(app);
     st.set_brush_color(rgb_to_color(brush(app)));
@@ -1302,7 +1331,10 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 // snapshot the draft State the deck has been editing.
                 let can_dpi = st.get_sel_can_dpi();
                 let can_poll = st.get_sel_can_poll();
-                let can_light = st.get_sel_can_light();
+                // the fader rides SetBrightness (the WRITE), NOT cap_light (a lighting block) — a
+                // synthesized legacy def carries a lighting block with no brightness spec, so gating
+                // the apply on can_light would fire a write into "no brightness write path".
+                let can_bright_set = st.get_sel_can_bright_set();
                 let can_store = st.get_sel_can_store();
                 let dpi = st.get_dpi() as u16;
                 let hz = st.get_polling_hz() as u32;
@@ -1325,7 +1357,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                         }
                         lines.push(msg);
                     }
-                    if can_light {
+                    if can_bright_set {
                         lines.push(s.rt.apply_brightness(pct));
                     }
                     if stages_ok {
@@ -5425,18 +5457,8 @@ pub fn install(app: &AppWindow) -> SharedRt {
 /// Seed the surfaced perf-control readouts from PERSISTED + DEVICE truth: the idle read-back, the
 /// sniper binding (sniper.toml), and the device's real DPI stage table. A panel that renders a
 /// compile-time default as if it were a reading breaks the instrument promise.
-fn init_perf_controls(app: &AppWindow, sh: &SharedRt) {
+fn init_perf_controls(app: &AppWindow) {
     let st = app.global::<State>();
-    // live idle-timeout read-back (best-effort; "—" if the device is asleep / has none).
-    let idle = sh.borrow().rt.read_idle_secs();
-    match idle {
-        Some(s) => {
-            st.set_idle_readout(format!("{s}s").into());
-            st.set_idle_secs(s as f32);
-            st.set_idle_secs_text(s.to_string().into());
-        }
-        None => st.set_idle_readout("—".into()),
-    }
     sync_idle_editor(&st);
     sync_scroll_stage_editor(&st);
     // sniper read-back: reflect the authored RULE (gui.rules.toml) — never a fictional default.
@@ -5457,21 +5479,79 @@ fn init_perf_controls(app: &AppWindow, sh: &SharedRt) {
         }
         None => st.set_sniper_button("—".into()),
     }
-    // the device's real stage table seeds the editor + the fader detents when readable.
-    let stages = sh.borrow().rt.read_dpi_stages();
-    if !stages.is_empty() {
-        let joined = stages
-            .iter()
-            .map(u16::to_string)
-            .collect::<Vec<_>>()
-            .join("/");
-        st.set_dpi_stages(joined.into());
-    }
     sync_stage_nums(&st);
-    // LIFT-OFF DISTANCE: seed the level + readout from the device's live symmetric LOD (best-effort;
-    // "—" on devices without it / asleep). debounce still has no derivable opcode -> unsupported.
-    refresh_lod_readout(app, sh);
+    // debounce still has no derivable opcode -> unsupported.
     st.set_debounce_supported(false);
+    // The LIVE readouts (idle timeout, DPI stage table, LOD) land asynchronously — see
+    // `seed_perf_async`, which the select path drives so the click renders immediately.
+}
+
+/// Fill the advanced-FEEL readouts (idle / DPI stages / LOD) from a background batched read
+/// sweep, then resume the newly-selected board's saved lighting. The old path ran four
+/// enumerate+open+getter round-trips ON THE UI THREAD (a visible ~half-second freeze when
+/// clicking a capable device); now the click paints instantly with the scan-cached fader
+/// values, pending readouts show "…", and the live truths drop in when the sweep lands.
+/// The lighting resume rides the COMPLETION on purpose: starting the stream first would race
+/// the getters on the device's one feature-report channel (the known second-handle clobber).
+/// A guard drops the result if the user has already switched to a different unit.
+fn seed_perf_async(app: &AppWindow, sh: &SharedRt, resume_lighting: bool) {
+    let st = app.global::<State>();
+    // pending state — never show the PREVIOUS board's numbers against the new board's name.
+    st.set_idle_readout("…".into());
+    st.set_lod_readout("…".into());
+    let (pid, unit) = {
+        let s = sh.borrow();
+        (s.rt.selected_pid, s.rt.selected_unit.clone())
+    };
+    let w = app.as_weak();
+    std::thread::spawn(move || {
+        let snap = crate::runtime::read_perf_snapshot(pid, &unit);
+        let _ = slint::invoke_from_event_loop(move || {
+            let Some(app) = w.upgrade() else { return };
+            with_shared(|sh| {
+                // stale sweep (user already picked another unit) — that pick spawned its own.
+                if sh.borrow().rt.selected_unit != unit {
+                    return;
+                }
+                let st = app.global::<State>();
+                match snap.idle_secs {
+                    Some(s) => {
+                        st.set_idle_readout(format!("{s}s").into());
+                        st.set_idle_secs(s as f32);
+                        st.set_idle_secs_text(s.to_string().into());
+                    }
+                    None => st.set_idle_readout("—".into()),
+                }
+                sync_idle_editor(&st);
+                if !snap.dpi_stages.is_empty() {
+                    let joined = snap
+                        .dpi_stages
+                        .iter()
+                        .map(u16::to_string)
+                        .collect::<Vec<_>>()
+                        .join("/");
+                    st.set_dpi_stages(joined.into());
+                }
+                sync_stage_nums(&st);
+                if let Some((lift, land)) = snap.lod_async {
+                    st.set_lod_async(true);
+                    st.set_lod_lift(lift as i32);
+                    st.set_lod_land(land as i32);
+                    st.set_lod_readout(format!("lift {lift} / land {land}").into());
+                } else if let Some(lvl) = snap.lod_level {
+                    st.set_lod_async(false);
+                    st.set_lod_level(lvl as i32);
+                    st.set_lod_readout(lod_level_label(lvl as i32).into());
+                } else {
+                    st.set_lod_readout("\u{2014}".into());
+                }
+                if resume_lighting && LIGHTING_READY.load(std::sync::atomic::Ordering::Acquire) {
+                    load_lighting_into_state(&app, sh);
+                    let _ = apply_current_lighting(&app, sh);
+                }
+            });
+        });
+    });
 }
 
 struct DpiStageParse {
@@ -6050,11 +6130,13 @@ fn audio_rows() -> Vec<DeviceRow> {
                 cap_poll: false,
                 cap_light: false,
                 cap_bright: false,
+                cap_bright_set: false,
                 cap_scroll: false,
                 cap_store: false,
                 cap_idle: false,
                 cap_plate: false,
                 plate: "".into(), // audio endpoints have no plate
+                adopting: false,  // audio endpoints are never HID-adopted
             });
         }
     }
@@ -6107,13 +6189,33 @@ fn select_device_at(app: &AppWindow, sh: &SharedRt, idx: i32) {
     let st = app.global::<State>();
     let rows = st.get_devices();
     let n = rows.row_count() as i32;
-    if n == 0 {
+    // idx < 0 is a deliberate "select nothing" (an all-adopting list has no auto-pickable row), so
+    // it routes into the same clear branch as an empty list — never clamped up to row 0.
+    if n == 0 || idx < 0 {
         st.set_selected_device(-1);
         st.set_selected_device_kind("".into());
         st.set_selected_device_name("\u{2014}".into());
+        // No longer a startup-only nicety: this fires on real transitions AWAY from a capable device
+        // (the list going all-adopting after a mid-probe unplug, or emptying out), so every gate the
+        // row path SETS below must be UNSET here — otherwise the FEEL deck keeps rendering the previous
+        // device's DPI/report/store controls against no selection, and an apply routes into stale state.
+        st.set_sel_can_dpi(false);
+        st.set_sel_can_poll(false);
         st.set_sel_can_light(false); // nothing selected → LIGHTING shows its "no device" empty state
+        st.set_sel_can_bright_set(false); // and the FEEL brightness fader (the WRITE gate) goes too
+        st.set_sel_can_scroll(false);
+        st.set_sel_can_store(false);
+        st.set_sel_can_idle(false);
+        st.set_sel_can_hyperpoll(false);
         st.set_sel_can_plate(false);
         st.set_selected_plate("".into());
+        // seeded_key describes the panel's CURRENT seed — a cleared panel is seeded with nothing, so
+        // the key must go too. Otherwise a same-unit reselect after an unplug/replug (unit ids are
+        // port-stable, and a re-arriving KNOWN device bumps no registry_gen) would find (unit, gen)
+        // still matching the stale key → changed == false → the reseed (init_perf_controls /
+        // refresh_effects / init_grid / seed_perf_async, and the saved-lighting resume riding
+        // seed_perf_async's completion) is skipped, orphaning the FEEL readouts on cleared state.
+        sh.borrow_mut().rt.seeded_key = None;
         return;
     }
     let i = idx.clamp(0, n - 1);
@@ -6127,6 +6229,7 @@ fn select_device_at(app: &AppWindow, sh: &SharedRt, idx: i32) {
     st.set_sel_can_dpi(row.cap_dpi);
     st.set_sel_can_poll(row.cap_poll);
     st.set_sel_can_light(row.cap_light);
+    st.set_sel_can_bright_set(row.cap_bright_set);
     st.set_sel_can_scroll(row.cap_scroll);
     st.set_sel_can_store(row.cap_store);
     st.set_sel_can_idle(row.cap_idle);
@@ -6168,12 +6271,36 @@ fn select_device_at(app: &AppWindow, sh: &SharedRt, idx: i32) {
         // path instance) + seed the FEEL fader from its live reads.
         let changed = {
             let mut s = sh.borrow_mut();
-            let c = s.rt.selected_pid != pid || s.rt.selected_unit != row.id.as_str();
+            // Point the runtime at this UNIT unconditionally — even a learning row: selecting it is
+            // a PROMISE that when the real registry-backed row flips in (same unit id) the selection
+            // is already on it, so it carries over with zero user action.
             s.rt.selected_pid = pid;
             s.rt.selected_unit = row.id.to_string();
-            // Switching which board you're EDITING no longer stops the others — each board's stream is
-            // independent now, so the keyboard keeps animating while you work on the mouse.
-            c
+            // A learning row is INERT: it has no def to seed against, so we neither reseed nor stamp
+            // seeded_key. Leaving the key STALE is exactly what makes the learning→real flip register
+            // as a change — the reseed then runs against the real def, not this ghost. Only a real
+            // row computes/stamps the (unit, registry-generation) key.
+            if row.adopting {
+                false
+            } else {
+                // Seeding follows the (unit, registry-generation) identity, not "did the unit id
+                // change": the same unit id after a registry reload is a DIFFERENT device as far as
+                // the panel is concerned (its def may have been swapped underneath — the learning→
+                // real adoption flip is just the most common reload; a user-edited devices/auto file
+                // is the same shape). Keying on the generation kills the whole "same unit id so skip
+                // reseed" class outright instead of special-casing transient learning rows.
+                let key = (row.id.to_string(), s.rt.registry_gen);
+                let c = s.rt.seeded_key.as_ref() != Some(&key);
+                if c {
+                    s.rt.seeded_key = Some(key);
+                }
+                c
+            }
+            // Deliberate parity with the old code: selecting an AUDIO endpoint never touches the key
+            // (that branch returns above), so HID → mic → same HID still skips the reseed — the key
+            // still matches, no def moved. Switching which board you're EDITING no longer stops the
+            // others either: each board's stream is independent, so the keyboard keeps animating
+            // while you work on the mouse.
         };
         if let Ok(v) = row.dpi.trim().parse::<f32>() {
             st.set_dpi(v);
@@ -6196,28 +6323,22 @@ fn select_device_at(app: &AppWindow, sh: &SharedRt, idx: i32) {
         {
             st.set_brightness(v);
         }
-        // the ADVANCED (stages/idle) + effects/grid re-reads are device round-trips — only on a switch.
+        // only a SWITCH re-seeds: config-derived controls sync + effects/grid (registry reads),
+        // then the live device round-trips (stages/idle/LOD) land asynchronously so the click
+        // itself never blocks on the wire. The newly-selected board's persisted lighting resumes
+        // from that sweep's completion (see `seed_perf_async` for the ordering rationale) —
+        // still gated on LIGHTING_READY so the INITIAL install-time selection stays state-only
+        // (restore_lighting owns that first stream and flips the gate).
         if changed {
-            init_perf_controls(app, sh);
+            init_perf_controls(app);
             st.set_selected_effect(-1);
             st.set_applied_effect(-1);
             // a fresh device starts with the brush down (not a stale per-LED editor from the last board);
-            // its own persisted stack is loaded by load_lighting_into_state below.
+            // its own persisted stack is loaded by the async completion's load_lighting_into_state.
             st.set_light_brush_on(false);
             refresh_effects(app, sh);
             init_grid(app, sh);
-            // SWITCHING boards: load the NEWLY-selected device's own persisted lighting (fps + stack /
-            // data mode) into state + the page, overriding init_grid's per-class fps default when a pick
-            // was saved, THEN resume it on the board. Under auto-apply the selected device's lighting is
-            // always the live one and the manual apply button is gone — so the switch itself is what brings
-            // the new board's saved stack live (immediate, like restore; not the 250ms edit-debounce).
-            // Honours writes-pause + an empty stack (both make `apply_current_lighting` a silent no-op).
-            // Gated on LIGHTING_READY so the INITIAL install-time selection stays state-only — restore_
-            // lighting owns that first stream (and flips the gate).
-            if LIGHTING_READY.load(std::sync::atomic::Ordering::Acquire) {
-                load_lighting_into_state(app, sh);
-                let _ = apply_current_lighting(app, sh);
-            }
+            seed_perf_async(app, sh, true);
         }
     }
 }
@@ -6550,6 +6671,7 @@ pub fn refresh_devices(app: &AppWindow, sh: &SharedRt) {
             cap_poll: d.cap_poll,
             cap_light: d.cap_light,
             cap_bright: d.cap_bright,
+            cap_bright_set: d.cap_bright_set,
             cap_scroll: d.cap_scroll,
             cap_store: d.cap_store,
             cap_idle: d.cap_idle,
@@ -6562,6 +6684,7 @@ pub fn refresh_devices(app: &AppWindow, sh: &SharedRt) {
             } else {
                 "".into()
             },
+            adopting: d.adopting,
         })
         .collect();
     // 2) EMERGENT audio endpoints appended — mic + every output, generic over any hardware.
@@ -6572,10 +6695,23 @@ pub fn refresh_devices(app: &AppWindow, sh: &SharedRt) {
     refresh_host_game_devices(app);
     // MECHANICAL ADVANTAGES: seed Snap Tap support from the live keyboard list (honest gate).
     refresh_snap_tap(app, sh);
-    // 3) restore selection by id (default to the first row), and seed its per-kind panel.
+    // 3) restore selection by id, and seed its per-kind panel. A previously-selected id that still
+    // has a row is restored as-is — adopting or not — so a learning row the USER chose stays chosen
+    // (the carry-over to the real row is the whole point). Only the DEFAULT (nothing was selected,
+    // or the prior id vanished) skips learning rows: it picks the first NON-adopting row, mirroring
+    // the runtime's own auto-pick rule (scan_devices' `find(|d| !d.adopting)`) so the two selection
+    // layers can't disagree. If EVERY row is adopting (fresh setup, single unknown mid-probe), -1 →
+    // no auto-pick at all (select_device_at clears), matching runtime leaving selected_unit empty.
     let n = st.get_devices().row_count() as i32;
+    let default_idx = (0..n)
+        .find(|&i| {
+            st.get_devices()
+                .row_data(i as usize)
+                .is_some_and(|r| !r.adopting)
+        })
+        .unwrap_or(-1);
     let idx = if prev_id.is_empty() {
-        0
+        default_idx
     } else {
         (0..n)
             .find(|&i| {
@@ -6585,7 +6721,7 @@ pub fn refresh_devices(app: &AppWindow, sh: &SharedRt) {
                     .as_deref()
                     == Some(prev_id.as_str())
             })
-            .unwrap_or(0)
+            .unwrap_or(default_idx)
     };
     select_device_at(app, sh, idx);
 }
@@ -7028,6 +7164,13 @@ pub fn refresh_effects(app: &AppWindow, sh: &SharedRt) {
 static LIGHTING_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 thread_local! {
+    /// Light poll (UI-thread) that re-renders the device list WHILE a background auto-adoption is
+    /// learning a new device — so the transient "learning…" row resolves on its own — AND drives
+    /// the SYNTH_RETRY re-probe cadence: a failed first probe (deep-asleep wireless mouse) leaves a
+    /// due-retry marker that this tick picks up via `adoption_pending`, so the device adopts within
+    /// ~a minute of waking with no user action. Idles as a per-second in-memory flag check when
+    /// nothing is being adopted and no retry is due.
+    static ADOPT_WATCH_TIMER: slint::Timer = slint::Timer::default();
     /// Debounce timer for the lighting-state disk write (UI-thread). Restarted on each change so a
     /// rapid gesture (dragging the speed slider) coalesces into ONE app.toml write ~400ms after the
     /// last edit, instead of one write per emitted value.

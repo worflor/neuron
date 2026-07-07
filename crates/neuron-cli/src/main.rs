@@ -37,9 +37,19 @@ enum Cmd {
     List,
     /// Self-emergent capability discovery: probe ANY Razer razer_report device, no registry
     Discover {
-        /// write a registry TOML skeleton per device to ./devices/ (self-onboarding)
+        /// adopt unknown devices: synthesize a FULL device def per unknown device and write it
+        /// to ./devices/auto/ (same as `neuron adopt`)
         #[arg(long)]
         emit: bool,
+    },
+    /// Adopt unknown Razer devices: probe the getter space, synthesize a complete device def
+    /// (commands + lighting dialect + measured link pacing) and write ./devices/auto/<pid>.toml.
+    /// From then on the file is plain per-device config — editable, never overwritten.
+    Adopt {
+        /// print the synthesized TOML instead of writing files, and include ALREADY-KNOWN
+        /// devices — diff against a curated def to verify synthesis on proven hardware
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Show device info (firmware, mode, battery)
     Info,
@@ -842,12 +852,19 @@ fn twin_cmd(action: TwinCmd) -> Result<()> {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let reg = Registry::load()?;
+    // Adoption is NOT a startup step (it would give read-only commands a hidden HID-probe + file
+    // write): it fires lazily inside device resolution, the moment a command actually reaches for
+    // the bus and comes up short. See `adopt_and_reload`.
     match cli.cmd {
         Cmd::List => list(&reg)?,
         Cmd::Discover { emit } => discover_cmd(emit),
+        Cmd::Adopt { dry_run } => adopt_cmd(&reg, dry_run)?,
         Cmd::Info => info(&open_first(&reg)?)?,
         Cmd::Battery => {
-            let d = open_first(&reg)?;
+            // Resolve by CAPABILITY, not enumeration order — "the device with a battery",
+            // never "the first device" (which is a keyboard whenever one sorts first). Via the
+            // local wrapper so a brand-new battery device is adopted-on-miss (see open_with_command).
+            let d = open_with_command(&reg, "battery_level")?;
             let pct = cap::battery_percent(&d)?;
             let charging = cap::charging(&d).unwrap_or(false);
             println!(
@@ -2520,9 +2537,12 @@ fn decode_dpi_stages(s: &[u8]) -> Vec<u16> {
     out
 }
 
-/// The active stage index (0-based) from a DPI stage-table getter reply, if present.
+/// The active stage index (0-based) from a DPI stage-table getter reply, if present. The wire
+/// byte is 1-BASED (probed live: the firmware REJECTS a 0 in the setter; the getter echoes the
+/// same numbering) — the old raw passthrough marked the WRONG stage as active, one past reality.
+/// A wire 0 means "no active stage reported" → None.
 fn decode_dpi_active(s: &[u8]) -> Option<u8> {
-    s.get(1).copied()
+    s.get(1).copied().filter(|&b| b > 0).map(|b| b - 1)
 }
 
 // ── "never fake success" input guards ─────────────────────────────────────────────────────────
@@ -3280,11 +3300,50 @@ fn ensure_driver(d: &Device) {
     let _ = neuron::writes::ensure_driver(d);
 }
 
+/// Adoption is a property of DEVICE RESOLUTION, not process startup: the first time a command
+/// actually reaches for the bus and comes up short (or enumerates it), unknown Razer hardware is
+/// learned (synth::adopt_unknown → devices/auto/<pid>.toml) and the registry reloaded — so
+/// `neuron battery` works out of the box on brand-new hardware, while read-only surfaces
+/// (pocket --list, profile list, …) never probe HID or write files. Once per process.
+fn adopt_and_reload() -> Option<Registry> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    // Once per process: the FIRST bus-facing miss learns; every later miss is a genuine
+    // "not connected", so we don't re-probe the whole unknown set on each retry.
+    static ADOPTED: AtomicBool = AtomicBool::new(false);
+    if ADOPTED.swap(true, Ordering::SeqCst) {
+        return None;
+    }
+    // Best-effort throughout: any failure (load, probe) degrades to None, and the caller returns
+    // its original resolution error — adoption never turns a clean "no device" into a crash.
+    let reg = Registry::load().ok()?;
+    let a = neuron::synth::adopt_unknown(&reg).ok()?;
+    for s in &a.skipped {
+        eprintln!("adoption skipped {s}");
+    }
+    if a.adopted.is_empty() {
+        return None;
+    }
+    for d in &a.adopted {
+        eprintln!(
+            "learned new device: {} (pid {:04x}) -> {}",
+            d.name,
+            d.pid,
+            d.path.display()
+        );
+    }
+    // Fresh load so the just-written devices/auto/*.toml are in the registry the caller retries on.
+    Registry::load().ok()
+}
+
 /// Open the first connected recognized device whose registry def exposes `cmd`. Thin wrapper over
 /// the shared core resolver [`neuron::device::Device::open_with_command`] (one implementation, no
-/// CLI/GUI drift).
+/// CLI/GUI drift). On a MISS, learn brand-new hardware once and retry against the fresh registry —
+/// the happy path is zero-cost (no adoption when the device already resolves).
 fn open_with_command(reg: &Registry, cmd: &str) -> Result<Device> {
-    Device::open_with_command(reg, cmd)
+    Device::open_with_command(reg, cmd).or_else(|e| match adopt_and_reload() {
+        Some(reg2) => Device::open_with_command(&reg2, cmd),
+        None => Err(e),
+    })
 }
 
 fn dpi_cmd(reg: &Registry, value: Option<u16>) -> Result<()> {
@@ -3334,23 +3393,47 @@ fn polling_cmd(reg: &Registry, hz: Option<u32>) -> Result<()> {
 }
 
 fn brightness_cmd(reg: &Registry, pct: Option<u8>) -> Result<()> {
-    let d = open_with_command(reg, "set_brightness")?;
+    // brightness is DUAL-DIALECT (matrix top-level command vs legacy lighting-block spec), so resolve
+    // it by CAPABILITY — the command-name path skipped legacy boards (the BlackWidow) that can only
+    // write brightness through the lighting block.
+    let d = Device::open_with_capability(reg, neuron::registry::Capability::SetBrightness)
+        // MISS: adopt brand-new hardware once, retry against the fresh registry (zero-cost when
+        // the device already resolves).
+        .or_else(|e| match adopt_and_reload() {
+            Some(reg2) => {
+                Device::open_with_capability(&reg2, neuron::registry::Capability::SetBrightness)
+            }
+            None => Err(e),
+        })?;
     if let Some(p) = pct {
         // lighting writes need driver mode; ensure it (reversible) via the canonical core helper.
         let _ = neuron::writes::ensure_driver(&d);
         cap::set_brightness(&d, p, cap::Store::Persist)?;
     }
-    let got = cap::brightness_percent(&d)?;
-    match pct {
-        Some(p) => println!(
-            "brightness -> {got}%  [{}]",
-            if got.abs_diff(p) <= 1 {
-                "verified"
-            } else {
-                "MISMATCH"
-            }
+    // Read-back is BEST-EFFORT: the legacy dialect (the BlackWidow) can SET brightness but has
+    // no getter — a write there is honest-but-unverifiable, and saying so beats erroring after
+    // a write that landed. Devices with the getter keep the full verified/MISMATCH report.
+    match (pct, d.def.has_command("brightness")) {
+        (Some(p), true) => {
+            let got = cap::brightness_percent(&d)?;
+            println!(
+                "brightness -> {got}%  [{}]",
+                if got.abs_diff(p) <= 1 {
+                    "verified"
+                } else {
+                    "MISMATCH"
+                }
+            );
+        }
+        (Some(p), false) => println!(
+            "brightness -> {p}%  [sent — '{}' has no brightness getter to verify against]",
+            d.def.name
         ),
-        None => println!("brightness: {got}%"),
+        (None, true) => println!("brightness: {}%", cap::brightness_percent(&d)?),
+        (None, false) => println!(
+            "brightness: unreadable — '{}' can set but not report it",
+            d.def.name
+        ),
     }
     Ok(())
 }
@@ -3744,6 +3827,17 @@ fn gesture_tune(
 }
 
 fn list(reg: &Registry) -> Result<()> {
+    // list ENUMERATES the bus, so it must SEE brand-new hardware. If any unknown Razer razer_report
+    // pipe is present, adopt once and list against the fresh registry. unknown_present is a single
+    // HID enumeration (no per-device probes) — cheap enough for list's "show me what's here"
+    // semantics, unlike the resolution helpers that only adopt on an actual miss. The recursion
+    // terminates: once adopted the pid is known (unknown_present drains), and adopt_and_reload is
+    // once-per-process anyway.
+    if !neuron::synth::unknown_present(reg).is_empty() {
+        if let Some(reg2) = adopt_and_reload() {
+            return list(&reg2);
+        }
+    }
     let infos = transport::enumerate()?;
     let mut found = false;
     for i in &infos {
@@ -3827,24 +3921,78 @@ fn discover_cmd(emit: bool) {
     }
 
     if emit {
-        let _ = std::fs::create_dir_all("devices");
-        for d in &devs {
-            // only onboard devices the registry doesn't already know
-            let known = reg
-                .as_ref()
-                .and_then(|r| r.find_by_pid(d.vid, d.pid))
-                .is_some();
-            if known {
-                println!("skip {:04x}: already in registry", d.pid);
-                continue;
+        // Full adoption (not a skeleton): probe the getter space, synthesize a complete def,
+        // write devices/auto/<pid>.toml — the same path as `neuron adopt`.
+        match reg.as_ref().map(neuron::synth::adopt_unknown) {
+            Some(Ok(a)) => {
+                for s in &a.skipped {
+                    println!("skipped {s}");
+                }
+                if a.adopted.is_empty() {
+                    println!("nothing to adopt: every connected device is already in the registry.");
+                }
+                for d in &a.adopted {
+                    println!("adopted {} (pid {:04x}) -> {}", d.name, d.pid, d.path.display());
+                }
             }
-            let path = format!("devices/razer-{:04x}-auto.toml", d.pid);
-            match std::fs::write(&path, d.to_toml_skeleton()) {
-                Ok(_) => println!("emitted {path}"),
-                Err(e) => println!("failed to write {path}: {e}"),
-            }
+            Some(Err(e)) => println!("adoption failed: {e}"),
+            None => println!("adoption skipped: registry failed to load"),
         }
     }
+}
+
+/// `neuron adopt`: synthesize full defs for unknown devices (write) or print the synthesis for
+/// EVERY connected device (`--dry-run`) — diffing a dry-run against a curated TOML is how the
+/// generalized prober is verified on proven hardware.
+fn adopt_cmd(reg: &Registry, dry_run: bool) -> Result<()> {
+    if dry_run {
+        let infos = transport::enumerate()?;
+        let mut seen = std::collections::BTreeSet::new();
+        let mut any = false;
+        for i in &infos {
+            if i.vid != neuron::synth::RAZER_VID
+                || i.feature_len != neuron::synth::RAZER_FEATURE_LEN
+            {
+                continue;
+            }
+            let Ok(t) = transport::open_path(&i.path) else {
+                continue;
+            };
+            let ctx = neuron::synth::SynthCtx::from_info(i);
+            let Some(s) = neuron::synth::synthesize(&*t, &ctx) else {
+                continue; // mute collection of a device another pipe already answered for
+            };
+            if !seen.insert(i.pid) {
+                continue;
+            }
+            any = true;
+            let known = reg
+                .find_by_pid(i.vid, i.pid)
+                .map(|d| format!("known: curated def '{}' would shadow this", d.name))
+                .unwrap_or_else(|| "unknown: `neuron adopt` would write this".into());
+            println!(
+                "# ── pid {:04x} · round-trip ~{}ms · {} ──────────────────────\n",
+                i.pid, s.roundtrip_ms, known
+            );
+            println!("{}", neuron::synth::emit_toml(&s));
+        }
+        if !any {
+            println!("no talking razer_report pipes found.");
+        }
+        return Ok(());
+    }
+    let a = neuron::synth::adopt_unknown(reg)?;
+    for s in &a.skipped {
+        println!("skipped {s}");
+    }
+    if a.adopted.is_empty() {
+        println!("nothing to adopt: every connected device is already in the registry.");
+    }
+    for d in &a.adopted {
+        println!("adopted {} (pid {:04x}) -> {}", d.name, d.pid, d.path.display());
+        println!("  it is live config now (devices/auto/) — edit to refine; curated devices/*.toml shadows it.");
+    }
+    Ok(())
 }
 
 fn open_first(reg: &Registry) -> Result<Device> {
@@ -3855,6 +4003,12 @@ fn open_first(reg: &Registry) -> Result<Device> {
                 return Device::open(def.clone(), i.pid);
             }
         }
+    }
+    // MISS: the connected hardware may just be unknown to the registry — adopt once and retry
+    // against the fresh registry (the recursion terminates: adopt_and_reload is once-per-process,
+    // so the second miss returns None and we bail for real).
+    if let Some(reg2) = adopt_and_reload() {
+        return open_first(&reg2);
     }
     bail!("no recognized Razer device connected")
 }
@@ -4174,14 +4328,17 @@ mod tests {
         // [varstore, active, count, {id, Xhi, Xlo, Yhi, Ylo, 0, 0} * count]. Two stages: 800, 16000.
         let mut buf = [0u8; 80];
         buf[0] = 0x01; // varstore
-        buf[1] = 1; // active index
+        buf[1] = 2; // active byte — 1-BASED on the wire, so 2 = the second stage
         buf[2] = 2; // count
                     // stage 0: id=1, X=800 (0x0320)
         buf[3..10].copy_from_slice(&[0x01, 0x03, 0x20, 0x03, 0x20, 0x00, 0x00]);
         // stage 1: id=2, X=16000 (0x3E80)
         buf[10..17].copy_from_slice(&[0x02, 0x3E, 0x80, 0x3E, 0x80, 0x00, 0x00]);
         assert_eq!(decode_dpi_stages(&buf), vec![800, 16000]);
-        assert_eq!(decode_dpi_active(&buf), Some(1));
+        assert_eq!(decode_dpi_active(&buf), Some(1), "wire 2 -> 0-based index 1");
+        // a wire 0 (no active reported) decodes to None, never a fake stage 1
+        buf[1] = 0;
+        assert_eq!(decode_dpi_active(&buf), None);
     }
 
     #[test]

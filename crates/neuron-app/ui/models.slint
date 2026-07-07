@@ -30,11 +30,17 @@ export struct DeviceRow {
     cap-poll: bool,     // polling contacts · in-game polling
     cap-light: bool,    // brightness fader
     cap-bright: bool,   // brightness GETTER — the LIGHT readout (a set-only board shows no readout)
+    cap-bright-set: bool, // brightness WRITE — the fader; cap-light stays the lighting-page gate
     cap-scroll: bool,   // scroll-wheel stages
     cap-store: bool,    // persist-to-onboard
     cap-idle: bool,     // idle-off timer (wireless)
     cap-plate: bool,    // swappable side plates (push-detected; surfaces the side-plate readout)
     plate: string,      // last side plate the mouse pushed ("12-button"…); "" if none/non-plated
+    // TRANSIENT: an unknown device whose auto-adoption probe is running ("learning device…").
+    // Selection policy hangs off this: the row is selectable (a click carries over to the real
+    // row that replaces it — same unit id), but INERT (no reseed against a missing def) and
+    // never AUTO-picked (the default-selection sweep skips it).
+    adopting: bool,
 }
 
 export struct ChromaDeviceRow {

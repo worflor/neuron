@@ -280,7 +280,11 @@ export component AppWindow inherits Window {
                     padding-left: Theme.pad-page;
                     padding-right: Theme.pad-page;
                     spacing: 8px;
-                    // a caret marking the readout line — phosphor for info, alarm red for failures
+
+                    // ── ZONE L — the readout message. It owns ALL the horizontal slack, so the state
+                    // cluster on the right stays pinned to the edge (the old blind spacer let that
+                    // cluster float mid-strip). A caret marks the line — phosphor for info, alarm red
+                    // for failures.
                     Text {
                         text: "›";
                         color: State.status-kind == "err" ? Theme.danger : Theme.accent;
@@ -299,67 +303,143 @@ export component AppWindow inherits Window {
                         font-family: Theme.mono;
                         vertical-alignment: center;
                         overflow: elide;
+                        // THE message absorbs every pixel of slack (and elides first) so the state
+                        // cluster packs hard against the right edge — never floats in the middle.
+                        horizontal-stretch: 1;
+                        min-width: 0;
                         animate color { duration: Theme.settle; }
                     }
-                    Rectangle {}
-                    // ── mode readouts — gates and live states belong on the scope line ──
-                    // BEACON: a macro is asking at the cursor (count includes queued asks).
-                    if State.beacon-count > 0 : Mono {
-                        text: State.beacon-count > 1 ? "beacon ×" + State.beacon-count : "beacon";
-                        color: Theme.accent;
-                    }
-                    if State.beacon-count > 0 : Rectangle { width: 14px; }
-                    // WRITES PAUSED: the global device-write kill-switch — click = go to its gate.
-                    if State.writes-paused : Rectangle {
-                        width: pw.width; height: parent.height;
-                        pw := Mono { text: "writes paused"; color: Theme.danger; vertical-alignment: center; }
-                        TouchArea {
-                            mouse-cursor: MouseCursor.pointer;
-                            clicked => { State.page = 3; }
+
+                    // ── ZONE R — the mode readouts, packed right, split by hairline DIVIDERS (visible
+                    // structure) instead of blind spacer gaps. Gates + live states belong on the scope
+                    // line. Order: beacon | writes-paused | gate | fired | focus. Each group LEADS with
+                    // its own divider, so whichever renders first is cleanly parted from the message.
+                    HorizontalLayout {
+                        alignment: end;
+                        spacing: 10px;
+
+                        // BEACON: a macro is asking at the cursor (count includes queued asks).
+                        if State.beacon-count > 0 : HorizontalLayout {
+                            spacing: 10px;
+                            Rectangle { width: 1px; height: 12px; y: (parent.height - self.height) / 2; background: Theme.line; }
+                            Text {
+                                text: State.beacon-count > 1 ? "beacon ×" + State.beacon-count : "beacon";
+                                color: Theme.accent;
+                                font-family: Theme.mono;
+                                font-size: Theme.fs-mono;
+                                vertical-alignment: center;
+                            }
                         }
-                    }
-                    if State.writes-paused : Rectangle { width: 14px; }
-                    // THE GATE: armed/safe. SAFE -> ARMED takes a confirming second click (real
-                    // keystrokes are consequential); ARMED -> SAFE disarms instantly.
-                    Rectangle {
-                        width: gate.width; height: parent.height;
-                        gate := Mono {
-                            text: State.input-armed ? "armed" : root.arm-confirm ? "arm?" : "safe";
-                            color: State.input-armed ? Theme.accent
-                                : root.arm-confirm ? Theme.warn
-                                : Theme.text-dim;
-                            vertical-alignment: center;
-                        }
-                        TouchArea {
-                            mouse-cursor: MouseCursor.pointer;
-                            clicked => {
-                                if (State.input-armed || root.arm-confirm) {
-                                    State.toggle-input-armed();
-                                    root.arm-confirm = false;
-                                } else {
-                                    root.arm-confirm = true;
+
+                        // WRITES PAUSED: the global device-write kill-switch — click = go to its gate.
+                        // The lamp makes it read as a THROWN switch (a red kill-lamp), not inert text.
+                        if State.writes-paused : HorizontalLayout {
+                            spacing: 10px;
+                            Rectangle { width: 1px; height: 12px; y: (parent.height - self.height) / 2; background: Theme.line; }
+                            Rectangle {
+                                width: pwrow.preferred-width;
+                                height: parent.height;
+                                pwrow := HorizontalLayout {
+                                    spacing: 6px;
+                                    Rectangle {
+                                        width: Theme.dot; height: Theme.dot; border-radius: 1px;
+                                        y: (parent.height - self.height) / 2;
+                                        background: Theme.danger;
+                                    }
+                                    Text {
+                                        text: "writes paused";
+                                        // hover brightens the label so the kill-switch invites the click
+                                        color: pwta.has-hover ? Theme.text : Theme.danger;
+                                        font-family: Theme.mono;
+                                        font-size: Theme.fs-mono;
+                                        vertical-alignment: center;
+                                        animate color { duration: Theme.quick; }
+                                    }
+                                }
+                                pwta := TouchArea {
+                                    mouse-cursor: MouseCursor.pointer;
+                                    clicked => { State.page = 3; }
                                 }
                             }
                         }
-                    }
-                    Rectangle { width: 14px; }
-                    // live dispatch readout — last trigger fired + total count (the headline's own
-                    // dedicated slot; it never stomps the status message on the left)
-                    if State.live-fired > 0 : Mono {
-                        text: "fired " + State.live-fired + " · " + State.live-last-trigger
-                            + " → " + State.live-last-action;
-                        color: Theme.accent-dim;
-                        overflow: elide;
-                        min-width: 0;   // elide a long trigger→action instead of shoving `focus` off-edge
-                    }
-                    Rectangle { width: 14px; }
-                    // the focus readout is the last thing to yield: it absorbs slack and elides first
-                    Mono {
-                        text: "focus " + State.focused-app;
-                        color: Theme.text-faint;
-                        overflow: elide;
-                        min-width: 0;
-                        horizontal-stretch: 1;
+
+                        // THE GATE: armed/safe. SAFE -> ARMED takes a confirming second click (real
+                        // keystrokes are consequential); ARMED -> SAFE disarms instantly. The lamp makes
+                        // the gate read as a physical switch, not inert text — accent=armed, warn=arm?,
+                        // a dim dot=safe.
+                        HorizontalLayout {
+                            spacing: 10px;
+                            Rectangle { width: 1px; height: 12px; y: (parent.height - self.height) / 2; background: Theme.line; }
+                            Rectangle {
+                                width: gaterow.preferred-width;
+                                height: parent.height;
+                                gaterow := HorizontalLayout {
+                                    spacing: 6px;
+                                    Rectangle {
+                                        width: Theme.dot; height: Theme.dot; border-radius: 1px;
+                                        y: (parent.height - self.height) / 2;
+                                        background: State.input-armed ? Theme.accent
+                                            : root.arm-confirm ? Theme.warn
+                                            : Theme.text-faint.with-alpha(0.5);
+                                        animate background { duration: Theme.quick; }
+                                    }
+                                    Text {
+                                        text: State.input-armed ? "armed" : root.arm-confirm ? "arm?" : "safe";
+                                        // when SAFE, a hover brightens the label so it INVITES the arming click
+                                        color: State.input-armed ? Theme.accent
+                                            : root.arm-confirm ? Theme.warn
+                                            : (gateta.has-hover ? Theme.text-mid : Theme.text-dim);
+                                        font-family: Theme.mono;
+                                        font-size: Theme.fs-mono;
+                                        vertical-alignment: center;
+                                        animate color { duration: Theme.quick; }
+                                    }
+                                }
+                                gateta := TouchArea {
+                                    mouse-cursor: MouseCursor.pointer;
+                                    clicked => {
+                                        if (State.input-armed || root.arm-confirm) {
+                                            State.toggle-input-armed();
+                                            root.arm-confirm = false;
+                                        } else {
+                                            root.arm-confirm = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // live dispatch readout — last trigger fired + total count. A hard max-width
+                        // caps it (elides a long trigger→action) so it can never shove `focus` off-edge.
+                        if State.live-fired > 0 : HorizontalLayout {
+                            spacing: 10px;
+                            Rectangle { width: 1px; height: 12px; y: (parent.height - self.height) / 2; background: Theme.line; }
+                            Text {
+                                text: "fired " + State.live-fired + " · " + State.live-last-trigger
+                                    + " → " + State.live-last-action;
+                                color: Theme.accent-dim;
+                                font-family: Theme.mono;
+                                font-size: Theme.fs-mono;
+                                vertical-alignment: center;
+                                overflow: elide;
+                                max-width: 340px;
+                            }
+                        }
+
+                        // the focus readout — the last item; natural width, elides at its own cap.
+                        HorizontalLayout {
+                            spacing: 10px;
+                            Rectangle { width: 1px; height: 12px; y: (parent.height - self.height) / 2; background: Theme.line; }
+                            Text {
+                                text: "focus " + State.focused-app;
+                                color: Theme.text-faint;
+                                font-family: Theme.mono;
+                                font-size: Theme.fs-mono;
+                                vertical-alignment: center;
+                                overflow: elide;
+                                max-width: 260px;
+                            }
+                        }
                     }
                 }
             }

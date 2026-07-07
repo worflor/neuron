@@ -58,10 +58,15 @@ pub struct DeviceState {
     pub cap_light: bool, // Lighting — the brightness fader
     pub cap_bright: bool, // Brightness (the GETTER) — the LIGHT readout; a device that can set but
     // never report brightness (the legacy BlackWidow) must not show a readout that reads "—" forever
+    pub cap_bright_set: bool, // SetBrightness (the WRITE, either dialect) — the BRIGHTNESS fader + its slot in the one-gesture apply; distinct from cap_light (a lighting BLOCK ≠ a brightness write: synthesized defs only carry lighting.brightness when the probe proved it)
     pub cap_scroll: bool, // SetScrollStage — scroll-wheel stages
     pub cap_store: bool, // Storage — persist-to-onboard
     pub cap_idle: bool, // Battery (wireless proxy) — the idle-off timer
     pub cap_plate: bool, // has a [side_plates] map — surfaces the push-detected side-plate readout
+    /// TRANSIENT: this row is an unknown device whose auto-adoption probe is running right now
+    /// ("learning device…"). All capability gates are off; the row is replaced by the real,
+    /// registry-backed one (same unit instance, so selection carries over) when the probe lands.
+    pub adopting: bool,
 }
 
 /// One live lighting stream's controls, owned PER-DEVICE in [`AppRuntime::anim`]: the stop flag its
@@ -72,6 +77,13 @@ pub struct AnimStream {
     pub stop: Arc<AtomicBool>,
     pub fps: Arc<AtomicU32>,
 }
+
+/// Re-probe cadence for a pid that stayed unknown (e.g. a mouse deep-asleep at first probe — it
+/// only wakes on user input, so poll slowly until it answers). This is BOTH the retry interval
+/// `adopt_unknown_in_background` gates each re-probe on AND the window `adoption_pending` (the
+/// watch-timer gate) uses to decide a retry is coming due — so a silent unknown device keeps the
+/// timer alive just long enough to rescan once per window and adopt within ~a minute of waking.
+const SYNTH_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The resident runtime state. UI-thread owned (held in an `Rc<RefCell<_>>` by the glue).
 pub struct AppRuntime {
@@ -104,6 +116,35 @@ pub struct AppRuntime {
     /// Alt+F4). A GUI-hosted daemon LL-keyboard hook consults this; carried so apply stays the
     /// canonical source. Empty by default (nothing suppressed).
     pub gaming_mode: neuron::writes::GamingMode,
+    /// When each unknown pid was last probed by a background auto-adoption (`neuron::synth`).
+    /// Not every scan tick — but not once-per-run either: a wireless device DEEP-asleep at
+    /// first probe only wakes on user input, so unanswered pids retry on a slow cadence
+    /// (SYNTH_RETRY) and adopt within a minute of waking. A pid that leaves enumeration is
+    /// forgotten immediately (unplug → replug = the natural instant retry).
+    synth_attempted: HashMap<u16, std::time::Instant>,
+    /// Pids whose adoption probe is RUNNING right now (inserted before the thread spawns,
+    /// cleared by the thread when it finishes). Drives the transient "learning device…" row so
+    /// a new device is visible the instant it's plugged in, not after the multi-second probe.
+    synth_inflight: Arc<std::sync::Mutex<std::collections::HashSet<u16>>>,
+    /// Pids with a LIVE probe thread RIGHT NOW — the spawn guard that keeps the single-probe
+    /// invariant even when a probe outlives the SYNTH_RETRY cadence (a stuck/slow wireless probe
+    /// can exceed 60s, and re-pushing the pid then would spawn a SECOND overlapping probe for it).
+    /// Distinct from `synth_inflight`, which only drives the transient "learning…" row for a pid's
+    /// FIRST attempt: this set spans every attempt (first and retry) and gates spawning, not UI.
+    synth_running: Arc<std::sync::Mutex<std::collections::HashSet<u16>>>,
+    /// Set by a finished adoption thread; the next scan tick reloads the registry so the newly
+    /// synthesized device appears without a restart.
+    synth_dirty: Arc<AtomicBool>,
+    /// Monotonic count of registry swaps — the def-identity half of the panel-seeding key
+    /// (`seeded_key`). A reload means ANY def behind an unchanged unit id may have changed (the
+    /// learning→real adoption flip, a user-edited devices/auto file), so a same-unit selection
+    /// after a bump must re-seed. Bumped at every site that reassigns `self.registry`.
+    pub registry_gen: u64,
+    /// The (unit, registry_gen) the inspector panel was last seeded for — the select path's
+    /// reseed decision. A selection reseeds iff this differs from the newly selected unit's key,
+    /// which catches BOTH a different unit and a same unit whose def changed under a reload.
+    /// None = never seeded.
+    pub seeded_key: Option<(String, u64)>,
 }
 
 impl AppRuntime {
@@ -129,6 +170,12 @@ impl AppRuntime {
             anim: HashMap::new(),
             light_fps: Arc::new(AtomicU32::new(30)),
             gaming_mode: neuron::writes::GamingMode::default(),
+            synth_attempted: HashMap::new(),
+            synth_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            synth_running: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            synth_dirty: Arc::new(AtomicBool::new(false)),
+            registry_gen: 0,
+            seeded_key: None,
         }
     }
 
@@ -150,10 +197,21 @@ impl AppRuntime {
     /// each read through its OWN control path, so the readouts are that unit's truth, never the
     /// truth of whichever twin enumerated first.
     pub fn scan_devices(&mut self) -> Vec<DeviceState> {
+        // A finished background adoption wrote a new devices/auto/*.toml — reload the registry
+        // so the freshly synthesized device becomes a row this very tick.
+        if self.synth_dirty.swap(false, Ordering::SeqCst) {
+            if let Ok(reg) = Registry::load() {
+                self.registry = reg;
+                // A def behind an existing unit id may have changed (learning→real, edited auto
+                // file) — bump the generation so a same-unit selection re-seeds the panel.
+                self.registry_gen = self.registry_gen.wrapping_add(1);
+            }
+        }
         let infos = match transport::enumerate() {
             Ok(v) => v,
             Err(_) => return Vec::new(),
         };
+        self.adopt_unknown_in_background(&infos);
         // Pass 1 — resolve units before any device I/O: dedupe collections to units, and learn
         // which pids have duplicate units so naming + vitals routing can be decided up front.
         struct Unit {
@@ -208,18 +266,164 @@ impl AppRuntime {
             }
             out.push(st);
         }
+        // A device being adopted RIGHT NOW is visible immediately as a transient "learning"
+        // row (product string as its name, every control gated off) instead of appearing out
+        // of thin air seconds later. ONE row per razer_report pipe — the same signature the
+        // probe targets — never one per HID collection (a mouse exposes a dozen collections
+        // under its pid; without this filter the page flooded with duplicate learning rows).
+        // Same unit-instance id as the real row that replaces it, so a selection made during
+        // the probe carries straight over.
+        if let Ok(inflight) = self.synth_inflight.lock() {
+            for i in &infos {
+                if i.vid != neuron::synth::RAZER_VID
+                    || i.feature_len != neuron::synth::RAZER_FEATURE_LEN
+                    || !inflight.contains(&i.pid)
+                {
+                    continue;
+                }
+                let instance = i.instance();
+                if out.iter().any(|d| d.instance == instance) {
+                    continue; // another razer_report pipe of the same learning unit
+                }
+                out.push(learning_row(i, instance));
+            }
+        }
         // Selection follows reality: if the selected unit is no longer enumerated (unplugged,
         // dongle gone) — or nothing was selected yet — adopt the first recognized unit so the
         // per-device panels never target a ghost. pid 0 / empty unit never match a row, so this
-        // one branch covers both first-scan auto-pick and stale-selection healing.
+        // one branch covers both first-scan auto-pick and stale-selection healing. Learning
+        // rows are never auto-picked (their def doesn't exist yet, so panels would ghost).
         if !out
             .iter()
             .any(|d| d.pid == self.selected_pid && d.instance == self.selected_unit)
         {
-            self.selected_pid = out.first().map(|d| d.pid).unwrap_or(0);
-            self.selected_unit = out.first().map(|d| d.instance.clone()).unwrap_or_default();
+            let first = out.iter().find(|d| !d.adopting);
+            self.selected_pid = first.map(|d| d.pid).unwrap_or(0);
+            self.selected_unit = first.map(|d| d.instance.clone()).unwrap_or_default();
         }
         out
+    }
+
+    /// Spawn one background auto-adoption (`neuron::synth`) per UNKNOWN Razer pid seen this
+    /// run: any razer_report pipe the registry can't resolve gets probed + synthesized into
+    /// devices/auto/<pid>.toml off-thread, then `synth_dirty` makes the next scan tick reload
+    /// the registry. Zero cost when everything is recognized (the common case — a pid-set
+    /// diff over the enumeration the scan already did). The probe is safe to run while the
+    /// app works: it only touches the unknown device, which nothing else opens until the
+    /// registry knows it.
+    fn adopt_unknown_in_background(&mut self, infos: &[transport::HidDeviceInfo]) {
+        // The ledger tracks UNKNOWN pids only: drop entries whose pid left the bus (unplug →
+        // replug = the natural instant retry) OR became registry-recognized (a successful adoption
+        // must retire its own retry state — a stale entry would arm `adoption_pending` forever and
+        // turn the watch timer into a permanent 1 Hz rescan loop). scan_devices reloads the registry
+        // BEFORE calling here, so an adopted pid already resolves and gets swept on this same pass.
+        let reg = &self.registry;
+        self.synth_attempted
+            .retain(|pid, _| infos.iter().any(|i| i.pid == *pid && reg.find_by_pid(i.vid, i.pid).is_none()));
+        let now = std::time::Instant::now();
+        let mut unknown: Vec<u16> = Vec::new(); // pids to probe this pass
+        let mut first_try: Vec<u16> = Vec::new(); // subset never probed before → "learning" row
+        // Single-probe guard, locked ONCE for the whole build: a pid whose probe thread is still
+        // running (a slow/stuck wireless probe can outlast SYNTH_RETRY) must not be re-pushed here,
+        // or we'd spawn a SECOND overlapping probe for it. The same guard is written below with the
+        // pids we actually spawn on, so the "already running → skip" read and the "now running"
+        // mark are one critical section. A poisoned lock (a probe thread panicked) recovers rather
+        // than wedging adoption forever.
+        let mut running = match self.synth_running.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        for i in infos {
+            if i.vid != neuron::synth::RAZER_VID
+                || i.feature_len != neuron::synth::RAZER_FEATURE_LEN
+                || self.registry.find_by_pid(i.vid, i.pid).is_some()
+                || unknown.contains(&i.pid)
+                || running.contains(&i.pid)
+            {
+                continue;
+            }
+            match self.synth_attempted.get(&i.pid) {
+                None => {
+                    unknown.push(i.pid);
+                    first_try.push(i.pid);
+                }
+                // A pid that stayed silent retries on the slow cadence — WITHOUT the
+                // "learning…" row, so a never-answering pipe doesn't flash UI every minute.
+                Some(at) if now.duration_since(*at) >= SYNTH_RETRY => unknown.push(i.pid),
+                Some(_) => {}
+            }
+        }
+        if unknown.is_empty() {
+            return;
+        }
+        self.synth_attempted
+            .extend(unknown.iter().map(|&pid| (pid, now)));
+        if let Ok(mut inflight) = self.synth_inflight.lock() {
+            inflight.extend(first_try.iter().copied());
+        }
+        // Mark exactly the pids we're about to spawn on as running, then release the guard before
+        // spawning (the thread re-locks it at its tail to clear them).
+        running.extend(unknown.iter().copied());
+        drop(running);
+        let dirty = self.synth_dirty.clone();
+        let inflight = self.synth_inflight.clone();
+        let running = self.synth_running.clone();
+        std::thread::spawn(move || {
+            // Fresh registry (not a clone of the UI's): adoption must judge "unknown" against
+            // what's on DISK, so a def another process adopted meanwhile isn't re-probed. Probe
+            // ONLY this worker's pids (`adopt_pids`, not `adopt_unknown`): a second worker spawned
+            // for a DIFFERENT pid must not also probe — and double-write the auto file of — a pid
+            // this worker already owns.
+            if let Ok(reg) = Registry::load() {
+                if let Ok(a) = neuron::synth::adopt_pids(&reg, &unknown) {
+                    if !a.adopted.is_empty() {
+                        dirty.store(true, Ordering::SeqCst);
+                    }
+                }
+            }
+            // Probe over (success or not): retire the "learning…" rows for FIRST attempts…
+            if let Ok(mut set) = inflight.lock() {
+                for pid in &first_try {
+                    set.remove(pid);
+                }
+            }
+            // …and drop the single-probe guard for every pid this thread probed, so a pid that
+            // stayed unknown becomes eligible for a fresh probe on the next SYNTH_RETRY tick.
+            if let Ok(mut set) = running.lock() {
+                for pid in &unknown {
+                    set.remove(pid);
+                }
+            }
+        });
+    }
+
+    /// Is an auto-adoption in flight, or its result not yet folded into the device list? The
+    /// device page polls this on a light timer and re-scans while true, so a "learning…" row
+    /// resolves into the real device the moment its probe lands — no manual re-scan. A cheap
+    /// flag check when nothing is being adopted (the permanent case).
+    pub fn adoption_active(&self) -> bool {
+        self.synth_dirty.load(Ordering::SeqCst)
+            || self
+                .synth_inflight
+                .lock()
+                .map(|s| !s.is_empty())
+                .unwrap_or(false)
+    }
+
+    /// Does the adoption machinery need the watch timer to keep ticking — active work NOW, or a
+    /// RETRY coming due? `adoption_active` alone goes false after a FAILED first probe (inflight
+    /// cleared, nothing dirty), which used to put the timer to sleep and orphan the SYNTH_RETRY
+    /// cadence entirely (the "adopts within a minute of waking" promise had no driver). The retry
+    /// half is a pure in-memory check over `synth_attempted` — no enumeration, no device I/O — so
+    /// an attached-but-silent unknown device costs one real rescan per SYNTH_RETRY window and a
+    /// flag check per tick, nothing more. Self-cleaning: unplugging the device lets the next scan
+    /// retain the pid out of `synth_attempted`, and the gate goes permanently quiet.
+    pub fn adoption_pending(&self) -> bool {
+        self.adoption_active()
+            || self
+                .synth_attempted
+                .values()
+                .any(|at| at.elapsed() >= SYNTH_RETRY)
     }
 
     /// Open the currently-selected device (or the first recognized one).
@@ -387,29 +591,6 @@ impl AppRuntime {
             }
             Err(e) => format!("no device: {e}"),
         }
-    }
-
-    /// Read the device's current DPI stage table (the cycle) — best-effort, `[]` when absent.
-    /// The read side of `apply_dpi_stages`, used to seed the editor with hardware truth.
-    pub fn read_dpi_stages(&self) -> Vec<u16> {
-        let mut out = Vec::new();
-        if let Ok(d) = self.open_selected() {
-            if let Ok(s) = d.run("dpi_stages") {
-                if s.len() > 2 {
-                    let count = s[2] as usize;
-                    for i in 0..count {
-                        let off = 3 + i * 7; // [id, Xhi, Xlo, Yhi, Ylo, 0, 0]
-                        if off + 2 < s.len() {
-                            let x = ((s[off + 1] as u16) << 8) | s[off + 2] as u16;
-                            if x > 0 {
-                                out.push(x);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        out
     }
 
     /// Apply HyperScroll wheel stages (class 0x0B) — verify-gated + hardware-pending; surfaces the
@@ -1312,6 +1493,119 @@ impl std::ops::Deref for GatedDevice {
 /// enumerated — never "some interface with this pid" — so each row of a duplicate pair reads its
 /// own hardware. `feed_vitals` routes the shared battery sample into the pid-keyed edge-detector;
 /// the caller enables it for ONE unit per pid (see `scan_devices`).
+/// Decode the DPI stage table response `[vs, active, count, {id, Xhi, Xlo, Yhi, Ylo, 0, 0}*]`
+/// into the X-DPI list. Shared by the sync read and the batched worker snapshot.
+fn decode_dpi_stages(s: &[u8; 80]) -> Vec<u16> {
+    let mut out = Vec::new();
+    let count = s[2] as usize;
+    for i in 0..count {
+        let off = 3 + i * 7;
+        if off + 2 < s.len() {
+            let x = ((s[off + 1] as u16) << 8) | s[off + 2] as u16;
+            if x > 0 {
+                out.push(x);
+            }
+        }
+    }
+    out
+}
+
+/// The advanced-FEEL live readouts a device switch needs: idle timeout, DPI stage table, LOD.
+/// Read as ONE batched sweep over a single opened handle (see [`read_perf_snapshot`]).
+#[derive(Default)]
+pub struct PerfSnapshot {
+    pub idle_secs: Option<u16>,
+    pub dpi_stages: Vec<u16>,
+    pub lod_async: Option<(u8, u8)>,
+    pub lod_level: Option<u8>,
+}
+
+/// Batched advanced-FEEL read sweep for one physical unit — a FREE function so a worker thread
+/// can run it (the UI's `AppRuntime` is `Rc`-held and UI-thread-only; threads open their own
+/// handles, the same pattern the lighting streams use). ONE enumeration + ONE open serve every
+/// getter — the old per-getter `open_selected()` paid enumerate+open FOUR times, which is what
+/// made clicking a capable device visibly hitch. The host writer is parked for the sweep
+/// (`io_gate`), same as every other getter path.
+pub fn read_perf_snapshot(pid: u16, unit: &str) -> PerfSnapshot {
+    let mut snap = PerfSnapshot::default();
+    let Ok(reg) = Registry::load() else {
+        return snap;
+    };
+    let Ok(infos) = transport::enumerate() else {
+        return snap;
+    };
+    let _gate = crate::host::io_gate(pid);
+    // Unit-precise first, pid-only healing second — the same two-pass rule as `open_selected`.
+    for relaxed in [false, true] {
+        for i in &infos {
+            let Some(def) = reg.find_by_pid(i.vid, i.pid) else {
+                continue;
+            };
+            if !def.matches_control(i.usage_page, i.usage, i.feature_len)
+                || (pid != 0 && i.pid != pid)
+                || !(relaxed || unit.is_empty() || i.instance() == unit)
+            {
+                continue;
+            }
+            let Ok(d) = Device::open_path(def.clone(), i.pid, &i.path) else {
+                continue;
+            };
+            snap.idle_secs = cap::idle_timeout_secs(&d).ok();
+            if let Ok(s) = d.run("dpi_stages") {
+                snap.dpi_stages = decode_dpi_stages(&s);
+            }
+            // Asymmetric LOD first (device reports split mode); else symmetric level.
+            snap.lod_async = neuron::writes::lift_off_async(&d);
+            if snap.lod_async.is_none() {
+                snap.lod_level = neuron::writes::lift_off_distance(&d).ok().map(|l| l.min(2));
+            }
+            return snap;
+        }
+    }
+    snap
+}
+
+/// The transient row for a device whose adoption probe is in flight: honest name (the USB
+/// product string when the device offers one), "learning device…" as its mode, every control
+/// gated off. No device I/O — the probe thread owns the pipe.
+fn learning_row(i: &transport::HidDeviceInfo, instance: String) -> DeviceState {
+    let name = if i.product.trim().is_empty() {
+        format!("Razer device {:04x}", i.pid)
+    } else {
+        i.product.trim().to_string()
+    };
+    DeviceState {
+        name,
+        codename: "learning".into(),
+        pid: i.pid,
+        instance,
+        mode: "learning device…".into(),
+        connected: true,
+        firmware: "—".into(),
+        dpi: "—".into(),
+        polling: "—".into(),
+        brightness: "—".into(),
+        battery: String::new(),
+        charging: false,
+        storage: String::new(),
+        icon: "device",
+        dpi_n: None,
+        polling_n: None,
+        brightness_n: None,
+        battery_frac: None,
+        cap_dpi: false,
+        cap_poll: false,
+        cap_light: false,
+        cap_bright: false,
+        cap_bright_set: false,
+        cap_scroll: false,
+        cap_store: false,
+        cap_idle: false,
+        cap_plate: false,
+        adopting: true,
+    }
+}
+
 fn read_device_state(
     def: &DeviceDef,
     pid: u16,
@@ -1347,10 +1641,12 @@ fn read_device_state(
         cap_poll: def.supports(neuron::registry::Capability::SetPolling),
         cap_light: def.supports(neuron::registry::Capability::Lighting),
         cap_bright: def.supports(neuron::registry::Capability::Brightness),
+        cap_bright_set: def.supports(neuron::registry::Capability::SetBrightness),
         cap_scroll: def.supports(neuron::registry::Capability::SetScrollStage),
         cap_store: def.supports(neuron::registry::Capability::Storage),
         cap_idle: def.supports(neuron::registry::Capability::Battery),
         cap_plate: def.has_side_plates(),
+        adopting: false,
     };
     // Park this device's host lighting writer for the whole getter sweep —
     // without the gate, streaming frames clobber every getter's pending reply

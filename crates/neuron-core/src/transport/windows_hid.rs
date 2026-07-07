@@ -14,7 +14,8 @@ use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
 };
 use windows_sys::Win32::Devices::HumanInterfaceDevice::{
     HidD_FreePreparsedData, HidD_GetAttributes, HidD_GetFeature, HidD_GetHidGuid,
-    HidD_GetPreparsedData, HidD_SetFeature, HidP_GetCaps, HIDD_ATTRIBUTES, HIDP_CAPS,
+    HidD_GetPreparsedData, HidD_GetProductString, HidD_SetFeature, HidP_GetCaps,
+    HIDD_ATTRIBUTES, HIDP_CAPS,
 };
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
@@ -72,6 +73,20 @@ unsafe fn query(path: &[u16]) -> Option<HidDeviceInfo> {
         if HidD_GetPreparsedData(h, &mut pp) != 0 {
             let mut caps: HIDP_CAPS = std::mem::zeroed();
             if HidP_GetCaps(pp, &mut caps) == HIDP_OK {
+                // Product string (IOCTL_HID_GET_PRODUCT_STRING is FILE_ANY_ACCESS, so it works
+                // on this access-0 handle like Get/SetFeature). Best-effort: empty on failure.
+                let mut prod = [0u16; 127];
+                let product = if HidD_GetProductString(
+                    h,
+                    prod.as_mut_ptr() as *mut c_void,
+                    (prod.len() * 2) as u32,
+                ) != 0
+                {
+                    let end = prod.iter().position(|&c| c == 0).unwrap_or(prod.len());
+                    String::from_utf16_lossy(&prod[..end]).trim().to_string()
+                } else {
+                    String::new()
+                };
                 info = Some(HidDeviceInfo {
                     vid: attr.VendorID,
                     pid: attr.ProductID,
@@ -81,6 +96,7 @@ unsafe fn query(path: &[u16]) -> Option<HidDeviceInfo> {
                     // `path` is the NUL-terminated wide buffer from `wide_from_ptr`; store it as the
                     // opaque key (NUL stripped) — `WinHid::open` re-adds it via `to_wide_nul`.
                     path: DevicePath::from_wide(path),
+                    product,
                 });
             }
             HidD_FreePreparsedData(pp);

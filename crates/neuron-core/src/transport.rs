@@ -62,6 +62,10 @@ pub struct HidDeviceInfo {
     pub usage: u16,
     pub feature_len: u16,
     pub path: DevicePath, // platform-opaque handle key
+    /// The device's own USB product string (e.g. "Razer Naga V2 Pro"), empty when the
+    /// OS/device doesn't offer one. Used to give auto-synthesized device defs an honest
+    /// name instead of a bare pid.
+    pub product: String,
 }
 
 impl HidDeviceInfo {

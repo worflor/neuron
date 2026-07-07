@@ -176,12 +176,16 @@ impl DpiStage {
     }
 }
 
-/// Build the DPI-stage SET payload from a stage list and the active index.
+/// Build the DPI-stage SET payload from a stage list and the active index (0-based API).
 ///
 /// Layout (the exact inverse of the proven read at 0x04/0x83):
-/// `[varstore, active_idx, count, {stage_id, X_hi, X_lo, Y_hi, Y_lo, 0, 0} * count]`.
-/// `stage_id` is 1-based (Synapse numbers stages 1..=N). The buffer is `DPI_STAGES_SIZE` long;
-/// unused stage slots stay zero. Pure (no I/O) so the byte construction is unit-testable.
+/// `[varstore, active(1-BASED), count, {stage_id, X_hi, X_lo, Y_hi, Y_lo, 0, 0} * count]`.
+/// BOTH `stage_id` and the active byte are 1-based on the wire (Synapse numbers stages 1..=N).
+/// PROBED LIVE (Naga V2 Pro, 2026-07-06): an active byte of 0 makes the firmware REJECT the whole
+/// write with FAIL — every all-defaults write failed until the byte was 1. The earlier "proven"
+/// round-trips happened to carry a nonzero byte, which is how the 0-based encoding slipped
+/// through. The buffer is `DPI_STAGES_SIZE` long; unused stage slots stay zero. Pure (no I/O) so
+/// the byte construction is unit-testable.
 pub fn build_dpi_stages_payload(
     stages: &[DpiStage],
     active_idx: u8,
@@ -201,7 +205,7 @@ pub fn build_dpi_stages_payload(
     let active = active_idx.min(count.saturating_sub(1));
     let mut buf = vec![0u8; DPI_STAGES_SIZE as usize];
     buf[0] = store.byte();
-    buf[1] = active;
+    buf[1] = active + 1; // 1-based on the wire — 0 is REJECTED by the firmware (probed live)
     buf[2] = count;
     for (i, s) in stages.iter().enumerate() {
         let off = 3 + i * DPI_STAGE_STRIDE;
@@ -1046,7 +1050,7 @@ mod tests {
             "buffer is the full table size"
         );
         assert_eq!(p[0], 0x01, "varstore = persist");
-        assert_eq!(p[1], 1, "active index");
+        assert_eq!(p[1], 2, "active byte is 1-BASED on the wire (API idx 1 = stage 2)");
         assert_eq!(p[2], 2, "count");
         // stage 0: id=1, X=800 (0x0320), Y=800
         assert_eq!(&p[3..10], &[0x01, 0x03, 0x20, 0x03, 0x20, 0x00, 0x00]);
@@ -1080,7 +1084,7 @@ mod tests {
     fn dpi_stages_active_clamped_to_count() {
         let stages = [DpiStage::symmetric(800)];
         let p = build_dpi_stages_payload(&stages, 9, Store::Volatile).unwrap();
-        assert_eq!(p[1], 0, "active index clamps to the last valid stage");
+        assert_eq!(p[1], 1, "active clamps to the last valid stage (wire 1-based: stage 1)");
     }
 
     #[test]
@@ -1175,7 +1179,7 @@ mod tests {
         ];
         let p = build_dpi_stages_payload(&five, 4, Store::Volatile).unwrap();
         assert_eq!(p[2], 5, "count");
-        assert_eq!(p[1], 4, "active = last");
+        assert_eq!(p[1], 5, "active = last (wire 1-based: stage 5)");
         // The 5th record's id is 5 and sits at offset 3 + 4*7 = 31.
         assert_eq!(p[31], 0x05);
         // 3 (header) + 5*7 (records) = 38 = the full buffer; nothing left over.

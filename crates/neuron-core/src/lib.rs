@@ -2,7 +2,10 @@
 //!
 //! Design principle: **semantics in code, wiring in data**. Capability *types* live in
 //! Rust (typed, testable); every device-specific detail (VID/PIDs, transaction-id,
-//! command class/id, control interface) lives in `devices/*.toml`. New device = new TOML.
+//! command class/id, control interface) lives in `devices/*.toml`. New device = plug it
+//! in: [`synth`] probes its getter space and writes `devices/auto/<pid>.toml` for it
+//! automatically — the TOML is per-device *config* (editable, curatable), not a
+//! prerequisite for discovery.
 //!
 //! ## The unified spine
 //! Every input source — device buttons, hotkeys, [`spellweaving`] (drawn glyphs *and* their
@@ -64,6 +67,7 @@ pub mod shapes;
 pub mod spectrum;
 pub mod spellweaving;
 pub mod synapse;
+pub mod synth;
 pub mod sys_stats;
 pub mod tone;
 pub mod transport;

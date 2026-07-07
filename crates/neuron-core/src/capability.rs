@@ -142,9 +142,40 @@ pub fn set_polling_hz_hires(dev: &Device, hz: u32) -> Result<u32> {
 }
 
 /// Set lighting brightness as a 0..=100 percentage (visible LED region).
+///
+/// Two honest write paths, decided by the device's DATA: matrix-era boards expose a top-level
+/// `set_brightness` command ([varstore, led 0x04, level]); legacy boards wire brightness inside
+/// the `[lighting]` block instead (the BlackWidow's 0x03/0x03 with its own baked [varstore, led]
+/// prefix). The old matrix-only path made the GUI's apply fail on the keyboard with "has no
+/// command 'set_brightness'" even though the board CAN set brightness — a dialect leak, not a
+/// missing capability.
+///
+/// The `store` parameter applies to the TOP-LEVEL-command dialect only. The lighting-block
+/// fallback uses the SPEC'S OWN baked varstore byte (the legacy dialect's single hardware-proven
+/// layout, e.g. the BlackWidow's `args = [0x01, 0x05]`); `store` is deliberately NOT spliced into
+/// that legacy prefix, because a volatile-varstore legacy brightness write is an unproven byte
+/// combination this write path refuses to invent (verify-gated culture: no unproven bytes on the
+/// wire).
 pub fn set_brightness(dev: &Device, pct: u8, store: Store) -> Result<()> {
     let level = (pct.min(100) as u16 * 255 / 100) as u8;
-    dev.run_args("set_brightness", &[store.byte(), 0x04, level])?;
+    if dev.def.has_command("set_brightness") {
+        dev.run_args("set_brightness", &[store.byte(), 0x04, level])?;
+        return Ok(());
+    }
+    let Some(spec) = dev.def.lighting.as_ref().and_then(|l| l.brightness.as_ref()) else {
+        anyhow::bail!("device '{}' has no brightness write path", dev.def.name);
+    };
+    // the spec's args are the full dialect prefix (e.g. legacy [0x01 varstore, 0x05 led]);
+    // only the level is appended — the registry data owns the layout, not this code.
+    let mut args = spec.args.clone();
+    args.push(level);
+    dev.exec_dynamic_tx(
+        spec.transaction_id.unwrap_or(dev.def.transaction_id),
+        spec.class,
+        spec.id,
+        spec.size,
+        &args,
+    )?;
     Ok(())
 }
 

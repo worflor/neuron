@@ -205,7 +205,7 @@ pub enum Protocol {
 
 /// Per-device lighting definition (registry TOML `[lighting]`). Semantics are in code; these
 /// opcodes/dims/effect-ids are the only device-specific bits.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct LightingDef {
     pub protocol: Protocol,
     pub rows: u8,

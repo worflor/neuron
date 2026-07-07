@@ -532,18 +532,92 @@ export component DevicePanel inherits VerticalLayout {
                             Mono { text: State.selected-device-name; color: Theme.text-faint; overflow: elide; }
                         }
                         Mono { text: "the selected endpoint's live level (Core Audio) · moves THIS device, not the system default"; color: Theme.text-faint; wrap: word-wrap; }
-                        Slider {
-                            caption: "VOLUME";
-                            minimum: 0; maximum: 100; value: State.device-volume; step: 2;
-                            // readout tracks the drag; the endpoint write (a COM round-trip) fires ONCE
-                            // on release, not per drag-tick — same "one write per gesture" rule as sniper.
-                            changed(v) => { State.device-volume = v; }
-                            released(v) => { State.set-device-volume(v); }
+                        // dim the fader when the channel is muted so the dead channel READS dead — it stays
+                        // interactive (we don't expect an unmute-by-drag), it just quiets to gated opacity.
+                        VerticalLayout {
+                            opacity: State.device-muted ? Theme.dim-gated : 1.0;
+                            animate opacity { duration: Theme.quick; }
+                            Slider {
+                                caption: "VOLUME";
+                                minimum: 0; maximum: 100; value: State.device-volume; step: 2;
+                                // readout tracks the drag; the endpoint write (a COM round-trip) fires ONCE
+                                // on release, not per drag-tick — same "one write per gesture" rule as sniper.
+                                changed(v) => { State.device-volume = v; }
+                                released(v) => { State.set-device-volume(v); }
+                            }
                         }
-                        HorizontalLayout {
-                            Button { text: State.device-muted ? "unmute" : "mute"; clicked => { State.toggle-device-mute(); } }
-                            Rectangle {}
-                            VerticalLayout { alignment: center; Pill { text: State.device-muted ? "MUTED" : "LIVE"; live: !State.device-muted; tint: Theme.warn; } }
+                        // channel state as ONE two-cell switch bank (LIVE ↔ MUTED), not a loose button +
+                        // status pill: a fused hairline rail, the current cell lit (LIVE phosphor, MUTED
+                        // warn — a silenced channel isn't "live"). Clicking the OTHER cell toggles; clicking
+                        // the cell that already holds does nothing (no redundant round-trip).
+                        Rectangle {
+                            height: Theme.row-h-sm;
+                            border-radius: Theme.radius-sm;
+                            border-width: Theme.hair;
+                            border-color: Theme.line;
+                            clip: true;
+                            HorizontalLayout {
+                                spacing: 0;
+                                live-cell := Rectangle {
+                                    horizontal-stretch: 1;
+                                    property <bool> on: !State.device-muted;
+                                    background: live-cell.on ? Theme.accent-glow : (liveta.has-hover ? Theme.well : transparent);
+                                    animate background { duration: Theme.quick; }
+                                    HorizontalLayout {
+                                        spacing: 6px; alignment: center;
+                                        Rectangle {
+                                            width: Theme.dot; height: Theme.dot; border-radius: 1px;
+                                            // self-center vertically — a fixed-size layout child top-aligns
+                                            // otherwise (the lamp floated at the cell ceiling); Pill's idiom.
+                                            y: (parent.height - self.height) / 2;
+                                            background: live-cell.on ? Theme.accent : Theme.text-faint.with-alpha(0.5);
+                                            animate background { duration: Theme.quick; }
+                                        }
+                                        Text {
+                                            text: "LIVE";
+                                            vertical-alignment: center;
+                                            color: live-cell.on ? Theme.accent : Theme.text-dim;
+                                            font-size: Theme.fs-small; font-weight: 700; font-family: Theme.mono;
+                                            letter-spacing: Theme.track-2;
+                                            animate color { duration: Theme.quick; }
+                                        }
+                                    }
+                                    liveta := TouchArea {
+                                        mouse-cursor: MouseCursor.pointer;
+                                        clicked => { if (State.device-muted) { State.toggle-device-mute(); } }
+                                    }
+                                }
+                                // the seam between the two states
+                                Rectangle { width: Theme.hair; background: Theme.line; }
+                                mute-cell := Rectangle {
+                                    horizontal-stretch: 1;
+                                    property <bool> on: State.device-muted;
+                                    background: mute-cell.on ? Theme.warn.with-alpha(0.1) : (muteta.has-hover ? Theme.well : transparent);
+                                    animate background { duration: Theme.quick; }
+                                    HorizontalLayout {
+                                        spacing: 6px; alignment: center;
+                                        Rectangle {
+                                            width: Theme.dot; height: Theme.dot; border-radius: 1px;
+                                            // self-center vertically (fixed-size layout children top-align).
+                                            y: (parent.height - self.height) / 2;
+                                            background: mute-cell.on ? Theme.warn : Theme.text-faint.with-alpha(0.5);
+                                            animate background { duration: Theme.quick; }
+                                        }
+                                        Text {
+                                            text: "MUTED";
+                                            vertical-alignment: center;
+                                            color: mute-cell.on ? Theme.warn : Theme.text-dim;
+                                            font-size: Theme.fs-small; font-weight: 700; font-family: Theme.mono;
+                                            letter-spacing: Theme.track-2;
+                                            animate color { duration: Theme.quick; }
+                                        }
+                                    }
+                                    muteta := TouchArea {
+                                        mouse-cursor: MouseCursor.pointer;
+                                        clicked => { if (!State.device-muted) { State.toggle-device-mute(); } }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -556,7 +630,7 @@ export component DevicePanel inherits VerticalLayout {
                 // (its stage cycle folded in beneath the fader); the rest live as a compact 2-up tile
                 // grid. NO per-control applies — ONE global [ reload | apply ] commits the whole tier
                 // (sniper auto-saves + persist is immediate, so they ride their own writes, not apply).
-                if (State.sel-can-dpi || State.sel-can-poll || State.sel-can-light || State.sel-can-store) : Card {
+                if (State.sel-can-dpi || State.sel-can-poll || State.sel-can-bright-set || State.sel-can-store) : Card {
                     VerticalLayout {
                         padding: 12px;
                         spacing: 14px;
@@ -614,18 +688,39 @@ export component DevicePanel inherits VerticalLayout {
                                     }
                                 }
                             }
-                            // pick which stage is ACTIVE — the cycle's second half, the i+1:stage pills.
+                            // pick which stage is ACTIVE — the cycle's second half. The stage numbers are
+                            // ONE selector bank, so they ride a content-hugging fused rail (label outside,
+                            // stretch spacer trailing so the rail hugs its cells instead of spanning).
                             HorizontalLayout {
                                 spacing: 6px;
                                 Mono { text: "stage"; color: Theme.text-faint; }
-                                for s[i] in State.dpi-stage-nums : Pill {
-                                    // compact stage NUMBER — the per-stage DPI values already live in the
-                                    // field above, and "i:value" chips overflowed + ellipsized ("1:8…")
-                                    // once a device exposed 5 stages with a wide value.
-                                    text: "" + (i + 1);
-                                    selected: i == State.dpi-active-stage;
-                                    clickable: true;
-                                    clicked => { State.dpi-active-stage = i; }
+                                Rectangle {
+                                    height: Theme.row-h-sm;
+                                    border-radius: Theme.radius-sm;
+                                    border-width: Theme.hair;
+                                    border-color: Theme.line;
+                                    clip: true;
+                                    HorizontalLayout {
+                                        spacing: 0;
+                                        for s[i] in State.dpi-stage-nums : stg-cell := Rectangle {
+                                            // compact stage NUMBER — the per-stage DPI values already live
+                                            // in the field above ("i:value" chips overflowed once a device
+                                            // exposed 5 stages with a wide value).
+                                            min-width: 34px;
+                                            property <bool> on: i == State.dpi-active-stage;
+                                            background: stg-cell.on ? Theme.accent-glow : (stg-ta.has-hover ? Theme.well : transparent);
+                                            animate background { duration: Theme.quick; }
+                                            if i > 0 : Rectangle { x: 0; width: Theme.hair; background: Theme.line; }
+                                            Text {
+                                                text: "" + (i + 1);
+                                                vertical-alignment: center; horizontal-alignment: center;
+                                                color: stg-cell.on ? Theme.accent : Theme.text-dim;
+                                                font-size: Theme.fs-small; font-weight: 700; font-family: Theme.mono;
+                                                animate color { duration: Theme.quick; }
+                                            }
+                                            stg-ta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { State.dpi-active-stage = i; } }
+                                        }
+                                    }
                                 }
                                 Rectangle { horizontal-stretch: 1; min-width: 8px; }
                             }
@@ -638,7 +733,7 @@ export component DevicePanel inherits VerticalLayout {
                         // one cell read lopsided.
                         VerticalLayout {
                             spacing: 10px;
-                            if State.sel-can-poll || State.sel-can-light : HorizontalLayout {
+                            if State.sel-can-poll || State.sel-can-bright-set : HorizontalLayout {
                                 spacing: 10px;
                                 // REPORT RATE — DRAFT only now: pick sets State.polling-hz (the global
                                 // apply commits it via apply-polling), no per-press device write.
@@ -655,7 +750,7 @@ export component DevicePanel inherits VerticalLayout {
                                     }
                                 }
                                 // BRIGHTNESS — a compact fader, no per-control apply (global apply commits).
-                                if State.sel-can-light : FeelTile {
+                                if State.sel-can-bright-set : FeelTile {
                                     horizontal-stretch: 1;
                                     term: "BRIGHTNESS";
                                     readout: round(State.brightness) + "%";
@@ -703,19 +798,43 @@ export component DevicePanel inherits VerticalLayout {
                                     // ONE config write per gesture, not one per drag-tick
                                     released(v) => { State.save-sniper(v); }
                                 }
+                                // preset DPIs are ONE selector bank — a content-hugging fused rail (label
+                                // outside, trailing stretch spacer so the rail hugs its cells).
                                 if State.dpi-stage-nums.length > 0 : HorizontalLayout {
                                     spacing: 6px;
                                     Mono { text: "presets"; color: Theme.text-faint; }
-                                    for s in State.dpi-stage-nums : Pill {
-                                        text: "" + s;
-                                        selected: s == State.sniper-dpi;
-                                        clickable: true;
-                                        clicked => {
-                                            State.sniper-dpi = s;
-                                            State.save-sniper(s);
+                                    Rectangle {
+                                        height: Theme.row-h-sm;
+                                        border-radius: Theme.radius-sm;
+                                        border-width: Theme.hair;
+                                        border-color: Theme.line;
+                                        clip: true;
+                                        HorizontalLayout {
+                                            spacing: 0;
+                                            for s[i] in State.dpi-stage-nums : snp-cell := Rectangle {
+                                                min-width: 48px;
+                                                property <bool> on: s == State.sniper-dpi;
+                                                background: snp-cell.on ? Theme.accent-glow : (snp-ta.has-hover ? Theme.well : transparent);
+                                                animate background { duration: Theme.quick; }
+                                                if i > 0 : Rectangle { x: 0; width: Theme.hair; background: Theme.line; }
+                                                Text {
+                                                    text: "" + s;
+                                                    vertical-alignment: center; horizontal-alignment: center;
+                                                    color: snp-cell.on ? Theme.accent : Theme.text-dim;
+                                                    font-size: Theme.fs-small; font-weight: 700; font-family: Theme.mono;
+                                                    animate color { duration: Theme.quick; }
+                                                }
+                                                snp-ta := TouchArea {
+                                                    mouse-cursor: MouseCursor.pointer;
+                                                    clicked => {
+                                                        State.sniper-dpi = s;
+                                                        State.save-sniper(s);
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
-                                    Rectangle {}
+                                    Rectangle { horizontal-stretch: 1; }
                                 }
                             }
                             // PERSIST — the onboard-memory toggle, full-width + slim. An IMMEDIATE write
@@ -743,36 +862,54 @@ export component DevicePanel inherits VerticalLayout {
                         spacing: 13px;
                         SectionTitle { text: "KEY GUARD"; }
                         Mono { text: "swallow OS chords mid-game so they can't yank you out (host-side, no device write)."; color: Theme.text-faint; wrap: word-wrap; }
-                        HorizontalLayout {
-                            spacing: 7px;
-                            for g in [
-                                { l: "Alt+Tab", on: State.disable-alt-tab },
-                                { l: "Win", on: State.disable-win },
-                                { l: "Alt+F4", on: State.disable-alt-f4 },
-                                { l: "Alt+Esc", on: State.disable-alt-esc },
-                            ] : Rectangle {
-                                height: 28px;
-                                horizontal-stretch: 1;
-                                border-radius: Theme.radius-sm;
-                                background: g.on ? Theme.accent-glow : (gta.has-hover ? Theme.well : transparent);
-                                border-width: Theme.hair;
-                                border-color: g.on ? Theme.accent-line : (gta.has-hover ? Theme.text-faint : Theme.line);
-                                animate background, border-color { duration: Theme.quick; }
-                                Text {
-                                    text: g.l;
-                                    x: 0; width: 100%;
-                                    horizontal-alignment: center; vertical-alignment: center;
-                                    color: g.on ? Theme.accent : Theme.text-dim;
-                                    font-size: Theme.fs-small; font-weight: 700; font-family: Theme.mono;
-                                }
-                                gta := TouchArea {
-                                    mouse-cursor: MouseCursor.pointer;
-                                    clicked => {
-                                        if (g.l == "Alt+Tab") { State.disable-alt-tab = !State.disable-alt-tab; }
-                                        else if (g.l == "Win") { State.disable-win = !State.disable-win; }
-                                        else if (g.l == "Alt+F4") { State.disable-alt-f4 = !State.disable-alt-f4; }
-                                        else { State.disable-alt-esc = !State.disable-alt-esc; }
-                                        State.apply-gaming-mode();
+                        // the four chords are ONE multi-select switch bank (several can be swallowed at
+                        // once), fused into a single hairline rail with 1px seams — the SplitToggle
+                        // grammar. Each cell wears a lamp dot so a MULTI-lit bank stays legible (an
+                        // accent-fill alone can't show "two of four on" the way lit lamps can).
+                        Rectangle {
+                            height: 28px;
+                            border-radius: Theme.radius-sm;
+                            border-width: Theme.hair;
+                            border-color: Theme.line;
+                            clip: true;
+                            HorizontalLayout {
+                                spacing: 0;
+                                for g[i] in [
+                                    { l: "Alt+Tab", on: State.disable-alt-tab },
+                                    { l: "Win", on: State.disable-win },
+                                    { l: "Alt+F4", on: State.disable-alt-f4 },
+                                    { l: "Alt+Esc", on: State.disable-alt-esc },
+                                ] : Rectangle {
+                                    horizontal-stretch: 1;
+                                    background: g.on ? Theme.accent-glow : (kg-ta.has-hover ? Theme.well : transparent);
+                                    animate background { duration: Theme.quick; }
+                                    if i > 0 : Rectangle { x: 0; width: Theme.hair; background: Theme.line; }
+                                    HorizontalLayout {
+                                        spacing: 6px; alignment: center;
+                                        Rectangle {
+                                            width: Theme.dot; height: Theme.dot; border-radius: 1px;
+                                            // self-center vertically (fixed-size layout children top-align).
+                                            y: (parent.height - self.height) / 2;
+                                            background: g.on ? Theme.accent : Theme.text-faint.with-alpha(0.5);
+                                            animate background { duration: Theme.quick; }
+                                        }
+                                        Text {
+                                            text: g.l;
+                                            vertical-alignment: center;
+                                            color: g.on ? Theme.accent : Theme.text-dim;
+                                            font-size: Theme.fs-small; font-weight: 700; font-family: Theme.mono;
+                                            animate color { duration: Theme.quick; }
+                                        }
+                                    }
+                                    kg-ta := TouchArea {
+                                        mouse-cursor: MouseCursor.pointer;
+                                        clicked => {
+                                            if (g.l == "Alt+Tab") { State.disable-alt-tab = !State.disable-alt-tab; }
+                                            else if (g.l == "Win") { State.disable-win = !State.disable-win; }
+                                            else if (g.l == "Alt+F4") { State.disable-alt-f4 = !State.disable-alt-f4; }
+                                            else { State.disable-alt-esc = !State.disable-alt-esc; }
+                                            State.apply-gaming-mode();
+                                        }
                                     }
                                 }
                             }
@@ -843,13 +980,40 @@ export component DevicePanel inherits VerticalLayout {
                                     clicked => { State.apply-scroll-stages(State.scroll-stages); }
                                 }
                             }
+                            // the wheel-mode presets are ONE selector bank — a content-hugging fused rail
+                            // trailing the note (the stretch spacer keeps it hugging its cells on the right).
                             HorizontalLayout {
                                 spacing: 6px;
                                 Mono { text: State.scroll-stages-note; color: State.scroll-stages-valid ? Theme.text-faint : Theme.danger; overflow: elide; min-width: 0px; }
                                 Rectangle { horizontal-stretch: 1; min-width: 8px; }
-                                Pill { text: "tactile/free"; clickable: true; clicked => { State.scroll-stages = "tactile/free"; State.scroll-stages-edited(State.scroll-stages); } }
-                                Pill { text: "tactile"; clickable: true; clicked => { State.scroll-stages = "tactile"; State.scroll-stages-edited(State.scroll-stages); } }
-                                Pill { text: "free"; clickable: true; clicked => { State.scroll-stages = "free"; State.scroll-stages-edited(State.scroll-stages); } }
+                                Rectangle {
+                                    height: Theme.row-h-sm;
+                                    border-radius: Theme.radius-sm;
+                                    border-width: Theme.hair;
+                                    border-color: Theme.line;
+                                    clip: true;
+                                    HorizontalLayout {
+                                        spacing: 0;
+                                        for m[i] in ["tactile/free", "tactile", "free"] : whl-cell := Rectangle {
+                                            min-width: 52px;
+                                            property <bool> on: State.scroll-stages == m;
+                                            background: whl-cell.on ? Theme.accent-glow : (whl-ta.has-hover ? Theme.well : transparent);
+                                            animate background { duration: Theme.quick; }
+                                            if i > 0 : Rectangle { x: 0; width: Theme.hair; background: Theme.line; }
+                                            Text {
+                                                text: m;
+                                                vertical-alignment: center; horizontal-alignment: center;
+                                                color: whl-cell.on ? Theme.accent : Theme.text-dim;
+                                                font-size: Theme.fs-small; font-weight: 700; font-family: Theme.mono;
+                                                animate color { duration: Theme.quick; }
+                                            }
+                                            whl-ta := TouchArea {
+                                                mouse-cursor: MouseCursor.pointer;
+                                                clicked => { State.scroll-stages = m; State.scroll-stages-edited(State.scroll-stages); }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                         if root.adv-wheel && (root.adv-sleep || root.adv-sensor) : Divider { }
@@ -887,24 +1051,49 @@ export component DevicePanel inherits VerticalLayout {
                                     clicked => { State.apply-idle(State.idle-secs); }
                                 }
                             }
+                            // idle presets are ONE selector bank — a content-hugging fused rail (label
+                            // outside, trailing stretch spacer so the rail hugs its cells).
                             HorizontalLayout {
                                 spacing: 6px;
                                 Mono { text: "presets"; color: Theme.text-faint; }
-                                for p in [
-                                    { l: "never", s: "0" },
-                                    { l: "1m", s: "60" },
-                                    { l: "5m", s: "300" },
-                                    { l: "15m", s: "900" },
-                                    { l: "1h", s: "3600" },
-                                ] : Pill {
-                                    text: p.l;
-                                    selected: State.idle-secs-text == p.s;
-                                    clickable: true;
-                                    clicked => {
-                                        State.idle-secs-text = p.s;
-                                        State.idle-edited(State.idle-secs-text);
+                                Rectangle {
+                                    height: Theme.row-h-sm;
+                                    border-radius: Theme.radius-sm;
+                                    border-width: Theme.hair;
+                                    border-color: Theme.line;
+                                    clip: true;
+                                    HorizontalLayout {
+                                        spacing: 0;
+                                        for p[i] in [
+                                            { l: "never", s: "0" },
+                                            { l: "1m", s: "60" },
+                                            { l: "5m", s: "300" },
+                                            { l: "15m", s: "900" },
+                                            { l: "1h", s: "3600" },
+                                        ] : slp-cell := Rectangle {
+                                            min-width: 44px;
+                                            property <bool> on: State.idle-secs-text == p.s;
+                                            background: slp-cell.on ? Theme.accent-glow : (slp-ta.has-hover ? Theme.well : transparent);
+                                            animate background { duration: Theme.quick; }
+                                            if i > 0 : Rectangle { x: 0; width: Theme.hair; background: Theme.line; }
+                                            Text {
+                                                text: p.l;
+                                                vertical-alignment: center; horizontal-alignment: center;
+                                                color: slp-cell.on ? Theme.accent : Theme.text-dim;
+                                                font-size: Theme.fs-small; font-weight: 700; font-family: Theme.mono;
+                                                animate color { duration: Theme.quick; }
+                                            }
+                                            slp-ta := TouchArea {
+                                                mouse-cursor: MouseCursor.pointer;
+                                                clicked => {
+                                                    State.idle-secs-text = p.s;
+                                                    State.idle-edited(State.idle-secs-text);
+                                                }
+                                            }
+                                        }
                                     }
                                 }
+                                Rectangle { horizontal-stretch: 1; }
                             }
                         }
                         if root.adv-sleep && root.adv-sensor : Divider { }
@@ -958,30 +1147,13 @@ export component DevicePanel inherits VerticalLayout {
                                 index: State.lod-async ? 1 : 0;
                                 picked(i) => { State.lod-async = i == 1; }
                             }
-                            // EVEN (symmetric) — the low/medium/high pills.
-                            if !State.lod-async : HorizontalLayout {
-                                spacing: 6px;
-                                Pill {
-                                    text: "low";
-                                    selected: State.lod-level == 0;
-                                    clickable: true;
-                                    enabled: !State.writes-paused;
-                                    clicked => { State.lod-level = 0; State.apply-lod(0); }
-                                }
-                                Pill {
-                                    text: "medium";
-                                    selected: State.lod-level == 1;
-                                    clickable: true;
-                                    enabled: !State.writes-paused;
-                                    clicked => { State.lod-level = 1; State.apply-lod(1); }
-                                }
-                                Pill {
-                                    text: "high";
-                                    selected: State.lod-level == 2;
-                                    clickable: true;
-                                    enabled: !State.writes-paused;
-                                    clicked => { State.lod-level = 2; State.apply-lod(2); }
-                                }
+                            // EVEN (symmetric) — an index pick over low/medium/high, so it's the real
+                            // SplitToggle bank (gated with the shared enabled seam), not three loose pills.
+                            if !State.lod-async : SplitToggle {
+                                options: ["low", "medium", "high"];
+                                index: State.lod-level;
+                                enabled: !State.writes-paused;
+                                picked(i) => { State.lod-level = i; State.apply-lod(i); }
                             }
                             // SPLIT (asymmetric) — two compact faders (LIFT 2..26 / LANDING 1..25), each with
                             // a readout, applying the PAIR on release (one write per gesture, like sniper).

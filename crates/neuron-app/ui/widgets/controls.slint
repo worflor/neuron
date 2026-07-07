@@ -368,41 +368,53 @@ export component Slider inherits Rectangle {
 // A row of DISCRETE contacts over the small fixed set a control can legally take (polling rates,
 // HyperPolling tiers). The honest replacement for a fake-continuous fader whose readout shows
 // values the hardware can never run. The lit contact IS the current state.
-export component ContactRow inherits HorizontalLayout {
+//
+// It reads as ONE switch bank, not a scatter of buttons: a single hairline-framed rail, the cells
+// fused by 1px seams (no gaps, no per-cell borders) — the SplitToggle grammar, so a legal-value
+// selector never drifts into the generic bordered-chips look. The lit cell IS the current value.
+export component ContactRow inherits Rectangle {
     in property <[int]> options;
     in property <int> value;
     in property <string> unit: "";
     in property <bool> enabled: true;
     callback picked(int);
-    spacing: 6px;
-    for opt in root.options : Rectangle {
-        height: 28px;
-        // 36px FLOOR + stretch: at a normal column width the chips fill to ~52px (unchanged look), but
-        // a 7-contact row (in-game polling) can shrink to 7·36 + gaps ≈ 288px so it fits a narrow FEEL
-        // column instead of pinning a 400px hard minimum that overflows the two-column layout.
-        min-width: 36px;
-        horizontal-stretch: 1;
-        border-radius: Theme.radius-sm;
-        property <bool> on: root.value == opt;
-        background: self.on ? Theme.accent-glow : (cta.has-hover && root.enabled ? Theme.well : transparent);
-        border-width: Theme.hair;
-        border-color: self.on ? Theme.accent-line : (cta.has-hover && root.enabled ? Theme.text-faint : Theme.line);
-        animate background, border-color { duration: Theme.quick; }
-        Text {
-            text: opt + root.unit;
-            vertical-alignment: center;
-            horizontal-alignment: center;
-            // a disabled option stays LEGIBLE (text-dim) — the gated CONTEXT carries "off", not an
-            // unreadable decorative-faint that reads as a render glitch
-            color: parent.on ? Theme.accent : Theme.text-dim;
-            font-size: Theme.fs-small;
-            font-weight: 700;
-            font-family: Theme.mono;
-        }
-        cta := TouchArea {
-            enabled: root.enabled;
-            mouse-cursor: root.enabled ? MouseCursor.pointer : MouseCursor.default;
-            clicked => { root.picked(opt); }
+    height: 28px;
+    border-radius: Theme.radius-sm;
+    border-width: Theme.hair;
+    // the whole rail quiets its frame when gated — the bank reads "off" as one object, not per-cell
+    border-color: root.enabled ? Theme.line : Theme.line-soft;
+    clip: true;   // square the fused cells to the rounded outline
+    animate border-color { duration: Theme.quick; }
+    HorizontalLayout {
+        spacing: 0;
+        for opt[i] in root.options : cell := Rectangle {
+            // 36px FLOOR + stretch: at a normal column width the cells fill to ~52px, but a 7-contact
+            // row (in-game polling) can shrink to 7·36 ≈ 252px so it fits a narrow FEEL column instead
+            // of pinning a hard minimum that overflows the two-column layout.
+            min-width: 36px;
+            horizontal-stretch: 1;
+            property <bool> on: root.value == opt;
+            background: cell.on ? Theme.accent-glow : (cta.has-hover && root.enabled ? Theme.well : transparent);
+            animate background { duration: Theme.quick; }
+            // the split — a hairline at the seam (every cell but the first), no gap between contacts
+            if i > 0 : Rectangle { x: 0; width: Theme.hair; background: Theme.line; }
+            Text {
+                text: opt + root.unit;
+                vertical-alignment: center;
+                horizontal-alignment: center;
+                // a disabled option stays LEGIBLE (text-dim) — the gated CONTEXT carries "off", not an
+                // unreadable decorative-faint that reads as a render glitch
+                color: cell.on ? Theme.accent : (cta.has-hover && root.enabled ? Theme.text-mid : Theme.text-dim);
+                font-size: Theme.fs-small;
+                font-weight: 700;
+                font-family: Theme.mono;
+                animate color { duration: Theme.quick; }
+            }
+            cta := TouchArea {
+                enabled: root.enabled;
+                mouse-cursor: root.enabled ? MouseCursor.pointer : MouseCursor.default;
+                clicked => { root.picked(opt); }
+            }
         }
     }
 }
@@ -1021,29 +1033,38 @@ export component Segment inherits HorizontalLayout {
 export component SplitToggle inherits Rectangle {
     in property <[string]> options;
     in property <int> index;
+    // when false the whole bank goes quiet + inert (a gated selector) — frame softens, ink faints,
+    // the TouchAreas stop reporting; mirrors the disabled key so a gated pick reads dead, not broken.
+    in property <bool> enabled: true;
     callback picked(int);
     height: Theme.row-h-sm;
     border-radius: Theme.radius-sm;
     border-width: Theme.hair;
-    border-color: Theme.line;
+    border-color: root.enabled ? Theme.line : Theme.line-soft;
     clip: true;   // square the inner halves to the rounded outline
+    animate border-color { duration: Theme.quick; }
     HorizontalLayout {
         spacing: 0;
         for opt[i] in root.options : seg := Rectangle {
             horizontal-stretch: 1;
             property <bool> on: i == root.index;
-            background: seg.on ? Theme.accent-glow : (sta.has-hover ? Theme.well : transparent);
+            background: seg.on ? Theme.accent-glow : (root.enabled && sta.has-hover ? Theme.well : transparent);
             animate background { duration: Theme.quick; }
             // the split — a hairline at the seam (every half but the first)
             if i > 0 : Rectangle { x: 0; width: Theme.hair; background: Theme.line; }
             Text {
                 text: opt;
                 vertical-alignment: center; horizontal-alignment: center;
-                color: seg.on ? Theme.accent : (sta.has-hover ? Theme.text-mid : Theme.text-dim);
+                color: !root.enabled ? Theme.text-faint
+                    : seg.on ? Theme.accent : (sta.has-hover ? Theme.text-mid : Theme.text-dim);
                 font-size: Theme.fs-small; font-weight: 700; font-family: Theme.mono;
                 letter-spacing: Theme.track-2;
             }
-            sta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.picked(i); } }
+            sta := TouchArea {
+                enabled: root.enabled;
+                mouse-cursor: root.enabled ? MouseCursor.pointer : MouseCursor.default;
+                clicked => { root.picked(i); }
+            }
         }
     }
 }

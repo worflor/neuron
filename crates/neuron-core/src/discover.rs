@@ -84,37 +84,9 @@ pub struct DeviceFp {
     pub cmds: Vec<(u8, u8, &'static str)>,
 }
 
-impl DeviceFp {
-    /// Emit a registry TOML skeleton for this device — the self-onboarding loop. Commands
-    /// are the discovered getters (RE fills semantic names + decoders later).
-    pub fn to_toml_skeleton(&self) -> String {
-        let mut s = String::new();
-        s.push_str(&format!(
-            "# auto-discovered skeleton for VID {:04x} PID {:04x}\n",
-            self.vid, self.pid
-        ));
-        s.push_str(&format!(
-            "name = \"Razer device {:04x} (auto)\"\n",
-            self.pid
-        ));
-        s.push_str("codename = \"unknown\"\n");
-        s.push_str(&format!("vendor_id = 0x{:04X}\n", self.vid));
-        s.push_str("transaction_id = 0x1F\n\n");
-        s.push_str("[[modes]]\nname = \"default\"\n");
-        s.push_str(&format!("product_id = 0x{:04X}\n\n", self.pid));
-        s.push_str("[control_interface]\n");
-        s.push_str(&format!("usage_page = 0x{:04X}\n", self.usage_page));
-        s.push_str(&format!("usage = 0x{:04X}\n", self.usage));
-        s.push_str("feature_report_len = 91\n\n");
-        for (c, id, kind) in &self.cmds {
-            s.push_str(&format!(
-                "# {kind} ({})\n[commands.get_{c:02x}_{id:02x}]\nclass = 0x{c:02X}\nid = 0x{id:02X}\nsize = 0x20\n\n",
-                class_hint(*c)
-            ));
-        }
-        s
-    }
-}
+// NOTE: the old `to_toml_skeleton` self-onboarding stub lived here — it emitted opaque
+// `get_XX_YY` getter lists that still needed hand-RE before a device worked. Superseded by
+// [`crate::synth`], which synthesizes a COMPLETE, immediately-usable def from the same probe.
 
 /// Probe one control pipe's getter space (classes × ids 0x80..0x8F, read-only).
 pub fn fingerprint(t: &dyn Transport, tid: u8) -> (Vec<u8>, Vec<(u8, u8, &'static str)>) {
