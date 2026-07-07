@@ -1,5 +1,5 @@
 import { Theme } from "../theme.slint";
-import { Card, SectionTitle, Label, Button, Toggle, Pill, Mono, Divider, PanelHead, Slider, Segment, ColorPicker, Palette, Field } from "../widgets/controls.slint";
+import { Card, SectionTitle, Label, Button, Toggle, Pill, Mono, Divider, PanelHead, Slider, SplitToggle, SplitButton, Contact, SubLabel, ColorPicker, Palette, Field } from "../widgets/controls.slint";
 import { State } from "../state.slint";
 import { ChromaStreamRow, DiagRow } from "../models.slint";
 
@@ -9,7 +9,7 @@ component ObsMenuItem inherits Rectangle {
     in property <bool> lit: false;
     width: txt.preferred-width + 12px;
     height: 18px;
-    border-radius: 3px;
+    border-radius: Theme.radius-sm;
     background: lit ? Theme.accent-glow : transparent;
     border-width: lit ? Theme.hair : 0px;
     border-color: Theme.accent-line;
@@ -80,7 +80,7 @@ component ObsFinder inherits Rectangle {
             padding: 5px; spacing: 2px;
             Mono { text: "Auto-Configuration Wizard"; color: Theme.text-faint; font-size: Theme.fs-small; }
             Rectangle {
-                height: 20px; border-radius: 3px;
+                height: 20px; border-radius: Theme.radius-sm;
                 background: Theme.accent-glow; border-width: Theme.hair; border-color: Theme.accent-line;
                 Mono {
                     x: 6px; text: "WebSocket Server Settings"; color: Theme.accent;
@@ -171,18 +171,16 @@ component DiagCell inherits Rectangle {
                 border-width: self.hollow ? 1.5px : 0px;
                 border-color: Theme.warn;
             }
-            Text {
+            Mono {
                 text: root.d.name;
                 color: Theme.text;
                 font-size: Theme.fs-small;
-                font-family: Theme.mono;
                 font-weight: 700;
                 letter-spacing: Theme.track-2;
-                vertical-alignment: center;
                 overflow: elide;
             }
             Rectangle {}
-            Text {
+            Mono {
                 // the VERDICT, tracked-out caps — the thing the eye hunts reads as a verdict
                 text: root.d.state == "pass" ? "PASS"
                     : root.d.state == "fail" ? "FAIL"
@@ -192,17 +190,13 @@ component DiagCell inherits Rectangle {
                     : root.d.state == "skip" ? Theme.warn
                     : Theme.text-faint;
                 font-size: Theme.fs-small;
-                font-family: Theme.mono;
                 font-weight: 700;
                 letter-spacing: Theme.track-2;
-                vertical-alignment: center;
             }
         }
-        Text {
+        Mono {
             text: root.d.detail;
-            color: Theme.text-dim;
             font-size: Theme.fs-small;
-            font-family: Theme.mono;
             wrap: word-wrap;
             overflow: elide;
         }
@@ -294,6 +288,8 @@ component NotifPlacer inherits Rectangle {
 
     min-width: 348px; max-width: 348px;   // pin the mock screen's width (can't also set `width`)
     height: 196px;
+    // a deliberate monitor-bezel exception — a physical screen reads rounder than an instrument
+    // control, so this stays 7px rather than snapping to Theme.radius (4px).
     border-radius: 7px;
     background: @linear-gradient(180deg, Theme.bg-2 0%, Theme.bg 100%);   // a faint screen sheen
     border-width: Theme.hair;
@@ -380,48 +376,13 @@ component NotifPlacer inherits Rectangle {
     }
 }
 
-// One "which change earns a card" row — a full-width toggle chip (name + what it is + a lit dot), so
-// the event TYPES read as a tidy stack beside the placer instead of a cramped pill row.
-component NotifTypeChip inherits Rectangle {
-    in property <string> label;
-    in property <string> desc;
-    in property <bool> on;
-    callback toggled();
-    height: 24px;
-    border-radius: Theme.radius-sm;
-    background: root.on ? Theme.accent-glow : (ta.has-hover ? Theme.well : Theme.bg-2);
-    border-width: Theme.hair;
-    border-color: root.on ? Theme.accent-line : (ta.has-hover ? Theme.text-faint : Theme.line);
-    animate background, border-color { duration: Theme.quick; }
-    HorizontalLayout {
-        padding-left: 10px; padding-right: 10px; spacing: 9px;
-        VerticalLayout {
-            alignment: center;
-            Text { text: root.label; color: root.on ? Theme.accent : Theme.text-mid; font-family: Theme.mono; font-size: Theme.fs-small; font-weight: 700; vertical-alignment: center; }
-        }
-        VerticalLayout {
-            alignment: center; horizontal-stretch: 1;
-            Text { text: root.desc; color: Theme.text-faint; font-family: Theme.mono; font-size: Theme.fs-small; vertical-alignment: center; overflow: elide; }
-        }
-        VerticalLayout {
-            alignment: center;
-            Rectangle { width: 5px; height: 5px; border-radius: 3px; background: root.on ? Theme.accent : Theme.text-faint; animate background { duration: Theme.quick; } }
-        }
-    }
-    ta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.toggled(); } }
-}
-
 // The WHEN-SEVERAL-LAND preview — a mock "screen corner" that shows how multiple cards behave in the
 // chosen mode: STACK = a depth-stacked column (newest in front, brightest; older recede); LATEST = one
 // card; DIGEST = one card with a count + a row of source glyphs. A glanceable picture of the live mode.
-component NotifStackMock inherits Rectangle {
+component NotifStackMock inherits Card {
     in property <string> mode;
     width: 150px;
     height: 96px;
-    border-radius: Theme.radius;
-    background: Theme.bg-2;
-    border-width: Theme.hair;
-    border-color: Theme.line;
     clip: true;
     property <length> cw: 96px;
     property <length> pad: 9px;
@@ -522,6 +483,15 @@ component NotifStackMock inherits Rectangle {
 component SnapTapStage inherits Rectangle {
     in property <bool> live: false;        // REVEALED → the demo plays; LOCKED → frozen
     property <int> phase: 0;
+
+    // ── the demo's private timing scale — named so the choreography reads at a glance (each was tuned
+    // by eye; do NOT retime). The snap-INSTANT halves of the `snapping ? fast : …` ternaries stay
+    // inline — they're the crisp flip, semantically bound to the snap, not part of this settle scale. ──
+    property <duration> dur-settle: 360ms;   // the weighty glide — markers / lead-gap easing back to rest
+    property <duration> dur-lag:    380ms;   // the raw laggard's slow limp across the rail
+    property <duration> dur-warn:   300ms;   // the dead-zone flare + the trapped marker's warn tint
+    property <duration> dur-halo:   320ms;   // the accent hero's halo bloom
+    property <duration> dur-ticks:  220ms;   // the lead-gap measurement ticks fading in
 
     // ── INTERACTIVE DRIVE — once revealed, you can press-and-hold the [A]/[D] caps and drive the race
     // yourself: the snap lane snaps to the last-pressed instantly while the raw lane stalls in the
@@ -636,7 +606,7 @@ component SnapTapStage inherits Rectangle {
         background: Theme.warn.with-alpha(root.snapping ? 0.16 : 0.06);
         border-width: Theme.hair;
         border-color: Theme.warn.with-alpha(root.snapping ? 0.55 : 0.22);
-        animate background, border-color { duration: 300ms; easing: ease-out; }
+        animate background, border-color { duration: root.dur-warn; easing: ease-out; }
     }
 
     // ── the LEAD-GAP — THE SIGNATURE. A glowing accent band bridging the two lanes' x-positions:
@@ -655,8 +625,8 @@ component SnapTapStage inherits Rectangle {
         border-color: Theme.accent-line;
         opacity: root.gap-open ? 1.0 : 0.0;
         // bloom fast with the snap; fade as it collapses on catchup. width follows the markers' easing.
-        animate x { duration: root.snapping ? 90ms : 360ms; easing: root.snapping ? ease-out : ease-in-out; }
-        animate width { duration: root.snapping ? 90ms : 360ms; easing: root.snapping ? ease-out : ease-in-out; }
+        animate x { duration: root.snapping ? 90ms : root.dur-settle; easing: root.snapping ? ease-out : ease-in-out; }
+        animate width { duration: root.snapping ? 90ms : root.dur-settle; easing: root.snapping ? ease-out : ease-in-out; }
         animate opacity { duration: root.gap-open ? 140ms : 280ms; easing: ease-out; }
         // MEASUREMENT TICKS — faint vertical hairlines stepping across the gap, brightening toward the
         // winning (D, right) edge: the lead reads as QUANTIFIED ("this many steps ahead"), not a blob.
@@ -669,7 +639,7 @@ component SnapTapStage inherits Rectangle {
             background: Theme.accent;
             // ramp brighter toward D — the lead, measured off; only when the gap is wide enough to read.
             opacity: (root.gap-open && parent.width > 24px) ? (0.18 + tk * 0.34) : 0.0;
-            animate opacity { duration: 220ms; easing: ease-out; }
+            animate opacity { duration: root.dur-ticks; easing: ease-out; }
         }
         // a brighter inner edge on the winning (right) side — the leading front of the advantage.
         Rectangle {
@@ -704,9 +674,9 @@ component SnapTapStage inherits Rectangle {
         // tints WARN when caught in the dead-zone on the snap (trapped); dim otherwise — the stall while
         // the accent is already at D IS the pitch.
         border-color: root.snapping ? Theme.warn : Theme.text-faint.with-alpha(0.9);
-        animate border-color { duration: 300ms; easing: ease-out; }
+        animate border-color { duration: root.dur-warn; easing: ease-out; }
         // ALWAYS moves with weight (slow) — so on the snap it visibly LAGS, stuck in the dead-zone.
-        animate x { duration: 380ms; easing: ease-in-out; }
+        animate x { duration: root.dur-lag; easing: ease-in-out; }
         opacity: root.snapping ? 1.0 : 0.6;
         animate opacity { duration: Theme.settle; }
         // a faint WARNING PULSE ring at the stuck spot on the snap — "frozen here, weighty, late".
@@ -717,7 +687,7 @@ component SnapTapStage inherits Rectangle {
             border-width: 1.5px;
             border-color: Theme.warn;
             opacity: root.snapping ? 0.8 : 0.0;
-            animate width, opacity { duration: 360ms; easing: ease-out; }
+            animate width, opacity { duration: root.dur-settle; easing: ease-out; }
         }
     }
 
@@ -729,7 +699,7 @@ component SnapTapStage inherits Rectangle {
         background: Theme.accent;
         // crisp instant reversal on the snap (~85ms ease-out); weighty glide otherwise — the edge's feel.
         animate x {
-            duration: root.snapping ? 85ms : 360ms;
+            duration: root.snapping ? 85ms : root.dur-settle;
             easing: root.snapping ? ease-out : ease-in-out;
         }
         // a steady accent halo (the glow that marks it as the hero), blooming bolder on the snap instant
@@ -742,7 +712,7 @@ component SnapTapStage inherits Rectangle {
             border-width: 1.5px;
             border-color: Theme.accent;
             opacity: root.snapping ? 1.0 : (root.phase == 3 ? 0.7 : (root.phase == 0 || root.phase == 4 ? 0.0 : 0.5));
-            animate width, opacity { duration: 320ms; easing: ease-out; }
+            animate width, opacity { duration: root.dur-halo; easing: ease-out; }
         }
     }
 
@@ -795,7 +765,7 @@ component SnapTapStage inherits Rectangle {
 // appears with a quiet ⚠ warn accent (the legality acknowledgment IS the consent click, not a
 // paragraph). If the device can't do it, the toggle stays GATED ("needs a supporting device") —
 // honest, like the other gates. The stage visual is passed in as the `stage` content.
-component MechAdvantage inherits Rectangle {
+component MechAdvantage inherits Card {
     in property <string> name;             // the option name (e.g. "snap tap")
     in property <string> tagline;          // one short line shown REVEALED (what the edge is)
     in property <bool> supported;          // a capable device is connected (else GATED)
@@ -807,11 +777,9 @@ component MechAdvantage inherits Rectangle {
     callback reveal();                     // step 1 click
     callback set-enabled(bool);            // step 2 toggle
 
-    border-radius: Theme.radius;
-    background: Theme.bg-2;
-    border-width: Theme.hair;
-    border-color: root.enabled ? Theme.accent-line : Theme.line;
-    animate border-color { duration: Theme.quick; }
+    // the enabled card wears Card's accent-line frame (active = a lit/chosen surface); Card provides
+    // the bg-2 ground + hairline + the border-color settle.
+    active: root.enabled;
     clip: true;
 
     VerticalLayout {
@@ -822,10 +790,10 @@ component MechAdvantage inherits Rectangle {
             spacing: 8px;
             VerticalLayout {
                 alignment: center;
-                Text {
+                Mono {
                     text: root.name;
                     color: root.enabled ? Theme.accent : Theme.text-mid;
-                    font-family: Theme.mono; font-size: Theme.fs-small; font-weight: 700;
+                    font-size: Theme.fs-small; font-weight: 700;
                     letter-spacing: Theme.track-2;
                     animate color { duration: Theme.quick; }
                 }
@@ -833,7 +801,7 @@ component MechAdvantage inherits Rectangle {
             Rectangle {}
             VerticalLayout {
                 alignment: center;
-                Text {
+                Mono {
                     text: !root.supported ? "GATED"
                         : root.enabled ? "ON"
                         : root.revealed ? "READY"
@@ -841,9 +809,8 @@ component MechAdvantage inherits Rectangle {
                     color: !root.supported ? Theme.warn
                         : root.enabled ? Theme.accent
                         : Theme.text-faint;
-                    font-family: Theme.mono; font-size: Theme.fs-small; font-weight: 700;
+                    font-size: Theme.fs-small; font-weight: 700;
                     letter-spacing: Theme.track-2;
-                    vertical-alignment: center;
                 }
             }
         }
@@ -956,10 +923,10 @@ component MechAdvantage inherits Rectangle {
         // REVEALED → the tagline, then step 2: the enable toggle (supported) or the honest gate (not).
         if root.revealed : VerticalLayout {
             spacing: 8px;
-            if root.tagline != "" : Text {
+            if root.tagline != "" : Mono {
                 text: root.tagline;
                 color: Theme.text-faint;
-                font-family: Theme.mono; font-size: Theme.fs-small;
+                font-size: Theme.fs-small;
                 wrap: word-wrap;
             }
             // supported → the ⚠ legality accent + the enable toggle
@@ -986,10 +953,10 @@ component MechAdvantage inherits Rectangle {
                 }
             }
             // unsupported → the honest gate, consistent with the other "needs hardware" lines
-            if !root.supported : Text {
+            if !root.supported : Mono {
                 text: "needs a supporting device";
                 color: Theme.text-faint;
-                font-family: Theme.mono; font-size: Theme.fs-small;
+                font-size: Theme.fs-small;
                 wrap: word-wrap;
             }
         }
@@ -1096,8 +1063,8 @@ component PingCard inherits Rectangle {
         HorizontalLayout { alignment: center; PingIcon { slug: root.slug; on: root.on; } }
         VerticalLayout {
             spacing: 2px;
-            Text { text: root.label; color: root.on ? Theme.accent : Theme.text-mid; font-family: Theme.mono; font-size: Theme.fs-small; font-weight: 700; horizontal-alignment: center; overflow: elide; }
-            Text { text: root.desc; color: Theme.text-faint; font-family: Theme.mono; font-size: Theme.fs-small; horizontal-alignment: center; overflow: elide; }
+            Mono { text: root.label; color: root.on ? Theme.accent : Theme.text-mid; font-size: Theme.fs-small; font-weight: 700; horizontal-alignment: center; overflow: elide; }
+            Mono { text: root.desc; color: Theme.text-faint; font-size: Theme.fs-small; horizontal-alignment: center; overflow: elide; }
         }
     }
     ta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.toggled(); } }
@@ -1151,7 +1118,7 @@ export component SettingsPanel inherits VerticalLayout {
                     // ── GATES — device writes (DPI/lighting persist) · input & macros (remaps fire) ──
                     VerticalLayout {
                         spacing: 7px;
-                        Mono { text: "GATES"; color: Theme.text-dim; font-size: Theme.fs-small; letter-spacing: Theme.track-2; }
+                        SubLabel { text: "GATES"; }
                         Toggle {
                             caption: "device writes";
                             checked: !State.writes-paused;
@@ -1175,15 +1142,16 @@ export component SettingsPanel inherits VerticalLayout {
                     // ── ON LAUNCH — labels are self-explanatory; one contextual line replaces the stack ──
                     VerticalLayout {
                         spacing: 7px;
-                        Mono { text: "ON LAUNCH"; color: Theme.text-dim; font-size: Theme.fs-small; letter-spacing: Theme.track-2; }
+                        SubLabel { text: "ON LAUNCH"; }
                         HorizontalLayout {
-                            Segment {
+                            // the fused rail hugs its cells; the stretch spacer eats the row's slack
+                            SplitToggle {
                                 options: ["MANUAL", "BOOT → TRAY", "BOOT → WINDOW"];
                                 index: State.launch-mode;
-                                min-seg: 96px;
+                                min-cell: 96px;
                                 picked(i) => { State.set-launch-mode(i); }
                             }
-                            Rectangle {}
+                            Rectangle { horizontal-stretch: 1; }
                         }
                         Mono {
                             text: State.launch-mode == 1 ? "› starts with Windows, stays in the tray"
@@ -1302,11 +1270,7 @@ export component SettingsPanel inherits VerticalLayout {
                         // your weave is poured from. The swatch animates so you see the substance breathe.
                         VerticalLayout {
                             spacing: 4px;
-                            Text {
-                                text: "MATERIAL";
-                                color: Theme.text-dim; font-family: Theme.mono; font-size: Theme.fs-small;
-                                font-weight: 700; letter-spacing: Theme.track-3;
-                            }
+                            SubLabel { text: "MATERIAL"; letter-spacing: Theme.track-3; }
                             material-grid := Rectangle {
                                 property <length> gap: 10px;
                                 property <length> cw: (self.width - self.gap) / 2;       // two columns
@@ -1351,15 +1315,15 @@ export component SettingsPanel inherits VerticalLayout {
                                                 animate opacity { duration: 100ms; easing: linear; }
                                             }
                                         }
-                                        Text {
+                                        Mono {
                                             text: c.name;
                                             color: card.sel ? Theme.accent : Theme.text-mid;
-                                            font-family: Theme.mono; font-size: Theme.fs-small; font-weight: 700;
+                                            font-size: Theme.fs-small; font-weight: 700;
                                             overflow: elide;
                                         }
-                                        Text {
+                                        Mono {
                                             text: c.blurb;
-                                            color: Theme.text-faint; font-family: Theme.mono; font-size: Theme.fs-small;
+                                            color: Theme.text-faint; font-size: Theme.fs-small;
                                             wrap: word-wrap;
                                         }
                                     }
@@ -1375,11 +1339,7 @@ export component SettingsPanel inherits VerticalLayout {
                                 padding-top: 2px;
                                 spacing: 7px;
                                 HorizontalLayout {
-                                    Text {
-                                        text: "TUNE";
-                                        color: Theme.text-dim; font-family: Theme.mono; font-size: Theme.fs-small;
-                                        font-weight: 700; letter-spacing: Theme.track-3; vertical-alignment: center;
-                                    }
+                                    SubLabel { text: "TUNE"; letter-spacing: Theme.track-3; }
                                     Rectangle {}
                                     rta := TouchArea {
                                         width: rl.preferred-width; height: 18px;
@@ -1397,9 +1357,9 @@ export component SettingsPanel inherits VerticalLayout {
                                     VerticalLayout {
                                         alignment: center;
                                         width: 96px;
-                                        Text {
+                                        Mono {
                                             text: k.label;
-                                            color: Theme.text-dim; font-family: Theme.mono; font-size: Theme.fs-small;
+                                            font-size: Theme.fs-small;
                                             overflow: elide;
                                         }
                                     }
@@ -1417,9 +1377,9 @@ export component SettingsPanel inherits VerticalLayout {
                                     VerticalLayout {
                                         alignment: center;
                                         width: 42px;
-                                        Text {
+                                        Mono {
                                             text: round(k.value * 100) / 100;
-                                            color: Theme.text-mid; font-family: Theme.mono; font-size: Theme.fs-small;
+                                            color: Theme.text-mid; font-size: Theme.fs-small;
                                             horizontal-alignment: right;
                                         }
                                     }
@@ -1439,13 +1399,14 @@ export component SettingsPanel inherits VerticalLayout {
                     SectionTitle { text: "CONFIG & MIGRATION"; }
                     Label { text: "every setting is plain, hand-editable TOML and JSON in the run folder: bindings.toml, cast.toml, apps.toml, gestures.json, plus profiles/ and backups/."; }
                     HorizontalLayout {
-                        spacing: 7px;
-                        Button { text: "open config folder"; clicked => { State.open-config-dir(); } }
-                        Button {
-                            text: "import from Synapse…";
-                            clicked => { State.import-open = true; }
+                        // the coupled config verbs fuse into one deck; the stretch spacer lets it hug
+                        SplitButton {
+                            left-text: "open config folder";
+                            right-text: "import from Synapse…";
+                            left-clicked => { State.open-config-dir(); }
+                            right-clicked => { State.import-open = true; }
                         }
-                        Rectangle {}
+                        Rectangle { horizontal-stretch: 1; }
                     }
                     Mono { text: "import is a one-time flow. it reads the plaintext export, normalises it, then applies it."; color: Theme.text-faint; wrap: word-wrap; }
 
@@ -1502,7 +1463,7 @@ export component SettingsPanel inherits VerticalLayout {
                             spacing: 9px;
                             HorizontalLayout {
                                 spacing: 10px;
-                                VerticalLayout { alignment: center; Mono { text: "WHERE"; color: Theme.text-dim; } }
+                                VerticalLayout { alignment: center; SubLabel { text: "WHERE"; } }
                                 VerticalLayout {
                                     alignment: center;
                                     Mono {
@@ -1551,7 +1512,7 @@ export component SettingsPanel inherits VerticalLayout {
                                         spacing: 9px;
                                         VerticalLayout {
                                             spacing: 5px;
-                                            Mono { text: "POINTER"; color: Theme.text-faint; font-size: Theme.fs-small; letter-spacing: Theme.track-3; }
+                                            SubLabel { text: "POINTER"; color: Theme.text-faint; letter-spacing: Theme.track-3; }
                                             HorizontalLayout {
                                                 spacing: 6px;
                                                 for k in State.ping-pointer : PingCard {
@@ -1562,7 +1523,7 @@ export component SettingsPanel inherits VerticalLayout {
                                         }
                                         VerticalLayout {
                                             spacing: 5px;
-                                            Mono { text: "HARDWARE"; color: Theme.text-faint; font-size: Theme.fs-small; letter-spacing: Theme.track-3; }
+                                            SubLabel { text: "HARDWARE"; color: Theme.text-faint; letter-spacing: Theme.track-3; }
                                             HorizontalLayout {
                                                 spacing: 6px;
                                                 for k in State.ping-hardware : PingCard {
@@ -1573,7 +1534,7 @@ export component SettingsPanel inherits VerticalLayout {
                                         }
                                         VerticalLayout {
                                             spacing: 5px;
-                                            Mono { text: "SESSION"; color: Theme.text-faint; font-size: Theme.fs-small; letter-spacing: Theme.track-3; }
+                                            SubLabel { text: "SESSION"; color: Theme.text-faint; letter-spacing: Theme.track-3; }
                                             HorizontalLayout {
                                                 spacing: 6px;
                                                 for k in State.ping-session : PingCard {
@@ -1593,7 +1554,7 @@ export component SettingsPanel inherits VerticalLayout {
                             spacing: 9px;
                             HorizontalLayout {
                                 spacing: 10px;
-                                VerticalLayout { alignment: center; Mono { text: "WHEN SEVERAL LAND"; color: Theme.text-dim; } }
+                                VerticalLayout { alignment: center; SubLabel { text: "WHEN SEVERAL LAND"; } }
                                 VerticalLayout {
                                     alignment: center;
                                     Mono {
@@ -1611,9 +1572,11 @@ export component SettingsPanel inherits VerticalLayout {
                                 VerticalLayout {
                                     horizontal-stretch: 1;
                                     spacing: 6px;
-                                    NotifTypeChip { label: "stack"; desc: "a column · see each"; on: State.notif-stack == "stack"; toggled => { State.set-notif-stack("stack"); } }
-                                    NotifTypeChip { label: "latest"; desc: "newest only, one card"; on: State.notif-stack == "latest"; toggled => { State.set-notif-stack("latest"); } }
-                                    NotifTypeChip { label: "digest"; desc: "one summary, counted"; on: State.notif-stack == "digest"; toggled => { State.set-notif-stack("digest"); } }
+                                    // full-width radio rows — Contact's lit body carries selection (the old
+                                    // trailing dot merely mirrored `on`, so it's gone); desc is the second line.
+                                    Contact { fill: true; label: "stack"; desc: "a column · see each"; active: State.notif-stack == "stack"; clicked => { State.set-notif-stack("stack"); } }
+                                    Contact { fill: true; label: "latest"; desc: "newest only, one card"; active: State.notif-stack == "latest"; clicked => { State.set-notif-stack("latest"); } }
+                                    Contact { fill: true; label: "digest"; desc: "one summary, counted"; active: State.notif-stack == "digest"; clicked => { State.set-notif-stack("digest"); } }
                                 }
                             }
                         }
@@ -1633,7 +1596,7 @@ export component SettingsPanel inherits VerticalLayout {
                             }
                             if State.notif-audio : HorizontalLayout {
                                 spacing: Theme.gap;
-                                VerticalLayout { alignment: center; width: 52px; Mono { text: "VOLUME"; color: Theme.text-dim; } }
+                                VerticalLayout { alignment: center; width: 52px; SubLabel { text: "VOLUME"; } }
                                 VerticalLayout {
                                     alignment: center;
                                     horizontal-stretch: 1;
@@ -1650,14 +1613,14 @@ export component SettingsPanel inherits VerticalLayout {
                             }
                             if State.notif-audio : HorizontalLayout {
                                 spacing: Theme.gap;
-                                VerticalLayout { alignment: center; width: 52px; Mono { text: "VOICE"; color: Theme.text-dim; } }
-                                Segment {
+                                VerticalLayout { alignment: center; width: 52px; SubLabel { text: "VOICE"; } }
+                                SplitToggle {
                                     options: ["PULSE", "WARM", "GLASS"];
-                                    min-seg: 64px;
+                                    min-cell: 64px;
                                     index: (State.notif-sound == "warm" ? 1 : State.notif-sound == "glass" ? 2 : 0);
                                     picked(i) => { State.set-notif-sound(i == 1 ? "warm" : i == 2 ? "glass" : "pulse"); }
                                 }
-                                Rectangle {}
+                                Rectangle { horizontal-stretch: 1; }
                             }
                         }
                     }
@@ -1771,17 +1734,19 @@ export component SettingsPanel inherits VerticalLayout {
                             spacing: 3px;
                             HorizontalLayout {
                                 spacing: 8px;
-                                VerticalLayout { alignment: center; Mono { text: "FEEL"; color: Theme.text-dim; } }
-                                Segment {
+                                VerticalLayout { alignment: center; SubLabel { text: "FEEL"; } }
+                                // one fused rail (no gapped chips); the stretch spacer lets it hug its cells
+                                SplitToggle {
                                     options: ["REPLACE", "MERGE", "BOOST", "TINT"];
-                                    min-seg: 70px;
+                                    min-cell: 70px;
                                     index: State.host-game-mode;
                                     picked(i) => { State.set-host-game-mode(i); }
                                 }
+                                Rectangle { horizontal-stretch: 1; }
                             }
                             HorizontalLayout {
                                 spacing: 10px;
-                                VerticalLayout { width: 96px; alignment: center; Mono { text: "STRENGTH"; color: Theme.text-dim; } }
+                                VerticalLayout { width: 96px; alignment: center; SubLabel { text: "STRENGTH"; } }
                                 Slider {
                                     compact: true;
                                     minimum: 0;
@@ -1796,7 +1761,7 @@ export component SettingsPanel inherits VerticalLayout {
                             }
                             HorizontalLayout {
                                 spacing: 10px;
-                                VerticalLayout { width: 96px; alignment: center; Mono { text: "FADE"; color: Theme.text-dim; } }
+                                VerticalLayout { width: 96px; alignment: center; SubLabel { text: "FADE"; } }
                                 Slider {
                                     compact: true;
                                     minimum: 0;
@@ -1811,7 +1776,7 @@ export component SettingsPanel inherits VerticalLayout {
                             }
                             HorizontalLayout {
                                 spacing: 9px;
-                                VerticalLayout { width: 96px; alignment: center; Mono { text: "DEVICES"; color: Theme.text-dim; } }
+                                VerticalLayout { width: 96px; alignment: center; SubLabel { text: "DEVICES"; } }
                                 for d in State.host-game-devices : Toggle {
                                     caption: d.name;
                                     checked: d.enabled;
@@ -1897,29 +1862,29 @@ export component SettingsPanel inherits VerticalLayout {
                             VerticalLayout {
                                 alignment: center;
                                 width: 120px;
-                                Text {
+                                Mono {
                                     text: o.name;
                                     color: o.state == "stall" ? Theme.danger : Theme.text-mid;
-                                    font-family: Theme.mono; font-size: Theme.fs-small; font-weight: 700;
+                                    font-size: Theme.fs-small; font-weight: 700;
                                     letter-spacing: Theme.track-2;
                                 }
                             }
                             VerticalLayout {
                                 alignment: center;
-                                Text {
+                                Mono {
                                     text: o.detail;
                                     color: o.state == "stall" ? Theme.danger : Theme.text-faint;
-                                    font-family: Theme.mono; font-size: Theme.fs-small;
+                                    font-size: Theme.fs-small;
                                 }
                             }
                             Rectangle {}
                         }
                     }
                     // the crash record — honest about whether this app has ever fallen over
-                    Text {
+                    Mono {
                         text: State.crash-summary;
                         color: State.crash-present ? Theme.warn : Theme.text-faint;
-                        font-family: Theme.mono; font-size: Theme.fs-small;
+                        font-size: Theme.fs-small;
                         wrap: word-wrap;
                     }
                     // phoenix — bare toggle (switch = state, flush-right) with the feature name carried
@@ -1934,10 +1899,14 @@ export component SettingsPanel inherits VerticalLayout {
                         Mono { text: "PHOENIX. Windows relaunches Neuron if it crashes or hangs."; color: Theme.text-faint; }
                     }
                     HorizontalLayout {
-                        spacing: 7px;
-                        Button { text: "write flight dump"; clicked => { State.write-flight-dump(); } }
-                        Button { text: "open crash log"; clicked => { State.open-crash-log(); } }
-                        Rectangle {}
+                        // the two flight-recorder verbs fuse into one deck; the stretch spacer lets it hug
+                        SplitButton {
+                            left-text: "write flight dump";
+                            right-text: "open crash log";
+                            left-clicked => { State.write-flight-dump(); }
+                            right-clicked => { State.open-crash-log(); }
+                        }
+                        Rectangle { horizontal-stretch: 1; }
                     }
 
                     Divider {}

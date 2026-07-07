@@ -1,5 +1,5 @@
 import { Theme } from "../theme.slint";
-import { Card, SectionTitle, Label, Button, Field, Mono, Divider, PanelHead, Contact, Pill, Slider, Segment, Toggle, SplitToggle, ColorPicker, Palette } from "../widgets/controls.slint";
+import { Card, SectionTitle, Label, Button, Field, Mono, Divider, PanelHead, Contact, Pill, Slider, Toggle, SplitToggle, SplitButton, IconButton, ColorPicker, SwatchRow, Palette } from "../widgets/controls.slint";
 import { DeviceRender } from "../widgets/render.slint";
 import { State } from "../state.slint";
 import { EffectTile, EffectParam } from "../models.slint";
@@ -140,15 +140,18 @@ component ParamControl inherits VerticalLayout {
         value: root.p.fval;
         changed(v) => { State.set-param-range(root.p.key, v); }
     }
-    // ENUM → a pick-one segment (direction, breath flavour)
+    // ENUM → a pick-one fused rail (direction, breath flavour)
     if root.p.kind == "enum" : VerticalLayout {
         spacing: 6px;
         Mono { text: root.p.label; color: Theme.text-dim; }
-        Segment {
-            options: root.p.options;
-            index: root.p.ival;
-            min-seg: 52px;
-            picked(i) => { State.set-param-enum(root.p.key, i); }
+        HorizontalLayout {
+            SplitToggle {
+                options: root.p.options;
+                index: root.p.ival;
+                min-cell: 52px;
+                picked(i) => { State.set-param-enum(root.p.key, i); }
+            }
+            Rectangle { horizontal-stretch: 1; }
         }
     }
     // TOGGLE → a switch
@@ -183,7 +186,7 @@ component SpectrumEditor inherits VerticalLayout {
     property <int> frame-idx: State.light-seq.length > 0
         ? min(max(0, State.light-active-frame), State.light-seq.length - 1)
         : 0;
-    // the surface speaks strings (motion / loop / ease); the Segments speak indices — map both ways.
+    // the surface speaks strings (motion / loop / ease); the fused rails speak indices — map both ways.
     property <int> motion-idx:
         State.light-motion == "drift" ? 1 :
         State.light-motion == "cycle" ? 2 :
@@ -262,7 +265,7 @@ component SpectrumEditor inherits VerticalLayout {
                     width: handle.on ? 14px : 11px; height: self.width; border-radius: self.width / 2;
                     y: 4px; x: (parent.width - self.width) / 2;
                     background: s.col;
-                    border-width: handle.on ? 1.5px : 1px;
+                    border-width: handle.on ? Theme.hair-2 : Theme.hair;
                     border-color: handle.on ? Theme.text : Theme.text-faint;
                 }
                 // the stem — ONLY the SELECTED stop drops a cursor line down the strip, marking the column
@@ -276,17 +279,19 @@ component SpectrumEditor inherits VerticalLayout {
                 }
             }
         }
-        // add/remove + the active-stop readout. The verbs are ADD/REMOVE, not "+ stop"/"- stop" —
-        // "stop" as a bare button word read like a transport control about to halt the effect.
+        // add/remove + the active-stop readout, the coupled pair fused into one deck: the destructive
+        // REMOVE half wears danger ink on the left, the constructive ADD half sits right. The remove
+        // half goes visibly DEAD at the last stop (left-enabled) — never a live-looking key that no-ops.
         HorizontalLayout {
             spacing: 7px;
-            Button { text: "+ add"; clicked => { State.add-stop(0.5); } }
-            Button {
-                text: "− remove"; danger: true;
-                enabled: State.light-stops.length > 1;
-                clicked => { State.remove-stop(root.stop-idx); }
+            SplitButton {
+                left-text: "− remove"; left-danger: true;
+                left-enabled: State.light-stops.length > 1;
+                right-text: "+ add";
+                left-clicked => { State.remove-stop(root.stop-idx); }
+                right-clicked => { State.add-stop(0.5); }
             }
-            Rectangle {}
+            Rectangle { horizontal-stretch: 1; }
             Mono { text: "stop " + (root.stop-idx + 1) + " of " + State.light-stops.length; color: Theme.text-faint; }
         }
         // the selected stop's colour — the SHARED prism picker (the SAME component the SYSTEM accents
@@ -305,11 +310,14 @@ component SpectrumEditor inherits VerticalLayout {
         if State.light-stops.length > 1 : VerticalLayout {
             spacing: 6px;
             Mono { text: "blend"; color: Theme.text-dim; }
-            Segment {
-                options: ["RGB", "HSV"];
-                index: root.interp-idx;
-                min-seg: 52px;
-                picked(i) => { State.set-interp(i == 1 ? "hsv" : "rgb"); }
+            HorizontalLayout {
+                SplitToggle {
+                    options: ["RGB", "HSV"];
+                    index: root.interp-idx;
+                    min-cell: 52px;
+                    picked(i) => { State.set-interp(i == 1 ? "hsv" : "rgb"); }
+                }
+                Rectangle { horizontal-stretch: 1; }
             }
         }
     }
@@ -320,13 +328,16 @@ component SpectrumEditor inherits VerticalLayout {
     VerticalLayout {
         spacing: 9px;
         SectionTitle { text: "MOTION"; }
-        Segment {
-            options: ["HOLD", "DRIFT", "CYCLE", "BREATHE", "FLOW"];
-            index: root.motion-idx;
-            min-seg: 52px;
-            picked(i) => {
-                State.set-motion(i == 1 ? "drift" : i == 2 ? "cycle" : i == 3 ? "breathe" : i == 4 ? "flow" : "hold");
+        HorizontalLayout {
+            SplitToggle {
+                options: ["HOLD", "DRIFT", "CYCLE", "BREATHE", "FLOW"];
+                index: root.motion-idx;
+                min-cell: 52px;
+                picked(i) => {
+                    State.set-motion(i == 1 ? "drift" : i == 2 ? "cycle" : i == 3 ? "breathe" : i == 4 ? "flow" : "hold");
+                }
             }
+            Rectangle { horizontal-stretch: 1; }
         }
         // speed paces every motion but Hold (which has nothing to move) — hidden honestly for Hold.
         if State.light-motion != "hold" : SpecSlider {
@@ -404,6 +415,8 @@ component SpectrumEditor inherits VerticalLayout {
                     VerticalLayout {
                         padding: 4px; spacing: 3px;
                         Rectangle {
+                            // deliberate 2px exception: this tiny keyframe-thumb mask wants a corner
+                            // tighter than radius-sm, matched to its 20px height (not a themed radius).
                             height: 20px; border-radius: 2px; clip: true;
                             Image { source: f.swatch; width: 100%; height: 100%; image-fit: fill; }
                         }
@@ -416,16 +429,15 @@ component SpectrumEditor inherits VerticalLayout {
                     cta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { State.select-frame(i); } }
                 }
             }
-            // add a keyframe (a clone of the active) / delete the active one
-            HorizontalLayout {
-                spacing: 7px;
-                Button { text: "+ keyframe"; clicked => { State.add-frame(); } }
-                Rectangle {}
-                Button {
-                    text: "delete frame"; danger: true;
-                    enabled: State.light-seq.length > 1;
-                    clicked => { State.remove-frame(root.frame-idx); }
-                }
+            // add a keyframe (a clone of the active) / delete the active one — the coupled pair fused
+            // into one full-width deck: destructive DELETE (danger, left), constructive + keyframe (right).
+            // The delete half goes visibly DEAD at the last frame (left-enabled), never a silent no-op.
+            SplitButton {
+                left-text: "delete frame"; left-danger: true;
+                left-enabled: State.light-seq.length > 1;
+                right-text: "+ keyframe";
+                left-clicked => { State.remove-frame(root.frame-idx); }
+                right-clicked => { State.add-frame(); }
             }
             // the active frame's timing — dwell (hold) → crossfade-in (fade) → the fade ease — with the
             // reorder arrows on its header so a frame moves earlier/later in the sequence. INDEX GUARD:
@@ -436,14 +448,17 @@ component SpectrumEditor inherits VerticalLayout {
                 spacing: 9px;
                 HorizontalLayout {
                     Mono { text: "frame " + (root.frame-idx + 1); color: Theme.text-dim; }
-                    Rectangle {}
-                    Button {
-                        text: "◂"; enabled: State.light-seq.length > 1 && root.frame-idx > 0;
-                        clicked => { State.move-frame(root.frame-idx, -1); }
-                    }
-                    Button {
-                        text: "▸"; enabled: State.light-seq.length > 1 && root.frame-idx < State.light-seq.length - 1;
-                        clicked => { State.move-frame(root.frame-idx, 1); }
+                    Rectangle { horizontal-stretch: 1; }
+                    // reorder ◂ ▸ fused into one deck (hugs right). The whole rail dies for a single
+                    // frame; each arrow goes visibly dead at its end of the sequence (per-half enables),
+                    // so an impossible move reads gated, not broken.
+                    SplitButton {
+                        left-text: "◂"; right-text: "▸";
+                        enabled: State.light-seq.length > 1;
+                        left-enabled: root.frame-idx > 0;
+                        right-enabled: root.frame-idx < State.light-seq.length - 1;
+                        left-clicked => { State.move-frame(root.frame-idx, -1); }
+                        right-clicked => { State.move-frame(root.frame-idx, 1); }
                     }
                 }
                 SpecSlider {
@@ -459,11 +474,14 @@ component SpectrumEditor inherits VerticalLayout {
                 VerticalLayout {
                     spacing: 6px;
                     Mono { text: "fade ease"; color: Theme.text-dim; }
-                    Segment {
-                        options: ["LINEAR", "SMOOTH", "SNAP"];
-                        index: root.ease-idx;
-                        min-seg: 52px;
-                        picked(i) => { State.set-frame-ease(root.frame-idx, i == 1 ? "smooth" : i == 2 ? "snap" : "linear"); }
+                    HorizontalLayout {
+                        SplitToggle {
+                            options: ["LINEAR", "SMOOTH", "SNAP"];
+                            index: root.ease-idx;
+                            min-cell: 52px;
+                            picked(i) => { State.set-frame-ease(root.frame-idx, i == 1 ? "smooth" : i == 2 ? "snap" : "linear"); }
+                        }
+                        Rectangle { horizontal-stretch: 1; }
                     }
                 }
             }
@@ -471,11 +489,14 @@ component SpectrumEditor inherits VerticalLayout {
             VerticalLayout {
                 spacing: 6px;
                 Mono { text: "playback"; color: Theme.text-dim; }
-                Segment {
-                    options: ["ONCE", "LOOP", "PINGPONG"];
-                    index: root.loop-idx;
-                    min-seg: 52px;
-                    picked(i) => { State.set-loop(i == 0 ? "once" : i == 2 ? "pingpong" : "loop"); }
+                HorizontalLayout {
+                    SplitToggle {
+                        options: ["ONCE", "LOOP", "PINGPONG"];
+                        index: root.loop-idx;
+                        min-cell: 52px;
+                        picked(i) => { State.set-loop(i == 0 ? "once" : i == 2 ? "pingpong" : "loop"); }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
                 }
             }
         }
@@ -757,7 +778,7 @@ export component LightingPanel inherits VerticalLayout {
                         spacing: 6px;
                         for li in State.light-stack-count : cell := Rectangle {
                             property <bool> on: li == State.selected-layer;
-                            height: 30px; min-width: 60px; horizontal-stretch: 1;
+                            height: Theme.row-h; min-width: 60px; horizontal-stretch: 1;
                             border-radius: Theme.radius-sm;
                             background: cell.on ? Theme.accent-glow : (sta.has-hover ? Theme.well-hi : Theme.bg-2);
                             border-width: Theme.hair;
@@ -779,23 +800,13 @@ export component LightingPanel inherits VerticalLayout {
                                         overflow: elide;
                                     }
                                 }
-                                // drop this layer — a real, always-visible button (was a near-invisible faint
-                                // glyph) with a comfortable hit target, red on hover. Declared LAST so its
-                                // touch wins the corner over the cell-wide select beneath.
-                                Rectangle {
-                                    width: 22px;
-                                    background: xta.has-hover ? Theme.danger : transparent;
-                                    border-radius: 3px;
-                                    animate background { duration: Theme.quick; }
-                                    Text {
-                                        // U+00D7 (×) — the dingbat U+2715 (✕) isn't in the mono font.
-                                        text: "\u{00d7}";
-                                        color: xta.has-hover ? Theme.text : (cell.on ? Theme.accent : Theme.text-dim);
-                                        font-family: Theme.mono; font-size: Theme.fs-data;
-                                        horizontal-alignment: center; vertical-alignment: center;
-                                        animate color { duration: Theme.quick; }
-                                    }
-                                    xta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { State.remove-stack(li); } }
+                                // drop this layer — the shared IconButton glyph chip (× in the mono font,
+                                // U+00D7 since the dingbat U+2715 isn't in it), danger ink on hover. Declared
+                                // LAST so its touch wins the corner over the cell-wide select beneath.
+                                IconButton {
+                                    glyph: "\u{00d7}";
+                                    danger: true;
+                                    clicked => { State.remove-stack(li); }
                                 }
                             }
                         }
@@ -827,8 +838,10 @@ export component LightingPanel inherits VerticalLayout {
                         spacing: 9px;
                         HorizontalLayout {
                             spacing: 9px;
+                            // live brush swatch — 26px, the SwatchRow chip size, so the preview and the
+                            // presets read as one family (was a 30px odd-one-out).
                             Rectangle {
-                                width: 30px; height: 30px; border-radius: Theme.radius-sm;
+                                width: 26px; height: 26px; border-radius: Theme.radius-sm;
                                 border-width: Theme.hair; border-color: Theme.line;
                                 background: State.brush-color;
                             }
@@ -841,24 +854,25 @@ export component LightingPanel inherits VerticalLayout {
                             }
                             Rectangle {}
                         }
-                        HorizontalLayout {
-                            spacing: 6px;
-                            for sw in Palette.accent : Rectangle {
-                                width: 26px; height: 26px; border-radius: Theme.radius-sm;
-                                border-width: Theme.hair;
-                                border-color: sw.hex == State.light-color ? Theme.accent-line : (pswta.has-hover ? Theme.text-faint : Theme.line-soft);
-                                background: sw.col;
-                                animate border-color { duration: Theme.quick; }
-                                pswta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { State.light-color = sw.hex; State.color-changed(sw.hex); } }
-                            }
-                            Rectangle {}
+                        // the preset chips — the shared SwatchRow (was a hand-copy of ColorPicker's strip)
+                        SwatchRow {
+                            swatches: Palette.accent;
+                            value: State.light-color;
+                            pick(h) => { State.light-color = h; State.color-changed(h); }
                         }
                         HorizontalLayout {
                             spacing: 7px;
-                            Button { text: "fill"; clicked => { State.fill-grid(); } }
-                            Button { text: "clear"; danger: true; clicked => { State.clear-grid(); } }
+                            // the canvas couplet fused: destructive CLEAR (danger, left) + constructive FILL
+                            // (right). PUSH FRAME stays a separate primary key beside it — it's the commit,
+                            // distinct from the fill/clear pair.
+                            SplitButton {
+                                left-text: "clear"; left-danger: true;
+                                right-text: "fill";
+                                left-clicked => { State.clear-grid(); }
+                                right-clicked => { State.fill-grid(); }
+                            }
                             Button { text: "push frame"; primary: true; enabled: !State.writes-paused; clicked => { State.push-painted(); } }
-                            Rectangle {}
+                            Rectangle { horizontal-stretch: 1; }
                         }
                     }
                 }

@@ -1,4 +1,5 @@
 import { Theme } from "../theme.slint";
+import { Mono } from "controls.slint";
 
 // DEVICE RENDER — the auto-generated picture of the peripheral itself, LEDs live.
 //
@@ -46,7 +47,7 @@ export component DeviceRender inherits Rectangle {
         y: parent.height * 4%;
         width: parent.width * 92%;
         height: parent.height * 92%;
-        border-radius: 10px;
+        border-radius: Theme.radius-case;
         border-width: Theme.hair;
         border-color: Theme.line;
         background: Theme.bg-2;
@@ -57,7 +58,7 @@ export component DeviceRender inherits Rectangle {
             y: 12px;
             width: parent.width - 24px;
             height: parent.height - 24px;
-            border-radius: 6px;
+            border-radius: Theme.radius-case-inner;
             border-width: Theme.hair;
             border-color: Theme.line-soft;
             background: transparent;
@@ -81,7 +82,7 @@ export component DeviceRender inherits Rectangle {
                 width: field.cell + 8px;
                 height: field.cell + 8px;
                 border-radius: field.cell / 2;
-                background: p.with-alpha(0.16);
+                background: p.with-alpha(Theme.bloom);
             }
             // the keycaps themselves
             for p[i] in root.px : Rectangle {
@@ -114,7 +115,7 @@ export component DeviceRender inherits Rectangle {
                 width: (self.c1 - self.c0) * (field.cell + field.gap) + field.cell + 6px;
                 height: (self.r1 - self.r0) * (field.cell + field.gap) + field.cell + 6px;
                 border-radius: Theme.radius-sm;
-                border-width: 1.5px;
+                border-width: Theme.hair-2;
                 border-color: Theme.accent;
                 background: Theme.accent-glow;
             }
@@ -219,7 +220,7 @@ export component DeviceRender inherits Rectangle {
                     : i == 1 ? body.height * 52%
                     : body.height * 36%) - 5px;
                 border-radius: self.width / 2;
-                background: p.with-alpha(0.16);
+                background: p.with-alpha(Theme.bloom);
             }
             // …then the pads themselves
             for p[i] in root.px : Rectangle {
@@ -247,11 +248,10 @@ export component DeviceRender inherits Rectangle {
             }
         }
         // honesty note: zone positions are approximate (the registry knows counts, not microns)
-        Text {
+        Mono {
             text: "~ zones approximate";
             color: Theme.text-faint;
             font-size: Theme.fs-small;
-            font-family: Theme.mono;
             x: parent.width - self.width - 6px;
             y: parent.height - self.height - 4px;
         }

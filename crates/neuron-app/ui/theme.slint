@@ -49,7 +49,17 @@ export global Theme {
     // (mirrors the accent-line / accent-glow pair, so a failed probe reads like a lit-but-bad station)
     out property <color> warn-line:   #f2b34a45;
     out property <color> danger-line: #f25a6b45;
+    out property <color> warn-glow:   #f2b34a1a;
     out property <color> danger-glow: #f25a6b1a;
+    // CAPTURE — the research-capture signal (rich-stroke recording, spellweaving). A warmer amber
+    // than warn, deliberately: it marks a MODE IDENTITY ("this stroke is being kept"), not a caution.
+    // The fourth and LAST signal hue; anything else stays monochrome or accent.
+    out property <color> capture:      #e6a93c;
+    out property <color> capture-line: #e6a93c45;
+    out property <color> capture-glow: #e6a93c1a;
+    // an UNLIT lamp — the visible "off" dot every lamp gutter shows so labels never slide when a
+    // signal toggles (Pill's idiom, now named for the rails/strips that draw their own lamps)
+    out property <color> lamp-off:     #353b4480;   // text-faint at half strength
     // the dim poured behind a modal overlay (one value for every sheet — was d8 vs cc)
     out property <color> scrim:       #000000d8;
     // a LIGHTER scrim — focuses a dropdown / popover (catches outside clicks) without a full blackout
@@ -84,6 +94,10 @@ export global Theme {
     out property <length> lead-in:   16px;   // a panel's hairline → its first content
     out property <length> section-gap: 22px; // gap between major sections stacked down a page (one knob)
     out property <length> hair:      1px;    // the hairline weight, named for intent
+    out property <length> hair-2:    1.5px;  // the EMPHASIS hairline — a lit/urgent frame, one notch above hair
+    // the render canvas's device chassis — a physical case is rounder than an instrument control
+    out property <length> radius-case:       10px;  // outer bezel of a drawn device body
+    out property <length> radius-case-inner: 6px;   // the key-field / plate inset within it
     // canonical interactive heights — a control row, a segment/contact, a nav/menu row
     out property <length> row-h:     30px;
     out property <length> row-h-sm:  28px;
@@ -98,6 +112,13 @@ export global Theme {
     out property <duration> settle: 110ms;
     out property <duration> quick:  80ms;
     out property <duration> press-throw: 60ms;      // a key's travel on press
+    out property <duration> sheen: 340ms;           // the device-glyph sheen band's sweep
+    // the delete choreography: content fades over fade-out, the row collapses at fade-out-hold —
+    // the 20ms stagger is deliberate (the fade must finish before the space closes under it)
+    out property <duration> fade-out:      240ms;
+    out property <duration> fade-out-hold: 260ms;
+    // the LED bloom wash behind a lit key/zone on the render canvas (chrome strength, not LED data)
+    out property <float> bloom: 0.16;
     // ── timing — a confirm window (not motion) ───────────────────────────
     // The two-click arm/confirm timeout: click to arm, click again within this to commit.
     out property <duration> confirm-window: 2500ms;

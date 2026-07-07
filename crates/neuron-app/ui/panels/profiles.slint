@@ -1,5 +1,5 @@
 import { Theme } from "../theme.slint";
-import { SectionTitle, Button, Field, Picker, Pill, Mono, Divider, PanelHead } from "../widgets/controls.slint";
+import { SectionTitle, Button, Field, Picker, Pill, Mono, Divider, PanelHead, SelectTick } from "../widgets/controls.slint";
 import { State } from "../state.slint";
 import { ProfileRow, AppRuleRow } from "../models.slint";
 
@@ -21,11 +21,11 @@ component ProfileMenuRow inherits Rectangle {
     border-width: Theme.hair;
     border-color: root.p.active ? Theme.accent-line : (cta.has-hover ? Theme.text-faint : Theme.line);
     animate background, border-color { duration: Theme.quick; }
-    // the active profile's index tick — its only colour, settling never teleporting
-    Rectangle {
-        x: 0; width: 2px; y: 9px; height: parent.height - 18px;
-        background: root.p.active ? Theme.accent : transparent;
-        animate background { duration: Theme.quick; }
+    // the active profile's index tick — its only colour, settling never teleporting.
+    // The site keeps its own vertical inset; SelectTick owns the bar + its animation.
+    SelectTick {
+        active: root.p.active;
+        y: 9px; height: parent.height - 18px;
     }
     cta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.apply(); } }
     HorizontalLayout {
@@ -148,7 +148,7 @@ export component ProfilesMenu inherits VerticalLayout {
         // entry. No section chrome or empty-state box: it reads as the "capture a new one" input beneath
         // the SAVED list (the 0-profiles count already states the emptiness).
         Rectangle {
-            height: 30px;
+            height: Theme.row-h;
             border-radius: Theme.radius-sm;
             background: Theme.well;
             border-width: Theme.hair; border-color: Theme.line;
@@ -209,7 +209,7 @@ export component ProfilesMenu inherits VerticalLayout {
             spacing: Theme.gap;
             // SOURCE — the live focused-app signal this routing switches on
             Rectangle {
-                height: 28px;
+                height: Theme.row-h-sm;
                 border-radius: Theme.radius-sm;
                 background: Theme.well;
                 border-width: Theme.hair; border-color: Theme.line;
@@ -231,7 +231,7 @@ export component ProfilesMenu inherits VerticalLayout {
                     border-width: Theme.hair;
                     property <bool> routing: i == State.active-app-rule;
                     border-color: self.routing ? Theme.accent-line : Theme.line;
-                    animate border-color { duration: Theme.settle; }
+                    animate border-color { duration: Theme.quick; }
                     rowta := TouchArea {}   // row-level hover so the delete stays quiet at rest
                     HorizontalLayout {
                         padding-left: 11px; padding-right: 7px; spacing: 8px;
@@ -239,19 +239,18 @@ export component ProfilesMenu inherits VerticalLayout {
                         VerticalLayout {
                             alignment: center;
                             Rectangle {
-                                width: 5px; height: 5px; border-radius: 3px;
+                                width: Theme.dot; height: Theme.dot; border-radius: Theme.dot / 2;
                                 background: rr.routing ? Theme.accent : Theme.line;
-                                animate background { duration: Theme.settle; }
+                                animate background { duration: Theme.quick; }
                             }
                         }
-                        Text { text: r.app; color: Theme.text; font-size: Theme.fs-body; font-family: Theme.mono; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
-                        Text {
+                        Mono { text: r.app; color: Theme.text; horizontal-stretch: 1; overflow: elide; }
+                        Mono {
                             text: "→";
                             color: rr.routing ? Theme.accent : Theme.text-faint;
-                            vertical-alignment: center;
-                            animate color { duration: Theme.settle; }
+                            animate color { duration: Theme.quick; }
                         }
-                        Text { text: r.profile; color: Theme.text-mid; font-size: Theme.fs-body; font-family: Theme.mono; vertical-alignment: center; overflow: elide; }
+                        Mono { text: r.profile; color: Theme.text-mid; overflow: elide; }
                         Button {
                             text: "del"; danger: true;
                             enabled: rowta.has-hover;

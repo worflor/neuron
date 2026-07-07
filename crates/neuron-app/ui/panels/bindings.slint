@@ -1,5 +1,5 @@
 import { Theme } from "../theme.slint";
-import { Card, SectionTitle, Label, Button, Field, CodeArea, Pill, Mono, Divider, Slider, Toggle, PanelHead, ActionPicker, Segment, InputHead, GuideButton } from "../widgets/controls.slint";
+import { Card, SectionTitle, Label, Button, Field, CodeArea, Pill, Mono, Divider, Slider, Toggle, PanelHead, ActionPicker, InputHead, GuideButton, SplitToggle, SplitButton, TriggerWell } from "../widgets/controls.slint";
 import { State } from "../state.slint";
 import { RuleRow, PocketCard, MacroBlock, MacroCard } from "../models.slint";
 
@@ -63,9 +63,9 @@ component PocketCardEl inherits Rectangle {
             // a filled dot marks a pocket kept on disk (survives a restart)
             Rectangle {
                 y: 4px;
-                width: 5px;
-                height: 5px;
-                border-radius: 2.5px;
+                width: Theme.dot;
+                height: Theme.dot;
+                border-radius: Theme.dot / 2;
                 background: p.durable ? root.tint : transparent;
                 border-width: p.durable ? 0 : Theme.hair;
                 border-color: Theme.line;
@@ -98,7 +98,7 @@ component MacroCardEl inherits Rectangle {
     property <bool> fired: false;
     clip: true;
     opacity: root.deleting ? 0.0 : 1.0;
-    animate opacity { duration: 240ms; easing: ease-out; }
+    animate opacity { duration: Theme.fade-out; easing: ease-out; }
     border-radius: Theme.radius;
     background: root.current ? Theme.accent-glow : (ta.has-hover ? Theme.well-hi : Theme.bg-2);
     border-width: Theme.hair;
@@ -138,7 +138,7 @@ component MacroCardEl inherits Rectangle {
             del := Rectangle {
                 width: 18px;
                 height: 18px;
-                border-radius: 4px;
+                border-radius: Theme.radius;
                 background: root.armed ? Theme.danger : (xta.has-hover ? Theme.well-hi : transparent);
                 animate background { duration: Theme.quick; }
                 Text {
@@ -187,7 +187,7 @@ component MacroCardEl inherits Rectangle {
     // fade THEN delete: the opacity animates out first, then the macro is removed from disk + the catalog
     // (which drops this card from the model). `fired` collapses the repeating timer to a single shot.
     Timer {
-        interval: 260ms;
+        interval: Theme.fade-out-hold;
         running: root.deleting && !root.fired;
         triggered => {
             root.fired = true;
@@ -229,40 +229,25 @@ component WireEditor inherits Card {
         // then phosphor), and the ACTION it fires.
         HorizontalLayout {
             spacing: 14px;
-            // the trigger end — the whole well is the press-to-bind / REBIND target.
+            // the trigger end — the whole well is the press-to-bind / REBIND target (the shared
+            // TriggerWell, clickable-with-REBIND-hint flavour). It's fixed row-h, so a centring
+            // VerticalLayout holds it in the stretchy cell (the well used to fill the column down to
+            // the taller ACTION side; now it centres at its natural height instead of stretching).
             VerticalLayout {
                 width: 300px;
                 spacing: 7px;
                 Mono { text: "TRIGGER"; color: Theme.text-dim; }
-                Rectangle {
+                VerticalLayout {
                     vertical-stretch: 1;
-                    min-height: 30px;
-                    border-radius: Theme.radius-sm;
-                    background: slotta.has-hover ? Theme.well-hi : Theme.well;
-                    border-width: Theme.hair;
-                    border-color: State.bind-trigger-ready ? Theme.accent-line
-                        : slotta.has-hover ? Theme.text-faint : Theme.line;
-                    animate background, border-color { duration: Theme.quick; }
-                    HorizontalLayout {
-                        padding-left: 11px; padding-right: 10px; spacing: 8px;
-                        Text {
-                            horizontal-stretch: 1;
-                            text: State.bind-trigger-ready ? State.bind-trigger-label : "press-to-bind a key or button";
-                            color: State.bind-trigger-ready ? Theme.accent
-                                : slotta.has-hover ? Theme.text-mid : Theme.text-faint;
-                            font-family: Theme.mono; font-size: Theme.fs-body;
-                            vertical-alignment: center; overflow: elide;
-                        }
-                        // a quiet "you can change it" hint once a trigger is present
-                        if State.bind-trigger-ready : Text {
-                            text: "REBIND";
-                            color: slotta.has-hover ? Theme.accent : Theme.text-faint;
-                            font-family: Theme.mono; font-size: Theme.fs-small;
-                            font-weight: 700; letter-spacing: Theme.track-4;
-                            vertical-alignment: center;
-                        }
+                    alignment: center;
+                    TriggerWell {
+                        text: State.bind-trigger-label;
+                        prompt: "press-to-bind a key or button";
+                        live: State.bind-trigger-ready;
+                        clickable: true;
+                        hint: "REBIND";
+                        clicked => { State.capture-trigger(); }
                     }
-                    slotta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { State.capture-trigger(); } }
                 }
             }
             // the wire's arrow — lights phosphor the instant both ends connect
@@ -276,6 +261,9 @@ component WireEditor inherits Card {
                     Text {
                         text: "→";
                         color: (State.bind-trigger-ready && picker.param-ok) ? Theme.accent : Theme.text-faint;
+                        // 16px is a DELIBERATE exception to the type scale — the wire arrow is sized as a
+                        // circuit glyph (the visible JOIN between the two ends), not body text, so it reads
+                        // one notch bigger than any fs- token would set it.
                         font-family: Theme.mono; font-size: 16px; font-weight: 700;
                         horizontal-alignment: center; vertical-alignment: center;
                         animate color { duration: Theme.settle; }
@@ -317,21 +305,29 @@ component WireEditor inherits Card {
 }
 
 // A quiet row control — ↑ / ↓ / ✕. Small square hit target, mono glyph, brightens on hover; `danger`
-// tints the delete red. Defined here (above its first use in RuleLine) and reused by the workshop.
+// tints the delete red. `enabled: false` faints the glyph and goes inert (default cursor, dead
+// TouchArea) — the Button/IconButton convention, for a control that can't act right now (e.g. the
+// top row can't move up). Defined here (above its first use in RuleLine) and reused by the workshop.
 component RowGlyph inherits Rectangle {
     in property <string> glyph;
     in property <bool> danger: false;
+    in property <bool> enabled: true;
     out property <bool> hovered: g-ta.has-hover;   // lets a parent card hold its hover while you reach a control
     callback clicked();
     width: 22px;
     height: 22px;
     border-radius: Theme.radius-sm;
-    background: g-ta.has-hover ? Theme.well : transparent;
+    background: (root.enabled && g-ta.has-hover) ? Theme.well : transparent;
     animate background { duration: Theme.quick; }
-    g-ta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.clicked(); } }
+    g-ta := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? MouseCursor.pointer : MouseCursor.default;
+        clicked => { root.clicked(); }
+    }
     Text {
         text: root.glyph;
-        color: root.danger ? (g-ta.has-hover ? Theme.danger : Theme.danger.with-alpha(0.6))
+        color: !root.enabled ? Theme.text-faint
+            : root.danger ? (g-ta.has-hover ? Theme.danger : Theme.danger.with-alpha(0.6))
             : (g-ta.has-hover ? Theme.text : Theme.text-faint);
         font-family: Theme.mono;
         font-size: Theme.fs-body;
@@ -394,7 +390,7 @@ component RuleLine inherits Rectangle {
         // trigger jack — the short index; capped so the ACTION (the long field) gets the slack
         Rectangle {
             width: 30%;
-            height: 30px;
+            height: Theme.row-h;
             y: (parent.height - self.height) / 2;
             border-radius: Theme.radius-sm;
             background: Theme.well;
@@ -437,7 +433,7 @@ component RuleLine inherits Rectangle {
         Rectangle {
             horizontal-stretch: 1;
             min-width: 120px;
-            height: 30px;
+            height: Theme.row-h;
             y: (parent.height - self.height) / 2;
             border-radius: Theme.radius-sm;
             background: Theme.well;
@@ -620,7 +616,7 @@ component ChannelStrip inherits VerticalLayout {
         }
         // MUTE — one illuminated key; lit danger-red when muted, a quiet contact when live
         Rectangle {
-            width: 58px; height: 26px; border-radius: Theme.radius-sm;
+            width: 58px; height: Theme.seg-h; border-radius: Theme.radius-sm;
             background: root.muted ? Theme.danger-glow : (mta.has-hover ? Theme.well : transparent);
             border-width: Theme.hair;
             border-color: root.muted ? Theme.danger.with-alpha(0.6) : (mta.has-hover ? Theme.text-faint : Theme.line);
@@ -925,7 +921,7 @@ component MacroBlockEl inherits Rectangle {
         if root.is-add : Rectangle {
             horizontal-stretch: 1;
             // the empty-state CTA is taller + warmer so it can't be missed; nested adds stay compact.
-            height: root.empty-cta ? 36px : 28px;
+            height: root.empty-cta ? 36px : Theme.row-h-sm;
             // collapsed invitation
             if !root.picker-open : Rectangle {
                 border-radius: Theme.radius-sm;
@@ -1001,7 +997,7 @@ export component BindingsPanel inherits VerticalLayout {
     // The MACRO·PYTHON editor's vertical offset from the panel top — the cross-panel "author a
     // macro" jump scrolls the page Flickable to this so the link lands ON the editor (see app.slint).
     out property <length> macro-y: macro_row.absolute-position.y - root.absolute-position.y;
-    // the stance segment is string-keyed in the engine but index-keyed in the Segment widget
+    // the stance is string-keyed in the engine but index-keyed in the SplitToggle rail
     property <int> stance-idx: State.hypershift-mode == "hold" ? 0
         : State.hypershift-mode == "latch" ? 1
         : State.hypershift-mode == "smart" ? 2 : 3;
@@ -1080,6 +1076,12 @@ export component BindingsPanel inherits VerticalLayout {
 
                 // ── REVEALED — the joined shell: label · base|HYPER flip · ⚙ configure ──
                 // "setup exists" = a hold key OR shifted binds; only the open-but-empty case offers a ×.
+                // STAYS HAND-ROLLED (not recomposed from SplitToggle + IconButtons): the fused single
+                // outline wraps a LABEL zone + the base|HYPER flip + a variable-width ⚙ text cell + the
+                // × as ONE object, seams hairline-fused into the shared frame. A nested SplitToggle would
+                // bring its own rounded border (a box inside the box), the ⚙ is a reflowing text label
+                // (not a fixed glyph IconButton takes), and the × wants to be a full-height fused cell —
+                // so composition can't honestly hold the one-outline look. Raw seam widths → Theme.hair.
                 if root.hyper-revealed : shell := Rectangle {
                     property <bool> setup-exists: State.hypershift-hold-ready || State.editable-hyper-count > 0;
                     horizontal-stretch: 0;
@@ -1097,7 +1099,7 @@ export component BindingsPanel inherits VerticalLayout {
                                 VerticalLayout { alignment: center; Text { text: "HyperShift"; color: Theme.text-mid; font-family: Theme.mono; font-size: Theme.fs-small; font-weight: 700; letter-spacing: Theme.track-3; vertical-alignment: center; } }
                             }
                         }
-                        Rectangle { width: 1px; background: Theme.line; }
+                        Rectangle { width: Theme.hair; background: Theme.line; }
                         // base | HYPER edit-flip — the active side lit accent (WEAVE's base|HYPER)
                         Rectangle {
                             background: root.view-layer == 0 ? Theme.accent-glow : (bflip.has-hover ? Theme.well : transparent);
@@ -1114,7 +1116,7 @@ export component BindingsPanel inherits VerticalLayout {
                             }
                             bflip := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.view-layer = 0; root.add-open = false; State.editing-rule = -1; } }
                         }
-                        Rectangle { width: 1px; background: Theme.line; }
+                        Rectangle { width: Theme.hair; background: Theme.line; }
                         Rectangle {
                             background: root.view-layer == 1 ? Theme.accent-glow : (hflip.has-hover ? Theme.well : transparent);
                             animate background { duration: Theme.quick; }
@@ -1130,7 +1132,7 @@ export component BindingsPanel inherits VerticalLayout {
                             }
                             hflip := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.view-layer = 1; root.add-open = false; State.editing-rule = -1; } }
                         }
-                        Rectangle { width: 1px; background: Theme.line; }
+                        Rectangle { width: Theme.hair; background: Theme.line; }
                         // ⚙ configure — toggles the hold/stance/feel disclosure. Accent while open OR
                         // while it needs attention (revealed but no hold key — won't actually trigger):
                         // the label itself becomes the nudge, so a user can't miss that a hold key is owed.
@@ -1154,7 +1156,7 @@ export component BindingsPanel inherits VerticalLayout {
                             cogta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.config-open = !root.config-open; } }
                         }
                         // collapse × — ONLY while opened-but-empty (never hide real work)
-                        if !shell.setup-exists : Rectangle { width: 1px; background: Theme.line; }
+                        if !shell.setup-exists : Rectangle { width: Theme.hair; background: Theme.line; }
                         if !shell.setup-exists : Rectangle {
                             background: xta.has-hover ? Theme.well : transparent;
                             animate background { duration: Theme.quick; }
@@ -1185,28 +1187,32 @@ export component BindingsPanel inherits VerticalLayout {
                         VerticalLayout { alignment: center; width: 92px; Mono { text: "REACHED BY"; color: Theme.text-dim; } }
                         VerticalLayout {
                             alignment: center; horizontal-stretch: 1;
-                            Rectangle {
-                                height: 30px;
-                                border-radius: Theme.radius-sm;
-                                background: Theme.well;
-                                border-width: Theme.hair;
-                                border-color: State.hypershift-hold-ready ? Theme.accent-line : Theme.line;
-                                HorizontalLayout {
-                                    padding-left: 11px; padding-right: 11px; spacing: 9px;
-                                    VerticalLayout { alignment: center; Rectangle { width: 6px; height: 6px; border-radius: 3px; background: State.hypershift-hold-ready ? Theme.accent : Theme.line; } }
-                                    VerticalLayout {
-                                        alignment: center; horizontal-stretch: 1;
-                                        Text {
-                                            text: State.hypershift-hold-ready ? State.hypershift-hold-label : "no hold key · press-to-bind the control you'll hold";
-                                            color: State.hypershift-hold-ready ? Theme.accent : Theme.text-faint;
-                                            font-family: Theme.mono; font-size: Theme.fs-body; vertical-alignment: center; overflow: elide;
-                                        }
-                                    }
-                                }
+                            // the shared TriggerWell (lamp flavour, DISPLAY-only — the capture verb is the
+                            // key beside it, so this well isn't clickable). Lamp lit accent once bound.
+                            TriggerWell {
+                                text: State.hypershift-hold-label;
+                                prompt: "no hold key · press-to-bind the control you'll hold";
+                                live: State.hypershift-hold-ready;
+                                lamp: true;
                             }
                         }
-                        VerticalLayout { alignment: center; Button { text: State.hypershift-hold-ready ? "rebind" : "press-to-bind"; primary: !State.hypershift-hold-ready; clicked => { State.capture-hypershift-hold(); } } }
-                        if State.hypershift-hold-ready : VerticalLayout { alignment: center; Button { text: "clear"; danger: true; clicked => { State.clear-hypershift-hold(); } } }
+                        // rebind / clear — a fused SplitButton once a key exists (clear = danger half on
+                        // the right); a lone primary press-to-bind key while nothing is set (nothing to
+                        // clear, so no second half).
+                        if State.hypershift-hold-ready : VerticalLayout {
+                            alignment: center;
+                            SplitButton {
+                                left-text: "rebind";
+                                right-text: "clear";
+                                right-danger: true;
+                                left-clicked => { State.capture-hypershift-hold(); }
+                                right-clicked => { State.clear-hypershift-hold(); }
+                            }
+                        }
+                        if !State.hypershift-hold-ready : VerticalLayout {
+                            alignment: center;
+                            Button { text: "press-to-bind"; primary: true; clicked => { State.capture-hypershift-hold(); } }
+                        }
                     }
                     // BEHAVES AS — the stance, now contextual to the layer it tunes
                     HorizontalLayout {
@@ -1214,10 +1220,12 @@ export component BindingsPanel inherits VerticalLayout {
                         VerticalLayout { alignment: center; width: 92px; Mono { text: "BEHAVES AS"; color: Theme.text-dim; } }
                         VerticalLayout {
                             alignment: center; horizontal-stretch: 0;
-                            Segment {
+                            // the fused rail hugs its cells (min-cell floor) because the trailing spacer
+                            // below eats the row's slack — it never fills the whole row.
+                            SplitToggle {
                                 options: ["HOLD", "LATCH", "SMART", "1-SHOT"];
                                 index: root.stance-idx;
-                                min-seg: 60px;
+                                min-cell: 60px;
                                 picked(i) => { State.set-hypershift-mode(i == 0 ? "hold" : i == 1 ? "latch" : i == 2 ? "smart" : "one-shot"); }
                             }
                         }
@@ -1370,64 +1378,21 @@ export component BindingsPanel inherits VerticalLayout {
                         if State.macro-busy : Pill { text: "WORKING"; live: true; }
                         // BLOCKS ⇄ CODE — the same macro, two presentations: a visual node-blocks canvas
                         // or the raw Python. Switching TO blocks re-parses the current source so the
-                        // canvas reflects whatever the code view holds.
-                        // a single SPLIT BUTTON — two joined halves under ONE rounded outline (a hairline
-                        // split between them), the active side lit. Not two pills with a gap.
+                        // canvas reflects whatever the code view holds. The fused SplitToggle IS the mode
+                        // grammar (two halves, one outline, active side lit) — the hand-rolled byte-copy
+                        // that used to sit here (drawn blocks-icon and all) is gone.
                         VerticalLayout {
-                            width: 160px;
                             alignment: center;
-                            Rectangle {
-                                height: Theme.row-h-sm;
-                                border-radius: Theme.radius-sm;
-                                border-width: Theme.hair;
-                                border-color: Theme.line;
-                                clip: true;   // square the inner halves to the rounded outline
-                                HorizontalLayout {
-                                    spacing: 0;
-                                    blk := Rectangle {
-                                        horizontal-stretch: 1;
-                                        property <bool> on: !State.macro-code-view;
-                                        background: blk.on ? Theme.accent-glow : (blka.has-hover ? Theme.well : transparent);
-                                        animate background { duration: Theme.quick; }
-                                        // the blocks icon is DRAWN (not a font glyph — Consolas lacks the grid
-                                        // glyphs): two tiny stacked cards = the step blocks, to match ‹/› code.
-                                        HorizontalLayout {
-                                            alignment: center;
-                                            spacing: 6px;
-                                            VerticalLayout {
-                                                alignment: center;
-                                                spacing: 2px;
-                                                Rectangle { width: 12px; height: 4px; border-radius: 1px; background: blk.on ? Theme.accent : (blka.has-hover ? Theme.text-mid : Theme.text-dim); }
-                                                Rectangle { width: 12px; height: 4px; border-radius: 1px; background: blk.on ? Theme.accent : (blka.has-hover ? Theme.text-mid : Theme.text-dim); }
-                                            }
-                                            Text {
-                                                text: "blocks";
-                                                vertical-alignment: center;
-                                                color: blk.on ? Theme.accent : (blka.has-hover ? Theme.text-mid : Theme.text-dim);
-                                                font-size: Theme.fs-small; font-weight: 700; font-family: Theme.mono; letter-spacing: Theme.track-2;
-                                            }
-                                        }
-                                        blka := TouchArea {
-                                            mouse-cursor: MouseCursor.pointer;
-                                            clicked => { State.macro-code-view = false; State.refresh-macro-blocks(State.macro-source); }
-                                        }
-                                    }
-                                    Rectangle { width: Theme.hair; background: Theme.line; }   // the split
-                                    cod := Rectangle {
-                                        horizontal-stretch: 1;
-                                        property <bool> on: State.macro-code-view;
-                                        background: cod.on ? Theme.accent-glow : (coda.has-hover ? Theme.well : transparent);
-                                        animate background { duration: Theme.quick; }
-                                        Text {
-                                            text: "‹/› code";
-                                            vertical-alignment: center; horizontal-alignment: center;
-                                            color: cod.on ? Theme.accent : (coda.has-hover ? Theme.text-mid : Theme.text-dim);
-                                            font-size: Theme.fs-small; font-weight: 700; font-family: Theme.mono; letter-spacing: Theme.track-2;
-                                        }
-                                        coda := TouchArea {
-                                            mouse-cursor: MouseCursor.pointer;
-                                            clicked => { State.macro-code-view = true; }
-                                        }
+                            SplitToggle {
+                                width: 160px;
+                                options: ["blocks", "‹/› code"];
+                                index: State.macro-code-view ? 1 : 0;
+                                picked(i) => {
+                                    if (i == 0) {
+                                        State.macro-code-view = false;
+                                        State.refresh-macro-blocks(State.macro-source);
+                                    } else {
+                                        State.macro-code-view = true;
                                     }
                                 }
                             }

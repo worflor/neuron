@@ -1,5 +1,5 @@
 import { Theme } from "../theme.slint";
-import { Card, SectionTitle, Label, Button, Field, Slider, ContactRow, Toggle, Pill, Mono, Divider, Readout, PanelHead, SplitButton, SplitToggle } from "../widgets/controls.slint";
+import { Card, SectionTitle, Label, Button, Field, Slider, ContactRow, Toggle, Pill, Mono, Divider, Readout, PanelHead, SplitButton, SplitToggle, LampRail, Disclosure, SelectTick } from "../widgets/controls.slint";
 import { State } from "../state.slint";
 import { DeviceRow } from "../models.slint";
 
@@ -19,7 +19,7 @@ component DeviceGlyph inherits Path {
     width: 26px;
     height: 26px;
     stroke: root.ink;
-    stroke-width: 1px;
+    stroke-width: Theme.hair;
     fill: transparent;
     commands: root.kind == "mouse"
         // capsule body + the scroll split line
@@ -61,7 +61,7 @@ component SheenGlyph inherits Rectangle {
         clip: true;
         background: transparent;
         opacity: root.live ? 1.0 : 0.0;
-        animate x, opacity { duration: 340ms; }
+        animate x, opacity { duration: Theme.sheen; }
         DeviceGlyph {
             x: -parent.x;
             kind: root.kind;
@@ -76,7 +76,7 @@ component SheenGlyph inherits Rectangle {
         clip: true;
         background: transparent;
         opacity: root.live ? 0.92 : 0.0;
-        animate x, opacity { duration: 340ms; }
+        animate x, opacity { duration: Theme.sheen; }
         DeviceGlyph {
             x: -parent.x;
             kind: root.kind;
@@ -119,7 +119,7 @@ component SheenText inherits Rectangle {
         clip: true;
         background: transparent;
         opacity: root.live ? 1.0 : 0.0;
-        animate x, opacity { duration: 340ms; }
+        animate x, opacity { duration: Theme.sheen; }
         Text {
             x: -parent.x;
             width: root.width;
@@ -142,7 +142,7 @@ component SheenText inherits Rectangle {
         clip: true;
         background: transparent;
         opacity: root.live ? 0.82 : 0.0;
-        animate x, opacity { duration: 340ms; }
+        animate x, opacity { duration: Theme.sheen; }
         Text {
             x: -parent.x;
             width: root.width;
@@ -258,11 +258,11 @@ component DeviceLine inherits Rectangle {
     border-color: selected ? Theme.line : transparent;
     animate background, border-color, opacity { duration: Theme.quick; }
     property <bool> sheen-live: root.d.connected && ta.has-hover;
-    // accent index tick on the selected channel — the only colour; settles in with the row
-    Rectangle {
-        x: 0; width: 2px; y: 12px; height: parent.height - 24px;
-        background: root.selected ? Theme.accent : transparent;
-        animate background { duration: Theme.quick; }
+    // accent index tick on the selected channel — the only colour; the shared SelectTick is the bar +
+    // its settle, and this site supplies its own vertical inset (12px top/bottom).
+    SelectTick {
+        active: root.selected;
+        y: 12px; height: parent.height - 24px;
     }
     ta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.clicked(); } }
     // CARD CONTENT — a flow row: [glyph] [main: identity over data] [backup]. The layout engine places
@@ -564,77 +564,18 @@ export component DevicePanel inherits VerticalLayout {
                                 released(v) => { State.set-device-volume(v); }
                             }
                         }
-                        // channel state as ONE two-cell switch bank (LIVE ↔ MUTED), not a loose button +
+                        // channel state as ONE two-cell LampRail (LIVE ↔ MUTED), not a loose button +
                         // status pill: a fused hairline rail, the current cell lit (LIVE phosphor, MUTED
-                        // warn — a silenced channel isn't "live"). Clicking the OTHER cell toggles; clicking
-                        // the cell that already holds does nothing (no redundant round-trip).
-                        Rectangle {
-                            height: Theme.row-h-sm;
-                            border-radius: Theme.radius-sm;
-                            border-width: Theme.hair;
-                            border-color: Theme.line;
-                            clip: true;
-                            HorizontalLayout {
-                                spacing: 0;
-                                live-cell := Rectangle {
-                                    horizontal-stretch: 1;
-                                    property <bool> on: !State.device-muted;
-                                    background: live-cell.on ? Theme.accent-glow : (liveta.has-hover ? Theme.well : transparent);
-                                    animate background { duration: Theme.quick; }
-                                    HorizontalLayout {
-                                        spacing: 6px; alignment: center;
-                                        Rectangle {
-                                            width: Theme.dot; height: Theme.dot; border-radius: 1px;
-                                            // self-center vertically — a fixed-size layout child top-aligns
-                                            // otherwise (the lamp floated at the cell ceiling); Pill's idiom.
-                                            y: (parent.height - self.height) / 2;
-                                            background: live-cell.on ? Theme.accent : Theme.text-faint.with-alpha(0.5);
-                                            animate background { duration: Theme.quick; }
-                                        }
-                                        Text {
-                                            text: "LIVE";
-                                            vertical-alignment: center;
-                                            color: live-cell.on ? Theme.accent : Theme.text-dim;
-                                            font-size: Theme.fs-small; font-weight: 700; font-family: Theme.mono;
-                                            letter-spacing: Theme.track-2;
-                                            animate color { duration: Theme.quick; }
-                                        }
-                                    }
-                                    liveta := TouchArea {
-                                        mouse-cursor: MouseCursor.pointer;
-                                        clicked => { if (State.device-muted) { State.toggle-device-mute(); } }
-                                    }
-                                }
-                                // the seam between the two states
-                                Rectangle { width: Theme.hair; background: Theme.line; }
-                                mute-cell := Rectangle {
-                                    horizontal-stretch: 1;
-                                    property <bool> on: State.device-muted;
-                                    background: mute-cell.on ? Theme.warn.with-alpha(0.1) : (muteta.has-hover ? Theme.well : transparent);
-                                    animate background { duration: Theme.quick; }
-                                    HorizontalLayout {
-                                        spacing: 6px; alignment: center;
-                                        Rectangle {
-                                            width: Theme.dot; height: Theme.dot; border-radius: 1px;
-                                            // self-center vertically (fixed-size layout children top-align).
-                                            y: (parent.height - self.height) / 2;
-                                            background: mute-cell.on ? Theme.warn : Theme.text-faint.with-alpha(0.5);
-                                            animate background { duration: Theme.quick; }
-                                        }
-                                        Text {
-                                            text: "MUTED";
-                                            vertical-alignment: center;
-                                            color: mute-cell.on ? Theme.warn : Theme.text-dim;
-                                            font-size: Theme.fs-small; font-weight: 700; font-family: Theme.mono;
-                                            letter-spacing: Theme.track-2;
-                                            animate color { duration: Theme.quick; }
-                                        }
-                                    }
-                                    muteta := TouchArea {
-                                        mouse-cursor: MouseCursor.pointer;
-                                        clicked => { if (!State.device-muted) { State.toggle-device-mute(); } }
-                                    }
-                                }
+                        // warn — a silenced channel isn't "live"). Exclusive semantics live in `toggled`:
+                        // clicking the OTHER cell toggles the mute; clicking the cell that already holds
+                        // does nothing (no redundant round-trip).
+                        LampRail {
+                            options: ["LIVE", "MUTED"];
+                            on: [!State.device-muted, State.device-muted];
+                            tints: [Theme.accent, Theme.warn];
+                            toggled(i) => {
+                                if (i == 0 && State.device-muted) { State.toggle-device-mute(); }
+                                if (i == 1 && !State.device-muted) { State.toggle-device-mute(); }
                             }
                         }
                     }
@@ -706,39 +647,21 @@ export component DevicePanel inherits VerticalLayout {
                                     }
                                 }
                             }
-                            // pick which stage is ACTIVE — the cycle's second half. The stage numbers are
-                            // ONE selector bank, so they ride a content-hugging fused rail (label outside,
-                            // stretch spacer trailing so the rail hugs its cells instead of spanning).
+                            // pick which stage is ACTIVE — the cycle's second half. The stage numbers ride
+                            // a content-hugging ContactRow in ORDINAL / by-index mode: the cells label as
+                            // stage 1..N (the per-stage DPI values already live in the field above), the
+                            // lit cell tracks dpi-active-stage. Label outside, stretch spacer trailing so
+                            // the rail hugs its cells instead of spanning.
                             HorizontalLayout {
                                 spacing: 6px;
                                 Mono { text: "stage"; color: Theme.text-faint; }
-                                Rectangle {
-                                    height: Theme.row-h-sm;
-                                    border-radius: Theme.radius-sm;
-                                    border-width: Theme.hair;
-                                    border-color: Theme.line;
-                                    clip: true;
-                                    HorizontalLayout {
-                                        spacing: 0;
-                                        for s[i] in State.dpi-stage-nums : stg-cell := Rectangle {
-                                            // compact stage NUMBER — the per-stage DPI values already live
-                                            // in the field above ("i:value" chips overflowed once a device
-                                            // exposed 5 stages with a wide value).
-                                            min-width: 34px;
-                                            property <bool> on: i == State.dpi-active-stage;
-                                            background: stg-cell.on ? Theme.accent-glow : (stg-ta.has-hover ? Theme.well : transparent);
-                                            animate background { duration: Theme.quick; }
-                                            if i > 0 : Rectangle { x: 0; width: Theme.hair; background: Theme.line; }
-                                            Text {
-                                                text: "" + (i + 1);
-                                                vertical-alignment: center; horizontal-alignment: center;
-                                                color: stg-cell.on ? Theme.accent : Theme.text-dim;
-                                                font-size: Theme.fs-small; font-weight: 700; font-family: Theme.mono;
-                                                animate color { duration: Theme.quick; }
-                                            }
-                                            stg-ta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { State.dpi-active-stage = i; } }
-                                        }
-                                    }
+                                ContactRow {
+                                    options: State.dpi-stage-nums;
+                                    ordinal: true;
+                                    by-index: true;
+                                    index: State.dpi-active-stage;
+                                    min-cell: 34px;
+                                    picked-index(i) => { State.dpi-active-stage = i; }
                                 }
                                 Rectangle { horizontal-stretch: 1; min-width: 8px; }
                             }
@@ -816,41 +739,18 @@ export component DevicePanel inherits VerticalLayout {
                                     // ONE config write per gesture, not one per drag-tick
                                     released(v) => { State.save-sniper(v); }
                                 }
-                                // preset DPIs are ONE selector bank — a content-hugging fused rail (label
-                                // outside, trailing stretch spacer so the rail hugs its cells).
+                                // preset DPIs ride a content-hugging value-keyed ContactRow — the cell
+                                // whose DPI equals sniper-dpi lights. Label outside, trailing stretch
+                                // spacer so the rail hugs its cells. The pick double-writes exactly as the
+                                // hand-rolled cell did: set the draft AND persist it (save-sniper).
                                 if State.dpi-stage-nums.length > 0 : HorizontalLayout {
                                     spacing: 6px;
                                     Mono { text: "presets"; color: Theme.text-faint; }
-                                    Rectangle {
-                                        height: Theme.row-h-sm;
-                                        border-radius: Theme.radius-sm;
-                                        border-width: Theme.hair;
-                                        border-color: Theme.line;
-                                        clip: true;
-                                        HorizontalLayout {
-                                            spacing: 0;
-                                            for s[i] in State.dpi-stage-nums : snp-cell := Rectangle {
-                                                min-width: 48px;
-                                                property <bool> on: s == State.sniper-dpi;
-                                                background: snp-cell.on ? Theme.accent-glow : (snp-ta.has-hover ? Theme.well : transparent);
-                                                animate background { duration: Theme.quick; }
-                                                if i > 0 : Rectangle { x: 0; width: Theme.hair; background: Theme.line; }
-                                                Text {
-                                                    text: "" + s;
-                                                    vertical-alignment: center; horizontal-alignment: center;
-                                                    color: snp-cell.on ? Theme.accent : Theme.text-dim;
-                                                    font-size: Theme.fs-small; font-weight: 700; font-family: Theme.mono;
-                                                    animate color { duration: Theme.quick; }
-                                                }
-                                                snp-ta := TouchArea {
-                                                    mouse-cursor: MouseCursor.pointer;
-                                                    clicked => {
-                                                        State.sniper-dpi = s;
-                                                        State.save-sniper(s);
-                                                    }
-                                                }
-                                            }
-                                        }
+                                    ContactRow {
+                                        options: State.dpi-stage-nums;
+                                        value: State.sniper-dpi;
+                                        min-cell: 48px;
+                                        picked(s) => { State.sniper-dpi = s; State.save-sniper(s); }
                                     }
                                     Rectangle { horizontal-stretch: 1; }
                                 }
@@ -879,61 +779,25 @@ export component DevicePanel inherits VerticalLayout {
                         padding: 12px;
                         spacing: 13px;
                         SectionTitle { text: "KEY GUARD"; }
-                        Mono { text: "swallow OS chords mid-game so they can't yank you out (host-side, no device write)."; color: Theme.text-faint; wrap: word-wrap; }
-                        // the four chords are ONE multi-select switch bank (several can be swallowed at
-                        // once), fused into a single hairline rail with 1px seams — the SplitToggle
-                        // grammar. Each cell wears a lamp dot so a MULTI-lit bank stays legible (an
-                        // accent-fill alone can't show "two of four on" the way lit lamps can).
-                        Rectangle {
-                            height: 28px;
-                            border-radius: Theme.radius-sm;
-                            border-width: Theme.hair;
-                            border-color: Theme.line;
-                            clip: true;
-                            HorizontalLayout {
-                                spacing: 0;
-                                for g[i] in [
-                                    { l: "Alt+Tab", on: State.disable-alt-tab },
-                                    { l: "Win", on: State.disable-win },
-                                    { l: "Alt+F4", on: State.disable-alt-f4 },
-                                    { l: "Alt+Esc", on: State.disable-alt-esc },
-                                ] : Rectangle {
-                                    horizontal-stretch: 1;
-                                    background: g.on ? Theme.accent-glow : (kg-ta.has-hover ? Theme.well : transparent);
-                                    animate background { duration: Theme.quick; }
-                                    if i > 0 : Rectangle { x: 0; width: Theme.hair; background: Theme.line; }
-                                    HorizontalLayout {
-                                        spacing: 6px; alignment: center;
-                                        Rectangle {
-                                            width: Theme.dot; height: Theme.dot; border-radius: 1px;
-                                            // self-center vertically (fixed-size layout children top-align).
-                                            y: (parent.height - self.height) / 2;
-                                            background: g.on ? Theme.accent : Theme.text-faint.with-alpha(0.5);
-                                            animate background { duration: Theme.quick; }
-                                        }
-                                        Text {
-                                            text: g.l;
-                                            vertical-alignment: center;
-                                            color: g.on ? Theme.accent : Theme.text-dim;
-                                            font-size: Theme.fs-small; font-weight: 700; font-family: Theme.mono;
-                                            animate color { duration: Theme.quick; }
-                                        }
-                                    }
-                                    kg-ta := TouchArea {
-                                        mouse-cursor: MouseCursor.pointer;
-                                        clicked => {
-                                            if (g.l == "Alt+Tab") { State.disable-alt-tab = !State.disable-alt-tab; }
-                                            else if (g.l == "Win") { State.disable-win = !State.disable-win; }
-                                            else if (g.l == "Alt+F4") { State.disable-alt-f4 = !State.disable-alt-f4; }
-                                            else { State.disable-alt-esc = !State.disable-alt-esc; }
-                                            State.apply-gaming-mode();
-                                        }
-                                    }
-                                }
+                        GateNote { text: "swallow OS chords mid-game so they can't yank you out (host-side, no device write)."; }
+                        // the four chords are ONE multi-select LampRail (several can be swallowed at once),
+                        // fused into a single hairline rail with 1px seams. Each cell wears a lamp dot so a
+                        // MULTI-lit bank stays legible (an accent-fill alone can't show "two of four on" the
+                        // way lit lamps can). No tints — accent is the default lamp hue. `toggled` flips the
+                        // matching flag by index, then re-applies the gaming mode.
+                        LampRail {
+                            options: ["Alt+Tab", "Win", "Alt+F4", "Alt+Esc"];
+                            on: [State.disable-alt-tab, State.disable-win, State.disable-alt-f4, State.disable-alt-esc];
+                            toggled(i) => {
+                                if (i == 0) { State.disable-alt-tab = !State.disable-alt-tab; }
+                                else if (i == 1) { State.disable-win = !State.disable-win; }
+                                else if (i == 2) { State.disable-alt-f4 = !State.disable-alt-f4; }
+                                else { State.disable-alt-esc = !State.disable-alt-esc; }
+                                State.apply-gaming-mode();
                             }
                         }
                         // wrap (was clipped at "…reversible (lif") — a chord guard lifts on profile change.
-                        Mono { text: "lit = swallowed while a gaming profile is active. reversible, it lifts when the profile changes."; color: Theme.text-faint; wrap: word-wrap; }
+                        GateNote { text: "lit = swallowed while a gaming profile is active. reversible, it lifts when the profile changes."; }
                         // THE HARDWARE SIBLING — the board's OWN firmware Win-key kill (FN+F10 / GAME_LED),
                         // surfaced beside the host chords because it eats the Win key device-side with zero
                         // software. Gated on the keyboard actually exposing it (SetGameMode capability).
@@ -943,35 +807,21 @@ export component DevicePanel inherits VerticalLayout {
                             checked: State.game-mode-on;
                             toggled => { State.toggle-game-mode(); }
                         }
-                        if State.sel-can-game-mode : Mono {
+                        if State.sel-can-game-mode : GateNote {
                             text: "the board's own FN+F10 Win-key kill — firmware-side, works with zero software. this is what ate your Win key.";
-                            color: Theme.text-faint;
-                            wrap: word-wrap;
                         }
                     }
                 }
 
-                // ── ADVANCED — a quiet disclosure line; the deep / gated HARDWARE WRITES live behind it,
-                // collapsed by default so the everyday deck stays the at-a-glance surface. These stay
-                // OUT of the global apply: each keeps its own deliberate per-control apply.
-                // ── ADVANCED — a quiet, FULL-WIDTH clickable disclosure line; the deep / gated HARDWARE
+                // ── ADVANCED — a quiet, FULL-WIDTH clickable Disclosure line; the deep / gated HARDWARE
                 // WRITES live behind it, collapsed by default so the everyday deck stays the at-a-glance
                 // surface. The whole row is the hit target (can't be missed), and the open flag is a
                 // global (State.feel-adv-open). These stay OUT of the global apply: each keeps its own
                 // deliberate per-control apply.
-                if root.adv-any : Rectangle {
-                    height: 26px;
-                    adv-ta := TouchArea {
-                        mouse-cursor: MouseCursor.pointer;
-                        clicked => { State.feel-adv-open = !State.feel-adv-open; }
-                    }
-                    Text {
-                        x: 0; width: 100%; height: 100%;
-                        text: (State.feel-adv-open ? "▾ " : "▸ ") + "advanced · gated hardware writes";
-                        color: adv-ta.has-hover ? Theme.text-mid : Theme.text-faint;
-                        font-family: Theme.mono; font-size: Theme.fs-small;
-                        horizontal-alignment: left; vertical-alignment: center;
-                    }
+                if root.adv-any : Disclosure {
+                    label: "advanced · gated hardware writes";
+                    open: State.feel-adv-open;
+                    toggled => { State.feel-adv-open = !State.feel-adv-open; }
                 }
 
                 // ── HARDWARE WRITES — real device paths, held until verified on the wire ──
@@ -1012,38 +862,23 @@ export component DevicePanel inherits VerticalLayout {
                                     clicked => { State.apply-scroll-stages(State.scroll-stages); }
                                 }
                             }
-                            // the wheel-mode presets are ONE selector bank — a content-hugging fused rail
-                            // trailing the note (the stretch spacer keeps it hugging its cells on the right).
+                            // the wheel-mode presets ride a content-hugging SplitToggle (the N-way fused
+                            // selector), trailing the note — the stretch spacer keeps it hugging its cells
+                            // on the right. A custom typed value matches no preset (index -1) so nothing lights.
                             HorizontalLayout {
                                 spacing: 6px;
                                 Mono { text: State.scroll-stages-note; color: State.scroll-stages-valid ? Theme.text-faint : Theme.danger; overflow: elide; min-width: 0px; }
                                 Rectangle { horizontal-stretch: 1; min-width: 8px; }
-                                Rectangle {
-                                    height: Theme.row-h-sm;
-                                    border-radius: Theme.radius-sm;
-                                    border-width: Theme.hair;
-                                    border-color: Theme.line;
-                                    clip: true;
-                                    HorizontalLayout {
-                                        spacing: 0;
-                                        for m[i] in ["tactile/free", "tactile", "free"] : whl-cell := Rectangle {
-                                            min-width: 52px;
-                                            property <bool> on: State.scroll-stages == m;
-                                            background: whl-cell.on ? Theme.accent-glow : (whl-ta.has-hover ? Theme.well : transparent);
-                                            animate background { duration: Theme.quick; }
-                                            if i > 0 : Rectangle { x: 0; width: Theme.hair; background: Theme.line; }
-                                            Text {
-                                                text: m;
-                                                vertical-alignment: center; horizontal-alignment: center;
-                                                color: whl-cell.on ? Theme.accent : Theme.text-dim;
-                                                font-size: Theme.fs-small; font-weight: 700; font-family: Theme.mono;
-                                                animate color { duration: Theme.quick; }
-                                            }
-                                            whl-ta := TouchArea {
-                                                mouse-cursor: MouseCursor.pointer;
-                                                clicked => { State.scroll-stages = m; State.scroll-stages-edited(State.scroll-stages); }
-                                            }
-                                        }
+                                SplitToggle {
+                                    options: ["tactile/free", "tactile", "free"];
+                                    min-cell: 52px;
+                                    index: State.scroll-stages == "tactile/free" ? 0
+                                        : State.scroll-stages == "tactile" ? 1
+                                        : State.scroll-stages == "free" ? 2
+                                        : -1;
+                                    picked(i) => {
+                                        State.scroll-stages = i == 0 ? "tactile/free" : i == 1 ? "tactile" : "free";
+                                        State.scroll-stages-edited(State.scroll-stages);
                                     }
                                 }
                             }
@@ -1083,46 +918,24 @@ export component DevicePanel inherits VerticalLayout {
                                     clicked => { State.apply-idle(State.idle-secs); }
                                 }
                             }
-                            // idle presets are ONE selector bank — a content-hugging fused rail (label
-                            // outside, trailing stretch spacer so the rail hugs its cells).
+                            // idle presets ride a content-hugging SplitToggle (the N-way fused selector) —
+                            // label outside, trailing stretch spacer so the rail hugs its cells. A custom
+                            // typed value matches no preset (index -1) so nothing lights, same as before.
                             HorizontalLayout {
                                 spacing: 6px;
                                 Mono { text: "presets"; color: Theme.text-faint; }
-                                Rectangle {
-                                    height: Theme.row-h-sm;
-                                    border-radius: Theme.radius-sm;
-                                    border-width: Theme.hair;
-                                    border-color: Theme.line;
-                                    clip: true;
-                                    HorizontalLayout {
-                                        spacing: 0;
-                                        for p[i] in [
-                                            { l: "never", s: "0" },
-                                            { l: "1m", s: "60" },
-                                            { l: "5m", s: "300" },
-                                            { l: "15m", s: "900" },
-                                            { l: "1h", s: "3600" },
-                                        ] : slp-cell := Rectangle {
-                                            min-width: 44px;
-                                            property <bool> on: State.idle-secs-text == p.s;
-                                            background: slp-cell.on ? Theme.accent-glow : (slp-ta.has-hover ? Theme.well : transparent);
-                                            animate background { duration: Theme.quick; }
-                                            if i > 0 : Rectangle { x: 0; width: Theme.hair; background: Theme.line; }
-                                            Text {
-                                                text: p.l;
-                                                vertical-alignment: center; horizontal-alignment: center;
-                                                color: slp-cell.on ? Theme.accent : Theme.text-dim;
-                                                font-size: Theme.fs-small; font-weight: 700; font-family: Theme.mono;
-                                                animate color { duration: Theme.quick; }
-                                            }
-                                            slp-ta := TouchArea {
-                                                mouse-cursor: MouseCursor.pointer;
-                                                clicked => {
-                                                    State.idle-secs-text = p.s;
-                                                    State.idle-edited(State.idle-secs-text);
-                                                }
-                                            }
-                                        }
+                                SplitToggle {
+                                    options: ["never", "1m", "5m", "15m", "1h"];
+                                    min-cell: 44px;
+                                    index: State.idle-secs-text == "0" ? 0
+                                        : State.idle-secs-text == "60" ? 1
+                                        : State.idle-secs-text == "300" ? 2
+                                        : State.idle-secs-text == "900" ? 3
+                                        : State.idle-secs-text == "3600" ? 4
+                                        : -1;
+                                    picked(i) => {
+                                        State.idle-secs-text = i == 0 ? "0" : i == 1 ? "60" : i == 2 ? "300" : i == 3 ? "900" : "3600";
+                                        State.idle-edited(State.idle-secs-text);
                                     }
                                 }
                                 Rectangle { horizontal-stretch: 1; }

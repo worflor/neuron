@@ -15,7 +15,7 @@
 import { Theme } from "theme.slint";
 import { State } from "state.slint";
 import { GuideContent } from "guides.slint";
-import { Pill, Mono, CaptureOverlay } from "widgets/controls.slint";
+import { Pill, Mono, CaptureOverlay, StatusLamp, IconButton, SectionTitle, Label } from "widgets/controls.slint";
 
 import { DevicePanel } from "panels/device.slint";
 import { LightingPanel } from "panels/lighting.slint";
@@ -31,6 +31,9 @@ export { Theme }
 
 // One entry in the section selector — a numbered channel. Quiet mono; the active one is lit phosphor
 // with a short underscore tick. No size-jump, no pan: it just changes state (mechanical, not kinetic).
+// The nav-rail sibling of controls.slint's Contact — same lit-cell grammar (accent-glow fill +
+// accent-line frame), kept local because it carries a channel-index tick Contact doesn't. Every
+// colour / size / motion value routes through Theme; only the layout paddings are raw pixels.
 component NavEntry inherits Rectangle {
     in property <string> label;
     in property <int> index;
@@ -293,15 +296,13 @@ export component AppWindow inherits Window {
                         vertical-alignment: center;
                         animate color { duration: Theme.settle; }
                     }
-                    Text {
+                    Mono {
                         text: State.status-line;
                         // freshness is honest: an aged message dims instead of posing as current
                         color: State.status-stale ? Theme.text-faint
                             : State.status-kind == "err" ? Theme.danger
                             : Theme.text-mid;
                         font-size: Theme.fs-mono;
-                        font-family: Theme.mono;
-                        vertical-alignment: center;
                         overflow: elide;
                         // THE message absorbs every pixel of slack (and elides first) so the state
                         // cluster packs hard against the right edge — never floats in the middle.
@@ -319,15 +320,13 @@ export component AppWindow inherits Window {
                         spacing: 10px;
 
                         // BEACON: a macro is asking at the cursor (count includes queued asks).
+                        // A plain lit readout — the outer `if` IS the "lit" condition, so it always shows phosphor.
                         if State.beacon-count > 0 : HorizontalLayout {
                             spacing: 10px;
                             Rectangle { width: 1px; height: 12px; y: (parent.height - self.height) / 2; background: Theme.line; }
-                            Text {
+                            StatusLamp {
                                 text: State.beacon-count > 1 ? "beacon ×" + State.beacon-count : "beacon";
-                                color: Theme.accent;
-                                font-family: Theme.mono;
-                                font-size: Theme.fs-mono;
-                                vertical-alignment: center;
+                                lit: true;
                             }
                         }
 
@@ -336,30 +335,12 @@ export component AppWindow inherits Window {
                         if State.writes-paused : HorizontalLayout {
                             spacing: 10px;
                             Rectangle { width: 1px; height: 12px; y: (parent.height - self.height) / 2; background: Theme.line; }
-                            Rectangle {
-                                width: pwrow.preferred-width;
-                                height: parent.height;
-                                pwrow := HorizontalLayout {
-                                    spacing: 6px;
-                                    Rectangle {
-                                        width: Theme.dot; height: Theme.dot; border-radius: 1px;
-                                        y: (parent.height - self.height) / 2;
-                                        background: Theme.danger;
-                                    }
-                                    Text {
-                                        text: "writes paused";
-                                        // hover brightens the label so the kill-switch invites the click
-                                        color: pwta.has-hover ? Theme.text : Theme.danger;
-                                        font-family: Theme.mono;
-                                        font-size: Theme.fs-mono;
-                                        vertical-alignment: center;
-                                        animate color { duration: Theme.quick; }
-                                    }
-                                }
-                                pwta := TouchArea {
-                                    mouse-cursor: MouseCursor.pointer;
-                                    clicked => { State.page = 3; }
-                                }
+                            StatusLamp {
+                                text: "writes paused";
+                                lit: true;
+                                tint: Theme.danger;
+                                clickable: true;
+                                clicked => { State.page = 3; }
                             }
                         }
 
@@ -370,40 +351,19 @@ export component AppWindow inherits Window {
                         HorizontalLayout {
                             spacing: 10px;
                             Rectangle { width: 1px; height: 12px; y: (parent.height - self.height) / 2; background: Theme.line; }
-                            Rectangle {
-                                width: gaterow.preferred-width;
-                                height: parent.height;
-                                gaterow := HorizontalLayout {
-                                    spacing: 6px;
-                                    Rectangle {
-                                        width: Theme.dot; height: Theme.dot; border-radius: 1px;
-                                        y: (parent.height - self.height) / 2;
-                                        background: State.input-armed ? Theme.accent
-                                            : root.arm-confirm ? Theme.warn
-                                            : Theme.text-faint.with-alpha(0.5);
-                                        animate background { duration: Theme.quick; }
-                                    }
-                                    Text {
-                                        text: State.input-armed ? "armed" : root.arm-confirm ? "arm?" : "safe";
-                                        // when SAFE, a hover brightens the label so it INVITES the arming click
-                                        color: State.input-armed ? Theme.accent
-                                            : root.arm-confirm ? Theme.warn
-                                            : (gateta.has-hover ? Theme.text-mid : Theme.text-dim);
-                                        font-family: Theme.mono;
-                                        font-size: Theme.fs-mono;
-                                        vertical-alignment: center;
-                                        animate color { duration: Theme.quick; }
-                                    }
-                                }
-                                gateta := TouchArea {
-                                    mouse-cursor: MouseCursor.pointer;
-                                    clicked => {
-                                        if (State.input-armed || root.arm-confirm) {
-                                            State.toggle-input-armed();
-                                            root.arm-confirm = false;
-                                        } else {
-                                            root.arm-confirm = true;
-                                        }
+                            // lit in either loud state — accent when ARMED, warn when ARM?; SAFE is the
+                            // unlit gutter (StatusLamp draws lamp-off + the text-dim ink, hover→text-mid).
+                            StatusLamp {
+                                text: State.input-armed ? "armed" : root.arm-confirm ? "arm?" : "safe";
+                                lit: State.input-armed || root.arm-confirm;
+                                tint: State.input-armed ? Theme.accent : Theme.warn;
+                                clickable: true;
+                                clicked => {
+                                    if (State.input-armed || root.arm-confirm) {
+                                        State.toggle-input-armed();
+                                        root.arm-confirm = false;
+                                    } else {
+                                        root.arm-confirm = true;
                                     }
                                 }
                             }
@@ -414,13 +374,11 @@ export component AppWindow inherits Window {
                         if State.live-fired > 0 : HorizontalLayout {
                             spacing: 10px;
                             Rectangle { width: 1px; height: 12px; y: (parent.height - self.height) / 2; background: Theme.line; }
-                            Text {
+                            Mono {
                                 text: "fired " + State.live-fired + " · " + State.live-last-trigger
                                     + " → " + State.live-last-action;
                                 color: Theme.accent-dim;
-                                font-family: Theme.mono;
                                 font-size: Theme.fs-mono;
-                                vertical-alignment: center;
                                 overflow: elide;
                                 max-width: 340px;
                             }
@@ -430,12 +388,10 @@ export component AppWindow inherits Window {
                         HorizontalLayout {
                             spacing: 10px;
                             Rectangle { width: 1px; height: 12px; y: (parent.height - self.height) / 2; background: Theme.line; }
-                            Text {
+                            Mono {
                                 text: "focus " + State.focused-app;
                                 color: Theme.text-faint;
-                                font-family: Theme.mono;
                                 font-size: Theme.fs-mono;
-                                vertical-alignment: center;
                                 overflow: elide;
                                 max-width: 260px;
                             }
@@ -612,27 +568,12 @@ export component AppWindow inherits Window {
                                 }
                             }
                         }
-                        // ── X — always shown; a clear close affordance (the \u{00d7} glyph pattern) ──
+                        // ── X — always shown; a clear close affordance (the shared 22px icon chip) ──
                         VerticalLayout {
                             alignment: center;
-                            Rectangle {
-                                width: 22px; height: 22px;
-                                border-radius: Theme.radius-sm;
-                                background: xta.has-hover ? Theme.well-hi : transparent;
-                                animate background { duration: Theme.quick; }
-                                Text {
-                                    text: "\u{00d7}";
-                                    color: xta.has-hover ? Theme.text : Theme.text-dim;
-                                    font-family: Theme.mono;
-                                    font-size: Theme.fs-data;
-                                    horizontal-alignment: center;
-                                    vertical-alignment: center;
-                                    animate color { duration: Theme.quick; }
-                                }
-                                xta := TouchArea {
-                                    mouse-cursor: MouseCursor.pointer;
-                                    clicked => { State.guide-close(); }
-                                }
+                            IconButton {
+                                glyph: "\u{00d7}";
+                                clicked => { State.guide-close(); }
                             }
                         }
                     }
@@ -663,12 +604,12 @@ export component AppWindow inherits Window {
                                 spacing: 18px;
                                 for s in g.sections : VerticalLayout {
                                     spacing: 8px;
-                                    Text {
+                                    // the section legend — SectionTitle in accent, kept at the guide's
+                                    // own body size + track-1 so the copy stays byte-identical.
+                                    SectionTitle {
                                         text: s.head;
                                         color: Theme.accent;
-                                        font-family: Theme.mono;
                                         font-size: Theme.fs-body;
-                                        font-weight: 700;
                                         letter-spacing: Theme.track-1;
                                         wrap: word-wrap;
                                     }
@@ -677,12 +618,9 @@ export component AppWindow inherits Window {
                                     // macro editor, so a snippet here looks like where it'll be pasted). The
                                     // code cell is selectable and carries a floating copy button (top-right).
                                     for b in s.blocks : VerticalLayout {
-                                        if !b.code : Text {
+                                        if !b.code : Label {
                                             text: b.text;
                                             color: Theme.text-mid;
-                                            font-family: Theme.sans;
-                                            font-size: Theme.fs-body;
-                                            wrap: word-wrap;
                                         }
                                         if b.code : codecell := Rectangle {
                                             // flipped true for ~1.2s after a copy → swaps the glyph to a ✓

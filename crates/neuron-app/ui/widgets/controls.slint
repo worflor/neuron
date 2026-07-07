@@ -11,12 +11,18 @@ import { Theme } from "../theme.slint";
 import { State } from "../state.slint";
 
 // A grouping surface — an instrument "bezel". Near-invisible: a hair above the void with a single
-// hairline border, no glow, no shadow. Organizes without shouting.
+// hairline border, no glow, no shadow. Organizes without shouting. When `active`, the bezel picks up
+// an accent-strength hairline (the accent-line alpha, 0.27) in `tint` instead of the neutral line —
+// a lit/selected surface whose BACKGROUND stays unchanged (no noisy accent-glow fill), for a card
+// that reads "this is the chosen one" by its frame alone.
 export component Card inherits Rectangle {
+    in property <bool> active: false;
+    in property <color> tint: Theme.accent;
     background: Theme.bg-2;
     border-radius: Theme.radius;
     border-width: Theme.hair;
-    border-color: Theme.line;
+    border-color: root.active ? root.tint.with-alpha(0.27) : Theme.line;
+    animate border-color { duration: Theme.quick; }
 }
 
 // A faint divider line — the primary structuring element of the whole UI.
@@ -54,12 +60,18 @@ export component Mono inherits Text {
 }
 
 // One contact of a MODE SEGMENT (EFFECTS·PAINT, DIRECT·WEAVE…) — a quiet mono switch position,
-// the active one lit. A segment is a view selector, not a status lamp (that's Pill's job).
+// the active one lit. A segment is a view selector, not a status lamp (that's Pill's job). Two extras
+// for radio-row duty: a non-empty `desc` stacks a Theme.text-faint fs-small line UNDER the label (the
+// row grows to fit it — a word of what the choice does), and `fill` makes the contact STRETCH to fill
+// its row instead of hugging its label (full-width radio rows, e.g. the notification-mode chips).
 export component Contact inherits Rectangle {
     in property <string> label;
     in property <bool> active;
+    in property <string> desc: "";
+    in property <bool> fill: false;
     callback clicked();
-    height: 24px;
+    horizontal-stretch: root.fill ? 1 : 0;
+    height: root.desc != "" ? 40px : 24px;
     border-radius: Theme.radius-sm;
     background: active ? Theme.accent-glow : (cta.has-hover ? Theme.well : transparent);
     border-width: Theme.hair;
@@ -68,14 +80,26 @@ export component Contact inherits Rectangle {
     HorizontalLayout {
         padding-left: 10px;
         padding-right: 10px;
-        Text {
-            text: root.label;
-            color: root.active ? Theme.accent : (cta.has-hover ? Theme.text-mid : Theme.text-dim);
-            font-size: Theme.fs-small;
-            font-family: Theme.mono;
-            font-weight: root.active ? 700 : 500;
-            letter-spacing: Theme.track-4;
-            vertical-alignment: center;
+        VerticalLayout {
+            alignment: center;
+            spacing: 2px;
+            Text {
+                text: root.label;
+                color: root.active ? Theme.accent : (cta.has-hover ? Theme.text-mid : Theme.text-dim);
+                font-size: Theme.fs-small;
+                font-family: Theme.mono;
+                font-weight: root.active ? 700 : 500;
+                letter-spacing: Theme.track-4;
+                vertical-alignment: center;
+            }
+            if root.desc != "" : Text {
+                text: root.desc;
+                color: Theme.text-faint;
+                font-size: Theme.fs-small;
+                font-family: Theme.mono;
+                vertical-alignment: center;
+                overflow: elide;
+            }
         }
     }
     cta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.clicked(); } }
@@ -91,6 +115,10 @@ export component Pill inherits Rectangle {
     in property <bool> selected: false;    // a CHOSEN CHIP — lights its whole body, never a reflowing dot
     in property <bool> clickable: false;   // when true, the pill is a button (reports `clicked`)
     in property <bool> enabled: true;      // when false: dimmed ink + inert (mirrors Button's disabled state)
+    // the LIT hue — phosphor accent by default; a signal pill that means something OTHER than "live"
+    // (the capture-amber RICH badge) recolours its whole lit state here, not by fighting `tint` (which
+    // only inks the UNLIT label/gutter). Existing pills change nothing.
+    in property <color> live-tint: Theme.accent;
     callback clicked();
     // "lit" = the phosphor state, from either a live signal OR a chosen-chip selection.
     property <bool> lit: root.live || root.selected;
@@ -103,9 +131,9 @@ export component Pill inherits Rectangle {
     // (the label keeps min-width:0 + elide), so a genuinely tight row can still shrink and truncate it.
     max-width: lbl.preferred-width + (root.clickable ? 16px : 26px);
     border-radius: Theme.radius-sm;
-    background: lit ? Theme.accent-glow : (root.clickable && pill-ta.has-hover ? Theme.well : transparent);
+    background: lit ? root.live-tint.with-alpha(0.1) : (root.clickable && pill-ta.has-hover ? Theme.well : transparent);
     border-width: Theme.hair;
-    border-color: lit ? Theme.accent-line
+    border-color: lit ? root.live-tint.with-alpha(0.27)
         : root.clickable ? (pill-ta.has-hover ? Theme.text-dim : Theme.text-faint)
         : Theme.line;
     animate background, border-color { duration: Theme.quick; }
@@ -126,7 +154,7 @@ export component Pill inherits Rectangle {
             y: (parent.height - self.height) / 2;
             // lit = phosphor lamp; UNLIT = a dim dot in the pill's own ink — a visible "off" lamp, NOT
             // transparent. A same-as-background dot reads as an empty gap and skews the label off-centre.
-            background: root.live ? Theme.accent : root.tint.with-alpha(0.5);
+            background: root.live ? root.live-tint : root.tint.with-alpha(0.5);
         }
         lbl := Text {
             text: root.text;
@@ -135,7 +163,7 @@ export component Pill inherits Rectangle {
             // able to shrink/truncate when a row IS too tight (a long gate name may elide — by design).
             min-width: 0px;
             overflow: elide;
-            color: !root.enabled ? Theme.text-faint : (root.lit ? Theme.accent : root.tint);
+            color: !root.enabled ? Theme.text-faint : (root.lit ? root.live-tint : root.tint);
             font-size: Theme.fs-small;
             font-family: Theme.mono;
             font-weight: 700;
@@ -183,7 +211,7 @@ export component Button inherits Rectangle {
     // so it lights in place and never shoves the centred label sideways when work starts. Inserting it
     // into the label row (the old way) jolted the text ~11px right on every click — movement-on-interact.
     if root.busy : Rectangle {
-        width: 5px; height: 5px; border-radius: 3px;
+        width: Theme.dot; height: Theme.dot; border-radius: Theme.dot / 2;
         x: 9px;
         y: (parent.height - self.height) / 2;
         background: Theme.accent-dim;
@@ -256,7 +284,7 @@ export component Slider inherits Rectangle {
                 color: Theme.text-dim;
                 font-size: Theme.fs-small;
                 font-family: Theme.mono;
-                letter-spacing: 1px;
+                letter-spacing: Theme.track-3;
                 vertical-alignment: center;
             }
             Rectangle {}
@@ -372,13 +400,28 @@ export component Slider inherits Rectangle {
 // It reads as ONE switch bank, not a scatter of buttons: a single hairline-framed rail, the cells
 // fused by 1px seams (no gaps, no per-cell borders) — the SplitToggle grammar, so a legal-value
 // selector never drifts into the generic bordered-chips look. The lit cell IS the current value.
+//
+// Two modes let it drive an ORDINAL rail (a "stage 1..N" selector whose option array carries the
+// underlying DATA — the DPI values — while the user picks by stage number): `ordinal` labels each
+// cell with its 1-based position (ignoring `unit`), and `by-index` lights the cell at `index` instead
+// of the one whose value equals `value` (right when the values can repeat or aren't what "active"
+// means). `picked-index` fires the CELL INDEX on every click alongside `picked(opt)` (the value) —
+// a stage picker takes the index, a value picker takes opt; both always fire.
 export component ContactRow inherits Rectangle {
     in property <[int]> options;
     in property <int> value;
     in property <string> unit: "";
     in property <bool> enabled: true;
+    // min per-cell width — the content FLOOR the cells stretch up from (was a hardcoded 36px). At a
+    // normal column width the cells fill wider, but a many-contact row can shrink to N·min-cell so it
+    // fits a narrow FEEL column instead of pinning a hard minimum that overflows the two-column layout.
+    in property <length> min-cell: 36px;
+    in property <bool> ordinal: false;
+    in property <bool> by-index: false;
+    in property <int> index: -1;
     callback picked(int);
-    height: 28px;
+    callback picked-index(int);
+    height: Theme.row-h-sm;
     border-radius: Theme.radius-sm;
     border-width: Theme.hair;
     // the whole rail quiets its frame when gated — the bank reads "off" as one object, not per-cell
@@ -388,18 +431,16 @@ export component ContactRow inherits Rectangle {
     HorizontalLayout {
         spacing: 0;
         for opt[i] in root.options : cell := Rectangle {
-            // 36px FLOOR + stretch: at a normal column width the cells fill to ~52px, but a 7-contact
-            // row (in-game polling) can shrink to 7·36 ≈ 252px so it fits a narrow FEEL column instead
-            // of pinning a hard minimum that overflows the two-column layout.
-            min-width: 36px;
+            min-width: root.min-cell;
             horizontal-stretch: 1;
-            property <bool> on: root.value == opt;
+            property <bool> on: root.by-index ? (i == root.index) : (root.value == opt);
             background: cell.on ? Theme.accent-glow : (cta.has-hover && root.enabled ? Theme.well : transparent);
             animate background { duration: Theme.quick; }
             // the split — a hairline at the seam (every cell but the first), no gap between contacts
             if i > 0 : Rectangle { x: 0; width: Theme.hair; background: Theme.line; }
             Text {
-                text: opt + root.unit;
+                // ordinal → the 1-based stage number; value → the option value + its unit.
+                text: root.ordinal ? "" + (i + 1) : (opt + root.unit);
                 vertical-alignment: center;
                 horizontal-alignment: center;
                 // a disabled option stays LEGIBLE (text-dim) — the gated CONTEXT carries "off", not an
@@ -413,7 +454,7 @@ export component ContactRow inherits Rectangle {
             cta := TouchArea {
                 enabled: root.enabled;
                 mouse-cursor: root.enabled ? MouseCursor.pointer : MouseCursor.default;
-                clicked => { root.picked(opt); }
+                clicked => { root.picked(opt); root.picked-index(i); }
             }
         }
     }
@@ -427,7 +468,7 @@ export component Toggle inherits Rectangle {
     in property <bool> checked: false;
     in property <color> tint: Theme.accent;
     callback toggled(bool);
-    height: 26px;
+    height: Theme.seg-h;
     row-ta := TouchArea {
         mouse-cursor: MouseCursor.pointer;
         clicked => { root.toggled(!root.checked); }
@@ -494,7 +535,7 @@ export component Field inherits Rectangle {
     preferred-width: field-width;
     max-width: field-width;
     horizontal-stretch: 1;
-    height: 30px;
+    height: Theme.row-h;
     clip: true;
     border-radius: Theme.radius-sm;
     background: Theme.well;
@@ -597,7 +638,7 @@ export component Picker inherits Rectangle {
     in property <[string]> options;
     in property <int> index: 0;
     callback changed(int);
-    height: 30px;
+    height: Theme.row-h;
     border-radius: Theme.radius-sm;
     background: ta.has-hover ? Theme.well : Theme.bg-2;
     border-width: Theme.hair;
@@ -615,7 +656,7 @@ export component Picker inherits Rectangle {
             VerticalLayout {
                 padding: 4px;
                 for opt[i] in root.options : Rectangle {
-                    height: 26px;
+                    height: Theme.seg-h;
                     border-radius: Theme.radius-sm;
                     background: ota.has-hover ? Theme.well : transparent;
                     ota := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.changed(i); } }
@@ -702,7 +743,7 @@ export component ActionPicker inherits VerticalLayout {
     out property <string> action-label: root.cur-label;
     spacing: 8px;
     Rectangle {
-        height: 30px;
+        height: Theme.row-h;
         border-radius: Theme.radius-sm;
         background: pa.has-hover ? Theme.well : Theme.bg-2;
         border-width: Theme.hair;
@@ -760,7 +801,7 @@ export component ActionPicker inherits VerticalLayout {
                                             font-family: Theme.mono;
                                             font-size: Theme.fs-small;
                                             font-weight: 700;
-                                            letter-spacing: 1.6px;
+                                            letter-spacing: Theme.track-4;
                                         }
                                     }
                                 }
@@ -995,47 +1036,21 @@ export component PanelHead inherits HorizontalLayout {
     }
 }
 
-// A SEGMENT — a row of mutually-exclusive choice contacts, STRING-keyed by index, the active one
-// lit. The string sibling of ContactRow (which is int-only). One home for the HYPERSHIFT STANCE +
-// ACTIVATION presets — so the same switch can't drift in look. (Joined 2-way switches like
-// DIRECT/WEAVE are SplitToggle now.) The lit contact IS the choice; accent marks it, nothing else.
-export component Segment inherits HorizontalLayout {
-    in property <[string]> options;
-    in property <int> index;
-    in property <length> min-seg: 56px;
-    callback picked(int);
-    spacing: 4px;
-    for opt[i] in root.options : Rectangle {
-        height: Theme.row-h-sm;
-        min-width: root.min-seg;
-        border-radius: Theme.radius-sm;
-        property <bool> on: i == root.index;
-        background: self.on ? Theme.accent-glow : (sta.has-hover ? Theme.well : transparent);
-        border-width: Theme.hair;
-        border-color: self.on ? Theme.accent-line : (sta.has-hover ? Theme.text-faint : Theme.line);
-        animate background, border-color { duration: Theme.quick; }
-        Text {
-            text: opt;
-            vertical-alignment: center; horizontal-alignment: center;
-            color: parent.on ? Theme.accent : (sta.has-hover ? Theme.text-mid : Theme.text-dim);
-            font-size: Theme.fs-small; font-weight: 700; font-family: Theme.mono;
-            letter-spacing: Theme.track-2;
-        }
-        sta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.picked(i); } }
-    }
-}
-
-// A SPLIT TOGGLE — the JOINED sibling of Segment: the choices sit under ONE rounded outline with a
-// hairline split between them (no gaps), the active half lit. Same API as Segment (options/index/
-// picked). For 2-way mode switches that should read as a SINGLE control — BASE·HYPERSHIFT,
-// DIRECT·WEAVE — the way the macro blocks·code toggle does, instead of two separate pills. The
-// caller sets `width` (the halves stretch to fill it equally, so sizing is robust).
+// A SPLIT TOGGLE — the N-WAY FUSED SELECTOR: the ONE grammar for a mutually-exclusive choice. The
+// options sit under ONE rounded outline with a hairline split between them (no gaps), the active cell
+// lit. Two-way mode switches are the common case (BASE·HYPERSHIFT, DIRECT·WEAVE, the macro blocks·code
+// toggle), yet it takes ANY count — it retired the old gapped `Segment` (loose bordered chips) so a
+// choice can't drift back into the scattered look. The caller sets `width` and the cells stretch to
+// fill it equally. `min-cell` puts a per-cell width FLOOR so a content-hugging rail — one placed
+// BESIDE a trailing stretch spacer rather than filling a fixed width — sizes to its cells (a label
+// outside, the rail hugging its options, slack eaten by the spacer).
 export component SplitToggle inherits Rectangle {
     in property <[string]> options;
     in property <int> index;
     // when false the whole bank goes quiet + inert (a gated selector) — frame softens, ink faints,
     // the TouchAreas stop reporting; mirrors the disabled key so a gated pick reads dead, not broken.
     in property <bool> enabled: true;
+    in property <length> min-cell: 0px;
     callback picked(int);
     height: Theme.row-h-sm;
     border-radius: Theme.radius-sm;
@@ -1046,6 +1061,7 @@ export component SplitToggle inherits Rectangle {
     HorizontalLayout {
         spacing: 0;
         for opt[i] in root.options : seg := Rectangle {
+            min-width: root.min-cell;
             horizontal-stretch: 1;
             property <bool> on: i == root.index;
             background: seg.on ? Theme.accent-glow : (root.enabled && sta.has-hover ? Theme.well : transparent);
@@ -1080,10 +1096,19 @@ export component SplitButton inherits Rectangle {
     in property <string> left-text;
     in property <string> right-text;
     in property <bool> right-primary: false;
+    // a danger half tints its LABEL red (mirroring Button.danger) — the destructive verb (unbind /
+    // clear) reads dangerous without changing the shared frame (stays Theme.line) or the hover
+    // backgrounds. `right-primary` and `right-danger` are mutually exclusive by convention: if both
+    // are set on the right half, PRIMARY wins (a commit-accent half is never also red).
+    in property <bool> left-danger: false;
+    in property <bool> right-danger: false;
     in property <bool> enabled: true;
-    // the right (apply) half can be gated on its own — e.g. SCAN always lives, APPLY only when a
-    // tunable device is selected. Left half follows `enabled`; right half needs both.
+    // EITHER half can be gated on its own — e.g. SCAN always lives, APPLY only when a tunable device
+    // is selected; or "− remove" goes dead at the last stop while "+ add" stays live. A gated half
+    // wears the disabled ink + inert contact (never a live-looking key that silently no-ops).
+    in property <bool> left-enabled: true;
     in property <bool> right-enabled: true;
+    property <bool> l-on: root.enabled && root.left-enabled;
     property <bool> r-on: root.enabled && root.right-enabled;
     callback left-clicked();
     callback right-clicked();
@@ -1097,7 +1122,7 @@ export component SplitButton inherits Rectangle {
         // ── LEFT half — a ghost action (reload) ───────────────────────────
         lseg := Rectangle {
             horizontal-stretch: 1;
-            background: !root.enabled ? transparent
+            background: !root.l-on ? transparent
                 : lta.pressed ? Theme.well-hi
                 : lta.has-hover ? Theme.well
                 : transparent;
@@ -1107,7 +1132,8 @@ export component SplitButton inherits Rectangle {
                 Text {
                     text: root.left-text;
                     vertical-alignment: center; horizontal-alignment: center;
-                    color: !root.enabled ? Theme.text-faint
+                    color: !root.l-on ? Theme.text-faint
+                        : root.left-danger ? Theme.danger
                         : lta.has-hover ? Theme.text : Theme.text-mid;
                     font-size: Theme.fs-small; font-weight: 700; font-family: Theme.mono;
                     letter-spacing: Theme.track-2;
@@ -1115,8 +1141,8 @@ export component SplitButton inherits Rectangle {
                 }
             }
             lta := TouchArea {
-                enabled: root.enabled;
-                mouse-cursor: root.enabled ? MouseCursor.pointer : MouseCursor.default;
+                enabled: root.l-on;
+                mouse-cursor: root.l-on ? MouseCursor.pointer : MouseCursor.default;
                 clicked => { root.left-clicked(); }
             }
         }
@@ -1138,6 +1164,7 @@ export component SplitButton inherits Rectangle {
                     vertical-alignment: center; horizontal-alignment: center;
                     color: !root.r-on ? Theme.text-faint
                         : root.right-primary ? Theme.accent
+                        : root.right-danger ? Theme.danger
                         : (rta.has-hover ? Theme.text : Theme.text-mid);
                     font-size: Theme.fs-small; font-weight: 700; font-family: Theme.mono;
                     letter-spacing: Theme.track-2;
@@ -1273,6 +1300,26 @@ export global Palette {
     ];
 }
 
+// The PRESET SWATCH ROW — the strip of 26px hue chips shared by ColorPicker AND the lighting brush
+// panel (which used to hand-copy it, letting the two drift). The chip whose bare-RRGGBB equals
+// `value` wears the accent frame; a click reports that hex via `pick`. Trailing spacer keeps the
+// chips hugging left in a stretchy column.
+export component SwatchRow inherits HorizontalLayout {
+    in property <[{hex: string, col: color}]> swatches;
+    in property <string> value;
+    callback pick(string);
+    spacing: 6px;
+    for sw in root.swatches : Rectangle {
+        width: 26px; height: 26px; border-radius: Theme.radius-sm;
+        border-width: Theme.hair;
+        border-color: sw.hex == root.value ? Theme.accent-line : (swta.has-hover ? Theme.text-faint : Theme.line-soft);
+        background: sw.col;
+        animate border-color { duration: Theme.quick; }
+        swta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.pick(sw.hex); } }
+    }
+    Rectangle {}
+}
+
 // The reusable PRISM-BASED COLOUR PICKER — the rich picker shared by the SYSTEM page (interface +
 // weave accents) and the LIGHTING page (the effect's colour knob). A live-preview swatch + label, a
 // row of preset hue swatches, a hex Field, AND the PRISM: a 2D pad where dragging across picks HUE,
@@ -1361,18 +1408,12 @@ export component ColorPicker inherits VerticalLayout {
             }
         }
     }
-    HorizontalLayout {
-        spacing: 6px;
-        for sw in root.swatches : Rectangle {
-            width: 26px; height: 26px; border-radius: Theme.radius-sm;
-            border-width: Theme.hair;
-            border-color: sw.hex == root.value ? Theme.accent-line : (sta.has-hover ? Theme.text-faint : Theme.line-soft);
-            background: sw.col;
-            animate border-color { duration: Theme.quick; }
-            // pick commits; prime the preview too so the swatch matches even if the field keeps focus
-            sta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.pick(sw.hex); State.preview-hex(sw.hex); } }
-        }
-        Rectangle {}
+    // the preset chips — the shared SwatchRow; a pick commits AND primes the preview so the live
+    // swatch matches even if the field keeps focus.
+    SwatchRow {
+        swatches: root.swatches;
+        value: root.value;
+        pick(h) => { root.pick(h); State.preview-hex(h); }
     }
     // the hint wraps within the column (a Mono ran off the edge before)
     if root.hint != "" : Text {
@@ -1381,5 +1422,284 @@ export component ColorPicker inherits VerticalLayout {
         font-family: Theme.mono;
         font-size: Theme.fs-small;
         wrap: word-wrap;
+    }
+}
+
+// A LAMP RAIL — the MULTI-LAMP sibling of SplitToggle: one fused hairline rail whose cells each wear a
+// lamp dot + label and light INDEPENDENTLY. Where SplitToggle lights exactly one cell (a mutually-
+// exclusive choice), this lights any number — for a bank where several can be on at once (KEY GUARD's
+// chord swallows) or where cells carry different signal tints (LIVE phosphor vs MUTED warn). It unifies
+// the LIVE/MUTED + KEY-GUARD banks the panels hand-rolled cell-by-cell. `on[i]` lights cell i; `tints[i]`
+// recolours it (falls back to the accent, array length guarded); `toggled(i)` reports the clicked index —
+// the CALLER owns what "on" means (it holds the state). The lamp is a Theme.dot CIRCLE (the Pill idiom),
+// not the square-ish 1px lamps the hand-rolled banks drew — the circle is the unification.
+export component LampRail inherits Rectangle {
+    in property <[string]> options;
+    in property <[bool]> on;
+    in property <[color]> tints: [];
+    in property <bool> enabled: true;
+    in property <length> min-cell: 0px;
+    callback toggled(int);
+    height: Theme.row-h-sm;
+    border-radius: Theme.radius-sm;
+    border-width: Theme.hair;
+    // the whole rail quiets its frame when gated — the bank reads "off" as one object (mirrors ContactRow)
+    border-color: root.enabled ? Theme.line : Theme.line-soft;
+    clip: true;   // square the fused cells to the rounded outline
+    animate border-color { duration: Theme.quick; }
+    HorizontalLayout {
+        spacing: 0;
+        for opt[i] in root.options : cell := Rectangle {
+            horizontal-stretch: 1;
+            min-width: root.min-cell;
+            // this cell's on-state + its tint — guard the parallel arrays, default the tint to accent.
+            property <bool> lit: i < root.on.length && root.on[i];
+            property <color> hue: i < root.tints.length ? root.tints[i] : Theme.accent;
+            background: cell.lit ? cell.hue.with-alpha(0.1)
+                : (cta.has-hover && root.enabled ? Theme.well : transparent);
+            animate background { duration: Theme.quick; }
+            // the split — a hairline at the seam (every cell but the first), no gap between contacts
+            if i > 0 : Rectangle { x: 0; width: Theme.hair; background: Theme.line; }
+            HorizontalLayout {
+                spacing: 6px; alignment: center;
+                // the lamp — a Theme.dot circle, self-centred vertically (a fixed-size layout child
+                // top-aligns otherwise); tint when lit, the unlit gutter (lamp-off) when dark.
+                Rectangle {
+                    width: Theme.dot; height: Theme.dot; border-radius: Theme.dot / 2;
+                    y: (parent.height - self.height) / 2;
+                    background: cell.lit ? cell.hue : Theme.lamp-off;
+                    animate background { duration: Theme.quick; }
+                }
+                Text {
+                    text: opt;
+                    vertical-alignment: center;
+                    color: !root.enabled ? Theme.text-faint
+                        : cell.lit ? cell.hue
+                        : (cta.has-hover ? Theme.text-mid : Theme.text-dim);
+                    font-size: Theme.fs-small; font-weight: 700; font-family: Theme.mono;
+                    letter-spacing: Theme.track-2;
+                    animate color { duration: Theme.quick; }
+                }
+            }
+            cta := TouchArea {
+                enabled: root.enabled;
+                mouse-cursor: root.enabled ? MouseCursor.pointer : MouseCursor.default;
+                clicked => { root.toggled(i); }
+            }
+        }
+    }
+}
+
+// A 22px ICON CHIP — a bare glyph key (the × close, the layer-delete ×). Unifies the hand-rolled 22×22
+// chips scattered across the app (app.slint's X-close, the lighting layer-×). Transparent at rest, a
+// Theme.well on hover; the glyph is dim ink at rest and brightens to text (or danger ink on a `danger`
+// chip) under the cursor. Disabled = faint + inert. A pointer cursor, motion settles.
+export component IconButton inherits Rectangle {
+    in property <string> glyph;
+    in property <bool> danger: false;
+    in property <bool> enabled: true;
+    callback clicked();
+    width: 22px; height: 22px;
+    border-radius: Theme.radius-sm;
+    background: (root.enabled && ta.has-hover) ? Theme.well : transparent;
+    animate background { duration: Theme.quick; }
+    Text {
+        text: root.glyph;
+        color: !root.enabled ? Theme.text-faint
+            : ta.has-hover ? (root.danger ? Theme.danger : Theme.text)
+            : Theme.text-dim;
+        font-family: Theme.mono;
+        font-size: Theme.fs-data;
+        width: 100%; height: 100%;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        animate color { duration: Theme.quick; }
+    }
+    ta := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? MouseCursor.pointer : MouseCursor.default;
+        clicked => { root.clicked(); }
+    }
+}
+
+// The micro SUB-HEADER atom — the tier BELOW SectionTitle: a small tracked-out mono legend over a
+// cluster ("GATES", "FEEL", "VOICE"…), hand-written ~15× before this. Dim by default; overridable at
+// the call site like Mono (set `text`, restyle a property if a site truly needs to).
+export component SubLabel inherits Text {
+    font-family: Theme.mono;
+    font-size: Theme.fs-small;
+    font-weight: 700;
+    letter-spacing: Theme.track-2;
+    color: Theme.text-dim;
+    vertical-alignment: center;
+}
+
+// A STATUS LAMP — the borderless lamp + label readout the status strip hand-builds three ways (beacon,
+// writes-paused, the arm gate). A bare row of a Theme.dot CIRCLE lamp + a mono label — NO chip body or
+// border (that's Pill's job); it sits directly on the strip. `lit` lights the lamp AND the label in
+// `tint`; `ink` is the unlit label colour. A `clickable` lamp is a real control: pointer cursor + a
+// hover brighten on the (unlit) ink, so a thrown switch invites its click.
+export component StatusLamp inherits Rectangle {
+    in property <string> text;
+    in property <bool> lit: false;
+    in property <color> tint: Theme.accent;
+    in property <color> ink: Theme.text-dim;
+    in property <bool> clickable: false;
+    callback clicked();
+    HorizontalLayout {
+        spacing: 6px;
+        Rectangle {
+            width: Theme.dot; height: Theme.dot; border-radius: Theme.dot / 2;
+            y: (parent.height - self.height) / 2;
+            background: root.lit ? root.tint : Theme.lamp-off;
+            animate background { duration: Theme.quick; }
+        }
+        Text {
+            text: root.text;
+            color: root.lit ? root.tint
+                : (root.clickable && lta.has-hover) ? Theme.text-mid
+                : root.ink;
+            font-family: Theme.mono;
+            font-size: Theme.fs-mono;
+            vertical-alignment: center;
+            animate color { duration: Theme.quick; }
+        }
+    }
+    // covers the whole readout (lamp + label) only when clickable — else inert, so a bare readout
+    // never eats a click meant for the strip beneath it.
+    lta := TouchArea {
+        enabled: root.clickable;
+        mouse-cursor: root.clickable ? MouseCursor.pointer : MouseCursor.default;
+        clicked => { root.clicked(); }
+    }
+}
+
+// A CONFIRM BUTTON — the two-step arm/confirm destructive key (delete / purge / reset), four copies of
+// which were hand-built before this. First click ARMS: the label swaps to `confirm-text` and a
+// Theme.confirm-window timer starts; a second click WHILE armed fires `confirmed()` and disarms; the
+// timer disarms it on its own if you walk away (a consequential key should never stay hot). Composes a
+// danger Button and inherits a layout so it sizes exactly to that inner key.
+export component ConfirmButton inherits HorizontalLayout {
+    in property <string> text;
+    in property <string> confirm-text: "sure?";
+    in property <bool> enabled: true;
+    callback confirmed();
+    property <bool> armed: false;
+    // running follows `armed`; on fire it disarms (which stops the timer). A second click also disarms.
+    Timer {
+        interval: Theme.confirm-window;
+        running: root.armed;
+        triggered => { root.armed = false; }
+    }
+    Button {
+        text: root.armed ? root.confirm-text : root.text;
+        danger: true;
+        enabled: root.enabled;
+        clicked => {
+            if (root.armed) {
+                root.armed = false;
+                root.confirmed();
+            } else {
+                root.armed = true;
+            }
+        }
+    }
+}
+
+// A DISCLOSURE ROW — the ▾/▸ reveal toggle over an advanced / gated cluster (device.slint's "advanced ·
+// gated hardware writes" row is the reference). Full-width, seg-height, no border; a leading caret + a
+// SubLabel-styled label, the WHOLE row a click target whose ink brightens on hover.
+export component Disclosure inherits Rectangle {
+    in property <string> label;
+    in property <bool> open: false;
+    callback toggled();
+    height: Theme.seg-h;
+    HorizontalLayout {
+        spacing: 7px;
+        Text {
+            text: root.open ? "▾" : "▸";
+            color: dta.has-hover ? Theme.text-mid : Theme.text-faint;
+            font-family: Theme.mono;
+            font-size: Theme.fs-small;
+            vertical-alignment: center;
+            animate color { duration: Theme.quick; }
+        }
+        SubLabel {
+            text: root.label;
+            horizontal-stretch: 1;
+            color: dta.has-hover ? Theme.text-mid : Theme.text-dim;
+            animate color { duration: Theme.quick; }
+        }
+    }
+    dta := TouchArea {
+        mouse-cursor: MouseCursor.pointer;
+        clicked => { root.toggled(); }
+    }
+}
+
+// A SELECT TICK — the thin accent bar that marks the selected/active row (the device channel, the
+// active profile), duplicated in device.slint + profiles.slint. x:0, a 2px vertical rule, `tint` when
+// active, transparent when not, settling in with the row. The two sites differ ONLY in their vertical
+// inset — the CALLER sets this element's `y` + `height` for that; the tick is the bar + its animation.
+export component SelectTick inherits Rectangle {
+    in property <bool> active: false;
+    in property <color> tint: Theme.accent;
+    x: 0;
+    width: 2px;
+    background: root.active ? root.tint : transparent;
+    animate background { duration: Theme.quick; }
+}
+
+// A TRIGGER WELL — the press-to-bind status well (the bindings TRIGGER slot, the hypershift REACHED-BY
+// slot, the cast TRIGGER slot: three hand-rolled copies). A row-h well with a hair frame that lights to
+// accent-line once a trigger is `live`, holding an elided mono value (the bound trigger) or a dim
+// `prompt` when empty. Two flavours the three sites need: an optional leading `lamp` dot (the
+// hypershift/cast wells wear one; the bindings well doesn't) and, when `clickable`, the whole well is
+// the capture target — hover-brighten + an optional trailing `hint` (e.g. REBIND). The non-clickable
+// sites sit beside a separate capture Button and just DISPLAY state.
+export component TriggerWell inherits Rectangle {
+    in property <string> text;         // the bound trigger's label
+    in property <string> prompt;       // shown dim when not live (e.g. "press-to-bind a key or button")
+    in property <bool> live: false;    // a trigger is bound → accent frame + accent ink
+    in property <bool> lamp: false;    // wear a leading lamp dot (the hypershift / cast wells)
+    in property <bool> clickable: false;
+    in property <string> hint: "";     // a trailing tracked-out hint when live + clickable (e.g. "REBIND")
+    callback clicked();
+    height: Theme.row-h;
+    border-radius: Theme.radius-sm;
+    background: (root.clickable && wta.has-hover) ? Theme.well-hi : Theme.well;
+    border-width: Theme.hair;
+    border-color: root.live ? Theme.accent-line
+        : (root.clickable && wta.has-hover) ? Theme.text-faint : Theme.line;
+    animate background, border-color { duration: Theme.quick; }
+    HorizontalLayout {
+        padding-left: 11px; padding-right: 10px; spacing: 9px;
+        // the lamp — accent when bound, a dim line gutter when empty (the hypershift/cast idiom).
+        if root.lamp : Rectangle {
+            width: Theme.dot-lg; height: Theme.dot-lg; border-radius: Theme.dot-lg / 2;
+            y: (parent.height - self.height) / 2;
+            background: root.live ? Theme.accent : Theme.line;
+        }
+        Text {
+            horizontal-stretch: 1;
+            text: root.live ? root.text : root.prompt;
+            color: root.live ? Theme.accent
+                : (root.clickable && wta.has-hover) ? Theme.text-mid : Theme.text-faint;
+            font-family: Theme.mono; font-size: Theme.fs-body;
+            vertical-alignment: center; overflow: elide;
+        }
+        // the "you can change it" hint once a trigger is present (bindings well only)
+        if root.live && root.hint != "" : Text {
+            text: root.hint;
+            color: (root.clickable && wta.has-hover) ? Theme.accent : Theme.text-faint;
+            font-family: Theme.mono; font-size: Theme.fs-small;
+            font-weight: 700; letter-spacing: Theme.track-4;
+            vertical-alignment: center;
+        }
+    }
+    wta := TouchArea {
+        enabled: root.clickable;
+        mouse-cursor: root.clickable ? MouseCursor.pointer : MouseCursor.default;
+        clicked => { root.clicked(); }
     }
 }

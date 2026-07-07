@@ -26,12 +26,12 @@
 
 /// WHICH MATERIAL a cast is poured from — each a distinct physical model, not a palette swap. The
 /// engine shades the same density field through whichever surface is chosen, so a glyph cast in
-/// `FluidThought` genuinely refracts and throws caustics where the same stroke in `MaterializedDesire`
+/// `FluidThought` genuinely runs a current of carried light where the same stroke in `MaterializedDesire`
 /// burns and sparks. The names are states of mind made visible (the magic IS the user's intent).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Surface {
     DirectedIntent,     // the house pour — white intent, cut-glass prism fire (the origin)
-    FluidThought,       // water — refraction, flowing caustics, a bright Fresnel edge
+    FluidThought,       // water — a laminar current of light running the channel, dapple, a wet rim
     MaterializedDesire, // fire — blackbody embers, rising turbulence, buoyant sparks
     GentleBreeze, // air — curl-flow wisps + drifting motes the breeze carries (the surprise: it's light)
     SuddenInsight, // (engine pick) electric — branching plasma filaments that crackle
@@ -125,7 +125,7 @@ pub const MAX_KNOBS: usize = 5;
 pub enum Field {
     Body,     // the substance's own presence (the metaball shoulder + diffusion halo)
     Turb,     // turbulent fbm advected along −y (rising heat / churn), gated by the field
-    Caustic,  // interference of two drifting flows → thin focused-light filaments
+    Flow,     // laminar current — light streaks advected along the stroke's tangent (a channel running)
     Cracks,   // Worley F2−F1 → a connected fracture network
     Wisp,     // curl-flow–smeared cloud (divergence-free, soft)
     Sparks,   // a rising grid of brief twinkling motes (embers / carried light)
@@ -738,12 +738,57 @@ fn ramp(id: Ramp, t: f32, m: &Material) -> (f32, f32, f32) {
     match id {
         Ramp::CoolWhite => l3((0.30, 0.40, 0.55), (1.0, 1.0, 1.0), smoothstep(0.0, 1.0, t)),
         Ramp::Blackbody => blackbody(t * 1.25),
-        Ramp::Water => l3((0.02, 0.12, 0.20), (0.45, 0.90, 1.0), t),
+        // DEEP liquid — a near-black abyssal dim end (so the body reads as depth, light IN water, not
+        // frozen ice) climbing to a SATURATED ocean cyan. The bright end is deliberately kept OFF white:
+        // a pale-near-white top made the dense body read as milky fog and washed the carried colour to
+        // grey. A saturated top keeps the water reading deep and lets the veins pop toward the accent; the
+        // bright silhouette highlight is the Fresnel meniscus's job (its specular tip is what goes white).
+        // TWO-SEGMENT with a deliberately LOW-RED / HIGH-CYAN mid stop: a straight abyss→crest lerp passed
+        // through a washed grey-teal at mid `t`, so a thin/mid stroke (which never reaches the crest) read
+        // as silver once the achromatic filament + meniscus sat on top. Pinning a saturated teal at the
+        // midband makes the water unmistakably aqua at EVERY width, not only the thick end.
+        Ramp::Water => {
+            let mid = (0.015, 0.42, 0.60);
+            if t < 0.5 {
+                l3((0.008, 0.045, 0.10), mid, smoothstep(0.0, 1.0, t * 2.0))
+            } else {
+                l3(mid, (0.18, 0.66, 0.96), (t - 0.5) * 2.0)
+            }
+        }
         Ramp::Plasma => l3((0.18, 0.22, 0.85), (0.80, 0.95, 1.0), t),
         Ramp::Air => l3((0.55, 0.62, 0.74), (0.88, 0.93, 1.0), t),
         Ramp::AccentHot => l3((ar * 0.10, ag * 0.10, ab * 0.10), (ar, ag, ab), t),
         Ramp::White => (1.0, 1.0, 1.0),
     }
+}
+
+/// Tint a WATER colour as if lit by the weave accent — "coloured light through water". The Water ramp's
+/// lit end is ferociously BLUE (b≈0.96 vs r≈0.18), so a plain lerp toward the accent can't overcome it
+/// (the ribbons stay teal and only crests turn pink → pastel). Real coloured light does two things at once,
+/// and so does this: (1) an additive PULL of the hue toward the accent, and (2) a multiplicative SUPPRESSION
+/// of the channels the accent lacks (a red light carries ~no blue, so it darkens the water's blue). It's the
+/// suppression that finally kills the teal. `ride` 0..1 is how strongly THIS pixel wears the colour — bright
+/// ribbons/spine high, dark water low — so the weave colour rides the LIGHT and the dark water stays teal.
+#[inline]
+fn light_through(c: (f32, f32, f32), accent: (f32, f32, f32), ride: f32) -> (f32, f32, f32) {
+    let (mut cr, mut cg, mut cb) = c;
+    let (ar, ag, ab) = accent;
+    cr += (ar - cr) * ride;
+    cg += (ag - cg) * ride;
+    cb += (ab - cb) * ride;
+    let mx = ar.max(ag).max(ab).max(1e-3);
+    cr *= 1.0 - ride * (1.0 - ar / mx);
+    cg *= 1.0 - ride * (1.0 - ag / mx);
+    cb *= 1.0 - ride * (1.0 - ab / mx);
+    (cr, cg, cb)
+}
+
+/// The accent's CHROMA (0 = grey/white, ~1 = fully saturated). Water tinting scales by this so a neutral
+/// weave keeps the deep-teal identity while a ruby/gold one wears its colour.
+#[inline]
+fn accent_sat(accent: (f32, f32, f32)) -> f32 {
+    let (ar, ag, ab) = accent;
+    (ar.max(ag).max(ab) - ar.min(ag).min(ab)).clamp(0.0, 1.0)
 }
 
 /// Embers / carried motes — a grid of points that rise, drift, and WINK (a sharp specular flash, not
@@ -904,8 +949,9 @@ fn prism(p: &Px, l: &Layer, m: &Material) -> (f32, f32, f32, f32) {
     (r.max(0.0), g.max(0.0), b.max(0.0), (white + core).min(1.0))
 }
 
-/// The directional wave set the water surface is built from (kx, ky, frequency) — incommensurate so the
-/// sum never loops. Shared by the caustic FOCUS and its analytic gradient (refraction).
+/// The directional wave set the underwater DAPPLE is built from (kx, ky, frequency) — incommensurate so
+/// the sum never loops. The dapple is now a whisper of ambience folded into `Field::Flow`; the current
+/// (laminar streaks) is the hero. Kept because it's analytic (no octaves) and calm at broad scale.
 const WATER_DIRS: [(f32, f32, f32); 4] = [
     (1.0, 0.0, 1.0),
     (-0.5, 0.866, 1.37),
@@ -913,11 +959,12 @@ const WATER_DIRS: [(f32, f32, f32); 4] = [
     (0.7, 0.71, 2.1),
 ];
 
-/// Caustics by wave FOCUSING (not mere crest-summing): real caustics are brightest where the surface is
-/// CONCAVE and acts as a converging lens — i.e. where the Laplacian ∇²h > 0. For a sum of plane waves the
+/// Underwater DAPPLE by wave FOCUSING (not mere crest-summing): caustics are brightest where the surface
+/// is CONCAVE and acts as a converging lens — where the Laplacian ∇²h > 0. For a sum of plane waves the
 /// Laplacian is analytic: ∇²sin(k·x − ωt) = −|k|²·sin(...), the SAME `sin` reused. So this costs no
-/// octaves, tracks the moving surface coherently, and gives thin nervous light filaments that brighten
-/// and dim as the waves sweep through focus — the alive pool-floor net, sharper than the old crest⁶.
+/// octaves and tracks the moving surface coherently. NOTE: it is now sampled at BROAD scale and softened
+/// (powf<1, low gain) as a mere ambient shimmer under the flow — never the sharp crest² veins it once
+/// drew (those collapsed into 1px cross-hatch speckle at ink scale). The current carries the material.
 fn water_caustic(x: f32, y: f32, t: f32) -> f32 {
     let mut lap = 0.0;
     for (kx, ky, f) in WATER_DIRS {
@@ -925,21 +972,7 @@ fn water_caustic(x: f32, y: f32, t: f32) -> f32 {
         lap += -k2 * (f * (kx * x + ky * y) - t * f * 1.1).sin();
     }
     let focus = (lap / WATER_DIRS.len() as f32).max(0.0); // only CONVERGING patches gather light
-    (focus * focus * 2.4).min(1.0) // square ⇒ thin bright veins, not round blobs
-}
-
-/// The water surface SLOPE (∇h) — the analytic derivative of the same wave sum (cos of the reused arg).
-/// Refracts the caustic sample (the floor's light shifts where the surface above tilts) so the light-net
-/// SWIMS under a moving skin instead of sitting in a fixed lattice.
-fn water_grad(x: f32, y: f32, t: f32) -> (f32, f32) {
-    let (mut gx, mut gy) = (0.0, 0.0);
-    for (kx, ky, f) in WATER_DIRS {
-        let c = (f * (kx * x + ky * y) - t * f * 1.1).cos();
-        gx += kx * f * c;
-        gy += ky * f * c;
-    }
-    let n = WATER_DIRS.len() as f32;
-    (gx / n, gy / n)
+    (focus * focus * 2.4).min(1.0)
 }
 
 /// Evaluate ONE layer at this pixel → its (rgb, intensity-for-luminance). The generic per-primitive
@@ -951,12 +984,31 @@ fn eval_layer(l: &Layer, p: &Px, m: &Material) -> (f32, f32, f32, f32) {
         Field::Body => {
             let halo = (p.d * 0.55).min(0.85);
             let s = (pres + halo * 0.5) * l.gain;
-            let (cr, cg, cb) = ramp(l.ramp, smoothstep(0.0, 1.3, p.d + p.heat * 1.4), m);
+            let (mut cr, mut cg, mut cb) = ramp(l.ramp, smoothstep(0.0, 1.3, p.d + p.heat * 1.4), m);
+            // WINE-LIT WATER — light the body with the weave colour (see `light_through`). Gated to the Water
+            // ramp so this is FluidThought's alone (the plasma/blackbody bodies are untouched). The LIT SPINE
+            // is bright-blue water (the heat² core lift below); left plain it read as a blue rail down the
+            // middle of a ruby stroke, so it wears the colour MORE where it is lit (heat) over a low wine
+            // floor — the dim halo tints dark-ruby, the spine to ruby light, the whole body reads tinted.
+            if matches!(l.ramp, Ramp::Water) {
+                let ride = (0.34 + 0.52 * p.heat.clamp(0.0, 1.0)) * accent_sat(m.accent);
+                let (r2, g2, b2) = light_through((cr, cg, cb), m.accent, ride);
+                cr = r2;
+                cg = g2;
+                cb = b2;
+            }
+            // LIT SPINE — the dense core glows a little brighter so a thin label never vanishes, but the
+            // body is kept DEEP and DARK on purpose: the current's veins and the wet meniscus are the bright
+            // elements, and they are composited by SCREEN. Screening a saturated accent (a red current) over
+            // a bright body floors its green/blue back up into grey-brown MUD — over a dark body it stays
+            // saturated (ruby light in dark water). So the lift is colour-preserving (cr·core, never additive
+            // white) and modest; only the very densest heart (heat⁴) blows a faint achromatic tip toward hot.
             let core = (p.heat * p.heat).min(1.0);
+            let tip = p.heat * p.heat * p.heat * p.heat * 0.06;
             (
-                cr * s + core,
-                cg * s + core,
-                cb * s + core,
+                cr * (s + core * 0.3) + tip,
+                cg * (s + core * 0.3) + tip,
+                cb * (s + core * 0.3) + tip,
                 (s * 0.7 + core).min(1.0),
             )
         }
@@ -996,39 +1048,167 @@ fn eval_layer(l: &Layer, p: &Px, m: &Material) -> (f32, f32, f32, f32) {
             cb += (ab - cb) * want;
             (cr * dens, cg * dens, cb * dens, (dens * 0.95).min(1.0))
         }
-        Field::Caustic => {
-            // focused-light net (analytic ∇²h, §water_caustic) + a touch of fbm break-up so it isn't too
-            // regular. REFRACTION: sample displaced by the wave SLOPE (×`warp` knob) so the light-net
-            // swims under the moving skin; a whisper of low-gain CURL adds water-correct eddies (no
-            // sources/sinks). The accent lives in the focused light.
-            let (sx, sy) = (x * l.scale * 13.0, y * l.scale * 13.0); // finer net ⇒ veins cross a thin stroke
-            let ct = t * l.speed * 4.0;
-            let (hgx, hgy) = water_grad(sx, sy, ct);
-            let refr = l.warp; // the "refraction" knob — how hard the skin bends the light beneath it
-            let (ex, ey) = curl(x * 0.3, y * 0.3, t * 0.1);
-            let caustic = water_caustic(sx + hgx * refr + ex * 0.2, sy + hgy * refr + ey * 0.2, ct);
-            // honest knob: `detail` (octaves) is now READ for the break-up — it was hardcoded 2 before (the
-            // recipe's `detail` set nothing). Clamped 1..5; the stock recipe carries 2, so the look holds.
-            let breakup =
-                0.7 + 0.3 * fbm(x * l.scale * 2.0, y * l.scale * 2.0 - t * l.speed, l.detail.clamp(1.0, 5.0) as u32);
-            // gate the focused light INSIDE the body so it glows from within — caustics haloing past the
-            // rim would blur a cast letter (legibility); inside, the ink glows like lit water. Boosted +
-            // sharpened (powf<1 lifts the dim net, the ×1.7 makes the bright veins POP) so the water reads
-            // as light DANCING through it, not a flat teal tube.
-            let c = ((caustic.powf(0.75) * breakup) * 1.7).min(1.3)
-                * pres
-                * smoothstep(0.10, 0.50, p.d);
-            let i = c * l.gain;
-            // the bright vein cores carry the WEAVE COLOUR (focused light wearing the user's hue) so a
-            // red weave gives red-lit water, a violet weave violet-lit — visible tint response — while
-            // the dim net stays watery teal.
-            let (mut cr, mut cg, mut cb) = ramp(l.ramp, c.min(1.0), m);
-            let (ar, ag, ab) = m.accent;
-            let pop = smoothstep(0.5, 1.05, c);
-            cr += (ar - cr) * pop * 0.7;
-            cg += (ag - cg) * pop * 0.7;
-            cb += (ab - cb) * pop * 0.7;
-            (cr * i, cg * i, cb * i, i.min(1.0))
+        Field::Flow => {
+            // FLUID THOUGHT = FLOW STATE. The stroke is a CHANNEL; thought is a CURRENT visibly running
+            // through it. The old caustic net collapsed at real ink scale into 1px cross-hatch speckle —
+            // frost + static — and it re-speckled IN PLACE with no direction. So the hero is LAMINAR light:
+            // long ribbons that TRANSLATE downstream, BEND WITH the channel, and swell and die along their
+            // length like backlit water — never infinite uniform bands.
+
+            // THE FLOW FRAME — the LOCAL TANGENT, done safely. The prevailing-axis compromise cut the veins
+            // in a coordinate projected onto ONE fixed axis, so the current ignored every bend (candy stripes
+            // crossing a curved channel). We follow the LOCAL tangent instead — perpendicular to the density
+            // gradient, i.e. ALONG the iso-density contour that traces the spine. The trap that sank the last
+            // attempt was using the tangent to PROJECT the noise coordinate (absolute coord × a fast-rotating
+            // tangent sweeps a whole feature within one pixel ⇒ 1px fur). The escape: keep the noise domain in
+            // plain (x,y) and only DISPLACE the sample by BOUNDED vectors along the tangent — a 3-tap
+            // elongation blur (±L) and a bounded two-phase flow-map advection. Every fbm argument is (x,y)
+            // plus a bounded offset, so the argument gradient stays bounded at any position and uptime (no
+            // fur), yet features stretch and drift ALONG the channel and follow its curve.
+            let (rx, ry) = (0.9435f32, 0.3312f32); // prevailing reference axis — the fallback where the stroke is flat
+            // tangent = perpendicular to the gradient (the normal). Sign-canonicalize downstream so it never
+            // flips 180° across the stroke (which would mirror the flow and the features); blend to the
+            // reference where |grad|→0 (the flat spine, the void) since the tangent is pure noise there.
+            let (mut tx, mut ty) = (-p.gy, p.gx);
+            if tx * rx + ty * ry < 0.0 {
+                tx = -tx;
+                ty = -ty;
+            }
+            let tl = (tx * tx + ty * ty).sqrt();
+            let aligned = smoothstep(0.006, 0.030, p.grad); // 0 on the flat spine → 1 on a defined flank
+            let (mut tx, mut ty) = if tl > 1e-4 {
+                (
+                    (tx / tl) * aligned + rx * (1.0 - aligned),
+                    (ty / tl) * aligned + ry * (1.0 - aligned),
+                )
+            } else {
+                (rx, ry)
+            };
+            let tl2 = (tx * tx + ty * ty).sqrt().max(1e-4);
+            tx /= tl2;
+            ty /= tl2;
+            let (nx, ny) = (-ty, tx); // the cross-channel normal (unit) — eddies undulate the veins along it
+            let sc = l.scale;
+            let f = sc * 2.6; // isotropic noise frequency
+            let (qx, qy) = (x * f, y * f);
+
+            // POISEUILLE — the core runs bright, the banks drag dim. `core` shapes the brightness and a
+            // BOUNDED shear; it must NOT scale advection speed per pixel (that offset grows with uptime and
+            // aliases across the steep bank gradient), so every use of it here is amplitude-bounded.
+            let core = smoothstep(0.10, 0.85, pres);
+            let ft = t * l.speed;
+            // EDDIES (`warp`) — a gentle travelling MEANDER: a bounded sideways displacement (along the LOCAL
+            // normal) whose PHASE rides the FIXED reference axis. The reference axis has a constant gradient,
+            // so it is safe as a sine argument; the fast-rotating local tangent is used only for the bounded
+            // displacement DIRECTION (whose spatial gradient stays tiny). So ribbons undulate across the
+            // channel instead of running ruler-straight — cheap two-sine, not the 12-call curl().
+            let along_ref = x * rx + y * ry;
+            let meander = l.warp
+                * 0.05
+                * ((along_ref * sc * 1.5 + ft * 0.5).sin() + 0.5 * (along_ref * sc * 3.1 - ft * 0.33).sin());
+            // the SHEAR — the core's pattern slides relative to the banks by a BOUNDED, slowly-breathing
+            // amount: real laminar shear you can watch, amplitude never grows so it never aliases.
+            let shear = core * 0.5 * (ft * 0.2).sin();
+            // the meandered base position (displaced sideways along the normal)
+            let (bx, by) = (qx + nx * meander, qy + ny * meander);
+
+            // DE-STRIPE — a second, much LOWER-frequency field: each ribbon SWELLS and DIES over its length
+            // (a brightness envelope) and its WIDTH rides the same slow field, so no two ribbons are identical
+            // and none runs as an infinite uniform band. Its phase wanders by a bounded sine (never a growing
+            // offset), so the swelling breathes at any uptime.
+            let swp = 0.5 * (ft * 0.13).sin();
+            let swell = fbm(bx * 0.24 + tx * swp, by * 0.24 + ty * swp, 2);
+            let swellm = smoothstep(0.22, 0.78, swell); // 0 (ribbon dies) .. 1 (ribbon swells bright & wide)
+
+            // ELONGATED 2-oct fbm — 3 taps of the SAME isotropic noise displaced ±L along the tangent,
+            // averaged, so features smear into ribbons that FOLLOW the bend. L in noise units ≈ one feature.
+            let el = 0.85; // elongation half-length (noise units)
+            let el_fbm = |o: f32| -> f32 {
+                // `o` = along-tangent offset (shear + advection), in noise units
+                let (cx, cy) = (bx + tx * o, by + ty * o);
+                (fbm(cx - tx * el, cy - ty * el, 2) + fbm(cx, cy, 2) + fbm(cx + tx * el, cy + ty * el, 2))
+                    / 3.0
+            };
+            // BOUNDED two-phase flow-map advection along −T (downstream): displacement ≤ one feature,
+            // crossfaded by a triangle weight so the sawtooth reset is always hidden ⇒ the light TRANSLATES
+            // coherently at any uptime, never re-randomises in place.
+            let disp = 1.15; // max advection displacement (noise units) ≈ one feature
+            let phase = ft * 0.9;
+            let p1 = phase.fract();
+            let p2 = (phase + 0.5).fract();
+            let lf = (1.0 - 2.0 * p1).abs();
+            let fb = el_fbm(shear - disp * p1) * (1.0 - lf) + el_fbm(shear - disp * p2) * lf;
+
+            // RIDGED VEINS — fold at the midline (1−|2f−1|) → elongated CRESTS, then a power narrows them into
+            // bright veins with a soft falloff. The power RIDES the swell (wider where the ribbon swells,
+            // narrower where it thins) and the whole vein is gated by the swell envelope, so ribbons breathe
+            // along their length instead of reading as one uniform band. Smooth everywhere ⇒ nothing aliases.
+            let ridge = 1.0 - (2.0 * fb - 1.0).abs();
+            // the swell envelope keeps a FLOOR of structure everywhere (0.22) so ribbons breathe brighter/
+            // dimmer without ever fully vanishing into a featureless stretch — the veins (and the ruby they
+            // carry) run the WHOLE length, they just swell and thin, never die to nothing.
+            let vein = ridge.powf(3.8 - 1.6 * swellm) * (0.22 + 0.88 * swellm);
+            // CONFINE the veins to the interior + flanks, off the vapoury rim (a vein on the fuzzy edge is
+            // what frayed into fur, and it bled light past a cast letter's silhouette). Brightest at the core.
+            let bodyweight = smoothstep(0.08, 0.40, pres);
+            let flow_i = vein * bodyweight * (0.45 + 0.55 * core);
+
+            // a WHISPER of underwater DAPPLE folded in — broad scale, slow, softened (powf<1, low gain):
+            // ambience the current circulates over, never the hero, never speckle. `detail` carries its gain.
+            let dap_gain = l.detail.clamp(0.0, 1.5);
+            let dapple = if dap_gain > 0.001 {
+                water_caustic(x * sc * 1.2, y * sc * 1.2, ft * 0.5).powf(0.6)
+                    * dap_gain
+                    * 0.30
+                    * core
+                    * core
+            } else {
+                0.0
+            };
+
+            // gate the light INSIDE the body and weight by `gain`. `lit` is the ramp lookup, `i` the brightness.
+            // SOFT-KNEE the summed vein light with x/(1+kx): where several bright veins pile up (the thick
+            // end) a hard sum clipped them into flat white FOAM POOLS with dark holes — soap suds, not water.
+            // The knee compresses the peaks so ribbons stay DISTINCT luminous bands with visible hue even at
+            // their brightest, while leaving the dim body untouched (kx≈0 there).
+            let lit_raw = flow_i + dapple;
+            let lit = (lit_raw / (1.0 + 0.85 * lit_raw)).min(1.0);
+            let i = lit * l.gain * pres;
+            // COLOUR = light IN dark water. The dim body stays in the deep teal Water ramp; the VEIN BODIES
+            // carry the weave colour at FULL strength (a red weave ⇒ ruby light in a dark stream — deep red,
+            // not pastel-pink bands); only the very PEAK of a vein leans achromatic toward the specular white.
+            let (cr0, cg0, cb0) = ramp(l.ramp, lit.min(1.0), m);
+            // COLOURED LIGHT THROUGH WATER (see `light_through`) — the ribbons ARE the light, so they wear the
+            // weave colour; the dark water between stays teal. `ride` keyed off the flow BRIGHTNESS (`lit`)
+            // with a low wine FLOOR so even the dim water reads faintly tinted and the bright ribbons go fully
+            // to the colour — no leftover teal-blue streak running alongside the ruby ones (that split read as
+            // pastel-with-cool-streaks). White is left to the filament peak alone.
+            let ride = (0.20 + 0.80 * smoothstep(0.04, 0.20, lit)) * bodyweight * accent_sat(m.accent);
+            let (cr, cg, cb) = light_through((cr0, cg0, cb0), m.accent, ride);
+            // SPECULAR FILAMENT — the glossy highlight down the wet spine. Keyed to heat⁴ so it COLLAPSES to
+            // a narrow white thread as the core narrows: a thin stroke reads as a glowing teal thread with a
+            // white core LINE (not a white-out tube), the thick end as a slender glint on the throat — the
+            // SAME substance at every width, continuous along the taper. A cube of the vein rides on top so
+            // the very PEAK of a bright vein leans white-pink (on a red weave) without pastel-washing its
+            // body. Low gain, additive over the screened body; it is the ONLY white this material draws at
+            // the thin end (the Fresnel meniscus, dimmed in the recipe, no longer whites the whole tube).
+            // gain + the vein³ term are kept LOW: a strong filament is what fused the bright veins into the
+            // white foam pools. heat⁴ still draws the fine white core LINE down the wet spine (a thin stroke
+            // = a teal thread cored white), the vein³ only lets the very PEAK of a bright vein lean white,
+            // never a wash that whites the whole crest.
+            // and the achromatic white is pulled back on a CHROMATIC weave (×1−0.5·sat): a full white core
+            // sitting on a ruby stroke washed it to pale pink, so a tinted weave keeps its cores deep and
+            // coloured (leaning white only at the very peak), while a neutral weave keeps its full white core.
+            let filament = (p.heat * p.heat * p.heat * p.heat + vein * vein * vein * 0.14).min(1.0)
+                * core
+                * 0.26
+                * (1.0 - 0.5 * accent_sat(m.accent));
+            (
+                cr * i + filament,
+                cg * i + filament,
+                cb * i + filament,
+                (i + filament * 0.6).min(1.0),
+            )
         }
         Field::Cracks => {
             // slow CHURN: a low-freq warp wanders/breathes the whole sheet; a finer JAG warp fractures
@@ -1275,10 +1455,44 @@ fn eval_layer(l: &Layer, p: &Px, m: &Material) -> (f32, f32, f32, f32) {
         }
         Field::Prism => prism(p, l, m),
         Field::Fresnel => {
-            // Schlick: near-zero face-on, whips to ~1 at the grazing edge (the wet, glassy snap)
+            // Schlick: near-zero face-on, whips to ~1 at the grazing edge — the wet, glassy SKIN that gives
+            // liquid a DEFINED silhouette. A crisp bright rim is precisely what separates water from vapour;
+            // without it the body's soft falloff reads as fog, which is another material's territory.
             let edge = (p.grad * l.scale).min(1.0);
-            let f = (0.04 + 0.96 * edge.powi(5)) * (0.4 + 0.6 * pres) * l.gain;
-            let (cr, cg, cb) = ramp(l.ramp, 1.0, m);
+            let sch = edge.powi(5);
+            // LOCALISE to the silhouette SHELL. A stroke's density falls off ~linearly, so |grad| is nearly
+            // constant from spine to rim — a bare grad-keyed rim would fire across the WHOLE flank and fill
+            // the body. pres·(1−pres) peaks on the fading outer shell and vanishes at both the dense spine
+            // and the void, so the meniscus is a thin bright line hugging the edge, not a wash over the body.
+            let shell = (pres * (1.0 - pres) * 4.0).clamp(0.0, 1.0);
+            let f = (0.04 + 0.96 * sch) * shell * l.gain;
+            let (mut cr, mut cg, mut cb) = ramp(l.ramp, 1.0, m);
+            // WET SKIN = WATER lit by the weave colour. A fixed aqua-white meniscus was a big untinted
+            // contributor that diluted a tinted stroke back to blue-grey (the rim ran along the whole flank).
+            // Bend the shell BASE toward the accent — gated to the Water ramp so this is FluidThought's alone
+            // (DirectedIntent's rim wears AccentHot) — BEFORE the specular whitening below, so the grazing
+            // peak still blows white while the softer shell reads wine-/gold-rimmed. Chroma-scaled (see the
+            // Body arm): a ruby/gold weave rims wine/gold, a neutral one keeps its aqua-white skin.
+            let sat = if matches!(l.ramp, Ramp::Water) {
+                let sat = accent_sat(m.accent);
+                let (r2, g2, b2) = light_through((cr, cg, cb), m.accent, 0.62 * sat);
+                cr = r2;
+                cg = g2;
+                cb = b2;
+                sat
+            } else {
+                0.0
+            };
+            // a specular glint is ACHROMATIC at its peak: the grazing edge blows past the ramp's gamut toward
+            // white, so the meniscus reads as a bright near-white highlight rather than just a brighter shade
+            // of the body colour. Keyed to the Schlick term so only the sharpest edge whitens. On a CHROMATIC
+            // weave the whitening is pulled back (×1−0.6·sat): a fully-white rim running the whole flank was
+            // what washed a ruby stroke to pastel — the tinted skin should read wine, whitening only at its
+            // very sharpest grazing peak; a neutral weave keeps the full aqua-white specular signature.
+            let spec = sch * (1.0 - 0.6 * sat);
+            cr += (1.0 - cr) * spec;
+            cg += (1.0 - cg) * spec;
+            cb += (1.0 - cb) * spec;
             (cr * f, cg * f, cb * f, f * 0.8)
         }
     }
@@ -1371,59 +1585,68 @@ pub fn preset(surface: Surface) -> Material {
             (2, 3)
         }
         Surface::FluidThought => {
+            // a DEEP liquid body (the darkened Water ramp) — so the moving flow-light reads as light IN
+            // water, not a bright frozen skin. The Body's heat² core still guarantees a lit spine so a
+            // thin radial label never vanishes (light-through-water — in character).
             layers[0] = Layer {
                 field: Field::Body,
                 ramp: Ramp::Water,
-                gain: 0.9,
+                gain: 0.3,
                 ..Layer::ZERO
             };
-            // the caustic SCREENS over the body — focused light passing THROUGH water onto a floor stays
-            // in-gamut over the bright body instead of additively blowing the accent to white.
+            // the CURRENT — laminar streaks SCREEN over the body (light carried through water stays
+            // in-gamut over the deep body instead of additively blowing the accent to white). `detail`
+            // is the dapple gain (the "shimmer" knob); `warp` meanders the streamlines (the "eddies").
             layers[1] = Layer {
-                field: Field::Caustic,
-                scale: 0.04,
-                speed: 0.20,
-                detail: 2.0, // now WIRED to the break-up fbm octaves — 2.0 keeps the stock look byte-identical
-                warp: 2.5,
+                field: Field::Flow,
+                scale: 0.05,
+                speed: 0.35,
+                detail: 0.5, // dapple (shimmer) gain — a whisper of underwater ambience under the streaks
+                warp: 5.5,   // EDDIES nonzero out of the box — the ribbons undulate, never ruler-straight
                 gain: 1.4,
-                ramp: Ramp::AccentHot,
+                ramp: Ramp::Water,
                 mix: Mix::Screen,
                 ..Layer::ZERO
             };
+            // the wet SKIN — a near-white-cyan meniscus snapping at the silhouette. Gain is MODEST on purpose:
+            // the Fresnel shell peaks on the fading flank, so at a THIN stroke (only as wide as the meniscus)
+            // a high gain filled the whole tube white — the "white-out" that made one stroke read as two glued
+            // materials. Dimmed here, the thick-end silhouette still reads (a crisp edge = water, a fuzzy one =
+            // vapour) while the thin end stays a glowing teal thread cored by Flow's own heat⁴ specular filament.
             layers[2] = Layer {
                 field: Field::Fresnel,
-                scale: 2.4,
-                gain: 1.0,
+                scale: 2.5,
+                gain: 0.8,
                 ramp: Ramp::Water,
                 ..Layer::ZERO
             };
             knobs[0] = Knob {
-                label: "caustic scale",
-                layer: 1,
-                kind: KnobKind::Scale,
-                min: 0.01,
-                max: 0.12,
-            };
-            knobs[1] = Knob {
-                label: "flow speed",
+                label: "current",
                 layer: 1,
                 kind: KnobKind::Speed,
                 min: 0.0,
-                max: 0.8,
+                max: 1.0,
             };
-            knobs[2] = Knob {
-                label: "edge light",
-                layer: 2,
-                kind: KnobKind::Scale,
-                min: 0.5,
-                max: 5.0,
-            };
-            knobs[3] = Knob {
-                label: "refraction",
+            knobs[1] = Knob {
+                label: "eddies",
                 layer: 1,
                 kind: KnobKind::Warp,
                 min: 0.0,
-                max: 6.0,
+                max: 12.0,
+            };
+            knobs[2] = Knob {
+                label: "streak scale",
+                layer: 1,
+                kind: KnobKind::Scale,
+                min: 0.02,
+                max: 0.12,
+            };
+            knobs[3] = Knob {
+                label: "shimmer",
+                layer: 1,
+                kind: KnobKind::Detail,
+                min: 0.0,
+                max: 1.5,
             };
             (3, 4)
         }

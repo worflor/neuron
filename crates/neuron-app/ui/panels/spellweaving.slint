@@ -1,5 +1,5 @@
 import { Theme } from "../theme.slint";
-import { Card, SectionTitle, Label, Button, Field, Slider, Pill, Mono, Divider, PanelHead, ActionPicker, Segment, InputHead } from "../widgets/controls.slint";
+import { Card, SectionTitle, Label, Button, Field, Slider, Pill, Mono, Divider, PanelHead, ActionPicker, SplitToggle, SplitButton, TriggerWell, ConfirmButton, InputHead } from "../widgets/controls.slint";
 import { State } from "../state.slint";
 import { RadialSector, GlyphChip } from "../models.slint";
 
@@ -11,20 +11,16 @@ import { RadialSector, GlyphChip } from "../models.slint";
 
 export component SpellweavingPanel inherits VerticalLayout {
     spacing: 0;
-    // two-step arm for "clear vault" — recorded glyphs are irreplaceable training data.
-    property <bool> clear-armed: false;
-    Timer {
-        interval: Theme.confirm-window;
-        running: root.clear-armed;
-        triggered => { root.clear-armed = false; }
-    }
+    // the recurring rhythm-row height — the hold→WEAVE row and each remappable rhythm row share it,
+    // so the map reads as one rank of equal-height rows (hoisted from three hand-typed 40px).
+    property <length> rhythm-row-h: 40px;
 
     // ── strokelab RICH MODE identity ────────────────────────────────────────────────────────────
-    // Shift+Record captures a FULL stroke to a research file instead of teaching the vault. It gets
-    // its own amber "capture → file" look so it reads as a distinct MODE, not a plain recording:
+    // Shift+Record captures a FULL stroke to a research file instead of teaching the vault. It wears
+    // the shared Theme.capture amber (its own signal hue) so it reads as a distinct MODE, not a plain
+    // recording:
     //   rich-armed = Shift is held (preview the mode on the button before you commit)
     //   rich-live  = a rich capture is actually running (the canvas takes on the research skin)
-    property <color> rich-col: #e6a93c;
     property <bool> rich-armed: State.shift-armed && !State.capturing-gesture;
     property <bool> rich-live: State.rich-capturing;
     property <bool> rich-any: root.rich-armed || root.rich-live;
@@ -37,7 +33,7 @@ export component SpellweavingPanel inherits VerticalLayout {
     }
     // rename buffer for the bind card
     property <string> rename-to: "";
-    // activation preset is string-keyed in the engine, index-keyed in the Segment widget
+    // activation preset is string-keyed in the engine, index-keyed in the SplitToggle widget
     property <int> activation-idx: State.activation-pattern == "hold" ? 0
         : State.activation-pattern == "tap hold" ? 1
         : State.activation-pattern == "tap tap hold" ? 2 : 3;
@@ -73,28 +69,15 @@ export component SpellweavingPanel inherits VerticalLayout {
         VerticalLayout { alignment: center; width: 78px; Mono { text: "TRIGGER"; color: Theme.text-dim; } }
         VerticalLayout {
             alignment: center;
-            Rectangle {
+            // the shared press-to-bind well — a lamp'd display (the rebind Button beside it does the
+            // capture); the min/max keep it compact so it never eats the whole row.
+            TriggerWell {
                 min-width: 196px;
-                max-width: 300px;   // <- compact: the field hugs a sane size, never eats the whole row
-                height: 30px;
-                border-radius: Theme.radius-sm;
-                background: Theme.well;
-                border-width: Theme.hair;
-                border-color: State.cast-trigger-label != "—" ? Theme.accent-line : Theme.line;
-                HorizontalLayout {
-                    padding-left: 12px; padding-right: 12px; spacing: 9px;
-                    VerticalLayout { alignment: center; Rectangle { width: 6px; height: 6px; border-radius: 3px; background: State.cast-trigger-label != "—" ? Theme.accent : Theme.line; } }
-                    VerticalLayout {
-                        alignment: center;
-                        horizontal-stretch: 1;
-                        Text {
-                            text: State.cast-trigger-label != "—" ? State.cast-trigger-label : "nothing bound yet";
-                            color: State.cast-trigger-label != "—" ? Theme.accent : Theme.text-faint;
-                            font-family: Theme.mono; font-size: Theme.fs-body; vertical-alignment: center;
-                            overflow: elide;
-                        }
-                    }
-                }
+                max-width: 300px;
+                lamp: true;
+                live: State.cast-trigger-label != "—";
+                text: State.cast-trigger-label;
+                prompt: "nothing bound yet";
             }
         }
         VerticalLayout {
@@ -121,7 +104,7 @@ export component SpellweavingPanel inherits VerticalLayout {
 
             // hold → WEAVE (primary, accent; its rhythm is the editable one)
             Rectangle {
-                height: 40px;
+                height: root.rhythm-row-h;
                 border-radius: Theme.radius-sm;
                 background: Theme.bg-2;
                 border-width: Theme.hair;
@@ -139,11 +122,14 @@ export component SpellweavingPanel inherits VerticalLayout {
                     VerticalLayout { alignment: center; horizontal-stretch: 1;
                         Text { text: "open the weave · draw a glyph or flick the radial"; color: Theme.text; font-family: Theme.mono; font-size: Theme.fs-body; vertical-alignment: center; overflow: elide; }
                     }
+                    // the activation-preset selector — the fused SplitToggle (min-cell carries the old
+                    // min-seg). It's wrapped in a hugging VerticalLayout so the bank sizes to its four
+                    // cells (4·min-cell) and the row's stretch is eaten by the description text beside it.
                     VerticalLayout { alignment: center;
-                        Segment {
+                        SplitToggle {
                             options: ["hold", "tap·hold", "2tap·hold", "2tap"];
                             index: root.activation-idx;
-                            min-seg: 56px;
+                            min-cell: 56px;
                             picked(i) => { State.set-activation(i == 0 ? "hold" : i == 1 ? "tap hold" : i == 2 ? "tap tap hold" : "tap tap"); }
                         }
                     }
@@ -163,7 +149,7 @@ export component SpellweavingPanel inherits VerticalLayout {
             for rb in State.rhythm-binds : VerticalLayout {
                 spacing: 6px;
                 Rectangle {
-                    height: 40px;
+                    height: root.rhythm-row-h;
                     border-radius: Theme.radius-sm;
                     property <bool> target: State.rhythm-bind-target == rb.taps;
                     background: self.target ? Theme.accent-glow : (rhyrow-ta.has-hover ? Theme.well : Theme.bg-2);
@@ -201,14 +187,17 @@ export component SpellweavingPanel inherits VerticalLayout {
                         Mono { text: "BIND → ACTION"; color: Theme.text-dim; }
                         rhy-picker := ActionPicker {}
                         HorizontalLayout {
-                            spacing: 7px;
-                            Button {
-                                text: "set"; primary: true;
-                                enabled: rhy-picker.param-ok;
-                                clicked => { State.commit-rhythm-bind(); }
+                            // the fused [ cancel | set ] deck — commit on the right (the app's reload|apply
+                            // grammar); the right half gates on param-ok, the left cancel is always live.
+                            SplitButton {
+                                left-text: "cancel";
+                                right-text: "set";
+                                right-primary: true;
+                                right-enabled: rhy-picker.param-ok;
+                                left-clicked => { State.rhythm-bind-target = -1; }
+                                right-clicked => { State.commit-rhythm-bind(); }
                             }
-                            Button { text: "cancel"; clicked => { State.rhythm-bind-target = -1; } }
-                            Rectangle {}
+                            Rectangle { horizontal-stretch: 1; }
                         }
                     }
                 }
@@ -239,10 +228,10 @@ export component SpellweavingPanel inherits VerticalLayout {
             canvas := Rectangle {
                 // RICH MODE skin: a faint amber wash + a lit border, so the surface itself reads as
                 // "research capture → file" the moment a rich stroke begins — not a plain recording.
-                background: root.rich-live ? root.rich-col.with-alpha(0.05) : Theme.bg-2;
+                background: root.rich-live ? Theme.capture.with-alpha(0.05) : Theme.bg-2;
                 border-radius: Theme.radius;
-                border-width: root.rich-live ? 1.5px : 0px;
-                border-color: root.rich-col.with-alpha(0.55);
+                border-width: root.rich-live ? Theme.hair-2 : 0px;
+                border-color: Theme.capture.with-alpha(0.55);
                 clip: true;
                 animate background, border-color, border-width { duration: Theme.quick; }
                 // FIXED height (was min-height: 260) — the SAME fix the radial wheel got (see its comment
@@ -268,7 +257,7 @@ export component SpellweavingPanel inherits VerticalLayout {
                         text: State.capturing-gesture
                             ? (root.rich-live ? "weaving · rich stroke → file" : "weaving · draw while holding the trigger")
                             : "your last stroke renders here";
-                        color: root.rich-live ? root.rich-col : Theme.text-dim;
+                        color: root.rich-live ? Theme.capture : Theme.text-dim;
                         horizontal-alignment: center;
                     }
                     if !State.capturing-gesture : Mono {
@@ -289,31 +278,18 @@ export component SpellweavingPanel inherits VerticalLayout {
                     x: tx * (canvas.width - self.width);
                     y: ty * (canvas.height - self.height);
                     // the drawn line turns amber in rich mode — the stroke you make IS the research colour.
-                    background: (root.rich-live ? root.rich-col : State.weave-accent-col).with-alpha(0.2 + 0.7 * frac);
+                    background: (root.rich-live ? Theme.capture : State.weave-accent-col).with-alpha(0.2 + 0.7 * frac);
                 }
                 // RICH MODE badge — top-left (opposite the record pill), present only while a rich
-                // capture runs, naming the mode + where it's going. The unmissable "different mode" cue.
-                if root.rich-live : Rectangle {
+                // capture runs, naming the mode + where it's going. The unmissable "different mode" cue,
+                // now the shared status Pill (lamp + tracked label) positioned in the canvas corner.
+                if root.rich-live : Pill {
                     x: 12px;
                     y: 12px;
-                    width: badgebar.preferred-width;
-                    height: 22px;
-                    border-radius: Theme.radius-sm;
-                    background: root.rich-col.with-alpha(0.14);
-                    border-width: 1px;
-                    border-color: root.rich-col.with-alpha(0.5);
-                    badgebar := HorizontalLayout {
-                        padding-left: 9px; padding-right: 10px; spacing: 6px;
-                        VerticalLayout { alignment: center;
-                            Rectangle { width: 6px; height: 6px; border-radius: 3px; background: root.rich-col; }
-                        }
-                        Text {
-                            text: "RICH STROKE → FILE";
-                            color: root.rich-col;
-                            font-family: Theme.mono; font-size: Theme.fs-small; font-weight: 700;
-                            letter-spacing: 1px; vertical-alignment: center;
-                        }
-                    }
+                    text: "RICH STROKE → FILE";
+                    tint: Theme.capture;
+                    live-tint: Theme.capture;   // the badge lights CAPTURE amber, not the phosphor accent
+                    live: true;
                 }
                 // floating RECORD — a compact pill in the canvas's top-right (a Button inherits
                 // Rectangle, which fills its parent unless sized, so it MUST hug its own content via
@@ -323,16 +299,16 @@ export component SpellweavingPanel inherits VerticalLayout {
                     x: parent.width - self.width - 12px;
                     y: 12px;
                     width: recbar.preferred-width;
-                    height: 28px;
+                    height: Theme.row-h-sm;
                     border-radius: Theme.radius-sm;
                     // rich mode (Shift held, or capturing to file) recolours the pill amber — the live
                     // signal that this press does something DIFFERENT than teaching a glyph.
-                    background: root.rich-live ? root.rich-col.with-alpha(0.16)
-                        : root.rich-armed ? root.rich-col.with-alpha(0.10)
+                    background: root.rich-live ? Theme.capture.with-alpha(0.16)
+                        : root.rich-armed ? Theme.capture.with-alpha(0.10)
                         : State.capturing-gesture ? Theme.accent-glow
                         : (rta.has-hover ? Theme.well : Theme.bg-2);
-                    border-width: root.rich-any ? 1px : Theme.hair;
-                    border-color: root.rich-any ? root.rich-col
+                    border-width: Theme.hair;
+                    border-color: root.rich-any ? Theme.capture
                         : State.capturing-gesture ? Theme.accent-line
                         : (rta.has-hover ? Theme.text-faint : Theme.line);
                     animate background, border-color { duration: Theme.quick; }
@@ -348,9 +324,9 @@ export component SpellweavingPanel inherits VerticalLayout {
                             alignment: center;
                             Rectangle {
                                 width: 8px; height: 8px; border-radius: 4px;
-                                background: root.rich-live ? root.rich-col : (State.capturing-gesture ? Theme.accent : transparent);
-                                border-width: 1.5px;
-                                border-color: root.rich-any ? root.rich-col : (State.capturing-gesture ? Theme.accent : Theme.text-dim);
+                                background: root.rich-live ? Theme.capture : (State.capturing-gesture ? Theme.accent : transparent);
+                                border-width: Theme.hair-2;
+                                border-color: root.rich-any ? Theme.capture : (State.capturing-gesture ? Theme.accent : Theme.text-dim);
                                 animate background, border-color { duration: Theme.quick; }
                             }
                         }
@@ -358,7 +334,7 @@ export component SpellweavingPanel inherits VerticalLayout {
                             text: root.rich-live ? "rec → file"
                                 : root.rich-armed ? "rich → file"
                                 : State.capturing-gesture ? "recording" : "record";
-                            color: root.rich-any ? root.rich-col : (State.capturing-gesture ? Theme.accent : Theme.text-mid);
+                            color: root.rich-any ? Theme.capture : (State.capturing-gesture ? Theme.accent : Theme.text-mid);
                             font-family: Theme.mono; font-size: Theme.fs-small; font-weight: 700;
                             letter-spacing: Theme.track-2;
                             vertical-alignment: center;
@@ -374,7 +350,7 @@ export component SpellweavingPanel inherits VerticalLayout {
                     height: savelink.preferred-height;
                     savelink := Mono {
                         text: State.gesture-status;
-                        color: savearea.has-hover ? Theme.accent : root.rich-col;
+                        color: savearea.has-hover ? Theme.accent : Theme.capture;
                     }
                     savearea := TouchArea {
                         mouse-cursor: MouseCursor.pointer;
@@ -457,14 +433,17 @@ export component SpellweavingPanel inherits VerticalLayout {
                             Mono { text: "BIND → ACTION"; color: Theme.text-dim; }
                             spicker := ActionPicker {}
                             HorizontalLayout {
-                                spacing: 7px;
-                                Button {
-                                    text: "set"; primary: true;
-                                    enabled: spicker.param-ok;
-                                    clicked => { State.commit-gesture-bind(); }
+                                // the fused [ cancel | set ] deck — commit on the right; the set half
+                                // gates on param-ok, cancel is always live.
+                                SplitButton {
+                                    left-text: "cancel";
+                                    right-text: "set";
+                                    right-primary: true;
+                                    right-enabled: spicker.param-ok;
+                                    left-clicked => { State.gesture-bind-target = ""; }
+                                    right-clicked => { State.commit-gesture-bind(); }
                                 }
-                                Button { text: "cancel"; clicked => { State.gesture-bind-target = ""; } }
-                                Rectangle {}
+                                Rectangle { horizontal-stretch: 1; }
                             }
                             Divider {}
                             HorizontalLayout {
@@ -504,19 +483,14 @@ export component SpellweavingPanel inherits VerticalLayout {
             HorizontalLayout {
                 spacing: 8px;
                 // (record glyph now floats over the canvas, top-right)
-                // two-step armed clear: the vault is irreplaceable recorded data
-                Button {
-                    text: root.clear-armed ? "erase " + State.glyphs.length + " glyphs?" : "clear vault";
-                    danger: true;
+                // two-step armed clear: the vault is irreplaceable recorded data. The shared ConfirmButton
+                // owns the arm/disarm timer (Theme.confirm-window, the same window the local one used);
+                // confirm-text keeps the dynamic "erase N glyphs?" count.
+                ConfirmButton {
+                    text: "clear vault";
+                    confirm-text: "erase " + State.glyphs.length + " glyphs?";
                     enabled: State.glyphs.length > 0 && !State.capturing-gesture;
-                    clicked => {
-                        if (root.clear-armed) {
-                            root.clear-armed = false;
-                            State.clear-gestures();
-                        } else {
-                            root.clear-armed = true;
-                        }
-                    }
+                    confirmed => { State.clear-gestures(); }
                 }
                 Rectangle {}
                 // SPELL ASSIST — recognition FORGIVENESS, a continuous level (0 = strict, higher = a
@@ -627,7 +601,7 @@ export component SpellweavingPanel inherits VerticalLayout {
                             hmain := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { State.set-hyper-radial-on(!State.hyper-radial-on); } }
                         }
                         // INLINE flip zone — only while ON: a hairline + the live edit target; tap flips it
-                        if State.hyper-radial-on : Rectangle { width: 1px; background: Theme.line; }
+                        if State.hyper-radial-on : Rectangle { width: Theme.hair; background: Theme.line; }
                         if State.hyper-radial-on : Rectangle {
                             background: State.radial-edit-hyper ? Theme.accent-glow : (hflip.has-hover ? Theme.well : transparent);
                             animate background { duration: Theme.quick; }
@@ -670,7 +644,9 @@ export component SpellweavingPanel inherits VerticalLayout {
                     x: wheel.cx - self.width / 2; y: wheel.cy - self.height / 2;
                     border-radius: self.width / 2;
                     background: (State.hyper-radial-on && State.radial-edit-hyper) ? State.weave-accent-col.with-alpha(0.08) : Theme.bg-2;
-                    border-width: (State.hyper-radial-on && State.radial-edit-hyper) ? 2px : 1px;
+                    // the HYPER ring is a DELIBERATE double-weight (2px) — it reads as the heavier, lit
+                    // layer over the base ring's hairline; the off/base branch is the plain hairline.
+                    border-width: (State.hyper-radial-on && State.radial-edit-hyper) ? 2px : Theme.hair;
                     border-color: State.hyper-radial-on
                         ? (State.radial-edit-hyper ? State.weave-accent-col : State.weave-accent-col.with-alpha(0.5))
                         : Theme.line;
@@ -714,12 +690,12 @@ export component SpellweavingPanel inherits VerticalLayout {
                     width: 50px; height: 50px; border-radius: 25px;
                     x: wheel.cx - 25px; y: wheel.cy - 25px;
                     background: Theme.well;
-                    border-width: 1px; border-color: State.weave-accent-col.with-alpha(0.4);
+                    border-width: Theme.hair; border-color: State.weave-accent-col.with-alpha(0.4);
                     Rectangle {
                         width: 16px; height: 16px; border-radius: 8px;
                         x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
                         background: transparent;
-                        border-width: 1px;
+                        border-width: Theme.hair;
                         border-color: State.capturing-gesture ? State.weave-accent-col : Theme.text-dim;
                         animate border-color { duration: Theme.quick; }
                     }
@@ -744,7 +720,7 @@ export component SpellweavingPanel inherits VerticalLayout {
                     // (the Paths use `transparent` too but never animate, so they never flash). Fading to
                     // the accent hue at ZERO alpha keeps it a clean, same-hue, alpha-only wash.
                     background: (self.on || nta.has-hover) ? State.weave-accent-col.with-alpha(0.1) : State.weave-accent-col.with-alpha(0);
-                    border-width: 1px;
+                    border-width: Theme.hair;
                     border-color: (self.on || nta.has-hover) ? State.weave-accent-col.with-alpha(0.27) : State.weave-accent-col.with-alpha(0);
                     animate background, border-color { duration: Theme.quick; }
                     nta := TouchArea {
@@ -812,14 +788,16 @@ export component SpellweavingPanel inherits VerticalLayout {
                         spacing: 8px;
                         rpicker := ActionPicker {}
                         HorizontalLayout {
-                            spacing: 7px;
-                            Button {
-                                text: "set"; primary: true;
-                                enabled: rpicker.param-ok;
-                                clicked => { State.commit-sector-action(); }
+                            // the fused [ cancel | set ] deck — commit on the right; set gates on param-ok.
+                            SplitButton {
+                                left-text: "cancel";
+                                right-text: "set";
+                                right-primary: true;
+                                right-enabled: rpicker.param-ok;
+                                left-clicked => { State.editing-sector = -1; }
+                                right-clicked => { State.commit-sector-action(); }
                             }
-                            Button { text: "cancel"; clicked => { State.editing-sector = -1; } }
-                            Rectangle {}
+                            Rectangle { horizontal-stretch: 1; }
                         }
                     }
                     if State.editing-sector != State.radial-preview-sector : HorizontalLayout {

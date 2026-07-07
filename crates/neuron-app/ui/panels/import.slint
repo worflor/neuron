@@ -1,5 +1,5 @@
 import { Theme } from "../theme.slint";
-import { Card, SectionTitle, Label, Button, Field, Pill, Mono, Divider, Readout, PanelHead } from "../widgets/controls.slint";
+import { Card, SectionTitle, Label, Button, Field, Pill, Mono, Divider, Readout, PanelHead, SplitButton } from "../widgets/controls.slint";
 import { State } from "../state.slint";
 import { ImportLine } from "../models.slint";
 
@@ -33,11 +33,13 @@ export component ImportWizard inherits Card {
                 text <=> State.import-path;
                 accepted(t) => { State.parse-import(t); }
             }
-            Button { text: "browse"; clicked => { State.browse-import(); } }
-            Button {
-                text: "parse";
-                primary: true;
-                clicked => { State.parse-import(State.import-path); }
+            // browse (ghost) + parse (accent commit) fused into one deck control
+            SplitButton {
+                left-text: "browse";
+                right-text: "parse";
+                right-primary: true;
+                left-clicked => { State.browse-import(); }
+                right-clicked => { State.parse-import(State.import-path); }
             }
         }
         // a parse that produced nothing-to-apply reads as caution, not normal info
@@ -82,25 +84,22 @@ export component ImportWizard inherits Card {
                     Mono { text: State.import-bindings.length + " migrate"; color: Theme.text-faint; }
                 }
                 for line in State.import-bindings : Rectangle {
-                    height: 30px;
+                    height: Theme.row-h;
                     border-radius: Theme.radius-sm;
                     background: Theme.well;
                     border-width: Theme.hair; border-color: Theme.line;
                     HorizontalLayout {
                         padding-left: 12px; padding-right: 12px; spacing: 8px;
-                        Text {
+                        Mono {
                             text: line.label;
                             color: Theme.text;
-                            font-size: Theme.fs-body; font-family: Theme.mono; font-weight: 600;
-                            vertical-alignment: center;
+                            font-weight: 600;
                             overflow: elide;
                         }
-                        Text { text: "→"; color: Theme.text-faint; vertical-alignment: center; }
-                        Text {
+                        Mono { text: "→"; color: Theme.text-faint; }
+                        Mono {
                             text: line.detail;
                             color: Theme.text-mid;
-                            font-size: Theme.fs-body; font-family: Theme.mono;
-                            vertical-alignment: center;
                             overflow: elide;
                         }
                         Rectangle {}
@@ -115,7 +114,7 @@ export component ImportWizard inherits Card {
                 }
                 for line in State.import-notes : HorizontalLayout {
                     spacing: 7px;
-                    Text { text: "–"; color: Theme.warn; font-family: Theme.mono; vertical-alignment: center; }
+                    Mono { text: "–"; color: Theme.warn; }
                     Mono { text: line.detail; color: Theme.text-dim; }
                     Rectangle {}
                 }
