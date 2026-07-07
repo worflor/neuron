@@ -3,7 +3,8 @@
 //! information structure (enum / level / xy-pair / table / string). Two different devices
 //! reveal two different feature suites from this one routine — the universal-tool brain.
 
-use crate::protocol::{Report, Status, BUF_LEN};
+use crate::dialect::{RAZER_FEATURE_LEN, RAZER_VID};
+use crate::protocol::{reply_status, Report, Status, BUF_LEN};
 use crate::transport::{self, Transport};
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -28,11 +29,14 @@ pub fn exec(
     for i in 0..40 {
         std::thread::sleep(Duration::from_millis(8));
         let mut b = [0u8; BUF_LEN];
-        if t.get_feature(&mut b).is_ok() && b[7] == class && b[8] == id {
-            match Status::from_u8(b[1]) {
-                Status::Success => return Some(Report::from_buf(&b).args),
-                Status::Fail | Status::Unsupported => return None,
-                _ => {}
+        if t.get_feature(&mut b).is_ok() {
+            // Shared echo filter (dialect seam): accept only a reply echoing our class/id.
+            if let Some(status) = reply_status(&b, class, id) {
+                match status {
+                    Status::Success => return Some(Report::from_buf(&b).args),
+                    Status::Fail | Status::Unsupported => return None,
+                    _ => {}
+                }
             }
         }
         if i % 12 == 11 {
@@ -115,9 +119,10 @@ pub fn discover() -> Vec<DeviceFp> {
     let mut out = Vec::new();
     let mut seen = BTreeSet::new();
     for info in infos {
-        // The universal signature of a razer_report control pipe: VID Razer + a 91-byte
-        // feature report, on WHATEVER interface it lives.
-        if info.vid != 0x1532 || info.feature_len != 91 {
+        // The universal signature of a razer_report control pipe: VID Razer + a 91-byte feature
+        // report, on WHATEVER interface it lives. The signature's home is the razer dialect
+        // (`dialect::RazerDialect::claims`); we ask through its consts, not a bare literal.
+        if info.vid != RAZER_VID || info.feature_len != RAZER_FEATURE_LEN {
             continue;
         }
         if !seen.insert((info.pid, info.usage_page, info.usage)) {

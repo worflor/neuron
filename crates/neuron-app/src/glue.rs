@@ -3995,16 +3995,27 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 // the probes do real device round-trips (seconds on an asleep wireless mouse) —
                 // they run OFF the UI thread so the bench never freezes the instrument. The
                 // probes are read-only and everything they need loads from disk, so a fresh
-                // Runtime on the worker with the selected pid+unit carried over is identical.
-                let (pid, unit) = {
+                // Runtime on the worker carrying the FULL selection identity is identical.
+                // All three legs matter: pid+unit pin the physical device, and the dialect pins
+                // the SELECTED control plane — one unit can expose several protocol families on
+                // one pid, and an empty dialect resolves to "any family" (whichever enumerates
+                // first), so the bench would probe a plane the user never picked. This is the one
+                // worker that RECONSTRUCTS selection state instead of sharing the live runtime,
+                // which is exactly how the (pid, unit, dialect) identity migration missed it.
+                let (pid, unit, dialect) = {
                     let s = sh.borrow();
-                    (s.rt.selected_pid, s.rt.selected_unit.clone())
+                    (
+                        s.rt.selected_pid,
+                        s.rt.selected_unit.clone(),
+                        s.rt.selected_dialect.clone(),
+                    )
                 };
                 let back = app.as_weak();
                 std::thread::spawn(move || {
                     let mut rt = AppRuntime::load();
                     rt.selected_pid = pid;
                     rt.selected_unit = unit;
+                    rt.selected_dialect = dialect;
                     let probes = rt.run_diagnostics();
                     let _ = slint::invoke_from_event_loop(move || {
                         if let Some(app) = back.upgrade() {
@@ -5499,13 +5510,19 @@ fn seed_perf_async(app: &AppWindow, sh: &SharedRt, resume_lighting: bool) {
     // pending state — never show the PREVIOUS board's numbers against the new board's name.
     st.set_idle_readout("…".into());
     st.set_lod_readout("…".into());
-    let (pid, unit) = {
+    let (pid, unit, dialect) = {
         let s = sh.borrow();
-        (s.rt.selected_pid, s.rt.selected_unit.clone())
+        (
+            s.rt.selected_pid,
+            s.rt.selected_unit.clone(),
+            // snapshot the selected PLANE's family too — the sweep resolves (pid, unit, dialect) so
+            // a multi-family unit reads getters off the picked plane, not first-family-wins.
+            s.rt.selected_dialect.clone(),
+        )
     };
     let w = app.as_weak();
     std::thread::spawn(move || {
-        let snap = crate::runtime::read_perf_snapshot(pid, &unit);
+        let snap = crate::runtime::read_perf_snapshot(pid, &unit, &dialect);
         let _ = slint::invoke_from_event_loop(move || {
             let Some(app) = w.upgrade() else { return };
             with_shared(|sh| {
@@ -5532,6 +5549,15 @@ fn seed_perf_async(app: &AppWindow, sh: &SharedRt, resume_lighting: bool) {
                         .join("/");
                     st.set_dpi_stages(joined.into());
                 }
+                // Seed the ACTIVE stage index from hardware truth. The GUI previously NEVER did, so
+                // the one-gesture apply always wrote "stage 1 active" regardless of the device's real
+                // onboard cycle. Set it BEFORE `sync_stage_nums` (which only clamps DOWN against the
+                // list), and only when it actually indexes inside the seeded stages.
+                if let Some(idx) = snap.dpi_active {
+                    if (idx as usize) < snap.dpi_stages.len() {
+                        st.set_dpi_active_stage(idx as i32);
+                    }
+                }
                 sync_stage_nums(&st);
                 if let Some((lift, land)) = snap.lod_async {
                     st.set_lod_async(true);
@@ -5545,12 +5571,112 @@ fn seed_perf_async(app: &AppWindow, sh: &SharedRt, resume_lighting: bool) {
                 } else {
                     st.set_lod_readout("\u{2014}".into());
                 }
+                // FIRMWARE GAME MODE (the KEY GUARD's device-side sibling) — seed the toggle from the
+                // same sweep's device truth. `None` (a mouse / unreadable board) leaves it off.
+                if let Some(on) = snap.game_mode {
+                    st.set_game_mode_on(on);
+                }
                 if resume_lighting && LIGHTING_READY.load(std::sync::atomic::Ordering::Acquire) {
                     load_lighting_into_state(&app, sh);
                     let _ = apply_current_lighting(&app, sh);
+                    // FIRST-LIGHT TX SELF-HEAL (DIALECT-RND wave 2b): the FIRST time we stream to an
+                    // AUTO def with lighting, prove its era-heuristic transaction_id actually lands
+                    // (writes don't echo honesty — a wrong tx ACKs then no-ops) and, if a different
+                    // cohort tx is the one that verifiably paints, rewrite the auto file with it.
+                    // Rides the apply we just did on purpose: the write is happening ANYWAY, so the
+                    // heal adds no new write class — it just walks the cohort with read-backs.
+                    maybe_first_light_heal(&app, sh, pid, &unit);
                 }
             });
         });
+    });
+}
+
+/// FIRST-LIGHT TX SELF-HEAL hook (DIALECT-RND wave 2b). Decides on the UI thread (cheaply), then
+/// does the device work on a worker thread. Gate: the selected def is AUTO (only synthesized config
+/// may be rewritten in place — a curated/builtin board's board-verified bytes are never touched),
+/// has a lighting block, and this physical unit hasn't been first-light-checked yet this run (the
+/// heal is a probe cost, not a per-apply cost — `healed_units` is the once-per-unit-per-run guard).
+///
+/// On a HEAL (a cohort tx verified that differs from the def's current one): rewrite the auto file
+/// via `synth::heal_auto_tx` and set the SAME `synth_dirty` flag the adoption worker sets — the next
+/// `scan_devices` reloads the registry, bumps `registry_gen`, and the seeded-key machinery re-seeds
+/// every downstream panel automatically. That reload chain is the payoff of the wave-2 design: the
+/// heal writes ONE file and the whole app picks it up with no bespoke plumbing. A verified-as-is tx
+/// does nothing (no rewrite, no status noise); only an actual heal posts a status line.
+fn maybe_first_light_heal(app: &AppWindow, sh: &SharedRt, pid: u16, unit: &str) {
+    // Honour the writes-paused kill-switch: the heal issues ACK'd probe WRITES (not just reads), so
+    // it must freeze with every other write path when the user has paused writes. (The streaming
+    // apply this rides is already gated the same way in `apply_current_lighting`.)
+    if neuron::writes::writes_paused() {
+        return;
+    }
+    // The def behind the current selection — enumerates once (device-switch/restore only, never per
+    // frame). Bail unless it's an AUTO def carrying lighting (the only thing worth/allowed to heal).
+    let def = match sh.borrow().rt.selected_def() {
+        Some(d) => d,
+        None => return,
+    };
+    if def.origin != neuron::registry::DefOrigin::Auto || def.lighting.is_none() {
+        return;
+    }
+    // Once per unit per run: insert returns false if we already checked this unit — then bail.
+    if !sh.borrow_mut().rt.healed_units.insert(unit.to_string()) {
+        return;
+    }
+    let dirty = sh.borrow().rt.synth_dirty_handle();
+    let current_tx = def.transaction_id;
+    let dialect = def.dialect.clone();
+    let unit = unit.to_string();
+    let w = app.as_weak();
+    std::thread::spawn(move || {
+        // Own registry + own device handle (the UI's AppRuntime is !Send), mirroring
+        // `read_perf_snapshot`'s worker: reload the registry, enumerate, open THIS unit's control
+        // interface with the two-pass unit-precise-then-pid-only rule. `io_gate` parks the HOST
+        // lighting writer for our ACK'd probe writes. The anim stream may still write concurrently
+        // on its own handle — the SAME accepted pre-existing second-handle race every getter worker
+        // rides; the heal's read-backs tolerate an interleaved frame exactly as the vitals reads do.
+        let Ok(reg) = neuron::registry::Registry::load() else {
+            return;
+        };
+        let Ok(infos) = neuron::transport::enumerate() else {
+            return;
+        };
+        let _gate = crate::host::io_gate(pid);
+        for relaxed in [false, true] {
+            for i in &infos {
+                // find_for_pipe: the def that DRIVES this control pipe (family-aware), so a
+                // two-family unit heals each pipe under the family that can frame it.
+                let Some(def) = reg.find_for_pipe(i) else {
+                    continue;
+                };
+                if (pid != 0 && i.pid != pid)
+                    || !(relaxed || unit.is_empty() || i.instance() == unit)
+                {
+                    continue;
+                }
+                let Ok(d) = neuron::device::Device::open_path(def.clone(), i.pid, &i.path) else {
+                    continue;
+                };
+                // Walk the tx cohort with read-backs; None = nothing verified (asleep / no getter),
+                // leave the def alone. Some(tx) == current = verified as-is (no rewrite). Some(tx)
+                // != current = a real heal: rewrite the auto file and flag the reload.
+                if let Some(tx) = neuron::writes::first_light_heal(&d, def) {
+                    if tx != current_tx && neuron::synth::heal_auto_tx(&dialect, pid, def, tx).is_ok()
+                    {
+                        dirty.store(true, std::sync::atomic::Ordering::SeqCst);
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(app) = w.upgrade() {
+                                app.global::<State>().set_status_line(
+                                    format!("lighting tx healed -> 0x{tx:02X} · def updated").into(),
+                                );
+                            }
+                        });
+                    }
+                }
+                return; // this unit is handled (verified or healed) — done for the run
+            }
+        }
     });
 }
 
@@ -5817,6 +5943,29 @@ fn install_perf_callbacks(app: &AppWindow, shared: &SharedRt) {
                     .into(),
                 );
                 st.set_status_line(st.get_perf_status());
+            }
+        });
+    });
+    // FIRMWARE GAME MODE — the KEY GUARD's device-side sibling (the FN+F10 Win-key kill that ate the
+    // user's Win key). Unlike the host chords above (a pure LL-hook policy), this is a REAL device
+    // write. CACHE-vs-SOURCE rule: `game_mode_on` is a DISPLAY cache (seeded async, cleared to false on
+    // every device switch) — never a command source. A toggle of HARDWARE state must read-modify-write
+    // the DEVICE, so we hand the whole flip to `rt.toggle_game_mode()`: it reads board truth and writes
+    // `!current` in one open (verify-gated). We reflect its VERIFIED new state into the cache on success
+    // (Some) and just post the error otherwise — deriving `!current` from the stale checkbox here sent
+    // inverted writes in the ~500ms post-switch window (review-caught).
+    bind(app, shared, |app, sh| {
+        let w = app.as_weak();
+        let sh = sh.clone();
+        app.global::<State>().on_toggle_game_mode(move || {
+            if let Some(app) = w.upgrade() {
+                let st = app.global::<State>();
+                let (now, msg) = sh.borrow().rt.toggle_game_mode();
+                if let Some(v) = now {
+                    st.set_game_mode_on(v);
+                }
+                st.set_perf_status(msg.clone().into());
+                st.set_status_line(msg.into());
             }
         });
     });
@@ -6124,6 +6273,10 @@ fn audio_rows() -> Vec<DeviceRow> {
                 icon: icon.into(),
                 kind: kind.into(),
                 id: e.id.into(),
+                // audio endpoints are Core-Audio faces, NOT dialect control planes — empty dialect
+                // (they never route through the plane resolver, and their selection branch returns
+                // before touching selected_dialect / the seeded plane key).
+                dialect: "".into(),
                 detail: detail.into(),
                 // audio endpoints have none of the HID capabilities — the audio card shows instead.
                 cap_dpi: false,
@@ -6135,6 +6288,7 @@ fn audio_rows() -> Vec<DeviceRow> {
                 cap_store: false,
                 cap_idle: false,
                 cap_plate: false,
+                cap_game_mode: false, // audio endpoints have no firmware game mode
                 plate: "".into(), // audio endpoints have no plate
                 adopting: false,  // audio endpoints are never HID-adopted
             });
@@ -6208,6 +6362,10 @@ fn select_device_at(app: &AppWindow, sh: &SharedRt, idx: i32) {
         st.set_sel_can_idle(false);
         st.set_sel_can_hyperpoll(false);
         st.set_sel_can_plate(false);
+        // the KEY GUARD firmware sibling gate + its live state — unset with every other row gate
+        // (the round-8 rule) so a cleared panel can't keep showing the previous keyboard's row.
+        st.set_sel_can_game_mode(false);
+        st.set_game_mode_on(false);
         st.set_selected_plate("".into());
         // seeded_key describes the panel's CURRENT seed — a cleared panel is seeded with nothing, so
         // the key must go too. Otherwise a same-unit reselect after an unplug/replug (unit ids are
@@ -6215,7 +6373,14 @@ fn select_device_at(app: &AppWindow, sh: &SharedRt, idx: i32) {
         // still matching the stale key → changed == false → the reseed (init_perf_controls /
         // refresh_effects / init_grid / seed_perf_async, and the saved-lighting resume riding
         // seed_perf_async's completion) is skipped, orphaning the FEEL readouts on cleared state.
-        sh.borrow_mut().rt.seeded_key = None;
+        // The selected PLANE's dialect goes with the cleared unit — the (pid, unit, dialect) identity
+        // is emptied as a whole (pid/unit are healed to none by scan's auto-pick when the list went
+        // all-adopting; the dialect is the third leg of that same emptied tuple).
+        {
+            let mut s = sh.borrow_mut();
+            s.rt.seeded_key = None;
+            s.rt.selected_dialect = String::new();
+        }
         return;
     }
     let i = idx.clamp(0, n - 1);
@@ -6241,6 +6406,9 @@ fn select_device_at(app: &AppWindow, sh: &SharedRt, idx: i32) {
     // has NO getter (push-only), so seed from THIS device's last-known value the confirmation core
     // recorded (hidwatch feeds it per-pid); a light poll keeps it fresh after this. Others show nothing.
     st.set_sel_can_plate(row.cap_plate);
+    // the KEY GUARD's firmware sibling — the keyboard's device-side Win-key kill. Its live state
+    // (game-mode-on) is seeded from the perf-snapshot sweep's completion (see seed_perf_async).
+    st.set_sel_can_game_mode(row.cap_game_mode);
     st.set_selected_plate(if row.cap_plate {
         neuron::confirm::last_plate(pid).unwrap_or_default().into()
     } else {
@@ -6276,20 +6444,24 @@ fn select_device_at(app: &AppWindow, sh: &SharedRt, idx: i32) {
             // is already on it, so it carries over with zero user action.
             s.rt.selected_pid = pid;
             s.rt.selected_unit = row.id.to_string();
+            // The third leg of the selection identity — the control PLANE's family. A learning row
+            // carries its CLAIMING dialect, so when the real registry-backed row flips in (same unit
+            // AND same dialect) the plane identity is unchanged and the selection carries over.
+            s.rt.selected_dialect = row.dialect.to_string();
             // A learning row is INERT: it has no def to seed against, so we neither reseed nor stamp
             // seeded_key. Leaving the key STALE is exactly what makes the learning→real flip register
             // as a change — the reseed then runs against the real def, not this ghost. Only a real
-            // row computes/stamps the (unit, registry-generation) key.
+            // row computes/stamps the (unit, dialect, registry-generation) key.
             if row.adopting {
                 false
             } else {
-                // Seeding follows the (unit, registry-generation) identity, not "did the unit id
-                // change": the same unit id after a registry reload is a DIFFERENT device as far as
-                // the panel is concerned (its def may have been swapped underneath — the learning→
-                // real adoption flip is just the most common reload; a user-edited devices/auto file
-                // is the same shape). Keying on the generation kills the whole "same unit id so skip
-                // reseed" class outright instead of special-casing transient learning rows.
-                let key = (row.id.to_string(), s.rt.registry_gen);
+                // The panel's seed identity is the PLANE (unit, dialect), not just the unit —
+                // qualified by the registry generation so a same-plane reselect after a registry
+                // reload still reseeds (its def may have been swapped underneath: the learning→real
+                // adoption flip is the common reload; a user-edited devices/auto file is the same
+                // shape). The dialect leg is what keeps a future two-family unit's two channel rows
+                // as DISTINCT seed identities on one unit id.
+                let key = (row.id.to_string(), row.dialect.to_string(), s.rt.registry_gen);
                 let c = s.rt.seeded_key.as_ref() != Some(&key);
                 if c {
                     s.rt.seeded_key = Some(key);
@@ -6632,17 +6804,22 @@ pub fn refresh_plated_row(app: &AppWindow) {
 }
 
 pub fn refresh_devices(app: &AppWindow, sh: &SharedRt) {
-    // keep the selection on the SAME device across a rescan, by its id (pid-hex or audio endpoint id).
-    let prev_id = {
+    // keep the selection on the SAME control PLANE across a rescan, by (id, dialect): the unit id
+    // (path instance / audio endpoint id) AND the plane's family. On a future multi-family unit the
+    // id alone would ambiguously match either of the unit's two channel rows; the dialect pins the
+    // exact plane. Today one plane per unit, so the dialect never changes the match — identical
+    // restore behaviour. An audio row carries an empty dialect, which round-trips fine.
+    let prev = {
         let st = app.global::<State>();
         use slint::Model;
         let i = st.get_selected_device();
         (i >= 0)
             .then(|| st.get_devices().row_data(i as usize))
             .flatten()
-            .map(|r| r.id.to_string())
+            .map(|r| (r.id.to_string(), r.dialect.to_string()))
             .unwrap_or_default()
     };
+    let (prev_id, prev_dialect) = (prev.0, prev.1);
     // 1) HID peripherals (registry-matched Razer devices), live-read.
     let devs = sh.borrow_mut().rt.scan_devices(); // also heals a stale selected_pid
     let mut rows: Vec<DeviceRow> = devs
@@ -6666,6 +6843,9 @@ pub fn refresh_devices(app: &AppWindow, sh: &SharedRt) {
             // the selection key is the PHYSICAL UNIT (path instance), so two identical devices
             // are two distinct, individually-selectable rows; the pid rides in `pid` above.
             id: d.instance.clone().into(),
+            // the control PLANE's family — the third leg of the (pid, unit, dialect) selection
+            // identity; today one plane per unit, so every real row carries its single family here.
+            dialect: d.dialect.clone().into(),
             detail: "".into(),
             cap_dpi: d.cap_dpi,
             cap_poll: d.cap_poll,
@@ -6676,6 +6856,7 @@ pub fn refresh_devices(app: &AppWindow, sh: &SharedRt) {
             cap_store: d.cap_store,
             cap_idle: d.cap_idle,
             cap_plate: d.cap_plate,
+            cap_game_mode: d.cap_game_mode,
             // SIDE PLATE (push-only, no getter): seed the row from THIS device's last pushed plate
             // (per-pid). refresh_plated_row keeps it live in place after this. Non-plated devices show
             // nothing.
@@ -6692,6 +6873,37 @@ pub fn refresh_devices(app: &AppWindow, sh: &SharedRt) {
     let st = app.global::<State>();
     use slint::Model;
     st.set_devices(ModelRc::new(VecModel::from(rows)));
+    // The UNCLAIMED footnote: our vendor's pipes that no dialect can frame (the audio sidecars),
+    // rendered as ONE dim line under the deck rather than a row apiece — a row per pipe double-listed
+    // hardware whose functional face (the Core-Audio mic/output rows) already sits in the list above
+    // (DIALECT-RND's revised failed-adoption ruling, live complaint 2026-07-07). Product name, or
+    // `pid XXXX` when the string is empty; `(NB)` is the pipe's feature_len (the recon-size hint).
+    // "" when the ledger is empty; the view elides so it never wraps.
+    let unclaimed_note = {
+        let ledger = &sh.borrow().rt.unclaimed;
+        if ledger.is_empty() {
+            String::new()
+        } else {
+            let names: Vec<String> = ledger
+                .iter()
+                .map(|u| {
+                    let name = if u.product.trim().is_empty() {
+                        format!("pid {:04x}", u.pid)
+                    } else {
+                        u.product.trim().to_string()
+                    };
+                    format!("{name} ({}B)", u.feature_len)
+                })
+                .collect();
+            let noun = if ledger.len() == 1 { "pipe" } else { "pipes" };
+            format!(
+                "{} razer vendor {noun} · no shared protocol — {}",
+                ledger.len(),
+                names.join(" · ")
+            )
+        }
+    };
+    st.set_unclaimed_note(unclaimed_note.into());
     refresh_host_game_devices(app);
     // MECHANICAL ADVANTAGES: seed Snap Tap support from the live keyboard list (honest gate).
     refresh_snap_tap(app, sh);
@@ -6715,11 +6927,11 @@ pub fn refresh_devices(app: &AppWindow, sh: &SharedRt) {
     } else {
         (0..n)
             .find(|&i| {
-                st.get_devices()
-                    .row_data(i as usize)
-                    .map(|r| r.id.to_string())
-                    .as_deref()
-                    == Some(prev_id.as_str())
+                st.get_devices().row_data(i as usize).is_some_and(|r| {
+                    // Match the whole PLANE identity (id + dialect), not just the unit id: the two
+                    // together are what a multi-family unit needs to restore the exact channel row.
+                    r.id.to_string() == prev_id && r.dialect.to_string() == prev_dialect
+                })
             })
             .unwrap_or(default_idx)
     };

@@ -6,7 +6,7 @@ use neuron::{capability::Store, device::Device, registry::Registry, transport, w
 fn open_naga(reg: &Registry) -> anyhow::Result<Device> {
     for i in &transport::enumerate()? {
         if let Some(def) = reg.find_by_pid(i.vid, i.pid) {
-            if def.matches_control(i.usage_page, i.usage, i.feature_len)
+            if def.matches_control(i)
                 && def.supports(neuron::registry::Capability::SetScrollStage)
             {
                 return Device::open(def.clone(), i.pid);

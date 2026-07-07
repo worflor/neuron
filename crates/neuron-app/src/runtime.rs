@@ -19,6 +19,7 @@ use neuron::gesture::Vault;
 use neuron::lighting::{Effect, Lights, Rgb};
 use neuron::profile::{AppRule, AppRules, Profile};
 use neuron::registry::{DeviceDef, Registry};
+use neuron::synth::{adopt_key, AdoptKey};
 use neuron::transport;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -33,6 +34,13 @@ pub struct DeviceState {
     /// identical devices apart. Every control-plane operation the row triggers (opens, setters,
     /// streams, host lighting) targets this unit, never "the first HID that shares my pid".
     pub instance: String,
+    /// The control PLANE's family (`DeviceDef::dialect`) — selection identity is (pid, unit,
+    /// dialect) because one physical unit may carry several protocol families' control pipes, each
+    /// its own plane. Rows are PER-PLANE: today every desk unit is N=1 (one plane per unit) so the
+    /// list is byte-identical, but a future multi-family unit (razer_report + an audio dialect on
+    /// one pid) lists one channel row per plane, and every routing decision keys off this rather
+    /// than first-family-wins.
+    pub dialect: String,
     pub mode: String,
     pub connected: bool,
     pub firmware: String,
@@ -63,9 +71,20 @@ pub struct DeviceState {
     pub cap_store: bool, // Storage — persist-to-onboard
     pub cap_idle: bool, // Battery (wireless proxy) — the idle-off timer
     pub cap_plate: bool, // has a [side_plates] map — surfaces the push-detected side-plate readout
-    /// TRANSIENT: this row is an unknown device whose auto-adoption probe is running right now
-    /// ("learning device…"). All capability gates are off; the row is replaced by the real,
-    /// registry-backed one (same unit instance, so selection carries over) when the probe lands.
+    pub cap_game_mode: bool, // SetGameMode — the keyboard's FIRMWARE FN+F10 Win-key kill (the
+    // device-physical sibling of the host KEY GUARD chord swallows). Keyboard-only.
+    /// PLACEHOLDER row — one WITHOUT a registry def behind it, so it is never auto-picked and is
+    /// selectable-but-inert (every capability gate off, the FEEL/perf panels stay blank). Two
+    /// kinds ride this one flag, so the glue selection policy needs ZERO cases for them (the point):
+    ///   * LEARNING — an unknown pipe whose adoption probe is running now ("learning device…");
+    ///     replaced by the real registry-backed row (same unit instance, so a selection carries
+    ///     over) when the probe lands.
+    ///   * UNRESPONSIVE — a razer-claimed pipe that answered nothing after N adoption retries
+    ///     (the strike ledger), surfaced so a broken/asleep device isn't silently invisible.
+    /// Both are non-operable (connected = false); only LEARNING later becomes a real row. (The
+    /// NO-PROTOCOL unclaimed pipes were a THIRD kind here until 2026-07-07 — they double-listed
+    /// hardware whose functional face already sits in the device list, so they moved out of the row
+    /// model entirely and became one dim FOOTNOTE line: see `AppRuntime::unclaimed`.)
     pub adopting: bool,
 }
 
@@ -102,6 +121,12 @@ pub struct AppRuntime {
     /// two identical devices share a pid. Empty = no unit pinned (match by pid alone), which only
     /// happens before the first scan.
     pub selected_unit: String,
+    /// The selected control plane's FAMILY (`DeviceDef::dialect`) — the third leg of the (pid,
+    /// unit, dialect) selection identity. Empty = no plane pinned (match by pid/unit alone), the
+    /// pre-first-scan / stateless state. On a unit exposing several families' pipes this is what
+    /// keeps opens, snapshot seeding, and profile capture on the plane the user picked instead of
+    /// whichever family enumerated first (the review's three findings share this root).
+    pub selected_dialect: String,
     /// Live lighting streams, keyed by physical UNIT (`path_instance`). Each board gets its OWN
     /// stop flag + fps, so starting, stopping, or re-pacing one board's lighting NEVER touches
     /// another's — including its identical twin on the same pid — and switching which board you're
@@ -116,22 +141,27 @@ pub struct AppRuntime {
     /// Alt+F4). A GUI-hosted daemon LL-keyboard hook consults this; carried so apply stays the
     /// canonical source. Empty by default (nothing suppressed).
     pub gaming_mode: neuron::writes::GamingMode,
-    /// When each unknown pid was last probed by a background auto-adoption (`neuron::synth`).
-    /// Not every scan tick — but not once-per-run either: a wireless device DEEP-asleep at
-    /// first probe only wakes on user input, so unanswered pids retry on a slow cadence
-    /// (SYNTH_RETRY) and adopt within a minute of waking. A pid that leaves enumeration is
-    /// forgotten immediately (unplug → replug = the natural instant retry).
-    synth_attempted: HashMap<u16, std::time::Instant>,
-    /// Pids whose adoption probe is RUNNING right now (inserted before the thread spawns,
+    /// When each unknown [`AdoptKey`] ((dialect, pid)) was last probed by a background auto-adoption
+    /// (`neuron::synth`) AND how many times it has been tried (the STRIKE count). Keyed on the full
+    /// identity, never bare pid: two families can share a pid, so a bare-pid ledger would conflate
+    /// their retry state (and let one family's strike silence the other). Not every scan tick — but
+    /// not once-per-run either: a wireless device DEEP-asleep at first probe only wakes on user
+    /// input, so unanswered keys retry on a slow cadence (SYNTH_RETRY) and adopt within a minute of
+    /// waking. Each retry increments the strike; a key that reaches [`UNRESPONSIVE_STRIKES`]
+    /// surfaces as a dim "answered nothing" placeholder row instead of staying invisible. A key
+    /// that leaves enumeration is forgotten immediately (unplug → replug = the natural instant
+    /// retry), which also resets its strikes.
+    synth_attempted: HashMap<AdoptKey, (std::time::Instant, u32)>,
+    /// [`AdoptKey`]s whose adoption probe is RUNNING right now (inserted before the thread spawns,
     /// cleared by the thread when it finishes). Drives the transient "learning device…" row so
     /// a new device is visible the instant it's plugged in, not after the multi-second probe.
-    synth_inflight: Arc<std::sync::Mutex<std::collections::HashSet<u16>>>,
-    /// Pids with a LIVE probe thread RIGHT NOW — the spawn guard that keeps the single-probe
+    synth_inflight: Arc<std::sync::Mutex<std::collections::HashSet<AdoptKey>>>,
+    /// [`AdoptKey`]s with a LIVE probe thread RIGHT NOW — the spawn guard that keeps the single-probe
     /// invariant even when a probe outlives the SYNTH_RETRY cadence (a stuck/slow wireless probe
-    /// can exceed 60s, and re-pushing the pid then would spawn a SECOND overlapping probe for it).
-    /// Distinct from `synth_inflight`, which only drives the transient "learning…" row for a pid's
+    /// can exceed 60s, and re-pushing the key then would spawn a SECOND overlapping probe for it).
+    /// Distinct from `synth_inflight`, which only drives the transient "learning…" row for a key's
     /// FIRST attempt: this set spans every attempt (first and retry) and gates spawning, not UI.
-    synth_running: Arc<std::sync::Mutex<std::collections::HashSet<u16>>>,
+    synth_running: Arc<std::sync::Mutex<std::collections::HashSet<AdoptKey>>>,
     /// Set by a finished adoption thread; the next scan tick reloads the registry so the newly
     /// synthesized device appears without a restart.
     synth_dirty: Arc<AtomicBool>,
@@ -140,12 +170,33 @@ pub struct AppRuntime {
     /// learning→real adoption flip, a user-edited devices/auto file), so a same-unit selection
     /// after a bump must re-seed. Bumped at every site that reassigns `self.registry`.
     pub registry_gen: u64,
-    /// The (unit, registry_gen) the inspector panel was last seeded for — the select path's
-    /// reseed decision. A selection reseeds iff this differs from the newly selected unit's key,
-    /// which catches BOTH a different unit and a same unit whose def changed under a reload.
-    /// None = never seeded.
-    pub seeded_key: Option<(String, u64)>,
+    /// The (unit, dialect, registry_gen) the inspector panel was last seeded for — the select
+    /// path's reseed decision. The seed identity is the control PLANE (unit + family), not the bare
+    /// unit: a selection reseeds iff this differs from the newly selected plane's key, which catches
+    /// a different unit, a same unit whose def changed under a reload, AND (on a future multi-family
+    /// unit) a switch between two family channels sharing one unit id. None = never seeded.
+    pub seeded_key: Option<(String, String, u64)>,
+    /// Physical units first-light-checked this run — the once-per-unit-per-run guard for the tx
+    /// self-heal. The heal is a PROBE cost (a handful of ACK'd lighting writes + read-backs to walk
+    /// the tx cohort), NOT a per-apply cost, so it must fire at most once per unit per run: after a
+    /// unit is verified (healed or already-right) its id lands here and no later apply re-probes it.
+    /// Cleared only by relaunch — a run is the natural scope (the def on disk doesn't change under us
+    /// except by our own heal, which flips the registry generation the normal way).
+    pub healed_units: std::collections::HashSet<String>,
+    /// The interested-but-unclaimed vendor pipes from the last scan — our hardware whose framing no
+    /// dialect speaks (the audio sidecars: the 41-byte sound card, the 64-byte Seiren). This is
+    /// INVENTORY, not channels: their functional faces (the Core-Audio mic/output rows) already list
+    /// as real device rows, so surfacing each pipe as its own row double-listed real hardware (live
+    /// complaint 2026-07-07). The device page renders the whole ledger as ONE dim footnote line under
+    /// the deck, per DIALECT-RND's revised failed-adoption ruling. One row per pid (fattest pipe).
+    pub unclaimed: Vec<neuron::synth::UnclaimedPipe>,
 }
+
+/// Adoption strikes at which a still-unrecognized, still-enumerated pid stops being merely retried
+/// and starts SURFACING as a dim "unresponsive · answered nothing" placeholder row. Three tries
+/// (~3 SYNTH_RETRY windows) is enough to distinguish "asleep, will wake" from "claimed but never
+/// answers" without flashing a scary row at every device that's briefly slow to first-probe.
+const UNRESPONSIVE_STRIKES: u32 = 3;
 
 impl AppRuntime {
     pub fn load() -> Self {
@@ -167,6 +218,7 @@ impl AppRuntime {
             persist: false,
             selected_pid: 0,
             selected_unit: String::new(),
+            selected_dialect: String::new(),
             anim: HashMap::new(),
             light_fps: Arc::new(AtomicU32::new(30)),
             gaming_mode: neuron::writes::GamingMode::default(),
@@ -176,7 +228,17 @@ impl AppRuntime {
             synth_dirty: Arc::new(AtomicBool::new(false)),
             registry_gen: 0,
             seeded_key: None,
+            healed_units: std::collections::HashSet::new(),
+            unclaimed: Vec::new(),
         }
+    }
+
+    /// A clone of the shared `synth_dirty` flag — the SAME `Arc<AtomicBool>` the adoption worker
+    /// sets. The first-light heal worker (in glue) sets it after rewriting an auto file, so the
+    /// next `scan_devices` reloads the registry, bumps `registry_gen`, and the seeded-key machinery
+    /// re-seeds every downstream panel — the exact reload chain a successful adoption already rides.
+    pub fn synth_dirty_handle(&self) -> Arc<AtomicBool> {
+        self.synth_dirty.clone()
     }
 
     fn store(&self) -> Store {
@@ -222,15 +284,22 @@ impl AppRuntime {
         }
         let mut units: Vec<Unit> = Vec::new();
         for i in &infos {
-            let Some(def) = self.registry.find_by_pid(i.vid, i.pid) else {
+            // find_for_pipe: the def that DRIVES this pipe (family-aware control-pipe rule), so a
+            // two-family unit resolves each control pipe to the family that can frame it.
+            let Some(def) = self.registry.find_for_pipe(i) else {
                 continue;
             };
-            if !def.matches_control(i.usage_page, i.usage, i.feature_len) {
-                continue;
-            }
             let instance = i.instance();
-            if units.iter().any(|u| u.instance == instance) {
-                continue; // another collection of the SAME physical unit
+            // One row per PLANE (unit × family), not per unit: the dedupe key is (instance, dialect)
+            // because a multi-family unit carries one control pipe per family and each is its own
+            // channel. Today every unit is N=1 (one plane), so the (instance, dialect) key collapses
+            // to exactly the old per-instance list — identical rows — and only a future two-family
+            // unit splits into two rows here.
+            if units
+                .iter()
+                .any(|u| u.instance == instance && u.def.dialect == def.dialect)
+            {
+                continue; // another collection of the SAME physical plane (unit + family)
             }
             units.push(Unit {
                 def: def.clone(),
@@ -275,31 +344,85 @@ impl AppRuntime {
         // the probe carries straight over.
         if let Ok(inflight) = self.synth_inflight.lock() {
             for i in &infos {
-                if i.vid != neuron::synth::RAZER_VID
-                    || i.feature_len != neuron::synth::RAZER_FEATURE_LEN
-                    || !inflight.contains(&i.pid)
-                {
+                // ONE learning row per CLAIMED control pipe — the same pipes the probe targets,
+                // now family-agnostic (was the hardcoded razer VID + 91-byte test). A new dialect
+                // makes its in-flight adoptions render here with zero change to this app code.
+                // Derive the adoption key (the same claiming test, now yielding identity) and match
+                // inflight on the FULL key so a twin-family pid can't borrow the other's learning row.
+                let Some(key) = adopt_key(i) else {
+                    continue;
+                };
+                let family = key.0;
+                if !inflight.contains(&key) {
                     continue;
                 }
                 let instance = i.instance();
                 if out.iter().any(|d| d.instance == instance) {
-                    continue; // another razer_report pipe of the same learning unit
+                    continue; // another claimed control pipe of the same learning unit
                 }
-                out.push(learning_row(i, instance));
+                out.push(learning_row(i, family, instance));
             }
         }
+        // FAILED-ADOPTION SURFACE (DIALECT-RND, REVISED 2026-07-07): two truths, two presentations.
+        // A CLAIMED pipe that stays unresponsive is a DEVICE STATE → a dim, non-selectable
+        // placeholder row (below) so "couldn't reach this" is honest data on screen, appended AFTER
+        // the real rows, `adopting = true` (never auto-picked, inert) and `connected = false`. An
+        // UNCLAIMED-but-interested pipe is INVENTORY, not a channel → the footnote line, not a row
+        // (see the `self.unclaimed` stash further down). Only the strike source builds rows here:
+        //   (a) STRIKE rows — pids some dialect CLAIMED but whose probe never answered after
+        //       UNRESPONSIVE_STRIKES retries. The attempted-ledger retains ONLY live+unrecognized
+        //       pids, so an entry here is guaranteed still on the bus — no separate liveness check.
+        for (&(family, pid), &(_, strikes)) in &self.synth_attempted {
+            if strikes < UNRESPONSIVE_STRIKES {
+                continue;
+            }
+            // The key already CARRIES the claiming family (`key.0`), so the label no longer
+            // re-derives it via `claimed_by` — the ledger key IS the identity, disambiguated across
+            // two same-pid families. The product-string lookup matches the same key (not bare pid)
+            // so a twin family's pipe can't lend its product name here. The attempted-ledger retains
+            // only live+unrecognized keys, so a match is guaranteed still on the bus.
+            let info = infos.iter().find(|i| adopt_key(i) == Some((family, pid)));
+            let name = info
+                .map(|i| i.product.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .unwrap_or_else(|| format!("{family} device {pid:04x}"));
+            out.push(placeholder_row(
+                name,
+                pid,
+                format!("unresponsive-{pid:04x}"),
+                format!("unresponsive · claimed by {family}, never answered"),
+                // The plane's family is the claiming dialect (`key.0`) — a placeholder row carries
+                // it like a real row so its selection identity is complete even while inert.
+                family.to_string(),
+            ));
+        }
+        // The UNCLAIMED LEDGER (vendor pipes NO dialect can frame — the audio sidecars) is NOT a
+        // second source of placeholder rows: as of 2026-07-07 it is INVENTORY, not channels. Each
+        // such pipe's functional face already lists above as a real device row (the Seiren's mic,
+        // the sound card's output — Core-Audio endpoints), so a row per pipe double-listed real
+        // hardware. Stash the ledger on the runtime instead; the device page renders it as ONE dim
+        // footnote line under the deck (glue formats `unclaimed_note`). Computed over the enumeration
+        // we ALREADY hold (`unclaimed_from`, not `unclaimed_pipes`, so scan never enumerates twice);
+        // `unclaimed_from` already dedupes to one row per pid (fattest feature_len).
+        self.unclaimed = neuron::synth::unclaimed_from(&self.registry, &infos);
         // Selection follows reality: if the selected unit is no longer enumerated (unplugged,
         // dongle gone) — or nothing was selected yet — adopt the first recognized unit so the
         // per-device panels never target a ghost. pid 0 / empty unit never match a row, so this
         // one branch covers both first-scan auto-pick and stale-selection healing. Learning
         // rows are never auto-picked (their def doesn't exist yet, so panels would ghost).
-        if !out
-            .iter()
-            .any(|d| d.pid == self.selected_pid && d.instance == self.selected_unit)
-        {
+        if !out.iter().any(|d| {
+            d.pid == self.selected_pid
+                && d.instance == self.selected_unit
+                && d.dialect == self.selected_dialect
+        }) {
+            // Selection identity is the full PLANE (pid, unit, dialect): heal by matching all three,
+            // and seed all three from the picked row. pid 0 / empty unit / empty dialect never match
+            // a real row, so this one branch still covers both first-scan auto-pick and stale-plane
+            // healing (the empty dialect is just as un-matchable as the empty unit already was).
             let first = out.iter().find(|d| !d.adopting);
             self.selected_pid = first.map(|d| d.pid).unwrap_or(0);
             self.selected_unit = first.map(|d| d.instance.clone()).unwrap_or_default();
+            self.selected_dialect = first.map(|d| d.dialect.clone()).unwrap_or_default();
         }
         out
     }
@@ -318,11 +441,21 @@ impl AppRuntime {
         // turn the watch timer into a permanent 1 Hz rescan loop). scan_devices reloads the registry
         // BEFORE calling here, so an adopted pid already resolves and gets swept on this same pass.
         let reg = &self.registry;
-        self.synth_attempted
-            .retain(|pid, _| infos.iter().any(|i| i.pid == *pid && reg.find_by_pid(i.vid, i.pid).is_none()));
+        // Retain iff some enumerated pipe STILL yields this exact key AND the registry can't resolve
+        // its pid — key-qualified so a twin family's pipe on the same pid can't keep a stale entry
+        // alive (both parts preserved from the bare-pid retain: same-key liveness + still-unknown).
+        self.synth_attempted.retain(|key, _| {
+            // Still-unknown is a FAMILY question (key.0 = the claiming dialect): a stale retry entry
+            // survives only while a pipe still maps to this exact key AND that family is unadopted.
+            // knows_family (not find_by_pid) so a sibling family's def on the same pid can't retire
+            // another family's retry state — the same family-scoping the loop below uses.
+            infos.iter().any(|i| {
+                adopt_key(i) == Some(*key) && !reg.knows_family(i.vid, i.pid, key.0)
+            })
+        });
         let now = std::time::Instant::now();
-        let mut unknown: Vec<u16> = Vec::new(); // pids to probe this pass
-        let mut first_try: Vec<u16> = Vec::new(); // subset never probed before → "learning" row
+        let mut unknown: Vec<AdoptKey> = Vec::new(); // keys to probe this pass
+        let mut first_try: Vec<AdoptKey> = Vec::new(); // subset never probed before → "learning" row
         // Single-probe guard, locked ONCE for the whole build: a pid whose probe thread is still
         // running (a slow/stuck wireless probe can outlast SYNTH_RETRY) must not be re-pushed here,
         // or we'd spawn a SECOND overlapping probe for it. The same guard is written below with the
@@ -334,30 +467,49 @@ impl AppRuntime {
             Err(p) => p.into_inner(),
         };
         for i in infos {
-            if i.vid != neuron::synth::RAZER_VID
-                || i.feature_len != neuron::synth::RAZER_FEATURE_LEN
-                || self.registry.find_by_pid(i.vid, i.pid).is_some()
-                || unknown.contains(&i.pid)
-                || running.contains(&i.pid)
+            // Derive the adoption identity ONCE per pipe. This REPLACES the old separate
+            // `claimed_by(i).is_none()` guard — same claiming test (None = no family claims it,
+            // skip) — and yields the (dialect, pid) key that every dedupe/retry below hangs on, so
+            // a probe's scope can't spill across two families that share a pid. The app's adoption
+            // machinery stays family-agnostic: the claiming decision lives entirely in core.
+            let Some(key) = adopt_key(i) else {
+                continue;
+            };
+            // Already-known is family-scoped (key.0 = the claiming dialect): a razer def on this pid
+            // must NOT suppress adopting the same unit's second-family pipe. knows_family, not
+            // find_by_pid, is what keeps the second family adoptable on a shared pid.
+            if self.registry.knows_family(i.vid, i.pid, key.0)
+                || unknown.contains(&key)
+                || running.contains(&key)
             {
                 continue;
             }
-            match self.synth_attempted.get(&i.pid) {
+            match self.synth_attempted.get(&key) {
                 None => {
-                    unknown.push(i.pid);
-                    first_try.push(i.pid);
+                    unknown.push(key);
+                    first_try.push(key);
                 }
-                // A pid that stayed silent retries on the slow cadence — WITHOUT the
+                // A key that stayed silent retries on the slow cadence — WITHOUT the
                 // "learning…" row, so a never-answering pipe doesn't flash UI every minute.
-                Some(at) if now.duration_since(*at) >= SYNTH_RETRY => unknown.push(i.pid),
+                Some((at, _strikes)) if now.duration_since(*at) >= SYNTH_RETRY => unknown.push(key),
                 Some(_) => {}
             }
         }
         if unknown.is_empty() {
             return;
         }
-        self.synth_attempted
-            .extend(unknown.iter().map(|&pid| (pid, now)));
+        // Stamp the attempt time AND bump the strike count: a first try starts at 1, each retry
+        // increments, and the count is what drives the "unresponsive" placeholder row once it
+        // reaches UNRESPONSIVE_STRIKES. (A key that leaves the bus is retained out entirely above,
+        // so its strikes reset on replug — the natural fresh start.)
+        for &key in &unknown {
+            let strikes = self
+                .synth_attempted
+                .get(&key)
+                .map(|(_, n)| *n)
+                .unwrap_or(0);
+            self.synth_attempted.insert(key, (now, strikes + 1));
+        }
         if let Ok(mut inflight) = self.synth_inflight.lock() {
             inflight.extend(first_try.iter().copied());
         }
@@ -371,11 +523,12 @@ impl AppRuntime {
         std::thread::spawn(move || {
             // Fresh registry (not a clone of the UI's): adoption must judge "unknown" against
             // what's on DISK, so a def another process adopted meanwhile isn't re-probed. Probe
-            // ONLY this worker's pids (`adopt_pids`, not `adopt_unknown`): a second worker spawned
-            // for a DIFFERENT pid must not also probe — and double-write the auto file of — a pid
-            // this worker already owns.
+            // ONLY this worker's keys (`adopt_keys`, not `adopt_unknown`): a second worker spawned
+            // for a DIFFERENT key must not also probe — and double-write the auto file of — a key
+            // this worker already owns. Keying on (dialect, pid) is what makes that scope precise
+            // when two families share a pid: this worker's key never selects the other's pipe.
             if let Ok(reg) = Registry::load() {
-                if let Ok(a) = neuron::synth::adopt_pids(&reg, &unknown) {
+                if let Ok(a) = neuron::synth::adopt_keys(&reg, &unknown) {
                     if !a.adopted.is_empty() {
                         dirty.store(true, Ordering::SeqCst);
                     }
@@ -383,15 +536,15 @@ impl AppRuntime {
             }
             // Probe over (success or not): retire the "learning…" rows for FIRST attempts…
             if let Ok(mut set) = inflight.lock() {
-                for pid in &first_try {
-                    set.remove(pid);
+                for key in &first_try {
+                    set.remove(key);
                 }
             }
-            // …and drop the single-probe guard for every pid this thread probed, so a pid that
+            // …and drop the single-probe guard for every key this thread probed, so a key that
             // stayed unknown becomes eligible for a fresh probe on the next SYNTH_RETRY tick.
             if let Ok(mut set) = running.lock() {
-                for pid in &unknown {
-                    set.remove(pid);
+                for key in &unknown {
+                    set.remove(key);
                 }
             }
         });
@@ -417,13 +570,13 @@ impl AppRuntime {
     /// half is a pure in-memory check over `synth_attempted` — no enumeration, no device I/O — so
     /// an attached-but-silent unknown device costs one real rescan per SYNTH_RETRY window and a
     /// flag check per tick, nothing more. Self-cleaning: unplugging the device lets the next scan
-    /// retain the pid out of `synth_attempted`, and the gate goes permanently quiet.
+    /// retain the key out of `synth_attempted`, and the gate goes permanently quiet.
     pub fn adoption_pending(&self) -> bool {
         self.adoption_active()
             || self
                 .synth_attempted
                 .values()
-                .any(|at| at.elapsed() >= SYNTH_RETRY)
+                .any(|(at, _strikes)| at.elapsed() >= SYNTH_RETRY)
     }
 
     /// Open the currently-selected device (or the first recognized one).
@@ -442,39 +595,37 @@ impl AppRuntime {
     /// Derefs to [`Device`], so every getter/setter call site is unchanged.
     pub fn open_selected(&self) -> anyhow::Result<GatedDevice> {
         let infos = transport::enumerate()?;
-        let unit_pass = [false, true]; // pass 0: exact unit; pass 1: pid-only healing
-        for relaxed in unit_pass {
-            for i in &infos {
-                if let Some(def) = self.registry.find_by_pid(i.vid, i.pid) {
-                    if def.matches_control(i.usage_page, i.usage, i.feature_len)
-                        && (self.selected_pid == 0 || i.pid == self.selected_pid)
-                        && (relaxed
-                            || self.selected_unit.is_empty()
-                            || i.instance() == self.selected_unit)
-                    {
-                        let gate = crate::host::io_gate(i.pid);
-                        return Device::open_path(def.clone(), i.pid, &i.path)
-                            .map(|dev| GatedDevice { _gate: gate, dev });
-                    }
-                }
+        match resolve_plane(
+            &self.registry,
+            &infos,
+            self.selected_pid,
+            &self.selected_unit,
+            &self.selected_dialect,
+        ) {
+            Some((def, i)) => {
+                let gate = crate::host::io_gate(i.pid);
+                Device::open_path(def.clone(), i.pid, &i.path)
+                    .map(|dev| GatedDevice { _gate: gate, dev })
             }
+            None => anyhow::bail!("no recognized Razer device connected"),
         }
-        anyhow::bail!("no recognized Razer device connected")
     }
 
     /// The def of the selected device, if known/connected.
     pub fn selected_def(&self) -> Option<DeviceDef> {
         let infos = transport::enumerate().ok()?;
-        for i in &infos {
-            if let Some(def) = self.registry.find_by_pid(i.vid, i.pid) {
-                if def.matches_control(i.usage_page, i.usage, i.feature_len)
-                    && (self.selected_pid == 0 || i.pid == self.selected_pid)
-                {
-                    return Some(def.clone());
-                }
-            }
-        }
-        None
+        // The one plane resolver: the selected (pid, unit, dialect) plane, unit-precise then
+        // pid-healed. Sharpens the old pid-only match with the same unit + family precision every
+        // other selection consumer uses, so a two-family unit returns the picked family's def, not
+        // find_by_pid's first-by-pid one.
+        resolve_plane(
+            &self.registry,
+            &infos,
+            self.selected_pid,
+            &self.selected_unit,
+            &self.selected_dialect,
+        )
+        .map(|(def, _)| def.clone())
     }
 
     // ── performance setters (gated) ──────────────────────────────────────
@@ -729,6 +880,39 @@ impl AppRuntime {
         }
     }
 
+    /// TOGGLE the keyboard FIRMWARE game mode (the FN+F10 Win-key kill) — a read-modify-write against
+    /// the DEVICE, not the UI. The checkbox is seeded ASYNCHRONOUSLY (see glue's `seed_perf_async`) and
+    /// is cleared to false on every device switch, so it can be stale for the first ~500ms after a
+    /// switch — deriving the write from it sent INVERTED commands (a click in that window on an already
+    /// game-mode board wrote ON again instead of off; review-caught). The device is the ONLY truthful
+    /// source of "current", so we read it (`cap::game_mode`) in the SAME open we write through: read
+    /// truth → write `!current` (which `cap::set_game_mode` read-back verifies, bailing on MISMATCH) →
+    /// return `(Some(new_state), status)`. Any step failing returns `(None, honest error)` so the caller
+    /// posts the error and leaves the display cache untouched. Honours writes-paused first.
+    pub fn toggle_game_mode(&self) -> (Option<bool>, String) {
+        if self.writes_paused() {
+            return (None, "writes paused".into());
+        }
+        let d = match self.open_selected() {
+            Ok(d) => d,
+            Err(e) => return (None, format!("no device: {e}")),
+        };
+        // READ device truth — the toggle's pivot. Never the UI cache (stale post-switch).
+        let current = match neuron::capability::game_mode(&d) {
+            Ok(c) => c,
+            Err(e) => return (None, format!("game mode [unreadable]: {e}")),
+        };
+        let want = !current;
+        match neuron::capability::set_game_mode(&d, want) {
+            Ok(()) if want => (
+                Some(true),
+                "keyboard game mode -> ON \u{00b7} Win key dead in firmware".to_string(),
+            ),
+            Ok(()) => (Some(false), "keyboard game mode -> off".to_string()),
+            Err(e) => (None, format!("game mode [failed]: {e}")),
+        }
+    }
+
     // ── lighting ─────────────────────────────────────────────────────────
 
     /// Effects available on the selected device (native first, then emulated).
@@ -857,9 +1041,10 @@ impl AppRuntime {
                 let reg = Registry::load().map_err(|e| format!("registry: {e}"))?;
                 let infos = transport::enumerate().map_err(|e| format!("enumerate: {e}"))?;
                 for i in &infos {
-                    if let Some(def) = reg.find_by_pid(i.vid, i.pid) {
-                        if def.matches_control(i.usage_page, i.usage, i.feature_len)
-                            && (pid == 0 || i.pid == pid)
+                    // find_for_pipe: the family-aware control-pipe def, so a two-family unit streams
+                    // to the family that can paint this pipe.
+                    if let Some(def) = reg.find_for_pipe(i) {
+                        if (pid == 0 || i.pid == pid)
                             && (unit.is_empty() || i.instance() == unit)
                         {
                             let d = Device::open_path(def.clone(), i.pid, &i.path)
@@ -871,14 +1056,32 @@ impl AppRuntime {
                                 .ok_or_else(|| "device has no lighting".to_string())?;
                             let mut comp = neuron::pattern::Compositor::from_defs(&defs);
                             let lights = Lights::new(&d, ldef);
-                            lights
+                            let streamed = lights
                                 // LIVE fps: read the shared atomic each frame so the GUI's fps
                                 // control re-paces this running composite without a restart.
                                 .animate(&mut comp, || fps_src.load(Ordering::Relaxed), 86_400, || {
                                     stop.load(Ordering::SeqCst) || neuron::writes::writes_paused()
                                 })
-                                .map_err(|e| format!("animate: {e}"))?;
-                            return Ok(());
+                                .map_err(|e| format!("animate: {e}"));
+                            // CUSTODY RELEASE (the DPI-16000 trap): streaming lighting holds this board
+                            // in driver mode (every write flips it via ensure_driver), which defers its
+                            // onboard buttons/FN to software AND orphans the wake-reassert duty. Driver
+                            // mode is a LEASE for the stream's duration, not a permanent state — now that
+                            // THIS board's (only) stream is ending and no host writer holds the device,
+                            // hand ownership back to the firmware. Routed through `release_custody` (the
+                            // stream's def IS razer today — lighting blocks only exist there — but the
+                            // dialect hook means a future STREAMING family releases ITS own custody
+                            // instead of receiving a razer-framed mode packet). Best-effort on the
+                            // stream's OWN handle (the cleanest teardown point: the Device is still open
+                            // here); the next write re-flips driver mode idempotently. Skipped when the
+                            // host owns the writer — it manages the board's mode itself and may still be
+                            // painting it. Also skipped under the writes-paused kill-switch — the
+                            // stream ALSO exits on pause, and a paused state must freeze every device
+                            // write (exit-restore + the next wake-reassert still cover the lease).
+                            if !crate::host::active() && !neuron::writes::writes_paused() {
+                                let _ = d.release_custody();
+                            }
+                            return streamed;
                         }
                     }
                 }
@@ -1046,10 +1249,12 @@ impl AppRuntime {
             name,
             self.gaming_mode,
             self.persist,
-            // respect the device the user picked in the UI — pid AND physical unit, so a rig
-            // with two identical devices captures the exact board being edited, not its twin.
+            // respect the device the user picked in the UI — pid, physical unit, AND dialect, so a
+            // rig with two identical devices captures the exact board being edited, not its twin,
+            // and a future multi-family unit captures the exact control PLANE (not first-family).
             self.selected_pid,
             &self.selected_unit,
+            &self.selected_dialect,
         );
 
         // The UI slider values are fallbacks only — applied where the device did not answer.
@@ -1149,6 +1354,15 @@ impl AppRuntime {
 
     /// Snapshot ONE physical unit's getter space, addressed by its `path_instance` (the row's
     /// unit id) — so backing up one of two identical devices snapshots the one you clicked.
+    ///
+    /// PLANE decision (DIALECT-RND): backup resolves the unit's FIRST resolvable plane (the first
+    /// pipe `find_for_pipe` claims), NOT a selection-precise (unit, dialect) plane — deliberately.
+    /// Backup targets the ROW's unit, not the current SELECTION, and today every unit is N=1 (one
+    /// plane) so "first plane" IS the only plane and the snapshot is exact. A future multi-family
+    /// unit snapshotting its first plane is acceptable-and-documented: a plane-specific backup can
+    /// arrive with real multi-plane hardware (it would need the dialect threaded through the State
+    /// callback + panels/device.slint callsite — out of this migration's edit scope). The sweep
+    /// reads the raw getter space regardless of family, so it never MIS-reads the wrong plane.
     pub fn backup(&self, unit: &str) -> String {
         let infos = match transport::enumerate() {
             Ok(v) => v,
@@ -1158,10 +1372,10 @@ impl AppRuntime {
             if i.instance() != unit {
                 continue;
             }
-            if let Some(def) = self.registry.find_by_pid(i.vid, i.pid).cloned() {
-                if !def.matches_control(i.usage_page, i.usage, i.feature_len) {
-                    continue; // wrong collection of the right unit — keep looking
-                }
+            // find_for_pipe: only the def that DRIVES this collection as its control pipe (family-
+            // aware) is the right one to sweep — a non-control sibling of the right unit resolves to
+            // None here and we keep looking, same as the old matches_control skip.
+            if let Some(def) = self.registry.find_for_pipe(i).cloned() {
                 // the backup sweep reads the ENTIRE getter space — park the
                 // host writer or streaming frames clobber half the replies.
                 let _gate = crate::host::io_gate(i.pid);
@@ -1395,15 +1609,15 @@ fn publish_source_vitals(forced: bool) {
     let source = infos
         .iter()
         .filter(|i| {
-            reg.find_by_pid(i.vid, i.pid).is_some_and(|def| {
-                def.commands.contains_key("battery_level")
-                    && def.matches_control(i.usage_page, i.usage, i.feature_len)
-            })
+            // find_for_pipe: only a battery-bearing def that DRIVES this pipe (family-aware control
+            // rule) is a vitals source — a two-family unit routes battery from the framing family.
+            reg.find_for_pipe(i)
+                .is_some_and(|def| def.commands.contains_key("battery_level"))
         })
         .min_by_key(|i| i.instance());
     {
         let Some(i) = source else { return };
-        let Some(def) = reg.find_by_pid(i.vid, i.pid) else { return };
+        let Some(def) = reg.find_for_pipe(i) else { return };
         // gate the wake-costing OPEN+READ behind the shared throttle; the enumeration above was free.
         if !neuron::vitals::due(i.pid, forced) {
             return;
@@ -1488,36 +1702,21 @@ impl std::ops::Deref for GatedDevice {
     }
 }
 
-/// Read one device's live state (best-effort). Each getter is independent so a partial/asleep
-/// device still yields a row with what it could read. Opens the exact control `path` the caller
-/// enumerated — never "some interface with this pid" — so each row of a duplicate pair reads its
-/// own hardware. `feed_vitals` routes the shared battery sample into the pid-keyed edge-detector;
-/// the caller enables it for ONE unit per pid (see `scan_devices`).
-/// Decode the DPI stage table response `[vs, active, count, {id, Xhi, Xlo, Yhi, Ylo, 0, 0}*]`
-/// into the X-DPI list. Shared by the sync read and the batched worker snapshot.
-fn decode_dpi_stages(s: &[u8; 80]) -> Vec<u16> {
-    let mut out = Vec::new();
-    let count = s[2] as usize;
-    for i in 0..count {
-        let off = 3 + i * 7;
-        if off + 2 < s.len() {
-            let x = ((s[off + 1] as u16) << 8) | s[off + 2] as u16;
-            if x > 0 {
-                out.push(x);
-            }
-        }
-    }
-    out
-}
-
 /// The advanced-FEEL live readouts a device switch needs: idle timeout, DPI stage table, LOD.
 /// Read as ONE batched sweep over a single opened handle (see [`read_perf_snapshot`]).
 #[derive(Default)]
 pub struct PerfSnapshot {
     pub idle_secs: Option<u16>,
     pub dpi_stages: Vec<u16>,
+    /// The device's ACTIVE stage index (0-based) from the same stage-table reply — so the editor
+    /// can seed the picked stage from hardware truth, not a hardcoded "stage 1".
+    pub dpi_active: Option<u8>,
     pub lod_async: Option<(u8, u8)>,
     pub lod_level: Option<u8>,
+    /// The keyboard's FIRMWARE game mode (the FN+F10 Win-key kill), best-effort. `None` on a device
+    /// with no game_mode getter (every mouse) or an unreadable/asleep board — the KEY GUARD card's
+    /// firmware sibling row seeds its toggle from this.
+    pub game_mode: Option<bool>,
 }
 
 /// Batched advanced-FEEL read sweep for one physical unit — a FREE function so a worker thread
@@ -1526,7 +1725,7 @@ pub struct PerfSnapshot {
 /// getter — the old per-getter `open_selected()` paid enumerate+open FOUR times, which is what
 /// made clicking a capable device visibly hitch. The host writer is parked for the sweep
 /// (`io_gate`), same as every other getter path.
-pub fn read_perf_snapshot(pid: u16, unit: &str) -> PerfSnapshot {
+pub fn read_perf_snapshot(pid: u16, unit: &str, dialect: &str) -> PerfSnapshot {
     let mut snap = PerfSnapshot::default();
     let Ok(reg) = Registry::load() else {
         return snap;
@@ -1535,42 +1734,85 @@ pub fn read_perf_snapshot(pid: u16, unit: &str) -> PerfSnapshot {
         return snap;
     };
     let _gate = crate::host::io_gate(pid);
-    // Unit-precise first, pid-only healing second — the same two-pass rule as `open_selected`.
+    // The one plane resolver — the selected (pid, unit, dialect) plane. With the plane now
+    // selection-PRECISE, the best-effort field reads below are CORRECT as-is: the resolved plane
+    // either exposes each getter or it honestly doesn't. Deliberately NO cross-plane fallback sweep
+    // — the review's "the sweep stops at the first pipe" dissolves because the pipe is no longer
+    // ARBITRARY (it's the plane the user picked), so reading only that plane's getters is right.
+    let Some((def, i)) = resolve_plane(&reg, &infos, pid, unit, dialect) else {
+        return snap;
+    };
+    let Ok(d) = Device::open_path(def.clone(), i.pid, &i.path) else {
+        return snap;
+    };
+    snap.idle_secs = cap::idle_timeout_secs(&d).ok();
+    // The ACTIVE getter (0x04/0x86) is the user's REAL cycle; the slot-table fallback
+    // (0x04/0x83) covers boards without 0x86 — seeding the editor from the slot table is how
+    // a stray apply CORRUPTED the user's onboard cycle with factory stages (live incident
+    // 2026-07-07). Bind the reply ONCE — both the stage list and the active index decode from
+    // the same buffer (identical layout for either getter).
+    if let Ok(s) = d.run("dpi_stages_active").or_else(|_| d.run("dpi_stages")) {
+        snap.dpi_stages = neuron::writes::decode_dpi_stages(&s);
+        snap.dpi_active = neuron::writes::decode_dpi_active(&s);
+    }
+    // Asymmetric LOD first (device reports split mode); else symmetric level.
+    snap.lod_async = neuron::writes::lift_off_async(&d);
+    if snap.lod_async.is_none() {
+        snap.lod_level = neuron::writes::lift_off_distance(&d).ok().map(|l| l.min(2));
+    }
+    // FIRMWARE GAME MODE (the Win-key kill) — same one-open sweep, best-effort. A device with
+    // no game_mode command (every mouse) errors before any I/O, so `.ok()` = None for free.
+    snap.game_mode = neuron::capability::game_mode(&d).ok();
+    snap
+}
+
+/// Resolve the SELECTED control plane among enumerated pipes: the pipe of `unit` (pid-healed
+/// when the unit left) whose resolving def speaks `dialect`. Empty dialect = first resolvable
+/// plane (pre-selection / stateless callers). The one resolution rule for open_selected,
+/// selected_def, and the perf snapshot — first-family-wins on a multi-plane unit was the
+/// review-caught identity gap. Two passes like `open_selected`'s old shape: pass 0 exact unit,
+/// pass 1 pid-only healing; within a pass, `find_for_pipe` gives the family-aware control def and
+/// we accept iff the dialect gate passes. Today N=1 (one plane per unit) so pass 0 finds the exact
+/// pipe and the list is byte-identical; the dialect gate only ever excludes a SECOND family's pipe
+/// on a future multi-family unit.
+fn resolve_plane<'a>(
+    reg: &'a Registry,
+    infos: &'a [transport::HidDeviceInfo],
+    pid: u16,
+    unit: &str,
+    dialect: &str,
+) -> Option<(&'a DeviceDef, &'a transport::HidDeviceInfo)> {
     for relaxed in [false, true] {
-        for i in &infos {
-            let Some(def) = reg.find_by_pid(i.vid, i.pid) else {
+        for i in infos {
+            // find_for_pipe: the def that DRIVES this control pipe (family-aware), so a two-family
+            // unit resolves each pipe under the family that can frame it.
+            let Some(def) = reg.find_for_pipe(i) else {
                 continue;
             };
-            if !def.matches_control(i.usage_page, i.usage, i.feature_len)
-                || (pid != 0 && i.pid != pid)
+            if (pid != 0 && i.pid != pid)
                 || !(relaxed || unit.is_empty() || i.instance() == unit)
             {
                 continue;
             }
-            let Ok(d) = Device::open_path(def.clone(), i.pid, &i.path) else {
+            // The dialect leg of the plane identity: empty = first resolvable plane (stateless /
+            // pre-selection); otherwise only the pipe whose def speaks the picked family qualifies.
+            if !(dialect.is_empty() || def.dialect == dialect) {
                 continue;
-            };
-            snap.idle_secs = cap::idle_timeout_secs(&d).ok();
-            if let Ok(s) = d.run("dpi_stages") {
-                snap.dpi_stages = decode_dpi_stages(&s);
             }
-            // Asymmetric LOD first (device reports split mode); else symmetric level.
-            snap.lod_async = neuron::writes::lift_off_async(&d);
-            if snap.lod_async.is_none() {
-                snap.lod_level = neuron::writes::lift_off_distance(&d).ok().map(|l| l.min(2));
-            }
-            return snap;
+            return Some((def, i));
         }
     }
-    snap
+    None
 }
 
 /// The transient row for a device whose adoption probe is in flight: honest name (the USB
 /// product string when the device offers one), "learning device…" as its mode, every control
 /// gated off. No device I/O — the probe thread owns the pipe.
-fn learning_row(i: &transport::HidDeviceInfo, instance: String) -> DeviceState {
+fn learning_row(i: &transport::HidDeviceInfo, family: &str, instance: String) -> DeviceState {
+    // Name fallback follows the CLAIMING dialect (Finding 3): the call site already resolved which
+    // family claims this pipe, so it threads the id in rather than this row re-deriving "razer".
     let name = if i.product.trim().is_empty() {
-        format!("Razer device {:04x}", i.pid)
+        format!("{family} device {:04x}", i.pid)
     } else {
         i.product.trim().to_string()
     };
@@ -1579,6 +1821,10 @@ fn learning_row(i: &transport::HidDeviceInfo, instance: String) -> DeviceState {
         codename: "learning".into(),
         pid: i.pid,
         instance,
+        // A learning row's plane family = the CLAIMING dialect: when the probe lands and the real
+        // registry-backed row flips in (same unit id AND same dialect — the def is tagged with this
+        // very family), the selection carries straight over because the plane identity is unchanged.
+        dialect: family.to_string(),
         mode: "learning device…".into(),
         connected: true,
         firmware: "—".into(),
@@ -1602,6 +1848,57 @@ fn learning_row(i: &transport::HidDeviceInfo, instance: String) -> DeviceState {
         cap_store: false,
         cap_idle: false,
         cap_plate: false,
+        cap_game_mode: false,
+        adopting: true,
+    }
+}
+
+/// A non-operable PLACEHOLDER row for the failed-adoption surface — the UNRESPONSIVE (strike
+/// ledger) and NO-PROTOCOL (unclaimed ledger) rows. No device I/O and no registry def: every
+/// capability gate off, `connected = false` (it can't be driven), `adopting = true` (so the glue
+/// selection policy treats it exactly like a learning row — never auto-picked, selectable-but-inert
+/// — with zero new cases). `mode` carries the honest one-line reason; `instance` is a synthetic id
+/// so it can't collide with a real unit's `path_instance`. It keeps the pipe's REAL pid (like a
+/// learning row): a pid with no registry def makes `open_selected` bail honestly if the row is ever
+/// manually selected — a pid of 0 would instead trip the "any device" branch and open a real one.
+fn placeholder_row(
+    name: String,
+    pid: u16,
+    instance: String,
+    mode: String,
+    dialect: String,
+) -> DeviceState {
+    DeviceState {
+        name,
+        codename: "unrecognized".into(),
+        pid,
+        instance,
+        // The claiming family, carried even on an inert row so its selection identity is complete.
+        dialect,
+        mode,
+        connected: false,
+        firmware: "—".into(),
+        dpi: "—".into(),
+        polling: "—".into(),
+        brightness: "—".into(),
+        battery: String::new(),
+        charging: false,
+        storage: String::new(),
+        icon: "device",
+        dpi_n: None,
+        polling_n: None,
+        brightness_n: None,
+        battery_frac: None,
+        cap_dpi: false,
+        cap_poll: false,
+        cap_light: false,
+        cap_bright: false,
+        cap_bright_set: false,
+        cap_scroll: false,
+        cap_store: false,
+        cap_idle: false,
+        cap_plate: false,
+        cap_game_mode: false,
         adopting: true,
     }
 }
@@ -1622,6 +1919,9 @@ fn read_device_state(
         codename: def.codename.clone(),
         pid,
         instance: String::new(), // the caller stamps the unit id it resolved
+        // The plane's family, straight off the resolving def — this row IS (unit, def.dialect),
+        // one channel of a possibly multi-family unit.
+        dialect: def.dialect.clone(),
         mode,
         connected: false,
         firmware: "—".into(),
@@ -1646,6 +1946,7 @@ fn read_device_state(
         cap_store: def.supports(neuron::registry::Capability::Storage),
         cap_idle: def.supports(neuron::registry::Capability::Battery),
         cap_plate: def.has_side_plates(),
+        cap_game_mode: def.supports(neuron::registry::Capability::SetGameMode),
         adopting: false,
     };
     // Park this device's host lighting writer for the whole getter sweep —

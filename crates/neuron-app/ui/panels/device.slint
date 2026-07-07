@@ -249,10 +249,14 @@ component DeviceLine inherits Rectangle {
     height: 84px;
     clip: true;
     border-radius: Theme.radius;
-    background: selected ? Theme.bg-2 : (ta.has-hover ? Theme.well : transparent);
+    // A placeholder (adopting) row is an ANNOTATION, not a device: dim the whole row and suppress
+    // the hover well so it reads as an inert note. Clicking stays live — selection carry-over for
+    // learning rows must keep working.
+    opacity: root.d.adopting ? Theme.dim-gated : 1.0;
+    background: selected ? Theme.bg-2 : ((ta.has-hover && !root.d.adopting) ? Theme.well : transparent);
     border-width: Theme.hair;
     border-color: selected ? Theme.line : transparent;
-    animate background, border-color { duration: Theme.quick; }
+    animate background, border-color, opacity { duration: Theme.quick; }
     property <bool> sheen-live: root.d.connected && ta.has-hover;
     // accent index tick on the selected channel — the only colour; settles in with the row
     Rectangle {
@@ -317,7 +321,10 @@ component DeviceLine inherits Rectangle {
             // data strip — most-glanced first: DPI · POLL · BATT · LIGHT · ONBOARD · FW. A preferred-0
             // Flickable: it neither pushes `backup` (min 0) nor inflates the card (preferred 0); it clips
             // the trailing (least-glanced) readouts when the card is tight. The PAGE owns scrolling.
-            if root.d.pid != "" : Flickable {
+            // Gated on !adopting too: a placeholder has all caps false + empty battery/storage, so
+            // only "FW —" would render — a dead readout on a row that isn't a device. Suppress the
+            // strip entirely so a placeholder is just its name + mode line.
+            if root.d.pid != "" && !root.d.adopting : Flickable {
                 height: 30px;
                 interactive: false;
                 // NO viewport-width binding: the content lays out at its natural width and the Flickable
@@ -396,7 +403,9 @@ component DeviceLine inherits Rectangle {
         // ── backup — the trailing flow child, a FIXED-width column so the layout engine can never
         // squeeze it (explicit width = min==max==width, immune to any shrink). `main` (stretch:1) eats
         // all slack, so this sits flush-right at the identical x on every device, full label intact. ──
-        if root.d.pid != "" : VerticalLayout {
+        // A placeholder carries a real pid but is unclaimable — a `backup` on it can only fail, so
+        // gate it out (!adopting) alongside the pid check.
+        if root.d.pid != "" && !root.d.adopting : VerticalLayout {
             width: 72px;
             alignment: center;
             Button { text: "backup"; clicked => { root.backup(); } }
@@ -482,6 +491,15 @@ export component DevicePanel inherits VerticalLayout {
                     clicked => { State.select-device(i); }
                     backup => { State.backup-device(d.id); }
                 }
+            }
+            // Unclaimed vendor pipes are an INVENTORY fact, not device channels — their functional
+            // faces (the audio endpoint rows) already list above; a row per pipe double-listed real
+            // hardware (live complaint 2026-07-07). One dim line answers "why isn't my device a
+            // channel" without pretending the pipe is one.
+            if State.unclaimed-note != "" : Mono {
+                text: State.unclaimed-note;
+                color: Theme.text-faint;
+                overflow: elide;
             }
         }
 
@@ -916,6 +934,20 @@ export component DevicePanel inherits VerticalLayout {
                         }
                         // wrap (was clipped at "…reversible (lif") — a chord guard lifts on profile change.
                         Mono { text: "lit = swallowed while a gaming profile is active. reversible, it lifts when the profile changes."; color: Theme.text-faint; wrap: word-wrap; }
+                        // THE HARDWARE SIBLING — the board's OWN firmware Win-key kill (FN+F10 / GAME_LED),
+                        // surfaced beside the host chords because it eats the Win key device-side with zero
+                        // software. Gated on the keyboard actually exposing it (SetGameMode capability).
+                        if State.sel-can-game-mode : Divider {}
+                        if State.sel-can-game-mode : Toggle {
+                            caption: "keyboard game mode (firmware)";
+                            checked: State.game-mode-on;
+                            toggled => { State.toggle-game-mode(); }
+                        }
+                        if State.sel-can-game-mode : Mono {
+                            text: "the board's own FN+F10 Win-key kill — firmware-side, works with zero software. this is what ate your Win key.";
+                            color: Theme.text-faint;
+                            wrap: word-wrap;
+                        }
                     }
                 }
 

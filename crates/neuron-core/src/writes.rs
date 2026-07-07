@@ -44,6 +44,7 @@ use crate::action::Action;
 use crate::capability::Store;
 use crate::device::Device;
 use crate::engine::{Rule, Trigger};
+use crate::registry::DeviceDef;
 use anyhow::{bail, Result};
 
 // ---------------------------------------------------------------------------------------------
@@ -73,12 +74,26 @@ pub fn writes_paused() -> bool {
 // The gate primitives (shared by every write below).
 // ---------------------------------------------------------------------------------------------
 
-/// Device-mode getter/setter codes (verified live elsewhere: `mode driver` flips 00/04=[0x03,0x00]
-/// and lighting/DPI writes only land in driver mode).
-const CLASS_DEVICE_MODE: u8 = 0x00;
-const ID_DEVICE_MODE_GET: u8 = 0x84;
-const ID_DEVICE_MODE_SET: u8 = 0x04;
+/// Device-mode getter/setter codes — the ONE home of the device-mode opcode; every mode switch
+/// (ensure_driver, the CLI `mode` verb, macro-key arming, lighting's take-control) routes through
+/// [`set_device_mode`] and these consts. (Verified live: `mode driver` flips 00/04=[0x03,0x00];
+/// lighting/DPI writes only land in driver mode.)
+pub const CLASS_DEVICE_MODE: u8 = 0x00;
+pub const ID_DEVICE_MODE_GET: u8 = 0x84;
+pub const ID_DEVICE_MODE_SET: u8 = 0x04;
 const DRIVER_MODE: u8 = 0x03;
+
+/// The raw device-mode switch: `(class 0x00, id 0x04, size 0x02, args [mode, 0x00])`. This is
+/// [`ensure_driver`]'s unconditional building block (no read-first guard — that's ensure_driver's
+/// job), exported so the CLI's explicit `neuron mode` verb and the app's macro-key arming don't
+/// re-derive the opcode. Returns the device's reply body. driver=0x03, hardware=0x00.
+///
+/// TEARDOWN must NOT call this directly — use [`Device::release_custody`](crate::device::Device::release_custody)
+/// (dialect-routed), so a non-razer family can't be handed a razer-framed mode packet. This raw form
+/// is for the RAZER-EXPLICIT paths only (`ensure_driver`, the CLI `mode` verb).
+pub fn set_device_mode(d: &Device, mode: u8) -> Result<[u8; 80]> {
+    d.exec_dynamic(CLASS_DEVICE_MODE, ID_DEVICE_MODE_SET, 0x02, &[mode, 0x00])
+}
 
 /// Ensure the device is in DRIVER mode — Razer gates host control behind it, so every firmware
 /// write must flip it first. Idempotent: a no-op if already in driver mode. Reversible (reopening
@@ -92,14 +107,29 @@ pub fn ensure_driver(d: &Device) -> u8 {
         .map(|a| a[0])
         .unwrap_or(0);
     if prior != DRIVER_MODE {
-        let _ = d.exec_dynamic(
-            CLASS_DEVICE_MODE,
-            ID_DEVICE_MODE_SET,
-            0x02,
-            &[DRIVER_MODE, 0x00],
-        );
+        let _ = set_device_mode(d, DRIVER_MODE);
     }
     prior
+}
+
+/// Read the device's CURRENT device-mode byte (0x00 = hardware/firmware, 0x03 = driver) WITHOUT
+/// changing it — the read-only sibling of [`ensure_driver`] (which flips). `None` when the getter
+/// doesn't answer (asleep link). (Formerly the wake-reconcile gated on this — a "driver mode owns the
+/// wake" assumption the 2026-07-07 trap DISPROVED, since a NORMAL-mode wake restored stale volatile
+/// state too; the reconcile is now disagreement-gated and mode-independent, see
+/// [`reconcile_volatile_with_persisted`].)
+pub fn device_mode(d: &Device) -> Option<u8> {
+    d.exec_dynamic(CLASS_DEVICE_MODE, ID_DEVICE_MODE_GET, 0x02, &[])
+        .ok()
+        .map(|a| a[0])
+}
+
+/// Is the device CURRENTLY held in DRIVER mode? A read-only gate (never flips) so callers can scope
+/// driver-mode-only duties without leaking [`DRIVER_MODE`]. A getter that doesn't answer reads as
+/// `false`. (It NO LONGER gates the wake-reconcile — the 2026-07-07 trap disproved the "driver mode
+/// owns the wake" premise — but is kept as the honest read-only mode probe.)
+pub fn is_driver_mode(d: &Device) -> bool {
+    device_mode(d) == Some(DRIVER_MODE)
 }
 
 /// Read a getter back and confirm the bytes we intended to write are present. `expect` is checked
@@ -156,6 +186,19 @@ fn hex_slice(b: &[u8]) -> String {
 const CLASS_DPI: u8 = 0x04;
 const ID_DPI_STAGES_GET: u8 = 0x86;
 const ID_DPI_STAGES_SET: u8 = 0x06;
+/// The plain active-DPI getter (`0x04/0x85`, reply `[varstore, X_hi, X_lo, Y_hi, Y_lo]`, size 7 —
+/// the same command `capability::dpi` reads). The wake-reassert reads the PERSISTED plane of this to
+/// copy the onboard DPI back into volatile after a driver-mode wake reverted it.
+const ID_DPI_GET: u8 = 0x85;
+const DPI_GET_SIZE: u8 = 0x07;
+/// The varstore arg that selects the ONBOARD (persisted) plane on a store-aware getter. Reading a
+/// stage/DPI getter with `[PERSISTED]` returns the flashed truth (the user's intent — what wake
+/// SHOULD have restored), not the volatile plane the wake corrupted.
+const PERSISTED: u8 = 0x01;
+/// The varstore arg that selects the VOLATILE (live) plane — what the device is ACTING on right now,
+/// which a bad wake corrupts. The wake-reconcile reads THIS and compares it to `[PERSISTED]` to decide
+/// whether the wake left the two planes disagreeing (and thus whether any heal is owed at all).
+const VOLATILE: u8 = 0x00;
 /// Read/write payload size for the stage table (matches the registry `dpi_stages` size 0x26 = 38).
 const DPI_STAGES_SIZE: u8 = 0x26;
 /// Per-stage record stride in the table body: {stage_id, X_hi, X_lo, Y_hi, Y_lo, 0, 0}.
@@ -219,6 +262,38 @@ pub fn build_dpi_stages_payload(
     Ok(buf)
 }
 
+/// Decode a DPI stage-table getter reply into the list of X resolutions (the cycle) — the ONE
+/// inverse of [`build_dpi_stages_payload`], matching the device layout
+/// `[varstore, active_idx, count, {stage_id, X_hi, X_lo, Y_hi, Y_lo, 0, 0} * count]`. Zero-DPI
+/// records (empty hardware slots) are skipped and an out-of-range `count` is clamped to what the
+/// buffer holds. Pure (slice in, Vec out) so it needs no hardware. Every consumer imports THIS —
+/// the terrain survey found three drifted copies (CLI, profile capture, app perf-snapshot).
+pub fn decode_dpi_stages(s: &[u8]) -> Vec<u16> {
+    if s.len() < 3 {
+        return Vec::new();
+    }
+    let count = s[2] as usize;
+    let mut out = Vec::new();
+    for i in 0..count {
+        let off = 3 + i * DPI_STAGE_STRIDE; // [id, X_hi, X_lo, Y_hi, Y_lo, 0, 0]
+        if off + 2 < s.len() {
+            let x = ((s[off + 1] as u16) << 8) | s[off + 2] as u16;
+            if x > 0 {
+                out.push(x);
+            }
+        }
+    }
+    out
+}
+
+/// The active stage index (0-based) from a DPI stage-table getter reply, if present. The wire
+/// byte is 1-BASED (probed live: the firmware REJECTS a 0 in the setter; the getter echoes the
+/// same numbering) — the old raw passthrough marked the WRONG stage as active, one past reality.
+/// A wire 0 means "no active stage reported" → None. The companion inverse to [`decode_dpi_stages`].
+pub fn decode_dpi_active(s: &[u8]) -> Option<u8> {
+    s.get(1).copied().filter(|&b| b > 0).map(|b| b - 1)
+}
+
 /// Write the full DPI stage table: driver-mode -> write (volatile unless `store` is Persist)
 /// -> read-back verify the active index + stage count + every stage's bytes.
 ///
@@ -244,6 +319,132 @@ pub fn set_dpi_stages(d: &Device, stages: &[DpiStage], active_idx: u8, store: St
     verify_getter(d, CLASS_DPI, ID_DPI_STAGES_GET, DPI_STAGES_SIZE, 1, expect)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(())
+}
+
+/// WAKE-RECONCILE (the Synapse duty): heal a wake that loaded the WRONG volatile state by copying this
+/// device's persisted plane — the user's intent — over whatever the wake left live. Only touches the
+/// DPI plane (lighting re-streams continuously and needs no reconcile).
+///
+/// THE STORE (trap-proven TWICE, dpi_trap.log 2026-07-07): the persisted (onboard varstore) plane is
+/// the user's intent, and a wake that loads ANYTHING else must be healed. The first trap blamed
+/// driver mode (device_mode 0x03) — "software owns volatile state, and neuron holds the lease with
+/// nobody on wake duty." The 07:42-07:51 re-run DISPROVED that gate: with the Naga in NORMAL mode
+/// (0x00) and BOTH varstores verified clean ([800,30000] active 1), a sleep/wake STILL restored the
+/// volatile plane to the FACTORY table ([800,16000,…] active 2, DPI 16000) while persisted stayed
+/// clean. The restoring source is neither varstore — it is the unmapped onboard-PROFILE flash (class
+/// 0x05 reads 5 slots, active slot 1; its content/write path is a standing recon target). It reloads
+/// factory tables on wake in EVERY device mode, so this heal is mode-INDEPENDENT.
+///
+/// DISAGREEMENT-GATED (the do-no-harm property): before writing anything, read the VOLATILE plane
+/// (`[VOLATILE]`) and compare it to PERSISTED (`[PERSISTED]`). Write the stage table ONLY if volatile
+/// disagrees (the decoded cycle OR the active index drifted) and write DPI ONLY if the volatile DPI
+/// disagrees. A clean wake — stores already agree — writes NOTHING and returns an empty Vec. Because
+/// firmware is never fought when it behaved, running this on every wake regardless of device mode is
+/// safe (the gate is what the old driver-mode gate was only approximating). Everything is derived from
+/// DEVICE truth so no host-side cached state is trusted. Honours the writes-paused kill-switch like
+/// every other autonomous write path. Returns a summary of ONLY what was actually reconciled.
+pub fn reconcile_volatile_with_persisted(d: &Device) -> Result<Vec<String>> {
+    if writes_paused() {
+        bail!("[writes paused]");
+    }
+    let mut done: Vec<String> = Vec::new();
+
+    // 1) STAGE TABLE. Read BOTH planes of the stage getter (0x04/0x86). PERSISTED is the intended
+    //    cycle+active; VOLATILE is what the wake left live. Reconcile ONLY on a disagreement — compare
+    //    the decoded stage list AND the (de-1-based) active index; if either drifted, copy
+    //    persisted→volatile via the proven stage writer.
+    let persisted = d
+        .exec_dynamic(CLASS_DPI, ID_DPI_STAGES_GET, DPI_STAGES_SIZE, &[PERSISTED])
+        .map_err(|e| anyhow::anyhow!("persisted stage read (0x04/0x86) failed: {e}"))?;
+    let volatile = d
+        .exec_dynamic(CLASS_DPI, ID_DPI_STAGES_GET, DPI_STAGES_SIZE, &[VOLATILE])
+        .map_err(|e| anyhow::anyhow!("volatile stage read (0x04/0x86) failed: {e}"))?;
+    let want_xs = decode_dpi_stages(&persisted);
+    if !want_xs.is_empty() {
+        let live_xs = decode_dpi_stages(&volatile);
+        // decode_dpi_active already de-1-bases the wire byte back to a 0-based index; default to the
+        // first stage when a plane reports none, so both sides compare on the same footing.
+        let want_active = decode_dpi_active(&persisted).unwrap_or(0);
+        let live_active = decode_dpi_active(&volatile).unwrap_or(0);
+        if live_xs != want_xs || live_active != want_active {
+            let stages: Vec<DpiStage> = want_xs.iter().map(|&x| DpiStage::symmetric(x)).collect();
+            set_dpi_stages(d, &stages, want_active, Store::Volatile)
+                .map_err(|e| anyhow::anyhow!("volatile stage reconcile failed: {e}"))?;
+            done.push(format!(
+                "stages [{}] active {}",
+                want_xs
+                    .iter()
+                    .map(|x| x.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                want_active + 1
+            ));
+        }
+    }
+
+    // 2) ACTIVE DPI. Same shape: reply is [varstore, X_hi, X_lo, Y_hi, Y_lo]. Read PERSISTED (intent)
+    //    and VOLATILE (live), and write the persisted X/Y back volatile ONLY when the live DPI drifted
+    //    (the capability setter — the sibling module owns the DPI opcode).
+    let persisted_dpi = d
+        .exec_dynamic(CLASS_DPI, ID_DPI_GET, DPI_GET_SIZE, &[PERSISTED])
+        .map_err(|e| anyhow::anyhow!("persisted dpi read (0x04/0x85) failed: {e}"))?;
+    let volatile_dpi = d
+        .exec_dynamic(CLASS_DPI, ID_DPI_GET, DPI_GET_SIZE, &[VOLATILE])
+        .map_err(|e| anyhow::anyhow!("volatile dpi read (0x04/0x85) failed: {e}"))?;
+    let want_x = ((persisted_dpi[1] as u16) << 8) | persisted_dpi[2] as u16;
+    let want_y = ((persisted_dpi[3] as u16) << 8) | persisted_dpi[4] as u16;
+    let live_x = ((volatile_dpi[1] as u16) << 8) | volatile_dpi[2] as u16;
+    let live_y = ((volatile_dpi[3] as u16) << 8) | volatile_dpi[4] as u16;
+    if want_x > 0 && (want_x != live_x || want_y != live_y) {
+        crate::capability::set_dpi(d, want_x, want_y, Store::Volatile)
+            .map_err(|e| anyhow::anyhow!("volatile dpi reconcile failed: {e}"))?;
+        done.push(format!("dpi {want_x}"));
+    }
+
+    Ok(done)
+}
+
+/// Pure membership test: is `announced` one of the DPI values in the persisted stage `cycle`? The
+/// device's onboard DPI-cycle button can ONLY ever land on a value that IS in the persisted cycle —
+/// cycle values are BY DEFINITION the legitimate stops the firmware walks — so a hit means "the
+/// user's thumb chose this, leave it." A miss means the announced DPI came from somewhere the user
+/// never configured: the trap-proven stale wake-restore's factory 16000 is the live proof (dpi_trap.log
+/// 08:39 — a wake self-announced 16000, absent from the user's `[800,30000]` cycle). Split out from
+/// [`announced_dpi_is_foreign`] so the rule is unit-testable without a device.
+fn dpi_in_cycle(cycle: &[u16], announced: u16) -> bool {
+    cycle.contains(&announced)
+}
+
+/// Is `announced` a FOREIGN DPI — one nobody legitimate chose? Reads this device's PERSISTED stage
+/// cycle (`0x04/0x86` with `[PERSISTED]`, decoded to its X list) and applies the [`dpi_in_cycle`]
+/// membership rule. This is the anti-fight-the-user gate for the `05 02` DPI-announce wake trigger,
+/// which fires on EVERY device-side DPI change — the user's onboard button-cycle AND the stale
+/// wake-restore alike — so the announce alone cannot tell a legitimate step from corruption; the
+/// persisted cycle can.
+///
+/// * `Some(false)` — `announced` IS a member of the persisted cycle → a legitimate onboard cycle-step
+///   by the user's button (cycle values are by definition members) → the caller does NOTHING (a
+///   reconcile would snap the cursor back against the user's thumb).
+/// * `Some(true)` — the cycle is non-empty and `announced` is NOT in it → nobody legitimate chose it
+///   (the trap-proven wake-restore: the 08:39 incident announced factory 16000 with NO `05 0c` power
+///   event, so the power-event trigger missed the wake and the stale plane sat uncorrected) → the
+///   caller runs [`reconcile_volatile_with_persisted`] (its own disagreement gate keeps the write
+///   minimal).
+/// * `None` — the persisted cycle is UNREADABLE (asleep link / short reply / empty table). Missing
+///   evidence is NEVER grounds to reconcile: the caller does nothing rather than heal against a value
+///   it can't corroborate.
+///
+/// Reads only (never gated). The device-truth cycle is supplied here; the pure rule lives in
+/// [`dpi_in_cycle`] so it needs no hardware to test.
+pub fn announced_dpi_is_foreign(d: &Device, announced: u16) -> Option<bool> {
+    let persisted = d
+        .exec_dynamic(CLASS_DPI, ID_DPI_STAGES_GET, DPI_STAGES_SIZE, &[PERSISTED])
+        .ok()?;
+    let cycle = decode_dpi_stages(&persisted);
+    if cycle.is_empty() {
+        return None; // unreadable / empty cycle → no evidence → caller must do nothing
+    }
+    Some(!dpi_in_cycle(&cycle, announced))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -852,6 +1053,79 @@ pub fn set_snap_tap(d: &Device, pairs: &[SnapTapPair], enable: bool) -> Result<(
 }
 
 // ---------------------------------------------------------------------------------------------
+// 2g. FIRST-LIGHT LIGHTING VERIFY + TX SELF-HEAL (DIALECT-RND wave 2b).
+//     Razer-dialect knowledge, living beside the other proven write recipes: a lighting write does
+//     NOT echo honesty (a wrong tx ACKs then silently no-ops — the Chroma V2 split-brain bug), so
+//     the ONLY way to know a tx is right is to write, then read the lighting_state getter back and
+//     see the effect actually change. That read-back is these two primitives.
+// ---------------------------------------------------------------------------------------------
+
+/// Did the last lighting write LAND? Reads the def's `lighting_state` getter and compares the
+/// echoed effect byte against `expected_effect`. The Naga TOML authored this getter "to verify
+/// a lighting write actually landed" — this is its first actual consumer (survey 2026-07-06).
+/// None = device has no lighting_state getter (verification impossible, not a failure).
+///
+/// Layout is per-era (read the two device TOMLs' lighting_state comments): the MATRIX state
+/// (class 0x0F/0x82) is `[varstore, led, effect, param, brightness, …]` so the effect sits at
+/// byte [2] and we compare it exactly. The LEGACY state (class 0x03/0x88, size 6) does NOT map to
+/// a clean effect byte, so legacy verification is COARSE: an ALL-ZERO reply means nothing is lit
+/// (the write didn't land), any nonzero byte in the state means it did — enough to tell "the tx
+/// reached the LEDs" from "the tx no-op'd", which is all the heal needs.
+pub fn lighting_landed(d: &Device, def: &DeviceDef, expected_effect: u8) -> Option<bool> {
+    let cmd = def.command("lighting_state")?;
+    let got = d.exec_dynamic(cmd.class, cmd.id, cmd.size, &cmd.args).ok()?;
+    match cmd.class {
+        // MATRIX: [varstore, led, effect, …] — the effect byte is the exact landed proof.
+        0x0F => Some(got[2] == expected_effect),
+        // LEGACY (and any other era): coarse — the 0x03/0x88 state has no clean effect byte, so a
+        // nonzero state = lit = landed; an all-zero state = the write no-op'd. Honest and blunt.
+        _ => {
+            let size = (cmd.size as usize).clamp(1, got.len());
+            Some(got[..size].iter().any(|&b| b != 0))
+        }
+    }
+}
+
+/// FIRST-LIGHT HEAL (DIALECT-RND): on an AUTO def whose lighting writes may ride a wrong era-
+/// heuristic tx (writes don't echo honesty — a wrong tx ACKs then no-ops), re-issue the custom-
+/// frame DISPLAY report at each tx cohort candidate (0x1F, 0x3F, 0xFF, 0x9F), read back
+/// lighting_state after each, and return the FIRST tx that verifiably landed. Starts with the
+/// def's current tx (already-right = no extra writes). None = nothing verified (device asleep /
+/// no getter) — caller leaves the def alone. Writes are the same volatile lighting writes the
+/// caller was already streaming; no new write class is introduced.
+pub fn first_light_heal(d: &Device, def: &DeviceDef) -> Option<u8> {
+    let l = def.lighting.as_ref()?;
+    // The custom-frame DISPLAY report — the write whose landing we're proving. Its data_size is the
+    // report's explicit size if any, else the arg count (same rule apply_lighting/send_lighting_fast use).
+    let rep = l.custom_display_report();
+    let size = rep.size.unwrap_or_else(|| rep.args.len().min(80) as u8);
+    // The effect byte a landed custom frame echoes in lighting_state. MATRIX expects `custom_id`
+    // (0x08 on the Naga); the LEGACY display report's own effect id is ALSO `custom_id` (0x05), and
+    // legacy verification is coarse anyway — so `custom_id` is the right expectation for both.
+    let custom_id = l.custom_id;
+    // Cohort candidates, current tx FIRST so an already-correct def verifies in ONE write and the
+    // caller does no rewrite. The rest are the known Razer tx cohorts, minus the current one.
+    const COHORT: [u8; 4] = [0x1F, 0x3F, 0xFF, 0x9F];
+    let mut candidates: Vec<u8> = vec![def.transaction_id];
+    candidates.extend(COHORT.iter().copied().filter(|&c| c != def.transaction_id));
+    for tx in candidates {
+        // ACK'd path (`exec_dynamic_tx`, NOT the fire-and-forget stream) — we WANT the ack, and we
+        // deliberately override the report's own tx with the candidate we're testing. A transport
+        // error (asleep link) just moves to the next candidate; only a verified landing returns.
+        if d
+            .exec_dynamic_tx(tx, rep.class, rep.id, size, &rep.args)
+            .is_err()
+        {
+            continue;
+        }
+        if lighting_landed(d, def, custom_id) == Some(true) {
+            return Some(tx);
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------------------------
 // 2d. GAMING MODE — Synapse `GamingMode` (DisableAltTab / DisableWin / DisableAltF4).
 //     This is enforced HOST-SIDE (a low-level keyboard hook suppresses the chords) — there is no
 //     reliable device-write for it on these devices, and host-side is what Neuron's daemon already
@@ -1184,6 +1458,19 @@ mod tests {
         assert_eq!(p[31], 0x05);
         // 3 (header) + 5*7 (records) = 38 = the full buffer; nothing left over.
         assert_eq!(p.len(), 38);
+    }
+
+    #[test]
+    fn dpi_in_cycle_gates_the_announce_reconcile() {
+        // MEMBER → a legitimate onboard-button cycle-step (the caller leaves it; never fought).
+        assert!(dpi_in_cycle(&[800, 30000], 800));
+        assert!(dpi_in_cycle(&[800, 30000], 30000));
+        // NON-MEMBER → the trap-proven stale wake-restore: factory 16000 is not in the user's
+        // `[800,30000]` cycle, so nobody legitimate chose it → foreign → reconcile (dpi_trap.log 08:39).
+        assert!(!dpi_in_cycle(&[800, 30000], 16000));
+        // EMPTY cycle has no members. `announced_dpi_is_foreign` maps an empty/unreadable cycle to
+        // None upstream (never reconcile on missing evidence); the pure rule just reports "no member".
+        assert!(!dpi_in_cycle(&[], 800));
     }
 
     #[test]

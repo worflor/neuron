@@ -7,8 +7,9 @@
 //!     keys/clicks/macros actually fire — remaps work out of the box;
 //!   * builds the ONE unified [`Engine`] from every on-disk config (bindings/cast/hypershift/
 //!     app-rules) via [`neuron::controls::build_runtime`];
-//!   * installs the GamingMode `WH_KEYBOARD_LL` suppression hook on the same thread that pumps the
-//!     Raw-Input message loop (an LL hook only fires while that thread pumps messages);
+//!   * activates the GamingMode `WH_KEYBOARD_LL` suppression hook (which self-hosts a dedicated
+//!     message-pump thread in `neuron::hook`, so it is immune to this loop's blocking device I/O —
+//!     an LL hook Windows silently bypasses if its installing thread misses the ~300 ms timeout);
 //!   * on each Raw-Input event translates to a [`Trigger`] and dispatches through the Engine —
 //!     HyperShift hold edges via held-layer state, daemon [`Intent`]s routed (DPI / scroll /
 //!     profile), Turbo repeated while held, the mic-tap + app-focus polled on the tick;
@@ -296,10 +297,15 @@ fn run_worker(weak: slint::Weak<AppWindow>, stop: Arc<AtomicBool>, live_rx: Rece
     let mut applied_hypershift_latch = false;
     let mut gaming_policy_dirty = false;
 
-    // GamingMode suppression hook (Alt+Tab / Win / Alt+F4). Installed on THIS thread because an LL
-    // keyboard hook only fires while its installing thread pumps messages — and `listen_until`'s
-    // Raw-Input window pumps the message loop on this very thread. The policy comes from the active
-    // profile's ApplyReport; we read it from the shared cell the glue updates on profile apply.
+    // GamingMode suppression hook (Alt+Tab / Win / Alt+F4). The hook SELF-HOSTS a dedicated
+    // message-pump thread (see neuron::hook / sys::pump_main), so it is immune to THIS thread's
+    // blocking device I/O. That immunity is the whole fix: an LL keyboard hook is silently bypassed
+    // by Windows if its installing thread misses the LowLevelHooksTimeout (~300 ms), and this
+    // listener does tens-of-ms sniper writes / mic reads / sleep throttles inside its callback —
+    // when the hook lived here, the KEY GUARD chords only suppressed while the thread was idle, i.e.
+    // never reliably. Now this handle is just an ownership token pushing desired policy at a hook
+    // that pumps itself. The policy comes from the active profile's ApplyReport; we read it from the
+    // shared cell the glue updates on profile apply.
     let mut hook: Option<neuron::hook::Hook> = None;
     install_gaming_hook(&mut hook);
 

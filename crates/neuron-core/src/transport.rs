@@ -61,6 +61,14 @@ pub struct HidDeviceInfo {
     pub usage_page: u16,
     pub usage: u16,
     pub feature_len: u16,
+    /// The collection's OUTPUT/INPUT report byte lengths (HIDP_CAPS `OutputReportByteLength` /
+    /// `InputReportByteLength`), the second wire surface's signature. `feature_len` above is the
+    /// razer_report control pipe's shape; these are what a request/reply-over-output/input family
+    /// (HID++: a 7-byte short or 20-byte long report) is recognized by. Zero when the OS reports no
+    /// output/input report on this collection (feature-only pipes). Kept alongside `feature_len` so
+    /// a `Dialect::claims` can test whichever surface it rides.
+    pub input_len: u16,
+    pub output_len: u16,
     pub path: DevicePath, // platform-opaque handle key
     /// The device's own USB product string (e.g. "Razer Naga V2 Pro"), empty when the
     /// OS/device doesn't offer one. Used to give auto-synthesized device defs an honest
@@ -113,9 +121,36 @@ pub fn path_instance(path: &str) -> String {
 }
 
 /// A feature-report channel to one device.
+///
+/// Two wire surfaces live here. The PROVEN one is the feature-report request/reply pair
+/// ([`set_feature`](Transport::set_feature)/[`get_feature`](Transport::get_feature)) — how
+/// `razer_report` talks (a SetFeature IOCTL request, a GetFeature IOCTL reply). The SECOND surface
+/// ([`write_output`](Transport::write_output)/[`read_input`](Transport::read_input)) is for
+/// families whose requests ride an OUTPUT report (`WriteFile`) and whose replies arrive as INPUT
+/// reports (`ReadFile`) — the shape HID++ uses (DIALECT-RND survey ruling: "HID++ requests ride
+/// `WriteFile`(output report) and replies arrive as input reports", distinct from razer's feature
+/// pull). Both default to an honest error so every existing impl — the Windows feature-report
+/// transport, the synth/dialect test mocks — compiles unchanged and only a family that needs the
+/// output/input surface overrides them.
 pub trait Transport {
     fn set_feature(&self, buf: &[u8]) -> Result<()>;
     fn get_feature(&self, buf: &mut [u8]) -> Result<()>;
+
+    /// Send an OUTPUT report (the request half of the output/input wire surface). Default: an
+    /// honest error — a feature-report-only transport does not carry output reports.
+    fn write_output(&self, buf: &[u8]) -> Result<()> {
+        let _ = buf;
+        anyhow::bail!("transport does not carry output reports")
+    }
+
+    /// Read the next INPUT report (the reply half), waiting at most `timeout_ms`; returns the byte
+    /// count written into `buf`. Default: an honest error — a feature-report-only transport does
+    /// not carry input reports. A timeout must surface as an `Err`, not a zero-length `Ok`, so a
+    /// probe draining replies can tell "nothing arrived in the window" from "an empty report".
+    fn read_input(&self, buf: &mut [u8], timeout_ms: u32) -> Result<usize> {
+        let _ = (buf, timeout_ms);
+        anyhow::bail!("transport does not carry input reports")
+    }
 }
 
 /// A read channel for device-INITIATED input reports — the unsolicited reports a device pushes on
@@ -162,4 +197,36 @@ pub fn open_path(_path: &DevicePath) -> Result<Box<dyn Transport>> {
 #[cfg(not(windows))]
 pub fn open_reader(_path: &DevicePath) -> Result<Box<dyn InputReader>> {
     anyhow::bail!("transport not implemented on this platform yet (hidapi backend pending)")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A feature-report-only transport (like a razer_report mock): it implements the pull surface
+    /// and inherits the DEFAULT output/input bodies. Pins that a family which never carries
+    /// output/input reports still gets an honest error, not silence, from the second surface.
+    struct FeatureOnly;
+    impl Transport for FeatureOnly {
+        fn set_feature(&self, _buf: &[u8]) -> Result<()> {
+            Ok(())
+        }
+        fn get_feature(&self, _buf: &mut [u8]) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn default_output_input_surface_errors_honestly() {
+        let t = FeatureOnly;
+        assert!(
+            t.write_output(&[0u8; 8]).is_err(),
+            "a feature-only transport must not silently accept an output report"
+        );
+        let mut buf = [0u8; 20];
+        assert!(
+            t.read_input(&mut buf, 100).is_err(),
+            "a feature-only transport must ERROR (not Ok(0)) when asked for an input report"
+        );
+    }
 }

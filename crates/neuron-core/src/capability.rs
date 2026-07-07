@@ -30,6 +30,47 @@ pub fn device_mode(dev: &Device) -> Result<u8> {
     Ok(a[0])
 }
 
+/// Firmware GAME MODE — the keyboard's own FN+F10-toggled Win-key kill (the GAME_LED state). When
+/// ON, the board eats the Windows key in FIRMWARE with ZERO software running: it is the device-
+/// PHYSICAL sibling of the host-side KEY GUARD chord swallows (which live in `crate::hook`). This
+/// is exactly what silently ate the user's Win key on 2026-07-07 while every host layer read clean.
+///
+/// Hardware-confirmed on the BlackWidow Chroma V2 (2026-07-07): the getter (0x03/0x80, baked args
+/// `[varstore, GAME_LED 0x08]`) echoes the state at response arg[2] (0 = off, nonzero = on).
+///
+/// NOTE the FN+F10 hardware toggle itself only works in NORMAL device mode — in driver mode the
+/// board defers FN combos to software (OpenRazer #1174 is the same bug class), so while neuron is
+/// driving the board the SOFTWARE path ([`set_game_mode`]) is the reliable way to flip it.
+pub fn game_mode(dev: &Device) -> Result<bool> {
+    let a = dev.run("game_mode")?;
+    Ok(a[2] != 0)
+}
+
+/// Set the firmware GAME MODE (the Win-key kill) on/off, then READ-BACK VERIFY it landed. Writes via
+/// `set_game_mode` (0x03/0x00, args `[varstore, GAME_LED 0x08, state]`) — the hardware-confirmed
+/// setter (2026-07-07: `[00 08 00]` ACKed and read back, the GAME_LED visibly went dark on the
+/// software write) — then re-reads the [`game_mode`] getter and bails with an honest MISMATCH error
+/// if the board doesn't report the state we asked for. This mirrors the verify-gated discipline of
+/// `writes::verify_getter` in spirit; a plain re-read + compare is enough here since both the setter
+/// and getter are registry-named commands (no raw class/id/offset to thread).
+///
+/// The device-PHYSICAL half of the KEY GUARD: the host chord-swallow lives in `crate::hook`, this is
+/// the firmware Win-key kill surfaced beside it. See [`game_mode`]'s note on why the software path is
+/// the reliable one while neuron holds the board in driver mode.
+pub fn set_game_mode(dev: &Device, on: bool) -> Result<()> {
+    let state = on as u8;
+    dev.run_args("set_game_mode", &[0x00, 0x08, state])?;
+    // Read-back verify: a lighting/LED write can ACK yet not land, so we never trust the write —
+    // the getter must echo the state we asked for, or this is a failure (not a silent success).
+    let got = game_mode(dev)?;
+    if got != on {
+        anyhow::bail!(
+            "VERIFY FAILED on game_mode: wrote {on} but device reports {got} — write NOT trusted"
+        );
+    }
+    Ok(())
+}
+
 /// Current sensitivity, (DPI_X, DPI_Y). Response is [varstore, X_hi, X_lo, Y_hi, Y_lo].
 pub fn dpi(dev: &Device) -> Result<(u16, u16)> {
     let a = dev.run("dpi")?;

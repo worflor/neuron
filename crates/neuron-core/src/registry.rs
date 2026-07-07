@@ -38,11 +38,40 @@ pub struct ControlInterface {
     pub feature_report_len: u16,
 }
 
+/// The serde default for [`DeviceDef::dialect`]: every TOML that predates the dialect field
+/// speaks razer_report, so an absent key means "razer".
+fn default_dialect() -> String {
+    "razer".into()
+}
+
+/// Where a def was loaded from — TRUST provenance. Builtin/Curated are board-verified data a
+/// self-heal must never rewrite; Auto is synthesized config the system may improve in place
+/// (e.g. the first-light tx heal). serde(skip): origin is a LOAD fact, never file content.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum DefOrigin {
+    #[default]
+    Builtin,
+    Curated,
+    Auto,
+}
+
 /// A complete device definition (the unit you add to support a new device).
 #[derive(Debug, Deserialize, Clone, PartialEq)]
 pub struct DeviceDef {
     pub name: String,
     pub codename: String,
+    /// The wire-protocol FAMILY this def speaks — resolved to a [`crate::dialect::Dialect`] impl by
+    /// [`crate::dialect::by_id`]. Serde-defaults to "razer" so every existing TOML (all of which
+    /// predate dialects) stays valid and razer-spoken; a non-razer board sets it explicitly (e.g.
+    /// `dialect = "hidpp"`). Bytes live behind the dialect; semantics (Capability) stay above it.
+    #[serde(default = "default_dialect")]
+    pub dialect: String,
+    /// TRUST provenance — where [`Registry::load`] read this def from (never a file field, hence
+    /// `serde(skip)`: a reload always re-derives it from the load path). The first-light self-heal
+    /// gates on it: only [`DefOrigin::Auto`] defs may be rewritten in place, so a curated/builtin
+    /// board's board-verified bytes are never clobbered by an inference the heal proved wrong.
+    #[serde(skip)]
+    pub origin: DefOrigin,
     pub vendor_id: u16,
     pub transaction_id: u8,
     /// Microseconds the transport must WAIT between a feature-report SET and the GET that drains its
@@ -81,9 +110,15 @@ impl DeviceDef {
     pub fn command(&self, name: &str) -> Option<&CommandSpec> {
         self.commands.get(name)
     }
-    pub fn matches_control(&self, usage_page: u16, usage: u16, feature_len: u16) -> bool {
-        let c = &self.control_interface;
-        c.usage_page == usage_page && c.usage == usage && c.feature_report_len == feature_len
+    /// Is `info` the CONTROL pipe this def drives? Which HID collection of a composite device is the
+    /// control pipe is DIALECT knowledge, not a universal triple compare: razer matches by the
+    /// `usage_page`/`usage`/`feature_report_len` triple stored in the def; HID++ matches by report
+    /// SHAPE (VID + 7/20-byte output/input reports) and its stored feature length is meaningless.
+    /// Route through the family seam so no caller has to know which rule applies. FAIL CLOSED on an
+    /// unknown dialect (Finding 2's sibling): a def whose family we can't identify matches NOTHING —
+    /// it must never be selected and opened into bytes we can't safely frame.
+    pub fn matches_control(&self, info: &crate::transport::HidDeviceInfo) -> bool {
+        crate::dialect::by_id(&self.dialect).is_some_and(|d| d.matches_control(self, info))
     }
 
     /// Does this device have a swappable SIDE-PLATE map (a `[side_plates]` table)? The push-only
@@ -179,11 +214,15 @@ pub enum Capability {
     Storage,
     /// Any unified lighting (a `[lighting]` block is present).
     Lighting,
+    /// Read the keyboard's FIRMWARE game mode (the FN+F10 Win-key kill / GAME_LED state).
+    GameMode,
+    /// Write the keyboard's firmware game mode (the Win-key kill) — the getter verifies the write.
+    SetGameMode,
 }
 
 impl Capability {
     /// All capabilities, for enumeration ([`DeviceDef::capabilities`]).
-    pub const ALL: [Capability; 14] = [
+    pub const ALL: [Capability; 16] = [
         Capability::Dpi,
         Capability::SetDpi,
         Capability::DpiStages,
@@ -198,6 +237,8 @@ impl Capability {
         Capability::Battery,
         Capability::Storage,
         Capability::Lighting,
+        Capability::GameMode,
+        Capability::SetGameMode,
     ];
 
     /// The registry command name(s) this capability needs (all must be present). The single source
@@ -218,6 +259,8 @@ impl Capability {
             Capability::Battery => &["battery_level"],
             Capability::Storage => &["storage_info"],
             Capability::Lighting => &[],
+            Capability::GameMode => &["game_mode"],
+            Capability::SetGameMode => &["set_game_mode"],
         }
     }
 
@@ -244,6 +287,8 @@ impl Capability {
             Capability::Battery => "battery",
             Capability::Storage => "onboard storage",
             Capability::Lighting => "lighting",
+            Capability::GameMode => "game mode (read)",
+            Capability::SetGameMode => "game mode (set)",
         }
     }
 }
@@ -253,19 +298,29 @@ pub struct Registry {
 }
 
 /// Is `def` fully SUBSUMED by already-loaded defs — i.e. does every (vendor, pid) it declares
-/// already resolve? Load order is trust order (builtins → devices/ → devices/auto/), and
-/// `find_by_pid` is first-match-wins per pid — so a fully-covered def is dead weight (the
-/// curated-shadows-auto rule), while a def bringing ANY new pid must load even if its human
-/// name collides (auto defs are NAMED from the USB product string, which legitimately repeats
-/// across revisions and link modes; a name was never an identity).
+/// already resolve WITHIN ITS OWN WIRE FAMILY? Load order is trust order (builtins → devices/ →
+/// devices/auto/), and `find_for_pipe` is first-match-wins per (pid, family) — so a fully-covered
+/// def is dead weight (the curated-shadows-auto rule), while a def bringing ANY new (pid, dialect)
+/// must load even if its human name collides (auto defs are NAMED from the USB product string,
+/// which legitimately repeats across revisions and link modes; a name was never an identity).
+///
+/// The FAMILY dimension is load-bearing: identity moved from `(vid, pid) → one def` to
+/// `(dialect, vid, pid)` (the adoption ledgers already key on it). Two families sharing one pid —
+/// one physical device speaking two protocols on different pipes (the razer-audio-sidecar future
+/// this repo documents) — are NOT subsumption partners: each drives a different control pipe via
+/// its own `matches_control` rule, so BOTH must load or the second family is permanently
+/// unopenable. Subsumption (curated-shadows-auto) stays exactly as before WITHIN a single family.
 fn subsumed(existing: &[DeviceDef], def: &DeviceDef) -> bool {
-    // Every pid this def brings must already be covered by some existing def of the same vendor.
-    // An empty def (no modes) declares no pid and resolves nothing — treat it as subsumed so the
-    // all()-over-empty vacuous-true is the intended answer, not an accident.
+    // Every pid this def brings must already be covered by some existing def of the same vendor
+    // AND THE SAME DIALECT — a different family on the same pid covers a DIFFERENT control pipe, so
+    // it never subsumes. An empty def (no modes) declares no pid and resolves nothing — treat it as
+    // subsumed so the all()-over-empty vacuous-true is the intended answer, not an accident.
     def.product_ids().all(|pid| {
-        existing
-            .iter()
-            .any(|d| d.vendor_id == def.vendor_id && d.product_ids().any(|p| p == pid))
+        existing.iter().any(|d| {
+            d.vendor_id == def.vendor_id
+                && d.dialect == def.dialect
+                && d.product_ids().any(|p| p == pid)
+        })
     })
 }
 
@@ -283,23 +338,59 @@ impl Registry {
                 include_str!("../devices/razer-blackwidow-chroma-v2.toml"),
             ];
             for src in BUILTINS {
-                devices.push(toml::from_str::<DeviceDef>(src)?);
+                let def = toml::from_str::<DeviceDef>(src)?;
+                // Builtins are compile-embedded with KNOWN dialect ids — unlike external files they
+                // need no load-time route filter, but assert the invariant so a future builtin with a
+                // typo'd/unregistered dialect trips in dev instead of silently occupying its pid.
+                debug_assert!(
+                    crate::dialect::by_id(&def.dialect).is_some(),
+                    "builtin def '{}' has unroutable dialect '{}'",
+                    def.name,
+                    def.dialect
+                );
+                devices.push(def);
             }
         }
 
         // Optional external definitions: extend coverage without recompiling. Load order is
-        // trust order — `find_by_pid` is first-match-wins, so curated `devices/*.toml` shadow
-        // the auto-synthesized `devices/auto/*.toml` (see `crate::synth`) for the same pid.
-        // Shadowing is BY PID, never by name: a def loads unless it adds no new pid at all
-        // (`subsumed`). Auto defs are named from the USB product string, which repeats across
-        // revisions/link-modes, so a name collision must NOT drop a def that brings a fresh pid.
+        // trust order — `find_for_pipe`/`find_by_pid` are first-match-wins, so curated
+        // `devices/*.toml` shadow the auto-synthesized `devices/auto/*.toml` (see `crate::synth`)
+        // for the same pid WITHIN A FAMILY. Shadowing is BY (PID, DIALECT), never by name: a def
+        // loads unless it adds no new pid IN ITS OWN FAMILY at all (`subsumed`). Two families that
+        // share a pid (one unit, two protocols) BOTH load — neither shadows the other, each
+        // resolves its own control pipe. Auto defs are named from the USB product string, which
+        // repeats across revisions/link-modes, so a name collision must NOT drop a def that brings
+        // a fresh (pid, dialect).
         for dir in ["devices", "devices/auto"] {
+            // Stamp origin by the DIRECTORY the file lives in — a LOAD fact serde can't carry
+            // (`origin` is `serde(skip)`, so every parse yields the Builtin default). `devices/`
+            // is the user's curated shelf (board-verified, self-heal must never touch it);
+            // `devices/auto/` is synthesized config the heal MAY rewrite in place.
+            let origin = if dir == "devices/auto" {
+                DefOrigin::Auto
+            } else {
+                DefOrigin::Curated
+            };
             if let Ok(rd) = std::fs::read_dir(dir) {
                 for entry in rd.flatten() {
                     let p = entry.path();
                     if p.extension().is_some_and(|x| x == "toml") && p.is_file() {
                         if let Ok(txt) = std::fs::read_to_string(&p) {
-                            if let Ok(def) = toml::from_str::<DeviceDef>(&txt) {
+                            if let Ok(mut def) = toml::from_str::<DeviceDef>(&txt) {
+                                def.origin = origin.clone();
+                                // REJECT UNROUTABLE at the LOAD boundary: a def we cannot ROUTE (its
+                                // `dialect` resolves to no registered family — a typo or a stale
+                                // user-editable auto file) is dead weight that would OCCUPY its pid.
+                                // `find_by_pid` would resolve it while matching/opening fail closed and
+                                // adoption's already-known short-circuit (`find_by_pid(...).is_some()`)
+                                // refuses to regenerate — the stranded-device trap. Skipping at load
+                                // leaves the pid UNRESOLVED, so the adoption pass hits its existing
+                                // "auto def exists but the registry does not resolve it — fix or delete
+                                // that file" surface (synth's `adopt_filtered`) and the failure is
+                                // REPORTED instead of silent.
+                                if crate::dialect::by_id(&def.dialect).is_none() {
+                                    continue;
+                                }
                                 if !subsumed(&devices, &def) {
                                     devices.push(def);
                                 }
@@ -317,6 +408,37 @@ impl Registry {
         self.devices
             .iter()
             .find(|d| d.vendor_id == vid && d.product_ids().any(|p| p == pid))
+    }
+
+    /// Every def covering (vid, pid) — the multi-family view. `find_by_pid` keeps its
+    /// first-match semantics for PID-level questions (labels, capability display, healing);
+    /// PIPE resolution must use find_for_pipe, which lets each family's def test the collection
+    /// with its own matches_control rule.
+    pub fn defs_for_pid(&self, vid: u16, pid: u16) -> impl Iterator<Item = &DeviceDef> {
+        self.devices
+            .iter()
+            .filter(move |d| d.vendor_id == vid && d.product_ids().any(|p| p == pid))
+    }
+
+    /// THE pipe-precise resolver: the first def (trust order) whose family claims this exact
+    /// collection as its control pipe. With one def per pid this is exactly the old
+    /// find_by_pid + matches_control pair; with two families on one pid, each pipe reaches
+    /// the def that can actually drive it (the review-blocking gap: first-match-by-pid made
+    /// the second family permanently unopenable).
+    pub fn find_for_pipe(&self, info: &crate::transport::HidDeviceInfo) -> Option<&DeviceDef> {
+        self.defs_for_pid(info.vid, info.pid)
+            .find(|d| d.matches_control(info))
+    }
+
+    /// Is the FAMILY that claims a pipe on (vid, pid) already covered by a loaded def? Family-scoped,
+    /// not pid-scoped: `defs_for_pid(vid, pid).any(|def| def.dialect == dialect_id)`. This fixes the
+    /// review-blocking adoption SUPPRESSION — the old `find_by_pid(...).is_some()` already-known gate
+    /// is dialect-blind, so a razer def on a pid would block adopting the SAME physical device's
+    /// second-family pipe (a hidpp/audio-sidecar collection on that same pid), stranding it forever.
+    /// Keyed on the CLAIMING dialect (from `synth::adopt_key`), a pipe is known only when ITS family
+    /// is already in the registry, so a still-unadopted family on a shared pid stays adoptable.
+    pub fn knows_family(&self, vid: u16, pid: u16, dialect_id: &str) -> bool {
+        self.defs_for_pid(vid, pid).any(|d| d.dialect == dialect_id)
     }
 }
 
@@ -366,11 +488,18 @@ mod tests {
         // dialect) — the board has no top-level set_brightness command yet CAN set brightness.
         assert!(bw.supports(Capability::SetBrightness));
         assert!(!bw.supports(Capability::Brightness), "no getter — the readout stays hidden");
+        // FIRMWARE GAME MODE — the keyboard's FN+F10 Win-key kill. The BlackWidow builtin carries
+        // both the getter (0x03/0x80) and setter (0x03/0x00), so BOTH directions are supported.
+        assert!(bw.supports(Capability::GameMode));
+        assert!(bw.supports(Capability::SetGameMode));
         assert!(!bw.supports(Capability::SetDpi));
         assert!(!bw.supports(Capability::SetDpiStages));
         assert!(!bw.supports(Capability::SetScrollStage));
         assert!(!bw.supports(Capability::Storage));
         assert!(!bw.supports(Capability::Battery));
+        // the mouse has no firmware game mode (a keyboard-only Win-key kill) — neither direction.
+        assert!(!naga.supports(Capability::GameMode));
+        assert!(!naga.supports(Capability::SetGameMode));
     }
 
     #[test]
@@ -458,6 +587,135 @@ mod tests {
         toml::from_str(&src).unwrap()
     }
 
+    /// Like `mini` but with an EXPLICIT `dialect` id — for exercising the unroutable-def trap
+    /// (Finding 2): a def whose family the registry can't resolve.
+    fn mini_dialect(name: &str, codename: &str, vid: u16, pid: u16, dialect: &str) -> DeviceDef {
+        let src = format!(
+            "name = \"{name}\"\n\
+             codename = \"{codename}\"\n\
+             vendor_id = {vid}\n\
+             dialect = \"{dialect}\"\n\
+             transaction_id = 0x1F\n\
+             [[modes]]\n\
+             name = \"wired\"\n\
+             product_id = {pid}\n\
+             [control_interface]\n\
+             usage_page = 1\n\
+             usage = 2\n\
+             feature_report_len = 91\n\
+             [commands]\n"
+        );
+        toml::from_str(&src).unwrap()
+    }
+
+    #[test]
+    fn unknown_dialect_is_the_load_skip_condition() {
+        // Pin the exact predicate `Registry::load`'s dir loop uses to REJECT unroutable defs:
+        // `if crate::dialect::by_id(&def.dialect).is_none() { continue; }`. A bogus id resolves to
+        // nothing (the load skip fires) while a registered family resolves (the def loads). Mirrors
+        // dialect.rs's `by_id_resolves_registered_families`, asserted here at the registry's own load
+        // boundary so the contract is tested where it's enforced.
+        assert!(
+            crate::dialect::by_id("nope").is_none(),
+            "unknown dialect id → the load-time skip fires (def rejected)"
+        );
+        assert!(
+            crate::dialect::by_id("razer").is_some(),
+            "a registered family → the def loads"
+        );
+    }
+
+    #[test]
+    fn unrouted_def_occupies_pid_but_matches_no_pipe_why_load_filters() {
+        // WHY load MUST filter (the in-memory trap the loader now prevents): a def with an unroutable
+        // dialect, if it ever reached the registry, STILL resolves via `find_by_pid` (pid-keyed,
+        // dialect-blind) yet matches NO control pipe (`matches_control` fails closed on an unknown
+        // family). That's the stranded-device trap — pid occupied, nothing openable, adoption's
+        // `find_by_pid(...).is_some()` short-circuit refusing to regenerate. Load-time
+        // `by_id(...).is_none()` skip keeps such a def out of `devices`, so the pid stays UNRESOLVED
+        // and the adoption pass reports the failure instead of silently stranding the device.
+        let bogus = mini_dialect("Ghost", "Ghost", 0x1532, 0x0999, "nope");
+        let reg = Registry {
+            devices: vec![bogus],
+        };
+        // First jaw: find_by_pid (pure pid lookup) resolves it — the pid is OCCUPIED.
+        assert!(
+            reg.find_by_pid(0x1532, 0x0999).is_some(),
+            "an unrouted def still occupies its pid via find_by_pid"
+        );
+        // Second jaw: even a byte-perfect control pipe selects it NOT AT ALL — fail closed on the
+        // unknown dialect (nothing openable). Occupied-but-unopenable = the trap load now prevents.
+        let info = crate::transport::HidDeviceInfo {
+            vid: 0x1532,
+            pid: 0x0999,
+            usage_page: 1,
+            usage: 2,
+            feature_len: 91,
+            input_len: 0,
+            output_len: 0,
+            path: crate::transport::DevicePath::from_str_for_tests("x"),
+            product: String::new(),
+        };
+        assert!(
+            !reg.find_by_pid(0x1532, 0x0999).unwrap().matches_control(&info),
+            "unknown dialect → matches no pipe (pid occupied, nothing openable — why load filters)"
+        );
+    }
+
+    #[test]
+    fn dialect_defaults_to_razer_and_honors_explicit() {
+        // A def WITHOUT a dialect key parses as razer — the serde default that keeps every
+        // pre-dialect TOML valid and razer-spoken (mini() emits no dialect key).
+        let d = mini("x", "X", 0x1532, 0x0001);
+        assert_eq!(d.dialect, "razer", "absent dialect key defaults to razer");
+        // An explicit `dialect = "hidpp"` parses as given — the seam a non-razer family sets.
+        let src = "\
+            name = \"h\"\n\
+            codename = \"H\"\n\
+            dialect = \"hidpp\"\n\
+            vendor_id = 0x046D\n\
+            transaction_id = 0x00\n\
+            [[modes]]\n\
+            name = \"wired\"\n\
+            product_id = 0x0001\n\
+            [control_interface]\n\
+            usage_page = 1\n\
+            usage = 2\n\
+            feature_report_len = 20\n\
+            [commands]\n";
+        let h: DeviceDef = toml::from_str(src).unwrap();
+        assert_eq!(h.dialect, "hidpp");
+    }
+
+    #[test]
+    fn origin_is_serde_skipped_and_defaults_builtin() {
+        // `origin` is a LOAD fact, never file content: a TOML with no `origin` key parses fine
+        // (serde(skip) means it's never read from the file), and the parsed def defaults to
+        // Builtin — Registry::load then STAMPS Curated/Auto by directory. `mini()` emits no
+        // origin key, so this proves the skip: parsing never fails for a missing origin, and the
+        // default is the trust-safe Builtin (a stray def nobody stamped is treated as untouchable).
+        let d = mini("x", "X", 0x1532, 0x0001);
+        assert_eq!(d.origin, DefOrigin::Builtin, "unstamped parse defaults to Builtin");
+        // An explicit `origin = "auto"` in the TOML must be IGNORED (skip = the file can't set it),
+        // so even a hand-forged key can't fake provenance — the load path is the sole authority.
+        let src = "\
+            name = \"x\"\n\
+            codename = \"X\"\n\
+            origin = \"auto\"\n\
+            vendor_id = 0x1532\n\
+            transaction_id = 0x1F\n\
+            [[modes]]\n\
+            name = \"wired\"\n\
+            product_id = 0x0001\n\
+            [control_interface]\n\
+            usage_page = 1\n\
+            usage = 2\n\
+            feature_report_len = 91\n\
+            [commands]\n";
+        let d: DeviceDef = toml::from_str(src).unwrap();
+        assert_eq!(d.origin, DefOrigin::Builtin, "a file-set origin key is skipped, not honored");
+    }
+
     #[test]
     fn subsumed_is_by_pid_not_by_name() {
         let (naga, _) = builtins();
@@ -520,6 +778,92 @@ mod tests {
         // The new pid resolves to the second def — proving it was NOT dropped for the name clash.
         let b = reg.find_by_pid(naga.vendor_id, 0x0999).unwrap();
         assert_eq!(b.codename, "Ghost");
+    }
+
+    #[test]
+    fn subsumed_is_family_scoped_two_families_one_pid_both_load() {
+        // Ruling A: subsumption keys on (vendor, pid, DIALECT), not (vendor, pid). Two families on
+        // ONE pid — the same physical unit speaking two protocols on different pipes (the
+        // razer-audio-sidecar future) — are not subsumption partners: each drives a different
+        // control pipe, so BOTH must load. Shared vid 0x046D so both defs group on one (vid, pid).
+        let razer = mini_dialect("Combo", "razer-side", 0x046D, 0x0042, "razer");
+        let hidpp = mini_dialect("Combo", "hidpp-side", 0x046D, 0x0042, "hidpp");
+        // same pid + same NAME + DIFFERENT dialect → NOT subsumed (the second family still loads).
+        assert!(
+            !subsumed(&[razer.clone()], &hidpp),
+            "a different-dialect def on the same pid brings a new family — not subsumed"
+        );
+        // same dialect + same pid → still subsumed (curated-shadows-auto unchanged WITHIN a family).
+        let razer_again = mini_dialect("Combo", "razer-dup", 0x046D, 0x0042, "razer");
+        assert!(
+            subsumed(&[razer.clone()], &razer_again),
+            "same family + same pid = dead weight (first-match resolves it) — unchanged within a family"
+        );
+    }
+
+    #[test]
+    fn find_for_pipe_and_knows_family_route_two_families_on_one_pid() {
+        // Ruling B/C: with two families sharing (vid, pid), `defs_for_pid` yields both, `find_for_pipe`
+        // routes each pipe SHAPE to the family that can drive it, and `knows_family` answers
+        // per-family. Shared vid 0x046D is the one value that lets BOTH resolve: hidpp's claims() is
+        // vid-gated to Logitech (0x046D), while razer's matches_control is a usage-triple compare
+        // that ignores vid — so 0x046D is the physical "one unit, two protocols" case the routing
+        // must handle. pid 0x0042 is not a hidpp receiver pid.
+        let razer = mini_dialect("Combo", "razer-side", 0x046D, 0x0042, "razer");
+        let hidpp = mini_dialect("Combo", "hidpp-side", 0x046D, 0x0042, "hidpp");
+        let reg = Registry {
+            devices: vec![razer, hidpp],
+        };
+        // defs_for_pid is the multi-family view: BOTH defs cover the shared (vid, pid).
+        assert_eq!(
+            reg.defs_for_pid(0x046D, 0x0042).count(),
+            2,
+            "both families cover the shared pid"
+        );
+        // A razer-shaped control pipe (91-byte feature report, usage 1/2, no output/input reports):
+        // razer's triple matches; hidpp's claims fails (no HID++ output report) → routes to razer.
+        let razer_info = crate::transport::HidDeviceInfo {
+            vid: 0x046D,
+            pid: 0x0042,
+            usage_page: 1,
+            usage: 2,
+            feature_len: 91,
+            input_len: 0,
+            output_len: 0,
+            path: crate::transport::DevicePath::from_str_for_tests("razer"),
+            product: String::new(),
+        };
+        assert_eq!(
+            reg.find_for_pipe(&razer_info).map(|d| d.codename.as_str()),
+            Some("razer-side"),
+            "a razer-shaped pipe reaches the razer family"
+        );
+        // A hidpp-shaped control pipe (20-byte output+input HID++ long reports, usage 1/2, no razer
+        // 91-byte feature report): razer's triple fails (feature_len 0 ≠ 91); hidpp claims + usage
+        // match → routes to hidpp. Mirrors dialect.rs's hidpp HidDeviceInfo constructor.
+        let hidpp_info = crate::transport::HidDeviceInfo {
+            vid: 0x046D,
+            pid: 0x0042,
+            usage_page: 1,
+            usage: 2,
+            feature_len: 0,
+            input_len: 20,
+            output_len: 20,
+            path: crate::transport::DevicePath::from_str_for_tests("hidpp"),
+            product: String::new(),
+        };
+        assert_eq!(
+            reg.find_for_pipe(&hidpp_info).map(|d| d.codename.as_str()),
+            Some("hidpp-side"),
+            "a hidpp-shaped pipe reaches the hidpp family — the second family is resolvable, not stranded"
+        );
+        // knows_family answers per FAMILY, not per pid: both families known, a third is not.
+        assert!(reg.knows_family(0x046D, 0x0042, "razer"), "razer family is loaded");
+        assert!(reg.knows_family(0x046D, 0x0042, "hidpp"), "hidpp family is loaded");
+        assert!(
+            !reg.knows_family(0x046D, 0x0042, "someother"),
+            "a family NOT on this pid is unknown — so its pipe stays adoptable"
+        );
     }
 
     #[test]

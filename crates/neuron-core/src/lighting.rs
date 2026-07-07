@@ -1224,7 +1224,7 @@ impl<'a> Lights<'a> {
             return Ok(());
         }
         if self.dev.run("device_mode").map(|m| m[0]).unwrap_or(0) != 0x03 {
-            self.dev.exec_dynamic(0x00, 0x04, 0x02, &[0x03, 0x00])?;
+            crate::writes::set_device_mode(self.dev, 0x03)?;
         }
         self.controlled.set(true);
         Ok(())

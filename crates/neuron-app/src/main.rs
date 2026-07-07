@@ -662,8 +662,56 @@ fn main() {
     // edit. Structural edits (stack/remove/tile-pick) already persist immediately; this catches a
     // knob (speed/stop/timing) tweaked within the 400ms debounce window right before quitting.
     glue::flush_lighting_save();
+    // ── DEVICE-MODE RESTORE (the DPI-16000 trap) ──────────────────────────
+    // Driver mode is a scoped LEASE (streams/writes), never a permanent state: while a device is held
+    // in it, its onboard buttons/FN defer to software and it wakes with a stale factory volatile plane
+    // unless something re-asserts config. On exit neuron is that "something" no longer, so hand every
+    // device back to firmware ownership. Stop the live streams FIRST (each board's own teardown
+    // releases its lease), then enumerate every recognized connected unit and set NORMAL mode as the
+    // authoritative last word — all best-effort; this is exit, a few control round-trips are fine.
+    if let Some(shared) = resident.borrow().shared.as_ref() {
+        shared.borrow_mut().rt.stop_all_animation();
+    }
+    restore_devices_to_firmware();
     // keep the tray alive for the whole loop
     drop(tray);
+}
+
+/// Best-effort: release every recognized, connected device's CUSTODY back to firmware on app exit.
+/// Custody is a per-FAMILY concept routed through the def's dialect (`Device::release_custody`): a
+/// razer board returns its driver-mode lease (device_mode -> NORMAL), a never-in-custody family
+/// no-ops rather than being handed a razer-framed mode packet. Driver mode is a lease held for the
+/// duration of streams/writes; leaving a razer device in it orphans its onboard buttons/FN and the
+/// wake-restore duty (the trap where the Naga woke announcing a stale DPI 16000). One release per
+/// (physical UNIT, FAMILY); every step is `let _ =` — this runs during teardown and must never fail
+/// the exit.
+fn restore_devices_to_firmware() {
+    let Ok(reg) = neuron::registry::Registry::load() else {
+        return;
+    };
+    let Ok(infos) = neuron::transport::enumerate() else {
+        return;
+    };
+    let mut done: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    for i in &infos {
+        // find_for_pipe: the family-aware control-pipe def, so a two-family unit restores through the
+        // family that can frame the mode switch.
+        let Some(def) = reg.find_for_pipe(i) else {
+            continue;
+        };
+        // Dedupe per (unit, FAMILY), seeded only AFTER a def resolves. A device's several HID
+        // collections collapse via `instance()`, but a MULTI-FAMILY unit must release each family's
+        // custody once. The review's failure shape: keying on `instance()` ALONE let whichever
+        // family's pipe enumerated first claim the unit, so a sibling family's NO-OP release could
+        // shadow razer's real mode restore — leaving the board stuck in driver mode. Keying on the
+        // dialect too gives each family its own single release.
+        if !done.insert((i.instance(), def.dialect.clone())) {
+            continue;
+        }
+        if let Ok(d) = neuron::device::Device::open_path(def.clone(), i.pid, &i.path) {
+            let _ = d.release_custody();
+        }
+    }
 }
 
 /// Choose the Slint renderer backend BEFORE any window is created: prefer femtovg (GPU), fall back to

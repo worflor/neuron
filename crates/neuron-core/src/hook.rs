@@ -107,12 +107,15 @@ pub fn decide(policy: &GamingMode, ev: KeyEvent, mods: Mods) -> bool {
 #[cfg(windows)]
 mod sys {
     use super::{decide, track, GamingMode, KeyEvent, Mods};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::Mutex;
+    use std::thread::JoinHandle;
     use windows_sys::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+    use windows_sys::Win32::System::Threading::GetCurrentThreadId;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CallNextHookEx, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT,
-        WH_KEYBOARD_LL, WM_KEYDOWN, WM_SYSKEYDOWN,
+        CallNextHookEx, GetMessageW, PeekMessageW, PostThreadMessageW, SetWindowsHookExW,
+        UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, MSG, PM_NOREMOVE, WH_KEYBOARD_LL, WM_KEYDOWN,
+        WM_QUIT, WM_SYSKEYDOWN, WM_USER,
     };
 
     // Global state the C-callback reads (a hook proc has a fixed signature — no user pointer).
@@ -125,8 +128,36 @@ mod sys {
     });
     static MODS: Mutex<Mods> = Mutex::new(Mods { alt: false });
     static INSTALLED: AtomicBool = AtomicBool::new(false);
-    // The installed hook handle, stored so `uninstall` (and Drop) can remove it.
+    // The installed hook handle. Created AND destroyed on the pump thread (a hook is owned by the
+    // thread that installs it) — no other thread ever calls SetWindowsHookExW/UnhookWindowsHookEx.
     static HANDLE: Mutex<isize> = Mutex::new(0);
+
+    // ── the dedicated hook-pump thread ──────────────────────────────────────────────────────────
+    //
+    // WHY a whole thread that does nothing but `GetMessageW`: a `WH_KEYBOARD_LL` callback is only
+    // delivered while the *installing* thread services its message queue, and Windows enforces
+    // `LowLevelHooksTimeout` (~300 ms) — if that thread doesn't return to its pump within the
+    // window, Windows SILENTLY BYPASSES the hook and lets the key through unsuppressed. The old
+    // design installed the hook on the dispatch/Raw-Input listener thread, which does BLOCKING work
+    // inside its event callback (sniper device writes ~tens of ms, mic reads, sleep throttles), so
+    // the KEY GUARD chords only suppressed while that thread was momentarily idle — i.e. unreliably.
+    // The fix: the hook lives on its OWN thread that ONLY installs + pumps, so it always answers the
+    // OS within the timeout. Everything else (POLICY, MODS) is shared statics the callback reads.
+
+    /// Handle to the running pump thread: its OS thread id (for `PostThreadMessageW`) plus the join
+    /// handle. Present exactly while the pump is live.
+    struct PumpHandle {
+        join: JoinHandle<()>,
+        tid: u32,
+    }
+    /// The running pump thread, if any. Guarded so at most one pump exists and install/uninstall
+    /// serialize their spawn/stop decisions.
+    static PUMP: Mutex<Option<PumpHandle>> = Mutex::new(None);
+    /// Handshake slot: the pump publishes its `GetCurrentThreadId` here (always non-zero) as the LAST
+    /// step after the install attempt, so once the controller reads a non-zero id it knows both the
+    /// tid to signal AND that `INSTALLED` already reflects the `SetWindowsHookExW` result. 0 = not
+    /// yet published.
+    static PUMP_TID: AtomicU32 = AtomicU32::new(0);
 
     /// The `WH_KEYBOARD_LL` callback. Tracks Alt state, asks [`decide`], and returns `1` to swallow
     /// or chains to the next hook. Must be `extern "system"` with the exact LL-hook signature.
@@ -153,57 +184,142 @@ mod sys {
         CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam)
     }
 
+    /// The pump thread body: install the hook ON THIS THREAD, then do NOTHING but block in
+    /// `GetMessageW` (which services the LL hook — the callback fires from inside message retrieval)
+    /// until a `WM_QUIT` (posted by [`uninstall`]) wakes us, at which point we unhook on our own
+    /// thread and exit. This is the entire point of the dedicated thread: it can never miss the
+    /// `LowLevelHooksTimeout` because it does no other work.
+    fn pump_main() {
+        // SAFETY: standard LL keyboard-hook install with a valid extern "system" proc. Ownership of
+        // the hook belongs to THIS thread, which is the one that pumps below.
+        let h: HHOOK =
+            unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(proc), std::ptr::null_mut(), 0) };
+        if !h.is_null() {
+            *HANDLE.lock().unwrap() = h as isize;
+            INSTALLED.store(true, Ordering::SeqCst);
+        }
+        // Force the thread message queue into existence BEFORE publishing our tid, so the
+        // controller's `PostThreadMessageW(WM_QUIT)` can never race a not-yet-created queue
+        // (PostThreadMessage fails against a thread that has not yet called a message function).
+        let mut msg: MSG = unsafe { std::mem::zeroed() };
+        unsafe { PeekMessageW(&mut msg, std::ptr::null_mut(), WM_USER, WM_USER, PM_NOREMOVE) };
+        // Handshake LAST: once this is non-zero the controller knows INSTALLED is settled + has our
+        // tid. If the install failed we still publish (so the controller stops spin-waiting) then
+        // return — there is nothing to pump.
+        PUMP_TID.store(unsafe { GetCurrentThreadId() }, Ordering::SeqCst);
+        if h.is_null() {
+            return;
+        }
+        // Blocking pump: `GetMessageW` returns >0 for a normal message, 0 on WM_QUIT (our stop
+        // signal), -1 on error. The LL hook callback runs INSIDE this call while it blocks.
+        loop {
+            let r = unsafe { GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) };
+            if r <= 0 {
+                break; // WM_QUIT (0) or error (-1) -> tear down + exit.
+            }
+            // No window, no messages of our own to dispatch — the hook already fired above. Loop.
+        }
+        // Unhook on the SAME thread that owns the hook, then reset shared state.
+        let hh = *HANDLE.lock().unwrap();
+        if hh != 0 {
+            // SAFETY: `hh` is the handle we installed on this thread and have not yet removed.
+            unsafe { UnhookWindowsHookEx(hh as HHOOK) };
+            *HANDLE.lock().unwrap() = 0;
+        }
+        INSTALLED.store(false, Ordering::SeqCst);
+        *MODS.lock().unwrap() = Mods::default();
+    }
+
+    /// Spawn the pump thread and wait (briefly) for its install-attempt handshake. Returns the
+    /// handle only when a hook is actually live; on install failure it reaps the (already-exited)
+    /// thread and returns `None` so no stale handle lingers. The caller holds the `PUMP` lock, so
+    /// this never double-spawns.
+    fn start_pump() -> Option<PumpHandle> {
+        PUMP_TID.store(0, Ordering::SeqCst);
+        let join = std::thread::Builder::new()
+            .name("neuron-gaming-hook".into())
+            .spawn(pump_main)
+            .ok()?;
+        // Spin-wait for the thread to publish its tid (it does so within microseconds, right after
+        // the install attempt). Bounded so a pathological hang can't wedge the controller forever.
+        let mut tid = 0u32;
+        for _ in 0..1_000_000 {
+            tid = PUMP_TID.load(Ordering::SeqCst);
+            if tid != 0 {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        if tid == 0 {
+            // Degenerate: the pump never reached the handshake (not expected). Don't block on join.
+            return None;
+        }
+        if !INSTALLED.load(Ordering::SeqCst) {
+            // The hook install failed on the pump thread; it has already returned. Reap it and
+            // report no active hook — never keep a PUMP handle for a dead thread.
+            let _ = join.join();
+            PUMP_TID.store(0, Ordering::SeqCst);
+            return None;
+        }
+        Some(PumpHandle { join, tid })
+    }
+
     /// Install (or update the policy of) the gaming-mode hook. If `policy` suppresses nothing, this
-    /// uninstalls any existing hook and installs none (zero cost when not gaming). Idempotent: a
-    /// second call just updates the live policy. Returns `true` if a hook is now active.
+    /// stops the pump (uninstalls) and installs none (zero cost when not gaming). Idempotent: a
+    /// second call while already pumping just updates the live policy — the callback reads `POLICY`
+    /// every event, so no thread work is needed. Returns `true` if a hook is now active.
     pub fn install(policy: GamingMode) -> bool {
         *POLICY.lock().unwrap() = policy;
         if !policy.any() {
             uninstall();
             return false;
         }
-        if INSTALLED.load(Ordering::Relaxed) {
-            return true; // already hooked; policy updated above.
+        // Hold the PUMP lock across the whole spawn decision so concurrent installs can't race into
+        // two pump threads. The pump thread itself never touches this lock, so no deadlock.
+        let mut pump = PUMP.lock().unwrap();
+        if pump.is_some() {
+            return true; // already pumping; POLICY was updated above and is read live.
         }
-        // SAFETY: standard LL keyboard-hook install with a valid extern "system" proc.
-        let h: HHOOK =
-            unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(proc), std::ptr::null_mut(), 0) };
-        if h.is_null() {
-            return false;
+        match start_pump() {
+            Some(handle) => {
+                *pump = Some(handle);
+                true
+            }
+            None => false,
         }
-        *HANDLE.lock().unwrap() = h as isize;
-        INSTALLED.store(true, Ordering::Relaxed);
-        true
     }
 
-    /// Remove the hook if installed (idempotent). The desktop returns to normal Alt+Tab/Win/Alt+F4
-    /// behaviour immediately — the reversibility guarantee.
+    /// Remove the hook if installed (idempotent): stop + join the pump thread. The desktop returns
+    /// to normal Alt+Tab/Win/Alt+F4 behaviour immediately — the reversibility guarantee. The actual
+    /// `UnhookWindowsHookEx` + MODS reset happen on the pump thread as it exits.
     pub fn uninstall() {
-        if !INSTALLED.swap(false, Ordering::Relaxed) {
-            return;
-        }
-        let h = *HANDLE.lock().unwrap();
-        if h != 0 {
-            // SAFETY: `h` is a handle we installed and have not yet removed.
-            unsafe { UnhookWindowsHookEx(h as HHOOK) };
-            *HANDLE.lock().unwrap() = 0;
-        }
-        *MODS.lock().unwrap() = Mods::default();
+        let handle = PUMP.lock().unwrap().take();
+        let Some(PumpHandle { join, tid }) = handle else {
+            return; // not pumping.
+        };
+        // Wake the pump out of `GetMessageW` with WM_QUIT (it returns 0), so it unhooks on its OWN
+        // thread and exits; then join to guarantee the thread + hook are fully gone before we
+        // return (so an off->on->off policy toggle can't leak a thread or a live hook).
+        unsafe { PostThreadMessageW(tid, WM_QUIT, 0, 0) };
+        let _ = join.join();
+        PUMP_TID.store(0, Ordering::SeqCst);
     }
 
     /// True if a gaming-mode hook is currently installed.
     pub fn is_installed() -> bool {
-        INSTALLED.load(Ordering::Relaxed)
+        INSTALLED.load(Ordering::SeqCst)
     }
 }
 
 /// RAII handle for an installed gaming-mode hook. Drop uninstalls — so a caller can scope the hook
 /// to a gaming-mode session and have it lift automatically. Construct via [`install`].
 ///
-/// NOTE: a `WH_KEYBOARD_LL` hook only receives events while the installing thread runs a message
-/// loop (`GetMessage`/`PeekMessage`). The CLI daemon and the GUI already pump messages on their
-/// listener thread, so the hook lives on that thread. If you install from a thread with no message
-/// pump, the callback will not fire — install it on the same thread as the Raw-Input listener.
+/// SELF-HOSTED PUMP: the `WH_KEYBOARD_LL` hook is installed on and serviced by its OWN dedicated
+/// message-pump thread (see `sys::pump_main`), NOT the caller's thread. A LL hook is silently
+/// bypassed by Windows if its installing thread doesn't answer the `LowLevelHooksTimeout` (~300 ms),
+/// so the hook can never share a thread that does blocking work. This handle is therefore just an
+/// ownership token: it neither pumps nor requires the caller to pump — dropping it (or calling
+/// [`Hook::uninstall`]) stops the pump thread and unhooks. Install from any thread.
 #[derive(Debug)]
 pub struct Hook {
     active: bool,
@@ -230,9 +346,10 @@ impl Drop for Hook {
 }
 
 /// Install (or update) the gaming-mode keyboard hook for `policy`. Usable identically by the CLI
-/// daemon and the GUI runtime: call it on the thread that pumps the Raw-Input message loop when a
-/// gaming-mode profile becomes active, and drop (or [`Hook::uninstall`]) the returned handle when it
-/// deactivates. If `policy` suppresses nothing, no hook is installed (`Hook::active()` is `false`).
+/// daemon and the GUI runtime, from ANY thread: the hook self-hosts a dedicated pump thread, so the
+/// caller's thread is irrelevant (no message-loop obligation). Call it when a gaming-mode profile
+/// becomes active, and drop (or [`Hook::uninstall`]) the returned handle when it deactivates. If
+/// `policy` suppresses nothing, no hook is installed (`Hook::active()` is `false`).
 ///
 /// **Live-path only.** This touches the global desktop; never call it from a test. (The pure
 /// [`decide`] policy is what tests verify.)
@@ -290,12 +407,13 @@ pub fn policy() -> GamingMode {
     *DESIRED_POLICY.lock().unwrap()
 }
 
-/// Make the installed hook match [`policy`]. Call this on the listener thread (the only thread that
-/// pumps the Raw-Input message loop the LL hook needs). Idempotent and cheap:
-/// * policy suppresses something + not yet installed -> install (sets `*slot`).
+/// Make the installed hook match [`policy`]. Call from ANY thread — the hook self-hosts its pump
+/// (see [`Hook`]), so this no longer has a "must run on the pumping thread" contract. Idempotent
+/// and cheap:
+/// * policy suppresses something + not yet installed -> install (spawns the pump, sets `*slot`).
 /// * policy suppresses something + already installed  -> update the live policy in place (no
-///   uninstall/reinstall thrash — `install` only re-registers when not already hooked).
-/// * policy suppresses nothing + installed            -> drop the handle (uninstall).
+///   uninstall/reinstall thrash — `sys::install` just updates `POLICY` when already pumping).
+/// * policy suppresses nothing + installed            -> drop the handle (uninstall -> stop pump).
 ///
 /// `slot` is the caller-owned RAII handle (held for the session so Drop uninstalls on shutdown).
 #[cfg(windows)]
@@ -303,7 +421,7 @@ pub fn reconcile(slot: &mut Option<Hook>) {
     let desired = *DESIRED_POLICY.lock().unwrap();
     if desired.any() {
         // Already hooked: update the live policy WITHOUT dropping the existing handle (dropping
-        // first would briefly uninstall — the thrash bug). `sys::install` updates in place.
+        // first would stop + respawn the pump — the thrash bug). `sys::install` updates in place.
         let active = sys::install(desired);
         if slot.is_none() {
             // Adopt a handle so Drop still uninstalls on shutdown; the hook is already live.

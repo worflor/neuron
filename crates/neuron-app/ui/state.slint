@@ -86,6 +86,10 @@ export global State {
 
     // ── Device (merged Dashboard + Performance) ──────────────────────────
     in-out property <[DeviceRow]> devices;
+    // ONE dim footnote line under the device deck: our vendor's pipes that no dialect can frame
+    // (the audio sidecars). INVENTORY, not channels — their functional faces already list as device
+    // rows — so glue answers "why isn't my pipe a channel" in one elided line. "" = none this scan.
+    in-out property <string> unclaimed-note: "";
     in-out property <int> selected-device: 0;        // index into devices
     in-out property <string> selected-device-name: "—"; // the channel every per-device panel tunes
     // the selected device's KIND drives which control cards the panel shows (a mic shows volume/mute,
@@ -110,6 +114,12 @@ export global State {
     // HyperPolling Wireless Dongle + Viper-8K-class). The Naga's stock dongle is legacy-capped at
     // 1000Hz, so this is false for it and the HYPERPOLLING card shows an honest "use REPORT RATE" note.
     in-out property <bool> sel-can-hyperpoll: false;
+    // the selected KEYBOARD exposes the FIRMWARE game mode (the FN+F10 Win-key kill / GAME_LED). When
+    // true, the KEY GUARD card shows its device-side sibling row beside the host-chord rail.
+    in-out property <bool> sel-can-game-mode: false;
+    // live state of that firmware game mode (true = the board is eating the Win key in firmware).
+    // Seeded from the perf-snapshot sweep; flipped by toggle-game-mode (which re-reads device truth).
+    in-out property <bool> game-mode-on: false;
     // audio-endpoint controls (shown when the selected device is a mic/output): act on the selected
     // endpoint by its id, NOT the system default.
     in-out property <float> device-volume: 50;       // 0..100
@@ -183,6 +193,9 @@ export global State {
     // hand-inlined OR behind out of sync. Grows by chord, exactly as the KEY GUARD note above intends.
     in-out property <bool> gaming-live: disable-alt-tab || disable-win || disable-alt-f4 || disable-alt-esc;
     callback apply-gaming-mode();
+    // flip the keyboard's FIRMWARE game mode (the device-side Win-key kill). The glue writes via the
+    // verify-gated capability setter, re-reads device truth, and updates game-mode-on to match.
+    callback toggle-game-mode();
     // LIFT-OFF distance — REAL verify-gated write (symmetric low/med/high). Verify-gated +
     // env-gated (NEURON_LOD_WRITE) until confirmed on hardware; the read-back is the safety net.
     in-out property <int> lod-level: 0;                // 0 low / 1 medium / 2 high

@@ -17,7 +17,7 @@ use neuron::{
     radial::{self, RadialMenu},
     registry::{DeviceDef, Registry},
     transport,
-    writes::{self, DpiStage},
+    writes::{self, decode_dpi_active, decode_dpi_stages, DpiStage},
 };
 
 #[derive(Parser)]
@@ -98,6 +98,13 @@ enum Cmd {
     },
     /// Lighting brightness 0..=100: show, or set
     Brightness { pct: Option<u8> },
+    /// Keyboard FIRMWARE game mode — the FN+F10 Win-key kill. No arg reads it; `on`/`off` sets it
+    /// (write is read-back verified). This is the DEVICE-side Win-key kill (firmware, zero software),
+    /// distinct from the host-side KEY GUARD chord swallows. Resolves the keyboard by capability.
+    GameMode {
+        /// on | off (omit to just read the current state)
+        state: Option<String>,
+    },
     /// Sniper / on-the-fly DPI: hold a control to drop to a precision DPI, release to snap back.
     /// Authors the bind into the shared rule store; the resident neuron app enforces the hold.
     /// First run asks you to PRESS the control you want — nothing hardcoded.
@@ -882,6 +889,7 @@ fn main() -> Result<()> {
         Cmd::Scroll { stage, volatile } => scroll_cmd(&reg, stage, volatile)?,
         Cmd::Lod { lift, landing, sym } => lod_cmd(&reg, lift, landing, sym)?,
         Cmd::Brightness { pct } => brightness_cmd(&reg, pct)?,
+        Cmd::GameMode { state } => gamemode_cmd(&reg, state.as_deref())?,
         Cmd::Sniper { bind, dpi } => sniper_cmd(bind, dpi)?,
         Cmd::Storage { raw } => storage_status(&reg, raw)?,
         Cmd::Watch { seconds } => neuron::controls::watch(seconds),
@@ -1074,6 +1082,7 @@ fn profile_capture(reg: &Registry, name: &str) -> Result<()> {
         false,
         0,  // the CLI is stateless — no selected device; capability-based first match
         "", // and no selected physical unit either
+        "", // and no selected dialect plane — empty = any family, same no-selection semantics
     );
 
     if p.is_empty() {
@@ -1259,11 +1268,12 @@ fn lit_devices(reg: &Registry) -> Result<Vec<(DeviceDef, u16)>> {
     let mut out = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
     for i in &transport::enumerate()? {
-        if let Some(def) = reg.find_by_pid(i.vid, i.pid) {
-            if def.matches_control(i.usage_page, i.usage, i.feature_len)
-                && def.lighting.is_some()
-                && seen.insert(i.pid)
-            {
+        // find_for_pipe: the def that DRIVES this pipe, so a two-family pid resolves each pipe to
+        // the family that can actually paint it (find_by_pid + matches_control missed the second).
+        if let Some(def) = reg.find_for_pipe(i) {
+            // one lighting row per (pid, family) — two families on one pid are two independently-
+            // drivable lighting planes, and the pid-only key silently dropped the second (review-caught).
+            if def.lighting.is_some() && seen.insert((i.pid, def.dialect.clone())) {
                 out.push((def.clone(), i.pid));
             }
         }
@@ -2036,7 +2046,7 @@ fn snapshot_device(
     let mut seen = std::collections::BTreeSet::new();
     for info in infos
         .iter()
-        .filter(|i| i.vid == vid && i.pid == pid && i.feature_len == 91)
+        .filter(|i| i.vid == vid && i.pid == pid && i.feature_len == neuron::synth::RAZER_FEATURE_LEN)
     {
         if !seen.insert((info.usage_page, info.usage)) {
             continue;
@@ -2090,7 +2100,7 @@ fn backup_cmd(reg: &Registry, pid_filter: Option<&str>) -> Result<()> {
     let mut seen = std::collections::BTreeSet::new();
     let mut targets: Vec<(u16, u16, String)> = Vec::new();
     for i in &infos {
-        if i.vid != 0x1532 || i.feature_len != 91 {
+        if i.vid != neuron::synth::RAZER_VID || i.feature_len != neuron::synth::RAZER_FEATURE_LEN {
             continue;
         }
         if want.is_some_and(|w| w != i.pid) {
@@ -2126,12 +2136,15 @@ fn mode_cmd(reg: &Registry, mode_str: &str, pid_str: &str) -> Result<()> {
     let mode: u8 = parse_device_mode(mode_str)?;
     let pid = parse_hex16(pid_str)?;
     let def = reg
-        .find_by_pid(0x1532, pid)
+        .find_by_pid(neuron::synth::RAZER_VID, pid)
         .ok_or_else(|| anyhow::anyhow!("no registry device for pid {pid:04x}"))?
         .clone();
     let d = Device::open(def, pid)?;
     println!("setting pid {pid:04x} -> {mode_str} mode  (class=00 id=04 args=[{mode:02X} 00])");
-    d.exec_dynamic(0x00, 0x04, 0x02, &[mode, 0x00])?;
+    // EXEMPT from the visitor-restore discipline: this verb's ENTIRE PURPOSE is to leave the device in
+    // the mode the user asked for. Restoring a "prior" here would undo the command — the opposite of
+    // every other write path (which only flips to driver as a transient means to an end).
+    writes::set_device_mode(&d, mode)?;
     println!("  device ACKed.");
     match d.run("device_mode") {
         Ok(a) => println!("  device_mode now reads: 0x{:02X}", a[0]),
@@ -2148,7 +2161,7 @@ fn verify_cmd(file: &str) -> Result<()> {
     let infos = transport::enumerate()?;
     if !infos
         .iter()
-        .any(|i| i.vid == snap.vid && i.pid == snap.pid && i.feature_len == 91)
+        .any(|i| i.vid == snap.vid && i.pid == snap.pid && i.feature_len == neuron::synth::RAZER_FEATURE_LEN)
     {
         bail!(
             "device pid {:04x} ({}) is not connected — can't verify",
@@ -2512,38 +2525,10 @@ fn parse_probe_target(class: Option<&str>, id: Option<&str>) -> Result<Option<(u
     }
 }
 
-/// Decode a DPI stage-table getter reply into the list of X resolutions (the cycle). This is the
-/// inverse of `writes::build_dpi_stages_payload` and the exact layout the device returns for
-/// `dpi_stages` (0x04/0x83) / `dpi_stages_active` (0x04/0x86):
-/// `[varstore, active_idx, count, {stage_id, X_hi, X_lo, Y_hi, Y_lo, 0, 0} * count]`.
-///
-/// Pure (slice in, Vec out) so the decode is unit-testable without hardware. Zero-DPI records are
-/// skipped (empty hardware slots) and an out-of-range `count` is clamped to what the buffer holds.
-fn decode_dpi_stages(s: &[u8]) -> Vec<u16> {
-    if s.len() < 3 {
-        return Vec::new();
-    }
-    let count = s[2] as usize;
-    let mut out = Vec::new();
-    for i in 0..count {
-        let off = 3 + i * 7; // [id, Xhi, Xlo, Yhi, Ylo, 0, 0]
-        if off + 2 < s.len() {
-            let x = ((s[off + 1] as u16) << 8) | s[off + 2] as u16;
-            if x > 0 {
-                out.push(x);
-            }
-        }
-    }
-    out
-}
-
-/// The active stage index (0-based) from a DPI stage-table getter reply, if present. The wire
-/// byte is 1-BASED (probed live: the firmware REJECTS a 0 in the setter; the getter echoes the
-/// same numbering) — the old raw passthrough marked the WRONG stage as active, one past reality.
-/// A wire 0 means "no active stage reported" → None.
-fn decode_dpi_active(s: &[u8]) -> Option<u8> {
-    s.get(1).copied().filter(|&b| b > 0).map(|b| b - 1)
-}
+// The DPI stage-table decode (`decode_dpi_stages` / `decode_dpi_active`) moved to
+// `neuron::writes` beside its encoder — the ONE inverse of `build_dpi_stages_payload`, imported at
+// the top of this file. The tests below still exercise the CLI-visible behavior through those
+// shared fns.
 
 // ── "never fake success" input guards ─────────────────────────────────────────────────────────
 // Pure validators run BEFORE any device write, so an out-of-range / no-op value is rejected with a
@@ -2643,7 +2628,14 @@ fn dpi_stages_cmd(reg: &Registry, stages: &[u16], active: u8, persist: bool) -> 
             "volatile"
         }
     );
-    writes::set_dpi_stages(&d, &st, active_idx, store)?;
+    // VISITOR discipline: `set_dpi_stages` flips to driver mode INTERNALLY (no prior returned to us),
+    // so read the mode BEFORE and restore it after by the same rule — a one-shot CLI never leaves the
+    // driver lease held (the `dpi_trap` self-poisoning loop). `unwrap_or(0)` = treat an unanswered
+    // getter as non-driver, matching `ensure_driver`'s own "flip when unsure".
+    let prior = writes::device_mode(&d).unwrap_or(0);
+    let res = writes::set_dpi_stages(&d, &st, active_idx, store);
+    restore_custody_if_visitor(&d, prior);
+    res?;
     println!("  done — write verified against the device's stage-table read-back.");
     Ok(())
 }
@@ -2671,9 +2663,13 @@ fn lod_cmd(reg: &Registry, lift: Option<u8>, landing: Option<u8>, sym: Option<u8
             if level > 2 {
                 bail!("symmetric lift-off level is 0, 1, or 2 (low/med/high); got {level}");
             }
-            ensure_driver(&d);
+            // VISITOR discipline: restore the found custody on exit (the write verifies internally
+            // BEFORE we hand the lease back, so the round-trip is unaffected).
+            let prior = ensure_driver(&d);
             println!("setting SYMMETRIC lift-off level {level}...");
-            writes::set_lift_off_distance(&d, level)?;
+            let res = writes::set_lift_off_distance(&d, level);
+            restore_custody_if_visitor(&d, prior);
+            res?;
             println!("  ACCEPTED + read-back VERIFIED (0x0B/0x85 echoed mode=symmetric + level).");
             show(&d);
         }
@@ -2684,12 +2680,15 @@ fn lod_cmd(reg: &Registry, lift: Option<u8>, landing: Option<u8>, sym: Option<u8
             if !(1..=25).contains(&la) {
                 bail!("--landing is 1..=25 (Focus Pro level); got {la}");
             }
-            ensure_driver(&d);
+            // VISITOR discipline: restore the found custody on exit (verify happens inside the write).
+            let prior = ensure_driver(&d);
             println!("setting ASYMMETRIC lift-off: lift {lf} / landing {la}...");
             // The write itself re-reads 0x0B/0x85 and bails unless the device echoes
             // mode=async + this exact lift/landing pair — so reaching the line below IS the
             // hardware round-trip.
-            writes::set_lift_off_asymmetric(&d, lf, la)?;
+            let res = writes::set_lift_off_asymmetric(&d, lf, la);
+            restore_custody_if_visitor(&d, prior);
+            res?;
             println!("  ACCEPTED + read-back VERIFIED on the shared 0x0B/0x85 getter — hardware round-trip.");
             show(&d);
         }
@@ -2731,7 +2730,12 @@ fn scroll_cmd(reg: &Registry, stage: Option<u8>, volatile: bool) -> Result<()> {
                     "persist/onboard"
                 }
             );
-            writes::set_scroll_stage(&d, s, store)?;
+            // VISITOR discipline: `set_scroll_stage` flips to driver mode INTERNALLY, so read the mode
+            // before and restore after by the same rule (see restore_custody_if_visitor).
+            let prior = writes::device_mode(&d).unwrap_or(0);
+            let res = writes::set_scroll_stage(&d, s, store);
+            restore_custody_if_visitor(&d, prior);
+            res?;
             println!("  done — scroll stage {s} active.");
         }
     }
@@ -2748,7 +2752,7 @@ fn probe_cmd(pid: &str, class: Option<&str>, id: Option<&str>, scan: bool) -> Re
     // one. Probe every distinct control interface, not just the first.
     let mut ifaces: Vec<_> = transport::enumerate()?
         .into_iter()
-        .filter(|i| i.vid == 0x1532 && i.pid == pid && i.feature_len == 91)
+        .filter(|i| i.vid == neuron::synth::RAZER_VID && i.pid == pid && i.feature_len == neuron::synth::RAZER_FEATURE_LEN)
         .collect();
     ifaces.sort_by_key(|i| (i.usage_page, i.usage));
     ifaces.dedup_by_key(|i| (i.usage_page, i.usage));
@@ -3295,9 +3299,31 @@ fn audio_out(
 /// Device writes only take in DRIVER mode (Razer gates host control behind it). Ensure it —
 /// reversible, idempotent, no-op if already there. Delegates to the canonical
 /// [`neuron::writes::ensure_driver`] (one driver-mode sequence, no CLI-local copy of the magic
-/// bytes that could drift from core).
-fn ensure_driver(d: &Device) {
-    let _ = neuron::writes::ensure_driver(d);
+/// bytes that could drift from core). RETURNS the PRIOR mode byte so a one-shot command can hand
+/// custody back on the way out (see [`restore_custody_if_visitor`]) — a CLI is a VISITOR.
+fn ensure_driver(d: &Device) -> u8 {
+    neuron::writes::ensure_driver(d)
+}
+
+/// The device-mode byte for DRIVER (host-control) custody. Kept here only so the visitor-restore
+/// can ask "was the app ALREADY holding the lease when I arrived?" — mirror of core's private const.
+const DRIVER_MODE: u8 = 0x03;
+
+/// Hand back the custody state a one-shot CLI command FOUND before it flipped the device into driver
+/// mode. THE CLI IS A VISITOR, NOT A RESIDENT: a process that takes the driver lease and then exits
+/// leaves the device in ABANDONED custody — onboard buttons go dead and the next wake restores stale
+/// volatile state. That was the 2026-07-07 `dpi_trap` self-poisoning loop (trap round 3): every
+/// "repair" verb (`dpi`, `brightness`, …) silently re-armed the very trap it was meant to fix, because
+/// it grabbed the lease and never let go. So each write path captures the PRIOR mode and, on the way
+/// out (success OR error), restores it. EXCEPTION: when the prior mode was ALREADY driver (0x03) some
+/// resident holds the lease (the app) — a visitor must NOT yank it, so we leave it exactly as found.
+/// (Callers that read the prior via [`writes::device_mode`] pass its `unwrap_or(0)` — an unanswered
+/// getter reads as non-driver, matching `ensure_driver`'s own "flip when unsure" assumption, so we
+/// restore in that case too.)
+fn restore_custody_if_visitor(d: &Device, prior: u8) {
+    if prior != DRIVER_MODE {
+        let _ = d.release_custody();
+    }
 }
 
 /// Adoption is a property of DEVICE RESOLUTION, not process startup: the first time a command
@@ -3354,9 +3380,14 @@ fn dpi_cmd(reg: &Registry, value: Option<u16>) -> Result<()> {
     }
     let d = open_with_command(reg, "dpi")?;
     if let Some(v) = value {
-        ensure_driver(&d);
-        cap::set_dpi(&d, v, v, cap::Store::Persist)?;
+        // VISITOR discipline: capture the mode we found, write, then restore it whatever happens —
+        // the whole reason `dpi_trap` looped was this verb leaving the driver lease held on exit.
+        let prior = ensure_driver(&d);
+        let res = cap::set_dpi(&d, v, v, cap::Store::Persist);
+        restore_custody_if_visitor(&d, prior);
+        res?;
     }
+    // Read-back runs AFTER the restore — getters are mode-independent, so verified/MISMATCH still holds.
     let (x, y) = cap::dpi(&d)?;
     match value {
         Some(v) => println!(
@@ -3375,8 +3406,11 @@ fn dpi_cmd(reg: &Registry, value: Option<u16>) -> Result<()> {
 fn polling_cmd(reg: &Registry, hz: Option<u32>) -> Result<()> {
     let d = open_with_command(reg, "polling_rate")?;
     if let Some(h) = hz {
-        ensure_driver(&d);
-        let target = cap::set_polling_hz(&d, h)?;
+        // VISITOR discipline: restore the found custody state on exit (success or error).
+        let prior = ensure_driver(&d);
+        let res = cap::set_polling_hz(&d, h);
+        restore_custody_if_visitor(&d, prior);
+        let target = res?;
         let got = cap::polling_rate_hz(&d)?;
         println!(
             "polling -> {got} Hz  [{}]",
@@ -3407,8 +3441,12 @@ fn brightness_cmd(reg: &Registry, pct: Option<u8>) -> Result<()> {
         })?;
     if let Some(p) = pct {
         // lighting writes need driver mode; ensure it (reversible) via the canonical core helper.
-        let _ = neuron::writes::ensure_driver(&d);
-        cap::set_brightness(&d, p, cap::Store::Persist)?;
+        // VISITOR discipline: capture the prior mode and restore it on exit — don't leave the driver
+        // lease held from a one-shot command (the `dpi_trap` self-poisoning class of bug).
+        let prior = neuron::writes::ensure_driver(&d);
+        let res = cap::set_brightness(&d, p, cap::Store::Persist);
+        restore_custody_if_visitor(&d, prior);
+        res?;
     }
     // Read-back is BEST-EFFORT: the legacy dialect (the BlackWidow) can SET brightness but has
     // no getter — a write there is honest-but-unverifiable, and saying so beats erroring after
@@ -3434,6 +3472,53 @@ fn brightness_cmd(reg: &Registry, pct: Option<u8>) -> Result<()> {
             "brightness: unreadable — '{}' can set but not report it",
             d.def.name
         ),
+    }
+    Ok(())
+}
+
+/// Keyboard FIRMWARE game mode — the FN+F10 Win-key kill (GAME_LED state). No arg reads it; `on`/
+/// `off` sets it. This is the DEVICE-side kill (firmware, zero software) — the hardware sibling of
+/// the host-side KEY GUARD chord swallows; it's what silently ate the user's Win key. Resolves the
+/// keyboard by CAPABILITY (never enumeration order) — the SetGameMode setter for a write, the
+/// GameMode getter for a bare read — mirroring `brightness_cmd`'s adopt-on-miss retry and its
+/// read/write capability split. The write is read-back verified inside `cap::set_game_mode` (bails on a
+/// MISMATCH), so a returned Ok already means the board reports the state we asked for.
+fn gamemode_cmd(reg: &Registry, state: Option<&str>) -> Result<()> {
+    // Parse + validate BEFORE opening/writing — reject junk with the valid choices, never half-run.
+    let want: Option<bool> = match state {
+        None => None,
+        Some(s) => match s.to_ascii_lowercase().as_str() {
+            "on" | "1" | "true" => Some(true),
+            "off" | "0" | "false" => Some(false),
+            other => bail!("unknown game-mode state '{other}' — use: on | off"),
+        },
+    };
+    // Resolve by the capability the operation ACTUALLY needs: a WRITE (`on`/`off`) demands the
+    // SetGameMode setter, but a bare READ (`neuron game-mode`, no arg) must resolve through the
+    // GameMode getter — resolving a read through the write capability would make a getter-only
+    // board unreadable, which is exactly the split's purpose (same rule as Brightness vs
+    // SetBrightness: read surfaces never demand write paths).
+    let needed = if want.is_some() {
+        neuron::registry::Capability::SetGameMode
+    } else {
+        neuron::registry::Capability::GameMode
+    };
+    let d = Device::open_with_capability(reg, needed)
+        // MISS: adopt brand-new hardware once, retry against the fresh registry (zero-cost when
+        // the device already resolves).
+        .or_else(|e| match adopt_and_reload() {
+            Some(reg2) => Device::open_with_capability(&reg2, needed),
+            None => Err(e),
+        })?;
+    if let Some(on) = want {
+        cap::set_game_mode(&d, on)?;
+    }
+    // Report the verified state (a re-read: after a set it confirms the write, else it's the plain
+    // readout). ON means the board is eating the Win key in firmware, right now.
+    if cap::game_mode(&d)? {
+        println!("game mode: ON — the keyboard is eating the Win key in firmware");
+    } else {
+        println!("game mode: off");
     }
     Ok(())
 }
@@ -3841,15 +3926,15 @@ fn list(reg: &Registry) -> Result<()> {
     let infos = transport::enumerate()?;
     let mut found = false;
     for i in &infos {
-        if let Some(def) = reg.find_by_pid(i.vid, i.pid) {
-            if def.matches_control(i.usage_page, i.usage, i.feature_len) {
-                let mode = def.mode_for(i.pid).map(|m| m.name.as_str()).unwrap_or("?");
-                println!(
-                    "{}  [{}]  pid={:04x}  mode={}",
-                    def.name, def.codename, i.pid, mode
-                );
-                found = true;
-            }
+        // find_for_pipe: one line per DRIVEN control pipe — on a two-family pid each pipe lists
+        // under the family that frames it, rather than both collapsing to find_by_pid's first def.
+        if let Some(def) = reg.find_for_pipe(i) {
+            let mode = def.mode_for(i.pid).map(|m| m.name.as_str()).unwrap_or("?");
+            println!(
+                "{}  [{}]  pid={:04x}  mode={}",
+                def.name, def.codename, i.pid, mode
+            );
+            found = true;
         }
     }
     if !found {
@@ -3998,10 +4083,10 @@ fn adopt_cmd(reg: &Registry, dry_run: bool) -> Result<()> {
 fn open_first(reg: &Registry) -> Result<Device> {
     let infos = transport::enumerate()?;
     for i in &infos {
-        if let Some(def) = reg.find_by_pid(i.vid, i.pid) {
-            if def.matches_control(i.usage_page, i.usage, i.feature_len) {
-                return Device::open(def.clone(), i.pid);
-            }
+        // find_for_pipe: open the def that DRIVES the first resolvable control pipe (family-aware),
+        // not find_by_pid's first-by-pid def which could be a different family on a shared pid.
+        if let Some(def) = reg.find_for_pipe(i) {
+            return Device::open(def.clone(), i.pid);
         }
     }
     // MISS: the connected hardware may just be unknown to the registry — adopt once and retry

@@ -25,12 +25,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
-const RAZER_VID: u16 = 0x1532;
 /// How often to re-enumerate (catch a keyboard replug) and re-assert Driver Mode (a replug reverts).
 const HOTPLUG_POLL: Duration = Duration::from_secs(20);
-/// `device_mode` SET: class `0x00` / id `0x04`, data_size `0x02`, args `[mode, 0x00]`.
-const DEVICE_MODE_SET: (u8, u8, u8) = (0x00, 0x04, 0x02);
 /// Driver Mode — the firmware hands its macro keys to the host (they emit the `0x04` report).
+/// The switch itself routes through `neuron::writes::set_device_mode` (the one home of the opcode).
 const DRIVER_MODE: u8 = 0x03;
 
 fn verbose() -> bool {
@@ -96,8 +94,7 @@ fn ensure_driver_mode(reg: &neuron::registry::Registry, mouse_pids: &HashSet<u16
             let Ok(dev) = neuron::device::Device::open(def.clone(), pid) else {
                 continue; // not connected
             };
-            let (class, id, size) = DEVICE_MODE_SET;
-            match dev.exec_dynamic(class, id, size, &[DRIVER_MODE, 0x00]) {
+            match neuron::writes::set_device_mode(&dev, DRIVER_MODE) {
                 Ok(_) => {
                     if verbose() {
                         eprintln!("[macrokeys] {pid:04x}: Driver Mode enabled");
@@ -121,7 +118,7 @@ fn arm_new(mouse_pids: &HashSet<u16>, armed: &Arc<Mutex<HashSet<DevicePath>>>) {
         Err(_) => return,
     };
     for info in infos {
-        if info.vid != RAZER_VID || mouse_pids.contains(&info.pid) {
+        if info.vid != neuron::synth::RAZER_VID || mouse_pids.contains(&info.pid) {
             continue; // non-Razer, or a mouse (hidwatch owns those collections)
         }
         // Where Razer's vendor input rides: the sibling generic-desktop collection with the undefined

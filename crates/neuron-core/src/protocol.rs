@@ -99,6 +99,15 @@ pub fn crc(buf: &[u8; BUF_LEN]) -> u8 {
     buf[3..=88].iter().fold(0u8, |c, &b| c ^ b)
 }
 
+/// Read one reply frame's status IF it echoes the awaited command — the shared echo filter
+/// (b[7]==class && b[8]==id → Status from b[1]) that device/discover/synth exec loops each
+/// hand-rolled. One frame vocabulary; the loops keep their own PACING (see DIALECT-RND.md:
+/// cadence differences are deliberate calibration behavior, not accidents). `None` means the
+/// buffer is not (yet) our reply — cross-talk from another command, so keep polling.
+pub fn reply_status(b: &[u8; BUF_LEN], class: u8, id: u8) -> Option<Status> {
+    (b[7] == class && b[8] == id).then(|| Status::from_u8(b[1]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,5 +127,19 @@ mod tests {
         assert_eq!(back.class, 0x00);
         assert_eq!(back.id, 0x81);
         assert_eq!(back.data_size, 0x02);
+    }
+
+    #[test]
+    fn reply_status_is_the_echo_filter() {
+        // A SUCCESS reply that echoes the awaited class/id yields its status…
+        let mut b = Report::command(0x1F, 0x04, 0x85, 0x07).to_buf();
+        b[1] = 0x02; // status = Success in the reply
+        assert_eq!(reply_status(&b, 0x04, 0x85), Some(Status::Success));
+        // …a Fail status still round-trips (the caller decides terminal vs keep-polling)…
+        b[1] = 0x03;
+        assert_eq!(reply_status(&b, 0x04, 0x85), Some(Status::Fail));
+        // …but a class OR id mismatch is cross-talk, not our reply → None (keep polling).
+        assert_eq!(reply_status(&b, 0x04, 0x86), None, "id mismatch");
+        assert_eq!(reply_status(&b, 0x00, 0x85), None, "class mismatch");
     }
 }

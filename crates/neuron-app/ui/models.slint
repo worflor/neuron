@@ -23,6 +23,8 @@ export struct DeviceRow {
     kind: string,       // "mouse" | "keyboard" | "device" (HID) | "mic" | "output" (Core Audio)
     id: string,         // selection key: the PHYSICAL unit (HID path instance — two identical
                         // devices get two distinct ids); the Core-Audio endpoint id for audio
+    dialect: string,    // the control PLANE's family (razer/hidpp/…) — part of the selection
+                        // identity (pid, unit, dialect); "" for audio endpoints (not dialect planes)
     detail: string,     // audio subtitle ("microphone · 62%" / "output · muted"); "" for HID
     // registry-driven CAPABILITY flags (from the device descriptor) — the panel gates each control on
     // these, so a keyboard shows no DPI fader and a wired board shows no battery/idle.
@@ -35,6 +37,7 @@ export struct DeviceRow {
     cap-store: bool,    // persist-to-onboard
     cap-idle: bool,     // idle-off timer (wireless)
     cap-plate: bool,    // swappable side plates (push-detected; surfaces the side-plate readout)
+    cap-game-mode: bool, // keyboard FIRMWARE game mode (FN+F10 Win-key kill) — the KEY GUARD's device-side sibling
     plate: string,      // last side plate the mouse pushed ("12-button"…); "" if none/non-plated
     // TRANSIENT: an unknown device whose auto-adoption probe is running ("learning device…").
     // Selection policy hangs off this: the row is selectable (a click carries over to the real

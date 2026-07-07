@@ -39,6 +39,29 @@ class = 0x00
 id = 0x84
 size = 0x02
 
+# FIRMWARE GAME MODE — the keyboard's own FN+F10-toggled Win-key kill (GAME_LED state, OpenRazer
+# razer_chroma_standard_get/set_led_state with GAME_LED=0x08; device-default 0xFF tx).
+# CONFIRMED live on this board (game_mode_probe, 2026-07-07): getter echoed [00 08 01] with the
+# LED lit, setter 0x03/0x00 [00 08 00] ACKed and read back [00 08 00] — the LED visibly went
+# dark on the software write. Device-PHYSICAL kill (firmware eats the Win key with zero
+# software) — the hardware sibling of the host-side KEY GUARD swallows; surfaced because it
+# silently ate the user's Win key on 2026-07-07 while every host layer probed clean. NOTE: the
+# FN+F10 toggle itself only works in NORMAL device mode (0x00) — in driver mode the keyboard
+# defers FN combos to software (OpenRazer #1174 is the same bug class), which is why the
+# restore-on-idle device-mode contract matters.
+# getter: args = [varstore, GAME_LED]; response arg[2] = state (0/1).
+[commands.game_mode]
+class = 0x03
+id = 0x80
+size = 0x03
+args = [0x00, 0x08]
+
+# setter: args = [varstore, GAME_LED, state] supplied at runtime.
+[commands.set_game_mode]
+class = 0x03
+id = 0x00
+size = 0x03
+
 # Legacy lighting getters — CONFIRMED live (03/88 current state, 03/89 capabilities).
 [commands.lighting_state]
 class = 0x03

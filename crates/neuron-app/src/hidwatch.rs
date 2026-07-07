@@ -17,6 +17,18 @@
 //! in `neuron::vitals`. A hotplug MONITOR re-arms collections after a dongle replug. Verified on the
 //! Naga V2 Pro family; when more devices are captured the report map should move to the registry.
 //!
+//! DRIVER-MODE BUTTON EVENTS — a SECOND report family, the `04` lead byte, captured live off the Naga
+//! V2 Pro (pid 0x00A8) 2026-07-07. In driver mode (device_mode 0x03) the firmware STOPS acting on its
+//! own onboard DPI/scroll/profile buttons; it DEFERS them to the resident software as bare "the button
+//! happened" events (Synapse silently implements the semantics). While neuron holds the driver lease
+//! for its lighting stream that duty is OURS or those buttons go dead:
+//!   `04 52 …` → DPI-stage button      `04 57 …` → scroll-sensitivity button
+//!   `04 50 …` → profile button        `04 00 …` → ANY button's release (buf[1]=0x00 — ignored)
+//! The event carries NO stage index and NO direction — software owns the cycle. `decode` maps the code
+//! to an [`Intent`] and hands it to a single SERIAL worker that — gated on a FRESH device_mode==0x03
+//! read — fulfills it through `neuron::intent::run_shared_intent`, the same cycle policy the CLI/GUI
+//! use. This is neuron honouring the driver-mode custody contract: hold the lease, own the buttons.
+//!
 //! `NEURON_HIDWATCH=1` additionally logs every raw report as hex (for decoding new devices) and the
 //! (otherwise-silent) battery-read failures.
 
@@ -26,7 +38,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const RAZER_VID: u16 = 0x1532;
 /// Settle window for the device-push BATCHER. Every pushed settings-report (dpi / scroll / side plate)
 /// joins a batch and waits this much quiet before the batch is decided. Two jobs in one window:
 ///   • absorbs a side plate's seating BOUNCE (the strap flickers `00`↔`01` before it settles) — the
@@ -104,7 +115,7 @@ fn arm_new(mouse_pids: &HashSet<u16>, armed: &Arc<Mutex<HashSet<DevicePath>>>) {
     };
     let mut spawned = 0usize;
     for info in infos {
-        if info.vid != RAZER_VID || !mouse_pids.contains(&info.pid) {
+        if info.vid != neuron::synth::RAZER_VID || !mouse_pids.contains(&info.pid) {
             continue;
         }
         // Where Razer's event reports ride: the sibling generic-desktop collection with the undefined
@@ -187,7 +198,32 @@ fn spawn_reader(pid: u16, path: DevicePath, armed: Arc<Mutex<HashSet<DevicePath>
 
 /// Translate one device-pushed report into the right action. De-dup / edge logic live downstream.
 fn decode(buf: &[u8], pid: u16) {
-    if buf.len() < 6 || buf[0] != 0x05 {
+    if buf.len() < 6 {
+        return;
+    }
+    // 04-FAMILY: the DRIVER-MODE deferred-button vocabulary (see module header). The firmware, having
+    // handed us its onboard DPI/scroll/profile buttons, emits a bare event per press; we ARE the
+    // implementer. Map the code to a cycle intent and hand it to the serial worker — the mode gate and
+    // the actual device write live THERE, off this reader thread. buf[1]==0x00 is a release and any
+    // other code is an unseen deferred button: both map to None (release silently, unknown under
+    // verbose). Sits BEFORE the 05-family gate; the 05 path below is unchanged.
+    if buf[0] == 0x04 {
+        match button_intent(buf[1]) {
+            Some(intent) => {
+                let _ = button_worker().send((pid, intent));
+            }
+            None => {
+                if buf[1] != 0x00 && verbose() {
+                    eprintln!(
+                        "[hidwatch] pid={pid:04x}: unknown 04-family button code {:#04x}",
+                        buf[1]
+                    );
+                }
+            }
+        }
+        return;
+    }
+    if buf[0] != 0x05 {
         return;
     }
     match buf[1] {
@@ -196,6 +232,24 @@ fn decode(buf: &[u8], pid: u16) {
             let dpi = u16::from_be_bytes([buf[2], buf[3]]) as u32;
             if (100..=30_000).contains(&dpi) {
                 batch_push(pid, Push::Dpi(dpi));
+                // WAKE-RECONCILE, SECOND TRIGGER. The `05 0c` power poke is NOT emitted on every wake:
+                // dpi_trap.log 08:39 (resident app) caught a wake that restored DPI 16000 and announced
+                // it (`05 02 3e 80`) with NO `05 0c` — so the power-event trigger never fired and the
+                // stale plane sat uncorrected. The DPI-announce is the RELIABLE signal: it fires on
+                // every device-side DPI change, including the stale restore itself (the device confesses
+                // its own corruption). But unlike the `05 0c` reassert (unconditional), this trigger is
+                // MEMBERSHIP-GATED — the announce ALSO fires when the user's onboard DPI button walks
+                // the cycle, and snapping that back would fight the user's thumb — so the worker heals
+                // only a value FOREIGN to the persisted cycle (`maybe_reconcile_announced`). The decision
+                // to admit this wake is made SYNCHRONOUSLY via the SAME 5s per-pid `reassert_due`
+                // debounce the `05 0c` hook uses: whichever trigger sees a given wake FIRST stamps the
+                // window and the other bows out, so one wake never double-fires a reconcile. The check
+                // itself (persisted-cycle read + reconcile = control-pipe round-trips that must never
+                // block this reader) rides its own off-thread worker.
+                if reassert_due(pid) {
+                    let announced = dpi as u16;
+                    thread::spawn(move || maybe_reconcile_announced(pid, announced));
+                }
             }
         }
         // Scroll / sensitivity stage changed: stage index in byte[2], bounded by the real stage count.
@@ -207,14 +261,39 @@ fn decode(buf: &[u8], pid: u16) {
         }
         // Power/charge poke — STATELESS. Settle the charge state (poll until it latches) then observe
         // as a real EVENT (fires a card even on a freshly-plugged device's first sample). Off-thread.
+        //
+        // The `05 0c` family ALSO fires on WAKE-from-idle — and that is when the wake-restore trap
+        // bites: a device wakes with a STALE factory volatile plane (the Naga self-announced DPI 16000
+        // with its stage table reverted while the persisted store stayed clean, 2026-07-07). Trap-proven
+        // in BOTH device modes — the restoring source is an unmapped onboard-profile flash, not driver
+        // mode — so the heal below is mode-independent. Real Synapse re-asserts config on every wake; we
+        // take that duty here. The debounce decision is made SYNCHRONOUSLY on this listener thread (the
+        // wake burst emits several 05-events; only the first arms a reconcile), but the reconcile itself
+        // — control-pipe round-trips that must never block this reader — rides the SAME off-thread charge
+        // worker, sequenced AFTER the settle so two control paths don't contend on the device's one
+        // feature channel.
+        //
+        // KEPT as the BELT even though the `05 02` announce is the reliable wake signal: some wakes DO
+        // emit `05 0c`, and one may not announce a DPI change at all (if the restored DPI happens to
+        // equal what the volatile plane already held, the device emits no `05 02`). Both triggers funnel
+        // into ONE debounced reconcile via the shared `reassert_due` stamps — whichever fires first for
+        // a given wake wins the window — so this belt never double-fires against the announce path. The
+        // `05 0c` reassert stays UNCONDITIONAL (no membership gate): a power poke is never a user's
+        // onboard DPI button, so there is no legitimate cycle-step to protect here.
         0x0c => {
-            thread::spawn(move || match settle_charge(pid) {
-                Some((b, c)) => neuron::vitals::observe(pid, b, c, true),
-                None => {
-                    neuron::vitals::mark_stale(pid);
-                    if verbose() {
-                        eprintln!("[hidwatch] pid={pid:04x}: charge settle read failed");
+            let reassert = reassert_due(pid);
+            thread::spawn(move || {
+                match settle_charge(pid) {
+                    Some((b, c)) => neuron::vitals::observe(pid, b, c, true),
+                    None => {
+                        neuron::vitals::mark_stale(pid);
+                        if verbose() {
+                            eprintln!("[hidwatch] pid={pid:04x}: charge settle read failed");
+                        }
                     }
+                }
+                if reassert {
+                    maybe_reassert(pid);
                 }
             });
         }
@@ -237,6 +316,82 @@ fn decode(buf: &[u8], pid: u16) {
             // Wire it here, off this same de-dup'd edge, so a swap both cards AND switches in one place.
         }
         _ => {}
+    }
+}
+
+/// Map a 04-family deferred-button code to the cycle [`Intent`] it REQUESTS. Pure + table-testable so
+/// the vocabulary is pinned without hardware. All three cycle UP: a deferred button carries no
+/// direction (the firmware forwards only "pressed"), and a single physical button walks its cycle
+/// forward — the same one-way step Synapse's onboard buttons do. buf[1]==0x00 (release) and any
+/// unrecognized code fall through to `None` — every real press is a DELIBERATE user act, so there is
+/// nothing to debounce; the serial worker's in-order execution is the whole ordering contract (3
+/// presses = 3 steps).
+///
+/// INTERPLAY (DpiCycle): the volatile DPI write `run_shared_intent` makes here itself provokes a
+/// device `05 02` DPI-announce. That announce feeds `maybe_reconcile_announced`, whose membership gate
+/// recognizes an IN-CYCLE value and stays out of the way (it heals only values foreign to the persisted
+/// cycle) — so our own cycle-step is never fought. That quiet depends on the active profile's
+/// `dpi_stages` matching the device's persisted cycle; profile apply writes BOTH, so keep them synced.
+fn button_intent(code: u8) -> Option<neuron::action::Intent> {
+    use neuron::action::{Direction, Intent};
+    match code {
+        0x52 => Some(Intent::DpiCycle(Direction::Up)),
+        0x57 => Some(Intent::ScrollStageCycle(Direction::Up)),
+        0x50 => Some(Intent::ProfileCycle(Direction::Up)),
+        _ => None,
+    }
+}
+
+/// The SINGLE deferred-button implementer. Lazily spawned on first press; every mapped press is sent
+/// down this one channel so presses execute STRICTLY in order and never race each other on the device's
+/// one control pipe (two cycle-writes interleaving would corrupt the step). Returns the send-end; the
+/// receive-end lives in the worker loop forever.
+fn button_worker() -> &'static std::sync::mpsc::Sender<(u16, neuron::action::Intent)> {
+    static TX: OnceLock<std::sync::mpsc::Sender<(u16, neuron::action::Intent)>> = OnceLock::new();
+    TX.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<(u16, neuron::action::Intent)>();
+        thread::Builder::new()
+            .name("neuron-hidwatch-button".into())
+            .spawn(move || {
+                for (pid, intent) in rx {
+                    fulfill_button(pid, intent);
+                }
+            })
+            .ok();
+        tx
+    })
+}
+
+/// Fulfill one deferred-button request on the serial worker (never the reader). The DRIVER-MODE GATE:
+/// read device_mode FRESH per press and act only when it reads 0x03. WHY act only in driver mode — in
+/// NORMAL mode (0x00) the firmware acts on the button ITSELF and merely announces the result via the
+/// 05-family, so cycling here too would DOUBLE-APPLY; in driver mode the firmware defers and the 04
+/// event is a REQUEST we must satisfy. WHY fresh, not cached — the lighting stream's driver lease comes
+/// and goes, so a cached mode would either drop presses (stale "normal") or double-apply (stale
+/// "driver"); the getter round-trip is cheap next to the write it guards. Past the gate, the request
+/// rides the SAME shared cycle policy the CLI/GUI dispatch use (`run_shared_intent`: stage lookup,
+/// volatile writes, resident scroll cursor, confirmation cards) so there is one implementation.
+fn fulfill_button(pid: u16, intent: neuron::action::Intent) {
+    let Some(d) = open_device(pid) else {
+        return;
+    };
+    if neuron::writes::device_mode(&d) != Some(0x03) {
+        // normal mode (firmware owns the button) or an unanswered getter (asleep link) — not ours.
+        if verbose() {
+            eprintln!("[hidwatch] pid={pid:04x}: 04-family button ignored (not in driver mode)");
+        }
+        return;
+    }
+    drop(d); // the gate handle is done; run_shared_intent opens its own writable via the session.
+    let Some(reg) = registry() else {
+        return;
+    };
+    let mut devices = neuron::device::DeviceSession::new(reg);
+    let mut cursor = neuron::intent::ProcessProfileCursor;
+    if let Some(msg) = neuron::intent::run_shared_intent(&mut devices, &mut cursor, &intent) {
+        if verbose() {
+            eprintln!("[hidwatch] pid={pid:04x}: 04-family button -> {msg}");
+        }
     }
 }
 
@@ -435,6 +590,119 @@ fn open_device(pid: u16) -> Option<neuron::device::Device> {
     neuron::device::Device::open(def.clone(), pid).ok()
 }
 
+/// WAKE-RECONCILE debounce, SHARED across BOTH wake triggers. The `05 0c` power/wake family fires
+/// SEVERAL events per wake burst, and the `05 02` DPI-announce fires on the same wake too; without a
+/// shared window each would queue its own reconcile (redundant control-pipe traffic against a
+/// just-woken device — and the announce and a power event for the SAME wake would double-fire). One
+/// stamp map, so at most one reconcile per pid per window regardless of which trigger saw the wake
+/// first.
+const REASSERT_DEBOUNCE: Duration = Duration::from_secs(5);
+
+/// Per-pid last-reassert stamps (lazily created — a `HashMap` can't init a `const` static).
+fn reassert_stamps() -> &'static Mutex<HashMap<u16, Instant>> {
+    static S: OnceLock<Mutex<HashMap<u16, Instant>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Should `pid` reassert now? True (and stamps the moment) only when the debounce window has elapsed
+/// since the last reassert — so a wake BURST arms exactly one. Decided synchronously on the listener
+/// thread so the burst is collapsed before any worker spawns.
+fn reassert_due(pid: u16) -> bool {
+    let mut map = reassert_stamps().lock().unwrap();
+    let now = Instant::now();
+    match map.get(&pid) {
+        Some(&last) if now.duration_since(last) < REASSERT_DEBOUNCE => false,
+        _ => {
+            map.insert(pid, now);
+            true
+        }
+    }
+}
+
+/// Reconcile `pid`'s volatile DPI plane with its persisted truth after a wake — the Synapse duty
+/// neuron owes for a device whose onboard-profile flash reloads factory tables on wake (see
+/// `writes::reconcile_volatile_with_persisted` for the trap). NO device-mode gate: the reconcile was
+/// once gated to driver mode on the assumption a normal-mode wake loads persisted config, but the
+/// 2026-07-07 trap DISPROVED that — a NORMAL-mode wake restored the factory volatile table from the
+/// unmapped profile store all the same. So it runs on every razer wake; the reconcile's OWN
+/// disagreement gate (it writes nothing when the two planes already agree) provides the do-no-harm
+/// property the mode gate was only approximating. Runs on the charge worker thread (off the reader).
+/// Logs the outcome (a rare, debounced device-integrity event earns a line even without
+/// NEURON_HIDWATCH; the read/verify inside the write is the safety net so a failure is honest, never a
+/// silent corruption).
+fn maybe_reassert(pid: u16) {
+    let Some(d) = open_device(pid) else {
+        return;
+    };
+    // FAMILY GATE (still correct): the wake-reconcile duty is part of RAZER's custody contract — the
+    // varstore getters it reads are razer-framed (DPI class 0x04). `open_device` resolves ANY family's
+    // def by pid, so on a non-razer def those getters would emit a validly-framed HID++ message with
+    // garbage meaning at that hardware. Bail before any read on anything that isn't razer. (The old
+    // driver-mode gate that sat here is GONE — the trap proved a normal-mode wake corrupts volatile
+    // state too, so the reconcile runs mode-independently and leans on its own disagreement gate.)
+    if d.def.dialect != "razer" {
+        return;
+    }
+    reconcile_now(pid, &d);
+}
+
+/// The DPI-ANNOUNCE (`05 02`) wake worker — the MEMBERSHIP-GATED sibling of [`maybe_reassert`]. Runs
+/// off the reader after the shared [`reassert_due`] debounce admitted this wake. The announce fires on
+/// EVERY device-side DPI change, so before healing we must tell a legitimate onboard-button cycle-step
+/// apart from the trap-proven stale wake-restore — `writes::announced_dpi_is_foreign` reads the
+/// device's PERSISTED cycle and tests membership:
+///   • `Some(false)` — `announced` is a cycle member → the user's onboard button chose it → do NOTHING
+///     (a reconcile would snap the cursor back against the user's thumb).
+///   • `Some(true)`  — the value is in no configured stage → nobody legitimate chose it (the 08:39
+///     wake-restore's factory 16000, which arrived with no `05 0c` power event) → run the reconcile.
+///   • `None`        — the persisted cycle is unreadable → do NOTHING (never heal on missing evidence).
+/// Same `dialect != "razer"` family gate as [`maybe_reassert`]: the varstore getters are razer-framed,
+/// so bail before any read on a non-razer def that `open_device` resolved by pid.
+fn maybe_reconcile_announced(pid: u16, announced: u16) {
+    let Some(d) = open_device(pid) else {
+        return;
+    };
+    if d.def.dialect != "razer" {
+        return;
+    }
+    match neuron::writes::announced_dpi_is_foreign(&d, announced) {
+        Some(true) => reconcile_now(pid, &d),
+        _ => {
+            // Some(false) = legitimate onboard cycle-step; None = unreadable/empty cycle. Either way no
+            // heal — the anti-fight-the-user gate and the never-reconcile-on-missing-evidence rule.
+            if verbose() {
+                eprintln!(
+                    "[hidwatch] pid={pid:04x}: DPI announce {announced} not foreign; no reconcile"
+                );
+            }
+        }
+    }
+}
+
+/// Run the disagreement-gated reconcile against an already-opened, already-family-checked device and
+/// log the outcome. SHARED by both wake triggers — the `05 0c` power poke ([`maybe_reassert`], which
+/// reaches here unconditionally) and the `05 02` DPI-announce ([`maybe_reconcile_announced`], which
+/// reaches here only past the foreign-membership gate) — so the "a rare debounced device-integrity
+/// event earns a line even without NEURON_HIDWATCH; the read/verify inside the write is the safety
+/// net" logging is identical on both paths.
+fn reconcile_now(pid: u16, d: &neuron::device::Device) {
+    match neuron::writes::reconcile_volatile_with_persisted(d) {
+        Ok(items) if !items.is_empty() => {
+            eprintln!("[hidwatch] pid={pid:04x}: wake-reconcile -> {}", items.join(", "));
+        }
+        Ok(_) => {
+            if verbose() {
+                eprintln!("[hidwatch] pid={pid:04x}: wake-reconcile (stores already agree)");
+            }
+        }
+        Err(e) => {
+            if verbose() {
+                eprintln!("[hidwatch] pid={pid:04x}: wake-reconcile failed: {e}");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -549,6 +817,25 @@ mod tests {
         // the existing guards must still hold — a non-0x05 lead byte or a too-short buffer is a no-op
         // (no panic), so the new arm can't destabilize the DPI/scroll/charge decoding.
         decode(&[0x05, 0x0e], NAGA_PID); // too short (< 6) — guarded
-        decode(&[0x01, 0x0e, 0x03, 0, 0, 0], NAGA_PID); // wrong lead byte — guarded
+        decode(&[0x02, 0x0e, 0x03, 0, 0, 0], NAGA_PID); // neither 04 nor 05 lead byte — guarded
+    }
+
+    #[test]
+    fn deferred_button_codes_map_to_their_cycle_intents() {
+        use neuron::action::{Direction, Intent};
+        // the live-captured 04-family vocabulary, pinned. Each maps to its cycle, stepping UP.
+        assert!(matches!(button_intent(0x52), Some(Intent::DpiCycle(Direction::Up))));
+        assert!(matches!(button_intent(0x57), Some(Intent::ScrollStageCycle(Direction::Up))));
+        assert!(matches!(button_intent(0x50), Some(Intent::ProfileCycle(Direction::Up))));
+    }
+
+    #[test]
+    fn releases_and_unknown_button_codes_map_to_nothing() {
+        // buf[1]==0x00 is EVERY button's release — never an action. Unknown codes are unseen deferred
+        // buttons — ignored (logged under verbose only), never guessed into a wrong cycle.
+        assert!(button_intent(0x00).is_none(), "release must map to nothing");
+        for code in [0x01u8, 0x51, 0x53, 0x56, 0x99, 0xff] {
+            assert!(button_intent(code).is_none(), "unknown code {code:#04x} must map to nothing");
+        }
     }
 }

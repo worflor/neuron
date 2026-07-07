@@ -7,7 +7,7 @@
 
 fn main() -> anyhow::Result<()> {
     let mut infos = neuron::transport::enumerate()?;
-    infos.retain(|i| i.vid == 0x1532);
+    infos.retain(|i| i.vid == neuron::synth::RAZER_VID);
     infos.sort_by_key(|i| (i.pid, i.usage_page, i.usage));
     if infos.is_empty() {
         println!("no Razer (vid 1532) HID collections enumerated.");
@@ -21,7 +21,7 @@ fn main() -> anyhow::Result<()> {
             i.usage_page,
             i.usage,
             i.feature_len,
-            if i.feature_len == 91 { "razer_report-shaped" } else { "other HID           " },
+            if i.feature_len == neuron::synth::RAZER_FEATURE_LEN { "razer_report-shaped" } else { "other HID           " },
             i.product,
             i.instance(),
         );

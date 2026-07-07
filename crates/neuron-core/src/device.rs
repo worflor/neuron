@@ -1,11 +1,11 @@
-//! A live device: the control transport + its registry definition + the busy-poll exec().
+//! A live device: the control transport + its registry definition, with wire exec routed through
+//! the device's protocol [`Dialect`](crate::dialect::Dialect) (razer_report today).
 
-use crate::protocol::{Report, Status, BUF_LEN};
+use crate::dialect::Dialect;
 use crate::registry::{CommandSpec, DeviceDef};
 use crate::transport::{self, DevicePath, Transport};
 use anyhow::{bail, Context, Result};
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
 
 pub struct Device {
     pub def: DeviceDef,
@@ -32,7 +32,7 @@ impl Device {
             .find(|i| {
                 i.vid == def.vendor_id
                     && i.pid == pid
-                    && def.matches_control(i.usage_page, i.usage, i.feature_len)
+                    && def.matches_control(i)
             })
             .context("control interface not found (is the device connected?)")?;
         Device::open_path(def, pid, &info.path)
@@ -45,10 +45,10 @@ impl Device {
     /// `"set_dpi"`), not the reader, so the predicate matches the operation.
     pub fn open_with_command(reg: &crate::registry::Registry, cmd: &str) -> Result<Self> {
         for i in &transport::enumerate()? {
-            if let Some(def) = reg.find_by_pid(i.vid, i.pid) {
-                if def.matches_control(i.usage_page, i.usage, i.feature_len)
-                    && def.command(cmd).is_some()
-                {
+            // find_for_pipe (not find_by_pid): resolve the def that actually DRIVES this pipe, so on
+            // a two-family pid each control pipe reaches the family that can frame it.
+            if let Some(def) = reg.find_for_pipe(i) {
+                if def.command(cmd).is_some() {
                     return Device::open_path(def.clone(), i.pid, &i.path);
                 }
             }
@@ -69,8 +69,10 @@ impl Device {
         cap: crate::registry::Capability,
     ) -> Result<Self> {
         for i in &transport::enumerate()? {
-            if let Some(def) = reg.find_by_pid(i.vid, i.pid) {
-                if def.matches_control(i.usage_page, i.usage, i.feature_len) && def.supports(cap) {
+            // find_for_pipe (not find_by_pid): the def that DRIVES this pipe answers the capability
+            // question, so a two-family pid resolves each pipe to its own frameable family.
+            if let Some(def) = reg.find_for_pipe(i) {
+                if def.supports(cap) {
                     return Device::open_path(def.clone(), i.pid, &i.path);
                 }
             }
@@ -96,6 +98,10 @@ impl Device {
     /// EFFECT/CUSTOM-FRAME writes need 0x3F while its getters/brightness use the device default.
     /// `exec_dynamic` delegates here with `self.def.transaction_id`, so every device that sets no
     /// per-command override is byte-identical to before.
+    ///
+    /// ROUTED through the device's protocol [`Dialect`](crate::dialect::Dialect) (the busy-poll
+    /// loop now lives in `dialect::RazerDialect::exec`): frame bytes and poll discipline are
+    /// byte-identical to the moved-out loop, pinned by the dialect's frame goldens.
     pub fn exec_dynamic_tx(
         &self,
         transaction_id: u8,
@@ -104,41 +110,23 @@ impl Device {
         size: u8,
         args: &[u8],
     ) -> Result<[u8; 80]> {
-        let mut req = Report::command(transaction_id, class, id, size);
-        for (i, b) in args.iter().enumerate() {
-            if i < req.args.len() {
-                req.args[i] = *b;
-            }
-        }
-        let cmd_class = class;
-        let cmd_id = id;
-        let out = req.to_buf();
-        self.transport.set_feature(&out)?;
-        for i in 0..60 {
-            std::thread::sleep(Duration::from_millis(10));
-            let mut b = [0u8; BUF_LEN];
-            b[0] = 0x00; // report id for the GET
-            if self.transport.get_feature(&mut b).is_ok() {
-                // accept only a reply that echoes our class/id (filters cross-talk)
-                if b[7] == cmd_class && b[8] == cmd_id {
-                    match Status::from_u8(b[1]) {
-                        Status::Success => return Ok(Report::from_buf(&b).args),
-                        Status::Fail => {
-                            bail!("device reported FAIL for command {cmd_class:#04x}/{cmd_id:#04x}")
-                        }
-                        Status::Unsupported => {
-                            bail!("command {cmd_class:#04x}/{cmd_id:#04x} unsupported")
-                        }
-                        _ => {} // busy / timeout / new — keep polling
-                    }
-                }
-            }
-            if i % 12 == 11 {
-                // re-arm if the device stayed busy (wireless round-trip can be slow)
-                self.transport.set_feature(&out)?;
-            }
-        }
-        bail!("timed out waiting for reply to {cmd_class:#04x}/{cmd_id:#04x}")
+        self.dialect()?
+            .exec(self.transport.as_ref(), transaction_id, class, id, size, args)
+    }
+
+    /// The wire-protocol family this device speaks. FAIL CLOSED on an unknown id (Finding 2): with a
+    /// second family registered and `dialect` being persisted, USER-EDITABLE data, a typo or a stale
+    /// auto file must NOT silently fall back to razer — that would emit razer-framed bytes at
+    /// possibly-non-razer hardware. A def whose family we can't identify gets no bytes on the wire at
+    /// all; the ACK'd exec path surfaces this error loudly, `send_lighting_fast` no-ops on it, and
+    /// `matches_control` already refuses to select such a def — defense in depth.
+    fn dialect(&self) -> Result<&'static dyn Dialect> {
+        crate::dialect::by_id(&self.def.dialect).with_context(|| {
+            format!(
+                "def '{}' declares unknown dialect '{}' — refusing to frame bytes for it",
+                self.def.name, self.def.dialect
+            )
+        })
     }
 
     /// Apply a built lighting command (gated write path). Sends the dynamic-arg report and
@@ -161,22 +149,41 @@ impl Device {
     /// DROPS frames — the lighting FLICKER. `stream_wait_us` (registry data; ~31ms for the Naga's
     /// wireless receiver, 0 for wired boards) is exactly OpenRazer's per-receiver `wait_us`. Wired/legacy
     /// boards keep their ~1-2ms cost; the wireless mouse trades a lower ceiling (~16fps) for stability.
+    ///
+    /// ROUTED through the device's protocol [`Dialect`](crate::dialect::Dialect): the
+    /// build-frame/set/wait/drain body now lives in `dialect::RazerDialect::exec_fast`, which
+    /// receives `self.def.stream_wait_us` as the wait discipline — byte-identical to before.
     pub fn send_lighting_fast(&self, rep: &crate::lighting::Report) {
         let size = rep.size.unwrap_or_else(|| rep.args.len().min(80) as u8);
         let tx = rep.tx.unwrap_or(self.def.transaction_id);
-        let mut req = Report::command(tx, rep.class, rep.id, size);
-        for (i, b) in rep.args.iter().enumerate() {
-            if i < req.args.len() {
-                req.args[i] = *b;
-            }
-        }
-        if self.transport.set_feature(&req.to_buf()).is_ok() {
-            if self.def.stream_wait_us > 0 {
-                std::thread::sleep(Duration::from_micros(self.def.stream_wait_us));
-            }
-            let mut b = [0u8; BUF_LEN];
-            let _ = self.transport.get_feature(&mut b); // drain the reply; don't busy-retry
-        }
+        // Fire-and-forget path: a silent no-op on a mistagged def is the SAFE failure (Finding 2).
+        // The ACK'd `exec_dynamic_tx` surfaces the unknown-dialect error loudly, and `matches_control`
+        // already refuses to select such a def — so reaching here at all means a def slipped through;
+        // the right move is to put NOTHING on the wire rather than razer-frame it blindly.
+        let Ok(dialect) = self.dialect() else {
+            return;
+        };
+        dialect.exec_fast(
+            self.transport.as_ref(),
+            tx,
+            rep.class,
+            rep.id,
+            size,
+            &rep.args,
+            self.def.stream_wait_us,
+        );
+    }
+
+    /// Release this family's CUSTODY of the device back to firmware — the rest-state restore run at
+    /// stream teardown and app exit (DIALECT-RND "Device-mode lifecycle"). Teardown surfaces call
+    /// THIS, never a raw device-mode write: the release routes through the def's [`Dialect`], so a
+    /// razer board returns its driver-mode lease (device_mode -> 0x00, re-enabling onboard buttons/FN
+    /// + firmware wake-restore) while a HID++ (or any never-in-custody) family no-ops instead of
+    /// receiving a razer-framed mode packet it would misread. FAIL CLOSED on an unknown dialect,
+    /// exactly like [`exec_dynamic_tx`](Self::exec_dynamic_tx) — a def we can't identify gets no bytes.
+    pub fn release_custody(&self) -> Result<()> {
+        self.dialect()?
+            .release_custody(self.transport.as_ref(), &self.def)
     }
 
     /// Run a named command from the device's registry command map.
@@ -372,6 +379,11 @@ impl<'a> DeviceSession<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The live stream-strategy probe below builds raw frames directly (bypassing the dialect
+    // seam, deliberately — DIALECT-RND do-not-disturb list), so it needs the protocol vocabulary
+    // and timing types the production impl no longer imports at module top.
+    use crate::protocol::{Report, BUF_LEN};
+    use std::time::Duration;
 
     /// The exact resolution gap this capability path closes: the legacy BlackWidow has NO top-level
     /// `set_brightness` command (its brightness lives in the `[lighting]` block), so the command-name
@@ -390,6 +402,60 @@ mod tests {
         assert!(
             bw.supports(Capability::SetBrightness),
             "yet it CAN set brightness via the lighting block, so open_with_capability's predicate selects it"
+        );
+    }
+
+    /// Finding 2 — fail closed. A def tagged with an unknown dialect id (a typo, or a stale
+    /// user-editable auto file) must put NO bytes on the wire: the ACK'd path errors LOUDLY naming
+    /// the dialect, the fire-and-forget path silently no-ops — neither falls back to razer framing at
+    /// possibly-non-razer hardware. The mock transport panics on ANY I/O, so a regression to the old
+    /// razer fallback is caught as a panic, not a silent wrong-bytes pass.
+    #[test]
+    fn unknown_dialect_fails_closed_and_puts_no_bytes_on_the_wire() {
+        struct PanicOnIo;
+        impl Transport for PanicOnIo {
+            fn set_feature(&self, _buf: &[u8]) -> Result<()> {
+                panic!("unknown-dialect def must put NO bytes on the wire")
+            }
+            fn get_feature(&self, _buf: &mut [u8]) -> Result<()> {
+                panic!("unknown-dialect def must read NOTHING")
+            }
+        }
+        let mut def: DeviceDef =
+            toml::from_str(include_str!("../devices/razer-blackwidow-chroma-v2.toml")).unwrap();
+        def.dialect = "nope".into(); // a family we can't identify
+        let dev = Device {
+            def,
+            pid: 0x0221,
+            transport: Box::new(PanicOnIo),
+        };
+        // ACK'd path: an Err that names the offending dialect, raised BEFORE any transport I/O.
+        let err = dev
+            .exec_dynamic_tx(0x1f, 0x04, 0x85, 0x07, &[])
+            .expect_err("unknown dialect must fail closed, not razer-frame bytes");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("nope") && msg.contains("unknown dialect"),
+            "the error names the dialect and the refusal: {msg}"
+        );
+        // Fire-and-forget path: a pure no-op (PanicOnIo is never touched, so no panic).
+        dev.send_lighting_fast(&crate::lighting::Report {
+            class: 0x03,
+            id: 0x00,
+            args: vec![0, 0, 0],
+            tx: None,
+            size: None,
+        });
+        // Teardown restore path: `release_custody` fails closed the same way — an unknown family gets
+        // NO mode write, so a stream/app-exit teardown surface can't razer-frame a device-mode packet
+        // at possibly-non-razer hardware (the finding this hook exists to fix). Errors before any I/O.
+        let err = dev
+            .release_custody()
+            .expect_err("unknown dialect release must fail closed, not razer-frame a mode write");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("nope") && msg.contains("unknown dialect"),
+            "the release error names the dialect and the refusal: {msg}"
         );
     }
 

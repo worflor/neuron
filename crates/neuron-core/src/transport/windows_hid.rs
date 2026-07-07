@@ -6,6 +6,7 @@ use super::{DevicePath, HidDeviceInfo, Transport};
 use anyhow::{bail, Result};
 use std::ffi::c_void;
 use std::ptr;
+use std::sync::Mutex;
 use windows_sys::core::GUID;
 use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
     SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInterfaces, SetupDiGetClassDevsW,
@@ -24,9 +25,27 @@ use windows_sys::Win32::Storage::FileSystem::{
 
 const HIDP_OK: i32 = 0x0011_0000; // HIDP_STATUS_SUCCESS
 const GENERIC_READ_FLAG: u32 = 0x8000_0000; // GENERIC_READ — declared locally to dodge windows-sys path churn
+const GENERIC_WRITE_FLAG: u32 = 0x4000_0000; // GENERIC_WRITE — output reports need it (WriteFile)
+const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000; // async I/O flag (dwFlagsAndAttributes slot, not access)
+const ERROR_IO_PENDING: u32 = 997; // ReadFile returned 0 but the overlapped op is in flight
+const WAIT_OBJECT_0: u32 = 0; // WaitForSingleObject: the event signaled (read completed)
 
-// `ReadFile` isn't exported under this windows-sys feature set; declare it directly. It lives in
-// kernel32, which this crate already links (CreateFileW et al.), so the symbol resolves.
+// The Win32 OVERLAPPED control block for an async ReadFile. `Win32_System_IO` is NOT in this
+// crate's windows-sys feature set (see Cargo.toml — frozen manifest), so the struct AND its
+// helpers (CancelIo/GetOverlappedResult) are hand-declared here, exactly as `ReadFile` already is.
+// Layout matches the Win32 `OVERLAPPED` (the Offset/OffsetHigh union arm — we never use Pointer).
+#[repr(C)]
+struct Overlapped {
+    internal: usize,
+    internal_high: usize,
+    offset: u32,
+    offset_high: u32,
+    h_event: HANDLE,
+}
+
+// These aren't exported under this windows-sys feature set; declare them directly. They live in
+// kernel32, which this crate already links (CreateFileW et al.), so the symbols resolve. (Same
+// escape hatch the pre-existing `ReadFile` declaration uses.)
 #[link(name = "kernel32")]
 extern "system" {
     fn ReadFile(
@@ -36,6 +55,28 @@ extern "system" {
         read: *mut u32,
         overlapped: *mut c_void,
     ) -> i32;
+    fn WriteFile(
+        handle: HANDLE,
+        buf: *const c_void,
+        len: u32,
+        written: *mut u32,
+        overlapped: *mut c_void,
+    ) -> i32;
+    fn CreateEventW(
+        attrs: *const c_void,
+        manual_reset: i32,
+        initial_state: i32,
+        name: *const u16,
+    ) -> HANDLE;
+    fn WaitForSingleObject(handle: HANDLE, ms: u32) -> u32;
+    fn CancelIo(handle: HANDLE) -> i32;
+    fn GetOverlappedResult(
+        handle: HANDLE,
+        overlapped: *mut c_void,
+        transferred: *mut u32,
+        wait: i32,
+    ) -> i32;
+    fn GetLastError() -> u32;
 }
 
 unsafe fn wide_from_ptr(p: *const u16) -> Vec<u16> {
@@ -93,6 +134,10 @@ unsafe fn query(path: &[u16]) -> Option<HidDeviceInfo> {
                     usage_page: caps.UsagePage,
                     usage: caps.Usage,
                     feature_len: caps.FeatureReportByteLength,
+                    // The second wire surface's shape, from the SAME HIDP_CAPS the feature len comes
+                    // from — a HID++ family recognizes its 7/20-byte output/input reports by these.
+                    input_len: caps.InputReportByteLength,
+                    output_len: caps.OutputReportByteLength,
                     // `path` is the NUL-terminated wide buffer from `wide_from_ptr`; store it as the
                     // opaque key (NUL stripped) — `WinHid::open` re-adds it via `to_wide_nul`.
                     path: DevicePath::from_wide(path),
@@ -168,6 +213,17 @@ pub fn enumerate() -> Result<Vec<HidDeviceInfo>> {
 
 pub struct WinHid {
     handle: HANDLE,
+    /// Whether `handle` was opened with GENERIC_WRITE. The feature-report path (Get/SetFeature) is
+    /// FILE_ANY_ACCESS and works at access 0 either way; only `write_output` (a real WriteFile)
+    /// needs write access, so this lets it error HONESTLY when we only got the access-0 fallback.
+    can_write: bool,
+    /// Kept so `read_input` can lazily open its OWN overlapped read handle on first use (the trait
+    /// method takes `&self`). The proven feature-report handle can't do a timed read.
+    path: DevicePath,
+    /// Lazily-opened GENERIC_READ + FILE_FLAG_OVERLAPPED handle for `read_input`. `Mutex` gives the
+    /// interior mutability the `&self` trait method needs; `WinHid` is single-threaded per `Device`
+    /// so the lock is uncontended. `None` until the first `read_input`.
+    read_handle: Mutex<Option<HANDLE>>,
 }
 
 impl WinHid {
@@ -176,9 +232,14 @@ impl WinHid {
         // reproduces the exact wide buffer the enumeration path passed to `CreateFileW`.
         let wide = path.to_wide_nul();
         unsafe {
-            let h = CreateFileW(
+            // Prefer GENERIC_READ|GENERIC_WRITE: output reports (`write_output`) need write access.
+            // Windows denies R/W on a protected mouse/keyboard control collection, so FALL BACK to
+            // access 0 — the razer feature-report IOCTLs are FILE_ANY_ACCESS and are unaffected
+            // either way. `can_write` records which handle we ended up with.
+            let mut can_write = true;
+            let mut h = CreateFileW(
                 wide.as_ptr(),
-                0,
+                GENERIC_READ_FLAG | GENERIC_WRITE_FLAG,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 ptr::null(),
                 OPEN_EXISTING,
@@ -186,9 +247,26 @@ impl WinHid {
                 ptr::null_mut(),
             );
             if h == INVALID_HANDLE_VALUE {
+                can_write = false;
+                h = CreateFileW(
+                    wide.as_ptr(),
+                    0,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    ptr::null(),
+                    OPEN_EXISTING,
+                    0,
+                    ptr::null_mut(),
+                );
+            }
+            if h == INVALID_HANDLE_VALUE {
                 bail!("CreateFile on control interface failed");
             }
-            Ok(WinHid { handle: h })
+            Ok(WinHid {
+                handle: h,
+                can_write,
+                path: path.clone(),
+                read_handle: Mutex::new(None),
+            })
         }
     }
 }
@@ -197,6 +275,10 @@ impl Drop for WinHid {
     fn drop(&mut self) {
         unsafe {
             CloseHandle(self.handle);
+            // Close the lazily-opened overlapped read handle too, if `read_input` ever opened one.
+            if let Some(rh) = *self.read_handle.lock().unwrap() {
+                CloseHandle(rh);
+            }
         }
     }
 }
@@ -282,5 +364,97 @@ impl Transport for WinHid {
             }
         }
         Ok(())
+    }
+
+    fn write_output(&self, buf: &[u8]) -> Result<()> {
+        // Output reports are a real WriteFile, which needs the GENERIC_WRITE handle. If `open` only
+        // got the access-0 fallback (protected collection), say so instead of silently no-op'ing —
+        // the razer feature-report path is unaffected, but HID++ cannot ride this collection.
+        if !self.can_write {
+            bail!("output report needs a GENERIC_WRITE handle; this collection opened access-0 only");
+        }
+        unsafe {
+            let mut written: u32 = 0;
+            if WriteFile(
+                self.handle,
+                buf.as_ptr() as *const c_void,
+                buf.len() as u32,
+                &mut written,
+                ptr::null_mut(),
+            ) == 0
+            {
+                bail!("WriteFile (output report) failed");
+            }
+        }
+        Ok(())
+    }
+
+    fn read_input(&self, buf: &mut [u8], timeout_ms: u32) -> Result<usize> {
+        // A timed input-report read. The control handle is synchronous (a blocking ReadFile could
+        // hang a probe thread forever if the reply never comes), so we use a SEPARATE handle opened
+        // GENERIC_READ + FILE_FLAG_OVERLAPPED and enforce the timeout with WaitForSingleObject +
+        // CancelIo. Opened lazily on first use (many devices never speak the output/input surface)
+        // and cached in `read_handle`. Contained here — the proven feature-report path never sees it.
+        let mut slot = self.read_handle.lock().unwrap();
+        if slot.is_none() {
+            let wide = self.path.to_wide_nul();
+            unsafe {
+                let rh = CreateFileW(
+                    wide.as_ptr(),
+                    GENERIC_READ_FLAG,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    ptr::null(),
+                    OPEN_EXISTING,
+                    FILE_FLAG_OVERLAPPED,
+                    ptr::null_mut(),
+                );
+                if rh == INVALID_HANDLE_VALUE {
+                    bail!("CreateFile (overlapped input read) failed — collection is OS-protected or busy");
+                }
+                *slot = Some(rh);
+            }
+        }
+        let rh = slot.expect("read handle opened just above");
+        drop(slot); // HANDLE is Copy — don't hold the lock across the blocking wait
+        unsafe {
+            // Manual-reset, initially non-signaled event for the overlapped completion.
+            let ev = CreateEventW(ptr::null(), 1, 0, ptr::null());
+            if ev.is_null() {
+                bail!("CreateEvent for overlapped read failed");
+            }
+            let mut ov: Overlapped = std::mem::zeroed();
+            ov.h_event = ev;
+            let mut got: u32 = 0;
+            let ov_ptr = &mut ov as *mut Overlapped as *mut c_void;
+            let started = ReadFile(
+                rh,
+                buf.as_mut_ptr() as *mut c_void,
+                buf.len() as u32,
+                &mut got,
+                ov_ptr,
+            );
+            if started == 0 {
+                let err = GetLastError();
+                if err != ERROR_IO_PENDING {
+                    CloseHandle(ev);
+                    bail!("ReadFile (overlapped input) failed: {err}");
+                }
+                // In flight: wait the caller's bounded patience.
+                if WaitForSingleObject(ev, timeout_ms) != WAIT_OBJECT_0 {
+                    // Timed out. Cancel and REAP the op (so `buf`/`ov` are safe to drop) before
+                    // returning — a dangling overlapped read into a stack buffer is a use-after-free.
+                    CancelIo(rh);
+                    let _ = GetOverlappedResult(rh, ov_ptr, &mut got, 1 /* bWait */);
+                    CloseHandle(ev);
+                    bail!("read_input timed out after {timeout_ms} ms");
+                }
+                if GetOverlappedResult(rh, ov_ptr, &mut got, 0) == 0 {
+                    CloseHandle(ev);
+                    bail!("GetOverlappedResult (input read) failed");
+                }
+            }
+            CloseHandle(ev);
+            Ok(got as usize)
+        }
     }
 }

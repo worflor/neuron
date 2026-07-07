@@ -391,11 +391,12 @@ fn lit_devices(reg: &Registry) -> Vec<(DeviceDef, u16, transport::DevicePath)> {
     let mut seen = std::collections::BTreeSet::new();
     if let Ok(infos) = transport::enumerate() {
         for i in &infos {
-            if let Some(def) = reg.find_by_pid(i.vid, i.pid) {
-                if def.matches_control(i.usage_page, i.usage, i.feature_len)
-                    && def.lighting.is_some()
-                    && seen.insert(i.pid)
-                {
+            // find_for_pipe: the def that DRIVES this pipe (its family's control-pipe rule), so a
+            // two-family pid resolves each pipe to the family that can actually paint it.
+            if let Some(def) = reg.find_for_pipe(i) {
+                // one lighting row per (pid, family) — two families on one pid are two independently-
+                // drivable lighting planes, and the pid-only key silently dropped the second (review-caught).
+                if def.lighting.is_some() && seen.insert((i.pid, def.dialect.clone())) {
                     out.push((def.clone(), i.pid, i.path.clone()));
                 }
             }
@@ -413,27 +414,33 @@ fn lit_devices(reg: &Registry) -> Vec<(DeviceDef, u16, transport::DevicePath)> {
 /// Unit semantics mirror the GUI's `open_selected`: when the named unit is PRESENT, it is the
 /// only acceptable match — a twin must never answer for it. Only when the unit is entirely gone
 /// from the enumeration (unplugged/re-ported since the scan) does the match relax to pid-level,
-/// the same "selection follows reality" healing the app does.
-fn open_selected_device(reg: &Registry, pid: u16, unit: &str) -> Option<Device> {
+/// the same "selection follows reality" healing the app does. `dialect` is the selected control
+/// PLANE's family (same accept rule as the app's `resolve_plane`): empty = any family (the
+/// stateless caller / no selection), else only a pipe whose def speaks that family qualifies — so
+/// a future multi-family unit captures the exact plane the user picked, not first-family-wins.
+fn open_selected_device(reg: &Registry, pid: u16, unit: &str, dialect: &str) -> Option<Device> {
     if pid == 0 {
         return None;
     }
     let infos = transport::enumerate().ok()?;
+    // A pipe is acceptable iff it's the SELECTED pid AND some family resolves it as a control pipe
+    // (find_for_pipe = pipe-precise, family-aware) whose dialect matches the selected PLANE (empty
+    // dialect = any family — the stateless CLI passes "").
     let matches = |i: &transport::HidDeviceInfo| {
         i.pid == pid
             && reg
-                .find_by_pid(i.vid, i.pid)
-                .is_some_and(|def| def.matches_control(i.usage_page, i.usage, i.feature_len))
+                .find_for_pipe(i)
+                .is_some_and(|def| dialect.is_empty() || def.dialect == dialect)
     };
     if !unit.is_empty() {
         if let Some(i) = infos.iter().find(|i| matches(i) && i.instance() == unit) {
-            let def = reg.find_by_pid(i.vid, i.pid)?.clone();
+            let def = reg.find_for_pipe(i)?.clone();
             return Device::open_path(def, i.pid, &i.path).ok();
         }
         // named unit not enumerated — heal to pid-level below.
     }
     let i = infos.iter().find(|i| matches(i))?;
-    let def = reg.find_by_pid(i.vid, i.pid)?.clone();
+    let def = reg.find_for_pipe(i)?.clone();
     Device::open_path(def, i.pid, &i.path).ok()
 }
 
@@ -441,10 +448,14 @@ fn open_selected_device(reg: &Registry, pid: u16, unit: &str) -> Option<Device> 
 /// `profile save` and the GUI's "capture" button call, so a captured profile is byte-identical no
 /// matter which client took it. Reads only; each capability is best-effort (an absent/asleep device
 /// simply leaves that field `None`). `gaming` carries the host-side Key-Guard toggles (not a device
-/// read) and `persist` records the volatile-vs-onboard intent. `selected_pid` + `selected_unit`
-/// are the GUI's picked physical device (pid 0 / empty unit = no selection → capability-based
-/// first match, which is what the stateless CLI passes); the unit is what keeps capture on the
-/// exact board the UI is editing when two identical devices share a pid.
+/// read) and `persist` records the volatile-vs-onboard intent. `selected_pid` + `selected_unit` +
+/// `selected_dialect` are the GUI's picked CONTROL PLANE (pid 0 / empty unit / empty dialect = no
+/// selection → capability-based first match, which is what the stateless CLI passes); the unit
+/// keeps capture on the exact board when two identical devices share a pid, and the dialect keeps
+/// it on the exact family plane when one unit exposes several. Capture reads the user's selected
+/// plane: a plane without numeric getters captures none (honest — you captured what that plane
+/// does), and the no-selection fallback stays capability-based (`open_with_command("dpi")`), the
+/// capability-aware resolution the review asked about.
 pub fn capture_from_devices(
     reg: &Registry,
     name: &str,
@@ -452,6 +463,7 @@ pub fn capture_from_devices(
     persist: bool,
     selected_pid: u16,
     selected_unit: &str,
+    selected_dialect: &str,
 ) -> Profile {
     let mut p = Profile {
         name: name.to_string(),
@@ -466,14 +478,18 @@ pub fn capture_from_devices(
     // captures the device the user is looking at — down to the exact physical unit of a duplicate
     // pair — not whatever enumerates first); with no selection (the stateless CLI, pid 0) fall back
     // to the first dpi-capable device.
-    let numeric = open_selected_device(reg, selected_pid, selected_unit)
+    let numeric = open_selected_device(reg, selected_pid, selected_unit, selected_dialect)
         .or_else(|| Device::open_with_command(reg, "dpi").ok());
     if let Some(d) = numeric {
         if let Ok((x, _)) = crate::capability::dpi(&d) {
             p.dpi = Some(x);
         }
-        if let Ok(s) = d.run("dpi_stages") {
-            p.dpi_stages = decode_dpi_stages(&s);
+        // Active-first (0x04/0x86 = the user's REAL cycle), slot-table fallback (0x04/0x83) for
+        // boards without 0x86 — snapshotting the FACTORY slots is how a captured profile replayed
+        // factory stages over the user's onboard cycle on every apply (live incident 2026-07-07).
+        // The decode below fits both replies (identical layout; the CLI relies on that same fit).
+        if let Ok(s) = d.run("dpi_stages_active").or_else(|_| d.run("dpi_stages")) {
+            p.dpi_stages = writes::decode_dpi_stages(&s);
         }
         if let Ok(hz) = crate::capability::polling_rate_hz(&d) {
             p.polling_hz = Some(hz);
@@ -489,28 +505,6 @@ pub fn capture_from_devices(
     // stack and core can't synthesize that from a device's current effect register. `p.lighting` stays
     // at its default (empty) — a captured profile leaves lighting alone unless the caller sets a stack.
     p
-}
-
-/// Decode a DPI stage-table getter reply into the list of X resolutions (the cycle) — the inverse of
-/// `writes::build_dpi_stages_payload`, matching the device layout
-/// `[varstore, active_idx, count, {stage_id, X_hi, X_lo, Y_hi, Y_lo, 0, 0} * count]`. Zero-DPI
-/// records (empty hardware slots) are skipped. Pure (slice in, Vec out) so it needs no hardware.
-fn decode_dpi_stages(s: &[u8]) -> Vec<u16> {
-    if s.len() < 3 {
-        return Vec::new();
-    }
-    let count = s[2] as usize;
-    let mut out = Vec::new();
-    for i in 0..count {
-        let off = 3 + i * 7;
-        if off + 2 < s.len() {
-            let x = ((s[off + 1] as u16) << 8) | s[off + 2] as u16;
-            if x > 0 {
-                out.push(x);
-            }
-        }
-    }
-    out
 }
 
 /// Names of all saved profiles.

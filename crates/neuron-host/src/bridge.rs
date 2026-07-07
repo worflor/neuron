@@ -207,12 +207,13 @@ fn discover_from(hids: &[HidDeviceInfo], reg: &Registry) -> Vec<Discovered> {
     }
     let mut matched: Vec<Matched> = Vec::new();
     for hid in hids {
-        let Some(def) = reg.find_by_pid(hid.vid, hid.pid) else {
+        // find_for_pipe: resolve the def that DRIVES this exact collection as its control pipe
+        // (family-aware). Discovery matches per-pipe then collapses collections to one physical
+        // unit, so on a two-family pid each control pipe reaches the family that can paint it,
+        // rather than find_by_pid's first-by-pid def which could be the other family entirely.
+        let Some(def) = reg.find_for_pipe(hid) else {
             continue;
         };
-        if !def.matches_control(hid.usage_page, hid.usage, hid.feature_len) {
-            continue;
-        }
         if def.lighting.is_none() {
             continue; // not a paintable surface
         }
@@ -726,6 +727,9 @@ mod tests {
             usage_page,
             usage,
             feature_len,
+            // Wave-3 output/input surface (HID++): irrelevant to these razer_report bridge tests.
+            input_len: 0,
+            output_len: 0,
             path: neuron::transport::DevicePath::from_str_for_tests(path),
             product: String::new(),
         }
