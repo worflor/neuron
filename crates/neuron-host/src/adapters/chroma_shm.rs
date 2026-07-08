@@ -889,6 +889,11 @@ pub mod server {
         /// a writable view is still readable. Sections that don't exist yet (game/
         /// on-demand) are simply skipped. Errors only if nothing could be opened
         /// (no server running).
+        ///
+        /// The app only ever calls [`ShmServer::create`] — read-alongside a live
+        /// Razer server would double-write the LEDs, exactly the last-writer-wins
+        /// race this whole adapter exists to kill. `open` is kept for capture and
+        /// diagnostic tooling that wants to observe a real server's traffic.
         pub fn open() -> io::Result<Self> {
             let mut sections = Vec::new();
             for o in OBJECTS.iter().filter(|o| o.origin == Origin::ServerCreated) {
@@ -1462,8 +1467,8 @@ pub mod server {
     unsafe impl Send for ShmServer {}
     unsafe impl Sync for ShmServer {}
 
-    use crate::adapters::chroma::GameLightingPolicy;
     use crate::arbiter::{BlendMode, LiveContent, Rgb};
+    use crate::paint::{merge_cells, FadeRamp, PaintPolicy};
     use std::sync::Arc;
     use std::time::Instant;
 
@@ -1484,10 +1489,8 @@ pub mod server {
         leds: usize,
         /// Last decoded game frame, carried forward on a torn/absent read.
         last: Vec<Option<Rgb>>,
-        /// Current fade level in `[0,1]`, ramped toward `present` each render.
-        alpha: f32,
-        /// `render`'s previous `Instant`, for the time-based fade ramp.
-        last_now: Option<Instant>,
+        /// Framerate-independent crossfade toward present/absent (shared engine).
+        ramp: FadeRamp,
         /// Cached "a game process is alive" and when last checked (a syscall, throttled
         /// to [`PRESENCE_POLL`]). One of two independent liveness signals.
         present: bool,
@@ -1499,8 +1502,8 @@ pub mod server {
         /// out when BOTH say the game is gone.
         last_ts: u32,
         last_ts_change: Option<Instant>,
-        /// Shared game-lighting policy: blend, intensity, fade, and device scope.
-        policy: Arc<GameLightingPolicy>,
+        /// Shared game-lighting policy: blend, strength, fade, and device scope.
+        policy: Arc<PaintPolicy>,
     }
 
     /// How many leading decoded units to skip before physical LED 0, by device CLASS —
@@ -1533,7 +1536,7 @@ pub mod server {
             key: String,
             device_type: u8,
             leds: usize,
-            policy: Arc<GameLightingPolicy>,
+            policy: Arc<PaintPolicy>,
             initial_alpha: f32,
         ) -> Self {
             ChromaShmLayer {
@@ -1542,8 +1545,7 @@ pub mod server {
                 device_type,
                 leds,
                 last: vec![None; leds],
-                alpha: initial_alpha,
-                last_now: None,
+                ramp: FadeRamp::new(initial_alpha),
                 present: false,
                 last_present_check: None,
                 last_ts: 0,
@@ -1601,29 +1603,19 @@ pub mod server {
             };
 
             // Ramp alpha toward the target by elapsed time (framerate-independent).
-            let dt = self
-                .last_now
-                .map(|t| now.duration_since(t).as_secs_f32())
-                .unwrap_or(0.0)
-                .min(0.25);
-            self.last_now = Some(now);
-            let fade_secs = self.policy.fade_secs();
-            let step = if fade_secs > 0.0 { dt / fade_secs } else { 1.0 };
-            if self.alpha < target {
-                self.alpha = (self.alpha + step).min(target);
-            } else if self.alpha > target {
-                self.alpha = (self.alpha - step).max(target);
-            }
+            let value = self.ramp.advance(now, target, self.policy.fade_secs());
 
             // Fully faded out → contribute nothing (the base shows untouched, cheaply).
-            if self.alpha <= 0.001 {
+            if value <= 0.001 {
                 return vec![None; self.leds];
             }
-            self.last.clone()
+            // Apply the mode-aware black rule so a mostly-black Multiply ("TINT")
+            // frame doesn't black out the base — the same rule every face uses.
+            merge_cells(self.policy.blend_mode(), &self.last)
         }
 
         fn alpha(&self) -> f32 {
-            self.alpha * self.policy.alpha()
+            self.ramp.value() * self.policy.alpha()
         }
 
         fn blend_mode(&self) -> BlendMode {
@@ -1637,8 +1629,7 @@ pub mod server {
                 device_type: self.device_type,
                 leds: self.leds,
                 last: self.last.clone(),
-                alpha: self.alpha,
-                last_now: self.last_now,
+                ramp: self.ramp.clone(),
                 present: self.present,
                 last_present_check: self.last_present_check,
                 last_ts: self.last_ts,

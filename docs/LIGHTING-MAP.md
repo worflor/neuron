@@ -140,11 +140,11 @@ stop loop (neither clears host bases nor restarts non-selected boards → their 
 *Fix shape:* iterate every persisted `[lighting.*]` stack (not the selection) on host toggle,
 restore, and profile apply — one shared "re-seat all boards" helper replacing the three copies.
 
-🟡 **Chroma custom effects black out the base.** Chroma CUSTOM frames decode zeros as BLACK (not
-transparent) at SESSION band — a game lighting 3 keys covers the user's animated base entirely.
-Chroma-authentic, but contradicts the "game lights six keys while the base keeps the rest"
-narrative; OpenRGB short updates DO fall through. Decide: document as authentic, or add optional
-zero=transparent keying per session.
+✅ **FIXED — Chroma custom effects no longer black out the base.** Chroma CUSTOM frames still
+decode zeros as BLACK, but the paint-policy rework's merge-mode black rule (`paint.rs::merge_cells`)
+now treats a painted-black cell as transparent in every non-Over blend mode — the same rule both
+protocol families obey — and the Chroma REST server's default policy blend is `Screen`, not `Over`,
+so out of the box a game lighting 3 keys no longer covers the user's animated base at SESSION band.
 
 🟡 **Sink latch-on-release shows a dead session's last frame when no base exists.** The
 "all-None → leave the silicon latched" rule means teardown only LOOKS clean when a base layer

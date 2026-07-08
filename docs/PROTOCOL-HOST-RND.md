@@ -488,14 +488,25 @@ residual (what neither captured). Map directly onto a supervision hierarchy:
   was absorbed at each tier vs. leaked to residual. A rising residual ratio = the
   system is failing in ways our supervisors don't model yet.
 
-### 6.5 Reconstructable state (AR(2)'s deepest lesson)
-The codec proves a rich stream reduces to **2 numbers + a recurrence** and
-reconstructs. Host philosophy: **authoritative state = a small set of declarations**
-(which layers exist, owners, priorities, bindings), persisted as a tiny append-only
-log / compact snapshot. On restart: **replay declarations → identical state.** No
-big fragile serialized heap. "Immortal" = death is cheap because rebirth is a
-replay of a compact seed. (Mirrors how a `.gwyph` block reconstructs a trajectory
-from K/G + residual.)
+### 6.5 Reconstructable state — corrected after implementation
+The original idea here (kept for the record): a rich stream reduces to a tiny
+seed and reconstructs, the way a `.gwyph` block reconstructs a trajectory from
+K/G + residual, so mirror that at the host — a declaration log that replays to
+identical state on restart. A `journal` module was built to this spec and was
+fully unit-tested (replay, compaction, named-layer supersession) — but nothing
+in production ever fed it, and it was deleted (2026-07-07).
+
+Why it could never carry the load: every real layer's content is
+`Content::Live` (closures, not data) — the app's animated base, the Chroma REST
+fade ramp, the OpenRGB `PolicyLayer`. A data journal can't replay a closure by
+construction, so a "durable declarations only" journal could only ever cover a
+sliver of state (static pinned fills) while the layers that actually matter
+stayed outside it. What rebirth actually does, and what turned out to be
+sufficient: replay the SEED (declared surfaces only — `shell.rs`'s `seed: Vec
+<SurfaceInfo>`), and let each owner re-assert its own content on its own
+schedule — the Chroma REST heartbeat, the OpenRGB pump's idle-tick `reassert`,
+the SHM refresh, the app-base heartbeat. Recovery is owner-driven, not
+seed-driven; the seed only has to be enough for surfaces to exist again.
 
 ### 6.6 Everything is a signal on a bus
 Eigenmotion decomposition factors a raw stream into interpretable bands; the host
@@ -571,6 +582,9 @@ macro engine are just two of its subscribers.
 
 ### 8.1 Progress ledger
 - **DONE (this branch):** kernel (arbiter/bus/journal/governor, 26 tests) →
+  (the journal was later deleted, 2026-07-07 — see §6.5: fully built and
+  tested, but never fed by production code, since real content is
+  `Content::Live` and can't be journaled) →
   `api.rs` HostApi seam (Kernel sync + HostHandle channel impls) → `shell.rs`
   actor w/ rebirth-from-seed + governor pacing + observable sweep →
   `writer.rs` single-writer w/ dedup + deadline pacing + MockSink →
@@ -606,8 +620,11 @@ macro engine are just two of its subscribers.
   as a per-session port in some client flows; future pump can bind them);
   (8) /chromasdk root accepted without /razer prefix; (9) session-info GET;
   (10) grid_to_cells bounds-guarded (mis-declared surface degrades, never
-  panics). DEFERRED (documented): DEVICE_LIST_UPDATED push on hotplug (pump
-  plumbing), OpenRGB reference-strict data_size validation (we're more
+  panics). IMPLEMENTED (2026-07-07, was DEFERRED here): DEVICE_LIST_UPDATED
+  push on hotplug — `OrgbConn::check_hotplug` fingerprints the surface list
+  (name + led count) and the pump's idle tick sends the packet exactly on a
+  change, never on the first tick. DEFERRED (documented): OpenRGB
+  reference-strict data_size validation (we're more
   lenient, safe), CUSTOM_KEY key-code translation, audit-1's claim that the
   real server accepts CHROMA_WAVE-style names over REST (audit-2's read of
   the official docs says only the five custom/static names exist — capture/
@@ -758,6 +775,23 @@ macro engine are just two of its subscribers.
   registry app-gating. The `chroma_shm` adapter is implemented in
   `crates/neuron-host/src/adapters/chroma_shm.rs` (elevation: `Global\` needs
   SeCreateGlobalPrivilege).
+- **DONE: the external paint policy rework (2026-07-07).** `paint.rs` now
+  holds `PaintPolicy`/`PolicyLayer`/`FadeRamp`/`merge_cells`: every external
+  claim (Chroma REST, OpenRGB) rides through a policy-driven layer instead of
+  painting raw, so blend mode, strength, fade, and per-device scope are real
+  settings, not always-opaque `Over`. Fade now runs on the Chroma REST face;
+  in every non-Over merge mode a painted-black cell is treated as transparent
+  (one rule for all merges, so a client's "black" doesn't fight the base).
+  OpenRGB claims are policy-wrapped `Live` content and obey a SECOND policy
+  instance, independent of the Chroma REST lane. The app grew two pref lanes
+  (one policy per protocol family) plus a universal hands-off device list, and
+  a real "my lighting always wins": the base can claim `band::OVERRIDE` to sit
+  above sessions outright. Status surfacing got honest about muted clients and
+  needs-elevation state, refreshes on a bus poke instead of only on a timer,
+  and re-claims by seq when a native game activates. The Lighting page's merge
+  controls moved to a VISITORS section (Settings→CONNECTIONS stayed
+  transport-only). See `crates/neuron-host/src/paint.rs` and
+  `adapters/openrgb.rs::OrgbConn` for the shapes.
 - **⚠ note:** the WIP snapshot needed the gitignored `runtime/` dir copied
   from the main tree (neuron-core include_str!s the Python host files);
   remember this for fresh worktrees.

@@ -1,5 +1,5 @@
 import { Theme } from "../theme.slint";
-import { Card, SectionTitle, Label, Button, Field, Slider, Pill, Mono, Divider, PanelHead, ActionPicker, SplitToggle, SplitButton, TriggerWell, ConfirmButton, InputHead } from "../widgets/controls.slint";
+import { Card, SectionTitle, Label, Button, Field, Slider, Pill, Mono, Divider, PanelHead, ActionPicker, SplitToggle, SplitButton, TriggerWell, ConfirmButton, InputHead, SelectableRow, GuideButton, ColorPicker, SubLabel, Palette } from "../widgets/controls.slint";
 import { State } from "../state.slint";
 import { RadialSector, GlyphChip } from "../models.slint";
 
@@ -148,28 +148,17 @@ export component SpellweavingPanel inherits VerticalLayout {
             // The defaults (tap·hold → teleport) are seeded from cast.toml's rhythm_actions.
             for rb in State.rhythm-binds : VerticalLayout {
                 spacing: 6px;
-                Rectangle {
-                    height: root.rhythm-row-h;
-                    border-radius: Theme.radius-sm;
-                    property <bool> target: State.rhythm-bind-target == rb.taps;
-                    background: self.target ? Theme.accent-glow : (rhyrow-ta.has-hover ? Theme.well : Theme.bg-2);
-                    border-width: Theme.hair;
-                    border-color: self.target ? Theme.accent-line : (rhyrow-ta.has-hover ? Theme.text-faint : Theme.line);
-                    animate background, border-color { duration: Theme.quick; }
-                    rhyrow-ta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { if (State.rhythm-bind-target == rb.taps) { State.rhythm-bind-target = -1; } else { State.bind-rhythm(rb.taps); } } }
-                    HorizontalLayout {
-                        padding-left: 13px; padding-right: 9px; spacing: 11px;
-                        VerticalLayout { alignment: center; width: 84px;
-                            Text { text: rb.label; color: rb.bound ? Theme.text-mid : Theme.text-faint; font-family: Theme.mono; font-size: Theme.fs-data; font-weight: 700; letter-spacing: 2px; vertical-alignment: center; }
-                        }
-                        VerticalLayout { alignment: center; Mono { text: "→"; color: Theme.text-faint; } }
-                        VerticalLayout { alignment: center; horizontal-stretch: 1;
-                            Text { text: rb.bound ? rb.desc : "unbound · click to bind"; color: rb.bound ? Theme.text : Theme.text-faint; font-family: Theme.mono; font-size: Theme.fs-body; vertical-alignment: center; overflow: elide; }
-                        }
-                        // a teleport / whiteboard rhythm keeps its TRY shortcut (opens the instrument now).
-                        if rb.desc == "teleport" : VerticalLayout { alignment: center; Button { text: "try"; clicked => { State.try-teleport(); } } }
-                        if rb.desc == "whiteboard" : VerticalLayout { alignment: center; Button { text: "try"; clicked => { State.try-whiteboard(); } } }
-                    }
+                // the shared pick-one SelectableRow: the rhythm symbols ride the leading tag, the bound
+                // action is the label, and a teleport/whiteboard rhythm keeps its TRY key in the
+                // trailing slot. `two-line` holds the taller control-row height (the folded rhythm-row-h).
+                SelectableRow {
+                    lead: rb.label;
+                    label: rb.bound ? rb.desc : "unbound · click to bind";
+                    selected: State.rhythm-bind-target == rb.taps;
+                    two-line: true;
+                    clicked => { if (State.rhythm-bind-target == rb.taps) { State.rhythm-bind-target = -1; } else { State.bind-rhythm(rb.taps); } }
+                    if rb.desc == "teleport" : VerticalLayout { alignment: center; Button { text: "try"; clicked => { State.try-teleport(); } } }
+                    if rb.desc == "whiteboard" : VerticalLayout { alignment: center; Button { text: "try"; clicked => { State.try-whiteboard(); } } }
                 }
                 // INLINE editor — opens beneath THIS rhythm's row when it's the selected target.
                 if State.rhythm-bind-target == rb.taps : Card {
@@ -350,7 +339,9 @@ export component SpellweavingPanel inherits VerticalLayout {
                     height: savelink.preferred-height;
                     savelink := Mono {
                         text: State.gesture-status;
-                        color: savearea.has-hover ? Theme.accent : Theme.capture;
+                        // hover is not a live/active signal — brighten WITHIN the capture hue rather
+                        // than swapping to the phosphor accent (accent stays reserved for live state).
+                        color: savearea.has-hover ? Theme.capture.brighter(0.35) : Theme.capture;
                     }
                     savearea := TouchArea {
                         mouse-cursor: MouseCursor.pointer;
@@ -368,51 +359,24 @@ export component SpellweavingPanel inherits VerticalLayout {
                 spacing: 5px;
                 for g in State.glyphs : VerticalLayout {
                     spacing: 6px;
-                    Rectangle {
-                        height: 40px;
-                        border-radius: Theme.radius-sm;
-                        property <bool> becoming: State.capturing-gesture && g.name == State.gesture-predict;
-                        property <bool> target: g.name == State.gesture-bind-target;
-                        background: self.target || self.becoming ? Theme.accent-glow
-                            : (gta.has-hover ? Theme.well : Theme.bg-2);
-                        border-width: Theme.hair;
-                        border-color: self.target || self.becoming ? Theme.accent-line
-                            : (gta.has-hover ? Theme.text-faint : Theme.line);
-                        animate background, border-color { duration: Theme.quick; }
-                        gta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { if (State.gesture-bind-target == g.name) { State.gesture-bind-target = ""; } else { State.bind-gesture(g.name); } } }
-                        // the live PREDICTION reads distinctly from a steady editor selection
-                        Rectangle {
-                            x: 0; width: 2px; y: 6px; height: parent.height - 12px;
-                            background: parent.becoming ? Theme.accent : transparent;
-                            animate background { duration: Theme.quick; }   // fade with the parent row's glow (line above), not a snap against it
-                        }
-                        HorizontalLayout {
-                            padding-left: 11px; padding-right: 11px; spacing: 10px;
-                            // bound lamp — a glyph wired to an action genuinely is a live rule
-                            VerticalLayout {
-                                alignment: center;
-                                Rectangle {
-                                    width: 5px; height: 5px; border-radius: 3px;
-                                    background: g.bound ? Theme.accent : Theme.line;
-                                }
-                            }
-                            VerticalLayout {
-                                alignment: center;
-                                horizontal-stretch: 1;
-                                Text {
-                                    text: g.name;
-                                    color: g.bound ? Theme.text : Theme.text-mid;
-                                    font-size: Theme.fs-body; font-family: Theme.mono; font-weight: 600;
-                                    overflow: elide;
-                                }
-                            }
-                            VerticalLayout {
-                                alignment: center;
-                                Mono {
-                                    text: g.bound ? "→ " + g.action : "unbound";
-                                    color: g.bound ? Theme.text-dim : Theme.text-faint;
-                                    overflow: elide;
-                                }
+                    // the shared pick-one SelectableRow: the bound lamp is the leading dot, the glyph
+                    // name the label, and its "→ action" readout the trailing slot. `selected` covers
+                    // BOTH a steady editor selection AND the live prediction (the old hand-rolled 2px
+                    // `becoming` bar is now the built-in SelectTick, lit accent for either).
+                    SelectableRow {
+                        lamp: true;
+                        lamp-on: g.bound;
+                        label: g.name;
+                        selected: g.name == State.gesture-bind-target
+                            || (State.capturing-gesture && g.name == State.gesture-predict);
+                        two-line: true;
+                        clicked => { if (State.gesture-bind-target == g.name) { State.gesture-bind-target = ""; } else { State.bind-gesture(g.name); } }
+                        VerticalLayout {
+                            alignment: center;
+                            Mono {
+                                text: g.bound ? "→ " + g.action : "unbound";
+                                color: g.bound ? Theme.text-dim : Theme.text-faint;
+                                overflow: elide;
                             }
                         }
                     }
@@ -497,6 +461,8 @@ export component SpellweavingPanel inherits VerticalLayout {
                 // near-miss snaps to the closest spell, clear-winner only). Casts show "(assist)" when it
                 // helped. The engine's `assist` margin IS this slider — a bool would throw the dimension out.
                 VerticalLayout { alignment: center; horizontal-stretch: 0; Mono { text: "ASSIST"; color: Theme.text-dim; } }
+                // the book button — opens the SPELL ASSIST guide (what the forgiveness margin does)
+                VerticalLayout { alignment: center; GuideButton { guide-id: "spell-assist"; } }
                 VerticalLayout {
                     alignment: center;
                     width: 104px;
@@ -811,4 +777,5 @@ export component SpellweavingPanel inherits VerticalLayout {
             }
         }
     }
+
 }

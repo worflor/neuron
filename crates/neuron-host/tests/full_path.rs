@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use neuron_host::adapters::openrgb::{ids, packet, OrgbConn};
 use neuron_host::api::{HostApi, LeaseSpec, SurfaceInfo, SurfaceKind};
 use neuron_host::arbiter::{band, Content, Rgb};
+use neuron_host::paint::PaintPolicy;
 use neuron_host::shell::Host;
 use neuron_host::writer::{MockSink, Writer};
 
@@ -62,7 +63,9 @@ fn wire_bytes_to_device_frames_with_clean_fallback() {
     // An OpenRGB client connects (its own handle = its own channel into the
     // one kernel) and paints the board red over the wire.
     let mut client_side = host.handle();
-    let mut conn = OrgbConn::new(&mut client_side);
+    // Opaque policy: paint shows exactly as sent, no fade — so the writer records
+    // only all-green or all-red frames (the atomic-resolution assertion below).
+    let mut conn = OrgbConn::new(&mut client_side, PaintPolicy::opaque());
     let mut payload = Vec::new();
     payload.extend_from_slice(&0u32.to_le_bytes());
     payload.extend_from_slice(&4u16.to_le_bytes());

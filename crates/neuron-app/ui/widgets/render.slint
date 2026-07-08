@@ -1,5 +1,5 @@
 import { Theme } from "../theme.slint";
-import { Mono } from "controls.slint";
+import { Pill } from "controls.slint";
 
 // DEVICE RENDER — the auto-generated picture of the peripheral itself, LEDs live.
 //
@@ -247,11 +247,12 @@ export component DeviceRender inherits Rectangle {
                 }
             }
         }
-        // honesty note: zone positions are approximate (the registry knows counts, not microns)
-        Mono {
-            text: "~ zones approximate";
-            color: Theme.text-faint;
-            font-size: Theme.fs-small;
+        // honesty note: zone positions are approximate (the registry knows counts, not microns).
+        // Dressed as the established caveat idiom — a small text-faint Pill, kin to "FIXED IN FIRMWARE"
+        // on the device pane — so a rendered qualifier reads as a real chip, not a bare raw-offset label.
+        Pill {
+            text: "ZONES APPROXIMATE";
+            tint: Theme.text-faint;
             x: parent.width - self.width - 6px;
             y: parent.height - self.height - 4px;
         }

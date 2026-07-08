@@ -13,10 +13,15 @@
 //!   outside it, so commands queued during a fault survive and are served by
 //!   the reborn kernel (the command that *caused* the fault is consumed — its
 //!   caller sees a dropped reply, which is the honest answer);
-//! - rebirth replays the SEED (declared surfaces — the journal lesson: durable
-//!   state is a small set of declarations). Leased claims are deliberately NOT
-//!   reborn: sessions must re-claim, exactly the lease contract, so a fault
-//!   can never resurrect a dead session's paint;
+//! - rebirth replays the SEED (declared surfaces only). Leased claims are
+//!   deliberately NOT reborn: sessions must re-claim, exactly the lease
+//!   contract, so a fault can never resurrect a dead session's paint. There is
+//!   no data journal behind this: every owner (app base, Chroma REST, Chroma
+//!   SHM, OpenRGB) already carries its own tested reassert/recovery path —
+//!   a REST heartbeat, an OpenRGB idle-tick reassert, an SHM refresh, an
+//!   app-base heartbeat — and all of it is `Content::Live` (closures), which
+//!   a data log cannot replay by construction. Recovery is owner-driven by
+//!   design, not seed-driven;
 //! - the [`governor`](crate::governor) paces rebirths: isolated faults restart
 //!   in under a second, a fault storm escalates and the shell gives up loudly
 //!   rather than spinning — spectral radius < 1, enforced at construction.

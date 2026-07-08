@@ -1,5 +1,5 @@
 import { Theme } from "../theme.slint";
-import { Card, SectionTitle, Label, Button, Field, Mono, Divider, PanelHead, Contact, Pill, Slider, Toggle, SplitToggle, SplitButton, IconButton, ColorPicker, SwatchRow, Palette } from "../widgets/controls.slint";
+import { Card, SectionTitle, SubLabel, Label, Button, Field, Mono, Divider, PanelHead, Contact, Pill, Slider, Toggle, SplitToggle, SplitButton, IconButton, ColorPicker, SwatchRow, Palette, SelectableRow, GuideButton } from "../widgets/controls.slint";
 import { DeviceRender } from "../widgets/render.slint";
 import { State } from "../state.slint";
 import { EffectTile, EffectParam } from "../models.slint";
@@ -69,7 +69,8 @@ component EffectTileCard inherits Rectangle {
             }
             // a tiny corner glyph marks a DATA tile (it shows your device, not a light show)
             if root.tile.kind == "data" : Mono {
-                text: "DATA"; color: Theme.accent-dim; font-size: Theme.fs-small;
+                // a static category label, not a live signal — dim chrome (text-faint), never accent.
+                text: "DATA"; color: Theme.text-faint; font-size: Theme.fs-small;
                 x: parent.width - self.width - 5px; y: 4px;
             }
             // removed-until-wired: the "SOON" stub-tile glyph (kind == "stub"). Restore this branch
@@ -209,7 +210,10 @@ component SpectrumEditor inherits VerticalLayout {
     VerticalLayout {
         spacing: 9px;
         HorizontalLayout {
+            spacing: 8px;
             SectionTitle { text: "SPECTRUM"; }
+            // the book button — opens the SPECTRUM + MOTION guide (what a stop is, the motion kinds)
+            VerticalLayout { alignment: center; GuideButton { guide-id: "spectrum"; } }
             Rectangle {}
             Mono {
                 text: State.light-stops.length + (State.light-stops.length == 1 ? " stop" : " stops");
@@ -588,7 +592,7 @@ export component LightingPanel inherits VerticalLayout {
                     + " is painting this board (via CONNECTIONS)";
                 color: Theme.text-dim;
             }
-            Mono { text: "your lighting is composed underneath and returns the moment it lets go."; color: Theme.text-faint; }
+            Mono { text: "your lighting is composed underneath and returns the moment it lets go. tune how it blends in VISITORS below."; color: Theme.text-faint; }
         }
     }
 
@@ -605,7 +609,7 @@ export component LightingPanel inherits VerticalLayout {
                     + " is connected but suppressed — your lighting wins.";
                 color: Theme.text-dim;
             }
-            Mono { text: "turn off \u{201c}my lighting always wins\u{201d} in SYSTEM to let it take over."; color: Theme.text-faint; }
+            Mono { text: "flip off \u{201c}my lighting always wins\u{201d} in VISITORS below to let it take over."; color: Theme.text-faint; }
         }
     }
 
@@ -776,39 +780,38 @@ export component LightingPanel inherits VerticalLayout {
                     // gesture needs — the user picks which layer (an effect OR the vitals readout) to place.
                     if State.light-stack-count >= 1 : HorizontalLayout {
                         spacing: 6px;
-                        for li in State.light-stack-count : cell := Rectangle {
-                            property <bool> on: li == State.selected-layer;
-                            height: Theme.row-h; min-width: 60px; horizontal-stretch: 1;
-                            border-radius: Theme.radius-sm;
-                            background: cell.on ? Theme.accent-glow : (sta.has-hover ? Theme.well-hi : Theme.bg-2);
-                            border-width: Theme.hair;
-                            border-color: cell.on ? Theme.accent-line : (sta.has-hover ? Theme.text-faint : Theme.line);
-                            animate background, border-color { duration: Theme.quick; }
-                            // SELECT covers the whole cell but is declared FIRST so it sits BENEATH the ✕'s
-                            // own touch (the last sibling) — a cell-wide TouchArea declared LAST was on top
-                            // and swallowed every click, so the ✕ could never fire (the "can't remove" bug).
-                            sta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { State.select-stack(li); } }
-                            HorizontalLayout {
-                                padding-left: 9px; padding-right: 5px; spacing: 5px;
-                                VerticalLayout {
-                                    alignment: center; horizontal-stretch: 1;
-                                    // the layer's display name (e.g. "Vitals", "Heat") so each cell is
-                                    // identifiable — falls back to L{n} until the labels model catches up.
-                                    Mono {
-                                        text: li < State.light-stack-labels.length ? State.light-stack-labels[li] : "L" + (li + 1);
-                                        color: cell.on ? Theme.accent : Theme.text-mid;
-                                        overflow: elide;
-                                    }
-                                }
-                                // drop this layer — the shared IconButton glyph chip (× in the mono font,
-                                // U+00D7 since the dingbat U+2715 isn't in it), danger ink on hover. Declared
-                                // LAST so its touch wins the corner over the cell-wide select beneath.
+                        // each stacked effect is a pick-one SelectableRow — the shared atom now owns the
+                        // frame / hover / accent-select / tick; the layer's display name is the label
+                        // ("Vitals", "Heat"), falling back to L{n} until the labels model catches up. The
+                        // ✕ rides the row's trailing slot (declared after the row's own pick TouchArea, so
+                        // its touch wins the corner — the "can't remove" bug can't return).
+                        for li in State.light-stack-count : SelectableRow {
+                            min-width: 60px; horizontal-stretch: 1;
+                            label: li < State.light-stack-labels.length ? State.light-stack-labels[li] : "L" + (li + 1);
+                            selected: li == State.selected-layer;
+                            clicked => { State.select-stack(li); }
+                            VerticalLayout {
+                                alignment: center;
                                 IconButton {
                                     glyph: "\u{00d7}";
                                     danger: true;
                                     clicked => { State.remove-stack(li); }
                                 }
                             }
+                        }
+                    }
+                    // reorder the SELECTED layer up/down the stack — the ◂|▸ deck TIMELINE also wears, per-
+                    // half gated at the ends. Shown only when there's a stack to reorder (>1 layer).
+                    if State.light-stack-count > 1 : HorizontalLayout {
+                        VerticalLayout { alignment: center; Mono { text: "reorder layer"; color: Theme.text-faint; } }
+                        Rectangle { horizontal-stretch: 1; }
+                        SplitButton {
+                            left-text: "\u{25c2}"; right-text: "\u{25b8}";
+                            enabled: State.light-stack-count > 1;
+                            left-enabled: State.selected-layer > 0;
+                            right-enabled: State.selected-layer < State.light-stack-count - 1;
+                            left-clicked => { State.move-stack(State.selected-layer, -1); }
+                            right-clicked => { State.move-stack(State.selected-layer, 1); }
                         }
                     }
                     Button {
@@ -918,6 +921,167 @@ export component LightingPanel inherits VerticalLayout {
                 // to the board (see glue::schedule_lighting_apply); "~ live on device" above is the honest
                 // readout, and the one deliberate "stop writing" is the global writes-pause gate (header /
                 // Settings) — a page-local stop would be undone by the very next edit, so it's gone.
+            }
+        }
+
+        // ── VISITORS — how EXTERNAL paint composes with your lighting. Games speak Chroma, tools
+        // speak OpenRGB (both enabled in SYSTEM → CONNECTIONS); the arbiter blends them instead of
+        // letting whoever wrote last win — the one config no last-writer-wins tool can offer. Lives
+        // HERE, beside the lighting it combines with. Two lanes (games / tools), a universal
+        // hands-off list, and the base-priority switch the suppressed strip above points at. ──
+        VerticalLayout {
+            spacing: 11px;
+            SectionTitle { text: "VISITORS"; }
+            Mono {
+                text: "games and tools can paint through Neuron — here's how they combine with your lighting.";
+                color: Theme.text-faint; wrap: word-wrap;
+            }
+
+            // CHROMA GAMES lane
+            VerticalLayout {
+                spacing: 6px;
+                SubLabel { text: "CHROMA GAMES"; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    VerticalLayout { width: 96px; alignment: center; SubLabel { text: "FEEL"; } }
+                    SplitToggle {
+                        options: ["REPLACE", "MERGE", "BOOST", "TINT"];
+                        min-cell: 70px;
+                        index: State.host-chroma-mode;
+                        picked(i) => { State.set-host-chroma-mode(i); }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                }
+                HorizontalLayout {
+                    spacing: 10px;
+                    VerticalLayout { width: 96px; alignment: center; SubLabel { text: "STRENGTH"; } }
+                    Slider {
+                        compact: true;
+                        minimum: 0;
+                        maximum: 100;
+                        step: 5;
+                        value: State.host-chroma-strength;
+                        unit: "%";
+                        wheel: false;
+                        changed(v) => { State.set-host-chroma-strength(v); }
+                    }
+                    Mono { text: Math.round(State.host-chroma-strength) + "%"; color: Theme.text-faint; }
+                }
+                HorizontalLayout {
+                    spacing: 10px;
+                    VerticalLayout { width: 96px; alignment: center; SubLabel { text: "FADE"; } }
+                    Slider {
+                        compact: true;
+                        minimum: 0;
+                        maximum: 2500;
+                        step: 50;
+                        value: State.host-chroma-fade;
+                        unit: "ms";
+                        wheel: false;
+                        changed(v) => { State.set-host-chroma-fade(v); }
+                    }
+                    Mono { text: Math.round(State.host-chroma-fade) + "ms"; color: Theme.text-faint; }
+                }
+                Mono {
+                    text: State.host-chroma-mode == 0
+                        ? "games take the LEDs they paint."
+                        : State.host-chroma-mode == 2
+                            ? "games brighten your lighting for loud moments."
+                            : State.host-chroma-mode == 3
+                                ? "games shade your lighting without washing it out."
+                                : "games sit on top while your lighting stays visible.";
+                    color: Theme.text-faint; wrap: word-wrap;
+                }
+            }
+
+            // OPENRGB TOOLS lane
+            VerticalLayout {
+                spacing: 6px;
+                SubLabel { text: "OPENRGB TOOLS"; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    VerticalLayout { width: 96px; alignment: center; SubLabel { text: "FEEL"; } }
+                    SplitToggle {
+                        options: ["REPLACE", "MERGE", "BOOST", "TINT"];
+                        min-cell: 70px;
+                        index: State.host-openrgb-mode;
+                        picked(i) => { State.set-host-openrgb-mode(i); }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                }
+                HorizontalLayout {
+                    spacing: 10px;
+                    VerticalLayout { width: 96px; alignment: center; SubLabel { text: "STRENGTH"; } }
+                    Slider {
+                        compact: true;
+                        minimum: 0;
+                        maximum: 100;
+                        step: 5;
+                        value: State.host-openrgb-strength;
+                        unit: "%";
+                        wheel: false;
+                        changed(v) => { State.set-host-openrgb-strength(v); }
+                    }
+                    Mono { text: Math.round(State.host-openrgb-strength) + "%"; color: Theme.text-faint; }
+                }
+                HorizontalLayout {
+                    spacing: 10px;
+                    VerticalLayout { width: 96px; alignment: center; SubLabel { text: "FADE"; } }
+                    Slider {
+                        compact: true;
+                        minimum: 0;
+                        maximum: 2500;
+                        step: 50;
+                        value: State.host-openrgb-fade;
+                        unit: "ms";
+                        wheel: false;
+                        changed(v) => { State.set-host-openrgb-fade(v); }
+                    }
+                    Mono { text: Math.round(State.host-openrgb-fade) + "ms"; color: Theme.text-faint; }
+                }
+                Mono {
+                    text: State.host-openrgb-mode == 0
+                        ? "tools take the LEDs they set — the classic hard takeover."
+                        : State.host-openrgb-mode == 2
+                            ? "tools brighten your lighting for loud moments."
+                            : State.host-openrgb-mode == 3
+                                ? "tools shade your lighting without washing it out."
+                                : "tools sit on top while your lighting stays visible.";
+                    color: Theme.text-faint; wrap: word-wrap;
+                }
+            }
+
+            // HANDS-OFF DEVICES — universal (both lanes). A device toggled OFF here stays yours;
+            // no visitor may paint it, whether it speaks Chroma or OpenRGB.
+            VerticalLayout {
+                spacing: 6px;
+                SubLabel { text: "HANDS-OFF DEVICES"; }
+                Mono {
+                    text: "toggle a device off to keep it yours — no visitor paints it, Chroma or OpenRGB.";
+                    color: Theme.text-faint; wrap: word-wrap;
+                }
+                HorizontalLayout {
+                    spacing: 9px;
+                    for d in State.host-paint-devices : Toggle {
+                        caption: d.name;
+                        checked: d.enabled;
+                        toggled(v) => { State.set-host-paint-device(d.id, v); }
+                    }
+                }
+            }
+
+            // MY LIGHTING ALWAYS WINS — the base-priority switch the suppressed strip above points at.
+            VerticalLayout {
+                spacing: 3px;
+                Toggle {
+                    caption: "my lighting always wins";
+                    checked: State.host-base-always-wins;
+                    toggled(v) => { State.set-host-base-always-wins(v); }
+                }
+                Mono {
+                    text: "when on, your lighting outranks every visitor — they keep painting underneath and show up as suppressed.";
+                    color: Theme.text-faint; wrap: word-wrap;
+                }
             }
         }
     }

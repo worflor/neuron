@@ -41,14 +41,13 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
-use std::sync::RwLock;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::api::{HostApi, LeaseSpec, SurfaceInfo, SurfaceKind};
-use crate::arbiter::{band, BlendMode, Content, LayerId, LiveContent, Rgb, SourceId};
+use crate::arbiter::{band, Content, LayerId, Rgb, SourceId};
 use crate::bus::Value;
+use crate::paint::{PaintPolicy, PolicyLayer};
 
 /// The Chroma SDK's own session contract: 15s of silence = dead. Layer leases
 /// AND session bookkeeping both use it, so a stalled game's session dies at
@@ -59,108 +58,6 @@ pub const SESSION_TTL: Duration = Duration::from_secs(15);
 /// First minted session id — in port-space above the SDK's own 54235 (see
 /// module docs).
 const FIRST_SESSION_ID: u64 = 54236;
-
-/// One shared game-lighting policy for every Chroma face. REST and native SHM
-/// both read this at render time, so the settings page describes "game Chroma"
-/// instead of leaking how a given game talks to Neuron.
-#[derive(Debug)]
-pub struct GameLightingPolicy {
-    blend: AtomicU8,
-    intensity: AtomicU8,
-    fade_ms: AtomicU32,
-    surfaces: RwLock<Option<HashSet<String>>>,
-}
-
-impl Default for GameLightingPolicy {
-    fn default() -> Self {
-        Self {
-            blend: AtomicU8::new(BlendMode::Screen.to_bits()),
-            intensity: AtomicU8::new(100),
-            fade_ms: AtomicU32::new(450),
-            surfaces: RwLock::new(None),
-        }
-    }
-}
-
-impl GameLightingPolicy {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
-    }
-
-    pub fn update(
-        &self,
-        blend: BlendMode,
-        intensity: u8,
-        fade_ms: u32,
-        surfaces: Option<HashSet<String>>,
-    ) {
-        self.blend.store(blend.to_bits(), Ordering::Relaxed);
-        self.intensity.store(intensity.clamp(0, 100), Ordering::Relaxed);
-        self.fade_ms.store(fade_ms.clamp(0, 2500), Ordering::Relaxed);
-        *self.surfaces.write().unwrap_or_else(|e| e.into_inner()) = surfaces;
-    }
-
-    pub fn blend_mode(&self) -> BlendMode {
-        BlendMode::from_bits(self.blend.load(Ordering::Relaxed))
-    }
-
-    pub fn alpha(&self) -> f32 {
-        self.intensity.load(Ordering::Relaxed) as f32 / 100.0
-    }
-
-    pub fn fade_secs(&self) -> f32 {
-        self.fade_ms.load(Ordering::Relaxed) as f32 / 1000.0
-    }
-
-    pub fn allows_surface(&self, surface: &SurfaceInfo) -> bool {
-        self.allows_key(&surface.key)
-    }
-
-    pub fn allows_key(&self, key: &str) -> bool {
-        self.surfaces
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-            .is_none_or(|set| set.contains(key))
-    }
-}
-
-#[derive(Clone)]
-struct PolicyContent {
-    key: String,
-    content: Content,
-    leds: usize,
-    policy: Arc<GameLightingPolicy>,
-}
-
-impl LiveContent for PolicyContent {
-    fn render(&mut self, _now: Instant) -> Vec<Option<Rgb>> {
-        if !self.policy.allows_key(&self.key) {
-            return vec![None; self.leds];
-        }
-        match &self.content {
-            Content::Fill(c) => vec![Some(*c); self.leds],
-            Content::Cells(cells) => cells.clone(),
-            Content::Live(_) => vec![None; self.leds],
-        }
-    }
-
-    fn alpha(&self) -> f32 {
-        if self.policy.allows_key(&self.key) {
-            self.policy.alpha()
-        } else {
-            0.0
-        }
-    }
-
-    fn blend_mode(&self) -> BlendMode {
-        self.policy.blend_mode()
-    }
-
-    fn boxed_clone(&self) -> Box<dyn LiveContent> {
-        Box::new(self.clone())
-    }
-}
 
 /// RZRESULT codes (Windows error codes, as the SDK reuses them — RzErrors.h).
 mod rz {
@@ -221,14 +118,16 @@ struct StoredEffect {
     action: Action,
 }
 
-/// One session's live paint on one device: the arbiter layer plus the surface
-/// key and last content it was claimed with. The key + content are RETAINED so
-/// a kernel rebirth (which sweeps every lease) can be recovered on the next
-/// heartbeat — re-claiming identical paint — without waiting for the game to
-/// push a fresh effect. See [`ChromaServer::heartbeat`].
+/// One session's live paint on one surface: the arbiter layer plus the SHARED
+/// paint buffer the layer reads. A new effect MUTATES this buffer (and refreshes
+/// the lease) instead of replacing the layer, so the layer's fade ramp survives
+/// across frames. The buffer is retained so a kernel rebirth (which sweeps every
+/// lease) can be recovered on the next heartbeat — re-claiming from the retained
+/// cells — without waiting for the game to push a fresh effect. See
+/// [`ChromaServer::heartbeat`].
 struct DeviceLayer {
     layer: LayerId,
-    content: Content,
+    cells: Arc<Mutex<Vec<Option<Rgb>>>>,
 }
 
 struct Session {
@@ -248,15 +147,15 @@ pub struct ChromaServer {
     sessions: HashMap<u64, Session>,
     next_id: u64,
     next_effect: u64,
-    policy: Arc<GameLightingPolicy>,
+    policy: Arc<PaintPolicy>,
 }
 
 impl ChromaServer {
     pub fn new() -> ChromaServer {
-        ChromaServer::with_policy(GameLightingPolicy::new())
+        ChromaServer::with_policy(PaintPolicy::new())
     }
 
-    pub fn with_policy(policy: Arc<GameLightingPolicy>) -> ChromaServer {
+    pub fn with_policy(policy: Arc<PaintPolicy>) -> ChromaServer {
         ChromaServer { sessions: HashMap::new(), next_id: FIRST_SESSION_ID, next_effect: 1, policy }
     }
 
@@ -618,7 +517,7 @@ impl ChromaServer {
     }
 
     fn reconcile_device(
-        policy: &Arc<GameLightingPolicy>,
+        policy: &Arc<PaintPolicy>,
         s: &mut Session,
         device: &str,
         host: &mut dyn HostApi,
@@ -635,7 +534,7 @@ impl ChromaServer {
         };
 
         let live = s.layers.entry(device.to_string()).or_default();
-        let current: std::collections::HashSet<String> =
+        let current: HashSet<String> =
             surfaces.iter().map(|surface| surface.key.clone()).collect();
         let stale: Vec<String> = live.keys().filter(|key| !current.contains(*key)).cloned().collect();
         for key in stale {
@@ -645,25 +544,39 @@ impl ChromaServer {
         }
 
         for surface in surfaces {
-            let content = policy_content(&paint, &surface, Arc::clone(policy));
-            if let Some(dl) = live.get_mut(&surface.key) {
-                if host.set_content(dl.layer, content.clone(), now) {
-                    dl.content = content;
+            let cells = paint_to_cells(&paint, &surface);
+            // Update path: write the new frame into the SHARED buffer and refresh
+            // the lease — the layer (and its fade ramp) stays put. A `false`
+            // refresh means the lease was swept (a kernel rebirth); fall through
+            // to re-claim, starting the ramp at full so a still-present game
+            // doesn't dip to black and fade back.
+            let existing = live.get(&surface.key).map(|dl| dl.layer);
+            if let Some(layer) = existing {
+                if let Some(dl) = live.get(&surface.key) {
+                    *dl.cells.lock().unwrap_or_else(|e| e.into_inner()) = cells.clone();
+                }
+                if host.refresh(layer, now) {
                     continue;
                 }
             }
+            let initial_alpha = if live.remove(&surface.key).is_some() { 1.0 } else { 0.0 };
+            let buffer = Arc::new(Mutex::new(cells));
+            let content = Content::Live(Box::new(PolicyLayer::new(
+                surface.key.clone(),
+                surface.leds,
+                Arc::clone(&buffer),
+                Arc::clone(policy),
+                initial_alpha,
+            )));
             if let Some(layer) = host.claim(
                 &surface.key,
                 s.owner,
                 band::SESSION,
                 LeaseSpec::Ttl(SESSION_TTL),
-                content.clone(),
+                content,
                 now,
             ) {
-                live.insert(
-                    surface.key.clone(),
-                    DeviceLayer { layer, content },
-                );
+                live.insert(surface.key.clone(), DeviceLayer { layer, cells: buffer });
             }
         }
         rz::SUCCESS
@@ -743,21 +656,14 @@ fn parse_effect(v: &serde_json::Value) -> Option<Action> {
     }
 }
 
-fn policy_content(
-    paint: &Paint,
-    surface: &SurfaceInfo,
-    policy: Arc<GameLightingPolicy>,
-) -> Content {
-    let content = match paint {
-        Paint::Fill(color) => Content::Fill(*color),
-        Paint::Grid(grid) => Content::Cells(grid_to_cells(grid, surface)),
-    };
-    Content::Live(Box::new(PolicyContent {
-        key: surface.key.clone(),
-        content,
-        leds: surface.leds,
-        policy,
-    }))
+/// An effect's paint, resolved to this surface's per-LED cells — the frame the
+/// shared [`PolicyLayer`] buffer holds. A `Fill` covers every LED; a `Grid` maps
+/// row-major with honest cropping (unpainted cells stay `None`).
+fn paint_to_cells(paint: &Paint, surface: &SurfaceInfo) -> Vec<Option<Rgb>> {
+    match paint {
+        Paint::Fill(color) => vec![Some(*color); surface.leds],
+        Paint::Grid(grid) => grid_to_cells(grid, surface),
+    }
 }
 
 /// `{"id": "..."}` or `{"ids": ["...", ...]}`.
@@ -820,12 +726,22 @@ fn grid_to_cells(grid: &[Vec<u32>], surface: &SurfaceInfo) -> Vec<Option<Rgb>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arbiter::BlendMode;
     use crate::Kernel;
 
     fn kernel() -> Kernel {
         let mut k = Kernel::new();
         k.declare(SurfaceInfo::grid("kbd", "Board", SurfaceKind::Keyboard, 6, 22));
         k
+    }
+
+    /// A server whose policy paints exactly as sent: `Over` blend, full
+    /// strength, no fade — so a paint resolves to its literal colour at the same
+    /// instant, which is what these protocol-shape tests assert. The fade ramp,
+    /// blend modes, and black rule are exercised by the dedicated tests below and
+    /// in `crate::paint`.
+    fn srv() -> ChromaServer {
+        ChromaServer::with_policy(PaintPolicy::opaque())
     }
 
     fn req(method: &str, path: &str, body: serde_json::Value) -> HttpRequest {
@@ -860,7 +776,7 @@ mod tests {
     fn sessions_roster_is_ttl_honest() {
         let mut k = kernel();
         let now = Instant::now();
-        let mut srv = ChromaServer::new();
+        let mut srv = srv();
         assert!(srv.sessions(now).is_empty());
         let id = open_session(&mut srv, &mut k, now);
         let live = srv.sessions(now);
@@ -885,7 +801,7 @@ mod tests {
     #[test]
     fn init_returns_port_plausible_session_and_routable_uri() {
         let mut k = kernel();
-        let mut srv = ChromaServer::new();
+        let mut srv = srv();
         let r = srv.handle(
             &req("POST", "/razer/chromasdk", serde_json::json!({ "title": "Test Game" })),
             &mut k,
@@ -900,7 +816,7 @@ mod tests {
     #[test]
     fn static_effect_decodes_bgr_correctly() {
         let mut k = kernel();
-        let mut srv = ChromaServer::new();
+        let mut srv = srv();
         let now = Instant::now();
         let id = open_session(&mut srv, &mut k, now);
         // 0x00FF0000 in COLORREF/BGR is BLUE, not red — the classic mixup.
@@ -912,7 +828,7 @@ mod tests {
     #[test]
     fn heartbeat_recovers_paint_after_kernel_rebirth() {
         let mut k = kernel();
-        let mut srv = ChromaServer::new();
+        let mut srv = srv();
         let now = Instant::now();
         let id = open_session(&mut srv, &mut k, now);
         put_static(&mut srv, &mut k, id, 0x00FF0000, now); // pure blue
@@ -947,7 +863,7 @@ mod tests {
     #[test]
     fn custom_grid_lands_row_major() {
         let mut k = kernel();
-        let mut srv = ChromaServer::new();
+        let mut srv = srv();
         let now = Instant::now();
         let id = open_session(&mut srv, &mut k, now);
         let mut grid = vec![vec![0u32; 22]; 6];
@@ -972,7 +888,7 @@ mod tests {
         // {color: 8x24, key: 6x22}, not a flat array. A spec-correct payload
         // must not 400.
         let mut k = kernel();
-        let mut srv = ChromaServer::new();
+        let mut srv = srv();
         let now = Instant::now();
         let id = open_session(&mut srv, &mut k, now);
         let mut color = vec![vec![0u32; 24]; 8];
@@ -996,7 +912,7 @@ mod tests {
     #[test]
     fn batch_effects_apply_in_sequence_with_results() {
         let mut k = kernel();
-        let mut srv = ChromaServer::new();
+        let mut srv = srv();
         let now = Instant::now();
         let id = open_session(&mut srv, &mut k, now);
         let r = srv.handle(
@@ -1020,7 +936,7 @@ mod tests {
     #[test]
     fn post_stores_without_applying_and_put_effect_applies() {
         let mut k = kernel();
-        let mut srv = ChromaServer::new();
+        let mut srv = srv();
         let now = Instant::now();
         let id = open_session(&mut srv, &mut k, now);
         // POST: create the effect. Nothing paints yet — a preloading game
@@ -1078,7 +994,7 @@ mod tests {
     #[test]
     fn heartbeats_keep_the_session_alive_past_the_ttl() {
         let mut k = kernel();
-        let mut srv = ChromaServer::new();
+        let mut srv = srv();
         let t0 = Instant::now();
         let id = open_session(&mut srv, &mut k, t0);
         put_static(&mut srv, &mut k, id, 255, t0);
@@ -1098,7 +1014,7 @@ mod tests {
     #[test]
     fn a_dead_game_stops_painting_and_its_session_dies_at_the_ttl() {
         let mut k = kernel();
-        let mut srv = ChromaServer::new();
+        let mut srv = srv();
         let t0 = Instant::now();
         let id = open_session(&mut srv, &mut k, t0);
         put_static(&mut srv, &mut k, id, 255, t0);
@@ -1119,7 +1035,7 @@ mod tests {
     #[test]
     fn delete_releases_immediately() {
         let mut k = kernel();
-        let mut srv = ChromaServer::new();
+        let mut srv = srv();
         let now = Instant::now();
         let id = open_session(&mut srv, &mut k, now);
         put_static(&mut srv, &mut k, id, 255, now);
@@ -1135,7 +1051,7 @@ mod tests {
     #[test]
     fn two_games_the_later_session_wins_and_uninit_reveals_the_first() {
         let mut k = kernel();
-        let mut srv = ChromaServer::new();
+        let mut srv = srv();
         let now = Instant::now();
         let a = open_session(&mut srv, &mut k, now);
         let b = open_session(&mut srv, &mut k, now);
@@ -1153,7 +1069,7 @@ mod tests {
     #[test]
     fn malformed_json_is_refused_and_state_untouched() {
         let mut k = kernel();
-        let mut srv = ChromaServer::new();
+        let mut srv = srv();
         let now = Instant::now();
         let id = open_session(&mut srv, &mut k, now);
         let r = srv.handle(
@@ -1172,7 +1088,7 @@ mod tests {
     #[test]
     fn missing_device_kind_answers_with_device_not_available() {
         let mut k = kernel(); // keyboard only — no mouse declared
-        let mut srv = ChromaServer::new();
+        let mut srv = srv();
         let now = Instant::now();
         let id = open_session(&mut srv, &mut k, now);
         let r = srv.handle(
@@ -1197,7 +1113,7 @@ mod tests {
         let mut k = Kernel::new();
         k.declare(SurfaceInfo::grid("mouse-a", "Mouse A", SurfaceKind::Mouse, 1, 2));
         k.declare(SurfaceInfo::grid("mouse-b", "Mouse B", SurfaceKind::Mouse, 1, 2));
-        let mut srv = ChromaServer::new();
+        let mut srv = srv();
         let now = Instant::now();
         let id = open_session(&mut srv, &mut k, now);
         let r = srv.handle(
@@ -1219,7 +1135,7 @@ mod tests {
         let mut k = Kernel::new();
         k.declare(SurfaceInfo::grid("generic-a", "Generic A", SurfaceKind::Generic, 1, 2));
         k.declare(SurfaceInfo::grid("generic-b", "Generic B", SurfaceKind::Generic, 1, 2));
-        let mut srv = ChromaServer::new();
+        let mut srv = srv();
         let now = Instant::now();
         let id = open_session(&mut srv, &mut k, now);
         let r = srv.handle(
@@ -1242,11 +1158,12 @@ mod tests {
         let mut k = Kernel::new();
         k.declare(SurfaceInfo::grid("mouse-a", "Mouse A", SurfaceKind::Mouse, 1, 2));
         k.declare(SurfaceInfo::grid("mouse-b", "Mouse B", SurfaceKind::Mouse, 1, 2));
-        let policy = GameLightingPolicy::new();
+        // Instant Over so the scope gate is what's under test, not the fade ramp.
+        let policy = PaintPolicy::new();
         policy.update(
             BlendMode::Over,
             100,
-            450,
+            0,
             Some(["mouse-a".to_string()].into_iter().collect()),
         );
         let mut srv = ChromaServer::with_policy(Arc::clone(&policy));
@@ -1265,14 +1182,14 @@ mod tests {
         assert_eq!(k.resolve("mouse-a", now).unwrap(), vec![Some(Rgb(255, 0, 0)); 2]);
         assert_eq!(k.resolve("mouse-b", now).unwrap(), vec![None; 2]);
 
-        policy.update(BlendMode::Over, 100, 450, None);
+        policy.update(BlendMode::Over, 100, 0, None);
         assert_eq!(k.resolve("mouse-b", now).unwrap(), vec![Some(Rgb(255, 0, 0)); 2]);
     }
 
     #[test]
     fn chroma_none_clears_only_that_device_layer() {
         let mut k = kernel();
-        let mut srv = ChromaServer::new();
+        let mut srv = srv();
         let now = Instant::now();
         let id = open_session(&mut srv, &mut k, now);
         put_static(&mut srv, &mut k, id, 255, now);
@@ -1292,7 +1209,7 @@ mod tests {
     #[test]
     fn session_info_get_answers_while_alive() {
         let mut k = kernel();
-        let mut srv = ChromaServer::new();
+        let mut srv = srv();
         let now = Instant::now();
         let id = open_session(&mut srv, &mut k, now);
         let r = srv.handle(
@@ -1312,7 +1229,7 @@ mod tests {
     #[test]
     fn unprefixed_chromasdk_root_is_accepted() {
         let mut k = kernel();
-        let mut srv = ChromaServer::new();
+        let mut srv = srv();
         let r = srv.handle(
             &req("GET", "/chromasdk", serde_json::json!({})),
             &mut k,
@@ -1324,7 +1241,7 @@ mod tests {
     #[test]
     fn firmware_effect_names_are_refused_not_faked() {
         let mut k = kernel();
-        let mut srv = ChromaServer::new();
+        let mut srv = srv();
         let now = Instant::now();
         let id = open_session(&mut srv, &mut k, now);
         let r = srv.handle(
@@ -1337,5 +1254,72 @@ mod tests {
             now,
         );
         assert_eq!(r.status, 400);
+    }
+
+    #[test]
+    fn tint_mode_sparse_frame_keeps_the_base_and_multiplies_only_the_colours() {
+        // The TINT bug fix, end to end through the arbiter. A lit base plus a
+        // Multiply game frame that is mostly black with two coloured keys: the
+        // base must SURVIVE everywhere except those keys, which get multiplied.
+        let mut k = Kernel::new();
+        k.declare(SurfaceInfo::grid("kbd", "Board", SurfaceKind::Keyboard, 1, 3));
+        // Base: solid mid-grey the game can tint.
+        let base = k.next_source();
+        k.claim(
+            "kbd",
+            base,
+            band::BASE,
+            LeaseSpec::Pinned,
+            Content::Fill(Rgb(200, 200, 200)),
+            Instant::now(),
+        )
+        .unwrap();
+
+        // TINT = Multiply, instant so we can read it at the same `now`.
+        let policy = PaintPolicy::new();
+        policy.update(BlendMode::Multiply, 100, 0, None);
+        let mut srv = ChromaServer::with_policy(policy);
+        let now = Instant::now();
+        let id = open_session(&mut srv, &mut k, now);
+
+        // Grid: black, white(=full BGR), black — only the middle key is painted.
+        let grid = vec![vec![0x000000u32, 0xFFFFFF, 0x000000]];
+        srv.handle(
+            &req(
+                "PUT",
+                &format!("/razer/chromasdk/sess/{id}/keyboard"),
+                serde_json::json!({ "effect": "CHROMA_CUSTOM", "param": grid }),
+            ),
+            &mut k,
+            now,
+        );
+
+        let frame = k.resolve("kbd", now).unwrap();
+        assert_eq!(frame[0], Some(Rgb(200, 200, 200)), "black key: base survives (not blacked out)");
+        assert_eq!(frame[2], Some(Rgb(200, 200, 200)), "black key: base survives");
+        // white × grey = grey (Multiply by full white is the identity).
+        assert_eq!(frame[1], Some(Rgb(200, 200, 200)), "the painted key tints the base");
+    }
+
+    #[test]
+    fn tint_black_would_otherwise_black_out_the_base() {
+        // Guardrail: the SAME black key under Multiply, WITHOUT the black rule,
+        // multiplies the base to black. Prove the rule is what saves it by
+        // comparing a coloured tint that legitimately darkens.
+        let mut k = Kernel::new();
+        k.declare(SurfaceInfo::grid("kbd", "Board", SurfaceKind::Keyboard, 1, 1));
+        let base = k.next_source();
+        k.claim("kbd", base, band::BASE, LeaseSpec::Pinned, Content::Fill(Rgb(200, 100, 50)), Instant::now())
+            .unwrap();
+        let policy = PaintPolicy::new();
+        policy.update(BlendMode::Multiply, 100, 0, None);
+        let mut srv = ChromaServer::with_policy(policy);
+        let now = Instant::now();
+        let id = open_session(&mut srv, &mut k, now);
+        // Half-brightness grey tint (BGR 0x808080): legitimately halves the base.
+        put_static(&mut srv, &mut k, id, 0x808080, now);
+        let frame = k.resolve("kbd", now).unwrap();
+        // 200*128/255 ≈ 100, 100*128 ≈ 50, 50*128 ≈ 25 — a real tint, base not lost.
+        assert_eq!(frame[0], Some(Rgb(100, 50, 25)), "a non-black tint darkens the base honestly");
     }
 }

@@ -147,6 +147,22 @@ export global State {
     // property on the conditional deck VerticalLayout — that write proved unreliable (clicking the
     // disclosure did nothing). Persists across reselects, which is fine.
     in-out property <bool> feel-adv-open: false;
+    // FEEL DIRTY tracking — the everyday-deck's seeded baselines, stamped by glue on every seed (device
+    // select / scan / apply). `feel-dirty` is the honest "you have unapplied edits" signal the SCAN⇄APPLY
+    // deck reads: any draft that diverges from its baseline flips it, and re-seeding (which re-stamps the
+    // baselines to the just-read/just-committed truth) clears it. Only the caps the device actually has
+    // count, so a knob the board can't expose never registers as dirt.
+    in-out property <float> feel-base-dpi: 1600;
+    in-out property <float> feel-base-polling: 1000;
+    in-out property <float> feel-base-brightness: 75;
+    in-out property <string> feel-base-stages: "800/1600/3200";
+    in-out property <int> feel-base-active-stage: 0;
+    out property <bool> feel-dirty:
+        (root.sel-can-dpi && round(root.dpi) != round(root.feel-base-dpi))
+        || (root.sel-can-poll && round(root.polling-hz) != round(root.feel-base-polling))
+        || (root.sel-can-bright-set && round(root.brightness) != round(root.feel-base-brightness))
+        || (root.sel-can-dpi && root.dpi-stages != root.feel-base-stages)
+        || (root.sel-can-dpi && root.dpi-active-stage != root.feel-base-active-stage);
 
     // ── EVERY perf control Synapse buries (Device panel) ─────────────────
     // DPI STAGE LIST — the cycle, applied as a full table (writes::set_dpi_stages).
@@ -273,6 +289,7 @@ export global State {
     callback stack-current();                          // add the active effect as another layer on top
     callback select-stack(int);                        // make stack layer `i` the active (knobs follow it)
     callback remove-stack(int);                        // drop stack layer `i`
+    callback move-stack(int, int);                     // reorder layer `i` in the stack (dir -1 down / +1 up)
     // PAINT — a brush you pick up ON the render (not a top-level mode). Off = effects play; on = your
     // pointer paints cells in the brush colour over the current frame.
     in-out property <bool> light-brush-on: false;     // is the per-key brush picked up?
@@ -387,6 +404,11 @@ export global State {
     in-out property <string> bind-trigger-label: "—"; // friendly name of the captured trigger
     in-out property <bool> bind-trigger-ready: false; // a trigger has been captured
     in-out property <bool> bind-hypershift: false;    // author this on the HyperShift layer
+    // DUPLICATE-TRIGGER honesty: set by glue at capture time when the captured trigger is ALREADY
+    // claimed by another rule on the SAME layer (base vs HyperShift). The live dispatch runs EVERY
+    // matching rule (executor resolves all, not first-wins), so a second bind doesn't replace — both
+    // fire. Surfaced inline by the TriggerWell. "" = no clash (hidden).
+    in-out property <string> dup-trigger-note: "";
     // the action being authored — picked from a typed list with one parameter field
     in-out property <[ActionChoice]> action-choices;  // the Action palette (key / run / mic / dpi / …)
     in-out property <int> action-choice: 0;           // selected action index
@@ -411,29 +433,13 @@ export global State {
     in-out property <string> mic-name: "—";
     in-out property <float> mic-gain: 100;
     in-out property <bool> mic-muted: false;
-    callback set-mic-gain(float);
-    callback toggle-mic-mute();
     callback refresh-mic();
     // OUTPUT (render) side — headphones / sound card / speakers volume + mute (Core Audio, generic).
     // The matching bindable Actions are out-gain / out-mute in the palette.
     in-out property <string> out-name: "—";
     in-out property <float> out-gain: 100;
     in-out property <bool> out-muted: false;
-    callback set-out-gain(float);
-    callback toggle-out-mute();
     callback refresh-out();
-    // LIVE METERS — the channel strips' DaVinci-style peak preview. `*-level` is the dB-mapped,
-    // ballistic level (0..1); `*-hold` is the falling peak-hold tick; `*-clip` latches on a near-0dBFS
-    // hit. Rust opens the meters while the DIRECT page is visible (set-audio-metering) and pushes these
-    // ~30fps (poll-audio-levels). They cost nothing when that page isn't showing.
-    in-out property <float> mic-level: 0.0;
-    in-out property <float> mic-hold: 0.0;
-    in-out property <bool>  mic-clip: false;
-    in-out property <float> out-level: 0.0;
-    in-out property <float> out-hold: 0.0;
-    in-out property <bool>  out-clip: false;
-    callback set-audio-metering(bool);   // open/close the meters as the audio page shows/hides
-    callback poll-audio-levels();        // ~30fps: read peaks → ballistics → the six props above
     // macro authoring: write PYTHON -> check (syntax) -> save+register -> test run.
     // A macro is real CPython run warm by the Macro Host sidecar (full power: ctypes/subprocess/
     // anything). `def macro(ctx):` is the entry; `import neuron` gives ctx + key/clipboard/mouse/run.
@@ -637,10 +643,17 @@ export global State {
     in-out property <bool> host-chroma: true;              // serve Chroma (games) while enabled
     in-out property <bool> host-openrgb: true;             // serve OpenRGB (tools) while enabled
     in-out property <bool> host-obs: false;                // connect OUT to OBS (macros drive scenes)
-    in-out property <int> host-game-mode: 1;               // 0 replace, 1 merge, 2 boost, 3 tint
-    in-out property <float> host-game-intensity: 100;
-    in-out property <float> host-game-fade-ms: 450;
-    in-out property <[ChromaDeviceRow]> host-game-devices;
+    // VISITORS — how external paint combines with your lighting (LIGHTING page). Two lanes:
+    // CHROMA games + OPENRGB tools, each its own blend/strength/fade. 0 replace, 1 merge, 2 boost,
+    // 3 tint. Plus a universal hands-off device list and the "my lighting always wins" priority.
+    in-out property <int> host-chroma-mode: 1;             // chroma lane blend index
+    in-out property <float> host-chroma-strength: 100;
+    in-out property <float> host-chroma-fade: 450;
+    in-out property <int> host-openrgb-mode: 0;            // openrgb lane blend index (default replace)
+    in-out property <float> host-openrgb-strength: 100;
+    in-out property <float> host-openrgb-fade: 0;
+    in-out property <[ChromaDeviceRow]> host-paint-devices; // universal hands-off list (both lanes)
+    in-out property <bool> host-base-always-wins: false;   // your lighting outranks every visitor
     in-out property <bool> host-chroma-detail-open: false;
     in-out property <[ChromaStreamRow]> host-chroma-streams;
     in-out property <string> host-obs-password: "";        // obs-websocket Server Password (masked field)
@@ -657,10 +670,14 @@ export global State {
     callback set-host-chroma(bool);
     callback set-host-openrgb(bool);
     callback set-host-obs(bool);
-    callback set-host-game-mode(int);
-    callback set-host-game-intensity(float);
-    callback set-host-game-fade(float);
-    callback set-host-game-device(string, bool);
+    callback set-host-chroma-mode(int);
+    callback set-host-chroma-strength(float);
+    callback set-host-chroma-fade(float);
+    callback set-host-openrgb-mode(int);
+    callback set-host-openrgb-strength(float);
+    callback set-host-openrgb-fade(float);
+    callback set-host-paint-device(string, bool);          // universal hands-off list (both lanes)
+    callback set-host-base-always-wins(bool);
     callback set-host-obs-password(string);                 // save + reconnect with the new secret
     // LIGHTING page truth strip: a client holds a claim above your base on the selected board
     // (painting now; your effect resumes when it releases).
@@ -705,7 +722,7 @@ export global State {
     // Each option carries its own consent state: `revealed` (step 1, locked→visual) + `enabled`
     // (step 2, the toggle). `supported` is seeded by Rust from a Synapse-4 keyboard PID allowlist —
     // false on the user's BlackWidow Chroma V2, so the toggle stays honestly GATED there.
-    in-out property <bool> snap-tap-supported: false;     // a supporting (Synapse-4-era) keyboard is connected
+    in-out property <bool> snap-tap-supported: false;     // the SELECTED device is a Snap-Tap-capable keyboard (gates the whole MECHANICAL ADVANTAGES section)
     in-out property <bool> snap-tap-revealed: false;      // step 1 done: the stage visual is unsealed
     in-out property <bool> snap-tap-enabled: false;       // step 2: the feature is on (the device write)
     callback set-snap-tap(bool);                          // enable/disable (perf-gated runtime write)
@@ -731,6 +748,10 @@ export global State {
     in-out property <[ImportLine]> import-notes;       // honestly NOT migrated
     in-out property <string> import-status: "Pick a Synapse export (.synapse3 / .ChromaEffects).";
     in-out property <bool> import-ready: false;       // a successful parse to apply
+    // an ACTUAL parse ran and FAILED — set true by glue only after parse-import tried and produced
+    // nothing to apply, cleared the moment the path is edited. Gates the danger ink so the untried
+    // hint (a path just typed, never parsed) stays neutral text-mid instead of flashing alarm-red.
+    in-out property <bool> import-parse-failed: false;
     callback browse-import();
     callback parse-import(string);
     callback apply-import();

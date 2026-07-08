@@ -31,21 +31,27 @@ export component ImportWizard inherits Card {
                 placeholder: "path to .synapse3 / .ChromaEffects";
                 field-width: 360px;
                 text <=> State.import-path;
+                // editing the path clears a prior FAILED verdict — the hint reverts to neutral until
+                // a fresh parse actually runs (danger is earned by an attempt, not by typing).
+                edited(t) => { State.import-parse-failed = false; }
                 accepted(t) => { State.parse-import(t); }
             }
-            // browse (ghost) + parse (accent commit) fused into one deck control
+            // browse (ghost) + parse (accent commit) fused into one deck control. The parse half goes
+            // visibly DEAD until there's a path to parse (a dead-half look, not a silent no-op).
             SplitButton {
                 left-text: "browse";
                 right-text: "parse";
                 right-primary: true;
+                right-enabled: State.import-path != "";
                 left-clicked => { State.browse-import(); }
                 right-clicked => { State.parse-import(State.import-path); }
             }
         }
-        // a parse that produced nothing-to-apply reads as caution, not normal info
+        // danger ONLY once a parse actually ran and failed — a path just typed (never parsed) keeps
+        // the neutral hint, so the line doesn't flash alarm-red the instant a character is entered.
         Mono {
             text: State.import-status;
-            color: !State.import-ready && State.import-path != "" && State.import-status != "" ? Theme.danger : Theme.text-mid;
+            color: State.import-parse-failed ? Theme.danger : Theme.text-mid;
         }
 
         Flickable {

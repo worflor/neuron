@@ -106,6 +106,7 @@ export global Theme {
     out property <length> dot-lg:    6px;    // the larger station / wordmark lamp
     out property <length> modal-inset: 70px; // a modal card's margin from the window edge
     out property <float>  dim-gated: 0.55;   // an inactive / gated section's opacity
+    out property <float>  battery-low-frac: 0.2;  // charge fraction below which a cell gauge reads WARN (not a magic 0.2)
 
     // ── motion — settle, don't bounce ────────────────────────────────────
     // Short and near-linear: a readout updating, a contact closing. Nothing eases AT the user.

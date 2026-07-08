@@ -17,6 +17,12 @@
 //!
 //! Pure, safe Rust — enforced: this module handles no OS resources, so it forbids
 //! `unsafe` outright.
+//!
+//! R&D icebox: fully built and unit-tested, but consumed by nothing in the app
+//! today — no caller feeds it decoded Chroma frames. Kept because the codec
+//! fixtures and the estimators (hysteresis, ramp/ETA, pulse counting) are the
+//! hard part of lighting-as-telemetry; wiring a real consumer (game-event
+//! inference from the light stream) is future work, not this module's job.
 #![forbid(unsafe_code)]
 
 use std::collections::VecDeque;

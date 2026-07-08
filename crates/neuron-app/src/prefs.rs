@@ -173,28 +173,42 @@ pub struct Prefs {
     /// separately (unlike the always-useful lighting servers).
     #[serde(default)]
     pub host_obs: bool,
-    /// HOW a game combines with your own lighting — the emergent config no last-writer-wins tool
-    /// (Synapse, OpenRGB) can offer, because only an arbiter has the concept. `true` (default):
-    /// MERGE — the game's light is SCREENED over your base, so its bright keys punch through while
-    /// your lighting stays underneath, rather than being replaced. `false`: the game takes the keys
-    /// it paints outright. Applies live.
-    #[serde(default = "default_true")]
-    pub host_game_merge: bool,
-    /// How game lighting combines with the user's lighting: "replace",
-    /// "merge", "boost", or "tint".
-    #[serde(default = "default_game_mode")]
-    pub host_game_mode: String,
-    /// Game layer opacity, 0..100. Applies to REST and native Chroma.
-    #[serde(default = "default_game_intensity")]
-    pub host_game_intensity: u8,
-    /// Native Chroma fade time in milliseconds. Kept in the shared policy so
-    /// every Chroma face reads the same settings surface.
-    #[serde(default = "default_game_fade_ms")]
-    pub host_game_fade_ms: u32,
-    /// Physical device ids excluded from game Chroma. Empty means every
-    /// attached lighting-capable device is included, including future hotplug.
+    /// CHROMA (games) paint lane — HOW a game's Chroma frame combines with your base lighting,
+    /// the emergent config no last-writer-wins tool (Synapse, OpenRGB) can offer because only an
+    /// arbiter has the concept: "replace" (the game takes the keys it paints outright), "merge"
+    /// (default — SCREENED over your base so its bright keys punch through while your lighting
+    /// stays underneath), "boost" (added) or "tint" (multiplied). Applies live to REST + native
+    /// Chroma.
+    #[serde(default = "default_chroma_paint_mode")]
+    pub host_chroma_paint_mode: String,
+    /// Chroma paint opacity, 0..=100.
+    #[serde(default = "default_paint_strength")]
+    pub host_chroma_paint_strength: u8,
+    /// Chroma crossfade time in milliseconds, 0..=2500.
+    #[serde(default = "default_chroma_paint_fade_ms")]
+    pub host_chroma_paint_fade_ms: u32,
+    /// OPENRGB (tools) paint lane — same domain as the Chroma lane, its own settings. Defaults to
+    /// "replace" so OpenRGB config tools keep their classic hard-takeover feel (a set colour
+    /// appears as-sent) until the user opts into blending.
+    #[serde(default = "default_openrgb_paint_mode")]
+    pub host_openrgb_paint_mode: String,
+    /// OpenRGB paint opacity, 0..=100.
+    #[serde(default = "default_paint_strength")]
+    pub host_openrgb_paint_strength: u8,
+    /// OpenRGB crossfade time in milliseconds, 0..=2500. Default 0 (instant), matching the
+    /// hard-takeover default mode.
     #[serde(default)]
-    pub host_game_disabled_devices: Vec<String>,
+    pub host_openrgb_paint_fade_ms: u32,
+    /// UNIVERSAL hands-off list: physical device ids excluded from ALL external paint (Chroma AND
+    /// OpenRGB). Empty means every attached lighting-capable device is included, including future
+    /// hotplug.
+    #[serde(default)]
+    pub host_paint_disabled_devices: Vec<String>,
+    /// When on, your own lighting outranks every visitor: the base claims the OVERRIDE band, so
+    /// games/tools keep painting underneath but never show (they read as suppressed). Default off
+    /// (visitors compose ABOVE your base). Applies live.
+    #[serde(default)]
+    pub host_base_always_wins: bool,
     /// The obs-websocket Server Password (OBS → Tools → WebSocket Server Settings). Empty = a
     /// passwordless OBS server (auth off). Stored in app.toml like the rest; the `NEURON_OBS_PASSWORD`
     /// env var, when set, overrides this (a dev/headless escape hatch).
@@ -229,15 +243,19 @@ fn default_true() -> bool {
     true
 }
 
-fn default_game_mode() -> String {
+fn default_chroma_paint_mode() -> String {
     "merge".to_string()
 }
 
-fn default_game_intensity() -> u8 {
+fn default_openrgb_paint_mode() -> String {
+    "replace".to_string()
+}
+
+fn default_paint_strength() -> u8 {
     100
 }
 
-fn default_game_fade_ms() -> u32 {
+fn default_chroma_paint_fade_ms() -> u32 {
     450
 }
 
@@ -350,11 +368,14 @@ impl Default for Prefs {
             host_chroma: true,
             host_openrgb: true,
             host_obs: false,
-            host_game_merge: true,
-            host_game_mode: default_game_mode(),
-            host_game_intensity: default_game_intensity(),
-            host_game_fade_ms: default_game_fade_ms(),
-            host_game_disabled_devices: Vec::new(),
+            host_chroma_paint_mode: default_chroma_paint_mode(),
+            host_chroma_paint_strength: default_paint_strength(),
+            host_chroma_paint_fade_ms: default_chroma_paint_fade_ms(),
+            host_openrgb_paint_mode: default_openrgb_paint_mode(),
+            host_openrgb_paint_strength: default_paint_strength(),
+            host_openrgb_paint_fade_ms: 0,
+            host_paint_disabled_devices: Vec::new(),
+            host_base_always_wins: false,
             host_obs_password: String::new(),
             lighting: BTreeMap::new(),
         }
@@ -385,10 +406,7 @@ impl Prefs {
         };
         let table = toml::from_str::<toml::Table>(&s).ok();
         // Fast path: a clean whole-struct parse (the overwhelmingly common case).
-        if let Ok(mut p) = toml::from_str::<Prefs>(&s) {
-            if let Some(table) = &table {
-                Self::migrate_game_mode(table, &mut p);
-            }
+        if let Ok(p) = toml::from_str::<Prefs>(&s) {
             return p;
         }
         // Something didn't fit the struct. Re-parse to a raw table and rebuild field-by-field so one
@@ -452,31 +470,21 @@ impl Prefs {
         salvage!("host_chroma", host_chroma);
         salvage!("host_openrgb", host_openrgb);
         salvage!("host_obs", host_obs);
-        salvage!("host_game_merge", host_game_merge);
-        salvage!("host_game_mode", host_game_mode);
-        salvage!("host_game_intensity", host_game_intensity);
-        salvage!("host_game_fade_ms", host_game_fade_ms);
-        salvage!("host_game_disabled_devices", host_game_disabled_devices);
+        salvage!("host_chroma_paint_mode", host_chroma_paint_mode);
+        salvage!("host_chroma_paint_strength", host_chroma_paint_strength);
+        salvage!("host_chroma_paint_fade_ms", host_chroma_paint_fade_ms);
+        salvage!("host_openrgb_paint_mode", host_openrgb_paint_mode);
+        salvage!("host_openrgb_paint_strength", host_openrgb_paint_strength);
+        salvage!("host_openrgb_paint_fade_ms", host_openrgb_paint_fade_ms);
+        salvage!("host_paint_disabled_devices", host_paint_disabled_devices);
+        salvage!("host_base_always_wins", host_base_always_wins);
         salvage!("host_obs_password", host_obs_password);
         // `lighting` is a per-device map — salvage it board-by-board so one corrupt record drops only
         // itself, not every other saved stack.
         if let Some(v) = table.get("lighting") {
             p.lighting = salvage_lighting(v);
         }
-        Self::migrate_game_mode(table, &mut p);
         p
-    }
-
-    fn migrate_game_mode(table: &toml::Table, p: &mut Prefs) {
-        let parsed_mode = table.get("host_game_mode").and_then(|v| v.as_str());
-        if let Some(mode) = parsed_mode {
-            p.host_game_mode = normalize_game_mode(mode).to_string();
-        } else if let Some(toml::Value::Boolean(merge)) = table.get("host_game_merge") {
-            p.host_game_mode = if *merge { "merge" } else { "replace" }.to_string();
-        } else {
-            p.host_game_mode = normalize_game_mode(&p.host_game_mode).to_string();
-        }
-        p.host_game_merge = p.host_game_mode != "replace";
     }
 
     /// Persist the prefs back to `app.toml`. Returns a status line.
@@ -942,8 +950,8 @@ pub fn set_host_obs_password(v: &str) -> String {
     }
 }
 
-/// Read the game blend policy (default true = merge/screen over your lighting).
-fn normalize_game_mode(v: &str) -> &'static str {
+/// Normalize an external-paint blend mode string to a known value (unknown → "merge").
+fn normalize_paint_mode(v: &str) -> &'static str {
     match v {
         "replace" => "replace",
         "boost" => "boost",
@@ -952,12 +960,9 @@ fn normalize_game_mode(v: &str) -> &'static str {
     }
 }
 
-pub fn host_game_mode() -> String {
-    normalize_game_mode(&Prefs::load().host_game_mode).to_string()
-}
-
-pub fn host_game_mode_index() -> i32 {
-    match host_game_mode().as_str() {
+/// The SplitToggle index for a paint mode (0 replace, 1 merge, 2 boost, 3 tint).
+fn paint_mode_index(mode: &str) -> i32 {
+    match mode {
         "replace" => 0,
         "boost" => 2,
         "tint" => 3,
@@ -965,64 +970,134 @@ pub fn host_game_mode_index() -> i32 {
     }
 }
 
-pub fn set_host_game_mode(v: &str) -> String {
+// ── CHROMA (games) paint lane ──────────────────────────────────────────────
+pub fn host_chroma_paint_mode() -> String {
+    normalize_paint_mode(&Prefs::load().host_chroma_paint_mode).to_string()
+}
+
+pub fn host_chroma_paint_mode_index() -> i32 {
+    paint_mode_index(&host_chroma_paint_mode())
+}
+
+pub fn set_host_chroma_paint_mode(v: &str) -> String {
     let mut p = Prefs::load();
-    let mode = normalize_game_mode(v);
-    p.host_game_mode = mode.to_string();
-    p.host_game_merge = mode != "replace";
+    let mode = normalize_paint_mode(v);
+    p.host_chroma_paint_mode = mode.to_string();
     match p.save() {
-        Ok(()) => format!("game chroma mode: {mode}"),
+        Ok(()) => format!("chroma games blend: {mode}"),
         Err(e) => format!("save failed: {e}"),
     }
 }
 
-pub fn host_game_intensity() -> u8 {
-    Prefs::load().host_game_intensity.clamp(0, 100)
+pub fn host_chroma_paint_strength() -> u8 {
+    Prefs::load().host_chroma_paint_strength.clamp(0, 100)
 }
 
-pub fn set_host_game_intensity(v: u8) -> String {
+pub fn set_host_chroma_paint_strength(v: u8) -> String {
     let mut p = Prefs::load();
-    p.host_game_intensity = v.clamp(0, 100);
+    p.host_chroma_paint_strength = v.clamp(0, 100);
     match p.save() {
-        Ok(()) => format!("game chroma intensity: {}%", p.host_game_intensity),
+        Ok(()) => format!("chroma games strength: {}%", p.host_chroma_paint_strength),
         Err(e) => format!("save failed: {e}"),
     }
 }
 
-pub fn host_game_fade_ms() -> u32 {
-    Prefs::load().host_game_fade_ms.clamp(0, 2500)
+pub fn host_chroma_paint_fade_ms() -> u32 {
+    Prefs::load().host_chroma_paint_fade_ms.clamp(0, 2500)
 }
 
-pub fn set_host_game_fade_ms(v: u32) -> String {
+pub fn set_host_chroma_paint_fade_ms(v: u32) -> String {
     let mut p = Prefs::load();
-    p.host_game_fade_ms = v.clamp(0, 2500);
+    p.host_chroma_paint_fade_ms = v.clamp(0, 2500);
     match p.save() {
-        Ok(()) => format!("game chroma fade: {} ms", p.host_game_fade_ms),
+        Ok(()) => format!("chroma games fade: {} ms", p.host_chroma_paint_fade_ms),
         Err(e) => format!("save failed: {e}"),
     }
 }
 
-pub fn host_game_disabled_devices() -> Vec<String> {
-    Prefs::load().host_game_disabled_devices
+// ── OPENRGB (tools) paint lane ─────────────────────────────────────────────
+pub fn host_openrgb_paint_mode() -> String {
+    normalize_paint_mode(&Prefs::load().host_openrgb_paint_mode).to_string()
 }
 
-pub fn host_game_device_enabled(id: &str) -> bool {
-    !Prefs::load().host_game_disabled_devices.iter().any(|x| x == id)
+pub fn host_openrgb_paint_mode_index() -> i32 {
+    paint_mode_index(&host_openrgb_paint_mode())
 }
 
-pub fn set_host_game_device(id: &str, enabled: bool, _attached: Vec<String>) -> String {
+pub fn set_host_openrgb_paint_mode(v: &str) -> String {
+    let mut p = Prefs::load();
+    let mode = normalize_paint_mode(v);
+    p.host_openrgb_paint_mode = mode.to_string();
+    match p.save() {
+        Ok(()) => format!("openrgb tools blend: {mode}"),
+        Err(e) => format!("save failed: {e}"),
+    }
+}
+
+pub fn host_openrgb_paint_strength() -> u8 {
+    Prefs::load().host_openrgb_paint_strength.clamp(0, 100)
+}
+
+pub fn set_host_openrgb_paint_strength(v: u8) -> String {
+    let mut p = Prefs::load();
+    p.host_openrgb_paint_strength = v.clamp(0, 100);
+    match p.save() {
+        Ok(()) => format!("openrgb tools strength: {}%", p.host_openrgb_paint_strength),
+        Err(e) => format!("save failed: {e}"),
+    }
+}
+
+pub fn host_openrgb_paint_fade_ms() -> u32 {
+    Prefs::load().host_openrgb_paint_fade_ms.clamp(0, 2500)
+}
+
+pub fn set_host_openrgb_paint_fade_ms(v: u32) -> String {
+    let mut p = Prefs::load();
+    p.host_openrgb_paint_fade_ms = v.clamp(0, 2500);
+    match p.save() {
+        Ok(()) => format!("openrgb tools fade: {} ms", p.host_openrgb_paint_fade_ms),
+        Err(e) => format!("save failed: {e}"),
+    }
+}
+
+// ── UNIVERSAL hands-off device list (Chroma AND OpenRGB) ────────────────────
+pub fn host_paint_disabled_devices() -> Vec<String> {
+    Prefs::load().host_paint_disabled_devices
+}
+
+pub fn host_paint_device_enabled(id: &str) -> bool {
+    !Prefs::load().host_paint_disabled_devices.iter().any(|x| x == id)
+}
+
+pub fn set_host_paint_device(id: &str, enabled: bool) -> String {
     let mut p = Prefs::load();
     if enabled {
-        p.host_game_disabled_devices.retain(|x| x != id);
-    } else {
-        if !p.host_game_disabled_devices.iter().any(|x| x == id) {
-            p.host_game_disabled_devices.push(id.to_string());
-        }
+        p.host_paint_disabled_devices.retain(|x| x != id);
+    } else if !p.host_paint_disabled_devices.iter().any(|x| x == id) {
+        p.host_paint_disabled_devices.push(id.to_string());
     }
-    p.host_game_disabled_devices.sort();
-    p.host_game_disabled_devices.dedup();
+    p.host_paint_disabled_devices.sort();
+    p.host_paint_disabled_devices.dedup();
     match p.save() {
-        Ok(()) => "game chroma devices saved".into(),
+        Ok(()) => "hands-off devices saved".into(),
+        Err(e) => format!("save failed: {e}"),
+    }
+}
+
+// ── my-lighting-always-wins base priority ──────────────────────────────────
+pub fn host_base_always_wins() -> bool {
+    Prefs::load().host_base_always_wins
+}
+
+pub fn set_host_base_always_wins(v: bool) -> String {
+    let mut p = Prefs::load();
+    p.host_base_always_wins = v;
+    match p.save() {
+        Ok(()) => if v {
+            "your lighting always wins — visitors paint underneath".into()
+        } else {
+            "visitors can paint over your lighting".into()
+        },
         Err(e) => format!("save failed: {e}"),
     }
 }
@@ -1086,27 +1161,68 @@ mod tests {
         assert!(start_minimized(), "true must persist + reload");
     }
 
+    /// Every new paint-lane key persists AND reloads through the real save/load — and the mode
+    /// getters normalize a junk on-disk value to a known mode rather than leaking it.
     #[test]
-    fn legacy_host_game_merge_false_migrates_to_replace_mode() {
+    fn host_paint_lanes_round_trip() {
         let _g = cwd_guard();
-        std::fs::write(Prefs::path(), "host_game_merge = false\n").unwrap();
-        let prefs = Prefs::load();
-        assert_eq!(prefs.host_game_mode, "replace");
-        assert!(!prefs.host_game_merge);
-        assert_eq!(host_game_mode(), "replace");
+        // Chroma lane
+        assert!(set_host_chroma_paint_mode("tint").contains("tint"));
+        assert_eq!(host_chroma_paint_mode(), "tint");
+        assert_eq!(host_chroma_paint_mode_index(), 3);
+        set_host_chroma_paint_strength(40);
+        assert_eq!(host_chroma_paint_strength(), 40);
+        set_host_chroma_paint_fade_ms(1200);
+        assert_eq!(host_chroma_paint_fade_ms(), 1200);
+        // OpenRGB lane
+        assert!(set_host_openrgb_paint_mode("boost").contains("boost"));
+        assert_eq!(host_openrgb_paint_mode(), "boost");
+        assert_eq!(host_openrgb_paint_mode_index(), 2);
+        set_host_openrgb_paint_strength(75);
+        assert_eq!(host_openrgb_paint_strength(), 75);
+        set_host_openrgb_paint_fade_ms(300);
+        assert_eq!(host_openrgb_paint_fade_ms(), 300);
+        // clamps
+        set_host_chroma_paint_strength(200);
+        assert_eq!(host_chroma_paint_strength(), 100);
+        set_host_openrgb_paint_fade_ms(9999);
+        assert_eq!(host_openrgb_paint_fade_ms(), 2500);
     }
 
+    /// A junk mode string on disk normalizes to "merge" through the getter (unreleased app: no
+    /// migration, the getter is the one guard).
     #[test]
-    fn malformed_host_game_mode_does_not_block_legacy_merge_migration() {
+    fn junk_paint_mode_normalizes_to_merge() {
         let _g = cwd_guard();
-        std::fs::write(
-            Prefs::path(),
-            "host_game_merge = false\nhost_game_mode = false\n",
-        )
-        .unwrap();
-        let prefs = Prefs::load();
-        assert_eq!(prefs.host_game_mode, "replace");
-        assert!(!prefs.host_game_merge);
+        std::fs::write(Prefs::path(), "host_chroma_paint_mode = \"garbage\"\n").unwrap();
+        assert_eq!(host_chroma_paint_mode(), "merge");
+        assert_eq!(host_chroma_paint_mode_index(), 1);
+    }
+
+    /// The universal hands-off list adds/removes by id and dedups, and `enabled` is the inverse of
+    /// membership.
+    #[test]
+    fn host_paint_devices_round_trip() {
+        let _g = cwd_guard();
+        assert!(host_paint_device_enabled("unit-a"), "empty list ⇒ every device enabled");
+        set_host_paint_device("unit-a", false);
+        set_host_paint_device("unit-a", false); // idempotent — no duplicate
+        assert!(!host_paint_device_enabled("unit-a"));
+        assert_eq!(host_paint_disabled_devices(), vec!["unit-a".to_string()]);
+        set_host_paint_device("unit-a", true);
+        assert!(host_paint_device_enabled("unit-a"));
+        assert!(host_paint_disabled_devices().is_empty());
+    }
+
+    /// `host_base_always_wins` persists both ways.
+    #[test]
+    fn host_base_always_wins_round_trips() {
+        let _g = cwd_guard();
+        assert!(!host_base_always_wins(), "default off");
+        set_host_base_always_wins(true);
+        assert!(host_base_always_wins());
+        set_host_base_always_wins(false);
+        assert!(!host_base_always_wins());
     }
 
     /// Lighting state persists per-device and reloads losslessly (fps + a multi-layer stack).
@@ -1249,11 +1365,14 @@ mod tests {
             host_chroma: !d.host_chroma,
             host_openrgb: !d.host_openrgb,
             host_obs: !d.host_obs,
-            host_game_merge: !d.host_game_merge,
-            host_game_mode: "boost".into(),
-            host_game_intensity: 65,
-            host_game_fade_ms: 700,
-            host_game_disabled_devices: vec!["unit-a".into(), "unit-b".into()],
+            host_chroma_paint_mode: "boost".into(),
+            host_chroma_paint_strength: 65,
+            host_chroma_paint_fade_ms: 700,
+            host_openrgb_paint_mode: "tint".into(),
+            host_openrgb_paint_strength: 33,
+            host_openrgb_paint_fade_ms: 250,
+            host_paint_disabled_devices: vec!["unit-a".into(), "unit-b".into()],
+            host_base_always_wins: !d.host_base_always_wins,
             host_obs_password: "test-pw".into(),
             lighting: d.lighting.clone(),
         };

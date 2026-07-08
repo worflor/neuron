@@ -198,9 +198,9 @@ mod tests {
         let a = k.next_source();
         let b = k.next_source();
         assert_ne!(a, b);
-        // SourceId(0) is the journal's CONFIG_SOURCE — never issued.
-        assert_ne!(a, crate::journal::CONFIG_SOURCE);
-        assert_ne!(b, crate::journal::CONFIG_SOURCE);
+        // SourceId(0) is never issued — next_source starts at 1.
+        assert_ne!(a, SourceId(0));
+        assert_ne!(b, SourceId(0));
     }
 
     #[test]

@@ -18,6 +18,12 @@ component DeviceGlyph inherits Path {
     in property <color> ink: Theme.text-faint;
     width: 26px;
     height: 26px;
+    // one SHARED authored coordinate space — every command set below is drawn on a 0..24 grid. Without a
+    // pinned viewbox each Path stretched to its OWN command bounding-box, so a narrow glyph (the mouse,
+    // x 8..18) fattened its stroke + drifted in optical scale versus a wide one (the keyboard, x 2..24).
+    // Fixing the viewbox to the design grid makes all five silhouettes scale identically and sit centred.
+    viewbox-width: 24;
+    viewbox-height: 24;
     stroke: root.ink;
     stroke-width: Theme.hair;
     fill: transparent;
@@ -255,7 +261,12 @@ component DeviceLine inherits Rectangle {
     opacity: root.d.adopting ? Theme.dim-gated : 1.0;
     background: selected ? Theme.bg-2 : ((ta.has-hover && !root.d.adopting) ? Theme.well : transparent);
     border-width: Theme.hair;
-    border-color: selected ? Theme.line : transparent;
+    // one consistent state ladder: selected wears the full hairline, a hovered row a fainter line-soft
+    // (it used to get the background wash but ZERO border), at rest nothing. Hover now reads as a real
+    // rung between rest and selected instead of a border-less wash.
+    border-color: selected ? Theme.line
+        : (ta.has-hover && !root.d.adopting) ? Theme.line-soft
+        : transparent;
     animate background, border-color, opacity { duration: Theme.quick; }
     property <bool> sheen-live: root.d.connected && ta.has-hover;
     // accent index tick on the selected channel — the only colour; the shared SelectTick is the bar +
@@ -292,9 +303,19 @@ component DeviceLine inherits Rectangle {
             horizontal-stretch: 1;
             alignment: center;
             spacing: 9px;
-            // header: name + pid/link mode; online state is shown as ink-local hover sheen
+            // header: a persistent connection LAMP + name + pid/link mode. The hover sheen stays a
+            // flourish, but at REST a connected row now reads at a glance (accent dot) vs a dropped one
+            // (dark lamp-off gutter) — before, rest-state connected and disconnected rendered identically.
             HorizontalLayout {
                 spacing: 8px;
+                VerticalLayout {
+                    alignment: center;
+                    Rectangle {
+                        width: Theme.dot; height: Theme.dot; border-radius: Theme.dot / 2;
+                        background: root.d.connected ? Theme.accent : Theme.lamp-off;
+                        animate background { duration: Theme.quick; }
+                    }
+                }
                 VerticalLayout {
                     alignment: center; spacing: 3px;
                     horizontal-stretch: 1;
@@ -337,6 +358,9 @@ component DeviceLine inherits Rectangle {
                     // never prints "LIGHT —"; each key shows only where the descriptor says it's real.
                     if root.d.cap-dpi : Readout { key: "DPI"; value: root.d.dpi; }
                     if root.d.cap-poll : Readout { key: "POLL"; value: root.d.polling; }
+                    // BATT rides the SAME key-over-value Readout rhythm as DPI/POLL (identical label row),
+                    // with the drawn cell gauge APPENDED after the value — so the vitals strip shares one
+                    // baseline: the value leads the second row, the gauge trails it as a graphic footnote.
                     if root.d.battery != "" : VerticalLayout {
                         alignment: center; spacing: 3px;
                         Text {
@@ -348,25 +372,7 @@ component DeviceLine inherits Rectangle {
                         }
                         HorizontalLayout {
                             spacing: 6px;
-                            // the drawn cell gauge — a level is a gauge, not a string
-                            VerticalLayout {
-                                alignment: center;
-                                Rectangle {
-                                    width: 30px; height: 8px;
-                                    border-width: Theme.hair;
-                                    border-color: Theme.line;
-                                    border-radius: 1px;
-                                    Rectangle {
-                                        x: 1px; y: 1px;
-                                        height: parent.height - 2px;
-                                        width: max(0px, (parent.width - 2px) * max(0.0, root.d.battery-frac));
-                                        background: root.d.charging ? Theme.accent
-                                            : root.d.battery-frac < 0.2 ? Theme.warn
-                                            : Theme.text-dim;
-                                        animate background { duration: Theme.quick; }
-                                    }
-                                }
-                            }
+                            // value first — matches Readout's fs-data/600 value line (the shared baseline)
                             Text {
                                 text: root.d.battery;
                                 color: root.d.charging ? Theme.accent : Theme.text-mid;
@@ -383,6 +389,25 @@ component DeviceLine inherits Rectangle {
                                 font-family: Theme.mono;
                                 letter-spacing: Theme.track-2;
                                 vertical-alignment: center;
+                            }
+                            // …then the drawn cell gauge, appended after the value — a level is a gauge, not a string
+                            VerticalLayout {
+                                alignment: center;
+                                Rectangle {
+                                    width: 30px; height: 8px;
+                                    border-width: Theme.hair;
+                                    border-color: Theme.line;
+                                    border-radius: 1px;
+                                    Rectangle {
+                                        x: 1px; y: 1px;
+                                        height: parent.height - 2px;
+                                        width: max(0px, (parent.width - 2px) * max(0.0, root.d.battery-frac));
+                                        background: root.d.charging ? Theme.accent
+                                            : root.d.battery-frac < Theme.battery-low-frac ? Theme.warn
+                                            : Theme.text-dim;
+                                        animate background { duration: Theme.quick; }
+                                    }
+                                }
                             }
                         }
                     }
@@ -413,6 +438,534 @@ component DeviceLine inherits Rectangle {
     }
 }
 
+// SNAP TAP STAGE — "THE DIVERGENCE". The self-demonstrating visual for the Snap Tap mechanical
+// advantage, reimagined as a TWO-PLAYER RACE on the same input. Two stacked full-width lanes are fed
+// the IDENTICAL counter-strafe sequence (the shared [A] [D] keycaps drive both): the upper RAW lane is
+// the dim, normal-SOCD player; the lower SNAP lane is the glowing accent player. On the snap the accent
+// player flips to D INSTANTLY while the dim one STALLS in the SOCD dead-zone — and the glowing LEAD-GAP
+// spanning the horizontal distance between them is the hero element: the edge, quantified. Same trigger,
+// one's already there, one's stuck. No text — accent=winner / dim=laggard carries it.
+//
+//   [A] ........... shared input lights both lanes ........... [D]
+//   raw   o..........|..  (stalls in the dead-zone)  — dim hollow ring, frozen
+//   snap  *======================>(O)  halo + rail-flash  — accent, snapped to D, instant
+//              |---- LEAD-GAP (glows) ----|             the advantage, made visible
+//
+// PHASES have a RHYTHM — the Timer's interval is bound to the phase, so beats vary: the SNAP (2) DWELLS
+// longest as the hero frame, catchup is quick, ready/reset just breathe. The snap flips fast then HOLDS
+// the rest of its (long) tick — that held frame after the instant flip is what sells "instant":
+//   0  ready   — both markers at A (left), keys up (a breath before the beat)         550ms
+//   1  strafe  — A pressed ([A] lit on both lanes); both markers hold the A end       750ms
+//   2  SNAP    — D tapped while A held: accent SNAPS to D (instant) + halo + the SNAP  1150ms (hero)
+//               rail FLASHES; dim STALLS in the dead-zone (warn pulse); LEAD-GAP blooms
+//   3  catchup — dim limps over to D (slow, too late); the lead-gap collapses          900ms
+//   4  reset   — keys up; both ease back to A, then loop                               650ms
+// `live` gates the Timer so it only animates while the option is REVEALED (sealed = perfectly still).
+// INTERACTIVE hand-off: while ANY cap is held, control stays yours indefinitely; ~2.4s after the LAST
+// release the idle timer fires ONCE and hands back to the loop at phase 0 (the ready beat, keys up) so
+// markers glide home. Releasing keys does NOT recentre — each marker RESTS at the last resolved side.
+component SnapTapStage inherits Rectangle {
+    in property <bool> live: false;        // REVEALED → the demo plays; LOCKED → frozen
+    property <int> phase: 0;
+
+    // ── the demo's private timing scale — named so the choreography reads at a glance (each was tuned
+    // by eye; do NOT retime). The snap-INSTANT halves of the `snapping ? fast : …` ternaries stay
+    // inline — they're the crisp flip, semantically bound to the snap, not part of this settle scale. ──
+    property <duration> dur-settle: 360ms;   // the weighty glide — markers / lead-gap easing back to rest
+    property <duration> dur-lag:    380ms;   // the raw laggard's slow limp across the rail
+    property <duration> dur-warn:   300ms;   // the dead-zone flare + the trapped marker's warn tint
+    property <duration> dur-halo:   320ms;   // the accent hero's halo bloom
+    property <duration> dur-ticks:  220ms;   // the lead-gap measurement ticks fading in
+
+    // ── INTERACTIVE DRIVE — once revealed, you can press-and-hold the [A]/[D] caps and drive the race
+    // yourself: the snap lane snaps to the last-pressed instantly while the raw lane stalls in the
+    // dead-zone when both are held. Purely illustrative — works on any device (only the ENABLE step is
+    // gated). While `interactive`, positions DERIVE from the held keys; a declarative idle Timer hands
+    // control back to the auto-loop ~2.4s after the LAST release (it can never fire while a key is held),
+    // and the auto-loop only advances `phase` while !interactive. ──
+    property <bool> a-held: false;         // [A] cap currently pressed (mouse-down)
+    property <bool> d-held: false;         // [D] cap currently pressed
+    property <int> last-key: 0;            // 0 = A, 1 = D — the last RESOLVED side (press wins; releasing one of two held keys hands it to the survivor)
+    property <bool> interactive: false;    // the user is driving (vs the auto-loop)
+
+    // ── the SHARED full-width lane geometry — both rails span MOST of the card (A=left, D=right) ──
+    property <length> inset: 30px;         // rail end ← card edge; keeps markers off the keycaps
+    property <length> rail-x0: self.inset;
+    property <length> rail-w: self.width - 2 * self.inset;
+    // marker centre x for a normalised position p (0 = A end, 1 = D end), in card coords.
+    pure function mx(p: float) -> length { root.rail-x0 + p * root.rail-w }
+    // the two stacked rails' y centres (and the keycap row above), inside the ~150px host.
+    property <length> caps-y: 26px;        // the shared input-cue keycap row
+    property <length> rail-t-y: 76px;      // upper rail — RAW (dim)
+    property <length> rail-b-y: 124px;     // lower rail — SNAP TAP (accent, the hero)
+
+    // the ACCENT (snap-tap) player's normalised position 0(A) .. 1(D).
+    //   INTERACTIVE: snap to last-pressed — both held → last-key; only D → D; only A → A; neither → rest.
+    //   AUTO:        the phased loop (ready/strafe→A, SNAP/catchup→D, reset→A).
+    property <float> accent-pos: root.interactive
+        ? ( (root.a-held && root.d-held) ? (root.last-key == 1 ? 1.0 : 0.0)
+            : root.d-held ? 1.0
+            : root.a-held ? 0.0
+            // releasing inputs doesn't move you — rest where the last input resolved, no recentre.
+            : (root.last-key == 1 ? 1.0 : 0.0) )
+        : ( root.phase == 0 ? 0.0 :        // ready  → A
+            root.phase == 1 ? 0.0 :        // strafe → A (agrees)
+            root.phase == 2 ? 1.0 :        // SNAP   → D (instant)
+            root.phase == 3 ? 1.0 :        // catchup→ holds D
+            0.0 );                          // reset  → A
+    // the DIM (raw SOCD) player: STALLS dead-centre when both are held (the dead-zone), else follows.
+    //   INTERACTIVE: both held → 0.5 (stall); only D → D; only A → A; neither → rest.
+    //   AUTO:        agrees on strafe, stalls on the snap, then limps to D.
+    property <float> dim-pos: root.interactive
+        ? ( (root.a-held && root.d-held) ? 0.5   // both held → stall dead-centre (the dead-zone)
+            : root.d-held ? 1.0
+            : root.a-held ? 0.0
+            // releasing inputs doesn't move you — rest where the last input resolved, no recentre.
+            : (root.last-key == 1 ? 1.0 : 0.0) )
+        : ( root.phase == 0 ? 0.0 :        // ready  → A
+            root.phase == 1 ? 0.0 :        // strafe → A (agrees)
+            root.phase == 2 ? 0.5 :        // STALLS dead-centre — the neutral dead-zone the edge removes
+            root.phase == 3 ? 1.0 :        // limps over (too late)
+            0.0 );                          // reset  → A
+    // which key is "pressed" (lights BOTH lanes' shared cue). Interactive → the real held state; auto →
+    // the scripted sequence (A held through 1,2,3; D tapped 2,3).
+    property <bool> a-down: root.interactive ? root.a-held : (root.phase == 1 || root.phase == 2 || root.phase == 3);
+    property <bool> d-down: root.interactive ? root.d-held : (root.phase == 2 || root.phase == 3);
+    // THE SNAP — drives the accent's crisp easing, the halo bloom, the rail-flash, the gap, the warn dead-zone.
+    // Interactive: both keys held = the live SOCD conflict (raw stalls, snap holds last). Auto: phase 2.
+    property <bool> snapping: root.interactive ? (root.a-held && root.d-held) : (root.phase == 2);
+    // the lead-gap is "live" (visible) whenever the accent is meaningfully ahead of the dim marker.
+    property <bool> gap-open: root.interactive ? (root.a-held && root.d-held) : (root.phase == 2);
+
+    height: 150px;
+    border-radius: Theme.radius;
+    background: Theme.bg-2;
+    border-width: Theme.hair;
+    border-color: Theme.line;
+    clip: true;
+
+    // the loop: 5 phases. The snap (2) flips fast then holds the rest of its (long) tick; 0 + 4 breathe.
+    // It keeps ticking while the user drives but only ADVANCES the phase when !interactive — manual
+    // driving never fights the auto-loop. Hand-back (the idle timer) resets to phase 0, so the loop
+    // always re-enters at the ready beat and the markers glide home.
+    Timer {
+        // beat lengths — the SNAP dwells longest (the hero frame), ready/reset just breathe
+        interval: root.phase == 2 ? 1150ms
+                : root.phase == 3 ? 900ms
+                : root.phase == 1 ? 750ms
+                : root.phase == 4 ? 650ms
+                : 550ms;
+        running: root.live;
+        triggered => { if (!root.interactive) { root.phase = mod(root.phase + 1, 5); } }
+    }
+    // IDLE-RESUME — declarative: it only RUNS once driving AND all caps are up, so holding any key keeps
+    // control yours indefinitely (running goes false while held) and any re-press cancels the countdown.
+    // ~2.4s after the last release it fires ONCE, handing back to the auto-loop at phase 0 (the ready
+    // beat, keys up) so the markers glide home smoothly instead of jumping into a stale frozen phase.
+    idle-timer := Timer {
+        interval: 2400ms;
+        running: root.interactive && !root.a-held && !root.d-held;
+        triggered => { root.interactive = false; root.phase = 0; }
+    }
+    function start-driving(key: int) {
+        root.last-key = key;
+        root.interactive = true;
+    }
+
+    // ── the two RAILS — faint full-width tracks the markers ride; end stops at A and D. Split into two
+    // explicit rails so the SNAP rail can FLASH accent while snapping (the old comet streak, folded into
+    // the rail itself). RAW rail stays a plain hairline. Both keep their A/D end-stop ticks. ──
+    // RAW rail (dim)
+    Rectangle {
+        x: root.rail-x0; y: root.rail-t-y - 1px;
+        width: root.rail-w; height: 2px; border-radius: 1px;
+        background: Theme.line;
+        for ex in [0.0, 1.0] : Rectangle {
+            x: ex * root.rail-w - 1px; y: -4px;
+            width: 2px; height: 10px; border-radius: 1px;
+            background: Theme.text-faint.with-alpha(0.6);
+        }
+    }
+    // SNAP rail (accent hairline) — brightens on the snap, then eases back (the rail-flash punctuation).
+    Rectangle {
+        x: root.rail-x0; y: root.rail-b-y - 1px;
+        width: root.rail-w; height: 2px; border-radius: 1px;
+        background: root.snapping ? Theme.accent.with-alpha(0.55) : Theme.accent-line;
+        animate background { duration: root.snapping ? 90ms : 420ms; easing: ease-out; }
+        for ex in [0.0, 1.0] : Rectangle {
+            x: ex * root.rail-w - 1px; y: -4px;
+            width: 2px; height: 10px; border-radius: 1px;
+            background: Theme.text-faint.with-alpha(0.6);
+        }
+    }
+    // the DEAD-ZONE on the RAW rail — the neutral trap where opposing inputs cancel. The dim player falls
+    // in and STALLS dead-centre; the SNAP-TAP rail has NONE. Faintly present, it flares warn as the marker
+    // is caught in it on the snap — naming the exact stall the advantage removes (no text needed).
+    Rectangle {
+        x: root.mx(0.38); y: root.rail-t-y - 9px;
+        width: root.mx(0.62) - root.mx(0.38); height: 18px;
+        border-radius: Theme.radius-sm;
+        background: Theme.warn.with-alpha(root.snapping ? 0.16 : 0.06);
+        border-width: Theme.hair;
+        border-color: Theme.warn.with-alpha(root.snapping ? 0.55 : 0.22);
+        animate background, border-color { duration: root.dur-warn; easing: ease-out; }
+    }
+
+    // ── the LEAD-GAP — THE SIGNATURE. A glowing accent band bridging the two lanes' x-positions:
+    // from where the dim player STALLED to where the accent player SNAPPED. It blooms on the snap = the
+    // edge made visible ("this far ahead"), then collapses as the dim one finally limps over on catchup.
+    Rectangle {
+        // span horizontally from the dim marker (left edge of the gap) to the accent marker (right edge),
+        // spanning vertically between the two rails so it visibly connects laggard → winner.
+        x: root.mx(root.dim-pos);
+        y: root.rail-t-y;
+        width: max(0px, root.mx(root.accent-pos) - root.mx(root.dim-pos));
+        height: root.rail-b-y - root.rail-t-y;
+        border-radius: Theme.radius-sm;
+        background: Theme.accent-glow;
+        border-width: Theme.hair;
+        border-color: Theme.accent-line;
+        opacity: root.gap-open ? 1.0 : 0.0;
+        // bloom fast with the snap; fade as it collapses on catchup. width follows the markers' easing.
+        animate x { duration: root.snapping ? 90ms : root.dur-settle; easing: root.snapping ? ease-out : ease-in-out; }
+        animate width { duration: root.snapping ? 90ms : root.dur-settle; easing: root.snapping ? ease-out : ease-in-out; }
+        animate opacity { duration: root.gap-open ? 140ms : 280ms; easing: ease-out; }
+        // MEASUREMENT TICKS — faint vertical hairlines stepping across the gap, brightening toward the
+        // winning (D, right) edge: the lead reads as QUANTIFIED ("this many steps ahead"), not a blob.
+        // Evenly spaced by fraction so they ride the gap as it blooms/collapses; the directional ramp
+        // gives a soft shimmer toward D. Hidden when the gap is too narrow to subdivide cleanly.
+        for tk in [0.2, 0.4, 0.6, 0.8] : Rectangle {
+            x: parent.width * tk - self.width / 2;
+            y: 2px; width: 1px; height: parent.height - 4px;
+            border-radius: 0.5px;
+            background: Theme.accent;
+            // ramp brighter toward D — the lead, measured off; only when the gap is wide enough to read.
+            opacity: (root.gap-open && parent.width > 24px) ? (0.18 + tk * 0.34) : 0.0;
+            animate opacity { duration: root.dur-ticks; easing: ease-out; }
+        }
+        // a brighter inner edge on the winning (right) side — the leading front of the advantage.
+        Rectangle {
+            x: parent.width - self.width; width: 2px; height: parent.height;
+            border-radius: 1px; background: Theme.accent;
+            opacity: root.gap-open ? 0.7 : 0.0;
+            animate opacity { duration: 200ms; }
+        }
+    }
+
+    // ── the RAW (dim) marker — normal SOCD, a HOLLOW ring on the upper rail; the laggard. ──
+    Rectangle {
+        x: root.mx(root.dim-pos) - self.width / 2;
+        y: root.rail-t-y - self.height / 2;
+        width: 13px; height: 13px; border-radius: 7px;
+        background: transparent;
+        border-width: 1.5px;
+        // tints WARN when caught in the dead-zone on the snap (trapped); dim otherwise — the stall while
+        // the accent is already at D IS the pitch.
+        border-color: root.snapping ? Theme.warn : Theme.text-faint.with-alpha(0.9);
+        animate border-color { duration: root.dur-warn; easing: ease-out; }
+        // ALWAYS moves with weight (slow) — so on the snap it visibly LAGS, stuck in the dead-zone.
+        animate x { duration: root.dur-lag; easing: ease-in-out; }
+        opacity: root.snapping ? 1.0 : 0.6;
+        animate opacity { duration: Theme.settle; }
+        // a faint WARNING PULSE ring at the stuck spot on the snap — "frozen here, weighty, late".
+        Rectangle {
+            x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+            width: root.snapping ? 32px : 13px; height: self.width; border-radius: self.width / 2;
+            background: transparent;
+            border-width: 1.5px;
+            border-color: Theme.warn;
+            opacity: root.snapping ? 0.8 : 0.0;
+            animate width, opacity { duration: root.dur-settle; easing: ease-out; }
+        }
+    }
+
+    // ── the SNAP TAP (accent) marker — the winner; solid, glowing, on the lower rail. ──
+    Rectangle {
+        x: root.mx(root.accent-pos) - self.width / 2;
+        y: root.rail-b-y - self.height / 2;
+        width: 14px; height: 14px; border-radius: 7px;
+        background: Theme.accent;
+        // crisp instant reversal on the snap (~85ms ease-out); weighty glide otherwise — the edge's feel.
+        animate x {
+            duration: root.snapping ? 85ms : root.dur-settle;
+            easing: root.snapping ? ease-out : ease-in-out;
+        }
+        // a steady accent halo (the glow that marks it as the hero), blooming bolder on the snap instant
+        // and giving a soft confirming pulse at D on catchup ("snap-tap arrived first").
+        Rectangle {
+            x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+            width: root.snapping ? 38px : (root.phase == 3 ? 30px : 22px);
+            height: self.width; border-radius: self.width / 2;
+            background: Theme.accent-glow;
+            border-width: 1.5px;
+            border-color: Theme.accent;
+            opacity: root.snapping ? 1.0 : (root.phase == 3 ? 0.7 : (root.phase == 0 || root.phase == 4 ? 0.0 : 0.5));
+            animate width, opacity { duration: root.dur-halo; easing: ease-out; }
+        }
+    }
+
+    // ── DISCOVERABILITY HINT — a quiet nudge between the caps that you can drive it yourself. Only shows
+    // in the live auto-demo (fades the instant you take over). Behind the caps; Text has no input. ──
+    Text {
+        text: "hold A + D yourself";
+        color: Theme.text-faint;
+        font-family: Theme.mono; font-size: Theme.fs-small;
+        horizontal-alignment: center; vertical-alignment: center;
+        x: 0; width: parent.width; y: root.caps-y - self.height / 2;
+        opacity: (root.live && !root.interactive) ? 0.8 : 0.0;
+        animate opacity { duration: 300ms; easing: ease-out; }
+    }
+
+    // ── the SHARED INPUT CUE — [A] far left, [D] far right. Now LIVE: press-and-hold to drive the race.
+    // Each cap lights (accent + depress) when its key is down, lifts/brightens a hair on hover (so it
+    // reads as pressable BEFORE the click), and its TouchArea feeds a-held/d-held + last-key (the idle
+    // Timer resumes declaratively on release). Works regardless of device support — the demo, not the gate. ──
+    for kc in [
+        { lbl: "A", key: 0, nx: 0.0 },
+        { lbl: "D", key: 1, nx: 1.0 },
+    ] : Rectangle {
+        property <bool> down: kc.key == 0 ? root.a-down : root.d-down;
+        x: root.mx(kc.nx) - self.width / 2;
+        // pressed → dips (depresses) a hair; hovered (not pressed) → lifts a hair — both tactile.
+        y: root.caps-y - self.height / 2
+            + (self.down ? 1px : (cap-ta.has-hover ? -1px : 0px));
+        width: 28px; height: 28px;
+        border-radius: Theme.radius-sm;
+        background: self.down ? Theme.accent-glow : (cap-ta.has-hover ? Theme.well : Theme.well.with-alpha(0.6));
+        border-width: Theme.hair;
+        border-color: self.down ? Theme.accent-line : (cap-ta.has-hover ? Theme.text-faint : Theme.line);
+        animate background, border-color, y { duration: Theme.quick; easing: ease-out; }
+        Text {
+            text: kc.lbl;
+            // hover pre-brightens the glyph (text-mid) before it lights accent on press.
+            color: parent.down ? Theme.accent : (cap-ta.has-hover ? Theme.text-mid : Theme.text-dim);
+            font-family: Theme.mono; font-size: Theme.fs-small; font-weight: 700;
+            horizontal-alignment: center; vertical-alignment: center;
+            width: parent.width; height: parent.height;
+            animate color { duration: Theme.quick; }
+        }
+        cap-ta := TouchArea {
+            mouse-cursor: MouseCursor.pointer;
+            pointer-event(e) => {
+                if (e.kind == PointerEventKind.down) {
+                    if (kc.key == 0) { root.a-held = true; } else { root.d-held = true; }
+                    root.start-driving(kc.key);   // arm interactivity (the idle timer is declarative)
+                } else if (e.kind == PointerEventKind.up || e.kind == PointerEventKind.cancel) {
+                    if (kc.key == 0) { root.a-held = false; } else { root.d-held = false; }
+                    // if the OTHER key is still held, releasing this one re-resolves to the survivor — so the
+                    // eventual full-release rest stays where the markers are already shown (no teleport).
+                    if (root.a-held) { root.last-key = 0; } else if (root.d-held) { root.last-key = 1; }
+                    // no timer poke — with all caps up the idle Timer's `running` binding starts its ~2.4s countdown.
+                }
+            }
+        }
+    }
+}
+
+// MECH ADVANTAGE — the reusable two-step-consent card for an opt-in, edge-giving device feature.
+// LOCKED: the stage visual is dimmed + sealed (a lock glyph), with a "click to reveal ▸" affordance —
+// you can tell something powerful is here. REVEALED: the visual plays its demo and a clear TOGGLE
+// appears with a quiet ⚠ warn accent (the legality acknowledgment IS the consent click, not a
+// paragraph). If the device can't do it, the toggle stays GATED ("needs a supporting device") —
+// honest, like the other gates. The stage visual is passed in as the `stage` content.
+component MechAdvantage inherits Card {
+    in property <string> name;             // the option name (e.g. "snap tap")
+    in property <string> tagline;          // one short line shown REVEALED (what the edge is)
+    in property <bool> supported;          // a capable device is connected (else GATED)
+    in-out property <bool> revealed;       // step 1 done
+    in-out property <bool> enabled;        // step 2: the feature is on
+    // shared invite-hover: the reveal ROW writes here so the SEAL (a sibling, out of the row's `if`
+    // scope) can light its lock too — hovering either invites the unseal.
+    property <bool> row-hover: false;
+    callback reveal();                     // step 1 click
+    callback set-enabled(bool);            // step 2 toggle
+
+    // the enabled card wears Card's accent-line frame (active = a lit/chosen surface); Card provides
+    // the bg-2 ground + hairline + the border-color settle.
+    active: root.enabled;
+    clip: true;
+
+    VerticalLayout {
+        padding: 12px;
+        spacing: 10px;
+        // header: the option name + a state word on the right (sealed / ready / ON / gated)
+        HorizontalLayout {
+            spacing: 8px;
+            VerticalLayout {
+                alignment: center;
+                Mono {
+                    text: root.name;
+                    color: root.enabled ? Theme.accent : Theme.text-mid;
+                    font-size: Theme.fs-small; font-weight: 700;
+                    letter-spacing: Theme.track-2;
+                    animate color { duration: Theme.quick; }
+                }
+            }
+            Rectangle {}
+            VerticalLayout {
+                alignment: center;
+                Mono {
+                    text: !root.supported ? "GATED"
+                        : root.enabled ? "ON"
+                        : root.revealed ? "READY"
+                        : "SEALED";
+                    color: !root.supported ? Theme.warn
+                        : root.enabled ? Theme.accent
+                        : Theme.text-faint;
+                    font-size: Theme.fs-small; font-weight: 700;
+                    letter-spacing: Theme.track-2;
+                }
+            }
+        }
+
+        // ── the STAGE — the demo visual, with a LOCKED overlay until revealed ──
+        stage-host := Rectangle {
+            height: 150px;
+            // the passed-in stage visual fills this host (a layout stretches the child to full width)
+            VerticalLayout { @children }
+            // the SEAL — a dim scrim + lock glyph over the visual until step 1. Fades on reveal.
+            // Hovering the sealed stage (or the reveal row) gives the lock a "press me" affordance: it
+            // lifts a hair + gains a faint accent glow, then settles back on leave. The seal is itself
+            // clickable (so the whole sealed card invites the unseal, not just the row).
+            seal := Rectangle {
+                // shared invite-hover: this scrim OR the reveal row below it.
+                property <bool> invite: !root.revealed && (seal-ta.has-hover || root.row-hover);
+                width: parent.width; height: parent.height;
+                border-radius: Theme.radius;
+                background: Theme.bg-2.with-alpha(0.82);
+                opacity: root.revealed ? 0.0 : 1.0;
+                visible: root.revealed ? false : true;
+                // the UNSEAL — a deliberate fade rather than a blink (the lock scales down a touch as it
+                // goes, like a key turning, then the scrim clears).
+                animate opacity { duration: Theme.settle; easing: ease-in-out; }
+                // a faint accent halo behind the lock on hover — the "something powerful here" tell.
+                Rectangle {
+                    x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+                    width: 64px; height: 64px; border-radius: 32px;
+                    background: Theme.accent-glow;
+                    opacity: parent.invite ? 0.9 : 0.0;
+                    animate opacity { duration: Theme.settle; easing: ease-out; }
+                }
+                // a small procedural LOCK (shackle arc approximated by a rounded-top body + a keyhole).
+                // A fixed-footprint wrapper keeps the layout still; the glyph inside scales/lifts.
+                VerticalLayout {
+                    alignment: center;
+                    HorizontalLayout {
+                        alignment: center;
+                        Rectangle {
+                            width: 34px; height: 34px;   // stable footprint — no layout shift
+                            lock := Rectangle {
+                                // a unit length that scales the whole glyph: full size sealed, a touch
+                                // smaller as it unseals (the "turn"), drawn from a 34u design grid.
+                                property <length> u: (root.revealed ? 0.8px : 1px) * (seal.invite ? 1.06 : 1.0);
+                                width: 34 * self.u; height: 34 * self.u;
+                                x: (parent.width - self.width) / 2;
+                                // lift a hair on invite-hover — the "press me" affordance.
+                                y: (parent.height - self.height) / 2 + (seal.invite ? -2px : 0px);
+                                animate width, height, y { duration: Theme.settle; easing: ease-in-out; }
+                                // shackle — a hollow rounded rect, bottom hidden behind the body
+                                Rectangle {
+                                    x: 9 * lock.u; y: 3 * lock.u; width: 16 * lock.u; height: 16 * lock.u;
+                                    border-radius: 8 * lock.u;
+                                    border-width: 2px;
+                                    // brightens toward accent on invite — it reads as armed/pressable.
+                                    border-color: seal.invite ? Theme.accent : Theme.text-dim;
+                                    animate border-color { duration: Theme.settle; }
+                                }
+                                // body
+                                Rectangle {
+                                    x: 6 * lock.u; y: 13 * lock.u; width: 22 * lock.u; height: 17 * lock.u;
+                                    border-radius: 3 * lock.u;
+                                    background: seal.invite ? Theme.accent : Theme.text-dim;
+                                    animate background { duration: Theme.settle; }
+                                }
+                                // keyhole
+                                Rectangle {
+                                    x: 15 * lock.u; y: 19 * lock.u; width: 4 * lock.u; height: 4 * lock.u;
+                                    border-radius: 2 * lock.u;
+                                    background: Theme.bg-2;
+                                }
+                            }
+                        }
+                    }
+                }
+                // the sealed stage is itself the unseal target — the whole card invites the click.
+                seal-ta := TouchArea {
+                    mouse-cursor: MouseCursor.pointer;
+                    clicked => { root.reveal(); }
+                }
+            }
+        }
+
+        // ── the GATE ROW — step 1 (reveal) or step 2 (enable), depending on state ──
+        // The demo is ALWAYS revealable (it's illustrative — you should be able to watch what the
+        // feature does even on a board that can't run it). Only the ENABLE step is device-gated.
+        if !root.revealed : Rectangle {
+            height: Theme.seg-h;
+            border-radius: Theme.radius-sm;
+            background: rta.has-hover ? Theme.well : Theme.bg-2;
+            border-width: Theme.hair;
+            border-color: rta.has-hover ? Theme.text-faint : Theme.line;
+            animate background, border-color { duration: Theme.quick; }
+            HorizontalLayout {
+                alignment: center;
+                Text {
+                    text: "click to reveal ▸";
+                    color: rta.has-hover ? Theme.text-mid : Theme.text-dim;
+                    font-family: Theme.mono; font-size: Theme.fs-small; font-weight: 700;
+                    vertical-alignment: center;
+                }
+            }
+            rta := TouchArea {
+                mouse-cursor: MouseCursor.pointer;
+                clicked => { root.reveal(); }
+                // mirror hover up so the SEAL's lock lights too (the row and seal invite together).
+                changed has-hover => { root.row-hover = self.has-hover; }
+            }
+        }
+        // REVEALED → the tagline, then step 2: the enable toggle (supported) or the honest gate (not).
+        if root.revealed : VerticalLayout {
+            spacing: 8px;
+            if root.tagline != "" : Mono {
+                text: root.tagline;
+                color: Theme.text-faint;
+                font-size: Theme.fs-small;
+                wrap: word-wrap;
+            }
+            // supported → the ⚠ legality accent + the enable toggle
+            if root.supported : HorizontalLayout {
+                spacing: 8px;
+                // ⚠ — the legality acknowledgment as a quiet accent, NOT a paragraph
+                VerticalLayout {
+                    alignment: center;
+                    Text {
+                        text: "!";
+                        color: Theme.warn;
+                        font-family: Theme.mono; font-size: Theme.fs-body;
+                        vertical-alignment: center;
+                    }
+                }
+                Rectangle {}
+                VerticalLayout {
+                    alignment: center;
+                    Toggle {
+                        caption: "enable";
+                        checked: root.enabled;
+                        toggled(v) => { root.set-enabled(v); }
+                    }
+                }
+            }
+            // unsupported → the honest gate, consistent with the other "needs hardware" lines
+            if !root.supported : Mono {
+                text: "needs a supporting device";
+                color: Theme.text-faint;
+                font-size: Theme.fs-small;
+                wrap: word-wrap;
+            }
+        }
+    }
+}
+
 export component DevicePanel inherits VerticalLayout {
     spacing: 0;
 
@@ -425,6 +978,31 @@ export component DevicePanel inherits VerticalLayout {
     property <bool> adv-sleep: State.sel-can-idle;
     property <bool> adv-sensor: State.sel-can-dpi;
     property <bool> adv-any: root.adv-wheel || root.adv-sleep || root.adv-sensor;
+
+    // which STAGE cell the live DPI fader is currently sitting on — the stage table's NEAR highlight
+    // (a quiet secondary marker, not the active/lit cell). No indexOf in Slint, so a bounded ternary
+    // over the stage list (Razer caps at ~5 DPI stages); an unmatched fader yields -1 (no highlight).
+    property <int> dpi-near-stage:
+        (State.dpi-stage-nums.length > 0 && round(State.dpi) == State.dpi-stage-nums[0]) ? 0
+        : (State.dpi-stage-nums.length > 1 && round(State.dpi) == State.dpi-stage-nums[1]) ? 1
+        : (State.dpi-stage-nums.length > 2 && round(State.dpi) == State.dpi-stage-nums[2]) ? 2
+        : (State.dpi-stage-nums.length > 3 && round(State.dpi) == State.dpi-stage-nums[3]) ? 3
+        : (State.dpi-stage-nums.length > 4 && round(State.dpi) == State.dpi-stage-nums[4]) ? 4
+        : -1;
+
+    // SCAN's discard-guard: when there are unapplied FEEL edits (State.feel-dirty), a scan would throw
+    // them away (it re-seeds the drafts from hardware), so the first SCAN click ARMS (relabels to a
+    // "sure?" verb, reddened) and only a second click within the confirm window actually re-scans —
+    // ConfirmButton's semantics, inlined onto the left half of the deck. A clean deck scans on one click.
+    property <bool> scan-armed: false;
+    Timer {
+        interval: Theme.confirm-window;
+        running: root.scan-armed;
+        triggered => { root.scan-armed = false; }
+    }
+    // walking away from a dirty deck (a device reselect discards drafts) also disarms — the drafts the
+    // arm was protecting are gone, so a stale armed state would be a lie.
+    changed adv-any => { root.scan-armed = false; }
 
     PanelHead {
         label: "DEVICE";
@@ -439,14 +1017,27 @@ export component DevicePanel inherits VerticalLayout {
             width: 150px;
             alignment: center;
             SplitButton {
-                left-text: "scan";
+                // SCAN relabels to the armed "discard?" verb (reddened) while a dirty scan is armed.
+                left-text: root.scan-armed ? "discard?" : "scan";
+                left-danger: root.scan-armed;
                 right-text: "apply";
-                right-primary: true;
+                // APPLY lights the commit accent ONLY when there's something to commit (feel-dirty); a
+                // clean deck leaves it plain — nothing to spend the accent on.
+                right-primary: State.feel-dirty;
                 right-enabled: !State.writes-paused
                     && (State.selected-device-kind == "mouse"
                         || State.selected-device-kind == "keyboard"
                         || State.selected-device-kind == "device");
-                left-clicked => { State.refresh-devices(); }
+                left-clicked => {
+                    // dirty + not yet armed → ARM (scan would discard the edits); otherwise scan for real
+                    // (a clean deck, or the confirming second click). Either path clears the arm.
+                    if (State.feel-dirty && !root.scan-armed) {
+                        root.scan-armed = true;
+                    } else {
+                        root.scan-armed = false;
+                        State.refresh-devices();
+                    }
+                }
                 right-clicked => { State.apply-feel(); }
             }
         }
@@ -564,16 +1155,15 @@ export component DevicePanel inherits VerticalLayout {
                                 released(v) => { State.set-device-volume(v); }
                             }
                         }
-                        // channel state as ONE two-cell LampRail (LIVE ↔ MUTED), not a loose button +
-                        // status pill: a fused hairline rail, the current cell lit (LIVE phosphor, MUTED
-                        // warn — a silenced channel isn't "live"). Exclusive semantics live in `toggled`:
-                        // clicking the OTHER cell toggles the mute; clicking the cell that already holds
-                        // does nothing (no redundant round-trip).
-                        LampRail {
+                        // channel state as ONE two-way SplitToggle (LIVE ↔ MUTED): this is a strictly
+                        // EXCLUSIVE pick (a channel is one or the other), so it belongs on the fused
+                        // index-picked idiom — LampRail is reserved for genuinely multi-select banks (KEY
+                        // GUARD, where several chords light at once). Picking the OTHER cell flips the
+                        // mute; picking the held cell is a no-op (no redundant round-trip).
+                        SplitToggle {
                             options: ["LIVE", "MUTED"];
-                            on: [!State.device-muted, State.device-muted];
-                            tints: [Theme.accent, Theme.warn];
-                            toggled(i) => {
+                            index: State.device-muted ? 1 : 0;
+                            picked(i) => {
                                 if (i == 0 && State.device-muted) { State.toggle-device-mute(); }
                                 if (i == 1 && !State.device-muted) { State.toggle-device-mute(); }
                             }
@@ -660,6 +1250,9 @@ export component DevicePanel inherits VerticalLayout {
                                     ordinal: true;
                                     by-index: true;
                                     index: State.dpi-active-stage;
+                                    // the fader confirming the table: the stage whose DPI equals the
+                                    // live fader value wears the quiet NEAR outline (never the accent).
+                                    near-index: root.dpi-near-stage;
                                     min-cell: 34px;
                                     picked-index(i) => { State.dpi-active-stage = i; }
                                 }
@@ -709,7 +1302,10 @@ export component DevicePanel inherits VerticalLayout {
                             if State.sel-can-dpi : FeelTile {
                                 term: "SNIPER";
                                 readout: State.sniper-button == "—" ? "no button" : "hold " + State.sniper-button;
-                                readout-ink: State.sniper-button == "—" ? Theme.text-faint : Theme.accent;
+                                // a BOUND button is a saved setting, not a live held state — so it reads in
+                                // plain ink (text-mid), never accent. Accent is reserved for genuinely-live
+                                // signals; nothing here observes the hold in real time, so it stays quiet.
+                                readout-ink: State.sniper-button == "—" ? Theme.text-faint : Theme.text-mid;
                                 // unbound → one capture verb. Bound → the joined [re-capture | unbind]
                                 // split (the missing "how do I turn this off" affordance — a bind you
                                 // can only overwrite, never remove, is a roach motel).
@@ -829,7 +1425,25 @@ export component DevicePanel inherits VerticalLayout {
                 // the card wears ONE quiet "verify-gated" marker and each verify-gated row echoes it
                 // with the same warn dot, so the trust zone reads as one system. We keep the controls
                 // honest, not faked. (DEBOUNCE is the lone exception: firmware-fixed, not verify-gated.)
-                if root.adv-any && State.feel-adv-open : Card {
+                // ADVANCED reveal — animate the disclosure so the Card doesn't POP in one frame: a
+                // clipping wrapper whose height eases 0 ↔ content over Theme.settle (with an opacity
+                // fade), so opening reads as a drawer sliding open, not a layout jump. The Card keeps its
+                // natural content height (adv-body.preferred-height); the wrapper clips it as it grows.
+                if root.adv-any : Rectangle {
+                    property <bool> shown: State.feel-adv-open;
+                    property <length> target: self.shown ? adv-body.preferred-height : 0px;
+                    clip: true;
+                    min-height: self.target;
+                    max-height: self.target;
+                    opacity: self.shown ? 1.0 : 0.0;
+                    animate min-height, max-height, opacity { duration: Theme.settle; easing: ease-in-out; }
+                    // the Card holds its FULL natural height (so the wrapper clips it as it grows, rather
+                    // than squishing the content); a bare Rectangle child would otherwise default to the
+                    // wrapper's animating height and deform the rows mid-reveal.
+                    adv-body := Card {
+                        y: 0;
+                        width: parent.width;
+                        height: self.preferred-height;
                     VerticalLayout {
                         padding: 12px;
                         spacing: 16px;
@@ -958,7 +1572,7 @@ export component DevicePanel inherits VerticalLayout {
                                 text: "this mouse polls up to 1000 Hz · set it in REPORT RATE above. 2000–8000 Hz HyperPolling needs Razer's separate HyperPolling Wireless Dongle.";
                             }
                             if State.sel-can-hyperpoll : GateNote {
-                                text: "the EXTENDED hi-res rate (>1000 Hz) for HyperPolling hardware, distinct from the live REPORT RATE up top.";
+                                text: "the EXTENDED hi-res rate (>1000 Hz) for HyperPolling hardware, distinct from the live REPORT RATE above.";
                             }
                             if State.sel-can-hyperpoll : ContactRow {
                                 options: [1000, 2000, 4000, 8000];
@@ -1044,6 +1658,40 @@ export component DevicePanel inherits VerticalLayout {
                             GateNote { text: "lift-off distance (even or split) is a real, verify-gated write; debounce is fixed in the mouse's firmware, so there's no setting to expose."; }
                         }
                     }
+                    }   // adv-body Card
+                }
+            }
+
+            // ── MECHANICAL ADVANTAGES — opt-in, edge-giving device features (device-scoped hardware
+            // behavior, beside the other hardware writes). Each option is one self-demonstrating visual
+            // stage behind a TWO-STEP consent (reveal, then enable). The whole section is gated on the
+            // SELECTED device actually supporting it: an incapable device shows NOTHING here — never a
+            // stray "GATED" card. (Snap Tap is the only advantage today; when more land, gate this on
+            // "the selected device supports at least one of them.")
+            if State.snap-tap-supported : VerticalLayout {
+                padding-top: 16px;
+                spacing: 16px;
+                Divider {}
+                HorizontalLayout {
+                    spacing: 10px;
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 3px;
+                        SectionTitle { text: "MECHANICAL ADVANTAGES"; }
+                        Mono { text: "opt-in, edge-giving. unseal to see what it does."; color: Theme.text-faint; }
+                    }
+                    Rectangle {}
+                }
+                MechAdvantage {
+                    name: "snap tap";
+                    tagline: "opposing inputs resolve to the last pressed: instant counter-strafe, no stall.";
+                    supported: State.snap-tap-supported;
+                    revealed: State.snap-tap-revealed;
+                    enabled: State.snap-tap-enabled;
+                    reveal => { State.snap-tap-revealed = true; }
+                    set-enabled(v) => { State.set-snap-tap(v); }
+                    // the stage visual — plays only once REVEALED (sealed = perfectly still)
+                    SnapTapStage { live: State.snap-tap-revealed; }
                 }
             }
                 }   // ibody

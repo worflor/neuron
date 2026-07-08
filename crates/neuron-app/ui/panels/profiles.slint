@@ -1,5 +1,5 @@
 import { Theme } from "../theme.slint";
-import { SectionTitle, Button, Field, Picker, Pill, Mono, Divider, PanelHead, SelectTick } from "../widgets/controls.slint";
+import { SectionTitle, Button, Field, Picker, Pill, Mono, Divider, PanelHead, SelectTick, IconButton } from "../widgets/controls.slint";
 import { State } from "../state.slint";
 import { ProfileRow, AppRuleRow } from "../models.slint";
 
@@ -56,27 +56,29 @@ component ProfileMenuRow inherits Rectangle {
             }
         }
         if root.p.active : VerticalLayout { alignment: center; Pill { text: "ACTIVE"; live: true; } }
-        // delete — a quiet glyph on hover; first click arms, a second commits. RESERVES the armed
-        // width so arming never reflows the name beside it.
+        // delete — the ONE idiom: an ALWAYS-VISIBLE quiet ✕ (faint ink) that brightens to danger on
+        // hover (never opacity-0-until-hover, never permanently-red). First click ARMS (the cell grows
+        // to a reddened "delete?"), a second confirms. RESERVES the armed width so arming never reflows
+        // the name. The TouchArea is always live (no invisible-but-clickable corner).
         VerticalLayout {
             alignment: center;
             Rectangle {
                 width: root.armed ? 58px : 22px;
                 height: 22px;
                 border-radius: Theme.radius-sm;
-                background: root.armed ? Theme.danger.with-alpha(0.15) : transparent;
+                background: root.armed ? Theme.danger.with-alpha(0.15) : (dta.has-hover ? Theme.well : transparent);
                 border-width: Theme.hair;
                 border-color: root.armed ? Theme.danger : transparent;
-                opacity: cta.has-hover || root.armed ? 1.0 : 0.0;
-                animate opacity, width, background, border-color { duration: Theme.quick; }
+                animate width, background, border-color { duration: Theme.quick; }
                 Text {
                     text: root.armed ? "delete?" : "\u{00d7}";
-                    color: Theme.danger; font-family: Theme.mono; font-size: Theme.fs-small; font-weight: 700;
+                    // faint at rest, danger on hover / while armed — the shared faint↔danger fade.
+                    color: (root.armed || dta.has-hover) ? Theme.danger : Theme.text-faint;
+                    font-family: Theme.mono; font-size: Theme.fs-small; font-weight: 700;
                     horizontal-alignment: center; vertical-alignment: center;
+                    animate color { duration: Theme.quick; }
                 }
-                TouchArea {
-                    // an opacity:0 TouchArea is still hit-tested — gate it so the empty corner is inert
-                    enabled: cta.has-hover || root.armed;
+                dta := TouchArea {
                     mouse-cursor: MouseCursor.pointer;
                     clicked => { if (root.armed) { root.confirm-delete(); } else { root.arm-delete(); } }
                 }
@@ -251,11 +253,11 @@ export component ProfilesMenu inherits VerticalLayout {
                             animate color { duration: Theme.quick; }
                         }
                         Mono { text: r.profile; color: Theme.text-mid; overflow: elide; }
-                        Button {
-                            text: "del"; danger: true;
-                            enabled: rowta.has-hover;
-                            opacity: rowta.has-hover ? 1.0 : 0.0;
-                            clicked => { State.remove-app-rule(i); }
+                        // delete — the ONE idiom: an always-visible quiet ✕ (faint) that brightens to
+                        // danger on hover, TouchArea always live (no opacity-0-until-hover corner).
+                        VerticalLayout {
+                            alignment: center;
+                            IconButton { glyph: "\u{00d7}"; danger: true; clicked => { State.remove-app-rule(i); } }
                         }
                     }
                 }

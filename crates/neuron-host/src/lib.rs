@@ -13,9 +13,6 @@
 //! - [`bus`] — named signals (`cs2.health`, `gpu.temp`, `obs.scene`) with
 //!   retained last-values and prefix subscriptions: normalize once, bind
 //!   anywhere. Generalizes the `controls::INJECT` broadcast pattern.
-//! - [`journal`] — durable state is a small replayable declaration log, the
-//!   codec lesson (a rich stream reduces to a tiny seed and reconstructs):
-//!   rebirth is a replay, so death is cheap.
 //! - [`governor`] — restart control as a damped AR(2) system, the same
 //!   `z[n] = K·z[n-1] − G·z[n-2]` recurrence as the eigenmotion stack. Spectral
 //!   radius < 1 (checked at construction) means a restart storm is impossible by
@@ -35,8 +32,8 @@ pub mod bridge;
 pub mod bus;
 pub mod crypto;
 pub mod governor;
-pub mod journal;
 pub mod net;
+pub mod paint;
 pub mod shell;
 pub mod writer;
 pub mod ws;
@@ -46,7 +43,6 @@ use std::collections::HashMap;
 use api::SurfaceInfo;
 use arbiter::{Arbiter, SourceId};
 use bus::Bus;
-use journal::Journal;
 
 /// The kernel: one struct owning the three state machines plus surface
 /// identity metadata. Thread/actor wiring is the thin [`shell`] — everything
@@ -55,10 +51,9 @@ use journal::Journal;
 pub struct Kernel {
     pub arbiter: Arbiter,
     pub bus: Bus,
-    pub journal: Journal,
     /// Declared surfaces, in declaration order (adapters enumerate these).
     pub(crate) infos: Vec<SurfaceInfo>,
-    /// Next SourceId to issue; 0 is reserved for journal::CONFIG_SOURCE.
+    /// Next SourceId to issue; starts at 1, so 0 is never issued.
     pub(crate) next_source: u64,
     /// Human names for sources ("Overwatch", "openrgb: hass") — advisory
     /// identity for the GUI's ownership truth, set by adapters the moment
@@ -71,22 +66,6 @@ impl Kernel {
         Kernel {
             arbiter: Arbiter::new(),
             bus: Bus::new(),
-            journal: Journal::new(),
-            infos: Vec::new(),
-            next_source: 1,
-            labels: HashMap::new(),
-        }
-    }
-
-    /// Rebirth: fold the journal's declarations into a fresh arbiter. The
-    /// returned kernel is byte-for-byte equivalent to the one that recorded the
-    /// log — proven by `journal::tests::replay_reproduces_state`.
-    pub fn from_journal(journal: Journal) -> Self {
-        let arbiter = journal.replay();
-        Kernel {
-            arbiter,
-            bus: Bus::new(),
-            journal,
             infos: Vec::new(),
             next_source: 1,
             labels: HashMap::new(),
@@ -165,5 +144,79 @@ mod tests {
         assert_eq!(released[0].layer, session);
         assert_eq!(released[0].owner, game);
         assert_eq!(released[0].why, ReleaseWhy::Expired);
+    }
+
+    /// Two protocols on ONE surface: a Chroma REST game and an OpenRGB client
+    /// paint the same board. The later claim composites on top, and a
+    /// device-disable on that surface gates BOTH families off so the base
+    /// returns — the cross-protocol conflict nothing tested before.
+    #[test]
+    fn chroma_and_openrgb_conflict_on_one_surface_and_both_obey_device_disable() {
+        use crate::adapters::chroma::{ChromaServer, HttpRequest};
+        use crate::adapters::openrgb::{ids, packet, OrgbConn};
+        use crate::api::{HostApi, LeaseSpec, SurfaceInfo, SurfaceKind};
+        use crate::arbiter::BlendMode;
+        use crate::paint::PaintPolicy;
+        use std::collections::HashSet;
+        use std::sync::Arc;
+
+        let mut k = Kernel::new();
+        k.declare(SurfaceInfo::grid("kbd", "Board", SurfaceKind::Keyboard, 1, 2));
+        let now = Instant::now();
+
+        // A lit base underneath both sessions.
+        let base = k.next_source();
+        k.claim("kbd", base, band::BASE, LeaseSpec::Pinned, Content::Fill(Rgb(0, 255, 0)), now)
+            .unwrap();
+
+        // Instant Over for both families so the composite is readable at one `now`.
+        let chroma_policy = PaintPolicy::opaque();
+        let orgb_policy = PaintPolicy::opaque();
+
+        // Chroma REST game paints red first.
+        let mut chroma = ChromaServer::with_policy(Arc::clone(&chroma_policy));
+        let init = chroma.handle(
+            &HttpRequest {
+                method: "POST".into(),
+                path: "/razer/chromasdk".into(),
+                body: br#"{"title":"Game"}"#.to_vec(),
+            },
+            &mut k,
+            now,
+        );
+        let sid = serde_json::from_str::<serde_json::Value>(&init.body).unwrap()["sessionid"]
+            .as_u64()
+            .unwrap();
+        chroma.handle(
+            &HttpRequest {
+                method: "PUT".into(),
+                path: format!("/razer/chromasdk/sess/{sid}/keyboard"),
+                body: br#"{"effect":"CHROMA_STATIC","param":{"color":255}}"#.to_vec(), // BGR red
+            },
+            &mut k,
+            now,
+        );
+        assert_eq!(k.resolve("kbd", now).unwrap()[0], Some(Rgb(255, 0, 0)), "chroma claims first");
+
+        // OpenRGB client paints blue AFTER — the later claim composites on top.
+        let mut orgb = OrgbConn::new(&mut k, Arc::clone(&orgb_policy));
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(&2u16.to_le_bytes());
+        for _ in 0..2 {
+            payload.extend_from_slice(&[0, 0, 255, 0]);
+        }
+        orgb.feed(&packet(0, ids::UPDATELEDS, &payload), &mut k, now);
+        assert_eq!(k.resolve("kbd", now).unwrap()[0], Some(Rgb(0, 0, 255)), "later OpenRGB claim wins");
+
+        // Disable this surface on BOTH families: each is independently gated, and
+        // with both silent the base shows through.
+        let off: HashSet<String> = HashSet::from(["nope".to_string()]);
+        chroma_policy.update(BlendMode::Over, 100, 0, Some(off.clone()));
+        orgb_policy.update(BlendMode::Over, 100, 0, Some(off));
+        assert!(
+            k.resolve("kbd", now).unwrap().iter().all(|c| *c == Some(Rgb(0, 255, 0))),
+            "device-disable gates BOTH protocols; base returns"
+        );
     }
 }

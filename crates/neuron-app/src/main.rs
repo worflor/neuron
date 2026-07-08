@@ -423,6 +423,9 @@ fn main() {
     // RELIABILITY panel freshness: refresh the uptime/heartbeats/crash readout ~1s (not every 60ms).
     let reliab_seen: RefCell<Instant> = RefCell::new(Instant::now() - Duration::from_secs(2));
     let slow_seen: RefCell<Instant> = RefCell::new(Instant::now() - Duration::from_secs(2));
+    // CONNECTIONS event pokes: this consumer's last-seen host-bus stamp (each poller owns one so
+    // two consumers can't swallow each other's wake-up).
+    let host_events_seen: std::cell::Cell<u64> = std::cell::Cell::new(0);
     let tray_seen: RefCell<Instant> = RefCell::new(Instant::now() - Duration::from_secs(2));
     let status_tick_seen: RefCell<Instant> = RefCell::new(Instant::now() - Duration::from_secs(2));
     // VITALS pump edge-tracker: true once a `vitals` layer is live, so we FORCE a prompt read on the
@@ -560,6 +563,16 @@ fn main() {
                         if st.get_window_shown() && st.get_page() == 3 {
                             crate::glue::refresh_host_status(app);
                         }
+                    }
+                    // Event poke: a host-bus signal (client connect/disconnect/paint, layer
+                    // released) refreshes CONNECTIONS immediately instead of waiting out the 1s
+                    // cadence. The stamp is consumed regardless of page — the cadence above
+                    // covers a page that opens later.
+                    if crate::host::take_host_events_dirty(&host_events_seen)
+                        && st.get_window_shown()
+                        && st.get_page() == 3
+                    {
+                        crate::glue::refresh_host_status(app);
                     }
                 }
                 // VITALS provider: while a `vitals` layer is live (previewing or streaming), feed the core

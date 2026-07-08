@@ -249,6 +249,15 @@ component WireEditor inherits Card {
                         clicked => { State.capture-trigger(); }
                     }
                 }
+                // DUPLICATE-TRIGGER honesty — a GateNote-style caution BY the well when this control is
+                // already claimed on the same layer. The live executor runs every matching rule, so
+                // saving replaces nothing; both fire. Glue sets it at capture; "" hides it.
+                if State.dup-trigger-note != "" : Mono {
+                    text: State.dup-trigger-note;
+                    color: Theme.warn;
+                    font-size: Theme.fs-small;
+                    wrap: word-wrap;
+                }
             }
             // the wire's arrow — lights phosphor the instant both ends connect
             VerticalLayout {
@@ -326,8 +335,10 @@ component RowGlyph inherits Rectangle {
     }
     Text {
         text: root.glyph;
+        // the ONE delete idiom: a danger glyph rests as QUIET faint ink and brightens to danger on
+        // hover (never permanently-red) — the same faint↔danger fade every ✕ in the app now uses.
         color: !root.enabled ? Theme.text-faint
-            : root.danger ? (g-ta.has-hover ? Theme.danger : Theme.danger.with-alpha(0.6))
+            : root.danger ? (g-ta.has-hover ? Theme.danger : Theme.text-faint)
             : (g-ta.has-hover ? Theme.text : Theme.text-faint);
         font-family: Theme.mono;
         font-size: Theme.fs-body;
@@ -339,6 +350,10 @@ component RowGlyph inherits Rectangle {
 
 component RuleLine inherits Rectangle {
     in property <RuleRow> r;
+    // reorder boundary flags — the topmost editable row can't move up, the bottom can't move down, so
+    // the ↑ / ↓ read DEAD at the ends instead of silently no-op'ing (never-disabled-at-boundaries bug).
+    in property <bool> can-up: true;
+    in property <bool> can-down: true;
     callback remove();
     callback edit();
     callback reorder(int);   // move this row: -1 = up / earlier, +1 = down / later
@@ -460,9 +475,12 @@ component RuleLine inherits Rectangle {
             if root.r.removable : HorizontalLayout {
                 alignment: end;
                 spacing: 2px;
-                VerticalLayout { alignment: center; RowGlyph { glyph: "\u{2191}"; clicked => { root.reorder(-1); } } }   // ↑
-                VerticalLayout { alignment: center; RowGlyph { glyph: "\u{2193}"; clicked => { root.reorder(1); } } }    // ↓
-                VerticalLayout { alignment: center; Button { text: "del"; danger: true; clicked => { root.remove(); } } }
+                // ↑ dead on the first editable row, ↓ dead on the last — a boundary move reads gated.
+                VerticalLayout { alignment: center; RowGlyph { glyph: "\u{2191}"; enabled: root.can-up; clicked => { root.reorder(-1); } } }   // ↑
+                VerticalLayout { alignment: center; RowGlyph { glyph: "\u{2193}"; enabled: root.can-down; clicked => { root.reorder(1); } } }    // ↓
+                // delete — the one idiom: quiet faint ✕ brightening to danger on hover (RowGlyph danger),
+                // never the old permanent-danger key. Its TouchArea is always live (no invisible target).
+                VerticalLayout { alignment: center; RowGlyph { glyph: "\u{00d7}"; danger: true; clicked => { root.remove(); } } }
             }
             if !root.r.removable : HorizontalLayout {
                 alignment: end;
@@ -484,6 +502,9 @@ component RuleList inherits VerticalLayout {
     in property <bool> hyper: false;
     callback remove(int);
     callback reorder(int, int);   // move row `i` by dir (-1 up / +1 down)
+    // the FIRST editable/removable row's index — the removable rows are the contiguous tail, so the
+    // ↑ is dead at this index and the ↓ is dead on the last row. Reads the tier's editable count.
+    property <int> first-removable: root.rules.length - (root.hyper ? State.editable-hyper-count : State.editable-count);
     spacing: 7px;
     HorizontalLayout {
         spacing: 8px;
@@ -505,6 +526,8 @@ component RuleList inherits VerticalLayout {
     for r[i] in root.rules : VerticalLayout {
         if !(State.editing-rule == i && State.editing-rule-hyper == root.hyper) : RuleLine {
             r: r;
+            can-up: i > root.first-removable;
+            can-down: i < root.rules.length - 1;
             remove => { root.remove(i); }
             edit => { State.begin-edit-rule(i, root.hyper); }
             reorder(dir) => { root.reorder(i, dir); }
@@ -514,122 +537,6 @@ component RuleList inherits VerticalLayout {
             hyper: root.hyper;
             commit => { State.commit-edit-rule(); }
             close => { State.cancel-edit-rule(); }
-        }
-    }
-}
-
-// One AUDIO CHANNEL STRIP — a mixer channel made instrument: a status lamp + channel tag + endpoint
-// name on top, then one tactile control line (fader · live %, an illuminated MUTE key, a quiet
-// re-read). MIC (capture) and OUT (render) are the SAME strip so the chain reads as one console;
-// muting lights the key red (a real alarm state), live stays quiet phosphor. Replaces the two heavy
-// stacked blocks (giant fader readout + caption-switch mute + competing refresh button).
-component ChannelStrip inherits VerticalLayout {
-    in property <string> tag;        // "MIC" / "OUT"
-    in property <string> device;     // resolved endpoint name
-    in property <float> level;       // 0..100 (gain / volume)
-    in property <bool> muted;
-    in property <float> meter;       // 0..1 LIVE dB-mapped signal level (the preview)
-    in property <float> phold;       // 0..1 falling peak-hold tick
-    in property <bool> clipping;     // a recent near-0dBFS hit (latched ~2s)
-    callback set-level(float);
-    callback toggle-mute();
-    spacing: 8px;
-    // identity: lamp (green live / red muted) · channel tag · device (dim, elides)
-    HorizontalLayout {
-        spacing: 8px;
-        Rectangle {
-            width: 6px; height: 6px; border-radius: 1px;
-            y: (parent.height - self.height) / 2;
-            background: root.muted ? Theme.danger : Theme.accent;
-            animate background { duration: Theme.quick; }
-        }
-        Text {
-            text: root.tag;
-            color: Theme.text-mid;
-            font-family: Theme.mono; font-size: Theme.fs-small; font-weight: 700;
-            letter-spacing: Theme.track-2; vertical-alignment: center;
-        }
-        Text {
-            text: root.device;
-            color: Theme.text-faint;
-            font-family: Theme.mono; font-size: Theme.fs-small;
-            vertical-alignment: center; overflow: elide;
-            horizontal-stretch: 1;
-        }
-    }
-    // the control line — fader · value · MUTE key · re-read
-    HorizontalLayout {
-        spacing: 10px;
-        VerticalLayout {
-            horizontal-stretch: 1;
-            spacing: 6px;
-            Slider {
-                compact: true;
-                minimum: 0; maximum: 100; value: root.level; step: 2;
-                wheel: false;          // writes the live endpoint — never on a stray page-scroll
-                // a muted channel's fader greys out (it isn't doing anything) — tactile honesty
-                tint: root.muted ? Theme.text-faint : Theme.accent;
-                changed(v) => { root.set-level(v); }
-            }
-            // LIVE METER — the dB-mapped peak of what the channel is hearing/playing, phosphor→amber→red
-            // by level, with a falling peak-hold tick (red on a clip). Greys to empty when muted.
-            Rectangle {
-                // the clip THRESHOLD, shared by the danger zone AND the positional notch below, so
-                // "clipping" reads as the fill crossing a FIXED marker (position), not by hue alone —
-                // amber "hot" vs red "clipping" are deuteranopia hue-twins, so a notch makes it spatial.
-                property <float> clip-at: 0.93;
-                height: 4px;
-                border-radius: 2px;
-                background: Theme.line-soft;
-                clip: true;
-                Rectangle {
-                    x: 0; y: 0; height: parent.height;
-                    width: parent.width * (root.muted ? 0.0 : root.meter);
-                    background: root.meter > parent.clip-at ? Theme.danger : (root.meter > 0.8 ? Theme.warn : Theme.accent);
-                }
-                // CLIP NOTCH — a fixed tick at the clip threshold. The fill reaching/passing it is the
-                // positional "now clipping" signal, legible with no colour discrimination at all.
-                Rectangle {
-                    y: 0; height: parent.height; width: 1px;
-                    x: parent.width * parent.clip-at - self.width / 2;
-                    background: Theme.bg;
-                    opacity: root.muted ? 0.0 : 0.85;
-                }
-                Rectangle {
-                    y: 0; height: parent.height; width: 2px;
-                    x: parent.width * (root.muted ? 0.0 : root.phold) - self.width / 2;
-                    background: root.clipping ? Theme.danger : Theme.text;
-                    opacity: (root.muted || root.phold <= 0.02) ? 0.0 : 0.9;
-                }
-            }
-        }
-        // the live value — mono, fixed cell so the fader never twitches at the 2→3 digit jump
-        VerticalLayout {
-            alignment: center;
-            width: 44px;
-            Text {
-                text: round(root.level) + "%";
-                color: root.muted ? Theme.text-faint : Theme.text;
-                font-family: Theme.mono; font-size: Theme.fs-data; font-weight: 600;
-                horizontal-alignment: right; vertical-alignment: center;
-            }
-        }
-        // MUTE — one illuminated key; lit danger-red when muted, a quiet contact when live
-        Rectangle {
-            width: 58px; height: Theme.seg-h; border-radius: Theme.radius-sm;
-            background: root.muted ? Theme.danger-glow : (mta.has-hover ? Theme.well : transparent);
-            border-width: Theme.hair;
-            border-color: root.muted ? Theme.danger.with-alpha(0.6) : (mta.has-hover ? Theme.text-faint : Theme.line);
-            animate background, border-color { duration: Theme.quick; }
-            Text {
-                text: "MUTE"; x: 0; width: 100%;
-                horizontal-alignment: center; vertical-alignment: center;
-                color: root.muted ? Theme.danger : Theme.text-dim;
-                font-family: Theme.mono; font-size: Theme.fs-small; font-weight: 700;
-                letter-spacing: Theme.track-2;
-                animate color { duration: Theme.quick; }
-            }
-            mta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.toggle-mute(); } }
         }
     }
 }
@@ -879,15 +786,14 @@ component MacroBlockEl inherits Rectangle {
                         vertical-alignment: center;
                     }
                 }
-                // QUIET ROW CONTROLS — reorder ↑/↓, delete ✕. ALWAYS laid out (revealing them never
-                // reflows the row) and only faded in while the card or a control is hovered. Each one
-                // feeds card.hovered, so crossing from the card onto a control can't drop the hover.
+                // QUIET ROW CONTROLS — reorder ↑/↓, delete ✕. Always LAID OUT and always VISIBLE as
+                // quiet faint ink (no opacity-0-until-hover — that left an invisible-but-clickable ✕):
+                // each RowGlyph rests faint and brightens on hover (the ✕ to danger). ↑ is dead on the
+                // first body step, ↓ on the last (b.first / b.last), so a boundary move reads gated.
                 HorizontalLayout {
                     spacing: 2px;
-                    opacity: card.hovered ? 1 : 0;
-                    animate opacity { duration: Theme.quick; }
-                    mvup := RowGlyph { glyph: "\u{2191}"; clicked => { State.move-step(root.b.path, -1); } }   // ↑
-                    mvdn := RowGlyph { glyph: "\u{2193}"; clicked => { State.move-step(root.b.path, 1); } }    // ↓
+                    mvup := RowGlyph { glyph: "\u{2191}"; enabled: !root.b.first; clicked => { State.move-step(root.b.path, -1); } }   // ↑
+                    mvdn := RowGlyph { glyph: "\u{2193}"; enabled: !root.b.last; clicked => { State.move-step(root.b.path, 1); } }    // ↓
                     mvdel := RowGlyph { glyph: "\u{00D7}"; danger: true; clicked => { State.delete-step(root.b.path); } } // ✕
                 }
             }
@@ -1012,16 +918,6 @@ export component BindingsPanel inherits VerticalLayout {
     // form: the user opened it, a hold key is set, or shifted binds already exist (auto-enable so
     // existing setup is never hidden). When NOT revealed it's a single quiet CTA — its whole footprint.
     property <bool> hyper-revealed: root.hyper-open || State.hypershift-hold-ready || State.editable-hyper-count > 0;
-    // LIVE AUDIO METERS — only while THIS (DIRECT) page is the one showing. `changed` opens/closes the
-    // meters (so the mic is never held when you're elsewhere); the Timer polls peaks ~30fps. Zero cost
-    // on any other page.
-    property <bool> audio-active: State.page == 2 && State.input-view == 0;
-    changed audio-active => { State.set-audio-metering(self.audio-active); }
-    Timer {
-        interval: 33ms;
-        running: root.audio-active;
-        triggered => { State.poll-audio-levels(); }
-    }
     // the INPUT head — the shared InputHead (DIRECT⇄WEAVE lives once); just a quiet reload extra here.
     InputHead {
         caption: "plain binds · a control fires an action";
@@ -1333,6 +1229,7 @@ export component BindingsPanel inherits VerticalLayout {
                             State.bind-hypershift = (root.view-layer == 1);
                             State.bind-trigger-ready = false;
                             State.bind-trigger-label = "—";
+                            State.dup-trigger-note = "";   // fresh slate — no stale clash note
                             root.add-open = true;
                         }
                     }
@@ -1571,58 +1468,6 @@ export component BindingsPanel inherits VerticalLayout {
                 }
             }
 
-            Divider {}
-
-            // AUDIO — the Core-Audio chain as a tiny mixing console (also bindable on the spine).
-            HorizontalLayout {
-                VerticalLayout {
-                    width: 340px;
-                    spacing: 14px;
-                    HorizontalLayout {
-                        SectionTitle { text: "AUDIO"; }
-                        Rectangle {}
-                        VerticalLayout {
-                            alignment: center;
-                            rta := TouchArea {
-                                width: rl.preferred-width; height: 20px;
-                                mouse-cursor: MouseCursor.pointer;
-                                clicked => { State.refresh-mic(); State.refresh-out(); }
-                                rl := Text {
-                                    text: "re-read";
-                                    color: rta.has-hover ? Theme.text-mid : Theme.text-faint;
-                                    font-family: Theme.mono; font-size: Theme.fs-small; letter-spacing: Theme.track-2;
-                                    vertical-alignment: center;
-                                }
-                            }
-                        }
-                    }
-                    ChannelStrip {
-                        tag: "MIC";
-                        device: State.mic-name;
-                        level: State.mic-gain;
-                        muted: State.mic-muted;
-                        meter: State.mic-level;
-                        phold: State.mic-hold;
-                        clipping: State.mic-clip;
-                        set-level(v) => { State.mic-gain = v; State.set-mic-gain(v); }
-                        toggle-mute => { State.toggle-mic-mute(); }
-                    }
-                    Divider {}
-                    ChannelStrip {
-                        tag: "OUT";
-                        device: State.out-name;
-                        level: State.out-gain;
-                        muted: State.out-muted;
-                        meter: State.out-level;
-                        phold: State.out-hold;
-                        clipping: State.out-clip;
-                        set-level(v) => { State.out-gain = v; State.set-out-gain(v); }
-                        toggle-mute => { State.toggle-out-mute(); }
-                    }
-                    Mono { text: "Core Audio · bind gain / mute on the spine"; color: Theme.text-faint; }
-                }
-                Rectangle {}
-            }
         }
     }
 }

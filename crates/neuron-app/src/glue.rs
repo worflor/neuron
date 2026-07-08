@@ -29,7 +29,7 @@ use neuron::lighting::Rgb;
 use slint::{
     ComponentHandle, Image, Model, ModelRc, Rgba8Pixel, SharedPixelBuffer, SharedString, VecModel,
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -152,60 +152,6 @@ thread_local! {
     /// The last HID control captured by press-to-bind, held between the capture callback and the
     /// "Add binding" commit (UI-thread-local, like the shared runtime).
     static CAPTURED_CONTROL: RefCell<Option<crate::capture::CapturedControl>> = const { RefCell::new(None) };
-
-    /// Live channel meters (mic + out) + their ballistics — opened only while the DIRECT page shows them.
-    static AUDIO_METERS: RefCell<Option<AudioMeters>> = const { RefCell::new(None) };
-}
-
-/// One channel's meter ballistics — DaVinci-style: instant attack, smooth release, a falling peak-hold
-/// tick, and a ~2s clip latch. Fed a 0..1 LINEAR peak each ~30fps poll; exposes a dB-mapped display
-/// level so the bar lives in the useful range instead of dead-then-slammed.
-#[derive(Default)]
-struct MeterChan {
-    level: f32,
-    hold: f32,
-    hold_age: u32,
-    clip_age: u32,
-}
-impl MeterChan {
-    fn update(&mut self, raw: f32) {
-        let disp = if raw <= 1e-4 {
-            0.0
-        } else {
-            ((20.0 * raw.log10() + 60.0) / 60.0).clamp(0.0, 1.0) // -60dB..0dB → 0..1
-        };
-        if disp >= self.level {
-            self.level = disp; // instant attack
-        } else {
-            self.level += (disp - self.level) * 0.30; // ~150ms release at 30fps
-        }
-        if disp >= self.hold {
-            self.hold = disp;
-            self.hold_age = 0;
-        } else {
-            self.hold_age += 1;
-            if self.hold_age > 30 {
-                self.hold += (disp - self.hold) * 0.08; // ~1s hold, then fall
-            }
-        }
-        if raw >= 0.99 {
-            self.clip_age = 0;
-        } else {
-            self.clip_age = self.clip_age.saturating_add(1);
-        }
-    }
-    fn clip(&self) -> bool {
-        self.clip_age < 60 // hold the clip flag ~2s after the last near-0dBFS hit
-    }
-}
-
-/// The open meter handles + ballistics, live only while the DIRECT page is showing.
-#[derive(Default)]
-struct AudioMeters {
-    mic: Option<neuron::audio::MeterCtl>,
-    out: Option<neuron::audio::MeterCtl>,
-    cm: MeterChan,
-    co: MeterChan,
 }
 
 /// Read the currently-selected action (palette id + parameter) from the State action picker.
@@ -743,6 +689,7 @@ fn add_row(ctx: &str, depth: i32) -> MacroBlock {
         kind: "".into(),
         verb: "".into(),
         value: "".into(),
+        first: false,
         last: false,
     }
 }
@@ -789,6 +736,7 @@ fn emit_body(nodes: &[MacroNode], depth: i32, prefix: &str, out: &mut Vec<MacroB
             kind: kind.into(),
             verb: macro_verb(kind).into(),
             value: macro_value(node).into(),
+            first: i == 0,
             last: i == last_idx,
         });
         for (label, arm, body) in node_lanes(node) {
@@ -801,6 +749,7 @@ fn emit_body(nodes: &[MacroNode], depth: i32, prefix: &str, out: &mut Vec<MacroB
                 kind: label.into(),
                 verb: "".into(),
                 value: "".into(),
+                first: false,
                 last: false,
             });
             emit_body(body, depth + 2, &lane_ctx, out);
@@ -1534,14 +1483,21 @@ pub fn install(app: &AppWindow) -> SharedRt {
         // FOREIGN-OWNER strip cadence: the preview ticks ~20Hz while the page is open — poll the
         // arbiter's claims every ~24th tick (~1s) so "a game is painting this board" appears and
         // clears without a dedicated timer. A kernel round-trip is microseconds; 1Hz is plenty.
+        // EVENT-DRIVEN TOP-UP: also poll immediately whenever the host bus has fired a
+        // `host.*` signal (a session opened/closed, a client connected, a layer released) since
+        // this poller last looked — `take_host_events_dirty` keeps ITS OWN last-seen stamp, so it
+        // can't race the SYSTEM page's independent read of the same counter. This is what makes a
+        // foreign paint appear/clear on the frame it actually happened, not up to a second later.
         let foreign_tick: Rc<RefCell<u32>> = Rc::new(RefCell::new(0));
+        let host_events_seen: Rc<Cell<u64>> = Rc::new(Cell::new(0));
         app.global::<State>().on_preview_tick(move || {
             if let Some(app) = w.upgrade() {
                 let st = app.global::<State>();
                 {
                     let mut t = foreign_tick.borrow_mut();
                     *t += 1;
-                    if *t % 24 == 1 {
+                    let host_dirty = crate::host::take_host_events_dirty(&host_events_seen);
+                    if host_dirty || *t % 24 == 1 {
                         let (pid, unit) = {
                             let s = sh.borrow();
                             (s.rt.selected_pid, s.rt.selected_unit.clone())
@@ -1929,10 +1885,55 @@ pub fn install(app: &AppWindow) -> SharedRt {
             let sh = sh.clone();
             app.global::<State>().on_add_stop(move |at| {
                 if let Some(app) = w.upgrade() {
+                    // insert RELATIVE to the current selection, NOT blindly at the `at` the (dumb) call
+                    // site passes: the midpoint between the selected stop and its RIGHT neighbour (or its
+                    // LEFT neighbour when the selection is last). Blindly inserting at 0.5 stacked
+                    // duplicate stops that became unreachable by the nearest-handle hit-test; a relative
+                    // midpoint means repeated adds always yield a distinct, grabbable handle.
+                    let target = {
+                        let s = sh.borrow();
+                        let sel = s.selected_layer;
+                        let fr = s.active_frame;
+                        let sel_stop = app.global::<State>().get_light_sel_stop().max(0) as usize;
+                        s.light_layers
+                            .get(sel)
+                            .and_then(|d| {
+                                let fr = fr.min(d.spectrum.seq.len().saturating_sub(1));
+                                d.spectrum.seq.get(fr).map(|frame| {
+                                    let stops = &frame.palette.stops;
+                                    if stops.is_empty() {
+                                        return at.clamp(0.0, 1.0);
+                                    }
+                                    let p = stops[sel_stop.min(stops.len() - 1)].at;
+                                    // nearest neighbour on each side, by POSITION (order-independent)
+                                    let right = stops
+                                        .iter()
+                                        .map(|s| s.at)
+                                        .filter(|&a| a > p)
+                                        .fold(f32::INFINITY, f32::min);
+                                    let left = stops
+                                        .iter()
+                                        .map(|s| s.at)
+                                        .filter(|&a| a < p)
+                                        .fold(f32::NEG_INFINITY, f32::max);
+                                    let t = if right.is_finite() {
+                                        (p + right) / 2.0
+                                    } else if left.is_finite() {
+                                        (p + left) / 2.0
+                                    } else if p <= 0.5 {
+                                        (p + 1.0) / 2.0 // a lone stop: open room toward the right end
+                                    } else {
+                                        p / 2.0 // …or toward the left when it sits past centre
+                                    };
+                                    t.clamp(0.0, 1.0)
+                                })
+                            })
+                            .unwrap_or_else(|| at.clamp(0.0, 1.0))
+                    };
                     // insert the stop, capturing the index it sorted into…
                     let mut inserted = 0usize;
                     edit_active_palette(&app, &sh, |pal| {
-                        inserted = pal.add_stop(at);
+                        inserted = pal.add_stop(target);
                     });
                     // …then SELECT it (after refresh_layers rebuilt light-stops), delivering the
                     // documented "add a stop, select it" contract: the prism now edits the NEW stop,
@@ -2279,6 +2280,37 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 }
             });
         }
+        // reorder a stack layer — swap it with its neighbour (dir -1 down / +1 later up the stack) and
+        // keep the selection ON the moved layer, mirroring the TIMELINE frame reorder. Structural →
+        // persist immediately.
+        {
+            let w = app.as_weak();
+            let sh = sh.clone();
+            app.global::<State>().on_move_stack(move |i, dir| {
+                if let Some(app) = w.upgrade() {
+                    let moved = {
+                        let mut s = sh.borrow_mut();
+                        let i = i.max(0) as usize;
+                        let j = if dir < 0 { i.checked_sub(1) } else { Some(i + 1) };
+                        match j {
+                            Some(j) if i < s.light_layers.len() && j < s.light_layers.len() => {
+                                s.light_layers.swap(i, j);
+                                s.selected_layer = j;
+                                s.layers_rev += 1;
+                                true
+                            }
+                            _ => false,
+                        }
+                    };
+                    // A boundary press (top moved up / bottom moved down) is a no-op —
+                    // don't rebuild the model or write the config for a move that didn't happen.
+                    if moved {
+                        refresh_layers(&app, &sh);
+                        flush_lighting_save(); // reordering layers is structural — persist it immediately
+                    }
+                }
+            });
+        }
         // toggle the PAINT brush — picking it up snapshots the current frame so painting starts from
         // what's lit (not a blank board); putting it down returns to the effect preview.
         {
@@ -2578,11 +2610,13 @@ pub fn install(app: &AppWindow) -> SharedRt {
         });
     });
     // PRESS-TO-BIND a trigger: capture the HID control the user presses (no hardcoded button).
-    bind(app, &shared, |app, _sh| {
+    bind(app, &shared, |app, sh| {
         let w = app.as_weak();
+        let sh = sh.clone();
         app.global::<State>().on_capture_trigger(move || {
             if let Some(app) = w.upgrade() {
-                crate::capture::begin_control(&app, |app, captured| {
+                let sh = sh.clone();
+                crate::capture::begin_control(&app, move |app, captured| {
                     let st = app.global::<State>();
                     match captured {
                         Some(c) => {
@@ -2594,11 +2628,50 @@ pub fn install(app: &AppWindow) -> SharedRt {
                             let label = neuron::controls::control_label(c.page, c.usage);
                             st.set_bind_trigger_label(label.into());
                             st.set_bind_trigger_ready(true);
+                            // DUPLICATE-TRIGGER honesty: if another rule on the SAME target layer
+                            // already claims this control, say so. The live executor RESOLVES + RUNS
+                            // every matching rule (not first-wins), so a second bind replaces nothing
+                            // — both fire. Skipped while EDITING (a rebind would match its own rule).
+                            if st.get_editing_rule() >= 0 {
+                                st.set_dup_trigger_note("".into());
+                            } else {
+                                let trigger = neuron::engine::Trigger::Input {
+                                    page: c.page,
+                                    usage: c.usage,
+                                    pid: c.pid,
+                                };
+                                let hyper = st.get_bind_hypershift();
+                                let engine = neuron::engine::Engine::from_rules(
+                                    sh.borrow().rt.spine_rules(),
+                                );
+                                let existing = if hyper {
+                                    engine.layers.values().flatten().find(|r| {
+                                        r.action != neuron::action::Action::Noop
+                                            && neuron::engine::Engine::matches(&r.trigger, &trigger)
+                                    })
+                                } else {
+                                    engine
+                                        .rules
+                                        .iter()
+                                        .find(|r| neuron::engine::Engine::matches(&r.trigger, &trigger))
+                                };
+                                st.set_dup_trigger_note(
+                                    match existing {
+                                        Some(r) => format!(
+                                            "already wired to {} — saving replaces nothing; both will fire",
+                                            r.action.describe()
+                                        ),
+                                        None => String::new(),
+                                    }
+                                    .into(),
+                                );
+                            }
                             st.set_status_line(
                                 "control captured — pick an action, then Add".into(),
                             );
                         }
                         None => {
+                            st.set_dup_trigger_note("".into());
                             st.set_status_line("capture cancelled".into());
                         }
                     }
@@ -2634,6 +2707,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                         CAPTURED_CONTROL.with(|cell| *cell.borrow_mut() = None);
                         st.set_bind_trigger_ready(false);
                         st.set_bind_trigger_label("—".into());
+                        st.set_dup_trigger_note("".into());
                         // leave the flow clean for the next author.
                         st.set_action_choice(0);
                         st.set_action_param("".into());
@@ -2704,6 +2778,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 };
                 st.set_bind_trigger_label(label.into());
                 st.set_bind_trigger_ready(true);
+                st.set_dup_trigger_note("".into()); // editing shows the rule's own wire — no clash note
                 // one editor owns the shared picker at a time — close the wedge / glyph / rhythm editors.
                 st.set_editing_sector(-1);
                 st.set_gesture_bind_target("".into());
@@ -2783,6 +2858,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 st.set_editing_rule(-1);
                 st.set_bind_trigger_ready(false);
                 st.set_bind_trigger_label("—".into());
+                st.set_dup_trigger_note("".into());
                 st.set_status_line("edit cancelled".into());
             }
         });
@@ -2844,67 +2920,6 @@ pub fn install(app: &AppWindow) -> SharedRt {
             }
         });
     });
-    // LIVE AUDIO METERS — open the mic + out meters when the DIRECT page shows (set-audio-metering),
-    // then poll peaks ~30fps (poll-audio-levels). Each poll is two cheap GetPeakValue reads; the
-    // ballistics (attack/release, peak-hold, clip latch) live in MeterChan.
-    bind(app, &shared, |app, _sh| {
-        let w = app.as_weak();
-        app.global::<State>().on_set_audio_metering(move |on| {
-            if w.upgrade().is_none() {
-                return;
-            }
-            AUDIO_METERS.with(|cell| {
-                if on {
-                    let mic = neuron::audio::resolve_capture(None)
-                        .and_then(|e| neuron::audio::MeterCtl::open(&e.id));
-                    let out = neuron::audio::resolve_render(None)
-                        .and_then(|e| neuron::audio::MeterCtl::open(&e.id));
-                    *cell.borrow_mut() = Some(AudioMeters {
-                        mic,
-                        out,
-                        ..Default::default()
-                    });
-                } else {
-                    *cell.borrow_mut() = None;
-                }
-            });
-        });
-    });
-    bind(app, &shared, |app, _sh| {
-        let w = app.as_weak();
-        app.global::<State>().on_poll_audio_levels(move || {
-            if let Some(app) = w.upgrade() {
-                let st = app.global::<State>();
-                let muted_mic = st.get_mic_muted();
-                let muted_out = st.get_out_muted();
-                AUDIO_METERS.with(|cell| {
-                    let mut g = cell.borrow_mut();
-                    let Some(m) = g.as_mut() else {
-                        return;
-                    };
-                    let raw_mic = if muted_mic {
-                        0.0
-                    } else {
-                        m.mic.as_ref().map(|x| x.peak()).unwrap_or(0.0)
-                    };
-                    let raw_out = if muted_out {
-                        0.0
-                    } else {
-                        m.out.as_ref().map(|x| x.peak()).unwrap_or(0.0)
-                    };
-                    m.cm.update(raw_mic);
-                    m.co.update(raw_out);
-                    st.set_mic_level(m.cm.level);
-                    st.set_mic_hold(m.cm.hold);
-                    st.set_mic_clip(m.cm.clip());
-                    st.set_out_level(m.co.level);
-                    st.set_out_hold(m.co.hold);
-                    st.set_out_clip(m.co.clip());
-                });
-            }
-        });
-    });
-
     // ── Spellweaving ─────────────────────────────────────────────────────
     bind(app, &shared, |app, sh| {
         let w = app.as_weak();
@@ -3354,6 +3369,9 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 st.set_import_notes(ModelRc::new(VecModel::from(notes)));
                 st.set_import_status(res.status.into());
                 st.set_import_ready(res.ready);
+                // an ATTEMPT just ran: it failed iff it produced nothing to apply. This (not "a path is
+                // present") is what earns the danger hint — the untried hint stays neutral.
+                st.set_import_parse_failed(!res.ready);
                 sh.borrow_mut().pending_import = res.imported;
             }
         });
@@ -4049,81 +4067,13 @@ pub fn install(app: &AppWindow) -> SharedRt {
     // ── Audio ────────────────────────────────────────────────────────────
     bind(app, &shared, |app, _sh| {
         let w = app.as_weak();
-        app.global::<State>().on_set_mic_gain(move |v| {
-            if let Some(app) = w.upgrade() {
-                let st = app.global::<State>();
-                match mic::set_gain(v) {
-                    Some(applied) => {
-                        st.set_status_line(format!("mic gain {}%", applied.round()).into())
-                    }
-                    None => {
-                        st.set_status_line("no capture device — gain unchanged".into());
-                        mic::refresh(&app); // snap the fader back to truth
-                    }
-                }
-            }
-        });
-    });
-    bind(app, &shared, |app, _sh| {
-        let w = app.as_weak();
-        app.global::<State>().on_toggle_mic_mute(move || {
-            if let Some(app) = w.upgrade() {
-                let st = app.global::<State>();
-                match mic::toggle_mute() {
-                    Some(muted) => {
-                        st.set_mic_muted(muted);
-                        st.set_status_line(
-                            format!("mic {}", if muted { "muted" } else { "live" }).into(),
-                        );
-                    }
-                    None => st.set_status_line("no capture device — nothing to mute".into()),
-                }
-            }
-        });
-    });
-    bind(app, &shared, |app, _sh| {
-        let w = app.as_weak();
         app.global::<State>().on_refresh_mic(move || {
             if let Some(app) = w.upgrade() {
                 mic::refresh(&app);
             }
         });
     });
-    // OUTPUT (render) audio — headphone / sound-card volume + mute, the mirror of the mic controls.
-    bind(app, &shared, |app, _sh| {
-        let w = app.as_weak();
-        app.global::<State>().on_set_out_gain(move |v| {
-            if let Some(app) = w.upgrade() {
-                let st = app.global::<State>();
-                match mic::set_output_gain(v) {
-                    Some(applied) => {
-                        st.set_status_line(format!("output vol {}%", applied.round()).into())
-                    }
-                    None => {
-                        st.set_status_line("no output device — volume unchanged".into());
-                        mic::refresh_output(&app);
-                    }
-                }
-            }
-        });
-    });
-    bind(app, &shared, |app, _sh| {
-        let w = app.as_weak();
-        app.global::<State>().on_toggle_out_mute(move || {
-            if let Some(app) = w.upgrade() {
-                let st = app.global::<State>();
-                match mic::toggle_output_mute() {
-                    Some(muted) => {
-                        st.set_out_muted(muted);
-                        st.set_status_line(
-                            format!("output {}", if muted { "muted" } else { "live" }).into(),
-                        );
-                    }
-                    None => st.set_status_line("no output device — nothing to mute".into()),
-                }
-            }
-        });
-    });
+    // OUTPUT (render) audio — headphone / sound-card volume re-read.
     bind(app, &shared, |app, _sh| {
         let w = app.as_weak();
         app.global::<State>().on_refresh_out(move || {
@@ -4531,12 +4481,14 @@ pub fn install(app: &AppWindow) -> SharedRt {
             }
         });
     });
-    // WHO WINS — flip the base-layer band live: re-pin drops mis-banded base layers, then
-    // re-applying the current stack re-claims at the new band (one code path). The truth strip
-    // on LIGHTING updates on its own next poll.
+    // VISITORS — how external paint (games via Chroma, tools via OpenRGB) combines with your own
+    // lighting. Two independent lanes, one universal hands-off list, one "my lighting always wins"
+    // switch. Each persists then pushes the live policy via `apply_protocol_prefs` (which refreshes
+    // BOTH policies from prefs), then re-reads the truth back into the UI.
+    // ── CHROMA (games) lane ──
     bind(app, &shared, |app, _sh| {
         let w = app.as_weak();
-        app.global::<State>().on_set_host_game_mode(move |i| {
+        app.global::<State>().on_set_host_chroma_mode(move |i| {
             if let Some(app) = w.upgrade() {
                 let mode = match i {
                     0 => "replace",
@@ -4544,46 +4496,107 @@ pub fn install(app: &AppWindow) -> SharedRt {
                     3 => "tint",
                     _ => "merge",
                 };
-                let msg = crate::prefs::set_host_game_mode(mode);
+                let msg = crate::prefs::set_host_chroma_paint_mode(mode);
                 crate::host::apply_protocol_prefs();
                 let st = app.global::<State>();
-                st.set_host_game_mode(crate::prefs::host_game_mode_index());
+                st.set_host_chroma_mode(crate::prefs::host_chroma_paint_mode_index());
                 st.set_status_line(msg.into());
             }
         });
     });
     bind(app, &shared, |app, _sh| {
         let w = app.as_weak();
-        app.global::<State>().on_set_host_game_intensity(move |v| {
+        app.global::<State>().on_set_host_chroma_strength(move |v| {
             if let Some(app) = w.upgrade() {
-                let msg = crate::prefs::set_host_game_intensity(v.round() as u8);
+                let msg = crate::prefs::set_host_chroma_paint_strength(v.round() as u8);
                 crate::host::apply_protocol_prefs();
                 let st = app.global::<State>();
-                st.set_host_game_intensity(crate::prefs::host_game_intensity() as f32);
+                st.set_host_chroma_strength(crate::prefs::host_chroma_paint_strength() as f32);
                 st.set_status_line(msg.into());
             }
         });
     });
     bind(app, &shared, |app, _sh| {
         let w = app.as_weak();
-        app.global::<State>().on_set_host_game_fade(move |v| {
+        app.global::<State>().on_set_host_chroma_fade(move |v| {
             if let Some(app) = w.upgrade() {
-                let msg = crate::prefs::set_host_game_fade_ms(v.round() as u32);
+                let msg = crate::prefs::set_host_chroma_paint_fade_ms(v.round() as u32);
                 crate::host::apply_protocol_prefs();
                 let st = app.global::<State>();
-                st.set_host_game_fade_ms(crate::prefs::host_game_fade_ms() as f32);
+                st.set_host_chroma_fade(crate::prefs::host_chroma_paint_fade_ms() as f32);
+                st.set_status_line(msg.into());
+            }
+        });
+    });
+    // ── OPENRGB (tools) lane ──
+    bind(app, &shared, |app, _sh| {
+        let w = app.as_weak();
+        app.global::<State>().on_set_host_openrgb_mode(move |i| {
+            if let Some(app) = w.upgrade() {
+                let mode = match i {
+                    0 => "replace",
+                    2 => "boost",
+                    3 => "tint",
+                    _ => "merge",
+                };
+                let msg = crate::prefs::set_host_openrgb_paint_mode(mode);
+                crate::host::apply_protocol_prefs();
+                let st = app.global::<State>();
+                st.set_host_openrgb_mode(crate::prefs::host_openrgb_paint_mode_index());
                 st.set_status_line(msg.into());
             }
         });
     });
     bind(app, &shared, |app, _sh| {
         let w = app.as_weak();
-        app.global::<State>().on_set_host_game_device(move |id, enabled| {
+        app.global::<State>().on_set_host_openrgb_strength(move |v| {
             if let Some(app) = w.upgrade() {
-                let msg = crate::prefs::set_host_game_device(&id, enabled, Vec::new());
+                let msg = crate::prefs::set_host_openrgb_paint_strength(v.round() as u8);
                 crate::host::apply_protocol_prefs();
-                refresh_host_game_devices(&app);
+                let st = app.global::<State>();
+                st.set_host_openrgb_strength(crate::prefs::host_openrgb_paint_strength() as f32);
+                st.set_status_line(msg.into());
+            }
+        });
+    });
+    bind(app, &shared, |app, _sh| {
+        let w = app.as_weak();
+        app.global::<State>().on_set_host_openrgb_fade(move |v| {
+            if let Some(app) = w.upgrade() {
+                let msg = crate::prefs::set_host_openrgb_paint_fade_ms(v.round() as u32);
+                crate::host::apply_protocol_prefs();
+                let st = app.global::<State>();
+                st.set_host_openrgb_fade(crate::prefs::host_openrgb_paint_fade_ms() as f32);
+                st.set_status_line(msg.into());
+            }
+        });
+    });
+    // ── UNIVERSAL hands-off device list (both lanes) ──
+    bind(app, &shared, |app, _sh| {
+        let w = app.as_weak();
+        app.global::<State>().on_set_host_paint_device(move |id, enabled| {
+            if let Some(app) = w.upgrade() {
+                let msg = crate::prefs::set_host_paint_device(&id, enabled);
+                crate::host::apply_protocol_prefs();
+                refresh_host_paint_devices(&app);
                 app.global::<State>().set_status_line(msg.into());
+            }
+        });
+    });
+    // ── MY LIGHTING ALWAYS WINS — flip the base-layer band live. Persist, then re-apply EVERY
+    // board's stack so `set_lighting` re-claims each surface at the new band (BASE ⇄ OVERRIDE);
+    // the release+re-claim path in `set_lighting` handles the live band change. The suppressed
+    // strips on LIGHTING update on their own next poll.
+    bind(app, &shared, |app, sh| {
+        let w = app.as_weak();
+        let sh = sh.clone();
+        app.global::<State>().on_set_host_base_always_wins(move |v| {
+            if let Some(app) = w.upgrade() {
+                let msg = crate::prefs::set_host_base_always_wins(v);
+                reapply_all_boards(&app, &sh);
+                let st = app.global::<State>();
+                st.set_host_base_always_wins(crate::prefs::host_base_always_wins());
+                st.set_status_line(msg.into());
             }
         });
     });
@@ -5587,6 +5600,10 @@ fn seed_perf_async(app: &AppWindow, sh: &SharedRt, resume_lighting: bool) {
                     // heal adds no new write class — it just walks the cohort with read-backs.
                     maybe_first_light_heal(&app, sh, pid, &unit);
                 }
+                // the async sweep just landed the stage list / active stage / LOD from hardware truth —
+                // re-stamp the FEEL dirty baselines so a freshly-seeded deck reads clean (feel-dirty
+                // false) rather than falsely dirty against the pre-sweep stage string.
+                stamp_feel_baseline(&st);
             });
         });
     });
@@ -5730,6 +5747,17 @@ fn sync_stage_nums(st: &State) {
     st.set_dpi_stages_valid(parsed.valid);
     st.set_dpi_stages_note(parsed.note.into());
     st.set_dpi_stage_nums(ModelRc::new(VecModel::from(nums)));
+}
+
+/// Stamp the FEEL deck's dirty-tracking baselines to the CURRENT draft values. Called on every seed
+/// (device select / scan / apply-then-refresh) so `feel-dirty` reads false until the user actually
+/// edits a draft — and clears the instant a scan/apply re-reads hardware truth. See State.feel-dirty.
+fn stamp_feel_baseline(st: &State) {
+    st.set_feel_base_dpi(st.get_dpi());
+    st.set_feel_base_polling(st.get_polling_hz());
+    st.set_feel_base_brightness(st.get_brightness());
+    st.set_feel_base_stages(st.get_dpi_stages());
+    st.set_feel_base_active_stage(st.get_dpi_active_stage());
 }
 
 struct ScrollStageParse {
@@ -6133,15 +6161,17 @@ fn pid_supports_snap_tap(pid: u16) -> bool {
     )
 }
 
-/// Seed `snap-tap-supported` from the live device list — true iff ANY connected keyboard's PID is in
-/// the Snap-Tap allowlist. A SYSTEM-page (not per-selected-device) concern: the MECHANICAL ADVANTAGES
-/// option applies to the connected keyboard. When unsupported (the user's Chroma V2), the toggle
-/// stays honestly GATED. Best-effort: reads the already-built `State.devices` rows.
+/// Keep the Snap-Tap ENABLED flag honest against the live device list. Section VISIBILITY is a
+/// per-selected-device truth set in `select_device_at` (Snap Tap must never appear under a device that
+/// can't do it) — this function does NOT touch `snap-tap-supported`. `enabled` is the keyboard's
+/// HARDWARE state, independent of what's selected, so it's only force-cleared when NO capable board is
+/// connected at all (the device physically went away), never merely because a different device is
+/// selected. Best-effort: reads the already-built `State.devices` rows.
 fn refresh_snap_tap(app: &AppWindow, _sh: &SharedRt) {
     use slint::Model;
     let st = app.global::<State>();
     let rows = st.get_devices();
-    let supported = (0..rows.row_count()).any(|i| {
+    let any_capable = (0..rows.row_count()).any(|i| {
         rows.row_data(i).is_some_and(|r| {
             r.kind == "keyboard"
                 && u16::from_str_radix(r.pid.as_str(), 16)
@@ -6149,9 +6179,7 @@ fn refresh_snap_tap(app: &AppWindow, _sh: &SharedRt) {
                     .unwrap_or(false)
         })
     });
-    st.set_snap_tap_supported(supported);
-    // An unsupported board can never be enabled — keep the toggle honest if the device went away.
-    if !supported {
+    if !any_capable {
         st.set_snap_tap_enabled(false);
     }
 }
@@ -6341,6 +6369,12 @@ fn patch_selected_audio_detail(st: &State) {
 fn select_device_at(app: &AppWindow, sh: &SharedRt, idx: i32) {
     use slint::Model;
     let st = app.global::<State>();
+    // Walking away from a dirty FEEL deck DISCARDS its drafts (the new selection re-seeds them from
+    // hardware). Note it honestly — read BEFORE any mutation, and only when this is a genuine switch to
+    // a DIFFERENT row (a same-row refresh/apply re-select must not cry "discarded").
+    if st.get_feel_dirty() && st.get_selected_device() >= 0 && st.get_selected_device() != idx {
+        st.set_status_line("unapplied feel edits discarded".into());
+    }
     let rows = st.get_devices();
     let n = rows.row_count() as i32;
     // idx < 0 is a deliberate "select nothing" (an all-adopting list has no auto-pickable row), so
@@ -6366,6 +6400,9 @@ fn select_device_at(app: &AppWindow, sh: &SharedRt, idx: i32) {
         // (the round-8 rule) so a cleared panel can't keep showing the previous keyboard's row.
         st.set_sel_can_game_mode(false);
         st.set_game_mode_on(false);
+        // MECHANICAL ADVANTAGES is per-SELECTED-device: nothing selected → the whole section is gone,
+        // never a stray "GATED" card under no device.
+        st.set_snap_tap_supported(false);
         st.set_selected_plate("".into());
         // seeded_key describes the panel's CURRENT seed — a cleared panel is seeded with nothing, so
         // the key must go too. Otherwise a same-unit reselect after an unplug/replug (unit ids are
@@ -6402,6 +6439,10 @@ fn select_device_at(app: &AppWindow, sh: &SharedRt, idx: i32) {
     // per-device plate readout and the hyperpoll gate. Audio endpoints have an empty pid → 0, and
     // they're never plate/hyperpoll-capable anyway.
     let pid = u16::from_str_radix(row.pid.as_str(), 16).unwrap_or(0);
+    // MECHANICAL ADVANTAGES gate: Snap Tap belongs to a capable keyboard and the DEVICE panel tunes
+    // one device at a time — so the section shows ONLY when THIS selected device can do it. A capable
+    // board connected but not selected must never surface Snap Tap under a mouse (or any other device).
+    st.set_snap_tap_supported(row.kind == "keyboard" && pid_supports_snap_tap(pid));
     // SIDE PLATE: a device with a [side_plates] map surfaces the last plate the mouse pushed. The plate
     // has NO getter (push-only), so seed from THIS device's last-known value the confirmation core
     // recorded (hidwatch feeds it per-pid); a light poll keeps it fresh after this. Others show nothing.
@@ -6512,6 +6553,11 @@ fn select_device_at(app: &AppWindow, sh: &SharedRt, idx: i32) {
             init_grid(app, sh);
             seed_perf_async(app, sh, true);
         }
+        // stamp the FEEL dirty baselines to what we just seeded synchronously (dpi/polling/brightness).
+        // The async stage/LOD sweep re-stamps once its readouts land (see seed_perf_async) so the stage
+        // list + active stage are baselined against hardware truth too — but this makes a same-unit
+        // reselect / a post-apply refresh (no async) read clean immediately.
+        stamp_feel_baseline(&st);
     }
 }
 
@@ -6904,7 +6950,7 @@ pub fn refresh_devices(app: &AppWindow, sh: &SharedRt) {
         }
     };
     st.set_unclaimed_note(unclaimed_note.into());
-    refresh_host_game_devices(app);
+    refresh_host_paint_devices(app);
     // MECHANICAL ADVANTAGES: seed Snap Tap support from the live keyboard list (honest gate).
     refresh_snap_tap(app, sh);
     // 3) restore selection by id, and seed its per-kind panel. A previously-selected id that still
@@ -9004,7 +9050,7 @@ fn fmt_uptime(ms: u64) -> String {
 /// CONNECTIONS truth → the System card: pref gates into the toggles, PORT truth into the
 /// per-protocol lines (a bind that failed — real Synapse holding the socket, a second
 /// instance — reads as busy, never green), and the bridged-device count underneath.
-fn refresh_host_game_devices(app: &AppWindow) {
+fn refresh_host_paint_devices(app: &AppWindow) {
     let st = app.global::<State>();
     let status = crate::host::status();
     let out: Vec<ChromaDeviceRow> = if status.active {
@@ -9014,7 +9060,7 @@ fn refresh_host_game_devices(app: &AppWindow) {
             .map(|d| ChromaDeviceRow {
                 id: d.id.clone().into(),
                 name: d.name.clone().into(),
-                enabled: crate::prefs::host_game_device_enabled(&d.id),
+                enabled: crate::prefs::host_paint_device_enabled(&d.id),
             })
             .collect()
     } else {
@@ -9025,11 +9071,11 @@ fn refresh_host_game_devices(app: &AppWindow) {
             .map(|d| ChromaDeviceRow {
                 id: d.id.clone(),
                 name: d.name.clone(),
-                enabled: crate::prefs::host_game_device_enabled(&d.id),
+                enabled: crate::prefs::host_paint_device_enabled(&d.id),
             })
             .collect()
     };
-    st.set_host_game_devices(ModelRc::new(VecModel::from(out)));
+    st.set_host_paint_devices(ModelRc::new(VecModel::from(out)));
 }
 
 pub fn refresh_host_status(app: &AppWindow) {
@@ -9043,10 +9089,14 @@ pub fn refresh_host_status(app: &AppWindow) {
     st.set_host_chroma(crate::prefs::host_chroma());
     st.set_host_openrgb(crate::prefs::host_openrgb());
     st.set_host_obs(crate::prefs::host_obs());
-    st.set_host_game_mode(crate::prefs::host_game_mode_index());
-    st.set_host_game_intensity(crate::prefs::host_game_intensity() as f32);
-    st.set_host_game_fade_ms(crate::prefs::host_game_fade_ms() as f32);
-    refresh_host_game_devices(app);
+    st.set_host_chroma_mode(crate::prefs::host_chroma_paint_mode_index());
+    st.set_host_chroma_strength(crate::prefs::host_chroma_paint_strength() as f32);
+    st.set_host_chroma_fade(crate::prefs::host_chroma_paint_fade_ms() as f32);
+    st.set_host_openrgb_mode(crate::prefs::host_openrgb_paint_mode_index());
+    st.set_host_openrgb_strength(crate::prefs::host_openrgb_paint_strength() as f32);
+    st.set_host_openrgb_fade(crate::prefs::host_openrgb_paint_fade_ms() as f32);
+    st.set_host_base_always_wins(crate::prefs::host_base_always_wins());
+    refresh_host_paint_devices(app);
     // NB: the password field is deliberately NOT touched here. This runs ~1s while the System
     // page is up, and "empty" is indistinguishable from "the user just cleared the field to
     // remove/replace the secret" — reseeding on empty would let the poller fight that edit and
@@ -9069,11 +9119,14 @@ pub fn refresh_host_status(app: &AppWindow) {
         if clients.is_empty() {
             return None;
         }
+        // Quoted = self-reported (a Chroma init title, an OpenRGB SET_CLIENT_NAME — the client
+        // just says who it is, unverified); unquoted = the "an unnamed app" fallback, which
+        // isn't a name at all.
         let name = |c: &crate::host::ClientStatus| -> String {
             if c.name.is_empty() {
                 "an unnamed app".into()
             } else {
-                c.name.clone()
+                format!("\u{201c}{}\u{201d}", c.name)
             }
         };
         let join = |cs: &[&crate::host::ClientStatus]| -> String {
@@ -9082,7 +9135,13 @@ pub fn refresh_host_status(app: &AppWindow) {
         let painting: Vec<&crate::host::ClientStatus> =
             clients.iter().filter(|c| !c.painting.is_empty()).collect();
         let all: Vec<&crate::host::ClientStatus> = clients.iter().collect();
-        Some(if !painting.is_empty() {
+        // MUTED first: the face is dialled to strength 0, so every connected client is here and
+        // honestly invisible — say so rather than implying paint (a strength-0 layer never shows
+        // in the arbiter's claims, so it can't read as "painting" anyway).
+        Some(if clients.iter().any(|c| c.muted) {
+            let verb = if all.len() == 1 { "is" } else { "are" };
+            format!("{} {verb} connected but muted (strength 0%)", join(&all))
+        } else if !painting.is_empty() {
             let verb = if painting.len() == 1 { "is" } else { "are" };
             let mut kinds: Vec<String> = Vec::new();
             for c in &painting {
@@ -9126,7 +9185,15 @@ pub fn refresh_host_status(app: &AppWindow) {
                 }
             })
             .collect();
-        format!("{} · {} dev · {}", g.game, g.devices, g.effect)
+        let base = format!("{} · {} dev · {}", g.game, g.devices, g.effect);
+        // The telemetry above is honest about what the game is PAINTING, but says nothing about
+        // who's actually WINNING the board — cross-referenced against the arbiter's live claims
+        // (`covered_by`), so a game fully out-prioritized by a REST/OpenRGB client reads as such
+        // instead of implying it's the thing on screen.
+        match &g.covered_by {
+            Some(name) => format!("{base} \u{2014} underneath {name}"),
+            None => base,
+        }
     } else {
         client_line(&s.chroma_clients).unwrap_or_else(|| {
             if s.chroma_native_serving {
@@ -9135,6 +9202,14 @@ pub fn refresh_host_status(app: &AppWindow) {
                 } else {
                     // native up, REST port taken (usually real Synapse) — say so, don't imply :54235 is ours.
                     "native sdk · rest :54235 busy".to_string()
+                }
+            } else if let Some(reason) = &s.chroma_native_error {
+                // The native (SHM) face declined and we know why — surface the fix (elevation) or
+                // the honest "Razer already owns it", alongside the REST face's own bind truth.
+                if s.chroma_serving {
+                    format!("rest :54235 · native {reason}")
+                } else {
+                    format!("native {reason}")
                 }
             } else {
                 line(crate::prefs::host_chroma(), s.chroma_serving, 54235)

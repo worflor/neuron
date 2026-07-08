@@ -39,11 +39,13 @@
 //! *more* correct than the racing free-for-all this ecosystem is used to.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::api::{HostApi, LeaseSpec, SurfaceInfo, SurfaceKind};
 use crate::arbiter::{band, Content, LayerId, Rgb, SourceId};
 use crate::bus::Value;
+use crate::paint::{PaintPolicy, PolicyLayer};
 
 pub const MAGIC: &[u8; 4] = b"ORGB";
 /// Highest protocol version we speak (fields gated per-request below).
@@ -226,7 +228,16 @@ fn serialize_controller(info: &SurfaceInfo, colors: &[Rgb], ver: u32) -> Vec<u8>
 
 struct Shadow {
     layer: LayerId,
-    cells: Vec<Option<Rgb>>,
+    /// The SHARED paint buffer the [`PolicyLayer`] reads. A new update MUTATES
+    /// this buffer and refreshes the lease instead of replacing the layer, so
+    /// the fade ramp survives across updates. Retained for rebirth re-claim.
+    cells: Arc<Mutex<Vec<Option<Rgb>>>>,
+}
+
+impl Shadow {
+    fn snapshot(&self) -> Vec<Option<Rgb>> {
+        self.cells.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
 }
 
 /// One client connection's protocol state machine.
@@ -238,16 +249,29 @@ pub struct OrgbConn {
     /// a client that never negotiates is treated as protocol 0).
     pub client_version: u32,
     shadows: HashMap<u32, Shadow>,
+    /// The OpenRGB family's paint policy (blend, strength, fade, device scope):
+    /// every claim rides through a [`PolicyLayer`] reading it, so OpenRGB now
+    /// honours the same user settings the Chroma faces do.
+    policy: Arc<PaintPolicy>,
+    /// The surface list (name, led count) as of the last [`check_hotplug`]
+    /// tick — `None` until the first tick. Lets the idle pump notice a
+    /// hotplug (device added/removed/resized) without diffing on every byte
+    /// read.
+    ///
+    /// [`check_hotplug`]: OrgbConn::check_hotplug
+    surfaces_seen: Option<Vec<(String, usize)>>,
 }
 
 impl OrgbConn {
-    pub fn new(host: &mut dyn HostApi) -> OrgbConn {
+    pub fn new(host: &mut dyn HostApi, policy: Arc<PaintPolicy>) -> OrgbConn {
         OrgbConn {
             buf: Vec::new(),
             owner: host.next_source(),
             client_name: String::new(),
             client_version: 0,
             shadows: HashMap::new(),
+            policy,
+            surfaces_seen: None,
         }
     }
 
@@ -344,19 +368,59 @@ impl OrgbConn {
         }
         let infos = host.surfaces();
         for dev_idx in dead {
-            // The dead layer id is gone; drop the stale shadow and re-claim fresh.
-            let cells = self.shadows.remove(&dev_idx).map(|s| s.cells).unwrap_or_default();
+            // The dead layer id is gone; drop the stale shadow and re-claim fresh
+            // from its retained cells. The client is already on screen, so seed the
+            // ramp at full to avoid a dip.
+            let cells = self.shadows.remove(&dev_idx).map(|s| s.snapshot()).unwrap_or_default();
             let Some(info) = infos.get(dev_idx as usize) else { continue };
+            let buffer = Arc::new(Mutex::new(cells));
+            let content = Content::Live(Box::new(PolicyLayer::new(
+                info.key.clone(),
+                info.leds,
+                Arc::clone(&buffer),
+                Arc::clone(&self.policy),
+                1.0,
+            )));
             if let Some(layer) = host.claim(
                 &info.key,
                 self.owner,
                 band::SESSION,
                 LeaseSpec::Pinned,
-                Content::Cells(cells.clone()),
+                content,
                 now,
             ) {
-                self.shadows.insert(dev_idx, Shadow { layer, cells });
+                self.shadows.insert(dev_idx, Shadow { layer, cells: buffer });
             }
+        }
+    }
+
+    /// Idle-tick hotplug check: the OpenRGB protocol has the server PUSH
+    /// DEVICE_LIST_UPDATED (id 100, zero-length payload) whenever the device
+    /// list changes, so a listening client (Home Assistant, an effect script)
+    /// knows to re-request controller data instead of polling. We have no
+    /// event to hang this on, so the pump calls this once per idle tick
+    /// (~10Hz, alongside [`reassert`](Self::reassert)); it diffs the current
+    /// surface list (name + led count, in declaration order) against the one
+    /// seen last tick and returns the packet exactly when it changed.
+    ///
+    /// The baseline is normally seeded when the client enumerates the device
+    /// list (REQUEST_CONTROLLER_COUNT), so a hotplug after enumeration is caught
+    /// on the next tick. If this runs before any enumeration (baseline still
+    /// unset), the first call only seeds and never sends — a client that hasn't
+    /// read the list yet has nothing stale to invalidate. Not version-gated:
+    /// the packet carries no version-dependent payload (it is a bare
+    /// notification, unlike REQUEST_CONTROLLER_DATA's version-serialized
+    /// block above), and the reference server pushes it to every connected
+    /// client regardless of what protocol version that client negotiated.
+    pub fn check_hotplug(&mut self, host: &mut dyn HostApi) -> Vec<u8> {
+        let fp: Vec<(String, usize)> =
+            host.surfaces().into_iter().map(|s| (s.name, s.leds)).collect();
+        let changed = self.surfaces_seen.as_ref().is_some_and(|prev| *prev != fp);
+        self.surfaces_seen = Some(fp);
+        if changed {
+            packet(0, ids::DEVICE_LIST_UPDATED, &[])
+        } else {
+            Vec::new()
         }
     }
 
@@ -371,8 +435,15 @@ impl OrgbConn {
     ) {
         match pkt_id {
             ids::REQUEST_CONTROLLER_COUNT => {
-                let count = host.surfaces().len() as u32;
-                out.extend_from_slice(&packet(0, pkt_id, &count.to_le_bytes()));
+                // Answer the count AND seed the hotplug baseline from the same snapshot:
+                // this is the topology the client is about to enumerate, so a later change
+                // diffs against THIS. A baseline seeded lazily on the first idle tick would
+                // swallow any hotplug that lands between enumeration and that tick, leaving
+                // the client on stale controller indices.
+                let fp: Vec<(String, usize)> =
+                    host.surfaces().into_iter().map(|s| (s.name, s.leds)).collect();
+                out.extend_from_slice(&packet(0, pkt_id, &(fp.len() as u32).to_le_bytes()));
+                self.surfaces_seen = Some(fp);
             }
             ids::REQUEST_CONTROLLER_DATA => {
                 // Protocol ≥1 clients send the effective version to serialize
@@ -472,7 +543,8 @@ impl OrgbConn {
         cells.truncate(info.leds);
         cells.resize(info.leds, None); // short update: leave the rest unclaimed
         let key = info.key.clone();
-        self.paint(dev_idx, &key, cells, host, now);
+        let leds = info.leds;
+        self.paint(dev_idx, &key, leds, cells, host, now);
     }
 
     fn apply_single(
@@ -489,40 +561,56 @@ impl OrgbConn {
             return;
         }
         let mut cells = match self.shadows.get(&dev_idx) {
-            Some(s) => s.cells.clone(),
+            Some(s) => s.snapshot(),
             None => vec![None; info.leds],
         };
         cells[idx] = Some(color);
         let key = info.key.clone();
-        self.paint(dev_idx, &key, cells, host, now);
+        let leds = info.leds;
+        self.paint(dev_idx, &key, leds, cells, host, now);
     }
 
-    /// Set-or-claim: the connection's layer for this device gets the new
-    /// cells; if the layer vanished (kernel rebirth), re-claim transparently —
-    /// the client keeps painting, none the wiser.
+    /// Update-or-claim: the connection's layer for this device gets the new
+    /// cells written into its SHARED buffer, refreshing the lease so the fade
+    /// ramp is preserved. If the layer vanished (kernel rebirth), re-claim
+    /// transparently — the client keeps painting, none the wiser.
     fn paint(
         &mut self,
         dev_idx: u32,
         surface: &str,
+        leds: usize,
         cells: Vec<Option<Rgb>>,
         host: &mut dyn HostApi,
         now: Instant,
     ) {
-        if let Some(shadow) = self.shadows.get_mut(&dev_idx) {
-            shadow.cells = cells.clone();
-            if host.set_content(shadow.layer, Content::Cells(cells.clone()), now) {
+        let mut on_screen = false;
+        if let Some(shadow) = self.shadows.get(&dev_idx) {
+            let layer = shadow.layer;
+            // Probe liveness FIRST: a live layer just takes the new frame into its
+            // shared buffer (cells moved, no clone). Only a swept lease falls through
+            // to a re-claim, so we never write into a buffer we're about to abandon.
+            if host.refresh(layer, now) {
+                *shadow.cells.lock().unwrap_or_else(|e| e.into_inner()) = cells;
                 return;
             }
+            // Lease was swept (a kernel rebirth): drop the stale shadow, re-claim.
+            self.shadows.remove(&dev_idx);
+            on_screen = true;
         }
-        if let Some(layer) = host.claim(
-            surface,
-            self.owner,
-            band::SESSION,
-            LeaseSpec::Pinned,
-            Content::Cells(cells.clone()),
-            now,
-        ) {
-            self.shadows.insert(dev_idx, Shadow { layer, cells });
+        // A genuine first paint fades in from black; a rebirth re-claim of a client
+        // that was ALREADY streaming seeds at full so it snaps back without a dip
+        // (mirrors reassert() and chroma reconcile_device — the dip this commit kills).
+        let initial_alpha = if on_screen { 1.0 } else { 0.0 };
+        let buffer = Arc::new(Mutex::new(cells));
+        let content = Content::Live(Box::new(PolicyLayer::new(
+            surface.to_string(),
+            leds,
+            Arc::clone(&buffer),
+            Arc::clone(&self.policy),
+            initial_alpha,
+        )));
+        if let Some(layer) = host.claim(surface, self.owner, band::SESSION, LeaseSpec::Pinned, content, now) {
+            self.shadows.insert(dev_idx, Shadow { layer, cells: buffer });
         }
     }
 }
@@ -543,12 +631,22 @@ fn current_colors(info: &SurfaceInfo, host: &mut dyn HostApi, now: Instant) -> V
 mod tests {
     use super::*;
     use crate::api::SurfaceInfo;
+    use crate::arbiter::BlendMode;
     use crate::Kernel;
+    use std::collections::HashSet;
 
     fn kernel_with_kbd() -> Kernel {
         let mut k = Kernel::new();
         k.declare(SurfaceInfo::grid("kbd", "Test Board", SurfaceKind::Keyboard, 2, 3));
         k
+    }
+
+    /// A connection whose policy paints exactly as sent (`Over`, full strength,
+    /// no fade) — the old always-opaque behaviour, so the protocol-shape tests
+    /// read literal colours. Policy-driven blend/strength/scope is covered by the
+    /// dedicated tests below.
+    fn conn(k: &mut Kernel) -> OrgbConn {
+        OrgbConn::new(k, PaintPolicy::opaque())
     }
 
     fn now() -> Instant {
@@ -558,7 +656,7 @@ mod tests {
     #[test]
     fn version_negotiation_replies_with_ours() {
         let mut k = kernel_with_kbd();
-        let mut c = OrgbConn::new(&mut k);
+        let mut c = conn(&mut k);
         let reply = c.feed(
             &packet(0, ids::REQUEST_PROTOCOL_VERSION, &9u32.to_le_bytes()),
             &mut k,
@@ -574,7 +672,7 @@ mod tests {
     #[test]
     fn controller_count_and_data_shape() {
         let mut k = kernel_with_kbd();
-        let mut c = OrgbConn::new(&mut k);
+        let mut c = conn(&mut k);
         let reply = c.feed(&packet(0, ids::REQUEST_CONTROLLER_COUNT, &[]), &mut k, now());
         assert_eq!(u32le(&reply[16..20]), 1);
 
@@ -601,7 +699,7 @@ mod tests {
     #[test]
     fn update_leds_lands_in_the_arbiter() {
         let mut k = kernel_with_kbd();
-        let mut c = OrgbConn::new(&mut k);
+        let mut c = conn(&mut k);
         // 3 colors (of 6 leds): red green blue; rest stays unclaimed.
         let mut payload = Vec::new();
         payload.extend_from_slice(&0u32.to_le_bytes()); // data_size (server doesn't re-check here)
@@ -621,7 +719,7 @@ mod tests {
     #[test]
     fn single_led_composes_with_the_connection_shadow() {
         let mut k = kernel_with_kbd();
-        let mut c = OrgbConn::new(&mut k);
+        let mut c = conn(&mut k);
         let mut p = Vec::new();
         p.extend_from_slice(&4u32.to_le_bytes()); // led idx
         p.extend_from_slice(&[7, 8, 9, 0]); // color
@@ -655,7 +753,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut c = OrgbConn::new(&mut k);
+        let mut c = conn(&mut k);
         let mut payload = Vec::new();
         payload.extend_from_slice(&0u32.to_le_bytes());
         payload.extend_from_slice(&6u16.to_le_bytes());
@@ -678,7 +776,7 @@ mod tests {
         // A client names itself, paints the whole board red, then goes SILENT —
         // exactly the set-and-forget config tool the finding is about.
         let mut k = kernel_with_kbd();
-        let mut c = OrgbConn::new(&mut k);
+        let mut c = conn(&mut k);
         c.feed(&packet(0, ids::SET_CLIENT_NAME, b"hass"), &mut k, now());
         let mut payload = Vec::new();
         payload.extend_from_slice(&0u32.to_le_bytes());
@@ -707,9 +805,42 @@ mod tests {
     }
 
     #[test]
+    fn active_paint_after_rebirth_reclaims_at_full_no_dip() {
+        // The active-path twin of the reassert test: a client STREAMING frames when a
+        // kernel rebirth sweeps its lease must re-claim at full alpha on its next paint,
+        // not fade in from black. With a real fade configured, a 0.0 seed would resolve
+        // to nothing on the first frame (below the visible floor); 1.0 snaps back.
+        let mut k = kernel_with_kbd();
+        let policy = PaintPolicy::new();
+        policy.update(BlendMode::Over, 100, 1000, None); // 1s fade — a dip would be visible
+        let mut c = OrgbConn::new(&mut k, policy);
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(&6u16.to_le_bytes());
+        for _ in 0..6 {
+            payload.extend_from_slice(&[255, 0, 0, 0]);
+        }
+        c.feed(&packet(0, ids::UPDATELEDS, &payload), &mut k, now());
+
+        // Kernel rebirth: fresh kernel, surface re-declared, every lease swept.
+        let mut reborn = kernel_with_kbd();
+        assert_eq!(reborn.resolve("kbd", now()).unwrap()[0], None, "reborn kernel starts dark");
+
+        // The client keeps streaming — the very next paint hits paint()'s inline re-claim.
+        let t = now();
+        c.feed(&packet(0, ids::UPDATELEDS, &payload), &mut reborn, t);
+        let frame = reborn.resolve("kbd", t).unwrap();
+        assert_eq!(
+            frame[0],
+            Some(Rgb(255, 0, 0)),
+            "active-path re-claim seeds at full — no dip to black mid-stream"
+        );
+    }
+
+    #[test]
     fn garbage_before_magic_is_survived() {
         let mut k = kernel_with_kbd();
-        let mut c = OrgbConn::new(&mut k);
+        let mut c = conn(&mut k);
         let mut stream = b"\x00\xffnoise".to_vec();
         stream.extend_from_slice(&packet(0, ids::REQUEST_CONTROLLER_COUNT, &[]));
         let reply = c.feed(&stream, &mut k, now());
@@ -719,7 +850,7 @@ mod tests {
     #[test]
     fn split_packets_reassemble() {
         let mut k = kernel_with_kbd();
-        let mut c = OrgbConn::new(&mut k);
+        let mut c = conn(&mut k);
         let pkt = packet(0, ids::REQUEST_CONTROLLER_COUNT, &[]);
         let (a, b) = pkt.split_at(7);
         assert!(c.feed(a, &mut k, now()).is_empty(), "half a header yields nothing");
@@ -730,7 +861,7 @@ mod tests {
     #[test]
     fn hostile_length_field_is_dropped() {
         let mut k = kernel_with_kbd();
-        let mut c = OrgbConn::new(&mut k);
+        let mut c = conn(&mut k);
         let mut evil = Vec::new();
         evil.extend_from_slice(MAGIC);
         evil.extend_from_slice(&0u32.to_le_bytes());
@@ -745,7 +876,7 @@ mod tests {
     #[test]
     fn zone_update_targets_the_single_zone_only() {
         let mut k = kernel_with_kbd();
-        let mut c = OrgbConn::new(&mut k);
+        let mut c = conn(&mut k);
         let mk = |zone: u32| {
             let mut p = Vec::new();
             p.extend_from_slice(&0u32.to_le_bytes());
@@ -767,7 +898,7 @@ mod tests {
         // OpenRGBDisconnected (and Home Assistant fails with it). The
         // reference server replies even when empty; shape = [u32 size][u16 0].
         let mut k = kernel_with_kbd();
-        let mut c = OrgbConn::new(&mut k);
+        let mut c = conn(&mut k);
         for id in [ids::REQUEST_PROFILE_LIST, ids::REQUEST_PLUGIN_LIST] {
             let reply = c.feed(&packet(0, id, &[]), &mut k, now());
             assert_eq!(u32le(&reply[8..12]), id);
@@ -780,7 +911,7 @@ mod tests {
     #[test]
     fn controller_data_reports_the_kernels_resolved_truth() {
         let mut k = kernel_with_kbd();
-        let mut c = OrgbConn::new(&mut k);
+        let mut c = conn(&mut k);
         // Paint via the protocol, then read the controller back: the colors
         // array must reflect what is actually resolved — truthful State.
         let mut payload = Vec::new();
@@ -800,5 +931,98 @@ mod tests {
         for i in 0..6 {
             assert_eq!(&colors[i * 4..i * 4 + 4], &[10, 20, 30, 0]);
         }
+    }
+
+    /// A whole-board UPDATELEDS payload filling all 6 LEDs with one colour.
+    fn fill_board(color: [u8; 4]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(&6u16.to_le_bytes());
+        for _ in 0..6 {
+            payload.extend_from_slice(&color);
+        }
+        payload
+    }
+
+    fn with_base_green(k: &mut Kernel) {
+        let base = k.next_source();
+        k.claim("kbd", base, band::BASE, LeaseSpec::Pinned, Content::Fill(Rgb(0, 255, 0)), now());
+    }
+
+    #[test]
+    fn strength_composites_the_paint_over_the_base_at_the_midpoint() {
+        // OpenRGB now honours strength: at 50% a red client paint sits halfway
+        // over a green base — the policy applies where it never used to.
+        let mut k = kernel_with_kbd();
+        with_base_green(&mut k);
+        let policy = PaintPolicy::new();
+        policy.update(BlendMode::Over, 50, 0, None); // Over, half strength, instant
+        let mut c = OrgbConn::new(&mut k, policy);
+        c.feed(&packet(0, ids::UPDATELEDS, &fill_board([255, 0, 0, 0])), &mut k, now());
+        let frame = k.resolve("kbd", now()).unwrap();
+        // blend(green, red, 0.5) ≈ (128, 128, 0).
+        let Some(Rgb(r, g, b)) = frame[0] else { panic!("expected a composited cell") };
+        assert!((120..=135).contains(&r), "red channel near midpoint: {r}");
+        assert!((120..=135).contains(&g), "green channel near midpoint: {g}");
+        assert_eq!(b, 0);
+    }
+
+    #[test]
+    fn hotplug_push_fires_once_when_the_surface_list_changes() {
+        let mut k = kernel_with_kbd();
+        let mut c = conn(&mut k);
+
+        // First tick only seeds the fingerprint — connecting isn't a hotplug.
+        assert!(c.check_hotplug(&mut k).is_empty(), "first tick must not send");
+        // Nothing changed since: still silent.
+        assert!(c.check_hotplug(&mut k).is_empty(), "unchanged surfaces stay silent");
+
+        // A surface appears between ticks (the hotplug case).
+        k.declare(SurfaceInfo::grid("mouse", "Mouse", SurfaceKind::Mouse, 1, 1));
+        let reply = c.check_hotplug(&mut k);
+        assert!(!reply.is_empty(), "surface list change must push exactly one packet");
+        assert_eq!(&reply[..4], MAGIC);
+        assert_eq!(u32le(&reply[8..12]), ids::DEVICE_LIST_UPDATED);
+        assert_eq!(u32le(&reply[12..16]), 0, "DEVICE_LIST_UPDATED has a zero-length payload");
+
+        // And it settles back to silent once the new fingerprint is seen.
+        assert!(c.check_hotplug(&mut k).is_empty(), "settles after the push");
+    }
+
+    #[test]
+    fn hotplug_after_enumeration_is_announced_on_the_first_tick() {
+        // The bug this guards: the baseline must be fixed when the client ENUMERATES
+        // (REQUEST_CONTROLLER_COUNT), not lazily on the first idle tick. Otherwise a
+        // hotplug landing between enumeration and that first tick is swallowed by the
+        // seed and the client keeps stale controller indices until some later change.
+        let mut k = kernel_with_kbd();
+        let mut c = conn(&mut k);
+
+        // Client enumerates: this fixes the baseline at the 1 surface it just read.
+        let reply = c.feed(&packet(0, ids::REQUEST_CONTROLLER_COUNT, &[]), &mut k, now());
+        assert_eq!(u32le(&reply[16..20]), 1, "one surface enumerated");
+
+        // A surface hotplugs BEFORE any idle tick has run.
+        k.declare(SurfaceInfo::grid("mouse", "Mouse", SurfaceKind::Mouse, 1, 1));
+
+        // The very first check must announce it — no seed-only swallow.
+        let hp = c.check_hotplug(&mut k);
+        assert!(!hp.is_empty(), "a hotplug after enumeration must be announced immediately");
+        assert_eq!(u32le(&hp[8..12]), ids::DEVICE_LIST_UPDATED);
+        assert!(c.check_hotplug(&mut k).is_empty(), "settles after the push");
+    }
+
+    #[test]
+    fn device_disable_lets_the_base_show_through() {
+        // Scope excludes this surface: the OpenRGB paint is gated off (it never
+        // was before), and the base shows.
+        let mut k = kernel_with_kbd();
+        with_base_green(&mut k);
+        let policy = PaintPolicy::new();
+        policy.update(BlendMode::Over, 100, 0, Some(HashSet::from(["other".to_string()])));
+        let mut c = OrgbConn::new(&mut k, policy);
+        c.feed(&packet(0, ids::UPDATELEDS, &fill_board([255, 0, 0, 0])), &mut k, now());
+        let frame = k.resolve("kbd", now()).unwrap();
+        assert!(frame.iter().all(|c| *c == Some(Rgb(0, 255, 0))), "disallowed surface: base shows through");
     }
 }

@@ -31,12 +31,12 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use neuron_host::adapters::chroma::GameLightingPolicy;
+use neuron_host::paint::PaintPolicy;
 #[cfg(windows)]
 use neuron_host::adapters::chroma_shm::{server::chroma_grid_lead, ColorUnit};
 use neuron_host::api::{HostApi, LeaseSpec};
@@ -71,7 +71,20 @@ struct HostState {
     /// at (which follows the "who wins" policy; tracked so a live policy flip
     /// re-pins rather than silently keeping the old band).
     base: HashMap<String, BaseLayer>,
-    game_policy: Arc<GameLightingPolicy>,
+    /// External-paint policy for the CHROMA faces (REST + native SHM), fed by the "chroma games"
+    /// settings lane. Separate from `openrgb_policy` so games and tools can blend differently.
+    chroma_policy: Arc<PaintPolicy>,
+    /// External-paint policy for OpenRGB clients, fed by the "openrgb tools" settings lane.
+    openrgb_policy: Arc<PaintPolicy>,
+    /// Why the NATIVE (Win32 SHM) Chroma face didn't come up, if it didn't: an elevation note
+    /// (`Global\` objects need SeCreateGlobalPrivilege) vs "Razer's server already owns the
+    /// objects". `None` = it came up, or was never asked to. Surfaced honestly in [`Status`].
+    chroma_native_error: Option<String>,
+    /// The bus listener that pokes [`HOST_EVENTS_STAMP`] on every `host.*` signal (see
+    /// [`HostEventsListener`]). Held only to keep the thread alive (underscore-named like
+    /// `_host`/`_lock`); publishes nothing on teardown, so unlike the fields below its drop
+    /// position isn't load-bearing.
+    _host_events: HostEventsListener,
     // FIELD ORDER IS LOAD-BEARING: Rust drops fields top-to-bottom, so the
     // protocol I/O (which publishes/uses the kernel bus on teardown — the OBS
     // connection publishes obs.connected=false in its Drop) MUST come before
@@ -278,6 +291,88 @@ fn hook_on_change<T: PartialEq>(hook: &str, prev: &mut Option<T>, now: T) {
     }
 }
 
+// ── The host events listener: bus pokes instead of pure polling ────────────
+//
+// Adapters already publish `host.chroma.session`, `host.chroma.closed`,
+// `host.openrgb.client`, `host.openrgb.disconnected`, `host.layer.released`
+// on the bus, but nothing consumed them — the UI found out by polling on a
+// fixed cadence instead. This listener is the one subscriber: it doesn't
+// interpret the signals, it just proves "something host-shaped happened" so
+// pollers can react sooner than their own cadence without each needing their
+// own bus subscription.
+
+/// Bumped by [`HostEventsListener`] on every bus signal published under the `host` prefix. Two
+/// independent pollers read it (the lighting preview tick's foreign-owner strip, the SYSTEM
+/// status refresh) — a single consumed bool would let whichever one checks first starve the
+/// other, so instead this is a monotonic counter and each caller keeps its OWN last-seen value,
+/// comparing via [`take_host_events_dirty`].
+static HOST_EVENTS_STAMP: AtomicU64 = AtomicU64::new(0);
+
+/// Has a `host.*` bus event landed since `last_seen`'s previous check? Updates `last_seen` to the
+/// current stamp either way, so the next call only reports events newer than this one. Callers
+/// own their `last_seen` cell — one per independent poller (see [`HOST_EVENTS_STAMP`]'s doc).
+pub fn take_host_events_dirty(last_seen: &std::cell::Cell<u64>) -> bool {
+    let now = HOST_EVENTS_STAMP.load(Ordering::Relaxed);
+    let dirty = now != last_seen.get();
+    last_seen.set(now);
+    dirty
+}
+
+/// Subscribed at bring-up to the bus's `host` prefix (segment-aware: matches `host.chroma.session`,
+/// `host.layer.released`, … but not e.g. `hostage.foo`); its only job is bumping
+/// [`HOST_EVENTS_STAMP`] so pollers elsewhere can react without each running their own bus
+/// consumer. Mirrors [`ObsFollower`]'s stop-flag-plus-join shutdown story; unlike the OBS follower
+/// it touches no shared state on teardown (nothing to reset), so its Drop position inside
+/// [`HostState`] isn't load-bearing.
+struct HostEventsListener {
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl HostEventsListener {
+    fn start(handle: HostHandle) -> HostEventsListener {
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = stop.clone();
+        let thread = thread::Builder::new()
+            .name("neuron-host-events".into())
+            .spawn(move || host_events_loop(handle, &flag))
+            .expect("spawn host events listener");
+        HostEventsListener { stop, thread: Some(thread) }
+    }
+}
+
+impl Drop for HostEventsListener {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// The listener loop: resubscribe across a kernel rebirth (same dance as [`follow`]), and bump
+/// the stamp on every signal delivered — including the retained snapshot a fresh subscribe
+/// replays, which is harmless (it only makes the very first poll after bring-up see "dirty").
+fn host_events_loop(handle: HostHandle, stop: &AtomicBool) {
+    use std::sync::mpsc::RecvTimeoutError;
+    let mut rx = handle.subscribe("host");
+    while !stop.load(Ordering::Relaxed) {
+        match &rx {
+            Some(r) => match r.recv_timeout(Duration::from_millis(250)) {
+                Ok(_) => {
+                    HOST_EVENTS_STAMP.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => rx = None,
+            },
+            None => {
+                thread::sleep(Duration::from_millis(250));
+                rx = handle.subscribe("host");
+            }
+        }
+    }
+}
+
 /// The SYSTEM card's honest readout: what's on, what actually BOUND (a taken
 /// port — real Synapse, another instance — shows as serving=false even while
 /// the gate is on), and how many devices the bridge speaks for.
@@ -292,6 +387,10 @@ pub struct Status {
     /// of what it's painting.
     pub chroma_native_serving: bool,
     pub chroma_native_game: Option<NativeChroma>,
+    /// Why the native (SHM) Chroma face isn't serving, when it isn't and a reason was captured:
+    /// distinguishes "needs elevation" from "Razer's server already owns the objects". `None`
+    /// when it IS serving, or the host is down. Drives the elevation-vs-generic status branch.
+    pub chroma_native_error: Option<String>,
     pub openrgb_serving: bool,
     /// OBS has actually authenticated (vs merely attempting). Drives the
     /// "connected to OBS" vs "connecting" copy.
@@ -328,6 +427,13 @@ pub struct NativeChroma {
     /// Effect kind the game is painting (`custom`, `static`, `wave`, …).
     pub effect: String,
     pub streams: Vec<NativeChromaStream>,
+    /// The name of whoever is actually winning the surfaces this game is claiming, when it's
+    /// nobody the game itself — cross-referenced against the ARBITER's live claims, not the raw
+    /// telemetry above (which only ever describes what the SHM face decoded, never who else is on
+    /// top of it). `None` when the game wins at least one of its claimed surfaces; `Some(name)`
+    /// when a foreign owner (a REST Chroma client, an OpenRGB tool) tops every one of them — the
+    /// game is connected and painting into shared memory, but the board shows someone else.
+    pub covered_by: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -352,6 +458,10 @@ pub struct ClientStatus {
     /// It holds at least one claim somewhere (painting OR layered underneath).
     /// false = connected but idle: it hasn't asked to paint anything yet.
     pub has_claim: bool,
+    /// It holds a claim but its face's paint STRENGTH is 0 — connected, leased, and honestly
+    /// invisible (the user dialled this family to nothing). Lets the card say "connected but
+    /// muted" instead of implying it's painting.
+    pub muted: bool,
 }
 
 /// Boot-time start, honoring the persisted preference (default OFF). The
@@ -422,8 +532,10 @@ pub fn set_enabled(on: bool) -> String {
     }
 }
 
-fn game_blend_from_prefs() -> BlendMode {
-    match crate::prefs::host_game_mode().as_str() {
+/// Map a paint-mode string to its arbiter blend mode. The one mapping both lanes share:
+/// "replace"=>Over, "boost"=>Add, "tint"=>Multiply, anything else ("merge")=>Screen.
+fn blend_from_mode_str(mode: &str) -> BlendMode {
+    match mode {
         "replace" => BlendMode::Over,
         "boost" => BlendMode::Add,
         "tint" => BlendMode::Multiply,
@@ -431,11 +543,19 @@ fn game_blend_from_prefs() -> BlendMode {
     }
 }
 
-fn refresh_game_policy(policy: &GameLightingPolicy, bridge: &Bridge) {
+/// Push both external-paint lanes' current prefs into their live policies. The UNIVERSAL
+/// hands-off list gates BOTH (built once, applied to each); each lane additionally reads its own
+/// (mode, strength, fade) from its prefs. Called on any protocol-pref change.
+fn refresh_paint_policies(
+    chroma_policy: &PaintPolicy,
+    openrgb_policy: &PaintPolicy,
+    bridge: &Bridge,
+) {
     let disabled: HashSet<String> =
-        crate::prefs::host_game_disabled_devices().into_iter().collect();
+        crate::prefs::host_paint_disabled_devices().into_iter().collect();
     let disabled_keys: HashSet<String> =
         disabled.iter().filter_map(|id| bridge.key_for_unit(id).cloned()).collect();
+    // `None` = every surface allowed; `Some(set)` = only these surfaces. Built once, shared.
     let surfaces = (!disabled.is_empty()).then(|| {
         bridge
             .surfaces
@@ -444,10 +564,16 @@ fn refresh_game_policy(policy: &GameLightingPolicy, bridge: &Bridge) {
             .map(|surface| surface.key.clone())
             .collect::<HashSet<_>>()
     });
-    policy.update(
-        game_blend_from_prefs(),
-        crate::prefs::host_game_intensity(),
-        crate::prefs::host_game_fade_ms(),
+    chroma_policy.update(
+        blend_from_mode_str(&crate::prefs::host_chroma_paint_mode()),
+        crate::prefs::host_chroma_paint_strength(),
+        crate::prefs::host_chroma_paint_fade_ms(),
+        surfaces.clone(),
+    );
+    openrgb_policy.update(
+        blend_from_mode_str(&crate::prefs::host_openrgb_paint_mode()),
+        crate::prefs::host_openrgb_paint_strength(),
+        crate::prefs::host_openrgb_paint_fade_ms(),
         surfaces,
     );
 }
@@ -471,7 +597,7 @@ fn game_device_scope(bridge: &Bridge) -> Vec<GameDeviceScope> {
 pub fn apply_protocol_prefs() {
     let mut g = guard();
     let Some(s) = g.as_mut() else { return };
-    refresh_game_policy(&s.game_policy, &s.bridge);
+    refresh_paint_policies(&s.chroma_policy, &s.openrgb_policy, &s.bridge);
     let want_chroma = crate::prefs::host_chroma();
     let want_orgb = crate::prefs::host_openrgb();
     match (want_chroma, s.chroma.is_some()) {
@@ -479,7 +605,7 @@ pub fn apply_protocol_prefs() {
             s.chroma = ChromaHttpServer::bind_with_policy(
                 CHROMA_ADDR,
                 s.handle.clone(),
-                Arc::clone(&s.game_policy),
+                Arc::clone(&s.chroma_policy),
             )
             .ok()
         }
@@ -492,17 +618,33 @@ pub fn apply_protocol_prefs() {
     match (want_chroma, s.chroma_shm.is_some()) {
         (true, false) => {
             let mut h = s.handle.clone();
-            s.chroma_shm = spawn_chroma_shm(&s.bridge, &mut h, Arc::clone(&s.game_policy));
+            let (shm, err) = spawn_chroma_shm(&s.bridge, &mut h, Arc::clone(&s.chroma_policy));
+            s.chroma_shm = shm;
+            s.chroma_native_error = err;
         }
         (false, true) => {
             if let Some(shm) = s.chroma_shm.take() {
                 s.handle.release_owner(shm.src);
             }
+            s.chroma_native_error = None;
         }
-        _ => {}
+        (false, false) => {
+            // Chroma is off with nothing to tear down — but a PRIOR failed spawn can
+            // have left a stale "needs elevation" error. An intentionally-off face has
+            // no error to report, so clear it (status honesty: off must read as off).
+            s.chroma_native_error = None;
+        }
+        _ => {} // (true, true): already serving — its error was cleared on spawn.
     }
     match (want_orgb, s.orgb.is_some()) {
-        (true, false) => s.orgb = OrgbServer::bind(OPENRGB_ADDR, s.handle.clone()).ok(),
+        (true, false) => {
+            s.orgb = OrgbServer::bind_with_policy(
+                OPENRGB_ADDR,
+                s.handle.clone(),
+                Arc::clone(&s.openrgb_policy),
+            )
+            .ok()
+        }
         (false, true) => s.orgb = None,
         _ => {}
     }
@@ -709,8 +851,15 @@ struct ChromaShm {
     /// refreshing until this ages past [`SHM_FADE_GRACE`], letting the crossfade finish before
     /// the leases are allowed to lapse. `None` = no game seen yet.
     last_live: Option<Instant>,
-    /// Shared game-lighting policy read live by every native Chroma layer.
-    policy: Arc<GameLightingPolicy>,
+    /// Shared paint policy read live by every native Chroma layer.
+    policy: Arc<PaintPolicy>,
+    /// The PID [`refresh_chroma_shm`] saw active as of the last tick (`None` = no game has been
+    /// seen since this face came up, or since the one that was here left). Lets it detect a fresh
+    /// ACTIVATION — a game connecting, or a different game taking over from the one that was
+    /// here — and force a re-claim so the newly-active painter gets the newest (i.e. topmost
+    /// within its priority band) seq, instead of forever holding the lowest seq it was born with
+    /// at host bring-up. See the "seq fairness" note in `refresh_chroma_shm`.
+    last_shm_game_pid: Option<u32>,
 }
 
 /// The Heartbeat TTL on each game layer. This lease is refreshed ONLY by the app's UI-thread
@@ -741,20 +890,30 @@ const SHM_FADE_GRACE: Duration = Duration::from_millis(1200);
 fn spawn_chroma_shm(
     bridge: &Bridge,
     h: &mut HostHandle,
-    policy: Arc<GameLightingPolicy>,
-) -> Option<ChromaShm> {
-    use neuron_host::adapters::chroma_shm::server::{ChromaShmLayer, ShmServer};
+    policy: Arc<PaintPolicy>,
+) -> (Option<ChromaShm>, Option<String>) {
+    use neuron_host::adapters::chroma_shm::server::{ChromaShmLayer, CreateError, ShmServer};
     use neuron_host::api::SurfaceKind;
     use std::sync::Arc;
 
-    // Log WHY the native face didn't come up instead of swallowing it with `.ok()?` —
-    // the usual cause is an unelevated launch (`Global\` needs SeCreateGlobalPrivilege),
-    // which silently degraded to REST-only and read as "my work vanished after a reboot."
+    // Capture WHY the native face didn't come up instead of swallowing it — the usual cause is an
+    // unelevated launch (`Global\` needs SeCreateGlobalPrivilege), which silently degraded to
+    // REST-only and read as "my work vanished after a reboot." Distinguish that from Razer's own
+    // server already owning the objects, so the card can point at the fix (the elevated tray task)
+    // rather than a generic error.
     let server: ChromaShmHandle = match ShmServer::create() {
         Ok(s) => Arc::new(s),
         Err(e) => {
             eprintln!("neuron-host: native Chroma (SHM) server not started — {e}");
-            return None;
+            let reason = match e {
+                CreateError::AlreadyServing => {
+                    "another Chroma server (Razer Synapse) already owns the native connection".to_string()
+                }
+                CreateError::Io(_) => {
+                    "needs elevation — start via the elevated tray task".to_string()
+                }
+            };
+            return (None, Some(reason));
         }
     };
     let src = h.next_source();
@@ -795,16 +954,26 @@ fn spawn_chroma_shm(
             });
         }
     }
-    Some(ChromaShm { handle: server, src, layers, last_live: None, policy })
+    (
+        Some(ChromaShm {
+            handle: server,
+            src,
+            layers,
+            last_live: None,
+            policy,
+            last_shm_game_pid: None,
+        }),
+        None,
+    )
 }
 
 #[cfg(not(windows))]
 fn spawn_chroma_shm(
     _bridge: &Bridge,
     _h: &mut HostHandle,
-    _policy: Arc<GameLightingPolicy>,
-) -> Option<ChromaShm> {
-    None
+    _policy: Arc<PaintPolicy>,
+) -> (Option<ChromaShm>, Option<String>) {
+    (None, None)
 }
 
 /// Keep the native-Chroma game layers honest against the arbiter's lease model. Each host tick
@@ -815,6 +984,15 @@ fn spawn_chroma_shm(
 /// user's base returns — structurally, not by trusting the layer's own alpha ramp. This is the
 /// invariant the arbiter states in one line: everything session-shaped keeps proving it exists
 /// (here, by the game's live PID) or it goes. Windows-only; a no-op stub elsewhere.
+/// Did the native game change since the last tick — a fresh connect (`None` → `Some`) or a
+/// different game taking over from the one that was here (`Some(old)` → `Some(new)`, `old != new`)?
+/// Deliberately NOT true for `Some` → `None` (a game leaving): that must keep the existing layer's
+/// fade-out running, not restart it. Pure so `refresh_chroma_shm`'s seq-fairness re-claim (see
+/// there) is unit-testable without a live arbiter.
+fn shm_game_activated(previous: Option<u32>, current: Option<u32>) -> bool {
+    matches!(current, Some(pid) if previous != Some(pid))
+}
+
 #[cfg(windows)]
 fn refresh_chroma_shm(s: &mut HostState, now: Instant) {
     use neuron_host::adapters::chroma_shm::server::ChromaShmLayer;
@@ -826,6 +1004,16 @@ fn refresh_chroma_shm(s: &mut HostState, now: Instant) {
     if present {
         shm.last_live = Some(now);
     }
+    // SEQ FAIRNESS: which PID (if any) is the active game, by the same "first registered app"
+    // convention `native_chroma_status` names by. The SHM layers are all claimed dormant at host
+    // bring-up, so absent this check a native game holds the LOWEST seq in the SESSION band
+    // forever — any REST/OpenRGB client connecting later permanently composites on top of it,
+    // even while the game is the thing actually on screen. Detecting the PID transition below and
+    // forcing a fresh re-claim gives the newly (or newly-different) active game the band's newest
+    // seq, so "whoever most recently became active sits on top" holds the way a user expects.
+    let current_pid = present.then(|| shm.handle.registered_apps().first().map(|a| a.id)).flatten();
+    let activated = shm_game_activated(shm.last_shm_game_pid, current_pid);
+    shm.last_shm_game_pid = current_pid;
     // Whether to keep the leases alive this tick:
     //   • no game has EVER connected (`last_live` None) → keep warm. A never-live layer paints
     //     nothing (its alpha is provably 0 with no game input to decode), so holding its lease
@@ -848,6 +1036,35 @@ fn refresh_chroma_shm(s: &mut HostState, now: Instant) {
     let src = shm.src;
     let policy = Arc::clone(&shm.policy);
     let mut h = s.handle.clone();
+    if activated {
+        // Release and re-claim EVERY layer right now, via the same claim recipe the rebirth path
+        // below uses, so this activation lands with a fresh (highest) seq in the band. Forced to
+        // 0.0 here — NOT the "present ⇒ 1.0" heuristic below, which exists for a layer that was
+        // swept mid-paint by a stall — because this is a genuinely fresh activation and should
+        // crossfade in like any new connection, not pop to full brightness.
+        for l in &mut shm.layers {
+            h.release(l.id);
+            let layer = ChromaShmLayer::new(
+                Arc::clone(&handle),
+                l.key.clone(),
+                l.device_type,
+                l.leds,
+                Arc::clone(&policy),
+                0.0,
+            );
+            if let Some(id) = h.claim(
+                &l.key,
+                src,
+                band::SESSION,
+                LeaseSpec::Ttl(SHM_LEASE_TTL),
+                Content::Live(Box::new(layer)),
+                now,
+            ) {
+                l.id = id;
+            }
+        }
+        return;
+    }
     for l in &mut shm.layers {
         // A live refresh pushes the deadline out; `false` = the layer was swept (lease lapsed
         // during a stall or a kernel rebirth) re-claim an identical one from its recipe.
@@ -898,10 +1115,14 @@ fn bring_up(g: &mut Option<HostState>) -> bool {
     let host = Host::spawn();
     let handle = host.handle();
     let mut h = host.handle();
+    let host_events = HostEventsListener::start(host.handle());
     let base_owner = h.next_source();
     let bridge = bridge::attach(&reg, &handle, 30);
-    let game_policy = GameLightingPolicy::new();
-    refresh_game_policy(&game_policy, &bridge);
+    // Two paint policies by design — one for the Chroma faces (games), one for OpenRGB (tools) —
+    // so the settings page can blend each family differently. Both fed from prefs now.
+    let chroma_policy = PaintPolicy::new();
+    let openrgb_policy = PaintPolicy::new();
+    refresh_paint_policies(&chroma_policy, &openrgb_policy, &bridge);
 
     // Per-protocol gates; a failed bind here means a squatter on THAT protocol only (often real
     // Synapse) — a second neuron instance is already excluded by the election above. Each
@@ -912,20 +1133,30 @@ fn bring_up(g: &mut Option<HostState>) -> bool {
             ChromaHttpServer::bind_with_policy(
                 CHROMA_ADDR,
                 host.handle(),
-                Arc::clone(&game_policy),
+                Arc::clone(&chroma_policy),
             )
             .ok()
         })
         .flatten();
     let orgb = crate::prefs::host_openrgb()
-        .then(|| OrgbServer::bind(OPENRGB_ADDR, host.handle()).ok())
+        .then(|| {
+            OrgbServer::bind_with_policy(
+                OPENRGB_ADDR,
+                host.handle(),
+                Arc::clone(&openrgb_policy),
+            )
+            .ok()
+        })
         .flatten();
     // The NATIVE face of the same "chroma (games)" feature: native games speak Win32
     // shared memory, not REST, so serving them means BEING the SHM server — gated by the
-    // same `host_chroma` switch as the REST face above.
-    let chroma_shm = crate::prefs::host_chroma()
-        .then(|| spawn_chroma_shm(&bridge, &mut h, Arc::clone(&game_policy)))
-        .flatten();
+    // same `host_chroma` switch as the REST face above. Capture why it declined (elevation vs
+    // Razer already serving) for the honest SYSTEM readout.
+    let (chroma_shm, chroma_native_error) = if crate::prefs::host_chroma() {
+        spawn_chroma_shm(&bridge, &mut h, Arc::clone(&chroma_policy))
+    } else {
+        (None, None)
+    };
 
     eprintln!(
         "neuron-host: connections open — {} device(s) bridged, chroma={} (rest={}, native={}), openrgb={}, obs={}",
@@ -941,7 +1172,10 @@ fn bring_up(g: &mut Option<HostState>) -> bool {
         bridge,
         base_owner,
         base: HashMap::new(),
-        game_policy,
+        chroma_policy,
+        openrgb_policy,
+        chroma_native_error,
+        _host_events: host_events,
         _host: host,
         orgb,
         chroma,
@@ -957,11 +1191,43 @@ fn bring_up(g: &mut Option<HostState>) -> bool {
     true
 }
 
+/// Whose paint the native SHM game is actually showing under, if anyone: given the topmost
+/// claim's owner (paired with its label, when the adapter named it) for each surface the SHM face
+/// holds a claim on, decide whether the game wins anywhere. If it does, `None` — uncontested (or
+/// at least not fully covered). If it wins NOWHERE and some other FOREIGN owner (a REST Chroma
+/// client, an OpenRGB tool — foreign means "not the app's base" throughout this module, see
+/// [`board_owner`]) tops at least one of those surfaces, `Some(name)` — the game is connected and
+/// painting into shared memory, but the board shows a rival client. The app's own base winning is
+/// deliberately NOT coverage: that's the "my lighting always wins" suppressed case, which the
+/// board-owner readout already tells honestly, not another app sitting on the game. Pure so it's
+/// unit-testable without a live arbiter.
+fn covered_by_decision(
+    tops: &[(SourceId, Option<String>)],
+    shm_src: SourceId,
+    base_owner: SourceId,
+) -> Option<String> {
+    if tops.iter().any(|(owner, _)| *owner == shm_src) {
+        return None;
+    }
+    tops.iter()
+        .find(|(owner, _)| *owner != shm_src && *owner != base_owner)
+        .map(|(_, label)| {
+            label.clone().filter(|l| !l.is_empty()).unwrap_or_else(|| "another app".into())
+        })
+}
+
 /// Pull the native Chroma face's live telemetry off the SHM server for the readout:
-/// `(serving, what a game is painting)`. Windows-only (the server is); a no-op stub
-/// elsewhere so [`Status`] stays platform-uniform.
+/// `(serving, what a game is painting)`. Cross-references the arbiter's live claims (via
+/// `handle`/`now`) so the readout can say who's actually on top, not just what the SHM face
+/// decoded (see [`covered_by_decision`]). Windows-only (the server is); a no-op stub elsewhere so
+/// [`Status`] stays platform-uniform.
 #[cfg(windows)]
-fn native_chroma_status(chroma_shm: &Option<ChromaShm>) -> (bool, Option<NativeChroma>) {
+fn native_chroma_status(
+    chroma_shm: &Option<ChromaShm>,
+    handle: &HostHandle,
+    base_owner: SourceId,
+    now: Instant,
+) -> (bool, Option<NativeChroma>) {
     fn chroma_device_name(device_type: u8) -> &'static str {
         match device_type {
             0x01 => "keyboard",
@@ -1029,7 +1295,21 @@ fn native_chroma_status(chroma_shm: &Option<ChromaShm>) -> (bool, Option<NativeC
                         })
                         .filter(|stream| stream.lit > 0)
                         .collect();
-                    NativeChroma { game, devices, effect: effect.to_lowercase(), streams }
+                    // The topmost owner (+ label, when named) of every surface the SHM face
+                    // claims — including surfaces the game isn't currently painting, which is
+                    // harmless: `covered_by_decision` only reports coverage when the SHM owner
+                    // wins NOWHERE, and a surface the game never touches can't flip that verdict
+                    // (it can only ever ADD a foreign winner, never remove the game's own win
+                    // elsewhere).
+                    let tops: Vec<(SourceId, Option<String>)> = shm
+                        .layers
+                        .iter()
+                        .filter_map(|l| {
+                            handle.claims(&l.key, now).into_iter().next().map(|c| (c.owner, c.label))
+                        })
+                        .collect();
+                    let covered_by = covered_by_decision(&tops, shm.src, base_owner);
+                    NativeChroma { game, devices, effect: effect.to_lowercase(), streams, covered_by }
                 });
             (true, game)
         }
@@ -1038,7 +1318,12 @@ fn native_chroma_status(chroma_shm: &Option<ChromaShm>) -> (bool, Option<NativeC
 }
 
 #[cfg(not(windows))]
-fn native_chroma_status(_chroma_shm: &Option<ChromaShm>) -> (bool, Option<NativeChroma>) {
+fn native_chroma_status(
+    _chroma_shm: &Option<ChromaShm>,
+    _handle: &HostHandle,
+    _base_owner: SourceId,
+    _now: Instant,
+) -> (bool, Option<NativeChroma>) {
     (false, None)
 }
 
@@ -1054,17 +1339,23 @@ fn status_of(g: &Option<HostState>) -> Status {
                 .iter()
                 .map(|i| (kind_word(i.kind), s.handle.claims(&i.key, now)))
                 .collect();
+            // A face is MUTED when the user dialled its paint strength to 0: any client of that
+            // face holding a claim is honestly invisible. `alpha()` is strength/100, so ==0.0
+            // exactly means strength 0.
+            let chroma_muted = s.chroma_policy.alpha() == 0.0;
+            let openrgb_muted = s.openrgb_policy.alpha() == 0.0;
             let chroma_clients = s
                 .chroma
                 .as_ref()
-                .map(|c| client_statuses(c.sessions(), &boards))
+                .map(|c| client_statuses(c.sessions(), &boards, chroma_muted))
                 .unwrap_or_default();
             let openrgb_clients = s
                 .orgb
                 .as_ref()
-                .map(|o| client_statuses(o.clients(), &boards))
+                .map(|o| client_statuses(o.clients(), &boards, openrgb_muted))
                 .unwrap_or_default();
-            let (chroma_native_serving, chroma_native_game) = native_chroma_status(&s.chroma_shm);
+            let (chroma_native_serving, chroma_native_game) =
+                native_chroma_status(&s.chroma_shm, &s.handle, s.base_owner, now);
             Status {
                 active: true,
                 devices: s.bridge.surfaces.len(),
@@ -1072,6 +1363,12 @@ fn status_of(g: &Option<HostState>) -> Status {
                 chroma_serving: s.chroma.is_some(),
                 chroma_native_serving,
                 chroma_native_game,
+                // Only meaningful WHILE the native face isn't serving; cleared once it is.
+                chroma_native_error: if chroma_native_serving {
+                    None
+                } else {
+                    s.chroma_native_error.clone()
+                },
                 openrgb_serving: s.orgb.is_some(),
                 obs_connected: s.obs.as_ref().is_some_and(|c| c.is_connected()),
                 obs_scene: obs.scene,
@@ -1092,6 +1389,7 @@ fn status_of(g: &Option<HostState>) -> Status {
 fn client_statuses(
     roster: Vec<(SourceId, String)>,
     boards: &[(&'static str, Vec<neuron_host::shell::Claim>)],
+    muted_face: bool,
 ) -> Vec<ClientStatus> {
     roster
         .into_iter()
@@ -1112,6 +1410,11 @@ fn client_statuses(
                 name,
                 painting,
                 has_claim,
+                // Its whole face is dialled to strength 0 — connected, yet painting nothing on
+                // screen. NB: a strength-0 layer's alpha is 0, so the arbiter's visibility floor
+                // drops it from `claims()` entirely (hence `has_claim` is false here) — that's
+                // exactly why muted keys off the face policy, not the (now-invisible) claim.
+                muted: muted_face,
             }
         })
         .collect()
@@ -1326,8 +1629,16 @@ pub fn set_lighting(pid: u16, unit: &str, defs: Vec<LayerDef>, fps: u32) -> bool
         return false;
     }
 
-    // The user's lighting is always the BASE layer; games sit above it at SESSION.
-    let want_band = band::BASE;
+    // Normally the user's lighting is the BASE layer and games sit above it at SESSION. When
+    // "my lighting always wins" is on, the base claims the OVERRIDE band instead, outranking every
+    // visitor (they keep painting underneath but never show — the suppressed case). A live toggle
+    // re-applies the stack (see the glue callback), and the band-change path below (release +
+    // re-claim when the band differs) re-pins each surface at the new priority.
+    let want_band = if crate::prefs::host_base_always_wins() {
+        band::OVERRIDE
+    } else {
+        band::BASE
+    };
     let now = Instant::now();
     let mut any = false;
     for key in keys {
@@ -1486,4 +1797,79 @@ pub fn heartbeat() {
     // once no game remains. This is what keeps the SESSION-band game layer inside the arbiter's
     // "session-shaped ⇒ Heartbeat" invariant rather than pinned-forever.
     refresh_chroma_shm(s, now);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The one blend mapping both paint lanes share (Chroma games + OpenRGB tools).
+    #[test]
+    fn blend_from_mode_str_maps_every_mode() {
+        assert_eq!(blend_from_mode_str("replace"), BlendMode::Over);
+        assert_eq!(blend_from_mode_str("boost"), BlendMode::Add);
+        assert_eq!(blend_from_mode_str("tint"), BlendMode::Multiply);
+        assert_eq!(blend_from_mode_str("merge"), BlendMode::Screen);
+        // unknown ⇒ the merge default, never a panic
+        assert_eq!(blend_from_mode_str("garbage"), BlendMode::Screen);
+        assert_eq!(blend_from_mode_str(""), BlendMode::Screen);
+    }
+
+    /// A game's own claim winning anywhere means it's not covered, regardless of what else is
+    /// going on elsewhere on its other (untouched) surfaces.
+    #[test]
+    fn covered_by_decision_none_when_shm_wins_anywhere() {
+        let (shm, base, other) = (SourceId(1), SourceId(0), SourceId(2));
+        let tops = vec![(shm, None), (other, Some("Aurora".into()))];
+        assert_eq!(covered_by_decision(&tops, shm, base), None);
+    }
+
+    /// The game wins nowhere and a named foreign owner tops one of its surfaces: covered, by name.
+    #[test]
+    fn covered_by_decision_names_the_foreign_winner() {
+        let (shm, base, other) = (SourceId(1), SourceId(0), SourceId(2));
+        let tops = vec![(other, Some("OpenRGB Tool".into()))];
+        assert_eq!(covered_by_decision(&tops, shm, base), Some("OpenRGB Tool".into()));
+    }
+
+    /// An unlabeled foreign winner still reads as coverage — falls back to "another app" rather
+    /// than surfacing nothing.
+    #[test]
+    fn covered_by_decision_falls_back_to_another_app() {
+        let (shm, base, other) = (SourceId(1), SourceId(0), SourceId(2));
+        let tops = vec![(other, None), (other, Some(String::new()))];
+        assert_eq!(covered_by_decision(&tops, shm, base), Some("another app".into()));
+    }
+
+    /// The app's OWN base winning (the "my lighting always wins" OVERRIDE pin) is the suppressed
+    /// case, not coverage — "underneath another app" must never describe the user's own lighting.
+    #[test]
+    fn covered_by_decision_ignores_the_apps_own_base() {
+        let (shm, base) = (SourceId(1), SourceId(0));
+        let tops = vec![(base, None), (base, None)];
+        assert_eq!(covered_by_decision(&tops, shm, base), None);
+    }
+
+    /// No claims at all (nobody tops any surface) ⇒ nobody to blame, not covered.
+    #[test]
+    fn covered_by_decision_none_when_nothing_claims_anything() {
+        let (shm, base) = (SourceId(1), SourceId(0));
+        assert_eq!(covered_by_decision(&[], shm, base), None);
+    }
+
+    /// The activation edges that matter: a fresh connect, and a different game taking over.
+    #[test]
+    fn shm_game_activated_on_connect_and_on_game_change() {
+        assert!(shm_game_activated(None, Some(42)));
+        assert!(shm_game_activated(Some(42), Some(99)));
+    }
+
+    /// The edges that must NOT re-claim: no change, and — critically — the game leaving (its
+    /// layer must keep running its existing fade-out, not restart via a fresh claim).
+    #[test]
+    fn shm_game_activated_not_on_steady_state_or_exit() {
+        assert!(!shm_game_activated(Some(42), Some(42)));
+        assert!(!shm_game_activated(Some(42), None));
+        assert!(!shm_game_activated(None, None));
+    }
 }

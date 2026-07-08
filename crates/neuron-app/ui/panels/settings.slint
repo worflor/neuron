@@ -1,5 +1,5 @@
 import { Theme } from "../theme.slint";
-import { Card, SectionTitle, Label, Button, Toggle, Pill, Mono, Divider, PanelHead, Slider, SplitToggle, SplitButton, Contact, SubLabel, ColorPicker, Palette, Field } from "../widgets/controls.slint";
+import { Card, SectionTitle, Label, Button, Toggle, Pill, Mono, Divider, PanelHead, Slider, SplitToggle, SplitButton, Contact, SubLabel, ColorPicker, Palette, Field, ConfirmButton } from "../widgets/controls.slint";
 import { State } from "../state.slint";
 import { ChromaStreamRow, DiagRow } from "../models.slint";
 
@@ -185,7 +185,10 @@ component DiagCell inherits Rectangle {
                 text: root.d.state == "pass" ? "PASS"
                     : root.d.state == "fail" ? "FAIL"
                     : root.d.state == "skip" ? "SKIP" : "—";
-                color: root.d.state == "pass" ? Theme.accent-dim
+                // PASS inks the FULL accent — the confident verdict shouldn't be the quietest thing in
+                // the cell. FAIL/SKIP already get full-strength danger/warn; a dimmed pass broke that
+                // scale (the good outcome read fainter than the bad ones).
+                color: root.d.state == "pass" ? Theme.accent
                     : root.d.state == "fail" ? Theme.danger
                     : root.d.state == "skip" ? Theme.warn
                     : Theme.text-faint;
@@ -260,6 +263,9 @@ component RingPulse inherits Rectangle {
 // Rust canonicalises an exact spot back to its preset slug. (The page Flickable is interactive:false,
 // so this drag never fights a page scroll.)
 component NotifPlacer inherits Rectangle {
+    // gated with the notifications master switch — dimmed + inert when notifications are off, so the
+    // drag surface can't be used behind a disabled subsystem (mirrors the atoms' `enabled`).
+    in property <bool> enabled: true;
     property <bool> off: State.notif-placement == "off";
     property <length> inset: 16px;          // keeps the card off the very bezel
     property <length> puck-w: 62px;
@@ -295,7 +301,7 @@ component NotifPlacer inherits Rectangle {
     border-width: Theme.hair;
     border-color: Theme.line;
     clip: true;
-    opacity: root.off ? 0.4 : 1.0;
+    opacity: root.off ? Theme.dim-gated : 1.0;
     animate opacity { duration: Theme.quick; }
 
     // faint screen structure — the centre cross the magnet pulls toward
@@ -356,7 +362,8 @@ component NotifPlacer inherits Rectangle {
 
     // the whole screen is the drag surface: press to place, drag to move, magnetic on the grid
     ta := TouchArea {
-        mouse-cursor: root.dragging ? MouseCursor.grabbing : MouseCursor.grab;
+        enabled: root.enabled;
+        mouse-cursor: !root.enabled ? MouseCursor.default : root.dragging ? MouseCursor.grabbing : MouseCursor.grab;
         moved => { if (root.dragging) { root.place-at(self.mouse-x, self.mouse-y); } }
         pointer-event(e) => {
             if (e.kind == PointerEventKind.down) {
@@ -458,511 +465,6 @@ component NotifStackMock inherits Card {
     }
 }
 
-// SNAP TAP STAGE — "THE DIVERGENCE". The self-demonstrating visual for the Snap Tap mechanical
-// advantage, reimagined as a TWO-PLAYER RACE on the same input. Two stacked full-width lanes are fed
-// the IDENTICAL counter-strafe sequence (the shared [A] [D] keycaps drive both): the upper RAW lane is
-// the dim, normal-SOCD player; the lower SNAP lane is the glowing accent player. On the snap the accent
-// player flips to D INSTANTLY while the dim one STALLS in the SOCD dead-zone — and the glowing LEAD-GAP
-// spanning the horizontal distance between them is the hero element: the edge, quantified. Same trigger,
-// one's already there, one's stuck. No text — accent=winner / dim=laggard carries it.
-//
-//   [A] ........... shared input lights both lanes ........... [D]
-//   raw   o..........|..  (stalls in the dead-zone)  — dim hollow ring, frozen
-//   snap  *======================>(O)  halo + comet  — accent, snapped to D, instant
-//              |---- LEAD-GAP (glows) ----|             the advantage, made visible
-//
-// PHASES (one Timer tick each; the snap flips fast then HOLDS the rest of the tick — that held frame
-// after the instant flip is what sells "instant"):
-//   0  ready   — both markers at A (left), keys up (a breath before the beat)
-//   1  strafe  — A pressed ([A] lit on both lanes); both markers hold the A end (they agree)
-//   2  SNAP    — D tapped while A held ([A]+[D] lit): accent SNAPS to D (instant) + halo + comet streak;
-//               dim STALLS in the dead-zone with a warning pulse; the LEAD-GAP blooms between them
-//   3  catchup — dim limps over to D (slow, too late); the lead-gap collapses; a soft accent pulse at D
-//   4  reset   — keys up; both ease back to A, then loop
-// `live` gates the Timer so it only animates while the option is REVEALED (sealed = perfectly still).
-component SnapTapStage inherits Rectangle {
-    in property <bool> live: false;        // REVEALED → the demo plays; LOCKED → frozen
-    property <int> phase: 0;
-
-    // ── the demo's private timing scale — named so the choreography reads at a glance (each was tuned
-    // by eye; do NOT retime). The snap-INSTANT halves of the `snapping ? fast : …` ternaries stay
-    // inline — they're the crisp flip, semantically bound to the snap, not part of this settle scale. ──
-    property <duration> dur-settle: 360ms;   // the weighty glide — markers / lead-gap easing back to rest
-    property <duration> dur-lag:    380ms;   // the raw laggard's slow limp across the rail
-    property <duration> dur-warn:   300ms;   // the dead-zone flare + the trapped marker's warn tint
-    property <duration> dur-halo:   320ms;   // the accent hero's halo bloom
-    property <duration> dur-ticks:  220ms;   // the lead-gap measurement ticks fading in
-
-    // ── INTERACTIVE DRIVE — once revealed, you can press-and-hold the [A]/[D] caps and drive the race
-    // yourself: the snap lane snaps to the last-pressed instantly while the raw lane stalls in the
-    // dead-zone when both are held. Purely illustrative — works on any device (only the ENABLE step is
-    // gated). While `interactive`, positions DERIVE from the held keys; an idle Timer hands control back
-    // to the auto-loop after a quiet beat, and the auto-loop only advances `phase` while !interactive. ──
-    property <bool> a-held: false;         // [A] cap currently pressed (mouse-down)
-    property <bool> d-held: false;         // [D] cap currently pressed
-    property <int> last-key: 0;            // 0 = A, 1 = D — the snap lane resolves to this when both held
-    property <bool> interactive: false;    // the user is driving (vs the auto-loop)
-
-    // ── the SHARED full-width lane geometry — both rails span MOST of the card (A=left, D=right) ──
-    property <length> inset: 30px;         // rail end ← card edge; keeps markers off the keycaps
-    property <length> rail-x0: self.inset;
-    property <length> rail-w: self.width - 2 * self.inset;
-    // marker centre x for a normalised position p (0 = A end, 1 = D end), in card coords.
-    pure function mx(p: float) -> length { root.rail-x0 + p * root.rail-w }
-    // the two stacked rails' y centres (and the keycap row above), inside the ~150px host.
-    property <length> caps-y: 26px;        // the shared input-cue keycap row
-    property <length> rail-t-y: 76px;      // upper rail — RAW (dim)
-    property <length> rail-b-y: 124px;     // lower rail — SNAP TAP (accent, the hero)
-
-    // the ACCENT (snap-tap) player's normalised position 0(A) .. 1(D).
-    //   INTERACTIVE: snap to last-pressed — both held → last-key; only D → D; only A → A; neither → rest.
-    //   AUTO:        the phased loop (ready/strafe→A, SNAP/catchup→D, reset→A).
-    property <float> accent-pos: root.interactive
-        ? ( (root.a-held && root.d-held) ? (root.last-key == 1 ? 1.0 : 0.0)
-            : root.d-held ? 1.0
-            : root.a-held ? 0.0
-            : 0.5 )                        // rest at centre
-        : ( root.phase == 0 ? 0.0 :        // ready  → A
-            root.phase == 1 ? 0.0 :        // strafe → A (agrees)
-            root.phase == 2 ? 1.0 :        // SNAP   → D (instant)
-            root.phase == 3 ? 1.0 :        // catchup→ holds D
-            0.0 );                          // reset  → A
-    // the DIM (raw SOCD) player: STALLS dead-centre when both are held (the dead-zone), else follows.
-    //   INTERACTIVE: both held → 0.5 (stall); only D → D; only A → A; neither → rest.
-    //   AUTO:        agrees on strafe, stalls on the snap, then limps to D.
-    property <float> dim-pos: root.interactive
-        ? ( (root.a-held && root.d-held) ? 0.5
-            : root.d-held ? 1.0
-            : root.a-held ? 0.0
-            : 0.5 )                        // rest at centre
-        : ( root.phase == 0 ? 0.0 :        // ready  → A
-            root.phase == 1 ? 0.0 :        // strafe → A (agrees)
-            root.phase == 2 ? 0.5 :        // STALLS dead-centre — the neutral dead-zone the edge removes
-            root.phase == 3 ? 1.0 :        // limps over (too late)
-            0.0 );                          // reset  → A
-    // which key is "pressed" (lights BOTH lanes' shared cue). Interactive → the real held state; auto →
-    // the scripted sequence (A held through 1,2,3; D tapped 2,3).
-    property <bool> a-down: root.interactive ? root.a-held : (root.phase == 1 || root.phase == 2 || root.phase == 3);
-    property <bool> d-down: root.interactive ? root.d-held : (root.phase == 2 || root.phase == 3);
-    // THE SNAP — drives the accent's crisp easing, the halo bloom, the comet, the gap, the warn dead-zone.
-    // Interactive: both keys held = the live SOCD conflict (raw stalls, snap holds last). Auto: phase 2.
-    property <bool> snapping: root.interactive ? (root.a-held && root.d-held) : (root.phase == 2);
-    // the lead-gap is "live" (visible) whenever the accent is meaningfully ahead of the dim marker.
-    property <bool> gap-open: root.interactive ? (root.a-held && root.d-held) : (root.phase == 2);
-
-    height: 150px;
-    border-radius: Theme.radius;
-    background: Theme.bg-2;
-    border-width: Theme.hair;
-    border-color: Theme.line;
-    clip: true;
-
-    // the loop: 5 phases. The snap (2) flips fast then holds the rest of its tick; 0 + 4 give it air.
-    // It keeps ticking while the user drives (so its phase stays warm) but only ADVANCES the phase when
-    // !interactive — manual driving never fights the auto-loop, and when control hands back the loop
-    // resumes from where it was, easing smoothly into the next beat.
-    Timer {
-        interval: 820ms;
-        running: root.live;
-        triggered => { if (!root.interactive) { root.phase = mod(root.phase + 1, 5); } }
-    }
-    // IDLE-RESUME — a single-shot countdown restarted on every press/release while driving. When it
-    // fires (a quiet beat after the last input) control eases back to the auto-loop. `start-driving()`
-    // arms interactivity + (re)starts it; releasing a cap also restarts it so a held pose still resumes.
-    idle-timer := Timer {
-        interval: 2500ms;
-        running: false;
-        triggered => { root.interactive = false; self.stop(); }
-    }
-    function start-driving(key: int) {
-        root.last-key = key;
-        root.interactive = true;
-        idle-timer.restart();
-    }
-    function bump-idle() { idle-timer.restart(); }
-
-    // ── the two RAILS — faint full-width tracks the markers ride; end stops at A and D ──
-    for r in [
-        { ry: root.rail-t-y, c: Theme.line },                    // RAW rail (dim)
-        { ry: root.rail-b-y, c: Theme.accent-line },             // SNAP rail (accent hairline)
-    ] : Rectangle {
-        x: root.rail-x0; y: r.ry - 1px;
-        width: root.rail-w; height: 2px; border-radius: 1px;
-        background: r.c;
-        // end stops — short ticks at the A end and D end of each rail
-        for ex in [0.0, 1.0] : Rectangle {
-            x: ex * root.rail-w - 1px; y: -4px;
-            width: 2px; height: 10px; border-radius: 1px;
-            background: Theme.text-faint.with-alpha(0.6);
-        }
-    }
-    // the DEAD-ZONE on the RAW rail — the neutral trap where opposing inputs cancel. The dim player falls
-    // in and STALLS dead-centre; the SNAP-TAP rail has NONE. Faintly present, it flares warn as the marker
-    // is caught in it on the snap — naming the exact stall the advantage removes (no text needed).
-    Rectangle {
-        x: root.mx(0.38); y: root.rail-t-y - 9px;
-        width: root.mx(0.62) - root.mx(0.38); height: 18px;
-        border-radius: Theme.radius-sm;
-        background: Theme.warn.with-alpha(root.snapping ? 0.16 : 0.06);
-        border-width: Theme.hair;
-        border-color: Theme.warn.with-alpha(root.snapping ? 0.55 : 0.22);
-        animate background, border-color { duration: root.dur-warn; easing: ease-out; }
-    }
-
-    // ── the LEAD-GAP — THE SIGNATURE. A glowing accent band bridging the two lanes' x-positions:
-    // from where the dim player STALLED to where the accent player SNAPPED. It blooms on the snap = the
-    // edge made visible ("this far ahead"), then collapses as the dim one finally limps over on catchup.
-    Rectangle {
-        // span horizontally from the dim marker (left edge of the gap) to the accent marker (right edge),
-        // spanning vertically between the two rails so it visibly connects laggard → winner.
-        x: root.mx(root.dim-pos);
-        y: root.rail-t-y;
-        width: max(0px, root.mx(root.accent-pos) - root.mx(root.dim-pos));
-        height: root.rail-b-y - root.rail-t-y;
-        border-radius: Theme.radius-sm;
-        background: Theme.accent-glow;
-        border-width: Theme.hair;
-        border-color: Theme.accent-line;
-        opacity: root.gap-open ? 1.0 : 0.0;
-        // bloom fast with the snap; fade as it collapses on catchup. width follows the markers' easing.
-        animate x { duration: root.snapping ? 90ms : root.dur-settle; easing: root.snapping ? ease-out : ease-in-out; }
-        animate width { duration: root.snapping ? 90ms : root.dur-settle; easing: root.snapping ? ease-out : ease-in-out; }
-        animate opacity { duration: root.gap-open ? 140ms : 280ms; easing: ease-out; }
-        // MEASUREMENT TICKS — faint vertical hairlines stepping across the gap, brightening toward the
-        // winning (D, right) edge: the lead reads as QUANTIFIED ("this many steps ahead"), not a blob.
-        // Evenly spaced by fraction so they ride the gap as it blooms/collapses; the directional ramp
-        // gives a soft shimmer toward D. Hidden when the gap is too narrow to subdivide cleanly.
-        for tk in [0.2, 0.4, 0.6, 0.8] : Rectangle {
-            x: parent.width * tk - self.width / 2;
-            y: 2px; width: 1px; height: parent.height - 4px;
-            border-radius: 0.5px;
-            background: Theme.accent;
-            // ramp brighter toward D — the lead, measured off; only when the gap is wide enough to read.
-            opacity: (root.gap-open && parent.width > 24px) ? (0.18 + tk * 0.34) : 0.0;
-            animate opacity { duration: root.dur-ticks; easing: ease-out; }
-        }
-        // a brighter inner edge on the winning (right) side — the leading front of the advantage.
-        Rectangle {
-            x: parent.width - self.width; width: 2px; height: parent.height;
-            border-radius: 1px; background: Theme.accent;
-            opacity: root.gap-open ? 0.7 : 0.0;
-            animate opacity { duration: 200ms; }
-        }
-    }
-
-    // ── the COMET STREAK — a thin accent bar racing A→D across the SNAP rail on the instant reversal,
-    // then gone. Sits behind the accent marker and punctuates the exact moment it crosses the lane.
-    Rectangle {
-        x: root.mx(0.0);
-        y: root.rail-b-y - 1px;
-        width: root.snapping ? root.rail-w : 0px;
-        height: 2px; border-radius: 1px;
-        background: Theme.accent;
-        opacity: root.snapping ? 0.9 : 0.0;
-        // appear with the flip (fast), then fade — a comet tail behind the accent marker.
-        animate width { duration: root.snapping ? 90ms : 0ms; easing: ease-out; }
-        animate opacity { duration: root.snapping ? 120ms : 260ms; easing: ease-out; }
-    }
-
-    // ── the RAW (dim) marker — normal SOCD, a HOLLOW ring on the upper rail; the laggard. ──
-    Rectangle {
-        x: root.mx(root.dim-pos) - self.width / 2;
-        y: root.rail-t-y - self.height / 2;
-        width: 13px; height: 13px; border-radius: 7px;
-        background: transparent;
-        border-width: 1.5px;
-        // tints WARN when caught in the dead-zone on the snap (trapped); dim otherwise — the stall while
-        // the accent is already at D IS the pitch.
-        border-color: root.snapping ? Theme.warn : Theme.text-faint.with-alpha(0.9);
-        animate border-color { duration: root.dur-warn; easing: ease-out; }
-        // ALWAYS moves with weight (slow) — so on the snap it visibly LAGS, stuck in the dead-zone.
-        animate x { duration: root.dur-lag; easing: ease-in-out; }
-        opacity: root.snapping ? 1.0 : 0.6;
-        animate opacity { duration: Theme.settle; }
-        // a faint WARNING PULSE ring at the stuck spot on the snap — "frozen here, weighty, late".
-        Rectangle {
-            x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
-            width: root.snapping ? 32px : 13px; height: self.width; border-radius: self.width / 2;
-            background: transparent;
-            border-width: 1.5px;
-            border-color: Theme.warn;
-            opacity: root.snapping ? 0.8 : 0.0;
-            animate width, opacity { duration: root.dur-settle; easing: ease-out; }
-        }
-    }
-
-    // ── the SNAP TAP (accent) marker — the winner; solid, glowing, on the lower rail. ──
-    Rectangle {
-        x: root.mx(root.accent-pos) - self.width / 2;
-        y: root.rail-b-y - self.height / 2;
-        width: 14px; height: 14px; border-radius: 7px;
-        background: Theme.accent;
-        // crisp instant reversal on the snap (~85ms ease-out); weighty glide otherwise — the edge's feel.
-        animate x {
-            duration: root.snapping ? 85ms : root.dur-settle;
-            easing: root.snapping ? ease-out : ease-in-out;
-        }
-        // a steady accent halo (the glow that marks it as the hero), blooming bolder on the snap instant
-        // and giving a soft confirming pulse at D on catchup ("snap-tap arrived first").
-        Rectangle {
-            x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
-            width: root.snapping ? 38px : (root.phase == 3 ? 30px : 22px);
-            height: self.width; border-radius: self.width / 2;
-            background: Theme.accent-glow;
-            border-width: 1.5px;
-            border-color: Theme.accent;
-            opacity: root.snapping ? 1.0 : (root.phase == 3 ? 0.7 : (root.phase == 0 || root.phase == 4 ? 0.0 : 0.5));
-            animate width, opacity { duration: root.dur-halo; easing: ease-out; }
-        }
-    }
-
-    // ── the SHARED INPUT CUE — [A] far left, [D] far right. Now LIVE: press-and-hold to drive the race.
-    // Each cap lights (accent + depress) when its key is down, lifts/brightens a hair on hover (so it
-    // reads as pressable BEFORE the click), and its TouchArea feeds a-held/d-held + last-key + the idle
-    // timer. Works regardless of device support — it's the illustrative demo, not the gated feature. ──
-    for kc in [
-        { lbl: "A", key: 0, nx: 0.0 },
-        { lbl: "D", key: 1, nx: 1.0 },
-    ] : Rectangle {
-        property <bool> down: kc.key == 0 ? root.a-down : root.d-down;
-        x: root.mx(kc.nx) - self.width / 2;
-        // pressed → dips (depresses) a hair; hovered (not pressed) → lifts a hair — both tactile.
-        y: root.caps-y - self.height / 2
-            + (self.down ? 1px : (cap-ta.has-hover ? -1px : 0px));
-        width: 28px; height: 28px;
-        border-radius: Theme.radius-sm;
-        background: self.down ? Theme.accent-glow : (cap-ta.has-hover ? Theme.well : Theme.well.with-alpha(0.6));
-        border-width: Theme.hair;
-        border-color: self.down ? Theme.accent-line : (cap-ta.has-hover ? Theme.text-faint : Theme.line);
-        animate background, border-color, y { duration: Theme.quick; easing: ease-out; }
-        Text {
-            text: kc.lbl;
-            // hover pre-brightens the glyph (text-mid) before it lights accent on press.
-            color: parent.down ? Theme.accent : (cap-ta.has-hover ? Theme.text-mid : Theme.text-dim);
-            font-family: Theme.mono; font-size: Theme.fs-small; font-weight: 700;
-            horizontal-alignment: center; vertical-alignment: center;
-            width: parent.width; height: parent.height;
-            animate color { duration: Theme.quick; }
-        }
-        cap-ta := TouchArea {
-            mouse-cursor: MouseCursor.pointer;
-            pointer-event(e) => {
-                if (e.kind == PointerEventKind.down) {
-                    if (kc.key == 0) { root.a-held = true; } else { root.d-held = true; }
-                    root.start-driving(kc.key);   // arm interactivity + (re)start the idle countdown
-                } else if (e.kind == PointerEventKind.up || e.kind == PointerEventKind.cancel) {
-                    if (kc.key == 0) { root.a-held = false; } else { root.d-held = false; }
-                    root.bump-idle();             // releasing still resumes after a quiet beat
-                }
-            }
-        }
-    }
-}
-
-// MECH ADVANTAGE — the reusable two-step-consent card for an opt-in, edge-giving device feature.
-// LOCKED: the stage visual is dimmed + sealed (a lock glyph), with a "click to reveal ▸" affordance —
-// you can tell something powerful is here. REVEALED: the visual plays its demo and a clear TOGGLE
-// appears with a quiet ⚠ warn accent (the legality acknowledgment IS the consent click, not a
-// paragraph). If the device can't do it, the toggle stays GATED ("needs a supporting device") —
-// honest, like the other gates. The stage visual is passed in as the `stage` content.
-component MechAdvantage inherits Card {
-    in property <string> name;             // the option name (e.g. "snap tap")
-    in property <string> tagline;          // one short line shown REVEALED (what the edge is)
-    in property <bool> supported;          // a capable device is connected (else GATED)
-    in-out property <bool> revealed;       // step 1 done
-    in-out property <bool> enabled;        // step 2: the feature is on
-    // shared invite-hover: the reveal ROW writes here so the SEAL (a sibling, out of the row's `if`
-    // scope) can light its lock too — hovering either invites the unseal.
-    property <bool> row-hover: false;
-    callback reveal();                     // step 1 click
-    callback set-enabled(bool);            // step 2 toggle
-
-    // the enabled card wears Card's accent-line frame (active = a lit/chosen surface); Card provides
-    // the bg-2 ground + hairline + the border-color settle.
-    active: root.enabled;
-    clip: true;
-
-    VerticalLayout {
-        padding: 12px;
-        spacing: 10px;
-        // header: the option name + a state word on the right (sealed / ready / ON / gated)
-        HorizontalLayout {
-            spacing: 8px;
-            VerticalLayout {
-                alignment: center;
-                Mono {
-                    text: root.name;
-                    color: root.enabled ? Theme.accent : Theme.text-mid;
-                    font-size: Theme.fs-small; font-weight: 700;
-                    letter-spacing: Theme.track-2;
-                    animate color { duration: Theme.quick; }
-                }
-            }
-            Rectangle {}
-            VerticalLayout {
-                alignment: center;
-                Mono {
-                    text: !root.supported ? "GATED"
-                        : root.enabled ? "ON"
-                        : root.revealed ? "READY"
-                        : "SEALED";
-                    color: !root.supported ? Theme.warn
-                        : root.enabled ? Theme.accent
-                        : Theme.text-faint;
-                    font-size: Theme.fs-small; font-weight: 700;
-                    letter-spacing: Theme.track-2;
-                }
-            }
-        }
-
-        // ── the STAGE — the demo visual, with a LOCKED overlay until revealed ──
-        stage-host := Rectangle {
-            height: 150px;
-            // the passed-in stage visual fills this host (a layout stretches the child to full width)
-            VerticalLayout { @children }
-            // the SEAL — a dim scrim + lock glyph over the visual until step 1. Fades on reveal.
-            // Hovering the sealed stage (or the reveal row) gives the lock a "press me" affordance: it
-            // lifts a hair + gains a faint accent glow, then settles back on leave. The seal is itself
-            // clickable (so the whole sealed card invites the unseal, not just the row).
-            seal := Rectangle {
-                // shared invite-hover: this scrim OR the reveal row below it.
-                property <bool> invite: !root.revealed && (seal-ta.has-hover || root.row-hover);
-                width: parent.width; height: parent.height;
-                border-radius: Theme.radius;
-                background: Theme.bg-2.with-alpha(0.82);
-                opacity: root.revealed ? 0.0 : 1.0;
-                visible: root.revealed ? false : true;
-                // the UNSEAL — a deliberate fade rather than a blink (the lock scales down a touch as it
-                // goes, like a key turning, then the scrim clears).
-                animate opacity { duration: Theme.settle; easing: ease-in-out; }
-                // a faint accent halo behind the lock on hover — the "something powerful here" tell.
-                Rectangle {
-                    x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
-                    width: 64px; height: 64px; border-radius: 32px;
-                    background: Theme.accent-glow;
-                    opacity: parent.invite ? 0.9 : 0.0;
-                    animate opacity { duration: Theme.settle; easing: ease-out; }
-                }
-                // a small procedural LOCK (shackle arc approximated by a rounded-top body + a keyhole).
-                // A fixed-footprint wrapper keeps the layout still; the glyph inside scales/lifts.
-                VerticalLayout {
-                    alignment: center;
-                    HorizontalLayout {
-                        alignment: center;
-                        Rectangle {
-                            width: 34px; height: 34px;   // stable footprint — no layout shift
-                            lock := Rectangle {
-                                // a unit length that scales the whole glyph: full size sealed, a touch
-                                // smaller as it unseals (the "turn"), drawn from a 34u design grid.
-                                property <length> u: (root.revealed ? 0.8px : 1px) * (seal.invite ? 1.06 : 1.0);
-                                width: 34 * self.u; height: 34 * self.u;
-                                x: (parent.width - self.width) / 2;
-                                // lift a hair on invite-hover — the "press me" affordance.
-                                y: (parent.height - self.height) / 2 + (seal.invite ? -2px : 0px);
-                                animate width, height, y { duration: Theme.settle; easing: ease-in-out; }
-                                // shackle — a hollow rounded rect, bottom hidden behind the body
-                                Rectangle {
-                                    x: 9 * lock.u; y: 3 * lock.u; width: 16 * lock.u; height: 16 * lock.u;
-                                    border-radius: 8 * lock.u;
-                                    border-width: 2px;
-                                    // brightens toward accent on invite — it reads as armed/pressable.
-                                    border-color: seal.invite ? Theme.accent : Theme.text-dim;
-                                    animate border-color { duration: Theme.settle; }
-                                }
-                                // body
-                                Rectangle {
-                                    x: 6 * lock.u; y: 13 * lock.u; width: 22 * lock.u; height: 17 * lock.u;
-                                    border-radius: 3 * lock.u;
-                                    background: seal.invite ? Theme.accent : Theme.text-dim;
-                                    animate background { duration: Theme.settle; }
-                                }
-                                // keyhole
-                                Rectangle {
-                                    x: 15 * lock.u; y: 19 * lock.u; width: 4 * lock.u; height: 4 * lock.u;
-                                    border-radius: 2 * lock.u;
-                                    background: Theme.bg-2;
-                                }
-                            }
-                        }
-                    }
-                }
-                // the sealed stage is itself the unseal target — the whole card invites the click.
-                seal-ta := TouchArea {
-                    mouse-cursor: MouseCursor.pointer;
-                    clicked => { root.reveal(); }
-                }
-            }
-        }
-
-        // ── the GATE ROW — step 1 (reveal) or step 2 (enable), depending on state ──
-        // The demo is ALWAYS revealable (it's illustrative — you should be able to watch what the
-        // feature does even on a board that can't run it). Only the ENABLE step is device-gated.
-        if !root.revealed : Rectangle {
-            height: 24px;
-            border-radius: Theme.radius-sm;
-            background: rta.has-hover ? Theme.well : Theme.bg-2;
-            border-width: Theme.hair;
-            border-color: rta.has-hover ? Theme.text-faint : Theme.line;
-            animate background, border-color { duration: Theme.quick; }
-            HorizontalLayout {
-                alignment: center;
-                Text {
-                    text: "click to reveal ▸";
-                    color: rta.has-hover ? Theme.text-mid : Theme.text-dim;
-                    font-family: Theme.mono; font-size: Theme.fs-small; font-weight: 700;
-                    vertical-alignment: center;
-                }
-            }
-            rta := TouchArea {
-                mouse-cursor: MouseCursor.pointer;
-                clicked => { root.reveal(); }
-                // mirror hover up so the SEAL's lock lights too (the row and seal invite together).
-                changed has-hover => { root.row-hover = self.has-hover; }
-            }
-        }
-        // REVEALED → the tagline, then step 2: the enable toggle (supported) or the honest gate (not).
-        if root.revealed : VerticalLayout {
-            spacing: 8px;
-            if root.tagline != "" : Mono {
-                text: root.tagline;
-                color: Theme.text-faint;
-                font-size: Theme.fs-small;
-                wrap: word-wrap;
-            }
-            // supported → the ⚠ legality accent + the enable toggle
-            if root.supported : HorizontalLayout {
-                spacing: 8px;
-                // ⚠ — the legality acknowledgment as a quiet accent, NOT a paragraph
-                VerticalLayout {
-                    alignment: center;
-                    Text {
-                        text: "!";
-                        color: Theme.warn;
-                        font-family: Theme.mono; font-size: Theme.fs-body;
-                        vertical-alignment: center;
-                    }
-                }
-                Rectangle {}
-                VerticalLayout {
-                    alignment: center;
-                    Toggle {
-                        caption: "enable";
-                        checked: root.enabled;
-                        toggled(v) => { root.set-enabled(v); }
-                    }
-                }
-            }
-            // unsupported → the honest gate, consistent with the other "needs hardware" lines
-            if !root.supported : Mono {
-                text: "needs a supporting device";
-                color: Theme.text-faint;
-                font-size: Theme.fs-small;
-                wrap: word-wrap;
-            }
-        }
-    }
-}
-
 // A small per-kind PING icon (16px), drawn from rectangles + rounded-rect "circles" — no fonts, so it
 // matches the overlay's procedural glyph vocabulary. `ink` tints it accent (earns a ping) or dim.
 component PingIcon inherits Rectangle {
@@ -1046,6 +548,9 @@ component PingCard inherits Rectangle {
     in property <string> label;
     in property <string> desc;
     in property <bool> on;
+    // gated with the notifications master switch — inert when notifications are off (the dim-gate over
+    // the whole subordinate block carries the visual quieting; this stops the click).
+    in property <bool> enabled: true;
     callback toggled();
     horizontal-stretch: 1;
     height: 54px;
@@ -1067,7 +572,7 @@ component PingCard inherits Rectangle {
             Mono { text: root.desc; color: Theme.text-faint; font-size: Theme.fs-small; horizontal-alignment: center; overflow: elide; }
         }
     }
-    ta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.toggled(); } }
+    ta := TouchArea { enabled: root.enabled; mouse-cursor: root.enabled ? MouseCursor.pointer : MouseCursor.default; clicked => { root.toggled(); } }
 }
 
 export component SettingsPanel inherits VerticalLayout {
@@ -1199,11 +704,8 @@ export component SettingsPanel inherits VerticalLayout {
                     // light that brightens while its ask is on screen, the macro + its question(s), a
                     // TEST that mock-fires it (the real ask rises, but input is disarmed for that fire so
                     // none of its real actions run), and a two-click-confirm delete of its .py.
-                    for m in State.beacon-macros : row := HorizontalLayout {
+                    for m in State.beacon-macros : HorizontalLayout {
                         spacing: 8px;
-                        // first click ARMS the delete (relabels + reddens); second click (while armed)
-                        // actually deletes. No timeout — it simply stays armed until clicked again.
-                        property <bool> armed: false;
                         VerticalLayout {
                             alignment: center;
                             Rectangle {
@@ -1226,19 +728,15 @@ export component SettingsPanel inherits VerticalLayout {
                             alignment: center;
                             Button { text: "test"; clicked => { State.test-beacon(m.name); } }
                         }
+                        // delete its .py — the two-step ConfirmButton (arms on click, self-disarms after
+                        // Theme.confirm-window, danger escalation on the armed rung). Replaces the old
+                        // hand-rolled Pill that armed on `warn` and stayed hot forever with no auto-disarm.
                         VerticalLayout {
                             alignment: center;
-                            Pill {
-                                text: row.armed ? "sure?" : "×";
-                                tint: row.armed ? Theme.warn : Theme.text-faint;
-                                clickable: true;
-                                clicked => {
-                                    if (row.armed) {
-                                        State.delete-beacon(m.name);
-                                    } else {
-                                        row.armed = true;
-                                    }
-                                }
+                            ConfirmButton {
+                                text: "×";
+                                confirm-text: "delete?";
+                                confirmed => { State.delete-beacon(m.name); }
                             }
                         }
                     }
@@ -1416,11 +914,15 @@ export component SettingsPanel inherits VerticalLayout {
                     // the whole Razer process tree.
                     // alignment:start so the lone action sizes to its LABEL instead of stretching the column
                     // (a single button in a default-stretch row eats the whole width).
+                    // purge is a process-tree-killing, service-demoting action — a two-step ConfirmButton
+                    // (arms, self-disarms after the confirm window, danger escalation), not a one-click
+                    // plain Button. alignment:start so the key hugs its label instead of stretching.
                     HorizontalLayout {
                         alignment: start;
-                        Button {
+                        ConfirmButton {
                             text: "purge Synapse";
-                            clicked => { State.purge-synapse(); }
+                            confirm-text: "purge?";
+                            confirmed => { State.purge-synapse(); }
                         }
                     }
                     Mono {
@@ -1443,7 +945,9 @@ export component SettingsPanel inherits VerticalLayout {
                         Rectangle {}
                         VerticalLayout {
                             alignment: center;
-                            Button { text: "test"; primary: true; clicked => { State.test-notification(); } }
+                            // a PREVIEW action, not a commit — plain, so it doesn't spend the accent `primary` reserves
+            // for real commits (run diagnostics). Matches the beacon `test` button, also plain.
+            Button { text: "test"; clicked => { State.test-notification(); } }
                         }
                     }
                     // the body groups as one block with an even rhythm; tight sub-groups bind a control
@@ -1456,6 +960,15 @@ export component SettingsPanel inherits VerticalLayout {
                             checked: State.notif-enabled;
                             toggled(v) => { State.set-notif-enabled(v); }
                         }
+                        // the SUBORDINATE block — dim-GATED behind the master switch, not collapsed
+                        // (CONNECTIONS' whole-subsystem collapse-behind-`if` is a different, larger-scale
+                        // idiom and stays as-is). The controls hold their place, quieted to Theme.dim-gated
+                        // and made inert (every interactive child's `enabled` follows the master), so OFF
+                        // reads as "held, still here" rather than gone.
+                        VerticalLayout {
+                            spacing: Theme.gap;
+                            opacity: State.notif-enabled ? 1.0 : Theme.dim-gated;
+                            animate opacity { duration: Theme.quick; }
                         // placement — a mock monitor you drop the card onto (drag anywhere; the named
                         // presets pull it in magnetically; OFF dims it to audio-only). The card TYPES —
                         // what earns a ping — fill the space to the right of the screen.
@@ -1479,6 +992,7 @@ export component SettingsPanel inherits VerticalLayout {
                                     Pill {
                                         text: "off";
                                         clickable: true;
+                                        enabled: State.notif-enabled;
                                         selected: State.notif-placement == "off";
                                         clicked => {
                                             if (State.notif-placement == "off") {
@@ -1492,14 +1006,14 @@ export component SettingsPanel inherits VerticalLayout {
                             }
                             HorizontalLayout {
                                 spacing: Theme.gap-col;
-                                NotifPlacer {}
+                                NotifPlacer { enabled: State.notif-enabled; }
                                 // the card TYPES — a tidy grid beside the placer. alignment:start keeps the
                                 // header + grid TOP-aligned with the placer (no stretch-spread gap below it).
                                 VerticalLayout {
                                     horizontal-stretch: 1;
                                     alignment: start;
                                     spacing: 10px;   // header → grid block (distinct from the tighter inter-row gutter below)
-                                    Mono { text: "WHAT EARNS A PING"; color: Theme.text-dim; }
+                                    SubLabel { text: "WHAT EARNS A PING"; }
                                     // DOMAIN CLUSTERS, data-driven: each caption owns ONE full-width
                                     // row of exactly its domain's kinds (the glue's exhaustive
                                     // ping_slot map decides membership), every card stretching to
@@ -1517,6 +1031,7 @@ export component SettingsPanel inherits VerticalLayout {
                                                 spacing: 6px;
                                                 for k in State.ping-pointer : PingCard {
                                                     slug: k.icon; label: k.label; desc: k.desc; on: k.on;
+                                                    enabled: State.notif-enabled;
                                                     toggled => { State.set-notif-event(k.slug, !k.on); }
                                                 }
                                             }
@@ -1528,6 +1043,7 @@ export component SettingsPanel inherits VerticalLayout {
                                                 spacing: 6px;
                                                 for k in State.ping-hardware : PingCard {
                                                     slug: k.icon; label: k.label; desc: k.desc; on: k.on;
+                                                    enabled: State.notif-enabled;
                                                     toggled => { State.set-notif-event(k.slug, !k.on); }
                                                 }
                                             }
@@ -1539,6 +1055,7 @@ export component SettingsPanel inherits VerticalLayout {
                                                 spacing: 6px;
                                                 for k in State.ping-session : PingCard {
                                                     slug: k.icon; label: k.label; desc: k.desc; on: k.on;
+                                                    enabled: State.notif-enabled;
                                                     toggled => { State.set-notif-event(k.slug, !k.on); }
                                                 }
                                             }
@@ -1574,15 +1091,16 @@ export component SettingsPanel inherits VerticalLayout {
                                     spacing: 6px;
                                     // full-width radio rows — Contact's lit body carries selection (the old
                                     // trailing dot merely mirrored `on`, so it's gone); desc is the second line.
-                                    Contact { fill: true; label: "stack"; desc: "a column · see each"; active: State.notif-stack == "stack"; clicked => { State.set-notif-stack("stack"); } }
-                                    Contact { fill: true; label: "latest"; desc: "newest only, one card"; active: State.notif-stack == "latest"; clicked => { State.set-notif-stack("latest"); } }
-                                    Contact { fill: true; label: "digest"; desc: "one summary, counted"; active: State.notif-stack == "digest"; clicked => { State.set-notif-stack("digest"); } }
+                                    Contact { fill: true; enabled: State.notif-enabled; label: "stack"; desc: "a column · see each"; active: State.notif-stack == "stack"; clicked => { State.set-notif-stack("stack"); } }
+                                    Contact { fill: true; enabled: State.notif-enabled; label: "latest"; desc: "newest only, one card"; active: State.notif-stack == "latest"; clicked => { State.set-notif-stack("latest"); } }
+                                    Contact { fill: true; enabled: State.notif-enabled; label: "digest"; desc: "one summary, counted"; active: State.notif-stack == "digest"; clicked => { State.set-notif-stack("digest"); } }
                                 }
                             }
                         }
                         // card background — the grounded squircle (app-card chrome) vs the floating spell.
                         Toggle {
                             caption: "card background";
+                            enabled: State.notif-enabled;
                             checked: State.notif-panel;
                             toggled(v) => { State.set-notif-panel(v); }
                         }
@@ -1591,6 +1109,7 @@ export component SettingsPanel inherits VerticalLayout {
                             spacing: 8px;
                             Toggle {
                                 caption: "audio cue";
+                                enabled: State.notif-enabled;
                                 checked: State.notif-audio;
                                 toggled(v) => { State.set-notif-audio(v); }
                             }
@@ -1602,6 +1121,7 @@ export component SettingsPanel inherits VerticalLayout {
                                     horizontal-stretch: 1;
                                     Slider {
                                         compact: true;
+                                        enabled: State.notif-enabled;
                                         minimum: 0.0;
                                         maximum: 1.0;
                                         value: State.notif-volume;
@@ -1617,12 +1137,14 @@ export component SettingsPanel inherits VerticalLayout {
                                 SplitToggle {
                                     options: ["PULSE", "WARM", "GLASS"];
                                     min-cell: 64px;
+                                    enabled: State.notif-enabled;
                                     index: (State.notif-sound == "warm" ? 1 : State.notif-sound == "glass" ? 2 : 0);
                                     picked(i) => { State.set-notif-sound(i == 1 ? "warm" : i == 2 ? "glass" : "pulse"); }
                                 }
                                 Rectangle { horizontal-stretch: 1; }
                             }
                         }
+                        }   // close the dim-gated subordinate block
                     }
 
                     Divider {}
@@ -1649,7 +1171,7 @@ export component SettingsPanel inherits VerticalLayout {
                     if State.host-enabled : VerticalLayout {
                         spacing: 7px;
                         // What Neuron is actually sharing right now (set the scope before the rows).
-                        if State.host-devices-line != "" : Mono { text: State.host-devices-line; color: Theme.text-faint; }
+                        if State.host-devices-line != "" : Mono { text: State.host-devices-line; color: Theme.text-faint; overflow: elide; }
                         VerticalLayout {
                             spacing: 3px;
                             Toggle {
@@ -1726,103 +1248,9 @@ export component SettingsPanel inherits VerticalLayout {
                             }
                         }
 
-                        // HOW A GAME COMBINES with your lighting — the config Synapse and OpenRGB
-                        // can't offer, because they just let the last writer win. Here the arbiter
-                        // blends instead: merge screens the game's light over your base.
-                        Rectangle { height: 1px; }
-                        VerticalLayout {
-                            spacing: 3px;
-                            HorizontalLayout {
-                                spacing: 8px;
-                                VerticalLayout { alignment: center; SubLabel { text: "FEEL"; } }
-                                // one fused rail (no gapped chips); the stretch spacer lets it hug its cells
-                                SplitToggle {
-                                    options: ["REPLACE", "MERGE", "BOOST", "TINT"];
-                                    min-cell: 70px;
-                                    index: State.host-game-mode;
-                                    picked(i) => { State.set-host-game-mode(i); }
-                                }
-                                Rectangle { horizontal-stretch: 1; }
-                            }
-                            HorizontalLayout {
-                                spacing: 10px;
-                                VerticalLayout { width: 96px; alignment: center; SubLabel { text: "STRENGTH"; } }
-                                Slider {
-                                    compact: true;
-                                    minimum: 0;
-                                    maximum: 100;
-                                    step: 5;
-                                    value: State.host-game-intensity;
-                                    unit: "%";
-                                    wheel: false;
-                                    changed(v) => { State.set-host-game-intensity(v); }
-                                }
-                                Mono { text: Math.round(State.host-game-intensity) + "%"; color: Theme.text-faint; }
-                            }
-                            HorizontalLayout {
-                                spacing: 10px;
-                                VerticalLayout { width: 96px; alignment: center; SubLabel { text: "FADE"; } }
-                                Slider {
-                                    compact: true;
-                                    minimum: 0;
-                                    maximum: 2500;
-                                    step: 50;
-                                    value: State.host-game-fade-ms;
-                                    unit: "ms";
-                                    wheel: false;
-                                    changed(v) => { State.set-host-game-fade(v); }
-                                }
-                                Mono { text: Math.round(State.host-game-fade-ms) + "ms"; color: Theme.text-faint; }
-                            }
-                            HorizontalLayout {
-                                spacing: 9px;
-                                VerticalLayout { width: 96px; alignment: center; SubLabel { text: "DEVICES"; } }
-                                for d in State.host-game-devices : Toggle {
-                                    caption: d.name;
-                                    checked: d.enabled;
-                                    toggled(v) => { State.set-host-game-device(d.id, v); }
-                                }
-                            }
-                            Mono {
-                                text: State.host-game-mode == 0
-                                    ? "game colours take the LEDs they paint."
-                                    : State.host-game-mode == 2
-                                        ? "game colours brighten your lighting for loud moments."
-                                        : State.host-game-mode == 3
-                                            ? "game colours shade your lighting without washing it out."
-                                            : "game colours sit on top while your lighting stays visible.";
-                                color: Theme.text-faint; wrap: word-wrap;
-                            }
-                        }
-                    }
-
-                    Divider {}
-
-                    // ── MECHANICAL ADVANTAGES — opt-in, edge-giving device features ──
-                    // A preferences category (sibling to the notification stages): each option is one
-                    // self-demonstrating visual stage behind a TWO-STEP consent (reveal, then enable).
-                    // No text hints yapping — the stage shows what it does; the consent click + a quiet
-                    // ⚠ carries the legality. Honest-gated when the connected device can't do it.
-                    HorizontalLayout {
-                        spacing: 10px;
-                        VerticalLayout {
-                            alignment: center;
-                            spacing: 3px;
-                            SectionTitle { text: "MECHANICAL ADVANTAGES"; }
-                            Mono { text: "opt-in, edge-giving. unseal to see what it does."; color: Theme.text-faint; }
-                        }
-                        Rectangle {}
-                    }
-                    MechAdvantage {
-                        name: "snap tap";
-                        tagline: "opposing inputs resolve to the last pressed: instant counter-strafe, no stall.";
-                        supported: State.snap-tap-supported;
-                        revealed: State.snap-tap-revealed;
-                        enabled: State.snap-tap-enabled;
-                        reveal => { State.snap-tap-revealed = true; }
-                        set-enabled(v) => { State.set-snap-tap(v); }
-                        // the stage visual — plays only once REVEALED (sealed = perfectly still)
-                        SnapTapStage { live: State.snap-tap-revealed; }
+                        // HOW visitors combine with your lighting (blend / strength / fade / hands-off
+                        // devices) now lives on the LIGHTING page's VISITORS section — it belongs beside
+                        // the lighting it composes with, not in this transport-only panel.
                     }
 
                     Divider {}
@@ -1867,6 +1295,7 @@ export component SettingsPanel inherits VerticalLayout {
                                     color: o.state == "stall" ? Theme.danger : Theme.text-mid;
                                     font-size: Theme.fs-small; font-weight: 700;
                                     letter-spacing: Theme.track-2;
+                                    overflow: elide;
                                 }
                             }
                             VerticalLayout {
@@ -1875,6 +1304,7 @@ export component SettingsPanel inherits VerticalLayout {
                                     text: o.detail;
                                     color: o.state == "stall" ? Theme.danger : Theme.text-faint;
                                     font-size: Theme.fs-small;
+                                    overflow: elide;
                                 }
                             }
                             Rectangle {}
@@ -1896,7 +1326,7 @@ export component SettingsPanel inherits VerticalLayout {
                             checked: State.phoenix;
                             toggled(v) => { State.set-phoenix(v); }
                         }
-                        Mono { text: "PHOENIX. Windows relaunches Neuron if it crashes or hangs."; color: Theme.text-faint; }
+                        Mono { text: "phoenix. Windows relaunches Neuron if it crashes or hangs."; color: Theme.text-faint; }
                     }
                     HorizontalLayout {
                         // the two flight-recorder verbs fuse into one deck; the stretch spacer lets it hug

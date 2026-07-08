@@ -69,11 +69,19 @@ export component Contact inherits Rectangle {
     in property <bool> active;
     in property <string> desc: "";
     in property <bool> fill: false;
+    // when false: dimmed ink + inert TouchArea (mirrors SplitToggle's disabled state), so a gated
+    // contact never has to be hand-rolled at the call site.
+    in property <bool> enabled: true;
     callback clicked();
     horizontal-stretch: root.fill ? 1 : 0;
     height: root.desc != "" ? 40px : 24px;
+    clip: true;   // a long label elides within the contact rather than overrunning it
     border-radius: Theme.radius-sm;
-    background: active ? Theme.accent-glow : (cta.has-hover ? Theme.well : transparent);
+    // pressed drops to well-hi (the quiet pressed tier every keyed control now shows); hover to well.
+    background: active ? Theme.accent-glow
+        : (root.enabled && cta.pressed) ? Theme.well-hi
+        : (root.enabled && cta.has-hover) ? Theme.well
+        : transparent;
     border-width: Theme.hair;
     border-color: active ? Theme.accent-line : transparent;
     animate background, border-color { duration: Theme.quick; }
@@ -85,12 +93,16 @@ export component Contact inherits Rectangle {
             spacing: 2px;
             Text {
                 text: root.label;
-                color: root.active ? Theme.accent : (cta.has-hover ? Theme.text-mid : Theme.text-dim);
+                overflow: elide;
+                color: !root.enabled ? Theme.text-faint
+                    : root.active ? Theme.accent
+                    : (cta.has-hover ? Theme.text-mid : Theme.text-dim);
                 font-size: Theme.fs-small;
                 font-family: Theme.mono;
                 font-weight: root.active ? 700 : 500;
                 letter-spacing: Theme.track-4;
                 vertical-alignment: center;
+                animate color { duration: Theme.quick; }
             }
             if root.desc != "" : Text {
                 text: root.desc;
@@ -102,7 +114,11 @@ export component Contact inherits Rectangle {
             }
         }
     }
-    cta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.clicked(); } }
+    cta := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? MouseCursor.pointer : MouseCursor.default;
+        clicked => { root.clicked(); }
+    }
 }
 
 // A small status pill — a contact lamp. Monochrome (hairline outline) by default; pass `live` to
@@ -332,8 +348,11 @@ export component Slider inherits Rectangle {
                 width: parent.width * root.frac;
                 height: 3px;
                 y: (parent.height - self.height) / 2;
-                // the travelled rail brightens under the cursor — the control feels "live" to touch
-                background: ta.has-hover || ta.pressed ? root.tint.brighter(0.25) : root.tint;
+                // the travelled rail brightens under the cursor — the control feels "live" to touch.
+                // A GATED fader dims the fill to text-faint (matching its value readout's dim) so a
+                // disabled fader never reads live at full phosphor.
+                background: !root.enabled ? Theme.text-faint
+                    : ta.has-hover || ta.pressed ? root.tint.brighter(0.25) : root.tint;
                 animate background { duration: Theme.quick; }
             }
             // tactile GRAB — a soft halo blooms under the cursor and the tick fattens into a real
@@ -353,7 +372,8 @@ export component Slider inherits Rectangle {
                 width: ta.pressed ? 6px : (ta.has-hover ? 5px : 3px);
                 height: ta.pressed ? 18px : 16px;
                 border-radius: self.width / 2;
-                background: root.tint;
+                // dims with the fill when gated — a disabled knob reads as dead chrome, not a live handle
+                background: root.enabled ? root.tint : Theme.text-faint;
                 x: clamp((track.width - self.width) * root.frac, 0px, track.width - self.width);
                 y: (parent.height - self.height) / 2;
                 animate width, height { duration: Theme.quick; }
@@ -419,6 +439,10 @@ export component ContactRow inherits Rectangle {
     in property <bool> ordinal: false;
     in property <bool> by-index: false;
     in property <int> index: -1;
+    // a QUIET SECONDARY highlight on one cell — a dim text-mid outline, NOT the accent-lit active
+    // state. Marks a cell that's "near"/related without claiming it's the current value (e.g. the DPI
+    // fader's live value landing on a stage cell — the fader visibly confirming the stage table).
+    in property <int> near-index: -1;
     callback picked(int);
     callback picked-index(int);
     height: Theme.row-h-sm;
@@ -434,10 +458,22 @@ export component ContactRow inherits Rectangle {
             min-width: root.min-cell;
             horizontal-stretch: 1;
             property <bool> on: root.by-index ? (i == root.index) : (root.value == opt);
-            background: cell.on ? Theme.accent-glow : (cta.has-hover && root.enabled ? Theme.well : transparent);
+            // the quiet secondary highlight — this cell is "near" (related) but not the active one.
+            property <bool> near: !cell.on && i == root.near-index;
+            background: cell.on ? Theme.accent-glow
+                : (root.enabled && cta.pressed) ? Theme.well-hi
+                : (root.enabled && cta.has-hover) ? Theme.well
+                : transparent;
             animate background { duration: Theme.quick; }
             // the split — a hairline at the seam (every cell but the first), no gap between contacts
             if i > 0 : Rectangle { x: 0; width: Theme.hair; background: Theme.line; }
+            // the NEAR outline — a dim text-mid inner frame (never accent), so the confirming cell
+            // reads as related-not-active. Drawn as an inset overlay so the fused rail keeps its layout.
+            if cell.near : Rectangle {
+                border-width: Theme.hair;
+                border-color: Theme.text-mid.with-alpha(0.45);
+                border-radius: Theme.radius-sm;
+            }
             Text {
                 // ordinal → the 1-based stage number; value → the option value + its unit.
                 text: root.ordinal ? "" + (i + 1) : (opt + root.unit);
@@ -467,17 +503,28 @@ export component Toggle inherits Rectangle {
     in property <string> caption;
     in property <bool> checked: false;
     in property <color> tint: Theme.accent;
+    // when false: dimmed ink + inert TouchArea (mirrors SplitToggle's disabled state) so a gated
+    // switch never has to be hand-rolled at the call site.
+    in property <bool> enabled: true;
     callback toggled(bool);
     height: Theme.seg-h;
+    border-radius: Theme.radius-sm;
+    // the quiet pressed tier — the whole-row target flashes well-hi under the finger (parity with
+    // the keyed controls). No fill at rest; sits on the void.
+    background: (root.enabled && row-ta.pressed) ? Theme.well-hi : transparent;
+    animate background { duration: Theme.quick; }
     row-ta := TouchArea {
-        mouse-cursor: MouseCursor.pointer;
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? MouseCursor.pointer : MouseCursor.default;
         clicked => { root.toggled(!root.checked); }
     }
     HorizontalLayout {
         spacing: 10px;
         Text {
             text: root.caption;
-            color: row-ta.has-hover ? Theme.text : Theme.text-mid;
+            overflow: elide;   // a long caption truncates rather than shoving the switch off the row
+            color: !root.enabled ? Theme.text-faint
+                : row-ta.has-hover ? Theme.text : Theme.text-mid;
             font-size: Theme.fs-body;
             font-family: Theme.mono;
             vertical-alignment: center;
@@ -488,16 +535,17 @@ export component Toggle inherits Rectangle {
             width: 40px;
             height: 20px;
             border-radius: Theme.radius-sm;
-            background: root.checked ? Theme.accent-glow : Theme.well;
+            background: (root.checked && root.enabled) ? Theme.accent-glow : Theme.well;
             border-width: Theme.hair;
-            border-color: root.checked ? root.tint.with-alpha(0.7)
+            border-color: !root.enabled ? Theme.line-soft
+                : root.checked ? root.tint.with-alpha(0.7)
                 : (row-ta.has-hover ? Theme.text-faint : Theme.line);
             animate background, border-color { duration: Theme.quick; }
             Rectangle {
                 width: 14px;
                 height: 14px;
                 border-radius: 2px;
-                background: root.checked ? root.tint : Theme.text-faint;
+                background: (root.checked && root.enabled) ? root.tint : Theme.text-faint;
                 y: (parent.height - self.height) / 2;
                 x: root.checked ? parent.width - self.width - 3px : 3px;
                 animate x, background { duration: Theme.quick; }
@@ -637,12 +685,16 @@ export component Readout inherits VerticalLayout {
 export component Picker inherits Rectangle {
     in property <[string]> options;
     in property <int> index: 0;
+    // when false: dimmed ink + inert TouchArea (mirrors SplitToggle's disabled state) so a gated
+    // selector never has to be hand-rolled at the call site.
+    in property <bool> enabled: true;
     callback changed(int);
     height: Theme.row-h;
     border-radius: Theme.radius-sm;
-    background: ta.has-hover ? Theme.well : Theme.bg-2;
+    background: (root.enabled && ta.has-hover) ? Theme.well : Theme.bg-2;
     border-width: Theme.hair;
-    border-color: ta.has-hover ? Theme.text-faint : Theme.line;
+    border-color: !root.enabled ? Theme.line-soft
+        : ta.has-hover ? Theme.text-faint : Theme.line;
     animate background, border-color { duration: Theme.quick; }
     popup := PopupWindow {
         x: 0;
@@ -688,7 +740,7 @@ export component Picker inherits Rectangle {
         padding-left: 11px; padding-right: 9px; spacing: 8px;
         Text {
             text: (root.index >= 0 && root.index < root.options.length) ? root.options[root.index] : "—";
-            color: Theme.text;
+            color: root.enabled ? Theme.text : Theme.text-faint;
             font-size: Theme.fs-body;
             font-family: Theme.mono;
             vertical-alignment: center;
@@ -697,13 +749,14 @@ export component Picker inherits Rectangle {
         Rectangle {}
         Text {
             text: "▾";
-            color: Theme.accent;
+            color: root.enabled ? Theme.accent : Theme.text-faint;
             font-size: Theme.fs-small;
             vertical-alignment: center;
         }
     }
     ta := TouchArea {
-        mouse-cursor: root.options.length > 0 ? MouseCursor.pointer : MouseCursor.default;
+        enabled: root.enabled && root.options.length > 0;
+        mouse-cursor: (root.enabled && root.options.length > 0) ? MouseCursor.pointer : MouseCursor.default;
         // an empty option set has nothing to pick — don't pop a hollow menu (the dead-dropdown bug).
         clicked => { if (root.options.length > 0) { popup.show(); } }
         // NO scroll-nudge on the closed control: it silently changed the selection (e.g. re-routed
@@ -741,13 +794,17 @@ export component ActionPicker inherits VerticalLayout {
     out property <bool> param-ok: !root.cur-required || State.action-param != "";
     // the chosen action's display label — exposed so an inline binder can preview the wire it forges.
     out property <string> action-label: root.cur-label;
+    // gates the palette TRIGGER chip: false → dimmed ink + inert (mirrors SplitToggle's disabled
+    // state). The param field/chips keep their own state; this is the palette-open affordance's gate.
+    in property <bool> enabled: true;
     spacing: 8px;
     Rectangle {
         height: Theme.row-h;
         border-radius: Theme.radius-sm;
-        background: pa.has-hover ? Theme.well : Theme.bg-2;
+        background: (root.enabled && pa.has-hover) ? Theme.well : Theme.bg-2;
         border-width: Theme.hair;
-        border-color: pa.has-hover ? Theme.text-faint : Theme.line;
+        border-color: !root.enabled ? Theme.line-soft
+            : pa.has-hover ? Theme.text-faint : Theme.line;
         animate background, border-color { duration: Theme.quick; }
         apopup := PopupWindow {
             x: 0;
@@ -865,14 +922,20 @@ export component ActionPicker inherits VerticalLayout {
             padding-left: 11px; padding-right: 9px; spacing: 8px;
             Text {
                 text: root.cur-label;
-                color: Theme.text; font-family: Theme.mono; font-size: Theme.fs-body;
+                color: root.enabled ? Theme.text : Theme.text-faint;
+                font-family: Theme.mono; font-size: Theme.fs-body;
                 vertical-alignment: center;
             }
             Rectangle {}
-            Text { text: "▾"; color: Theme.accent; font-size: Theme.fs-small; vertical-alignment: center; }
+            Text {
+                text: "▾";
+                color: root.enabled ? Theme.accent : Theme.text-faint;
+                font-size: Theme.fs-small; vertical-alignment: center;
+            }
         }
         pa := TouchArea {
-            mouse-cursor: MouseCursor.pointer;
+            enabled: root.enabled;
+            mouse-cursor: root.enabled ? MouseCursor.pointer : MouseCursor.default;
             clicked => { apopup.show(); }
         }
     }
@@ -933,15 +996,23 @@ export component ActionPicker inherits VerticalLayout {
         }
         // press-to-fill: capture the actual key/chord/button instead of typing its name. The
         // recorder ids get REC instead — play the keys, the grammar writes itself.
-        if root.capturable : Contact {
-            label: "CAPTURE";
-            active: State.capture-active;
-            clicked => { State.capture-action-param(); }
+        // The 24px chip is CENTRED against the 30px Field (an HBox top-aligns a shorter fixed-height
+        // child, which floated the chip 6px high) — wrap it, don't renorm Contact's height globally.
+        if root.capturable : VerticalLayout {
+            alignment: center;
+            Contact {
+                label: "CAPTURE";
+                active: State.capture-active;
+                clicked => { State.capture-action-param(); }
+            }
         }
-        if root.recordable : Contact {
-            label: State.recording-keys ? "STOP" : "REC";
-            active: State.recording-keys;
-            clicked => { State.record-action-keys(); }
+        if root.recordable : VerticalLayout {
+            alignment: center;
+            Contact {
+                label: State.recording-keys ? "STOP" : "REC";
+                active: State.recording-keys;
+                clicked => { State.record-action-keys(); }
+            }
         }
     }
 }
@@ -1002,7 +1073,10 @@ export component PanelHead inherits HorizontalLayout {
         spacing: 3px;
         HorizontalLayout {
             spacing: 8px;
-            // a short accent index tick before the label — the "channel armed" mark
+            // a short accent index tick before the label — the "channel armed" mark.
+            // SANCTIONED ACCENT EXCEPTION (audit-ruled, do not relitigate): the accent rule bars
+            // decoration, but this tick is not decoration — it MARKS the lit instrument face ("this
+            // panel is the live surface"), kin to the wordmark lamp. It stays accent by design.
             Rectangle {
                 width: 3px; height: 14px; border-radius: 1px;
                 y: 1px;
@@ -1064,7 +1138,10 @@ export component SplitToggle inherits Rectangle {
             min-width: root.min-cell;
             horizontal-stretch: 1;
             property <bool> on: i == root.index;
-            background: seg.on ? Theme.accent-glow : (root.enabled && sta.has-hover ? Theme.well : transparent);
+            background: seg.on ? Theme.accent-glow
+                : (root.enabled && sta.pressed) ? Theme.well-hi
+                : (root.enabled && sta.has-hover) ? Theme.well
+                : transparent;
             animate background { duration: Theme.quick; }
             // the split — a hairline at the seam (every half but the first)
             if i > 0 : Rectangle { x: 0; width: Theme.hair; background: Theme.line; }
@@ -1108,8 +1185,11 @@ export component SplitButton inherits Rectangle {
     // wears the disabled ink + inert contact (never a live-looking key that silently no-ops).
     in property <bool> left-enabled: true;
     in property <bool> right-enabled: true;
-    property <bool> l-on: root.enabled && root.left-enabled;
-    property <bool> r-on: root.enabled && root.right-enabled;
+    // an async op is in flight (e.g. an import parse) — a working lamp lights on the commit half and
+    // BOTH halves go inert so the deck can't fire twice mid-op. Mirrors Button's `busy`.
+    in property <bool> busy: false;
+    property <bool> l-on: root.enabled && root.left-enabled && !root.busy;
+    property <bool> r-on: root.enabled && root.right-enabled && !root.busy;
     callback left-clicked();
     callback right-clicked();
     height: Theme.row-h-sm;
@@ -1117,6 +1197,7 @@ export component SplitButton inherits Rectangle {
     border-width: Theme.hair;
     border-color: root.enabled ? Theme.line : Theme.line-soft;
     clip: true;   // square the inner halves to the rounded outline
+    animate border-color { duration: Theme.quick; }   // settle the frame like SplitToggle (it snapped)
     HorizontalLayout {
         spacing: 0;
         // ── LEFT half — a ghost action (reload) ───────────────────────────
@@ -1129,6 +1210,9 @@ export component SplitButton inherits Rectangle {
             animate background { duration: Theme.quick; }
             HorizontalLayout {
                 padding-left: 13px; padding-right: 13px;
+                // the label travels 1px on press — a key has throw (parity with Button / the right half)
+                y: lta.pressed && root.l-on ? 1px : 0px;
+                animate y { duration: Theme.press-throw; }
                 Text {
                     text: root.left-text;
                     vertical-alignment: center; horizontal-alignment: center;
@@ -1157,12 +1241,24 @@ export component SplitButton inherits Rectangle {
                 : rta.has-hover ? Theme.well
                 : (root.right-primary ? Theme.bg-2 : transparent);
             animate background { duration: Theme.quick; }
+            // the working lamp — a phosphor dot overlaid in the commit half's left padding while the
+            // async op runs (absolute, so it lights in place without shoving the centred label).
+            if root.busy : Rectangle {
+                width: Theme.dot; height: Theme.dot; border-radius: Theme.dot / 2;
+                x: 9px;
+                y: (parent.height - self.height) / 2;
+                background: Theme.accent-dim;
+            }
             HorizontalLayout {
                 padding-left: 13px; padding-right: 13px;
+                // the label travels 1px on press — a key has throw (parity with Button)
+                y: rta.pressed && root.r-on ? 1px : 0px;
+                animate y { duration: Theme.press-throw; }
                 Text {
                     text: root.right-text;
                     vertical-alignment: center; horizontal-alignment: center;
-                    color: !root.r-on ? Theme.text-faint
+                    color: root.busy ? Theme.accent-dim
+                        : !root.r-on ? Theme.text-faint
                         : root.right-primary ? Theme.accent
                         : root.right-danger ? Theme.danger
                         : (rta.has-hover ? Theme.text : Theme.text-mid);
@@ -1193,6 +1289,8 @@ export component InputHead inherits HorizontalLayout {
         alignment: center;
         HorizontalLayout {
             spacing: 8px;
+            // SANCTIONED ACCENT EXCEPTION (same ruling as PanelHead): the tick marks the lit instrument
+            // face, not decoration — it stays accent. See PanelHead's note.
             Rectangle { width: 3px; height: 14px; border-radius: 1px; y: 1px; background: Theme.accent; }
             Text {
                 text: "INPUT";
@@ -1456,7 +1554,9 @@ export component LampRail inherits Rectangle {
             property <bool> lit: i < root.on.length && root.on[i];
             property <color> hue: i < root.tints.length ? root.tints[i] : Theme.accent;
             background: cell.lit ? cell.hue.with-alpha(0.1)
-                : (cta.has-hover && root.enabled ? Theme.well : transparent);
+                : (root.enabled && cta.pressed) ? Theme.well-hi
+                : (root.enabled && cta.has-hover) ? Theme.well
+                : transparent;
             animate background { duration: Theme.quick; }
             // the split — a hairline at the seam (every cell but the first), no gap between contacts
             if i > 0 : Rectangle { x: 0; width: Theme.hair; background: Theme.line; }
@@ -1551,12 +1651,19 @@ export component StatusLamp inherits Rectangle {
         Rectangle {
             width: Theme.dot; height: Theme.dot; border-radius: Theme.dot / 2;
             y: (parent.height - self.height) / 2;
-            background: root.lit ? root.tint : Theme.lamp-off;
+            // chip-less by design, so a press has no fill to flash — the lamp itself gives the tactile
+            // click: an unlit clickable lamp half-lights under the finger, then settles back.
+            background: root.lit ? root.tint
+                : (root.clickable && lta.pressed) ? root.tint.with-alpha(0.5)
+                : Theme.lamp-off;
             animate background { duration: Theme.quick; }
         }
         Text {
             text: root.text;
+            // ...and the label ink jumps to full-bright on press (above the hover text-mid) — the
+            // borderless readout's stand-in for a pressed well.
             color: root.lit ? root.tint
+                : (root.clickable && lta.pressed) ? Theme.text
                 : (root.clickable && lta.has-hover) ? Theme.text-mid
                 : root.ink;
             font-family: Theme.mono;
@@ -1577,24 +1684,79 @@ export component StatusLamp inherits Rectangle {
 // A CONFIRM BUTTON — the two-step arm/confirm destructive key (delete / purge / reset), four copies of
 // which were hand-built before this. First click ARMS: the label swaps to `confirm-text` and a
 // Theme.confirm-window timer starts; a second click WHILE armed fires `confirmed()` and disarms; the
-// timer disarms it on its own if you walk away (a consequential key should never stay hot). Composes a
-// danger Button and inherits a layout so it sizes exactly to that inner key.
-export component ConfirmButton inherits HorizontalLayout {
+// timer disarms it on its own if you walk away (a consequential key should never stay hot).
+//
+// It draws its OWN key (rather than composing Button) for two reasons the audit called out:
+//   * IN-PLACE RELABEL — the key reserves the width of the WIDER of its two labels (both are laid out,
+//     the idle one at opacity 0), so arming swaps "clear vault"↔"erase N glyphs?" without resizing and
+//     shoving its neighbours (the lamp-gutter doctrine, applied to a label).
+//   * ESCALATION WITHIN THE DANGER HUE — rest is quiet danger ink on a well; ARMED fills solid danger
+//     with near-black ink (Button-primary's accent-fill idiom, in danger). One hue, rising commitment —
+//     armed no longer reads identical to rest.
+export component ConfirmButton inherits Rectangle {
     in property <string> text;
     in property <string> confirm-text: "sure?";
     in property <bool> enabled: true;
     callback confirmed();
     property <bool> armed: false;
+    // pin the width to the WIDER label (+ Button's 13px×2 side padding) so the key hugs like a Button
+    // AND never changes size when the label swaps. Reading the labels' intrinsic preferred-widths is
+    // layout-cycle-free (glyph-measured, independent of the box) — the same trick Button uses.
+    property <length> label-w: max(rest.preferred-width, conf.preferred-width);
+    min-width: root.label-w + 26px;
+    max-width: root.label-w + 26px;
+    height: Theme.row-h;
+    clip: true;
+    border-radius: Theme.radius-sm;
+    // rest = quiet danger ink on a hover/press well; ARMED = a solid danger FILL (the escalation).
+    background: !root.enabled ? transparent
+        : root.armed ? Theme.danger
+        : touch.pressed ? Theme.well-hi
+        : touch.has-hover ? Theme.well
+        : transparent;
+    border-width: Theme.hair;
+    border-color: !root.enabled ? Theme.line-soft
+        : Theme.danger.with-alpha(root.armed ? 1.0 : 0.5);
+    animate background, border-color { duration: Theme.quick; }
     // running follows `armed`; on fire it disarms (which stops the timer). A second click also disarms.
     Timer {
         interval: Theme.confirm-window;
         running: root.armed;
         triggered => { root.armed = false; }
     }
-    Button {
-        text: root.armed ? root.confirm-text : root.text;
-        danger: true;
+    HorizontalLayout {
+        padding-left: 13px; padding-right: 13px;
+        y: touch.pressed && root.enabled ? 1px : 0px;   // key throw, like Button
+        animate y { duration: Theme.press-throw; }
+        // both labels stack, centred; the idle one holds its width at opacity 0 so the key stays sized
+        // to the wider of the two and the relabel lands in place.
+        Rectangle {
+            rest := Text {
+                text: root.text;
+                opacity: root.armed ? 0 : 1;
+                width: 100%; height: 100%;
+                horizontal-alignment: center; vertical-alignment: center;
+                font-size: Theme.fs-body; font-family: Theme.mono;
+                font-weight: 500; letter-spacing: Theme.track-1;
+                color: root.enabled ? Theme.danger : Theme.text-faint;
+                animate opacity { duration: Theme.quick; }
+            }
+            conf := Text {
+                text: root.confirm-text;
+                opacity: root.armed ? 1 : 0;
+                width: 100%; height: 100%;
+                horizontal-alignment: center; vertical-alignment: center;
+                font-size: Theme.fs-body; font-family: Theme.mono;
+                font-weight: 700; letter-spacing: Theme.track-1;   // bolder = the committed rung
+                // near-black ink on the danger fill (mirrors accent-ink on an accent fill)
+                color: Theme.danger.darker(0.9);
+                animate opacity { duration: Theme.quick; }
+            }
+        }
+    }
+    touch := TouchArea {
         enabled: root.enabled;
+        mouse-cursor: root.enabled ? MouseCursor.pointer : MouseCursor.default;
         clicked => {
             if (root.armed) {
                 root.armed = false;
@@ -1648,6 +1810,83 @@ export component SelectTick inherits Rectangle {
     width: 2px;
     background: root.active ? root.tint : transparent;
     animate background { duration: Theme.quick; }
+}
+
+// A SELECTABLE ROW — the shared "pick one row from a list" atom the unification plan named. One
+// fused frame with a built-in SelectTick, ONE hover fill (well-hi), the accent-glow ground when
+// `selected`, and canonical heights defined ONCE here (single-line = row-h; a two-line variant when
+// `desc` is set OR `two-line` is forced, so a control-carrying row isn't a per-panel 40px literal).
+// A `lead` string draws a bold tracked leading tag (rhythm symbols); `lamp`/`lamp-on` draws a leading
+// signal dot (a bound glyph); `@children` is the TRAILING slot (an action readout, a ✕, a TRY key) —
+// declared after the row's own TouchArea, so a trailing control wins its corner over the row-wide pick.
+// Retires the hand-rolled pick-one rows in lighting (STACK cell) + spellweaving (glyph vault, rhythm).
+export component SelectableRow inherits Rectangle {
+    in property <string> label;
+    in property <string> desc: "";          // optional second line — grows to the two-line height
+    in property <string> lead: "";          // optional bold tracked leading tag (e.g. a rhythm symbol)
+    in property <bool> lamp: false;          // wear a leading signal dot
+    in property <bool> lamp-on: false;       // …lit (accent) vs a dim line gutter
+    in property <bool> selected: false;
+    in property <bool> two-line: false;      // force the taller row even without a desc (a control row)
+    in property <color> tint: Theme.accent;
+    out property <bool> hovered: sr-ta.has-hover;
+    callback clicked();
+    // the ONE place these heights live — single-line rows are row-h; a desc / control row is the taller.
+    property <length> two-h: 40px;
+    height: (root.desc != "" || root.two-line) ? root.two-h : Theme.row-h;
+    border-radius: Theme.radius-sm;
+    background: root.selected ? root.tint.with-alpha(0.1)
+        : (sr-ta.has-hover ? Theme.well-hi : Theme.bg-2);
+    border-width: Theme.hair;
+    border-color: root.selected ? root.tint.with-alpha(0.27)
+        : (sr-ta.has-hover ? Theme.text-faint : Theme.line);
+    animate background, border-color { duration: Theme.quick; }
+    // the selection marker — the shared tick, tinted, inset with the row.
+    SelectTick { active: root.selected; tint: root.tint; y: 6px; height: parent.height - 12px; }
+    // row-wide pick target — declared BEFORE the content, so a trailing control (a ✕) sits above it.
+    sr-ta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.clicked(); } }
+    HorizontalLayout {
+        padding-left: 11px; padding-right: 9px; spacing: 10px;
+        // leading signal dot (a bound glyph)
+        if root.lamp : VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: Theme.dot; height: Theme.dot; border-radius: Theme.dot / 2;
+                background: root.lamp-on ? root.tint : Theme.line;
+                animate background { duration: Theme.quick; }
+            }
+        }
+        // leading bold tag (rhythm symbols)
+        if root.lead != "" : VerticalLayout {
+            alignment: center; width: 84px;
+            Text {
+                text: root.lead;
+                color: root.selected ? root.tint : Theme.text-mid;
+                font-family: Theme.mono; font-size: Theme.fs-data; font-weight: 700;
+                letter-spacing: Theme.track-2; vertical-alignment: center;
+                animate color { duration: Theme.quick; }
+            }
+        }
+        // the label (+ optional desc line) — the stretchy main text.
+        VerticalLayout {
+            alignment: center; horizontal-stretch: 1; spacing: 2px;
+            Text {
+                text: root.label;
+                color: root.selected ? root.tint : (sr-ta.has-hover ? Theme.text : Theme.text-mid);
+                font-family: Theme.mono; font-size: Theme.fs-body; font-weight: 600;
+                vertical-alignment: center; overflow: elide;
+                animate color { duration: Theme.quick; }
+            }
+            if root.desc != "" : Text {
+                text: root.desc;
+                color: Theme.text-faint;
+                font-family: Theme.mono; font-size: Theme.fs-small;
+                vertical-alignment: center; overflow: elide;
+            }
+        }
+        // the TRAILING slot — the caller drops an action readout / ✕ / TRY key here.
+        @children
+    }
 }
 
 // A TRIGGER WELL — the press-to-bind status well (the bindings TRIGGER slot, the hypershift REACHED-BY

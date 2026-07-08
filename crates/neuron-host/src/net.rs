@@ -24,11 +24,12 @@ use std::time::{Duration, Instant};
 
 use std::sync::mpsc::{Receiver, Sender};
 
-use crate::adapters::chroma::{ChromaServer, GameLightingPolicy, HttpRequest, HttpResponse};
+use crate::adapters::chroma::{ChromaServer, HttpRequest, HttpResponse};
 use crate::adapters::obs::{ObsClient, ObsEvent};
 use crate::adapters::openrgb::OrgbConn;
 use crate::api::HostApi;
 use crate::bus::Value;
+use crate::paint::PaintPolicy;
 use crate::shell::HostHandle;
 use crate::ws::{WsIn, WsStream};
 
@@ -87,11 +88,23 @@ pub struct OrgbServer {
 }
 
 impl OrgbServer {
-    /// Bind and serve. `addr` is usually [`OPENRGB_ADDR`]; tests pass
-    /// `127.0.0.1:0` for an ephemeral port. A bind failure is returned as-is —
-    /// on the well-known port it means "another host instance owns this
+    /// Bind and serve with the default OpenRGB paint policy ([`PaintPolicy::opaque`]
+    /// — show the client's paint as sent). `addr` is usually [`OPENRGB_ADDR`];
+    /// tests pass `127.0.0.1:0` for an ephemeral port. A bind failure is returned
+    /// as-is — on the well-known port it means "another host instance owns this
     /// machine; connect as a client instead".
     pub fn bind(addr: &str, handle: HostHandle) -> std::io::Result<OrgbServer> {
+        OrgbServer::bind_with_policy(addr, handle, PaintPolicy::opaque())
+    }
+
+    /// Bind and serve, wiring every connection to a shared [`PaintPolicy`] (the
+    /// OpenRGB family's blend/strength/fade/scope settings). The app passes the
+    /// policy it also drives from the settings page.
+    pub fn bind_with_policy(
+        addr: &str,
+        handle: HostHandle,
+        policy: Arc<PaintPolicy>,
+    ) -> std::io::Result<OrgbServer> {
         let listener = TcpListener::bind(addr)?;
         listener.set_nonblocking(true)?;
         let local = listener.local_addr()?;
@@ -101,7 +114,7 @@ impl OrgbServer {
         let shared = roster.clone();
         let accept = thread::Builder::new()
             .name("neuron-orgb-accept".into())
-            .spawn(move || accept_loop(listener, handle, stop_flag, shared))
+            .spawn(move || accept_loop(listener, handle, stop_flag, shared, policy))
             .expect("spawn accept thread");
         Ok(OrgbServer {
             stop,
@@ -141,6 +154,7 @@ fn accept_loop(
     handle: HostHandle,
     stop: Arc<AtomicBool>,
     roster: OrgbRoster,
+    policy: Arc<PaintPolicy>,
 ) {
     let mut conns: Vec<thread::JoinHandle<()>> = Vec::new();
     let mut next_conn: u64 = 1;
@@ -150,11 +164,12 @@ fn accept_loop(
                 let handle = handle.clone();
                 let stop = stop.clone();
                 let roster = roster.clone();
+                let policy = Arc::clone(&policy);
                 let conn_id = next_conn;
                 next_conn += 1;
                 if let Ok(t) = thread::Builder::new()
                     .name("neuron-orgb-conn".into())
-                    .spawn(move || serve_conn(stream, handle, stop, roster, conn_id))
+                    .spawn(move || serve_conn(stream, handle, stop, roster, conn_id, policy))
                 {
                     conns.push(t);
                 }
@@ -179,13 +194,14 @@ fn serve_conn(
     stop: Arc<AtomicBool>,
     roster: OrgbRoster,
     conn_id: u64,
+    policy: Arc<PaintPolicy>,
 ) {
     // Blocking reads with a short timeout so the stop flag is honored within
     // ~100ms without a busy loop.
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
     let _ = stream.set_nodelay(true);
-    let mut conn = OrgbConn::new(&mut handle);
+    let mut conn = OrgbConn::new(&mut handle, policy);
     // On the roster from the first byte (named "" until SET_CLIENT_NAME) — a
     // connected-but-mute client still shows as connected, honestly.
     roster
@@ -220,6 +236,16 @@ fn serve_conn(
                     if !reply.is_empty() && stream.write_all(&reply).is_err() {
                         break;
                     }
+                    // Also check hotplug on the ACTIVE path, not just the idle tick below:
+                    // a client that streams continuously (an effect at 30+fps) never lets
+                    // the read time out, so the idle branch would never fire for it. The
+                    // fingerprint guard makes this idempotent — it only writes when the
+                    // surface list actually changed — and DEVICE_LIST_UPDATED is an async
+                    // push the client already expects at any time.
+                    let hotplug = conn.check_hotplug(&mut handle);
+                    if !hotplug.is_empty() && stream.write_all(&hotplug).is_err() {
+                        break;
+                    }
                 }
                 // Windows surfaces read timeouts as TimedOut, Unix as WouldBlock.
                 Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
@@ -227,6 +253,14 @@ fn serve_conn(
                     // kernel rebirth swept its claims. A silent client never
                     // sends fresh traffic, so this is the only path back for it.
                     conn.reassert(&mut handle, Instant::now());
+                    // Same tick: push DEVICE_LIST_UPDATED if the surface list
+                    // changed since last time, so a listening client (Home
+                    // Assistant, an effect script) re-requests controller data
+                    // instead of polling.
+                    let hotplug = conn.check_hotplug(&mut handle);
+                    if !hotplug.is_empty() && stream.write_all(&hotplug).is_err() {
+                        break;
+                    }
                     continue;
                 }
                 Err(_) => break, // reset/abort — same teardown as EOF
@@ -258,13 +292,13 @@ pub struct ChromaHttpServer {
 
 impl ChromaHttpServer {
     pub fn bind(addr: &str, handle: HostHandle) -> std::io::Result<ChromaHttpServer> {
-        ChromaHttpServer::bind_with_policy(addr, handle, GameLightingPolicy::new())
+        ChromaHttpServer::bind_with_policy(addr, handle, PaintPolicy::new())
     }
 
     pub fn bind_with_policy(
         addr: &str,
         handle: HostHandle,
-        policy: Arc<GameLightingPolicy>,
+        policy: Arc<PaintPolicy>,
     ) -> std::io::Result<ChromaHttpServer> {
         let listener = TcpListener::bind(addr)?;
         listener.set_nonblocking(true)?;

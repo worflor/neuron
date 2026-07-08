@@ -37,7 +37,10 @@ pub struct LayerId(pub u64);
 pub mod band {
     /// The user's configured lighting — always present, never expires.
     pub const BASE: i32 = 0;
-    /// Ambient/passive sources (screen mirror, audio meter) riding above base.
+    /// Reserved for ambient/passive sources riding above base — currently
+    /// claimed by nothing: screen-mirror and the audio meter run inside the
+    /// app's own base-layer stack today, not as an out-of-app claimant. The
+    /// band stays as the designed slot for a future out-of-app ambient source.
     pub const AMBIENT: i32 = 1_000;
     /// Live protocol sessions: a Chroma game, an OpenRGB client.
     pub const SESSION: i32 = 10_000;
@@ -54,7 +57,7 @@ pub struct Rgb(pub u8, pub u8, pub u8);
 /// sessions, and returns the instant they release. Implementations do math
 /// only (the kernel stays I/O-free); `Send` because layers live on the kernel
 /// actor thread. `boxed_clone` exists because layer content must be clonable
-/// (journal replay, set-or-claim fallbacks); implementations typically
+/// (set-or-claim fallbacks, rebirth reassert); implementations typically
 /// rebuild from their defs.
 pub trait LiveContent: Send {
     /// Current cells; `None` = transparent, same contract as [`Content::Cells`].

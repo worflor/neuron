@@ -285,7 +285,8 @@ export struct MacroBlock {
     kind: string,   // step: "type_text"|"hotkey"|"clipboard"|"run"|"notify"|"ask"|"raw" · lane: "yes"|"no" · add: ""
     verb: string,   // step: the plain-language label ("type" / "press" / "copy" / "open" / "notify" / "ask" / "code")
     value: string,  // step: the editable param (text / "ctrl+c" / target / question / raw code); "" for lane/add
-    last: bool,     // step: is this the last row at its level (spine end-cap)
+    first: bool,    // step: is this the FIRST row at its level (its ↑ reorder is dead)
+    last: bool,     // step: is this the last row at its level (spine end-cap; its ↓ reorder is dead)
 }
 
 // One macro that raises a BEACON — i.e. its source calls `neuron.ask(…)`. The SYSTEM panel's BEACONS

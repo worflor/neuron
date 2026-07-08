@@ -213,14 +213,24 @@ export component AppWindow inherits Window {
                         HorizontalLayout {
                             alignment: end;
                             spacing: 10px;
-                            // show WHICH layer(s) are held when the runtime names them, not a static word
-                            if State.hypershift-on : Text {
-                                text: State.live-held != "" ? State.live-held : "shift";
-                                color: Theme.accent;
-                                font-size: Theme.fs-small;
-                                font-family: Theme.mono;
-                                letter-spacing: Theme.track-4;
-                                vertical-alignment: center;
+                            // show WHICH layer(s) are held when the runtime names them, not a static
+                            // word. A FIXED-WIDTH slot (sized to the longest expected label) always
+                            // reserves its space so the PROFILE pill never slides when a layer is held
+                            // — the same lamp-gutter doctrine the atoms follow (reserve, don't reflow).
+                            // The word right-anchors against the pill and only paints while shifted.
+                            Rectangle {
+                                width: 68px;
+                                Text {
+                                    visible: State.hypershift-on;
+                                    text: State.live-held != "" ? State.live-held : "shift";
+                                    width: 100%;
+                                    horizontal-alignment: right;
+                                    color: Theme.accent;
+                                    font-size: Theme.fs-small;
+                                    font-family: Theme.mono;
+                                    letter-spacing: Theme.track-4;
+                                    vertical-alignment: center;
+                                }
                             }
                             // PROFILE — opens the profiles sheet (save/apply/rules from anywhere).
                             Pill {
@@ -276,7 +286,7 @@ export component AppWindow inherits Window {
 
             // ── status strip (the scope readout line) ─────────────────────────
             Rectangle {
-                height: 26px;
+                height: Theme.seg-h;
                 background: Theme.bg-2;
                 Rectangle { x: 0; y: 0; width: parent.width; height: Theme.hair; background: Theme.line; }
                 HorizontalLayout {
@@ -315,6 +325,11 @@ export component AppWindow inherits Window {
                     // structure) instead of blind spacer gaps. Gates + live states belong on the scope
                     // line. Order: beacon | writes-paused | gate | fired | focus. Each group LEADS with
                     // its own divider, so whichever renders first is cleanly parted from the message.
+                    //
+                    // SANCTIONED REFLOW EXCEPTION (audit-ruled): the transient chips (beacon, writes-
+                    // paused) pop in and push the groups to their right. That is ACCEPTED here — these
+                    // are short-lived signals, and reserving a fixed slot for each would waste strip
+                    // width that the readout message legitimately wants. Don't "fix" this with gutters.
                     HorizontalLayout {
                         alignment: end;
                         spacing: 10px;
@@ -323,7 +338,7 @@ export component AppWindow inherits Window {
                         // A plain lit readout — the outer `if` IS the "lit" condition, so it always shows phosphor.
                         if State.beacon-count > 0 : HorizontalLayout {
                             spacing: 10px;
-                            Rectangle { width: 1px; height: 12px; y: (parent.height - self.height) / 2; background: Theme.line; }
+                            Rectangle { width: Theme.hair; height: 12px; y: (parent.height - self.height) / 2; background: Theme.line; }
                             StatusLamp {
                                 text: State.beacon-count > 1 ? "beacon ×" + State.beacon-count : "beacon";
                                 lit: true;
@@ -334,7 +349,7 @@ export component AppWindow inherits Window {
                         // The lamp makes it read as a THROWN switch (a red kill-lamp), not inert text.
                         if State.writes-paused : HorizontalLayout {
                             spacing: 10px;
-                            Rectangle { width: 1px; height: 12px; y: (parent.height - self.height) / 2; background: Theme.line; }
+                            Rectangle { width: Theme.hair; height: 12px; y: (parent.height - self.height) / 2; background: Theme.line; }
                             StatusLamp {
                                 text: "writes paused";
                                 lit: true;
@@ -350,7 +365,7 @@ export component AppWindow inherits Window {
                         // a dim dot=safe.
                         HorizontalLayout {
                             spacing: 10px;
-                            Rectangle { width: 1px; height: 12px; y: (parent.height - self.height) / 2; background: Theme.line; }
+                            Rectangle { width: Theme.hair; height: 12px; y: (parent.height - self.height) / 2; background: Theme.line; }
                             // lit in either loud state — accent when ARMED, warn when ARM?; SAFE is the
                             // unlit gutter (StatusLamp draws lamp-off + the text-dim ink, hover→text-mid).
                             StatusLamp {
@@ -373,7 +388,7 @@ export component AppWindow inherits Window {
                         // caps it (elides a long trigger→action) so it can never shove `focus` off-edge.
                         if State.live-fired > 0 : HorizontalLayout {
                             spacing: 10px;
-                            Rectangle { width: 1px; height: 12px; y: (parent.height - self.height) / 2; background: Theme.line; }
+                            Rectangle { width: Theme.hair; height: 12px; y: (parent.height - self.height) / 2; background: Theme.line; }
                             Mono {
                                 text: "fired " + State.live-fired + " · " + State.live-last-trigger
                                     + " → " + State.live-last-action;
@@ -387,7 +402,7 @@ export component AppWindow inherits Window {
                         // the focus readout — the last item; natural width, elides at its own cap.
                         HorizontalLayout {
                             spacing: 10px;
-                            Rectangle { width: 1px; height: 12px; y: (parent.height - self.height) / 2; background: Theme.line; }
+                            Rectangle { width: Theme.hair; height: 12px; y: (parent.height - self.height) / 2; background: Theme.line; }
                             Mono {
                                 text: "focus " + State.focused-app;
                                 color: Theme.text-faint;

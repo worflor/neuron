@@ -122,5 +122,40 @@ export global GuideContent {
                 },
             ],
         },
+        {
+            id: "spell-assist",
+            title: "SPELL ASSIST",
+            sections: [
+                {
+                    head: "What assist does",
+                    blocks: [
+                        { code: false, text: "When you draw a spell, Neuron scores how close your stroke is to each glyph you've taught. Assist is how far past the strict gate a near-miss may sit and still snap to the closest spell." },
+                        { code: false, text: "At 0 (off) only a clean match fires. Nudge it up and a slightly-off stroke still lands — but only when one spell is a clear winner, never when two are close (it won't guess between them)." },
+                        { code: false, text: "Higher is more forgiving, with more chance of the wrong spell. Lower is stricter, with more misses. A cast that only landed because assist helped tells you so." },
+                    ],
+                },
+            ],
+        },
+        {
+            id: "spectrum",
+            title: "SPECTRUM \u{00b7} MOTION",
+            sections: [
+                {
+                    head: "Stops",
+                    blocks: [
+                        { code: false, text: "A stop is one colour pinned at a spot along the strip. One stop is a solid colour; add more and the colours blend between them into a gradient." },
+                        { code: false, text: "Click a stop to recolour it, drag it to move it, + adds one beside the selected stop, − removes it. The strip is the board's colours, left to right." },
+                    ],
+                },
+                {
+                    head: "Motion",
+                    blocks: [
+                        { code: false, text: "Motion is how those colours move over time:" },
+                        { code: false, text: "HOLD stays still. DRIFT slides the gradient along the board. CYCLE rotates the hues through the wheel. BREATHE fades the whole thing up and down. FLOW is a soft, organic wander." },
+                        { code: false, text: "Speed paces every motion but HOLD. BREATHE adds a depth knob (how far it dims); FLOW adds a chaos knob (how restless the wander)." },
+                    ],
+                },
+            ],
+        },
     ];
 }

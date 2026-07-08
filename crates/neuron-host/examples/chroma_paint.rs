@@ -15,7 +15,7 @@
 #[cfg(all(windows, feature = "bridge"))]
 fn main() -> anyhow::Result<()> {
     use neuron_host::adapters::chroma_shm::server::{ChromaShmLayer, CreateError, ShmServer};
-    use neuron_host::adapters::chroma::GameLightingPolicy;
+    use neuron_host::paint::PaintPolicy;
     use neuron_host::api::{HostApi, LeaseSpec, SurfaceKind};
     use neuron_host::arbiter::{band, Content, Rgb};
     use neuron_host::bridge;
@@ -57,7 +57,7 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     let mut h = host.handle();
-    let policy = GameLightingPolicy::new();
+    let policy = PaintPolicy::new();
 
     // A calm base layer so unclaimed LEDs aren't black before a game connects.
     let base = h.next_source();
