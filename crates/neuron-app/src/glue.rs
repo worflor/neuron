@@ -36,6 +36,112 @@ use std::rc::Rc;
 /// The "off" colour of an LED cell — what `clear` paints and what an unpainted grid shows.
 const GRID_OFF: slint::Color = slint::Color::from_rgb_u8(0x0c, 0x0d, 0x10);
 
+/// The app's weak handle, installed ONCE at startup — the reach-back a non-UI subsystem
+/// (`hidwatch`'s hardware-mute bridge, off a reader thread) needs to post onto the UI thread without
+/// being threaded through as a parameter down through `hidwatch`/`decode`/`bridge_mic_mute`.
+static UI: std::sync::OnceLock<slint::Weak<AppWindow>> = std::sync::OnceLock::new();
+
+/// Install the app's weak handle for [`notify_hardware_mute`] and any future non-UI caller. Call once,
+/// as early as the weak handle exists (main.rs builds it before starting `hidwatch::start()`).
+pub fn install_ui(weak: slint::Weak<AppWindow>) {
+    let _ = UI.set(weak);
+}
+
+/// The device registry — delegates to the ONE shared, RELOADABLE app-layer cache
+/// ([`crate::hidwatch::registry`]) rather than a second private OnceLock that would freeze a startup
+/// snapshot while hidwatch's/runtime's reloaded (the reload-mismatch a review caught). Used by
+/// [`endpoint_has_hardware_mute`] on device SELECT (not a hot path); one shared source keeps the
+/// def-based capability check consistent with hidwatch arming after an adoption reload.
+fn registry() -> Option<&'static neuron::registry::Registry> {
+    crate::hidwatch::registry()
+}
+
+/// Is this audio endpoint's mute HARDWARE-owned — driven by a device that pushes a firmware tap-mute
+/// event neuron bridges to the OS mute, rather than a plain software-only OS toggle? Two independent
+/// ways an endpoint can qualify, either sufficing:
+///   * `hidwatch::hardware_mute_products()` — the EMERGENT capability surface, populated from LIVE
+///     dialect claiming (e.g. razer-audio's family-wide tap-mute vocabulary arming on the Seiren's
+///     Consumer-Control pipe) — never from a def.
+///   * a registry def that both declares a MuteState push (`[events]`) AND identifies this endpoint
+///     by the def's `name`. Defs are the PER-DEVICE override layer, so this stays a live, additional
+///     check alongside the emergent one — a curated def naming a device the dialect surface hasn't
+///     (yet) armed still counts.
+/// Both legs resolve identity through the ONE shared predicate
+/// (`neuron::audio::endpoint_matches_product`) — the same one `hidwatch::bridge_mic_mute` resolves
+/// the OS endpoint with and `notify_hardware_mute` matches the UI row with, so what this gate
+/// declares hardware-owned and what the bridge can actually reach can never drift apart.
+/// This is the CAPABILITY gate behind `State.device-mute-hardware`, replacing the old `kind == "mic"`
+/// string policy: a mic with neither (BlackShark-class) is host-invisible for mute, so it must not
+/// claim to be hardware-owned. Thin shim over the pure [`hardware_mute_gate`], where tests live.
+fn endpoint_has_hardware_mute(endpoint_name: &str) -> bool {
+    hardware_mute_gate(endpoint_name, &crate::hidwatch::hardware_mute_products(), registry())
+}
+
+/// The PURE core of [`endpoint_has_hardware_mute`]: same two-leg decision, with the emergent surface
+/// and the registry INJECTED so tests exercise the real gate against minted inputs (no global
+/// stores, no disk registry). Keep every policy change HERE — the shim above only fetches the live
+/// inputs.
+fn hardware_mute_gate(
+    endpoint_name: &str,
+    emergent_products: &[String],
+    registry: Option<&neuron::registry::Registry>,
+) -> bool {
+    emergent_products
+        .iter()
+        .any(|p| neuron::audio::endpoint_matches_product(endpoint_name, p))
+        || registry.is_some_and(|r| {
+            r.devices.iter().any(|d| {
+                d.has_event(neuron::registry::EventKind::MuteState)
+                    && neuron::audio::endpoint_matches_product(endpoint_name, &d.name)
+            })
+        })
+}
+
+/// The WRITE facet: is this mic endpoint's mute backed by a PROVEN device setter? True only when
+/// `hidwatch::mute_writable_products()` — the emergent surface, populated ONLY when an arming
+/// dialect's `audio_mute_writable()` said yes — identifies this endpoint (the same shared predicate
+/// as `endpoint_has_hardware_mute`). The Seiren (read-only, see `RazerAudioDialect::
+/// audio_mute_writable`) never lands there, so its control stays a live indicator, never an
+/// interactive toggle that would contradict the firmware LED.
+fn endpoint_mute_writable(endpoint_name: &str) -> bool {
+    crate::hidwatch::mute_writable_products()
+        .iter()
+        .any(|p| neuron::audio::endpoint_matches_product(endpoint_name, p))
+}
+
+/// Bridge a device-pushed hardware mute event (see `hidwatch::bridge_mic_mute`) onto the UI thread —
+/// SOURCE-AWARE: `product` is the USB product string of the mic that pushed the tap. The device panel
+/// (and the `mic-muted` pill) update ONLY when the SELECTED endpoint IS that same device, matched by
+/// the SAME shared identity predicate (`neuron::audio::endpoint_matches_product`) `bridge_mic_mute`
+/// resolves the OS endpoint with — one predicate on both sides, so the OS write and the UI mirror can
+/// never disagree about which device an event belongs to (the predicate also refuses an empty
+/// product, so a nameless event can never claim the selected row). Without the match, a tap on mic A
+/// would flip mic B's panel + row detail when B is the selected hardware mic — a wrong-device UI
+/// readout. This push IS how the panel learns of an out-of-band tap (there is no poll any more — see
+/// the deleted `refresh_selected_audio_mute`). The global default-mic `mic-muted` state stays owned
+/// by the dispatch loop's Core-Audio mic-tap (device-correct for the default mic), so it isn't
+/// force-set here from an arbitrary source.
+pub fn notify_hardware_mute(product: &str, muted: bool) {
+    let Some(weak) = UI.get() else { return };
+    let product = product.to_string();
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        let Some(app) = weak.upgrade() else { return };
+        let st = app.global::<State>();
+        if st.get_selected_device_kind() != "mic" || !st.get_device_mute_hardware() {
+            return;
+        }
+        // only the SELECTED endpoint that actually pushed this event.
+        if selected_audio_name(&st)
+            .is_some_and(|n| neuron::audio::endpoint_matches_product(&n, &product))
+        {
+            st.set_device_muted(muted);
+            st.set_mic_muted(muted);
+            patch_selected_audio_detail(&st);
+        }
+    });
+}
+
 /// Whether the lighting-page render profiler is on (env `NEURON_PROF`). Cached once — env reads lock
 /// an internal mutex, and the tile tick is hot. INERT in prod (the env var is unset), so the per-tick
 /// `Instant` calls below are skipped entirely; this is pure diagnostics, gone the moment the var is.
@@ -6337,6 +6443,20 @@ fn selected_audio_id(st: &State) -> Option<String> {
     (kind == "mic" || kind == "output").then(|| row.id.to_string())
 }
 
+/// The selected device row's DISPLAY NAME, if it IS an audio device (mic/output) — the Core-Audio
+/// endpoint name a hardware-mute event's product string is matched against in `notify_hardware_mute`,
+/// so a tap only ever flips the row of the mic that actually pushed it.
+fn selected_audio_name(st: &State) -> Option<String> {
+    use slint::Model;
+    let i = st.get_selected_device();
+    if i < 0 {
+        return None;
+    }
+    let row = st.get_devices().row_data(i as usize)?;
+    let kind = row.kind.to_string();
+    (kind == "mic" || kind == "output").then(|| row.name.to_string())
+}
+
 /// Repaint the SELECTED audio row's subtitle ("mic · 62%" / "output · muted") from the live
 /// device-volume/mute state, so the channel strip in the list never contradicts the card after a
 /// drag/mute (no full rescan needed — just the one row).
@@ -6475,6 +6595,16 @@ fn select_device_at(app: &AppWindow, sh: &SharedRt, idx: i32) {
             st.set_device_volume((e.volume * 100.0).round());
             st.set_device_muted(e.muted);
         }
+        // CAPABILITY, not string policy: a mic is "hardware-owned" only when a registry def both
+        // declares a MuteState push and claims THIS endpoint (Seiren-class). An output row's OS mute
+        // IS its real mute (never hardware-owned); a mic with no such def (BlackShark-class) hides
+        // its mute control entirely instead of showing a misleading OS-only toggle (see device.slint).
+        st.set_device_mute_hardware(kind == "mic" && endpoint_has_hardware_mute(&row.name));
+        // The WRITE facet: an output endpoint's OS mute IS a real, writable mute (always true); a mic
+        // is interactive only when its arming dialect PROVED a setter (`endpoint_mute_writable`) — the
+        // Seiren (read-only) stays false here, so device.slint renders it as a live indicator, not a
+        // toggle that would silently no-op against the firmware.
+        st.set_device_mute_writable(kind == "output" || endpoint_mute_writable(&row.name));
     } else {
         // HID: point the runtime at this UNIT (pid parsed above; `row.id` is the physical unit's
         // path instance) + seed the FEEL fader from its live reads.
@@ -9318,6 +9448,69 @@ fn open_crash_log() {
         .unwrap_or_else(|_| ".".into())
         .join("neuron-crash.log");
     open_in_file_manager(&path);
+}
+
+#[cfg(test)]
+mod hardware_mute_gate_tests {
+    //! The capability gate behind `State.device-mute-hardware`, pinned against MINTED inputs — the
+    //! pure [`hardware_mute_gate`] core with the emergent surface and registry injected, so these
+    //! never touch the global stores, the disk registry, or Core Audio. The endpoint-identity
+    //! predicate itself is pinned in `neuron::audio::identity_tests`; here we pin the GATE's
+    //! two-leg policy over it.
+    use super::hardware_mute_gate;
+    use neuron::registry::{DeviceDef, Registry};
+
+    /// Mint a def from TOML (the only public constructor), optionally carrying a MuteState
+    /// `[events]` vocabulary — the shape a curated Seiren-class def would ship.
+    fn def(name: &str, with_mute_event: bool) -> DeviceDef {
+        let events = if with_mute_event {
+            "[events]\nusage_page = 12\nusage = 1\nfeature_len = 64\n[events.reports]\n\"0511\" = \"mute_state\"\n"
+        } else {
+            ""
+        };
+        toml::from_str(&format!(
+            "name = \"{name}\"\ncodename = \"t\"\nvendor_id = 5426\ntransaction_id = 0x1F\n\
+             [[modes]]\nname = \"wired\"\nproduct_id = 1\n\
+             [control_interface]\nusage_page = 1\nusage = 2\nfeature_report_len = 91\n\
+             [commands]\n{events}"
+        ))
+        .expect("test def parses")
+    }
+
+    const SEIREN_EP: &str = "Microphone (2- Razer Seiren V3 Mini)";
+
+    #[test]
+    fn emergent_leg_gates_by_live_claimed_product() {
+        let armed = vec!["Razer Seiren V3 Mini".to_string()];
+        assert!(hardware_mute_gate(SEIREN_EP, &armed, None), "a live-armed product owns its endpoint");
+        // per-DEVICE, not per-vendor: a different mic never inherits the armed product's gate.
+        assert!(!hardware_mute_gate("Microphone (HyperX QuadCast)", &armed, None));
+        // and nothing armed = nothing hardware-owned.
+        assert!(!hardware_mute_gate(SEIREN_EP, &[], None));
+    }
+
+    #[test]
+    fn def_leg_gates_only_on_a_declared_mute_event() {
+        // a curated def that DECLARES the push still counts before its pipe ever arms…
+        let reg = Registry { devices: vec![def("Razer Seiren V3 Mini", true)] };
+        assert!(hardware_mute_gate(SEIREN_EP, &[], Some(&reg)));
+        // …but a def that names the device WITHOUT a MuteState vocabulary must not claim it
+        // (BlackShark-class: a def exists, yet its mute is host-invisible).
+        let reg = Registry { devices: vec![def("Razer Seiren V3 Mini", false)] };
+        assert!(!hardware_mute_gate(SEIREN_EP, &[], Some(&reg)));
+        // and a mute-capable def for a DIFFERENT device never claims this endpoint.
+        let reg = Registry { devices: vec![def("Razer Seiren V2 X", true)] };
+        assert!(!hardware_mute_gate(SEIREN_EP, &[], Some(&reg)));
+    }
+
+    #[test]
+    fn blank_products_can_never_claim_an_endpoint() {
+        // defense-in-depth below `note_audio_capability`'s insertion guard: even if a blank needle
+        // ever reached the gate, the shared predicate refuses it — no endpoint reads as
+        // hardware-owned by accident.
+        let armed = vec![String::new(), "   ".to_string()];
+        assert!(!hardware_mute_gate(SEIREN_EP, &armed, None));
+    }
 }
 
 #[cfg(test)]

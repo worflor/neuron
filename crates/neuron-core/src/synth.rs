@@ -505,6 +505,9 @@ pub fn synthesize(t: &dyn Transport, ctx: &SynthCtx) -> Option<Synthesis> {
         commands,
         lighting,
         side_plates: None,
+        // Synthesis never probes push-only report vocabularies (no HID reader in this pass) —
+        // an auto def carries no `[events]` block; hidwatch's collection-shape arming is unaffected.
+        events: None,
     };
     Some(Synthesis {
         def,
@@ -672,6 +675,13 @@ fn emit(d: &DeviceDef, notes: &EmitNotes) -> String {
         "[control_interface]\nusage_page = 0x{:04X}\nusage = 0x{:04X}\nfeature_report_len = {}\n\n",
         d.control_interface.usage_page, d.control_interface.usage, d.control_interface.feature_report_len
     ));
+    if d.commands.is_empty() {
+        // `commands` has no `#[serde(default)]` (a load-time typo'd/truncated table should fail
+        // loudly, not silently deserialize to empty) — so a genuinely EMPTY map (e.g. razer-audio's
+        // synthesized def, which probes none) still needs the key to be PRESENT on disk, exactly the
+        // convention the curated Seiren TOML used by hand before it was deleted.
+        out.push_str("# No commands known — an honest empty table, not invented opcodes.\n[commands]\n\n");
+    }
     for (name, c) in &d.commands {
         emit_cmd(&mut out, &format!("commands.{name}"), c);
     }

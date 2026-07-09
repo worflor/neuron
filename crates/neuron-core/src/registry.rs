@@ -55,6 +55,31 @@ pub enum DefOrigin {
     Auto,
 }
 
+/// One device-PUSHED HID event vocabulary (an `[events]` TOML block) — the DATA half of the
+/// per-device report map `hidwatch`'s module header says "should move to the registry". The arming
+/// triple (`usage_page`/`usage`/`feature_len`) pins WHICH collection the pushes ride (e.g. the Seiren
+/// V3 Mini's Consumer-Control collection, distinct from its vendor control pipe); `reports` maps the
+/// pushed report's first two bytes (lowercase hex, e.g. `"0511"`) to the semantic [`EventKind`] it
+/// carries.
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+pub struct EventMap {
+    pub usage_page: u16,
+    pub usage: u16,
+    pub feature_len: u16,
+    reports: BTreeMap<String, EventKind>,
+}
+
+/// A semantic device-pushed event. Deserialized from its TOML string name (`rename_all =
+/// "snake_case"`) — an unregistered name (an event typo in a device TOML) is a serde LOAD ERROR, never
+/// a silent vanish, the same fail-loud stance [`Registry::load`] takes on an unroutable `dialect`.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EventKind {
+    /// An AUDIO device's capacitive tap-mute toggled (the Seiren V3 Mini family's `05 11 <state>`
+    /// push; `state` 0=live, 1=muted).
+    MuteState,
+}
+
 /// A complete device definition (the unit you add to support a new device).
 #[derive(Debug, Deserialize, Clone, PartialEq)]
 pub struct DeviceDef {
@@ -98,6 +123,11 @@ pub struct DeviceDef {
     /// appear here. Devices without swappable plates simply omit the table.
     #[serde(default)]
     pub side_plates: Option<BTreeMap<String, String>>,
+    /// Optional device-PUSHED event vocabulary (an `[events]` table). Devices that push no such
+    /// reports simply omit the table (`None`) — no every-device tax for a Naga-only or Seiren-only
+    /// behaviour.
+    #[serde(default)]
+    pub events: Option<EventMap>,
 }
 
 impl DeviceDef {
@@ -165,6 +195,44 @@ impl DeviceDef {
         }
         cap.required_commands().iter().all(|c| self.has_command(c))
             && (!cap.requires_lighting() || self.lighting.is_some())
+    }
+
+    /// Decode a device-PUSHED report against this def's `[events]` vocabulary. Matches on `report`'s
+    /// first two bytes only (the report-kind lead byte + sub-kind byte, e.g. `05 11`) — any further
+    /// length/shape policy for the resolved [`EventKind`] (e.g. reading `report[2]` for MuteState's
+    /// state bit) belongs to the caller, not this lookup. `None` for a too-short report, a device with
+    /// no `[events]` block, or a lead-byte pair the vocabulary doesn't name.
+    pub fn event_for(&self, report: &[u8]) -> Option<EventKind> {
+        if report.len() < 2 {
+            return None;
+        }
+        let key = format!("{:02x}{:02x}", report[0], report[1]);
+        self.events.as_ref()?.reports.get(&key).copied()
+    }
+
+    /// Does this def's `[events]` vocabulary ride the collection (`page`, `usage`, `flen`)? The arming
+    /// check a collection-enumeration filter (`hidwatch`'s) tests before spawning a reader — false for
+    /// a device with no `[events]` block, so a def that never pushes anything never arms one.
+    pub fn event_pipe_matches(&self, page: u16, usage: u16, flen: u16) -> bool {
+        self.events
+            .as_ref()
+            .is_some_and(|e| e.usage_page == page && e.usage == usage && e.feature_len == flen)
+    }
+
+    /// Does this def's `[events]` vocabulary declare `kind` at all (any collection)? The CAPABILITY
+    /// check for a UI gate ("is this device's mute hardware-owned") — distinct from
+    /// `event_pipe_matches`, which tests the arming collection rather than the vocabulary's contents.
+    pub fn has_event(&self, kind: EventKind) -> bool {
+        self.events.as_ref().is_some_and(|e| e.reports.values().any(|k| *k == kind))
+    }
+
+    /// Does this def expose ANY operable control surface (a command to run, or a lighting block to
+    /// paint)? A def can be DATA-ONLY — the Seiren V3 Mini's carries just an `[events]` vocabulary
+    /// for hidwatch, with an honest empty `[commands]` — and such a def must not grow a device-list
+    /// row: its user-facing face is its Core-Audio endpoint row, and a second, knob-less HID row is
+    /// exactly the double-listing the unclaimed-footnote rework removed.
+    pub fn is_operable(&self) -> bool {
+        !self.commands.is_empty() || self.lighting.is_some()
     }
 
     /// Every semantic [`Capability`] this device currently exposes (registry-driven). Lets a GUI
@@ -864,6 +932,78 @@ mod tests {
             !reg.knows_family(0x046D, 0x0042, "someother"),
             "a family NOT on this pid is unknown — so its pipe stays adoptable"
         );
+    }
+
+    #[test]
+    fn events_table_parses_and_event_for_matches_lead_bytes() {
+        let src = "\
+            name = \"x\"\n\
+            codename = \"X\"\n\
+            vendor_id = 0x1532\n\
+            transaction_id = 0x1F\n\
+            [[modes]]\n\
+            name = \"usb\"\n\
+            product_id = 0x0001\n\
+            [control_interface]\n\
+            usage_page = 1\n\
+            usage = 2\n\
+            feature_report_len = 64\n\
+            [commands]\n\
+            [events]\n\
+            usage_page = 0x000C\n\
+            usage = 0x0001\n\
+            feature_len = 64\n\
+            [events.reports]\n\
+            \"0511\" = \"mute_state\"\n";
+        let d: DeviceDef = toml::from_str(src).unwrap();
+        assert_eq!(d.event_for(&[0x05, 0x11, 0x01]), Some(EventKind::MuteState));
+        assert_eq!(d.event_for(&[0x05, 0x11]), Some(EventKind::MuteState), "2 lead bytes is enough");
+        // a lead-byte pair the vocabulary doesn't name.
+        assert_eq!(d.event_for(&[0x05, 0x02, 0x00]), None);
+        // too short to carry even the lead pair.
+        assert_eq!(d.event_for(&[0x05]), None);
+        // arming triple: matches only the exact (page, usage, flen) the [events] block declares.
+        assert!(d.event_pipe_matches(0x000C, 0x0001, 64));
+        assert!(!d.event_pipe_matches(0x0001, 0x0002, 64), "wrong collection");
+        assert!(!d.event_pipe_matches(0x000C, 0x0001, 91), "wrong feature length");
+    }
+
+    #[test]
+    fn unknown_event_kind_is_a_load_error() {
+        // An event-name typo must not silently vanish — it fails the whole file's parse (mirrors the
+        // registry's fail-loud stance on an unroutable `dialect`), not a quietly-dropped table entry.
+        let src = "\
+            name = \"x\"\n\
+            codename = \"X\"\n\
+            vendor_id = 0x1532\n\
+            transaction_id = 0x1F\n\
+            [[modes]]\n\
+            name = \"usb\"\n\
+            product_id = 0x0001\n\
+            [control_interface]\n\
+            usage_page = 1\n\
+            usage = 2\n\
+            feature_report_len = 64\n\
+            [commands]\n\
+            [events]\n\
+            usage_page = 0x000C\n\
+            usage = 0x0001\n\
+            feature_len = 64\n\
+            [events.reports]\n\
+            \"0511\" = \"mute_stat3\"\n";
+        assert!(toml::from_str::<DeviceDef>(src).is_err());
+    }
+
+    #[test]
+    fn devices_without_events_round_trip_unchanged() {
+        // mini()/builtins() emit no `[events]` key at all — the field must stay None, not error.
+        let d = mini("x", "X", 0x1532, 0x0001);
+        assert!(d.events.is_none());
+        assert_eq!(d.event_for(&[0x05, 0x11, 0x01]), None);
+        assert!(!d.event_pipe_matches(0x000C, 0x0001, 64));
+        let (naga, bw) = builtins();
+        assert!(naga.events.is_none(), "the Naga's own report map isn't in the registry yet");
+        assert!(bw.events.is_none());
     }
 
     #[test]

@@ -268,6 +268,9 @@ impl AppRuntime {
                 // file) — bump the generation so a same-unit selection re-seeds the panel.
                 self.registry_gen = self.registry_gen.wrapping_add(1);
             }
+            // Keep the app-layer shared cache (hidwatch arming + glue capability gating) in step with
+            // this reload, so a freshly-adopted device's event pipe arms + gates without a restart.
+            crate::hidwatch::reload_registry();
         }
         let infos = match transport::enumerate() {
             Ok(v) => v,
@@ -289,6 +292,12 @@ impl AppRuntime {
             let Some(def) = self.registry.find_for_pipe(i) else {
                 continue;
             };
+            // DATA-ONLY defs (an `[events]` vocabulary with no commands/lighting — the Seiren) never
+            // grow a row: nothing here is operable, and the device's user-facing face is its
+            // Core-Audio endpoint row. A second knob-less HID row would double-list the hardware.
+            if !def.is_operable() {
+                continue;
+            }
             let instance = i.instance();
             // One row per PLANE (unit × family), not per unit: the dedupe key is (instance, dialect)
             // because a multi-family unit carries one control pipe per family and each is its own

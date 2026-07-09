@@ -380,6 +380,9 @@ fn main() {
     // Listen for the device-pushed reports Synapse reads (onboard DPI/scroll-stage button → "now X")
     // and turn them into confirmations — so onboard changes earn a Neuron card, event-driven, no poll.
     // (NEURON_HIDWATCH=1 also dumps raw reports for decoding new devices.)
+    // Install the weak handle FIRST — hidwatch's hardware-mute bridge posts onto the UI thread
+    // through it from a reader thread that starts as soon as `hidwatch::start()` returns.
+    glue::install_ui(weak.clone());
     hidwatch::start();
 
     // ── MACRO KEYS ────────────────────────────────────────────────────────
@@ -532,6 +535,9 @@ fn main() {
                     crate::glue::refresh_selected_plate(app);
                     // and the DEVICE-LIST row the plate belongs under — patched in place, not rebuilt.
                     crate::glue::refresh_plated_row(app);
+                    // (the old ~1s LIVE mic-mute poll that lived here is GONE — a physical tap-mute now
+                    // reaches the device panel event-driven, via hidwatch's registry-driven bridge ->
+                    // glue::notify_hardware_mute, so there's nothing left to poll.)
                 }
 
                 // LINK lamp: lights only while the live loop is alive.

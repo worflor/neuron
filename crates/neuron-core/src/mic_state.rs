@@ -82,6 +82,17 @@ pub fn muted() -> Option<bool> {
     }
 }
 
+/// Publish a device-PUSHED hardware mute event directly into the tri-state (e.g. the Seiren V3
+/// Mini's capacitive tap, bridged to the OS capture mute by `hidwatch::bridge_mic_mute` BEFORE this
+/// call). This is the EVENT feed, not the sampler — it does NOT start `run` — so the honesty
+/// contract stays: the ~8Hz poller (when running) may overwrite this within one tick (~125ms) with
+/// its own read of the OS endpoint, which is correct, not a race, because the caller already
+/// converged the OS mute to `muted` first — the two feeds agree. This call only makes the flip feel
+/// INSTANT instead of waiting for the next poll tick.
+pub fn publish_hardware(muted: bool) {
+    STATE.store(if muted { 2 } else { 1 }, Ordering::Relaxed);
+}
+
 /// Test-only OVERRIDE of the tri-state (0 unknown / 1 live / 2 muted) — stored out-of-band so a
 /// real sampler thread another test started can't race it away mid-assertion.
 #[cfg(test)]
@@ -133,5 +144,20 @@ fn run() {
         };
         STATE.store(state, Ordering::Relaxed);
         thread::sleep(SAMPLE_INTERVAL);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn publish_hardware_stores_the_expected_atomic_state() {
+        // Test the raw STATE, not `muted()` — under cfg(test) `muted()` prefers TEST_OVERRIDE, which
+        // would mask what this function actually stores.
+        publish_hardware(true);
+        assert_eq!(STATE.load(Ordering::Relaxed), 2, "muted must store the MUTED tri-state");
+        publish_hardware(false);
+        assert_eq!(STATE.load(Ordering::Relaxed), 1, "live must store the LIVE tri-state");
     }
 }

@@ -71,7 +71,21 @@ lto = "fat"
 strip = true
 codegen-units = 1
 
-# DEBUG builds: optimize the two crates that carry the hot SOFTWARE-RENDER loop, even in `dev`.
+# DEBUG builds: incremental compilation is OFF for the whole dev profile. This is the ROOT-CAUSE fix
+# for the recurring `LNK2019: unresolved external symbol anon.*.llvm.*` link failures on this project
+# (they surfaced in UNTOUCHED code — serde-derived `serialize` impls — after unrelated edits, i.e. a
+# codegen artifact, not a source bug). Cause: rustc/MSVC mis-handles OPTIMIZED + INCREMENTAL together
+# — at opt-level 3, LLVM internalizes anonymous constants and shares them across codegen units, and
+# the incremental cache then reuses some CGUs while regenerating others, orphaning the object that
+# DEFINES an `anon.*` symbol while a referencing object still points at it (rust-lang/rust #86049,
+# #45929; the documented fix is "disable incremental for optimized builds"). We optimize `neuron-app`
+# and `neuron` at opt-level 3 in dev (below), so this profile IS an optimized build and hits the bug.
+# `incremental` is profile-scoped (Cargo forbids it under `[profile.dev.package.*]`), so it goes here.
+# Cost is ~nil: at opt-level 3 those two crates barely reused incremental state anyway, and the small
+# opt-0 crates recompile fast — reliability beats the ritual `rm -rf target/debug/incremental`.
+[profile.dev]
+incremental = false
+
 # The overlay composites ~0.5M pixels/frame for a weave; at opt-level 0 the per-pixel bounds-checks
 # and un-vectorized float math run ~6–7x slower than release (measured on a large radial cast:
 # ~140ms/frame debug vs ~22ms release), which makes the spellweave crawl in a `cargo run` build.

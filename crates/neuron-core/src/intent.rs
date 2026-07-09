@@ -91,13 +91,23 @@ pub fn run_shared_intent(
             }
         }
         DpiCycle(dir) => {
-            // The CONTRACT is "cycle the active profile's DPI stages". Load them; with stages we land
-            // on the next stage (current → nearest stage → step → wrap). With NO stages defined we
-            // fall back to a ±200 nudge, so a stage-less setup still does something sensible.
-            let stages: Vec<u16> = Profile::load(&cursor.active_profile())
+            // The CONTRACT is "cycle the user's CONFIGURED stages", resolved in trust order:
+            //   1. the active profile's `dpi_stages` (explicit config wins);
+            //   2. else the DEVICE's persisted onboard stage table — what the FEEL page writes and
+            //      what the firmware itself walks in normal mode. This tier keeps the DPI button
+            //      IDENTICAL across the custody line: in driver mode the firmware defers the button
+            //      to us, and "own the buttons" means walking the device's own stages, not a
+            //      software-only list (the empty-profile ±200-nudge regression, 2026-07-08);
+            //   3. else a ±200 nudge, so a genuinely stage-less setup still does something sensible.
+            let profile_stages: Vec<u16> = Profile::load(&cursor.active_profile())
                 .map(|p| p.dpi_stages)
                 .unwrap_or_default();
             let result = devices.with_writable("set_dpi", |d| {
+                let stages = if profile_stages.is_empty() {
+                    crate::writes::read_persisted_dpi_stages(d)
+                } else {
+                    profile_stages.clone()
+                };
                 let cur = cap::dpi(d).map(|(x, _)| x)?;
                 let next = next_dpi(cur, dir.step(), &stages);
                 cap::set_dpi(d, next, next, cap::Store::Volatile)?;

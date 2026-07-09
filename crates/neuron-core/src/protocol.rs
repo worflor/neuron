@@ -104,7 +104,21 @@ pub fn crc(buf: &[u8; BUF_LEN]) -> u8 {
 /// hand-rolled. One frame vocabulary; the loops keep their own PACING (see DIALECT-RND.md:
 /// cadence differences are deliberate calibration behavior, not accidents). `None` means the
 /// buffer is not (yet) our reply — cross-talk from another command, so keep polling.
-pub fn reply_status(b: &[u8; BUF_LEN], class: u8, id: u8) -> Option<Status> {
+///
+/// Takes a SLICE, not `&[u8; BUF_LEN]`: offsets 1/7/8 sit at the SAME place in every razer-family
+/// envelope this codebase speaks — the 91-byte razer_report buffer AND the razer-audio dialect's
+/// 64-byte envelope ([`crate::dialect::RazerAudioDialect`], HARDWARE FACTS-verified on the Seiren
+/// V3 Mini 2026-07-08) — so one echo filter serves both instead of each dialect hand-rolling its
+/// own copy. Every existing caller passes `&[u8; BUF_LEN]`, which coerces to `&[u8]` at the call
+/// site — zero behavior change for razer_report.
+///
+/// Relaxing the parameter from `&[u8; BUF_LEN]` to `&[u8]` gave up the compile-time length proof, so
+/// a runtime guard restores it: a buffer too short to hold offsets 1/7/8 is `None` (not our reply,
+/// keep polling) — a truncated read can never panic here.
+pub fn reply_status(b: &[u8], class: u8, id: u8) -> Option<Status> {
+    if b.len() <= 8 {
+        return None;
+    }
     (b[7] == class && b[8] == id).then(|| Status::from_u8(b[1]))
 }
 
@@ -141,5 +155,9 @@ mod tests {
         // …but a class OR id mismatch is cross-talk, not our reply → None (keep polling).
         assert_eq!(reply_status(&b, 0x04, 0x86), None, "id mismatch");
         assert_eq!(reply_status(&b, 0x00, 0x85), None, "class mismatch");
+        // …and a truncated slice (offsets 1/7/8 out of range) is None, never a panic — the runtime
+        // guard that replaces the lost `&[u8; BUF_LEN]` compile-time length proof.
+        assert_eq!(reply_status(&b[..8], 0x04, 0x85), None, "too short to hold offset 8");
+        assert_eq!(reply_status(&[], 0x04, 0x85), None, "empty slice");
     }
 }

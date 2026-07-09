@@ -403,6 +403,8 @@ impl Dialect for HidppDialect {
             // No lighting: HID++ lighting (feature 0x8070/…) is unspecified this wave.
             lighting: None,
             side_plates: None,
+            // No push-report vocabulary probed this wave — an auto HID++ def carries none.
+            events: None,
         };
 
         // Mint through the cross-dialect seam: tx/dims/stream_wait are all Heuristic/None (HID++ has

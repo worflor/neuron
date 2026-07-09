@@ -1155,17 +1155,40 @@ export component DevicePanel inherits VerticalLayout {
                                 released(v) => { State.set-device-volume(v); }
                             }
                         }
-                        // channel state as ONE two-way SplitToggle (LIVE ↔ MUTED): this is a strictly
-                        // EXCLUSIVE pick (a channel is one or the other), so it belongs on the fused
-                        // index-picked idiom — LampRail is reserved for genuinely multi-select banks (KEY
-                        // GUARD, where several chords light at once). Picking the OTHER cell flips the
-                        // mute; picking the held cell is a no-op (no redundant round-trip).
-                        SplitToggle {
+                        // channel state, RENDERED BY FACET (read × write — see `Dialect::
+                        // audio_mute_writable` / `read_audio_mute`): a control is interactive only when
+                        // there is a PROVEN setter behind it; a read-only hardware mute gets a live
+                        // indicator, never a toggle that would silently no-op against the firmware.
+                        if State.device-mute-writable : SplitToggle {
+                            // WRITABLE — an interactive two-way SplitToggle (LIVE ↔ MUTED) driving the
+                            // endpoint's OS mute, which genuinely silences the stream for BOTH kinds (a
+                            // render endpoint's playback, a capture endpoint's mic signal with a proven
+                            // setter) — so the switch is always functional, never decorative. A strictly
+                            // EXCLUSIVE pick, so it belongs on the fused index-picked idiom — LampRail is
+                            // reserved for genuinely multi-select banks (KEY GUARD). Picking the held
+                            // cell is a no-op.
                             options: ["LIVE", "MUTED"];
                             index: State.device-muted ? 1 : 0;
                             picked(i) => {
                                 if (i == 0 && State.device-muted) { State.toggle-device-mute(); }
                                 if (i == 1 && !State.device-muted) { State.toggle-device-mute(); }
+                            }
+                        }
+                        if !State.device-mute-writable && State.device-mute-hardware : VerticalLayout {
+                            // READ-ONLY hardware mute (e.g. the Seiren): the firmware owns the tap-mute
+                            // register and NO setter is known (an exhaustive getter-oracle sweep proved
+                            // it), so an interactive OS toggle here would contradict the physical LED. A
+                            // non-interactive pill mirrors the live state instead.
+                            spacing: 6px;
+                            Pill {
+                                text: State.device-muted ? "MUTED" : "LIVE";
+                                live: State.device-muted;
+                                live-tint: Theme.danger;
+                            }
+                            Mono {
+                                text: "hardware mute \u{00b7} tap the mic (sensor-owned)";
+                                color: Theme.text-faint;
+                                wrap: word-wrap;
                             }
                         }
                     }

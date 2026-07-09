@@ -73,6 +73,79 @@ impl Flow {
     }
 }
 
+/// THE endpoint-identity predicate: does an OS audio endpoint's display name identify `product`
+/// (a USB product string, a def `name`, or a user-config needle)? Case-insensitive containment —
+/// an OS endpoint name WRAPS the product string (e.g. "Microphone (2- Razer Seiren V3 Mini)"
+/// contains "Razer Seiren V3 Mini"), so containment in this one direction is the identity test.
+///
+/// This is the ONE place that owns the question. Every site that maps between a HID-side product
+/// and a Core-Audio endpoint (`find_capture`/`find_render`, the app's hardware-mute capability
+/// gates, the UI's source-matched mute notify) routes through here, so the scheme has a single
+/// upgrade point when containment someday needs to become something stronger (a container-id
+/// join, say) — and a single set of tests pinning it.
+///
+/// An EMPTY (or all-whitespace) `product` identifies NOTHING and returns false. An empty needle
+/// is a substring of every name, so treating it as a match would resolve "unknown device" to
+/// "whichever endpoint enumerates first" — exactly the wrong-device mute write a review caught.
+/// That invariant is enforced HERE, at the root, not by guard comments at call sites.
+pub fn endpoint_matches_product(endpoint_name: &str, product: &str) -> bool {
+    let p = product.trim();
+    !p.is_empty() && endpoint_name.to_lowercase().contains(&p.to_lowercase())
+}
+
+/// Normalize an OPTIONAL explicit device needle from config/CLI: a PRESENT-BUT-BLANK string
+/// (`device = ""` in a binding, `--device ""` on the CLI) means "no explicit device", exactly like
+/// an absent field — so the resolvers fall through to their preference order. Before this, a blank
+/// needle rode `find_capture("")` straight to "whichever endpoint enumerates first": a silent
+/// wrong-device pick reachable from every config-sourced `device:` field. Shared by
+/// `resolve_capture`/`resolve_render` so the rule can't drift between flows.
+pub fn explicit_needle(device: Option<&str>) -> Option<&str> {
+    device.map(str::trim).filter(|n| !n.is_empty())
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::endpoint_matches_product;
+
+    #[test]
+    fn os_wrapped_product_names_match_case_insensitively() {
+        // the real shape: Windows wraps the USB product string in a form-factor prefix + a
+        // duplicate-ordinal ("2-") — containment must see through both, and through case.
+        assert!(endpoint_matches_product(
+            "Microphone (2- Razer Seiren V3 Mini)",
+            "Razer Seiren V3 Mini"
+        ));
+        assert!(endpoint_matches_product("Microphone (RAZER SEIREN V3 MINI)", "razer seiren v3 mini"));
+        // identity is per-DEVICE: a different mic's endpoint must never claim this product.
+        assert!(!endpoint_matches_product("Microphone (HyperX QuadCast)", "Razer Seiren V3 Mini"));
+        // and a bare fragment still resolves (user-config needles are partial by design).
+        assert!(endpoint_matches_product("Microphone (2- Razer Seiren V3 Mini)", "seiren"));
+    }
+
+    #[test]
+    fn empty_product_identifies_nothing() {
+        // the empty-needle hazard, pinned: "" (and whitespace) is a substring of EVERY endpoint
+        // name, so it must identify NO endpoint — else an unidentified device's mute event would
+        // land on whichever mic enumerates first (the wrong-device write a review caught).
+        assert!(!endpoint_matches_product("Microphone (2- Razer Seiren V3 Mini)", ""));
+        assert!(!endpoint_matches_product("Microphone (2- Razer Seiren V3 Mini)", "   "));
+        assert!(!endpoint_matches_product("", ""));
+    }
+
+    #[test]
+    fn blank_explicit_needle_counts_as_absent() {
+        use super::explicit_needle;
+        // a config field that EXISTS but is blank (`device = ""`) is "no explicit device" — the
+        // resolvers must fall to their preference order, never resolve "" to the first endpoint.
+        assert_eq!(explicit_needle(None), None);
+        assert_eq!(explicit_needle(Some("")), None);
+        assert_eq!(explicit_needle(Some("   ")), None);
+        // a real needle passes through, trimmed (a stray space in config still resolves).
+        assert_eq!(explicit_needle(Some(" seiren ")), Some("seiren"));
+        assert_eq!(explicit_needle(Some("Razer Seiren V3 Mini")), Some("Razer Seiren V3 Mini"));
+    }
+}
+
 #[cfg(windows)]
 mod imp {
     use super::{Endpoint, Flow};
@@ -886,20 +959,23 @@ mod imp {
         }
     }
 
-    /// Find the first capture endpoint whose name contains `needle` (case-insensitive).
+    /// Find the first capture endpoint that IDENTIFIES as `needle` (the shared
+    /// [`super::endpoint_matches_product`] predicate — case-insensitive containment, and an EMPTY
+    /// needle identifies NOTHING, so this returns `None` rather than an arbitrary first mic).
     /// This is how a binding resolves "my real mic" to a concrete endpoint id.
     pub fn find_capture(needle: &str) -> Option<Endpoint> {
-        let n = needle.to_lowercase();
         // light path: we only need name+id to resolve, not every endpoint's volume.
         collect(Flow::Capture, false)
             .into_iter()
-            .find(|e| e.name.to_lowercase().contains(&n))
+            .find(|e| super::endpoint_matches_product(&e.name, needle))
     }
 
     /// Resolve the capture endpoint to act on: explicit needle, else the user's Razer/Seiren
     /// mic, else the system's first capture endpoint. Shared by the CLI and the run daemon.
+    /// A blank explicit needle counts as absent ([`super::explicit_needle`]) — it falls to the
+    /// preference order, never to "first endpoint".
     pub fn resolve_capture(device: Option<&str>) -> Option<Endpoint> {
-        if let Some(n) = device {
+        if let Some(n) = super::explicit_needle(device) {
             return find_capture(n);
         }
         for needle in ["seiren", "razer"] {
@@ -910,21 +986,22 @@ mod imp {
         collect(Flow::Capture, false).into_iter().next()
     }
 
-    /// Find the first RENDER endpoint (speakers / headphones / sound card) whose name contains
-    /// `needle` (case-insensitive) — the output mirror of [`find_capture`].
+    /// Find the first RENDER endpoint (speakers / headphones / sound card) that identifies as
+    /// `needle` — the output mirror of [`find_capture`], same shared identity predicate (empty
+    /// needle → `None`).
     pub fn find_render(needle: &str) -> Option<Endpoint> {
-        let n = needle.to_lowercase();
         collect(Flow::Render, false)
             .into_iter()
-            .find(|e| e.name.to_lowercase().contains(&n))
+            .find(|e| super::endpoint_matches_product(&e.name, needle))
     }
 
     /// Resolve the RENDER endpoint to act on (headset / sound card / speakers): explicit needle,
     /// else the actual system DEFAULT output (the device whose volume the OSD shows), falling back
     /// to the first active render endpoint. Generic — no hardcoded device; works for any
-    /// headphone/sound-card the OS exposes.
+    /// headphone/sound-card the OS exposes. A blank explicit needle counts as absent, same as
+    /// [`resolve_capture`].
     pub fn resolve_render(device: Option<&str>) -> Option<Endpoint> {
-        if let Some(n) = device {
+        if let Some(n) = super::explicit_needle(device) {
             return find_render(n);
         }
         let all = collect(Flow::Render, false);
@@ -1032,9 +1109,10 @@ mod imp {
             names
                 .iter()
                 .filter_map(|n| {
-                    let nl = n.to_lowercase();
+                    // the shared identity predicate: a BLANK config entry identifies nothing (it
+                    // is skipped like a disconnected device), never "the first endpoint".
                     all.iter()
-                        .find(|e| e.name.to_lowercase().contains(&nl))
+                        .find(|e| super::endpoint_matches_product(&e.name, n))
                         .cloned()
                 })
                 .collect()

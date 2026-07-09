@@ -13,9 +13,22 @@
 //!   `05 0e <plate_id:u8> …`             → a swappable SIDE PLATE was attached/detached. `plate_id`
 //!                                          is a hardware strap-code (0=detached); resolved to a label
 //!                                          via the registry `[side_plates]` map, de-dup'd on change.
+//!   `05 11 <state:u8> …`                → an AUDIO device's capacitive TAP-MUTE toggled (Razer Seiren
+//!                                          V3 Mini family, pid 0x056a; captured live 2026-07-08).
+//!                                          `state` 0=live/green, 1=muted/red. This vocabulary is now
+//!                                          FAMILY knowledge on the `razer-audio` dialect
+//!                                          (`Dialect::default_event_for`), not a hardcoded arm here —
+//!                                          a def's own `[events]` table (`DeviceDef::event_for`)
+//!                                          still OVERRIDES it per device when one is present. The
+//!                                          firmware owns the mute+LED self-contained; we bridge it to
+//!                                          the OS capture mute so the tap drives the UI pill + apps
+//!                                          (the role a Synapse install used to play). See
+//!                                          `bridge_mic_mute`.
 //! De-dup for the DPI/scroll echoes lives in `confirm`; the battery/charge edge logic + throttle live
-//! in `neuron::vitals`. A hotplug MONITOR re-arms collections after a dongle replug. Verified on the
-//! Naga V2 Pro family; when more devices are captured the report map should move to the registry.
+//! in `neuron::vitals`. A hotplug MONITOR re-arms collections after a dongle replug. The 04/05 MOUSE
+//! arms above (DPI/scroll/power/plate) remain a hardcoded vocabulary pinned to the Naga V2 Pro family
+//! — only the `05 11` mute event has moved to the registry `[events]` map so far; the rest move the
+//! same way as their defs grow `[events]` entries.
 //!
 //! DRIVER-MODE BUTTON EVENTS — a SECOND report family, the `04` lead byte, captured live off the Naga
 //! V2 Pro (pid 0x00A8) 2026-07-07. In driver mode (device_mode 0x03) the firmware STOPS acting on its
@@ -32,6 +45,7 @@
 //! `NEURON_HIDWATCH=1` additionally logs every raw report as hex (for decoding new devices) and the
 //! (otherwise-silent) battery-read failures.
 
+use neuron::registry::EventKind;
 use neuron::transport::DevicePath;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -68,9 +82,36 @@ fn verbose() -> bool {
 /// The device registry, loaded ONCE and cached. Battery reads used to re-parse the device TOMLs from
 /// disk on every poke + throttled sample; the registry is immutable at runtime, so this kills all that
 /// hot-path I/O.
-fn registry() -> Option<&'static neuron::registry::Registry> {
-    static R: OnceLock<Option<neuron::registry::Registry>> = OnceLock::new();
-    R.get_or_init(|| neuron::registry::Registry::load().ok()).as_ref()
+/// The app-layer registry — the ONE shared, RELOADABLE cache both `hidwatch` (arming, battery) and
+/// `glue` (endpoint capability gating) read, so both track the runtime's normal reload path instead
+/// of freezing a startup snapshot until restart (the reload-mismatch a review caught). It returns
+/// `&'static` on purpose: `event_def` is threaded into background reader threads and held for the
+/// reader's life, so it must outlive any borrow. To stay `&'static` AND reloadable, [`reload_registry`]
+/// LEAKS a fresh `Registry` and swaps the pointer — old readers keep their still-valid leaked snapshot,
+/// new arms see the new one. The leak is bounded by adoption events (rare — a few per session at most),
+/// not a per-frame cost, which is the deliberate trade for keeping the zero-alloc `&'static` reader path.
+pub fn registry() -> Option<&'static neuron::registry::Registry> {
+    let mut cell = reg_cell().lock().unwrap_or_else(|p| p.into_inner());
+    if cell.is_none() {
+        *cell = neuron::registry::Registry::load()
+            .ok()
+            .map(|r| &*Box::leak(Box::new(r)));
+    }
+    *cell
+}
+
+/// Re-read the registry from disk and swap it in — called from the runtime's `synth_dirty` reload
+/// path (an adoption wrote a new `devices/auto/*.toml`) so hidwatch arming + glue capability gating
+/// see the newly-adopted/edited defs on the next re-arm/select, not only after a restart.
+pub fn reload_registry() {
+    if let Ok(r) = neuron::registry::Registry::load() {
+        *reg_cell().lock().unwrap_or_else(|p| p.into_inner()) = Some(&*Box::leak(Box::new(r)));
+    }
+}
+
+fn reg_cell() -> &'static Mutex<Option<&'static neuron::registry::Registry>> {
+    static R: OnceLock<Mutex<Option<&'static neuron::registry::Registry>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(None))
 }
 
 /// Arm the listener: a reader thread per readable, event-carrying collection of each connected Razer
@@ -115,21 +156,40 @@ fn arm_new(mouse_pids: &HashSet<u16>, armed: &Arc<Mutex<HashSet<DevicePath>>>) {
     };
     let mut spawned = 0usize;
     for info in infos {
-        if info.vid != neuron::synth::RAZER_VID || !mouse_pids.contains(&info.pid) {
-            continue;
-        }
-        // Where Razer's event reports ride: the sibling generic-desktop collection with the undefined
-        // usage (`u=0x0000`) or a vendor page. Skip the OS-protected mouse collection + media keys.
-        let event_carrying =
-            (info.usage_page == 0x0001 && info.usage == 0x0000) || info.usage_page >= 0xFF00;
-        if !event_carrying {
+        // Three ways a readable collection earns a reader — each carries its OWN vendor/shape gate,
+        // so there is no blanket VID filter above them (an earlier `vid != RAZER_VID continue` made
+        // the two family-general paths a lie: a non-razer family's event pipe would be dropped before
+        // it was ever checked). Now the emergence in the doc matches the code — a pipe arms purely
+        // from what claims it:
+        //   • a DPI-mouse's sibling generic-desktop collection (undefined usage `u=0x0000`) or a
+        //     vendor page — the 04/05 button/settings reports; gated to the Razer DPI-mouse pid set
+        //     (`mouse_pids`), which is itself Razer-only, so this path stays Razer by construction;
+        //   • ANY registry def's declared event-pipe (`DeviceDef::event_pipe_matches`) — the PER-
+        //     DEVICE override from `[events]` DATA; vendor-matched (`vendor_id == info.vid`) so a pid
+        //     collision across vendors can't mis-arm;
+        //   • ANY dialect's FAMILY-wide push vocabulary (`neuron::dialect::event_dialect_for`) — the
+        //     dialect's own `claims` carries its vendor/shape signature (razer-audio pins Razer VID +
+        //     000c/0001/64B), so a future non-Razer family with an events pipe arms here too, from
+        //     SHAPE alone, with no def anywhere.
+        // Skip the OS-protected mouse collection + plain media keys (0-length feature report).
+        let is_mouse_event = mouse_pids.contains(&info.pid)
+            && ((info.usage_page == 0x0001 && info.usage == 0x0000) || info.usage_page >= 0xFF00);
+        let event_def = registry().and_then(|r| {
+            r.devices.iter().find(|d| {
+                d.vendor_id == info.vid
+                    && d.product_ids().any(|p| p == info.pid)
+                    && d.event_pipe_matches(info.usage_page, info.usage, info.feature_len)
+            })
+        });
+        let event_dialect = neuron::dialect::event_dialect_for(&info);
+        if !(is_mouse_event || event_def.is_some() || event_dialect.is_some()) {
             continue;
         }
         // claim this collection (HashSet::insert is false if already armed → skip)
         if !armed.lock().unwrap().insert(info.path.clone()) {
             continue;
         }
-        spawn_reader(info.pid, info.path.clone(), armed.clone());
+        spawn_reader(info.pid, info.path.clone(), armed.clone(), event_def, event_dialect, info.product.clone());
         spawned += 1;
     }
     if verbose() && spawned > 0 {
@@ -137,8 +197,23 @@ fn arm_new(mouse_pids: &HashSet<u16>, armed: &Arc<Mutex<HashSet<DevicePath>>>) {
     }
 }
 
-fn spawn_reader(pid: u16, path: DevicePath, armed: Arc<Mutex<HashSet<DevicePath>>>) {
+fn spawn_reader(
+    pid: u16,
+    path: DevicePath,
+    armed: Arc<Mutex<HashSet<DevicePath>>>,
+    def: Option<&'static neuron::registry::DeviceDef>,
+    dialect: Option<&'static dyn neuron::dialect::Dialect>,
+    product: String,
+) {
     let tag = format!("pid={pid:04x}");
+    // Record this collection's product string in the emergent capability surface (see
+    // `hardware_mute_products`'s doc) THE MOMENT a dialect-claimed events collection arms — before we
+    // know it will ever push anything — so glue's capability check can resolve it as soon as it's
+    // live. The insertion RULE (empty never lands; the write facet only on a proven setter) lives in
+    // `note_audio_capability`, where tests pin it.
+    if let Some(d) = dialect {
+        note_audio_capability(d, &product);
+    }
     thread::Builder::new()
         .name("neuron-hidwatch".into())
         .spawn(move || {
@@ -155,6 +230,20 @@ fn spawn_reader(pid: u16, path: DevicePath, armed: Arc<Mutex<HashSet<DevicePath>
             if verbose() {
                 eprintln!("[hidwatch] LISTENING {tag}");
             }
+            // AUTHORITATIVE SEED: a best-effort one-shot read of the current mute state, ONCE per arm,
+            // so the UI is correct from launch — not only after the first tap. Opens its own FEATURE
+            // transport on the same collection (the reader handle above is INPUT-only); any failure
+            // (device asleep, not this family) is silently skipped — this is a seed, not a requirement.
+            // Runs on this reader's own thread, before the read loop starts, so it costs no extra thread.
+            if let Some(d) = dialect {
+                if !product.is_empty() {
+                    if let Ok(t) = neuron::transport::open_path(&path) {
+                        if let Some(muted) = d.read_audio_mute(t.as_ref()) {
+                            bridge_mic_mute(&product, muted);
+                        }
+                    }
+                }
+            }
             let mut buf = [0u8; 64];
             loop {
                 match reader.read(&mut buf) {
@@ -166,7 +255,7 @@ fn spawn_reader(pid: u16, path: DevicePath, armed: Arc<Mutex<HashSet<DevicePath>
                             }
                             eprintln!();
                         }
-                        decode(&buf[..n], pid);
+                        decode(&buf[..n], pid, def, dialect, &product);
                         // lazy battery freshness — piggyback on activity (the device is awake; it's
                         // sending reports), throttled, off-thread so a slow open never stalls reads.
                         if neuron::vitals::due(pid, false) {
@@ -196,9 +285,138 @@ fn spawn_reader(pid: u16, path: DevicePath, armed: Arc<Mutex<HashSet<DevicePath>
         .ok();
 }
 
+/// Record an arming, dialect-claimed collection's product string on the emergent capability
+/// surface(s): the READ facet always, the WRITE facet only when the arming dialect PROVED a setter
+/// (`Dialect::audio_mute_writable` — today never: razer-audio is read-only, hidpp/razer have no audio
+/// concept; the plumbing is ready for a future writable family with zero call-site changes).
+///
+/// The insertion INVARIANT, pinned by tests below: an EMPTY (or blank) product is NEVER inserted.
+/// These stores hold needles for `neuron::audio::endpoint_matches_product`, whose contract is that an
+/// empty needle identifies nothing — the stores must only ever hold strings that can actually resolve
+/// an endpoint, so a nameless collection simply doesn't surface a capability.
+fn note_audio_capability(dialect: &dyn neuron::dialect::Dialect, product: &str) {
+    let product = product.trim();
+    if product.is_empty() {
+        return;
+    }
+    mute_products_store().lock().unwrap().insert(product.to_string());
+    if dialect.audio_mute_writable() {
+        mute_writable_store().lock().unwrap().insert(product.to_string());
+    }
+}
+
+/// The emergent capability surface glue reads: audio-product names discovered from LIVE claiming (a
+/// dialect-claimed events collection actually arming), never from any def. Insert-only — a replug
+/// re-inserts the same string, harmlessly; nothing is ever removed, so a momentary read race can never
+/// see a product vanish mid-session. Lazily created (a `HashSet` can't init a `const` static).
+fn mute_products_store() -> &'static Mutex<HashSet<String>> {
+    static S: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Snapshot of every USB product string a hardware-mute-pushing collection has armed under, this
+/// session. `glue::endpoint_has_hardware_mute` reads this to decide whether an audio endpoint's mute
+/// is hardware-owned — discovered from what the dialect layer actually CLAIMED and armed, not from a
+/// registry def (a def with its own `[events]` MuteState entry is a SEPARATE, additional check there).
+pub fn hardware_mute_products() -> Vec<String> {
+    mute_products_store().lock().unwrap().iter().cloned().collect()
+}
+
+/// The WRITE facet's own store, lazily created — mirrors [`mute_products_store`].
+fn mute_writable_store() -> &'static Mutex<HashSet<String>> {
+    static S: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// The emergent WRITE-facet surface: a product lands here ONLY when its arming dialect's
+/// `audio_mute_writable()` is true (today: never — see `spawn_reader`; the plumbing is ready for a
+/// writable-mute family).
+pub fn mute_writable_products() -> Vec<String> {
+    mute_writable_store().lock().unwrap().iter().cloned().collect()
+}
+
+/// Bridge an audio device's firmware tap-mute (its pushed `05 11 <state>`-shaped report) to the
+/// OS/Core-Audio capture mute, the shared mic-state provider, and the UI — the MuteState handler for
+/// [`decode`]. Setting the OS mute lights up the whole chain the resident dispatch loop already
+/// watches (Discord/games follow the OS mute the same way Synapse used to drive it), with no extra UI
+/// plumbing beyond the two explicit nudges below.
+///
+/// Off-thread: endpoint resolution + `VolumeCtl::open` do COM enumeration that must never stall this
+/// reader loop. Idempotent (setting the mute it already has is harmless), so a duplicate report is a
+/// no-op. Cross-platform via the `audio` seam — off Windows endpoint resolution returns `None`, so
+/// this compiles and no-ops with zero cfg here.
+///
+/// Endpoint resolution is BY DEVICE IDENTITY, not a global guess: `find_capture(product)` resolves
+/// via the ONE shared identity predicate (`neuron::audio::endpoint_matches_product` — the endpoint's
+/// Core-Audio name contains the USB product string, e.g. "Microphone (2- Razer Seiren V3 Mini)"
+/// contains "Razer Seiren V3 Mini") — so a second capture device never receives THIS device's mute.
+/// `product` is the arming collection's OWN USB product string (not a def's `name`, which may not
+/// exist at all for a dialect-only arm). There is deliberately NO fallback to a generic
+/// `resolve_capture(None)` guess: an unresolvable event is not bridged (see below).
+///
+/// ORDER MATTERS: (1) the OS mute FIRST, so any poller that races this reads the already-converged
+/// state; (2) `mic_state::publish_hardware` so the shared provider (and anything reading it, like the
+/// `miclight` pattern) flips instantly instead of waiting for its own next sample; (3) the UI nudge
+/// last, once the truth it will read is already settled.
+fn bridge_mic_mute(product: &str, muted: bool) {
+    if product.trim().is_empty() {
+        // No USB product string → we cannot identify WHICH capture endpoint pushed this, and a
+        // generic guess (resolve_capture(None)) would set the mute on whatever default/first mic that
+        // returns — a real WRONG-DEVICE write, not a stale readout. With nothing to match on, the tap
+        // is simply not bridged — nothing downstream either: publishing to the shared provider or
+        // nudging the UI for a device we can't name would be the same wrong-device lie in softer
+        // form. (`find_capture("")` is ALSO a no-match by the predicate's own contract now — this
+        // early return is the honest log line + skipping the pointless thread, not the safety.)
+        // (A dialect-armed pipe on real Razer hardware always reports a product string.)
+        if verbose() {
+            eprintln!("[hidwatch] mute event with no product string — not bridged (endpoint unidentifiable)");
+        }
+        return;
+    }
+    let product = product.to_string();
+    thread::spawn(move || {
+        // DEVICE-PRECISE: only the capture endpoint whose Core-Audio name CONTAINS this device's USB
+        // product string. NO resolve_capture(None) fallback — on a name miss (localized/stripped
+        // endpoint string) we skip the OS write entirely: an honest no-op beats muting someone else's
+        // mic. The UI row still learns of the tap via `notify_hardware_mute`, matched by the SAME
+        // product, so a miss here degrades to "OS doesn't follow" for that one device, never a
+        // cross-device write.
+        if let Some(ep) = neuron::audio::find_capture(&product) {
+            if let Some(ctl) = neuron::audio::VolumeCtl::open(&ep.id) {
+                ctl.set_mute(muted);
+            }
+        }
+        neuron::mic_state::publish_hardware(muted);
+        crate::glue::notify_hardware_mute(&product, muted);
+    });
+}
+
 /// Translate one device-pushed report into the right action. De-dup / edge logic live downstream.
-fn decode(buf: &[u8], pid: u16) {
+/// `def` is the registry def whose event pipe armed this collection (`None` for a plain mouse
+/// collection, or a dialect-only arm with no def loaded); `dialect` is the family that PUSHES events
+/// on this collection's shape (`None` when neither a def nor a dialect claims it — unreachable in
+/// practice, since `arm_new` only spawns a reader when at least one of the three arming conditions
+/// holds). Event resolution order: `def.event_for` FIRST (the per-device OVERRIDE) then
+/// `dialect.default_event_for` (the family fallback) — so a device with its own `[events]` table
+/// always wins over the family's generic vocabulary, and a device with NO def (or an empty auto one)
+/// still gets the family's events. `product` is the arming collection's own USB product string, used
+/// (not `def.name`, which may not exist) to resolve the OS capture endpoint in `bridge_mic_mute`.
+fn decode(
+    buf: &[u8],
+    pid: u16,
+    def: Option<&'static neuron::registry::DeviceDef>,
+    dialect: Option<&'static dyn neuron::dialect::Dialect>,
+    product: &str,
+) {
     if buf.len() < 6 {
+        return;
+    }
+    // REGISTRY-DRIVEN EVENTS FIRST (a def's own `[events]` table, e.g. a curated Seiren-class def),
+    // else the FAMILY vocabulary (`Dialect::default_event_for`, e.g. razer-audio's `05 11` tap-mute) —
+    // ahead of the 04/05 hardcoded families below so either always wins. The resolution chain +
+    // payload read are pure (`mute_event_state`) so tests pin them without touching the OS mute.
+    if let Some(muted) = mute_event_state(buf, def, dialect) {
+        bridge_mic_mute(product, muted);
         return;
     }
     // 04-FAMILY: the DRIVER-MODE deferred-button vocabulary (see module header). The firmware, having
@@ -316,6 +534,28 @@ fn decode(buf: &[u8], pid: u16) {
             // Wire it here, off this same de-dup'd edge, so a swap both cards AND switches in one place.
         }
         _ => {}
+    }
+}
+
+/// The PURE half of the hardware-mute event path: resolve one pushed report against the two-layer
+/// event vocabulary and, when it names a MuteState, read the state bit the payload carries
+/// (`report[2]`: 0=live, 1=muted). Resolution order is the contract [`decode`] promises — a def's own
+/// `[events]` table FIRST (the per-device OVERRIDE), the family vocabulary
+/// (`Dialect::default_event_for`) second — so a device with a curated def always wins over the
+/// family's generic map, and a device with NO def still speaks via its family. `None` = this report
+/// carries no mute event (or is too short to carry the state bit) — the caller falls through to the
+/// other report families. No I/O, no globals: the side-effectful bridging stays in
+/// [`bridge_mic_mute`], which is why tests can pin this chain without touching the OS mute.
+fn mute_event_state(
+    buf: &[u8],
+    def: Option<&neuron::registry::DeviceDef>,
+    dialect: Option<&dyn neuron::dialect::Dialect>,
+) -> Option<bool> {
+    let event = def
+        .and_then(|d| d.event_for(buf))
+        .or_else(|| dialect.and_then(|d| d.default_event_for(buf)));
+    match event? {
+        EventKind::MuteState => (buf.len() >= 3).then(|| buf[2] != 0),
     }
 }
 
@@ -722,7 +962,7 @@ mod tests {
         buf[1] = b1;
         buf[2] = b2;
         buf[3] = b3;
-        decode(&buf, NAGA_PID);
+        decode(&buf, NAGA_PID, None, None, "");
     }
     fn dpi_report(dpi: u16) {
         let [hi, lo] = dpi.to_be_bytes();
@@ -737,6 +977,24 @@ mod tests {
     // Long enough for the settle thread to fire and finish before we assert.
     fn settle() {
         thread::sleep(BATCH_SETTLE + Duration::from_millis(150));
+    }
+
+    #[test]
+    fn registry_cache_swaps_on_reload_instead_of_freezing_startup() {
+        // The reload-mismatch pin: this cache is the ONE app-layer registry both hidwatch (arming)
+        // and glue (capability gating) read, and the runtime's `synth_dirty` reload path calls
+        // `reload_registry()` on it. A regression back to a frozen OnceLock snapshot would make an
+        // adopted def appear in the device list while event arming + mute gating kept the startup
+        // snapshot until restart — so pin that a reload actually SWAPS the snapshot. (Old readers
+        // keeping their previous leaked snapshot is by design; new reads must see the new one.)
+        let before = registry().expect("registry loads on a dev checkout")
+            as *const neuron::registry::Registry;
+        reload_registry();
+        let after = registry().expect("registry reloads") as *const neuron::registry::Registry;
+        assert!(
+            !std::ptr::eq(before, after),
+            "reload_registry must swap in a freshly loaded snapshot, not keep the startup one"
+        );
     }
 
     #[test]
@@ -816,8 +1074,8 @@ mod tests {
     fn decode_ignores_short_or_foreign_reports() {
         // the existing guards must still hold — a non-0x05 lead byte or a too-short buffer is a no-op
         // (no panic), so the new arm can't destabilize the DPI/scroll/charge decoding.
-        decode(&[0x05, 0x0e], NAGA_PID); // too short (< 6) — guarded
-        decode(&[0x02, 0x0e, 0x03, 0, 0, 0], NAGA_PID); // neither 04 nor 05 lead byte — guarded
+        decode(&[0x05, 0x0e], NAGA_PID, None, None, ""); // too short (< 6) — guarded
+        decode(&[0x02, 0x0e, 0x03, 0, 0, 0], NAGA_PID, None, None, ""); // neither 04 nor 05 lead byte — guarded
     }
 
     #[test]
@@ -827,6 +1085,107 @@ mod tests {
         assert!(matches!(button_intent(0x52), Some(Intent::DpiCycle(Direction::Up))));
         assert!(matches!(button_intent(0x57), Some(Intent::ScrollStageCycle(Direction::Up))));
         assert!(matches!(button_intent(0x50), Some(Intent::ProfileCycle(Direction::Up))));
+    }
+
+    // ── the hardware-mute event path, pinned WITHOUT hardware or the OS mute ────────────────────
+    // `mute_event_state` is the pure resolution chain `decode` promises; these mint a def from TOML
+    // (the only public constructor, same as registry.rs's own tests) and resolve the real
+    // razer-audio dialect by its live pipe signature — no stubs, the actual production layers.
+
+    /// The razer-audio family, resolved exactly the way `arm_new` resolves it: by claiming the
+    /// Seiren-class pipe shape (Razer VID + usage 000c/0001 + 64-byte feature report).
+    fn razer_audio() -> &'static dyn neuron::dialect::Dialect {
+        let info = neuron::transport::HidDeviceInfo {
+            vid: 0x1532,
+            pid: 0x056A,
+            usage_page: 0x000C,
+            usage: 0x0001,
+            feature_len: 64,
+            input_len: 0,
+            output_len: 0,
+            path: neuron::transport::DevicePath::from_str_for_tests("test-pipe"),
+            product: "Razer Seiren V3 Mini".into(),
+        };
+        neuron::dialect::event_dialect_for(&info).expect("razer-audio claims its own signature")
+    }
+
+    /// A minimal def whose `[events]` table names a NON-family lead pair (`05 02`) as MuteState —
+    /// distinguishable from razer-audio's family `05 11`, so the tests can see WHICH layer answered.
+    fn def_with_events() -> neuron::registry::DeviceDef {
+        toml::from_str(
+            "name = \"Test Seiren\"\ncodename = \"test-seiren\"\nvendor_id = 5426\ntransaction_id = 0x1F\n\
+             [[modes]]\nname = \"wired\"\nproduct_id = 1386\n\
+             [control_interface]\nusage_page = 1\nusage = 2\nfeature_report_len = 91\n\
+             [commands]\n\
+             [events]\nusage_page = 12\nusage = 1\nfeature_len = 64\n\
+             [events.reports]\n\"0502\" = \"mute_state\"\n",
+        )
+        .expect("test def parses")
+    }
+
+    #[test]
+    fn mute_event_resolves_def_override_first_then_family_fallback() {
+        let def = def_with_events();
+        let fam = razer_audio();
+        // the def's OWN vocabulary answers for a lead pair the family doesn't know: the override layer.
+        assert_eq!(
+            mute_event_state(&[0x05, 0x02, 0x01, 0, 0, 0], Some(&def), Some(fam)),
+            Some(true),
+            "a def's [events] entry must resolve even when the family vocabulary is silent"
+        );
+        // the family vocabulary still answers THROUGH a present-but-silent def: the fallback layer.
+        assert_eq!(
+            mute_event_state(&[0x05, 0x11, 0x00, 0, 0, 0], Some(&def), Some(fam)),
+            Some(false),
+            "a family push must survive a def that doesn't name it"
+        );
+        // a def-less (auto/empty) arm still speaks via its family — the emergence the dialect layer buys.
+        assert_eq!(mute_event_state(&[0x05, 0x11, 0x01, 0, 0, 0], None, Some(fam)), Some(true));
+        // and a def-only arm needs no dialect.
+        assert_eq!(mute_event_state(&[0x05, 0x02, 0x00, 0, 0, 0], Some(&def), None), Some(false));
+    }
+
+    #[test]
+    fn mute_event_ignores_foreign_short_and_unclaimed_reports() {
+        let def = def_with_events();
+        let fam = razer_audio();
+        // a lead pair NEITHER layer names is not a mute event — decode falls through to 04/05 arms.
+        assert_eq!(mute_event_state(&[0x05, 0x3a, 0x01, 0, 0, 0], Some(&def), Some(fam)), None);
+        // no def and no dialect (a plain mouse collection) can never produce one.
+        assert_eq!(mute_event_state(&[0x05, 0x11, 0x01, 0, 0, 0], None, None), None);
+        // too short to carry the state bit → not an event, never a guessed state.
+        assert_eq!(mute_event_state(&[0x05, 0x11], None, Some(fam)), None);
+    }
+
+    #[test]
+    fn capability_surface_never_learns_an_empty_product() {
+        // the stores hold needles for `endpoint_matches_product`, whose contract is "empty
+        // identifies nothing" — so an arm with a stripped/blank product must surface NO capability.
+        let fam = razer_audio();
+        note_audio_capability(fam, "");
+        note_audio_capability(fam, "   ");
+        assert!(
+            hardware_mute_products().iter().all(|p| !p.trim().is_empty()),
+            "a blank product must never land on the capability surface"
+        );
+    }
+
+    #[test]
+    fn capability_surface_learns_read_facet_but_not_unproven_write() {
+        let fam = razer_audio();
+        // a unique name so this test owns its entry in the process-shared, insert-only store.
+        let product = "Test Capability Mic 7f3a";
+        note_audio_capability(fam, product);
+        assert!(
+            hardware_mute_products().iter().any(|p| p == product),
+            "an arming dialect-claimed collection must surface the READ facet"
+        );
+        // razer-audio is read-only (`audio_mute_writable` = false): the WRITE facet must stay
+        // empty of it — the UI renders an indicator, never a toggle that would fight the firmware LED.
+        assert!(
+            !mute_writable_products().iter().any(|p| p == product),
+            "a read-only family must never surface the WRITE facet"
+        );
     }
 
     #[test]

@@ -111,6 +111,45 @@ pub trait Dialect: Send + Sync {
         let _ = (t, def);
         Ok(())
     }
+
+    /// The dialect's own device-PUSHED event vocabulary, when it has one that applies FAMILY-WIDE —
+    /// as opposed to a per-device registry `[events]` block (`DeviceDef::event_for`), which is a
+    /// per-device OVERRIDE checked first by callers (`hidwatch::decode`). Default `None`: razer and
+    /// hidpp push nothing this seam knows about (their existing per-device `[events]` path is
+    /// unaffected). A dialect that DOES know a family-wide push vocabulary — e.g. razer-audio's tap-
+    /// mute report, HARDWARE-CAPTURED on the Seiren V3 Mini (2026-07-08) and heuristically assumed
+    /// family-wide until a counterexample — overrides this alongside [`Dialect::pushes_events`].
+    fn default_event_for(&self, report: &[u8]) -> Option<crate::registry::EventKind> {
+        let _ = report;
+        None
+    }
+
+    /// Does this dialect push HID input reports at all on `info`'s collection? The FAMILY-level arming
+    /// question [`event_dialect_for`] answers, alongside a def's own `event_pipe_matches` (the per-
+    /// device question) — `hidwatch::arm_new` arms a collection when EITHER says yes. Default `false`:
+    /// a dialect with no family-wide push vocabulary never arms a collection on its own say-so.
+    fn pushes_events(&self, info: &HidDeviceInfo) -> bool {
+        let _ = info;
+        false
+    }
+
+    /// The audio-mute WRITE facet: is there a PROVEN setter for this family's tap-mute? Default
+    /// `false` — a mute setter is never assumed, and NEVER destructively probed at runtime; a family
+    /// earns `true` only by overriding this with a hardware-verified command. Paired with
+    /// [`read_audio_mute`] (the READ facet); the UI (glue's `endpoint_mute_writable`) renders an
+    /// interactive control only when both facets are real.
+    fn audio_mute_writable(&self) -> bool {
+        false
+    }
+
+    /// The audio-mute authoritative READ: ask the device its CURRENT mute state right now, rather than
+    /// waiting for the next push. Default `None` — a dialect with no such getter (or no audio concept
+    /// at all) has nothing to answer with. `Err`/timeout from an override should also collapse to
+    /// `None` (device asleep / not this family) — this is a best-effort seed, never a hard requirement.
+    fn read_audio_mute(&self, t: &dyn Transport) -> Option<bool> {
+        let _ = t;
+        None
+    }
 }
 
 /// Build the outgoing 91-byte razer_report feature buffer once, in ONE place. Both [`exec`] and
@@ -265,15 +304,277 @@ impl Dialect for RazerDialect {
 /// The one razer instance the registry hands out. A ZST, so `&RAZER` is a cheap `'static` handle.
 static RAZER: RazerDialect = RazerDialect;
 
+/// The Consumer-Control usage pair the razer-audio family's control pipe rides (Seiren V3 Mini,
+/// hardware-verified 2026-07-08) — distinct from razer_report's mouse/keyboard vendor placement.
+const AUDIO_USAGE_PAGE: u16 = 0x000C;
+const AUDIO_USAGE: u16 = 0x0001;
+/// The razer-audio family's feature-report length — a 64-byte envelope, not razer_report's 91.
+const AUDIO_FEATURE_LEN: u16 = 64;
+/// The razer-audio envelope's HID report id (buf[0]) — razer_report's is 0x00.
+const AUDIO_REPORT_ID: u8 = 0x07;
+/// The razer-audio envelope's total buffer length.
+const AUDIO_BUF_LEN: usize = 64;
+/// The command BODY inside the audio envelope: buf[9..62], 53 bytes (vs razer_report's 80-byte
+/// body at buf[9..89]) — buf[62] is CRC, buf[63] is reserved.
+const AUDIO_BODY_LEN: usize = 53;
+/// The transaction id [`RazerAudioDialect::read_audio_mute`] frames its getter with — the same
+/// era-heuristic 0x1F [`RazerAudioDialect::probe`] stamps on every synthesized def (the one value this
+/// family's live session actually saw ACK a getter).
+const AUDIO_MUTE_READ_TX: u8 = 0x1F;
+
+/// Razer's SECOND wire family (dialect #3): its audio-peripheral control pipe — a 64-byte feature
+/// envelope, HID report id 0x07, on the device's Consumer-Control collection rather than
+/// razer_report's mouse/keyboard vendor placement. Hardware-verified live on a Seiren V3 Mini
+/// (vid 0x1532 pid 0x056A, 2026-07-08): getters class 0x00 id 0x82 (serial) and 0x84 (device_mode)
+/// answered Status Success with class/id echoed. CRITICAL finding from that same session: the
+/// device PARROTS Success+echo with all-zero args for ~485 of 512 unknown (class,id) headers — a
+/// probe-synthesized command map from this family is untrustworthy and [`RazerAudioDialect::probe`]
+/// deliberately synthesizes NONE (see its doc). The family's real user-facing surface is the OS
+/// Core-Audio capture endpoint, not a knobbed device row — see [`crate::registry::DeviceDef::
+/// is_operable`].
+pub struct RazerAudioDialect;
+
+impl Dialect for RazerAudioDialect {
+    fn id(&self) -> &'static str {
+        "razer-audio"
+    }
+
+    /// Bus signature: Razer VID + the Consumer-Control usage pair + the 64-byte feature report.
+    /// PIPE-SHAPE only, NEVER a pid check — a new audio sidecar with this same collection shape
+    /// adopts automatically, which is the entire point of claiming by signature.
+    fn claims(&self, info: &HidDeviceInfo) -> bool {
+        info.vid == RAZER_VID
+            && info.usage_page == AUDIO_USAGE_PAGE
+            && info.usage == AUDIO_USAGE
+            && info.feature_len == AUDIO_FEATURE_LEN
+    }
+
+    /// The same triple-compare rule razer_report uses (mirrors [`RazerDialect::matches_control`]):
+    /// this family also picks its control pipe by the def's stored `usage_page`/`usage`/
+    /// `feature_report_len`, compared against the enumerated collection's.
+    fn matches_control(&self, def: &crate::registry::DeviceDef, info: &HidDeviceInfo) -> bool {
+        let c = &def.control_interface;
+        c.usage_page == info.usage_page
+            && c.usage == info.usage
+            && c.feature_report_len == info.feature_len
+    }
+
+    /// Synthesize a MINIMAL, honest def for a claimed audio pipe: no probing at all — the CRITICAL
+    /// hardware finding (device module doc) is that this family parrots Success+echo with all-zero
+    /// args for the vast majority of (class,id) headers, so a probe loop here would mint a command
+    /// map out of noise, not evidence. The returned def carries an EMPTY `[commands]` table and no
+    /// lighting, which makes `DeviceDef::is_operable()` false — by design: this device's user-facing
+    /// row is its Core-Audio capture endpoint, not a knob-less HID device row (the same rule the
+    /// deleted `razer-seiren-v3-mini.toml` builtin stated by hand). `transaction_id` 0x1F is the one
+    /// value this session actually saw ACK a getter (era-heuristic, like every synthesized tx).
+    fn probe(
+        &self,
+        t: &dyn Transport,
+        ctx: &crate::synth::SynthCtx,
+    ) -> Option<crate::synth::Synthesis> {
+        let _ = t; // read-only by contract, and there is nothing safe left to read (see doc above)
+        use crate::registry::{ControlInterface, DefOrigin, DeviceDef, Mode};
+        use crate::synth::{Heuristic, Synthesis};
+        use std::collections::BTreeMap;
+
+        let name = if ctx.product.trim().is_empty() {
+            format!("Razer audio device {:04x}", ctx.pid)
+        } else {
+            ctx.product.trim().to_string()
+        };
+        let def = DeviceDef {
+            name,
+            codename: format!("auto-{:04x}", ctx.pid),
+            dialect: "razer-audio".into(),
+            origin: DefOrigin::Auto,
+            vendor_id: ctx.vid,
+            transaction_id: 0x1F,
+            stream_wait_us: 0,
+            modes: vec![Mode {
+                name: "default".into(),
+                product_id: ctx.pid,
+            }],
+            control_interface: ControlInterface {
+                usage_page: ctx.usage_page,
+                usage: ctx.usage,
+                feature_report_len: ctx.feature_len,
+            },
+            commands: BTreeMap::new(),
+            lighting: None,
+            side_plates: None,
+            // No push-report vocabulary probed here — the FAMILY vocabulary is on this dialect
+            // itself (`default_event_for`), so an empty def still arms correctly via
+            // `event_dialect_for`; a per-device `[events]` override is a config addition later.
+            events: None,
+        };
+        Some(Synthesis::from_probe(
+            def,
+            Vec::new(),
+            Heuristic(0x1F),
+            None,
+            Heuristic(0),
+            String::new(),
+            0,
+        ))
+    }
+
+    fn exec(
+        &self,
+        t: &dyn Transport,
+        transaction_id: u8,
+        spec_class: u8,
+        spec_id: u8,
+        size: u8,
+        args: &[u8],
+    ) -> Result<[u8; 80]> {
+        // Mirrors RazerDialect::exec's busy-poll discipline verbatim (10ms x 60 polls, re-arm at
+        // i%12==11, the exact error strings) — only the envelope shape differs (64 bytes / report id
+        // 0x07 vs razer_report's 91 bytes / report id 0x00). `reply_status` reads offsets 1/7/8,
+        // IDENTICAL in both envelopes, so the echo filter is reused unchanged.
+        let cmd_class = spec_class;
+        let cmd_id = spec_id;
+        let out = frame_audio(transaction_id, spec_class, spec_id, size, args);
+        t.set_feature(&out)?;
+        for i in 0..60 {
+            std::thread::sleep(Duration::from_millis(10));
+            let mut b = [0u8; AUDIO_BUF_LEN];
+            b[0] = 0x00; // report id for the GET, same convention RazerDialect::exec uses
+            if t.get_feature(&mut b).is_ok() {
+                if let Some(status) = reply_status(&b, cmd_class, cmd_id) {
+                    match status {
+                        Status::Success => return Ok(args_from_audio_buf(&b)),
+                        Status::Fail => {
+                            bail!("device reported FAIL for command {cmd_class:#04x}/{cmd_id:#04x}")
+                        }
+                        Status::Unsupported => {
+                            bail!("command {cmd_class:#04x}/{cmd_id:#04x} unsupported")
+                        }
+                        _ => {} // busy / timeout / new — keep polling
+                    }
+                }
+            }
+            if i % 12 == 11 {
+                t.set_feature(&out)?;
+            }
+        }
+        bail!("timed out waiting for reply to {cmd_class:#04x}/{cmd_id:#04x}")
+    }
+
+    fn exec_fast(
+        &self,
+        t: &dyn Transport,
+        transaction_id: u8,
+        class: u8,
+        id: u8,
+        size: u8,
+        args: &[u8],
+        stream_wait_us: u64,
+    ) {
+        // Mirrors RazerDialect::exec_fast: SetFeature, wait the calibrated round-trip, one drain —
+        // never a busy-retry loop.
+        let out = frame_audio(transaction_id, class, id, size, args);
+        if t.set_feature(&out).is_ok() {
+            if stream_wait_us > 0 {
+                std::thread::sleep(Duration::from_micros(stream_wait_us));
+            }
+            let mut b = [0u8; AUDIO_BUF_LEN];
+            let _ = t.get_feature(&mut b); // drain the reply; don't busy-retry
+        }
+    }
+
+    // NB: `release_custody` is INTENTIONALLY NOT overridden — the trait's default no-op is correct.
+    // This family never takes a driver-mode LEASE (no device-mode concept on an audio peripheral's
+    // control pipe), so there is nothing to hand back at teardown — the same reasoning HID++'s
+    // `release_custody` doc gives for why IT stays default too.
+
+    /// Any pipe this dialect CLAIMS is also one it PUSHES the family-wide tap-mute vocabulary on —
+    /// the two questions coincide for this family (there is no claimed-but-silent audio pipe here).
+    fn pushes_events(&self, info: &HidDeviceInfo) -> bool {
+        self.claims(info)
+    }
+
+    /// FAMILY EVENT VOCABULARY: `05 11 <state>` is the capacitive tap-mute push (state 0=live,
+    /// 1=muted) — HARDWARE-CAPTURED on the Seiren V3 Mini (2026-07-08) and heuristically assumed to
+    /// hold across the whole razer-audio family until a counterexample device disagrees. A def's own
+    /// `[events]` table (`DeviceDef::event_for`) is checked FIRST by callers and OVERRIDES this per
+    /// device — this is only the fallback when no def (or an empty/auto one) says otherwise.
+    fn default_event_for(&self, report: &[u8]) -> Option<crate::registry::EventKind> {
+        if report.len() >= 2 && report[0] == 0x05 && report[1] == 0x11 {
+            Some(crate::registry::EventKind::MuteState)
+        } else {
+            None
+        }
+    }
+
+    /// OVERRIDE that documents the proof, not a default fallthrough: the Seiren's tap-mute register is
+    /// hardware-verified READ-ONLY (sensor-owned) — an EXHAUSTIVE getter-oracle sweep (all classes
+    /// 0x00-0x3F, class 0x08 fully) plus user LED confirmation found NO command that writes it. Stays
+    /// explicit `false` rather than relying on the trait default so a future reader of this impl sees
+    /// the negative result was checked, not assumed.
+    fn audio_mute_writable(&self) -> bool {
+        false
+    }
+
+    /// The authoritative getter: class 0x08 id 0x88, hardware-verified on the Seiren V3 Mini
+    /// (2026-07-08) — family-level, like [`Dialect::default_event_for`]'s push vocabulary. The reply
+    /// body's `args[1]` (buffer offset 10) is the mute state (0 live / 1 muted); `args[0]` is a
+    /// constant 0x01 selector, ignored here. `exec`'s `Err` (device asleep / link down) collapses to
+    /// `None` — this is a best-effort UI seed, never a hard requirement.
+    fn read_audio_mute(&self, t: &dyn Transport) -> Option<bool> {
+        let args = self.exec(t, AUDIO_MUTE_READ_TX, 0x08, 0x88, 0x02, &[]).ok()?;
+        Some(args[1] != 0)
+    }
+}
+
+/// Build the razer-audio family's 64-byte request: report id [`AUDIO_REPORT_ID`] (razer_report's is
+/// 0x00), the SAME field slots as [`frame`] (status/tx/size/class/id at buf[1]/[2]/[6]/[7]/[8] —
+/// [`reply_status`]'s echo filter reads only those, so it is reused unchanged for this envelope), a
+/// [`AUDIO_BODY_LEN`]-byte arg body at buf[9..62], and CRC = XOR(buf[2..=61]) at buf[62] (buf[63]
+/// reserved). Args past the body are dropped, exactly as [`frame`] drops args past razer_report's
+/// 80-byte body.
+fn frame_audio(tx: u8, class: u8, id: u8, size: u8, args: &[u8]) -> [u8; AUDIO_BUF_LEN] {
+    let mut b = [0u8; AUDIO_BUF_LEN];
+    b[0] = AUDIO_REPORT_ID;
+    b[2] = tx;
+    b[6] = size;
+    b[7] = class;
+    b[8] = id;
+    let n = args.len().min(AUDIO_BODY_LEN);
+    b[9..9 + n].copy_from_slice(&args[..n]);
+    b[62] = b[2..=61].iter().fold(0u8, |c, &x| c ^ x);
+    b
+}
+
+/// Lift the razer-audio reply body (buf[9..62], [`AUDIO_BODY_LEN`] bytes) into the 80-byte arg shape
+/// [`Dialect::exec`] promises callers — zero-padded past the bytes this shorter envelope carries.
+fn args_from_audio_buf(b: &[u8; AUDIO_BUF_LEN]) -> [u8; 80] {
+    let mut args = [0u8; 80];
+    args[..AUDIO_BODY_LEN].copy_from_slice(&b[9..62]);
+    args
+}
+
 /// The Logitech HID++ 2.0 family (dialect #2, wave 3 — spec-implemented, EXPERIMENTAL, no hardware
 /// on this desk). See [`crate::hidpp`] for the wire vocabulary and the semantic-reshape contract.
 static HIDPP: crate::hidpp::HidppDialect = crate::hidpp::HidppDialect;
 
-/// The static dialect registry — slice order is claim order (razer first, then hidpp; the two
-/// vendors are disjoint so order is immaterial for claiming, but razer stays first as the proven
-/// family). No lazy_static/once_cell: a `static` slice over the `static` items is a plain const
-/// initializer (the `&Dialect → &dyn Dialect` unsizing happens in const context).
-static DIALECTS: &[&dyn Dialect] = &[&RAZER, &HIDPP];
+/// The one razer-audio instance the registry hands out. A ZST, like [`RAZER`].
+static RAZER_AUDIO: RazerAudioDialect = RazerAudioDialect;
+
+/// The static dialect registry — slice order is claim order (razer first as the proven family, then
+/// razer-audio, then hidpp; razer_report and razer-audio pipes are disjoint shapes on the same VID so
+/// order between them is immaterial for claiming). No lazy_static/once_cell: a `static` slice over
+/// the `static` items is a plain const initializer (the `&Dialect → &dyn Dialect` unsizing happens in
+/// const context).
+static DIALECTS: &[&dyn Dialect] = &[&RAZER, &RAZER_AUDIO, &HIDPP];
+
+/// The first dialect that PUSHES device events on this collection ([`Dialect::pushes_events`]) —
+/// slice order = claim order. `hidwatch::arm_new` arms a collection when this is `Some` OR a
+/// registry def's own `event_pipe_matches` says yes; `hidwatch::decode` then resolves the actual
+/// event via the def first (per-device override) and this dialect's `default_event_for` second
+/// (family fallback). `None` when no registered family pushes anything on this shape.
+pub fn event_dialect_for(info: &HidDeviceInfo) -> Option<&'static dyn Dialect> {
+    dialects().iter().copied().find(|d| d.pushes_events(info))
+}
 
 /// The static dialect registry, in claim order.
 pub fn dialects() -> &'static [&'static dyn Dialect] {
@@ -546,5 +847,235 @@ mod tests {
         assert_eq!(claimed_by(&info(0x1532, 91)).map(|d| d.id()), Some("razer"));
         assert!(claimed_by(&info(0x1532, 41)).is_none(), "interested but unclaimed");
         assert!(claimed_by(&info(0x046D, 91)).is_none(), "foreign vendor");
+    }
+
+    /// A pipe shaped like `(usage_page, usage, feature_len)` on the given vendor — the builder every
+    /// razer-audio test below shares.
+    fn audio_pipe(vid: u16, usage_page: u16, usage: u16, feature_len: u16) -> HidDeviceInfo {
+        HidDeviceInfo {
+            vid,
+            pid: 0x056A,
+            usage_page,
+            usage,
+            feature_len,
+            input_len: 64,
+            output_len: 0,
+            path: DevicePath::from_str_for_tests("x"),
+            product: String::new(),
+        }
+    }
+
+    #[test]
+    fn razer_audio_claims_only_its_signature() {
+        // The right shape: Razer VID, Consumer-Control usage pair, 64-byte feature report.
+        assert!(RazerAudioDialect.claims(&audio_pipe(RAZER_VID, 0x000C, 0x0001, 64)), "the razer-audio signature");
+        // The razer_report mouse/keyboard shape (91-byte feature report) is NOT this family's pipe.
+        assert!(!RazerAudioDialect.claims(&audio_pipe(RAZER_VID, 0x000C, 0x0001, 91)), "91-byte pipe is razer_report's, not razer-audio's");
+        // Right vendor + length, wrong usage — a different collection entirely.
+        assert!(!RazerAudioDialect.claims(&audio_pipe(RAZER_VID, 0x0001, 0x0002, 64)), "wrong usage pair");
+        // A foreign vendor with the identical shape is still not ours.
+        assert!(!RazerAudioDialect.claims(&audio_pipe(0x046D, 0x000C, 0x0001, 64)), "Logitech VID");
+        // And RazerDialect must NOT claim the audio shape either — the two families stay disjoint.
+        assert!(!RazerDialect.claims(&audio_pipe(RAZER_VID, 0x000C, 0x0001, 64)), "razer_report never claims the audio pipe");
+    }
+
+    #[test]
+    fn frame_audio_emits_golden_bytes_with_the_64_byte_crc_span() {
+        // tx 0x1F, class 0x00, id 0x82 (serial getter), size 0x16, no args — the exact request this
+        // dialect's `probe`/`exec` would frame for the Seiren's serial getter.
+        let got = frame_audio(0x1F, 0x00, 0x82, 0x16, &[]);
+        let mut want = [0u8; AUDIO_BUF_LEN];
+        want[0] = 0x07; // report id — NOT razer_report's 0x00
+        want[2] = 0x1F; // transaction id
+        want[6] = 0x16; // data size
+        want[7] = 0x00; // class
+        want[8] = 0x82; // id
+        want[62] = 0x1F ^ 0x16 ^ 0x00 ^ 0x82; // CRC = XOR(buf[2..=61]); [2],[6],[7],[8] are nonzero there
+        assert_eq!(got, want, "frame_audio must match the hand-computed 64-byte golden");
+        assert_eq!(got.len(), 64, "the razer-audio envelope is 64 bytes, not razer_report's 91");
+    }
+
+    #[test]
+    fn razer_audio_exec_round_trips_through_the_shared_echo_filter() {
+        // A 64-byte mock that echoes class/id/size with status SUCCESS — proves `reply_status` (built
+        // for the 91-byte envelope) reads this shorter envelope's offsets 1/7/8 correctly.
+        struct AudioMock {
+            last: Mutex<Option<[u8; AUDIO_BUF_LEN]>>,
+        }
+        impl Transport for AudioMock {
+            fn set_feature(&self, buf: &[u8]) -> anyhow::Result<()> {
+                let mut b = [0u8; AUDIO_BUF_LEN];
+                let n = buf.len().min(AUDIO_BUF_LEN);
+                b[..n].copy_from_slice(&buf[..n]);
+                *self.last.lock().unwrap() = Some(b);
+                Ok(())
+            }
+            fn get_feature(&self, buf: &mut [u8]) -> anyhow::Result<()> {
+                let req = self.last.lock().unwrap().expect("a command was sent first");
+                let mut rep = [0u8; AUDIO_BUF_LEN];
+                rep[1] = 0x02; // Success
+                rep[7] = req[7]; // echo class
+                rep[8] = req[8]; // echo id
+                let n = buf.len().min(AUDIO_BUF_LEN);
+                buf[..n].copy_from_slice(&rep[..n]);
+                Ok(())
+            }
+        }
+        let mock = AudioMock { last: Mutex::new(None) };
+        let out = RazerAudioDialect
+            .exec(&mock, 0x1F, 0x00, 0x82, 0x16, &[])
+            .expect("mock replies SUCCESS");
+        assert_eq!(out, [0u8; 80], "reply body round-trips (mock sent all-zero args)");
+        let sent = mock.last.lock().unwrap().expect("a command was sent");
+        assert_eq!(sent, frame_audio(0x1F, 0x00, 0x82, 0x16, &[]), "request bytes match frame_audio");
+    }
+
+    #[test]
+    fn razer_audio_pushes_and_maps_the_family_wide_mute_vocabulary() {
+        let shape = audio_pipe(RAZER_VID, 0x000C, 0x0001, 64);
+        assert!(RazerAudioDialect.pushes_events(&shape), "a claimed pipe also pushes events");
+        assert!(!RazerAudioDialect.pushes_events(&audio_pipe(RAZER_VID, 0x000C, 0x0001, 91)), "an unclaimed pipe pushes nothing");
+        // `05 11` -> MuteState, any other lead pair -> None (default_event_for is the FAMILY fallback,
+        // checked only after a def's own event_for finds nothing).
+        assert_eq!(
+            RazerAudioDialect.default_event_for(&[0x05, 0x11, 0x01]),
+            Some(crate::registry::EventKind::MuteState)
+        );
+        assert_eq!(RazerAudioDialect.default_event_for(&[0x05, 0x11]), Some(crate::registry::EventKind::MuteState), "2 lead bytes is enough");
+        assert_eq!(RazerAudioDialect.default_event_for(&[0x05, 0x02, 0x00]), None, "a different sub-kind is not mute");
+        assert_eq!(RazerAudioDialect.default_event_for(&[0x05]), None, "too short to carry the lead pair");
+        // RazerDialect / HidppDialect never grew this vocabulary — the default `None`/`false` stays.
+        assert!(!RazerDialect.pushes_events(&shape));
+        assert_eq!(RazerDialect.default_event_for(&[0x05, 0x11, 0x01]), None);
+    }
+
+    #[test]
+    fn razer_audio_is_read_only_never_writable() {
+        // The WRITE facet's whole point: an EXHAUSTIVE getter-oracle sweep found no setter for the
+        // Seiren's tap-mute register, so this must stay `false` — an explicit override of the proof,
+        // not a silent default.
+        assert!(!RazerAudioDialect.audio_mute_writable());
+    }
+
+    #[test]
+    fn read_audio_mute_none_when_exec_fails() {
+        // A transport that fails every I/O call (device asleep / unplugged) must collapse to `None`,
+        // never a fabricated true/false.
+        struct AlwaysFail;
+        impl Transport for AlwaysFail {
+            fn set_feature(&self, _buf: &[u8]) -> anyhow::Result<()> {
+                bail!("no device")
+            }
+            fn get_feature(&self, _buf: &mut [u8]) -> anyhow::Result<()> {
+                bail!("no device")
+            }
+        }
+        assert_eq!(RazerAudioDialect.read_audio_mute(&AlwaysFail), None);
+    }
+
+    #[test]
+    fn read_audio_mute_parses_args1_as_the_state_byte() {
+        // A mock that answers the 0x08/0x88 getter with args[0]=0x01 (the constant selector, ignored)
+        // and args[1]=the mute state — proves `read_audio_mute` reads offset 1, not 0.
+        struct MuteMock {
+            last: Mutex<Option<[u8; AUDIO_BUF_LEN]>>,
+            state: u8,
+        }
+        impl Transport for MuteMock {
+            fn set_feature(&self, buf: &[u8]) -> anyhow::Result<()> {
+                let mut b = [0u8; AUDIO_BUF_LEN];
+                let n = buf.len().min(AUDIO_BUF_LEN);
+                b[..n].copy_from_slice(&buf[..n]);
+                *self.last.lock().unwrap() = Some(b);
+                Ok(())
+            }
+            fn get_feature(&self, buf: &mut [u8]) -> anyhow::Result<()> {
+                let req = self.last.lock().unwrap().expect("a command was sent first");
+                let mut rep = [0u8; AUDIO_BUF_LEN];
+                rep[1] = 0x02; // Success
+                rep[7] = req[7]; // echo class
+                rep[8] = req[8]; // echo id
+                rep[9] = 0x01; // args[0]: the constant selector, ignored by read_audio_mute
+                rep[10] = self.state; // args[1]: the mute state byte
+                let n = buf.len().min(AUDIO_BUF_LEN);
+                buf[..n].copy_from_slice(&rep[..n]);
+                Ok(())
+            }
+        }
+        let live = MuteMock { last: Mutex::new(None), state: 0 };
+        assert_eq!(RazerAudioDialect.read_audio_mute(&live), Some(false), "state 0 = live");
+        let muted = MuteMock { last: Mutex::new(None), state: 1 };
+        assert_eq!(RazerAudioDialect.read_audio_mute(&muted), Some(true), "state 1 = muted");
+    }
+
+    #[test]
+    fn event_dialect_for_resolves_the_pushing_family_only() {
+        assert_eq!(
+            event_dialect_for(&audio_pipe(RAZER_VID, 0x000C, 0x0001, 64)).map(|d| d.id()),
+            Some("razer-audio")
+        );
+        assert!(event_dialect_for(&audio_pipe(RAZER_VID, 0x000C, 0x0001, 91)).is_none(), "razer_report's shape pushes nothing family-wide");
+        assert!(event_dialect_for(&audio_pipe(0x046D, 0x000C, 0x0001, 64)).is_none(), "foreign vendor");
+    }
+
+    #[test]
+    fn razer_audio_probe_yields_an_empty_inoperable_def() {
+        // No transport I/O at all — `probe` never sends a byte (see its doc: the family parrots
+        // Success+echo for unknown headers, so no probed command would be trustworthy evidence).
+        struct PanicOnIo;
+        impl Transport for PanicOnIo {
+            fn set_feature(&self, _buf: &[u8]) -> anyhow::Result<()> {
+                panic!("razer-audio probe must never write to the wire")
+            }
+            fn get_feature(&self, _buf: &mut [u8]) -> anyhow::Result<()> {
+                panic!("razer-audio probe must never read the wire")
+            }
+        }
+        let ctx = crate::synth::SynthCtx {
+            vid: RAZER_VID,
+            pid: 0x056A,
+            usage_page: 0x000C,
+            usage: 0x0001,
+            feature_len: 64,
+            product: "Razer Seiren V3 Mini".into(),
+        };
+        let s = RazerAudioDialect
+            .probe(&PanicOnIo, &ctx)
+            .expect("a claimed pipe always synthesizes Some, even with an empty command map");
+        assert_eq!(s.def.dialect, "razer-audio");
+        assert_eq!(s.def.name, "Razer Seiren V3 Mini");
+        assert!(s.def.commands.is_empty(), "no command survives — none was ever probed");
+        assert!(s.def.lighting.is_none());
+        assert!(!s.def.is_operable(), "an empty-commands, no-lighting def must never grow a device row");
+        // Round-trips through the same emitter/loader every other synthesis uses.
+        let text = crate::synth::emit_toml(&s);
+        let mut parsed: crate::registry::DeviceDef =
+            toml::from_str(&text).unwrap_or_else(|e| panic!("emitted razer-audio TOML must parse: {e}\n---\n{text}"));
+        parsed.origin = s.def.origin.clone();
+        assert_eq!(parsed, s.def, "emit -> parse must be lossless for a razer-audio def");
+        assert!(!parsed.is_operable(), "the reloaded def is still honestly inoperable");
+    }
+
+    #[test]
+    fn razer_audio_probe_falls_back_to_a_pid_name_when_product_is_empty() {
+        struct PanicOnIo;
+        impl Transport for PanicOnIo {
+            fn set_feature(&self, _buf: &[u8]) -> anyhow::Result<()> {
+                panic!("no I/O expected")
+            }
+            fn get_feature(&self, _buf: &mut [u8]) -> anyhow::Result<()> {
+                panic!("no I/O expected")
+            }
+        }
+        let ctx = crate::synth::SynthCtx {
+            vid: RAZER_VID,
+            pid: 0x056A,
+            usage_page: 0x000C,
+            usage: 0x0001,
+            feature_len: 64,
+            product: String::new(),
+        };
+        let s = RazerAudioDialect.probe(&PanicOnIo, &ctx).unwrap();
+        assert_eq!(s.def.name, "Razer audio device 056a");
     }
 }

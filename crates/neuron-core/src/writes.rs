@@ -294,6 +294,18 @@ pub fn decode_dpi_active(s: &[u8]) -> Option<u8> {
     s.get(1).copied().filter(|&b| b > 0).map(|b| b - 1)
 }
 
+/// Read the device's PERSISTED onboard DPI stage table (0x04/0x86, persisted plane) as the X-axis
+/// cycle values. Empty on any failure (no getter answer / asleep wireless) — callers treat that as
+/// "no onboard cycle known", never an error. This is THE stage source the FEEL page writes and the
+/// firmware itself walks in normal mode — so the software DpiCycle (the deferred-button duty neuron
+/// takes while holding driver-mode custody) reads it too, keeping the button's behaviour identical
+/// whichever side of the custody line owns it.
+pub fn read_persisted_dpi_stages(d: &Device) -> Vec<u16> {
+    d.exec_dynamic(CLASS_DPI, ID_DPI_STAGES_GET, DPI_STAGES_SIZE, &[PERSISTED])
+        .map(|a| decode_dpi_stages(&a))
+        .unwrap_or_default()
+}
+
 /// Write the full DPI stage table: driver-mode -> write (volatile unless `store` is Persist)
 /// -> read-back verify the active index + stage count + every stage's bytes.
 ///

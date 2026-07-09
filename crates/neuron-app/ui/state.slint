@@ -124,6 +124,16 @@ export global State {
     // endpoint by its id, NOT the system default.
     in-out property <float> device-volume: 50;       // 0..100
     in-out property <bool> device-muted: false;
+    // is the selected mic's mute HARDWARE-owned (a registry [events] MuteState def claims this
+    // endpoint, e.g. the Seiren V3 Mini)? Gates the device panel between a real OS toggle, a
+    // read-only firmware-state pill, and (false on a mic with neither) no mute control at all.
+    // Always false for an "output" row — an output's OS mute IS its real mute.
+    in-out property <bool> device-mute-hardware: false;
+    // the WRITE facet: is there a PROVEN device setter behind this mute (device.slint renders an
+    // interactive toggle only when true)? Always true for an "output" row (a render endpoint's OS
+    // mute IS a real, writable mute); for a mic, true only when the arming dialect proved a setter —
+    // the Seiren (read-only tap-mute) stays false and renders a live indicator instead.
+    in-out property <bool> device-mute-writable: false;
     callback set-device-volume(float);
     callback toggle-device-mute();
     callback refresh-devices();
