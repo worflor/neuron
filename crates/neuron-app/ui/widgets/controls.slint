@@ -1203,6 +1203,9 @@ export component SplitButton inherits Rectangle {
         // ── LEFT half — a ghost action (reload) ───────────────────────────
         lseg := Rectangle {
             horizontal-stretch: 1;
+            // each half reserves its OWN label's width (a bare Text reports min-width ≈ 0, and the
+            // stretch split is blind to content — "− remove | + add" clipped the wider verb mid-word)
+            min-width: ltxt.preferred-width + 26px;
             background: !root.l-on ? transparent
                 : lta.pressed ? Theme.well-hi
                 : lta.has-hover ? Theme.well
@@ -1213,7 +1216,7 @@ export component SplitButton inherits Rectangle {
                 // the label travels 1px on press — a key has throw (parity with Button / the right half)
                 y: lta.pressed && root.l-on ? 1px : 0px;
                 animate y { duration: Theme.press-throw; }
-                Text {
+                ltxt := Text {
                     text: root.left-text;
                     vertical-alignment: center; horizontal-alignment: center;
                     color: !root.l-on ? Theme.text-faint
@@ -1235,6 +1238,7 @@ export component SplitButton inherits Rectangle {
         // ── RIGHT half — the commit action (apply), accent-dressed when right-primary ──
         rseg := Rectangle {
             horizontal-stretch: 1;
+            min-width: rtxt.preferred-width + 26px;
             background: !root.r-on ? transparent
                 : rta.pressed ? Theme.well-hi
                 : (root.right-primary && rta.has-hover) ? Theme.accent-glow
@@ -1254,7 +1258,7 @@ export component SplitButton inherits Rectangle {
                 // the label travels 1px on press — a key has throw (parity with Button)
                 y: rta.pressed && root.r-on ? 1px : 0px;
                 animate y { duration: Theme.press-throw; }
-                Text {
+                rtxt := Text {
                     text: root.right-text;
                     vertical-alignment: center; horizontal-alignment: center;
                     color: root.busy ? Theme.accent-dim
@@ -1715,8 +1719,13 @@ export component ConfirmButton inherits Rectangle {
         : touch.has-hover ? Theme.well
         : transparent;
     border-width: Theme.hair;
+    // rest wears the NEUTRAL frame — the danger ink on the glyph is the warning; a red frame around
+    // a width-reserved key read as a loud empty box before anyone even hovered it. Danger arrives on
+    // approach (hover) and commits on the armed rung.
     border-color: !root.enabled ? Theme.line-soft
-        : Theme.danger.with-alpha(root.armed ? 1.0 : 0.5);
+        : root.armed ? Theme.danger
+        : touch.has-hover ? Theme.danger.with-alpha(0.5)
+        : Theme.line;
     animate background, border-color { duration: Theme.quick; }
     // running follows `armed`; on fire it disarms (which stops the timer). A second click also disarms.
     Timer {

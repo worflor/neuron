@@ -120,6 +120,25 @@ component ConnStatus inherits HorizontalLayout {
     Mono { text: root.text; color: Theme.text-faint; }
 }
 
+// The quiet inline disclosure for a status line's detail rows — a WORD beside the readout, not a
+// row-height key flung to the panel's far edge. Caret carries the open state, ink brightens on
+// hover; same grammar as the Disclosure atom, sized to sit inside a status row.
+component MoreLink inherits Rectangle {
+    in property <bool> open;
+    callback clicked();
+    width: t.preferred-width;
+    t := Text {
+        text: root.open ? "▾ less" : "▸ more";
+        height: 100%;
+        vertical-alignment: center;
+        font-family: Theme.mono;
+        font-size: Theme.fs-small;
+        color: mta.has-hover ? Theme.text-mid : Theme.text-faint;
+        animate color { duration: Theme.quick; }
+    }
+    mta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.clicked(); } }
+}
+
 component ChromaStream inherits HorizontalLayout {
     in property <ChromaStreamRow> stream;
     spacing: 8px;
@@ -945,9 +964,9 @@ export component SettingsPanel inherits VerticalLayout {
                         Rectangle {}
                         VerticalLayout {
                             alignment: center;
-                            // a PREVIEW action, not a commit — plain, so it doesn't spend the accent `primary` reserves
-            // for real commits (run diagnostics). Matches the beacon `test` button, also plain.
-            Button { text: "test"; clicked => { State.test-notification(); } }
+                            // a PREVIEW action, not a commit — plain, so it doesn't spend the accent `primary`
+                            // reserves for real commits (run diagnostics). Matches the beacon `test`, also plain.
+                            Button { text: "test"; clicked => { State.test-notification(); } }
                         }
                     }
                     // the body groups as one block with an even rhythm; tight sub-groups bind a control
@@ -979,6 +998,7 @@ export component SettingsPanel inherits VerticalLayout {
                                 VerticalLayout { alignment: center; SubLabel { text: "WHERE"; } }
                                 VerticalLayout {
                                     alignment: center;
+                                    horizontal-stretch: 0;
                                     Mono {
                                         text: State.notif-placement == "off" ? "off · audio only"
                                             : State.notif-placement == "custom" ? "custom placement"
@@ -986,7 +1006,8 @@ export component SettingsPanel inherits VerticalLayout {
                                         color: State.notif-placement == "off" ? Theme.text-faint : Theme.text-mid;
                                     }
                                 }
-                                Rectangle {}
+                                // the audio-only escape hatch HUGS the readout it flips (far-right
+                                // float read as furniture, not the readout's own mode switch).
                                 VerticalLayout {
                                     alignment: center;
                                     Pill {
@@ -1003,6 +1024,7 @@ export component SettingsPanel inherits VerticalLayout {
                                         }
                                     }
                                 }
+                                Rectangle {}
                             }
                             HorizontalLayout {
                                 spacing: Theme.gap-col;
@@ -1180,12 +1202,15 @@ export component SettingsPanel inherits VerticalLayout {
                                 toggled(v) => { State.set-host-chroma(v); }
                             }
                             HorizontalLayout {
-                                spacing: 8px;
-                                ConnStatus { lit: State.host-chroma-live; text: State.host-chroma-status; }
-                                if State.host-chroma-streams.length > 0 : Button {
-                                    text: State.host-chroma-detail-open ? "less" : "more";
+                                spacing: 10px;
+                                ConnStatus { horizontal-stretch: 0; lit: State.host-chroma-live; text: State.host-chroma-status; }
+                                // detail disclosure HUGS the readout it expands (a stretched status
+                                // used to shove a full Button against the panel's right edge).
+                                if State.host-chroma-streams.length > 0 : MoreLink {
+                                    open: State.host-chroma-detail-open;
                                     clicked => { State.host-chroma-detail-open = !State.host-chroma-detail-open; }
                                 }
+                                Rectangle {}
                             }
                             if State.host-chroma-detail-open && State.host-chroma-streams.length > 0 : VerticalLayout {
                                 spacing: 4px;
