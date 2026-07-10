@@ -500,6 +500,24 @@ Safety model:
 - Raw Python can still do arbitrary process actions by design; this is not sandboxed.
 - Macro beacon prompts route through `beacon.rs` so asking the user does not block the UI thread or the live dispatch worker.
 
+### 5.7 Device Identity, Discovery, And Input Decode
+
+Everything in §5.5 assumes a device is already *modeled*. This is how one gets modeled, and how its live button/event reports are read. The seam is the `Dialect` trait (`neuron-core/src/dialect.rs`): bytes live below it, `Capability` semantics above it, and per-device wiring (opcodes, geometry, quirks) lives in TOML neither layer hardcodes.
+
+**Claiming is pipe-shape, never PID.** `claimed_by(info)` walks `DIALECTS = [razer, razer-audio, hidpp]` and returns the first whose `claims()` matches the HID pipe's signature — razer by `vid==0x1532 && feature_len==91`, razer-audio by the 64-byte Consumer-Control envelope, hidpp by output/input report shape. So a new device with a known shape auto-adopts with no code; a new *wire shape* lands on the unclaimed ledger (`synth.rs unclaimed_from`, surfaced as the device-page "N razer vendor pipes · no shared protocol" footer) until a dialect is written for it. The razer-audio dialect (Seiren) is the worked example of adding a third family: one `DIALECTS` entry, nothing above the seam changes.
+
+**Synthesis mints evidence-typed beliefs.** `discover.rs`/`synth.rs` probe the getter space read-only against a universal command catalog, keep only commands the device answers SUCCESS for, and emit a paired setter only when its getter answered ("writes are not probes"). `Proven<T>` has no public constructor outside the probe, so code above the seam cannot forge evidence; `Heuristic<T>` marks era-inference (tx cohort, and the rows×cols geometry guess — mouse `(1,2)` else keyboard `(6,22)`, the one fact no getter reveals). The result is written to `devices/auto/<dialect>-<pid>.toml`; a curated `devices/*.toml` shadows it. The one field synthesis cannot prove is the transaction id (a wrong-tx write ACKs then no-ops); `first_light_heal` walks the cohort `[0x1F,0x3F,0xFF,0x9F]` on first lighting apply and rewrites the auto file when read-back proves a different tx.
+
+**Input decode (`hidwatch.rs decode`)** reads device-pushed reports on the readable sibling pipes in priority order: a def's own `[events]` table, then the dialect's family vocabulary (`default_event_for`, e.g. razer-audio's `05 11` tap-mute), then the hardcoded 04/05 families:
+
+- `04 <code>` — Razer driver-mode deferred buttons. The firmware, once neuron takes driver-mode custody, hands neuron its onboard macro/DPI/scroll buttons as bare per-press events; neuron IS the implementer. Codes verified live on the BlackWidow: `0x01`=FN, `0x20..0x24`=M1..M5, `0x00`=release.
+- `05 02 <X_be><Y_be>` — DPI change, value carried big-endian per axis (verified live on the Naga: `05 02 03 20 03 20`=800, `05 02 75 30 75 30`=30000). Drives the wake-reconcile that heals a stale volatile plane.
+- `05 3a <stage> <?>` — scroll/sensitivity stage. Byte[2] is the stage (read); byte[3] (`0x82`/`0x85` observed) is an unread field, not yet decoded.
+- `05 0c` — power/charge poke (also fires on wake); settles charge + reasserts config.
+- `05 0e <strap>` — side-plate strap code (push-only, no getter — this report *is* the detection), resolved to a label via `[side_plates]`.
+
+**Live-verified boundaries (negative knowledge).** A read-only report-shape ledger (open every non-keyboard/non-mouse Razer pipe, log deduped report shapes) confirmed the vocabulary above against real hardware and earned facts that cost a poke to learn: the headset volume knob emits nothing on any readable pipe (analog/OS-swallowed); of the Naga's four undefined-usage vendor pipes only one is the live event channel; the mouse thumb-grid buttons ride the primary mouse/keyboard HID (correctly unopened), not a vendor pipe; and the BlackWidow's consumer pipe stays silent for FN+F-row media while neuron holds driver-mode custody — the custody-complementarity of §9's input-model risk, observed.
+
 ## 6. Safety And Reliability Contracts
 
 ### 6.1 Arm Gates
@@ -709,6 +727,17 @@ Mitigation:
 - Treat this file as the current app-level TDD.
 - Keep feature-specific docs under `docs/` but link their status to actual code.
 - Update this TDD when new workers, config files, or dispatch sources are added.
+
+### Risk: Device Input Model Is Implicit
+
+`DeviceDef` models lighting geometry richly (rows/cols/effects/key-cell map) but has **no symmetric input model**: no table of the buttons/keys a device exposes, their identities, or their default onboard functions. `EventKind` — the registry's vocabulary for device-pushed events — has exactly one variant (`MuteState`); every other pushed event (04-family macro/DPI/scroll buttons, `05` DPI/scroll/power/plate) is a hardcoded vocabulary in `hidwatch.rs`, not evidence-typed registry data. Two consequences follow. (1) **New non-standard hardware needs hand-work** the discovery path can't cover: a novel keyboard geometry mis-places vitals/reactive lighting (the `razer_key_cell` map in `lighting.rs` is one family-standard ANSI 6×22 convention, not per-device data), and a new event class has nowhere to be named. (2) **Custody-complementarity is unmodeled and therefore silent**: to read the macro keys neuron must take Razer driver-mode custody, which is the same act that stops the firmware handling FN combos — so the onboard fn-row/media layer goes dark and nothing re-provides it (observed live: the BlackWidow consumer pipe emits nothing under driver custody). The def cannot express "these are the decisions you inherit when you open this pipe."
+
+Mitigation:
+
+- Treat the hardcoded 04/05 decode in `hidwatch.rs` as a staging area, not the final home; the module header already flags this.
+- The tractable next artifact is a passive **report-shape ledger** inside the app — read-only-open the secondary/unclaimed pipes, dedupe seen report shapes per unit, mark decoded (matches a `Proven` vocab) vs unknown, surface the unknowns for promotion. It is zero wire-risk (getters/reads only), it turns every desk into a discovery instrument, and a scratch prototype already validated the current vocabulary and the boundaries above. It would have surfaced the side-plate codes and the Seiren mute event without manual poking.
+- A per-device `[input]` block + expanded `EventKind` (evidence-typed like commands) is the larger move; design it as a *custody ledger* — what taking a pipe's custody removes from firmware — not just a button list.
+- Until that exists, keep binding storage `(page, usage, pid)`-keyed and honest that it is disjoint from the device model.
 
 ### Risk: Silent Preference Fallback
 

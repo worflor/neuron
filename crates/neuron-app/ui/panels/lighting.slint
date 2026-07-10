@@ -576,44 +576,12 @@ export component LightingPanel inherits VerticalLayout {
         }
     }
 
-    // ── FOREIGN-OWNER truth strip: a protocol client (a Chroma game, an OpenRGB tool) holds a
-    // layer ABOVE this board's base right now, so the preview below and the physical board
-    // intentionally disagree — say so, plainly, where the user is looking. Clears itself the
-    // moment the client releases (the ~1s claims poll rides the preview tick).
-    if State.light-foreign && State.sel-can-light && State.grid-rows > 0 : Rectangle {
-        background: Theme.bg-2; border-radius: Theme.radius;
-        border-width: Theme.hair; border-color: Theme.line;
-        VerticalLayout {
-            padding: 8px; spacing: 2px;
-            // name the owner when it announced one — "Overwatch is painting this board" turns a
-            // spooky wrong-effect moment into the arbiter doing its job, visibly.
-            Mono {
-                text: (State.light-foreign-app == "" ? "another app" : State.light-foreign-app)
-                    + " is painting this board (via CONNECTIONS)";
-                color: Theme.text-dim;
-            }
-            Mono { text: "your lighting is composed underneath and returns the moment it lets go. tune how it blends in VISITORS below."; color: Theme.text-faint; }
-        }
-    }
-
-    // ── SUPPRESSED strip: the "my lighting always wins" flip side — a client is CONNECTED but
-    // your base outranks it, so it's here and honestly not showing. No tool without an arbiter
-    // can tell you this; we can, because the session is a first-class, named claim.
-    if State.light-suppressed && State.sel-can-light && State.grid-rows > 0 : Rectangle {
-        background: Theme.bg-2; border-radius: Theme.radius;
-        border-width: Theme.hair; border-color: Theme.line;
-        VerticalLayout {
-            padding: 8px; spacing: 2px;
-            Mono {
-                text: (State.light-foreign-app == "" ? "another app" : State.light-foreign-app)
-                    + " is connected but suppressed — your lighting wins.";
-                color: Theme.text-dim;
-            }
-            Mono { text: "flip off \u{201c}my lighting always wins\u{201d} in VISITORS below to let it take over."; color: Theme.text-faint; }
-        }
-    }
-
     // ── THE SURFACE: render hero (centred) → gallery + contextual inspector ─
+    // FOREIGN-OWNER / SUPPRESSED truth now lives ON the subject, not as a banner above it:
+    // the status strip names the painter, the render's frame glows while a visitor holds the
+    // brush (the same earned-glow doctrine as the connection lamps), and one faint line under
+    // the render carries the explanation. Clears itself the moment the client releases (the
+    // ~1s claims poll rides the preview tick).
     if State.sel-can-light && State.grid-rows > 0 : VerticalLayout {
         spacing: Theme.section-gap;
 
@@ -628,8 +596,18 @@ export component LightingPanel inherits VerticalLayout {
                     color: Theme.text-faint;
                     overflow: elide; horizontal-stretch: 1;
                 }
-                if State.compositing : Mono { text: "~ live on device"; color: Theme.accent-dim; }
-                if !State.compositing && !State.light-brush-on && State.light-effect != "" : Mono {
+                // the live-truth slot: a visitor painting OUTRANKS "~ live on device" (it IS
+                // what's live on the device); suppressed rides beside it as a quiet fact.
+                if State.light-foreign : Mono {
+                    text: "\u{25cf} " + (State.light-foreign-app == "" ? "another app" : State.light-foreign-app) + " is painting";
+                    color: Theme.accent;
+                }
+                if State.light-suppressed && !State.light-foreign : Mono {
+                    text: (State.light-foreign-app == "" ? "a visitor" : State.light-foreign-app) + " connected \u{00b7} suppressed \u{00b7} ";
+                    color: Theme.text-faint;
+                }
+                if State.compositing && !State.light-foreign : Mono { text: "~ live on device"; color: Theme.accent-dim; }
+                if !State.compositing && !State.light-foreign && !State.light-brush-on && State.light-effect != "" : Mono {
                     text: "preview only"; color: Theme.text-faint;
                 }
                 if State.light-brush-on : Mono { text: "brush down · L paint · R erase · drag sweeps"; color: Theme.accent; }
@@ -642,6 +620,16 @@ export component LightingPanel inherits VerticalLayout {
                 Rectangle {
                     width: min(parent.width, 760px);
                     height: 280px;
+                    // while a visitor paints, the FRAME says so: a soft accent halo around the
+                    // subject (earned — someone else genuinely holds the brush right now), so the
+                    // preview/board disagreement reads as arbitration, not a glitch. Settles in
+                    // and out with the claim.
+                    border-radius: Theme.radius;
+                    border-width: State.light-foreign ? Theme.hair : 0px;
+                    border-color: Theme.accent.with-alpha(0.45);
+                    drop-shadow-color: State.light-foreign ? Theme.accent.with-alpha(0.22) : transparent;
+                    drop-shadow-blur: State.light-foreign ? 10px : 0px;
+                    animate drop-shadow-color, drop-shadow-blur { duration: Theme.settle; }
                     DeviceRender {
                         width: 100%; height: 100%;
                         rows: State.grid-rows;
@@ -661,6 +649,16 @@ export component LightingPanel inherits VerticalLayout {
                         place-region(r0, c0, r1, c1) => { State.set-layer-region(r0, c0, r1, c1); }
                     }
                 }
+            }
+            // the one explanatory line — under the subject, only while a claim exists. Names the
+            // arbitration ("no tool without an arbiter can tell you this") without becoming a box.
+            if State.light-foreign || State.light-suppressed : Mono {
+                text: State.light-foreign
+                    ? "your lighting composes underneath and returns the moment it lets go \u{00b7} tune the blend in VISITORS"
+                    : "connected but outranked \u{2014} flip off \u{201c}my lighting always wins\u{201d} in VISITORS to let it through";
+                color: Theme.text-faint;
+                horizontal-alignment: center;
+                wrap: word-wrap;
             }
         }
 

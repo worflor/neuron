@@ -119,11 +119,13 @@ pub fn post_macro(id: &str, text: &str) {
 // ── THE STACK ENGINE — timings + animation params (all hand-rolled, ticked off a ~60fps loop) ──
 // SNAPPY is the bar: fast, decisive, smoothly interpolated. Entry slides+fades in (~170ms ease-out);
 // exit fades + collapses the gap (~150ms); a coalesce BUMP pulses the card (~120ms); the column
-// REFLOW eases each card to its target slot (~150ms crisp spring, overshoot-free). The HOLD (the
-// at-rest dwell before a card leaves) is the legacy 1200ms, reset on every coalesce.
+// REFLOW eases each card to its target slot (~150ms crisp spring, overshoot-free). The HOLD is
+// where snappy stops being a virtue: a confirmation is read out of the corner of an eye mid-game,
+// and at the old 1200ms a glance that started when the card landed missed it (measured live —
+// a 900ms-late screenshot caught nothing, twice). Motion stays fast; the dwell breathes.
 
 /// How long a card holds at full strength before it begins leaving (reset by a coalesce).
-const HOLD: Duration = Duration::from_millis(1200);
+const HOLD: Duration = Duration::from_millis(2500);
 /// Entry animation length (slide-in + fade-up).
 const ENTER_MS: f32 = 170.0;
 /// Exit animation length (fade + height-collapse so the column closes the gap).
