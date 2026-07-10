@@ -1,0 +1,12 @@
+# neuron-testkit — test-only instruments: recorded-reality decoders (ChromaTape), device twins,
+# and generators. A dev-dependency for the other crates; never ships in a release binary.
+[package]
+name = "neuron-testkit"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+flate2 = "1"
