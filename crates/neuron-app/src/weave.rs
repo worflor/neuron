@@ -2124,6 +2124,9 @@ pub fn weave_proof_sheet(t: f32) -> (usize, usize, Vec<u8>) {
 pub fn write_proof_sheets() {
     use image::codecs::gif::{GifEncoder, Repeat};
     use image::{Delay, Frame, RgbaImage};
+    // Proof artifacts land in the run root (next to the exe), matching where a `cargo run --
+    // --weave-proof` judged them when the process cwd was still pinned there.
+    let root = neuron::runroot::run_root();
     let nframes = 24;
     let mut frames = Vec::with_capacity(nframes);
     for i in 0..nframes {
@@ -2138,7 +2141,7 @@ pub fn write_proof_sheets() {
             ));
         }
     }
-    if let Ok(file) = std::fs::File::create("_weave_proof.gif") {
+    if let Ok(file) = std::fs::File::create(root.join("_weave_proof.gif")) {
         let mut enc = GifEncoder::new_with_speed(file, 12);
         let _ = enc.set_repeat(Repeat::Infinite);
         let _ = enc.encode_frames(frames);
@@ -2146,7 +2149,7 @@ pub fn write_proof_sheets() {
     // a single still for quick inspection
     let (w, h, buf) = weave_proof_sheet(0.7);
     if let Some(img) = RgbaImage::from_raw(w as u32, h as u32, buf) {
-        let _ = img.save("_weave_proof.png");
+        let _ = img.save(root.join("_weave_proof.png"));
     }
     // the GALLERY sheet — the exact metaball swatch the MATERIAL page shows (same renderer, same
     // 220×132 tile), every material × a few time samples, so the gallery look is judgeable headless.
@@ -2169,7 +2172,7 @@ pub fn write_proof_sheets() {
             }
         }
     }
-    let _ = sheet.save("_weave_gallery.png");
+    let _ = sheet.save(root.join("_weave_gallery.png"));
 }
 
 #[cfg(test)]

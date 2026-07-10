@@ -206,10 +206,16 @@ pub fn organ_status() -> Vec<(&'static str, Option<u64>, bool)> {
         .collect()
 }
 
+/// The crash log lives in the run root (next to the exe) — the panic hook, the SEH filter, the
+/// on-demand dump, and the RELIABILITY panel's reader must all mean the SAME file.
+pub fn crash_log_path() -> std::path::PathBuf {
+    neuron::runroot::run_root().join("neuron-crash.log")
+}
+
 /// How many crash/stall dumps `neuron-crash.log` holds (0 if absent/unreadable) — the panel's
 /// honest "has this app ever fallen over?" count, read straight from the on-disk record.
 pub fn crash_dump_count() -> usize {
-    std::fs::read_to_string("neuron-crash.log")
+    std::fs::read_to_string(crash_log_path())
         .map(|s| s.matches("dump reason:").count())
         .unwrap_or(0)
 }
@@ -281,7 +287,7 @@ pub fn dump_to_crash_log(reason: &str) {
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("neuron-crash.log")
+        .open(crash_log_path())
     {
         let _ = writeln!(f, "[flight] dump reason: {reason}");
         dump(&mut f);

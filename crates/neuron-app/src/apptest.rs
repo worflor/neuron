@@ -660,7 +660,7 @@ fn all_perf_controls_have_callbacks() {
 #[test]
 fn app_rule_add_then_remove() {
     let Some(app) = try_window() else { return };
-    // `apps.toml` + profiles/ are cwd-relative; isolate (and serialize via the shared cwd lock).
+    // `apps.toml` + profiles/ resolve via the run root; isolate (and serialize via the shared guard).
     let _cwd = crate::testsupport::cwd_guard("apptest_apprule");
     let shared = glue::install(&app);
     let st = app.global::<State>();

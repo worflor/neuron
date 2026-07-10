@@ -154,9 +154,13 @@ struct PresetDoc {
     width: f32,
 }
 
+fn board_path() -> std::path::PathBuf {
+    neuron::runroot::run_root().join("board.toml")
+}
+
 fn board_load() -> (Pen, Vec<Pen>) {
     use std::sync::atomic::Ordering::SeqCst;
-    let doc: BoardDoc = std::fs::read_to_string("board.toml")
+    let doc: BoardDoc = std::fs::read_to_string(board_path())
         .ok()
         .and_then(|s| toml::from_str(&s).ok())
         .unwrap_or_default();
@@ -214,7 +218,7 @@ fn board_save(pen: &Pen, presets: &[Pen]) {
         py: park.1,
     };
     if let Ok(body) = toml::to_string_pretty(&doc) {
-        let _ = std::fs::write("board.toml", body);
+        let _ = std::fs::write(board_path(), body);
     }
 }
 

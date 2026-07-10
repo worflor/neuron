@@ -1295,7 +1295,10 @@ impl AppRuntime {
         match r {
             Ok(_) => {
                 // a deleted profile can't stay "active" — the header pill must drop to none.
-                if self.active_profile == name {
+                // Compare against the PROCESS-WIDE cursor too, not just our display copy: an
+                // async apply updates the cell on its worker before this copy catches up, and
+                // a delete landing in that window used to leave the cell dangling.
+                if self.active_profile == name || neuron::profile::active() == name {
                     self.active_profile = "—".into();
                     neuron::profile::set_active("");
                 }
@@ -2178,8 +2181,9 @@ fn snapshot_device(def: &DeviceDef, pid: u16, path: &transport::DevicePath) -> S
             getters,
         }],
     };
-    let _ = std::fs::create_dir_all("backups");
-    let path = std::path::Path::new("backups").join(snap.filename());
+    let dir = neuron::runroot::run_root().join("backups");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join(snap.filename());
     match std::fs::write(&path, snap.to_json()) {
         Ok(_) => format!(
             "backed up {} getters -> {}",
@@ -2301,9 +2305,9 @@ mod tests {
     /// Profile save -> reload round-trips through the runtime (uses a temp-named profile, cleaned up).
     #[test]
     fn profile_save_and_delete_roundtrip() {
-        // `Profile::path` is cwd-relative (`profiles/<name>.toml`), and the editor/prefs/apptest
-        // tests swap the process-global cwd. Take the shared cwd lock so this save+reload is
-        // isolated in its own temp dir and can't race a cwd swap out from under it.
+        // `Profile::path` resolves via the run root (`NEURON_RUN_DIR`), and the editor/prefs/apptest
+        // tests swap that process-global override. Take the shared guard so this save+reload is
+        // isolated in its own temp dir and can't race an override swap out from under it.
         let _cwd = crate::testsupport::cwd_guard("runtime_profile");
         let mut rt = AppRuntime::load();
         let name = format!("__neuron_test_{}", std::process::id());

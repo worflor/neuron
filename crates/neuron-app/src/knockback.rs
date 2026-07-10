@@ -51,7 +51,7 @@ pub fn owned_vk() -> i32 {
 
 /// Where the familiar's brain is persisted between sessions.
 fn brain_path() -> std::path::PathBuf {
-    std::path::Path::new("runtime").join("twin.knbk")
+    neuron::runroot::run_root().join("runtime").join("twin.knbk")
 }
 
 /// Enter or leave the session.

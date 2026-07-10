@@ -1166,11 +1166,16 @@ pub fn install(app: &AppWindow) -> SharedRt {
     UI_SHARED.with(|s| *s.borrow_mut() = Some(shared.clone()));
     let st = app.global::<State>();
 
-    // the ABOUT nameplate — version (compile-time) + where the config/run dir lives
+    // the ABOUT nameplate — version (compile-time) + where the config/run dir lives.
+    // run_root(), NOT current_dir: the CWD is the user's shell/scheduler directory and no
+    // config lives there — showing it would point users at the wrong folder.
     st.set_app_version(env!("CARGO_PKG_VERSION").into());
-    if let Ok(dir) = std::env::current_dir() {
-        st.set_run_dir(dir.display().to_string().into());
-    }
+    st.set_run_dir(
+        neuron::runroot::run_root()
+            .display()
+            .to_string()
+            .into(),
+    );
 
     // initial population — every readout seeded from persisted/device truth.
     refresh_devices(app, &shared);
@@ -3365,12 +3370,34 @@ pub fn install(app: &AppWindow) -> SharedRt {
                                     // sidecar set) — a row index held open in the inline editor may not
                                     // survive, so close it rather than let it seed from a stale row.
                                     st.set_editing_rule(-1);
-                                    st.set_active_profile(applied.name.clone().into());
+                                    // The apply ran on a worker for SECONDS (stream-stop + device
+                                    // writes) — the profile can be DELETED while it's in flight (the
+                                    // sheet's ×). The settings landed either way, but a gone file must
+                                    // not become "active": that leaves the header pill and the
+                                    // process-wide cursor naming a profile that no longer exists, and
+                                    // the next live-trigger status post re-asserts it forever.
+                                    let loaded_lighting =
+                                        match neuron::profile::Profile::load(&applied.name) {
+                                            Ok(p) => {
+                                                st.set_active_profile(applied.name.clone().into());
+                                                Some(p.lighting)
+                                            }
+                                            Err(_) => {
+                                                neuron::profile::set_active("");
+                                                st.set_active_profile("\u{2014}".into());
+                                                None
+                                            }
+                                        };
+                                    let profile_exists = loaded_lighting.is_some();
                                     with_shared(|sh| {
                                         {
                                             let mut s = sh.borrow_mut();
                                             s.rt.persist = persist;
-                                            s.rt.active_profile = applied.name.clone();
+                                            s.rt.active_profile = if profile_exists {
+                                                applied.name.clone()
+                                            } else {
+                                                "\u{2014}".into()
+                                            };
                                             s.rt.gaming_mode = policy;
                                         }
                                         refresh_profiles(&app, sh);
@@ -3382,9 +3409,8 @@ pub fn install(app: &AppWindow) -> SharedRt {
                                         // (Every OTHER board resumes too, below, via `reapply_all_boards`
                                         // — this local `stack` only ever seeds the selected board's live
                                         // layers.)
-                                        let stack = neuron::profile::Profile::load(&applied.name)
-                                            .map(|p| p.lighting)
-                                            .ok()
+                                        let stack = loaded_lighting
+                                            .clone()
                                             .filter(|l| !l.is_empty())
                                             .unwrap_or_else(|| prev_lighting.clone());
                                         if !stack.is_empty() {
@@ -9249,29 +9275,25 @@ fn open_in_file_manager(path: &std::path::Path) {
 }
 
 fn open_config_dir() {
-    let dir = std::env::current_dir().unwrap_or_else(|_| ".".into());
-    open_in_file_manager(&dir);
+    // The config home is the RUN ROOT (exe dir / NEURON_RUN_DIR) — never the process CWD,
+    // which is whatever directory the user's shell or the task scheduler happened to hold.
+    open_in_file_manager(&neuron::runroot::run_root());
 }
 
-/// Reveal the macros folder (`macros/scripts/`) in the OS file manager — the Workshop's "drop a .py
-/// here" affordance. The core's `macros_dir()` is cwd-relative, so resolve it to an ABSOLUTE path
-/// (join the run dir) and CREATE it if missing, so reveal works on a fresh install and a user can
-/// drop scripts in before any macro has been saved.
+/// Reveal the macros folder (`macros/scripts/` in the run root) in the OS file manager — the
+/// Workshop's "drop a .py here" affordance. CREATE it if missing, so reveal works on a fresh
+/// install and a user can drop scripts in before any macro has been saved.
 fn reveal_macros_folder() {
-    let dir = std::env::current_dir()
-        .unwrap_or_else(|_| ".".into())
-        .join(neuron::macros::macro_host::macros_dir());
+    let dir = neuron::macros::macro_host::macros_dir();
     let _ = std::fs::create_dir_all(&dir);
     open_in_file_manager(&dir);
 }
 
-/// Reveal the strokelab output folder (`./strokes/`, cwd-relative like the vault) in the OS file
-/// manager — clicking a "saved strokes/…" line jumps you to the exported `.gwyph` + `.json`. Resolve
-/// to an ABSOLUTE path and create it if missing, so reveal works even before the first capture.
+/// Reveal the strokelab output folder (`strokes/` in the run root) in the OS file manager —
+/// clicking a "saved strokes/…" line jumps you to the exported `.gwyph` + `.json`. Create it if
+/// missing, so reveal works even before the first capture.
 fn reveal_strokes_folder() {
-    let dir = std::env::current_dir()
-        .unwrap_or_else(|_| ".".into())
-        .join("strokes");
+    let dir = crate::strokelab::strokes_dir();
     let _ = std::fs::create_dir_all(&dir);
     open_in_file_manager(&dir);
 }
@@ -9561,10 +9583,7 @@ pub fn refresh_reliability(app: &AppWindow) {
 fn open_crash_log() {
     // ensure the file exists so "open" never opens nothing — a fresh dump is a useful first entry.
     crate::flight::dump_to_crash_log("opened from the reliability panel");
-    let path = std::env::current_dir()
-        .unwrap_or_else(|_| ".".into())
-        .join("neuron-crash.log");
-    open_in_file_manager(&path);
+    open_in_file_manager(&crate::flight::crash_log_path());
 }
 
 #[cfg(test)]

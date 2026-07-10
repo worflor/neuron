@@ -1095,10 +1095,15 @@ fn post_status(weak: &slint::Weak<AppWindow>, status: &Arc<Mutex<LiveStatus>>) {
                 // stomping the status line erased deliberate feedback ("binding added") with
                 // background scroll-wheel noise before the user could read it.
             }
-            if !snap.active_profile.is_empty() {
-                // a live ProfileSwitch/Cycle moved the cursor — mirror it into the header pill,
-                // the GUI runtime, and the Profiles panel highlight.
-                crate::glue::note_live_profile(&app, &snap.active_profile);
+            // a live ProfileSwitch/Cycle moved the cursor — mirror it into the header pill,
+            // the GUI runtime, and the Profiles panel highlight. Read the process-wide cell
+            // NOW, not the snapshot: `snap.active_profile` is a cache refreshed only when a
+            // trigger fires, so after a delete/apply cleared the cell, a later status post
+            // (tick, focus change) would re-assert the deleted profile from the stale copy.
+            // The cell is the ONE cursor; display time reads display truth.
+            let live_cursor = neuron::profile::active();
+            if !live_cursor.is_empty() {
+                crate::glue::note_live_profile(&app, &live_cursor);
             }
             st.set_live_held(snap.held_layers.clone().into());
         }
@@ -1158,8 +1163,8 @@ mod tests {
     // These drive `live_edge`/`live_tick` directly against a `LiveCtx::for_tests` — never through
     // `run_worker` (which is LIVE-PATH ONLY: it arms input and would need a real listener). Every
     // test that builds a `LiveCtx` wraps itself in `cwd_guard` because `LiveCtx::for_tests` calls
-    // `controls::build_runtime()`, which reads several cwd-relative config files — without the
-    // guard a test could race another test's cwd swap and read garbage (see testsupport.rs).
+    // `controls::build_runtime()`, which reads several run-root config files — without the
+    // guard a test could race another test's NEURON_RUN_DIR swap and read garbage (see testsupport.rs).
 
     /// A minimal `profiles/*.rules.toml` sidecar binding one [`Trigger::AppFocus`] to
     /// [`neuron::action::Action::Echo`] — kept as one helper so every wiring test below writes the

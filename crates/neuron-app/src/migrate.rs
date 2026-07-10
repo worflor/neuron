@@ -170,7 +170,7 @@ pub fn apply(imp: &Imported) -> Result<String, String> {
 /// Write the imported rules to `profiles/<name>.rules.toml`. Returns the path written.
 fn save_rules_sidecar(name: &str, rules: &[neuron::engine::Rule]) -> Result<String, String> {
     use neuron::engine::RuleDoc;
-    let dir = std::path::PathBuf::from("profiles");
+    let dir = neuron::profile::profiles_dir();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let path = dir.join(format!("{name}.rules.toml"));
     let doc = RuleDoc {

@@ -94,7 +94,7 @@ fn run() {
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open("neuron_profile.log")
+            .open(neuron::runroot::run_root().join("neuron_profile.log"))
         {
             let _ = writeln!(f, "{line}");
         }

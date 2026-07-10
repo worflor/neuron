@@ -1010,7 +1010,7 @@ use neuron::engine::RuleDoc;
 
 /// The path the GUI's authored binds live at — read by `controls::load_rule_sidecars`.
 pub fn gui_rules_path() -> std::path::PathBuf {
-    std::path::PathBuf::from("profiles").join("gui.rules.toml")
+    neuron::profile::profiles_dir().join("gui.rules.toml")
 }
 
 /// Load the GUI-authored spine rules (the removable, editable set the Bindings panel owns).
@@ -1025,7 +1025,7 @@ pub fn load_gui_rules() -> Vec<Rule> {
 
 /// Save the GUI-authored spine rules back to the sidecar.
 pub fn save_gui_rules(rules: &[Rule]) -> Result<(), String> {
-    std::fs::create_dir_all("profiles").map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(neuron::profile::profiles_dir()).map_err(|e| e.to_string())?;
     let doc = RuleDoc {
         rules: rules.to_vec(),
     };

@@ -337,6 +337,12 @@ fn build_bundle(
     }
 }
 
+/// Where captured strokes land (`strokes/` in the run root) — shared with the SYSTEM panel's
+/// "reveal strokes" affordance so the writer and the reveal can't drift apart.
+pub fn strokes_dir() -> PathBuf {
+    neuron::runroot::run_root().join("strokes")
+}
+
 /// Capture-result handler: write `<dir>/stroke_<id>.{gwyph,json}` for one stroke + its timestamps.
 /// Returns `(json_path, gwyph_path, n_points)` on success. A stroke shorter than 3 points has no
 /// geometry to study — caller should treat that as "too short", not an error.
@@ -346,7 +352,7 @@ pub fn dump_stroke(
     cfg: &GlyphConfig,
     vault: &Vault,
 ) -> std::io::Result<(PathBuf, PathBuf, usize)> {
-    let dir = PathBuf::from("strokes");
+    let dir = strokes_dir();
     std::fs::create_dir_all(&dir)?;
 
     let id = format!("{}_{}", now_ms(), SEQ.fetch_add(1, Ordering::Relaxed));

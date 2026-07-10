@@ -545,7 +545,7 @@ pub fn run_purge_and_log() {
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("neuron-purge.log")
+        .open(neuron::runroot::run_root().join("neuron-purge.log"))
     {
         let _ = writeln!(
             f,
@@ -610,7 +610,7 @@ pub fn scan_and_log() {
         .create(true)
         .write(true)
         .truncate(true)
-        .open("neuron-synapse-scan.log")
+        .open(neuron::runroot::run_root().join("neuron-synapse-scan.log"))
     {
         let _ = f.write_all(report.as_bytes());
     }

@@ -388,9 +388,9 @@ static PREFS_CACHE: OnceLock<Mutex<Prefs>> = OnceLock::new();
 static PREFS_DIRTY: AtomicBool = AtomicBool::new(true);
 
 impl Prefs {
-    /// The prefs file path (run-directory-relative, like the rest of the config).
+    /// The prefs file path (in the run root, like the rest of the config).
     pub fn path() -> PathBuf {
-        PathBuf::from("app.toml")
+        neuron::runroot::run_root().join("app.toml")
     }
 
     /// Load the prefs (never errors). An absent file yields all-defaults silently (normal first run).

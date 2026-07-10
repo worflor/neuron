@@ -225,8 +225,12 @@ mod imp {
         (v != u64::MAX).then_some(((v >> 32) as u32 as i32, v as u32 as i32))
     }
 
+    fn anchor_path() -> std::path::PathBuf {
+        neuron::runroot::run_root().join("glance.toml")
+    }
+
     fn anchor_load() {
-        if let Ok(s) = std::fs::read_to_string("glance.toml") {
+        if let Ok(s) = std::fs::read_to_string(anchor_path()) {
             let get = |k: &str| {
                 s.lines()
                     .find(|l| l.trim_start().starts_with(k))
@@ -242,7 +246,7 @@ mod imp {
     fn anchor_save() {
         if let Some((x, y)) = unpack(ANCHOR.load(Ordering::SeqCst)) {
             let _ = std::fs::write(
-                "glance.toml",
+                anchor_path(),
                 format!("# where the glance cluster is parked\nx = {x}\ny = {y}\n"),
             );
         }
