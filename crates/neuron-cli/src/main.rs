@@ -38,12 +38,13 @@ enum Cmd {
     /// Self-emergent capability discovery: probe ANY Razer razer_report device, no registry
     Discover {
         /// adopt unknown devices: synthesize a FULL device def per unknown device and write it
-        /// to ./devices/auto/ (same as `neuron adopt`)
+        /// to devices/auto/ in the run folder (same as `neuron adopt`)
         #[arg(long)]
         emit: bool,
     },
     /// Adopt unknown Razer devices: probe the getter space, synthesize a complete device def
-    /// (commands + lighting dialect + measured link pacing) and write ./devices/auto/<pid>.toml.
+    /// (commands + lighting dialect + measured link pacing) and write devices/auto/<pid>.toml
+    /// in the run folder (next to the neuron binaries).
     /// From then on the file is plain per-device config — editable, never overwritten.
     Adopt {
         /// print the synthesized TOML instead of writing files, and include ALREADY-KNOWN
@@ -633,7 +634,7 @@ enum GestureCmd {
 // ── KNOCKBACK — the rhythm familiar (headless proof + SVG export) ───────────
 
 fn twin_default_path() -> std::path::PathBuf {
-    std::path::Path::new("runtime").join("twin.knbk")
+    neuron::runroot::run_root().join("runtime").join("twin.knbk")
 }
 
 /// A scripted, deterministic player — a mix that exercises the whole loop: a steady groove
@@ -717,13 +718,24 @@ fn twin_cmd(action: TwinCmd) -> Result<()> {
                     println!("storyboard SVG → {svg_path}");
                 }
             }
-            // persist the grown familiar
-            let path = twin_default_path();
+            // persist the grown familiar — but NEVER over the real one: the app's live familiar
+            // learns from the user's actual play for weeks, and a scripted 16-turn proof silently
+            // replacing it is data loss (it happened). A demo brain gets its own file; only a
+            // rig with no familiar yet seeds the real path so the demo remains the first-run hook.
+            let real = twin_default_path();
+            let path = if real.exists() {
+                real.with_file_name("twin-demo.knbk")
+            } else {
+                real
+            };
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
             std::fs::write(&path, fam.save())?;
             println!("familiar saved → {}", path.display());
+            if path.file_name().and_then(|n| n.to_str()) == Some("twin-demo.knbk") {
+                println!("(your real familiar was left untouched — this demo brain saved beside it)");
+            }
         }
         TwinCmd::Stats { file } => {
             let path = file
@@ -968,7 +980,15 @@ fn pocket_cmd(name: Option<String>, list: bool, keep: bool, sigil: Option<String
     }
     // The move mutates the clipboard — arm for this one-shot run.
     neuron::action::arm_input(true);
-    println!("{}", neuron::pocket::activate(&slot, keep));
+    // A CLI pocket is ALWAYS durable: this process exits on the next line, so a RAM-only slot
+    // (the resident app's default) would take the user's clipboard with it — a stash that
+    // reports success and then destroys the payload. `--keep` stays accepted (it's the app's
+    // vocabulary) but the disk mirror is not optional here.
+    let _ = keep;
+    println!("{}", neuron::pocket::activate(&slot, true));
+    // activate() persists on a worker thread; this process exits NOW — flush synchronously or
+    // the worker dies mid-write and the stash evaporates (live-verified before this call existed).
+    neuron::pocket::flush_durable_sync();
     Ok(())
 }
 
@@ -2115,15 +2135,17 @@ fn backup_cmd(reg: &Registry, pid_filter: Option<&str>) -> Result<()> {
     if targets.is_empty() {
         bail!("no recognized razer_report devices found to back up");
     }
-    std::fs::create_dir_all("backups")?;
+    let backups_dir = neuron::runroot::run_root().join("backups");
+    std::fs::create_dir_all(&backups_dir)?;
     for (vid, pid, name) in targets {
         let snap = snapshot_device(vid, pid, name, &infos, now);
-        let path = format!("backups/{}", snap.filename());
+        let path = backups_dir.join(snap.filename());
         std::fs::write(&path, snap.to_json())?;
         println!(
-            "backed up {} (pid {pid:04x}): {} getters -> {path}",
+            "backed up {} (pid {pid:04x}): {} getters -> {}",
             snap.name,
-            snap.getter_count()
+            snap.getter_count(),
+            path.display()
         );
     }
     println!("\n(read-only snapshot — restore/verify uses this as the known-good reference for gated writes)");
@@ -2323,7 +2345,7 @@ fn import_export_cmd(file: &str, apply: bool) -> Result<()> {
         let doc = RuleDoc {
             rules: imported.rules.clone(),
         };
-        std::fs::create_dir_all("profiles").ok();
+        std::fs::create_dir_all(neuron::profile::profiles_dir()).ok();
         std::fs::write(&path, toml::to_string_pretty(&doc)?)
             .with_context(|| format!("writing {}", path.display()))?;
         println!(
@@ -2338,7 +2360,7 @@ fn import_export_cmd(file: &str, apply: bool) -> Result<()> {
 use neuron::engine::RuleDoc;
 
 fn rules_sidecar_path(name: &str) -> std::path::PathBuf {
-    std::path::PathBuf::from("profiles").join(format!("{name}.rules.toml"))
+    neuron::profile::profiles_dir().join(format!("{name}.rules.toml"))
 }
 
 // ───────────────────────────────────────── macros ────────────────────────────────────────────
@@ -3540,7 +3562,7 @@ fn key_down(_vk: i32) -> bool {
 // standalone GetAsyncKeyState loop — one config, one dispatcher, CLI and GUI can't drift.
 
 fn gui_rules_path() -> std::path::PathBuf {
-    std::path::PathBuf::from("profiles").join("gui.rules.toml")
+    neuron::profile::profiles_dir().join("gui.rules.toml")
 }
 
 fn load_gui_rules() -> Vec<neuron::engine::Rule> {
@@ -3552,7 +3574,7 @@ fn load_gui_rules() -> Vec<neuron::engine::Rule> {
 }
 
 fn save_gui_rules(rules: Vec<neuron::engine::Rule>) -> Result<()> {
-    std::fs::create_dir_all("profiles")?;
+    std::fs::create_dir_all(neuron::profile::profiles_dir())?;
     let doc = neuron::engine::RuleDoc { rules };
     std::fs::write(gui_rules_path(), toml::to_string_pretty(&doc)?)?;
     Ok(())
@@ -3645,7 +3667,10 @@ fn sniper_cmd(rebind: bool, dpi_override: Option<u16>) -> Result<()> {
 }
 
 fn storage_status(reg: &Registry, raw: bool) -> Result<()> {
-    let d = open_first(reg)?;
+    // Resolve by CAPABILITY, not enumeration order (same rule as `battery`): "the device with
+    // onboard storage", never "the first device" — which is a storage-less keyboard whenever
+    // one sorts first, making the command unusable on a multi-device rig.
+    let d = open_with_command(reg, "storage_info")?;
     let s = cap::storage(&d)?;
     let (macros, profiles) = cap::storage_counts(&d).unwrap_or((0, 0));
     let pct = s.pct_remaining();
