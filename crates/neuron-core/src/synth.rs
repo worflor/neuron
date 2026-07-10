@@ -180,6 +180,13 @@ fn timed_exec(
     max_polls: usize,
 ) -> Option<([u8; 80], Duration)> {
     use crate::protocol::{reply_status, Report, Status, BUF_LEN};
+
+    // Hold the pipe's wire lock for this ONE request/reply conversation only — not the whole probe
+    // sweep. A sweep touches dozens of commands; locking per-pair (not per-sweep) is what lets a
+    // 30fps lighting writer interleave between pairs instead of starving for the sweep's duration.
+    let wire = t.wire_lock();
+    let _wire = wire.as_ref().map(|w| w.acquire());
+
     let mut req = Report::command(PROBE_TX, class, id, size);
     for (i, b) in args.iter().enumerate() {
         if i < req.args.len() {

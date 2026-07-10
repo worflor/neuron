@@ -60,7 +60,7 @@ fn state() -> &'static Mutex<HashMap<u16, Vitals>> {
 /// must call [`mark_stale`] so the claim doesn't strand the device for a whole window.
 pub fn due(pid: u16, forced: bool) -> bool {
     let now = Instant::now();
-    let mut map = state().lock().unwrap();
+    let mut map = state().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let v = map
         .entry(pid)
         .or_insert(Vitals { next_read_at: now, batt: UNREAD, charging: false });
@@ -74,7 +74,7 @@ pub fn due(pid: u16, forced: bool) -> bool {
 
 /// A claimed read FAILED — allow a retry shortly ([`RETRY_AFTER`]) rather than holding the full window.
 pub fn mark_stale(pid: u16) {
-    let mut map = state().lock().unwrap();
+    let mut map = state().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(v) = map.get_mut(&pid) {
         v.next_read_at = Instant::now() + RETRY_AFTER;
     }
@@ -83,7 +83,7 @@ pub fn mark_stale(pid: u16) {
 /// The last-known charging state for `pid`, if we have a real prior sample. Lets a feed point fall
 /// back to the prior charge state on a charge-read blip instead of defaulting to a phantom "unplugged".
 pub fn last_charging(pid: u16) -> Option<bool> {
-    let map = state().lock().unwrap();
+    let map = state().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     map.get(&pid).filter(|v| v.batt != UNREAD).map(|v| v.charging)
 }
 
@@ -97,7 +97,7 @@ pub fn observe(pid: u16, batt: u8, charging: bool, from_event: bool) {
     // (pct, title, prev) cards to emit once the lock is dropped. Empty Vec doesn't allocate.
     let mut cards: Vec<(u32, &'static str, Option<u32>)> = Vec::new();
     {
-        let mut map = state().lock().unwrap();
+        let mut map = state().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let v = map
             .entry(pid)
             .or_insert(Vitals { next_read_at: now, batt: UNREAD, charging: false });

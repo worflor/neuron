@@ -3,7 +3,7 @@
 > stale, wrong, or slop — or it may be load-bearing and exactly right.
 > code is the source of truth; verify before you lean on it.
 >
-> **kind:** app-level technical design (the living architecture doc) · **as of:** 2026-06-19 · **trust:** high — broadly matches the tree; the map most worth reading first
+> **kind:** app-level technical design (the living architecture doc) · **as of:** 2026-06-19, §8 test-surface refreshed 2026-07-09 (pre-release hardening) · **trust:** high — broadly matches the tree; the map most worth reading first
 
 # Neuron Technical Design Document
 
@@ -605,16 +605,19 @@ Coverage that already exists:
 - Gesture/radial/rhythm/twin/scene/overlay helper tests.
 - Engram integration tests.
 
-Gaps to close for daily-driver confidence:
+Gaps CLOSED in the 2026-07-09 pre-release hardening pass (each name is the shipped test):
 
-- Existing UI reload smoke exists; missing is a worker/rebuild integration test that edits a binding/cast rule, calls `dispatch::request_reload`, and proves the live runtime consumes the changed rule.
-- A live-dispatch simulation seam that can feed `LiveCommand::Inject`, reload clearing, held turbo repeats, and `DeviceSession` retry behavior through the worker-owned command path without Raw Input or real device writes.
-- A test-only safety seam, or focused tests for Observe/Device/disarm transitions, that proves UI stance changes keep input/write/macro gates synchronized without arming real input in ordinary tests.
-- A test that `DeviceSession::with_writable` invalidates and retries a stale handle once.
-- A test around `beacon` trigger ownership: editor weave, pending prompt, whiteboard, and knockback must not double-consume the same trigger.
-- A persistence audit test that no GUI save path writes outside the executable/run directory after cwd pinning.
-- A deterministic no-hardware transport fixture proving device-bound diagnostics skip rather than silently pass.
-- Existing Macro Host e2e covers warm/error/beacon behavior; missing is an app-level sidecar death/respawn/re-register regression that proves app-side dispatch remains non-blocking when the sidecar dies mid-session.
+- ✅ Worker consumes a config edit: `dispatch::tests::reload_consumes_a_config_edit` — file edit + `LiveCommand::Reload` + one `live_tick` provably changes what the live engine resolves.
+- ✅ Live-dispatch simulation seam: the worker's closures were extracted into `live_edge`/`live_tick` over a `LiveCtx` (built once, survives listener reopens — zero behavior change), with `LiveCtx::for_tests`; inject / reload-clear / latch-reconcile / channel-disconnect are each pinned (`inject_fires_through_the_same_engine`, `reload_clears_held_state`, `hypershift_latch_reconciles`, `tick_survives_command_channel_disconnect`).
+- ✅ Safety stance transitions: `safety.rs` tests pin all four stances' gate pairs, idempotence, and gate independence — no real input armed, globals restored by RAII guard.
+- ✅ `DeviceSession::with_writable` stale-handle retry: `device.rs` tests (`with_writable_retries_once_recovers_from_a_stale_handle_and_rehandshakes`, `…keeps_the_first_failure_in_context…`) via the `with_writable_via` resolve seam (no enumeration, no hardware).
+- ✅ Beacon trigger ownership + persistence audit + startup-order contracts: beacon ownership predicates pinned in `beacon.rs` tests; the persistence audit lives in `testsupport.rs` (path-derivation assertions + a behavioral save sample under `cwd_guard`); main.rs's three comment-only startup orderings are now `debug_assert` contracts (`glue::ui_installed` before `hidwatch::start`, `host::start_attempted` before `build_window`) plus an upgraded CONTRACT comment for the set-armed-before-dispatch ordering.
+- ✅ Sidecar death regression: `tests/macro_host_respawn.rs` — kill the sidecar mid-session, prove dispatch stays non-blocking and the documented recovery path works.
+- ✅ (Bonus, same pass) Wire-pair atomicity: `dialect::tests::two_handles_never_cross_read_replies_on_one_pipe`; writer pause gate: `writer.rs::pauser_actually_parks_the_stream_not_just_documents_it`; poison-discipline convention: `testsupport.rs conventions::no_bare_poison_unwraps_in_production_code` (132 production sites converted 2026-07-09).
+
+Still open (honest):
+
+- A deterministic no-hardware transport fixture proving device-bound diagnostics skip rather than silently pass (diagnostics already report skip in practice; the fixture that PINS it is unwritten).
 
 ## 9. Architecture Risks
 

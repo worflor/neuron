@@ -172,11 +172,11 @@ mod sys {
             };
             // Update tracked modifier state first, then decide.
             let new_mods = {
-                let mut m = MODS.lock().unwrap();
+                let mut m = MODS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 *m = track(*m, ev);
                 *m
             };
-            let policy = *POLICY.lock().unwrap();
+            let policy = *POLICY.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if decide(&policy, ev, new_mods) {
                 return 1; // swallow: do NOT call the next hook -> the chord never reaches the OS.
             }
@@ -195,7 +195,7 @@ mod sys {
         let h: HHOOK =
             unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(proc), std::ptr::null_mut(), 0) };
         if !h.is_null() {
-            *HANDLE.lock().unwrap() = h as isize;
+            *HANDLE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = h as isize;
             INSTALLED.store(true, Ordering::SeqCst);
         }
         // Force the thread message queue into existence BEFORE publishing our tid, so the
@@ -220,14 +220,14 @@ mod sys {
             // No window, no messages of our own to dispatch — the hook already fired above. Loop.
         }
         // Unhook on the SAME thread that owns the hook, then reset shared state.
-        let hh = *HANDLE.lock().unwrap();
+        let hh = *HANDLE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if hh != 0 {
             // SAFETY: `hh` is the handle we installed on this thread and have not yet removed.
             unsafe { UnhookWindowsHookEx(hh as HHOOK) };
-            *HANDLE.lock().unwrap() = 0;
+            *HANDLE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = 0;
         }
         INSTALLED.store(false, Ordering::SeqCst);
-        *MODS.lock().unwrap() = Mods::default();
+        *MODS.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Mods::default();
     }
 
     /// Spawn the pump thread and wait (briefly) for its install-attempt handshake. Returns the
@@ -269,14 +269,14 @@ mod sys {
     /// second call while already pumping just updates the live policy — the callback reads `POLICY`
     /// every event, so no thread work is needed. Returns `true` if a hook is now active.
     pub fn install(policy: GamingMode) -> bool {
-        *POLICY.lock().unwrap() = policy;
+        *POLICY.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = policy;
         if !policy.any() {
             uninstall();
             return false;
         }
         // Hold the PUMP lock across the whole spawn decision so concurrent installs can't race into
         // two pump threads. The pump thread itself never touches this lock, so no deadlock.
-        let mut pump = PUMP.lock().unwrap();
+        let mut pump = PUMP.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if pump.is_some() {
             return true; // already pumping; POLICY was updated above and is read live.
         }
@@ -293,7 +293,7 @@ mod sys {
     /// to normal Alt+Tab/Win/Alt+F4 behaviour immediately — the reversibility guarantee. The actual
     /// `UnhookWindowsHookEx` + MODS reset happen on the pump thread as it exits.
     pub fn uninstall() {
-        let handle = PUMP.lock().unwrap().take();
+        let handle = PUMP.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
         let Some(PumpHandle { join, tid }) = handle else {
             return; // not pumping.
         };
@@ -399,12 +399,12 @@ static DESIRED_POLICY: StdMutex<GamingMode> = StdMutex::new(GamingMode {
 /// next [`reconcile`] on the listener thread installs / updates / drops the hook to match. Safe to
 /// call from any thread (e.g. the UI thread on profile apply); does NOT itself touch Win32.
 pub fn set_policy(policy: GamingMode) {
-    *DESIRED_POLICY.lock().unwrap() = policy;
+    *DESIRED_POLICY.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = policy;
 }
 
 /// The currently desired policy (the one [`reconcile`] will enforce). Mostly for diagnostics/tests.
 pub fn policy() -> GamingMode {
-    *DESIRED_POLICY.lock().unwrap()
+    *DESIRED_POLICY.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Make the installed hook match [`policy`]. Call from ANY thread — the hook self-hosts its pump
@@ -418,7 +418,7 @@ pub fn policy() -> GamingMode {
 /// `slot` is the caller-owned RAII handle (held for the session so Drop uninstalls on shutdown).
 #[cfg(windows)]
 pub fn reconcile(slot: &mut Option<Hook>) {
-    let desired = *DESIRED_POLICY.lock().unwrap();
+    let desired = *DESIRED_POLICY.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if desired.any() {
         // Already hooked: update the live policy WITHOUT dropping the existing handle (dropping
         // first would stop + respawn the pump — the thrash bug). `sys::install` updates in place.
@@ -435,7 +435,7 @@ pub fn reconcile(slot: &mut Option<Hook>) {
 /// Non-Windows: no hook concept; keep the desired policy carrier coherent but install nothing.
 #[cfg(not(windows))]
 pub fn reconcile(slot: &mut Option<Hook>) {
-    let desired = *DESIRED_POLICY.lock().unwrap();
+    let desired = *DESIRED_POLICY.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if desired.any() {
         if slot.is_none() {
             *slot = Some(install(desired));

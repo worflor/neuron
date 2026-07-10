@@ -331,10 +331,13 @@ fn main() {
         );
         app.as_weak()
     };
-    // Set the macro gate's atomic BEFORE the live runtime can route a single fire, so a python
-    // macro triggered on the very first frame already sees the correct arm state (no startup window
-    // where a fire could slip through against the intended gate). This only sets an atomic + a
-    // non-blocking frame; the sidecar itself is warmed below, off-thread.
+    // CONTRACT: set the macro gate's atomic BEFORE `dispatch::LiveRuntime::start` below — a python
+    // macro triggered on the very first frame must already see the correct arm state (no startup
+    // window where a fire could slip through against the intended gate). Not debug_assert-able like
+    // the other two startup-order contracts in this file (`glue::install_ui` before `hidwatch::start`,
+    // `host::start` before `build_window`): `false` is a legitimate armed state, so there's no wrong
+    // value to catch — only a wrong ORDER, which this comment is the guard against. This only sets an
+    // atomic + a non-blocking frame; the sidecar itself is warmed below, off-thread.
     neuron::macros::macro_host().set_armed(armed);
 
     let live = dispatch::LiveRuntime::start(weak.clone(), armed);
@@ -760,6 +763,10 @@ fn select_renderer_backend() {
 /// Create the window + install glue if not already present — WITHOUT showing it. Quick actions
 /// need the runtime, not a window in the user's face.
 fn build_window(resident: &Rc<RefCell<Resident>>) {
+    debug_assert!(
+        host::start_attempted(),
+        "startup-order contract: host::start must run before build_window — restore_lighting (run inside build_window) needs the host routing decision already made (main.rs wiring)"
+    );
     if resident.borrow().window.is_some() {
         return;
     }

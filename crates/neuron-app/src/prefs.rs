@@ -502,10 +502,10 @@ impl Prefs {
         let cell = PREFS_CACHE.get_or_init(|| Mutex::new(Prefs::load()));
         if PREFS_DIRTY.swap(false, Ordering::AcqRel) {
             let fresh = Prefs::load();
-            *cell.lock().unwrap() = fresh.clone();
+            *cell.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = fresh.clone();
             fresh
         } else {
-            cell.lock().unwrap().clone()
+            cell.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
         }
     }
 

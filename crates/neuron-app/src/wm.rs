@@ -381,7 +381,7 @@ pub fn tether_preview(slot: &str) -> TetherPreview {
     // a stone whose window has since closed is as good as unset — exactly tether()'s `existing`.
     let existing = stones()
         .lock()
-        .unwrap()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(&key)
         .copied()
         .filter(|a| os().is_window(a.hwnd));
@@ -411,7 +411,7 @@ pub fn tether(slot: &str) -> String {
     // a stone whose window has since closed is as good as unset.
     let existing = stones()
         .lock()
-        .unwrap()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(&key)
         .copied()
         .filter(|a| os().is_window(a.hwnd));
@@ -419,7 +419,10 @@ pub fn tether(slot: &str) -> String {
     match existing {
         // standing ON the tethered window → let it go (this is the untether the toggle never had)
         Some(a) if os().is_foreground(a.hwnd) => {
-            stones().lock().unwrap().remove(&key);
+            stones()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&key);
             format!("\u{1f5ff} tether released{label}")
         }
         // away from the stone → come back to it
@@ -430,7 +433,10 @@ pub fn tether(slot: &str) -> String {
         // nothing tethered → drop the stone here
         None => match capture() {
             Some(a) => {
-                stones().lock().unwrap().insert(key.clone(), a);
+                stones()
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(key.clone(), a);
                 format!("\u{1f5ff} tethered{label} \u{2192} {}", os().title_of(a.hwnd))
             }
             None => "nothing to tether to here".into(),
@@ -467,7 +473,7 @@ pub fn wormhole_preview(slot: &str) -> WormholePreview {
     let live = |k: &str| {
         stones()
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(k)
             .copied()
             .filter(|a| os().is_window(a.hwnd))
@@ -503,7 +509,7 @@ pub fn wormhole(slot: &str) -> String {
     let live = |k: &str| {
         stones()
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(k)
             .copied()
             .filter(|a| os().is_window(a.hwnd))
@@ -520,7 +526,10 @@ pub fn wormhole(slot: &str) -> String {
         // endpoint A empty → capture here as A (the first half of the portal)
         (None, _) => match capture() {
             Some(anc) => {
-                stones().lock().unwrap().insert(ka, anc);
+                stones()
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(ka, anc);
                 format!(
                     "\u{1f300} wormhole A set{label} \u{2192} {} \u{00b7} now mark B",
                     os().title_of(anc.hwnd)
@@ -531,7 +540,10 @@ pub fn wormhole(slot: &str) -> String {
         // A set, B empty → capture here as B (completes the portal)
         (Some(_), None) => match capture() {
             Some(anc) => {
-                stones().lock().unwrap().insert(kb, anc);
+                stones()
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(kb, anc);
                 format!(
                     "\u{1f300} wormhole B set{label} \u{2192} {} \u{00b7} press to swap",
                     os().title_of(anc.hwnd)

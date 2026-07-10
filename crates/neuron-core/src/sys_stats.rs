@@ -119,7 +119,7 @@ const IDLE_STOP_MS: u64 = 4000; // stop the thread if no getter read in ~4s
 /// — so it's cheap to call every frame. Refreshes the idle timer so a brand-new thread doesn't
 /// immediately auto-stop before the first getter read lands.
 pub fn ensure() {
-    let mut running = inner().lock().unwrap();
+    let mut running = inner().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     LAST_ACCESS_MS.store(now_ms(), Ordering::Relaxed);
     if *running {
         return;
@@ -154,7 +154,7 @@ fn run() {
     loop {
         // ── control: idle auto-stop ──
         {
-            let mut running = inner().lock().unwrap();
+            let mut running = inner().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let idle = now_ms().saturating_sub(LAST_ACCESS_MS.load(Ordering::Relaxed));
             if idle > IDLE_STOP_MS {
                 *running = false;

@@ -165,6 +165,16 @@ fn explorer_path() -> Option<std::path::PathBuf> {
     }
 }
 
+/// The Win32 clipboard is a single PROCESS-WIDE resource with no internal per-thread locking: the
+/// pointer `GetClipboardData` hands back is only valid until *any* thread calls `CloseClipboard`.
+/// Two of our threads capturing at once (the parallel context probes do exactly this) would race —
+/// one thread's `CloseClipboard` frees/moves the block the other is still scanning through
+/// `GlobalLock`, a use-after-free that surfaces as an access violation or heap corruption. This
+/// mutex holds the whole Open→…→Close window to ONE capturer at a time. (Cross-process contention
+/// is already handled: a foreign holder just makes our `OpenClipboard` fail → `None`.)
+#[cfg(windows)]
+static CLIPBOARD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(windows)]
 fn clipboard_text() -> Option<String> {
     use windows_sys::Win32::Foundation::HANDLE;
@@ -175,6 +185,10 @@ fn clipboard_text() -> Option<String> {
 
     // CF_UNICODETEXT = 13.
     const CF_UNICODETEXT: u32 = 13;
+    // Serialize this process's clipboard window; a poisoned lock still yields the guard so a prior
+    // panic in an unrelated capture never wedges clipboard reads (the critical section is unsafe FFI
+    // that itself never panics, so there is no corrupt state to protect against).
+    let _guard = CLIPBOARD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     unsafe {
         // OpenClipboard(NULL) associates with the current task; can fail if another process holds
         // it — degrade to None rather than block.

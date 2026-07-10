@@ -129,7 +129,7 @@ fn arm_new(mouse_pids: &HashSet<u16>, armed: &Arc<Mutex<HashSet<DevicePath>>>) {
         if !event_carrying {
             continue;
         }
-        if !armed.lock().unwrap().insert(info.path.clone()) {
+        if !armed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(info.path.clone()) {
             continue; // already armed
         }
         spawn_reader(info.pid, info.path.clone(), armed.clone());
@@ -147,7 +147,7 @@ fn spawn_reader(pid: u16, path: DevicePath, armed: Arc<Mutex<HashSet<DevicePath>
                     if verbose() {
                         eprintln!("[macrokeys] {tag}: not readable ({e})");
                     }
-                    armed.lock().unwrap().remove(&path); // let the monitor retry later
+                    armed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&path); // let the monitor retry later
                     return;
                 }
             };
@@ -160,7 +160,7 @@ fn spawn_reader(pid: u16, path: DevicePath, armed: Arc<Mutex<HashSet<DevicePath>
                     Ok(n) if n > 0 => decode(&buf[..n], pid),
                     Ok(_) => {} // zero-length read — keep listening
                     Err(_) => {
-                        armed.lock().unwrap().remove(&path); // unplugged — monitor re-arms on replug
+                        armed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&path); // unplugged — monitor re-arms on replug
                         if verbose() {
                             eprintln!("[macrokeys] {tag}: closed");
                         }

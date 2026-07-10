@@ -473,6 +473,7 @@ pub struct ClientStatus {
 /// shows the LIVE truth instead: `refresh_host_status` reads `active()`, never the pref, so a
 /// failed boot can't paint the Connections toggle green over a dead host.
 pub fn start() {
+    START_ATTEMPTED.store(true, Ordering::Relaxed);
     let on = match std::env::var("NEURON_HOST") {
         Ok(v) if v == "0" || v.eq_ignore_ascii_case("off") => false,
         Ok(v) if v == "1" || v.eq_ignore_ascii_case("on") => true,
@@ -484,6 +485,16 @@ pub fn start() {
              connections stay OFF this session; the saved preference is preserved"
         );
     }
+}
+
+/// Startup-order contract probe: has `start()` run yet (regardless of whether the host actually
+/// came up)? `main.rs`'s `build_window` runs `restore_lighting`, which needs the host's routing
+/// decision already made — even a decided-OFF host still means the decision was made, so this
+/// tracks the call, not [`active`].
+static START_ATTEMPTED: AtomicBool = AtomicBool::new(false);
+
+pub fn start_attempted() -> bool {
+    START_ATTEMPTED.load(Ordering::Relaxed)
 }
 
 /// The SYSTEM master toggle. Returns a user-facing status line (house style).

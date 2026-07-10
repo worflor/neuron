@@ -531,7 +531,36 @@ fn run_phases() {
         eprintln!("[pocket 20] fnv1a_hash_slot_name_collision_zero OK");
     }
 
+    // ── 21. refused_clipboard_write_moves_nothing (review finding, 2026-07-09) ─────────────────
+    // The ordinary FALLIBLE path, not the panic path: a foreign process grabs the clipboard
+    // between activate()'s read and its write (`set_clipboard` returns false). The exchange must
+    // move NOTHING — the pocketed payload stays in the slot (not silently consumed), the
+    // clipboard is untouched, the generation doesn't bump, and the status says so honestly.
+    {
+        safety::set_input_armed(true);
+        testclip::reset_store();
+        // seed the slot through a WORKING clipboard first: pocket <- "precious".
+        testclip::install_text("precious");
+        activate("ref", false);
+        assert_eq!(view_of("ref").text.as_deref(), Some("precious"));
+        // now the clipboard turns hostile: reads show "live-stuff", every write is refused.
+        testclip::install_refusing_text("live-stuff");
+        let g0 = generation();
+        let r = activate("ref", false);
+        assert!(
+            r.contains("nothing moved"),
+            "a refused clipboard write must report an honest no-move: {r}"
+        );
+        assert_eq!(
+            view_of("ref").text.as_deref(),
+            Some("precious"),
+            "the pocketed payload must SURVIVE a refused exchange — never silently consumed"
+        );
+        assert_eq!(generation(), g0, "a refused exchange is not a move");
+        eprintln!("[pocket 21] refused_clipboard_write_moves_nothing OK");
+    }
+
     // a final clean state for the public API after the storm.
     let _ = pocket::generation();
-    eprintln!("[pocket] all 20 phases passed");
+    eprintln!("[pocket] all 21 phases passed");
 }

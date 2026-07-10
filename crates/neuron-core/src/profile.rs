@@ -539,12 +539,12 @@ static ACTIVE: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
 /// Record `name` as the currently-applied profile (call after a successful apply).
 pub fn set_active(name: &str) {
-    *ACTIVE.lock().unwrap() = name.to_string();
+    *ACTIVE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = name.to_string();
 }
 
 /// The currently-applied profile name ("" if none applied this process lifetime).
 pub fn active() -> String {
-    ACTIVE.lock().unwrap().clone()
+    ACTIVE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
 }
 
 /// Resolve the next profile index for a `ProfileCycle`, stepping from `current` by `step` (+1/-1)

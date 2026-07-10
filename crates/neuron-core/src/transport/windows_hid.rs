@@ -2,12 +2,17 @@
 //! open the control collection with dwDesiredAccess = 0 (Windows blocks GENERIC_R/W on a
 //! mouse, but HidD_Get/SetFeature use FILE_ANY_ACCESS IOCTLs, so access=0 works).
 
-use super::{DevicePath, HidDeviceInfo, Transport};
+use super::{wire_lock_for, DevicePath, HidDeviceInfo, Transport, WireLock};
 use anyhow::{bail, Result};
 use std::ffi::c_void;
 use std::ptr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use windows_sys::core::GUID;
+use windows_sys::Win32::Security::{
+    InitializeSecurityDescriptor, SetSecurityDescriptorDacl, ACL, SECURITY_ATTRIBUTES,
+    SECURITY_DESCRIPTOR,
+};
+use windows_sys::Win32::System::Threading::{CreateMutexW, ReleaseMutex};
 use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
     SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInterfaces, SetupDiGetClassDevsW,
     SetupDiGetDeviceInterfaceDetailW, DIGCF_DEVICEINTERFACE, DIGCF_PRESENT,
@@ -29,6 +34,13 @@ const GENERIC_WRITE_FLAG: u32 = 0x4000_0000; // GENERIC_WRITE — output reports
 const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000; // async I/O flag (dwFlagsAndAttributes slot, not access)
 const ERROR_IO_PENDING: u32 = 997; // ReadFile returned 0 but the overlapped op is in flight
 const WAIT_OBJECT_0: u32 = 0; // WaitForSingleObject: the event signaled (read completed)
+const WAIT_ABANDONED_0: u32 = 0x80; // WaitForSingleObject: mutex holder DIED — ownership transferred to us
+const SECURITY_DESCRIPTOR_REVISION: u32 = 1; // the only revision Win32 has ever defined
+/// Bounded wait for the cross-process wire mutex: a conversation legitimately holds ≤~600ms
+/// worst-case (the ACK'd 60×10ms poll against a non-answering device), so 2s of waiting means the
+/// foreign holder is wedged — proceed with only the process-local lock rather than deadlock a
+/// user's command behind a hung process (see `super::WireLock`'s degradation rules).
+const WIRE_OS_WAIT_MS: u32 = 2000;
 
 // The Win32 OVERLAPPED control block for an async ReadFile. `Win32_System_IO` is NOT in this
 // crate's windows-sys feature set (see Cargo.toml — frozen manifest), so the struct AND its
@@ -224,6 +236,12 @@ pub struct WinHid {
     /// interior mutability the `&self` trait method needs; `WinHid` is single-threaded per `Device`
     /// so the lock is uncontended. `None` until the first `read_input`.
     read_handle: Mutex<Option<HANDLE>>,
+    /// The pipe's shared WIRE LOCK, resolved via [`wire_lock_for`] on `path` — every `WinHid`
+    /// opened on the same `DevicePath` (a separate handle from a separate in-process actor) gets
+    /// the IDENTICAL `Arc`, so a `Dialect`'s conversation-holding guard serializes them; the
+    /// lock's kernel half ([`OsWireMutex`]) extends the same guarantee across PROCESSES (see
+    /// `Transport::wire_lock` and LIGHTING-MAP §5).
+    wire: Arc<WireLock>,
 }
 
 impl WinHid {
@@ -266,6 +284,7 @@ impl WinHid {
                 can_write,
                 path: path.clone(),
                 read_handle: Mutex::new(None),
+                wire: wire_lock_for(path),
             })
         }
     }
@@ -276,7 +295,7 @@ impl Drop for WinHid {
         unsafe {
             CloseHandle(self.handle);
             // Close the lazily-opened overlapped read handle too, if `read_input` ever opened one.
-            if let Some(rh) = *self.read_handle.lock().unwrap() {
+            if let Some(rh) = *self.read_handle.lock().unwrap_or_else(std::sync::PoisonError::into_inner) {
                 CloseHandle(rh);
             }
         }
@@ -343,7 +362,117 @@ impl Drop for WinHidReader {
     }
 }
 
+/// The KERNEL half of a [`WireLock`]: a named Win32 mutex shared by every process on this login
+/// session that opens the same control pipe — the app's host writer and a `neuron-cli` command
+/// resolve the identical kernel object by name, so their request/reply conversations serialize
+/// exactly like two in-process handles do (LIGHTING-MAP §5, cross-process closure).
+pub(super) struct OsWireMutex {
+    handle: HANDLE,
+}
+
+// SAFETY: the HANDLE is a kernel-object reference; WaitForSingleObject/ReleaseMutex are
+// thread-safe entry points. The Win32 rule that a mutex must be RELEASED by the thread that
+// acquired it is enforced structurally: `WireGuard` holds a `MutexGuard` and is therefore !Send,
+// so acquire and release can never land on different threads.
+unsafe impl Send for OsWireMutex {}
+unsafe impl Sync for OsWireMutex {}
+
+impl OsWireMutex {
+    /// The named mutex for a device pipe. The name must be STABLE ACROSS PROCESSES, so it's an
+    /// FNV-1a hash of the path's UTF-16 units — NOT `DefaultHasher`, whose SipHash keys are
+    /// randomized per process (two processes would derive two different names and never meet).
+    /// `Local\` namespace = this login session, the only place two neuron processes coexist
+    /// (and it needs no privilege, unlike `Global\`).
+    pub(super) fn for_path(path: &DevicePath) -> Option<OsWireMutex> {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for unit in path.to_wide_nul() {
+            for b in unit.to_le_bytes() {
+                h = (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        Self::open_named(&format!("Local\\neuron-wire-{h:016x}"))
+    }
+
+    /// Create-or-open the named mutex with an EXPLICIT NULL DACL (everyone full access). This is
+    /// load-bearing, not laziness: with NULL security attributes the object inherits the creator
+    /// TOKEN's default DACL, and an elevated process's token owner is BUILTIN\Administrators — a
+    /// default-DACL mutex created by the elevated tray app would be unopenable by an unelevated
+    /// `neuron-cli` (whose filtered token lacks Administrators), silently killing the
+    /// cross-process guarantee in exactly the deployment it exists for (elevated tray + normal
+    /// shell). A world-accessible mutex is a safe object to leave open: the worst a hostile local
+    /// process can do is HOLD it, and the bounded wait in `WireLock::acquire` caps that at a 2s
+    /// delay before degrading to local-only — a nuisance, not a lockout. `None` on any create
+    /// failure → the caller runs process-local, never worse than the pre-kernel-layer behavior.
+    pub(super) fn open_named(name: &str) -> Option<OsWireMutex> {
+        unsafe {
+            let mut sd: SECURITY_DESCRIPTOR = std::mem::zeroed();
+            let psd = &mut sd as *mut SECURITY_DESCRIPTOR as *mut c_void;
+            if InitializeSecurityDescriptor(psd, SECURITY_DESCRIPTOR_REVISION) == 0 {
+                return None;
+            }
+            // present=TRUE + dacl=NULL is the documented "NULL DACL" (allow everyone) shape —
+            // distinct from "no DACL present", which would fall back to the default DACL.
+            if SetSecurityDescriptorDacl(psd, 1, ptr::null::<ACL>(), 0) == 0 {
+                return None;
+            }
+            let sa = SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: psd,
+                bInheritHandle: 0,
+            };
+            let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+            // bInitialOwner = FALSE: creating must not implicitly acquire — acquisition is
+            // exclusively WireLock::acquire's job, or the create-path would deadlock itself.
+            let handle = CreateMutexW(&sa, 0, wide.as_ptr());
+            if handle.is_null() {
+                None
+            } else {
+                Some(OsWireMutex { handle })
+            }
+        }
+    }
+
+    /// Bounded acquire; `true` = held. `WAIT_ABANDONED` counts as held: the previous holder DIED
+    /// mid-conversation, ownership transferred to us, and the reply-echo filter already tolerates
+    /// whatever half-conversation the corpse left on the pipe (the same story as a same-process
+    /// crash before this layer existed). Timeout/failure = `false` → the caller proceeds with only
+    /// the process-local lock (see `WIRE_OS_WAIT_MS` for why that's the right failure).
+    pub(super) fn acquire(&self) -> bool {
+        self.acquire_for(WIRE_OS_WAIT_MS)
+    }
+
+    /// [`acquire`](Self::acquire) with an explicit wait budget — the production path always uses
+    /// `WIRE_OS_WAIT_MS`; tests use short budgets to PROVE blocking (a must-time-out probe while
+    /// another process holds the mutex) without stalling the suite.
+    pub(super) fn acquire_for(&self, ms: u32) -> bool {
+        unsafe {
+            matches!(
+                WaitForSingleObject(self.handle, ms),
+                WAIT_OBJECT_0 | WAIT_ABANDONED_0
+            )
+        }
+    }
+
+    pub(super) fn release(&self) {
+        unsafe {
+            ReleaseMutex(self.handle);
+        }
+    }
+}
+
+impl Drop for OsWireMutex {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.handle);
+        }
+    }
+}
+
 impl Transport for WinHid {
+    fn wire_lock(&self) -> Option<Arc<WireLock>> {
+        Some(self.wire.clone())
+    }
+
     fn set_feature(&self, buf: &[u8]) -> Result<()> {
         unsafe {
             if HidD_SetFeature(self.handle, buf.as_ptr() as *const c_void, buf.len() as u32) == 0 {
@@ -395,7 +524,7 @@ impl Transport for WinHid {
         // GENERIC_READ + FILE_FLAG_OVERLAPPED and enforce the timeout with WaitForSingleObject +
         // CancelIo. Opened lazily on first use (many devices never speak the output/input surface)
         // and cached in `read_handle`. Contained here — the proven feature-report path never sees it.
-        let mut slot = self.read_handle.lock().unwrap();
+        let mut slot = self.read_handle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if slot.is_none() {
             let wide = self.path.to_wide_nul();
             unsafe {

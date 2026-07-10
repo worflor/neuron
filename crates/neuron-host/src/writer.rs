@@ -543,4 +543,88 @@ mod tests {
         pauser.release();
         assert_eq!(pauser.pause.load(Ordering::Relaxed), 0, "release saturates at zero");
     }
+
+    /// The sibling the test above stops short of: it only checks the `parked` BOOKKEEPING flag,
+    /// never that frames actually stop landing in the sink. LIGHTING-MAP §5's io_gate/sniper race is
+    /// about the real feature-report channel — a pauser that flips `parked` correctly but still lets
+    /// the writer thread call `sink.write` underneath a concurrent getter would reintroduce the exact
+    /// clobber the valve exists to prevent. Uses `Content::Live` (an ever-incrementing counter, not a
+    /// static `Fill`) so frames keep changing every tick — a static scene would dedup+heal-sweep into
+    /// quiescence on its own, making "frames stopped" ambiguous between "paused" and "nothing new to
+    /// paint".
+    #[test]
+    fn pauser_actually_parks_the_stream_not_just_documents_it() {
+        use crate::api::{LeaseSpec, SurfaceInfo, SurfaceKind};
+        use crate::arbiter::{band, Content, LiveContent};
+        use crate::shell::Host;
+
+        struct Counter(u8);
+        impl LiveContent for Counter {
+            fn render(&mut self, _now: Instant) -> Vec<Option<Rgb>> {
+                self.0 = self.0.wrapping_add(1);
+                vec![Some(Rgb(self.0, self.0, self.0))]
+            }
+            fn boxed_clone(&self) -> Box<dyn LiveContent> {
+                Box::new(Counter(self.0))
+            }
+        }
+
+        let host = Host::spawn();
+        let mut h = host.handle();
+        h.declare(SurfaceInfo::grid("kbd", "Board", SurfaceKind::Keyboard, 1, 1));
+        let owner = h.next_source();
+        h.claim(
+            "kbd",
+            owner,
+            band::BASE,
+            LeaseSpec::Pinned,
+            Content::Live(Box::new(Counter(0))),
+            Instant::now(),
+        )
+        .unwrap();
+
+        let sink = MockSink::new();
+        let writer_sink = sink.clone();
+        // MAX_WRITER_FPS (30) — the pipeline's real ceiling — so the millisecond bounds below read
+        // directly as "N missed ticks" at the writer's actual pace, not an arbitrary test-only rate.
+        let writer = Writer::spawn(host.handle(), "kbd", MAX_WRITER_FPS, move || writer_sink);
+        let pauser = writer.pauser();
+
+        // Let the writer come up and stream a handful of ever-changing frames.
+        thread::sleep(Duration::from_millis(100));
+        let before_pause = sink.frames().len();
+        assert!(
+            before_pause >= 2,
+            "writer must be actively streaming before we test pausing it: {before_pause} frames"
+        );
+
+        pauser.engage(); // blocks (up to ~100ms) until the writer confirms it parked
+        // One frame may already be in flight right at the parking edge — give it room to land
+        // before taking the "frozen" baseline.
+        thread::sleep(Duration::from_millis(15));
+        let frozen_at = sink.frames().len();
+
+        // 150ms at 30fps is ~4-5 missed ticks: generous enough to be CI-safe while still a hard
+        // failure if the valve were merely documentation (parked flips, frames keep flowing anyway).
+        thread::sleep(Duration::from_millis(150));
+        assert_eq!(
+            sink.frames().len(),
+            frozen_at,
+            "no new frames may land while the pause valve is engaged — the stream must actually \
+             park, not just flip a flag nobody reads"
+        );
+
+        pauser.release();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let resumed = loop {
+            if sink.frames().len() > frozen_at {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert!(resumed, "frames must resume arriving within a bounded window after the last release");
+    }
 }

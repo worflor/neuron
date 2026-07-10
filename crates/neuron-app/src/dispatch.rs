@@ -25,9 +25,11 @@
 //! never arm and never start this runtime.
 
 use crate::ui::{AppWindow, State};
+use neuron::controls::{self, ControlEvent, HoldEdges, InputEdge, MIC_TAP};
 use neuron::engine::Trigger;
 use neuron::executor::{DispatchExecutor, DispatchOutcome, IntentRunner, TurboRuntime};
 use slint::ComponentHandle;
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -255,6 +257,105 @@ impl Drop for LiveRuntime {
     }
 }
 
+/// Every borrow the live worker's two `listen_until` closures need, gathered into one struct so the
+/// closure BODIES can live in named functions ([`live_edge`], [`live_tick`]) a test can call
+/// directly — one edge / one tick at a time — instead of only ever running inside [`run_worker`]'s
+/// immortal loop.
+///
+/// `run_worker` wraps the whole struct in ONE `RefCell` and hands both closures a shared reference
+/// to it; each closure opens its own `borrow_mut()` for the span of its own call. `listen_until`
+/// invokes `on_event` and `on_tick` strictly sequentially (never re-entrantly — see its own doc), so
+/// the two `borrow_mut()`s never overlap at runtime; this is the same trick the pre-refactor code
+/// already used with a `RefCell` per field (`rt`/`exec`/`devices`/`edges`/`turbos`/…), just gathered
+/// under one lock instead of many. Fields that a free function ELSEWHERE in this module already
+/// takes as `&RefCell<...>` keep that inner `RefCell` (so those signatures don't change): `rt`,
+/// `exec`, `devices`, `edges`, `momentary`, `held_keys`, `sniper`, `turbos`. Everything else is a
+/// plain field, mutated directly through the `&mut LiveCtx` that `live_edge`/`live_tick` get from
+/// their own `RefCell<LiveCtx>::borrow_mut()`.
+struct LiveCtx<'a> {
+    rt: RefCell<controls::Runtime>,
+    exec: RefCell<DispatchExecutor>,
+    devices: RefCell<neuron::device::DeviceSession<'a>>,
+    /// Status shared with the UI: only post deltas (the loop runs hot, the UI updates on events).
+    status: Arc<Mutex<LiveStatus>>,
+    weak: slint::Weak<AppWindow>,
+    /// Edge-detector: a Razer report is the SET of buttons currently down, so we DIFF successive
+    /// reports into per-button down/up edges. This fixes multi-button chords (every newly-pressed
+    /// control dispatches, not just the first hit) and precise HyperShift release (only the input
+    /// that actually went up releases ITS layer — no blanket release_all on any empty report).
+    edges: RefCell<HoldEdges>,
+    /// MOMENTARY MIC held state: trigger -> (mic device, mute-state to restore on release). A held
+    /// momentary action the stateless dispatch can't express — the edge loop owns its press/release.
+    momentary: MomentaryMap,
+    /// INPUT→KEY REMAP held state: trigger -> the output VKs currently held down. A key remap holds
+    /// its output key while the control is held (so a macro key / remapped button acts like the real
+    /// key — hold = hold, the OS auto-repeats), which the stateless tap-only action can't express.
+    held_keys: KeyHoldMap,
+    /// SNIPER held state: trigger -> the DPI to RESTORE on release (snapshotted at press, so it
+    /// respects whatever stage the mouse was on). A held device write the stateless dispatch can't
+    /// express — the edge loop owns the drop on DOWN and the restore on UP, like the momentary mic.
+    sniper: SniperMap,
+    turbos: RefCell<TurboRuntime>,
+    live_rx: Receiver<LiveCommand>,
+    /// Mic-tap detection reads the CACHED mic mute (refreshed off-thread by `beacon::audio_cache`).
+    /// Polling `VolumeCtl::get_mute()` inline here used to hang the whole dispatch loop when an audio
+    /// endpoint stalled (Core-Audio COM blocks indefinitely) — the dispatch-stall the flight log
+    /// caught. The cache means NO COM on this hot path; tap latency is the cache's ~400ms, fine for
+    /// a mute toggle. `None` until the cache warms / if no mic.
+    last_mute: Option<bool>,
+    switcher: neuron::app_focus::AppFocusSwitch,
+    tick: u32,
+    reload_pending: bool,
+    injected: Vec<Trigger>,
+    hypershift_latch: bool,
+    applied_hypershift_latch: bool,
+    gaming_policy_dirty: bool,
+    /// GamingMode suppression hook handle. `None` in every `#[cfg(test)]`-built `LiveCtx` (see
+    /// [`LiveCtx::for_tests`]) — a test must never touch the real Win32 LL hook.
+    hook: Option<neuron::hook::Hook>,
+}
+
+#[cfg(test)]
+impl<'a> LiveCtx<'a> {
+    /// Build a `LiveCtx` for a unit test. Reads config from the CURRENT process cwd exactly like
+    /// [`run_worker`]'s real construction does (via [`controls::build_runtime`]) — a test isolates
+    /// that by wrapping itself in [`crate::testsupport::cwd_guard`] before calling this. Takes an
+    /// already-built empty [`neuron::registry::Registry`] by reference (the caller owns it, since
+    /// [`neuron::device::DeviceSession`] borrows it — the same local-then-borrow shape `run_worker`
+    /// itself uses for `reg`/`devices`). Uses a DEAD `slint::Weak` (`Default`): there is no running
+    /// event loop in a test, and `post_status`'s `slint::invoke_from_event_loop` call already
+    /// tolerates that — with no platform registered it just returns
+    /// `Err(EventLoopError::NoEventLoopProvider)` without ever touching the weak handle, exactly the
+    /// same as every `let _ = slint::invoke_from_event_loop(...)` call site already assumes.
+    /// NEVER installs the gaming hook (unlike `run_worker`'s real startup right after construction)
+    /// — a test must never install the real LL hook or race another test on the process-global
+    /// desired-policy cell; `hook` starts (and, in every test, stays) `None`.
+    fn for_tests(reg: &'a neuron::registry::Registry, live_rx: Receiver<LiveCommand>) -> Self {
+        LiveCtx {
+            rt: RefCell::new(controls::build_runtime()),
+            exec: RefCell::new(DispatchExecutor::new()),
+            devices: RefCell::new(neuron::device::DeviceSession::new(reg)),
+            status: Arc::new(Mutex::new(LiveStatus::default())),
+            weak: slint::Weak::default(),
+            edges: RefCell::new(HoldEdges::new()),
+            momentary: RefCell::new(std::collections::HashMap::new()),
+            held_keys: RefCell::new(std::collections::HashMap::new()),
+            sniper: RefCell::new(std::collections::HashMap::new()),
+            turbos: RefCell::new(TurboRuntime::new()),
+            live_rx,
+            last_mute: None,
+            switcher: neuron::app_focus::AppFocusSwitch::new(),
+            tick: 0,
+            reload_pending: false,
+            injected: Vec::new(),
+            hypershift_latch: false,
+            applied_hypershift_latch: false,
+            gaming_policy_dirty: false,
+            hook: None,
+        }
+    }
+}
+
 /// The worker body: arm input, install the gaming hook, build the engine, run the listen loop.
 ///
 /// PLATFORM-NEUTRAL: every callee here is portable or cfg-seamed at its source —
@@ -264,16 +365,13 @@ impl Drop for LiveRuntime {
 /// non-Windows host the loop still arms/builds the engine and processes reload/inject/profile
 /// commands on the tick — only hardware input edges are dormant (no source yet).
 fn run_worker(weak: slint::Weak<AppWindow>, stop: Arc<AtomicBool>, live_rx: Receiver<LiveCommand>) {
-    use neuron::controls::{self, HoldEdges, InputEdge, MIC_TAP};
-    use std::cell::RefCell;
-
     // Build the ONE unified spine (bindings.toml + cast.toml + profiles/*.rules.toml + apps.toml).
-    let rt = RefCell::new(controls::build_runtime());
-    let exec = RefCell::new(DispatchExecutor::new());
+    let rt = controls::build_runtime();
+    let exec = DispatchExecutor::new();
     let reg = neuron::registry::Registry::load().unwrap_or(neuron::registry::Registry {
         devices: Vec::new(),
     });
-    let devices = RefCell::new(neuron::device::DeviceSession::new(&reg));
+    let devices = neuron::device::DeviceSession::new(&reg);
 
     // Status shared with the UI: only post deltas (the loop runs hot, the UI updates on events).
     let status = Arc::new(Mutex::new(LiveStatus::default()));
@@ -283,19 +381,31 @@ fn run_worker(weak: slint::Weak<AppWindow>, stop: Arc<AtomicBool>, live_rx: Rece
     }
     post_status(&weak, &status);
 
-    // Mic-tap detection reads the CACHED mic mute (refreshed off-thread by `beacon::audio_cache`).
-    // Polling `VolumeCtl::get_mute()` inline here used to hang the whole dispatch loop when an audio
-    // endpoint stalled (Core-Audio COM blocks indefinitely) — the dispatch-stall the flight log
-    // caught. The cache means NO COM on this hot path; tap latency is the cache's ~400ms, fine for
-    // a mute toggle. `None` until the cache warms / if no mic.
-    let mut last_mute: Option<bool> = None;
-    let mut switcher = neuron::app_focus::AppFocusSwitch::new();
-    let mut tick = 0u32;
-    let mut reload_pending = false;
-    let mut injected = Vec::new();
-    let mut hypershift_latch = false;
-    let mut applied_hypershift_latch = false;
-    let mut gaming_policy_dirty = false;
+    // Every borrow the two `listen_until` closures below need, gathered into ONE `LiveCtx` (see its
+    // doc) built ONCE here — outside the immortal loop — so its state SURVIVES a listener reopen
+    // exactly like the individual RefCells it replaces used to.
+    let mut ctx = RefCell::new(LiveCtx {
+        rt: RefCell::new(rt),
+        exec: RefCell::new(exec),
+        devices: RefCell::new(devices),
+        status,
+        weak,
+        edges: RefCell::new(HoldEdges::new()),
+        momentary: RefCell::new(std::collections::HashMap::new()),
+        held_keys: RefCell::new(std::collections::HashMap::new()),
+        sniper: RefCell::new(std::collections::HashMap::new()),
+        turbos: RefCell::new(TurboRuntime::new()),
+        live_rx,
+        last_mute: None,
+        switcher: neuron::app_focus::AppFocusSwitch::new(),
+        tick: 0,
+        reload_pending: false,
+        injected: Vec::new(),
+        hypershift_latch: false,
+        applied_hypershift_latch: false,
+        gaming_policy_dirty: false,
+        hook: None,
+    });
 
     // GamingMode suppression hook (Alt+Tab / Win / Alt+F4). The hook SELF-HOSTS a dedicated
     // message-pump thread (see neuron::hook / sys::pump_main), so it is immune to THIS thread's
@@ -306,27 +416,7 @@ fn run_worker(weak: slint::Weak<AppWindow>, stop: Arc<AtomicBool>, live_rx: Rece
     // never reliably. Now this handle is just an ownership token pushing desired policy at a hook
     // that pumps itself. The policy comes from the active profile's ApplyReport; we read it from the
     // shared cell the glue updates on profile apply.
-    let mut hook: Option<neuron::hook::Hook> = None;
-    install_gaming_hook(&mut hook);
-
-    // Edge-detector: a Razer report is the SET of buttons currently down, so we DIFF successive
-    // reports into per-button down/up edges. This fixes multi-button chords (every newly-pressed
-    // control dispatches, not just the first hit) and precise HyperShift release (only the input
-    // that actually went up releases ITS layer — no blanket release_all on any empty report).
-    let edges = RefCell::new(HoldEdges::new());
-    // MOMENTARY MIC held state: trigger -> (mic device, mute-state to restore on release). A held
-    // momentary action the stateless dispatch can't express — the edge loop owns its press/release.
-    let momentary: RefCell<std::collections::HashMap<Trigger, (Option<String>, bool)>> =
-        RefCell::new(std::collections::HashMap::new());
-    // INPUT→KEY REMAP held state: trigger -> the output VKs currently held down. A key remap holds
-    // its output key while the control is held (so a macro key / remapped button acts like the real
-    // key — hold = hold, the OS auto-repeats), which the stateless tap-only action can't express.
-    let held_keys: KeyHoldMap = RefCell::new(std::collections::HashMap::new());
-    // SNIPER held state: trigger -> the DPI to RESTORE on release (snapshotted at press, so it
-    // respects whatever stage the mouse was on). A held device write the stateless dispatch can't
-    // express — the edge loop owns the drop on DOWN and the restore on UP, like the momentary mic.
-    let sniper: SniperMap = RefCell::new(std::collections::HashMap::new());
-    let turbos = RefCell::new(TurboRuntime::new());
+    install_gaming_hook(&mut ctx.get_mut().hook);
 
     // ── THE IMMORTAL LISTENER ── this worker is the organ that fires every cast and remap; if it
     // dies, spellweaving "visually works but nothing happens" — the worst reliability lie the app
@@ -340,213 +430,8 @@ fn run_worker(weak: slint::Weak<AppWindow>, stop: Arc<AtomicBool>, live_rx: Rece
                 None,
                 &stop,
                 false,
-                |ev| {
-                    // While a press-to-bind capture is in flight, the user is pressing a control to BIND it,
-                    // not to use it — track edges but fire NOTHING, so the captured key doesn't also run
-                    // whatever it's currently bound to. (During a CONTROL capture we mostly see nothing at
-                    // all: the capture's own transient listener steals the process's Raw-Input registration
-                    // until it ends — the resident pump re-arms itself right after; see controls REARM.)
-                    let capturing = crate::capture::CAPTURE_ACTIVE.load(Ordering::Relaxed);
-                    for edge in edges.borrow_mut().edges(ev) {
-                        if capturing {
-                            continue;
-                        }
-                        match edge {
-                            InputEdge::Down(trigger) => {
-                                // Hold any HyperShift layer THIS input activates (tracked per-input so its
-                                // release drops only its own layer), then dispatch the input's action.
-                                rt.borrow_mut().hold_for_input(&trigger);
-                                // An input→key REMAP holds the output key while held (edge-driven, like
-                                // the mic) so it behaves like the real key; every OTHER action fires once.
-                                // Skip fire_trigger when we held a key — firing would ALSO tap it.
-                                if !key_remap_press(&rt, &held_keys, &trigger, &status, &weak) {
-                                    if let Some(outcome) = fire_trigger(
-                                        &mut devices.borrow_mut(),
-                                        &mut rt.borrow_mut(),
-                                        &mut exec.borrow_mut(),
-                                        &trigger,
-                                        &status,
-                                        &weak,
-                                    ) {
-                                        turbos.borrow_mut().start(outcome.turbo);
-                                    }
-                                }
-                                // momentary mic: capture the rest state + flip while held.
-                                momentary_press(&rt, &momentary, &trigger);
-                                // sniper: snapshot the live DPI + drop to precision while held.
-                                sniper_press(&devices, &rt, &sniper, &trigger);
-                            }
-                            InputEdge::Up(trigger) => {
-                                rt.borrow_mut().release_for_input(&trigger);
-                                turbos.borrow_mut().release(&trigger);
-                                key_remap_release(&held_keys, &trigger); // release the held output key
-                                momentary_release(&momentary, &trigger); // restore the mic on release
-                                sniper_release(&devices, &sniper, &trigger); // restore the DPI on release
-                            }
-                        }
-                    }
-                    publish_held(&rt, &status, &weak);
-                },
-                || {
-                    tick = tick.wrapping_add(1);
-                    for cmd in live_rx.try_iter() {
-                        match cmd {
-                            LiveCommand::Reload => reload_pending = true,
-                            LiveCommand::Inject(trigger) => injected.push(trigger),
-                            LiveCommand::ToggleHyperShift(reply) => {
-                                hypershift_latch = !hypershift_latch;
-                                let _ = reply.send(hypershift_latch);
-                            }
-                            LiveCommand::ReconcileGamingHook => gaming_policy_dirty = true,
-                            LiveCommand::ApplyProfile {
-                                name,
-                                persist,
-                                reply,
-                            } => {
-                                let result =
-                                    apply_profile_live(&mut devices.borrow_mut(), &name, persist);
-                                if let Ok(applied) = &result {
-                                    neuron::hook::set_policy(applied.policy);
-                                    gaming_policy_dirty = true;
-                                    {
-                                        let mut s = status.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                                        s.last_trigger = format!("profile {name}");
-                                        s.last_action = applied.summary.clone();
-                                        s.active_profile = name.clone();
-                                    }
-                                    post_status(&weak, &status);
-                                }
-                                let _ = reply.send(result);
-                            }
-                        }
-                    }
-                    // flight heartbeat: the live loop proves it's alive every tick — a silent organ is
-                    // surfaced by the UI watch (and recorded in every crash dump).
-                    crate::flight::pulse(crate::flight::organ::DISPATCH);
-                    // Engine hot-reload: a GUI editor rewrote the config — rebuild NOW, before any
-                    // throttle (an atomic swap per tick is free; the RefCell has no outstanding borrow
-                    // here because the event and tick closures run sequentially on this thread).
-                    if reload_pending {
-                        reload_pending = false;
-                        momentary_release_all(&momentary); // a held mic can't survive a config swap
-                        key_remap_release_all(&held_keys); // nor a held remapped key
-                        sniper_release_all(&devices, &sniper); // nor a held sniper (restore the DPI)
-                        *rt.borrow_mut() = controls::build_runtime();
-                        exec.borrow_mut().clear();
-                        devices.borrow_mut().clear();
-                        turbos.borrow_mut().clear();
-                        applied_hypershift_latch = !hypershift_latch;
-                        *LAST_ACTION_DESC
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-                        publish_held(&rt, &status, &weak);
-                    }
-                    // Injected triggers (the weave watcher's resolved flicks/glyphs) — same Engine,
-                    // same fire path, so a cast composes with layers/intents/SAFE exactly like hardware.
-                    {
-                        let drained = std::mem::take(&mut injected);
-                        for t in drained {
-                            if fire_trigger(
-                                &mut devices.borrow_mut(),
-                                &mut rt.borrow_mut(),
-                                &mut exec.borrow_mut(),
-                                &t,
-                                &status,
-                                &weak,
-                            )
-                            .is_some()
-                            {
-                                crate::flight::trace("cast", "injected trigger fired", 0);
-                            } else {
-                                // a cast the user SAW resolve (the wheel lit, the glyph flared) that
-                                // matched nothing in the engine — that must never be a silent fizzle.
-                                crate::flight::trace("cast", "injected trigger matched NOTHING", 0);
-                                {
-                                    let mut s = status.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                                    s.last_trigger = t.describe();
-                                    s.last_action =
-                                "cast hit nothing \u{2014} not bound in the engine (reload/config mismatch?)".into();
-                                }
-                                post_status(&weak, &status);
-                            }
-                        }
-                    }
-                    if applied_hypershift_latch != hypershift_latch {
-                        rt.borrow_mut().latch_layer("hypershift", hypershift_latch);
-                        applied_hypershift_latch = hypershift_latch;
-                        publish_held(&rt, &status, &weak);
-                    }
-                    // Gaming policy is pushed by glue/profile apply; reconcile only when that shared
-                    // carrier changed instead of polling every dispatch tick.
-                    if gaming_policy_dirty {
-                        gaming_policy_dirty = false;
-                        install_gaming_hook(&mut hook);
-                    }
-                    {
-                        let mut intents = AppIntentRunner {
-                            devices: &mut devices.borrow_mut(),
-                        };
-                        turbos
-                            .borrow_mut()
-                            .tick(&mut exec.borrow_mut(), &mut intents);
-                    }
-                    if !tick.is_multiple_of(10) {
-                        return; // throttle the periodic polls to ~50 ms
-                    }
-                    // mic tap (cached Core-Audio mute toggle) -> a MicTap trigger AND its raw Input usage.
-                    if let Some(now) = crate::beacon::audio_cache::snap().mic.map(|(_, m)| m) {
-                        let fire = last_mute == Some(!now); // a real toggle (not the first warm read)
-                        last_mute = Some(now);
-                        if fire {
-                            // mirror the detected flip into the UI's mic pill — the panel otherwise only
-                            // updates on its own toggle or a manual refresh.
-                            let ui = weak.clone();
-                            let _ = slint::invoke_from_event_loop(move || {
-                                if let Some(app) = ui.upgrade() {
-                                    app.global::<State>().set_mic_muted(now);
-                                }
-                            });
-                            fire_trigger(
-                                &mut devices.borrow_mut(),
-                                &mut rt.borrow_mut(),
-                                &mut exec.borrow_mut(),
-                                &Trigger::MicTap,
-                                &status,
-                                &weak,
-                            );
-                            let (p, u) = MIC_TAP;
-                            fire_trigger(
-                                &mut devices.borrow_mut(),
-                                &mut rt.borrow_mut(),
-                                &mut exec.borrow_mut(),
-                                &Trigger::Input {
-                                    page: p,
-                                    usage: u,
-                                    pid: Some(0x056a),
-                                },
-                                &status,
-                                &weak,
-                            );
-                        }
-                    }
-                    // app-aware switch: a focus change fires an AppFocus trigger; the Engine's matching
-                    // rule (-> ProfileSwitch intent) does the switch (or nothing if unbound).
-                    if let Some(app) = switcher.poll() {
-                        {
-                            let mut s = status.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                            s.focused_app = app.clone();
-                        }
-                        post_status(&weak, &status);
-                        fire_trigger(
-                            &mut devices.borrow_mut(),
-                            &mut rt.borrow_mut(),
-                            &mut exec.borrow_mut(),
-                            &Trigger::AppFocus { app },
-                            &status,
-                            &weak,
-                        );
-                    }
-                },
+                |ev| live_edge(&mut ctx.borrow_mut(), ev),
+                || live_tick(&mut ctx.borrow_mut()),
             );
         }));
         if stop.load(Ordering::SeqCst) {
@@ -561,23 +446,255 @@ fn run_worker(weak: slint::Weak<AppWindow>, stop: Arc<AtomicBool>, live_rx: Rece
             },
             0,
         );
-        momentary_release_all(&momentary); // never strand a held mic across a respawn
-        key_remap_release_all(&held_keys); // nor a held remapped key
-        sniper_release_all(&devices, &sniper); // nor a held sniper (restore the DPI)
+        {
+            let c = ctx.borrow();
+            momentary_release_all(&c.momentary); // never strand a held mic across a respawn
+            key_remap_release_all(&c.held_keys); // nor a held remapped key
+            sniper_release_all(&c.devices, &c.sniper); // nor a held sniper (restore the DPI)
+        }
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
 
     // teardown: restore any mic a momentary action was holding (the loop ended mid-hold) + release
     // any remapped key still held + restore any sniper DPI still dropped, the hook drops here
     // (uninstalls), input disarms in LiveRuntime::stop.
-    momentary_release_all(&momentary);
-    key_remap_release_all(&held_keys);
-    sniper_release_all(&devices, &sniper);
+    {
+        let c = ctx.borrow();
+        momentary_release_all(&c.momentary);
+        key_remap_release_all(&c.held_keys);
+        sniper_release_all(&c.devices, &c.sniper);
+    }
     // the hold feed goes default with the loop — a painted mode light never outlives the mode.
     LAYER_HELD.store(false, Ordering::Relaxed);
     SNIPER_HELD.store(false, Ordering::Relaxed);
     push_hold_state();
-    drop(hook);
+    drop(ctx); // the hook (among everything else) drops here (uninstalls)
+}
+
+/// The live worker's per-event edge handler — the exact body of `run_worker`'s old `on_event`
+/// closure, verbatim (capture-active check, edge loop, down/up arms, publish_held), now callable
+/// one edge at a time so a test can drive it directly instead of only through the immortal loop.
+fn live_edge(ctx: &mut LiveCtx, ev: &ControlEvent) {
+    // While a press-to-bind capture is in flight, the user is pressing a control to BIND it,
+    // not to use it — track edges but fire NOTHING, so the captured key doesn't also run
+    // whatever it's currently bound to. (During a CONTROL capture we mostly see nothing at
+    // all: the capture's own transient listener steals the process's Raw-Input registration
+    // until it ends — the resident pump re-arms itself right after; see controls REARM.)
+    let capturing = crate::capture::CAPTURE_ACTIVE.load(Ordering::Relaxed);
+    for edge in ctx.edges.borrow_mut().edges(ev) {
+        if capturing {
+            continue;
+        }
+        match edge {
+            InputEdge::Down(trigger) => {
+                // Hold any HyperShift layer THIS input activates (tracked per-input so its
+                // release drops only its own layer), then dispatch the input's action.
+                ctx.rt.borrow_mut().hold_for_input(&trigger);
+                // An input→key REMAP holds the output key while held (edge-driven, like
+                // the mic) so it behaves like the real key; every OTHER action fires once.
+                // Skip fire_trigger when we held a key — firing would ALSO tap it.
+                if !key_remap_press(&ctx.rt, &ctx.held_keys, &trigger, &ctx.status, &ctx.weak) {
+                    if let Some(outcome) = fire_trigger(
+                        &mut ctx.devices.borrow_mut(),
+                        &mut ctx.rt.borrow_mut(),
+                        &mut ctx.exec.borrow_mut(),
+                        &trigger,
+                        &ctx.status,
+                        &ctx.weak,
+                    ) {
+                        ctx.turbos.borrow_mut().start(outcome.turbo);
+                    }
+                }
+                // momentary mic: capture the rest state + flip while held.
+                momentary_press(&ctx.rt, &ctx.momentary, &trigger);
+                // sniper: snapshot the live DPI + drop to precision while held.
+                sniper_press(&ctx.devices, &ctx.rt, &ctx.sniper, &trigger);
+            }
+            InputEdge::Up(trigger) => {
+                ctx.rt.borrow_mut().release_for_input(&trigger);
+                ctx.turbos.borrow_mut().release(&trigger);
+                key_remap_release(&ctx.held_keys, &trigger); // release the held output key
+                momentary_release(&ctx.momentary, &trigger); // restore the mic on release
+                sniper_release(&ctx.devices, &ctx.sniper, &trigger); // restore the DPI on release
+            }
+        }
+    }
+    publish_held(&ctx.rt, &ctx.status, &ctx.weak);
+}
+
+/// The live worker's per-tick handler — the exact body of `run_worker`'s old `on_tick` closure,
+/// verbatim (tick increment, command drain, flight pulse, reload rebuild, injected drain, latch
+/// reconcile, gaming hook reconcile, turbo tick, the %10 throttle and the mic-tap + app-focus polls
+/// below it), now callable one tick at a time so a test can drive it directly.
+fn live_tick(ctx: &mut LiveCtx) {
+    ctx.tick = ctx.tick.wrapping_add(1);
+    for cmd in ctx.live_rx.try_iter() {
+        match cmd {
+            LiveCommand::Reload => ctx.reload_pending = true,
+            LiveCommand::Inject(trigger) => ctx.injected.push(trigger),
+            LiveCommand::ToggleHyperShift(reply) => {
+                ctx.hypershift_latch = !ctx.hypershift_latch;
+                let _ = reply.send(ctx.hypershift_latch);
+            }
+            LiveCommand::ReconcileGamingHook => ctx.gaming_policy_dirty = true,
+            LiveCommand::ApplyProfile {
+                name,
+                persist,
+                reply,
+            } => {
+                let result = apply_profile_live(&mut ctx.devices.borrow_mut(), &name, persist);
+                if let Ok(applied) = &result {
+                    neuron::hook::set_policy(applied.policy);
+                    ctx.gaming_policy_dirty = true;
+                    {
+                        let mut s = ctx
+                            .status
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        s.last_trigger = format!("profile {name}");
+                        s.last_action = applied.summary.clone();
+                        s.active_profile = name.clone();
+                    }
+                    post_status(&ctx.weak, &ctx.status);
+                }
+                let _ = reply.send(result);
+            }
+        }
+    }
+    // flight heartbeat: the live loop proves it's alive every tick — a silent organ is
+    // surfaced by the UI watch (and recorded in every crash dump).
+    crate::flight::pulse(crate::flight::organ::DISPATCH);
+    // Engine hot-reload: a GUI editor rewrote the config — rebuild NOW, before any
+    // throttle (an atomic swap per tick is free; the RefCell has no outstanding borrow
+    // here because the event and tick closures run sequentially on this thread).
+    if ctx.reload_pending {
+        ctx.reload_pending = false;
+        momentary_release_all(&ctx.momentary); // a held mic can't survive a config swap
+        key_remap_release_all(&ctx.held_keys); // nor a held remapped key
+        sniper_release_all(&ctx.devices, &ctx.sniper); // nor a held sniper (restore the DPI)
+        *ctx.rt.borrow_mut() = controls::build_runtime();
+        ctx.exec.borrow_mut().clear();
+        ctx.devices.borrow_mut().clear();
+        ctx.turbos.borrow_mut().clear();
+        ctx.applied_hypershift_latch = !ctx.hypershift_latch;
+        *LAST_ACTION_DESC
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        publish_held(&ctx.rt, &ctx.status, &ctx.weak);
+    }
+    // Injected triggers (the weave watcher's resolved flicks/glyphs) — same Engine,
+    // same fire path, so a cast composes with layers/intents/SAFE exactly like hardware.
+    {
+        let drained = std::mem::take(&mut ctx.injected);
+        for t in drained {
+            if fire_trigger(
+                &mut ctx.devices.borrow_mut(),
+                &mut ctx.rt.borrow_mut(),
+                &mut ctx.exec.borrow_mut(),
+                &t,
+                &ctx.status,
+                &ctx.weak,
+            )
+            .is_some()
+            {
+                crate::flight::trace("cast", "injected trigger fired", 0);
+            } else {
+                // a cast the user SAW resolve (the wheel lit, the glyph flared) that
+                // matched nothing in the engine — that must never be a silent fizzle.
+                crate::flight::trace("cast", "injected trigger matched NOTHING", 0);
+                {
+                    let mut s = ctx
+                        .status
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    s.last_trigger = t.describe();
+                    s.last_action =
+                        "cast hit nothing \u{2014} not bound in the engine (reload/config mismatch?)".into();
+                }
+                post_status(&ctx.weak, &ctx.status);
+            }
+        }
+    }
+    if ctx.applied_hypershift_latch != ctx.hypershift_latch {
+        ctx.rt
+            .borrow_mut()
+            .latch_layer("hypershift", ctx.hypershift_latch);
+        ctx.applied_hypershift_latch = ctx.hypershift_latch;
+        publish_held(&ctx.rt, &ctx.status, &ctx.weak);
+    }
+    // Gaming policy is pushed by glue/profile apply; reconcile only when that shared
+    // carrier changed instead of polling every dispatch tick.
+    if ctx.gaming_policy_dirty {
+        ctx.gaming_policy_dirty = false;
+        install_gaming_hook(&mut ctx.hook);
+    }
+    {
+        let mut intents = AppIntentRunner {
+            devices: &mut ctx.devices.borrow_mut(),
+        };
+        ctx.turbos
+            .borrow_mut()
+            .tick(&mut ctx.exec.borrow_mut(), &mut intents);
+    }
+    if !ctx.tick.is_multiple_of(10) {
+        return; // throttle the periodic polls to ~50 ms
+    }
+    // mic tap (cached Core-Audio mute toggle) -> a MicTap trigger AND its raw Input usage.
+    if let Some(now) = crate::beacon::audio_cache::snap().mic.map(|(_, m)| m) {
+        let fire = ctx.last_mute == Some(!now); // a real toggle (not the first warm read)
+        ctx.last_mute = Some(now);
+        if fire {
+            // mirror the detected flip into the UI's mic pill — the panel otherwise only
+            // updates on its own toggle or a manual refresh.
+            let ui = ctx.weak.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(app) = ui.upgrade() {
+                    app.global::<State>().set_mic_muted(now);
+                }
+            });
+            fire_trigger(
+                &mut ctx.devices.borrow_mut(),
+                &mut ctx.rt.borrow_mut(),
+                &mut ctx.exec.borrow_mut(),
+                &Trigger::MicTap,
+                &ctx.status,
+                &ctx.weak,
+            );
+            let (p, u) = MIC_TAP;
+            fire_trigger(
+                &mut ctx.devices.borrow_mut(),
+                &mut ctx.rt.borrow_mut(),
+                &mut ctx.exec.borrow_mut(),
+                &Trigger::Input {
+                    page: p,
+                    usage: u,
+                    pid: Some(0x056a),
+                },
+                &ctx.status,
+                &ctx.weak,
+            );
+        }
+    }
+    // app-aware switch: a focus change fires an AppFocus trigger; the Engine's matching
+    // rule (-> ProfileSwitch intent) does the switch (or nothing if unbound).
+    if let Some(app) = ctx.switcher.poll() {
+        {
+            let mut s = ctx
+                .status
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            s.focused_app = app.clone();
+        }
+        post_status(&ctx.weak, &ctx.status);
+        fire_trigger(
+            &mut ctx.devices.borrow_mut(),
+            &mut ctx.rt.borrow_mut(),
+            &mut ctx.exec.borrow_mut(),
+            &Trigger::AppFocus { app },
+            &ctx.status,
+            &ctx.weak,
+        );
+    }
 }
 
 // ── MOMENTARY MIC: the held push-to-talk / push-to-mute edge handling ─────────────────────────
@@ -1035,5 +1152,198 @@ mod tests {
             0,
             "unknown cursor starts at 0"
         );
+    }
+
+    // ── LiveCtx wiring tests ──────────────────────────────────────────────────────────────────
+    // These drive `live_edge`/`live_tick` directly against a `LiveCtx::for_tests` — never through
+    // `run_worker` (which is LIVE-PATH ONLY: it arms input and would need a real listener). Every
+    // test that builds a `LiveCtx` wraps itself in `cwd_guard` because `LiveCtx::for_tests` calls
+    // `controls::build_runtime()`, which reads several cwd-relative config files — without the
+    // guard a test could race another test's cwd swap and read garbage (see testsupport.rs).
+
+    /// A minimal `profiles/*.rules.toml` sidecar binding one [`Trigger::AppFocus`] to
+    /// [`neuron::action::Action::Echo`] — kept as one helper so every wiring test below writes the
+    /// identical, known-good shape (tag = "kind"/"type", the [[rules]] array-of-tables nesting).
+    fn marker_rule_toml(marker: &str) -> String {
+        format!(
+            "[[rules]]\n\n[rules.trigger]\nkind = \"app-focus\"\napp = \"{marker}\"\n\n[rules.action]\ntype = \"echo\"\n"
+        )
+    }
+
+    fn marker_trigger(marker: &str) -> Trigger {
+        Trigger::AppFocus {
+            app: marker.to_string(),
+        }
+    }
+
+    /// THE missing wiring guarantee: a config file edit followed by `request_reload` must actually
+    /// change what the live engine resolves. Builds a `LiveCtx` against an on-disk config with NO
+    /// rule for our marker trigger, confirms the freshly-built engine doesn't resolve it, THEN
+    /// writes a sidecar that binds it, sends `LiveCommand::Reload`, drives one `live_tick`, and
+    /// confirms the rebuilt engine now resolves it — proving `live_tick`'s reload block actually
+    /// re-reads disk instead of e.g. only clearing held state.
+    #[test]
+    fn reload_consumes_a_config_edit() {
+        let _g = crate::testsupport::cwd_guard("dispatch_reload_consumes");
+        let trigger = marker_trigger("zzz-dispatch-reload-marker.exe");
+        let reg = neuron::registry::Registry { devices: Vec::new() };
+        let (tx, rx) = channel();
+        let mut ctx = LiveCtx::for_tests(&reg, rx);
+        assert!(
+            ctx.rt.borrow().engine.resolve(&trigger).is_empty(),
+            "before any sidecar exists, the marker trigger must resolve to nothing"
+        );
+
+        std::fs::create_dir_all("profiles").unwrap();
+        std::fs::write(
+            "profiles/test.rules.toml",
+            marker_rule_toml("zzz-dispatch-reload-marker.exe"),
+        )
+        .unwrap();
+        tx.send(LiveCommand::Reload).unwrap();
+        live_tick(&mut ctx);
+
+        assert_eq!(
+            ctx.rt.borrow().engine.resolve(&trigger).len(),
+            1,
+            "a live_tick after Reload must rebuild the engine from the just-edited config"
+        );
+    }
+
+    /// A held momentary mic / held key remap / held sniper DPI / held turbo must not survive a
+    /// config reload — the reload block's whole point is that a config swap can't strand a physical
+    /// hold. Seeds one entry into each held-state map (turbo via `TurboRuntime::start`, timed to
+    /// already be "due"), sends `Reload`, drives one `live_tick`, and confirms every map is empty —
+    /// for turbos (whose held set has no public inspector) by proving a MANUAL tick that WOULD fire
+    /// a still-held turbo instead fires nothing.
+    #[test]
+    fn reload_clears_held_state() {
+        let _g = crate::testsupport::cwd_guard("dispatch_reload_clears");
+        let reg = neuron::registry::Registry { devices: Vec::new() };
+        let (tx, rx) = channel();
+        let mut ctx = LiveCtx::for_tests(&reg, rx);
+        let trigger = marker_trigger("zzz-dispatch-seed-marker.exe");
+
+        ctx.momentary.borrow_mut().insert(
+            trigger.clone(),
+            (Some("neuron-test-nonexistent-mic".to_string()), false),
+        );
+        ctx.held_keys
+            .borrow_mut()
+            .insert(trigger.clone(), vec![0x41]);
+        ctx.sniper.borrow_mut().insert(trigger.clone(), (800, 0));
+        ctx.turbos.borrow_mut().start(vec![neuron::executor::TurboStart {
+            trigger: trigger.clone(),
+            action: neuron::action::Action::Echo,
+            cps: 100, // clamped max cps -> ~10ms interval
+        }]);
+        // let the seeded turbo actually come due before we reload, so the post-reload check below
+        // (a manual tick firing nothing) is proof of CLEARING, not just of not-yet-due.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+
+        tx.send(LiveCommand::Reload).unwrap();
+        live_tick(&mut ctx);
+
+        assert!(
+            ctx.momentary.borrow().is_empty(),
+            "reload must clear momentary mic holds"
+        );
+        assert!(
+            ctx.held_keys.borrow().is_empty(),
+            "reload must clear held key remaps"
+        );
+        assert!(
+            ctx.sniper.borrow().is_empty(),
+            "reload must clear sniper holds"
+        );
+
+        struct CountIntents(u32);
+        impl neuron::executor::IntentRunner for CountIntents {
+            fn run_intent(&mut self, _intent: &neuron::action::Intent) -> String {
+                self.0 += 1;
+                String::new()
+            }
+        }
+        let mut counter = CountIntents(0);
+        ctx.turbos
+            .borrow_mut()
+            .tick(&mut ctx.exec.borrow_mut(), &mut counter);
+        assert_eq!(
+            counter.0, 0,
+            "reload must clear the held turbo (a due-but-still-held turbo would have fired here)"
+        );
+    }
+
+    /// `inject_trigger`'s queue (drained here as `LiveCommand::Inject`) dispatches through the SAME
+    /// engine + executor as a hardware edge — not a separate hard-wired path. Binds our marker
+    /// trigger to `Action::Echo` (whose fresh, empty-history report — "nothing to echo yet" — is a
+    /// precise, zero-side-effect string to assert on), injects it, drives one `live_tick`, and
+    /// confirms the shared `LiveStatus` recorded exactly that fire.
+    #[test]
+    fn inject_fires_through_the_same_engine() {
+        let _g = crate::testsupport::cwd_guard("dispatch_inject_fires");
+        let trigger = marker_trigger("zzz-dispatch-inject-marker.exe");
+        std::fs::create_dir_all("profiles").unwrap();
+        std::fs::write(
+            "profiles/test.rules.toml",
+            marker_rule_toml("zzz-dispatch-inject-marker.exe"),
+        )
+        .unwrap();
+        let reg = neuron::registry::Registry { devices: Vec::new() };
+        let (tx, rx) = channel();
+        let mut ctx = LiveCtx::for_tests(&reg, rx);
+
+        tx.send(LiveCommand::Inject(trigger)).unwrap();
+        live_tick(&mut ctx);
+
+        let s = ctx
+            .status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            s.last_action, "nothing to echo yet",
+            "the injected trigger must fire through the real executor (fresh history -> this exact report)"
+        );
+        assert_eq!(s.fired, 1, "exactly one dispatch must be recorded");
+    }
+
+    /// `LiveCommand::ToggleHyperShift` must flip the SOFTWARE latch, have `live_tick` reconcile it
+    /// into the engine's real held-layer set (the one true source `publish_held` reads from), and
+    /// reply on the given channel with the new state — all in one `live_tick` call.
+    #[test]
+    fn hypershift_latch_reconciles() {
+        let _g = crate::testsupport::cwd_guard("dispatch_hypershift_latch");
+        let reg = neuron::registry::Registry { devices: Vec::new() };
+        let (tx, rx) = channel();
+        let mut ctx = LiveCtx::for_tests(&reg, rx);
+        let (reply_tx, reply_rx) = channel();
+
+        tx.send(LiveCommand::ToggleHyperShift(reply_tx)).unwrap();
+        live_tick(&mut ctx);
+
+        let replied = reply_rx
+            .try_recv()
+            .expect("ToggleHyperShift must reply on its channel within the same tick");
+        assert!(replied, "the first toggle latches the layer ON");
+        assert!(
+            ctx.rt.borrow().engine.is_held("hypershift"),
+            "live_tick must reconcile the software latch into the engine's real held-layer set"
+        );
+    }
+
+    /// A `LiveCommand` sender being dropped (the GUI thread tearing down `LiveRuntime`) must not
+    /// panic `live_tick` — `Receiver::try_iter` on a disconnected channel simply ends, same as an
+    /// empty one.
+    #[test]
+    fn tick_survives_command_channel_disconnect() {
+        let _g = crate::testsupport::cwd_guard("dispatch_disconnect");
+        let reg = neuron::registry::Registry { devices: Vec::new() };
+        let (tx, rx) = channel();
+        let mut ctx = LiveCtx::for_tests(&reg, rx);
+        drop(tx);
+
+        live_tick(&mut ctx); // must not panic
+
+        assert_eq!(ctx.tick, 1, "the tick counter still advances");
     }
 }

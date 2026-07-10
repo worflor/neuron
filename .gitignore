@@ -19,8 +19,15 @@
 # Runtime diagnostics and crash artifacts
 *.dmp
 *.mdmp
+# msys/Cygwin tool crash dumps (a crashing bash.exe drops bash.exe.stackdump in the cwd —
+# machine-specific module addresses, never source)
+*.stackdump
 neuron-crash.log
 /diagnostics/
+
+# Side build lanes used by parallel review/hardening agents (cargo with CARGO_TARGET_DIR
+# pointed into the repo) — pure build cache, same class as /target/
+/target-lane-*/
 
 # Local/generated runtime state
 /runtime/host/__pycache__/

@@ -192,6 +192,25 @@ pub struct AppRuntime {
     pub unclaimed: Vec<neuron::synth::UnclaimedPipe>,
 }
 
+/// The single background-scan slot: at most one hardware scan (`scan_hardware`) in flight at a
+/// time. A free-standing static (not an `AppRuntime` field) because the worker that clears it
+/// runs on a spawned thread that never touches `AppRuntime` at all — see `scan_hardware`'s doc for
+/// why. Mirrors `pump_vitals`'s local `IN_FLIGHT` and `synth_running`'s spawn guard.
+static SCAN_BG_INFLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// Claim the background-scan slot; `false` if one is already running. The ADOPT_WATCH_TIMER tick
+/// (glue.rs) calls this before spawning, so a slow scan (a sleepy wireless device's open can take
+/// hundreds of ms) can never stack a second overlapping one under the 1s cadence.
+pub fn scan_bg_try_start() -> bool {
+    !SCAN_BG_INFLIGHT.swap(true, Ordering::AcqRel)
+}
+
+/// Release the background-scan slot — called once the worker's result (or its absence, on an
+/// enumerate failure or a caught panic) has been handled.
+pub fn scan_bg_finish() {
+    SCAN_BG_INFLIGHT.store(false, Ordering::Release);
+}
+
 /// Adoption strikes at which a still-unrecognized, still-enumerated pid stops being merely retried
 /// and starts SURFACING as a dim "unresponsive · answered nothing" placeholder row. Three tries
 /// (~3 SYNTH_RETRY windows) is enough to distinguish "asleep, will wake" from "claimed but never
@@ -259,8 +278,22 @@ impl AppRuntime {
     /// each read through its OWN control path, so the readouts are that unit's truth, never the
     /// truth of whichever twin enumerated first.
     pub fn scan_devices(&mut self) -> Vec<DeviceState> {
-        // A finished background adoption wrote a new devices/auto/*.toml — reload the registry
-        // so the freshly synthesized device becomes a row this very tick.
+        self.reload_registry_if_dirty();
+        let infos = match transport::enumerate() {
+            Ok(v) => v,
+            Err(_) => return Vec::new(),
+        };
+        let out = scan_units(&self.registry, &infos);
+        self.finish_scan(infos, out)
+    }
+
+    /// A finished background adoption wrote a new devices/auto/*.toml — reload the registry so
+    /// the freshly synthesized device becomes a row this very tick. A disk read (small TOML
+    /// files), never device I/O, so this always runs on the owning thread — in `scan_devices`
+    /// directly, and in `finish_background_scan` once a backgrounded scan's result lands.
+    /// Returns whether a reload actually happened, so the BACKGROUND completion path can tell
+    /// that rows computed before this point were resolved against a now-stale registry.
+    fn reload_registry_if_dirty(&mut self) -> bool {
         if self.synth_dirty.swap(false, Ordering::SeqCst) {
             if let Ok(reg) = Registry::load() {
                 self.registry = reg;
@@ -271,79 +304,48 @@ impl AppRuntime {
             // Keep the app-layer shared cache (hidwatch arming + glue capability gating) in step with
             // this reload, so a freshly-adopted device's event pipe arms + gates without a restart.
             crate::hidwatch::reload_registry();
+            return true;
         }
-        let infos = match transport::enumerate() {
-            Ok(v) => v,
-            Err(_) => return Vec::new(),
-        };
+        false
+    }
+
+    /// Fold a finished BACKGROUND scan (see [`scan_hardware`]) into `self` — the exact same
+    /// in-memory tail `scan_devices` runs synchronously (registry-dirty reload, adoption
+    /// bookkeeping, the transient learning/placeholder rows, the unclaimed ledger, selection
+    /// healing). No device I/O happens here — `infos`/`out` are the worker's plain-data result —
+    /// so this is cheap and safe to call straight from the UI thread once
+    /// `slint::invoke_from_event_loop` hops the result back (see the ADOPT_WATCH_TIMER install in
+    /// glue.rs, the fix for the UI-thread stall this split exists for).
+    ///
+    /// The `bool` in the return is the STALE flag: `true` means an adoption finished between the
+    /// worker loading ITS registry snapshot (`scan_hardware` can't borrow `self` off-thread, so it
+    /// loads its own) and this completion running — the rows in hand were resolved against the
+    /// PRE-adoption registry and may omit the freshly adopted device. The caller MUST answer
+    /// `true` by kicking one more background scan immediately: it cannot rely on the adopt-watch
+    /// timer to self-correct, because the successful adoption is exactly what clears
+    /// `adoption_pending()` and stops that timer — the stale list would otherwise stand until a
+    /// manual refresh. (The synchronous `scan_devices` has no such window: it reloads BEFORE
+    /// resolving rows.) Convergent by construction: each re-kick is one guarded scan, and only a
+    /// NEW adoption landing mid-flight can set the flag again.
+    pub fn finish_background_scan(
+        &mut self,
+        infos: Vec<transport::HidDeviceInfo>,
+        out: Vec<DeviceState>,
+    ) -> (Vec<DeviceState>, bool) {
+        let stale = self.reload_registry_if_dirty();
+        (self.finish_scan(infos, out), stale)
+    }
+
+    /// The cheap, in-memory tail of a scan — everything AFTER the hardware I/O (`scan_units`):
+    /// adoption bookkeeping, the transient "learning…"/"unresponsive" rows, the unclaimed ledger,
+    /// and selection healing. Shared by the synchronous `scan_devices` and the backgrounded
+    /// `finish_background_scan` so the two paths can never drift apart.
+    fn finish_scan(
+        &mut self,
+        infos: Vec<transport::HidDeviceInfo>,
+        mut out: Vec<DeviceState>,
+    ) -> Vec<DeviceState> {
         self.adopt_unknown_in_background(&infos);
-        // Pass 1 — resolve units before any device I/O: dedupe collections to units, and learn
-        // which pids have duplicate units so naming + vitals routing can be decided up front.
-        struct Unit {
-            def: DeviceDef,
-            pid: u16,
-            path: transport::DevicePath,
-            instance: String,
-        }
-        let mut units: Vec<Unit> = Vec::new();
-        for i in &infos {
-            // find_for_pipe: the def that DRIVES this pipe (family-aware control-pipe rule), so a
-            // two-family unit resolves each control pipe to the family that can frame it.
-            let Some(def) = self.registry.find_for_pipe(i) else {
-                continue;
-            };
-            // DATA-ONLY defs (an `[events]` vocabulary with no commands/lighting — the Seiren) never
-            // grow a row: nothing here is operable, and the device's user-facing face is its
-            // Core-Audio endpoint row. A second knob-less HID row would double-list the hardware.
-            if !def.is_operable() {
-                continue;
-            }
-            let instance = i.instance();
-            // One row per PLANE (unit × family), not per unit: the dedupe key is (instance, dialect)
-            // because a multi-family unit carries one control pipe per family and each is its own
-            // channel. Today every unit is N=1 (one plane), so the (instance, dialect) key collapses
-            // to exactly the old per-instance list — identical rows — and only a future two-family
-            // unit splits into two rows here.
-            if units
-                .iter()
-                .any(|u| u.instance == instance && u.def.dialect == def.dialect)
-            {
-                continue; // another collection of the SAME physical plane (unit + family)
-            }
-            units.push(Unit {
-                def: def.clone(),
-                pid: i.pid,
-                path: i.path.clone(),
-                instance,
-            });
-        }
-        let mut out = Vec::new();
-        for u in units.iter() {
-            // Duplicate group = other units sharing this (codename, pid). Numbering is by
-            // instance ORDER, not enumeration order, so "· 1"/"· 2" stay glued to the same
-            // physical unit across rescans (enumeration order is not stable; instances are).
-            let twins: Vec<&str> = units
-                .iter()
-                .filter(|o| o.pid == u.pid && o.def.codename == u.def.codename)
-                .map(|o| o.instance.as_str())
-                .collect();
-            // The battery edge-detector (`vitals::observe`) is pid-keyed core state; feeding it
-            // from BOTH twins would interleave two batteries into one series and fabricate
-            // charge/drop edges. Route it from the pid's lowest instance only — one stable unit.
-            let feed_vitals =
-                twins.iter().min().copied() == Some(u.instance.as_str());
-            let mut st = read_device_state(&u.def, u.pid, &u.path, feed_vitals);
-            st.instance = u.instance.clone();
-            if twins.len() > 1 {
-                let nth = {
-                    let mut sorted = twins.clone();
-                    sorted.sort_unstable();
-                    sorted.iter().position(|s| *s == u.instance).unwrap_or(0) + 1
-                };
-                st.name = format!("{} · {}", st.name, nth);
-            }
-            out.push(st);
-        }
         // A device being adopted RIGHT NOW is visible immediately as a transient "learning"
         // row (product string as its name, every control gated off) instead of appearing out
         // of thin air seconds later. ONE row per razer_report pipe — the same signature the
@@ -1912,6 +1914,105 @@ fn placeholder_row(
     }
 }
 
+/// The registry-driven unit-resolution + per-unit read loop — the SLOW half of a scan (opens
+/// every resolved unit via `read_device_state`, which can block on a sleepy wireless device).
+/// Takes `registry` by reference rather than `&AppRuntime` so it has no `AppRuntime` borrow at
+/// all: shared by the synchronous `scan_devices` (passing `&self.registry`) and the free-standing
+/// `scan_hardware` (which loads its own, since a spawned thread can't borrow `AppRuntime` — see
+/// its doc for why).
+fn scan_units(registry: &Registry, infos: &[transport::HidDeviceInfo]) -> Vec<DeviceState> {
+    // Pass 1 — resolve units before any device I/O: dedupe collections to units, and learn
+    // which pids have duplicate units so naming + vitals routing can be decided up front.
+    struct Unit {
+        def: DeviceDef,
+        pid: u16,
+        path: transport::DevicePath,
+        instance: String,
+    }
+    let mut units: Vec<Unit> = Vec::new();
+    for i in infos {
+        // find_for_pipe: the def that DRIVES this pipe (family-aware control-pipe rule), so a
+        // two-family unit resolves each control pipe to the family that can frame it.
+        let Some(def) = registry.find_for_pipe(i) else {
+            continue;
+        };
+        // DATA-ONLY defs (an `[events]` vocabulary with no commands/lighting — the Seiren) never
+        // grow a row: nothing here is operable, and the device's user-facing face is its
+        // Core-Audio endpoint row. A second knob-less HID row would double-list the hardware.
+        if !def.is_operable() {
+            continue;
+        }
+        let instance = i.instance();
+        // One row per PLANE (unit × family), not per unit: the dedupe key is (instance, dialect)
+        // because a multi-family unit carries one control pipe per family and each is its own
+        // channel. Today every unit is N=1 (one plane), so the (instance, dialect) key collapses
+        // to exactly the old per-instance list — identical rows — and only a future two-family
+        // unit splits into two rows here.
+        if units
+            .iter()
+            .any(|u| u.instance == instance && u.def.dialect == def.dialect)
+        {
+            continue; // another collection of the SAME physical plane (unit + family)
+        }
+        units.push(Unit {
+            def: def.clone(),
+            pid: i.pid,
+            path: i.path.clone(),
+            instance,
+        });
+    }
+    let mut out = Vec::new();
+    for u in units.iter() {
+        // Duplicate group = other units sharing this (codename, pid). Numbering is by
+        // instance ORDER, not enumeration order, so "· 1"/"· 2" stay glued to the same
+        // physical unit across rescans (enumeration order is not stable; instances are).
+        let twins: Vec<&str> = units
+            .iter()
+            .filter(|o| o.pid == u.pid && o.def.codename == u.def.codename)
+            .map(|o| o.instance.as_str())
+            .collect();
+        // The battery edge-detector (`vitals::observe`) is pid-keyed core state; feeding it
+        // from BOTH twins would interleave two batteries into one series and fabricate
+        // charge/drop edges. Route it from the pid's lowest instance only — one stable unit.
+        let feed_vitals = twins.iter().min().copied() == Some(u.instance.as_str());
+        let mut st = read_device_state(&u.def, u.pid, &u.path, feed_vitals);
+        st.instance = u.instance.clone();
+        if twins.len() > 1 {
+            let nth = {
+                let mut sorted = twins.clone();
+                sorted.sort_unstable();
+                sorted.iter().position(|s| *s == u.instance).unwrap_or(0) + 1
+            };
+            st.name = format!("{} · {}", st.name, nth);
+        }
+        out.push(st);
+    }
+    out
+}
+
+/// The BACKGROUND half of a device scan — free-standing (not a method): the UI's `AppRuntime` is
+/// `!Send` (it holds a raw registry + non-thread-safe caches), so a worker thread can never borrow
+/// `self`. Mirrors `read_perf_snapshot`'s worker (glue.rs's `seed_perf_async`) — it loads its OWN
+/// `Registry` fresh from disk instead of touching the UI's cached copy, does the real HID I/O
+/// (`transport::enumerate()` + opening every resolved unit — the part that can block for hundreds
+/// of ms on a sleepy wireless device), and hands back plain data. `None` on an enumerate failure,
+/// mirroring `scan_devices`'s own early return (no partial/stale bookkeeping on a failed scan).
+///
+/// Running this off the UI thread is the whole fix for the ADOPT_WATCH_TIMER stall (glue.rs):
+/// that 1s timer used to call `scan_devices` — this exact I/O — synchronously on the UI thread
+/// once a second for as long as anything was unadopted, freezing the window in a way the
+/// organ-stall watchdog can't see (the UI tick itself is the stall). The caller spawns a thread
+/// that calls this, then folds the result in via `AppRuntime::finish_background_scan` once it
+/// hops back to the UI thread (`slint::invoke_from_event_loop`).
+pub fn scan_hardware() -> Option<(Vec<transport::HidDeviceInfo>, Vec<DeviceState>)> {
+    let registry = Registry::load().unwrap_or(Registry {
+        devices: Vec::new(),
+    });
+    let infos = transport::enumerate().ok()?;
+    let out = scan_units(&registry, &infos);
+    Some((infos, out))
+}
+
 fn read_device_state(
     def: &DeviceDef,
     pid: u16,
@@ -2092,6 +2193,27 @@ fn snapshot_device(def: &DeviceDef, pid: u16, path: &transport::DevicePath) -> S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The stale-rows race (review finding, 2026-07-09): an adoption finishing while a background
+    /// scan is in flight sets `synth_dirty` AFTER the worker resolved its rows against the old
+    /// registry. `finish_background_scan` must SAY SO (stale = true) so its caller re-kicks one
+    /// more scan — the adopt-watch timer can't be relied on, because the successful adoption is
+    /// exactly what clears `adoption_pending()` and stops it. Pins: dirty-at-completion → stale
+    /// true; clean completion → stale false (no infinite re-kick loop).
+    #[test]
+    fn background_scan_reports_stale_rows_when_an_adoption_landed_mid_flight() {
+        let mut rt = AppRuntime::load();
+        // adoption lands mid-flight: the worker has computed rows, then this flag flips.
+        rt.synth_dirty.store(true, Ordering::SeqCst);
+        let (_, stale) = rt.finish_background_scan(Vec::new(), Vec::new());
+        assert!(
+            stale,
+            "a dirty registry at completion means the rows predate the adoption — caller must rescan"
+        );
+        // …and the reload consumed the dirty flag: the re-kicked scan completes clean.
+        let (_, stale) = rt.finish_background_scan(Vec::new(), Vec::new());
+        assert!(!stale, "a clean completion must not re-kick (convergence)");
+    }
 
     /// The runtime loads from disk (registry + config) without a device present.
     #[test]

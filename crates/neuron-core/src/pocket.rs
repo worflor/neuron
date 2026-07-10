@@ -339,7 +339,13 @@ pub fn activate(slot: &str, persist: bool) -> String {
         ClipState::Carryable(p) => (p, false),
     };
 
-    let mut g = slots().lock().unwrap();
+    // Poison-recoverable BECAUSE the exchange below is panic-safe by construction: the clipboard
+    // write happens FIRST, borrowing the slot in place, and only then does a single-step
+    // `mem::replace` swap the slot's content — so a panic anywhere in this critical section leaves
+    // the slot in a VALID state (pre-exchange, payload intact) rather than a torn "silently
+    // emptied" one. That ordering is what makes `into_inner` safe here; do not reorder the
+    // exchange back to take-then-write without restoring a bare unwrap and its rationale.
+    let mut g = slots().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let entry = g.entry(slot.to_string()).or_default();
     let stored_empty = entry.pocket.is_empty();
 
@@ -352,13 +358,21 @@ pub fn activate(slot: &str, persist: bool) -> String {
     }
 
     // The whole semantics: an unconditional exchange. clipboard <- old pocket; pocket <- old live.
+    // FAILURE-SAFETY ORDER (load-bearing — see the lock comment above): write the clipboard FIRST,
+    // borrowing the slot in place, and swap ONLY once that write reports success — so BOTH failure
+    // shapes leave the slot untouched with the user's payload intact: a panic inside
+    // set_clipboard (unwinds before the swap), and the ordinary fallible path (a foreign process
+    // holding the clipboard → `false` → honest "nothing moved", never a silently-consumed pocket).
     let new_pocket = live; // what was on the clipboard now rests in the pocket
-    let to_clipboard = std::mem::take(&mut entry.pocket); // what was pocketed goes to the clipboard
-    set_clipboard(&to_clipboard);
+    if !set_clipboard(&entry.pocket) {
+        // what was pocketed COULD NOT reach the clipboard — moving it out anyway would destroy
+        // it (the old clipboard content still sits on the clipboard AND would land in the slot).
+        return format!("pocket{tag}: clipboard is held by another app \u{2014} nothing moved");
+    }
+    let to_clipboard = std::mem::replace(&mut entry.pocket, new_pocket);
 
     entry.durable |= persist;
     let durable = entry.durable;
-    entry.pocket = new_pocket;
     if durable {
         // Persist OFF the dispatch path: a multi-MB image pocket shouldn't block the live tick on a
         // synchronous file write. Snapshot under the lock, write on a worker.
@@ -395,7 +409,7 @@ pub fn activate(slot: &str, persist: bool) -> String {
 
 /// Every pocket's live contents, for the GUI to render: `(slot, durable, view)`. Read-only, safe.
 pub fn views() -> Vec<(String, bool, PocketView)> {
-    let g = slots().lock().unwrap();
+    let g = slots().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut out: Vec<_> = g
         .iter()
         .map(|(k, v)| (k.clone(), v.durable, v.pocket.view()))
@@ -408,7 +422,7 @@ pub fn views() -> Vec<(String, bool, PocketView)> {
 pub fn view_of(slot: &str) -> PocketView {
     slots()
         .lock()
-        .unwrap()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(slot)
         .map(|s| s.pocket.view())
         .unwrap_or_default()
@@ -418,7 +432,7 @@ pub fn view_of(slot: &str) -> PocketView {
 pub fn sigil_of(slot: &str, samples: usize) -> Sigil {
     slots()
         .lock()
-        .unwrap()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(slot)
         .map(|s| s.pocket.sigil(samples))
         .unwrap_or_default()
@@ -428,7 +442,7 @@ pub fn sigil_of(slot: &str, samples: usize) -> Sigil {
 pub fn sigil_svg_of(slot: &str, size: f32) -> String {
     slots()
         .lock()
-        .unwrap()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(slot)
         .map(|s| s.pocket.sigil_svg(size))
         .unwrap_or_default()
@@ -674,6 +688,11 @@ enum FakeClip {
     Empty,
     Uncarryable,
     Carryable(Pocket),
+    /// Reads succeed (the payload is visible) but every WRITE is refused — the real-world race
+    /// where a foreign process grabs the clipboard between our read and our write
+    /// (`OpenClipboard` fails → `imp::set_clipboard` returns false). Exists to pin `activate`'s
+    /// nothing-moved guarantee on the ordinary fallible path, not just the panic path.
+    Refuses(Pocket),
 }
 
 static FAKE_CLIP: OnceLock<Mutex<Option<FakeClip>>> = OnceLock::new();
@@ -684,11 +703,13 @@ fn fake_clip() -> &'static Mutex<Option<FakeClip>> {
 
 /// Read the clipboard state — the in-memory test clipboard if one is installed, else the OS.
 fn read_clip_state() -> ClipState {
-    if let Some(fake) = fake_clip().lock().unwrap().as_ref() {
+    if let Some(fake) = fake_clip().lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref() {
         return match fake {
             FakeClip::Empty => ClipState::Empty,
             FakeClip::Uncarryable => ClipState::Uncarryable,
             FakeClip::Carryable(p) => ClipState::Carryable(p.clone()),
+            // reads see the content normally — only the WRITE half is refused.
+            FakeClip::Refuses(p) => ClipState::Carryable(p.clone()),
         };
     }
     imp::read_clip_state()
@@ -696,14 +717,20 @@ fn read_clip_state() -> ClipState {
 
 /// Write the clipboard — the in-memory test clipboard if installed, else the OS.
 fn set_clipboard(p: &Pocket) -> bool {
-    let mut g = fake_clip().lock().unwrap();
-    if g.is_some() {
-        *g = Some(if p.is_empty() {
-            FakeClip::Empty
-        } else {
-            FakeClip::Carryable(p.clone())
-        });
-        return true;
+    let mut g = fake_clip().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    match g.as_ref() {
+        // the write-refusing state stays exactly as installed — like a foreign process that
+        // still holds the clipboard open when our write arrives.
+        Some(FakeClip::Refuses(_)) => return false,
+        Some(_) => {
+            *g = Some(if p.is_empty() {
+                FakeClip::Empty
+            } else {
+                FakeClip::Carryable(p.clone())
+            });
+            return true;
+        }
+        None => {}
     }
     drop(g);
     imp::set_clipboard(p)
@@ -735,50 +762,57 @@ pub mod testclip {
 
     /// Install an EMPTY in-memory clipboard (routes `activate()` away from the OS).
     pub fn install_empty() {
-        *fake_clip().lock().unwrap() = Some(FakeClip::Empty);
+        *fake_clip().lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(FakeClip::Empty);
     }
     /// Install an in-memory clipboard holding `s` as text.
     pub fn install_text(s: &str) {
-        *fake_clip().lock().unwrap() = Some(FakeClip::Carryable(text_pocket(s)));
+        *fake_clip().lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(FakeClip::Carryable(text_pocket(s)));
     }
     /// Install an in-memory clipboard holding an arbitrary multi-format payload.
     pub fn install_pocket(p: Pocket) {
-        *fake_clip().lock().unwrap() = Some(if p.is_empty() {
+        *fake_clip().lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(if p.is_empty() {
             FakeClip::Empty
         } else {
             FakeClip::Carryable(p)
         });
     }
+    /// Install an in-memory clipboard that READS as holding `s` but REFUSES every write — the
+    /// foreign-holder race (`OpenClipboard` fails at write time). For pinning `activate`'s
+    /// nothing-moved guarantee on the ordinary fallible path.
+    pub fn install_refusing_text(s: &str) {
+        *fake_clip().lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(FakeClip::Refuses(text_pocket(s)));
+    }
     /// Install an in-memory clipboard whose content can't be carried (handle-only, no twin).
     pub fn install_uncarryable() {
-        *fake_clip().lock().unwrap() = Some(FakeClip::Uncarryable);
+        *fake_clip().lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(FakeClip::Uncarryable);
     }
     /// What currently sits on the in-memory clipboard (None if empty / uncarryable / not installed).
     pub fn current() -> Option<Pocket> {
-        match fake_clip().lock().unwrap().as_ref() {
+        match fake_clip().lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref() {
             Some(FakeClip::Carryable(p)) => Some(p.clone()),
             _ => None,
         }
     }
     /// Uninstall the in-memory clipboard (restore OS-clipboard routing).
     pub fn uninstall() {
-        *fake_clip().lock().unwrap() = None;
+        *fake_clip().lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
     /// Clear the in-memory pocket store (the slot map) for test isolation.
     pub fn reset_store() {
-        slots().lock().unwrap().clear();
+        slots().lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
     }
     /// Seed one slot's pocket directly into the store (durable flag set), bypassing `activate()`.
     pub fn seed_slot(slot: &str, pocket: Pocket, durable: bool) {
         slots()
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(slot.to_string(), Slot { pocket, durable });
     }
     /// Re-read the durable pockets from disk into the store (re-runs `load_all`, for tests that
     /// write `.pocket` files directly and then want them loaded).
     pub fn reload_disk() {
-        *slots().lock().unwrap() = load_all();
+        *slots().lock().unwrap_or_else(std::sync::PoisonError::into_inner) = load_all();
     }
 }
 

@@ -131,7 +131,7 @@ const IDLE_STOP_MS: u64 = 3000; // stop the thread if no `grid()` read in ~3s
 /// — so it's cheap to call every frame. Refreshes the idle timer so a brand-new thread doesn't
 /// immediately auto-stop before the first [`grid`] read lands.
 pub fn ensure() {
-    let mut run = running().lock().unwrap();
+    let mut run = running().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     LAST_ACCESS_MS.store(now_ms(), Ordering::Relaxed);
     if *run {
         return;
@@ -148,7 +148,7 @@ pub fn ensure() {
 /// reading lets the thread auto-stop.
 pub fn grid() -> (usize, usize, Vec<Rgb>) {
     LAST_ACCESS_MS.store(now_ms(), Ordering::Relaxed);
-    let g = cells().lock().unwrap().clone();
+    let g = cells().lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
     (AMBIENT_COLS, AMBIENT_ROWS, g)
 }
 
@@ -168,7 +168,7 @@ fn run_loop() {
     loop {
         // ── control: idle auto-stop ──
         {
-            let mut run = running().lock().unwrap();
+            let mut run = running().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let idle = now_ms().saturating_sub(LAST_ACCESS_MS.load(Ordering::Relaxed));
             if idle > IDLE_STOP_MS {
                 *run = false;

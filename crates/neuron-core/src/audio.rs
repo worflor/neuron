@@ -103,6 +103,63 @@ pub fn explicit_needle(device: Option<&str>) -> Option<&str> {
     device.map(str::trim).filter(|n| !n.is_empty())
 }
 
+/// THE decision behind `resolve_capture` (and the capture half of every other by-name resolver):
+/// given an already-enumerated candidate list (in enumeration order — the same order the OS
+/// handed back, never re-sorted) and an optional EXPLICIT needle, pick which endpoint to act on.
+///
+/// Order of precedent, pinned here so a COM-side caller never has to re-derive it:
+///   1. an explicit needle (already passed through [`explicit_needle`]) wins outright — the first
+///      candidate it identifies via [`endpoint_matches_product`], enumeration order breaking ties;
+///   2. failing that, each of `fallback_needles` is tried IN THE ORDER GIVEN — the first needle
+///      with any match wins, even if a LATER needle would have matched an EARLIER-enumerated
+///      candidate (needle priority beats enumeration order — pin: this is what lets a user's
+///      "seiren" preference beat a "razer"-branded device that happens to enumerate first);
+///   3. failing every needle, the first enumerated candidate — "something connected" beats "no
+///      device", the same "arbitrary but deterministic" fallback `resolve_capture` always used;
+///   4. an empty candidate list has nothing to pick — `None`.
+///
+/// Split out of `imp::resolve_capture` so the preference order is unit-testable without a live
+/// COM enumerator (the COM side now does exactly one `collect()` and calls this).
+pub fn pick_by_needles<'a>(
+    candidates: &'a [Endpoint],
+    explicit: Option<&str>,
+    fallback_needles: &[&str],
+) -> Option<&'a Endpoint> {
+    if let Some(n) = explicit {
+        return candidates.iter().find(|e| endpoint_matches_product(&e.name, n));
+    }
+    for needle in fallback_needles {
+        if let Some(e) = candidates.iter().find(|e| endpoint_matches_product(&e.name, needle)) {
+            return Some(e);
+        }
+    }
+    candidates.first()
+}
+
+/// THE decision behind `resolve_render`: the output mirror of [`pick_by_needles`], but the
+/// no-explicit-needle fallback is "the current system DEFAULT endpoint" (matched by id) rather
+/// than a fixed needle list — turning the wrong endpoint's master volume is silent (the OSD never
+/// moves), so matching the real default is what makes "the current output" mean anything.
+/// Precedent: explicit needle wins outright; else the candidate whose `id` equals `default_id`
+/// (when one is given and it actually matches a candidate); else the first enumerated candidate;
+/// else `None`. Split out for the same reason as `pick_by_needles` — one place, one set of tests,
+/// pinning the order without a live COM enumerator or a live default-endpoint call.
+pub fn pick_render<'a>(
+    candidates: &'a [Endpoint],
+    explicit: Option<&str>,
+    default_id: Option<&str>,
+) -> Option<&'a Endpoint> {
+    if let Some(n) = explicit {
+        return candidates.iter().find(|e| endpoint_matches_product(&e.name, n));
+    }
+    if let Some(def) = default_id {
+        if let Some(e) = candidates.iter().find(|e| e.id == def) {
+            return Some(e);
+        }
+    }
+    candidates.first()
+}
+
 #[cfg(test)]
 mod identity_tests {
     use super::endpoint_matches_product;
@@ -143,6 +200,120 @@ mod identity_tests {
         // a real needle passes through, trimmed (a stray space in config still resolves).
         assert_eq!(explicit_needle(Some(" seiren ")), Some("seiren"));
         assert_eq!(explicit_needle(Some("Razer Seiren V3 Mini")), Some("Razer Seiren V3 Mini"));
+    }
+}
+
+#[cfg(test)]
+mod resolution_tests {
+    use super::{pick_by_needles, pick_render, Endpoint, Flow};
+
+    fn ep(id: &str, name: &str, flow: Flow) -> Endpoint {
+        Endpoint {
+            id: id.into(),
+            name: name.into(),
+            flow,
+            volume: 0.0,
+            muted: false,
+        }
+    }
+
+    // ── pick_by_needles (resolve_capture's decision) ────────────────────────────────────────
+
+    #[test]
+    fn explicit_needle_wins_even_when_a_fallback_needle_would_also_match() {
+        let cands = vec![
+            ep("1", "Microphone (Razer Seiren V3 Mini)", Flow::Capture),
+            ep("2", "HyperX QuadCast", Flow::Capture),
+        ];
+        // explicit "quadcast" must win outright — the fallback list is never consulted.
+        let picked = pick_by_needles(&cands, Some("quadcast"), &["seiren", "razer"]).unwrap();
+        assert_eq!(picked.id, "2");
+    }
+
+    #[test]
+    fn explicit_needle_matches_case_insensitively_via_the_shared_predicate() {
+        let cands = vec![ep("1", "Microphone (RAZER SEIREN V3 MINI)", Flow::Capture)];
+        let picked = pick_by_needles(&cands, Some("razer seiren v3 mini"), &[]).unwrap();
+        assert_eq!(picked.id, "1");
+    }
+
+    #[test]
+    fn no_explicit_needle_falls_to_first_fallback_that_matches_anything() {
+        // "seiren" matches nothing here; "razer" is the first fallback that does.
+        let cands = vec![
+            ep("1", "Microphone (HyperX QuadCast)", Flow::Capture),
+            ep("2", "Microphone (Razer Barracuda)", Flow::Capture),
+        ];
+        let picked = pick_by_needles(&cands, None, &["seiren", "razer"]).unwrap();
+        assert_eq!(picked.id, "2");
+    }
+
+    #[test]
+    fn fallback_needle_priority_beats_enumeration_order() {
+        // "razer" enumerates FIRST, "seiren" second — but fallback order is ["seiren", "razer"],
+        // so the LATER-enumerated "seiren" endpoint wins: needle preference order, not scan order.
+        let cands = vec![
+            ep("1", "Microphone (Razer Barracuda)", Flow::Capture),
+            ep("2", "Microphone (Razer Seiren V3 Mini)", Flow::Capture),
+        ];
+        let picked = pick_by_needles(&cands, None, &["seiren", "razer"]).unwrap();
+        assert_eq!(picked.id, "2");
+    }
+
+    #[test]
+    fn no_needle_matches_anything_falls_to_first_enumerated_candidate() {
+        let cands = vec![
+            ep("1", "Microphone (Built-in)", Flow::Capture),
+            ep("2", "Microphone (Webcam)", Flow::Capture),
+        ];
+        let picked = pick_by_needles(&cands, None, &["seiren", "razer"]).unwrap();
+        assert_eq!(picked.id, "1"); // "something connected" — first enumerated, no needle involved
+    }
+
+    #[test]
+    fn empty_candidate_list_resolves_to_none_regardless_of_needles() {
+        assert!(pick_by_needles(&[], Some("seiren"), &["razer"]).is_none());
+        assert!(pick_by_needles(&[], None, &["seiren", "razer"]).is_none());
+    }
+
+    // ── pick_render (resolve_render's decision) ─────────────────────────────────────────────
+
+    #[test]
+    fn render_explicit_needle_wins_over_the_default_id() {
+        let cands = vec![
+            ep("dev-1", "Speakers (Razer)", Flow::Render),
+            ep("dev-2", "Headset (Generic)", Flow::Render),
+        ];
+        // dev-1 is the system default, but an explicit needle for "headset" must still win.
+        let picked = pick_render(&cands, Some("headset"), Some("dev-1")).unwrap();
+        assert_eq!(picked.id, "dev-2");
+    }
+
+    #[test]
+    fn render_no_explicit_needle_falls_to_the_default_id_match() {
+        let cands = vec![
+            ep("dev-1", "Speakers", Flow::Render),
+            ep("dev-2", "Headset", Flow::Render),
+        ];
+        let picked = pick_render(&cands, None, Some("dev-2")).unwrap();
+        assert_eq!(picked.id, "dev-2");
+    }
+
+    #[test]
+    fn render_default_id_that_matches_no_candidate_falls_to_first_enumerated() {
+        // the "current default" id came back stale/disconnected — never silently pick nothing.
+        let cands = vec![
+            ep("dev-1", "Speakers", Flow::Render),
+            ep("dev-2", "Headset", Flow::Render),
+        ];
+        let picked = pick_render(&cands, None, Some("dev-unplugged")).unwrap();
+        assert_eq!(picked.id, "dev-1");
+    }
+
+    #[test]
+    fn render_empty_candidates_resolves_to_none() {
+        assert!(pick_render(&[], Some("headset"), Some("dev-1")).is_none());
+        assert!(pick_render(&[], None, None).is_none());
     }
 }
 
@@ -973,17 +1144,13 @@ mod imp {
     /// Resolve the capture endpoint to act on: explicit needle, else the user's Razer/Seiren
     /// mic, else the system's first capture endpoint. Shared by the CLI and the run daemon.
     /// A blank explicit needle counts as absent ([`super::explicit_needle`]) — it falls to the
-    /// preference order, never to "first endpoint".
+    /// preference order, never to "first endpoint". The decision itself (which candidate wins) is
+    /// [`super::pick_by_needles`] — pure, unit-tested — so this is just ONE enumeration handed to
+    /// it (previously up to three: `find_capture` per fallback needle, then a bare `collect`).
     pub fn resolve_capture(device: Option<&str>) -> Option<Endpoint> {
-        if let Some(n) = super::explicit_needle(device) {
-            return find_capture(n);
-        }
-        for needle in ["seiren", "razer"] {
-            if let Some(e) = find_capture(needle) {
-                return Some(e);
-            }
-        }
-        collect(Flow::Capture, false).into_iter().next()
+        let candidates = collect(Flow::Capture, false);
+        super::pick_by_needles(&candidates, super::explicit_needle(device), &["seiren", "razer"])
+            .cloned()
     }
 
     /// Find the first RENDER endpoint (speakers / headphones / sound card) that identifies as
@@ -999,20 +1166,14 @@ mod imp {
     /// else the actual system DEFAULT output (the device whose volume the OSD shows), falling back
     /// to the first active render endpoint. Generic — no hardcoded device; works for any
     /// headphone/sound-card the OS exposes. A blank explicit needle counts as absent, same as
-    /// [`resolve_capture`].
+    /// [`resolve_capture`]. The decision is [`super::pick_render`] — pure, unit-tested; the default
+    /// endpoint id is only fetched when there's no explicit needle to short-circuit on (the same
+    /// COM call the original inline version made, just relocated).
     pub fn resolve_render(device: Option<&str>) -> Option<Endpoint> {
-        if let Some(n) = super::explicit_needle(device) {
-            return find_render(n);
-        }
-        let all = collect(Flow::Render, false);
-        // "the current output" = the default endpoint, NOT whatever enumerates first. Turning the
-        // wrong endpoint's master volume is silent (the OSD never moves) — match the default by id.
-        if let Some(def) = default_render_id() {
-            if let Some(e) = all.iter().find(|e| e.id == def) {
-                return Some(e.clone());
-            }
-        }
-        all.into_iter().next()
+        let explicit = super::explicit_needle(device);
+        let candidates = collect(Flow::Render, false);
+        let default_id = if explicit.is_none() { default_render_id() } else { None };
+        super::pick_render(&candidates, explicit, default_id.as_deref()).cloned()
     }
 
     /// The id of the current DEFAULT render endpoint (the eConsole role) — the "current output".

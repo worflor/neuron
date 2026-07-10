@@ -47,6 +47,12 @@ pub fn install_ui(weak: slint::Weak<AppWindow>) {
     let _ = UI.set(weak);
 }
 
+/// Has [`install_ui`] run yet? Startup-order contract probe for `hidwatch::start()`'s
+/// `debug_assert` (main.rs installs the weak handle before arming hidwatch's reader threads).
+pub fn ui_installed() -> bool {
+    UI.get().is_some()
+}
+
 /// The device registry — delegates to the ONE shared, RELOADABLE app-layer cache
 /// ([`crate::hidwatch::registry`]) rather than a second private OnceLock that would freeze a startup
 /// snapshot while hidwatch's/runtime's reloaded (the reload-mismatch a review caught). Used by
@@ -1177,6 +1183,81 @@ pub fn install(app: &AppWindow) -> SharedRt {
     // the device really does adopt within ~a minute of waking with no user action. Gating on
     // `adoption_pending` (not `adoption_active`) is what keeps the driver alive across that gap;
     // idle cost is a per-second in-memory flag check whenever nothing is pending.
+    //
+    // UI-THREAD STALL FIX (pre-release wiring audit, 2026-07-09): this tick used to call
+    // `refresh_devices` straight through, and `refresh_devices` -> `scan_devices` runs real HID
+    // I/O (`transport::enumerate()` + `Device::open_path` on every resolved unit) SYNCHRONOUSLY —
+    // once a second, for as long as anything is unadopted. A sleepy wireless device's open can
+    // block for hundreds of ms, which froze the whole window — and the organ-stall watchdog can't
+    // see it, because the UI TICK ITSELF is the stall. Now the tick does no enumeration and no
+    // device opens: it only kicks (at most one, guarded by `scan_bg_try_start`) a background
+    // hardware scan (`runtime::scan_hardware`, which loads its own registry + enumerates + opens
+    // devices off-thread) and applies a FINISHED result once `slint::invoke_from_event_loop` hops
+    // it back — mirroring the `synth_inflight`/`pump_vitals` one-shot-worker pattern already used
+    // for adoption probes and vitals reads. `with_shared` (not a captured `sh`) is what lets the
+    // hop-back closure reach `AppRuntime` without moving the (`!Send`) `Rc<RefCell<Shared>>`
+    // through the spawned thread.
+    /// Kick ONE guarded background hardware scan (worker enumerates + reads off-thread, result
+    /// hops back to the UI thread and lands through the shared `apply_scanned_devices` tail).
+    /// Shared by the ADOPT_WATCH_TIMER tick AND the stale-result re-kick below — one spawn shape,
+    /// so the two callers can't drift. No-op if a scan is already in flight (the one-slot guard).
+    ///
+    /// SLOT LIFETIME = scan lifetime INCLUDING the UI-thread application (review finding,
+    /// 2026-07-09): releasing the slot at scan-end let the 1s timer launch scan B (resolved
+    /// against a pre-adoption registry) while scan A's result still sat in the event-loop queue —
+    /// A's completion would then mark stale and try to re-kick, the re-kick would no-op against
+    /// B's held slot, and B would land LAST with old-registry rows and a clean flag, with the
+    /// timer already stopped by the successful adoption. The RAII `SlotHeld` below closes that:
+    /// the slot travels worker → event-loop closure and releases only when the result has been
+    /// APPLIED (or provably never will be — every early exit drops it too). At most one scan
+    /// result can ever be in flight, so results can't arrive out of order by construction.
+    fn spawn_background_scan(w: &slint::Weak<AppWindow>) {
+        if !crate::runtime::scan_bg_try_start() {
+            return; // a scan from an earlier kick hasn't finished yet
+        }
+        /// Releases the scan slot on drop — whichever exit path runs (worker panic, no result,
+        /// dead event loop, dead window, normal application), the slot can never leak shut.
+        struct SlotHeld;
+        impl Drop for SlotHeld {
+            fn drop(&mut self) {
+                crate::runtime::scan_bg_finish();
+            }
+        }
+        let slot = SlotHeld;
+        let w2 = w.clone();
+        std::thread::spawn(move || {
+            let scanned = std::panic::catch_unwind(crate::runtime::scan_hardware);
+            let Ok(Some((infos, devs))) = scanned else {
+                drop(slot); // no result will ever apply — free the slot for the next tick
+                return;
+            };
+            // Hop back to the UI thread to touch Slint state / AppRuntime — neither is
+            // Send, so `with_shared` (the UI-thread-local set up in `install`) replaces
+            // moving `sh` into this worker. The slot rides INSIDE the closure: if the event
+            // loop is gone (Err) or the window died, the dropped closure releases it.
+            let _ = slint::invoke_from_event_loop(move || {
+                let slot = slot;
+                let Some(app) = w2.upgrade() else { return };
+                let w3 = app.as_weak();
+                with_shared(move |sh| {
+                    let (rows, stale) = sh.borrow_mut().rt.finish_background_scan(infos, devs);
+                    apply_scanned_devices(&app, sh, rows);
+                    // STALE: an adoption finished while this scan was in flight — the rows just
+                    // applied were resolved against the pre-adoption registry and may omit the
+                    // new device. The timer can NOT be trusted to correct this (the successful
+                    // adoption is what clears `adoption_pending()`, stopping the timer), so
+                    // answer it here with one more guarded scan against the now-fresh registry.
+                    // Release-then-claim is safe: this closure runs ON the UI thread, the same
+                    // thread the timer tick runs on — nothing can interleave between the drop
+                    // and the re-kick's try_start.
+                    if stale {
+                        drop(slot);
+                        spawn_background_scan(&w3);
+                    }
+                });
+            });
+        });
+    }
     {
         let w = app.as_weak();
         let sh = shared.clone();
@@ -1185,11 +1266,15 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 slint::TimerMode::Repeated,
                 std::time::Duration::from_millis(1000),
                 move || {
-                    let Some(app) = w.upgrade() else { return };
-                    let pending = sh.borrow().rt.adoption_pending();
-                    if pending {
-                        refresh_devices(&app, &sh);
+                    // Just a liveness check here — the window handle itself is only needed once
+                    // the background scan lands, where the spawn's hop upgrades it fresh.
+                    if w.upgrade().is_none() {
+                        return;
                     }
+                    if !sh.borrow().rt.adoption_pending() {
+                        return;
+                    }
+                    spawn_background_scan(&w);
                 },
             )
         });
@@ -3247,8 +3332,11 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 st.set_status_line(format!("applying '{profile_name}'...").into());
                 // FREE the device before apply: a live lighting stream holds the keyboard open and
                 // writes it every frame, so apply's own device writes (brightness/DPI/…) fight it —
-                // two writers stall each other and apply blows its deadline. Snapshot the current
-                // look, stop the stream(s), then apply on a quiet device; lighting restarts after.
+                // two writers stall each other and apply blows its deadline. Snapshot the SELECTED
+                // board's current look, stop EVERY board's stream (not just the selected one — the
+                // profile write only touches the selected device, but a parked stream anywhere is a
+                // dark board), then apply on a quiet device; lighting resumes on all of them after,
+                // success or failure, via `reapply_all_boards`.
                 let prev_lighting = with_shared_ret(|sh| {
                     let s = sh.borrow();
                     let prev = s.light_layers.clone();
@@ -3287,10 +3375,13 @@ pub fn install(app: &AppWindow) -> SharedRt {
                                         }
                                         refresh_profiles(&app, sh);
                                         refresh_devices(&app, sh);
-                                        // Restart lighting on the now-freed device: the profile's stack
-                                        // if it sets one, else the look that was streaming before apply —
-                                        // so an empty-lighting profile keeps the current look (not dark)
-                                        // and the stream we stopped for the apply always comes back.
+                                        // Restart lighting on the now-freed SELECTED device: the profile's
+                                        // stack if it sets one, else the look that was streaming before
+                                        // apply — so an empty-lighting profile keeps the current look (not
+                                        // dark) and the stream we stopped for the apply always comes back.
+                                        // (Every OTHER board resumes too, below, via `reapply_all_boards`
+                                        // — this local `stack` only ever seeds the selected board's live
+                                        // layers.)
                                         let stack = neuron::profile::Profile::load(&applied.name)
                                             .map(|p| p.lighting)
                                             .ok()
@@ -3313,26 +3404,33 @@ pub fn install(app: &AppWindow) -> SharedRt {
                                                 refresh_layers(&app, sh); // project + persist
                                             }
                                             flush_lighting_save(); // structural — persist now
-                                            let _ = apply_current_lighting(&app, sh); // stream live
                                         }
+                                        // stream live — and every OTHER board too: the stop side above
+                                        // parked every local anim stream, not just the selected one, so
+                                        // a single-board resume would leave the rest dark until some
+                                        // unrelated transition happened to wake them. OUTSIDE the
+                                        // stack-non-empty gate (mirroring the failure arm): even when the
+                                        // selected board has nothing to stream (empty profile + nothing
+                                        // streaming before), the other boards still deserve their resume.
+                                        let _ = reapply_all_boards(&app, sh);
                                     });
                                     st.set_status_line(applied.summary.into());
                                 }
                                 Err(e) => {
                                     // apply failed — bring back the look that was streaming before, so a
                                     // failed apply never leaves the board frozen with its stream stopped.
-                                    if !prev_lighting.is_empty() {
-                                        with_shared(|sh| {
-                                            {
-                                                let mut s = sh.borrow_mut();
-                                                s.light_layers = prev_lighting.clone();
-                                                s.selected_layer =
-                                                    s.light_layers.len().saturating_sub(1);
-                                                s.layers_rev += 1;
-                                            }
-                                            let _ = apply_current_lighting(&app, sh);
-                                        });
-                                    }
+                                    // The stop side parked EVERY board (not just this one), so resume all
+                                    // of them regardless of whether the selected board had a snapshot to
+                                    // restore — only the snapshot restore itself is gated on that.
+                                    with_shared(|sh| {
+                                        if !prev_lighting.is_empty() {
+                                            let mut s = sh.borrow_mut();
+                                            s.light_layers = prev_lighting.clone();
+                                            s.selected_layer = s.light_layers.len().saturating_sub(1);
+                                            s.layers_rev += 1;
+                                        }
+                                        let _ = reapply_all_boards(&app, sh);
+                                    });
                                     st.set_status_line(e.into());
                                 }
                             }
@@ -6980,6 +7078,20 @@ pub fn refresh_plated_row(app: &AppWindow) {
 }
 
 pub fn refresh_devices(app: &AppWindow, sh: &SharedRt) {
+    // 1) HID peripherals (registry-matched Razer devices), live-read on THIS thread — the
+    // synchronous path for explicit refreshes and callbacks. The ADOPT_WATCH_TIMER's background
+    // scan reaches the SAME row-building/selection tail below through `apply_scanned_devices`
+    // with worker-computed rows — one tail, two drivers, so the paths can never drift apart.
+    let devs = sh.borrow_mut().rt.scan_devices(); // also heals a stale selected_pid
+    apply_scanned_devices(app, sh, devs);
+}
+
+/// The shared row-building + selection-restore tail of a device scan: everything AFTER the rows
+/// are known. Driven synchronously by [`refresh_devices`] (which scans on the calling thread) and
+/// asynchronously by the ADOPT_WATCH_TIMER (whose worker thread computed the rows off-thread and
+/// hopped them back — the UI-thread-stall fix; see the timer install). Pure UI-state application:
+/// no enumeration, no device opens.
+fn apply_scanned_devices(app: &AppWindow, sh: &SharedRt, devs: Vec<crate::runtime::DeviceState>) {
     // keep the selection on the SAME control PLANE across a rescan, by (id, dialect): the unit id
     // (path instance / audio endpoint id) AND the plane's family. On a future multi-family unit the
     // id alone would ambiguously match either of the unit's two channel rows; the dialect pins the
@@ -6996,8 +7108,6 @@ pub fn refresh_devices(app: &AppWindow, sh: &SharedRt) {
             .unwrap_or_default()
     };
     let (prev_id, prev_dialect) = (prev.0, prev.1);
-    // 1) HID peripherals (registry-matched Razer devices), live-read.
-    let devs = sh.borrow_mut().rt.scan_devices(); // also heals a stale selected_pid
     let mut rows: Vec<DeviceRow> = devs
         .iter()
         .map(|d| DeviceRow {
@@ -7780,14 +7890,17 @@ fn light_capable_units(app: &AppWindow) -> Vec<(u16, String)> {
 /// memory). Because `stream_board` → `start_layers` stops each board's prior LOCAL stream before
 /// (re)claiming, this MIGRATES every board onto the host on enable — closing the double-writer
 /// window on non-selected boards — and RESTORES every board (not just the one on screen) after a
-/// "who wins" flip or a resume from pause/Observe.
-fn reapply_all_boards(app: &AppWindow, sh: &SharedRt) {
+/// "who wins" flip, a resume from pause/Observe, a profile apply (success OR failure — the stop
+/// side of profile-apply parks every board, so the resume side must wake all of them back up), or
+/// startup restore. Returns the selected board's status ([`apply_current_lighting`]'s message) so
+/// callers that narrate that one board (startup's status line) don't need a second call.
+fn reapply_all_boards(app: &AppWindow, sh: &SharedRt) -> String {
     if app.global::<State>().get_writes_paused() {
-        return; // paused: nothing streams (mirrors apply_current_lighting's own gate)
+        return "writes paused — composite not applied".into(); // mirrors apply_current_lighting's own gate
     }
     let selected_unit = sh.borrow().rt.selected_unit.clone();
     // The selected board first, from the live stack (this also sets the compositing indicator).
-    let _ = apply_current_lighting(app, sh);
+    let msg = apply_current_lighting(app, sh);
     // Then every OTHER light-capable board, each from its own persisted stack + pace. The saved
     // stack is per-pid (config is per-model); two identical boards each stream it on their OWN
     // unit — explicit per-board application, not first-match-wins.
@@ -7816,6 +7929,7 @@ fn reapply_all_boards(app: &AppWindow, sh: &SharedRt) {
         .rt
         .light_fps
         .store(sel_fps, std::sync::atomic::Ordering::Relaxed);
+    msg
 }
 
 /// AUTO-APPLY — the one debounced chokepoint that keeps the board tracking the UI. Every lighting edit
@@ -7862,15 +7976,18 @@ fn schedule_lighting_apply(app: &AppWindow, sh: &SharedRt) {
     });
 }
 
-/// Restore + RE-APPLY the selected device's persisted lighting ONCE at startup: load the saved fps +
-/// stack/data into state, and — if there's a surface to resume — start the device stream so the board
-/// picks the effect back up instead of holding its stale last frame. Flips `LIGHTING_READY` so user
-/// edits from here on persist. Respects the writes-paused gate (the state is still restored; it just
-/// isn't streamed until writes resume — un-pausing re-applies the stack; there is no manual apply now).
+/// Restore + RE-APPLY every configured board's persisted lighting ONCE at startup: load the
+/// selected device's saved fps + stack/data into state, and — if there's a surface to resume —
+/// re-establish it via [`reapply_all_boards`] so a multi-board desk boots with EVERY board's
+/// lighting resumed, not just the one on screen (the selected board streams from the state just
+/// loaded; every other light-capable board streams from its own persisted stack, same as the
+/// other host transitions). Flips `LIGHTING_READY` so user edits from here on persist. Respects
+/// the writes-paused gate (the state is still restored; it just isn't streamed until writes
+/// resume — un-pausing re-applies the stack; there is no manual apply now).
 pub fn restore_lighting(app: &AppWindow, sh: &SharedRt) {
     let has_surface = load_lighting_into_state(app, sh);
     if has_surface {
-        let msg = apply_current_lighting(app, sh);
+        let msg = reapply_all_boards(app, sh);
         let (sel, sel_unit) = {
             let s = sh.borrow();
             (s.rt.selected_pid, s.rt.selected_unit.clone())

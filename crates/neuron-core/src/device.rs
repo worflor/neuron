@@ -311,21 +311,39 @@ impl<'a> DeviceSession<'a> {
         self.writable_for_key(cmd, |reg| Device::open_with_command(reg, cmd))
     }
 
+    /// Shared retry CORE behind [`with_writable`]: resolve-and-cache under `key` via `resolve`, run
+    /// `op`; on failure, invalidate the cached handle (forcing a fresh `resolve` + a re-run
+    /// `ensure_driver` handshake through `writable_for_key`) and retry `op` once, wrapping a second
+    /// failure with the first failure's text so neither is lost. `with_writable` below is the
+    /// production convenience that supplies `cmd` as both the cache key and the `open_with_command`
+    /// resolver — byte-identical behavior, just factored so the `(key, resolve)` pair is an explicit
+    /// seam: a test can supply a `resolve` that returns a fake `Device` over an in-memory `Transport`,
+    /// exercising this exact retry contract without ever reaching `Device::open_with_command`'s
+    /// `transport::enumerate()` (which would touch real hardware).
+    fn with_writable_via<T>(
+        &mut self,
+        key: &str,
+        resolve: impl Fn(&crate::registry::Registry) -> Result<Device>,
+        mut op: impl FnMut(&Device) -> Result<T>,
+    ) -> Result<T> {
+        match self.writable_for_key(key, &resolve).and_then(&mut op) {
+            Ok(v) => Ok(v),
+            Err(first) => {
+                self.invalidate_command(key);
+                self.writable_for_key(key, &resolve).and_then(&mut op).with_context(|| {
+                    format!("after reopening cached '{key}' handle; first failure: {first}")
+                })
+            }
+        }
+    }
+
     /// Run one writable operation, reopening/re-handshaking once if the cached handle failed.
     pub fn with_writable<T>(
         &mut self,
         cmd: &str,
-        mut op: impl FnMut(&Device) -> Result<T>,
+        op: impl FnMut(&Device) -> Result<T>,
     ) -> Result<T> {
-        match self.writable_for(cmd).and_then(&mut op) {
-            Ok(v) => Ok(v),
-            Err(first) => {
-                self.invalidate_command(cmd);
-                self.writable_for(cmd).and_then(&mut op).with_context(|| {
-                    format!("after reopening cached '{cmd}' handle; first failure: {first}")
-                })
-            }
-        }
+        self.with_writable_via(cmd, |reg| Device::open_with_command(reg, cmd), op)
     }
 
     /// Run one writable operation resolved by CAPABILITY, reopening/re-handshaking once if the
@@ -383,6 +401,8 @@ mod tests {
     // seam, deliberately — DIALECT-RND do-not-disturb list), so it needs the protocol vocabulary
     // and timing types the production impl no longer imports at module top.
     use crate::protocol::{Report, BUF_LEN};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     /// The exact resolution gap this capability path closes: the legacy BlackWidow has NO top-level
@@ -456,6 +476,179 @@ mod tests {
         assert!(
             msg.contains("nope") && msg.contains("unknown dialect"),
             "the release error names the dialect and the refusal: {msg}"
+        );
+    }
+
+    /// A fake `Transport` that can be flipped "dead" via a shared `AtomicBool` — the stale-HID-handle
+    /// scenario `DeviceSession::invalidate_command` exists for (wireless sleep/replug leaves an open
+    /// handle stale while enumeration can reopen the same logical device). While dead, `set_feature`
+    /// and `get_feature` fail IMMEDIATELY (no busy-poll delay: `RazerDialect::exec`'s `t.set_feature(&out)?`
+    /// propagates the error before ever entering the poll loop). While alive it behaves like
+    /// `dialect::tests::SharedPipe`: `get_feature` echoes whatever `(class, id)` was last `set_feature`d
+    /// with a SUCCESS status. `device_mode_sets` counts how many times a device-mode SET (class
+    /// 0x00/id 0x04, `writes::ensure_driver`'s handshake write) actually landed while alive, so a test
+    /// can pin "the handshake re-ran on the reopened device" on a plain counter instead of guessing at
+    /// call counts.
+    #[derive(Clone)]
+    struct DiesOnce {
+        dead: Arc<AtomicBool>,
+        last: Arc<Mutex<(u8, u8)>>,
+        device_mode_sets: Arc<AtomicUsize>,
+    }
+
+    impl Transport for DiesOnce {
+        fn set_feature(&self, buf: &[u8]) -> Result<()> {
+            if self.dead.load(Ordering::SeqCst) {
+                bail!("stale handle: set_feature failed (simulated unplug/sleep)");
+            }
+            let (class, id) = (buf[7], buf[8]);
+            *self.last.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = (class, id);
+            if class == crate::writes::CLASS_DEVICE_MODE && id == crate::writes::ID_DEVICE_MODE_SET {
+                self.device_mode_sets.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(())
+        }
+
+        fn get_feature(&self, buf: &mut [u8]) -> Result<()> {
+            if self.dead.load(Ordering::SeqCst) {
+                bail!("stale handle: get_feature failed (simulated unplug/sleep)");
+            }
+            let (class, id) = *self.last.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut rep = Report::command(0x1F, class, id, 0);
+            rep.status = 0x02; // Success
+            let out = rep.to_buf();
+            let n = buf.len().min(out.len());
+            buf[..n].copy_from_slice(&out[..n]);
+            Ok(())
+        }
+    }
+
+    /// TDD §8's named gap: "a test that `DeviceSession::with_writable` invalidates and retries a
+    /// stale handle once." Drives the REAL retry code through the `with_writable_via` seam (no
+    /// `transport::enumerate()`, no real hardware): attempt 1 resolves a fresh `Device`, ensure_driver's
+    /// handshake succeeds (device is alive), then the write itself discovers the handle just went
+    /// stale (models a wireless sleep landing between resolve and write) and fails. `with_writable`
+    /// must invalidate, resolve a SECOND fresh handle, re-run the driver handshake on it, and retry the
+    /// write — which this time succeeds because the "reopen" produced a healthy handle.
+    #[test]
+    fn with_writable_retries_once_recovers_from_a_stale_handle_and_rehandshakes() {
+        let bw: DeviceDef =
+            toml::from_str(include_str!("../devices/razer-blackwidow-chroma-v2.toml")).unwrap();
+        let reg = crate::registry::Registry { devices: Vec::new() };
+
+        let dead = Arc::new(AtomicBool::new(false)); // starts alive
+        let device_mode_sets = Arc::new(AtomicUsize::new(0));
+        let resolve_calls = Arc::new(AtomicUsize::new(0));
+        let op_calls = Arc::new(AtomicUsize::new(0));
+
+        let resolve = {
+            let bw = bw.clone();
+            let dead = dead.clone();
+            let device_mode_sets = device_mode_sets.clone();
+            let resolve_calls = resolve_calls.clone();
+            move |_reg: &crate::registry::Registry| -> Result<Device> {
+                let n = resolve_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                if n == 2 {
+                    // The "reopen" produces a healthy handle — exactly what a real replug/wake does.
+                    dead.store(false, Ordering::SeqCst);
+                }
+                Ok(Device {
+                    def: bw.clone(),
+                    pid: 0x0221,
+                    transport: Box::new(DiesOnce {
+                        dead: dead.clone(),
+                        last: Arc::new(Mutex::new((0u8, 0u8))),
+                        device_mode_sets: device_mode_sets.clone(),
+                    }),
+                })
+            }
+        };
+
+        let mut session = DeviceSession::new(&reg);
+        let out = {
+            let op_calls = op_calls.clone();
+            let dead = dead.clone();
+            session.with_writable_via("test-write", resolve, move |d: &Device| {
+                let n = op_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                if n == 1 {
+                    // The handle goes stale right at write-time — the exact race the retry exists for.
+                    dead.store(true, Ordering::SeqCst);
+                }
+                d.exec_dynamic(0x0c, 0x02, 0x01, &[9])
+            })
+        };
+
+        assert!(
+            out.is_ok(),
+            "the retry must recover and propagate the second attempt's success: {out:?}"
+        );
+        assert_eq!(op_calls.load(Ordering::SeqCst), 2, "the write must be attempted exactly twice");
+        assert_eq!(
+            resolve_calls.load(Ordering::SeqCst),
+            2,
+            "resolve must run twice — a fresh handle each time, never a memoized stale one"
+        );
+        assert_eq!(
+            device_mode_sets.load(Ordering::SeqCst),
+            2,
+            "ensure_driver's device-mode handshake must re-run on the reopened device (once per \
+             resolved handle), not be skipped on retry"
+        );
+    }
+
+    /// The other half of the retry contract: when the RE-OPENED handle is *also* dead (a genuinely
+    /// unplugged device, not just a transient sleep), `with_writable` must still surface a single,
+    /// informative error — and that error must retain the FIRST failure's text, not just the second's,
+    /// so a diagnosing human sees the original symptom instead of only "retry also failed".
+    #[test]
+    fn with_writable_keeps_the_first_failure_in_context_when_the_reopen_also_fails() {
+        let bw: DeviceDef =
+            toml::from_str(include_str!("../devices/razer-blackwidow-chroma-v2.toml")).unwrap();
+        let reg = crate::registry::Registry { devices: Vec::new() };
+
+        let dead = Arc::new(AtomicBool::new(true)); // never recovers
+        let device_mode_sets = Arc::new(AtomicUsize::new(0));
+        let resolve_calls = Arc::new(AtomicUsize::new(0));
+
+        let resolve = {
+            let bw = bw.clone();
+            let dead = dead.clone();
+            let device_mode_sets = device_mode_sets.clone();
+            let resolve_calls = resolve_calls.clone();
+            move |_reg: &crate::registry::Registry| -> Result<Device> {
+                resolve_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Device {
+                    def: bw.clone(),
+                    pid: 0x0221,
+                    transport: Box::new(DiesOnce {
+                        dead: dead.clone(),
+                        last: Arc::new(Mutex::new((0u8, 0u8))),
+                        device_mode_sets: device_mode_sets.clone(),
+                    }),
+                })
+            }
+        };
+
+        let mut session = DeviceSession::new(&reg);
+        let err = session
+            .with_writable_via("test-write", resolve, |d: &Device| {
+                d.exec_dynamic(0x0c, 0x02, 0x01, &[9])
+            })
+            .expect_err("a permanently dead transport must fail even after the retry");
+
+        assert_eq!(
+            resolve_calls.load(Ordering::SeqCst),
+            2,
+            "the retry still resolves a fresh handle even though it too is dead"
+        );
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("after reopening cached"),
+            "the final error names the retry context: {msg}"
+        );
+        assert!(
+            msg.contains("stale handle"),
+            "the FIRST failure's text must survive into the final error, not just the second's: {msg}"
         );
     }
 

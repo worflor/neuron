@@ -342,8 +342,15 @@ impl Dialect for HidppDialect {
         // file's provenance header. Require a valid 2.0 echo: a non-answering / 1.0 pipe is not ours.
         let ping = build_long(IROOT_FEATURE, IROOT_FN_GET_PROTOCOL, &[0x00, 0x00, PING_TOKEN]);
         let start = Instant::now();
-        t.write_output(&ping).ok()?;
-        let reply = recv_matching(t, IROOT_FEATURE, IROOT_FN_GET_PROTOCOL)?;
+        let reply = {
+            // ONE request/reply conversation under the pipe's wire lock — per-pair, released before
+            // the getFeature conversations below (each guards itself in `get_feature_index`).
+            let wire = t.wire_lock();
+            let _wire =
+                wire.as_ref().map(|w| w.acquire());
+            t.write_output(&ping).ok()?;
+            recv_matching(t, IROOT_FEATURE, IROOT_FN_GET_PROTOCOL)?
+        };
         let roundtrip_ms = start.elapsed().as_millis() as u64;
         let (major, echo) = (reply[4], reply[6]);
         if echo != PING_TOKEN || major < 0x02 {
@@ -434,6 +441,12 @@ impl Dialect for HidppDialect {
         args: &[u8],
     ) -> Result<[u8; 80]> {
         let _ = (transaction_id, size); // razer vocabulary; no meaning in HID++
+
+        // Hold the pipe's wire lock for the WHOLE conversation (write → read/drain): pair-atomicity
+        // is the unit; between conversations other actors may interleave freely.
+        let wire = t.wire_lock();
+        let _wire = wire.as_ref().map(|w| w.acquire());
+
         let feature_idx = spec_class;
         let fn_id = spec_id;
         let reshape_tag = args.first().copied().unwrap_or(RESHAPE_NONE);
@@ -517,8 +530,14 @@ pub fn probe_report(t: &dyn Transport) -> Option<HidppProbe> {
     // getProtocolVersion: params [0x00, 0x00, pingData] — the two leading zeros + echoed ping are
     // the documented HID++ 1.0/2.0 disambiguation trick. Reply payload = [major, minor, pingEcho].
     let ping = build_long(IROOT_FEATURE, IROOT_FN_GET_PROTOCOL, &[0x00, 0x00, PING_TOKEN]);
-    t.write_output(&ping).ok()?;
-    let reply = recv_matching(t, IROOT_FEATURE, IROOT_FN_GET_PROTOCOL)?;
+    let reply = {
+        // ONE request/reply conversation under the pipe's wire lock — per-pair, released before the
+        // getFeature conversations below (each takes its own guard inside `get_feature_index`).
+        let wire = t.wire_lock();
+        let _wire = wire.as_ref().map(|w| w.acquire());
+        t.write_output(&ping).ok()?;
+        recv_matching(t, IROOT_FEATURE, IROOT_FN_GET_PROTOCOL)?
+    };
     let (major, minor, echo) = (reply[4], reply[5], reply[6]);
     if echo != PING_TOKEN || major < 0x02 {
         return None; // not a HID++ 2.0 device (or the echo didn't confirm)
@@ -536,6 +555,11 @@ pub fn probe_report(t: &dyn Transport) -> Option<HidppProbe> {
 fn get_feature_index(t: &dyn Transport, feature_id: u16) -> Option<u8> {
     let params = [(feature_id >> 8) as u8, feature_id as u8];
     let req = build_long(IROOT_FEATURE, IROOT_FN_GET_FEATURE, &params);
+
+    // ONE request/reply conversation under the pipe's wire lock (per-pair, like every probe site).
+    let wire = t.wire_lock();
+    let _wire = wire.as_ref().map(|w| w.acquire());
+
     t.write_output(&req).ok()?;
     let reply = recv_matching(t, IROOT_FEATURE, IROOT_FN_GET_FEATURE)?;
     let idx = reply[4]; // payload[0] = featureIndex

@@ -155,7 +155,7 @@ struct LinkState {
 
 impl Shared {
     fn push_log(&self, line: String) {
-        let mut l = self.log.lock().unwrap();
+        let mut l = self.log.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if l.len() >= LOG_RING {
             l.pop_front();
         }
@@ -163,13 +163,13 @@ impl Shared {
     }
     fn mark_dead(&self) {
         {
-            let mut s = self.state.lock().unwrap();
+            let mut s = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             s.dead = true;
             s.warm = false;
         }
         self.cv.notify_all();
         // fail every in-flight waiter so no blocking caller hangs past the sidecar's death.
-        self.pending.lock().unwrap().clear();
+        self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
     }
 }
 
@@ -198,7 +198,7 @@ fn send_frame(w: &mut impl Write, v: &Value) -> bool {
 impl Session {
     /// Frame one request to the sidecar. Returns false if the pipe is broken (sidecar gone).
     fn send(&mut self, v: &Value) -> bool {
-        send_frame(&mut *self.stdin.lock().unwrap(), v)
+        send_frame(&mut *self.stdin.lock().unwrap_or_else(std::sync::PoisonError::into_inner), v)
     }
 }
 
@@ -319,7 +319,7 @@ impl MacroHost {
     /// the fact is logged — a beacon never strands a macro just because no UI is watching.
     pub fn beacon_events(&self) -> Receiver<BeaconEvent> {
         let (tx, rx) = channel();
-        *self.beacon.lock().unwrap() = Some(tx);
+        *self.beacon.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tx);
         rx
     }
 
@@ -327,7 +327,7 @@ impl MacroHost {
     /// macro's prompt returns its `default`). An unknown/expired pid is ignored by the sidecar —
     /// answering late is always safe.
     pub fn answer(&self, pid: u64, choice: Option<usize>) {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(s) = g.session.as_mut() {
             let _ = s.send(&json!({"t": "answer", "pid": pid, "choice": choice}));
         }
@@ -362,13 +362,13 @@ impl MacroHost {
         // persist first (the manifest mirrors disk; a respawn re-reads from here)
         write_macro_file(id, source)?;
         let rx = {
-            let mut g = self.inner.lock().unwrap();
+            let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             g.manifest.insert(id.to_string(), source.to_string());
             self.ensure_locked(&mut g)?;
             let s = g.session.as_mut().unwrap();
             let rid = s.shared.next_rid.fetch_add(1, Ordering::Relaxed);
             let (tx, rx) = channel();
-            s.shared.pending.lock().unwrap().insert(rid, tx);
+            s.shared.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(rid, tx);
             if !s.send(&json!({"t": "register", "rid": rid, "id": id, "source": source})) {
                 return Err("sidecar pipe broken".into());
             }
@@ -382,7 +382,7 @@ impl MacroHost {
                 // to render the moment it's added.
                 let opts = v.get("options").cloned().unwrap_or(Value::Null);
                 {
-                    let mut g = self.inner.lock().unwrap();
+                    let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     if opts.is_array() {
                         g.options.insert(id.to_string(), opts.clone());
                     } else {
@@ -404,7 +404,7 @@ impl MacroHost {
     /// A macro's DECLARED options (its `NEURON_OPTIONS` manifest) — what the GUI renders controls
     /// from. `None` (or empty) = the macro takes no options.
     pub fn options_manifest(&self, id: &str) -> Option<Value> {
-        self.inner.lock().unwrap().options.get(id).cloned()
+        self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner).options.get(id).cloned()
     }
 
     /// The user's chosen option VALUES for a macro (a `{key: value}` map), from disk. Empty if none.
@@ -420,7 +420,7 @@ impl MacroHost {
     /// Remove a macro (disk + manifest + sidecar registry).
     pub fn unregister(&self, id: &str) {
         let _ = std::fs::remove_file(macro_path(id));
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         g.manifest.remove(id);
         g.options.remove(id);
         if let Some(s) = g.session.as_mut() {
@@ -432,18 +432,18 @@ impl MacroHost {
     /// full-power, so we never claim a behavioural trace). Returns the def names on success.
     pub fn check(&self, source: &str) -> Result<Vec<String>, String> {
         let (rx, shared, rid, rid_send) = {
-            let mut g = self.inner.lock().unwrap();
+            let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             self.ensure_locked(&mut g)?;
             let s = g.session.as_mut().unwrap();
             let rid = s.shared.next_rid.fetch_add(1, Ordering::Relaxed);
             let (tx, rx) = channel();
             let shared = Arc::clone(&s.shared);
-            shared.pending.lock().unwrap().insert(rid, tx);
+            shared.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(rid, tx);
             let ok = s.send(&json!({"t": "check", "rid": rid, "source": source}));
             (rx, shared, rid, ok)
         };
         if !rid_send {
-            shared.pending.lock().unwrap().remove(&rid);
+            shared.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&rid);
             return Err("sidecar pipe broken".into());
         }
         match rx.recv_timeout(FIRE_BUDGET) {
@@ -462,7 +462,7 @@ impl MacroHost {
                 .unwrap_or("syntax error")
                 .to_string()),
             Err(_) => {
-                shared.pending.lock().unwrap().remove(&rid);
+                shared.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&rid);
                 Err("sidecar did not answer".into())
             }
         }
@@ -479,18 +479,18 @@ impl MacroHost {
     /// like [`check`](MacroHost::check), do NOT call from the input/UI thread.
     pub fn parse_macro(&self, source: &str) -> ParseResult {
         let (rx, shared, rid, sent) = {
-            let mut g = self.inner.lock().unwrap();
+            let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             self.ensure_locked(&mut g).map_err(host_err)?;
             let s = g.session.as_mut().unwrap();
             let rid = s.shared.next_rid.fetch_add(1, Ordering::Relaxed);
             let (tx, rx) = channel();
             let shared = Arc::clone(&s.shared);
-            shared.pending.lock().unwrap().insert(rid, tx);
+            shared.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(rid, tx);
             let ok = s.send(&json!({"t": "parse", "rid": rid, "source": source}));
             (rx, shared, rid, ok)
         };
         if !sent {
-            shared.pending.lock().unwrap().remove(&rid);
+            shared.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&rid);
             return Err(host_err("sidecar pipe broken"));
         }
         match rx.recv_timeout(FIRE_BUDGET) {
@@ -515,7 +515,7 @@ impl MacroHost {
                 Err(ParseError::Syntax { line, msg })
             }
             Err(_) => {
-                shared.pending.lock().unwrap().remove(&rid);
+                shared.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&rid);
                 Err(host_err("sidecar did not answer"))
             }
         }
@@ -554,7 +554,7 @@ impl MacroHost {
                 .session
                 .as_ref()
                 .map(|s| {
-                    let st = s.shared.state.lock().unwrap();
+                    let st = s.shared.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     st.warm && !st.dead
                 })
                 .unwrap_or(false);
@@ -598,7 +598,7 @@ impl MacroHost {
         budget: Duration,
     ) -> String {
         let (rx, shared, rid, sent) = {
-            let mut g = self.inner.lock().unwrap();
+            let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Err(e) = self.ensure_locked(&mut g) {
                 return format!("[{e}]");
             }
@@ -607,12 +607,12 @@ impl MacroHost {
             let rid = s.shared.next_rid.fetch_add(1, Ordering::Relaxed);
             let (tx, rx) = channel();
             let shared = Arc::clone(&s.shared);
-            shared.pending.lock().unwrap().insert(rid, tx);
+            shared.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(rid, tx);
             let ok = s.send(&json!({"t": "fire", "rid": rid, "id": id, "ctx": ctx_json(ctx, armed), "options": load_option_values(id)}));
             (rx, shared, rid, ok)
         };
         if !sent {
-            shared.pending.lock().unwrap().remove(&rid);
+            shared.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&rid);
             return "[sidecar pipe broken]".into();
         }
         match rx.recv_timeout(budget) {
@@ -630,7 +630,7 @@ impl MacroHost {
             // The wait expired, NOT necessarily the macro: a slow API call or an unanswered beacon
             // keeps running on its sidecar worker — its result lands in the macro log when it ends.
             Err(_) => {
-                shared.pending.lock().unwrap().remove(&rid);
+                shared.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&rid);
                 format!(
                     "macro '{id}' still running (waiting on a beacon or a slow call?) — \
                      result will land in the macro log"
@@ -644,14 +644,14 @@ impl MacroHost {
     /// macro scan lives in the spawn path itself (see [`ensure_locked`]), so EVERY road to a warm
     /// sidecar — GUI launch, `macro run <name>`, a respawn after a crash — sees the same world.
     pub fn ensure_warm(&self) -> Result<(), String> {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         self.ensure_locked(&mut g)
     }
 
     /// Drain the macro-log ring (the sidecar's stderr: prints + tracebacks). Newest last. Reads the
     /// persistent MacroHost-level ring, so a crashed sidecar's final lines survive its respawn.
     pub fn drain_log(&self) -> Vec<String> {
-        self.log.lock().unwrap().drain(..).collect()
+        self.log.lock().unwrap_or_else(std::sync::PoisonError::into_inner).drain(..).collect()
     }
 
     // ── internals ──────────────────────────────────────────────────────────────────────────
@@ -661,7 +661,7 @@ impl MacroHost {
         let dead = g
             .session
             .as_ref()
-            .map(|s| s.shared.state.lock().unwrap().dead)
+            .map(|s| s.shared.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).dead)
             .unwrap_or(true);
         if !dead {
             return Ok(());
@@ -804,7 +804,7 @@ fn spawn_session(armed: bool, log: LogRing, beacon: BeaconSlot) -> Result<Sessio
 
     // wait for warm (the `ready` frame the reader sets), bounded.
     {
-        let mut st = shared.state.lock().unwrap();
+        let mut st = shared.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let deadline = Instant::now() + WARM_TIMEOUT;
         while !st.warm && !st.dead {
             let now = Instant::now();
@@ -837,7 +837,7 @@ fn spawn_session(armed: bool, log: LogRing, beacon: BeaconSlot) -> Result<Sessio
 /// Deliver a beacon event to the installed listener, returning whether anyone took it. A dead
 /// receiver (the UI dropped its end) clears the slot so later prompts take the no-UI path cleanly.
 fn beacon_deliver(beacon: &BeaconSlot, ev: BeaconEvent) -> bool {
-    let mut slot = beacon.lock().unwrap();
+    let mut slot = beacon.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     match slot.as_ref() {
         Some(tx) if tx.send(ev).is_ok() => true,
         Some(_) => {
@@ -1052,7 +1052,7 @@ fn reader_loop(
         crate::prof::bump(&crate::prof::READER_FRAME);
         match v.get("t").and_then(Value::as_str) {
             Some("ready") => {
-                let mut st = shared.state.lock().unwrap();
+                let mut st = shared.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 st.warm = true;
                 st.dead = false;
                 shared.cv.notify_all();
@@ -1069,7 +1069,7 @@ fn reader_loop(
                 let waiter = v
                     .get("rid")
                     .and_then(Value::as_u64)
-                    .and_then(|rid| shared.pending.lock().unwrap().remove(&rid));
+                    .and_then(|rid| shared.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&rid));
                 if let Some(tx) = waiter {
                     let _ = tx.send(v.clone());
                 } else if v.get("t").and_then(Value::as_str) == Some("result") {
@@ -1140,7 +1140,7 @@ fn reader_loop(
                     // of hanging until timeout. The auto-answer goes straight down the pipe.
                     if let Some(stdin) = stdin.upgrade() {
                         let _ = send_frame(
-                            &mut *stdin.lock().unwrap(),
+                            &mut *stdin.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
                             &json!({"t": "answer", "pid": pid, "choice": Value::Null}),
                         );
                     }
@@ -1186,7 +1186,7 @@ fn reader_loop(
                     let (ok, msg) = run_act(&verb, &arg);
                     if let Some(stdin) = stdin.upgrade() {
                         let _ = send_frame(
-                            &mut *stdin.lock().unwrap(),
+                            &mut *stdin.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
                             &json!({"t": "act_result", "rid": rid, "ok": ok, "msg": msg}),
                         );
                     }

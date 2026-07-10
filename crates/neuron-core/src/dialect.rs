@@ -226,6 +226,11 @@ impl Dialect for RazerDialect {
         size: u8,
         args: &[u8],
     ) -> Result<[u8; 80]> {
+        // Hold the pipe's wire lock for the WHOLE conversation (set → poll/drain [→ re-arm]):
+        // pair-atomicity is the unit; between conversations other actors may interleave freely.
+        let wire = t.wire_lock();
+        let _wire = wire.as_ref().map(|w| w.acquire());
+
         // MOVED VERBATIM from device.rs::exec_dynamic_tx: 10ms × 60 polls, re-arm at i%12==11,
         // the exact error strings. Only the hand-rolled echo `if b[7]==.. && b[8]==..` collapses
         // into `protocol::reply_status` (same bytes, same decision).
@@ -270,6 +275,11 @@ impl Dialect for RazerDialect {
         args: &[u8],
         stream_wait_us: u64,
     ) {
+        // Hold the pipe's wire lock for the WHOLE conversation (set → poll/drain [→ re-arm]):
+        // pair-atomicity is the unit; between conversations other actors may interleave freely.
+        let wire = t.wire_lock();
+        let _wire = wire.as_ref().map(|w| w.acquire());
+
         // MOVED from device.rs::send_lighting_fast: SetFeature, wait the receiver round-trip if
         // the def calibrated one, then a single GetFeature drain (the razer_report protocol
         // requires the reply be read before the next write — skip it and the device freezes).
@@ -427,6 +437,11 @@ impl Dialect for RazerAudioDialect {
         size: u8,
         args: &[u8],
     ) -> Result<[u8; 80]> {
+        // Hold the pipe's wire lock for the WHOLE conversation (set → poll/drain [→ re-arm]):
+        // pair-atomicity is the unit; between conversations other actors may interleave freely.
+        let wire = t.wire_lock();
+        let _wire = wire.as_ref().map(|w| w.acquire());
+
         // Mirrors RazerDialect::exec's busy-poll discipline verbatim (10ms x 60 polls, re-arm at
         // i%12==11, the exact error strings) — only the envelope shape differs (64 bytes / report id
         // 0x07 vs razer_report's 91 bytes / report id 0x00). `reply_status` reads offsets 1/7/8,
@@ -470,6 +485,11 @@ impl Dialect for RazerAudioDialect {
         args: &[u8],
         stream_wait_us: u64,
     ) {
+        // Hold the pipe's wire lock for the WHOLE conversation (set → poll/drain [→ re-arm]):
+        // pair-atomicity is the unit; between conversations other actors may interleave freely.
+        let wire = t.wire_lock();
+        let _wire = wire.as_ref().map(|w| w.acquire());
+
         // Mirrors RazerDialect::exec_fast: SetFeature, wait the calibrated round-trip, one drain —
         // never a busy-retry loop.
         let out = frame_audio(transaction_id, class, id, size, args);
@@ -597,7 +617,7 @@ pub fn claimed_by(info: &HidDeviceInfo) -> Option<&'static dyn Dialect> {
 mod tests {
     use super::*; // brings Dialect, RazerDialect, frame, by_id, reply_status, Report, Transport, HidDeviceInfo, …
     use crate::transport::DevicePath;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     /// A razer_report device that RECORDS the exact request buffer and replies SUCCESS echoing the
     /// command's class/id — enough to pin the bytes the dialect puts on the wire AND prove the
@@ -1077,5 +1097,130 @@ mod tests {
         };
         let s = RazerAudioDialect.probe(&PanicOnIo, &ctx).unwrap();
         assert_eq!(s.def.name, "Razer audio device 056a");
+    }
+
+    /// What the ONE simulated firmware control pipe currently holds — "whatever the LAST
+    /// `set_feature` wrote" is exactly the real hardware's behavior (LIGHTING-MAP §5): the pipe has
+    /// no per-caller memory, so a `get_feature` from ANY handle echoes whoever wrote most recently.
+    /// `violations` is incremented by [`SharedPipe::get_feature`] whenever a THREAD's own poll
+    /// observes a class/id different from the one IT most recently sent — i.e. another thread's
+    /// `set_feature` landed in between, a cross-read.
+    struct PipeState {
+        class: u8,
+        id: u8,
+        violations: usize,
+    }
+
+    /// A fake `Transport` that simulates the shared control pipe TWO real HID handles opened on the
+    /// same `DevicePath` would present. Two `SharedPipe` values built via [`SharedPipe::second_handle`]
+    /// share the SAME inner `state` AND the SAME `wire` lock — exactly what two `WinHid::open` calls
+    /// on one path would produce through `transport::wire_lock_for`. `set_feature` OVERWRITES the
+    /// shared state (with a short sleep that widens the interleave window a real 10ms poll cadence
+    /// would otherwise mostly hide); `get_feature` answers Success echoing whatever is CURRENTLY
+    /// there — the last-set-wins cross-read behavior LIGHTING-MAP §5 describes.
+    struct SharedPipe {
+        state: Arc<Mutex<PipeState>>,
+        wire: Arc<crate::transport::WireLock>,
+    }
+
+    impl SharedPipe {
+        fn new() -> Self {
+            SharedPipe {
+                state: Arc::new(Mutex::new(PipeState { class: 0, id: 0, violations: 0 })),
+                wire: Arc::new(crate::transport::WireLock::new_local()),
+            }
+        }
+
+        /// A second handle onto the SAME simulated pipe: same `state`, same `wire` — the fake's
+        /// analogue of a second in-process `WinHid::open` on the identical `DevicePath`.
+        fn second_handle(&self) -> SharedPipe {
+            SharedPipe {
+                state: self.state.clone(),
+                wire: self.wire.clone(),
+            }
+        }
+    }
+
+    thread_local! {
+        // The (class, id) THIS thread most recently sent — compared against the shared pipe state
+        // inside `get_feature` to detect a cross-read from the OTHER thread's conversation.
+        static LAST_SENT: std::cell::Cell<(u8, u8)> = std::cell::Cell::new((0, 0));
+    }
+
+    impl Transport for SharedPipe {
+        fn set_feature(&self, buf: &[u8]) -> anyhow::Result<()> {
+            let (class, id) = (buf[7], buf[8]);
+            LAST_SENT.with(|c| c.set((class, id)));
+            {
+                let mut st = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                st.class = class;
+                st.id = id;
+            }
+            // Widen the interleave window: WITHOUT the wire lock, this is exactly the gap another
+            // thread's own `set_feature` would land in and overwrite `state` out from under us.
+            std::thread::sleep(std::time::Duration::from_micros(300));
+            Ok(())
+        }
+
+        fn get_feature(&self, buf: &mut [u8]) -> anyhow::Result<()> {
+            let (want_class, want_id) = LAST_SENT.with(|c| c.get());
+            let (cur_class, cur_id) = {
+                let st = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                (st.class, st.id)
+            };
+            if (cur_class, cur_id) != (want_class, want_id) {
+                self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).violations += 1;
+            }
+            // Success, echoing whatever the pipe CURRENTLY holds — the last-set-wins cross-read.
+            let mut rep = Report::command(0x1F, cur_class, cur_id, 0);
+            rep.status = 0x02; // Success
+            let out = rep.to_buf();
+            let n = buf.len().min(BUF_LEN);
+            buf[..n].copy_from_slice(&out[..n]);
+            Ok(())
+        }
+
+        fn wire_lock(&self) -> Option<Arc<crate::transport::WireLock>> {
+            // Both `SharedPipe` handles built from one `second_handle()` call return the IDENTICAL
+            // Arc — precisely how two real `WinHid` opens on the same `DevicePath` behave.
+            Some(self.wire.clone())
+        }
+    }
+
+    #[test]
+    fn two_handles_never_cross_read_replies_on_one_pipe() {
+        // INVERSE CONTROL (documented, not asserted): comment out `RazerDialect::exec`'s
+        // `t.wire_lock()` guard and this SAME fake demonstrably cross-reads — with two threads
+        // racing `SharedPipe::set_feature`/`get_feature` unguarded, a `get_feature` between them
+        // routinely echoes the OTHER thread's class/id (`violations` climbs well above zero). The
+        // lock exercised below is what keeps `violations` at zero; it is load-bearing, not
+        // incidental scaffolding.
+        let pipe = SharedPipe::new();
+        let h1 = pipe.second_handle();
+        let h2 = pipe.second_handle();
+
+        // Two threads, ~50 conversations each, DIFFERENT (class, id) pairs per thread so a
+        // cross-read is distinguishable from a same-thread repeat.
+        let t1 = std::thread::spawn(move || {
+            for i in 0..50u8 {
+                let out = RazerDialect.exec(&h1, 0x1F, 0x10, i, 0x02, &[]);
+                assert!(out.is_ok(), "thread 1's exec must succeed under the wire lock");
+            }
+        });
+        let t2 = std::thread::spawn(move || {
+            for i in 0..50u8 {
+                let out = RazerDialect.exec(&h2, 0x1F, 0x20, i, 0x02, &[]);
+                assert!(out.is_ok(), "thread 2's exec must succeed under the wire lock");
+            }
+        });
+        t1.join().expect("thread 1 must not panic");
+        t2.join().expect("thread 2 must not panic");
+
+        assert_eq!(
+            pipe.state.lock().unwrap().violations,
+            0,
+            "no thread's get_feature may ever observe the OTHER thread's class/id mid-conversation \
+             — the wire lock must keep every set→poll conversation atomic"
+        );
     }
 }

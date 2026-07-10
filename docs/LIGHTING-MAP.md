@@ -3,7 +3,7 @@
 > stale, wrong, or slop — or it may be load-bearing and exactly right.
 > code is the source of truth; verify before you lean on it.
 >
-> **kind:** as-built architecture map (four-sweep audit) · **as of:** 2026-07-02 · **trust:** high — every claim was cited to live code at the time; §5 honestly lists the seams still open
+> **kind:** as-built architecture map (four-sweep audit) · **as of:** 2026-07-02, §5 refreshed 2026-07-09 (pre-release hardening: both 🔴s closed) · **trust:** high — every claim was cited to live code at the time; §5 honestly lists the seams still open
 
 # The Lighting System — Map & Inspection
 
@@ -123,22 +123,31 @@ provably matches the board.
 
 ## 5. FLAGGED — known seams, in priority order
 
-🔴 **Control-plane writes race the stream on a second HID handle.** The wire protocol is
-SetFeature→GetFeature pairs on ONE firmware control pipe; two handles interleaving pairs can
-cross-read replies (`send_lighting_fast` drains blindly). Offenders, all opening their own handle
-while the host writer streams: `runtime::apply_effect`/`apply_brightness` (no `host::active()`
-guard — unlike `start_layers`), the macro `brightness` verb, the `macrokeys` driver-mode
-re-assert thread, profile-apply's brightness write, and the entire CLI cross-process. The ACK'd
-path's class/id echo filter + re-arm gives partial protection; the fast path has none.
-*Fix shape:* route one-shot control writes through the device's writer (a control queue on the
-sink), or a per-DevicePath wire mutex in neuron-core (solves in-process; document the CLI case).
+✅ **FIXED (2026-07-09) — control-plane writes no longer race the stream in-process.** The wire
+protocol is SetFeature→GetFeature pairs on ONE firmware control pipe; two handles interleaving
+pairs cross-read replies. Now every transport opened on the same `DevicePath` shares a process-
+global wire lock (`Transport::wire_lock`, resolved in `windows_hid::WinHid::open`), and the
+conversation OWNER holds it for the duration of ONE request/reply conversation: the dialect
+`exec`/`exec_fast` bodies (razer, razer-audio, HID++ incl. its probe pings) and the per-pair
+probe loops in `synth::timed_exec` / `discover::exec`. Pair-atomicity is the unit — between
+conversations, writers interleave freely, so a probe sweep can't starve the 30fps stream.
+Regression-pinned by `dialect::tests::two_handles_never_cross_read_replies_on_one_pipe` (a
+shared-pipe fake with last-set-wins echo semantics). CROSS-PROCESS TOO (same day, review
+follow-up): `WireLock` layers a NAMED kernel mutex (`Local\neuron-wire-<fnv64(path)>`, explicit
+null DACL so the unelevated CLI can open what the elevated tray created — the default DACL of an
+elevated token grants BUILTIN\Administrators, which a filtered token lacks) under the process
+mutex, so `neuron-cli` writes serialize against the app's writer as well. Bounded 2s kernel wait
++ local-only degradation: a hung foreign process delays a command, never deadlocks it. Pinned by
+`transport::tests::named_kernel_mutex_excludes_across_separate_handles` (two independent handles
+to one named object — the exact topology two processes have). Transaction-level read-verify
+atomicity stays `io_gate`'s job, by design.
 
-🔴 **Host on/off transitions and profile apply are single-board.** Only the SELECTED board is
-re-seated: host-off strands other boards frozen; host-on used to double-write them (the selected
-board's case is fixed, the others migrate only when next applied); profile apply hand-rolls a
-stop loop (neither clears host bases nor restarts non-selected boards → their lighting goes dark).
-*Fix shape:* iterate every persisted `[lighting.*]` stack (not the selection) on host toggle,
-restore, and profile apply — one shared "re-seat all boards" helper replacing the three copies.
+✅ **FIXED (2026-07-09) — host/profile transitions re-seat every board.** `glue::reapply_all_boards`
+(selected board from the LIVE stack, every other light-capable board from its persisted per-pid
+stack, per-board fps posing) is now the one transition helper, driven by: host on/off toggle,
+writes-pause resume, arm-stance resume, profile apply (success AND failure arms, resume placed
+OUTSIDE the stack-emptiness gate so other boards wake even when the selected board has nothing to
+stream), and startup restore (a multi-board desk boots with every board resumed).
 
 ✅ **FIXED — Chroma custom effects no longer black out the base.** Chroma CUSTOM frames still
 decode zeros as BLACK, but the paint-policy rework's merge-mode black rule (`paint.rs::merge_cells`)

@@ -117,6 +117,10 @@ fn reg_cell() -> &'static Mutex<Option<&'static neuron::registry::Registry>> {
 /// Arm the listener: a reader thread per readable, event-carrying collection of each connected Razer
 /// DPI-mouse, plus a hotplug monitor that re-arms after replug. Never fails the app.
 pub fn start() {
+    debug_assert!(
+        crate::glue::ui_installed(),
+        "startup-order contract: glue::install_ui must run before hidwatch::start — early mute events would silently drop (main.rs wiring)"
+    );
     registry(); // pre-warm (surface a load error early; cache for the hot path)
     let mouse_pids: HashSet<u16> = match registry() {
         Some(r) => r
@@ -186,7 +190,7 @@ fn arm_new(mouse_pids: &HashSet<u16>, armed: &Arc<Mutex<HashSet<DevicePath>>>) {
             continue;
         }
         // claim this collection (HashSet::insert is false if already armed → skip)
-        if !armed.lock().unwrap().insert(info.path.clone()) {
+        if !armed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(info.path.clone()) {
             continue;
         }
         spawn_reader(info.pid, info.path.clone(), armed.clone(), event_def, event_dialect, info.product.clone());
@@ -223,7 +227,7 @@ fn spawn_reader(
                     if verbose() {
                         eprintln!("[hidwatch] {tag}: not readable ({e})");
                     }
-                    armed.lock().unwrap().remove(&path); // let the monitor retry later
+                    armed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&path); // let the monitor retry later
                     return;
                 }
             };
@@ -273,7 +277,7 @@ fn spawn_reader(
                     Ok(_) => {} // zero-length read — keep listening
                     Err(_) => {
                         // unplugged / device gone — drop our claim so the monitor re-arms on replug.
-                        armed.lock().unwrap().remove(&path);
+                        armed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&path);
                         if verbose() {
                             eprintln!("[hidwatch] {tag}: closed");
                         }
@@ -299,9 +303,9 @@ fn note_audio_capability(dialect: &dyn neuron::dialect::Dialect, product: &str) 
     if product.is_empty() {
         return;
     }
-    mute_products_store().lock().unwrap().insert(product.to_string());
+    mute_products_store().lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(product.to_string());
     if dialect.audio_mute_writable() {
-        mute_writable_store().lock().unwrap().insert(product.to_string());
+        mute_writable_store().lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(product.to_string());
     }
 }
 
@@ -319,7 +323,7 @@ fn mute_products_store() -> &'static Mutex<HashSet<String>> {
 /// is hardware-owned — discovered from what the dialect layer actually CLAIMED and armed, not from a
 /// registry def (a def with its own `[events]` MuteState entry is a SEPARATE, additional check there).
 pub fn hardware_mute_products() -> Vec<String> {
-    mute_products_store().lock().unwrap().iter().cloned().collect()
+    mute_products_store().lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().cloned().collect()
 }
 
 /// The WRITE facet's own store, lazily created — mirrors [`mute_products_store`].
@@ -332,7 +336,7 @@ fn mute_writable_store() -> &'static Mutex<HashSet<String>> {
 /// `audio_mute_writable()` is true (today: never — see `spawn_reader`; the plumbing is ready for a
 /// writable-mute family).
 pub fn mute_writable_products() -> Vec<String> {
-    mute_writable_store().lock().unwrap().iter().cloned().collect()
+    mute_writable_store().lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().cloned().collect()
 }
 
 /// Bridge an audio device's firmware tap-mute (its pushed `05 11 <state>`-shaped report) to the
@@ -690,7 +694,7 @@ fn batches() -> &'static Mutex<HashMap<u16, BatchState>> {
 /// flush acts; a sibling device's batch and generation are untouched.
 fn batch_push(pid: u16, ev: Push) {
     let my_gen = {
-        let mut map = batches().lock().unwrap();
+        let mut map = batches().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let st = map
             .entry(pid)
             .or_insert_with(|| BatchState { batch: Batch::EMPTY, generation: 0 });
@@ -719,7 +723,7 @@ fn batch_push(pid: u16, ev: Push) {
             // Take + decide under the lock so a report landing in the gap can't be lost: if a newer
             // push for THIS pid bumped its generation, a later flush owns the batch — this one bows out.
             let batch = {
-                let mut map = batches().lock().unwrap();
+                let mut map = batches().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 let Some(st) = map.get_mut(&pid) else {
                     return;
                 };
@@ -848,7 +852,7 @@ fn reassert_stamps() -> &'static Mutex<HashMap<u16, Instant>> {
 /// since the last reassert — so a wake BURST arms exactly one. Decided synchronously on the listener
 /// thread so the burst is collapsed before any worker spawns.
 fn reassert_due(pid: u16) -> bool {
-    let mut map = reassert_stamps().lock().unwrap();
+    let mut map = reassert_stamps().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let now = Instant::now();
     match map.get(&pid) {
         Some(&last) if now.duration_since(last) < REASSERT_DEBOUNCE => false,

@@ -3,9 +3,18 @@
 //! Windows uses the native `windows-sys` path (open with access=0, feature IOCTLs are
 //! FILE_ANY_ACCESS — which is how you talk to a protected HID mouse). Other platforms
 //! can drop in a hidapi/hidraw impl behind the same trait later.
+//!
+//! [`Transport::wire_lock`] serializes conversations from separate handles opened on the SAME
+//! `DevicePath` (LIGHTING-MAP §5's cross-read bug) — within this process via a local `Mutex`,
+//! and ACROSS processes on Windows via a named kernel mutex layered underneath ([`WireLock`]):
+//! the CLI and the app now serialize against each other's request/reply pairs too. The kernel
+//! half is best-effort by design (bounded 2s wait, local-only degradation on create failure) so
+//! a hung foreign process can never deadlock a user command.
 
 use anyhow::Result;
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
 /// An opaque handle key identifying one enumerated HID interface.
 ///
@@ -120,6 +129,108 @@ pub fn path_instance(path: &str) -> String {
         .join("#")
 }
 
+/// Process-global DevicePath → wire-lock registry. Strong Arcs, never evicted: the set of
+/// control pipes on one machine in one boot is tiny (a handful), and a stable Arc means two
+/// opens at any two times always share the same lock.
+static WIRE_LOCKS: LazyLock<Mutex<HashMap<DevicePath, Arc<WireLock>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Resolve (creating on first sight) the shared wire lock for `path`. Every backend's `open()`
+/// calls this so two handles onto the same control pipe — the host lighting writer and a
+/// runtime `apply_effect`, say — hold the IDENTICAL `Arc<WireLock>` and so serialize against
+/// each other's request/reply conversations (see the module doc and LIGHTING-MAP §5).
+pub(crate) fn wire_lock_for(path: &DevicePath) -> Arc<WireLock> {
+    let mut locks = WIRE_LOCKS.lock().unwrap_or_else(PoisonError::into_inner);
+    locks
+        .entry(path.clone())
+        .or_insert_with(|| Arc::new(WireLock::for_path(path)))
+        .clone()
+}
+
+/// The per-pipe wire lock: a process-local `Mutex` (fast path, poison-recovered) LAYERED over a
+/// named kernel mutex on Windows, so pair-atomicity holds across PROCESSES too — the app's host
+/// writer and a `neuron-cli` write no longer interleave SetFeature/GetFeature pairs (the
+/// LIGHTING-MAP §5 race, previously fixed in-process only).
+///
+/// Semantics, in acquisition order:
+/// 1. the LOCAL mutex first (cheap, and it means at most one thread per process ever waits on the
+///    kernel object — the OS wait below can never be contended by our own threads);
+/// 2. then the KERNEL mutex, with a BOUNDED 2s wait. Timeout/failure degrades to proceeding with
+///    only the local lock — never a deadlock behind a hung foreign process, and never worse than
+///    the pre-cross-process behavior. (A conversation legitimately holds for ≤~600ms worst-case;
+///    a 2s-held wire means the holder is wedged and the device is already toast.)
+///    `WAIT_ABANDONED` counts as acquired: the previous holder DIED mid-conversation — ownership
+///    transfers to us, and the reply-echo filter already tolerates whatever half-conversation the
+///    corpse left on the pipe (same story as a same-process crash before this layer existed).
+///
+/// Construction is infallible: if the kernel object can't be created (name collision with a
+/// foreign object type, exotic ACL environment), `os` is `None` and the lock is process-local —
+/// graceful degradation, loudly documented rather than silently assumed away.
+pub struct WireLock {
+    local: Mutex<()>,
+    #[cfg(windows)]
+    os: Option<windows_hid::OsWireMutex>,
+}
+
+impl WireLock {
+    /// A process-local-only lock — for test fakes and non-Windows backends (no kernel half).
+    pub fn new_local() -> WireLock {
+        WireLock {
+            local: Mutex::new(()),
+            #[cfg(windows)]
+            os: None,
+        }
+    }
+
+    /// The full lock for a real device pipe: local mutex + (Windows) the named kernel mutex
+    /// derived from the path, shared by every neuron process that opens this pipe.
+    fn for_path(path: &DevicePath) -> WireLock {
+        #[cfg(windows)]
+        {
+            WireLock {
+                local: Mutex::new(()),
+                os: windows_hid::OsWireMutex::for_path(path),
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = path;
+            WireLock::new_local()
+        }
+    }
+
+    /// Hold the wire for ONE request/reply conversation. See the type doc for the ordering and
+    /// degradation rules. The guard releases both halves on drop (kernel half only if acquired).
+    pub fn acquire(&self) -> WireGuard<'_> {
+        let local = self.local.lock().unwrap_or_else(PoisonError::into_inner);
+        #[cfg(windows)]
+        let os_held = self.os.as_ref().is_some_and(|m| m.acquire());
+        WireGuard {
+            _local: local,
+            #[cfg(windows)]
+            os: if os_held { self.os.as_ref() } else { None },
+        }
+    }
+}
+
+/// RAII guard from [`WireLock::acquire`]. `!Send` by construction (holds a `MutexGuard`), which
+/// also guarantees the kernel mutex is released by the thread that acquired it — a Win32
+/// `ReleaseMutex` requirement.
+pub struct WireGuard<'a> {
+    _local: std::sync::MutexGuard<'a, ()>,
+    #[cfg(windows)]
+    os: Option<&'a windows_hid::OsWireMutex>,
+}
+
+#[cfg(windows)]
+impl Drop for WireGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(m) = self.os {
+            m.release();
+        }
+    }
+}
+
 /// A feature-report channel to one device.
 ///
 /// Two wire surfaces live here. The PROVEN one is the feature-report request/reply pair
@@ -150,6 +261,18 @@ pub trait Transport {
     fn read_input(&self, buf: &mut [u8], timeout_ms: u32) -> Result<usize> {
         let _ = (buf, timeout_ms);
         anyhow::bail!("transport does not carry input reports")
+    }
+
+    /// The per-pipe WIRE LOCK shared by every transport opened on the same DevicePath, or None for
+    /// a transport with no shared identity (test fakes). A razer_report conversation is a
+    /// SetFeature→GetFeature(s) pair on one firmware control pipe; two handles interleaving pairs
+    /// cross-read replies (LIGHTING-MAP §5). The conversation OWNER (a Dialect's exec/exec_fast, a
+    /// probe loop) holds this for the duration of ONE request/reply conversation — not per call,
+    /// which couldn't keep the pair atomic. Cross-PROCESS too on Windows: [`WireLock`] layers a
+    /// named kernel mutex under the process-local one, so a `neuron-cli` write serializes against
+    /// the app's writer as well (bounded wait + graceful local-only degradation — see `WireLock`).
+    fn wire_lock(&self) -> Option<Arc<WireLock>> {
+        None
     }
 }
 
@@ -215,6 +338,117 @@ mod tests {
             Ok(())
         }
     }
+
+    /// The cross-process wire guarantee, exercised through the exact object topology two
+    /// PROCESSES have: two SEPARATELY-OPENED handles to one NAMED kernel mutex. A kernel object
+    /// is resolved by name and doesn't care which address space the handle lives in — this is the
+    /// same syscall path (`CreateMutexW` open-existing → `WaitForSingleObject` → `ReleaseMutex`)
+    /// the app and the CLI take; only the process boundary differs, which the kernel abstracts.
+    /// Pins: (a) a second handle BLOCKS while the first holds (measured, not assumed), (b) the
+    /// release hands over within the bounded wait, (c) `WireGuard`-style release actually works
+    /// across handles.
+    #[cfg(windows)]
+    #[test]
+    fn named_kernel_mutex_excludes_across_separate_handles() {
+        // Unique per test process so parallel/repeated runs never collide on a stale name.
+        let name = format!("Local\\neuron-wire-selftest-{}", std::process::id());
+        let a = windows_hid::OsWireMutex::open_named(&name).expect("create the named mutex");
+        let b = windows_hid::OsWireMutex::open_named(&name).expect("open a second handle to it");
+        assert!(a.acquire(), "first handle acquires immediately");
+        let waiter = std::thread::spawn(move || {
+            // A named mutex is recursive PER THREAD, so the exclusion proof must come from a
+            // different thread — which is also the honest analogue of a different process.
+            let t0 = std::time::Instant::now();
+            assert!(b.acquire(), "second handle acquires once the first releases");
+            b.release();
+            t0.elapsed()
+        });
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        a.release();
+        let waited = waiter.join().expect("waiter thread clean");
+        assert!(
+            waited >= std::time::Duration::from_millis(100),
+            "the second handle provably BLOCKED on the first's hold (waited {waited:?}) — \
+             a no-op acquire would return instantly and the wire guarantee would be fiction"
+        );
+    }
+
+    /// CHILD HALF of `cross_process_wire_exclusion_is_real` below — inert on a normal test run
+    /// (no env var → returns immediately, shows as a trivially-passing test). When the parent
+    /// test re-invokes this test binary with `NEURON_WIRE_TEST_NAME` set, this process opens that
+    /// named mutex, ACQUIRES it, announces the hold on stdout, keeps it for 400ms, releases, and
+    /// exits — the foreign-process holder the parent proves exclusion against.
+    #[cfg(windows)]
+    #[test]
+    fn wire_child_holds_the_named_mutex() {
+        let Ok(name) = std::env::var("NEURON_WIRE_TEST_NAME") else {
+            return; // normal run: not a child — nothing to do
+        };
+        use std::io::Write;
+        let m = windows_hid::OsWireMutex::open_named(&name).expect("child opens the named mutex");
+        assert!(m.acquire(), "child acquires");
+        println!("WIRE-CHILD-HELD");
+        std::io::stdout().flush().ok();
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        m.release();
+    }
+
+    /// The cross-process wire guarantee exercised ACROSS A REAL PROCESS BOUNDARY (review
+    /// observation closed): this test spawns the test binary itself as a child (env-gated helper
+    /// above), waits until the child announces it HOLDS the named mutex, then proves from THIS
+    /// process that (a) a short acquire attempt times out while the child holds — real blocking,
+    /// not a no-op — and (b) a full-budget acquire succeeds once the child releases. Two distinct
+    /// PIDs, one kernel object: the exact topology of the app and the CLI on a user's desk.
+    #[cfg(windows)]
+    #[test]
+    fn cross_process_wire_exclusion_is_real() {
+        use std::io::BufRead;
+        let name = format!("Local\\neuron-wire-xproc-{}", std::process::id());
+        // Our handle FIRST, so the object outlives any child-side timing.
+        let mine = windows_hid::OsWireMutex::open_named(&name).expect("parent opens the mutex");
+        let exe = std::env::current_exe().expect("test binary path");
+        let mut child = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "transport::tests::wire_child_holds_the_named_mutex",
+                "--nocapture",
+            ])
+            .env("NEURON_WIRE_TEST_NAME", &name)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn the child test process");
+        // Wait for the child's explicit HOLD announcement (libtest chatter precedes it).
+        let stdout = child.stdout.take().expect("piped stdout");
+        let mut lines = std::io::BufReader::new(stdout).lines();
+        let held = loop {
+            match lines.next() {
+                Some(Ok(l)) if l.contains("WIRE-CHILD-HELD") => break true,
+                Some(Ok(_)) => continue,
+                _ => break false,
+            }
+        };
+        assert!(held, "the child process must announce it acquired the mutex");
+        // (a) While the CHILD PROCESS holds: a short probe from THIS process must time out.
+        assert!(
+            !mine.acquire_for(100),
+            "acquire must BLOCK while another PROCESS holds the named mutex — \
+             if this succeeded, cross-process exclusion is fiction"
+        );
+        // (b) After the child's 400ms hold ends: the full-budget acquire succeeds.
+        assert!(
+            mine.acquire_for(WIRE_OS_WAIT_MS_FOR_TESTS),
+            "acquire must succeed once the foreign holder releases"
+        );
+        mine.release();
+        let status = child.wait().expect("child exits");
+        assert!(status.success(), "the child test process must itself pass");
+    }
+
+    /// The production wait budget, mirrored for the cross-process test's success half (the
+    /// constant lives in the windows backend; tests get it through this alias so the test reads
+    /// as "the real budget", not a magic number).
+    #[cfg(windows)]
+    const WIRE_OS_WAIT_MS_FOR_TESTS: u32 = 2000;
 
     #[test]
     fn default_output_input_surface_errors_honestly() {

@@ -18,6 +18,11 @@ pub fn exec(
     size: u8,
     args: &[u8],
 ) -> Option<[u8; 80]> {
+    // Hold the pipe's wire lock for this ONE request/reply conversation only — not the whole
+    // fingerprint sweep (classes x ids), so a lighting writer can interleave between pairs.
+    let wire = t.wire_lock();
+    let _wire = wire.as_ref().map(|w| w.acquire());
+
     let mut req = Report::command(tid, class, id, size);
     for (i, b) in args.iter().enumerate() {
         if i < req.args.len() {

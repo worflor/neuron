@@ -470,7 +470,7 @@ fn session_loop(weak: &slint::Weak<AppWindow>) {
         )
     };
     {
-        let pen = state.lock().unwrap().pen;
+        let pen = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).pen;
         status(weak, &pen);
     }
 
@@ -504,11 +504,11 @@ fn session_loop(weak: &slint::Weak<AppWindow>) {
         }
         // matured taps resolve once the multi-click window closes
         if taps > 0 && last_release.elapsed().as_millis() as u64 > click_window {
-            let laser = state.lock().unwrap().laser;
+            let laser = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).laser;
             match taps {
                 // a single tap: PING here in laser mode (the presenter's "look"), else UNDO
                 1 if laser => {
-                    let pc = state.lock().unwrap().pen.color;
+                    let pc = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).pen.color;
                     let _ = tx.send(Cmd::Ping(last_tap.0, last_tap.1, PingKind::Here, pc));
                 }
                 1 => {
@@ -539,7 +539,7 @@ fn session_loop(weak: &slint::Weak<AppWindow>) {
                     // interactively below (on the held branch), so a *released* hold-in-place here
                     // is the wheel being dismissed with no pick; nothing to do.
                     if taps == 0 && held && !moved {
-                        if !state.lock().unwrap().laser {
+                        if !state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).laser {
                             let _ = tx.send(Cmd::Redo);
                         }
                         break;
@@ -555,9 +555,9 @@ fn session_loop(weak: &slint::Weak<AppWindow>) {
                 }
                 // LASER mode: a hold-in-place (no move yet) at taps==0 raises the reactionary-ping
                 // WHEEL — the redo gesture re-cast as direct comms (resolves by release direction).
-                if held && !moved && taps == 0 && state.lock().unwrap().laser {
+                if held && !moved && taps == 0 && state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).laser {
                     taps = 0;
-                    ping_wheel(weak, tx, vk, &done, start, state.lock().unwrap().pen.color);
+                    ping_wheel(weak, tx, vk, &done, start, state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).pen.color);
                     break;
                 }
                 // a held-in-place FIRST press is a redo candidate (resolves on release above),
@@ -566,19 +566,19 @@ fn session_loop(weak: &slint::Weak<AppWindow>) {
                 if moved || (held && taps != 0) {
                     let t = taps;
                     taps = 0;
-                    state.lock().unwrap().veiled = false; // a hold-action brings the ink back
+                    state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).veiled = false; // a hold-action brings the ink back
                     match t {
                         // ── plain hold: laser trail (presentation), else drag a grabbed
                         //    selection, else ink ──
                         0 => {
-                            if state.lock().unwrap().laser {
-                                let pen = state.lock().unwrap().pen;
+                            if state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).laser {
+                                let pen = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).pen;
                                 laser_trail(tx, vk, &done, start, &pen);
                             } else if selection_hit(tx, start) {
                                 drag_selection(tx, vk, &done, start);
                             } else {
                                 let _ = tx.send(Cmd::Deselect);
-                                let pen = state.lock().unwrap().pen;
+                                let pen = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).pen;
                                 draw_stroke(weak, tx, vk, &done, start, &pen);
                             }
                         }
@@ -3439,7 +3439,7 @@ mod palette {
                         lmb_was = neuron::glyph::key_down(0x01);
                         rmb_was = neuron::glyph::key_down(0x02);
                         if let Some((_, state)) = ctx.as_ref() {
-                            let st = state.lock().unwrap();
+                            let st = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                             surface.paint(&its, hover, &st, sca);
                         }
                         ShowWindow(hwnd, SW_SHOWNOACTIVATE);
@@ -3473,7 +3473,7 @@ mod palette {
                 if (wr.left, wr.top) != expected && !neuron::glyph::key_down(0x01) {
                     expected = (wr.left, wr.top);
                     PAL_POS.store(super::pack_pos(wr.left, wr.top), SeqCst);
-                    let st = state.lock().unwrap();
+                    let st = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     board_save(&st.pen, &st.presets);
                     last_use = std::time::Instant::now();
                 }
@@ -3507,7 +3507,7 @@ mod palette {
                         // the pen every fresh session opens with — parking there sets your
                         // default.
                         last_use = std::time::Instant::now();
-                        let mut st = state.lock().unwrap();
+                        let mut st = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                         let pen = st.pen;
                         if let Some(slot) = st.presets.get_mut(i) {
                             *slot = pen;
@@ -3528,7 +3528,7 @@ mod palette {
                 if lmb && !lmb_was && !closing {
                     if let Some(it) = now_hover {
                         last_use = std::time::Instant::now();
-                        let mut st = state.lock().unwrap();
+                        let mut st = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                         match it {
                             Item::BrushK(i) => {
                                 st.pen.brush = BRUSHES[i % BRUSHES.len()];
@@ -3566,7 +3566,7 @@ mod palette {
                                     );
                                     drop(st);
                                     super::post_status(weak, line);
-                                    st = state.lock().unwrap();
+                                    st = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                                 }
                             }
                             Item::Undo => {
@@ -3591,7 +3591,7 @@ mod palette {
                                         "ink unveiled".into()
                                     },
                                 );
-                                st = state.lock().unwrap();
+                                st = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                             }
                             Item::Laser => {
                                 st.laser = !st.laser;
@@ -3610,7 +3610,7 @@ mod palette {
                                         "laser off \u{2014} back to ink".into()
                                     },
                                 );
-                                st = state.lock().unwrap();
+                                st = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                             }
                             Item::Pin => {
                                 let pinned = !PAL_PIN.load(SeqCst);
@@ -3627,7 +3627,7 @@ mod palette {
                                         "palette unpinned".into()
                                     },
                                 );
-                                st = state.lock().unwrap();
+                                st = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                             }
                             Item::Quit => {
                                 drop(st);
@@ -3683,7 +3683,7 @@ mod palette {
                     }
                 }
                 if repaint {
-                    let st = state.lock().unwrap();
+                    let st = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     surface.paint(&its, hover, &st, sca);
                 }
                 std::thread::sleep(std::time::Duration::from_millis(16));

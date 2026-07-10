@@ -590,11 +590,20 @@ pub fn prepare(z: &[C], cfg: &GlyphConfig) -> Vec<C> {
     }
     let spacing = diag / cfg.resample.max(1) as f64;
     let base = ((arc / spacing).round() as usize).clamp(8, 4096);
+    // Denoise at the RAW sample rate before measuring curvature. `curvature_arc_weights` sums
+    // UNSIGNED |dθ| per step, so sensor/hand jitter (which a signed integral like `winding` mostly
+    // cancels) instead piles up — once positional noise is comparable to the inter-sample spacing,
+    // the per-vertex kink it creates can dwarf a real circle's genuine turning by an order of
+    // magnitude (measured: an 11x inflation on a noisy circle whose true turning is one revolution).
+    // A light low-pass HERE, at the path's native density, is what actually fixes it: applying the
+    // same smooth to the (10x-oversampled) canonicalized path below only reaches a fraction of one
+    // raw inter-sample gap per pass, so it barely touches noise that lives at raw resolution.
+    let raw = smooth(z, 3);
     // Stage 1 — CANONICALIZE DENSITY: a dense uniform-arc pre-resample erases the draw-SPEED bias
     // (raw sample density depends on how fast you moved), so the turning we measure next is a
     // property of the SHAPE, not the sampling. This is what keeps the whole thing speed-invariant.
     let h = (base * 10).clamp(400, 8000);
-    let canon = resample_uniform(z, h);
+    let canon = resample_uniform(&raw, h);
     // Stage 2 — weight by arc-length + turning, the eigenmotion's native coordinate.
     let (weights, total_turn) = curvature_arc_weights(&canon);
     // Stage 3 — grow the budget mildly with total turning (a line keeps `base`; a busy signature

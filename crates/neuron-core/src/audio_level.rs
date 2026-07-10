@@ -113,7 +113,7 @@ const IDLE_STOP_MS: u64 = 2000; // stop the thread if no `level()` read in ~2s
 /// repoint a running sampler to it. Idempotent: a call on the already-running source is a no-op.
 /// Cheap to call every frame.
 pub fn ensure(source: &str) {
-    let mut st = inner().lock().unwrap();
+    let mut st = inner().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if st.running {
         if st.source != source {
             st.source = source.to_string();
@@ -153,7 +153,7 @@ fn run(mut my_gen: u64, mut source: String) {
         // ── control: idle auto-stop + source repoint (lock held only briefly) ──
         let repoint;
         {
-            let mut st = inner().lock().unwrap();
+            let mut st = inner().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let idle = now_ms().saturating_sub(LAST_ACCESS_MS.load(Ordering::Relaxed));
             if idle > IDLE_STOP_MS {
                 st.running = false;

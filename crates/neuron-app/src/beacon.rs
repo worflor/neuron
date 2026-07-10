@@ -112,6 +112,17 @@ pub fn beacon_presenting() -> bool {
     BEACON_PRESENTING.load(Ordering::SeqCst)
 }
 
+/// THE OWNERSHIP PREDICATE for the cast trigger: may the live-weave capture path arm right now?
+/// `whiteboard`'s own session pause spells this out inline as
+/// `editor_weave_active() || beacon_presenting()`; this is the same rule, named once, so
+/// `live_weave`'s entry gate and any sibling capture-owning surface read one fact instead of two
+/// copies that could drift apart. (A *queued-but-not-yet-presenting* ask preempts live weave too,
+/// but structurally — the presenter loop in [`start`] pops the queue before it would ever call
+/// `live_weave`; [`prompt_pending`] is that check, pinned separately in tests below.)
+fn weave_may_capture() -> bool {
+    !EDITOR_WEAVE.load(Ordering::SeqCst) && !BEACON_PRESENTING.load(Ordering::SeqCst)
+}
+
 /// One queued ask, as the presenter sees it.
 struct Prompt {
     pid: u64,
@@ -161,7 +172,7 @@ pub fn start(weak: slint::Weak<AppWindow>) {
                             ..
                         } => {
                             let (q, cv) = &*shared;
-                            q.lock().unwrap().queue.push_back(Prompt {
+                            q.lock().unwrap_or_else(std::sync::PoisonError::into_inner).queue.push_back(Prompt {
                                 pid,
                                 macro_id,
                                 text,
@@ -173,7 +184,7 @@ pub fn start(weak: slint::Weak<AppWindow>) {
                         }
                         BeaconEvent::Retire { pid } => {
                             let (q, _) = &*shared;
-                            let mut g = q.lock().unwrap();
+                            let mut g = q.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                             g.queue.retain(|p| p.pid != pid);
                             if let Some((cur, stop)) = &g.current {
                                 if *cur == pid {
@@ -185,7 +196,7 @@ pub fn start(weak: slint::Weak<AppWindow>) {
                         }
                         BeaconEvent::RetireAll => {
                             let (q, _) = &*shared;
-                            let mut g = q.lock().unwrap();
+                            let mut g = q.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                             g.queue.clear();
                             if let Some((_, stop)) = &g.current {
                                 stop.store(true, Ordering::SeqCst);
@@ -313,7 +324,7 @@ fn live_weave(
     // inside the cancel predicate below, which ticks every few ms even while a capture blocks
     // — so a wedged capture reads as alive, a dead thread reads as a stall).
     crate::flight::pulse(crate::flight::organ::WEAVE);
-    if EDITOR_WEAVE.load(Ordering::SeqCst) {
+    if !weave_may_capture() {
         std::thread::sleep(std::time::Duration::from_millis(50));
         return;
     }
@@ -1054,7 +1065,7 @@ fn live_weave(
 /// Is any ask waiting to be presented? (The live weave stands down the moment one is.)
 fn prompt_pending(shared: &Shared) -> bool {
     let (q, _) = &**shared;
-    !q.lock().unwrap().queue.is_empty()
+    !q.lock().unwrap_or_else(std::sync::PoisonError::into_inner).queue.is_empty()
 }
 
 /// Format a system [`crate::control::Glance`] (+ the cached output reading) into the overlay's
@@ -1956,7 +1967,7 @@ fn mirror_active(weak: &slint::Weak<AppWindow>, shared: &Shared, p: Option<&Prom
     };
     let queued = {
         let (q, _) = &**shared;
-        let g = q.lock().unwrap();
+        let g = q.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         g.queue.len() + usize::from(g.current.is_some())
     };
     let w = weak.clone();
@@ -1983,7 +1994,7 @@ fn mirror_active(weak: &slint::Weak<AppWindow>, shared: &Shared, p: Option<&Prom
 fn mirror_count(weak: &slint::Weak<AppWindow>, shared: &Shared) {
     let queued = {
         let (q, _) = &**shared;
-        let g = q.lock().unwrap();
+        let g = q.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         g.queue.len() + usize::from(g.current.is_some())
     };
     // a "test" beacon's gate lifts the moment nothing is queued/presenting — the mock fire it
@@ -2055,5 +2066,132 @@ mod tests {
     fn under_deadzone_picks_nothing() {
         assert_eq!(pick2(10.0, 5.0), None, "tiny flick");
         assert_eq!(neuron::radial::pick_wedge(0.0, 0.0, 40.0, 2), None, "no motion");
+    }
+
+    // ── TRIGGER-OWNERSHIP (TDD §8: editor weave / pending prompt / whiteboard / knockback must
+    // never double-consume the same trigger) ──────────────────────────────────────────────────
+    //
+    // `EDITOR_WEAVE` and `BEACON_PRESENTING` are process-globals also touched by the real
+    // weave-presenter/whiteboard threads on the live app path (neither runs under `cargo test`,
+    // but a future test could add one, and `cargo test` runs this file's tests concurrently by
+    // default). `OWNERSHIP_LOCK` serializes every test below against every other; `OwnershipGuard`
+    // snapshots both flags on entry and restores them on drop (even on panic), so no test can leak
+    // a flipped flag into a sibling — the same discipline `testsupport::cwd_guard` uses for the cwd.
+
+    static OWNERSHIP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct OwnershipGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        editor: bool,
+        presenting: bool,
+    }
+
+    impl OwnershipGuard {
+        fn take() -> Self {
+            let lock = OWNERSHIP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let editor = super::EDITOR_WEAVE.load(std::sync::atomic::Ordering::SeqCst);
+            let presenting = super::BEACON_PRESENTING.load(std::sync::atomic::Ordering::SeqCst);
+            Self {
+                _lock: lock,
+                editor,
+                presenting,
+            }
+        }
+    }
+
+    impl Drop for OwnershipGuard {
+        fn drop(&mut self) {
+            super::EDITOR_WEAVE.store(self.editor, std::sync::atomic::Ordering::SeqCst);
+            super::BEACON_PRESENTING.store(self.presenting, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// With neither owner claimed, the live-weave path may capture.
+    #[test]
+    fn weave_may_capture_with_no_owner_claimed() {
+        let _g = OwnershipGuard::take();
+        super::EDITOR_WEAVE.store(false, std::sync::atomic::Ordering::SeqCst);
+        super::BEACON_PRESENTING.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            super::weave_may_capture(),
+            "no owner claimed the trigger — live weave should be free to arm"
+        );
+    }
+
+    /// The GUI editor recording/testing a glyph stands the live-weave capture path down, and
+    /// releasing its `EditorWeave` guard resumes it — the exact RAII contract `live_weave`'s entry
+    /// gate (now `weave_may_capture`) relies on.
+    #[test]
+    fn editor_weave_stands_down_live_capture_then_resumes() {
+        let _g = OwnershipGuard::take();
+        super::BEACON_PRESENTING.store(false, std::sync::atomic::Ordering::SeqCst);
+        super::EDITOR_WEAVE.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(super::weave_may_capture(), "baseline: nothing claimed yet");
+
+        let guard = super::EditorWeave::engage();
+        assert!(super::editor_weave_active(), "engage() must publish ownership");
+        assert!(
+            !super::weave_may_capture(),
+            "the editor holding the trigger must preempt live weave"
+        );
+
+        drop(guard);
+        assert!(
+            !super::editor_weave_active(),
+            "dropping the guard must release ownership"
+        );
+        assert!(
+            super::weave_may_capture(),
+            "ownership released — live weave capture must resume"
+        );
+    }
+
+    /// A presenting beacon (the answer wheel/signal strip) stands the live-weave path down for the
+    /// duration, matching `whiteboard`'s own pause check (`editor_weave_active() ||
+    /// beacon_presenting()`) — and release resumes capture, same as the editor case.
+    #[test]
+    fn beacon_presenting_stands_down_live_capture_then_resumes() {
+        let _g = OwnershipGuard::take();
+        super::EDITOR_WEAVE.store(false, std::sync::atomic::Ordering::SeqCst);
+        super::BEACON_PRESENTING.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            !super::weave_may_capture(),
+            "a presenting beacon must preempt live weave"
+        );
+
+        super::BEACON_PRESENTING.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            super::weave_may_capture(),
+            "the beacon finishing (present() returned, its RAII guard cleared) resumes capture"
+        );
+    }
+
+    /// A prompt merely sitting in the queue (not yet presenting) is the OTHER half of "pending
+    /// prompt preempts live weave" — enforced structurally in `start()`'s presenter loop (it pops
+    /// the queue before ever calling `live_weave`), gated on exactly this predicate.
+    #[test]
+    fn pending_queued_prompt_is_detected_before_presenting() {
+        let shared: super::Shared = std::sync::Arc::new((
+            std::sync::Mutex::new(super::Q::default()),
+            std::sync::Condvar::new(),
+        ));
+        assert!(
+            !super::prompt_pending(&shared),
+            "an empty queue never preempts the live weave slot"
+        );
+        {
+            let (q, _) = &*shared;
+            q.lock().unwrap().queue.push_back(super::Prompt {
+                pid: 1,
+                macro_id: "test-macro".into(),
+                text: "deploy?".into(),
+                options: vec!["yes".into(), "no".into()],
+                detail: String::new(),
+            });
+        }
+        assert!(
+            super::prompt_pending(&shared),
+            "a queued (not-yet-presented) ask must preempt the presenter loop's live_weave branch"
+        );
     }
 }

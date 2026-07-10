@@ -349,14 +349,14 @@ static LIVE: Mutex<Material> = Mutex::new(Material::neuron());
 
 /// Pick the live weave SURFACE — rebuilds the recipe, preserving the current accent.
 pub fn set_weave_surface(s: Surface) {
-    let mut live = LIVE.lock().unwrap();
+    let mut live = LIVE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let accent = live.accent;
     *live = preset(s).with_accent(accent);
 }
 
 /// The live weave surface.
 pub fn weave_surface() -> Surface {
-    LIVE.lock().unwrap().surface
+    LIVE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).surface
 }
 
 /// Set the live weave accent (packed `0xRRGGBB`) — folds into every accent ramp + the prism hue.
@@ -366,7 +366,7 @@ pub fn set_weave_accent(rgb: u32) {
         ((rgb >> 8) & 0xFF) as f32 / 255.0,
         (rgb & 0xFF) as f32 / 255.0,
     );
-    let mut live = LIVE.lock().unwrap();
+    let mut live = LIVE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let m = (*live).with_accent(c);
     *live = m;
 }
@@ -378,7 +378,7 @@ pub fn clear_weave_accent() {
 
 /// Drive one of the live material's KNOBS (the UI sliders reshape the substance live).
 pub fn set_weave_knob(i: usize, v: f32) {
-    LIVE.lock().unwrap().set_knob(i, v);
+    LIVE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).set_knob(i, v);
 }
 
 /// Reset the current material's knobs to its recipe defaults (keeps the chosen surface + accent).
@@ -389,7 +389,7 @@ pub fn reset_weave_knobs() {
 
 /// The live material's surfaced knobs, for the UI: `(label, value, min, max)` each.
 pub fn weave_knobs() -> Vec<(&'static str, f32, f32, f32)> {
-    let live = LIVE.lock().unwrap();
+    let live = LIVE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     (0..live.n_knobs as usize)
         .map(|i| {
             let k = live.knobs[i];
@@ -400,7 +400,7 @@ pub fn weave_knobs() -> Vec<(&'static str, f32, f32, f32)> {
 
 /// The live cast material — a by-value copy for the per-FRAME overlay setup (never per-pixel).
 pub fn live_material() -> Material {
-    *LIVE.lock().unwrap()
+    *LIVE.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// The accent INSTRUMENT OVERLAYS wear — teleport's scry frame, glance's frame, the landing pip, …:
