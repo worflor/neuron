@@ -71,15 +71,10 @@ struct Resident {
 }
 
 fn main() {
-    // Pin the run directory to the exe's folder FIRST. Every Neuron config path is
-    // run-directory-relative (bindings.toml, profiles/, gestures.json, app.toml, …) and an HKCU
-    // Run autostart launches with cwd=C:\Windows\System32 — without the pin, an autostart boot
-    // loaded EMPTY config and scattered saves into System32.
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let _ = std::env::set_current_dir(dir);
-        }
-    }
+    // Config never depends on the process CWD: every Neuron runtime path resolves through
+    // `neuron::runroot::run_root()` (the exe's directory, or NEURON_RUN_DIR), so an HKCU Run
+    // autostart from C:\Windows\System32 and a shell launch from anywhere read the SAME config.
+    // No cwd pin — the CWD stays the user's, as any CLI-adjacent process should leave it.
 
     // PROFILER (inert unless NEURON_PROFILE is set): 1 Hz hot-path counters + per-thread/sidecar
     // CPU to neuron_profile.log, so a "never stops" spin localizes to a counter or a thread.
@@ -123,7 +118,7 @@ fn main() {
             if let Ok(mut f) = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open("neuron-crash.log")
+                .open(flight::crash_log_path())
             {
                 let loc = info
                     .location()
@@ -170,7 +165,7 @@ fn main() {
             if let Ok(mut f) = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open("neuron-crash.log")
+                .open(crate::flight::crash_log_path())
             {
                 let (code, addr) = unsafe {
                     if !info.is_null() && !(*info).ExceptionRecord.is_null() {
@@ -196,6 +191,15 @@ fn main() {
         }
     }
     flight::trace("life", "app start", 0);
+
+    // STARTUP SELF-HEAL (after the crash hooks — its child-process calls get logged like
+    // everything else): migrate a leftover HKCU Run-key launcher (unelevated — native Chroma
+    // dead every boot, and a double-launch beside the task) to the elevated scheduled task,
+    // preserving the autostart intent. Replace-then-remove: the key only goes once the task
+    // holds the trigger. autostart::set() migrates on toggle too; this covers users who never
+    // touch the launch selector.
+    #[cfg(windows)]
+    autostart::migrate_legacy_run_key();
 
     // ── POWER-THROTTLING OPT-OUT (Win11 background QoS) ───────────────────
     // When a fullscreen game has focus, Windows puts unfocused processes on
