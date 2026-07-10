@@ -557,11 +557,35 @@ fn dib_dims(b: &[u8]) -> Option<(u32, u32)> {
     Some((w.unsigned_abs(), h.unsigned_abs()))
 }
 
+/// Mirror EVERY durable slot to disk NOW, synchronously — the exit barrier for one-shot processes.
+/// `activate()` persists on a worker thread (right for the resident app, which must not block the
+/// live tick on a multi-MB file write), but a process that exits right after the move kills that
+/// worker mid-write and the user's payload with it. A one-shot caller (the CLI) runs this before
+/// returning. Idempotent full re-mirror: full slots written, emptied slots' files removed.
+pub fn flush_durable_sync() {
+    let snapshot: Vec<(String, Pocket)> = {
+        let g = slots()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        g.iter()
+            .filter(|(_, s)| s.durable)
+            .map(|(k, s)| (k.clone(), s.pocket.clone()))
+            .collect()
+    };
+    for (slot, p) in snapshot {
+        let _ = write_disk(&slot, &p);
+    }
+}
+
 // ---- durable-pocket persistence (binary, handles any payload) ---------------------------------
 
-const DISK_DIR: &str = "runtime/pockets";
 const MAGIC: &[u8; 4] = b"NPKT";
 const VERSION: u8 = 1;
+
+/// `runtime/pockets/` in the run root — where durable pockets are mirrored.
+fn disk_dir() -> PathBuf {
+    crate::runroot::run_root().join("runtime").join("pockets")
+}
 
 fn fnv1a(s: &str) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
@@ -575,7 +599,7 @@ fn fnv1a(s: &str) -> u64 {
 fn disk_path(slot: &str) -> PathBuf {
     // The slot name can be anything (including empty / path-unsafe), so the filename is a hash and
     // the real name is stored inside the file.
-    PathBuf::from(DISK_DIR).join(format!("{:016x}.pocket", fnv1a(slot)))
+    disk_dir().join(format!("{:016x}.pocket", fnv1a(slot)))
 }
 
 fn put_bytes(buf: &mut Vec<u8>, b: &[u8]) {
@@ -599,7 +623,7 @@ fn write_disk(slot: &str, p: &Pocket) -> std::io::Result<()> {
         buf.extend_from_slice(&f.id.to_le_bytes());
         put_bytes(&mut buf, &f.bytes);
     }
-    std::fs::create_dir_all(DISK_DIR)?;
+    std::fs::create_dir_all(disk_dir())?;
     std::fs::write(path, buf)
 }
 
@@ -643,7 +667,7 @@ fn parse_disk(mut b: &[u8]) -> Option<(String, Pocket)> {
 
 fn load_all() -> HashMap<String, Slot> {
     let mut map = HashMap::new();
-    let Ok(rd) = std::fs::read_dir(DISK_DIR) else {
+    let Ok(rd) = std::fs::read_dir(disk_dir()) else {
         return map;
     };
     for entry in rd.flatten() {
@@ -984,6 +1008,46 @@ mod tests {
         let v = Pocket::empty().view();
         assert_eq!(v.kind, PocketKind::Empty);
         assert!(v.is_empty());
+    }
+
+    // The one-shot exit barrier: a durable slot must be ON DISK when flush_durable_sync returns —
+    // activate()'s worker-thread persist dies with a short-lived process (the CLI stash used to
+    // report success and evaporate). Emptied durable slots must lose their file the same way.
+    #[test]
+    fn flush_durable_sync_mirrors_full_and_emptied_slots_before_exit() {
+        let _g = crate::runroot::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = std::env::temp_dir().join(format!("neuron-pocket-flush-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+        let _run_pin = crate::runroot::RunDirPin::to(&tmp);
+
+        testclip::reset_store();
+        testclip::seed_slot("flushme", text_pocket("payload"), true);
+        flush_durable_sync();
+        assert!(
+            disk_path("flushme").exists(),
+            "durable slot not mirrored synchronously"
+        );
+
+        // round-trip: a fresh load (the next process) must see the payload
+        testclip::reset_store();
+        testclip::reload_disk();
+        let found = views().iter().any(|(s, durable, v)| {
+            s == "flushme" && *durable && v.text.as_deref() == Some("payload")
+        });
+        assert!(found, "reloaded store missing the flushed pocket");
+
+        // emptied durable slot -> file removed by the same flush
+        testclip::seed_slot("flushme", Pocket::empty(), true);
+        flush_durable_sync();
+        assert!(
+            !disk_path("flushme").exists(),
+            "emptied durable slot left a ghost file (would resurrect on next boot)"
+        );
+
+        testclip::reset_store();
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

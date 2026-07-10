@@ -8,8 +8,8 @@
 //! STRICTLY NON-DESTRUCTIVE — the real OS clipboard is NEVER touched. `activate()` normally reads
 //! and writes the OS clipboard; here we install an IN-MEMORY clipboard via the `pocket::testclip`
 //! seam (off in production), so every move runs against a fake cell. Durable state is isolated to a
-//! private temp cwd (`runtime/pockets/` is cwd-relative) and cleaned up. The process arm gate is
-//! restored on exit.
+//! private temp dir (cwd + NEURON_RUN_DIR both pinned there — the crate resolves `runtime/pockets/`
+//! via the run root) and cleaned up. The process arm gate is restored on exit.
 //!
 //! ONE monolithic test on purpose: the pocket store, the generation counter, the fake clipboard, and
 //! the process cwd are all PROCESS-GLOBAL, so the phases run serially (no intra-process races), the
@@ -87,6 +87,9 @@ fn pocket_stress() {
     std::fs::create_dir_all(&tmp).unwrap();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(&tmp).unwrap();
+    // config resolves via the run root (NEURON_RUN_DIR, else the exe dir) — pin it to the same tmp
+    // so the crate's `runtime/pockets/` and this file's cwd-relative DISK_DIR mean the same place.
+    let _run_pin = neuron::runroot::RunDirPin::to(&tmp);
 
     // Remember the real arm state and force a known one; restored at the end.
     let prev_armed = safety::input_armed();

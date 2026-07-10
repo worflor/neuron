@@ -24,24 +24,29 @@ fn ctx(field: &str) -> Value {
 
 /// Isolate the macros dir into a private temp cwd, returning the host if the bundled runtime
 /// materializes (it ships in the binary, so this should always succeed; None => skip on a rare IO
-/// failure). Returns (prev_cwd, tmp_dir) for cleanup alongside.
-fn setup() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+/// failure). Returns (prev_cwd, tmp_dir, run-dir pin) for cleanup alongside — the pin must outlive
+/// the whole test, so it rides along in the tuple instead of dropping at the end of this fn.
+fn setup() -> Option<(std::path::PathBuf, std::path::PathBuf, neuron::runroot::RunDirPin)> {
     let tmp = std::env::temp_dir().join(format!("neuron_macro_nodes_e2e_{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(&tmp).unwrap();
+    // config resolves via the run root (NEURON_RUN_DIR, else the exe dir) — pin it to the same tmp
+    let run_pin = neuron::runroot::RunDirPin::to(&tmp);
 
     if !macro_host().available() {
         eprintln!("skipping macro-nodes e2e: bundled python runtime did not materialize");
         std::env::set_current_dir(&prev).ok();
+        drop(run_pin);
         let _ = std::fs::remove_dir_all(&tmp);
         return None;
     }
-    Some((prev, tmp))
+    Some((prev, tmp, run_pin))
 }
 
-fn teardown(prev: std::path::PathBuf, tmp: std::path::PathBuf) {
+fn teardown(prev: std::path::PathBuf, tmp: std::path::PathBuf, run_pin: neuron::runroot::RunDirPin) {
     std::env::set_current_dir(prev).ok();
+    drop(run_pin);
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
@@ -66,7 +71,7 @@ fn assert_round_trip(src: &str, expect: &[MacroNode]) {
 
 #[test]
 fn macro_nodes_round_trip_is_stable() {
-    let Some((prev, tmp)) = setup() else {
+    let Some((prev, tmp, run_pin)) = setup() else {
         return;
     };
     let host = macro_host();
@@ -340,5 +345,5 @@ fn macro_nodes_round_trip_is_stable() {
     let from_empty = host.parse_macro(&regen_empty).expect("parse empty-codegen");
     assert_eq!(from_empty, vec![MacroNode::Raw { code: "pass".into() }]);
 
-    teardown(prev, tmp);
+    teardown(prev, tmp, run_pin);
 }

@@ -176,7 +176,7 @@ pub struct Resolved {
 
 impl CastConfig {
     pub fn path() -> PathBuf {
-        PathBuf::from("cast.toml")
+        crate::runroot::run_root().join("cast.toml")
     }
     /// The radial action set to use RIGHT NOW: the HyperShift set when a HyperShift layer is held AND
     /// it's enabled AND populated; otherwise the base set. An empty/disabled hyper set transparently

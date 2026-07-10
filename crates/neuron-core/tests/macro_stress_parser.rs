@@ -163,11 +163,12 @@ fn summarize_unicode_truncation() {
 
 #[test]
 fn parser_stress() {
-    let Some((prev, tmp)) = setup() else {
+    let Some((prev, tmp, run_pin)) = setup() else {
         return; // no python runtime -> skip cleanly (not a failure)
     };
     let result = std::panic::catch_unwind(|| run_sidecar_phases(macro_host()));
     std::env::set_current_dir(&prev).ok();
+    drop(run_pin);
     let _ = std::fs::remove_dir_all(&tmp);
     if let Err(e) = result {
         std::panic::resume_unwind(e);
@@ -510,18 +511,23 @@ fn idempotence_corpus() -> Vec<Vec<MacroNode>> {
 }
 
 // ── setup / teardown (isolate the macros dir into a private temp cwd) ──────────────────────────────
-fn setup() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+// The pin must outlive the whole test, so it rides along in the returned tuple instead of dropping
+// at the end of this fn.
+fn setup() -> Option<(std::path::PathBuf, std::path::PathBuf, neuron::runroot::RunDirPin)> {
     let tmp = std::env::temp_dir().join(format!("neuron_macro_stress_parser_{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(&tmp).unwrap();
+    // config resolves via the run root (NEURON_RUN_DIR, else the exe dir) — pin it to the same tmp
+    let run_pin = neuron::runroot::RunDirPin::to(&tmp);
     let host = macro_host();
     if !host.available() {
         eprintln!("skipping parser_stress: bundled python runtime did not materialize");
         std::env::set_current_dir(&prev).ok();
+        drop(run_pin);
         let _ = std::fs::remove_dir_all(&tmp);
         return None;
     }
     host.set_armed(false); // parse-only; never execute, never synthesize input
-    Some((prev, tmp))
+    Some((prev, tmp, run_pin))
 }

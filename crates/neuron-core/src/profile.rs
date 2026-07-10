@@ -68,9 +68,15 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+/// The `profiles/` directory (profiles + their `.rules.toml`/`.frame.toml` sidecars) in the run
+/// root — the ONE derivation every profile/sidecar reader and writer shares.
+pub fn profiles_dir() -> PathBuf {
+    crate::runroot::run_root().join("profiles")
+}
+
 impl Profile {
     pub fn path(name: &str) -> PathBuf {
-        PathBuf::from("profiles").join(format!("{}.toml", sanitize(name)))
+        profiles_dir().join(format!("{}.toml", sanitize(name)))
     }
 
     /// The canonical on-disk KEY that two display names collide on: the sanitized filename stem,
@@ -92,7 +98,7 @@ impl Profile {
     /// Persist the profile as plain TOML. Lighting lives in the profile itself now (the `lighting`
     /// layer stack), so there is no sidecar to reconcile — one write, done.
     pub fn save(&self) -> Result<(), String> {
-        std::fs::create_dir_all("profiles").map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(profiles_dir()).map_err(|e| e.to_string())?;
         let s = toml::to_string_pretty(self).map_err(|e| e.to_string())?;
         std::fs::write(Self::path(&self.name), s).map_err(|e| e.to_string())
     }
@@ -510,7 +516,7 @@ pub fn capture_from_devices(
 /// Names of all saved profiles.
 pub fn list() -> Vec<String> {
     let mut out = Vec::new();
-    if let Ok(rd) = std::fs::read_dir("profiles") {
+    if let Ok(rd) = std::fs::read_dir(profiles_dir()) {
         for e in rd.flatten() {
             let p = e.path();
             if p.extension().and_then(|x| x.to_str()) == Some("toml") {
@@ -577,7 +583,7 @@ pub struct AppRules {
 
 impl AppRules {
     pub fn path() -> PathBuf {
-        PathBuf::from("apps.toml")
+        crate::runroot::run_root().join("apps.toml")
     }
     pub fn load() -> Self {
         match std::fs::read_to_string(Self::path()) {
@@ -787,11 +793,14 @@ mod tests {
 
     #[test]
     fn sanitize_strips_unsafe_chars() {
-        assert_eq!(
+        // The path is now run-root-absolute; the sanitization contract is the trailing shape.
+        assert!(
             Profile::path("my game/2")
                 .to_string_lossy()
-                .replace('\\', "/"),
-            "profiles/my_game_2.toml"
+                .replace('\\', "/")
+                .ends_with("profiles/my_game_2.toml"),
+            "got {}",
+            Profile::path("my game/2").display()
         );
     }
 
@@ -846,7 +855,13 @@ persist = false
     fn list_excludes_sidecars() {
         // list() returns real profiles only — never a `<name>.rules.toml` sidecar sharing the dir. A
         // real profile's stem never carries a dot (sanitize maps `.`→`_`), so the guard is robust to
-        // whatever else the test dir holds at the time.
+        // whatever else the test dir holds at the time. Disk IO is isolated into a temp run root via
+        // NEURON_RUN_DIR (env is process-global — hold the crate's env lock while it's overridden).
+        let _g = crate::runroot::ENV_LOCK.lock().unwrap();
+        let prev = std::env::var_os("NEURON_RUN_DIR");
+        let tmp = std::env::temp_dir().join(format!("neuron_profile_list_{}", std::process::id()));
+        std::env::set_var("NEURON_RUN_DIR", &tmp);
+
         Profile {
             name: "t_list_sc".into(),
             dpi: Some(800),
@@ -855,12 +870,7 @@ persist = false
         .save()
         .unwrap();
         // Drop a rules sidecar beside it by hand (list() must skip the `.rules`-stemmed file).
-        std::fs::create_dir_all("profiles").unwrap();
-        std::fs::write(
-            PathBuf::from("profiles").join("t_list_sc.rules.toml"),
-            "rules = []\n",
-        )
-        .unwrap();
+        std::fs::write(profiles_dir().join("t_list_sc.rules.toml"), "rules = []\n").unwrap();
         let names = list();
         assert!(
             names.contains(&"t_list_sc".to_string()),
@@ -870,8 +880,12 @@ persist = false
             !names.iter().any(|n| n.contains('.')),
             "no sidecar stem leaks into the profile list: {names:?}"
         );
-        std::fs::remove_file(Profile::path("t_list_sc")).ok();
-        std::fs::remove_file(PathBuf::from("profiles").join("t_list_sc.rules.toml")).ok();
+
+        match prev {
+            Some(v) => std::env::set_var("NEURON_RUN_DIR", v),
+            None => std::env::remove_var("NEURON_RUN_DIR"),
+        }
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]

@@ -1,5 +1,5 @@
 //! Data-driven device registry. Device definitions are TOML — built-ins are embedded,
-//! and any `devices/*.toml` next to the working dir is loaded too (extend without recompile).
+//! and any `devices/*.toml` in the run root is loaded too (extend without recompile).
 
 use anyhow::Result;
 use serde::Deserialize;
@@ -429,16 +429,15 @@ impl Registry {
         // resolves its own control pipe. Auto defs are named from the USB product string, which
         // repeats across revisions/link-modes, so a name collision must NOT drop a def that brings
         // a fresh (pid, dialect).
-        for dir in ["devices", "devices/auto"] {
+        let devices_root = crate::runroot::run_root().join("devices");
+        for (dir, origin) in [
             // Stamp origin by the DIRECTORY the file lives in — a LOAD fact serde can't carry
             // (`origin` is `serde(skip)`, so every parse yields the Builtin default). `devices/`
             // is the user's curated shelf (board-verified, self-heal must never touch it);
             // `devices/auto/` is synthesized config the heal MAY rewrite in place.
-            let origin = if dir == "devices/auto" {
-                DefOrigin::Auto
-            } else {
-                DefOrigin::Curated
-            };
+            (devices_root.clone(), DefOrigin::Curated),
+            (devices_root.join("auto"), DefOrigin::Auto),
+        ] {
             if let Ok(rd) = std::fs::read_dir(dir) {
                 for entry in rd.flatten() {
                     let p = entry.path();

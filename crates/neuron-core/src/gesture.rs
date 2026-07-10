@@ -29,8 +29,8 @@ pub struct Vault {
 
 impl Vault {
     pub fn path() -> PathBuf {
-        // alongside the binary's working dir; keeps the gesture set portable.
-        PathBuf::from("gestures.json")
+        // alongside the binaries; keeps the gesture set portable with the install.
+        crate::runroot::run_root().join("gestures.json")
     }
 
     pub fn load() -> Self {

@@ -163,7 +163,7 @@ impl Default for FeelConfig {
 
 impl FeelConfig {
     pub fn path() -> PathBuf {
-        PathBuf::from("feel.toml")
+        crate::runroot::run_root().join("feel.toml")
     }
 
     /// Load from `feel.toml` (defaults when absent/unparseable — never errors).

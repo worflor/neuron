@@ -142,7 +142,7 @@ pub struct Bindings {
 
 impl Bindings {
     pub fn path() -> PathBuf {
-        PathBuf::from("bindings.toml")
+        crate::runroot::run_root().join("bindings.toml")
     }
 
     /// Load from disk, or fall back to the sensible defaults for this user.

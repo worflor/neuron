@@ -71,6 +71,8 @@ fn act_protocol_stress_e2e() {
     std::env::set_var("NEURON_MACRO_STATE", &state);
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(&tmp).unwrap();
+    // config resolves via the run root (NEURON_RUN_DIR, else the exe dir) — pin it to the same tmp
+    let _run_pin = neuron::runroot::RunDirPin::to(&tmp);
 
     let host = macro_host();
     if !host.available() {

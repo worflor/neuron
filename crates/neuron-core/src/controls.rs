@@ -906,7 +906,7 @@ pub fn load_rule_sidecars_except(excluded_file_name: &str) -> Vec<Rule> {
 fn load_rule_sidecars_with(include: impl Fn(&str) -> bool) -> Vec<Rule> {
     use crate::engine::RuleDoc;
     let mut out = Vec::new();
-    let Ok(rd) = std::fs::read_dir("profiles") else {
+    let Ok(rd) = std::fs::read_dir(crate::profile::profiles_dir()) else {
         return out;
     };
     for entry in rd.flatten() {

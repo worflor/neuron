@@ -1247,9 +1247,9 @@ fn resolve_runtime() -> Result<crate::macros::Runtime, String> {
 
 // ── macro persistence (macros/scripts/<id>.py) ──────────────────────────────────────────────────
 
-/// Directory holding python macro sources (cwd-relative, like the rest of Neuron's config).
+/// Directory holding python macro sources (in the run root, like the rest of Neuron's config).
 pub fn macros_dir() -> PathBuf {
-    PathBuf::from("macros").join("scripts")
+    crate::runroot::run_root().join("macros").join("scripts")
 }
 
 /// Exemplar macros shipped with the binary (id, source). Written to disk on a truly-fresh install
@@ -1309,7 +1309,7 @@ fn write_macro_file(id: &str, source: &str) -> Result<(), String> {
 
 // ── self-describing-option VALUES: chosen in the GUI (or hand-edited), kept beside the scripts ──
 fn options_dir() -> PathBuf {
-    PathBuf::from("macros").join("options")
+    crate::runroot::run_root().join("macros").join("options")
 }
 
 fn options_path(id: &str) -> PathBuf {

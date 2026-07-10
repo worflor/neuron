@@ -185,26 +185,32 @@ fn context_non_windows_capture_is_all_none_and_restore_is_false() {
 /// (single-quoted python keys so the Rust literal needs no double-quote escaping.)
 const CTX_ECHO: &str = "import json\ndef macro(ctx):\n    return json.dumps({'app': ctx.app, 'title': ctx.title, 'cwd': ctx.cwd, 'clipboard': ctx.clipboard, 'selection': ctx.selection, 'prev_window': ctx.prev_window, 'armed': ctx.armed}, ensure_ascii=False)\n";
 
-/// Isolate the macros/scripts dir into a private temp cwd; return (prev_cwd, tmp) or None to skip.
-fn setup() -> Option<(PathBuf, PathBuf)> {
+/// Isolate the macros/scripts dir into a private temp cwd; return (prev_cwd, tmp, run-dir pin) or
+/// None to skip. The pin must outlive the whole test, so it rides along in the tuple instead of
+/// dropping at the end of this fn.
+fn setup() -> Option<(PathBuf, PathBuf, neuron::runroot::RunDirPin)> {
     let tmp = std::env::temp_dir().join(format!("neuron_macro_stress_ctx_{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
     let prev = std::env::current_dir().unwrap();
     std::env::set_current_dir(&tmp).unwrap();
+    // config resolves via the run root (NEURON_RUN_DIR, else the exe dir) — pin it to the same tmp
+    let run_pin = neuron::runroot::RunDirPin::to(&tmp);
 
     let host = macro_host();
     if !host.available() {
         eprintln!("skipping context stress e2e: bundled python runtime did not materialize");
         std::env::set_current_dir(&prev).ok();
+        drop(run_pin);
         let _ = std::fs::remove_dir_all(&tmp);
         return None;
     }
     host.set_armed(false); // read-only probes; no input synthesis anywhere in this file
-    Some((prev, tmp))
+    Some((prev, tmp, run_pin))
 }
 
-fn teardown(prev: PathBuf, tmp: PathBuf) {
+fn teardown(prev: PathBuf, tmp: PathBuf, run_pin: neuron::runroot::RunDirPin) {
     std::env::set_current_dir(prev).ok();
+    drop(run_pin);
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
@@ -253,7 +259,7 @@ fn non_utf8_pathbuf() -> PathBuf {
 
 #[test]
 fn context_protocol_marshalling_via_sidecar() {
-    let Some((prev, tmp)) = setup() else {
+    let Some((prev, tmp, run_pin)) = setup() else {
         return;
     };
     let host = macro_host();
@@ -504,5 +510,5 @@ fn context_protocol_marshalling_via_sidecar() {
     for id in ["ctx_echo", "ctx_arm", "ctx_readall", "ctx_snap", "ctx_boom"] {
         host.unregister(id);
     }
-    teardown(prev, tmp);
+    teardown(prev, tmp, run_pin);
 }

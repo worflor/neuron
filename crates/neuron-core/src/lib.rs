@@ -62,6 +62,7 @@ pub mod protocol;
 pub mod radial;
 pub mod registry;
 pub mod rhythm;
+pub mod runroot;
 pub mod safety;
 pub mod scene;
 pub mod screen_ambient;

@@ -192,7 +192,7 @@ sequenceDiagram
     participant Macro as "MacroHost"
     participant Beacon as "Beacon"
 
-    Main->>Main: pin cwd, parse flags, install crash hooks
+    Main->>Main: parse flags, install crash hooks (config resolves via run_root(), not cwd)
     Main->>Main: initialize COM and restart policy on Windows
     Main->>App: create hidden window eagerly
     Main->>Glue: install callbacks and resident state

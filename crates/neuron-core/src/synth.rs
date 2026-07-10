@@ -799,12 +799,13 @@ pub struct Adoption {
     pub skipped: Vec<String>,
 }
 
-/// Where an auto-synthesized def lives (relative, like every other config path). Keyed by the
-/// synthesizing DIALECT's id so two families that share a pid can't collide on one filename:
+/// Where an auto-synthesized def lives (in the run root, like every other config path). Keyed by
+/// the synthesizing DIALECT's id so two families that share a pid can't collide on one filename:
 /// `devices/auto/<dialect_id>-<pid>.toml`. Razer's id is literally "razer", so every existing
 /// auto file name (`razer-<pid>.toml`) is IDENTICAL — the generalization renames nothing on disk.
 pub fn auto_def_path(dialect_id: &str, pid: u16) -> PathBuf {
-    PathBuf::from("devices")
+    crate::runroot::run_root()
+        .join("devices")
         .join("auto")
         .join(format!("{dialect_id}-{pid:04x}.toml"))
 }
