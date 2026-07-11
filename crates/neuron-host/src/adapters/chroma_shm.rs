@@ -1228,10 +1228,10 @@ pub mod server {
         }
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop_thread = std::sync::Arc::clone(&stop);
-        let thread = std::thread::Builder::new()
-            .name("chroma-arbiter".into())
-            .spawn(move || arbiter_loop(appreg, sessinfo, keyboard, stop_thread))
-            .ok();
+        let thread = crate::worker::spawn_named("chroma-arbiter", move || {
+            arbiter_loop(appreg, sessinfo, keyboard, stop_thread)
+        })
+        .ok();
         MaskGuard { held, stop, thread }
     }
 

@@ -126,9 +126,13 @@ pub fn ensure() {
     }
     *running = true;
     drop(running);
-    let _ = thread::Builder::new()
-        .name("neuron-sys-stats".into())
-        .spawn(run);
+    // The latch is cleared by the release — which runs on completion, panic, OR a spawn refusal —
+    // so a failed spawn can never leave the sampler latched "on" and block every later `ensure`.
+    crate::worker::spawn_guarded(
+        "neuron-sys-stats",
+        || *inner().lock().unwrap_or_else(std::sync::PoisonError::into_inner) = false,
+        run,
+    );
 }
 
 /// The latest smoothed CPU load (0.0..=1.0). Lock-free and cheap. Reading it keeps the sampler
@@ -154,10 +158,10 @@ fn run() {
     loop {
         // ── control: idle auto-stop ──
         {
-            let mut running = inner().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let running = inner().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let idle = now_ms().saturating_sub(LAST_ACCESS_MS.load(Ordering::Relaxed));
             if idle > IDLE_STOP_MS {
-                *running = false;
+                // `running` is cleared by the spawn's release, not here — see `ensure`.
                 drop(running);
                 CPU_BITS.store(0f32.to_bits(), Ordering::Relaxed);
                 RAM_BITS.store(0f32.to_bits(), Ordering::Relaxed);

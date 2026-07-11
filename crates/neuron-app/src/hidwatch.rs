@@ -143,13 +143,10 @@ pub fn start() {
     arm_new(&mouse_pids, &armed);
 
     let mon = armed.clone();
-    thread::Builder::new()
-        .name("neuron-hidwatch-mon".into())
-        .spawn(move || loop {
-            thread::sleep(HOTPLUG_POLL);
-            arm_new(&mouse_pids, &mon);
-        })
-        .ok();
+    crate::worker::spawn_detached("neuron-hidwatch-mon", move || loop {
+        thread::sleep(HOTPLUG_POLL);
+        arm_new(&mouse_pids, &mon);
+    });
 }
 
 /// Enumerate and spawn a reader for any event-carrying mouse collection not already armed.
@@ -218,17 +215,27 @@ fn spawn_reader(
     if let Some(d) = dialect {
         note_audio_capability(d, &product);
     }
-    thread::Builder::new()
-        .name("neuron-hidwatch".into())
-        .spawn(move || {
+    // `armed` claimed this collection's path in `arm_new` before this spawn — the release below is
+    // the ONE place that un-claims it (on open failure, on read-loop exit, on a spawn refusal/panic),
+    // so the monitor can always retry a stranded claim instead of a collection going deaf forever.
+    let release_armed = armed.clone();
+    let release_path = path.clone();
+    crate::worker::spawn_guarded(
+        "neuron-hidwatch",
+        move || {
+            release_armed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&release_path);
+        },
+        move || {
             let reader = match neuron::transport::open_reader(&path) {
                 Ok(r) => r,
                 Err(e) => {
                     if verbose() {
                         eprintln!("[hidwatch] {tag}: not readable ({e})");
                     }
-                    armed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&path); // let the monitor retry later
-                    return;
+                    return; // release un-claims `path`; the monitor retries later
                 }
             };
             if verbose() {
@@ -263,21 +270,37 @@ fn spawn_reader(
                         // lazy battery freshness — piggyback on activity (the device is awake; it's
                         // sending reports), throttled, off-thread so a slow open never stalls reads.
                         if neuron::vitals::due(pid, false) {
-                            thread::spawn(move || match read_battery(pid) {
-                                Some((b, c)) => neuron::vitals::observe(pid, b, c, false),
-                                None => {
-                                    neuron::vitals::mark_stale(pid); // don't strand the throttle
-                                    if verbose() {
-                                        eprintln!("[hidwatch] pid={pid:04x}: battery read failed");
+                            // `due` already advanced the throttle (claimed the read slot). If the
+                            // read never runs — thread refused OR the worker panicked — the slot
+                            // must be released to the SHORT stale-retry, not left claimed for the
+                            // full interval: `done(None)` marks it stale. A completed read reports
+                            // its own success/failure inside the worker.
+                            crate::worker::spawn_notify(
+                                "neuron-hidwatch-batt",
+                                move || match read_battery(pid) {
+                                    Some((b, c)) => {
+                                        neuron::vitals::observe(pid, b, c, false);
+                                        true
                                     }
-                                }
-                            });
+                                    None => {
+                                        neuron::vitals::mark_stale(pid);
+                                        if verbose() {
+                                            eprintln!("[hidwatch] pid={pid:04x}: battery read failed");
+                                        }
+                                        false
+                                    }
+                                },
+                                move |ran| {
+                                    if ran.is_none() {
+                                        neuron::vitals::mark_stale(pid);
+                                    }
+                                },
+                            );
                         }
                     }
                     Ok(_) => {} // zero-length read — keep listening
                     Err(_) => {
-                        // unplugged / device gone — drop our claim so the monitor re-arms on replug.
-                        armed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&path);
+                        // unplugged / device gone — release un-claims `path` so the monitor re-arms.
                         if verbose() {
                             eprintln!("[hidwatch] {tag}: closed");
                         }
@@ -285,8 +308,8 @@ fn spawn_reader(
                     }
                 }
             }
-        })
-        .ok();
+        },
+    );
 }
 
 /// Record an arming, dialect-claimed collection's product string on the emergent capability
@@ -378,7 +401,7 @@ fn bridge_mic_mute(product: &str, muted: bool) {
         return;
     }
     let product = product.to_string();
-    thread::spawn(move || {
+    crate::worker::spawn_detached("neuron-hidwatch-mute", move || {
         // DEVICE-PRECISE: only the capture endpoint whose Core-Audio name CONTAINS this device's USB
         // product string. NO resolve_capture(None) fallback — on a name miss (localized/stripped
         // endpoint string) we skip the OS write entirely: an honest no-op beats muting someone else's
@@ -432,7 +455,9 @@ fn decode(
     if buf[0] == 0x04 {
         match button_intent(buf[1]) {
             Some(intent) => {
-                let _ = button_worker().send((pid, intent));
+                if let Some(tx) = button_worker() {
+                    let _ = tx.send((pid, intent));
+                }
             }
             None => {
                 if buf[1] != 0x00 && verbose() {
@@ -470,7 +495,9 @@ fn decode(
                 // block this reader) rides its own off-thread worker.
                 if reassert_due(pid) {
                     let announced = dpi as u16;
-                    thread::spawn(move || maybe_reconcile_announced(pid, announced));
+                    crate::worker::spawn_detached("neuron-hidwatch-dpi", move || {
+                        maybe_reconcile_announced(pid, announced)
+                    });
                 }
             }
         }
@@ -504,7 +531,7 @@ fn decode(
         // onboard DPI button, so there is no legitimate cycle-step to protect here.
         0x0c => {
             let reassert = reassert_due(pid);
-            thread::spawn(move || {
+            crate::worker::spawn_detached("neuron-hidwatch-charge", move || {
                 match settle_charge(pid) {
                     Some((b, c)) => neuron::vitals::observe(pid, b, c, true),
                     None => {
@@ -590,19 +617,18 @@ fn button_intent(code: u8) -> Option<neuron::action::Intent> {
 /// down this one channel so presses execute STRICTLY in order and never race each other on the device's
 /// one control pipe (two cycle-writes interleaving would corrupt the step). Returns the send-end; the
 /// receive-end lives in the worker loop forever.
-fn button_worker() -> &'static std::sync::mpsc::Sender<(u16, neuron::action::Intent)> {
-    static TX: OnceLock<std::sync::mpsc::Sender<(u16, neuron::action::Intent)>> = OnceLock::new();
-    TX.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::channel::<(u16, neuron::action::Intent)>();
-        thread::Builder::new()
-            .name("neuron-hidwatch-button".into())
-            .spawn(move || {
-                for (pid, intent) in rx {
-                    fulfill_button(pid, intent);
-                }
-            })
-            .ok();
-        tx
+// `service_sender` caches the send-end ONLY once the worker actually spawned — so a refused spawn
+// (resource exhaustion) can't leave presses flowing into a dead channel forever; the next press
+// retries. `None` = the worker can't start right now, so the press is dropped honestly.
+fn button_worker() -> Option<std::sync::mpsc::Sender<(u16, neuron::action::Intent)>> {
+    static TX: crate::worker::Service<(u16, neuron::action::Intent)> =
+        crate::worker::Service::new();
+    crate::worker::service_sender(&TX, "neuron-hidwatch-button", |rx| {
+        // drain CONTAINS a panic per press (a malformed HID reply slice-indexing, say) so one bad
+        // press can't kill the serial button worker for the rest of the run.
+        crate::worker::drain(rx, "neuron-hidwatch-button", |(pid, intent)| {
+            fulfill_button(pid, intent);
+        })
     })
 }
 
@@ -716,25 +742,22 @@ fn batch_push(pid: u16, ev: Push) {
         st.generation += 1;
         st.generation
     };
-    thread::Builder::new()
-        .name("neuron-hidwatch-batch".into())
-        .spawn(move || {
-            thread::sleep(BATCH_SETTLE);
-            // Take + decide under the lock so a report landing in the gap can't be lost: if a newer
-            // push for THIS pid bumped its generation, a later flush owns the batch — this one bows out.
-            let batch = {
-                let mut map = batches().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                let Some(st) = map.get_mut(&pid) else {
-                    return;
-                };
-                if st.generation != my_gen {
-                    return;
-                }
-                std::mem::replace(&mut st.batch, Batch::EMPTY)
+    crate::worker::spawn_detached("neuron-hidwatch-batch", move || {
+        thread::sleep(BATCH_SETTLE);
+        // Take + decide under the lock so a report landing in the gap can't be lost: if a newer
+        // push for THIS pid bumped its generation, a later flush owns the batch — this one bows out.
+        let batch = {
+            let mut map = batches().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(st) = map.get_mut(&pid) else {
+                return;
             };
-            flush_batch(pid, batch);
-        })
-        .ok();
+            if st.generation != my_gen {
+                return;
+            }
+            std::mem::replace(&mut st.batch, Batch::EMPTY)
+        };
+        flush_batch(pid, batch);
+    });
 }
 
 /// Decide a settled batch. The SYNC TEST: ≥2 distinct card-worthy kinds whose first reports landed

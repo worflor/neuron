@@ -130,9 +130,13 @@ pub fn ensure(source: &str) {
     let start_source = st.source.clone();
     LAST_ACCESS_MS.store(now_ms(), Ordering::Relaxed);
     drop(st);
-    let _ = thread::Builder::new()
-        .name("neuron-audio-level".into())
-        .spawn(move || run(start_gen, start_source));
+    // The latch is cleared by the release — which runs on completion, panic, OR a spawn refusal —
+    // so a failed spawn can never leave `running` stuck true and block every later `ensure`.
+    crate::worker::spawn_guarded(
+        "neuron-audio-level",
+        || inner().lock().unwrap_or_else(std::sync::PoisonError::into_inner).running = false,
+        move || run(start_gen, start_source),
+    );
 }
 
 /// The latest smoothed level (0.0..=1.0). Lock-free and cheap. Reading it also keeps the sampler
@@ -153,10 +157,10 @@ fn run(mut my_gen: u64, mut source: String) {
         // ── control: idle auto-stop + source repoint (lock held only briefly) ──
         let repoint;
         {
-            let mut st = inner().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let st = inner().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let idle = now_ms().saturating_sub(LAST_ACCESS_MS.load(Ordering::Relaxed));
             if idle > IDLE_STOP_MS {
-                st.running = false;
+                // `running` is cleared by the spawn's release, not here — see `ensure`.
                 drop(st);
                 LEVEL_BITS.store(0f32.to_bits(), Ordering::Relaxed);
                 return;

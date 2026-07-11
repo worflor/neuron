@@ -76,4 +76,5 @@ pub mod tone;
 pub mod transport;
 pub mod twin;
 pub mod vitals;
+pub mod worker;
 pub mod writes;

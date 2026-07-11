@@ -20,7 +20,6 @@
 use crate::ui::{AppWindow, State};
 use slint::ComponentHandle;
 use std::sync::mpsc::{channel, Sender};
-use std::sync::OnceLock;
 
 /// The 8 ink colours — the same literal palette the lighting panel offers (one app, one set).
 pub const PALETTE: [u32; 8] = [
@@ -345,16 +344,18 @@ struct Stroke {
     seed: u32,
 }
 
-fn canvas() -> &'static Sender<Cmd> {
-    static TX: OnceLock<Sender<Cmd>> = OnceLock::new();
-    TX.get_or_init(|| {
-        let (tx, rx) = channel::<Cmd>();
-        std::thread::Builder::new()
-            .name("neuron-whiteboard".into())
-            .spawn(move || imp::canvas_thread(rx))
-            .ok();
-        tx
-    })
+// `service_sender` caches the send-end only once the worker spawned, so a refused spawn retries
+// next call instead of stranding draw commands in a dead channel. `None` = can't start now.
+fn canvas() -> Option<Sender<Cmd>> {
+    static TX: crate::worker::Service<Cmd> = crate::worker::Service::new();
+    crate::worker::service_sender(&TX, "neuron-whiteboard", |rx| imp::canvas_thread(rx))
+}
+
+/// Send a canvas command, starting the worker on demand; silently no-ops if it can't start.
+fn canvas_send(cmd: Cmd) {
+    if let Some(tx) = canvas() {
+        let _ = tx.send(cmd);
+    }
 }
 
 /// Shared board state: the SESSION draws with it, the PALETTE edits it live — that's what lets
@@ -402,22 +403,18 @@ pub fn toggle(weak: &slint::Weak<AppWindow>) {
     }
     WB_CLOSE.store(false, SeqCst);
     let weak = weak.clone();
-    let started = std::thread::Builder::new()
-        .name("neuron-board-session".into())
-        .spawn(move || {
-            // PANIC-PROOF: a session that unwinds must still release its key claim and flags —
-            // a leaked WB_ACTIVE is "the board's key is dead until restart".
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| session_loop(&weak)));
+    // RELEASE covers completion, panic, AND spawn refusal alike — WB_ACTIVE must never stay
+    // claimed with nothing running behind it (that's "the board's key is dead until restart").
+    crate::worker::spawn_guarded(
+        "neuron-board-session",
+        || {
             crate::flight::pulse_clear(crate::flight::organ::WHITEBOARD);
             WB_CLOSE.store(false, SeqCst);
             WB_ACTIVE.store(false, SeqCst);
             crate::flight::trace("wb", "session ended (key released to weave)", 0);
-        })
-        .is_ok();
-    if !started {
-        // the session thread never spawned — release the key claim so it isn't darked forever.
-        WB_ACTIVE.store(false, SeqCst);
-    }
+        },
+        move || session_loop(&weak),
+    );
 }
 
 #[cfg(not(windows))]
@@ -447,7 +444,14 @@ fn session_loop(weak: &slint::Weak<AppWindow>) {
         WB_CLOSE.load(std::sync::atomic::Ordering::SeqCst)
             || crate::dispatch::reload_generation() != gen
     };
-    let tx = canvas();
+    // No render worker (a refused spawn) → no session to run; the next open retries.
+    let Some(tx) = canvas() else {
+        return;
+    };
+    // hold the sender for this whole session and pass it to the gesture helpers by reference. If the
+    // worker died mid-session sends here silently drop (as before) — the self-heal is the NEXT
+    // `canvas()` (next open), which is why we must not stash this handle beyond the session.
+    let tx = &tx;
     // the board REMEMBERS — and a fresh session always opens holding PRESET 1 (your default
     // pen: right-click slot 1 in the palette to change what "default" means).
     let (_, presets) = board_load();
@@ -1131,6 +1135,7 @@ mod imp {
             let mut pings: Vec<(i32, i32, PingKind, u32, Instant)> = Vec::new();
             let mut ping_wheel: Option<(i32, i32, i32, u32)> = None;
             let mut overlay_was = false; // an overlay drew last frame — gives it one clean exit
+            let mut frame_panics = 0u32; // per-frame render panic streak (contain_frame throttle)
 
             let present = |dirty: bool| {
                 if !dirty {
@@ -1171,7 +1176,9 @@ mod imp {
                     batch.push(c);
                 }
                 for cmd in batch {
-                    match cmd {
+                    // contain a per-command panic (pixel-pointer math on a bad size) so one bad
+                    // command can't kill the whiteboard render loop for the run.
+                    crate::worker::contain("neuron-whiteboard", || match cmd {
                         Cmd::Begin {
                             color,
                             width,
@@ -1574,8 +1581,13 @@ mod imp {
                             visible = true;
                             dirty = true;
                         }
-                    }
+                    });
                 }
+                // the per-frame render — full repaint + the animated overlay pass + present — is
+                // pixel/geometry work run every tick (the likeliest panic surface), contained on its
+                // own hot lane so a panicked frame is a dropped frame (repainted next tick) instead
+                // of a permanently dead whiteboard worker.
+                crate::worker::contain_frame("neuron-whiteboard", &mut frame_panics, || {
                 if full {
                     std::ptr::write_bytes(px, 0, count);
                     // the live stroke's carve must NOT pollute the committed strokes' shared distance
@@ -1803,6 +1815,9 @@ mod imp {
                 if shown {
                     present(dirty || full);
                 }
+                });
+                // the message pump is NOT contained: a panic across the `extern "system"`
+                // window-proc ABI aborts the process, so catch_unwind here would be dead code.
                 // pump so the window stays healthy
                 let mut msg: MSG = std::mem::zeroed();
                 while PeekMessageW(&mut msg, hwnd, 0, 0, PM_REMOVE) != 0 {
@@ -3224,8 +3239,8 @@ mod palette {
     };
     use crate::ui::AppWindow;
     use std::sync::atomic::Ordering::SeqCst;
-    use std::sync::mpsc::{channel, Receiver, Sender};
-    use std::sync::{Arc, Mutex, OnceLock};
+    use std::sync::mpsc::{Receiver, Sender};
+    use std::sync::{Arc, Mutex};
     use windows_sys::Win32::Foundation::RECT;
 
     /// The dock (vertical tools), the air gap, the base (everything else).
@@ -3255,24 +3270,24 @@ mod palette {
 
     /// Ask the palette to appear (3×click). Safe from any thread.
     pub fn show(weak: slint::Weak<AppWindow>, state: Arc<Mutex<BoardState>>) {
-        let _ = tx().send(PCmd::Show { weak, state });
+        send_cmd(PCmd::Show { weak, state });
     }
 
     /// The session is over — hide the palette (pinned or not).
     pub fn session_ended() {
-        let _ = tx().send(PCmd::SessionEnded);
+        send_cmd(PCmd::SessionEnded);
     }
 
-    fn tx() -> &'static Sender<PCmd> {
-        static TX: OnceLock<Sender<PCmd>> = OnceLock::new();
-        TX.get_or_init(|| {
-            let (tx, rx) = channel::<PCmd>();
-            std::thread::Builder::new()
-                .name("neuron-board-palette".into())
-                .spawn(move || palette_thread(rx))
-                .ok();
-            tx
-        })
+    fn tx() -> Option<Sender<PCmd>> {
+        static TX: crate::worker::Service<PCmd> = crate::worker::Service::new();
+        crate::worker::service_sender(&TX, "neuron-board-palette", palette_thread)
+    }
+
+    /// Send a palette command, starting the worker on demand; silently no-ops if it can't start.
+    fn send_cmd(cmd: PCmd) {
+        if let Some(t) = tx() {
+            let _ = t.send(cmd);
+        }
     }
 
     #[derive(Clone, Copy, PartialEq)]
@@ -3405,6 +3420,7 @@ mod palette {
             // dismiss (closing) — alive, but no bounce, so the static instrument feel survives.
             let mut pop_in = false;
             let mut closing = false;
+            let mut frame_panics = 0u32; // per-frame repaint panic streak (contain_frame throttle)
 
             loop {
                 // hidden = block (zero idle cost); shown = poll
@@ -3538,28 +3554,28 @@ mod palette {
                                 st.pen.brush = BRUSHES[i % BRUSHES.len()];
                                 // a pen change also re-skins whatever is selected — the palette
                                 // is the selection's action set too (a no-op with none selected).
-                                let _ = super::canvas().send(Cmd::RebrushSelection(st.pen.brush));
+                                super::canvas_send(Cmd::RebrushSelection(st.pen.brush));
                                 board_save(&st.pen, &st.presets);
                             }
                             Item::Size(i) => {
                                 st.pen.width = SIZES[i % SIZES.len()];
-                                let _ = super::canvas().send(Cmd::ResizeSelection(st.pen.width));
+                                super::canvas_send(Cmd::ResizeSelection(st.pen.width));
                                 board_save(&st.pen, &st.presets);
                             }
                             Item::Swatch(i) => {
                                 st.pen.color = PALETTE[i % PALETTE.len()];
                                 // a swatch click also recolours whatever is selected — the
                                 // palette doubles as the selection action set.
-                                let _ = super::canvas().send(Cmd::RecolorSelection(st.pen.color));
+                                super::canvas_send(Cmd::RecolorSelection(st.pen.color));
                                 board_save(&st.pen, &st.presets);
                             }
                             Item::Preset(i) => {
                                 if let Some(slot) = st.presets.get(i).copied() {
                                     st.pen = slot;
                                     // a preset is the whole pen — selected ink takes all of it.
-                                    let _ = super::canvas().send(Cmd::RebrushSelection(slot.brush));
-                                    let _ = super::canvas().send(Cmd::ResizeSelection(slot.width));
-                                    let _ = super::canvas().send(Cmd::RecolorSelection(slot.color));
+                                    super::canvas_send(Cmd::RebrushSelection(slot.brush));
+                                    super::canvas_send(Cmd::ResizeSelection(slot.width));
+                                    super::canvas_send(Cmd::RecolorSelection(slot.color));
                                     board_save(&st.pen, &st.presets);
                                     let line = format!(
                                         "preset {} \u{00b7} {} #{:06X} w{:.1}",
@@ -3574,18 +3590,18 @@ mod palette {
                                 }
                             }
                             Item::Undo => {
-                                let _ = super::canvas().send(Cmd::Undo);
+                                super::canvas_send(Cmd::Undo);
                             }
                             Item::Redo => {
-                                let _ = super::canvas().send(Cmd::Redo);
+                                super::canvas_send(Cmd::Redo);
                             }
                             Item::Clear => {
-                                let _ = super::canvas().send(Cmd::Clear);
+                                super::canvas_send(Cmd::Clear);
                             }
                             Item::Veil => {
                                 st.veiled = !st.veiled;
                                 let veiled = st.veiled;
-                                let _ = super::canvas().send(Cmd::Visible(!veiled));
+                                super::canvas_send(Cmd::Visible(!veiled));
                                 drop(st);
                                 super::post_status(
                                     weak,
@@ -3602,8 +3618,8 @@ mod palette {
                                 let on = st.laser;
                                 if !on {
                                     // leaving presentation mode: make sure no wheel is left up
-                                    let _ = super::canvas().send(Cmd::PingWheel(None));
-                                    let _ = super::canvas().send(Cmd::LaserLift);
+                                    super::canvas_send(Cmd::PingWheel(None));
+                                    super::canvas_send(Cmd::LaserLift);
                                 }
                                 drop(st);
                                 super::post_status(
@@ -3688,7 +3704,13 @@ mod palette {
                 }
                 if repaint {
                     let st = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                    surface.paint(&its, hover, &st, sca);
+                    // the per-frame repaint (raw GDI/pixel work — the real panic surface here; the
+                    // command match above uses `continue`, so it can't cross a closure and its state
+                    // bookkeeping is low-risk anyway) on its own hot lane: a panicked frame is a
+                    // dropped frame, throttled so a deterministic paint panic can't storm the log.
+                    crate::worker::contain_frame("neuron-board-palette", &mut frame_panics, || {
+                        surface.paint(&its, hover, &st, sca)
+                    });
                 }
                 std::thread::sleep(std::time::Duration::from_millis(16));
             }

@@ -1011,13 +1011,13 @@ fn run_sequence(steps: &[Step], ctx: &Context) -> String {
     let n = steps.len();
     let owned_steps = steps.to_vec();
     let owned_ctx = ctx.clone();
-    match std::thread::Builder::new()
-        .name("neuron-macro".into())
-        .spawn(move || {
-            run_sequence_sync(&owned_steps, &owned_ctx);
-        }) {
-        Ok(_) => format!("running macro ({n} step{})", if n == 1 { "" } else { "s" }),
-        Err(_) => run_sequence_sync(steps, ctx),
+    let spawned = crate::worker::spawn_detached("neuron-macro", move || {
+        run_sequence_sync(&owned_steps, &owned_ctx);
+    });
+    if spawned {
+        format!("running macro ({n} step{})", if n == 1 { "" } else { "s" })
+    } else {
+        run_sequence_sync(steps, ctx)
     }
 }
 
@@ -1098,10 +1098,11 @@ fn ghost_paste(speed: GhostSpeed) -> String {
         ClipText::Busy => return "ghost-paste: clipboard busy \u{2014} try again".into(),
     };
     let n = text.chars().count();
-    std::thread::Builder::new()
-        .name("neuron-ghost-paste".into())
-        .spawn(move || ghost_type(&text, speed))
-        .ok();
+    // Report the TRUTH: if the OS refuses the typing thread (resource exhaustion), no keystrokes
+    // go out, so don't claim typing started — same honesty the sequence path keeps.
+    if !crate::worker::spawn_detached("neuron-ghost-paste", move || ghost_type(&text, speed)) {
+        return "ghost-paste: couldn't start typing (system busy)".into();
+    }
     format!(
         "ghost-paste: typing {n} char{} ({})",
         if n == 1 { "" } else { "s" },

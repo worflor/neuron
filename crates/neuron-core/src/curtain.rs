@@ -80,14 +80,14 @@ pub fn raise() -> String {
     if CURTAIN_UP.swap(true, Ordering::SeqCst) {
         return "curtain (already up)".into();
     }
-    let spawned = std::thread::Builder::new()
-        .name("neuron-curtain".into())
-        .spawn(|| {
-            run();
-            CURTAIN_UP.store(false, Ordering::SeqCst);
-        });
-    if spawned.is_err() {
-        CURTAIN_UP.store(false, Ordering::SeqCst);
+    // The latch is cleared by the release — which runs on completion, panic, OR a spawn refusal —
+    // so a failed raise can never leave `CURTAIN_UP` stuck true and block every later raise.
+    let spawned = crate::worker::spawn_guarded(
+        "neuron-curtain",
+        || CURTAIN_UP.store(false, Ordering::SeqCst),
+        run,
+    );
+    if !spawned {
         return "curtain [spawn failed]".into();
     }
     "curtain".into()

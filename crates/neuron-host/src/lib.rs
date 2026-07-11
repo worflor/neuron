@@ -35,6 +35,7 @@ pub mod governor;
 pub mod net;
 pub mod paint;
 pub mod shell;
+pub mod worker;
 pub mod writer;
 pub mod ws;
 

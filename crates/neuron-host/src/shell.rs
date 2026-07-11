@@ -92,9 +92,7 @@ pub struct Host {
 impl Host {
     pub fn spawn() -> Host {
         let (tx, rx) = channel();
-        let thread = thread::Builder::new()
-            .name("neuron-host-kernel".into())
-            .spawn(move || run(rx))
+        let thread = crate::worker::spawn_named("neuron-host-kernel", move || run(rx))
             .expect("spawn kernel actor");
         Host { tx, thread: Some(thread) }
     }

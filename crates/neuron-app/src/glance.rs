@@ -36,8 +36,7 @@ pub fn suggestions() -> Vec<String> {
 mod imp {
 
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    use std::sync::mpsc::{channel, Receiver, Sender};
-    use std::sync::OnceLock;
+    use std::sync::mpsc::{Receiver, Sender};
 
     /// A matched source window: (hwnd, title, screen rect).
     type Found = (isize, String, (i32, i32, i32, i32));
@@ -62,11 +61,15 @@ mod imp {
     /// "bring me home" — the key that opened the eye is the key that closes the loop.
     pub fn toggle(target: &str) -> String {
         if POSSESSED.load(Ordering::SeqCst) {
-            let _ = engine().send(GCmd::Return);
+            if let Some(tx) = engine() {
+                let _ = tx.send(GCmd::Return);
+            }
             return "\u{21a9} returned from the portal".into();
         }
         if SHOWING.swap(false, Ordering::SeqCst) {
-            let _ = engine().send(GCmd::Hide);
+            if let Some(tx) = engine() {
+                let _ = tx.send(GCmd::Hide);
+            }
             return "glance closed".into();
         }
         let t = target.trim().to_lowercase();
@@ -84,7 +87,13 @@ mod imp {
         unsafe {
             windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut cur);
         }
-        let _ = engine().send(GCmd::Show(found, (cur.x, cur.y)));
+        // Only latch SHOWING once the Show actually went out. If the worker was refused, the
+        // overlay never opened, so leaving SHOWING false keeps the NEXT toggle a Show (a retry),
+        // not a Hide of a window that isn't there.
+        let Some(tx) = engine() else {
+            return "glance unavailable \u{2014} system busy, try again".into();
+        };
+        let _ = tx.send(GCmd::Show(found, (cur.x, cur.y)));
         SHOWING.store(true, Ordering::SeqCst);
         if n == 1 {
             format!("glance \u{2192} {first} \u{00b7} drag it anywhere \u{2014} it remembers")
@@ -144,16 +153,12 @@ mod imp {
             .collect()
     }
 
-    fn engine() -> &'static Sender<GCmd> {
-        static TX: OnceLock<Sender<GCmd>> = OnceLock::new();
-        TX.get_or_init(|| {
-            let (tx, rx) = channel::<GCmd>();
-            std::thread::Builder::new()
-                .name("neuron-glance".into())
-                .spawn(move || engine_thread(rx))
-                .ok();
-            tx
-        })
+    // `service_sender` caches the send-end only once the worker spawned, so a refused spawn
+    // retries on the next call instead of stranding commands in a dead channel. `None` = the
+    // engine can't start right now; the caller skips the command.
+    fn engine() -> Option<Sender<GCmd>> {
+        static TX: crate::worker::Service<GCmd> = crate::worker::Service::new();
+        crate::worker::service_sender(&TX, "neuron-glance", engine_thread)
     }
 
     /// Every visible, titled, non-self window whose title OR exe stem contains the needle —
@@ -372,9 +377,11 @@ mod imp {
             let mut prev_esc = false;
             // an active POSSESSION: (source hwnd, home window, home cursor, when entered)
             let mut poss: Option<(isize, isize, (i32, i32), std::time::Instant)> = None;
+            let mut frame_panics = 0u32; // per-frame tail panic streak (contain_frame throttle)
             loop {
                 while let Ok(cmd) = rx.try_recv() {
-                    match cmd {
+                    // contain a per-command panic so one bad tiling command can't kill the pump.
+                    crate::worker::contain("neuron-glance", || match cmd {
                         GCmd::Hide => {
                             for t in tiles.drain(..) {
                                 destroy_tile(&t);
@@ -441,8 +448,10 @@ mod imp {
                                 }
                             }
                         }
-                    }
+                    });
                 }
+                // the message pump is NOT contained: a panic across the `extern "system"`
+                // window-proc ABI aborts the process, so catch_unwind here would be dead code.
                 // pump every tile window
                 for t in &tiles {
                     let mut msg: MSG = std::mem::zeroed();
@@ -451,6 +460,10 @@ mod imp {
                         DispatchMessageW(&msg);
                     }
                 }
+                // the per-frame tail — input edges, the possession state machine, tile geometry and
+                // reseating — is logic run every tick, contained on its own hot lane so a panic here
+                // (a bad index, an arithmetic edge) drops one frame instead of killing the pump.
+                crate::worker::contain_frame("neuron-glance", &mut frame_panics, || {
                 let lmb = neuron::glyph::key_down(0x01);
                 let lmb_edge = lmb && !prev_lmb;
                 let rmb = neuron::glyph::key_down(0x02);
@@ -749,6 +762,7 @@ mod imp {
                 prev_lmb = lmb;
                 prev_rmb = rmb;
                 prev_esc = esc;
+                });
                 std::thread::sleep(std::time::Duration::from_millis(16));
             }
         }

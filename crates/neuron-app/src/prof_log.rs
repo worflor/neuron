@@ -11,9 +11,7 @@ pub fn start() {
     if !neuron::prof::enabled() {
         return;
     }
-    let _ = std::thread::Builder::new()
-        .name("neuron-prof".into())
-        .spawn(run);
+    crate::worker::spawn_detached("neuron-prof", run);
 }
 
 #[cfg(not(windows))]

@@ -157,9 +157,7 @@ pub fn start(weak: slint::Weak<AppWindow>) {
     {
         let shared = shared.clone();
         let weak = weak.clone();
-        std::thread::Builder::new()
-            .name("neuron-beacon-router".into())
-            .spawn(move || {
+        crate::worker::spawn_detached("neuron-beacon-router", move || {
                 while let Ok(ev) = rx.recv() {
                     neuron::prof::bump(&neuron::prof::ROUTER_EVENT);
                     match ev {
@@ -223,8 +221,7 @@ pub fn start(weak: slint::Weak<AppWindow>) {
                     }
                 }
                 // the Macro Host replaced this listener (a new beacon_events() call) — retire quietly.
-            })
-            .ok();
+            });
     }
 
     // ── PRESENTER: the ONE owner of the cast trigger. Alternates between two faces:
@@ -233,9 +230,7 @@ pub fn start(weak: slint::Weak<AppWindow>) {
     //                             fire for real, injected into the live dispatch Engine).
     // One thread, one capture at a time = double-consume of a press is impossible by
     // construction; the editor's EditorWeave guard pre-empts both faces.
-    std::thread::Builder::new()
-        .name("neuron-weave-presenter".into())
-        .spawn(move || {
+    crate::worker::spawn_detached("neuron-weave-presenter", move || {
             // ONE persistent overlay serves both faces (ask wheel + weave sigil) — no window or
             // render-thread churn per weave; begin()/end() show and fade it as needed.
             let overlay = crate::overlay::SpellOverlay::spawn();
@@ -296,8 +291,7 @@ pub fn start(weak: slint::Weak<AppWindow>) {
                     std::thread::sleep(std::time::Duration::from_millis(40));
                 }
             }
-        })
-        .ok();
+        });
 }
 
 /// THE LIVE WEAVE WATCHER — what makes spellweaving a real keybind, not a demo button. Runs
@@ -890,7 +884,7 @@ fn live_weave(
     // any path out of the capture retires an open scry portal — it lives only while aiming —
     // and the click guard (clicks must only ever be swallowed while a weave aims).
     if bloomed.get() != 0 {
-        let _ = crate::teleport::scry().send(crate::teleport::ScryCmd::Hide);
+        crate::teleport::scry_send(crate::teleport::ScryCmd::Hide);
     }
     crate::teleport::click_guard::disarm();
     crate::flight::trace(
@@ -1288,16 +1282,13 @@ pub(crate) mod audio_cache {
     /// Spawn the refresher once (from `beacon::start`). Idempotent.
     pub fn ensure() {
         START.call_once(|| {
-            std::thread::Builder::new()
-                .name("neuron-audio-cache".into())
-                .spawn(|| loop {
-                    let s = read();
-                    *CACHE
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = s;
-                    std::thread::sleep(std::time::Duration::from_millis(400));
-                })
-                .ok();
+            crate::worker::spawn_detached("neuron-audio-cache", || loop {
+                let s = read();
+                *CACHE
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = s;
+                std::thread::sleep(std::time::Duration::from_millis(400));
+            });
         });
     }
 
@@ -1718,7 +1709,7 @@ fn aim_tick(
         carry_rect.set(aimed_rect.get());
         carry_realm.set(aimed_realm.get());
         if bloomed.get() != 0 {
-            let _ = crate::teleport::scry().send(crate::teleport::ScryCmd::Hide);
+            crate::teleport::scry_send(crate::teleport::ScryCmd::Hide);
             bloomed.set(0);
         }
         post_status(
@@ -1738,7 +1729,7 @@ fn aim_tick(
         // every window EARNS its bloom — switching aim (drag OR dial) retires the
         // old peek; the new one appears after its own dwell: the zoom-in feel.
         if bloomed.get() != 0 {
-            let _ = crate::teleport::scry().send(crate::teleport::ScryCmd::Hide);
+            crate::teleport::scry_send(crate::teleport::ScryCmd::Hide);
             bloomed.set(0);
         }
         // the hot blob follows; the PINNED re-begin keeps the map in place, and
@@ -1751,7 +1742,7 @@ fn aim_tick(
         && bloomed.get() != sel_h
         && sel_since.get().elapsed().as_millis() as u64 >= crate::teleport::SCRY_DWELL_MS
     {
-        let _ = crate::teleport::scry().send(crate::teleport::ScryCmd::Show {
+        crate::teleport::scry_send(crate::teleport::ScryCmd::Show {
             src: sel_h,
             src_rect: aimed_rect.get(),
             near: aimed_cell.get(), // hug the minimap cell this peek mirrors
@@ -1766,13 +1757,13 @@ fn aim_tick(
             (rect.3 - rect.1).max(1) as f32,
         );
         let warp = aimed_warp.get();
-        let _ = crate::teleport::scry().send(crate::teleport::ScryCmd::Aim {
+        crate::teleport::scry_send(crate::teleport::ScryCmd::Aim {
             fx: (warp.0 - rect.0) as f32 / w,
             fy: (warp.1 - rect.1) as f32 / hgt,
         });
     }
     if sel_h == 0 && bloomed.get() != 0 {
-        let _ = crate::teleport::scry().send(crate::teleport::ScryCmd::Hide);
+        crate::teleport::scry_send(crate::teleport::ScryCmd::Hide);
         bloomed.set(0);
     }
     false

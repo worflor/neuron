@@ -40,8 +40,12 @@ use std::time::{Duration, Instant};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
+// DETACHED_PROCESS, not CREATE_NO_WINDOW: NO_WINDOW still allocates a (hidden) console, so a
+// conhost.exe rides along with every sidecar — one more background process on the user's box
+// (caught live by the testkit budget lane's child census, 2026-07-10). The sidecar speaks only
+// over its three stdio PIPES, which need no console; DETACHED gives it none and no conhost.
 #[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const DETACHED_PROCESS: u32 = 0x0000_0008;
 
 /// The macro-log ring, shared across sessions so a crashed sidecar's last stderr (its traceback)
 /// survives the respawn that replaces the session. (A per-session ring would be dropped with the
@@ -721,10 +725,16 @@ impl MacroHost {
         {
             return; // a warm is already in flight
         }
-        std::thread::spawn(move || {
-            let _ = me.ensure_warm();
-            me.warm_in_flight.store(false, Ordering::Release);
-        });
+        // The latch is cleared by the release — which runs on completion, panic, OR a spawn
+        // refusal — so a failed warm can never latch `warm_in_flight` true and block every later
+        // recovery attempt for the rest of the run.
+        crate::worker::spawn_guarded(
+            "macro-host-warm",
+            || me.warm_in_flight.store(false, Ordering::Release),
+            move || {
+                let _ = me.ensure_warm();
+            },
+        );
     }
 }
 
@@ -741,7 +751,7 @@ fn spawn_session(armed: bool, log: LogRing, beacon: BeaconSlot) -> Result<Sessio
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     #[cfg(windows)]
-    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd.creation_flags(DETACHED_PROCESS);
 
     let mut child = cmd
         .spawn()
@@ -765,20 +775,20 @@ fn spawn_session(armed: bool, log: LogRing, beacon: BeaconSlot) -> Result<Sessio
     // reader thread: protocol frames off child STDOUT. Keep its handle so Drop can join it. It
     // holds the stdin WEAKLY so a dropped Session's pipe really closes (the reader must not keep
     // the child's stdin alive past the session's death).
+    // Session owns the reader/logger handles and joins them on Drop, so both route through the
+    // handle-returning primitive.
     let reader = {
         let shared = shared.clone();
         let stdin_weak = Arc::downgrade(&stdin);
-        std::thread::Builder::new()
-            .name("macro-host-reader".into())
-            .spawn(move || reader_loop(stdout, shared, beacon, stdin_weak))
-            .ok()
+        crate::worker::spawn_named("macro-host-reader", move || {
+            reader_loop(stdout, shared, beacon, stdin_weak)
+        })
+        .ok()
     };
     // logger thread: macro output off child STDERR -> bounded ring.
     let logger = {
         let shared = shared.clone();
-        std::thread::Builder::new()
-            .name("macro-host-logger".into())
-            .spawn(move || {
+        crate::worker::spawn_named("macro-host-logger", move || {
                 let mut r = BufReader::new(stderr);
                 let mut line = Vec::new();
                 let mut byte = [0u8; 1];
@@ -1182,15 +1192,27 @@ fn reader_loop(
                     .to_string();
                 let arg = v.get("arg").cloned().unwrap_or(Value::Null);
                 let stdin = stdin.clone();
-                std::thread::spawn(move || {
-                    let (ok, msg) = run_act(&verb, &arg);
-                    if let Some(stdin) = stdin.upgrade() {
-                        let _ = send_frame(
-                            &mut *stdin.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
-                            &json!({"t": "act_result", "rid": rid, "ok": ok, "msg": msg}),
-                        );
-                    }
-                });
+                // The `act_result` frame is MANDATORY — the macro blocks on it. The worker only
+                // RUNS the verb and returns its outcome; `done` sends the frame exactly once,
+                // whether the verb completed, panicked, or the thread was refused (synthesizing a
+                // failure result in the latter cases) — so the macro can never hang waiting.
+                crate::worker::spawn_notify(
+                    "macro-host-act",
+                    move || run_act(&verb, &arg),
+                    move |outcome| {
+                        let (ok, msg) = outcome.unwrap_or_else(|| {
+                            (false, "act worker could not run (thread refused or panicked)".into())
+                        });
+                        if let Some(stdin) = stdin.upgrade() {
+                            let _ = send_frame(
+                                &mut *stdin
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                                &json!({"t": "act_result", "rid": rid, "ok": ok, "msg": msg}),
+                            );
+                        }
+                    },
+                );
             }
             _ => {}
         }

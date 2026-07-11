@@ -57,9 +57,13 @@ pub fn ensure() {
     *on = true;
     LAST_ACCESS_MS.store(now_ms(), Ordering::Relaxed);
     drop(on);
-    let _ = thread::Builder::new()
-        .name("neuron-mic-state".into())
-        .spawn(run);
+    // The latch is cleared by the release — which runs on completion, panic, OR a spawn refusal —
+    // so a failed spawn can never leave the sampler latched "on" and block every later `ensure`.
+    crate::worker::spawn_guarded(
+        "neuron-mic-state",
+        || *running().lock().unwrap_or_else(|p| p.into_inner()) = false,
+        run,
+    );
 }
 
 /// The latest mute state: `None` = unknown (no mic resolved, or nothing sampled yet),
@@ -111,7 +115,7 @@ fn run() {
         // idle auto-stop: nobody read `muted()` in a while → stop and go unknown.
         let idle = now_ms().saturating_sub(LAST_ACCESS_MS.load(Ordering::Relaxed));
         if idle > IDLE_STOP_MS {
-            *running().lock().unwrap_or_else(|p| p.into_inner()) = false;
+            // `running` is cleared by the spawn's release, not here — see `ensure`.
             STATE.store(0, Ordering::Relaxed);
             return;
         }

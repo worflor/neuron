@@ -112,10 +112,10 @@ impl OrgbServer {
         let stop_flag = stop.clone();
         let roster: OrgbRoster = Arc::new(Mutex::new(HashMap::new()));
         let shared = roster.clone();
-        let accept = thread::Builder::new()
-            .name("neuron-orgb-accept".into())
-            .spawn(move || accept_loop(listener, handle, stop_flag, shared, policy))
-            .expect("spawn accept thread");
+        let accept = crate::worker::spawn_named("neuron-orgb-accept", move || {
+            accept_loop(listener, handle, stop_flag, shared, policy)
+        })
+        .expect("spawn accept thread");
         Ok(OrgbServer {
             stop,
             accept: Some(accept),
@@ -167,10 +167,9 @@ fn accept_loop(
                 let policy = Arc::clone(&policy);
                 let conn_id = next_conn;
                 next_conn += 1;
-                if let Ok(t) = thread::Builder::new()
-                    .name("neuron-orgb-conn".into())
-                    .spawn(move || serve_conn(stream, handle, stop, roster, conn_id, policy))
-                {
+                if let Ok(t) = crate::worker::spawn_named("neuron-orgb-conn", move || {
+                    serve_conn(stream, handle, stop, roster, conn_id, policy)
+                }) {
                     conns.push(t);
                 }
                 // Opportunistically reap finished connections so a long-lived
@@ -307,10 +306,10 @@ impl ChromaHttpServer {
         let stop_flag = stop.clone();
         let server = Arc::new(Mutex::new(ChromaServer::with_policy(policy)));
         let shared = server.clone();
-        let accept = thread::Builder::new()
-            .name("neuron-chroma-accept".into())
-            .spawn(move || chroma_accept_loop(listener, handle, shared, stop_flag))
-            .expect("spawn chroma accept thread");
+        let accept = crate::worker::spawn_named("neuron-chroma-accept", move || {
+            chroma_accept_loop(listener, handle, shared, stop_flag)
+        })
+        .expect("spawn chroma accept thread");
         Ok(ChromaHttpServer {
             stop,
             accept: Some(accept),
@@ -356,10 +355,9 @@ fn chroma_accept_loop(
                 let handle = handle.clone();
                 let server = server.clone();
                 let stop = stop.clone();
-                if let Ok(t) = thread::Builder::new()
-                    .name("neuron-chroma-conn".into())
-                    .spawn(move || serve_chroma_conn(stream, handle, server, stop))
-                {
+                if let Ok(t) = crate::worker::spawn_named("neuron-chroma-conn", move || {
+                    serve_chroma_conn(stream, handle, server, stop)
+                }) {
                     conns.push(t);
                 }
                 conns.retain(|t| !t.is_finished());
@@ -561,19 +559,17 @@ impl ObsConnection {
         let addr = addr.to_string();
         let password = password.to_string();
         let mut thread_host = host.clone();
-        let thread = thread::Builder::new()
-            .name("neuron-obs".into())
-            .spawn(move || {
-                obs_run(
-                    &addr,
-                    &password,
-                    &rx,
-                    &mut thread_host,
-                    &stop_flag,
-                    &conn_flag,
-                )
-            })
-            .expect("spawn obs thread");
+        let thread = crate::worker::spawn_named("neuron-obs", move || {
+            obs_run(
+                &addr,
+                &password,
+                &rx,
+                &mut thread_host,
+                &stop_flag,
+                &conn_flag,
+            )
+        })
+        .expect("spawn obs thread");
         ObsConnection {
             stop,
             thread: Some(thread),

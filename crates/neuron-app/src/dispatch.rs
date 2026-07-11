@@ -209,10 +209,11 @@ impl LiveRuntime {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((id, tx));
         neuron::action::arm_input(armed);
-        let handle = std::thread::Builder::new()
-            .name("neuron-live-dispatch".into())
-            .spawn(move || run_worker(weak, worker_stop, rx))
-            .ok();
+        // LiveRuntime owns this handle and joins it in stop(), so it routes through the
+        // handle-returning primitive.
+        let handle =
+            crate::worker::spawn_named("neuron-live-dispatch", move || run_worker(weak, worker_stop, rx))
+                .ok();
         if handle.is_none() {
             *LIVE_TX
                 .lock()

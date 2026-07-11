@@ -378,12 +378,9 @@ pub fn activate(slot: &str, persist: bool) -> String {
         // synchronous file write. Snapshot under the lock, write on a worker.
         let slot = slot.to_string();
         let snapshot = entry.pocket.clone();
-        std::thread::Builder::new()
-            .name("neuron-pocket-persist".into())
-            .spawn(move || {
-                let _ = write_disk(&slot, &snapshot);
-            })
-            .ok();
+        crate::worker::spawn_detached("neuron-pocket-persist", move || {
+            let _ = write_disk(&slot, &snapshot);
+        });
     }
     GEN.fetch_add(1, Ordering::Relaxed); // a real move happened — let the GUI repaint
 

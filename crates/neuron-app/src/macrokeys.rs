@@ -67,16 +67,13 @@ pub fn start() {
 
     let mon = armed.clone();
     let mice = mouse_pids.clone();
-    thread::Builder::new()
-        .name("neuron-macrokeys-mon".into())
-        .spawn(move || loop {
-            thread::sleep(HOTPLUG_POLL);
-            if let Some(reg) = registry() {
-                ensure_driver_mode(reg, &mice); // a replug reverts to onboard — re-assert
-            }
-            arm_new(&mice, &mon);
-        })
-        .ok();
+    crate::worker::spawn_detached("neuron-macrokeys-mon", move || loop {
+        thread::sleep(HOTPLUG_POLL);
+        if let Some(reg) = registry() {
+            ensure_driver_mode(reg, &mice); // a replug reverts to onboard — re-assert
+        }
+        arm_new(&mice, &mon);
+    });
 }
 
 /// Put every connected Razer keyboard (speaks `device_mode`, not a mouse) into Driver Mode so its
@@ -138,17 +135,27 @@ fn arm_new(mouse_pids: &HashSet<u16>, armed: &Arc<Mutex<HashSet<DevicePath>>>) {
 
 fn spawn_reader(pid: u16, path: DevicePath, armed: Arc<Mutex<HashSet<DevicePath>>>) {
     let tag = format!("pid={pid:04x}");
-    thread::Builder::new()
-        .name("neuron-macrokeys".into())
-        .spawn(move || {
+    // `armed` claimed this collection's path in `arm_new` before this spawn — the release below is
+    // the ONE place that un-claims it (open failure, read-loop exit, spawn refusal/panic), so the
+    // monitor can always retry a stranded claim instead of a collection going deaf forever.
+    let release_armed = armed.clone();
+    let release_path = path.clone();
+    crate::worker::spawn_guarded(
+        "neuron-macrokeys",
+        move || {
+            release_armed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&release_path);
+        },
+        move || {
             let reader = match neuron::transport::open_reader(&path) {
                 Ok(r) => r,
                 Err(e) => {
                     if verbose() {
                         eprintln!("[macrokeys] {tag}: not readable ({e})");
                     }
-                    armed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&path); // let the monitor retry later
-                    return;
+                    return; // release un-claims `path`; the monitor retries later
                 }
             };
             if verbose() {
@@ -160,7 +167,7 @@ fn spawn_reader(pid: u16, path: DevicePath, armed: Arc<Mutex<HashSet<DevicePath>
                     Ok(n) if n > 0 => decode(&buf[..n], pid),
                     Ok(_) => {} // zero-length read — keep listening
                     Err(_) => {
-                        armed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&path); // unplugged — monitor re-arms on replug
+                        // unplugged — release un-claims `path` so the monitor re-arms.
                         if verbose() {
                             eprintln!("[macrokeys] {tag}: closed");
                         }
@@ -168,8 +175,8 @@ fn spawn_reader(pid: u16, path: DevicePath, armed: Arc<Mutex<HashSet<DevicePath>
                     }
                 }
             }
-        })
-        .ok();
+        },
+    );
 }
 
 /// Decode a Razer macro report and inject the held keys. The report is `04 <code>* 00*` — id `0x04`

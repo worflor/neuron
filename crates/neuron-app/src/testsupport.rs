@@ -203,6 +203,127 @@ mod conventions {
             offenders.join("\n")
         );
     }
+
+    // ── convention regression: every production thread goes through the worker primitive ───────
+    //
+    // A raw `std::thread::spawn`/`thread::spawn` hands back an unnamed OS thread — invisible to
+    // per-thread CPU attribution (`prof_log`) and to any future thread-census tooling. A raw
+    // `std::thread::Builder::new()...spawn(...)` fixes the naming but reintroduces the original
+    // trap this crate's `neuron::worker` module exists to close: a discarded `.spawn(...).ok()`
+    // silently strands whatever latch/result the caller was relying on when the OS refuses the
+    // thread. The established replacement is one of `neuron::worker::{spawn_detached, spawn_guarded,
+    // spawn_notify}` (re-exported as `crate::worker::*` in neuron-app) — see macro_host.rs's
+    // "warm"/"act" sites, runtime.rs's start_layers/vitals/adopt, hidwatch.rs's battery watcher, and
+    // the glue.rs macro/diag/cast/catalog/capture sites for the pattern. Neither raw form should
+    // appear in production text outside `worker.rs` itself (the primitive's home, which legitimately
+    // constructs `std::thread::Builder` once).
+    //
+    // TWO exemptions, no more:
+    //   * `worker.rs` — the whole file (the primitive's implementation).
+    //   * a raw construction whose own line carries a `worker-exempt:` marker comment. The three
+    //     primitives return only `bool`, so a lifecycle thread whose owner KEEPS the `JoinHandle`
+    //     to `.join()` it on Drop/stop (the host servers/actors, the macro_host reader/logger, the
+    //     overlay/dispatch/hook pumps) genuinely cannot route through them without losing that
+    //     deterministic teardown. Each such site names WHY inline; a NEW unmarked raw spawn still
+    //     trips the test, so the escape hatch can't be used to sneak a fire-and-forget past it.
+    // Test code is exempt (a test's own worker threads are fine raw and unnamed) via the same
+    // `strip_test_region` truncation `no_bare_poison_unwraps_in_production_code` uses.
+    #[test]
+    fn all_production_threads_go_through_the_worker_primitive() {
+        let root = workspace_root();
+        let crates_dir = root.join("crates");
+        // Scoped to the three crates that actually spawn OS threads (the thread-census contract),
+        // NOT the whole workspace — unlike `no_bare_poison_unwraps_in_production_code`'s sweep,
+        // sibling crates (neuron-cli, neuron-testkit, engram, …) are out of scope here.
+        let mut files = Vec::new();
+        for name in ["neuron-app", "neuron-core", "neuron-host"] {
+            let src = crates_dir.join(name).join("src");
+            assert!(
+                src.is_dir(),
+                "expected crate src dir at {} — path resolution is broken",
+                src.display()
+            );
+            collect_rs_files(&src, &mut files);
+        }
+        assert!(
+            files.len() > 20,
+            "the three-crate sweep under {} found only {} .rs file(s) — path resolution is \
+             broken (expected hundreds of files across neuron-app/neuron-core/neuron-host)",
+            crates_dir.display(),
+            files.len(),
+        );
+
+        // The `worker.rs` files are the primitives' own homes — the ONLY places raw
+        // `std::thread::Builder::new().spawn(...)` is allowed. Two of them because neuron-host
+        // keeps `neuron` an optional dep (its kernel stays pure-std), so it can't reach
+        // neuron-core's worker and mirrors `spawn_named` locally. Everything else routes through
+        // one of them; no per-site exemption exists (an exemption you must read the closure to
+        // trust is exactly what rots — this stays a pure allowlist).
+        let allowlisted = [
+            crates_dir.join("neuron-core").join("src").join("worker.rs"),
+            crates_dir.join("neuron-host").join("src").join("worker.rs"),
+        ];
+
+        let mut offenders = Vec::new();
+        for file in &files {
+            if allowlisted.contains(file) {
+                continue;
+            }
+            for line in bare_thread_spawns(file) {
+                offenders.push(format!("{}:{line}", file.display()));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "route every production thread through the worker primitives \
+             (spawn_detached/spawn_guarded/spawn_notify, or spawn_named for a handle an owner \
+             joins) so a spawn refusal or panic can't strand a latch/result — raw \
+             thread::spawn/Builder is allowed only in a worker.rs\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    /// `file:line` for every raw `thread::spawn(` or `thread::Builder` (with or without a `std::`
+    /// prefix) in `path`'s production region. Whitespace-collapsed first (mirrors
+    /// `bare_poison_unwraps`), so a call wrapped across lines is still caught; `//` line comments are
+    /// stripped first so a doc comment that merely mentions the pattern (e.g. controls.rs's `/// let
+    /// handle = std::thread::spawn`) can't false-positive. Matches the specific tokens
+    /// `thread::spawn` and `thread::Builder` — NOT bare `.spawn(`, so `Command::spawn` (subprocess,
+    /// e.g. the macro_host/purge sidecars) never trips this. There is no per-line exemption: the
+    /// only allowed homes for raw thread creation are the `worker.rs` files, handled by the caller.
+    fn bare_thread_spawns(path: &Path) -> Vec<usize> {
+        let Ok(content) = std::fs::read_to_string(path) else {
+            return Vec::new();
+        };
+        let production = strip_test_region(&content);
+
+        let raw_lines: Vec<&str> = production.lines().collect();
+        let mut haystack = String::with_capacity(production.len());
+        let mut line_at: Vec<usize> = Vec::with_capacity(production.len());
+        for (i, line) in raw_lines.iter().enumerate() {
+            let code = match line.find("//") {
+                Some(idx) => &line[..idx],
+                None => *line,
+            };
+            for ch in code.chars().filter(|c| !c.is_whitespace()) {
+                haystack.push(ch);
+                line_at.push(i + 1);
+            }
+        }
+
+        let mut hits = Vec::new();
+        for needle in ["thread::spawn(", "thread::Builder"] {
+            let mut start = 0;
+            while let Some(pos) = haystack[start..].find(needle) {
+                let abs = start + pos;
+                hits.push(line_at.get(abs).copied().unwrap_or(0));
+                start = abs + 1;
+            }
+        }
+        hits.sort_unstable();
+        hits.dedup();
+        hits
+    }
 }
 
 // ── persistence audit (TDD §8: "no GUI save path writes outside the executable/run directory") ──

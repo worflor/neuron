@@ -24,13 +24,10 @@ thread_local! {
 pub fn pick_synapse_export(app: &AppWindow, on_pick: impl Fn(&AppWindow, String) + 'static) {
     PICK_HANDLER.with(|h| *h.borrow_mut() = Some(Box::new(on_pick)));
     PICK_WINDOW.with(|c| *c.borrow_mut() = Some(app.as_weak()));
-    std::thread::Builder::new()
-        .name("neuron-file-dialog".into())
-        .spawn(move || {
-            let path = open_dialog();
-            let _ = slint::invoke_from_event_loop(move || finish(path));
-        })
-        .ok();
+    crate::worker::spawn_detached("neuron-file-dialog", move || {
+        let path = open_dialog();
+        let _ = slint::invoke_from_event_loop(move || finish(path));
+    });
 }
 
 /// Run the stashed pick handler on the UI thread.

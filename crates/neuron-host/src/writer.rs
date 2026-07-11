@@ -260,9 +260,7 @@ impl Writer {
         let pause = Arc::new(AtomicUsize::new(0));
         let parked = Arc::new(AtomicBool::new(false));
         let (pause_flag, parked_flag) = (pause.clone(), parked.clone());
-        let thread = thread::Builder::new()
-            .name(format!("neuron-writer-{surface}"))
-            .spawn(move || {
+        let thread = crate::worker::spawn_named(&format!("neuron-writer-{surface}"), move || {
                 let mut sink = make_sink();
                 let mut core = WriterCore::new();
                 let mut heal = HealPolicy::new();

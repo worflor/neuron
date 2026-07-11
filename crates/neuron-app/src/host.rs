@@ -174,10 +174,12 @@ impl ObsFollower {
     fn start(handle: HostHandle, control: ObsControl) -> ObsFollower {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
-        let thread = thread::Builder::new()
-            .name("neuron-obs-follow".into())
-            .spawn(move || follow(handle, control, &flag))
-            .expect("spawn obs follower");
+        // ObsFollower owns this handle and joins it on Drop — routed through the handle-returning
+        // primitive.
+        let thread = crate::worker::spawn_named("neuron-obs-follow", move || {
+            follow(handle, control, &flag)
+        })
+        .expect("spawn obs follower");
         ObsFollower { stop, thread: Some(thread) }
     }
 }
@@ -333,10 +335,12 @@ impl HostEventsListener {
     fn start(handle: HostHandle) -> HostEventsListener {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
-        let thread = thread::Builder::new()
-            .name("neuron-host-events".into())
-            .spawn(move || host_events_loop(handle, &flag))
-            .expect("spawn host events listener");
+        // HostEventsListener owns this handle and joins it on Drop — routed through the
+        // handle-returning primitive.
+        let thread = crate::worker::spawn_named("neuron-host-events", move || {
+            host_events_loop(handle, &flag)
+        })
+        .expect("spawn host events listener");
         HostEventsListener { stop, thread: Some(thread) }
     }
 }

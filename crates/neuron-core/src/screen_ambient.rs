@@ -138,9 +138,13 @@ pub fn ensure() {
     }
     *run = true;
     drop(run);
-    let _ = thread::Builder::new()
-        .name("neuron-screen-ambient".into())
-        .spawn(run_loop);
+    // The latch is cleared by the release — which runs on completion, panic, OR a spawn refusal —
+    // so a failed spawn can never leave the capturer latched "on" and block every later `ensure`.
+    crate::worker::spawn_guarded(
+        "neuron-screen-ambient",
+        || *running().lock().unwrap_or_else(std::sync::PoisonError::into_inner) = false,
+        run_loop,
+    );
 }
 
 /// The latest captured zone grid as `(cols, rows, cells)`. Cheap (one lock + clone of ~132
@@ -168,10 +172,10 @@ fn run_loop() {
     loop {
         // ── control: idle auto-stop ──
         {
-            let mut run = running().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let run = running().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let idle = now_ms().saturating_sub(LAST_ACCESS_MS.load(Ordering::Relaxed));
             if idle > IDLE_STOP_MS {
-                *run = false;
+                // `running` is cleared by the spawn's release, not here — see `ensure`.
                 drop(run);
                 if let Ok(mut g) = cells().lock() {
                     for c in g.iter_mut() {

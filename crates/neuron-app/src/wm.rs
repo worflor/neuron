@@ -808,7 +808,7 @@ mod imp {
             }
             // a game can fire one more ClipCursor from its render loop before it loses foreground; clear it
             // again a beat later so that last in-flight re-clip can't re-lock the cursor to centre.
-            std::thread::spawn(|| {
+            crate::worker::spawn_detached("neuron-wm-unclip", || {
                 std::thread::sleep(std::time::Duration::from_millis(40));
                 unsafe { windows_sys::Win32::UI::WindowsAndMessaging::ClipCursor(std::ptr::null()) };
             });
@@ -861,7 +861,7 @@ mod imp {
             // cursor stays put across two reads — then stop, so a hand that's genuinely moving again gets
             // control back fast (a held-still mouse releases in ~12ms, not a flat 90ms "stick"). Capped so a
             // continuously-moving mouse can't be fought forever; by the cap the landing has still won.
-            std::thread::spawn(move || unsafe {
+            crate::worker::spawn_detached("neuron-wm-pin-cursor", move || unsafe {
                 SetCursorPos(x, y);
                 let mut stable = 0;
                 for _ in 0..16 {

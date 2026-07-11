@@ -99,22 +99,27 @@ pub fn begin(app: &AppWindow, mouse_only: bool, on_done: impl Fn(&AppWindow, i32
         .into(),
     );
 
-    std::thread::Builder::new()
-        .name("neuron-press-to-bind".into())
-        .spawn(move || {
+    // A spawn refusal or worker panic must still clear CAPTURE_ACTIVE/the handler cells (they were
+    // set above) — `done` runs on every path, including synchronously on refusal.
+    crate::worker::spawn_notify(
+        "neuron-press-to-bind",
+        move || {
             let vk = if mouse_only {
                 capture_mouse_until(&stop)
             } else {
                 neuron::capture::capture_keypress_until(&stop)
             };
-            let (code, name) = match vk {
+            match vk {
                 Some(v) => (v, neuron::capture::vk_name(v)),
                 None => (0, "cancelled".to_string()),
-            };
+            }
+        },
+        move |result| {
+            let (code, name) = result.unwrap_or_else(|| (0, "cancelled".to_string()));
             // Post only plain data across the boundary; the !Send handler runs on the UI thread.
             let _ = slint::invoke_from_event_loop(move || finish_vk(gen, code, name));
-        })
-        .ok();
+        },
+    );
 }
 
 /// Begin a CHORD-aware press-to-bind capture: like [`begin`], but the handler also receives the
@@ -138,17 +143,22 @@ pub fn begin_chord(app: &AppWindow, on_done: impl Fn(&AppWindow, i32, &[&str], &
     CAPTURE_ACTIVE.store(true, Ordering::Relaxed);
     st.set_capture_prompt("press the key / button / chord you want — ESC to cancel".into());
 
-    std::thread::Builder::new()
-        .name("neuron-chord-capture".into())
-        .spawn(move || {
+    // Same "done clears the latch on every path" contract as `begin` above.
+    crate::worker::spawn_notify(
+        "neuron-chord-capture",
+        move || {
             let vk = neuron::capture::capture_keypress_until(&stop);
-            let (code, mods, name) = match vk {
+            match vk {
                 Some(v) => (v, held_modifiers(v), neuron::capture::vk_name(v)),
                 None => (0, Vec::new(), "cancelled".to_string()),
-            };
+            }
+        },
+        move |result| {
+            let (code, mods, name) =
+                result.unwrap_or_else(|| (0, Vec::new(), "cancelled".to_string()));
             let _ = slint::invoke_from_event_loop(move || finish_chord(gen, code, mods, name));
-        })
-        .ok();
+        },
+    );
 }
 
 /// The modifier names held *right now*, excluding `pressed` itself (so a captured Ctrl press is
@@ -242,14 +252,17 @@ pub fn begin_control(
         "press the device control (knob / mute / media / macro key / mic-tap) — ESC to cancel".into(),
     );
 
-    std::thread::Builder::new()
-        .name("neuron-control-capture".into())
-        .spawn(move || {
+    // Same "done clears the latch on every path" contract as `begin` above.
+    crate::worker::spawn_notify(
+        "neuron-control-capture",
+        move || {
             let captured = capture_control_until(&stop);
-            let pkt = captured.map(|c| (c.page, c.usage, c.pid));
-            let _ = slint::invoke_from_event_loop(move || finish_ctl(gen, pkt));
-        })
-        .ok();
+            captured.map(|c| (c.page, c.usage, c.pid))
+        },
+        move |pkt| {
+            let _ = slint::invoke_from_event_loop(move || finish_ctl(gen, pkt.flatten()));
+        },
+    );
 }
 
 /// Run the stashed control handler on the UI thread (stale generations are inert; see finish_vk).
@@ -380,14 +393,16 @@ pub fn begin_keyseq(app: &AppWindow, on_done: impl Fn(&AppWindow, Option<String>
         "RECORDING — play the keys with your real timing · STOP or ESC ends the take".into(),
     );
 
-    std::thread::Builder::new()
-        .name("neuron-seq-recorder".into())
-        .spawn(move || {
-            let grammar = record_keyseq_until(&stop);
+    // RECORDING (set above) must clear even if the worker never runs or panics mid-take, or the
+    // REC/STOP toggle would wedge in "recording" forever.
+    crate::worker::spawn_notify(
+        "neuron-seq-recorder",
+        move || record_keyseq_until(&stop),
+        move |grammar| {
             RECORDING.store(false, Ordering::Relaxed);
-            let _ = slint::invoke_from_event_loop(move || finish_seq(gen, grammar));
-        })
-        .ok();
+            let _ = slint::invoke_from_event_loop(move || finish_seq(gen, grammar.flatten()));
+        },
+    );
 }
 
 fn finish_seq(gen: u64, grammar: Option<String>) {

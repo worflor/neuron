@@ -525,13 +525,30 @@ impl AppRuntime {
             inflight.extend(first_try.iter().copied());
         }
         // Mark exactly the pids we're about to spawn on as running, then release the guard before
-        // spawning (the thread re-locks it at its tail to clear them).
+        // spawning. The RELEASE runs whether the worker finishes, panics, or the OS refuses the
+        // thread — so a spawn failure can never leave these keys latched "running"/"learning" and
+        // block every future adoption attempt for the rest of the run.
         running.extend(unknown.iter().copied());
         drop(running);
         let dirty = self.synth_dirty.clone();
         let inflight = self.synth_inflight.clone();
         let running = self.synth_running.clone();
-        std::thread::spawn(move || {
+        let release_keys = unknown.clone(); // the worker consumes `unknown`; the guard needs its own
+        let release = move || {
+            // Retire the "learning…" rows for FIRST attempts, and drop the single-probe guard for
+            // every key this thread owned so a still-unknown key can be re-probed next tick.
+            // `into_inner` on poison: unconditional release is the whole point — a poisoned lock
+            // must not strand the latch any more than a spawn failure may.
+            inflight
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retain(|k| !first_try.contains(k));
+            running
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retain(|k| !release_keys.contains(k));
+        };
+        crate::worker::spawn_guarded("neuron-runtime-adopt", release, move || {
             // Fresh registry (not a clone of the UI's): adoption must judge "unknown" against
             // what's on DISK, so a def another process adopted meanwhile isn't re-probed. Probe
             // ONLY this worker's keys (`adopt_keys`, not `adopt_unknown`): a second worker spawned
@@ -543,19 +560,6 @@ impl AppRuntime {
                     if !a.adopted.is_empty() {
                         dirty.store(true, Ordering::SeqCst);
                     }
-                }
-            }
-            // Probe over (success or not): retire the "learning…" rows for FIRST attempts…
-            if let Ok(mut set) = inflight.lock() {
-                for key in &first_try {
-                    set.remove(key);
-                }
-            }
-            // …and drop the single-probe guard for every key this thread probed, so a key that
-            // stayed unknown becomes eligible for a fresh probe on the next SYNTH_RETRY tick.
-            if let Ok(mut set) = running.lock() {
-                for key in &unknown {
-                    set.remove(key);
                 }
             }
         });
@@ -1047,7 +1051,16 @@ impl AppRuntime {
             },
         );
         let unit = unit.to_string();
-        std::thread::spawn(move || {
+        // `on_done` (glue) is the SOLE cleanup authority: it removes this board's `anim` entry and
+        // clears the "compositing" indicator. The worker returns its outcome and `done` calls
+        // `on_done` exactly once — with the real error, a synthesized error on spawn refusal, or
+        // `None` on success — so a refused/panicked thread can't leave a PHANTOM compositor (entry
+        // present + indicator lit + no thread). `on_done` defers its work via invoke_from_event_loop,
+        // so the synchronous spawn-fail path only POSTS the cleanup — no re-borrow of `self` here.
+        let stop_for_done = stop.clone();
+        let spawned = crate::worker::spawn_notify(
+            "neuron-runtime-anim",
+            move || {
             let outcome: Result<(), String> = (|| {
                 let reg = Registry::load().map_err(|e| format!("registry: {e}"))?;
                 let infos = transport::enumerate().map_err(|e| format!("enumerate: {e}"))?;
@@ -1098,8 +1111,18 @@ impl AppRuntime {
                 }
                 Err("device not found".into())
             })();
-            on_done(outcome.err(), stop);
-        });
+            outcome.err()
+            },
+            move |res| {
+                // res: Some(err_opt) = worker ran; None = thread refused or panicked.
+                let err = res.unwrap_or_else(|| Some("lighting thread could not start".into()));
+                on_done(err, stop_for_done);
+            },
+        );
+        if !spawned {
+            // `done` already ran (posted the cleanup); report the failure, not "compositing".
+            return "lighting thread could not start".into();
+        }
         "compositing".into()
     }
 
@@ -1186,11 +1209,14 @@ impl AppRuntime {
         if IN_FLIGHT.swap(true, Ordering::AcqRel) {
             return; // a read is already running — don't stack another.
         }
-        std::thread::spawn(move || {
-            // contain a fault so a read error can never strand the in-flight latch.
-            let _ = std::panic::catch_unwind(|| publish_source_vitals(forced));
-            IN_FLIGHT.store(false, Ordering::Release);
-        });
+        // The latch is cleared by the release guard, which runs whether the worker completes,
+        // panics, OR the OS refuses the thread — so a spawn failure under resource exhaustion
+        // can never strand `IN_FLIGHT` true and silence vitals for the rest of the run.
+        crate::worker::spawn_guarded(
+            "neuron-runtime-vitals",
+            || IN_FLIGHT.store(false, Ordering::Release),
+            move || publish_source_vitals(forced),
+        );
     }
 
     // ── spine: rules from the loaded config ──────────────────────────────

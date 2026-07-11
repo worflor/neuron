@@ -706,10 +706,9 @@ mod imp {
     impl SpellOverlay {
         pub fn spawn() -> Self {
             let (tx, rx) = channel::<Cmd>();
-            let handle = std::thread::Builder::new()
-                .name("neuron-spell-overlay".into())
-                .spawn(move || render_thread(rx))
-                .ok();
+            // SpellOverlay owns this handle and joins it on Drop — routed through the
+            // handle-returning primitive.
+            let handle = crate::worker::spawn_named("neuron-spell-overlay", move || render_thread(rx)).ok();
             SpellOverlay { tx, handle }
         }
         /// Show the sigil for `mode`, anchored at the current cursor; resets the stroke.

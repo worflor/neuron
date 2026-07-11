@@ -236,10 +236,9 @@ mod sys {
     /// this never double-spawns.
     fn start_pump() -> Option<PumpHandle> {
         PUMP_TID.store(0, Ordering::SeqCst);
-        let join = std::thread::Builder::new()
-            .name("neuron-gaming-hook".into())
-            .spawn(pump_main)
-            .ok()?;
+        // PumpHandle owns this handle and joins it on reap/stop_pump, so it routes through the
+        // handle-returning primitive rather than a fire-and-forget helper.
+        let join = crate::worker::spawn_named("neuron-gaming-hook", pump_main).ok()?;
         // Spin-wait for the thread to publish its tid (it does so within microseconds, right after
         // the install attempt). Bounded so a pathological hang can't wedge the controller forever.
         let mut tid = 0u32;

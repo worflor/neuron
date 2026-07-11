@@ -565,17 +565,17 @@ fn schedule_material_cards(app: &AppWindow) {
     let tx = TX.get_or_init(|| {
         let weak = app.as_weak();
         let (tx, rx) = sync_channel::<(Vec<crate::weave::Material>, f32)>(1);
-        std::thread::Builder::new()
-            .name("neuron-weave-gallery".into())
-            .spawn(move || {
-                while let Ok((mats, t)) = rx.recv() {
-                    let bufs = render_material_bufs(&mats, t);
-                    let _ = weak.upgrade_in_event_loop(move |app| {
-                        upload_material_cards(&app, bufs);
-                    });
-                }
-            })
-            .expect("spawn weave-gallery worker");
+        // fire-and-forget: no latch, nothing waits on a result — a spawn refusal just means the
+        // gallery never renders (the channel send below silently no-ops forever), same visible
+        // effect as any other worker starvation.
+        crate::worker::spawn_detached("neuron-weave-gallery", move || {
+            while let Ok((mats, t)) = rx.recv() {
+                let bufs = render_material_bufs(&mats, t);
+                let _ = weak.upgrade_in_event_loop(move |app| {
+                    upload_material_cards(&app, bufs);
+                });
+            }
+        });
         tx
     });
     let _ = tx.try_send((material_snapshot(), crate::weave::seconds()));
@@ -1230,7 +1230,11 @@ pub fn install(app: &AppWindow) -> SharedRt {
         }
         let slot = SlotHeld;
         let w2 = w.clone();
-        std::thread::spawn(move || {
+        // `slot` rides INSIDE the closure, so its Drop already releases the scan slot on a spawn
+        // refusal (Builder::spawn drops the un-run closure, guard included) exactly as it does on
+        // every in-body exit path below — a genuine fire-and-forget from the primitives' point of
+        // view, nothing else to report.
+        crate::worker::spawn_detached("neuron-glue-scan", move || {
             let scanned = std::panic::catch_unwind(crate::runtime::scan_hardware);
             let Ok(Some((infos, devs))) = scanned else {
                 drop(slot); // no result will ever apply — free the slot for the next tick
@@ -3352,15 +3356,24 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 })
                 .unwrap_or_default();
                 let back = app.as_weak();
-                std::thread::spawn(move || {
-                    // let the anim thread(s) notice the stop and release the device handle first.
-                    std::thread::sleep(std::time::Duration::from_millis(350));
-                    let result = crate::dispatch::apply_profile(profile_name, persist);
+                // The stop side above parked EVERY board's stream before this spawn — a spawn
+                // refusal or a worker panic must still bring lighting back (`None` below), the same
+                // recovery the Err arm already does, or a board sits frozen dark until some
+                // unrelated transition happens to wake it. `spawn_notify` is what makes `None`
+                // observable here (a bare `.spawn().ok()` would just strand the parked streams).
+                crate::worker::spawn_notify(
+                    "neuron-glue-profile",
+                    move || {
+                        // let the anim thread(s) notice the stop and release the device handle first.
+                        std::thread::sleep(std::time::Duration::from_millis(350));
+                        crate::dispatch::apply_profile(profile_name, persist)
+                    },
+                    move |result| {
                     let _ = slint::invoke_from_event_loop(move || {
                         if let Some(app) = back.upgrade() {
                             let st = app.global::<State>();
                             match result {
-                                Ok(applied) => {
+                                Some(Ok(applied)) => {
                                     let policy = applied.policy;
                                     st.set_disable_alt_tab(policy.disable_alt_tab);
                                     st.set_disable_win(policy.disable_win);
@@ -3442,7 +3455,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                                     });
                                     st.set_status_line(applied.summary.into());
                                 }
-                                Err(e) => {
+                                Some(Err(e)) => {
                                     // apply failed — bring back the look that was streaming before, so a
                                     // failed apply never leaves the board frozen with its stream stopped.
                                     // The stop side parked EVERY board (not just this one), so resume all
@@ -3459,10 +3472,26 @@ pub fn install(app: &AppWindow) -> SharedRt {
                                     });
                                     st.set_status_line(e.into());
                                 }
+                                None => {
+                                    // spawn refusal or a worker panic before a result ever formed —
+                                    // same recovery as a failed apply above, since the boards were
+                                    // parked either way.
+                                    with_shared(|sh| {
+                                        if !prev_lighting.is_empty() {
+                                            let mut s = sh.borrow_mut();
+                                            s.light_layers = prev_lighting.clone();
+                                            s.selected_layer = s.light_layers.len().saturating_sub(1);
+                                            s.layers_rev += 1;
+                                        }
+                                        let _ = reapply_all_boards(&app, sh);
+                                    });
+                                    st.set_status_line("profile apply failed to start".into());
+                                }
                             }
                         }
                     });
-                });
+                    },
+                );
             }
         });
     });
@@ -3696,12 +3725,21 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 st.set_macro_status("checking syntax…".into());
                 let source = src.to_string();
                 let back = app.as_weak();
-                std::thread::spawn(move || {
+                let release_w = app.as_weak();
+                crate::worker::spawn_guarded(
+                    "neuron-glue-macrochk",
+                    move || {
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(app) = release_w.upgrade() {
+                                app.global::<State>().set_macro_busy(false);
+                            }
+                        });
+                    },
+                    move || {
                     let result = neuron::macros::macro_host().check(&source);
                     let _ = slint::invoke_from_event_loop(move || {
                         if let Some(app) = back.upgrade() {
                             let st = app.global::<State>();
-                            st.set_macro_busy(false);
                             match result {
                                 Ok(defs) => {
                                     let has_entry = defs.iter().any(|d| d == "macro" || d == "main");
@@ -3724,7 +3762,8 @@ pub fn install(app: &AppWindow) -> SharedRt {
                             }
                         }
                     });
-                });
+                    },
+                );
             }
         });
     });
@@ -3758,12 +3797,21 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 }
                 st.set_macro_parsing(true);
                 let back = app.as_weak();
-                std::thread::spawn(move || {
+                let release_w = app.as_weak();
+                crate::worker::spawn_guarded(
+                    "neuron-glue-macroparse",
+                    move || {
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(app) = release_w.upgrade() {
+                                app.global::<State>().set_macro_parsing(false);
+                            }
+                        });
+                    },
+                    move || {
                     let result = neuron::macros::parse_macro(&source);
                     let _ = slint::invoke_from_event_loop(move || {
                         if let Some(app) = back.upgrade() {
                             let st = app.global::<State>();
-                            st.set_macro_parsing(false);
                             match result {
                                 Ok(nodes) => {
                                     let mut blocks = Vec::new();
@@ -3790,7 +3838,8 @@ pub fn install(app: &AppWindow) -> SharedRt {
                             }
                         }
                     });
-                });
+                    },
+                );
             }
         });
     });
@@ -3915,13 +3964,22 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 st.set_macro_status(format!("registering '{name}'…").into());
                 let source = src.to_string();
                 let back = app.as_weak();
+                let release_w = app.as_weak();
                 // register blocks up to FIRE_BUDGET for the ack — off the UI thread.
-                std::thread::spawn(move || {
+                crate::worker::spawn_guarded(
+                    "neuron-glue-macrosave",
+                    move || {
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(app) = release_w.upgrade() {
+                                app.global::<State>().set_macro_busy(false);
+                            }
+                        });
+                    },
+                    move || {
                     let res = neuron::macros::macro_host().register(&name, &source);
                     let _ = slint::invoke_from_event_loop(move || {
                         if let Some(app) = back.upgrade() {
                             let st = app.global::<State>();
-                            st.set_macro_busy(false);
                             match res {
                                 Ok(()) => st.set_macro_status(
                                     format!(
@@ -3939,7 +3997,8 @@ pub fn install(app: &AppWindow) -> SharedRt {
                             refresh_macro_catalog(&app);
                         }
                     });
-                });
+                    },
+                );
             }
         });
     });
@@ -3973,33 +4032,45 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 );
             }
             let back = w.clone();
-            std::thread::spawn(move || {
-                let host = neuron::macros::macro_host();
-                // make sure the sidecar knows this macro (sync its current source from disk), then mock-fire.
-                if let Some((_, src)) = neuron::macros::macro_host::scan_macro_dir()
-                    .into_iter()
-                    .find(|(mid, _)| *mid == id)
-                {
-                    let _ = host.register(&id, &src);
-                }
-                let ctx = neuron::macros::Context::capture();
-                // SURFACE the result — a silent button is the worst UX. If the bundled python
-                // runtime can't be materialized (a rare IO failure), say so plainly.
-                let result = host.fire_mock(&id, &ctx);
-                // a successful dispatch raises a beacon that mirror_count will clear the gate for;
-                // a FAILED dispatch (sidecar cold/dead/unavailable) raises none, so release the gate
-                // here or the test button would stay locked until the next real beacon clears.
-                if !result.contains("dispatched") {
-                    crate::beacon::TEST_BEACON_INFLIGHT
-                        .store(false, std::sync::atomic::Ordering::SeqCst);
-                }
-                let _ = slint::invoke_from_event_loop(move || {
-                    if let Some(app) = back.upgrade() {
-                        app.global::<State>()
-                            .set_status_line(format!("beacon test \u{00b7} {result}").into());
+            // TEST_BEACON_INFLIGHT was just claimed above and is normally released either by
+            // `mirror_count` (a real beacon rose) or by the "failed dispatch" branch below — a spawn
+            // refusal or a worker panic hits NEITHER of those, so it must be released here too via
+            // `spawn_notify`'s `None`, or the gate would stay locked forever with no beacon ever
+            // coming to clear it.
+            crate::worker::spawn_notify(
+                "neuron-glue-testbeacon",
+                move || {
+                    let host = neuron::macros::macro_host();
+                    // make sure the sidecar knows this macro (sync its current source from disk), then mock-fire.
+                    if let Some((_, src)) = neuron::macros::macro_host::scan_macro_dir()
+                        .into_iter()
+                        .find(|(mid, _)| *mid == id)
+                    {
+                        let _ = host.register(&id, &src);
                     }
-                });
-            });
+                    let ctx = neuron::macros::Context::capture();
+                    // SURFACE the result — a silent button is the worst UX. If the bundled python
+                    // runtime can't be materialized (a rare IO failure), say so plainly.
+                    host.fire_mock(&id, &ctx)
+                },
+                move |result: Option<String>| {
+                    // a successful dispatch raises a beacon that mirror_count will clear the gate for;
+                    // anything else (a FAILED dispatch, or no result at all) releases the gate here or
+                    // the test button would stay locked until the next real beacon clears.
+                    let dispatched = matches!(&result, Some(r) if r.contains("dispatched"));
+                    if !dispatched {
+                        crate::beacon::TEST_BEACON_INFLIGHT
+                            .store(false, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    let msg = result.unwrap_or_else(|| "worker failed to start".to_string());
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(app) = back.upgrade() {
+                            app.global::<State>()
+                                .set_status_line(format!("beacon test \u{00b7} {msg}").into());
+                        }
+                    });
+                },
+            );
         });
     });
     // TEST ASKS (macro editor): the SAFE, learn-by-doing companion to "test run". Registers the LIVE
@@ -4038,24 +4109,34 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 );
             }
             let back = w.clone();
-            std::thread::spawn(move || {
-                let host = neuron::macros::macro_host();
-                let _ = host.register(&id, &source);
-                let ctx = neuron::macros::Context::capture();
-                let result = host.fire_mock(&id, &ctx);
-                // a failed dispatch raises no beacon, so release the shared gate here (else it'd stay
-                // locked until the next real beacon clears it).
-                if !result.contains("dispatched") {
-                    crate::beacon::TEST_BEACON_INFLIGHT
-                        .store(false, std::sync::atomic::Ordering::SeqCst);
-                }
-                let _ = slint::invoke_from_event_loop(move || {
-                    if let Some(app) = back.upgrade() {
-                        app.global::<State>()
-                            .set_macro_status(format!("ask preview \u{00b7} {result}").into());
+            // same gate, same strand risk as the SYSTEM-panel test beacon above: a spawn refusal or
+            // a worker panic never dispatches, so nothing would ever release TEST_BEACON_INFLIGHT —
+            // `spawn_notify`'s `None` is what closes that gap.
+            crate::worker::spawn_notify(
+                "neuron-glue-testasks",
+                move || {
+                    let host = neuron::macros::macro_host();
+                    let _ = host.register(&id, &source);
+                    let ctx = neuron::macros::Context::capture();
+                    host.fire_mock(&id, &ctx)
+                },
+                move |result: Option<String>| {
+                    // a failed dispatch (or no result at all) raises no beacon, so release the shared
+                    // gate here (else it'd stay locked until the next real beacon clears it).
+                    let dispatched = matches!(&result, Some(r) if r.contains("dispatched"));
+                    if !dispatched {
+                        crate::beacon::TEST_BEACON_INFLIGHT
+                            .store(false, std::sync::atomic::Ordering::SeqCst);
                     }
-                });
-            });
+                    let msg = result.unwrap_or_else(|| "worker failed to start".to_string());
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(app) = back.upgrade() {
+                            app.global::<State>()
+                                .set_macro_status(format!("ask preview \u{00b7} {msg}").into());
+                        }
+                    });
+                },
+            );
         });
     });
     // editor source changed -> recompute whether it contains an ask (gates the self-surfacing "test
@@ -4131,33 +4212,48 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 app.global::<State>()
                     .set_macro_status("reloading macros from disk\u{2026}".into());
                 let back = app.as_weak();
-                std::thread::spawn(move || {
-                    let host = neuron::macros::macro_host();
-                    let found = neuron::macros::macro_host::scan_macro_dir();
-                    let count = found.len();
-                    for (id, src) in &found {
-                        let _ = host.register(id, src);
-                    }
-                    let _ = slint::invoke_from_event_loop(move || {
-                        if let Some(app) = back.upgrade() {
-                            let st = app.global::<State>();
-                            refresh_macro_catalog(&app);
-                            refresh_beacon_macros(&app);
-                            // re-read the open macro from disk so external edits / a same-name drag-in
-                            // show without a restart (it overwrites the status; set ours after).
-                            let open = st.get_macro_name().to_string();
-                            let open = open.trim();
-                            if !open.is_empty()
-                                && neuron::macros::macro_host::load_macro(open).is_some()
-                            {
-                                load_macro_into_editor(&app, open);
-                            }
-                            st.set_macro_status(
-                                format!("reloaded {count} macro(s) from disk").into(),
-                            );
+                // "reloading…" was just posted above — a spawn refusal must correct it (spawn_notify's
+                // `None`) or the status line would read "reloading" forever with nothing ever landing.
+                crate::worker::spawn_notify(
+                    "neuron-glue-macroload",
+                    move || {
+                        let host = neuron::macros::macro_host();
+                        let found = neuron::macros::macro_host::scan_macro_dir();
+                        for (id, src) in &found {
+                            let _ = host.register(id, src);
                         }
-                    });
-                });
+                        found.len()
+                    },
+                    move |count: Option<usize>| {
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(app) = back.upgrade() {
+                                let st = app.global::<State>();
+                                match count {
+                                    Some(count) => {
+                                        refresh_macro_catalog(&app);
+                                        refresh_beacon_macros(&app);
+                                        // re-read the open macro from disk so external edits / a same-name
+                                        // drag-in show without a restart (it overwrites the status; set
+                                        // ours after).
+                                        let open = st.get_macro_name().to_string();
+                                        let open = open.trim();
+                                        if !open.is_empty()
+                                            && neuron::macros::macro_host::load_macro(open).is_some()
+                                        {
+                                            load_macro_into_editor(&app, open);
+                                        }
+                                        st.set_macro_status(
+                                            format!("reloaded {count} macro(s) from disk").into(),
+                                        );
+                                    }
+                                    None => {
+                                        st.set_macro_status("reload failed to start".into());
+                                    }
+                                }
+                            }
+                        });
+                    },
+                );
             }
         });
     });
@@ -4202,7 +4298,17 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 st.set_macro_status("running once…".into());
                 let source = src.to_string();
                 let back = app.as_weak();
-                std::thread::spawn(move || {
+                let release_w = app.as_weak();
+                crate::worker::spawn_guarded(
+                    "neuron-glue-macrotest",
+                    move || {
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(app) = release_w.upgrade() {
+                                app.global::<State>().set_macro_busy(false);
+                            }
+                        });
+                    },
+                    move || {
                     let host = neuron::macros::macro_host();
                     let reg = host.register(&name, &source);
                     let (result, log) = match reg {
@@ -4216,14 +4322,14 @@ pub fn install(app: &AppWindow) -> SharedRt {
                     let _ = slint::invoke_from_event_loop(move || {
                         if let Some(app) = back.upgrade() {
                             let st = app.global::<State>();
-                            st.set_macro_busy(false);
                             st.set_macro_status(result.into());
                             let lines: Vec<SharedString> =
                                 log.into_iter().map(Into::into).collect();
                             st.set_macro_dryrun(ModelRc::new(VecModel::from(lines)));
                         }
                     });
-                });
+                    },
+                );
             }
         });
     });
@@ -4259,7 +4365,17 @@ pub fn install(app: &AppWindow) -> SharedRt {
                     )
                 };
                 let back = app.as_weak();
-                std::thread::spawn(move || {
+                let release_w = app.as_weak();
+                crate::worker::spawn_guarded(
+                    "neuron-glue-diag",
+                    move || {
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(app) = release_w.upgrade() {
+                                app.global::<State>().set_diag_running(false);
+                            }
+                        });
+                    },
+                    move || {
                     let mut rt = AppRuntime::load();
                     rt.selected_pid = pid;
                     rt.selected_unit = unit;
@@ -4286,10 +4402,10 @@ pub fn install(app: &AppWindow) -> SharedRt {
                             st.set_diag_summary(
                                 format!("{pass} passed · {fail} failed · {skip} skipped").into(),
                             );
-                            st.set_diag_running(false);
                         }
                     });
-                });
+                    },
+                );
             }
         });
     });
@@ -5101,7 +5217,17 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 );
                 let trigger = sh.borrow().rt.cast.trigger;
                 let back = app.as_weak();
-                std::thread::spawn(move || {
+                let release_w = app.as_weak();
+                crate::worker::spawn_guarded(
+                    "neuron-glue-castrec",
+                    move || {
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(app) = release_w.upgrade() {
+                                app.global::<State>().set_recording_activation(false);
+                            }
+                        });
+                    },
+                    move || {
                     let cfg = neuron::feel::FeelConfig::load();
                     let t0 = std::time::Instant::now();
                     let mut presses: Vec<(u64, Option<u64>)> = Vec::new();
@@ -5142,7 +5268,6 @@ pub fn install(app: &AppWindow) -> SharedRt {
                     let _ = slint::invoke_from_event_loop(move || {
                         if let Some(app) = back.upgrade() {
                             let st = app.global::<State>();
-                            st.set_recording_activation(false);
                             match phrase {
                                 Some(p) => {
                                     // capture a failed disk write instead of swallowing it — the rhythm
@@ -5171,7 +5296,8 @@ pub fn install(app: &AppWindow) -> SharedRt {
                             }
                         }
                     });
-                });
+                    },
+                );
             }
         });
     });
@@ -5764,8 +5890,16 @@ fn seed_perf_async(app: &AppWindow, sh: &SharedRt, resume_lighting: bool) {
         )
     };
     let w = app.as_weak();
-    std::thread::spawn(move || {
-        let snap = crate::runtime::read_perf_snapshot(pid, &unit, &dialect);
+    let unit_for_work = unit.clone();
+    let dialect_for_work = dialect.clone();
+    // resume_lighting rides THIS worker's completion on purpose (see the doc comment above) — a
+    // spawn refusal or a worker panic must not silently skip it, or a newly-selected board would
+    // just stay dark with no error, and the readouts would stay pinned on "…" forever. Wiring this
+    // through `spawn_notify`'s `None` closes both gaps.
+    crate::worker::spawn_notify(
+        "neuron-glue-perfscan",
+        move || crate::runtime::read_perf_snapshot(pid, &unit_for_work, &dialect_for_work),
+        move |snap: Option<crate::runtime::PerfSnapshot>| {
         let _ = slint::invoke_from_event_loop(move || {
             let Some(app) = w.upgrade() else { return };
             with_shared(|sh| {
@@ -5774,6 +5908,17 @@ fn seed_perf_async(app: &AppWindow, sh: &SharedRt, resume_lighting: bool) {
                     return;
                 }
                 let st = app.global::<State>();
+                let Some(snap) = snap else {
+                    // the worker never produced a snapshot — leave the readouts honest instead of
+                    // stuck on "…", but still resume lighting (that half doesn't need the snapshot).
+                    st.set_idle_readout("\u{2014}".into());
+                    st.set_lod_readout("\u{2014}".into());
+                    if resume_lighting && LIGHTING_READY.load(std::sync::atomic::Ordering::Acquire) {
+                        load_lighting_into_state(&app, sh);
+                        let _ = apply_current_lighting(&app, sh);
+                    }
+                    return;
+                };
                 match snap.idle_secs {
                     Some(s) => {
                         st.set_idle_readout(format!("{s}s").into());
@@ -5836,7 +5981,8 @@ fn seed_perf_async(app: &AppWindow, sh: &SharedRt, resume_lighting: bool) {
                 stamp_feel_baseline(&st);
             });
         });
-    });
+        },
+    );
 }
 
 /// FIRST-LIGHT TX SELF-HEAL hook (DIALECT-RND wave 2b). Decides on the UI thread (cheaply), then
@@ -5876,7 +6022,10 @@ fn maybe_first_light_heal(app: &AppWindow, sh: &SharedRt, pid: u16, unit: &str) 
     let dialect = def.dialect.clone();
     let unit = unit.to_string();
     let w = app.as_weak();
-    std::thread::spawn(move || {
+    // `healed_units` above is a permanent once-per-unit-per-run marker, not a busy latch — nothing
+    // clears it on any path, so a spawn refusal just means this unit's heal is skipped for the
+    // run (identical in effect to the def already being verified-as-is). Nothing else to report.
+    crate::worker::spawn_detached("neuron-glue-txheal", move || {
         // Own registry + own device handle (the UI's AppRuntime is !Send), mirroring
         // `read_perf_snapshot`'s worker: reload the registry, enumerate, open THIS unit's control
         // interface with the two-pass unit-precise-then-pid-only rule. `io_gate` parks the HOST
@@ -6996,7 +7145,18 @@ fn refresh_macro_catalog(app: &AppWindow) {
     let triggers = with_shared_ret(macro_trigger_map).unwrap_or_default();
     app.global::<State>().set_macro_catalog_building(true);
     let back = app.as_weak();
-    std::thread::spawn(move || {
+    let release_w = app.as_weak();
+    crate::worker::spawn_guarded(
+        "neuron-glue-catalog",
+        move || {
+            MACRO_CATALOG_BUILDING.store(false, Ordering::SeqCst);
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(app) = release_w.upgrade() {
+                    app.global::<State>().set_macro_catalog_building(false);
+                }
+            });
+        },
+        move || {
         let rows: Vec<MacroCard> = macros
             .into_iter()
             .map(|(id, src)| {
@@ -7023,11 +7183,10 @@ fn refresh_macro_catalog(app: &AppWindow) {
             if let Some(app) = back.upgrade() {
                 let st = app.global::<State>();
                 st.set_macro_catalog(ModelRc::new(VecModel::from(rows)));
-                st.set_macro_catalog_building(false);
             }
-            MACRO_CATALOG_BUILDING.store(false, Ordering::SeqCst);
         });
-    });
+        },
+    );
 }
 
 /// Load a macro from disk INTO the editor: set the name + source, recompute has-ask, then re-parse
@@ -8775,7 +8934,9 @@ fn weave_capture(
     overlay.recognized(recognized(&path));
     overlay.end();
     // let the sigil fade on its own time — the capture (and the user's next weave) doesn't wait.
-    std::thread::spawn(move || {
+    // fire-and-forget: `overlay` is dropped INSIDE the closure, so a spawn refusal drops it
+    // (and fades it) immediately instead of leaking — nothing else to report.
+    crate::worker::spawn_detached("neuron-glue-fade", move || {
         std::thread::sleep(std::time::Duration::from_millis(350));
         drop(overlay);
     });
@@ -8795,19 +8956,22 @@ fn free_glyph_name(vault: &neuron::gesture::Vault) -> String {
 /// (beacon.rs:272 wraps its cycle the same way). It makes a stranded "recording" state structurally
 /// impossible, so no capture worker can ever leave the UI wedged:
 ///
-///   1. RAII cleanup. `CaptureFlags::drop` clears `capturing-gesture` / `rich-capturing` /
-///      `gesture-predict` on EVERY exit of `body` — normal return, early return, OR panic (Drop runs
-///      during unwind; the crate is deliberately `panic = "unwind"`, see the root Cargo.toml). The
-///      flags become a CONSEQUENCE of this call's lifetime, not a bool someone must remember to reset
-///      on each path (the fragility that stranded the recorder on a mid-stroke panic).
+///   1. RAII cleanup via [`crate::worker::spawn_guarded`]: the release (clearing
+///      `capturing-gesture` / `rich-capturing` / `gesture-predict`) runs on EVERY exit of `body` —
+///      normal return, early return, panic (Drop runs during unwind; the crate is deliberately
+///      `panic = "unwind"`, see the root Cargo.toml) — AND on a spawn failure (OS thread exhaustion),
+///      since the guard travels inside the very closure `Builder::spawn` would otherwise drop
+///      silently. The flags become a CONSEQUENCE of this call's lifetime, not a bool someone must
+///      remember to reset on each path.
 ///   2. Panic containment. A panic in `body` is caught, traced to the flight log (so it localizes like
 ///      every other weave event), and surfaced as a friendly status instead of silently killing the
 ///      worker thread.
 ///
-/// `w` is the UI handle for the drop-cleanup + the failure status; `body` is the worker's real work
-/// (capture → analyze → save → status), which owns its own weak(s) for the happy-path UI posts.
-/// Which status line a capture worker's panic message lands in — so a radial-wheel failure surfaces
-/// by the wheel (`radial-status`), not in the glyph panel (`gesture-status`) the user wasn't looking at.
+/// `name` is the worker's thread name; `w` is the UI handle for the release-cleanup + the failure
+/// status; `body` is the worker's real work (capture → analyze → save → status), which owns its own
+/// weak(s) for the happy-path UI posts. Which status line a capture worker's panic message lands in —
+/// so a radial-wheel failure surfaces by the wheel (`radial-status`), not in the glyph panel
+/// (`gesture-status`) the user wasn't looking at.
 #[derive(Clone, Copy)]
 enum CaptureChannel {
     Gesture,
@@ -8815,18 +8979,16 @@ enum CaptureChannel {
 }
 
 fn run_guarded(
+    name: &str,
     w: slint::Weak<AppWindow>,
     channel: CaptureChannel,
     generation: u64,
     body: impl FnOnce() + Send + 'static,
 ) {
-    struct CaptureFlags {
-        w: slint::Weak<AppWindow>,
-        generation: u64,
-    }
-    impl Drop for CaptureFlags {
-        fn drop(&mut self) {
-            let (w, generation) = (self.w.clone(), self.generation);
+    let release_w = w.clone();
+    crate::worker::spawn_guarded(
+        name,
+        move || {
             let _ = slint::invoke_from_event_loop(move || {
                 // GENERATION GUARD: only clear if THIS capture is still the latest. A newer capture
                 // that started right after us (the cancel-then-restart race: a sync cancel frees the
@@ -8836,33 +8998,31 @@ fn run_guarded(
                 if CAPTURE_GEN.load(std::sync::atomic::Ordering::SeqCst) != generation {
                     return;
                 }
-                if let Some(app) = w.upgrade() {
+                if let Some(app) = release_w.upgrade() {
                     let st = app.global::<State>();
                     st.set_capturing_gesture(false);
                     st.set_rich_capturing(false);
                     st.set_gesture_predict("".into());
                 }
             });
-        }
-    }
-    let _flags = CaptureFlags {
-        w: w.clone(),
-        generation,
-    };
-    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).is_err() {
-        crate::flight::trace("weave", "GUI capture worker panicked \u{2014} recovered", 0);
-        let _ = slint::invoke_from_event_loop(move || {
-            if let Some(app) = w.upgrade() {
-                let st = app.global::<State>();
-                let msg: slint::SharedString = "capture hiccup \u{2014} nothing saved, try again".into();
-                match channel {
-                    CaptureChannel::Gesture => st.set_gesture_status(msg),
-                    CaptureChannel::Radial => st.set_radial_status(msg),
-                }
+        },
+        move || {
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).is_err() {
+                crate::flight::trace("weave", "GUI capture worker panicked \u{2014} recovered", 0);
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(app) = w.upgrade() {
+                        let st = app.global::<State>();
+                        let msg: slint::SharedString =
+                            "capture hiccup \u{2014} nothing saved, try again".into();
+                        match channel {
+                            CaptureChannel::Gesture => st.set_gesture_status(msg),
+                            CaptureChannel::Radial => st.set_radial_status(msg),
+                        }
+                    }
+                });
             }
-        });
-    }
-    // `_flags` drops HERE — clearing the capture flags whether `body` returned or unwound.
+        },
+    );
 }
 
 /// Capture a gesture on a worker thread (blocking hold-to-draw), analyze it, store it, and post
@@ -8913,7 +9073,7 @@ fn record_gesture(app: &AppWindow, sh: &SharedRt) {
     let vault = sh.borrow().rt.vault.clone();
     let w = app.as_weak();
     let predict_w = app.as_weak();
-    std::thread::spawn(move || run_guarded(w.clone(), CaptureChannel::Gesture, capture_gen, move || {
+    run_guarded("neuron-glue-gesture", w.clone(), CaptureChannel::Gesture, capture_gen, move || {
         let feel = neuron::feel::FeelConfig::load();
         let mut last_pred_len = 0usize;
         let path = weave_capture(
@@ -9006,7 +9166,7 @@ fn record_gesture(app: &AppWindow, sh: &SharedRt) {
                 }
             }
         });
-    }));
+    });
 }
 
 /// Like [`weave_capture`], but uses the **timestamped, un-thinned** capture ([`neuron::glyph::
@@ -9037,7 +9197,9 @@ fn weave_capture_stamped(
     );
     overlay.recognized(path.len() >= 3);
     overlay.end();
-    std::thread::spawn(move || {
+    // fire-and-forget: `overlay` is dropped INSIDE the closure, so a spawn refusal drops it
+    // (and fades it) immediately instead of leaking — nothing else to report.
+    crate::worker::spawn_detached("neuron-glue-fade", move || {
         std::thread::sleep(std::time::Duration::from_millis(350));
         drop(overlay);
     });
@@ -9081,7 +9243,7 @@ fn record_rich_stroke(app: &AppWindow, sh: &SharedRt) {
     let vault = sh.borrow().rt.vault.clone();
     let w = app.as_weak();
     let trail_w = app.as_weak();
-    std::thread::spawn(move || run_guarded(w.clone(), CaptureChannel::Gesture, capture_gen, move || {
+    run_guarded("neuron-glue-stroke", w.clone(), CaptureChannel::Gesture, capture_gen, move || {
         let feel = neuron::feel::FeelConfig::load();
         let mut last_trail_len = 0usize;
         let (path, stamps) = weave_capture_stamped(
@@ -9146,7 +9308,7 @@ fn record_rich_stroke(app: &AppWindow, sh: &SharedRt) {
                 }
             }
         });
-    }));
+    });
 }
 
 /// Test the wheel: hold the cast trigger and flick. Goes through the EXACT same [`weave_capture`]
@@ -9193,7 +9355,7 @@ fn preview_radial(app: &AppWindow, sh: &SharedRt) {
         items: Vec::new(),
     };
     let w = app.as_weak();
-    std::thread::spawn(move || run_guarded(w.clone(), CaptureChannel::Radial, capture_gen, move || {
+    run_guarded("neuron-glue-radial", w.clone(), CaptureChannel::Radial, capture_gen, move || {
         let feel = neuron::feel::FeelConfig::load();
         let menu_for_hit = menu.clone();
         let path = weave_capture(
@@ -9228,7 +9390,7 @@ fn preview_radial(app: &AppWindow, sh: &SharedRt) {
                 }
             }
         });
-    }));
+    });
 }
 
 /// Map a captured complex path into normalized interleaved (x,y) in 0..1 for the trail canvas,

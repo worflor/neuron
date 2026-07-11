@@ -65,24 +65,22 @@ pub fn toggle(weak: &slint::Weak<AppWindow>) {
     #[cfg(windows)]
     {
         let weak = weak.clone();
-        let started = std::thread::Builder::new()
-            .name("neuron-knockback".into())
-            .spawn(move || {
-                // PANIC-PROOF teardown: if the session ever unwinds, the trigger guard, the
-                // owned-key claim and the ACTIVE flag must all release anyway — a leaked claim
-                // here is "all spellcasting is dead until restart".
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| imp::run(&weak)));
+        // PANIC-PROOF / spawn-refusal teardown: the trigger guard, the owned-key claim and the
+        // ACTIVE flag must all release on every exit path — a leaked claim here is "all
+        // spellcasting is dead until restart", and a refused spawn must not dark the drum key
+        // waiting on a session that will never run.
+        crate::worker::spawn_guarded(
+            "neuron-knockback",
+            || {
                 crate::teleport::click_guard::disarm();
                 crate::flight::pulse_clear(crate::flight::organ::KNOCKBACK);
                 OWNED_VK.store(0, Ordering::SeqCst);
                 ACTIVE.store(false, Ordering::SeqCst);
-            })
-            .is_ok();
-        if !started {
-            // the session thread never spawned — clear the duet flag so the drum key isn't
-            // darked forever waiting on a session that will never run.
-            ACTIVE.store(false, Ordering::SeqCst);
-        }
+            },
+            move || {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| imp::run(&weak)));
+            },
+        );
     }
     #[cfg(not(windows))]
     {

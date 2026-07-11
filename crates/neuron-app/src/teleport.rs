@@ -625,18 +625,21 @@ pub enum ScryCmd {
     Hide,
 }
 
+// `service_sender` caches the send-end only once the worker spawned — a refused spawn retries on
+// the next call rather than stranding scry commands in a dead channel. `None` = can't start now.
 #[cfg(windows)]
-pub fn scry() -> &'static std::sync::mpsc::Sender<ScryCmd> {
-    use std::sync::OnceLock;
-    static TX: OnceLock<std::sync::mpsc::Sender<ScryCmd>> = OnceLock::new();
-    TX.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::channel::<ScryCmd>();
-        std::thread::Builder::new()
-            .name("neuron-scry".into())
-            .spawn(move || scry_thread(rx))
-            .ok();
-        tx
-    })
+pub fn scry() -> Option<std::sync::mpsc::Sender<ScryCmd>> {
+    static TX: crate::worker::Service<ScryCmd> = crate::worker::Service::new();
+    crate::worker::service_sender(&TX, "neuron-scry", scry_thread)
+}
+
+/// Send a scry command, starting the worker on demand. Silently no-ops if the worker can't be
+/// started (a refused spawn) — the peek simply doesn't appear, and the next call retries.
+#[cfg(windows)]
+pub fn scry_send(cmd: ScryCmd) {
+    if let Some(tx) = scry() {
+        let _ = tx.send(cmd);
+    }
 }
 
 /// The teleport bloom portal (anchored to the map, with the landing marker). GLANCE grew into
@@ -706,6 +709,7 @@ fn scry_thread(rx: std::sync::mpsc::Receiver<ScryCmd>) {
         let mut thumb: isize = 0;
         // the portal's live geometry — what Aim maps source-fractions through.
         let mut portal: Option<(i32, i32, i32, i32)> = None; // (x, y, w, h)
+        let mut frame_panics = 0u32; // per-frame render panic streak (contain_frame throttle)
         loop {
             // drain commands: the latest Show/Hide wins; the latest Aim rides along.
             let mut latest: Option<ScryCmd> = None;
@@ -716,6 +720,9 @@ fn scry_thread(rx: std::sync::mpsc::Receiver<ScryCmd>) {
                     other => latest = Some(other),
                 }
             }
+            // contain a per-command panic (a stale DWM thumbnail handle, odd geometry) so it can't
+            // kill the scry pump for the run.
+            crate::worker::contain("neuron-scry", || {
             if let Some(cmd) = latest {
                 if thumb != 0 {
                     DwmUnregisterThumbnail(thumb);
@@ -784,32 +791,40 @@ fn scry_thread(rx: std::sync::mpsc::Receiver<ScryCmd>) {
                     ScryCmd::Aim { .. } => unreachable!("split above"),
                 }
             }
-            // the landing marker: the ghost's exact spot, projected into the portal — the
-            // peek SHOWS where the cursor will appear (a marker window floats above the
-            // thumbnail, since DWM composites thumbnails over the portal's own pixels).
-            if let (Some((px, py, pw, ph)), Some((fx, fy))) = (portal, aim) {
-                if !marker.is_null() {
-                    let mx = px + (fx.clamp(0.0, 1.0) * pw as f32) as i32 - MARK / 2;
-                    let my = py + (fy.clamp(0.0, 1.0) * ph as f32) as i32 - MARK / 2;
-                    SetWindowPos(marker, HWND_TOPMOST, mx, my, MARK, MARK, SWP_NOACTIVATE);
-                    ShowWindow(marker, SW_SHOWNOACTIVATE);
+            });
+            // the per-frame render — marker projection + sparkle-frame paint/present — runs every
+            // tick (pixel/geometry work, the likeliest panic surface), so it's contained on its own
+            // hot lane: a panicked frame is a dropped frame, repainted next tick.
+            crate::worker::contain_frame("neuron-scry", &mut frame_panics, || {
+                // the landing marker: the ghost's exact spot, projected into the portal — the
+                // peek SHOWS where the cursor will appear (a marker window floats above the
+                // thumbnail, since DWM composites thumbnails over the portal's own pixels).
+                if let (Some((px, py, pw, ph)), Some((fx, fy))) = (portal, aim) {
+                    if !marker.is_null() {
+                        let mx = px + (fx.clamp(0.0, 1.0) * pw as f32) as i32 - MARK / 2;
+                        let my = py + (fy.clamp(0.0, 1.0) * ph as f32) as i32 - MARK / 2;
+                        SetWindowPos(marker, HWND_TOPMOST, mx, my, MARK, MARK, SWP_NOACTIVATE);
+                        ShowWindow(marker, SW_SHOWNOACTIVATE);
+                    }
                 }
-            }
-            // repaint the sparkle frame around the live portal (animated rim + travelling sparkles)
-            if let Some((px, py, pw, ph)) = portal {
-                if !frame_win.is_null() {
-                    paint_scry_frame(fpx, pw, ph);
-                    let fpos = POINT {
-                        x: px - SCRY_FRAME_B,
-                        y: py - SCRY_FRAME_B,
-                    };
-                    let fsize = SIZE {
-                        cx: pw + 2 * SCRY_FRAME_B,
-                        cy: ph + 2 * SCRY_FRAME_B,
-                    };
-                    frame_surf.present(Some(fpos), fsize, 255);
+                // repaint the sparkle frame around the live portal (animated rim + travelling sparkles)
+                if let Some((px, py, pw, ph)) = portal {
+                    if !frame_win.is_null() {
+                        paint_scry_frame(fpx, pw, ph);
+                        let fpos = POINT {
+                            x: px - SCRY_FRAME_B,
+                            y: py - SCRY_FRAME_B,
+                        };
+                        let fsize = SIZE {
+                            cx: pw + 2 * SCRY_FRAME_B,
+                            cy: ph + 2 * SCRY_FRAME_B,
+                        };
+                        frame_surf.present(Some(fpos), fsize, 255);
+                    }
                 }
-            }
+            });
+            // the message pump is NOT contained: a panic across the `extern "system"` window-proc
+            // ABI aborts the process, so catch_unwind here would be misleading dead code.
             let mut msg: MSG = std::mem::zeroed();
             while PeekMessageW(&mut msg, hwnd, 0, 0, PM_REMOVE) != 0 {
                 TranslateMessage(&msg);
@@ -1485,17 +1500,13 @@ pub mod click_guard {
 
     fn install() {
         INSTALL.call_once(|| {
-            std::thread::Builder::new()
-                .name("neuron-click-guard".into())
-                .spawn(|| unsafe {
-                    if SetWindowsHookExW(WH_MOUSE_LL, Some(hook), std::ptr::null_mut(), 0).is_null()
-                    {
-                        return;
-                    }
-                    let mut msg: MSG = std::mem::zeroed();
-                    while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {}
-                })
-                .ok();
+            crate::worker::spawn_detached("neuron-click-guard", || unsafe {
+                if SetWindowsHookExW(WH_MOUSE_LL, Some(hook), std::ptr::null_mut(), 0).is_null() {
+                    return;
+                }
+                let mut msg: MSG = std::mem::zeroed();
+                while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {}
+            });
         });
     }
 

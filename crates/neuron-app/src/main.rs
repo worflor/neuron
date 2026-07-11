@@ -47,6 +47,7 @@ mod ui;
 mod weave;
 mod whiteboard;
 mod wm;
+mod worker;
 
 #[cfg(test)]
 mod apptest;
@@ -351,7 +352,7 @@ fn main() {
     // Spawn the bundled-CPython sidecar once and register every macros/scripts/*.py into it, so a
     // triggered python macro fires warm (no per-press spawn/import). The input path + hardware
     // control are live immediately regardless; the macro tier just becomes ready a beat later.
-    std::thread::spawn(|| {
+    crate::worker::spawn_detached("neuron-macro-warm", || {
         let _ = neuron::macros::macro_host().ensure_warm();
     });
 
@@ -373,14 +374,14 @@ fn main() {
         notifs::set_note_sink(note_tx.clone()); // backs post_macro / post_ask / clear_ask
         let (conf_tx, conf_rx) = std::sync::mpsc::channel::<neuron::confirm::Confirmation>();
         neuron::confirm::set_sink(Some(conf_tx));
-        std::thread::spawn(move || {
+        crate::worker::spawn_detached("neuron-notif-fwd", move || {
             while let Ok(c) = conf_rx.recv() {
                 if note_tx.send(notifs::Note::Confirm(c)).is_err() {
                     break; // the engine went away
                 }
             }
         });
-        std::thread::spawn(move || notifs::run(note_rx));
+        crate::worker::spawn_detached("neuron-notif-engine", move || notifs::run(note_rx));
     }
 
     // ── HID EVENT LISTENER ────────────────────────────────────────────────
