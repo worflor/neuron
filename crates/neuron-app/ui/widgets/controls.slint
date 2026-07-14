@@ -189,6 +189,60 @@ export component Pill inherits Rectangle {
     }
 }
 
+// A LOADING RIM — the shared "something is happening" affordance: a short comet of beads chasing
+// around a control's own rectangular border. Drop it in as an absolute overlay (`width`/`height`
+// bound to the host) inside anything that wants a busy/working state — it doesn't know or care about
+// any other LoadingRim on screen, it just runs its own clock and walks its own rim. This is the ONE
+// place that motion lives, so a future busy affordance reuses this instead of growing another
+// hand-rolled dot.
+//
+// The walk is a plain rectangle perimeter (top → right → bottom → left), not a true rounded-rect —
+// at the small radii these controls use, a square corner and a true arc read the same at bead scale,
+// and skipping the per-corner trig keeps this simple. Waypoints are spaced by distance (not by a flat
+// step count), so the sweep reads the same speed on a wide button as a narrow one.
+export component LoadingRim inherits Rectangle {
+    in property <color> tint: Theme.accent-dim;
+    background: transparent;
+    property <length> inset: 4px;              // how far inside the host's own edge the beads ride
+    property <length> bw: max(0px, root.width - 2 * root.inset);
+    property <length> bh: max(0px, root.height - 2 * root.inset);
+    property <length> perimeter: 2 * (root.bw + root.bh);
+    property <int> segments: max(16, floor(root.perimeter / 8px));   // ~8px per step
+    property <int> step: 0;
+    Timer {
+        interval: 40ms;
+        running: root.perimeter > 0px;
+        triggered => { root.step += 1; }
+    }
+    // position at distance `d` along the perimeter, walking clockwise from the top-left corner.
+    pure function rim-x(d: length) -> length {
+        if (d < root.bw) { return d; }
+        if (d < root.bw + root.bh) { return root.bw; }
+        if (d < root.bw + root.bh + root.bw) { return root.bw - (d - root.bw - root.bh); }
+        return 0px;
+    }
+    pure function rim-y(d: length) -> length {
+        if (d < root.bw) { return 0px; }
+        if (d < root.bw + root.bh) { return d - root.bw; }
+        if (d < root.bw + root.bh + root.bw) { return root.bh; }
+        return root.bh - (d - root.bw - root.bh - root.bw);
+    }
+    // the comet: 5 beads, brightest at the head, fading along the trail. Each bead just trails the
+    // head by `i` steps — a linear tween between waypoints at the tick's own interval is what makes
+    // the chase read as one continuous sweep instead of a hopping dot.
+    for i in 5 : Rectangle {
+        property <int> idx: mod(root.step - i + root.segments * 8, max(1, root.segments));
+        property <float> frac: (self.idx * 1.0) / max(1, root.segments);
+        property <length> d: root.perimeter * self.frac;
+        width: 4px; height: 4px;
+        border-radius: 2px;
+        x: root.inset + root.rim-x(self.d) - self.width / 2;
+        y: root.inset + root.rim-y(self.d) - self.height / 2;
+        background: root.tint.with-alpha(1.0 - i * 0.2);
+        animate x, y { duration: 40ms; easing: linear; }
+    }
+}
+
 // Push button — a labelled key. Flat, tight, mono. Primary = a quiet accent-outlined key that fills
 // faintly on hover (an armed contact); ghost = text on a hairline; danger = red ink. The label
 // travels 1px on press (a real key has throw), and `busy` swaps in a working lamp + disables.
@@ -223,14 +277,12 @@ export component Button inherits Rectangle {
         : primary ? (touch.has-hover ? Theme.accent.with-alpha(0.7) : Theme.accent-line)
         : (touch.has-hover ? Theme.text-faint : Theme.line);
     animate background, border-color { duration: Theme.quick; }
-    // the working lamp — a phosphor dot while the async op runs, OVERLAID in the left padding (absolute)
-    // so it lights in place and never shoves the centred label sideways when work starts. Inserting it
-    // into the label row (the old way) jolted the text ~11px right on every click — movement-on-interact.
-    if root.busy : Rectangle {
-        width: Theme.dot; height: Theme.dot; border-radius: Theme.dot / 2;
-        x: 9px;
-        y: (parent.height - self.height) / 2;
-        background: Theme.accent-dim;
+    // the working indicator — a comet chasing the button's own rim while the async op runs, OVERLAID
+    // (absolute) so it never shoves the centred label sideways when work starts. Replaces the old
+    // static in-button dot with actual motion — "something is happening", not a frozen mark.
+    if root.busy : LoadingRim {
+        width: parent.width; height: parent.height;
+        tint: Theme.accent-dim;
     }
     HorizontalLayout {
         padding-left: 13px;
@@ -1245,13 +1297,11 @@ export component SplitButton inherits Rectangle {
                 : rta.has-hover ? Theme.well
                 : (root.right-primary ? Theme.bg-2 : transparent);
             animate background { duration: Theme.quick; }
-            // the working lamp — a phosphor dot overlaid in the commit half's left padding while the
-            // async op runs (absolute, so it lights in place without shoving the centred label).
-            if root.busy : Rectangle {
-                width: Theme.dot; height: Theme.dot; border-radius: Theme.dot / 2;
-                x: 9px;
-                y: (parent.height - self.height) / 2;
-                background: Theme.accent-dim;
+            // the working indicator — a comet chasing the commit half's own rim while the async op
+            // runs (absolute, so it never shoves the centred label). Mirrors Button's LoadingRim.
+            if root.busy : LoadingRim {
+                width: parent.width; height: parent.height;
+                tint: Theme.accent-dim;
             }
             HorizontalLayout {
                 padding-left: 13px; padding-right: 13px;
@@ -1703,12 +1753,15 @@ export component ConfirmButton inherits Rectangle {
     in property <bool> enabled: true;
     callback confirmed();
     property <bool> armed: false;
-    // pin the width to the WIDER label (+ Button's 13px×2 side padding) so the key hugs like a Button
-    // AND never changes size when the label swaps. Reading the labels' intrinsic preferred-widths is
-    // layout-cycle-free (glyph-measured, independent of the box) — the same trick Button uses.
-    property <length> label-w: max(rest.preferred-width, conf.preferred-width);
+    // hug the CURRENT label (+ Button's 13px×2 side padding), like Button — not the wider of the two,
+    // which left a short idle glyph (the beacon row's bare "×") sitting in a box sized for "delete?".
+    // The width animates through the same escalation the fill/border already animate on, so the grow-
+    // on-arm reads as one motion, not a resize glitch. Reading preferred-width is layout-cycle-free
+    // (glyph-measured, independent of the box) — the same trick Button uses.
+    property <length> label-w: root.armed ? conf.preferred-width : rest.preferred-width;
     min-width: root.label-w + 26px;
     max-width: root.label-w + 26px;
+    animate min-width, max-width { duration: Theme.quick; }
     height: Theme.row-h;
     clip: true;
     border-radius: Theme.radius-sm;
@@ -1737,13 +1790,16 @@ export component ConfirmButton inherits Rectangle {
         padding-left: 13px; padding-right: 13px;
         y: touch.pressed && root.enabled ? 1px : 0px;   // key throw, like Button
         animate y { duration: Theme.press-throw; }
-        // both labels stack, centred; the idle one holds its width at opacity 0 so the key stays sized
-        // to the wider of the two and the relabel lands in place.
+        // both labels stack, centred; the idle one holds opacity 0 so the relabel lands in place.
+        // width/height are left INTRINSIC (not 100%) — root.label-w reads rest/conf's preferred-width
+        // to size the button, and binding that same text's width to its own container would be a
+        // circular reference that collapses to 0 (the glyph vanishes). Centre by hand instead.
         Rectangle {
             rest := Text {
                 text: root.text;
                 opacity: root.armed ? 0 : 1;
-                width: 100%; height: 100%;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
                 horizontal-alignment: center; vertical-alignment: center;
                 font-size: Theme.fs-body; font-family: Theme.mono;
                 font-weight: 500; letter-spacing: Theme.track-1;
@@ -1753,7 +1809,8 @@ export component ConfirmButton inherits Rectangle {
             conf := Text {
                 text: root.confirm-text;
                 opacity: root.armed ? 1 : 0;
-                width: 100%; height: 100%;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
                 horizontal-alignment: center; vertical-alignment: center;
                 font-size: Theme.fs-body; font-family: Theme.mono;
                 font-weight: 700; letter-spacing: Theme.track-1;   // bolder = the committed rung
@@ -1838,22 +1895,32 @@ export component SelectableRow inherits Rectangle {
     in property <bool> selected: false;
     in property <bool> two-line: false;      // force the taller row even without a desc (a control row)
     in property <color> tint: Theme.accent;
+    // false = something else on the same trigger already wins this row (e.g. a rhythm shadowed by
+    // the weave's own hold pattern) — faints + goes inert, the same "dead control" read as RowGlyph/
+    // Button's `enabled: false`, so a shadowed row reads exactly like any other disabled affordance.
+    in property <bool> enabled: true;
     out property <bool> hovered: sr-ta.has-hover;
     callback clicked();
     // the ONE place these heights live — single-line rows are row-h; a desc / control row is the taller.
     property <length> two-h: 40px;
     height: (root.desc != "" || root.two-line) ? root.two-h : Theme.row-h;
     border-radius: Theme.radius-sm;
-    background: root.selected ? root.tint.with-alpha(0.1)
+    background: !root.enabled ? Theme.bg-2
+        : root.selected ? root.tint.with-alpha(0.1)
         : (sr-ta.has-hover ? Theme.well-hi : Theme.bg-2);
     border-width: Theme.hair;
-    border-color: root.selected ? root.tint.with-alpha(0.27)
+    border-color: !root.enabled ? Theme.line-soft
+        : root.selected ? root.tint.with-alpha(0.27)
         : (sr-ta.has-hover ? Theme.text-faint : Theme.line);
     animate background, border-color { duration: Theme.quick; }
     // the selection marker — the shared tick, tinted, inset with the row.
     SelectTick { active: root.selected; tint: root.tint; y: 6px; height: parent.height - 12px; }
     // row-wide pick target — declared BEFORE the content, so a trailing control (a ✕) sits above it.
-    sr-ta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.clicked(); } }
+    sr-ta := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? MouseCursor.pointer : MouseCursor.default;
+        clicked => { root.clicked(); }
+    }
     HorizontalLayout {
         padding-left: 11px; padding-right: 9px; spacing: 10px;
         // leading signal dot (a bound glyph)
@@ -1870,7 +1937,7 @@ export component SelectableRow inherits Rectangle {
             alignment: center; width: 84px;
             Text {
                 text: root.lead;
-                color: root.selected ? root.tint : Theme.text-mid;
+                color: !root.enabled ? Theme.text-faint : (root.selected ? root.tint : Theme.text-mid);
                 font-family: Theme.mono; font-size: Theme.fs-data; font-weight: 700;
                 letter-spacing: Theme.track-2; vertical-alignment: center;
                 animate color { duration: Theme.quick; }
@@ -1881,7 +1948,8 @@ export component SelectableRow inherits Rectangle {
             alignment: center; horizontal-stretch: 1; spacing: 2px;
             Text {
                 text: root.label;
-                color: root.selected ? root.tint : (sr-ta.has-hover ? Theme.text : Theme.text-mid);
+                color: !root.enabled ? Theme.text-faint
+                    : root.selected ? root.tint : (sr-ta.has-hover ? Theme.text : Theme.text-mid);
                 font-family: Theme.mono; font-size: Theme.fs-body; font-weight: 600;
                 vertical-alignment: center; overflow: elide;
                 animate color { duration: Theme.quick; }

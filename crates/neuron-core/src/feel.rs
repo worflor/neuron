@@ -166,17 +166,32 @@ impl FeelConfig {
         crate::runroot::run_root().join("feel.toml")
     }
 
-    /// Load from `feel.toml` (defaults when absent/unparseable — never errors).
+    /// Load from `feel.toml`, salvaging field-by-field (a malformed timing no longer silently resets
+    /// every feel/hypershift setting) and never clobbering the file — see [`crate::salvage::SalvageLoad`].
     pub fn load() -> Self {
-        std::fs::read_to_string(Self::path())
-            .ok()
-            .and_then(|s| toml::from_str(&s).ok())
-            .unwrap_or_default()
+        <Self as crate::salvage::SalvageLoad>::load()
     }
 
     pub fn save(&self) -> Result<(), String> {
         let body = toml::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(Self::path(), body).map_err(|e| e.to_string())
+        crate::salvage::atomic_write(&Self::path(), body.as_bytes()).map_err(|e| e.to_string())
+    }
+}
+
+impl crate::salvage::SalvageLoad for FeelConfig {
+    const FILE: &'static str = "feel.toml";
+    fn path() -> PathBuf {
+        crate::runroot::run_root().join("feel.toml")
+    }
+    fn salvage(table: &toml::Table) -> Self {
+        let mut cfg = Self::default();
+        crate::salvage_fields!(table, Self::FILE, cfg, {
+            "hold_ms" => hold_ms,
+            "gap_ms" => gap_ms,
+            "coyote_ms" => coyote_ms,
+            "hypershift" => hypershift,
+        });
+        cfg
     }
 }
 
@@ -337,6 +352,27 @@ impl PhraseWatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn degraded_feel_defaults_the_bad_field_and_keeps_the_rest() {
+        use crate::salvage::SalvageLoad;
+        let dir = std::env::temp_dir().join(format!("neuron-feel-degraded-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("feel.toml");
+        // hold_ms is the wrong type (forces the degraded path); the sibling scalars must survive.
+        std::fs::write(&path, "hold_ms = \"nope\"\ngap_ms = 250\ncoyote_ms = 80\n").unwrap();
+        let cfg = FeelConfig::load_from(&path);
+        assert_eq!(cfg.gap_ms, 250, "the good sibling scalar survived");
+        assert_eq!(cfg.coyote_ms, 80);
+        assert_eq!(
+            cfg.hold_ms,
+            FeelConfig::default().hold_ms,
+            "the malformed scalar fell back to its own default"
+        );
+        assert!(dir.join("feel.toml.bad").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn cfg() -> FeelConfig {
         FeelConfig::default() // hold 200 / gap 280 / coyote 120

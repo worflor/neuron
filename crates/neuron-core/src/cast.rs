@@ -160,6 +160,42 @@ impl Default for CastConfig {
     }
 }
 
+impl crate::salvage::SalvageLoad for CastConfig {
+    const FILE: &'static str = "cast.toml";
+    fn path() -> PathBuf {
+        crate::runroot::run_root().join("cast.toml")
+    }
+    fn salvage(table: &toml::Table) -> Self {
+        let mut cfg = Self::default();
+        crate::salvage_fields!(table, Self::FILE, cfg, {
+            "trigger" => trigger,
+            "activation" => activation,
+            "sectors" => sectors,
+            "deadzone" => deadzone,
+            "assist" => assist,
+            "mode" => mode,
+            "hyper_radial_on" => hyper_radial_on,
+        });
+        // radial/hyper_radial are POSITIONAL (index = sector): a bad wedge resets to Noop IN PLACE
+        // so later wedges keep their sectors, instead of shifting them left. rhythm entries are
+        // self-describing (own `taps` key, order-independent) so they drop themselves.
+        if let Some(v) = crate::salvage::salvage_vec_positional(table, "radial", Self::FILE) {
+            cfg.radial = v;
+        }
+        if let Some(v) = crate::salvage::salvage_vec_positional(table, "hyper_radial", Self::FILE) {
+            cfg.hyper_radial = v;
+        }
+        if let Some(v) = crate::salvage::salvage_vec(table, "rhythm_actions", Self::FILE) {
+            cfg.rhythm_actions = v;
+        }
+        // …and the gesture map salvages per-entry.
+        if let Some(v) = crate::salvage::salvage_map(table, "gestures", Self::FILE) {
+            cfg.gestures = v;
+        }
+        cfg
+    }
+}
+
 /// What a stroke resolved to.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Resolved {
@@ -188,14 +224,11 @@ impl CastConfig {
             &self.radial
         }
     }
+    /// Load from disk, salvaging field-by-field (scalars, the radial/rhythm arrays element-wise, and
+    /// the gesture map entry-wise) so one malformed value can't reset the whole cast config — and
+    /// never clobbering the file. See [`crate::salvage::SalvageLoad`].
     pub fn load() -> Self {
-        match std::fs::read_to_string(Self::path()) {
-            Ok(s) => toml::from_str(&s).unwrap_or_else(|e| {
-                eprintln!("cast.toml parse error ({e}); using defaults");
-                Self::default()
-            }),
-            Err(_) => Self::default(),
-        }
+        <Self as crate::salvage::SalvageLoad>::load()
     }
 
     /// The VALIDATED activation slots — THE one place rhythm conflicts are decided. Rules:
@@ -409,6 +442,73 @@ cmd = "echo cast circle"
 mod tests {
     use super::*;
     use crate::glyph::{add_noise, synth_circle, synth_line};
+
+    #[test]
+    fn degraded_cast_defaults_the_bad_scalar_and_keeps_the_rest() {
+        use crate::salvage::SalvageLoad;
+        let dir = std::env::temp_dir().join(format!("neuron-cast-degraded-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cast.toml");
+        // `sectors` is the wrong type (forces the degraded path); `trigger`/`deadzone` must survive.
+        std::fs::write(&path, "trigger = 7\nsectors = \"nope\"\ndeadzone = 55.0\n").unwrap();
+        let cfg = CastConfig::load_from(&path);
+        assert_eq!(cfg.trigger, 7, "good scalar survived the salvage");
+        assert_eq!(cfg.deadzone, 55.0);
+        assert_eq!(
+            cfg.sectors,
+            CastConfig::default().sectors,
+            "the malformed scalar fell back to its own default"
+        );
+        assert!(dir.join("cast.toml.bad").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn degraded_radial_wedge_resets_in_place_not_a_sector_shift() {
+        use crate::salvage::SalvageLoad;
+        let dir = std::env::temp_dir().join(format!("neuron-cast-radial-degraded-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cast.toml");
+        // wedge 1 is malformed (unknown `type`, forces the whole-struct fast parse to fail); wedges
+        // 0 and 2 are valid Key actions. If radial were dropped-per-element like a list, wedge 2
+        // would shift down to index 1 — the exact sector-shift bug this positional salvage fixes.
+        std::fs::write(
+            &path,
+            r#"
+[[radial]]
+type = "key"
+key = "1"
+
+[[radial]]
+type = "not-a-real-action"
+
+[[radial]]
+type = "key"
+key = "3"
+"#,
+        )
+        .unwrap();
+        let cfg = CastConfig::load_from(&path);
+        assert_eq!(cfg.radial.len(), 3, "no wedge was dropped; the slot count is preserved");
+        assert_eq!(
+            cfg.radial[0],
+            Action::Key { key: "1".into() },
+            "sector 0 kept its original binding"
+        );
+        assert_eq!(
+            cfg.radial[1],
+            Action::default(),
+            "the malformed wedge reset to the default IN PLACE, not dropped"
+        );
+        assert_eq!(
+            cfg.radial[2],
+            Action::Key { key: "3".into() },
+            "sector 2 did NOT shift down to sector 1's slot"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn cast_with_a_wedge_serializes_to_valid_toml() {

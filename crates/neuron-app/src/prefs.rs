@@ -398,27 +398,11 @@ impl Prefs {
     /// bad value (a typo'd number, a hand-edit, a type that shifted during pre-release shaping) defaults
     /// only ITSELF while every sibling pref — accents, safety/notification gates, the lighting stack —
     /// is kept. Each salvaged-to-default part warns by name, so a corrupt config is visible, not a
-    /// silent reset. `load` NEVER writes: a partially-bad file keeps its good values and stays on disk
-    /// untouched (only `save` writes).
+    /// silent reset. Unified onto the shared [`neuron::salvage::SalvageLoad`] mechanism: a degraded load
+    /// also copies the original to `app.toml.bad` BEFORE returning, so a later `save` (which would
+    /// persist the salvaged-with-parts-reset struct) can never destroy the user's original bytes.
     pub fn load() -> Self {
-        let Ok(s) = std::fs::read_to_string(Self::path()) else {
-            return Prefs::default(); // absent file → defaults (first run; nothing to warn about)
-        };
-        let table = toml::from_str::<toml::Table>(&s).ok();
-        // Fast path: a clean whole-struct parse (the overwhelmingly common case).
-        if let Ok(p) = toml::from_str::<Prefs>(&s) {
-            return p;
-        }
-        // Something didn't fit the struct. Re-parse to a raw table and rebuild field-by-field so one
-        // corrupt value can't nuke the rest. If it isn't even valid TOML, fall back to all-defaults —
-        // still WITHOUT touching the file (only `save` writes).
-        match table {
-            Some(table) => Self::from_table_salvaging(&table),
-            None => {
-                eprintln!("neuron: app.toml is not valid TOML; using defaults (file left intact)");
-                Prefs::default()
-            }
-        }
+        <Self as neuron::salvage::SalvageLoad>::load()
     }
 
     /// Rebuild [`Prefs`] from a parsed TOML table, salvaging field by field: each pref that fails to
@@ -490,7 +474,7 @@ impl Prefs {
     /// Persist the prefs back to `app.toml`. Returns a status line.
     pub fn save(&self) -> Result<(), String> {
         let body = toml::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(Self::path(), body).map_err(|e| e.to_string())?;
+        neuron::salvage::atomic_write(&Self::path(), body.as_bytes()).map_err(|e| e.to_string())?;
         PREFS_DIRTY.store(true, Ordering::Release); // invalidate the load_cached() copy
         Ok(())
     }
@@ -553,6 +537,18 @@ impl Prefs {
             Kind::Battery => self.notif_battery,
             Kind::SidePlate => self.notif_side_plate,
         }
+    }
+}
+
+impl neuron::salvage::SalvageLoad for Prefs {
+    const FILE: &'static str = "app.toml";
+    fn path() -> PathBuf {
+        neuron::runroot::run_root().join("app.toml")
+    }
+    fn salvage(table: &toml::Table) -> Self {
+        // the existing field-by-field body (scalars + the per-device lighting map); the shared
+        // provided `load()` wraps it with the fast path and the `.bad` backup-on-degraded-load.
+        Self::from_table_salvaging(table)
     }
 }
 

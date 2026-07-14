@@ -91,7 +91,7 @@ impl Vault {
             .iter()
             .map(|t| (t.name.as_str(), word_distance(query, &t.word, &self.config)))
             .collect();
-        ranked.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        ranked.sort_by(|a, b| a.1.total_cmp(&b.1));
         let (name, score) = ranked.first().map(|(n, s)| (n.to_string(), *s))?;
         Some((name, score, ranked.get(1).map(|(_, s)| *s)))
     }
@@ -104,7 +104,7 @@ impl Vault {
             .iter()
             .map(|t| (t.name.as_str(), word_distance(query, &t.word, &self.config)))
             .collect();
-        ranked.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        ranked.sort_by(|a, b| a.1.total_cmp(&b.1));
 
         let best = ranked.first().map(|(n, s)| (n.to_string(), *s));
         let runner_up = ranked.get(1).map(|(_, s)| *s);

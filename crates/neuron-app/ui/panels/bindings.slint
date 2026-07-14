@@ -1224,12 +1224,19 @@ export component BindingsPanel inherits VerticalLayout {
                         mouse-cursor: MouseCursor.pointer;
                         // a clean slate for a NEW bind: drop any stale captured trigger so the slot
                         // shows "press-to-bind" (the commit button gates on bind-trigger-ready, so a
-                        // leftover capture can't be committed blind).
+                        // leftover capture can't be committed blind). The ACTION side is shared with
+                        // every other picker on this page (edit-in-place, radial, gesture binder), so
+                        // it can't be trusted to already be clean here — force it back to the first
+                        // real choice (index 0 is always a header) so a just-edited/cancelled rule's
+                        // action can never leak into the next fresh bind.
                         clicked => {
                             State.bind-hypershift = (root.view-layer == 1);
                             State.bind-trigger-ready = false;
                             State.bind-trigger-label = "—";
                             State.dup-trigger-note = "";   // fresh slate — no stale clash note
+                            State.action-choice = 1;
+                            State.action-param = "";
+                            State.action-choice-changed();  // refresh the suggestion chips — no stale leftovers
                             root.add-open = true;
                         }
                     }
@@ -1267,9 +1274,12 @@ export component BindingsPanel inherits VerticalLayout {
                     HorizontalLayout {
                         spacing: 8px;
                         SectionTitle { text: "MACRO"; }
-                        // the book button — opens the macro/Workshop guide popup, anchored here
-                        VerticalLayout { alignment: center; GuideButton { guide-id: "macros"; } }
                         VerticalLayout { alignment: center; Mono { text: "a script you bind to a trigger"; color: Theme.text-faint; font-size: Theme.fs-small; } }
+                        // the book button — opens the macro/Workshop guide popup, anchored here.
+                        // Lands after the hint (title, hint, book), mirroring the weave side's GLYPH
+                        // row (title, book) — the book always trails any inline label text, never
+                        // wedged between a title and its own description.
+                        VerticalLayout { alignment: center; GuideButton { guide-id: "macros"; } }
                         Rectangle {}
                         if State.macro-parsing && !State.macro-code-view : Pill { text: "READING"; live: true; }
                         if State.macro-busy : Pill { text: "WORKING"; live: true; }

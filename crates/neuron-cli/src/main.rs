@@ -1059,7 +1059,7 @@ fn profile_cmd(reg: &Registry, action: ProfileCmd) -> Result<()> {
                         app: a.clone(),
                         profile: p.clone(),
                     });
-                    std::fs::write(AppRules::path(), toml::to_string_pretty(&rules)?)?;
+                    rules.save().map_err(|e| anyhow::anyhow!("saving apps.toml: {e}"))?;
                     println!(
                         "rule added: focus '{a}' -> profile '{p}'  ({})",
                         AppRules::path().display()
@@ -1161,7 +1161,7 @@ fn cast_cmd(action: CastCmd) -> Result<()> {
             if CastConfig::path().exists() && !force {
                 bail!("cast.toml already exists (use --force to overwrite)");
             }
-            std::fs::write(CastConfig::path(), neuron::cast::TEMPLATE_TOML)?;
+            neuron::salvage::atomic_write(&CastConfig::path(), neuron::cast::TEMPLATE_TOML.as_bytes())?;
             println!(
                 "wrote {} — record glyphs with `neuron gesture record <name>`, then bind them.",
                 CastConfig::path().display()
@@ -2296,8 +2296,14 @@ fn f_skipped(found: &[neuron::synapse::Found]) -> usize {
 /// rules, and (with --apply) write them to disk. Without --apply it's a dry preview.
 fn import_export_cmd(file: &str, apply: bool) -> Result<()> {
     use std::path::Path;
-    let imported = neuron::import::import_export(Path::new(file))
+    let mut imported = neuron::import::import_export(Path::new(file))
         .with_context(|| format!("importing {file}"))?;
+    // Resolve a blank/whitespace name to "imported" up front so the preview shows the real
+    // landing name a raw blank would otherwise hide (`profiles/.toml`). Filesystem DE-COLLISION is
+    // deliberately deferred to the --apply branch below: a dry preview must not invent a "(2)"
+    // suffix — or fail outright — based on destination state when it writes nothing.
+    imported.profile.name =
+        neuron::profile::Profile::resolve_import_name(&imported.profile.name);
 
     println!("Imported '{}':", imported.profile.name);
     println!("  profile : {}", imported.profile.summary());
@@ -2323,6 +2329,13 @@ fn import_export_cmd(file: &str, apply: bool) -> Result<()> {
         return Ok(());
     }
 
+    // De-collide against profiles already on disk ONLY now that we're actually writing — the SAME
+    // resolution the GUI wizard applies (`Profile::de_collide_import_name`), so `--apply` can never
+    // silently clobber an existing profile (or orphan rules sidecar) whose display name merely
+    // differs from this one but sanitizes to the same file key.
+    imported.profile.name = neuron::profile::Profile::de_collide_import_name(&imported.profile.name)
+        .map_err(|e| anyhow::anyhow!(e))?;
+
     // Write the profile (the settings bundle) and a rules sidecar (the spine Rule set the
     // run-daemon loads). Rules are the engine's serde `Rule`, so they get their own
     // `<name>.rules.toml` next to the profile.
@@ -2346,7 +2359,7 @@ fn import_export_cmd(file: &str, apply: bool) -> Result<()> {
             rules: imported.rules.clone(),
         };
         std::fs::create_dir_all(neuron::profile::profiles_dir()).ok();
-        std::fs::write(&path, toml::to_string_pretty(&doc)?)
+        neuron::salvage::atomic_write(&path, toml::to_string_pretty(&doc)?.as_bytes())
             .with_context(|| format!("writing {}", path.display()))?;
         println!(
             "wrote {} ({} spine rule(s))",
@@ -2360,7 +2373,9 @@ fn import_export_cmd(file: &str, apply: bool) -> Result<()> {
 use neuron::engine::RuleDoc;
 
 fn rules_sidecar_path(name: &str) -> std::path::PathBuf {
-    neuron::profile::profiles_dir().join(format!("{name}.rules.toml"))
+    // Same canonical derivation as the profile file — never the raw name (a separator would aim it
+    // at a nonexistent nested dir; see `Profile::rules_path`).
+    neuron::profile::Profile::rules_path(name)
 }
 
 // ───────────────────────────────────────── macros ────────────────────────────────────────────
@@ -2867,7 +2882,7 @@ fn bind_cmd(action: BindCmd) -> Result<()> {
             if Bindings::path().exists() && !force {
                 bail!("bindings.toml already exists (use --force to overwrite)");
             }
-            std::fs::write(Bindings::path(), neuron::bindings::TEMPLATE_TOML)?;
+            neuron::salvage::atomic_write(&Bindings::path(), neuron::bindings::TEMPLATE_TOML.as_bytes())?;
             println!(
                 "wrote {} — edit it to customize.",
                 Bindings::path().display()
@@ -3576,7 +3591,8 @@ fn load_gui_rules() -> Vec<neuron::engine::Rule> {
 fn save_gui_rules(rules: Vec<neuron::engine::Rule>) -> Result<()> {
     std::fs::create_dir_all(neuron::profile::profiles_dir())?;
     let doc = neuron::engine::RuleDoc { rules };
-    std::fs::write(gui_rules_path(), toml::to_string_pretty(&doc)?)?;
+    let body = toml::to_string_pretty(&doc)?;
+    neuron::salvage::atomic_write(&gui_rules_path(), body.as_bytes())?;
     Ok(())
 }
 

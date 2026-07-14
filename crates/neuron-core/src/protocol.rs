@@ -160,4 +160,100 @@ mod tests {
         assert_eq!(reply_status(&b[..8], 0x04, 0x85), None, "too short to hold offset 8");
         assert_eq!(reply_status(&[], 0x04, 0x85), None, "empty slice");
     }
+
+    /// `to_buf`/`from_buf` must round-trip EVERY field losslessly — not just class/id/data_size
+    /// (already covered by `roundtrip_and_crc`), but status, transaction_id, and the full 80-byte
+    /// args payload at its exact offsets, since a shifted or truncated arg copy would silently
+    /// corrupt device commands.
+    #[test]
+    fn roundtrip_preserves_status_tx_id_and_full_args_payload() {
+        let mut args = [0u8; 80];
+        for (i, b) in args.iter_mut().enumerate() {
+            *b = i as u8; // distinct per-index values so a shift/truncation is detectable
+        }
+        let r = Report {
+            status: 0x02,
+            transaction_id: 0x3F,
+            data_size: 0x50,
+            class: 0x0B,
+            id: 0x85,
+            args,
+        };
+        let buf = r.to_buf();
+        let back = Report::from_buf(&buf);
+        assert_eq!(back.status, r.status);
+        assert_eq!(back.transaction_id, r.transaction_id);
+        assert_eq!(back.data_size, r.data_size);
+        assert_eq!(back.class, r.class);
+        assert_eq!(back.id, r.id);
+        assert_eq!(back.args, r.args);
+        assert_eq!(back.status(), Status::Success);
+    }
+
+    /// The CRC span is documented as buffer bytes `[3..=88]` — which excludes `status` (buf[1])
+    /// and `transaction_id` (buf[2]). Pins that exclusion (corrupting either must NOT desync a
+    /// fresh recompute from the stored checksum) and that a byte genuinely inside the span
+    /// (`class`, buf[7]) IS detectable as corruption — the actual mechanism a receiver would use
+    /// to notice a mangled frame.
+    #[test]
+    fn crc_span_excludes_status_and_transaction_id_but_detects_class_corruption() {
+        let r = Report::command(0x1F, 0x04, 0x85, 0x02);
+        let buf = r.to_buf();
+        let stored_crc = buf[89];
+
+        let mut status_corrupt = buf;
+        status_corrupt[1] ^= 0xFF;
+        assert_eq!(
+            crc(&status_corrupt),
+            stored_crc,
+            "status is outside the checksum span"
+        );
+
+        let mut tx_corrupt = buf;
+        tx_corrupt[2] ^= 0xFF;
+        assert_eq!(
+            crc(&tx_corrupt),
+            stored_crc,
+            "transaction_id is outside the checksum span"
+        );
+
+        let mut class_corrupt = buf;
+        class_corrupt[7] ^= 0xFF;
+        assert_ne!(
+            crc(&class_corrupt),
+            stored_crc,
+            "a corrupted class byte must be detectable against the stored checksum"
+        );
+    }
+
+    /// `Status::from_u8` must map every documented code (New..Unsupported = 0..5) exactly, and
+    /// fall back to `Other(v)` for anything outside that table — including the boundary value
+    /// 255 — rather than panicking or silently aliasing to a known status.
+    #[test]
+    fn status_from_u8_maps_every_known_code_and_falls_back_to_other() {
+        assert_eq!(Status::from_u8(0), Status::New);
+        assert_eq!(Status::from_u8(1), Status::Busy);
+        assert_eq!(Status::from_u8(2), Status::Success);
+        assert_eq!(Status::from_u8(3), Status::Fail);
+        assert_eq!(Status::from_u8(4), Status::Timeout);
+        assert_eq!(Status::from_u8(5), Status::Unsupported);
+        assert_eq!(Status::from_u8(6), Status::Other(6));
+        assert_eq!(Status::from_u8(255), Status::Other(255));
+    }
+
+    /// An all-zero buffer (the boundary/degenerate input — e.g. a device that answers with a
+    /// blank feature report) must decode sanely via `from_buf`: never panic/overflow-index, and
+    /// every field reads back as zero (status 0 == `Status::New`).
+    #[test]
+    fn from_buf_on_all_zero_buffer_decodes_sanely_with_no_panic() {
+        let buf = [0u8; BUF_LEN];
+        let r = Report::from_buf(&buf);
+        assert_eq!(r.status, 0);
+        assert_eq!(r.transaction_id, 0);
+        assert_eq!(r.data_size, 0);
+        assert_eq!(r.class, 0);
+        assert_eq!(r.id, 0);
+        assert_eq!(r.args, [0u8; 80]);
+        assert_eq!(r.status(), Status::New);
+    }
 }

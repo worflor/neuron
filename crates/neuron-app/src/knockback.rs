@@ -502,7 +502,9 @@ mod imp {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let _ = std::fs::write(&path, fam.save());
+        if let Err(e) = neuron::salvage::atomic_write(&path, &fam.save()) {
+            eprintln!("neuron: failed to save familiar state ({e})");
+        }
         overlay.end();
         let g = fam.signals();
         super::post_status(

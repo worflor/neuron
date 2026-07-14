@@ -1023,15 +1023,16 @@ pub fn load_gui_rules() -> Vec<Rule> {
     }
 }
 
-/// Save the GUI-authored spine rules back to the sidecar.
+/// Save the GUI-authored spine rules back to the sidecar. Atomic (temp file + rename) — every add
+/// / edit / delete on the Bindings panel writes here, so a torn write on this path is not a cold
+/// corner case.
 pub fn save_gui_rules(rules: &[Rule]) -> Result<(), String> {
     std::fs::create_dir_all(neuron::profile::profiles_dir()).map_err(|e| e.to_string())?;
     let doc = RuleDoc {
         rules: rules.to_vec(),
     };
     let body = toml::to_string_pretty(&doc).map_err(|e| e.to_string())?;
-    std::fs::write(gui_rules_path(), body).map_err(|e| e.to_string())?;
-    Ok(())
+    neuron::salvage::atomic_write(&gui_rules_path(), body.as_bytes()).map_err(|e| e.to_string())
 }
 
 /// How [`add_gui_rule`] landed: appended fresh, or replaced an existing rule for the same trigger.
@@ -1208,9 +1209,12 @@ pub fn clear_hypershift_hold() -> Result<(), String> {
 
 /// Serialize a [`CastConfig`] back to `cast.toml` (the radial wedges + glyph spells). `CastConfig`
 /// has no `save()` in core, so the editor owns the write — the file format is plain serde TOML.
+/// Goes through the shared `atomic_write` (temp file + rename), not a truncating `std::fs::write`:
+/// `CastConfig::load` now recovers from a malformed file via `SalvageLoad`, and that safeguard is
+/// only worth anything if an interrupted write can't leave a half-written file for it to find.
 pub fn save_cast(cast: &CastConfig) -> Result<(), String> {
     let body = toml::to_string_pretty(cast).map_err(|e| e.to_string())?;
-    std::fs::write(CastConfig::path(), body).map_err(|e| e.to_string())
+    neuron::salvage::atomic_write(&CastConfig::path(), body.as_bytes()).map_err(|e| e.to_string())
 }
 
 /// Set sector `i`'s action in the base OR HyperShift radial (`hyper`), growing the vec as needed,

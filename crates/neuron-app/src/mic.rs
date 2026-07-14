@@ -34,22 +34,6 @@ pub fn refresh(app: &AppWindow) {
     }
 }
 
-/// Set absolute gain (0..100 %). `None` = no capture endpoint / open failed — the gain did NOT
-/// change, and the caller must say so instead of asserting success.
-pub fn set_gain(pct: f32) -> Option<f32> {
-    let (id, _) = endpoint()?;
-    let ctl = VolumeCtl::open(&id)?;
-    ctl.set_volume((pct / 100.0).clamp(0.0, 1.0));
-    Some(pct)
-}
-
-/// Toggle mute, returning the new muted state. `None` = no endpoint (nothing flipped).
-pub fn toggle_mute() -> Option<bool> {
-    let (id, _) = endpoint()?;
-    let ctl = VolumeCtl::open(&id)?;
-    Some(ctl.toggle_mute())
-}
-
 // ── OUTPUT (render) side: headphones / sound card / speakers ────────────────
 
 /// Refresh the output panel from the live render endpoint (the headset / sound-card volume + mute).
@@ -67,19 +51,4 @@ pub fn refresh_output(app: &AppWindow) {
         }
         None => st.set_out_name("(no output device)".into()),
     }
-}
-
-/// Set absolute output volume (0..100 %). `None` = no render endpoint (volume unchanged).
-pub fn set_output_gain(pct: f32) -> Option<f32> {
-    let (id, _) = render_endpoint()?;
-    let ctl = VolumeCtl::open(&id)?;
-    ctl.set_volume((pct / 100.0).clamp(0.0, 1.0));
-    Some(pct)
-}
-
-/// Toggle output mute, returning the new muted state. `None` = no endpoint (nothing flipped).
-pub fn toggle_output_mute() -> Option<bool> {
-    let (id, _) = render_endpoint()?;
-    let ctl = VolumeCtl::open(&id)?;
-    Some(ctl.toggle_mute())
 }

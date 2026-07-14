@@ -1,15 +1,18 @@
 // The GUIDE content registry — the data behind the in-app help popup. Each guide is pure DATA: an id
-// (matched against State.guide-active-id), a title, and a list of sections. A section is a bold heading
-// over a list of BLOCKS, where each block is either PROSE (rendered in quiet sans) or CODE (rendered in
-// a mono code cell, like the editor). The GuidePopup (app.slint) renders the active guide straight off
-// this model, so adding help is data + a dropped GuideButton — never new UI.
+// (matched against State.guide-active-id), a title, and one or more TABS, each its own run of
+// sections. A section is a bold heading over a list of BLOCKS, where each block is either PROSE
+// (rendered in quiet sans) or CODE (rendered in a mono code cell, like the editor). The GuidePopup
+// (app.slint) renders the active guide's active tab straight off this model, so adding help is data +
+// a dropped GuideButton — never new UI. A guide with only one tab never shows the tab dock, so a
+// single-track guide stays exactly as plain as it was before tabs existed.
 //
 // To add a guide: append a GuideEntry below, then drop `GuideButton { guide-id: "<your-id>"; }` next
-// to the relevant header. That's it — the popup, the tooltip<->sticky window, the X, and the scroll
-// all come for free.
+// to the relevant header. That's it — the popup, the tooltip<->sticky window, the tab dock (once a
+// guide has a second tab), the X, and the scroll all come for free.
 
 // One block within a section: a paragraph of prose, OR a snippet of code. `code: true` flips the
-// renderer from sans-prose to a mono code cell. Keep code lines short (~44 chars) so they don't wrap.
+// renderer from sans-prose to a mono code cell. Keep code lines short (~44 chars) so they don't wrap
+// — the cell doesn't wrap long lines, it clips them.
 export struct GuideBlock {
     code: bool,
     text: string,
@@ -21,11 +24,20 @@ export struct GuideSection {
     blocks: [GuideBlock],
 }
 
-// One whole guide — selected by `id`, titled in the popup's title bar, bodied by its sections.
+// One TAB within a guide — its own label plus its own run of sections. Most guides only need one
+// (the popup's tab dock stays hidden whenever a guide has just the one), but a guide that outgrows
+// a single track doesn't need to become two guides — e.g. Workshop keeps its teaching ramp on one
+// tab and a grab-and-go EXAMPLES shelf on another, both under the one book button.
+export struct GuideTab {
+    label: string,
+    sections: [GuideSection],
+}
+
+// One whole guide — selected by `id`, titled in the popup's title bar, bodied by its tabs.
 export struct GuideEntry {
     id: string,
     title: string,
-    sections: [GuideSection],
+    tabs: [GuideTab],
 }
 
 export global GuideContent {
@@ -34,104 +46,190 @@ export global GuideContent {
     // (the librarian pattern), the device verbs, and the no-code / no-limit escape hatches. Every
     // section is a paste-able recipe grounded in the REAL prelude (runtime/host/neuron.py), never
     // engine exposition. The order is the lesson — keep the ramp intact. (ctx.selection is always
-    // None on Windows today — never teach it.)
+    // None on Windows today — never teach it.) The EXAMPLES tab is a separate shelf: no ramp, no
+    // narrative, just recipes worth stealing outright — a mix of everyday-generic and pointedly
+    // specific, so it reads as genuinely useful rather than a second tutorial.
     out property <[GuideEntry]> guides: [
         {
             id: "macros",
             title: "MACROS \u{00b7} WORKSHOP",
-            sections: [
+            tabs: [
                 {
-                    head: "Your first macro",
-                    blocks: [
-                        { code: false, text: "A macro is a Python function. It runs every time you press the control you bind it to." },
-                        { code: true, text: "def macro(ctx):\n    neuron.type_text(\"on my way!\")" },
-                        { code: false, text: "Paste it, bind it on this page, press the key. The Workshop tests disarmed: you see everything a macro would do, but nothing actually types or clicks. You can't break anything while you learn." },
+                    label: "GUIDE",
+                    sections: [
+                        {
+                            head: "Your first macro",
+                            blocks: [
+                                { code: false, text: "A macro is a Python function. It runs every time you press the control you bind it to." },
+                                { code: true, text: "def macro(ctx):\n    neuron.type_text(\"on my way!\")" },
+                                { code: false, text: "Paste it, bind it on this page, press the key. The Workshop tests disarmed: you see everything a macro would do, but nothing actually types or clicks. You can't break anything while you learn." },
+                            ],
+                        },
+                        {
+                            head: "Your second macro: it reacts",
+                            blocks: [
+                                { code: false, text: "ctx is a snapshot of the moment you pressed. Read it and one key behaves differently wherever you are." },
+                                { code: true, text: "def macro(ctx):\n    if \"code\" in ctx.app:    # editor -> toggle a comment\n        neuron.hotkey(\"ctrl\", \"/\")\n    else:                     # anywhere else -> shout whatever you copied\n        s = ctx.clipboard or \"\"\n        neuron.type_text(s.upper())" },
+                                { code: false, text: "You get: ctx.app, ctx.title, ctx.clipboard, and ctx.cwd (the folder, when you're in explorer)." },
+                            ],
+                        },
+                        {
+                            head: "Your third macro: hit an API",
+                            blocks: [
+                                { code: false, text: "The runtime is full CPython with the whole stdlib: urllib, sockets, json, subprocess. Any API you can reach, a keypress can hit." },
+                                { code: true, text: "def macro(ctx):\n    import urllib.request\n    r = urllib.request.urlopen(\n        \"https://wttr.in/?format=%t\")\n    neuron.notify(r.read().decode())" },
+                                { code: false, text: "The weather, on a mouse button. Swap the URL for your CI, your home server, a webhook: notify() puts the answer on screen without stealing focus." },
+                            ],
+                        },
+                        {
+                            head: "The everyday verbs",
+                            blocks: [
+                                { code: false, text: "Most macros are just the keystrokes and clicks you'd rather not do by hand." },
+                                { code: true, text: "neuron.type_text(\"...\")     # type a string\nneuron.hotkey(\"ctrl\", \"s\")  # a chord\nneuron.key(\"enter\")         # one key\nneuron.click(\"right\")       # a mouse click\nneuron.run(\"notepad\")       # run a program" },
+                                { code: false, text: "Also handy: type_ghost (slow, organic typing that lands in chats and games), scroll, mouse_to, key_down / key_up (holds), clipboard_get, clipboard_set, focus(title), sleep(ms). And run(cmd, wait=True) hands back (exit code, stdout), so the shell doubles as a sensor." },
+                            ],
+                        },
+                        {
+                            head: "Ask before acting",
+                            blocks: [
+                                { code: false, text: "A macro can stop and ask you. A small radial appears at the cursor and blocks this macro only, never the rest of your input." },
+                                { code: true, text: "if neuron.ask(\"deploy?\"):\n    ...\npick = neuron.choose(\"profile?\",\n    [\"gaming\", \"work\", \"quiet\"])\nif neuron.confirm(\"wipe disk\"):\n    return   # swipe = stop, ignore = go" },
+                                { code: false, text: "Flick to answer, or ignore it and take the default. confirm is a one-swipe pause: leave it alone and the macro keeps going. Asks work even in SAFE mode, and in the terminal when you run headless." },
+                            ],
+                        },
+                        {
+                            head: "Give it a memory",
+                            blocks: [
+                                { code: false, text: "store and load persist per macro across restarts, atomic on disk. forget() wipes, stored() shows everything. Toggles and counters fall out." },
+                                { code: true, text: "def macro(ctx):             # a DPI toggle\n    on = not neuron.load(\"on\", False)\n    neuron.store(\"on\", on)\n    neuron.dpi(3200 if on else 800)\n    neuron.notify(\"on\" if on else \"off\")" },
+                            ],
+                        },
+                        {
+                            head: "Share state between macros",
+                            blocks: [
+                                { code: false, text: "Each macro's store is its own, so shared state is a macro that owns the data. Siblings invoke() it: kwargs arrive as its options, and its return value comes back." },
+                                { code: true, text: "def macro(ctx):          # counter.py\n    if neuron.option(\"op\") == \"add\":\n        n = neuron.load(\"n\", 0) + 1\n        neuron.store(\"n\", n)\n    return neuron.load(\"n\", 0)" },
+                                { code: true, text: "def macro(ctx):          # anywhere else\n    n = neuron.invoke(\"counter\", op=\"add\")\n    neuron.notify(f\"count: {n}\")" },
+                                { code: false, text: "invoke runs the sibling inline and waits; wait=False queues it and moves on. A failed invoke returns None instead of raising, and nesting stops at 16 deep. Small macros, wired together, is the whole style." },
+                            ],
+                        },
+                        {
+                            head: "Drive the device",
+                            blocks: [
+                                { code: false, text: "When you do want the hardware: a macro drives Neuron exactly like a bound action, same verified writes, same confirmation cards. One press, whole setup:" },
+                                { code: true, text: "def macro(ctx):\n    neuron.profile(\"gaming\")\n    neuron.dpi(1600)\n    neuron.mic_mute(\"off\")" },
+                                { code: false, text: "Writes: dpi, dpi_cycle, scroll_cycle, profile, profile_cycle, brightness, mic_mute, out_mute, mic_gain, out_gain. Reads: battery() (percent + charging), current_dpi(), active_profile(), scroll_stage()." },
+                                { code: false, text: "And signal(channel, value) drives the Signal lighting layer: paint it anywhere on the LIGHTING page, then any script can light it. signal(1, 1.0) when CI breaks, signal(1, 0.0) when it heals; the value picks the colour on the layer's gradient and stays until you change it." },
+                            ],
+                        },
+                        {
+                            head: "Drive OBS, and let OBS drive you",
+                            blocks: [
+                                { code: false, text: "With CONNECTIONS + obs on (SYSTEM page), OBS is bindable with no code at all: the action picker's obs entry does stream, record, pause, replay (\"clip that!\"), scene switches, and input mute from any key, wedge, or gesture. Macros get the same verbs and more: obs_scene(name), obs_stream(), obs_record(), obs_replay(), obs_mute(), and obs_request() for anything else in the obs-websocket API. Reads: obs_scene_name(), obs_streaming(), obs_recording(), obs_connected()." },
+                                { code: false, text: "It runs the other way too. Name a macro on_obs_scene, on_obs_stream, or on_obs_record and Neuron fires it whenever OBS changes that state. Going live can set your profile, your DPI, and your mic in one motion:" },
+                                { code: true, text: "def macro(ctx):          # on_obs_stream.py\n    if neuron.obs_streaming():\n        neuron.profile(\"streaming\")\n        neuron.mic_mute(\"off\")\n    else:\n        neuron.profile(\"default\")" },
+                            ],
+                        },
+                        {
+                            head: "No code, or no limits",
+                            blocks: [
+                                { code: false, text: "Every macro is also a drag-and-drop block tree, for whenever you'd rather skip Python entirely, and it converts back to code without losing anything." },
+                                { code: false, text: "Underneath, it's real CPython running in its own process: import anything, open files and sockets, call Win32 through ctypes, spawn threads, even loop forever as a watcher (a busy macro only ever blocks its own queue). No pip in the bundled runtime: point NEURON_PYTHON at your own interpreter, or sys.path.append a folder. A crash only takes down the sidecar, which respawns; your input never stutters. The helpers respect SAFE mode; raw ctypes is your own rope." },
+                            ],
+                        },
                     ],
                 },
                 {
-                    head: "Your second macro: it reacts",
-                    blocks: [
-                        { code: false, text: "ctx is a snapshot of the moment you pressed. Read it and one key behaves differently wherever you are." },
-                        { code: true, text: "def macro(ctx):\n    # shout whatever you copied\n    s = ctx.clipboard or \"\"\n    neuron.type_text(s.upper())\n\ndef macro(ctx):\n    if \"code\" in ctx.app:    # editor only\n        neuron.hotkey(\"ctrl\", \"/\")" },
-                        { code: false, text: "You get: ctx.app, ctx.title, ctx.clipboard, and ctx.cwd (the folder, when you're in explorer)." },
-                    ],
-                },
-                {
-                    head: "Your third macro: hit an API",
-                    blocks: [
-                        { code: false, text: "The runtime is full CPython with the whole stdlib: urllib, sockets, json, subprocess. Any API you can reach, a keypress can hit." },
-                        { code: true, text: "def macro(ctx):\n    import urllib.request\n    r = urllib.request.urlopen(\n        \"https://wttr.in/?format=%t\")\n    neuron.notify(r.read().decode())" },
-                        { code: false, text: "The weather, on a mouse button. Swap the URL for your CI, your home server, a webhook: notify() puts the answer on screen without stealing focus." },
-                    ],
-                },
-                {
-                    head: "The everyday verbs",
-                    blocks: [
-                        { code: false, text: "Most macros are just the keystrokes and clicks you'd rather not do by hand." },
-                        { code: true, text: "neuron.type_text(\"...\")     # type a string\nneuron.hotkey(\"ctrl\", \"s\")  # a chord\nneuron.key(\"enter\")         # one key\nneuron.click(\"right\")       # a mouse click\nneuron.run(\"notepad\")       # run a program" },
-                        { code: false, text: "Also handy: type_ghost (slow, organic typing that lands in chats and games), scroll, mouse_to, key_down / key_up (holds), clipboard_get, clipboard_set, focus(title), sleep(ms). And run(cmd, wait=True) hands back (exit code, stdout), so the shell doubles as a sensor." },
-                    ],
-                },
-                {
-                    head: "Ask before acting",
-                    blocks: [
-                        { code: false, text: "A macro can stop and ask you. A small radial appears at the cursor and blocks this macro only, never the rest of your input." },
-                        { code: true, text: "if neuron.ask(\"deploy?\"):\n    ...\npick = neuron.choose(\"profile?\",\n    [\"gaming\", \"work\", \"quiet\"])\nif neuron.confirm(\"wipe disk\"):\n    return   # swipe = stop, ignore = go" },
-                        { code: false, text: "Flick to answer, or ignore it and take the default. confirm is a one-swipe pause: leave it alone and the macro keeps going. Asks work even in SAFE mode, and in the terminal when you run headless." },
-                    ],
-                },
-                {
-                    head: "Give it a memory",
-                    blocks: [
-                        { code: false, text: "store and load persist per macro across restarts, atomic on disk. forget() wipes, stored() shows everything. Toggles and counters fall out." },
-                        { code: true, text: "def macro(ctx):             # a DPI toggle\n    on = not neuron.load(\"on\", False)\n    neuron.store(\"on\", on)\n    neuron.dpi(3200 if on else 800)\n    neuron.notify(\"on\" if on else \"off\")" },
-                    ],
-                },
-                {
-                    head: "Share state between macros",
-                    blocks: [
-                        { code: false, text: "Each macro's store is its own, so shared state is a macro that owns the data. Siblings invoke() it: kwargs arrive as its options, and its return value comes back." },
-                        { code: true, text: "def macro(ctx):          # counter.py\n    if neuron.option(\"op\") == \"add\":\n        n = neuron.load(\"n\", 0) + 1\n        neuron.store(\"n\", n)\n    return neuron.load(\"n\", 0)" },
-                        { code: true, text: "def macro(ctx):          # anywhere else\n    n = neuron.invoke(\"counter\", op=\"add\")\n    neuron.notify(f\"count: {n}\")" },
-                        { code: false, text: "invoke runs the sibling inline and waits; wait=False queues it and moves on. A failed invoke returns None instead of raising, and nesting stops at 16 deep. Small macros, wired together, is the whole style." },
-                    ],
-                },
-                {
-                    head: "Drive the device",
-                    blocks: [
-                        { code: false, text: "When you do want the hardware: a macro drives Neuron exactly like a bound action, same verified writes, same confirmation cards. One press, whole setup:" },
-                        { code: true, text: "def macro(ctx):\n    neuron.profile(\"gaming\")\n    neuron.dpi(1600)\n    neuron.mic_mute(\"off\")" },
-                        { code: false, text: "Writes: dpi, dpi_cycle, scroll_cycle, profile, profile_cycle, brightness, mic_mute, out_mute, mic_gain, out_gain. Reads: battery() (percent + charging), current_dpi(), active_profile(), scroll_stage()." },
-                        { code: false, text: "And signal(channel, value) drives the Signal lighting layer: paint it anywhere on the LIGHTING page, then any script can light it. signal(1, 1.0) when CI breaks, signal(1, 0.0) when it heals; the value picks the colour on the layer's gradient and stays until you change it." },
-                    ],
-                },
-                {
-                    head: "Drive OBS, and let OBS drive you",
-                    blocks: [
-                        { code: false, text: "With CONNECTIONS + obs on (SYSTEM page), OBS is bindable with no code at all: the action picker's obs entry does stream, record, pause, replay (\"clip that!\"), scene switches, and input mute from any key, wedge, or gesture. Macros get the same verbs and more: obs_scene(name), obs_stream(), obs_record(), obs_replay(), obs_mute(), and obs_request() for anything else in the obs-websocket API. Reads: obs_scene_name(), obs_streaming(), obs_recording(), obs_connected()." },
-                        { code: false, text: "It runs the other way too. Name a macro on_obs_scene, on_obs_stream, or on_obs_record and Neuron fires it whenever OBS changes that state. Going live can set your profile, your DPI, and your mic in one motion:" },
-                        { code: true, text: "def macro(ctx):          # on_obs_stream.py\n    if neuron.obs_streaming():\n        neuron.profile(\"streaming\")\n        neuron.mic_mute(\"off\")\n    else:\n        neuron.profile(\"default\")" },
-                    ],
-                },
-                {
-                    head: "No code, or no limits",
-                    blocks: [
-                        { code: false, text: "Rather not write Python? Every macro is also a drag-and-drop block tree, and it converts back to code without losing anything." },
-                        { code: false, text: "Need more? It's real CPython in its own process: import anything, open files and sockets, call Win32 through ctypes, spawn threads, even loop forever as a watcher (a busy macro only ever blocks its own queue). No pip in the bundled runtime: point NEURON_PYTHON at your own interpreter, or sys.path.append a folder. A crash only takes down the sidecar, which respawns; your input never stutters. The helpers respect SAFE mode; raw ctypes is your own rope." },
+                    label: "EXAMPLES",
+                    sections: [
+                        {
+                            head: "Clean the clipboard before you paste it",
+                            blocks: [
+                                { code: false, text: "Copied text from a PDF or a chat window drags stray whitespace and line breaks along with it. Strip it once and retype the clean version instead of the mess." },
+                                { code: true, text: "def macro(ctx):\n    s = (ctx.clipboard or \"\").strip()\n    neuron.type_text(\" \".join(s.split()))" },
+                            ],
+                        },
+                        {
+                            head: "A do-not-disturb switch",
+                            blocks: [
+                                { code: false, text: "The same toggle-and-remember shape as the DPI toggle a tab over, aimed at your mic instead. One key for on, the same key for off." },
+                                { code: true, text: "def macro(ctx):\n    on = not neuron.load(\"dnd\", False)\n    neuron.store(\"dnd\", on)\n    neuron.mic_mute(\"on\" if on else \"off\")\n    msg = \"dnd on\" if on else \"dnd off\"\n    neuron.notify(msg)" },
+                            ],
+                        },
+                        {
+                            head: "Peek your repo without leaving the game",
+                            blocks: [
+                                { code: false, text: "run() with wait=True hands back the exit code and the output, so a macro can act as a quick status check instead of just firing a command blind." },
+                                { code: true, text: "def macro(ctx):\n    _, out = neuron.run(\n        \"git status -s\", wait=True)\n    n = len(out.strip().splitlines())\n    msg = f\"{n} dirty\" if n else \"clean\"\n    neuron.notify(msg)" },
+                            ],
+                        },
+                        {
+                            head: "Warn yourself before the battery dies",
+                            blocks: [
+                                { code: false, text: "battery() reads percent and charging state straight off the device, so a macro can watch a wireless mouse without you ever opening a settings page." },
+                                { code: true, text: "def macro(ctx):\n    b = neuron.battery()\n    if b is None:\n        neuron.notify(\"battery unreadable\")\n    elif b[\"percent\"] < 20 and not b[\"charging\"]:\n        neuron.dpi(800)\n        neuron.notify(\"battery low\")\n    else:\n        neuron.notify(f\"{b['percent']}%\")" },
+                            ],
+                        },
+                        {
+                            head: "POST to a webhook, with a body",
+                            blocks: [
+                                { code: false, text: "The weather example a tab over only reads. Sending is the same urllib, just with a body and a Request object standing in for a bare URL. Add a Content-Type header too if the endpoint you're hitting is picky about it." },
+                                { code: true, text: "def macro(ctx):\n    import urllib.request as u, json\n    data = json.dumps({\"ok\": 1}).encode()\n    url = \"https://your-webhook-url\"\n    u.urlopen(u.Request(url, data=data))" },
+                            ],
+                        },
                     ],
                 },
             ],
         },
         {
-            id: "spell-assist",
-            title: "SPELL ASSIST",
-            sections: [
+            id: "spellweaving",
+            title: "SPELLWEAVING \u{00b7} THE HELD-STROKE ENGINE",
+            tabs: [
                 {
-                    head: "What assist does",
-                    blocks: [
-                        { code: false, text: "When you draw a spell, Neuron scores how close your stroke is to each glyph you've taught. Assist is how far past the strict gate a near-miss may sit and still snap to the closest spell." },
-                        { code: false, text: "At 0 (off) only a clean match fires. Nudge it up and a slightly-off stroke still lands — but only when one spell is a clear winner, never when two are close (it won't guess between them)." },
-                        { code: false, text: "Higher is more forgiving, with more chance of the wrong spell. Lower is stricter, with more misses. A cast that only landed because assist helped tells you so." },
+                    label: "GUIDE",
+                    sections: [
+                        {
+                            head: "One trigger, one stroke, two outcomes",
+                            blocks: [
+                                { code: false, text: "Every weave starts the same way: hold the cast trigger and draw. What comes back depends entirely on what you actually drew." },
+                                { code: false, text: "Neuron checks your stroke against the glyphs you've taught first: a shape you've taught always wins over a directional guess, and radial only happens once glyph recognition comes up empty." },
+                                { code: false, text: "Barely move and the hold just cancels, quietly: no message, no cost. Move plenty but nothing matches and no direction reads clean, and you get a fizzle instead, with the status line always saying why." },
+                            ],
+                        },
+                        {
+                            head: "The rich weave: teaching glyphs",
+                            blocks: [
+                                { code: false, text: "Press Record glyph, hold the trigger, and draw. A live \"\u{2248} name \u{00b7} NN%\" readout tracks what your stroke is closest to becoming as you go, so you always know where it's headed. Release, and it lands in the vault unbound, ready to name and bind to any action." },
+                                { code: false, text: "Shift+Record does something else: it captures the same kind of stroke with real timing preserved and writes it to a research file instead of teaching the vault. Reach for it when you want to study your own strokes afterward." },
+                                { code: false, text: "Every glyph in the vault can be renamed, rebound, or deleted on its own, and renaming or deleting cleans up after itself: a binding never points at a shape that's gone. Clear vault wipes shapes and bindings together for the same reason, since a stray leftover binding could silently fire on a name you reuse later." },
+                                { code: false, text: "There's one vault for the whole install, shared across every device and lighting profile, and switching profiles never touches it." },
+                            ],
+                        },
+                        {
+                            head: "The radial: quick flicks",
+                            blocks: [
+                                { code: false, text: "The radial wheel reads the same held stroke as a direction instead of a shape: north is sector 0, counting clockwise from there. WEDGES sets how many slices exist, capped at however many slices your hand can reliably aim between before a flick's natural jitter starts landing on the wrong one." },
+                                { code: false, text: "Click a slice to bind it, the same action picker as everywhere else in this app. Test wheel lets you try the live layout without flicking blind." },
+                                { code: false, text: "HyperShift radial adds a second wheel, same slice count, that takes over only while you're holding the HyperShift layer. Turn it on and a base \u{21c4} HYPER flip appears so you can author both sets from the one wheel. Leave it off and HyperShift falls through to your base wheel, so switching it on never blanks anything out." },
+                            ],
+                        },
+                        {
+                            head: "Assist: how forgiving a near miss is",
+                            blocks: [
+                                { code: false, text: "When you draw, Neuron scores how close your stroke is to each glyph you've taught. Assist is how far past the strict gate a near miss can sit and still snap to the closest one." },
+                                { code: false, text: "At 0 (off), only a clean match fires. Turn it up and a slightly-off stroke can still land, but only when one glyph is a clear winner: if two glyphs are close, it won't guess between them, no matter how high assist is set." },
+                                { code: false, text: "Higher is more forgiving, with more risk of the wrong glyph firing. Lower is stricter, with more misses. A cast that only landed because assist helped says so." },
+                            ],
+                        },
+                        {
+                            head: "Rhythms: more than one gesture on the same key",
+                            blocks: [
+                                { code: false, text: "The whole rhythm map rides one physical trigger: hold always opens the weave, glyph or radial, while tapping first fires a different gesture entirely. tap·hold and 2tap·hold are each their own bindable action, unconnected to anything you draw." },
+                                { code: false, text: "By default tap·hold opens teleport: a mini-map of your real monitors and windows appears at the cursor. Drag a ghost across it and release to warp there, or release on a window to focus it. Scroll while holding to dial through whatever's stacked at that screen point." },
+                                { code: false, text: "2tap·hold starts unbound. Bind it to whiteboard and you get a click-through ink layer over your whole desktop: hold and move to draw, a plain tap undoes your last stroke, tap-tap opens a small tool wheel for pen, highlighter, eraser, colour, and clear. The ink stays on screen after you let go, meant to survive a screen share." },
+                                { code: false, text: "The lone 2tap option on the weave's own row up top works differently: it changes how you open the weave itself. Instead of holding to draw, you double-tap to open it and tap again to close it. Everything else works exactly the same once it's open." },
+                            ],
+                        },
                     ],
                 },
             ],
@@ -139,20 +237,25 @@ export global GuideContent {
         {
             id: "spectrum",
             title: "SPECTRUM \u{00b7} MOTION",
-            sections: [
+            tabs: [
                 {
-                    head: "Stops",
-                    blocks: [
-                        { code: false, text: "A stop is one colour pinned at a spot along the strip. One stop is a solid colour; add more and the colours blend between them into a gradient." },
-                        { code: false, text: "Click a stop to recolour it, drag it to move it, + adds one beside the selected stop, − removes it. The strip is the board's colours, left to right." },
-                    ],
-                },
-                {
-                    head: "Motion",
-                    blocks: [
-                        { code: false, text: "Motion is how those colours move over time:" },
-                        { code: false, text: "HOLD stays still. DRIFT slides the gradient along the board. CYCLE rotates the hues through the wheel. BREATHE fades the whole thing up and down. FLOW is a soft, organic wander." },
-                        { code: false, text: "Speed paces every motion but HOLD. BREATHE adds a depth knob (how far it dims); FLOW adds a chaos knob (how restless the wander)." },
+                    label: "GUIDE",
+                    sections: [
+                        {
+                            head: "Stops",
+                            blocks: [
+                                { code: false, text: "A stop is one colour pinned at a spot along the strip. One stop is a solid colour; add more and the colours blend between them into a gradient." },
+                                { code: false, text: "Click a stop to recolour it, drag it to move it, + adds one beside the selected stop, − removes it. The strip is the board's colours, left to right." },
+                            ],
+                        },
+                        {
+                            head: "Motion",
+                            blocks: [
+                                { code: false, text: "Motion is how those colours move over time:" },
+                                { code: false, text: "HOLD stays still. DRIFT slides the gradient along the board. CYCLE rotates the hues through the wheel. BREATHE fades the whole thing up and down. FLOW is a soft, organic wander." },
+                                { code: false, text: "Speed paces every motion but HOLD. BREATHE adds a depth knob (how far it dims); FLOW adds a chaos knob (how restless the wander)." },
+                            ],
+                        },
                     ],
                 },
             ],

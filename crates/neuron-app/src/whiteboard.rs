@@ -217,7 +217,9 @@ fn board_save(pen: &Pen, presets: &[Pen]) {
         py: park.1,
     };
     if let Ok(body) = toml::to_string_pretty(&doc) {
-        let _ = std::fs::write(board_path(), body);
+        if let Err(e) = neuron::salvage::atomic_write(&board_path(), body.as_bytes()) {
+            eprintln!("neuron: failed to save whiteboard ({e})");
+        }
     }
 }
 

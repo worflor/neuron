@@ -145,20 +145,15 @@ impl Bindings {
         crate::runroot::run_root().join("bindings.toml")
     }
 
-    /// Load from disk, or fall back to the sensible defaults for this user.
+    /// Load from disk, salvaging field-by-field so one malformed binding can't wipe the whole file
+    /// (and never clobbering the user's bytes — see [`crate::salvage::SalvageLoad`]).
     pub fn load() -> Self {
-        match std::fs::read_to_string(Self::path()) {
-            Ok(s) => toml::from_str(&s).unwrap_or_else(|e| {
-                eprintln!("bindings.toml parse error ({e}); using defaults");
-                Self::default_for_user()
-            }),
-            Err(_) => Self::default_for_user(),
-        }
+        <Self as crate::salvage::SalvageLoad>::load()
     }
 
     pub fn save(&self) -> Result<(), String> {
         let s = toml::to_string_pretty(self).unwrap_or_default();
-        std::fs::write(Self::path(), s).map_err(|e| e.to_string())
+        crate::salvage::atomic_write(&Self::path(), s.as_bytes()).map_err(|e| e.to_string())
     }
 
     /// Default bindings. Empty on purpose: the BlackShark knob/mute are hardware-internal
@@ -170,9 +165,52 @@ impl Bindings {
     }
 }
 
+impl crate::salvage::SalvageLoad for Bindings {
+    const FILE: &'static str = "bindings.toml";
+    fn path() -> PathBuf {
+        crate::runroot::run_root().join("bindings.toml")
+    }
+    // A MISSING file seeds the starter set; a present-but-broken one does NOT.
+    fn fallback() -> Self {
+        Self::default_for_user()
+    }
+    fn salvage(table: &toml::Table) -> Self {
+        // The user HAS a file — keep their SURVIVING bindings only (drop the malformed rows), never
+        // resurrect starter bindings alongside them.
+        let mut cfg = Self::default();
+        if let Some(v) = crate::salvage::salvage_vec(table, "bindings", Self::FILE) {
+            cfg.bindings = v;
+        }
+        cfg
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn degraded_bindings_drops_the_bad_entry_and_backs_up() {
+        use crate::salvage::SalvageLoad;
+        let dir = std::env::temp_dir().join(format!("neuron-bindings-degraded-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bindings.toml");
+        // element 1 has a wrong-typed `page`, so the whole-struct parse fails and the salvage path
+        // runs — dropping only the bad row, keeping the good one.
+        std::fs::write(
+            &path,
+            "[[bindings]]\npage = 12\nusage = 233\naction = \"mic-mute\"\n\n\
+             [[bindings]]\npage = \"bad\"\nusage = 234\naction = \"mic-mute\"\n",
+        )
+        .unwrap();
+        let cfg = Bindings::load_from(&path);
+        assert_eq!(cfg.bindings.len(), 1, "malformed binding dropped, the good one kept");
+        assert_eq!(cfg.bindings[0].page, 12);
+        assert_eq!(cfg.bindings[0].usage, 233);
+        assert!(dir.join("bindings.toml.bad").exists(), "original backed up before any save");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn ev(pid: &str, page: u16, usage: u16) -> ControlEvent {
         ControlEvent {

@@ -1386,8 +1386,7 @@ impl AppRuntime {
     }
 
     fn save_app_rules(&self) -> Result<(), String> {
-        let s = toml::to_string_pretty(&self.app_rules).map_err(|e| e.to_string())?;
-        std::fs::write(AppRules::path(), s).map_err(|e| e.to_string())
+        self.app_rules.save()
     }
 
     // ── backup ───────────────────────────────────────────────────────────

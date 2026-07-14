@@ -250,10 +250,10 @@ mod imp {
 
     fn anchor_save() {
         if let Some((x, y)) = unpack(ANCHOR.load(Ordering::SeqCst)) {
-            let _ = std::fs::write(
-                anchor_path(),
-                format!("# where the glance cluster is parked\nx = {x}\ny = {y}\n"),
-            );
+            let body = format!("# where the glance cluster is parked\nx = {x}\ny = {y}\n");
+            if let Err(e) = neuron::salvage::atomic_write(&anchor_path(), body.as_bytes()) {
+                eprintln!("neuron: failed to save glance layout ({e})");
+            }
         }
     }
 

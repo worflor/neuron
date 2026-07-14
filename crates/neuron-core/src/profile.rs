@@ -88,6 +88,75 @@ impl Profile {
         sanitize(name).to_lowercase()
     }
 
+    /// The rules sidecar PAIRED with this profile: the profile's own (sanitized) path with its
+    /// extension swapped to `.rules.toml`. Deriving it from [`path`](Self::path) — the single source
+    /// of truth for a name→file mapping — guarantees the sidecar always sits FLAT beside
+    /// `<sanitized>.toml` and can never diverge from it. Interpolating the RAW name instead (the old
+    /// importer bug) let a name with a path separator, e.g. `"FPS/competitive"`, aim the sidecar at a
+    /// nonexistent nested dir (`profiles/FPS/competitive.rules.toml`) — so the write failed after the
+    /// profile had already been saved, and the daemon (which globs `profiles/*.rules.toml`) would
+    /// never have found it anyway. Every name-derived sidecar path MUST go through here.
+    pub fn rules_path(name: &str) -> PathBuf {
+        Self::path(name).with_extension("rules.toml")
+    }
+
+    /// The ONE place a blank/whitespace-only imported name gets a real name — a blank name
+    /// `sanitize`s to `""`, and `path`/`rules_path` would then happily write a hidden `.toml` /
+    /// `.rules.toml` pair that no profile-listing flow shows and nobody can select. Every importer
+    /// (GUI wizard, CLI `import-export --apply`) MUST resolve through here before calling `save()`
+    /// or deriving a sidecar path, so a blank-named import always lands as the same visible,
+    /// selectable `imported` profile regardless of which front door it came through.
+    pub fn resolve_import_name(name: &str) -> String {
+        let n = name.trim();
+        if n.is_empty() {
+            "imported".to_string()
+        } else {
+            n.to_string()
+        }
+    }
+
+    /// Resolve an import name AND de-collide it against profiles already on disk. Overwriting is only
+    /// legitimate when the existing file IS this profile — i.e. its stored display name matches
+    /// exactly, which makes a re-import (or the idempotent retry after a failed sidecar write) update
+    /// in place. Any other occupant of the same file key — a DIFFERENT display name that merely
+    /// sanitizes to the same stem (see [`file_key`](Self::file_key): "FPS/competitive" vs
+    /// "FPS_competitive", or a case-only variant on Windows' case-insensitive filesystem), or a file
+    /// too corrupt to read a name out of — must NOT be silently replaced: the name gets a " (2)" /
+    /// " (3)" … suffix until it lands on a free key. Every importer (GUI wizard, CLI --apply) MUST
+    /// resolve through here, not just resolve_import_name, before saving.
+    /// No-clobber is now UNCONDITIONAL: exhausting the " (2)".." (99)" search returns an `Err`
+    /// (never falls back to the already-proven-occupied base) — see `de_collide_with`.
+    /// Also guards the rules-only sidecar: an importer that writes an empty profile skips the
+    /// `.toml` write but still writes `.rules.toml` (see migrate.rs / CLI import-export), leaving
+    /// an occupied sidecar with no paired profile file. A sidecar stores no display name, so an
+    /// orphan one can never be verified as "this very import" — it is always RESERVED. Safety over
+    /// convenience: an identical rules-only re-import lands at " (2)" instead of updating in place,
+    /// but another import's bindings can never be silently destroyed. The sidecar check only runs
+    /// when the profile file itself is ABSENT — when it's present with an exact display-name match
+    /// (update-in-place), the paired sidecar belongs to that same profile and the key stays FREE.
+    pub fn de_collide_import_name(name: &str) -> Result<String, String> {
+        let base = Self::resolve_import_name(name);
+        let free = |n: &str| -> bool {
+            let p = Self::path(n);
+            match std::fs::symlink_metadata(&p) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // profile file absent — but a rules-only sidecar may still occupy the key.
+                    match std::fs::symlink_metadata(Self::rules_path(n)) {
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true, // truly absent → free
+                        Err(_) => false, // present-but-uninspectable → RESERVED
+                        Ok(_) => false, // orphan sidecar: no display name to verify → always RESERVED
+                    }
+                }
+                Err(_) => false, // present-but-uninspectable (e.g. permission denied) → RESERVED, never a target
+                Ok(_) => {
+                    // occupied: overwrite is fine ONLY if it's this very profile (exact display-name match).
+                    matches!(Self::load(n), Ok(existing) if existing.name == n)
+                }
+            }
+        };
+        de_collide_with(base, free)
+    }
+
     pub fn load(name: &str) -> anyhow::Result<Profile> {
         let p = Self::path(name);
         let s = std::fs::read_to_string(&p)
@@ -100,7 +169,7 @@ impl Profile {
     pub fn save(&self) -> Result<(), String> {
         std::fs::create_dir_all(profiles_dir()).map_err(|e| e.to_string())?;
         let s = toml::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(Self::path(&self.name), s).map_err(|e| e.to_string())
+        crate::salvage::atomic_write(&Self::path(&self.name), s.as_bytes()).map_err(|e| e.to_string())
     }
 
     /// True if the profile sets nothing (useful guard before save).
@@ -585,11 +654,19 @@ impl AppRules {
     pub fn path() -> PathBuf {
         crate::runroot::run_root().join("apps.toml")
     }
+    /// Load from disk, salvaging rule-by-rule so one malformed rule can't silently drop every
+    /// auto-switch rule (and never clobbering the file — see [`crate::salvage::SalvageLoad`]).
     pub fn load() -> Self {
-        match std::fs::read_to_string(Self::path()) {
-            Ok(s) => toml::from_str(&s).unwrap_or_default(),
-            Err(_) => Self::default(),
-        }
+        <Self as crate::salvage::SalvageLoad>::load()
+    }
+    /// Persist to `apps.toml`, atomically (temp file + rename). The ONE place AppRules is
+    /// serialized and written — every caller (GUI, CLI) goes through here instead of hand-rolling
+    /// its own `toml::to_string_pretty` + write, so a future call site can't reintroduce a
+    /// truncating `std::fs::write` that bypasses the durability `load()`'s `SalvageLoad` recovery
+    /// depends on.
+    pub fn save(&self) -> Result<(), String> {
+        let s = toml::to_string_pretty(self).map_err(|e| e.to_string())?;
+        crate::salvage::atomic_write(&Self::path(), s.as_bytes()).map_err(|e| e.to_string())
     }
     /// The profile to apply for a focused exe name (first matching rule), if any.
     pub fn profile_for(&self, exe: &str) -> Option<&str> {
@@ -598,6 +675,22 @@ impl AppRules {
             .iter()
             .find(|r| e.contains(&r.app.to_lowercase()))
             .map(|r| r.profile.as_str())
+    }
+}
+
+impl crate::salvage::SalvageLoad for AppRules {
+    const FILE: &'static str = "apps.toml";
+    fn path() -> PathBuf {
+        crate::runroot::run_root().join("apps.toml")
+    }
+    fn salvage(table: &toml::Table) -> Self {
+        // Keep every rule that still parses (drop only the malformed ones) instead of silently
+        // discarding EVERY auto-switch rule on one bad entry.
+        let mut cfg = Self::default();
+        if let Some(v) = crate::salvage::salvage_vec(table, "rules", Self::FILE) {
+            cfg.rules = v;
+        }
+        cfg
     }
 }
 
@@ -611,6 +704,30 @@ pub const APPS_TEMPLATE: &str = r#"# App-aware profile auto-switch. `neuron run`
 # app = "chrome"
 # profile = "chill"
 "#;
+
+/// The search core behind [`Profile::de_collide_import_name`], factored out so the suffix logic
+/// can be unit-tested against a fake `free` predicate instead of real filesystem occupancy.
+/// Tries `base`, then `"{base} (2)"..="{base} (99)"`; the first name `free` accepts wins. Never
+/// falls back to `base` on exhaustion — that would silently overwrite a proven-occupied file — an
+/// `Err` is returned instead.
+fn de_collide_with(base: String, free: impl Fn(&str) -> bool) -> Result<String, String> {
+    if free(&base) {
+        return Ok(base);
+    }
+    for i in 2..=99 {
+        let alt = format!("{base} ({i})");
+        if free(&alt) {
+            eprintln!(
+                "neuron: import '{base}' collides with an existing profile's file; importing as '{alt}' instead"
+            );
+            return Ok(alt);
+        }
+    }
+    Err(format!(
+        "import '{base}': 98 name collisions deep — refusing to overwrite an existing profile; \
+         rename the import or clean up profiles/"
+    ))
+}
 
 fn sanitize(name: &str) -> String {
     name.chars()
@@ -627,6 +744,28 @@ fn sanitize(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn degraded_apprules_drops_the_bad_rule_and_keeps_the_rest() {
+        use crate::salvage::SalvageLoad;
+        let dir = std::env::temp_dir().join(format!("neuron-apps-degraded-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("apps.toml");
+        // rule 1's `profile` is the wrong type — the whole parse fails, salvage drops only that rule.
+        std::fs::write(
+            &path,
+            "[[rules]]\napp = \"valorant\"\nprofile = \"fps\"\n\n\
+             [[rules]]\napp = \"chrome\"\nprofile = 123\n",
+        )
+        .unwrap();
+        let cfg = AppRules::load_from(&path);
+        assert_eq!(cfg.rules.len(), 1, "the malformed rule dropped, the good one kept");
+        assert_eq!(cfg.rules[0].app, "valorant");
+        assert_eq!(cfg.rules[0].profile, "fps");
+        assert!(dir.join("apps.toml.bad").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn cycle_index_steps_from_current_with_wraparound() {
@@ -805,6 +944,31 @@ mod tests {
     }
 
     #[test]
+    fn resolve_import_name_falls_back_on_blank_or_whitespace() {
+        // The root guard every importer (GUI wizard, CLI import-export --apply) MUST resolve
+        // through: a blank name sanitizes to "" and would otherwise write a hidden `.toml` /
+        // `.rules.toml` pair no profile-listing flow shows.
+        assert_eq!(Profile::resolve_import_name(""), "imported");
+        assert_eq!(Profile::resolve_import_name("   "), "imported");
+        assert_eq!(Profile::resolve_import_name("\t\n"), "imported");
+        // a real name passes through untouched (just trimmed) — this isn't a blanket rename.
+        assert_eq!(Profile::resolve_import_name("Valorant"), "Valorant");
+        assert_eq!(Profile::resolve_import_name("  Valorant  "), "Valorant");
+    }
+
+    #[test]
+    fn rules_path_pairs_with_the_sanitized_profile_path_and_stays_flat() {
+        // A name with a path separator that sanitize() maps to '_'. The sidecar must share the
+        // profile's sanitized stem AND its directory (flat — never a nested `profiles/FPS/…`).
+        let name = "FPS/competitive";
+        let prof = Profile::path(name);
+        let rules = Profile::rules_path(name);
+        assert_eq!(prof.parent(), rules.parent(), "sidecar must sit flat beside the profile");
+        assert_eq!(prof.file_name().unwrap(), "FPS_competitive.toml");
+        assert_eq!(rules.file_name().unwrap(), "FPS_competitive.rules.toml");
+    }
+
+    #[test]
     fn new_fields_round_trip() {
         // The advanced-import + native fields: idle, in-game polling pair, all four gaming toggles.
         let p = Profile {
@@ -980,6 +1144,132 @@ persist = false
             !mentions_plain_dpi || mentions_stages,
             "must not also take the single-dpi path"
         );
+    }
+
+    #[test]
+    fn import_decollides_a_sanitized_name_collision() {
+        let _g = crate::runroot::ENV_LOCK.lock().unwrap();
+        let prev = std::env::var_os("NEURON_RUN_DIR");
+        let tmp = std::env::temp_dir().join(format!("neuron_profile_decollide_{}", std::process::id()));
+        std::env::set_var("NEURON_RUN_DIR", &tmp);
+
+        Profile {
+            name: "FPS_competitive".into(),
+            dpi: Some(800),
+            ..Default::default()
+        }
+        .save()
+        .unwrap();
+        assert_eq!(
+            Profile::de_collide_import_name("FPS/competitive").unwrap(),
+            "FPS/competitive (2)"
+        );
+
+        match prev {
+            Some(v) => std::env::set_var("NEURON_RUN_DIR", v),
+            None => std::env::remove_var("NEURON_RUN_DIR"),
+        }
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn import_same_display_name_updates_in_place() {
+        let _g = crate::runroot::ENV_LOCK.lock().unwrap();
+        let prev = std::env::var_os("NEURON_RUN_DIR");
+        let tmp = std::env::temp_dir().join(format!("neuron_profile_decollide_same_{}", std::process::id()));
+        std::env::set_var("NEURON_RUN_DIR", &tmp);
+
+        Profile {
+            name: "Valorant".into(),
+            dpi: Some(800),
+            ..Default::default()
+        }
+        .save()
+        .unwrap();
+        assert_eq!(Profile::de_collide_import_name("Valorant").unwrap(), "Valorant");
+
+        match prev {
+            Some(v) => std::env::set_var("NEURON_RUN_DIR", v),
+            None => std::env::remove_var("NEURON_RUN_DIR"),
+        }
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn orphan_rules_sidecar_reserves_the_key() {
+        let _g = crate::runroot::ENV_LOCK.lock().unwrap();
+        let prev = std::env::var_os("NEURON_RUN_DIR");
+        let tmp = std::env::temp_dir().join(format!("neuron_profile_decollide_orphan_{}", std::process::id()));
+        std::env::set_var("NEURON_RUN_DIR", &tmp);
+
+        std::fs::create_dir_all(crate::profile::profiles_dir()).unwrap();
+        std::fs::write(Profile::rules_path("FPS_competitive"), b"# rules only\n").unwrap();
+        assert_eq!(
+            Profile::de_collide_import_name("FPS/competitive").unwrap(),
+            "FPS/competitive (2)"
+        );
+
+        match prev {
+            Some(v) => std::env::set_var("NEURON_RUN_DIR", v),
+            None => std::env::remove_var("NEURON_RUN_DIR"),
+        }
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn same_profile_with_sidecar_still_updates_in_place() {
+        let _g = crate::runroot::ENV_LOCK.lock().unwrap();
+        let prev = std::env::var_os("NEURON_RUN_DIR");
+        let tmp = std::env::temp_dir().join(format!("neuron_profile_decollide_same_sidecar_{}", std::process::id()));
+        std::env::set_var("NEURON_RUN_DIR", &tmp);
+
+        Profile {
+            name: "Valorant".into(),
+            dpi: Some(800),
+            ..Default::default()
+        }
+        .save()
+        .unwrap();
+        std::fs::write(Profile::rules_path("Valorant"), b"# rules\n").unwrap();
+        assert_eq!(Profile::de_collide_import_name("Valorant").unwrap(), "Valorant");
+
+        match prev {
+            Some(v) => std::env::set_var("NEURON_RUN_DIR", v),
+            None => std::env::remove_var("NEURON_RUN_DIR"),
+        }
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn blank_name_still_resolves_to_imported() {
+        let _g = crate::runroot::ENV_LOCK.lock().unwrap();
+        let prev = std::env::var_os("NEURON_RUN_DIR");
+        let tmp = std::env::temp_dir().join(format!("neuron_profile_decollide_blank_{}", std::process::id()));
+        std::env::set_var("NEURON_RUN_DIR", &tmp);
+
+        assert_eq!(Profile::de_collide_import_name("  ").unwrap(), "imported");
+
+        match prev {
+            Some(v) => std::env::set_var("NEURON_RUN_DIR", v),
+            None => std::env::remove_var("NEURON_RUN_DIR"),
+        }
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn de_collide_with_exhaustion_errors_instead_of_overwriting() {
+        // every candidate is occupied — must never fall back to the (proven-occupied) base.
+        let r = de_collide_with("dupe".to_string(), |_| false);
+        assert!(r.is_err(), "exhaustion must error, not silently overwrite");
+        let msg = r.unwrap_err();
+        assert!(msg.contains("dupe"), "error names the base: {msg}");
+    }
+
+    #[test]
+    fn de_collide_with_picks_first_free_suffix() {
+        // base and " (2)" taken, " (3)" free.
+        let free = |n: &str| n == "dupe (3)";
+        assert_eq!(de_collide_with("dupe".to_string(), free).unwrap(), "dupe (3)");
     }
 
     #[test]

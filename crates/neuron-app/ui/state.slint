@@ -76,6 +76,7 @@ export global State {
     // new guide = add data + drop a GuideButton (no new wiring). The popup lives at the window root.
     in-out property <bool> guide-open: false;        // the popup is showing
     in-out property <string> guide-active-id;        // which guide (matches a GuideContent.guides[].id)
+    in-out property <int> guide-active-tab: 0;       // which tab of that guide (reset to 0 on open)
     in-out property <bool> guide-sticky: false;      // false = tooltip (click-away closes) · true = pinned window
     in-out property <length> guide-x;                // popup top-left (the popup clamps it on-screen)
     in-out property <length> guide-y;
@@ -542,6 +543,11 @@ export global State {
     // the ACTIVATION RHYTHM on that trigger — a feel::Phrase ("hold", "tap hold", "tap tap", …).
     // Presets cover the sane ones; record-activation captures YOUR rhythm and normalizes it.
     in-out property <string> activation-pattern: "hold";
+    // the ENGINE's effective taps-then-hold count for the weave's OWN activation phrase (mirrors
+    // CastConfig::phrase().taps_then_hold().unwrap_or(0) — a non-hold-terminated phrase like
+    // "tap tap" degrades to 0). This is NOT the SplitToggle preset's widget index; use it (not
+    // activation-idx) whenever a rhythm row needs to know if the weave's own trigger now shadows it.
+    in-out property <int> weave-taps;
     in-out property <string> activation-display: "▬";   // the rhythm as symbols (● tap · ▬ hold · ↔ toggle)
     in-out property <bool> recording-activation: false;
     callback set-activation(string);

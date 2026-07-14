@@ -37,6 +37,20 @@ export component SpellweavingPanel inherits VerticalLayout {
     property <int> activation-idx: State.activation-pattern == "hold" ? 0
         : State.activation-pattern == "tap hold" ? 1
         : State.activation-pattern == "tap tap hold" ? 2 : 3;
+    // local mirror of State.weave-taps — `changed` can only attach to a property owned by this
+    // component, not a global's property directly.
+    property <int> weave-taps: State.weave-taps;
+    // An activation pattern always owns its tap-count. If it changes to the rhythm
+    // currently being edited, close that editor as the row becomes shadowed; leaving
+    // the target behind would make a disabled row retain live binding actions.
+    // Compared against State.weave-taps (the ENGINE's own tap count for this phrase), NOT
+    // activation-idx (the SplitToggle preset's widget index) — those only coincidentally agree
+    // for presets 0/1/2; preset 3 ("tap tap") is a non-hold phrase whose engine tap count is 0.
+    changed weave-taps => {
+        if (State.rhythm-bind-target == State.weave-taps) {
+            State.rhythm-bind-target = -1;
+        }
+    }
 
     // the INPUT head — the shared InputHead, so the DIRECT⇄WEAVE segment lives ONCE and is
     // guaranteed to match the DIRECT depth instead of being kept byte-identical by hand.
@@ -146,8 +160,15 @@ export component SpellweavingPanel inherits VerticalLayout {
             // each NON-weave rhythm is a first-class Trigger::Cast bound to any Action — remappable
             // here, inline (click a row → an ActionPicker drops beneath it, just like the glyphs).
             // The defaults (tap·hold → teleport) are seeded from cast.toml's rhythm_actions.
-            for rb in State.rhythm-binds : VerticalLayout {
+            for rb in State.rhythm-binds : rbrow := VerticalLayout {
                 spacing: 6px;
+                // the main weave's own hold pattern always wins the trigger — if it now lands on the
+                // same tap-count as this rhythm, this row can never fire. Read it the same way the
+                // rest of the app reads "dead right now": grayed out + inert (SelectableRow's
+                // `enabled: false`), not a separate warning affordance. Compared against the ENGINE's
+                // tap count (State.weave-taps), not the SplitToggle preset's widget index — a non-hold
+                // preset like "tap tap" (index 3) has engine tap count 0, so it shadows NO row.
+                property <bool> shadowed: State.weave-taps == rb.taps;
                 // the shared pick-one SelectableRow: the rhythm symbols ride the leading tag, the bound
                 // action is the label, and a teleport/whiteboard rhythm keeps its TRY key in the
                 // trailing slot. `two-line` holds the taller control-row height (the folded rhythm-row-h).
@@ -155,10 +176,11 @@ export component SpellweavingPanel inherits VerticalLayout {
                     lead: rb.label;
                     label: rb.bound ? rb.desc : "unbound · click to bind";
                     selected: State.rhythm-bind-target == rb.taps;
+                    enabled: !rbrow.shadowed;
                     two-line: true;
                     clicked => { if (State.rhythm-bind-target == rb.taps) { State.rhythm-bind-target = -1; } else { State.bind-rhythm(rb.taps); } }
-                    if rb.desc == "teleport" : VerticalLayout { alignment: center; Button { text: "try"; clicked => { State.try-teleport(); } } }
-                    if rb.desc == "whiteboard" : VerticalLayout { alignment: center; Button { text: "try"; clicked => { State.try-whiteboard(); } } }
+                    if rb.desc == "teleport" : VerticalLayout { alignment: center; Button { text: "try"; enabled: !rbrow.shadowed; clicked => { State.try-teleport(); } } }
+                    if rb.desc == "whiteboard" : VerticalLayout { alignment: center; Button { text: "try"; enabled: !rbrow.shadowed; clicked => { State.try-whiteboard(); } } }
                 }
                 // INLINE editor — opens beneath THIS rhythm's row when it's the selected target.
                 if State.rhythm-bind-target == rb.taps : Card {
@@ -213,7 +235,15 @@ export component SpellweavingPanel inherits VerticalLayout {
             min-width: parent.width - 380px - Theme.gap-col;
             max-width: parent.width - 380px - Theme.gap-col;
             spacing: Theme.gap;
-            SectionTitle { text: "GLYPH · the rich weave"; }
+            HorizontalLayout {
+                spacing: 8px;
+                SectionTitle { text: "GLYPH · the rich weave"; }
+                // the book button — opens the whole-engine spellweaving guide (rich, radial, the
+                // vault, assist, rhythms). Lives here, at the top of the weave, rather than tucked
+                // beside one slider further down — it's about the feature, not just ASSIST.
+                VerticalLayout { alignment: center; GuideButton { guide-id: "spellweaving"; } }
+                Rectangle {}
+            }
             canvas := Rectangle {
                 // RICH MODE skin: a faint amber wash + a lit border, so the surface itself reads as
                 // "research capture → file" the moment a rich stroke begins — not a plain recording.
@@ -461,8 +491,6 @@ export component SpellweavingPanel inherits VerticalLayout {
                 // near-miss snaps to the closest spell, clear-winner only). Casts show "(assist)" when it
                 // helped. The engine's `assist` margin IS this slider — a bool would throw the dimension out.
                 VerticalLayout { alignment: center; horizontal-stretch: 0; Mono { text: "ASSIST"; color: Theme.text-dim; } }
-                // the book button — opens the SPELL ASSIST guide (what the forgiveness margin does)
-                VerticalLayout { alignment: center; GuideButton { guide-id: "spell-assist"; } }
                 VerticalLayout {
                     alignment: center;
                     width: 104px;

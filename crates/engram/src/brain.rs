@@ -381,7 +381,7 @@ impl Brain {
             nn_dists.push(best);
         }
 
-        nn_dists.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        nn_dists.sort_by(|a, b| a.total_cmp(b));
         let typical_gap = if nn_dists.len() % 2 == 0 {
             (nn_dists[nn_dists.len() / 2 - 1] + nn_dists[nn_dists.len() / 2]) / 2.0
         } else {

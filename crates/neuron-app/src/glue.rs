@@ -198,7 +198,7 @@ impl TileProfAcc {
             .iter()
             .map(|(&k, &g)| (k, g / n, self.prev.get(k).copied().unwrap_or(0.0) / n))
             .collect();
-        rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        rows.sort_by(|a, b| b.1.total_cmp(&a.1));
         for (slug, g, p) in rows {
             eprintln!("PROF:   tile={slug:<12} gen_us={g:>8.1} preview_us={p:>6.1}");
         }
@@ -2908,9 +2908,11 @@ pub fn install(app: &AppWindow) -> SharedRt {
                         st.set_bind_trigger_ready(false);
                         st.set_bind_trigger_label("—".into());
                         st.set_dup_trigger_note("".into());
-                        // leave the flow clean for the next author.
-                        st.set_action_choice(0);
+                        // leave the flow clean for the next author. Index 0 is always a group header
+                        // (never a real choice — see init_action_palette), so land on 1 instead.
+                        st.set_action_choice(1);
                         st.set_action_param("".into());
+                        refresh_param_suggestions(&st);
                         st.set_status_line(
                             match outcome {
                                 crate::editor::AddOutcome::Added(n) => {
@@ -4707,6 +4709,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                     return;
                 }
                 st.set_guide_active_id(id);
+                st.set_guide_active_tab(0); // always opens on the first tab
                 st.set_guide_sticky(false); // opens as a click-away tooltip
                 st.set_guide_x(ax); // anchored at the button; the popup clamps on-screen
                 st.set_guide_y(ay);
@@ -8880,10 +8883,17 @@ fn phrase_symbols(pattern: &str) -> String {
     out.join(" ")
 }
 
-/// Push an activation pattern into both view properties (the raw string + the symbol readout).
+/// Push an activation pattern into all its view properties (the raw string, the symbol readout,
+/// and the engine's own tap count for that phrase). `weave-taps` is derived the SAME way the
+/// engine derives it in `CastConfig::mode_slots` (`phrase().taps_then_hold().unwrap_or(0)`) so a
+/// non-hold-terminated phrase (e.g. "tap tap") reports 0, exactly like the engine — never the
+/// SplitToggle's preset INDEX, which only coincidentally lines up for presets 0/1/2.
 fn sync_activation_view(st: &State, pattern: &str) {
     st.set_activation_pattern(pattern.into());
     st.set_activation_display(phrase_symbols(pattern).into());
+    let phrase =
+        neuron::feel::Phrase::parse(pattern).unwrap_or_else(|_| neuron::feel::Phrase::hold());
+    st.set_weave_taps(phrase.taps_then_hold().unwrap_or(0) as i32);
 }
 
 /// Set true to ABORT an in-flight weave capture (glyph recorder or radial preview) — the capture

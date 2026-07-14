@@ -615,9 +615,17 @@ export component AppWindow inherits Window {
                         // nothing to scroll (the wheel fell through to the page). A VerticalLayout adopts
                         // the section block's REAL height, so the popup scrolls when the guide is long.
                         for g in GuideContent.guides : VerticalLayout {
-                            if g.id == State.guide-active-id : VerticalLayout {
+                            // `g.tabs.length > 0` isn't decorative: every guide today ships at
+                            // least one tab, but `g.tabs[tab-idx]` below would index an empty
+                            // array the moment that stops being true — this keeps a future
+                            // data-only guide entry that forgets a tab from being a panic instead
+                            // of just an empty popup.
+                            if g.id == State.guide-active-id && g.tabs.length > 0 : activetab := VerticalLayout {
                                 spacing: 18px;
-                                for s in g.sections : VerticalLayout {
+                                // the tab this guide is showing, clamped in case a stale index ever
+                                // outlives its guide (guide-toggle already resets it to 0 on open).
+                                property <int> tab-idx: clamp(State.guide-active-tab, 0, g.tabs.length - 1);
+                                for s in g.tabs[activetab.tab-idx].sections : VerticalLayout {
                                     spacing: 8px;
                                     // the section legend — SectionTitle in accent, kept at the guide's
                                     // own body size + track-1 so the copy stays byte-identical.
@@ -728,6 +736,80 @@ export component AppWindow inherits Window {
                                             }
                                         }
                                     }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // ── TAB DOCK — a genuinely FLOATING island, absolutely overlaid on the card instead of
+            // living in its own reserved footer row. The old reserved strip read as a permanent black
+            // chin under the guide even when nothing needed it; this way the body keeps the card's
+            // full height (the scrollable content runs right underneath, and the last inch of a long
+            // guide simply scrolls in behind the pill) and the pill only ever costs the screen space
+            // it actually occupies. Surfaces only when this guide has more than one tab.
+            for g in GuideContent.guides : Rectangle {
+                if g.id == State.guide-active-id && g.tabs.length > 1 : HorizontalLayout {
+                    x: 0;
+                    y: gcard.height - self.height - 10px;
+                    width: gcard.width;
+                    height: 30px;
+                    alignment: center;
+                    // the pill itself: fixed-width cells (the labels are short curated words, not
+                    // arbitrary text), so the active mark can glide as ONE piece between them by
+                    // simple arithmetic instead of measuring neighbours. A soft drop-shadow lifts it
+                    // off whatever's scrolling underneath instead of reading flush with the card.
+                    dock := Rectangle {
+                        property <length> cell-w: 80px;
+                        property <int> tab-idx: clamp(State.guide-active-tab, 0, g.tabs.length - 1);
+                        height: 30px;
+                        width: dock.cell-w * g.tabs.length;
+                        border-radius: self.height / 2;
+                        // a hair short of opaque — enough that a scrolling line of code underneath
+                        // never fights the tab labels for legibility, but still a whisper glassy
+                        // rather than a flat opaque slab pretending it isn't floating over content.
+                        background: Theme.bg-2.with-alpha(0.94);
+                        border-width: Theme.hair;
+                        border-color: Theme.line;
+                        drop-shadow-color: Theme.bg.with-alpha(0.8);
+                        drop-shadow-blur: 16px;
+                        drop-shadow-offset-y: 4px;
+                        // the MARK — one capsule that glides + settles under the active label, instead
+                        // of N cells each independently cross-fading their own fill (which read as a
+                        // static swap, not a slide). Inset 4px on every side — clear of the dock's own
+                        // rounded ends, so the two radii never collide into a mismatched-corner seam.
+                        mark := Rectangle {
+                            y: 4px;
+                            height: dock.height - 8px;
+                            width: dock.cell-w - 8px;
+                            x: dock.tab-idx * dock.cell-w + 4px;
+                            border-radius: self.height / 2;
+                            background: Theme.accent-glow;
+                            border-width: Theme.hair;
+                            border-color: Theme.accent-line;
+                            // a decisive glide that settles without overshoot (the app's motion rule:
+                            // mechanical, not bouncy) — quick departure, soft arrival.
+                            animate x { duration: 260ms; easing: cubic-bezier(0.22, 1, 0.36, 1); }
+                        }
+                        HorizontalLayout {
+                            for t[i] in g.tabs : cell := Rectangle {
+                                property <bool> on: dock.tab-idx == i;
+                                width: dock.cell-w;
+                                Text {
+                                    text: t.label;
+                                    x: (parent.width - self.width) / 2;
+                                    y: (parent.height - self.height) / 2;
+                                    color: cell.on ? Theme.accent
+                                        : (tabta.has-hover ? Theme.text-mid : Theme.text-dim);
+                                    font-family: Theme.mono;
+                                    font-size: Theme.fs-small;
+                                    font-weight: 700;
+                                    letter-spacing: Theme.track-2;
+                                    animate color { duration: Theme.quick; }
+                                }
+                                tabta := TouchArea {
+                                    mouse-cursor: MouseCursor.pointer;
+                                    clicked => { State.guide-active-tab = i; }
                                 }
                             }
                         }
