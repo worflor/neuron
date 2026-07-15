@@ -78,6 +78,14 @@ impl HostLock {
 /// the status card reads who's connected without asking the sockets anything.
 type OrgbRoster = Arc<Mutex<HashMap<u64, (crate::arbiter::SourceId, String)>>>;
 
+/// Bound on [`OrgbServer`]'s teardown (see its `Drop`). Derived from the accept loop's
+/// stop-check cadence (nonblocking `accept` polled every ≤50ms) plus a connection thread's
+/// worst case (a 100ms read timeout and — since the write-timeout fix below — a 500ms write
+/// timeout), with margin for the accept thread's own connection-reaping join. Connection
+/// threads race toward exit concurrently with the accept thread, so this is NOT additive across
+/// however many clients are connected.
+const ORGB_SERVER_DROP_DEADLINE: Duration = Duration::from_millis(1000);
+
 /// A running OpenRGB TCP server. Dropping it stops the accept loop, joins
 /// every connection thread, and thereby releases every client's claims.
 pub struct OrgbServer {
@@ -144,7 +152,7 @@ impl Drop for OrgbServer {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(t) = self.accept.take() {
-            let _ = t.join();
+            crate::worker::join_bounded(t, ORGB_SERVER_DROP_DEADLINE, "neuron-orgb-accept");
         }
     }
 }
@@ -196,9 +204,14 @@ fn serve_conn(
     policy: Arc<PaintPolicy>,
 ) {
     // Blocking reads with a short timeout so the stop flag is honored within
-    // ~100ms without a busy loop.
+    // ~100ms without a busy loop. The write side needs its own bound: a client that stops
+    // draining its receive buffer (connected but never reading) would otherwise let
+    // `write_all` below block this thread forever — the stop flag is never rechecked mid-write.
+    // 500ms is generous for any real local client and keeps the connection's worst-case exit
+    // inside `ORGB_SERVER_DROP_DEADLINE`.
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
     let _ = stream.set_nodelay(true);
     let mut conn = OrgbConn::new(&mut handle, policy);
     // On the roster from the first byte (named "" until SET_CLIENT_NAME) — a
@@ -280,6 +293,11 @@ fn serve_conn(
 /// is NOT a TCP connection (games may reconnect per request) — lifecycle is
 /// the 15s heartbeat lease inside the state machine, so this pump has no
 /// disconnect duty at all; it only moves requests and responses.
+/// Bound on [`ChromaHttpServer`]'s teardown — same reasoning as [`ORGB_SERVER_DROP_DEADLINE`]
+/// (nonblocking accept polled ≤50ms, connections bounded by a 100ms read timeout plus a 500ms
+/// write timeout).
+const CHROMA_SERVER_DROP_DEADLINE: Duration = Duration::from_millis(1000);
+
 pub struct ChromaHttpServer {
     stop: Arc<AtomicBool>,
     accept: Option<thread::JoinHandle<()>>,
@@ -337,7 +355,7 @@ impl Drop for ChromaHttpServer {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(t) = self.accept.take() {
-            let _ = t.join();
+            crate::worker::join_bounded(t, CHROMA_SERVER_DROP_DEADLINE, "neuron-chroma-accept");
         }
     }
 }
@@ -379,8 +397,12 @@ fn serve_chroma_conn(
     server: Arc<Mutex<ChromaServer>>,
     stop: Arc<AtomicBool>,
 ) {
+    // Same read/write bounding as the OpenRGB pump (see `serve_conn`): the read timeout keeps
+    // the stop flag honored between requests, and the write timeout keeps `write_http_response`
+    // below from blocking forever on a client that stopped draining its receive buffer.
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
     let _ = stream.set_nodelay(true);
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 8192];
@@ -511,6 +533,17 @@ pub enum ObsCmd {
     Resync,
 }
 
+/// Bound on [`ObsConnection`]'s teardown. `WsStream::connect`'s handshake and every frame send
+/// now carry a 750ms read/write timeout each (see `ws.rs`), and `sleep_interruptible`'s backoff
+/// already rechecks `stop` every 100ms — so most of `obs_run`/`obs_session` is bounded well under
+/// a second. The one residual gap: `WsStream::poll` intentionally reads the REST of an
+/// already-started frame with no timeout (documented in `ws.rs`, so a slow network can't split a
+/// frame across an idle timeout) — a peer that starts a frame and then goes silent mid-frame
+/// would still stall this thread past 750ms. That pathological case is exactly what the
+/// `join_bounded` backstop exists for, hence the generous margin here rather than trying to prove
+/// a tighter bound.
+const OBS_CONNECTION_DROP_DEADLINE: Duration = Duration::from_millis(1500);
+
 /// A running OBS connection: a background thread that connects (with backoff),
 /// authenticates, publishes events to the bus, and services commands. Dropping
 /// it stops the thread. Cloneable [`ObsControl`] is how callers send commands.
@@ -594,7 +627,7 @@ impl Drop for ObsConnection {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(t) = self.thread.take() {
-            let _ = t.join();
+            crate::worker::join_bounded(t, OBS_CONNECTION_DROP_DEADLINE, "neuron-obs");
         }
         self.connected.store(false, Ordering::Relaxed);
         // Correct the retained truth: whatever we last said, we're down now.
@@ -967,6 +1000,81 @@ mod tests {
             ),
             "HTTP-driven paint must reach the arbiter"
         );
+    }
+
+    /// Drop `value` on a background thread and wait for THAT thread with our own bounded poll —
+    /// so a regression in `join_bounded` (removed, or given an unbounded deadline) fails this
+    /// test cleanly instead of hanging the whole test binary.
+    fn assert_drop_bounded<T: Send + 'static>(value: T, bound: Duration, label: &str) {
+        let start = Instant::now();
+        let dropper =
+            crate::worker::spawn_named("t-drop-bound", move || drop(value)).expect("spawn dropper");
+        let deadline = Instant::now() + bound;
+        let mut finished = false;
+        while Instant::now() < deadline {
+            if dropper.is_finished() {
+                finished = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(finished, "{label}: drop must return within {bound:?}");
+        assert!(
+            start.elapsed() < bound,
+            "{label}: drop took {:?}, expected under {bound:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn orgb_server_drop_is_bounded_with_a_silent_client() {
+        // A client that connects and never reads or writes — the pump's connection thread sits
+        // in its read loop. Whether or not this particular scenario ever triggers the write-side
+        // timeout, Drop must be bounded regardless.
+        let host = Host::spawn();
+        let server = OrgbServer::bind("127.0.0.1:0", host.handle()).expect("bind ephemeral");
+        let client = TcpStream::connect(server.addr()).expect("connect");
+        thread::sleep(Duration::from_millis(50)); // let the conn thread actually start
+
+        assert_drop_bounded(server, ORGB_SERVER_DROP_DEADLINE * 3, "OrgbServer");
+        drop(client);
+    }
+
+    #[test]
+    fn chroma_server_drop_is_bounded_with_a_silent_client() {
+        let host = Host::spawn();
+        let server = ChromaHttpServer::bind("127.0.0.1:0", host.handle()).expect("bind ephemeral");
+        let client = TcpStream::connect(server.addr()).expect("connect");
+        thread::sleep(Duration::from_millis(50));
+
+        assert_drop_bounded(server, CHROMA_SERVER_DROP_DEADLINE * 3, "ChromaHttpServer");
+        drop(client);
+    }
+
+    #[test]
+    fn obs_connection_drop_is_bounded_when_the_peer_never_speaks() {
+        // A raw loopback listener that accepts the connection and then holds it open in total
+        // silence — never sends the HTTP upgrade response `WsStream::connect` waits for. This is
+        // exactly the handshake-stall scenario the read/write timeouts in `ws.rs` were added for.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+        let addr = listener.local_addr().unwrap().to_string();
+        let holder = crate::worker::spawn_named("t-obs-silent-peer", move || {
+            if let Ok((stream, _)) = listener.accept() {
+                // Hold the accepted socket open (and thus the listener's peer) for longer than
+                // any bound under test, without ever reading or writing it.
+                thread::sleep(Duration::from_secs(5));
+                drop(stream);
+            }
+        })
+        .expect("spawn silent peer");
+
+        let host = Host::spawn();
+        let conn = ObsConnection::start(&addr, "", host.handle());
+        // Give it time to dial in and start (and, pre-fix, wedge inside) the handshake read.
+        thread::sleep(Duration::from_millis(200));
+
+        assert_drop_bounded(conn, OBS_CONNECTION_DROP_DEADLINE * 3, "ObsConnection");
+        drop(holder); // the silent-peer thread's own sleep ends on its own; not joined here
     }
 
     #[test]

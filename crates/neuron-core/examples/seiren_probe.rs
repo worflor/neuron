@@ -12,7 +12,7 @@ const REPORT_ID: u8 = 0x07;
 const BUF: usize = 64;
 const TXID: u8 = 0x1F;
 
-use neuron::transport::{self, Transport};
+use neuron::transport::{self, ReadStep, Transport};
 use std::time::{Duration, Instant};
 
 fn hexdump(bytes: &[u8]) -> String {
@@ -164,14 +164,15 @@ fn setter_hunt(info: &transport::HidDeviceInfo) -> anyhow::Result<()> {
         let Ok(reader) = transport::open_reader(&rpath) else { return };
         let mut buf = vec![0u8; 64];
         loop {
-            match reader.read(&mut buf) {
-                Ok(n) if n >= 3 && buf[0] == 0x05 && buf[1] == 0x11 => {
+            match transport::classify_read(reader.read(&mut buf)) {
+                ReadStep::Data(n) if n >= 3 && buf[0] == 0x05 && buf[1] == 0x11 => {
                     if tx.send(buf[2]).is_err() {
                         return;
                     }
                 }
-                Ok(_) => {}
-                Err(_) => return,
+                ReadStep::Data(_) => {}
+                ReadStep::Idle => {}
+                ReadStep::Gone => return,
             }
         }
     });
@@ -392,12 +393,13 @@ fn trymute(info: &transport::HidDeviceInfo) -> anyhow::Result<()> {
         let Ok(reader) = transport::open_reader(&rpath) else { return };
         let mut buf = vec![0u8; 64];
         loop {
-            match reader.read(&mut buf) {
-                Ok(n) if n >= 3 && buf[0] == 0x05 && buf[1] == 0x11 => {
+            match transport::classify_read(reader.read(&mut buf)) {
+                ReadStep::Data(n) if n >= 3 && buf[0] == 0x05 && buf[1] == 0x11 => {
                     let _ = tx.send(buf[2]);
                 }
-                Ok(_) => {}
-                Err(_) => return,
+                ReadStep::Data(_) => {}
+                ReadStep::Idle => {}
+                ReadStep::Gone => return,
             }
         }
     });
@@ -539,14 +541,15 @@ fn discover(info: &transport::HidDeviceInfo) -> anyhow::Result<()> {
         let Ok(reader) = transport::open_reader(&rpath) else { return };
         let mut buf = vec![0u8; 64];
         loop {
-            match reader.read(&mut buf) {
-                Ok(n) if n >= 3 && buf[0] == 0x05 && buf[1] == 0x11 => {
+            match transport::classify_read(reader.read(&mut buf)) {
+                ReadStep::Data(n) if n >= 3 && buf[0] == 0x05 && buf[1] == 0x11 => {
                     if tx.send(buf[2]).is_err() {
                         return;
                     }
                 }
-                Ok(_) => {}
-                Err(_) => return,
+                ReadStep::Data(_) => {}
+                ReadStep::Idle => {}
+                ReadStep::Gone => return,
             }
         }
     });
@@ -624,14 +627,15 @@ fn input_watch(info: &transport::HidDeviceInfo) -> anyhow::Result<()> {
         let Ok(reader) = transport::open_reader(&path) else { return };
         let mut buf = vec![0u8; len];
         loop {
-            match reader.read(&mut buf) {
-                Ok(n) if n > 0 => {
+            match transport::classify_read(reader.read(&mut buf)) {
+                ReadStep::Data(n) if n > 0 => {
                     if tx.send(buf[..n].to_vec()).is_err() {
                         return;
                     }
                 }
-                Ok(_) => {}
-                Err(_) => return,
+                ReadStep::Data(_) => {}
+                ReadStep::Idle => {}
+                ReadStep::Gone => return,
             }
         }
     });

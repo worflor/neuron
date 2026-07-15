@@ -743,6 +743,7 @@ fn bad_slot_path(base: &Path, i: usize) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[derive(Debug, Default, PartialEq, serde::Deserialize)]
     struct Item {
@@ -1395,5 +1396,381 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Crown properties ────────────────────────────────────────────────────────────────────
+    // A unique temp DIRECTORY per property case (not just a unique file name) — each case gets
+    // its own sandbox so a stray sibling backup/temp from one case can never leak into another's
+    // assertions, and cleanup is one `remove_dir_all`.
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    /// A purpose-built config with a RICH field mix (scalar, string, order-independent vec,
+    /// POSITIONAL vec, map, nested table) — richer than `Demo`, so the crown properties below
+    /// exercise every `salvage_*` primitive through one real [`SalvageLoad`] impl at once.
+    #[derive(Debug, Default, serde::Deserialize)]
+    struct Nested {
+        // Deserialization target only — the property asserts survival/defaulting of the whole
+        // nested table, never this field's value directly.
+        #[allow(dead_code)]
+        x: u32,
+    }
+
+    #[derive(Debug, Default, serde::Deserialize)]
+    struct Rich {
+        n: u32,
+        s: String,
+        #[serde(default)]
+        items: Vec<u32>, // order-independent (salvage_vec)
+        #[serde(default)]
+        slots: Vec<Item>, // positional (salvage_vec_positional)
+        #[serde(default)]
+        map: std::collections::BTreeMap<String, Item>, // salvage_map
+        #[serde(default)]
+        nested: Nested, // a nested table, salvaged as one opaque scalar field
+    }
+
+    impl SalvageLoad for Rich {
+        const FILE: &'static str = "rich.toml";
+        fn path() -> PathBuf {
+            // unused directly (tests drive `load_from`); required by the trait.
+            std::env::temp_dir().join("rich.toml")
+        }
+        fn salvage(table: &toml::Table) -> Self {
+            let mut cfg = Self::default();
+            crate::salvage_fields!(table, Self::FILE, cfg, { "n" => n, "s" => s, "nested" => nested });
+            if let Some(v) = salvage_vec(table, "items", Self::FILE) {
+                cfg.items = v;
+            }
+            if let Some(v) = salvage_vec_positional(table, "slots", Self::FILE) {
+                cfg.slots = v;
+            }
+            if let Some(v) = salvage_map(table, "map", Self::FILE) {
+                cfg.map = v;
+            }
+            cfg
+        }
+    }
+
+    /// A bounded (depth-limited) arbitrary `toml::Value` tree: scalars at any depth, arrays/tables
+    /// recursing down to `depth == 0`. Shared by every property below that needs "some arbitrary
+    /// TOML shape" without hand-writing a grammar per test.
+    fn arb_toml_scalar() -> impl Strategy<Value = toml::Value> {
+        prop_oneof![
+            "[a-zA-Z0-9 _-]{0,12}".prop_map(toml::Value::String),
+            any::<i64>().prop_map(toml::Value::Integer),
+            (-1.0e9f64..1.0e9f64).prop_map(toml::Value::Float),
+            any::<bool>().prop_map(toml::Value::Boolean),
+        ]
+    }
+
+    fn arb_toml_value(depth: u32) -> BoxedStrategy<toml::Value> {
+        let leaf = arb_toml_scalar().boxed();
+        if depth == 0 {
+            return leaf;
+        }
+        prop_oneof![
+            3 => leaf,
+            1 => proptest::collection::vec(arb_toml_value(depth - 1), 0..4)
+                .prop_map(toml::Value::Array),
+            1 => proptest::collection::vec(
+                ("[a-zA-Z_][a-zA-Z0-9_]{0,6}", arb_toml_value(depth - 1)),
+                0..4
+            )
+            .prop_map(|pairs| {
+                let mut t = toml::map::Map::new();
+                for (k, v) in pairs {
+                    t.insert(k, v);
+                }
+                toml::Value::Table(t)
+            }),
+        ]
+        .boxed()
+    }
+
+    /// Arbitrary INPUT BYTES spanning every degradation class `load_from` must survive: invalid
+    /// UTF-8, valid-UTF-8-non-TOML, valid TOML of the wrong shape, half-valid TOML (some real
+    /// `Rich` field names present but wrong-typed, mixed with junk), and deeply (but boundedly)
+    /// nested tables. The classes overlap on purpose (e.g. raw bytes occasionally happen to be
+    /// valid UTF-8) — the point is coverage, not mutually-exclusive partitioning.
+    fn arbitrary_input_bytes() -> impl Strategy<Value = Vec<u8>> {
+        prop_oneof![
+            // invalid UTF-8 (almost always — the rare valid ones are covered by the arms below too).
+            proptest::collection::vec(any::<u8>(), 0..48),
+            // valid UTF-8, essentially never valid TOML.
+            "\\PC{0,60}".prop_map(|s| s.into_bytes()),
+            // valid TOML, but shaped nothing like `Rich` (unrelated keys/values).
+            arb_toml_value(3).prop_map(|v| {
+                let mut t = toml::Table::new();
+                t.insert("unrelated".into(), v);
+                toml::to_string(&t).unwrap_or_default().into_bytes()
+            }),
+            // half-valid: real `Rich` field names present (`n`, `s`, `slots`) but wrong-typed,
+            // forcing the whole-struct fast parse to fail and the degraded path to run.
+            (arb_toml_value(2), arb_toml_value(2)).prop_map(|(a, b)| {
+                let mut t = toml::Table::new();
+                t.insert("n".into(), a);
+                t.insert("s".into(), b);
+                t.insert(
+                    "slots".into(),
+                    toml::Value::Array(vec![
+                        toml::Value::Integer(1),
+                        toml::Value::String("bad".into()),
+                        toml::Value::Integer(3),
+                    ]),
+                );
+                toml::to_string(&t).unwrap_or_default().into_bytes()
+            }),
+            // deeply nested tables (bounded depth <= 3) as the top-level document.
+            proptest::collection::vec(arb_toml_value(3), 1..3).prop_map(|vals| {
+                let mut t = toml::Table::new();
+                for (i, v) in vals.into_iter().enumerate() {
+                    t.insert(format!("k{i}"), v);
+                }
+                toml::to_string(&t).unwrap_or_default().into_bytes()
+            }),
+        ]
+    }
+
+    proptest! {
+        // disk-touching (one temp dir per case): keep the case count modest.
+        #![proptest_config(ProptestConfig::with_cases(48))]
+
+        /// TASK 1(a): for ANY bytes at all — invalid UTF-8, garbage UTF-8, wrong-shaped TOML,
+        /// half-valid TOML, deeply nested tables — `load_from` must never panic and must always
+        /// produce a value. This is the module's own top-doc promise ("Every ... `load()` ...
+        /// NEVER errors") turned into a property instead of a handful of hand-picked examples.
+        #[test]
+        fn load_from_never_panics_and_always_returns(bytes in arbitrary_input_bytes()) {
+            let dir = unique_temp_dir("neuron-salvage-fuzz-load");
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("rich.toml");
+            std::fs::write(&path, &bytes).unwrap();
+            let _got: Rich = Rich::load_from(&path); // the assertion IS that this returns.
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// TASK 1(b): whenever `load_from` takes the DEGRADED path (the whole-struct fast parse
+        /// fails, per lines 127-132 above), the EXACT original bytes must survive verbatim in one
+        /// of the nine `.bad*` sibling slots — searched exhaustively, not just slot 0, since a
+        /// pre-occupied ring can push the backup to any of them.
+        #[test]
+        fn degraded_bytes_always_survive_in_a_bad_sibling(bytes in arbitrary_input_bytes()) {
+            let dir = unique_temp_dir("neuron-salvage-fuzz-backup");
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("rich.toml");
+            std::fs::write(&path, &bytes).unwrap();
+
+            // mirrors `load_from`'s own degraded-or-not classification (lines 114-130): not valid
+            // UTF-8, or valid UTF-8 that doesn't whole-parse as `Rich`.
+            let is_degraded = match std::str::from_utf8(&bytes) {
+                Err(_) => true,
+                Ok(s) => toml::from_str::<Rich>(s).is_err(),
+            };
+
+            let _got = Rich::load_from(&path);
+
+            if is_degraded {
+                let base = bad_sibling(&path);
+                let found = (0..=8).any(|i| {
+                    std::fs::read(bad_slot_path(&base, i))
+                        .map(|b| b == bytes)
+                        .unwrap_or(false)
+                });
+                prop_assert!(found, "degraded bytes must survive verbatim in some .bad* sibling");
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// TASK 1: the generational ring under FUZZED payloads — 12 DISTINCT degraded generations
+        /// (distinctness is structural: each is prefixed with its own generation index, so no
+        /// filter/rejection is needed) must never overwrite an earlier, still-distinct slot, and
+        /// re-presenting an already-saved generation must dedupe (no new file appears).
+        #[test]
+        fn ring_never_overwrites_distinct_generations_and_dedupes_identical(
+            salts in proptest::collection::vec(proptest::collection::vec(any::<u8>(), 0..8), 12)
+        ) {
+            let gens: Vec<Vec<u8>> = salts
+                .into_iter()
+                .enumerate()
+                .map(|(i, salt)| {
+                    let mut b = format!("gen-{i}-").into_bytes();
+                    b.extend(salt);
+                    b
+                })
+                .collect();
+            let dir = unique_temp_dir("neuron-salvage-fuzz-ring");
+            std::fs::create_dir_all(&dir).unwrap();
+            let target = dir.join("cfg.toml");
+
+            for g in &gens {
+                backup_degraded_bytes(&target, g);
+            }
+            let base = bad_sibling(&target);
+            for (i, g) in gens.iter().enumerate().take(9) {
+                prop_assert_eq!(
+                    std::fs::read(bad_slot_path(&base, i)).unwrap(),
+                    g.clone(),
+                    "slot {} must hold its own generation, never overwritten by a later one",
+                    i
+                );
+            }
+
+            // re-presenting an already-saved generation (slot 0's payload) must not add any new
+            // file to the directory — AlreadySaved dedupe.
+            let before = std::fs::read_dir(&dir).unwrap().count();
+            backup_degraded_bytes(&target, &gens[0]);
+            let after = std::fs::read_dir(&dir).unwrap().count();
+            prop_assert_eq!(before, after, "an identical, already-saved generation must dedupe, not add a file");
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    // ── Task 2: primitives over arbitrary toml::Value trees (in-memory, no disk) ──────────────
+    // In-memory (no disk I/O), so a bigger case count per house rules.
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
+
+        /// `salvage_field`'s documented contract (doc comment on the fn, above): `None` = key
+        /// absent OR malformed; a present-and-parseable value comes back `Some`. Encoded directly
+        /// against `toml::Value::try_into`, the exact primitive `salvage_field` itself calls.
+        #[test]
+        fn salvage_field_matches_try_into_contract(val in arb_toml_value(3)) {
+            let mut t = toml::Table::new();
+            t.insert("k".to_string(), val.clone());
+            let expected = val.try_into::<i64>().ok();
+            let got = salvage_field::<i64>(&t, "k", "t.toml");
+            prop_assert_eq!(got, expected);
+            // an absent key is always None, regardless of what else the table holds.
+            prop_assert_eq!(salvage_field::<i64>(&t, "definitely-absent-key", "t.toml"), None);
+        }
+
+        /// `salvage_vec`'s documented contract (doc comment above): dropped elements shrink the
+        /// output (never grow it), and survivors keep their ORIGINAL relative order — encoded here
+        /// as "the output is exactly the filter-map of the input", which implies both at once.
+        #[test]
+        fn salvage_vec_length_bounded_and_order_preserved(val in arb_toml_value(3)) {
+            let mut t = toml::Table::new();
+            t.insert("items".to_string(), val.clone());
+            let got = salvage_vec::<i64>(&t, "items", "t.toml");
+            match val {
+                toml::Value::Array(items) => {
+                    let expected: Vec<i64> = items
+                        .iter()
+                        .filter_map(|v| v.clone().try_into::<i64>().ok())
+                        .collect();
+                    prop_assert!(got.as_ref().map(|v| v.len()).unwrap_or(0) <= items.len());
+                    prop_assert_eq!(got, Some(expected));
+                }
+                _ => prop_assert_eq!(got, None),
+            }
+        }
+
+        /// `salvage_vec_positional`'s documented contract: the output length is EXACTLY the input
+        /// array length (position-preserving — never shrinks, never grows), with `T::default()` in
+        /// every slot that didn't parse.
+        #[test]
+        fn salvage_vec_positional_preserves_length_and_defaults_failed_slots(val in arb_toml_value(3)) {
+            let mut t = toml::Table::new();
+            t.insert("items".to_string(), val.clone());
+            let got = salvage_vec_positional::<i64>(&t, "items", "t.toml");
+            match val {
+                toml::Value::Array(items) => {
+                    let expected: Vec<i64> = items
+                        .iter()
+                        .map(|v| v.clone().try_into::<i64>().unwrap_or_default())
+                        .collect();
+                    prop_assert_eq!(got.as_ref().map(Vec::len), Some(items.len()));
+                    prop_assert_eq!(got, Some(expected));
+                }
+                _ => prop_assert_eq!(got, None),
+            }
+        }
+
+        /// `salvage_map`'s documented contract: every surviving key is a SUBSET of the input
+        /// table's keys (entries are only ever dropped, never invented), and every surviving
+        /// value is the correctly-parsed entry.
+        #[test]
+        fn salvage_map_keys_are_a_subset_of_input_keys(val in arb_toml_value(3)) {
+            let mut t = toml::Table::new();
+            t.insert("m".to_string(), val.clone());
+            let got = salvage_map::<i64>(&t, "m", "t.toml");
+            match val {
+                toml::Value::Table(entries) => {
+                    let got = got.expect("m is a table, so salvage_map must return Some");
+                    for (k, v) in got.iter() {
+                        prop_assert!(entries.contains_key(k), "key `{k}` was not in the input table");
+                        let want: i64 = entries
+                            .get(k)
+                            .expect("checked contains_key above")
+                            .clone()
+                            .try_into::<i64>()
+                            .expect("surviving entries must actually parse");
+                        prop_assert_eq!(*v, want);
+                    }
+                }
+                _ => prop_assert_eq!(got, None),
+            }
+        }
+    }
+
+    // ── Task 4: atomic_write crash-consistency ──────────────────────────────────────────────────
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(40))]
+
+        /// Simulates the observable intermediate on-disk states of a crash mid-write BY HAND
+        /// (this process can't actually kill itself mid-`rename`, so the states are constructed
+        /// directly rather than induced): a good, already-published file sitting next to a STRAY
+        /// temp holding only a PREFIX of some future write's bytes (the "partial" state) or the
+        /// full bytes (the "complete but not yet renamed" state, when `prefix_len == new bytes
+        /// length`) — neither may perturb a read of the real path, and the eventual real
+        /// `atomic_write` (the "renamed" state) must fully replace with no torn mix of old/new.
+        #[test]
+        fn atomic_write_prefix_states_never_destroy_good_content(
+            orig_keep in 0u32..100_000,
+            new_keep in 0u32..100_000,
+            prefix_len in 0usize..24,
+        ) {
+            let dir = unique_temp_dir("neuron-salvage-fuzz-crash");
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("demo.toml");
+            let original = format!("keep = {orig_keep}\nalso = \"orig\"\n");
+            atomic_write(&path, original.as_bytes()).unwrap();
+
+            let new_bytes = format!("keep = {new_keep}\nalso = \"new\"\n");
+            let cut = prefix_len.min(new_bytes.len());
+            let prefix_bytes = new_bytes.as_bytes()[..cut].to_vec();
+            // a name matching atomic_write's own temp-naming scheme, but one it will never mint
+            // itself (the real sequence counter starts far below this) — a stray survivor of a
+            // hypothetical earlier crash.
+            let stray = dir.join(format!(".demo.toml.{}.999999999.tmp", std::process::id()));
+            std::fs::write(&stray, &prefix_bytes).unwrap();
+
+            // the stray (partial-or-complete-but-unrenamed) temp must not perturb a read of the
+            // real path at all — `load_from`/`atomic_write` only ever touch `path` itself.
+            let got = Demo::load_from(&path);
+            prop_assert_eq!(got.keep, orig_keep, "the published file's content must be read, not the stray temp");
+            prop_assert_eq!(
+                std::fs::read(&path).unwrap(),
+                original.clone().into_bytes(),
+                "the good file must be untouched by an unrelated stray sibling"
+            );
+
+            // the real overwrite must still fully succeed (never a torn mix) despite the stray.
+            atomic_write(&path, new_bytes.as_bytes()).unwrap();
+            prop_assert_eq!(std::fs::read(&path).unwrap(), new_bytes.clone().into_bytes());
+
+            // atomic_write always mints its OWN fresh unique temp name — it must never adopt,
+            // repair, or clobber a stray pre-existing temp it didn't create itself.
+            prop_assert_eq!(std::fs::read(&stray).unwrap(), prefix_bytes);
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }

@@ -643,4 +643,219 @@ mod tests {
         assert_eq!(json_str(auth, "challenge").as_deref(), Some("abc"));
         assert_eq!(json_str(auth, "salt").as_deref(), Some("def"));
     }
+
+    // ── Property harness: on_message is documented as a PURE message state
+    // machine over hand-rolled JSON; fuzz the reader and differential-test its
+    // field extraction against serde_json (a trusted reference). ────────────
+
+    use proptest::prelude::*;
+
+    /// Syntactically-nested-but-arbitrary JSON text, up to `depth` levels deep —
+    /// exercises parse_obj/parse_arr recursion without caring what the shape
+    /// means to on_message (most of it is unrecognized and inert by design).
+    fn arb_json_text(depth: u32) -> BoxedStrategy<String> {
+        let leaf = prop_oneof![
+            Just("null".to_string()),
+            Just("true".to_string()),
+            Just("false".to_string()),
+            any::<i32>().prop_map(|n| n.to_string()),
+            "[A-Za-z0-9 ]{0,16}".prop_map(|s| json_string(&s)),
+        ];
+        leaf.prop_recursive(depth, 64, 6, |inner| {
+            prop_oneof![
+                proptest::collection::vec(inner.clone(), 0..5)
+                    .prop_map(|v| format!("[{}]", v.join(","))),
+                proptest::collection::vec(
+                    ("[a-zA-Z]{1,8}".prop_map(|s| json_string(&s)), inner),
+                    0..5
+                )
+                .prop_map(|pairs| {
+                    let body: Vec<String> =
+                        pairs.into_iter().map(|(k, v)| format!("{k}:{v}")).collect();
+                    format!("{{{}}}", body.join(","))
+                }),
+            ]
+        })
+        .boxed()
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
+
+        /// Arbitrary text (including non-ASCII and control characters) fed to
+        /// on_message never panics. When the text isn't valid JSON at all (per
+        /// our own reader, the same reader on_message uses internally), the
+        /// documented contract holds: an empty Step comes back.
+        #[test]
+        fn on_message_never_panics_on_arbitrary_strings(s in ".{0,500}") {
+            let mut c = ObsClient::new("pw");
+            let step = c.on_message(&s); // must not panic
+            if parse_json(&s).is_none() {
+                prop_assert_eq!(step, Step::default(), "unparseable text must yield the empty Step");
+            }
+        }
+
+        /// Deeply nested (but mostly meaningless) JSON never panics the reader's
+        /// recursive descent, however deep or wide it goes.
+        #[test]
+        fn on_message_never_panics_on_deep_nested_json(text in arb_json_text(8)) {
+            let mut c = ObsClient::new("pw");
+            let _ = c.on_message(&text);
+        }
+    }
+
+    /// One decoded scene-name character, produced either as raw ASCII, a
+    /// `\uXXXX` BMP escape, a valid astral surrogate pair, or a lone surrogate
+    /// half — the case our parser deliberately degrades (U+FFFD) instead of
+    /// failing the whole frame.
+    #[derive(Clone, Debug)]
+    enum NamePiece {
+        Ascii(String),
+        BmpEscape(u32),
+        SurrogatePair(u32, u32),
+        LoneHigh(u32),
+        LoneLow(u32),
+    }
+
+    fn arb_name_piece() -> impl Strategy<Value = NamePiece> {
+        prop_oneof![
+            "[A-Za-z0-9 ]{0,10}".prop_map(NamePiece::Ascii),
+            (0x0020u32..=0xD7FFu32).prop_map(NamePiece::BmpEscape),
+            (0xE000u32..=0xFFFDu32).prop_map(NamePiece::BmpEscape),
+            (0xD800u32..=0xDBFFu32, 0xDC00u32..=0xDFFFu32)
+                .prop_map(|(hi, lo)| NamePiece::SurrogatePair(hi, lo)),
+            (0xD800u32..=0xDBFFu32).prop_map(NamePiece::LoneHigh),
+            (0xDC00u32..=0xDFFFu32).prop_map(NamePiece::LoneLow),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
+
+        /// DIFFERENTIAL: a CurrentProgramSceneChanged event's sceneName, run
+        /// through on_message, must match what serde_json (trusted reference)
+        /// extracts from the very same text — except for the lone-surrogate
+        /// case, where serde_json rejects the frame outright but our parser is
+        /// documented to tolerate it via U+FFFD. That gap is the expected
+        /// divergence, not a bug.
+        #[test]
+        fn scene_name_extraction_matches_serde_or_is_the_documented_divergence(piece in arb_name_piece()) {
+            let (literal, expected, is_lone_surrogate) = match &piece {
+                NamePiece::Ascii(s) => (s.clone(), s.clone(), false),
+                NamePiece::BmpEscape(cp) => {
+                    let ch = char::from_u32(*cp).expect("BMP range excludes surrogates");
+                    (format!("\\u{cp:04x}"), ch.to_string(), false)
+                }
+                NamePiece::SurrogatePair(hi, lo) => {
+                    let cp = 0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00);
+                    let ch = char::from_u32(cp).expect("valid surrogate pair decodes");
+                    (format!("\\u{hi:04x}\\u{lo:04x}"), ch.to_string(), false)
+                }
+                NamePiece::LoneHigh(hi) => (format!("\\u{hi:04x}"), '\u{fffd}'.to_string(), true),
+                NamePiece::LoneLow(lo) => (format!("\\u{lo:04x}"), '\u{fffd}'.to_string(), true),
+            };
+            let text = format!(
+                r#"{{"op":5,"d":{{"eventType":"CurrentProgramSceneChanged","eventData":{{"sceneName":"{literal}"}}}}}}"#
+            );
+
+            let mut c = ObsClient::new("");
+            let step = c.on_message(&text); // must not panic
+            prop_assert_eq!(step.events, vec![ObsEvent::Scene(expected.clone())]);
+
+            match serde_json::from_str::<serde_json::Value>(&text) {
+                Ok(v) => {
+                    let serde_name = v.get("d")
+                        .and_then(|d| d.get("eventData"))
+                        .and_then(|e| e.get("sceneName"))
+                        .and_then(|n| n.as_str());
+                    if !is_lone_surrogate {
+                        prop_assert_eq!(serde_name, Some(expected.as_str()));
+                    }
+                    // else: serde_json happened to accept it too (impl-defined for
+                    // lone surrogates) — no requirement to agree with our tolerant
+                    // U+FFFD substitution in that case.
+                }
+                Err(_) => {
+                    prop_assert!(is_lone_surrogate, "serde_json should only reject the lone-surrogate case here");
+                }
+            }
+        }
+
+        /// DIFFERENTIAL: op-code dispatch and event/requestType → ObsEvent
+        /// mapping, cross-checked field-by-field against serde_json reading the
+        /// SAME well-formed JSON text (built by serde_json::json!, not our own
+        /// writer, so this doesn't just check the parser against itself).
+        #[test]
+        fn on_message_dispatch_matches_serde_extracted_fields(
+            op in prop_oneof![Just(0u64), Just(2u64), Just(5u64), Just(7u64), 8u64..20u64],
+            kind in prop_oneof![
+                Just("StreamStateChanged".to_string()),
+                Just("RecordStateChanged".to_string()),
+                Just("CurrentProgramSceneChanged".to_string()),
+                Just("InputMuteStateChanged".to_string()),
+                Just("GetStreamStatus".to_string()),
+                Just("GetRecordStatus".to_string()),
+                Just("GetCurrentProgramScene".to_string()),
+                "[A-Za-z]{1,12}",
+            ],
+            active in any::<bool>(),
+            name in "[A-Za-z0-9 _-]{0,16}",
+        ) {
+            let inner = match kind.as_str() {
+                "StreamStateChanged" | "GetStreamStatus" | "RecordStateChanged" | "GetRecordStatus" =>
+                    serde_json::json!({ "outputActive": active }),
+                "CurrentProgramSceneChanged" | "GetCurrentProgramScene" =>
+                    serde_json::json!({ "sceneName": name, "currentProgramSceneName": name }),
+                "InputMuteStateChanged" =>
+                    serde_json::json!({ "inputName": name, "inputMuted": active }),
+                _ => serde_json::json!({ "outputActive": active, "sceneName": name }),
+            };
+            // Both `eventType`/`eventData` (op 5) and `requestType`/`responseData` (op 7)
+            // keys are always present — json! keys can't be dynamic, and the extra pair
+            // is simply ignored by whichever branch on_message doesn't take, so one
+            // shape covers every op value under test.
+            let text = serde_json::json!({
+                "op": op,
+                "d": {
+                    "rpcVersion": 1,
+                    "requestId": "x",
+                    "eventType": kind,
+                    "eventData": inner.clone(),
+                    "requestType": kind,
+                    "responseData": inner,
+                }
+            }).to_string();
+
+            let mut c = ObsClient::new("");
+            let step = c.on_message(&text); // must not panic on any op/kind combo
+
+            // Independent oracle: what the mapping SHOULD produce, read from the
+            // same well-formed text through serde_json instead of our own reader.
+            let v: serde_json::Value = serde_json::from_str(&text).expect("json! output is always valid JSON");
+            let d = &v["d"];
+            let expected: Vec<ObsEvent> = if op == 5 {
+                match kind.as_str() {
+                    "StreamStateChanged" => vec![ObsEvent::Streaming(d["eventData"]["outputActive"].as_bool().unwrap())],
+                    "RecordStateChanged" => vec![ObsEvent::Recording(d["eventData"]["outputActive"].as_bool().unwrap())],
+                    "CurrentProgramSceneChanged" => vec![ObsEvent::Scene(d["eventData"]["sceneName"].as_str().unwrap().to_string())],
+                    "InputMuteStateChanged" => vec![ObsEvent::InputMute {
+                        name: d["eventData"]["inputName"].as_str().unwrap().to_string(),
+                        muted: d["eventData"]["inputMuted"].as_bool().unwrap(),
+                    }],
+                    _ => vec![],
+                }
+            } else if op == 7 {
+                match kind.as_str() {
+                    "GetStreamStatus" => vec![ObsEvent::Streaming(d["responseData"]["outputActive"].as_bool().unwrap())],
+                    "GetRecordStatus" => vec![ObsEvent::Recording(d["responseData"]["outputActive"].as_bool().unwrap())],
+                    "GetCurrentProgramScene" => vec![ObsEvent::Scene(d["responseData"]["currentProgramSceneName"].as_str().unwrap().to_string())],
+                    _ => vec![],
+                }
+            } else {
+                vec![]
+            };
+
+            prop_assert_eq!(step.events, expected);
+        }
+    }
 }

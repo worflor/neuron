@@ -17,6 +17,15 @@
 /docs/chroma-shm-capture/
 
 # Runtime diagnostics and crash artifacts
+# Transient build/test console captures (agents and humans redirecting cargo output while
+# debugging: build_err.txt, test_out.txt, ...). Machine-specific paths, often mid-failure
+# snapshots — never source, never evidence. Anchored to the repo root so a crate could still
+# ship a legitimately-named file if one ever needs to exist.
+/build_err.txt
+/build_out*.txt
+/err.txt
+/test_err*.txt
+/test_out*.txt
 *.dmp
 *.mdmp
 # msys/Cygwin tool crash dumps (a crashing bash.exe drops bash.exe.stackdump in the cwd —

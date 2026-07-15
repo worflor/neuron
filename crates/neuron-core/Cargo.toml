@@ -27,6 +27,10 @@ path = "src/lib.rs"
 # `NEURON_HYPERSCROLL_WRITE` env var is kept as a runtime escape hatch so the write can be probed
 # without a rebuild — either gate opens it.)
 hyperscroll-write = []
+# Enables the failpoint registry (src/failpoint.rs) in NON-test builds — e.g. a chaos/soak binary
+# that wants fault injection against release-shaped code. Regular `cargo test` builds get the
+# registry via cfg(test) without this; release builds without it compile every failpoint to nothing.
+failpoints = []
 # Compile-time gate for the LED idle/power-timeout WRITE (0x07/0x03, writes.rs::set_idle_secs).
 # Both directions are hardware-confirmed on the Naga V2 Pro (2026-07-02: wrote 120s, 0x83 echoed,
 # restored 300s), so the app + CLI enable this feature. It stays a feature (not unconditional) so a
@@ -102,3 +106,7 @@ features = [
     "Win32_System_Memory",
     "Win32_System_Ole",
 ]
+
+[dev-dependencies]
+proptest = "1"
+static_assertions = "1.1"

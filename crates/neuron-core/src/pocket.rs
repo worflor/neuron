@@ -878,6 +878,9 @@ mod imp {
         const CF_LOCALE: u32 = 16;
         const CF_DIB: u32 = 8;
         const CF_DIBV5: u32 = 17;
+        // Serialize this process's clipboard window against every other clipboard user — see
+        // `crate::clipboard` for why there is exactly one process-wide lock.
+        let _guard = crate::clipboard::clipboard_guard();
         unsafe {
             if !open_clipboard_retry() {
                 // Couldn't open it even after retrying — treat as uncarryable so we never clobber a
@@ -925,6 +928,24 @@ mod imp {
     /// Copy one format's bytes out of its global memory block. Returns None for handle-only formats
     /// (CF_BITMAP / CF_PALETTE / metafiles) that aren't `GlobalLock`-able.
     unsafe fn snapshot_one(fmt: u32) -> Option<Vec<u8>> {
+        // A handful of PREDEFINED clipboard formats hand back a GDI/handle object, NOT an HGLOBAL
+        // movable-memory block: CF_BITMAP -> HBITMAP, CF_PALETTE -> HPALETTE, CF_ENHMETAFILE ->
+        // HENHMETAFILE. `GlobalLock`/`GlobalSize`/`GlobalUnlock` assume the handle IS a moveable
+        // global-memory block (they read/write an internal lock-count in memory addressed via the
+        // handle) — calling them on a GDI handle is undefined behavior: it can silently corrupt
+        // whatever the handle's bit pattern happens to address, which surfaces later as
+        // STATUS_HEAP_CORRUPTION rather than an immediate access violation. Root-caused via a live
+        // clipboard holding Bitmap+PNG: `GetClipboardData(CF_BITMAP)` returns an HBITMAP, and
+        // GlobalLock/GlobalUnlock on it reproducibly corrupted the heap (confirmed by excluding
+        // just CF_BITMAP here and watching 50/50 runs go clean). So: skip every known handle-only
+        // predefined format before ever calling GlobalLock on it. (CF_METAFILEPICT IS a real
+        // HGLOBAL — to a small METAFILEPICT struct — so it's left to the normal path below.)
+        const CF_BITMAP: u32 = 2;
+        const CF_PALETTE: u32 = 9;
+        const CF_ENHMETAFILE: u32 = 14;
+        if matches!(fmt, CF_BITMAP | CF_PALETTE | CF_ENHMETAFILE) {
+            return None;
+        }
         let h = GetClipboardData(fmt); // owned by the clipboard — do NOT free.
         if h.is_null() {
             return None;
@@ -942,6 +963,9 @@ mod imp {
     /// Replace the clipboard with exactly these formats (empties it first). An empty `Pocket` just
     /// clears the clipboard.
     pub fn set_clipboard(p: &Pocket) -> bool {
+        // Serialize this process's clipboard window against every other clipboard user — see
+        // `crate::clipboard` for why there is exactly one process-wide lock.
+        let _guard = crate::clipboard::clipboard_guard();
         unsafe {
             if !open_clipboard_retry() {
                 return false;
@@ -1169,5 +1193,35 @@ mod tests {
         // restore: live empty, stored full -> clipboard full, pocket empty
         let (to_clip, new_pocket) = (full.clone(), empty.clone());
         assert!(!to_clip.is_empty() && new_pocket.is_empty());
+    }
+
+    // Regression for the clipboard use-after-free shape: `pocket`'s `read_clip_state` and
+    // `macros::context::Context::capture`'s clipboard probe are two INDEPENDENT call sites that
+    // each open/scan/close the Win32 clipboard. Before both were routed through the shared
+    // `neuron::clipboard::clipboard_guard()`, hammering them from two threads at once could race
+    // one thread's `CloseClipboard` against the other's still-in-flight `GlobalLock` scan — a
+    // real access violation / heap corruption previously hit in this exact shape (see
+    // `clipboard.rs`'s doc comment). This test never arms input and never requires (or seeds) a
+    // real clipboard payload — a headless/CI box legitimately fails every `OpenClipboard` call
+    // (another process holding it, or no clipboard at all), and both probes already degrade that
+    // to `None`/`Uncarryable` rather than erroring. The only thing asserted is that hammering both
+    // paths concurrently for a bounded number of iterations never panics or crashes the process.
+    #[test]
+    fn concurrent_clipboard_reads_do_not_race() {
+        const ITERS: usize = 200;
+
+        let reader_a = std::thread::spawn(|| {
+            for _ in 0..ITERS {
+                let _ = imp::read_clip_state();
+            }
+        });
+        let reader_b = std::thread::spawn(|| {
+            for _ in 0..ITERS {
+                let _ = crate::macros::context::Context::capture();
+            }
+        });
+
+        assert!(reader_a.join().is_ok(), "pocket clipboard reader thread panicked");
+        assert!(reader_b.join().is_ok(), "context clipboard reader thread panicked");
     }
 }

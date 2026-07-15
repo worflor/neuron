@@ -440,4 +440,129 @@ mod tests {
         let mut layer = PolicyLayer::new("kbd".into(), 2, shared, policy, 1.0);
         assert_eq!(layer.render(Instant::now()), vec![None; 2], "scoped-out surface shows nothing");
     }
+
+    // ── Property tests: `merge_cells`' black-transparent law + the `BlendMode::apply`
+    // channel algebra it exists to protect against (the "TINT bug" in the module docs).
+    mod props {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn cfg() -> ProptestConfig {
+            ProptestConfig { cases: 256, ..ProptestConfig::default() }
+        }
+
+        fn any_mode() -> impl Strategy<Value = BlendMode> {
+            prop_oneof![
+                Just(BlendMode::Over),
+                Just(BlendMode::Screen),
+                Just(BlendMode::Add),
+                Just(BlendMode::Multiply),
+            ]
+        }
+
+        fn any_rgb() -> impl Strategy<Value = Rgb> {
+            (any::<u8>(), any::<u8>(), any::<u8>()).prop_map(|(r, g, b)| Rgb(r, g, b))
+        }
+
+        fn any_cell() -> impl Strategy<Value = Option<Rgb>> {
+            prop_oneof![Just(None), any_rgb().prop_map(Some)]
+        }
+
+        proptest! {
+            #![proptest_config(cfg())]
+
+            /// (a) `merge_cells` only ever reshapes cell VALUES, never the cell COUNT — the
+            /// per-surface LED arrays it feeds must stay the surface's declared length.
+            #[test]
+            fn merge_preserves_length(
+                cells in prop::collection::vec(any_cell(), 0..64),
+                mode in any_mode(),
+            ) {
+                let merged = merge_cells(mode, &cells);
+                prop_assert_eq!(merged.len(), cells.len());
+            }
+
+            /// (b) `merge_cells` has no signal it didn't get from `cells`: a layer painting
+            /// NOTHING (all-`None`) stays nothing under every mode — it can never fabricate
+            /// colour, so the base beneath it is left visually untouched.
+            #[test]
+            fn all_none_layer_is_left_untouched(
+                len in 0usize..64,
+                mode in any_mode(),
+            ) {
+                let cells = vec![None; len];
+                prop_assert_eq!(merge_cells(mode, &cells), cells);
+            }
+
+            /// (c) The documented black-transparent rule (module docs above `merge_cells`,
+            /// and the "TINT bug" rationale): under `Over` a painted pure-black cell is an
+            /// explicit LED-off and stays opaque; under every OTHER mode
+            /// (`Screen`/`Add`/`Multiply`) painted black is transparent ("the game says
+            /// nothing here"), because those modes would otherwise let black cells corrupt
+            /// the base (`Multiply` blacks it out; `Screen`/`Add` are black's identity
+            /// anyway, so dropping costs nothing). Non-black cells and already-`None` cells
+            /// are untouched by every mode.
+            #[test]
+            fn black_vs_transparent_semantics(
+                cells in prop::collection::vec(
+                    prop_oneof![
+                        Just(None),
+                        Just(Some(Rgb(0, 0, 0))),
+                        (any_rgb().prop_filter("non-black", |c| *c != Rgb(0, 0, 0))).prop_map(Some),
+                    ],
+                    0..64,
+                ),
+                mode in any_mode(),
+            ) {
+                let merged = merge_cells(mode, &cells);
+                for (input, output) in cells.iter().zip(merged.iter()) {
+                    match (mode, input) {
+                        (BlendMode::Over, _) => prop_assert_eq!(output, input, "Over: unconditionally opaque"),
+                        (_, Some(Rgb(0, 0, 0))) => prop_assert_eq!(*output, None, "{:?}: black merges to transparent", mode),
+                        (_, other) => prop_assert_eq!(output, other, "{:?}: non-black/None cells pass through", mode),
+                    }
+                }
+            }
+
+            /// (d1) `Screen`/`Add` are the identity on a black overlay — the exact reason
+            /// `merge_cells` can drop their black cells to transparent "for free" (module docs).
+            /// True by construction: `channel()`'s `+127` rounding term vanishes against `o=0`.
+            #[test]
+            fn screen_and_add_are_identity_on_black(under in any_rgb()) {
+                prop_assert_eq!(BlendMode::Screen.apply(under, Rgb(0, 0, 0)), under);
+                prop_assert_eq!(BlendMode::Add.apply(under, Rgb(0, 0, 0)), under);
+            }
+
+            /// (d2) `Multiply` is NOT the identity on black — it drives every channel to 0
+            /// regardless of `under`. This is the "TINT bug" `merge_cells` exists to dodge: a
+            /// mostly-black `Multiply` frame would blacken the whole board if black cells
+            /// weren't first turned transparent.
+            #[test]
+            fn multiply_by_black_annihilates(under in any_rgb()) {
+                prop_assert_eq!(BlendMode::Multiply.apply(under, Rgb(0, 0, 0)), Rgb(0, 0, 0));
+            }
+
+            /// (d3) `Over` is a pure projection onto `over` — true by construction
+            /// (`BlendMode::Over => over`), for ANY `under`, not just black/white endpoints.
+            #[test]
+            fn over_always_degenerates_to_the_top_layer(under in any_rgb(), over in any_rgb()) {
+                prop_assert_eq!(BlendMode::Over.apply(under, over), over);
+            }
+
+            /// (d4) `Screen`/`Add`/`Multiply`'s per-channel integer formulas are symmetric in
+            /// `(under, over)` (verified by reading `channel()`: every arm's arithmetic is
+            /// commutative — `u+o`, `u*o`, and the shared `+127` rounding term don't depend on
+            /// order), so these three modes are genuinely commutative. `Over` is deliberately
+            /// EXCLUDED: it always returns `over`, so it's only commutative when `under == over`
+            /// — asserting general commutativity for it would be a false law.
+            #[test]
+            fn screen_add_multiply_are_commutative(
+                a in any_rgb(),
+                b in any_rgb(),
+                mode in prop_oneof![Just(BlendMode::Screen), Just(BlendMode::Add), Just(BlendMode::Multiply)],
+            ) {
+                prop_assert_eq!(mode.apply(a, b), mode.apply(b, a));
+            }
+        }
+    }
 }

@@ -80,3 +80,6 @@ windows-sys = { version = "0.59", features = [
 
 [build-dependencies]
 slint-build = "1.16"
+
+[dev-dependencies]
+proptest = "1"

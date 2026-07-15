@@ -1045,6 +1045,7 @@ fn post_status(weak: &slint::Weak<AppWindow>, line: String) {
 #[cfg(windows)]
 mod imp {
     use super::{Brush, Cmd, Command, Cull, PingKind, Stroke};
+    use crate::raster::{FieldBuf, FieldView, PixelBuf, PixelView};
     use std::sync::mpsc::Receiver;
     use std::time::Instant;
     use windows_sys::Win32::Foundation::{POINT, SIZE};
@@ -1092,6 +1093,32 @@ mod imp {
             let px = surf.bits();
             let count = (w * h) as usize;
             std::ptr::write_bytes(px, 0, count);
+            // The raster primitives below all take a bounds-checked PixelBuf/FieldBuf instead of
+            // a loose (pointer, w, h) triple — dimensions travel WITH the pointer, so a
+            // mismatched w/h can never reach them. `w`/`h` here are the SAME authoritative values
+            // the DIB/fields were sized from (this closure never resizes them), so wrapping a
+            // fresh view at each call site is just plumbing, not a borrow the loop needs to hold.
+            // (already inside canvas_thread's outer `unsafe` block — no nested `unsafe {}` needed)
+            macro_rules! pixbuf {
+                ($p:expr) => {
+                    &mut PixelBuf::from_raw_parts($p, w, h)
+                };
+            }
+            macro_rules! pixview {
+                ($p:expr) => {
+                    PixelView::from_raw_parts($p, w, h)
+                };
+            }
+            macro_rules! fieldbuf {
+                ($p:expr) => {
+                    &mut FieldBuf::from_raw_parts($p, w, h)
+                };
+            }
+            macro_rules! fieldview {
+                ($p:expr) => {
+                    FieldView::from_raw_parts($p, w, h)
+                };
+            }
 
             let mut strokes: Vec<Stroke> = Vec::new();
             let mut live: Option<Stroke> = None;
@@ -1218,10 +1245,8 @@ mod imp {
                                         as f32)
                                         .sqrt();
                                     let r = carve(
-                                        dmin.as_mut_ptr(),
-                                        smin.as_mut_ptr(),
-                                        w,
-                                        h,
+                                        fieldbuf!(dmin.as_mut_ptr()),
+                                        fieldbuf!(smin.as_mut_ptr()),
                                         from,
                                         p,
                                         reach,
@@ -1230,11 +1255,10 @@ mod imp {
                                     );
                                     live_arc += seg_len;
                                     composite(
-                                        px,
-                                        Some(base.as_ptr()),
-                                        dmin.as_ptr(),
-                                        smin.as_ptr(),
-                                        w,
+                                        pixbuf!(px),
+                                        Some(pixview!(base.as_ptr())),
+                                        fieldview!(dmin.as_ptr()),
+                                        fieldview!(smin.as_ptr()),
                                         r,
                                         s,
                                     );
@@ -1253,7 +1277,7 @@ mod imp {
                                 }
                             }
                             if let Some(r) = live_bbox.take() {
-                                reset_region(dmin.as_mut_ptr(), w, r);
+                                reset_region(fieldbuf!(dmin.as_mut_ptr()), r);
                             }
                         }
                         Cmd::EndAs(poly) => {
@@ -1261,17 +1285,15 @@ mod imp {
                             // render the perfect polyline fresh — no full-canvas repaint needed.
                             if let Some(mut s) = live.take() {
                                 if let Some(r) = live_bbox.take() {
-                                    restore_region(px, base.as_ptr(), w, r);
-                                    reset_region(dmin.as_mut_ptr(), w, r);
+                                    restore_region(pixbuf!(px), pixview!(base.as_ptr()), r);
+                                    reset_region(fieldbuf!(dmin.as_mut_ptr()), r);
                                 }
                                 s.pts = poly.iter().map(|(x, y)| (x - vx, y - vy)).collect();
                                 if !s.pts.is_empty() {
                                     render_stroke(
-                                        px,
-                                        dmin.as_mut_ptr(),
-                                        smin.as_mut_ptr(),
-                                        w,
-                                        h,
+                                        pixbuf!(px),
+                                        fieldbuf!(dmin.as_mut_ptr()),
+                                        fieldbuf!(smin.as_mut_ptr()),
                                         &s,
                                     );
                                     strokes.push(s);
@@ -1285,8 +1307,8 @@ mod imp {
                             // the ghost vanishes EXACTLY: its region restores from the snapshot.
                             if live.take().is_some() {
                                 if let Some(r) = live_bbox.take() {
-                                    restore_region(px, base.as_ptr(), w, r);
-                                    reset_region(dmin.as_mut_ptr(), w, r);
+                                    restore_region(pixbuf!(px), pixview!(base.as_ptr()), r);
+                                    reset_region(fieldbuf!(dmin.as_mut_ptr()), r);
                                     clean_valid = false; // px region was rewritten; re-snapshot
                                     dirty = true;
                                 }
@@ -1518,11 +1540,9 @@ mod imp {
                                 // first touch. Restore the field invariant (f32::MAX everywhere)
                                 // so the next stroke reads only its own distances.
                                 if let Some(r) = live_bbox.take() {
-                                    reset_region(dmin.as_mut_ptr(), w, r);
+                                    reset_region(fieldbuf!(dmin.as_mut_ptr()), r);
                                 }
-                                for d in std::slice::from_raw_parts_mut(dmin.as_mut_ptr(), count) {
-                                    *d = f32::MAX;
-                                }
+                                dmin.fill(f32::MAX);
                                 full = true;
                             }
                         }
@@ -1597,7 +1617,7 @@ mod imp {
                     // leaks along the command path) — clear its region so the committed strokes carve
                     // into a clean field; the live stroke is re-carved fresh just below.
                     if let Some(r) = live_bbox {
-                        reset_region(dmin.as_mut_ptr(), w, r);
+                        reset_region(fieldbuf!(dmin.as_mut_ptr()), r);
                     }
                     for (i, s) in strokes.iter().enumerate() {
                         // selected ink wears the PRISM — white diffusing into a spectral fringe,
@@ -1621,9 +1641,7 @@ mod imp {
                                         (j as f32 / n as f32) * 300.0 + phase + (i as f32 * 47.0);
                                     let c = hsv(hue, 0.72, 1.0);
                                     stamp_segment(
-                                        px,
-                                        w,
-                                        h,
+                                        pixbuf!(px),
                                         (from.0 + ox, from.1 + oy),
                                         (p.0 + ox, p.1 + oy),
                                         c,
@@ -1637,9 +1655,7 @@ mod imp {
                             let mut prev: Option<(i32, i32)> = None;
                             for &p in &s.pts {
                                 stamp_segment(
-                                    px,
-                                    w,
-                                    h,
+                                    pixbuf!(px),
                                     prev.unwrap_or(p),
                                     p,
                                     0xFFFFFF,
@@ -1654,9 +1670,7 @@ mod imp {
                             let mut prev: Option<(i32, i32)> = None;
                             for &p in &s.pts {
                                 stamp_segment(
-                                    px,
-                                    w,
-                                    h,
+                                    pixbuf!(px),
                                     prev.unwrap_or(p),
                                     p,
                                     mark_color,
@@ -1666,7 +1680,12 @@ mod imp {
                                 prev = Some(p);
                             }
                         }
-                        render_stroke(px, dmin.as_mut_ptr(), smin.as_mut_ptr(), w, h, s);
+                        render_stroke(
+                            pixbuf!(px),
+                            fieldbuf!(dmin.as_mut_ptr()),
+                            fieldbuf!(smin.as_mut_ptr()),
+                            s,
+                        );
                     }
                     // a live stroke survives the repaint: re-base on the fresh canvas, RE-CARVE its
                     // whole path into the now-clean field (cleared above, so it never polluted the
@@ -1679,10 +1698,8 @@ mod imp {
                             let mut arc = 0.0f32;
                             if s.pts.len() == 1 {
                                 bb = Some(carve(
-                                    dmin.as_mut_ptr(),
-                                    smin.as_mut_ptr(),
-                                    w,
-                                    h,
+                                    fieldbuf!(dmin.as_mut_ptr()),
+                                    fieldbuf!(smin.as_mut_ptr()),
                                     s.pts[0],
                                     s.pts[0],
                                     reach,
@@ -1698,10 +1715,8 @@ mod imp {
                                 bb = Some(union(
                                     bb,
                                     carve(
-                                        dmin.as_mut_ptr(),
-                                        smin.as_mut_ptr(),
-                                        w,
-                                        h,
+                                        fieldbuf!(dmin.as_mut_ptr()),
+                                        fieldbuf!(smin.as_mut_ptr()),
                                         sw[0],
                                         sw[1],
                                         reach,
@@ -1713,11 +1728,10 @@ mod imp {
                             }
                             if let Some(r) = bb {
                                 composite(
-                                    px,
-                                    Some(base.as_ptr()),
-                                    dmin.as_ptr(),
-                                    smin.as_ptr(),
-                                    w,
+                                    pixbuf!(px),
+                                    Some(pixview!(base.as_ptr())),
+                                    fieldview!(dmin.as_ptr()),
+                                    fieldview!(smin.as_ptr()),
                                     r,
                                     s,
                                 );
@@ -1764,7 +1778,12 @@ mod imp {
                         if !clean_valid {
                             std::ptr::write_bytes(px, 0, count);
                             for s in strokes.iter() {
-                                render_stroke(px, dmin.as_mut_ptr(), smin.as_mut_ptr(), w, h, s);
+                                render_stroke(
+                                    pixbuf!(px),
+                                    fieldbuf!(dmin.as_mut_ptr()),
+                                    fieldbuf!(smin.as_mut_ptr()),
+                                    s,
+                                );
                             }
                             std::ptr::copy_nonoverlapping(
                                 px as *const u32,
@@ -1777,14 +1796,12 @@ mod imp {
                         }
                         frame = frame.wrapping_add(1);
                         if !selected.is_empty() {
-                            selection_wave(px, w, h, &strokes, &selected, frame);
+                            selection_wave(pixbuf!(px), &strokes, &selected, frame);
                         }
-                        draw_laser(px, w, h, &laser, now);
+                        draw_laser(pixbuf!(px), &laser, now);
                         for &(x, y, kind, color, born) in &pings {
                             draw_ping(
-                                px,
-                                w,
-                                h,
+                                pixbuf!(px),
                                 x,
                                 y,
                                 kind,
@@ -1793,7 +1810,7 @@ mod imp {
                             );
                         }
                         if let Some((cx, cy, sect, color)) = ping_wheel {
-                            draw_ping_wheel(px, w, h, cx - vx, cy - vy, sect, color, frame);
+                            draw_ping_wheel(pixbuf!(px), cx - vx, cy - vy, sect, color, frame);
                         }
                         dirty = true;
                     }
@@ -2073,56 +2090,63 @@ mod imp {
     /// this segment wins, `smin` takes the ARC LENGTH at the projected spine point. (dmin, smin)
     /// together are the stroke-local UV every medium shades in: `d` across the stroke, `s` along
     /// it — the coordinate grain rides, edges waver by, ink loads dry over. Returns the region.
-    #[allow(clippy::too_many_arguments)] // the field carver's natural arity
-    unsafe fn carve(
-        dmin: *mut f32,
-        smin: *mut f32,
-        w: i32,
-        h: i32,
+    /// A raster primitive's natural arity: the buffers carry their own w/h now (no loose `w`/`h`
+    /// params to go stale against them), so the count here is just the real varyings.
+    #[allow(clippy::too_many_arguments)]
+    fn carve(
+        dmin: &mut FieldBuf,
+        smin: &mut FieldBuf,
         a: (i32, i32),
         b: (i32, i32),
         reach: f32,
         s0: f32,
         seg_len: f32,
     ) -> Region {
-        unsafe {
-            let ri = reach.ceil() as i32 + 1;
-            let x0 = (a.0.min(b.0) - ri).clamp(0, w - 1);
-            let x1 = (a.0.max(b.0) + ri).clamp(0, w - 1);
-            let y0 = (a.1.min(b.1) - ri).clamp(0, h - 1);
-            let y1 = (a.1.max(b.1) + ri).clamp(0, h - 1);
-            for yy in y0..=y1 {
-                for xx in x0..=x1 {
-                    let (d, t) = seg_proj((xx as f32, yy as f32), a, b);
-                    let i = (yy * w + xx) as usize;
-                    if d < *dmin.add(i) {
-                        *dmin.add(i) = d;
-                        *smin.add(i) = s0 + t * seg_len;
+        let (w, h) = (dmin.w(), dmin.h());
+        if w <= 0 || h <= 0 {
+            return (0, 0, -1, -1); // an empty region: every `r.1..=r.3`/`r.0..=r.2` iterates zero times
+        }
+        let ri = reach.ceil() as i32 + 1;
+        // `saturating_*`: a pathological/off-screen coordinate (a stroke point near i32::MIN/MAX)
+        // must clip at the field edge, not wrap or panic on the subtract/add overflowing.
+        let x0 = (a.0.min(b.0).saturating_sub(ri)).clamp(0, w - 1);
+        let x1 = (a.0.max(b.0).saturating_add(ri)).clamp(0, w - 1);
+        let y0 = (a.1.min(b.1).saturating_sub(ri)).clamp(0, h - 1);
+        let y1 = (a.1.max(b.1).saturating_add(ri)).clamp(0, h - 1);
+        for yy in y0..=y1 {
+            for xx in x0..=x1 {
+                let (d, t) = seg_proj((xx as f32, yy as f32), a, b);
+                // SAFETY: (xx, yy) ranges over x0..=x1, y0..=y1, which were just clamped against
+                // this SAME buffer's dmin.w()/dmin.h() above — not a separately-carried w/h.
+                unsafe {
+                    if d < dmin.get_unchecked(xx, yy) {
+                        dmin.put_unchecked(xx, yy, d);
+                        smin.put_unchecked(xx, yy, s0 + t * seg_len);
                     }
                 }
             }
-            (x0, y0, x1, y1)
         }
+        (x0, y0, x1, y1)
     }
 
     /// Return a carved region to the field's resting state (f32::MAX).
-    unsafe fn reset_region(dmin: *mut f32, w: i32, r: Region) {
-        unsafe {
-            for yy in r.1..=r.3 {
-                for xx in r.0..=r.2 {
-                    *dmin.add((yy * w + xx) as usize) = f32::MAX;
-                }
+    fn reset_region(dmin: &mut FieldBuf, r: Region) {
+        for yy in r.1..=r.3 {
+            if let Some(row) = dmin.row_range_mut(yy, r.0, r.2) {
+                row.fill(f32::MAX);
             }
         }
     }
 
     /// Restore a region of the canvas from the pre-stroke snapshot (ghost erase, shape-set swap).
-    unsafe fn restore_region(px: *mut u32, base: *const u32, w: i32, r: Region) {
-        unsafe {
-            for yy in r.1..=r.3 {
-                for xx in r.0..=r.2 {
-                    let i = (yy * w + xx) as usize;
-                    *px.add(i) = *base.add(i);
+    fn restore_region(px: &mut PixelBuf, base: PixelView, r: Region) {
+        for yy in r.1..=r.3 {
+            for xx in r.0..=r.2 {
+                // `base` may legitimately be smaller/differently-shaped in a future refactor; go
+                // through the checked `get` here (restore isn't the hot per-frame path stamp/
+                // composite are) so a mismatch degrades to "skip that pixel", not corruption.
+                if let Some(v) = base.get(xx, yy) {
+                    px.put(xx, yy, v);
                 }
             }
         }
@@ -2132,16 +2156,15 @@ mod imp {
     /// (live strokes) every pixel re-resolves over the pre-stroke substrate — so when a new
     /// segment turns yesterday's watercolour RIM into today's interior, the rim actually
     /// recedes (pure max-blend can only ever get heavier; this is the joint-splotch fix).
-    unsafe fn composite(
-        px: *mut u32,
-        base: Option<*const u32>,
-        dmin: *const f32,
-        smin: *const f32,
-        w: i32,
+    fn composite(
+        px: &mut PixelBuf,
+        base: Option<PixelView>,
+        dmin: FieldView,
+        smin: FieldView,
         r: Region,
         s: &Stroke,
     ) {
-        unsafe {
+        {
             let rad = (s.width / 2.0).max(1.0);
             let mt = crate::weave::seconds();
             // The spellweaving pen pours the LIVE material — a per-stroke clone of whatever surface/knobs
@@ -2164,28 +2187,28 @@ mod imp {
             };
             for yy in r.1..=r.3 {
                 for xx in r.0..=r.2 {
-                    let i = (yy * w + xx) as usize;
-                    let under = match base {
-                        Some(b) => *b.add(i),
-                        None => *px.add(i),
+                    // SAFETY: (xx, yy) ranges over r, which every caller derives from carve()'s
+                    // return — itself clamped against dmin's own w()/h(). `px`/`base` share those
+                    // same dimensions by construction (one DIB, one snapshot of it), so the same
+                    // range is in-bounds for all three buffers.
+                    let (under, d, sa) = unsafe {
+                        let under = match base {
+                            Some(b) => b.get_unchecked(xx, yy),
+                            None => px.get_unchecked(xx, yy),
+                        };
+                        (under, dmin.get_unchecked(xx, yy), smin.get_unchecked(xx, yy))
                     };
-                    let d = *dmin.add(i);
-                    let sa = *smin.add(i);
                     let (col, a) = match &material_mat {
                         Some(m) if d <= rad + 2.0 => {
                             // surface normal = the gradient of the distance field (clamped neighbours)
                             // — only its DIRECTION matters (it picks the facet); |∇d|≈1 everywhere.
-                            let dl = if xx > r.0 { *dmin.add(i - 1) } else { d };
-                            let dr2 = if xx < r.2 { *dmin.add(i + 1) } else { d };
-                            let du = if yy > r.1 {
-                                *dmin.add(i - w as usize)
-                            } else {
-                                d
-                            };
-                            let dd2 = if yy < r.3 {
-                                *dmin.add(i + w as usize)
-                            } else {
-                                d
+                            let (dl, dr2, du, dd2) = unsafe {
+                                (
+                                    if xx > r.0 { dmin.get_unchecked(xx - 1, yy) } else { d },
+                                    if xx < r.2 { dmin.get_unchecked(xx + 1, yy) } else { d },
+                                    if yy > r.1 { dmin.get_unchecked(xx, yy - 1) } else { d },
+                                    if yy < r.3 { dmin.get_unchecked(xx, yy + 1) } else { d },
+                                )
                             };
                             material_core(
                                 d,
@@ -2211,11 +2234,12 @@ mod imp {
                     // canvas, never over a kept stroke — so crossing a (grainy) stroke can't leave a
                     // white speck at the intersection that reads as a real mark (max-blend would let the
                     // ghost's 88 alpha beat a textured stroke's sub-88 grain pixels).
-                    *px.add(i) = if a == 0 || (s.ghost && (under >> 24) != 0) {
+                    let out = if a == 0 || (s.ghost && (under >> 24) != 0) {
                         under
                     } else {
                         blend_max(under, col, a)
                     };
+                    unsafe { px.put_unchecked(xx, yy, out) };
                 }
             }
         }
@@ -2447,37 +2471,28 @@ mod imp {
     /// Render a COMMITTED stroke (full repaints, shape-set replacements): carve every segment
     /// (accumulating arc length so the grain rides exactly as it did live), composite once from
     /// true distance, return the field to rest.
-    pub(super) unsafe fn render_stroke(
-        px: *mut u32,
-        dmin: *mut f32,
-        smin: *mut f32,
-        w: i32,
-        h: i32,
-        s: &Stroke,
-    ) {
-        unsafe {
-            if s.pts.is_empty() {
-                return;
-            }
-            let reach = (s.width / 2.0).max(1.0) + 2.0;
-            let mut bb: Option<Region> = None;
-            let mut arc = 0.0f32;
-            if s.pts.len() == 1 {
-                bb = Some(carve(dmin, smin, w, h, s.pts[0], s.pts[0], reach, 0.0, 0.0));
-            }
-            for sw in s.pts.windows(2) {
-                let seg_len =
-                    (((sw[1].0 - sw[0].0).pow(2) + (sw[1].1 - sw[0].1).pow(2)) as f32).sqrt();
-                bb = Some(union(
-                    bb,
-                    carve(dmin, smin, w, h, sw[0], sw[1], reach, arc, seg_len),
-                ));
-                arc += seg_len;
-            }
-            if let Some(r) = bb {
-                composite(px, None, dmin, smin, w, r, s);
-                reset_region(dmin, w, r);
-            }
+    pub(super) fn render_stroke(px: &mut PixelBuf, dmin: &mut FieldBuf, smin: &mut FieldBuf, s: &Stroke) {
+        if s.pts.is_empty() {
+            return;
+        }
+        let reach = (s.width / 2.0).max(1.0) + 2.0;
+        let mut bb: Option<Region> = None;
+        let mut arc = 0.0f32;
+        if s.pts.len() == 1 {
+            bb = Some(carve(dmin, smin, s.pts[0], s.pts[0], reach, 0.0, 0.0));
+        }
+        for sw in s.pts.windows(2) {
+            // cast to f32 BEFORE subtracting/squaring — a pathological point pair (near
+            // i32::MIN/MAX) would overflow the i32 `.pow(2)` this used to do; the field carve
+            // itself is already float-space and handles any magnitude here without a panic.
+            let (dx, dy) = (sw[1].0 as f32 - sw[0].0 as f32, sw[1].1 as f32 - sw[0].1 as f32);
+            let seg_len = (dx * dx + dy * dy).sqrt();
+            bb = Some(union(bb, carve(dmin, smin, sw[0], sw[1], reach, arc, seg_len)));
+            arc += seg_len;
+        }
+        if let Some(r) = bb {
+            composite(px, None, dmin.as_view(), smin.as_view(), r, s);
+            reset_region(dmin, r);
         }
     }
 
@@ -2497,36 +2512,35 @@ mod imp {
     /// For a flat alpha, the max-blend union of capsules IS the polyline's distance field — so
     /// glows and ghosts read as smooth ribbons, never chains of discs.
     #[allow(clippy::too_many_arguments)] // a raster primitive's natural arity, not an API smell
-    unsafe fn stamp_segment(
-        px: *mut u32,
-        w: i32,
-        h: i32,
-        from: (i32, i32),
-        to: (i32, i32),
-        color: u32,
-        width: f32,
-        a: u32,
-    ) {
-        unsafe {
-            let rad = (width / 2.0).max(1.0);
-            let ri = rad.ceil() as i32 + 1;
-            let x0 = (from.0.min(to.0) - ri).clamp(0, w - 1);
-            let x1 = (from.0.max(to.0) + ri).clamp(0, w - 1);
-            let y0 = (from.1.min(to.1) - ri).clamp(0, h - 1);
-            let y1 = (from.1.max(to.1) + ri).clamp(0, h - 1);
-            for yy in y0..=y1 {
-                for xx in x0..=x1 {
-                    let d = seg_dist_f((xx as f32, yy as f32), from, to);
-                    let cov = (rad + 0.5 - d).clamp(0.0, 1.0);
-                    if cov <= 0.0 {
-                        continue;
-                    }
-                    let aa = (a as f32 * cov) as u32;
-                    if aa == 0 {
-                        continue;
-                    }
-                    let idx = (yy * w + xx) as usize;
-                    *px.add(idx) = blend_max(*px.add(idx), color, aa);
+    fn stamp_segment(px: &mut PixelBuf, from: (i32, i32), to: (i32, i32), color: u32, width: f32, a: u32) {
+        let (w, h) = (px.w(), px.h());
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        let rad = (width / 2.0).max(1.0);
+        let ri = rad.ceil() as i32 + 1;
+        // saturating: a pathological endpoint near i32::MIN/MAX clips at the buffer edge instead
+        // of overflowing the subtract/add.
+        let x0 = (from.0.min(to.0).saturating_sub(ri)).clamp(0, w - 1);
+        let x1 = (from.0.max(to.0).saturating_add(ri)).clamp(0, w - 1);
+        let y0 = (from.1.min(to.1).saturating_sub(ri)).clamp(0, h - 1);
+        let y1 = (from.1.max(to.1).saturating_add(ri)).clamp(0, h - 1);
+        for yy in y0..=y1 {
+            for xx in x0..=x1 {
+                let d = seg_dist_f((xx as f32, yy as f32), from, to);
+                let cov = (rad + 0.5 - d).clamp(0.0, 1.0);
+                if cov <= 0.0 {
+                    continue;
+                }
+                let aa = (a as f32 * cov) as u32;
+                if aa == 0 {
+                    continue;
+                }
+                // SAFETY: (xx, yy) ranges over x0..=x1, y0..=y1, clamped above against this same
+                // buffer's px.w()/px.h() — not a separately-carried w/h.
+                unsafe {
+                    let under = px.get_unchecked(xx, yy);
+                    px.put_unchecked(xx, yy, blend_max(under, color, aa));
                 }
             }
         }
@@ -2536,15 +2550,8 @@ mod imp {
     /// light TRAVELS along the selected ink. The hard prism edge (baked in `clean`) is untouched;
     /// this adds a moving wave: a bright spectral crest sweeping along each stroke by arc-fraction,
     /// broken by per-point noise so it shimmers like the material rather than marching as a dot.
-    unsafe fn selection_wave(
-        px: *mut u32,
-        w: i32,
-        h: i32,
-        strokes: &[Stroke],
-        selected: &[usize],
-        frame: u32,
-    ) {
-        unsafe {
+    fn selection_wave(px: &mut PixelBuf, strokes: &[Stroke], selected: &[usize], frame: u32) {
+        {
             let facets = crate::weave::live_material().facets.max(1) as f32;
             let phase = frame as f32 * 0.16;
             for (rank, &i) in selected.iter().enumerate() {
@@ -2557,8 +2564,13 @@ mod imp {
                 let mut acc: Vec<f32> = Vec::with_capacity(s.pts.len());
                 acc.push(0.0);
                 for win in s.pts.windows(2) {
-                    cum += (((win[1].0 - win[0].0).pow(2) + (win[1].1 - win[0].1).pow(2)) as f32)
-                        .sqrt();
+                    // cast to f32 before subtracting (see render_stroke's identical fix): a
+                    // pathological point pair overflows the i32 `.pow(2)` this used to do.
+                    let (dx, dy) = (
+                        win[1].0 as f32 - win[0].0 as f32,
+                        win[1].1 as f32 - win[0].1 as f32,
+                    );
+                    cum += (dx * dx + dy * dy).sqrt();
                     acc.push(cum);
                 }
                 let total = cum.max(1.0);
@@ -2581,17 +2593,8 @@ mod imp {
                         / facets
                         * 360.0;
                     let c = hsv(hue, 0.85, 1.0);
-                    stamp_segment(px, w, h, p, p, c, s.width + 4.5, (150.0 * spark) as u32);
-                    stamp_segment(
-                        px,
-                        w,
-                        h,
-                        p,
-                        p,
-                        0xFFFFFF,
-                        s.width + 1.0,
-                        (200.0 * spark) as u32,
-                    );
+                    stamp_segment(px, p, p, c, s.width + 4.5, (150.0 * spark) as u32);
+                    stamp_segment(px, p, p, 0xFFFFFF, s.width + 1.0, (200.0 * spark) as u32);
                 }
             }
         }
@@ -2608,8 +2611,8 @@ mod imp {
     /// fades to nothing over `LASER_MS` instead of being kept. No hardcoded material, size or colour
     /// — each run renders through its own pen's brush (or the real Ichor material if that's the held
     /// pen), at the pen's width, so the laser is the same media you draw with, just transient.
-    unsafe fn draw_laser(px: *mut u32, w: i32, h: i32, runs: &[LaserRun], now: Instant) {
-        unsafe {
+    fn draw_laser(px: &mut PixelBuf, runs: &[LaserRun], now: Instant) {
+        {
             let life_of = |born: Instant| {
                 (1.0 - now.duration_since(born).as_millis() as f32 / LASER_MS as f32)
                     .clamp(0.0, 1.0)
@@ -2639,16 +2642,7 @@ mod imp {
                     if let Some(&(x, y, born)) = trail.first() {
                         let life = life_of(born);
                         if life > 0.0 {
-                            splat_soft(
-                                px,
-                                w,
-                                h,
-                                x,
-                                y,
-                                rad.max(3.0),
-                                pen.color,
-                                (235.0 * life * life) as u32,
-                            );
+                            splat_soft(px, x, y, rad.max(3.0), pen.color, (235.0 * life * life) as u32);
                         }
                     }
                     continue;
@@ -2659,17 +2653,7 @@ mod imp {
                     if let Some((px0, py0, pl)) = prev {
                         // the segment's fade tracks its two endpoints' lives (head bright → tail gone)
                         let amp = life.max(pl).powi(2);
-                        laser_segment(
-                            px,
-                            w,
-                            h,
-                            (px0, py0),
-                            (x, y),
-                            rad,
-                            amp,
-                            pen,
-                            material_mat.as_ref(),
-                        );
+                        laser_segment(px, (px0, py0), (x, y), rad, amp, pen, material_mat.as_ref());
                     }
                     prev = Some((x, y, life));
                 }
@@ -2677,16 +2661,7 @@ mod imp {
                 if let Some(&(x, y, born)) = trail.last() {
                     let life = life_of(born);
                     if life > 0.0 {
-                        splat_soft(
-                            px,
-                            w,
-                            h,
-                            x,
-                            y,
-                            (rad * 0.9).max(3.0),
-                            pen.color,
-                            (235.0 * life * life) as u32,
-                        );
+                        splat_soft(px, x, y, (rad * 0.9).max(3.0), pen.color, (235.0 * life * life) as u32);
                     }
                 }
             }
@@ -2697,10 +2672,8 @@ mod imp {
     /// held pen (gradient = the segment normal), else the pen's own brush — pre-multiplied and
     /// max-blended like the canvas ink so overlapping never darkens, scaled by the fade `amp`.
     #[allow(clippy::too_many_arguments)] // a fragment shader's natural arity (its varyings)
-    unsafe fn laser_segment(
-        px: *mut u32,
-        w: i32,
-        h: i32,
+    fn laser_segment(
+        px: &mut PixelBuf,
         a: (i32, i32),
         b: (i32, i32),
         rad: f32,
@@ -2708,45 +2681,53 @@ mod imp {
         pen: &super::Pen,
         material_mat: Option<&crate::weave::Material>,
     ) {
-        unsafe {
-            let r = (rad + 2.0).ceil() as i32 + 1;
-            let x0 = (a.0.min(b.0) - r).clamp(0, w - 1);
-            let x1 = (a.0.max(b.0) + r).clamp(0, w - 1);
-            let y0 = (a.1.min(b.1) - r).clamp(0, h - 1);
-            let y1 = (a.1.max(b.1) + r).clamp(0, h - 1);
-            let mt = crate::weave::seconds();
-            for yy in y0..=y1 {
-                for xx in x0..=x1 {
-                    let (d, t) = seg_proj((xx as f32, yy as f32), a, b);
-                    if d > rad + 2.0 {
-                        continue;
+        let (w, h) = (px.w(), px.h());
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        let r = (rad + 2.0).ceil() as i32 + 1;
+        // saturating: a pathological endpoint near i32::MIN/MAX clips at the buffer edge instead
+        // of overflowing the subtract/add.
+        let x0 = (a.0.min(b.0).saturating_sub(r)).clamp(0, w - 1);
+        let x1 = (a.0.max(b.0).saturating_add(r)).clamp(0, w - 1);
+        let y0 = (a.1.min(b.1).saturating_sub(r)).clamp(0, h - 1);
+        let y1 = (a.1.max(b.1).saturating_add(r)).clamp(0, h - 1);
+        let mt = crate::weave::seconds();
+        for yy in y0..=y1 {
+            for xx in x0..=x1 {
+                let (d, t) = seg_proj((xx as f32, yy as f32), a, b);
+                if d > rad + 2.0 {
+                    continue;
+                }
+                let (col, al) = match material_mat {
+                    Some(m) => {
+                        // analytic field gradient = the segment normal (so the rim/facets resolve)
+                        let (ax, ay) = (a.0 as f32, a.1 as f32);
+                        let (bx, by) = (b.0 as f32, b.1 as f32);
+                        let (cx, cy) = (ax + (bx - ax) * t, ay + (by - ay) * t);
+                        let (mut gx, mut gy) = (xx as f32 - cx, yy as f32 - cy);
+                        let gl = (gx * gx + gy * gy).sqrt().max(1e-3);
+                        gx /= gl;
+                        gy /= gl;
+                        material_core(d, rad, gx, gy, xx as f32, yy as f32, mt, m)
                     }
-                    let (col, al) = match material_mat {
-                        Some(m) => {
-                            // analytic field gradient = the segment normal (so the rim/facets resolve)
-                            let (ax, ay) = (a.0 as f32, a.1 as f32);
-                            let (bx, by) = (b.0 as f32, b.1 as f32);
-                            let (cx, cy) = (ax + (bx - ax) * t, ay + (by - ay) * t);
-                            let (mut gx, mut gy) = (xx as f32 - cx, yy as f32 - cy);
-                            let gl = (gx * gx + gy * gy).sqrt().max(1e-3);
-                            gx /= gl;
-                            gy /= gl;
-                            material_core(d, rad, gx, gy, xx as f32, yy as f32, mt, m)
-                        }
-                        None => {
-                            // the pen's OWN brush — the laser is the same media, just fading. (arc = 0:
-                            // the along-stroke streak doesn't vary on a transient pointer; the across/
-                            // tooth grain via d,x,y still reads, so crayon/chalk look like themselves.)
-                            let al = brush_alpha(pen.brush, false, 0x1A5E, d, rad, 0.0, xx, yy);
-                            (pen.color, al)
-                        }
-                    };
-                    let al = (al as f32 * amp) as u32;
-                    if al == 0 {
-                        continue;
+                    None => {
+                        // the pen's OWN brush — the laser is the same media, just fading. (arc = 0:
+                        // the along-stroke streak doesn't vary on a transient pointer; the across/
+                        // tooth grain via d,x,y still reads, so crayon/chalk look like themselves.)
+                        let al = brush_alpha(pen.brush, false, 0x1A5E, d, rad, 0.0, xx, yy);
+                        (pen.color, al)
                     }
-                    let idx = (yy * w + xx) as usize;
-                    *px.add(idx) = blend_max(*px.add(idx), col, al);
+                };
+                let al = (al as f32 * amp) as u32;
+                if al == 0 {
+                    continue;
+                }
+                // SAFETY: (xx, yy) ranges over x0..=x1, y0..=y1, clamped above against this same
+                // buffer's px.w()/px.h().
+                unsafe {
+                    let under = px.get_unchecked(xx, yy);
+                    px.put_unchecked(xx, yy, blend_max(under, col, al));
                 }
             }
         }
@@ -2754,20 +2735,8 @@ mod imp {
 
     /// A soft round bead (a degenerate point capsule) — the ping/head dots. A point→point
     /// `stamp_segment` IS a disc (distance-to-segment with a==b), AA'd + max-blended, no new code.
-    #[allow(clippy::too_many_arguments)] // a raster primitive's natural arity, not an API smell
-    unsafe fn splat_soft(
-        px: *mut u32,
-        w: i32,
-        h: i32,
-        cx: i32,
-        cy: i32,
-        rad: f32,
-        color: u32,
-        peak: u32,
-    ) {
-        unsafe {
-            stamp_segment(px, w, h, (cx, cy), (cx, cy), color, rad * 2.0, peak);
-        }
+    fn splat_soft(px: &mut PixelBuf, cx: i32, cy: i32, rad: f32, color: u32, peak: u32) {
+        stamp_segment(px, (cx, cy), (cx, cy), color, rad * 2.0, peak);
     }
 
     // ── ping animation easings (the "svg magic": smooth/overshoot/draw-on curves) ──
@@ -2790,44 +2759,36 @@ mod imp {
     /// shared base every ping's animation builds on. `rr` = radius, `band` = half-width, `amp` =
     /// brightness; `d` runs across the band, the gradient is radial, so the ring IS the ink's glass.
     #[allow(clippy::too_many_arguments)] // a raster primitive's varyings, not an API smell
-    unsafe fn ping_ring(
-        px: *mut u32,
-        w: i32,
-        h: i32,
-        cx: i32,
-        cy: i32,
-        rr: f32,
-        band: f32,
-        amp: f32,
-        m: &crate::weave::Material,
-    ) {
-        unsafe {
-            if amp <= 0.01 || rr <= 0.0 {
-                return;
-            }
-            let yl = ((cy as f32 - rr - band - 1.0) as i32).max(0);
-            let yh = ((cy as f32 + rr + band + 1.0) as i32).min(h - 1);
-            let xl = ((cx as f32 - rr - band - 1.0) as i32).max(0);
-            let xh = ((cx as f32 + rr + band + 1.0) as i32).min(w - 1);
-            let mt = crate::weave::seconds();
-            for yy in yl..=yh {
-                for xx in xl..=xh {
-                    let dxp = xx as f32 - cx as f32;
-                    let dyp = yy as f32 - cy as f32;
-                    let dist = (dxp * dxp + dyp * dyp).sqrt();
-                    let d = (dist - rr).abs();
-                    if d > band {
-                        continue;
-                    }
-                    let inv = 1.0 / dist.max(1e-3);
-                    let (col, al) =
-                        material_core(d, band, dxp * inv, dyp * inv, xx as f32, yy as f32, mt, m);
-                    let al = (al as f32 * amp.clamp(0.0, 1.0)) as u32;
-                    if al == 0 {
-                        continue;
-                    }
-                    let idx = (yy * w + xx) as usize;
-                    *px.add(idx) = blend_max(*px.add(idx), col, al);
+    fn ping_ring(px: &mut PixelBuf, cx: i32, cy: i32, rr: f32, band: f32, amp: f32, m: &crate::weave::Material) {
+        if amp <= 0.01 || rr <= 0.0 {
+            return;
+        }
+        let (w, h) = (px.w(), px.h());
+        let yl = ((cy as f32 - rr - band - 1.0) as i32).max(0);
+        let yh = ((cy as f32 + rr + band + 1.0) as i32).min(h - 1);
+        let xl = ((cx as f32 - rr - band - 1.0) as i32).max(0);
+        let xh = ((cx as f32 + rr + band + 1.0) as i32).min(w - 1);
+        let mt = crate::weave::seconds();
+        for yy in yl..=yh {
+            for xx in xl..=xh {
+                let dxp = xx as f32 - cx as f32;
+                let dyp = yy as f32 - cy as f32;
+                let dist = (dxp * dxp + dyp * dyp).sqrt();
+                let d = (dist - rr).abs();
+                if d > band {
+                    continue;
+                }
+                let inv = 1.0 / dist.max(1e-3);
+                let (col, al) = material_core(d, band, dxp * inv, dyp * inv, xx as f32, yy as f32, mt, m);
+                let al = (al as f32 * amp.clamp(0.0, 1.0)) as u32;
+                if al == 0 {
+                    continue;
+                }
+                // SAFETY: (xx, yy) ranges over xl..=xh, yl..=yh, clamped above against this same
+                // buffer's px.w()/px.h().
+                unsafe {
+                    let under = px.get_unchecked(xx, yy);
+                    px.put_unchecked(xx, yy, blend_max(under, col, al));
                 }
             }
         }
@@ -2837,10 +2798,8 @@ mod imp {
     /// DRAWN-ON up to `reveal` (0..1) of its total path length — so a ✓ strokes in, a ✗ slashes in.
     /// crosshair / ? / ! / ✓ / ✗ / → — the abstract comms idea, read at a glance.
     #[allow(clippy::too_many_arguments)] // a raster primitive's varyings, not an API smell
-    unsafe fn draw_ping_glyph(
-        px: *mut u32,
-        w: i32,
-        h: i32,
+    fn draw_ping_glyph(
+        px: &mut PixelBuf,
         cx: i32,
         cy: i32,
         sz: f32,
@@ -2849,7 +2808,7 @@ mod imp {
         alpha: u32,
         reveal: f32,
     ) {
-        unsafe {
+        {
             if alpha == 0 || sz < 1.0 {
                 return;
             }
@@ -2914,22 +2873,13 @@ mod imp {
                 }
                 let f = ((target - acc) / lens[i].max(1e-3)).clamp(0.0, 1.0); // partial draw of this seg
                 let bp = (a.0 + (b.0 - a.0) * f, a.1 + (b.1 - a.1) * f);
-                stamp_segment(
-                    px,
-                    w,
-                    h,
-                    pt(a.0, a.1),
-                    pt(bp.0, bp.1),
-                    color,
-                    sr * 2.0,
-                    alpha,
-                );
+                stamp_segment(px, pt(a.0, a.1), pt(bp.0, bp.1), color, sr * 2.0, alpha);
                 acc += lens[i];
             }
             if reveal >= 0.9 {
                 if let Some((dx, dy)) = dot {
                     let (px2, py2) = pt(dx, dy);
-                    splat_soft(px, w, h, px2, py2, sr, color, alpha);
+                    splat_soft(px, px2, py2, sr, color, alpha);
                 }
             }
         }
@@ -2940,17 +2890,8 @@ mod imp {
     /// Bang shockwaves + pops + shakes; Ask bobs in curiously; Yes/No draw their mark on; Arrow
     /// thrusts forward with a motion-trail. Everything fades over PING_MS.
     #[allow(clippy::too_many_arguments)] // a raster primitive's varyings, not an API smell
-    unsafe fn draw_ping(
-        px: *mut u32,
-        w: i32,
-        h: i32,
-        cx: i32,
-        cy: i32,
-        kind: PingKind,
-        color: u32,
-        age_ms: f32,
-    ) {
-        unsafe {
+    fn draw_ping(px: &mut PixelBuf, cx: i32, cy: i32, kind: PingKind, color: u32, age_ms: f32) {
+        {
             let life = (1.0 - age_ms / PING_MS as f32).clamp(0.0, 1.0);
             if life <= 0.0 {
                 return;
@@ -2974,8 +2915,6 @@ mod imp {
                         if rt > 0.0 && rt < 1.0 {
                             ping_ring(
                                 px,
-                                w,
-                                h,
                                 cx,
                                 cy,
                                 6.0 + 34.0 * (1.0 - ease_out(rt)),
@@ -2987,8 +2926,6 @@ mod imp {
                     }
                     ping_ring(
                         px,
-                        w,
-                        h,
                         cx,
                         cy,
                         6.0 + (1.0 - life) * 18.0,
@@ -2996,15 +2933,13 @@ mod imp {
                         life * life * 0.7,
                         &m,
                     );
-                    draw_ping_glyph(px, w, h, cx, cy, big * smooth(ent), kind, color, amask, 1.0);
+                    draw_ping_glyph(px, cx, cy, big * smooth(ent), kind, color, amask, 1.0);
                 }
                 // EMPHASIS: a fast shockwave, the ! pops with overshoot + a quick vertical shake.
                 PingKind::Bang => {
                     let sw = ease_out((age_ms / 240.0).clamp(0.0, 1.0));
                     ping_ring(
                         px,
-                        w,
-                        h,
                         cx,
                         cy,
                         6.0 + sw * 42.0,
@@ -3018,8 +2953,6 @@ mod imp {
                     let shake = (sk * std::f32::consts::TAU * 2.5).sin() * 3.0 * (1.0 - sk);
                     draw_ping_glyph(
                         px,
-                        w,
-                        h,
                         cx,
                         (cy as f32 + shake) as i32,
                         big * ease_back(ent),
@@ -3033,8 +2966,6 @@ mod imp {
                 PingKind::Ask => {
                     ping_ring(
                         px,
-                        w,
-                        h,
                         cx,
                         cy,
                         7.0 + (1.0 - life) * 26.0,
@@ -3045,8 +2976,6 @@ mod imp {
                     let bob = (age_ms * 0.006).sin() * 2.2 * life;
                     draw_ping_glyph(
                         px,
-                        w,
-                        h,
                         cx,
                         (cy as f32 + bob) as i32,
                         big * smooth(ent),
@@ -3060,8 +2989,6 @@ mod imp {
                 PingKind::Yes => {
                     ping_ring(
                         px,
-                        w,
-                        h,
                         cx,
                         cy,
                         7.0 + (1.0 - life) * 28.0,
@@ -3069,14 +2996,12 @@ mod imp {
                         (life * 0.85).min(1.0),
                         &m,
                     );
-                    draw_ping_glyph(px, w, h, cx, cy, big, kind, color, amask, ease_out(ent));
+                    draw_ping_glyph(px, cx, cy, big, kind, color, amask, ease_out(ent));
                 }
                 // NEGATE: the ✗ slashes in (both diagonals draw on) + a quick horizontal shake.
                 PingKind::No => {
                     ping_ring(
                         px,
-                        w,
-                        h,
                         cx,
                         cy,
                         7.0 + (1.0 - life) * 28.0,
@@ -3088,8 +3013,6 @@ mod imp {
                     let shake = (sk * std::f32::consts::TAU * 2.5).sin() * 2.8 * (1.0 - sk);
                     draw_ping_glyph(
                         px,
-                        w,
-                        h,
                         (cx as f32 + shake) as i32,
                         cy,
                         big,
@@ -3103,8 +3026,6 @@ mod imp {
                 PingKind::Arrow => {
                     ping_ring(
                         px,
-                        w,
-                        h,
                         cx,
                         cy,
                         7.0 + (1.0 - life) * 26.0,
@@ -3115,8 +3036,6 @@ mod imp {
                     let push = (1.0 - ease_out(ent)) * big * 1.4; // slides in from behind to land at cx
                     draw_ping_glyph(
                         px,
-                        w,
-                        h,
                         (cx as f32 - push * 2.8) as i32,
                         cy,
                         big,
@@ -3127,8 +3046,6 @@ mod imp {
                     );
                     draw_ping_glyph(
                         px,
-                        w,
-                        h,
                         (cx as f32 - push * 1.8) as i32,
                         cy,
                         big,
@@ -3139,8 +3056,6 @@ mod imp {
                     );
                     draw_ping_glyph(
                         px,
-                        w,
-                        h,
                         (cx as f32 - push) as i32,
                         cy,
                         big,
@@ -3155,8 +3070,6 @@ mod imp {
             let beat = 0.7 + 0.3 * (age_ms * 0.02).sin();
             splat_soft(
                 px,
-                w,
-                h,
                 cx,
                 cy,
                 2.2 * life.max(0.3),
@@ -3170,61 +3083,300 @@ mod imp {
     /// the six pings laid clockwise from North, the one under the aim lit. Drawn on the canvas at
     /// the cursor; the session resolves the choice by release direction (the radial weave grammar).
     #[allow(clippy::too_many_arguments)]
-    unsafe fn draw_ping_wheel(
-        px: *mut u32,
-        w: i32,
-        h: i32,
-        cx: i32,
-        cy: i32,
-        sect: i32,
-        color: u32,
-        frame: u32,
-    ) {
-        unsafe {
-            let n = PingKind::WHEEL.len() as i32;
-            let rr = 64.0;
-            let breathe = 0.82 + 0.18 * ((frame as f32) * 0.12).sin();
-            // the MENU wears the PEN's colour (it IS the stroke you're about to drop) — the six kinds
-            // are told apart by their SYMBOL, not a hue; the aimed one goes white-hot to lead the eye.
-            let phos = color;
-            splat_soft(px, w, h, cx, cy, 6.0, phos, (90.0 * breathe) as u32); // faint hub = "here"
-            for (k, kind) in PingKind::WHEEL.iter().enumerate() {
-                let a = k as f32 / n as f32 * std::f32::consts::TAU - std::f32::consts::FRAC_PI_2; // N, clockwise
-                let (dx, dy) = (a.cos(), a.sin());
-                let lit = k as i32 == sect;
-                // a faint spoke out to the option, brightening when aimed
-                for t in 1..=10 {
-                    let f = t as f32 / 10.0;
-                    let (x, y) = (cx as f32 + dx * rr * f, cy as f32 + dy * rr * f);
-                    stamp_segment(
-                        px,
-                        w,
-                        h,
-                        (x as i32, y as i32),
-                        (x as i32, y as i32),
-                        phos,
-                        if lit { 2.6 } else { 1.8 },
-                        (((if lit { 130.0 } else { 55.0 }) * f) as u32).max(1),
-                    );
-                }
-                // the option's SYMBOL at the rim — the aimed one bigger + white-hot over a soft halo
-                let (ox, oy) = ((cx as f32 + dx * rr) as i32, (cy as f32 + dy * rr) as i32);
-                if lit {
-                    splat_soft(px, w, h, ox, oy, 13.0, phos, (60.0 * breathe) as u32);
-                }
-                draw_ping_glyph(
+    fn draw_ping_wheel(px: &mut PixelBuf, cx: i32, cy: i32, sect: i32, color: u32, frame: u32) {
+        let n = PingKind::WHEEL.len() as i32;
+        let rr = 64.0;
+        let breathe = 0.82 + 0.18 * ((frame as f32) * 0.12).sin();
+        // the MENU wears the PEN's colour (it IS the stroke you're about to drop) — the six kinds
+        // are told apart by their SYMBOL, not a hue; the aimed one goes white-hot to lead the eye.
+        let phos = color;
+        splat_soft(px, cx, cy, 6.0, phos, (90.0 * breathe) as u32); // faint hub = "here"
+        for (k, kind) in PingKind::WHEEL.iter().enumerate() {
+            let a = k as f32 / n as f32 * std::f32::consts::TAU - std::f32::consts::FRAC_PI_2; // N, clockwise
+            let (dx, dy) = (a.cos(), a.sin());
+            let lit = k as i32 == sect;
+            // a faint spoke out to the option, brightening when aimed
+            for t in 1..=10 {
+                let f = t as f32 / 10.0;
+                let (x, y) = (cx as f32 + dx * rr * f, cy as f32 + dy * rr * f);
+                stamp_segment(
                     px,
-                    w,
-                    h,
-                    ox,
-                    oy,
-                    if lit { 13.0 } else { 9.0 },
-                    *kind,
-                    if lit { 0xFFFFFF } else { phos },
-                    if lit { 235 } else { 120 },
-                    1.0,
+                    (x as i32, y as i32),
+                    (x as i32, y as i32),
+                    phos,
+                    if lit { 2.6 } else { 1.8 },
+                    (((if lit { 130.0 } else { 55.0 }) * f) as u32).max(1),
                 );
             }
+            // the option's SYMBOL at the rim — the aimed one bigger + white-hot over a soft halo
+            let (ox, oy) = ((cx as f32 + dx * rr) as i32, (cy as f32 + dy * rr) as i32);
+            if lit {
+                splat_soft(px, ox, oy, 13.0, phos, (60.0 * breathe) as u32);
+            }
+            draw_ping_glyph(
+                px,
+                ox,
+                oy,
+                if lit { 13.0 } else { 9.0 },
+                *kind,
+                if lit { 0xFFFFFF } else { phos },
+                if lit { 235 } else { 120 },
+                1.0,
+            );
+        }
+    }
+
+    /// Adversarial coverage for the raster primitives above: every one of them is secretly pure
+    /// (no window, no DIB, no OS call) once its buffers are `PixelBuf`/`FieldBuf` instead of a
+    /// caller-trusted `(pointer, w, h)` triple. These tests drive them directly with synthetic
+    /// buffers at edge-case geometry — the exact stale/mismatched-dimensions shape the PixelBuf
+    /// refactor exists to make unrepresentable — and assert no panic and no out-of-region write.
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// A `w*h`-logical-word buffer with a sentinel guard band after it. Any raster primitive
+        /// that walks past the logical region (the exact heap-corruption shape a stale/mismatched
+        /// `w`/`h` used to allow) overwrites a sentinel — `assert_guard_intact` catches it.
+        struct Guarded {
+            buf: Vec<u32>,
+            w: i32,
+            h: i32,
+        }
+        const GUARD: usize = 64;
+        const SENTINEL: u32 = 0xDEAD_BEEF;
+        impl Guarded {
+            fn new(w: i32, h: i32) -> Self {
+                let n = if w <= 0 || h <= 0 { 0 } else { (w * h) as usize };
+                let mut buf = vec![0u32; n + GUARD];
+                for s in &mut buf[n..] {
+                    *s = SENTINEL;
+                }
+                Guarded { buf, w, h }
+            }
+            fn pixel_buf(&mut self) -> PixelBuf<'_> {
+                let n = if self.w <= 0 || self.h <= 0 {
+                    0
+                } else {
+                    (self.w * self.h) as usize
+                };
+                PixelBuf::new(&mut self.buf[..n], self.w, self.h)
+            }
+            fn assert_guard_intact(&self) {
+                let n = self.buf.len() - GUARD;
+                assert!(
+                    self.buf[n..].iter().all(|&v| v == SENTINEL),
+                    "guard band corrupted — an OOB write escaped the logical {}x{} region",
+                    self.w,
+                    self.h
+                );
+            }
+        }
+
+        fn stroke(pts: Vec<(i32, i32)>, brush: Brush, width: f32) -> Stroke {
+            Stroke {
+                pts,
+                color: 0xFF8040,
+                width,
+                brush,
+                ghost: false,
+                seed: 0x1234,
+            }
+        }
+
+        const EXTREME: [i32; 9] = [
+            i32::MIN,
+            i32::MIN + 1,
+            -1_000_000_000,
+            -1,
+            0,
+            1,
+            1_000_000_000,
+            i32::MAX - 1,
+            i32::MAX,
+        ];
+
+        #[test]
+        fn stamp_segment_zero_size_buffer_is_noop_not_panic() {
+            let mut g = Guarded::new(0, 0);
+            let mut pb = g.pixel_buf();
+            stamp_segment(&mut pb, (0, 0), (5, 5), 0xFFFFFF, 4.0, 200);
+            drop(pb);
+            g.assert_guard_intact();
+        }
+
+        #[test]
+        fn stamp_segment_extreme_coordinates_never_panic_or_corrupt() {
+            let mut g = Guarded::new(24, 24);
+            let mut pb = g.pixel_buf();
+            for &x in &EXTREME {
+                for &y in &EXTREME {
+                    stamp_segment(&mut pb, (x, y), (x.wrapping_add(3), y), 0xFF00FF, 6.0, 255);
+                }
+            }
+            drop(pb);
+            g.assert_guard_intact();
+        }
+
+        #[test]
+        fn stamp_segment_radius_larger_than_buffer_stays_in_bounds() {
+            let mut g = Guarded::new(8, 8);
+            let mut pb = g.pixel_buf();
+            // a capsule whose radius dwarfs the whole buffer, crossing all four edges
+            stamp_segment(&mut pb, (-500, -500), (500, 500), 0xFFFFFF, 100_000.0, 255);
+            drop(pb);
+            g.assert_guard_intact();
+        }
+
+        #[test]
+        fn splat_soft_extreme_and_1x1_buffer() {
+            let mut g = Guarded::new(1, 1);
+            let mut pb = g.pixel_buf();
+            for &(x, y) in &[(0, 0), (i32::MIN, i32::MAX), (i32::MAX, i32::MIN), (-1, -1)] {
+                splat_soft(&mut pb, x, y, 9999.0, 0xABCDEF, 255);
+            }
+            drop(pb);
+            g.assert_guard_intact();
+        }
+
+        #[test]
+        fn carve_and_reset_region_zero_size_field_is_noop() {
+            let mut dmin_data: Vec<f32> = Vec::new();
+            let mut smin_data: Vec<f32> = Vec::new();
+            let mut dmin = FieldBuf::new(&mut dmin_data, 0, 0);
+            let mut smin = FieldBuf::new(&mut smin_data, 0, 0);
+            let r = carve(&mut dmin, &mut smin, (i32::MIN, i32::MIN), (i32::MAX, i32::MAX), 50.0, 0.0, 10.0);
+            reset_region(&mut dmin, r); // must not panic on the degenerate region carve() returns
+        }
+
+        #[test]
+        fn carve_extreme_segment_stays_in_bounds() {
+            let (w, h) = (12, 12);
+            let mut dmin_data = vec![f32::MAX; (w * h) as usize];
+            let mut smin_data = vec![0.0f32; (w * h) as usize];
+            let mut dmin = FieldBuf::new(&mut dmin_data, w, h);
+            let mut smin = FieldBuf::new(&mut smin_data, w, h);
+            let r = carve(&mut dmin, &mut smin, (i32::MIN, i32::MIN), (i32::MAX, i32::MAX), 25.0, 0.0, 1e9);
+            // the returned region must itself be within the field's own bounds
+            assert!(r.0 >= 0 && r.2 <= w - 1 || r.0 > r.2);
+            assert!(r.1 >= 0 && r.3 <= h - 1 || r.1 > r.3);
+            reset_region(&mut dmin, r);
+        }
+
+        #[test]
+        fn composite_and_render_stroke_zero_size_canvas_is_noop() {
+            let mut px_data: Vec<u32> = Vec::new();
+            let mut dmin_data: Vec<f32> = Vec::new();
+            let mut smin_data: Vec<f32> = Vec::new();
+            let mut px = PixelBuf::new(&mut px_data, 0, 0);
+            let mut dmin = FieldBuf::new(&mut dmin_data, 0, 0);
+            let mut smin = FieldBuf::new(&mut smin_data, 0, 0);
+            let s = stroke(vec![(i32::MIN, 0), (0, i32::MAX), (5, 5)], Brush::Marker, 6.0);
+            render_stroke(&mut px, &mut dmin, &mut smin, &s); // must not panic
+        }
+
+        #[test]
+        fn render_stroke_extreme_points_stay_in_guard_band() {
+            let (w, h) = (16, 16);
+            let mut g = Guarded::new(w, h);
+            let mut dmin_data = vec![f32::MAX; (w * h) as usize];
+            let mut smin_data = vec![0.0f32; (w * h) as usize];
+            let mut dmin = FieldBuf::new(&mut dmin_data, w, h);
+            let mut smin = FieldBuf::new(&mut smin_data, w, h);
+            for &brush in &[Brush::Marker, Brush::Crayon, Brush::Water, Brush::Chalk, Brush::DirectedIntent] {
+                let s = stroke(
+                    vec![
+                        (i32::MIN, i32::MIN),
+                        (i32::MAX, i32::MAX),
+                        (i32::MIN, i32::MAX),
+                        (7, 7),
+                    ],
+                    brush,
+                    12.0,
+                );
+                let mut pb = g.pixel_buf();
+                render_stroke(&mut pb, &mut dmin, &mut smin, &s);
+                drop(pb);
+            }
+            g.assert_guard_intact();
+        }
+
+        #[test]
+        fn restore_region_mismatched_and_degenerate_regions_are_safe() {
+            let mut g = Guarded::new(6, 6);
+            let base_data = vec![0x11223344u32; 36];
+            let base = PixelView::new(&base_data, 6, 6);
+            let mut pb = g.pixel_buf();
+            // a region that runs off every edge, plus the degenerate empty-region convention
+            restore_region(&mut pb, base, (-100, -100, 100, 100));
+            restore_region(&mut pb, base, (0, 0, -1, -1));
+            drop(pb);
+            g.assert_guard_intact();
+        }
+
+        #[test]
+        fn selection_wave_and_draw_laser_with_extreme_geometry() {
+            let mut g = Guarded::new(20, 20);
+            let strokes = vec![stroke(
+                vec![(i32::MIN, 0), (0, 0), (i32::MAX, i32::MAX)],
+                Brush::Water,
+                8.0,
+            )];
+            let selected = vec![0usize, 99usize]; // 99 is out of range — must be skipped, not panic
+            let mut pb = g.pixel_buf();
+            selection_wave(&mut pb, &strokes, &selected, 42);
+            let runs = vec![LaserRun {
+                pen: super::super::Pen {
+                    brush: Brush::Marker,
+                    color: 0xFFFFFF,
+                    width: 5.0,
+                },
+                pts: vec![
+                    (i32::MIN, i32::MIN, Instant::now()),
+                    (i32::MAX, i32::MAX, Instant::now()),
+                    (10, 10, Instant::now()),
+                ],
+            }];
+            draw_laser(&mut pb, &runs, Instant::now());
+            drop(pb);
+            g.assert_guard_intact();
+        }
+
+        #[test]
+        fn ping_family_extreme_geometry_stays_in_guard_band() {
+            let mut g = Guarded::new(20, 20);
+            for &(cx, cy) in &[(i32::MIN, i32::MIN), (i32::MAX, i32::MAX), (10, 10), (-500, 500)] {
+                let mut pb = g.pixel_buf();
+                for kind in PingKind::WHEEL {
+                    draw_ping(&mut pb, cx, cy, kind, 0xFF00AA, 50.0);
+                    draw_ping_wheel(&mut pb, cx, cy, 2, 0x00FFAA, 7);
+                }
+                drop(pb);
+            }
+            g.assert_guard_intact();
+        }
+
+        #[test]
+        fn ping_family_zero_size_buffer_is_noop() {
+            let mut g = Guarded::new(0, 0);
+            let mut pb = g.pixel_buf();
+            draw_ping(&mut pb, 0, 0, PingKind::Bang, 0xFFFFFF, 10.0);
+            draw_ping_wheel(&mut pb, 0, 0, 0, 0xFFFFFF, 1);
+            drop(pb);
+            g.assert_guard_intact();
+        }
+
+        /// The refactor's headline guarantee, demonstrated directly: a `PixelBuf` can only be
+        /// built from a slice whose length actually matches the `w`/`h` it's paired with — a
+        /// caller holding stale dimensions relative to its buffer cannot construct one at all,
+        /// so there is no `(pointer, w, h)` triple left to go stale against each other.
+        #[test]
+        #[should_panic(expected = "slice len")]
+        fn stale_dimensions_cannot_construct_a_pixel_buf() {
+            let mut canvas = vec![0u32; 64 * 64]; // the REAL buffer size
+            let stale_w = 128; // a caller's cached width from before a resize
+            let stale_h = 128;
+            let _ = PixelBuf::new(&mut canvas, stale_w, stale_h);
         }
     }
 }

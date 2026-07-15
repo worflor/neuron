@@ -37,6 +37,7 @@ mod prefs;
 mod prof_log;
 #[cfg(windows)]
 mod purge;
+mod raster;
 mod runtime;
 mod sound;
 mod strokelab;

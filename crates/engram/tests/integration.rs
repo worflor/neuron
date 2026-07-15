@@ -1,6 +1,6 @@
 //! Integration tests: full end-to-end pipeline on real text.
 //!
-//! Feeds golden vector .txt articles through ByteHistogram → encode →
+//! Feeds article-shaped .txt fixtures through ByteHistogram → encode →
 //! wire → decode, verifying the complete pipeline.
 
 use engram::brain::Brain;
@@ -11,41 +11,44 @@ use engram::histogram;
 use engram::types::Mode;
 use engram::wire::{from_wire, from_wire_compact, to_wire, to_wire_compact};
 
-/// Path to golden vector text files.
+/// In-repo fixture corpus (checked in, always available).
+const FIXTURES_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+
+/// External golden vector corpus, used when present (e.g. some CI/dev
+/// setups vendor a larger real-article corpus outside the repo). Falls
+/// back to the in-repo fixtures above when absent.
 const GOLDEN_DIR: &str = "../rag_tests/engram/cache/_golden_vectors";
 
-/// Load a golden vector text file.
-fn load_text(name: &str) -> Option<String> {
-    let path = format!("{}/{}.txt", GOLDEN_DIR, name);
-    std::fs::read_to_string(&path).ok()
+/// Load a fixture text file, preferring the in-repo corpus and falling
+/// back to the external golden corpus. Panics loudly if neither is
+/// readable — tests must never silently skip for a missing corpus.
+fn load_text(name: &str) -> String {
+    let fixture_path = format!("{}/{}.txt", FIXTURES_DIR, name);
+    if let Ok(t) = std::fs::read_to_string(&fixture_path) {
+        return t;
+    }
+
+    let golden_path = format!("{}/{}.txt", GOLDEN_DIR, name);
+    if let Ok(t) = std::fs::read_to_string(&golden_path) {
+        return t;
+    }
+
+    panic!(
+        "missing text corpus for '{name}': not found at in-repo fixture \
+         path ({fixture_path}) or external golden-vector path ({golden_path}). \
+         Add crates/engram/tests/fixtures/{name}.txt or provide the external corpus."
+    );
 }
 
-/// All golden vector article names.
-const ARTICLES: &[&str] = &[
-    "cheese",
-    "platypus",
-    "toilet",
-    "zombie",
-    "banana",
-    "dragon",
-    "infinite_monkey_theorem",
-    "trolley_problem",
-    "fermi_paradox",
-    "moon_landing_conspiracy_theories",
-];
+/// All article fixture names (in-repo corpus, see tests/fixtures/).
+const ARTICLES: &[&str] = &["repetitive", "short_burst", "varied_vocab", "long_form"];
 
 // ─── Full pipeline tests ───────────────────────────────────────────
 
 #[test]
 fn histogram_produces_valid_trajectories() {
     for &name in ARTICLES {
-        let text = match load_text(name) {
-            Some(t) => t,
-            None => {
-                eprintln!("skipping {} (file not found)", name);
-                continue;
-            }
-        };
+        let text = load_text(name);
 
         let (traj, t) = histogram::text_to_trajectory(&text, histogram::default_chunk_size());
 
@@ -69,10 +72,7 @@ fn histogram_produces_valid_trajectories() {
 #[test]
 fn encode_decode_roundtrip_all_articles() {
     for &name in ARTICLES {
-        let text = match load_text(name) {
-            Some(t) => t,
-            None => continue,
-        };
+        let text = load_text(name);
 
         let (traj, t) = histogram::text_to_trajectory(&text, histogram::default_chunk_size());
         if t < 4 {
@@ -118,10 +118,7 @@ fn encode_decode_roundtrip_all_articles() {
 #[test]
 fn wire_roundtrip_all_articles() {
     for &name in ARTICLES {
-        let text = match load_text(name) {
-            Some(t) => t,
-            None => continue,
-        };
+        let text = load_text(name);
 
         let (traj, t) = histogram::text_to_trajectory(&text, histogram::default_chunk_size());
         if t < 4 {
@@ -170,10 +167,7 @@ fn brain_absorb_all_articles() {
 
     let mut absorbed = 0;
     for &name in ARTICLES {
-        let text = match load_text(name) {
-            Some(t) => t,
-            None => continue,
-        };
+        let text = load_text(name);
 
         let (traj, t) = histogram::text_to_trajectory(&text, histogram::default_chunk_size());
         if t < 4 {
@@ -204,10 +198,7 @@ fn brain_measure_after_absorb() {
 
     let mut trajs = Vec::new();
     for &name in ARTICLES {
-        let text = match load_text(name) {
-            Some(t) => t,
-            None => continue,
-        };
+        let text = load_text(name);
         let (traj, t) = histogram::text_to_trajectory(&text, histogram::default_chunk_size());
         if t < 4 {
             continue;
@@ -235,10 +226,7 @@ fn brain_save_load_roundtrip() {
     brain.name = "Alexandria".into();
 
     for &name in &ARTICLES[..3] {
-        let text = match load_text(name) {
-            Some(t) => t,
-            None => continue,
-        };
+        let text = load_text(name);
         let (traj, t) = histogram::text_to_trajectory(&text, histogram::default_chunk_size());
         if t < 4 {
             continue;
@@ -278,10 +266,7 @@ fn brain_save_load_roundtrip() {
 fn encoding_modes_are_realistic() {
     // Real articles should produce mostly CASCADED blocks
     for &name in ARTICLES {
-        let text = match load_text(name) {
-            Some(t) => t,
-            None => continue,
-        };
+        let text = load_text(name);
 
         let (traj, t) = histogram::text_to_trajectory(&text, histogram::default_chunk_size());
         if t < 4 {
@@ -324,10 +309,7 @@ fn encoding_modes_are_realistic() {
 #[test]
 fn compression_ratio_is_meaningful() {
     for &name in ARTICLES {
-        let text = match load_text(name) {
-            Some(t) => t,
-            None => continue,
-        };
+        let text = load_text(name);
 
         let (traj, t) = histogram::text_to_trajectory(&text, histogram::default_chunk_size());
         if t < 4 {

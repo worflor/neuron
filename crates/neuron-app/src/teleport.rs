@@ -810,7 +810,11 @@ fn scry_thread(rx: std::sync::mpsc::Receiver<ScryCmd>) {
                 // repaint the sparkle frame around the live portal (animated rim + travelling sparkles)
                 if let Some((px, py, pw, ph)) = portal {
                     if !frame_win.is_null() {
-                        paint_scry_frame(fpx, pw, ph);
+                        paint_scry_frame(
+                            &mut crate::raster::PixelBuf::from_raw_parts(fpx, SCRY_FRAME_W, SCRY_FRAME_H),
+                            pw,
+                            ph,
+                        );
                         let fpos = POINT {
                             x: px - SCRY_FRAME_B,
                             y: py - SCRY_FRAME_B,
@@ -924,12 +928,19 @@ const SCRY_FRAME_W: i32 = 640 + 2 * SCRY_FRAME_B; // the portal is capped ≤ 64
 const SCRY_FRAME_H: i32 = 420 + 2 * SCRY_FRAME_B;
 
 
-/// Paint the sparkle frame into `px` (a premultiplied-ARGB DIB of stride `SCRY_FRAME_W`) for the
-/// live portal size `pw×ph`: a glowing phosphor rim hugging the portal's edge that drifts through a
-/// faint prism (the white→aberration look), with six diffused sparkle crests sliding around the
-/// perimeter. The interior (where the thumbnail sits) stays fully transparent so the peek shows.
+/// Paint the sparkle frame into `px` (a premultiplied-ARGB DIB `SCRY_FRAME_W × SCRY_FRAME_H`, the
+/// fixed size it was allocated at) for the live portal size `pw×ph`: a glowing phosphor rim
+/// hugging the portal's edge that drifts through a faint prism (the white→aberration look), with
+/// six diffused sparkle crests sliding around the perimeter. The interior (where the thumbnail
+/// sits) stays fully transparent so the peek shows.
+///
+/// `pw`/`ph` are bounded ≤ 640×420 by `Show`'s scale-down (`fw`/`fh` therefore ≤ `SCRY_FRAME_W`/
+/// `SCRY_FRAME_H`) — but that invariant lives at a distant call site, not here. `px` takes a
+/// bounds-checked [`PixelBuf`] fixed at the DIB's real allocation size instead of a raw pointer +
+/// the derived `fw`/`fh`, so if that distant invariant is ever loosened, a too-large portal clips
+/// its sparkle frame at the DIB edge instead of corrupting adjacent memory.
 #[cfg(windows)]
-fn paint_scry_frame(px: *mut u32, pw: i32, ph: i32) {
+fn paint_scry_frame(px: &mut crate::raster::PixelBuf, pw: i32, ph: i32) {
     use crate::weave::{phase, swell, tempo};
     use std::f32::consts::{PI, TAU};
     let b = SCRY_FRAME_B;
@@ -938,7 +949,6 @@ fn paint_scry_frame(px: *mut u32, pw: i32, ph: i32) {
     let (cx, cy) = (fw as f32 / 2.0, fh as f32 / 2.0);
     let (rx0, ry0, rx1, ry1) = (b as f32, b as f32, (b + pw) as f32, (b + ph) as f32);
     let band = b as f32 * 0.95;
-    let stride = SCRY_FRAME_W;
     // the material's TEMPO drives every moving part — wall-clock, frame-rate independent, off the
     // shared Directed-Intent clock (so this can never strobe again, and a 60fps portal reads the
     // same as a 30fps canvas). Compute the time-varying phases ONCE per paint, not per pixel.
@@ -964,9 +974,8 @@ fn paint_scry_frame(px: *mut u32, pw: i32, ph: i32) {
             };
             let mut glow = (1.0 - d / band).clamp(0.0, 1.0);
             glow *= glow;
-            let idx = (y * stride + x) as usize;
             if glow < 0.012 {
-                unsafe { *px.add(idx) = 0 };
+                px.put(x, y, 0);
                 continue;
             }
             // perimeter angle (0..TAU) for the prism hue + the travelling sparkle crests
@@ -989,7 +998,7 @@ fn paint_scry_frame(px: *mut u32, pw: i32, ph: i32) {
             let rim_a = glow * 0.62 * breath; // the rim glow breathes, gently, on the shared clock
             let a = ((rim_a + spark) * 255.0).min(255.0);
             if a < 1.0 {
-                unsafe { *px.add(idx) = 0 };
+                px.put(x, y, 0);
                 continue;
             }
             // phosphor rim drifting through a faint prism (white→aberration); sparkles burn white.
@@ -1005,7 +1014,7 @@ fn paint_scry_frame(px: *mut u32, pw: i32, ph: i32) {
             let rr = (cr * 255.0) as u32 * a8 / 255;
             let gg = (cg * 255.0) as u32 * a8 / 255;
             let bb = (cb * 255.0) as u32 * a8 / 255;
-            unsafe { *px.add(idx) = (a8 << 24) | (rr << 16) | (gg << 8) | bb };
+            px.put(x, y, (a8 << 24) | (rr << 16) | (gg << 8) | bb);
         }
     }
 }

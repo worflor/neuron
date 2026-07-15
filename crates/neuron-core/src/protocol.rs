@@ -256,4 +256,128 @@ mod tests {
         assert_eq!(r.args, [0u8; 80]);
         assert_eq!(r.status(), Status::New);
     }
+
+    // ---- Property tests. `Report`'s fields are all raw u8/[u8;80] — the whole space is exactly
+    // `any::<u8>()`/`any::<[u8;80]>()`, no domain narrowing needed.
+    mod props {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn cfg() -> ProptestConfig {
+            ProptestConfig { cases: 256, ..ProptestConfig::default() }
+        }
+
+        /// `[u8; 80]` generator — proptest's `array::uniformN` helpers stop at 32, so build the
+        /// 80-byte args payload from a fixed-length `Vec` and convert (the length is pinned by
+        /// `collection::vec`'s exact-size range, so `try_into` can never fail).
+        fn args80() -> impl Strategy<Value = [u8; 80]> {
+            proptest::collection::vec(any::<u8>(), 80)
+                .prop_map(|v| v.try_into().expect("vec length pinned to 80 by the strategy"))
+        }
+
+        proptest! {
+            #![proptest_config(cfg())]
+
+            /// (a) `to_buf` → `from_buf` round-trips every field losslessly for ARBITRARY field
+            /// values, generalizing `roundtrip_preserves_status_tx_id_and_full_args_payload`'s
+            /// single fixed sample to the whole u8/[u8;80] space.
+            #[test]
+            fn report_roundtrips_through_its_buffer(
+                status in any::<u8>(),
+                transaction_id in any::<u8>(),
+                data_size in any::<u8>(),
+                class in any::<u8>(),
+                id in any::<u8>(),
+                args in args80(),
+            ) {
+                let r = Report { status, transaction_id, data_size, class, id, args };
+                let buf = r.to_buf();
+                let back = Report::from_buf(&buf);
+                prop_assert_eq!(back.status, r.status);
+                prop_assert_eq!(back.transaction_id, r.transaction_id);
+                prop_assert_eq!(back.data_size, r.data_size);
+                prop_assert_eq!(back.class, r.class);
+                prop_assert_eq!(back.id, r.id);
+                prop_assert_eq!(back.args, r.args);
+            }
+
+            /// (b) The CRC is an XOR-fold over exactly buffer bytes `[3..=88]` (`crc`, protocol.rs
+            /// line ~99: `buf[3..=88].iter().fold(0u8, |c, &b| c ^ b)`). XOR-fold is a true law:
+            /// flipping ANY SINGLE byte within that span always changes the fold (XOR is its own
+            /// inverse — `old ^ new != 0` whenever `old != new`, and folding a changed term always
+            /// changes the total for an XOR accumulator). So for an arbitrary report and an
+            /// arbitrary index inside [3, 88] and an arbitrary non-zero XOR delta, corrupting that
+            /// byte must change the recomputed crc relative to the original stored one.
+            #[test]
+            fn crc_detects_any_single_byte_corruption_in_its_span(
+                status in any::<u8>(),
+                transaction_id in any::<u8>(),
+                data_size in any::<u8>(),
+                class in any::<u8>(),
+                id in any::<u8>(),
+                args in args80(),
+                span_offset in 0usize..=85, // 3..=88 is 86 positions; offset indexes into that span
+                delta in 1u8..=255,          // non-zero XOR delta guarantees an actual change
+            ) {
+                let r = Report { status, transaction_id, data_size, class, id, args };
+                let buf = r.to_buf();
+                let original_crc = crc(&buf);
+
+                let idx = 3 + span_offset;
+                let mut corrupted = buf;
+                corrupted[idx] ^= delta;
+                prop_assert_ne!(
+                    crc(&corrupted),
+                    original_crc,
+                    "flipping byte {} (inside the [3..=88] CRC span) with delta {:#04x} must change the crc",
+                    idx, delta
+                );
+            }
+
+            /// (b, complement) A byte OUTSIDE the CRC span ([0..=2] report-id/status/transaction_id,
+            /// or [89..=90] the crc slot itself + reserved) never changes the recompute — pins the
+            /// span boundary from the other side, so a future off-by-one in `crc`'s range literal
+            /// trips one of these two properties.
+            #[test]
+            fn crc_ignores_corruption_outside_its_span(
+                status in any::<u8>(),
+                transaction_id in any::<u8>(),
+                data_size in any::<u8>(),
+                class in any::<u8>(),
+                id in any::<u8>(),
+                args in args80(),
+                outside_idx in prop_oneof![0usize..=2, 89usize..=90],
+                delta in 1u8..=255,
+            ) {
+                let r = Report { status, transaction_id, data_size, class, id, args };
+                let buf = r.to_buf();
+                let original_crc = crc(&buf);
+
+                let mut corrupted = buf;
+                corrupted[outside_idx] ^= delta;
+                prop_assert_eq!(
+                    crc(&corrupted),
+                    original_crc,
+                    "byte {} sits outside the [3..=88] CRC span and must not affect the recompute",
+                    outside_idx
+                );
+            }
+
+            /// (c) `reply_status` never panics for ANY slice length 0..96 and ANY content — extends
+            /// the existing truncated-slice unit tests (length 8, length 0) to the whole short-slice
+            /// space, and pins the documented `b.len() <= 8` guard: any buffer at or below that
+            /// length always yields `None`.
+            #[test]
+            fn reply_status_never_panics_on_arbitrary_slices(
+                buf in proptest::collection::vec(any::<u8>(), 0..96),
+                class in any::<u8>(),
+                id in any::<u8>(),
+            ) {
+                let result = reply_status(&buf, class, id); // must not panic
+                if buf.len() <= 8 {
+                    prop_assert_eq!(result, None, "reply_status must be None at/below its 8-byte guard");
+                }
+            }
+        }
+    }
 }

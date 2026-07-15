@@ -1231,6 +1231,9 @@ fn clipboard_text() -> ClipText {
     };
     use windows_sys::Win32::System::Memory::{GlobalLock, GlobalUnlock};
     const CF_UNICODETEXT: u32 = 13;
+    // Serialize this process's clipboard window against every other clipboard user — see
+    // `crate::clipboard` for why there is exactly one process-wide lock.
+    let _guard = crate::clipboard::clipboard_guard();
     unsafe {
         // A clipboard manager / RDP / a browser can hold the clipboard for a few ms — retry before
         // giving up so we don't misreport contention as "empty".

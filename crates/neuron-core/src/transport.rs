@@ -279,11 +279,39 @@ pub trait Transport {
 /// A read channel for device-INITIATED input reports — the unsolicited reports a device pushes on
 /// its own (e.g. a Razer mouse announcing "DPI is now X" when you press its onboard DPI button).
 /// Feature reports are pull (request/response); these are push, so they need their own handle opened
-/// with read access. `read` blocks until one report arrives (or the handle is closed). `Send` so a
-/// listener thread can own it.
+/// with read access. `Send` so a listener thread can own it.
 pub trait InputReader: Send {
-    /// Block for the next input report; returns the number of bytes written into `buf`.
-    fn read(&self, buf: &mut [u8]) -> Result<usize>;
+    /// Wait (BOUNDED — implementations must never block forever) for the next input report.
+    /// `Ok(Some(n))` = a report landed, `n` bytes written into `buf` (may be 0 for an empty report
+    /// — still means "device is alive"). `Ok(None)` = the wait's internal timeout elapsed with
+    /// nothing to read — NOT an error, just "try again"; a caller's read loop must treat this
+    /// exactly like a zero-length report (loop back, check any stop flag, re-issue the read).
+    /// `Err` = the device/handle is gone (unplugged, I/O error) — the caller should stop.
+    fn read(&self, buf: &mut [u8]) -> Result<Option<usize>>;
+}
+
+/// How a caller's read loop should react to one [`InputReader::read`] outcome. Every listener
+/// thread (hidwatch, macrokeys, the seiren R&D probe) needs the identical three-way branch —
+/// factoring it here means a copy-pasted match arm can't quietly reintroduce the old
+/// block-forever bug (treating a timeout as an error, or an error as "keep listening").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadStep {
+    /// A report arrived (`usize` may be 0 for an empty report).
+    Data(usize),
+    /// No report within the read's internal timeout — keep listening, no error.
+    Idle,
+    /// The device/handle is gone — stop the loop.
+    Gone,
+}
+
+/// Classify one `InputReader::read` result into the loop action a caller should take. See
+/// [`ReadStep`] for the contract each variant implies.
+pub fn classify_read(result: Result<Option<usize>>) -> ReadStep {
+    match result {
+        Ok(Some(n)) => ReadStep::Data(n),
+        Ok(None) => ReadStep::Idle,
+        Err(_) => ReadStep::Gone,
+    }
 }
 
 #[cfg(windows)]
@@ -325,6 +353,16 @@ pub fn open_reader(_path: &DevicePath) -> Result<Box<dyn InputReader>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Compile-time pin of the `WireGuard` doc's load-bearing soundness claim (transport.rs:216-218):
+    // "`!Send` by construction (holds a `MutexGuard`), which also guarantees the kernel mutex is
+    // released by the thread that acquired it — a Win32 `ReleaseMutex` requirement." That guarantee
+    // currently rests ENTIRELY on `MutexGuard` happening to be `!Send` and nobody adding a manual
+    // `unsafe impl Send for WireGuard` later; this assertion turns a future violation into a build
+    // break instead of a silent soundness hole. `WireGuard<'a>` carries a lifetime, and auto-trait-ness
+    // doesn't depend on the lifetime parameter's value, only on the fields, so pinning the `'static`
+    // instantiation covers every instantiation.
+    static_assertions::assert_not_impl_any!(WireGuard<'static>: Send);
 
     /// A feature-report-only transport (like a razer_report mock): it implements the pull surface
     /// and inherits the DEFAULT output/input bodies. Pins that a family which never carries
@@ -462,5 +500,75 @@ mod tests {
             t.read_input(&mut buf, 100).is_err(),
             "a feature-only transport must ERROR (not Ok(0)) when asked for an input report"
         );
+    }
+
+    #[test]
+    fn classify_read_maps_every_outcome() {
+        assert_eq!(classify_read(Ok(Some(12))), ReadStep::Data(12));
+        assert_eq!(classify_read(Ok(Some(0))), ReadStep::Data(0));
+        assert_eq!(classify_read(Ok(None)), ReadStep::Idle);
+        assert_eq!(
+            classify_read(Err(anyhow::anyhow!("device gone"))),
+            ReadStep::Gone
+        );
+    }
+
+    /// A scripted fake `InputReader` — no OS handle, just a canned outcome per call — standing in
+    /// for `WinHidReader` so the CALLER LOOP contract (the thing hidwatch/macrokeys/seiren_probe
+    /// all copy) is provable headless: a timeout must never look like "device gone", and a real
+    /// error must always end the loop.
+    struct ScriptedReader {
+        script: Mutex<std::vec::IntoIter<Result<Option<usize>>>>,
+    }
+    impl ScriptedReader {
+        fn new(script: Vec<Result<Option<usize>>>) -> Self {
+            ScriptedReader {
+                script: Mutex::new(script.into_iter()),
+            }
+        }
+    }
+    impl InputReader for ScriptedReader {
+        fn read(&self, _buf: &mut [u8]) -> Result<Option<usize>> {
+            self.script
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .next()
+                .expect("script exhausted — loop read past its scripted outcomes")
+        }
+    }
+
+    /// Runs the exact match shape hidwatch.rs / macrokeys.rs use, against a boxed trait object —
+    /// proving the loop only ever sees the trait's contract, never a concrete backend.
+    fn run_loop_via_trait(reader: &dyn InputReader, iterations: usize) -> (u32, u32, bool) {
+        let (mut data_hits, mut idle_hits, mut stopped) = (0u32, 0u32, false);
+        let mut buf = [0u8; 8];
+        for _ in 0..iterations {
+            match classify_read(reader.read(&mut buf)) {
+                ReadStep::Data(_) => data_hits += 1,
+                ReadStep::Idle => idle_hits += 1,
+                ReadStep::Gone => {
+                    stopped = true;
+                    break;
+                }
+            }
+        }
+        (data_hits, idle_hits, stopped)
+    }
+
+    #[test]
+    fn timeout_keeps_the_loop_alive_and_error_stops_it() {
+        // Two timeouts (device idle, no data) must NOT be mistaken for "gone" — the loop keeps
+        // spinning through them and only stops on the real error.
+        let reader = ScriptedReader::new(vec![
+            Ok(None),
+            Ok(None),
+            Ok(Some(3)),
+            Ok(None),
+            Err(anyhow::anyhow!("unplugged")),
+        ]);
+        let (data_hits, idle_hits, stopped) = run_loop_via_trait(&reader, 10);
+        assert_eq!(data_hits, 1, "the single real report must be counted");
+        assert_eq!(idle_hits, 3, "every timeout must be treated as idle, not an error");
+        assert!(stopped, "the Err outcome must terminate the loop");
     }
 }

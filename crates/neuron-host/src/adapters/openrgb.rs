@@ -1025,4 +1025,130 @@ mod tests {
         let frame = k.resolve("kbd", now()).unwrap();
         assert!(frame.iter().all(|c| *c == Some(Rgb(0, 255, 0))), "disallowed surface: base shows through");
     }
+
+    // ── Property harness: feed() is documented as a pure per-connection state
+    // machine, built exactly for this kind of replay/fuzz testing. ─────────
+
+    use proptest::prelude::*;
+
+    /// Splits `bytes` at `points` (each reduced mod `len+1`, then sorted and
+    /// deduped into monotonic boundaries) into the chunks a chopped `feed()`
+    /// sequence would see.
+    fn split_chunks(bytes: &[u8], raw_points: &[usize]) -> Vec<Vec<u8>> {
+        let len = bytes.len();
+        let mut points: Vec<usize> = raw_points.iter().map(|p| p % (len + 1)).collect();
+        points.sort_unstable();
+        points.dedup();
+        let mut chunks = Vec::with_capacity(points.len() + 1);
+        let mut prev = 0;
+        for p in points {
+            chunks.push(bytes[prev..p].to_vec());
+            prev = p;
+        }
+        chunks.push(bytes[prev..].to_vec());
+        chunks
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        /// Arbitrary bytes (whole and arbitrarily chopped) never panic feed(), and
+        /// packet fragmentation is semantically neutral: reply bytes and the
+        /// resolved arbiter state must be identical whichever way the same bytes
+        /// arrive. `now` is held fixed across both branches — this compares two
+        /// deliveries of the SAME instant, not a real-time window.
+        #[test]
+        fn feed_never_panics_and_chopping_is_neutral(
+            bytes in proptest::collection::vec(any::<u8>(), 0..4096),
+            raw_points in proptest::collection::vec(any::<usize>(), 0..12),
+        ) {
+            let t = now();
+
+            let mut k1 = kernel_with_kbd();
+            let mut c1 = conn(&mut k1);
+            let one_shot_reply = c1.feed(&bytes, &mut k1, t);
+
+            let mut k2 = kernel_with_kbd();
+            let mut c2 = conn(&mut k2);
+            let mut chopped_reply = Vec::new();
+            for chunk in split_chunks(&bytes, &raw_points) {
+                chopped_reply.extend(c2.feed(&chunk, &mut k2, t));
+            }
+
+            prop_assert_eq!(one_shot_reply, chopped_reply, "fragmentation must not change the reply stream");
+            prop_assert_eq!(k1.resolve("kbd", t), k2.resolve("kbd", t), "fragmentation must not change resolved state");
+        }
+
+        /// Well-formed packets with proptest-chosen bytes corrupted never panic,
+        /// and the connection either services the (possibly now-garbage) frame or
+        /// resyncs — either way it stays serviceable for the next well-formed
+        /// packet fed right after.
+        #[test]
+        fn valid_packets_with_random_corruption_never_panic(
+            which in 0..4u8,
+            corrupt_positions in proptest::collection::vec(any::<usize>(), 0..16),
+            corrupt_bytes in proptest::collection::vec(any::<u8>(), 0..16),
+        ) {
+            let base = match which {
+                0 => packet(0, ids::REQUEST_CONTROLLER_COUNT, &[]),
+                1 => packet(0, ids::REQUEST_CONTROLLER_DATA, &5u32.to_le_bytes()),
+                2 => packet(0, ids::UPDATELEDS, &fill_board([1, 2, 3, 0])),
+                _ => {
+                    let mut p = Vec::new();
+                    p.extend_from_slice(&0u32.to_le_bytes()); // led idx
+                    p.extend_from_slice(&[4, 5, 6, 0]); // color
+                    packet(0, ids::UPDATESINGLELED, &p)
+                }
+            };
+            let mut corrupted = base;
+            let n = corrupted.len();
+            // The 4-byte header LENGTH field lives at offset 12..16 (magic[0..4] dev[4..8]
+            // cmd[8..12] size[12..16] — see `packet`). Corruption there is a DIFFERENT case from
+            // corruption anywhere else: an inflated length makes the parser (correctly, for a
+            // length-prefixed protocol) buffer the bytes that follow as THAT packet's payload up to
+            // MAX_PAYLOAD — it cannot magic-resync mid-declared-payload, so the immediately-following
+            // request is consumed as payload rather than serviced. That bounded over-buffer is
+            // intentional, not a wedge. So: `feed` must never PANIC on any corruption (checked
+            // below over every position), but the stronger "resyncs on the very next request" only
+            // holds when the length field itself survived.
+            let mut hit_length = false;
+            for (pos, b) in corrupt_positions.iter().zip(corrupt_bytes.iter()) {
+                let idx = pos % n;
+                if (12..16).contains(&idx) {
+                    hit_length = true;
+                }
+                corrupted[idx] = *b;
+            }
+
+            let mut k = kernel_with_kbd();
+            let mut c = conn(&mut k);
+            let t = now();
+            let _ = c.feed(&corrupted, &mut k, t); // must not panic on ANY corruption
+
+            // Serviced or resynced: a well-formed request right after must still work — provided the
+            // corruption didn't inflate the declared length (see above).
+            let reply = c.feed(&packet(0, ids::REQUEST_CONTROLLER_COUNT, &[]), &mut k, t);
+            if !hit_length {
+                prop_assert!(!reply.is_empty(), "connection recovers after corrupted input");
+                prop_assert_eq!(&reply[..4], MAGIC);
+                prop_assert_eq!(u32le(&reply[16..20]), 1);
+            }
+        }
+
+        /// Garbage that never contains the magic, followed by a valid packet: the
+        /// valid packet still gets serviced (the resync-hunt-for-magic behaviour).
+        #[test]
+        fn magic_resync_after_garbage_prefix(
+            garbage in proptest::collection::vec(any::<u8>(), 0..64),
+        ) {
+            prop_assume!(garbage.windows(4).all(|w| w != MAGIC));
+            let mut k = kernel_with_kbd();
+            let mut c = conn(&mut k);
+            let mut stream = garbage;
+            stream.extend_from_slice(&packet(0, ids::REQUEST_CONTROLLER_COUNT, &[]));
+            let reply = c.feed(&stream, &mut k, now());
+            prop_assert_eq!(&reply[..4], MAGIC);
+            prop_assert_eq!(u32le(&reply[16..20]), 1, "resynced past garbage and served the request");
+        }
+    }
 }

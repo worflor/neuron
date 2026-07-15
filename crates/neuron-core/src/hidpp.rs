@@ -915,4 +915,134 @@ mod tests {
         assert_eq!(parsed.dialect, "hidpp", "the non-razer dialect tag survives the round-trip");
         assert_eq!(parsed, s.def, "emit → parse must be lossless for a hidpp def");
     }
+
+    // ---- Property tests (EXPERIMENTAL dialect — see module doc: spec-implemented, zero
+    // hardware verification). These properties pin the STRUCTURAL contracts that follow from the
+    // code as written — reshape's `.unwrap_or(0)`/`.get(..)` semantics, the fixed 80-byte output
+    // shape, the length guards on `error_code`/`matches_reply`, and the wire-length constants —
+    // not the truth of the underlying Logitech spec, which nothing here can hardware-verify.
+    mod props {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn cfg() -> ProptestConfig {
+            ProptestConfig { cases: 256, ..ProptestConfig::default() }
+        }
+
+        proptest! {
+            #![proptest_config(cfg())]
+
+            /// (a) `reshape` never panics for ANY tag and ANY payload length 0..64, and its output
+            /// is always exactly the documented 80-byte arg-layout shape (fixed-size array, so this
+            /// is really pinning "no panic" — the shape is a compile-time fact of the return type,
+            /// restated here so a future signature change trips the test).
+            #[test]
+            fn reshape_never_panics_on_arbitrary_payloads(
+                tag in any::<u8>(),
+                payload in proptest::collection::vec(any::<u8>(), 0..64),
+            ) {
+                let out = reshape(tag, &payload);
+                prop_assert_eq!(out.len(), 80, "reshape's documented arg-layout shape is fixed at 80 bytes");
+            }
+
+            /// (b) RESHAPE_BATTERY structural contract (hidpp.rs:237-238): a payload with NO byte
+            /// at index 0 (`payload.first().copied().unwrap_or(0)`) must decode as pct=0, i.e.
+            /// `out[1] == 0` — the "empty payload reads as unknown/0%" default, never a garbage
+            /// byte borrowed from elsewhere. Whenever a first byte DOES exist, out[1] is exactly
+            /// the documented `(pct*255+50)/100` scale-up, clamped to 255 (pct is a raw u8 so the
+            /// clamp is unreachable in practice, but the property pins the formula regardless).
+            #[test]
+            fn battery_reshape_truncated_payload_yields_zero_not_garbage(
+                payload in proptest::collection::vec(any::<u8>(), 0..64),
+            ) {
+                let out = reshape(RESHAPE_BATTERY, &payload);
+                let expected = match payload.first().copied() {
+                    None => 0u8,
+                    Some(pct) => (((pct as u32) * 255 + 50) / 100).min(255) as u8,
+                };
+                prop_assert_eq!(out[1], expected);
+                // Every other byte of the 80-byte output stays untouched-zero — RESHAPE_BATTERY
+                // writes ONLY out[1] (hidpp.rs:238).
+                prop_assert!(out[0] == 0 && out[2..].iter().all(|&b| b == 0));
+            }
+
+            /// (b) RESHAPE_DPI structural contract (hidpp.rs:244-249): `payload.get(1)`/`get(2)`
+            /// each `.unwrap_or(0)` independently — a payload too short to hold byte 1 and/or byte 2
+            /// must decode those fields as 0, NOT borrow an adjacent byte (e.g. a 1-byte payload
+            /// must NOT let payload[0] leak into the "hi" slot). The single DPI value is always
+            /// mirrored identically onto both X (out[1..3]) and Y (out[3..5]).
+            #[test]
+            fn dpi_reshape_truncated_payload_yields_zeroed_fields_not_adjacent_bytes(
+                payload in proptest::collection::vec(any::<u8>(), 0..64),
+            ) {
+                let out = reshape(RESHAPE_DPI, &payload);
+                let hi = payload.get(1).copied().unwrap_or(0);
+                let lo = payload.get(2).copied().unwrap_or(0);
+                prop_assert_eq!([out[1], out[2], out[3], out[4]], [hi, lo, hi, lo]);
+                prop_assert_eq!(out[0], 0, "the reshape tag slot is never populated by RESHAPE_DPI");
+            }
+
+            /// (b) RESHAPE_NONE (and any unrecognized tag — the `_` arm, hidpp.rs:251-255): the raw
+            /// payload is copied left-aligned into out[0..], truncated to 80 bytes, with everything
+            /// past the payload's length left zeroed. Covers both the documented RESHAPE_NONE tag
+            /// and arbitrary unknown tags, since they share the same `_` arm.
+            #[test]
+            fn none_and_unknown_tag_reshape_copies_payload_left_aligned_and_zero_pads(
+                tag in any::<u8>().prop_filter("not a recognized tag", |t| *t != RESHAPE_BATTERY && *t != RESHAPE_DPI),
+                payload in proptest::collection::vec(any::<u8>(), 0..64),
+            ) {
+                let out = reshape(tag, &payload);
+                let n = payload.len().min(80);
+                prop_assert_eq!(&out[..n], &payload[..n]);
+                prop_assert!(out[n..].iter().all(|&b| b == 0), "bytes past the payload stay zero-padded");
+            }
+
+            /// (c) `error_code`/`matches_reply` are length-safe over the WHOLE short-buffer space:
+            /// no panic for any length 0..24, and buffers shorter than each function's documented
+            /// guard length always yield the "not applicable" result — `error_code` guards on
+            /// `buf.len() >= 6` (hidpp.rs:187), `matches_reply` on `buf.len() >= 4` (hidpp.rs:197).
+            #[test]
+            fn error_code_and_matches_reply_are_length_safe(
+                full in proptest::collection::vec(any::<u8>(), 0..24),
+                cut_at in 0usize..24,
+                feature_idx in any::<u8>(),
+                fn_id in any::<u8>(),
+            ) {
+                let cut = cut_at.min(full.len());
+                let buf = &full[..cut];
+
+                let ec = error_code(buf); // must not panic
+                if buf.len() < 6 {
+                    prop_assert_eq!(ec, None, "error_code must be None below its 6-byte guard");
+                }
+
+                let mr = matches_reply(buf, feature_idx, fn_id); // must not panic
+                if buf.len() < 4 {
+                    prop_assert!(!mr, "matches_reply must be false below its 4-byte guard");
+                }
+            }
+
+            /// (d) Golden-consistency: `build_long` for ARBITRARY feature/fn/params never exceeds
+            /// [`LONG_LEN`] — the wire limit this dialect always frames to (module doc: "We frame
+            /// everything as LONG reports"). Params past the 16-byte body are silently dropped
+            /// (hidpp.rs:153-157: `if 4 + i < LONG_LEN`), never overflowing the frame or panicking,
+            /// for a params slice of ANY length. Also pins SHORT_LEN <= LONG_LEN, the ordering the
+            /// module doc's frame table asserts (7-byte short, 20-byte long).
+            #[test]
+            fn build_long_request_never_exceeds_the_long_wire_limit(
+                feature_idx in any::<u8>(),
+                fn_id in any::<u8>(),
+                params in proptest::collection::vec(any::<u8>(), 0..64),
+            ) {
+                let req = build_long(feature_idx, fn_id, &params);
+                prop_assert_eq!(req.len(), LONG_LEN, "build_long's frame is pinned at the LONG_LEN wire limit");
+                prop_assert!((SHORT_LEN as usize) <= LONG_LEN, "SHORT_LEN must never exceed LONG_LEN");
+                // Header bytes are exactly as build_long documents, for every input.
+                prop_assert_eq!(req[0], REPORT_ID_LONG);
+                prop_assert_eq!(req[1], DEVICE_INDEX);
+                prop_assert_eq!(req[2], feature_idx);
+                prop_assert_eq!(req[3], func_swid(fn_id));
+            }
+        }
+    }
 }

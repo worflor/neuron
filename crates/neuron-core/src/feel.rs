@@ -374,6 +374,54 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Every field wrong-typed at once (or absent) must land on the FULL default — no field's
+    /// wiring may panic, and none may leak a partial (e.g. a half-defaulted `LayerMode`).
+    #[test]
+    fn degraded_feel_all_fields_wrong_typed_matches_full_default() {
+        use crate::salvage::SalvageLoad;
+        let dir = std::env::temp_dir().join(format!("neuron-feel-allbad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("feel.toml");
+        std::fs::write(
+            &path,
+            "hold_ms = \"nope\"\ngap_ms = \"nope\"\ncoyote_ms = \"nope\"\nhypershift = 123\n",
+        )
+        .unwrap();
+        let cfg = FeelConfig::load_from(&path);
+        assert_eq!(
+            cfg,
+            FeelConfig::default(),
+            "every field malformed must salvage to exactly the default, not a partial mix"
+        );
+        assert!(dir.join("feel.toml.bad").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Exactly one field (`coyote_ms`) is well-typed; every sibling — including the enum field
+    /// `hypershift` — must default independently, and the survivor must not be disturbed by its
+    /// malformed neighbours.
+    #[test]
+    fn degraded_feel_exactly_one_field_valid_survives_alone() {
+        use crate::salvage::SalvageLoad;
+        let dir = std::env::temp_dir().join(format!("neuron-feel-onegood-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("feel.toml");
+        std::fs::write(
+            &path,
+            "hold_ms = \"nope\"\ngap_ms = \"nope\"\ncoyote_ms = 999\nhypershift = 123\n",
+        )
+        .unwrap();
+        let cfg = FeelConfig::load_from(&path);
+        let d = FeelConfig::default();
+        assert_eq!(cfg.coyote_ms, 999, "the one valid field survived");
+        assert_eq!(cfg.hold_ms, d.hold_ms);
+        assert_eq!(cfg.gap_ms, d.gap_ms);
+        assert_eq!(cfg.hypershift, d.hypershift, "the malformed enum field defaulted too");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn cfg() -> FeelConfig {
         FeelConfig::default() // hold 200 / gap 280 / coyote 120
     }

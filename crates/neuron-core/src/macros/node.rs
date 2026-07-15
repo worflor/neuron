@@ -102,7 +102,15 @@ pub fn value_to_source(value: &Value) -> String {
                 .map(value_to_source)
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!("{}.{method}({args})", value_to_source(recv))
+            // A bare integer literal cannot take an attribute in Python source — `5.x()` lexes
+            // as the float literal `5.` followed by `x` ("invalid decimal literal"). Parenthesize
+            // an Int receiver so every representable tree emits parseable source.
+            let recv_src = value_to_source(recv);
+            let recv_src = match recv.as_ref() {
+                Value::Int { .. } => format!("({recv_src})"),
+                _ => recv_src,
+            };
+            format!("{recv_src}.{method}({args})")
         }
         Value::Bin { op, left, right } => {
             format!(
@@ -526,6 +534,10 @@ fn short_value(v: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Brings `Strategy::prop_map`/`.boxed()` etc. into scope for the injection-hardness properties
+    // further down (everything else in this module is called through fully-qualified `proptest::`
+    // paths to avoid any risk of colliding with this file's own `Value` type).
+    use proptest::strategy::Strategy as _;
 
     // ── Value codegen ─────────────────────────────────────────────────────────────────────────
 
@@ -954,6 +966,177 @@ mod tests {
         assert_eq!(py_str_literal("tab\u{0007}bell"), "\"tab\\x07bell\"");
     }
 
+    // ── py_str_literal injection-hardness (decoder + properties) ────────────────────────────────
+    //
+    // `py_str_literal` is a code-injection boundary: it splices arbitrary macro text into GENERATED
+    // PYTHON SOURCE. The escape forms it can EMIT (read off the match arms above) are exactly:
+    //   `\\`  (backslash)     `\"`  (the delimiter quote)     `\n` `\r` `\t`     `\xNN` (control < 0x20)
+    // Everything else is passed through verbatim (no `\uNNNN`, no `\'` — the literal is always
+    // double-quoted, so a literal `'` never needs escaping). The decoder below understands exactly
+    // this set — nothing more — so it doubles as a spec-check: if `py_str_literal` ever starts
+    // emitting a form the decoder doesn't know, `decode_py_str_literal` panics loudly instead of
+    // silently accepting a new escape shape.
+    /// Decode ONE double-quoted Python string literal (as `py_str_literal` emits it) back to its
+    /// value. Returns `(decoded_value, chars_consumed)`; `chars_consumed` lets callers assert the
+    /// decoder walked the ENTIRE literal and landed exactly on the closing quote — the mechanical
+    /// check that nothing inside the body terminated the literal early (an unescaped quote) or threw
+    /// the decoder off track (an ambiguous backslash).
+    fn decode_py_str_literal(lit: &str) -> (String, usize) {
+        let chars: Vec<char> = lit.chars().collect();
+        assert_eq!(
+            chars.first(),
+            Some(&'"'),
+            "literal must open with a double quote: {lit:?}"
+        );
+        let mut out = String::new();
+        let mut i = 1;
+        while i < chars.len() {
+            match chars[i] {
+                '"' => {
+                    i += 1;
+                    return (out, i);
+                }
+                '\\' => {
+                    let esc = *chars
+                        .get(i + 1)
+                        .unwrap_or_else(|| panic!("dangling backslash in {lit:?}"));
+                    match esc {
+                        '\\' => {
+                            out.push('\\');
+                            i += 2;
+                        }
+                        '"' => {
+                            out.push('"');
+                            i += 2;
+                        }
+                        'n' => {
+                            out.push('\n');
+                            i += 2;
+                        }
+                        'r' => {
+                            out.push('\r');
+                            i += 2;
+                        }
+                        't' => {
+                            out.push('\t');
+                            i += 2;
+                        }
+                        'x' => {
+                            let hi =
+                                *chars.get(i + 2).unwrap_or_else(|| panic!("truncated \\x escape in {lit:?}"));
+                            let lo =
+                                *chars.get(i + 3).unwrap_or_else(|| panic!("truncated \\x escape in {lit:?}"));
+                            let hex: String = [hi, lo].iter().collect();
+                            let val = u32::from_str_radix(&hex, 16)
+                                .unwrap_or_else(|_| panic!("invalid \\x escape {hex:?} in {lit:?}"));
+                            out.push(
+                                char::from_u32(val)
+                                    .unwrap_or_else(|| panic!("invalid \\x codepoint {val:x} in {lit:?}")),
+                            );
+                            i += 4;
+                        }
+                        other => panic!(
+                            "py_str_literal never emits \\{other} — decoder doesn't recognise it in {lit:?}"
+                        ),
+                    }
+                }
+                c => {
+                    out.push(c);
+                    i += 1;
+                }
+            }
+        }
+        panic!("literal never closed with a quote: {lit:?}");
+    }
+
+    /// A string with the exact texture the injection properties need to stress: control chars
+    /// (including NUL), quotes, backslashes, raw newlines/CRs, non-ASCII, and astral-plane chars.
+    /// `any::<char>()` already covers this whole space (every Unicode scalar value Rust can hold).
+    fn arb_injection_string() -> impl proptest::strategy::Strategy<Value = String> {
+        proptest::collection::vec(proptest::prelude::any::<char>(), 0..64)
+            .prop_map(|cs| cs.into_iter().collect())
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(256))]
+
+        /// (a) decode(py_str_literal(s)) == s for arbitrary strings — the literal always re-decodes
+        /// to the exact original value, and the decoder consumes the WHOLE literal doing it.
+        #[test]
+        fn py_literal_round_trips_arbitrary_strings(s in arb_injection_string()) {
+            let lit = py_str_literal(&s);
+            let (decoded, consumed) = decode_py_str_literal(&lit);
+            proptest::prop_assert_eq!(&decoded, &s, "round-trip mismatch for {:?}", s);
+            proptest::prop_assert_eq!(
+                consumed,
+                lit.chars().count(),
+                "decoder didn't consume the whole literal for {:?} (lit={:?})",
+                s,
+                lit
+            );
+        }
+
+        /// (b) the literal body can never smuggle an early, unescaped closing quote or a raw
+        /// line-break out into the surrounding generated source. Mechanically: the decoder must
+        /// consume the entire literal (never stop short at a spurious unescaped quote), and no raw
+        /// `\n`/`\r` byte may appear anywhere in the emitted literal (a line break there is a
+        /// statement break in Python — the injection this whole function exists to prevent).
+        #[test]
+        fn literal_never_escapes_its_quotes(s in arb_injection_string()) {
+            let lit = py_str_literal(&s);
+            let (_decoded, consumed) = decode_py_str_literal(&lit);
+            proptest::prop_assert_eq!(
+                consumed,
+                lit.chars().count(),
+                "an unescaped quote (or an ambiguous backslash) terminated the literal early: {:?}",
+                lit
+            );
+            proptest::prop_assert!(
+                !lit.contains('\n') && !lit.contains('\r'),
+                "a raw line break survived into the literal (statement break = injection): {lit:?}"
+            );
+        }
+    }
+
+    /// (c) a targeted corpus of adversarial payloads — quote-then-inject attempts, escape-sequence
+    /// confusion, comment breakouts, mixed-quote floods, and a lone trailing backslash — all stay
+    /// completely inert: each round-trips exactly and satisfies the same "no early termination, no
+    /// raw line break" contract as the property above.
+    #[test]
+    fn adversarial_payloads_stay_inert() {
+        let payloads: &[&str] = &[
+            "'; import os #",
+            "\\'; os.system(\"rm -rf /\")",
+            "\"\"\"",
+            "\"; import os; os.system(\"whoami\"); \"",
+            "trailing backslash\\",
+            "\\",
+            "'",
+            "\"",
+            "\"'\"'\"'\"'",
+            "\"\"\"\"\"\"\"\"",
+            "\0",
+            "line1\nline2\r\nline3",
+            "\\n\\r\\t literal backslash-letter text, not real escapes",
+            "\\x41\\x42 literal backslash-x-digit text, not a real escape",
+            "\u{202e}reversed-by-bidi-override\u{202c}",
+        ];
+        for p in payloads {
+            let lit = py_str_literal(p);
+            let (decoded, consumed) = decode_py_str_literal(&lit);
+            assert_eq!(decoded.as_str(), *p, "payload {p:?} did not round-trip (lit={lit:?})");
+            assert_eq!(
+                consumed,
+                lit.chars().count(),
+                "payload {p:?} let the decoder stop before the literal's true end (lit={lit:?})"
+            );
+            assert!(
+                !lit.contains('\n') && !lit.contains('\r'),
+                "payload {p:?} left a raw line break in the literal: {lit:?}"
+            );
+        }
+    }
+
     #[test]
     fn nested_flow_codegen() {
         // for line in ctx.selection.splitlines(): if line: notify(line)
@@ -1227,5 +1410,182 @@ mod summary_tests {
         assert!(s.starts_with("runs aaaa"));
         assert!(s.ends_with("\u{2026}"), "a long value is cut with an ellipsis");
         assert!(s.chars().count() < 40, "the line is bounded, not 80+ chars");
+    }
+}
+
+#[cfg(test)]
+mod codegen_parse_proptests {
+    //! parse<->codegen idempotence: an ARBITRARY (not hand-enumerated — see the corpus in
+    //! `crates/neuron-core/tests/macro_stress_parser.rs`, which this deliberately does not duplicate)
+    //! [`MacroNode`] tree must reach a stable fixed point through the sidecar's real `ast`-backed
+    //! parser. Mirrors the EXACT equivalence the existing `parse_codegen_parse_idempotence` corpus
+    //! test in that file asserts (not a stricter one): a first codegen→parse cycle may legitimately
+    //! re-shape unrecognised sub-expressions (e.g. into [`Value::Raw`]), so we don't require
+    //! `source == source'` after only one hop; we require the SECOND hop to be a byte-identical no-op
+    //! (`p0 == p1` and `codegen(p1) == codegen(p0's reparse)`), exactly like the corpus fixture sweep.
+    //!
+    //! Needs the bundled CPython sidecar (the parse half is real `ast`, not reimplemented in Rust —
+    //! see this module's top doc comment). Skips cleanly (asserts nothing) when it can't materialize,
+    //! matching every other sidecar-dependent test in this codebase; `MacroHost::available()` is a
+    //! cheap path-resolution check, not a spawn, so this costs nothing when the runtime is present but
+    //! not yet warmed either.
+    use super::*;
+    use crate::macros::macro_host::macro_host;
+    // Brings `Strategy::prop_map`/`.boxed()`, `Just`, `any`, `prop_oneof!` etc. into scope for every
+    // strategy builder below (fully-qualified `proptest::` paths are used everywhere else in this
+    // file to avoid any risk of colliding with this file's own `Value`/`MacroNode` types — neither
+    // name is exported by proptest's prelude, so this glob import is safe).
+    use proptest::prelude::*;
+
+    /// A handful of syntactically-safe identifiers (no Python keywords) for every position that
+    /// splices directly into source as a bare name (`var`/`name` bindings, `ctx.field`-less `Var`
+    /// names, `Call` method names) — unlike string DATA (which goes through the hardened
+    /// [`py_str_literal`] and can be anything, proven by the properties above), these positions have
+    /// no escaping and MUST be valid identifiers or the generated source is simply invalid Python.
+    fn arb_ident() -> impl proptest::strategy::Strategy<Value = String> {
+        proptest::sample::select(&["x", "y", "z", "n", "i", "line", "val", "tmp", "acc", "out"][..])
+            .prop_map(|s| s.to_string())
+    }
+
+    /// The known `ctx.<field>` names (mirrors the doc comment on [`Value::Ctx`]) — also a bare
+    /// identifier splice, so also restricted rather than arbitrary.
+    fn arb_ctx_field() -> impl proptest::strategy::Strategy<Value = String> {
+        proptest::sample::select(&["selection", "clipboard", "app", "title", "cwd"][..])
+            .prop_map(|s| s.to_string())
+    }
+
+    /// A real Python binary/boolean operator token (mirrors the sets the integration stress test
+    /// exercises) — also a raw splice with no escaping, so restricted to the valid vocabulary.
+    fn arb_bin_op() -> impl proptest::strategy::Strategy<Value = String> {
+        proptest::sample::select(&["+", "-", "*", "==", "!=", "<", "and", "or", "in"][..])
+            .prop_map(|s| s.to_string())
+    }
+
+    /// String DATA (goes through `py_str_literal`, so genuinely arbitrary — same texture as the
+    /// injection-hardness properties above, just kept a little shorter for proptest tree-generation
+    /// speed).
+    fn arb_data_string() -> impl proptest::strategy::Strategy<Value = String> {
+        proptest::collection::vec(proptest::prelude::any::<char>(), 0..24)
+            .prop_map(|cs| cs.into_iter().collect())
+    }
+
+    /// An arbitrary [`Value`] expression tree, bounded to `depth` levels of `Call`/`Bin` nesting.
+    fn arb_value(depth: u32) -> proptest::strategy::BoxedStrategy<Value> {
+        let leaf = prop_oneof![
+            arb_data_string().prop_map(Value::str),
+            any::<i64>().prop_map(|n| Value::Int { n }),
+            any::<bool>().prop_map(|b| Value::Bool { b }),
+            arb_ctx_field().prop_map(|field| Value::Ctx { field }),
+            arb_ident().prop_map(|name| Value::Var { name }),
+        ];
+        if depth == 0 {
+            return leaf.boxed();
+        }
+        prop_oneof![
+            3 => leaf,
+            1 => (arb_value(depth - 1), arb_ident(), proptest::collection::vec(arb_value(depth - 1), 0..2))
+                .prop_map(|(recv, method, args)| Value::Call { recv: Box::new(recv), method, args }),
+            1 => (arb_bin_op(), arb_value(depth - 1), arb_value(depth - 1))
+                .prop_map(|(op, l, r)| Value::Bin { op, left: Box::new(l), right: Box::new(r) }),
+        ]
+        .boxed()
+    }
+
+    /// A leaf (non-flow) [`MacroNode`] — every action arm, plus `SetVar`/`Stop`. [`MacroNode::Raw`]
+    /// is deliberately EXCLUDED: it is verbatim, unvalidated source, so an arbitrary string there
+    /// could easily be invalid Python — a property this generator cannot honor (it must always
+    /// produce a tree whose codegen reparses successfully).
+    fn arb_leaf_node() -> proptest::strategy::BoxedStrategy<MacroNode> {
+        let v = || arb_value(2);
+        prop_oneof![
+            (v(), any::<bool>(), proptest::option::of(arb_data_string()))
+                .prop_map(|(text, ghost, speed)| MacroNode::Type { text, ghost, speed }),
+            proptest::collection::vec(arb_data_string(), 0..3).prop_map(|keys| MacroNode::Press { keys }),
+            arb_data_string().prop_map(|name| MacroNode::KeyPress { name }),
+            arb_data_string().prop_map(|button| MacroNode::Click { button }),
+            v().prop_map(|amount| MacroNode::Scroll { amount }),
+            (v(), v()).prop_map(|(x, y)| MacroNode::MoveTo { x, y }),
+            v().prop_map(|text| MacroNode::Copy { text }),
+            Just(MacroNode::Paste),
+            (v(), proptest::option::of(arb_ident()))
+                .prop_map(|(command, capture)| MacroNode::Open { command, capture }),
+            v().prop_map(|window| MacroNode::Focus { window }),
+            v().prop_map(|ms| MacroNode::Wait { ms }),
+            v().prop_map(|text| MacroNode::Notify { text }),
+            (arb_ident(), v()).prop_map(|(name, value)| MacroNode::SetVar { name, value }),
+            Just(MacroNode::Stop),
+        ]
+        .boxed()
+    }
+
+    /// An arbitrary [`MacroNode`], bounded to `depth` levels of flow nesting (`if`/loops/`try`/`ask`)
+    /// around leaf actions.
+    fn arb_node(depth: u32) -> proptest::strategy::BoxedStrategy<MacroNode> {
+        if depth == 0 {
+            return arb_leaf_node();
+        }
+        let body = |d: u32| proptest::collection::vec(arb_node(d), 1..3);
+        let v = || arb_value(1);
+        prop_oneof![
+            4 => arb_leaf_node(),
+            1 => (v(), v(), body(depth - 1), body(depth - 1))
+                .prop_map(|(question, description, yes, no)| MacroNode::Ask { question, description, yes, no }),
+            1 => (v(), body(depth - 1), body(depth - 1))
+                .prop_map(|(cond, then_, else_)| MacroNode::If { cond, then_, else_ }),
+            1 => (v(), body(depth - 1)).prop_map(|(count, body)| MacroNode::RepeatN { count, body }),
+            1 => (v(), body(depth - 1)).prop_map(|(cond, body)| MacroNode::RepeatWhile { cond, body }),
+            1 => (arb_ident(), v(), body(depth - 1))
+                .prop_map(|(var, source, body)| MacroNode::ForEach { var, source, body }),
+            1 => (body(depth - 1), body(depth - 1))
+                .prop_map(|(body, except_)| MacroNode::Try { body, except_ }),
+        ]
+        .boxed()
+    }
+
+    proptest::proptest! {
+        // Each case round-trips through the live CPython sidecar TWICE (real subprocess IPC, not a
+        // pure-Rust check) — bounded lower than the house default (128-256) so the suite stays fast;
+        // the sidecar's own load-stress test (`sidecar_parse_load_stress`) already proves per-parse
+        // latency is sub-millisecond once warm, so 40 cases is still a meaningful sweep, not a token one.
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(40))]
+
+        /// nodes -> source -> parse -> source' -> parse' reaches a stable fixed point: the SECOND
+        /// parse agrees with the first (`p0 == p1`) and codegen from there on is byte-identical
+        /// (`codegen(p1) == codegen(p0)`'s regenerated source). Every generated tree must also parse
+        /// successfully both times — a parse failure on a tree this generator can only build from
+        /// modelled, syntactically-valid constructs would itself be a bug.
+        #[test]
+        fn codegen_parse_codegen_is_stable(nodes in proptest::collection::vec(arb_node(3), 1..4)) {
+            // Serialize against the sidecar-killing death-race tests: they taskkill the shared
+            // singleton, which would surface here as a spurious parse failure mid-round-trip.
+            let _sidecar = crate::macros::macro_host::SIDECAR_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let host = macro_host();
+            if !host.available() {
+                return Ok(()); // no bundled python runtime in this environment -> skip cleanly
+            }
+            let s0 = nodes_to_source(&nodes);
+            let p0 = match host.parse_macro(&s0) {
+                Ok(p) => p,
+                Err(e) => {
+                    return Err(proptest::test_runner::TestCaseError::fail(format!(
+                        "generated tree failed to parse: {e}\nsrc:\n{s0}"
+                    )));
+                }
+            };
+            let s1 = nodes_to_source(&p0);
+            let p1 = match host.parse_macro(&s1) {
+                Ok(p) => p,
+                Err(e) => {
+                    return Err(proptest::test_runner::TestCaseError::fail(format!(
+                        "re-parse of the first-pass source failed: {e}\nsrc:\n{s1}"
+                    )));
+                }
+            };
+            proptest::prop_assert_eq!(&p0, &p1, "parse must be stable at the second cycle\nsrc:\n{}", s1);
+            let s2 = nodes_to_source(&p1);
+            proptest::prop_assert_eq!(s1, s2, "codegen must reach a byte-identical fixed point after one normalization pass");
+        }
     }
 }

@@ -222,6 +222,16 @@ impl WriterPauser {
     }
 }
 
+/// Bound on [`Writer`]'s teardown (see its `Drop`). Unlike the net.rs servers, this loop has no
+/// provable bound: `sink.write`/`sink.refresh` are an opaque [`FrameSink`] call the writer thread
+/// does not control, and a wedged sink (a blocking HID write past its driver timeout, or — as
+/// exercised by the `writer_drop_is_bounded_when_the_sink_write_wedges` test — any sink that
+/// simply never returns) is checked against `stop` only on the NEXT tick, which never comes. Real
+/// device writes are short USB transfers with their own sub-second driver-level timeouts, so this
+/// deadline is an empirical margin over that, not a derived guarantee — it exists specifically so
+/// `join_bounded`'s backstop, not the loop's own logic, is what bounds a stuck sink.
+const WRITER_DROP_DEADLINE: Duration = Duration::from_millis(1000);
+
 /// The paced writer thread for one surface. Dropping it stops and joins.
 pub struct Writer {
     stop: Arc<AtomicBool>,
@@ -349,7 +359,7 @@ impl Drop for Writer {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(t) = self.thread.take() {
-            let _ = t.join();
+            crate::worker::join_bounded(t, WRITER_DROP_DEADLINE, "neuron-writer");
         }
     }
 }
@@ -384,6 +394,80 @@ impl FrameSink for MockSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Condvar;
+
+    /// A sink whose `write` NEVER returns — parked on a condvar nobody ever notifies. Stands in
+    /// for the worst case `WRITER_DROP_DEADLINE` is sized against: a wedged device write the
+    /// writer thread's loop cannot interrupt (the stop flag is only rechecked between ticks).
+    struct BlockingSink {
+        gate: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl FrameSink for BlockingSink {
+        fn write(&mut self, _frame: &[Option<Rgb>]) {
+            let (lock, cvar) = &*self.gate;
+            let guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
+            // `gate.0` never becomes true and `cvar` is never notified: this parks forever,
+            // exactly like a hung blocking HID write.
+            drop(cvar.wait(guard));
+        }
+    }
+
+    #[test]
+    fn writer_drop_is_bounded_when_the_sink_write_wedges() {
+        use crate::api::{LeaseSpec, SurfaceInfo, SurfaceKind};
+        use crate::arbiter::{band, Content};
+        use crate::shell::Host;
+
+        let host = Host::spawn();
+        let mut h = host.handle();
+        h.declare(SurfaceInfo::grid("kbd", "Board", SurfaceKind::Keyboard, 1, 1));
+        let owner = h.next_source();
+        h.claim(
+            "kbd",
+            owner,
+            band::BASE,
+            LeaseSpec::Pinned,
+            Content::Fill(Rgb(9, 9, 9)),
+            Instant::now(),
+        )
+        .unwrap();
+
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let sink_gate = gate.clone();
+        let writer = Writer::spawn(host.handle(), "kbd", 100, move || BlockingSink { gate: sink_gate });
+
+        // Give the writer a moment to reach its first `sink.write` and wedge inside it.
+        thread::sleep(Duration::from_millis(100));
+
+        // Drop on a background thread and wait for THAT thread with our own bounded poll, so a
+        // regression (join_bounded broken, or removed) fails this test cleanly instead of
+        // hanging the whole test binary.
+        let start = Instant::now();
+        let dropper = crate::worker::spawn_named("t-writer-drop", move || drop(writer))
+            .expect("spawn dropper");
+        let bound = WRITER_DROP_DEADLINE * 3;
+        let deadline = Instant::now() + bound;
+        let mut finished = false;
+        while Instant::now() < deadline {
+            if dropper.is_finished() {
+                finished = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            finished,
+            "Writer::drop must return within {bound:?} even when the sink write wedges forever"
+        );
+        assert!(
+            start.elapsed() < bound,
+            "Writer::drop took {:?}, expected under {bound:?}",
+            start.elapsed()
+        );
+        // The BlockingSink's thread is intentionally leaked (still parked on the condvar) — that
+        // IS the fix: a leaked thread at shutdown instead of a hung process.
+    }
 
     #[test]
     fn core_dedups_identical_frames() {
@@ -624,5 +708,54 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         };
         assert!(resumed, "frames must resume arriving within a bounded window after the last release");
+    }
+
+    // ── TASK 3(c): clock-leap laws for the writer's two "clocks" ────────────
+
+    #[test]
+    fn pace_handles_a_giant_wall_clock_jump_without_a_catch_up_burst() {
+        // The one place in this module that reads a live wall clock against a
+        // previously-computed deadline is `pace` — `HealPolicy` (below) is
+        // tick-counted and never touches `Instant` at all. An 8h wake must
+        // clamp forward by AT MOST one `dt` (never accumulate a catch-up
+        // burst) and must never produce a negative/nonsensical sleep.
+        let dt = Duration::from_secs(1) / 30;
+        let deadline = Instant::now();
+        let wake = deadline + Duration::from_secs(8 * 3600);
+        let (next, nap) = pace(deadline, wake, dt);
+        assert_eq!(nap, Duration::ZERO, "a massive overrun must not produce a sleep at all");
+        assert!(next <= wake, "the clamped deadline must not still be hours in the past");
+        assert!(
+            next >= wake.checked_sub(dt).expect("wake is hours past the epoch, dt is tiny"),
+            "clamp must land within one dt of now, not accumulate a catch-up burst: next={next:?} wake={wake:?}"
+        );
+    }
+
+    #[test]
+    fn heal_policy_is_tick_counted_so_a_wall_clock_jump_between_ticks_cannot_storm() {
+        // `HealPolicy::since_change`/`since_heal` are plain tick counters,
+        // advanced once per `tick()` call — the policy has NO wall-clock of
+        // its own. So unlike `pace`, a real system sleep between two
+        // writer-loop iterations is invisible to it: waking up is just "the
+        // next tick()", never a burst of many at once. This freezes a policy
+        // in its post-sweep QUIESCENT state, then drives a large number of
+        // further ticks (standing in for however much real time could have
+        // passed) and asserts it never re-fires — the "no re-assert storm on
+        // wake" law, encoded at the level this module actually has a clock.
+        let mut p = HealPolicy::new();
+        let h0 = p.due();
+        p.tick(h0, true); // one real content frame
+        // Drive it all the way through its sweep into quiescence.
+        for _ in 0..(QUIET_SWEEP_AT + QUIET_SWEEP_LEN + 5) {
+            let h = p.due();
+            p.tick(h, false);
+        }
+        // "A very long time passes" — an arbitrarily large run of further
+        // ticks, no new content ever again.
+        for _ in 0..100_000u64 {
+            let h = p.due();
+            assert!(!h, "a quiescent policy must never re-fire no matter how many ticks pass");
+            p.tick(h, false);
+        }
     }
 }

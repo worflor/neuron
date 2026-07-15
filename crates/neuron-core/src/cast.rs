@@ -510,6 +510,75 @@ key = "3"
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Every scalar AND every collection field wrong-shaped at once — none of the eleven fields'
+    /// wiring in `salvage()` may panic, and every single one must land on its own default (`Vec`/
+    /// `BTreeMap` fields included, not just the `salvage_fields!` scalars).
+    #[test]
+    fn degraded_cast_all_fields_wrong_typed_defaults_every_field() {
+        use crate::salvage::SalvageLoad;
+        let dir = std::env::temp_dir().join(format!("neuron-cast-allbad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cast.toml");
+        std::fs::write(
+            &path,
+            r#"
+trigger = "nope"
+activation = 5
+sectors = "nope"
+deadzone = "nope"
+assist = "nope"
+mode = 5
+hyper_radial_on = "nope"
+radial = "nope"
+hyper_radial = "nope"
+rhythm_actions = "nope"
+gestures = "nope"
+"#,
+        )
+        .unwrap();
+        let cfg = CastConfig::load_from(&path);
+        let d = CastConfig::default();
+        assert_eq!(cfg.trigger, d.trigger);
+        assert_eq!(cfg.activation, d.activation);
+        assert_eq!(cfg.sectors, d.sectors);
+        assert_eq!(cfg.deadzone, d.deadzone);
+        assert_eq!(cfg.assist, d.assist);
+        assert_eq!(cfg.mode, d.mode);
+        assert_eq!(cfg.hyper_radial_on, d.hyper_radial_on);
+        assert_eq!(cfg.radial, d.radial);
+        assert_eq!(cfg.hyper_radial, d.hyper_radial);
+        assert_eq!(cfg.rhythm_actions, d.rhythm_actions, "even the non-empty rhythm seed default survives a wrong-shaped field");
+        assert_eq!(cfg.gestures, d.gestures);
+        assert!(dir.join("cast.toml.bad").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Exactly one scalar (`deadzone`) is well-typed; every sibling — including `trigger`, which
+    /// the OTHER degraded test above keeps valid — must default independently here.
+    #[test]
+    fn degraded_cast_exactly_one_scalar_field_valid_survives_alone() {
+        use crate::salvage::SalvageLoad;
+        let dir = std::env::temp_dir().join(format!("neuron-cast-onegood-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cast.toml");
+        // `sectors` is wrong-typed (forces the whole-struct parse to fail); `deadzone` is the only
+        // field that survives.
+        std::fs::write(&path, "sectors = \"nope\"\ndeadzone = 77.5\n").unwrap();
+        let cfg = CastConfig::load_from(&path);
+        let d = CastConfig::default();
+        assert_eq!(cfg.deadzone, 77.5, "the one valid field survived");
+        assert_eq!(cfg.sectors, d.sectors);
+        assert_eq!(cfg.trigger, d.trigger, "an ABSENT field also defaults, same as a malformed one");
+        assert_eq!(cfg.activation, d.activation);
+        assert_eq!(cfg.assist, d.assist);
+        assert_eq!(cfg.mode, d.mode);
+        assert_eq!(cfg.hyper_radial_on, d.hyper_radial_on);
+        assert_eq!(cfg.rhythm_actions, d.rhythm_actions);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn cast_with_a_wedge_serializes_to_valid_toml() {
         // a non-empty radial makes `radial`/`gestures` serialize as TABLES; every scalar field

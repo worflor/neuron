@@ -212,6 +212,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `Bindings` has exactly one field (`bindings`, a whole vec), so "every field wrong-typed"
+    /// collapses to "the field is present but the WRONG SHAPE (not an array at all)" — a case the
+    /// existing per-element test above doesn't cover (that one always had a valid array). This is
+    /// also the fallback-vs-salvage distinction's other half: `fallback()` (a MISSING file) seeds
+    /// `default_for_user()`, but a present-and-broken file must go through `salvage()` and land on
+    /// plain `Self::default()` instead — they happen to be byte-identical today (`default_for_user`
+    /// is empty "on purpose", see its doc comment), so the two paths aren't distinguishable by
+    /// content alone, but this proves the salvage path never panics or partially parses a
+    /// non-array value into rows.
+    #[test]
+    fn degraded_bindings_wrong_shaped_field_defaults_to_empty_not_a_partial_parse() {
+        use crate::salvage::SalvageLoad;
+        let dir = std::env::temp_dir().join(format!("neuron-bindings-wrongshape-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bindings.toml");
+        // `bindings` present but a STRING, not an array — the whole-struct parse fails and
+        // `salvage_vec` must reject it wholesale (None), not attempt to iterate characters.
+        std::fs::write(&path, "bindings = \"not-an-array\"\n").unwrap();
+        let cfg = Bindings::load_from(&path);
+        assert!(
+            cfg.bindings.is_empty(),
+            "a wrong-shaped field must default to empty, not panic or leak a partial parse"
+        );
+        assert!(dir.join("bindings.toml.bad").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn ev(pid: &str, page: u16, usage: u16) -> ControlEvent {
         ControlEvent {
             pid: pid.into(),

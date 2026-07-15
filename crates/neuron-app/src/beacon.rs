@@ -143,6 +143,43 @@ struct Q {
 
 type Shared = Arc<(Mutex<Q>, Condvar)>;
 
+/// Hard cap on the pending-ask backlog. The presenter (`start()`'s presenter loop) services
+/// EXACTLY ONE prompt at a time — `queue.pop_front()` then `present()` blocks the whole thread
+/// until that one ask is answered/retired — so the queue is purely a "how many more are behind
+/// this one" backlog, never a worklist multiple threads drain in parallel. A macro calling
+/// `neuron.ask` in a tight loop with a UI attached that never answers (the no-UI case is already
+/// auto-dismissed at the Macro Host, see `macro_host.rs`'s `Some("prompt")` handler) would
+/// otherwise grow `Q.queue` without bound. 32 is generous headroom for legitimate concurrent
+/// multi-macro asks (the header pill already shows the backlog count to the user) while keeping
+/// the worst case bounded to `MAX_PENDING_PROMPTS * size_of(Prompt)` instead of unbounded.
+const MAX_PENDING_PROMPTS: usize = 32;
+
+/// Enqueue an ask, or — once the backlog is already at [`MAX_PENDING_PROMPTS`] — refuse it
+/// HONESTLY instead of growing the queue further: answer it `None`, the exact "passed/dismissed"
+/// shape `present()` sends below for a real PASS (and the shape the Macro Host's own no-UI
+/// auto-dismiss uses), so the blocked `neuron.ask` in the sidecar returns its `default` at once
+/// instead of riding out its full timeout budget behind a backlog it will never see. Refusing the
+/// NEWEST ask (rather than evicting an older queued one to make room) is the honest policy: an
+/// older queued prompt may be the very next one shown, or one a human is already mid-flick
+/// answering — silently voiding it would be a surprise no different from a lost message. A new ask
+/// arriving at the cap is, structurally, the LEAST likely of the lot to ever be seen (it would sit
+/// 32-deep in the backlog), so it is the one that costs least to refuse.
+///
+/// Returns whether the prompt was queued (`false` = refused at the cap).
+fn try_enqueue(shared: &Shared, p: Prompt) -> bool {
+    let (q, cv) = &**shared;
+    let mut g = q.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if g.queue.len() >= MAX_PENDING_PROMPTS {
+        drop(g);
+        macro_host().answer(p.pid, None);
+        return false;
+    }
+    g.queue.push_back(p);
+    drop(g);
+    cv.notify_all();
+    true
+}
+
 /// Start the beacon service (router + presenter threads). Call ONCE from the real `main` run path,
 /// after the live runtime starts — never from tests (it talks to the real Macro Host + input state).
 pub fn start(weak: slint::Weak<AppWindow>) {
@@ -169,16 +206,20 @@ pub fn start(weak: slint::Weak<AppWindow>) {
                             detail,
                             ..
                         } => {
-                            let (q, cv) = &*shared;
-                            q.lock().unwrap_or_else(std::sync::PoisonError::into_inner).queue.push_back(Prompt {
-                                pid,
-                                macro_id,
-                                text,
-                                options,
-                                detail,
-                            });
-                            cv.notify_all();
-                            mirror_count(&weak, &shared);
+                            let queued = try_enqueue(
+                                &shared,
+                                Prompt {
+                                    pid,
+                                    macro_id,
+                                    text,
+                                    options,
+                                    detail,
+                                },
+                            );
+                            // a refusal doesn't change the shown count — only mirror on a real enqueue.
+                            if queued {
+                                mirror_count(&weak, &shared);
+                            }
                         }
                         BeaconEvent::Retire { pid } => {
                             let (q, _) = &*shared;
@@ -2183,6 +2224,73 @@ mod tests {
         assert!(
             super::prompt_pending(&shared),
             "a queued (not-yet-presented) ask must preempt the presenter loop's live_weave branch"
+        );
+    }
+
+    /// A macro (or a bug) hammering `neuron.ask` in a loop with a UI attached that never answers
+    /// must never grow the queue past [`super::MAX_PENDING_PROMPTS`] — the root fix for the
+    /// unbounded `VecDeque`. Drives the real enqueue path (`try_enqueue`, the same function the
+    /// router thread calls per `BeaconEvent::Ask`) directly, without spinning up the presenter or
+    /// a real Macro Host session, so it stays deterministic and doesn't arm input or wait on
+    /// wall-clock. Every overflowed ask must be refused promptly (never silently dropped — the
+    /// caller learns immediately via `try_enqueue`'s `false` return, mirroring the real "answer it
+    /// `None` right now" behaviour), and the queue must keep servicing at the cap: draining one
+    /// frees exactly one slot for the next arrival.
+    #[test]
+    fn flood_of_asks_is_capped_and_overflow_is_refused_not_dropped() {
+        let shared: super::Shared = std::sync::Arc::new((
+            std::sync::Mutex::new(super::Q::default()),
+            std::sync::Condvar::new(),
+        ));
+        let mk = |pid: u64| super::Prompt {
+            pid,
+            macro_id: "flood-macro".into(),
+            text: format!("ask {pid}"),
+            options: vec!["yes".into(), "no".into()],
+            detail: String::new(),
+        };
+
+        let mut queued_count = 0usize;
+        let mut refused_count = 0usize;
+        for pid in 0..500u64 {
+            if super::try_enqueue(&shared, mk(pid)) {
+                queued_count += 1;
+            } else {
+                refused_count += 1;
+            }
+            // never exceeds the cap at ANY point during the flood, not just at the end.
+            let len = shared.0.lock().unwrap().queue.len();
+            assert!(
+                len <= super::MAX_PENDING_PROMPTS,
+                "queue grew past the cap at ask #{pid}: len={len}"
+            );
+        }
+        assert_eq!(
+            queued_count,
+            super::MAX_PENDING_PROMPTS,
+            "exactly a cap's worth got queued out of the flood"
+        );
+        assert_eq!(
+            refused_count,
+            500 - super::MAX_PENDING_PROMPTS,
+            "every ask past the cap was refused promptly, not silently dropped"
+        );
+
+        // the queue still SERVICES at the cap: draining one (as the presenter does when it takes
+        // the next prompt to show) frees exactly one slot for the next arrival.
+        {
+            let (q, _) = &*shared;
+            q.lock().unwrap().queue.pop_front();
+        }
+        assert!(
+            super::try_enqueue(&shared, mk(9999)),
+            "a freed slot must admit the next ask"
+        );
+        let len = shared.0.lock().unwrap().queue.len();
+        assert_eq!(
+            len,
+            super::MAX_PENDING_PROMPTS,
+            "back at the cap after one drain + one enqueue"
         );
     }
 }

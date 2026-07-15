@@ -453,6 +453,14 @@ impl Chan {
             dt,
         );
         if self.energy < 1e-11 {
+            // Flush-to-zero floor: without resetting the FIELD (not just the returned
+            // level), a silence tail keeps multiplying `energy` toward 0 forever, spending
+            // many ticks with it parked in f32's SUBNORMAL range (below ~1.18e-38) even
+            // though the published level already reports honest dark. Denormal arithmetic
+            // is 10-100x slower on x86 — an unbounded decay is a real CPU-cost bug on any
+            // sustained-silence tail. 1e-11 sits far above the subnormal boundary, so this
+            // floor is hit long before `energy` could ever become subnormal.
+            self.energy = 0.0;
             return 0.0; // fully drained — honestly dark
         }
         let smooth_db = 10.0 * self.energy.log10();
@@ -862,6 +870,163 @@ mod tests {
         assert!(tilt_db(0) < 0.0, "the bottom band sits below the tilt reference");
         for i in 1..BANDS {
             assert!(tilt_db(i) > tilt_db(i - 1), "tilt is monotonic in frequency");
+        }
+    }
+
+    // ── Property tests: metamorphic centroid laws, the denormal floor, and hostile-PCM
+    // robustness. ────────────────────────────────────────────────────────────────────
+    mod props {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn cfg() -> ProptestConfig {
+            ProptestConfig { cases: 128, ..ProptestConfig::default() }
+        }
+
+        /// The same band-index-weighted centroid `analyze` computes internally (region 0 =
+        /// the full mix, weighted by tilted band energy) — pulled out here as a pure helper
+        /// so the metamorphic properties can probe it directly without the AGC/integrator
+        /// state `analyze`/`Loudness` carry across ticks.
+        fn band_centroid(dbs: &[f32; BANDS]) -> f32 {
+            let mut weighted = 0.0f32;
+            let mut total = 0.0f32;
+            for (i, d) in dbs.iter().enumerate() {
+                let e = 10f32.powf(d / 10.0);
+                weighted += e * i as f32 / (BANDS - 1) as f32;
+                total += e;
+            }
+            weighted / total.max(1e-12)
+        }
+
+        proptest! {
+            #![proptest_config(cfg())]
+
+            /// (3a) A time shift must not change WHAT frequency the music is at — only WHEN.
+            /// For a bin-exact pure tone (frequency an exact multiple of `rate/FFT_N`), a
+            /// circular shift of the sampled buffer is a pure phase shift of the same
+            /// underlying periodic signal. For a COMPLEX exponential the Hann-windowed
+            /// magnitude spectrum would be exactly phase-invariant — but a REAL sine is two
+            /// complex exponentials (±bin), and the window's sidelobe skirts of the two
+            /// images overlap and interfere PHASE-DEPENDENTLY at a small level (the property
+            /// run that pinned this found ~1.1e-3 of centroid drift at bin 684, shift 26).
+            /// So the law holds to a small tolerance, not float-epsilon: 5e-3 on a centroid
+            /// that lives in [0,1] still pins "the music didn't move bands", while leaving
+            /// room for the real-tone image interference that is genuinely there.
+            /// Bin domain: the analyzed band range tops out at [`F_HI`] (16kHz = bin ~683 at
+            /// 48kHz/2048), and a tone AT the edge has its leakage skirt half-outside the banded
+            /// range — phase then genuinely moves the in-band energy (the pinning runs measured
+            /// 2%+ of centroid drift at bins 684-701). The law is about tones the analyzer
+            /// actually covers, so the domain stops comfortably inside the edge (bin 660 ≈
+            /// 15.5kHz), mirroring how the pitch-ranking law below already excludes the edges.
+            #[test]
+            fn centroid_is_time_shift_invariant(
+                bin in 5usize..660,
+                shift in 1usize..FFT_N,
+            ) {
+                let rate = 48_000u32;
+                let hz = bin as f32 * rate as f32 / FFT_N as f32;
+                let buf = sine(hz, 0.8, rate, FFT_N);
+                let mut shifted = buf.clone();
+                shifted.rotate_left(shift % FFT_N);
+
+                let c1 = band_centroid(&tilted_band_dbs(&buf, rate));
+                let c2 = band_centroid(&tilted_band_dbs(&shifted, rate));
+                // Principled tolerance: the law is "the music didn't move bands", so the bound is
+                // HALF A BAND WIDTH on the [0,1] band-index centroid — not a hand-tuned epsilon.
+                // (The real-tone ±bin image interference described above peaks near the top band
+                // edge; the pinning runs measured up to ~5e-3 of drift there, well inside this.)
+                let half_band = 0.5 / (BANDS - 1) as f32;
+                prop_assert!(
+                    (c1 - c2).abs() < half_band,
+                    "shift moved the centroid by more than half a band: {c1} vs {c2}"
+                );
+            }
+
+            /// (3b) Ranking law: a higher pure tone reads as a higher (band-index) centroid
+            /// than a lower one — "where the music's energy lives" must move the right way
+            /// as pitch rises. Frequencies are kept solidly inside the analysed band
+            /// [`F_LO`]..[`F_HI`] (a tone above `F_HI` falls outside every band's range and
+            /// reads as pure noise-floor, a degenerate case unrelated to this law) and
+            /// spaced far enough apart (`hz2 >= hz1 * 1.5`) that they can't land in the same
+            /// band and tie.
+            #[test]
+            fn centroid_scales_with_pitch(
+                hz1 in 150.0f32..5_000.0,
+                mult in 1.5f32..3.0,
+            ) {
+                let rate = 48_000u32;
+                let hz2 = (hz1 * mult).min(15_000.0);
+                prop_assume!(hz2 >= hz1 * 1.5);
+                let c1 = band_centroid(&tilted_band_dbs(&sine(hz1, 0.8, rate, FFT_N), rate));
+                let c2 = band_centroid(&tilted_band_dbs(&sine(hz2, 0.8, rate, FFT_N), rate));
+                prop_assert!(c2 > c1, "higher tone ({hz2}Hz, centroid {c2}) didn't rank above the lower one ({hz1}Hz, centroid {c1})");
+            }
+
+            /// (3c) Sustained silence must decay `Chan::energy` to TRUE zero, never leave it
+            /// parked in the f32 SUBNORMAL range — the denormal-floor bug fixed in `step`
+            /// above (see the comment there). Without that fix this property fails: the
+            /// unfloored field drifts through denormal values for ~150 ticks before ever
+            /// reaching exact 0.0.
+            /// Tick budget: the decay measured in the pinning run is ~0.899x per 16ms tick, so
+            /// crossing the 1e-11 flush floor from a full-scale 1.0 start takes ~237 ticks —
+            /// 400 is a comfortable worst-case margin. (The per-tick invariant inside the loop
+            /// is the load-bearing half of the law: energy must NEVER be observable between 0
+            /// and the subnormal boundary, at any tick count.)
+            #[test]
+            fn silence_decays_to_true_zero_not_denormals(
+                start_energy in 1e-6f32..1.0,
+                ticks in 400usize..800,
+            ) {
+                let mut chan = Chan::new();
+                chan.energy = start_energy;
+                for _ in 0..ticks {
+                    chan.step(0.0, 0.016);
+                    prop_assert!(
+                        chan.energy == 0.0 || chan.energy >= f32::MIN_POSITIVE,
+                        "energy parked in the denormal range: {}", chan.energy
+                    );
+                }
+                prop_assert_eq!(chan.energy, 0.0, "a sustained silence tail must fully flush to true zero");
+            }
+
+            /// (3d) Hostile PCM — NaN, ±Inf, full-scale, DC offset, alternating ±1 — must
+            /// never panic the analysis kernels. A short hostile pattern is cycled to fill a
+            /// full FFT window (cheaper to generate than a full 2048-element strategy while
+            /// still exercising every position via the cycling FFT/window math). Every
+            /// published field stays either NaN (hostile input legitimately can't produce a
+            /// meaningful reading — no floor exists to invent one) or within its documented
+            /// bound; NEITHER kernel panics either way.
+            #[test]
+            fn dsp_kernels_never_panic_on_hostile_pcm(
+                pattern in prop::collection::vec(
+                    prop_oneof![
+                        Just(f32::NAN),
+                        Just(f32::INFINITY),
+                        Just(f32::NEG_INFINITY),
+                        Just(1.0f32),
+                        Just(-1.0f32),
+                        Just(0.0f32),
+                        Just(1e30f32),
+                        Just(-1e30f32),
+                        proptest::num::f32::ANY,
+                    ],
+                    1..32,
+                ),
+                rate in prop_oneof![Just(44_100u32), Just(48_000u32), Just(96_000u32)],
+                dt in 0.0f32..0.1,
+            ) {
+                let ring: Vec<f32> = pattern.iter().cycle().take(FFT_N).copied().collect();
+
+                let dbs = tilted_band_dbs(&ring, rate); // must not panic
+                prop_assert_eq!(dbs.len(), BANDS);
+
+                let mut st = Loudness::new();
+                let sig = analyze(&ring, rate, dt, &mut st); // must not panic
+                for lvl in sig.levels {
+                    prop_assert!(lvl.is_nan() || (0.0..=1.0).contains(&lvl), "level out of bounds: {lvl}");
+                }
+                prop_assert!(sig.tone.is_nan() || (0.0..=1.0).contains(&sig.tone), "tone out of bounds: {}", sig.tone);
+            }
         }
     }
 }

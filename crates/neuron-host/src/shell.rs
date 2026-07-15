@@ -102,11 +102,27 @@ impl Host {
     }
 }
 
+/// Bound on [`Host`]'s teardown. The kernel actor normally consumes `Cmd::Shutdown` within one
+/// command-loop turn — but a turn can include `Arbiter::resolve`, which invokes arbitrary
+/// [`LiveContent::render`] implementations SYNCHRONOUSLY on the actor thread. A wedged renderer
+/// (an adapter's live layer stuck on a lock or a blocking call) would leave `Cmd::Shutdown`
+/// forever unread, and an unbounded join here would hang process teardown at the CENTRAL kernel
+/// owner — the one place the bounded-teardown sweep must not have a hole. 2s is many orders of
+/// magnitude above a real resolve (microseconds over a few hundred cells); hitting this deadline
+/// means a renderer is genuinely wedged, and leaking the kernel thread at exit beats hanging.
+const HOST_DROP_DEADLINE: Duration = Duration::from_secs(2);
+
+/// Bound on one [`HostHandle`] request's reply wait — the caller-side twin of
+/// [`HOST_DROP_DEADLINE`]: a leaked-but-wedged kernel still owns the command Receiver, so sends
+/// succeed and only this deadline stands between a retained handle and an infinite wait (see
+/// `request`). Same wedge-not-slowness sizing rationale.
+const HOST_REQUEST_DEADLINE: Duration = Duration::from_secs(2);
+
 impl Drop for Host {
     fn drop(&mut self) {
         let _ = self.tx.send(Cmd::Shutdown);
         if let Some(t) = self.thread.take() {
-            let _ = t.join();
+            crate::worker::join_bounded(t, HOST_DROP_DEADLINE, "neuron-host-kernel");
         }
     }
 }
@@ -123,7 +139,16 @@ impl HostHandle {
     fn request<T>(&self, build: impl FnOnce(Sender<T>) -> Cmd) -> Option<T> {
         let (rtx, rrx) = channel();
         self.tx.send(build(rtx)).ok()?;
-        rrx.recv().ok()
+        // Bounded, not bare `recv()`: the disconnected-channel case (kernel escalated or shut
+        // down cleanly) errors immediately, but a kernel thread that is ALIVE-BUT-WEDGED — stuck
+        // inside an adapter's `LiveContent::render`, or leaked by `Host::drop`'s bounded join —
+        // still owns the command Receiver, so the send above SUCCEEDS and an unbounded recv would
+        // wait forever for a reply the actor can never produce. That would quietly move the hang
+        // this type's contract forbids ("callers observe absence, never hang forever") from Drop
+        // into every later API call on a retained handle. A real kernel turn is microseconds;
+        // this deadline is the same wedge-not-slowness class as `HOST_DROP_DEADLINE`, and timing
+        // out degrades to the documented honest absence (`None`).
+        rrx.recv_timeout(HOST_REQUEST_DEADLINE).ok()
     }
 
     /// Subscribe to bus signals by prefix (see [`crate::bus::Bus::subscribe`]).
@@ -351,6 +376,73 @@ mod tests {
     use crate::arbiter::band;
 
     #[test]
+    fn host_drop_is_bounded_when_a_live_renderer_wedges() {
+        // `Arbiter::resolve` runs arbitrary `LiveContent::render` implementations SYNCHRONOUSLY on
+        // the kernel actor thread — so a wedged renderer (stuck lock, blocking call) leaves
+        // `Cmd::Shutdown` forever unread. This pins the `HOST_DROP_DEADLINE` backstop: dropping
+        // `Host` must return within the bound even with the kernel mid-wedge, leaking the actor
+        // thread (loudly) instead of hanging process teardown at the central kernel owner.
+        use crate::arbiter::{Content, LiveContent};
+        struct Wedged;
+        impl LiveContent for Wedged {
+            fn render(&mut self, _now: Instant) -> Vec<Option<Rgb>> {
+                // Park forever: an unpaired Condvar wait, the same shape as the writer lane's
+                // BlockingSink. The kernel thread is deliberately leaked by the bounded drop.
+                let pair = std::sync::Mutex::new(());
+                let cv = std::sync::Condvar::new();
+                let g = pair.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                drop(cv.wait(g));
+                unreachable!("nobody notifies");
+            }
+            fn boxed_clone(&self) -> Box<dyn LiveContent> {
+                Box::new(Wedged)
+            }
+        }
+
+        let host = Host::spawn();
+        let mut h = host.handle();
+        h.declare(SurfaceInfo::grid("kbd", "Board", SurfaceKind::Keyboard, 1, 1));
+        let owner = h.next_source();
+        h.claim(
+            "kbd",
+            owner,
+            band::SESSION,
+            LeaseSpec::Pinned,
+            Content::Live(Box::new(Wedged)),
+            Instant::now(),
+        )
+        .expect("claim the wedged live layer");
+        // Fire a resolve the kernel will wedge inside; never read the reply.
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let _ = host.tx.send(Cmd::Resolve { surface: "kbd".into(), now: Instant::now(), reply: tx });
+        std::thread::sleep(Duration::from_millis(150)); // let the actor actually enter render()
+
+        let started = Instant::now();
+        drop(host);
+        assert!(
+            started.elapsed() < HOST_DROP_DEADLINE * 3,
+            "Host::drop must be bounded with a wedged renderer, took {:?}",
+            started.elapsed()
+        );
+
+        // The sharper half of the contract: the wedged kernel thread was LEAKED, not killed — it
+        // still owns the command Receiver, so sends from this retained handle SUCCEED and only
+        // `request`'s reply deadline stands between the caller and an infinite wait. A retained
+        // handle after teardown must observe honest absence within the bound, never hang.
+        let post = Instant::now();
+        let surfaces = h.surfaces();
+        assert!(
+            post.elapsed() < HOST_REQUEST_DEADLINE * 3,
+            "a retained HostHandle must not hang against a leaked wedged kernel, took {:?}",
+            post.elapsed()
+        );
+        assert!(
+            surfaces.is_empty(),
+            "a wedged kernel can produce no reply — the handle must read honest absence"
+        );
+    }
+
+    #[test]
     fn claims_carry_names_and_bands_the_who_wins_readout() {
         // The emergent config no last-writer-wins tool can represent: name a
         // session, and read whether it WINS or is SUPPRESSED purely from band
@@ -486,5 +578,170 @@ mod tests {
             c.0 > b.0,
             "reused a source id across rebirth: {c:?} not above {b:?}"
         );
+    }
+
+    // ── TASK 2 (second half): claim fight racing a real kernel fault ───────
+    //
+    // `Cmd::Poison`/`HostHandle::poison` are `#[cfg(test)]`-gated INSIDE this
+    // crate, so an EXTERNAL integration-test binary (like
+    // `tests/claim_fights.rs`, which links the lib without `--cfg test`)
+    // cannot see them — this scenario has to live here instead. The
+    // no-poisoning concurrent claim fight lives in `tests/claim_fights.rs`,
+    // which only needs the public `HostApi`/`HostHandle` surface.
+
+    #[test]
+    fn claim_fight_survives_poisoning_mid_fight() {
+        let host = Host::spawn();
+        let mut setup = host.handle();
+        setup.declare(SurfaceInfo::grid("kbd", "Board", SurfaceKind::Keyboard, 1, 1));
+
+        const THREADS: usize = 4;
+        const ITERS: usize = 30;
+        let workers: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let mut h = host.handle();
+                thread::Builder::new()
+                    .name(format!("poison-fight-{t}"))
+                    .spawn(move || {
+                        for i in 0..ITERS {
+                            let owner = h.next_source();
+                            let lease = if i % 2 == 0 {
+                                LeaseSpec::Ttl(Duration::from_millis(10))
+                            } else {
+                                LeaseSpec::Pinned
+                            };
+                            // A claim landing during the crash/rebirth window
+                            // honestly returns `None` (channel gone or kernel
+                            // mid-fault) — never panics, never hangs, bounded
+                            // by the governor's own restart contract.
+                            if let Some(id) = h.claim(
+                                "kbd",
+                                owner,
+                                band::SESSION,
+                                lease,
+                                Content::Fill(Rgb(t as u8, i as u8, 0)),
+                                Instant::now(),
+                            ) {
+                                h.refresh(id, Instant::now());
+                            }
+                        }
+                    })
+                    .expect("spawn poison-fight thread")
+            })
+            .collect();
+
+        // Poison the kernel twice, spaced enough to be isolated faults each
+        // (the escalation-burst composed contract is TASK 4's job, not this
+        // one's — this test is about surviving a fault WHILE claims race it).
+        let poisoner = host.handle();
+        poisoner.poison();
+        thread::sleep(Duration::from_millis(120));
+        poisoner.poison();
+
+        for w in workers {
+            assert!(
+                w.join().is_ok(),
+                "a claim-fight thread must never panic across a kernel fault"
+            );
+        }
+
+        // Bound every recv the same way `kernel_fault_rebirths_...` above
+        // does: poll for the reborn kernel rather than trusting a single
+        // blocking call.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut h = host.handle();
+        loop {
+            let surfaces = h.surfaces();
+            if !surfaces.is_empty() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "kernel never came back after the poisoning burst");
+            thread::sleep(Duration::from_millis(50));
+        }
+        // Re-claim after rebirth must succeed — the documented lease
+        // contract (surfaces reborn, sessions must re-claim).
+        let owner = h.next_source();
+        let now = Instant::now();
+        assert!(
+            h.claim("kbd", owner, band::SESSION, LeaseSpec::Pinned, Content::Fill(Rgb(9, 9, 9)), now)
+                .is_some(),
+            "a fresh claim after rebirth must succeed"
+        );
+    }
+
+    // ── TASK 4: governor × shell composed contract under a crash BURST ─────
+
+    #[test]
+    fn crash_burst_never_hangs_and_the_composed_governor_contract_holds() {
+        // `kernel_fault_rebirths_with_surfaces_but_without_claims` proves ONE
+        // rebirth. This drives a BURST — repeated poisoning in quick
+        // succession — to observe the ACTUAL composed contract. Per this
+        // module's own docs: "isolated faults restart in under a second, a
+        // fault storm escalates and the shell gives up loudly rather than
+        // spinning" — `Verdict::Escalate` makes `run` `break`, so the actor
+        // thread exits FOR GOOD (see `run`'s match on `governor.on_crash`).
+        // There is no separate "give up after N tries, then restart clean"
+        // tier in this composition: once escalated, the Host stays
+        // permanently dead and every `HostHandle` call degrades honestly.
+        // This test's whole point is proving that degrade is FAST, not a
+        // hang, whichever branch (kept-absorbing vs escalated) the burst
+        // actually lands in on this machine.
+        let host = Host::spawn();
+        let mut setup = host.handle();
+        setup.declare(SurfaceInfo::grid("kbd", "Board", SurfaceKind::Keyboard, 1, 1));
+
+        let poison_handle = host.handle();
+        let mut probe_handle = host.handle();
+        let scenario = crate::worker::spawn_named("t-crash-burst", move || {
+            const BURST: usize = 6;
+            for _ in 0..BURST {
+                poison_handle.poison();
+            }
+            // Poll for a settled reading, exiting as soon as two consecutive
+            // probes agree (early-exit keeps the common case fast); bounded
+            // overall so a genuine non-convergence still finishes promptly.
+            let ceiling = Instant::now() + Duration::from_secs(8);
+            let mut prev: Option<bool> = None;
+            let settled;
+            loop {
+                let alive = !probe_handle.surfaces().is_empty();
+                if prev == Some(alive) {
+                    settled = alive;
+                    break;
+                }
+                prev = Some(alive);
+                if Instant::now() >= ceiling {
+                    settled = alive;
+                    break;
+                }
+                thread::sleep(Duration::from_millis(150));
+            }
+            settled
+        })
+        .expect("spawn crash-burst scenario thread");
+
+        let alive_at_rest =
+            crate::worker::join_bounded(scenario, Duration::from_secs(15), "t-crash-burst").expect(
+                "the burst-and-settle scenario must finish within its bound — a hang here would \
+                 mean the governor/shell composition can spin-restart or block forever, contrary \
+                 to the documented 'gives up loudly rather than spinning' contract",
+            );
+
+        // Whichever branch the burst landed in, a FRESH probe right now must
+        // be fast and consistent with that resting state — never itself a
+        // hang, and (if escalated) never a fluke straggler answer.
+        let mut h = host.handle();
+        let probed = h.surfaces();
+        if alive_at_rest {
+            assert_eq!(
+                probed.first().map(|s| s.key.as_str()),
+                Some("kbd"),
+                "still-alive branch: the seed must still be served"
+            );
+        } else {
+            assert!(probed.is_empty(), "escalated host must stay dead, not intermittently answer");
+            thread::sleep(Duration::from_millis(200));
+            assert!(h.surfaces().is_empty(), "escalated host must not un-escalate on its own");
+        }
     }
 }

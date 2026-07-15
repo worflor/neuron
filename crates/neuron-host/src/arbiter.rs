@@ -295,6 +295,52 @@ mod live_tests {
     }
 
     #[test]
+    fn nan_alpha_renders_invisible_never_poisons_the_blend() {
+        // `LiveContent::alpha` is an OPEN trait method — a broken adapter can return any non-finite
+        // opacity: NaN (a 0.0/0.0 fade ratio) or ±∞ (an overflowed fade calc). `f32::clamp`
+        // mishandles them — it passes NaN straight through, and pre-fix the two consumers even
+        // DISAGREED on NaN: `is_visible` (NaN > floor = false) called the layer invisible while
+        // `resolve`'s floor gate (NaN <= floor = false) composited it, poisoning every blended
+        // channel. `sane_alpha` pins ALL THREE to one answer: a non-finite alpha is a broken
+        // producer, and a broken producer renders INVISIBLE — the base survives untouched and both
+        // consumers agree. +∞ is DELIBERATELY invisible, not clamped-to-opaque: a producer whose
+        // opacity math overflowed must not seize the whole board on the strength of a bug (a real
+        // layer that wants full opacity returns 1.0). See `sane_alpha`'s doc for the full rationale.
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut a = Arbiter::new();
+            let t0 = Instant::now();
+            a.declare_surface("kbd", 2);
+            a.claim("kbd", SourceId(1), band::BASE, Lease::Pinned, Content::Fill(Rgb(100, 100, 100)))
+                .unwrap();
+            a.claim(
+                "kbd",
+                SourceId(2),
+                band::SESSION,
+                Lease::Pinned,
+                Content::Live(Box::new(Wash { color: Rgb(255, 255, 255), alpha: bad })),
+            )
+            .unwrap();
+            let f = a.resolve("kbd", t0).unwrap();
+            assert_eq!(
+                f,
+                vec![Some(Rgb(100, 100, 100)), Some(Rgb(100, 100, 100))],
+                "a {bad:?}-alpha layer must contribute nothing — the base wins every cell"
+            );
+            // And the claims view agrees: `claims` lists only VISIBLE layers, so the broken layer
+            // must be absent — never masquerading as the board's owner while contributing nothing.
+            let visible = a.claims("kbd", t0);
+            assert!(
+                visible.iter().any(|(o, _)| *o == SourceId(1)),
+                "the base must still read as a visible claimant under {bad:?} alpha: {visible:?}"
+            );
+            assert!(
+                visible.iter().all(|(o, _)| *o != SourceId(2)),
+                "the {bad:?}-alpha layer must not read as visible: {visible:?}"
+            );
+        }
+    }
+
+    #[test]
     fn alpha_endpoints_are_pure_base_and_pure_over() {
         let mut a = Arbiter::new();
         let t0 = Instant::now();
@@ -536,6 +582,32 @@ pub struct Layer {
 /// cutoff `resolve`/`ChromaShmLayer` use to skip a fully-faded overlay.
 const MIN_VISIBLE_ALPHA: f32 = 0.001;
 
+/// Sanitize a [`LiveContent::alpha`] value at the trust boundary. `alpha()` is an OPEN trait
+/// method — any adapter can implement it, and nothing in the type system stops a broken producer
+/// returning a non-finite opacity: NaN (a `0.0/0.0` fade ratio), or ±∞ (a fade calc that
+/// overflowed). `f32::clamp` mishandles both — it PASSES NaN straight through (both comparisons
+/// are false, the same trap `tone::soft_clip` fixed), and NaN comparisons made the two consumers
+/// DISAGREE: the visibility gate (`NaN > floor` = false) called the layer invisible while
+/// `resolve`'s post-clamp gate (`NaN <= floor` = false) went ahead and COMPOSITED it, poisoning
+/// every blended channel.
+///
+/// The single rule, applied at both sites: **any non-finite alpha is a broken producer, and a
+/// broken producer renders INVISIBLE** — NaN and +∞ and −∞ alike, never garbage on the board.
+///
+/// Note +∞ deliberately becomes invisible, NOT opaque. Clamp arithmetic would order +∞ above 1.0
+/// and pin it to full opacity, but a producer whose opacity math overflowed is not *requesting*
+/// maximum opacity — it is signalling a bug, and a bug must not let a layer seize the whole board
+/// and blank the user's base lighting. A real layer that wants to be opaque returns `1.0`. So this
+/// is the same conservative direction as `soft_clip` flushing a broken sample to silence: broken
+/// producers contribute nothing until they are fixed.
+fn sane_alpha(a: f32) -> f32 {
+    if a.is_finite() {
+        a.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
 impl Layer {
     /// Whether this layer visibly contributes to the board right now. Static
     /// content (`Fill`/`Cells`) always does; a `Live` layer only while its
@@ -543,7 +615,7 @@ impl Layer {
     /// dormant, transparent overlay doesn't masquerade as the board's owner.
     fn is_visible(&self) -> bool {
         match &self.content {
-            Content::Live(c) => c.alpha() > MIN_VISIBLE_ALPHA,
+            Content::Live(c) => sane_alpha(c.alpha()) > MIN_VISIBLE_ALPHA,
             _ => true,
         }
     }
@@ -775,7 +847,9 @@ impl Arbiter {
                         (&rendered, l.alpha(), l.blend_mode())
                     }
                 };
-            let alpha = alpha.clamp(0.0, 1.0);
+            // `sane_alpha`, not a bare clamp: clamp passes NaN through, and a NaN here would slip
+            // past the floor check below (NaN <= x is false) straight into the per-channel blend.
+            let alpha = sane_alpha(alpha);
             if alpha <= MIN_VISIBLE_ALPHA {
                 continue; // below the visibility floor — contributes nothing this resolve
             }
@@ -983,5 +1057,262 @@ mod tests {
             .claim("ghost", SourceId(1), band::BASE, Lease::Pinned, Content::Fill(Rgb(0, 0, 0)))
             .is_none());
         assert!(a.resolve("ghost", now()).is_none());
+    }
+
+    // ── TASK 3(a/b): clock-leap laws ────────────────────────────────────────
+
+    #[test]
+    fn wake_storm_after_a_long_sleep_expires_everything_expirable_in_one_sweep() {
+        // A laptop wakes 8 hours later: ONE big `AdvanceClock` step, not a
+        // stream of small ticks. A single sweep must expire everything that's
+        // due, without panicking; resolve degrades to base; a fresh claim
+        // right after the wake works exactly as normal.
+        let mut a = Arbiter::new();
+        let t0 = now();
+        a.declare_surface("kbd", 1);
+        a.claim("kbd", SourceId(1), band::BASE, Lease::Pinned, Content::Fill(Rgb(1, 2, 3))).unwrap();
+        // Staggered TTLs, all short next to an 8h jump.
+        for (owner, secs) in [(2u64, 5), (3, 30), (4, 3600)] {
+            a.claim(
+                "kbd",
+                SourceId(owner),
+                band::SESSION,
+                Lease::heartbeat(Duration::from_secs(secs), t0),
+                Content::Fill(Rgb(9, 9, 9)),
+            )
+            .unwrap();
+        }
+        let wake = t0 + Duration::from_secs(8 * 3600);
+        let released = a.sweep(wake);
+        assert_eq!(released.len(), 3, "every heartbeat claim must lapse across an 8h jump");
+        assert!(released.iter().all(|r| r.why == ReleaseWhy::Expired));
+        assert_eq!(a.resolve("kbd", wake).unwrap()[0], Some(Rgb(1, 2, 3)), "degrades to base");
+        // The wake-storm law: a claim right after the jump is unaffected.
+        assert!(a
+            .claim(
+                "kbd",
+                SourceId(5),
+                band::SESSION,
+                Lease::heartbeat(Duration::from_secs(15), wake),
+                Content::Fill(Rgb(5, 5, 5)),
+            )
+            .is_some());
+        assert_eq!(a.resolve("kbd", wake).unwrap()[0], Some(Rgb(5, 5, 5)));
+    }
+
+    #[test]
+    fn sweep_is_idempotent_across_a_zero_length_leap() {
+        // `now` here is `Instant` — monotonic by construction (a real
+        // `Instant::now()` value-stream never regresses), and the module docs
+        // ("no notion of time other than the `now` the caller passes in")
+        // don't claim to handle a caller that violates that. A genuine
+        // BACKWARD leap is therefore not a scenario this clock type can
+        // represent in good faith; the representable degenerate case is a
+        // leap of exactly ZERO — two sweeps at the identical instant must be
+        // idempotent (the second finds nothing new to report).
+        let mut a = Arbiter::new();
+        let t0 = now();
+        a.declare_surface("kbd", 1);
+        a.claim(
+            "kbd",
+            SourceId(1),
+            band::SESSION,
+            Lease::heartbeat(Duration::from_millis(1), t0),
+            Content::Fill(Rgb(1, 1, 1)),
+        )
+        .unwrap();
+        let later = t0 + Duration::from_secs(1);
+        let first = a.sweep(later);
+        assert_eq!(first.len(), 1);
+        let second = a.sweep(later); // identical instant, no clock movement at all
+        assert!(second.is_empty(), "a repeated sweep at the identical instant must be a no-op");
+    }
+}
+
+/// TASK 1 — reference-model stateful property test.
+///
+/// A naive model of the arbiter's own DOCUMENTED precedence rule (see the doc
+/// comments above `Arbiter::resolve`/`claims`): higher `band` wins; within a
+/// band the LATER claim (higher `seq`) wins; an expired lease never wins, and
+/// that's checked LIVE — no sweep required (`expired_lease_stops_winning_before_any_sweep`
+/// pins exactly this). One subtlety the naive "refresh only works while alive"
+/// intuition gets WRONG, discovered by reading `Arbiter::refresh`/`set_content`
+/// closely: neither checks lease liveness at all, only PHYSICAL presence — a
+/// heartbeat that arrives just after its own deadline but before the next
+/// `sweep` still succeeds and resurrects the claim. The model mirrors that
+/// real (if surprising) behaviour rather than the simpler wrong rule, or every
+/// case would falsely report as a divergence.
+#[cfg(test)]
+mod model_props {
+    use super::*;
+    use proptest::prelude::*;
+    use std::time::{Duration, Instant};
+
+    const SURFACES: [&str; 2] = ["s0", "s1"];
+    const BANDS: [i32; 4] = [band::BASE, band::AMBIENT, band::SESSION, band::OVERRIDE];
+
+    #[derive(Clone, Debug)]
+    enum ModelOp {
+        Claim { owner: u8, surface: u8, band_idx: u8, ttl_ms: Option<u64> },
+        Refresh { target: usize },
+        SetContent { target: usize },
+        Release { target: usize },
+        ReleaseOwner { owner: u8 },
+        Sweep,
+        AdvanceClock { ms: u64 },
+    }
+
+    fn any_op() -> impl Strategy<Value = ModelOp> {
+        prop_oneof![
+            3 => (0u8..4, 0u8..2, 0u8..4, prop::option::of(0u64..5000))
+                .prop_map(|(owner, surface, band_idx, ttl_ms)| ModelOp::Claim {
+                    owner,
+                    surface,
+                    band_idx,
+                    ttl_ms,
+                }),
+            2 => (0usize..64).prop_map(|target| ModelOp::Refresh { target }),
+            2 => (0usize..64).prop_map(|target| ModelOp::SetContent { target }),
+            2 => (0usize..64).prop_map(|target| ModelOp::Release { target }),
+            1 => (0u8..4).prop_map(|owner| ModelOp::ReleaseOwner { owner }),
+            1 => Just(ModelOp::Sweep),
+            2 => (0u64..3000).prop_map(|ms| ModelOp::AdvanceClock { ms }),
+        ]
+    }
+
+    /// One tracked claim, model-side. `present` = still physically in the
+    /// arbiter's layer vec (false once Released / ReleaseOwner'd / swept) —
+    /// deliberately distinct from lease liveness, which is a pure function of
+    /// `now_ms` (see `model_winner`).
+    struct Slot {
+        real_id: LayerId,
+        owner: u8,
+        surface: u8,
+        band: i32,
+        seq: u64,
+        ttl_ms: Option<u64>, // None = Pinned
+        deadline_ms: u64,
+        present: bool,
+    }
+
+    /// The reference model itself: resolve by the documented precedence rule,
+    /// over whatever is currently `present` and lease-alive at `now_ms`.
+    fn model_winner(slots: &[Slot], surface: u8, now_ms: u64) -> Option<u8> {
+        slots
+            .iter()
+            .filter(|s| s.present && s.surface == surface && s.ttl_ms.map_or(true, |_| now_ms < s.deadline_ms))
+            .max_by_key(|s| (s.band, s.seq))
+            .map(|s| s.owner)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 128, .. ProptestConfig::default() })]
+
+        #[test]
+        fn arbiter_matches_the_reference_model(ops in prop::collection::vec(any_op(), 0..64)) {
+            let mut a = Arbiter::new();
+            for s in SURFACES { a.declare_surface(s, 1); }
+            let t0 = Instant::now();
+            let mut slots: Vec<Slot> = Vec::new();
+            let mut now_ms: u64 = 0;
+            let mut next_seq: u64 = 1;
+
+            for op in &ops {
+                let now = t0 + Duration::from_millis(now_ms);
+                match op.clone() {
+                    ModelOp::Claim { owner, surface, band_idx, ttl_ms } => {
+                        let band = BANDS[band_idx as usize];
+                        let lease = match ttl_ms {
+                            Some(ms) => Lease::heartbeat(Duration::from_millis(ms), now),
+                            None => Lease::Pinned,
+                        };
+                        let content = Content::Fill(Rgb(owner, 0, 0));
+                        let id = a
+                            .claim(SURFACES[surface as usize], SourceId(owner as u64), band, lease, content)
+                            .expect("surface pre-declared, claim must succeed");
+                        slots.push(Slot {
+                            real_id: id,
+                            owner,
+                            surface,
+                            band,
+                            seq: next_seq,
+                            ttl_ms,
+                            deadline_ms: now_ms + ttl_ms.unwrap_or(0),
+                            present: true,
+                        });
+                        next_seq += 1;
+                    }
+                    ModelOp::Refresh { target } => {
+                        if !slots.is_empty() {
+                            let idx = target % slots.len();
+                            if slots[idx].present {
+                                let ok = a.refresh(slots[idx].real_id, now);
+                                prop_assert!(ok, "refresh must succeed while the layer is physically present, regardless of lease liveness");
+                                if let Some(ms) = slots[idx].ttl_ms {
+                                    slots[idx].deadline_ms = now_ms + ms;
+                                }
+                            }
+                        }
+                    }
+                    ModelOp::SetContent { target } => {
+                        if !slots.is_empty() {
+                            let idx = target % slots.len();
+                            if slots[idx].present {
+                                let owner = slots[idx].owner;
+                                let ok = a.set_content(slots[idx].real_id, Content::Fill(Rgb(owner, 0, 0)), now);
+                                prop_assert!(ok, "set_content must succeed while the layer is physically present");
+                                if let Some(ms) = slots[idx].ttl_ms {
+                                    slots[idx].deadline_ms = now_ms + ms;
+                                }
+                            }
+                        }
+                    }
+                    ModelOp::Release { target } => {
+                        if !slots.is_empty() {
+                            let idx = target % slots.len();
+                            if slots[idx].present {
+                                let released = a.release(slots[idx].real_id);
+                                prop_assert!(released.is_some());
+                                slots[idx].present = false;
+                            }
+                        }
+                    }
+                    ModelOp::ReleaseOwner { owner } => {
+                        let expected = slots.iter().filter(|s| s.present && s.owner == owner).count();
+                        let released = a.release_owner(SourceId(owner as u64));
+                        prop_assert_eq!(released.len(), expected);
+                        for s in slots.iter_mut() {
+                            if s.present && s.owner == owner {
+                                s.present = false;
+                            }
+                        }
+                    }
+                    ModelOp::Sweep => {
+                        let expected = slots
+                            .iter()
+                            .filter(|s| s.present && s.ttl_ms.map_or(false, |_| now_ms >= s.deadline_ms))
+                            .count();
+                        let released = a.sweep(now);
+                        prop_assert_eq!(released.len(), expected);
+                        for s in slots.iter_mut() {
+                            if s.present && s.ttl_ms.map_or(false, |_| now_ms >= s.deadline_ms) {
+                                s.present = false;
+                            }
+                        }
+                    }
+                    ModelOp::AdvanceClock { ms } => {
+                        now_ms += ms;
+                    }
+                }
+
+                let now = t0 + Duration::from_millis(now_ms);
+                for (i, surface) in SURFACES.iter().enumerate() {
+                    let expected = model_winner(&slots, i as u8, now_ms);
+                    let frame = a.resolve(surface, now).expect("declared surface");
+                    let actual = frame[0].map(|Rgb(o, _, _)| o);
+                    prop_assert_eq!(actual, expected, "surface {} mismatch after {:?} at now_ms={}", surface, op, now_ms);
+                }
+            }
+        }
     }
 }

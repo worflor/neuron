@@ -358,10 +358,30 @@ fn invoke_store_stress_e2e() {
     for tag in ["p", "q", "r", "s"] {
         assert!(host.fire_async(&format!("store_conc_{tag}"), &ctx).contains("dispatched"));
     }
-    let _ = wait_log("S conc done 50", Duration::from_secs(8));
-    // give the slowest worker a moment, then verify every file independently.
-    std::thread::sleep(Duration::from_millis(300));
+    // The four macros share ONE process-global store lock (`_state_lock` in neuron.py) that spans
+    // each store()'s whole load->mutate->atomic-replace, by design (see store_atomic_write_safety
+    // above) — so 4 macros * 50 writes = 200 serialized disk round-trips contending for one lock.
+    // Under real load (a loaded CI box, a concurrent workspace build) that serialization can take
+    // seconds, not milliseconds. The old wait here keyed off ONE macro's completion line (whichever
+    // happened to finish first) plus a fixed 300ms grace — the other three could still be mid-loop
+    // at that point, so the read below would observe a genuinely-incomplete-but-still-in-flight file
+    // and misreport it as a lost write. Wait for ALL FOUR completion lines instead — that is the
+    // actual finish signal — with a deadline generous enough to survive real contention.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut acc = Vec::new();
+    let needles = ["P conc done 50", "Q conc done 50", "R conc done 50", "S conc done 50"];
+    loop {
+        acc.extend(macro_host().drain_log());
+        if needles.iter().all(|n| acc.iter().any(|l| l.contains(n))) || Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
     for (tag, low) in [("P", "p"), ("Q", "q"), ("R", "r"), ("S", "s")] {
+        assert!(
+            acc.iter().any(|l| l.contains(&format!("{tag} conc done 50"))),
+            "{tag}: never reported completion within the deadline (log: {acc:?})"
+        );
         let m = read_store(&state, &format!("store_conc_{low}")).unwrap_or_else(|| panic!("store_conc_{low} parses"));
         let obj = m.as_object().unwrap_or_else(|| panic!("store_conc_{low} is an object"));
         assert_eq!(obj.len(), 50, "{tag}: all 50 concurrent writes landed");

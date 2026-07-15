@@ -14,7 +14,7 @@
 //! between polls on the one owning thread (no second thread, no write races).
 
 use std::io::{self, ErrorKind, Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::time::{Duration, SystemTime};
 
 const MAX_FRAME: usize = 16 << 20; // 16 MiB — obs frames are tiny; this is a hostile-length guard.
@@ -42,8 +42,30 @@ impl WsStream {
     /// an `upgrade: websocket` header is conclusive here. Documented, not
     /// silently skipped.
     pub fn connect(addr: &str, host: &str, path: &str) -> io::Result<WsStream> {
-        let mut sock = TcpStream::connect(addr)?;
+        // Bound the CONNECT itself, not just the post-connect I/O. `TcpStream::connect` blocks with
+        // no timeout: pointed at an unreachable OBS host (a remote box that's off, a firewall
+        // dropping SYN), it hangs for the OS default (~21s on Windows) — and `obs_run` only rechecks
+        // its stop flag BETWEEN top-level calls, so a hung connect makes ObsConnection's Drop miss
+        // its deadline and leak the thread (caught by the resident-census churn test). A 750ms
+        // connect budget matches the read/write bounds below; a failure just falls into obs_run's
+        // interruptible backoff, which rechecks stop. (Address resolution is done here too — for
+        // OBS's usual IP:port it's instant; a hostname's DNS lookup is a separate rare blocking
+        // point not bounded here.)
+        let sockaddr = addr
+            .to_socket_addrs()?
+            .next()
+            .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "obs address resolved to nothing"))?;
+        let mut sock = TcpStream::connect_timeout(&sockaddr, Duration::from_millis(750))?;
         sock.set_nodelay(true).ok();
+        // Bound both directions before doing any I/O: the owning thread (`obs_run`) only
+        // rechecks its stop flag BETWEEN top-level calls, so a handshake that stalls — the peer
+        // accepted the TCP connection but never sends a byte, or the write below meets a full
+        // send buffer with nobody reading — must not block this call forever. 750ms per read/
+        // write call is generous for a local obs-websocket peer; the write timeout persists for
+        // the whole connection (later frame sends reuse it), while the read timeout is
+        // overwritten per-call by `poll` below.
+        sock.set_read_timeout(Some(Duration::from_millis(750))).ok();
+        sock.set_write_timeout(Some(Duration::from_millis(750))).ok();
         // The Sec-WebSocket-Key is a per-connection nonce, not a secret; the
         // RFC only asks that it vary. Time + address entropy is ample.
         let seed = SystemTime::now()

@@ -328,6 +328,20 @@ pub const RECORD_MAGIC: u16 = 0xffff;
 /// random colours while the true state sits still underneath. Un-XOR with the same
 /// keystream and phase and the stable image falls straight out — no averaging or
 /// smoothing needed. Byte order matches [`ColorUnit::rgb`] (channel 0 = R).
+///
+/// INDEXING PROOF (every KEYSTREAM read site is in [`parse_frame_decoded`], 3 of them —
+/// `KEYSTREAM[phase]`, `KEYSTREAM[phase + KEYSTREAM_CHANNEL_STRIDE]`,
+/// `KEYSTREAM[phase + 2 * KEYSTREAM_CHANNEL_STRIDE]`): `phase` comes only from
+/// [`frame_phase`], which masks the attacker-controlled timestamp with `& 0x7f` (never
+/// exceeds 127) and then applies the CLAMP documented there (`phase -= 3` when
+/// `phase > 124`), capping it at 124. The channel multiplier is NOT attacker data — it is
+/// the fixed literal `0`/`1`/`2` at the three call sites, never a value read from shared
+/// memory — so the true worst case is `124 + 2*0x81 = 382 < 512`. In fact even the
+/// *unclamped* mask alone (`phase <= 127`) already gives `127 + 2*0x81 = 385 < 512`; the
+/// clamp's real job is protecting a hypothetical 4th channel (`3*0x81 + phase < 512`
+/// needs `phase <= 124`) that this decoder never reads. Either way no KEYSTREAM index
+/// derived from hostile SHM content can leave `[0, 512)`. See `keystream_phase_never_out_of_bounds_*`
+/// tests below for the exhaustive/boundary regression sweep.
 pub const KEYSTREAM: &[u8; 512] = include_bytes!("chroma_shm_data/keystream.bin");
 /// Per-channel stride into [`KEYSTREAM`] (R at `phase+0`, G at `+0x81`, B at `+0x102`).
 const KEYSTREAM_CHANNEL_STRIDE: usize = 0x81;
@@ -620,6 +634,12 @@ pub fn newest_record_meta(section: &[u8]) -> Option<(u32, u32)> {
 /// The per-frame XOR phase from a record's timestamp: `timestamp & 0x7f`, clamped so
 /// `phase + 0x183` stays inside the 512-byte [`KEYSTREAM`] (the writer's
 /// `if (0x80 - phase < 4) phase -= 3`).
+///
+/// THIS is the clamp site referenced by [`KEYSTREAM`]'s indexing proof: `ts & 0x7f` bounds
+/// `phase` to `0..=127` first (so the subtraction below can never underflow — `0x80 - phase`
+/// is always `>= 1` in `usize`), then the `phase > 124` branch pulls the top 3 values down
+/// to `122..=124`. Callers only ever add fixed literal channel strides (`0`, `KEYSTREAM_CHANNEL_STRIDE`,
+/// `2 * KEYSTREAM_CHANNEL_STRIDE`) to the returned value, never attacker data.
 fn frame_phase(section: &[u8], ff: usize) -> Option<usize> {
     let o = ff + ts_offset(section);
     if o + 4 > section.len() {
@@ -876,7 +896,16 @@ pub mod server {
             let appreg = find_sec(APP_REGISTRY);
             let sessinfo = find_sec(SESSION_INFO);
             let keyboard = device_section(0x01).map(|g| find_sec(g)).unwrap_or((0, 0));
-            let mask = wear_mask(&sa, appreg, sessinfo, keyboard);
+            // `wear_mask` can decline (`None`) if another thread in THIS process won the
+            // `mask_worn()` race above and already claimed the single in-process arbiter slot
+            // (see `claim_mask_slot`) — the same "a live server owns arbitration" signal as the
+            // early check, just caught after the TOCTOU window instead of before it. Treat it
+            // identically: stand down rather than let two `chroma-arbiter` threads write the
+            // same shared pages.
+            let mask = match wear_mask(&sa, appreg, sessinfo, keyboard) {
+                Some(m) => m,
+                None => return Err(CreateError::AlreadyServing),
+            };
             Ok(ShmServer { sections, handles, _sa: Some(sa), _mask: Some(mask) })
         }
 
@@ -1173,9 +1202,51 @@ pub mod server {
     struct SendHandle(HANDLE);
     unsafe impl Send for SendHandle {}
 
+    /// The single in-process arbiter slot. `mask_worn()` above is a CROSS-process check
+    /// (it opens a named kernel mutex) and has a TOCTOU window: two threads racing
+    /// [`ShmServer::create`] can both observe "not worn" before either has actually created
+    /// the mask mutexes, and both would then stand up their own `chroma-arbiter` thread —
+    /// two threads writing the SAME app-registry/SessionInfo pages via `write_grant`. That is
+    /// exactly the silent shared-memory race the `unsafe impl Sync for ShmServer` justification
+    /// (see its comment below) assumes can't happen: "the one in-process writer is a single
+    /// thread". This atomic makes that assumption true by construction, cheaply (no syscall)
+    /// and deterministically, on top of the cross-process check.
+    static MASK_CLAIMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// Claim the single in-process arbiter slot. `true` = claimed, the caller may stand up the
+    /// arbiter thread; `false` = a [`MaskGuard`] already owns it in this process — the caller
+    /// must stand down exactly as it would for [`CreateError::AlreadyServing`].
+    fn claim_mask_slot() -> bool {
+        MASK_CLAIMED
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// Release the in-process arbiter slot. Called exactly once, from [`MaskGuard::drop`]
+    /// (never from an error path — [`wear_mask`] only returns a `MaskGuard` after a
+    /// successful claim, so drop is the only place that owns a claim to give back).
+    fn release_mask_slot() {
+        MASK_CLAIMED.store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Bound on how long [`MaskGuard::drop`] will wait for `chroma-arbiter` to notice the
+    /// stop flag and exit, via [`crate::worker::join_bounded`]. The loop's designed stop-check
+    /// cadence is the 2s poll sleep in `arbiter_loop` — comfortably inside this deadline even
+    /// counting one worst-case `find_chroma_client` process scan or the 60ms `activate_once`
+    /// beat. Exceeding it means that design bound was violated (a scan wedged, not routine
+    /// slowness) and `join_bounded` leaks the thread rather than hanging the caller — the same
+    /// trade-off every other owned thread in this crate makes at Drop.
+    const MASK_GUARD_DROP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
+
     /// Owns the arbitration objects + the background arbiter thread. Dropping it stops
-    /// the thread (join) THEN releases every held handle — so no tick can fire after the
-    /// sections it writes have been torn down.
+    /// the thread (bounded join) THEN releases every held handle — so no tick can fire after
+    /// the sections it writes have been torn down — and finally frees the in-process arbiter
+    /// slot so a subsequent [`wear_mask`] can claim it.
     pub struct MaskGuard {
         held: Vec<SendHandle>,
         stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -1185,11 +1256,12 @@ pub mod server {
         fn drop(&mut self) {
             self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
             if let Some(t) = self.thread.take() {
-                let _ = t.join();
+                crate::worker::join_bounded(t, MASK_GUARD_DROP_DEADLINE, "chroma-arbiter");
             }
             for h in &self.held {
                 unsafe { CloseHandle(h.0) };
             }
+            release_mask_slot();
         }
     }
 
@@ -1197,12 +1269,19 @@ pub mod server {
     /// one-shot grant/activate loop on a background thread (NO pulse — see the arbiter
     /// block above). `appreg`/`sessinfo` are the mapped `(pointer, size)` of the
     /// app-registry and SessionInfo sections the grant writes.
+    ///
+    /// Returns `None` if another [`MaskGuard`] already owns the single in-process arbiter
+    /// slot ([`claim_mask_slot`]) — the caller (only [`ShmServer::create`]) must treat this
+    /// exactly like [`CreateError::AlreadyServing`] and stand down, never wearing a second mask.
     fn wear_mask(
         sa: &EveryoneSa,
         appreg: (usize, usize),
         sessinfo: (usize, usize),
         keyboard: (usize, usize),
-    ) -> MaskGuard {
+    ) -> Option<MaskGuard> {
+        if !claim_mask_slot() {
+            return None;
+        }
         let mut held = Vec::new();
         // Arbitration mutexes: the three fixed + one per interactive user.
         let user = std::env::var("USERNAME").unwrap_or_default();
@@ -1232,7 +1311,7 @@ pub mod server {
             arbiter_loop(appreg, sessinfo, keyboard, stop_thread)
         })
         .ok();
-        MaskGuard { held, stop, thread }
+        Some(MaskGuard { held, stop, thread })
     }
 
     /// The arbiter: ACTIVATE the connected game ONCE — write its grant, then fire the
@@ -1360,6 +1439,38 @@ pub mod server {
                 write_grant((tiny.as_mut_ptr() as usize, tiny.len()), (0, 0), 0x1234, 1);
             }
             assert!(tiny.iter().all(|&b| b == 0), "undersized app-registry left untouched");
+        }
+    }
+
+    #[cfg(test)]
+    mod mask_slot_tests {
+        use super::{claim_mask_slot, release_mask_slot};
+
+        // Pure atomic-only guard test — no kernel objects, no live `wear_mask`/`MaskGuard`.
+        // Serialized with a process-wide lock because `MASK_CLAIMED` is a single global static
+        // and `cargo test` runs tests in this module concurrently by default; without this the
+        // two tests below would race each other's claim/release calls.
+        static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+        #[test]
+        fn second_concurrent_claim_is_refused() {
+            let _guard = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(claim_mask_slot(), "first claim succeeds (slot starts free)");
+            assert!(
+                !claim_mask_slot(),
+                "a second concurrent claim (simulating a second in-process MaskGuard) must be refused"
+            );
+            release_mask_slot();
+        }
+
+        #[test]
+        fn claim_is_reusable_after_release() {
+            let _guard = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(claim_mask_slot(), "slot free at test start (serialized by TEST_LOCK)");
+            release_mask_slot();
+            assert!(claim_mask_slot(), "claim succeeds again once the prior guard released it");
+            assert!(!claim_mask_slot(), "still refuses a second claim while the first is held");
+            release_mask_slot();
         }
     }
 
@@ -1861,5 +1972,197 @@ mod tests {
             let o = OBJECTS.iter().find(|o| o.guid == g).unwrap();
             assert_eq!(o.kind, Kind::Event);
         }
+    }
+
+    // ── KEYSTREAM index safety (adversarial timestamp sweep) ──
+    //
+    // The proof lives on `KEYSTREAM`'s and `frame_phase`'s doc comments: `phase` is masked to
+    // `0..=127` by `ts & 0x7f` before the writer's clamp ever runs, and every KEYSTREAM read
+    // adds only a FIXED literal channel stride (0, 0x81, or 2*0x81) — never a value read from
+    // shared memory. So the only part of a hostile timestamp that can affect indexing is its
+    // low 7 bits: a fully enumerable, 128-value space. These tests exhaust that space directly
+    // and additionally pin the masking itself against full-`u32` boundary/bit-pattern inputs.
+
+    /// A minimal single-record device section (no second record tag, so `ts_offset` falls back
+    /// to the fixed [`TIMESTAMP_IN_RECORD`]) with `ts` stamped at that offset — just enough for
+    /// `parse_frame_decoded` to reach `frame_phase` and every KEYSTREAM read it drives.
+    fn synth_section_with_ts(ts: u32) -> Vec<u8> {
+        const REC0: usize = 0x08;
+        let ts_off = REC0 + TIMESTAMP_IN_RECORD;
+        let mut buf = vec![0u8; ts_off + 4];
+        buf[REC0] = 0xff;
+        buf[REC0 + 1] = 0xff;
+        buf[REC0 + 2] = 0x01; // device type (keyboard)
+        buf[REC0 + 3] = 0x00;
+        // Non-zero grid content so `parse_frame` doesn't see an empty (all-zero) grid.
+        for b in &mut buf[GRID_OFFSET..GRID_OFFSET + 32] {
+            *b = 0xAA;
+        }
+        buf[ts_off..ts_off + 4].copy_from_slice(&ts.to_le_bytes());
+        buf
+    }
+
+    #[test]
+    fn keystream_phase_never_out_of_bounds_exhaustive_low7() {
+        // Exhaust the entire masked-phase domain: only the low 7 bits of `ts` matter.
+        for low7 in 0u32..128 {
+            let section = synth_section_with_ts(low7);
+            let phase = frame_phase(&section, 0x08).expect("ts present at the fallback offset");
+            assert!(phase < KEYSTREAM.len(), "low7={low7} phase={phase} out of range");
+            assert!(
+                phase + 2 * KEYSTREAM_CHANNEL_STRIDE < KEYSTREAM.len(),
+                "low7={low7} phase={phase} B-channel index out of range"
+            );
+            // The whole decode path must not panic either.
+            let _ = parse_frame_decoded(&section);
+        }
+    }
+
+    #[test]
+    fn keystream_phase_never_out_of_bounds_u32_boundaries() {
+        // Full-u32 boundary and bit-pattern timestamps — pins that only `& 0x7f` matters.
+        let boundaries: &[u32] = &[
+            0,
+            1,
+            0x7f,
+            0x80,
+            0xff,
+            0x100,
+            0x7FFF_FFFF,
+            0x8000_0000,
+            0xAAAA_AAAA,
+            0x5555_5555,
+            0xFFFF_FF80,
+            u32::MAX,
+            u32::MAX - 1,
+        ];
+        for &ts in boundaries {
+            let section = synth_section_with_ts(ts);
+            let phase = frame_phase(&section, 0x08).expect("ts present at the fallback offset");
+            assert!(
+                phase + 2 * KEYSTREAM_CHANNEL_STRIDE < KEYSTREAM.len(),
+                "ts={ts:#010x} phase={phase} out of range"
+            );
+            // Must not panic decoding a full frame through this phase either.
+            let _ = parse_frame_decoded(&section);
+        }
+    }
+
+    // ── torn-read tolerance (the safety invariant behind `unsafe impl Sync for ShmServer`) ──
+    //
+    // `section_bytes` volatile-copies live shared memory that another process (the game) is
+    // concurrently writing; a snapshot taken mid-write is a TORN frame. The module's safety
+    // argument is that the decoders TOLERATE that: the `0xffff` magic-word check in
+    // `parse_record_header`/`parse_frame`/`newest_slot_ff` rejects a record whose header didn't
+    // survive the tear, and the length-bounded grid scan (`while i + 4 <= grid.len()`) means a
+    // surviving-but-mangled body can only ever decode BOUNDED, in-range output — never an
+    // out-of-range index or a panic. These tests simulate tearing against the real captured
+    // Overwatch keyboard fixture and assert both properties hold.
+
+    /// A cheap seeded PRNG (SplitMix64) — deterministic across runs/platforms, no `rand` dep.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+            z ^ (z >> 31)
+        }
+        fn next_u8(&mut self) -> u8 {
+            (self.next_u64() >> 56) as u8
+        }
+        fn next_below(&mut self, bound: usize) -> usize {
+            (self.next_u64() % bound as u64) as usize
+        }
+    }
+
+    /// Asserts the shared "torn frame → rejected or bounded, never a panic / OOB decode"
+    /// property against one candidate torn buffer.
+    fn assert_never_panics_and_stays_bounded(section: &[u8]) {
+        // `parse_frame` must not panic; if it decodes something, the grid it read can never
+        // extend past the buffer it read it from (the structural bound the scan loop enforces).
+        if let Some((_, units)) = parse_frame(section) {
+            assert!(
+                units.len() * 4 <= section.len(),
+                "decoded {} units ({} bytes) from a {}-byte section",
+                units.len(),
+                units.len() * 4,
+                section.len()
+            );
+        }
+        // The XOR-decoded path adds the KEYSTREAM read on top; must not panic either, and is
+        // bounded the same way.
+        if let Some((_, units)) = parse_frame_decoded(section) {
+            assert!(units.len() * 4 <= section.len(), "decoded-path unit count exceeds the section");
+        }
+    }
+
+    #[test]
+    fn splice_at_every_64_byte_boundary_never_panics() {
+        let a = OW_KEYBOARD;
+        // A structurally different "next frame": every byte bit-flipped, so the header/magic
+        // at the splice point genuinely diverges from `a` instead of coincidentally matching it.
+        let b: Vec<u8> = a.iter().map(|&x| !x).collect();
+        let mut offset = 0usize;
+        while offset < a.len() {
+            let mut spliced = a.to_vec();
+            spliced[offset..].copy_from_slice(&b[offset..]);
+            assert_never_panics_and_stays_bounded(&spliced);
+            // Splicing before the magic word (`+0x08..+0x0a`) tears it — must be rejected, not
+            // silently misdecoded through a stale/garbage header.
+            if offset <= 0x08 {
+                assert!(
+                    parse_frame(&spliced).is_none(),
+                    "offset={offset} tore the magic word but parse_frame still returned Some"
+                );
+            }
+            offset += 64;
+        }
+    }
+
+    #[test]
+    fn zeroed_tail_from_every_64_byte_offset_never_panics() {
+        let a = OW_KEYBOARD;
+        let mut offset = 0usize;
+        while offset < a.len() {
+            let mut zeroed = a.to_vec();
+            for b in &mut zeroed[offset..] {
+                *b = 0;
+            }
+            assert_never_panics_and_stays_bounded(&zeroed);
+            // Zeroing over the magic word itself must be rejected outright.
+            if offset <= 0x08 {
+                assert!(
+                    parse_frame(&zeroed).is_none(),
+                    "offset={offset} zeroed the magic word but parse_frame still returned Some"
+                );
+            }
+            offset += 64;
+        }
+    }
+
+    #[test]
+    fn random_corruption_150_seeded_trials_never_panics() {
+        // Fixed seed — deterministic, no wall-clock/OS randomness.
+        let mut rng = Lcg(0xC0FFEE_u64);
+        for _ in 0..150 {
+            let mut buf = OW_KEYBOARD.to_vec();
+            let n_corrupt = 1 + rng.next_below(24);
+            for _ in 0..n_corrupt {
+                let pos = rng.next_below(buf.len());
+                buf[pos] = rng.next_u8();
+            }
+            assert_never_panics_and_stays_bounded(&buf);
+        }
+    }
+
+    #[test]
+    fn recorded_reality_fixtures_still_decode_byte_identical() {
+        // Pins that the torn-read tests above touch only synthesized/corrupted copies — the
+        // real captured fixtures used elsewhere in this file must decode exactly as before.
+        let (h, units) = parse_frame(OW_KEYBOARD).expect("populated keyboard frame");
+        assert_eq!(h.device_type, 0x01);
+        assert_eq!(units[0].raw(), [0x56, 0x57, 0xf6, 0x02]);
     }
 }

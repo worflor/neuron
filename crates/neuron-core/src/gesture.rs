@@ -181,4 +181,87 @@ mod tests {
             r2.score
         );
     }
+
+    // ── TASK1(h): metamorphic/robustness laws for the vault's public API ──────────────────────
+    mod props {
+        use super::*;
+        use crate::glyph::{synth_vee, C};
+        use proptest::prelude::*;
+
+        fn cfg() -> ProptestConfig {
+            ProptestConfig { cases: 256, ..ProptestConfig::default() }
+        }
+
+        /// Same random-walk generator as `glyph::tests::props::arb_stroke` (kept local — that one
+        /// is private to `glyph.rs`'s test module).
+        fn arb_stroke() -> impl Strategy<Value = Vec<C>> {
+            proptest::collection::vec((-8.0f64..8.0f64, -8.0f64..8.0f64), 8..128).prop_map(
+                |deltas| {
+                    let mut acc = C::new(0.0, 0.0);
+                    deltas
+                        .into_iter()
+                        .map(|(dx, dy)| {
+                            acc = acc.add(C::new(dx, dy));
+                            acc
+                        })
+                        .collect()
+                },
+            )
+        }
+
+        fn seeded_vault() -> Vault {
+            use std::f64::consts::TAU;
+            let cfgv = GlyphConfig::default();
+            let mut v = Vault::default();
+            v.config = cfgv;
+            v.upsert("circle_cw", analyze(&synth_circle(64, 300.0, TAU / 64.0), &cfgv));
+            v.upsert("circle_ccw", analyze(&synth_circle(64, 300.0, -TAU / 64.0), &cfgv));
+            v.upsert("line", analyze(&synth_line(60), &cfgv));
+            v.upsert("vee", analyze(&synth_vee(60, 8.0), &cfgv));
+            v
+        }
+
+        proptest! {
+            #![proptest_config(cfg())]
+
+            /// TASK2(f)/(h): `predict`/`recognize` never panic on an arbitrary query, on either an
+            /// empty vault (the documented "`None` only for an empty vault" case, see `predict`'s
+            /// doc comment above) or a populated one.
+            #[test]
+            fn vault_never_panics_on_empty_or_populated_query(stroke in arb_stroke()) {
+                let cfgv = GlyphConfig::default();
+                let q = analyze(&stroke, &cfgv);
+
+                let empty = Vault::default();
+                prop_assert!(empty.predict(&q).is_none());
+                let r = empty.recognize(&q);
+                prop_assert!(r.name.is_none());
+                prop_assert_eq!(r.score, f64::INFINITY);
+                prop_assert!(r.runner_up.is_none());
+
+                let v = seeded_vault();
+                let _ = v.predict(&q);
+                let _ = v.recognize(&q);
+            }
+
+            /// TASK1(h): `recognize` is exactly `predict`'s top result, threshold-gated — this is
+            /// a direct restatement of `recognize`'s own logic (gesture.rs ~101-128: same ranked
+            /// list, same top score; `name` is `Some` only when that score is `<= config.threshold`)
+            /// but pinned as a property over arbitrary queries rather than the two fixed shapes
+            /// `recognizes_known_rejects_unknown` above already covers.
+            #[test]
+            fn recognize_agrees_with_predict_gated_by_threshold(stroke in arb_stroke()) {
+                let v = seeded_vault();
+                let q = analyze(&stroke, &v.config);
+                let (pred_name, pred_score, _) = v.predict(&q).expect("seeded vault is non-empty");
+                let rec = v.recognize(&q);
+                prop_assert_eq!(rec.score, pred_score);
+                if pred_score <= v.config.threshold {
+                    prop_assert_eq!(rec.name, Some(pred_name));
+                } else {
+                    prop_assert_eq!(rec.name, None);
+                }
+            }
+        }
+    }
 }

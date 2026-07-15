@@ -324,6 +324,157 @@ mod conventions {
         hits.dedup();
         hits
     }
+
+    // ── convention regression: every clipboard critical section is serialized ──────────────────
+    //
+    // 2026-07: a Win32 clipboard use-after-free was fixed by routing every `OpenClipboard`...
+    // `CloseClipboard` window through ONE process-wide lock (`neuron::clipboard::clipboard_guard`)
+    // — two threads racing `CloseClipboard` against a `GlobalLock` scan is a real, previously-hit
+    // heap corruption, not theoretical. `pocket.rs` originally ran a SECOND, independent critical
+    // section that skipped the lock: the exact structural shape that produced the original bug,
+    // just in a different file. The fix generalized: `clipboard_guard()` moved to its own module
+    // (`neuron-core/src/clipboard.rs`) so every caller — `macros/context.rs`, `pocket.rs`,
+    // `action.rs`'s ghost-paste — shares it.
+    //
+    // This is a pragmatic, not a control-flow-precise, check (mirrors the worker-spawn sweep):
+    // a NEW file calling `OpenClipboard(` is caught by the allowlist alone (not being on it is an
+    // offense by itself); an allowlisted file is additionally required to reference
+    // `clipboard_guard(` somewhere, so ripping out the guard call without deleting the file from
+    // the allowlist still trips this.
+    #[test]
+    fn every_clipboard_open_is_serialized() {
+        let root = workspace_root();
+        let crates_dir = root.join("crates");
+        let mut files = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&crates_dir) {
+            for entry in entries.flatten() {
+                let src = entry.path().join("src");
+                if src.is_dir() {
+                    collect_rs_files(&src, &mut files);
+                }
+            }
+        }
+        assert!(
+            files.len() > 50,
+            "the workspace crate sweep under {} found only {} .rs file(s) — path resolution is \
+             broken (expected the whole workspace, hundreds of files)",
+            crates_dir.display(),
+            files.len(),
+        );
+
+        // The ONLY files permitted to open the clipboard directly. Each must ALSO reference the
+        // shared guard (checked below) — this is a pure allowlist, no per-site exemption.
+        let allowlisted = [
+            crates_dir.join("neuron-core").join("src").join("macros").join("context.rs"),
+            crates_dir.join("neuron-core").join("src").join("pocket.rs"),
+            crates_dir.join("neuron-core").join("src").join("action.rs"),
+        ];
+
+        let mut offenders = Vec::new();
+        for file in &files {
+            let Ok(content) = std::fs::read_to_string(file) else {
+                continue;
+            };
+            let production = strip_test_region(&content);
+            if !production.contains("OpenClipboard(") {
+                continue;
+            }
+            if !allowlisted.contains(file) {
+                offenders.push(format!(
+                    "{} calls OpenClipboard( but is not on the clipboard allowlist — route it \
+                     through neuron::clipboard::clipboard_guard() and add it to the allowlist in \
+                     testsupport.rs",
+                    file.display()
+                ));
+                continue;
+            }
+            if !production.contains("clipboard_guard(") {
+                offenders.push(format!(
+                    "{} calls OpenClipboard( without referencing clipboard_guard() — every \
+                     Open...Close window must hold the process-wide clipboard lock",
+                    file.display()
+                ));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "every OpenClipboard critical section must be serialized through \
+             neuron::clipboard::clipboard_guard() — see clipboard.rs's doc comment for why (a \
+             second, unlocked critical section is the exact shape that produced a prior \
+             use-after-free)\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    // ── convention regression: every synthesized input call is arm-gated ────────────────────────
+    //
+    // `SendInput` fires REAL keyboard/mouse events into whatever has focus — every call site must
+    // be behind `input_armed()` (the app-wide kill switch macros/ghost-paste/teleport's foreground
+    // whisper all defer to). Scoped to the known low-level modules that legitimately touch
+    // `SendInput` (built from `action.rs`'s `win_key`/`win_mouse` and `teleport.rs`'s
+    // foreground-handoff whisper/chord helpers) rather than trusting a per-call comment, so a NEW
+    // file that starts synthesizing input trips this even if its author remembers to check
+    // `input_armed()` somewhere far from the call.
+    #[test]
+    fn every_input_synth_call_is_arm_gated() {
+        let root = workspace_root();
+        let crates_dir = root.join("crates");
+        let mut files = Vec::new();
+        for name in ["neuron-app", "neuron-core"] {
+            let src = crates_dir.join(name).join("src");
+            assert!(
+                src.is_dir(),
+                "expected crate src dir at {} — path resolution is broken",
+                src.display()
+            );
+            collect_rs_files(&src, &mut files);
+        }
+        assert!(
+            files.len() > 20,
+            "the two-crate sweep under {} found only {} .rs file(s) — path resolution is broken",
+            crates_dir.display(),
+            files.len(),
+        );
+
+        // The ONLY files permitted to call SendInput( directly. Each must ALSO reference
+        // input_armed( somewhere in its production region (checked below).
+        let allowlisted = [
+            crates_dir.join("neuron-core").join("src").join("action.rs"),
+            crates_dir.join("neuron-app").join("src").join("teleport.rs"),
+        ];
+
+        let mut offenders = Vec::new();
+        for file in &files {
+            let Ok(content) = std::fs::read_to_string(file) else {
+                continue;
+            };
+            let production = strip_test_region(&content);
+            if !production.contains("SendInput(") {
+                continue;
+            }
+            if !allowlisted.contains(file) {
+                offenders.push(format!(
+                    "{} calls SendInput( but is not on the input-synthesis allowlist — gate it \
+                     with input_armed() and add it to the allowlist in testsupport.rs",
+                    file.display()
+                ));
+                continue;
+            }
+            if !production.contains("input_armed(") {
+                offenders.push(format!(
+                    "{} calls SendInput( without referencing input_armed() anywhere in the file \
+                     — every synthesized input call must be arm-gated",
+                    file.display()
+                ));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "every SendInput call must be gated by input_armed() — a raw synthesis call outside \
+             the allowlisted low-level modules can fire real input unconditionally\n{}",
+            offenders.join("\n")
+        );
+    }
 }
 
 // ── persistence audit (TDD §8: "no GUI save path writes outside the executable/run directory") ──

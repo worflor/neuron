@@ -767,6 +767,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `AppRules` has exactly one field (`rules`, a whole vec), so "every field wrong-typed"
+    /// collapses to "present but the WRONG SHAPE (not an array)" — distinct from the test above,
+    /// which always had a valid array with one bad element inside it. `AppRule` has no `PartialEq`
+    /// derive, so the check is `is_empty()` rather than an equality against `Vec::new()`.
+    #[test]
+    fn degraded_apprules_wrong_shaped_field_defaults_to_empty_not_a_partial_parse() {
+        use crate::salvage::SalvageLoad;
+        let dir = std::env::temp_dir().join(format!("neuron-apps-wrongshape-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("apps.toml");
+        std::fs::write(&path, "rules = \"not-an-array\"\n").unwrap();
+        let cfg = AppRules::load_from(&path);
+        assert!(
+            cfg.rules.is_empty(),
+            "a wrong-shaped field must default to empty, not panic or leak a partial parse"
+        );
+        assert!(dir.join("apps.toml.bad").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn cycle_index_steps_from_current_with_wraparound() {
         let names: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();

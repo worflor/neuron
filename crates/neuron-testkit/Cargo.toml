@@ -23,3 +23,7 @@ features = [
     "Win32_System_ProcessStatus",
     "Win32_System_Diagnostics_ToolHelp",
 ]
+
+[dev-dependencies]
+proptest = "1"
+static_assertions = "1.1"

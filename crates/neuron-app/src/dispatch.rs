@@ -31,9 +31,9 @@ use neuron::executor::{DispatchExecutor, DispatchOutcome, IntentRunner, TurboRun
 use slint::ComponentHandle;
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 enum LiveCommand {
     Reload,
@@ -357,6 +357,110 @@ impl<'a> LiveCtx<'a> {
     }
 }
 
+/// A storm of faults inside this window trips the breaker. Mirrors the macro host's `Breaker`
+/// (`crates/neuron-core/src/macros/macro_host.rs`) — same "more than N in a window" shape, same
+/// N and window (4 in 30s), since both are guarding the identical failure mode: a deterministically
+/// panicking body pinned behind a respawn-forever loop.
+const DISPATCH_BREAKER_WINDOW: Duration = Duration::from_secs(30);
+const DISPATCH_BREAKER_MAX: u32 = 4;
+/// Resume-sleep base and ceiling. The base matches the pre-breaker fixed sleep (250ms) so a lone,
+/// isolated fault behaves exactly as before; each further fault inside the window DOUBLES it, so a
+/// building storm backs off before the breaker gives up outright (250ms, 500ms, 1s, 2s, 4s, 8s…).
+const DISPATCH_BREAKER_BASE_SLEEP: Duration = Duration::from_millis(250);
+const DISPATCH_BREAKER_MAX_SLEEP: Duration = Duration::from_secs(8);
+
+/// Crash bookkeeping for the dispatch respawn loop — the live-dispatch twin of the macro host's
+/// `Breaker`, deliberately NOT copy-pasted: unlike `Breaker`, which auto-resumes after a fixed
+/// cooldown, a live-dispatch halt is user-facing (dead remaps/casts, not a background macro), so
+/// there is no silent auto-resume — once tripped it STAYS tripped until an explicit
+/// `LiveCommand::Reload` resets it (see `service_while_halted`). And unlike `Breaker`, every method
+/// here takes `now: Instant` as a parameter instead of calling `Instant::now()` internally, so the
+/// trip/backoff/reset arithmetic is pure and a test can drive it with synthetic timestamps instead
+/// of real sleeps.
+#[derive(Default)]
+struct DispatchBreaker {
+    /// Timestamps of faults still inside the window (oldest first).
+    faults: std::collections::VecDeque<Instant>,
+    /// Set once a storm crosses `DISPATCH_BREAKER_MAX`; only `reset` clears it.
+    tripped: bool,
+}
+
+impl DispatchBreaker {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record one respawn-triggering fault at `now`; drop faults that have aged out of the window,
+    /// trip the breaker if more than `DISPATCH_BREAKER_MAX` remain inside it, and return the resume
+    /// sleep to use before the caller's next reopen attempt (ignored once tripped — the caller stops
+    /// reopening entirely and calls `service_while_halted` instead).
+    fn record_fault(&mut self, now: Instant) -> Duration {
+        self.faults.push_back(now);
+        while self
+            .faults
+            .front()
+            .is_some_and(|t| now.duration_since(*t) > DISPATCH_BREAKER_WINDOW)
+        {
+            self.faults.pop_front();
+        }
+        let n = self.faults.len() as u32;
+        if n > DISPATCH_BREAKER_MAX {
+            self.tripped = true;
+        }
+        DISPATCH_BREAKER_BASE_SLEEP
+            .saturating_mul(1u32 << n.saturating_sub(1).min(5))
+            .min(DISPATCH_BREAKER_MAX_SLEEP)
+    }
+
+    /// Is the breaker currently refusing to respawn?
+    fn tripped(&self) -> bool {
+        self.tripped
+    }
+
+    /// User-initiated revival (a `LiveCommand::Reload` arriving while halted): forget every past
+    /// fault and un-trip, so the caller gets a completely fresh storm budget on the next attempt.
+    fn reset(&mut self) {
+        self.faults.clear();
+        self.tripped = false;
+    }
+}
+
+/// Service the live-command channel while the breaker is tripped — the respawn loop calls this
+/// INSTEAD of reopening `listen_until`, so a deterministically-panicking cycle stops busy-faulting
+/// at ~4Hz forever. It must keep draining `rx` (never stop reading it): `LiveCommand::Reload` is the
+/// ONLY way out of a halt, and it arrives on this same channel — a tripped breaker that also stopped
+/// servicing commands could never be revived.
+///
+/// Every command other than `Reload` is silently dropped while halted. That's safe: both reply-
+/// bearing commands already bound their wait with `recv_timeout` on the CALLING side
+/// (`toggle_hypershift_latch` / `apply_profile`), so to them a halted organ reads as an honest
+/// timeout, never a hang — exactly the "no signal" failure this breaker exists to fix, just moved
+/// from "silence forever" to "a bounded, explained wait."
+///
+/// Returns `true` once a `Reload` resets the breaker (the caller should resume respawning), `false`
+/// if `stop` was asked for first, or the channel disconnected (the sender side is gone — treat that
+/// the same as a stop rather than spin).
+fn service_while_halted(
+    rx: &Receiver<LiveCommand>,
+    stop: &Arc<AtomicBool>,
+    breaker: &mut DispatchBreaker,
+) -> bool {
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return false;
+        }
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(LiveCommand::Reload) => {
+                breaker.reset();
+                return true;
+            }
+            Ok(_other) => {} // dropped while halted — see doc above
+            Err(RecvTimeoutError::Timeout) => {} // loop back and recheck `stop`
+            Err(RecvTimeoutError::Disconnected) => return false,
+        }
+    }
+}
+
 /// The worker body: arm input, install the gaming hook, build the engine, run the listen loop.
 ///
 /// PLATFORM-NEUTRAL: every callee here is portable or cfg-seamed at its source —
@@ -425,6 +529,13 @@ fn run_worker(weak: slint::Weak<AppWindow>, stop: Arc<AtomicBool>, live_rx: Rece
     // close-the-game-menu key; the old shared listener died on the first ESC of the session), and
     // any exit that wasn't an explicit stop (a contained fault, a dead listener window) is logged
     // to the flight ring and the listener is simply REOPENED. Casts must never silently die.
+    //
+    // "Immortal" has a limit, though: a DETERMINISTICALLY panicking cycle (a config that panics
+    // every tick) would otherwise respawn at ~4Hz forever, burning CPU and spamming the flight log
+    // with zero signal to the user that live dispatch is effectively dead. `breaker` is that limit —
+    // see its doc. While tripped this loop stops reopening the listener but keeps the command
+    // channel alive via `service_while_halted`, so a user-initiated Reload is still the one way back.
+    let mut breaker = DispatchBreaker::new();
     loop {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             controls::listen_until(
@@ -438,22 +549,40 @@ fn run_worker(weak: slint::Weak<AppWindow>, stop: Arc<AtomicBool>, live_rx: Rece
         if stop.load(Ordering::SeqCst) {
             break; // an asked-for stop — the only legitimate way out
         }
-        crate::flight::trace(
-            "life",
-            if outcome.is_err() {
-                "dispatch listener fault contained — reopening"
-            } else {
-                "dispatch listener exited unasked — reopening"
-            },
-            0,
-        );
+        let breadcrumb = if outcome.is_err() {
+            "dispatch listener fault contained — reopening"
+        } else {
+            "dispatch listener exited unasked — reopening"
+        };
+        crate::flight::trace("life", breadcrumb, 0);
         {
             let c = ctx.borrow();
             momentary_release_all(&c.momentary); // never strand a held mic across a respawn
             key_remap_release_all(&c.held_keys); // nor a held remapped key
             sniper_release_all(&c.devices, &c.sniper); // nor a held sniper (restore the DPI)
         }
-        std::thread::sleep(std::time::Duration::from_millis(250));
+        let resume_sleep = breaker.record_fault(Instant::now());
+        if breaker.tripped() {
+            crate::flight::trace("life", "dispatch breaker tripped — halting respawns until Reload", 0);
+            {
+                let c = ctx.borrow();
+                let mut s = c.status.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                s.last_trigger = "dispatch halted".into();
+                s.last_action =
+                    format!("live dispatch halted after repeated faults: {breadcrumb} — reload to retry");
+                post_status(&c.weak, &c.status);
+            }
+            let revived = {
+                let c = ctx.borrow();
+                service_while_halted(&c.live_rx, &stop, &mut breaker)
+            };
+            if !revived {
+                break; // stop was asked for (or the channel died) while halted
+            }
+            crate::flight::trace("life", "dispatch breaker reset by Reload — resuming", 0);
+            continue; // breaker.tripped() is now false; go straight back to reopening, no sleep
+        }
+        std::thread::sleep(resume_sleep);
     }
 
     // teardown: restore any mic a momentary action was holding (the loop ended mid-hold) + release
@@ -1351,5 +1480,542 @@ mod tests {
         live_tick(&mut ctx); // must not panic
 
         assert_eq!(ctx.tick, 1, "the tick counter still advances");
+    }
+
+    // ── DispatchBreaker: pure logic, synthetic clocks, no real sleeps ────────────────────────────
+
+    /// Faults spaced further apart than the window never accumulate — a rare, isolated respawn
+    /// (e.g. a one-off device hiccup) must never trip the breaker, no matter how many happen over
+    /// the life of the process.
+    #[test]
+    fn spaced_faults_never_trip() {
+        let mut b = DispatchBreaker::new();
+        let t0 = Instant::now();
+        for i in 0..20 {
+            b.record_fault(t0 + Duration::from_secs(i * (DISPATCH_BREAKER_WINDOW.as_secs() + 1)));
+            assert!(!b.tripped(), "fault #{i} spaced past the window must not trip");
+        }
+    }
+
+    /// A burst of faults inside the window trips the breaker exactly once `DISPATCH_BREAKER_MAX`
+    /// is exceeded (the 5th fault within 30s, given the current MAX=4).
+    #[test]
+    fn burst_trips_the_breaker() {
+        let mut b = DispatchBreaker::new();
+        let t0 = Instant::now();
+        for i in 0..DISPATCH_BREAKER_MAX {
+            b.record_fault(t0 + Duration::from_millis(i as u64 * 10));
+            assert!(!b.tripped(), "the {}th fault must not trip yet (MAX={})", i + 1, DISPATCH_BREAKER_MAX);
+        }
+        b.record_fault(t0 + Duration::from_millis(DISPATCH_BREAKER_MAX as u64 * 10));
+        assert!(b.tripped(), "exceeding MAX faults inside the window must trip the breaker");
+    }
+
+    /// The resume sleep doubles with each fault still inside the window, capped at
+    /// `DISPATCH_BREAKER_MAX_SLEEP` — a building storm backs off before it gives up outright.
+    #[test]
+    fn backoff_doubles_and_caps() {
+        let mut b = DispatchBreaker::new();
+        let t0 = Instant::now();
+        let s1 = b.record_fault(t0);
+        let s2 = b.record_fault(t0 + Duration::from_millis(1));
+        let s3 = b.record_fault(t0 + Duration::from_millis(2));
+        assert_eq!(s1, DISPATCH_BREAKER_BASE_SLEEP);
+        assert_eq!(s2, DISPATCH_BREAKER_BASE_SLEEP * 2);
+        assert_eq!(s3, DISPATCH_BREAKER_BASE_SLEEP * 4);
+        // hammer far more faults into the same instant than it takes to trip — even ignoring the
+        // trip, the sleep this returns must never exceed the ceiling.
+        let mut last = Duration::ZERO;
+        for _ in 0..30 {
+            last = b.record_fault(t0);
+        }
+        assert_eq!(last, DISPATCH_BREAKER_MAX_SLEEP, "backoff must cap, never grow unbounded");
+    }
+
+    /// `reset` (the user-initiated-Reload path) forgets every past fault and un-trips — a fresh
+    /// storm budget, not a partially-primed one.
+    #[test]
+    fn reset_forgets_history_and_untrips() {
+        let mut b = DispatchBreaker::new();
+        let t0 = Instant::now();
+        for i in 0..=DISPATCH_BREAKER_MAX {
+            b.record_fault(t0 + Duration::from_millis(i as u64));
+        }
+        assert!(b.tripped());
+        b.reset();
+        assert!(!b.tripped(), "reset must un-trip immediately");
+        // and the fault history is really gone, not just the flag: it takes a full fresh burst to
+        // trip again, not one more fault riding on the old count.
+        let t1 = t0 + Duration::from_secs(60);
+        for i in 0..DISPATCH_BREAKER_MAX {
+            b.record_fault(t1 + Duration::from_millis(i as u64));
+            assert!(!b.tripped(), "post-reset fault #{i} alone must not re-trip");
+        }
+    }
+
+    /// The revival seam: `service_while_halted` is what the respawn loop calls instead of
+    /// reopening the listener once tripped. This proves the loop-structure guarantee the task
+    /// hinges on — a tripped breaker MUST keep servicing `LiveCommand`s (never just block deaf on
+    /// the listener), because `Reload` is the only way out and it arrives on this same channel. A
+    /// non-Reload command is dropped (its sender already bounds its own wait via `recv_timeout`),
+    /// but the loop keeps draining and a subsequent `Reload` still revives it.
+    #[test]
+    fn halted_breaker_services_commands_and_revives_on_reload() {
+        let mut b = DispatchBreaker::new();
+        let t0 = Instant::now();
+        for i in 0..=DISPATCH_BREAKER_MAX {
+            b.record_fault(t0 + Duration::from_millis(i as u64));
+        }
+        assert!(b.tripped(), "setup: the breaker must be tripped before this test proves anything");
+
+        let (tx, rx) = channel();
+        let stop = Arc::new(AtomicBool::new(false));
+
+        // a command that ISN'T Reload must be drained (not left clogging the channel) and must
+        // NOT revive the breaker on its own.
+        tx.send(LiveCommand::ReconcileGamingHook).unwrap();
+        tx.send(LiveCommand::Reload).unwrap();
+
+        let revived = service_while_halted(&rx, &stop, &mut b);
+
+        assert!(revived, "a Reload arriving while halted must revive service_while_halted");
+        assert!(!b.tripped(), "revival must reset the breaker so the next fault gets a fresh budget");
+    }
+
+    /// `stop` being set while halted must return promptly (the app is shutting down, not asking
+    /// for a revival) instead of blocking forever waiting for a `Reload` that will never come.
+    #[test]
+    fn halted_breaker_exits_promptly_on_stop() {
+        let mut b = DispatchBreaker::new();
+        b.record_fault(Instant::now());
+        b.tripped = true; // force-trip without needing a full burst — this test is about `stop`, not the storm math
+
+        let (_tx, rx) = channel::<LiveCommand>();
+        let stop = Arc::new(AtomicBool::new(true)); // already asked to stop
+
+        let revived = service_while_halted(&rx, &stop, &mut b);
+
+        assert!(!revived, "a stop request while halted must exit without waiting for Reload");
+    }
+
+    // ── model-based random walker over the live dispatch state machine ──────────────────────────
+    //
+    // Everything above drives `live_edge`/`live_tick` with ONE hand-picked scenario per test. This
+    // section instead throws a proptest-shrinkable SEQUENCE of arbitrary operations at the same seam
+    // — raw multi-device edge chords (including down-without-up, duplicated-down, up-without-down),
+    // ticks, reloads (the on-disk config-edit trick `reload_consumes_a_config_edit` established),
+    // injects, the HyperShift latch toggle, and a hardware-free "ghost hold" seed (the direct-insert
+    // trick `reload_clears_held_state` established, generalized to fire at ANY point in the walk, not
+    // just once before a single reload) — and checks the same standing invariants after every step.
+    mod walker {
+        use super::*;
+        use proptest::prelude::*;
+        use proptest::strategy::{BoxedStrategy, Just, Union};
+        use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+
+        /// One operation the walker can apply to a live `LiveCtx`. A plain data enum (not a closure)
+        /// so a failing `Vec<Op>` SHRINKS — proptest can drop/simplify ops and still replay the exact
+        /// same seam calls.
+        #[derive(Clone, Debug)]
+        enum Op {
+            /// Toggle one (device, button) in/out of that device's currently-held set and feed the
+            /// resulting full report through `live_edge` — `HoldEdges` does the down/up diffing, so
+            /// this alphabet alone covers down-without-up (never toggle off), up-without-down (toggle
+            /// off a button never pressed — a no-op edge), duplicated downs (toggle on twice in a row
+            /// — idempotent, no re-fire), and interleaved devices (two independent per-device sets).
+            RawEdge { device: u8, button: u8, pressed: bool },
+            Tick,
+            /// A short burst of extra ticks back-to-back (turbo/throttle/mic-tap-cadence stress).
+            Burst(u8),
+            Reload,
+            /// Index into a small fixed pool of triggers (a bound one, an unbound one, the AppFocus
+            /// marker) — see `inject_pool` in `run_episode`.
+            Inject(u8),
+            ToggleHyperShift,
+            /// The hardware-free "ghost hold" seed: directly plants one entry into EACH of the three
+            /// held-state maps (mirroring `reload_clears_held_state`'s seeding technique) without
+            /// needing a real mic/device — so the "no stranded held key" law gets exercised even when
+            /// no real hardware answers `sniper_press`/`momentary_press` in this environment.
+            SeedGhostHold,
+            NoOp,
+        }
+
+        // ApplyProfile was DROPPED from the alphabet: exercising it for real needs an on-disk
+        // `Profile` TOML whose full field shape (device targets, lighting stack, etc.) this task
+        // didn't have budget to verify byte-for-byte against `profile.rs` — a wrong shape would fail
+        // to compile or degrade to a silent `Err` every time, adding a no-op op for real risk. The
+        // `LiveCommand::ApplyProfile` plumbing itself (reply channel, status post) is still reachable
+        // through the existing `apply_profile`/`ApplyProfile` unit coverage elsewhere in this file.
+
+        /// A tiny deterministic PRNG (splitmix64) — used ONLY by the plain-`#[test]` curiosity sweep
+        /// below, which drives its own bandit sampling outside proptest's generator. No wall clock, no
+        /// external RNG crate, fully reproducible from one fixed seed.
+        struct Lcg(u64);
+        impl Lcg {
+            fn next_u64(&mut self) -> u64 {
+                self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
+                let mut z = self.0;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+                z ^ (z >> 31)
+            }
+            fn next_range(&mut self, n: u64) -> u64 {
+                if n == 0 { 0 } else { self.next_u64() % n }
+            }
+            fn next_bool(&mut self) -> bool {
+                self.next_u64() & 1 == 1
+            }
+        }
+
+        /// Map one op "category" index (0..=6, matching the mask bits below) to a concrete `Op` using
+        /// the LCG — the curiosity sweep's hand-rolled twin of `op_category_strategies`' proptest
+        /// generators, since that sweep runs outside proptest's own generator.
+        fn op_from_category(cat: usize, rng: &mut Lcg) -> Op {
+            match cat {
+                0 => Op::RawEdge {
+                    device: rng.next_range(2) as u8,
+                    button: rng.next_range(5) as u8,
+                    pressed: rng.next_bool(),
+                },
+                1 => Op::Tick,
+                2 => Op::Reload,
+                3 => Op::Inject(rng.next_range(3) as u8),
+                4 => Op::ToggleHyperShift,
+                5 => Op::SeedGhostHold,
+                6 => Op::Burst(1 + rng.next_range(4) as u8),
+                _ => Op::NoOp,
+            }
+        }
+
+        /// The op alphabet as (mask bit, proptest strategy) pairs — SWARM TESTING: a walk episode
+        /// picks a random SUBSET of these bits (see `walker_strategy`) so some episodes never Reload,
+        /// some hammer only raw edges, etc. Feature-absence combinations a uniform mix rarely samples.
+        fn op_category_strategies() -> Vec<(u8, BoxedStrategy<Op>)> {
+            vec![
+                (
+                    1u8,
+                    (0u8..2, 0u8..5, any::<bool>())
+                        .prop_map(|(device, button, pressed)| Op::RawEdge { device, button, pressed })
+                        .boxed(),
+                ),
+                (2u8, Just(Op::Tick).boxed()),
+                (4u8, Just(Op::Reload).boxed()),
+                (8u8, (0u8..3u8).prop_map(Op::Inject).boxed()),
+                (16u8, Just(Op::ToggleHyperShift).boxed()),
+                (32u8, Just(Op::SeedGhostHold).boxed()),
+                (64u8, (1u8..=4u8).prop_map(Op::Burst).boxed()),
+            ]
+        }
+
+        /// One op strategy that only ever produces ops whose category bit is set in `mask` — a NoOp
+        /// fallback keeps `Union` non-empty for an all-zero mask (still a legal, if boring, episode).
+        fn ops_for_mask(mask: u8) -> BoxedStrategy<Op> {
+            let mut branches: Vec<(u32, BoxedStrategy<Op>)> = op_category_strategies()
+                .into_iter()
+                .filter(|(bit, _)| mask & bit != 0)
+                .map(|(_, s)| (1u32, s))
+                .collect();
+            if branches.is_empty() {
+                branches.push((1, Just(Op::NoOp).boxed()));
+            }
+            Union::new_weighted(branches).boxed()
+        }
+
+        /// The proptest strategy driving the main walker: pick an arbitrary swarm mask, then a bounded
+        /// op sequence drawn only from that mask's categories. `Vec<Op>` shrinks on its own (proptest
+        /// drops/simplifies elements), so a failure minimizes to the smallest reproducing sequence.
+        fn walker_strategy() -> impl Strategy<Value = (u8, Vec<Op>)> {
+            any::<u8>().prop_flat_map(|mask| {
+                proptest::collection::vec(ops_for_mask(mask), 0usize..120)
+                    .prop_map(move |ops| (mask, ops))
+            })
+        }
+
+        /// A minimal but REAL rule set written to the pinned run-dir's `profiles/` sidecar so raw
+        /// edges actually resolve to actions through the one engine, exactly like a hardware daemon:
+        ///   * usage 1 -> `Action::Sniper` (a held-style rule; DPI writes silently no-op against the
+        ///     empty test registry — no real device, no real write, but the press/release edge path,
+        ///     including `sniper_dpi_for` resolution, is exercised for real).
+        ///   * usage 3 -> `Action::Key` (a held-style rule; `press_and_hold`/`release_keys` run for
+        ///     real but are gated no-ops because `arm_input` is never flipped on in these tests — see
+        ///     the module's input-safety invariant doc at the top of this file).
+        ///   * usage 4 -> `Action::Echo` (a plain one-shot action, so a base-layer dispatch fires too).
+        ///   * the AppFocus marker -> `Action::Echo` (the `Inject` op's bound-trigger case).
+        /// Deliberately NO on-disk `Action::MomentaryMic` rule: `device: None` resolves to the REAL
+        /// default capture endpoint, and firing it through a real edge would flip the ACTUAL system
+        /// mic mute on the machine running this test — the momentary held-map is instead exercised via
+        /// `SeedGhostHold` (see its doc), which never touches audio hardware.
+        fn write_walker_rules() {
+            let rules = vec![
+                neuron::engine::Rule::new(
+                    Trigger::Input { page: 0x09, usage: 1, pid: None },
+                    neuron::action::Action::Sniper { dpi: 400 },
+                ),
+                neuron::engine::Rule::new(
+                    Trigger::Input { page: 0x09, usage: 3, pid: None },
+                    neuron::action::Action::Key { key: "f".into() },
+                ),
+                neuron::engine::Rule::new(
+                    Trigger::Input { page: 0x09, usage: 4, pid: None },
+                    neuron::action::Action::Echo,
+                ),
+                neuron::engine::Rule::new(
+                    marker_trigger("zzz-dispatch-walker-marker.exe"),
+                    neuron::action::Action::Echo,
+                ),
+            ];
+            std::fs::create_dir_all("profiles").unwrap();
+            let doc = neuron::engine::RuleDoc { rules };
+            std::fs::write("profiles/walker.rules.toml", toml::to_string(&doc).unwrap()).unwrap();
+        }
+
+        /// A cheap, cheaply-observable digest of "what state is the seam in right now" — the three
+        /// held-map sizes, whether the HyperShift latch is armed, the held-layer count, and the fired
+        /// counter (mod 256) — fed to a `LogosStream` as the curiosity signal, and used directly by
+        /// `curiosity_sweep_finds_diverse_states` to count how many distinct states a sweep visited.
+        fn state_digest(ctx: &LiveCtx) -> [u8; 6] {
+            let momentary = ctx.momentary.borrow().len().min(255) as u8;
+            let held_keys = ctx.held_keys.borrow().len().min(255) as u8;
+            let sniper = ctx.sniper.borrow().len().min(255) as u8;
+            let layers = ctx.rt.borrow().engine.held_layers().count().min(255) as u8;
+            let latch = ctx.hypershift_latch as u8;
+            let fired = (ctx
+                .status
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .fired
+                % 256) as u8;
+            [momentary, held_keys, sniper, layers, latch, fired]
+        }
+
+        /// Standing invariants checked after EVERY op (see the task doc above for the full list):
+        /// no panic (proven by returning here at all), input never armed, held-map sizes never run
+        /// away, and — generalizing `reload_clears_held_state` to an ARBITRARY preceding op history —
+        /// immediately after any `Reload` every held-state map (momentary/key-hold/sniper) is empty
+        /// and no stranded turbo is due. `context` is folded into every assertion message so a
+        /// shrunk-failure report carries the recent op trail + cumulative curiosity surprise.
+        fn check_invariants(ctx: &LiveCtx, context: &str, after_reload: bool) {
+            assert!(
+                !neuron::action::input_armed(),
+                "input must never arm during the walk ({context})"
+            );
+            assert!(ctx.momentary.borrow().len() < 1000, "runaway momentary growth ({context})");
+            assert!(ctx.held_keys.borrow().len() < 1000, "runaway held-key growth ({context})");
+            assert!(ctx.sniper.borrow().len() < 1000, "runaway sniper growth ({context})");
+            if after_reload {
+                assert!(
+                    ctx.momentary.borrow().is_empty(),
+                    "a reload must clear momentary holds ({context})"
+                );
+                assert!(
+                    ctx.held_keys.borrow().is_empty(),
+                    "a reload must clear held key remaps ({context})"
+                );
+                assert!(
+                    ctx.sniper.borrow().is_empty(),
+                    "a reload must clear sniper holds ({context})"
+                );
+                struct CountIntents(u32);
+                impl neuron::executor::IntentRunner for CountIntents {
+                    fn run_intent(&mut self, _intent: &neuron::action::Intent) -> String {
+                        self.0 += 1;
+                        String::new()
+                    }
+                }
+                let mut counter = CountIntents(0);
+                ctx.turbos.borrow_mut().tick(&mut ctx.exec.borrow_mut(), &mut counter);
+                assert_eq!(
+                    counter.0, 0,
+                    "no stranded turbo may fire right after a reload ({context})"
+                );
+            }
+        }
+
+        /// Apply one `Op` to `ctx`, mutating `active` (the walker's own per-device down-set bookkeeping
+        /// — the ONE piece of state the walker itself owns, everything else is real seam state).
+        fn apply_op(
+            ctx: &mut LiveCtx,
+            op: &Op,
+            active: &mut HashMap<u8, BTreeSet<(u16, u16)>>,
+            tx: &Sender<LiveCommand>,
+            inject_pool: &[Trigger],
+            ghost_marker: &Trigger,
+        ) {
+            match op {
+                Op::NoOp => {}
+                Op::Tick => live_tick(ctx),
+                Op::Burst(n) => {
+                    for _ in 0..*n {
+                        live_tick(ctx);
+                    }
+                }
+                Op::RawEdge { device, button, pressed } => {
+                    let device: u8 = *device % 2;
+                    let usage = 1u16 + (*button as u16 % 5);
+                    let set = active.entry(device).or_default();
+                    if *pressed {
+                        set.insert((0x09, usage));
+                    } else {
+                        set.remove(&(0x09, usage));
+                    }
+                    let pid = if device == 0 { "00a8" } else { "0221" };
+                    let ev = ControlEvent {
+                        pid: pid.into(),
+                        hits: set.iter().cloned().collect(),
+                        raw: Vec::new(),
+                    };
+                    live_edge(ctx, &ev);
+                }
+                Op::Reload => {
+                    let _ = tx.send(LiveCommand::Reload);
+                    live_tick(ctx);
+                }
+                Op::Inject(idx) => {
+                    let t = inject_pool[*idx as usize % inject_pool.len()].clone();
+                    let _ = tx.send(LiveCommand::Inject(t));
+                    live_tick(ctx);
+                }
+                Op::ToggleHyperShift => {
+                    let (reply_tx, _reply_rx) = channel();
+                    let _ = tx.send(LiveCommand::ToggleHyperShift(reply_tx));
+                    live_tick(ctx);
+                }
+                Op::SeedGhostHold => {
+                    ctx.momentary.borrow_mut().insert(
+                        ghost_marker.clone(),
+                        (Some("neuron-test-nonexistent-mic".to_string()), false),
+                    );
+                    ctx.held_keys.borrow_mut().insert(ghost_marker.clone(), vec![0x41]);
+                    ctx.sniper.borrow_mut().insert(ghost_marker.clone(), (800, 0));
+                }
+            }
+        }
+
+        /// Run one full walk episode: build a fresh `LiveCtx` in a pinned temp run-dir, seed the real
+        /// rule set, apply every op (checking invariants after each and feeding a `LogosStream` a state
+        /// digest), then send a final `Reload` + tick and assert the "no stranded held key" law — a
+        /// dropped up-edge must never survive a reload, no matter how the episode got there. Returns
+        /// the episode's total curiosity surprise and the digest trail (the curiosity sweep uses both).
+        fn run_episode(mask: u8, ops: &[Op]) -> (f32, Vec<[u8; 6]>) {
+            let _g = crate::testsupport::cwd_guard("dispatch_walker");
+            write_walker_rules();
+            let reg = neuron::registry::Registry { devices: Vec::new() };
+            let (tx, rx) = channel();
+            let mut ctx = LiveCtx::for_tests(&reg, rx);
+
+            let ghost_marker = marker_trigger("zzz-dispatch-walker-ghost.exe");
+            let inject_pool = [
+                marker_trigger("zzz-dispatch-walker-marker.exe"),
+                Trigger::Input { page: 0x09, usage: 1, pid: None },
+                Trigger::Input { page: 0x09, usage: 99, pid: None }, // deliberately unbound
+            ];
+            let mut active: HashMap<u8, BTreeSet<(u16, u16)>> = HashMap::new();
+            let mut logos = neuron::logos::LogosStream::new();
+            let mut total_surprise = 0.0f32;
+            let mut digests = Vec::with_capacity(ops.len() + 1);
+            let mut recent: VecDeque<String> = VecDeque::new();
+
+            for (step, op) in ops.iter().enumerate() {
+                apply_op(&mut ctx, op, &mut active, &tx, &inject_pool, &ghost_marker);
+                recent.push_back(format!("{step}:{op:?}"));
+                if recent.len() > 12 {
+                    recent.pop_front();
+                }
+                let digest = state_digest(&ctx);
+                total_surprise += logos.surprise_of(&digest);
+                digests.push(digest);
+                let context = format!(
+                    "mask={mask:#04x}, recent ops: {recent:?}, cumulative surprise: {total_surprise:.2}"
+                );
+                check_invariants(&ctx, &context, matches!(op, Op::Reload));
+            }
+
+            // episode end: a final Reload + tick, then the "no stranded held key" law — whatever the
+            // walk did, a reload afterward must leave every held-state map empty.
+            let _ = tx.send(LiveCommand::Reload);
+            live_tick(&mut ctx);
+            let final_digest = state_digest(&ctx);
+            total_surprise += logos.surprise_of(&final_digest);
+            digests.push(final_digest);
+            check_invariants(
+                &ctx,
+                &format!("mask={mask:#04x}, episode end, cumulative surprise: {total_surprise:.2}"),
+                true,
+            );
+
+            (total_surprise, digests)
+        }
+
+        proptest! {
+            // one `LiveCtx` (+ a pinned temp run-dir) per case, up to 120 ops each — keep it modest.
+            #![proptest_config(ProptestConfig::with_cases(48))]
+
+            /// THE flagship harness: an arbitrary, swarm-masked sequence of edges/ticks/reloads/
+            /// injects/latch-toggles/ghost-holds must never panic, never arm input, and must never let
+            /// a held state survive a reload — across every op-history proptest can construct, shrunk
+            /// to the minimal failing sequence when it finds one.
+            #[test]
+            fn dispatch_state_machine_walker(case in walker_strategy()) {
+                let (mask, ops) = case;
+                run_episode(mask, &ops);
+            }
+        }
+
+        /// A second, non-shrinking exploration pass: a simple deterministic bandit samples op
+        /// CATEGORIES weighted by the curiosity (Logos surprise) each category mix earned in earlier
+        /// episodes, biasing later episodes toward whatever kept producing novel states. This is a
+        /// smoke floor around the real value (the invariant checker running under a self-steering
+        /// sweep, not a fixed uniform mix) — it asserts the sweep visited a reasonably diverse set of
+        /// held-map-size digests, not that the bandit converged to anything in particular.
+        #[test]
+        fn curiosity_sweep_finds_diverse_states() {
+            const CATEGORIES: usize = 7; // RawEdge, Tick, Reload, Inject, ToggleHyperShift, SeedGhostHold, Burst
+            const EPISODES: u32 = 64;
+            const MIN_DISTINCT_STATES: usize = 12;
+
+            let mut rng = Lcg(0xD1B54A32D192ED03);
+            let mut weights = [1.0f64; CATEGORIES];
+            let mut seen: HashSet<[u8; 6]> = HashSet::new();
+
+            for _ in 0..EPISODES {
+                let total_w: f64 = weights.iter().sum();
+                let mut included: Vec<usize> = Vec::new();
+                for (i, &w) in weights.iter().enumerate() {
+                    let threshold = ((w / total_w) * CATEGORIES as f64).min(0.95);
+                    let r = (rng.next_range(1_000_000) as f64) / 1_000_000.0;
+                    if r < threshold {
+                        included.push(i);
+                    }
+                }
+                if included.is_empty() {
+                    included.push(1); // Tick — always a safe, harmless fallback category
+                }
+                let len = rng.next_range(80) as usize; // keep the sweep light (64 episodes)
+                let ops: Vec<Op> = (0..len)
+                    .map(|_| {
+                        let pick = included[rng.next_range(included.len() as u64) as usize];
+                        op_from_category(pick, &mut rng)
+                    })
+                    .collect();
+                let mask = included.iter().fold(0u8, |acc, &i| acc | (1u8 << i));
+
+                let (surprise, digests) = run_episode(mask, &ops);
+                seen.extend(digests);
+
+                // reward every category this episode drew from, proportional to the surprise it found.
+                let reward = (surprise as f64).max(0.01);
+                for &i in &included {
+                    weights[i] += reward / included.len() as f64;
+                }
+            }
+
+            assert!(
+                seen.len() >= MIN_DISTINCT_STATES,
+                "the curiosity sweep should visit a diverse set of held-map-size states; saw only {} \
+                 distinct digests out of {} — the bandit may have collapsed onto one op mix",
+                seen.len(),
+                EPISODES
+            );
+        }
     }
 }

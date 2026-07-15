@@ -14,4 +14,5 @@
 //! offset) are pinned by this crate's tests so the format and the facts cannot drift apart.
 
 pub mod budget;
+pub mod census;
 pub mod tape;

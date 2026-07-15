@@ -257,8 +257,8 @@ fn spawn_reader(
             }
             let mut buf = [0u8; 64];
             loop {
-                match reader.read(&mut buf) {
-                    Ok(n) if n > 0 => {
+                match neuron::transport::classify_read(reader.read(&mut buf)) {
+                    neuron::transport::ReadStep::Data(n) if n > 0 => {
                         if verbose() {
                             eprint!("[hidwatch] {tag} n={n} ");
                             for b in &buf[..n] {
@@ -298,8 +298,9 @@ fn spawn_reader(
                             );
                         }
                     }
-                    Ok(_) => {} // zero-length read — keep listening
-                    Err(_) => {
+                    neuron::transport::ReadStep::Data(_) => {} // zero-length read — keep listening
+                    neuron::transport::ReadStep::Idle => {} // read timed out — keep listening
+                    neuron::transport::ReadStep::Gone => {
                         // unplugged / device gone — release un-claims `path` so the monitor re-arms.
                         if verbose() {
                             eprintln!("[hidwatch] {tag}: closed");
@@ -1067,12 +1068,29 @@ mod tests {
         let _g = BATCH_TEST_LOCK.lock().unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         neuron::confirm::set_sink(Some(tx));
+        // Drain to QUIESCENCE before the actual test. The confirm sink is process-global, and a
+        // prior test's async settle worker — delayed past its own fixed-sleep `settle` under heavy
+        // full-workspace load — can still be in flight and would otherwise land in this sink as a
+        // phantom card (observed as spurious "got N cards" failures only under load). We hold
+        // BATCH_TEST_LOCK, so no other batch test runs concurrently, and any worker already spawned
+        // fires within one `BATCH_SETTLE`; two consecutive empty spans therefore prove nothing
+        // spawned before this point is still pending, so the only cards the assertion below can see
+        // are the ones THIS test's reports produce.
+        let mut quiet = 0;
+        while quiet < 2 {
+            settle();
+            if rx.try_iter().count() == 0 {
+                quiet += 1;
+            } else {
+                quiet = 0;
+            }
+        }
         dpi_report(1600);
         scroll_report(3);
         plate_report(4); // 6-button
         settle();
-        neuron::confirm::set_sink(None);
         let cards: Vec<_> = rx.try_iter().collect();
+        neuron::confirm::set_sink(None);
         assert!(cards.is_empty(), "a wake-burst must prime silently, got {} card(s)", cards.len());
         assert_eq!(neuron::confirm::last_plate(NAGA_PID).as_deref(), Some("6-button"));
     }
@@ -1223,5 +1241,164 @@ mod tests {
         for code in [0x01u8, 0x51, 0x53, 0x56, 0x99, 0xff] {
             assert!(button_intent(code).is_none(), "unknown code {code:#04x} must map to nothing");
         }
+    }
+
+    // ── HOTPLUG BURST STRESS: the map-mutating entry points under concurrent rapid
+    // plug/unplug/re-plug, same pid AND distinct pids at once ──────────────────────────────────
+    //
+    // `mute_products_store`/`mute_writable_store` (via `note_audio_capability`), `batches` (via
+    // `batch_push`, the same function `decode`'s 0x02/0x3a/0x0e arms call), and `reassert_stamps`
+    // (via `reassert_due`, the same function `decode`'s 0x02/0x0c arms call) are the four
+    // process-global `OnceLock<Mutex<..>>` maps keyed by pid/product. Driven DIRECTLY (not through
+    // `decode`) so the burst can never touch a real device: `decode`'s own dpi/charge arms spawn a
+    // worker that opens a device BY PID (`maybe_reconcile_announced`/`maybe_reassert` ->
+    // `open_device`), which for a REGISTERED pid (e.g. `NAGA_PID`, used by this file's other tests)
+    // would attempt a real HID open on whatever hardware happens to be plugged into this machine —
+    // exactly the "never touch real hardware" line a test must not cross. Calling `batch_push` and
+    // `reassert_due` straight — the same functions `decode` calls into — exercises the identical
+    // map code with zero device I/O, registered pid or not. `button_worker`/`fulfill_button`/
+    // `open_device`/`read_battery`/`settle_charge` are NOT exercised here: every one of them needs a
+    // real (or at least registered) device behind `open_device` to do anything but bail early, so
+    // they are out of headless scope — honestly excluded rather than faked.
+    #[test]
+    fn hotplug_burst_stresses_global_maps_without_corruption() {
+        let _g = BATCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        const THREADS: u16 = 16;
+        const ITERS: usize = 50;
+        // even-indexed threads hammer ONE shared pid — rapid plug/unplug/re-plug of the SAME
+        // device; odd-indexed threads each own a distinct pid — several different devices at once.
+        // Neither pid range is registered in the real device TOMLs, so `open_device` (were it ever
+        // reached from here, which it isn't) would bail before any real HID call.
+        const SHARED_PID: u16 = 0xE0FF;
+        let fam = razer_audio();
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                std::thread::spawn(move || {
+                    let pid = if t % 2 == 0 { SHARED_PID } else { 0xE100 + t };
+                    let product = format!("burst-mic-{t}");
+                    for i in 0..ITERS {
+                        // "plug": the arm-time capability learn + a device-pushed settings report,
+                        // alternating kind so DPI/scroll/plate each get real traffic across the run.
+                        note_audio_capability(fam, &product);
+                        reassert_due(pid);
+                        match i % 3 {
+                            0 => batch_push(pid, Push::Dpi(800 + (i as u32 % 100))),
+                            1 => batch_push(pid, Push::Scroll(1 + (i as u32 % SCROLL_STAGE_MAX))),
+                            _ => batch_push(pid, Push::Plate((i % 5) as u8, format!("plate-{i}"))),
+                        }
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("a burst thread must never panic");
+        }
+
+        // quiesce: let every settle worker the burst spawned finish flushing.
+        settle();
+
+        // no poisoned mutex: a raw `.lock()` on each of the four maps must still succeed.
+        assert!(mute_products_store().lock().is_ok(), "mute_products_store poisoned");
+        assert!(mute_writable_store().lock().is_ok(), "mute_writable_store poisoned");
+        assert!(batches().lock().is_ok(), "batches poisoned");
+        assert!(reassert_stamps().lock().is_ok(), "reassert_stamps poisoned");
+
+        // every pid the burst touched settled to a CLEAN (fully-flushed) batch — no half-applied
+        // state from the storm survives quiescence, whether the pid was shared or exclusive.
+        {
+            let map = batches().lock().unwrap_or_else(|e| e.into_inner());
+            for t in 0..THREADS {
+                let pid = if t % 2 == 0 { SHARED_PID } else { 0xE100 + t };
+                let st = map
+                    .get(&pid)
+                    .unwrap_or_else(|| panic!("pid {pid:#06x} lost its batch entry"));
+                assert!(
+                    st.batch.dpi.is_none() && st.batch.scroll.is_none() && st.batch.plate.is_none(),
+                    "pid {pid:#06x} left a half-flushed batch after quiescence: dpi={:?} scroll={:?} plate={:?}",
+                    st.batch.dpi,
+                    st.batch.scroll,
+                    st.batch.plate.as_ref().map(|(_, id, _)| id),
+                );
+            }
+        }
+
+        // reassert_stamps learned every pid the burst touched — the shared pid plus each distinct
+        // one — never a phantom key (a torn write landing under the wrong pid) and never a dropped
+        // one (contention on the shared pid losing a write outright).
+        {
+            let map = reassert_stamps().lock().unwrap_or_else(|e| e.into_inner());
+            assert!(map.contains_key(&SHARED_PID), "the shared pid must have a reassert stamp");
+            for t in (1..THREADS).step_by(2) {
+                let pid = 0xE100 + t;
+                assert!(map.contains_key(&pid), "distinct pid {pid:#06x} must have a reassert stamp");
+            }
+        }
+
+        // the capability surface learned every thread's product (READ facet), and none of it
+        // leaked into the WRITE facet — razer-audio is read-only, the same invariant the
+        // single-threaded `capability_surface_learns_read_facet_but_not_unproven_write` test pins.
+        let read = hardware_mute_products();
+        let write = mute_writable_products();
+        for t in 0..THREADS {
+            let product = format!("burst-mic-{t}");
+            assert!(
+                read.iter().any(|p| *p == product),
+                "product {product} missing from the read facet"
+            );
+            assert!(
+                !write.iter().any(|p| *p == product),
+                "razer-audio must never surface the write facet"
+            );
+        }
+
+        // ── FRESH-PID PASS: a normal single-threaded run, on a pid/product the burst never
+        // touched, must behave EXACTLY like it would on a clean process — no state the storm left
+        // behind corrupts or wedges a later, unrelated arm. Mirrors the existing single-threaded
+        // `lone_plate_report_settles_and_reaches_confirm` expectation, computed the same way.
+        const FRESH_PID: u16 = 0xE999;
+        assert!(
+            reassert_due(FRESH_PID),
+            "a pid never seen before (burst or not) must reassert on its first wake"
+        );
+        batch_push(FRESH_PID, Push::Plate(2, "clean-plate".into()));
+        settle();
+        assert_eq!(
+            neuron::confirm::last_plate(FRESH_PID).as_deref(),
+            Some("clean-plate"),
+            "a lone plate report on a fresh pid must still settle and reach confirm after the burst"
+        );
+        let fresh_product = "burst-clean-product";
+        note_audio_capability(fam, fresh_product);
+        assert!(
+            hardware_mute_products().iter().any(|p| p == fresh_product),
+            "a fresh product must still land on the capability surface after the burst"
+        );
+
+        // Leave the process-global surface as clean as a fresh start. This test drives ~800 async
+        // settle/batch workers and populates four shared maps with ~17 pids; `BATCH_TEST_LOCK`
+        // serializes test EXECUTION but does not RESET this state, so a straggler card (a worker
+        // still flushing after `settle`'s fixed sleep, which a loaded machine can outrun) or a
+        // residual map entry would leak into whatever test runs next (e.g. the wake-burst test,
+        // which asserts a SILENT prime and would see the stragglers as phantom cards). Drain the
+        // confirm pipeline to quiescence, then clear the maps we filled.
+        {
+            let (tx, rx) = std::sync::mpsc::channel();
+            neuron::confirm::set_sink(Some(tx));
+            // Two full settle spans with no new input: any worker still in flight from the storm
+            // has flushed by the end of the second quiet span. Loop until a span yields nothing.
+            for _ in 0..5 {
+                settle();
+                if rx.try_iter().count() == 0 {
+                    break;
+                }
+            }
+            neuron::confirm::set_sink(None);
+        }
+        batches().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        reassert_stamps().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        mute_products_store().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        mute_writable_store().lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 }

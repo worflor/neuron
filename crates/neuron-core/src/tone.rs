@@ -226,6 +226,14 @@ impl Voice {
 /// that keeps overlapping voices from clipping harshly — odd-harmonic warmth, not a hard edge.
 #[inline]
 pub fn soft_clip(x: f32) -> f32 {
+    // A NaN sample must never reach cpal — `x.clamp` alone passes NaN straight through
+    // (`f32::clamp` returns `self` when neither comparison against `min`/`max` is true,
+    // which NaN always satisfies), so a single poisoned upstream sample would otherwise
+    // ride this "safety net" all the way to the audio device as real garbage audio. This
+    // is the last stage before the mix leaves `render`/the live callback, so flush here.
+    if x.is_nan() {
+        return 0.0;
+    }
     let x = x.clamp(-1.0, 1.0);
     1.5 * x - 0.5 * x * x * x
 }
@@ -347,5 +355,95 @@ mod tests {
         assert!(soft_clip(10.0) <= 1.0 && soft_clip(10.0) > 0.9);
         assert!(soft_clip(-10.0) >= -1.0 && soft_clip(-10.0) < -0.9);
         assert!(soft_clip(0.5) > soft_clip(0.4)); // monotonic in the linear-ish region
+    }
+
+    // ── Property tests ──────────────────────────────────────────────────────────────
+    mod props {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn cfg() -> ProptestConfig {
+            ProptestConfig { cases: 256, ..ProptestConfig::default() }
+        }
+
+        proptest! {
+            #![proptest_config(cfg())]
+
+            /// (2a) `soft_clip` over the WHOLE f32 space, including NaN/±Inf/subnormals
+            /// (`proptest::num::f32::ANY` samples every IEEE-754 category, not just the
+            /// "normal" default). A finite/infinite input must land in `[-1,1]`; a NaN input
+            /// is the one documented exception — it's flushed to `0.0` (see the comment on
+            /// `soft_clip`) rather than riding a NaN through the mix to the audio device,
+            /// which is the fix this property pins.
+            #[test]
+            fn soft_clip_is_bounded_for_all_floats(x in proptest::num::f32::ANY) {
+                let y = soft_clip(x);
+                if x.is_nan() {
+                    prop_assert_eq!(y, 0.0, "NaN in must never reach the audio device as NaN");
+                } else {
+                    prop_assert!(y.is_finite(), "soft_clip({x}) = {y} is not finite");
+                    prop_assert!((-1.0..=1.0).contains(&y), "soft_clip({x}) = {y} out of [-1,1]");
+                }
+            }
+        }
+
+        fn any_timbre() -> impl Strategy<Value = Timbre> {
+            prop_oneof![Just(Timbre::PULSE), Just(Timbre::WARM), Just(Timbre::GLASS)]
+        }
+
+        /// A `Hit` with realistic (bounded, audible-range) parameters — the domain
+        /// `render` is actually driven with in the live engine, not adversarial input
+        /// (hostile-PCM-style fuzzing belongs to the DSP kernels in `audio_spectrum.rs`).
+        fn any_hit(max_at: usize) -> impl Strategy<Value = Hit> {
+            (0..max_at, 20.0f32..20_000.0, 0.0f32..=1.0, any_timbre()).prop_map(
+                move |(at, freq, vel, timbre)| Hit { at, freq, vel, timbre },
+            )
+        }
+
+        proptest! {
+            #![proptest_config(cfg())]
+
+            /// (2b) Arbitrary small cue gestures (bounded count/params, matching how the
+            /// engine actually schedules cues) always render to a fully finite, bounded
+            /// buffer — `render`'s whole job is to be the safe, always-playable offline twin
+            /// of the live callback.
+            #[test]
+            fn render_produces_finite_bounded_samples(
+                hits in prop::collection::vec(any_hit(4_800), 0..8),
+                master in 0.0f32..=2.0,
+            ) {
+                let sr = 48_000.0;
+                let buf = render(&hits, 4_800, sr, master);
+                prop_assert_eq!(buf.len(), 4_800);
+                for &s in &buf {
+                    prop_assert!(s.is_finite(), "render produced a non-finite sample: {s}");
+                    prop_assert!((-1.0..=1.0).contains(&s), "render produced an out-of-range sample: {s}");
+                }
+            }
+        }
+
+        proptest! {
+            #![proptest_config(cfg())]
+
+            /// (2c) `loudness_gain` is NOT monotone in frequency — it's the INVERSE of the
+            /// A-weighting curve (module docs: "keeps notes even in perceived loudness across
+            /// pitch"), and A-weighting itself is U-shaped (attenuates bass and highs relative
+            /// to the ~2-4kHz presence band), so the inverse/compensation gain is U-shaped too:
+            /// highest near the frequency extremes, lowest around ~3kHz. Numerically verified
+            /// (not just by inspection): `loudness_gain(20.0) ≈ 3.98` (saturated at the +12dB
+            /// clamp) while `loudness_gain(3000.0) ≈ 0.92` — asserting global monotonicity
+            /// would be a FALSE law, so this property instead pins the one thing that IS true
+            /// by construction: `gain_db` is unconditionally `.clamp(-6.0, 12.0)` before the
+            /// `10^(gain_db/20)` conversion, so for any FINITE frequency the gain is bounded to
+            /// `[10^(-6/20), 10^(12/20)]` regardless of how the A-weighting math resolves.
+            #[test]
+            fn loudness_gain_is_bounded_for_finite_freqs(f in 0.0f32..48_000.0) {
+                let g = loudness_gain(f);
+                prop_assert!(g.is_finite(), "loudness_gain({f}) = {g} is not finite");
+                let lo = 10.0f32.powf(-6.0 / 20.0);
+                let hi = 10.0f32.powf(12.0 / 20.0);
+                prop_assert!(g >= lo - 1e-4 && g <= hi + 1e-4, "loudness_gain({f}) = {g} outside the clamp-implied [{lo},{hi}]");
+            }
+        }
     }
 }

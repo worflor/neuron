@@ -91,6 +91,80 @@ extern "system" {
     fn GetLastError() -> u32;
 }
 
+/// One overlapped `ReadFile` against `handle`, bounded by `timeout_ms`. Shared by every read path
+/// in this file (`WinHid::read_input`'s request/reply probe AND `WinHidReader::read`'s listener
+/// loop) so the cancellation/lifetime contract is written and audited in exactly one place.
+///
+/// Returns `Ok(Some(n))` on a completed read, `Ok(None)` on timeout (nothing arrived in the
+/// window — NOT an error), `Err` on a real I/O failure.
+///
+/// SAFETY / lifetime contract: `buf` and the stack-local `Overlapped` (`ov`) are both handed to
+/// the kernel by pointer for the duration of the I/O, so NEITHER may be dropped, moved, or reused
+/// while a read is in flight — that would be a use-after-free the kernel writes into after this
+/// function has already returned. Every exit path below upholds this:
+///   - `ReadFile` completes synchronously (`started != 0`): no I/O is pending — safe to return.
+///   - `ReadFile` fails outright (`started == 0` and the error isn't `ERROR_IO_PENDING`): nothing
+///     was queued — safe to return.
+///   - The wait succeeds (`WAIT_OBJECT_0`): the event only signals when the kernel has finished
+///     writing into `buf`/`ov` — the subsequent `GetOverlappedResult(..., wait=0)` is a
+///     non-blocking formality to fetch the byte count, not a second wait.
+///   - The wait TIMES OUT: this is the dangerous path — the kernel may still be about to write
+///     into `buf`/`ov` at any instant. We call `CancelIo` (cancels I/O the CALLING THREAD issued
+///     on this handle; both callers here issue and await from the same thread, so `CancelIo`
+///     fully covers it — unlike `CancelIoEx`'s cross-thread cancel, unneeded here) and then
+///     `GetOverlappedResult(..., wait=TRUE)`, which BLOCKS until the kernel confirms the I/O has
+///     actually stopped (cancellation is asynchronous — `CancelIo` returning is not proof the op
+///     is done). Only once that call returns do we close the event and return `Ok(None)`; only
+///     then are `buf`/`ov` safe for the caller to drop or reuse. This holds even if the cancel
+///     "fails" (e.g. the read had already completed the instant before `CancelIo` ran) —
+///     `GetOverlappedResult(wait=TRUE)` still blocks until the kernel is done with the buffer
+///     either way, so there is no path out of this function with I/O still pending.
+/// A panic between `ReadFile` and this function's return would unwind through the same code path
+/// (Rust doesn't skip drops/cleanup here — there IS no separate cleanup to skip, since this
+/// function contains no early-return before the cancel-and-reap sequence completes; the only heap
+/// object involved, `ev`, is a plain `HANDLE` closed on every exit, including the timeout path).
+unsafe fn overlapped_read_timed(handle: HANDLE, buf: &mut [u8], timeout_ms: u32) -> Result<Option<usize>> {
+    // Manual-reset, initially non-signaled event for the overlapped completion.
+    let ev = CreateEventW(ptr::null(), 1, 0, ptr::null());
+    if ev.is_null() {
+        bail!("CreateEvent for overlapped read failed");
+    }
+    let mut ov: Overlapped = std::mem::zeroed();
+    ov.h_event = ev;
+    let mut got: u32 = 0;
+    let ov_ptr = &mut ov as *mut Overlapped as *mut c_void;
+    let started = ReadFile(
+        handle,
+        buf.as_mut_ptr() as *mut c_void,
+        buf.len() as u32,
+        &mut got,
+        ov_ptr,
+    );
+    if started == 0 {
+        let err = GetLastError();
+        if err != ERROR_IO_PENDING {
+            CloseHandle(ev);
+            bail!("ReadFile (overlapped) failed: {err}");
+        }
+        // In flight: wait the caller's bounded patience.
+        if WaitForSingleObject(ev, timeout_ms) != WAIT_OBJECT_0 {
+            // Timed out. Cancel and REAP the op (so `buf`/`ov` are safe to drop) before returning —
+            // a dangling overlapped read into this buffer is a use-after-free. `GetOverlappedResult`
+            // with `wait=TRUE` blocks until the kernel confirms the cancellation actually landed.
+            CancelIo(handle);
+            let _ = GetOverlappedResult(handle, ov_ptr, &mut got, 1 /* bWait */);
+            CloseHandle(ev);
+            return Ok(None);
+        }
+        if GetOverlappedResult(handle, ov_ptr, &mut got, 0) == 0 {
+            CloseHandle(ev);
+            bail!("GetOverlappedResult (overlapped read) failed");
+        }
+    }
+    CloseHandle(ev);
+    Ok(Some(got as usize))
+}
+
 unsafe fn wide_from_ptr(p: *const u16) -> Vec<u16> {
     let mut v = Vec::new();
     let mut i = 0isize;
@@ -305,6 +379,12 @@ impl Drop for WinHid {
 /// A read handle for one collection's device-initiated input reports. Opened with `GENERIC_READ`
 /// (which `ReadFile` needs) — so it FAILS on the OS-protected mouse/keyboard collections and only
 /// succeeds on the vendor collections where Razer's event reports (DPI/stage changes) ride.
+///
+/// Opened `FILE_FLAG_OVERLAPPED` so `read` can enforce [`READER_POLL_TIMEOUT_MS`]: a synchronous
+/// read on this handle would block a listener thread FOREVER if the device stalls mid-session
+/// (wireless dropout, sleep transition, driver hiccup) — unplug happens to complete the pending
+/// IO, but nothing else does. The bounded overlapped read means the thread always wakes up on its
+/// own schedule to re-issue the read (see `overlapped_read_timed`'s cancellation contract).
 pub struct WinHidReader {
     handle: HANDLE,
 }
@@ -312,6 +392,11 @@ pub struct WinHidReader {
 // The handle is a raw OS pointer; we own it solely here and close it on drop, so it's safe to move
 // to the listener thread that owns this reader.
 unsafe impl Send for WinHidReader {}
+
+/// How long one `WinHidReader::read` waits for a report before returning `Ok(None)` and letting
+/// the caller loop back around (check a stop flag, re-issue). Short enough that a listener thread
+/// stays responsive to shutdown/re-arm; long enough that idle devices don't spin the thread.
+const READER_POLL_TIMEOUT_MS: u32 = 400;
 
 impl WinHidReader {
     pub fn open(path: &DevicePath) -> Result<Self> {
@@ -323,7 +408,7 @@ impl WinHidReader {
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 ptr::null(),
                 OPEN_EXISTING,
-                0,
+                FILE_FLAG_OVERLAPPED,
                 ptr::null_mut(),
             );
             if h == INVALID_HANDLE_VALUE {
@@ -335,27 +420,19 @@ impl WinHidReader {
 }
 
 impl super::InputReader for WinHidReader {
-    fn read(&self, buf: &mut [u8]) -> Result<usize> {
-        unsafe {
-            let mut got: u32 = 0;
-            // synchronous (handle opened without FILE_FLAG_OVERLAPPED) — blocks until a report lands.
-            if ReadFile(
-                self.handle,
-                buf.as_mut_ptr() as *mut c_void,
-                buf.len() as u32,
-                &mut got,
-                ptr::null_mut(),
-            ) == 0
-            {
-                bail!("ReadFile failed");
-            }
-            Ok(got as usize)
-        }
+    fn read(&self, buf: &mut [u8]) -> Result<Option<usize>> {
+        // One bounded overlapped read; see `overlapped_read_timed` for the cancellation/lifetime
+        // contract. `Ok(None)` (timeout) is NOT an error — the caller's loop is expected to spin
+        // back around and call `read` again, which is exactly what re-issues the ReadFile.
+        unsafe { overlapped_read_timed(self.handle, buf, READER_POLL_TIMEOUT_MS) }
     }
 }
 
 impl Drop for WinHidReader {
     fn drop(&mut self) {
+        // No overlapped read is ever left pending across calls (each `read` cancels-and-reaps its
+        // own timeout before returning — see `overlapped_read_timed`), so there is nothing to
+        // cancel here; a plain close is safe.
         unsafe {
             CloseHandle(self.handle);
         }
@@ -545,45 +622,12 @@ impl Transport for WinHid {
         }
         let rh = slot.expect("read handle opened just above");
         drop(slot); // HANDLE is Copy — don't hold the lock across the blocking wait
-        unsafe {
-            // Manual-reset, initially non-signaled event for the overlapped completion.
-            let ev = CreateEventW(ptr::null(), 1, 0, ptr::null());
-            if ev.is_null() {
-                bail!("CreateEvent for overlapped read failed");
-            }
-            let mut ov: Overlapped = std::mem::zeroed();
-            ov.h_event = ev;
-            let mut got: u32 = 0;
-            let ov_ptr = &mut ov as *mut Overlapped as *mut c_void;
-            let started = ReadFile(
-                rh,
-                buf.as_mut_ptr() as *mut c_void,
-                buf.len() as u32,
-                &mut got,
-                ov_ptr,
-            );
-            if started == 0 {
-                let err = GetLastError();
-                if err != ERROR_IO_PENDING {
-                    CloseHandle(ev);
-                    bail!("ReadFile (overlapped input) failed: {err}");
-                }
-                // In flight: wait the caller's bounded patience.
-                if WaitForSingleObject(ev, timeout_ms) != WAIT_OBJECT_0 {
-                    // Timed out. Cancel and REAP the op (so `buf`/`ov` are safe to drop) before
-                    // returning — a dangling overlapped read into a stack buffer is a use-after-free.
-                    CancelIo(rh);
-                    let _ = GetOverlappedResult(rh, ov_ptr, &mut got, 1 /* bWait */);
-                    CloseHandle(ev);
-                    bail!("read_input timed out after {timeout_ms} ms");
-                }
-                if GetOverlappedResult(rh, ov_ptr, &mut got, 0) == 0 {
-                    CloseHandle(ev);
-                    bail!("GetOverlappedResult (input read) failed");
-                }
-            }
-            CloseHandle(ev);
-            Ok(got as usize)
+        // `read_input`'s contract (unlike `InputReader::read`) is request/reply: "did the reply
+        // arrive in the window" — a timeout here IS the caller's answer, not a spurious wakeup to
+        // loop past. So the shared helper's `Ok(None)` is turned back into an honest error.
+        match unsafe { overlapped_read_timed(rh, buf, timeout_ms) }? {
+            Some(n) => Ok(n),
+            None => bail!("read_input timed out after {timeout_ms} ms"),
         }
     }
 }

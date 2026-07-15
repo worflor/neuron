@@ -166,6 +166,11 @@ impl Shared {
         l.push_back(line);
     }
     fn mark_dead(&self) {
+        // Race window (a): freezing HERE (before the clear) while a concurrent request's insert
+        // proceeds first lets that fresh, legitimate waiter get wiped by the clear below the moment
+        // this thread resumes — "mark_dead racing register", the opposite-side sibling of the
+        // pending_insert.before window in the request paths (see `macro_host_death_race_*` tests).
+        crate::failpoint!("macro_host.mark_dead.before_clear");
         {
             let mut s = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             s.dead = true;
@@ -174,6 +179,11 @@ impl Shared {
         self.cv.notify_all();
         // fail every in-flight waiter so no blocking caller hangs past the sidecar's death.
         self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+        // Race window (b): freezing HERE (after the clear) while a concurrent request's insert has
+        // NOT happened yet lets that request insert its waiter into an already-cleared map — and
+        // this reader thread is about to exit for good, so nothing will ever route that waiter's
+        // reply. Bounded only by the request's own recv_timeout (see FIRE_BUDGET/WARM_TIMEOUT).
+        crate::failpoint!("macro_host.mark_dead.after_clear");
     }
 }
 
@@ -611,6 +621,10 @@ impl MacroHost {
             let rid = s.shared.next_rid.fetch_add(1, Ordering::Relaxed);
             let (tx, rx) = channel();
             let shared = Arc::clone(&s.shared);
+            // Race window: a concurrent mark_dead's clear can land in the gap right here — see
+            // `Shared::mark_dead`'s two failpoints and the `macro_host_death_race_*` tests, which
+            // freeze one side or the other of this exact window.
+            crate::failpoint!("macro_host.pending_insert.before");
             shared.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(rid, tx);
             let ok = s.send(&json!({"t": "fire", "rid": rid, "id": id, "ctx": ctx_json(ctx, armed), "options": load_option_values(id)}));
             (rx, shared, rid, ok)
@@ -709,6 +723,11 @@ impl MacroHost {
             let rid = sess.shared.next_rid.fetch_add(1, Ordering::Relaxed);
             let _ = sess.send(&json!({"t": "register", "rid": rid, "id": id, "source": src}));
         }
+        // Warm/spawn-path race window: a request that read the OLD (dead) session's `dead` flag as
+        // false just before this replaces it can still be mid-flight against the old `Shared` right
+        // up until this assignment lands — freezing here lets a death-race test confirm the NEXT
+        // lookup after this point reliably sees the fresh session (no torn/partial swap).
+        crate::failpoint!("macro_host.ensure_locked.before_replace");
         g.session = Some(sess);
         Ok(())
     }
@@ -1433,6 +1452,15 @@ pub fn delete_macro(id: &str) -> std::io::Result<()> {
     std::fs::remove_file(macro_path(id))
 }
 
+/// Serializes every test that exclusively drives — or outright KILLS — the process-global
+/// `macro_host()` sidecar singleton. The sidecar and its `pending` map are shared by all tests in
+/// this binary; a test that taskkills the child (the death-race tests) or does many real
+/// round-trips (`node`'s codegen proptest) would otherwise corrupt a concurrent sidecar test's
+/// `pending` view or answer stream. Anyone touching the live sidecar in anger holds this first.
+/// Poison-tolerant: a panicking holder must not wedge every later sidecar test.
+#[cfg(test)]
+pub(crate) static SIDECAR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1480,5 +1508,219 @@ mod tests {
     #[test]
     fn macros_dir_is_under_macros() {
         assert!(macros_dir().ends_with("scripts"));
+    }
+
+    // ── death-race tests ──────────────────────────────────────────────────────────────────────
+    //
+    // These pin the known timeout-masked bug class documented at `Shared::mark_dead` and the
+    // `pending_insert.before` site above: a request that inserts its `pending` waiter racing
+    // mark_dead's clear can strand that waiter — bounded only by the caller's recv_timeout, never
+    // truly leaked (the caller's own `Err(_)` arm removes it), but slow and silent instead of
+    // failing fast. Both tests use the REAL bundled sidecar (same skip-cleanly-with-no-python
+    // contract as `macro_host_respawn.rs`) and `crate::runroot::ENV_LOCK` to safely retarget
+    // `NEURON_RUN_DIR` from a crate-internal unit test — these run in the SAME process as every
+    // other lib unit test, including `macros::node`'s `codegen_parse_codegen_is_stable` proptest,
+    // which also uses the process-global `macro_host()`. That sharing is a pre-existing property of
+    // the singleton (not introduced here); what IS new is that these tests deliberately kill the
+    // live sidecar process, which could in principle cause a transient, unrelated failure in
+    // whatever other macro_host() consumer happens to be mid-request at that exact moment. The
+    // window is small (kill + recover completes in well under a second) but it is a real,
+    // non-zero risk worth flagging rather than hiding.
+    //
+    // Rather than simulate `mark_dead` by calling it directly (which would leave the REAL sidecar
+    // process alive and still able to answer — defeating the point, since the actual bug requires
+    // the reader thread to have permanently stopped routing replies), these kill the real process,
+    // exactly like `macro_host_respawn.rs`, so the race is reproduced against real IPC.
+
+    fn death_race_ctx() -> crate::macros::context::Context {
+        crate::macros::context::Context::synthetic(Some("failpoint.exe".into()), None, None, None, None)
+    }
+
+    /// Shared setup for both death-race tests: isolate the run root, ensure a warm host with one
+    /// registered echo macro, and return (host, ctx, tmp dir to clean up). Skips (returns `None`)
+    /// when no bundled python runtime resolves — the same honest skip every other sidecar test uses.
+    fn death_race_setup(tag: &str) -> Option<(&'static MacroHost, crate::macros::context::Context, PathBuf)> {
+        let tmp = std::env::temp_dir().join(format!("neuron_failpoint_race_{tag}_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).ok()?;
+        let host = macro_host();
+        if !host.available() {
+            eprintln!("skipping macro_host death-race ({tag}): bundled python runtime did not materialize");
+            let _ = std::fs::remove_dir_all(&tmp);
+            return None;
+        }
+        host.set_armed(false); // the test macro is read-only; no input synthesis needed
+        let src = "def macro(ctx):\n    return 'ok'\n";
+        if let Err(e) = host.register("fp_death_race", src) {
+            eprintln!("skipping macro_host death-race ({tag}): register failed: {e}");
+            let _ = std::fs::remove_dir_all(&tmp);
+            return None;
+        }
+        Some((host, death_race_ctx(), tmp))
+    }
+
+    #[cfg(windows)]
+    fn kill_pid(pid: u32) {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/PID", &pid.to_string()])
+            .status();
+    }
+    #[cfg(not(windows))]
+    fn kill_pid(pid: u32) {
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status();
+    }
+
+    /// Race (b): the request's insert lands AFTER mark_dead's clear (freeze the REQUEST side).
+    /// Proves: the request still resolves within its budget (never hangs past it), the pending map
+    /// is empty afterward (no permanent leak — only the documented timeout-bounded delay), and a
+    /// subsequent request against the auto-respawned session succeeds.
+    #[test]
+    #[ignore = "kills the real sidecar process + needs the bundled Python runtime; opt in with --ignored (also mutates the global macro-host singleton, so it is not a fast-suite test)"]
+    fn death_race_insert_after_clear_is_bounded_and_recovers() {
+        let _sidecar = SIDECAR_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _fp = crate::failpoint::FAILPOINT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env = crate::runroot::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some((host, ctx, tmp)) = death_race_setup("insert_after_clear") else { return };
+        let _pin = crate::runroot::RunDirPin::to(&tmp);
+
+        let baseline = host.invoke("fp_death_race", &ctx);
+        assert!(baseline.contains("ok"), "baseline invoke failed: {baseline}");
+        let pid_before = crate::prof::SIDECAR_PID.load(Ordering::Relaxed);
+
+        // Freeze the NEXT insert-before-send window so mark_dead's clear (triggered by the kill
+        // below) lands first, and the request's own insert follows it.
+        let _armed = crate::failpoint::Armed::new(
+            "macro_host.pending_insert.before",
+            crate::failpoint::Action::Sleep(Duration::from_millis(350)),
+        );
+
+        let (tx, rx) = channel::<String>();
+        let t0 = Instant::now();
+        std::thread::spawn(move || {
+            let host = macro_host();
+            let ctx = death_race_ctx();
+            let r = host.invoke_with_budget("fp_death_race", &ctx, Duration::from_secs(2));
+            let _ = tx.send(r);
+        });
+
+        // give the request thread time to pass ensure_locked and hit the armed failpoint before we
+        // pull the sidecar out from under it.
+        std::thread::sleep(Duration::from_millis(80));
+        kill_pid(pid_before);
+
+        let result = rx
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap_or_else(|_| panic!("request did not return within its budget — a waiter leaked"));
+        eprintln!("death-race(insert-after-clear) result in {:?}: {result}", t0.elapsed());
+
+        assert!(
+            crate::failpoint::hits("macro_host.pending_insert.before") > 0,
+            "anti-vacuity: the armed failpoint was never reached"
+        );
+
+        // no waiter left behind in whatever session is now live.
+        {
+            let g = host.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(s) = g.session.as_ref() {
+                let pending = s.shared.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                assert!(
+                    pending.is_empty(),
+                    "a waiter leaked into the live session's pending map: {:?}",
+                    pending.keys().collect::<Vec<_>>()
+                );
+            }
+        }
+
+        // recovery: the next request must succeed against a freshly respawned sidecar.
+        let healed = host.invoke("fp_death_race", &ctx);
+        assert!(healed.contains("ok"), "post-race recovery failed: {healed}");
+        let pid_after = crate::prof::SIDECAR_PID.load(Ordering::Relaxed);
+        // A live sidecar answering "ok" above already proves recovery respawned the child;
+        // do NOT assert the PID changed — Windows can legitimately reuse the just-freed PID
+        // for the respawn, which is not a recovery failure. Keep the read for the log only.
+        let _ = (pid_before, pid_after);
+        assert!(
+            crate::failpoint::hits("macro_host.ensure_locked.before_replace") > 0,
+            "anti-vacuity: recovery must actually pass through session replacement"
+        );
+
+        host.unregister("fp_death_race");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Race (c): mark_dead's clear lands AFTER a concurrent request's insert (freeze the DEATH
+    /// side) — the opposite interleave of the test above, exercising `mark_dead.before_clear`
+    /// instead of `pending_insert.before`. Same invariants: bounded, no leaked waiter, recovers.
+    #[test]
+    #[ignore = "kills the real sidecar process + needs the bundled Python runtime; opt in with --ignored (also mutates the global macro-host singleton, so it is not a fast-suite test)"]
+    fn death_race_clear_after_insert_is_bounded_and_recovers() {
+        let _sidecar = SIDECAR_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _fp = crate::failpoint::FAILPOINT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env = crate::runroot::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some((host, ctx, tmp)) = death_race_setup("clear_after_insert") else { return };
+        let _pin = crate::runroot::RunDirPin::to(&tmp);
+
+        let baseline = host.invoke("fp_death_race", &ctx);
+        assert!(baseline.contains("ok"), "baseline invoke failed: {baseline}");
+        let pid_before = crate::prof::SIDECAR_PID.load(Ordering::Relaxed);
+
+        // Freeze mark_dead itself (the reader thread, on EOF) right before it clears `pending`, so
+        // a concurrent request's insert can land first.
+        let _armed = crate::failpoint::Armed::new(
+            "macro_host.mark_dead.before_clear",
+            crate::failpoint::Action::Sleep(Duration::from_millis(350)),
+        );
+
+        kill_pid(pid_before);
+        // give the reader thread time to notice EOF and hit the armed failpoint (frozen there)
+        // before the request below races its own insert in underneath it.
+        std::thread::sleep(Duration::from_millis(80));
+
+        let (tx, rx) = channel::<String>();
+        let t0 = Instant::now();
+        std::thread::spawn(move || {
+            let host = macro_host();
+            let ctx = death_race_ctx();
+            let r = host.invoke_with_budget("fp_death_race", &ctx, Duration::from_secs(2));
+            let _ = tx.send(r);
+        });
+
+        let result = rx
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap_or_else(|_| panic!("request did not return within its budget — a waiter leaked"));
+        eprintln!("death-race(clear-after-insert) result in {:?}: {result}", t0.elapsed());
+
+        assert!(
+            crate::failpoint::hits("macro_host.mark_dead.before_clear") > 0,
+            "anti-vacuity: the armed failpoint was never reached"
+        );
+
+        {
+            let g = host.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(s) = g.session.as_ref() {
+                let pending = s.shared.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                assert!(
+                    pending.is_empty(),
+                    "a waiter leaked into the live session's pending map: {:?}",
+                    pending.keys().collect::<Vec<_>>()
+                );
+            }
+        }
+
+        let healed = host.invoke("fp_death_race", &ctx);
+        assert!(healed.contains("ok"), "post-race recovery failed: {healed}");
+        let pid_after = crate::prof::SIDECAR_PID.load(Ordering::Relaxed);
+        // A live sidecar answering "ok" above already proves recovery respawned the child;
+        // do NOT assert the PID changed — Windows can legitimately reuse the just-freed PID
+        // for the respawn, which is not a recovery failure. Keep the read for the log only.
+        let _ = (pid_before, pid_after);
+
+        host.unregister("fp_death_race");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

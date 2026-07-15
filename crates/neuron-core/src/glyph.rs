@@ -650,7 +650,11 @@ fn windows_sigs(r: &[C]) -> Vec<Sig> {
 // ── physical invariants (first-principles, conserved/topological) ────────────
 
 /// Conserved/topological motion invariants of a gesture. All are translation-, scale-,
-/// and speed-invariant; `winding` and `bending` are also rotation-invariant.
+/// and speed-invariant; `winding` and `bending` are also rotation-invariant — with one
+/// intrinsic caveat: a turn of exactly ±π (a perfect reversal) sits on the angle-wrap's
+/// branch cut, where handedness is mathematically ambiguous, so `winding` can shift by a
+/// whole turn under rotation for strokes containing such reversals (real captured strokes
+/// essentially never do; axis-aligned synthetic ones can).
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct Invariants {
     /// signed turning ∮dθ/2π — loop count × handedness (+1 = one CW loop, −2 = two CCW)
@@ -2023,5 +2027,381 @@ mod tests {
             acc >= 0.9,
             "classifier accuracy {acc:.2} ({correct}/{total}) below 0.9"
         );
+    }
+
+    // ── metamorphic laws (no oracle exists for "the right score", so these assert RELATIONS
+    // between outputs instead) + robustness properties, over random-walk strokes. ─────────────
+    mod props {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Every law below runs the full `analyze`/`prepare`/`dtw` pipeline at least once
+        /// (curvature-arc resampling + windowed eigen-fits + O(n·m) DTW) — cheap per-case at
+        /// these stroke sizes (dtw ends up on ~10-50-element Sig sequences after windowing), but
+        /// kept at the house "heavy math" case count rather than the 256-case "cheap" one.
+        fn cfg_heavy() -> ProptestConfig {
+            ProptestConfig { cases: 128, ..ProptestConfig::default() }
+        }
+
+        /// Random-walk stroke as a HEADING walk, not independent step deltas: each step turns the
+        /// current heading by a bounded angle and advances at a bounded positive speed. This makes
+        /// the stroke smooth BY CONSTRUCTION (no zero-length segments, every turn well inside the
+        /// ±π velocity-angle branch cut) — an earlier independent-delta generator drew consecutive
+        /// directions uncorrelated, so near-π reversals were routine, which the continuity-sensitive
+        /// invariants (winding) can't survive. It also reads more like an actual hand motion (a pen
+        /// has momentum; its direction is continuous). 8..128 points mirrors real capture lengths;
+        /// the ±1.8rad turn bound stays clear of the ±π branch cut while still allowing loops,
+        /// spirals, and zigzags. Used by the translation/scale/premetric/DTW laws (rotation and
+        /// resample state their claims on canonical shapes instead — see those tests).
+        fn arb_stroke() -> impl Strategy<Value = Vec<C>> {
+            (
+                0.0f64..std::f64::consts::TAU,
+                proptest::collection::vec((-1.8f64..1.8f64, 0.5f64..8.0f64), 8..128),
+            )
+                .prop_map(|(heading0, steps)| {
+                    let mut heading = heading0;
+                    let mut acc = C::new(0.0, 0.0);
+                    steps
+                        .into_iter()
+                        .map(|(turn, speed)| {
+                            heading += turn;
+                            acc = acc.add(C::new(heading.cos() * speed, heading.sin() * speed));
+                            acc
+                        })
+                        .collect()
+                })
+        }
+
+        fn rotate(z: &[C], theta: f64) -> Vec<C> {
+            let r = C::new(theta.cos(), theta.sin());
+            z.iter().map(|p| p.mul(r)).collect()
+        }
+        fn translate(z: &[C], dx: f64, dy: f64) -> Vec<C> {
+            let d = C::new(dx, dy);
+            z.iter().map(|p| p.add(d)).collect()
+        }
+        fn scale_stroke(z: &[C], s: f64) -> Vec<C> {
+            z.iter().map(|p| p.scale(s)).collect()
+        }
+
+        /// A small, structurally-distinct dictionary (mirrors `classifier_accuracy_on_variant_set`
+        /// above) for the ranking-stability laws.
+        fn dictionary(cfg: &GlyphConfig) -> Vec<(&'static str, GestureWord)> {
+            use std::f64::consts::TAU;
+            vec![
+                ("circle_cw", analyze(&synth_circle(64, 300.0, TAU / 64.0), cfg)),
+                ("circle_ccw", analyze(&synth_circle(64, 300.0, -TAU / 64.0), cfg)),
+                ("line", analyze(&synth_line(60), cfg)),
+                ("vee", analyze(&synth_vee(60, 8.0), cfg)),
+            ]
+        }
+
+        /// Rank a word against `dictionary` by `word_distance`, ascending. Only meaningful when
+        /// there's a clear margin between 1st and 2nd place — callers `prop_assume!` on that.
+        fn ranked<'a>(
+            dict: &'a [(&'static str, GestureWord)],
+            w: &GestureWord,
+            cfg: &GlyphConfig,
+        ) -> Vec<(&'static str, f64)> {
+            let mut scored: Vec<(&'static str, f64)> = dict
+                .iter()
+                .map(|(n, t)| (*n, word_distance(w, t, cfg)))
+                .collect();
+            scored.sort_by(|a, b| a.1.total_cmp(&b.1));
+            scored
+        }
+
+
+        proptest! {
+            #![proptest_config(cfg_heavy())]
+
+            /// (a) TASK1: rotating a stroke by an arbitrary angle must not change its physical
+            /// invariants (glyph.rs doc comment above `Invariants`, ~line 652: "All are
+            /// translation-, scale-, and speed-invariant; `winding` and `bending` are also
+            /// rotation-invariant" — `closure` is a ratio of magnitudes so it's rotation-invariant
+            /// too, trivially). The eigenmotion fit is exactly rotation-EQUIVARIANT by
+            /// construction (`fit` solves a LINEAR least-squares recurrence on velocities: if
+            /// v'[n] = R·v[n] for a rotation R, then K,G solving v'[n]=K·v'[n-1]-G·v'[n-2] are
+            /// IDENTICAL to the unrotated K,G — R factors out of the whole linear system), so any
+            /// drift here is floating-point/resampling-boundary noise, not model error. Epsilon
+            /// 0.15 matches the existing `invariants_are_speed_and_size_invariant` precedent
+            /// (glyph.rs ~1941), which already tolerates that much drift between MUCH more
+            /// different strokes (a small/dense vs. a big/sparse circle); a same-shape rotation
+            /// should sit well inside it.
+            #[test]
+            fn invariant_distance_is_rotation_invariant(
+                which in 0usize..4,
+                theta in 0.0f64..std::f64::consts::TAU,
+            ) {
+                // Stated on CANONICAL shapes (same reasoning as `resample_preserves_the_winner`):
+                // `winding` integrates wrapped velocity-angle deltas and is discontinuous at the
+                // ±π branch cut, so an ARBITRARY high-curvature scribble can sit exactly on that
+                // cut and legitimately shift winding by a whole turn under rotation — a fact about
+                // the winding functional, not a recognizer bug (documented on `Invariants`). The
+                // meaningful claim is that the recognizable gestures — where handedness is
+                // unambiguous and well-separated from the cut — read identically at every
+                // orientation. Canonical shapes are exactly that domain; no prop_assume needed.
+                use std::f64::consts::TAU;
+                let cfgv = cfg();
+                let (name, stroke): (&str, Vec<C>) = match which {
+                    0 => ("circle_cw", synth_circle(96, 300.0, TAU / 96.0)),
+                    1 => ("circle_ccw", synth_circle(96, 300.0, -TAU / 96.0)),
+                    2 => ("line", synth_line(90)),
+                    _ => ("vee", synth_vee(90, 8.0)),
+                };
+                let rotated = rotate(&stroke, theta);
+                let a = analyze(&stroke, &cfgv);
+                let b = analyze(&rotated, &cfgv);
+                prop_assert!(
+                    invariant_distance(a.inv, b.inv) < 0.15,
+                    "rotation drifted {}'s invariants: {:?} vs {:?}", name, a.inv, b.inv
+                );
+
+                // And the winner is orientation-independent: a rotated canonical shape still reads
+                // as its own template (ground truth exists here, unlike for a scribble).
+                let dict = dictionary(&cfgv);
+                let after = ranked(&dict, &b, &cfgv);
+                prop_assert_eq!(after[0].0, name, "{} misread after rotation", name);
+            }
+
+            /// (b) TASK1: same law, for translation. Velocities cancel a constant offset exactly
+            /// (z[n]-z[n-1] removes any additive shift), so the eigenmotion fit — and therefore
+            /// every invariant/signature derived from it — is translation-invariant by
+            /// construction; only resampling-boundary float noise can move the result. Same
+            /// epsilon/margin rationale as the rotation law above. Offsets kept to a "sane" range
+            /// (matching the stroke's own coordinate magnitude) so this isn't secretly testing
+            /// catastrophic-cancellation behavior at extreme magnitudes — that's TASK2(f)'s job.
+            #[test]
+            fn invariant_distance_is_translation_invariant(
+                stroke in arb_stroke(),
+                dx in -500.0f64..500.0f64,
+                dy in -500.0f64..500.0f64,
+            ) {
+                let cfgv = cfg();
+                let shifted = translate(&stroke, dx, dy);
+                let a = analyze(&stroke, &cfgv);
+                let b = analyze(&shifted, &cfgv);
+                prop_assert!(
+                    invariant_distance(a.inv, b.inv) < 0.15,
+                    "translation drifted invariants: {:?} vs {:?}", a.inv, b.inv
+                );
+
+                let dict = dictionary(&cfgv);
+                let before = ranked(&dict, &a, &cfgv);
+                prop_assume!(before.len() >= 2 && before[1].1 - before[0].1 > 0.05);
+                let after = ranked(&dict, &b, &cfgv);
+                prop_assert_eq!(after[0].0, before[0].0, "ranking flipped under translation");
+            }
+
+            /// (c) TASK1: same law, for scale (0.1x–10x). Scaling multiplies every velocity by
+            /// the same real factor `s`; the least-squares system for K,G is homogeneous in the
+            /// data (both sides scale by `s`), so K,G — and hence `mag`/`rot` — are exactly
+            /// scale-invariant by construction. `resid_norm` is `residual/mean_step`, a ratio of
+            /// two quantities that both scale by `s`, so it's scale-invariant too. Same
+            /// epsilon/margin rationale as above.
+            #[test]
+            fn invariant_distance_is_scale_invariant(
+                stroke in arb_stroke(),
+                s in 0.1f64..10.0f64,
+            ) {
+                let cfgv = cfg();
+                let scaled = scale_stroke(&stroke, s);
+                let a = analyze(&stroke, &cfgv);
+                let b = analyze(&scaled, &cfgv);
+                prop_assert!(
+                    invariant_distance(a.inv, b.inv) < 0.15,
+                    "scale drifted invariants: {:?} vs {:?}", a.inv, b.inv
+                );
+
+                let dict = dictionary(&cfgv);
+                let before = ranked(&dict, &a, &cfgv);
+                prop_assume!(before.len() >= 2 && before[1].1 - before[0].1 > 0.05);
+                let after = ranked(&dict, &b, &cfgv);
+                prop_assert_eq!(after[0].0, before[0].0, "ranking flipped under scaling");
+            }
+
+            /// (d) TASK1 premetric, part 1: d(a,a) ≈ 0. Already spot-checked for synthetic shapes
+            /// by `dtw_zero_to_self_and_orders_shapes` above; this generalizes it to arbitrary
+            /// strokes. The DP table's diagonal path (matching each window to itself) costs
+            /// exactly 0 by construction (`sig_distance(x,x,_) == 0`), so this should hold near
+            /// machine epsilon, not just "small".
+            #[test]
+            fn distance_is_a_premetric(stroke in arb_stroke()) {
+                let sigs = signature_sequence(&stroke, &cfg());
+                prop_assert!(dtw(&sigs, &sigs, &cfg()) < 1e-9);
+            }
+
+            /// (d) TASK1 premetric, part 2 — documenting REALITY, not the naive claim: `dtw` is
+            /// NOT symmetric in general. Its own doc comment (glyph.rs ~295-301) says so: the DP
+            /// score is normalized by the QUERY length only ("For 1-NN this is constant across
+            /// templates, so ranking == raw DTW... A template-dependent divisor... would dilute
+            /// that"), so `dtw(a,b) != dtw(b,a)` whenever `len(a) != len(b)`. What IS symmetric by
+            /// construction is the UNNORMALIZED DP table: the recurrence's cost function
+            /// (`sig_distance`) is symmetric, and swapping the two input sequences is exactly a
+            /// transpose of the same recurrence, so `dp[n][m]` (== `dtw(a,b) * len(a)`) must equal
+            /// `dp'[m][n]` (== `dtw(b,a) * len(b)`) up to float summation-order noise. This is the
+            /// real (asymmetric) premetric law this codebase implements.
+            #[test]
+            fn dtw_asymmetry_is_exactly_the_query_length_normalization(
+                stroke_a in arb_stroke(),
+                stroke_b in arb_stroke(),
+            ) {
+                let cfgv = cfg();
+                let a = signature_sequence(&stroke_a, &cfgv);
+                let b = signature_sequence(&stroke_b, &cfgv);
+                prop_assume!(!a.is_empty() && !b.is_empty());
+                let d_ab = dtw(&a, &b, &cfgv);
+                let d_ba = dtw(&b, &a, &cfgv);
+                prop_assert!(d_ab >= 0.0 && d_ba >= 0.0);
+                let (na, nb) = (a.len() as f64, b.len() as f64);
+                let (raw_ab, raw_ba) = (d_ab * na, d_ba * nb);
+                let tol = 1e-6 * raw_ab.abs().max(raw_ba.abs()).max(1.0);
+                prop_assert!(
+                    (raw_ab - raw_ba).abs() < tol,
+                    "unnormalized DTW should be swap-symmetric: {raw_ab} vs {raw_ba}"
+                );
+            }
+
+            /// (e) TASK1: uniformly resampling a stroke to a different density (drawn "slower" or
+            /// "faster") must not change which dictionary word wins — the whole point of
+            /// `resample_uniform`/`prepare`'s speed-invariance design (see the `speed_invariant`
+            /// and `prepare_speed_and_size_invariant` tests above). Ranking, not raw score, per
+            /// the house rule: exact-distance equality would be flaky (resampling genuinely
+            /// perturbs the shape a little), but which template wins should not, away from
+            /// near-ties.
+            #[test]
+            fn resample_preserves_the_winner(
+                which in 0usize..4,
+                scale in 0.5f64..2.0,
+                n_sparse in 20usize..40,
+                n_dense in 60usize..120,
+            ) {
+                // Stated on CANONICAL shapes, not arbitrary random walks: earlier rounds of this
+                // law kept rediscovering that an arbitrary scribble sitting near a classifier
+                // decision boundary flips winners under resampling — true, but that's a fact
+                // about decision boundaries, not a recognizer bug (there is no "right answer" to
+                // preserve for a shapeless scribble). The meaningful claim is that for each
+                // dictionary shape — where ground truth EXISTS — the right template wins at every
+                // reasonable capture density and size. No prop_assume domain-carving needed.
+                use std::f64::consts::TAU;
+                let cfgv = cfg();
+                let (name, stroke): (&str, Vec<C>) = match which {
+                    0 => ("circle_cw", synth_circle(96, 300.0, TAU / 96.0)),
+                    1 => ("circle_ccw", synth_circle(96, 300.0, -TAU / 96.0)),
+                    2 => ("line", synth_line(90)),
+                    _ => ("vee", synth_vee(90, 8.0)),
+                };
+                let stroke = scale_stroke(&stroke, scale);
+                let dict = dictionary(&cfgv);
+                for n in [n_sparse, n_dense] {
+                    let variant = resample_uniform(&stroke, n);
+                    let word = analyze(&variant, &cfgv);
+                    let ranking = ranked(&dict, &word, &cfgv);
+                    prop_assert_eq!(
+                        ranking[0].0, name,
+                        "canonical {} at {} samples (scale {}) was misread", name, n, scale
+                    );
+                }
+            }
+
+            /// (g) TASK2: dtw's basic algebraic laws that DO hold by construction: non-negativity
+            /// (every DP cell is a sum of `sig_distance` outputs, which is a `.sqrt()` of a
+            /// nonnegative sum, so never negative) is checked inline above; this is the standalone
+            /// coverage over arbitrary stroke pairs (not just the fixed synthetic shapes in
+            /// `dtw_zero_to_self_and_orders_shapes`). NOTE: "monotone under concatenating
+            /// identical suffixes" (the other candidate law from the task) is NOT true by
+            /// construction here and is deliberately NOT encoded — `signature_sequence` runs the
+            /// whole stroke through curvature-arc resampling (`prepare`) before windowing, so
+            /// appending a suffix to two strokes does not append anything to their Sig sequences;
+            /// it can rescale/reshape the ENTIRE resampled representation (the base sample count,
+            /// the turning-driven growth factor, and every window's boundary all depend globally
+            /// on the whole path). Asserting it would be asserting something the code doesn't
+            /// promise.
+            #[test]
+            fn dtw_is_nonnegative(stroke_a in arb_stroke(), stroke_b in arb_stroke()) {
+                let cfgv = cfg();
+                let a = signature_sequence(&stroke_a, &cfgv);
+                let b = signature_sequence(&stroke_b, &cfgv);
+                prop_assert!(dtw(&a, &b, &cfgv) >= 0.0);
+            }
+        }
+
+        // ── (f) TASK2: robustness — no panics, no infinite loops, on degenerate input ──────────
+
+        /// Run every public (+ intra-module-private, reachable via `super::*`) kernel over `z`.
+        /// `NaN`-in may produce `NaN`-out (that's fine, and observed for several of these paths —
+        /// e.g. `fit`'s Q14 quantization casts a `NaN` intermediate to `0` via Rust's saturating
+        /// float-to-int cast, `C::sqrt` launders a `NaN` discriminant to `0` via `.max(0.0)`); the
+        /// only thing this asserts is that nothing PANICS and nothing loops forever. Indices for
+        /// `phase_boundary_score`/`choose_block_len` are swept only over `0..z.len()`, mirroring
+        /// how `segment` actually calls them (both have `usize` subtraction that underflows for
+        /// out-of-range indices no real caller ever passes — see `choose_block_len`'s
+        /// `z.len() - start` — so that's a separate, not-reachable-from-any-caller finding, not
+        /// exercised here).
+        fn exercise_all_kernels(z: &[C], cfg: &GlyphConfig) {
+            let _ = fit(z);
+            let _ = fit(&velocities(z));
+            let _ = smooth(z, 3);
+            let _ = resample_uniform(z, 24);
+            if z.len() >= 2 {
+                let w = vec![1.0f64; z.len() - 1];
+                let _ = resample_weighted(z, &w, 24);
+            }
+            let _ = segment(z);
+            for at in 0..z.len() {
+                let _ = phase_boundary_score(z, at);
+            }
+            for start in 0..z.len() {
+                let _ = choose_block_len(z, start);
+            }
+            let _ = fit_sequence(z);
+            let _ = prepare(z, cfg);
+            let _ = signature_sequence(z, cfg);
+            let word = analyze(z, cfg);
+            let _ = invariant_distance(word.inv, word.inv);
+            let _ = word_distance(&word, &word, cfg);
+            let _ = dtw(&word.sigs, &word.sigs, cfg);
+            let _ = exemplar_path(z, cfg);
+        }
+
+        #[test]
+        fn no_kernel_panics_on_degenerate_input() {
+            let c = cfg();
+            let cases: Vec<(&str, Vec<C>)> = vec![
+                ("empty", vec![]),
+                ("single_point", vec![C::new(1.0, 2.0)]),
+                ("two_identical_points", vec![C::new(3.0, 3.0), C::new(3.0, 3.0)]),
+                ("all_collinear", (0..40).map(|i| C::new(i as f64, 2.0 * i as f64)).collect()),
+                (
+                    "extreme_magnitude",
+                    vec![
+                        C::new(1e15, -1e15),
+                        C::new(-1e15, 1e15),
+                        C::new(1e15, 1e15),
+                        C::new(-1e15, -1e15),
+                        C::new(0.0, 1e15),
+                    ],
+                ),
+                (
+                    "nan_and_infinity",
+                    vec![
+                        C::new(0.0, 0.0),
+                        C::new(f64::NAN, 1.0),
+                        C::new(2.0, f64::INFINITY),
+                        C::new(f64::NEG_INFINITY, f64::NAN),
+                        C::new(3.0, 4.0),
+                    ],
+                ),
+                ("all_nan", vec![C::new(f64::NAN, f64::NAN); 12]),
+                ("all_infinite", vec![C::new(f64::INFINITY, f64::INFINITY); 8]),
+            ];
+            for (label, z) in cases {
+                // catch_unwind so one failing case doesn't hide the label of the others' results.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    exercise_all_kernels(&z, &c);
+                }));
+                assert!(result.is_ok(), "kernel panicked on degenerate input case: {label}");
+            }
+        }
     }
 }
