@@ -342,7 +342,9 @@ fn capture_control_until(stop: &AtomicBool) -> Option<CapturedControl> {
                 stop.store(true, Ordering::Relaxed);
             }
         },
-        || {},
+        // on_tick: nothing to poll during a one-shot interactive capture. The returned Duration
+        // is a pump-cadence hint for the future blocking-wait rewrite (ignored today).
+        || std::time::Duration::from_millis(5),
     );
     found.get()
 }

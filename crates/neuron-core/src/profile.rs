@@ -192,6 +192,19 @@ impl Profile {
         self.disable_alt_tab || self.disable_win || self.disable_alt_f4 || self.disable_alt_esc
     }
 
+    /// The host-side [`GamingMode`] suppression policy this profile's own flags derive — the ONE
+    /// mapping `apply()`'s `ApplyReport.gaming_mode` and the launch `gaming_hook_policy` reconcile
+    /// unit (`neuron-app`'s `glue.rs`) both consult, so a profile's suppression policy reads the SAME
+    /// whether it came from a live apply or from re-deriving the active profile at startup.
+    pub fn gaming_mode(&self) -> GamingMode {
+        GamingMode::from_profile(
+            self.disable_alt_tab,
+            self.disable_win,
+            self.disable_alt_f4,
+            self.disable_alt_esc,
+        )
+    }
+
     /// A short human label for the lighting stack — the ONE source both `summary()` and the profile
     /// sheet's row badge consult, so a profile's lighting reads the SAME everywhere (no "1 fx" here vs
     /// "Axis" there). A hand-painted/imported frame is `"custom"`; a lone procedural layer names its
@@ -408,12 +421,7 @@ impl Profile {
         }
 
         // --- Gaming-mode: HOST-SIDE policy (no device write). The daemon installs the LL hook. ---
-        r.gaming_mode = GamingMode::from_profile(
-            self.disable_alt_tab,
-            self.disable_win,
-            self.disable_alt_f4,
-            self.disable_alt_esc,
-        );
+        r.gaming_mode = self.gaming_mode();
 
         r
     }

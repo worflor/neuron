@@ -48,6 +48,7 @@
 use neuron::registry::EventKind;
 use neuron::transport::DevicePath;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -72,6 +73,45 @@ const BURST_SPAN: Duration = Duration::from_millis(150);
 const SCROLL_STAGE_MAX: u32 = neuron::intent::SCROLL_STAGE_COUNT as u32;
 /// How often the hotplug monitor re-enumerates to catch a dongle replug / hub glitch / sleep-wake.
 const HOTPLUG_POLL: Duration = Duration::from_secs(20);
+
+/// How many INITIAL-PASS readers still owe an authoritative mute-seed attempt.
+///
+/// `arm_new` sets this BEFORE spawning any reader (a fast reader must not be able to drive it to
+/// zero while we're still discovering the collection whose seed actually matters), and each counted
+/// reader decrements it exactly once when its attempt completes. Whoever takes it to ZERO signals
+/// `Readiness::MicBridge`. A plain per-reader signal would let the FIRST reader to finish — often an
+/// unrelated mouse dialect doing a no-op seed — release the gate while the mic's real seed is still
+/// in flight, letting the `mic_mute` reconcile unit publish a PRE-bridge mute. Only initial-pass
+/// readers participate (`gate_seed`), so later hotplug arms can never underflow it.
+static SEED_PENDING: AtomicUsize = AtomicUsize::new(0);
+
+/// One counted reader's seed attempt finished — it ran, or definitively could not. The last one out
+/// opens the readiness gate. See [`SEED_PENDING`].
+///
+/// SATURATING on purpose. The counter's correctness otherwise rests on a distributed discipline —
+/// exactly one gated enumeration, and exactly one `seed_done` per counted reader — that a future
+/// retry path or a second startup route could violate silently. A plain `fetch_sub` past zero would
+/// wrap to `usize::MAX` and strand the gate for good (the reconcile timeout would mask it, so nobody
+/// would ever notice). Saturating makes the worst case "an extra call does nothing", and only the
+/// real 1→0 transition ever signals.
+fn seed_done() {
+    let prev = SEED_PENDING.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+        Some(n.saturating_sub(1))
+    });
+    if prev == Ok(1) {
+        crate::reconcile::signal_ready(crate::reconcile::Readiness::MicBridge);
+    }
+}
+
+/// Will a reader armed for this collection attempt an AUTHORITATIVE hardware-mute seed?
+///
+/// THE ONE definition — `arm_new`'s countdown and `spawn_reader`'s seed path must agree EXACTLY or
+/// the `MicBridge` gate breaks in one of two silent ways: under-count and it opens before the mic's
+/// real seed has run (the launch race returns), over-count and it never opens without the reconcile
+/// timeout. Both sites call THIS, so the invariant can't drift as reader eligibility evolves.
+fn will_attempt_seed(dialect: Option<&'static dyn neuron::dialect::Dialect>, product: &str) -> bool {
+    dialect.is_some() && !product.is_empty()
+}
 
 /// Verbose discovery logging (`NEURON_HIDWATCH=1`), read once and cached.
 fn verbose() -> bool {
@@ -140,22 +180,61 @@ pub fn start() {
     // Armed collection paths — shared so the monitor and the reader threads (which remove their own
     // path on exit) agree on what's live, so a REPLUG re-arms instead of staying deaf.
     let armed: Arc<Mutex<HashSet<DevicePath>>> = Arc::new(Mutex::new(HashSet::new()));
-    arm_new(&mouse_pids, &armed);
+    // MicBridge readiness. Who owns the signal depends on what the initial pass actually learned —
+    // and the three cases are genuinely different; collapsing them (an earlier version signalled
+    // unconditionally, a later one treated every zero alike) is what reopened the launch race.
+    match arm_new(&mouse_pids, &armed, true) {
+        // ENUMERATION FAILED — we learned nothing. Claiming readiness here would release the
+        // `mic_mute` unit to read a possibly PRE-bridge OS mute, which is exactly the race this
+        // exists to kill. Stay silent: the unit's own timeout backstops it, and the monitor's next
+        // pass re-arms (its bridge then corrects the pill via `notify_hardware_mute`).
+        None => {
+            if verbose() {
+                eprintln!("[hidwatch] initial enumerate failed — MicBridge left to the reconcile timeout");
+            }
+        }
+        // Enumeration OK and nothing will EVER seed (no hardware-mute mic present): the OS mute is
+        // ALREADY truth, so say so now rather than make the unit wait out its full timeout.
+        Some(0) => crate::reconcile::signal_ready(crate::reconcile::Readiness::MicBridge),
+        // Seeds are pending: the LAST reader to finish its attempt opens the gate (see `seed_done`).
+        // Signalling per-reader would let the FIRST one — often an unrelated mouse dialect doing a
+        // no-op seed — release it while the mic's real seed is still in flight.
+        Some(_) => {}
+    }
 
     let mon = armed.clone();
     crate::worker::spawn_detached("neuron-hidwatch-mon", move || loop {
         thread::sleep(HOTPLUG_POLL);
-        arm_new(&mouse_pids, &mon);
+        // `gate_seeds = false`: the MicBridge countdown belongs to the INITIAL pass only — it has
+        // long since run out (or been backstopped by the reconcile timeout) by the time a hotplug
+        // arm lands, and decrementing it here would underflow. A late-arriving mic still corrects
+        // the pill through its own bridge → `notify_hardware_mute` push.
+        arm_new(&mouse_pids, &mon, false);
     });
 }
 
 /// Enumerate and spawn a reader for any event-carrying mouse collection not already armed.
-fn arm_new(mouse_pids: &HashSet<u16>, armed: &Arc<Mutex<HashSet<DevicePath>>>) {
+///
+/// `None` means ENUMERATION ITSELF FAILED — we learned nothing, which is NOT the same as "there is
+/// nothing to arm" and must never be read as one (see `start`). `Some(n)` = enumeration succeeded and
+/// `n` newly-armed readers will each attempt an AUTHORITATIVE hardware-mute seed.
+///
+/// `gate_seeds` makes those `n` readers participate in the [`SEED_PENDING`] countdown that opens the
+/// `MicBridge` readiness gate — true only for the INITIAL pass; a later hotplug arm must not touch a
+/// countdown that has already run out.
+fn arm_new(
+    mouse_pids: &HashSet<u16>,
+    armed: &Arc<Mutex<HashSet<DevicePath>>>,
+    gate_seeds: bool,
+) -> Option<usize> {
     let infos = match neuron::transport::enumerate() {
         Ok(v) => v,
-        Err(_) => return,
+        Err(_) => return None, // enumeration failed — say so; do NOT report it as "nothing found"
     };
-    let mut spawned = 0usize;
+    // PHASE 1 — decide and claim, spawning NOTHING yet. The seed countdown must be fully known before
+    // any reader starts: a fast reader could otherwise finish its seed and drive the count to zero,
+    // opening the readiness gate, while we are still discovering the collection whose seed matters.
+    let mut to_spawn = Vec::new();
     for info in infos {
         // Three ways a readable collection earns a reader — each carries its OWN vendor/shape gate,
         // so there is no blanket VID filter above them (an earlier `vid != RAZER_VID continue` made
@@ -190,12 +269,31 @@ fn arm_new(mouse_pids: &HashSet<u16>, armed: &Arc<Mutex<HashSet<DevicePath>>>) {
         if !armed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(info.path.clone()) {
             continue;
         }
-        spawn_reader(info.pid, info.path.clone(), armed.clone(), event_def, event_dialect, info.product.clone());
-        spawned += 1;
+        // The SAME predicate `spawn_reader`'s seed path uses — see `will_attempt_seed`.
+        let will_seed = will_attempt_seed(event_dialect, &info.product);
+        to_spawn.push((info, event_def, event_dialect, will_seed));
+    }
+    let audio_seeds = to_spawn.iter().filter(|(_, _, _, seed)| *seed).count();
+    // PHASE 2 — arm the countdown FIRST, then spawn. Now no reader can outrun the discovery above.
+    if gate_seeds && audio_seeds > 0 {
+        SEED_PENDING.store(audio_seeds, Ordering::SeqCst);
+    }
+    let spawned = to_spawn.len();
+    for (info, event_def, event_dialect, will_seed) in to_spawn {
+        spawn_reader(
+            info.pid,
+            info.path.clone(),
+            armed.clone(),
+            event_def,
+            event_dialect,
+            info.product.clone(),
+            gate_seeds && will_seed,
+        );
     }
     if verbose() && spawned > 0 {
         eprintln!("[hidwatch] armed {spawned} collection(s)");
     }
+    Some(audio_seeds)
 }
 
 fn spawn_reader(
@@ -205,6 +303,10 @@ fn spawn_reader(
     def: Option<&'static neuron::registry::DeviceDef>,
     dialect: Option<&'static dyn neuron::dialect::Dialect>,
     product: String,
+    // `gate_seed`: this reader is one of the INITIAL pass's counted seeds — it must call `seed_done`
+    // exactly once when its authoritative-seed attempt completes (or definitively can't run), so the
+    // last one out opens the `MicBridge` gate. See `SEED_PENDING`.
+    gate_seed: bool,
 ) {
     let tag = format!("pid={pid:04x}");
     // Record this collection's product string in the emergent capability surface (see
@@ -227,6 +329,9 @@ fn spawn_reader(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .remove(&release_path);
+            // Drop the mute-edge baseline too, so a replug of this path re-seeds from a fresh
+            // authoritative read instead of comparing against a stale pre-unplug value.
+            forget_mute_baseline(&release_path);
         },
         move || {
             let reader = match neuron::transport::open_reader(&path) {
@@ -234,6 +339,11 @@ fn spawn_reader(
                 Err(e) => {
                     if verbose() {
                         eprintln!("[hidwatch] {tag}: not readable ({e})");
+                    }
+                    // This counted seed will never run — settle the countdown anyway, or the gate
+                    // would wait on a reader that has already given up.
+                    if gate_seed {
+                        seed_done();
                     }
                     return; // release un-claims `path`; the monitor retries later
                 }
@@ -246,13 +356,30 @@ fn spawn_reader(
             // transport on the same collection (the reader handle above is INPUT-only); any failure
             // (device asleep, not this family) is silently skipped — this is a seed, not a requirement.
             // Runs on this reader's own thread, before the read loop starts, so it costs no extra thread.
-            if let Some(d) = dialect {
-                if !product.is_empty() {
+            // THE seed path — gated by the SAME `will_attempt_seed` predicate `arm_new` counted with,
+            // so the countdown and this can never drift apart.
+            if will_attempt_seed(dialect, &product) {
+                if let Some(d) = dialect {
                     if let Ok(t) = neuron::transport::open_path(&path) {
                         if let Some(muted) = d.read_audio_mute(t.as_ref()) {
+                            // Seed the mute-edge baseline from this authoritative read BEFORE the
+                            // reader loop runs, so the device's first report is compared against real
+                            // prior state instead of being fired as a phantom tap (a startup /
+                            // reconnect heartbeat is not a user action). `bridge_mic_mute` mirrors it
+                            // to the OS; this records what the HW edge detector should treat as "was".
+                            seed_mute_baseline(&path, muted);
                             bridge_mic_mute(&product, muted);
                         }
                     }
+                }
+                // This collection's bridge step has now COMPLETED — it either seeded the OS mute from
+                // hardware truth, or definitively could not (asleep / unreadable / not this family),
+                // which waiting longer cannot improve. Settle the countdown EITHER WAY; the LAST
+                // counted reader to get here opens the `MicBridge` gate. `start()` deliberately does
+                // not pre-signal while any seed is pending — that would release the `mic_mute` unit
+                // to read the PRE-bridge OS mute, the exact race the reconciler exists to kill.
+                if gate_seed {
+                    seed_done();
                 }
             }
             let mut buf = [0u8; 64];
@@ -266,7 +393,7 @@ fn spawn_reader(
                             }
                             eprintln!();
                         }
-                        decode(&buf[..n], pid, def, dialect, &product);
+                        decode(&buf[..n], pid, &path, def, dialect, &product);
                         // lazy battery freshness — piggyback on activity (the device is awake; it's
                         // sending reports), throttled, off-thread so a slow open never stalls reads.
                         if neuron::vitals::due(pid, false) {
@@ -386,6 +513,64 @@ pub fn mute_writable_products() -> Vec<String> {
 /// state; (2) `mic_state::publish_hardware` so the shared provider (and anything reading it, like the
 /// `miclight` pattern) flips instantly instead of waiting for its own next sample; (3) the UI nudge
 /// last, once the truth it will read is already settled.
+/// Per-device last-seen hardware mute state — so a repeated / retransmitted / heartbeat mute report
+/// doesn't re-fire the tap. Keyed by the collection's [`DevicePath`], NOT the pid: two identical
+/// mics share a pid but are distinct paths, and pid-keying would let their reports overwrite each
+/// other's baseline (hiding a real tap, or manufacturing an edge as activity alternates).
+fn mute_state() -> &'static Mutex<HashMap<DevicePath, bool>> {
+    static LAST: OnceLock<Mutex<HashMap<DevicePath, bool>>> = OnceLock::new();
+    LAST.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Record the baseline mute state established WITHOUT a user action — the arm-time AUTHORITATIVE
+/// SEED's hardware read. Because it seeds the baseline, the FIRST report the reader then decodes is
+/// compared against real prior state instead of being taken as an edge on faith, so a startup /
+/// reconnect heartbeat can't manufacture a phantom tap.
+fn seed_mute_baseline(path: &DevicePath, muted: bool) {
+    mute_state()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(path.clone(), muted);
+}
+
+/// Drop a device's baseline when its reader exits, so a stale entry can't linger across a replug.
+fn forget_mute_baseline(path: &DevicePath) {
+    mute_state()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(path);
+}
+
+/// Did this report's mute state CHANGE from what we last knew for this device? Returns `true` on a
+/// genuine flip. A first report with NO prior baseline (a device that couldn't be seeded — asleep /
+/// unreadable at arm time) is honestly `true`: we have no state proving it isn't a real tap, and the
+/// safe direction for an unseeded device is to surface the user's action, not swallow it. Once a
+/// seed OR a first report has established a baseline, every repeat is correctly deduped.
+fn mute_state_changed(path: &DevicePath, muted: bool) -> bool {
+    match mute_state()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(path.clone(), muted)
+    {
+        Some(prev) => prev != muted,
+        None => true,
+    }
+}
+
+/// A PHYSICAL mic tap fires `Trigger::MicTap` and its synthetic raw-Input twin, through the same
+/// engine seam a hardware button uses (`dispatch::inject_trigger`), so it composes with HyperShift
+/// layers / intents / SAFE-mode exactly like any other control. Mirrors the pair the dispatch
+/// detector fires — but sourced from the HID edge, so it is immediate and needs no inference.
+fn fire_mic_tap(pid: u16) {
+    crate::dispatch::inject_trigger(neuron::engine::Trigger::MicTap);
+    let (page, usage) = neuron::controls::MIC_TAP;
+    crate::dispatch::inject_trigger(neuron::engine::Trigger::Input {
+        page,
+        usage,
+        pid: Some(pid),
+    });
+}
+
 fn bridge_mic_mute(product: &str, muted: bool) {
     if product.trim().is_empty() {
         // No USB product string → we cannot identify WHICH capture endpoint pushed this, and a
@@ -411,7 +596,17 @@ fn bridge_mic_mute(product: &str, muted: bool) {
         // cross-device write.
         if let Some(ep) = neuron::audio::find_capture(&product) {
             if let Some(ctl) = neuron::audio::VolumeCtl::open(&ep.id) {
-                ctl.set_mute(muted);
+                // Mirror the hardware mute to the OS. `set_mute` returns whether it actually changed
+                // the state — only THEN open the mic-tap self-write window, so the dispatch poll
+                // doesn't double-fire on the OS transition we just caused (this bridge already
+                // surfaces the physical tap via `fire_mic_tap`). A no-op write (the OS mute already
+                // matched hardware — the common launch-seed case) opens no window, so it can't shadow
+                // a real tap. ONLY the DEFAULT endpoint arms the process-global window: this bridge is
+                // DEVICE-PRECISE, and a secondary mic's transition must not shadow the default's.
+                let changed = ctl.set_mute(muted);
+                if changed && neuron::audio::is_default_capture_id(&ep.id) {
+                    neuron::mic_state::note_self_mute_write();
+                }
             }
         }
         neuron::mic_state::publish_hardware(muted);
@@ -432,6 +627,7 @@ fn bridge_mic_mute(product: &str, muted: bool) {
 fn decode(
     buf: &[u8],
     pid: u16,
+    path: &DevicePath,
     def: Option<&'static neuron::registry::DeviceDef>,
     dialect: Option<&'static dyn neuron::dialect::Dialect>,
     product: &str,
@@ -445,6 +641,23 @@ fn decode(
     // payload read are pure (`mute_event_state`) so tests pin them without touching the OS mute.
     if let Some(muted) = mute_event_state(buf, def, dialect) {
         bridge_mic_mute(product, muted);
+        // Fire MicTap on the mute-state EDGE only. `mute_event_state` reports the state a report
+        // CARRIES, not that it changed — a device that repeats/retransmits an unchanged mute report
+        // (or heartbeats it), or the FIRST report after an arm-time seed, would otherwise fire the
+        // tap (and its raw-input twin, and any bound
+        // actions) again for no user action. Dedup per device against its last seen state.
+        if mute_state_changed(path, muted) {
+            // THE physical tap fires MicTap — from the HID edge we just decoded (GROUND TRUTH), not
+            // by inferring it back out of the OS mute `bridge_mic_mute` is about to write. That write
+            // is neuron's OWN, so the dispatch detector declines to credit it to the user (see
+            // `mic_state`'s self-write window) — which is what stops a double-fire, and is also why
+            // firing HERE is mandatory: without it a physical Seiren tap would run NO MicTap bindings
+            // at all. Firing from the HID edge is also INSTANT — no ~400ms cache lag.
+            //
+            // The launch AUTHORITATIVE SEED reaches `bridge_mic_mute` by a DIFFERENT path (a direct
+            // getter read, not this report handler), so it never fires a tap for boot state.
+            fire_mic_tap(pid);
+        }
         return;
     }
     // 04-FAMILY: the DRIVER-MODE deferred-button vocabulary (see module header). The firmware, having
@@ -983,6 +1196,12 @@ mod tests {
     // settle threads can't interleave across tests.
     static BATCH_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+    /// A stable test device path for `feed`'s reports (DPI/scroll/plate — none touch the mute-edge
+    /// map, so one shared path is fine). Mute-dedup tests build their OWN distinct paths.
+    fn test_path() -> neuron::transport::DevicePath {
+        neuron::transport::DevicePath::from_str_for_tests("test-decode-pipe")
+    }
+
     // Drive one device-pushed report through the real decode path. `b1` is the report kind byte.
     fn feed(b1: u8, b2: u8, b3: u8) {
         let mut buf = [0u8; 16];
@@ -990,7 +1209,7 @@ mod tests {
         buf[1] = b1;
         buf[2] = b2;
         buf[3] = b3;
-        decode(&buf, NAGA_PID, None, None, "");
+        decode(&buf, NAGA_PID, &test_path(), None, None, "");
     }
     fn dpi_report(dpi: u16) {
         let [hi, lo] = dpi.to_be_bytes();
@@ -1119,8 +1338,36 @@ mod tests {
     fn decode_ignores_short_or_foreign_reports() {
         // the existing guards must still hold — a non-0x05 lead byte or a too-short buffer is a no-op
         // (no panic), so the new arm can't destabilize the DPI/scroll/charge decoding.
-        decode(&[0x05, 0x0e], NAGA_PID, None, None, ""); // too short (< 6) — guarded
-        decode(&[0x02, 0x0e, 0x03, 0, 0, 0], NAGA_PID, None, None, ""); // neither 04 nor 05 lead byte — guarded
+        decode(&[0x05, 0x0e], NAGA_PID, &test_path(), None, None, ""); // too short (< 6) — guarded
+        decode(&[0x02, 0x0e, 0x03, 0, 0, 0], NAGA_PID, &test_path(), None, None, ""); // neither 04 nor 05 lead — guarded
+    }
+
+    #[test]
+    fn mute_edge_dedups_per_device_and_a_seed_prevents_a_phantom_first_tap() {
+        // The two hidwatch mute-edge bugs, pinned. `mute_state_changed` fires only on a genuine flip,
+        // keyed by DEVICE PATH (not pid, which two identical mics share), and an arm-time seed means
+        // the first report after startup is compared to real prior state, not fired on faith.
+        let a = neuron::transport::DevicePath::from_str_for_tests("mic-A");
+        let b = neuron::transport::DevicePath::from_str_for_tests("mic-B"); // same model → same pid, different path
+        forget_mute_baseline(&a);
+        forget_mute_baseline(&b);
+
+        // No seed: the first report has no prior state, so it IS treated as an edge (honest — we
+        // can't prove it isn't a real tap on an unseeded device).
+        assert!(mute_state_changed(&a, true), "first report with no baseline is an edge");
+        assert!(!mute_state_changed(&a, true), "a repeat / heartbeat of the same state is NOT");
+        assert!(mute_state_changed(&a, false), "a genuine flip is an edge");
+
+        // A SEED establishes the baseline, so the first REPORT that merely echoes it is NOT a tap —
+        // this is what stops a startup/reconnect heartbeat from firing every MicTap binding.
+        seed_mute_baseline(&b, true); // arm-time authoritative read said "muted"
+        assert!(!mute_state_changed(&b, true), "the first report equals the seed → no phantom tap");
+        assert!(mute_state_changed(&b, false), "a real change away from the seed fires");
+
+        // Per-DEVICE: B's activity must not have disturbed A's baseline (pid-keying would alias them).
+        assert!(!mute_state_changed(&a, false), "A still remembers its own last state, independent of B");
+        forget_mute_baseline(&a);
+        forget_mute_baseline(&b);
     }
 
     #[test]

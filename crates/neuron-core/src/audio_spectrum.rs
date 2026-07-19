@@ -380,12 +380,32 @@ fn tilt_db(i: usize) -> f32 {
     TILT_DB_PER_OCT * (band_center_hz(i) / TILT_REF_HZ).log2()
 }
 
+/// Reusable FFT work buffers for [`tilted_band_dbs`] — `re`/`im`, both fixed at [`FFT_N`]. Owned by
+/// the per-thread [`Loudness`] state and rewritten in full every call, so hoisting them out of the
+/// ~60Hz hot path avoids two fresh `Vec<f32>` allocations (~16KB) per tick with no behavior change.
+struct ScratchBufs {
+    re: Vec<f32>,
+    im: Vec<f32>,
+}
+
+impl ScratchBufs {
+    fn new() -> ScratchBufs {
+        ScratchBufs {
+            re: vec![0.0f32; FFT_N],
+            im: vec![0.0f32; FFT_N],
+        }
+    }
+}
+
 /// Window + FFT the last [`FFT_N`] samples of `ring` (zero-padded in front while it fills) and
 /// return each band's TILTED level in dB (a full-scale sine reads ~0dB pre-tilt). The weighting
-/// stage the loudness sum and the silence gate both read.
-fn tilted_band_dbs(ring: &[f32], rate: u32) -> [f32; BANDS] {
-    let mut re = vec![0.0f32; FFT_N];
-    let mut im = vec![0.0f32; FFT_N];
+/// stage the loudness sum and the silence gate both read. `scratch` holds the FFT work buffers,
+/// reused call-to-call (both zeroed here since `fft` leaves them non-zero on return).
+fn tilted_band_dbs(ring: &[f32], rate: u32, scratch: &mut ScratchBufs) -> [f32; BANDS] {
+    let re = &mut scratch.re;
+    let im = &mut scratch.im;
+    re.fill(0.0);
+    im.fill(0.0);
     let n = ring.len().min(FFT_N);
     let pad = FFT_N - n;
     for (k, &s) in ring[ring.len() - n..].iter().enumerate() {
@@ -393,7 +413,7 @@ fn tilted_band_dbs(ring: &[f32], rate: u32) -> [f32; BANDS] {
         let w = 0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / FFT_N as f32).cos();
         re[i] = s * w;
     }
-    fft(&mut re, &mut im);
+    fft(re, im);
     let ranges = band_bin_ranges(rate);
     let scale = 4.0 / FFT_N as f32; // Hann coherent gain 0.5 → sine peak bin ≈ N/4
     let mut out = [0.0f32; BANDS];
@@ -472,6 +492,8 @@ impl Chan {
 struct Loudness {
     chans: [Chan; REGIONS],
     tone: f32,
+    /// Reused FFT work buffers for [`tilted_band_dbs`] — see [`ScratchBufs`].
+    scratch: ScratchBufs,
 }
 
 impl Loudness {
@@ -479,6 +501,7 @@ impl Loudness {
         Loudness {
             chans: [Chan::new(), Chan::new(), Chan::new(), Chan::new()],
             tone: 0.0,
+            scratch: ScratchBufs::new(),
         }
     }
 }
@@ -501,7 +524,7 @@ impl Loudness {
 /// ~[`TONE_TAU_S`] — the "what does it sound like" axis. Held (not drained) through silence: with
 /// the level at 0 the colour is invisible anyway, and holding avoids a re-entry jump.
 fn analyze(ring: &[f32], rate: u32, dt: f32, st: &mut Loudness) -> Signal {
-    let dbs = tilted_band_dbs(ring, rate);
+    let dbs = tilted_band_dbs(ring, rate, &mut st.scratch);
     let max_db = dbs.iter().cloned().fold(f32::MIN, f32::max);
     let live_signal = max_db >= GATE_DB;
     let dt = dt.max(0.0);
@@ -664,11 +687,12 @@ mod tests {
         // the weighting stage must still be a real spectrum: 100Hz lands in a LOW band, 8kHz in a
         // HIGH one — that's what makes the loudness spectral, not just an RMS.
         let rate = 48_000u32;
-        let low = tilted_band_dbs(&sine(100.0, 0.8, rate, FFT_N), rate);
+        let mut scratch = ScratchBufs::new();
+        let low = tilted_band_dbs(&sine(100.0, 0.8, rate, FFT_N), rate, &mut scratch);
         let low_peak = low.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
         assert!(low_peak < BANDS / 3, "100Hz reads as bass (band {low_peak})");
 
-        let high = tilted_band_dbs(&sine(8_000.0, 0.8, rate, FFT_N), rate);
+        let high = tilted_band_dbs(&sine(8_000.0, 0.8, rate, FFT_N), rate, &mut scratch);
         let high_peak = high.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
         assert!(high_peak > BANDS * 2 / 3, "8kHz reads as treble (band {high_peak})");
     }
@@ -929,8 +953,9 @@ mod tests {
                 let mut shifted = buf.clone();
                 shifted.rotate_left(shift % FFT_N);
 
-                let c1 = band_centroid(&tilted_band_dbs(&buf, rate));
-                let c2 = band_centroid(&tilted_band_dbs(&shifted, rate));
+                let mut scratch = ScratchBufs::new();
+                let c1 = band_centroid(&tilted_band_dbs(&buf, rate, &mut scratch));
+                let c2 = band_centroid(&tilted_band_dbs(&shifted, rate, &mut scratch));
                 // Principled tolerance: the law is "the music didn't move bands", so the bound is
                 // HALF A BAND WIDTH on the [0,1] band-index centroid — not a hand-tuned epsilon.
                 // (The real-tone ±bin image interference described above peaks near the top band
@@ -957,8 +982,9 @@ mod tests {
                 let rate = 48_000u32;
                 let hz2 = (hz1 * mult).min(15_000.0);
                 prop_assume!(hz2 >= hz1 * 1.5);
-                let c1 = band_centroid(&tilted_band_dbs(&sine(hz1, 0.8, rate, FFT_N), rate));
-                let c2 = band_centroid(&tilted_band_dbs(&sine(hz2, 0.8, rate, FFT_N), rate));
+                let mut scratch = ScratchBufs::new();
+                let c1 = band_centroid(&tilted_band_dbs(&sine(hz1, 0.8, rate, FFT_N), rate, &mut scratch));
+                let c2 = band_centroid(&tilted_band_dbs(&sine(hz2, 0.8, rate, FFT_N), rate, &mut scratch));
                 prop_assert!(c2 > c1, "higher tone ({hz2}Hz, centroid {c2}) didn't rank above the lower one ({hz1}Hz, centroid {c1})");
             }
 
@@ -1017,7 +1043,8 @@ mod tests {
             ) {
                 let ring: Vec<f32> = pattern.iter().cycle().take(FFT_N).copied().collect();
 
-                let dbs = tilted_band_dbs(&ring, rate); // must not panic
+                let mut scratch = ScratchBufs::new();
+                let dbs = tilted_band_dbs(&ring, rate, &mut scratch); // must not panic
                 prop_assert_eq!(dbs.len(), BANDS);
 
                 let mut st = Loudness::new();

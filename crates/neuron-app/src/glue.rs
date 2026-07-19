@@ -128,6 +128,15 @@ fn endpoint_mute_writable(endpoint_name: &str) -> bool {
 /// by the dispatch loop's Core-Audio mic-tap (device-correct for the default mic), so it isn't
 /// force-set here from an arbitrary source.
 pub fn notify_hardware_mute(product: &str, muted: bool) {
+    // THE PILL: ungated on SELECTION (it used to require `selected_device_kind() == "mic"`, which is
+    // ~never true at launch — a mouse/kbd auto-selects first — silently dropping hidwatch's own
+    // launch-time correction; that was the bug). But still gated on device IDENTITY, which is a
+    // DIFFERENT question: the pill speaks for the DEFAULT capture endpoint, so a hardware-mute push
+    // from a SECONDARY mic must not publish its state as the default's (nor seed the tap baseline
+    // with unrelated state). Selection must never decide truth; identity must.
+    if neuron::audio::default_capture_matches_product(product) {
+        publish_mic_state(muted);
+    }
     let Some(weak) = UI.get() else { return };
     let product = product.to_string();
     let weak = weak.clone();
@@ -142,8 +151,148 @@ pub fn notify_hardware_mute(product: &str, muted: bool) {
             .is_some_and(|n| neuron::audio::endpoint_matches_product(&n, &product))
         {
             st.set_device_muted(muted);
-            st.set_mic_muted(muted);
             patch_selected_audio_detail(&st);
+        }
+    });
+}
+
+/// The dispatch mic-tap detector's edge baseline — SHARED (not a per-worker private field) so
+/// EVERY [`publish_mic_state`] call, whatever thread it comes from, immediately becomes what
+/// dispatch's next sample compares against. Without this, a correction that reaches the UI by a
+/// path dispatch doesn't see (the launch reconcile unit's own read, a manual "refresh mic") could
+/// still be misread, on dispatch's own NEXT poll, as a fresh external edge purely because
+/// dispatch's own previous sample predates the correction — independent of the echo latch
+/// (`neuron::mic_state`'s `note_self_mute_write`/`take_self_mute_write`), which instead
+/// distinguishes a genuine echo of neuron's OWN OS-mute write from a real external one.
+static MIC_TAP_BASELINE: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
+
+/// The dispatch mic-tap detector's current baseline (see [`MIC_TAP_BASELINE`]'s doc).
+pub(crate) fn mic_tap_baseline() -> Option<bool> {
+    *MIC_TAP_BASELINE.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// THE single authoritative writer of `State.mic-muted` — every mic-state source (the launch
+/// `mic_mute` reconcile unit, `hidwatch`'s hardware-mute bridge via [`notify_hardware_mute`], the
+/// dispatch mic-tap poll, and a manual "refresh mic") funnels through here; nothing else may call
+/// `set_mic_muted`. No selection gate, no delta gate — it always publishes the CURRENT truth, which
+/// is what fixes the launch-seeding bug (`mic::refresh`'s old too-early read raced hidwatch's
+/// hardware bridge and nothing unconditional ever corrected it before this).
+///
+/// Also seeds [`MIC_TAP_BASELINE`] so THIS publish can never later read, on dispatch's own next
+/// sample, as a phantom edge it must react to.
+pub fn publish_mic_state(muted: bool) {
+    // Idempotent: if the pill already shows this exact value there is nothing to do — skip the UI
+    // post AND the flight trace, so the dispatch poll (which calls this every ~50ms) can't spam the
+    // flight ring or the event loop with no-op republishes. Only a genuine change (or the first
+    // seed, when the baseline is still None) falls through.
+    {
+        let mut base = MIC_TAP_BASELINE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *base == Some(muted) {
+            return;
+        }
+        *base = Some(muted);
+    }
+    crate::flight::trace("reconcile", "mic published", muted as u64);
+    let Some(weak) = UI.get() else { return };
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(app) = weak.upgrade() {
+            app.global::<State>().set_mic_muted(muted);
+        }
+    });
+}
+
+/// Register every reconcile unit this app owns + start the worker. Called once from `main`, after
+/// every subsystem a unit's `Readiness` depends on has at least been ASKED to start (`hidwatch::
+/// start`, `beacon::start`) — the units themselves are gated on their own `Readiness`/timeout, so
+/// the exact call order relative to THIS function doesn't matter; it just needs to run before the
+/// one `reconcile::request(Scope::All)` main fires at the end of startup.
+pub fn reconcile_setup() {
+    use crate::reconcile::{Readiness, ReconcileUnit, Truth};
+    crate::reconcile::register(ReconcileUnit::new("mic_mute", &[Readiness::MicBridge], || {
+        // RESOLVE: the default capture endpoint's real OS mute — the exact read `mic::refresh`
+        // and `beacon::audio_cache` already use. No mic resolves (or no volume handle opens) →
+        // `Truth::Unknown` — a bool pill has no "unknown" state to show, and the panel's own
+        // "(no capture device)" readout already owns that story, so PUBLISH below simply skips.
+        let truth: Truth<bool> = neuron::audio::resolve_capture(None)
+            .and_then(|ep| neuron::audio::VolumeCtl::open(&ep.id))
+            .map_or(Truth::Unknown, |ctl| Truth::Read(ctl.get_mute()));
+        // RECORD: the one authoritative writer — never invents a value for `Unknown`.
+        if let Truth::Read(m) = truth {
+            publish_mic_state(m);
+        }
+    }));
+    // CHUNK C — gaming-mode suppression policy is otherwise DEAD after every reboot: nothing else
+    // re-applies the active profile's `GamingMode` at launch, so a gaming profile's Alt+Tab/Win/
+    // Alt+F4 suppression silently does nothing until the user happens to re-apply a profile by hand.
+    // Pure config -> process-local hook policy, no device I/O, so it needs no `Readiness` at all.
+    crate::reconcile::register(ReconcileUnit::new("gaming_hook_policy", &[], || {
+        // RESOLVE + RECORD in one call: `set_gaming_policy` is the SAME public entry point
+        // `on_apply_gaming_mode`/`on_apply_profile` use (glue.rs), so this can never grow a second,
+        // divergent hook-reconcile mechanism.
+        crate::dispatch::set_gaming_policy(gaming_policy_for_active_profile());
+    }));
+    // CHUNK D — the HyperScroll active-stage editor showed a hardcoded "tactile/free" literal
+    // forever (ui/state.slint): nothing persists a chosen scroll-stage/table anywhere (no Profile
+    // field, no Prefs field, no device getter — writes.rs's scroll-stage commands are SET-ONLY), so
+    // there is no honest value to assert. `Truth::Unknown` is the truthful answer; deps `&[]` because
+    // no readiness would ever change that answer.
+    crate::reconcile::register(ReconcileUnit::new("scroll_stage", &[], || {
+        publish_scroll_stage(scroll_stage_truth());
+    }));
+    crate::reconcile::start();
+}
+
+/// CHUNK C's RESOLVE step, factored out so a test can drive it without the UI: the ACTIVE profile's
+/// `GamingMode`, via the SAME derivation `Profile::apply`'s `ApplyReport.gaming_mode` uses
+/// (`Profile::gaming_mode`) — never a second copy of the flag->policy mapping. No active profile this
+/// process lifetime (`neuron::profile::active()` is `""`) or a name that no longer resolves to a
+/// profile file both collapse to `GamingMode::default()` — the honest "no gaming profile" answer
+/// (suppress nothing), not a skip.
+pub(crate) fn gaming_policy_for_active_profile() -> neuron::writes::GamingMode {
+    let name = neuron::profile::active();
+    if name.is_empty() {
+        return neuron::writes::GamingMode::default();
+    }
+    neuron::profile::Profile::load(&name)
+        .map(|p| p.gaming_mode())
+        .unwrap_or_default()
+}
+
+/// CHUNK D's RESOLVE step. See [`reconcile_setup`]'s doc: investigated every persistence surface
+/// (Profile fields, Prefs, the device) and found no source that would make anything BUT
+/// `Truth::Unknown` honest here. Kept as its own function (rather than inlined) so the "no fake
+/// literal" contract stays independently testable.
+fn scroll_stage_truth() -> crate::reconcile::Truth<String> {
+    crate::reconcile::Truth::Unknown
+}
+
+/// CHUNK D's RECORD step: publish `truth` to the HyperScroll editor field the UI reads
+/// (`State.scroll-stages`), replacing the old hardcoded `"tactile/free"` Slint default. `Unknown`
+/// renders the same dash convention as `sniper-button`'s "unset" state, and is explicitly marked
+/// invalid so the apply button stays disabled until the user actually types a real value — no
+/// fabricated "N modes ready" for a table nobody ever set.
+fn publish_scroll_stage(truth: crate::reconcile::Truth<String>) {
+    let Some(weak) = UI.get() else { return };
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(app) = weak.upgrade() {
+            let st = app.global::<State>();
+            match truth {
+                crate::reconcile::Truth::Read(v) | crate::reconcile::Truth::Asserted(v) => {
+                    st.set_scroll_stages(v.into());
+                    sync_scroll_stage_editor(&st);
+                }
+                crate::reconcile::Truth::Unknown => {
+                    st.set_scroll_stages("\u{2014}".into());
+                    st.set_scroll_stages_valid(false);
+                    st.set_scroll_stages_note(
+                        "no scroll-stage source persisted — pick tactile/free and apply".into(),
+                    );
+                }
+            }
         }
     });
 }
@@ -1388,7 +1537,20 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 let st = app.global::<State>();
                 if let Some(id) = selected_audio_id(&st) {
                     if let Some(ctl) = neuron::audio::VolumeCtl::open(&id) {
-                        let muted = ctl.toggle_mute();
+                        // Is this the DEFAULT capture endpoint — the one the mic-tap detector samples
+                        // and the pill represents? A toggle on a non-default mic row or an OUTPUT
+                        // endpoint touches neither.
+                        let is_default_mic = st.get_selected_device_kind() == "mic"
+                            && neuron::audio::resolve_capture(None).is_some_and(|e| e.id == id);
+                        let muted = ctl.toggle_mute(); // a toggle always changes state
+                        if is_default_mic {
+                            // Open the self-write window (a toggle IS a real transition) so the
+                            // detector doesn't fire MicTap for our own write; the ~1s window opens
+                            // well inside the ~400ms cache lag, so no race. Then push the pill so the
+                            // UI reflects it instantly rather than waiting for the poll.
+                            neuron::mic_state::note_self_mute_write();
+                            publish_mic_state(muted);
+                        }
                         st.set_device_muted(muted);
                         patch_selected_audio_detail(&st);
                         st.set_status_line(
@@ -10286,6 +10448,189 @@ mod macro_canvas_tests {
         assert!(src.contains("neuron.type_text(\"hi\")"));
         assert!(src.contains("if neuron.ask(\"go?\"):"));
         assert!(src.contains("neuron.hotkey(\"ctrl\", \"c\")"));
+    }
+}
+
+#[cfg(test)]
+mod reconcile_units_tests {
+    //! CHUNK C (gaming-mode) + CHUNK D (scroll-stage) — the two launch-reconcile units this file
+    //! registers in [`reconcile_setup`]. These drive the REAL resolve fns (`gaming_policy_for_active_profile`,
+    //! `scroll_stage_truth`) and the REAL publish path (`neuron::hook::set_policy`/`policy()` via
+    //! `crate::dispatch::set_gaming_policy`), not just a compile check.
+    use super::*;
+    use neuron::writes::GamingMode;
+
+    /// Serializes every test in this module: `neuron::hook`'s desired-policy cell and
+    /// `neuron::profile::active()`'s cursor are both process-global. Mirrors
+    /// `reconcile::RECONCILE_TEST_LOCK` / `controls::INJECT_TEST_LOCK`.
+    static GAMING_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    // ── gaming-mode derivation (pure) ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn gaming_mode_derivation_matches_each_profile_flag() {
+        let _guard = GAMING_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut p = neuron::profile::Profile::default();
+        p.disable_alt_tab = true;
+        p.disable_win = false;
+        p.disable_alt_f4 = true;
+        p.disable_alt_esc = false;
+        let gm = p.gaming_mode();
+        assert!(gm.disable_alt_tab);
+        assert!(!gm.disable_win);
+        assert!(gm.disable_alt_f4);
+        assert!(!gm.disable_alt_esc);
+    }
+
+    #[test]
+    fn gaming_mode_derivation_all_flags_set() {
+        let _guard = GAMING_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut p = neuron::profile::Profile::default();
+        p.disable_alt_tab = true;
+        p.disable_win = true;
+        p.disable_alt_f4 = true;
+        p.disable_alt_esc = true;
+        let gm = p.gaming_mode();
+        assert!(gm.disable_alt_tab && gm.disable_win && gm.disable_alt_f4 && gm.disable_alt_esc);
+    }
+
+    #[test]
+    fn gaming_mode_derivation_no_flags_is_default() {
+        let _guard = GAMING_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let p = neuron::profile::Profile::default();
+        assert_eq!(p.gaming_mode(), GamingMode::default());
+        assert!(!p.gaming_mode().any());
+    }
+
+    // ── gaming_policy_for_active_profile — the launch unit's RESOLVE step ──────────────────────
+
+    #[test]
+    fn no_active_profile_resolves_to_default_policy() {
+        let _guard = GAMING_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _cwd = crate::testsupport::cwd_guard("gaming_reconcile_no_active");
+        neuron::profile::set_active("");
+        let policy = gaming_policy_for_active_profile();
+        assert_eq!(policy, GamingMode::default(), "no active profile => suppress nothing");
+        neuron::profile::set_active(""); // leave the process-global cursor clean for later tests
+    }
+
+    #[test]
+    fn active_profile_with_gaming_flags_resolves_matching_policy() {
+        let _guard = GAMING_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _cwd = crate::testsupport::cwd_guard("gaming_reconcile_active");
+        let mut p = neuron::profile::Profile::default();
+        p.name = "gm-test-profile".into();
+        p.disable_alt_tab = true;
+        p.disable_alt_f4 = true;
+        p.save().expect("profile save must succeed under the pinned temp run root");
+        neuron::profile::set_active(&p.name);
+
+        let policy = gaming_policy_for_active_profile();
+        assert!(policy.disable_alt_tab);
+        assert!(!policy.disable_win);
+        assert!(policy.disable_alt_f4);
+        assert!(!policy.disable_alt_esc);
+
+        neuron::profile::set_active("");
+    }
+
+    #[test]
+    fn active_profile_naming_a_deleted_file_resolves_to_default_not_a_panic() {
+        let _guard = GAMING_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _cwd = crate::testsupport::cwd_guard("gaming_reconcile_gone");
+        neuron::profile::set_active("no-such-profile-on-disk");
+        let policy = gaming_policy_for_active_profile();
+        assert_eq!(policy, GamingMode::default(), "a dangling active-profile name must not panic or fake a policy");
+        neuron::profile::set_active("");
+    }
+
+    // ── the unit end-to-end: resolve+publish must leave hook::policy() == the derived policy ────
+
+    #[test]
+    fn gaming_unit_publish_leaves_hook_policy_matching_derivation() {
+        let _guard = GAMING_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _cwd = crate::testsupport::cwd_guard("gaming_reconcile_publish");
+        let saved_hook_policy = neuron::hook::policy(); // restore so this test can't leak into others
+
+        let mut p = neuron::profile::Profile::default();
+        p.name = "gm-publish-profile".into();
+        p.disable_win = true;
+        p.disable_alt_esc = true;
+        p.save().expect("profile save must succeed");
+        neuron::profile::set_active(&p.name);
+
+        // exactly what the registered "gaming_hook_policy" unit's `run` closure does.
+        crate::dispatch::set_gaming_policy(gaming_policy_for_active_profile());
+
+        let installed = neuron::hook::policy();
+        assert!(!installed.disable_alt_tab);
+        assert!(installed.disable_win);
+        assert!(!installed.disable_alt_f4);
+        assert!(installed.disable_alt_esc);
+
+        neuron::profile::set_active("");
+        neuron::hook::set_policy(saved_hook_policy);
+    }
+
+    #[test]
+    fn gaming_unit_publish_with_no_active_profile_clears_hook_to_default() {
+        let _guard = GAMING_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _cwd = crate::testsupport::cwd_guard("gaming_reconcile_publish_clear");
+        let saved_hook_policy = neuron::hook::policy();
+
+        // leave some non-default policy installed first, as if a previous session's profile had
+        // suppression on, to prove the unit actively CLEARS it rather than merely not touching it.
+        neuron::hook::set_policy(GamingMode::from_profile(true, true, true, true));
+        neuron::profile::set_active("");
+
+        crate::dispatch::set_gaming_policy(gaming_policy_for_active_profile());
+        assert_eq!(neuron::hook::policy(), GamingMode::default());
+
+        neuron::hook::set_policy(saved_hook_policy);
+    }
+
+    // ── scroll-stage Truth — CHUNK D ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn scroll_stage_truth_is_unknown_nothing_persists_it() {
+        // The investigated reality (see `reconcile_setup`'s doc): no Profile field, no Prefs field,
+        // and no device getter (writes.rs's scroll-stage commands are SET-ONLY) ever makes a scroll
+        // stage re-assertable at launch, so the only honest `Truth` is `Unknown` — never the old
+        // hardcoded "tactile/free".
+        assert_eq!(scroll_stage_truth(), crate::reconcile::Truth::Unknown);
+    }
+
+    #[test]
+    fn scroll_stage_truth_never_yields_the_old_fake_literal() {
+        assert_ne!(
+            scroll_stage_truth(),
+            crate::reconcile::Truth::Read("tactile/free".to_string())
+        );
+        assert_ne!(
+            scroll_stage_truth(),
+            crate::reconcile::Truth::Asserted("tactile/free".to_string())
+        );
+    }
+
+    #[test]
+    fn state_slint_default_no_longer_hardcodes_the_fake_scroll_stage() {
+        // A convention regression guard on the source itself: the launch reconcile unit is the
+        // only thing now allowed to decide what `State.scroll-stages` starts as, so the Slint
+        // default must be the honest dash, not a re-introduced fake "tactile/free".
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("ui/state.slint");
+        let src = std::fs::read_to_string(&path).expect("ui/state.slint must be readable");
+        let default_line = src
+            .lines()
+            .find(|l| l.contains("in-out property <string> scroll-stages:"))
+            .expect("scroll-stages property declaration must exist");
+        assert!(
+            !default_line.contains("tactile/free"),
+            "state.slint's scroll-stages default must not hardcode a fake value: {default_line}"
+        );
+        assert!(
+            default_line.contains('\u{2014}'),
+            "state.slint's scroll-stages default should be the honest dash: {default_line}"
+        );
     }
 }
 

@@ -42,7 +42,7 @@ pub const RAZER_MACRO_PAGE: u16 = 0xFF1A;
 // `listen_until` registers a sink and drains it into the SAME `on_event` path as Raw Input, so an
 // injected control is captured (press-to-bind) and dispatched identically to a native one. Broadcast
 // (not a single channel) because capture + live-dispatch run concurrent listens that must BOTH see it.
-static INJECT: std::sync::Mutex<Vec<(u64, std::sync::mpsc::Sender<ControlEvent>)>> =
+static INJECT: std::sync::Mutex<Vec<(u64, std::sync::mpsc::Sender<ControlEvent>, isize)>> =
     std::sync::Mutex::new(Vec::new());
 static INJECT_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Events injected BEFORE any listen loop has registered its drain — buffered (not dropped) so the
@@ -84,16 +84,28 @@ pub fn inject_event(ev: ControlEvent) {
         }
         return;
     }
-    sinks.retain(|(_, tx)| tx.send(ev.clone()).is_ok());
+    sinks.retain(|(_, tx, _)| tx.send(ev.clone()).is_ok());
+    // Wake EVERY registered listener NOW so this injected edge is drained on the next wait return,
+    // not on the idle timeout (up to ~1s) — it arrives on `inject_rx`, NOT the message queue, so
+    // nothing else releases the wait. We already hold the INJECT lock, so signal in place rather
+    // than calling `wake_pump` (which re-locks INJECT → self-deadlock). Per-listener events mean a
+    // concurrent capture pump AND the resident worker are both released (see `wake_pump`'s note).
+    signal_listeners(&sinks);
 }
 
 /// Register a drain for one listen loop; the loop drains the receiver each tick into `on_event`,
 /// then [`inject_unregister`]s on exit. Returns the registration id + the receiver. Any events that
 /// arrived before ANY sink existed are seeded into this fresh receiver first (see [`INJECT_PENDING`]),
 /// so the first listener to arm picks up the startup-race edges before its first live tick.
-fn inject_register() -> (u64, std::sync::mpsc::Receiver<ControlEvent>) {
+fn inject_register() -> (u64, std::sync::mpsc::Receiver<ControlEvent>, isize) {
     let (tx, rx) = std::sync::mpsc::channel();
     let id = INJECT_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    // Each listener gets its OWN wake event (see `wake_pump`'s note): the resident dispatch pump and
+    // a transient press-to-bind capture pump can block concurrently, and a single shared auto-reset
+    // event releases only ONE waiter — so a command/inject could wake the WRONG pump and strand the
+    // intended one until its timeout (up to the ~1s idle cadence). Minted here, closed by
+    // `inject_unregister`.
+    let wake = create_wake_event();
     // Hold the INJECT lock across the pending drain (same lock order as inject_event: INJECT then
     // PENDING) so the handoff is atomic — an inject_event racing us either buffered into PENDING
     // (we drain it here) or will broadcast to the sink we're about to push. Never lost, never doubled.
@@ -105,16 +117,19 @@ fn inject_register() -> (u64, std::sync::mpsc::Receiver<ControlEvent>) {
     {
         let _ = tx.send(ev);
     }
-    sinks.push((id, tx));
-    (id, rx)
+    sinks.push((id, tx, wake));
+    (id, rx, wake)
 }
 
-/// Drop a listen loop's drain registration (its receiver is gone).
+/// Drop a listen loop's drain registration (its receiver is gone) and close its wake event.
 fn inject_unregister(id: u64) {
-    INJECT
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .retain(|(i, _)| *i != id);
+    let mut sinks = INJECT.lock().unwrap_or_else(|e| e.into_inner());
+    // Remove + close under the INJECT lock so `wake_pump` (which signals every registered handle
+    // while holding this same lock) can never race a SetEvent against a handle we're closing.
+    if let Some(pos) = sinks.iter().position(|(i, _, _)| *i == id) {
+        let (_, _, wake) = sinks.remove(pos);
+        close_wake_event(wake);
+    }
 }
 
 /// Friendly name for the common control usages we expect (printing only).
@@ -237,7 +252,9 @@ pub fn watch(seconds: u64) {
             }
             count += 1;
         },
-        || {},
+        // on_tick: nothing to poll for the watch printout. The returned Duration is the pump-cadence
+        // hint (max wait before the next tick); a short one here keeps the printout responsive.
+        || std::time::Duration::from_millis(5),
     );
     println!("\ncaptured {count} Razer control event(s).");
 }
@@ -255,11 +272,22 @@ pub fn watch(_seconds: u64) {
 /// [`listen_until`] with a stop flag that is never set. A GUI worker thread should prefer
 /// [`listen_until`] so it can stop the loop cleanly from another thread.
 #[cfg(windows)]
-pub fn listen(seconds: Option<u64>, on_event: impl FnMut(&ControlEvent), on_tick: impl FnMut()) {
+pub fn listen(
+    seconds: Option<u64>,
+    on_event: impl FnMut(&ControlEvent),
+    mut on_tick: impl FnMut(),
+) {
     // A stop flag that is never set: identical behaviour to the historical `listen` (run until
     // `seconds` elapse or ESC). Keeps the CLI daemon path byte-for-byte the same.
     static NEVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    win::listen(seconds, &NEVER, true, on_event, on_tick);
+    // `win::listen` speaks the Duration-cadence `on_tick` (the value it waits before the next tick
+    // when the blocking-wait pump is active — see `listen_until`'s doc). This plain `listen` keeps
+    // ITS OWN unit-less signature (the CLI daemon's `run_listen` has no cadence to offer), so adapt:
+    // run the caller's tick, then hand back a short fixed cadence.
+    win::listen(seconds, &NEVER, true, on_event, move || {
+        on_tick();
+        std::time::Duration::from_millis(5)
+    });
 }
 
 #[cfg(not(windows))]
@@ -317,7 +345,9 @@ pub fn listen(_seconds: Option<u64>, _on_event: impl FnMut(&ControlEvent), _on_t
 ///                 let _ = rule.action.run_ctx(&ctx);      // run each matched action
 ///             }
 ///         },
-///         || {},                // on_tick: poll mic-tap / app-switch here if desired
+///         || std::time::Duration::from_millis(50), // on_tick: poll mic-tap / app-switch here;
+///                               // the returned Duration is the pump-cadence hint (max wait
+///                               // before the next tick when the blocking pump is active)
 ///     );
 /// });
 ///
@@ -332,7 +362,11 @@ pub fn listen_until(
     stop: &std::sync::atomic::AtomicBool,
     esc_stops: bool,
     on_event: impl FnMut(&ControlEvent),
-    on_tick: impl FnMut(),
+    // The returned Duration is the cadence HINT — "the max time before the pump should call
+    // `on_tick` again". When the blocking-wait pump is active (default; `NEURON_PUMP=poll` opts back
+    // to the old fixed-sleep), `win::listen` waits at most this long between ticks; the poll path
+    // opts out to the legacy fixed 5ms sleep, which ignores the hint.
+    on_tick: impl FnMut() -> std::time::Duration,
 ) {
     win::listen(seconds, stop, esc_stops, on_event, on_tick);
 }
@@ -354,7 +388,7 @@ pub fn listen_until(
     stop: &std::sync::atomic::AtomicBool,
     _esc_stops: bool,
     _on_event: impl FnMut(&ControlEvent),
-    mut on_tick: impl FnMut(),
+    mut on_tick: impl FnMut() -> std::time::Duration,
 ) {
     use std::time::Instant;
     let start = Instant::now();
@@ -362,7 +396,9 @@ pub fn listen_until(
         if stop.load(std::sync::atomic::Ordering::Relaxed) {
             break;
         }
-        on_tick();
+        // The returned Duration is a cadence hint for the future blocking-wait rewrite; this
+        // inert loop ignores it and keeps its fixed 50ms poll — no behavior change.
+        let _cadence = on_tick();
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
@@ -552,12 +588,26 @@ pub struct Runtime {
     oneshot: std::collections::HashSet<String>,
     /// Down timestamps for the smart stance's tap-vs-momentary decision.
     down_at: std::collections::HashMap<Trigger, std::time::Instant>,
+    /// Cached answer to "does the active engine bind anything that needs periodic polling
+    /// (`Trigger::MicTap` / `Trigger::AppFocus`)?" — computed ONCE in [`build_runtime_from`] by
+    /// scanning the assembled rule set, so the pump-cadence seam's per-tick check
+    /// ([`needs_periodic_poll`](Self::needs_periodic_poll)) is O(1) instead of rescanning every
+    /// rule on every tick.
+    poll_needed: bool,
 }
 
 impl Runtime {
     /// The number of rules across base + all layers (for the daemon's startup banner).
     pub fn rule_count(&self) -> usize {
         self.engine.rules.len() + self.engine.layers.values().map(Vec::len).sum::<usize>()
+    }
+
+    /// Does the active engine bind a `Trigger::MicTap` or `Trigger::AppFocus` anywhere (base or
+    /// any HyperShift layer)? Cheap — a cached bool from build time (see `poll_needed`'s doc), not
+    /// a live scan. The pump-cadence seam uses this to decide whether the live worker still needs
+    /// its ~50ms periodic-poll cadence or can idle.
+    pub fn needs_periodic_poll(&self) -> bool {
+        self.poll_needed
     }
 
     /// Set the layer stance + timing from feel config (see [`crate::feel`]).
@@ -878,6 +928,11 @@ pub fn build_runtime_from(
         ));
     }
 
+    // Computed ONCE here (build time), not per-tick — see `Runtime::poll_needed`'s doc.
+    let poll_needed = rules
+        .iter()
+        .any(|r| matches!(r.trigger, Trigger::MicTap | Trigger::AppFocus { .. }));
+
     Runtime {
         engine: Engine::from_rules(rules),
         cast_trigger: cast.trigger,
@@ -889,6 +944,7 @@ pub fn build_runtime_from(
         latched: std::collections::HashSet::new(),
         oneshot: std::collections::HashSet::new(),
         down_at: std::collections::HashMap::new(),
+        poll_needed,
     }
 }
 
@@ -979,8 +1035,14 @@ mod spine_tests {
         }
     }
 
+    /// Serializes the tests that touch the process-global INJECT registry (this one asserts INJECT
+    /// starts empty; the multi-listener wake test registers listeners) so cargo's parallel runner
+    /// can't race them. Poison-tolerant — a panicking test must not wedge the other.
+    static INJECT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn injected_event_before_any_listener_is_buffered_then_delivered() {
+        let _guard = INJECT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // The startup race (issue: first macro keypress dropped): the macro-key reader can push an
         // injected control BEFORE the live-dispatch listener registers its drain. The event must be
         // BUFFERED and handed to the first sink that registers — so no first keypress is lost.
@@ -991,7 +1053,7 @@ mod spine_tests {
             raw: vec![0x04, 0x20],
         };
         inject_event(ev.clone()); // arrives with no listener yet → buffered, not dropped
-        let (id, rx) = inject_register(); // a listener arms — it must inherit the buffered edge
+        let (id, rx, _wake) = inject_register(); // a listener arms — it must inherit the buffered edge
         let got = rx
             .try_recv()
             .expect("the pre-registration macro keypress was delivered to the new sink");
@@ -1003,6 +1065,45 @@ mod spine_tests {
             "post-registration events broadcast directly to the live sink"
         );
         inject_unregister(id);
+    }
+
+    // The multi-listener root fix: a single shared auto-reset event releases only ONE of several
+    // concurrently-blocked pumps (resident dispatch + a transient press-to-bind capture), so the
+    // wrong pump could consume the wake and strand the intended one's command/inject until its
+    // timeout. This proves each listener owns a DISTINCT wake event and that BOTH `wake_pump` and
+    // `inject_event` signal every one. Windows-only — it inspects real Win32 event state.
+    #[test]
+    #[cfg(windows)]
+    fn every_concurrent_listener_is_woken_not_just_one() {
+        use windows_sys::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+        // Poll-and-consume the signaled state of an auto-reset event (0 timeout).
+        fn signaled(h: isize) -> bool {
+            unsafe { WaitForSingleObject(h as HANDLE, 0) == WAIT_OBJECT_0 }
+        }
+        let _guard = INJECT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (id_a, _rx_a, wake_a) = inject_register();
+        let (id_b, rx_b, wake_b) = inject_register();
+        assert!(wake_a != 0 && wake_b != 0, "each listener minted its own wake event");
+        assert_ne!(wake_a, wake_b, "distinct events, NOT one shared handle");
+        // start from a clean (non-signaled) slate
+        let _ = signaled(wake_a);
+        let _ = signaled(wake_b);
+        // the crux: wake_pump signals BOTH, not just whichever the OS would release from a shared event
+        wake_pump();
+        assert!(signaled(wake_a), "wake_pump signals listener A");
+        assert!(signaled(wake_b), "wake_pump signals listener B — every listener, not just one");
+        // inject_event (broadcast) must wake both in place AND deliver the edge
+        let ev = ControlEvent {
+            pid: "f042".into(),
+            hits: vec![(RAZER_MACRO_PAGE, 0x21)],
+            raw: vec![0x04, 0x21],
+        };
+        inject_event(ev);
+        assert!(signaled(wake_a) && signaled(wake_b), "inject_event wakes every listener");
+        assert!(rx_b.try_recv().is_ok(), "and the injected edge reached the listener");
+        inject_unregister(id_a);
+        inject_unregister(id_b);
     }
 
     #[test]
@@ -1516,6 +1617,173 @@ mod spine_tests {
     }
 }
 
+// ── pump wake events (per-listener — how a producer wakes a blocked pump) ────────────────────────
+//
+// `win::listen`'s tail blocks in `MsgWaitForMultipleObjectsEx` on (a) its listener window's message
+// queue and (b) a wake event. A producer with work for a pump `SetEvent`s that pump's wake event so
+// the wait returns at once instead of sitting out the (up to ~1s idle) cadence — this is what keeps
+// a queued LiveCommand (`neuron-app::dispatch::send_live`) or an injected control edge
+// (`inject_event`) from waiting until the next timeout.
+//
+// CRUCIAL: each listener owns its OWN event (minted in `inject_register`, stored in the INJECT
+// registry, closed in `inject_unregister`), NOT one shared event. The resident dispatch pump and a
+// transient press-to-bind capture pump can be blocked at the same moment; a single auto-reset event
+// releases only ONE waiter — possibly the wrong one — so the intended pump's work would strand until
+// its timeout. `wake_pump` (and inject_event's in-place signal) therefore wake EVERY registered
+// listener; a listener woken with nothing to do just runs one tick and re-blocks (harmless).
+
+/// Create one auto-reset, initially-non-signaled, unnamed Win32 event for a single listen loop,
+/// returned as an `isize` handle (0 if creation fails, or off-Windows where there is no blocking
+/// wait). Each `inject_register` mints its own — see the module note above.
+#[cfg(windows)]
+fn create_wake_event() -> isize {
+    // SAFETY: FFI with valid null/null optional-pointer args per CreateEventW's contract; returns a
+    // valid HANDLE or NULL (0), both fine to stash as a bit pattern.
+    let h = unsafe {
+        windows_sys::Win32::System::Threading::CreateEventW(
+            std::ptr::null(),
+            0, // bManualReset = FALSE (auto-reset)
+            0, // bInitialState = FALSE (non-signaled)
+            std::ptr::null(),
+        )
+    };
+    h as isize
+}
+
+#[cfg(not(windows))]
+fn create_wake_event() -> isize {
+    0
+}
+
+/// Close a wake event minted by [`create_wake_event`] (no-op for 0 / off-Windows).
+#[cfg(windows)]
+fn close_wake_event(handle: isize) {
+    if handle != 0 {
+        // SAFETY: `handle` is an event this module created and is removing from the registry under
+        // the INJECT lock; no pump waits on it after removal.
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(
+                handle as windows_sys::Win32::Foundation::HANDLE,
+            );
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn close_wake_event(_handle: isize) {}
+
+/// `SetEvent` every listener's wake event in a locked INJECT slice — the lock-free core shared by
+/// [`wake_pump`] (which locks first) and [`inject_event`] (which already holds the lock; calling
+/// `wake_pump` there would re-lock INJECT and self-deadlock). No-op off-Windows.
+#[cfg(windows)]
+fn signal_listeners(sinks: &[(u64, std::sync::mpsc::Sender<ControlEvent>, isize)]) {
+    for (_, _, wake) in sinks {
+        if *wake != 0 {
+            // SAFETY: `wake` is a live event handle owned by the registry (closed only by
+            // inject_unregister under the INJECT lock the caller holds), valid for SetEvent.
+            unsafe {
+                windows_sys::Win32::System::Threading::SetEvent(
+                    *wake as windows_sys::Win32::Foundation::HANDLE,
+                );
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn signal_listeners(_sinks: &[(u64, std::sync::mpsc::Sender<ControlEvent>, isize)]) {}
+
+/// Wake EVERY registered listen loop by signaling its wake event. Called by every producer of
+/// listener work — `neuron-app`'s `send_live` (a LiveCommand for the resident worker), the runtime's
+/// stop, and (in place) `inject_event` — so the pump drains the work on its next wait return instead
+/// of sitting out its cadence. Wakes ALL listeners, not just one: see the module note above on why a
+/// single shared event is wrong. Safe to call from any thread; no-op off-Windows.
+pub fn wake_pump() {
+    let sinks = INJECT.lock().unwrap_or_else(|e| e.into_inner());
+    signal_listeners(&sinks);
+}
+
+// ── pump wait-plan (pure, unit-tested) ──────────────────────────────────────────────────────
+//
+// `win::listen`'s tail turns the `on_tick` cadence hint (turbo ~8ms / mic-or-appfocus-bound
+// ~50ms / idle ~1000ms) into a concrete Win32 `MsgWaitForMultipleObjectsEx` wait. `plan_wait` is
+// the pure (no FFI) half of that decision, split out so it's unit-testable without hardware —
+// `win::listen` itself stays a thin, un-testable shell around it.
+
+/// The Win32 wait recipe derived from one `on_tick` cadence hint.
+#[cfg(windows)]
+struct WaitPlan {
+    /// Also arm the high-resolution waitable timer: `MsgWaitForMultipleObjectsEx`'s own millisecond
+    /// timeout is too coarse (~15.6ms) to hit a TURBO cadence (< 16ms) reliably, so the timer does
+    /// the fine timing. `timeout_ms` stays finite even then (see below) — the timer is an addition,
+    /// not a replacement.
+    use_timer: bool,
+    /// The timeout passed straight to `MsgWaitForMultipleObjectsEx` — ALWAYS a real millisecond
+    /// value, NEVER infinite. For a turbo the hi-res timer (when armed) fires first and gives the
+    /// fine cadence; this stays a coarse BACKSTOP so a missing or failed-to-arm timer degrades to a
+    /// coarse-but-live repeat instead of an indefinite hang.
+    timeout_ms: u32,
+    /// The relative due time for `SetWaitableTimer`, in NEGATIVE 100ns units (negative = relative
+    /// to now, per `SetWaitableTimer`'s contract — an absolute due time would need wall-clock
+    /// alignment this pump has no use for). Only meaningful when `use_timer` is true.
+    due_100ns: i64,
+}
+
+/// Turn an `on_tick` cadence hint into a concrete Win32 wait recipe (see [`WaitPlan`]).
+#[cfg(windows)]
+fn plan_wait(cadence: std::time::Duration) -> WaitPlan {
+    let ms = cadence.as_millis().clamp(1, u32::MAX as u128) as u32;
+    let turbo = cadence < std::time::Duration::from_millis(16);
+    WaitPlan {
+        use_timer: turbo,
+        // ALWAYS finite (never infinite): the hi-res timer (when armed) provides the fine timing for
+        // a turbo, but the millisecond timeout stays as a backstop so a missing/failed timer degrades
+        // to a coarse repeat instead of blocking forever (the turbo-hang bug this guards against).
+        timeout_ms: ms,
+        due_100ns: if turbo { -((cadence.as_nanos() / 100) as i64) } else { 0 },
+    }
+}
+
+#[cfg(all(test, windows))]
+mod plan_wait_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn idle_cadence_is_a_plain_long_timeout() {
+        let plan = plan_wait(Duration::from_millis(1000));
+        assert!(!plan.use_timer);
+        assert_eq!(plan.timeout_ms, 1000);
+    }
+
+    #[test]
+    fn mic_bound_cadence_is_a_plain_mid_timeout() {
+        let plan = plan_wait(Duration::from_millis(50));
+        assert!(!plan.use_timer);
+        assert_eq!(plan.timeout_ms, 50);
+    }
+
+    #[test]
+    fn turbo_cadence_arms_the_hires_timer_with_a_finite_backstop() {
+        let plan = plan_wait(Duration::from_millis(8));
+        assert!(plan.use_timer);
+        assert_eq!(plan.due_100ns, -80_000); // 8ms == 80_000 * 100ns
+        // The timeout is the cadence in ms, NOT infinite — so a missing/failed hi-res timer degrades
+        // to a coarse repeat instead of hanging the turbo (the regression this pins).
+        assert_eq!(plan.timeout_ms, 8);
+    }
+
+    #[test]
+    fn sub_millisecond_cadence_never_yields_a_zero_timeout() {
+        // Sub-ms cadences land in the turbo branch too (< 16ms), so the timer does the actual
+        // timing rather than `ms` — but this pins the invariant the `clamp(1, ..)` above exists
+        // for: whichever branch is taken, the wait's timeout must never collapse to 0 (which
+        // would busy-spin `MsgWaitForMultipleObjectsEx`, defeating the entire point).
+        let plan = plan_wait(Duration::from_micros(100));
+        assert!(plan.timeout_ms >= 1);
+    }
+}
+
 #[cfg(windows)]
 mod win {
     use super::{ControlEvent, PROBE_PAGES};
@@ -1524,6 +1792,11 @@ mod win {
     use windows_sys::Win32::Devices::HumanInterfaceDevice::{
         HidP_GetUsages, HidP_Input, HidP_MaxUsageListLength, HIDP_STATUS_SUCCESS,
     };
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_FAILED};
+    use windows_sys::Win32::System::Threading::{
+        CancelWaitableTimer, CreateWaitableTimerExW, SetWaitableTimer,
+        CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS,
+    };
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
     use windows_sys::Win32::UI::Input::{
         GetRawInputData, GetRawInputDeviceInfoW, RegisterRawInputDevices, HRAWINPUT, RAWINPUT,
@@ -1531,8 +1804,9 @@ mod win {
         RID_INPUT, RIM_TYPEHID, RIM_TYPEKEYBOARD, RIM_TYPEMOUSE,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DestroyWindow, DispatchMessageW, GetForegroundWindow, PeekMessageW,
-        TranslateMessage, MSG, PM_REMOVE, WM_INPUT,
+        CreateWindowExW, DestroyWindow, DispatchMessageW, GetForegroundWindow,
+        MsgWaitForMultipleObjectsEx, PeekMessageW, TranslateMessage, MSG, MWMO_INPUTAVAILABLE,
+        PM_REMOVE, QS_ALLINPUT, WM_INPUT,
     };
 
     // RAWKEYBOARD.Flags bits (windows-sys doesn't name them).
@@ -1681,7 +1955,7 @@ mod win {
         stop: &std::sync::atomic::AtomicBool,
         esc_stops: bool,
         mut on_event: impl FnMut(&ControlEvent),
-        mut on_tick: impl FnMut(),
+        mut on_tick: impl FnMut() -> Duration,
     ) {
         unsafe {
             let cls: Vec<u16> = "Static\0".encode_utf16().collect();
@@ -1749,11 +2023,52 @@ mod win {
             let mut last_fg: isize = 0;
             // Injected HID sources (the Razer macro-key reader) broadcast ControlEvents here; we
             // drain them into the SAME on_event below, so they bind + dispatch like native input.
-            let (inject_id, inject_rx) = super::inject_register();
+            let (inject_id, inject_rx, wake_ev) = super::inject_register();
             let mut n_input = 0u32;
             let mut n_hid = 0u32;
             let start = Instant::now();
+            // ── measurement harness (crate::prof::pump) — NO behavior change ──────────────
+            // Wraps the caller's `on_event` so the wake -> first-edge latency for THIS
+            // iteration lands in the histogram exactly once, then forwards the call
+            // unchanged. `iter_start`/`first_edge_pending` are reset every iteration below.
+            let iter_start = std::cell::Cell::new(Instant::now());
+            let first_edge_pending = std::cell::Cell::new(true);
+            let mut on_event = |ev: &ControlEvent| {
+                if first_edge_pending.replace(false) {
+                    crate::prof::pump::record_latency_us(
+                        iter_start.get().elapsed().as_micros() as u64
+                    );
+                }
+                on_event(ev);
+            };
+            // ── blocking-wait pump setup (replaces the fixed-5ms busy poll below) ──────────────
+            // `NEURON_PUMP=poll` is the field escape hatch back to the old busy sleep, in case the
+            // blocking wait ever needs to be ruled out live without a rebuild. Read ONCE — the
+            // env var doesn't change mid-run.
+            let use_wait = std::env::var("NEURON_PUMP").map(|v| v != "poll").unwrap_or(true);
+            // THIS listener's own wake event (minted by `inject_register` above; see `wake_pump`'s
+            // note on why each listener needs its own). A producer `SetEvent`s it to turn queued
+            // work into an instant wake instead of waiting out the cadence. May be 0 (null) if
+            // `CreateEventW` failed; the wait below just omits it from the handle set then.
+            let wake: HANDLE = wake_ev as HANDLE;
+            // A high-resolution waitable timer for TURBO cadences (~8ms): `MsgWaitForMultipleObjectsEx`'s
+            // own millisecond timeout is too coarse to hit those reliably. A null return (old
+            // Windows, or the rare allocation failure) just degrades: turbo iterations fall back
+            // to the plain millisecond timeout in `plan_wait` — still far better than the fixed
+            // 5ms sleep it replaces. Created once, closed after the loop.
+            let timer: HANDLE = if use_wait {
+                CreateWaitableTimerExW(
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                    TIMER_ALL_ACCESS,
+                )
+            } else {
+                std::ptr::null_mut()
+            };
             while seconds.map_or(true, |s| start.elapsed().as_secs() < s) {
+                iter_start.set(Instant::now());
+                first_edge_pending.set(true);
                 // A GUI worker thread (or any caller of `listen_until`) flips this to tear the
                 // loop down cleanly from another thread; the CLI passes a flag that is never set.
                 if stop.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1775,7 +2090,9 @@ mod win {
                     );
                 }
                 let mut msg: MSG = std::mem::zeroed();
+                let mut got_msg = false; // prof: this iteration's wake-reason (see record_wake below)
                 while PeekMessageW(&mut msg, hwnd, 0, 0, PM_REMOVE) != 0 {
+                    got_msg = true;
                     if msg.message == WM_INPUT {
                         n_input += 1;
                         let mut size: u32 = 0;
@@ -1947,13 +2264,79 @@ mod win {
                 last_fg = fg;
                 // Drain injected events (Razer macro keys + future HID readers) through the same
                 // on_event path as Raw Input — captured to bind, dispatched to fire, identically.
+                // An injected control arrives on `inject_rx` + the listener WAKE EVENT, not the Win32
+                // message queue, so it counts as INPUT for the wake-reason diagnostic just like a
+                // WM_INPUT does — recording that here (after this drain, not before) is what keeps a
+                // macro-key / HID mic-tap wake from being mislabelled `tick_only`.
+                let mut got_input = got_msg;
                 for ev in inject_rx.try_iter() {
+                    got_input = true;
                     on_event(&ev);
                 }
-                on_tick();
-                std::thread::sleep(Duration::from_millis(5));
+                crate::prof::pump::record_wake(got_input);
+                // The returned cadence is the max time this pump should wait before its next tick
+                // (turbo→~8ms, mic/appfocus-bound→50ms, idle→1000ms) — `plan_wait` turns it into a
+                // concrete Win32 wait recipe below.
+                let cadence = on_tick();
+                // Starvation watchdog, per THIS listener and cadence-aware: a gap far beyond `cadence`
+                // means this pump is genuinely stalled. Keyed by `inject_id` + the cadence so a
+                // healthy concurrent listener can't mask it, and the variable idle cadence (up to
+                // ~1s) is never mistaken for starvation. See prof::pump.
+                crate::prof::pump::record_tick(
+                    inject_id,
+                    cadence.as_millis().min(u32::MAX as u128) as u32,
+                );
+                if use_wait {
+                    let plan = super::plan_wait(cadence);
+                    // Built fresh each iteration (cheap — at most 2 handles): which ones are live
+                    // depends on this iteration's plan.
+                    let mut handles: [HANDLE; 2] = [std::ptr::null_mut(), std::ptr::null_mut()];
+                    let mut n: u32 = 0;
+                    if !wake.is_null() {
+                        handles[n as usize] = wake;
+                        n += 1;
+                    }
+                    if plan.use_timer && !timer.is_null() {
+                        // Relative (negative) due time — see `WaitPlan::due_100ns`'s doc.
+                        SetWaitableTimer(timer, &plan.due_100ns, 0, None, std::ptr::null(), 0);
+                        handles[n as usize] = timer;
+                        n += 1;
+                    } else if !timer.is_null() {
+                        // Not a turbo iteration — make sure a PRIOR turbo iteration's still-armed
+                        // timer can't spuriously signal into this (longer) wait.
+                        CancelWaitableTimer(timer);
+                    }
+                    let ptr = if n == 0 {
+                        std::ptr::null()
+                    } else {
+                        handles.as_ptr()
+                    };
+                    // `MWMO_INPUTAVAILABLE` is MANDATORY: without it, input already sitting in the
+                    // queue (peeked-but-not-yet-removed) does NOT wake the wait — a keypress reads
+                    // as "stuck" until some unrelated wake. `QS_ALLINPUT` is what makes hardware-event
+                    // latency ~0 (any input returns the wait immediately); `wake` is what makes a
+                    // queued LiveCommand return it immediately too.
+                    let r = MsgWaitForMultipleObjectsEx(
+                        n,
+                        ptr,
+                        plan.timeout_ms,
+                        QS_ALLINPUT,
+                        MWMO_INPUTAVAILABLE,
+                    );
+                    if r == WAIT_FAILED {
+                        // Never busy-spin on an error path — degrade to (at worst) a short sleep.
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                } else {
+                    // NEURON_PUMP=poll — the old fixed busy-poll, kept as the field escape hatch.
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+            if !timer.is_null() {
+                CloseHandle(timer);
             }
             super::inject_unregister(inject_id);
+            crate::prof::pump::forget_listener(inject_id); // drop this listener's watchdog state
             if dbg {
                 eprintln!("    [dbg] WM_INPUT msgs={n_input}  HID events={n_hid}");
             }

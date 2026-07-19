@@ -258,6 +258,21 @@ enum Cmd {
         #[arg(long)]
         scan: bool,
     },
+    /// Measurement harness for the input pump — read-only diagnostics for the baseline the
+    /// upcoming pump rewrite is measured against (wake counts by reason, wake -> first-edge
+    /// latency histogram, tick-starvation watchdog). Counters are IN-PROCESS: `neuron run`
+    /// prints its own session's snapshot on exit; a bare `neuron prof pump` reads whatever this
+    /// process itself has pumped (zero, unless something in-process ran the loop first).
+    Prof {
+        #[command(subcommand)]
+        action: ProfCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProfCmd {
+    /// Print the current pump-loop counters.
+    Pump,
 }
 
 #[derive(Subcommand)]
@@ -932,6 +947,9 @@ fn main() -> Result<()> {
             keep,
             sigil,
         } => pocket_cmd(name, list, keep, sigil)?,
+        Cmd::Prof {
+            action: ProfCmd::Pump,
+        } => prof_pump_cmd(),
     }
     Ok(())
 }
@@ -2892,6 +2910,27 @@ fn bind_cmd(action: BindCmd) -> Result<()> {
     Ok(())
 }
 
+/// Print the pump's measurement-harness counters (`neuron::prof::pump`): wake counts by reason,
+/// the wake -> first-edge latency histogram, and the tick-starvation watchdog's event count.
+/// Read-only, in-process — see `Cmd::Prof`'s doc for what that means for a bare invocation vs.
+/// letting `run_daemon` print its own session's snapshot on exit.
+fn prof_pump_cmd() {
+    let s = neuron::prof::pump::snapshot();
+    println!("pump wakes: input={}  tick_only={}  total={}", s.wake_input, s.wake_tick_only, s.wake_total);
+    println!("tick-starvation events: {}", s.starvation_events);
+    println!("wake -> first-edge latency (us):");
+    let mut any = false;
+    for (bound_us, count) in s.latency_buckets_us {
+        if count > 0 {
+            any = true;
+            println!("  <= {bound_us:>8} us : {count}");
+        }
+    }
+    if !any {
+        println!("  (no samples yet)");
+    }
+}
+
 fn run_daemon(reg: &Registry, seconds: Option<u64>, safe: bool) {
     // ARM real input synthesis for live use. This is the one place the CLI daemon flips the
     // process-wide safety gate ON so bound key/click/macro actions actually fire. `--safe` keeps
@@ -3125,11 +3164,15 @@ fn run_listen(reg: &Registry, seconds: Option<u64>, rt: neuron::controls::Runtim
             }
         },
     );
+    // measurement harness read-out: this session's pump counters (see `neuron prof pump`).
+    prof_pump_cmd();
 }
 
 #[cfg(not(windows))]
 fn run_listen(_reg: &Registry, seconds: Option<u64>, _rt: neuron::controls::Runtime) {
     neuron::controls::listen(seconds, |_ev| {}, || {});
+    // measurement harness read-out: honestly zero off-Windows (no pump source there yet).
+    prof_pump_cmd();
 }
 
 fn audio_cmd(action: AudioCmd) -> Result<()> {
@@ -3623,7 +3666,9 @@ fn capture_sniper_control() -> Option<(u16, u16, Option<u16>)> {
                 stop.store(true, Ordering::Relaxed);
             }
         },
-        || {},
+        // on_tick: nothing to poll during a one-shot interactive capture. The returned Duration
+        // is a pump-cadence hint for the future blocking-wait rewrite (ignored today).
+        || std::time::Duration::from_millis(5),
     );
     found.get()
 }

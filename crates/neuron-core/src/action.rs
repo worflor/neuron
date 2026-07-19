@@ -1372,20 +1372,24 @@ fn mic_set(device: Option<&str>, pct: f32) -> String {
 #[cfg(windows)]
 fn mic_mute(device: Option<&str>, mode: &str) -> String {
     match crate::audio::resolve_capture(device)
-        .and_then(|e| crate::audio::VolumeCtl::open(&e.id).map(|c| (e.name, c)))
+        .and_then(|e| crate::audio::VolumeCtl::open(&e.id).map(|c| (e.id, e.name, c)))
     {
-        Some((name, ctl)) => {
-            let s = match mode {
-                "on" => {
-                    ctl.set_mute(true);
-                    true
-                }
-                "off" => {
-                    ctl.set_mute(false);
-                    false
-                }
-                _ => ctl.toggle_mute(),
+        Some((id, name, ctl)) => {
+            // Write, then — only if the OS state actually CHANGED (`set_mute` reports that; a toggle
+            // always changes) — open the mic-tap self-write window, so the detector doesn't fire
+            // `MicTap`'s bound actions for our OWN write. A no-op write is no transition, so the poll
+            // sees no edge and a window would only shadow a real tap. A real transition's ~1s window
+            // opens well inside the ~400ms cache lag before the poll could sample it, so there is no
+            // race. ONLY the DEFAULT endpoint arms it: `device` may name a SECONDARY mic the detector
+            // never samples — arming for it could shadow a real tap on the default.
+            let (s, changed) = match mode {
+                "on" => (true, ctl.set_mute(true)),
+                "off" => (false, ctl.set_mute(false)),
+                _ => (ctl.toggle_mute(), true),
             };
+            if changed && crate::audio::is_default_capture_id(&id) {
+                crate::mic_state::note_self_mute_write();
+            }
             format!("{name} mute -> {}", if s { "ON" } else { "off" })
         }
         None => "no mic".into(),

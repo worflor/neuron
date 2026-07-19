@@ -17,7 +17,12 @@ fn render_endpoint() -> Option<(String, String)> {
     audio::resolve_render(None).map(|e| (e.id, e.name))
 }
 
-/// Refresh the mic panel from the live endpoint.
+/// Refresh the mic panel from the live endpoint — NAME + GAIN only. `mic-muted` is NOT set here:
+/// the launch `mic_mute` reconcile unit owns the initial seed (this early call used to race
+/// hidwatch's hardware-mute bridge and read a stale pre-bridge value — the Chunk-B launch bug), and
+/// `glue::publish_mic_state` is the one authoritative writer of `mic-muted` everywhere else. The
+/// request below re-runs that same unit so the manual "refresh mic" button still refreshes the
+/// mute reading — through the one writer, not a second one here.
 pub fn refresh(app: &AppWindow) {
     let st = app.global::<State>();
     match endpoint() {
@@ -25,13 +30,13 @@ pub fn refresh(app: &AppWindow) {
             if let Some(ctl) = VolumeCtl::open(&id) {
                 st.set_mic_name(name.into());
                 st.set_mic_gain((ctl.get_volume() * 100.0).round());
-                st.set_mic_muted(ctl.get_mute());
-                return;
+            } else {
+                st.set_mic_name(name.into());
             }
-            st.set_mic_name(name.into());
         }
         None => st.set_mic_name("(no capture device)".into()),
     }
+    crate::reconcile::request(crate::reconcile::Scope::Unit("mic_mute"));
 }
 
 // ── OUTPUT (render) side: headphones / sound card / speakers ────────────────

@@ -184,10 +184,13 @@ export global State {
     in-out property <string> dpi-stages-note: "3 stages ready";
     callback dpi-stages-edited(string);              // re-parse the list into dpi-stage-nums
     callback apply-dpi-stages(string, int);
-    // SCROLL / HyperScroll stages (gated until class 0x0B is hardware-verified).
-    in-out property <string> scroll-stages: "tactile/free";
-    in-out property <bool> scroll-stages-valid: true;
-    in-out property <string> scroll-stages-note: "2 modes ready";
+    // SCROLL / HyperScroll stages (gated until class 0x0B is hardware-verified). Default is the
+    // honest "nothing persisted yet" dash (matches `sniper-button`'s unset convention) — the launch
+    // `scroll_stage` reconcile unit (glue.rs) publishes this every launch since no code path
+    // persists a chosen table anywhere (no getter, no Profile/Prefs field) to assert instead.
+    in-out property <string> scroll-stages: "—";
+    in-out property <bool> scroll-stages-valid: false;
+    in-out property <string> scroll-stages-note: "no scroll-stage source persisted — pick tactile/free and apply";
     callback scroll-stages-edited(string);
     callback apply-scroll-stages(string);
     // SNIPER / hold-to-precision-DPI — bind a button (press-to-bind) + target DPI.

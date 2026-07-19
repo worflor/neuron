@@ -27,6 +27,120 @@ static STATE: AtomicU8 = AtomicU8::new(0);
 /// Millis since the process epoch of the last [`muted`] read — drives the idle auto-stop.
 static LAST_ACCESS_MS: AtomicU64 = AtomicU64::new(0);
 
+// ── the ECHO LATCH — tell neuron's OWN OS-mute writes apart from a genuinely external change ──
+//
+// Every place neuron itself writes the default capture endpoint's OS mute (`hidwatch::
+// bridge_mic_mute` mirroring a hardware tap, the app's mic-toggle button, a momentary-mic hold, an
+// `Action::MicMute`) calls [`note_self_mute_write`] with the value it just wrote — but ONLY when
+// that write lands on the DEFAULT capture endpoint (`crate::audio::is_default_capture_id`), the one
+// stream the detector samples; a write to a secondary mic must never arm this latch or it could
+// swallow a real external edge on the default mic whenever the two agree on a value.
+//
+// The dispatch mic-tap detector — which watches the OS mute for edges to fire `Trigger::MicTap` —
+// asks [`is_self_echo`] whether the sample it just took is explained by our own write, and if so
+// does not re-fire MicTap's bound effects (state is still published unconditionally either way —
+// only the EFFECTS are gated).
+//
+// DO NOT try to identify our own writes BY VALUE. Three versions tried and each shipped a real bug,
+// because the detector's input — a ~400ms-refreshed cache sampled every ~50ms — coalesces and
+// reorders our writes beyond recovery:
+//   1. clear-on-every-poll: consumed before our write ever surfaced → the echo fired as a phantom.
+//   2. a QUEUE of pending values: kept dead history alive → a stale entry SWALLOWED a genuine tap.
+//   3. convergence on the LATEST value: a momentary press+release RETURNS TO ITS STARTING VALUE, so
+//      the stale pre-write sample equals the expectation, "converges" trivially before the cache has
+//      seen anything, and the late intermediate then fires as a phantom.
+// Each fix was correct and each was an epicycle. The value channel cannot answer "who wrote this?".
+//
+// So this asks a question the channel CAN answer: **did neuron write recently?** A plain time window.
+// No values, no matching, no ordering, therefore no aliasing — the whole bug class is unrepresentable.
+//
+// The honest trade: a genuine external change within [`SELF_WRITE_QUIET`] of one of our own writes is
+// attributed to us and its MicTap effects are skipped. That is the SAFE direction — a phantom tap
+// runs the user's bound actions unbidden, a missed one merely does nothing — and it is narrow: only
+// right after neuron itself wrote the mute. It costs nothing for the PHYSICAL tap, which no longer
+// comes through here at all: `hidwatch` fires MicTap straight from the HID edge it decoded (ground
+// truth, and instant), and this window is what stops its bridge write from double-firing.
+//
+// This is a STOPGAP with a known exit: Core Audio's `SetMute` takes an event-context GUID that
+// `IAudioEndpointVolumeCallback::OnNotify` hands back, so origin can arrive WITH the change and all
+// of this — window, detector polling, inference — is deleted. See docs/PERF-AUDIT.md §8.
+static LAST_SELF_WRITE: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+
+/// BACKSTOP TTL only — the window normally closes when our write's EDGE actually surfaces in the
+/// cache (see [`consume_self_write_on_edge`]), NOT on this clock. The clock exists solely so a write
+/// that never produces an observable edge (write failed to land, endpoint vanished) can't leave the
+/// window armed forever and swallow a later real tap. Generous, because the cache is nominally ~400ms
+/// but its Core-Audio call can stall / the pump can starve — a fixed 400ms would let a delayed edge
+/// fire as a phantom, the exact bug this backstop must NOT cause by closing too early.
+const SELF_WRITE_QUIET: Duration = Duration::from_secs(3);
+
+fn last_self_write() -> &'static Mutex<Option<Instant>> {
+    LAST_SELF_WRITE.get_or_init(|| Mutex::new(None))
+}
+
+/// Record that NEURON ITSELF just wrote the DEFAULT capture endpoint's OS mute — see the doc above.
+/// Callers MUST have checked `crate::audio::is_default_capture_id` first (the detector only ever
+/// samples the default endpoint, so a secondary mic's write must never open this window).
+///
+/// Takes no value ON PURPOSE: what we wrote is exactly the thing that cannot be matched reliably
+/// against a lagging cache, and a parameter nobody can use honestly is a lie in the signature.
+pub fn note_self_mute_write() {
+    *last_self_write()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Instant::now());
+}
+
+/// Forget any open window. TEST SUPPORT — this is process-global, so a test wanting a known-clean
+/// start (including one in ANOTHER crate, e.g. the dispatch detector's sequence tests) needs a way
+/// to clear it. Mirrors `neuron-app::reconcile`'s `reset_readiness`/`reset_registry`. Nothing in the
+/// live path calls this.
+pub fn reset_self_mute_write() {
+    *last_self_write()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+}
+
+/// Is the self-write window open right now? (Within the backstop TTL of an un-consumed write.)
+fn window_open() -> bool {
+    last_self_write()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_some_and(|at| at.elapsed() <= SELF_WRITE_QUIET)
+}
+
+/// Called by the dispatch detector for a NON-edge sample (the cache still shows the same value as
+/// last poll): is our own write still pending? Just reports whether the window is open; a non-edge
+/// can't be the write surfacing, so it never consumes. Kept distinct from
+/// [`consume_self_write_on_edge`] so the edge case can CLOSE the window and this cannot.
+pub fn in_self_write_window() -> bool {
+    window_open()
+}
+
+/// Called by the dispatch detector for an EDGE sample (the cache value changed since last poll):
+/// should this edge be credited to NEURON rather than the user?
+///
+/// If our write is still pending (window open), THIS edge is that write finally surfacing in the
+/// cache — however delayed. Consume the window (close it) and return `true` to suppress MicTap: the
+/// write produces exactly ONE edge, so once we've attributed it, the window's job is done and any
+/// FURTHER edge is genuinely external. Closing on the edge — not on a wall clock — is what makes the
+/// suppression robust to an arbitrarily-delayed cache observation (endpoint stall / pump starvation),
+/// which a fixed-duration window could not cover. Returns `false` (fire) when nothing was pending.
+pub fn consume_self_write_on_edge() -> bool {
+    let mut g = last_self_write()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match *g {
+        Some(at) if at.elapsed() <= SELF_WRITE_QUIET => {
+            *g = None; // this edge IS our write surfacing — attributed, window done
+            true
+        }
+        _ => {
+            *g = None; // stale/absent — clear so it can't linger
+            false
+        }
+    }
+}
+
 fn epoch() -> &'static Instant {
     static E: OnceLock<Instant> = OnceLock::new();
     E.get_or_init(Instant::now)
@@ -163,5 +277,80 @@ mod tests {
         assert_eq!(STATE.load(Ordering::Relaxed), 2, "muted must store the MUTED tri-state");
         publish_hardware(false);
         assert_eq!(STATE.load(Ordering::Relaxed), 1, "live must store the LIVE tri-state");
+    }
+
+    // ── the self-write window ────────────────────────────────────────────────────────────────
+
+    /// Serializes these: the window is one process-global cell every test below shares.
+    static LATCH_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Open the window as if the write happened at `at` — so expiry is testable without sleeping.
+    fn arm_at(at: Instant) {
+        *last_self_write().lock().unwrap_or_else(|e| e.into_inner()) = Some(at);
+    }
+
+    #[test]
+    fn no_write_means_an_edge_is_the_users() {
+        let _guard = LATCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_self_mute_write();
+        assert!(!in_self_write_window(), "no window open");
+        assert!(
+            !consume_self_write_on_edge(),
+            "with nothing of ours pending, an edge belongs to the user (fire)"
+        );
+    }
+
+    #[test]
+    fn our_writes_edge_is_consumed_exactly_once() {
+        let _guard = LATCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_self_mute_write();
+        note_self_mute_write();
+        assert!(in_self_write_window(), "a non-edge poll still sees the window open");
+        assert!(consume_self_write_on_edge(), "our write's edge is ours — suppress");
+        assert!(
+            !consume_self_write_on_edge(),
+            "and it CLOSED on that edge — the next edge is external (fire)"
+        );
+        assert!(!in_self_write_window(), "window is closed after the edge consumed it");
+    }
+
+    #[test]
+    fn a_non_edge_poll_does_not_consume_the_window() {
+        // The un-changed polls before our write surfaces must NOT close the window — only the edge.
+        let _guard = LATCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_self_mute_write();
+        note_self_mute_write();
+        for _ in 0..8 {
+            assert!(in_self_write_window(), "still armed through the lagging polls");
+        }
+        assert!(consume_self_write_on_edge(), "then the edge consumes it");
+    }
+
+    #[test]
+    fn the_backstop_ttl_closes_a_write_that_never_produced_an_edge() {
+        // If our write never surfaces as an edge (write didn't land / endpoint vanished), the TTL is
+        // the only thing that stops the window swallowing a later real tap.
+        let _guard = LATCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_self_mute_write();
+        let Some(stale) = Instant::now().checked_sub(SELF_WRITE_QUIET + Duration::from_millis(200))
+        else {
+            return; // machine booted moments ago — no earlier instant to backdate to
+        };
+        arm_at(stale);
+        assert!(!in_self_write_window(), "past the backstop TTL, the window is closed");
+        assert!(
+            !consume_self_write_on_edge(),
+            "an aged-out window suppresses nothing — a real edge fires"
+        );
+    }
+
+    #[test]
+    fn the_backstop_ttl_outlasts_the_cache_refresh() {
+        // The TTL is a BACKSTOP, but it must still comfortably outlast the ~400ms cache — a shorter
+        // one would let a merely-slow (not stalled) edge age out and fire as a phantom.
+        assert!(
+            SELF_WRITE_QUIET >= Duration::from_millis(800),
+            "backstop TTL must comfortably exceed the ~400ms cache refresh"
+        );
     }
 }

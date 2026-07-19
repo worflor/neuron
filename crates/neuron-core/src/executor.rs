@@ -71,6 +71,20 @@ impl TurboRuntime {
         self.held.clear();
     }
 
+    /// Is ANY turbo currently held? Cheap (a length check) — the pump-cadence seam (see
+    /// `neuron-app::dispatch::live_tick`) calls this every tick to decide whether it needs a short
+    /// wake interval, so it must stay O(1).
+    pub fn is_active(&self) -> bool {
+        !self.held.is_empty()
+    }
+
+    /// The shortest repeat interval among currently-held turbos, if any are held — so the pump-
+    /// cadence seam can use the turbo's OWN rate instead of a guessed constant. `None` when no
+    /// turbo is held (mirrors [`is_active`](Self::is_active)).
+    pub fn min_interval(&self) -> Option<Duration> {
+        self.held.values().map(|t| t.interval).min()
+    }
+
     pub fn tick(&mut self, exec: &mut DispatchExecutor, intents: &mut impl IntentRunner) {
         let now = Instant::now();
         for turbo in self.held.values_mut() {

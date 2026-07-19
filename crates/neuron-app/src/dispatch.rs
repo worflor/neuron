@@ -56,7 +56,16 @@ fn send_live(cmd: LiveCommand) -> bool {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .as_ref()
         .map(|(_, tx)| tx.clone());
-    tx.is_some_and(|tx| tx.send(cmd).is_ok())
+    let sent = tx.is_some_and(|tx| tx.send(cmd).is_ok());
+    if sent {
+        // Every LiveCommand (Reload/Inject/ToggleHyperShift/ApplyProfile/ReconcileGamingHook)
+        // funnels through this one function, so signaling the pump wake event here (see
+        // `neuron::controls::wake_pump`) covers all of them in one place: with the blocking-wait
+        // pump active, this wakes it immediately so the command is serviced on the next tick instead
+        // of waiting out the cadence. (Under `NEURON_PUMP=poll` the fixed sleep ignores it, harmless.)
+        neuron::controls::wake_pump();
+    }
+    sent
 }
 
 /// Monotonic config generation, bumped with every [`request_reload`]. Long-lived watchers that
@@ -243,6 +252,10 @@ impl LiveRuntime {
             }
         }
         self.stop.store(true, Ordering::SeqCst);
+        // The pump may now be blocked in the wait (up to ~1s idle) instead of busy-polling —
+        // wake it so it re-checks `stop` at the top of its loop and exits immediately, keeping
+        // this join fast instead of stalling out the rest of a stale interval.
+        neuron::controls::wake_pump();
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
@@ -298,14 +311,19 @@ struct LiveCtx<'a> {
     sniper: SniperMap,
     turbos: RefCell<TurboRuntime>,
     live_rx: Receiver<LiveCommand>,
-    /// Mic-tap detection reads the CACHED mic mute (refreshed off-thread by `beacon::audio_cache`).
-    /// Polling `VolumeCtl::get_mute()` inline here used to hang the whole dispatch loop when an audio
-    /// endpoint stalled (Core-Audio COM blocks indefinitely) — the dispatch-stall the flight log
-    /// caught. The cache means NO COM on this hot path; tap latency is the cache's ~400ms, fine for
-    /// a mute toggle. `None` until the cache warms / if no mic.
+    /// Dispatch's OWN previous mic-mute cache sample — the stream it edge-detects on to fire MicTap
+    /// on a real external toggle. SEPARATE from `glue::mic_tap_baseline` (the pill's shown value): a
+    /// fresher source (the launch reconcile unit) can seed the baseline while dispatch's 400ms cache
+    /// still lags, and edge-detecting against that cross-source value would misread the lag as a
+    /// phantom tap. `None` until dispatch's first sample.
     last_mute: Option<bool>,
     switcher: neuron::app_focus::AppFocusSwitch,
     tick: u32,
+    /// When the ~50ms mic-tap / app-focus polls last ran. These poll at their OWN wall-clock cadence
+    /// (`POLL_INTERVAL`), decoupled from the PUMP's cadence: the pump now waits a variable interval
+    /// (turbo ~8ms, idle ~1000ms), so a fixed `tick % N` gate would over-poll during turbo and
+    /// under-poll (10×!) at idle. `None` until the first poll.
+    last_poll: Option<Instant>,
     reload_pending: bool,
     injected: Vec<Trigger>,
     hypershift_latch: bool,
@@ -347,6 +365,7 @@ impl<'a> LiveCtx<'a> {
             last_mute: None,
             switcher: neuron::app_focus::AppFocusSwitch::new(),
             tick: 0,
+            last_poll: None,
             reload_pending: false,
             injected: Vec::new(),
             hypershift_latch: false,
@@ -504,6 +523,7 @@ fn run_worker(weak: slint::Weak<AppWindow>, stop: Arc<AtomicBool>, live_rx: Rece
         last_mute: None,
         switcher: neuron::app_focus::AppFocusSwitch::new(),
         tick: 0,
+        last_poll: None,
         reload_pending: false,
         injected: Vec::new(),
         hypershift_latch: false,
@@ -652,11 +672,47 @@ fn live_edge(ctx: &mut LiveCtx, ev: &ControlEvent) {
     publish_held(&ctx.rt, &ctx.status, &ctx.weak);
 }
 
-/// The live worker's per-tick handler — the exact body of `run_worker`'s old `on_tick` closure,
-/// verbatim (tick increment, command drain, flight pulse, reload rebuild, injected drain, latch
-/// reconcile, gaming hook reconcile, turbo tick, the %10 throttle and the mic-tap + app-focus polls
-/// below it), now callable one tick at a time so a test can drive it directly.
-fn live_tick(ctx: &mut LiveCtx) {
+/// Fallback pump cadence while a turbo is held but [`TurboRuntime::min_interval`] somehow can't
+/// name one (never happens today — `min_interval` is always `Some` when `is_active()` is true;
+/// kept as a documented floor rather than unwrapping).
+const TURBO_FALLBACK_CADENCE: Duration = Duration::from_millis(8);
+/// Matches today's `tick % 10` throttle: the mic-tap / app-focus polls already run at ~50ms
+/// (5ms pump iteration * 10). Returned as the cadence hint while the engine binds either.
+const POLL_CADENCE: Duration = Duration::from_millis(50);
+/// Nothing in the active engine needs periodic polling — a generous idle cadence. Once the
+/// blocking-wait rewrite lands, the wake event (not this hint) delivers real work instantly; this
+/// value only bounds how long the pump would otherwise sit blocked with nothing to do.
+const IDLE_CADENCE: Duration = Duration::from_millis(1000);
+
+/// Wall-clock cadence for the mic-tap / app-focus polls, independent of the pump's own (variable)
+/// cadence. Matches the ~50ms the old fixed-5ms pump delivered via its `tick % 10` gate.
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// The pump-cadence HINT this tick wants (see [`controls::listen_until`]'s `on_tick` doc): the max
+/// time the pump should wait before calling `live_tick` again. Cheap on every call — turbo
+/// activity is an O(1) check ([`TurboRuntime::is_active`]) and the engine's poll-need is a cached
+/// bool ([`controls::Runtime::needs_periodic_poll`]), never a rule rescan. The blocking-wait pump
+/// waits at most this long before the next tick (turbo ~8ms / mic-or-appfocus-bound 50ms / idle 1s);
+/// under `NEURON_PUMP=poll` the fixed 5ms sleep ignores it.
+fn live_cadence(ctx: &LiveCtx) -> Duration {
+    let turbos = ctx.turbos.borrow();
+    if turbos.is_active() {
+        return turbos.min_interval().unwrap_or(TURBO_FALLBACK_CADENCE);
+    }
+    drop(turbos);
+    if ctx.rt.borrow().needs_periodic_poll() {
+        return POLL_CADENCE;
+    }
+    IDLE_CADENCE
+}
+
+/// The live worker's per-tick handler — the exact body of `run_worker`'s old `on_tick` closure
+/// (tick increment, command drain, flight pulse, reload rebuild, injected drain, latch reconcile,
+/// gaming hook reconcile, turbo tick, and the timestamp-throttled mic-tap + app-focus polls below
+/// it), now callable one tick at a time so a test can drive it directly. Returns the pump-cadence
+/// hint (see [`live_cadence`]) at EVERY exit path — the blocking-wait pump waits that long before
+/// the next tick.
+fn live_tick(ctx: &mut LiveCtx) -> Duration {
     ctx.tick = ctx.tick.wrapping_add(1);
     for cmd in ctx.live_rx.try_iter() {
         match cmd {
@@ -766,22 +822,51 @@ fn live_tick(ctx: &mut LiveCtx) {
             .borrow_mut()
             .tick(&mut ctx.exec.borrow_mut(), &mut intents);
     }
-    if !ctx.tick.is_multiple_of(10) {
-        return; // throttle the periodic polls to ~50 ms
+    // Throttle the periodic polls (mic-tap / app-focus) to their OWN ~50ms wall-clock cadence,
+    // independent of how fast the pump is ticking. The old `tick % 10` gate assumed a fixed 5ms
+    // pump iteration (10 × 5ms ≈ 50ms); the pump now waits a VARIABLE cadence, so counting ticks
+    // would poll every ~80ms under turbo and only every ~10s at idle (a 10× regression the reviewer
+    // caught). A timestamp gate gives the real ~50ms in every pump mode.
+    let now = Instant::now();
+    if ctx.last_poll.is_some_and(|t| now.duration_since(t) < POLL_INTERVAL) {
+        return live_cadence(ctx);
     }
+    ctx.last_poll = Some(now);
     // mic tap (cached Core-Audio mute toggle) -> a MicTap trigger AND its raw Input usage.
+    // Reads the CACHED mic mute (refreshed off-thread by `beacon::audio_cache`) — polling
+    // `VolumeCtl::get_mute()` inline here used to hang the whole dispatch loop when an audio
+    // endpoint stalled (Core-Audio COM blocks indefinitely), the dispatch-stall the flight log
+    // caught. STATE PUBLISH and EFFECTS FIRING are two separate concerns here (the Chunk-B fix):
+    // publishing to the UI pill is UNCONDITIONAL, every sample, through the one authoritative
+    // writer (`glue::publish_mic_state`) — the old code only published on a detected `fire` edge,
+    // so a wrong value seeded before this loop's first sample (or by anything else) could sit on
+    // screen, silently adopted as the new baseline, until the NEXT real toggle. Firing the
+    // EFFECTS (`Trigger::MicTap` + its synthetic `Input`) stays edge-gated, via the pure
+    // `mic_tap_decision`, and additionally consults the echo latch (`neuron::mic_state::
+    // take_self_mute_write`) so a change neuron caused itself (hidwatch's hardware-mute bridge,
+    // the panel's mic toggle, a momentary hold, `Action::MicMute`) never re-fires as if it were a
+    // fresh external tap.
     if let Some(now) = crate::beacon::audio_cache::snap().mic.map(|(_, m)| m) {
-        let fire = ctx.last_mute == Some(!now); // a real toggle (not the first warm read)
+        // Edge-detect on dispatch's OWN cache stream (`ctx.last_mute`), NOT the shared pill baseline:
+        // a fresher source can seed the baseline while this ~400ms cache still lags, and firing off
+        // that cross-source disagreement would be a phantom tap. First sample (`None`) is never an
+        // edge.
+        let own_edge = ctx.last_mute.is_some_and(|prev| prev != now);
+        // Decide MicTap's EFFECTS. Only an EDGE can be a tap; and an edge that is OUR OWN write
+        // finally surfacing must not fire. `consume_self_write_on_edge` answers the latter AND closes
+        // the self-write window on that edge — so the suppression is bounded by "our write surfaced",
+        // not by a wall clock, and therefore survives an arbitrarily-delayed cache observation
+        // (endpoint stall / pump starvation) that a fixed-duration window could not cover. A non-edge
+        // sample can't be our write surfacing, so it never consumes the window.
+        let fire = own_edge && !neuron::mic_state::consume_self_write_on_edge();
+        // Publish the pill on an own-stream edge, OR to seed it when nothing has published yet (the
+        // launch reconcile unit may have read Unknown or not run). Never publish this (possibly
+        // stale) reading OVER a value a fresher source already seeded — that flips the pill backward.
+        if own_edge || crate::glue::mic_tap_baseline().is_none() {
+            crate::glue::publish_mic_state(now);
+        }
         ctx.last_mute = Some(now);
         if fire {
-            // mirror the detected flip into the UI's mic pill — the panel otherwise only
-            // updates on its own toggle or a manual refresh.
-            let ui = ctx.weak.clone();
-            let _ = slint::invoke_from_event_loop(move || {
-                if let Some(app) = ui.upgrade() {
-                    app.global::<State>().set_mic_muted(now);
-                }
-            });
             fire_trigger(
                 &mut ctx.devices.borrow_mut(),
                 &mut ctx.rt.borrow_mut(),
@@ -825,18 +910,33 @@ fn live_tick(ctx: &mut LiveCtx) {
             &ctx.weak,
         );
     }
+    live_cadence(ctx)
 }
 
 // ── MOMENTARY MIC: the held push-to-talk / push-to-mute edge handling ─────────────────────────
 type MomentaryMap =
     std::cell::RefCell<std::collections::HashMap<neuron::engine::Trigger, (Option<String>, bool)>>;
 
-/// Open the mic VolumeCtl for a momentary action's (optional) device. Cross-platform via the
-/// `audio` seam: off-Windows `VolumeCtl::open` returns `None` (no audio backend), so the whole
-/// momentary path falls through to a no-op without any cfg gating here.
-fn open_mic(device: &Option<String>) -> Option<neuron::audio::VolumeCtl> {
+/// Open the mic VolumeCtl for a momentary action's (optional) device, WITH the resolved endpoint id.
+/// Callers need the id to ask `neuron::audio::is_default_capture_id` before arming the echo latch: a
+/// momentary bound to a NAMED secondary mic must not arm a latch the dispatch detector (which only
+/// ever samples the DEFAULT endpoint) would then consume against an unrelated real tap.
+/// Cross-platform via the `audio` seam: off-Windows `VolumeCtl::open` returns `None` (no audio
+/// backend), so the whole momentary path falls through to a no-op without any cfg gating here.
+fn open_mic(device: &Option<String>) -> Option<(String, neuron::audio::VolumeCtl)> {
     neuron::audio::resolve_capture(device.as_deref())
-        .and_then(|e| neuron::audio::VolumeCtl::open(&e.id))
+        .and_then(|e| neuron::audio::VolumeCtl::open(&e.id).map(|c| (e.id, c)))
+}
+
+/// Open the mic-tap self-write window for a mute write we just made — but ONLY if it (a) actually
+/// CHANGED the state (`changed`: a no-op write is no transition, so the poll sees no edge and a
+/// window would only shadow a real tap) and (b) landed on the DEFAULT capture endpoint (the one
+/// stream the detector samples). See `neuron::mic_state`'s doc. `VolumeCtl::set_mute` returns
+/// whether it changed anything, so the window now tracks real OS transitions, not write attempts.
+fn note_mic_write_if_default(id: &str, changed: bool) {
+    if changed && neuron::audio::is_default_capture_id(id) {
+        neuron::mic_state::note_self_mute_write();
+    }
 }
 
 /// A trigger's DOWN edge: if it binds a momentary mic, capture the resting mute-state, flip the mic
@@ -853,9 +953,14 @@ fn momentary_press(
     let Some((device, mode)) = rt.borrow().momentary_mic_for(trigger) else {
         return;
     };
-    if let Some(ctl) = open_mic(&device) {
+    if let Some((id, ctl)) = open_mic(&device) {
         let (while_held, on_release) = mode.states(ctl.get_mute());
-        ctl.set_mute(while_held);
+        // Open the self-write window only if the write CHANGES the OS state (`set_mute` returns that).
+        // A no-op write is no transition, so the dispatch poll sees no edge and a window would only
+        // shadow a genuine tap. A real transition's ~1s window opens well inside the ~400ms cache lag
+        // before the poll could sample it, so there's no race despite arming after the write.
+        let changed = ctl.set_mute(while_held);
+        note_mic_write_if_default(&id, changed);
         held.borrow_mut()
             .insert(trigger.clone(), (device, on_release));
     }
@@ -864,8 +969,9 @@ fn momentary_press(
 /// A trigger's UP edge: restore the mic to its resting state.
 fn momentary_release(held: &MomentaryMap, trigger: &neuron::engine::Trigger) {
     if let Some((device, restore)) = held.borrow_mut().remove(trigger) {
-        if let Some(ctl) = open_mic(&device) {
-            ctl.set_mute(restore);
+        if let Some((id, ctl)) = open_mic(&device) {
+            let changed = ctl.set_mute(restore);
+            note_mic_write_if_default(&id, changed); // only on a real transition — see momentary_press
         }
     }
 }
@@ -874,8 +980,9 @@ fn momentary_release(held: &MomentaryMap, trigger: &neuron::engine::Trigger) {
 /// momentary can never strand the mic flipped.
 fn momentary_release_all(held: &MomentaryMap) {
     for (_, (device, restore)) in held.borrow_mut().drain() {
-        if let Some(ctl) = open_mic(&device) {
-            ctl.set_mute(restore);
+        if let Some((id, ctl)) = open_mic(&device) {
+            let changed = ctl.set_mute(restore);
+            note_mic_write_if_default(&id, changed); // only on a real transition — see momentary_press
         }
     }
 }
@@ -1243,6 +1350,95 @@ fn post_status(weak: &slint::Weak<AppWindow>, status: &Arc<Mutex<LiveStatus>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── the mic-tap detector, END TO END ────────────────────────────────────────────────────────
+    //
+    // These drive the REAL detector logic from `live_tick` — `own_edge && !consume_self_write_on_edge()`
+    // over the REAL process-global self-write window — through the REAL timing sequences, which is
+    // where every actual bug in this path has lived: the detector samples a ~400ms-refreshed cache
+    // every ~50ms, so neuron's own writes surface LATE, out of step, and sometimes not at all. Four
+    // successive designs each passed narrower unit tests and still fired phantom taps (or swallowed
+    // real ones) against that timing. A phantom tap runs arbitrary user-bound actions, so these are
+    // the tests that matter. (There is deliberately NO isolated pure-decision test: the decision is a
+    // two-liner inlined in the loop, and a separate test of a hand-fed version was, twice now, a
+    // fiction that misled review — so the contract is pinned only where it actually runs.)
+
+    /// Serializes these tests: the self-write window is process-global.
+    static MIC_SEQ_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// One cache sample through the EXACT detector logic `live_tick` runs: an edge is a change in our
+    /// own cache stream; an edge fires MicTap's effects unless it's our own write surfacing (which
+    /// also CLOSES the window). Advances the own-stream baseline. Returns whether the effects fire.
+    fn detect(last: &mut Option<bool>, now: bool) -> bool {
+        let own_edge = last.is_some_and(|prev| prev != now);
+        let fire = own_edge && !neuron::mic_state::consume_self_write_on_edge();
+        *last = Some(now);
+        fire
+    }
+
+    #[test]
+    fn seq_quick_momentary_through_a_lagging_cache_never_fires_a_phantom() {
+        // A push-to-talk TAP: press writes, release writes, both inside ONE ~400ms cache window. The
+        // cache can then surface the INTERMEDIATE muted state late — an edge that looks exactly like
+        // a physical tap but is entirely neuron's own doing. Neither our-write edge may fire.
+        let _g = MIC_SEQ_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        neuron::mic_state::reset_self_mute_write();
+        let mut last = Some(false); // resting: unmuted, and the detector has seen that
+        neuron::mic_state::note_self_mute_write(); // press (window opens)
+        neuron::mic_state::note_self_mute_write(); // release — window re-armed to now
+        assert!(!detect(&mut last, false), "stale pre-write sample: no edge, no fire");
+        assert!(
+            !detect(&mut last, true),
+            "the INTERMEDIATE hold surfacing late is OUR edge — consumed, no phantom"
+        );
+        // The window closed on that edge; the cache settling back to `false` is a SECOND edge. With
+        // only one un-consumed write left in a real momentary (press+release = two writes), a fresh
+        // note stands in for the release's own late edge.
+        neuron::mic_state::note_self_mute_write();
+        assert!(!detect(&mut last, false), "the release's edge is ours too");
+    }
+
+    #[test]
+    fn seq_a_delayed_edge_beyond_a_fixed_window_is_still_ours() {
+        // THE finding this rewrite fixes. Suppression closes on the EDGE, not a wall clock — so even
+        // if the cache is stalled far past any fixed duration, our write's edge (whenever it finally
+        // surfaces) is still attributed to us. A fixed-timer window would have fired a phantom here.
+        let _g = MIC_SEQ_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        neuron::mic_state::reset_self_mute_write();
+        let mut last = Some(false);
+        neuron::mic_state::note_self_mute_write(); // our write
+        for _ in 0..50 {
+            assert!(!detect(&mut last, false), "long stall — cache hasn't moved, no edge");
+        }
+        assert!(!detect(&mut last, true), "the write's edge, however delayed, is consumed as ours");
+        assert!(detect(&mut last, false), "and the NEXT edge is external again — fires");
+    }
+
+    #[test]
+    fn seq_an_external_change_with_no_window_fires_once() {
+        // The case the detector still exists for: ANOTHER APP changed our mute. (A physical Seiren
+        // tap does NOT come through here — hidwatch fires it from the HID edge directly.)
+        let _g = MIC_SEQ_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        neuron::mic_state::reset_self_mute_write();
+        let mut last = Some(false);
+        assert!(detect(&mut last, true), "another app muted us — fire MicTap");
+        assert!(!detect(&mut last, true), "…and only once — no change is not an edge");
+        assert!(detect(&mut last, false), "it unmuting us fires again");
+    }
+
+    #[test]
+    fn seq_a_non_edge_sample_never_consumes_the_window() {
+        // The un-changed polls between our write and its cache edge must leave the window ARMED — a
+        // design that consumed on every sample lost it before the edge arrived and fired a phantom.
+        let _g = MIC_SEQ_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        neuron::mic_state::reset_self_mute_write();
+        let mut last = Some(false);
+        neuron::mic_state::note_self_mute_write(); // e.g. hidwatch bridging a hardware tap
+        for _ in 0..8 {
+            assert!(!detect(&mut last, false), "still lagging — no edge, window untouched");
+        }
+        assert!(!detect(&mut last, true), "our write's edge finally surfaces — suppressed");
+    }
 
     /// LiveStatus defaults are inert (no fired triggers, no held layers) — the loop hasn't run.
     #[test]
@@ -1843,7 +2039,9 @@ mod tests {
         ) {
             match op {
                 Op::NoOp => {}
-                Op::Tick => live_tick(ctx),
+                Op::Tick => {
+                    live_tick(ctx);
+                }
                 Op::Burst(n) => {
                     for _ in 0..*n {
                         live_tick(ctx);

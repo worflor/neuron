@@ -38,6 +38,7 @@ mod prof_log;
 #[cfg(windows)]
 mod purge;
 mod raster;
+mod reconcile;
 mod runtime;
 mod sound;
 mod strokelab;
@@ -415,6 +416,18 @@ fn main() {
     // presents the binary radial instead (green=yes / red=no / vertical=pass). Live-path only,
     // like the dispatch runtime — tests never start it.
     beacon::start(weak);
+
+    // ── RECONCILER (Chunk B: mic-mute launch sync) ────────────────────────
+    // Register every reconcile unit + start its worker now that hidwatch/beacon/dispatch have all
+    // at least been asked to start, then fire the one launch-wide request. Each unit is itself
+    // gated on its own `Readiness`-or-timeout, so it's correct even if a dependency signals before
+    // or after this point — this just needs to run once, after everything above.
+    glue::reconcile_setup();
+    // The initial device enumeration finished long before here — `build_window` (line ~280) runs
+    // `glue::install`, whose `refresh_devices` scans synchronously. State it as the fact it is, so a
+    // unit that needs a real device list can wait on it rather than racing an empty registry.
+    reconcile::signal_ready(reconcile::Readiness::DevicesScanned);
+    reconcile::request(reconcile::Scope::All);
 
     if !start_hidden {
         show_window(&resident);

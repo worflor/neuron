@@ -93,6 +93,27 @@ pub fn endpoint_matches_product(endpoint_name: &str, product: &str) -> bool {
     !p.is_empty() && endpoint_name.to_lowercase().contains(&p.to_lowercase())
 }
 
+/// Is `id` the CURRENT DEFAULT capture endpoint's id?
+///
+/// The default capture endpoint is the ONE mic the app speaks for globally: it is what the UI's
+/// `mic-muted` pill represents and the only stream the dispatch mic-tap detector samples. So both
+/// halves of the mute story must be scoped to it — a write to a SECONDARY mic must not arm the
+/// (process-global) echo latch dispatch consumes, or it could swallow a real external edge on the
+/// default mic whenever the two happen to agree on a value. Kept here beside
+/// [`endpoint_matches_product`] so the "is this the mic we speak for?" question has ONE answer, at
+/// the root, rather than a re-derived comparison at each call site.
+pub fn is_default_capture_id(id: &str) -> bool {
+    resolve_capture(None).is_some_and(|ep| ep.id == id)
+}
+
+/// Does `product` identify the CURRENT DEFAULT capture endpoint (see [`is_default_capture_id`])?
+/// The product-name form, for event sources that know a device by its product string rather than an
+/// endpoint id — e.g. a hardware-mute push, which must only speak for the pill when the mic that
+/// pushed it IS the default one.
+pub fn default_capture_matches_product(product: &str) -> bool {
+    resolve_capture(None).is_some_and(|ep| endpoint_matches_product(&ep.name, product))
+}
+
 /// Normalize an OPTIONAL explicit device needle from config/CLI: a PRESENT-BUT-BLANK string
 /// (`device = ""` in a binding, `--device ""` on the CLI) means "no explicit device", exactly like
 /// an absent field — so the resolvers fall through to their preference order. Before this, a blank
@@ -685,21 +706,47 @@ mod imp {
             v
         }
 
-        pub fn get_mute(&self) -> bool {
+        /// The current OS mute state, or `None` if the `GetMute` call FAILED — a failed read must
+        /// not masquerade as a definite `false`, or a caller could skip a needed write (see
+        /// `set_mute`). The public [`get_mute`](Self::get_mute) keeps the historical infallible
+        /// `bool` (failure → `false`) for callers that only display it.
+        fn try_get_mute(&self) -> Option<bool> {
             unsafe {
                 let vt = vtbl::<IAudioEndpointVolumeVtbl>(self.vol);
                 let mut m = 0i32;
-                let _ = ((*vt).get_mute)(self.vol, &mut m);
-                m != 0
+                if ((*vt).get_mute)(self.vol, &mut m) < 0 {
+                    return None; // GetMute failed — we do NOT know the state
+                }
+                Some(m != 0)
             }
         }
+        pub fn get_mute(&self) -> bool {
+            self.try_get_mute().unwrap_or(false)
+        }
+        /// Set the mute state. Returns `true` only if the OS state ACTUALLY CHANGED — i.e. the write
+        /// both was needed (the endpoint didn't already hold `mute`) AND succeeded (`SetMute`'s
+        /// HRESULT is checked). Callers use that to arm the mic-tap self-write window ONLY on a real
+        /// transition: a redundant OR failed write produces no edge for the dispatch poll to see, so
+        /// it must not open a window that would shadow a genuine tap, nor publish a value we didn't
+        /// actually set.
+        ///
+        /// The redundant-write skip fires ONLY on a TRUSTED read (`try_get_mute` returned `Some`).
+        /// If the read failed we do not know the state, so we attempt the write rather than assume
+        /// it's already correct — the safe direction, since a needless write is harmless but a
+        /// skipped needed one leaves the mic wrong.
         pub fn set_mute(&self, mute: bool) -> bool {
+            if self.try_get_mute() == Some(mute) {
+                return false; // trusted read says already there — no transition
+            }
             unsafe {
                 let vt = vtbl::<IAudioEndpointVolumeVtbl>(self.vol);
-                ((*vt).set_mute)(self.vol, mute as i32, std::ptr::null()) >= 0
+                ((*vt).set_mute)(self.vol, mute as i32, std::ptr::null()) >= 0 // true only if it landed
             }
         }
         pub fn toggle_mute(&self) -> bool {
+            // Flip relative to the current state (best-effort read; `get_mute` → `false` on a failed
+            // read, so a toggle from an unknown state still moves it). Returns the value we AIMED to
+            // set; `set_mute` reports whether it actually landed for the self-write-window callers.
             let next = !self.get_mute();
             self.set_mute(next);
             next
