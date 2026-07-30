@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Lifecycle churn -- the unit-level sibling of the whole-app resident BUDGET lane
 //! (`neuron-testkit::budget`). Every thread-owning type in this crate (`OrgbServer`,
 //! `ChromaHttpServer`, `ObsConnection`, `Writer`) grew a bounded, join-on-Drop teardown so a

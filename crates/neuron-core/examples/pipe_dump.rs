@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Dump every enumerated Razer HID collection — the raw bus truth `synth`/`discover` filter
 //! from. Diagnostic for emergent-discovery work: shows which pipes carry the razer_report
 //! signature (91-byte feature report) and which are other HID (consumer controls, audio

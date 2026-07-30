@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Radial (pie / comms-wheel) menu — the **degenerate weave**: the simplest case of the
 //! [`crate::spellweaving`] system, NOT a separate one. Hold the trigger, flick a direction, release;
 //! the flick's net direction buckets into one of N sectors, each bound to a quick action. It's a

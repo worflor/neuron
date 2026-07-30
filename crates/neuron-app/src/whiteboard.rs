@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! WHITEBOARD — vector ink over the whole desk, on the spellweaving engine.
 //!
 //! A virtual-screen, click-through, topmost canvas that is HIDDEN (and costs nothing) until ink
@@ -350,7 +354,7 @@ struct Stroke {
 // next call instead of stranding draw commands in a dead channel. `None` = can't start now.
 fn canvas() -> Option<Sender<Cmd>> {
     static TX: crate::worker::Service<Cmd> = crate::worker::Service::new();
-    crate::worker::service_sender(&TX, "neuron-whiteboard", |rx| imp::canvas_thread(rx))
+    crate::worker::service_sender(&TX, "neuron-whiteboard", imp::canvas_thread)
 }
 
 /// Send a canvas command, starting the worker on demand; silently no-ops if it can't start.
@@ -3258,8 +3262,8 @@ mod imp {
             let mut smin = FieldBuf::new(&mut smin_data, w, h);
             let r = carve(&mut dmin, &mut smin, (i32::MIN, i32::MIN), (i32::MAX, i32::MAX), 25.0, 0.0, 1e9);
             // the returned region must itself be within the field's own bounds
-            assert!(r.0 >= 0 && r.2 <= w - 1 || r.0 > r.2);
-            assert!(r.1 >= 0 && r.3 <= h - 1 || r.1 > r.3);
+            assert!(r.0 >= 0 && r.2 < w || r.0 > r.2);
+            assert!(r.1 >= 0 && r.3 < h || r.1 > r.3);
             reset_region(&mut dmin, r);
         }
 

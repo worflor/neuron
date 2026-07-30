@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! RECONCILER — the coordination engine behind "the UI must never show a fake state".
 //!
 //! The bug class this exists to close: a subsystem publishes device/OS state to the UI before the
@@ -296,7 +300,7 @@ fn run_scope(scope: Scope, timeout: Duration) {
 /// worker or block its siblings.
 fn run_unit(unit: &ReconcileUnit) {
     let f = &unit.run;
-    if std::panic::catch_unwind(AssertUnwindSafe(|| f())).is_err() {
+    if std::panic::catch_unwind(AssertUnwindSafe(f)).is_err() {
         crate::flight::trace("reconcile-panic", unit.id, 0);
     }
 }

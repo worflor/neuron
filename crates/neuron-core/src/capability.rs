@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Typed capability decoders. These hold the *semantics* (how to interpret a reply);
 //! the *command codes* come from the device registry, so they generalize across devices
 //! that expose the same capability under different class/id.

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Logitech HID++ 2.0 — dialect #2 (DIALECT-RND wave 3). **EXPERIMENTAL, spec-implemented, ZERO
 //! hardware verification.** Every byte layout here is transcribed from the libratbag / Solaar /
 //! Logitech `cpg-docs` documentation (URLs in the frame/reshape comments below), NOT observed on a

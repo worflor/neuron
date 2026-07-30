@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Device-event listener — the channel Synapse reads for its instant OSD. A Razer wireless mouse
 //! PUSHES a HID input report when its ONBOARD buttons change state (DPI button → "DPI is now X",
 //! scroll-stage button → "stage N", plug/unplug → a `05 0c` power poke). Our transport only ever did
@@ -334,6 +338,10 @@ fn spawn_reader(
             forget_mute_baseline(&release_path);
         },
         move || {
+            // Input posture, same as the macro-key reader: this thread is where a mouse's vendor
+            // event reports (DPI/scroll-stage/side buttons) first become visible to us, and it lives
+            // blocked in a HID read — prompt wake-up is the entire job.
+            neuron::timing::boost_input_thread();
             let reader = match neuron::transport::open_reader(&path) {
                 Ok(r) => r,
                 Err(e) => {
@@ -1065,6 +1073,43 @@ fn settle_charge(pid: u16) -> Option<(u8, bool)> {
     }
 }
 
+/// STARTUP REASSERT — one detached pass over every connected device with a recorded feel intent,
+/// healing it exactly like a wake would ([`reconcile_now`]'s intent-first path, same debounce
+/// stamps so a wake burst right after launch can't double-heal). This closes the window the wake
+/// triggers can't see: the app was NOT running when the device wandered (power-cycle while the PC
+/// was off, another machine, Synapse) — at launch nothing pushes a `05 0c`/`05 02` report, so
+/// without this pass the mouse would sit on foreign state until the next sleep/wake.
+pub fn startup_reassert() {
+    crate::worker::spawn_detached("neuron-feel-reassert", || {
+        let Some(reg) = registry() else { return };
+        let Ok(infos) = neuron::transport::enumerate() else { return };
+        let mut seen: HashSet<u16> = HashSet::new();
+        for i in &infos {
+            if !seen.insert(i.pid) {
+                continue;
+            }
+            // only devices the user configured through neuron, and only the razer custody family
+            // (the varstore getters the reassert reads are razer-framed).
+            if neuron::feel_intent::get(i.pid).is_none() {
+                continue;
+            }
+            let is_razer = reg
+                .devices
+                .iter()
+                .any(|d| d.product_ids().any(|p| p == i.pid) && d.dialect == "razer");
+            if !is_razer {
+                continue;
+            }
+            if !reassert_due(i.pid) {
+                continue; // a wake burst already armed one for this pid
+            }
+            if let Some(d) = open_device(i.pid) {
+                reconcile_now(i.pid, &d);
+            }
+        }
+    });
+}
+
 fn open_device(pid: u16) -> Option<neuron::device::Device> {
     let reg = registry()?;
     let def = reg.devices.iter().find(|d| d.product_ids().any(|p| p == pid))?;
@@ -1167,6 +1212,29 @@ fn maybe_reconcile_announced(pid: u16, announced: u16) {
 /// event earns a line even without NEURON_HIDWATCH; the read/verify inside the write is the safety
 /// net" logging is identical on both paths.
 fn reconcile_now(pid: u16, d: &neuron::device::Device) {
+    // HOST INTENT FIRST (2026-07-23): the device's own persisted plane is corruptible — the
+    // Naga's onboard-profile flash restored the FACTORY table into BOTH varstore planes, so the
+    // plane-vs-plane reconcile below faithfully re-enforced factory DPI against the user. When a
+    // recorded feel intent exists it is the authority; the plane reconcile is only the fallback
+    // for a device the user never configured through neuron.
+    if let Some(intent) = neuron::feel_intent::get(pid) {
+        match neuron::writes::reassert_feel(d, &intent) {
+            Ok(items) if !items.is_empty() => {
+                eprintln!("[hidwatch] pid={pid:04x}: intent-reassert -> {}", items.join(", "));
+            }
+            Ok(_) => {
+                if verbose() {
+                    eprintln!("[hidwatch] pid={pid:04x}: intent-reassert (device already matches)");
+                }
+            }
+            Err(e) => {
+                if verbose() {
+                    eprintln!("[hidwatch] pid={pid:04x}: intent-reassert failed: {e}");
+                }
+            }
+        }
+        return;
+    }
     match neuron::writes::reconcile_volatile_with_persisted(d) {
         Ok(items) if !items.is_empty() => {
             eprintln!("[hidwatch] pid={pid:04x}: wake-reconcile -> {}", items.join(", "));
@@ -1591,11 +1659,11 @@ mod tests {
         for t in 0..THREADS {
             let product = format!("burst-mic-{t}");
             assert!(
-                read.iter().any(|p| *p == product),
+                read.contains(&product),
                 "product {product} missing from the read facet"
             );
             assert!(
-                !write.iter().any(|p| *p == product),
+                !write.contains(&product),
                 "razer-audio must never surface the write facet"
             );
         }

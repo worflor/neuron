@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Input FEEL — the press grammar + timing forgiveness that makes Neuron's triggers feel like a
 //! good game, not a form. First principles:
 //!

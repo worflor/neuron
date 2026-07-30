@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Synapse migration — ingest Synapse's official **Export** files into Neuron config.
 //!
 //! Unlike Synapse's cloud cache (rennab.json / *Enc* = AES, the lock-in we refuse to crack),

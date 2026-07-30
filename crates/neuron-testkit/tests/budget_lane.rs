@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! The resident-citizenship BUDGET LANE — opt-in (it launches the real binary and needs
 //! ~90 s of wall clock), run with:
 //!

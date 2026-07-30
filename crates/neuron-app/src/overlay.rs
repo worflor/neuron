@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! The spell overlay — a transparent, click-through, always-on-top window that renders the
 //! "living sigil" while you weave: a glowing comet trail with a white-hot head, a procedural rune
 //! ring that assembles as you draw and flares on recognition, a charge-glow at the anchor, and
@@ -366,7 +370,7 @@ pub struct NotifySlot {
 
 /// The DIGEST summary card's view (see [`WeaveMode::NotifyStack`]). Drawn only in digest mode when
 /// >1 note is live: a big COUNT, a ROW of the distinct source glyphs (deduped by kind), and the
-/// latest note's title/value line. Its own alpha/scale animate the calm-count reveal.
+/// > latest note's title/value line. Its own alpha/scale animate the calm-count reveal.
 #[derive(Clone, Debug)]
 pub struct DigestView {
     /// how many notes are live (0 = no digest; render the single live slot as a plain card instead).
@@ -516,13 +520,13 @@ mod imp {
         }
         #[inline]
         fn set_tile(&mut self, tx: i32, ty: i32) {
-            if tx >= 0 && tx < TW && ty >= 0 && ty < TH {
+            if (0..TW).contains(&tx) && (0..TH).contains(&ty) {
                 self.on[(ty * TW + tx) as usize] = true;
             }
         }
         #[inline]
         fn get_tile(&self, tx: i32, ty: i32) -> bool {
-            tx >= 0 && tx < TW && ty >= 0 && ty < TH && self.on[(ty * TW + tx) as usize]
+            (0..TW).contains(&tx) && (0..TH).contains(&ty) && self.on[(ty * TW + tx) as usize]
         }
         /// Mark the tile a pixel falls in (off-buffer pixels are ignored — the trail may run past
         /// the buffer edge, transparently).
@@ -610,74 +614,6 @@ mod imp {
                 ((tx + 1) * TILE).min(W),
                 ((ty + 1) * TILE).min(H),
             )
-        }
-    }
-
-    #[cfg(test)]
-    mod tile_tests {
-        use super::*;
-
-        fn count(ts: &TileSet) -> usize {
-            ts.on.iter().filter(|&&b| b).count()
-        }
-
-        #[test]
-        fn box_marks_the_anchor_tile() {
-            let mut ts = TileSet::new();
-            ts.set_box(CX - 10.0, CY - 10.0, CX + 10.0, CY + 10.0);
-            assert!(
-                ts.get_tile(CX as i32 / TILE, CY as i32 / TILE),
-                "the anchor tile must be marked"
-            );
-        }
-
-        #[test]
-        fn ring_marks_a_band_not_a_disc() {
-            // THE load-bearing invariant: a ring at radius 600 must NOT fill the disc — its centre
-            // stays empty and its cover is a small fraction of the filled disc. This is exactly the
-            // O(reach) vs O(reach²) guarantee the whole change rests on (a rune ring is thin curves,
-            // never a solid wheel of work).
-            let mut ring = TileSet::new();
-            ring.set_ring(596.0, 604.0);
-            assert!(
-                !ring.get_tile(CX as i32 / TILE, CY as i32 / TILE),
-                "a ring must leave its centre empty"
-            );
-            let band = count(&ring);
-            assert!(band > 0, "the ring must mark its band");
-            let disc = (std::f32::consts::PI * 600.0 * 600.0 / (TILE * TILE) as f32) as usize;
-            assert!(
-                band * 3 < disc,
-                "band {band} must be far below the filled disc {disc}"
-            );
-        }
-
-        #[test]
-        fn seg_marches_end_to_end_without_gaps() {
-            // a stroke reaching 500px out marks both ends and every tile between (no skipped cell a
-            // dilation would otherwise have to rescue) — the trail's cover is contiguous.
-            let mut ts = TileSet::new();
-            ts.set_seg(CX, CY, CX + 500.0, CY);
-            let ty = CY as i32 / TILE;
-            for tx in (CX as i32 / TILE)..=((CX + 500.0) as i32 / TILE) {
-                assert!(ts.get_tile(tx, ty), "no gap at tile column {tx}");
-            }
-        }
-
-        #[test]
-        fn dilate_grows_and_union_merges() {
-            let mut a = TileSet::new();
-            a.set_px(CX, CY); // mid-buffer → all 8 neighbours are in-bounds
-            assert_eq!(
-                count(&a.dilated(1)),
-                9,
-                "8-neighbour dilation adds the surrounding ring"
-            );
-            let mut b = TileSet::new();
-            b.set_px(CX + 400.0, CY);
-            let mut u = a.clone();
-            u.or_with(&b);
-            assert_eq!(count(&u), count(&a) + count(&b), "disjoint union sums");
         }
     }
 
@@ -2435,7 +2371,7 @@ mod imp {
                                 .is_none()
                             {
                                 if let Some(t) = &ask_pass {
-                                    let ang = (aim.1).atan2(aim.0) as f32;
+                                    let ang = (aim.1).atan2(aim.0);
                                     let (px, py) =
                                         (CX + ang.cos() * (rad - 24.0), CY + ang.sin() * (rad - 24.0));
                                     text_pocket(&mut buf, t, px, py, 0.30);
@@ -2867,7 +2803,7 @@ mod imp {
                     // second so a corner notification (or a weave) never sinks behind the shell. The
                     // momentary NOTOPMOST lasts only between these two calls (no frame renders), so
                     // it's invisible; the window is click-through, so z never affects input.
-                    if frame % 6 == 0 {
+                    if frame.is_multiple_of(6) {
                         SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
                         SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
                     }
@@ -5078,5 +5014,73 @@ mod imp {
             biClrImportant: 0,
         };
         bmi
+    }
+
+    #[cfg(test)]
+    mod tile_tests {
+        use super::*;
+
+        fn count(ts: &TileSet) -> usize {
+            ts.on.iter().filter(|&&b| b).count()
+        }
+
+        #[test]
+        fn box_marks_the_anchor_tile() {
+            let mut ts = TileSet::new();
+            ts.set_box(CX - 10.0, CY - 10.0, CX + 10.0, CY + 10.0);
+            assert!(
+                ts.get_tile(CX as i32 / TILE, CY as i32 / TILE),
+                "the anchor tile must be marked"
+            );
+        }
+
+        #[test]
+        fn ring_marks_a_band_not_a_disc() {
+            // THE load-bearing invariant: a ring at radius 600 must NOT fill the disc — its centre
+            // stays empty and its cover is a small fraction of the filled disc. This is exactly the
+            // O(reach) vs O(reach²) guarantee the whole change rests on (a rune ring is thin curves,
+            // never a solid wheel of work).
+            let mut ring = TileSet::new();
+            ring.set_ring(596.0, 604.0);
+            assert!(
+                !ring.get_tile(CX as i32 / TILE, CY as i32 / TILE),
+                "a ring must leave its centre empty"
+            );
+            let band = count(&ring);
+            assert!(band > 0, "the ring must mark its band");
+            let disc = (std::f32::consts::PI * 600.0 * 600.0 / (TILE * TILE) as f32) as usize;
+            assert!(
+                band * 3 < disc,
+                "band {band} must be far below the filled disc {disc}"
+            );
+        }
+
+        #[test]
+        fn seg_marches_end_to_end_without_gaps() {
+            // a stroke reaching 500px out marks both ends and every tile between (no skipped cell a
+            // dilation would otherwise have to rescue) — the trail's cover is contiguous.
+            let mut ts = TileSet::new();
+            ts.set_seg(CX, CY, CX + 500.0, CY);
+            let ty = CY as i32 / TILE;
+            for tx in (CX as i32 / TILE)..=((CX + 500.0) as i32 / TILE) {
+                assert!(ts.get_tile(tx, ty), "no gap at tile column {tx}");
+            }
+        }
+
+        #[test]
+        fn dilate_grows_and_union_merges() {
+            let mut a = TileSet::new();
+            a.set_px(CX, CY); // mid-buffer → all 8 neighbours are in-bounds
+            assert_eq!(
+                count(&a.dilated(1)),
+                9,
+                "8-neighbour dilation adds the surrounding ring"
+            );
+            let mut b = TileSet::new();
+            b.set_px(CX + 400.0, CY);
+            let mut u = a.clone();
+            u.or_with(&b);
+            assert_eq!(count(&u), count(&a) + count(&b), "disjoint union sums");
+        }
     }
 }

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! TELEPORT — the nether-portal ratio for your desk. Hold the teleport slot's rhythm and a
 //! mini-map of your REAL setup materializes at the cursor: every monitor where it actually sits
 //! (live geometry, never guessed), open windows as abstract recency-lit blobs inside them. Drag

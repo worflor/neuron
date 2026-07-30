@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! The Razer vendor wire format: the 90-byte `razer_report`, its CRC, and status codes.
 //!
 //! Framing (verified live): a HID *feature report* of 91 bytes = 1 report-id byte (0x00)

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! SHAPE SNAP — the recognition engine used as a drawing tool.
 //!
 //! v2: recognition is a CONVERSATION between two signals, both native to the codec's worldview:

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Device write-completion — verified firmware writes plus host-side remap helpers.
 //!
 //! Neuron's read side and several setters (DPI/polling/brightness, lighting) already work. This
@@ -7,9 +11,11 @@
 //! [`crate::engine::Rule`] values consumed by the Engine.
 //!
 //! Scope (the WRITES agent owns this file):
-//! * **Button remap** — produce the host-side [`crate::engine::Rule`] the Engine consumes today.
-//!   No firmware Mapping write API is exposed until the Naga's onboard layout is proven with a
-//!   capture and a verify-gated implementation.
+//! * **Button remap** — TWO layers. Host-side: produce the [`crate::engine::Rule`] the Engine
+//!   consumes. Device-side (NEW, RE'd live 2026-07-22): [`set_mouse_button_key`] writes the Razer
+//!   `15/02` "set button function" command so a physical mouse button emits the remapped key AT THE
+//!   SOURCE — the true fix for the thumb-grid double-send (the button no longer types its default).
+//!   No getter reflects the map, so it is ACK-gated, not read-back-verified; volatile.
 //! * **DPI-stage apply** — write the full DPI stage LIST (the cycle), not just the active DPI
 //!   (active-stage read = `dpi_stages` class 0x04/0x86; SET = 0x04/0x06, hardware-proven, verified
 //!   against the 0x04/0x86 read-back).
@@ -130,6 +136,132 @@ pub fn device_mode(d: &Device) -> Option<u8> {
 /// owns the wake" premise — but is kept as the honest read-only mode probe.)
 pub fn is_driver_mode(d: &Device) -> bool {
     device_mode(d) == Some(DRIVER_MODE)
+}
+
+// ---------------------------------------------------------------------------------------------
+// DEVICE-SIDE BUTTON REMAP — Razer class 0x15 "set button function" (Synapse-4 family).
+//
+// Reverse-engineered live on the Naga V2 Pro (2026-07-22). The thumb grid is a hardware keyboard:
+// each button emits its key AT THE SOURCE. `15/02 [button_id, type, param]` reassigns a physical
+// button so the DEVICE emits the new key directly — one keystroke, no host injection, no
+// double-send. This is exactly how Synapse remaps (device-side, volatile), and it composes with
+// neuron holding driver mode: the remap stays live while a host keeps the device in driver mode;
+// the mouse auto-reverts to its onboard profile when no host is present.
+//
+// Payload layout (RE'd via the paired `15/82` readback oracle):
+//   SET 15/02 [button_id, type, param_len, param...]
+//   GET 15/82 [button_id, type] -> [button_id, type, param_len, param...]
+// `type` enum (validated live — 0x00 & 0xFF are rejected; 0x01/0x02 accepted):
+//   0x01 = mouse button (param = 1-based Button-page index; param_len 1)
+//   0x02 = keyboard      (param = RAW HID Keyboard/Keypad usage, e.g. 'g' = 0x0A; param_len 1)
+// NB: `param_len` is REQUIRED — a 3-byte `[button, type, usage]` write is mis-parsed as
+// `param_len = usage` and maps the button to a null key (emits nothing). Always send the length.
+//
+// Thumb-grid button ids are 0x40..=0x4B (from the 02/84 button table). At stock they emit the
+// keypad 1 2 3 4 5 6 7 8 9 0 - = (usages 0x1E..0x27, 0x2D, 0x2E) in button-id order — the mapping
+// used to resolve a captured keypad usage back to its physical button id.
+//
+// Because the `15/82` getter reads the map back, every write here IS verify-gated (round-trip
+// confirmed byte-for-byte) exactly like DPI. Volatile — no onboard slot is exposed to us.
+// ---------------------------------------------------------------------------------------------
+
+/// Razer "set button function" command (class 0x15, id 0x02) + its readback getter (0x82). RE'd
+/// live; see section header.
+pub const CLASS_BUTTON_FUNC: u8 = 0x15;
+pub const ID_BUTTON_FUNC_SET: u8 = 0x02;
+pub const ID_BUTTON_FUNC_GET: u8 = 0x82;
+const BTN_FN_TYPE_MOUSE: u8 = 0x01;
+const BTN_FN_TYPE_KEYBOARD: u8 = 0x02;
+
+/// Write one button-function record and confirm it round-trips through the `15/82` getter. `tail`
+/// is `[param_len, param...]`; the full SET payload is `[button_id, kind, tail...]`. Errors (never
+/// silently trusts) if the device's read-back doesn't echo exactly what we wrote — the same
+/// honesty gate as [`verify_getter`], using the button-map's own paired getter.
+fn write_button_func(d: &Device, button_id: u8, kind: u8, tail: &[u8]) -> Result<()> {
+    let mut payload = Vec::with_capacity(2 + tail.len());
+    payload.push(button_id);
+    payload.push(kind);
+    payload.extend_from_slice(tail);
+    d.exec_dynamic(
+        CLASS_BUTTON_FUNC,
+        ID_BUTTON_FUNC_SET,
+        payload.len() as u8,
+        &payload,
+    )
+    .map_err(|e| anyhow::anyhow!("button remap (15/02) not accepted: {e}"))?;
+    // Read the map back for this (button, kind): reply = [button, kind, param_len, param...].
+    let got = d
+        .exec_dynamic(CLASS_BUTTON_FUNC, ID_BUTTON_FUNC_GET, 0x20, &[button_id, kind])
+        .map_err(|e| anyhow::anyhow!("button-map read-back (15/82) failed: {e}"))?;
+    let end = 2 + tail.len();
+    if got[0] != button_id || got[1] != kind || got.get(2..end) != Some(tail) {
+        bail!(
+            "button remap did not round-trip: wrote button {button_id:#04x} kind {kind:#04x} \
+             {tail:02X?}, device holds {:02X?}",
+            &got[..end.min(got.len())]
+        );
+    }
+    Ok(())
+}
+
+/// Lowest thumb-grid button id (the "1"-position button on the 12-key side plate).
+pub const THUMB_BUTTON_BASE: u8 = 0x40;
+/// Stock thumb-grid layout: button ids `0x40..=0x4B` emit these HID keyboard usages
+/// (`1 2 3 4 5 6 7 8 9 0 - =`) in order. THE reference for (a) mapping a captured keypad usage
+/// back to its button id and (b) resetting the grid to a known baseline before applying remaps.
+pub const THUMB_STOCK_USAGES: [u8; 12] =
+    [0x1E, 0x1F, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x2D, 0x2E];
+
+/// Resolve a captured keypad usage (what a *stock* thumb button emits) to its physical button id
+/// (`0x40..=0x4B`). `None` if `usage` isn't one of the 12 stock keypad keys — i.e. not a thumb
+/// button we can address at the device, so the caller leaves it to host-side dispatch.
+pub fn thumb_button_id_for_usage(usage: u8) -> Option<u8> {
+    THUMB_STOCK_USAGES
+        .iter()
+        .position(|&u| u == usage)
+        .map(|i| THUMB_BUTTON_BASE + i as u8)
+}
+
+/// Reassign a physical mouse button to emit a keyboard `usage` at the source (type 0x02). Volatile;
+/// flips driver mode first. No read-back getter exists for button maps, so success is the command
+/// ACK (see section header). Honors the process-wide writes-pause kill-switch.
+pub fn set_mouse_button_key(d: &Device, button_id: u8, usage: u8) -> Result<()> {
+    if writes_paused() {
+        bail!("device writes are paused");
+    }
+    ensure_driver(d);
+    write_button_func(d, button_id, BTN_FN_TYPE_KEYBOARD, &[0x01, usage])
+}
+
+/// Reassign a physical mouse button to emit a mouse-button `index` (type 0x01, 1-based).
+pub fn set_mouse_button_click(d: &Device, button_id: u8, index: u8) -> Result<()> {
+    if writes_paused() {
+        bail!("device writes are paused");
+    }
+    ensure_driver(d);
+    write_button_func(d, button_id, BTN_FN_TYPE_MOUSE, &[0x01, index])
+}
+
+/// Restore the whole thumb grid to its stock keypad layout (`1..9 0 - =`). Neuron normalizes the
+/// device to this known baseline before applying the user's remaps, so a stale onboard profile
+/// (e.g. a leftover Synapse gaming layout) can't shadow the intended bindings. Best-effort per
+/// button — the first hard failure aborts and is returned.
+pub fn reset_thumb_buttons(d: &Device) -> Result<()> {
+    if writes_paused() {
+        bail!("device writes are paused");
+    }
+    ensure_driver(d);
+    for (i, &usage) in THUMB_STOCK_USAGES.iter().enumerate() {
+        write_button_func(d, THUMB_BUTTON_BASE + i as u8, BTN_FN_TYPE_KEYBOARD, &[0x01, usage])?;
+    }
+    Ok(())
+}
+
+/// Does this device speak the class-0x15 button-function protocol? A read-only probe of a known
+/// 0x15 getter (the serial, `15/8B`): a successful reply means the Synapse-4 button-map family is
+/// present, so device-side remaps are safe to apply. Cheap; call once when arming the live loop.
+pub fn supports_button_remap(d: &Device) -> bool {
+    d.exec_dynamic(CLASS_BUTTON_FUNC, 0x8B, 0x20, &[]).is_ok()
 }
 
 /// Read a getter back and confirm the bytes we intended to write are present. `expect` is checked
@@ -324,13 +456,97 @@ pub fn set_dpi_stages(d: &Device, stages: &[DpiStage], active_idx: u8, store: St
     d.exec_dynamic(CLASS_DPI, ID_DPI_STAGES_SET, DPI_STAGES_SIZE, &payload)
         .map_err(|e| anyhow::anyhow!("DPI-stage write (0x04/0x06) was not accepted: {e}"))?;
 
-    // Read-back verify: the table body (from active_idx onward) must echo what we wrote. We compare
-    // active_idx, count and every stage record; the varstore byte the device may echo differently,
-    // so verify from byte 1 (active_idx) inclusive of the stage records.
+    // Read-back verify ON THE PLANE WE WROTE: the table body (from active_idx onward) must echo
+    // what we wrote. The old arg-less read-back landed on whichever plane the firmware defaults
+    // to — a Persist write with a diverged volatile plane then verify-failed against the WRONG
+    // plane's bytes. Passing the store byte as the getter arg reads the written plane itself.
     let expect = &payload[1..];
-    verify_getter(d, CLASS_DPI, ID_DPI_STAGES_GET, DPI_STAGES_SIZE, 1, expect)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let got = d
+        .exec_dynamic(CLASS_DPI, ID_DPI_STAGES_GET, DPI_STAGES_SIZE, &[store.byte()])
+        .map_err(|e| anyhow::anyhow!("stage-table read-back (0x04/0x86) failed: {e}"))?;
+    if got.get(1..1 + expect.len()) != Some(expect) {
+        bail!(
+            "VERIFY FAILED on DPI stages ({:?} plane): wrote {} but device reports {} — write NOT trusted",
+            store,
+            hex_slice(expect),
+            hex_slice(&got[1..(1 + expect.len()).min(got.len())]),
+        );
+    }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// INTENT-DRIVEN REASSERT — heal the device from the HOST'S recorded feel intent.
+//
+// The 2026-07-23 live incident proved the device-persisted plane is NOT a trustworthy record of
+// user intent: the Naga's unmapped onboard-PROFILE flash restored the FACTORY stage table into
+// BOTH varstore planes, so `reconcile_volatile_with_persisted` faithfully re-enforced factory
+// 400/800/1600/3200/6400 against the user. The fix is an authority the firmware cannot corrupt:
+// `crate::feel_intent` (host disk), written only on verify-gated applies. This reassert heals
+// BOTH planes from it — volatile so the mouse acts right NOW, persisted so onboard-mode /
+// zero-software operation matches too (devices whose varstore reads fail simply skip the
+// persisted half: host reassert-on-wake IS their durability story).
+// ---------------------------------------------------------------------------------------------
+
+/// Heal this device's DPI state (stage table + active DPI, both varstore planes) from the host's
+/// recorded intent. Disagreement-gated per plane: a plane already matching the intent is not
+/// written. Returns a summary of what was actually healed (empty = nothing was wrong). Honours
+/// the writes-paused kill-switch. An empty intent is an error — callers must fall back to
+/// [`reconcile_volatile_with_persisted`] (device-derived truth) instead, never call this blind.
+pub fn reassert_feel(d: &Device, intent: &crate::feel_intent::FeelIntent) -> Result<Vec<String>> {
+    if writes_paused() {
+        bail!("[writes paused]");
+    }
+    if intent.is_empty() {
+        bail!("no recorded feel intent for this device");
+    }
+    let mut done: Vec<String> = Vec::new();
+
+    // 1) STAGE TABLE — per-plane compare against the intent's cycle + active index.
+    if !intent.stages.is_empty() {
+        let stages: Vec<DpiStage> = intent.stages.iter().map(|&x| DpiStage::symmetric(x)).collect();
+        for (label, vs, store) in [
+            ("volatile", VOLATILE, Store::Volatile),
+            ("persisted", PERSISTED, Store::Persist),
+        ] {
+            let Ok(plane) = d.exec_dynamic(CLASS_DPI, ID_DPI_STAGES_GET, DPI_STAGES_SIZE, &[vs])
+            else {
+                continue; // unreadable plane (no varstore / asleep) — not this device's story
+            };
+            let live_xs = decode_dpi_stages(&plane);
+            let live_active = decode_dpi_active(&plane).unwrap_or(0);
+            if live_xs != intent.stages || live_active != intent.active {
+                set_dpi_stages(d, &stages, intent.active, store)
+                    .map_err(|e| anyhow::anyhow!("{label} stage reassert failed: {e}"))?;
+                done.push(format!(
+                    "{label} stages [{}] active {}",
+                    intent.stages.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(","),
+                    intent.active + 1
+                ));
+            }
+        }
+    }
+
+    // 2) ACTIVE DPI — same per-plane shape via the 0x04/0x85 getter.
+    if let Some((want_x, want_y)) = intent.dpi {
+        for (label, vs, store) in [
+            ("volatile", VOLATILE, Store::Volatile),
+            ("persisted", PERSISTED, Store::Persist),
+        ] {
+            let Ok(a) = d.exec_dynamic(CLASS_DPI, ID_DPI_GET, DPI_GET_SIZE, &[vs]) else {
+                continue;
+            };
+            let live_x = ((a[1] as u16) << 8) | a[2] as u16;
+            let live_y = ((a[3] as u16) << 8) | a[4] as u16;
+            if (live_x, live_y) != (want_x, want_y) {
+                crate::capability::set_dpi(d, want_x, want_y, store)
+                    .map_err(|e| anyhow::anyhow!("{label} dpi reassert failed: {e}"))?;
+                done.push(format!("{label} dpi {want_x}"));
+            }
+        }
+    }
+
+    Ok(done)
 }
 
 /// WAKE-RECONCILE (the Synapse duty): heal a wake that loaded the WRONG volatile state by copying this
@@ -449,6 +665,14 @@ fn dpi_in_cycle(cycle: &[u16], announced: u16) -> bool {
 /// Reads only (never gated). The device-truth cycle is supplied here; the pure rule lives in
 /// [`dpi_in_cycle`] so it needs no hardware to test.
 pub fn announced_dpi_is_foreign(d: &Device, announced: u16) -> Option<bool> {
+    // HOST INTENT FIRST: the recorded feel intent is the authority the firmware can't corrupt
+    // (the 2026-07-23 incident put the FACTORY table in both varstore planes, so a membership
+    // test against the device's own cycle would have blessed factory values as legitimate).
+    if let Some(i) = crate::feel_intent::get(d.pid) {
+        if !i.stages.is_empty() {
+            return Some(!dpi_in_cycle(&i.stages, announced));
+        }
+    }
     let persisted = d
         .exec_dynamic(CLASS_DPI, ID_DPI_STAGES_GET, DPI_STAGES_SIZE, &[PERSISTED])
         .ok()?;
@@ -1324,6 +1548,22 @@ pub fn hypershift_write(layer: &str, remaps: &[ButtonRemap]) -> Result<Vec<Rule>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The stock thumb map resolves each keypad usage to its button id (0x40..=0x4B in order) and
+    /// rejects non-thumb usages, and the two tables agree on length/ordering.
+    #[test]
+    fn thumb_button_id_resolution() {
+        assert_eq!(THUMB_STOCK_USAGES.len(), 12);
+        // '1' (0x1E) is the first thumb button, '=' (0x2E) is the last.
+        assert_eq!(thumb_button_id_for_usage(0x1E), Some(0x40));
+        assert_eq!(thumb_button_id_for_usage(0x2E), Some(0x4B));
+        // every stock usage maps to a distinct id in 0x40..=0x4B, in order.
+        for (i, &u) in THUMB_STOCK_USAGES.iter().enumerate() {
+            assert_eq!(thumb_button_id_for_usage(u), Some(THUMB_BUTTON_BASE + i as u8));
+        }
+        // a key that isn't on the stock thumb grid (e.g. 'g' = 0x0A) has no thumb button.
+        assert_eq!(thumb_button_id_for_usage(0x0A), None);
+    }
 
     #[test]
     fn dpi_stages_payload_layout() {

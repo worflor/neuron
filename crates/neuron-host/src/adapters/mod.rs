@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Protocol adapters — codecs at the edge of the kernel.
 //!
 //! Every adapter is a PURE state machine: bytes/requests in, bytes/responses

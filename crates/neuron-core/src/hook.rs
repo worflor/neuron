@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Gaming-mode key suppression — a host `WH_KEYBOARD_LL` low-level keyboard hook that swallows
 //! Alt+Tab / the Windows key / Alt+F4 while a gaming-mode profile is active. This is Synapse's
 //! "Gaming Mode" done host-side (no firmware write): determinism + reversibility (the policy lifts
@@ -190,6 +194,12 @@ mod sys {
     /// thread and exit. This is the entire point of the dedicated thread: it can never miss the
     /// `LowLevelHooksTimeout` because it does no other work.
     fn pump_main() {
+        // Input posture: this thread's callback runs INSIDE the OS keyboard input path, and every
+        // keystroke on the machine waits behind it. If the scheduler leaves it behind a busy game,
+        // the whole desktop's typing feels the delay — and past `LowLevelHooksTimeout` Windows stops
+        // consulting us at all, which reads as "gaming mode randomly stops working". See
+        // `crate::timing::boost_input_thread` for why ABOVE_NORMAL and not higher.
+        crate::timing::boost_input_thread();
         // SAFETY: standard LL keyboard-hook install with a valid extern "system" proc. Ownership of
         // the hook belongs to THIS thread, which is the one that pumps below.
         let h: HHOOK =

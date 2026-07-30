@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Process-wide clipboard serialization.
 //!
 //! The Win32 clipboard is a single PROCESS-WIDE resource with no internal per-thread locking: the

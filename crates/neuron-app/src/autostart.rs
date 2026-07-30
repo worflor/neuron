@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Start-with-Windows — via the Scheduled Task "Neuron (elevated tray)" (RunLevel Highest),
 //! NOT an HKCU Run-key entry. Elevation is load-bearing: the native Chroma SHM server creates
 //! `Global\` objects (SeCreateGlobalPrivilege), and an unelevated autostart silently degrades

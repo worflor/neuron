@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! NON-DESTRUCTIVE stress tests for the FIRE-QUEUE dimension of the macro system — the per-macro
 //! SERIAL worker + bounded `queue.Queue(maxsize=256)` that live in the python sidecar
 //! (`runtime/host/neuron_host.py`), driven through the Rust [`MacroHost`].
@@ -262,7 +266,7 @@ fn fire_queue_stress_e2e() {
             assert_eq!(d, N - QMAX, "macro {id} must drop exactly N-256 (independent cap): {drop_lines:?}");
         }
 
-        for (_, pid) in &holds {
+        for pid in holds.values() {
             host.answer(*pid, Some(0));
         }
         let notifs = drain_notifies(&rx, Duration::from_millis(900), Duration::from_secs(45));

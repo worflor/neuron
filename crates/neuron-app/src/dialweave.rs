@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! THE DIAL — an analog knob the eigenmotion stroke turns.
 //!
 //! Primed by [`Action::Dial`](neuron::action::Action::Dial), the next hold of the cast trigger

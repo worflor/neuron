@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Woflo Labs
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 # neuron-app — the resident GUI + tray app (Slint, GPU/femtovg renderer — draws ONLY while the window
 # is shown; tray-hidden = no compute, just a held GL context; event loop alive with no window shown). The ONE long-lived process: tray icon, global hotkey loops,
 # device-runtime daemon, lazily-created Slint window. Depends on neuron-core for all logic
@@ -16,6 +20,9 @@ description = "Neuron resident app — tray + Slint GUI for the anti-Synapse."
 version.workspace = true
 edition.workspace = true
 license-file.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
 
 [[bin]]
 name = "neuron-app"

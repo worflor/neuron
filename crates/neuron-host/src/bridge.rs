@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! The neuron-core bridge — real hardware becomes kernel surfaces.
 //!
 //! This is where the R&D stops being abstract: the registry's device TOMLs map
@@ -6,12 +10,12 @@
 //! changed rows → `row_report` → `send_lighting_fast` → latch). Everything
 //! else — the GUI, protocol adapters, telemetry bindings — paints through the
 //! arbiter. The bridge deliberately does NOT hand out device handles: the
-//! whole point (§9.3) is that the writer is the only writer.
+//! writer remains the only component allowed to touch the device.
 //!
 //! Honest edges, stated up front:
 //! - **Kind is a heuristic** (DPI-capable ⇒ mouse; tall LED matrix ⇒
 //!   keyboard) until the device TOMLs grow an explicit `kind` field — the
-//!   right fix, noted in the R&D doc.
+//!   right fix rather than guessing from geometry.
 //! - **Unclaimed LEDs paint black.** `None` cells mean "nothing claims this
 //!   LED"; a row-addressed HID write must still send whole rows, and carrying
 //!   dead sessions' pixels forward would be exactly the stuck-lighting bug

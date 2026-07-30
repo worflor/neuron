@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: LicenseRef-WLCSL-1.0
+// See ../LICENSE.md.
+
 //! Streaming encoder: incremental block emission.
 //!
 //! Buffers samples and emits blocks on buffer full or phase transition.
@@ -247,7 +251,7 @@ mod tests {
         }
 
         assert!(
-            blocks.len() >= 1,
+            !blocks.is_empty(),
             "should emit at least one block, got {}",
             blocks.len()
         );

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Pure tone synthesis — the mathematical heart of Neuron's audio. Notification cues now, the
 //! knockback rhythm voice later. No I/O, no platform, no allocation in the per-sample hot path:
 //! everything is f32, deterministic, and unit-testable. The real-time output layer (cpal) and the

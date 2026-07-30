@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! The system tray — the 90% surface. A resident `TrayIcon` with a menu (active profile +
 //! quick-switch, HyperShift toggle, brightness/DPI quick controls, effects quick-pick, Open,
 //! Settings sub-toggles, Quit). Events arrive on tray-icon's + global-hotkey's static channels;

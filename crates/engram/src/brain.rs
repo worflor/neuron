@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: LicenseRef-WLCSL-1.0
+// See ../LICENSE.md.
+
 //! The Engram brain: wells, dream buffer, measurement, and absorption.
 //!
 //! The brain is a constant-size knowledge base that stores:

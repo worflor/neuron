@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! The WEAVE/BEACON service — the ONE owner of the cast trigger, with two faces:
 //!
 //! **LIVE SPELLWEAVING** (the idle face): whenever no beacon is pending, this thread watches the
@@ -2100,7 +2104,7 @@ mod tests {
         assert_eq!(neuron::radial::pick_wedge(0.0, 0.0, 40.0, 2), None, "no motion");
     }
 
-    // ── TRIGGER-OWNERSHIP (TDD §8: editor weave / pending prompt / whiteboard / knockback must
+    // ── TRIGGER-OWNERSHIP (editor weave / pending prompt / whiteboard / knockback must
     // never double-consume the same trigger) ──────────────────────────────────────────────────
     //
     // `EDITOR_WEAVE` and `BEACON_PRESENTING` are process-globals also touched by the real

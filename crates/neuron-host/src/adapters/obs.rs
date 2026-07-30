@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! OBS Studio integration via obs-websocket v5 — the one adapter that
 //! connects OUT (neuron is the client) rather than serving.
 //!

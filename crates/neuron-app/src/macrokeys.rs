@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Razer macro-key input — native protocol talk, capability-driven, EMERGENT.
 //!
 //! A Razer keyboard in "Driver Mode" stops handling its dedicated macro keys onboard and instead
@@ -149,6 +153,10 @@ fn spawn_reader(pid: u16, path: DevicePath, armed: Arc<Mutex<HashSet<DevicePath>
                 .remove(&release_path);
         },
         move || {
+            // Input posture: this thread is the FIRST place a macro-key press becomes visible to us,
+            // and it spends its life blocked in a HID read — so being scheduled promptly on wake is
+            // the whole job, and being scheduled late puts a delay in front of everything downstream.
+            neuron::timing::boost_input_thread();
             let reader = match neuron::transport::open_reader(&path) {
                 Ok(r) => r,
                 Err(e) => {
@@ -187,6 +195,10 @@ fn decode(buf: &[u8], pid: u16) {
     if buf.first() != Some(&0x04) {
         return; // not a macro report (a different vendor report may share this collection)
     }
+    // Everything from here to `inject_event` is the reader thread's own cost — the first stage of a
+    // macro-key press that is ours to make small. Timed as one span because `inject_event` stamps
+    // the edge at its own entry, so the two readings meet without overlapping.
+    let _t = neuron::latency::start(&neuron::latency::HID_DECODE);
     let hits: Vec<(u16, u16)> = buf[1..]
         .iter()
         .copied()

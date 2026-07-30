@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Protocol FAMILIES as a pluggable seam. Everything above the wire stays semantic
 //! (`Capability::*`, the registry, FEEL/LIGHTING, profiles, adoption UX); everything
 //! wire-shaped — bus signature, framing, status semantics, exec discipline — lives behind a
@@ -910,7 +914,7 @@ mod tests {
         want[6] = 0x16; // data size
         want[7] = 0x00; // class
         want[8] = 0x82; // id
-        want[62] = 0x1F ^ 0x16 ^ 0x00 ^ 0x82; // CRC = XOR(buf[2..=61]); [2],[6],[7],[8] are nonzero there
+        want[62] = (0x1F ^ 0x16) ^ 0x82; // CRC = XOR(buf[2..=61]); [2],[6],[7],[8] are nonzero there
         assert_eq!(got, want, "frame_audio must match the hand-computed 64-byte golden");
         assert_eq!(got.len(), 64, "the razer-audio envelope is 64 bytes, not razer_report's 91");
     }
@@ -1100,7 +1104,7 @@ mod tests {
     }
 
     /// What the ONE simulated firmware control pipe currently holds — "whatever the LAST
-    /// `set_feature` wrote" is exactly the real hardware's behavior (LIGHTING-MAP §5): the pipe has
+    /// `set_feature` wrote" is exactly the real hardware's behavior: the pipe has
     /// no per-caller memory, so a `get_feature` from ANY handle echoes whoever wrote most recently.
     /// `violations` is incremented by [`SharedPipe::get_feature`] whenever a THREAD's own poll
     /// observes a class/id different from the one IT most recently sent — i.e. another thread's
@@ -1117,7 +1121,7 @@ mod tests {
     /// on one path would produce through `transport::wire_lock_for`. `set_feature` OVERWRITES the
     /// shared state (with a short sleep that widens the interleave window a real 10ms poll cadence
     /// would otherwise mostly hide); `get_feature` answers Success echoing whatever is CURRENTLY
-    /// there — the last-set-wins cross-read behavior LIGHTING-MAP §5 describes.
+    /// there — faithfully modeling the last-set-wins cross-read behavior.
     struct SharedPipe {
         state: Arc<Mutex<PipeState>>,
         wire: Arc<crate::transport::WireLock>,
@@ -1144,7 +1148,7 @@ mod tests {
     thread_local! {
         // The (class, id) THIS thread most recently sent — compared against the shared pipe state
         // inside `get_feature` to detect a cross-read from the OTHER thread's conversation.
-        static LAST_SENT: std::cell::Cell<(u8, u8)> = std::cell::Cell::new((0, 0));
+        static LAST_SENT: std::cell::Cell<(u8, u8)> = const { std::cell::Cell::new((0, 0)) };
     }
 
     impl Transport for SharedPipe {

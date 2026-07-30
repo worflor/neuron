@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Windows HID transport via the Win32 API (windows-sys). Mirrors the proven approach:
 //! open the control collection with dwDesiredAccess = 0 (Windows blocks GENERIC_R/W on a
 //! mouse, but HidD_Get/SetFeature use FILE_ANY_ACCESS IOCTLs, so access=0 works).
@@ -314,7 +318,7 @@ pub struct WinHid {
     /// opened on the same `DevicePath` (a separate handle from a separate in-process actor) gets
     /// the IDENTICAL `Arc`, so a `Dialect`'s conversation-holding guard serializes them; the
     /// lock's kernel half ([`OsWireMutex`]) extends the same guarantee across PROCESSES (see
-    /// `Transport::wire_lock` and LIGHTING-MAP §5).
+    /// `Transport::wire_lock`).
     wire: Arc<WireLock>,
 }
 
@@ -442,7 +446,7 @@ impl Drop for WinHidReader {
 /// The KERNEL half of a [`WireLock`]: a named Win32 mutex shared by every process on this login
 /// session that opens the same control pipe — the app's host writer and a `neuron-cli` command
 /// resolve the identical kernel object by name, so their request/reply conversations serialize
-/// exactly like two in-process handles do (LIGHTING-MAP §5, cross-process closure).
+/// exactly like two in-process handles do, closing the cross-process race.
 pub(super) struct OsWireMutex {
     handle: HANDLE,
 }

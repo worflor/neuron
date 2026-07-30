@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: LicenseRef-WLCSL-1.0
+// See ../LICENSE.md.
+
 //! Block encoding: fit → predict → residual → mode selection → quantize.
 //!
 //! The encoder takes a trajectory segment and produces a Block with:

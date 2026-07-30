@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! The NOTIFICATION ENGINE — the consumer end of [`neuron::confirm`].
 //!
 //! A dedicated thread drains the confirmation channel and, for each one, does TWO independent things

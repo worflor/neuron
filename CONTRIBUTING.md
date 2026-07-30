@@ -20,7 +20,7 @@ the README has an honest map of how much groundwork is already done: **[README â
 - **a lighting effect** is one registry entry plus a `field()` generator. pure math, self-contained, a good first PR.
 - **a preset (a look)** is pure data: an existing pattern plus a spectrum. zero code.
 - **a neuron-host protocol adapter** (OBS, MQTT, WLED, MIDI, ...) is a small codec with a capture-and-replay harness.
-- **bigger chunks** (the linux / mac port, a real vendor abstraction) are described in the README and in `docs/TDD.md` / `docs/PROTOCOL-HOST-RND.md`. talk to me before starting one.
+- **bigger chunks** (the linux / mac port, a real vendor abstraction) are described in the README. talk to me before starting one so we can agree on the seam before you burn a weekend on it.
 
 ## the layout
 
@@ -30,7 +30,7 @@ so you know where things live:
 - `neuron-app` is the windows GUI and the live driver.
 - `neuron-cli` is a thin front-end.
 - `neuron-host` is a separate protocol hub (an OpenRGB / Chroma-REST bridge, so neuron can drive a mixed-brand rig).
-- `engram` is the gesture codec, vendored under its own terms.
+- `engram` is the Woflo Labs gesture codec, included under its own terms.
 
 the rule everywhere: semantics live in `neuron-core` as typed, tested code; device wiring lives in data.
 
@@ -50,7 +50,7 @@ three hard invariants:
 2. **device writes read-back-verify, or they stay gated.** a write either confirms itself against the device's own bytes, or it lives behind a `NEURON_*_WRITE` gate until a capture proves it. a wrong guess should fail loud, never brick anything.
 3. **more, never bloat.** neuron does a lot on purpose, but every addition earns its place. replacing slop with slop defeats the whole point.
 
-the diagnostics bench on the system page (also what CI runs) is the "prove it works" surface: read-only and always safe.
+the diagnostics bench on the system page is the "prove it works" surface: read-only, always safe, and the fastest way to show a change actually landed on real hardware instead of just compiling.
 
 ## building it (windows gotchas)
 
@@ -64,12 +64,15 @@ the diagnostics bench on the system page (also what CI runs) is the "prove it wo
 2. keep commits focused and the message honest about what changed and why.
 3. run the gates above.
 4. open a PR against `main`. describe what you did, how you verified it, and (for device or lighting work) what hardware you tested on. link the issue you're closing.
-5. if it touches a board card, mention it so i can move it along the pipeline.
+5. read and check the contributor-agreement box in the pull request template. i can't merge a contribution without that record.
+6. if it touches a board card, mention it so i can move it along the pipeline.
 
 small, self-contained PRs get reviewed fastest. if you're planning something big, open an issue first so we can agree on the shape.
 
-## license, for contributors
+## the legal bit
 
-neuron is under the Whisper Protocol License (`LICENSE.md`), the same license as the rest of my tools: free for individuals, nonprofits, education, other open-source projects, and bootstrapped shops, with a commercial license for funded companies. by sending a contribution you agree to the contribution terms in that license (you grant me the right to ship your change under it). if that's a dealbreaker, no hard feelings, better to know up front.
+most of neuron is GPL-3.0-or-later with the Neuron-Woflo exception. Engram and the three reusable research modules named in [LICENSE.md](LICENSE.md) use the Woflo Labs Community Source License instead; a contribution follows the license of the path where it lands.
+
+you keep ownership of what you write. checking the pull request box accepts the [Woflo Labs Contributor Agreement 1.0](LICENSES/CONTRIBUTOR-AGREEMENT-1.0.md) for that contribution, which gives Woflo Labs room to maintain and license the project while keeping accepted public work available in source form. if an employer, client, or school might control the work, make sure you have permission before submitting it.
 
 thanks for being here. build something you'd want to use.

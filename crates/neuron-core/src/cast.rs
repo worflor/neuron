@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! The cast engine — **the [`crate::spellweaving`] resolver**, the one entry point for the whole
 //! weave continuum. Hold the trigger and weave a stroke; on release it resolves to an `Action`,
 //! whether that stroke is the degenerate weave (a directional *flick* → radial sector) or a rich

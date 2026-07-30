@@ -1,6 +1,7 @@
 # neuron
 
-a lean, mean, do-what-i-say control layer for razer gear. an *anti-synapse*.
+a lean, mean, do-what-i-say control layer for razer gear, built by Woflo Labs
+as an *anti-synapse*.
 
 one small binary. no account, no cloud, no telemetry. no "please update razer central." it talks to your mouse and keyboard directly: the same `razer_report` HID bytes synapse sends, worked out from wire captures (USBPcap), the open-source [openrazer](https://github.com/openrazer/openrazer) driver, and a lot of live probing. it does exactly what you tell it then fricks off. no kernel driver, no vendor SDK 😳
 
@@ -11,7 +12,7 @@ one small binary. no account, no cloud, no telemetry. no "please update razer ce
 | **hardware** | razer mice + keyboards over raw HID; daily-driven on a Naga V2 Pro + BlackWidow Chroma V2, any other `razer_report` device |
 | **install** | build from source: `cargo build --release` |
 | **footprint** | no driver, no account, no runtime, no cloud; your config is plain TOML |
-| **license** | Whisper Protocol License (source-available): free for individuals, nonprofits, education, open-source projects, and bootstrapped shops; commercial license for funded companies |
+| **license** | most of Neuron is GPL-3.0-or-later with a linking exception; Engram and the eigenmotion research modules have separate Woflo Labs community-source terms. [the exact split](LICENSE.md) |
 
 > **status: public beta mk1.** windows-first, single dev, very much a personal project that got out of hand. mk1 is the same release language my other tools use, and it means exactly this: until now the only eyes and hands on this thing were mine. it works on my desk every day but *obviously* hasn't been tested on yours, and that gap is the whole definition. once it has survived desks that aren't mine, it graduates to mk2. where each feature actually stands, solid to barely-started, is tracked in [state of the project](docs/STATUS.md).
 
@@ -276,13 +277,15 @@ four sections, because that's what a user actually needs:
 - **device**: dpi (with the stage table on the slider), polling, brightness, sniper, battery, and a clearly-marked *gated* shelf for the writes that aren't hardware-confirmed yet.
 - **lighting**: a render of *your* board, generated from what the registry actually knows (rows × cols + device kind). you paint per-key directly on it, and effects run on it with the same frame math the hardware gets. effect tiles with live previews and auto-generated knobs, plus a stack strip for layering. a mouse with a few LEDs falls back to zones, and says so.
 - **input**: direct binds and spellweaving, sharing one action palette. a lamp lights on each rule when its trigger fires, so you can check a bind just by pressing it.
-- **system**: the gates, migration and the synapse purge, appearance (accents + cast materials), a reliability bench (uptime, worker heartbeats, auto-restart, the crash log), the beacon registry, the mechanical-advantage toggles, notification settings, and the diagnostics bench: nine real probes (enumerate HID, load the registry, round-trip a device, build a lighting frame, resolve the effect engine, assemble the spine, check the macro runtime, load the gesture vault, resolve a mic endpoint), each reported pass, fail, or skip. read-only, always safe to run, and the same thing CI runs.
+- **system**: the gates, migration and the synapse purge, appearance (accents + cast materials), a reliability bench (uptime, worker heartbeats, auto-restart, the crash log), the beacon registry, the mechanical-advantage toggles, notification settings, and the diagnostics bench: nine real probes (enumerate HID, load the registry, round-trip a device, build a lighting frame, resolve the effect engine, assemble the spine, check the macro runtime, load the gesture vault, resolve a mic endpoint), each reported pass, fail, or skip. read-only and always safe to run.
 
 profiles open as a sheet from the header wherever you are, saving and restoring the other sections as one bundle (read back from the live device, not from the sliders).
 
 ## get it
 
 ### build
+
+there isn't a prebuilt download yet; for mk1, the source checkout is the release. when packaged binaries arrive, they'll carry the same license bundle and a durable link to the corresponding source.
 
 ```
 cargo build --release      # -> target/release/neuron.exe (CLI) + neuron-app.exe (GUI)
@@ -331,7 +334,7 @@ gui         neuron-app  [--safe · --tray · --purge-synapse · --scan-synapse]
 
 neuron is one person, one desk, one vendor gone deep. that's the point, but it also means a handful of pieces are wide open, and some are shaped so you can own one cleanly without reading the whole tree. here's the honest map, graded by how much groundwork is already done.
 
-the layout, so you know where things live: `neuron-core` is the headless engine (protocol, registry, lighting, the trigger/action spine, gestures, macros) and it's portable by construction. `neuron-app` is the windows GUI and the live driver. `neuron-cli` is a thin front-end. `neuron-host` is a separate protocol hub (an OpenRGB / Chroma-REST bridge, so neuron can drive a mixed-brand rig). `engram` is the gesture codec, vendored under its own terms. the rule everywhere: semantics live in core as typed, tested code; device wiring lives in data.
+the layout, so you know where things live: `neuron-core` is the headless engine (protocol, registry, lighting, the trigger/action spine, gestures, macros) and it's portable by construction. `neuron-app` is the windows GUI and the live driver. `neuron-cli` is a thin front-end. `neuron-host` is a separate protocol hub (an OpenRGB / Chroma-REST bridge, so neuron can drive a mixed-brand rig). `engram` is the Woflo Labs gesture codec, included under its own terms. the rule everywhere: semantics live in core as typed, tested code; device wiring lives in data.
 
 ### pieces you can pick up cleanly
 
@@ -342,16 +345,18 @@ the layout, so you know where things live: `neuron-core` is the headless engine 
 
 ### bigger pieces, if you want to own a real chunk
 
-- **the linux / mac port.** the core already ports. the platform-specific parts (HID, audio, the layered overlays, raw input, the window manager) already sit behind seams that compile as inert stubs off windows, so porting is a matter of filling those in: a hidraw or IOKit transport, an ALSA/PipeWire/CoreAudio control, a layered-surface backend, an input source, a window-manager impl. the hidraw transport alone lights up all of device control and the whole CLI on linux. the one genuinely welded chunk left is the overlay instruments (teleport, whiteboard, glance, curtain), which still need their windows bodies factored out first. the map: the cross-platform readiness scorecard in `docs/TDD.md` (§9) and `docs/PROTOCOL-HOST-RND.md`.
-- **another vendor entirely (logitech and friends).** the straight answer: there's no vendor abstraction yet. the wire format is razer-specific above the HID transport, so native logitech (HID++) means first extracting a device-protocol trait and then writing an implementation of it. that's a real project, so talk to me about the shape before you start. if what you actually want is other-brand *lighting*, the far better path — once it exists — is driving those devices through a neuron-host OpenRGB *client* and letting neuron be the sync hub, instead of reverse-engineering each vendor. today neuron-host only runs the OpenRGB *server* side (other tools drive neuron); the client half that would reach out to another OpenRGB-speaking app or device is planned, not built — a well-scoped chunk to pick up. one thing to avoid outright: the per-vendor LED-SDK DLLs (the razer/corsair/logitech "chroma-like" SDKs). they're anti-cheat bait and a maintenance sinkhole.
+- **the linux / mac port.** the core already ports. the platform-specific parts (HID, audio, the layered overlays, raw input, the window manager) already sit behind seams that compile as inert stubs off windows, so porting is a matter of filling those in: a hidraw or IOKit transport, an ALSA/PipeWire/CoreAudio control, a layered-surface backend, an input source, a window-manager impl. the hidraw transport alone lights up all of device control and the whole CLI on linux. the one genuinely welded chunk left is the overlay instruments (teleport, whiteboard, glance, curtain), which still need their windows bodies factored out first. it's a real project, so open an issue before diving in and we'll agree on the first backend and the shape of the seam.
+- **another vendor entirely (logitech and friends).** the straight answer: there's no vendor abstraction yet. the wire format is razer-specific above the HID transport, so native logitech (HID++) means first extracting a device-protocol trait and then writing an implementation of it. that's a real project, so talk to me about the shape before you start. if what you actually want is other-brand *lighting*, the far better path, once it exists, is driving those devices through a neuron-host OpenRGB *client* and letting neuron be the sync hub, instead of reverse-engineering each vendor. today neuron-host only runs the OpenRGB *server* side (other tools drive neuron); the client half that would reach out to another OpenRGB-speaking app or device is planned, not built, and it's a well-scoped chunk to pick up. one thing to avoid outright: the per-vendor LED-SDK DLLs (the razer/corsair/logitech "chroma-like" SDKs). they're anti-cheat bait and a maintenance sinkhole.
 
 ### the gates
 
-every change runs the same suite i do: `cargo test --workspace`, `cargo clippy --workspace`, and the one hard invariant, that tests may never arm input (there's a test whose only job is enforcing that). device writes either read-back-verify or stay behind a `NEURON_*_WRITE` gate until a capture confirms them. the diagnostics bench on the system page (also what CI runs) is the "prove it works" surface, read-only and always safe.
+every change runs the same suite i do: `cargo test --workspace`, `cargo clippy --workspace`, and the one hard invariant, that tests may never arm input (there's a test whose only job is enforcing that). device writes either read-back-verify or stay behind a `NEURON_*_WRITE` gate until a capture confirms them. the diagnostics bench on the system page is the "prove it works" surface: it fires the nine real probes against your own hardware, read-only and always safe, so you can show a device change actually landed rather than asserting it did.
 
-### license, for contributors
+### the legal bit
 
-neuron is under the Whisper Protocol License (`LICENSE.md`), the same license as the rest of my tools: free for individuals, nonprofits, education, other open-source projects, and bootstrapped shops, with a commercial license for funded companies. by sending a contribution you agree to the contribution terms in that license (you grant me the right to ship your change under it). if that's a dealbreaker, no hard feelings, better to know up front.
+most changes land under GPL-3.0-or-later with the Neuron-Woflo exception. Engram and three reusable codec/eigenmotion modules keep their Woflo Labs community-source terms because they're research components rather than neuron-specific application code. [the license file](LICENSE.md) shows the exact four paths and how the combined build works.
+
+what you write stays yours. the checkbox on a pull request gives Woflo Labs enough permission to ship, maintain, relicense, and commercially license an accepted contribution, with a promise that work accepted into the public project stays available in source form under a public project license. the full agreement is [here](LICENSES/CONTRIBUTOR-AGREEMENT-1.0.md); if an employer or client might own your work, please clear it with them before sending it.
 
 ## honesty: proven, gated, absent
 

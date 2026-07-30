@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Woflo Labs
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 # neuron-testkit — test-only instruments: recorded-reality decoders (ChromaTape), device twins,
 # and generators. A dev-dependency for the other crates; never ships in a release binary.
 [package]
@@ -5,7 +9,9 @@ name = "neuron-testkit"
 version.workspace = true
 edition.workspace = true
 license-file.workspace = true
-publish = false
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true

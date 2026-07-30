@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! NON-DESTRUCTIVE stress tests for the `act` DIMENSION of the macro system — the device/audio/
 //! brightness/sense bridge a macro reaches through `neuron.dpi/profile/battery/…`. The path under
 //! test is the full round-trip:

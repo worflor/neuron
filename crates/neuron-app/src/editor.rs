@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! The editors — turn UI selections into real config on disk. Press-to-bind authored rules, the
 //! per-sector radial editor, gesture->action binding, sniper, and the surfaced perf controls all
 //! write the SAME plain TOML the CLI + live runtime read. No hardcoded buttons; nothing faked.

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Control-event listener + decoder — the foundation for remapping. Captures Raw Input
 //! (INPUTSINK) from the headset's Consumer (knob/media) and Telephony (mute) collections and
 //! decodes each report into semantic `(usage_page, usage)` pairs via HidP — so bindings match
@@ -42,8 +46,22 @@ pub const RAZER_MACRO_PAGE: u16 = 0xFF1A;
 // `listen_until` registers a sink and drains it into the SAME `on_event` path as Raw Input, so an
 // injected control is captured (press-to-bind) and dispatched identically to a native one. Broadcast
 // (not a single channel) because capture + live-dispatch run concurrent listens that must BOTH see it.
-static INJECT: std::sync::Mutex<Vec<(u64, std::sync::mpsc::Sender<ControlEvent>, isize)>> =
+static INJECT: std::sync::Mutex<Vec<(u64, std::sync::mpsc::Sender<Injected>, isize)>> =
     std::sync::Mutex::new(Vec::new());
+
+/// One injected edge plus WHEN it became visible to us — the stamp the latency instrument needs.
+///
+/// The stamp rides the event rather than being taken when the pump drains it, because the whole
+/// point of `latency::INJECT_HOP` is to measure the gap BETWEEN those two moments: a pump that the
+/// scheduler left sitting behind a fullscreen game shows up as a large hop and nowhere else. Taking
+/// the timestamp at drain time would measure zero by construction and hide exactly the stall we
+/// most need to see.
+#[derive(Clone, Debug)]
+struct Injected {
+    ev: ControlEvent,
+    /// When the source thread published this edge (the HID read having just returned).
+    at: std::time::Instant,
+}
 static INJECT_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Events injected BEFORE any listen loop has registered its drain — buffered (not dropped) so the
 /// FIRST macro keypress after launch survives the startup race: the macro-key reader (`macrokeys`)
@@ -52,7 +70,7 @@ static INJECT_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 /// sink list and vanished. Drained into the first sink that registers, so no edge is lost and none is
 /// delivered twice. Bounded — only the brief startup window (or a host that never opens a listener,
 /// e.g. non-Windows) ever leaves events here, and the oldest are dropped past the cap.
-static INJECT_PENDING: std::sync::Mutex<Vec<ControlEvent>> = std::sync::Mutex::new(Vec::new());
+static INJECT_PENDING: std::sync::Mutex<Vec<Injected>> = std::sync::Mutex::new(Vec::new());
 /// How many pre-registration events to retain (oldest dropped past this). A handful of macro-key
 /// edges more than covers the sub-second gap before the listener arms.
 const INJECT_PENDING_MAX: usize = 64;
@@ -64,6 +82,12 @@ const INJECT_PENDING_MAX: usize = 64;
 /// than dropped, and the first sink to register replays it (see [`inject_register`]) — so the very
 /// first macro keypress after launch is never lost to the startup race.
 pub fn inject_event(ev: ControlEvent) {
+    // Stamp BEFORE taking the lock: the stamp means "when this edge became visible to us", and lock
+    // acquisition is part of the delivery cost we want the hop to include, not excluded from it.
+    let ev = Injected {
+        ev,
+        at: std::time::Instant::now(),
+    };
     let mut sinks = INJECT.lock().unwrap_or_else(|e| e.into_inner());
     if sinks.is_empty() {
         // No drain exists yet — hold the edge until one registers (INJECT lock still held, so a
@@ -97,7 +121,7 @@ pub fn inject_event(ev: ControlEvent) {
 /// then [`inject_unregister`]s on exit. Returns the registration id + the receiver. Any events that
 /// arrived before ANY sink existed are seeded into this fresh receiver first (see [`INJECT_PENDING`]),
 /// so the first listener to arm picks up the startup-race edges before its first live tick.
-fn inject_register() -> (u64, std::sync::mpsc::Receiver<ControlEvent>, isize) {
+fn inject_register() -> (u64, std::sync::mpsc::Receiver<Injected>, isize) {
     let (tx, rx) = std::sync::mpsc::channel();
     let id = INJECT_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     // Each listener gets its OWN wake event (see `wake_pump`'s note): the resident dispatch pump and
@@ -1057,7 +1081,7 @@ mod spine_tests {
         let got = rx
             .try_recv()
             .expect("the pre-registration macro keypress was delivered to the new sink");
-        assert_eq!(got.hits, ev.hits, "the buffered keypress survived the race");
+        assert_eq!(got.ev.hits, ev.hits, "the buffered keypress survived the race");
         // and once a sink exists, further injects broadcast straight through (no second buffering).
         inject_event(ev.clone());
         assert!(
@@ -1104,6 +1128,38 @@ mod spine_tests {
         assert!(rx_b.try_recv().is_ok(), "and the injected edge reached the listener");
         inject_unregister(id_a);
         inject_unregister(id_b);
+    }
+
+    // A press-to-bind capture spawns its own `listen`, which STEALS the process-wide Raw-Input
+    // registration; on teardown the resident dispatch pump must take it back. Raising REARM alone
+    // was not enough once the pump started BLOCKING — the flag is only read at the top of the loop,
+    // so it sat unseen until `plan_wait`'s timeout, up to IDLE_CADENCE (1000 ms), leaving the
+    // dispatcher deaf to every key. A completed bind masked it (`request_reload` wakes the pump
+    // anyway); a CANCELLED capture — ESC, the cancel button, the 30 s cap — writes nothing and
+    // reloads nothing, so it ate the full second. This pins the wake half of the pair.
+    #[test]
+    #[cfg(windows)]
+    fn a_capture_teardown_wakes_the_surviving_pump_it_stole_from() {
+        use windows_sys::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+        fn signaled(h: isize) -> bool {
+            unsafe { WaitForSingleObject(h as HANDLE, 0) == WAIT_OBJECT_0 }
+        }
+        let _guard = INJECT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // The resident dispatch pump, blocked in its wait.
+        let (id, _rx, wake) = inject_register();
+        let _ = signaled(wake); // clean, non-signaled slate
+
+        // A transient capture finishes and runs its teardown notification.
+        super::win::rearm_and_wake();
+
+        assert!(
+            signaled(wake),
+            "listener teardown must WAKE the surviving pump, not just set REARM — an unwoken \
+             pump does not re-register until its cadence elapses, which is the up-to-1s deafness \
+             users feel as \"rebinding is laggy\""
+        );
+        inject_unregister(id);
     }
 
     #[test]
@@ -1676,7 +1732,7 @@ fn close_wake_event(_handle: isize) {}
 /// [`wake_pump`] (which locks first) and [`inject_event`] (which already holds the lock; calling
 /// `wake_pump` there would re-lock INJECT and self-deadlock). No-op off-Windows.
 #[cfg(windows)]
-fn signal_listeners(sinks: &[(u64, std::sync::mpsc::Sender<ControlEvent>, isize)]) {
+fn signal_listeners(sinks: &[(u64, std::sync::mpsc::Sender<Injected>, isize)]) {
     for (_, _, wake) in sinks {
         if *wake != 0 {
             // SAFETY: `wake` is a live event handle owned by the registry (closed only by
@@ -1691,7 +1747,7 @@ fn signal_listeners(sinks: &[(u64, std::sync::mpsc::Sender<ControlEvent>, isize)
 }
 
 #[cfg(not(windows))]
-fn signal_listeners(_sinks: &[(u64, std::sync::mpsc::Sender<ControlEvent>, isize)]) {}
+fn signal_listeners(_sinks: &[(u64, std::sync::mpsc::Sender<Injected>, isize)]) {}
 
 /// Wake EVERY registered listen loop by signaling its wake event. Called by every producer of
 /// listener work — `neuron-app`'s `send_live` (a LiveCommand for the resident worker), the runtime's
@@ -1785,7 +1841,7 @@ mod plan_wait_tests {
 }
 
 #[cfg(windows)]
-mod win {
+pub(crate) mod win {
     use super::{ControlEvent, PROBE_PAGES};
     use std::ffi::c_void;
     use std::time::{Duration, Instant};
@@ -1819,11 +1875,26 @@ mod win {
     // silently STEALS every collection from the resident dispatch pump — and when the transient
     // window is destroyed, delivery just stops process-wide: the resident window stays alive but
     // DEAF, forever (the "sniper rebind needs a restart" bug — the rule was fine; the pump never
-    // heard another native edge). The flag heals it: every `listen` teardown raises it, and every
-    // still-running pump re-registers its collections on its next iteration (~5 ms), taking the
-    // wire back. A spurious raise (e.g. the resident pump's own shutdown) costs one redundant
-    // re-registration — a no-op.
+    // heard another native edge). The flag heals it: every `listen` teardown raises it AND wakes
+    // every surviving pump, so the re-registration lands on the next wait return instead of
+    // whenever the cadence happens to elapse. That wake is load-bearing, not a nicety — the pump
+    // blocks now, so an unaccompanied flag is only noticed after `plan_wait`'s timeout, up to
+    // IDLE_CADENCE (1000 ms). (This note used to say "~5 ms"; that was true of the old fixed 5 ms
+    // poll loop and went stale the day the pump started blocking.) A spurious raise (e.g. the
+    // resident pump's own shutdown) costs one redundant re-registration — a no-op.
     static REARM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// Raise the re-arm flag AND wake every surviving pump.
+    ///
+    /// These are ONE operation, and live in one function so they cannot drift apart again.
+    /// Raising the flag alone is exactly the bug: the pump blocks now, so an unaccompanied flag
+    /// sits unread until `plan_wait`'s timeout elapses — up to a second of a fully deaf
+    /// dispatcher after every press-to-bind capture. A completed bind hid it (`request_reload`
+    /// wakes the pump for its own reasons); a CANCELLED capture had nothing to hide behind.
+    pub(super) fn rearm_and_wake() {
+        REARM.store(true, std::sync::atomic::Ordering::Relaxed);
+        super::wake_pump();
+    }
 
     /// The device PID (`pid_XXXX` segment) from a Raw-Input device path, as a 4-hex lowercase string
     /// ("" if absent) — the same key the capture + dispatch already tag triggers with.
@@ -1874,6 +1945,25 @@ mod win {
                 _ => return None,
             }
         })
+    }
+
+    /// Inverse of [`scancode_to_usage`]: a HID Keyboard/Keypad (page 0x07) usage → the physical
+    /// scancode that produces it, folded as `make | (0x100 if extended-E0)` — the same "physkey"
+    /// shape [`crate::intercept`] matches on. Found by scanning the scancode space (the forward
+    /// table is the single source of truth; no parallel table to drift). `None` for a usage no
+    /// scancode maps to (e.g. a synthetic/consumer usage).
+    pub(crate) fn usage_to_physkey(usage: u16) -> Option<u16> {
+        for make in 0u16..=0x7F {
+            if scancode_to_usage(make, false) == Some(usage) {
+                return Some(make);
+            }
+        }
+        for make in 0u16..=0x7F {
+            if scancode_to_usage(make, true) == Some(usage) {
+                return Some(make | 0x100);
+            }
+        }
+        None
     }
 
     unsafe fn device_path(hdev: isize) -> String {
@@ -2033,13 +2123,22 @@ mod win {
             // unchanged. `iter_start`/`first_edge_pending` are reset every iteration below.
             let iter_start = std::cell::Cell::new(Instant::now());
             let first_edge_pending = std::cell::Cell::new(true);
+            // ── latency instrument: the EDGE ORIGIN ────────────────────────────────────────────
+            // Every edge is dispatched inside `latency::with_edge`, so the first keystroke the edge
+            // causes records `PRESS_TO_OUTPUT` no matter how many threads it travels through (see
+            // `crate::latency`). The origin is normally "now" (a raw-input report we are decoding
+            // this instant), but an INJECTED edge was published by another thread earlier and
+            // carries its own stamp — the drain loop parks it here so the wrapper uses the real
+            // press time instead of restarting the clock and hiding the whole cross-thread hop.
+            let origin_override: std::cell::Cell<Option<Instant>> = std::cell::Cell::new(None);
             let mut on_event = |ev: &ControlEvent| {
                 if first_edge_pending.replace(false) {
                     crate::prof::pump::record_latency_us(
                         iter_start.get().elapsed().as_micros() as u64
                     );
                 }
-                on_event(ev);
+                let origin = origin_override.take().unwrap_or_else(Instant::now);
+                crate::latency::with_edge(origin, || on_event(ev));
             };
             // ── blocking-wait pump setup (replaces the fixed-5ms busy poll below) ──────────────
             // `NEURON_PUMP=poll` is the field escape hatch back to the old busy sleep, in case the
@@ -2066,7 +2165,7 @@ mod win {
             } else {
                 std::ptr::null_mut()
             };
-            while seconds.map_or(true, |s| start.elapsed().as_secs() < s) {
+            while seconds.is_none_or(|s| start.elapsed().as_secs() < s) {
                 iter_start.set(Instant::now());
                 first_edge_pending.set(true);
                 // A GUI worker thread (or any caller of `listen_until`) flips this to tear the
@@ -2139,9 +2238,14 @@ mod win {
                                         .to_vec();
                                         let pp = preparsed_data(hdev);
                                         let mut hits = Vec::new();
-                                        for &page in &PROBE_PAGES {
-                                            for u in decode(&pp, &mut report, page) {
-                                                hits.push((page, u));
+                                        {
+                                            // The HidP usage walk across every probed page — the
+                                            // only real CPU on the pump's receive path.
+                                            let _t = crate::latency::start(&crate::latency::RAW_DECODE);
+                                            for &page in &PROBE_PAGES {
+                                                for u in decode(&pp, &mut report, page) {
+                                                    hits.push((page, u));
+                                                }
                                             }
                                         }
                                         on_event(&ControlEvent {
@@ -2168,6 +2272,17 @@ mod win {
                                                 ),
                                             };
                                             let path = device_path(hdev);
+                                            // DEVICE-SIDE REMAP SHIM: feed every raw keyboard edge
+                                            // (with its source pid) to the interceptor so it can
+                                            // attribute a hook-swallowed keystroke and inject the
+                                            // remapped key. No-op unless armed (see `intercept`).
+                                            {
+                                                let physkey =
+                                                    kb.MakeCode | if e0 { 0x100 } else { 0 };
+                                                let pid = u16::from_str_radix(&pid_from_path(&path), 16)
+                                                    .unwrap_or(0);
+                                                crate::intercept::on_raw_keyboard(physkey, !up, pid);
+                                            }
                                             let set = down_sets.entry(path.clone()).or_default();
                                             let changed = if up {
                                                 let before = set.len();
@@ -2269,9 +2384,15 @@ mod win {
                 // WM_INPUT does — recording that here (after this drain, not before) is what keeps a
                 // macro-key / HID mic-tap wake from being mislabelled `tick_only`.
                 let mut got_input = got_msg;
-                for ev in inject_rx.try_iter() {
+                for inj in inject_rx.try_iter() {
                     got_input = true;
-                    on_event(&ev);
+                    // The cross-thread delivery cost (channel + SetEvent + the scheduler actually
+                    // running this pump). A starved pump — the classic "my macro fired late while a
+                    // game had the CPU" — reads out HERE and nowhere else.
+                    crate::latency::INJECT_HOP.record(inj.at.elapsed());
+                    // Dispatch against the ORIGINAL press time, not now (see `origin_override`).
+                    origin_override.set(Some(inj.at));
+                    on_event(&inj.ev);
                 }
                 crate::prof::pump::record_wake(got_input);
                 // The returned cadence is the max time this pump should wait before its next tick
@@ -2316,6 +2437,11 @@ mod win {
                     // as "stuck" until some unrelated wake. `QS_ALLINPUT` is what makes hardware-event
                     // latency ~0 (any input returns the wait immediately); `wake` is what makes a
                     // queued LiveCommand return it immediately too.
+                    // How long this pump actually sits blocked. Not a latency reading — an
+                    // IDLE-HEALTH one: if this collapses toward zero the pump has started
+                    // busy-spinning, which is the CPU-and-battery regression the blocking wait
+                    // exists to prevent, and it would otherwise be invisible from the outside.
+                    let waited = Instant::now();
                     let r = MsgWaitForMultipleObjectsEx(
                         n,
                         ptr,
@@ -2323,6 +2449,7 @@ mod win {
                         QS_ALLINPUT,
                         MWMO_INPUTAVAILABLE,
                     );
+                    crate::latency::PUMP_BLOCKED.record(waited.elapsed());
                     if r == WAIT_FAILED {
                         // Never busy-spin on an error path — degrade to (at worst) a short sleep.
                         std::thread::sleep(Duration::from_millis(1));
@@ -2343,7 +2470,11 @@ mod win {
             DestroyWindow(hwnd);
             // this instance owned the process's Raw-Input registration — tell any surviving pump
             // (the resident dispatch listener, if we were a capture) to re-arm and hear again.
-            REARM.store(true, std::sync::atomic::Ordering::Relaxed);
+            // Safe at this point: `inject_unregister` above already dropped the INJECT lock (and
+            // removed THIS listener's wake handle), so re-locking it inside `wake_pump` can
+            // neither deadlock nor signal a closed event — it reaches exactly the pumps that
+            // outlived us.
+            rearm_and_wake();
         }
     }
 }

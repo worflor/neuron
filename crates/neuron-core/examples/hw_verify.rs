@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Live test of the USBPcap-captured scroll-stage command (class 0x15/0x00 [store, stage]).
 //! Writes stage 1 then stage 2 (persist, matching what Synapse sent) — you should FEEL the wheel
 //! change between the two enabled stages. Run: cargo run -p neuron --example hw_verify

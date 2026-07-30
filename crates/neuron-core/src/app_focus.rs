@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Shared foreground-app edge detector.
 //!
 //! The app and CLI live loops both need the same shape: periodically sample the platform foreground

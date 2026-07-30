@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! OpenRGB SDK protocol adapter (server side) — the proving ground.
 //!
 //! Implements the OpenRGB network protocol (TCP 6742) as a PURE per-connection
@@ -8,8 +12,8 @@
 //!
 //! Being an OpenRGB *server* means Home Assistant's official OpenRGB
 //! integration, openrgb-python, and every community effect script can drive
-//! neuron's devices with zero neuron-specific code — the ecosystem plug-in
-//! story from the R&D doc §4.3.
+//! neuron's devices with zero neuron-specific code: the ecosystem plug-in
+//! path in executable form.
 //!
 //! Wire format verified byte-for-byte against the OpenRGB sources
 //! (NetworkProtocol.h/.cpp, RGBController.h/.cpp GetDeviceDescription /

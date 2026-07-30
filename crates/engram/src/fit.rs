@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: LicenseRef-WLCSL-1.0
+// See ../LICENSE.md.
+
 //! The core AR(2) fitting algorithm.
 //!
 //! Five dot products and a division. This is the entire engine.
@@ -286,7 +290,7 @@ mod tests {
     fn fit_pair_damped() {
         let z: Vec<Complex64> = (0..60)
             .map(|i| {
-                let decay = 0.95_f64.powi(i as i32);
+                let decay = 0.95_f64.powi(i);
                 Complex64::new(decay * (2.0 * PI * i as f64 / 12.0).cos(), 0.0)
             })
             .collect();

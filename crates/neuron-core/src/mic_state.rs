@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! A shared, live MIC-MUTE provider — the single source of truth the `miclight` lighting
 //! pattern (and its preview) reads.
 //!
@@ -63,7 +67,7 @@ static LAST_ACCESS_MS: AtomicU64 = AtomicU64::new(0);
 //
 // This is a STOPGAP with a known exit: Core Audio's `SetMute` takes an event-context GUID that
 // `IAudioEndpointVolumeCallback::OnNotify` hands back, so origin can arrive WITH the change and all
-// of this — window, detector polling, inference — is deleted. See docs/PERF-AUDIT.md §8.
+// of this — window, detector polling, inference — can be deleted.
 static LAST_SELF_WRITE: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
 
 /// BACKSTOP TTL only — the window normally closes when our write's EDGE actually surfaces in the
@@ -235,7 +239,7 @@ fn run() {
         }
         // (Re-)resolve the default capture endpoint on the first tick and every ~1s after —
         // a swapped default mic or an unplug is picked up within a second.
-        if tick % RERESOLVE_TICKS == 0 {
+        if tick.is_multiple_of(RERESOLVE_TICKS) {
             match crate::audio::resolve_capture(None) {
                 Some(ep) => {
                     if ep.id != ctl_id || ctl.is_none() {

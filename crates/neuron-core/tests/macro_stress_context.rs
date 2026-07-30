@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! NON-DESTRUCTIVE stress tests for the macro **Context** dimension of the "protocol" group.
 //!
 //! The Context is the world a macro reacts to: foreground app/title, the Explorer/terminal cwd, the

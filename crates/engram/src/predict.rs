@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: LicenseRef-WLCSL-1.0
+// See ../LICENSE.md.
+
 //! The AR(2) prediction engine.
 //!
 //! Given fitted K, G coefficients and two seed values, spin the oscillator

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: LicenseRef-WLCSL-1.0
+// See ../LICENSE.md.
+
 //! Brain file I/O: save and load .engram files.
 //!
 //! Format: binary sections (not ZIP, for minimal dependencies).

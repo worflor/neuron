@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! NON-DESTRUCTIVE stress tests for the PYRUNTIME dimension — the bundled-CPython lifecycle the macro
 //! sidecar runs on: extraction (atomic, idempotent, concurrent-safe), the slim runtime's stdlib
 //! completeness, host-script co-location, and the warm sidecar's spawn / crash / respawn / circuit-

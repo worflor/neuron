@@ -1,9 +1,13 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Automatic device synthesis — the generalization of the hand-written `devices/*.toml`s.
 //!
 //! The two builtin defs were reverse-engineered by probing the `razer_report` getter space
 //! and watching the device answer SUCCESS / UNSUPPORTED per command. That loop is mechanical,
 //! so this module runs it automatically: probe an unknown Razer control pipe against the
-//! UNIVERSAL COMMAND CATALOG (the union of the proven builtin specs — OpenRazer-derived,
+//! UNIVERSAL COMMAND CATALOG (the union of the proven builtin specs — cross-checked with OpenRazer,
 //! hardware-verified on the Naga V2 Pro + BlackWidow Chroma V2), keep exactly the commands the
 //! device says yes to, detect the lighting dialect from which lighting getters answer, measure
 //! the link's real round-trip to pick `stream_wait_us`, and assemble a complete [`DeviceDef`].
@@ -1331,7 +1335,8 @@ mod tests {
             assert!(proven.iter().any(|c| c == name), "proven_commands missing answered '{name}'");
         }
         // …and NOT the catalog names the mock never answered (legacy-only class-0x03 lighting).
-        for name in ["lighting_caps"] {
+        {
+            let name = "lighting_caps";
             assert!(!proven.iter().any(|c| c == name), "proven_commands has unanswered '{name}'");
         }
         // (b) the mint path: proven_commands is EXACTLY the def's command map keys (the def is the

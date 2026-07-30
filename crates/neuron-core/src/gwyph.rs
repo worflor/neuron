@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: LicenseRef-WLCSL-1.0
+// See ../../../LICENSE.md and ../../../LICENSES/WLCSL-1.0.md.
+
 //! `.gwyph` writer — emit a Whisper Glyph v3 file from a stroke, in pure Rust.
 //!
 //! `.gwyph` (a *whisper glyph file*, MIME `application/x-whisper-gwyph`) is the on-disk format the

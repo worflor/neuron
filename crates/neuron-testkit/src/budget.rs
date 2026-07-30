@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Resident-citizenship BUDGET lane — run the real binary inside a Windows Job Object,
 //! sample its resource footprint through scripted phases, and hold it to explicit budgets.
 //!

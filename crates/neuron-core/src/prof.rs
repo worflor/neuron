@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! A lightweight hot-path profiler, INERT unless `NEURON_PROFILE` is set in the environment.
 //!
 //! Each instrumented loop calls [`bump`] on a named [`AtomicU64`] counter. When profiling is on,
@@ -254,7 +258,7 @@ pub mod pump {
             // a prompt follow-up tick sees a healthy gap and clears the per-listener starved flag;
             // the count itself must never go backward.
             record_tick(listener, 5);
-            assert!(starvation_count() >= before + 1);
+            assert!(starvation_count() > before);
             forget_listener(listener);
         }
 
@@ -286,15 +290,31 @@ pub mod pump {
             forget_listener(healthy);
             forget_listener(stalled);
             let before = starvation_count();
-            record_tick(healthy, 5); // both establish a baseline
-            record_tick(stalled, 5);
-            // the healthy listener keeps ticking well inside its threshold while the stalled one
-            // stays silent across a > FLOOR_MS span
+            // The two listeners declare DIFFERENT cadences on purpose, so that scheduler jitter
+            // can only ever push this test further into the passing region:
+            //   healthy — cadence 60_000 ⇒ threshold max(60_000*4, 250) = 4 MINUTES. Ticking it
+            //             every ~60ms leaves a ~4000x margin. The earlier 1000 (a 4s threshold) was
+            //             still theoretically floutable: a >4s suspension of the test process
+            //             (laptop sleep, a debugger pause, severe CI contention) would flag the
+            //             healthy listener too and fail with `left: 2, right: 1`. Only a stall long
+            //             enough to break the entire suite can reach 4 minutes, so the exact-count
+            //             assertion below is now genuinely one-sided.
+            //   stalled — cadence 5 ⇒ threshold 250ms. Its gap is the WHOLE loop (~360ms), and
+            //             load only makes that gap longer, i.e. more starved.
+            // The old version used cadence 5 for both: `healthy`'s threshold was also 250ms, so a
+            // single `sleep(60)` overshooting past 250 (routine under parallel test load) flagged
+            // the healthy listener too and failed with `left: 2, right: 1` — a false failure about
+            // the OS scheduler, not about the watchdog.
+            const HEALTHY_CADENCE: u32 = 60_000;
+            const STALLED_CADENCE: u32 = 5;
+            record_tick(healthy, HEALTHY_CADENCE); // both establish a baseline
+            record_tick(stalled, STALLED_CADENCE);
             for _ in 0..6 {
                 std::thread::sleep(std::time::Duration::from_millis(60));
-                record_tick(healthy, 5); // gaps ~60ms < 250 → healthy never flagged
+                record_tick(healthy, HEALTHY_CADENCE); // far inside its threshold, always
             }
-            record_tick(stalled, 5); // ~360ms silent → flagged, despite `healthy` staying fresh
+            // >= 360ms silent against a 250ms threshold → flagged, despite `healthy` staying fresh
+            record_tick(stalled, STALLED_CADENCE);
             assert_eq!(
                 starvation_count(),
                 before + 1,

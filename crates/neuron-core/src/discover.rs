@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Self-emergent capability discovery. No per-device registry: enumerate every Razer
 //! `razer_report` control pipe, probe its getter space, and classify each response by its
 //! information structure (enum / level / xy-pair / table / string). Two different devices

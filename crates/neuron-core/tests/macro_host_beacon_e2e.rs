@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! End-to-end proof of the BEACON layer against the REAL python sidecar — the full prime→activate
 //! protocol round trip, with no GUI and no human:
 //!   * NO-UI HONESTY — with no beacon listener installed, a macro's `ask` is auto-dismissed and

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! NON-DESTRUCTIVE stress tests for the macro PARSER + codegen — the two-way bridge between a macro's
 //! Python source and the typed [`MacroNode`] tree (`parse_macro` in the warm CPython sidecar; the
 //! Rust inverse [`nodes_to_source`]). Covers the audit gaps: deep expression/flow nesting, Unicode in

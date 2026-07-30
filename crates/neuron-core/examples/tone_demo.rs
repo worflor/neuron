@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Audition harness for the tone synth — renders the palettes, a "spam" burst, and the semantic
 //! notification cues to WAV files so the sound can be judged by ear (and inspected) before any
 //! real-time output exists. Pure offline render; no audio device touched.

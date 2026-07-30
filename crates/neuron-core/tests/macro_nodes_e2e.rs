@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! End-to-end proof of the bidirectional macro model against the REAL python sidecar: the two-way
 //! mapping between a macro's Python source and the typed [`MacroNode`] tree is ROUND-TRIP STABLE.
 //!

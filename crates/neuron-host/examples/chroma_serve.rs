@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Stand up the neuron Chroma SHM server and print any lighting a game paints.
 //!
 //! This is the anti-cheat-safe path: neuron creates the named shared objects a game

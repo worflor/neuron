@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Data-driven device registry. Device definitions are TOML — built-ins are embedded,
 //! and any `devices/*.toml` in the run root is loaded too (extend without recompile).
 

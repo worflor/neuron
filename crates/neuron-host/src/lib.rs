@@ -1,3 +1,8 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo Research Components Exception 1.0.
+// See ../../../LICENSE.md.
+
 //! neuron-host — the kernel of the protocol host.
 //!
 //! Every RGB-ecosystem conflict in the wild (Synapse-vs-SignalRGB "bad rave"

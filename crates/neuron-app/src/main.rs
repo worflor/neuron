@@ -1,3 +1,8 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo Research Components Exception 1.0.
+// See ../../../LICENSE.md.
+
 //! Neuron resident app — the ONE long-lived process. Tray-resident: the Slint event loop runs
 //! with NO window shown; the main window is built once before the event loop, may start hidden,
 //! and is hidden on close while its handle/glue are retained. The tray menu
@@ -34,6 +39,7 @@ mod migrate;
 mod notifs;
 mod overlay;
 mod prefs;
+mod lat_log;
 mod prof_log;
 #[cfg(windows)]
 mod purge;
@@ -82,6 +88,9 @@ fn main() {
     // PROFILER (inert unless NEURON_PROFILE is set): 1 Hz hot-path counters + per-thread/sidecar
     // CPU to neuron_profile.log, so a "never stops" spin localizes to a counter or a thread.
     prof_log::start();
+    // Latency reporting (NEURON_LATENCY=1) — the only way the hardware-side stages of the input
+    // chain can be read, since no synthetic test can press a physical macro key. See `lat_log`.
+    lat_log::start();
 
     // SELF-TEST HARNESS: `neuron-app --weave-proof` renders every spellweaving material as actual ink
     // STROKES (a flowing stroke, a ring, a straight stroke) to PNGs in the run dir, then exits — so the
@@ -394,6 +403,10 @@ fn main() {
     // through it from a reader thread that starts as soon as `hidwatch::start()` returns.
     glue::install_ui(weak.clone());
     hidwatch::start();
+    // Heal every configured device from the host's recorded feel intent at launch — the wake
+    // triggers only cover sleep/wake while the app runs; a power-cycle that happened while the
+    // app was down (the factory-DPI-restore incident, 2026-07-23) is only caught here.
+    hidwatch::startup_reassert();
 
     // ── MACRO KEYS ────────────────────────────────────────────────────────
     // Put Razer keyboards into Driver Mode and read their vendor macro-key report (id 0x04), injecting

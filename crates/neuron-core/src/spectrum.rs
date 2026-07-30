@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Spectrum — the COLOUR PROGRAM half of the Spectrum lighting model (a layer = PATTERN × SPECTRUM).
 //!
 //! A [`Pattern`](crate::pattern::Pattern) emits, per cell, a sample coordinate `u` (0..1) and an
@@ -145,8 +149,10 @@ impl Interp {
 
 /// Intra-frame palette animation — applied at time `t` before the stops are sampled.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Default)]
 pub enum Motion {
     /// Static — the palette is sampled as-is.
+    #[default]
     Hold,
     /// Slide the stop positions along `u` over time (a scrolling gradient).
     Drift { speed: f32 },
@@ -158,11 +164,6 @@ pub enum Motion {
     Flow { speed: f32, chaos: f32 },
 }
 
-impl Default for Motion {
-    fn default() -> Self {
-        Motion::Hold
-    }
-}
 
 impl Motion {
     /// The stable tag (`"hold"`, `"drift"`, …).

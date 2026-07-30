@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! strokelab — a developer stroke recorder, sidecarred onto Neuron for research.
 //!
 //! The recognizer stores only a stroke's *fingerprint* (the eigenmotion `Sig`/`Invariants`) and
@@ -377,7 +381,7 @@ pub fn dump_stroke(
         normalization,
     );
     let json = serde_json::to_string_pretty(&bundle)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     // write the pair all-or-nothing: if the JSON write fails after the gwyph, remove the orphan so
     // there's never a lone .gwyph with no bundle beside it.

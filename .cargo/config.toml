@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Woflo Labs
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 # Keep checked-in builds portable. For local silicon-tuned builds, set this outside the repo:
 #
 #   $env:RUSTFLAGS="-C target-cpu=native"

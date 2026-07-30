@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! The ownership arbiter — the traffic controller every RGB stack is missing.
 //!
 //! A layer here is not just pixels: it carries WHO painted it (owner), HOW MUCH
@@ -1200,7 +1204,7 @@ mod model_props {
     fn model_winner(slots: &[Slot], surface: u8, now_ms: u64) -> Option<u8> {
         slots
             .iter()
-            .filter(|s| s.present && s.surface == surface && s.ttl_ms.map_or(true, |_| now_ms < s.deadline_ms))
+            .filter(|s| s.present && s.surface == surface && s.ttl_ms.is_none_or(|_| now_ms < s.deadline_ms))
             .max_by_key(|s| (s.band, s.seq))
             .map(|s| s.owner)
     }
@@ -1290,12 +1294,12 @@ mod model_props {
                     ModelOp::Sweep => {
                         let expected = slots
                             .iter()
-                            .filter(|s| s.present && s.ttl_ms.map_or(false, |_| now_ms >= s.deadline_ms))
+                            .filter(|s| s.present && s.ttl_ms.is_some_and(|_| now_ms >= s.deadline_ms))
                             .count();
                         let released = a.sweep(now);
                         prop_assert_eq!(released.len(), expected);
                         for s in slots.iter_mut() {
-                            if s.present && s.ttl_ms.map_or(false, |_| now_ms >= s.deadline_ms) {
+                            if s.present && s.ttl_ms.is_some_and(|_| now_ms >= s.deadline_ms) {
                                 s.present = false;
                             }
                         }

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! State-change CONFIRMATIONS — the structural heart of the notification engine.
 //!
 //! A confirmation is the byproduct of a change that ALREADY committed: a verified device write, a

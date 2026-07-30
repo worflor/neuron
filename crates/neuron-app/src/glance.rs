@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! GLANCE — live peeks at the windows you care about, bound to anything.
 //!
 //! Cast it and every window matching the target (title or exe substring) blooms as a TILE in a

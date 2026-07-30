@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! A live device: the control transport + its registry definition, with wire exec routed through
 //! the device's protocol [`Dialect`](crate::dialect::Dialect) (razer_report today).
 
@@ -14,6 +18,31 @@ pub struct Device {
 }
 
 impl Device {
+    /// TEST SEAM — build a `Device` over a caller-supplied transport, bypassing enumeration and
+    /// the real HID open.
+    ///
+    /// `transport` is private, and every other constructor reaches the wire (`open_path` calls
+    /// `transport::open_path`; the three resolvers call `transport::enumerate`). That privacy meant
+    /// only `device.rs`'s own test module could build a `Device` over a fake — so the ~33 `&Device`
+    /// entry points in [`crate::writes`], the whole [`crate::lighting`] paint path, and
+    /// [`crate::dialect`]'s exec surface had NO test that drives a device. The gap is admitted in
+    /// `writes.rs`'s own suite ("We can't construct a Device here; this asserts the gate predicate,
+    /// which is the guard") — i.e. those tests validate payload BUILDERS and boolean gates, never a
+    /// conversation.
+    ///
+    /// Deliberately NOT feature-gated: a `Box<dyn Transport>` is the only thing it accepts, so the
+    /// worst a production caller could do is hand over a real transport it already owns — exactly
+    /// what `open_path` does one line below. `#[doc(hidden)]` keeps it out of the public surface,
+    /// matching [`DevicePath::from_str_for_tests`](crate::transport::DevicePath::from_str_for_tests).
+    #[doc(hidden)]
+    pub fn with_transport(def: DeviceDef, pid: u16, transport: Box<dyn Transport>) -> Self {
+        Device {
+            def,
+            pid,
+            transport,
+        }
+    }
+
     /// Open a specific enumerated control interface path for `(def, pid)`.
     pub fn open_path(def: DeviceDef, pid: u16, path: &DevicePath) -> Result<Self> {
         let transport = transport::open_path(path)?;
@@ -359,11 +388,11 @@ impl<'a> DeviceSession<'a> {
     ) -> Result<T> {
         let key = format!("cap:{cap:?}");
         let resolve = move |reg: &crate::registry::Registry| Device::open_with_capability(reg, cap);
-        match self.writable_for_key(&key, &resolve).and_then(&mut op) {
+        match self.writable_for_key(&key, resolve).and_then(&mut op) {
             Ok(v) => Ok(v),
             Err(first) => {
                 self.invalidate_command(&key);
-                self.writable_for_key(&key, &resolve)
+                self.writable_for_key(&key, resolve)
                     .and_then(&mut op)
                     .with_context(|| {
                         format!("after reopening cached '{key}' handle; first failure: {first}")
@@ -523,8 +552,8 @@ mod tests {
         }
     }
 
-    /// TDD §8's named gap: "a test that `DeviceSession::with_writable` invalidates and retries a
-    /// stale handle once." Drives the REAL retry code through the `with_writable_via` seam (no
+    /// Proves that `DeviceSession::with_writable` invalidates and retries a stale handle once.
+    /// Drives the REAL retry code through the `with_writable_via` seam (no
     /// `transport::enumerate()`, no real hardware): attempt 1 resolves a fresh `Device`, ensure_driver's
     /// handshake succeeds (device is alive), then the write itself discovers the handle just went
     /// stale (models a wireless sleep landing between resolve and write) and fails. `with_writable`

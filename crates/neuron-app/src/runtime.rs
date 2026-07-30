@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! The engine-facing runtime — Neuron's logic state, owned by the GUI process.
 //!
 //! This is the thin layer between the Slint view and `neuron-core`. It holds the device registry
@@ -652,14 +656,26 @@ impl AppRuntime {
         match self.open_selected() {
             Ok(d) => {
                 let _ = d.run("device_mode"); // wake / ensure reachable
-                match cap::set_dpi(&d, dpi, dpi, self.store()) {
+                // DUAL-PLANE by design (2026-07-23): volatile first so the mouse acts right now,
+                // then onboard-persist so hardware truth survives power-cycles and zero-software
+                // operation. A device without a working persist plane keeps the volatile success
+                // (its durability is the host's feel-intent reassert-on-wake instead).
+                match cap::set_dpi(&d, dpi, dpi, cap::Store::Volatile) {
                     Ok(_) => {
+                        let onboard = cap::set_dpi(&d, dpi, dpi, cap::Store::Persist);
+                        // Record the HOST intent — the authority every wake/announce reassert
+                        // heals from. Disk trouble is a log-line, not a failed apply (the device
+                        // write already landed).
+                        if let Err(e) = neuron::feel_intent::record_dpi(d.pid, dpi, dpi) {
+                            eprintln!("[feel-intent] record dpi failed: {e}");
+                        }
                         // confirmation fires past the committed write — same as apply_polling /
-                        // apply_brightness (was missing here, so GUI DPI changes earned no card).
-                        // Absolute set → no prior read, so no old→new (matches Intent::DpiSet).
-                        // Per-device de-dup keyed by the device we just opened + wrote.
+                        // apply_brightness. Absolute set → no prior read, so no old→new.
                         neuron::confirm::dpi(d.pid, dpi as u32, None);
-                        format!("DPI -> {dpi}")
+                        match onboard {
+                            Ok(_) => format!("DPI -> {dpi} (saved to mouse)"),
+                            Err(e) => format!("DPI -> {dpi} (onboard save unavailable: {e})"),
+                        }
                     }
                     Err(e) => format!("DPI failed: {e}"),
                 }
@@ -716,9 +732,6 @@ impl AppRuntime {
     /// Apply the full DPI STAGE LIST (the cycle) as one table — `writes::set_dpi_stages`, the
     /// verify-gated write. `list` is "/"-separated DPI values; `active` is the active stage index.
     pub fn apply_dpi_stages(&self, list: &str, active: u8) -> String {
-        if self.writes_paused() {
-            return "writes paused".into();
-        }
         // Parse with ACCOUNTING: a precision instrument never guesses. Garbage or out-of-range
         // tokens refuse the whole apply with the offenders named, rather than silently writing
         // half the list the user typed.
@@ -747,11 +760,38 @@ impl AppRuntime {
         }
         // a stale UI index must never ship out-of-range to the device.
         let active = (active as usize).min(stages.len() - 1) as u8;
+        // kill-switch AFTER parse (parse is read-only and its accounting is useful even while
+        // paused; also keeps the parse honest under the process-global pause other code may flip).
+        if self.writes_paused() {
+            return "writes paused".into();
+        }
         match self.open_selected() {
             Ok(d) => {
                 let _ = d.run("device_mode");
-                match neuron::writes::set_dpi_stages(&d, &stages, active, self.store()) {
-                    Ok(()) => format!("DPI stages [{}] active {}", fmt_stages(&stages), active + 1),
+                // DUAL-PLANE by design (2026-07-23): volatile (acts now) then onboard-persist
+                // (survives power-cycle / zero-software) — see apply_dpi. Host intent is recorded
+                // as the reassert authority either way.
+                match neuron::writes::set_dpi_stages(&d, &stages, active, cap::Store::Volatile) {
+                    Ok(()) => {
+                        let onboard =
+                            neuron::writes::set_dpi_stages(&d, &stages, active, cap::Store::Persist);
+                        let xs: Vec<u16> = stages.iter().map(|s| s.x).collect();
+                        if let Err(e) = neuron::feel_intent::record_stages(d.pid, &xs, active) {
+                            eprintln!("[feel-intent] record stages failed: {e}");
+                        }
+                        match onboard {
+                            Ok(()) => format!(
+                                "DPI stages [{}] active {} (saved to mouse)",
+                                fmt_stages(&stages),
+                                active + 1
+                            ),
+                            Err(e) => format!(
+                                "DPI stages [{}] active {} (onboard save unavailable: {e})",
+                                fmt_stages(&stages),
+                                active + 1
+                            ),
+                        }
+                    }
                     Err(e) => format!("DPI stages failed: {e}"),
                 }
             }
@@ -762,9 +802,6 @@ impl AppRuntime {
     /// Apply HyperScroll wheel stages (class 0x0B) — verify-gated + hardware-pending; surfaces the
     /// honest gated message when the env flag is unset. `list` is "/"-separated mode names/bytes.
     pub fn apply_scroll_stages(&self, list: &str) -> String {
-        if self.writes_paused() {
-            return "writes paused".into();
-        }
         // map "tactile"/"free" friendly names to mode bytes (0 tactile / 1 free-spin).
         let mut modes = Vec::new();
         let mut bad = Vec::new();
@@ -792,6 +829,10 @@ impl AppRuntime {
         }
         if modes.is_empty() {
             return "no scroll modes — e.g. tactile/free".into();
+        }
+        // kill-switch AFTER parse — see apply_dpi_stages.
+        if self.writes_paused() {
+            return "writes paused".into();
         }
         match self.open_selected() {
             Ok(d) => match neuron::writes::set_scroll_stages(&d, &modes, 0, self.store()) {

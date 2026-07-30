@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Hand-rolled SHA-256 + base64 — just enough crypto for the obs-websocket
 //! auth handshake, kept in-house so [`neuron-host`](crate) stays zero-dep
 //! (the same instinct as the hand-rolled AR(2) governor). Both are fixed,

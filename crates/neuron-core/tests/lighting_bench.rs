@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Part A — deterministic micro-bench of the lighting render path (NO GUI).
 //!
 //! Times, in MICROSECONDS, with a warmup then N≈2000 iterations (avg · p50 · max):

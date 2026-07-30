@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Gesture vault — named eigenmotion templates, persisted, recognized by DTW.
 //!
 //! A template is a gesture word (sequence of [`Sig`]). Recognition is 1-NN by the

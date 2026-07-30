@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Shared daemon intent execution for resident runtimes.
 //!
 //! `Action` stays stateless: it can describe a DPI/profile/scroll request, but it has no device

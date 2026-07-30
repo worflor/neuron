@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Resilient config loading: one bad value must never cost the user the whole file.
 //!
 //! Every `Struct::load()` for a TOML config shares the same choreography — read, try a clean

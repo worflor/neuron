@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! The host API seam — the ONE surface adapters talk to.
 //!
 //! Adapters (Chroma REST, OpenRGB TCP, telemetry, the device writer) never

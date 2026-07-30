@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! The unified action model — what any input source (control event, gesture, radial flick)
 //! resolves to. Deliberately serde-tagged and self-contained so it is the contract between
 //! the headless engine and ANY client — the CLI today and the in-process Slint GUI, both of which
@@ -1004,20 +1008,54 @@ impl ScriptKind {
 /// The `ctx` threads through to nested actions (a `Sequence` can contain a context-aware
 /// `Script` step) so the whole macro reasons about one consistent snapshot of the world.
 fn run_sequence(steps: &[Step], ctx: &Context) -> String {
-    // A macro can sleep (held keys, inter-step delays), so run it on a WORKER thread — never block
-    // the live dispatch tick (the listener thread) the way a synchronous walk would. Returns at once
-    // with a "running" line; the work happens off-thread, exactly like ghost-paste and the curtain.
-    // (Spawn failure is vanishingly rare; if it ever happens we run inline rather than drop the macro.)
+    // A macro can sleep (held keys, inter-step delays), so it must not run on the live dispatch
+    // thread the way a synchronous walk would — that would stall every other binding for the
+    // macro's whole duration. Returns at once with a "running" line; the work happens off-thread.
+    //
+    // It goes to the WARM RUNNER POOL rather than a freshly spawned thread. That is a measured
+    // choice, not a stylistic one: spawning cost mean 342µs / p99 2.6ms *on the dispatch thread*,
+    // before the macro's first keystroke could go out — the largest controllable cost in the whole
+    // press→output path. See `crate::macros::runner`.
     let n = steps.len();
+    let plural = if n == 1 { "" } else { "s" };
     let owned_steps = steps.to_vec();
     let owned_ctx = ctx.clone();
-    let spawned = crate::worker::spawn_detached("neuron-macro", move || {
-        run_sequence_sync(&owned_steps, &owned_ctx);
-    });
-    if spawned {
-        format!("running macro ({n} step{})", if n == 1 { "" } else { "s" })
-    } else {
-        run_sequence_sync(steps, ctx)
+    // Carry the press's origin across the thread boundary so the macro's FIRST keystroke still
+    // records `press_to_output` against the real press — otherwise the headline number would stop
+    // at "we handed the macro to a worker", which is not what the user feels.
+    let origin = crate::latency::origin();
+    // Scoped tightly to the HANDOFF. If the guard covered the whole `match`, the no-pool fallback's
+    // inline run would record the macro's entire duration as "spawn cost" and poison the stage that
+    // exists to measure the handoff.
+    let submitted = {
+        let _t = crate::latency::start(&crate::latency::MACRO_SPAWN);
+        crate::macros::runner::submit(move || {
+            crate::latency::adopt(origin);
+            run_sequence_sync(&owned_steps, &owned_ctx);
+        })
+    };
+    match submitted {
+        crate::macros::runner::Submitted::Queued => format!("running macro ({n} step{plural})"),
+        // Every worker slot is busy AND the queue is full — something is asking for more macro work
+        // than the machine can run. Say so instead of stalling the dispatch thread behind it (see the
+        // runner's doc on why refusing is the honest outcome).
+        crate::macros::runner::Submitted::Refused => {
+            format!("macro skipped ({n} step{plural}) — too many macros already running")
+        }
+        // No pool could be created at all. Fall back to the old per-fire thread, and only run inline
+        // if even that fails — a macro is never silently dropped for an infrastructure failure.
+        crate::macros::runner::Submitted::NoPool => {
+            let steps2 = steps.to_vec();
+            let ctx2 = ctx.clone();
+            if crate::worker::spawn_detached("neuron-macro", move || {
+                crate::latency::adopt(origin);
+                run_sequence_sync(&steps2, &ctx2);
+            }) {
+                format!("running macro ({n} step{plural})")
+            } else {
+                run_sequence_sync(steps, ctx)
+            }
+        }
     }
 }
 
@@ -1053,12 +1091,17 @@ fn run_sequence_sync(steps: &[Step], ctx: &Context) -> String {
             (action, h) => {
                 let _ = action.run_ctx(ctx);
                 if h > 0 {
-                    std::thread::sleep(Duration::from_millis(h as u64));
+                    crate::timing::sleep_precise(Duration::from_millis(h as u64));
                 }
             }
         }
         if step.delay_ms > 0 {
-            std::thread::sleep(Duration::from_millis(step.delay_ms.min(STEP_MS_CAP) as u64));
+            // `sleep_precise`, NOT `thread::sleep`: on Windows the latter is quantised to the ~15.6ms
+            // scheduler tick, so every inter-step delay under ~16ms silently became ~16ms and a macro
+            // written with 2ms spacing ran roughly eight times slower than authored. See `crate::timing`.
+            crate::timing::sleep_precise(Duration::from_millis(
+                step.delay_ms.min(STEP_MS_CAP) as u64,
+            ));
         }
     }
     format!(
@@ -1313,7 +1356,9 @@ fn hold_key(name: &str, hold_ms: u32) -> String {
         win_key::down(vk);
         held.0.push(vk);
     }
-    std::thread::sleep(Duration::from_millis(hold_ms as u64));
+    // Precise: a "hold W for 2ms" that really holds for 15ms is a different input to a game than the
+    // one the macro author wrote. See `crate::timing`.
+    crate::timing::sleep_precise(Duration::from_millis(hold_ms as u64));
     drop(held); // release in reverse press order (also fires if the sleep above unwinds)
     format!("held [{name}] {hold_ms}ms (vk 0x{vk:02X})")
 }
@@ -1334,13 +1379,10 @@ fn run_cmd(cmd: &str) -> String {
     if !process_spawn_armed() {
         return format!("run `{cmd}` [disarmed]");
     }
-    // Spawn through the shared macro helper so shell-outs never inherit Neuron's process arm-state
-    // and interpreter consoles stay hidden on Windows.
-    let res = crate::macros::spawn_shell_command(cmd);
-    match res {
-        Ok(_) => format!("ran `{cmd}`"),
-        Err(e) => format!("run failed: {e}"),
-    }
+    // Through the shared macro helper so shell-outs never inherit Neuron's process arm-state and
+    // interpreter consoles stay hidden on Windows — and so a spawn fired by a keypress does not stall
+    // the dispatch pump for the milliseconds `CreateProcess` takes (see `crate::macros::run_shell`).
+    crate::macros::run_shell(cmd)
 }
 
 #[cfg(windows)]
@@ -1626,6 +1668,91 @@ pub fn key_param_for_vk(vk: u16) -> String {
     }
 }
 
+/// Convert a neuron key-name (the [`key_param_for_vk`] vocabulary — lowercase: `"g"`, `"5"`,
+/// `"f5"`, `"-"`, `"space"`, `"up"`, `"lctrl"`) into its RAW HID Keyboard/Keypad usage, for a
+/// DEVICE-SIDE button remap ([`crate::writes::set_mouse_button_key`]). `None` for anything a single
+/// device usage can't express — chords (`"ctrl+s"`), media keys, numpad, or unknown names — so the
+/// caller falls back to host-side dispatch. The inverse of `controls::kbd_usage_name`.
+pub fn hid_usage_for_key(key: &str) -> Option<u8> {
+    let raw = key.trim();
+    if raw.is_empty() || raw.contains('+') {
+        return None; // a chord / multi-key can't be a single device usage
+    }
+    // Normalize case ONCE, here, and use `k` everywhere below.
+    //
+    // Case used to be folded in two separate places — per-character for the single-char branch, and
+    // again inside the named-key match — which left the function-key branch (`strip_prefix('f')`)
+    // matching lowercase only. So `"g"`/`"G"` both worked while `"F5"` silently returned `None` and
+    // fell back to host-side dispatch, even though `"f5"` mapped fine. One normalization point makes
+    // that whole class of inconsistency unrepresentable rather than fixing the `f` branch alone.
+    let lowered = raw.to_ascii_lowercase();
+    let k = lowered.as_str();
+    if k.len() == 1 {
+        let c = k.as_bytes()[0];
+        match c {
+            b'a'..=b'z' => return Some(0x04 + (c - b'a')),
+            b'1'..=b'9' => return Some(0x1E + (c - b'1')),
+            b'0' => return Some(0x27),
+            b'-' => return Some(0x2D),
+            b'=' => return Some(0x2E),
+            b'[' => return Some(0x2F),
+            b']' => return Some(0x30),
+            b'\\' => return Some(0x31),
+            b';' => return Some(0x33),
+            b'\'' => return Some(0x34),
+            b'`' => return Some(0x35),
+            b',' => return Some(0x36),
+            b'.' => return Some(0x37),
+            b'/' => return Some(0x38),
+            _ => return None,
+        }
+    }
+    // fN function keys (f1..f12 -> 0x3A.., f13..f24 -> 0x68..)
+    if let Some(n) = k
+        .strip_prefix('f')
+        .filter(|d| d.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|d| d.parse::<u8>().ok())
+    {
+        return match n {
+            1..=12 => Some(0x3A + (n - 1)),
+            13..=24 => Some(0x68 + (n - 13)),
+            _ => None,
+        };
+    }
+    Some(match k {
+        "space" => 0x2C,
+        "enter" | "return" => 0x28,
+        "esc" | "escape" => 0x29,
+        "backspace" => 0x2A,
+        "tab" => 0x2B,
+        "caps-lock" => 0x39,
+        "up" => 0x52,
+        "down" => 0x51,
+        "left" => 0x50,
+        "right" => 0x4F,
+        "insert" => 0x49,
+        "delete" | "del" => 0x4C,
+        "home" => 0x4A,
+        "end" => 0x4D,
+        "page-up" => 0x4B,
+        "page-down" => 0x4E,
+        "num-lock" => 0x53,
+        "scroll-lock" => 0x47,
+        "print-screen" => 0x46,
+        "pause" => 0x48,
+        "menu" | "apps" => 0x65,
+        "lctrl" | "ctrl" | "control" => 0xE0,
+        "lshift" | "shift" => 0xE1,
+        "lalt" | "alt" => 0xE2,
+        "lwin" | "win" => 0xE3,
+        "rctrl" => 0xE4,
+        "rshift" => 0xE5,
+        "ralt" => 0xE6,
+        "rwin" => 0xE7,
+        _ => return None,
+    })
+}
+
 /// Split a `+`-chord key name into `(modifier VKs, the final key name)`. Only the canonical
 /// modifier names chord (`ctrl`/`shift`/`alt`/`win` and their sided forms) so names that legally
 /// CONTAIN a `+` — `num+`, `=` — never mis-split. A bare modifier name is just a key, not a chord.
@@ -1802,12 +1929,26 @@ mod win_key {
         }
     }
 
+    /// Issue one `SendInput` call — the single door every synthesised keystroke leaves through, so
+    /// it is the one honest place to stamp the latency instrument.
+    ///
+    /// `mark_output` runs AFTER the call, not before: the moment that matters to the user is when the
+    /// OS accepted the keystroke, so `press_to_output` should include the syscall rather than stop
+    /// just short of it. (It is a no-op unless this thread is servicing an input edge that has not
+    /// produced output yet — see `crate::latency`.)
+    unsafe fn emit(n: u32, inputs: *const INPUT) {
+        let t = std::time::Instant::now();
+        SendInput(n, inputs, std::mem::size_of::<INPUT>() as i32);
+        crate::latency::SEND_INPUT.record(t.elapsed());
+        crate::latency::mark_output();
+    }
+
     /// Send a single keyboard event (down or up).
     unsafe fn send_one(input: INPUT) {
         if !super::input_armed() {
             return;
         }
-        SendInput(1, &input, std::mem::size_of::<INPUT>() as i32);
+        emit(1, &input);
     }
 
     /// Press a key down (no release) — pairs with [`up`] for real held-key macros.
@@ -1826,11 +1967,7 @@ mod win_key {
             return;
         }
         let inputs = [mk(vk, 0), mk(vk, KEYEVENTF_KEYUP)];
-        SendInput(
-            inputs.len() as u32,
-            inputs.as_ptr(),
-            std::mem::size_of::<INPUT>() as i32,
-        );
+        emit(inputs.len() as u32, inputs.as_ptr());
     }
 
     /// Type ONE character as a Unicode scan-code (down+up per UTF-16 unit) — layout-independent,
@@ -1859,11 +1996,7 @@ mod win_key {
             seq.push(uni(u, false));
             seq.push(uni(u, true));
         }
-        SendInput(
-            seq.len() as u32,
-            seq.as_ptr(),
-            std::mem::size_of::<INPUT>() as i32,
-        );
+        emit(seq.len() as u32, seq.as_ptr());
     }
 }
 
@@ -1901,16 +2034,21 @@ mod win_mouse {
         }
     }
 
-    /// Send a slice of mouse inputs in one atomic `SendInput` call.
+    /// Send a slice of mouse inputs in one atomic `SendInput` call. Instrumented for the same reason
+    /// as `win_key::emit` — a click is an output edge like a keystroke, and a mouse-bound macro's
+    /// `press_to_output` must read the same as a key-bound one's.
     unsafe fn send(inputs: &[INPUT]) {
         if !super::input_armed() {
             return;
         }
+        let t = std::time::Instant::now();
         SendInput(
             inputs.len() as u32,
             inputs.as_ptr(),
             std::mem::size_of::<INPUT>() as i32,
         );
+        crate::latency::SEND_INPUT.record(t.elapsed());
+        crate::latency::mark_output();
     }
 
     /// Synthesize a full click (down+up) for a button, or one wheel notch for a scroll direction.
@@ -1976,13 +2114,58 @@ mod win_mouse {
             }
         }
         let _release = Release(up, data);
-        std::thread::sleep(std::time::Duration::from_millis(ms));
+        // Precise for the same reason as the key hold: a drag or a short click-hold that overshoots
+        // to the ~15.6ms scheduler tick is not the input the macro asked for. See `crate::timing`.
+        crate::timing::sleep_precise(std::time::Duration::from_millis(ms));
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `hid_usage_for_key` maps neuron key-names to raw HID usages, is the inverse of controls'
+    /// `kbd_usage_name` for the keys both cover, and rejects anything a single device usage can't
+    /// express (chords, media, numpad, unknown).
+    #[test]
+    fn hid_usage_for_key_maps_and_rejects() {
+        // letters, digits, symbols
+        assert_eq!(hid_usage_for_key("a"), Some(0x04));
+        assert_eq!(hid_usage_for_key("g"), Some(0x0A));
+        assert_eq!(hid_usage_for_key("z"), Some(0x1D));
+        assert_eq!(hid_usage_for_key("1"), Some(0x1E));
+        assert_eq!(hid_usage_for_key("9"), Some(0x26));
+        assert_eq!(hid_usage_for_key("0"), Some(0x27));
+        assert_eq!(hid_usage_for_key("-"), Some(0x2D));
+        assert_eq!(hid_usage_for_key("="), Some(0x2E));
+        // case-insensitive
+        assert_eq!(hid_usage_for_key("G"), Some(0x0A));
+        // function keys, both banks
+        assert_eq!(hid_usage_for_key("f5"), Some(0x3E));
+        assert_eq!(hid_usage_for_key("f13"), Some(0x68));
+        assert_eq!(hid_usage_for_key("f24"), Some(0x73));
+        assert_eq!(hid_usage_for_key("f"), Some(0x09)); // the LETTER f, not a function key
+        // ...and case-insensitively for EVERY shape, not just single characters. `F5` is how a
+        // person naturally writes a function key; it used to return None (silently falling back to
+        // host-side dispatch) because case was folded in two places and the `f` prefix check saw the
+        // un-normalized string.
+        assert_eq!(hid_usage_for_key("F5"), Some(0x3E), "uppercase function keys must map");
+        assert_eq!(hid_usage_for_key("F13"), Some(0x68));
+        assert_eq!(hid_usage_for_key("F"), Some(0x09), "uppercase letter f is still the letter");
+        assert_eq!(hid_usage_for_key("SPACE"), Some(0x2C), "uppercase named keys must map");
+        assert_eq!(hid_usage_for_key("Up"), Some(0x52), "mixed-case named keys must map");
+        // named keys + modifiers
+        assert_eq!(hid_usage_for_key("space"), Some(0x2C));
+        assert_eq!(hid_usage_for_key("up"), Some(0x52));
+        assert_eq!(hid_usage_for_key("lctrl"), Some(0xE0));
+        assert_eq!(hid_usage_for_key("shift"), Some(0xE1));
+        // rejects
+        assert_eq!(hid_usage_for_key("ctrl+s"), None, "chord");
+        assert_eq!(hid_usage_for_key("volume-up"), None, "media");
+        assert_eq!(hid_usage_for_key("num5"), None, "numpad");
+        assert_eq!(hid_usage_for_key("f25"), None, "out of range fN");
+        assert_eq!(hid_usage_for_key(""), None);
+    }
 
     /// Every named VK round-trips: `vk_for(key_param_for_vk(vk)) == vk` over the full practical
     /// space — what press-to-bind capture writes is exactly what the engine presses. (The sided

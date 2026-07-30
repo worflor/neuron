@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! A minimal RFC 6455 WebSocket client — just enough to speak obs-websocket,
 //! hand-rolled so [`neuron-host`](crate) stays zero-dep. Text frames only
 //! (obs-websocket is all JSON text), plus the control frames a compliant

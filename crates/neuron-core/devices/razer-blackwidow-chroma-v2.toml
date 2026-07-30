@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Woflo Labs
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 # Device definition — Razer BlackWidow Chroma V2 (older era: legacy lighting, NO onboard
 # storage). Confirmed live: razer_report on usage 0001/0002, classes 0x00/0x02/0x03 only,
 # serial IO1735F09002641, device mode 0x03. This file exists mainly to drive the keyboard's

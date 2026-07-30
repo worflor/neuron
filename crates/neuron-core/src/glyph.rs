@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: LicenseRef-WLCSL-1.0
+// See ../../../LICENSE.md and ../../../LICENSES/WLCSL-1.0.md.
+
 //! Glyph eigenmotion — faithful Rust port of `glyph.wat` (+ the lane/segment logic
 //! from `live-wasm-glyph.ts`), specialized to 2D mouse motion and gesture recognition.
 //!
@@ -2098,8 +2102,8 @@ mod tests {
 
         /// Rank a word against `dictionary` by `word_distance`, ascending. Only meaningful when
         /// there's a clear margin between 1st and 2nd place — callers `prop_assume!` on that.
-        fn ranked<'a>(
-            dict: &'a [(&'static str, GestureWord)],
+        fn ranked(
+            dict: &[(&'static str, GestureWord)],
             w: &GestureWord,
             cfg: &GlyphConfig,
         ) -> Vec<(&'static str, f64)> {

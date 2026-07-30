@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Real-time audio output — a cpal stream driving a voice pool, fed by a lock-free ring.
 //!
 //! The notification engine (its own thread) calls [`SoundEngine::strike`], which packs a note into a

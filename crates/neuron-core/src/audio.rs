@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Core-Audio control for capture/render endpoints — the cross-device half of remapping.
 //!
 //! Synapse's own mic gain/mute path is `RSy3_WinAudio.dll`, a thin native wrapper over the
@@ -1139,7 +1143,7 @@ mod imp {
                     }
                     let n = frames as usize;
                     if flags & BUFFERFLAGS_SILENT != 0 || data.is_null() {
-                        out.extend(std::iter::repeat(0.0).take(n));
+                        out.extend(std::iter::repeat_n(0.0, n));
                     } else {
                         match self.fmt {
                             SampleFmt::F32 => {

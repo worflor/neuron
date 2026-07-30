@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: LicenseRef-WLCSL-1.0
+// See ../LICENSE.md.
+
 #![allow(clippy::needless_range_loop)]
 //! Wire format serialization and deserialization.
 //!

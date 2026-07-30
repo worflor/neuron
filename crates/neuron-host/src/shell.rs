@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! The host shell — the kernel as an immortal actor.
 //!
 //! One thread owns the [`Kernel`]. Everyone else holds a [`HostHandle`]
@@ -6,7 +10,7 @@
 //! can never corrupt the kernel, and a kernel fault can never deadlock a
 //! caller (their reply sender drops, they get a default, they carry on).
 //!
-//! Immortality is the §6 design, composed from the pieces already proven in
+//! Process recovery is composed from the pieces already proven in
 //! isolation:
 //!
 //! - the actor loop runs inside `catch_unwind`; the command RECEIVER lives

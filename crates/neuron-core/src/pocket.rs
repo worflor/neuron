@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Portable clipboards — "pockets".
 //!
 //! A pocket is a named, single-payload clipboard register. Activating a `pocket` Action MOVES
@@ -258,7 +262,9 @@ impl SplitMix64 {
 
 /// What a pocket is holding, at a glance — drives the icon/representation in the UI.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Default)]
 pub enum PocketKind {
+    #[default]
     Empty,
     Text,
     Files,
@@ -266,11 +272,6 @@ pub enum PocketKind {
     Other,
 }
 
-impl Default for PocketKind {
-    fn default() -> Self {
-        PocketKind::Empty
-    }
-}
 
 /// A renderable view of a pocket's payload: enough for the GUI to *show the data*, not just name it.
 #[derive(Clone, Default)]

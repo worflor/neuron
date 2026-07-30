@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: LicenseRef-WLCSL-1.0
+// See ../LICENSE.md.
+
 //! Core data types for the Engram codec.
 //!
 //! These mirror the Python dataclasses but with Rust's type system

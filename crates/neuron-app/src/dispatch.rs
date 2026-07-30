@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! LIVE DISPATCH — the headline. A device-event runtime on a dedicated worker thread, so GUI-bound
 //! remaps fire LIVE without the CLI daemon.
 //!
@@ -489,6 +493,20 @@ fn service_while_halted(
 /// non-Windows host the loop still arms/builds the engine and processes reload/inject/profile
 /// commands on the tick — only hardware input edges are dormant (no source yet).
 fn run_worker(weak: slint::Weak<AppWindow>, stop: Arc<AtomicBool>, live_rx: Receiver<LiveCommand>) {
+    // Input posture: this is THE thread that turns a device edge into an action, so if the scheduler
+    // leaves it waiting behind a fullscreen game's threads, every binding fires late — intermittently,
+    // and worst exactly when a game is running. `latency::INJECT_HOP` is what measures whether this
+    // is working. See `neuron::timing::boost_input_thread` for why ABOVE_NORMAL and not higher.
+    let boosted = neuron::timing::boost_input_thread();
+    crate::flight::trace(
+        "life",
+        if boosted {
+            "live dispatch pump: input priority raised"
+        } else {
+            "live dispatch pump: running at default priority"
+        },
+        0,
+    );
     // Build the ONE unified spine (bindings.toml + cast.toml + profiles/*.rules.toml + apps.toml).
     let rt = controls::build_runtime();
     let exec = DispatchExecutor::new();
@@ -542,6 +560,14 @@ fn run_worker(weak: slint::Weak<AppWindow>, stop: Arc<AtomicBool>, live_rx: Rece
     // that pumps itself. The policy comes from the active profile's ApplyReport; we read it from the
     // shared cell the glue updates on profile apply.
     install_gaming_hook(&mut ctx.get_mut().hook);
+
+    // DEVICE-SIDE REMAP SHIM: arm the user-mode interceptor from the engine's pid-scoped keyboard
+    // `Key` bindings (the Naga thumb grid etc. — hardware keyboards Razer only remaps via a kernel
+    // filter; this is the driver-free user-mode equivalent). No-op when there are none.
+    {
+        let c = ctx.borrow();
+        neuron::intercept::configure_from_engine(&c.rt.borrow().engine);
+    }
 
     // ── THE IMMORTAL LISTENER ── this worker is the organ that fires every cast and remap; if it
     // dies, spellweaving "visually works but nothing happens" — the worst reliability lie the app
@@ -618,12 +644,26 @@ fn run_worker(weak: slint::Weak<AppWindow>, stop: Arc<AtomicBool>, live_rx: Rece
     LAYER_HELD.store(false, Ordering::Relaxed);
     SNIPER_HELD.store(false, Ordering::Relaxed);
     push_hold_state();
+    neuron::intercept::deactivate(); // uninstall the remap-shim hook; the desktop returns to normal
     drop(ctx); // the hook (among everything else) drops here (uninstalls)
 }
 
 /// The live worker's per-event edge handler — the exact body of `run_worker`'s old `on_event`
 /// closure, verbatim (capture-active check, edge loop, down/up arms, publish_held), now callable
 /// one edge at a time so a test can drive it directly instead of only through the immortal loop.
+/// Does the device-side remap shim own this trigger? Only pid-scoped keyboard-page `Input`
+/// triggers can be shim-owned; everything else dispatches through the engine as before.
+fn interceptor_owns(t: &Trigger) -> bool {
+    match t {
+        Trigger::Input {
+            page,
+            usage,
+            pid: Some(pid),
+        } => neuron::intercept::owns(*page, *usage, *pid),
+        _ => false,
+    }
+}
+
 fn live_edge(ctx: &mut LiveCtx, ev: &ControlEvent) {
     // While a press-to-bind capture is in flight, the user is pressing a control to BIND it,
     // not to use it — track edges but fire NOTHING, so the captured key doesn't also run
@@ -631,8 +671,23 @@ fn live_edge(ctx: &mut LiveCtx, ev: &ControlEvent) {
     // all: the capture's own transient listener steals the process's Raw-Input registration
     // until it ends — the resident pump re-arms itself right after; see controls REARM.)
     let capturing = crate::capture::CAPTURE_ACTIVE.load(Ordering::Relaxed);
-    for edge in ctx.edges.borrow_mut().edges(ev) {
+    let edges = {
+        // The held-set diff that turns one report into Down/Up edges. `edges` returns an owned Vec,
+        // so the timer closes on the diff itself rather than spanning every action the edges go on
+        // to fire — which is what would make this reading meaningless.
+        let _t = neuron::latency::start(&neuron::latency::EDGE_DIFF);
+        ctx.edges.borrow_mut().edges(ev)
+    };
+    for edge in edges {
         if capturing {
+            continue;
+        }
+        // The remap SHIM owns this trigger at the input layer (it swallows the original + injects
+        // the target key). Do NOT also dispatch it host-side — that would double-send.
+        let edge_trigger = match &edge {
+            InputEdge::Down(t) | InputEdge::Up(t) => t,
+        };
+        if interceptor_owns(edge_trigger) {
             continue;
         }
         match edge {
@@ -714,6 +769,8 @@ fn live_cadence(ctx: &LiveCtx) -> Duration {
 /// the next tick.
 fn live_tick(ctx: &mut LiveCtx) -> Duration {
     ctx.tick = ctx.tick.wrapping_add(1);
+    // Remap shim fail-open: replay any keystroke swallowed but never attributed by Raw-Input.
+    neuron::intercept::expire_tick();
     for cmd in ctx.live_rx.try_iter() {
         match cmd {
             LiveCommand::Reload => ctx.reload_pending = true,
@@ -759,6 +816,8 @@ fn live_tick(ctx: &mut LiveCtx) -> Duration {
         key_remap_release_all(&ctx.held_keys); // nor a held remapped key
         sniper_release_all(&ctx.devices, &ctx.sniper); // nor a held sniper (restore the DPI)
         *ctx.rt.borrow_mut() = controls::build_runtime();
+        // Re-arm the remap shim from the rebuilt engine (a rebind/added binding takes effect here).
+        neuron::intercept::configure_from_engine(&ctx.rt.borrow().engine);
         ctx.exec.borrow_mut().clear();
         ctx.devices.borrow_mut().clear();
         ctx.turbos.borrow_mut().clear();
@@ -867,27 +926,35 @@ fn live_tick(ctx: &mut LiveCtx) -> Duration {
         }
         ctx.last_mute = Some(now);
         if fire {
-            fire_trigger(
-                &mut ctx.devices.borrow_mut(),
-                &mut ctx.rt.borrow_mut(),
-                &mut ctx.exec.borrow_mut(),
-                &Trigger::MicTap,
-                &ctx.status,
-                &ctx.weak,
-            );
-            let (p, u) = MIC_TAP;
-            fire_trigger(
-                &mut ctx.devices.borrow_mut(),
-                &mut ctx.rt.borrow_mut(),
-                &mut ctx.exec.borrow_mut(),
-                &Trigger::Input {
-                    page: p,
-                    usage: u,
-                    pid: Some(0x056a),
-                },
-                &ctx.status,
-                &ctx.weak,
-            );
+            // A mic tap is a real input edge, so it is stamped like one — otherwise this whole class of
+            // trigger would be invisible to `press_to_output` / `edge_to_done`. It is NOT an injected
+            // `ControlEvent` (it is detected here, by polling Core Audio), so nothing upstream has
+            // wrapped it; a live capture proved the gap — the toggles produced `resolve` samples with
+            // no end-to-end reading at all. ONE `with_edge` spans both triggers because one physical
+            // tap fires both, and the instrument measures the tap, not each rule it matches.
+            neuron::latency::with_edge(Instant::now(), || {
+                fire_trigger(
+                    &mut ctx.devices.borrow_mut(),
+                    &mut ctx.rt.borrow_mut(),
+                    &mut ctx.exec.borrow_mut(),
+                    &Trigger::MicTap,
+                    &ctx.status,
+                    &ctx.weak,
+                );
+                let (p, u) = MIC_TAP;
+                fire_trigger(
+                    &mut ctx.devices.borrow_mut(),
+                    &mut ctx.rt.borrow_mut(),
+                    &mut ctx.exec.borrow_mut(),
+                    &Trigger::Input {
+                        page: p,
+                        usage: u,
+                        pid: Some(0x056a),
+                    },
+                    &ctx.status,
+                    &ctx.weak,
+                );
+            });
         }
     }
     // app-aware switch: a focus change fires an AppFocus trigger; the Engine's matching
@@ -901,14 +968,18 @@ fn live_tick(ctx: &mut LiveCtx) -> Duration {
             s.focused_app = app.clone();
         }
         post_status(&ctx.weak, &ctx.status);
-        fire_trigger(
-            &mut ctx.devices.borrow_mut(),
-            &mut ctx.rt.borrow_mut(),
-            &mut ctx.exec.borrow_mut(),
-            &Trigger::AppFocus { app },
-            &ctx.status,
-            &ctx.weak,
-        );
+        // Stamped for the same reason as the mic tap: a focus change is an edge the user causes, and a
+        // profile switch that feels slow should be measurable rather than anecdotal.
+        neuron::latency::with_edge(Instant::now(), || {
+            fire_trigger(
+                &mut ctx.devices.borrow_mut(),
+                &mut ctx.rt.borrow_mut(),
+                &mut ctx.exec.borrow_mut(),
+                &Trigger::AppFocus { app },
+                &ctx.status,
+                &ctx.weak,
+            );
+        });
     }
     live_cadence(ctx)
 }
@@ -1937,6 +2008,7 @@ mod tests {
         ///     the module's input-safety invariant doc at the top of this file).
         ///   * usage 4 -> `Action::Echo` (a plain one-shot action, so a base-layer dispatch fires too).
         ///   * the AppFocus marker -> `Action::Echo` (the `Inject` op's bound-trigger case).
+        ///
         /// Deliberately NO on-disk `Action::MomentaryMic` rule: `device: None` resolves to the REAL
         /// default capture endpoint, and firing it through a real edge would flip the ACTUAL system
         /// mic mute on the machine running this test — the momentary held-map is instead exercised via

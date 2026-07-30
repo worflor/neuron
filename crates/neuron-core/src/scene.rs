@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! The visual language of KNOCKBACK — and the template for Neuron's magic at large: **hard
 //! light**. Symmetra's school of sorcery: nothing is a soft puff of smoke; everything is a
 //! *constructed* thing made of light — faceted, crystalline, edge-lit, with a prismatic

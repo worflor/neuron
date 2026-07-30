@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Audio panel glue — thin wrapper over neuron-core's Core-Audio `VolumeCtl`. Resolves both sides of
 //! the chain: the default CAPTURE device (mic, preferring a Razer/Seiren) and the default RENDER
 //! device (headset / sound card / speakers), reading/writing gain + mute on each. No vendor HID —

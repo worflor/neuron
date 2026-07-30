@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! The NODE MODEL — the two-way contract between a macro's Python source and a typed tree.
 //!
 //! A macro is the ordered statements inside `def macro(ctx):`; the wrapper `def` is implicit, so a

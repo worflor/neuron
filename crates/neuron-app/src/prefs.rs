@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! App preferences — the small set of GUI-only settings that aren't device config. Lives as plain,
 //! hand-editable TOML (`app.toml`) in the run directory, same as every other Neuron config. Today
 //! it holds `start_minimized`: whether a `--tray`/autostart launch (or a bare launch) should bring

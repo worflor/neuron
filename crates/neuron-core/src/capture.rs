@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Press-to-bind capture — the core primitive behind the project's strongest UX rule:
 //! **the user PRESSES the control they want; we never hardcode a button.** (See the memory note:
 //! "DONT HARD CODE IT TO FUCKING THUMB 2".)

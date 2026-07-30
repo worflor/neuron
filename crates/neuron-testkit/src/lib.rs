@@ -1,10 +1,15 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo Research Components Exception 1.0.
+// See ../../../LICENSE.md.
+
 //! neuron-testkit — instruments for testing neuron against RECORDED REALITY instead of
 //! hand-imagined mocks.
 //!
-//! The doctrine (see docs/TDD.md §5.7 and §9): every belief a test bakes in should be
-//! traceable to an observation. So the kit is built from recordings taken through neuron's
-//! own seams — the Chroma SHM sections a real game painted, the HID conversations a real
-//! device answered — with models fitted to those recordings, and generators that only
+//! Every belief a test bakes in should be traceable to an observation. The kit is therefore
+//! built from recordings taken through neuron's own seams — the Chroma SHM sections a real
+//! game painted and the HID conversations a real device answered — with models fitted to
+//! those recordings, and generators that only
 //! explore the space the real protocol grammar admits.
 //!
 //! Today: [`tape`] — the ChromaTape format (a sampled recording of the native Chroma

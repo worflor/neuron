@@ -1,10 +1,14 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! The capstone: every piece composed, end to end.
 //!
 //! An OpenRGB client's raw wire bytes flow through the adapter, over the
 //! actor channel into the kernel, the arbiter resolves ownership, and the
 //! paced writer delivers frames to a (mock) device sink — while the user's
 //! base lighting waits underneath and returns the instant the client
-//! disconnects. This is the R&D doc's §5.1 story running as real threads.
+//! disconnects. The test runs that entire ownership handoff through real threads.
 
 use std::time::{Duration, Instant};
 

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Native file-open dialog for the Import wizard — replaces the type-the-path stub. We drive the
 //! real Windows file-open dialog via PowerShell's `System.Windows.Forms.OpenFileDialog` (a genuine
 //! native Win32 common dialog), which needs NO extra crate / no new windows-sys feature. The dialog

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: LicenseRef-WLCSL-1.0
+// See ../LICENSE.md.
+
 //! Integration tests: full end-to-end pipeline on real text.
 //!
 //! Feeds article-shaped .txt fixtures through ByteHistogram → encode →

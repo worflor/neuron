@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Chroma shared-memory adapter — the native face of neuron's Chroma server.
 //!
 //! The REST adapter ([`crate::adapters::chroma`], port 54235) catches network clients.
@@ -676,9 +680,9 @@ pub fn parse_frame_decoded(section: &[u8]) -> Option<(RecordHeader, Vec<ColorUni
         // No timestamp (an old-format or single capture) → hand back the raw grid.
         return Some((header, raw));
     };
-    let k_r = KEYSTREAM[phase] as u8;
-    let k_g = KEYSTREAM[phase + KEYSTREAM_CHANNEL_STRIDE] as u8;
-    let k_b = KEYSTREAM[phase + 2 * KEYSTREAM_CHANNEL_STRIDE] as u8;
+    let k_r = KEYSTREAM[phase];
+    let k_g = KEYSTREAM[phase + KEYSTREAM_CHANNEL_STRIDE];
+    let k_b = KEYSTREAM[phase + 2 * KEYSTREAM_CHANNEL_STRIDE];
 
     let units = raw
         .iter()
@@ -895,7 +899,7 @@ pub mod server {
             };
             let appreg = find_sec(APP_REGISTRY);
             let sessinfo = find_sec(SESSION_INFO);
-            let keyboard = device_section(0x01).map(|g| find_sec(g)).unwrap_or((0, 0));
+            let keyboard = device_section(0x01).map(find_sec).unwrap_or((0, 0));
             // `wear_mask` can decline (`None`) if another thread in THIS process won the
             // `mask_worn()` race above and already claimed the single in-process arbiter slot
             // (see `claim_mask_slot`) — the same "a live server owns arbitration" signal as the

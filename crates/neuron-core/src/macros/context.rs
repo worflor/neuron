@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! The macro Context API — the world a macro reacts to.
 //!
 //! A context-aware macro asks "where am I?" before it acts: which app is focused, what's the
@@ -52,14 +56,24 @@ impl Context {
     /// `GetForegroundWindow` (handle + title), the clipboard (`CF_UNICODETEXT`), and the
     /// Explorer shell-folder path; every probe is read-only and falls back to `None` rather
     /// than failing, so `capture()` always yields a valid context.
+    ///
+    /// Each probe runs exactly ONCE and the results are threaded into whatever else needs them.
+    /// That is not tidiness — it is measured: this runs on the dispatch thread, which services no
+    /// other input while it does, and the naive version called `foreground_app` (an `OpenProcess` +
+    /// `QueryFullProcessImageNameW` round trip) and `foreground_window_title` twice each, because
+    /// `explorer_path` re-derived both for itself. `latency::CTX_CAPTURE` is what shows the
+    /// difference; `latency::CTX_CLIPBOARD` is what proved the clipboard was NOT the expensive part
+    /// (~78µs of ~734µs), which is what pointed here instead.
     pub fn capture() -> Self {
         let prev_window = foreground_window();
+        let app = foreground_app();
+        let window_title = foreground_window_title();
         Context {
-            app: foreground_app(),
-            window_title: foreground_window_title(),
-            cwd: explorer_path(),
+            cwd: explorer_path(app.as_deref(), window_title.as_deref()),
             clipboard: clipboard_text(),
             selection: selection_text(),
+            app,
+            window_title,
             prev_window,
         }
     }
@@ -147,17 +161,21 @@ fn foreground_window_title() -> Option<String> {
 }
 
 #[cfg(windows)]
-fn explorer_path() -> Option<std::path::PathBuf> {
+fn explorer_path(app: Option<&str>, title: Option<&str>) -> Option<std::path::PathBuf> {
     // Best-effort: an Explorer window's title is the folder *name* (or, with "show full path in
     // title bar" enabled, the full path). We only return a path when the title resolves to an
     // existing directory — anything ambiguous degrades to None (the COM IShellWindows walk is the
     // full solution; this guarded heuristic avoids a flaky COM dependency in the hot path).
-    let app = foreground_app()?;
-    if app != "explorer.exe" {
+    //
+    // `app` and `title` are PASSED IN, not re-probed: the caller already has both, and re-deriving
+    // them here meant every context capture paid for two extra `OpenProcess`/image-name round trips
+    // (see `Context::capture`'s note).
+    if app? != "explorer.exe" {
         return None;
     }
-    let title = foreground_window_title()?;
-    let p = std::path::PathBuf::from(title.trim());
+    let p = std::path::PathBuf::from(title?.trim());
+    // `is_dir` is a filesystem stat, so it is reached only after the cheap checks have already
+    // established this is an Explorer window with an absolute-looking title.
     if p.is_absolute() && p.is_dir() {
         Some(p)
     } else {
@@ -175,6 +193,10 @@ fn clipboard_text() -> Option<String> {
 
     // CF_UNICODETEXT = 13.
     const CF_UNICODETEXT: u32 = 13;
+    // Measured separately from the rest of `capture` (see `latency::CTX_CLIPBOARD`): this is the only
+    // part that waits on a resource other processes contend for, so it is the only part whose cost is
+    // not ours to simply make smaller.
+    let _t = crate::latency::start(&crate::latency::CTX_CLIPBOARD);
     // Serialize this process's clipboard window against every other clipboard user — see
     // `crate::clipboard` for why there is exactly one process-wide lock.
     let _guard = crate::clipboard::clipboard_guard();
@@ -242,7 +264,7 @@ fn foreground_window_title() -> Option<String> {
     None
 }
 #[cfg(not(windows))]
-fn explorer_path() -> Option<std::path::PathBuf> {
+fn explorer_path(_app: Option<&str>, _title: Option<&str>) -> Option<std::path::PathBuf> {
     None
 }
 #[cfg(not(windows))]

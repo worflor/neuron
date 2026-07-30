@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! The named-thread primitive for neuron-host's lifecycle threads (protocol servers, per-socket
 //! connection handlers, the OBS bridge, the paced writer, the SHM arbiter). Every one of these is
 //! OWNED by a struct that `.join()`s its handle on Drop/stop, so they need the JoinHandle back —

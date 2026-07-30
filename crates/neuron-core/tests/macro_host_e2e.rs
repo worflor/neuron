@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! End-to-end proof of the Macro Host's load-bearing claims against the REAL python sidecar:
 //!   * WARM PERSISTENCE — one sidecar serves many fires with NO respawn (the same os.getpid()
 //!     every time), so a trigger never pays a spawn/import cost. This is the real-time guarantee.

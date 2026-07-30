@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! The signal bus — normalize once, bind anywhere.
 //!
 //! Adapters publish named signals (`cs2.health`, `gpu.temp`, `obs.scene`,

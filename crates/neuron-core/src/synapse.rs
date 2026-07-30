@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Version-agnostic Synapse config ingest ("eat the data"). We never hard-code a Synapse
 //! version's schema or install path — only the stable VENDOR root ("Razer" under the standard
 //! OS data dirs). Files are classified and mined by their *content shape* (the element/key names

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Shared lighting primitives — the small, model-agnostic pieces the Pattern × Spectrum engine is
 //! built from. The open effect SYSTEM itself now lives in [`crate::pattern`] (the shapes) and
 //! [`crate::spectrum`] (the colour programs); a layer is a [`pattern::LayerDef`](crate::pattern::LayerDef)

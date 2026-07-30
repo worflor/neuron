@@ -1,5 +1,10 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: LicenseRef-WLCSL-1.0
+// See ../../../LICENSE.md and ../../../LICENSES/WLCSL-1.0.md.
+
 //! Logos — the attention organ. A Rust port of the Whisper Logos 0D adaptive entropy
-//! predictor (`logos.wat`, by Woflo / MB), specialized for KNOCKBACK's one new need: a
+//! predictor (`logos.wat`, by Woflo Labs), specialized for KNOCKBACK's
+//! one new need: a
 //! **per-byte surprise probe**.
 //!
 //! Logos models a byte stream with eight axes of attention and mixes them with the **Born

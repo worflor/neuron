@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! NON-DESTRUCTIVE stress tests for the BEACON dimension of the macro system — the two-part
 //! "prime, then activate" surface (`neuron.ask`/`choose`/`confirm`) and the radial answer-wheel
 //! geometry that the GUI uses to turn a flick into an option index.

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! The restart governor — supervision as a damped second-order system.
 //!
 //! A naive retry loop is first-order: it either hammers (restart storm) or

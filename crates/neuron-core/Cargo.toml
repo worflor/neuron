@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Woflo Labs
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 # neuron-core — the headless engine. All device protocol, capabilities, lighting/effects,
 # gestures/radial/cast, profiles, the unified Trigger->Action spine, the macro engine, device
 # writes, and Synapse migration. UI-agnostic: the CLI and the GUI both `use neuron::*`.
@@ -10,6 +14,9 @@ description = "Open, lightweight control for Razer devices. The anti-Synapse."
 version.workspace = true
 edition.workspace = true
 license-file.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
 # Bundles a private CPython into the binary: build.rs downloads (and sha256-verifies against the
 # release's SHA256SUMS manifest) a python-build-standalone tarball for the build target, caches it
 # under vendor/pbs-cache/, and hands its path to the crate via NEURON_PY_TARBALL, which
@@ -45,6 +52,11 @@ ingame-poll-write = []
 # off by default (the user's BlackWidow Chroma V2 can't do it). Enable with `--features snap-tap-write`
 # on a supporting board once the round-trip is confirmed (or `NEURON_SNAP_TAP_WRITE` at runtime).
 snap-tap-write = []
+# Exposes the phantom-device harness (src/transport/mock.rs) and the `Backend` install hook to
+# OTHER crates' tests. neuron-core's own unit tests get both via cfg(test) without this. Without
+# it, `installed_backend()` is a compile-time `None`, so a release build keeps the exact call shape
+# it had before the hook existed — the branch folds away and the platform body inlines.
+mock-transport = []
 
 [dependencies]
 serde.workspace = true
@@ -52,7 +64,7 @@ serde_json.workspace = true
 toml.workspace = true
 anyhow.workspace = true
 
-# The Whisper Engram trajectory codec (vendored from the user's Prism suite) — the rhythm
+# The Woflo Labs Engram trajectory codec, included under its own terms — the rhythm
 # familiar's brain in KNOCKBACK: every exchange is an Engram block; the twin's knockback is
 # `predict_all` run one beat past the player's motif. Real, tested physics, not a sim.
 engram = { path = "../engram" }

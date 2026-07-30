@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Device VITALS — battery/charge status cards from a tiny per-device state machine.
 //!
 //! Three variables per battery-capable device: `next_read_at` (the throttle — the earliest instant a

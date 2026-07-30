@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: LicenseRef-WLCSL-1.0
+// See ../LICENSE.md.
+
 //! Block decoding: the inverse of encode.
 //!
 //! Reconstructs the trajectory from oscillator parameters + quantized residuals.

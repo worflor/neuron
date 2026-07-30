@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! ChromaTape — a timestamped recording of the native Chroma shared-memory sections while a
 //! real game paints, and the decoder that replays it into tests.
 //!

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! KNOCKBACK — the rhythm familiar, as an in-app session you enter.
 //!
 //! A lightweight, non-invasive AFK duet: you drum on the cast trigger (and fidget the mouse)

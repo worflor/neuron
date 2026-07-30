@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! THE CONTROL CENTER — a radial PRIME that GLANCES system state and offers a quick toggle.
 //!
 //! Primed by [`Action::Control`](neuron::action::Action::Control), the next hold of the cast

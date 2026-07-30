@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! The socket pump — deliberately dumb I/O at the very edge.
 //!
 //! All protocol intelligence lives in the pure adapter codecs; this module
@@ -12,7 +16,7 @@
 //! the host is the machine's own processes unless the user explicitly asks
 //! for LAN exposure). A failed bind on the well-known port is a FEATURE — it
 //! means another neuron host already owns this machine, and the caller should
-//! become its client instead (the single-instance story, §10.1).
+//! become its client instead, preserving a single host instance per machine.
 
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Unified lighting — one model across Razer's two Chroma eras without losing fidelity.
 //!
 //! The hardware speaks two dialects (we confirmed both live): the **legacy** keyboard class
@@ -507,36 +511,10 @@ pub fn render_frame(effect: Effect, rows: u8, cols: u8, phase: f32, base: Rgb) -
     f
 }
 
-// ── Razer full-size ANSI keyboard: key → (row, col) map ───────────────────────────────────
-//
-// EMERGENT FAMILY-STANDARD KEYMAP — this is NOT one specific board.
-//
-// neuron drives ALL Razer hardware emergently with ZERO per-device scanning or configuration. Razer's
-// full-size keyboards share ONE standard 6×22 ANSI LED matrix convention across the whole BlackWidow
-// family (the same layout OpenRazer's daemon `KEY_MAPPING` encodes, daemon/openrazer_daemon/keyboard.py).
-// The physical key under cell (r,c) is fixed by firmware and is the SAME across the family, so this
-// single key-name → cell table covers any standard Razer keyboard out-of-the-box — no scan, no
-// per-device data. Every key maps to its standard cell.
-//
-// CRUCIALLY we do NOT special-case "which keys have no LED". A board that physically lacks an LED at a
-// key's standard cell (e.g. this Chroma V2's space bar — hardware-confirmed dark; Synapse blanks it
-// too) simply lights NOTHING there: the write lands on a dark cell and disappears — gracefully,
-// automatically, with no per-device "no-LED" list and no scan. A board that DOES carry that LED lights
-// it correctly from the SAME map. Physics handles the difference, not configuration.
-//
-// This serves BOTH the cross-device vitals surface AND the Reactive effect (which lights a pressed
-// key's TRUE single cell). The VK→name mapping (`vk_to_name`) is the universal OS keyboard standard
-// (VK codes are an OS convention, not per-device). The `neuron lighting keytest` / `cellsweep` CLI
-// tools are OPTIONAL developer/verification aids to re-confirm a cell by eye — NEVER a required user
-// step. Genuinely-different layouts (non-ANSI / other form factors) can be supported later via an
-// OPTIONAL per-device override in the registry, but this standard convention covers the family today.
+// Full-size BlackWidow boards share this 6×22 ANSI matrix. Missing LEDs simply ignore their cell.
+// Verified on hardware and cross-checked against OpenRazer's `KEY_MAPPING`.
 
-/// The keyboard cell `(row, col)` a named key lives on, in the STANDARD Razer full-size 6×22 ANSI
-/// matrix shared across the BlackWidow family — `None` if the name isn't in the map. Applies to any
-/// standard Razer keyboard with ZERO per-device setup; a board lacking an LED at a key's cell simply
-/// lights nothing there (no special-casing). Primary names are uppercase, OpenRazer-style (`ESC`, `F1`,
-/// `M1`, `LOGO`, `NUM7`, `LSHIFT`, letters `A`..`Z`, digits as the literal char); punctuation carries
-/// both a word alias and the literal symbol (`SEMICOLON`/`;`). Pure, const-foldable, no allocation.
+/// Resolve a key name or alias to its standard `(row, column)` LED cell.
 pub fn razer_key_cell(name: &str) -> Option<(u8, u8)> {
     Some(match name {
         // ── Row 0: macro M6, ESC, F-row, the print/scroll/pause cluster, logo ──
@@ -884,7 +862,7 @@ pub fn render_vitals(v: Vitals, rows: u8, cols: u8, phase: f32) -> Vec<Rgb> {
         return f;
     }
     // Write `c` to the cell named `name` if the map knows it AND it fits this matrix. The clamp keeps
-    // the surface safe on any dimensions while the real board uses the genuine OpenRazer cells.
+    // the surface safe on any dimensions while the real board uses the verified hardware cells.
     let mut put = |name: &str, c: Rgb| {
         if let Some((r, col)) = razer_key_cell(name) {
             let (r, col) = (r as usize, col as usize);
@@ -1148,7 +1126,7 @@ pub fn changed_rows_into(prev: Option<&[Rgb]>, cur: &[Rgb], cols: usize, out: &m
     if cols == 0 {
         return; // a zero-width matrix has no rows to paint (mirrors `row_report`).
     }
-    let nrows = (cur.len() + cols - 1) / cols; // ceil-div: the rows this frame spans.
+    let nrows = cur.len().div_ceil(cols); // ceil-div: the rows this frame spans.
     let same = match prev {
         Some(p) => p.len() == cur.len(),
         None => false,
@@ -1796,7 +1774,7 @@ mod tests {
 
     // ── CROSS-DEVICE DATA SURFACE: render_vitals ─────────────────────────────────────────
 
-    // cell index helper for a 6×22 matrix, by OpenRazer key name (panics if the key isn't mapped —
+    // cell index helper for a 6×22 matrix, by Neuron's canonical key name (panics if the key isn't mapped —
     // tests only name keys we know are in the map).
     fn cell(name: &str) -> usize {
         let (r, c) = razer_key_cell(name).unwrap();
@@ -1804,8 +1782,8 @@ mod tests {
     }
 
     #[test]
-    fn razer_key_map_matches_openrazer_anchors() {
-        // the sanity anchors from the OpenRazer daemon BlackWidow 6×22 KEY_MAPPING.
+    fn razer_key_map_matches_verified_matrix_anchors() {
+        // Sanity anchors for the hardware-verified BlackWidow 6×22 matrix.
         assert_eq!(razer_key_cell("ESC"), Some((0, 1)));
         assert_eq!(razer_key_cell("M6"), Some((0, 0)));
         assert_eq!(razer_key_cell("LOGO"), Some((0, 20)));

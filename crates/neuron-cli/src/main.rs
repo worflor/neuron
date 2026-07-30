@@ -1,3 +1,8 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo Research Components Exception 1.0.
+// See ../../../LICENSE.md.
+
 //! Neuron CLI — the lightweight, open replacement for Razer Synapse.
 
 use anyhow::{bail, Context, Result};
@@ -24,7 +29,7 @@ use neuron::{
 #[command(
     name = "neuron",
     version,
-    about = "Open, lightweight control for Razer devices — the anti-Synapse"
+    about = "Open, lightweight control for Razer devices: the anti-Synapse"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -184,6 +189,24 @@ enum Cmd {
         /// device PID (hex), e.g. 00a8
         #[arg(long)]
         pid: String,
+    },
+    /// DEVICE-SIDE thumb-button remap (Razer 15/02, RE'd live): the physical button emits the new
+    /// key AT THE SOURCE — one keystroke, no host injection, no double-send. `--key <thumb key>`
+    /// names the stock keypad key to remap (e.g. `=`); `--button <hex>` targets a raw button id;
+    /// `--to <key>` is the target (e.g. `g`, `f13`, `space`). `--reset` restores the stock grid.
+    Remap {
+        /// stock keypad key on the thumb grid to remap (e.g. "=", "5") — resolves to its button id
+        #[arg(long)]
+        key: Option<String>,
+        /// raw thumb button id in hex (e.g. 4b) — alternative to --key
+        #[arg(long)]
+        button: Option<String>,
+        /// target key the button should emit (e.g. "g", "f13", "space")
+        #[arg(long)]
+        to: Option<String>,
+        /// restore the whole thumb grid to stock (1 2 3 4 5 6 7 8 9 0 - =)
+        #[arg(long)]
+        reset: bool,
     },
     /// Read-only: snapshot every recognized device's full state to backups/*.json. The first
     /// move of every safe write — a known-good restore/verify reference.
@@ -926,6 +949,12 @@ fn main() -> Result<()> {
         Cmd::Run { seconds, safe } => run_daemon(&reg, seconds, safe),
         Cmd::Lighting { action } => lighting_cmd(&reg, action)?,
         Cmd::Mode { mode, pid } => mode_cmd(&reg, &mode, &pid)?,
+        Cmd::Remap {
+            key,
+            button,
+            to,
+            reset,
+        } => remap_cmd(&reg, key.as_deref(), button.as_deref(), to.as_deref(), reset)?,
         Cmd::Backup { pid } => backup_cmd(&reg, pid.as_deref())?,
         Cmd::Verify { file } => verify_cmd(&file)?,
         Cmd::Import { deep } => import_cmd(deep),
@@ -1772,7 +1801,7 @@ fn lighting_cells(
 
     // hold the block lit: ESC-interruptible, or until --seconds elapses, polling in small slices.
     let start = Instant::now();
-    while !key_down(0x1B) && !seconds.is_some_and(|s| start.elapsed().as_secs() >= s) {
+    while !key_down(0x1B) && seconds.is_none_or(|s| start.elapsed().as_secs() < s) {
         std::thread::sleep(Duration::from_millis(20));
     }
     // clear the board on the way out.
@@ -2190,6 +2219,75 @@ fn mode_cmd(reg: &Registry, mode_str: &str, pid_str: &str) -> Result<()> {
         Ok(a) => println!("  device_mode now reads: 0x{:02X}", a[0]),
         Err(_) => println!("  (device_mode getter didn't respond — expected in some states)"),
     }
+    Ok(())
+}
+
+/// DEVICE-SIDE thumb-button remap (Razer 15/02). Resolves the target Razer mouse by DPI capability,
+/// confirms it speaks the class-0x15 button-map protocol, then writes the reassignment so the button
+/// emits the new key at the source. Volatile — see the printed note.
+fn remap_cmd(
+    reg: &Registry,
+    key: Option<&str>,
+    button: Option<&str>,
+    to: Option<&str>,
+    reset: bool,
+) -> Result<()> {
+    let d = open_with_command(reg, "dpi")
+        .context("no DPI-capable Razer mouse found for a device-side remap")?;
+    if !writes::supports_button_remap(&d) {
+        bail!(
+            "{} does not speak the class-0x15 button-map protocol — device-side remap unsupported \
+             on this device",
+            d.def.name
+        );
+    }
+    // REFUSE contradictory invocations instead of silently picking one. This verb rewrites what a
+    // physical button emits, so resolving an ambiguous request could remap the WRONG control and
+    // still print success — the one outcome a device-write path must never produce.
+    if reset && (key.is_some() || button.is_some() || to.is_some()) {
+        bail!(
+            "--reset restores the WHOLE thumb grid, so it can't be combined with \
+             --key/--button/--to; run the reset on its own, or drop --reset to remap one button"
+        );
+    }
+    if reset {
+        writes::reset_thumb_buttons(&d)?;
+        println!("thumb grid restored to stock: 1 2 3 4 5 6 7 8 9 0 - =");
+        return Ok(());
+    }
+    if key.is_some() && button.is_some() {
+        bail!("--key and --button both name the button to remap — pass exactly one, not both");
+    }
+    let button_id = match (key, button) {
+        (Some(k), _) => {
+            let usage = neuron::action::hid_usage_for_key(k)
+                .ok_or_else(|| anyhow::anyhow!("'{k}' is not a key I can resolve to a HID usage"))?;
+            writes::thumb_button_id_for_usage(usage).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "'{k}' is not one of the stock thumb keys (1..9 0 - =); use --button <hex> \
+                     to target a raw button id"
+                )
+            })?
+        }
+        (None, Some(b)) => u8::from_str_radix(b.trim_start_matches("0x"), 16)
+            .context("--button must be a hex byte, e.g. 4b")?,
+        (None, None) => bail!(
+            "say what to remap: --key <thumb key> or --button <hex>, plus --to <key> (or --reset)"
+        ),
+    };
+    let to = to.ok_or_else(|| anyhow::anyhow!("--to <key> is required (e.g. --to g)"))?;
+    let usage = neuron::action::hid_usage_for_key(to).ok_or_else(|| {
+        anyhow::anyhow!(
+            "target '{to}' can't be expressed as a single device key (chords / media / numpad \
+             aren't supported device-side)"
+        )
+    })?;
+    writes::set_mouse_button_key(&d, button_id, usage)?;
+    println!(
+        "remapped button 0x{button_id:02X} -> emits '{to}' (HID usage 0x{usage:02X}) at the source.\n\
+         NOTE: volatile — it holds while a host keeps the mouse in driver mode (the neuron app does); \
+         the mouse reverts to its onboard profile otherwise. `neuron remap --reset` restores stock."
+    );
     Ok(())
 }
 
@@ -2671,26 +2769,41 @@ fn dpi_stages_cmd(reg: &Registry, stages: &[u16], active: u8, persist: bool) -> 
     }
     let active_idx = active.saturating_sub(1);
     let st: Vec<DpiStage> = stages.iter().map(|&v| DpiStage::symmetric(v)).collect();
-    let store = cap::Store::from_persist(persist);
+    // DUAL-PLANE always (2026-07-23): volatile so the mouse acts right now, PLUS onboard so
+    // hardware truth survives power-cycles — the volatile-only default is how the factory table
+    // kept resurrecting. `--persist` is still accepted but is now the standing behaviour.
+    let _ = persist;
     let list: Vec<String> = stages.iter().map(|v| v.to_string()).collect();
     println!(
-        "setting DPI stages [{}] active {} ({})...",
+        "setting DPI stages [{}] active {} (live + onboard)...",
         list.join("/"),
         active,
-        if persist {
-            "persist/onboard"
-        } else {
-            "volatile"
-        }
     );
     // VISITOR discipline: `set_dpi_stages` flips to driver mode INTERNALLY (no prior returned to us),
     // so read the mode BEFORE and restore it after by the same rule — a one-shot CLI never leaves the
     // driver lease held (the `dpi_trap` self-poisoning loop). `unwrap_or(0)` = treat an unanswered
     // getter as non-driver, matching `ensure_driver`'s own "flip when unsure".
     let prior = writes::device_mode(&d).unwrap_or(0);
-    let res = writes::set_dpi_stages(&d, &st, active_idx, store);
+    // Name WHICH plane landed if the pair breaks apart. A bare propagated error can't distinguish
+    // "nothing was written" from "the live plane took it and onboard didn't", and those need
+    // different reactions from the user — the second leaves the mouse acting correctly right now but
+    // liable to revert on a power-cycle.
+    let res = writes::set_dpi_stages(&d, &st, active_idx, cap::Store::Volatile).and_then(|()| {
+        writes::set_dpi_stages(&d, &st, active_idx, cap::Store::Persist).map_err(|e| {
+            anyhow::anyhow!(
+                "the LIVE plane accepted the stage table but the ONBOARD write failed, so the two \
+                 planes are now DIVERGED (the mouse behaves correctly now, but may revert to its \
+                 old table on a power-cycle). Re-run to converge them: {e}"
+            )
+        })
+    });
     restore_custody_if_visitor(&d, prior);
     res?;
+    // Record the HOST feel intent — the authority the app's wake/startup reasserts heal from
+    // (whichever front door applied it). A disk failure is a note, not a failed apply.
+    if let Err(e) = neuron::feel_intent::record_stages(d.pid, stages, active_idx) {
+        println!("  note: feel-intent record failed: {e}");
+    }
     println!("  done — write verified against the device's stage-table read-back.");
     Ok(())
 }
@@ -3464,8 +3577,24 @@ fn dpi_cmd(reg: &Registry, value: Option<u16>) -> Result<()> {
         // the whole reason `dpi_trap` looped was this verb leaving the driver lease held on exit.
         let prior = ensure_driver(&d);
         let res = cap::set_dpi(&d, v, v, cap::Store::Persist);
+        // volatile too — a Persist write lands onboard; the LIVE plane must match right now
+        // (dual-plane discipline, same as the app's apply_dpi).
+        // Name WHICH plane landed if the pair breaks apart (see `dpi_stages_cmd`). Here the order is
+        // reversed, so a partial failure means onboard holds the new DPI while the live plane does not.
+        let res_vol = res.and_then(|()| {
+            cap::set_dpi(&d, v, v, cap::Store::Volatile).map_err(|e| {
+                anyhow::anyhow!(
+                    "the ONBOARD plane accepted DPI {v} but the LIVE write failed, so the two planes \
+                     are now DIVERGED (the mouse may keep its old sensitivity until a reconnect or \
+                     the app's reassert). Re-run to converge them: {e}"
+                )
+            })
+        });
         restore_custody_if_visitor(&d, prior);
-        res?;
+        res_vol?;
+        if let Err(e) = neuron::feel_intent::record_dpi(d.pid, v, v) {
+            println!("note: feel-intent record failed: {e}");
+        }
     }
     // Read-back runs AFTER the restore — getters are mode-independent, so verified/MISMATCH still holds.
     let (x, y) = cap::dpi(&d)?;

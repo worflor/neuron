@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! FLIGHT RECORDER — Neuron's always-on, crash-surviving diagnostics core.
 //!
 //! The lifecycle problem this solves: the app can die in ways the Rust panic hook never sees
@@ -291,6 +295,16 @@ pub fn dump_to_crash_log(reason: &str) {
     {
         let _ = writeln!(f, "[flight] dump reason: {reason}");
         dump(&mut f);
+        // The input-latency numbers go in every crash report too: a death during heavy input, or a
+        // report of "it got laggy and then it died", is far easier to read when the per-stage
+        // distribution up to that moment is part of the same record instead of lost with the process.
+        //
+        // The ALLOCATION-FREE writer, not the pretty table — this runs from the panic hook and the
+        // unhandled-exception filter, where the whole point of this module is that it touches no
+        // lock and no allocator (a heap-corruption death would otherwise be finished off by its own
+        // crash report). It is also written AFTER the flight dump, so the irreplaceable part is
+        // already on disk before this line runs at all.
+        neuron::latency::write_crash_summary(&mut f);
     }
 }
 

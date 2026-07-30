@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 import { Theme } from "../theme.slint";
 import { Card, SectionTitle, Label, Button, Toggle, Pill, Mono, Divider, PanelHead, Slider, SplitToggle, SplitButton, Contact, SubLabel, ColorPicker, Palette, Field, ConfirmButton } from "../widgets/controls.slint";
 import { State } from "../state.slint";
@@ -1458,6 +1462,12 @@ export component SettingsPanel inherits VerticalLayout {
                     spacing: 3px;
                     SectionTitle { text: "ABOUT"; }
                     Mono { text: "neuron " + (State.app-version == "" ? "unknown" : State.app-version); color: Theme.text-mid; }
+                    Mono { text: "© 2026 Woflo Labs"; color: Theme.text-faint; }
+                    // the honest license line: the GPL default, the community-source research core, and
+                    // the warranty disclaimer. "community-source" is deliberate — WLCSL is source-available,
+                    // NOT an OSI open-source licence, so never render it as "open source" here.
+                    Mono { text: "GPL-3.0-or-later · WLCSL community-source research core · no warranty"; color: Theme.text-faint; overflow: elide; }
+                    Mono { text: "github.com/worflor/neuron"; color: Theme.text-faint; overflow: elide; }
                     Mono { text: State.run-dir == "" ? "" : State.run-dir; color: Theme.text-faint; overflow: elide; }
                 }
                 Rectangle {}

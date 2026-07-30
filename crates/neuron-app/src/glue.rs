@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! The glue — binds every `State` callback to a `Runtime` operation and pushes engine data back
 //! into the view. One place wires the whole GUI<->engine contract; the panels stay declarative.
 //!
@@ -1194,7 +1198,7 @@ fn default_node(kind: &str) -> Option<MacroNode> {
 
 /// Split a chord/key spec into lowercased key names (the press-keys setter): on `+`, `,`, or space.
 fn split_keys(v: &str) -> Vec<String> {
-    v.split(|c| c == '+' || c == ',' || c == ' ')
+    v.split(['+', ',', ' '])
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|s| s.to_lowercase())
@@ -2086,7 +2090,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                                     } else {
                                         st.set_light_paint_mode(false);
                                     }
-                                    refresh_layers(&app, &sh);
+                                    refresh_layers(app, &sh);
                                     st.set_status_line(format!("imported {n} layer(s)").into());
                                 }
                             }
@@ -3247,7 +3251,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                             match crate::editor::set_hypershift_hold(trigger) {
                                 Ok(()) => {
                                     sh.borrow_mut().rt.bindings = neuron::bindings::Bindings::load();
-                                    refresh_rules(&app, &sh);
+                                    refresh_rules(app, &sh);
                                     crate::dispatch::request_reload();
                                     st.set_status_line(
                                         "HyperShift hold key set — hold it to reach the second layer"
@@ -7566,7 +7570,7 @@ fn apply_scanned_devices(app: &AppWindow, sh: &SharedRt, devs: Vec<crate::runtim
                 st.get_devices().row_data(i as usize).is_some_and(|r| {
                     // Match the whole PLANE identity (id + dialect), not just the unit id: the two
                     // together are what a multi-family unit needs to restore the exact channel row.
-                    r.id.to_string() == prev_id && r.dialect.to_string() == prev_dialect
+                    r.id == prev_id && r.dialect == prev_dialect
                 })
             })
             .unwrap_or(default_idx)
@@ -8029,7 +8033,7 @@ thread_local! {
     /// base on relaunch" bug: a stack/re-theme made within the debounce window never reached disk).
     static LIGHT_PENDING: std::cell::RefCell<
         Option<(u16, u32, Vec<neuron::pattern::LayerDef>)>,
-    > = std::cell::RefCell::new(None);
+    > = const { std::cell::RefCell::new(None) };
     /// Debounce timer for the AUTO-APPLY device re-stream (UI-thread), mirroring `LIGHT_SAVE_TIMER`.
     /// Restarted on each lighting edit so a burst (a knob drag) coalesces into ONE re-stream ~250ms after
     /// the last change instead of thrashing the board once per emitted value. See `schedule_lighting_apply`.
@@ -8038,7 +8042,7 @@ thread_local! {
     /// STATE-LOAD / explicit-stream paths (device switch, profile apply) whose callers stream immediately
     /// themselves — so the debounced re-stream can't fire a redundant second write on top of their direct
     /// `apply_current_lighting`. A scoped [`SuppressApply`] guard sets/clears it (restore-safe).
-    static SUPPRESS_LIGHT_APPLY: std::cell::Cell<bool> = std::cell::Cell::new(false);
+    static SUPPRESS_LIGHT_APPLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Scope guard: suppress `refresh_layers`' auto-apply for the duration (used by load/profile-apply paths
@@ -8081,7 +8085,7 @@ fn save_lighting(sh: &SharedRt) {
         t.start(
             slint::TimerMode::SingleShot,
             std::time::Duration::from_millis(400),
-            || flush_lighting_save(),
+            flush_lighting_save,
         );
     });
 }

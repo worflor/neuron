@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Woflo Labs
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 # release.ps1 - build Neuron in release mode and make it the resident (startup) instance.
 #
 # Neuron runs as a tray-resident app launched at login by the Scheduled Task

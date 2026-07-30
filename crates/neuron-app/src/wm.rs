@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! WINDOW QUICK-ACTIONS — bindable primitives that move, hide, raise and remember windows.
 //!
 //! These are the prebuilt verbs the spine offers for living in a desk full of windows: summon a

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! the Macro Host — Neuron's macro runtime. A bundled private CPython, run as ONE warm sidecar
 //! process. Macros are real Python (`import ctypes`/`subprocess`/anything — full unsandboxed
 //! power, "as if it were a program"); they're registered once (imports warmed) and a trigger is a
@@ -1358,7 +1362,59 @@ fn options_path(id: &str) -> PathBuf {
 }
 
 /// The user's chosen option values for `id` (a `{key: value}` object). `{}` if none on disk.
+/// Parsed option values, cached in memory per macro id.
+///
+/// This exists because [`load_option_values`] is called from `fire_dispatch` — the LIVE DISPATCH
+/// PATH — and its original form did a synchronous `read_to_string` + JSON parse on the input thread
+/// for **every single macro press**. A file read is microseconds when the page cache is warm and
+/// milliseconds when it is not (first press after boot, after an antivirus scan, on a slow volume),
+/// which put an unbounded, invisible disk dependency directly in front of the user's keypress.
+///
+/// Cached values are invalidated by [`invalidate_option_cache`], which every writer calls. That means
+/// a hand-edit of the JSON outside the app is picked up on the next macro (re)register or reload
+/// rather than instantly — the same contract as every other config this app loads, and the right
+/// trade for taking the disk off the input path.
+fn option_cache() -> &'static Mutex<HashMap<String, Value>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Value>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn load_option_values(id: &str) -> Value {
+    // A leaf lock: nothing else is acquired while it is held, so it cannot participate in a deadlock
+    // even though `fire_dispatch` calls this while holding the host's own lock.
+    {
+        let cache = option_cache().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(v) = cache.get(id) {
+            return v.clone();
+        }
+    }
+    // The lock is NOT held across this read — see `cache_if_absent` for why that is safe.
+    let from_disk = read_option_values_from_disk(id);
+    cache_if_absent(id, from_disk)
+}
+
+/// Cache `value` for `id` only if nothing is cached yet, and return whatever ends up cached.
+///
+/// The "only if absent" is the whole point. `load_option_values` deliberately drops the cache lock
+/// while it reads the file (holding a mutex across disk I/O on the live dispatch path is worse than
+/// the problem it would solve), which opens a window: the UI can save NEW options and cache them
+/// while a reader is still mid-read of the OLD file. An unconditional insert then clobbers the newer
+/// value with the older one, and every later macro press uses stale options despite a successful
+/// save — with nothing to correct it until the next reload.
+///
+/// Inserting only when vacant makes the writer always win, and returns the fresher value to the
+/// reader as a bonus.
+fn cache_if_absent(id: &str, value: Value) -> Value {
+    option_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(id.to_string())
+        .or_insert(value)
+        .clone()
+}
+
+/// The uncached read — the only place that touches the options file for reading.
+fn read_option_values_from_disk(id: &str) -> Value {
     std::fs::read_to_string(options_path(id))
         .ok()
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
@@ -1366,10 +1422,113 @@ fn load_option_values(id: &str) -> Value {
         .unwrap_or_else(|| json!({}))
 }
 
+/// Drop `id`'s cached options so the next read comes from disk. Called by every writer, and on
+/// (re)register so a reload picks up externally-edited values.
+fn invalidate_option_cache(id: &str) {
+    option_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(id);
+}
+
 fn write_option_values(id: &str, values: &Value) -> Result<(), String> {
     std::fs::create_dir_all(options_dir()).map_err(|e| e.to_string())?;
     let body = serde_json::to_string_pretty(values).map_err(|e| e.to_string())?;
-    std::fs::write(options_path(id), body).map_err(|e| e.to_string())
+    std::fs::write(options_path(id), body).map_err(|e| e.to_string())?;
+    // Cache the value we just wrote rather than merely dropping it: the UI's save is immediately
+    // followed by the user testing the macro, and that press should not have to go to disk either.
+    option_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(id.to_string(), values.clone());
+    Ok(())
+}
+
+#[cfg(test)]
+mod option_cache_tests {
+    use super::*;
+
+    /// The point of the cache: once an id is cached, reads come from memory and NOT from the disk.
+    /// Proven without touching the filesystem — a sentinel is placed in the cache that no file could
+    /// have produced, so seeing it back means the disk path was skipped. That is the whole property,
+    /// since the reason this exists is to keep a file read off the live keypress path.
+    #[test]
+    fn a_cached_read_does_not_go_to_disk() {
+        let id = "neuron_test_option_cache_hit";
+        invalidate_option_cache(id);
+        assert_eq!(
+            load_option_values(id),
+            json!({}),
+            "an unknown macro's options read as an empty object"
+        );
+        // A value no options file contains. If `load_option_values` consulted the disk it would come
+        // back as `{}` again and this would fail.
+        option_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.to_string(), json!({"sentinel": 42}));
+        assert_eq!(
+            load_option_values(id),
+            json!({"sentinel": 42}),
+            "the cached value was returned, so the fire path did no file I/O"
+        );
+        invalidate_option_cache(id);
+        assert_eq!(
+            load_option_values(id),
+            json!({}),
+            "invalidation sends the next read back to disk"
+        );
+    }
+
+    /// A reader that lost the race must not overwrite a fresher save.
+    ///
+    /// The real interleaving is: a macro fire misses the cache and starts reading the OLD file; the UI
+    /// saves NEW options and caches them; the reader finishes and inserts what it read. If that insert
+    /// won, the save would be silently undone in memory and every later press would use stale options
+    /// while the file on disk said otherwise — the worst kind of bug, because the UI shows success.
+    ///
+    /// Pinned deterministically on `cache_if_absent` (the exact step that races) rather than by
+    /// spawning threads and hoping the window is hit, which would be flaky and prove less.
+    #[test]
+    fn a_slow_reader_cannot_clobber_a_newer_save() {
+        let id = "neuron_test_option_cache_race";
+        invalidate_option_cache(id);
+        // The UI's save lands first.
+        option_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.to_string(), json!({"v": "new"}));
+        // The slow reader now finishes and tries to cache the value it read BEFORE that save.
+        let got = cache_if_absent(id, json!({"v": "old"}));
+        assert_eq!(
+            got,
+            json!({"v": "new"}),
+            "the reader was handed the stale value it read instead of the fresher cached one"
+        );
+        assert_eq!(
+            load_option_values(id),
+            json!({"v": "new"}),
+            "a stale reader overwrote a newer save — the saved options would be silently ignored"
+        );
+        invalidate_option_cache(id);
+    }
+
+    #[test]
+    fn caching_is_per_macro_id() {
+        // A shared cache keyed wrongly would hand one macro another's options — a correctness bug far
+        // worse than the latency it was added to fix, so pin the isolation.
+        let (a, b) = ("neuron_test_opt_a", "neuron_test_opt_b");
+        invalidate_option_cache(a);
+        invalidate_option_cache(b);
+        option_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(a.to_string(), json!({"who": "a"}));
+        assert_eq!(load_option_values(a), json!({"who": "a"}));
+        assert_eq!(load_option_values(b), json!({}), "b did not inherit a's options");
+        invalidate_option_cache(a);
+        invalidate_option_cache(b);
+    }
 }
 
 /// On (re)register, fill in any option the user hasn't set yet with its declared default — so a
@@ -1378,6 +1537,9 @@ fn seed_option_defaults(id: &str, manifest: &Value) {
     let Some(opts) = manifest.as_array() else {
         return;
     };
+    // (Re)register is the reload boundary, so re-read from disk here rather than trusting the cache —
+    // it is how a hand-edited options file gets picked up (see `option_cache`).
+    invalidate_option_cache(id);
     let mut values = load_option_values(id);
     let map = match values.as_object_mut() {
         Some(m) => m,

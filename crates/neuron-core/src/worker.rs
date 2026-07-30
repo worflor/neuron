@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Named background workers whose completion callback CANNOT be stranded.
 //!
 //! The trap: a caller sets up state (a latch, a claimed throttle slot, a pending protocol
@@ -213,7 +217,7 @@ where
                 // surface a worker STUCK panicking on every item (a deterministic bug), without
                 // spamming a line per command.
                 consecutive += 1;
-                if consecutive == 1 || consecutive % 16 == 0 {
+                if consecutive == 1 || consecutive.is_multiple_of(16) {
                     eprintln!("[worker] {name}: item panicked (contained), {consecutive} in a row");
                 }
             }
@@ -273,13 +277,32 @@ mod tests {
         assert_eq!(rx.recv().unwrap(), None, "a panicking worker must still notify (None)");
     }
 
+    // Handshake, not a sleep. The old shape was `spawn(...); sleep(50ms); assert_eq!(n, 1)`, which
+    // under a loaded machine (the full suite runs tests in parallel) lost the race and reported
+    // `left: 0, right: 1` — a false failure about the scheduler, not about the code. It was also
+    // WEAKER than its own name: a single load 50ms in proves "ran at least once by then", never
+    // "exactly once". Blocking on the release's own signal makes the first half deterministic, and
+    // a second, expected-to-time-out receive makes the "exactly once" half real.
     #[test]
     fn guarded_release_runs_exactly_once() {
         let n = Arc::new(AtomicUsize::new(0));
         let c = n.clone();
-        spawn_guarded("t-once", move || { c.fetch_add(1, Ordering::SeqCst); }, || {});
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        assert_eq!(n.load(Ordering::SeqCst), 1);
+        let (tx, rx) = mpsc::channel();
+        spawn_guarded(
+            "t-once",
+            move || {
+                c.fetch_add(1, Ordering::SeqCst);
+                let _ = tx.send(());
+            },
+            || {},
+        );
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the guard's release must run on the worker's exit path");
+        assert_eq!(n.load(Ordering::SeqCst), 1, "release ran once");
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(200)).is_err(),
+            "release must run EXACTLY once — a second signal means the guard fired twice"
+        );
     }
 
     #[test]

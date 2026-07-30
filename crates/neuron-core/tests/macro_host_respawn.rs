@@ -1,8 +1,12 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Proof that a DEAD sidecar never hangs the caller, and that the Macro Host recovers — against
 //! the REAL python sidecar (modeled on `macro_host_e2e.rs`; same skip-cleanly-with-no-python
 //! contract, same private-temp-cwd isolation).
 //!
-//! TDD §8: "sidecar death/respawn must be non-blocking." Two claims, both read off the actual
+//! Sidecar death and respawn must be non-blocking. Two claims, both read off the actual
 //! code in `crate::macros::macro_host` (nothing here is invented):
 //!
 //!   (a) NON-BLOCKING ON DEATH — [`neuron::macros::MacroHost::fire_async`] is documented as never

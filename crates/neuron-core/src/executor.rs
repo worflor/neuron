@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Shared live dispatch execution.
 //!
 //! The engine owns matching (`Trigger -> Action`). This executor owns the repeatable runtime
@@ -132,11 +136,15 @@ impl DispatchExecutor {
         trigger: &Trigger,
         intents: &mut impl IntentRunner,
     ) -> Option<DispatchOutcome> {
-        let matched = engine.resolve(trigger);
+        let matched = {
+            let _t = crate::latency::start(&crate::latency::RESOLVE);
+            engine.resolve(trigger)
+        };
         if matched.is_empty() {
             return None;
         }
         let ctx = if matched.iter().any(|r| r.action.needs_context()) {
+            let _t = crate::latency::start(&crate::latency::CTX_CAPTURE);
             Context::capture()
         } else {
             Context::default()
@@ -191,6 +199,10 @@ impl DispatchExecutor {
             return self.echo(ctx, intents);
         }
 
+        // The dispatch thread is BLOCKED for this whole call, so nothing else — no other key, no
+        // other device edge — is serviced while it runs. That makes it the stage whose p99 is felt
+        // as "the app stuttered", separately from how long the action's own effects take.
+        let _t = crate::latency::start(&crate::latency::ACTION_RUN);
         self.last_action = Some(action.clone());
         if let Some(intent) = action.intent() {
             intents.run_intent(&intent)

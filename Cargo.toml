@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Woflo Labs
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 # Neuron — open, lightweight control for Razer devices. The anti-Synapse.
 #
 # Cargo WORKSPACE. The engine lives in `neuron-core` (a headless, UI-agnostic library);
@@ -22,6 +26,9 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license-file = "LICENSE.md"
+authors = ["Woflo Labs"]
+repository = "https://github.com/worflor/neuron"
+publish = false
 
 # Shared dependency versions — declare once, reference with `.workspace = true` in members.
 [workspace.dependencies]

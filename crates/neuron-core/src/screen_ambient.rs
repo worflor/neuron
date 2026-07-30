@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! A shared, fast, live SCREEN-colour provider — the single source of truth the `ambient`
 //! (ambilight) lighting effect and its on-screen preview both read.
 //!

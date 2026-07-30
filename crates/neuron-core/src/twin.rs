@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! The rhythm familiar — KNOCKBACK's twin. A spectral entity with no rhythm of its own:
 //! it learns to move by watching you and knocks back what it learns, with one tiny
 //! flourish. This module is **pure logic** (no platform, no wall-clock, no I/O); the

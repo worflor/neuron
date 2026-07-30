@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Lighting-as-telemetry — infer game events from the decoded Chroma stream.
 //!
 //! Every Chroma game continuously projects a lossy view of its internal state onto
@@ -350,7 +354,7 @@ mod tests {
         let mut t = 0u32;
         while t < 2000 {
             // 100ms on, 100ms off = one 200ms cycle = 5 Hz
-            let on = (t / 100) % 2 == 0;
+            let on = (t / 100).is_multiple_of(2);
             let c = if on { (255, 255, 255) } else { (0, 0, 0) };
             series.push((t, c));
             t += 20;

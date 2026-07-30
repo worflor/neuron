@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! READ-ONLY R&D probe of the Razer Seiren V3 Mini's control pipe (pid 0x056a, usage 000c/0001).
 //! The mic speaks the Razer command protocol in a 64-byte / report-id-0x07 envelope
 //! (CRC = XOR(buf[2..=61]) @ buf[62]); confirmed live. This tool NEVER sends a setter — only

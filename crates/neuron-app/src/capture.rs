@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Press-to-bind capture glue — the GUI side of the project's strongest UX rule: the user PRESSES
 //! the control they want; we NEVER hardcode a button. (Memory: "DONT HARD CODE IT TO FUCKING
 //! THUMB 2".)

@@ -1,7 +1,11 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! The device writer — ONE writer per surface, everything else is a client.
 //!
-//! This is the structural fix for the seven-uncoordinated-writers problem the
-//! lifecycle map found (§9.3 of the R&D doc): nobody writes a device except
+//! This is the structural fix for the old seven-uncoordinated-writers problem:
+//! nobody writes a device except
 //! its writer task, and the writer paints exactly what the arbiter resolves.
 //! The real HID sink arrives with the neuron-core bridge; [`MockSink`] stands
 //! in for tests and adapter development.
@@ -627,8 +631,8 @@ mod tests {
     }
 
     /// The sibling the test above stops short of: it only checks the `parked` BOOKKEEPING flag,
-    /// never that frames actually stop landing in the sink. LIGHTING-MAP §5's io_gate/sniper race is
-    /// about the real feature-report channel — a pauser that flips `parked` correctly but still lets
+    /// never that frames actually stop landing in the sink. The historical io_gate/sniper race was
+    /// on the real feature-report channel — a pauser that flips `parked` correctly but still lets
     /// the writer thread call `sink.write` underneath a concurrent getter would reintroduce the exact
     /// clobber the valve exists to prevent. Uses `Content::Live` (an ever-incrementing counter, not a
     /// static `Fill`) so frames keep changing every tick — a static scene would dedup+heal-sweep into

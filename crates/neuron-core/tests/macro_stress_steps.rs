@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! NON-DESTRUCTIVE EXECUTION stress tests for every macro STEP type, run against the REAL warm
 //! CPython sidecar. The audit found ~11% execution coverage (only Ask/Notify were ever executed);
 //! this drives every action (Type/Press/KeyPress/Click/Scroll/MoveTo/Copy/Paste/Open/Focus/Wait/

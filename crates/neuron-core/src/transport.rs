@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Platform-agnostic transport: send/receive HID feature reports to the control pipe.
 //!
 //! Windows uses the native `windows-sys` path (open with access=0, feature IOCTLs are
@@ -5,7 +9,7 @@
 //! can drop in a hidapi/hidraw impl behind the same trait later.
 //!
 //! [`Transport::wire_lock`] serializes conversations from separate handles opened on the SAME
-//! `DevicePath` (LIGHTING-MAP §5's cross-read bug) — within this process via a local `Mutex`,
+//! `DevicePath` to prevent cross-read replies — within this process via a local `Mutex`,
 //! and ACROSS processes on Windows via a named kernel mutex layered underneath ([`WireLock`]):
 //! the CLI and the app now serialize against each other's request/reply pairs too. The kernel
 //! half is best-effort by design (bounded 2s wait, local-only degradation on create failure) so
@@ -15,6 +19,9 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
+// Only the backend-policy cell needs this, and that cell only exists in test/mock builds.
+#[cfg(any(test, feature = "mock-transport"))]
+use std::sync::RwLock;
 
 /// An opaque handle key identifying one enumerated HID interface.
 ///
@@ -138,7 +145,7 @@ static WIRE_LOCKS: LazyLock<Mutex<HashMap<DevicePath, Arc<WireLock>>>> =
 /// Resolve (creating on first sight) the shared wire lock for `path`. Every backend's `open()`
 /// calls this so two handles onto the same control pipe — the host lighting writer and a
 /// runtime `apply_effect`, say — hold the IDENTICAL `Arc<WireLock>` and so serialize against
-/// each other's request/reply conversations (see the module doc and LIGHTING-MAP §5).
+/// each other's request/reply conversations (see the module-level locking contract).
 pub(crate) fn wire_lock_for(path: &DevicePath) -> Arc<WireLock> {
     let mut locks = WIRE_LOCKS.lock().unwrap_or_else(PoisonError::into_inner);
     locks
@@ -149,8 +156,8 @@ pub(crate) fn wire_lock_for(path: &DevicePath) -> Arc<WireLock> {
 
 /// The per-pipe wire lock: a process-local `Mutex` (fast path, poison-recovered) LAYERED over a
 /// named kernel mutex on Windows, so pair-atomicity holds across PROCESSES too — the app's host
-/// writer and a `neuron-cli` write no longer interleave SetFeature/GetFeature pairs (the
-/// LIGHTING-MAP §5 race, previously fixed in-process only).
+/// writer and a `neuron-cli` write no longer interleave SetFeature/GetFeature pairs, closing the
+/// cross-process form of a race that was previously fixed in-process only.
 ///
 /// Semantics, in acquisition order:
 /// 1. the LOCAL mutex first (cheap, and it means at most one thread per process ever waits on the
@@ -266,7 +273,7 @@ pub trait Transport {
     /// The per-pipe WIRE LOCK shared by every transport opened on the same DevicePath, or None for
     /// a transport with no shared identity (test fakes). A razer_report conversation is a
     /// SetFeature→GetFeature(s) pair on one firmware control pipe; two handles interleaving pairs
-    /// cross-read replies (LIGHTING-MAP §5). The conversation OWNER (a Dialect's exec/exec_fast, a
+    /// cross-read replies. The conversation OWNER (a Dialect's exec/exec_fast, a
     /// probe loop) holds this for the duration of ONE request/reply conversation — not per call,
     /// which couldn't keep the pair atomic. Cross-PROCESS too on Windows: [`WireLock`] layers a
     /// named kernel mutex under the process-local one, so a `neuron-cli` write serializes against
@@ -314,39 +321,224 @@ pub fn classify_read(result: Result<Option<usize>>) -> ReadStep {
     }
 }
 
-#[cfg(windows)]
-mod windows_hid;
+// ── the backend hook ───────────────────────────────────────────────────────────────────────────
+//
+// `enumerate`/`open_path`/`open_reader` were free functions with hardcoded bodies, and they are
+// the ONLY doors to hardware: 36 production call sites reach `enumerate` alone (device.rs's three
+// resolvers, synth::adopt_filtered's whole auto-adoption pipeline, discover, profile::apply,
+// hidwatch, macrokeys, runtime, glue, both mains, the CLI, the host bridge). With no indirection
+// there was nothing to intercept, so NOTHING downstream of a device open could be tested — and
+// two `#[test]`s (profile.rs's apply pair) enumerate real HID and issue real DPI/polling/lighting
+// WRITES to whatever is plugged into the developer's desk during `cargo test`.
+//
+// One `Backend` consulted at the top of those three functions fixes all of it with zero changes to
+// any call site. The trait is `Send + Sync` because it lives in a static; the `Box<dyn Transport>`
+// it hands back is deliberately NOT `Send` (a `Device` is born on, and never leaves, the thread
+// that writes it — see bridge.rs) and is constructed on the calling thread, so the bound stops at
+// the factory.
+//
+// Release builds pay NOTHING: outside `cfg(test)` / the `mock-transport` feature the policy is a
+// compile-time constant, so the branch folds away and the call inlines to exactly the platform
+// body it had before.
+//
+// ── why a THREE-state policy and not `Option<Backend>` ────────────────────────────────────────
+//
+// An `Option` has one fatal default: "nothing installed" means "use real hardware". That is the
+// right default for the app and exactly the wrong one for a test — and it is not hypothetical.
+// `profile.rs`'s two apply tests reached real HID and wrote `dpi = 16000` with stages
+// `[800, 16000]` to the maintainer's own Naga during `cargo test`, then recorded it into the
+// deployed `feel-intent.toml` that gets reasserted on wake. Both tests' comments assert the
+// opposite ("in a test/CI env no Razer device is present") — the assumption was simply never
+// enforceable, because there was nothing to enforce it WITH.
+//
+// So the default is inverted where it matters: under `cfg(test)` the policy starts DENIED and a
+// test must say what it wants. `enumerate` then honestly reports an empty bus — which is the very
+// world those comments describe, so they become true by construction instead of by luck — and any
+// attempt to actually OPEN a device fails loudly rather than silently reaching the wire.
+//
+// This is a whole-class fix. It is not possible to write a new neuron-core test that touches the
+// user's hardware by forgetting a gate; you have to ask for hardware by name.
 
-#[cfg(windows)]
-pub fn enumerate() -> Result<Vec<HidDeviceInfo>> {
-    windows_hid::enumerate()
+/// A source of HID devices. Implement this to stand in for real hardware.
+///
+/// The three methods mirror the three free functions below; see [`install_backend`] for the
+/// lifetime rules and [`crate::transport::mock`] for the shipped fake.
+pub trait Backend: Send + Sync {
+    fn enumerate(&self) -> Result<Vec<HidDeviceInfo>>;
+    fn open_path(&self, path: &DevicePath) -> Result<Box<dyn Transport>>;
+    fn open_reader(&self, path: &DevicePath) -> Result<Box<dyn InputReader>>;
 }
 
-#[cfg(windows)]
+/// Where this process's devices come from.
+#[cfg(any(test, feature = "mock-transport"))]
+#[derive(Clone)]
+enum Policy {
+    /// The platform HID backend — the real wire.
+    Real,
+    /// No hardware is reachable. The default under `cfg(test)`.
+    Denied,
+    /// A phantom stands in for the bus.
+    Fake(Arc<dyn Backend>),
+}
+
+/// `None` = "not yet decided", resolved to the build's default on first read. A `RwLock<Option<_>>`
+/// rather than a `LazyLock` so a guard can put back whatever was here before it (including `None`).
+#[cfg(any(test, feature = "mock-transport"))]
+static POLICY: RwLock<Option<Policy>> = RwLock::new(None);
+
+/// Denied under test, Real otherwise. The single line that makes the hazard structural.
+#[cfg(any(test, feature = "mock-transport"))]
+fn default_policy() -> Policy {
+    if cfg!(test) {
+        Policy::Denied
+    } else {
+        Policy::Real
+    }
+}
+
+#[cfg(any(test, feature = "mock-transport"))]
+fn policy() -> Policy {
+    POLICY
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+        .unwrap_or_else(default_policy)
+}
+
+#[cfg(any(test, feature = "mock-transport"))]
+fn set_policy(p: Policy) -> BackendGuard {
+    let mut slot = POLICY.write().unwrap_or_else(PoisonError::into_inner);
+    // Hand the OUTGOING policy to the guard so drop can put it back verbatim. Clearing to `None`
+    // instead would fall through to `default_policy()`, which is only coincidentally right: under
+    // `cfg(test)` the default is `Denied`, but a DOWNSTREAM crate using the `mock-transport`
+    // feature compiles neuron-core without `cfg(test)`, so its default is `Real`. Dropping an
+    // inner phantom guard would then revert to the REAL WIRE while an enclosing `deny_hardware()`
+    // guard was still in scope — silently re-opening the hazard the policy exists to close.
+    let previous = slot.clone();
+    *slot = Some(p);
+    BackendGuard(previous)
+}
+
+/// Restores whatever policy was in force before this guard was created (including "not yet
+/// decided") when dropped, so nested and overlapping scopes unwind correctly.
+///
+/// RAII because a leaked policy would silently mislead every LATER test in the process — a fake
+/// left installed yields a green suite that never touched hardware, and a `Real` left installed
+/// re-opens the exact hazard this type exists to close. Mirrors `failpoint::Armed`.
+#[cfg(any(test, feature = "mock-transport"))]
+#[must_use = "the policy reverts as soon as this guard is dropped"]
+pub struct BackendGuard(Option<Policy>);
+
+#[cfg(any(test, feature = "mock-transport"))]
+impl Drop for BackendGuard {
+    fn drop(&mut self) {
+        *POLICY.write().unwrap_or_else(PoisonError::into_inner) = self.0.take();
+    }
+}
+
+/// Serve every device from `backend` until the guard drops.
+///
+/// PROCESS-GLOBAL, like `failpoint::arm` and `testsupport::cwd_guard` — tests that set a policy
+/// must serialize against each other ([`mock::test_lock`]) or they will observe each other's bus.
+#[cfg(any(test, feature = "mock-transport"))]
+pub fn install_backend(backend: Arc<dyn Backend>) -> BackendGuard {
+    set_policy(Policy::Fake(backend))
+}
+
+/// Opt IN to the real wire, for the handful of `#[ignore]`d probes that genuinely need hardware
+/// (`device.rs::live_stream_strategy_probe` and friends). Naming it at the call site is the point:
+/// touching the user's devices from a test should be a deliberate, greppable act.
+#[cfg(any(test, feature = "mock-transport"))]
+pub fn allow_real_hardware() -> BackendGuard {
+    set_policy(Policy::Real)
+}
+
+/// Cut this process off from hardware until the guard drops.
+///
+/// `cfg(test)` only covers the crate being tested, so neuron-core's own tests get [`Policy::Denied`]
+/// for free but DOWNSTREAM crates (neuron-app, neuron-cli, integration tests) link neuron-core as a
+/// plain dependency and would still reach the wire. They enable `mock-transport` and call this once
+/// in their test setup to inherit the same guarantee.
+#[cfg(any(test, feature = "mock-transport"))]
+pub fn deny_hardware() -> BackendGuard {
+    set_policy(Policy::Denied)
+}
+
+#[cfg(any(test, feature = "mock-transport"))]
+const DENIED: &str = "real hardware is denied in this build — install a phantom with \
+                      transport::install_backend(), or opt in with transport::allow_real_hardware()";
+
+/// Enumerate every present HID interface.
+pub fn enumerate() -> Result<Vec<HidDeviceInfo>> {
+    #[cfg(any(test, feature = "mock-transport"))]
+    match policy() {
+        Policy::Fake(b) => return b.enumerate(),
+        // An honest empty bus, not an error: "I looked and found nothing" is a state the
+        // production code already handles on every machine with no Razer gear attached, so
+        // denied tests exercise a REAL branch rather than a synthetic failure.
+        Policy::Denied => return Ok(Vec::new()),
+        Policy::Real => {}
+    }
+    platform_enumerate()
+}
+
+/// Open one enumerated interface for feature-report conversations.
 pub fn open_path(path: &DevicePath) -> Result<Box<dyn Transport>> {
-    Ok(Box::new(windows_hid::WinHid::open(path)?))
+    #[cfg(any(test, feature = "mock-transport"))]
+    match policy() {
+        Policy::Fake(b) => return b.open_path(path),
+        Policy::Denied => anyhow::bail!("{DENIED}"),
+        Policy::Real => {}
+    }
+    platform_open_path(path)
 }
 
 /// Open a collection for READING its device-initiated input reports. Fails on OS-protected
 /// collections (the mouse/keyboard top-level collections deny `GENERIC_READ`); succeeds on the
 /// vendor collections where event reports actually ride.
-#[cfg(windows)]
 pub fn open_reader(path: &DevicePath) -> Result<Box<dyn InputReader>> {
+    #[cfg(any(test, feature = "mock-transport"))]
+    match policy() {
+        Policy::Fake(b) => return b.open_reader(path),
+        Policy::Denied => anyhow::bail!("{DENIED}"),
+        Policy::Real => {}
+    }
+    platform_open_reader(path)
+}
+
+#[cfg(windows)]
+mod windows_hid;
+
+#[cfg(any(test, feature = "mock-transport"))]
+pub mod mock;
+
+#[cfg(windows)]
+fn platform_enumerate() -> Result<Vec<HidDeviceInfo>> {
+    windows_hid::enumerate()
+}
+
+#[cfg(windows)]
+fn platform_open_path(path: &DevicePath) -> Result<Box<dyn Transport>> {
+    Ok(Box::new(windows_hid::WinHid::open(path)?))
+}
+
+#[cfg(windows)]
+fn platform_open_reader(path: &DevicePath) -> Result<Box<dyn InputReader>> {
     Ok(Box::new(windows_hid::WinHidReader::open(path)?))
 }
 
 #[cfg(not(windows))]
-pub fn enumerate() -> Result<Vec<HidDeviceInfo>> {
+fn platform_enumerate() -> Result<Vec<HidDeviceInfo>> {
     anyhow::bail!("transport not implemented on this platform yet (hidapi backend pending)")
 }
 
 #[cfg(not(windows))]
-pub fn open_path(_path: &DevicePath) -> Result<Box<dyn Transport>> {
+fn platform_open_path(_path: &DevicePath) -> Result<Box<dyn Transport>> {
     anyhow::bail!("transport not implemented on this platform yet (hidapi backend pending)")
 }
 
 #[cfg(not(windows))]
-pub fn open_reader(_path: &DevicePath) -> Result<Box<dyn InputReader>> {
+fn platform_open_reader(_path: &DevicePath) -> Result<Box<dyn InputReader>> {
     anyhow::bail!("transport not implemented on this platform yet (hidapi backend pending)")
 }
 
@@ -393,22 +585,40 @@ mod tests {
         let a = windows_hid::OsWireMutex::open_named(&name).expect("create the named mutex");
         let b = windows_hid::OsWireMutex::open_named(&name).expect("open a second handle to it");
         assert!(a.acquire(), "first handle acquires immediately");
+
+        // Exclusion is a HAPPENS-BEFORE property, so prove it with ordering, not with a stopwatch.
+        // The old shape timed the waiter and demanded `waited >= 100ms` against a 150ms hold — but
+        // the waiter's clock started only once the OS scheduled the thread, so a 60ms scheduling
+        // delay under parallel test load shrank the measurement below the floor and failed a
+        // perfectly correct mutex. Now: the waiter announces it is about to block, and the test
+        // asserts it CANNOT finish while we hold, then MUST finish once we release.
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (got_tx, got_rx) = std::sync::mpsc::channel();
         let waiter = std::thread::spawn(move || {
             // A named mutex is recursive PER THREAD, so the exclusion proof must come from a
             // different thread — which is also the honest analogue of a different process.
-            let t0 = std::time::Instant::now();
+            ready_tx.send(()).expect("waiter announces itself");
             assert!(b.acquire(), "second handle acquires once the first releases");
+            let _ = got_tx.send(());
             b.release();
-            t0.elapsed()
         });
-        std::thread::sleep(std::time::Duration::from_millis(150));
-        a.release();
-        let waited = waiter.join().expect("waiter thread clean");
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("waiter thread started");
+        // Load can only make this window LONGER, never shorter, so a slow machine cannot turn a
+        // correct mutex into a failure — it can only make the proof stronger.
         assert!(
-            waited >= std::time::Duration::from_millis(100),
-            "the second handle provably BLOCKED on the first's hold (waited {waited:?}) — \
-             a no-op acquire would return instantly and the wire guarantee would be fiction"
+            got_rx
+                .recv_timeout(std::time::Duration::from_millis(250))
+                .is_err(),
+            "the second handle acquired while the first still held it — a no-op acquire would do \
+             exactly this, and the cross-process wire guarantee would be fiction"
         );
+        a.release();
+        got_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("release must hand the named mutex over to the waiting handle");
+        waiter.join().expect("waiter thread clean");
     }
 
     /// CHILD HALF of `cross_process_wire_exclusion_is_real` below — inert on a normal test run

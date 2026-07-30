@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Process-wide runtime safety state.
 //!
 //! This is the single in-process source of truth for Neuron's live authority:
@@ -132,7 +136,7 @@ mod tests {
         }
     }
 
-    /// TDD §4.6's state machine, pinned directly against [`RuntimeMode::state`]: each stance's
+    /// Pins the safety state machine directly against [`RuntimeMode::state`]: each stance's
     /// (writes_paused, input_armed) pair, AND that [`RuntimeMode::from_state`] is its exact inverse —
     /// so a caller that reads back a state via `from_state` always recovers the mode that produced it
     /// (no two modes may share a state, no state may resolve to the wrong mode).

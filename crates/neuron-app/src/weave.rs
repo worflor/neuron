@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! THE SPELLWEAVING MATERIAL ENGINE — the substance every cast / glyph / radial sigil is poured from.
 //!
 //! **White intent.** The core idea: effects are fields, and the material is how light behaves at
@@ -801,7 +805,11 @@ fn motes(x: f32, y: f32, t: f32, cell: f32, rise: f32, drift: f32, density: f32,
         return 0.0;
     }
     // a sharp WINK (dust catching a beam glints on/off; it doesn't slowly pulse)
-    let life = smoothstep(0.55, 1.0, (t * twk + hash2(cx + 7, cy - 3) * 6.283).sin());
+    let life = smoothstep(
+        0.55,
+        1.0,
+        (t * twk + hash2(cx + 7, cy - 3) * std::f32::consts::TAU).sin(),
+    );
     let mx = cx as f32 * cell + cell * 0.5 + (hash2(cx + 1, cy) * cell * 0.6 - cell * 0.3);
     let my = cy as f32 * cell + cell * 0.5 + (hash2(cx + 2, cy) * cell * 0.4 - cell * 0.2);
     let ox = dx - mx;
@@ -1252,7 +1260,9 @@ fn eval_layer(l: &Layer, p: &Px, m: &Material) -> (f32, f32, f32, f32) {
             // master rift runs a hot flowing segment — the blackbody ramp turns that into deep reds
             // for most of the network and reserves white for the few places the crust is truly open.
             let deep = 0.8 + 0.2 * (t * 0.11).sin(); // the furnace below, breathing on the far bloom
-            let throb = 0.88 + 0.12 * (t * (0.35 + 0.5 * life) + life * 6.283).sin(); // per-SEAM phase
+            // per-SEAM phase
+            let throb =
+                0.88 + 0.12 * (t * (0.35 + 0.5 * life) + life * std::f32::consts::TAU).sin();
             let seam_t = 0.16 + 0.50 * vital * (0.35 + 0.45 * seg) + 0.55 * rift * seg * flow;
             let temp = ((core * seam_t * 1.15
                 + lip * 0.34 * vital * (0.3 + 0.7 * seg)
@@ -1344,7 +1354,7 @@ fn eval_layer(l: &Layer, p: &Px, m: &Material) -> (f32, f32, f32, f32) {
                     // BENDS — and a hero's wider, faster sway curls it into the classic wind loop.
                     let rad_sway = l.warp * (0.35 + 0.75 * h3) * if hero { 1.8 } else { 1.0 };
                     let om = l.speed * (0.9 + 1.4 * h2);
-                    let ph = h * 6.283;
+                    let ph = h * std::f32::consts::TAU;
                     let r0 = cell * (0.19 + 0.11 * h3) * if hero { 1.4 } else { 1.0 };
                     // life BREATHES but never hits zero — a mote at full dark that re-lights in
                     // place reads as a pop; a 0.3 floor keeps every fade a shimmer, not a blink.

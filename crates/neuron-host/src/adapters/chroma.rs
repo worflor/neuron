@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Chroma SDK REST server adapter — the flagship port.
 //!
 //! Chroma-enabled games and tools open a session against `localhost:54235`, heartbeat
@@ -11,8 +15,8 @@
 //! claimed with a 15-second TTL lease, and every effect write or heartbeat
 //! refreshes it. A game that crashes simply stops refreshing, its lease
 //! lapses, and the user's base lighting returns — the protocol's own 15s
-//! inactivity contract, enforced by the arbiter instead of by cleanup code
-//! (§5.1: teardown is the default path).
+//! inactivity contract, enforced by the arbiter instead of by cleanup code;
+//! teardown is the default path.
 //!
 //! ## Conformance status (two adversarial audit passes, primary sources)
 //! Verified MATCH: endpoints + ~1s heartbeat + 15s timeout (Razer REST portal
@@ -465,7 +469,7 @@ impl ChromaServer {
             return Err(HttpResponse::err(400, rz::INVALID_PARAMETER));
         };
         // Truthful capability answer: no surface of this kind → say so with
-        // the SDK's own code for it, don't fake success (§5.4).
+        // the SDK's own code for it; don't fake success.
         if surfaces_for(host, device).is_none() {
             return Err(HttpResponse::json(
                 200,

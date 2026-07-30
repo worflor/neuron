@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Spellweaving — the held-stroke → action engine, and Neuron's novel-input playground.
 //!
 //! You hold a trigger and *weave* a stroke; on release it resolves to an [`crate::action::Action`].

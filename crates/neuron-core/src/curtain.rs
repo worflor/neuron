@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! CURTAIN — a panic privacy screen. **Not** a power action: it never touches DPMS, the monitor
 //! power state, or the system at all. It throws ONE opaque, topmost window across the WHOLE virtual
 //! desktop (every monitor, taskbar included) so the screen content is hidden INSTANTLY and RELIABLY,
@@ -204,7 +208,7 @@ fn run() {
         // topmost band so a LATE pop-up (a notification, neuron's own overlay) can't peek over the
         // black; (2) re-read the virtual-screen bounds and resize, so the curtain keeps covering every
         // monitor even if one changes resolution / sleeps / hot-plugs while we're up.
-        if reveal_start.is_none() && tick % 25 == 0 {
+        if reveal_start.is_none() && tick.is_multiple_of(25) {
             unsafe {
                 let vx = GetSystemMetrics(76);
                 let vy = GetSystemMetrics(77);
@@ -246,7 +250,7 @@ fn run() {
             // ceiling forces it), snapshot the baseline, then the first FRESH key/click bursts out.
             if !armed {
                 let elapsed = t0.elapsed();
-                let all_clear = !(1..256).any(|vk| crate::capture::key_down(vk));
+                let all_clear = !(1..256).any(crate::capture::key_down);
                 if (all_clear && elapsed >= MIN_VISIBLE) || elapsed >= DISARM_CEILING {
                     for (vk, slot) in baseline.iter_mut().enumerate() {
                         *slot = crate::capture::key_down(vk as i32);

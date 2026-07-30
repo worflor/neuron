@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Binding config — flat remap rows lifted into the typed `Trigger -> Action` engine.
 //! Config lives in a hand-editable `bindings.toml`.
 //!

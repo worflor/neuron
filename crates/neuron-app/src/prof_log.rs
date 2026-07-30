@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! The profiler's 1 Hz logger (Windows). Spawned at startup ONLY when `NEURON_PROFILE` is set.
 //!
 //! Each second it records: neuron-core's hot-path [`neuron::prof`] counters as per-second DELTAS,

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! The ONE Win32 layered-window seam — `LayeredSurface`.
 //!
 //! Every drawing overlay in the app (the spell overlay, the teleport ghost-marker + sparkle-frame,

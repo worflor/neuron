@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Synapse purge — evict Razer's resident slopware by PROVENANCE and the PROCESS TREE, not by a
 //! hand-maintained list of names.
 //!
@@ -124,7 +128,7 @@ pub fn is_elevated() -> bool {
 /// like `razerfan\` is not. Quotes/args on a service's binary path don't matter — the clean `Razer`
 /// component still falls out of the split.
 fn is_razer_path(path: &str) -> bool {
-    path.split(|c| c == '\\' || c == '/').any(|seg| {
+    path.split(['\\', '/']).any(|seg| {
         let s = seg.trim().trim_matches('"').to_ascii_lowercase();
         s == "razer" || s.starts_with("razer ")
     })

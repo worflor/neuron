@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Profiles — a named bundle of device settings (DPI, polling, brightness, lighting) saved and
 //! applied as one. The spine of a Synapse replacement: a profile is one "look + feel" for your
 //! kit. Switch them by hand now; auto-switch per focused app later. Plain TOML in `profiles/`.
@@ -310,22 +314,32 @@ impl Profile {
                     .dpi
                     .and_then(|cur| self.dpi_stages.iter().position(|&s| s == cur))
                     .unwrap_or(0) as u8;
-                writes::set_dpi_stages(d, &stages, active, store).map(|()| active)
+                writes::set_dpi_stages(d, &stages, active, store).map(|()| (d.pid, active))
             }) {
-                Ok(active) => r.applied.push(format!(
-                    "dpi stages [{}] active {}",
-                    self.dpi_stages
-                        .iter()
-                        .map(|s| s.to_string())
-                        .collect::<Vec<_>>()
-                        .join("/"),
-                    active
-                )),
+                Ok((pid, active)) => {
+                    // record the HOST feel intent — the authority wake/announce reasserts heal
+                    // from (a disk failure is inert here; the device write already landed).
+                    let _ = crate::feel_intent::record_stages(pid, &self.dpi_stages, active);
+                    r.applied.push(format!(
+                        "dpi stages [{}] active {}",
+                        self.dpi_stages
+                            .iter()
+                            .map(|s| s.to_string())
+                            .collect::<Vec<_>>()
+                            .join("/"),
+                        active
+                    ));
+                }
                 Err(e) => r.skipped.push(format!("dpi stages: {e}")),
             }
         } else if let Some(dpi) = self.dpi {
-            match devices.with_writable("set_dpi", |d| cap::set_dpi(d, dpi, dpi, store)) {
-                Ok(()) => r.applied.push(format!("dpi {dpi}")),
+            match devices.with_writable("set_dpi", |d| {
+                cap::set_dpi(d, dpi, dpi, store).map(|()| d.pid)
+            }) {
+                Ok(pid) => {
+                    let _ = crate::feel_intent::record_dpi(pid, dpi, dpi);
+                    r.applied.push(format!("dpi {dpi}"));
+                }
                 Err(e) => r.skipped.push(format!("dpi: {e}")),
             }
         }
@@ -989,6 +1003,15 @@ mod tests {
     fn rules_path_pairs_with_the_sanitized_profile_path_and_stays_flat() {
         // A name with a path separator that sanitize() maps to '_'. The sidecar must share the
         // profile's sanitized stem AND its directory (flat — never a nested `profiles/FPS/…`).
+        //
+        // ENV_LOCK is required even though this test never WRITES the env: both calls below
+        // resolve the run root independently, so a concurrent test that retargets NEURON_RUN_DIR
+        // between them tears the pair and fails the comparison with two unrelated parents. The
+        // lock is the crate's convention for touching that process-global value AT ALL — reads
+        // included, because a torn read is just as wrong as a torn write.
+        let _g = crate::runroot::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let name = "FPS/competitive";
         let prof = Profile::path(name);
         let rules = Profile::rules_path(name);

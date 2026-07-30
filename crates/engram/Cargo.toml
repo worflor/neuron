@@ -1,8 +1,8 @@
-# Vendored from the user's Whisper Prism suite (the Engram Universal Trajectory Codec).
-# Author: Woflo / MB. Patent pending. This is the user's own work, under the Whisper
-# Protocol License (LICENSE.md, copied from the Whisper project root). Neuron ships under
-# that same license now (repo-root LICENSE.md), so the whole workspace is one license.
-# Do NOT relicense; do NOT regress the math.
+# The Woflo Labs Engram Universal Trajectory Codec, included in Neuron.
+# SPDX-FileCopyrightText: 2026 Woflo Labs
+# SPDX-License-Identifier: LicenseRef-WLCSL-1.0
+# This crate is governed by the Work Notice and WLCSL-1.0 text in its LICENSE.md.
+# Neuron's GPL-covered code combines with it under the repository-root exception.
 #
 # KNOCKBACK uses this crate as the rhythm-familiar's brain: every exchange is an Engram
 # block; the twin's knockback is `predict_all` run one beat past the player's motif.
@@ -12,7 +12,9 @@ version = "0.1.0"
 edition = "2024"
 description = "The Whisper Engram Universal Trajectory Codec"
 license-file = "LICENSE.md"
-authors = ["Woflo / MB"]
+authors = ["Woflo Labs"]
+repository = "https://github.com/worflor/neuron"
+publish = false
 
 [lib]
 name = "engram"

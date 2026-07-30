@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! A shared, live audio LOUDNESS provider — the honest signal behind the `audiometer` effect.
 //!
 //! ## Why not just the OS peak
@@ -270,7 +274,7 @@ fn run(mut my_gen: u64, mut source: String) {
                     dry_ticks += 1;
                     if dry_ticks >= DRY_TICKS_FOR_SILENCE {
                         let n = (eff_rate as f32 * SAMPLE_INTERVAL.as_secs_f32()) as usize;
-                        ring.extend(std::iter::repeat(0.0).take(n));
+                        ring.extend(std::iter::repeat_n(0.0, n));
                     }
                 } else {
                     dry_ticks = 0;

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Rhythm engine for KNOCKBACK — the desk-drum half of the rhythm familiar.
 //!
 //! This module is **pure**: no platform code, no wall-clock, no device I/O. It turns a

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Automated GUI coverage — drives the REAL compiled Slint `AppWindow` + the `State` global through
 //! the generated component API (set properties, invoke callbacks, assert state). This exercises the
 //! actual `.slint` view and the Rust↔UI glue contract — the previously-untested surface.

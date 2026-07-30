@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Pattern — the SHAPE & MOTION half of the Spectrum lighting model (a layer = PATTERN × SPECTRUM).
 //!
 //! A **Pattern** owns the dynamics (heat sim, scroll, keypress ignite, ripple, flow field, meter, …)
@@ -2334,7 +2338,7 @@ fn render_load_meter(source: u8, cpu: f32, ram: f32, breath: f32, r: usize, c: u
         }
     };
     if source == 4 {
-        let cpu_rows = (r + 1) / 2;
+        let cpu_rows = r.div_ceil(2);
         paint(0, cpu_rows, cpu); // CPU — top
         paint(cpu_rows, r, ram); // RAM — bottom
     } else if source == 3 {
@@ -4283,9 +4287,9 @@ mod tests {
         // whole-board rect → EMPTY (the canonical region-less full board).
         assert!(region_from_rect(0, 0, 3, 5, 4, 6).is_empty(), "full board stores empty");
         // a single cell → exactly that row-major index.
-        assert_eq!(region_from_rect(1, 2, 1, 2, 4, 6), vec![1 * 6 + 2]);
+        assert_eq!(region_from_rect(1, 2, 1, 2, 4, 6), vec![6 + 2]);
         // a rect (rows 1..=2, cols 2..=3) on a 4×6 board → the four enclosed cells, row-major.
-        assert_eq!(region_from_rect(1, 2, 2, 3, 4, 6), vec![1 * 6 + 2, 1 * 6 + 3, 2 * 6 + 2, 2 * 6 + 3]);
+        assert_eq!(region_from_rect(1, 2, 2, 3, 4, 6), vec![6 + 2, 6 + 3, 2 * 6 + 2, 2 * 6 + 3]);
         // out-of-order corners describe the SAME rect (the corners get ordered).
         assert_eq!(region_from_rect(2, 3, 1, 2, 4, 6), region_from_rect(1, 2, 2, 3, 4, 6));
         // corners off the board are CLAMPED in — a fully-overhanging rect clamps to the whole board → empty.

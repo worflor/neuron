@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Run the protocol host against REAL hardware.
 //!
 //! Discovers registry-known devices, declares them as kernel surfaces, starts

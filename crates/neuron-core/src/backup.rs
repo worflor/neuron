@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Device state backup — the first move of every safe write. A read-only snapshot of a
 //! device's entire getter space (raw bytes + structural classification) to a timestamped JSON,
 //! so any future write can be diffed against, verified, and rolled back to a known-good prior

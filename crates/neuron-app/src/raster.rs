@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Bounds-checked views over raw 2-D pixel/field buffers.
 //!
 //! Several hand-rolled raster paths (whiteboard ink, teleport's scry frame) used to pass a bare

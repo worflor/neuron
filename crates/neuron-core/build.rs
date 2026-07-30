@@ -1,3 +1,8 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo Research Components Exception 1.0.
+// See ../../LICENSE.md.
+
 //! Build script: BUNDLE a private CPython into `neuron`.
 //!
 //! It maps the Cargo build TARGET to a `python-build-standalone` (PBS) release triple, makes sure a

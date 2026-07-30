@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! Shared test-only isolation helpers.
 //!
 //! The process current-directory AND the environment are single global resources:
@@ -198,8 +202,8 @@ mod conventions {
         }
         assert!(
             offenders.is_empty(),
-            "use .lock().unwrap_or_else(std::sync::PoisonError::into_inner) — see docs/TDD.md \
-             poison discipline\n{}",
+            "recover poisoned mutexes with \
+             .lock().unwrap_or_else(std::sync::PoisonError::into_inner)\n{}",
             offenders.join("\n")
         );
     }
@@ -440,6 +444,7 @@ mod conventions {
         // input_armed( somewhere in its production region (checked below).
         let allowlisted = [
             crates_dir.join("neuron-core").join("src").join("action.rs"),
+            crates_dir.join("neuron-core").join("src").join("intercept.rs"),
             crates_dir.join("neuron-app").join("src").join("teleport.rs"),
         ];
 
@@ -477,7 +482,7 @@ mod conventions {
     }
 }
 
-// ── persistence audit (TDD §8: "no GUI save path writes outside the executable/run directory") ──
+// ── persistence audit: no GUI save path writes outside the executable/run directory ───────────
 //
 // Two layers:
 //   1. DERIVATION — every config path helper this crate + neuron-core expose resolves UNDER

@@ -1,3 +1,8 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo Research Components Exception 1.0.
+// See ../../../LICENSE.md.
+
 //! Neuron — open, lightweight control for Razer devices. The anti-Synapse.
 //!
 //! Design principle: **semantics in code, wiring in data**. Capability *types* live in
@@ -44,6 +49,7 @@ pub mod engine;
 pub mod executor;
 pub mod failpoint;
 pub mod feel;
+pub mod feel_intent;
 pub mod gesture;
 pub mod glyph;
 pub mod gwyph;
@@ -51,6 +57,8 @@ pub mod hidpp;
 pub mod hook;
 pub mod import;
 pub mod intent;
+pub mod intercept;
+pub mod latency;
 pub mod lighting;
 pub mod logos;
 pub mod macros;
@@ -75,6 +83,7 @@ pub mod spellweaving;
 pub mod synapse;
 pub mod synth;
 pub mod sys_stats;
+pub mod timing;
 pub mod tone;
 pub mod transport;
 pub mod twin;

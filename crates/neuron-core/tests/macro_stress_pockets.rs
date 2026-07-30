@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! NON-DESTRUCTIVE stress tests for the POCKET subsystem (`neuron::pocket`) — the macro spine's
 //! "portable clipboard" register. The 21 stress cases below cover the gaps the audit flagged: the
 //! arm/disarm gate, the full `activate()` move table (stash / restore / swap / nothing), durable vs

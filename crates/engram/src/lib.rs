@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: LicenseRef-WLCSL-1.0
+// See ../LICENSE.md.
+
 //! The Whisper Engram Universal Trajectory Codec
 //!
 //! Any signal that moves through a high-dimensional space over time is a

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
 //! The "game paints your hardware" pipeline — neuron as the Chroma server.
 //!
 //! neuron creates the named shared objects a native game opens, holds the arbitration
