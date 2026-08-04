@@ -76,7 +76,7 @@ impl Tray {
 
         let icon = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
-            .with_tooltip("Neuron — anti-Synapse")
+            .with_tooltip("Neuron: anti-Synapse")
             .with_icon(load_icon())
             .build()
             .expect("failed to build tray icon");

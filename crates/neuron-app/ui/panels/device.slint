@@ -1144,7 +1144,7 @@ export component DevicePanel inherits VerticalLayout {
                             Rectangle {}
                             Mono { text: State.selected-device-name; color: Theme.text-faint; overflow: elide; }
                         }
-                        Mono { text: "the selected endpoint's live level (Core Audio) · moves THIS device, not the system default"; color: Theme.text-faint; wrap: word-wrap; }
+                        Mono { text: "moves this device, not your system default"; color: Theme.text-faint; wrap: word-wrap; }
                         // dim the fader when the channel is muted so the dead channel READS dead — it stays
                         // interactive (we don't expect an unmute-by-drag), it just quiets to gated opacity.
                         VerticalLayout {
@@ -1682,7 +1682,6 @@ export component DevicePanel inherits VerticalLayout {
                                 Rectangle {}
                                 Pill { text: "FIXED IN FIRMWARE"; tint: Theme.text-faint; }
                             }
-                            GateNote { text: "lift-off distance (even or split) is a real, verify-gated write; debounce is fixed in the mouse's firmware, so there's no setting to expose."; }
                         }
                     }
                     }   // adv-body Card

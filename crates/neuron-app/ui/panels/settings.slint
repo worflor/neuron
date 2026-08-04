@@ -929,7 +929,7 @@ export component SettingsPanel inherits VerticalLayout {
                         }
                         Rectangle { horizontal-stretch: 1; }
                     }
-                    Mono { text: "import is a one-time flow. it reads the plaintext export, normalises it, then applies it."; color: Theme.text-faint; wrap: word-wrap; }
+                    Mono { text: "import is a one-time flow."; color: Theme.text-faint; wrap: word-wrap; }
 
                     // PURGE SYNAPSE — once you've migrated in, evict Razer's resident slopware. Demotes its
                     // respawning SYSTEM services to manual-start (gone from boot, but Synapse can still be
@@ -1183,7 +1183,6 @@ export component SettingsPanel inherits VerticalLayout {
                     VerticalLayout {
                         spacing: 3px;
                         SectionTitle { text: "CONNECTIONS"; }
-                        Mono { text: "let games and tools light your devices through Neuron."; color: Theme.text-faint; }
                     }
                     VerticalLayout {
                         spacing: 3px;
