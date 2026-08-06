@@ -936,17 +936,32 @@ fn batches() -> &'static Mutex<HashMap<u16, BatchState>> {
     B.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Settle workers currently in flight — incremented before each spawn, decremented when the worker
+/// exits (panic-safe, via drop guard). Zero is PROVABLE pipeline quiescence: every card a flush was
+/// going to emit has been emitted. Tests wait on this instead of sleeping a fixed span, because a
+/// loaded runner can starve a detached worker past any fixed sleep — the starved worker's card then
+/// lands in a LATER test's process-global confirm sink as a phantom.
+static PENDING_FLUSHES: AtomicUsize = AtomicUsize::new(0);
+
 /// Add a pushed report to `pid`'s batch and (re)arm its settle window. Same-kind repeats overwrite the
 /// VALUE but keep the FIRST-seen instant — so a seating bounce or a rapid DPI re-press stays one kind
 /// at one moment, never a fake "burst". Every push bumps THAT device's generation so only its final
 /// flush acts; a sibling device's batch and generation are untouched.
 fn batch_push(pid: u16, ev: Push) {
+    batch_push_at(pid, ev, Instant::now());
+}
+
+/// [`batch_push`] with the report's arrival instant passed in rather than read off the wall clock.
+/// The instant is what the SYNC TEST in [`flush_batch`] measures, so taking it as a parameter is the
+/// seam that lets a test stamp a burst deterministically — a loaded test runner can preempt the
+/// pushing thread for longer than [`BURST_SPAN`] between calls, which would misfile a stamped-live
+/// burst as lone user actions.
+fn batch_push_at(pid: u16, ev: Push, now: Instant) {
     let my_gen = {
         let mut map = batches().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let st = map
             .entry(pid)
             .or_insert_with(|| BatchState { batch: Batch::EMPTY, generation: 0 });
-        let now = Instant::now();
         match ev {
             Push::Dpi(v) => {
                 let t = st.batch.dpi.map(|(t, _)| t).unwrap_or(now);
@@ -964,7 +979,17 @@ fn batch_push(pid: u16, ev: Push) {
         st.generation += 1;
         st.generation
     };
+    PENDING_FLUSHES.fetch_add(1, Ordering::SeqCst);
     crate::worker::spawn_detached("neuron-hidwatch-batch", move || {
+        // decrement on EVERY exit path (bow-out, missing pid, panic) — a leaked count would wedge
+        // the tests' quiescence wait forever.
+        struct FlushDone;
+        impl Drop for FlushDone {
+            fn drop(&mut self) {
+                PENDING_FLUSHES.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let _done = FlushDone;
         thread::sleep(BATCH_SETTLE);
         // Take + decide under the lock so a report landing in the gap can't be lost: if a newer
         // push for THIS pid bumped its generation, a later flush owns the batch — this one bows out.
@@ -1289,9 +1314,13 @@ mod tests {
     fn plate_report(id: u8) {
         feed(0x0e, id, 0);
     }
-    // Long enough for the settle thread to fire and finish before we assert.
+    // Wait until every in-flight settle worker has finished — PROVABLE quiescence via the
+    // PENDING_FLUSHES count, not a fixed sleep a loaded runner can outrun. When this returns,
+    // every card the pipeline was going to emit has been emitted.
     fn settle() {
-        thread::sleep(BATCH_SETTLE + Duration::from_millis(150));
+        while PENDING_FLUSHES.load(Ordering::SeqCst) > 0 {
+            thread::sleep(Duration::from_millis(5));
+        }
     }
 
     #[test]
@@ -1355,26 +1384,22 @@ mod tests {
         let _g = BATCH_TEST_LOCK.lock().unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         neuron::confirm::set_sink(Some(tx));
-        // Drain to QUIESCENCE before the actual test. The confirm sink is process-global, and a
-        // prior test's async settle worker — delayed past its own fixed-sleep `settle` under heavy
-        // full-workspace load — can still be in flight and would otherwise land in this sink as a
-        // phantom card (observed as spurious "got N cards" failures only under load). We hold
-        // BATCH_TEST_LOCK, so no other batch test runs concurrently, and any worker already spawned
-        // fires within one `BATCH_SETTLE`; two consecutive empty spans therefore prove nothing
-        // spawned before this point is still pending, so the only cards the assertion below can see
-        // are the ones THIS test's reports produce.
-        let mut quiet = 0;
-        while quiet < 2 {
-            settle();
-            if rx.try_iter().count() == 0 {
-                quiet += 1;
-            } else {
-                quiet = 0;
-            }
-        }
-        dpi_report(1600);
-        scroll_report(3);
-        plate_report(4); // 6-button
+        // Drain to QUIESCENCE before the actual test. The confirm sink is process-global, so a
+        // straggler worker from a PRIOR test (observed as spurious "got N cards" failures only
+        // under load) must be flushed out first. `settle()` waits for PENDING_FLUSHES to hit zero
+        // — provable quiescence — and we hold BATCH_TEST_LOCK, so after one settle + drain the
+        // only cards the assertion below can see are the ones THIS test's pushes produce.
+        settle();
+        let _ = rx.try_iter().count();
+        // Push the burst with ONE shared instant via the `batch_push_at` seam rather than through
+        // `feed`. What this test pins is the burst CLASSIFICATION (≥2 kinds inside BURST_SPAN →
+        // silent prime), and a loaded parallel runner can preempt this thread for >150ms between
+        // feed calls — real wall-clock stamps would then misfile the burst as lone actions and the
+        // test would flake. The feed→push decode per kind is covered by the surrounding tests.
+        let t0 = Instant::now();
+        batch_push_at(NAGA_PID, Push::Dpi(1600), t0);
+        batch_push_at(NAGA_PID, Push::Scroll(3), t0);
+        batch_push_at(NAGA_PID, Push::Plate(4, plate_label(NAGA_PID, 4)), t0);
         settle();
         let cards: Vec<_> = rx.try_iter().collect();
         neuron::confirm::set_sink(None);
@@ -1693,24 +1718,12 @@ mod tests {
 
         // Leave the process-global surface as clean as a fresh start. This test drives ~800 async
         // settle/batch workers and populates four shared maps with ~17 pids; `BATCH_TEST_LOCK`
-        // serializes test EXECUTION but does not RESET this state, so a straggler card (a worker
-        // still flushing after `settle`'s fixed sleep, which a loaded machine can outrun) or a
+        // serializes test EXECUTION but does not RESET this state, so a straggler worker or a
         // residual map entry would leak into whatever test runs next (e.g. the wake-burst test,
-        // which asserts a SILENT prime and would see the stragglers as phantom cards). Drain the
-        // confirm pipeline to quiescence, then clear the maps we filled.
-        {
-            let (tx, rx) = std::sync::mpsc::channel();
-            neuron::confirm::set_sink(Some(tx));
-            // Two full settle spans with no new input: any worker still in flight from the storm
-            // has flushed by the end of the second quiet span. Loop until a span yields nothing.
-            for _ in 0..5 {
-                settle();
-                if rx.try_iter().count() == 0 {
-                    break;
-                }
-            }
-            neuron::confirm::set_sink(None);
-        }
+        // which asserts a SILENT prime and would see the stragglers as phantom cards). `settle()`
+        // waits for PENDING_FLUSHES to hit zero — provable quiescence, no fixed sleep for a loaded
+        // machine to outrun — then clear the maps we filled.
+        settle();
         batches().lock().unwrap_or_else(|e| e.into_inner()).clear();
         reassert_stamps().lock().unwrap_or_else(|e| e.into_inner()).clear();
         mute_products_store().lock().unwrap_or_else(|e| e.into_inner()).clear();

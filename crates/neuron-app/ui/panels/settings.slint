@@ -1426,14 +1426,17 @@ export component SettingsPanel inherits VerticalLayout {
                     // the bench grid — 3 stations per row, arithmetic placement (no lazy list). It
                     // STRETCHES to absorb the column's slack (so config packs tight at the top and the
                     // "prove it works" grid fills the rest), with a 3-row floor so the 9 stations always show.
+                    // 3 columns (not 4): the longest probe names ("lighting test pattern", "transport
+                    // enumerate") need real width for their tracked-out mono label, and 9 probes over 3
+                    // columns lands on an exact 3×3 grid — no orphaned single-tile last row either.
                     bench := Rectangle {
                         vertical-stretch: 1;
-                        property <length> cw: (self.width - 30px) / 4;
-                        min-height: ceil(max(4, State.diagnostics.length) / 4) * 96px;
+                        property <length> cw: (self.width - 20px) / 3;
+                        min-height: ceil(max(3, State.diagnostics.length) / 3) * 96px;
                         for d[i] in State.diagnostics : DiagCell {
                             d: d;
-                            x: mod(i, 4) * (bench.cw + 10px);
-                            y: floor(i / 4) * 96px;
+                            x: mod(i, 3) * (bench.cw + 10px);
+                            y: floor(i / 3) * 96px;
                             width: bench.cw;
                             height: 86px;
                         }

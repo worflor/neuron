@@ -1008,6 +1008,38 @@ export component DevicePanel inherits VerticalLayout {
     // arm was protecting are gone, so a stale armed state would be a lie.
     changed adv-any => { root.scan-armed = false; }
 
+    // ── ADVANCED reveal · SCROLL-INTO-VIEW ────────────────────────────────────────────────────
+    // The ADVANCED disclosure sits at the BOTTOM of the inspector's own wheel-only scroller, so
+    // everything it reveals lands below the fold: the row looks dead even though it worked. That
+    // exact illusion cost three separate investigations (see the note at the Flickable below, and
+    // docs/UX-PENTEST.md) — a reveal you cannot see is indistinguishable from a reveal that did not
+    // happen. Opening now scrolls its own content into view.
+    //
+    // WHY A TIMER rather than scrolling in the click handler: the drawer's height eases open over
+    // `Theme.settle`, and i-slint-core's Flickable clamps `viewport-y` against the extent it has
+    // RIGHT NOW (`ensure_in_bound`, items/flickable.rs) — and its re-clamp handler only ever pulls
+    // an OUT-of-bounds viewport back in, never re-scrolls one that is already legal. Scroll on the
+    // click and you are clamped to the pre-growth bottom, which then stays "in bounds" forever as
+    // the content grows past it: a silent no-op.
+    //
+    // And why a FOLLOW rather than one shot at `Theme.settle`: a single sample assumes the extent
+    // is final the very frame the animation ends — true only if layout has already propagated by
+    // then, and silently wrong the day anyone retunes the animation. Re-pinning on a short interval
+    // across a window comfortably longer than the animation is self-correcting: whatever the extent
+    // settles to, the last tick lands on it. Cheap — a handful of assignments, then it stops itself.
+    property <int> reveal-ticks: 0;   // ticks elapsed in the current follow; reset on each open
+    reveal-scroll := Timer {
+        interval: 40ms;
+        running: false;
+        triggered => {
+            // most-negative legal offset == the Flickable's own lower bound (h - vh), floored at 0
+            // so a drawer that already fits can't scroll a short column upward.
+            insp.viewport-y = min(0px, insp.height - insp.viewport-height);
+            root.reveal-ticks += 1;
+            if (root.reveal-ticks >= 8) { self.running = false; }   // 320ms ≈ 3x Theme.settle
+        }
+    }
+
     PanelHead {
         label: "DEVICE";
         caption: "live device readout";
@@ -1109,7 +1141,7 @@ export component DevicePanel inherits VerticalLayout {
             min-width: 410px;
             preferred-width: 410px;
             max-width: 410px;
-            Flickable {
+            insp := Flickable {
                 // WHEEL-ONLY, exactly like the page-level PanelPage. A plain (drag-to-flick) Flickable
                 // HIJACKS a click-drag that begins on a child control into a scroll — that competition is
                 // why controls in this pane (the ▸ advanced disclosure especially) clicked inconsistently
@@ -1444,7 +1476,14 @@ export component DevicePanel inherits VerticalLayout {
                 if root.adv-any : Disclosure {
                     label: "advanced · gated hardware writes";
                     open: State.feel-adv-open;
-                    toggled => { State.feel-adv-open = !State.feel-adv-open; }
+                    toggled => {
+                        State.feel-adv-open = !State.feel-adv-open;
+                        // OPENING only: start the short follow that keeps the revealed drawer
+                        // pinned into view while it grows (see `reveal-scroll` up top for why it
+                        // can't be done inline). Closing needs nothing — the content shrinks away
+                        // and the Flickable's own clamp walks the viewport back up on its own.
+                        if (State.feel-adv-open) { root.reveal-ticks = 0; reveal-scroll.running = true; }
+                    }
                 }
 
                 // ── HARDWARE WRITES — real device paths, held until verified on the wire ──
@@ -1487,15 +1526,31 @@ export component DevicePanel inherits VerticalLayout {
                         if root.adv-wheel : VerticalLayout {
                             spacing: 9px;
                             CapHead { term: "WHEEL MODE"; gated: true; }
+                            // SAME two-row shape as SLEEP TIMER below: [ field · note · apply ] over
+                            // [ presets · rail ]. The note used to share the second row with the
+                            // preset rail, which left it a sliver — once the rail started taking the
+                            // width its labels actually need (see SplitToggle's content-aware floor)
+                            // the note elided to "no scroll-stage source…" and the part that tells
+                            // you what to DO was the part that got cut. Giving it the wide row is
+                            // also just consistency: the two gated writes now read identically.
                             HorizontalLayout {
                                 spacing: 8px;
                                 Field {
-                                    field-width: 260px;
+                                    field-width: 160px;
                                     placeholder: "tactile/free";
                                     text <=> State.scroll-stages;
-                                    invalid: !State.scroll-stages-valid;
+                                    invalid: State.scroll-stages-error;
                                     edited(t) => { State.scroll-stages-edited(t); }
                                     accepted(t) => { State.apply-scroll-stages(t); }
+                                }
+                                // ERROR-tinted, not merely un-appliable: an unread table and an empty
+                                // field are both blocked-but-blameless, and red would accuse the user
+                                // of a typo they never made.
+                                Mono {
+                                    text: State.scroll-stages-note;
+                                    color: State.scroll-stages-error ? Theme.danger : Theme.text-faint;
+                                    overflow: elide;
+                                    min-width: 0px;
                                 }
                                 Button {
                                     text: "apply";
@@ -1503,13 +1558,10 @@ export component DevicePanel inherits VerticalLayout {
                                     clicked => { State.apply-scroll-stages(State.scroll-stages); }
                                 }
                             }
-                            // the wheel-mode presets ride a content-hugging SplitToggle (the N-way fused
-                            // selector), trailing the note — the stretch spacer keeps it hugging its cells
-                            // on the right. A custom typed value matches no preset (index -1) so nothing lights.
+                            // A custom typed value matches no preset (index -1) so nothing lights.
                             HorizontalLayout {
                                 spacing: 6px;
-                                Mono { text: State.scroll-stages-note; color: State.scroll-stages-valid ? Theme.text-faint : Theme.danger; overflow: elide; min-width: 0px; }
-                                Rectangle { horizontal-stretch: 1; min-width: 8px; }
+                                Mono { text: "presets"; color: Theme.text-faint; }
                                 SplitToggle {
                                     options: ["tactile/free", "tactile", "free"];
                                     min-cell: 52px;
@@ -1522,6 +1574,7 @@ export component DevicePanel inherits VerticalLayout {
                                         State.scroll-stages-edited(State.scroll-stages);
                                     }
                                 }
+                                Rectangle { horizontal-stretch: 1; }
                             }
                         }
                         if root.adv-wheel && (root.adv-sleep || root.adv-sensor) : Divider { }

@@ -194,7 +194,12 @@ export global State {
     // persists a chosen table anywhere (no getter, no Profile/Prefs field) to assert instead.
     in-out property <string> scroll-stages: "—";
     in-out property <bool> scroll-stages-valid: false;
-    in-out property <string> scroll-stages-note: "no scroll-stage source persisted — pick tactile/free and apply";
+    // Whether the note is a COMPLAINT (bad input) rather than a statement of where we are. Distinct
+    // from `!valid`: an unread table and an empty field are both un-appliable without anyone having
+    // done anything wrong, and colouring those danger-red accuses the user of a mistake they didn't
+    // make. Only this flag may tint the note.
+    in-out property <bool> scroll-stages-error: false;
+    in-out property <string> scroll-stages-note: "not read from the mouse yet";
     callback scroll-stages-edited(string);
     callback apply-scroll-stages(string);
     // SNIPER / hold-to-precision-DPI — bind a button (press-to-bind) + target DPI.

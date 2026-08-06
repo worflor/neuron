@@ -275,9 +275,9 @@ fn scroll_stage_truth() -> crate::reconcile::Truth<String> {
 
 /// CHUNK D's RECORD step: publish `truth` to the HyperScroll editor field the UI reads
 /// (`State.scroll-stages`), replacing the old hardcoded `"tactile/free"` Slint default. `Unknown`
-/// renders the same dash convention as `sniper-button`'s "unset" state, and is explicitly marked
-/// invalid so the apply button stays disabled until the user actually types a real value — no
-/// fabricated "N modes ready" for a table nobody ever set.
+/// renders the same dash convention as `sniper-button`'s "unset" state, un-appliable (`valid` off,
+/// so the apply key stays disabled until the user supplies a real value) but NOT `error` — unread
+/// is blameless, never a red complaint. No fabricated "N modes ready" for a table nobody ever set.
 fn publish_scroll_stage(truth: crate::reconcile::Truth<String>) {
     let Some(weak) = UI.get() else { return };
     let weak = weak.clone();
@@ -290,11 +290,10 @@ fn publish_scroll_stage(truth: crate::reconcile::Truth<String>) {
                     sync_scroll_stage_editor(&st);
                 }
                 crate::reconcile::Truth::Unknown => {
-                    st.set_scroll_stages("\u{2014}".into());
+                    st.set_scroll_stages(SCROLL_STAGE_UNKNOWN.into());
                     st.set_scroll_stages_valid(false);
-                    st.set_scroll_stages_note(
-                        "no scroll-stage source persisted — pick tactile/free and apply".into(),
-                    );
+                    st.set_scroll_stages_error(false); // unread is not a user error
+                    st.set_scroll_stages_note(SCROLL_STAGE_UNKNOWN_NOTE.into());
                 }
             }
         }
@@ -2883,17 +2882,10 @@ pub fn install(app: &AppWindow) -> SharedRt {
         app.global::<State>().on_remove_rule(move |row| {
             if let Some(app) = w.upgrade() {
                 let st = app.global::<State>();
-                let total = st.get_rules().row_count() as i32;
-                let editable = st.get_editable_count();
-                let first_editable = total - editable;
-                if row < first_editable {
-                    st.set_status_line(
-                        "that rule comes from bindings.toml / cast.toml — edit there to change it"
-                            .into(),
-                    );
+                let Some(gui_idx) = gui_row_index(&st, row, false) else {
+                    st.set_status_line(PROVENANCE_ROW_NOTE.into());
                     return;
-                }
-                let gui_idx = (row - first_editable) as usize;
+                };
                 match crate::editor::remove_gui_rule_in_tier(gui_idx, false) {
                     Ok(()) => {
                         // removing a row shifts the editable tail — close the inline editor so a stale
@@ -2908,16 +2900,21 @@ pub fn install(app: &AppWindow) -> SharedRt {
             }
         });
     });
-    // REMOVE a GUI-authored HYPERSHIFT rule. AppRuntime::rules() contributes no hyper rows (its hyper
-    // list is empty by construction), so every row in `hypershift-rules` is GUI-authored: the row
-    // index IS the n-th hyper-tier rule in gui.rules.toml.
+    // REMOVE a GUI-authored HYPERSHIFT rule. Same display->tier mapping as the base verb: the hyper
+    // list can ALSO lead with read-only provenance rows (a hypershift rule hand-authored in any
+    // non-gui sidecar), so the leading count must be subtracted — see `gui_row_index`, which this
+    // used to bypass and thereby delete the wrong binding.
     bind(app, &shared, |app, sh| {
         let w = app.as_weak();
         let sh = sh.clone();
         app.global::<State>().on_remove_hyper_rule(move |row| {
             if let Some(app) = w.upgrade() {
                 let st = app.global::<State>();
-                match crate::editor::remove_gui_rule_in_tier(row.max(0) as usize, true) {
+                let Some(gui_idx) = gui_row_index(&st, row, true) else {
+                    st.set_status_line(PROVENANCE_ROW_NOTE.into());
+                    return;
+                };
+                match crate::editor::remove_gui_rule_in_tier(gui_idx, true) {
                     Ok(()) => {
                         st.set_editing_rule(-1); // close the inline editor — the hyper list reindexed
                         refresh_rules(&app, &sh);
@@ -2938,13 +2935,9 @@ pub fn install(app: &AppWindow) -> SharedRt {
         app.global::<State>().on_move_rule(move |row, dir| {
             if let Some(app) = w.upgrade() {
                 let st = app.global::<State>();
-                let total = st.get_rules().row_count() as i32;
-                let editable = st.get_editable_count();
-                let first_editable = total - editable;
-                if row < first_editable {
+                let Some(gui_idx) = gui_row_index(&st, row, false) else {
                     return; // a provenance row — not reorderable here
-                }
-                let gui_idx = (row - first_editable) as usize;
+                };
                 match crate::editor::move_gui_rule_in_tier(gui_idx, false, dir) {
                     Ok(()) => {
                         st.set_editing_rule(-1); // reordering shifts indices — close the inline editor
@@ -2956,15 +2949,19 @@ pub fn install(app: &AppWindow) -> SharedRt {
             }
         });
     });
-    // REORDER a GUI-authored HYPERSHIFT rule. Every hyper row is GUI-authored (AppRuntime contributes
-    // no hyper provenance rows), so the row index IS the tier index — no provenance offset.
+    // REORDER a GUI-authored HYPERSHIFT rule. Same provenance offset as every other verb (see
+    // `gui_row_index`) — a hyper list that leads with hand-authored sidecar rules would otherwise
+    // reorder the wrong binding.
     bind(app, &shared, |app, sh| {
         let w = app.as_weak();
         let sh = sh.clone();
         app.global::<State>().on_move_hyper_rule(move |row, dir| {
             if let Some(app) = w.upgrade() {
                 let st = app.global::<State>();
-                match crate::editor::move_gui_rule_in_tier(row.max(0) as usize, true, dir) {
+                let Some(gui_idx) = gui_row_index(&st, row, true) else {
+                    return; // a provenance row — not reorderable here
+                };
+                match crate::editor::move_gui_rule_in_tier(gui_idx, true, dir) {
                     Ok(()) => {
                         st.set_editing_rule(-1); // reordering shifts indices — close the inline editor
                         refresh_rules(&app, &sh);
@@ -3096,29 +3093,27 @@ pub fn install(app: &AppWindow) -> SharedRt {
             }
         });
     });
-    // EDIT an existing GUI-authored rule IN PLACE — clicking a removable row opens the SAME wire-editor
-    // inline, seeded from its real trigger + action (edit-shows-current). Only the GUI-authored tail is
-    // editable; a toml/cast row says where it lives and bails. Mirrors the radial sector editor
-    // (preset_picker + an editing sentinel + a commit verb), and closes every other shared-picker editor.
+    // EDIT an existing GUI-authored rule IN PLACE — clicking ANY row (removable or not — the TOML pill
+    // is just the read-only rows' right edge, it isn't its own click target, so a click there falls
+    // through to the same row-level TouchArea) opens the SAME wire-editor inline, seeded from its real
+    // trigger + action (edit-shows-current). Only the GUI-authored tail is actually editable; a
+    // toml/cast/apps/sidecar row says where it really lives and bails instead of opening the editor —
+    // that's the ONLY feedback a click on a provenance row produces, so it has to be honest and
+    // specific, not a generic "can't edit that". Mirrors the radial sector editor (preset_picker + an
+    // editing sentinel + a commit verb), and closes every other shared-picker editor.
     bind(app, &shared, |app, _sh| {
         let w = app.as_weak();
         app.global::<State>().on_begin_edit_rule(move |row, hyper| {
             if let Some(app) = w.upgrade() {
                 let st = app.global::<State>();
-                // map the visible row -> the n-th GUI rule of its tier. BASE: the editable tail (toml
-                // rows lead); HYPER: every listed row is GUI-authored, so the row index IS n.
-                let n = if hyper {
-                    row.max(0) as usize
-                } else {
-                    let total = st.get_rules().row_count() as i32;
-                    let first_editable = total - st.get_editable_count();
-                    if row < first_editable {
-                        st.set_status_line(
-                            "that rule comes from bindings.toml / cast.toml — edit it there".into(),
-                        );
-                        return;
-                    }
-                    (row - first_editable) as usize
+                // Map the visible row -> the n-th GUI rule of its tier. BOTH tiers lead with
+                // read-only provenance rows and carry the GUI-authored rules as their tail, so both
+                // go through the one mapping (see `gui_row_index` for what happened when the hyper
+                // tier assumed otherwise). A provenance row isn't editable here — say where it
+                // really lives instead of opening an editor that can't write back.
+                let Some(n) = gui_row_index(&st, row, hyper) else {
+                    st.set_status_line(PROVENANCE_ROW_NOTE.into());
+                    return;
                 };
                 let Some(rule) = crate::editor::gui_rule_in_tier(n, hyper) else {
                     st.set_status_line("couldn't find that binding to edit".into());
@@ -6309,11 +6304,46 @@ fn stamp_feel_baseline(st: &State) {
 }
 
 struct ScrollStageParse {
+    /// Can this value be written to the device? Gates the apply key.
     valid: bool,
+    /// Is the note a COMPLAINT about what the user typed, or just a statement of where we are?
+    /// Separate from `valid` on purpose: "nothing has been read off the hardware yet" and "you
+    /// typed banana" are both un-appliable, but only one of them is the user's fault, and painting
+    /// the first one in danger-red accuses them of an error they did not make.
+    error: bool,
     note: String,
 }
 
+/// The "nothing read off the hardware yet" sentinel the HyperScroll editor carries before a real
+/// read lands (mirrored as `State.scroll-stages`'s default in state.slint, guarded by
+/// `state_slint_default_no_longer_hardcodes_the_fake_scroll_stage`). It is a SENTINEL WE WROTE,
+/// never something the user typed — see `parse_scroll_stage_editor`.
+const SCROLL_STAGE_UNKNOWN: &str = "\u{2014}";
+/// The ONE thing the app says about that sentinel. Both paths that can describe an unknown table —
+/// `publish_scroll_stage`'s `Truth::Unknown` arm and the editor re-sync — must agree, or whichever
+/// runs last silently redefines the state (which is exactly how the sync below came to overwrite
+/// the honest line with a fabricated "invalid:" error).
+/// Deliberately SHORT. This sits between a 160px field and the apply key, so a longer sentence
+/// elides — and the half that got cut was the half telling you what to do ("…source persisted…").
+/// The preset rail directly beneath already shows the choices, so the words only have to carry the
+/// state; the UI carries the action.
+const SCROLL_STAGE_UNKNOWN_NOTE: &str = "not read from the mouse yet";
+
 fn parse_scroll_stage_editor(list: &str) -> ScrollStageParse {
+    // The sentinel is OUR value, not the user's, so it is graded "unknown" — never "invalid".
+    // Without this, `init_perf_controls`' startup sync re-parses the dash as if it were typed
+    // input, lands it in `bad`, and paints a red `invalid: — (use tactile/free)` on a control the
+    // user has never touched — blaming them for a placeholder the app itself wrote. Returning the
+    // shared note here also makes the sync IDEMPOTENT: re-syncing an unread table keeps saying the
+    // same honest thing instead of degrading it.
+    if list.trim() == SCROLL_STAGE_UNKNOWN {
+        return ScrollStageParse {
+            valid: false,
+            error: false, // un-appliable, but nothing is WRONG — see `ScrollStageParse::error`
+            note: SCROLL_STAGE_UNKNOWN_NOTE.into(),
+        };
+    }
+
     let mut count = 0usize;
     let mut bad = Vec::new();
     for tok in list
@@ -6339,12 +6369,19 @@ fn parse_scroll_stage_editor(list: &str) -> ScrollStageParse {
         format!("{count} mode{plural} ready")
     };
 
-    ScrollStageParse { valid, note }
+    // Only a token we could not understand is the USER's error. An empty field is a prompt, not a
+    // complaint — it gets the same quiet ink as the unknown sentinel above.
+    ScrollStageParse {
+        valid,
+        error: !bad.is_empty(),
+        note,
+    }
 }
 
 fn sync_scroll_stage_editor(st: &State) {
     let parsed = parse_scroll_stage_editor(st.get_scroll_stages().as_str());
     st.set_scroll_stages_valid(parsed.valid);
+    st.set_scroll_stages_error(parsed.error);
     st.set_scroll_stages_note(parsed.note.into());
 }
 
@@ -7576,6 +7613,70 @@ fn apply_scanned_devices(app: &AppWindow, sh: &SharedRt, devs: Vec<crate::runtim
             .unwrap_or(default_idx)
     };
     select_device_at(app, sh, idx);
+}
+
+/// What every GUI rule editor says when the user acts on a PROVENANCE row. One constant because
+/// three verbs (edit / remove / reorder) across two tiers all have to describe the same state — they
+/// had drifted into three different sentences, two of which named only bindings.toml and cast.toml
+/// when the read-only tier is actually folded from four-plus sources.
+const PROVENANCE_ROW_NOTE: &str =
+    "loaded from disk config, not gui.rules.toml — this panel can't touch it, edit the source file";
+
+/// Map a VISIBLE rule-row index to that row's index among the GUI-authored rules of its tier, or
+/// `None` when the row is read-only provenance that no GUI editor may touch.
+///
+/// Both tiers are assembled identically in [`refresh_rules`]: engine/TOML-sourced provenance rows
+/// LEAD, and the GUI-authored (`gui.rules.toml`) rows are the removable TAIL. Every editor verb
+/// addresses the GUI tier by ITS OWN index (`editor::{gui_rule_in_tier, remove_gui_rule_in_tier,
+/// move_gui_rule_in_tier}` all count only GUI rules), so the leading provenance count must be
+/// subtracted before handing an index across that boundary.
+///
+/// The HYPER tier used to skip this step entirely, on a comment asserting that `AppRuntime::rules()`
+/// "contributes no hyper rows ... empty by construction". That invariant was never true:
+/// `rules()` partitions the WHOLE spine on `layer.is_some()`, and `spine_rules()` folds in
+/// bindings.toml, cast.toml, apps.toml and every `profiles/*.rules.toml` sidecar except
+/// gui.rules.toml — any of which may hand-author a hypershift-layered rule (hand-editable TOML is
+/// the app's stated config model, so this is a supported thing to do, not a hypothetical). With a
+/// single such rule present, the raw row index was off by the number of leading provenance rows, so
+/// the hyper verbs silently addressed the WRONG binding: edit opened another rule, reorder moved
+/// another rule, and remove DELETED another rule. Routing every verb through one mapping is what
+/// stops the two tiers drifting apart again.
+fn gui_row_index(st: &State, row: i32, hyper: bool) -> Option<usize> {
+    use slint::Model;
+    let (total, editable) = if hyper {
+        (
+            st.get_hypershift_rules().row_count() as i32,
+            st.get_editable_hyper_count(),
+        )
+    } else {
+        (st.get_rules().row_count() as i32, st.get_editable_count())
+    };
+    gui_row_index_of(total, editable, row)
+}
+
+/// The mapping itself, over plain numbers.
+///
+/// Split out from [`gui_row_index`] so the contract can be tested WITHOUT standing up an
+/// `AppWindow`. That is not a stylistic preference: Slint expects window/component work on one UI
+/// thread, so a test that builds a window from a second test module races the ones in `apptest`,
+/// and an earlier version of this test did exactly that — turning
+/// `hidwatch::wake_burst_is_primed_silently_never_carded` into an intermittent failure that passed
+/// alone, passed under `--test-threads=1`, and failed only in the parallel suite. Pure input, pure
+/// output, no global state, no window.
+fn gui_row_index_of(total: i32, editable: i32, row: i32) -> Option<usize> {
+    // Refuse anything we cannot honestly map, rather than returning a confident-looking index.
+    // Today's callers can't produce these (the row comes from a `for` over the very model we're
+    // measuring, and `refresh_rules` publishes the model and its editable count in one synchronous
+    // pass, so a callback can't observe them half-updated) — and the downstream verbs are defensive
+    // anyway (`gui_rule_in_tier` -> None, `remove_gui_rule_in_tier` -> Err). But this function's
+    // whole job is translating between two index spaces, and a translator that answers `Some` for
+    // an input it cannot actually translate is how the hyper-tier bug above stayed invisible for so
+    // long. An out-of-range or inconsistent input is a NO, not an arithmetic accident.
+    if !(0..=total).contains(&editable) || !(0..total).contains(&row) {
+        return None;
+    }
+    let first_editable = total - editable;
+    (row >= first_editable).then(|| (row - first_editable) as usize)
 }
 
 pub fn refresh_rules(app: &AppWindow, sh: &SharedRt) {
@@ -10634,6 +10735,117 @@ mod reconcile_units_tests {
         assert!(
             default_line.contains('\u{2014}'),
             "state.slint's scroll-stages default should be the honest dash: {default_line}"
+        );
+    }
+
+    /// The unknown SENTINEL must never be graded as invalid USER INPUT.
+    ///
+    /// `init_perf_controls` re-syncs the editor at startup, which re-parses whatever
+    /// `State.scroll-stages` currently holds — and before any hardware read that is the dash. When
+    /// the parser treated the dash as a typed token it landed in `bad` and painted a red
+    /// `invalid: — (use tactile/free)` over the honest default note, so a user opening ADVANCED for
+    /// the first time was told they'd entered something wrong on a control they had never touched.
+    #[test]
+    fn unknown_scroll_stage_sentinel_is_not_graded_as_invalid_input() {
+        let parsed = parse_scroll_stage_editor(SCROLL_STAGE_UNKNOWN);
+        assert!(!parsed.valid, "an unread table must not enable apply");
+        assert!(
+            !parsed.note.contains("invalid"),
+            "the sentinel must never be reported as invalid input, got: {}",
+            parsed.note
+        );
+        assert!(
+            !parsed.error,
+            "an unread table is blocked-but-blameless — tinting it danger-red accuses the user of \
+             a typo they never made"
+        );
+        // an empty field is a prompt, not a complaint, and must read the same quiet way.
+        assert!(!parse_scroll_stage_editor("").error, "empty is a prompt");
+        assert!(!parse_scroll_stage_editor("   ").error, "blank is a prompt");
+        assert_eq!(
+            parsed.note, SCROLL_STAGE_UNKNOWN_NOTE,
+            "the parse path and the publish path must say the SAME thing about an unknown table"
+        );
+        // Idempotent: the sentinel is what the field still holds after a sync, so re-syncing an
+        // unread table has to keep saying the same thing rather than degrading it on a later pass.
+        assert_eq!(parse_scroll_stage_editor(SCROLL_STAGE_UNKNOWN).note, parsed.note);
+
+        // and the guard still holds for genuinely bad input — this must not have gone soft.
+        let bogus = parse_scroll_stage_editor("banana");
+        assert!(!bogus.valid);
+        assert!(
+            bogus.note.contains("invalid"),
+            "real typos must still be called invalid, got: {}",
+            bogus.note
+        );
+        assert!(
+            bogus.error,
+            "a token we can't understand IS the user's error and must still tint red"
+        );
+        // and a good value is neither blocked nor blamed.
+        let good = parse_scroll_stage_editor("tactile/free");
+        assert!(good.valid && !good.error);
+    }
+
+    /// BOTH rule tiers lead with read-only provenance rows, so BOTH must subtract that lead before
+    /// handing an index to `editor::*_gui_rule_in_tier` (which counts only GUI-authored rules).
+    ///
+    /// The hyper tier used to pass the raw row index straight through, on a comment claiming
+    /// `AppRuntime::rules()` yields no hyper rows. It does: `rules()` splits the whole spine on
+    /// `layer.is_some()`, and the spine folds in bindings.toml / cast.toml / apps.toml / every
+    /// non-gui `profiles/*.rules.toml`. One hand-authored hypershift rule in any of those shifted
+    /// every hyper verb by one: edit opened the wrong binding, reorder moved it, remove DELETED it.
+    #[test]
+    fn both_tiers_offset_visible_rows_past_read_only_provenance() {
+        // 3 visible rows, only the last GUI-authored => 2 leading provenance rows. This is the
+        // shape BOTH tiers can take (a hypershift rule hand-authored in a non-gui sidecar puts
+        // provenance rows at the head of the hyper list too), and the shape the hyper verbs used to
+        // get wrong.
+        assert_eq!(
+            gui_row_index_of(3, 1, 0),
+            None,
+            "a leading provenance row must be untouchable, not GUI rule 0"
+        );
+        assert_eq!(gui_row_index_of(3, 1, 1), None);
+        assert_eq!(
+            gui_row_index_of(3, 1, 2),
+            Some(0),
+            "the first GUI-authored row is tier index 0, not its visible index"
+        );
+
+        // an all-GUI tier (the shape the old hyper code assumed was the ONLY one) still maps 1:1,
+        // which is exactly why the bug hid: every test authored only GUI rules.
+        assert_eq!(gui_row_index_of(3, 3, 0), Some(0));
+        assert_eq!(gui_row_index_of(3, 3, 2), Some(2));
+
+        // A translator must refuse what it cannot translate. Out-of-range rows and an editable
+        // count that outruns the model are both a NO — never an arithmetic accident that happens
+        // to produce a plausible index into someone else's binding.
+        assert_eq!(gui_row_index_of(3, 1, -1), None, "negative row");
+        assert_eq!(gui_row_index_of(3, 1, 3), None, "row past the model");
+        assert_eq!(gui_row_index_of(3, 1, 99), None, "row far past the model");
+        assert_eq!(
+            gui_row_index_of(3, 9, 0),
+            None,
+            "an editable count larger than the model is inconsistent state, not row 6"
+        );
+        assert_eq!(gui_row_index_of(0, 0, 0), None, "an empty tier has no rows");
+    }
+
+    /// The Slint-side default note and the Rust const are two copies of one sentence; if they drift
+    /// the UI shows one message at launch and a different one after the first reconcile.
+    #[test]
+    fn state_slint_unknown_note_matches_the_rust_const() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("ui/state.slint");
+        let src = std::fs::read_to_string(&path).expect("ui/state.slint must be readable");
+        let note_line = src
+            .lines()
+            .find(|l| l.contains("in-out property <string> scroll-stages-note:"))
+            .expect("scroll-stages-note property declaration must exist");
+        assert!(
+            note_line.contains(SCROLL_STAGE_UNKNOWN_NOTE),
+            "state.slint's scroll-stages-note default must match SCROLL_STAGE_UNKNOWN_NOTE \
+             ({SCROLL_STAGE_UNKNOWN_NOTE:?}), got: {note_line}"
         );
     }
 }

@@ -453,7 +453,14 @@ export component AppWindow inherits Window {
                 interactive: false;   // wheel-only, like the panels
                 viewport-width: self.width;
                 viewport-height: menu.preferred-height;
-                menu := ProfilesMenu { width: parent.viewport-width; }
+                // `menu`'s own height must tie back to the viewport (the same convention PanelPage's
+                // `body` uses above). Left unbound, the VerticalLayout sizes itself independently of
+                // the number this Flickable's viewport (and the card's opaque background, sized off
+                // that same viewport height a few lines up) were told to use — the two can drift a
+                // hair apart, and the sliver of content past the background's edge renders over the
+                // translucent scrim instead of the opaque card, i.e. the panel behind bleeds through
+                // the sheet's own lower edge.
+                menu := ProfilesMenu { width: parent.viewport-width; height: parent.viewport-height; }
             }
         }
     }

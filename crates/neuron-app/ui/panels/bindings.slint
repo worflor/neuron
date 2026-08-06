@@ -364,17 +364,22 @@ component RuleLine inherits Rectangle {
     height: 40px;
     border-radius: Theme.radius-sm;
     // GUI-authored rows are click-to-edit; the whole row lifts on hover to advertise it. TOML rows
-    // (read-only provenance) stay inert — clicking them does nothing, as before.
-    background: (root.r.removable && rowta.has-hover) ? Theme.well : transparent;
+    // (read-only provenance) lift the same way now — they're clickable too, just to a different end
+    // (see rowta below): the hover cue would lie if it stayed dark on a row that DOES respond to a click.
+    background: rowta.has-hover ? Theme.well : transparent;
     animate background { duration: Theme.quick; }
     // the live lamp: this rule's trigger was the engine's last dispatch
     property <bool> fired: State.live-last-trigger == root.r.trigger;
     // row-level click target, BEHIND the cells (so the `del` button — declared inside the HBox above
-    // — still wins its own corner, and the bare trigger/action wells fall through to here). Only
-    // armed for removable (GUI-authored) rows; provenance rows aren't editable through this menu.
+    // — still wins its own corner, and the bare trigger/action wells + the TOML pill fall through to
+    // here). ALWAYS armed now, for both removable and provenance rows: `edit()` reaches
+    // on_begin_edit_rule in glue.rs, which already knows how to open the inline editor for a
+    // GUI-authored row OR — for a toml/cast-sourced row — explain on the status line where the rule
+    // actually lives instead of silently doing nothing. (Previously this TouchArea was disabled for
+    // provenance rows, which orphaned that explanation: the message existed in glue.rs but no click
+    // could ever reach it, so hovering the TOML pill went dead — the exact gap this fixes.)
     rowta := TouchArea {
-        enabled: root.r.removable;
-        mouse-cursor: root.r.removable ? MouseCursor.pointer : MouseCursor.default;
+        mouse-cursor: MouseCursor.pointer;
         clicked => { root.edit(); }
     }
     HorizontalLayout {

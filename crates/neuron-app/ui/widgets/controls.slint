@@ -1191,7 +1191,16 @@ export component SplitToggle inherits Rectangle {
     HorizontalLayout {
         spacing: 0;
         for opt[i] in root.options : seg := Rectangle {
-            min-width: root.min-cell;
+            // CONTENT-AWARE floor. `min-cell` alone can't be it: the label below is a BARE Text
+            // (deliberately — it fills the cell so it can centre in it), and a Rectangle does not
+            // inherit a minimum from a non-layout child, so a cell's minimum WAS exactly `min-cell`
+            // no matter how long its label. Squeeze the row and every cell collapses to that floor
+            // while the root's `clip: true` shears the centred label from BOTH ends — "tactile/free"
+            // rendering as "actile/free". That made `min-cell` a value each call site had to guess
+            // correctly against its own longest string, with silent clipping as the failure mode.
+            // Taking the max keeps `min-cell` doing its real job (a comfort floor so SHORT labels
+            // like "1m" don't get cramped cells) while making it impossible to under-size a long one.
+            min-width: max(root.min-cell, txt.preferred-width + 20px);
             horizontal-stretch: 1;
             property <bool> on: i == root.index;
             background: seg.on ? Theme.accent-glow
@@ -1201,7 +1210,7 @@ export component SplitToggle inherits Rectangle {
             animate background { duration: Theme.quick; }
             // the split — a hairline at the seam (every half but the first)
             if i > 0 : Rectangle { x: 0; width: Theme.hair; background: Theme.line; }
-            Text {
+            txt := Text {
                 text: opt;
                 vertical-alignment: center; horizontal-alignment: center;
                 color: !root.enabled ? Theme.text-faint
