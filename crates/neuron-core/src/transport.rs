@@ -252,7 +252,18 @@ impl Drop for WireGuard<'_> {
 /// output/input surface overrides them.
 pub trait Transport {
     fn set_feature(&self, buf: &[u8]) -> Result<()>;
-    fn get_feature(&self, buf: &mut [u8]) -> Result<()>;
+
+    /// Pull a feature report into `buf`; returns HOW MANY BYTES were actually filled.
+    ///
+    /// The count is the whole point. This used to return `()`, which made a SHORT READ structurally
+    /// invisible: a device that answers a few bytes and goes quiet left the caller's zeroed buffer
+    /// mostly untouched, `Report::from_buf` zero-filled the tail, and a reply that never happened
+    /// verified successfully against any all-zero expectation — i.e. the round-trip verify that
+    /// gates neuron's most dangerous writes could report "the write landed" for a device that said
+    /// nothing. `writes::verify_getter`'s own short-read guard was likewise unreachable, since the
+    /// payload it inspects is a fixed `[u8; 80]`. With a real count, the dialects can (and do)
+    /// refuse a structurally short frame instead of trusting its zero-padding.
+    fn get_feature(&self, buf: &mut [u8]) -> Result<usize>;
 
     /// Send an OUTPUT report (the request half of the output/input wire surface). Default: an
     /// honest error — a feature-report-only transport does not carry output reports.
@@ -564,8 +575,8 @@ mod tests {
         fn set_feature(&self, _buf: &[u8]) -> Result<()> {
             Ok(())
         }
-        fn get_feature(&self, _buf: &mut [u8]) -> Result<()> {
-            Ok(())
+        fn get_feature(&self, buf: &mut [u8]) -> Result<usize> {
+            Ok(buf.len())
         }
     }
 

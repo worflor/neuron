@@ -466,7 +466,7 @@ mod tests {
             fn set_feature(&self, _buf: &[u8]) -> Result<()> {
                 panic!("unknown-dialect def must put NO bytes on the wire")
             }
-            fn get_feature(&self, _buf: &mut [u8]) -> Result<()> {
+            fn get_feature(&self, _buf: &mut [u8]) -> Result<usize> {
                 panic!("unknown-dialect def must read NOTHING")
             }
         }
@@ -538,7 +538,7 @@ mod tests {
             Ok(())
         }
 
-        fn get_feature(&self, buf: &mut [u8]) -> Result<()> {
+        fn get_feature(&self, buf: &mut [u8]) -> Result<usize> {
             if self.dead.load(Ordering::SeqCst) {
                 bail!("stale handle: get_feature failed (simulated unplug/sleep)");
             }
@@ -548,7 +548,7 @@ mod tests {
             let out = rep.to_buf();
             let n = buf.len().min(out.len());
             buf[..n].copy_from_slice(&out[..n]);
-            Ok(())
+            Ok(n)
         }
     }
 

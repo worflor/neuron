@@ -1945,4 +1945,129 @@ mod tests {
         std::env::remove_var("NEURON_HYPERSCROLL_WRITE");
         assert!(!hyperscroll_write_enabled());
     }
+
+    // ── FAULT-INJECTION over a REAL verify-gated write ─────────────────────────────────────────
+    // These are the first tests in which `verify_getter` actually EXECUTES (every earlier test in
+    // this module stops at payload builders and gate booleans — the module used to admit "we can't
+    // construct a Device here"). `Device::with_transport` + the phantom close that gap, and the
+    // fault variants drive the exact firmware misbehaviours the mock was built to model.
+    //
+    // Target: `set_lift_off_distance` — a real, UNGATED verify-gated write (SET 0x0B/0x0B, then
+    // `verify_getter` on 0x0B/0x85 expecting `[mode, level]` at offset 2), so the whole
+    // conversation (ensure_driver → SET → verify read-back) runs with zero env/feature gating.
+
+    use crate::transport::mock::{Fault, MockDevice};
+    use std::sync::Arc;
+
+    /// A phantom that answers the LOD conversation HONESTLY: driver-mode getter says "already in
+    /// driver mode" (so `ensure_driver` writes nothing), the SET ACKs, and the LOD getter reports
+    /// the written level back at the layout `verify_getter` inspects.
+    fn honest_lod_phantom(level: u8) -> Arc<MockDevice> {
+        Arc::new(
+            MockDevice::razer(0x00A8, "phantom naga")
+                .answering(CLASS_DEVICE_MODE, ID_DEVICE_MODE_GET, &[DRIVER_MODE])
+                .answering(CLASS_SENSOR, ID_LOD_SET, &[])
+                // getter layout: [0x00, 0x04, mode, level] — expect is checked at offset 2.
+                .answering(
+                    CLASS_SENSOR,
+                    ID_LOD_GET,
+                    &[0x00, 0x04, LOD_MODE_SYMMETRIC, level],
+                ),
+        )
+    }
+
+    fn lod_device(phantom: &Arc<MockDevice>) -> Device {
+        let def: crate::registry::DeviceDef =
+            toml::from_str(include_str!("../devices/razer-naga-v2-pro.toml")).unwrap();
+        Device::with_transport(def, 0x00A8, Box::new(phantom.handle()))
+    }
+
+    /// The control run: with an honest phantom the whole write+verify conversation succeeds. This
+    /// is what gives the fault runs below their teeth — same plumbing, only the fault differs.
+    #[test]
+    fn lod_write_verifies_against_an_honest_read_back() {
+        let phantom = honest_lod_phantom(2);
+        set_lift_off_distance(&lod_device(&phantom), 2).expect("honest echo must verify");
+        // the conversation actually happened: mode getter, LOD set, LOD read-back — in order.
+        assert_eq!(
+            phantom.asked(),
+            vec![
+                (CLASS_DEVICE_MODE, ID_DEVICE_MODE_GET),
+                (CLASS_SENSOR, ID_LOD_SET),
+                (CLASS_SENSOR, ID_LOD_GET),
+            ]
+        );
+    }
+
+    /// THE SHORT-READ PROPERTY: a device that can only ever deliver partial frames must NEVER
+    /// produce a trusted write. Before `get_feature` returned a byte count, this test could not
+    /// exist — a truncated reply was completed by the caller's zeroed buffer, and the razer
+    /// dialect happily parsed the zero-fill. Now a short frame is treated as silence, the poll
+    /// loop times out, and the write surfaces an error instead of a false "landed".
+    #[test]
+    fn a_short_reading_device_never_yields_a_trusted_write() {
+        let mut phantom = MockDevice::razer(0x00A8, "phantom naga")
+            .answering(CLASS_DEVICE_MODE, ID_DEVICE_MODE_GET, &[DRIVER_MODE])
+            .answering(CLASS_SENSOR, ID_LOD_SET, &[])
+            .answering(
+                CLASS_SENSOR,
+                ID_LOD_GET,
+                &[0x00, 0x04, LOD_MODE_SYMMETRIC, 2],
+            );
+        // Every conversation (including each poll-loop re-arm) consumes one fault: queue enough
+        // that the device is short-read for the ENTIRE exchange, however many re-arms happen.
+        for _ in 0..64 {
+            phantom = phantom.faulting(Fault::ShortRead(12));
+        }
+        let phantom = Arc::new(phantom);
+        let err = set_lift_off_distance(&lod_device(&phantom), 2)
+            .expect_err("a 12-byte reply must never verify a write");
+        // Pin the SHAPE, not just the failure: a partial frame is not a message, so the SET itself
+        // is refused at the transport ("not accepted", from the timed-out poll loop) — the write is
+        // never even provisionally believed, so no verify runs. Asserting the specific wording
+        // stops a future regression from passing this test with the wrong failure (e.g. a verify
+        // that ran against zero-fill and happened to mismatch).
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("was not accepted") && msg.contains("timed out"),
+            "expected a transport-level refusal of the SET, got: {msg}"
+        );
+    }
+
+    /// THE PARROT PROPERTY: firmware that ACKs SUCCESS with an EMPTY body (the Seiren's observed
+    /// behaviour) must fail the verify — the read-back reports zeros where the written
+    /// `[mode, level]` should re-appear, and `verify_getter` refuses to trust the write.
+    #[test]
+    fn a_parroting_device_fails_the_verify_instead_of_faking_success() {
+        let phantom = Arc::new(
+            MockDevice::razer(0x00A8, "phantom parrot")
+                .answering(CLASS_DEVICE_MODE, ID_DEVICE_MODE_GET, &[DRIVER_MODE])
+                .parroting(),
+        );
+        let err = set_lift_off_distance(&lod_device(&phantom), 2)
+            .expect_err("an empty-body SUCCESS echo must not verify");
+        assert!(
+            format!("{err}").contains("VERIFY FAILED"),
+            "the parrot must be caught BY THE VERIFY (not an I/O error): {err}"
+        );
+    }
+
+    /// Mid-conversation unplug: `Fault::Yank` during the SET must surface as an error from the
+    /// write — and the verify read-back must never run against a dead handle and "pass".
+    #[test]
+    fn a_yanked_device_surfaces_an_error_not_a_trusted_write() {
+        let phantom = Arc::new(
+            MockDevice::razer(0x00A8, "phantom naga")
+                .answering(CLASS_DEVICE_MODE, ID_DEVICE_MODE_GET, &[DRIVER_MODE])
+                .answering(CLASS_SENSOR, ID_LOD_SET, &[])
+                .answering(
+                    CLASS_SENSOR,
+                    ID_LOD_GET,
+                    &[0x00, 0x04, LOD_MODE_SYMMETRIC, 2],
+                )
+                .faulting(Fault::Yank),
+        );
+        set_lift_off_distance(&lod_device(&phantom), 2)
+            .expect_err("an unplugged device must never yield a trusted write");
+    }
 }

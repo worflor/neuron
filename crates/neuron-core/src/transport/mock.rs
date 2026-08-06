@@ -285,21 +285,23 @@ impl Transport for MockHandle {
         Ok(())
     }
 
-    fn get_feature(&self, buf: &mut [u8]) -> Result<()> {
+    fn get_feature(&self, buf: &mut [u8]) -> Result<usize> {
         let d = &self.0;
         if d.yanked.load(Ordering::Relaxed) {
             bail!("mock: device was yanked");
         }
         let pending = *d.pending.lock().unwrap_or_else(PoisonError::into_inner);
         let Some((reply, truncate)) = pending else {
-            // Silence: leave the caller's buffer untouched. `reply_status` will not match, so a
-            // poll loop keeps polling — exactly what a mute pipe does.
-            return Ok(());
+            // Silence: leave the caller's buffer untouched and report ZERO bytes read. `reply_status`
+            // will not match, so a poll loop keeps polling — exactly what a mute pipe does.
+            return Ok(0);
         };
         let full = buf.len().min(BUF_LEN);
         let n = if truncate > 0 { truncate.min(full) } else { full };
         buf[..n].copy_from_slice(&reply[..n]);
-        Ok(())
+        // The REAL count — this is what makes `Fault::ShortRead` observable to the dialects instead
+        // of hiding behind the caller's zeroed buffer.
+        Ok(n)
     }
 
     fn wire_lock(&self) -> Option<Arc<WireLock>> {

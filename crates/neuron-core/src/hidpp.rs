@@ -623,7 +623,7 @@ mod tests {
         fn set_feature(&self, _buf: &[u8]) -> Result<()> {
             bail!("hidpp mock carries no feature reports")
         }
-        fn get_feature(&self, _buf: &mut [u8]) -> Result<()> {
+        fn get_feature(&self, _buf: &mut [u8]) -> Result<usize> {
             bail!("hidpp mock carries no feature reports")
         }
         fn write_output(&self, buf: &[u8]) -> Result<()> {

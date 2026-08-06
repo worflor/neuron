@@ -1056,7 +1056,7 @@ mod tests {
             *self.last.lock().unwrap() = Some((buf[7], buf[8]));
             Ok(())
         }
-        fn get_feature(&self, buf: &mut [u8]) -> anyhow::Result<()> {
+        fn get_feature(&self, buf: &mut [u8]) -> anyhow::Result<usize> {
             let Some((class, id)) = *self.last.lock().unwrap() else {
                 anyhow::bail!("no pending command");
             };
@@ -1071,7 +1071,7 @@ mod tests {
             let out = rep.to_buf();
             let n = buf.len().min(BUF_LEN);
             buf[..n].copy_from_slice(&out[..n]);
-            Ok(())
+            Ok(n)
         }
     }
 

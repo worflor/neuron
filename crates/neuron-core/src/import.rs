@@ -1114,11 +1114,29 @@ fn vk_name(vk: u16) -> Option<String> {
 
 // ─────────────────────────────────────── XML helpers ─────────────────────────────────────────
 
-/// Read a ZIP member by exact name to a UTF-8 string (lossy). `None` if absent/unreadable.
+/// The most a single ZIP member may DECOMPRESS to. `.ChromaEffects`/`.synapse3` files come off the
+/// internet, and a zip bomb turns a few KB on disk into GBs in memory via `read_to_end` — real
+/// exports' XML members are tens of KB, so 16 MiB is orders of magnitude of headroom while keeping
+/// a hostile file from exhausting memory.
+const MAX_MEMBER_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Read a ZIP member by exact name to a UTF-8 string (lossy). `None` if absent/unreadable — or if
+/// it inflates past [`MAX_MEMBER_BYTES`] (a bomb is "unreadable", never a partial parse: truncating
+/// mid-document would hand the XML layer a corrupted record and call it the file's content).
 fn read_member(zip: &mut zip::ZipArchive<Cursor<&[u8]>>, name: &str) -> Option<String> {
-    let mut f = zip.by_name(name).ok()?;
+    let f = zip.by_name(name).ok()?;
+    // Reject on the DECLARED size first (cheap), then cap the actual read too — the declared size
+    // is attacker-controlled metadata and may lie small.
+    if f.size() > MAX_MEMBER_BYTES {
+        return None;
+    }
     let mut buf = Vec::new();
-    f.read_to_end(&mut buf).ok()?;
+    // +1 so a stream that lies about its size and runs past the cap is detected (the extra byte
+    // arrives) instead of silently truncated at exactly the cap.
+    f.take(MAX_MEMBER_BYTES + 1).read_to_end(&mut buf).ok()?;
+    if buf.len() as u64 > MAX_MEMBER_BYTES {
+        return None;
+    }
     Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
@@ -1196,7 +1214,10 @@ fn split_blocks(xml: &str, tag: &str) -> Vec<String> {
                 depth += 1;
             }
             Ok(Event::End(e)) => {
-                depth -= 1;
+                // saturating: quick_xml's name-checking rejects a stray close before we see it,
+                // but this parser must never be one config-default away from a usize underflow
+                // panic on attacker-supplied XML.
+                depth = depth.saturating_sub(1);
                 if let Some(cd) = capture_depth {
                     if e.name().as_ref() == target && depth == cd {
                         blocks.push(std::mem::take(&mut current));
@@ -1962,5 +1983,116 @@ mod tests {
             }
         }
         out
+    }
+
+    // ── ADVERSARIAL input — `.ChromaEffects` files come off the internet ─────────────────────
+    // Everything above parses TRUSTED fixtures (the user's own exports). These feed the import
+    // path what an attacker would: a zip bomb, truncated/garbage archives, unbalanced XML. The
+    // properties are always the same two — never panic, never let a hostile file masquerade as
+    // a usable import.
+
+    /// A tiny-on-disk archive whose one XML member INFLATES far past [`MAX_MEMBER_BYTES`]. The
+    /// member must be rejected (not read into memory, not parsed) — the import completes with
+    /// nothing ingested rather than ballooning to the inflated size.
+    #[test]
+    fn zip_bomb_member_is_rejected_not_inflated() {
+        use std::io::Write;
+        let mut cur = Cursor::new(Vec::new());
+        {
+            let mut zw = zip::ZipWriter::new(&mut cur);
+            let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            zw.start_file("boom.xml", opts).unwrap();
+            // VALID lighting XML up front, then 64 MiB of padding (deflates to ~64 KiB on the
+            // wire, 4× past the inflate cap). The valid prefix is the tripwire: if the cap ever
+            // regresses, the member inflates, the prefix PARSES, and the assertion below sees an
+            // ingested layer — "rejected" and "inflated-but-harmless" are distinguishable.
+            zw.write_all(
+                b"<LightingEffects><Mode>basic</Mode><Effect>static</Effect>\
+                  <Colors><RzColor><Green>255</Green></RzColor></Colors></LightingEffects>",
+            )
+            .unwrap();
+            let pad = vec![b' '; 1024 * 1024];
+            for _ in 0..64 {
+                zw.write_all(&pad).unwrap();
+            }
+            zw.finish().unwrap();
+        }
+        let bytes = cur.into_inner();
+        assert!(
+            bytes.len() < 1024 * 1024,
+            "the bomb must be small on the wire for this test to mean anything ({} bytes)",
+            bytes.len()
+        );
+        let out = import_chroma_effects(&bytes).expect("a rejected member is skipped, not a crash");
+        assert!(
+            out.profile.lighting.is_empty(),
+            "nothing from the bomb may be ingested as content"
+        );
+    }
+
+    #[test]
+    fn non_zip_and_truncated_zip_fail_loudly_never_panic() {
+        // plain garbage
+        assert!(import_chroma_effects(b"this is not a zip archive").is_err());
+        // empty input
+        assert!(import_chroma_effects(&[]).is_err());
+        // a real archive cut in half — the central directory (at the tail) is gone
+        let mut cur = Cursor::new(Vec::new());
+        {
+            use std::io::Write;
+            let mut zw = zip::ZipWriter::new(&mut cur);
+            let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zw.start_file("effect.xml", opts).unwrap();
+            zw.write_all(b"<LightingList></LightingList>").unwrap();
+            zw.finish().unwrap();
+        }
+        let whole = cur.into_inner();
+        assert!(import_chroma_effects(&whole[..whole.len() / 2]).is_err());
+        // the ZIP magic followed by garbage — passes the sniff, fails the parse
+        let mut fake = b"PK\x03\x04".to_vec();
+        fake.extend_from_slice(&[0xA5; 512]);
+        assert!(import_chroma_effects(&fake).is_err());
+    }
+
+    /// Unbalanced / hostile XML through the block splitter and scalar puller: stray closes,
+    /// deep nesting, interleaved tags, NUL-laden text. The parsers are iterative and quick_xml
+    /// name-checking rejects mismatches — this pins that NO shape panics or hangs, including the
+    /// stray-close case that a `usize` depth underflow would have turned into a crash.
+    #[test]
+    fn hostile_xml_never_panics_the_block_splitter() {
+        let cases: &[&str] = &[
+            "</S></S></S>",                            // closes with no opens
+            "<S>",                                     // open with no close
+            "<S><S><S></S>",                           // under-closed nesting
+            "<S></X>",                                 // mismatched close
+            "<S><V>1</V></S></S><S><V>2</V></S>",      // stray close BETWEEN records
+            "\u{0}\u{0}<S>\u{0}</S>",                  // NULs
+            "<S V=\"<S>\"></S>",                       // tag-in-attribute
+        ];
+        for xml in cases {
+            let _ = split_blocks(xml, "S");
+            let _ = scalar(xml, "S");
+        }
+        // deep nesting — iterative parse must survive 10k levels without recursion or panic
+        let mut deep = String::new();
+        for _ in 0..10_000 {
+            deep.push_str("<S>");
+        }
+        for _ in 0..10_000 {
+            deep.push_str("</S>");
+        }
+        let _ = split_blocks(&deep, "S");
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
+        /// ANY byte string through the whole import entry point: never a panic, never an OOM —
+        /// only `Ok` (something parseable was salvaged) or a loud `Err`.
+        #[test]
+        fn arbitrary_bytes_never_panic_the_importer(bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..4096)) {
+            let _ = import_chroma_effects(&bytes);
+        }
     }
 }

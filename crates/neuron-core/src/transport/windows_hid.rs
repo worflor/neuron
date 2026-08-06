@@ -562,7 +562,7 @@ impl Transport for WinHid {
         }
         Ok(())
     }
-    fn get_feature(&self, buf: &mut [u8]) -> Result<()> {
+    fn get_feature(&self, buf: &mut [u8]) -> Result<usize> {
         unsafe {
             if HidD_GetFeature(
                 self.handle,
@@ -573,7 +573,12 @@ impl Transport for WinHid {
                 bail!("HidD_GetFeature failed");
             }
         }
-        Ok(())
+        // HidD_GetFeature is all-or-nothing at this layer: the driver either transfers the whole
+        // report the collection declares (which is what `buf` is sized to) or fails. So a success
+        // means `buf.len()` bytes — the honest count for this API. A transport whose wire CAN
+        // deliver a partial frame (the phantom, a future backend) reports its real count, and the
+        // dialects reject anything short of a full frame.
+        Ok(buf.len())
     }
 
     fn write_output(&self, buf: &[u8]) -> Result<()> {

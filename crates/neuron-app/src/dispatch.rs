@@ -1067,7 +1067,58 @@ fn momentary_release_all(held: &MomentaryMap) {
 // ── SNIPER: the held hold-to-precision-DPI edge handling (mirrors the momentary mic) ───────────
 /// trigger → (the DPI to RESTORE on release, the device pid it was written to — the pid keys the
 /// confirmation + its echo-absorbing baseline, see `neuron::confirm::sniper`).
-type SniperMap = std::cell::RefCell<std::collections::HashMap<Trigger, (u16, u16)>>;
+/// A held sniper's snapshot: `(base_dpi, pid, profile_gen)` — the DPI to restore, the device it
+/// belongs to, and [`PROFILE_GEN`] as of the press.
+type SniperMap = std::cell::RefCell<std::collections::HashMap<Trigger, (u16, u16, u64)>>;
+
+/// Bumped every time a profile is APPLIED to live devices (a bound ProfileSwitch/Cycle, an
+/// app-focus rule, or the GUI's apply). A profile apply writes DPI, which makes every held
+/// sniper's snapshotted base STALE: it was the DPI of the profile you were on when you pressed.
+static PROFILE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Record that a profile just applied — see [`PROFILE_GEN`].
+pub fn note_profile_applied() {
+    PROFILE_GEN.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Re-seed the confirmation baseline for `pid` after a sniper release whose restore was dropped.
+///
+/// The press primed the baseline with the PRECISION dpi (so the device's echo of that write didn't
+/// card). When a profile then applies its own DPI and the restore is skipped, that baseline is a
+/// lie: the device is at the profile's DPI, the baseline still says 400, and the device's next
+/// announce would card a ghost "DPI changed" mid-game — exactly the class of spurious card the
+/// confirmation layer exists to suppress. Read what the device is ACTUALLY at and prime the
+/// baseline silently (no card: nothing the user did just changed).
+///
+/// A read failure (asleep wireless mouse) leaves the baseline alone — the hidwatch wake-burst path
+/// primes it on the next announce anyway, and a wrong silent baseline beats a wrong loud one.
+fn sniper_forget_baseline(
+    devices: &std::cell::RefCell<neuron::device::DeviceSession<'_>>,
+    pid: u16,
+) {
+    let _gates = crate::host::io_gate_all();
+    // "set_dpi" is the RESOLUTION key (which device/handle), not a claim about what the closure
+    // does — it reads. Deliberately the same key the press and release paths use, so this reuses
+    // their cached handle instead of opening a second one against the same pipe.
+    let live = devices
+        .borrow_mut()
+        .with_writable("set_dpi", |d| neuron::capability::dpi(d));
+    if let Ok((x, _)) = live {
+        neuron::confirm::prime_dpi(pid, x as u32);
+    }
+}
+
+/// Should a held sniper's DPI restore be SKIPPED because a profile applied while it was held?
+///
+/// The bug this closes: press sniper (snapshot 1600, drop to 400) → a profile switch fires (from a
+/// bound button, or an app-focus rule when you alt-tab into a game) and writes its own DPI, say
+/// 3200 → release the sniper. The release restored the SNAPSHOT (1600), silently undoing the
+/// profile's DPI with a value the user never asked for and no UI ever showed. The profile write is
+/// the newer explicit intent, so the stale restore is dropped: whatever the profile set stands.
+/// Pure so it is unit-testable without a device.
+fn sniper_restore_is_stale(snapshot_gen: u64, current_gen: u64) -> bool {
+    snapshot_gen != current_gen
+}
 
 /// A trigger's DOWN edge: if it binds a [`neuron::action::Action::Sniper`], snapshot the LIVE DPI,
 /// drop to the precision DPI (VOLATILE — never flashed onboard, so it reverts on its own), and
@@ -1099,7 +1150,10 @@ fn sniper_press(
         Ok((base_x, d.pid))
     });
     if let Ok((base_x, pid)) = base {
-        held.borrow_mut().insert(trigger.clone(), (base_x, pid));
+        // stamp the profile generation: if a profile applies before the release, the base we just
+        // snapshotted is stale and must NOT be written back over the profile's DPI.
+        held.borrow_mut()
+            .insert(trigger.clone(), (base_x, pid, PROFILE_GEN.load(Ordering::Relaxed)));
         // its OWN confirmation kind (gated separately from plain DPI, default off) — and the
         // constructor updates the pid's DPI baseline either way, so the mouse's echo of this
         // write is absorbed instead of carding as a spurious "DPI changed" mid-game.
@@ -1120,14 +1174,20 @@ fn sniper_release(
     // remove OUTSIDE the if-let so the RefMut temporary is dropped before the emptiness re-read
     // below (an if-let scrutinee's temporary lives for the whole block).
     let removed = held.borrow_mut().remove(trigger);
-    if let Some((base, pid)) = removed {
-        // same wire discipline as the press: the restore is read-back verified
-        let _gates = crate::host::io_gate_all();
-        let ok = devices.borrow_mut().with_writable("set_dpi", |d| {
-            neuron::capability::set_dpi(d, base, base, neuron::capability::Store::Volatile)
-        });
-        if ok.is_ok() {
-            neuron::confirm::sniper(pid, base as u32, None, false);
+    if let Some((base, pid, gen)) = removed {
+        // A profile applied while this was held → its DPI is the newer intent; writing our
+        // snapshot back would silently undo it (see `sniper_restore_is_stale`).
+        if sniper_restore_is_stale(gen, PROFILE_GEN.load(Ordering::Relaxed)) {
+            sniper_forget_baseline(devices, pid);
+        } else {
+            // same wire discipline as the press: the restore is read-back verified
+            let _gates = crate::host::io_gate_all();
+            let ok = devices.borrow_mut().with_writable("set_dpi", |d| {
+                neuron::capability::set_dpi(d, base, base, neuron::capability::Store::Volatile)
+            });
+            if ok.is_ok() {
+                neuron::confirm::sniper(pid, base as u32, None, false);
+            }
         }
         // the mode-light edge: only dark when NO sniper hold remains (two thumbs, one truth).
         SNIPER_HELD.store(!held.borrow().is_empty(), Ordering::Relaxed);
@@ -1142,7 +1202,19 @@ fn sniper_release_all(
     devices: &std::cell::RefCell<neuron::device::DeviceSession<'_>>,
     held: &SniperMap,
 ) {
-    let bases: Vec<(u16, u16)> = held.borrow_mut().drain().map(|(_, held)| held).collect();
+    let now = PROFILE_GEN.load(Ordering::Relaxed);
+    let (fresh, stale): (Vec<_>, Vec<_>) = held
+        .borrow_mut()
+        .drain()
+        .map(|(_, held)| held)
+        .partition(|(_, _, gen)| !sniper_restore_is_stale(*gen, now));
+    let bases: Vec<(u16, u16)> = fresh.into_iter().map(|(base, pid, _)| (base, pid)).collect();
+    // Stale holds skip the RESTORE but still owe the baseline re-seed (see `sniper_forget_baseline`)
+    // — otherwise the confirmation layer keeps the precision DPI as truth and cards a ghost when
+    // the device announces the profile's value.
+    for (_, pid, _) in stale {
+        sniper_forget_baseline(devices, pid);
+    }
     // the map is drained either way — the mode light must read dark from here on.
     SNIPER_HELD.store(false, Ordering::Relaxed);
     push_hold_state();
@@ -1306,6 +1378,14 @@ fn run_intent(
         }
         _ => {}
     }
+    // A profile intent writes device DPI, which stales every held sniper's snapshot — stamp the
+    // generation so a later release drops its restore instead of undoing the profile.
+    if matches!(
+        intent,
+        Intent::ProfileSwitch(_) | Intent::ProfileCycle(_)
+    ) {
+        note_profile_applied();
+    }
     let mut cursor = neuron::intent::ProcessProfileCursor;
     neuron::intent::run_shared_intent(devices, &mut cursor, intent)
         .unwrap_or_else(|| "instrument routed".into())
@@ -1327,6 +1407,8 @@ fn apply_profile_live(
     // Park every bridged host writer for the write batch — each setter is read-back verified, and
     // a streaming lighting frame can clobber a verify reply (the same race that blanked readouts).
     let _gates = crate::host::io_gate_all();
+    // same stale-snapshot rule as the intent path: this write is the newer DPI intent.
+    note_profile_applied();
     let report = profile.apply_with_session(devices, false);
     neuron::profile::set_active(name);
     Ok(ProfileApplyResult {
@@ -1639,7 +1721,9 @@ mod tests {
         ctx.held_keys
             .borrow_mut()
             .insert(trigger.clone(), vec![0x41]);
-        ctx.sniper.borrow_mut().insert(trigger.clone(), (800, 0));
+        ctx.sniper
+            .borrow_mut()
+            .insert(trigger.clone(), (800, 0, PROFILE_GEN.load(Ordering::Relaxed)));
         ctx.turbos.borrow_mut().start(vec![neuron::executor::TurboStart {
             trigger: trigger.clone(),
             action: neuron::action::Action::Echo,
@@ -1679,6 +1763,43 @@ mod tests {
         assert_eq!(
             counter.0, 0,
             "reload must clear the held turbo (a due-but-still-held turbo would have fired here)"
+        );
+    }
+
+    /// A profile applying MID-HOLD invalidates a sniper's snapshotted DPI.
+    ///
+    /// The scenario: hold sniper (snapshot 1600, drop to 400) → alt-tab into a game, whose
+    /// app-focus rule fires a ProfileSwitch that writes DPI 3200 → release the sniper. The release
+    /// used to write the SNAPSHOT (1600) back, silently undoing the profile with a value the user
+    /// never chose and no surface ever showed. A profile apply is the newer explicit intent, so a
+    /// snapshot taken before it is dropped, not written.
+    ///
+    /// Tested on the pure decision + the real generation counter (no device I/O): a snapshot taken
+    /// at generation N stays valid until a profile applies, and is stale forever after.
+    #[test]
+    fn a_profile_applied_mid_hold_invalidates_the_sniper_restore() {
+        // The DECISION, over literal generations — no reads of the process-global counter, so a
+        // profile apply in a concurrently-running test can't perturb these assertions.
+        assert!(
+            !sniper_restore_is_stale(7, 7),
+            "no profile applied since the press: the snapshot is still the newest DPI intent"
+        );
+        assert!(
+            sniper_restore_is_stale(7, 8),
+            "a profile wrote DPI after the snapshot — restoring it would undo the profile"
+        );
+        // Staleness is per-hold, never a latch: a sniper pressed AFTER the switch snapshots the
+        // profile's own DPI, so its restore is valid again.
+        assert!(!sniper_restore_is_stale(8, 8));
+
+        // And the COUNTER actually advances when a profile applies — read once, either side, so
+        // this holds regardless of what else the runner is doing in parallel.
+        let before = PROFILE_GEN.load(Ordering::Relaxed);
+        note_profile_applied();
+        let after = PROFILE_GEN.load(Ordering::Relaxed);
+        assert!(
+            after > before,
+            "a profile apply must move the generation ({before} -> {after})"
         );
     }
 
@@ -2162,7 +2283,10 @@ mod tests {
                         (Some("neuron-test-nonexistent-mic".to_string()), false),
                     );
                     ctx.held_keys.borrow_mut().insert(ghost_marker.clone(), vec![0x41]);
-                    ctx.sniper.borrow_mut().insert(ghost_marker.clone(), (800, 0));
+                    ctx.sniper.borrow_mut().insert(
+                        ghost_marker.clone(),
+                        (800, 0, PROFILE_GEN.load(Ordering::Relaxed)),
+                    );
                 }
             }
         }

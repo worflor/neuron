@@ -246,7 +246,12 @@ impl Dialect for RazerDialect {
             std::thread::sleep(Duration::from_millis(10));
             let mut b = [0u8; BUF_LEN];
             b[0] = 0x00; // report id for the GET
-            if t.get_feature(&mut b).is_ok() {
+            // A razer_report reply is a FIXED 91-byte frame: anything shorter is a partial transfer,
+            // not a message. Reading only the count-checked full frame is what stops a truncated
+            // reply from being completed by the caller's zeroed buffer and then verifying (as a
+            // payload of zeros) against a write that never landed. A short read is treated exactly
+            // like silence — keep polling, and time out honestly if nothing whole ever arrives.
+            if t.get_feature(&mut b).is_ok_and(|n| n >= BUF_LEN) {
                 // accept only a reply that echoes our class/id (filters cross-talk)
                 if let Some(status) = reply_status(&b, cmd_class, cmd_id) {
                     match status {
@@ -458,7 +463,9 @@ impl Dialect for RazerAudioDialect {
             std::thread::sleep(Duration::from_millis(10));
             let mut b = [0u8; AUDIO_BUF_LEN];
             b[0] = 0x00; // report id for the GET, same convention RazerDialect::exec uses
-            if t.get_feature(&mut b).is_ok() {
+            // Full-frame rule, same as RazerDialect::exec — the audio envelope is a fixed 64 bytes,
+            // so a short transfer is a partial frame, never a message worth trusting.
+            if t.get_feature(&mut b).is_ok_and(|n| n >= AUDIO_BUF_LEN) {
                 if let Some(status) = reply_status(&b, cmd_class, cmd_id) {
                     match status {
                         Status::Success => return Ok(args_from_audio_buf(&b)),
@@ -646,7 +653,7 @@ mod tests {
             *self.last.lock().unwrap() = Some(b);
             Ok(())
         }
-        fn get_feature(&self, buf: &mut [u8]) -> anyhow::Result<()> {
+        fn get_feature(&self, buf: &mut [u8]) -> anyhow::Result<usize> {
             let req = self.last.lock().unwrap().expect("a command was sent first");
             // Echo class/id (and tx/size) from the recorded request, status SUCCESS.
             let mut rep = Report::command(req[2], req[7], req[8], req[6]);
@@ -654,7 +661,7 @@ mod tests {
             let out = rep.to_buf();
             let n = buf.len().min(BUF_LEN);
             buf[..n].copy_from_slice(&out[..n]);
-            Ok(())
+            Ok(n)
         }
     }
 
@@ -737,7 +744,7 @@ mod tests {
             fn set_feature(&self, _buf: &[u8]) -> anyhow::Result<()> {
                 panic!("HID++ is never in our custody — release must touch the wire NOT AT ALL")
             }
-            fn get_feature(&self, _buf: &mut [u8]) -> anyhow::Result<()> {
+            fn get_feature(&self, _buf: &mut [u8]) -> anyhow::Result<usize> {
                 panic!("HID++ release must read NOTHING")
             }
         }
@@ -934,7 +941,7 @@ mod tests {
                 *self.last.lock().unwrap() = Some(b);
                 Ok(())
             }
-            fn get_feature(&self, buf: &mut [u8]) -> anyhow::Result<()> {
+            fn get_feature(&self, buf: &mut [u8]) -> anyhow::Result<usize> {
                 let req = self.last.lock().unwrap().expect("a command was sent first");
                 let mut rep = [0u8; AUDIO_BUF_LEN];
                 rep[1] = 0x02; // Success
@@ -942,7 +949,7 @@ mod tests {
                 rep[8] = req[8]; // echo id
                 let n = buf.len().min(AUDIO_BUF_LEN);
                 buf[..n].copy_from_slice(&rep[..n]);
-                Ok(())
+                Ok(n)
             }
         }
         let mock = AudioMock { last: Mutex::new(None) };
@@ -990,7 +997,7 @@ mod tests {
             fn set_feature(&self, _buf: &[u8]) -> anyhow::Result<()> {
                 bail!("no device")
             }
-            fn get_feature(&self, _buf: &mut [u8]) -> anyhow::Result<()> {
+            fn get_feature(&self, _buf: &mut [u8]) -> anyhow::Result<usize> {
                 bail!("no device")
             }
         }
@@ -1013,7 +1020,7 @@ mod tests {
                 *self.last.lock().unwrap() = Some(b);
                 Ok(())
             }
-            fn get_feature(&self, buf: &mut [u8]) -> anyhow::Result<()> {
+            fn get_feature(&self, buf: &mut [u8]) -> anyhow::Result<usize> {
                 let req = self.last.lock().unwrap().expect("a command was sent first");
                 let mut rep = [0u8; AUDIO_BUF_LEN];
                 rep[1] = 0x02; // Success
@@ -1023,7 +1030,7 @@ mod tests {
                 rep[10] = self.state; // args[1]: the mute state byte
                 let n = buf.len().min(AUDIO_BUF_LEN);
                 buf[..n].copy_from_slice(&rep[..n]);
-                Ok(())
+                Ok(n)
             }
         }
         let live = MuteMock { last: Mutex::new(None), state: 0 };
@@ -1051,7 +1058,7 @@ mod tests {
             fn set_feature(&self, _buf: &[u8]) -> anyhow::Result<()> {
                 panic!("razer-audio probe must never write to the wire")
             }
-            fn get_feature(&self, _buf: &mut [u8]) -> anyhow::Result<()> {
+            fn get_feature(&self, _buf: &mut [u8]) -> anyhow::Result<usize> {
                 panic!("razer-audio probe must never read the wire")
             }
         }
@@ -1087,7 +1094,7 @@ mod tests {
             fn set_feature(&self, _buf: &[u8]) -> anyhow::Result<()> {
                 panic!("no I/O expected")
             }
-            fn get_feature(&self, _buf: &mut [u8]) -> anyhow::Result<()> {
+            fn get_feature(&self, _buf: &mut [u8]) -> anyhow::Result<usize> {
                 panic!("no I/O expected")
             }
         }
@@ -1166,7 +1173,7 @@ mod tests {
             Ok(())
         }
 
-        fn get_feature(&self, buf: &mut [u8]) -> anyhow::Result<()> {
+        fn get_feature(&self, buf: &mut [u8]) -> anyhow::Result<usize> {
             let (want_class, want_id) = LAST_SENT.with(|c| c.get());
             let (cur_class, cur_id) = {
                 let st = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1181,7 +1188,7 @@ mod tests {
             let out = rep.to_buf();
             let n = buf.len().min(BUF_LEN);
             buf[..n].copy_from_slice(&out[..n]);
-            Ok(())
+            Ok(n)
         }
 
         fn wire_lock(&self) -> Option<Arc<crate::transport::WireLock>> {

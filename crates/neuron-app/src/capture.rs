@@ -66,6 +66,27 @@ pub struct CapturedControl {
 /// it's currently bound to. Set by every `begin*`, cleared on cancel and on the (non-stale) finish.
 pub static CAPTURE_ACTIVE: AtomicBool = AtomicBool::new(false);
 
+/// A capture finished with NO window to deliver it to (the `slint::Weak` no longer upgrades).
+///
+/// The latch still has to come down. [`CAPTURE_ACTIVE`] is read by the live DISPATCHER on its own
+/// thread to suppress dispatch while a key is being bound; every `finish_*` used to bail here
+/// BEFORE clearing it, so a capture that outlived its window left the flag stuck true and the
+/// dispatcher swallowing every input edge — binds dead process-wide with no visible cause and no
+/// way back but a restart. The handler cells are dropped too: they hold a closure over the dead
+/// window and can never run.
+fn end_capture_without_window() {
+    CAPTURE_ACTIVE.store(false, Ordering::Relaxed);
+    RECORDING.store(false, Ordering::Relaxed);
+    // the stop flag belongs to the worker that just finished — drop it with everything else so no
+    // stale cell survives into the next capture.
+    CANCEL.with(|c| *c.borrow_mut() = None);
+    VK_HANDLER.with(|h| *h.borrow_mut() = None);
+    CHORD_HANDLER.with(|h| *h.borrow_mut() = None);
+    CTL_HANDLER.with(|h| *h.borrow_mut() = None);
+    SEQ_HANDLER.with(|h| *h.borrow_mut() = None);
+    CAP_WINDOW.with(|c| *c.borrow_mut() = None);
+}
+
 /// Cancel any in-flight press-to-bind capture (the dialog closed / a new capture started).
 pub fn cancel() {
     CAPTURE_ACTIVE.store(false, Ordering::Relaxed);
@@ -198,6 +219,7 @@ fn finish_chord(gen: u64, code: i32, mods: Vec<&'static str>, name: String) {
     }
     let weak = CAP_WINDOW.with(|c| c.borrow().clone());
     let Some(app) = weak.and_then(|w| w.upgrade()) else {
+        end_capture_without_window();
         return;
     };
     let st = app.global::<State>();
@@ -219,6 +241,7 @@ fn finish_vk(gen: u64, code: i32, name: String) {
     }
     let weak = CAP_WINDOW.with(|c| c.borrow().clone());
     let Some(app) = weak.and_then(|w| w.upgrade()) else {
+        end_capture_without_window();
         return;
     };
     let st = app.global::<State>();
@@ -276,6 +299,7 @@ fn finish_ctl(gen: u64, pkt: Option<(u16, u16, Option<u16>)>) {
     }
     let weak = CAP_WINDOW.with(|c| c.borrow().clone());
     let Some(app) = weak.and_then(|w| w.upgrade()) else {
+        end_capture_without_window();
         return;
     };
     let st = app.global::<State>();
@@ -417,6 +441,7 @@ fn finish_seq(gen: u64, grammar: Option<String>) {
     }
     let weak = CAP_WINDOW.with(|c| c.borrow().clone());
     let Some(app) = weak.and_then(|w| w.upgrade()) else {
+        end_capture_without_window();
         return;
     };
     let st = app.global::<State>();
@@ -545,4 +570,88 @@ fn record_keyseq_until(stop: &AtomicBool) -> Option<String> {
 #[cfg(not(windows))]
 fn record_keyseq_until(_stop: &AtomicBool) -> Option<String> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every capture flow shares one process-global latch, [`CAPTURE_ACTIVE`], which the live
+    /// dispatcher reads to suppress dispatch while a control is being bound. If a capture ever
+    /// ends WITHOUT lowering it, the dispatcher swallows every input edge from then on: no binds
+    /// fire, nothing on screen says why, and only a restart clears it. That is the most severe
+    /// failure this module can produce, and until now the file had no tests at all.
+    ///
+    /// The dead-window path is the one that can reach it: the worker completes after the window
+    /// is gone (close-to-tray hides rather than drops the handle, so this needs a genuinely
+    /// dropped window — process teardown, or any future path that releases it), the `Weak` fails
+    /// to upgrade, and each `finish_*` returned early. Every one of the four now routes through
+    /// `end_capture_without_window`, which is what this pins.
+    #[test]
+    fn a_capture_that_outlives_its_window_never_leaves_the_dispatcher_gated() {
+        // Simulate the state a live capture leaves behind, then the dead-window completion.
+        CAPTURE_ACTIVE.store(true, Ordering::Relaxed);
+        RECORDING.store(true, Ordering::Relaxed);
+        CAP_WINDOW.with(|c| *c.borrow_mut() = None); // a Weak that cannot upgrade
+
+        end_capture_without_window();
+
+        assert!(
+            !CAPTURE_ACTIVE.load(Ordering::Relaxed),
+            "the dispatcher gate MUST come down — a stuck latch kills every binding process-wide"
+        );
+        assert!(
+            !RECORDING.load(Ordering::Relaxed),
+            "the REC/STOP toggle must not wedge in 'recording' either"
+        );
+        VK_HANDLER.with(|h| assert!(h.borrow().is_none(), "handler cells hold closures over the dead window"));
+        CHORD_HANDLER.with(|h| assert!(h.borrow().is_none()));
+        CTL_HANDLER.with(|h| assert!(h.borrow().is_none()));
+        SEQ_HANDLER.with(|h| assert!(h.borrow().is_none()));
+    }
+
+    /// `cancel` is the ESC / dialog-closed path. It must lower the latch and ARM the stop flag,
+    /// but it deliberately does NOT bump the generation: the in-flight worker still owns its
+    /// generation and delivers a `(0, "cancelled")` completion, which the handler interprets as
+    /// "no bind was made". Pinning that here so a future "tidy up" doesn't turn a cancel into a
+    /// silent bind of VK 0.
+    #[test]
+    fn cancel_lowers_the_gate_and_arms_the_stop_flag() {
+        let stop = Arc::new(AtomicBool::new(false));
+        CANCEL.with(|c| *c.borrow_mut() = Some(stop.clone()));
+        CAPTURE_ACTIVE.store(true, Ordering::Relaxed);
+
+        cancel();
+
+        assert!(!CAPTURE_ACTIVE.load(Ordering::Relaxed), "cancel lowers the dispatcher gate");
+        assert!(stop.load(Ordering::Relaxed), "the capture worker is told to stop");
+        CANCEL.with(|c| assert!(c.borrow().is_none(), "the stop cell is cleared for the next capture"));
+    }
+
+    /// A STALE completion (its capture was superseded by a newer one, so the generation moved) is
+    /// inert: it must not lower a gate the NEW capture raised, and must not consume the new
+    /// capture's handler. This is the supersession contract every `finish_*` opens with, and it is
+    /// what keeps "click bind, change your mind, click bind again" from eating the second bind.
+    #[test]
+    fn a_stale_completion_cannot_disturb_the_capture_that_replaced_it() {
+        let stale_gen = GENERATION.with(|g| {
+            let v = g.get() + 1;
+            g.set(v);
+            v
+        });
+        // the NEWER capture bumps the generation and raises the gate
+        GENERATION.with(|g| g.set(g.get() + 1));
+        CAPTURE_ACTIVE.store(true, Ordering::Relaxed);
+        CAP_WINDOW.with(|c| *c.borrow_mut() = None);
+
+        // the older worker lands late — with no window, so it would otherwise take the
+        // dead-window path and clear everything the new capture just set up.
+        finish_vk(stale_gen, 0x41, "A".to_string());
+
+        assert!(
+            CAPTURE_ACTIVE.load(Ordering::Relaxed),
+            "a superseded completion must not lower the live capture's gate"
+        );
+        CAPTURE_ACTIVE.store(false, Ordering::Relaxed); // leave the global clean for other tests
+    }
 }
