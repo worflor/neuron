@@ -948,8 +948,11 @@ export component BindingsPanel inherits VerticalLayout {
             // ════════ ALTITUDE 1 · THE INPUT MAP ════════
             // the model, in one line (the teaching spine, like WEAVE's "one trigger, several rhythms")
             Mono {
-                text: "Two layers of controls. The base is always live; hold your HyperShift key for the second.";
-                color: Theme.text-dim;
+                // one clause, meta weight — the full-sentence version was the most prominent text
+                // on the page while being the least actionable (and the HyperShift bar right below
+                // re-explains the second layer anyway).
+                text: "two layers: base always live · HyperShift while held";
+                color: Theme.text-faint;
                 wrap: word-wrap;
             }
             // ── the HYPERSHIFT BAR — opt-in, WEAVE-lean. A joined hairline-split shell, just like
@@ -1278,7 +1281,9 @@ export component BindingsPanel inherits VerticalLayout {
                     HorizontalLayout {
                         spacing: 8px;
                         SectionTitle { text: "MACRO"; }
-                        VerticalLayout { alignment: center; Mono { text: "a script you bind to a trigger"; color: Theme.text-faint; font-size: Theme.fs-small; } }
+                        // no inline hint: WORKSHOP's own subtitle two rows up already says what these
+                        // are — two overlapping definitions back-to-back read as filler. The book
+                        // button carries the depth.
                         // the book button — opens the macro/Workshop guide popup, anchored here.
                         // Lands after the hint (title, hint, book), mirroring the weave side's GLYPH
                         // row (title, book) — the book always trails any inline label text, never
@@ -1394,8 +1399,10 @@ export component BindingsPanel inherits VerticalLayout {
                             clicked => { State.test-asks(State.macro-name, State.macro-source); }
                         }
                         Button {
-                            // runs it once for real — danger-tinted; SAFE-mode keeps its input harmless
-                            text: "test run";
+                            // runs it once FOR REAL — the label now says so, which is what earns the
+                            // danger tint ("test run" in red read as red-for-no-reason; red is
+                            // reserved for consequences everywhere else). SAFE-mode keeps its input harmless.
+                            text: "run for real";
                             danger: true;
                             busy: State.macro-busy;
                             clicked => { State.macro-test(State.macro-name, State.macro-source); }

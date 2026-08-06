@@ -5,7 +5,7 @@
 # neuron-cli — the thin command-line client. All logic lives in neuron-core; this is a
 # throwaway front-end that wires subcommands to engine calls.
 #
-# FROZEN MANIFEST (Integration agent only).
+# Dependencies are added here deliberately and sparingly: new code should not mean new deps.
 [package]
 name = "neuron-cli"
 description = "Neuron command-line client — the anti-Synapse CLI."
@@ -36,3 +36,9 @@ features = [
     "Win32_Foundation",
     "Win32_UI_Input_KeyboardAndMouse",
 ]
+
+[dev-dependencies]
+# Test builds sever the wire: `mock-transport` compiles neuron-core's transport policy into this
+# crate's test binary, and the ctor hook in the test module denies hardware before any test runs.
+neuron = { path = "../neuron-core", features = ["mock-transport"] }
+ctor = "0.2"

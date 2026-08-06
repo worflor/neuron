@@ -9,7 +9,7 @@
 //! `device.rs` so every existing device's traffic is byte-identical (pinned by the frame goldens
 //! below). Semantics live above (Capability — a HID++ mouse's 0x1000 battery and a Razer mouse's
 //! 0x07/0x80 battery are the SAME `Capability::Battery` to everything above this line); bytes live
-//! here. See docs/DIALECT-RND.md for the wave plan.
+//! here. See docs/TDD.md §5.7 for the dialect design and the wave plan.
 
 use crate::protocol::{reply_status, Report, Status, BUF_LEN};
 use crate::transport::{HidDeviceInfo, Transport};

@@ -50,6 +50,16 @@ use api::SurfaceInfo;
 use arbiter::{Arbiter, SourceId};
 use bus::Bus;
 
+/// Sever the wire for the ENTIRE test binary, before any test runs — neuron-core's deny-by-default
+/// transport policy only covers its own `cfg(test)` build, and this crate's bridge links it as a
+/// plain dependency (see neuron-core/src/transport.rs). Leaked deliberately: the denial is
+/// process-lifetime; a hardware probe opts back in with `transport::allow_real_hardware()`.
+#[cfg(test)]
+#[ctor::ctor]
+fn deny_hardware_for_all_tests() {
+    std::mem::forget(neuron::transport::deny_hardware());
+}
+
 /// The kernel: one struct owning the three state machines plus surface
 /// identity metadata. Thread/actor wiring is the thin [`shell`] — everything
 /// interesting is synchronous and testable right here. Adapters talk to it

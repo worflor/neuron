@@ -23,6 +23,18 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 
+/// Sever the wire for the ENTIRE test binary, before any test runs. neuron-core's deny-by-default
+/// transport policy only covers its OWN `cfg(test)` build — this crate links it as a plain
+/// dependency, so without this hook every test here could reach real hardware (that is how
+/// `profile.rs`'s apply tests once wrote dpi 16000 to the maintainer's Naga; see
+/// neuron-core/src/transport.rs). The guard is leaked deliberately: the denial is process-lifetime,
+/// not scoped. A probe that genuinely needs the wire opts back in, by name, with
+/// `neuron::transport::allow_real_hardware()`.
+#[ctor::ctor]
+fn deny_hardware_for_all_tests() {
+    std::mem::forget(neuron::transport::deny_hardware());
+}
+
 /// The single process-wide cwd/run-root lock. ALL mutating tests across the crate share this so
 /// they run serially relative to one another regardless of which module they live in.
 static CWD_LOCK: Mutex<()> = Mutex::new(());

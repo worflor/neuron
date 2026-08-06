@@ -614,7 +614,7 @@ export component SettingsPanel inherits VerticalLayout {
     }
     PanelHead {
         label: "SYSTEM";
-        caption: "set it up, keep it safe, make it yours · prove it works";
+        caption: "set it up · prove it works";
     }
     Divider {}
     Rectangle { height: Theme.lead-in; }
@@ -708,7 +708,9 @@ export component SettingsPanel inherits VerticalLayout {
                     // an on/off "wait for fullscreen" option that has no control — dropped; the live
                     // registry below is the real surface (a macro's beacon, visible the moment it exists).
                     Mono {
-                        text: "a running macro can pause and ask you yes or no. neuron.ask(\"…\") raises a quiet strip; hold the cast trigger and flick to answer:";
+                        // one clause; the code literal moved out of the prose (the registry rows
+                        // below show the real macros, which is the actual teaching surface).
+                        text: "a macro can pause and ask you something · hold its trigger, flick to answer:";
                         color: Theme.text-dim;
                         wrap: word-wrap;
                     }
@@ -769,7 +771,7 @@ export component SettingsPanel inherits VerticalLayout {
                     SectionTitle { text: "APPEARANCE"; }
                     ColorPicker {
                         label: "INTERFACE";
-                        hint: "the app's accent. everything live, active, or connected lights up in this.";
+                        hint: "the app's accent — anything live lights up in this.";
                         current: Theme.accent;
                         value: State.ui-accent;
                         swatches: Palette.accent;
@@ -949,7 +951,7 @@ export component SettingsPanel inherits VerticalLayout {
                         }
                     }
                     Mono {
-                        text: State.purge-status == "" ? "kills every Razer Synapse process + sets its services to manual so they stop auto-running at boot. Synapse still opens if you want it. asks for admin." : State.purge-status;
+                        text: State.purge-status == "" ? "stops Synapse + demotes its services so they skip boot. it still opens by hand. asks for admin." : State.purge-status;
                         color: State.purge-status == "" ? Theme.text-faint : Theme.text;
                         wrap: word-wrap;
                     }
@@ -999,7 +1001,7 @@ export component SettingsPanel inherits VerticalLayout {
                             spacing: 9px;
                             HorizontalLayout {
                                 spacing: 10px;
-                                VerticalLayout { alignment: center; SubLabel { text: "WHERE"; } }
+                                VerticalLayout { alignment: center; SubLabel { text: "where"; } }
                                 VerticalLayout {
                                     alignment: center;
                                     horizontal-stretch: 0;
@@ -1097,16 +1099,10 @@ export component SettingsPanel inherits VerticalLayout {
                             spacing: 9px;
                             HorizontalLayout {
                                 spacing: 10px;
-                                VerticalLayout { alignment: center; SubLabel { text: "WHEN SEVERAL LAND"; } }
-                                VerticalLayout {
-                                    alignment: center;
-                                    Mono {
-                                        text: State.notif-stack == "latest" ? "newest only"
-                                            : State.notif-stack == "digest" ? "one summary when it's busy"
-                                            : "a tidy column · see each";
-                                        color: Theme.text-mid;
-                                    }
-                                }
+                                VerticalLayout { alignment: center; SubLabel { text: "when several land"; } }
+                                // no echoed value here: the radio rows directly below each carry
+                                // their own caption — the header repeating the selected row's
+                                // caption printed the same words twice, 40px apart.
                                 Rectangle {}
                             }
                             HorizontalLayout {
@@ -1354,7 +1350,8 @@ export component SettingsPanel inherits VerticalLayout {
                             checked: State.phoenix;
                             toggled(v) => { State.set-phoenix(v); }
                         }
-                        Mono { text: "phoenix. Windows relaunches Neuron if it crashes or hangs."; color: Theme.text-faint; }
+                        // no "phoenix." lead — an internal codename floating as a sentence fragment.
+                        Mono { text: "Windows relaunches neuron if it crashes or hangs."; color: Theme.text-faint; }
                     }
                     HorizontalLayout {
                         // the two flight-recorder verbs fuse into one deck; the stretch spacer lets it hug

@@ -9,7 +9,7 @@ one small binary. no account, no cloud, no telemetry. no "please update razer ce
 |---|---|
 | **what** | one tray-resident binary (CLI + GUI) built to replace razer synapse |
 | **platform** | windows today (linux/mac kept behind seams, not yet implemented) |
-| **hardware** | razer mice + keyboards over raw HID; daily-driven on a Naga V2 Pro + BlackWidow Chroma V2, any other `razer_report` device |
+| **hardware** | razer mice + keyboards over raw HID; daily-driven (and hardware-verified) on a Naga V2 Pro + BlackWidow Chroma V2; any other `razer_report` device should adopt itself via auto-synthesis |
 | **install** | build from source: `cargo build --release` |
 | **footprint** | no driver, no account, no runtime, no cloud; your config is plain TOML |
 | **license** | most of Neuron is GPL-3.0-or-later with a linking exception; Engram and the eigenmotion research modules have separate Woflo Labs community-source terms. [the exact split](LICENSE.md) |
@@ -49,7 +49,7 @@ to be clear, i love my razer hardware. this is anti-*synapse*: a multi-process, 
 
 neuron is the opposite design, on purpose:
 
-- **one process, lazily windowed.** tray-resident, single-digit-MB idle. the live remap loop runs *inside* it. there's no second, third, fourth daemon.
+- **one process, lazily windowed.** tray-resident, ~14 MB idle on my machine. the live remap loop runs *inside* it. there's no second, third, fourth daemon.
 - **no cloud, no account.** your config is plain TOML on your disk. you can read it, diff it, and check it into git if you want :P
 - **deterministic.** it changes what you ask and nothing else. no surprise re-enables, no "smart" anything you turned off three separate times. plus you can add custom macros using raw python to LITERALLY do whatever you want. true freedom (be safe)
 - **on-device first.** push settings to the mouse's onboard memory and you can uninstall *everything*. the dream is no software at all. (older hardware has no onboard storage, so we make do.)
@@ -87,7 +87,7 @@ everything in neuron is **one primitive**. *something happened* (a `Trigger`) so
 
 ## talks to your gear
 
-first, the part that makes any of it possible: how neuron reaches a protected device without a driver. razer's vendor control collection answers `HidD_Get/SetFeature`, and those IOCTLs are `FILE_ANY_ACCESS`, so neuron opens the device with `dwDesiredAccess = 0`. windows blocks `GENERIC_READ/WRITE` on a mouse; it doesn't block access-zero feature reports. that one trick is the whole foundation: same bytes as synapse, no kernel anything. it's also why neuron can't get swept into the windows-defender "vulnerable driver" quarantine that bricked OpenRGB, SignalRGB, and FanControl in 2025 (the WinRing0 mess): plain HID feature reports skip the signed-driver circus entirely.
+first, the part that makes any of it possible: how neuron reaches a protected device without a driver. razer's vendor control collection answers `HidD_Get/SetFeature`, and those IOCTLs are `FILE_ANY_ACCESS`, so neuron opens the device with `dwDesiredAccess = 0`. windows blocks `GENERIC_READ/WRITE` on a mouse; it doesn't block access-zero feature reports. that one trick is the whole foundation: same bytes as synapse, no kernel anything. it's also why neuron can't get swept into the windows-defender "vulnerable driver" quarantine that got OpenRGB, SignalRGB, and FanControl flagged in 2025 (the WinRing0 mess): plain HID feature reports skip the signed-driver circus entirely.
 
 ### device control
 
@@ -264,7 +264,7 @@ neuron discover
 
 point it at any `razer_report` device and it pokes the whole command space (finding the right pipe by vendor id and a 91-byte feature report, wherever it lives) then sorts each reply by its *shape*: an enum, a level, an x/y pair, a table, a string. line two devices up and the pattern falls out: a command they both answer is shared protocol, one only a single device answers is that device's own trick. nothing hardcoded.
 
-it's already fingerprinted a keyboard it had no entry for, and `discover --emit` drops a starter TOML for each unknown device into `devices/`. adding a device is writing a file, not writing code.
+it's already fingerprinted a keyboard it had no entry for, and `discover --emit` drops a starter TOML for each unknown device. curated device defs live in the source tree at `crates/neuron-core/devices/`; auto-synthesized ones land in the run root's `devices/auto/` (and a curated file shadows the auto one). adding a device is writing a file, not writing code.
 
 ## the app
 
@@ -293,7 +293,7 @@ cargo test  --workspace    # the suite: runs disarmed, never injects
 cargo clippy --workspace
 ```
 
-the normal `--release` build is tuned for snappy runtime (ThinLTO, stripped). use `--profile release-size` if you want it small, `--profile release-fast` if you want it quick, and `RUSTFLAGS="-C target-cpu=native"` outside the repo for native codegen. panic is `unwind`, not `abort`, on purpose: cleanup still runs when something panics, so the app never leaves your gear in a state you didn't ask for. every panic gets logged.
+the normal `--release` build is tuned for snappy runtime (ThinLTO, stripped). use `--profile release-size` if you want it small, `--profile release-fast` if you want it quick, and `RUSTFLAGS="-C target-cpu=native"` outside the repo for native codegen. we keep cargo's default `unwind` (not `abort`), deliberately (see the comment in `Cargo.toml`): cleanup still runs when something panics, so the app never leaves your gear in a state you didn't ask for. every panic gets logged.
 
 ### the CLI
 
@@ -317,13 +317,13 @@ neuron macro prelude                 the `neuron` module reference (ctx + helper
 
 ```
 device      list · info · battery · dpi · polling · dpi-stages · scroll ·
-            brightness · sniper · storage · mode · backup · verify · watch · probe
+            brightness · sniper · lod · storage · mode · backup · verify · watch · probe
 lighting    effect · run · mirror · keytest · cellsweep · cells
 input       bind · radial · cast · gesture
 macros      macro (list · add · run · check · prelude)
 audio       audio (list · monitor · mic · out)
 profiles    profile (list · show · save · apply · capture · autoswitch)
-migrate     import · import-export · discover [--emit]
+migrate     import · import-export · discover [--emit] · adopt [--dry-run]
 instruments twin (knockback: demo · stats · sigil · stage) · pocket
 gui         neuron-app  [--safe · --tray · --purge-synapse · --scan-synapse]
 ```
@@ -338,7 +338,7 @@ the layout, so you know where things live: `neuron-core` is the headless engine 
 
 ### pieces you can pick up cleanly
 
-- **a new razer device.** run `neuron discover --emit` and it drops a starter TOML in `devices/`, which the registry loads at runtime with no recompile. fill in the command names and matrix dims and you have a device. the limit: a fixed opcode is just data, but a computed payload (a dpi-stage table, a lift-off handshake) or a lighting dialect that isn't the legacy or matrix one needs rust in `writes.rs`. read-back verify guards every write, so a wrong guess fails loud instead of bricking anything.
+- **a new razer device.** run `neuron discover --emit` and it drops a starter TOML into the run root's `devices/auto/`, which the registry loads at runtime with no recompile (move it to `crates/neuron-core/devices/` to make it a curated def). fill in the command names and matrix dims and you have a device. the limit: a fixed opcode is just data, but a computed payload (a dpi-stage table, a lift-off handshake) or a lighting dialect that isn't the legacy or matrix one needs rust in `writes.rs`. read-back verify guards every write, so a wrong guess fails loud instead of bricking anything.
 - **a lighting effect.** one entry in the pattern registry plus the generator (a `field()` that returns brightness per cell). the factory, the tuning knobs, and the gallery tile all derive from that single entry, and a half-registration won't compile. pure math, fully self-contained, a good first PR.
 - **a preset (a look).** pure data: an existing pattern plus a spectrum. paint fire with an ocean gradient and it's a new look with zero code.
 - **a protocol adapter for neuron-host.** a small codec that talks to the internal bus. OpenRGB and Chroma REST already exist; wanted next are things like OBS, MQTT, WLED, MIDI. well-scoped, with a capture-and-replay harness to prove it.
@@ -375,8 +375,8 @@ every device write is sorted by how sure i am of it:
 | dpi-stage table · scroll-stage select | **wire-confirmed** off synapse (USBPcap) + round-tripped |
 | symmetric lift-off distance | **proven**: reads back clean on the Naga |
 | asymmetric lift-off distance (split lift/landing) | **proven**: set/read round-trip on the Naga (the `0x0B/0x85` getter echoes mode=async + the lift/landing pair; the physical split confirmed by feel) |
-| idle/sleep timer | **proven**: set/read round-trip on the naga (write echoes back on the getter) |
-| in-game hi-res polling · scroll *curve* table · snap-tap (SOCD) | **gated** behind `NEURON_*_WRITE` until a capture confirms; payloads unit-tested, still read-back-verified |
+| idle/sleep timer | **proven**: set/read round-trip on the naga (write echoes back on the getter); ships behind the default-on `idle-power-write` feature |
+| in-game hi-res polling · scroll *stage* table · snap-tap (SOCD) | **gated** behind `NEURON_*_WRITE` until a capture confirms; payloads unit-tested, still read-back-verified |
 | debounce · onboard button-remap | **no known opcode**: bails with a "needs RE" note, never a blind write |
 
 things it flat-out doesn't do, so you know before you install:

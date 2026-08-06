@@ -9,8 +9,8 @@
 # KERNEL modules (arbiter/bus/journal/governor/shell/writer) are PURE STD:
 # deterministic state machines, exhaustively unit-tested with injected clocks.
 # Adapters may use the ALREADY-DECLARED workspace deps (serde/serde_json for
-# the Chroma REST JSON bodies) — no NEW workspace dependencies introduced,
-# honoring the workspace manifest's dependency freeze.
+# the Chroma REST JSON bodies) — no NEW workspace dependencies introduced.
+# Deps are added deliberately and sparingly: new code should not mean new deps.
 [package]
 name = "neuron-host"
 version.workspace = true
@@ -68,3 +68,7 @@ proptest = "1"
 static_assertions = "1.1"
 serde_json = "1"
 neuron-testkit = { path = "../neuron-testkit" }
+# Test builds sever the wire: `mock-transport` compiles neuron-core's transport policy into this
+# crate's test binary, and the ctor hook in lib.rs denies hardware before any test runs.
+neuron = { path = "../neuron-core", features = ["mock-transport"] }
+ctor = "0.2"

@@ -219,10 +219,8 @@ component SpectrumEditor inherits VerticalLayout {
             // the book button — opens the SPECTRUM + MOTION guide (what a stop is, the motion kinds)
             VerticalLayout { alignment: center; GuideButton { guide-id: "spectrum"; } }
             Rectangle {}
-            Mono {
-                text: State.light-stops.length + (State.light-stops.length == 1 ? " stop" : " stops");
-                color: Theme.text-faint;
-            }
+            // no stop-count here: "stop N of M" under the strip already carries the total —
+            // the same number twice in 75px, in two grammars, read as unconsidered.
         }
         // the strip: the Rust-rendered gradient of the ACTIVE frame's palette, with stop handles
         // overlaid. ONE touch surface owns every gesture — press grabs the nearest handle (or adds
@@ -545,7 +543,9 @@ export component LightingPanel inherits VerticalLayout {
 
     PanelHead {
         label: "LIGHTING";
-        caption: State.selected-device-name;
+        // no device-name caption: the status strip 36px below already opens with the device name
+        // (plus its LED geometry) — printing it twice in one header block read as generated filler.
+        caption: "paint it · or hand it to your games";
         if State.writes-paused : VerticalLayout { alignment: center; Pill { text: "WRITES PAUSED"; tint: Theme.danger; } }
     }
     Divider {}
@@ -610,7 +610,9 @@ export component LightingPanel inherits VerticalLayout {
                     text: (State.light-foreign-app == "" ? "a visitor" : State.light-foreign-app) + " connected \u{00b7} suppressed \u{00b7} ";
                     color: Theme.text-faint;
                 }
-                if State.compositing && !State.light-foreign : Mono { text: "~ live on device"; color: Theme.accent-dim; }
+                // no "~" prefix: the app's leader glyphs are "›" and "·" — a stray tilde was a
+                // one-off ornament that read as a typo rather than a status.
+                if State.compositing && !State.light-foreign : Mono { text: "\u{25cf} live on device"; color: Theme.accent-dim; }
                 if !State.compositing && !State.light-foreign && !State.light-brush-on && State.light-effect != "" : Mono {
                     text: "preview only"; color: Theme.text-faint;
                 }
@@ -729,7 +731,9 @@ export component LightingPanel inherits VerticalLayout {
                         changed(v) => { State.set-light-fps(v); }
                     }
                     if State.light-fps-legacy : Mono {
-                        text: "legacy board · wire-verified to 30 fps";
+                        // plain words over the invented compound ("wire-verified"): say what was
+                        // done and what it means for the slider.
+                        text: "30 fps is this board's measured limit";
                         color: Theme.text-faint; wrap: word-wrap;
                     }
                 }

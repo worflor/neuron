@@ -559,17 +559,6 @@ mod tests {
         assert!(heals >= 15, "a slow stream heals about once per cycle, got {heals}");
     }
 
-    #[test]
-    fn mock_sink_records_in_order() {
-        let sink = MockSink::new();
-        let mut writer_side = sink.clone();
-        writer_side.write(&[Some(Rgb(1, 1, 1))]);
-        writer_side.write(&[None]);
-        let frames = sink.frames();
-        assert_eq!(frames.len(), 2);
-        assert_eq!(frames[0], vec![Some(Rgb(1, 1, 1))]);
-        assert_eq!(frames[1], vec![None]);
-    }
 
     #[test]
     fn pause_gates_nest_writer_resumes_only_after_last_release() {

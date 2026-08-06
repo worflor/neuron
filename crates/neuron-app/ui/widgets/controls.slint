@@ -727,9 +727,11 @@ export component Readout inherits VerticalLayout {
     }
     Text {
         text: root.value;
-        color: root.value-color;
+        // an unread value ("—") recedes to placeholder weight instead of printing a content-weight
+        // dash — four bold dashes on a selected row read as "broken", not "not read yet"
+        color: root.value == "—" ? Theme.text-faint : root.value-color;
         font-size: Theme.fs-data;
-        font-weight: 600;
+        font-weight: root.value == "—" ? 400 : 600;
         font-family: Theme.mono;
         overflow: elide;   // a long firmware/effect/value string truncates, never overruns its cell
     }

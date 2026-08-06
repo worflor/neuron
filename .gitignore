@@ -53,6 +53,8 @@ neuron-crash.log
 # Local project notes and scratch files. Useful while building Neuron, but not
 # part of the public repository.
 /.local/
+# Internal UX pentest write-up — working notes, not published docs.
+/docs/UX-PENTEST.md
 
 # Local editor/OS noise
 .DS_Store

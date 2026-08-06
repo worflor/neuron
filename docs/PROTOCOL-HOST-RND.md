@@ -3,17 +3,16 @@
 > stale, wrong, or slop — or it may be load-bearing and exactly right.
 > code is the source of truth; verify before you lean on it.
 >
-> **kind:** R&D findings + design (protocol-host) · **as of:** 2026-07-04 · **trust:** mixed — §0–8 (thesis, principles, design) are durable; the later survey/lifecycle sections carry `file:line` refs against a branch snapshot and drift
+> **kind:** R&D findings + design (protocol-host) · **as of:** 2026-07-04 · **trust:** the thesis, principles, and design sections are durable; the integration plan tracks a moving codebase
 
 # Neuron Protocol Host — R&D Findings & Design
 
-> **Status:** R&D, branch `rnd/protocol-host`, worktree `../neuron-rnd`.
+> **Status:** R&D, branch `rnd/protocol-host`.
 > **Purpose:** Durable record of the research + design behind making neuron a *local
 > protocol host* — the hub that speaks every RGB/telemetry/creator/automation
 > protocol, built from first principles in Rust to be the best of all of them.
-> **Read this first if context was lost.** Everything below is distilled from a
-> large multi-agent research pass (Synapse parity + protocol landscape) plus the
-> architecture reasoning that followed.
+> Everything below is distilled from a large research pass (Synapse parity +
+> protocol landscape) plus the architecture reasoning that followed.
 
 ---
 
@@ -36,8 +35,7 @@ another.
 
 ## 1. Guiding principles (the soul — do not violate)
 
-These come from user's standing preferences (see memory: *no-sensory-effect-slop*,
-*curtain-not-a-power-action*, *action-audit-and-fixes*, *verify-by-running*).
+These come from the project's standing preferences.
 
 1. **The software should disappear into the hardware.** If the user uninstalls
    tonight, as little as possible should break. Onboard-first. The app is a
@@ -84,7 +82,7 @@ If a port can't pass these four, it's slop no matter how good the demo looks.
 
 ---
 
-## 3. Synapse parity research (condensed — full sub-reports in session history)
+## 3. Synapse parity research (condensed)
 
 **Sourcing caveat:** reddit.com was firewalled to the research crawler the entire
 time. Evidence is from Razer Insider forums, Tom's Hardware, PC Gamer, TechPowerUp,
@@ -112,8 +110,8 @@ Reddit threads.
 2. **Wireless battery QoL** — Synapse's *most-hated small feature*. What people
    actually want: **accurate tray readout** + **dismissible/threshold low-battery
    warning** (false-low-on-wake is the real hatred). Sleep/threshold sliders
-   themselves are niche/rarely-touched — don't over-invest. (Memory:
-   "vitals 1Hz wakes a sleeping mouse" is the same failure class — fix it.)
+   themselves are niche/rarely-touched — don't over-invest. Our own "vitals 1Hz
+   wakes a sleeping mouse" bug is the same failure class — fix it.
 3. **Audio-reactive lighting (visualizer)** — moderate-loved. **CORRECTION
    (lifecycle map): already exists in-tree** — `neuron-core/src/audio_level.rs`
    (~60Hz peak sampler, lock-free atomic, auto-stops ~2s unread) feeds a readout
@@ -425,11 +423,10 @@ avoid OpenRGB's "device support = graveyard of unresolved GitHub issues" fate.
 
 ## 6. HOST DESIGN R&D — immortal, redundant, simple (math-stack inspired)
 
-> User's ask: "make something truly immortal, redundant, and simple, using our
-> math stack as inspiration. we do wild crazy math here." The math stack is the
-> **AR(2) eigenmotion oscillator** `z[n] = K·z[n-1] − G·z[n-2]` — cascaded
-> macro+micro oscillators + residuals, per `glyph.rs` / `engram` / `.gwyph`
-> (memory: *gwyph-eigenmotion-export*, *audio-tone-system*).
+The goal: make the host truly immortal, redundant, and simple, using our own
+math stack as inspiration. That stack is the **AR(2) eigenmotion oscillator**
+`z[n] = K·z[n-1] − G·z[n-2]` — cascaded macro+micro oscillators + residuals, per
+`glyph.rs` / `engram` / `.gwyph`.
 
 The host is fundamentally an **actor/supervisor** problem. Gold-standard prior art
 is Erlang/OTP: "let it crash" + supervision trees. The move is OTP-grade
@@ -578,380 +575,24 @@ macro engine are just two of its subscribers.
 
 ---
 
-## 8. Working notes / housekeeping
+## 8. Grounded integration plan (map → target topology)
 
-### 8.1 Progress ledger
-- **DONE (this branch):** kernel (arbiter/bus/journal/governor, 26 tests) →
-  (the journal was later deleted, 2026-07-07 — see §6.5: fully built and
-  tested, but never fed by production code, since real content is
-  `Content::Live` and can't be journaled) →
-  `api.rs` HostApi seam (Kernel sync + HostHandle channel impls) → `shell.rs`
-  actor w/ rebirth-from-seed + governor pacing + observable sweep →
-  `writer.rs` single-writer w/ dedup + deadline pacing + MockSink →
-  `adapters/openrgb.rs` full server codec (v0..v5, byte-verified) →
-  `net.rs` TCP pump (loopback-only, disconnect releases footprint,
-  bind-failure = single-instance signal) → capstone tests: in-process full
-  path AND real-TCP-socket round trip. 47 tests green.
-- **DONE:** `adapters/chroma.rs` — Chroma REST server state machine (the
-  delegated agent died mid-flight without writing; built directly instead):
-  sessions with kernel-issued owners, 15s-TTL layers refreshed by effect
-  writes + heartbeats, BGR/COLORREF decode, grid mapping w/ honest crop,
-  CHROMA_NONE / STATIC / CUSTOM / CUSTOM_KEY / CUSTOM2, firmware effect
-  names refused not faked, missing device kinds answered NOT_FOUND, 30s
-  bookkeeping prune. Exact session-URI base + init/heartbeat reply field
-  set marked UNVERIFIED vs live RzSDKServer (safe: we mint what we parse;
-  reply with a superset) — capture/replay against a real Chroma game will
-  true them up. 59 tests green total.
-- **DONE: two adversarial spec audits** (Sonnet, primary sources re-fetched).
-  Verdict: OpenRGB byte layout fully conformant (every field order + version
-  gate MATCHed against RGBController.cpp + openrgb-python walk-through). Real
-  bugs found + FIXED: (1) OpenRGB must ANSWER profile-list(150)/plugin-list
-  (200) with empty lists or openrgb-python's constructor blocks 10s and
-  raises (Home Assistant dies with it); (2) keyboard CHROMA_CUSTOM2 param is
-  an OBJECT {color:8×24, key:6×22} — flat-array-only parsing 400'd every
-  spec-correct modern payload (accept both shapes now); (3) batch
-  {"effects":[...]} bodies supported with results arrays; (4) POST stores +
-  returns id, PUT applies (SDK create/apply split; a preloading game must
-  not flash each created effect — python-chroma-rest-server applies on POST,
-  we deliberately follow the Unity-client contract instead); (5) RZRESULT
-  4319 DEVICE_NOT_AVAILABLE for missing device kinds (was 1168); (6) session
-  prune aligned to the 15s contract (a lapsed session 404s, no resurrection);
-  (7) session ids minted port-plausible (≥54236 — official sessionid doubles
-  as a per-session port in some client flows; future pump can bind them);
-  (8) /chromasdk root accepted without /razer prefix; (9) session-info GET;
-  (10) grid_to_cells bounds-guarded (mis-declared surface degrades, never
-  panics). IMPLEMENTED (2026-07-07, was DEFERRED here): DEVICE_LIST_UPDATED
-  push on hotplug — `OrgbConn::check_hotplug` fingerprints the surface list
-  (name + led count) and the pump's idle tick sends the packet exactly on a
-  change, never on the first tick. DEFERRED (documented): OpenRGB
-  reference-strict data_size validation (we're more
-  lenient, safe), CUSTOM_KEY key-code translation, audit-1's claim that the
-  real server accepts CHROMA_WAVE-style names over REST (audit-2's read of
-  the official docs says only the five custom/static names exist — capture/
-  replay against a live RzSDKServer settles it).
-- **DONE: the neuron-core bridge** (`bridge.rs`, feature `bridge` — kernel
-  stays pure-std by default; `neuron` is an INTERNAL workspace path dep).
-  Registry TOMLs → SurfaceInfo (kind = honest heuristic: DPI ⇒ mouse, ≥4-row
-  matrix ⇒ keyboard — an explicit TOML `kind` field is the right future fix);
-  `HidSink` = the one place bytes reach a device, mirroring Lights::animate's
-  proven step (changed rows → row_report → send_lighting_fast → latch), gated
-  by writes_paused (SAFE-mode parity), row-level dedup, lazy open ON the
-  writer thread with decimated retry (= replug recovery; never herd a
-  sleeping mouse). Writer now takes a SINK FACTORY (the recipe crosses the
-  thread, never the handle — Device is not Send and now structurally never
-  needs to be). Legacy boards honestly clamped to 6fps (they drop writes
-  above it), matrix to 30. Writer loop is panic-walled (a faulting sink costs
-  one frame, never the thread). `examples/host_serve.rs` = run against real
-  hardware + real OpenRGB port. 67 tests green incl. bridge tests over the
-  real embedded device TOMLs.
-- **DONE: the in-game flicker/lag root-cause pass (2026-07-02).** Symptoms:
-  protocol-client lighting flickered; effects went laggy mid-Overwatch, fine
-  on the desktop. Diagnosis (three roots, all below the arbiter — the lease/
-  priority model audited clean): (1) fire-and-forget HID writes drop under
-  load, the sink's row dedup then caches the lie, and the fixed 64-tick heal
-  left torn frames visible ~2s — continuous tear→heal reads as flicker
-  exactly when a client streams; (2) plain `thread::sleep` pacing with no
-  timer-resolution/priority/EcoQoS handling gets coarsened to ~15.6ms and
-  deprioritized when a fullscreen game has focus → the 33ms frame deadline
-  blows, frames skip (wall-clock `t`, so it chops rather than slows);
-  (3) a Chroma game (Overwatch) legitimately painting above BASE looked like
-  "my effect broke" because nothing named the owner. Fixes: writer.rs
-  `HealPolicy` (activity-aware self-heal: full repaint every 12 ticks while
-  frames flow, a two-shot retransmit at +8/+24 ticks when they stop, then
-  FULL quiescence — faster healing AND quieter idle than the old fixed
-  cadence); bridge.rs `writer_thread_qos` (timeBeginPeriod(1) + ABOVE_NORMAL
-  on each writer thread, raw FFI, no new deps); main.rs process-wide
-  PowerThrottling opt-out (EXECUTION_SPEED + IGNORE_TIMER_RESOLUTION
-  ControlMask, StateMask 0 — HighQoS + honored timers under Game Mode);
-  host.rs/glue/lighting.slint: the truth strip now NAMES the painting client
-  (bus-fed — Chroma session title / OpenRGB client name) so an owned board
-  reads as the arbiter working, not a bug.
-- **DONE: OBS both-directions pass (2026-07-02).** The outbound half (macro
-  verbs → typed ObsCmd → authed websocket) already worked; the inbound half
-  was published-but-unconsumed. Now: (1) `adapters/obs.rs` RESYNCS at
-  Identified (GetStreamStatus/GetRecordStatus/GetCurrentProgramScene;
-  RequestResponse mapped into the same normalized events) — events only
-  announce changes, so a mid-stream (re)connect no longer sits on stale
-  defaults; `Step.send` is a Vec. (2) app-side **OBS follower**
-  (neuron-app/host.rs): one thread subscribes `obs.*`, keeps a mirror
-  (`ObsSnapshot`) for GUI + sensing, holds the **on-air tally** — a red
-  full-board layer at OVERRIDE+1000 on a 2s-TTL lease refreshed each 250ms
-  tick (a dead follower/app CANNOT leave boards stuck red; kernel rebirth
-  re-claims via the refresh-fail path), owner labeled "on-air tally" so the
-  truth strip names it; gated by pref `host_obs_tally` (default OFF) via an
-  atomic. (3) **hook macros**: `on_obs_scene` / `on_obs_stream` /
-  `on_obs_record` fire (async, arm-gated inside the sidecar) on state
-  CHANGES — first observation seeds, so the identify resync never fires
-  go-live rituals for an already-running stream. (4) new act verbs:
-  `obs_get(scene|streaming|recording|connected)` senses the mirror;
-  `obs_request(type[, data])` reaches the whole obs-websocket API via
-  ObsCmd::Raw (was built but unreachable). (5) prelude wrappers
-  (runtime/host/neuron.py): obs_scene/stream/record/mute/request +
-  obs_scene_name/streaming/recording/connected. (6) SYSTEM card: the OBS
-  status line now carries what OBS announced ("connected to OBS · scene:
-  Gameplay · LIVE · recording"); on-air tally toggle in the OBS reveal;
-  Workshop guide gained a "Drive OBS, and let OBS drive you" section.
-  (7) **kernel-rebirth resync**: a reborn kernel starts with an EMPTY bus while
-  the websocket to OBS survives — the follower detects the rebirth (its
-  subscription dies), resubscribes, and sends `ObsCmd::Resync`, which
-  republishes the retained `obs.connected` and re-issues the identify-time
-  trio (`ObsClient::resync_requests`, one builder for both paths). The mirror
-  keeps its last-known truth for the round-trip (no fake "disconnected" blip
-  darkening an onair layer) and converges on what OBS re-announces — truth is
-  re-read from the source, never assumed from memory.
-- **DONE: OBS as a first-class Action + client-visibility pass (2026-07-02).**
-  (1) `Action::Obs { op: ObsOp, arg }` (stream / record / record-pause /
-  replay / scene / mute) — routed through the SAME obs_hook seam macros use,
-  arm-gated (an accidental go-live is unrecoverable), honest "OBS not
-  connected" when the host is off. Palette gained a consolidated `obs` entry
-  (first word = op, rest = argument; strict front door rejects a nameless
-  scene), so OBS binds from keys, wedges, and glyphs with no code. The radial
-  wedge reads the LIVE mirror: Active + "LIVE" while streaming, Inert when
-  disconnected. New sink verbs: obs_record "pause" (ToggleRecordPause),
-  obs_replay save/start/stop (the "clip that!" button); prelude obs_replay().
-  (2) Chroma/OpenRGB rows now name their clients: ChromaHttpServer keeps its
-  state-machine Arc and exposes `sessions()` (TTL-honest — a vanished game
-  stops being reported when its lease would lapse); OrgbServer keeps a
-  connection roster (insert on accept, name on SET_CLIENT_NAME, remove on
-  every exit path incl. contained panics). Status cross-references rosters
-  against arbiter claims per surface: painting (topmost claim) vs waiting
-  underneath (present, not top) vs connected-not-painting-yet. The card reads
-  "Overwatch is painting your keyboard + mouse" from the same leased truth
-  the boards obey. 91 host tests.
-- **DONE: the on-air tally became a DATA LAYER (2026-07-02)** — the forced
-  full-board red was Synapse-grade slop (nobody wants their colour profile
-  stomped); it's now the lighting engine's second DATA tile. New pieces:
-  `Blend::Cut` (cutout/sprite blend: black = "nothing to say" falls through,
-  lit cells REPLACE at true colour — readout presets default to it now, fixing
-  the vitals screen-wash too); `lighting::publish_broadcast/Broadcast` (the
-  vitals-feed shape, pushed by the app's OBS follower on every announced
-  change + a disconnected default at teardown, so an onair layer can never
-  hold a stale "live"); the `onair` pattern (registry `readout: true`,
-  `has_spectrum: true` — a SCALAR readout: the user paints the region and the
-  spectrum, gradients span the placement, Motion breathes/cycles; knobs:
-  `signal` stream/record/either + opt-in `standby` placement trace while
-  connected off-air; renders dark on no-feed/disconnect — a tally that might
-  be wrong is worse than none). The old machinery is deleted (pref
-  host_obs_tally, SYSTEM toggle, follower claims at OVERRIDE+1000); the OBS
-  reveal now points at the LIGHTING page. Tile thumbnail shows a
-  representative live look (the real pattern is honestly dark off-air).
-- **DONE (code-complete, tests authored but NOT yet run — another agent held
-  the build): the data-tile family grew to five (2026-07-02).** Following the
-  on-air pattern ("protocol truths land as paintable data layers"), three new
-  readout tiles, all Scalar+Cut+region/spectrum-driven via the shared
-  `placement_field` helper: (1) **Mic Light** (`miclight`) — the system
-  capture endpoint's REAL mute state via the new `mic_state` provider
-  (audio_level's provider discipline: one ~8Hz sampler, idle auto-stop,
-  ~1s endpoint re-resolution to bound the get_mute dead-handle staleness,
-  platform-neutral because audio.rs is already seamed); knob `show` =
-  muted|hot-mic; UNKNOWN renders dark, never a guess. (2) **Mode Held**
-  (`modeheld`) — hold-layer/sniper truth via `lighting::publish_hold`,
-  pushed edge-accurately from dispatch.rs (status tick for layers,
-  sniper_press/release/release_all for sniper, default pushed at loop
-  teardown so the light can't outlive the mode); knob `signal` =
-  hold-layer|sniper|either. (3) **Signal** (`signal`) — four macro-drivable
-  0..=1 channels (`lighting::set_signal`/`signal`, lock-free atomics,
-  clamped, process-state that persists until overwritten); act verb
-  `signal` + prelude `neuron.signal(channel, value)` (ungated, like store);
-  knobs `channel` 1-4 + `style` level|glow (level: value picks the colour
-  along the spectrum — urgency ramp; glow: value is brightness). Registry
-  count 16→19 (test updated); presets + gated-tile thumbnail arm
-  generalized in glue; Workshop guide documents signal(). VERIFY when the
-  build frees: `cargo test -p neuron --lib pattern` + workspace check.
-- **SPEC'D (2026-07-02): the Chroma SHARED-MEMORY server — the second face.**
-  Live experiment (Python port-trap on 54236-54245 + session-table polling +
-  `tasklist /M`) proved native games DON'T speak our REST face: Overwatch loads
-  Razer's `RzChromaSDK64.dll`, which talks to `RzSDKServer.exe` over **Win32
-  named shared memory + events under `Global\{GUID}`** (DLL imports
-  CreateFileMappingW/OpenFileMappingW/MapViewOfFile/CreateEventW/... and NOTHING
-  else — no COM/HTTP/RPC/pipe). The Razer services are registered but STOPPED
-  (Synapse purge), so the DLL dials a dead server → silent no-op. Fix, per user
-  constraint "NO DLLs": **be the shared-memory server** Razer's own DLL already
-  dials (zero DLLs of ours, nothing in the game process, anti-cheat-safe).
-  Static recon captured the ABI (14 exports), the transport, the object
-  namespace (31 `Global\{GUID}` the DLL references + 2 the server creates =
-  `60C824F3…`/`CB3C8DAE…`, the rendezvous pair we must own), the structs
-  (ChromaAppInfo/AppData/SessionInfo/DeviceChromaData), version 3.37, and the
-  registry app-gating. The `chroma_shm` adapter is implemented in
-  `crates/neuron-host/src/adapters/chroma_shm.rs` (elevation: `Global\` needs
-  SeCreateGlobalPrivilege).
-- **DONE: the external paint policy rework (2026-07-07).** `paint.rs` now
-  holds `PaintPolicy`/`PolicyLayer`/`FadeRamp`/`merge_cells`: every external
-  claim (Chroma REST, OpenRGB) rides through a policy-driven layer instead of
-  painting raw, so blend mode, strength, fade, and per-device scope are real
-  settings, not always-opaque `Over`. Fade now runs on the Chroma REST face;
-  in every non-Over merge mode a painted-black cell is treated as transparent
-  (one rule for all merges, so a client's "black" doesn't fight the base).
-  OpenRGB claims are policy-wrapped `Live` content and obey a SECOND policy
-  instance, independent of the Chroma REST lane. The app grew two pref lanes
-  (one policy per protocol family) plus a universal hands-off device list, and
-  a real "my lighting always wins": the base can claim `band::OVERRIDE` to sit
-  above sessions outright. Status surfacing got honest about muted clients and
-  needs-elevation state, refreshes on a bus poke instead of only on a timer,
-  and re-claims by seq when a native game activates. The Lighting page's merge
-  controls moved to a VISITORS section (Settings→CONNECTIONS stayed
-  transport-only). See `crates/neuron-host/src/paint.rs` and
-  `adapters/openrgb.rs::OrgbConn` for the shapes.
-- **⚠ note:** the WIP snapshot needed the gitignored `runtime/` dir copied
-  from the main tree (neuron-core include_str!s the Python host files);
-  remember this for fresh worktrees.
-- **NEXT:** run host_serve against the real Naga/BlackWidow (NOT while the
-  app's own lighting streams run — that's the pre-inversion double-writer
-  case; coordinate or pause the app's streams first) → Chroma HTTP pump
-  (54235) → journal disk format (with its consumer) → OpenRGB client mode →
-  authed control plane → the writer inversion (app becomes a host client).
-- Worktree `../neuron-rnd` on `rnd/protocol-host`. Master is source-of-truth; an
-  agent is finishing WIP there. First commit here = snapshot of that WIP so we
-  build against current reality; expect to rebase/merge when it lands on master.
-- **No co-author trailers, no pushing past local** (user directive, 2026-07-01).
-- Token policy: Fable drives; Sonnet read-only subagents for mapping/exploration;
-  Opus subagents for bulk coding when needed.
-- Relevant memory: *cross-platform-seam-plan* (5 trait seams:
-  LayeredSurface/InputSource/WindowManager/AudioControl/DevicePath — now the
-  readiness scorecard in docs/TDD.md §9; HIGH = dispatch status-mutex poison →
-  §6.1 fixes it), *lighting-engine-plan*,
-  *macro-backend-v2* (`act`/run_act), *refine-pass-backlog* (flagged races).
-- Section 9 below (neuron lifecycle map) is being filled by a read-only agent.
-
-## 9. Neuron runtime lifecycle map (from read-only code survey, 2026-07-01)
-
-> Full agent reports lived in temp task files; this section is the durable
-> distillation. All `file:line` refs are against the snapshot commit on this
-> branch (`snapshot: carry in-flight master WIP`).
-
-### 9.1 Startup (neuron-app/src/main.rs:72-610, exact order)
-cwd-pin to exe dir → prof_log → one-shot CLI exits (--weave-proof /
---purge-synapse / --scan-synapse) → **panic hook** (neuron-crash.log + flight
-dump) → **SEH filter + RegisterApplicationRestart** ("phoenix": Windows relaunches
-`--tray --respawned` after crash/hang, gated on prefs) → OleInitialize(STA) →
-renderer select (femtovg GPU, software fallback) → **build_window (eager, hidden)
-→ glue::install → AppRuntime::load()** (registry/bindings/cast/profiles/rules/
-vault from disk; ends with `restore_lighting()` re-applying saved layer stacks
-through the live compositor stream, then flips LIGHTING_READY) → tray (seeded
-from resident runtime) → arm gate set **before** worker start → **dispatch::
-LiveRuntime::start** → macro-host warm (detached) → notification engine (Note
-channel + confirm sink + forwarder + notifs::run w/ own overlay) → hidwatch →
-macrokeys → curtain painter → beacon::start → show window → **60ms Slint tick**
-(tray/hotkey pump + cadence-gated: status 250ms, reliability 1s, vitals ≤1Hz,
-organ-stall watch via flight heartbeats) → run_event_loop_until_quit. Quit path:
-drop tick timer → `flush_lighting_save()` → drop tray.
-
-**⚠ NO single-instance guard exists.** Two neuron-app.exe instances can run,
-each spawning workers + HID handles. (§10 fixes this *via the host itself*.)
-
-### 9.2 Thread/worker inventory (the load-bearing ones)
-- **`neuron-live-dispatch`** (dispatch.rs:193) — THE input/dispatch engine:
-  Raw-Input pump + WH_KEYBOARD_LL on one thread, HoldEdges → Engine::resolve →
-  DispatchExecutor → TurboRuntime; owns a `DeviceSession`. Fed by
-  `mpsc<LiveCommand>` behind `static LIVE_TX` (Reload/Inject/ToggleHyperShift/
-  ReconcileGamingHook/ApplyProfile). **Immortal listener**: catch_unwind +
-  reopen-after-250ms; ESC never stops it. **The ONLY cleanly-joined worker**
-  (stop atomic + join in Drop). Status posted to UI via invoke_from_event_loop.
-  The status-mutex-poison risk is handled here (all sites use
-  `unwrap_or_else(PoisonError::into_inner)`).
-- **`neuron-beacon-router` / `neuron-weave-presenter`** (beacon.rs:149/225) —
-  drain MacroHost beacon events; presenter is the single cast-trigger owner
-  (beacon asks OR live spellweave), per-cycle catch_unwind, never joined.
-- **`neuron-audio-cache`** (beacon.rs:1280) — 400ms Core-Audio snapshot so
-  dispatch never does COM inline.
-- **notifs engine + confirm→note forwarder** (main.rs:316-333) — single-consumer
-  sinks: `NOTE_SINK` and `confirm::set_sink` are each **OnceLock, one subscriber
-  max** — already occupied by the app's own engine.
-- **hidwatch / macrokeys readers + monitors** — blocking reads per device
-  collection; hotplug = **20s re-enumeration polling** (no WM_DEVICECHANGE).
-  macrokeys injects ControlEvents via `controls::INJECT`
-  (`Mutex<Vec<(u64,Sender)>>` broadcast + 64-deep pre-registration buffer) —
-  **the one existing broadcast-bus pattern in the codebase.**
-- **Lighting anim thread, per-pid, per-apply** (runtime.rs:619-651) — opens its
-  OWN Device, `Compositor::from_defs`, `Lights::animate` at fps from a shared
-  AtomicU32 (live re-pace, clamp 1..30), row-dedup + deadline pacing;
-  stop-token generation guard (`anim_is_current`) against stale completions.
-- **MacroHost** (OnceLock singleton) — CPython sidecar, 3-pipe framed-JSON;
-  `fire_async` is **non-queueing drop-or-warm** (the flagged backpressure gap);
-  crash Breaker (4 crashes/30s → 20s cooldown); `run_act` verb table at
-  macro_host.rs:876 = the `act` protocol responder.
-- **Pull-providers with auto-stop** (neuron-core): `audio_level.rs` (~60Hz,
-  stops ~2s unread), `screen_ambient.rs` (~18Hz, 22×6 grid), `sys_stats.rs`
-  (1Hz) → readout patterns in pattern.rs. **Precedent for bus providers: lazy,
-  self-stopping, lock-free publication.**
-- Flight recorder (flight.rs): 1024-slot static seqlock ring + per-organ
-  heartbeat atomics; UI tick surfaces organ stalls. Not a thread.
-
-### 9.3 Device I/O — one wire funnel, MANY independent writers
-All writes converge on `Device::exec_dynamic_tx` (set_feature → busy-poll
-get_feature, echo-filter on class/id) or `send_lighting_fast` (fire → settle
-sleep → **drain ONE reply, no echo check** ← device.rs:156, the race mechanism)
-— but over **independently-opened handles**. Windows HID opens are
-FILE_SHARE_READ|WRITE, so nothing prevents concurrent handles to one device.
-**Seven concurrent writer domains today:** (1) UI-thread `open_selected()` per
-setter call; (2) live-dispatch `DeviceSession`; (3) per-pid anim threads;
-(4) hidwatch battery one-shots; (5) vitals pump; (6) macro `act` responders;
-(7) any neuron-cli process. Ad-hoc mitigations exist (profile apply stops all
-streams + sleeps 350ms; push_frame stops the stream first;
-`apply_with_session(paint_lighting=false)`) but hidwatch/vitals/act have **no**
-coordination with a live stream. Serialization is per-handle only.
-**→ The host must NOT become writer domain #8. Short-term: route through
-LiveCommand + start_layers. End-state: the kernel's one-writer-per-device
-absorbs all seven (§10).**
-
-### 9.4 Lighting pipeline facts the host must respect
-- `pattern::Compositor::from_defs(&[LayerDef])` → pure `render(rows, cols, t)`;
-  wrong-length pattern outputs are skipped (benign degradation).
-- **Shared render clock**: process-global `render_epoch()` + `quantized_t(elapsed,
-  fps)` used by BOTH the device stream and the GUI preview → "the preview
-  provably matches the board." Protocol-driven frames must join this clock.
-- Row-level dedup vs last-sent frame (static effect ≈ zero HID traffic after
-  first paint — the firmware latches); deadline pacing (`next += dt`, no
-  catch-up bursts). Legacy boards: class 0x03, fixed data_size, tx 0x3F, ~6fps
-  cap; Matrix: class 0x0F, `custom_id=0x08` (0x05 = reactive-flicker bug).
-- Persistence: layer edits debounce 400ms (`LIGHT_SAVE_TIMER`) →
-  `prefs::set_device_light(pid, {fps, layers})`; `restore_lighting` on install;
-  gated by LIGHTING_READY against startup clobber.
-- `vitals` is already a *pattern layer* fed by `lighting::publish_vitals` — the
-  cross-device mirror composes with the ordinary stack, not a side paint path.
-
-### 9.5 Existing attach points (precedents to follow)
-- **Act/execute**: new `LiveCommand` variants; `inject_trigger(Trigger)`
-  (dispatch.rs:83) and `apply_profile` (request/reply mpsc + timeout,
-  dispatch.rs:128) are the exact shape for a server RPC → reuses the worker's
-  serialized DeviceSession/Engine/Turbo. Casts already compose with HyperShift/
-  turbo/SAFE identically to hardware via this path.
-- **Lighting**: call `AppRuntime::start_layers` (accepts Vec<LayerDef> + pid +
-  completion) rather than reimplement streaming.
-- **Registry/capability**: `Registry::load()` is cheap + immutable — servers can
-  hold their own copy read-only.
-- **Safety gates**: `safety.rs` process-global atomics (`input_armed`,
-  `writes_paused`) — read for status; route effectful changes through the live
-  worker to keep tray/UI projections in sync (TDD.md "multiple sources of
-  runtime truth" risk).
-- **Event stream**: NO formal bus. To stream events to protocol clients,
-  broadcast-ify NOTE_SINK/confirm (`Option<Sender>` → `Vec<Sender>`) following
-  the `controls::INJECT` pattern.
-- Teardown reality: only LiveRuntime + macro-host pipes tear down
-  deterministically; everything else is process-lifetime. Lighting is left
-  latched in firmware on exit **by design** (survives without the app — the
-  onboard-first ethos already in action).
-
----
-
-## 10. Grounded integration plan (map → target topology)
-
-### 10.1 The inversion (end-state)
+### 8.1 The inversion (end-state)
 **The GUI becomes client #1 of the host.** The host owns: kernel (arbiter + bus
 + journal) + the single device-writer task per device + the protocol adapters.
 The Slint app, the CLI, and every external client speak the same surface. This
-also *solves the missing single-instance guard for free*: binding the localhost
+also *solves the app's missing single-instance guard for free*: binding the localhost
 port/pipe IS the instance lock — a second launch detects the bind failure and
 becomes a client of the running host instead.
 
-### 10.2 How the kernel wraps (not replaces) today's compositor
+### 8.2 How the kernel wraps (not replaces) today's compositor
 The existing `LayerDef` stack (user's configured lighting) becomes the content
 of ONE pinned arbiter layer at `band::BASE`. Protocol sessions (Chroma game,
 OpenRGB client) claim leased layers above it. The arbiter resolves; the winner's
 frame feeds the existing `Lights::animate` machinery (shared clock, row dedup,
 deadline pacing) — pattern.rs is untouched; the arbiter sits ABOVE it.
 
-### 10.3 Phases
+### 8.3 Phases
 - **Phase 0 (this branch, now):** `crates/neuron-host` — pure-std kernel:
   arbiter (owner/priority/lease/scope, resolve, sweep), bus (retained values +
   prefix subscribe + dead-sub pruning, generalizing controls::INJECT), journal
@@ -974,7 +615,7 @@ deadline pacing) — pattern.rs is untouched; the arbiter sits ABOVE it.
 
 ---
 
-## 11. Wire-format appendix (implementation-day details)
+## 9. Wire-format appendix (implementation-day details)
 
 Extra precision captured during research, for when each adapter is built:
 
@@ -1015,7 +656,3 @@ Extra precision captured during research, for when each adapter is built:
 - **Elite paths**: `%userprofile%\Saved Games\Frontier Developments\Elite
   Dangerous\` — `Status.json` (Flags/Flags2 bitfields, Pips, Fuel, Cargo,
   LegalState, rewritten every few seconds) + append-only ndjson Journal.
-
-*(History note: a background agent left a truncated parallel ledger at
-docs/rnd/PROTOCOLS.md during the research session; its unique details were
-folded in here and the orphan removed — one canonical doc, no drift.)*

@@ -25,12 +25,25 @@ use slint::ComponentHandle;
 /// Try to bring up a backend + window. Returns None if the platform can't (headless CI with no
 /// display / backend), so callers SKIP rather than fail — the smoke test asserts "doesn't panic",
 /// not "a display exists".
+///
+/// The skip must be LOUD and refusable: 29 green GUI tests that silently asserted nothing (the
+/// headless default before this) is indistinguishable from real coverage in a summary line. Every
+/// skip prints, and `NEURON_REQUIRE_GUI=1` (set it in a job that promises GUI coverage) turns the
+/// skip into a failure so a headless environment can't quietly report the tier green.
 fn try_window() -> Option<AppWindow> {
     // `AppWindow::new()` initializes the (winit/software) backend lazily; on a machine with no
     // windowing it returns an Err instead of panicking. Either way we don't crash the suite.
     match std::panic::catch_unwind(AppWindow::new) {
         Ok(Ok(app)) => Some(app),
-        _ => None,
+        _ => {
+            assert!(
+                std::env::var_os("NEURON_REQUIRE_GUI").is_none(),
+                "NEURON_REQUIRE_GUI is set but no windowing backend is available — \
+                 this environment cannot provide the GUI coverage it promises"
+            );
+            eprintln!("skipping: no windowing backend available (GUI test ran zero assertions)");
+            None
+        }
     }
 }
 
@@ -471,6 +484,9 @@ fn press_to_bind_surface_defaults_clean() {
 /// it. Drives the real callbacks (no device, no input).
 #[test]
 fn radial_sector_editor_targets_a_wedge() {
+    // `invoke_set_sector_count` persists cast.toml through the run root — take the process-wide
+    // guard like every other run-root-mutating test, so the write lands in a private temp dir.
+    let _cwd = crate::testsupport::cwd_guard("apptest_sector_editor");
     let Some(app) = try_window() else { return };
     let _shared = glue::install(&app);
     let st = app.global::<State>();

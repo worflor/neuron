@@ -756,7 +756,7 @@ pub fn set_scroll_stages(d: &Device, modes: &[u8], active_idx: u8, store: Store)
         bail!(
             "HyperScroll stage write is gated off (class 0x0B layout not yet hardware-verified). \
              Set NEURON_HYPERSCROLL_WRITE=1 to enable, then verify the round-trip on the Naga \
-             before trusting it. (Integration: promote this to a `hyperscroll-write` Cargo feature.)"
+             before trusting it. (TODO: promote this to a `hyperscroll-write` Cargo feature.)"
         );
     }
     ensure_driver(d);

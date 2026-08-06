@@ -22,7 +22,7 @@ nothing here is a promise or a date. it's the current reality and the direction,
 | audio control (mute / gain / output-flip) | 🟢 solid | rides the OS mixer APIs. |
 | synapse import / purge / device discover | 🟢 solid | import, purge, and discover all work. |
 | notifications / confirmations | 🟢 solid | visual cards plus optional audio, per kind. |
-| device support (capability-driven) | 🟡 works, polishing | you plug a device in and it adopts itself — neuron reads the capabilities off the hardware instead of hardcoding them per model, so the UI only ever shows what your device actually has. every `razer_report` device is covered today; other families are a per-family seam — fill the seam once and the whole family works. honest limit: i only own razer gear, so razer is all *i* can actually test. |
+| device support (capability-driven) | 🟡 works, polishing | you plug a device in and it adopts itself — neuron reads the capabilities off the hardware instead of hardcoding them per model, so the UI only ever shows what your device actually has. any `razer_report` device should adopt itself this way (two are hardware-verified: the Naga V2 Pro and the BlackWidow Chroma V2); other families are a per-family seam — fill the seam once and the whole family works. honest limit: i only own razer gear, so razer is all *i* can actually test. |
 | lighting engine | 🟡 works, polishing | recently rebuilt: pattern × spectrum, positionable data layers, auto-apply. good already. the live work is ironing out every quirk so it behaves exactly as expected, every time. |
 | macros & beacons | 🟡 works, polishing | a warm CPython sidecar, ask/notify, a persistent key-value store, macro-calls-macro, the block builder. next up: proper docs and a cleaner API around the whole thing, plus closing a memory smell in the python bridge. |
 | GUI rendering | 🟡 works, polishing | the main UI is on the GPU now (femtovg, software fallback so it still opens on a VM or bad-driver box). the overlay instruments (weaves, teleport, whiteboard, curtain) are the exception: layered click-through windows composited pixel-by-pixel on the CPU, and that's the part you can still feel. moving those to the GPU is real work, not a switch. |
@@ -34,7 +34,7 @@ nothing here is a promise or a date. it's the current reality and the direction,
 | the CLI (`neuron-cli`) | 🟠 under-tested | a full command-line surface — device control plus a headless daemon run path — running the same engine as the GUI. works in theory, but i've been building neuron more than driving it from the terminal, so expect a few duh-obvious bugs that just haven't been hit yet. |
 | integrations, on your terms | 🟠 early | games and apps can push into your lighting through the neuron-host hub (it speaks Chroma and OpenRGB). the point was never that it speaks them — it's that *you* decide what they're allowed to do to your base, how it blends, and that off stays off for real, unlike the thing this replaces. the pipes work; the control surface and the clean-teardown guarantees are what i'm still hardening. |
 | chroma interpretation & dynamic redraw | ⚪ planned | the next step for integrations: richer ways to *interpret* what a game or app feeds in, and redrawing the board dynamically off that input instead of just passing it through. i know what i want here; none of it is in the code yet. |
-| momentary mic / push-to-talk | 🔴 barely started | the action shape is wired; the behavior isn't near done. treat it as absent. |
+| momentary mic / push-to-talk | 🟠 built, under-tested | wired end-to-end (press holds the mute, release restores it) with teardown guards so a held mic never strands across a config swap, respawn, or exit. light real-world mileage. |
 | cross-platform (linux / mac) | ⚪ planned | windows only today. the seams exist and compile as inert stubs; the backends aren't written. a great place to help, see [contributing](../README.md#contributing). |
 
 ## a bit more on the moving pieces
@@ -45,7 +45,7 @@ nothing here is a promise or a date. it's the current reality and the direction,
 
 **rendering.** the main UI runs on the GPU now (femtovg, with a software fallback so it opens anywhere). the overlay instruments are the holdout: they're layered click-through windows painted pixel-by-pixel on the CPU, and in the overlay-heavy ones you can feel it. moving those to the GPU is real work, not a switch.
 
-**momentary mic.** honest: i've barely touched this. the enum and the dispatch hook exist so the wiring is there, but it is not a finished feature. treat it as absent until this page says otherwise.
+**momentary mic.** wired end-to-end: the dispatch edge loop holds the mute while the trigger is down and restores it on release, with release-all teardown nets on config swap, worker respawn, and exit so a held mic can never get stranded. honest caveat: it's had light real-world mileage, so treat the edges as under-tested rather than absent.
 
 **on-device / onboard.** the dream is pushing everything to the mouse and uninstalling the software entirely. reads and volatile writes are there; the storage-chunk protocol for real onboard profile slots isn't done, so that dream isn't fully real yet.
 

@@ -699,6 +699,9 @@ mod tests {
     #[ignore = "live HID probe — BlackWidow attached, neuron-app stopped; run with --nocapture"]
     fn live_stream_strategy_probe() {
         use std::time::Instant;
+        // Opt IN to the wire by name: under `cfg(test)` the transport policy defaults to Denied,
+        // so without this guard `Device::open` fails and the probe would lie "not connected".
+        let _wire = crate::transport::allow_real_hardware();
         let reg = crate::registry::Registry::load().expect("registry loads");
         let Some(def) = reg.find_by_pid(0x1532, 0x0221) else {
             eprintln!("skip: no BlackWidow def in the registry");

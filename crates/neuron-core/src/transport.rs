@@ -445,8 +445,8 @@ pub fn install_backend(backend: Arc<dyn Backend>) -> BackendGuard {
     set_policy(Policy::Fake(backend))
 }
 
-/// Opt IN to the real wire, for the handful of `#[ignore]`d probes that genuinely need hardware
-/// (`device.rs::live_stream_strategy_probe` and friends). Naming it at the call site is the point:
+/// Opt IN to the real wire, for `#[ignore]`d probes that genuinely need hardware
+/// (`device.rs::live_stream_strategy_probe`). Naming it at the call site is the point:
 /// touching the user's devices from a test should be a deliberate, greppable act.
 #[cfg(any(test, feature = "mock-transport"))]
 pub fn allow_real_hardware() -> BackendGuard {

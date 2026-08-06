@@ -942,6 +942,12 @@ fn live_tick(ctx: &mut LiveCtx) -> Duration {
                     &ctx.weak,
                 );
                 let (p, u) = MIC_TAP;
+                // pid: None — this detector watches the OS default-capture mute, so the DEVICE that
+                // caused the edge is genuinely unknowable here (a hotkey, another app, any mic).
+                // Only pid-less rules match (engine semantics: a rule's `Some(pid)` requires an
+                // exact fired pid). Device-attributed taps come from the HID edge instead —
+                // `hidwatch::fire_mic_tap` fires this same trigger with the true pid — so a rule
+                // pinned to a specific mic still works, via the path that actually knows the device.
                 fire_trigger(
                     &mut ctx.devices.borrow_mut(),
                     &mut ctx.rt.borrow_mut(),
@@ -949,7 +955,7 @@ fn live_tick(ctx: &mut LiveCtx) -> Duration {
                     &Trigger::Input {
                         page: p,
                         usage: u,
-                        pid: Some(0x056a),
+                        pid: None,
                     },
                     &ctx.status,
                     &ctx.weak,

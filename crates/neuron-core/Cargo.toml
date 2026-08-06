@@ -6,8 +6,8 @@
 # gestures/radial/cast, profiles, the unified Trigger->Action spine, the macro engine, device
 # writes, and Synapse migration. UI-agnostic: the CLI and the GUI both `use neuron::*`.
 #
-# FROZEN MANIFEST. Every anticipated dependency is already here so subsystem agents never edit
-# this file. (Integration agent only.)
+# Dependencies are added here deliberately and sparingly: new code should not mean new deps.
+# Every anticipated dependency is already declared.
 [package]
 name = "neuron"
 description = "Open, lightweight control for Razer devices. The anti-Synapse."

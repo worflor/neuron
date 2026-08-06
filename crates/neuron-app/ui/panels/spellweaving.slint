@@ -384,7 +384,10 @@ export component SpellweavingPanel inherits VerticalLayout {
                 }
                 if !State.stroke-saved : Mono { text: State.gesture-status; }
                 Rectangle {}
-                Mono { text: State.glyphs.length + " glyph" + (State.glyphs.length == 1 ? "" : "s"); }
+                Mono {
+                    text: State.glyphs.length == 0 ? "no glyphs yet"
+                        : State.glyphs.length + " glyph" + (State.glyphs.length == 1 ? "" : "s");
+                }
             }
             // vault — each glyph a full-width ROW (name + what it's bound to), a VERTICAL list so it
             // obeys the page's vertical-only scroll (the old horizontal strip hid glyphs off-edge with
@@ -470,13 +473,9 @@ export component SpellweavingPanel inherits VerticalLayout {
                         }
                     }
                 }
-                if State.glyphs.length == 0 : Rectangle {
-                    height: 56px;
-                    VerticalLayout {
-                        alignment: center;
-                        Mono { text: "no glyphs recorded yet · press Record glyph"; color: Theme.text-faint; horizontal-alignment: center; }
-                    }
-                }
+                // (no separate empty-state row: the canvas's own centered prompt already says how to
+                // record, and the status rail says "no glyphs yet" — a third statement of the same
+                // nothing read as generated filler.)
             }
             HorizontalLayout {
                 spacing: 8px;
@@ -485,7 +484,8 @@ export component SpellweavingPanel inherits VerticalLayout {
                 // owns the arm/disarm timer (Theme.confirm-window, the same window the local one used);
                 // confirm-text keeps the dynamic "erase N glyphs?" count.
                 ConfirmButton {
-                    text: "clear vault";
+                    // "vault" appeared nowhere else on the page — name the thing being cleared.
+                    text: "clear glyphs";
                     confirm-text: "erase " + State.glyphs.length + " glyphs?";
                     enabled: State.glyphs.length > 0 && !State.capturing-gesture;
                     confirmed => { State.clear-gestures(); }
@@ -494,7 +494,9 @@ export component SpellweavingPanel inherits VerticalLayout {
                 // SPELL ASSIST — recognition FORGIVENESS, a continuous level (0 = strict, higher = a
                 // near-miss snaps to the closest spell, clear-winner only). Casts show "(assist)" when it
                 // helped. The engine's `assist` margin IS this slider — a bool would throw the dimension out.
-                VerticalLayout { alignment: center; horizontal-stretch: 0; Mono { text: "ASSIST"; color: Theme.text-dim; } }
+                // named for what it does — a bare "ASSIST 35%" floating between panels read as
+                // an aim-assist scare word on a gaming app.
+                VerticalLayout { alignment: center; horizontal-stretch: 0; Mono { text: "ASSIST · near-miss forgiveness"; color: Theme.text-dim; } }
                 VerticalLayout {
                     alignment: center;
                     width: 104px;
@@ -590,7 +592,9 @@ export component SpellweavingPanel inherits VerticalLayout {
                                 padding-left: 13px;
                                 padding-right: State.hyper-radial-on ? 11px : 13px;
                                 Text {
-                                    text: State.hyper-radial-on ? "HyperShift radial: ON" : "HyperShift radial: off";
+                                    // verb when off (it's an invitation to click), state when on —
+                                    // "HyperShift radial: off" read as a status line, not a button.
+                                    text: State.hyper-radial-on ? "HyperShift radial ON" : "add a HyperShift radial";
                                     color: State.hyper-radial-on ? Theme.accent : (hmain.has-hover ? Theme.text : Theme.text-mid);
                                     font-family: Theme.mono; font-size: Theme.fs-small; font-weight: 700;
                                     letter-spacing: Theme.track-3; vertical-alignment: center;

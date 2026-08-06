@@ -40,6 +40,27 @@ use std::rc::Rc;
 /// The "off" colour of an LED cell — what `clear` paints and what an unpainted grid shows.
 const GRID_OFF: slint::Color = slint::Color::from_rgb_u8(0x0c, 0x0d, 0x10);
 
+/// Display floor for LIVE frames: per-channel max against [`GRID_OFF`], so a black pixel renders
+/// as the render's own "off" well instead of a pure-black hole. Without this, an idle reactive
+/// effect (Typing Heat with nobody typing) painted the entire board DARKER than an empty grid —
+/// the page's hero area reading as a failed render. Lit channels are far above the floor, so real
+/// colours pass through untouched; this shifts nothing on the wire (display-only seam).
+fn grid_display(r: u8, g: u8, b: u8) -> slint::Color {
+    slint::Color::from_rgb_u8(r.max(0x0c), g.max(0x0d), b.max(0x10))
+}
+
+/// The inverse seam for anything read BACK off the grid model toward the wire: a pixel at (or
+/// below) the display floor means "off", and off is `0,0,0` on the device — not the well colour.
+/// This also closes a pre-existing leak: `erase` painted [`GRID_OFF`] into the model, so a
+/// committed frame wrote `0c0d10` to erased LEDs — dim-glowing "off" cells on real hardware.
+fn grid_wire(c: slint::Color) -> Rgb {
+    if c.red() <= 0x0c && c.green() <= 0x0d && c.blue() <= 0x10 {
+        Rgb::new(0, 0, 0)
+    } else {
+        Rgb::new(c.red(), c.green(), c.blue())
+    }
+}
+
 /// The app's weak handle, installed ONCE at startup — the reach-back a non-UI subsystem
 /// (`hidwatch`'s hardware-mute bridge, off a reader thread) needs to post onto the UI thread without
 /// being threaded through as a parameter down through `hidwatch`/`decode`/`bridge_mic_mute`.
@@ -1936,7 +1957,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 let frame = comp.render(rows as u8, cols as u8, t);
                 let px: Vec<slint::Color> = frame
                     .iter()
-                    .map(|p| slint::Color::from_rgb_u8(p.r, p.g, p.b))
+                    .map(|p| grid_display(p.r, p.g, p.b))
                     .collect();
                 st.set_grid_px(ModelRc::new(VecModel::from(px)));
             }
@@ -2079,7 +2100,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                                         let mut px: Vec<slint::Color> = cells
                                             .iter()
                                             .take(count)
-                                            .map(|c| slint::Color::from_rgb_u8(c[0], c[1], c[2]))
+                                            .map(|c| grid_display(c[0], c[1], c[2]))
                                             .collect();
                                         while px.len() < count {
                                             px.push(GRID_OFF);
@@ -2815,7 +2836,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                     let model = st.get_grid_px();
                     let mut frame = Vec::with_capacity(model.row_count());
                     for c in model.iter() {
-                        frame.push(Rgb::new(c.red(), c.green(), c.blue()));
+                        frame.push(grid_wire(c));
                     }
                     // the painted frame is a first-class `custom` layer (survives relaunch, rides a captured
                     // profile); committing COLLAPSES the stack to it (a full opaque frame occludes beneath).
@@ -7561,20 +7582,23 @@ fn apply_scanned_devices(app: &AppWindow, sh: &SharedRt, devs: Vec<crate::runtim
         if ledger.is_empty() {
             String::new()
         } else {
+            // Plain words for an inventory fact: these are pipes neuron SEES but doesn't SPEAK.
+            // The old string led with protocol jargon ("no shared protocol") and a per-pipe
+            // feature-length suffix ("(0B)") that read as "this device is transferring zero
+            // bytes" — the scariest-looking line on the page, for the least alarming fact.
             let names: Vec<String> = ledger
                 .iter()
                 .map(|u| {
-                    let name = if u.product.trim().is_empty() {
+                    if u.product.trim().is_empty() {
                         format!("pid {:04x}", u.pid)
                     } else {
                         u.product.trim().to_string()
-                    };
-                    format!("{name} ({}B)", u.feature_len)
+                    }
                 })
                 .collect();
             let noun = if ledger.len() == 1 { "pipe" } else { "pipes" };
             format!(
-                "{} razer vendor {noun} · no shared protocol — {}",
+                "{} more razer {noun} neuron sees but doesn't speak yet: {}",
                 ledger.len(),
                 names.join(" · ")
             )
@@ -8621,6 +8645,58 @@ fn preview_thermal_frame(rows: u8, cols: u8) -> Vec<Rgb> {
     f
 }
 
+/// A representative REACTIVE frame for the tile thumbnail — three key-splashes at different decay
+/// ages on a dark board. Reactive is input-driven and the thumbnail pass sees no input, so the
+/// honest live render is a permanently black square in the catalog (it read as a broken tile, not
+/// a quiet one). Same convention as [`preview_thermal_frame`]: the still shows what the effect IS;
+/// the real input-reactivity plays on the selected big preview + the device stream.
+fn preview_reactive_frame(rows: u8, cols: u8) -> Vec<Rgb> {
+    let sp = preset_layer("reactive").spectrum;
+    let (r, c) = (rows as usize, cols as usize);
+    let mut f = vec![Rgb::BLACK; r * c];
+    // three presses caught mid-fade: a fresh one (tight, bright) through an old one (wide, dim).
+    let splashes = [
+        (r as f32 * 0.55, c as f32 * 0.30, 1.0f32),
+        (r as f32 * 0.35, c as f32 * 0.55, 0.6),
+        (r as f32 * 0.65, c as f32 * 0.78, 0.3),
+    ];
+    for y in 0..r {
+        for x in 0..c {
+            let mut lit = 0.0f32;
+            for (sy, sx, age) in splashes {
+                let d = ((y as f32 - sy).powi(2) + (x as f32 - sx).powi(2)).sqrt();
+                lit = lit.max(age * (1.0 - d / (1.2 + 1.8 * (1.0 - age))).clamp(0.0, 1.0));
+            }
+            if lit > 0.0 {
+                f[y * c + x] = sp.at(0.0, lit);
+            }
+        }
+    }
+    f
+}
+
+/// A representative RIPPLE frame for the tile thumbnail — one ring caught mid-expansion. Same
+/// input-driven-effect problem and same still-frame convention as [`preview_reactive_frame`].
+fn preview_ripple_frame(rows: u8, cols: u8) -> Vec<Rgb> {
+    let sp = preset_layer("ripple").spectrum;
+    let (r, c) = (rows as usize, cols as usize);
+    let mut f = vec![Rgb::BLACK; r * c];
+    let (cy, cx) = ((r as f32 - 1.0) * 0.5, (c as f32 - 1.0) * 0.45);
+    // sized to the board's SHORT axis so the full circle fits — a ring wider than the board
+    // crops into two disconnected bracket shapes and stops reading as a ripple at all.
+    let radius = ((r.min(c) as f32) * 0.55).max(1.5);
+    for y in 0..r {
+        for x in 0..c {
+            let d = ((y as f32 - cy).powi(2) + (x as f32 - cx).powi(2)).sqrt();
+            let lit = (1.0 - (d - radius).abs() / 1.6).clamp(0.0, 1.0);
+            if lit > 0.0 {
+                f[y * c + x] = sp.at(0.0, lit);
+            }
+        }
+    }
+    f
+}
+
 /// A representative VITALS snapshot for the data tile's PREVIEW (a charging mouse at ~64% on stage 2)
 /// — the tile shows what the data surface LOOKS like without polling hardware every tick. The live
 /// applied stream reads the real device.
@@ -8747,6 +8823,10 @@ fn render_light_tiles(app: &AppWindow, sh: &SharedRt, t: f32) {
                 // live key reads, so the thermal field would otherwise sit cold. The still shows what
                 // the effect IS; live typing plays on the selected big preview + the device stream.
                 _ if slug == "typingheat" => preview_thermal_frame(rows, cols),
+                // REACTIVE + RIPPLE: input-driven, so their honest gallery render is permanent
+                // black — representative stills instead, per the typingheat/onair convention.
+                _ if slug == "reactive" => preview_reactive_frame(rows, cols),
+                _ if slug == "ripple" => preview_ripple_frame(rows, cols),
                 // AMBIENT thumbnail: render LIVE (driving the whole-desktop capture) ONLY when ambient
                 // is the selected effect — then the big preview + device stream already run the capture.
                 // Otherwise show a representative still and touch no provider (no ~41ms/grab StretchBlt).

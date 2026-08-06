@@ -1697,7 +1697,7 @@ pub fn preset(surface: Surface) -> Material {
                 max: 4.0,
             };
             knobs[2] = Knob {
-                label: "lick",
+                label: "flicker",
                 layer: 0,
                 kind: KnobKind::Warp,
                 min: 0.0,

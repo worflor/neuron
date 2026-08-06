@@ -3253,6 +3253,10 @@ fn run_listen(reg: &Registry, seconds: Option<u64>, rt: neuron::controls::Runtim
                         &Trigger::MicTap,
                     );
                     let (p, u) = MIC_TAP;
+                    // pid: None — the CLI detector watches the OS default-capture mute, so the
+                    // device behind the edge is unknowable here (same reasoning as the app's
+                    // dispatch poll): only pid-less rules match; device-pinned rules belong to the
+                    // HID-edge path, which knows the true pid.
                     fire_trigger(
                         &mut devices.borrow_mut(),
                         &mut exec.borrow_mut(),
@@ -3260,7 +3264,7 @@ fn run_listen(reg: &Registry, seconds: Option<u64>, rt: neuron::controls::Runtim
                         &Trigger::Input {
                             page: p,
                             usage: u,
-                            pid: Some(0x056a),
+                            pid: None,
                         },
                     );
                 }
@@ -4357,6 +4361,15 @@ fn info(d: &Device) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Sever the wire for the ENTIRE test binary, before any test runs — neuron-core's
+    /// deny-by-default transport policy only covers its own `cfg(test)` build, and this crate links
+    /// it as a plain dependency (see neuron-core/src/transport.rs). Leaked deliberately: the denial
+    /// is process-lifetime; a hardware probe opts back in with `transport::allow_real_hardware()`.
+    #[ctor::ctor]
+    fn deny_hardware_for_all_tests() {
+        std::mem::forget(neuron::transport::deny_hardware());
+    }
 
     // Convenience: parse an argv (with the leading "neuron") into a `Cmd`, panicking on a clap error
     // so the assertions read cleanly. Uses the same derive the real binary uses.

@@ -6,10 +6,10 @@
 #
 # Cargo WORKSPACE. The engine lives in `neuron-core` (a headless, UI-agnostic library);
 # `neuron-cli` is the thin command-line client; `neuron-app` is the resident GUI/tray app
-# (Slint, built out by the GUI agent). One process model — no internal IPC.
+# (Slint). One process model — no internal IPC.
 #
-# FROZEN: this file and every crate Cargo.toml are owned by the Integration agent only.
-# Subsystem agents add code, not dependencies — all anticipated deps are already declared.
+# Dependencies are added here deliberately and sparingly: new code should not mean new deps.
+# Everything anticipated is already declared, so reach for what's here before adding anything.
 [workspace]
 resolver = "2"
 members = [

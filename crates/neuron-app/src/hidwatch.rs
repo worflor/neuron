@@ -166,11 +166,17 @@ pub fn start() {
         "startup-order contract: glue::install_ui must run before hidwatch::start — early mute events would silently drop (main.rs wiring)"
     );
     registry(); // pre-warm (surface a load error early; cache for the hot path)
+    // RAZER-dialect DPI mice only — `arm_new`'s shape path and `decode`'s 04/05 arms both speak the
+    // razer push vocabulary, so membership here must mean "this pid's family is razer", not merely
+    // "this pid has DPI". Without the dialect filter, a future non-razer DPI def (e.g. hidpp) would
+    // arm here and have its reports parsed as razer bytes — a foreign `05 02` misread as a DPI
+    // announce could even trigger a reconcile write. A non-razer family's pipes still arm through
+    // the def/dialect paths, which carry their own vendor gates.
     let mouse_pids: HashSet<u16> = match registry() {
         Some(r) => r
             .devices
             .iter()
-            .filter(|d| d.supports(neuron::registry::Capability::Dpi))
+            .filter(|d| d.dialect == "razer" && d.supports(neuron::registry::Capability::Dpi))
             .flat_map(|d| d.product_ids())
             .collect(),
         None => {
@@ -1401,9 +1407,25 @@ mod tests {
         batch_push_at(NAGA_PID, Push::Scroll(3), t0);
         batch_push_at(NAGA_PID, Push::Plate(4, plate_label(NAGA_PID, 4)), t0);
         settle();
-        let cards: Vec<_> = rx.try_iter().collect();
+        // Judge ONLY the kinds the batch pipeline can emit (Dpi/Scroll/SidePlate). The sink is
+        // process-global and the parallel runner's OTHER modules card through it concurrently —
+        // the dispatch walkers alone produce dozens of Layer cards — and none of that is this
+        // test's claim. BATCH_TEST_LOCK guarantees no other BATCH producer runs, so a card of
+        // these three kinds inside the window could only have come from the pushes above.
+        // (`a_lone_change_outside_any_burst_still_cards` scopes by kind for the same reason.)
+        let cards: Vec<_> = rx
+            .try_iter()
+            .filter(|c| {
+                matches!(
+                    c.kind,
+                    neuron::confirm::Kind::Dpi
+                        | neuron::confirm::Kind::Scroll
+                        | neuron::confirm::Kind::SidePlate
+                )
+            })
+            .collect();
         neuron::confirm::set_sink(None);
-        assert!(cards.is_empty(), "a wake-burst must prime silently, got {} card(s)", cards.len());
+        assert!(cards.is_empty(), "a wake-burst must prime silently, got {cards:?}");
         assert_eq!(neuron::confirm::last_plate(NAGA_PID).as_deref(), Some("6-button"));
     }
 

@@ -273,6 +273,16 @@ component DeviceLine inherits Rectangle {
         : transparent;
     animate background, border-color, opacity { duration: Theme.quick; }
     property <bool> sheen-live: root.d.connected && ta.has-hover;
+    // When firmware is the ONLY readout this device would show, a one-key data strip is an orphan —
+    // a lone two-line "FW / v1.01" block breaking the list's name-plus-meta rhythm. Fold it into the
+    // meta line instead ("pid 0221 · wired · fw v1.01") and suppress the strip.
+    property <bool> lone-fw: !root.d.cap-dpi && !root.d.cap-poll && root.d.battery == ""
+        && !root.d.cap-bright && root.d.storage == ""
+        && !(root.d.cap-plate && root.d.plate != "");
+    // A wireless mouse that hasn't spoken yet shows "—" for every live readout while the FEEL panel
+    // confidently shows its CONFIG values — two halves of one screen disagreeing about whether the
+    // device is connected. The strip earns a one-line explanation instead of four bare dashes.
+    property <bool> asleep: root.d.cap-dpi && root.d.dpi == "—";
     // accent index tick on the selected channel — the only colour; the shared SelectTick is the bar +
     // its settle, and this site supplies its own vertical inset (12px top/bottom).
     SelectTick {
@@ -334,6 +344,8 @@ component DeviceLine inherits Rectangle {
                     SheenText {
                         value: root.d.pid != ""
                             ? "pid " + root.d.pid + (root.d.mode != "" ? " · " + root.d.mode : "")
+                              + (root.lone-fw && root.d.firmware != "" && root.d.firmware != "—"
+                                  ? " · fw " + root.d.firmware : "")
                             : root.d.detail;
                         live: root.sheen-live;
                         ink: Theme.text-faint;
@@ -349,7 +361,7 @@ component DeviceLine inherits Rectangle {
             // Gated on !adopting too: a placeholder has all caps false + empty battery/storage, so
             // only "FW —" would render — a dead readout on a row that isn't a device. Suppress the
             // strip entirely so a placeholder is just its name + mode line.
-            if root.d.pid != "" && !root.d.adopting : Flickable {
+            if root.d.pid != "" && !root.d.adopting && !root.lone-fw : Flickable {
                 height: 30px;
                 interactive: false;
                 // NO viewport-width binding: the content lays out at its natural width and the Flickable
@@ -424,6 +436,17 @@ component DeviceLine inherits Rectangle {
                     // shown only once a plate has actually been reported, so it's never a lie).
                     if root.d.cap-plate && root.d.plate != "" : Readout { key: "PLATE"; value: root.d.plate; }
                     Readout { key: "FW"; value: root.d.firmware; }
+                    // the strip-level explanation for a sleeping wireless device — one quiet clause
+                    // instead of a row of dashes that contradicts the FEEL panel's config values.
+                    if root.asleep : VerticalLayout {
+                        alignment: center;
+                        Text {
+                            text: "asleep · readouts return when it moves";
+                            color: Theme.text-faint;
+                            font-size: Theme.fs-small;
+                            font-family: Theme.mono;
+                        }
+                    }
                     Rectangle {}
                 }
             }
@@ -1360,7 +1383,7 @@ export component DevicePanel inherits VerticalLayout {
                             // CONFIG write (auto-saves on release), NOT part of the global apply.
                             if State.sel-can-dpi : FeelTile {
                                 term: "SNIPER";
-                                readout: State.sniper-button == "—" ? "no button" : "hold " + State.sniper-button;
+                                readout: State.sniper-button == "—" ? "no hold button yet" : "hold " + State.sniper-button;
                                 // a BOUND button is a saved setting, not a live held state — so it reads in
                                 // plain ink (text-mid), never accent. Accent is reserved for genuinely-live
                                 // signals; nothing here observes the hold in real time, so it stays quiet.
@@ -1419,7 +1442,7 @@ export component DevicePanel inherits VerticalLayout {
                                     checked: State.persist-to-onboard;
                                     toggled(v) => { State.persist-to-onboard = v; State.set-persist(v); }
                                 }
-                                Mono { text: "settings ride on the mouse with no app running. matrix mice only."; color: Theme.text-faint; wrap: word-wrap; }
+                                Mono { text: "saved to the mouse — holds with the app closed. needs onboard profiles."; color: Theme.text-faint; wrap: word-wrap; }
                             }
                         }
                     }

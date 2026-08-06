@@ -23,12 +23,14 @@ Every dispatchable input source becomes a `Trigger`; every dispatchable effect b
 
 ## 2. Workspace Shape
 
-The workspace has four crates:
+The workspace has six crates:
 
 - `crates/neuron-core`: hardware protocol, profiles, bindings, trigger/action engine, shared dispatch executor, device session resolver, import, macros, gesture/rhythm/twin logic, and process-wide safety gates.
 - `crates/neuron-app`: Slint desktop app, tray resident runtime, live dispatch worker, UI glue, spellweaving/beacon service, overlays, audio UI, window instruments, diagnostics, and reliability surfaces.
 - `crates/neuron-cli`: command-line device control and daemon-style run path. It is still an important reference implementation for the GUI live dispatcher.
+- `crates/neuron-host`: the protocol-host kernel (ownership arbiter, signal bus, declaration journal, restart governor, host shell) plus the OpenRGB and Chroma protocol adapters other apps drive Neuron through.
 - `crates/engram`: trajectory codec used by the newer rhythm/twin systems.
+- `crates/neuron-testkit`: shared test scaffolding (mock transport, fault injection) for the other crates.
 
 Important non-code state:
 
@@ -360,7 +362,7 @@ Safety invariants:
 
 ### 4.7 Accepted Runtime Tradeoffs
 
-The current code is cleaner than the original Opus-built shape, but these are still deliberate boundaries:
+The current code is cleaner than the original shape, but these are still deliberate boundaries:
 
 - The 60 ms UI timer is still the tray/hotkey pump. Slower UI housekeeping is cadence-gated, not fully event-driven.
 - Foreground app switching still polls the active app on the live worker. A platform event hook would be more elegant on Windows, with polling as fallback for cross-platform backends.
@@ -720,7 +722,7 @@ The *core* is ready; the *driver and surfaces* are welded. Every welded/seam row
 
 ### Risk: Docs Drift
 
-`docs/KNOCKBACK.md` is now a feature implementation/design plan, not the source of truth for the app architecture. The README is product narrative plus user-facing architecture, but it is too broad to serve as implementation TDD.
+Feature-level design notes are implementation plans, not the source of truth for the app architecture. The README is product narrative plus user-facing architecture, but it is too broad to serve as implementation TDD.
 
 Mitigation:
 
@@ -768,4 +770,3 @@ Neuron is ready to replace Synapse for daily use when these checks are true on t
 ## 11. Related Docs
 
 - `README.md`: product narrative, user-facing feature map, commands, and honesty/status.
-- `docs/KNOCKBACK.md`: feature design and implementation plan for the rhythm familiar.

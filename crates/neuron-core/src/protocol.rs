@@ -105,7 +105,7 @@ pub fn crc(buf: &[u8; BUF_LEN]) -> u8 {
 
 /// Read one reply frame's status IF it echoes the awaited command — the shared echo filter
 /// (b[7]==class && b[8]==id → Status from b[1]) that device/discover/synth exec loops each
-/// hand-rolled. One frame vocabulary; the loops keep their own PACING (see DIALECT-RND.md:
+/// hand-rolled. One frame vocabulary; the loops keep their own PACING (see docs/TDD.md §5.7:
 /// cadence differences are deliberate calibration behavior, not accidents). `None` means the
 /// buffer is not (yet) our reply — cross-talk from another command, so keep polling.
 ///
