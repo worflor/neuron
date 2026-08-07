@@ -136,6 +136,9 @@ const ENTER_MS: f32 = 170.0;
 const LEAVE_MS: f32 = 150.0;
 /// Coalesce-bump length (the scale pulse + value flash on the card that updated).
 const BUMP_MS: f32 = 120.0;
+/// What fraction of [`LEAVE_MS`] the FADE gets. The collapse still runs the full window (it owns
+/// closing the column gap); the card is visually gone by ~60% of it, so nobody watches the squash.
+const LEAVE_FADE_FRAC: f32 = 0.6;
 /// Reflow spring constant — fraction of the remaining gap closed per ~16ms tick (≈150ms settle).
 /// Crisp, not bouncy: a simple exponential approach, no overshoot.
 const REFLOW_K: f32 = 0.32;
@@ -548,7 +551,16 @@ fn present(slots: &[Slot], mode: StackMode) -> (Vec<NotifySlot>, DigestView, u32
             Phase::Hold => 1.0,
             Phase::Leave => {
                 let t = now.duration_since(s.phase_since).as_millis() as f32 / LEAVE_MS;
-                1.0 - ease_out(t)
+                // The card fades on a SHORTER clock than it collapses (see `LEAVE_FADE_FRAC`), so
+                // the height-collapse — whose job is closing the column gap, not being watched —
+                // happens on an already-invisible card. Previously fade and collapse ran the same
+                // curve, so at mid-exit the card was still ~25% visible while 75% squashed: the
+                // content visibly compressed inside a shrinking box, which is what made the exit
+                // read as parts moving separately rather than one card leaving.
+                // clamped here rather than relying on a downstream clamp: this is the value the
+                // engine PUBLISHES, and an alpha that reads negative past the fade window would be
+                // a lie in every consumer that isn't the renderer (tests, telemetry, a future sink).
+                (1.0 - ease_out(t / LEAVE_FADE_FRAC)).max(0.0)
             }
         }
     };

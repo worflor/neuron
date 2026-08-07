@@ -3084,7 +3084,8 @@ mod imp {
     /// colour is the live material accent.
     fn draw_tail_pill(buf: &mut Buffers, cx: f32, cy: f32, frame: u32, accent: (f32, f32, f32), n: u32) {
         let breath = 0.82 + 0.18 * ((frame as f32) * 0.05).sin();
-        card_frame(buf, cx, cy, STACK_HALF - 1.0, STACK_TAIL_H * 0.5, 9.0, accent, breath, false);
+        // the tail pill has no per-slot fade of its own (it appears with the stack it summarises).
+        card_frame(buf, cx, cy, STACK_HALF - 1.0, STACK_TAIL_H * 0.5, 9.0, accent, breath, false, 1.0);
         // SAFETY: same GDI text rasterization the render thread does everywhere; we're on that thread.
         if let Some(t) = unsafe { rasterize_text(&format!("+{n} more"), 13) } {
             let bx = cx; // centred in the pill
@@ -3132,7 +3133,7 @@ mod imp {
         // CHROME — the same crafted frame, its half-extents nudged out by the bump pop and its tab
         // breath lifted by the slot alpha so an entering card's tab fades up with it.
         let grow = pop * 6.0; // px the frame swells at the bump's peak
-        card_frame(buf, cx, cy, half - 1.0 + grow, ry + grow, 12.0, accent, breath * a, c.panel);
+        card_frame(buf, cx, cy, half - 1.0 + grow, ry + grow, 12.0, accent, breath, c.panel, a);
         // the accent border itself also fades with alpha: re-tint a quiet wash so a fading card dims
         // its hairline too (card_frame's border is at full accent; layer a small dimming isn't easy,
         // so we accept the chrome at full and fade the CONTENT — the dominant visual — by alpha).
@@ -3152,7 +3153,7 @@ mod imp {
         // the glyph chip — at the spec's `chip_cy`, anchored to the HEADLINE cluster (not the box
         // centre), so it keeps the same relationship to the title/value on every card shape.
         let chip_y = top + lay.chip_cy;
-        chip_box(buf, chip_cx, chip_y, crate::notifs::CHIP_HALF, 7.0, accent);
+        chip_box(buf, chip_cx, chip_y, crate::notifs::CHIP_HALF, 7.0, accent, a);
         draw_wedge_glyph(buf, c.glyph, chip_cx, chip_y, crate::notifs::CHIP_GLYPH_R, Tone::Plain, frame, 0.92 * a);
         // ── THE ASK SLOT — same chrome + Ask glyph chip as above, but the ask LAYOUT (a prompt, not
         // a value-hierarchy): the QUESTION prominent and the answer GRAMMAR on its OWN legible row,
@@ -3270,7 +3271,7 @@ mod imp {
         let cx = STACK_AX;
         let cy = if top_corner { anchor + ry } else { anchor - ry };
         let half = STACK_HALF;
-        card_frame(buf, cx, cy, half - 1.0, ry, 12.0, accent, breath * a, true);
+        card_frame(buf, cx, cy, half - 1.0, ry, 12.0, accent, breath, true, a);
         // the COUNT — a large accent numeral on the left, sitting in the SAME icon column a stack
         // card's chip occupies (shared `CHIP_DX`), so collapsing Stack→Digest doesn't shift the left edge.
         let count_cx = cx - half + crate::notifs::CHIP_DX;
@@ -3290,7 +3291,7 @@ mod imp {
         for (i, g) in d.glyphs.iter().enumerate() {
             let gx = row_x0 + i as f32 * step * rv;
             let ga = a * rv;
-            chip_box(buf, gx, row_y, 11.0, 4.0, accent);
+            chip_box(buf, gx, row_y, 11.0, 4.0, accent, ga);
             draw_wedge_glyph(buf, *g, gx, row_y, 8.0, Tone::Plain, frame, 0.9 * ga);
         }
         // the LATEST LINE — the most recent note's title + value, under the glyph row (revealing).
@@ -3319,6 +3320,14 @@ mod imp {
     /// darker and squarer; the floating card is lighter and softer-cornered, but both share the same
     /// defined geometry. `accent` (the live material accent) is the whole chrome colour — border, tab,
     /// and fill tint; `breath` (0..1) gently lifts the tab.
+    ///
+    /// `alpha` fades the WHOLE frame — fill, border and tab together.
+    ///
+    /// It used to fade only the tab (via `breath`), leaving the panel fill and the accent hairline
+    /// at full strength for the entire enter/exit animation. The visible result: the box snapped in
+    /// at full opacity while its text faded up behind it, and on the way out the text vanished while
+    /// an empty solid card sat there collapsing — the card read as several parts moving
+    /// independently instead of one object.
     #[allow(clippy::too_many_arguments)]
     fn card_frame(
         buf: &mut Buffers,
@@ -3330,7 +3339,9 @@ mod imp {
         accent: (f32, f32, f32),
         breath: f32,
         panel: bool,
+        alpha: f32,
     ) {
+        let alpha = alpha.clamp(0.0, 1.0);
         let (rx, ry) = (rx.max(2.0), ry.max(2.0));
         let r = radius.min(rx).min(ry);
         let pad = 2.0;
@@ -3338,9 +3349,10 @@ mod imp {
         let x1 = ((cx + rx + pad).ceil() as i32).min(W - 1);
         let y0 = ((cy - ry - pad).floor() as i32).max(0);
         let y1 = ((cy + ry + pad).ceil() as i32).min(H - 1);
-        // grounded panel sits darker (a real card over a game); floating a little lighter.
-        let fill_k = if panel { 0.88 } else { 0.62 };
-        let edge_k = if panel { 0.50 } else { 0.42 };
+        // grounded panel sits darker (a real card over a game); floating a little lighter. BOTH ride
+        // the slot alpha so the card enters and leaves as one object.
+        let fill_k = (if panel { 0.88 } else { 0.62 }) * alpha;
+        let edge_k = (if panel { 0.50 } else { 0.42 }) * alpha;
         // the accent TAB lives just inside the left edge: a thin rounded bar, ~55% of the body height.
         let tab_h = ry * 0.55;
         let tab_x = cx - rx + 4.0; // its centre x, a hair in from the rim
@@ -3373,7 +3385,7 @@ mod imp {
                 let td = (tdx.max(0.0).powi(2) + tdy.max(0.0).powi(2)).sqrt() - 1.0;
                 let tabv = (0.6 - td).clamp(0.0, 1.0);
                 if tabv > 0.001 {
-                    let tb = tabv * (0.55 + 0.30 * breath);
+                    let tb = tabv * (0.55 + 0.30 * breath) * alpha;
                     buf.pr[i] += tb * accent.0;
                     buf.pg[i] += tb * accent.1;
                     buf.pb[i] += tb * accent.2;
@@ -3386,7 +3398,19 @@ mod imp {
     /// rounded square with a faint accent-tinted dark fill and a clean accent hairline border, centred
     /// at (cx, cy). A designed home for the mark (no glow halo); the icon is drawn crisp on top by the
     /// caller. `half` is its half-size, `radius` the corner round, `accent` the live material accent.
-    fn chip_box(buf: &mut Buffers, cx: f32, cy: f32, half: f32, radius: f32, accent: (f32, f32, f32)) {
+    ///
+    /// `alpha` fades the chip with its slot. Without it the chip drew at full strength while the
+    /// glyph inside it faded by alpha — a solid badge with a ghost inside, mid-animation.
+    fn chip_box(
+        buf: &mut Buffers,
+        cx: f32,
+        cy: f32,
+        half: f32,
+        radius: f32,
+        accent: (f32, f32, f32),
+        alpha: f32,
+    ) {
+        let alpha = alpha.clamp(0.0, 1.0);
         let half = half.max(2.0);
         let r = radius.min(half);
         let pad = 2.0;
@@ -3402,7 +3426,7 @@ mod imp {
                 let d = (dx * dx + dy * dy).sqrt() - r;
                 let i = row + xx as usize;
                 // fill: a touch darker than the card so the chip reads as inset; an accent whisper in it.
-                let fillv = (0.5 - d).clamp(0.0, 1.0);
+                let fillv = (0.5 - d).clamp(0.0, 1.0) * alpha;
                 if fillv > 0.001 {
                     buf.shade[i] += 0.32 * fillv;
                     buf.pr[i] += fillv * accent.0 * 0.06;
@@ -3410,7 +3434,7 @@ mod imp {
                     buf.pb[i] += fillv * accent.2 * 0.06;
                 }
                 // border: a clean accent hairline.
-                let edge = (1.0 - (d + 0.9).abs()).clamp(0.0, 1.0);
+                let edge = (1.0 - (d + 0.9).abs()).clamp(0.0, 1.0) * alpha;
                 if edge > 0.001 {
                     buf.pr[i] += edge * accent.0 * 0.55;
                     buf.pg[i] += edge * accent.1 * 0.55;
