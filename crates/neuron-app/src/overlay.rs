@@ -422,6 +422,37 @@ pub use imp::SpellOverlay;
 #[cfg(not(windows))]
 pub use stub::SpellOverlay;
 
+// ── the notification PROOF TAP's public face (see `imp::proof`) ────────────────────────────────
+// Thin wrappers rather than a re-export so the non-Windows build gets honest no-ops and the harness
+// compiles everywhere.
+
+/// Record every composed overlay frame into `dir`, cropped to `(x, y, w, h)` in buffer space and
+/// magnified `scale`× (nearest-neighbour) so small type is judgeable.
+pub fn proof_arm(dir: &str, crop: (i32, i32, i32, i32), scale: u32) {
+    #[cfg(windows)]
+    imp::proof::arm(dir, crop, scale);
+    #[cfg(not(windows))]
+    let _ = (dir, crop, scale);
+}
+
+/// Stop recording.
+pub fn proof_disarm() {
+    #[cfg(windows)]
+    imp::proof::disarm();
+}
+
+/// Frames written since the last `proof_arm`.
+pub fn proof_frames() -> u32 {
+    #[cfg(windows)]
+    {
+        imp::proof::frames()
+    }
+    #[cfg(not(windows))]
+    {
+        0
+    }
+}
+
 #[cfg(not(windows))]
 mod stub {
     use super::{DigestView, GlyphHint, NotifySlot, WeaveMode};
@@ -461,7 +492,7 @@ mod imp {
         CreateCompatibleDC, CreateDIBSection, CreateFontW, DeleteDC, DeleteObject,
         GetMonitorInfoW, GetTextExtentPoint32W, MonitorFromPoint, SelectObject,
         SetBkMode, SetTextColor, TextOutW, BITMAPINFO, BITMAPINFOHEADER,
-        BI_RGB, CLEARTYPE_QUALITY, DEFAULT_CHARSET, DIB_RGB_COLORS, FW_NORMAL,
+        ANTIALIASED_QUALITY, BI_RGB, DEFAULT_CHARSET, DIB_RGB_COLORS, FW_NORMAL,
         HBITMAP, MONITORINFO, MONITOR_DEFAULTTONEAREST, TRANSPARENT,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -482,6 +513,111 @@ mod imp {
     const H: i32 = 1600;
     const CX: f32 = (W / 2) as f32;
     const CY: f32 = (H / 2) as f32;
+
+    /// THE PROOF TAP — a frame recorder wired into the real render loop.
+    ///
+    /// A notification's enter (~170ms) and leave (~150ms) are far too short to judge by taking
+    /// screenshots, and the overlay is a click-through layered window, so the ordinary window-capture
+    /// harness can't even see it (`WindowFromPoint` skips `WS_EX_TRANSPARENT`, so it reports the
+    /// window behind). The alternative — a proof that draws cards into its own buffer and composites
+    /// them itself — would be judging a REIMPLEMENTATION of the look, and would silently drift from
+    /// what ships.
+    ///
+    /// So the tap sits at the one place that is unambiguously ground truth: immediately after the
+    /// compositor fills the DIB and immediately before `present` hands those exact pixels to
+    /// Windows. Disarmed, it is a single relaxed atomic load per frame.
+    pub(super) mod proof {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        use std::sync::Mutex;
+
+        static ARMED: AtomicBool = AtomicBool::new(false);
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        static DIR: Mutex<String> = Mutex::new(String::new());
+        /// Crop written to disk, in BUFFER coordinates: (x, y, w, h). The buffer is 1600×1600 and a
+        /// card occupies a corner of it, so dumping it whole would bury the subject in transparency.
+        static CROP: Mutex<(i32, i32, i32, i32)> = Mutex::new((0, 0, super::W, super::H));
+        /// Integer nearest-neighbour magnification of the written PNG. Judging 11px type at 1:1 is
+        /// impossible — the strip is smaller than the defect. NEAREST (not smooth) on purpose: it
+        /// magnifies the pixels as they are rather than inventing intermediate ones.
+        static SCALE: AtomicU32 = AtomicU32::new(1);
+
+        /// Start recording every composed frame into `dir` as `frame_XXXX.png`, cropped to
+        /// `crop` = (x, y, w, h) in buffer space.
+        pub fn arm(dir: &str, crop: (i32, i32, i32, i32), scale: u32) {
+            let _ = std::fs::create_dir_all(dir);
+            *DIR.lock().unwrap_or_else(|e| e.into_inner()) = dir.to_string();
+            *CROP.lock().unwrap_or_else(|e| e.into_inner()) = crop;
+            SCALE.store(scale.clamp(1, 12), Ordering::Relaxed);
+            SEQ.store(0, Ordering::Relaxed);
+            ARMED.store(true, Ordering::Release);
+        }
+
+        /// How many frames have been written since [`arm`].
+        pub fn frames() -> u32 {
+            SEQ.load(Ordering::Relaxed)
+        }
+
+        pub fn disarm() {
+            ARMED.store(false, Ordering::Release);
+        }
+
+        /// Write one composed frame. `bits` is the live DIB: `W*H` premultiplied BGRA `u32`s,
+        /// top-down — the exact memory `UpdateLayeredWindow` is about to read.
+        ///
+        /// PNG encoding happens synchronously ON the render thread, which deliberately stalls it —
+        /// the harness must record EVERY composed frame in order, and handing them to a worker would
+        /// let encoding fall behind and drop exactly the fast enter/exit frames it exists to capture.
+        /// Frame pacing under the tap is therefore not representative; timing is judged from the
+        /// engine's own constants, and the tap only ever runs in `--notif-proof`.
+        ///
+        /// # Safety
+        /// Called only from the render thread, between the composite and the present, where `bits`
+        /// is valid for `W*H` reads and nothing else touches it.
+        pub fn capture_frame(bits: *mut u32, origin_x: i32, origin_y: i32) {
+            if !ARMED.load(Ordering::Acquire) {
+                return;
+            }
+            let (cx, cy, cw, ch) = *CROP.lock().unwrap_or_else(|e| e.into_inner());
+            let (cw, ch) = (cw.max(1), ch.max(1));
+            let k = SCALE.load(Ordering::Relaxed).max(1) as i32;
+            let mut img = image::RgbaImage::new((cw * k) as u32, (ch * k) as u32);
+            for y in 0..ch {
+                let sy = (cy + y).clamp(0, super::H - 1);
+                for x in 0..cw {
+                    let sx = (cx + x).clamp(0, super::W - 1);
+                    // SAFETY: sx/sy are clamped into the buffer; see the fn's safety note.
+                    let v = unsafe { *bits.add((sy * super::W + sx) as usize) };
+                    // mask every channel: `v as u32` would keep the WHOLE word, so red would carry
+                    // the alpha byte and saturate the card to white.
+                    let a = (v >> 24) & 0xff;
+                    let (b, g, r) = (v & 0xff, (v >> 8) & 0xff, (v >> 16) & 0xff);
+                    // COMPOSITE over a dark backdrop rather than emitting straight alpha. The DIB is
+                    // premultiplied, which is exactly `src + dst*(1-a)` — so this is the real
+                    // blend Windows performs, against a stand-in for the dark desktop/game the
+                    // surface is designed over. Emitting the alpha channel instead made every frame
+                    // unjudgeable: a viewer mattes transparency to flat grey, so a card at 30%
+                    // opacity and one at 90% looked nearly identical, which defeats the point of
+                    // recording a fade. Opaque output = what the eye actually gets.
+                    const BG: u32 = 0x1A; // ~#1a1a1e, a dark desktop
+                    let inv = 255 - a;
+                    let over = |c: u32| -> u8 { (c + BG * inv / 255).min(255) as u8 };
+                    let px = image::Rgba([over(r), over(g), over(b), 255]);
+                    for dy in 0..k {
+                        for dx in 0..k {
+                            img.put_pixel((x * k + dx) as u32, (y * k + dy) as u32, px);
+                        }
+                    }
+                }
+            }
+            let n = SEQ.fetch_add(1, Ordering::Relaxed);
+            let dir = DIR.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let path = std::path::Path::new(&dir).join(format!("frame_{n:04}.png"));
+            let _ = img.save(&path);
+            if n == 0 {
+                eprintln!("[notif-proof] recording to {dir} (window origin {origin_x},{origin_y})");
+            }
+        }
+    }
     // INVARIANT (enforced below): every cursor-anchored weave (the ask wheel, the radial, the dial,
     // …) draws around buffer (CX, CY) and `place_window` centres the window on the cursor as
     // `cur - W/2`, so the anchor lands exactly under the cursor only while CX == W/2. Keep them equal.
@@ -1024,7 +1160,14 @@ mod imp {
             DEFAULT_CHARSET as u32,
             0,
             0,
-            CLEARTYPE_QUALITY as u32,
+            // GRAYSCALE AA, deliberately not ClearType. The mask this builds is a MONOCHROME
+            // coverage value (one float per pixel, later multiplied by the accent colour), and the
+            // extraction below reads a single channel. ClearType's channels are per-SUBPIXEL
+            // coverage, not glyph coverage, so reading one of them weights each stem by whichever
+            // subpixel it happened to land on — at 11px the prev-row type came out visibly uneven,
+            // some strokes bright and some nearly gone. Grayscale AA puts true coverage in every
+            // channel, which is exactly what a one-channel read wants.
+            ANTIALIASED_QUALITY as u32,
             0,
             face.as_ptr(),
         );
@@ -1067,7 +1210,7 @@ mod imp {
         TextOutW(dc, 0, 0, wide.as_ptr(), wide.len() as i32);
         let mut mask = vec![0.0f32; n];
         for (i, m) in mask.iter_mut().enumerate() {
-            // any channel works (white text); green channel as the intensity.
+            // white text on black + grayscale AA ⇒ R=G=B=coverage, so one channel IS the mask.
             *m = ((*px_buf.add(i) >> 8) & 0xFF) as f32 / 255.0;
         }
         SelectObject(dc, old_bmp);
@@ -2797,6 +2940,12 @@ mod imp {
                         y: origin.y,
                     };
                     let size = SIZE { cx: W, cy: H };
+                    // PROOF TAP — off by default (one relaxed load per frame). When armed, every
+                    // frame the compositor just finished is written to disk EXACTLY as it will be
+                    // presented: same buffers, same material pipeline, same alpha. A proof that
+                    // re-implemented the composite would drift from the shipping look, which is the
+                    // one thing a visual harness must never do.
+                    proof::capture_frame(surf.bits(), origin.x, origin.y);
                     surf.present(Some(pos), size, 255);
                     // STAY on top: a topmost window still loses the z-race when the taskbar, a game,
                     // or another topmost re-asserts. Re-flip to the front of the band a few times a
@@ -3242,11 +3391,22 @@ mod imp {
                 (accent.0 * a, accent.1 * a, accent.2 * a),
             );
         }
-        // prev — tiny + dim, trailing under the value/track.
+        // prev — tiny + dim, trailing under the value/track. Drawn in the ACCENT channels like every
+        // other label on the card, NOT into `glow`.
+        //
+        // `glow` is the phosphor EMISSION channel: the material pipeline takes its gradient and runs
+        // the facet/prism dispersion on it, which is the spellweaving ink aesthetic. This row was the
+        // one piece of card text going through it, and 11px type is the highest-frequency content on
+        // the surface — so it produced the maximum possible gradient and came out as magenta/yellow
+        // rainbow noise instead of a quiet line of text. (Caught at 4× in the proof harness; at 1:1
+        // it just read as "the small text looks a bit off".) The whole card is UI chrome; only the
+        // weave surfaces are ink.
         if let Some(t) = &c.prev {
             let py = top + lay.prev_cy;
             let bx = tx + t.w as f32 / 2.0;
-            blit_mask(&mut buf.glow, t, bx, py, 0.40 * a);
+            blit_mask(&mut buf.pr, t, bx, py, 0.40 * accent.0 * a);
+            blit_mask(&mut buf.pg, t, bx, py, 0.40 * accent.1 * a);
+            blit_mask(&mut buf.pb, t, bx, py, 0.40 * accent.2 * a);
             blit_mask(&mut buf.white, t, bx, py, 0.05 * a);
         }
     }

@@ -100,6 +100,15 @@ fn main() {
         return;
     }
 
+    // SELF-TEST HARNESS: `neuron-app --notif-proof` drives the REAL notification engine + overlay
+    // and dumps every composed frame to `<run-root>/_notif_proof/`, then exits. The entry/exit
+    // animations are ~10 frames each and the surface is a click-through layered window, so this is
+    // the only way to actually LOOK at them. No GUI/tray.
+    if std::env::args().any(|a| a == "--notif-proof") {
+        notifs::write_proof_frames();
+        return;
+    }
+
     // SYNAPSE PURGE (elevated arm): the settings button relaunches us with `runas` + this flag when
     // it isn't already admin — Razer's services run as SYSTEM. This instance stops every Razer
     // service (so they can't respawn helpers) then terminates every Synapse process, then exits. No

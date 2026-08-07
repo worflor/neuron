@@ -37,6 +37,7 @@ use std::time::{Duration, Instant};
 ///     it lives until a matching `ClearAsk` removes it. Identified by `ask:{pid}` so a re-post
 ///     coalesces and `clear_ask` can find it.
 ///   * `ClearAsk` — the beacon answered / passed / timed out / retired the ask: drop its card.
+#[derive(Clone)]
 pub enum Note {
     Confirm(Confirmation),
     Ask {
@@ -506,10 +507,16 @@ fn reflow(slots: &mut [Slot], mode: StackMode) {
     }
     for (s, &t) in slots.iter_mut().zip(targets.iter()) {
         if !s.seeded {
-            // SEED a fresh card a touch BEFORE its slot (nearer the corner edge) so the spring pulls
-            // it inward — a crisp slide-IN that rides alongside the overlay's fade-up. The offset is
-            // toward the corner (smaller y), so the column gently nudges as the newcomer arrives.
-            s.cur_y = (t - ENTRY_SLIDE_PX).max(0.0 - ENTRY_SLIDE_PX);
+            // SEED a fresh card a touch PAST its slot — further from the corner — so the spring
+            // pulls it back toward the edge: a crisp slide-in riding the fade-up.
+            //
+            // The offset is AWAY from the corner deliberately. Seeding it toward the corner (the
+            // original `t - ENTRY_SLIDE_PX`) put the first frames of a top-anchored card ABOVE the
+            // buffer's top edge, so the card appeared with its rounded corners sheared flat against
+            // the screen edge and then slid down into shape — visible in the very first frames the
+            // proof harness recorded. `cur_y` is distance FROM the corner, so `+` is always further
+            // into the screen and can never clip, at any of the nine placements.
+            s.cur_y = t + ENTRY_SLIDE_PX;
             s.seeded = true;
         } else {
             s.cur_y += (t - s.cur_y) * REFLOW_K; // crisp exponential approach
@@ -1378,4 +1385,113 @@ mod tests {
         assert!(crit_floor >= low_floor, "critical is at least as hard as low");
         assert!(crit.len() >= low.len(), "critical is at least as insistent as low");
     }
+}
+
+// ─────────────────────────────── THE NOTIFICATION PROOF HARNESS ───────────────────────────────
+
+/// `neuron-app --notif-proof` — record the notification surface as it ACTUALLY renders.
+///
+/// Why this exists: a card's entry is ~170ms and its exit ~150ms. That is 10 frames each — far too
+/// fast to judge by taking screenshots, and the surface is a click-through layered window, so the
+/// ordinary window-capture harness cannot even see it (`WindowFromPoint` skips `WS_EX_TRANSPARENT`
+/// and reports the window behind). Judging the animation by eye therefore meant guessing, which is
+/// how three separate fade desyncs survived in the renderer for as long as they did.
+///
+/// What makes it a real harness rather than a mock: it drives the SHIPPING engine loop ([`run`]) with
+/// real [`Note`]s, and the frames are dumped by a tap sitting between the compositor and `present` —
+/// the exact pixels Windows receives. Nothing about the look is re-implemented here, so the proof
+/// cannot drift from the product.
+///
+/// Frames land in `<run-root>/_notif_proof/`, numbered in render order.
+pub fn write_proof_frames() {
+    use neuron::confirm::{Confirmation, Kind, Shape};
+
+    let root = neuron::runroot::run_root();
+    let dir = root.join("_notif_proof");
+    let _ = std::fs::remove_dir_all(&dir); // a fresh run, not a pile of stale frames
+    // The column is anchored at STACK_AX (~162) from the buffer's left edge and grows down from
+    // y=6, so this crop holds a full stack of cards with a margin of transparency around them.
+    // `NEURON_PROOF_CROP=x,y,w,h` narrows it — a tight crop on one card is how you judge the
+    // small type and the chip's hairline, which are invisible at column scale.
+    let crop = std::env::var("NEURON_PROOF_CROP")
+        .ok()
+        .and_then(|s| {
+            let v: Vec<i32> = s.split(',').filter_map(|p| p.trim().parse().ok()).collect();
+            (v.len() == 4).then(|| (v[0], v[1], v[2], v[3]))
+        })
+        .unwrap_or((0, 0, 380, 620));
+    // `NEURON_PROOF_SCALE=4` magnifies the dump — 11px type at 1:1 is smaller than its own defect.
+    let scale = std::env::var("NEURON_PROOF_SCALE")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(1);
+    crate::overlay::proof_arm(&dir.to_string_lossy(), crop, scale);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let engine = std::thread::spawn(move || run(rx));
+
+    // A deterministic script through the REAL constructors — one card of each shape the surface
+    // has to lay out, then a coalesce onto a live card (the bump), then the stack drains. Timed so
+    // each stage is separated by more than the entry animation, so the frames are readable.
+    let card = |kind: Kind, shape: Shape, title: &str, ident: &str, prev: Option<&str>| {
+        Note::Confirm(Confirmation {
+            kind,
+            shape,
+            title: title.into(),
+            ident: ident.into(),
+            prev: prev.map(str::to_string),
+        })
+    };
+    let ranged = |v: f32, unit: &'static str| Shape::Ranged {
+        value: v as f64,
+        min: 100.0,
+        max: 30_000.0,
+        unit,
+    };
+
+    let script: &[(u64, Note)] = &[
+        // t=0: a single card enters alone — the cleanest read of the ENTER animation.
+        (0, card(Kind::Dpi, ranged(1600.0, "DPI"), "DPI", "proof:dpi", Some("800"))),
+        // +700ms: a second card joins — the column reflow (the first card slides to make room).
+        (
+            700,
+            card(
+                Kind::Polling,
+                ranged(1000.0, "Hz"),
+                "Polling",
+                "proof:poll",
+                Some("500"),
+            ),
+        ),
+        // +500ms: a discrete card (no track) — a different layout through the same chrome.
+        (
+            500,
+            Note::Confirm(Confirmation {
+                kind: Kind::Profile,
+                shape: Shape::Discrete { label: "fps".into() },
+                title: "Profile".into(),
+                ident: "proof:profile".into(),
+                prev: Some("desk".into()),
+            }),
+        ),
+        // +500ms: RE-post the first ident — a coalesce, which plays the bump on the live card.
+        (
+            500,
+            card(Kind::Dpi, ranged(3200.0, "DPI"), "DPI", "proof:dpi", Some("1600")),
+        ),
+    ];
+
+    for (delay_ms, note) in script {
+        std::thread::sleep(std::time::Duration::from_millis(*delay_ms));
+        let _ = tx.send(note.clone());
+    }
+    // Hold past the last card's dwell so the LEAVE animation and the column's close-up are recorded
+    // too — the exit is half the thing being judged.
+    std::thread::sleep(std::time::Duration::from_secs(6));
+
+    crate::overlay::proof_disarm();
+    let n = crate::overlay::proof_frames();
+    drop(tx); // closing the channel ends `run`, which ends the engine thread
+    let _ = engine.join();
+    eprintln!("[notif-proof] {n} frames -> {}", dir.display());
 }
