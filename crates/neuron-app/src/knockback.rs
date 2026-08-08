@@ -37,17 +37,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static STOP: AtomicBool = AtomicBool::new(false);
-/// The drum key the live session armed (0 = none). The weave service stands down ONLY this
-/// key while the duet plays — every other slot keeps weaving.
-static OWNED_VK: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+/// The drum control the live session armed (`None` = none). The weave service stands down ONLY
+/// this control while the duet plays — every other slot keeps weaving.
+static OWNED: std::sync::Mutex<Option<neuron::controls::ControlRef>> = std::sync::Mutex::new(None);
 
-/// The drum key the live session owns (0 = no session). See [`owned_vk`].
-pub fn owned_vk() -> i32 {
-    let v = OWNED_VK.load(Ordering::SeqCst);
-    // self-heal: a session that died/stalled without clearing OWNED_VK would dark its drum key
+/// The drum control the live session owns (`None` = no session).
+pub fn owned_ctl() -> Option<neuron::controls::ControlRef> {
+    let v = *OWNED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    // self-heal: a session that died/stalled without clearing OWNED would dark its drum key
     // forever; if its organ has gone silent past the cap, the claim is stale → report unowned.
-    if v != 0 && crate::flight::organ_stalled(crate::flight::organ::KNOCKBACK) {
-        0
+    if v.is_some() && crate::flight::organ_stalled(crate::flight::organ::KNOCKBACK) {
+        None
     } else {
         v
     }
@@ -78,7 +78,7 @@ pub fn toggle(weak: &slint::Weak<AppWindow>) {
             || {
                 crate::teleport::click_guard::disarm();
                 crate::flight::pulse_clear(crate::flight::organ::KNOCKBACK);
-                OWNED_VK.store(0, Ordering::SeqCst);
+                *OWNED.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
                 ACTIVE.store(false, Ordering::SeqCst);
             },
             move || {
@@ -220,7 +220,7 @@ mod imp {
         let mut fam = load_or_new();
         let cast = neuron::cast::CastConfig::load();
         let trigger = cast.trigger;
-        let trigger_name = neuron::capture::vk_name(trigger);
+        let trigger_name = trigger.label();
         let mut detector = OnsetDetector::new(DetectorConfig::default());
         let mut builder = MotifBuilder::new(MotifConfig {
             phrase_gap_ms: PHRASE_GAP_MS,
@@ -232,10 +232,13 @@ mod imp {
         // the game underneath. A swallowed event never updates GetAsyncKeyState, so the drum is
         // read from the guard's own edge tracker; keyboard triggers aren't swallowed (that
         // would eat typing) and read via GetAsyncKeyState as normal.
-        super::OWNED_VK.store(trigger, Ordering::SeqCst);
-        let guarded = matches!(trigger, 0x01 | 0x02 | 0x04 | 0x05 | 0x06);
-        if guarded {
-            crate::teleport::click_guard::arm_button(trigger);
+        *super::OWNED.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(trigger);
+        // Only MOUSE buttons ride the click-guard swallow (a keyboard trigger's swallow — when
+        // pid-scoped — is the intercept shim's job, and its holds are read device-aware below).
+        let guard_vk = trigger.is_mouse_button().then(|| trigger.vk_hint()).flatten();
+        let guarded = guard_vk.is_some();
+        if let Some(vk) = guard_vk {
+            crate::teleport::click_guard::arm_button(vk);
         }
 
         super::post_status(
@@ -272,7 +275,11 @@ mod imp {
         let mut esc_was = false;
         let mut last_sent = Instant::now() - std::time::Duration::from_secs(1);
 
-        crate::flight::trace("knockback", "session enter", trigger as u64);
+        crate::flight::trace(
+            "knockback",
+            "session enter",
+            ((trigger.page as u64) << 16) | trigger.usage as u64,
+        );
         loop {
             if super::STOP.load(Ordering::SeqCst) {
                 break;
@@ -302,8 +309,8 @@ mod imp {
             // knocks build heavy constructs and rolls build light ones. The guarded mouse
             // button reads from the hook's edge tracker (swallowed events are invisible to
             // GetAsyncKeyState); both reads compose safely.
-            let pressed =
-                key_down(trigger) || (guarded && crate::teleport::click_guard::swallowed_down());
+            let pressed = neuron::glyph::control_down(trigger)
+                || (guarded && crate::teleport::click_guard::swallowed_down());
             if pressed && !down {
                 down = true;
                 let energy = match phrase_start {

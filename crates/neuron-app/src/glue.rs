@@ -1494,7 +1494,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
     mic::refresh_output(app);
     st.set_brush_color(rgb_to_color(brush(app)));
     // the cast hold-trigger label comes from cast.toml — never a hardcoded button name.
-    st.set_cast_trigger_label(neuron::capture::vk_name(shared.borrow().rt.cast.trigger).into());
+    st.set_cast_trigger_label(shared.borrow().rt.cast.trigger.label().into());
     // the activation rhythm + HyperShift stance come from persisted config too.
     sync_activation_view(&st, &shared.borrow().rt.cast.activation);
     {
@@ -2877,9 +2877,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 // cast.toml feeds the wheel + trigger label too — one reload, one world.
                 refresh_radial(&app, &sh);
                 let st = app.global::<State>();
-                st.set_cast_trigger_label(
-                    neuron::capture::vk_name(sh.borrow().rt.cast.trigger).into(),
-                );
+                st.set_cast_trigger_label(sh.borrow().rt.cast.trigger.label().into());
                 sync_activation_view(&st, &sh.borrow().rt.cast.activation);
                 st.set_editing_sector(-1); // drop any in-flight wedge edit targeting the old config
                 // …and any OPEN inline rule editor: a reload rebuilds the rules model from disk and
@@ -5425,7 +5423,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                             break true;
                         }
                         let now = t0.elapsed().as_millis() as u64;
-                        let d = neuron::glyph::key_down(trigger);
+                        let d = neuron::glyph::control_down(trigger);
                         if d && !down {
                             presses.push((now, None));
                             down = true;
@@ -5559,26 +5557,37 @@ pub fn install(app: &AppWindow) -> SharedRt {
     });
 
     // ── cast trigger press-to-bind (the hold button) ──────────────────────
+    // A CONTROL capture (page/usage/pid), not a VK capture: the cast trigger is a device bind in
+    // the same identity namespace as every rule, so pressing a Naga side-plate key here binds
+    // THAT device's key (and the intercept shim then keeps its keystroke out of the desktop) —
+    // while the same '1' on the real keyboard stays an ordinary '1'. This was the last persisted
+    // bind still living in the VK side-pipeline.
     bind(app, &shared, |app, sh| {
         let w = app.as_weak();
         let sh = sh.clone();
         app.global::<State>().on_capture_cast_trigger(move || {
             if let Some(app) = w.upgrade() {
                 let sh2 = sh.clone();
-                crate::capture::begin(&app, false, move |app, vk, name| {
+                crate::capture::begin_control(&app, move |app, captured| {
                     let st = app.global::<State>();
-                    if vk == 0 {
+                    let Some(c) = captured else {
                         st.set_status_line("cast trigger capture cancelled".into());
                         return;
-                    }
+                    };
+                    let ctl = neuron::controls::ControlRef {
+                        page: c.page,
+                        usage: c.usage,
+                        pid: c.pid,
+                    };
+                    let name = ctl.label();
                     // the trigger applies live regardless; a failed disk write must SAY so, not report ok.
                     let err = {
                         let mut s = sh2.borrow_mut();
-                        s.rt.cast.trigger = vk;
+                        s.rt.cast.trigger = ctl;
                         crate::editor::save_cast(&s.rt.cast).err()
                     };
                     crate::dispatch::request_reload();
-                    st.set_cast_trigger_label(name.into());
+                    st.set_cast_trigger_label(name.clone().into());
                     match err {
                         Some(e) => st.set_status_line(format!("cast trigger save failed: {e}").into()),
                         None => st.set_status_line(format!("cast trigger -> {name}").into()),
@@ -9264,7 +9273,7 @@ static CAPTURE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// CANCEL: the capture polls [`CANCEL_CAPTURE`] every tick (same path as ESC), so the record button
 /// can stop an in-flight (or wedged) stroke by setting it — see [`record_gesture`]'s toggle.
 fn weave_capture(
-    trigger: i32,
+    trigger: neuron::controls::ControlRef,
     phrase: &neuron::feel::Phrase,
     feel: &neuron::feel::FeelConfig,
     mode: crate::overlay::WeaveMode,
@@ -9531,7 +9540,7 @@ fn record_gesture(app: &AppWindow, sh: &SharedRt) {
 /// per-sample timestamps. Same overlay + cancel wiring, so drawing feels identical to recording.
 #[allow(clippy::too_many_arguments)]
 fn weave_capture_stamped(
-    trigger: i32,
+    trigger: neuron::controls::ControlRef,
     phrase: &neuron::feel::Phrase,
     feel: &neuron::feel::FeelConfig,
     mode: crate::overlay::WeaveMode,

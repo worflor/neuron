@@ -437,7 +437,7 @@ fn session_loop(weak: &slint::Weak<AppWindow>) {
     let vk = slots
         .iter()
         .find(|s| s.action == neuron::action::Action::Whiteboard)
-        .map(|s| s.vk)
+        .map(|s| s.ctl)
         .unwrap_or(cast.trigger);
     let feel = neuron::feel::FeelConfig::load();
     let gen = crate::dispatch::reload_generation();
@@ -535,7 +535,7 @@ fn session_loop(weak: &slint::Weak<AppWindow>) {
             }
             taps = 0;
         }
-        if neuron::glyph::key_down(vk) {
+        if neuron::glyph::control_down(vk) {
             let pressed = std::time::Instant::now();
             let start = cursor_pos();
             loop {
@@ -545,7 +545,7 @@ fn session_loop(weak: &slint::Weak<AppWindow>) {
                 let now = cursor_pos();
                 let moved = (now.0 - start.0).pow(2) + (now.1 - start.1).pow(2) >= 9;
                 let held = pressed.elapsed().as_millis() as u64 >= feel.hold_ms;
-                if !neuron::glyph::key_down(vk) {
+                if !neuron::glyph::control_down(vk) {
                     // TAP-AND-HOLD IN PLACE = REDO (the mirror of tap = undo): a single press
                     // held past the hold beat, never moved, then released. Consumed here so it
                     // never matures into an undo tap. (Silent, like the undo tap.) In LASER mode
@@ -623,7 +623,7 @@ fn session_loop(weak: &slint::Weak<AppWindow>) {
 fn draw_stroke(
     weak: &slint::Weak<AppWindow>,
     tx: &Sender<Cmd>,
-    vk: i32,
+    vk: neuron::controls::ControlRef,
     cancel: &(impl Fn() -> bool + ?Sized),
     start: (i32, i32),
     pen: &Pen,
@@ -642,7 +642,7 @@ fn draw_stroke(
     // lags a flick. Tuned to read like a gentle ~4% tablet smoothing — felt, not seen.
     let mut sx = start.0 as f64;
     let mut sy = start.1 as f64;
-    while neuron::glyph::key_down(vk) && !cancel() {
+    while neuron::glyph::control_down(vk) && !cancel() {
         let p = cursor_pos();
         let dx = p.0 as f64 - sx;
         let dy = p.1 as f64 - sy;
@@ -696,7 +696,7 @@ fn draw_stroke(
 #[cfg(windows)]
 fn laser_trail(
     tx: &Sender<Cmd>,
-    vk: i32,
+    vk: neuron::controls::ControlRef,
     cancel: &(impl Fn() -> bool + ?Sized),
     start: (i32, i32),
     pen: &Pen,
@@ -715,7 +715,7 @@ fn laser_trail(
     // ribbon, not a string of dots. Slow moves settle most (where tremor lives); flicks ride near-raw.
     let mut sx = start.0 as f64;
     let mut sy = start.1 as f64;
-    while neuron::glyph::key_down(vk) && !cancel() {
+    while neuron::glyph::control_down(vk) && !cancel() {
         let p = cursor_pos();
         let dx = p.0 as f64 - sx;
         let dy = p.1 as f64 - sy;
@@ -740,7 +740,7 @@ fn laser_trail(
 fn ping_wheel(
     weak: &slint::Weak<AppWindow>,
     tx: &Sender<Cmd>,
-    vk: i32,
+    vk: neuron::controls::ControlRef,
     cancel: &(impl Fn() -> bool + ?Sized),
     origin: (i32, i32),
     color: u32,
@@ -761,7 +761,7 @@ fn ping_wheel(
         Some(((rel / TAU * n as f32).round() as i32).rem_euclid(n))
     };
     let mut sect = -1;
-    while neuron::glyph::key_down(vk) && !cancel() {
+    while neuron::glyph::control_down(vk) && !cancel() {
         let pick = aim(cursor_pos());
         let s = pick.unwrap_or(-1);
         if s != sect {
@@ -787,7 +787,7 @@ fn ping_wheel(
 fn command_stroke(
     weak: &slint::Weak<AppWindow>,
     tx: &Sender<Cmd>,
-    vk: i32,
+    vk: neuron::controls::ControlRef,
     cancel: &(impl Fn() -> bool + ?Sized),
     start: (i32, i32),
 ) {
@@ -802,7 +802,7 @@ fn command_stroke(
     let mut pts: Vec<(i32, i32)> = vec![start];
     let mut marked = Command::None;
     let mut last_mark = std::time::Instant::now();
-    while neuron::glyph::key_down(vk) && !cancel() {
+    while neuron::glyph::control_down(vk) && !cancel() {
         let p = cursor_pos();
         let lp = *pts.last().unwrap();
         if (p.0 - lp.0).pow(2) + (p.1 - lp.1).pow(2) > 4 {
@@ -1007,12 +1007,12 @@ fn selection_hit(tx: &Sender<Cmd>, p: (i32, i32)) -> bool {
 #[cfg(windows)]
 fn drag_selection(
     tx: &Sender<Cmd>,
-    vk: i32,
+    vk: neuron::controls::ControlRef,
     cancel: &(impl Fn() -> bool + ?Sized),
     start: (i32, i32),
 ) {
     let mut last = start;
-    while neuron::glyph::key_down(vk) && !cancel() {
+    while neuron::glyph::control_down(vk) && !cancel() {
         let p = cursor_pos();
         if p != last {
             let _ = tx.send(Cmd::NudgeSelection(p.0 - last.0, p.1 - last.1));

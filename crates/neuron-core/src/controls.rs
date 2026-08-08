@@ -82,6 +82,13 @@ const INJECT_PENDING_MAX: usize = 64;
 /// than dropped, and the first sink to register replays it (see [`inject_register`]) — so the very
 /// first macro keypress after launch is never lost to the startup race.
 pub fn inject_event(ev: ControlEvent) {
+    // Injected sources (macro keys) feed the shared held-state registry too, so a macro key is a
+    // first-class candidate for held binds (the cast trigger) exactly like a native control.
+    note_held(
+        &format!("inject:{}", ev.pid),
+        u16::from_str_radix(&ev.pid, 16).ok(),
+        &ev.hits,
+    );
     // Stamp BEFORE taking the lock: the stamp means "when this edge became visible to us", and lock
     // acquisition is part of the delivery cost we want the hop to include, not excluded from it.
     let ev = Injected {
@@ -541,6 +548,347 @@ fn normalize_hits(hits: &mut Vec<(u16, u16)>) {
     }
 }
 
+// ── ControlRef: the ONE persisted identity for "a physical control" ────────────────────────────
+//
+// Historically the cast/weave trigger was a bare Windows virtual-key (`trigger = 6` in cast.toml)
+// while every other bind in the product was a `Trigger::Input { page, usage, pid }` rule. That
+// split is exactly the "weird side pipeline" a generalist device manager can't afford: a VK is
+// device-blind (keyboard '1' and the Naga side-plate '1' are indistinguishable), invisible to the
+// device-scoped remap shim, and un-nameable in device terms. `ControlRef` closes the split: it IS
+// the `Trigger::Input` identity, made storable by feature configs (cast.toml today).
+
+/// A persisted reference to one physical control, in the SAME namespace as
+/// [`Trigger::Input`]: HID usage `page` + `usage`, optionally scoped to a source device `pid`.
+/// Deserializes from either the modern table form (`{ page = 9, usage = 5, pid = 0xa8 }`) or a
+/// LEGACY bare virtual-key integer (`trigger = 6`) — old configs keep working unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
+pub struct ControlRef {
+    pub page: u16,
+    pub usage: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u16>,
+}
+
+impl<'de> serde::Deserialize<'de> for ControlRef {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            /// legacy `trigger = <vk>` form
+            Vk(i64),
+            Ctl {
+                page: u16,
+                usage: u16,
+                #[serde(default)]
+                pid: Option<u16>,
+            },
+        }
+        match Raw::deserialize(d)? {
+            Raw::Vk(vk) => Ok(ControlRef::from_vk(vk as i32)),
+            Raw::Ctl { page, usage, pid } => Ok(ControlRef { page, usage, pid }),
+        }
+    }
+}
+
+impl ControlRef {
+    /// Map a legacy Windows virtual-key to its control identity (device-any). An unknown VK
+    /// degrades to the historical default trigger (XBUTTON1) rather than an unbindable ghost —
+    /// a config typo must never brick the cast engine.
+    pub fn from_vk(vk: i32) -> Self {
+        let (page, usage) = vk_to_control(vk).unwrap_or((0x09, 4));
+        ControlRef {
+            page,
+            usage,
+            pid: None,
+        }
+    }
+
+    /// The equivalent [`Trigger::Input`] — a `ControlRef` bind and a spine rule are the SAME
+    /// identity, so features holding one can talk to the engine without translation.
+    pub fn to_trigger(self) -> Trigger {
+        Trigger::Input {
+            page: self.page,
+            usage: self.usage,
+            pid: self.pid,
+        }
+    }
+
+    /// The legacy virtual-key this control corresponds to, when one exists. Used ONLY as the
+    /// degraded fallback (polling `GetAsyncKeyState` when no Raw-Input pump is alive — the CLI
+    /// one-shots) and for the mouse-only click-guard arming. Macro keys and exotic controls have
+    /// no VK — they are exactly the controls the registry path exists for.
+    pub fn vk_hint(self) -> Option<i32> {
+        control_to_vk(self.page, self.usage)
+    }
+
+    /// True for the five standard mouse buttons (Button page 1..=5).
+    pub fn is_mouse_button(self) -> bool {
+        self.page == 0x09 && (1..=5).contains(&self.usage)
+    }
+
+    /// Human label: the shared control name, plus the device scope when pid-bound — the honest
+    /// "this key on THIS device" the old VK label couldn't say.
+    pub fn label(self) -> String {
+        // the five standard mouse buttons keep their friendly names (label parity with the old
+        // VK captures); everything else speaks the shared control vocabulary.
+        let name = match (self.page, self.usage) {
+            (0x09, 1) => "Left Mouse".to_string(),
+            (0x09, 2) => "Right Mouse".to_string(),
+            (0x09, 3) => "Middle Mouse".to_string(),
+            (0x09, 4) => "Mouse 4 (thumb 1)".to_string(),
+            (0x09, 5) => "Mouse 5 (thumb 2)".to_string(),
+            (p, u) => control_label(p, u),
+        };
+        match self.pid {
+            Some(p) => format!("{name} @{p:04x}"),
+            None => name,
+        }
+    }
+}
+
+/// Legacy VK → control identity. Mouse buttons map to the Button page; keyboard keys to their HID
+/// Keyboard/Keypad usage. `None` for VKs with no stable control identity.
+pub fn vk_to_control(vk: i32) -> Option<(u16, u16)> {
+    Some(match vk {
+        0x01 => (0x09, 1),
+        0x02 => (0x09, 2),
+        0x04 => (0x09, 3),
+        0x05 => (0x09, 4),
+        0x06 => (0x09, 5),
+        0x30 => (0x07, 0x27),                                // '0'
+        v @ 0x31..=0x39 => (0x07, (v - 0x31) as u16 + 0x1E), // '1'..'9'
+        v @ 0x41..=0x5A => (0x07, (v - 0x41) as u16 + 0x04), // 'A'..'Z'
+        v @ 0x70..=0x7B => (0x07, (v - 0x70) as u16 + 0x3A), // F1..F12
+        0x08 => (0x07, 0x2A),                                // Backspace
+        0x09 => (0x07, 0x2B),                                // Tab
+        0x0D => (0x07, 0x28),                                // Enter
+        0x14 => (0x07, 0x39),                                // Caps Lock
+        0x1B => (0x07, 0x29),                                // Esc
+        0x20 => (0x07, 0x2C),                                // Space
+        0x21 => (0x07, 0x4B),                                // Page Up
+        0x22 => (0x07, 0x4E),                                // Page Down
+        0x23 => (0x07, 0x4D),                                // End
+        0x24 => (0x07, 0x4A),                                // Home
+        0x25 => (0x07, 0x50),                                // Left
+        0x26 => (0x07, 0x52),                                // Up
+        0x27 => (0x07, 0x4F),                                // Right
+        0x28 => (0x07, 0x51),                                // Down
+        0x2D => (0x07, 0x49),                                // Insert
+        0x2E => (0x07, 0x4C),                                // Delete
+        0x10 | 0xA0 => (0x07, 0xE1),                         // (Left) Shift
+        0x11 | 0xA2 => (0x07, 0xE0),                         // (Left) Ctrl
+        0x12 | 0xA4 => (0x07, 0xE2),                         // (Left) Alt
+        0xA1 => (0x07, 0xE5),                                // Right Shift
+        0xA3 => (0x07, 0xE4),                                // Right Ctrl
+        0xA5 => (0x07, 0xE6),                                // Right Alt
+        0xBA => (0x07, 0x33),                                // ;
+        0xBB => (0x07, 0x2E),                                // =
+        0xBC => (0x07, 0x36),                                // ,
+        0xBD => (0x07, 0x2D),                                // -
+        0xBE => (0x07, 0x37),                                // .
+        0xBF => (0x07, 0x38),                                // /
+        0xC0 => (0x07, 0x35),                                // `
+        0xDB => (0x07, 0x2F),                                // [
+        0xDC => (0x07, 0x31),                                // \
+        0xDD => (0x07, 0x30),                                // ]
+        0xDE => (0x07, 0x34),                                // '
+        _ => return None,
+    })
+}
+
+/// Control identity → legacy VK (the inverse of [`vk_to_control`], for the degraded fallbacks).
+pub fn control_to_vk(page: u16, usage: u16) -> Option<i32> {
+    match page {
+        0x09 => Some(match usage {
+            1 => 0x01,
+            2 => 0x02,
+            3 => 0x04,
+            4 => 0x05,
+            5 => 0x06,
+            _ => return None,
+        }),
+        0x07 => Some(match usage {
+            0x27 => 0x30,
+            u @ 0x1E..=0x26 => (u - 0x1E) as i32 + 0x31,
+            u @ 0x04..=0x1D => (u - 0x04) as i32 + 0x41,
+            u @ 0x3A..=0x45 => (u - 0x3A) as i32 + 0x70,
+            0x2A => 0x08,
+            0x2B => 0x09,
+            0x28 => 0x0D,
+            0x39 => 0x14,
+            0x29 => 0x1B,
+            0x2C => 0x20,
+            0x4B => 0x21,
+            0x4E => 0x22,
+            0x4D => 0x23,
+            0x4A => 0x24,
+            0x50 => 0x25,
+            0x52 => 0x26,
+            0x4F => 0x27,
+            0x51 => 0x28,
+            0x49 => 0x2D,
+            0x4C => 0x2E,
+            0xE1 => 0x10,
+            0xE0 => 0x11,
+            0xE2 => 0x12,
+            0xE5 => 0xA1,
+            0xE4 => 0xA3,
+            0xE6 => 0xA5,
+            0x33 => 0xBA,
+            0x2E => 0xBB,
+            0x36 => 0xBC,
+            0x2D => 0xBD,
+            0x37 => 0xBE,
+            0x38 => 0xBF,
+            0x35 => 0xC0,
+            0x2F => 0xDB,
+            0x31 => 0xDC,
+            0x30 => 0xDD,
+            0x34 => 0xDE,
+            _ => return None,
+        }),
+        _ => None,
+    }
+}
+
+// ── the SHARED HELD-STATE REGISTRY ──────────────────────────────────────────────────────────────
+//
+// The device-aware analogue of `GetAsyncKeyState`: which controls are down RIGHT NOW, with their
+// source device. Fed by the Raw-Input pump at decode time (keyboard / mouse / HID branches) and by
+// `inject_event` (macro keys), so it sees every edge the spine sees — including keystrokes a
+// low-level hook swallows (Raw Input is delivered regardless; see `intercept`). Keyed by device
+// PATH, not pid, because one physical device (the Naga: keyboard interface + mouse interface,
+// same pid) sends independent snapshots per interface — pid-keying would let a mouse click
+// clobber a held side-plate key. Consumers poll [`control_held`]; the same shared-stateless-state
+// model as `capture::set_macro_held` (each consumer keeps its own prev[] and edge-detects).
+static HELD: std::sync::Mutex<Vec<(String, Option<u16>, Vec<(u16, u16)>)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Record one input source's full current down-set (the same snapshot shape [`HoldEdges`] diffs).
+/// An empty set removes the entry, so the list stays bounded by "devices with something held".
+pub(crate) fn note_held(source: &str, pid: Option<u16>, hits: &[(u16, u16)]) {
+    let mut g = HELD.lock().unwrap_or_else(|e| e.into_inner());
+    match g.iter_mut().position(|(s, _, _)| s == source) {
+        Some(i) if hits.is_empty() => {
+            g.swap_remove(i);
+        }
+        _ if hits.is_empty() => {}
+        pos => {
+            let mut set = hits.to_vec();
+            normalize_hits(&mut set);
+            match pos {
+                Some(i) => {
+                    g[i].1 = pid;
+                    g[i].2 = set;
+                }
+                None => g.push((source.to_string(), pid, set)),
+            }
+        }
+    }
+}
+
+/// Is any live Raw-Input pump feeding the registry? Every listen loop registers an inject drain
+/// for its whole lifetime, so the sink list doubles as the pump-liveness signal — no extra
+/// bookkeeping. When this is false (CLI one-shots, tests), [`control_held`] returns `None` and
+/// callers degrade to their legacy VK poll.
+pub fn held_registry_live() -> bool {
+    !INJECT.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+}
+
+/// Whether `(page, usage)` is currently held — device-aware. `pid = Some(p)` counts only presses
+/// from device `p`; `None` counts any source (the device-any semantics `Trigger::Input` rules
+/// already have). Returns `None` when no pump is alive to feed the registry (caller falls back).
+pub fn control_held(page: u16, usage: u16, pid: Option<u16>) -> Option<bool> {
+    if !held_registry_live() {
+        return None;
+    }
+    let g = HELD.lock().unwrap_or_else(|e| e.into_inner());
+    Some(g.iter().any(|(_, src_pid, set)| {
+        (pid.is_none() || pid == *src_pid) && set.binary_search(&(page, usage)).is_ok()
+    }))
+}
+
+#[cfg(test)]
+mod control_ref_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_vk_and_table_forms_both_deserialize() {
+        // legacy `trigger = 6` (XBUTTON2) — the pre-ControlRef cast.toml form.
+        #[derive(serde::Deserialize)]
+        struct Doc {
+            trigger: ControlRef,
+        }
+        let legacy: Doc = toml::from_str("trigger = 6").unwrap();
+        assert_eq!(
+            legacy.trigger,
+            ControlRef { page: 0x09, usage: 5, pid: None }
+        );
+        // modern table form, pid-scoped (a Naga side-plate '1').
+        let modern: Doc =
+            toml::from_str("trigger = { page = 7, usage = 30, pid = 168 }").unwrap();
+        assert_eq!(
+            modern.trigger,
+            ControlRef { page: 0x07, usage: 0x1E, pid: Some(0x00a8) }
+        );
+        // serialize → reparse roundtrip (always the table form on the way out).
+        let out = toml::to_string(&modern.trigger).unwrap();
+        let back: ControlRef = toml::from_str(&out).unwrap();
+        assert_eq!(back, modern.trigger);
+    }
+
+    #[test]
+    fn vk_control_mapping_roundtrips_for_every_mapped_vk() {
+        for vk in 1..256 {
+            if let Some((page, usage)) = vk_to_control(vk) {
+                let back = control_to_vk(page, usage).expect("mapped VK must map back");
+                // sided modifiers collapse onto the generic VK — everything else is exact.
+                let generic = match vk {
+                    0xA0 => 0x10,
+                    0xA2 => 0x11,
+                    0xA4 => 0x12,
+                    v => v,
+                };
+                assert_eq!(back, generic, "vk 0x{vk:02X} roundtrip");
+            }
+        }
+    }
+
+    #[test]
+    fn held_registry_is_device_aware_and_snapshot_replacing() {
+        // No live pump in tests → the public query reports "no registry"; drive the internals.
+        assert_eq!(control_held(0x07, 0x1E, None), None);
+        note_held("test:naga-kbd", Some(0xa8), &[(0x07, 0x1E)]);
+        note_held("test:kbd", Some(0x221), &[(0x07, 0x1E)]);
+        {
+            let g = HELD.lock().unwrap();
+            let hit = |pid: Option<u16>| {
+                g.iter().any(|(_, p, set)| {
+                    (pid.is_none() || pid == *p) && set.binary_search(&(0x07, 0x1E)).is_ok()
+                })
+            };
+            assert!(hit(Some(0xa8)) && hit(Some(0x221)) && hit(None));
+            assert!(!g.iter().any(|(_, p, _)| *p == Some(0x99)), "unknown pid holds nothing");
+        }
+        // a mouse-interface snapshot from the SAME device must not clobber the keyboard
+        // interface's held key — entries are per SOURCE, not per pid.
+        note_held("test:naga-mouse", Some(0xa8), &[(0x09, 1)]);
+        {
+            let g = HELD.lock().unwrap();
+            assert!(
+                g.iter().any(|(s, _, set)| s == "test:naga-kbd"
+                    && set.binary_search(&(0x07, 0x1E)).is_ok()),
+                "side-plate key stays held across a same-pid mouse click"
+            );
+        }
+        // an empty snapshot releases (and drops) the source.
+        note_held("test:naga-kbd", Some(0xa8), &[]);
+        note_held("test:naga-mouse", Some(0xa8), &[]);
+        note_held("test:kbd", Some(0x221), &[]);
+        assert!(HELD.lock().unwrap().iter().all(|(s, _, _)| !s.starts_with("test:")));
+    }
+}
+
 /// Translate a [`Binding`] (control-event -> action, the `bindings.toml` row) into a spine
 /// [`Rule`]. The trigger becomes a [`Trigger::Input`] (page/usage, optional pid filter); the
 /// stringly-typed action becomes a typed [`Action`]:
@@ -582,15 +930,16 @@ pub fn binding_rule(b: &Binding) -> Option<Rule> {
 pub struct Runtime {
     /// The unified dispatcher (base rules + named HyperShift layers).
     pub engine: Engine,
-    /// The cast hold-trigger VK (from `cast.toml`) — the button to watch to capture a gesture /
-    /// radial flick and emit a [`Trigger::Gesture`] / [`Trigger::RadialSector`].
+    /// The cast hold-trigger control (from `cast.toml`) — the button to watch to capture a
+    /// gesture / radial flick and emit a [`Trigger::Gesture`] / [`Trigger::RadialSector`].
+    /// A [`ControlRef`] (page/usage/pid), NOT a VK — the same identity namespace as every rule.
     ///
     /// LIVE in the GUI app: its weave watcher (neuron-app `beacon.rs`, the one owner of the cast
     /// trigger) captures the held stroke on a dedicated thread, resolves it through
     /// [`crate::cast::CastConfig::resolve`], and injects the resolved trigger into the live
     /// dispatch Engine. The CLI `run` daemon does NOT capture weaves (its blocking capture would
     /// freeze the Raw-Input pump) — CLI weaving stays on the one-shot `cast run` subcommand.
-    pub cast_trigger: i32,
+    pub cast_trigger: ControlRef,
     /// The cast radial sector count (so a dispatcher resolves a flick to the right wedge index).
     pub cast_sectors: usize,
     /// The radial menu name the cast wedges are registered under (matches the rules built here).
@@ -1490,7 +1839,7 @@ mod spine_tests {
                 Action::Key { key: "1".into() },
                 Action::Noop, // skipped
             ],
-            trigger: 0x06,
+            trigger: ControlRef::from_vk(0x06),
             ..Default::default()
         };
         cast.gestures
@@ -1517,7 +1866,7 @@ mod spine_tests {
 
         let rt = build_runtime_from(&bindings, &cast, &apps, &sidecar);
 
-        assert_eq!(rt.cast_trigger, 0x06);
+        assert_eq!(rt.cast_trigger, ControlRef::from_vk(0x06));
 
         // base rules: mic-gain + mic-gain-set + radial wedge 0 + gesture + the default cast
         // rhythm (teleport on tap-then-hold) + app-focus = 6
@@ -2248,8 +2597,14 @@ pub(crate) mod win {
                                                 }
                                             }
                                         }
+                                        let pid = pid_from_path(&path);
+                                        super::note_held(
+                                            &path,
+                                            u16::from_str_radix(&pid, 16).ok(),
+                                            &hits,
+                                        );
                                         on_event(&ControlEvent {
-                                            pid: pid_from_path(&path),
+                                            pid,
                                             hits,
                                             raw: report,
                                         });
@@ -2295,8 +2650,14 @@ pub(crate) mod win {
                                                 false // auto-repeat: already down, no new edge
                                             };
                                             if changed {
+                                                let pid = pid_from_path(&path);
+                                                super::note_held(
+                                                    &path,
+                                                    u16::from_str_radix(&pid, 16).ok(),
+                                                    set,
+                                                );
                                                 on_event(&ControlEvent {
-                                                    pid: pid_from_path(&path),
+                                                    pid,
                                                     hits: set.clone(),
                                                     raw: Vec::new(),
                                                 });
@@ -2333,8 +2694,14 @@ pub(crate) mod win {
                                                 }
                                             }
                                             if changed {
+                                                let pid = pid_from_path(&path);
+                                                super::note_held(
+                                                    &path,
+                                                    u16::from_str_radix(&pid, 16).ok(),
+                                                    set,
+                                                );
                                                 on_event(&ControlEvent {
-                                                    pid: pid_from_path(&path),
+                                                    pid,
                                                     hits: set.clone(),
                                                     raw: Vec::new(),
                                                 });

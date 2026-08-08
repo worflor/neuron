@@ -11,13 +11,13 @@
 //! (sniper, gesture/radial triggers, button remaps), so it is lifted here into the headless core
 //! where both the CLI and the Slint app can call it.
 //!
-//! Two capture surfaces:
-//! * [`capture_keypress`] — wait for any newly-pressed virtual-key (keyboard key OR mouse button,
-//!   since `GetAsyncKeyState` covers `VK_LBUTTON`/`VK_RBUTTON`/`VK_MBUTTON`/`VK_XBUTTON1`/2). This is
-//!   the baseline-then-detect loop: snapshot what is already held, then return the first key that
-//!   transitions *down* afterwards. **ESC always cancels** (returns `None`).
-//! * [`capture_mouse_button`] — same loop but restricted to the mouse VK set, for "bind a mouse
-//!   button" UI that should ignore keyboard keys.
+//! The capture surface is [`capture_keypress_until`] — wait for any newly-pressed virtual-key
+//! (keyboard key OR mouse button, since `GetAsyncKeyState` covers `VK_LBUTTON`/`VK_RBUTTON`/
+//! `VK_MBUTTON`/`VK_XBUTTON1`/2). This is the baseline-then-detect loop: snapshot what is already
+//! held, then return the first key that transitions *down* afterwards. **ESC always cancels**
+//! (returns `None`). It backs the GUI's chord capture and the sequence recorder; the PERSISTED
+//! binds (rules, the cast trigger) capture device controls via `controls::listen` instead — the
+//! `Trigger::Input` page/usage/pid namespace, not VKs.
 //!
 //! Plus friendly-name helpers so the UI shows "Mouse 5 (thumb 2)" / "'1'" / "Phone Mute" — never a
 //! raw hex code:
@@ -35,7 +35,7 @@
 pub use crate::controls::usage_name;
 
 /// Mouse virtual-keys (`GetAsyncKeyState` codes): L/R/Middle + the two X-buttons (thumb 1/2).
-/// Used by [`capture_mouse_button`] to restrict capture to the mouse and by [`is_mouse_vk`].
+/// Used by [`is_mouse_vk`] (the sequence recorder's keyboard-only filter).
 pub const MOUSE_VKS: [i32; 5] = [
     0x01, // VK_LBUTTON
     0x02, // VK_RBUTTON
@@ -172,36 +172,11 @@ fn baseline() -> [bool; 256] {
     b
 }
 
-/// Wait for the user to press ANY key or mouse button and return its virtual-key. Keys already held
-/// when capture starts are ignored (baseline-then-detect). **ESC cancels** (returns `None`).
-///
-/// This is the press-to-bind primitive: the UI says "press the control you want", calls this, and
-/// shows [`vk_name`] of the result — no hex to type, nothing hardcoded. Blocking; run on a worker
-/// thread in a GUI. For a cancellable-from-another-thread version, see [`capture_keypress_until`].
-#[cfg(windows)]
-pub fn capture_keypress() -> Option<i32> {
-    capture_filtered(|_| true)
-}
-#[cfg(not(windows))]
-pub fn capture_keypress() -> Option<i32> {
-    None
-}
-
-/// Like [`capture_keypress`] but only accepts mouse buttons — for "bind a mouse button" UI that
-/// should ignore keyboard keys. ESC still cancels.
-#[cfg(windows)]
-pub fn capture_mouse_button() -> Option<i32> {
-    capture_filtered(is_mouse_vk)
-}
-#[cfg(not(windows))]
-pub fn capture_mouse_button() -> Option<i32> {
-    None
-}
-
-/// Cancellable [`capture_keypress`]: returns `None` if ESC is pressed OR `stop` is set from another
-/// thread (a GUI flips it to abort the capture, e.g. the user closed the bind dialog). Otherwise
-/// returns the first newly-pressed virtual-key. The GUI's press-to-bind owns an `Arc<AtomicBool>`
-/// and clones it into the capture worker.
+/// Wait for the user to press ANY key or mouse button and return its virtual-key — cancellable:
+/// returns `None` if ESC is pressed OR `stop` is set from another thread (a GUI flips it to abort
+/// the capture, e.g. the user closed the bind dialog). Keys already held when capture starts are
+/// ignored (baseline-then-detect). The GUI's press-to-bind owns an `Arc<AtomicBool>` and clones it
+/// into the capture worker. Blocking; run on a worker thread in a GUI.
 #[cfg(windows)]
 pub fn capture_keypress_until(stop: &std::sync::atomic::AtomicBool) -> Option<i32> {
     capture_filtered_until(stop, |_| true)
@@ -212,14 +187,7 @@ pub fn capture_keypress_until(_stop: &std::sync::atomic::AtomicBool) -> Option<i
 }
 
 /// Core capture loop: snapshot the baseline, then poll until a key passing `accept` transitions
-/// down (returns its VK), or ESC is pressed (returns `None`). Shared by the public capture fns.
-#[cfg(windows)]
-fn capture_filtered(accept: impl Fn(i32) -> bool) -> Option<i32> {
-    static NEVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    capture_filtered_until(&NEVER, accept)
-}
-
-/// As [`capture_filtered`] but also abortable via `stop`.
+/// down (returns its VK), ESC is pressed, or `stop` is set (both return `None`).
 #[cfg(windows)]
 fn capture_filtered_until(
     stop: &std::sync::atomic::AtomicBool,

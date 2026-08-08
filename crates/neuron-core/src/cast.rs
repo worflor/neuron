@@ -34,8 +34,12 @@ pub enum Mode {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CastConfig {
-    /// activation button (VK): hold to capture. Default XBUTTON1 (0x05).
-    pub trigger: i32,
+    /// activation control: hold to capture. A [`crate::controls::ControlRef`] — the SAME
+    /// page/usage/pid identity as every `Trigger::Input` rule, so binding a specific device's
+    /// button (the Naga side plate) is a real device rebind, not a device-blind VK shim. Legacy
+    /// configs holding a bare VK integer still deserialize (see `ControlRef`'s serde). Default
+    /// = Mouse 4 / XBUTTON1, device-any.
+    pub trigger: crate::controls::ControlRef,
     /// the activation RHYTHM on that button — a [`crate::feel::Phrase`] ("hold", "tap hold",
     /// "tap tap hold", "tap tap", …). The classic single hold is the default; rhythms let the
     /// same physical button keep its normal click AND open a weave (e.g. double-tap-then-hold).
@@ -96,7 +100,7 @@ pub struct ModeSlot {
     /// The action this rhythm fires (`Action::Noop` for the weave slot — the weave resolves its
     /// own stroke, it has no fixed action).
     pub action: Action,
-    pub vk: i32,
+    pub ctl: crate::controls::ControlRef,
     pub taps: u8,
     /// true ⇔ the weave slot (the plain-hold cast capture itself).
     pub is_weave: bool,
@@ -149,7 +153,7 @@ fn d_rhythm_actions() -> Vec<RhythmBind> {
 impl Default for CastConfig {
     fn default() -> Self {
         CastConfig {
-            trigger: 0x05,
+            trigger: crate::controls::ControlRef::from_vk(0x05),
             activation: d_activation(),
             sectors: 8,
             deadzone: d_deadzone(),
@@ -254,7 +258,7 @@ impl CastConfig {
         // weave rhythm degrades to a plain hold for slot purposes).
         slots.push(ModeSlot {
             action: Action::Noop,
-            vk: self.trigger,
+            ctl: self.trigger,
             taps: weave_taps,
             is_weave: true,
         });
@@ -271,7 +275,7 @@ impl CastConfig {
                 ));
                 continue;
             }
-            if let Some(clash) = slots.iter().find(|s| s.vk == self.trigger && s.taps == rb.taps) {
+            if let Some(clash) = slots.iter().find(|s| s.ctl == self.trigger && s.taps == rb.taps) {
                 let with = if clash.is_weave {
                     "the weave".to_string()
                 } else {
@@ -287,7 +291,7 @@ impl CastConfig {
             }
             slots.push(ModeSlot {
                 action: rb.action.clone(),
-                vk: self.trigger,
+                ctl: self.trigger,
                 taps: rb.taps,
                 is_weave: false,
             });
@@ -455,9 +459,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("cast.toml");
         // `sectors` is the wrong type (forces the degraded path); `trigger`/`deadzone` must survive.
-        std::fs::write(&path, "trigger = 7\nsectors = \"nope\"\ndeadzone = 55.0\n").unwrap();
+        std::fs::write(&path, "trigger = 6\nsectors = \"nope\"\ndeadzone = 55.0\n").unwrap();
         let cfg = CastConfig::load_from(&path);
-        assert_eq!(cfg.trigger, 7, "good scalar survived the salvage");
+        assert_eq!(
+            cfg.trigger,
+            crate::controls::ControlRef::from_vk(6),
+            "good scalar survived the salvage (legacy VK form upgrades to a ControlRef)"
+        );
         assert_eq!(cfg.deadzone, 55.0);
         assert_eq!(
             cfg.sectors,
@@ -651,7 +659,7 @@ gestures = "nope"
             "weave + teleport; whiteboard is off by default"
         );
         assert!(
-            slots.iter().all(|s| s.vk == c.trigger),
+            slots.iter().all(|s| s.ctl == c.trigger),
             "default = ride the cast trigger"
         );
         let taps: Vec<u8> = slots.iter().map(|s| s.taps).collect();

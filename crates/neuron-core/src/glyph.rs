@@ -838,12 +838,12 @@ pub fn add_noise(z: &[C], sigma: f64, seed: u64) -> Vec<C> {
 
 // ── live capture (Windows Raw Input; phrase-activated, game-feel) ───────────
 
-/// Hold-and-do: wait for `trigger_vk` to be pressed, capture sensor-true motion while
+/// Hold-and-do: wait for the `trigger` control to be pressed, capture sensor-true motion while
 /// it's held, stop on release. The classic activation — `capture_phrase` with a plain hold.
 #[cfg(windows)]
-pub fn capture_held(trigger_vk: i32, max_pts: usize) -> Vec<C> {
+pub fn capture_held(trigger: crate::controls::ControlRef, max_pts: usize) -> Vec<C> {
     capture_phrase(
-        trigger_vk,
+        trigger,
         &crate::feel::Phrase::hold(),
         &crate::feel::FeelConfig::default(),
         max_pts,
@@ -855,9 +855,13 @@ pub fn capture_held(trigger_vk: i32, max_pts: usize) -> Vec<C> {
 /// new motion arrives (the accumulated points so far), so a live overlay can draw the weave as it
 /// forms. The callback runs on the capture thread between motion drains.
 #[cfg(windows)]
-pub fn capture_held_with(trigger_vk: i32, max_pts: usize, on_progress: impl FnMut(&[C])) -> Vec<C> {
+pub fn capture_held_with(
+    trigger: crate::controls::ControlRef,
+    max_pts: usize,
+    on_progress: impl FnMut(&[C]),
+) -> Vec<C> {
     capture_phrase(
-        trigger_vk,
+        trigger,
         &crate::feel::Phrase::hold(),
         &crate::feel::FeelConfig::default(),
         max_pts,
@@ -872,14 +876,14 @@ pub fn capture_held_with(trigger_vk: i32, max_pts: usize, on_progress: impl FnMu
 /// A broken rhythm resets silently and instantly — fidgeting costs nothing. ESC aborts.
 #[cfg(windows)]
 pub fn capture_phrase(
-    trigger_vk: i32,
+    trigger: crate::controls::ControlRef,
     phrase: &crate::feel::Phrase,
     cfg: &crate::feel::FeelConfig,
     max_pts: usize,
     on_progress: impl FnMut(&[C]),
 ) -> Vec<C> {
     raw_input::capture_phrase(
-        trigger_vk,
+        trigger,
         phrase,
         cfg,
         max_pts,
@@ -898,7 +902,7 @@ pub fn capture_phrase(
 /// one press must never feed two captures.
 #[cfg(windows)]
 pub fn capture_phrase_until(
-    trigger_vk: i32,
+    trigger: crate::controls::ControlRef,
     phrase: &crate::feel::Phrase,
     cfg: &crate::feel::FeelConfig,
     max_pts: usize,
@@ -906,7 +910,7 @@ pub fn capture_phrase_until(
     on_progress: impl FnMut(&[C]),
 ) -> Vec<C> {
     raw_input::capture_phrase(
-        trigger_vk,
+        trigger,
         phrase,
         cfg,
         max_pts,
@@ -925,7 +929,7 @@ pub fn capture_phrase_until(
 /// a `max_pts` high enough that the buffer never thins (`compact` would desync points from stamps).
 #[cfg(windows)]
 pub fn capture_phrase_until_stamped(
-    trigger_vk: i32,
+    trigger: crate::controls::ControlRef,
     phrase: &crate::feel::Phrase,
     cfg: &crate::feel::FeelConfig,
     max_pts: usize,
@@ -934,7 +938,7 @@ pub fn capture_phrase_until_stamped(
 ) -> (Vec<C>, Vec<u32>) {
     let mut stamps = Vec::new();
     let pts = raw_input::capture_phrase(
-        trigger_vk,
+        trigger,
         phrase,
         cfg,
         max_pts,
@@ -955,13 +959,13 @@ pub fn capture_phrase_until_stamped(
 }
 
 #[cfg(not(windows))]
-pub fn capture_held(_trigger_vk: i32, _max_pts: usize) -> Vec<C> {
+pub fn capture_held(_trigger: crate::controls::ControlRef, _max_pts: usize) -> Vec<C> {
     Vec::new()
 }
 
 #[cfg(not(windows))]
 pub fn capture_held_with(
-    _trigger_vk: i32,
+    _trigger: crate::controls::ControlRef,
     _max_pts: usize,
     _on_progress: impl FnMut(&[C]),
 ) -> Vec<C> {
@@ -970,7 +974,7 @@ pub fn capture_held_with(
 
 #[cfg(not(windows))]
 pub fn capture_phrase(
-    _trigger_vk: i32,
+    _trigger: crate::controls::ControlRef,
     _phrase: &crate::feel::Phrase,
     _cfg: &crate::feel::FeelConfig,
     _max_pts: usize,
@@ -981,7 +985,7 @@ pub fn capture_phrase(
 
 #[cfg(not(windows))]
 pub fn capture_phrase_until(
-    _trigger_vk: i32,
+    _trigger: crate::controls::ControlRef,
     _phrase: &crate::feel::Phrase,
     _cfg: &crate::feel::FeelConfig,
     _max_pts: usize,
@@ -993,7 +997,7 @@ pub fn capture_phrase_until(
 
 #[cfg(not(windows))]
 pub fn capture_phrase_until_stamped(
-    _trigger_vk: i32,
+    _trigger: crate::controls::ControlRef,
     _phrase: &crate::feel::Phrase,
     _cfg: &crate::feel::FeelConfig,
     _max_pts: usize,
@@ -1004,11 +1008,12 @@ pub fn capture_phrase_until_stamped(
 }
 
 /// One activation slot the multi-instrument watcher listens for: `id` is returned on activation,
-/// `vk` is the key, `taps` is how many quick taps precede the final hold (0 = plain hold).
+/// `ctl` is the control (page/usage/pid — device-aware), `taps` is how many quick taps precede
+/// the final hold (0 = plain hold).
 #[derive(Clone, Copy, Debug)]
 pub struct CaptureSlot {
     pub id: u32,
-    pub vk: i32,
+    pub ctl: crate::controls::ControlRef,
     pub taps: u8,
 }
 
@@ -1086,6 +1091,19 @@ pub fn key_down(vk: i32) -> bool {
 #[cfg(not(windows))]
 pub fn key_down(_vk: i32) -> bool {
     false
+}
+
+/// Device-aware held-state for one control — the read every capture loop uses for its trigger.
+/// Primary source: the shared Raw-Input held registry (`controls::control_held`), which knows the
+/// source device (so a pid-bound trigger ignores the same key on other devices) and still sees
+/// keystrokes a low-level hook swallows. When NO pump feeds the registry (CLI one-shots), it
+/// degrades to the legacy `GetAsyncKeyState` poll via the control's VK equivalent — device-blind,
+/// exactly the historical behaviour.
+pub fn control_down(ctl: crate::controls::ControlRef) -> bool {
+    match crate::controls::control_held(ctl.page, ctl.usage, ctl.pid) {
+        Some(down) => down,
+        None => ctl.vk_hint().map(key_down).unwrap_or(false),
+    }
 }
 
 #[cfg(windows)]
@@ -1302,7 +1320,7 @@ mod raw_input {
             return None;
         }
         struct KeyState {
-            vk: i32,
+            ctl: crate::controls::ControlRef,
             down: bool,
             t_down: Instant,
             last_release: Instant,
@@ -1315,9 +1333,9 @@ mod raw_input {
             let t0 = Instant::now();
             let mut keys: Vec<KeyState> = Vec::new();
             for s in slots {
-                if !keys.iter().any(|k| k.vk == s.vk) {
+                if !keys.iter().any(|k| k.ctl == s.ctl) {
                     keys.push(KeyState {
-                        vk: s.vk,
+                        ctl: s.ctl,
                         down: false,
                         t_down: t0,
                         last_release: t0,
@@ -1343,7 +1361,7 @@ mod raw_input {
                 }
                 let now = Instant::now();
                 for k in keys.iter_mut() {
-                    let is_down = super::key_down(k.vk);
+                    let is_down = super::control_down(k.ctl);
                     if is_down && !k.down {
                         // press edge: stale taps die after gap_ms of silence
                         if now.duration_since(k.last_release).as_millis() as u64 > cfg.gap_ms {
@@ -1365,7 +1383,7 @@ mod raw_input {
                             // more taps than any slot on this key wants = not ours; reset
                             let max_taps = slots
                                 .iter()
-                                .filter(|s| s.vk == k.vk)
+                                .filter(|s| s.ctl == k.ctl)
                                 .map(|s| s.taps)
                                 .max()
                                 .unwrap_or(0);
@@ -1391,7 +1409,7 @@ mod raw_input {
                             _ => false,
                         };
                         if held >= cfg.hold_ms || moved {
-                            match slots.iter().find(|s| s.vk == k.vk && s.taps == k.taps) {
+                            match slots.iter().find(|s| s.ctl == k.ctl && s.taps == k.taps) {
                                 Some(s) => break 'wait (s.id, std::mem::take(&mut pre)),
                                 None => k.dead = true, // the key's normal job — not ours
                             }
@@ -1402,7 +1420,15 @@ mod raw_input {
             };
 
             let (id, mut pts) = activated;
-            let vk = slots.iter().find(|s| s.id == id).map(|s| s.vk).unwrap_or(0);
+            let ctl = slots
+                .iter()
+                .find(|s| s.id == id)
+                .map(|s| s.ctl)
+                .unwrap_or(crate::controls::ControlRef {
+                    page: 0,
+                    usage: 0,
+                    pid: None,
+                });
             // cursor pinned for the stroke, exactly like every other weave.
             let _cursor = super::cursor_lock::CursorLock::engage();
             on_activated(id);
@@ -1416,7 +1442,7 @@ mod raw_input {
             // hold lasts 30s, so cap it: a stuck capture self-releases (cursor unlocks, thread
             // returns) instead of bricking every mode. ──
             let hold_start = Instant::now();
-            while super::key_down(vk) {
+            while super::control_down(ctl) {
                 if stop() || hold_start.elapsed() > Duration::from_secs(30) {
                     DestroyWindow(hwnd);
                     return None;
@@ -1431,7 +1457,7 @@ mod raw_input {
             }
             let tail_end = Instant::now() + Duration::from_millis(cfg.coyote_ms);
             while Instant::now() < tail_end {
-                if super::key_down(vk) {
+                if super::control_down(ctl) {
                     break;
                 }
                 if drain(hwnd, &mut acc, &mut pts, &mut Vec::new(), false) {
@@ -1448,7 +1474,7 @@ mod raw_input {
     }
 
     pub fn capture_phrase(
-        trigger_vk: i32,
+        trigger: crate::controls::ControlRef,
         phrase: &crate::feel::Phrase,
         cfg: &crate::feel::FeelConfig,
         max_pts: usize,
@@ -1476,7 +1502,7 @@ mod raw_input {
                     return Ok(Vec::new());
                 }
                 let now = t0.elapsed().as_millis() as u64;
-                match watcher.feed(now, super::key_down(trigger_vk)) {
+                match watcher.feed(now, super::control_down(trigger)) {
                     Watch::Activated { toggle } => break toggle,
                     // a broken rhythm costs nothing — the watcher already re-armed itself.
                     Watch::Pending | Watch::Reset => {}
@@ -1504,7 +1530,7 @@ mod raw_input {
                 // here forever with the cursor LOCKED (frozen mouse + dead modes until restart).
                 let hold_start = Instant::now();
                 let mut last_motion = Instant::now();
-                while super::key_down(trigger_vk) {
+                while super::control_down(trigger) {
                     if stop() {
                         // retired mid-weave: the stroke must NOT commit (its owner withdrew it).
                         DestroyWindow(hwnd);
@@ -1541,7 +1567,7 @@ mod raw_input {
                 // (cut short instantly by a re-press — the next weave must never wait on this)
                 let tail_end = Instant::now() + Duration::from_millis(cfg.coyote_ms);
                 while Instant::now() < tail_end {
-                    if super::key_down(trigger_vk) {
+                    if super::control_down(trigger) {
                         break; // spam: the user is already starting the next weave
                     }
                     if drain(hwnd, &mut acc, &mut pts, stamps_out, want_stamps) {
@@ -1555,7 +1581,7 @@ mod raw_input {
             } else {
                 // ── toggle capture: runs until the NEXT tap of the trigger (or ESC) ──
                 // First let the activating press release (its motion already counts).
-                while super::key_down(trigger_vk) {
+                while super::control_down(trigger) {
                     if drain(hwnd, &mut acc, &mut pts, stamps_out, want_stamps) {
                         if pts.len() >= max_pts {
                             compact(&mut pts);
@@ -1589,7 +1615,7 @@ mod raw_input {
                         DestroyWindow(hwnd);
                         return Ok(Vec::new());
                     }
-                    if super::key_down(0x1B) || super::key_down(trigger_vk) {
+                    if super::key_down(0x1B) || super::control_down(trigger) {
                         break;
                     }
                     if drain(hwnd, &mut acc, &mut pts, stamps_out, want_stamps) {
@@ -1603,7 +1629,7 @@ mod raw_input {
                 }
                 // swallow the closing press so it can't double as the next phrase's first tap
                 // (activation-to-deactivate must be free, not a hidden re-activation).
-                while super::key_down(trigger_vk) {
+                while super::control_down(trigger) {
                     std::thread::sleep(Duration::from_millis(2));
                 }
             }

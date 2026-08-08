@@ -566,7 +566,11 @@ fn run_worker(weak: slint::Weak<AppWindow>, stop: Arc<AtomicBool>, live_rx: Rece
     // filter; this is the driver-free user-mode equivalent). No-op when there are none.
     {
         let c = ctx.borrow();
-        neuron::intercept::configure_from_engine(&c.rt.borrow().engine);
+        let rt = c.rt.borrow();
+        // The cast trigger rides along as a HELD-BIND claim: a pid-scoped keyboard trigger (a
+        // Naga side-plate key bound to the weave) gets its keystroke swallowed device-scoped,
+        // so holding it to weave stops typing into the focused app. See `intercept`.
+        neuron::intercept::configure_from_engine_with(&rt.engine, Some(rt.cast_trigger));
     }
 
     // ── THE IMMORTAL LISTENER ── this worker is the organ that fires every cast and remap; if it
@@ -816,8 +820,12 @@ fn live_tick(ctx: &mut LiveCtx) -> Duration {
         key_remap_release_all(&ctx.held_keys); // nor a held remapped key
         sniper_release_all(&ctx.devices, &ctx.sniper); // nor a held sniper (restore the DPI)
         *ctx.rt.borrow_mut() = controls::build_runtime();
-        // Re-arm the remap shim from the rebuilt engine (a rebind/added binding takes effect here).
-        neuron::intercept::configure_from_engine(&ctx.rt.borrow().engine);
+        // Re-arm the remap shim from the rebuilt engine (a rebind/added binding takes effect
+        // here) — including the cast trigger's held-bind claim.
+        {
+            let rt = ctx.rt.borrow();
+            neuron::intercept::configure_from_engine_with(&rt.engine, Some(rt.cast_trigger));
+        }
         ctx.exec.borrow_mut().clear();
         ctx.devices.borrow_mut().clear();
         ctx.turbos.borrow_mut().clear();

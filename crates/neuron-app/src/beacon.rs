@@ -385,13 +385,10 @@ fn live_weave(
         crate::knockback::toggle(weak);
         return;
     }
-    // the key the live session actually armed (0 = no session). Slots on this key stand down
-    // below; instruments that would ride it get a friendly refusal instead of a key fight.
-    let kb_vk = {
-        let v = crate::knockback::owned_vk();
-        (v != 0).then_some(v)
-    };
-    if (request == 1 || request == 3 || request == 6) && kb_vk == Some(cast.trigger) {
+    // the control the live session actually armed (None = no session). Slots on this control
+    // stand down below; instruments that would ride it get a friendly refusal instead of a fight.
+    let kb_ctl = crate::knockback::owned_ctl();
+    if (request == 1 || request == 3 || request == 6) && kb_ctl == Some(cast.trigger) {
         post_status(
             weak,
             "the familiar holds that trigger \u{2014} esc (or recast knockback) to leave the duet first".into(),
@@ -411,19 +408,19 @@ fn live_weave(
         // primed teleport: the next plain hold of the cast trigger IS the drag.
         1 => vec![neuron::glyph::CaptureSlot {
             id: 1,
-            vk: cast.trigger,
+            ctl: cast.trigger,
             taps: 0,
         }],
         // primed dial: the next plain hold of the cast trigger IS the slide.
         3 => vec![neuron::glyph::CaptureSlot {
             id: 3,
-            vk: cast.trigger,
+            ctl: cast.trigger,
             taps: 0,
         }],
         // primed control center: the next plain hold of the cast trigger opens the glance.
         6 => vec![neuron::glyph::CaptureSlot {
             id: 6,
-            vk: cast.trigger,
+            ctl: cast.trigger,
             taps: 0,
         }],
         _ => slots
@@ -432,7 +429,7 @@ fn live_weave(
                 // the slot's own contract id: 0 weave, 1 teleport, 2 whiteboard, 100+taps =
                 // "fire via Trigger::Cast{taps}" (any other bound action — routed via the spine).
                 id: s.capture_id(),
-                vk: s.vk,
+                ctl: s.ctl,
                 taps: s.taps,
             })
             .collect(),
@@ -511,9 +508,9 @@ fn live_weave(
         let board_key = slots
             .iter()
             .find(|s| s.action == neuron::action::Action::Whiteboard)
-            .map(|s| s.vk)
+            .map(|s| s.ctl)
             .unwrap_or(cast.trigger);
-        if kb_vk == Some(board_key) {
+        if kb_ctl == Some(board_key) {
             post_status(
                 weak,
                 "the familiar holds that trigger \u{2014} esc (or recast knockback) to leave the duet first".into(),
@@ -527,15 +524,15 @@ fn live_weave(
     // The session and the weave service are separate threads now; without this, a draw-hold
     // double-fires as a cast ("i can't draw, it just activates the spellweaving"). Slots on
     // OTHER keys keep working — only the board's key stands down.
-    let board_vk = crate::whiteboard::active().then(|| {
+    let board_ctl = crate::whiteboard::active().then(|| {
         slots
             .iter()
             .find(|s| s.action == neuron::action::Action::Whiteboard)
-            .map(|s| s.vk)
+            .map(|s| s.ctl)
             .unwrap_or(cast.trigger)
     });
     if request == 1 {
-        if board_vk == Some(cast.trigger) {
+        if board_ctl == Some(cast.trigger) {
             post_status(
                 weak,
                 "the whiteboard holds that trigger \u{2014} close the board (esc) to teleport"
@@ -549,7 +546,7 @@ fn live_weave(
         );
     }
     if request == 6 {
-        if board_vk == Some(cast.trigger) {
+        if board_ctl == Some(cast.trigger) {
             post_status(
                 weak,
                 "the whiteboard holds that trigger \u{2014} close the board (esc) to glance".into(),
@@ -566,7 +563,7 @@ fn live_weave(
     // duet plays, so radial/teleport/whiteboard on their own triggers never go dark.
     let cap_slots: Vec<neuron::glyph::CaptureSlot> = cap_slots
         .into_iter()
-        .filter(|s| board_vk != Some(s.vk) && kb_vk != Some(s.vk))
+        .filter(|s| board_ctl != Some(s.ctl) && kb_ctl != Some(s.ctl))
         .collect();
     if cap_slots.is_empty() {
         // every slot shares an owned key — nothing to listen for until that session closes.
@@ -712,7 +709,7 @@ fn live_weave(
         let c_gen = crate::dispatch::reload_generation() != gen;
         let c_instr = INSTRUMENT_REQ.load(Ordering::SeqCst) != 0; // a try-button yanks the wait
                                                                   // knockback claimed or released its drum key mid-wait → re-arm with the right slots.
-        let c_kb = crate::knockback::owned_vk() != kb_vk.unwrap_or(0);
+        let c_kb = crate::knockback::owned_ctl() != kb_ctl;
         // a "fire via the spine" rhythm just activated: end the capture AT ONCE (no drawing
         // session) so we inject Trigger::Cast right after — the rhythm IS the whole gesture.
         let c_fire = fire_taps.get().is_some();
@@ -750,7 +747,7 @@ fn live_weave(
                     let exempt = cap_slots
                         .iter()
                         .find(|s| s.id == 1)
-                        .map(|s| s.vk)
+                        .and_then(|s| s.ctl.vk_hint())
                         .unwrap_or(0);
                     crate::teleport::click_guard::arm(exempt);
                     let mut s = crate::teleport::snapshot();
@@ -1878,7 +1875,7 @@ fn present(
     let feel = neuron::feel::FeelConfig::load();
     let phrase = neuron::feel::Phrase::hold(); // answering is always the plain hold — predictable
     let deadzone = cast.deadzone;
-    let trigger_name = neuron::capture::vk_name(cast.trigger);
+    let trigger_name = cast.trigger.label();
     // built as its two REAL parts — how to engage, then the answer set — separated by a line break, so
     // the wrapper keeps the options together on their own row instead of splitting the list mid-way.
     // (Not a hardcoded row: it's the grammar's actual structure; the wrapper just honours the '\n'.)

@@ -24,8 +24,6 @@ use slint::ComponentHandle;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-/// The handler run on the UI thread when a VK capture completes (vk = 0 means cancelled).
-type VkHandler = Box<dyn Fn(&AppWindow, i32, &str)>;
 /// The handler run on the UI thread when a HID control capture completes (None = cancelled).
 type CtlHandler = Box<dyn Fn(&AppWindow, Option<CapturedControl>)>;
 /// The handler for a chord-aware capture: `(app, vk, held-modifier-names, friendly-name)`.
@@ -41,8 +39,6 @@ thread_local! {
     /// stop flag on its next poll) must NOT tear down the prompt/handler of the capture that
     /// replaced it — the guard makes stale completions inert.
     static GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    /// The pending VK-capture handler (set on the UI thread; run on the UI thread when done).
-    static VK_HANDLER: std::cell::RefCell<Option<VkHandler>> = const { std::cell::RefCell::new(None) };
     /// The pending control-capture handler.
     static CTL_HANDLER: std::cell::RefCell<Option<CtlHandler>> = const { std::cell::RefCell::new(None) };
     /// The pending chord-capture handler.
@@ -76,11 +72,11 @@ pub static CAPTURE_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// window and can never run.
 fn end_capture_without_window() {
     CAPTURE_ACTIVE.store(false, Ordering::Relaxed);
+    neuron::intercept::set_paused(false);
     RECORDING.store(false, Ordering::Relaxed);
     // the stop flag belongs to the worker that just finished — drop it with everything else so no
     // stale cell survives into the next capture.
     CANCEL.with(|c| *c.borrow_mut() = None);
-    VK_HANDLER.with(|h| *h.borrow_mut() = None);
     CHORD_HANDLER.with(|h| *h.borrow_mut() = None);
     CTL_HANDLER.with(|h| *h.borrow_mut() = None);
     SEQ_HANDLER.with(|h| *h.borrow_mut() = None);
@@ -90,6 +86,7 @@ fn end_capture_without_window() {
 /// Cancel any in-flight press-to-bind capture (the dialog closed / a new capture started).
 pub fn cancel() {
     CAPTURE_ACTIVE.store(false, Ordering::Relaxed);
+    neuron::intercept::set_paused(false);
     CANCEL.with(|c| {
         if let Some(flag) = c.borrow().as_ref() {
             flag.store(true, Ordering::Relaxed);
@@ -98,56 +95,7 @@ pub fn cancel() {
     });
 }
 
-/// Begin a press-to-bind VK capture on a worker thread. `mouse_only` restricts to mouse buttons.
-/// `on_done(app, vk, name)` runs on the UI thread (vk = 0 = cancelled).
-pub fn begin(app: &AppWindow, mouse_only: bool, on_done: impl Fn(&AppWindow, i32, &str) + 'static) {
-    cancel();
-    let gen = GENERATION.with(|g| {
-        let v = g.get() + 1;
-        g.set(v);
-        v
-    });
-    let stop = Arc::new(AtomicBool::new(false));
-    CANCEL.with(|c| *c.borrow_mut() = Some(stop.clone()));
-    VK_HANDLER.with(|h| *h.borrow_mut() = Some(Box::new(on_done)));
-    CAP_WINDOW.with(|c| *c.borrow_mut() = Some(app.as_weak()));
-
-    let st = app.global::<State>();
-    st.set_capture_active(true);
-    CAPTURE_ACTIVE.store(true, Ordering::Relaxed);
-    st.set_capture_prompt(
-        if mouse_only {
-            "press the mouse button you want — ESC to cancel"
-        } else {
-            "press the key / button you want — ESC to cancel"
-        }
-        .into(),
-    );
-
-    // A spawn refusal or worker panic must still clear CAPTURE_ACTIVE/the handler cells (they were
-    // set above) — `done` runs on every path, including synchronously on refusal.
-    crate::worker::spawn_notify(
-        "neuron-press-to-bind",
-        move || {
-            let vk = if mouse_only {
-                capture_mouse_until(&stop)
-            } else {
-                neuron::capture::capture_keypress_until(&stop)
-            };
-            match vk {
-                Some(v) => (v, neuron::capture::vk_name(v)),
-                None => (0, "cancelled".to_string()),
-            }
-        },
-        move |result| {
-            let (code, name) = result.unwrap_or_else(|| (0, "cancelled".to_string()));
-            // Post only plain data across the boundary; the !Send handler runs on the UI thread.
-            let _ = slint::invoke_from_event_loop(move || finish_vk(gen, code, name));
-        },
-    );
-}
-
-/// Begin a CHORD-aware press-to-bind capture: like [`begin`], but the handler also receives the
+/// Begin a CHORD-aware press-to-bind capture: the handler also receives the
 /// modifier names held at the instant of the press (`["ctrl","shift"]`, press order ctrl→shift→
 /// alt→win), read in the WORKER at capture time — by the time a UI-thread handler ran, the user
 /// would already have let go. A pressed modifier captures as itself, never as its own chord.
@@ -166,6 +114,7 @@ pub fn begin_chord(app: &AppWindow, on_done: impl Fn(&AppWindow, i32, &[&str], &
     let st = app.global::<State>();
     st.set_capture_active(true);
     CAPTURE_ACTIVE.store(true, Ordering::Relaxed);
+    neuron::intercept::set_paused(true);
     st.set_capture_prompt("press the key / button / chord you want — ESC to cancel".into());
 
     // Same "done clears the latch on every path" contract as `begin` above.
@@ -225,32 +174,11 @@ fn finish_chord(gen: u64, code: i32, mods: Vec<&'static str>, name: String) {
     let st = app.global::<State>();
     st.set_capture_active(false);
     CAPTURE_ACTIVE.store(false, Ordering::Relaxed);
+    neuron::intercept::set_paused(false);
     st.set_capture_prompt("".into());
     let handler = CHORD_HANDLER.with(|h| h.borrow_mut().take());
     if let Some(h) = handler {
         h(&app, code, &mods, &name);
-    }
-}
-
-/// Run the stashed VK handler on the UI thread (clearing the capture UI state first). A stale
-/// generation (this worker was superseded by a newer capture) returns before touching ANYTHING —
-/// including the handler cells, which now belong to the newer capture.
-fn finish_vk(gen: u64, code: i32, name: String) {
-    if GENERATION.with(|g| g.get()) != gen {
-        return;
-    }
-    let weak = CAP_WINDOW.with(|c| c.borrow().clone());
-    let Some(app) = weak.and_then(|w| w.upgrade()) else {
-        end_capture_without_window();
-        return;
-    };
-    let st = app.global::<State>();
-    st.set_capture_active(false);
-    CAPTURE_ACTIVE.store(false, Ordering::Relaxed);
-    st.set_capture_prompt("".into());
-    let handler = VK_HANDLER.with(|h| h.borrow_mut().take());
-    if let Some(h) = handler {
-        h(&app, code, &name);
     }
 }
 
@@ -275,6 +203,7 @@ pub fn begin_control(
     let st = app.global::<State>();
     st.set_capture_active(true);
     CAPTURE_ACTIVE.store(true, Ordering::Relaxed);
+    neuron::intercept::set_paused(true);
     st.set_capture_prompt(
         "press the device control (knob / mute / media / macro key / mic-tap) — ESC to cancel".into(),
     );
@@ -305,38 +234,13 @@ fn finish_ctl(gen: u64, pkt: Option<(u16, u16, Option<u16>)>) {
     let st = app.global::<State>();
     st.set_capture_active(false);
     CAPTURE_ACTIVE.store(false, Ordering::Relaxed);
+    neuron::intercept::set_paused(false);
     st.set_capture_prompt("".into());
     let captured = pkt.map(|(page, usage, pid)| CapturedControl { page, usage, pid });
     let handler = CTL_HANDLER.with(|h| h.borrow_mut().take());
     if let Some(h) = handler {
         h(&app, captured);
     }
-}
-
-/// Mouse-only cancellable capture (composes the cancellable loop with the mouse filter).
-#[cfg(windows)]
-fn capture_mouse_until(stop: &AtomicBool) -> Option<i32> {
-    use neuron::capture::{is_mouse_vk, key_down, MOUSE_VKS, VK_ESCAPE};
-    let mut base = [false; 7];
-    for &vk in &MOUSE_VKS {
-        base[vk as usize] = key_down(vk);
-    }
-    loop {
-        if key_down(VK_ESCAPE) || stop.load(Ordering::Relaxed) {
-            return None;
-        }
-        for &vk in &MOUSE_VKS {
-            if is_mouse_vk(vk) && key_down(vk) && !base[vk as usize] {
-                return Some(vk);
-            }
-        }
-        std::thread::sleep(std::time::Duration::from_millis(8));
-    }
-}
-
-#[cfg(not(windows))]
-fn capture_mouse_until(_stop: &AtomicBool) -> Option<i32> {
-    None
 }
 
 /// Listen for the first HID control press (or ESC/stop/timeout). Returns its semantic identity.
@@ -419,6 +323,7 @@ pub fn begin_keyseq(app: &AppWindow, on_done: impl Fn(&AppWindow, Option<String>
     let st = app.global::<State>();
     st.set_capture_active(true);
     CAPTURE_ACTIVE.store(true, Ordering::Relaxed);
+    neuron::intercept::set_paused(true);
     st.set_capture_prompt(
         "RECORDING — play the keys with your real timing · STOP or ESC ends the take".into(),
     );
@@ -447,6 +352,7 @@ fn finish_seq(gen: u64, grammar: Option<String>) {
     let st = app.global::<State>();
     st.set_capture_active(false);
     CAPTURE_ACTIVE.store(false, Ordering::Relaxed);
+    neuron::intercept::set_paused(false);
     st.set_capture_prompt("".into());
     let handler = SEQ_HANDLER.with(|h| h.borrow_mut().take());
     if let Some(h) = handler {
@@ -591,6 +497,7 @@ mod tests {
     fn a_capture_that_outlives_its_window_never_leaves_the_dispatcher_gated() {
         // Simulate the state a live capture leaves behind, then the dead-window completion.
         CAPTURE_ACTIVE.store(true, Ordering::Relaxed);
+        neuron::intercept::set_paused(true);
         RECORDING.store(true, Ordering::Relaxed);
         CAP_WINDOW.with(|c| *c.borrow_mut() = None); // a Weak that cannot upgrade
 
@@ -604,8 +511,12 @@ mod tests {
             !RECORDING.load(Ordering::Relaxed),
             "the REC/STOP toggle must not wedge in 'recording' either"
         );
-        VK_HANDLER.with(|h| assert!(h.borrow().is_none(), "handler cells hold closures over the dead window"));
-        CHORD_HANDLER.with(|h| assert!(h.borrow().is_none()));
+        assert!(
+            !neuron::intercept::paused(),
+            "the interceptor pause must release too — a leaked pause silently kills every \
+             device remap AND the cast-trigger swallow until the next capture completes"
+        );
+        CHORD_HANDLER.with(|h| assert!(h.borrow().is_none(), "handler cells hold closures over the dead window"));
         CTL_HANDLER.with(|h| assert!(h.borrow().is_none()));
         SEQ_HANDLER.with(|h| assert!(h.borrow().is_none()));
     }
@@ -620,10 +531,12 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         CANCEL.with(|c| *c.borrow_mut() = Some(stop.clone()));
         CAPTURE_ACTIVE.store(true, Ordering::Relaxed);
+        neuron::intercept::set_paused(true);
 
         cancel();
 
         assert!(!CAPTURE_ACTIVE.load(Ordering::Relaxed), "cancel lowers the dispatcher gate");
+        assert!(!neuron::intercept::paused(), "cancel releases the interceptor pause");
         assert!(stop.load(Ordering::Relaxed), "the capture worker is told to stop");
         CANCEL.with(|c| assert!(c.borrow().is_none(), "the stop cell is cleared for the next capture"));
     }
@@ -642,16 +555,18 @@ mod tests {
         // the NEWER capture bumps the generation and raises the gate
         GENERATION.with(|g| g.set(g.get() + 1));
         CAPTURE_ACTIVE.store(true, Ordering::Relaxed);
+        neuron::intercept::set_paused(true);
         CAP_WINDOW.with(|c| *c.borrow_mut() = None);
 
         // the older worker lands late — with no window, so it would otherwise take the
         // dead-window path and clear everything the new capture just set up.
-        finish_vk(stale_gen, 0x41, "A".to_string());
+        finish_ctl(stale_gen, None);
 
         assert!(
             CAPTURE_ACTIVE.load(Ordering::Relaxed),
             "a superseded completion must not lower the live capture's gate"
         );
         CAPTURE_ACTIVE.store(false, Ordering::Relaxed); // leave the global clean for other tests
+        neuron::intercept::set_paused(false);
     }
 }

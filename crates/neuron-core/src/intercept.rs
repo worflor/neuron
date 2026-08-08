@@ -35,6 +35,10 @@ use std::collections::{HashMap, VecDeque};
 pub enum KeyOut {
     /// Emit this physical scancode instead (a plain key remap).
     Scancode(u16),
+    /// Emit NOTHING — the key is claimed by a host feature (the cast/weave trigger) and its
+    /// keystroke must not reach the desktop at all. The same key on any OTHER device still
+    /// replays unchanged, exactly like a remap.
+    Swallow,
 }
 
 /// One device-scoped remap: pressing physical `from` scancode on device `pid` emits `to`. The same
@@ -120,6 +124,8 @@ impl Interceptor {
         match remaps.iter().find(|r| r.pid == pid) {
             Some(r) => match r.to {
                 KeyOut::Scancode(sc) => Some(Inject { scancode: sc, down }),
+                // Claimed by a host feature: the swallow IS the resolution — inject nothing.
+                KeyOut::Swallow => None,
             },
             // Some OTHER device sent this scancode — replay it unchanged so the real key still works.
             None => Some(Inject { scancode, down }),
@@ -167,19 +173,21 @@ impl Interceptor {
     /// Returns the target key if this (physkey, pid) is remapped, else the original (pass-through).
     /// Unlike [`on_rawinput`], this never touches `pending` (the Windows correlation path). The
     /// Windows/macOS backends use `on_hook`+`on_rawinput`; a grab backend uses this instead.
-    pub fn resolve_direct(&self, physkey: u16, down: bool, pid: u16) -> Inject {
+    /// `None` = the key is claimed with [`KeyOut::Swallow`] — emit nothing.
+    pub fn resolve_direct(&self, physkey: u16, down: bool, pid: u16) -> Option<Inject> {
         match self
             .by_scancode
             .get(&physkey)
             .and_then(|v| v.iter().find(|r| r.pid == pid))
         {
             Some(r) => match r.to {
-                KeyOut::Scancode(sc) => Inject { scancode: sc, down },
+                KeyOut::Scancode(sc) => Some(Inject { scancode: sc, down }),
+                KeyOut::Swallow => None,
             },
-            None => Inject {
+            None => Some(Inject {
                 scancode: physkey,
                 down,
-            },
+            }),
         }
     }
 }
@@ -222,6 +230,13 @@ static PAUSED: AtomicBool = AtomicBool::new(false);
 /// `true` when a capture starts and `false` when it ends.
 pub fn set_paused(on: bool) {
     PAUSED.store(on, Ordering::SeqCst);
+}
+
+/// Is the shim currently paused for a press-to-bind capture? Read-only witness for the capture
+/// teardown paths' tests (a leaked pause = keyboard remaps and the cast-trigger swallow silently
+/// dead process-wide until the next capture) and for diagnostics.
+pub fn paused() -> bool {
+    PAUSED.load(Ordering::SeqCst)
 }
 
 /// Is the shim standing down for this edge — either not armed at all, or [`set_paused`] for a
@@ -306,8 +321,59 @@ pub fn remap_for_rule(rule: &crate::engine::Rule) -> Option<Remap> {
 /// and [`configure`] with them. The dispatcher separately SKIPS these triggers ([`owns`]) so the
 /// engine never additively fires them. The ONE call the live loop makes on start + every reload.
 pub fn configure_from_engine(engine: &crate::engine::Engine) {
-    let remaps: Vec<Remap> = engine.rules.iter().filter_map(remap_for_rule).collect();
-    configure(remaps);
+    configure_from_engine_with(engine, None);
+}
+
+/// [`configure_from_engine`] plus a HELD-BIND claim: when a host feature owns a control as a held
+/// trigger (the cast/weave trigger), pass it here and — if it is a pid-scoped keyboard key the
+/// shim can express — its keystroke is swallowed device-scoped, so holding the Naga side-plate
+/// key to weave stops typing `1111…` into the focused app. The feature still sees the hold via
+/// the Raw-Input held registry (a hook swallow never blocks Raw Input). Device-any or
+/// mouse-button binds contribute nothing (mouse swallowing stays with the click-guard).
+pub fn configure_from_engine_with(
+    engine: &crate::engine::Engine,
+    held_bind: Option<crate::controls::ControlRef>,
+) {
+    configure(compose_remaps(engine, held_bind));
+}
+
+/// The pure remap-set composer behind [`configure_from_engine_with`] (split out so precedence is
+/// unit-testable without touching the process-global shim). The held-bind claim WINS over an
+/// ordinary engine remap on the same `(pid, key)`: resolution picks the FIRST matching rule, so a
+/// user who both remapped a key and made it the cast trigger would otherwise have the remap
+/// shadow the swallow — holding the trigger would type the remapped key into the focused app.
+/// The trigger claim is the more specific intent (every other surface already stands down to it),
+/// so the colliding remap is dropped, not merely out-ordered.
+fn compose_remaps(
+    engine: &crate::engine::Engine,
+    held_bind: Option<crate::controls::ControlRef>,
+) -> Vec<Remap> {
+    let claim = held_bind.and_then(swallow_for_control);
+    let mut remaps: Vec<Remap> = engine
+        .rules
+        .iter()
+        .filter_map(remap_for_rule)
+        .filter(|r| claim.is_none_or(|c| (r.pid, r.from) != (c.pid, c.from)))
+        .collect();
+    remaps.extend(claim);
+    remaps
+}
+
+/// The swallow-only [`Remap`] for a held-bind control, when the shim can express it: pid-scoped
+/// (a device-any bind would eat the key on EVERY keyboard — never) and on a keyboard page the
+/// platform can hook. `None` otherwise.
+pub fn swallow_for_control(ctl: crate::controls::ControlRef) -> Option<Remap> {
+    let pid = ctl.pid?;
+    let from = match ctl.page {
+        0x07 => sys::physkey_for_usage(ctl.usage)?,
+        0xFF07 => ctl.usage,
+        _ => return None, // mouse/consumer/macro controls aren't LL-keyboard-hook territory
+    };
+    Some(Remap {
+        pid,
+        from,
+        to: KeyOut::Swallow,
+    })
 }
 
 /// Does the shim own this trigger `(page, usage, pid)`? The live dispatcher calls this to skip its
@@ -727,19 +793,88 @@ mod tests {
         // Naga '=' -> 'g' directly.
         assert_eq!(
             i.resolve_direct(0x0D, true, NAGA),
-            Inject { scancode: 0x22, down: true }
+            Some(Inject { scancode: 0x22, down: true })
         );
         // The same key from another device -> passed through unchanged.
         assert_eq!(
             i.resolve_direct(0x0D, true, KBD),
-            Inject { scancode: 0x0D, down: true }
+            Some(Inject { scancode: 0x0D, down: true })
         );
         // An unremapped key -> unchanged, and no pending state was touched.
         assert_eq!(
             i.resolve_direct(0x1E, false, NAGA),
-            Inject { scancode: 0x1E, down: false }
+            Some(Inject { scancode: 0x1E, down: false })
         );
         assert_eq!(i.pending_len(), 0);
+    }
+
+    /// The held-bind claim must WIN over an ordinary engine remap on the same device key —
+    /// resolution picks the first `(pid, from)` match, so without the compose-time drop the
+    /// remap would shadow the swallow and holding the cast trigger would TYPE the remapped key.
+    /// (Windows-only: composing needs the usage→scancode map.)
+    #[cfg(windows)]
+    #[test]
+    fn held_bind_claim_beats_a_colliding_engine_remap() {
+        use crate::action::Action;
+        use crate::engine::{Engine, Rule, Trigger};
+        let ctl = crate::controls::ControlRef {
+            page: 0x07,
+            usage: 0x1E, // the side-plate '1'
+            pid: Some(NAGA),
+        };
+        // the same key carries a plain Key remap rule AND is the held cast trigger.
+        let engine = Engine::from_rules(vec![
+            Rule::new(
+                Trigger::Input { page: 0x07, usage: 0x1E, pid: Some(NAGA) },
+                Action::Key { key: "g".into() },
+            ),
+            // an unrelated remap on another key must survive untouched.
+            Rule::new(
+                Trigger::Input { page: 0x07, usage: 0x1F, pid: Some(NAGA) },
+                Action::Key { key: "h".into() },
+            ),
+        ]);
+        let remaps = compose_remaps(&engine, Some(ctl));
+        let from = sys::physkey_for_usage(0x1E).expect("'1' has a scancode");
+        let on_trigger: Vec<_> = remaps
+            .iter()
+            .filter(|r| r.pid == NAGA && r.from == from)
+            .collect();
+        assert_eq!(on_trigger.len(), 1, "exactly one rule may own the trigger key");
+        assert_eq!(on_trigger[0].to, KeyOut::Swallow, "and it is the swallow claim");
+        let other = sys::physkey_for_usage(0x1F).expect("'2' has a scancode");
+        assert!(
+            remaps.iter().any(|r| r.from == other && matches!(r.to, KeyOut::Scancode(_))),
+            "the non-colliding remap survives"
+        );
+    }
+
+    /// A held-bind claim (the cast trigger on a specific device) swallows that device's
+    /// keystroke entirely — and ONLY that device's: the same key elsewhere replays unchanged.
+    #[test]
+    fn swallow_claim_eats_the_devices_key_and_only_that_devices() {
+        let mut i = Interceptor::new();
+        // '1' scancode 0x02 claimed as a held bind on the Naga.
+        i.set_remaps([Remap {
+            pid: NAGA,
+            from: 0x02,
+            to: KeyOut::Swallow,
+        }]);
+        assert!(i.on_hook(0x02, true, 1000), "claimed scancode is swallowed at hook time");
+        // Naga attribution -> nothing injected: the '1' never reaches the desktop.
+        assert_eq!(i.on_rawinput(0x02, true, NAGA), None);
+        // The real keyboard's '1' is swallowed then replayed unchanged.
+        assert!(i.on_hook(0x02, true, 2000));
+        assert_eq!(
+            i.on_rawinput(0x02, true, KBD),
+            Some(Inject { scancode: 0x02, down: true })
+        );
+        // Grab-model path agrees.
+        assert_eq!(i.resolve_direct(0x02, true, NAGA), None);
+        assert_eq!(
+            i.resolve_direct(0x02, true, KBD),
+            Some(Inject { scancode: 0x02, down: true })
+        );
     }
 
     #[test]

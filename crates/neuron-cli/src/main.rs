@@ -1223,9 +1223,9 @@ fn cast_show() {
     let cfg = CastConfig::load();
     let custom = CastConfig::path().exists();
     println!(
-        "cast config ({}):  trigger=0x{:02X}  mode={:?}  sectors={}  deadzone={}",
+        "cast config ({}):  trigger={}  mode={:?}  sectors={}  deadzone={}",
         if custom { "cast.toml" } else { "defaults" },
-        cfg.trigger,
+        cfg.trigger.label(),
         cfg.mode,
         cfg.sectors,
         cfg.deadzone
@@ -1253,10 +1253,13 @@ fn cast_show() {
 fn cast_run(trigger_override: Option<i32>) {
     let cfg = CastConfig::load();
     let vault = Vault::load();
-    let trigger = trigger_override.unwrap_or(cfg.trigger);
+    let trigger = trigger_override
+        .map(neuron::controls::ControlRef::from_vk)
+        .unwrap_or(cfg.trigger);
     println!(
-        "Cast engine — mode={:?}, trigger=0x{trigger:02X}, {} wheel wedge(s), {} glyph(s), {} recorded template(s).",
+        "Cast engine — mode={:?}, trigger={}, {} wheel wedge(s), {} glyph(s), {} recorded template(s).",
         cfg.mode,
+        trigger.label(),
         cfg.radial.len(),
         cfg.gestures.len(),
         vault.templates.len()
@@ -1314,7 +1317,7 @@ fn radial_pick(trigger: i32, sectors: usize) {
         items: vec![],
     };
     println!("Radial: HOLD trigger 0x{trigger:02X}, flick a direction, release (ESC aborts)...");
-    let path = glyph::capture_held(trigger, 4096);
+    let path = glyph::capture_held(neuron::controls::ControlRef::from_vk(trigger), 4096);
     if path.len() < 2 {
         println!("(no motion captured)");
         return;
@@ -4021,7 +4024,7 @@ fn gesture_selftest() {
 fn gesture_record(name: &str, trigger: i32) -> Result<()> {
     let mut vault = Vault::load();
     println!("Recording '{name}'. HOLD trigger 0x{trigger:02X}, draw, release (ESC aborts)...");
-    let stroke = glyph::capture_held(trigger, 8192);
+    let stroke = glyph::capture_held(neuron::controls::ControlRef::from_vk(trigger), 8192);
     if stroke.len() < 8 {
         bail!("not enough motion captured ({} pts)", stroke.len());
     }
@@ -4050,7 +4053,7 @@ fn gesture_match(trigger: i32) -> Result<()> {
         return Ok(());
     }
     println!("HOLD trigger 0x{trigger:02X}, draw, release...");
-    let stroke = glyph::capture_held(trigger, 8192);
+    let stroke = glyph::capture_held(neuron::controls::ControlRef::from_vk(trigger), 8192);
     if stroke.len() < 8 {
         bail!("not enough motion captured ({} pts)", stroke.len());
     }
