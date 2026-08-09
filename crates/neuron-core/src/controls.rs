@@ -2747,6 +2747,31 @@ pub(crate) mod win {
                                                 (0x0100, 0x0200, 5),
                                             ];
                                             let path = device_path(hdev);
+                                            // MOUSE-SIDE REMAP SHIM: feed middle/X button edges
+                                            // (with their canonical source pid) to the
+                                            // interceptor so it can attribute a hook-swallowed
+                                            // click and replay unclaimed-device ones. The twin
+                                            // of the keyboard feed above; no-op unless armed.
+                                            {
+                                                let pid = crate::registry::canonical_event_pid(
+                                                    u16::from_str_radix(&pid_from_path(&path), 16)
+                                                        .unwrap_or(0),
+                                                );
+                                                for &(d, u, n) in &BTN {
+                                                    if (3..=5).contains(&n) {
+                                                        if flags & d != 0 {
+                                                            crate::intercept::on_raw_mouse(
+                                                                n, true, pid,
+                                                            );
+                                                        }
+                                                        if flags & u != 0 {
+                                                            crate::intercept::on_raw_mouse(
+                                                                n, false, pid,
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                            }
                                             let set = down_sets.entry(path.clone()).or_default();
                                             let mut changed = false;
                                             for &(d, u, n) in &BTN {
