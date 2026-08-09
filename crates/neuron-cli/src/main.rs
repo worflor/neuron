@@ -3782,8 +3782,14 @@ fn save_gui_rules(rules: Vec<neuron::engine::Rule>) -> Result<()> {
 fn capture_sniper_control() -> Option<(u16, u16, Option<u16>)> {
     use std::cell::Cell;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Instant;
+    // TWIN-EVENT PREFERENCE, mirroring the GUI capture: a side-plate press can emit BOTH its
+    // keyboard usage and a receiver-echoed macro-page code; park the macro hit briefly and
+    // prefer the same-device keyboard identity if it follows.
+    const TWIN_SETTLE: std::time::Duration = std::time::Duration::from_millis(80);
     let stop = AtomicBool::new(false);
     let found: Cell<Option<(u16, u16, Option<u16>)>> = Cell::new(None);
+    let parked: Cell<Option<(u16, u16, Option<u16>, Instant)>> = Cell::new(None);
     neuron::controls::listen_until(
         Some(30),
         &stop,
@@ -3793,18 +3799,46 @@ fn capture_sniper_control() -> Option<(u16, u16, Option<u16>)> {
                 if (page, usage) == (0x09, 1) {
                     return; // left mouse operates the terminal, not a bindable control
                 }
-                let pid = if page == neuron::controls::RAZER_MACRO_PAGE {
-                    None
-                } else {
-                    u16::from_str_radix(&ev.pid, 16).ok()
-                };
-                found.set(Some((page, usage, pid)));
-                stop.store(true, Ordering::Relaxed);
+                // device-scoped, macro page included: strip the macro stream's edge-bucket
+                // prefix back to the canonical device pid (mirrors the GUI capture; the strip is
+                // MACRO-PAGE-ONLY, like `controls::hit_trigger`).
+                let pid = u16::from_str_radix(&ev.pid, 16).ok().map(|p| {
+                    if page == neuron::controls::RAZER_MACRO_PAGE && p & 0xF000 == 0xF000 {
+                        p & 0x0FFF
+                    } else {
+                        p
+                    }
+                });
+                match parked.get() {
+                    None if page == neuron::controls::RAZER_MACRO_PAGE => {
+                        parked.set(Some((page, usage, pid, Instant::now())));
+                    }
+                    Some((pp, pu, ppid, at)) => {
+                        if at.elapsed() >= TWIN_SETTLE {
+                            found.set(Some((pp, pu, ppid))); // the macro press WAS the bind
+                            stop.store(true, Ordering::Relaxed);
+                        } else if page != neuron::controls::RAZER_MACRO_PAGE && pid == ppid {
+                            found.set(Some((page, usage, pid))); // the keyboard twin wins
+                            stop.store(true, Ordering::Relaxed);
+                        }
+                    }
+                    None => {
+                        found.set(Some((page, usage, pid)));
+                        stop.store(true, Ordering::Relaxed);
+                    }
+                }
             }
         },
-        // on_tick: nothing to poll during a one-shot interactive capture. The returned Duration
-        // is a pump-cadence hint for the future blocking-wait rewrite (ignored today).
-        || std::time::Duration::from_millis(5),
+        // on_tick: commit a parked macro candidate once its settle window closes with no twin.
+        || {
+            if let Some((pp, pu, ppid, at)) = parked.get() {
+                if at.elapsed() >= TWIN_SETTLE {
+                    found.set(Some((pp, pu, ppid)));
+                    stop.store(true, Ordering::Relaxed);
+                }
+            }
+            std::time::Duration::from_millis(5)
+        },
     );
     found.get()
 }

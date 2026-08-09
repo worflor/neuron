@@ -69,13 +69,12 @@ impl Trigger {
                 // a friendly, layout-independent control name ("F13", "Button 4", "Left Ctrl") instead
                 // of raw hex — the ONE place a HID control becomes rule-list text.
                 let name = crate::controls::control_label(*page, *usage);
-                // Macro keys are device-any logical controls riding a synthetic edge-bucket pid; the
-                // name already says which key, so the pid is noise — never tack it on for them.
+                // A pid-scoped bind says so — macro-page included, now that captures keep the
+                // device identity there (two boards share the macro code space, so "which device"
+                // is signal, not noise). Device-any binds stay clean.
                 match pid {
-                    Some(p) if *page != crate::controls::RAZER_MACRO_PAGE => {
-                        format!("{name} @pid {p:04x}")
-                    }
-                    _ => name,
+                    Some(p) => format!("{name} @pid {p:04x}"),
+                    None => name,
                 }
             }
             Trigger::Gesture { name } => format!("gesture '{name}'"),
@@ -311,8 +310,14 @@ impl Engine {
 
     /// Do two triggers match for dispatch purposes? Exact equality, except `Input` with no
     /// `pid` filter matches any source pid, and `AppFocus` uses a (case-insensitive) substring
-    /// match (so a rule needle `"valorant"` fires on `"valorant.exe"`). Pure and side-effect
-    /// free so it stays testable.
+    /// match (so a rule needle `"valorant"` fires on `"valorant.exe"`).
+    ///
+    /// The RULE's pid is canonicalized through the registry before comparing — a persisted bind
+    /// that stored a link-mode pid (a rule captured on the dongle as `00a8` before event pids
+    /// canonicalized) keeps matching, because fired events now always carry the canonical pid.
+    /// This is the in-place MIGRATION for every rule store at once (gui rules, sidecars,
+    /// bindings.toml, imports) — no file rewrite. An unknown pid canonicalizes to itself, so
+    /// this stays pure identity for non-registry devices.
     pub fn matches(rule_trigger: &Trigger, fired: &Trigger) -> bool {
         match (rule_trigger, fired) {
             (
@@ -326,7 +331,12 @@ impl Engine {
                     usage: fu,
                     pid: fpid,
                 },
-            ) => rp == fp && ru == fu && rpid.is_none_or(|p| Some(p) == *fpid),
+            ) => {
+                rp == fp
+                    && ru == fu
+                    && rpid
+                        .is_none_or(|p| Some(crate::registry::canonical_event_pid(p)) == *fpid)
+            }
             (Trigger::AppFocus { app: needle }, Trigger::AppFocus { app }) => {
                 app.to_lowercase().contains(&needle.to_lowercase())
             }

@@ -56,12 +56,15 @@ pub fn start() {
         return;
     };
     // Mice belong to hidwatch (it reads the SAME vendor collection for DPI/scroll). Macro keys ride
-    // keyboards: Razer devices that speak `device_mode` but aren't DPI mice — capability-driven scope.
+    // keyboards: Razer devices that speak `device_mode` but aren't DPI mice — capability-driven
+    // scope. OWNED EVENT pids, not just mode pids: a mouse's HyperSpeed receiver exposes its own
+    // sideband collections under the DONGLE's pid, and claiming those here read the mouse's
+    // driver-mode side-plate events as keyboard macro keys (device-anonymous, wrong reader).
     let mouse_pids: HashSet<u16> = reg
         .devices
         .iter()
         .filter(|d| d.supports(Capability::Dpi))
-        .flat_map(|d| d.product_ids())
+        .flat_map(|d| d.owned_event_pids())
         .collect();
 
     ensure_driver_mode(reg, &mouse_pids);
@@ -222,11 +225,13 @@ fn decode(buf: &[u8], pid: u16) {
     neuron::capture::set_macro_held(macro_mask);
     // Synthetic edge-bucket pid (high range, never a real Razer PID < 0x1000) so the macro stream
     // gets its OWN HoldEdges bucket — it must NOT be diffed against the same keyboard's STANDARD
-    // keys, which arrive via Raw Input under the real PID. Macro binds are device-ANY (capture.rs
-    // drops this pid), so it's runtime-only — never persisted — and only needs to be locally distinct.
-    debug_assert!(pid < 0x1000, "Razer pid {pid:#06x} would alias the 0xF000 macro-bucket prefix");
+    // keys, which arrive via Raw Input under the real PID. Built from the CANONICAL event pid so
+    // the device identity the bucket carries (and `hit_trigger` strips back out for pid-scoped
+    // macro binds) is stable across link modes.
+    let canon = neuron::registry::canonical_event_pid(pid);
+    debug_assert!(canon < 0x1000, "Razer pid {canon:#06x} would alias the 0xF000 macro-bucket prefix");
     neuron::controls::inject_event(neuron::controls::ControlEvent {
-        pid: format!("{:04x}", 0xF000u16 | (pid & 0x0FFF)),
+        pid: format!("{:04x}", 0xF000u16 | (canon & 0x0FFF)),
         hits,
         raw: buf.to_vec(),
     });

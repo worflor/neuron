@@ -244,10 +244,22 @@ fn finish_ctl(gen: u64, pkt: Option<(u16, u16, Option<u16>)>) {
 }
 
 /// Listen for the first HID control press (or ESC/stop/timeout). Returns its semantic identity.
+///
+/// TWIN-EVENT PREFERENCE: one physical press can emit TWO events. The Naga side plate types its
+/// keyboard usage AND the HyperSpeed receiver echoes a vendor deferred-button code (proven live —
+/// driver mode does not stop the plate typing). The keyboard identity is the one every downstream
+/// mechanism serves best (the intercept shim can swallow it; `control_label` names it), so when a
+/// MACRO-page hit lands first we hold it as a candidate for a short settle window and prefer any
+/// non-macro hit that follows. A lone macro key (a BlackWidow M-key) just commits after the
+/// window — imperceptible in a press-to-bind dialog.
 #[cfg(windows)]
 fn capture_control_until(stop: &AtomicBool) -> Option<CapturedControl> {
     use std::cell::Cell;
+    use std::time::Instant;
+    /// How long a macro-page candidate waits for its possible keyboard twin.
+    const TWIN_SETTLE: std::time::Duration = std::time::Duration::from_millis(80);
     let found: Cell<Option<CapturedControl>> = Cell::new(None);
+    let macro_candidate: Cell<Option<(CapturedControl, Instant)>> = Cell::new(None);
     neuron::controls::listen_until(
         Some(30), // hard 30s cap so a forgotten capture can't run forever
         stop,
@@ -261,22 +273,62 @@ fn capture_control_until(stop: &AtomicBool) -> Option<CapturedControl> {
                 if (page, usage) == (0x09, 1) {
                     return;
                 }
-                // Macro keys are LOGICAL controls (M5 is M5 on any board) riding a synthetic
-                // edge-bucket pid; bind them DEVICE-ANY so the label stays clean ("Macro M5", no
-                // @pid) and a replug/keyboard-swap keeps the binding. Every other control keeps its
-                // real device pid (a knob on headset A is not the knob on headset B).
-                let pid = if page == neuron::controls::RAZER_MACRO_PAGE {
-                    None
-                } else {
-                    u16::from_str_radix(&ev.pid, 16).ok()
-                };
-                found.set(Some(CapturedControl { page, usage, pid }));
-                stop.store(true, Ordering::Relaxed);
+                // Every control keeps its device identity — including macro-page controls, whose
+                // events ride a synthetic edge-bucket pid (`0xF000 | canonical pid`): strip the
+                // bucket prefix back to the canonical device pid. Two boards share the macro code
+                // space (a keyboard's M3 and a Naga side-plate key can both be 0x22), so a
+                // device-anonymous bind fires from BOTH — the old "M5 is M5 on any board" policy
+                // only ever made sense with a single Razer device attached. The canonical pid is
+                // link-mode-stable, so a replug/dongle swap keeps the binding.
+                // bucket-strip is MACRO-PAGE-ONLY, mirroring `controls::hit_trigger` — on any
+                // other page a 0xF???-range pid is (an unlikely but) real device identity.
+                let pid = u16::from_str_radix(&ev.pid, 16).ok().map(|p| {
+                    if page == neuron::controls::RAZER_MACRO_PAGE && p & 0xF000 == 0xF000 {
+                        p & 0x0FFF
+                    } else {
+                        p
+                    }
+                });
+                let c = CapturedControl { page, usage, pid };
+                match macro_candidate.get() {
+                    // maybe a receiver echo — park it and wait for the keyboard twin.
+                    None if page == neuron::controls::RAZER_MACRO_PAGE => {
+                        macro_candidate.set(Some((c, Instant::now())));
+                    }
+                    // A candidate is parked: only its OWN device's non-macro event, INSIDE the
+                    // settle window, is the twin (both sides carry the canonical pid). A window
+                    // that already lapsed commits the candidate — the macro press WAS the bind —
+                    // even if a same-device event arrives before the next tick. Anything else — a
+                    // headset push, a stray control on another board — is neither the press being
+                    // bound nor its twin; ignore it rather than let it steal the bind.
+                    Some((cand, at)) => {
+                        if at.elapsed() >= TWIN_SETTLE {
+                            found.set(Some(cand));
+                            stop.store(true, Ordering::Relaxed);
+                        } else if page != neuron::controls::RAZER_MACRO_PAGE && pid == cand.pid {
+                            found.set(Some(c));
+                            stop.store(true, Ordering::Relaxed);
+                        }
+                    }
+                    // no candidate, ordinary control — first press wins, instantly.
+                    None => {
+                        found.set(Some(c));
+                        stop.store(true, Ordering::Relaxed);
+                    }
+                }
             }
         },
-        // on_tick: nothing to poll during a one-shot interactive capture. The returned Duration
-        // is a pump-cadence hint for the future blocking-wait rewrite (ignored today).
-        || std::time::Duration::from_millis(5),
+        // on_tick: commit a parked macro candidate once its settle window closes without a
+        // keyboard twin appearing (the press really was a macro key).
+        || {
+            if let Some((c, at)) = macro_candidate.get() {
+                if at.elapsed() >= TWIN_SETTLE {
+                    found.set(Some(c));
+                    stop.store(true, Ordering::Relaxed);
+                }
+            }
+            std::time::Duration::from_millis(5)
+        },
     );
     found.get()
 }

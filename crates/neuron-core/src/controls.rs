@@ -82,11 +82,15 @@ const INJECT_PENDING_MAX: usize = 64;
 /// than dropped, and the first sink to register replays it (see [`inject_register`]) — so the very
 /// first macro keypress after launch is never lost to the startup race.
 pub fn inject_event(ev: ControlEvent) {
-    // Injected sources (macro keys) feed the shared held-state registry too, so a macro key is a
-    // first-class candidate for held binds (the cast trigger) exactly like a native control.
+    // Injected sources (macro keys / deferred buttons) feed the shared held-state registry too,
+    // so they are first-class candidates for held binds (the cast trigger) exactly like a native
+    // control. The registry speaks the device's canonical identity, so strip the synthetic
+    // edge-bucket prefix (see `hit_trigger`) before recording.
     note_held(
         &format!("inject:{}", ev.pid),
-        u16::from_str_radix(&ev.pid, 16).ok(),
+        u16::from_str_radix(&ev.pid, 16)
+            .ok()
+            .map(|p| if p & 0xF000 == 0xF000 { p & 0x0FFF } else { p }),
         &ev.hits,
     );
     // Stamp BEFORE taking the lock: the stamp means "when this edge became visible to us", and lock
@@ -467,11 +471,23 @@ use crate::profile::AppRules;
 pub fn event_trigger(ev: &ControlEvent) -> Option<Trigger> {
     let &(page, usage) = ev.hits.first()?;
     let pid = u16::from_str_radix(&ev.pid, 16).ok();
-    Some(Trigger::Input { page, usage, pid })
+    Some(hit_trigger(page, usage, pid))
 }
 
 /// Map a single decoded `(page, usage)` hit + source pid to its [`Trigger::Input`].
+///
+/// Macro-page events ride a synthetic edge-bucket pid (`0xF000 | canonical device pid`) so their
+/// [`HoldEdges`] bucket never collides with the same device's Raw-Input streams. The TRIGGER,
+/// though, speaks the device's canonical identity — strip the bucket prefix here so pid-scoped
+/// macro/deferred-button binds (a Naga side-plate key, a BlackWidow M-key) match their device.
 fn hit_trigger(page: u16, usage: u16, pid: Option<u16>) -> Trigger {
+    let pid = pid.map(|p| {
+        if page == RAZER_MACRO_PAGE && p & 0xF000 == 0xF000 {
+            crate::registry::canonical_event_pid(p & 0x0FFF)
+        } else {
+            p
+        }
+    });
     Trigger::Input { page, usage, pid }
 }
 
@@ -787,6 +803,24 @@ pub(crate) fn note_held(source: &str, pid: Option<u16>, hits: &[(u16, u16)]) {
     }
 }
 
+/// Canonicalize a decode-time pid hex string onto the owning device's event identity — the one
+/// transformation between "the pid this event physically arrived under" (a link-mode or
+/// receiver-sideband pid) and "the device the user bound". See [`crate::registry::
+/// canonical_event_pid`]; an unparseable pid passes through untouched.
+pub(crate) fn canonical_pid_hex(pid: String) -> String {
+    match u16::from_str_radix(&pid, 16) {
+        Ok(p) => {
+            let c = crate::registry::canonical_event_pid(p);
+            if c == p {
+                pid
+            } else {
+                format!("{c:04x}")
+            }
+        }
+        Err(_) => pid,
+    }
+}
+
 /// Is any live Raw-Input pump feeding the registry? Every listen loop registers an inject drain
 /// for its whole lifetime, so the sink list doubles as the pump-liveness signal — no extra
 /// bookkeeping. When this is false (CLI one-shots, tests), [`control_held`] returns `None` and
@@ -802,6 +836,9 @@ pub fn control_held(page: u16, usage: u16, pid: Option<u16>) -> Option<bool> {
     if !held_registry_live() {
         return None;
     }
+    // registry entries carry canonical pids (decode canonicalizes) — canonicalize the QUERY too,
+    // so a bind persisted with a link-mode pid before canonicalization keeps reading its hold.
+    let pid = pid.map(crate::registry::canonical_event_pid);
     let g = HELD.lock().unwrap_or_else(|e| e.into_inner());
     Some(g.iter().any(|(_, src_pid, set)| {
         (pid.is_none() || pid == *src_pid) && set.binary_search(&(page, usage)).is_ok()
@@ -852,6 +889,31 @@ mod control_ref_tests {
                 assert_eq!(back, generic, "vk 0x{vk:02X} roundtrip");
             }
         }
+    }
+
+    #[test]
+    fn macro_bucket_pids_strip_to_the_canonical_device() {
+        // A deferred-button/macro event rides bucket pid 0xF000|canonical; its TRIGGER must speak
+        // the device. 0xF0A7 → the Naga's canonical 0x00A7 (identity through the builtin defs).
+        let ev = ControlEvent {
+            pid: "f0a7".into(),
+            hits: vec![(RAZER_MACRO_PAGE, 0x22)],
+            raw: Vec::new(),
+        };
+        assert_eq!(
+            event_trigger(&ev),
+            Some(Trigger::Input {
+                page: RAZER_MACRO_PAGE,
+                usage: 0x22,
+                pid: Some(0x00A7),
+            })
+        );
+        // a non-macro page never strips (0xF0.. would be a genuinely weird real pid — keep it).
+        let ev2 = ControlEvent { pid: "0221".into(), hits: vec![(0x07, 0x1E)], raw: Vec::new() };
+        assert_eq!(
+            event_trigger(&ev2),
+            Some(Trigger::Input { page: 0x07, usage: 0x1E, pid: Some(0x0221) })
+        );
     }
 
     #[test]
@@ -2597,7 +2659,7 @@ pub(crate) mod win {
                                                 }
                                             }
                                         }
-                                        let pid = pid_from_path(&path);
+                                        let pid = super::canonical_pid_hex(pid_from_path(&path));
                                         super::note_held(
                                             &path,
                                             u16::from_str_radix(&pid, 16).ok(),
@@ -2634,8 +2696,12 @@ pub(crate) mod win {
                                             {
                                                 let physkey =
                                                     kb.MakeCode | if e0 { 0x100 } else { 0 };
-                                                let pid = u16::from_str_radix(&pid_from_path(&path), 16)
-                                                    .unwrap_or(0);
+                                                // canonical identity, so a pid-scoped remap keeps
+                                                // working when the same device rides its dongle.
+                                                let pid = crate::registry::canonical_event_pid(
+                                                    u16::from_str_radix(&pid_from_path(&path), 16)
+                                                        .unwrap_or(0),
+                                                );
                                                 crate::intercept::on_raw_keyboard(physkey, !up, pid);
                                             }
                                             let set = down_sets.entry(path.clone()).or_default();
@@ -2650,7 +2716,9 @@ pub(crate) mod win {
                                                 false // auto-repeat: already down, no new edge
                                             };
                                             if changed {
-                                                let pid = pid_from_path(&path);
+                                                let pid = super::canonical_pid_hex(
+                                                    pid_from_path(&path),
+                                                );
                                                 super::note_held(
                                                     &path,
                                                     u16::from_str_radix(&pid, 16).ok(),
@@ -2694,7 +2762,9 @@ pub(crate) mod win {
                                                 }
                                             }
                                             if changed {
-                                                let pid = pid_from_path(&path);
+                                                let pid = super::canonical_pid_hex(
+                                                    pid_from_path(&path),
+                                                );
                                                 super::note_held(
                                                     &path,
                                                     u16::from_str_radix(&pid, 16).ok(),

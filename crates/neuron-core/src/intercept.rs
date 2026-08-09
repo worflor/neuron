@@ -297,7 +297,14 @@ pub fn remap_for_rule(rule: &crate::engine::Rule) -> Option<Remap> {
             page,
             usage,
             pid: Some(pid),
-        } => (*page, *usage, *pid),
+        } => (
+            *page,
+            *usage,
+            // raw-input attribution feeds this shim CANONICAL pids (controls decode
+            // canonicalizes) — canonicalize the rule's stored pid to match, so a bind persisted
+            // with a link-mode pid before canonicalization keeps owning its key.
+            crate::registry::canonical_event_pid(*pid),
+        ),
         _ => return None,
     };
     let from = match page {
@@ -363,7 +370,8 @@ fn compose_remaps(
 /// (a device-any bind would eat the key on EVERY keyboard — never) and on a keyboard page the
 /// platform can hook. `None` otherwise.
 pub fn swallow_for_control(ctl: crate::controls::ControlRef) -> Option<Remap> {
-    let pid = ctl.pid?;
+    // canonical, like every pid the raw-input attribution hands this shim.
+    let pid = crate::registry::canonical_event_pid(ctl.pid?);
     let from = match ctl.page {
         0x07 => sys::physkey_for_usage(ctl.usage)?,
         0xFF07 => ctl.usage,
@@ -835,10 +843,13 @@ mod tests {
             ),
         ]);
         let remaps = compose_remaps(&engine, Some(ctl));
+        // stored pids canonicalize through the registry: the dongle pid (00a8, the test's NAGA)
+        // composes into claims under the Naga's canonical identity (00a7, its first mode).
+        let canon = crate::registry::canonical_event_pid(NAGA);
         let from = sys::physkey_for_usage(0x1E).expect("'1' has a scancode");
         let on_trigger: Vec<_> = remaps
             .iter()
-            .filter(|r| r.pid == NAGA && r.from == from)
+            .filter(|r| r.pid == canon && r.from == from)
             .collect();
         assert_eq!(on_trigger.len(), 1, "exactly one rule may own the trigger key");
         assert_eq!(on_trigger[0].to, KeyOut::Swallow, "and it is the swallow claim");

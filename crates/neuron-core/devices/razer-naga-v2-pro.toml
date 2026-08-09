@@ -17,6 +17,14 @@ transaction_id = 0x1F
 # Streaming writes sleep this; if a board ever wants a different cadence it's a one-line data tweak.
 stream_wait_us = 31000
 
+# The HyperSpeed receiver's OWN pid (the dongle hardware itself, distinct from the per-link pids
+# in [[modes]] below — Windows shows both PID_00A8 and PID_0529 while on dongle). Driver-mode
+# deferred-button events (the side-plate keys) ride the receiver's sideband HID collections under
+# THIS pid. Owning it keeps the keyboard-side reader (macrokeys) off a mouse's receiver and
+# canonicalizes those events onto this device's identity. Never a control pipe. (Root-level key —
+# it must sit ABOVE the [[modes]] tables or TOML files it into the last mode.)
+event_alias_pids = [0x0529]
+
 # The device changes USB PID per link mode.
 [[modes]]
 name = "wired"

@@ -508,6 +508,7 @@ pub fn synthesize(t: &dyn Transport, ctx: &SynthCtx) -> Option<Synthesis> {
             name: "default".into(),
             product_id: ctx.pid,
         }],
+        event_alias_pids: Vec::new(),
         control_interface: ControlInterface {
             usage_page: ctx.usage_page,
             usage: ctx.usage,

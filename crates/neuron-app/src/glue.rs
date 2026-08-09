@@ -3005,9 +3005,14 @@ pub fn install(app: &AppWindow) -> SharedRt {
                             // stash the captured (page,usage,pid) for add-binding, show its name.
                             CAPTURED_CONTROL.with(|cell| *cell.borrow_mut() = Some(c));
                             // a friendly, layout-independent control name ("F13", "Button 4",
-                            // "Left Ctrl") — control_label falls back to an exact hex id for anything
-                            // unmapped, so a weird controller still shows something legible.
-                            let label = neuron::controls::control_label(c.page, c.usage);
+                            // "Left Ctrl"), device-scoped when the capture carries a pid — the
+                            // label tells the truth about WHICH device's key this bind owns.
+                            let label = neuron::controls::ControlRef {
+                                page: c.page,
+                                usage: c.usage,
+                                pid: c.pid,
+                            }
+                            .label();
                             st.set_bind_trigger_label(label.into());
                             st.set_bind_trigger_ready(true);
                             // DUPLICATE-TRIGGER honesty: if another rule on the SAME target layer

@@ -413,6 +413,7 @@ impl Dialect for RazerAudioDialect {
                 name: "default".into(),
                 product_id: ctx.pid,
             }],
+            event_alias_pids: Vec::new(),
             control_interface: ControlInterface {
                 usage_page: ctx.usage_page,
                 usage: ctx.usage,

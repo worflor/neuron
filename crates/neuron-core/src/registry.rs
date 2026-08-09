@@ -113,6 +113,14 @@ pub struct DeviceDef {
     #[serde(default)]
     pub stream_wait_us: u64,
     pub modes: Vec<Mode>,
+    /// USB pids that carry this device's EVENTS but are not the device itself — e.g. a HyperSpeed
+    /// receiver's own sideband HID collections (the DONGLE's pid, distinct from the paired
+    /// device's per-link-mode pids in `modes`). Owning these pids does two things: input readers
+    /// scope them to this device's family (the keyboard-side macro reader must not claim a
+    /// mouse's receiver), and event identity CANONICALIZES onto this device (see
+    /// [`canonical_event_pid`]). Never a control pipe — `razer_report` still goes to `modes`.
+    #[serde(default)]
+    pub event_alias_pids: Vec<u16>,
     pub control_interface: ControlInterface,
     pub commands: BTreeMap<String, CommandSpec>,
     /// Optional unified-lighting wiring (the device-specific dialect of class 0x03 / 0x0F).
@@ -137,6 +145,11 @@ pub struct DeviceDef {
 impl DeviceDef {
     pub fn product_ids(&self) -> impl Iterator<Item = u16> + '_ {
         self.modes.iter().map(|m| m.product_id)
+    }
+    /// Every pid whose INPUT EVENTS belong to this device: the per-link-mode pids plus any
+    /// receiver-sideband aliases. The set input readers use to decide ownership.
+    pub fn owned_event_pids(&self) -> impl Iterator<Item = u16> + '_ {
+        self.product_ids().chain(self.event_alias_pids.iter().copied())
     }
     pub fn mode_for(&self, pid: u16) -> Option<&Mode> {
         self.modes.iter().find(|m| m.product_id == pid)
@@ -367,6 +380,112 @@ impl Capability {
 
 pub struct Registry {
     pub devices: Vec<DeviceDef>,
+}
+
+// ── CANONICAL EVENT PID ─────────────────────────────────────────────────────────────────────────
+//
+// One physical device presents SEVERAL USB pids: one per link mode (wired / dongle / bluetooth)
+// plus, on dongle, the receiver's own sideband collections. Input events arrive under whichever
+// pid the current link uses — so a pid-scoped bind captured on the dongle silently died on the
+// wire, and receiver-sideband events looked like a different (or unknown) device entirely. Event
+// identity therefore canonicalizes: every pid a def owns maps to the def's FIRST declared mode
+// (the stable, documented identity), and triggers/captures/the held registry all speak that one
+// pid. Transport/control identity is untouched — `razer_report` still opens the live pid.
+
+/// The event-identity tables (canonical map + alias set), built from ONE successful registry
+/// load and cached. A FAILED load is NOT cached — it returns `None` (callers degrade to identity
+/// behaviour) and the next call retries, so a transient startup race or a momentarily-bad def
+/// file can never freeze canonicalization off for the whole process. Def edits still need a
+/// restart once a load has succeeded, like the rest of the registry surface.
+#[allow(clippy::type_complexity)]
+fn event_identity_tables(
+) -> Option<std::sync::Arc<(std::collections::HashMap<u16, u16>, std::collections::HashSet<u16>)>>
+{
+    static CACHE: std::sync::Mutex<
+        Option<std::sync::Arc<(std::collections::HashMap<u16, u16>, std::collections::HashSet<u16>)>>,
+    > = std::sync::Mutex::new(None);
+    let mut g = CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if g.is_none() {
+        if let Ok(r) = Registry::load() {
+            let map = build_canonical_map(&r.devices);
+            let aliases = r
+                .devices
+                .iter()
+                .flat_map(|d| d.event_alias_pids.iter().copied())
+                .collect();
+            *g = Some(std::sync::Arc::new((map, aliases)));
+        }
+    }
+    g.clone()
+}
+
+/// The canonical EVENT pid for `pid`: the first declared mode of the def that owns it (via
+/// [`DeviceDef::owned_event_pids`]), or `pid` unchanged when no def claims it — or when no
+/// registry has loaded yet (identity is the honest degraded answer, retried next call).
+pub fn canonical_event_pid(pid: u16) -> u16 {
+    event_identity_tables()
+        .and_then(|t| t.0.get(&pid).copied())
+        .unwrap_or(pid)
+}
+
+/// Is `pid` a receiver-sideband ALIAS (declared in some def's `event_alias_pids`) rather than a
+/// device's own link-mode pid? Readers use this to keep alias collections on a short leash:
+/// deferred-button events only — never intents, settings pushes, or getter opens (an alias pid is
+/// not a control pipe; opening it can't answer).
+pub fn is_event_alias_pid(pid: u16) -> bool {
+    event_identity_tables().is_some_and(|t| t.1.contains(&pid))
+}
+
+/// The pure map builder behind [`canonical_event_pid`] (split out so the policy is testable
+/// without a disk registry). First def to claim a pid wins, mirroring `find_for_pipe`'s
+/// first-match trust order.
+///
+/// SCOPE, honestly: the map is keyed by pid ALONE because the event stream is — a `ControlEvent`
+/// carries only its source pid, and every consumer downstream (HoldEdges buckets, rule matching,
+/// the held registry) already lives in that pid-only namespace. A cross-vendor pid collision
+/// would conflate devices HERE exactly as it already would THERE; widening event identity to
+/// (vendor, pid) is a spine-wide change, not a map-shape fix, and is out of scope until a real
+/// colliding device shows up.
+pub fn build_canonical_map(devices: &[DeviceDef]) -> std::collections::HashMap<u16, u16> {
+    let mut map = std::collections::HashMap::new();
+    for def in devices {
+        let Some(canon) = def.modes.first().map(|m| m.product_id) else {
+            continue; // a def with no modes declares no identity
+        };
+        for pid in def.owned_event_pids() {
+            map.entry(pid).or_insert(canon);
+        }
+    }
+    map
+}
+
+#[cfg(test)]
+mod canonical_pid_tests {
+    use super::*;
+
+    #[test]
+    fn every_owned_pid_maps_to_the_first_mode() {
+        // The real builtin Naga def IS the motivating case: wired 00A7 / dongle 00A8 /
+        // bluetooth 00A9 / receiver sideband 0529 must all read as ONE device.
+        let naga: DeviceDef = toml::from_str(include_str!("../devices/razer-naga-v2-pro.toml"))
+            .expect("builtin def parses");
+        let map = build_canonical_map(&[naga]);
+        for pid in [0x00A7u16, 0x00A8, 0x00A9, 0x0529] {
+            assert_eq!(map.get(&pid), Some(&0x00A7), "pid {pid:04x} canonicalizes");
+        }
+        assert_eq!(map.get(&0x0221), None, "an unowned pid stays unmapped");
+    }
+
+    #[test]
+    fn live_canonicalization_covers_the_dongle_and_receiver() {
+        // Through the cached surface (builtin defs load even with no run-root registry):
+        // link-mode pids collapse onto the wired identity, foreign pids pass through.
+        assert_eq!(canonical_event_pid(0x00A8), 0x00A7, "dongle → wired identity");
+        assert_eq!(canonical_event_pid(0x0529), 0x00A7, "receiver sideband → wired identity");
+        assert_eq!(canonical_event_pid(0xBEEF), 0xBEEF, "unknown pid passes through");
+        assert!(is_event_alias_pid(0x0529), "the receiver pid is an alias");
+        assert!(!is_event_alias_pid(0x00A8), "a link-mode pid is not an alias");
+    }
 }
 
 /// Is `def` fully SUBSUMED by already-loaded defs — i.e. does every (vendor, pid) it declares

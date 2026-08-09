@@ -172,12 +172,15 @@ pub fn start() {
     // arm here and have its reports parsed as razer bytes — a foreign `05 02` misread as a DPI
     // announce could even trigger a reconcile write. A non-razer family's pipes still arm through
     // the def/dialect paths, which carry their own vendor gates.
+    // OWNED EVENT pids, not just mode pids: a HyperSpeed receiver exposes its own sideband
+    // collections under the DONGLE's pid (`event_alias_pids`), and the mouse's driver-mode
+    // side-plate events ride there — those collections belong to THIS reader, not macrokeys.
     let mouse_pids: HashSet<u16> = match registry() {
         Some(r) => r
             .devices
             .iter()
             .filter(|d| d.dialect == "razer" && d.supports(neuron::registry::Capability::Dpi))
-            .flat_map(|d| d.product_ids())
+            .flat_map(|d| d.owned_event_pids())
             .collect(),
         None => {
             if verbose() {
@@ -649,6 +652,18 @@ fn decode(
     if buf.len() < 6 {
         return;
     }
+    // ALIAS COLLECTIONS ON A SHORT LEASH: a receiver-sideband pid carries the paired device's
+    // deferred-button events and nothing we should act on twice. The device's own collections
+    // (under its link-mode pid) already deliver the mute bridge, the cycle intents, and the 05
+    // settings pushes — handling them here too would double-fire every one (two pipes can mirror
+    // the same report). Deferred BUTTONS are safe to take from either pipe: they inject a held-
+    // set snapshot, and identical snapshots from two pipes produce one edge (HoldEdges diffs).
+    if neuron::registry::is_event_alias_pid(pid) {
+        if buf[0] == 0x04 {
+            inject_deferred_buttons(buf, pid);
+        }
+        return;
+    }
     // REGISTRY-DRIVEN EVENTS FIRST (a def's own `[events]` table, e.g. a curated Seiren-class def),
     // else the FAMILY vocabulary (`Dialect::default_event_for`, e.g. razer-audio's `05 11` tap-mute) —
     // ahead of the 04/05 hardcoded families below so either always wins. The resolution chain +
@@ -688,12 +703,13 @@ fn decode(
                 }
             }
             None => {
-                if buf[1] != 0x00 && verbose() {
-                    eprintln!(
-                        "[hidwatch] pid={pid:04x}: unknown 04-family button code {:#04x}",
-                        buf[1]
-                    );
-                }
+                // Every OTHER 04-family code is a deferred BUTTON the firmware handed us — on
+                // the Naga family, the side-plate keys in driver mode. They are bindable
+                // CONTROLS, not intents: inject the currently-held array exactly like the
+                // keyboard macro-key reader, so they capture + dispatch as
+                // `(RAZER_MACRO_PAGE, code)` controls carrying the device's canonical identity.
+                // buf[1]==0x00 (all released) injects the empty set — the Up edges.
+                inject_deferred_buttons(buf, pid);
             }
         }
         return;
@@ -816,6 +832,45 @@ fn mute_event_state(
     match event? {
         EventKind::MuteState => (buf.len() >= 3).then(|| buf[2] != 0),
     }
+}
+
+/// Inject a driver-mode deferred-button report as bindable `(RAZER_MACRO_PAGE, code)` controls —
+/// the mouse-side twin of `macrokeys::decode`, sharing its edge-bucket convention (`0xF000 |
+/// canonical pid`) so the spine sees ONE device identity whichever pipe carried the press.
+/// Cycle-intent codes stay out of the array (the cycle IS their meaning — the intent path owns
+/// them); every other held code becomes a control. An all-zero report injects the empty set.
+fn inject_deferred_buttons(buf: &[u8], pid: u16) {
+    let hits = deferred_hits(buf);
+    if verbose() {
+        eprintln!("[hidwatch] pid={pid:04x} deferred buttons hits={hits:02x?}");
+    }
+    let canon = neuron::registry::canonical_event_pid(pid);
+    debug_assert!(
+        canon < 0x1000,
+        "Razer pid {canon:#06x} would alias the 0xF000 deferred-button bucket prefix"
+    );
+    neuron::controls::inject_event(neuron::controls::ControlEvent {
+        pid: format!("{:04x}", 0xF000u16 | (canon & 0x0FFF)),
+        hits,
+        raw: buf.to_vec(),
+    });
+}
+
+/// The pure half of [`inject_deferred_buttons`]: which held codes in a `04` report are bindable
+/// controls. Only codes in the OBSERVED deferred-button region qualify — FN (0x01) and the
+/// button block 0x20..=0x5F (M-keys, side-plate keys, and the cycle buttons live here; captured
+/// live from the BlackWidow + Naga and matching OpenRazer's razer_raw_event vocabulary). Cycle-
+/// intent codes stay with the intent path, and anything OUTSIDE the region is a status byte some
+/// future firmware may put on the 04 report — never a phantom bindable press.
+fn deferred_hits(buf: &[u8]) -> Vec<(u16, u16)> {
+    buf[1..]
+        .iter()
+        .copied()
+        .filter(|&c| {
+            (c == 0x01 || (0x20..=0x5F).contains(&c)) && button_intent(c).is_none()
+        })
+        .map(|c| (neuron::controls::RAZER_MACRO_PAGE, c as u16))
+        .collect()
 }
 
 /// Map a 04-family deferred-button code to the cycle [`Intent`] it REQUESTS. Pure + table-testable so
@@ -1289,6 +1344,33 @@ mod tests {
 
     // The Naga V2 Pro's dongle PID — the device that ships the `[side_plates]` map.
     const NAGA_PID: u16 = 0x00A8;
+
+    /// Deferred-button classification: plate keys become bindable macro-page hits, the cycle
+    /// codes stay with the intent path, zeros are padding, and an all-released report is empty
+    /// (the Up edges). This is the seam that turned "unknown 04-family code — dropped" into
+    /// first-class side-plate binds.
+    #[test]
+    fn deferred_hits_bind_plate_keys_and_leave_intents_alone() {
+        // held plate keys 1+3 (codes 0x20/0x22) + padding
+        assert_eq!(
+            deferred_hits(&[0x04, 0x20, 0x22, 0x00, 0x00, 0x00]),
+            vec![
+                (neuron::controls::RAZER_MACRO_PAGE, 0x20),
+                (neuron::controls::RAZER_MACRO_PAGE, 0x22)
+            ]
+        );
+        // a cycle code (DPI up, 0x52) is the intent path's — never a bindable hit
+        assert_eq!(deferred_hits(&[0x04, 0x52, 0x00, 0x00, 0x00, 0x00]), vec![]);
+        // all released → empty set → the edge detector raises the Ups
+        assert_eq!(deferred_hits(&[0x04, 0x00, 0x00, 0x00, 0x00, 0x00]), vec![]);
+        // a byte OUTSIDE the deferred-button region (a status/firmware byte) is never a press
+        assert_eq!(deferred_hits(&[0x04, 0x7F, 0x02, 0x00, 0x00, 0x00]), vec![]);
+        // FN (0x01) is a real deferred button
+        assert_eq!(
+            deferred_hits(&[0x04, 0x01, 0x00, 0x00, 0x00, 0x00]),
+            vec![(neuron::controls::RAZER_MACRO_PAGE, 0x01)]
+        );
+    }
 
     // The per-pid batches and `confirm`'s per-pid baselines for NAGA_PID, plus the global sink, are
     // shared across these tests; serialize the tests that drive `decode` (and read the sink) so their
