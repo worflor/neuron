@@ -1186,6 +1186,13 @@ pub mod server {
     /// The Chroma client DLL a game loads — the marker we scan processes for.
     const CHROMA_CLIENT_DLL: &str = "rzchromasdk64.dll";
 
+    /// A grant candidate must have completed client registration AND still carry the SDK
+    /// module. Kept as a tiny pure predicate so fallback discovery's identity contract stays
+    /// pinned independently of Win32 process enumeration.
+    fn client_identity_matches(registered: bool, module_loaded: bool) -> bool {
+        registered && module_loaded
+    }
+
     /// True if a Chroma server already wears the mask (holds the first mask mutex). This
     /// is the honest "another live server owns arbitration — stand down" signal: whoever
     /// serves creates these mutexes and they VANISH when it dies (including a prior neuron
@@ -1318,6 +1325,41 @@ pub mod server {
         Some(MaskGuard { held, stop, thread })
     }
 
+    /// How often the quiet arbiter checks its state. Client-owned transport objects make
+    /// discovery happen on the next tick; they are hints, not correctness requirements.
+    const ARBITER_TICK: std::time::Duration = std::time::Duration::from_millis(2000);
+
+    /// Even when every client-owned event was transient (or a newer SDK changes which one
+    /// survives), authoritative process/module discovery still runs at this bounded cadence.
+    /// This keeps true idle cheap without letting a missed hint strand a live game forever.
+    const IDLE_CLIENT_RESCAN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+
+    /// Scheduling state for Chroma-client discovery. A newly-created server starts armed, so
+    /// enabling/re-enabling Chroma is an immediate rescan boundary rather than waiting for the
+    /// game to recreate a one-shot event. Kernel objects only accelerate subsequent scans.
+    #[derive(Clone, Copy, Debug)]
+    struct ClientDiscovery {
+        next_fallback_scan: std::time::Instant,
+    }
+
+    impl ClientDiscovery {
+        fn armed(now: std::time::Instant) -> Self {
+            Self { next_fallback_scan: now }
+        }
+
+        fn scan_due(&self, now: std::time::Instant, transport_hint: bool) -> bool {
+            transport_hint || now >= self.next_fallback_scan
+        }
+
+        fn note_scan(&mut self, now: std::time::Instant) {
+            self.next_fallback_scan = now + IDLE_CLIENT_RESCAN_INTERVAL;
+        }
+
+        fn rearm(&mut self, now: std::time::Instant) {
+            self.next_fallback_scan = now;
+        }
+    }
+
     /// The arbiter: ACTIVATE the connected game ONCE — write its grant, then fire the
     /// per-key activation event — and otherwise stay QUIET. It is deliberately NOT a
     /// heartbeat. Once a game is activated it STAYS activated (its own frames flow), so the
@@ -1325,9 +1367,10 @@ pub mod server {
     /// session. (An earlier "re-activate if the board looks uniform" recheck was removed: it
     /// occasionally caught the game's own transient clear frame and re-fired the activation
     /// mid-stream, which the game rendered as a periodic flicker.) The expensive
-    /// process/module scan runs ONLY while no game is activated yet, gated behind a live
-    /// session-worker event so it costs nothing at idle. Re-activation happens only on a
-    /// relaunch (a new PID appears after the old one dies).
+    /// process/module scan runs ONLY while no game is activated yet. Stable client-owned
+    /// objects accelerate it, but no single event gates correctness: the first scan is
+    /// immediate and a bounded idle fallback covers missed/transient SDK events. Re-activation
+    /// happens only on a relaunch (a new PID appears after the old one dies).
     fn arbiter_loop(
         appreg: (usize, usize),
         sessinfo: (usize, usize),
@@ -1336,6 +1379,7 @@ pub mod server {
     ) {
         use std::sync::atomic::Ordering;
         let mut activated: Option<u32> = None; // the PID we've activated
+        let mut discovery = ClientDiscovery::armed(std::time::Instant::now());
         while !stop.load(Ordering::Relaxed) {
             match activated {
                 // Activated: the only ongoing work is a cheap liveness check. A dead PID
@@ -1343,12 +1387,16 @@ pub mod server {
                 Some(pid) => {
                     if !process_alive(pid) {
                         activated = None;
+                        discovery.rearm(std::time::Instant::now());
                     }
                 }
-                // No game yet: the (heavier) scan, but only once a client's session worker
-                // is up, so at true idle this is a single cheap event-open.
+                // No game yet: client-owned objects are cheap positive hints, while the
+                // bounded fallback is the correctness path when a hint was transient or a
+                // newer SDK no longer creates the exact object an older capture showed.
                 None => {
-                    if session_worker_present() {
+                    let now = std::time::Instant::now();
+                    if discovery.scan_due(now, client_transport_present()) {
+                        discovery.note_scan(now);
                         if let Some(pid) = find_chroma_client() {
                             unsafe { activate_once(appreg, sessinfo, pid, pid_session(pid)) };
                             activated = Some(pid);
@@ -1356,7 +1404,7 @@ pub mod server {
                     }
                 }
             }
-            std::thread::sleep(std::time::Duration::from_millis(2000));
+            std::thread::sleep(ARBITER_TICK);
         }
     }
 
@@ -1398,6 +1446,65 @@ pub mod server {
             std::ptr::write_unaligned(s as *mut u32, 0); // head
             std::ptr::write_unaligned(s.add(4) as *mut u32, 8); // slot0 event-type 8 (grant access)
             std::ptr::write_unaligned(s.add(8) as *mut u32, sess); // slot0 session id
+        }
+    }
+
+    #[cfg(test)]
+    mod discovery_tests {
+        use super::{ClientDiscovery, IDLE_CLIENT_RESCAN_INTERVAL};
+        use std::time::{Duration, Instant};
+
+        #[test]
+        fn a_new_or_reenabled_server_scans_immediately_without_an_event() {
+            let now = Instant::now();
+            let discovery = ClientDiscovery::armed(now);
+
+            assert!(
+                discovery.scan_due(now, false),
+                "creating the Chroma face is an immediate rescan boundary"
+            );
+        }
+
+        #[test]
+        fn a_client_object_accelerates_discovery_but_is_not_required() {
+            let now = Instant::now();
+            let mut discovery = ClientDiscovery::armed(now);
+            discovery.note_scan(now);
+            let before_fallback = now + Duration::from_secs(1);
+
+            assert!(!discovery.scan_due(before_fallback, false), "true idle stays cheap");
+            assert!(
+                discovery.scan_due(before_fallback, true),
+                "any durable client transport witness triggers the next scan"
+            );
+            assert!(
+                discovery.scan_due(now + IDLE_CLIENT_RESCAN_INTERVAL, false),
+                "a missed/transient event cannot gate discovery forever"
+            );
+        }
+
+        #[test]
+        fn a_dead_activated_client_rearms_discovery() {
+            let now = Instant::now();
+            let mut discovery = ClientDiscovery::armed(now);
+            discovery.note_scan(now);
+            let relaunched = now + Duration::from_secs(1);
+
+            discovery.rearm(relaunched);
+            assert!(
+                discovery.scan_due(relaunched, false),
+                "process death must make the replacement PID discoverable immediately"
+            );
+        }
+
+        #[test]
+        fn fallback_candidates_must_be_registered_and_have_the_sdk_loaded() {
+            use super::client_identity_matches;
+
+            assert!(client_identity_matches(true, true));
+            assert!(!client_identity_matches(true, false), "a stale registration is not a client");
+            assert!(!client_identity_matches(false, true), "a passive DLL load is not a client");
+            assert!(!client_identity_matches(false, false));
         }
     }
 
@@ -1490,18 +1597,49 @@ pub mod server {
         }
     }
 
-
-    /// True if a client's session worker has created its wake event — a game has inited
-    /// its Chroma SDK and is waiting to be granted. Gates the (heavier) client scan.
-    fn session_worker_present() -> bool {
-        let w = wide(&format!("Global\\{SESSION_WORKER_EVENT}"));
-        let h = unsafe { OpenEventW(0x1F0003, 0, w.as_ptr()) };
+    /// Open a named event only long enough to prove it exists. `SYNCHRONIZE` is sufficient
+    /// for a presence probe and is deliberately less demanding than full control: client
+    /// objects use the game's token DACL, not the Everyone DACL on server-owned objects.
+    fn named_event_present(name: &str) -> bool {
+        const SYNCHRONIZE: u32 = 0x0010_0000;
+        let w = wide(name);
+        let h = unsafe { OpenEventW(SYNCHRONIZE, 0, w.as_ptr()) };
         if h.is_null() {
             false
         } else {
             unsafe { CloseHandle(h) };
             true
         }
+    }
+
+    /// Mutex counterpart to [`named_event_present`]. Opening never waits for or acquires the
+    /// mutex; it is a side-effect-free liveness hint.
+    fn named_mutex_present(name: &str) -> bool {
+        const SYNCHRONIZE: u32 = 0x0010_0000;
+        let w = wide(name);
+        let h = unsafe { OpenMutexW(SYNCHRONIZE, 0, w.as_ptr()) };
+        if h.is_null() {
+            false
+        } else {
+            unsafe { CloseHandle(h) };
+            true
+        }
+    }
+
+    /// True when the live client side has left ANY known transport witness. Older code used
+    /// only `SESSION_WORKER_EVENT`; that event is on-demand/transient, so enabling Neuron after
+    /// a game had initialized could miss it forever even though the durable activation events
+    /// and registration mutex were still present. The canonical object map now supplies all
+    /// stable client-created hints. This only accelerates discovery — [`ClientDiscovery`]'s
+    /// immediate/fallback scans remain authoritative when no known witness survives.
+    fn client_transport_present() -> bool {
+        let session_worker = format!("Global\\{SESSION_WORKER_EVENT}");
+        named_event_present(&session_worker)
+            || client_objects().any(|o| match o.kind {
+                Kind::Event => named_event_present(&o.name()),
+                Kind::Mutex => named_mutex_present(&o.name()),
+                Kind::Section(_) | Kind::Unknown => false,
+            })
     }
 
     /// The interactive session id for a pid (games run in the console session, usually 1).
@@ -1514,8 +1652,13 @@ pub mod server {
         }
     }
 
-    /// Find a live process with the Chroma client DLL loaded — the game to grant. Returns
-    /// the first match (the common case is a single game); skips processes we can't
+    /// Find a live, REGISTERED process with the Chroma client DLL loaded — the game to
+    /// grant. The per-exe `Global\<stem>_rz` mutex is the durable client-side registration
+    /// witness; requiring it prevents an idle process that merely loaded the SDK DLL from
+    /// winning an authoritative fallback scan. Checking the cheap mutex first also avoids
+    /// taking a module snapshot for every unrelated process on the machine.
+    ///
+    /// Returns the first match (the common case is a single game); skips processes we can't
     /// snapshot (bitness / access), which is harmless.
     fn find_chroma_client() -> Option<u32> {
         let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
@@ -1528,9 +1671,16 @@ pub mod server {
         if unsafe { Process32FirstW(snap, &mut pe) } != 0 {
             loop {
                 let pid = pe.th32ProcessID;
-                if pid > 4 && process_has_module(pid, CHROMA_CLIENT_DLL) {
-                    found = Some(pid);
-                    break;
+                if pid > 4 {
+                    let end =
+                        pe.szExeFile.iter().position(|&c| c == 0).unwrap_or(pe.szExeFile.len());
+                    let exe = String::from_utf16_lossy(&pe.szExeFile[..end]);
+                    let registered = named_mutex_present(&rz_mutex_name(&exe));
+                    let module_loaded = registered && process_has_module(pid, CHROMA_CLIENT_DLL);
+                    if client_identity_matches(registered, module_loaded) {
+                        found = Some(pid);
+                        break;
+                    }
                 }
                 if unsafe { Process32NextW(snap, &mut pe) } == 0 {
                     break;

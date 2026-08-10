@@ -243,89 +243,128 @@ fn finish_ctl(gen: u64, pkt: Option<(u16, u16, Option<u16>)>) {
     }
 }
 
+/// How long a macro-page candidate waits for its possible keyboard twin.
+#[cfg(windows)]
+const TWIN_SETTLE: std::time::Duration = std::time::Duration::from_millis(80);
+
+/// Pure selection state shared by resident-stream capture and the no-resident fallback below.
+/// One physical Naga press can emit TWO events: its fixed keyboard usage plus the receiver's vendor
+/// deferred-button code. Prefer the keyboard identity because the input interceptor can replace it.
+#[cfg(windows)]
+#[derive(Default)]
+struct ControlCaptureState {
+    macro_candidate: Option<(CapturedControl, std::time::Instant)>,
+}
+
+#[cfg(windows)]
+impl ControlCaptureState {
+    fn observe(&mut self, ev: &neuron::controls::ControlEvent) -> Option<CapturedControl> {
+        let &(page, usage) = ev.hits.first()?;
+        // Left mouse operates the capture dialog itself. Side buttons (2-5), keyboard, consumer,
+        // telephony and macro controls remain bindable.
+        if (page, usage) == (0x09, 1) {
+            return None;
+        }
+        // Injected macro/deferred reports historically carry `0xF000 | canonical pid`; the new
+        // resident observer already supplies the canonical pid, while this keeps the standalone
+        // fallback and old injected path compatible.
+        let pid = u16::from_str_radix(&ev.pid, 16).ok().map(|p| {
+            if page == neuron::controls::RAZER_MACRO_PAGE && p & 0xF000 == 0xF000 {
+                p & 0x0FFF
+            } else {
+                p
+            }
+        });
+        let control = CapturedControl { page, usage, pid };
+        match self.macro_candidate {
+            None if page == neuron::controls::RAZER_MACRO_PAGE => {
+                self.macro_candidate = Some((control, std::time::Instant::now()));
+                None
+            }
+            Some((candidate, at)) if at.elapsed() >= TWIN_SETTLE => Some(candidate),
+            Some((candidate, _))
+                if page != neuron::controls::RAZER_MACRO_PAGE && pid == candidate.pid =>
+            {
+                Some(control)
+            }
+            Some(_) => None,
+            None => Some(control),
+        }
+    }
+
+    fn settled(&self) -> Option<CapturedControl> {
+        self.macro_candidate
+            .filter(|(_, at)| at.elapsed() >= TWIN_SETTLE)
+            .map(|(control, _)| control)
+    }
+}
+
 /// Listen for the first HID control press (or ESC/stop/timeout). Returns its semantic identity.
 ///
-/// TWIN-EVENT PREFERENCE: one physical press can emit TWO events. The Naga side plate types its
-/// keyboard usage AND the HyperSpeed receiver echoes a vendor deferred-button code (proven live —
-/// driver mode does not stop the plate typing). The keyboard identity is the one every downstream
-/// mechanism serves best (the intercept shim can swallow it; `control_label` names it), so when a
-/// MACRO-page hit lands first we hold it as a candidate for a short settle window and prefer any
-/// non-macro hit that follows. A lone macro key (a BlackWidow M-key) just commits after the
-/// window — imperceptible in a press-to-bind dialog.
+/// ROOT OWNERSHIP RULE: when the resident pump is alive, capture passively subscribes to its
+/// decoded held-state seam. It does NOT create another Raw-Input window. Windows permits only one
+/// target window per process and usage pair; the old transient listener stole those registrations,
+/// then left the live dispatcher deaf after a rebind. A standalone listener remains only as the
+/// honest fallback when no resident pump exists.
 #[cfg(windows)]
 fn capture_control_until(stop: &AtomicBool) -> Option<CapturedControl> {
-    use std::cell::Cell;
-    use std::time::Instant;
-    /// How long a macro-page candidate waits for its possible keyboard twin.
-    const TWIN_SETTLE: std::time::Duration = std::time::Duration::from_millis(80);
-    let found: Cell<Option<CapturedControl>> = Cell::new(None);
-    let macro_candidate: Cell<Option<(CapturedControl, Instant)>> = Cell::new(None);
-    neuron::controls::listen_until(
-        Some(30), // hard 30s cap so a forgotten capture can't run forever
-        stop,
-        true, // interactive press-to-bind — ESC cancels, as the panel says
-        |ev| {
-            if let Some(&(page, usage)) = ev.hits.first() {
-                // The LEFT mouse button operates this dialog (the "cancel" button + the scrim-click
-                // dismiss). It is not a bindable "device control", so never capture it here —
-                // otherwise clicking cancel binds mouse-1 instead of cancelling. Side buttons (2-5),
-                // the knob, media keys, mic-tap and macro keys all still capture normally.
-                if (page, usage) == (0x09, 1) {
-                    return;
-                }
-                // Every control keeps its device identity — including macro-page controls, whose
-                // events ride a synthetic edge-bucket pid (`0xF000 | canonical pid`): strip the
-                // bucket prefix back to the canonical device pid. Two boards share the macro code
-                // space (a keyboard's M3 and a Naga side-plate key can both be 0x22), so a
-                // device-anonymous bind fires from BOTH — the old "M5 is M5 on any board" policy
-                // only ever made sense with a single Razer device attached. The canonical pid is
-                // link-mode-stable, so a replug/dongle swap keeps the binding.
-                // bucket-strip is MACRO-PAGE-ONLY, mirroring `controls::hit_trigger` — on any
-                // other page a 0xF???-range pid is (an unlikely but) real device identity.
-                let pid = u16::from_str_radix(&ev.pid, 16).ok().map(|p| {
-                    if page == neuron::controls::RAZER_MACRO_PAGE && p & 0xF000 == 0xF000 {
-                        p & 0x0FFF
-                    } else {
-                        p
-                    }
-                });
-                let c = CapturedControl { page, usage, pid };
-                match macro_candidate.get() {
-                    // maybe a receiver echo — park it and wait for the keyboard twin.
-                    None if page == neuron::controls::RAZER_MACRO_PAGE => {
-                        macro_candidate.set(Some((c, Instant::now())));
-                    }
-                    // A candidate is parked: only its OWN device's non-macro event, INSIDE the
-                    // settle window, is the twin (both sides carry the canonical pid). A window
-                    // that already lapsed commits the candidate — the macro press WAS the bind —
-                    // even if a same-device event arrives before the next tick. Anything else — a
-                    // headset push, a stray control on another board — is neither the press being
-                    // bound nor its twin; ignore it rather than let it steal the bind.
-                    Some((cand, at)) => {
-                        if at.elapsed() >= TWIN_SETTLE {
-                            found.set(Some(cand));
-                            stop.store(true, Ordering::Relaxed);
-                        } else if page != neuron::controls::RAZER_MACRO_PAGE && pid == cand.pid {
-                            found.set(Some(c));
-                            stop.store(true, Ordering::Relaxed);
-                        }
-                    }
-                    // no candidate, ordinary control — first press wins, instantly.
-                    None => {
-                        found.set(Some(c));
-                        stop.store(true, Ordering::Relaxed);
-                    }
+    if neuron::controls::held_registry_live() {
+        capture_control_from_resident(stop)
+    } else {
+        capture_control_standalone(stop)
+    }
+}
+
+#[cfg(windows)]
+fn capture_control_from_resident(stop: &AtomicBool) -> Option<CapturedControl> {
+    use std::sync::mpsc::RecvTimeoutError;
+    use std::time::{Duration, Instant};
+
+    let observer = neuron::controls::observe_controls();
+    let started = Instant::now();
+    let mut state = ControlCaptureState::default();
+    while started.elapsed() < Duration::from_secs(30) && !stop.load(Ordering::Relaxed) {
+        if neuron::capture::key_down(neuron::capture::VK_ESCAPE) {
+            return None;
+        }
+        match observer.recv_timeout(Duration::from_millis(5)) {
+            Ok(ev) => {
+                if let Some(control) = state.observe(&ev) {
+                    return Some(control);
                 }
             }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return None,
+        }
+        if let Some(control) = state.settled() {
+            return Some(control);
+        }
+    }
+    None
+}
+
+/// CLI/headless fallback for the rare case where the GUI resident pump is not alive. With no
+/// resident owner there is nothing to steal, so a temporary Raw-Input listener is correct here.
+#[cfg(windows)]
+fn capture_control_standalone(stop: &AtomicBool) -> Option<CapturedControl> {
+    use std::cell::{Cell, RefCell};
+
+    let found: Cell<Option<CapturedControl>> = Cell::new(None);
+    let state = RefCell::new(ControlCaptureState::default());
+    neuron::controls::listen_until(
+        Some(30),
+        stop,
+        true,
+        |ev| {
+            if let Some(control) = state.borrow_mut().observe(ev) {
+                found.set(Some(control));
+                stop.store(true, Ordering::Relaxed);
+            }
         },
-        // on_tick: commit a parked macro candidate once its settle window closes without a
-        // keyboard twin appearing (the press really was a macro key).
         || {
-            if let Some((c, at)) = macro_candidate.get() {
-                if at.elapsed() >= TWIN_SETTLE {
-                    found.set(Some(c));
-                    stop.store(true, Ordering::Relaxed);
-                }
+            if let Some(control) = state.borrow().settled() {
+                found.set(Some(control));
+                stop.store(true, Ordering::Relaxed);
             }
             std::time::Duration::from_millis(5)
         },
@@ -533,6 +572,66 @@ fn record_keyseq_until(_stop: &AtomicBool) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn resident_capture_keeps_the_device_identity_for_an_ordinary_key() {
+        let mut state = ControlCaptureState::default();
+        let control = state
+            .observe(&neuron::controls::ControlEvent {
+                pid: "00a7".into(),
+                hits: vec![(0x07, 0x1E)],
+                raw: Vec::new(),
+            })
+            .expect("ordinary keyboard edge captures immediately");
+        assert_eq!((control.page, control.usage, control.pid), (0x07, 0x1E, Some(0x00A7)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resident_capture_prefers_the_naga_keyboard_twin() {
+        let mut state = ControlCaptureState::default();
+        assert!(
+            state
+                .observe(&neuron::controls::ControlEvent {
+                    pid: "f0a7".into(),
+                    hits: vec![(neuron::controls::RAZER_MACRO_PAGE, 0x20)],
+                    raw: Vec::new(),
+                })
+                .is_none(),
+            "receiver echo waits for its fixed-key twin"
+        );
+        let control = state
+            .observe(&neuron::controls::ControlEvent {
+                pid: "00a7".into(),
+                hits: vec![(0x07, 0x1E)],
+                raw: Vec::new(),
+            })
+            .expect("same-device keyboard twin wins");
+        assert_eq!((control.page, control.usage, control.pid), (0x07, 0x1E, Some(0x00A7)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resident_capture_commits_a_lone_macro_key_after_settle() {
+        let mut state = ControlCaptureState {
+            macro_candidate: Some((
+                CapturedControl {
+                    page: neuron::controls::RAZER_MACRO_PAGE,
+                    usage: 0x22,
+                    pid: Some(0x0221),
+                },
+                std::time::Instant::now() - TWIN_SETTLE,
+            )),
+        };
+        let control = state.settled().expect("expired candidate commits");
+        assert_eq!(
+            (control.page, control.usage, control.pid),
+            (neuron::controls::RAZER_MACRO_PAGE, 0x22, Some(0x0221))
+        );
+        // Reading the settled value is side-effect free; the caller returns immediately.
+        assert!(state.settled().is_some());
+    }
 
     /// Every capture flow shares one process-global latch, [`CAPTURE_ACTIVE`], which the live
     /// dispatcher reads to suppress dispatch while a control is being bound. If a capture ever

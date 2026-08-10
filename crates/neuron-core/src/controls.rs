@@ -780,27 +780,93 @@ pub fn control_to_vk(page: u16, usage: u16) -> Option<i32> {
 static HELD: std::sync::Mutex<Vec<(String, Option<u16>, Vec<(u16, u16)>)>> =
     std::sync::Mutex::new(Vec::new());
 
+// Passive observers of the resident pump's already-decoded control stream. Unlike `INJECT`, this
+// is NOT another input source and owns no Win32 registration: it is a tap on `note_held`, the one
+// seam every native keyboard/mouse/HID edge and injected vendor edge already crosses. The GUI's
+// press-to-bind capture subscribes here so it never creates a second Raw-Input window and therefore
+// can never steal registration from the resident dispatcher.
+static CONTROL_OBSERVERS: std::sync::Mutex<
+    Vec<(u64, std::sync::mpsc::Sender<ControlEvent>)>,
+> = std::sync::Mutex::new(Vec::new());
+static CONTROL_OBSERVER_GEN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// A passive subscription to decoded control snapshots from the resident input pump.
+///
+/// Dropping it unregisters the sink. It never registers Raw Input, installs a hook, or changes
+/// dispatch; it only observes the same normalized `(page, usage, pid)` snapshots the held-state
+/// registry receives.
+pub struct ControlObserver {
+    id: u64,
+    rx: std::sync::mpsc::Receiver<ControlEvent>,
+}
+
+impl ControlObserver {
+    /// Wait for the next decoded snapshot, bounded so callers can poll cancellation/timeout state.
+    pub fn recv_timeout(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<ControlEvent, std::sync::mpsc::RecvTimeoutError> {
+        self.rx.recv_timeout(timeout)
+    }
+}
+
+impl Drop for ControlObserver {
+    fn drop(&mut self) {
+        CONTROL_OBSERVERS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(id, _)| *id != self.id);
+    }
+}
+
+/// Observe decoded control snapshots without competing for the process's singleton Raw-Input
+/// registration. Intended for transient GUI capture while the resident listener remains owner.
+pub fn observe_controls() -> ControlObserver {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let id = CONTROL_OBSERVER_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    CONTROL_OBSERVERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((id, tx));
+    ControlObserver { id, rx }
+}
+
+fn publish_control_observation(pid: Option<u16>, hits: &[(u16, u16)]) {
+    let ev = ControlEvent {
+        pid: pid.map(|p| format!("{p:04x}")).unwrap_or_default(),
+        hits: hits.to_vec(),
+        raw: Vec::new(),
+    };
+    CONTROL_OBSERVERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|(_, tx)| tx.send(ev.clone()).is_ok());
+}
+
 /// Record one input source's full current down-set (the same snapshot shape [`HoldEdges`] diffs).
 /// An empty set removes the entry, so the list stays bounded by "devices with something held".
 pub(crate) fn note_held(source: &str, pid: Option<u16>, hits: &[(u16, u16)]) {
+    let mut set = hits.to_vec();
+    normalize_hits(&mut set);
     let mut g = HELD.lock().unwrap_or_else(|e| e.into_inner());
     match g.iter_mut().position(|(s, _, _)| s == source) {
-        Some(i) if hits.is_empty() => {
+        Some(i) if set.is_empty() => {
             g.swap_remove(i);
         }
-        _ if hits.is_empty() => {}
+        _ if set.is_empty() => {}
         pos => {
-            let mut set = hits.to_vec();
-            normalize_hits(&mut set);
             match pos {
                 Some(i) => {
                     g[i].1 = pid;
-                    g[i].2 = set;
+                    g[i].2 = set.clone();
                 }
-                None => g.push((source.to_string(), pid, set)),
+                None => g.push((source.to_string(), pid, set.clone())),
             }
         }
     }
+    drop(g);
+    publish_control_observation(pid, &set);
 }
 
 /// Canonicalize a decode-time pid hex string onto the owning device's event identity — the one
@@ -914,6 +980,26 @@ mod control_ref_tests {
             event_trigger(&ev2),
             Some(Trigger::Input { page: 0x07, usage: 0x1E, pid: Some(0x0221) })
         );
+    }
+
+    #[test]
+    fn passive_observer_receives_the_normalized_held_stream() {
+        let observer = observe_controls();
+        let pid = 0xEFFE;
+        note_held("observer-regression", Some(pid), &[(0x09, 5), (0x07, 0x1E)]);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let ev = loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let ev = observer.recv_timeout(left).expect("held update reaches passive capture tap");
+            if ev.pid == "effe" {
+                break ev;
+            }
+        };
+        assert_eq!(ev.hits, vec![(0x07, 0x1E), (0x09, 5)]);
+        assert!(ev.raw.is_empty(), "the passive tap carries semantic state only");
+
+        note_held("observer-regression", Some(pid), &[]);
     }
 
     #[test]
