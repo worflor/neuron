@@ -8548,12 +8548,26 @@ pub fn refresh_layers(app: &AppWindow, sh: &SharedRt) {
 /// light show, so the tile draws a "DATA" corner glyph) and `"effect"` for every decorative preset.
 /// Registry-driven (`pattern_is_readout`), so a new readout preset self-marks. Adding a look is a preset
 /// entry in core — zero UI code.
-fn light_tile_catalog() -> Vec<(&'static str, &'static str, &'static str)> {
+/// One catalog row the tile grid renders: slug, label, SHELF group ("effect" | "input" | "data"),
+/// the plain-words blurb, and the named real-world feed ("" for a pure light show). All straight
+/// off the preset table — the registry is the taxonomy, the UI just shelves it.
+struct TileSpec {
+    slug: &'static str,
+    name: &'static str,
+    group: &'static str,
+    blurb: &'static str,
+    source: &'static str,
+}
+
+fn light_tile_catalog() -> Vec<TileSpec> {
     neuron::pattern::presets()
         .iter()
-        .map(|p| {
-            let kind = if neuron::pattern::pattern_is_readout(p.pattern) { "data" } else { "effect" };
-            (p.slug, p.label, kind)
+        .map(|p| TileSpec {
+            slug: p.slug,
+            name: p.label,
+            group: p.group(),
+            blurb: p.blurb,
+            source: p.source,
         })
         .collect()
 }
@@ -8568,8 +8582,10 @@ fn preset_layer(slug: &str) -> neuron::pattern::LayerDef {
 /// MATERIAL-card pattern: each cell becomes a block, lit on the void. Cheap (tiles are ~110px) and
 /// the swatch literally IS the effect running, so the grid reads as a wall of live previews.
 fn frame_to_preview(frame: &[Rgb], rows: usize, cols: usize) -> Image {
-    // a small canvas — block-fill per cell with a 1px gutter so the lattice reads
-    let (cell, gap, pad) = (9usize, 2usize, 4usize);
+    // a small canvas — block-fill per cell with a 1px gutter so the lattice reads. Kept LEAN: the
+    // tile shows this upscaled (image-fit fills the card), so 6px cells look identical to the old
+    // 9px ones at half the pixel-fill + GPU texture-upload cost — and this runs per-tile per-tick.
+    let (cell, gap, pad) = (6usize, 1usize, 3usize);
     let w = pad * 2 + cols * cell + cols.saturating_sub(1) * gap;
     let h = pad * 2 + rows * cell + rows.saturating_sub(1) * gap;
     let (w, h) = (w.max(1), h.max(1));
@@ -8615,14 +8631,16 @@ fn frame_to_preview(frame: &[Rgb], rows: usize, cols: usize) -> Image {
 /// is then driven ONLY by the selected ambient effect's big preview + the device stream — never by a
 /// postage-stamp thumbnail. Mirrors the `preview_vitals` pattern: the tile shows what the surface
 /// LOOKS like without paying its live cost.
-fn preview_ambient_frame(rows: u8, cols: u8) -> Vec<Rgb> {
+fn preview_ambient_frame(rows: u8, cols: u8, t: f32) -> Vec<Rgb> {
     let (r, c) = (rows as usize, cols as usize);
     let mut f = vec![Rgb::BLACK; r * c];
+    // a slow hue drift sells "mirrors whatever is on screen" without paying the capture cost.
+    let drift = (t * 9.0).rem_euclid(360.0);
     for y in 0..r {
         let v = 0.55 + 0.35 * (1.0 - y as f32 / r.max(1) as f32); // a touch brighter at the top
         for x in 0..c {
             let hue = if c > 1 { x as f32 / (c as f32 - 1.0) * 300.0 } else { 0.0 };
-            f[y * c + x] = Rgb::from_hsv(hue, 0.82, v.clamp(0.0, 1.0));
+            f[y * c + x] = Rgb::from_hsv((hue + drift).rem_euclid(360.0), 0.82, v.clamp(0.0, 1.0));
         }
     }
     f
@@ -8634,13 +8652,19 @@ fn preview_ambient_frame(rows: u8, cols: u8) -> Vec<Rgb> {
 /// The LIVE typing-reactivity plays only on the SELECTED effect's big preview + the device stream (both
 /// read keys live). It samples the SAME thermal spectrum the device renders, across a synthetic heat
 /// field (a warm bed brightest mid-board, with two hot flares).
-fn preview_thermal_frame(rows: u8, cols: u8) -> Vec<Rgb> {
+fn preview_thermal_frame(rows: u8, cols: u8, t: f32) -> Vec<Rgb> {
     let sp = neuron::pattern::default_spectrum("thermal").unwrap_or_default();
     let (r, c) = (rows as usize, cols as usize);
     let mut f = vec![Rgb::BLACK; r * c];
     let cx = (c as f32 - 1.0) / 2.0;
-    // two fixed "just-pressed" flares so the still reads as live typing without any input.
-    let flares = [(r as f32 * 0.5, c as f32 * 0.35), (r as f32 * 0.4, c as f32 * 0.66)];
+    // two "just-pressed" flares, each breathing on its own cadence — the burst-of-typing look,
+    // demonstrated without faking input (the thumbnail pass suppresses key reads).
+    let pulse_a = 0.35 + 0.65 * (0.5 + 0.5 * (t * 2.1).sin());
+    let pulse_b = 0.35 + 0.65 * (0.5 + 0.5 * (t * 1.6 + 2.4).sin());
+    let flares = [
+        (r as f32 * 0.5, c as f32 * 0.35, pulse_a),
+        (r as f32 * 0.4, c as f32 * 0.66, pulse_b),
+    ];
     for y in 0..r {
         for x in 0..c {
             // a warm bed: brighter toward the centre column and toward the home rows.
@@ -8648,9 +8672,9 @@ fn preview_thermal_frame(rows: u8, cols: u8) -> Vec<Rgb> {
             let bed = 0.18 + 0.22 * horiz;
             // hot flares with a soft radial falloff.
             let mut hot = 0.0f32;
-            for (fy, fx) in flares {
+            for (fy, fx, pulse) in flares {
                 let d = ((y as f32 - fy).powi(2) + (x as f32 - fx).powi(2)).sqrt();
-                hot = hot.max((1.0 - d / 2.6).clamp(0.0, 1.0));
+                hot = hot.max(pulse * (1.0 - d / 2.6).clamp(0.0, 1.0));
             }
             let temp = (bed + 0.75 * hot).clamp(0.0, 1.0);
             f[y * c + x] = sp.at(0.0, temp);
@@ -8664,16 +8688,24 @@ fn preview_thermal_frame(rows: u8, cols: u8) -> Vec<Rgb> {
 /// honest live render is a permanently black square in the catalog (it read as a broken tile, not
 /// a quiet one). Same convention as [`preview_thermal_frame`]: the still shows what the effect IS;
 /// the real input-reactivity plays on the selected big preview + the device stream.
-fn preview_reactive_frame(rows: u8, cols: u8) -> Vec<Rgb> {
+fn preview_reactive_frame(rows: u8, cols: u8, t: f32) -> Vec<Rgb> {
     let sp = preset_layer("reactive").spectrum;
     let (r, c) = (rows as usize, cols as usize);
     let mut f = vec![Rgb::BLACK; r * c];
-    // three presses caught mid-fade: a fresh one (tight, bright) through an old one (wide, dim).
-    let splashes = [
-        (r as f32 * 0.55, c as f32 * 0.30, 1.0f32),
-        (r as f32 * 0.35, c as f32 * 0.55, 0.6),
-        (r as f32 * 0.65, c as f32 * 0.78, 0.3),
-    ];
+    // three press LANES, each on its own clock: a splash flares at a spot, fades out, and the next
+    // cycle hops it somewhere else — phantom typing, so the tile demonstrates press→light→fade.
+    let mut splashes = [(0.0f32, 0.0f32, 0.0f32); 3];
+    for (i, s) in splashes.iter_mut().enumerate() {
+        let clock = t * 0.55 + i as f32 * 0.61;
+        let age = 1.0 - clock.fract(); // 1.0 at the press, 0.0 fully faded
+        // a cheap integer hash spreads successive presses over the board without a RNG
+        let h = (clock.floor() as u32)
+            .wrapping_mul(2654435761)
+            .wrapping_add(i as u32 * 40503);
+        let sy = (h % r.max(1) as u32) as f32;
+        let sx = ((h / 13) % c.max(1) as u32) as f32;
+        *s = (sy, sx, age);
+    }
     for y in 0..r {
         for x in 0..c {
             let mut lit = 0.0f32;
@@ -8691,18 +8723,22 @@ fn preview_reactive_frame(rows: u8, cols: u8) -> Vec<Rgb> {
 
 /// A representative RIPPLE frame for the tile thumbnail — one ring caught mid-expansion. Same
 /// input-driven-effect problem and same still-frame convention as [`preview_reactive_frame`].
-fn preview_ripple_frame(rows: u8, cols: u8) -> Vec<Rgb> {
+fn preview_ripple_frame(rows: u8, cols: u8, t: f32) -> Vec<Rgb> {
     let sp = preset_layer("ripple").spectrum;
     let (r, c) = (rows as usize, cols as usize);
     let mut f = vec![Rgb::BLACK; r * c];
     let (cy, cx) = ((r as f32 - 1.0) * 0.5, (c as f32 - 1.0) * 0.45);
-    // sized to the board's SHORT axis so the full circle fits — a ring wider than the board
-    // crops into two disconnected bracket shapes and stops reading as a ripple at all.
-    let radius = ((r.min(c) as f32) * 0.55).max(1.5);
+    // the ring EXPANDS from the press point and dies at the rim, then the next press restarts it —
+    // the actual press→ripple story, looping. Sized to the SHORT axis so the full circle fits — a
+    // ring wider than the board crops into two disconnected bracket shapes and stops reading at all.
+    let max_radius = ((r.min(c) as f32) * 0.75).max(1.5);
+    let p = (t * 0.45).fract();
+    let radius = p * max_radius;
+    let strength = 1.0 - p * p; // fades as it spreads
     for y in 0..r {
         for x in 0..c {
             let d = ((y as f32 - cy).powi(2) + (x as f32 - cx).powi(2)).sqrt();
-            let lit = (1.0 - (d - radius).abs() / 1.6).clamp(0.0, 1.0);
+            let lit = strength * (1.0 - (d - radius).abs() / 1.6).clamp(0.0, 1.0);
             if lit > 0.0 {
                 f[y * c + x] = sp.at(0.0, lit);
             }
@@ -8711,16 +8747,101 @@ fn preview_ripple_frame(rows: u8, cols: u8) -> Vec<Rgb> {
     f
 }
 
-/// A representative VITALS snapshot for the data tile's PREVIEW (a charging mouse at ~64% on stage 2)
-/// — the tile shows what the data surface LOOKS like without polling hardware every tick. The live
-/// applied stream reads the real device.
-fn preview_vitals() -> neuron::lighting::Vitals {
+/// A synthetic VITALS story for the data tile's PREVIEW — the gauge drains, then charges back up, on
+/// a slow loop. Demonstrates battery→gauge without polling hardware every tick; the live applied
+/// stream reads the real device's heartbeat feed.
+fn preview_vitals(t: f32) -> neuron::lighting::Vitals {
+    let p = (t / 14.0).fract();
+    // first half: draining 90→20 (not charging); second half: charging 20→90.
+    let (pct, charging) = if p < 0.5 {
+        (90.0 - 140.0 * p, false)
+    } else {
+        (20.0 + 140.0 * (p - 0.5), true)
+    };
     neuron::lighting::Vitals {
-        battery_pct: 64,
-        charging: true,
+        battery_pct: pct.round().clamp(0.0, 100.0) as u8,
+        charging,
         active_stage: 1,
         stage_count: 3,
     }
+}
+
+/// A demo AUDIO METER frame for the unselected tile — the board as ONE tinted surface whose
+/// brightness pumps like loudness and whose colour drifts like tone, which is exactly what the real
+/// meter does to the device. Synthetic on purpose: the live analyser reads silence as black, and a
+/// black catalog tile reads as broken, not quiet (the honest live render plays on the selected
+/// preview + the device).
+fn preview_meter_demo_frame(rows: u8, cols: u8, t: f32) -> Vec<Rgb> {
+    let sp = preset_layer("audiometer").spectrum;
+    let (r, c) = (rows as usize, cols as usize);
+    // loudness pumps at roughly a beat; tone wanders slowly across the spectrum.
+    let loud = 0.22 + 0.78 * (t * std::f32::consts::PI * 1.1).sin().abs().powf(1.4);
+    let tone = 0.5 + 0.5 * (t * 0.45).sin();
+    let col = sp.at(0.0, tone).scale_f(loud);
+    vec![col; r * c]
+}
+
+/// A demo frame for the GATED indicator tiles (On Air / Mic Light / Mode Held) — a painted patch
+/// that switches on, holds, and drops to a faint standby, looping. Each slug paints a DIFFERENT
+/// patch shape so the three stop being identical solid walls: On Air a centred banner, Mic Light a
+/// bottom-left cluster (where a mute key lives), Mode Held a left-edge column (a held modifier).
+fn preview_indicator_frame(slug: &str, rows: u8, cols: u8, t: f32) -> Vec<Rgb> {
+    let sp = preset_layer(slug).spectrum;
+    let (r, c) = (rows as usize, cols as usize);
+    let mut f = vec![Rgb::BLACK; r * c];
+    let (period, duty) = match slug {
+        "onair" => (4.2f32, 0.6f32),
+        "miclight" => (2.8, 0.55),
+        _ => (3.4, 0.5),
+    };
+    let p = (t / period).fract();
+    // eased on/off edges so the switch reads as a state change, not a glitch frame
+    let edge = 0.06f32;
+    let lvl = if p < duty {
+        ((p / edge).min(1.0)).min(((duty - p) / edge).min(1.0))
+    } else {
+        0.0
+    }
+    .clamp(0.0, 1.0);
+    let lit = sp.at(0.0, 1.0);
+    let standby = lit.scale_f(0.10); // the faint "armed, not live" trace
+    let inside = |y: usize, x: usize| -> bool {
+        let (rf, cf) = (r as f32, c as f32);
+        let (yy, xx) = (y as f32, x as f32);
+        match slug {
+            // a centred banner — the painted ON AIR sign
+            "onair" => yy >= rf * 0.25 && yy < rf * 0.75 && xx >= cf * 0.2 && xx < cf * 0.8,
+            // a bottom-left cluster — the corner where a mute key lives
+            "miclight" => yy >= rf * 0.55 && xx < cf * 0.3,
+            // a left-edge column — a held modifier
+            _ => xx < cf * 0.14,
+        }
+    };
+    for y in 0..r {
+        for x in 0..c {
+            if inside(y, x) {
+                f[y * c + x] = if lvl > 0.0 { lit.scale_f(0.15 + 0.85 * lvl) } else { standby };
+            }
+        }
+    }
+    f
+}
+
+/// A demo SIGNAL frame — the level sweeps 0→1 and the board reads it along the urgency ramp
+/// (green → amber → red) while the lit fraction grows with it: a macro-driven gauge, demonstrated.
+fn preview_signal_frame(rows: u8, cols: u8, t: f32) -> Vec<Rgb> {
+    let sp = preset_layer("signal").spectrum;
+    let (r, c) = (rows as usize, cols as usize);
+    let mut f = vec![Rgb::BLACK; r * c];
+    let level = (t / 6.0).fract();
+    let col = sp.at(0.0, level);
+    let lit_cols = ((level * c as f32).ceil() as usize).min(c);
+    for y in 0..r {
+        for x in 0..lit_cols {
+            f[y * c + x] = col;
+        }
+    }
+    f
 }
 
 /// Render the whole tile grid — each tile a live (effects) or representative (data) preview at time
@@ -8730,8 +8851,10 @@ fn preview_vitals() -> neuron::lighting::Vitals {
 fn render_light_tiles(app: &AppWindow, sh: &SharedRt, t: f32) {
     let (rows, cols) = sh.borrow().rt.grid_dims();
     if rows == 0 || cols == 0 {
-        app.global::<State>()
-            .set_light_tiles(ModelRc::new(VecModel::from(Vec::<EffectTile>::new())));
+        let state = app.global::<State>();
+        state.set_light_tiles(ModelRc::new(VecModel::from(Vec::<EffectTile>::new())));
+        state.set_light_input_tiles(ModelRc::new(VecModel::from(Vec::<EffectTile>::new())));
+        state.set_light_data_tiles(ModelRc::new(VecModel::from(Vec::<EffectTile>::new())));
         return;
     }
     let (ru, cu) = (rows as usize, cols as usize);
@@ -8781,46 +8904,50 @@ fn render_light_tiles(app: &AppWindow, sh: &SharedRt, t: f32) {
     // thumbnail size (and the selected effect's big preview + the device stream still scan live).
     // Dropped at the end of the tile loop. ~765 syscalls/tick removed.
     let _no_keys = neuron::capture::suppress_key_reads();
-    let tiles: Vec<EffectTile> = light_tile_catalog()
+    // the last frame each tile showed — an unchanged frame skips BOTH the pixel-fill conversion and
+    // the model write (no texture re-upload), which zeroes the steady-state cost of every tile that
+    // isn't actually animating right now (Static, the idle half of an indicator's blink, stubs).
+    thread_local! {
+        static LAST_FRAMES: RefCell<std::collections::HashMap<&'static str, Vec<Rgb>>> =
+            RefCell::new(std::collections::HashMap::new());
+    }
+    struct TileRow {
+        spec: TileSpec,
+        frame: Vec<Rgb>,
+        changed: bool,
+    }
+    let entries: Vec<TileRow> = light_tile_catalog()
         .into_iter()
-        .map(|(slug, name, kind)| {
+        .map(|spec| {
+            let slug = spec.slug;
             let g0 = prof.then(std::time::Instant::now);
-            let frame = match kind {
-                "stub" => vec![Rgb::BLACK; ru * cu], // a dark, honest "soon" tile
+            let frame: Vec<Rgb> = match slug {
                 // the VITALS readout tile renders through the SAME proportional renderer the APPLIED layer
                 // uses (`pattern::render_vitals_bounds` over the full board) — NOT the key-anchored
                 // `lighting::render_vitals` — so the swatch matches the composited surface at any grid size
                 // (a zone/mouse grid included) instead of reading ~all-black off a real keyboard's keys.
-                // Fed a REPRESENTATIVE snapshot (a charging mouse) so the gallery reads the look without
+                // Fed a SYNTHETIC drain→charge story so the gauge demonstrably tracks a battery without
                 // polling hardware per thumbnail; the live big-preview + device stream read the heartbeat feed.
-                _ if slug == "vitals" => neuron::pattern::render_vitals_bounds(
-                    preview_vitals(),
+                "vitals" => neuron::pattern::render_vitals_bounds(
+                    preview_vitals(t),
                     rows,
                     cols,
                     neuron::pattern::Bounds::board(rows, cols),
                     phase,
                 ),
-                // the GATED readout tiles (on air / mic light / mode held / signal): a
-                // representative still of the LIT look — the preset's spectrum sampled across the
-                // board at full brightness. The real patterns render dark unless their truth is
-                // actually on (honest on the device, but an unreadable black square in a catalog);
-                // the applied layer + big preview show the real gated behaviour.
-                _ if matches!(slug, "onair" | "miclight" | "modeheld" | "signal") => {
-                    let sp = preset_layer(slug).spectrum;
-                    let span = cu.max(1) as f32 - 1.0;
-                    (0..ru * cu)
-                        .map(|i| {
-                            let u = if span > 0.0 { (i % cu) as f32 / span } else { 0.0 };
-                            sp.at(t, u)
-                        })
-                        .collect()
-                }
-                // the audiometer thumbnail runs the REAL meter pattern → it reads the shared, fast,
-                // idle-auto-stopping `audio_spectrum` loudness provider (cheap), so the tile matches
-                // the device. CACHED across ticks like the other tiles — the level ballistics are
-                // per-instance state that must persist to glide — and pointed at the resolved source
-                // (a knob flip drops the cache entry above).
-                _ if slug == "audiometer" => COMPS.with(|c| {
+                // the GATED indicator tiles (on air / mic light / mode held): a looping DEMO of the
+                // gate itself — a painted patch switches on, holds, drops to standby. The real
+                // patterns render dark unless their truth is actually on (honest on the device, but
+                // an unreadable black square in a catalog); the applied layer shows the real gate.
+                "onair" | "miclight" | "modeheld" => preview_indicator_frame(slug, rows, cols, t),
+                // SIGNAL: the macro-driven level sweeps the urgency ramp, demonstrated.
+                "signal" => preview_signal_frame(rows, cols, t),
+                // the audiometer thumbnail: run the REAL meter (the shared, fast, idle-auto-stopping
+                // `audio_spectrum` provider) ONLY while audiometer is the selected effect — the hero
+                // preview + device already pay for a live analyser then, and the two stay in step.
+                // Unselected, the tile plays a synthetic loudness/tone demo instead: the live render
+                // reads silence as BLACK, and a black catalog tile reads broken, not quiet.
+                "audiometer" if selected == "audiometer" => COMPS.with(|c| {
                     let mut c = c.borrow_mut();
                     if c.0 != rows || c.1 != cols {
                         *c = (rows, cols, std::collections::HashMap::new());
@@ -8833,18 +8960,18 @@ fn render_light_tiles(app: &AppWindow, sh: &SharedRt, t: f32) {
                     });
                     comp.render(rows, cols, t)
                 }),
-                // TYPING HEAT thumbnail: ALWAYS a representative still — the thumbnail pass suppresses
-                // live key reads, so the thermal field would otherwise sit cold. The still shows what
-                // the effect IS; live typing plays on the selected big preview + the device stream.
-                _ if slug == "typingheat" => preview_thermal_frame(rows, cols),
-                // REACTIVE + RIPPLE: input-driven, so their honest gallery render is permanent
-                // black — representative stills instead, per the typingheat/onair convention.
-                _ if slug == "reactive" => preview_reactive_frame(rows, cols),
-                _ if slug == "ripple" => preview_ripple_frame(rows, cols),
+                "audiometer" => preview_meter_demo_frame(rows, cols, t),
+                // TYPING HEAT / REACTIVE / RIPPLE: input-driven, and the thumbnail pass suppresses
+                // live key reads — so each plays a looping phantom-input DEMO of its press→light
+                // story instead of the old frozen still (or worse, permanent black). The real input
+                // reactivity plays on the selected big preview + the device stream.
+                "typingheat" => preview_thermal_frame(rows, cols, t),
+                "reactive" => preview_reactive_frame(rows, cols, t),
+                "ripple" => preview_ripple_frame(rows, cols, t),
                 // AMBIENT thumbnail: render LIVE (driving the whole-desktop capture) ONLY when ambient
                 // is the selected effect — then the big preview + device stream already run the capture.
-                // Otherwise show a representative still and touch no provider (no ~41ms/grab StretchBlt).
-                _ if slug == "ambient" && selected != "ambient" => preview_ambient_frame(rows, cols),
+                // Otherwise a drifting representative still touches no provider (no ~41ms/grab StretchBlt).
+                "ambient" if selected != "ambient" => preview_ambient_frame(rows, cols, t),
                 _ => COMPS.with(|c| {
                     let mut c = c.borrow_mut();
                     if c.0 != rows || c.1 != cols {
@@ -8857,35 +8984,56 @@ fn render_light_tiles(app: &AppWindow, sh: &SharedRt, t: f32) {
                     comp.render(rows, cols, t)
                 }),
             };
-            let gen_us = g0.map_or(0.0, |s| s.elapsed().as_nanos() as f64 / 1000.0);
-            let p0 = prof.then(std::time::Instant::now);
-            let swatch = frame_to_preview(&frame, ru, cu);
-            if let Some(p0) = p0 {
-                prof_rows.push((slug, gen_us, p0.elapsed().as_nanos() as f64 / 1000.0));
+            if let Some(g0) = g0 {
+                prof_rows.push((slug, g0.elapsed().as_nanos() as f64 / 1000.0, 0.0));
             }
-            EffectTile {
-                name: name.into(),
-                slug: slug.into(),
-                kind: kind.into(),
-                swatch,
-            }
+            let changed = LAST_FRAMES.with(|l| {
+                let mut l = l.borrow_mut();
+                if l.get(slug) == Some(&frame) {
+                    false
+                } else {
+                    l.insert(slug, frame.clone());
+                    true
+                }
+            });
+            TileRow { spec, frame, changed }
         })
         .collect();
     let u0 = prof.then(std::time::Instant::now);
-    // UPDATE the rows IN PLACE, never replace the model: swapping the ModelRc destroys + recreates
-    // every `for`-item in the grid — each tile card and its TouchArea — so `has-hover` reset to false
-    // on every 120ms tick and a hovered card kept dropping its hover/lift until the mouse moved again
-    // (the "card unfocuses after a cycle" bug). A row write updates the LIVE item (only its swatch
-    // binding re-evaluates); the model is rebuilt only when the tile count itself changes.
+    let make_tile = |row: &TileRow| EffectTile {
+        name: row.spec.name.into(),
+        slug: row.spec.slug.into(),
+        kind: row.spec.group.into(),
+        blurb: row.spec.blurb.into(),
+        source: row.spec.source.into(),
+        swatch: frame_to_preview(&row.frame, ru, cu),
+    };
+    // THREE shelf models (effects / input-driven / data-fed), each updated the same way. UPDATE rows
+    // IN PLACE, never replace a model: swapping the ModelRc destroys + recreates every `for`-item in
+    // the grid — each tile card and its TouchArea — so `has-hover` reset to false on every 120ms tick
+    // and a hovered card kept dropping its hover/lift until the mouse moved again (the "card
+    // unfocuses after a cycle" bug). A row write updates the LIVE item (only its swatch binding
+    // re-evaluates), an UNCHANGED row isn't written at all, and a model is rebuilt only when its
+    // tile count changes.
     let state = app.global::<State>();
-    let existing = state.get_light_tiles();
-    match existing.as_any().downcast_ref::<VecModel<EffectTile>>() {
-        Some(vm) if vm.row_count() == tiles.len() => {
-            for (i, tile) in tiles.into_iter().enumerate() {
-                vm.set_row_data(i, tile);
+    for (group, existing, install) in [
+        ("effect", state.get_light_tiles(), Box::new(|m| state.set_light_tiles(m)) as Box<dyn Fn(ModelRc<EffectTile>)>),
+        ("input", state.get_light_input_tiles(), Box::new(|m| state.set_light_input_tiles(m))),
+        ("data", state.get_light_data_tiles(), Box::new(|m| state.set_light_data_tiles(m))),
+    ] {
+        let shelf: Vec<&TileRow> = entries.iter().filter(|e| e.spec.group == group).collect();
+        match existing.as_any().downcast_ref::<VecModel<EffectTile>>() {
+            Some(vm) if vm.row_count() == shelf.len() => {
+                for (i, row) in shelf.iter().enumerate() {
+                    if row.changed {
+                        vm.set_row_data(i, make_tile(row));
+                    }
+                }
             }
+            _ => install(ModelRc::new(VecModel::from(
+                shelf.iter().map(|r| make_tile(r)).collect::<Vec<_>>(),
+            ))),
         }
-        _ => state.set_light_tiles(ModelRc::new(VecModel::from(tiles))),
     }
     if let (Some(u0), Some(tick_start)) = (u0, tick_start) {
         let upload_us = u0.elapsed().as_nanos() as f64 / 1000.0;

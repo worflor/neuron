@@ -110,10 +110,12 @@ export struct EffectRow {
 // `kind` groups the tile ("effect" | "data" | "stub"); `swatch` is the rendered preview image (the
 // tile IS the effect, running). Selection is derived in the view (slug == State.light-effect).
 export struct EffectTile {
-    name: string,        // human label ("Breathing", "Mouse Battery")
-    slug: string,        // generator/data id ("breathing", "mouse-battery")
-    kind: string,        // "effect" | "data" | "stub"
-    swatch: image,       // a live (or representative) preview of this tile, rendered Rust-side
+    name: string,        // human label ("Breathing", "Vitals")
+    slug: string,        // generator/data id ("breathing", "vitals")
+    kind: string,        // the shelf group: "effect" | "input" | "data" | "stub"
+    blurb: string,       // one plain-words line: what this look IS / what feeds it
+    source: string,      // the named real-world feed ("keys", "audio", "battery", …; "" = none)
+    swatch: image,       // a live (or demo) preview of this tile, rendered Rust-side
 }
 
 // One auto-rendered PARAM control for the selected effect — the weave-knobs pattern applied to

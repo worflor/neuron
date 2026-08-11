@@ -289,7 +289,12 @@ export global State {
     // render and auto-renders its declared params inline (the weave-knobs pattern). The layer stack
     // (above) is the backend; this is the calm front: a single effect is the default, stacking is an
     // optional spatial act, paint is a brush you pick up — no mode toggle, no layers list.
-    in-out property <[EffectTile]> light-tiles;       // the grid (effects + data + stub), each a live swatch
+    // The catalog is THREE SHELVES, grouped by what feeds each look (the registry's taxonomy):
+    // pure light shows / driven by live typing / fed by a real data source. Same tile grammar on
+    // every shelf; the split is the information.
+    in-out property <[EffectTile]> light-tiles;        // EFFECTS shelf — light shows on a clock
+    in-out property <[EffectTile]> light-input-tiles;  // REACTS-TO-KEYS shelf — driven by live typing
+    in-out property <[EffectTile]> light-data-tiles;   // LIVE-DATA shelf — audio/screen/battery/OBS/mic/…
     in-out property <string> light-effect: "";        // the active tile's slug (lights the tile, drives the knobs); "" = none
     in-out property <[EffectParam]> light-params;     // the active effect's auto-rendered param controls (range/enum/toggle)
     // STREAM RATE — the frame-rate the live effect runs at, driving BOTH the device stream AND this

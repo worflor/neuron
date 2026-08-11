@@ -2813,9 +2813,32 @@ pub struct Preset {
     pub pattern: &'static str,
     pub params: fn() -> Params,
     pub spectrum: fn() -> Spectrum,
+    /// One plain-words line: what this look IS (and, for a fed tile, what feeds it). Preset-specific
+    /// because several presets share one pattern (Audio Meter and Pulse are both `meter` but read
+    /// different worlds).
+    pub blurb: &'static str,
+    /// The real-world feed this tile reads, named for the catalog chip ("keys", "audio", "battery",
+    /// "OBS", "mic", …). Empty for a pure light show (clock-driven, reads nothing).
+    pub source: &'static str,
 }
 
 impl Preset {
+    /// Which catalog SHELF this look belongs on — the taxonomy the lighting page groups its tiles by:
+    /// `"effect"` (a light show on a clock — reads nothing), `"input"` (driven by your live typing),
+    /// `"data"` (reads a real feed — audio, screen, battery, stream state, a macro signal). Derived
+    /// from the registry truth (`readout` / `live_input`) plus the two fed-but-not-readout patterns
+    /// (`meter` reads audio/load, `screen` reads your desktop), so a new preset lands on the right
+    /// shelf for free.
+    pub fn group(&self) -> &'static str {
+        if pattern_is_readout(self.pattern) || matches!(self.pattern, "meter" | "screen") {
+            "data"
+        } else if pattern_def(self.pattern).is_some_and(|d| d.tile.live_input) {
+            "input"
+        } else {
+            "effect"
+        }
+    }
+
     /// Build the [`LayerDef`] this preset describes (a fresh layer ready to composite/persist).
     pub fn to_layer(&self) -> LayerDef {
         LayerDef {
@@ -2840,27 +2863,48 @@ impl Preset {
 /// source for the (phase-3) tile grid. Each is pure data: a pattern key, param overrides, and a spectrum.
 pub fn presets() -> Vec<Preset> {
     vec![
-        Preset { slug: "static", label: "Static", pattern: "uniform", params: pp_none, spectrum: sp_static },
-        Preset { slug: "breathing", label: "Breathing", pattern: "uniform", params: pp_none, spectrum: sp_breathing },
-        Preset { slug: "cycle", label: "Cycle", pattern: "uniform", params: pp_none, spectrum: sp_cycle },
-        Preset { slug: "wave", label: "Wave", pattern: "axis", params: pp_none, spectrum: spectrum::rainbow },
-        Preset { slug: "colorwheel", label: "Color Wheel", pattern: "radial", params: pp_none, spectrum: spectrum::rainbow },
-        Preset { slug: "fire", label: "Fire", pattern: "heat", params: pp_none, spectrum: fire_spectrum },
-        Preset { slug: "typingheat", label: "Typing Heat", pattern: "thermal", params: pp_none, spectrum: thermal_spectrum },
-        Preset { slug: "cascade", label: "Cascade", pattern: "rain", params: pp_rain, spectrum: sp_cascade },
-        Preset { slug: "comet", label: "Comet", pattern: "comet", params: pp_none, spectrum: streak_spectrum },
-        Preset { slug: "starlight", label: "Starlight", pattern: "sparkle", params: pp_none, spectrum: sp_starlight },
-        Preset { slug: "reactive", label: "Reactive", pattern: "ignite", params: pp_none, spectrum: sp_solid_accent },
-        Preset { slug: "ripple", label: "Ripple", pattern: "ring", params: pp_none, spectrum: sp_solid_accent },
-        Preset { slug: "aurora", label: "Aurora", pattern: "flow", params: pp_none, spectrum: aurora_spectrum },
-        Preset { slug: "audiometer", label: "Audio Meter", pattern: "meter", params: pp_audio, spectrum: meter_spectrum },
-        Preset { slug: "pulse", label: "Pulse", pattern: "meter", params: pp_load, spectrum: sp_pulse },
-        Preset { slug: "ambient", label: "Ambient", pattern: "screen", params: pp_none, spectrum: sp_solid_accent },
-        Preset { slug: "vitals", label: "Vitals", pattern: "vitals", params: pp_none, spectrum: sp_solid_accent },
-        Preset { slug: "onair", label: "On Air", pattern: "onair", params: pp_none, spectrum: onair_spectrum },
-        Preset { slug: "miclight", label: "Mic Light", pattern: "miclight", params: pp_none, spectrum: onair_spectrum },
-        Preset { slug: "modeheld", label: "Mode Held", pattern: "modeheld", params: pp_none, spectrum: sp_solid_accent },
-        Preset { slug: "signal", label: "Signal", pattern: "signal", params: pp_none, spectrum: sp_pulse },
+        Preset { slug: "static", label: "Static", pattern: "uniform", params: pp_none, spectrum: sp_static,
+            blurb: "one colour across the whole board", source: "" },
+        Preset { slug: "breathing", label: "Breathing", pattern: "uniform", params: pp_none, spectrum: sp_breathing,
+            blurb: "the colour breathes — a slow rise and fall", source: "" },
+        Preset { slug: "cycle", label: "Cycle", pattern: "uniform", params: pp_none, spectrum: sp_cycle,
+            blurb: "the whole board cycles through the spectrum", source: "" },
+        Preset { slug: "wave", label: "Wave", pattern: "axis", params: pp_none, spectrum: spectrum::rainbow,
+            blurb: "a gradient scrolling along an axis", source: "" },
+        Preset { slug: "colorwheel", label: "Color Wheel", pattern: "radial", params: pp_none, spectrum: spectrum::rainbow,
+            blurb: "a hue wheel turning around the centre", source: "" },
+        Preset { slug: "fire", label: "Fire", pattern: "heat", params: pp_none, spectrum: fire_spectrum,
+            blurb: "an upward fire — heat rises, flickers, cools", source: "" },
+        Preset { slug: "typingheat", label: "Typing Heat", pattern: "thermal", params: pp_none, spectrum: thermal_spectrum,
+            blurb: "your typing rendered as a living heat map", source: "keys" },
+        Preset { slug: "cascade", label: "Cascade", pattern: "rain", params: pp_rain, spectrum: sp_cascade,
+            blurb: "falling rain — matrix streams, white-hot heads", source: "" },
+        Preset { slug: "comet", label: "Comet", pattern: "comet", params: pp_none, spectrum: streak_spectrum,
+            blurb: "streaking comets — break one with a keypress", source: "keys" },
+        Preset { slug: "starlight", label: "Starlight", pattern: "sparkle", params: pp_none, spectrum: sp_starlight,
+            blurb: "random twinkles igniting and fading like stars", source: "" },
+        Preset { slug: "reactive", label: "Reactive", pattern: "ignite", params: pp_none, spectrum: sp_solid_accent,
+            blurb: "lights the key you press, then fades", source: "keys" },
+        Preset { slug: "ripple", label: "Ripple", pattern: "ring", params: pp_none, spectrum: sp_solid_accent,
+            blurb: "a keypress sends a ring rippling outward", source: "keys" },
+        Preset { slug: "aurora", label: "Aurora", pattern: "flow", params: pp_none, spectrum: aurora_spectrum,
+            blurb: "a slow aurora flow drifting over the board", source: "" },
+        Preset { slug: "audiometer", label: "Audio Meter", pattern: "meter", params: pp_audio, spectrum: meter_spectrum,
+            blurb: "brightness follows loudness, colour follows tone", source: "audio" },
+        Preset { slug: "pulse", label: "Pulse", pattern: "meter", params: pp_load, spectrum: sp_pulse,
+            blurb: "a gauge filling with your CPU + RAM load", source: "system" },
+        Preset { slug: "ambient", label: "Ambient", pattern: "screen", params: pp_none, spectrum: sp_solid_accent,
+            blurb: "the board mirrors the colours on your screen", source: "screen" },
+        Preset { slug: "vitals", label: "Vitals", pattern: "vitals", params: pp_none, spectrum: sp_solid_accent,
+            blurb: "the device's live battery & charge as a gauge", source: "battery" },
+        Preset { slug: "onair", label: "On Air", pattern: "onair", params: pp_none, spectrum: onair_spectrum,
+            blurb: "lights where you paint it while your stream is live", source: "OBS" },
+        Preset { slug: "miclight", label: "Mic Light", pattern: "miclight", params: pp_none, spectrum: onair_spectrum,
+            blurb: "lights where you paint it while your mic is muted (or hot)", source: "mic" },
+        Preset { slug: "modeheld", label: "Mode Held", pattern: "modeheld", params: pp_none, spectrum: sp_solid_accent,
+            blurb: "lights while a hold layer or sniper is engaged", source: "modes" },
+        Preset { slug: "signal", label: "Signal", pattern: "signal", params: pp_none, spectrum: sp_pulse,
+            blurb: "a light your macros drive: neuron.signal(n, v)", source: "macros" },
     ]
 }
 
