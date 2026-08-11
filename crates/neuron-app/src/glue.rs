@@ -3884,7 +3884,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                             "Pick a Synapse export (.synapse3 / .ChromaEffects).".into(),
                         );
                         st.set_status_line(
-                            format!("{msg} — press apply on the profile to make it live").into(),
+                            format!("{msg} · press apply on the profile to make it live").into(),
                         );
                         st.set_import_open(false);
                         // land the user ON the imported profile, where the next press is obvious
@@ -8491,7 +8491,7 @@ pub fn restore_lighting(app: &AppWindow, sh: &SharedRt) {
         };
         if sh.borrow().rt.animating(sel, &sel_unit) {
             app.global::<State>()
-                .set_status_line(format!("lighting resumed — {msg}").into());
+                .set_status_line(format!("lighting resumed · {msg}").into());
         }
     }
     LIGHTING_READY.store(true, std::sync::atomic::Ordering::Release);

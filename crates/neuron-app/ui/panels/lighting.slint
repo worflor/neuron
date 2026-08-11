@@ -785,7 +785,7 @@ export component LightingPanel inherits VerticalLayout {
             if State.light-foreign || State.light-suppressed : Mono {
                 text: State.light-foreign
                     ? "your lighting composes underneath and returns the moment it lets go \u{00b7} tune the blend in VISITORS"
-                    : "connected but outranked \u{2014} flip off \u{201c}my lighting always wins\u{201d} in VISITORS to let it through";
+                    : "connected but outranked. flip off \u{201c}my lighting always wins\u{201d} in VISITORS to let it through";
                 color: Theme.text-faint;
                 horizontal-alignment: center;
                 wrap: word-wrap;
@@ -811,7 +811,7 @@ export component LightingPanel inherits VerticalLayout {
                 }
                 TileShelf {
                     title: "EFFECTS";
-                    caption: "light shows on a clock — they read nothing";
+                    caption: "pure light shows, running on a clock";
                     tiles: State.light-tiles;
                 }
                 TileShelf {
@@ -821,7 +821,7 @@ export component LightingPanel inherits VerticalLayout {
                 }
                 TileShelf {
                     title: "LIVE DATA";
-                    caption: "each reads a real feed — the chip names it · tiles loop a demo";
+                    caption: "each one reads a real feed, named on the chip · tiles loop a demo";
                     tiles: State.light-data-tiles;
                 }
             }
@@ -880,13 +880,13 @@ export component LightingPanel inherits VerticalLayout {
                 // a READOUT layer (vitals) is honest about being a live device gauge, not a tunable light
                 // show — it has a rate + a placement but no colour ramp or knobs, so point at what it IS.
                 if State.light-is-readout : Mono {
-                    text: "a live device readout — battery / charge. place it anywhere on the render.";
+                    text: "a live readout of battery and charge. place it anywhere on the render.";
                     color: Theme.text-faint; wrap: word-wrap;
                 }
                 // a hand-painted `custom` frame owns its pixels directly — no ramp, no knobs. It's edited
                 // with the brush on the render, so the inspector just points there instead of faking knobs.
                 if State.light-effect == "custom" : Mono {
-                    text: "a hand-painted frame — pick up the brush on the render to edit its pixels.";
+                    text: "a hand-painted frame. pick up the brush on the render to edit its pixels.";
                     color: Theme.text-faint; wrap: word-wrap;
                 }
 
@@ -1042,7 +1042,7 @@ export component LightingPanel inherits VerticalLayout {
                         }
                     }
                     if State.light-place-on : Mono {
-                        text: "drag a rectangle on the render — the enclosed keys become this layer's area.";
+                        text: "drag a rectangle on the render. the keys inside it become this layer's area.";
                         color: Theme.text-faint; wrap: word-wrap;
                     }
                 }
@@ -1095,7 +1095,7 @@ export component LightingPanel inherits VerticalLayout {
                     strength: State.host-openrgb-strength;
                     fade: State.host-openrgb-fade;
                     blurb: State.host-openrgb-mode == 0
-                        ? "tools take the LEDs they set — the classic hard takeover."
+                        ? "tools take the LEDs they set, the classic hard takeover."
                         : State.host-openrgb-mode == 2
                             ? "tools brighten your lighting for loud moments."
                             : State.host-openrgb-mode == 3
@@ -1126,7 +1126,7 @@ export component LightingPanel inherits VerticalLayout {
                         }
                     }
                     Mono {
-                        text: "toggle a device off to keep it yours — no visitor paints it, Chroma or OpenRGB.";
+                        text: "toggle a device off to keep it yours. no visitor paints it, Chroma or OpenRGB.";
                         color: Theme.text-faint; wrap: word-wrap;
                     }
                 }
@@ -1141,7 +1141,7 @@ export component LightingPanel inherits VerticalLayout {
                         toggled(v) => { State.set-host-base-always-wins(v); }
                     }
                     Mono {
-                        text: "when on, your lighting outranks every visitor — they keep painting underneath and show up as suppressed.";
+                        text: "when on, your lighting outranks every visitor. they keep painting underneath and show up as suppressed.";
                         color: Theme.text-faint; wrap: word-wrap;
                     }
                 }

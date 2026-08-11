@@ -1442,7 +1442,7 @@ export component DevicePanel inherits VerticalLayout {
                                     checked: State.persist-to-onboard;
                                     toggled(v) => { State.persist-to-onboard = v; State.set-persist(v); }
                                 }
-                                Mono { text: "saved to the mouse — holds with the app closed. needs onboard profiles."; color: Theme.text-faint; wrap: word-wrap; }
+                                Mono { text: "saved to the mouse, so it holds with the app closed. needs onboard profiles."; color: Theme.text-faint; wrap: word-wrap; }
                             }
                         }
                     }
@@ -1486,7 +1486,7 @@ export component DevicePanel inherits VerticalLayout {
                             toggled => { State.toggle-game-mode(); }
                         }
                         if State.sel-can-game-mode : GateNote {
-                            text: "the board's own FN+F10 Win-key kill — firmware-side, works with zero software. this is what ate your Win key.";
+                            text: "the board's own FN+F10 Win-key kill, firmware-side and working with zero software. this is what ate your Win key.";
                         }
                     }
                 }

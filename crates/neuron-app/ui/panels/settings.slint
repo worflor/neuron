@@ -832,7 +832,7 @@ export component SettingsPanel inherits VerticalLayout {
                     SectionTitle { text: "APPEARANCE"; }
                     ColorPicker {
                         label: "INTERFACE";
-                        hint: "the app's accent — anything live lights up in this.";
+                        hint: "the app's accent. anything live lights up in this.";
                         current: Theme.accent;
                         value: State.ui-accent;
                         swatches: Palette.accent;
@@ -1317,7 +1317,7 @@ export component SettingsPanel inherits VerticalLayout {
                                 // On Air data layer (paint the keys it covers, pick any colour or
                                 // motion), driven by the broadcast state this connection announces.
                                 Mono {
-                                    text: "want an on-air light? add the On Air layer on the LIGHTING page. paint the keys it covers and give it any look; it shows only while you are actually live.";
+                                    text: "for an on-air light, add the On Air layer on the LIGHTING page. paint the keys it covers and give it any look; it shows only while you are actually live.";
                                     color: Theme.text-faint; wrap: word-wrap;
                                 }
                             }

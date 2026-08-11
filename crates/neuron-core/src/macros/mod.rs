@@ -260,7 +260,7 @@ fn launch(what: Launch) -> String {
         // the request that was already one too many. So it is refused and SAYS so, matching the
         // runner's stated contract and how `run_sequence` treats the same outcome.
         runner::Submitted::Refused => {
-            format!("`{label}` skipped — too many launches already queued")
+            format!("`{label}` skipped · too many launches already queued")
         }
         // No pool at all is an infrastructure failure, not overload: the worker threads could not be
         // created. Falling back to a synchronous spawn costs this one press its latency, which is far
