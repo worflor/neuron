@@ -144,6 +144,10 @@ export component SpellweavingPanel inherits VerticalLayout {
                     // min-seg). It's wrapped in a hugging VerticalLayout so the bank sizes to its four
                     // cells (4·min-cell) and the row's stretch is eaten by the description text beside it.
                     VerticalLayout { alignment: center;
+                        // stretch: 0 — the wrapping VerticalLayout carries a layout-child's default
+                        // stretch 1, so on a wide window the bank inflated its cells to fill slack
+                        // that belongs to the description text beside it. Hugging keeps 4·min-cell.
+                        horizontal-stretch: 0;
                         SplitToggle {
                             options: ["hold", "tap·hold", "2tap·hold", "2tap"];
                             index: root.activation-idx;
@@ -248,7 +252,16 @@ export component SpellweavingPanel inherits VerticalLayout {
                 VerticalLayout { alignment: center; GuideButton { guide-id: "spellweaving"; } }
                 Rectangle {}
             }
+            // the canvas rides a centring row with a width CEILING: it mirrors strokes drawn across
+            // the whole screen, and past ~920px the cells become flat slabs that distort the glyph's
+            // proportions (a maximized window stretched it to ~1450×280). Centred, it stays a calm
+            // subject in its column — the LIGHTING hero's treatment. Constraint + weighted gutter
+            // spacers, NOT `width: min(parent.width, …)` (a binding loop — see app.slint's ceiling).
+            HorizontalLayout {
+            Rectangle { horizontal-stretch: 0.001; }
             canvas := Rectangle {
+                horizontal-stretch: 1;
+                max-width: 920px;
                 // RICH MODE skin: a faint amber wash + a lit border, so the surface itself reads as
                 // "research capture → file" the moment a rich stroke begins — not a plain recording.
                 background: root.rich-live ? Theme.capture.with-alpha(0.05) : Theme.bg-2;
@@ -365,6 +378,8 @@ export component SpellweavingPanel inherits VerticalLayout {
                     }
                 }
             }
+            Rectangle { horizontal-stretch: 0.001; }
+            }   // close the canvas's centring row
             HorizontalLayout {
                 // a rich-SAVE line becomes a click-to-reveal link (amber like the mode, brightens on
                 // hover) that opens the strokes folder; every other status stays plain text.

@@ -256,11 +256,22 @@ export component AppWindow inherits Window {
                 background: Theme.bg;
                 clip: true;
                 VerticalLayout {
-                    padding-left: Theme.pad-page;
-                    padding-right: Theme.pad-page;
                     padding-top: 14px;
                     padding-bottom: 14px;
-                    Rectangle {
+                    // the CONTENT CEILING: pages live in a centred column bounded by
+                    // Theme.content-max, so a maximized window widens the margins instead of
+                    // stretching every control to the glass edge. Constraint-based (max-width +
+                    // weighted gutter spacers), NOT `width: min(parent.width, …)` — a child reading
+                    // its layout parent's width is a binding loop. The gutters' tiny stretch weight
+                    // splits any past-the-ceiling slack evenly, centring the column; below the
+                    // ceiling they collapse to ~0 and this is exactly the old pad-page gutter.
+                    HorizontalLayout {
+                        padding-left: Theme.pad-page;
+                        padding-right: Theme.pad-page;
+                        Rectangle { horizontal-stretch: 0.001; }
+                        Rectangle {
+                            horizontal-stretch: 1;
+                            max-width: Theme.content-max;
                         // DEVICE owns its OWN inner inspector Flickable (fixed-footprint pane, scrolls
                         // internally) — so it must NOT also be wrapped in the page-level PanelPage, or the
                         // two nested Flickables break hit-testing on the inner's scrolled content (clicking
@@ -285,6 +296,8 @@ export component AppWindow inherits Window {
                                 State.macro-jump-pending = false;
                             }
                         }
+                        }
+                        Rectangle { horizontal-stretch: 0.001; }
                     }
                 }
             }

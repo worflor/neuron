@@ -598,8 +598,69 @@ component PingCard inherits Rectangle {
     ta := TouchArea { enabled: root.enabled; mouse-cursor: root.enabled ? MouseCursor.pointer : MouseCursor.default; clicked => { root.toggled(); } }
 }
 
+// The WHAT-EARNS-A-PING grid — the three DOMAIN CLUSTERS, data-driven: each caption owns ONE
+// full-width row of exactly its domain's kinds (the glue's exhaustive ping_slot map decides
+// membership), every card stretching to share the row evenly up to a card's own ceiling (200px —
+// past that a toggle card is an empty slab, so wide rows pack left instead of inflating). The
+// layout structurally CANNOT grow a dangling odd card — a new kind joins its domain's row and that
+// row just gets denser; a denser row beside a looser one reads as grouping, not damage. One
+// component, because the placer row instantiates it in BOTH its wide and narrow arrangements.
+component PingGrid inherits VerticalLayout {
+    in property <bool> gate: true;
+    spacing: 9px;
+    VerticalLayout {
+        spacing: 5px;
+        SubLabel { text: "POINTER"; color: Theme.text-faint; letter-spacing: Theme.track-3; }
+        HorizontalLayout {
+            spacing: 6px;
+            for k in State.ping-pointer : PingCard {
+                slug: k.icon; label: k.label; desc: k.desc; on: k.on;
+                enabled: root.gate;
+                max-width: 200px;
+                toggled => { State.set-notif-event(k.slug, !k.on); }
+            }
+            Rectangle {}
+        }
+    }
+    VerticalLayout {
+        spacing: 5px;
+        SubLabel { text: "HARDWARE"; color: Theme.text-faint; letter-spacing: Theme.track-3; }
+        HorizontalLayout {
+            spacing: 6px;
+            for k in State.ping-hardware : PingCard {
+                slug: k.icon; label: k.label; desc: k.desc; on: k.on;
+                enabled: root.gate;
+                max-width: 200px;
+                toggled => { State.set-notif-event(k.slug, !k.on); }
+            }
+            Rectangle {}
+        }
+    }
+    VerticalLayout {
+        spacing: 5px;
+        SubLabel { text: "SESSION"; color: Theme.text-faint; letter-spacing: Theme.track-3; }
+        HorizontalLayout {
+            spacing: 6px;
+            for k in State.ping-session : PingCard {
+                slug: k.icon; label: k.label; desc: k.desc; on: k.on;
+                enabled: root.gate;
+                max-width: 200px;
+                toggled => { State.set-notif-event(k.slug, !k.on); }
+            }
+            Rectangle {}
+        }
+    }
+}
+
 export component SettingsPanel inherits VerticalLayout {
     spacing: 0;
+    // Is the RIGHT COLUMN too narrow to seat the notification placer (348px) beside a workable
+    // 4-card ping row? Measured HERE, at the panel root — its width is imposed by the page
+    // Flickable's viewport (never derived from children), so reading it can't loop, unlike a
+    // self-measuring wrapper inside the column (which both loops in spirit and reports a stale
+    // preferred height — the overlapping-sections bug). 380px = the left column, gap-col = the
+    // gutter; below ~792px of remainder the row stacks instead.
+    property <bool> narrow-col: self.width - 380px - Theme.gap-col < 792px;
     // the curated accent hues live ONCE in `Palette.accent` (controls.slint), shared with the LIGHTING
     // colour picker so the two never drift. The ColorPickers below pull straight from it.
     // animate the material gallery swatches only while SYSTEM is open, and only at ~10fps — the
@@ -918,12 +979,19 @@ export component SettingsPanel inherits VerticalLayout {
                 // hero (it stretches to fill), so config sits as a tight utility block above it.
                 VerticalLayout {
                     horizontal-stretch: 1;
+                    // CAPPED: past ~880px a column of toggles and sliders stops being an instrument
+                    // and becomes empty track between a caption and its far-flung control — one
+                    // ceiling bounds every child at once instead of each control defending itself.
+                    max-width: 880px;
                     spacing: 13px;
                     SectionTitle { text: "CONFIG & MIGRATION"; }
                     Label { text: "every setting is plain, hand-editable TOML and JSON in the run folder: bindings.toml, cast.toml, apps.toml, gestures.json, plus profiles/ and backups/."; }
                     HorizontalLayout {
-                        // the coupled config verbs fuse into one deck; the stretch spacer lets it hug
+                        // the coupled config verbs fuse into one deck. stretch: 0 makes the trailing
+                        // spacer actually work (a layout-bearing element defaults to stretch 1 and
+                        // was splitting the slack with it).
                         SplitButton {
+                            horizontal-stretch: 0;
                             left-text: "open config folder";
                             right-text: "import from Synapse…";
                             left-clicked => { State.open-config-dir(); }
@@ -1032,63 +1100,38 @@ export component SettingsPanel inherits VerticalLayout {
                                 }
                                 Rectangle {}
                             }
-                            HorizontalLayout {
+                            // RESPONSIVE: the placer pins its mock-screen width, so the grid beside it
+                            // gets whatever is left — and below ~790px of column that remainder can't
+                            // hold a 4-card row (the crushed-slivers bug this replaces). The panel
+                            // root's `narrow-col` decides the arrangement: side-by-side when the grid
+                            // keeps a workable measure, stacked (placer above grid, both full-width)
+                            // when it wouldn't. Same two pieces either way — plain `if` children of
+                            // the column, so the active arrangement's height flows into the layout
+                            // (a wrapping Rectangle reported a stale preferred height and the
+                            // sections below overlapped it).
+                            if !root.narrow-col : HorizontalLayout {
                                 spacing: Theme.gap-col;
                                 NotifPlacer { enabled: State.notif-enabled; }
-                                // the card TYPES — a tidy grid beside the placer. alignment:start keeps the
-                                // header + grid TOP-aligned with the placer (no stretch-spread gap below it).
+                                // alignment:start keeps the header + grid TOP-aligned with the
+                                // placer (no stretch-spread gap below it).
                                 VerticalLayout {
                                     horizontal-stretch: 1;
                                     alignment: start;
-                                    spacing: 10px;   // header → grid block (distinct from the tighter inter-row gutter below)
+                                    spacing: 10px;   // header → grid block (distinct from the tighter inter-row gutter)
                                     SubLabel { text: "WHAT EARNS A PING"; }
-                                    // DOMAIN CLUSTERS, data-driven: each caption owns ONE full-width
-                                    // row of exactly its domain's kinds (the glue's exhaustive
-                                    // ping_slot map decides membership), every card stretching to
-                                    // share the row evenly. The layout structurally CANNOT grow a
-                                    // dangling odd card — a new kind joins its domain's row and that
-                                    // row just gets denser; a denser row beside a looser one reads as
-                                    // grouping, not damage. The captions double as the taxonomy the
-                                    // toggles already live in inside your head: aim, metal, software.
-                                    VerticalLayout {
-                                        spacing: 9px;
-                                        VerticalLayout {
-                                            spacing: 5px;
-                                            SubLabel { text: "POINTER"; color: Theme.text-faint; letter-spacing: Theme.track-3; }
-                                            HorizontalLayout {
-                                                spacing: 6px;
-                                                for k in State.ping-pointer : PingCard {
-                                                    slug: k.icon; label: k.label; desc: k.desc; on: k.on;
-                                                    enabled: State.notif-enabled;
-                                                    toggled => { State.set-notif-event(k.slug, !k.on); }
-                                                }
-                                            }
-                                        }
-                                        VerticalLayout {
-                                            spacing: 5px;
-                                            SubLabel { text: "HARDWARE"; color: Theme.text-faint; letter-spacing: Theme.track-3; }
-                                            HorizontalLayout {
-                                                spacing: 6px;
-                                                for k in State.ping-hardware : PingCard {
-                                                    slug: k.icon; label: k.label; desc: k.desc; on: k.on;
-                                                    enabled: State.notif-enabled;
-                                                    toggled => { State.set-notif-event(k.slug, !k.on); }
-                                                }
-                                            }
-                                        }
-                                        VerticalLayout {
-                                            spacing: 5px;
-                                            SubLabel { text: "SESSION"; color: Theme.text-faint; letter-spacing: Theme.track-3; }
-                                            HorizontalLayout {
-                                                spacing: 6px;
-                                                for k in State.ping-session : PingCard {
-                                                    slug: k.icon; label: k.label; desc: k.desc; on: k.on;
-                                                    enabled: State.notif-enabled;
-                                                    toggled => { State.set-notif-event(k.slug, !k.on); }
-                                                }
-                                            }
-                                        }
-                                    }
+                                    PingGrid { gate: State.notif-enabled; }
+                                }
+                            }
+                            if root.narrow-col : VerticalLayout {
+                                spacing: Theme.gap;
+                                HorizontalLayout {
+                                    alignment: start;
+                                    NotifPlacer { enabled: State.notif-enabled; }
+                                }
+                                VerticalLayout {
+                                    spacing: 10px;
+                                    SubLabel { text: "WHAT EARNS A PING"; }
+                                    PingGrid { gate: State.notif-enabled; }
                                 }
                             }
                         }
@@ -1110,6 +1153,9 @@ export component SettingsPanel inherits VerticalLayout {
                                 NotifStackMock { mode: State.notif-stack; }
                                 VerticalLayout {
                                     horizontal-stretch: 1;
+                                    // a radio row longer than a readable line is just empty contact
+                                    // plate — cap the column at the shared control measure.
+                                    max-width: Theme.measure-max;
                                     spacing: 6px;
                                     // full-width radio rows — Contact's lit body carries selection (the old
                                     // trailing dot merely mirrored `on`, so it's gone); desc is the second line.
@@ -1117,6 +1163,7 @@ export component SettingsPanel inherits VerticalLayout {
                                     Contact { fill: true; enabled: State.notif-enabled; label: "latest"; desc: "newest only, one card"; active: State.notif-stack == "latest"; clicked => { State.set-notif-stack("latest"); } }
                                     Contact { fill: true; enabled: State.notif-enabled; label: "digest"; desc: "one summary, counted"; active: State.notif-stack == "digest"; clicked => { State.set-notif-stack("digest"); } }
                                 }
+                                Rectangle {}
                             }
                         }
                         // card background — the grounded squircle (app-card chrome) vs the floating spell.
@@ -1141,6 +1188,9 @@ export component SettingsPanel inherits VerticalLayout {
                                 VerticalLayout {
                                     alignment: center;
                                     horizontal-stretch: 1;
+                                    // a volume knob gains nothing from half a metre of track —
+                                    // the shared control measure caps its travel.
+                                    max-width: Theme.measure-max;
                                     Slider {
                                         compact: true;
                                         enabled: State.notif-enabled;
@@ -1152,6 +1202,7 @@ export component SettingsPanel inherits VerticalLayout {
                                         changed(v) => { State.set-notif-volume(v); }
                                     }
                                 }
+                                Rectangle {}
                             }
                             if State.notif-audio : HorizontalLayout {
                                 spacing: Theme.gap;
@@ -1354,8 +1405,12 @@ export component SettingsPanel inherits VerticalLayout {
                         Mono { text: "Windows relaunches neuron if it crashes or hangs."; color: Theme.text-faint; }
                     }
                     HorizontalLayout {
-                        // the two flight-recorder verbs fuse into one deck; the stretch spacer lets it hug
+                        // the two flight-recorder verbs fuse into one deck. stretch: 0 is what makes
+                        // the trailing spacer work — an element CONTAINING a layout defaults to
+                        // stretch 1, so without it the deck split the slack with its own spacer and
+                        // inflated to half the column on a wide window.
                         SplitButton {
+                            horizontal-stretch: 0;
                             left-text: "write flight dump";
                             right-text: "open crash log";
                             left-clicked => { State.write-flight-dump(); }

@@ -93,6 +93,14 @@ export global Theme {
     out property <length> radius:    4px;    // instrument corners are tight, not pill-soft
     out property <length> radius-sm: 3px;
     out property <length> pad-page:  22px;   // page margin — breathing without squandering glass
+    // the page CONTENT CEILING — on a wide window the work area is a centred, bounded column, the
+    // way the LIGHTING hero already treats its render (a calm subject, not a banner). Without it a
+    // maximized window stretched every stretchy control to the glass edge: 1400px sliders, radio
+    // rows wider than a paragraph is readable, ping cards inflated into empty slabs.
+    out property <length> content-max: 1500px;
+    // a single control cluster's readable measure — sliders/radio stacks stop growing past this
+    // even inside a wide column (a slider's travel gains nothing from 800px of track).
+    out property <length> measure-max: 560px;
     out property <length> gap:       12px;
     out property <length> gap-col:   24px;   // the two-column panel gutter (device/lighting/bindings/…)
     out property <length> lead-in:   16px;   // a panel's hairline → its first content
