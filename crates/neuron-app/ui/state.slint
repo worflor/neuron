@@ -542,7 +542,7 @@ export global State {
     // live Shift state, polled by the weave page while it's on-screen — previews the rich-mode
     // affordance on the Record button the instant Shift goes down, before you commit to a capture.
     in-out property <bool> shift-armed: false;
-    callback poll-shift() -> bool;                    // glue → is Shift physically down right now?
+    callback poll-shift() -> bool;                    // glue → Shift down AND our window focused? (global key read, focus-gated)
     // true only when `gesture-status` is a rich-save confirmation — turns that line into a clickable
     // link that reveals the strokes folder in the OS file manager. Cleared at the start of any capture.
     in-out property <bool> stroke-saved: false;

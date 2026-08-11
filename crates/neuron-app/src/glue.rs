@@ -3325,9 +3325,13 @@ pub fn install(app: &AppWindow) -> SharedRt {
     });
     // live Shift probe for the weave page's rich-mode preview — a ~8Hz Timer on that page asks this
     // whether Shift is physically down, so the Record button can morph to "rich → file" before a click.
+    // FOCUS-GATED: `key_down` is `GetAsyncKeyState` — a GLOBAL read — so without the gate, holding
+    // Shift in a game (window visible behind it, unfocused) flipped the weave page into its amber
+    // strokelab identity from across the desktop. The mode preview is an answer to "what would THIS
+    // click do", and an unfocused window has no click to answer for.
     bind(app, &shared, |app, _sh| {
         app.global::<State>()
-            .on_poll_shift(|| neuron::glyph::key_down(0x10));
+            .on_poll_shift(|| app_window_focused() && neuron::glyph::key_down(0x10));
     });
     bind(app, &shared, |app, sh| {
         let w = app.as_weak();
@@ -9728,6 +9732,34 @@ fn weave_capture_stamped(
 /// strokelab: Shift+Record. Capture a FULL rich weave at sensor fidelity (with per-sample
 /// timestamps, never thinned) and write the whole eigenmotion bundle to `./strokes/` — the vault is
 /// NOT touched. The capture path is byte-identical to [`record_gesture`]'s; only the destination
+/// Does OUR process own the foreground window right now? The gate for GLOBAL input reads
+/// (`GetAsyncKeyState`) that feed pure UI affordances — a mode preview answers "what would this
+/// click do", and a click can only land on a focused window. Checked per poll, uncached: two
+/// syscalls at ~9Hz, and focus can change between any two ticks.
+#[cfg(windows)]
+fn app_window_focused() -> bool {
+    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, GetWindowThreadProcessId,
+    };
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.is_null() {
+            return false;
+        }
+        let mut pid: u32 = 0;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        pid == GetCurrentProcessId()
+    }
+}
+
+/// Non-Windows: no global key reads exist to gate (`glyph::key_down` is already a stub there), so
+/// the answer only has to keep the caller's expression well-formed.
+#[cfg(not(windows))]
+fn app_window_focused() -> bool {
+    false
+}
+
 /// differs (a research file instead of a learned gesture). A second press cancels, same as record.
 fn record_rich_stroke(app: &AppWindow, sh: &SharedRt) {
     let st = app.global::<State>();
