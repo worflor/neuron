@@ -587,6 +587,35 @@ mod tests {
         assert_eq!((control.page, control.usage, control.pid), (0x07, 0x1E, Some(0x00A7)));
     }
 
+    /// The resident observer fans out EVERY control edge in the process (the pump is a global
+    /// bus); what keeps bind-capture sane is this state machine's own filtering. Left mouse is
+    /// the load-bearing exclusion — it operates the capture dialog itself, so if it ever slipped
+    /// through, clicking "record" would instantly bind Mouse 1 and the dialog could never be
+    /// used again. Side buttons stay bindable.
+    #[cfg(windows)]
+    #[test]
+    fn resident_capture_ignores_left_mouse_but_takes_side_buttons() {
+        let mut state = ControlCaptureState::default();
+        assert!(
+            state
+                .observe(&neuron::controls::ControlEvent {
+                    pid: "00a7".into(),
+                    hits: vec![(0x09, 1)],
+                    raw: Vec::new(),
+                })
+                .is_none(),
+            "left mouse operates the dialog — never capturable"
+        );
+        let control = state
+            .observe(&neuron::controls::ControlEvent {
+                pid: "00a7".into(),
+                hits: vec![(0x09, 4)],
+                raw: Vec::new(),
+            })
+            .expect("a side button is a bindable control");
+        assert_eq!((control.page, control.usage, control.pid), (0x09, 4, Some(0x00A7)));
+    }
+
     #[cfg(windows)]
     #[test]
     fn resident_capture_prefers_the_naga_keyboard_twin() {

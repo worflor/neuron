@@ -326,11 +326,12 @@ impl LayerDef {
 
 // ───────────────────────────────────────── the registry ──────────────────────────────────
 
-/// Tile / catalog metadata for a pattern — what the (phase-3) preset grid shows about it.
+/// Tile / catalog metadata for a pattern — the behavioural flags the preset grid derives from.
+/// User-facing COPY does not live here: each [`Preset`] carries its own `blurb`/`source`, because
+/// copy is per-LOOK (Audio Meter and Pulse share the `meter` pattern but read different worlds) —
+/// a pattern-level blurb was a second source of truth that drifted against it.
 #[derive(Clone, Copy, Debug)]
 pub struct TileMeta {
-    /// A one-line human blurb for the tile.
-    pub blurb: &'static str,
     /// Does the pattern need LIVE input (keys / audio / screen / telemetry) to show anything? Headless
     /// previews and the no-dead-knob sweeps skip these (they render dark without a live source).
     pub live_input: bool,
@@ -379,7 +380,6 @@ static REGISTRY: &[PatternDef] = &[
         params: Vec::new,
         default_spectrum: || Spectrum::solid(ACCENT),
         tile: TileMeta {
-            blurb: "one colour across the whole board",
             live_input: false,
         },
         has_spectrum: true,
@@ -392,7 +392,6 @@ static REGISTRY: &[PatternDef] = &[
         params: || vec![direction_param(), speed_param()],
         default_spectrum: spectrum::rainbow,
         tile: TileMeta {
-            blurb: "a gradient scrolling along an axis (the wave shape)",
             live_input: false,
         },
         has_spectrum: true,
@@ -405,7 +404,6 @@ static REGISTRY: &[PatternDef] = &[
         params: || vec![direction_param(), speed_param()],
         default_spectrum: spectrum::rainbow,
         tile: TileMeta {
-            blurb: "a hue wheel turning around the centre",
             live_input: false,
         },
         has_spectrum: true,
@@ -418,7 +416,6 @@ static REGISTRY: &[PatternDef] = &[
         params: || vec![speed_param(), density_param()],
         default_spectrum: fire_spectrum,
         tile: TileMeta {
-            blurb: "an upward fire — heat rises, flickers and cools",
             live_input: false,
         },
         has_spectrum: true,
@@ -431,7 +428,6 @@ static REGISTRY: &[PatternDef] = &[
         params: || vec![mode_param(), speed_param(), density_param()],
         default_spectrum: sp_cascade,
         tile: TileMeta {
-            blurb: "falling rain — or matrix code streams, white-hot heads",
             live_input: false,
         },
         has_spectrum: true,
@@ -444,7 +440,6 @@ static REGISTRY: &[PatternDef] = &[
         params: || vec![speed_param(), density_param()],
         default_spectrum: streak_spectrum,
         tile: TileMeta {
-            blurb: "streaking comets — break one with a keypress",
             live_input: true,
         },
         has_spectrum: true,
@@ -457,7 +452,6 @@ static REGISTRY: &[PatternDef] = &[
         params: || vec![speed_param(), density_param(), fade_param()],
         default_spectrum: || Spectrum::solid(Rgb::new(0xFF, 0xFF, 0xE0)),
         tile: TileMeta {
-            blurb: "random twinkles igniting and fading like stars",
             live_input: false,
         },
         has_spectrum: true,
@@ -470,7 +464,6 @@ static REGISTRY: &[PatternDef] = &[
         params: || vec![fade_param(), glow_param()],
         default_spectrum: || Spectrum::solid(ACCENT),
         tile: TileMeta {
-            blurb: "lights the key you press, then fades",
             live_input: true,
         },
         has_spectrum: true,
@@ -483,7 +476,6 @@ static REGISTRY: &[PatternDef] = &[
         params: || vec![speed_param(), fade_param()],
         default_spectrum: || Spectrum::solid(ACCENT),
         tile: TileMeta {
-            blurb: "a keypress sends a ring rippling outward",
             live_input: true,
         },
         has_spectrum: true,
@@ -496,7 +488,6 @@ static REGISTRY: &[PatternDef] = &[
         params: || vec![speed_param()],
         default_spectrum: aurora_spectrum,
         tile: TileMeta {
-            blurb: "a slow aurora flow drifting over the board",
             live_input: false,
         },
         has_spectrum: true,
@@ -509,7 +500,6 @@ static REGISTRY: &[PatternDef] = &[
         params: || vec![sensitivity_param(), fade_param()],
         default_spectrum: thermal_spectrum,
         tile: TileMeta {
-            blurb: "your typing rendered as a living heat map",
             live_input: true,
         },
         has_spectrum: true,
@@ -522,7 +512,6 @@ static REGISTRY: &[PatternDef] = &[
         params: || vec![source_param(), focus_param(), speed_param()],
         default_spectrum: meter_spectrum,
         tile: TileMeta {
-            blurb: "a live meter — audio loudness or system load",
             live_input: true,
         },
         has_spectrum: true,
@@ -535,7 +524,6 @@ static REGISTRY: &[PatternDef] = &[
         params: || vec![speed_param(), saturation_param()],
         default_spectrum: || Spectrum::solid(ACCENT),
         tile: TileMeta {
-            blurb: "the board mirrors the colours on your screen",
             live_input: true,
         },
         has_spectrum: false,
@@ -548,7 +536,6 @@ static REGISTRY: &[PatternDef] = &[
         params: Vec::new,
         default_spectrum: || Spectrum::solid(Rgb::new(0, 0, 0)),
         tile: TileMeta {
-            blurb: "a hand-painted or imported per-key frame",
             live_input: false,
         },
         has_spectrum: false,
@@ -563,7 +550,6 @@ static REGISTRY: &[PatternDef] = &[
         // registry still requires a non-empty default, so a solid accent stands in (never sampled).
         default_spectrum: || Spectrum::solid(ACCENT),
         tile: TileMeta {
-            blurb: "the device's live battery & charge as a gauge",
             live_input: true,
         },
         has_spectrum: false,
@@ -576,7 +562,6 @@ static REGISTRY: &[PatternDef] = &[
         params: || vec![signal_param(), standby_param()],
         default_spectrum: onair_spectrum,
         tile: TileMeta {
-            blurb: "lights where you paint it while your stream is live",
             live_input: true,
         },
         // A SCALAR readout — unlike vitals it colours THROUGH the spectrum, so the user paints the
@@ -591,7 +576,6 @@ static REGISTRY: &[PatternDef] = &[
         params: || vec![show_param()],
         default_spectrum: onair_spectrum, // the same warning red as On Air (repaintable, as ever)
         tile: TileMeta {
-            blurb: "lights where you paint it while your mic is muted (or hot)",
             live_input: true,
         },
         has_spectrum: true,
@@ -604,7 +588,6 @@ static REGISTRY: &[PatternDef] = &[
         params: || vec![held_param()],
         default_spectrum: || Spectrum::solid(ACCENT),
         tile: TileMeta {
-            blurb: "lights while a hold layer or sniper is engaged",
             live_input: true,
         },
         has_spectrum: true,
@@ -617,7 +600,6 @@ static REGISTRY: &[PatternDef] = &[
         params: || vec![channel_param(), style_param()],
         default_spectrum: sp_pulse, // the green→amber→red urgency ramp `level` reads along
         tile: TileMeta {
-            blurb: "a light your macros drive: neuron.signal(channel, value)",
             live_input: true,
         },
         has_spectrum: true,
@@ -3089,7 +3071,6 @@ mod tests {
             assert!(!d.key.is_empty(), "a pattern has an empty key");
             assert!(!d.label.is_empty(), "{}: empty label", d.key);
             assert!(seen_keys.insert(d.key), "duplicate pattern key {}", d.key);
-            assert!(!d.tile.blurb.is_empty(), "{}: empty tile blurb", d.key);
 
             // make: produces a working pattern that fills the matrix
             let mut p = (d.make)();
@@ -3531,6 +3512,69 @@ mod tests {
             // and it builds a working layer that fills the matrix
             let mut layer = p.to_layer().make_pattern().expect("preset builds a pattern");
             assert_eq!(layer.field(6, 22, 0.0).len(), 6 * 22, "{}: fills rows*cols", p.label);
+        }
+    }
+
+    /// The catalog SHELVES are a contract, not an accident: the lighting page groups tiles by
+    /// [`Preset::group`], so a preset landing on the wrong shelf is user-visible mislabelling
+    /// (a data readout filed under decorative effects, or vice versa). This pins the FULL
+    /// partition — a new preset fails here until its shelf is consciously chosen — and the copy
+    /// rules that make the shelves readable: every preset explains itself (non-empty blurb), a
+    /// fed look NAMES its feed (input/data ⇒ non-empty source chip), and a pure light show
+    /// carries no chip (effect ⇒ empty source).
+    #[test]
+    fn every_preset_lands_on_its_intended_shelf_with_honest_copy() {
+        let expected: &[(&str, &str)] = &[
+            ("static", "effect"),
+            ("breathing", "effect"),
+            ("cycle", "effect"),
+            ("wave", "effect"),
+            ("colorwheel", "effect"),
+            ("fire", "effect"),
+            ("typingheat", "input"),
+            ("cascade", "effect"),
+            ("comet", "input"),
+            ("starlight", "effect"),
+            ("reactive", "input"),
+            ("ripple", "input"),
+            ("aurora", "effect"),
+            ("audiometer", "data"),
+            ("pulse", "data"),
+            ("ambient", "data"),
+            ("vitals", "data"),
+            ("onair", "data"),
+            ("miclight", "data"),
+            ("modeheld", "data"),
+            ("signal", "data"),
+        ];
+        let ps = presets();
+        assert_eq!(
+            ps.len(),
+            expected.len(),
+            "a preset was added or removed — extend the golden shelf map consciously"
+        );
+        for (slug, shelf) in expected {
+            let p = ps
+                .iter()
+                .find(|p| p.slug == *slug)
+                .unwrap_or_else(|| panic!("golden map names unknown preset '{slug}'"));
+            assert_eq!(
+                p.group(),
+                *shelf,
+                "{slug}: expected the {shelf} shelf — if the move is intentional, update the map"
+            );
+            assert!(!p.blurb.is_empty(), "{slug}: every tile explains itself");
+            match p.group() {
+                "effect" => assert!(
+                    p.source.is_empty(),
+                    "{slug}: a pure light show must not claim a feed chip"
+                ),
+                "input" | "data" => assert!(
+                    !p.source.is_empty(),
+                    "{slug}: a fed look must name its feed for the tile chip"
+                ),
+                other => panic!("{slug}: unknown shelf '{other}'"),
+            }
         }
     }
 
