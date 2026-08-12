@@ -369,6 +369,15 @@ enum ProfileCmd {
     },
     /// Apply a profile to the connected devices
     Apply { name: String },
+    /// Delete a profile and the binds sidecar paired with it
+    Delete {
+        name: String,
+        /// skip the "this profile exists and here's what it holds" confirmation prompt
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Rename a profile, carrying its binds sidecar and any auto-switch rules with it
+    Rename { from: String, to: String },
     /// Capture the CURRENT live device settings into a profile — the clean Synapse import
     /// (reads what Synapse wrote to your hardware; no encrypted-file gimmicks).
     Capture { name: String },
@@ -1089,18 +1098,128 @@ fn profile_cmd(reg: &Registry, action: ProfileCmd) -> Result<()> {
                 persist,
                 ..Default::default()
             };
+            if let Some(why) = neuron::profile::name_conflict(&name) {
+                bail!("{why}");
+            }
             if p.is_empty() {
                 bail!("nothing to save — pass at least one setting flag (see 'neuron profile save --help')");
+            }
+            // The GUI says "overwrite" before it clobbers; the CLI used to overwrite in silence.
+            // Same guard, said the way a terminal says it — the write still happens, you just know.
+            if let Ok(existing) = Profile::load(&name) {
+                println!("overwriting '{name}' ({})", existing.summary());
             }
             p.save().map_err(anyhow::Error::msg)?;
             println!("saved profile '{name}': {}", p.summary());
         }
         ProfileCmd::Apply { name } => profile_apply(reg, &name)?,
+        ProfileCmd::Delete { name, yes } => {
+            let p = Profile::load(&name)
+                .map_err(|_| anyhow::anyhow!("no profile '{name}' (neuron profile list)"))?;
+            let sidecar = Profile::rules_path(&name);
+            let binds = std::fs::read_to_string(&sidecar)
+                .ok()
+                .and_then(|s| toml::from_str::<neuron::engine::RuleDoc>(&s).ok())
+                .map(|d| d.rules.len())
+                .unwrap_or(0);
+            if !yes {
+                println!("'{name}': {}", p.summary());
+                if binds > 0 {
+                    println!("  and {binds} bind(s) in {}", sidecar.display());
+                }
+                bail!("refusing to delete without --yes");
+            }
+            Profile::delete(&name).map_err(anyhow::Error::msg)?;
+            match binds {
+                0 => println!("deleted '{name}'"),
+                n => println!("deleted '{name}' and its {n} bind(s)"),
+            }
+            // Rules are NOT pruned: they are the user's config, and a route is the thing you most
+            // likely want to re-point rather than lose. But a dangling route can never fire, so
+            // name each one and the exact repair instead of a bare count. (The live daemon no
+            // longer churns on them either — it only reassembles the spine when a switch lands.)
+            let rules = neuron::profile::AppRules::load();
+            let dangling: Vec<&str> = rules
+                .rules
+                .iter()
+                .filter(|r| r.profile == name)
+                .map(|r| r.app.as_str())
+                .collect();
+            if !dangling.is_empty() {
+                println!(
+                    "  {} auto-switch route(s) still point at '{name}' and can no longer fire: {}",
+                    dangling.len(),
+                    dangling.join(", ")
+                );
+                println!(
+                    "  re-point or remove them in {}",
+                    neuron::profile::AppRules::path().display()
+                );
+            }
+            if rules.default.as_deref() == Some(name.as_str()) {
+                println!("  it was also the fallback profile · clear `default` in apps.toml");
+            }
+        }
+        ProfileCmd::Rename { from, to } => {
+            let landed = Profile::rename(&from, &to).map_err(anyhow::Error::msg)?;
+            println!("renamed '{from}' to '{landed}'");
+            // auto-switch rules name a profile by string, so a rename without this quietly breaks them.
+            let mut rules = neuron::profile::AppRules::load();
+            let mut moved = 0;
+            for r in rules.rules.iter_mut().filter(|r| r.profile == from) {
+                r.profile = landed.clone();
+                moved += 1;
+            }
+            if rules.default.as_deref() == Some(from.as_str()) {
+                rules.default = Some(landed.clone());
+                moved += 1;
+            }
+            if moved > 0 {
+                // The profile has already moved by this point, so a failed save leaves apps.toml
+                // pointing at a name that is gone. It can't be rolled back (rolling the rename back
+                // could itself fail), so say exactly what is broken and how to repair it rather
+                // than bailing with a bare IO error the user has to reverse-engineer.
+                match rules.save() {
+                    Ok(()) => println!("  {moved} auto-switch entr(y/ies) followed it"),
+                    Err(e) => {
+                        // Two files have to change together and only one can be written atomically,
+                        // so on a failed apps.toml write put the PROFILE back rather than leave a
+                        // rename that silently broke every route pointing at it. Renaming back is
+                        // itself fallible; if it works the whole command is a clean no-op, and if
+                        // it doesn't the user gets the exact repair instead of a bare IO error.
+                        eprintln!("  apps.toml could not be written: {e}");
+                        match neuron::profile::Profile::rename(&landed, &from) {
+                            Ok(_) => bail!(
+                                "rename rolled back · '{from}' is unchanged and its {moved} \
+                                 auto-switch entr(y/ies) still work"
+                            ),
+                            Err(re) => {
+                                eprintln!("  and rolling the rename back failed too: {re}");
+                                eprintln!(
+                                    "  '{from}' is now '{landed}', but {moved} auto-switch \
+                                     entr(y/ies) still name '{from}' and will not fire."
+                                );
+                                eprintln!(
+                                    "  repair: edit {} and change '{from}' to '{landed}'.",
+                                    neuron::profile::AppRules::path().display()
+                                );
+                                bail!("apps.toml not updated");
+                            }
+                        }
+                    }
+                }
+            }
+        }
         ProfileCmd::Capture { name } => profile_capture(reg, &name)?,
         ProfileCmd::Autoswitch { app, profile } => {
             use neuron::profile::{AppRule, AppRules};
             match (app, profile) {
                 (Some(a), Some(p)) => {
+                    // the rule is only as real as its target — the GUI refuses a typo'd profile,
+                    // and the CLI used to accept one and fail forever at focus-switch time.
+                    if Profile::load(&p).is_err() {
+                        bail!("no profile '{p}' · save it first (neuron profile list)");
+                    }
                     let mut rules = AppRules::load();
                     rules.rules.push(AppRule {
                         app: a.clone(),
@@ -3064,9 +3183,20 @@ fn run_daemon(reg: &Registry, seconds: Option<u64>, safe: bool) {
         neuron::writes::set_writes_paused(false);
     }
 
-    // Live-wire the unified spine: every config source — bindings.toml, cast.toml (radial + glyph),
-    // every profiles/*.rules.toml import sidecar, and apps.toml — folds into ONE Engine. The event
-    // loop translates each device event into a Trigger and dispatches through it (Engine::fire).
+    // Restore the remembered profile cursor FIRST — before the spine is built. A profile's
+    // `<name>.rules.toml` binds are in scope only while that profile is active, so a daemon that
+    // started with an empty cursor would fold in none of them and silently run without the binds
+    // the GUI shows as live. Same file the GUI reads, so the two agree. Read-only: no device write
+    // happens because a daemon started.
+    let restored = neuron::profile::restore_active_once();
+    if !restored.is_empty() {
+        println!("Neuron daemon · profile '{restored}' (remembered; settings not re-applied)");
+    }
+
+    // Live-wire the unified spine: bindings.toml, cast.toml (radial + glyph), and the ACTIVE
+    // profile's rules sidecar fold into ONE Engine. Auto-switch routing (apps.toml) rides beside it
+    // as a table, not as rules — see controls::build_runtime_from. The event loop translates each
+    // device event into a Trigger and dispatches through the Engine (Engine::fire).
     let rt = neuron::controls::build_runtime();
     println!(
         "Neuron daemon — {} spine rule(s) across base + {} HyperShift layer(s):",
@@ -3172,6 +3302,12 @@ fn run_listen(reg: &Registry, seconds: Option<u64>, rt: neuron::controls::Runtim
     let mut last_mute = ctl.as_ref().map(|c| c.get_mute());
     let mut switcher = neuron::app_focus::AppFocusSwitch::new();
     let mut tick = 0u32;
+    // The profile the spine was last assembled for. A profile carries its `<name>.rules.toml`
+    // binds, in scope only while it is active, so ANY path that moves the cursor — auto-switch, a
+    // bound ProfileSwitch key, a ProfileCycle — has to be followed by a rebuild. Watching the
+    // cursor itself covers all of them, instead of a rebuild bolted onto each switch site (the GUI
+    // does the equivalent through its reload command).
+    let mut spine_profile = neuron::profile::active();
 
     // GamingMode suppression hook (Alt+Tab / Win / Alt+F4 / Alt+Esc). Installed HERE — on the thread that
     // pumps the Raw-Input message loop inside `controls::listen` — because a WH_KEYBOARD_LL hook only
@@ -3228,6 +3364,17 @@ fn run_listen(reg: &Registry, seconds: Option<u64>, rt: neuron::controls::Runtim
             if tick.is_multiple_of(20) {
                 neuron::hook::reconcile(&mut gaming_hook);
             }
+            // The active profile moved (any path) — reassemble the spine so the newly active
+            // profile's binds are live and the previous one's are not. Held-layer state resets with
+            // it, the same guarantee the GUI's reload makes: a config swap must not strand a held
+            // layer. A string compare per tick; the rebuild only runs on an actual switch.
+            {
+                let now = neuron::profile::active();
+                if now != spine_profile {
+                    spine_profile = now;
+                    *rt.borrow_mut() = neuron::controls::build_runtime();
+                }
+            }
             {
                 let mut intents = CliIntentRunner {
                     devices: &mut devices.borrow_mut(),
@@ -3272,9 +3419,32 @@ fn run_listen(reg: &Registry, seconds: Option<u64>, rt: neuron::controls::Runtim
                     );
                 }
             }
-            // app-aware switch: a focus change fires an AppFocus trigger; the Engine's matching
-            // AppFocus rule (-> ProfileSwitch intent) does the switch (or nothing if unbound).
+            // app-aware switch — the same two-part shape the GUI dispatcher uses:
+            //   1. ROUTING (apps.toml) resolves through `AppRules::resolve`: first match wins, else
+            //      the configured fallback. It is not a set of engine rules, because the executor
+            //      fires EVERY matching rule and two overlapping needles would apply two profiles
+            //      back-to-back with the last one winning.
+            //   2. The AppFocus TRIGGER still fires, so a hand-authored `app focus 'x' -> …` bind
+            //      keeps working. Those are real binds; routing isn't.
             if let Some(app) = switcher.poll() {
+                // `switch_target` is the SHARED decision (first match, else fallback, and nothing
+                // to do when it names the profile already active) — the same call the GUI
+                // dispatcher makes, so the two front ends cannot drift on what to switch to.
+                let target = rt
+                    .borrow()
+                    .app_rules
+                    .switch_target(&app, &neuron::profile::active());
+                if let Some(name) = target {
+                    let line = run_intent(
+                        &mut devices.borrow_mut(),
+                        &neuron::action::Intent::ProfileSwitch(name.clone()),
+                    );
+                    println!("  {line}");
+                    // Only rebuild when the switch actually landed — the cursor is the authority.
+                    // A rule pointing at a deleted profile fails on every focus into that app, and
+                    // reassembling the whole spine on each failure is churn for state that never
+                    // changed.
+                }
                 fire_trigger(
                     &mut devices.borrow_mut(),
                     &mut exec.borrow_mut(),

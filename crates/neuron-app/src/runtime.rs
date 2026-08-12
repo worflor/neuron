@@ -116,6 +116,9 @@ pub struct AppRuntime {
     pub vault: Vault,
     pub app_rules: AppRules,
     pub profiles: Vec<Profile>,
+    /// Profiles whose file wouldn't parse, as `(name, why)` — surfaced in the sheet so a broken
+    /// profile reads as broken instead of silently missing.
+    pub broken_profiles: Vec<(String, String)>,
     pub active_profile: String,
     pub persist: bool,
     /// Currently selected device pid (for per-device panels). 0 = none. The pid names the MODEL/
@@ -226,10 +229,51 @@ impl AppRuntime {
         let registry = Registry::load().unwrap_or(Registry {
             devices: Vec::new(),
         });
-        let profiles = neuron::profile::list()
-            .into_iter()
-            .filter_map(|n| Profile::load(&n).ok())
-            .collect();
+        let mut profiles = Vec::new();
+        let mut broken_profiles = Vec::new();
+        for e in neuron::profile::load_all() {
+            match e {
+                neuron::profile::ProfileEntry::Ok(p) => profiles.push(*p),
+                neuron::profile::ProfileEntry::Broken { name, why } => {
+                    broken_profiles.push((name, why))
+                }
+            }
+        }
+        // Restore the profile CURSOR before anything reads it. Nothing is written to the device
+        // here — it already holds what this profile applied last session. Restoring the name is
+        // what makes three things true at boot: the header names the profile you're on, the
+        // gaming-hook reconcile unit can resolve a real policy (its own doc says it is otherwise
+        // dead after every reboot, and it was, because `active()` started empty), and the profile's
+        // binds sidecar is in scope. It lives in core, not prefs, so `neuron run` restores the same
+        // cursor instead of starting blind.
+        // `restore_active` already refuses a cursor whose profile won't load. What it returns is
+        // the string that was STORED, though, and the sheet's row highlight compares against each
+        // profile's own `name` field — so adopt the canonical spelling here. A cursor saved as
+        // "Valorant" against a file whose name field reads "valorant" would otherwise light the
+        // header while no row in the list matched it.
+        // `_once`, not the unconditional restore: this is a CONSTRUCTOR, and the unconditional one
+        // is authoritative in both directions — it assigns EMPTY when the run root holds no cursor
+        // file. Calling it from here wiped the process-wide cursor every time a runtime was built
+        // against a directory without one, which in the test binary (many run roots, one process)
+        // silently cleared a cursor another test had just set. The `_once` form keeps a cursor the
+        // process has already chosen and only reads disk when there is nothing to keep.
+        let remembered = neuron::profile::restore_active_once();
+        let active_profile = profiles
+            .iter()
+            .find(|p| {
+                !remembered.is_empty()
+                    && Profile::file_key(&p.name) == Profile::file_key(&remembered)
+            })
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| "—".to_string());
+        // …and seed the runtime's gaming-mode copy from that same profile. The startup reconcile
+        // unit installs the HOOK from the cursor, but THIS copy is what a capture reads: left at
+        // default, re-capturing the profile you are already on would silently drop its key guards.
+        let gaming_mode = profiles
+            .iter()
+            .find(|p| p.name == active_profile)
+            .map(|p| p.gaming_mode())
+            .unwrap_or_default();
         AppRuntime {
             registry,
             bindings: Bindings::load(),
@@ -237,14 +281,15 @@ impl AppRuntime {
             vault: Vault::load(),
             app_rules: AppRules::load(),
             profiles,
-            active_profile: "—".into(),
+            broken_profiles,
+            active_profile,
             persist: false,
             selected_pid: 0,
             selected_unit: String::new(),
             selected_dialect: String::new(),
             anim: HashMap::new(),
             light_fps: Arc::new(AtomicU32::new(30)),
-            gaming_mode: neuron::writes::GamingMode::default(),
+            gaming_mode,
             synth_attempted: HashMap::new(),
             synth_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             synth_running: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
@@ -1284,7 +1329,10 @@ impl AppRuntime {
     /// Spine `Rule`s assembled from the same sources as live dispatch, excluding GUI-authored rows
     /// that the editor appends separately as removable UI entries.
     pub fn spine_rules(&self) -> Vec<Rule> {
-        let sidecars = neuron::controls::load_rule_sidecars_except("gui.rules.toml");
+        // Scoped to the active profile by the loader, so this list shows the binds that are
+        // actually live right now — not every profile's binds at once.
+        let sidecars =
+            neuron::controls::load_rule_sidecars_except(neuron::controls::GUI_RULES_FILE);
         neuron::controls::build_runtime_from(&self.bindings, &self.cast, &self.app_rules, &sidecars)
             .engine
             .to_rules()
@@ -1292,11 +1340,20 @@ impl AppRuntime {
 
     // ── profiles ─────────────────────────────────────────────────────────
 
+    /// Reload the saved profiles, keeping the unreadable ones as named faults rather than dropping
+    /// them. The old `filter_map(...ok())` made a profile with one bad line disappear from the sheet
+    /// while its file sat on disk — no row, no message, and the name still occupied.
     pub fn reload_profiles(&mut self) {
-        self.profiles = neuron::profile::list()
-            .into_iter()
-            .filter_map(|n| Profile::load(&n).ok())
-            .collect();
+        self.profiles.clear();
+        self.broken_profiles.clear();
+        for e in neuron::profile::load_all() {
+            match e {
+                neuron::profile::ProfileEntry::Ok(p) => self.profiles.push(*p),
+                neuron::profile::ProfileEntry::Broken { name, why } => {
+                    self.broken_profiles.push((name, why))
+                }
+            }
+        }
     }
 
     /// Save the FULL current device state into a named profile — a real read-back of every
@@ -1313,8 +1370,11 @@ impl AppRuntime {
         brightness: u8,
         lighting: Vec<neuron::pattern::LayerDef>,
     ) -> String {
-        if name.trim().is_empty() {
-            return "name required".into();
+        // one reserved-name check for every naming door — "gui" would aim this profile's binds
+        // sidecar at gui.rules.toml (the binds you authored in the app), and a Windows device name
+        // fails the write with an opaque OS error instead of a sentence.
+        if let Some(why) = neuron::profile::name_conflict(name) {
+            return why;
         }
         // Full device read-back now lives in core (shared with the CLI): active DPI + the full stage
         // list, polling, brightness, idle-off, and the current matrix effect — plus the host-side
@@ -1354,10 +1414,11 @@ impl AppRuntime {
     }
 
     pub fn delete_profile(&mut self, name: &str) -> String {
-        let path = Profile::path(name);
-        let r = std::fs::remove_file(path);
-        // Lighting lives IN the profile TOML now (the layer stack) — there's no frame sidecar to
-        // reap, so removing the one file is a full delete.
+        // A profile is BOTH files: `<name>.toml` and the `<name>.rules.toml` binds paired with it.
+        // Deleting only the first left the binds live forever (every sidecar folds into the spine)
+        // with no UI able to remove them, and the orphan reserved the filename so re-importing the
+        // same profile landed at " (2)". `Profile::delete` owns both.
+        let r = Profile::delete(name);
         self.reload_profiles();
         match r {
             Ok(_) => {
@@ -1368,7 +1429,34 @@ impl AppRuntime {
                 if self.active_profile == name || neuron::profile::active() == name {
                     self.active_profile = "—".into();
                     neuron::profile::set_active("");
+                    // The profile is gone, so its host-side key suppression must go with it.
+                    // Without this the Key Guard stayed lit and Alt+Tab stayed swallowed with no
+                    // profile left to explain it — while the panel's own caption said it lifts when
+                    // the profile changes. Live-reproduced: delete a gaming profile, Alt+Tab dies.
+                    self.gaming_mode = neuron::writes::GamingMode::default();
+                    crate::dispatch::set_gaming_policy(self.gaming_mode);
                 }
+                // The FALLBACK is different from a rule: a rule that goes dangling still shows in
+                // the list where you can see and remove it, but a dangling fallback would fire on
+                // every unmatched focus change and fail, while the picker (which resolves by name)
+                // quietly displayed "stay put". Clear it rather than keep a hidden broken setting.
+                // Same rule as everywhere else here: a write that didn't happen is not a success.
+                // A dangling fallback left on disk resumes switching to a deleted profile.
+                let cleared_fallback = if self.app_rules.default.as_deref() == Some(name) {
+                    self.app_rules.default = None;
+                    match self.save_app_rules() {
+                        Ok(()) => Some(String::new()),
+                        // memory back in step with disk: the fallback is still there, still
+                        // pointing at the profile just deleted, and the panel must say so rather
+                        // than show a clean state the next launch will contradict.
+                        Err(e) => {
+                            self.app_rules = AppRules::load();
+                            Some(format!(" (but apps.toml did not save: {e})"))
+                        }
+                    }
+                } else {
+                    None
+                };
                 // dangling app rules would fail forever at focus-switch time; say so now.
                 let refs = self
                     .app_rules
@@ -1376,14 +1464,120 @@ impl AppRuntime {
                     .iter()
                     .filter(|r| r.profile == name)
                     .count();
+                let mut msg = format!("deleted '{name}'");
                 if refs > 0 {
-                    format!("deleted '{name}' — {refs} app rule(s) still reference it")
-                } else {
-                    format!("deleted '{name}'")
+                    msg.push_str(&format!(" · {refs} app rule(s) still point at it"));
                 }
+                if let Some(note) = cleared_fallback {
+                    msg.push_str(&format!(" · it was the fallback, now stay put{note}"));
+                }
+                msg
             }
             Err(e) => format!("delete failed: {e}"),
         }
+    }
+
+    /// Rename a profile, carrying its binds sidecar and every app rule that pointed at the old
+    /// name. Without the rule retarget a rename would silently break auto-switch — the exact
+    /// failure that made "capture under a new name, delete the old one" the wrong workaround.
+    pub fn rename_profile(&mut self, from: &str, to: &str) -> String {
+        let to = to.trim();
+        if to.is_empty() {
+            return "name required".into();
+        }
+        if from == to {
+            return format!("'{from}' already has that name");
+        }
+        // Decided BEFORE the rename, because `Profile::rename` moves the process-wide cursor itself
+        // — asking afterwards whether the cursor still says `from` always answers no, so the app's
+        // display copy would never be updated (and a stale copy would never be healed).
+        let was_active = Profile::file_key(&self.active_profile) == Profile::file_key(from)
+            || Profile::file_key(&neuron::profile::active()) == Profile::file_key(from);
+        match Profile::rename(from, to) {
+            Ok(landed) => {
+                // Synced FIRST, before anything that can fail, so the early-return path below can't
+                // leave the header naming a profile that no longer exists under that name. (Core
+                // already moved the process cursor; this is the app's copy of it.)
+                if was_active {
+                    self.active_profile = landed.clone();
+                    neuron::profile::set_active(&landed);
+                }
+                let mut retargeted = 0;
+                for r in self.app_rules.rules.iter_mut().filter(|r| r.profile == from) {
+                    r.profile = landed.clone();
+                    retargeted += 1;
+                }
+                if self.app_rules.default.as_deref() == Some(from) {
+                    self.app_rules.default = Some(landed.clone());
+                    retargeted += 1;
+                }
+                // ONE write for both edits, and its failure is REPORTED. Discarding it reported a
+                // clean rename while apps.toml on disk still named the old profile — correct-looking
+                // until the next launch, when auto-switch silently stopped working. Nothing here can
+                // roll the rename back safely, so the honest outcome is to say what didn't persist.
+                if retargeted > 0 {
+                    if let Err(e) = self.save_app_rules() {
+                        // Put the in-memory rules BACK. The panel refreshes from this copy, so
+                        // leaving the retarget applied would show routes pointing at the new name
+                        // while the disk — and therefore the live dispatcher — still held the old:
+                        // the UI quietly disagreeing with what actually routes.
+                        self.app_rules = AppRules::load();
+                        self.reload_profiles();
+                        crate::dispatch::request_reload();
+                        return format!(
+                            "renamed '{from}' to '{landed}', but apps.toml did not save ({e}) \
+                             · its auto-switch routes still name '{from}' and now dangle"
+                        );
+                    }
+                }
+                self.reload_profiles();
+                // the binds sidecar moved with it, so the live spine must re-read from the new stem.
+                crate::dispatch::request_reload();
+                match retargeted {
+                    0 => format!("renamed '{from}' to '{landed}'"),
+                    n => format!("renamed '{from}' to '{landed}' · {n} app rule(s) followed"),
+                }
+            }
+            Err(e) => format!("rename failed: {e}"),
+        }
+    }
+
+    /// Set (or clear, with an empty name) the profile auto-switch falls back to when the focused
+    /// app matches no rule.
+    pub fn set_default_profile(&mut self, name: &str) -> String {
+        let name = name.trim();
+        if name.is_empty() {
+            self.app_rules.default = None;
+            // Report the write, and on failure put memory BACK so the panel shows what actually
+            // routes. Discarding the result cleared the fallback in memory, said so, and left the
+            // old one on disk to come back at the next launch — a setting that un-sets itself,
+            // with the UI insisting otherwise in the meantime.
+            let msg = match self.save_app_rules() {
+                Ok(()) => "no fallback · the active profile stays put".to_string(),
+                Err(e) => {
+                    self.app_rules = AppRules::load();
+                    format!("could not clear the fallback ({e}) · it is unchanged")
+                }
+            };
+            crate::dispatch::request_reload();
+            return msg;
+        }
+        if !self.profiles.iter().any(|p| p.name == name) {
+            return format!("no profile '{name}'");
+        }
+        let previous = self.app_rules.default.clone();
+        self.app_rules.default = Some(name.to_string());
+        let msg = match self.save_app_rules() {
+            Ok(()) => format!("fallback profile · {name}"),
+            // Same rule as the clear branch: memory goes back to what disk holds, so the picker
+            // can't show a selection that a reload or the next launch would silently revert.
+            Err(e) => {
+                self.app_rules.default = previous;
+                format!("could not set the fallback ({e}) · it is unchanged")
+            }
+        };
+        crate::dispatch::request_reload();
+        msg
     }
 
     pub fn add_app_rule(&mut self, app: &str, profile: &str) -> String {
@@ -2408,7 +2602,16 @@ mod tests {
     fn empty_profile_name_rejected() {
         let mut rt = AppRuntime::load();
         let msg = rt.save_profile_from_devices("  ", 800, 1000, 50, vec![]);
-        assert!(msg.contains("name required"));
+        assert!(msg.contains("needs a name"), "got: {msg}");
+        // the same door refuses the names that would collide with the app's own binds file or
+        // that the filesystem would reject — one check, not a per-call-site guard.
+        assert!(
+            rt.save_profile_from_devices("gui", 800, 1000, 50, vec![])
+                .contains("the binds you author"),
+        );
+        assert!(rt
+            .save_profile_from_devices("NUL", 800, 1000, 50, vec![])
+            .contains("windows won't let"));
     }
 
     /// Grid dims are honest: with no lit device selected the sentinel is (0,0) — the editor shows
@@ -2424,6 +2627,12 @@ mod tests {
     /// Writes-paused blocks every device setter without touching hardware.
     #[test]
     fn paused_writes_block_setters() {
+        // The pause gate is PROCESS-GLOBAL, so flipping it here is visible to every other test
+        // running at the same time — and anything behind the gate (a profile switch, say) silently
+        // does nothing while this test holds it. Take the binary's serialization lock so the window
+        // can't overlap someone else's. Found the hard way: this raced the auto-switch dispatch
+        // test into an intermittent failure that looked like a routing bug.
+        let _cwd = crate::testsupport::cwd_guard("runtime_paused_writes");
         let rt = AppRuntime::load();
         let saved = neuron::writes::writes_paused();
         neuron::writes::set_writes_paused(true);
@@ -2485,6 +2694,90 @@ mod tests {
             "must warn about dangling rules: {msg}"
         );
         assert_eq!(rt.active_profile, "—", "active marker must clear");
+    }
+
+    /// A rename is one operation across FOUR persisted things: the profile TOML, its binds
+    /// sidecar, every auto-switch route naming it, and the active cursor. Each used to be a
+    /// separate place someone could forget — the old workaround for "rename" was capture-new +
+    /// delete-old, which silently orphaned the routes.
+    #[test]
+    fn rename_carries_binds_routes_the_fallback_and_the_cursor() {
+        let _cwd = crate::testsupport::cwd_guard("runtime_rename_carries");
+        let mut rt = AppRuntime::load();
+        let from = format!("__neuron_ren_{}", std::process::id());
+        let to = format!("{from}_new");
+        rt.save_profile_from_devices(&from, 800, 1000, 50, vec![]);
+        std::fs::write(Profile::rules_path(&from), b"rules = []\n").unwrap();
+        rt.app_rules.rules.push(AppRule {
+            app: "game".into(),
+            profile: from.clone(),
+        });
+        rt.app_rules.default = Some(from.clone());
+        rt.app_rules.save().unwrap();
+        rt.active_profile = from.clone();
+        neuron::profile::set_active(&from);
+
+        let msg = rt.rename_profile(&from, &to);
+        assert!(msg.contains("renamed"), "unexpected: {msg}");
+        assert!(Profile::path(&to).exists(), "the profile moved");
+        assert!(Profile::rules_path(&to).exists(), "its binds moved with it");
+        assert!(!Profile::rules_path(&from).exists(), "and left nothing behind");
+        assert_eq!(rt.app_rules.rules[0].profile, to, "the route followed");
+        assert_eq!(rt.app_rules.default.as_deref(), Some(to.as_str()), "so did the fallback");
+        assert_eq!(rt.active_profile, to, "and the header");
+        assert_eq!(neuron::profile::active(), to, "and the process cursor");
+        // …and it all survives a restart, because the write actually happened.
+        assert_eq!(
+            AppRules::load().rules[0].profile,
+            to,
+            "apps.toml on disk carries the new name"
+        );
+
+        neuron::profile::set_active("");
+        let _ = Profile::delete(&to);
+    }
+
+    /// Deleting the active profile must take its HOST-side key suppression with it. Live-verified
+    /// as a bug first: delete a gaming profile and the Key Guard stayed lit, Alt+Tab stayed
+    /// swallowed, and the panel's own caption ("it lifts when the profile changes") was contradicted
+    /// by the header two inches above it reading NO PROFILE.
+    #[test]
+    fn deleting_the_active_gaming_profile_lifts_its_key_guard() {
+        let _cwd = crate::testsupport::cwd_guard("runtime_delete_gaming");
+        let mut rt = AppRuntime::load();
+        let name = format!("__neuron_gam_{}", std::process::id());
+        rt.gaming_mode = neuron::writes::GamingMode::from_profile(true, true, false, false);
+        rt.save_profile_from_devices(&name, 800, 1000, 50, vec![]);
+        rt.active_profile = name.clone();
+        neuron::profile::set_active(&name);
+        assert!(Profile::load(&name).unwrap().has_gaming(), "the profile captured its guards");
+
+        rt.delete_profile(&name);
+        assert_eq!(rt.active_profile, "—");
+        assert!(
+            !rt.gaming_mode.any(),
+            "no profile is active, so nothing should still be suppressing chords"
+        );
+        assert!(!neuron::hook::policy().any(), "and the shared policy carrier agrees");
+        neuron::profile::set_active("");
+    }
+
+    /// The fallback is a setting that must not un-set itself: clearing it when the profile it names
+    /// is deleted has to reach DISK, or unmatched focus resumes switching to a gone profile after
+    /// a restart.
+    #[test]
+    fn deleting_the_fallback_profile_clears_it_on_disk() {
+        let _cwd = crate::testsupport::cwd_guard("runtime_delete_fallback");
+        let mut rt = AppRuntime::load();
+        let name = format!("__neuron_fb_{}", std::process::id());
+        rt.save_profile_from_devices(&name, 800, 1000, 50, vec![]);
+        assert!(rt.set_default_profile(&name).contains("fallback"));
+        assert_eq!(AppRules::load().default.as_deref(), Some(name.as_str()));
+
+        let msg = rt.delete_profile(&name);
+        assert!(msg.contains("fallback"), "the message says what changed: {msg}");
+        assert_eq!(rt.app_rules.default, None, "cleared live");
+        assert_eq!(AppRules::load().default, None, "and on disk");
     }
 
     /// App rules validate their target profile exists and refuse duplicates.

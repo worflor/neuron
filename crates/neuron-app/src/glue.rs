@@ -3570,6 +3570,12 @@ pub fn install(app: &AppWindow) -> SharedRt {
                                     st.set_disable_win(policy.disable_win);
                                     st.set_disable_alt_f4(policy.disable_alt_f4);
                                     st.set_disable_alt_esc(policy.disable_alt_esc);
+                                    // …and (de)install the low-level hook to match, on the thread
+                                    // that pumps messages. The four properties above are only the
+                                    // Key Guard's DISPLAY: without this the panel lit up while
+                                    // nothing was actually being suppressed. Same call the live
+                                    // switch path makes, so all four entry points behave alike.
+                                    crate::dispatch::set_gaming_policy(policy);
                                     // switching profiles can swap which rules exist (the per-profile
                                     // sidecar set) — a row index held open in the inline editor may not
                                     // survive, so close it rather than let it seed from a stale row.
@@ -3584,11 +3590,15 @@ pub fn install(app: &AppWindow) -> SharedRt {
                                         match neuron::profile::Profile::load(&applied.name) {
                                             Ok(p) => {
                                                 st.set_active_profile(applied.name.clone().into());
+                                                // the profile's binds sidecar is only in scope
+                                                // while it is active — re-read the spine.
+                                                crate::dispatch::request_reload();
                                                 Some(p.lighting)
                                             }
                                             Err(_) => {
                                                 neuron::profile::set_active("");
                                                 st.set_active_profile("\u{2014}".into());
+                                                crate::dispatch::request_reload();
                                                 None
                                             }
                                         };
@@ -3717,9 +3727,13 @@ pub fn install(app: &AppWindow) -> SharedRt {
             if let Some(app) = w.upgrade() {
                 let msg = sh.borrow_mut().rt.delete_profile(name.as_str());
                 refresh_profiles(&app, &sh);
+                refresh_app_rules(&app, &sh); // a rule pointing at it just went dangling
                 let st = app.global::<State>();
                 // a deleted ACTIVE profile must drop the header pill to none.
-                st.set_active_profile(sh.borrow().rt.active_profile.clone().into());
+                let active = sh.borrow().rt.active_profile.clone();
+                st.set_active_profile(active.clone().into());
+                // its binds sidecar went with it (Profile::delete owns both files) — re-read.
+                crate::dispatch::request_reload();
                 st.set_status_line(msg.into());
             }
         });
@@ -3746,13 +3760,46 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 // so "my game/2" ≡ "my_game_2" and "Valorant" ≡ "valorant" all hit the same .toml.
                 // Comparing raw names lets the button read "capture" while the save clobbers a file.
                 let key = neuron::profile::Profile::file_key(name.as_str());
-                let exists = sh
-                    .borrow()
+                let s = sh.borrow();
+                // BROKEN profiles count as occupied too. They're excluded from the readable list,
+                // so checking only that list said "capture" for a name whose file is right there —
+                // and the save then clobbered it without ever saying "overwrite".
+                let exists = s
                     .rt
                     .profiles
                     .iter()
-                    .any(|p| neuron::profile::Profile::file_key(&p.name) == key);
+                    .map(|p| p.name.as_str())
+                    .chain(s.rt.broken_profiles.iter().map(|(n, _)| n.as_str()))
+                    .any(|n| neuron::profile::Profile::file_key(n) == key);
+                drop(s);
                 app.global::<State>().set_profile_name_exists(exists);
+            }
+        });
+    });
+    bind(app, &shared, |app, sh| {
+        let w = app.as_weak();
+        let sh = sh.clone();
+        app.global::<State>().on_rename_profile(move |from, to| {
+            if let Some(app) = w.upgrade() {
+                let msg = sh.borrow_mut().rt.rename_profile(from.as_str(), to.as_str());
+                refresh_profiles(&app, &sh);
+                refresh_app_rules(&app, &sh);
+                let st = app.global::<State>();
+                let active = sh.borrow().rt.active_profile.clone();
+                st.set_active_profile(active.clone().into());
+                st.set_status_line(msg.into());
+            }
+        });
+    });
+    bind(app, &shared, |app, sh| {
+        let w = app.as_weak();
+        let sh = sh.clone();
+        app.global::<State>().on_set_default_profile(move |name| {
+            if let Some(app) = w.upgrade() {
+                let msg = sh.borrow_mut().rt.set_default_profile(name.as_str());
+                refresh_profiles(&app, &sh);
+                refresh_app_rules(&app, &sh);
+                app.global::<State>().set_status_line(msg.into());
             }
         });
     });
@@ -6838,9 +6885,17 @@ fn refresh_lod_readout(app: &AppWindow, sh: &SharedRt) {
 
 /// A live ProfileSwitch/Cycle moved the process-wide cursor — mirror it into the header pill, the
 /// GUI runtime (so save-profile captures current gaming-mode etc.), and the Profiles panel.
+///
+/// This is the path an AUTO-SWITCH or a bound profile key takes, and it has to land the same state
+/// the sheet's own apply does. It used to update the pill and stop there, so the same profile gave
+/// two different results: picking it in the sheet restreamed its lighting, while alt-tabbing into
+/// the linked game applied the device settings and left the previous look running. Lighting is a
+/// profile's most visible content — that split was the biggest gap against what a Synapse user
+/// expects a profile to be.
 pub fn note_live_profile(app: &AppWindow, name: &str) {
     let st = app.global::<State>();
-    if st.get_active_profile() != name {
+    let changed = st.get_active_profile() != name;
+    if changed {
         st.set_active_profile(name.into());
         // a live bound ProfileSwitch/Cycle changed the active profile — same reason as the manual
         // apply path: the rules behind an open inline editor may no longer line up, so close it.
@@ -6853,24 +6908,83 @@ pub fn note_live_profile(app: &AppWindow, name: &str) {
             refresh_profiles(app, sh);
         }
     });
+    if !changed {
+        return;
+    }
+    // the binds sidecar in scope changed with the profile — re-read the spine.
+    crate::dispatch::request_reload();
+    // and stream the profile's own lighting, exactly as the manual apply does. An empty stack means
+    // "this profile doesn't set lighting", so the current look stays (a profile only touches what
+    // it sets); the gaming policy rides along because a live switch carries one too.
+    // A live switch can race a delete: the cursor named this profile a moment ago and its file is
+    // gone now. Fall back to "no profile" rather than advertising one that can't be loaded — the
+    // same recovery the manual apply path makes, because a header naming a missing profile also
+    // pins the binds-sidecar scope to it and gets re-asserted by every later status post.
+    let Ok(loaded) = neuron::profile::Profile::load(name) else {
+        neuron::profile::set_active("");
+        st.set_active_profile("\u{2014}".into());
+        st.set_disable_alt_tab(false);
+        st.set_disable_win(false);
+        st.set_disable_alt_f4(false);
+        st.set_disable_alt_esc(false);
+        let policy = neuron::writes::GamingMode::default();
+        with_shared(|sh| {
+            sh.borrow_mut().rt.gaming_mode = policy;
+            sh.borrow_mut().rt.active_profile = "\u{2014}".to_string();
+            refresh_profiles(app, sh);
+        });
+        crate::dispatch::set_gaming_policy(policy);
+        crate::dispatch::request_reload();
+        return;
+    };
+    let stack = {
+        let p = loaded;
+        {
+            st.set_disable_alt_tab(p.disable_alt_tab);
+            st.set_disable_win(p.disable_win);
+            st.set_disable_alt_f4(p.disable_alt_f4);
+            st.set_disable_alt_esc(p.disable_alt_esc);
+            // The four toggles above are only the DISPLAY. The policy itself is set in core (the
+            // ProfileSwitch intent) so every client gets it; what's left here is the GUI's own
+            // two: reconcile the low-level hook on the thread that pumps messages, and update the
+            // runtime's copy — a later capture reads THAT, so a stale copy would save the previous
+            // profile's guards into the new profile.
+            let policy = p.gaming_mode();
+            with_shared(|sh| sh.borrow_mut().rt.gaming_mode = policy);
+            crate::dispatch::set_gaming_policy(policy);
+            p.lighting
+        }
+    };
+    if stack.is_empty() {
+        return;
+    }
+    with_shared(|sh| {
+        {
+            let mut s = sh.borrow_mut();
+            s.light_layers = stack;
+            s.selected_layer = s.light_layers.len().saturating_sub(1);
+            s.active_frame = 0;
+            s.layers_rev += 1;
+        }
+        st.set_light_paint_mode(false);
+        {
+            let _suppress = SuppressApply::new();
+            refresh_layers(app, sh);
+        }
+        flush_lighting_save();
+        let _ = reapply_all_boards(app, sh);
+    });
 }
 
-/// The focused app changed — light the app-rule contact that's currently winning (first match, the
-/// same top-to-bottom contract `AppRules::profile_for` applies).
+/// The focused app changed — light the app-rule contact that's currently winning.
+///
+/// Reads the SAME `AppRules::resolve` verdict the dispatcher acts on, so the lamp can't light one
+/// rule while a different one applies (which is exactly what happened when routing lived in the
+/// engine: all matching rules fired, last-wins, while this lit the first).
 pub fn note_focused_app(app: &AppWindow, focused: &str) {
     let st = app.global::<State>();
-    let lf = focused.to_lowercase();
-    let idx = with_shared_ret(|sh| {
-        sh.borrow()
-            .rt
-            .app_rules
-            .rules
-            .iter()
-            .position(|r| !r.app.is_empty() && lf.contains(&r.app.to_lowercase()))
-            .map(|i| i as i32)
-            .unwrap_or(-1)
-    })
-    .unwrap_or(-1);
+    let idx = with_shared_ret(|sh| sh.borrow().rt.app_rules.resolve(focused).rule_index())
+        .unwrap_or(-1);
     if st.get_active_app_rule() != idx {
         st.set_active_app_rule(idx);
     }
@@ -7866,10 +7980,21 @@ fn trigger_kind_str(t: &neuron::engine::Trigger) -> &'static str {
     }
 }
 
+/// How many rules the profile's paired `<name>.rules.toml` carries (0 when it has none). Cheap
+/// enough for a list refresh: a sidecar is a handful of lines and the sheet has a handful of rows.
+fn profile_bind_count(name: &str) -> i32 {
+    let path = neuron::profile::Profile::rules_path(name);
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| toml::from_str::<neuron::engine::RuleDoc>(&s).ok())
+        .map(|d| d.rules.len() as i32)
+        .unwrap_or(0)
+}
+
 pub fn refresh_profiles(app: &AppWindow, sh: &SharedRt) {
     let s = sh.borrow();
     let active = s.rt.active_profile.clone();
-    let rows: Vec<ProfileRow> =
+    let mut rows: Vec<ProfileRow> =
         s.rt.profiles
             .iter()
             .map(|p| {
@@ -7913,15 +8038,48 @@ pub fn refresh_profiles(app: &AppWindow, sh: &SharedRt) {
                         .into(),
                     gaming: p.has_gaming(),
                     active: p.name == active,
+                    binds: profile_bind_count(&p.name),
+                    broken: false,
+                    why: SharedString::new(),
                 }
             })
             .collect();
+    // unreadable profiles get a row of their own rather than silently missing from the list.
+    rows.extend(s.rt.broken_profiles.iter().map(|(name, why)| ProfileRow {
+        name: name.clone().into(),
+        summary: SharedString::new(),
+        dpi: SharedString::new(),
+        polling: SharedString::new(),
+        brightness: SharedString::new(),
+        lighting: SharedString::new(),
+        idle: SharedString::new(),
+        in_game: SharedString::new(),
+        gaming: false,
+        active: false,
+        binds: 0,
+        broken: true,
+        why: why.clone().into(),
+    }));
     let names: Vec<SharedString> =
         s.rt.profiles
             .iter()
             .map(|p| p.name.clone().into())
             .collect();
+    // the fallback picker's options: "stay put" first, then `names` — same order, one build site,
+    // so the selected index and the list it indexes into are derived together and can't drift.
+    let mut fallback: Vec<SharedString> = vec!["stay put".into()];
+    fallback.extend(names.iter().cloned());
+    let default_name = s.rt.app_rules.default.clone().unwrap_or_default();
+    let fallback_idx = fallback
+        .iter()
+        .skip(1)
+        .position(|n| n.as_str() == default_name)
+        .map(|i| i as i32 + 1)
+        .unwrap_or(0);
     let st = app.global::<State>();
+    st.set_default_profile(default_name.into());
+    st.set_fallback_options(ModelRc::new(VecModel::from(fallback)));
+    st.set_fallback_index(fallback_idx);
     st.set_profiles(ModelRc::new(VecModel::from(rows)));
     st.set_profile_names(ModelRc::new(VecModel::from(names)));
     drop(s);
@@ -7999,13 +8157,17 @@ pub fn refresh_profile_suggestion(app: &AppWindow, focused: &str) {
 
 pub fn refresh_app_rules(app: &AppWindow, sh: &SharedRt) {
     let s = sh.borrow();
+    let saved: Vec<String> = s.rt.profiles.iter().map(|p| p.name.clone()).collect();
+    let dangling = s.rt.app_rules.dangling(&saved);
     let rows: Vec<AppRuleRow> =
         s.rt.app_rules
             .rules
             .iter()
-            .map(|r| AppRuleRow {
+            .enumerate()
+            .map(|(i, r)| AppRuleRow {
                 app: r.app.clone().into(),
                 profile: r.profile.clone().into(),
+                dangling: dangling.contains(&i),
             })
             .collect();
     drop(s);

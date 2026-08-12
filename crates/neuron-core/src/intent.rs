@@ -154,6 +154,13 @@ pub fn run_shared_intent(
                 // for the device here. (Lighting-on-auto-switch in a headless daemon is a follow-up.)
                 let rep = p.apply_with_session(devices, false);
                 cursor.set_active_profile(name);
+                // The gaming-mode guards are HOST-side policy, not a device write, so applying the
+                // profile does not install them — this does. Without it an auto-switch (or a bound
+                // profile key) changed your DPI but left the previous profile's Alt+Tab/Win
+                // suppression exactly as it was: a game profile that never guarded anything, or a
+                // guard that stayed on after you left the game. Set here, in the ONE place every
+                // client switches through, rather than in each front end.
+                crate::hook::set_policy(rep.gaming_mode);
                 // ONE confirmation for the action you took (switching profiles), not one per field
                 // the profile applied — those are its consequence, not a separate act.
                 crate::confirm::profile(name, Some(&prev));
@@ -162,7 +169,8 @@ pub fn run_shared_intent(
             Err(e) => format!("profile '{name}': {e}"),
         },
         ProfileCycle(dir) => {
-            let names = profile::list();
+            // loadable profiles only — a file that won't parse is not somewhere to cycle TO.
+            let names = profile::cycle_candidates();
             if names.is_empty() {
                 return Some("profile cycle: none saved".into());
             }
@@ -173,6 +181,7 @@ pub fn run_shared_intent(
                     let prev = cursor.active_profile();
                     let rep = p.apply_with_session(devices, false); // settings only (see ProfileSwitch)
                     cursor.set_active_profile(&name);
+                    crate::hook::set_policy(rep.gaming_mode); // see ProfileSwitch
                     crate::confirm::profile(&name, Some(&prev));
                     format!("profile cycle {} -> {name}: {}", dir.label(), rep.summary())
                 }

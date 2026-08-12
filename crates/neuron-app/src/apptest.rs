@@ -94,8 +94,14 @@ fn nav_pages_switch() {
 }
 
 /// The device-write safety gate toggles through the real callback and flips `writes-paused`.
+// Flips the PROCESS-GLOBAL device-write gate (through the real callback, which is the point),
+// so it must not run alongside a test that depends on writes being live — anything behind that
+// gate silently does nothing while this holds it. `cwd_guard` is this binary's serialization
+// lock; taking it keeps the window exclusive. Found via an intermittent auto-switch failure
+// that looked like a routing bug.
 #[test]
 fn safety_gate_toggles() {
+    let _cwd = crate::testsupport::cwd_guard("apptest_safety_gate");
     let Some(app) = try_window() else { return };
     let _shared = glue::install(&app);
     let st = app.global::<State>();
@@ -532,8 +538,14 @@ fn input_arm_single_callback_defaults_safe() {
 
 /// Perf-control callbacks are reachable + honor the writes-paused gate (no device needed). Pausing
 /// writes makes every surfaced perf write report "writes paused" rather than touch hardware.
+// Flips the PROCESS-GLOBAL device-write gate (through the real callback, which is the point),
+// so it must not run alongside a test that depends on writes being live — anything behind that
+// gate silently does nothing while this holds it. `cwd_guard` is this binary's serialization
+// lock; taking it keeps the window exclusive. Found via an intermittent auto-switch failure
+// that looked like a routing bug.
 #[test]
 fn perf_controls_honor_paused_gate() {
+    let _cwd = crate::testsupport::cwd_guard("apptest_perf_paused");
     let Some(app) = try_window() else { return };
     let _shared = glue::install(&app);
     let st = app.global::<State>();
@@ -647,8 +659,14 @@ fn beacon_state_is_inert_and_defer_pref_persists() {
 /// The surfaced perf controls each have a reachable callback (DPI stages, scroll stages, idle,
 /// in-game polling, gaming-mode, sniper-save) — the "every perf control Synapse buries" surface.
 /// Driven with writes paused so NOTHING touches hardware; each reports its gated/paused status.
+// Flips the PROCESS-GLOBAL device-write gate (through the real callback, which is the point),
+// so it must not run alongside a test that depends on writes being live — anything behind that
+// gate silently does nothing while this holds it. `cwd_guard` is this binary's serialization
+// lock; taking it keeps the window exclusive. Found via an intermittent auto-switch failure
+// that looked like a routing bug.
 #[test]
 fn all_perf_controls_have_callbacks() {
+    let _cwd = crate::testsupport::cwd_guard("apptest_perf_callbacks");
     let Some(app) = try_window() else { return };
     let _shared = glue::install(&app);
     let st = app.global::<State>();

@@ -794,6 +794,10 @@ export component Picker inherits Rectangle {
             }
         }
     }
+    // A long option must never set this control's size: the closed label elides and the control
+    // shrinks, so a picker sitting beside a button (the app-rule add row) can't push that button
+    // off the edge. Caught on screen with a 51-character profile name clipping "+ add rule".
+    min-width: 120px;
     HorizontalLayout {
         padding-left: 11px; padding-right: 9px; spacing: 8px;
         Text {
@@ -803,8 +807,9 @@ export component Picker inherits Rectangle {
             font-family: Theme.mono;
             vertical-alignment: center;
             horizontal-alignment: left;
+            overflow: elide;
+            horizontal-stretch: 1;
         }
-        Rectangle {}
         Text {
             text: "▾";
             color: root.enabled ? Theme.accent : Theme.text-faint;

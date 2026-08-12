@@ -971,8 +971,14 @@ fn live_tick(ctx: &mut LiveCtx) -> Duration {
             });
         }
     }
-    // app-aware switch: a focus change fires an AppFocus trigger; the Engine's matching
-    // rule (-> ProfileSwitch intent) does the switch (or nothing if unbound).
+    // app-aware switch. Two separate things happen on a focus change, and keeping them separate is
+    // the point:
+    //   1. ROUTING (apps.toml) resolves through `AppRules::resolve` — first match wins, else the
+    //      configured fallback. It is NOT a set of engine rules: the executor fires every matching
+    //      rule, so overlapping needles used to apply two profiles back-to-back with the last one
+    //      winning while the UI lamp lit the first.
+    //   2. The `AppFocus` TRIGGER still fires, so a hand-authored `app focus 'x' -> <anything>` bind
+    //      in a sidecar keeps working. Those are real binds; routing isn't.
     if let Some(app) = ctx.switcher.poll() {
         {
             let mut s = ctx
@@ -985,6 +991,7 @@ fn live_tick(ctx: &mut LiveCtx) -> Duration {
         // Stamped for the same reason as the mic tap: a focus change is an edge the user causes, and a
         // profile switch that feels slow should be measurable rather than anecdotal.
         neuron::latency::with_edge(Instant::now(), || {
+            route_focus_to_profile(ctx, &app);
             fire_trigger(
                 &mut ctx.devices.borrow_mut(),
                 &mut ctx.rt.borrow_mut(),
@@ -1395,8 +1402,54 @@ fn run_intent(
         note_profile_applied();
     }
     let mut cursor = neuron::intent::ProcessProfileCursor;
-    neuron::intent::run_shared_intent(devices, &mut cursor, intent)
-        .unwrap_or_else(|| "instrument routed".into())
+    // THE funnel every intent passes through, so the "a profile switch changes which binds are
+    // live" rule is enforced once here rather than at each caller. A profile carries its
+    // `<name>.rules.toml`, in scope only while it is active — a bound ProfileSwitch/ProfileCycle key
+    // that changed the cursor without reassembling the spine left the old profile's binds firing
+    // and the new profile's dark. Keyed on the CURSOR actually moving, so a failed switch (a target
+    // that no longer loads) costs nothing.
+    let before = neuron::profile::active();
+    let out = neuron::intent::run_shared_intent(devices, &mut cursor, intent)
+        .unwrap_or_else(|| "instrument routed".into());
+    if neuron::profile::active() != before {
+        request_reload();
+    }
+    out
+}
+
+/// Apply whatever [`neuron::profile::AppRules::resolve`] says this focused app should be on.
+///
+/// Idempotent by construction: a verdict naming the already-active profile does nothing, so holding
+/// focus in one app doesn't re-write the device on every poll, and a fallback that's already live
+/// stays quiet. Routes through the same `Intent::ProfileSwitch` a bound key uses, so the
+/// confirmation card, the lighting restream and the active cursor all behave identically no matter
+/// what caused the switch.
+fn route_focus_to_profile(ctx: &LiveCtx, app: &str) {
+    let Some(target) = ({
+        let rt = ctx.rt.borrow();
+        rt.app_rules
+            .switch_target(app, &neuron::profile::active())
+    }) else {
+        return;
+    };
+    let line = run_intent(
+        &mut ctx.devices.borrow_mut(),
+        &neuron::action::Intent::ProfileSwitch(target),
+    );
+    // The spine reload is `run_intent`'s job (it fires for ANY intent that moves the cursor, so a
+    // bound profile key gets it too, not just auto-switch). The profile's LIGHTING is the GUI's
+    // own: `glue::note_live_profile`, reached from the status post below, loads the new profile's
+    // layer stack into the compositor and restreams it. It has to live on the UI thread, which is
+    // where those layers are — this thread cannot touch them.
+    {
+        let mut s = ctx
+            .status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        s.last_action = line;
+        s.active_profile = neuron::profile::active();
+    }
+    post_status(&ctx.weak, &ctx.status);
 }
 
 fn apply_profile_live(
@@ -1417,8 +1470,19 @@ fn apply_profile_live(
     let _gates = crate::host::io_gate_all();
     // same stale-snapshot rule as the intent path: this write is the newer DPI intent.
     note_profile_applied();
+    let prev = neuron::profile::active();
     let report = profile.apply_with_session(devices, false);
     neuron::profile::set_active(name);
+    // The gaming guards are HOST-side policy, not a device write, so applying the profile does not
+    // install them. The shared intent path (a bound key, an auto-switch) sets the policy; this —
+    // the sheet and the tray — did not, so applying an FPS profile by hand left Alt+Tab live for
+    // the rest of the session and only took effect after a restart, via the startup reconcile.
+    // Every entry point now lands the same policy. (The GUI additionally reconciles its low-level
+    // hook on the pump thread; see `on_apply_profile`.)
+    neuron::hook::set_policy(report.gaming_mode);
+    // Same card a bound ProfileSwitch pops. The sheet and the tray used to be the two ways to switch
+    // that stayed silent — and the tray has no window on screen to read a status line from.
+    neuron::confirm::profile(name, Some(&prev));
     Ok(ProfileApplyResult {
         name: name.to_string(),
         summary: format!("applied '{name}': {}", report.summary()),
@@ -1668,6 +1732,27 @@ mod tests {
         )
     }
 
+    /// Write the marker sidecar as profile `test`'s binds AND make that profile active, because a
+    /// profile's `<name>.rules.toml` is in scope only while it is the active profile (see
+    /// `controls::sidecar_is_live`). These tests are about the RELOAD/INJECT wiring, not about
+    /// scoping — they just need their sidecar to be one the loader will actually read.
+    fn write_live_marker_sidecar(marker: &str) {
+        std::fs::create_dir_all("profiles").unwrap();
+        std::fs::write("profiles/test.rules.toml", marker_rule_toml(marker)).unwrap();
+        // The profile FILE has to exist too, not just its sidecar: the cursor is validated against
+        // a loadable profile (`restore_active`), so a cursor naming a profile with no file is
+        // cleared — and its sidecar then falls out of scope, which is the correct product
+        // behaviour and made this helper silently produce an empty engine.
+        neuron::profile::Profile {
+            name: "test".into(),
+            dpi: Some(800),
+            ..Default::default()
+        }
+        .save()
+        .unwrap();
+        neuron::profile::set_active("test");
+    }
+
     fn marker_trigger(marker: &str) -> Trigger {
         Trigger::AppFocus {
             app: marker.to_string(),
@@ -1692,12 +1777,7 @@ mod tests {
             "before any sidecar exists, the marker trigger must resolve to nothing"
         );
 
-        std::fs::create_dir_all("profiles").unwrap();
-        std::fs::write(
-            "profiles/test.rules.toml",
-            marker_rule_toml("zzz-dispatch-reload-marker.exe"),
-        )
-        .unwrap();
+        write_live_marker_sidecar("zzz-dispatch-reload-marker.exe");
         tx.send(LiveCommand::Reload).unwrap();
         live_tick(&mut ctx);
 
@@ -1706,6 +1786,116 @@ mod tests {
             1,
             "a live_tick after Reload must rebuild the engine from the just-edited config"
         );
+    }
+
+    /// THE auto-switch guarantee, end to end: focusing a linked app must swap which profile's BINDS
+    /// are live, not just its device settings. A profile carries three things — settings, lighting,
+    /// and a `<name>.rules.toml` sidecar that is in scope only while that profile is active — and
+    /// the binds half is the one that used to be wrong in both directions: every profile's sidecar
+    /// loaded at once (so two imported profiles fought), and later, once scoped, a focus switch
+    /// changed the cursor without reassembling the spine (so the old profile's binds kept firing).
+    ///
+    /// Drives the real `route_focus_to_profile` + reload path: two profiles, each with a sidecar
+    /// binding a DIFFERENT marker, and proves the engine follows the switch.
+    #[test]
+    fn an_auto_switch_swaps_which_profiles_binds_are_live() {
+        let _g = crate::testsupport::cwd_guard("dispatch_autoswitch_binds");
+        let alpha = marker_trigger("zzz-alpha-marker.exe");
+        let beta = marker_trigger("zzz-beta-marker.exe");
+        std::fs::create_dir_all("profiles").unwrap();
+        for (name, marker) in [("alpha", "zzz-alpha-marker.exe"), ("beta", "zzz-beta-marker.exe")] {
+            neuron::profile::Profile {
+                name: name.into(),
+                dpi: Some(800),
+                ..Default::default()
+            }
+            .save()
+            .unwrap();
+            std::fs::write(
+                neuron::profile::Profile::rules_path(name),
+                marker_rule_toml(marker),
+            )
+            .unwrap();
+        }
+        // an app rule routing a focused exe to `beta`, and `alpha` active to begin with.
+        neuron::profile::AppRules {
+            default: None,
+            rules: vec![neuron::profile::AppRule {
+                app: "zzz-switch-app".into(),
+                profile: "beta".into(),
+            }],
+        }
+        .save()
+        .unwrap();
+        neuron::profile::set_active("alpha");
+
+        let reg = neuron::registry::Registry { devices: Vec::new() };
+        let (tx, rx) = channel();
+        let mut ctx = LiveCtx::for_tests(&reg, rx);
+        assert_eq!(
+            ctx.rt.borrow().engine.resolve(&alpha).len(),
+            1,
+            "the ACTIVE profile's binds are live"
+        );
+        assert!(
+            ctx.rt.borrow().engine.resolve(&beta).is_empty(),
+            "and an inactive profile's binds are NOT — this is the scoping"
+        );
+
+        // A profile switch runs behind the process-wide WRITE GATE, so a concurrently-paused test
+        // would gate it and this would read as a routing bug. Anything that flips that gate takes
+        // the same `cwd_guard` this test holds, so the two can't overlap — assert it rather than
+        // trust it, so a future unserialized pauser fails loudly instead of intermittently.
+        assert!(
+            !neuron::writes::writes_paused(),
+            "writes are paused, so the switch below is gated: something flipped the process-wide              gate without taking cwd_guard"
+        );
+        // fixture first, so a failure below points at the routing rather than the setup.
+        assert!(
+            neuron::profile::Profile::load("beta").is_ok(),
+            "the target profile must be loadable or the switch can't happen"
+        );
+        assert_eq!(
+            ctx.rt
+                .borrow()
+                .app_rules
+                .switch_target("zzz-switch-app.exe", &neuron::profile::active())
+                .as_deref(),
+            Some("beta"),
+            "the routing table resolves this app to beta (active was {:?})",
+            neuron::profile::active()
+        );
+
+        // the focus edge itself: routing decides beta, applies it, and asks for a rebuild.
+        let gen_before = reload_generation();
+        route_focus_to_profile(&ctx, "zzz-switch-app.exe");
+        assert_eq!(
+            neuron::profile::active(),
+            "beta",
+            "routing switched the active profile"
+        );
+        assert!(
+            reload_generation() > gen_before,
+            "the switch must REQUEST a spine rebuild — without it the old profile's binds keep \
+             firing and the new profile's never start"
+        );
+        // `request_reload` also posts LiveCommand::Reload, but that goes to the live runtime's own
+        // channel, which no test installs — so deliver the same command on this ctx's channel to
+        // drive the consumption half. (Both halves are real: the request is observed above through
+        // the generation counter, the mechanism the rest of the app watches.)
+        tx.send(LiveCommand::Reload).unwrap();
+        live_tick(&mut ctx);
+
+        assert_eq!(
+            ctx.rt.borrow().engine.resolve(&beta).len(),
+            1,
+            "the newly active profile's binds are live after the switch"
+        );
+        assert!(
+            ctx.rt.borrow().engine.resolve(&alpha).is_empty(),
+            "and the previous profile's binds stopped firing"
+        );
+        neuron::profile::set_active("");
     }
 
     /// A held momentary mic / held key remap / held sniper DPI / held turbo must not survive a
@@ -1820,12 +2010,7 @@ mod tests {
     fn inject_fires_through_the_same_engine() {
         let _g = crate::testsupport::cwd_guard("dispatch_inject_fires");
         let trigger = marker_trigger("zzz-dispatch-inject-marker.exe");
-        std::fs::create_dir_all("profiles").unwrap();
-        std::fs::write(
-            "profiles/test.rules.toml",
-            marker_rule_toml("zzz-dispatch-inject-marker.exe"),
-        )
-        .unwrap();
+        write_live_marker_sidecar("zzz-dispatch-inject-marker.exe");
         let reg = neuron::registry::Registry { devices: Vec::new() };
         let (tx, rx) = channel();
         let mut ctx = LiveCtx::for_tests(&reg, rx);
@@ -2170,6 +2355,11 @@ mod tests {
             std::fs::create_dir_all("profiles").unwrap();
             let doc = neuron::engine::RuleDoc { rules };
             std::fs::write("profiles/walker.rules.toml", toml::to_string(&doc).unwrap()).unwrap();
+            // a profile's binds are in scope only while that profile is active
+            // (`controls::sidecar_is_live`), so name the walker's own profile as the active one —
+            // otherwise the loader correctly refuses to fold these rules in and every raw edge
+            // resolves to nothing.
+            neuron::profile::set_active("walker");
         }
 
         /// A cheap, cheaply-observable digest of "what state is the seam in right now" — the three

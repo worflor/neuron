@@ -445,13 +445,18 @@ pub fn listen_until(
 // lived inline in the CLI. That is three code paths for the one primitive the project's keystone
 // insight collapses: *something happened (a [`Trigger`]) so do this (an [`Action`])*.
 //
-// [`build_engine`] is the bridge: it reads every config source the daemon already loads — the
-// `bindings.toml`, the cast `cast.toml` (radial wedges + glyph spells), every imported
-// `profiles/*.rules.toml` spine sidecar, and the app-switch `apps.toml` — and folds them into ONE
-// [`Engine`] via [`Engine::from_rules`]. The run-daemon then translates each device event into a
-// [`Trigger`] and calls [`Engine::fire`], so the SAME dispatcher serves buttons, gestures, the
-// radial wheel, app focus, the mic tap and HyperShift layers. Backward compatible: the on-disk
-// formats are unchanged — this only changes how they are *executed* at runtime.
+// [`build_runtime`] is the bridge: it reads every config source the daemon already loads — the
+// `bindings.toml`, the cast `cast.toml` (radial wedges + glyph spells), and the ACTIVE profile's
+// `profiles/<name>.rules.toml` spine sidecar plus the always-on `gui.rules.toml` — and folds them
+// into ONE [`Engine`] via [`Engine::from_rules`]. The run-daemon then translates each device event
+// into a [`Trigger`] and calls [`Engine::fire`], so the SAME dispatcher serves buttons, gestures,
+// the radial wheel, app focus, the mic tap and HyperShift layers.
+//
+// The one config that is deliberately NOT folded into the engine is the app-switch `apps.toml`. It
+// is a routing TABLE, not a set of binds: the executor fires every rule that matches a trigger, so
+// as rules two overlapping needles applied two profiles back-to-back and the last one won. It rides
+// on [`Runtime::app_rules`] and both front ends resolve it through [`AppRules::resolve`] — see
+// [`build_runtime_from`]. Backward compatible: the on-disk formats are unchanged.
 
 use crate::action::Action;
 use crate::bindings::{Binding, Bindings};
@@ -1078,6 +1083,10 @@ pub fn binding_rule(b: &Binding) -> Option<Rule> {
 pub struct Runtime {
     /// The unified dispatcher (base rules + named HyperShift layers).
     pub engine: Engine,
+    /// The app-aware auto-switch ROUTING TABLE. Deliberately not folded into `engine`: see the
+    /// note in [`build_runtime_from`]. Both the dispatcher and the UI lamp resolve a focused app
+    /// through [`crate::profile::AppRules::resolve`], so one verdict drives both.
+    pub app_rules: crate::profile::AppRules,
     /// The cast hold-trigger control (from `cast.toml`) — the button to watch to capture a
     /// gesture / radial flick and emit a [`Trigger::Gesture`] / [`Trigger::RadialSector`].
     /// A [`ControlRef`] (page/usage/pid), NOT a VK — the same identity namespace as every rule.
@@ -1360,6 +1369,10 @@ pub const CAST_MENU: &str = "comms";
 pub fn build_runtime() -> Runtime {
     let bindings = Bindings::load();
     let cast = CastConfig::load();
+    // The sidecar scope is keyed off the active-profile cursor, so make sure the cursor is the
+    // remembered one before reading sidecars — this function owns that dependency rather than
+    // trusting a caller to have restored it first (see `profile::restore_active_once`).
+    let _ = crate::profile::restore_active_once();
     let app_rules = AppRules::load();
     let mut rt = build_runtime_from(&bindings, &cast, &app_rules, &load_rule_sidecars());
     // the layer stance + timing windows come from feel.toml (defaults when absent).
@@ -1439,22 +1452,26 @@ pub fn build_runtime_from(
     // 3. imported / GUI-authored spine sidecars verbatim (HyperShift layer tags preserved).
     rules.extend(sidecar_rules.iter().cloned());
 
-    // 4. app-aware profile switching -> AppFocus -> ProfileSwitch intent rules.
-    for r in &app_rules.rules {
-        rules.push(Rule::new(
-            Trigger::AppFocus { app: r.app.clone() },
-            Action::ProfileSwitch {
-                name: r.profile.clone(),
-            },
-        ));
-    }
+    // 4. app-aware profile switching is NOT folded in as rules. It used to be — one
+    //    `AppFocus -> ProfileSwitch` rule per entry — but the executor fires EVERY matching rule,
+    //    so two overlapping needles ("chrome" and "rome" both match `chrome.exe`) applied two
+    //    profiles back-to-back and the LAST one won, while the lamp lit the first and the docs
+    //    promised first-match. apps.toml is a routing TABLE, not a set of independent binds: the
+    //    dispatcher resolves it through `AppRules::resolve` (first match, else the `default`
+    //    fallback) and the UI lamp reads the same verdict. A hand-authored `AppFocus` rule in a
+    //    sidecar still folds in above and still fires — those ARE independent binds.
 
     // Computed ONCE here (build time), not per-tick — see `Runtime::poll_needed`'s doc.
+    // Auto-switch needs the foreground poll even with zero AppFocus RULES now that routing lives
+    // outside the engine, so any rule (or a fallback) keeps the poll alive.
     let poll_needed = rules
         .iter()
-        .any(|r| matches!(r.trigger, Trigger::MicTap | Trigger::AppFocus { .. }));
+        .any(|r| matches!(r.trigger, Trigger::MicTap | Trigger::AppFocus { .. }))
+        || !app_rules.rules.is_empty()
+        || app_rules.default.is_some();
 
     Runtime {
+        app_rules: app_rules.clone(),
         engine: Engine::from_rules(rules),
         cast_trigger: cast.trigger,
         cast_sectors: cast.sectors,
@@ -1469,38 +1486,110 @@ pub fn build_runtime_from(
     }
 }
 
-/// Load every `profiles/*.rules.toml` spine sidecar into a flat `Vec<Rule>`. These are the
-/// migration importer's output (and any GUI-authored rules). Missing dir / parse errors degrade to
-/// an empty list rather than failing the daemon.
+/// The always-on sidecar: the rules the GUI itself authors. Not owned by any profile, so it is
+/// live whatever profile you're on (or none).
+pub const GUI_RULES_FILE: &str = "gui.rules.toml";
+
+/// Is this sidecar live right now? `gui.rules.toml` always is; every other `<name>.rules.toml`
+/// belongs to the profile of the same name and is live only while that profile is active.
+///
+/// This is the scoping the rest of the app already assumed and the loader didn't do. Every sidecar
+/// used to fold into the spine unconditionally, so importing two Synapse profiles put BOTH bind
+/// sets on your keyboard at once, and deleting a profile left its binds firing forever. The import
+/// wizard's own status line says "press apply on the profile to make it live" — this makes that
+/// true. A profile is one object: settings, lighting, AND binds.
+pub fn sidecar_is_live(file_name: &str, active_profile: &str) -> bool {
+    if file_name == GUI_RULES_FILE {
+        return true;
+    }
+    let Some(stem) = file_name.strip_suffix(".rules.toml") else {
+        return false;
+    };
+    // compare on the canonical on-disk key: the sidecar's stem is already sanitized (it was derived
+    // from `Profile::path`), and the active name is a display name that may not be.
+    !active_profile.is_empty()
+        && crate::profile::Profile::file_key(stem) == crate::profile::Profile::file_key(active_profile)
+}
+
+/// Load the spine sidecars that are live for `active_profile` (see [`sidecar_is_live`]) into a flat
+/// `Vec<Rule>`. Missing dir degrades to an empty list rather than failing the daemon; a sidecar that
+/// won't parse is reported through [`take_sidecar_faults`] so a client can say so instead of the
+/// user's binds quietly not existing.
 pub fn load_rule_sidecars() -> Vec<Rule> {
-    load_rule_sidecars_with(|_| true)
+    load_rule_sidecars_with(|name| sidecar_is_live(name, &crate::profile::active()))
 }
 
 pub fn load_rule_sidecars_except(excluded_file_name: &str) -> Vec<Rule> {
-    load_rule_sidecars_with(|name| name != excluded_file_name)
+    let active = crate::profile::active();
+    load_rule_sidecars_with(move |name| {
+        name != excluded_file_name && sidecar_is_live(name, &active)
+    })
+}
+
+/// Sidecars that failed to parse on the last load, as `(file name, reason)`. A malformed sidecar
+/// used to print to stderr and vanish — invisible in the GUI, where "my binds are gone" had no
+/// explanation on screen.
+static SIDECAR_FAULTS: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+
+/// Take (and clear) the faults recorded by the last sidecar load.
+pub fn take_sidecar_faults() -> Vec<(String, String)> {
+    std::mem::take(
+        &mut *SIDECAR_FAULTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
 }
 
 fn load_rule_sidecars_with(include: impl Fn(&str) -> bool) -> Vec<Rule> {
     use crate::engine::RuleDoc;
     let mut out = Vec::new();
-    let Ok(rd) = std::fs::read_dir(crate::profile::profiles_dir()) else {
-        return out;
-    };
-    for entry in rd.flatten() {
-        let path = entry.path();
-        let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        if !file_name.ends_with(".rules.toml") || !include(file_name) {
-            continue;
-        }
-        if let Ok(s) = std::fs::read_to_string(&path) {
-            match toml::from_str::<RuleDoc>(&s) {
-                Ok(doc) => out.extend(doc.rules),
-                Err(e) => eprintln!("  (skipping {}: {e})", path.display()),
+    let mut faults = Vec::new();
+    // The fault list is published on EVERY path, including the early return below. Returning before
+    // the store left the previous load's faults standing, so a fixed sidecar would keep reporting
+    // its old error (and a directory that vanished would keep reporting a file that no longer
+    // exists). The publish is deferred to one place at the end for exactly that reason.
+    match std::fs::read_dir(crate::profile::profiles_dir()) {
+        Ok(rd) => {
+            for entry in rd.flatten() {
+                let path = entry.path();
+                let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                if !file_name.ends_with(".rules.toml") || !include(file_name) {
+                    continue;
+                }
+                let first_line = |e: &dyn std::fmt::Display| {
+                    e.to_string()
+                        .lines()
+                        .next()
+                        .unwrap_or("unreadable")
+                        .trim()
+                        .to_string()
+                };
+                match std::fs::read_to_string(&path) {
+                    Ok(s) => match toml::from_str::<RuleDoc>(&s) {
+                        Ok(doc) => out.extend(doc.rules),
+                        Err(e) => {
+                            eprintln!("  (skipping {}: {e})", path.display());
+                            faults.push((file_name.to_string(), first_line(&e)));
+                        }
+                    },
+                    // A sidecar that won't OPEN (locked by another process, permissions) is just as
+                    // invisible to the user as one that won't parse — same report, not a silent skip.
+                    Err(e) => {
+                        eprintln!("  (skipping {}: {e})", path.display());
+                        faults.push((file_name.to_string(), first_line(&e)));
+                    }
+                }
             }
         }
+        // No profiles dir yet is the normal empty state, not a fault worth reporting.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => faults.push(("profiles/".to_string(), e.to_string())),
     }
+    *SIDECAR_FAULTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = faults;
     out
 }
 
@@ -1995,6 +2084,7 @@ mod spine_tests {
 
         // app rule -> AppFocus -> ProfileSwitch
         let apps = AppRules {
+            default: None,
             rules: vec![AppRule {
                 app: "valorant".into(),
                 profile: "fps".into(),
@@ -2017,8 +2107,9 @@ mod spine_tests {
         assert_eq!(rt.cast_trigger, ControlRef::from_vk(0x06));
 
         // base rules: mic-gain + mic-gain-set + radial wedge 0 + gesture + the default cast
-        // rhythm (teleport on tap-then-hold) + app-focus = 6
-        assert_eq!(rt.engine.rules.len(), 6, "six base rules folded in");
+        // rhythm (teleport on tap-then-hold) = 5. App-focus ROUTING is deliberately not among
+        // them — it rides on `rt.app_rules` as a table (see `app_rules_do_not_become_engine_rules`).
+        assert_eq!(rt.engine.rules.len(), 5, "five base rules folded in");
         // one HyperShift layer from the sidecar
         assert_eq!(rt.engine.layers.len(), 1);
         assert_eq!(rt.engine.layers["sniper"].len(), 1);
@@ -2083,23 +2174,19 @@ mod spine_tests {
                 .len(),
             1
         );
-        // app focus (substring) -> 1, and the action is the ProfileSwitch intent
-        let log = rt.engine.dispatch(
-            &Trigger::AppFocus {
-                app: "valorant.exe".into(),
-            },
-            &ctx,
-        );
-        assert_eq!(log.len(), 1);
-        let r = rt
-            .engine
-            .resolve_top(&Trigger::AppFocus {
-                app: "valorant.exe".into(),
-            })
-            .unwrap();
+        // app focus (substring) routes to its profile — through the table, not the engine.
+        assert_eq!(rt.app_rules.resolve("valorant.exe").profile(), Some("fps"));
         assert_eq!(
-            r.action.intent(),
-            Some(crate::action::Intent::ProfileSwitch("fps".into()))
+            rt.engine
+                .dispatch(
+                    &Trigger::AppFocus {
+                        app: "valorant.exe".into(),
+                    },
+                    &ctx,
+                )
+                .len(),
+            0,
+            "no engine rule for routing — a hand-authored AppFocus bind would be the only match"
         );
     }
 
@@ -2138,28 +2225,22 @@ mod spine_tests {
         );
     }
 
+    /// An app rule still routes a focused exe to its profile by substring — but through the
+    /// routing table on the Runtime, not as an engine rule. See `app_rules_do_not_become_engine_rules`
+    /// for why: the executor fires EVERY matching rule, so overlapping needles applied two profiles
+    /// back-to-back with the last one winning while the UI lamp lit the first.
     #[test]
-    fn app_focus_rule_carries_profile_switch_intent() {
+    fn app_focus_routes_to_its_profile_by_substring() {
         let apps = AppRules {
+            default: None,
             rules: vec![AppRule {
                 app: "code".into(),
                 profile: "work".into(),
             }],
         };
         let rt = build_runtime_from(&Bindings::default(), &CastConfig::default(), &apps, &[]);
-        let fired = Trigger::AppFocus {
-            app: "code.exe".into(),
-        };
-        let rule = rt
-            .engine
-            .resolve_top(&fired)
-            .expect("app rule matches by substring");
-        assert_eq!(
-            rule.action,
-            Action::ProfileSwitch {
-                name: "work".into()
-            }
-        );
+        assert_eq!(rt.app_rules.resolve("code.exe").profile(), Some("work"));
+        assert_eq!(rt.app_rules.resolve("code.exe").rule_index(), 0);
     }
 
     // keep `Direction` import used (it documents the intent surface the daemon drives)
@@ -3024,5 +3105,78 @@ pub(crate) mod win {
             // outlived us.
             rearm_and_wake();
         }
+    }
+}
+
+#[cfg(test)]
+mod sidecar_scope_tests {
+    use super::*;
+
+    /// A profile's binds ride WITH the profile. `gui.rules.toml` is the app's own always-on set;
+    /// every `<name>.rules.toml` belongs to the profile of that name and is live only while it's
+    /// active. Before this, every sidecar folded into the spine unconditionally: importing two
+    /// Synapse profiles put both keymaps on your keyboard at once, and deleting a profile left its
+    /// binds firing with no UI able to remove them. The import wizard's own status line already
+    /// promised the opposite ("press apply on the profile to make it live").
+    #[test]
+    fn only_the_active_profiles_sidecar_is_live() {
+        assert!(sidecar_is_live(GUI_RULES_FILE, ""), "the GUI's own set is always live");
+        assert!(sidecar_is_live(GUI_RULES_FILE, "fps"));
+
+        assert!(sidecar_is_live("fps.rules.toml", "fps"));
+        assert!(!sidecar_is_live("fps.rules.toml", "chill"));
+        assert!(
+            !sidecar_is_live("fps.rules.toml", ""),
+            "with no profile active a profile's binds are not live"
+        );
+    }
+
+    /// The stem is compared on the canonical on-disk key, because the sidecar's name is already
+    /// sanitized while the active profile is a display name that may not be ("FPS/competitive"
+    /// lives at `FPS_competitive.rules.toml`), and Windows filenames are case-insensitive.
+    #[test]
+    fn sidecar_scope_compares_the_on_disk_key_not_the_raw_name() {
+        assert!(sidecar_is_live("FPS_competitive.rules.toml", "FPS/competitive"));
+        assert!(sidecar_is_live("Valorant.rules.toml", "valorant"));
+        assert!(!sidecar_is_live("apex.rules.toml", "valorant"));
+        // a file that isn't a sidecar at all never qualifies.
+        assert!(!sidecar_is_live("fps.toml", "fps"));
+    }
+
+    /// Auto-switch routing is NOT folded into the engine — see the note in `build_runtime_from`.
+    /// The executor fires every matching rule, so two overlapping needles used to apply two
+    /// profiles back-to-back with the last one winning. The table lives on the Runtime instead.
+    #[test]
+    fn app_rules_do_not_become_engine_rules() {
+        use crate::profile::{AppRule, AppRules};
+        let apps = AppRules {
+            default: Some("everyday".into()),
+            rules: vec![
+                AppRule {
+                    app: "chrome".into(),
+                    profile: "chill".into(),
+                },
+                AppRule {
+                    app: "rome".into(),
+                    profile: "fps".into(),
+                },
+            ],
+        };
+        let rt = build_runtime_from(
+            &Bindings::default(),
+            &CastConfig::default(),
+            &apps,
+            &[],
+        );
+        assert!(
+            !rt.engine
+                .rules
+                .iter()
+                .any(|r| matches!(r.trigger, Trigger::AppFocus { .. })),
+            "routing is a table, not a set of binds — otherwise all matches fire and last wins"
+        );
+        assert_eq!(rt.app_rules.rules.len(), 2, "the table rides on the Runtime");
+        // and the poll stays alive even though no AppFocus RULE exists any more.
+        assert!(rt.needs_periodic_poll(), "auto-switch still needs the foreground poll");
     }
 }

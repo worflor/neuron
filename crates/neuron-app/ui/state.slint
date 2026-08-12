@@ -614,9 +614,18 @@ export global State {
     in-out property <string> profile-name-suggested: ""; // glue's low-friction default (focused app / value descriptor); non-colliding
     callback profile-name-edited(string);              // glue answers profile-name-exists
     callback refresh-profile-suggestion();             // recompute the zero-typing default from LIVE state — called on sheet-open so a value tuned since last focus-change isn't stale
+    // the profile auto-switch falls back to when the focused app matches no rule ("" = stay put,
+    // the latching behaviour). This is the "you closed the game" half of auto-switching.
+    in-out property <string> default-profile: "";
+    // `profile-names` with a leading "stay put" — the fallback picker's options. Built in glue
+    // beside `profile-names` so the two can never disagree about order.
+    in-out property <[string]> fallback-options: ["stay put"];
+    in-out property <int> fallback-index: 0;           // which of fallback-options is `default-profile`
     callback apply-profile(string);
     callback save-current-profile(string);
     callback delete-profile(string);
+    callback rename-profile(string, string);         // from, to — carries binds + app rules along
+    callback set-default-profile(string);            // "" clears the fallback
     callback add-app-rule(string, string);           // app-needle, profile
     callback remove-app-rule(int);
 

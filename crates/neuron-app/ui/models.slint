@@ -87,12 +87,18 @@ export struct ProfileRow {
     in-game: string,    // in-game polling "1000/500Hz" (wired/dongle); "" = none
     gaming: bool,       // any gaming-mode suppression (alt-tab/win/alt-f4) captured
     active: bool,
+    binds: int,         // rules in this profile's `<name>.rules.toml`; live only while it's active
+    // A profile whose file wouldn't parse. It still gets a row (with `why` in place of the values)
+    // rather than vanishing from the list with the file still on disk.
+    broken: bool,
+    why: string,
 }
 
 // An app-aware auto-switch rule.
 export struct AppRuleRow {
     app: string,
     profile: string,
+    dangling: bool,     // its target profile no longer exists — the route can never fire
 }
 
 // A named lighting effect available on the selected device. `idx` is the index into the FULL

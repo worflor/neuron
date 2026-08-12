@@ -18,7 +18,7 @@ the README has an honest map of how much groundwork is already done: **[README â
 
 - **a new razer device** is a TOML file, not a recompile (`neuron discover --emit` drops you a starter).
 - **a lighting effect** is one registry entry plus a `field()` generator. pure math, self-contained, a good first PR.
-- **a preset (a look)** is pure data: an existing pattern plus a spectrum. zero code.
+- **a preset (a look)** is pure data: an existing pattern plus a spectrum, a blurb, and the feed it reads. zero code, though you'll also add a line to the golden shelf map in `pattern.rs` so the catalog test knows where it belongs.
 - **a neuron-host protocol adapter** (OBS, MQTT, WLED, MIDI, ...) is a small codec with a capture-and-replay harness.
 - **bigger chunks** (the linux / mac port, a real vendor abstraction) are described in the README. talk to me before starting one so we can agree on the seam before you burn a weekend on it.
 

@@ -12,18 +12,23 @@ import { ProfileRow, AppRuleRow } from "../models.slint";
 // full-screen sheet. Primary action is "pick a saved profile to apply"; below it you capture the
 // live state into a new bundle, and route focused apps to profiles. Same State API as before.
 
-// One saved profile — a slim row. The whole row applies it; a two-step armed contact deletes.
+// One saved profile — a slim row. The whole row applies it; a two-step armed contact deletes; the
+// name itself is a rename affordance (click it and it becomes an editable field in place).
 component ProfileMenuRow inherits Rectangle {
     in property <ProfileRow> p;
     in property <bool> armed;
+    // marks the row whose name is being edited in the sheet's own rename field (below the list).
+    in property <bool> renaming;
     callback apply();
     callback arm-delete();
     callback confirm-delete();
+    callback begin-rename();
     height: 52px;
     border-radius: Theme.radius-sm;
-    background: root.p.active ? Theme.accent-glow : (cta.has-hover ? Theme.well : Theme.bg-2);
+    background: (root.p.active || root.renaming) ? Theme.accent-glow : (cta.has-hover ? Theme.well : Theme.bg-2);
     border-width: Theme.hair;
-    border-color: root.p.active ? Theme.accent-line : (cta.has-hover ? Theme.text-faint : Theme.line);
+    border-color: root.p.broken ? Theme.danger.with-alpha(0.5)
+        : ((root.p.active || root.renaming) ? Theme.accent-line : (cta.has-hover ? Theme.text-faint : Theme.line));
     animate background, border-color { duration: Theme.quick; }
     // the active profile's index tick — its only colour, settling never teleporting.
     // The site keeps its own vertical inset; SelectTick owns the bar + its animation.
@@ -31,21 +36,74 @@ component ProfileMenuRow inherits Rectangle {
         active: root.p.active;
         y: 9px; height: parent.height - 18px;
     }
-    cta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.apply(); } }
+    // a broken profile can't be applied — no click target, so the row can't lie about being usable.
+    // `enabled` deliberately does NOT depend on `renaming`. The rename affordance is a TouchArea
+    // nested above this one, so a click there would flip this sibling's enabled state while Slint
+    // is still dispatching that very click — which it answers with a "Recursion detected" panic.
+    // While renaming, the edit Field covers this area anyway, so nothing here needs disabling.
+    cta := TouchArea {
+        enabled: !root.p.broken;
+        mouse-cursor: MouseCursor.pointer;
+        clicked => { if (!root.renaming) { root.apply(); } }
+    }
     HorizontalLayout {
         padding-left: 13px; padding-right: 9px; spacing: 9px;
         VerticalLayout {
             alignment: center; horizontal-stretch: 1; spacing: 3px;
-            Text {
-                text: root.p.name;
-                color: root.p.active ? Theme.accent : Theme.text;
-                font-family: Theme.mono; font-size: Theme.fs-data; font-weight: 700;
-                vertical-alignment: center; overflow: elide;
-                animate color { duration: Theme.quick; }
+            // The row's SHAPE never changes on click. An in-place edit field here — swapping the
+            // name Text out for a Field when this row's `renaming` went true — panicked Slint with
+            // "Recursion detected" every single time: the click handler was replacing the very
+            // subtree the click was still being dispatched through. Three narrower fixes (dropping
+            // the blur handler, dropping the init-focus, unbinding the row TouchArea's `enabled`)
+            // each failed, because the structural swap itself was the cause.
+            //
+            // So the editor lives ONCE, below the list, and a row only ever gets highlighted. No
+            // element is created or destroyed by the click that starts a rename.
+            HorizontalLayout {
+                spacing: 7px;
+                nm := Text {
+                    text: root.p.name;
+                    color: root.p.broken ? Theme.danger : (root.p.active ? Theme.accent : Theme.text);
+                    font-family: Theme.mono; font-size: Theme.fs-data; font-weight: 700;
+                    vertical-alignment: center; overflow: elide;
+                    animate color { duration: Theme.quick; }
+                }
+                // rename — a quiet micro-label beside the name, in the same faint→bright idiom as ✕.
+                // A word, not a glyph: the UI font is Consolas, which has no pencil (✎ rendered as
+                // tofu — caught on screen, not in review). Every symbol in this app is one Consolas
+                // actually draws, and the tiny uppercase label is already the house vocabulary
+                // (LIVE / FOCUS / ACTIVE / TOML).
+                //
+                // Renaming in place is the verb people reach for; the workaround used to be
+                // "capture under a new name, delete the old one", which orphans the app rules
+                // pointing at it.
+                if !root.p.broken : VerticalLayout {
+                    alignment: center;
+                    Rectangle {
+                        width: 44px; height: 18px;
+                        border-radius: Theme.radius-sm;
+                        background: rnta.has-hover ? Theme.well : transparent;
+                        animate background { duration: Theme.quick; }
+                        Text {
+                            text: "rename";
+                            color: rnta.has-hover ? Theme.text-mid : Theme.text-faint;
+                            font-family: Theme.mono; font-size: Theme.fs-small;
+                            horizontal-alignment: center; vertical-alignment: center;
+                            animate color { duration: Theme.quick; }
+                        }
+                        rnta := TouchArea {
+                            mouse-cursor: MouseCursor.pointer;
+                            clicked => { root.begin-rename(); }
+                        }
+                    }
+                }
+                Rectangle {}
             }
             // a compact captured-values line (the data is the hero, never one prose run)
             HorizontalLayout {
                 spacing: 10px;
+                // a profile whose file won't parse says why, in place of values it doesn't have.
+                if root.p.broken : Mono { text: root.p.why; color: Theme.danger; font-size: Theme.fs-small; overflow: elide; }
                 if root.p.dpi != "" : Mono { text: "dpi " + root.p.dpi; color: Theme.text-faint; font-size: Theme.fs-small; }
                 if root.p.polling != "" : Mono { text: "poll " + root.p.polling; color: Theme.text-faint; font-size: Theme.fs-small; }
                 if root.p.brightness != "" : Mono { text: "bright " + root.p.brightness; color: Theme.text-faint; font-size: Theme.fs-small; }
@@ -53,9 +111,13 @@ component ProfileMenuRow inherits Rectangle {
                 if root.p.idle != "" : Mono { text: "idle " + root.p.idle; color: Theme.text-faint; font-size: Theme.fs-small; }
                 if root.p.in-game != "" : Mono { text: "in-game " + root.p.in-game; color: Theme.text-faint; font-size: Theme.fs-small; }
                 if root.p.gaming : Mono { text: "gaming"; color: Theme.warn; font-size: Theme.fs-small; }
+                // binds ride WITH the profile: `<name>.rules.toml` is live only while it's active.
+                // Without this badge a profile that carries an imported keymap looked identical to
+                // one that doesn't, and there was no way to tell what applying it would change.
+                if root.p.binds > 0 : Mono { text: root.p.binds + (root.p.binds == 1 ? " bind" : " binds"); color: Theme.accent-dim; font-size: Theme.fs-small; }
                 // every real field has its OWN badge above, so the summary fallback is now purely the
                 // "(empty)" guard: it shows only when the row is genuinely blank (no field, no gaming).
-                if root.p.dpi == "" && root.p.polling == "" && root.p.brightness == "" && root.p.lighting == "" && root.p.idle == "" && root.p.in-game == "" && !root.p.gaming : Mono { text: root.p.summary; color: Theme.text-faint; font-size: Theme.fs-small; overflow: elide; }
+                if !root.p.broken && root.p.dpi == "" && root.p.polling == "" && root.p.brightness == "" && root.p.lighting == "" && root.p.idle == "" && root.p.in-game == "" && !root.p.gaming && root.p.binds == 0 : Mono { text: root.p.summary; color: Theme.text-faint; font-size: Theme.fs-small; overflow: elide; }
                 Rectangle {}
             }
         }
@@ -64,27 +126,38 @@ component ProfileMenuRow inherits Rectangle {
         // hover (never opacity-0-until-hover, never permanently-red). First click ARMS (the cell grows
         // to a reddened "delete?"), a second confirms. RESERVES the armed width so arming never reflows
         // the name. The TouchArea is always live (no invisible-but-clickable corner).
+        // The slot is a FIXED 58px — the armed "delete?" width — whether armed or not, and its
+        // TouchArea owns the whole slot. The pill inside grows into it. This is what stops the
+        // confirm window from turning into a footgun: the cell used to be 22px at rest and 58px
+        // armed, so when the 2.5s window expired the pixels that had just read "delete?" became
+        // plain row, and a second click meant to confirm a delete APPLIED the profile instead.
+        // Live-reproduced. A wider quiet target is also simply easier to hit.
         VerticalLayout {
             alignment: center;
             Rectangle {
-                width: root.armed ? 58px : 22px;
+                width: 58px;
                 height: 22px;
-                border-radius: Theme.radius-sm;
-                background: root.armed ? Theme.danger.with-alpha(0.15) : (dta.has-hover ? Theme.well : transparent);
-                border-width: Theme.hair;
-                border-color: root.armed ? Theme.danger : transparent;
-                animate width, background, border-color { duration: Theme.quick; }
-                Text {
-                    text: root.armed ? "delete?" : "\u{00d7}";
-                    // faint at rest, danger on hover / while armed — the shared faint↔danger fade.
-                    color: (root.armed || dta.has-hover) ? Theme.danger : Theme.text-faint;
-                    font-family: Theme.mono; font-size: Theme.fs-small; font-weight: 700;
-                    horizontal-alignment: center; vertical-alignment: center;
-                    animate color { duration: Theme.quick; }
-                }
                 dta := TouchArea {
                     mouse-cursor: MouseCursor.pointer;
                     clicked => { if (root.armed) { root.confirm-delete(); } else { root.arm-delete(); } }
+                }
+                Rectangle {
+                    x: parent.width - self.width;
+                    width: root.armed ? 58px : 22px;
+                    height: 22px;
+                    border-radius: Theme.radius-sm;
+                    background: root.armed ? Theme.danger.with-alpha(0.15) : (dta.has-hover ? Theme.well : transparent);
+                    border-width: Theme.hair;
+                    border-color: root.armed ? Theme.danger : transparent;
+                    animate width, background, border-color { duration: Theme.quick; }
+                    Text {
+                        text: root.armed ? "delete?" : "\u{00d7}";
+                        // faint at rest, danger on hover / while armed — the shared faint↔danger fade.
+                        color: (root.armed || dta.has-hover) ? Theme.danger : Theme.text-faint;
+                        font-family: Theme.mono; font-size: Theme.fs-small; font-weight: 700;
+                        horizontal-alignment: center; vertical-alignment: center;
+                        animate color { duration: Theme.quick; }
+                    }
                 }
             }
         }
@@ -109,6 +182,15 @@ export component ProfilesMenu inherits VerticalLayout {
     property <int> rule-profile-idx: 0;
     // name-keyed delete arming (an index can drift when the model refreshes mid-arm)
     property <string> armed-delete: "";
+    // name-keyed rename target, same reasoning
+    property <string> renaming: "";
+    // The sheet is built once and reopened, so a rename left open (or a delete left armed) would
+    // still be there next time. Closing it is the "never mind" gesture — reset both. Mirrored into
+    // a local property because `changed` needs one it owns.
+    property <bool> sheet-open: State.profile-sheet-open;
+    changed sheet-open => {
+        if (!self.sheet-open) { root.renaming = ""; root.armed-delete = ""; }
+    }
     Timer {
         interval: Theme.confirm-window;
         running: root.armed-delete != "";
@@ -144,10 +226,35 @@ export component ProfilesMenu inherits VerticalLayout {
             for p in State.profiles : ProfileMenuRow {
                 p: p;
                 armed: root.armed-delete == p.name;
+                renaming: root.renaming == p.name;
                 apply => { root.armed-delete = ""; State.apply-profile(p.name); State.profile-sheet-open = false; }
                 arm-delete => { root.armed-delete = p.name; }
                 confirm-delete => { root.armed-delete = ""; State.delete-profile(p.name); }
+                begin-rename => { root.armed-delete = ""; root.renaming = p.name; }
             }
+        }
+        // RENAME — one editor for the whole list, shown only while a row is picked. It sits here,
+        // not in the row, because creating an edit field inside the row that was just clicked
+        // replaces the subtree the click is still travelling through, and Slint panics on that.
+        if root.renaming != "" : HorizontalLayout {
+            spacing: 8px;
+            VerticalLayout { alignment: center; Mono { text: "rename to"; color: Theme.accent-dim; } }
+            ren := Field {
+                field-width: 220px;
+                text: root.renaming;
+                accepted(t) => {
+                    if (t != "") { State.rename-profile(root.renaming, t); }
+                    root.renaming = "";
+                }
+            }
+            Button {
+                text: "rename";
+                primary: true;
+                enabled: ren.text != "";
+                clicked => { State.rename-profile(root.renaming, ren.text); root.renaming = ""; }
+            }
+            Button { text: "cancel"; clicked => { root.renaming = ""; } }
+            Rectangle {}
         }
         // the live device read-back a capture freezes — the dpi/polling/brightness/lighting you already
         // dialed in on the Device and Lighting pages, surfaced so a capture is a confirmation, not data
@@ -236,7 +343,8 @@ export component ProfilesMenu inherits VerticalLayout {
                     background: Theme.well;
                     border-width: Theme.hair;
                     property <bool> routing: i == State.active-app-rule;
-                    border-color: self.routing ? Theme.accent-line : Theme.line;
+                    border-color: r.dangling ? Theme.danger.with-alpha(0.5)
+                        : (self.routing ? Theme.accent-line : Theme.line);
                     animate border-color { duration: Theme.quick; }
                     rowta := TouchArea {}   // row-level hover so the delete stays quiet at rest
                     HorizontalLayout {
@@ -256,7 +364,11 @@ export component ProfilesMenu inherits VerticalLayout {
                             color: rr.routing ? Theme.accent : Theme.text-faint;
                             animate color { duration: Theme.quick; }
                         }
-                        Mono { text: r.profile; color: Theme.text-mid; overflow: elide; }
+                        // a route whose target profile is gone can never fire — say so on the row
+                        // instead of rendering it identically to a working one and failing silently
+                        // at focus-switch time.
+                        Mono { text: r.profile; color: r.dangling ? Theme.danger : Theme.text-mid; overflow: elide; }
+                        if r.dangling : Mono { text: "gone"; color: Theme.danger; font-size: Theme.fs-small; }
                         // delete — the ONE idiom: an always-visible quiet ✕ (faint) that brightens to
                         // danger on hover, TouchArea always live (no opacity-0-until-hover corner).
                         VerticalLayout {
@@ -267,6 +379,55 @@ export component ProfilesMenu inherits VerticalLayout {
                 }
             }
             if State.app-rules.length == 0 : Mono { text: "no rules yet · match a focused app to a profile"; color: Theme.text-faint; }
+            // WHEN NOTHING MATCHES — the other half of auto-switching. Without a fallback the last
+            // profile a rule applied stays on after you close the game, which is why your DPI was
+            // still at 400 in the browser. Off by default: neuron doesn't start switching profiles
+            // on you until you name the one to come back to.
+            if State.profiles.length > 0 : Rectangle {
+                height: Theme.row-h-sm;
+                border-radius: Theme.radius-sm;
+                background: Theme.well;
+                border-width: Theme.hair; border-color: Theme.line;
+                HorizontalLayout {
+                    padding-left: 11px; padding-right: 7px; spacing: 8px;
+                    VerticalLayout {
+                        alignment: center;
+                        // lit only when the fallback is BOTH in play (no rule matched) and
+                        // resolvable — a fallback naming a profile that's gone is not routing
+                        // anything, so it must not read as a closed contact.
+                        Rectangle {
+                            width: Theme.dot; height: Theme.dot; border-radius: Theme.dot / 2;
+                            background: State.active-app-rule == -1 && State.fallback-index > 0 ? Theme.accent : Theme.line;
+                            animate background { duration: Theme.quick; }
+                        }
+                    }
+                    VerticalLayout { alignment: center; Mono { text: "anything else"; color: Theme.text-faint; } }
+                    // apps.toml names a fallback that isn't a readable profile (hand-edited, or the
+                    // file went bad). The picker resolves by name, so it would have quietly shown
+                    // "stay put" while the setting on disk said otherwise.
+                    if State.default-profile != "" && State.fallback-index == 0 : VerticalLayout {
+                        alignment: center;
+                        Mono { text: "'" + State.default-profile + "' is gone"; color: Theme.danger; font-size: Theme.fs-small; overflow: elide; }
+                    }
+                    Rectangle {}
+                    VerticalLayout {
+                        alignment: center;
+                        Mono {
+                            text: "→";
+                            color: State.active-app-rule == -1 && State.fallback-index > 0 ? Theme.accent : Theme.text-faint;
+                            animate color { duration: Theme.quick; }
+                        }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        Picker {
+                            options: State.fallback-options;
+                            index: State.fallback-index;
+                            changed(i) => { State.set-default-profile(i == 0 ? "" : State.profile-names[i - 1]); }
+                        }
+                    }
+                }
+            }
             // add a rule — gated on having a profile to route to (no dead-end picker). The existing
             // rules above render unconditionally, so they stay deletable even with zero profiles.
             if State.profiles.length > 0 : VerticalLayout {

@@ -77,7 +77,9 @@ mod tests {
     /// under the directory containing the current executable.
     #[test]
     fn run_root_honors_env_override_and_falls_back_to_exe_dir() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let prev = std::env::var_os("NEURON_RUN_DIR");
 
         let tmp = std::env::temp_dir().join(format!("neuron_runroot_{}", std::process::id()));

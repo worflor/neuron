@@ -153,7 +153,7 @@ the trigger side, up close: everything you can make *fire* an action, from a pla
 
 releasing one input drops only *its* layer, so two held layers don't stomp each other. this is the fix razer never shipped.
 
-**app-aware switching** is a tiny read-only query of the foreground exe (no hooks): a rule like `valorant → game profile` fires on `valorant.exe` by substring. it's just an `AppFocus` trigger feeding a `ProfileSwitch` action. same spine.
+**app-aware switching** is a tiny read-only query of the foreground exe (no hooks): a rule like `valorant → game profile` fires on `valorant.exe` by substring. rules are read top to bottom and the first match wins; name a fallback profile and closing the game puts you back on it, which is the half synapse gets right and most remaps forget.
 
 **the radial menu** is the simple end of spellweaving: hold, flick a direction, release, with a custom hand-motion engine tracking your hand in the air as you cast.
 
@@ -275,11 +275,11 @@ it lives in the tray. the window is built once at startup and just hidden when y
 four sections, because that's what a user actually needs:
 
 - **device**: dpi (with the stage table on the slider), polling, brightness, sniper, battery, and a clearly-marked *gated* shelf for the writes that aren't hardware-confirmed yet.
-- **lighting**: a render of *your* board, generated from what the registry actually knows (rows × cols + device kind). you paint per-key directly on it, and effects run on it with the same frame math the hardware gets. effect tiles with live previews and auto-generated knobs, plus a stack strip for layering. a mouse with a few LEDs falls back to zones, and says so.
+- **lighting**: a render of *your* board, generated from what the registry actually knows (rows × cols + device kind). you paint per-key directly on it, and effects run on it with the same frame math the hardware gets. the catalog below it is split by what actually feeds each look: pure light shows, the ones that react to your typing, and the ones reading a live feed (audio, screen, battery, stream state). every tile plays its own looping preview, says in plain words what it does, and the fed ones carry a chip naming the feed they read. knobs are generated from the effect's own registry entry, and a stack strip handles layering. a mouse with a few LEDs falls back to zones, and says so.
 - **input**: direct binds and spellweaving, sharing one action palette. a lamp lights on each rule when its trigger fires, so you can check a bind just by pressing it.
 - **system**: the gates, migration and the synapse purge, appearance (accents + cast materials), a reliability bench (uptime, worker heartbeats, auto-restart, the crash log), the beacon registry, the mechanical-advantage toggles, notification settings, and the diagnostics bench: nine real probes (enumerate HID, load the registry, round-trip a device, build a lighting frame, resolve the effect engine, assemble the spine, check the macro runtime, load the gesture vault, resolve a mic endpoint), each reported pass, fail, or skip. read-only and always safe to run.
 
-profiles open as a sheet from the header wherever you are, saving and restoring the other sections as one bundle (read back from the live device, not from the sliders).
+profiles open as a sheet from the header wherever you are, saving and restoring the other sections as one bundle (read back from the live device, not from the sliders). a profile is one object: its settings, its lighting stack, and its binds, which are live only while it's the active profile. rename it and its binds and auto-switch rules follow; delete it and they go with it. the profile you're on survives a restart.
 
 ## get it
 
@@ -322,7 +322,7 @@ lighting    effect · run · mirror · keytest · cellsweep · cells
 input       bind · radial · cast · gesture
 macros      macro (list · add · run · check · prelude)
 audio       audio (list · monitor · mic · out)
-profiles    profile (list · show · save · apply · capture · autoswitch)
+profiles    profile (list · show · save · apply · capture · rename · delete · autoswitch)
 migrate     import · import-export · discover [--emit] · adopt [--dry-run]
 instruments twin (knockback: demo · stats · sigil · stage) · pocket
 gui         neuron-app  [--safe · --tray · --purge-synapse · --scan-synapse]
@@ -340,7 +340,7 @@ the layout, so you know where things live: `neuron-core` is the headless engine 
 
 - **a new razer device.** run `neuron discover --emit` and it drops a starter TOML into the run root's `devices/auto/`, which the registry loads at runtime with no recompile (move it to `crates/neuron-core/devices/` to make it a curated def). fill in the command names and matrix dims and you have a device. the limit: a fixed opcode is just data, but a computed payload (a dpi-stage table, a lift-off handshake) or a lighting dialect that isn't the legacy or matrix one needs rust in `writes.rs`. read-back verify guards every write, so a wrong guess fails loud instead of bricking anything.
 - **a lighting effect.** one entry in the pattern registry plus the generator (a `field()` that returns brightness per cell). the factory, the tuning knobs, and the gallery tile all derive from that single entry, and a half-registration won't compile. pure math, fully self-contained, a good first PR.
-- **a preset (a look).** pure data: an existing pattern plus a spectrum. paint fire with an ocean gradient and it's a new look with zero code.
+- **a preset (a look).** pure data: an existing pattern plus a spectrum, a one-line blurb, and the name of the feed it reads (blank if it reads nothing, which also decides its catalog shelf). paint fire with an ocean gradient and it's a new look with zero code.
 - **a protocol adapter for neuron-host.** a small codec that talks to the internal bus. OpenRGB and Chroma REST already exist; wanted next are things like OBS, MQTT, WLED, MIDI. well-scoped, with a capture-and-replay harness to prove it.
 
 ### bigger pieces, if you want to own a real chunk
