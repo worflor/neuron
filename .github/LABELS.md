@@ -4,11 +4,10 @@ Three tiers, hard-capped. Exactly one Tier-1 label and exactly one Tier-2 label
 per issue; Tier-3 labels are zero or more. A script can validate this; an agent
 should.
 
-Neuron's Tier-2 predates the family taxonomy and keeps its own functional map —
-nine areas, a documented exception to the four-area cap the other repos use.
-The Tier-1 and Tier-3 layers below are the same as whisperglass, lore,
-Manifold, Stithy, and WDYM, so the agentic framework routes identically
-everywhere.
+
+This file is the reasoning. [`labels.yml`](labels.yml) is the configuration — the
+same set as data, with colours. 
+
 
 ## Tier 1 — type (exactly one)
 
@@ -38,32 +37,25 @@ everywhere.
 | label | meaning |
 |---|---|
 | `polish` | Small, batchable refinements. Group into one PR when convenient. |
-| `straightforward` | Expected to be clear-cut: low ambiguity, bounded surface, independently verifiable. Routes to lighter model tiers in the agentic framework. Replaces GitHub's "good first issue" framing — the signal is task shape, not newcomer-friendliness. |
+| `straightforward` | Expected to be clear-cut: low ambiguity, bounded surface, independently verifiable. Would route to a lighter  / efficiency model  in an agentic framework. Replaces GitHub's "good first issue" framing — the signal is task shape, not newcomer-friendliness. |
 | `delicate` | Fine-grained work where the details carry the whole result: visual proportion, copy tone, interaction feel. Correctness alone is not success; needs taste and iteration. Routes to stronger tiers. The opposite of `straightforward`. |
 | `freetime capable` | Opt-in for bounded Free Time proposals. Never authorizes merge. |
 | `risky` | Touches HID interception, device write paths, or the python bridge. An agent must stop and ask the owner before implementing; never picked up autonomously. |
-| `autonomously-derived` | The issue originated in an autonomous session (Free Time, heartbeat, unattended run), not from the owner's direct request or interactive work. Provenance of *creation*, not evidence quality. |
+| `autonomously-derived` | The issue originated in an autonomous session (Free Time, a heartbeat/cron job, unattended run), not from a developer's direct request or interactive work. Provenance of *creation*, not evidence quality. |
 | `quality-of-life` | Low priority but nice: tightens an existing loop without changing guarantees. |
 
-Provenance of evidence is not a label (see the note below), but provenance of *session origin* is: it tells the owner which issues were born while nobody was watching, which changes how much to trust the framing before reading.
+Provenance of *evidence* is not a label. Real-usage evidence belongs in the issue
+body — the agent-ready template already mandates it — and a label that should be on
+every well-formed issue distinguishes nothing.
 
-Provenance of evidence is not a label. Real-usage evidence belongs in the issue
-body — the agent-ready template already mandates it — and a label that should be
-on every well-formed issue distinguishes nothing. (The one provenance exception
-is `autonomously-derived` above: it marks *session origin*, not evidence.)
-Priority, if it ever matters, becomes
-its own explicit tier when the need is real, not a smuggled axis with one value.
+Provenance of *session origin* is, and that is what `autonomously-derived` marks: it
+tells the owner which issues were born while nobody was watching, which changes how
+much to trust the framing before reading it.
 
-### Emergent routing, not explicit routing
+Priority is not a label either. If it ever matters it becomes its own explicit tier
+when the need is real, not a smuggled axis with one value.
 
-Model tiers are never labeled on an issue. The framework derives them from the
-label combination: `straightforward` + `area:cli` suggests the lightest tier;
-`straightforward` + `area:app-ui` suggests a mid tier (GUI verification needs a
-desktop loop, not just correctness); no `straightforward`, or `risky` present,
-suggests the strongest tier or a human. The labels carry the shape of the work;
-the delegation policy maps shape to model. Keeping those separate means
-rebalancing model assignments never requires re-tagging issues.
-
+###
 ## Outside the tiers (orthogonal, optional)
 
 | label | meaning |
@@ -81,11 +73,23 @@ not part of the system above.
 1. Every issue carries exactly one Tier-1 and exactly one Tier-2 label.
 2. Tier-3 flags are optional and stack.
 3. `risky` overrides `freetime capable`: if both apply, the agent stops and asks.
-   4. `straightforward` and `delicate` are mutually exclusive: they are opposite
-   ends of one axis. An issue carries at most one.
+4. `straightforward` and `delicate` are mutually exclusive: they are opposite ends
+   of one axis. An issue carries at most one.
 5. New labels are added only when an existing label cannot express the
    distinction without stretching. Tier counts stay capped (4 / 9 / 7); the
    nine areas are the one deliberate exception.
 6. Agents creating issues validate tiers before creating; agents picking work
    filter on Tier 2 + Tier 3 (`freetime capable` and not `risky`) before
    proposing.
+
+## Applying it
+
+```bash
+bash .github/sync-labels.sh --dry-run   # show what would be pushed
+bash .github/sync-labels.sh             # push labels.yml onto the repo
+```
+
+The sync is idempotent and **never deletes**. A label added by hand survives the run
+and is reported at the end as "not in labels.yml" — which is the prompt to either
+write it down or remove it deliberately. Deleting a label silently un-triages every
+issue carrying it, so that stays a decision, not a side effect.

@@ -1,0 +1,21 @@
+# Blank issues stay on. CONTRIBUTING.md explicitly invites "this feels wrong" and
+# "have you thought about X", and neither of those fits a template. Forcing them
+# through one would cost more reports than it would save triage.
+blank_issues_enabled: true
+
+contact_links:
+  - name: The board - what's already up for grabs
+    url: https://github.com/users/worflor/projects/1
+    about: Anything in "Up for grabs" is blessed and ready to claim. Check here before opening a new issue.
+
+  - name: Report a security vulnerability (private)
+    url: https://github.com/worflor/neuron/security/advisories/new
+    about: Anything that lets code on a machine escalate through neuron. Goes straight to the maintainer and stays private until there's a fix - please don't open a public issue for it.
+
+  - name: Ask a question or float an idea
+    url: https://github.com/worflor/neuron/discussions
+    about: "Not sure it's a bug? Wondering if something is meant to work that way? Start here - it keeps the issue tracker to things that are actually actionable."
+
+  - name: How to contribute
+    url: https://github.com/worflor/neuron/blob/main/CONTRIBUTING.md
+    about: The gates your change has to pass, the layout of the tree, and the Windows build gotchas.

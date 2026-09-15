@@ -1,0 +1,110 @@
+# SPDX-FileCopyrightText: 2026 Woflo Labs
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
+# The label set, as data. `.github/LABELS.md` explains WHY the taxonomy is shaped
+# this way; this file is what the repo is actually configured to. When they
+# disagree, one of them is a bug.
+#
+# Apply with:
+#   gh label create <name> --color <color> --description <desc> --force
+# or run the sync block at the bottom of LABELS.md.
+#
+# COLOUR IS A TIER SIGNAL, not decoration. Scanning an issue list, you should be
+# able to read the three tiers apart without reading the words:
+#   * tier 1 (type)  — saturated, one distinct hue each. The loudest thing.
+#   * tier 2 (area)  — one neutral slate for all nine. A filter, not an alarm.
+#   * tier 3 (flags) — pale. They modify; they don't compete. The single
+#                      exception is `risky`, which is a stop sign and looks like one.
+
+tier1:
+  - name: bug
+    color: D73A4A
+    description: Existing behavior is broken.
+  - name: enhancement
+    color: A2EEEF
+    description: New behavior.
+  - name: rework
+    color: D4C5F9
+    description: Existing behavior rebuilt or rebalanced - same spec, better implementation.
+  - name: documentation
+    color: 0075CA
+    description: Docs only.
+
+tier2:
+  - name: area:device
+    color: 57606A
+    description: "Device control: dpi, polling, brightness, battery, side-plate, scroll."
+  - name: area:lighting
+    color: 57606A
+    description: Lighting engine, effects, and presets.
+  - name: area:macros
+    color: 57606A
+    description: Macros, beacons, and the python bridge.
+  - name: area:audio
+    color: 57606A
+    description: "Audio control: mute, gain, output flip."
+  - name: area:host
+    color: 57606A
+    description: "neuron-host protocol hub: the OpenRGB / Chroma bridge."
+  - name: area:app-ui
+    color: 57606A
+    description: GUI / app rendering and UX.
+  - name: area:cli
+    color: 57606A
+    description: neuron-cli front-end.
+  - name: area:core
+    color: 57606A
+    description: neuron-core engine; repo-wide concerns that fit no narrower area.
+  - name: area:cross-platform
+    color: 57606A
+    description: Linux / Mac port and platform seams.
+
+tier3:
+  - name: polish
+    color: C5DEF5
+    description: Small, batchable refinements. Group into one PR when convenient.
+  - name: straightforward
+    color: C6E9C0
+    description: Clear-cut - low ambiguity, bounded surface, independently verifiable.
+  - name: delicate
+    color: F9D0C4
+    description: The details carry the result - needs taste and iteration, not just correctness.
+  - name: freetime capable
+    color: E4D3F5
+    description: Opt-in for bounded Free Time proposals. Never authorizes merge.
+  - name: risky
+    color: E99695
+    description: Touches HID interception, device write paths, or the python bridge - the agent must stop and ask.
+  - name: autonomously-derived
+    color: D3DDE0
+    description: Created during an autonomous session (not owner-directed or interactive).
+  - name: quality-of-life
+    color: F5E6B8
+    description: Low priority but nice - tightens an existing loop without changing guarantees.
+
+orthogonal:
+  - name: epic
+    color: 3E4B9E
+    description: A large, multi-part effort with sub-issues. Still carries its own tier-1 and tier-2.
+  - name: needs-triage
+    color: FBCA04
+    description: Intake state for reported-but-unconfirmed issues. Cleared by triage.
+
+# GitHub mechanics, not taxonomy. Listed so a sync run doesn't delete them.
+plumbing:
+  - name: duplicate
+    color: CFD3D7
+    description: This issue or pull request already exists.
+  - name: invalid
+    color: E4E669
+    description: This doesn't seem right.
+  - name: question
+    color: D876E3
+    description: Further information is requested.
+  - name: wontfix
+    color: FFFFFF
+    description: This will not be worked on.
+  - name: help wanted
+    color: "008672"
+    description: Extra attention is needed.

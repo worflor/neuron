@@ -1,0 +1,27 @@
+# SPDX-FileCopyrightText: 2026 Woflo Labs
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
+# Every path, one owner. This is a one-person project, so CODEOWNERS is not a
+# routing table here - it exists so a contributor's PR auto-requests the review it
+# needs instead of sitting unassigned, and so the paths below are on the record as
+# the ones where a wrong change costs the most.
+
+*                       @worflor
+
+# The three hard invariants in CONTRIBUTING.md live here. A change to any of these
+# paths is `risky` by definition: HID interception, device write paths, the arm
+# gate, and the python bridge.
+/crates/neuron-core/src/writes.rs       @worflor
+/crates/neuron-core/src/intercept.rs    @worflor
+/crates/neuron-core/src/transport/      @worflor
+/crates/neuron-core/src/macros/         @worflor
+/runtime/host/                          @worflor
+
+# Licensing and the contributor agreement.
+/LICENSE.md                             @worflor
+/LICENSES/                              @worflor
+/THIRD-PARTY-NOTICES.md                 @worflor
+
+# The gates themselves.
+/.github/workflows/                     @worflor
