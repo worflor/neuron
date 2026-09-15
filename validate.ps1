@@ -22,8 +22,8 @@
 #                                 #   no-hardware ignored tests. Slow. Run it before a release.
 #   .\validate.ps1 -Locked        # add --locked (CI always does; use it to reproduce a CI run)
 #
-# WHAT IS DELIBERATELY NOT HERE: the hardware probes. Nine tests are #[ignore]d because they
-# need a real device, real audio, or a real elevated tray instance - a live HID probe against
+# WHAT IS DELIBERATELY NOT HERE: the hardware probes and perf benches. Eight tests are #[ignore]d
+# because they need a real device, real audio, a real built exe, or an uncontended CPU - a live HID probe against
 # an attached BlackWidow, a WASAPI loopback that needs sound actually playing, a resident
 # footprint budget that launches the built exe. No runner has any of that, and a green run
 # that silently skipped them would be a lie. `-Mode full` runs the ignored tests that DO work

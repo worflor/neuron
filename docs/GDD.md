@@ -62,6 +62,8 @@ first, the part that makes any of it possible: how neuron reaches a protected de
 
 the bread and butter: DPI (a single value or the full stage cycle), polling rate, brightness, idle/sleep timer, scroll stage, lift-off distance, onboard-storage accounting, battery and charge state. reads decode the device's own bytes and match synapse byte-for-byte: DPI comes back as a big-endian X/Y pair, the onboard pool reports the same "% remaining" math synapse shows (`free = available + recycle`).
 
+the naga's thumb grid can be remapped **on the device itself**: `neuron remap --key 5 --to g` makes the physical button emit `g` at the source, one keystroke with no host injection and no double-send, which is exactly how synapse does it. every write is round-trip verified against the device's own readback. it's volatile, though: the remap holds while neuron keeps the mouse in driver mode, and the mouse falls back to its onboard profile when no host is present. saving a remap into onboard memory has no known opcode yet.
+
 some of it the device just *volunteers*. press the onboard DPI button, toggle the scroll stage, or snap a magnetic side-plate onto a Naga and the mouse pushes its own HID report saying so; neuron hears it on a separate read channel and turns it into a live readout, the same instant-OSD path synapse listens on without polling.
 
 polling covers both the legacy divisor path (1000/500/250/125 Hz) and the hi-res "HyperPolling" path up to 8000 Hz where the device exposes it. DPI stages write the whole table at once (`0x04/0x06`, openrazer-confirmed, verified live on a Naga V2 Pro) with a chosen active stage. sniper / on-the-fly DPI (a hold-to-drop-to-precision binding razer never put on MY mouse) is here too.

@@ -93,6 +93,18 @@ changed — a docs-only push skips the build jobs. Lint is deliberately advisory
 reasoning is in the script next to the command, along with what would have to happen
 for it to become a gate.
 
+**On Linux or macOS**, install PowerShell 7 and run the seams lane instead:
+
+```bash
+pwsh ./validate.ps1 -Mode seams
+```
+
+That is the only mode that works off Windows. Plain `validate.ps1` tests the whole
+workspace, and `neuron-app` does not compile off Windows yet (its overlay instruments are
+still Win32-only). The seams lane checks the crates that do port and runs the rustfmt
+advisory, which is exactly what CI's Linux job runs. Say in your PR that the Windows suite
+was not run locally, and CI will run it.
+
 ### Do not
 
 - **Do not run `cargo fmt --all`.** The source is hand-formatted and no

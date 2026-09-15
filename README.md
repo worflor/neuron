@@ -139,16 +139,20 @@ neuron macro prelude                 the `neuron` module reference (ctx + helper
 <details>
 <summary><b>the full command tree</b> (every subcommand takes <code>--help</code>)</summary>
 
+every name is a top-level command: `neuron dpi`, never `neuron device dpi`. the left column is just a grouping. a name followed by `( … )` takes a subcommand of its own, so it's `neuron profile apply`, `neuron lighting effect`.
+
 ```
-device      list · info · battery · dpi · polling · dpi-stages · scroll ·
-            brightness · sniper · lod · storage · mode · backup · verify · watch · probe
-lighting    effect · run · mirror · keytest · cellsweep · cells
-input       bind · radial · cast · gesture
+device      list · info · battery · dpi · dpi-stages · polling · scroll · brightness ·
+            sniper · lod · storage · mode · game-mode · remap · backup · verify · watch · probe
+lighting    lighting (run · effect · mirror · keytest · cellsweep · cells)
+input       bind (list · init) · radial (map · pick) · cast (show · init · run) ·
+            gesture (selftest · record · match · list · tune) · run [--safe]
 macros      macro (list · add · run · check · prelude)
 audio       audio (list · monitor · mic · out)
 profiles    profile (list · show · save · apply · capture · rename · delete · autoswitch)
 migrate     import · import-export · discover [--emit] · adopt [--dry-run]
-instruments twin (knockback: demo · stats · sigil · stage) · pocket
+instruments twin (demo · stats · sigil · stage) · pocket
+diagnostics prof (pump)
 gui         neuron-app  [--safe · --tray · --purge-synapse · --scan-synapse]
 ```
 
@@ -158,7 +162,7 @@ gui         neuron-app  [--safe · --tray · --purge-synapse · --scan-synapse]
 
 neuron is one person, one desk, one vendor gone deep. that's the point, but it also means a handful of pieces are wide open, and some are shaped so you can own one cleanly without reading the whole tree.
 
-the honest map of what's pickable — a new razer device (a TOML file, not a recompile), a lighting effect (one registry entry plus a `field()` generator), a preset (pure data, zero code), a neuron-host protocol adapter, or one of the bigger chunks like the linux/mac port — is in **[CONTRIBUTING.md](CONTRIBUTING.md)**, graded by how much groundwork is already done. the board, **[neuron · orbit](https://github.com/users/worflor/projects/1)**, is the front door: anything in *Up for grabs* is blessed and ready to claim.
+the honest map of what's pickable — a new razer device (a TOML file, not a recompile), a lighting pattern (one registry entry plus a `field()` generator), a preset (pure data, zero code), a neuron-host protocol adapter, or one of the bigger chunks like the linux/mac port — is in **[CONTRIBUTING.md](CONTRIBUTING.md)**, graded by how much groundwork is already done. the board, **[neuron · orbit](https://github.com/users/worflor/projects/1)**, is the front door: anything in *Up for grabs* is blessed and ready to claim.
 
 new to the tree entirely? **[AGENTS.md](AGENTS.md)** is the fast orientation — the layout, the three hard invariants, and what "verified" has to mean here before you claim it.
 
@@ -187,9 +191,10 @@ every device write is sorted by how sure i am of it:
 | dpi-stage table · scroll-stage select | **wire-confirmed** off synapse (USBPcap) + round-tripped |
 | symmetric lift-off distance | **proven**: reads back clean on the Naga |
 | asymmetric lift-off distance (split lift/landing) | **proven**: set/read round-trip on the Naga (the `0x0B/0x85` getter echoes mode=async + the lift/landing pair; the physical split confirmed by feel) |
-| idle/sleep timer | **proven**: set/read round-trip on the naga (write echoes back on the getter); ships behind the default-on `idle-power-write` feature |
+| idle/sleep timer | **proven**: set/read round-trip on the naga (write echoes back on the getter); behind the `idle-power-write` feature, which both shipped binaries turn on (a bare `neuron-core` library build leaves it off) |
+| thumb-grid button remap (`neuron remap`) | **proven**: reverse-engineered live on the Naga V2 Pro (class `0x15`), every write round-trip verified against the `15/82` getter. device-side and **volatile**: it holds while neuron keeps the mouse in driver mode, and the mouse falls back to its onboard profile without a host |
 | in-game hi-res polling · scroll *stage* table · snap-tap (SOCD) | **gated** behind `NEURON_*_WRITE` until a capture confirms; payloads unit-tested, still read-back-verified |
-| debounce · onboard button-remap | **no known opcode**: bails with a "needs RE" note, never a blind write |
+| debounce · saving a button remap into onboard memory | **no known opcode**: bails with a "needs RE" note, never a blind write |
 
 things it flat-out doesn't do, so you know before you install:
 
