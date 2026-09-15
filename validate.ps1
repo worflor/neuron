@@ -41,7 +41,15 @@ Push-Location $RepoRoot
 # In CI, --locked is non-negotiable: a PR must not silently drift the dependency graph.
 # Locally it is opt-in, because a mid-change Cargo.toml edit shouldn't hard-fail your loop.
 if ($env:CI) { $Locked = $true }
-$lock = if ($Locked) { @('--locked') } else { @() }
+
+# MUST be a plain assignment, not `$lock = if (...) { @('--locked') } else { @() }`. An `if`
+# used as an expression UNROLLS a single-element array to its element, so $lock would come
+# back a [String], and splatting a string with @lock explodes it one character at a time:
+# cargo receives '-', '-', 'l', 'o', 'c', 'k'... and dies on "unexpected argument '-'".
+# Assignment preserves the array type; the expression form does not. This only ever bites
+# when --locked is actually present, which is to say: only in CI.
+$lock = @()
+if ($Locked) { $lock = @('--locked') }
 
 $script:Failures = @()
 $script:Advisories = @()
