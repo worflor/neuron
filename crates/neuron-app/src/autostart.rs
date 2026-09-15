@@ -215,7 +215,7 @@ pub fn set(enabled: bool) -> String {
             msg
         }
         Err(err) if err.to_lowercase().contains("denied") => {
-            "autostart needs the elevated instance — start Neuron via the tray task and retry"
+            "autostart needs admin rights: restart Neuron with Run as administrator, then turn this on again"
                 .into()
         }
         Err(err) => format!("failed to update the startup task: {err}"),
