@@ -1880,6 +1880,17 @@ export component Disclosure inherits Rectangle {
         }
     }
     dta := TouchArea {
+        // Pinned explicitly to root's own box rather than relying on TouchArea's implicit
+        // "100% of parent" default. root is a Rectangle WITH children (the HorizontalLayout
+        // above), and it only pins `height` — not `width` — so its own resolved width comes
+        // from the enclosing VerticalLayout's stretch, one indirection away. Every other
+        // whole-row hit target in this file (SelectableRow's sr-ta, etc.) sizes the same way
+        // dta now does: bound straight to the row's own geometry, no implicit default in the
+        // chain, so the click surface can't silently end up narrower than the visible row.
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
         mouse-cursor: MouseCursor.pointer;
         clicked => { root.toggled(); }
     }
