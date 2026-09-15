@@ -4,22 +4,16 @@
 
 # Cut a release ZIP.
 #
-# WHEN THIS RUNS — deliberately narrow:
-#   * you push a version tag (`v0.1.0`, `v0.2.0-mk1`, …), or
-#   * you press the button in the Actions tab (`workflow_dispatch`).
-# NOT on push to main. NOT on pull requests. An ordinary commit does not become a release; `ci.yml`
-# is what runs on every commit.
+# Runs only on a pushed version tag (`v0.1.0`, `v0.2.0-mk1`, …) or a manual
+# `workflow_dispatch` - never on push to main or on pull requests; `ci.yml` covers those.
 #
-# It also opens the release as a DRAFT: nothing is publicly visible until you read it over and
-# click publish. A tag you pushed by accident costs you a delete, not a retraction. Flip `--draft`
-# below if you ever want it to publish straight away.
+# Opens the release as a draft: nothing is publicly visible until reviewed and published.
+# Flip `--draft` below to publish straight away.
 #
-# NO CODE SIGNING, on purpose. A standard OV certificate now needs hardware-token or cloud-HSM
-# storage (a few hundred a year) and STILL does not clear SmartScreen — that reputation accrues by
-# download volume either way. So instead of a signature nobody can check, this attaches BUILD
-# PROVENANCE: a cryptographic attestation binding the zip to the exact commit and workflow run that
-# produced it, verifiable by anyone with `gh attestation verify`. It proves where the binary came
-# from, which is the actual question a signature is a proxy for.
+# No code signing: an OV certificate needs hardware-token/cloud-HSM storage and still doesn't
+# clear SmartScreen on its own. Instead this attaches build provenance - a cryptographic
+# attestation binding the zip to the exact commit and workflow run, verifiable with
+# `gh attestation verify` - proving where the binary came from.
 
 name: release
 
@@ -42,23 +36,19 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
-  # STATIC CRT, or the zip doesn't launch on a clean machine. By default a Rust MSVC binary
-  # imports VCRUNTIME140.dll, which is NOT part of Windows. It ships with the Visual C++
-  # Redistributable, which most gaming PCs happen to have and a fresh install often doesn't.
-  # Without it, the user double-clicks and gets a missing-DLL dialog with no explanation.
-  # (Checked: both binaries from a local release build import it.) +crt-static links the
-  # runtime into the exe instead. The api-ms-win-crt-* imports are the Universal CRT, which IS
-  # part of Windows 10+, so those are fine. Scoped to this workflow only, so everyday local
-  # builds and ci.yml's cache are untouched.
+  # Static CRT, or the zip doesn't launch on a clean machine: a Rust MSVC binary otherwise
+  # imports VCRUNTIME140.dll (ships with the VC++ Redistributable, not with Windows itself),
+  # so a fresh install without it gets a missing-DLL dialog. +crt-static links the runtime in
+  # instead; the api-ms-win-crt-* imports are the Universal CRT and are part of Windows 10+.
+  # Scoped to this workflow only, so local builds and ci.yml's cache are untouched.
   RUSTFLAGS: -C target-feature=+crt-static
 
 jobs:
   windows:
     name: windows x86_64
     runs-on: windows-latest
-    # 180, not 60. This runs `-Mode full`: the test compile (measured ~22 min on this runner),
-    # a clippy compile, four feature checks, and a ThinLTO release build, all on 2 cores. 60
-    # would time out, and a timed-out release saves no cache, so it would time out forever.
+    # `-Mode full` runs the test compile, a clippy compile, four feature checks, and a ThinLTO
+    # release build, all on 2 cores - 60 min would time out before that finishes.
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v7
@@ -79,10 +69,10 @@ jobs:
           fi
           echo "tag $tag matches Cargo $cargo_ver"
 
-      # Provenance attestations only work on PUBLIC repos on GitHub's Free, Pro and Team plans.
-      # SOURCE.txt tells users to verify one, so a real tagged release from a private repo
-      # would ship a promise it can't keep. Tag pushes fail fast here instead; a manual test
-      # run (workflow_dispatch) is allowed through and just skips attestation, with a warning.
+      # Provenance attestations only work on public repos. SOURCE.txt tells users to verify
+      # one, so a tagged release from a private repo would ship a promise it can't keep. Tag
+      # pushes fail fast here; a manual test run (workflow_dispatch) skips attestation instead,
+      # with a warning.
       - name: Releases need a public repo
         if: github.event_name == 'push' && github.event.repository.private
         shell: bash
@@ -98,7 +88,7 @@ jobs:
         with:
           cache-on-failure: true # same reason as ci.yml: a failed run must still warm the cache
 
-      # Same cache as ci.yml — build.rs fetches a ~46 MB CPython tarball on a miss.
+      # Same cache as ci.yml - build.rs fetches a ~46 MB CPython tarball on a miss.
       - name: Cache the bundled CPython tarball
         uses: actions/cache@v6
         with:
@@ -116,23 +106,21 @@ jobs:
             echo "version=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
           fi
 
-      # The gates run against a release too - a tag must not be able to ship something main
-      # wouldn't accept. It runs the FULL pass rather than the per-push one: a release is the
-      # one moment worth paying for the feature matrix (every gated device write still
-      # compiles) and the no-hardware ignored tests. Same script a contributor runs locally,
-      # so there is exactly one definition of "validated" in this repo.
+      # The gates run against a release too - a tag must not ship something main wouldn't
+      # accept. Runs the full pass (feature matrix + no-hardware ignored tests), the same
+      # script a contributor runs locally.
       - name: validate (full)
         shell: pwsh
         run: ./validate.ps1 -Mode full
 
-      # -Mode full already produced the release binaries; this is a cached no-op that exists
-      # so the packaging step below never depends on that implementation detail.
+      # -Mode full already produced the release binaries; this is a cached no-op so the
+      # packaging step below never depends on that implementation detail.
       - name: build
         run: cargo build --release --workspace --locked
 
-      # STAGE THE ZIP. The license bundle ships WITH the binary, not just in the repo: neuron is
-      # GPL-3.0-or-later, so a binary release carries its terms and a durable pointer back to the
-      # exact source it was built from. That is also the promise the README already makes.
+      # Stage the zip. The license bundle ships with the binary, not just in the repo: neuron
+      # is GPL-3.0-or-later, so a binary release carries its terms and a pointer back to the
+      # exact source it was built from.
       - name: Stage the package
         shell: bash
         run: |
@@ -169,8 +157,8 @@ jobs:
           $h = (Get-FileHash "dist/$env:name.zip" -Algorithm SHA256).Hash.ToLower()
           "$h  $env:name.zip" | Out-File -FilePath "dist/SHA256SUMS.txt" -Encoding utf8
 
-      # The $0 answer to "is this really your binary": signed provenance tying the artifact to
-      # this commit + this workflow. Verify with `gh attestation verify <zip> --repo <owner/repo>`.
+      # Signed provenance tying the artifact to this commit + this workflow. Verify with
+      # `gh attestation verify <zip> --repo <owner/repo>`.
       - name: Attest build provenance
         if: ${{ !github.event.repository.private }}
         uses: actions/attest-build-provenance@v4

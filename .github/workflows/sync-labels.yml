@@ -4,15 +4,14 @@
 
 # Push .github/labels.yml onto the repo's labels whenever it changes on main.
 #
-# labels.yml is the configuration of record, but until now applying it was a manual step, and
-# a manual step is exactly how config and reality drift apart. This removes the step. It runs
-# the same script you'd run by hand, so there's still exactly one implementation.
+# labels.yml is the configuration of record; this runs the same sync-labels.sh you'd run by
+# hand, so there's exactly one implementation.
 #
-# Safe to run on every change: the sync is idempotent and NEVER deletes a label. A label that
-# exists on GitHub but not in the file is reported in the run log, not removed.
+# Safe on every change: the sync is idempotent and never deletes a label. A label that exists
+# on GitHub but not in the file is reported in the run log, not removed.
 #
-# It is a few seconds on linux, and ci.yml's gate treats these files as non-code, so editing
-# labels never triggers a windows build.
+# A few seconds on linux, and ci.yml's gate treats these files as non-code, so editing labels
+# never triggers a windows build.
 
 name: sync-labels
 

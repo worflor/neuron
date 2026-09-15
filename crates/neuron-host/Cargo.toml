@@ -6,10 +6,9 @@
 # declaration journal, damped restart governor, host shell, and protocol
 # adapters (pure state machines; sockets live in the process shell).
 #
-# KERNEL modules (arbiter/bus/journal/governor/shell/writer) are PURE STD:
-# deterministic state machines, exhaustively unit-tested with injected clocks.
-# Adapters may use the ALREADY-DECLARED workspace deps (serde/serde_json for
-# the Chroma REST JSON bodies) — no NEW workspace dependencies introduced.
+# Kernel modules (arbiter/bus/journal/governor/shell/writer) are pure std: deterministic
+# state machines, unit-tested with injected clocks. Adapters may use already-declared
+# workspace deps (serde/serde_json for the Chroma REST JSON bodies); no new ones introduced.
 # Deps are added deliberately and sparingly: new code should not mean new deps.
 [package]
 name = "neuron-host"
@@ -29,9 +28,9 @@ serde_json = { workspace = true }
 neuron = { path = "../neuron-core", optional = true }
 anyhow = { workspace = true, optional = true }
 
-# Win32 FFI for the Chroma SHM server pump (create the named objects, read the
-# device buffers). Already used by neuron-core; only compiled on Windows and
-# only when the `bridge` feature is on — the pure protocol codec needs none of it.
+# Win32 FFI for the Chroma SHM server pump (create the named objects, read the device
+# buffers). Only compiled on Windows and only when `bridge` is on; the pure protocol codec
+# needs none of it.
 [target.'cfg(windows)'.dependencies.windows-sys]
 version = "0.59"
 optional = true
@@ -46,9 +45,8 @@ features = [
 ]
 
 [features]
-# Real-hardware bridge: registry discovery -> surfaces, HID frame sinks
-# behind the single writer. Off by default; the kernel + adapters build
-# and test with zero deps beyond serde.
+# Real-hardware bridge: registry discovery -> surfaces, HID frame sinks behind the single
+# writer. Off by default; the kernel + adapters build and test with zero deps beyond serde.
 bridge = ["dep:neuron", "dep:anyhow", "dep:windows-sys"]
 
 [[example]]
@@ -68,7 +66,7 @@ proptest = "1"
 static_assertions = "1.1"
 serde_json = "1"
 neuron-testkit = { path = "../neuron-testkit" }
-# Test builds sever the wire: `mock-transport` compiles neuron-core's transport policy into this
-# crate's test binary, and the ctor hook in lib.rs denies hardware before any test runs.
+# `mock-transport` compiles neuron-core's transport policy into this crate's test binary;
+# the ctor hook in lib.rs denies hardware before any test runs.
 neuron = { path = "../neuron-core", features = ["mock-transport"] }
 ctor = "0.2"

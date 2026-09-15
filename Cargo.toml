@@ -45,21 +45,15 @@ cpal = "0.15"
 
 # Lean by design: the anti-Synapse should be a small static binary.
 #
-# panic = "unwind" (NOT abort) is a LIFECYCLE decision: with abort, any Rust panic anywhere
-# kills the resident app instantly — no Drop guards (device handles, cursor locks, click-guard
-# disarm, gated-write restore), no catch_unwind shells, no graceful teardown. For an app whose
-# whole ethos is "never leave the desk in a state you didn't ask for", unwinding is worth the
-# ~small size cost. The panic hook still logs every panic to neuron-crash.log.
+# panic = "unwind" (not abort): with abort, any panic anywhere kills the resident app
+# instantly - no Drop guards (device handles, cursor locks, click-guard disarm, gated-write
+# restore), no catch_unwind shells, no graceful teardown. Worth the size cost. The panic hook
+# still logs every panic to neuron-crash.log.
 [profile.release]
-# Tuned for a 12-thread build that still optimizes hard. The old config (opt-level="z" + fat
-# `lto=true` + codegen-units=1) bought a SINGLE-THREADED finale: fat LTO merges all bitcode into
-# one module and optimizes it serially, and cgu=1 gives that stage nothing to parallelize — so 11
-# of 12 threads idled through the slowest phase. ThinLTO does the SAME cross-module inlining via a
-# parallel summary/call-graph index (each module optimized concurrently), landing within ~1-3% of
-# fat LTO's runtime, while cgu=16 unleashes that parallelism. opt-level 3 (speed, not "z" size)
-# also drops the extra shrink passes. Net: near-identical optimization, the finale now spread
-# across every core. CPU-specific codegen is intentionally opt-in via external RUSTFLAGS, not a
-# repository default, so release artifacts stay portable.
+# ThinLTO does cross-module inlining via a parallel summary/call-graph index (each module
+# optimized concurrently), landing within ~1-3% of fat LTO's runtime while letting cgu=16
+# parallelize across cores (fat LTO + cgu=1 optimizes serially in a single thread). CPU-specific
+# codegen is opt-in via external RUSTFLAGS, not a repository default, so artifacts stay portable.
 opt-level = 3
 lto = "thin"
 strip = true
@@ -79,27 +73,20 @@ lto = "fat"
 strip = true
 codegen-units = 1
 
-# DEBUG builds: incremental compilation is OFF for the whole dev profile. This is the ROOT-CAUSE fix
-# for the recurring `LNK2019: unresolved external symbol anon.*.llvm.*` link failures on this project
-# (they surfaced in UNTOUCHED code — serde-derived `serialize` impls — after unrelated edits, i.e. a
-# codegen artifact, not a source bug). Cause: rustc/MSVC mis-handles OPTIMIZED + INCREMENTAL together
-# — at opt-level 3, LLVM internalizes anonymous constants and shares them across codegen units, and
-# the incremental cache then reuses some CGUs while regenerating others, orphaning the object that
-# DEFINES an `anon.*` symbol while a referencing object still points at it (rust-lang/rust #86049,
-# #45929; the documented fix is "disable incremental for optimized builds"). We optimize `neuron-app`
-# and `neuron` at opt-level 3 in dev (below), so this profile IS an optimized build and hits the bug.
-# `incremental` is profile-scoped (Cargo forbids it under `[profile.dev.package.*]`), so it goes here.
-# Cost is ~nil: at opt-level 3 those two crates barely reused incremental state anyway, and the small
-# opt-0 crates recompile fast — reliability beats the ritual `rm -rf target/debug/incremental`.
+# Incremental is off for the whole dev profile: rustc/MSVC mis-handle optimized + incremental
+# together (LLVM internalizes anonymous constants and shares them across codegen units, and
+# the incremental cache can reuse some CGUs while regenerating others, orphaning an `anon.*`
+# symbol - rust-lang/rust #86049, #45929). `neuron-app` and `neuron` run opt-level 3 in dev
+# (below), so this profile counts as optimized and hits the bug. `incremental` is profile-
+# scoped (Cargo forbids it under `[profile.dev.package.*]`), so it goes here.
 [profile.dev]
 incremental = false
 
-# The overlay composites ~0.5M pixels/frame for a weave; at opt-level 0 the per-pixel bounds-checks
-# and un-vectorized float math run ~6–7x slower than release (measured on a large radial cast:
-# ~140ms/frame debug vs ~22ms release), which makes the spellweave crawl in a `cargo run` build.
-# Optimizing ONLY `neuron-app` (overlay + weave) and `neuron` (engine math) keeps the debug run
-# usable without touching release at all. Everything else — and full debuginfo — stays default, so
-# the rest of the workspace still compiles fast and stays debuggable.
+# The overlay composites ~0.5M pixels/frame for a weave; at opt-level 0 the per-pixel bounds
+# checks and un-vectorized float math run ~6-7x slower than release, making it crawl in a
+# `cargo run` build. Optimizing only `neuron-app` (overlay + weave) and `neuron` (engine math)
+# keeps the debug run usable without touching release; the rest of the workspace stays default
+# (fast compiles, full debuginfo).
 [profile.dev.package.neuron-app]
 opt-level = 3
 

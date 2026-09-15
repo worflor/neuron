@@ -4,37 +4,25 @@
 
 # The gate on every push and pull request.
 #
-# THIS FILE DELIBERATELY CONTAINS NO CARGO COMMANDS. The gates live in `validate.ps1` at the
-# repo root, and both CI and a human run the same script. If CI spelled out its own cargo
-# invocations they would drift from what you run locally, and "it passed on my machine" would
-# stop meaning anything. All this workflow decides is WHICH MODE runs on WHICH RUNNER.
+# This file deliberately contains no cargo commands. The gates live in `validate.ps1` at the
+# repo root, and both CI and a human run the same script, so "it passed on my machine" stays
+# meaningful. This workflow only decides which mode runs on which runner.
 #
 #   .\validate.ps1              <- before you commit
 #   .\validate.ps1 -Mode full   <- the thorough pass, same as the manual "full" run below
 #
-# COST MODEL, because this is a private repo and minutes are real: GitHub bills windows
-# runners at a 2x multiplier and linux at 1x. So the shape here is "let the cheap runner
-# decide whether the expensive one has to wake up at all":
+# Cost model: GitHub bills windows runners at a 2x multiplier and linux at 1x, so a cheap
+# linux `gate` job decides whether the expensive windows job wakes up at all:
 #
-#   gate  (linux, ~10s, 1x)  - did any CODE change?
+#   gate  (linux, ~10s, 1x)  - did any code change?
 #     +-- test  (windows, 2x)  only if code changed
 #     +-- seams (linux,   1x)  only if code changed
 #
-# A docs-only push - which is most of them around a release - costs about six seconds instead
-# of a full windows build plus a linux build.
+# fmt runs on the linux lane (pure parsing, no platform needed); clippy lives in `-Mode full`
+# since it's a second full workspace compile that gates nothing.
 #
-# The previous version also ran fmt and clippy on a SECOND windows runner: paying the 2x
-# multiplier twice to compile the same tree, for two signals that are advisory and cannot
-# block anything. fmt moved to the linux lane, because formatting is pure parsing and needs no
-# platform. clippy moved to `-Mode full`, because it is a whole second compilation of the
-# workspace and running it on every push roughly doubled the cost of the expensive job to
-# learn nothing that gates a merge. Run it before a release, or locally, whenever you want it.
-#
-# WHY A `gate` JOB INSTEAD OF `paths-ignore`: a skipped-by-`if` job still REPORTS, so it
-# satisfies a required status check. A path-filtered workflow simply never runs, and if
-# branch protection is ever turned on (it needs Pro or a public repo, so not yet) every
-# docs-only PR would sit forever waiting for a check that is never coming. This shape cannot
-# develop that problem later.
+# A `gate` job rather than `paths-ignore`: a skipped-by-`if` job still reports, satisfying a
+# required status check, where a path-filtered workflow simply never runs.
 
 name: ci
 
@@ -58,17 +46,15 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
-  # Compilation, not test execution, is the entire cost here: a measured windows run spent
-  # 74 minutes compiling and about 2 minutes running 900-odd tests. Full debuginfo means
-  # generating PDBs for the whole workspace, which is a large slice of that and is worth
-  # nothing to a CI run nobody attaches a debugger to. `line-tables-only` keeps what a
-  # failure actually needs - file and line in the backtrace - and drops the rest.
+  # Compilation, not test execution, is the entire cost here. Full debuginfo means PDBs for
+  # the whole workspace, worth nothing to a CI run nobody attaches a debugger to.
+  # `line-tables-only` keeps file/line in the backtrace and drops the rest.
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
   CARGO_PROFILE_TEST_DEBUG: line-tables-only
 
-  # Incremental compilation is a pessimisation on a fresh runner: it writes a pile of extra
-  # state to speed up the NEXT build, and there is never a next build on a throwaway VM.
-  # (rust-cache sets this too; stated here so it survives the cache action changing.)
+  # Incremental compilation is a pessimisation on a fresh runner: extra state written to speed
+  # up a next build that never happens on a throwaway VM. (rust-cache sets this too; stated
+  # here so it survives the cache action changing.)
   CARGO_INCREMENTAL: 0
 
 jobs:
@@ -88,14 +74,14 @@ jobs:
         run: |
           set -euo pipefail
 
-          # A manual run is always deliberate - never second-guess it.
+          # A manual run is always deliberate.
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "manual run: forcing the full job set"
             echo "code=true" >> "$GITHUB_OUTPUT"; exit 0
           fi
 
           base="${{ github.event.pull_request.base.sha || github.event.before }}"
-          # A brand-new branch reports an all-zero "before" and has nothing to diff against.
+          # A brand-new branch reports an all-zero "before" with nothing to diff against.
           if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
             echo "no usable base ref: assuming code changed"
             echo "code=true" >> "$GITHUB_OUTPUT"; exit 0
@@ -104,7 +90,7 @@ jobs:
           changed="$(git diff --name-only "$base" "${{ github.sha }}")"
           echo "changed files:"; echo "$changed" | sed 's/^/  /'
 
-          # Everything that CANNOT affect a build. Anything not matched here counts as code,
+          # Everything that cannot affect a build. Anything not matched here counts as code,
           # so the failure mode is "ran CI unnecessarily", never "skipped a real change".
           code="$(printf '%s\n' "$changed" | grep -vE \
             -e '(^|/)[^/]+\.md$' \
@@ -130,33 +116,22 @@ jobs:
     needs: gate
     if: needs.gate.outputs.code == 'true'
     runs-on: windows-latest
-    # MEASURED, so nobody has to guess. With a separate `cargo build` in front of `cargo test`
-    # this was 70 min cold and 78 warm - the cache never made it cheap, because
-    # Swatinem/rust-cache caches DEPENDENCIES and deliberately discards local workspace
-    # artifacts, so neuron's own crates recompile every run regardless. Dropping that duplicate
-    # compile (see validate.ps1) brought a warm run to ~21 min.
-    #
-    # 60 is headroom for a COLD run: GitHub evicts a cache nobody touches for 7 days, so the
-    # first push after a break starts from nothing. If a cold run ever does time out,
-    # cache-on-failure below still saves what it built, and the next run finishes.
+    # Swatinem/rust-cache caches dependencies, not neuron's own workspace artifacts, so they
+    # recompile every run regardless; a warm run lands around 21 min. 60 is headroom for a
+    # cold run (GitHub evicts a cache untouched for 7 days). cache-on-failure below still
+    # saves what a timed-out run built, so the next run isn't stuck cold forever.
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      # cache-on-failure is load-bearing, not a nicety. rust-cache only saves on success by
-      # default, so a job that times out saves NOTHING - the next run starts cold, takes just
-      # as long, times out again, and CI is permanently stuck with no way to warm itself.
-      # That is exactly what happened on the first run of this workflow.
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
 
-      # THE NEURON-SPECIFIC ONE. `crates/neuron-core/build.rs` downloads a ~46 MB
-      # python-build-standalone tarball, sha256-checks it against the release manifest, then
-      # embeds it. Uncached, every cold run re-downloads it: slower, and a network dependency
-      # on the critical path of every build (i.e. a flake source unrelated to the code).
+      # `crates/neuron-core/build.rs` downloads a ~46 MB python-build-standalone tarball,
+      # sha256-checks it, then embeds it. Uncached, every cold run re-downloads it.
       - name: Cache the bundled CPython tarball
         uses: actions/cache@v6
         with:
@@ -174,19 +149,13 @@ jobs:
     if: needs.gate.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # This does NOT claim neuron runs on linux. It claims the cross-platform SEAMS still
-    # compile, which is a real thing to protect: the stubs are inert off windows, so nothing
-    # else would notice them rotting until someone actually attempts the port. The excluded
-    # crate and the reasoning live in validate.ps1, next to the command.
+    # Does NOT claim neuron runs on linux - it claims the cross-platform seams still compile.
+    # Excluded crate and reasoning live in validate.ps1, next to the command.
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      # cache-on-failure is load-bearing, not a nicety. rust-cache only saves on success by
-      # default, so a job that times out saves NOTHING - the next run starts cold, takes just
-      # as long, times out again, and CI is permanently stuck with no way to warm itself.
-      # That is exactly what happened on the first run of this workflow.
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true

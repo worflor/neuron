@@ -2,16 +2,13 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
 
-# neuron-app — the resident GUI + tray app (Slint, GPU/femtovg renderer — draws ONLY while the window
-# is shown; tray-hidden = no compute, just a held GL context; event loop alive with no window shown). The ONE long-lived process: tray icon, global hotkey loops,
-# device-runtime daemon, lazily-created Slint window. Depends on neuron-core for all logic
-# (in-process, no IPC).
+# neuron-app — the resident GUI + tray app (Slint, GPU/femtovg renderer — draws only while
+# the window is shown; tray-hidden = no compute, just a held GL context). The one long-lived
+# process: tray icon, global hotkey loops, device-runtime daemon, lazily-created Slint window.
+# Depends on neuron-core for all logic (in-process, no IPC).
 #
 # Dependencies are added here deliberately and sparingly: new code should not mean new deps.
-# The set, and why each one earns its place:
-#   slint + slint-build  — declarative UI; GPU (femtovg) renderer — only draws while the window is
-#                           shown (tray-hidden = no per-frame compute, just a held GL context);
-#                           winit-backed event loop stays alive with no window shown (tray-resident).
+#   slint + slint-build  — declarative UI, GPU (femtovg) renderer.
 #   tray-icon            — the 90%-surface system-tray menu.
 #   global-hotkey        — OS-wide hotkeys (profile quick-switch, HyperShift toggle).
 #   image                — decode the embedded tray icon PNG at startup.
@@ -30,27 +27,26 @@ name = "neuron-app"
 path = "src/main.rs"
 
 [dependencies]
-# idle-power-write: the sleep-timer SET (0x07/0x03) is hardware-confirmed (Naga V2 Pro,
-# 2026-07-02 round-trip), so the app ships with the write enabled; it stays verify-gated
-# (every write re-reads 0x07/0x83 and demands the echo).
+# idle-power-write: the sleep-timer SET (0x07/0x03) is hardware-confirmed on the Naga V2
+# Pro, so the app ships with it enabled; still verify-gated (every write re-reads 0x07/0x83
+# and demands the echo).
 neuron = { path = "../neuron-core", features = ["idle-power-write"] }
-# The protocol host: ownership arbiter + OpenRGB/Chroma servers + the neuron-core
-# bridge (the "bridge" feature pulls in the real HID sinks). This is what lets
-# games (Chroma) and RGB tools (OpenRGB) drive the SAME lighting the app edits,
-# with the app's layer stack as the animated base layer underneath.
+# The protocol host: ownership arbiter + OpenRGB/Chroma servers + the neuron-core bridge
+# (the "bridge" feature pulls in the real HID sinks). Lets games (Chroma) and RGB tools
+# (OpenRGB) drive the same lighting the app edits, with the app's layer stack as the
+# animated base layer underneath.
 neuron-host = { path = "../neuron-host", features = ["bridge"] }
-# strokelab (dev stroke dump) serializes the full eigenmotion bundle as JSON and runs the raw stroke
-# through the engram trajectory codec for the macro+micro oscillator decomposition.
+# strokelab (dev stroke dump) serializes the full eigenmotion bundle as JSON and runs the raw
+# stroke through the engram trajectory codec for the macro+micro oscillator decomposition.
 engram = { path = "../engram" }
 serde.workspace = true
 serde_json = "1"
 toml.workspace = true
 anyhow.workspace = true
-# BOTH renderers compiled: femtovg (GPU) is preferred for the instant-feeling UI on a real GPU, but
-# renderer-software is the fallback so a VM / RDP / headless / bad-driver host (no usable GL context)
-# can still open the window. main.rs selects femtovg-first with a software fallback before the first
-# AppWindow::new(); the winit backend ALSO auto-falls-back to software at window creation if GL init
-# fails — but it can only do that if the software renderer is compiled in, hence this feature.
+# Both renderers compiled: femtovg (GPU) for the instant-feeling UI, renderer-software as
+# fallback so a VM / RDP / headless / bad-driver host (no usable GL context) can still open
+# the window. main.rs selects femtovg-first with a software fallback; winit also auto-falls-
+# back to software at window creation if GL init fails, but only if it's compiled in.
 slint = { version = "1.16", default-features = false, features = ["compat-1-2", "std", "backend-winit", "renderer-femtovg", "renderer-software"] }
 tray-icon = "0.24"
 global-hotkey = "0.8"
@@ -58,9 +54,9 @@ image = { version = "0.25", default-features = false, features = ["png", "gif"] 
 cpal.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-# Lock the main thread's COM apartment to STA before winit/tray-icon/Core-Audio touch COM —
-# winit's OleInitialize needs STA, while tray-icon + neuron-core's audio request MTA. Initializing
-# STA first wins; their later MTA requests fail harmlessly (RPC_E_CHANGED_MODE, ignored) yet work.
+# Lock the main thread's COM apartment to STA before winit/tray-icon/Core-Audio touch COM:
+# winit's OleInitialize needs STA, while tray-icon + neuron-core's audio request MTA.
+# Initializing STA first wins; their later MTA requests fail harmlessly (RPC_E_CHANGED_MODE).
 windows-sys = { version = "0.59", features = [
     "Win32_System_Com",
     "Win32_System_Ole",
@@ -68,22 +64,22 @@ windows-sys = { version = "0.59", features = [
     "Win32_Graphics_Gdi",
     "Win32_Graphics_Dwm",
     "Win32_UI_WindowsAndMessaging",
-    "Win32_UI_Shell",                  # ShellExecuteW — summon LAUNCHES an app (Win+R resolution) when none is open
-    # control center — glance system state (no elevation): net medium + SSID + bluetooth presence
-    "Win32_NetworkManagement_IpHelper",# GetAdaptersAddresses — ethernet vs wifi + the online route
+    "Win32_UI_Shell",                  # ShellExecuteW — summon launches an app (Win+R resolution)
+    # control center: net medium + SSID + bluetooth presence, no elevation
+    "Win32_NetworkManagement_IpHelper",# GetAdaptersAddresses — ethernet vs wifi, online route
     "Win32_NetworkManagement_Ndis",    # IF_OPER_STATUS / NET_LUID (IP_ADAPTER_ADDRESSES struct deps)
     "Win32_Networking_WinSock",        # SOCKET_ADDRESS (IP_ADAPTER_ADDRESSES struct deps)
     "Win32_NetworkManagement_WiFi",    # WlanOpenHandle/QueryInterface — the connected SSID
-    "Win32_Devices_Bluetooth",         # BluetoothFindFirstRadio — is a BT radio present (toggle seam)
-    # lifecycle armor (flight recorder + crash recovery):
+    "Win32_Devices_Bluetooth",         # BluetoothFindFirstRadio — is a BT radio present
+    # crash recovery:
     "Win32_System_Threading",          # GetCurrentThreadId for flight-event attribution
-    "Win32_System_Recovery",           # RegisterApplicationRestart — the OS respawns us after a crash
-    "Win32_System_Diagnostics_Debug",  # SetUnhandledExceptionFilter — native faults leave a breadcrumb
-    "Win32_System_Kernel",             # EXCEPTION_POINTERS/CONTEXT for the SEH breadcrumb filter
-    # synapse purge (settings button): stop the respawning services, then terminate every process
+    "Win32_System_Recovery",           # RegisterApplicationRestart — OS respawns us after a crash
+    "Win32_System_Diagnostics_Debug",  # SetUnhandledExceptionFilter — native faults leave a trace
+    "Win32_System_Kernel",             # EXCEPTION_POINTERS/CONTEXT for the SEH filter
+    # synapse purge: stop respawning services, then terminate every process
     "Win32_System_Diagnostics_ToolHelp", # CreateToolhelp32Snapshot — enumerate live processes by name
     "Win32_System_Services",           # SCM: stop RzActionSvc/Razer Synapse Service/… so they can't respawn
-    "Win32_Security",                  # OpenProcessToken/TokenElevation — are we the elevated SYSTEM-killer
+    "Win32_Security",                  # OpenProcessToken/TokenElevation — are we elevated
 ] }
 
 [build-dependencies]
@@ -91,8 +87,7 @@ slint-build = "1.16"
 
 [dev-dependencies]
 proptest = "1"
-# Test builds sever the wire: `mock-transport` compiles neuron-core's transport policy into this
-# crate's test binary, and the ctor hook in testsupport denies hardware before any test runs —
-# the same deny-by-default neuron-core's own tests get from cfg(test).
+# `mock-transport` compiles neuron-core's transport policy into this crate's test binary; the
+# ctor hook in testsupport denies hardware before any test runs, same as neuron-core's own tests.
 neuron = { path = "../neuron-core", features = ["mock-transport"] }
 ctor = "0.2"

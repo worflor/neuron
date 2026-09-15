@@ -6,10 +6,9 @@
 # Push `.github/labels.yml` onto the repo's label set. Idempotent: `--force` turns
 # create into upsert, so running it twice changes nothing the second time.
 #
-# It NEVER deletes. A label someone added by hand survives a sync and shows up in
-# the "not in labels.yml" report at the end, which is the prompt to either write it
-# down or remove it deliberately. Silent deletion of a label would silently
-# un-triage every issue carrying it.
+# Never deletes. A label added by hand survives a sync and shows up in the "not in
+# labels.yml" report at the end instead, since silent deletion would un-triage every
+# issue carrying it.
 #
 # Usage:  bash .github/sync-labels.sh [--dry-run] [owner/repo]
 set -euo pipefail

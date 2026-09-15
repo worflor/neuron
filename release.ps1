@@ -7,11 +7,11 @@
 # Neuron runs as a tray-resident app launched at login by the Scheduled Task
 # "Neuron (elevated tray)" (RunLevel Highest). Elevation is load-bearing: the native Chroma
 # SHM server creates Global\ shared-memory objects, which need SeCreateGlobalPrivilege - an
-# unelevated instance silently degrades to REST-only. The old HKCU "Run" key launcher is
-# retired for exactly that reason; this script must never re-create it.
+# unelevated instance silently degrades to REST-only. Never recreate the old HKCU "Run" key
+# launcher.
 #
 # The task already points at target\release\neuron-app.exe, so "release" = rebuild that file
-# and bounce the task. Stopping also goes THROUGH the task: an unelevated shell's
+# and bounce the task. Stopping also goes through the task: an unelevated shell's
 # Stop-Process gets Access Denied against the elevated instance.
 #
 # Usage:
@@ -34,9 +34,8 @@ function Write-Step($msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
 
 # 1. Stop any running instance - the elevated one via its task (the only handle an
 #    unelevated shell has on it), then any stray debug/unelevated ones directly.
-#    The exe must be unlocked or the link step fails. Teardown is asynchronous, so POLL
-#    for exit instead of guessing a sleep; only a process that survives both the task-end
-#    and a direct Stop-Process is worth stopping the script over.
+#    The exe must be unlocked or the link step fails. Teardown is asynchronous, so poll
+#    for exit instead of guessing a sleep.
 Write-Step 'Stopping any running Neuron instances'
 if (Get-Process neuron-app, neuron -ErrorAction SilentlyContinue) {
     schtasks /end /tn $TaskName | Out-Null
@@ -76,11 +75,10 @@ if (-not $SkipBuild) {
 
 if (-not (Test-Path $AppExe)) { throw "release binary not found at $AppExe" }
 
-# 3. Relaunch the resident instance THROUGH the task so it comes back elevated.
-#    The task's target is VERIFIED on both sides of the launch: the app itself can re-register
-#    the task from its own exe path (the launch-mode selector), so a debug/dev instance may have
-#    re-pointed it - blindly running the task could resurrect a stale binary and still "see a
-#    neuron-app process". Command check before, executable-path check after; fail loud on both.
+# 3. Relaunch the resident instance through the task so it comes back elevated.
+#    The task's target is verified on both sides of the launch: the app itself can re-register
+#    the task from its own exe path (the launch-mode selector), so a debug/dev instance may
+#    have re-pointed it. Command check before, executable-path check after; fail loud on both.
 if (-not $NoRelaunch) {
     Write-Step "Launching via scheduled task '$TaskName'"
     # no stderr redirect: under EAP=Stop, PS 5.1 wraps redirected native stderr into a
@@ -97,9 +95,7 @@ if (-not $NoRelaunch) {
         Write-Host "    task missing - creating it for the release build"
     }
     if ($needsRepair) {
-        # Re-register at $AppExe, PRESERVING the logon-trigger (autostart) state the task had.
-        # A dev/debug app instance can legitimately re-register the task at its own exe
-        # (the launch-mode selector); release must be able to take startup back.
+        # Re-register at $AppExe, preserving the logon-trigger (autostart) state the task had.
         Write-Step 'Repairing the startup task'
         # XML-escape everything interpolated: Windows paths and account names can legally
         # contain '&' and friends, which would corrupt the task definition.
@@ -157,13 +153,11 @@ $trigger
         Write-Host '    task repaired'
     }
     schtasks /run /tn $TaskName | Out-Null
-    # POLL for the spawn - task-scheduler latency varies (a one-shot 2s check raced it).
-    # The resident-is-release invariant is proven by the CHAIN, not by reading the elevated
-    # process's path (unreadable from an unelevated shell - both Get-Process .Path and WMI
-    # ExecutablePath come back empty across the elevation boundary): every instance was
-    # stopped above, the task's <Command> was verified (or repaired) to be $AppExe, and a
-    # process appeared after /run - so the survivor is the task's spawn of the release exe.
-    # Readable paths DO exist for unelevated strays; any of those not at $AppExe fails loud.
+    # Poll for the spawn - task-scheduler latency varies. The resident-is-release invariant is
+    # proven by the chain, not by reading the elevated process's path (Get-Process .Path and
+    # WMI ExecutablePath both come back empty across the elevation boundary): every instance
+    # was stopped above, the task's <Command> was verified/repaired to $AppExe, and a process
+    # appeared after /run. Readable paths do exist for unelevated strays; those fail loud.
     $deadline = (Get-Date).AddSeconds(15)
     do {
         Start-Sleep -Milliseconds 500

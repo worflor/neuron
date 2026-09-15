@@ -17,9 +17,9 @@ license-file.workspace = true
 authors.workspace = true
 repository.workspace = true
 publish.workspace = true
-# Bundles a private CPython into the binary: build.rs downloads (and sha256-verifies against the
-# release's SHA256SUMS manifest) a python-build-standalone tarball for the build target, caches it
-# under vendor/pbs-cache/, and hands its path to the crate via NEURON_PY_TARBALL, which
+# Bundles a private CPython into the binary: build.rs downloads (sha256-verified against the
+# release's SHA256SUMS manifest) a python-build-standalone tarball for the build target, caches
+# it under vendor/pbs-cache/, and hands its path via NEURON_PY_TARBALL, which
 # macros/pyruntime.rs `include_bytes!`s. No system Python dependency at runtime.
 build = "build.rs"
 
@@ -28,34 +28,32 @@ name = "neuron"
 path = "src/lib.rs"
 
 [features]
-# Compile-time gate for the HyperScroll (class 0x0B) stage WRITE in writes.rs. The byte layout is
-# a structural reconstruction not yet confirmed on hardware, so the write is off by default. Enable
-# with `--features hyperscroll-write` once the round-trip is verified on the Naga. (The
-# `NEURON_HYPERSCROLL_WRITE` env var is kept as a runtime escape hatch so the write can be probed
-# without a rebuild — either gate opens it.)
+# Compile-time gate for the HyperScroll (class 0x0B) stage write in writes.rs. Byte layout is
+# a structural reconstruction, not yet confirmed on hardware, so off by default. Enable with
+# `--features hyperscroll-write` once verified on the Naga (or `NEURON_HYPERSCROLL_WRITE` at
+# runtime, to probe without a rebuild).
 hyperscroll-write = []
-# Enables the failpoint registry (src/failpoint.rs) in NON-test builds — e.g. a chaos/soak binary
-# that wants fault injection against release-shaped code. Regular `cargo test` builds get the
-# registry via cfg(test) without this; release builds without it compile every failpoint to nothing.
+# Enables the failpoint registry (src/failpoint.rs) in non-test builds, e.g. a chaos/soak
+# binary that wants fault injection against release-shaped code. `cargo test` gets the registry
+# via cfg(test) without this; release builds without it compile every failpoint to nothing.
 failpoints = []
-# Compile-time gate for the LED idle/power-timeout WRITE (0x07/0x03, writes.rs::set_idle_secs).
-# Both directions are hardware-confirmed on the Naga V2 Pro (2026-07-02: wrote 120s, 0x83 echoed,
-# restored 300s), so the app + CLI enable this feature. It stays a feature (not unconditional) so a
-# bare library build defaults to no device writes; `NEURON_IDLE_WRITE` is the runtime escape hatch.
+# Compile-time gate for the LED idle/power-timeout write (0x07/0x03, writes.rs::set_idle_secs).
+# Both directions are hardware-confirmed on the Naga V2 Pro, so the app + CLI enable this
+# feature. Stays a feature (not unconditional) so a bare library build defaults to no device
+# writes; `NEURON_IDLE_WRITE` is the runtime escape hatch.
 idle-power-write = []
-# Compile-time gate for the in-game (wired/dongle) polling-rate WRITE (0x00/0x06,
-# writes.rs::set_in_game_polling). Derived from the proven single-rate setter; off by default until
-# the dual-rate round-trip is hardware-verified (or `NEURON_INGAME_POLL_WRITE` at runtime).
+# Compile-time gate for the in-game (wired/dongle) polling-rate write (0x00/0x06,
+# writes.rs::set_in_game_polling). Derived from the proven single-rate setter; off until the
+# dual-rate round-trip is hardware-verified (or `NEURON_INGAME_POLL_WRITE` at runtime).
 ingame-poll-write = []
-# Compile-time gate for the Snap Tap (SOCD) WRITE (0x02/0x27, writes.rs::set_snap_tap). A Synapse-4-era
-# keyboard feature; the layout is from OpenRazer #2754 and has a getter (0xA7) for verify, but it is
-# off by default (the user's BlackWidow Chroma V2 can't do it). Enable with `--features snap-tap-write`
-# on a supporting board once the round-trip is confirmed (or `NEURON_SNAP_TAP_WRITE` at runtime).
+# Compile-time gate for the Snap Tap (SOCD) write (0x02/0x27, writes.rs::set_snap_tap). A
+# Synapse-4-era keyboard feature; layout from OpenRazer #2754, has a getter (0xA7) for verify,
+# off by default (this BlackWidow Chroma V2 can't do it). Enable once confirmed on a supporting
+# board (or `NEURON_SNAP_TAP_WRITE` at runtime).
 snap-tap-write = []
 # Exposes the phantom-device harness (src/transport/mock.rs) and the `Backend` install hook to
-# OTHER crates' tests. neuron-core's own unit tests get both via cfg(test) without this. Without
-# it, `installed_backend()` is a compile-time `None`, so a release build keeps the exact call shape
-# it had before the hook existed — the branch folds away and the platform body inlines.
+# other crates' tests; neuron-core's own unit tests get both via cfg(test) without this. Without
+# it, `installed_backend()` is a compile-time `None`, so the branch folds away in release.
 mock-transport = []
 
 [dependencies]
@@ -66,7 +64,7 @@ anyhow.workspace = true
 
 # The Woflo Labs Engram trajectory codec, included under its own terms — the rhythm
 # familiar's brain in KNOCKBACK: every exchange is an Engram block; the twin's knockback is
-# `predict_all` run one beat past the player's motif. Real, tested physics, not a sim.
+# `predict_all` run one beat past the player's motif.
 engram = { path = "../engram" }
 
 # Synapse migration (import.rs): the official Export format is a ZIP with a fake extension
@@ -76,22 +74,21 @@ zip.workspace = true
 # Features/*.xml mappings + lighting).
 quick-xml.workspace = true
 
-# Bundled-CPython MATERIALIZATION (macros/pyruntime.rs). The interpreter tarball is embedded at
-# compile time (include_bytes!) and unpacked into the user's data dir on first use. tar + flate2
-# are pure-Rust so extraction is identical on Windows/macOS/Linux (no shelling out to a system
+# Bundled-CPython materialization (macros/pyruntime.rs). Interpreter tarball is embedded at
+# compile time (include_bytes!) and unpacked into the user's data dir on first use. tar +
+# flate2 are pure-Rust so extraction is identical across platforms (no shelling out to system
 # tar/gzip). `dirs` resolves the per-user data-local dir cross-platform.
 tar = "0.4"
 flate2 = "1"
 dirs = "6"
 
 # Build-time only: fetch + verify the python-build-standalone tarball for the build target.
-# `ureq` is a small blocking HTTP client (rustls — no OpenSSL); `sha2` checks the download against
-# the release's SHA256SUMS manifest. Neither ships in the final binary.
+# `ureq` is a small blocking HTTP client (rustls, no OpenSSL); `sha2` checks the download
+# against the release's SHA256SUMS manifest. Neither ships in the final binary.
 #
-# `tar` + `flate2` are REUSED from [dependencies] (identical versions) to STREAM-SLIM the upstream
-# install_only tarball at build time — drop debug symbols (.pdb), pip/ensurepip/venv, the test
-# suite, idlelib/lib2to3/turtledemo, and __pycache__ dupes — then embed the slimmed tar.gz. Listing
-# them here adds NO new crate to the graph (same crates, already resolved), just a build-script edge.
+# `tar` + `flate2` are reused from [dependencies] to stream-slim the upstream install_only
+# tarball at build time (drop debug symbols, pip/ensurepip/venv, test suite, idlelib/lib2to3/
+# turtledemo, __pycache__ dupes) before embedding it. Adds no new crate to the graph.
 [build-dependencies]
 ureq = "3"
 sha2 = "0.10"
