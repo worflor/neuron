@@ -25,6 +25,10 @@ on:
   workflow_dispatch:
 
 permissions:
+  # Declaring ANY permission drops every unlisted one to none, and that includes the
+  # contents:read that checkout needs. On a private repo that surfaces as a baffling
+  # "repository not found". It did, on this workflow's first run.
+  contents: read
   issues: write # creating/updating labels is an issues-scoped permission
 
 concurrency:
