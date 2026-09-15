@@ -104,8 +104,7 @@ that answers the question a signature only gestures at ("did this really come fr
 
 ```
 cargo build --release      # -> target/release/neuron.exe (CLI) + neuron-app.exe (GUI)
-cargo test  --workspace    # the suite: runs disarmed, never injects
-cargo clippy --workspace
+.\validate.ps1             # the gates: build + test. the same ones CI runs.
 ```
 
 ### where your config lives

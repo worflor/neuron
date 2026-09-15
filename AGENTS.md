@@ -73,16 +73,25 @@ can be stale. Verify against the tree before you lean on a detail.
 
 ## The gates
 
-```bash
-cargo build --workspace
-cargo test --workspace     # the gate. green, or it doesn't go in.
-cargo clippy --workspace   # advisory today. read it; don't add new warnings.
+**One line. Put it in your plan and run it before you claim you're done:**
+
+```powershell
+.\validate.ps1
 ```
 
-CI runs build + test on Windows, and a `cargo check` of the porting seams on Linux,
-on every push and PR. Lint is deliberately advisory — see the comment at the top of
-[`.github/workflows/ci.yml`](.github/workflows/ci.yml) for why, and what would have
-to happen for it to become a gate.
+That is build + test across the workspace — the same definition CI runs, because CI
+literally invokes this script rather than spelling out its own cargo commands. If it
+passes locally it passes in CI, by construction rather than by convention.
+
+```powershell
+.\validate.ps1 -Mode full    # + feature matrix, release build, the CI-safe ignored tests
+.\validate.ps1 -Locked       # add --locked, exactly reproducing a CI run
+```
+
+CI runs `-Mode ci` on Windows and `-Mode seams` on Linux, and only when code actually
+changed — a docs-only push skips the build jobs. Lint is deliberately advisory; the
+reasoning is in the script next to the command, along with what would have to happen
+for it to become a gate.
 
 ### Do not
 

@@ -4,18 +4,33 @@
 
 # The gate on every push and pull request.
 #
-# WHY WINDOWS-ONLY FOR TESTS: neuron is windows-first. The cross-platform seams compile as inert
-# stubs off windows, so a linux job proves the seams still COMPILE (see `seams`), not that the app
-# works there — claiming otherwise would be the kind of dishonesty this project exists to avoid.
+# THIS FILE DELIBERATELY CONTAINS NO CARGO COMMANDS. The gates live in `validate.ps1` at the
+# repo root, and both CI and a human run the same script. If CI spelled out its own cargo
+# invocations they would drift from what you run locally, and "it passed on my machine" would
+# stop meaning anything. All this workflow decides is WHICH MODE runs on WHICH RUNNER.
 #
-# WHY THE FULL SUITE, NOT A FAST SUBSET: the suite runs in ~2 minutes warm; the build in front of it
-# is several times that. Splitting out a "quick" lane would save almost nothing and would silently
-# shrink what a contributor's PR is actually checked against. Every environment-dependent test
-# (live HID probe, live WASAPI loopback, the real python sidecar, the perf bench) is ALREADY
-# `#[ignore]`d with a reason string, so the default suite is "runs anywhere" by construction.
+#   .\validate.ps1              <- before you commit
+#   .\validate.ps1 -Mode full   <- the thorough pass, same as the manual "full" run below
 #
-# SAFETY ON A SHARED RUNNER: `mock-transport` + the deny-by-default transport policy under
-# cfg(test) mean the suite cannot reach real hardware, and a dedicated test forbids arming input.
+# COST MODEL, because this is a private repo and minutes are real: GitHub bills windows
+# runners at a 2x multiplier and linux at 1x. So the shape here is "let the cheap runner
+# decide whether the expensive one has to wake up at all":
+#
+#   gate  (linux, ~10s, 1x)  - did any CODE change?
+#     +-- test  (windows, 2x)  only if code changed
+#     +-- seams (linux,   1x)  only if code changed
+#
+# A docs-only push - which is most of them around a release - now costs about ten seconds
+# instead of a full windows build plus a linux build. The previous version also ran fmt and
+# clippy on a SECOND windows runner, which meant paying the 2x multiplier twice to build the
+# same tree; clippy now rides along on the test runner whose cache is already warm, and fmt
+# moved to linux because formatting is pure parsing and needs no platform.
+#
+# WHY A `gate` JOB INSTEAD OF `paths-ignore`: a skipped-by-`if` job still REPORTS, so it
+# satisfies a required status check. A path-filtered workflow simply never runs, and if
+# branch protection is ever turned on (it needs Pro or a public repo, so not yet) every
+# docs-only PR would sit forever waiting for a check that is never coming. This shape cannot
+# develop that problem later.
 
 name: ci
 
@@ -24,8 +39,14 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      depth:
+        description: "quick = what every push runs. full = + feature matrix + release build + the CI-safe ignored tests."
+        type: choice
+        options: [quick, full]
+        default: quick
 
-# A new push to the same branch supersedes the old run — don't burn minutes on stale commits.
+# A new push to the same branch supersedes the old run - don't burn minutes on stale commits.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -34,22 +55,74 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  gate:
+    name: what changed
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.decide.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # need history to diff against the base
+
+      - id: decide
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # A manual run is always deliberate - never second-guess it.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "manual run: forcing the full job set"
+            echo "code=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+
+          base="${{ github.event.pull_request.base.sha || github.event.before }}"
+          # A brand-new branch reports an all-zero "before" and has nothing to diff against.
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
+            echo "no usable base ref: assuming code changed"
+            echo "code=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+
+          changed="$(git diff --name-only "$base" "${{ github.sha }}")"
+          echo "changed files:"; echo "$changed" | sed 's/^/  /'
+
+          # Everything that CANNOT affect a build. Anything not matched here counts as code,
+          # so the failure mode is "ran CI unnecessarily", never "skipped a real change".
+          code="$(printf '%s\n' "$changed" | grep -vE \
+            -e '(^|/)[^/]+\.md$' \
+            -e '^docs/' \
+            -e '^LICENSES?/' \
+            -e '^LICENSE\.md$' \
+            -e '^\.github/(ISSUE_TEMPLATE|CODEOWNERS|labels\.yml|social-preview\.png|LABELS\.md|pull_request_template\.md)' \
+            -e '^_shots/' \
+            || true)"
+
+          if [ -n "$code" ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "-> code changed, running the full job set"
+          else
+            echo "code=false" >> "$GITHUB_OUTPUT"
+            echo "-> docs only, skipping the build jobs"
+          fi
+
   test:
     name: build + test (windows)
+    needs: gate
+    if: needs.gate.outputs.code == 'true'
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-
       - uses: dtolnay/rust-toolchain@stable
-
-      # Caches ~/.cargo + target/. This is the job's real cost — the tests themselves are ~2 min.
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
 
       # THE NEURON-SPECIFIC ONE. `crates/neuron-core/build.rs` downloads a ~46 MB
-      # python-build-standalone tarball and sha256-checks it against the release manifest, then
-      # embeds it. Uncached, every cold run re-downloads it: slower, and a network dependency on
-      # the critical path of every build (i.e. a flake source that has nothing to do with the code).
+      # python-build-standalone tarball, sha256-checks it against the release manifest, then
+      # embeds it. Uncached, every cold run re-downloads it: slower, and a network dependency
+      # on the critical path of every build (i.e. a flake source unrelated to the code).
       - name: Cache the bundled CPython tarball
         uses: actions/cache@v4
         with:
@@ -57,33 +130,25 @@ jobs:
           key: pbs-${{ runner.os }}-${{ hashFiles('crates/neuron-core/build.rs') }}
           restore-keys: pbs-${{ runner.os }}-
 
-      # `--locked` so a PR cannot silently drift the dependency graph; Cargo.lock is committed.
-      - name: build
-        run: cargo build --workspace --locked
-
-      - name: test
-        run: cargo test --workspace --locked
+      - name: validate
+        shell: pwsh
+        run: ./validate.ps1 -Mode ${{ inputs.depth == 'full' && 'full' || 'ci' }}
 
   seams:
     name: cross-platform seams (linux)
+    needs: gate
+    if: needs.gate.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # This does NOT claim neuron runs on linux. It claims the cross-platform SEAMS still compile,
-    # which is a real thing to protect: the stubs are inert off windows, so nothing else would
-    # notice them rotting until someone actually attempts the port.
-    #
-    # VERIFIED 2026-08-18 under WSL (Ubuntu 24.04, cargo 1.97): every crate below checks clean on
-    # linux with nothing but gcc. `neuron-cli` among them — the whole command-line surface is one
-    # hidraw transport away from working, exactly as the README says.
-    #
-    # `neuron-app` is EXCLUDED, honestly and specifically: it fails with 10 errors, every one of
-    # them in the overlay instruments (`teleport::scry_send`/`summon`, `beacon::audio_cache`,
-    # `overlay_origin`/`cell_screen`, a bare `imp` module) — i.e. precisely the "one genuinely
-    # welded chunk" the README already names. Add it here the moment those bodies are factored out;
-    # until then, gating on it would just be a permanently red job nobody looks at.
+    # This does NOT claim neuron runs on linux. It claims the cross-platform SEAMS still
+    # compile, which is a real thing to protect: the stubs are inert off windows, so nothing
+    # else would notice them rotting until someone actually attempts the port. The excluded
+    # crate and the reasoning live in validate.ps1, next to the command.
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
       - uses: Swatinem/rust-cache@v2
       - name: Cache the bundled CPython tarball
         uses: actions/cache@v4
@@ -91,40 +156,7 @@ jobs:
           path: vendor/pbs-cache
           key: pbs-${{ runner.os }}-${{ hashFiles('crates/neuron-core/build.rs') }}
           restore-keys: pbs-${{ runner.os }}-
-      - name: check the porting seams
-        run: cargo check -p neuron -p neuron-cli -p neuron-host -p neuron-testkit -p engram --locked
 
-  lint:
-    name: fmt + clippy (advisory)
-    runs-on: windows-latest
-    timeout-minutes: 45
-    # ADVISORY ON PURPOSE, and this is a deliberate decision rather than an oversight.
-    #
-    # The repo has never been gated on either tool: `cargo fmt --all --check` reports ~1873 diffs
-    # (the source is hand-formatted, and there is no rustfmt.toml pinning that style) and clippy
-    # reports ~123 warnings, almost all pedantic (doc-list indentation, `drop` of a non-Drop type).
-    #
-    # Turning either into a hard gate TODAY would mean one of two bad things: a red CI on day one,
-    # or a blanket `cargo fmt --all` reformat commit immediately before a public release — which
-    # would rewrite thousands of lines, destroy `git blame` across a codebase whose comments are
-    # its most valuable asset, and do it at the exact moment the diff most needs to stay readable.
-    #
-    # So: report, don't block. When the warnings are actually cleared (a deliberate pass, not a
-    # release-eve reflex), delete `continue-on-error` and add `-- -D warnings` to make it a gate.
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: Cache the bundled CPython tarball
-        uses: actions/cache@v4
-        with:
-          path: vendor/pbs-cache
-          key: pbs-${{ runner.os }}-${{ hashFiles('crates/neuron-core/build.rs') }}
-          restore-keys: pbs-${{ runner.os }}-
-      - name: fmt
-        run: cargo fmt --all --check
-      - name: clippy
-        run: cargo clippy --workspace --all-targets --locked
+      - name: validate
+        shell: pwsh
+        run: ./validate.ps1 -Mode seams

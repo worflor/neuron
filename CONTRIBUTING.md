@@ -47,11 +47,12 @@ the rule everywhere: semantics live in `neuron-core` as typed, tested code; devi
 every change runs the same suite i do. green before you open the PR:
 
 ```
-cargo test --workspace     # the gate. green, or it doesn't go in.
-cargo clippy --workspace   # read it. it's advisory today (see below).
+.\validate.ps1             # build + test. green, or it doesn't go in.
 ```
 
-CI runs the same two on every push and PR, so you'll see the result on your branch either way.
+that's the whole gate, and it's one script on purpose: CI *calls it* instead of listing its own cargo commands, so what you run locally and what runs on your PR can't drift apart. `-Mode full` adds the feature matrix, a release build, and the ignored tests that don't need hardware. `-Mode ci` and `-Mode seams` are what the two CI jobs run, if you want to reproduce one exactly.
+
+CI runs on every push and PR — though only when code actually changed, so a docs-only PR won't sit there building rust for ten minutes.
 
 **don't run `cargo fmt --all`.** the source is hand-formatted and there's no `rustfmt.toml` pinning that style, so a blanket format rewrites ~1900 sites across the repo and buries your actual change in noise. match the style of the code around you instead. same story with clippy: there are ~120 existing warnings, mostly pedantic, so it's a thing to read rather than a wall to clear — just don't add new ones in code you touch.
 
