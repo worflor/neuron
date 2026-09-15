@@ -1,0 +1,141 @@
+# SPDX-FileCopyrightText: 2026 Woflo Labs
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
+# Cut a release ZIP.
+#
+# WHEN THIS RUNS — deliberately narrow:
+#   * you push a version tag (`v0.1.0`, `v0.2.0-mk1`, …), or
+#   * you press the button in the Actions tab (`workflow_dispatch`).
+# NOT on push to main. NOT on pull requests. An ordinary commit does not become a release; `ci.yml`
+# is what runs on every commit.
+#
+# It also opens the release as a DRAFT: nothing is publicly visible until you read it over and
+# click publish. A tag you pushed by accident costs you a delete, not a retraction. Flip `--draft`
+# below if you ever want it to publish straight away.
+#
+# NO CODE SIGNING, on purpose. A standard OV certificate now needs hardware-token or cloud-HSM
+# storage (a few hundred a year) and STILL does not clear SmartScreen — that reputation accrues by
+# download volume either way. So instead of a signature nobody can check, this attaches BUILD
+# PROVENANCE: a cryptographic attestation binding the zip to the exact commit and workflow run that
+# produced it, verifiable by anyone with `gh attestation verify`. It proves where the binary came
+# from, which is the actual question a signature is a proxy for.
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version label for a manual build (e.g. v0.1.0-test)"
+        required: true
+        default: v0.0.0-dev
+
+permissions:
+  contents: write # create the release + upload assets
+  id-token: write # provenance attestation signing
+  attestations: write # record the attestation
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: windows x86_64
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Same cache as ci.yml — build.rs fetches a ~46 MB CPython tarball on a miss.
+      - name: Cache the bundled CPython tarball
+        uses: actions/cache@v4
+        with:
+          path: vendor/pbs-cache
+          key: pbs-${{ runner.os }}-${{ hashFiles('crates/neuron-core/build.rs') }}
+          restore-keys: pbs-${{ runner.os }}-
+
+      - name: Resolve version
+        id: v
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # The suite gates the release too. A tag must not be able to ship something main wouldn't.
+      - name: test
+        run: cargo test --workspace --locked
+
+      - name: build
+        run: cargo build --release --workspace --locked
+
+      # STAGE THE ZIP. The license bundle ships WITH the binary, not just in the repo: neuron is
+      # GPL-3.0-or-later, so a binary release carries its terms and a durable pointer back to the
+      # exact source it was built from. That is also the promise the README already makes.
+      - name: Stage the package
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="neuron-${{ steps.v.outputs.version }}-windows-x86_64"
+          mkdir -p "dist/$name"
+          cp target/release/neuron-app.exe "dist/$name/"
+          cp target/release/neuron.exe     "dist/$name/"
+          cp README.md LICENSE.md THIRD-PARTY-NOTICES.md SECURITY.md "dist/$name/"
+          cp -r LICENSES "dist/$name/"
+          cat > "dist/$name/SOURCE.txt" <<EOF
+          neuron ${{ steps.v.outputs.version }} — windows x86_64
+
+          Built by GitHub Actions from:
+            repository : ${{ github.server_url }}/${{ github.repository }}
+            commit     : ${{ github.sha }}
+            source     : ${{ github.server_url }}/${{ github.repository }}/tree/${{ github.sha }}
+            run        : ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          This build is NOT code-signed. Windows SmartScreen will warn on first run;
+          "More info" -> "Run anyway". Rather than trusting that dialog, verify the build
+          provenance — it proves this binary came from the commit above:
+
+            gh attestation verify $name.zip --repo ${{ github.repository }}
+
+          Corresponding source for this binary is the commit linked above, per GPL-3.0-or-later.
+          EOF
+          echo "name=$name" >> "$GITHUB_ENV"
+
+      - name: Zip + checksum
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "dist/$env:name" -DestinationPath "dist/$env:name.zip"
+          $h = (Get-FileHash "dist/$env:name.zip" -Algorithm SHA256).Hash.ToLower()
+          "$h  $env:name.zip" | Out-File -FilePath "dist/SHA256SUMS.txt" -Encoding utf8
+
+      # The $0 answer to "is this really your binary": signed provenance tying the artifact to
+      # this commit + this workflow. Verify with `gh attestation verify <zip> --repo <owner/repo>`.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/${{ env.name }}.zip
+
+      # `gh` is preinstalled on the runner, so this needs no third-party action.
+      - name: Publish draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.v.outputs.version }}" \
+            "dist/${{ env.name }}.zip" \
+            "dist/SHA256SUMS.txt" \
+            --draft \
+            --title "neuron ${{ steps.v.outputs.version }}" \
+            --generate-notes \
+            || gh release upload "${{ steps.v.outputs.version }}" \
+                 "dist/${{ env.name }}.zip" "dist/SHA256SUMS.txt" --clobber

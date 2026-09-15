@@ -1,0 +1,130 @@
+# SPDX-FileCopyrightText: 2026 Woflo Labs
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
+# The gate on every push and pull request.
+#
+# WHY WINDOWS-ONLY FOR TESTS: neuron is windows-first. The cross-platform seams compile as inert
+# stubs off windows, so a linux job proves the seams still COMPILE (see `seams`), not that the app
+# works there — claiming otherwise would be the kind of dishonesty this project exists to avoid.
+#
+# WHY THE FULL SUITE, NOT A FAST SUBSET: the suite runs in ~2 minutes warm; the build in front of it
+# is several times that. Splitting out a "quick" lane would save almost nothing and would silently
+# shrink what a contributor's PR is actually checked against. Every environment-dependent test
+# (live HID probe, live WASAPI loopback, the real python sidecar, the perf bench) is ALREADY
+# `#[ignore]`d with a reason string, so the default suite is "runs anywhere" by construction.
+#
+# SAFETY ON A SHARED RUNNER: `mock-transport` + the deny-by-default transport policy under
+# cfg(test) mean the suite cannot reach real hardware, and a dedicated test forbids arming input.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A new push to the same branch supersedes the old run — don't burn minutes on stale commits.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: build + test (windows)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Caches ~/.cargo + target/. This is the job's real cost — the tests themselves are ~2 min.
+      - uses: Swatinem/rust-cache@v2
+
+      # THE NEURON-SPECIFIC ONE. `crates/neuron-core/build.rs` downloads a ~46 MB
+      # python-build-standalone tarball and sha256-checks it against the release manifest, then
+      # embeds it. Uncached, every cold run re-downloads it: slower, and a network dependency on
+      # the critical path of every build (i.e. a flake source that has nothing to do with the code).
+      - name: Cache the bundled CPython tarball
+        uses: actions/cache@v4
+        with:
+          path: vendor/pbs-cache
+          key: pbs-${{ runner.os }}-${{ hashFiles('crates/neuron-core/build.rs') }}
+          restore-keys: pbs-${{ runner.os }}-
+
+      # `--locked` so a PR cannot silently drift the dependency graph; Cargo.lock is committed.
+      - name: build
+        run: cargo build --workspace --locked
+
+      - name: test
+        run: cargo test --workspace --locked
+
+  seams:
+    name: cross-platform seams (linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # This does NOT claim neuron runs on linux. It claims the cross-platform SEAMS still compile,
+    # which is a real thing to protect: the stubs are inert off windows, so nothing else would
+    # notice them rotting until someone actually attempts the port.
+    #
+    # VERIFIED 2026-08-18 under WSL (Ubuntu 24.04, cargo 1.97): every crate below checks clean on
+    # linux with nothing but gcc. `neuron-cli` among them — the whole command-line surface is one
+    # hidraw transport away from working, exactly as the README says.
+    #
+    # `neuron-app` is EXCLUDED, honestly and specifically: it fails with 10 errors, every one of
+    # them in the overlay instruments (`teleport::scry_send`/`summon`, `beacon::audio_cache`,
+    # `overlay_origin`/`cell_screen`, a bare `imp` module) — i.e. precisely the "one genuinely
+    # welded chunk" the README already names. Add it here the moment those bodies are factored out;
+    # until then, gating on it would just be a permanently red job nobody looks at.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Cache the bundled CPython tarball
+        uses: actions/cache@v4
+        with:
+          path: vendor/pbs-cache
+          key: pbs-${{ runner.os }}-${{ hashFiles('crates/neuron-core/build.rs') }}
+          restore-keys: pbs-${{ runner.os }}-
+      - name: check the porting seams
+        run: cargo check -p neuron -p neuron-cli -p neuron-host -p neuron-testkit -p engram --locked
+
+  lint:
+    name: fmt + clippy (advisory)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    # ADVISORY ON PURPOSE, and this is a deliberate decision rather than an oversight.
+    #
+    # The repo has never been gated on either tool: `cargo fmt --all --check` reports ~1873 diffs
+    # (the source is hand-formatted, and there is no rustfmt.toml pinning that style) and clippy
+    # reports ~123 warnings, almost all pedantic (doc-list indentation, `drop` of a non-Drop type).
+    #
+    # Turning either into a hard gate TODAY would mean one of two bad things: a red CI on day one,
+    # or a blanket `cargo fmt --all` reformat commit immediately before a public release — which
+    # would rewrite thousands of lines, destroy `git blame` across a codebase whose comments are
+    # its most valuable asset, and do it at the exact moment the diff most needs to stay readable.
+    #
+    # So: report, don't block. When the warnings are actually cleared (a deliberate pass, not a
+    # release-eve reflex), delete `continue-on-error` and add `-- -D warnings` to make it a gate.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Cache the bundled CPython tarball
+        uses: actions/cache@v4
+        with:
+          path: vendor/pbs-cache
+          key: pbs-${{ runner.os }}-${{ hashFiles('crates/neuron-core/build.rs') }}
+          restore-keys: pbs-${{ runner.os }}-
+      - name: fmt
+        run: cargo fmt --all --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --locked
