@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: 2026 Woflo Labs
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
+# Let the logged-in user talk to Razer devices, so neuron never needs root.
+#
+# /dev/hidraw* is root-only by default. `uaccess` hands the node to whoever is logged in at the
+# active seat, and hands it back on logout, which is what a desktop user wants. Scoped to vendor
+# 1532 (Razer): no other device on the system is affected.
+#
+# Install:
+#   sudo cp 70-neuron.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+# Then replug the device (or log out and back in) so the new permissions apply.
+#
+# USB and USB dongles only. A device paired over Bluetooth has no idVendor attribute to match on,
+# so it needs its own rule; neuron has not been verified over Bluetooth anyway.
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1532", TAG+="uaccess"
+
+# On a distro without systemd-logind, `uaccess` does nothing. Use a group instead: comment out the
+# line above, uncomment this one, and make sure your user is in the `plugdev` group.
+#KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1532", MODE="0660", GROUP="plugdev"

@@ -23,6 +23,7 @@
 
 use crate::ui::{AppWindow, State};
 use slint::ComponentHandle;
+#[cfg(windows)]
 use std::sync::mpsc::{channel, Sender};
 
 /// The 8 ink colours — the same literal palette the lighting panel offers (one app, one set).
@@ -352,12 +353,14 @@ struct Stroke {
 
 // `service_sender` caches the send-end only once the worker spawned, so a refused spawn retries
 // next call instead of stranding draw commands in a dead channel. `None` = can't start now.
+#[cfg(windows)]
 fn canvas() -> Option<Sender<Cmd>> {
     static TX: crate::worker::Service<Cmd> = crate::worker::Service::new();
     crate::worker::service_sender(&TX, "neuron-whiteboard", imp::canvas_thread)
 }
 
 /// Send a canvas command, starting the worker on demand; silently no-ops if it can't start.
+#[cfg(windows)]
 fn canvas_send(cmd: Cmd) {
     if let Some(tx) = canvas() {
         let _ = tx.send(cmd);

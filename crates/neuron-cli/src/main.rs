@@ -7,14 +7,18 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+#[cfg(windows)]
+use neuron::{
+    device::DeviceSession,
+    executor::{DispatchExecutor, DispatchOutcome, IntentRunner, TurboRuntime},
+};
 use neuron::{
     audio, backup,
     bindings::Bindings,
     capability as cap,
     cast::CastConfig,
-    device::{Device, DeviceSession},
+    device::Device,
     discover,
-    executor::{DispatchExecutor, DispatchOutcome, IntentRunner, TurboRuntime},
     gesture::Vault,
     glyph,
     lighting::{self, Effect, Rgb},

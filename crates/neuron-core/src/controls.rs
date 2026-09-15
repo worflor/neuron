@@ -90,12 +90,15 @@ static INJECT: std::sync::Mutex<Vec<(u64, std::sync::mpsc::Sender<Injected>, isi
 /// scheduler left sitting behind a fullscreen game shows up as a large hop and nowhere else. Taking
 /// the timestamp at drain time would measure zero by construction and hide exactly the stall we
 /// most need to see.
+// Listen-loop plumbing: only the Windows input loop drives it so far.
+#[cfg_attr(not(windows), allow(dead_code))]
 #[derive(Clone, Debug)]
 struct Injected {
     ev: ControlEvent,
     /// When the source thread published this edge (the HID read having just returned).
     at: std::time::Instant,
 }
+#[cfg_attr(not(windows), allow(dead_code))]
 static INJECT_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Events injected BEFORE any listen loop has registered its drain — buffered (not dropped) so the
 /// FIRST macro keypress after launch survives the startup race: the macro-key reader (`macrokeys`)
@@ -160,6 +163,7 @@ pub fn inject_event(ev: ControlEvent) {
 /// then [`inject_unregister`]s on exit. Returns the registration id + the receiver. Any events that
 /// arrived before ANY sink existed are seeded into this fresh receiver first (see [`INJECT_PENDING`]),
 /// so the first listener to arm picks up the startup-race edges before its first live tick.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn inject_register() -> (u64, std::sync::mpsc::Receiver<Injected>, isize) {
     let (tx, rx) = std::sync::mpsc::channel();
     let id = INJECT_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -185,6 +189,7 @@ fn inject_register() -> (u64, std::sync::mpsc::Receiver<Injected>, isize) {
 }
 
 /// Drop a listen loop's drain registration (its receiver is gone) and close its wake event.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn inject_unregister(id: u64) {
     let mut sinks = INJECT.lock().unwrap_or_else(|e| e.into_inner());
     // Remove + close under the INJECT lock so `wake_pump` (which signals every registered handle
@@ -921,6 +926,7 @@ pub(crate) fn note_held(
 /// This replaces a hex-STRING round trip (`String -> u16 -> canonicalize -> String`) that every
 /// decode site had to remember to call. Returning the typed
 /// [`CanonicalPid`](crate::registry::CanonicalPid) means a site that forgets doesn't compile.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn source_pid(pid_hex: &str) -> Option<crate::registry::CanonicalPid> {
     u16::from_str_radix(pid_hex, 16)
         .ok()
@@ -2376,6 +2382,7 @@ fn create_wake_event() -> isize {
 }
 
 #[cfg(not(windows))]
+#[allow(dead_code)]
 fn create_wake_event() -> isize {
     0
 }
@@ -2395,6 +2402,7 @@ fn close_wake_event(handle: isize) {
 }
 
 #[cfg(not(windows))]
+#[allow(dead_code)]
 fn close_wake_event(_handle: isize) {}
 
 /// `SetEvent` every listener's wake event in a locked INJECT slice — the lock-free core shared by

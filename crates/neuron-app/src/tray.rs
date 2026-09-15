@@ -12,10 +12,15 @@
 //! checkmark, and the Pause-writes check track reality. Hotkeys are registered once and survive
 //! every menu rebuild (their ids live in a separate map).
 
+#[cfg(windows)]
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager};
+#[cfg(windows)]
 use std::cell::RefCell;
+#[cfg(windows)]
 use std::collections::HashMap;
+#[cfg(windows)]
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
+#[cfg(windows)]
 use tray_icon::{TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 /// A decoded action the tray/hotkey raised, handed to the glue to execute on the UI thread.
@@ -44,7 +49,34 @@ pub struct TraySnapshot {
     pub hyper: bool,
 }
 
+
+/// No tray on this platform yet: `tray-icon` and `global-hotkey` need GTK and X11 on Linux, and
+/// neuron has no working Linux GUI to hang them off. The app still builds and runs headless —
+/// `poll` simply never yields an action and `sync` has nothing to redraw.
+#[cfg(not(windows))]
+pub struct Tray;
+
+#[cfg(not(windows))]
+impl Tray {
+    pub fn build(
+        _profiles: &[String],
+        _effects: &[String],
+        _active: &str,
+        _paused: bool,
+        _hyper: bool,
+    ) -> Self {
+        Tray
+    }
+
+    pub fn sync(&self, _snap: &TraySnapshot, _force: bool) {}
+
+    pub fn poll(&self) -> Vec<TrayAction> {
+        Vec::new()
+    }
+}
+
 /// The resident tray. Holds the icon + the hotkey manager alive for the process lifetime.
+#[cfg(windows)]
 pub struct Tray {
     icon: TrayIcon,
     _hotkeys: Option<GlobalHotKeyManager>,
@@ -56,6 +88,7 @@ pub struct Tray {
     snapshot: RefCell<TraySnapshot>,
 }
 
+#[cfg(windows)]
 impl Tray {
     /// Build the tray with the given snapshot of profiles/effects/active/gates.
     pub fn build(
@@ -137,6 +170,7 @@ impl Tray {
 }
 
 /// Construct the menu + its id->action map from a snapshot (shared by build and sync).
+#[cfg(windows)]
 fn build_menu(snap: &TraySnapshot) -> (Menu, HashMap<String, TrayAction>) {
     let mut map = HashMap::new();
     let menu = Menu::new();
@@ -208,6 +242,7 @@ fn build_menu(snap: &TraySnapshot) -> (Menu, HashMap<String, TrayAction>) {
 
 /// Register OS-wide hotkeys (best-effort; failures are non-fatal — the tray menu still works).
 /// Ctrl+Alt+H toggles HyperShift, Ctrl+Alt+P pauses writes, Ctrl+Alt+N opens the window.
+#[cfg(windows)]
 fn register_hotkeys(map: &mut HashMap<String, TrayAction>) -> Option<GlobalHotKeyManager> {
     use global_hotkey::hotkey::{Code, HotKey, Modifiers};
     let mgr = GlobalHotKeyManager::new().ok()?;
@@ -233,6 +268,7 @@ fn register_hotkeys(map: &mut HashMap<String, TrayAction>) -> Option<GlobalHotKe
 
 /// The tray icon bitmap — a small generated neuron mark (no asset file needed). A 32×32 RGBA: a true
 /// near-black tile carrying a single phosphor diamond, matching the instrument accent (#4af2b0).
+#[cfg(windows)]
 fn load_icon() -> tray_icon::Icon {
     const W: u32 = 32;
     let mut rgba = vec![0u8; (W * W * 4) as usize];

@@ -48,12 +48,14 @@ anyhow.workspace = true
 # the window. main.rs selects femtovg-first with a software fallback; winit also auto-falls-
 # back to software at window creation if GL init fails, but only if it's compiled in.
 slint = { version = "1.16", default-features = false, features = ["compat-1-2", "std", "backend-winit", "renderer-femtovg", "renderer-software"] }
-tray-icon = "0.24"
-global-hotkey = "0.8"
 image = { version = "0.25", default-features = false, features = ["png", "gif"] }
 cpal.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+# Tray + OS-wide hotkeys. Windows-only on purpose: on Linux these pull in GTK and libxdo
+# (X11), which neuron has no working Linux GUI to use — see the stub in tray.rs.
+tray-icon = "0.24"
+global-hotkey = "0.8"
 # Lock the main thread's COM apartment to STA before winit/tray-icon/Core-Audio touch COM:
 # winit's OleInitialize needs STA, while tray-icon + neuron-core's audio request MTA.
 # Initializing STA first wins; their later MTA requests fail harmlessly (RPC_E_CHANGED_MODE).

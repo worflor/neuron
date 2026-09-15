@@ -254,6 +254,7 @@ use std::time::Instant;
 
 /// Signature stamped into `dwExtraInfo` on every keystroke WE inject — the hook recognizes its own
 /// replays and passes them through. "nrn\0" — arbitrary but distinctive.
+#[cfg(windows)]
 const INJECT_SIG: usize = 0x006e_726e;
 /// Fail-open window: a swallowed keystroke with no Raw-Input attribution within this long is
 /// replayed as-is. The measured hook→Raw-Input gap is ~0.3–2ms, so 8ms is a comfortable ceiling.
@@ -487,6 +488,7 @@ pub fn deactivate() {
 /// The HOOK's per-edge decision: should this keystroke be swallowed? Called from the LL hook proc
 /// with the physkey (`scancode | 0x100 if extended`). Records it as pending when swallowed. Gated
 /// on the input-arm kill-switch — in safe mode we swallow nothing (pure pass-through, no remap).
+#[cfg_attr(not(windows), allow(dead_code))]
 fn hook_edge(physkey: u16, down: bool) -> bool {
     // `standing_down` covers PAUSED too: swallowing a key mid-capture is exactly the bug the pause
     // exists to prevent (the user is BINDING this control, not using it).

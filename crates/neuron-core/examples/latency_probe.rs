@@ -399,6 +399,7 @@ unsafe fn send_raw_batch(n: usize) {
 #[cfg(not(windows))]
 fn hook_cost_case() {}
 
+#[cfg(windows)]
 fn fmt(us: u64) -> String {
     if us < 1_000 {
         format!("{us}us")

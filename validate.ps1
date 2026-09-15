@@ -36,6 +36,15 @@ Push-Location $RepoRoot
 # Locally it is opt-in, because a mid-change Cargo.toml edit shouldn't hard-fail your loop.
 if ($env:CI) { $Locked = $true }
 
+# Leave the desk usable. cargo defaults to one build job per logical CPU, which pins every core
+# and can lock the machine out from under you - worse when two builds overlap (a worktree, or WSL
+# alongside Windows), since each one claims every core again. One spare core costs a few percent
+# of build time and keeps the UI responsive. CI runners are dedicated, so they keep all of them.
+# An explicit CARGO_BUILD_JOBS (or -j on the command line) still wins over this.
+if (-not $env:CI -and -not $env:CARGO_BUILD_JOBS) {
+    $env:CARGO_BUILD_JOBS = [Math]::Max(1, [Environment]::ProcessorCount - 1)
+}
+
 # Must be a plain assignment, not `$lock = if (...) { @('--locked') } else { @() }`: the `if`
 # expression form unrolls a single-element array to its element, so $lock becomes a [String]
 # and splatting it with @lock explodes it one character at a time.

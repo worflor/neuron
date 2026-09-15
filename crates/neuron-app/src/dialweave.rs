@@ -14,6 +14,7 @@
 
 #![cfg(windows)]
 
+use crate::beacon::audio_cache::short_device;
 use neuron::action::DialTarget;
 use neuron::audio::VolumeCtl;
 
@@ -111,20 +112,5 @@ pub fn target_from_code(code: u8) -> DialTarget {
     match code {
         1 => DialTarget::MicVolume,
         _ => DialTarget::OutputVolume,
-    }
-}
-
-/// Trim a Windows endpoint name to the identifying part: the hardware in parentheses if present
-/// ("Headset Earphone (Razer BlackShark V2)" → "Razer BlackShark V2"), else the name, capped.
-pub(crate) fn short_device(name: &str) -> String {
-    let core = match (name.find('('), name.rfind(')')) {
-        (Some(a), Some(b)) if b > a + 1 => name[a + 1..b].trim(),
-        _ => name.trim(),
-    };
-    let core = if core.is_empty() { name.trim() } else { core };
-    if core.chars().count() > 22 {
-        core.chars().take(21).collect::<String>() + "\u{2026}"
-    } else {
-        core.to_string()
     }
 }

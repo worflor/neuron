@@ -136,9 +136,12 @@ impl Snapshot {
     /// at the cursor, clamped onto the cursor's monitor (mirrors `overlay::place_window`). Knowing
     /// it lets canvas-relative geometry (a window blob's minimap cell) be turned back into screen
     /// coordinates so the scry bloom can sit right against the cell it mirrors.
-    #[cfg(windows)]
     pub(crate) fn overlay_origin(&self) -> (i32, i32) {
+        #[cfg(windows)]
         let (l, t, r, b) = unsafe { work_area(self.cursor) };
+        // No monitor work-area query off Windows: clamp to the snapshot's own desk bounds.
+        #[cfg(not(windows))]
+        let (l, t, r, b) = (self.vx, self.vy, self.vx + self.vw, self.vy + self.vh);
         let half = CANVAS_HALF as i32;
         (
             (self.cursor.0 - half).clamp(l, (r - half * 2).max(l)),
@@ -149,7 +152,6 @@ impl Snapshot {
     /// A window blob's minimap CELL as a SCREEN rect — its projected canvas rect lifted back onto
     /// the glass through the overlay origin. The scry bloom anchors to this so it hugs the exact
     /// cell, never a fixed (often awkward) distance from the cursor.
-    #[cfg(windows)]
     pub(crate) fn cell_screen(&self, rect: (i32, i32, i32, i32)) -> (i32, i32, i32, i32) {
         let (ox, oy) = self.overlay_origin();
         let a = self.project(rect.0, rect.1);
@@ -646,6 +648,9 @@ pub fn scry_send(cmd: ScryCmd) {
     }
 }
 
+#[cfg(not(windows))]
+pub fn scry_send(_cmd: ScryCmd) {}
+
 /// The teleport bloom portal (anchored to the map, with the landing marker). GLANCE grew into
 /// its own constellation engine (`crate::glance`) with its own tile windows — this thread now
 /// serves the weave alone, so a pinned glance and a teleport peek can never stomp each other.
@@ -1034,6 +1039,11 @@ fn paint_scry_frame(px: &mut crate::raster::PixelBuf, pw: i32, ph: i32) {
 //                           the emptiest glass — deterministic, and the status says which.
 // Window placement is host-side window management (SetWindowPos), not input synthesis — same
 // stance as commit(). Forging a new desktop DOES synthesize Win+Ctrl+D, so it honors the arm gate.
+
+#[cfg(not(windows))]
+pub fn summon(_hwnd: isize, _to: (i32, i32), _cross_desktop: bool) -> String {
+    "summon: windows-only".into()
+}
 
 /// SUMMON: bring a window to a real screen point (the weave origin). `cross_desktop` pulls it
 /// to the current desktop first.

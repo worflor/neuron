@@ -1286,9 +1286,47 @@ fn foreground_hwnd() -> isize {
 /// flight recorder caught: weave silent forever, dispatch fine). Now the weave thread only reads
 /// these cached values (instant, never COM); if COM stalls, only this refresher thread waits and
 /// the cache serves last-known — the cast always proceeds.
-#[cfg(windows)]
 pub(crate) mod audio_cache {
     use std::sync::Mutex;
+
+    /// Trim an audio endpoint name to the identifying part: the hardware in parentheses if
+    /// present ("Headset Earphone (Razer BlackShark V2)" → "Razer BlackShark V2"), else the
+    /// name, capped.
+    pub(crate) fn short_device(name: &str) -> String {
+        let core = match (name.find('('), name.rfind(')')) {
+            (Some(a), Some(b)) if b > a + 1 => name[a + 1..b].trim(),
+            _ => name.trim(),
+        };
+        let core = if core.is_empty() { name.trim() } else { core };
+        if core.chars().count() > 22 {
+            core.chars().take(21).collect::<String>() + "\u{2026}"
+        } else {
+            core.to_string()
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::short_device;
+
+        #[test]
+        fn keeps_the_hardware_in_parentheses() {
+            assert_eq!(short_device("Headset Earphone (Razer BlackShark V2)"), "Razer BlackShark V2");
+        }
+
+        #[test]
+        fn falls_back_to_the_whole_name_when_parentheses_are_empty_or_absent() {
+            assert_eq!(short_device("Speakers ()"), "Speakers ()");
+            assert_eq!(short_device("  Speakers  "), "Speakers");
+        }
+
+        #[test]
+        fn caps_long_names_at_21_characters_plus_an_ellipsis() {
+            let out = short_device("An Extremely Long Endpoint Name Indeed");
+            assert_eq!(out.chars().count(), 22);
+            assert!(out.ends_with('\u{2026}'));
+        }
+    }
 
     #[derive(Clone, Default)]
     pub struct Snap {
@@ -1344,7 +1382,7 @@ pub(crate) mod audio_cache {
         let out_ep = neuron::audio::resolve_render(None);
         let out_name = out_ep
             .as_ref()
-            .map(|e| crate::dialweave::short_device(&e.name));
+            .map(|e| short_device(&e.name));
         let out = out_ep
             .and_then(|e| neuron::audio::VolumeCtl::open(&e.id))
             .map(|c| (c.get_volume(), c.get_mute()));
