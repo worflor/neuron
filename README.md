@@ -92,6 +92,8 @@ a thing that remaps your buttons and runs python on a keypress is, by definition
 
 ### build
 
+**using an AI agent?** point it at [`skills/neuron-lazy-update`](skills/neuron-lazy-update/SKILL.md). it installs, updates, rolls back and drives neuron step by step, verifies every download, never touches your config, and tells you what it noticed. it's written so a small model can follow it. a script does the risky parts.
+
 tagged releases publish a windows zip: both binaries, the license bundle, and a `SOURCE.txt` naming the exact commit it was built from. if the releases page is empty, none has been cut yet — build from source below, which is the same thing by hand.
 
 the zip is **not code-signed**, and that's a decision rather than an oversight. a certificate that would satisfy SmartScreen costs a few hundred a year *and still* doesn't clear the warning until a build accrues download reputation, so it buys a dialog change, not trust. instead every release carries a **build provenance attestation** — proof, signed by github, that the zip came from a specific commit and workflow run:

@@ -65,6 +65,7 @@ one).
 | What actually works today, honestly graded | [`docs/STATUS.md`](docs/STATUS.md) |
 | How to send a change | [`CONTRIBUTING.md`](CONTRIBUTING.md) |
 | The label taxonomy, if you're filing or picking up issues | [`.github/LABELS.md`](.github/LABELS.md) |
+| You're helping a *user* install, update, or run neuron, not changing its code | [`skills/neuron-lazy-update/SKILL.md`](skills/neuron-lazy-update/SKILL.md) |
 
 **The code is the source of truth.** `docs/TDD.md` and `docs/PROTOCOL-HOST.md` both
 carry a banner saying an LLM wrote them while building neuron. That banner is
