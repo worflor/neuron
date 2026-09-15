@@ -178,7 +178,9 @@ if ($Mode -eq 'full') {
     # NOT run, and cannot be: device.rs live_stream_strategy_probe (needs a BlackWidow
     # attached), audio_spectrum.rs live_loopback_probe (needs audio actually playing),
     # budget_lane.rs resident_footprint (launches the real exe, needs NEURON_BUDGET_EXE),
-    # lighting_bench (a perf micro-bench - meaningless on a shared runner's noisy CPU).
+    # lighting_bench and runner.rs submitting_is_far_cheaper_than_spawning_a_thread (perf
+    # micro-benches - a shared runner's contended CPU makes the number meaningless, and the
+    # second one failed CI exactly that way before it was marked).
     # One invocation per filter: libtest's positional filter is a single pattern, and passing
     # two silently runs only the first on some toolchains - which would look green while
     # testing half of what it claims.
