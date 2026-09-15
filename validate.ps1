@@ -14,8 +14,9 @@
 # windows lane, the linux seams lane, and local use without a second implementation.
 #
 # Usage:
-#   .\validate.ps1                # quick  - build + test. BOTH the windows CI job and what you
-#                                 #          run before committing. The same thing, on purpose.
+#   .\validate.ps1                # quick  - the suite, which compiles everything on its way.
+#                                 #          BOTH the windows CI job and what you run before
+#                                 #          committing. The same thing, on purpose.
 #   .\validate.ps1 -Mode seams    # the portable crates + advisory fmt. The linux CI job.
 #   .\validate.ps1 -Mode full     # + clippy, the feature matrix, a release build, and the
 #                                 #   no-hardware ignored tests. Slow. Run it before a release.
@@ -120,7 +121,7 @@ if ($Mode -eq 'seams') {
     Invoke-Advisory 'rustfmt' { cargo fmt --all --check }
 }
 
-# ── build + test ──────────────────────────────────────────────────────────────────────────
+# ── the suite ──────────────────────────────────────────────────────────────────────────
 # WHY THE FULL SUITE, NOT A FAST SUBSET: it runs in ~2 minutes warm; the build in front of it
 # is several times that. A "quick" subset would save almost nothing and would silently shrink
 # what a change is actually checked against.
@@ -130,8 +131,16 @@ if ($Mode -eq 'seams') {
 # this is safe to run on a shared runner - and also why a green suite is NOT verification of
 # a user-facing change. See AGENTS.md.
 if ($Mode -in @('quick', 'full')) {
-    Invoke-Gate 'build' { cargo build --workspace @lock }
-    Invoke-Gate 'test'  { cargo test  --workspace @lock }
+    # ONE compile, not two. `cargo build` followed by `cargo test` compiles the whole
+    # workspace twice - measured on the windows runner: 45m26s for the build, then another
+    # 28m45s for the test profile, against ~2 minutes of tests actually executing. `cargo
+    # test` already compiles every lib, bin and test target, so a separate build step adds
+    # three quarters of an hour per push and proves nothing the test compile didn't.
+    #
+    # What it technically loses: the final non-test link of neuron-app.exe / neuron.exe.
+    # `-Mode full` does a real `cargo build --release`, and so does the release workflow, so
+    # that link is still proven before anything ships - just not on every single push.
+    Invoke-Gate 'test' { cargo test --workspace @lock }
 }
 
 # Clippy is a SECOND full compilation of the workspace (different flags, different artifacts)

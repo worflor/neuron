@@ -58,6 +58,19 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
+  # Compilation, not test execution, is the entire cost here: a measured windows run spent
+  # 74 minutes compiling and about 2 minutes running 900-odd tests. Full debuginfo means
+  # generating PDBs for the whole workspace, which is a large slice of that and is worth
+  # nothing to a CI run nobody attaches a debugger to. `line-tables-only` keeps what a
+  # failure actually needs - file and line in the backtrace - and drops the rest.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+
+  # Incremental compilation is a pessimisation on a fresh runner: it writes a pile of extra
+  # state to speed up the NEXT build, and there is never a next build on a throwaway VM.
+  # (rust-cache sets this too; stated here so it survives the cache action changing.)
+  CARGO_INCREMENTAL: 0
+
 jobs:
   gate:
     name: what changed
@@ -111,15 +124,20 @@ jobs:
           fi
 
   test:
-    name: build + test (windows)
+    name: test (windows)
     needs: gate
     if: needs.gate.outputs.code == 'true'
     runs-on: windows-latest
-    # 90, not 45. The first cold run - no rust cache, no CPython cache, the whole workspace
-    # plus every test binary from scratch on a 2-core runner - hit exactly 45 minutes and was
-    # cancelled, which is also why nothing got cached. This needs enough headroom to finish
-    # ONCE; after that the cache makes it a fraction of this. If a warm run ever approaches
-    # 90 minutes, something is wrong and the timeout should stay put while you find out what.
+    # 90, not 45. The first run hit exactly 45 minutes and was cancelled by its own timeout.
+    #
+    # MEASURED, so nobody has to guess: cold 70 min, warm 78 min. The cache does NOT make this
+    # cheap, and it was never going to - Swatinem/rust-cache caches DEPENDENCIES and
+    # deliberately discards local workspace artifacts (stale ones produce wrong builds), so
+    # neuron's own five crates recompile every single run no matter what is cached. Of that 78:
+    # ~74 minutes compiling, ~2 minutes actually running 900-odd tests.
+    #
+    # The duplicate `cargo build` in front of `cargo test` is gone (see validate.ps1), which
+    # should remove the larger half. 90 stays as headroom until a run proves it can come down.
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4

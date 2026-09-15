@@ -79,7 +79,7 @@ can be stale. Verify against the tree before you lean on a detail.
 .\validate.ps1
 ```
 
-That is build + test across the workspace — the same definition CI runs, because CI
+That compiles the whole workspace and runs the suite — the same definition CI runs, because CI
 literally invokes this script rather than spelling out its own cargo commands. If it
 passes locally it passes in CI, by construction rather than by convention.
 
