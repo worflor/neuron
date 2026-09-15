@@ -70,7 +70,10 @@ not part of the system above.
 
 ## Rules
 
-1. Every issue carries exactly one Tier-1 and exactly one Tier-2 label.
+1. Every triaged issue carries exactly one Tier-1 and exactly one Tier-2 label. The one
+   exception is intake: an issue still marked `needs-triage` may be missing its Tier-2, because
+   the bug template can't know the area a reporter hit. Triage adds the area and removes
+   `needs-triage` in the same pass, and an agent filing an issue itself has no such excuse.
 2. Tier-3 flags are optional and stack.
 3. `risky` overrides `freetime capable`: if both apply, the agent stops and asks.
 4. `straightforward` and `delicate` are mutually exclusive: they are opposite ends

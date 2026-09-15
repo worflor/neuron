@@ -46,11 +46,14 @@ everything in neuron is **one primitive**. *something happened* (a `Trigger`) so
 | group | what's in it |
 |---|---|
 | **input** | key / chord, mouse button, media key, autofire (turbo), ghost-paste, echo-last |
-| **device** | dpi set + stage-cycle, scroll stage, polling, brightness, profile switch + cycle |
-| **audio** | mic & output mute/gain, output flip |
-| **macros** | run a sequence, run python, invoke another macro |
-| **instruments** | teleport, tether, whiteboard, glance, window verbs, dial, knockback, control |
-| **system** | lock, sleep, curtain, pocket |
+| **device** | dpi set + stage-cycle, sniper (hold to drop to precision DPI), scroll-stage cycle, profile switch + cycle |
+| **audio** | mic & output mute/gain, momentary mic (push-to-talk), output flip |
+| **macros** | run a sequence, run python (which can itself call another macro) |
+| **instruments** | teleport, tether, whiteboard, glance, window verbs (summon · banish · pin · kill), dial, knockback, control |
+| **system** | run a shell command, lock, sleep, curtain, pocket |
+| **integrations** | OBS: switch scenes, start and stop streaming or recording |
+
+polling and brightness aren't in that list on purpose. you set them from the GUI, the tray, or the CLI, but they aren't bindable actions.
 
 **press-to-bind anything and everything**: don't like my setup? make it yours
 
@@ -96,6 +99,14 @@ a preset is just a pattern plus a spectrum, pure data, no code (adding your own 
 | `starlight` / `reactive` / `ripple` | stars twinkling and fading, the key you pressed lighting up, rings spreading from each strike |
 | `audio meter` / `pulse` | your live output *or mic* peak, or live CPU and RAM, painted low→high |
 | `ambient` | the whole board as an ambilight, mirroring your screen |
+| `static` / `breathing` / `colorwheel` | the classics: one colour, one colour rising and falling, a hue wheel turning around the centre |
+| `vitals` | your battery and charge level, drawn as a gauge |
+| `onair` | lights wherever you paint it while your stream is live (reads OBS) |
+| `miclight` | lights wherever you paint it while your mic is muted, or while it's hot |
+| `modeheld` | lights while a hold layer or sniper is engaged |
+| `signal` | a light your macros drive directly: `neuron.signal(n, v)` |
+
+that's all 21. the catalog groups them by what feeds them: pure light shows, ones that react to your keys, and ones reading a live feed.
 
 and since a frame is just data, a data readout is just another layer. your device's live vitals (battery and charge) render as a `vitals` layer in the same stack as any effect, so you drop it wherever you want on the board, at whatever size, and stack it over a running effect with the effect showing through around it. edits stream to the board as you make them, there's no apply button. the CLI keeps the cross-device version too: **`lighting mirror`** paints one device's state onto another's LEDs, your mouse's battery gauge across the keyboard's number row. synapse silos every device and openrazer has no cross-device layer :P
 

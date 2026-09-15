@@ -2,7 +2,7 @@
 name: Bug report
 about: something broke, or lied to you about working
 title: ''
-labels: bug
+labels: bug, needs-triage
 assignees: ''
 ---
 
