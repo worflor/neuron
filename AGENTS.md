@@ -140,6 +140,32 @@ says so. The README's proven / gated / absent ledger and the grading in
 capability actually does, update the ledger in the same change — a doc that
 overstates the code is a bug here, and gets filed as one.
 
+## Comments
+
+Write the comment a maintainer needs, or write none.
+
+**Keep:**
+- **Why**, when the code can't say it: a non-obvious constraint, an invariant, what a
+  workaround works around.
+- **Protocol and hardware facts**: byte layouts, opcodes, and where a value was verified on
+  real hardware. One line each.
+- **Safety**: `// SAFETY:` on every `unsafe`, and the reasoning behind the arm gate and
+  write gates.
+- **Public API docs** (`///`): what it does, its contract, how it fails. A sentence or two.
+- **License headers** (`SPDX-…`). A test enforces them.
+
+**Cut:**
+- Narration of what the next line obviously does.
+- History: how it used to work, what was tried, how long a bug took to find. That belongs
+  in the commit message.
+- Conversation: asides, jokes, "honestly", rhetorical questions, first-person storytelling,
+  ALL-CAPS used as a tone of voice.
+- Essays defending a design. Link the doc that already explains it.
+
+The test: a comment has to make sense to someone reading the code cold, with no memory of the
+session that wrote it. If it only makes sense as part of that story, it goes in the commit
+message, not the code.
+
 ## Verifying your work honestly
 
 This is the part agents get wrong most often, so it is stated plainly.
