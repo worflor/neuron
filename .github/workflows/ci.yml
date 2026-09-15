@@ -79,7 +79,7 @@ jobs:
     outputs:
       code: ${{ steps.decide.outputs.code }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0 # need history to diff against the base
 
@@ -111,7 +111,9 @@ jobs:
             -e '^docs/' \
             -e '^LICENSES?/' \
             -e '^LICENSE\.md$' \
-            -e '^\.github/(ISSUE_TEMPLATE|CODEOWNERS|labels\.yml|social-preview\.png|LABELS\.md|pull_request_template\.md)' \
+            -e '^\.github/(ISSUE_TEMPLATE|CODEOWNERS|labels\.yml|social-preview\.png|LABELS\.md|pull_request_template\.md|dependabot\.yml|sync-labels\.sh)' \
+            -e '^\.github/workflows/(release|sync-labels)\.yml$' \
+            -e '^release\.ps1$' \
             -e '^_shots/' \
             || true)"
 
@@ -128,19 +130,18 @@ jobs:
     needs: gate
     if: needs.gate.outputs.code == 'true'
     runs-on: windows-latest
-    # 90, not 45. The first run hit exactly 45 minutes and was cancelled by its own timeout.
+    # MEASURED, so nobody has to guess. With a separate `cargo build` in front of `cargo test`
+    # this was 70 min cold and 78 warm - the cache never made it cheap, because
+    # Swatinem/rust-cache caches DEPENDENCIES and deliberately discards local workspace
+    # artifacts, so neuron's own crates recompile every run regardless. Dropping that duplicate
+    # compile (see validate.ps1) brought a warm run to ~21 min.
     #
-    # MEASURED, so nobody has to guess: cold 70 min, warm 78 min. The cache does NOT make this
-    # cheap, and it was never going to - Swatinem/rust-cache caches DEPENDENCIES and
-    # deliberately discards local workspace artifacts (stale ones produce wrong builds), so
-    # neuron's own five crates recompile every single run no matter what is cached. Of that 78:
-    # ~74 minutes compiling, ~2 minutes actually running 900-odd tests.
-    #
-    # The duplicate `cargo build` in front of `cargo test` is gone (see validate.ps1), which
-    # should remove the larger half. 90 stays as headroom until a run proves it can come down.
-    timeout-minutes: 90
+    # 60 is headroom for a COLD run: GitHub evicts a cache nobody touches for 7 days, so the
+    # first push after a break starts from nothing. If a cold run ever does time out,
+    # cache-on-failure below still saves what it built, and the next run finishes.
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -157,7 +158,7 @@ jobs:
       # embeds it. Uncached, every cold run re-downloads it: slower, and a network dependency
       # on the critical path of every build (i.e. a flake source unrelated to the code).
       - name: Cache the bundled CPython tarball
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: vendor/pbs-cache
           key: pbs-${{ runner.os }}-${{ hashFiles('crates/neuron-core/build.rs') }}
@@ -178,7 +179,7 @@ jobs:
     # else would notice them rotting until someone actually attempts the port. The excluded
     # crate and the reasoning live in validate.ps1, next to the command.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -190,7 +191,7 @@ jobs:
         with:
           cache-on-failure: true
       - name: Cache the bundled CPython tarball
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: vendor/pbs-cache
           key: pbs-${{ runner.os }}-${{ hashFiles('crates/neuron-core/build.rs') }}

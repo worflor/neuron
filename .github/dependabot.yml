@@ -1,0 +1,29 @@
+# SPDX-FileCopyrightText: 2026 Woflo Labs
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
+# Keeps the workflows' `uses: …@vN` pins from rotting, and nothing else.
+#
+# WHY THIS EXISTS: until now the pins sat two to three majors behind, and every CI log
+# carried "Node.js 20 is deprecated" warnings. That becomes a hard failure the day GitHub
+# removes the runtime. A pin that only moves when someone notices a warning will eventually
+# be noticed as a broken release.
+#
+# WHY ONLY github-actions: cargo dependencies are deliberately NOT here. Cargo.lock is
+# committed and CI builds with --locked, so a dependency bump is a real change that deserves
+# a human deciding when. A bot opening crate PRs would just be a second inbox.
+#
+# Monthly and grouped into ONE pull request, because every workflow edit triggers a full
+# windows CI run. That's at most one run a month.
+
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "Bump workflow actions"

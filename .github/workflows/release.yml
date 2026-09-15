@@ -61,7 +61,7 @@ jobs:
     # would time out, and a timed-out release saves no cache, so it would time out forever.
     timeout-minutes: 180
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # A release must never ship a version that disagrees with the binary. `neuron --version`
       # reports Cargo.toml's workspace version, so the tag has to say the same thing.
@@ -100,7 +100,7 @@ jobs:
 
       # Same cache as ci.yml — build.rs fetches a ~46 MB CPython tarball on a miss.
       - name: Cache the bundled CPython tarball
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: vendor/pbs-cache
           key: pbs-${{ runner.os }}-${{ hashFiles('crates/neuron-core/build.rs') }}
@@ -173,7 +173,7 @@ jobs:
       # this commit + this workflow. Verify with `gh attestation verify <zip> --repo <owner/repo>`.
       - name: Attest build provenance
         if: ${{ !github.event.repository.private }}
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: dist/${{ env.name }}.zip
 

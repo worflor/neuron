@@ -87,9 +87,13 @@ not part of the system above.
 
 ## Applying it
 
+**It applies itself.** Push a change to `labels.yml` on `main` and the `sync-labels` workflow
+pushes it onto the repo within seconds. You only need the script by hand to preview a
+change, or to sync from a branch:
+
 ```bash
 bash .github/sync-labels.sh --dry-run   # show what would be pushed
-bash .github/sync-labels.sh             # push labels.yml onto the repo
+bash .github/sync-labels.sh             # push labels.yml onto the repo now
 ```
 
 The sync is idempotent and **never deletes**. A label added by hand survives the run
