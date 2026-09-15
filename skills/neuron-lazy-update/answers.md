@@ -35,15 +35,8 @@ Short answers you can give directly. Check the linked source if the user wants m
 - **Where are my settings?** In the install folder next to the exes, or in `%LOCALAPPDATA%\neuron`
   if the install folder isn't writable.
 
-## Reporting a bug
+## Something broken, or a bug to report
 
-Help the user file a good report:
-
-1. Open https://github.com/worflor/neuron/issues/new?template=bug_report.md
-2. Include: the device and its PID (`neuron.exe list` shows it), the Windows build (`winver`), what
-   happened, and what they expected.
-3. For device or lighting problems: open the SYSTEM page in the app, run the diagnostics bench
-   (nine read-only checks, always safe), and paste the output.
-4. If `neuron-crash.log` exists in the config folder, attach it.
-
-A security problem does **not** go in a public issue. Use the private report link in `SECURITY.md`.
+Follow [issues.md](issues.md): research it, answer, and offer to draft an issue only when it's a
+real, unreported problem. A security problem never goes in a public issue. Use the private report
+link in `SECURITY.md`.

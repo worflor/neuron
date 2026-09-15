@@ -17,7 +17,8 @@ stop when it tells you to.
 |---|---|
 | install, update, roll back, uninstall, or know their version | [update.md](update.md) |
 | change a setting, read a device, or run any `neuron` command | [cli.md](cli.md) |
-| know how something works, whether it's supported, or where to report a bug | [answers.md](answers.md) |
+| know how something works, or whether it's supported | [answers.md](answers.md) |
+| says something didn't work, or asks why something is the way it is | [issues.md](issues.md) |
 
 Read only the file you need.
 
@@ -49,7 +50,8 @@ These are not judgement calls.
 2. **Never delete the user's config.** Their profiles, bindings and settings sit next to the exes
    or in `%LOCALAPPDATA%\neuron`. The script never deletes anything, and neither do you.
 3. **Never do these unless the user asks for that exact thing:** arm input, use `--persist`, run
-   `neuron-app.exe --purge-synapse`, pass `-AllowDowngrade`, or run a macro file.
+   `neuron-app.exe --purge-synapse`, pass `-AllowDowngrade`, run a macro file, or file an issue.
+   Filing is an offer you make once. Only file after the user has approved the exact text.
 4. **Don't invent commands or flags.** If you're unsure, run `neuron.exe <command> --help` and use
    what it says.
 5. **When you're unsure, ask the user.** A wrong guess here changes someone's hardware or setup.
