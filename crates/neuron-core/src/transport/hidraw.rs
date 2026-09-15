@@ -1,0 +1,658 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
+//! Linux HID transport via `/dev/hidrawN` (`libc::ioctl`/`write`/`poll`/`read`), enumerated from
+//! `/sys/class/hidraw/`.
+//!
+//! ## Windows exposes one path per collection; Linux exposes one node per interface
+//!
+//! `HidD_GetCaps` on Windows already answers "how big is this collection's feature/input/output
+//! report" per top-level collection, because Windows itself enumerates one HID path per top-level
+//! collection. Linux only hands out one `/dev/hidrawN` per HID INTERFACE, which can carry several
+//! top-level collections and several report IDs behind that one node — so this backend parses the
+//! interface's report descriptor itself ([`super::hid_descriptor`]) and emits one [`HidDeviceInfo`]
+//! per top-level Application collection, with a `#colNN` suffix on the [`DevicePath`] to keep them
+//! addressable as distinct "devices" the way the rest of neuron already expects (see
+//! `transport.rs`'s module doc and `HidDeviceInfo`).
+//!
+//! ## ioctl numbers
+//!
+//! `HIDIOCSFEATURE`/`HIDIOCGFEATURE` are defined in `include/uapi/linux/hidraw.h` as
+//! `_IOC(_IOC_WRITE|_IOC_READ, 'H', 0x06/0x07, len)` — a VARIABLE-size ioctl whose encoded size
+//! field the hidraw driver reads back out of the command number to know how many bytes to copy, so
+//! it must be computed per call from the buffer length, not hardcoded. The generic `_IOC` encoding
+//! (`include/uapi/asm-generic/ioctl.h`: 2-bit dir | 14-bit size | 8-bit type | 8-bit nr, in that
+//! bit order from the top) is what x86_64 and aarch64 both use; a handful of exotic architectures
+//! (mips, sparc, powerpc, alpha) define their OWN dir/size bit layout, so this file intentionally
+//! fails to compile there (see the `compile_error!` below) rather than silently deriving a wrong
+//! ioctl number for them. Both files were read from this machine's WSL2 install
+//! (`/usr/include/linux/hidraw.h`, `/usr/include/asm-generic/ioctl.h`) while writing this, not
+//! recalled from memory.
+//!
+//! The comment right above `HIDIOCSFEATURE`/`HIDIOCGFEATURE` in `hidraw.h` — "The first byte of
+//! SFEATURE and GFEATURE is the report number" — is the Linux side of the same report-ID-first
+//! convention `windows_hid.rs` documents for `HidD_Get/SetFeature`, so `Transport::set_feature`/
+//! `get_feature`'s buffer contract is identical on both backends: byte 0 is the report number, 0
+//! when the collection doesn't use report IDs.
+
+use super::hid_descriptor;
+use super::{wire_lock_for, DevicePath, HidDeviceInfo, InputReader, Transport, WireLock};
+use anyhow::{bail, Result};
+use std::ffi::CString;
+use std::os::unix::io::RawFd;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+compile_error!(
+    "neuron's hidraw backend only derives ioctl numbers for the generic asm-generic/ioctl.h \
+     encoding (x86_64, aarch64). Other architectures (mips/sparc/powerpc/alpha/...) define a \
+     different dir/size bit layout and would silently get the WRONG ioctl number here rather \
+     than a compile error — add and verify that architecture's encoding before enabling it."
+);
+
+// include/uapi/linux/hidraw.h
+const HIDIOC_MAGIC: u32 = b'H' as u32; // 0x48
+const HIDIOCSFEATURE_NR: u32 = 0x06;
+const HIDIOCGFEATURE_NR: u32 = 0x07;
+
+// include/uapi/asm-generic/ioctl.h: bit layout shared by x86_64 and aarch64 (see the module doc
+// and the `compile_error!` above).
+const IOC_WRITE: u32 = 1;
+const IOC_READ: u32 = 2;
+const IOC_NRSHIFT: u32 = 0;
+const IOC_TYPESHIFT: u32 = 8;
+const IOC_SIZESHIFT: u32 = 16;
+const IOC_DIRSHIFT: u32 = 30;
+const IOC_SIZEMASK: u32 = 0x3FFF; // 14 bits
+
+/// Build the `_IOC(_IOC_WRITE|_IOC_READ, 'H', nr, len)` request number for HIDIOCSFEATURE/
+/// HIDIOCGFEATURE. `len` is masked to the 14-bit size field rather than asserted, matching the
+/// kernel macro (`_IOC_TYPECHECK` doesn't apply here since the size is a runtime buffer length,
+/// not a fixed C type) — a `len` over 16383 bytes silently truncates the size field, which no real
+/// HID report ever approaches.
+fn feature_ioctl(nr: u32, len: usize) -> libc::c_ulong {
+    let size = (len as u32) & IOC_SIZEMASK;
+    let dir = IOC_WRITE | IOC_READ;
+    ((dir << IOC_DIRSHIFT) | (size << IOC_SIZESHIFT) | (HIDIOC_MAGIC << IOC_TYPESHIFT) | (nr << IOC_NRSHIFT))
+        as libc::c_ulong
+}
+
+fn last_os_error() -> std::io::Error {
+    std::io::Error::last_os_error()
+}
+
+/// `errno` for a failed syscall as an owned code, so callers can special-case ENODEV/EPIPE (device
+/// unplugged) without a second `errno()` read racing a subsequent call.
+fn errno_of(err: &std::io::Error) -> i32 {
+    err.raw_os_error().unwrap_or(0)
+}
+
+/// True for the errno pair that means "the device is gone" — unplugged mid-conversation (ENODEV)
+/// or the far end of the pipe closed under us (EPIPE). Both get a distinctly-worded error so a
+/// caller's disconnect handling doesn't have to string-match a generic I/O failure.
+fn is_disconnect(errno: i32) -> bool {
+    errno == libc::ENODEV || errno == libc::EPIPE
+}
+
+// ── sysfs enumeration ──────────────────────────────────────────────────────────────────────────
+
+/// Parse a `hidraw*/device/uevent` file's `HID_ID=bus:vendor:product` line (hex, each field 4-8
+/// digits wide — real devices vary, so this parses whatever width is present rather than assuming
+/// one). Pure and platform-independent so it's testable without touching `/sys`.
+fn parse_hid_id(uevent: &str) -> Option<(u16, u16, u16)> {
+    for line in uevent.lines() {
+        if let Some(rest) = line.strip_prefix("HID_ID=") {
+            let mut parts = rest.trim().split(':');
+            let bus = u16::from_str_radix(parts.next()?, 16).ok()?;
+            let vid = u16::from_str_radix(parts.next()?, 16).ok()?;
+            let pid = u16::from_str_radix(parts.next()?, 16).ok()?;
+            return Some((bus, vid, pid));
+        }
+    }
+    None
+}
+
+const BUS_USB: u16 = 0x0003;
+const BUS_BLUETOOTH: u16 = 0x0005;
+
+/// FNV-1a over raw bytes — used both for the wire-lock file name (below) and available here for
+/// anything else that needs a short, stable, cross-process-reproducible tag from a path. Not
+/// `DefaultHasher`: its SipHash keys are randomized per process, so two processes (the CLI and the
+/// app) would derive two different names for the identical device and never share a lock.
+fn stable_hash(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h = (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Encode a `DevicePath` for one top-level collection: the hidraw node's canonical sysfs path,
+/// plus a 1-based 2-digit collection index. `col_index` must be 1-99.
+fn encode_path(canonical_sysfs_path: &str, col_index: u32) -> DevicePath {
+    DevicePath::from_str(&format!("{canonical_sysfs_path}#col{col_index:02}"))
+}
+
+/// Split an encoded `DevicePath` back into its sysfs path and collection index. Pure (no `/sys`
+/// access), so it's testable without real hardware; [`hidraw_dev_node`] is the part that touches
+/// the path further (deriving `/dev/hidrawN`).
+fn decode_path(raw: &str) -> Option<(&str, u32)> {
+    let idx = raw.rfind("#col")?;
+    let digits = raw.get(idx + 4..)?;
+    if digits.len() != 2 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((&raw[..idx], digits.parse().ok()?))
+}
+
+/// The `/dev/hidrawN` node a `DevicePath` opens to — the basename of the sysfs path component
+/// before `#colNN` (the canonical sysfs path ends in `.../hidraw/hidrawN`).
+fn hidraw_dev_node(path: &DevicePath) -> Result<String> {
+    let raw = path.as_os_str().to_string_lossy();
+    let (sysfs_path, _col) = decode_path(&raw)
+        .ok_or_else(|| anyhow::anyhow!("not a hidraw DevicePath: {raw:?}"))?;
+    let basename = sysfs_path
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("malformed hidraw sysfs path: {sysfs_path:?}"))?;
+    Ok(format!("/dev/{basename}"))
+}
+
+/// Walk upward from the hidraw node's canonical sysfs path looking for the nearest ancestor with a
+/// readable `product` attribute — the USB device node's (`manufacturer`/`product`/`serial` live
+/// only on a `usb_device`, never on a `usb_interface` or a `hid` bus device, so the first hit while
+/// walking up IS the physical USB device's own string, whatever the exact nesting depth). Bounded
+/// so a Bluetooth device (no such ancestor) or an unexpected layout can't walk indefinitely.
+fn usb_product_string(canonical_hidraw_path: &Path) -> Option<String> {
+    let mut dir = canonical_hidraw_path.to_path_buf();
+    for _ in 0..8 {
+        dir = dir.parent()?.to_path_buf();
+        if let Ok(s) = std::fs::read_to_string(dir.join("product")) {
+            let s = s.trim();
+            if !s.is_empty() {
+                return Some(s.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Enumerate every present `/dev/hidrawN` interface, emitting one [`HidDeviceInfo`] per top-level
+/// Application collection its report descriptor declares. `/sys/class/hidraw/*/device/uevent` and
+/// `report_descriptor` are both world-readable, so this needs no `/dev` permissions — only opening
+/// a collection for I/O does. No vendor filter: every USB (bus 0x0003) and Bluetooth (bus 0x0005)
+/// HID interface is included, mirroring the Windows backend's unfiltered `enumerate`. A node this
+/// process can't fully read (races with unplug, a permission-locked file) is silently skipped,
+/// same as Windows' `query` returning `None`.
+pub fn enumerate() -> Result<Vec<HidDeviceInfo>> {
+    let mut out = Vec::new();
+    let entries = match std::fs::read_dir("/sys/class/hidraw") {
+        Ok(d) => d,
+        // No hidraw class at all (module not loaded, or a non-Linux-HID system) — an honest empty
+        // bus, matching how the Windows backend reports "nothing found" rather than erroring.
+        Err(_) => return Ok(out),
+    };
+    for entry in entries.flatten() {
+        let device_dir = entry.path().join("device");
+        let Ok(uevent) = std::fs::read_to_string(device_dir.join("uevent")) else {
+            continue;
+        };
+        let Some((bus, vid, pid)) = parse_hid_id(&uevent) else {
+            continue;
+        };
+        if bus != BUS_USB && bus != BUS_BLUETOOTH {
+            continue;
+        }
+        let Ok(desc_bytes) = std::fs::read(device_dir.join("report_descriptor")) else {
+            continue;
+        };
+        let Ok(canonical) = std::fs::canonicalize(entry.path()) else {
+            continue;
+        };
+        let canonical_str = canonical.to_string_lossy().into_owned();
+        let product = usb_product_string(&canonical).unwrap_or_default();
+
+        for (i, caps) in hid_descriptor::parse(&desc_bytes).into_iter().enumerate() {
+            out.push(HidDeviceInfo {
+                vid,
+                pid,
+                usage_page: caps.usage_page,
+                usage: caps.usage,
+                feature_len: caps.feature_len,
+                input_len: caps.input_len,
+                output_len: caps.output_len,
+                path: encode_path(&canonical_str, (i + 1) as u32),
+                product: product.clone(),
+            });
+        }
+    }
+    Ok(out)
+}
+
+// ── poll-bounded read, shared by the Transport's read_input and InputReader ──────────────────────
+
+/// One bounded read: `poll(2)` up to `timeout_ms`, then `read(2)`. `Ok(Some(n))` = data, `Ok(None)`
+/// = the wait elapsed with nothing to read (NOT an error), `Err` = a real failure — `ENODEV`/
+/// `EPIPE` (device gone) get an explicit message, anything else the raw OS error. Retries both
+/// `poll` and `read` on `EINTR`, so a caller never sees a signal-interrupted wait as either a
+/// timeout or a failure — a signal must SHORTEN the remaining wait, never restart it, or a request/
+/// reply caller's timeout (its actual answer, not a spurious wakeup — see `read_input`) could be
+/// extended arbitrarily by repeated interruptions.
+fn poll_read(fd: RawFd, buf: &mut [u8], timeout_ms: i32) -> Result<Option<usize>> {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(0) as u64);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let remaining_ms = remaining.as_millis().min(i32::MAX as u128) as i32;
+        if remaining_ms == 0 && Instant::now() >= deadline {
+            return Ok(None); // deadline exhausted, possibly across several EINTR retries
+        }
+        let ret = unsafe { libc::poll(&mut pfd, 1, remaining_ms) };
+        if ret < 0 {
+            let err = last_os_error();
+            if errno_of(&err) == libc::EINTR {
+                continue; // re-poll with whatever time is LEFT, not the original budget
+            }
+            bail!("poll(2) failed: {err}");
+        }
+        if ret == 0 {
+            return Ok(None); // timed out, nothing to read
+        }
+        break;
+    }
+    loop {
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+        if n < 0 {
+            let err = last_os_error();
+            let errno = errno_of(&err);
+            if errno == libc::EINTR {
+                continue;
+            }
+            if is_disconnect(errno) {
+                bail!("device disconnected: {err}");
+            }
+            bail!("read(2) failed: {err}");
+        }
+        return Ok(Some(n as usize));
+    }
+}
+
+fn open_rdwr(dev_node: &str) -> Result<RawFd> {
+    let cpath = CString::new(dev_node).map_err(|_| anyhow::anyhow!("device node path has an embedded NUL"))?;
+    let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+    if fd < 0 {
+        bail!("open {dev_node} failed: {}", last_os_error());
+    }
+    Ok(fd)
+}
+
+/// A control channel to one top-level collection's `/dev/hidrawN` interface. Feature reports
+/// (`set_feature`/`get_feature`) and output reports (`write_output`) all ride this ONE fd, opened
+/// `O_RDWR | O_CLOEXEC` — unlike Windows, hidraw has no separate "protected collection" access
+/// tier to work around, so there's no fallback-to-access-0 story here.
+pub struct HidRaw {
+    fd: RawFd,
+    /// Several top-level collections share ONE `/dev/hidrawN` node (see the module doc), so two
+    /// `HidRaw`s on different collections of the SAME interface each open their OWN fd rather than
+    /// sharing one — Linux offers no per-collection handle, so per-collection isolation the way
+    /// Windows gets it for free doesn't exist here; two collections' conversations can still
+    /// interleave on the wire. `wire_lock_for` keys on the FULL `DevicePath` (sysfs path + colNN),
+    /// so this only serializes handles opened on the SAME collection, same as Windows — a known,
+    /// documented gap versus Windows' natural per-collection isolation, not a regression this
+    /// backend can close without a kernel-side interface split.
+    wire: Arc<WireLock>,
+}
+
+impl HidRaw {
+    pub fn open(path: &DevicePath) -> Result<Self> {
+        let dev_node = hidraw_dev_node(path)?;
+        let fd = open_rdwr(&dev_node)?;
+        Ok(HidRaw {
+            fd,
+            wire: wire_lock_for(path),
+        })
+    }
+}
+
+impl Drop for HidRaw {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.fd);
+        }
+    }
+}
+
+impl Transport for HidRaw {
+    fn wire_lock(&self) -> Option<Arc<WireLock>> {
+        Some(self.wire.clone())
+    }
+
+    fn set_feature(&self, buf: &[u8]) -> Result<()> {
+        let req = feature_ioctl(HIDIOCSFEATURE_NR, buf.len());
+        let ret = unsafe { libc::ioctl(self.fd, req as _, buf.as_ptr()) };
+        if ret < 0 {
+            let err = last_os_error();
+            if is_disconnect(errno_of(&err)) {
+                bail!("device disconnected: {err}");
+            }
+            bail!("HIDIOCSFEATURE failed: {err}");
+        }
+        Ok(())
+    }
+
+    fn get_feature(&self, buf: &mut [u8]) -> Result<usize> {
+        let req = feature_ioctl(HIDIOCGFEATURE_NR, buf.len());
+        let ret = unsafe { libc::ioctl(self.fd, req as _, buf.as_mut_ptr()) };
+        if ret < 0 {
+            let err = last_os_error();
+            if is_disconnect(errno_of(&err)) {
+                bail!("device disconnected: {err}");
+            }
+            bail!("HIDIOCGFEATURE failed: {err}");
+        }
+        // The hidraw driver's GFEATURE ioctl returns the number of bytes actually transferred —
+        // the real short-read count, same contract as `HidD_GetFeature`'s length on Windows.
+        Ok(ret as usize)
+    }
+
+    fn write_output(&self, buf: &[u8]) -> Result<()> {
+        let n = unsafe { libc::write(self.fd, buf.as_ptr().cast(), buf.len()) };
+        if n < 0 {
+            let err = last_os_error();
+            if is_disconnect(errno_of(&err)) {
+                bail!("device disconnected: {err}");
+            }
+            bail!("write(2) (output report) failed: {err}");
+        }
+        // An output report is a single fixed-size frame — a real HID device never accepts a
+        // partial one, so a short write here means the report did NOT land as sent. `write(2)` on
+        // a character device can return fewer bytes than requested without erroring; trust the
+        // count, not the non-negative return alone.
+        if n as usize != buf.len() {
+            bail!("write(2) (output report) short write: sent {n} of {} bytes", buf.len());
+        }
+        Ok(())
+    }
+
+    fn read_input(&self, buf: &mut [u8], timeout_ms: u32) -> Result<usize> {
+        // Request/reply contract: a timeout here IS the caller's answer, not a spurious wakeup to
+        // loop past — so `poll_read`'s `Ok(None)` becomes an honest error, mirroring
+        // `WinHid::read_input`.
+        match poll_read(self.fd, buf, timeout_ms as i32)? {
+            Some(n) => Ok(n),
+            None => bail!("read_input timed out after {timeout_ms} ms"),
+        }
+    }
+}
+
+/// How long one [`HidRawReader::read`] waits for a report before returning `Ok(None)` and letting
+/// the caller loop back around — mirrors `windows_hid::READER_POLL_TIMEOUT_MS`.
+const READER_POLL_TIMEOUT_MS: i32 = 400;
+
+/// A read-only handle for one collection's device-initiated input reports — a separate fd from
+/// [`HidRaw`], opened `O_RDONLY`, so a long-lived listener thread never contends the control fd's
+/// feature-report conversations.
+pub struct HidRawReader {
+    fd: RawFd,
+}
+
+impl HidRawReader {
+    pub fn open(path: &DevicePath) -> Result<Self> {
+        let dev_node = hidraw_dev_node(path)?;
+        let cpath = CString::new(dev_node.clone())
+            .map_err(|_| anyhow::anyhow!("device node path has an embedded NUL"))?;
+        let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        if fd < 0 {
+            bail!("open {dev_node} (read) failed: {}", last_os_error());
+        }
+        Ok(HidRawReader { fd })
+    }
+}
+
+impl Drop for HidRawReader {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.fd);
+        }
+    }
+}
+
+impl InputReader for HidRawReader {
+    fn read(&self, buf: &mut [u8]) -> Result<Option<usize>> {
+        poll_read(self.fd, buf, READER_POLL_TIMEOUT_MS)
+    }
+}
+
+// ── cross-process wire lock (flock) ───────────────────────────────────────────────────────────
+
+/// Bounded wait for the cross-process flock — mirrors `windows_hid::WIRE_OS_WAIT_MS` and the same
+/// reasoning: a legitimate conversation holds far less than this, so timing out means the foreign
+/// holder is wedged and degrading to process-local-only is the safe choice.
+const WIRE_FLOCK_WAIT_MS: u32 = 2000;
+/// Poll interval while waiting for the flock — `flock(2)` has no built-in timeout, so the bounded
+/// wait above is implemented as a short-sleep retry loop.
+const WIRE_FLOCK_POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+fn lock_dir() -> PathBuf {
+    match std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
+        Some(rt) => PathBuf::from(rt).join("neuron"),
+        None => std::env::temp_dir().join("neuron"),
+    }
+}
+
+/// The KERNEL half of a [`WireLock`] on Linux: an `flock(2)` on a well-known file under
+/// `$XDG_RUNTIME_DIR/neuron/` (falling back to the system temp dir), named from a stable hash of
+/// the `DevicePath` so every neuron process opening the same control pipe locks the same file.
+/// `flock` locks are per OPEN FILE DESCRIPTION, not per process, so two processes (or two
+/// independently-`open()`ed fds in one process — see the test below) contend the SAME lock exactly
+/// the way `OsWireMutex`'s named kernel mutex does on Windows.
+pub(super) struct OsWireFlock {
+    fd: RawFd,
+}
+
+impl OsWireFlock {
+    pub(super) fn for_path(path: &DevicePath) -> Option<OsWireFlock> {
+        let hash = stable_hash(path.as_os_str().to_string_lossy().as_bytes());
+        let dir = lock_dir();
+        std::fs::create_dir_all(&dir).ok()?;
+        Self::open_named(&dir.join(format!("wire-{hash:016x}.lock")))
+    }
+
+    /// Create-or-open the lock file and hold its fd (the flock is taken/released per conversation
+    /// by [`acquire`](Self::acquire)/[`release`](Self::release), not for the fd's whole lifetime).
+    /// `None` on any failure (unwritable runtime dir, exotic filesystem) — the caller degrades to
+    /// process-local-only, never worse than the pre-cross-process behavior.
+    pub(super) fn open_named(file: &Path) -> Option<OsWireFlock> {
+        let cpath = CString::new(file.as_os_str().to_string_lossy().into_owned()).ok()?;
+        let fd = unsafe {
+            libc::open(
+                cpath.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            None
+        } else {
+            Some(OsWireFlock { fd })
+        }
+    }
+
+    /// Bounded acquire; `true` = held.
+    pub(super) fn acquire(&self) -> bool {
+        self.acquire_for(WIRE_FLOCK_WAIT_MS)
+    }
+
+    /// [`acquire`](Self::acquire) with an explicit wait budget — the production path always uses
+    /// `WIRE_FLOCK_WAIT_MS`; tests use short budgets to prove blocking without stalling the suite.
+    pub(super) fn acquire_for(&self, ms: u32) -> bool {
+        let deadline = Instant::now() + Duration::from_millis(ms as u64);
+        loop {
+            let ret = unsafe { libc::flock(self.fd, libc::LOCK_EX | libc::LOCK_NB) };
+            if ret == 0 {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(WIRE_FLOCK_POLL_INTERVAL);
+        }
+    }
+
+    pub(super) fn release(&self) {
+        unsafe {
+            libc::flock(self.fd, libc::LOCK_UN);
+        }
+    }
+}
+
+impl Drop for OsWireFlock {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.fd);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── pure parsing ───────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn parses_hid_id_from_uevent() {
+        let uevent = "DRIVER=hid-generic\nHID_ID=0003:00001532:0000005A\nHID_NAME=Razer Naga\n";
+        assert_eq!(parse_hid_id(uevent), Some((0x0003, 0x1532, 0x005A)));
+    }
+
+    #[test]
+    fn parses_hid_id_with_narrow_hex_fields() {
+        // Real files pad vendor/product to 8 hex digits, but the parser shouldn't assume the
+        // width — it splits on ':' and parses whatever's there.
+        let uevent = "HID_ID=3:1532:a8\n";
+        assert_eq!(parse_hid_id(uevent), Some((0x0003, 0x1532, 0x00A8)));
+    }
+
+    #[test]
+    fn missing_hid_id_line_is_none() {
+        assert_eq!(parse_hid_id("DRIVER=hid-generic\nHID_NAME=Foo\n"), None);
+    }
+
+    #[test]
+    fn malformed_hid_id_is_none_not_a_panic() {
+        assert_eq!(parse_hid_id("HID_ID=not-hex-at-all\n"), None);
+        assert_eq!(parse_hid_id("HID_ID=0003:1532\n"), None); // missing product field
+        assert_eq!(parse_hid_id(""), None);
+    }
+
+    #[test]
+    fn encode_and_decode_round_trip() {
+        let path = encode_path("/sys/devices/.../hidraw/hidraw3", 7);
+        let raw = path.as_os_str().to_string_lossy();
+        assert!(raw.ends_with("#col07"));
+        let (sysfs, col) = decode_path(&raw).expect("decodes");
+        assert_eq!(sysfs, "/sys/devices/.../hidraw/hidraw3");
+        assert_eq!(col, 7);
+    }
+
+    #[test]
+    fn decode_rejects_paths_without_the_suffix() {
+        assert_eq!(decode_path("/sys/devices/.../hidraw/hidraw3"), None);
+        assert_eq!(decode_path("/sys/devices/.../hidraw/hidraw3#col1"), None); // not 2 digits
+        assert_eq!(decode_path("/sys/devices/.../hidraw/hidraw3#colxx"), None);
+    }
+
+    #[test]
+    fn dev_node_from_encoded_path() {
+        let path = encode_path("/sys/devices/pci0000:00/usb1/1-2/1-2:1.0/0003:1532:0091.0001/hidraw/hidraw2", 1);
+        assert_eq!(hidraw_dev_node(&path).expect("resolves"), "/dev/hidraw2");
+    }
+
+    #[test]
+    fn feature_ioctl_matches_the_kernel_uapi_header() {
+        // include/uapi/linux/hidraw.h: HIDIOCGFEATURE(len) = _IOC(_IOC_WRITE|_IOC_READ,'H',0x07,len)
+        // include/uapi/asm-generic/ioctl.h: _IOC(dir,type,nr,size) =
+        //   (dir<<30)|(type<<8)|(nr<<0)|(size<<16)
+        // For len=91 (the razer_report feature length): dir=3, type='H'=0x48, nr=0x07, size=91.
+        let got = feature_ioctl(HIDIOCGFEATURE_NR, 91);
+        let want: u32 = (3u32 << 30) | (91u32 << 16) | (0x48u32 << 8) | 0x07;
+        assert_eq!(got, want as libc::c_ulong);
+    }
+
+    #[test]
+    fn stable_hash_is_deterministic_and_path_sensitive() {
+        assert_eq!(stable_hash(b"/dev/hidraw0"), stable_hash(b"/dev/hidraw0"));
+        assert_ne!(stable_hash(b"/dev/hidraw0"), stable_hash(b"/dev/hidraw1"));
+    }
+
+    // ── the flock exclusion contract ──────────────────────────────────────────────────────────
+
+    /// `flock` locks belong to the OPEN FILE DESCRIPTION, not the process — two independently
+    /// `open()`ed fds onto the SAME path contend the lock exactly like two separate processes
+    /// would, so this same-process test is a faithful proof of the cross-process guarantee (the
+    /// same reasoning `windows_hid.rs`'s named-kernel-mutex test relies on for its two handles).
+    #[test]
+    fn flock_excludes_across_separate_opens_of_the_same_file() {
+        let dir = std::env::temp_dir().join(format!("neuron-wire-selftest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let file = dir.join("wire.lock");
+
+        let a = OsWireFlock::open_named(&file).expect("first open");
+        let b = OsWireFlock::open_named(&file).expect("second open");
+        assert!(a.acquire(), "first handle acquires immediately");
+        assert!(
+            !b.acquire_for(100),
+            "a second, independently-opened fd on the SAME file must NOT acquire while the \
+             first holds — otherwise flock exclusion here is fiction"
+        );
+        a.release();
+        assert!(
+            b.acquire_for(WIRE_FLOCK_WAIT_MS),
+            "once the first releases, the second must be able to acquire"
+        );
+        b.release();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── live checkpoint ────────────────────────────────────────────────────────────────────────
+
+    /// LIVE enumeration probe: prints what this machine's `enumerate()` sees. For the hardware
+    /// checkpoint — run with a real Razer device (or any HID device) plugged into WSL via
+    /// `usbipd`/passthrough:
+    /// `cargo test -p neuron --lib transport::hidraw::tests::live_enumerate -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs a HID device present on this machine"]
+    fn live_enumerate() {
+        let _wire = crate::transport::allow_real_hardware();
+        match crate::transport::enumerate() {
+            Ok(devices) => {
+                println!("{} HID collection(s):", devices.len());
+                for d in &devices {
+                    println!(
+                        "  vid={:04x} pid={:04x} usage_page={:#06x} usage={:#06x} \
+                         feature_len={} input_len={} output_len={} product={:?} path={:?}",
+                        d.vid,
+                        d.pid,
+                        d.usage_page,
+                        d.usage,
+                        d.feature_len,
+                        d.input_len,
+                        d.output_len,
+                        d.product,
+                        d.path.as_os_str()
+                    );
+                }
+            }
+            Err(e) => println!("enumerate() failed: {e}"),
+        }
+    }
+}
