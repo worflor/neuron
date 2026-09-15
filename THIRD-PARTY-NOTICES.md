@@ -950,7 +950,7 @@ copied from:
   copied the other's expression, only that the hardware behaves
   consistently.
 - A targeted check of `crates/neuron-core/src/device.rs`, `registry.rs`,
-  `synth.rs`, and the docs that discuss OpenRazer (`docs/PROTOCOL-HOST-RND.md`)
+  `synth.rs`, and the docs that discuss OpenRazer (`docs/PROTOCOL-HOST.md`)
   found no verbatim code, comment blocks, or tables copied from OpenRazer.
   README's own wording is explicit that opcodes were "worked out from" wire
   captures and the OpenRazer driver "and a lot of live probing", i.e.

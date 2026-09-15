@@ -1,21 +1,30 @@
-> **🤖 agent-generated · live context doc**
-> *not official docs.* an LLM wrote this while building neuron. it may be
-> stale, wrong, or slop — or it may be load-bearing and exactly right.
-> code is the source of truth; verify before you lean on it.
+> **kind:** subsystem design — the protocol host (`crates/neuron-host`): what it is,
+> the principles it must not violate, and the wire details each adapter needs. The
+> app-wide architecture is [`TDD.md`](TDD.md); what the hub does for a user is
+> [`GDD.md`](GDD.md#talks-to-your-gear).
 >
-> **kind:** R&D findings + design (protocol-host) · **as of:** 2026-07-04 · **trust:** the thesis, principles, and design sections are durable; the integration plan tracks a moving codebase
+> **🤖 agent-generated.** An LLM wrote this while building neuron. It may be stale or
+> wrong. The code is the source of truth; verify before you lean on a detail.
 
-# Neuron Protocol Host — R&D Findings & Design
+# Neuron Protocol Host
 
-> **Status:** R&D, branch `rnd/protocol-host`.
-> **Purpose:** Durable record of the research + design behind making neuron a *local
-> protocol host* — the hub that speaks every RGB/telemetry/creator/automation
-> protocol, built from first principles in Rust to be the best of all of them.
-> Everything below is distilled from a large research pass (Synapse parity +
-> protocol landscape) plus the architecture reasoning that followed.
+**Purpose:** the durable design record behind making neuron a *local protocol host* —
+the hub that speaks RGB, telemetry, creator, and automation protocols, built from
+first principles rather than by wrapping vendor SDKs.
+
+**Status: built and shipped.** `crates/neuron-host` exists and is natively integrated
+into the app: the kernel (arbiter, bus, journal, restart governor), a device writer,
+and the adapters under `src/adapters/` — OpenRGB (`127.0.0.1:6742`), Chroma REST
+(`127.0.0.1:54235`), a Chroma shared-memory face for native games, and OBS. The app's
+own lighting runs as the arbiter's animated BASE layer and games paint above it;
+`NEURON_HOST=0` opts out entirely. What is *not* built is named in
+[§6](#6-what-is-not-built-yet).
+
+The sections below are the reasoning, not a plan. Where a section describes a
+mechanism, that mechanism is in the tree; where it describes a judgement call, that
+call is still the one being honoured.
 
 ---
-
 ## 0. The one-sentence thesis
 
 **We are not building an app with integrations. We are building a local, honest,
@@ -82,74 +91,9 @@ If a port can't pass these four, it's slop no matter how good the demo looks.
 
 ---
 
-## 3. Synapse parity research (condensed)
-
-**Sourcing caveat:** reddit.com was firewalled to the research crawler the entire
-time. Evidence is from Razer Insider forums, Tom's Hardware, PC Gamer, TechPowerUp,
-RTINGS, GitHub/GitLab, and OSS-tool communities. Equivalent quality, not literal
-Reddit threads.
-
-### 3.1 What people LOVE (keep / match)
-- Per-key/button remap that persists. **Hypershift** hold-layer (we already have
-  multi-layer in `neuron-cli`; Synapse caps at ONE layer, hold-only, no lighting
-  feedback → shipping toggle-mode + layer-lighting-feedback beats them outright).
-- Macros with **real logic** — Synapse is dumb record-replay (no `if`, no clean
-  hold-until-release, no repeat-while-held; degrades over runtime; S4 "forces
-  minimum macro delay"). Our `MacroNode` tree (RepeatN/RepeatWhile/conditionals/
-  cross-macro) already beats the Synapse+AutoHotkey combo people are forced into.
-- DPI stages + OTF cycle, polling rate, lift-off distance. Snap Tap (we do it
-  *better*: gated + sealed-consent; add per-game legality labels).
-- Layered lighting (our Pattern×Spectrum ≈ Chroma Studio) + cross-device sync
-  (`lighting mirror` ≈ Chroma's most-missed feature).
-- Beloved effect vocabulary to cover: **Static, Breathing, Spectrum Cycling, Wave,
-  Reactive, Ripple, Starlight**. (Fire/Starlight/Immersive = niche.)
-
-### 3.2 Genuine feature gaps (ranked)
-1. **Reactive / Ripple lighting** — input-driven; needs a live key-event feed into
-   the compositor. In the "iconic Chroma" tier.
-2. **Wireless battery QoL** — Synapse's *most-hated small feature*. What people
-   actually want: **accurate tray readout** + **dismissible/threshold low-battery
-   warning** (false-low-on-wake is the real hatred). Sleep/threshold sliders
-   themselves are niche/rarely-touched — don't over-invest. Our own "vitals 1Hz
-   wakes a sleeping mouse" bug is the same failure class — fix it.
-3. **Audio-reactive lighting (visualizer)** — moderate-loved. **CORRECTION
-   (lifecycle map): already exists in-tree** — `neuron-core/src/audio_level.rs`
-   (~60Hz peak sampler, lock-free atomic, auto-stops ~2s unread) feeds a readout
-   pattern. Gap is polish/exposure, not existence.
-4. **Ambient/screen-mirror lighting** — niche but high-delight (SignalRGB's
-   headline paid feature). **CORRECTION: also already exists** —
-   `neuron-core/src/screen_ambient.rs` (~18Hz desktop grab → 22×6 zone grid,
-   auto-stop) + readout pattern. Same: polish, not existence.
-5. **Gaming Mode / Win-key lock** — table-stakes; ship with a visible on-state.
-6. **DPI sniper/clutch button** — essential FPS; make it first-class.
-7. **Rapid Trigger / adjustable actuation** — *the* top competitive-keyboard demand
-   of 2024-26 (207+ pro CS2 players on Hall-effect). CONDITIONAL: our BlackWidow
-   Chroma V2 isn't analog. Synapse's Rapid Trigger is **global (all-keys)** — so
-   *per-key* actuation would beat them if we ever target analog/Hall-effect boards.
-
-### 3.3 What people HATE (our architecture already answers)
-Mandatory account/cloud login (root of the 2 worst bugs: destructive cloud-sync
-wiping macros on S3→S4 migration, + slow startup). Bloat (~30% idle CPU, 160MB
-"to run a mouse", 2-3min startup, "1GB bloatware"). Telemetry/AI-training clauses.
-Always-on elevated service w/ world-writable dirs (= CVE-2021-44226). Updates that
-break macros/profiles. Cloud-sync conflict UX. Lighting/macros dying on app close.
-
-### 3.4 Market gap (why this is worth doing)
-**No actively-maintained, cross-platform, full-feature (lighting + macros + DPI +
-battery + profiles) Synapse replacement exists.** OpenRGB/SignalRGB = lighting-only,
-still need Synapse for DPI/macros. OpenRazer *deliberately removed* macros. Every
-Windows-native attempt (razer-ctl, Knife) is archived/dead. Live ones are all
-single-OS or single-device-class. **That gap is exactly where neuron sits.**
-
-### 3.5 Two late additions
-- **macOS restoration**: Synapse 2.0 ran on Mac; S3 dropped it, never returned.
-  Our cross-platform-by-traits Rust discipline makes Mac a "we restore what they
-  took away" differentiator (user has a Mac collaborator).
-- **Synapse macro XML import** = migration on-ramp ("I lost 200+ profiles" rage).
-
 ---
 
-## 4. Protocol landscape (the northbound surface)
+## 3. Protocol landscape (the northbound surface)
 
 The reframe: we RE'd the **southbound** protocols (toward silicon). The opportunity
 is the **northbound** surface (toward OS/games/network/room). Our app can be a
@@ -159,7 +103,7 @@ Signals flow IN (telemetry, sensors, SDK effects, app events) → through our en
 devices, re-emitted SDK effects, automations). **It's a bus, and we already built
 the junction box.**
 
-### 4.1 ⭐ THE KEY FINDING — be a protocol SERVER, not a DLL parasite
+### 3.1 ⭐ THE KEY FINDING — be a protocol SERVER, not a DLL parasite
 
 **The Razer Chroma native C++ SDK is just a thin HTTP client over the same
 `localhost:54235` REST server.** `RzChromaSDK64.dll` internally makes HTTP calls to
@@ -184,7 +128,7 @@ Prior art to study: `captin411/python-chroma-rest-server` (proves OS-portable
 Chroma REST server), `chroma-sdk` org (Colore/chroma-python for JSON schema
 cross-check), `Vaskivskyi/ha-chroma`.
 
-### 4.2 Chroma REST wire format (for the flagship adapter)
+### 3.2 Chroma REST wire format (for the flagship adapter)
 - `POST /razer/chromasdk` app-info → returns session URI + per-device sub-URIs.
 - `GET /razer/chromasdk` → installed SDK version.
 - `PUT` heartbeat ~1s; **15s inactivity kills the session.**
@@ -197,7 +141,7 @@ cross-check), `Vaskivskyi/ha-chroma`.
   - response `{"result": <code>}`.
 - Colors are **BGR**, not RGB. Grid → real keys via our capability/layout TOML.
 
-### 4.3 OpenRGB SDK protocol (TCP 6742) — build FIRST
+### 3.3 OpenRGB SDK protocol (TCP 6742) — build FIRST
 Fully open, versioned, cross-platform binary TCP. **16-byte header:**
 ```
 char[4] pkt_magic = "ORGB"
@@ -221,7 +165,7 @@ in other-brand devices, become the mixed-rig sync hub. Rust crates to crib:
 our device/effect model to be cleanly externally-addressable, the best pressure
 test for the internal model.
 
-### 4.4 Meta-RGB prior art (architecture references)
+### 3.4 Meta-RGB prior art (architecture references)
 - **Aurora/AuroraRGB** (C#): unifies via (1) official SDK/GSI integrations,
   (2) wrapper/compat DLLs mimicking vendor SDKs, (3) live process-memory reads
   (fragile, anti-cheat-banned). Failure mode: signature-checked SDK DLLs refuse the
@@ -234,7 +178,7 @@ test for the internal model.
   retired citing "inherent complexity of interacting with SDKs" — the DLL-per-vendor
   approach is a sinkhole. **Cautionary data point.**
 
-### 4.5 Telemetry ingest (mechanic value, not lightshow)
+### 3.5 Telemetry ingest (mechanic value, not lightshow)
 Real payoff: **auto-legality** (CS2 GSI truthfully reports in-match → Snap Tap/turbo
 self-disable on banned servers, re-enable after) + **honest state-based context
 switching** (beats Synapse's unreliable exe-name allowlist).
@@ -257,7 +201,7 @@ X-Plane RREF (dead-simple UDP subscribe), ACC/AC/RaceRoom shmem, MSFS SimConnect
 Elite. **Steal SimHub's real lesson: "normalize once, bind anywhere" + a declared
 External-Sim-Integration schema** so new games are a data file, not a parser.
 
-### 4.6 Creator / streaming ecosystem
+### 3.6 Creator / streaming ecosystem
 - **OBS `obs-websocket` v5** (`obws` crate) — ⭐ replaces the fake-keystroke hack
   the research found people using: real `SetCurrentProgramScene` works minimized,
   no hotkey collision, + bidirectional (react to `StreamStateChanged`/
@@ -275,7 +219,7 @@ External-Sim-Integration schema** so new games are a data file, not a parser.
   tools. Plus `elgato-streamdeck` crate drives *real* Stream Decks over raw HID
   (same paradigm as our Razer RE). Two-way Stream Deck citizenship, no Elgato app.
 
-### 4.7 System / media / ambient sources
+### 3.7 System / media / ambient sources
 - **Media now-playing** — SMTC (`windows::Media::Control`) + MPRIS (`mpris` crate).
   Both event-driven, near-zero cost, cross-platform. Build-first provider. Value =
   *context* (correct media-key behavior), not a visualizer.
@@ -295,7 +239,7 @@ External-Sim-Integration schema** so new games are a data file, not a parser.
   concept (auto-arm on lock); idle (`user-idle`); network/VPN (per-OS shim).
   Notifications read-back = high friction, deprioritize.
 
-### 4.8 Input / automation / smart-home emission
+### 3.8 Input / automation / smart-home emission
 - **MQTT + Home Assistant discovery** (`rumqttc`) — highest-leverage: publish
   retained discovery topics once → neuron's battery/presence/triggers appear as
   native HA entities, bidirectional. Follows OpenRGB's official-HA-integration
@@ -319,7 +263,7 @@ External-Sim-Integration schema** so new games are a data file, not a parser.
   transports: WebSocket (browser/phone), named-pipe/unix-socket (AHK/Python/Lua),
   stdin (CLI). *This is one thing, not per-client.* Our `act` verbs turned outward.
 
-### 4.9 The full port map, ranked by mechanic value
+### 3.9 The full port map, ranked by mechanic value
 **Tier 1 (build first — highest parity, cleanest lifecycle, fully local):**
 1. OpenRGB server+client (proving ground for the internal model)
 2. Chroma REST server (the "leave Synapse completely" flagship; TTL teardown)
@@ -345,9 +289,9 @@ External-Sim-Integration schema** so new games are a data file, not a parser.
 
 ---
 
-## 5. THE ARCHITECTURE (first-principles, the crown jewels)
+## 4. THE ARCHITECTURE (first-principles, the crown jewels)
 
-### 5.1 Model ownership as a first-class thing (the differentiator)
+### 4.1 Model ownership as a first-class thing (the differentiator)
 Every conflict is an ownership bug. Nobody modeled it. **We extend our layered
 compositor so every source is a LAYER WITH AN OWNER, PRIORITY, AND LIFECYCLE:**
 
@@ -373,7 +317,7 @@ one write path. Parity = honor the source's intent, then get out cleanly.
 Generalizes beyond lighting: `act`/input ownership, device-tuning claims, etc.
 **Build this before any protocol adapter — every adapter depends on it.**
 
-### 5.2 Protocols are codecs at the edges; the model is the center
+### 4.2 Protocols are codecs at the edges; the model is the center
 One canonical internal representation:
 - a **spatial device/zone/LED model** = union of Chroma's 6×22 / 8×24 grid,
   OpenRGB's zones/matrices/segments, and our real device layouts (from capability
@@ -386,7 +330,7 @@ I/O.** Adding a protocol = a small, isolated, testable codec that inherits all o
 correctness for free. This is SimHub's "normalize once, bind anywhere" + OpenRGB's
 controller model, done deliberately instead of accreted.
 
-### 5.3 Split the planes; authenticate the dangerous one
+### 4.3 Split the planes; authenticate the dangerous one
 - **Lighting-ingest plane** (Chroma/OpenRGB in): can be permissive-localhost —
   worst case someone blinks your keyboard.
 - **Control plane** (`act`/macros): can synthesize input + run commands. An
@@ -395,25 +339,25 @@ controller model, done deliberately instead of accreted.
   authenticated**, dangerous verbs behind the existing sealed-consent pattern.
   **Do this day one, not after a CVE.** None of the prior art considered this.
 
-### 5.4 Truthful capability mapping
+### 4.4 Truthful capability mapping
 When a Chroma game asks "is there a keyboard grid," answer from the *actual
 connected device's declared layout* — map its grid to real keys; when you can't
 honor something, degrade *visibly*. Same TOML that describes a device to the UI
 describes it to the Chroma grid mapper. Honesty pushed down to the handshake.
 
-### 5.5 Publish OUR OWN protocol, open + versioned, from commit one
+### 4.5 Publish OUR OWN protocol, open + versioned, from commit one
 OpenRGB became a standard because its protocol was documented + stable, so others
 integrated *with* it (HA integrated OpenRGB, not Razer). Be the OpenRGB of the next
 generation — but our surface is lighting **+ macros + tuning + telemetry**, not
 lighting-only. Version it, document the wire format, keep backward-compat.
 
-### 5.6 No fragility
+### 4.6 No fragility
 No daemon-that-breaks (OpenRGB's DKMS-per-kernel pain), no kernel module, no
 elevation, loopback-default. One Rust binary, userspace HID, servers bind
 127.0.0.1 only unless told otherwise, discoverable, killable, zero-config. The
 cross-platform-by-traits discipline is what makes this hold on Win/Linux/Mac.
 
-### 5.7 Capture-and-replay as the test methodology
+### 4.7 Capture-and-replay as the test methodology
 The RE community's superpower is packet captures. Capture real Chroma/OpenRGB/
 telemetry traffic once, replay against adapters in unit tests → protocol
 correctness with zero hardware, deterministic, regression-proof. This is how we
@@ -421,7 +365,7 @@ avoid OpenRGB's "device support = graveyard of unresolved GitHub issues" fate.
 
 ---
 
-## 6. HOST DESIGN R&D — immortal, redundant, simple (math-stack inspired)
+## 5. Host design — immortal, redundant, simple (math-stack inspired)
 
 The goal: make the host truly immortal, redundant, and simple, using our own
 math stack as inspiration. That stack is the **AR(2) eigenmotion oscillator**
@@ -433,8 +377,8 @@ is Erlang/OTP: "let it crash" + supervision trees. The move is OTP-grade
 supervision in a single Rust binary, *simpler*, with the eigenmotion math as
 genuine (not decorative) inspiration for the control laws.
 
-### 6.1 The Kernel (spine) — simple because it does almost nothing
-Owns ONLY: the canonical device/zone/LED model + the ownership arbiter (§5.1) +
+### 5.1 The Kernel (spine) — simple because it does almost nothing
+Owns ONLY: the canonical device/zone/LED model + the ownership arbiter (§4.1) +
 the signal bus. **No I/O.** Minimal surface = maximal reliability. Because it holds
 no sockets and does no parsing, it has almost nothing that *can* crash. This is the
 "simple" heart everything else orbits.
@@ -444,7 +388,7 @@ kernel is a message-passing **actor** — it owns its state on ONE thread, every
 talks to it via a channel. There is **no shared `Mutex` to poison.** A panicking
 adapter cannot corrupt kernel state because it never holds a lock on it.
 
-### 6.2 Adapters as supervised, isolated tasks (redundant + immortal)
+### 5.2 Adapters as supervised, isolated tasks (redundant + immortal)
 Each protocol (Chroma REST, OpenRGB TCP, telemetry UDP, OBS ws, ...) is a task
 that ONLY talks to the bus, spawned under a supervisor. If an adapter panics (a
 malformed packet from some game), `catch_unwind` at the task boundary contains it,
@@ -452,7 +396,7 @@ malformed packet from some game), `catch_unwind` at the task boundary contains i
 adapter dying can NEVER take the kernel or another adapter down. *That's* the
 redundancy and the immortality — death is local and cheap.
 
-### 6.3 Supervision as a DAMPED OSCILLATOR (the real math)
+### 5.3 Supervision as a DAMPED OSCILLATOR (the real math)
 This is where AR(2) stops being a metaphor and becomes the control law.
 
 A naive retry loop is a first-order system that either does nothing or storms.
@@ -472,7 +416,7 @@ recurrence determine behavior:
   going unstable → escalate. **We can literally fit an oscillator to failure
   telemetry and read off stability.**
 
-### 6.4 Cascade / residual as tiered supervision (redundancy structure)
+### 5.4 Cascade / residual as tiered supervision (redundancy structure)
 The eigenmotion codec is macro-oscillator (coarse) + micro-oscillator (fine) +
 residual (what neither captured). Map directly onto a supervision hierarchy:
 - **macro tier** = coarse supervisor over whole subsystems (all-lighting,
@@ -485,7 +429,7 @@ residual (what neither captured). Map directly onto a supervision hierarchy:
   was absorbed at each tier vs. leaked to residual. A rising residual ratio = the
   system is failing in ways our supervisors don't model yet.
 
-### 6.5 Reconstructable state — corrected after implementation
+### 5.5 Reconstructable state — corrected after implementation
 The original idea here (kept for the record): a rich stream reduces to a tiny
 seed and reconstructs, the way a `.gwyph` block reconstructs a trajectory from
 K/G + residual, so mirror that at the host — a declaration log that replays to
@@ -505,34 +449,34 @@ schedule — the Chroma REST heartbeat, the OpenRGB pump's idle-tick `reassert`,
 the SHM refresh, the app-base heartbeat. Recovery is owner-driven, not
 seed-driven; the seed only has to be enough for surfaces to exist again.
 
-### 6.6 Everything is a signal on a bus
+### 5.6 Everything is a signal on a bus
 Eigenmotion decomposition factors a raw stream into interpretable bands; the host
 factors the raw event bus and lets adapters subscribe to bands. Same "normalize
 once, bind anywhere." The bus is the one shared abstraction; the compositor and the
 macro engine are just two of its subscribers.
 
-### 6.7 Host topology (target)
+### 5.7 Host topology (target)
 ```
                     ┌──────────────────────────────────────────┐
                     │  KERNEL (actor, 1 thread, no I/O)         │
                     │  • canonical device/zone/LED model        │
                     │  • ownership arbiter (layers: owner/       │
-                    │    priority/ttl/scope)  ← §5.1             │
+                    │    priority/ttl/scope)  ← §4.1             │
                     │  • signal bus (named namespace)           │
-                    │  state = replayable declaration log ←§6.5 │
+                    │  state = replayable declaration log ←§5.5 │
                     └───────────▲──────────────┬────────────────┘
              commands (channel) │              │ frames / signals (channel)
         ┌───────────────────────┴──────────────┴───────────────────────┐
-        │                    SUPERVISOR (damped-AR(2) restart ←§6.3)      │
-        │           macro tier → micro tier → residual  (←§6.4)          │
+        │                    SUPERVISOR (damped-AR(2) restart ←§5.3)      │
+        │           macro tier → micro tier → residual  (←§5.4)          │
         └──┬─────────┬─────────┬─────────┬─────────┬─────────┬──────────┘
-   catch_unwind each, isolated; panic → release layer + restart (§6.2)
+   catch_unwind each, isolated; panic → release layer + restart (§5.2)
       │         │         │         │         │         │
  ┌────▼───┐┌────▼───┐┌────▼────┐┌───▼────┐┌───▼────┐┌───▼─────┐
  │Chroma  ││OpenRGB ││Telemetry││ OBS ws ││ MQTT/  ││ act ctrl│
  │REST    ││TCP srv ││UDP/HTTP/││(obws)  ││ HA     ││ plane   │
  │:54235  ││:6742   ││file-tail││:4455   ││        ││(AUTHED, │
- │(TTL    ││(+client││(F1/Elite││        ││        ││ §5.3)   │
+ │(TTL    ││(+client││(F1/Elite││        ││        ││ §4.3)   │
  │ teardn)││ mode)  ││ /GSI)   ││        ││        ││         │
  └────┬───┘└────┬───┘└────┬────┘└───┬────┘└───┬────┘└───┬─────┘
       │ ingest   │ both    │ ingest  │ both    │ both    │ ctrl
@@ -544,7 +488,7 @@ macro engine are just two of its subscribers.
                     └────────────────────┘
 ```
 
-### 6.8 Concrete first-principles decisions
+### 5.8 Concrete first-principles decisions
 - **Kernel = actor, not shared-mutex.** Kills lock poisoning as a class.
 - **Single serialized device-write path** owned by the kernel side, fed by the
   compositor output. Fixes the flagged anim-thread/dispatch/vitals write races —
@@ -558,64 +502,31 @@ macro engine are just two of its subscribers.
 
 ---
 
-## 7. Build order (recommended)
-1. **Ownership/arbitration compositor + canonical device/zone/LED model** (the
-   spine; §5.1/§5.2). Nail before any wire protocol.
-2. **OpenRGB adapter (server + client)** — proving ground; validates the model
-   both directions; instant HA + open-ecosystem plug-in.
-3. **Chroma REST server** — flagship; TTL teardown pays off the ownership work.
-4. **Split + authenticate the control plane** — before exposing `act` on any
-   socket. Not after.
-5. **Capture/replay harness** — alongside adapter #2, so correctness is locked
-   from the first protocol.
-6. **Publish the neuron protocol spec** — versioned, once the model survived
-   contact with OpenRGB + Chroma.
-7. Then telemetry (F1/Elite/GSI + auto-legality), MQTT/HA, OBS, then emission
-   (WLED, MIDI/OSC, gamepad), then opt-in edges (Twitch/Discord/VTS).
+---
+
+## 6. What is not built yet
+
+Named explicitly so this doc stops being a plan and starts being a record. Everything
+above describes what exists; these are the acknowledged holes.
+
+- **The OpenRGB *client* half.** Today the hub runs the OpenRGB *server* side: other
+  tools drive neuron. The client half — neuron reaching out to another
+  OpenRGB-speaking app or device, which is what would make it a genuine sync hub for
+  a mixed-brand rig — is not written. It is a well-scoped chunk and a good one to
+  pick up (see [`CONTRIBUTING.md`](../CONTRIBUTING.md)).
+- **An authenticated control plane.** §4.3 argues the dangerous plane must be split
+  off and authenticated before `act` verbs are exposed on any socket. The lighting
+  plane is what is exposed today; the control plane is not finished, which is the
+  reason `act` is not reachable from the network.
+- **A published neuron protocol spec.** §4.5 argues for publishing our own versioned
+  protocol from commit one. It has not been written down, so the honest position is
+  that the surface is not yet a commitment anyone should build against.
+- **Most of the port map in §3.9.** Telemetry ingest, MQTT/Home Assistant, and the
+  emission side (WLED, MIDI/OSC, virtual gamepad) are researched, not implemented.
 
 ---
 
-## 8. Grounded integration plan (map → target topology)
-
-### 8.1 The inversion (end-state)
-**The GUI becomes client #1 of the host.** The host owns: kernel (arbiter + bus
-+ journal) + the single device-writer task per device + the protocol adapters.
-The Slint app, the CLI, and every external client speak the same surface. This
-also *solves the app's missing single-instance guard for free*: binding the localhost
-port/pipe IS the instance lock — a second launch detects the bind failure and
-becomes a client of the running host instead.
-
-### 8.2 How the kernel wraps (not replaces) today's compositor
-The existing `LayerDef` stack (user's configured lighting) becomes the content
-of ONE pinned arbiter layer at `band::BASE`. Protocol sessions (Chroma game,
-OpenRGB client) claim leased layers above it. The arbiter resolves; the winner's
-frame feeds the existing `Lights::animate` machinery (shared clock, row dedup,
-deadline pacing) — pattern.rs is untouched; the arbiter sits ABOVE it.
-
-### 8.3 Phases
-- **Phase 0 (this branch, now):** `crates/neuron-host` — pure-std kernel:
-  arbiter (owner/priority/lease/scope, resolve, sweep), bus (retained values +
-  prefix subscribe + dead-sub pruning, generalizing controls::INJECT), journal
-  (declaration log → replay → identical state), governor (AR(2)-damped restart
-  control, Jury-criterion stability check, escalation ledger). Zero deps, zero
-  I/O, fully unit-tested. **No workspace dep additions (manifest is FROZEN for
-  deps; member-list add only).**
-- **Phase 1:** host process shell — kernel on its own thread (actor: one owner,
-  channels in/out, nothing to poison), OpenRGB server+client adapter against a
-  MOCK sink; capture/replay harness for protocol correctness.
-- **Phase 2:** attach to the app the *safe* way: adapter-driven lighting goes
-  through `start_layers`-shaped calls; acts go through new `LiveCommand`
-  variants. Host is NOT a new device-writer domain.
-- **Phase 3:** the writer inversion — one writer task per device inside the
-  host; anim threads, GUI one-shot opens, vitals, hidwatch battery reads all
-  become kernel clients; `send_lighting_fast`'s unchecked reply-drain race dies
-  structurally. Chroma REST adapter lands here (leases prove themselves).
-- **Phase 4:** control plane (authed, sealed-consent verbs) + published neuron
-  protocol spec + GUI-as-client migration begins.
-
----
-
-## 9. Wire-format appendix (implementation-day details)
+## 7. Wire-format appendix (implementation-day details)
 
 Extra precision captured during research, for when each adapter is built:
 

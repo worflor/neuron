@@ -14,13 +14,21 @@ no board card for your idea? open an issue. bug reports, "this feels wrong", and
 
 ## what's easy to own
 
-the README has an honest map of how much groundwork is already done: **[README → contributing](README.md#contributing)**. the short version:
+the honest map, graded by how much groundwork is already done.
 
-- **a new razer device** is a TOML file, not a recompile (`neuron discover --emit` drops you a starter).
-- **a lighting effect** is one registry entry plus a `field()` generator. pure math, self-contained, a good first PR.
-- **a preset (a look)** is pure data: an existing pattern plus a spectrum, a blurb, and the feed it reads. zero code, though you'll also add a line to the golden shelf map in `pattern.rs` so the catalog test knows where it belongs.
-- **a neuron-host protocol adapter** (OBS, MQTT, WLED, MIDI, ...) is a small codec with a capture-and-replay harness.
-- **bigger chunks** (the linux / mac port, a real vendor abstraction) are described in the README. talk to me before starting one so we can agree on the seam before you burn a weekend on it.
+### pieces you can pick up cleanly
+
+- **a new razer device.** run `neuron discover --emit` and it drops a starter TOML into the run root's `devices/auto/`, which the registry loads at runtime with no recompile (move it to `crates/neuron-core/devices/` to make it a curated def). fill in the command names and matrix dims and you have a device. the limit: a fixed opcode is just data, but a computed payload (a dpi-stage table, a lift-off handshake) or a lighting dialect that isn't the legacy or matrix one needs rust in `writes.rs`. read-back verify guards every write, so a wrong guess fails loud instead of bricking anything.
+- **a lighting effect.** one entry in the pattern registry plus the generator (a `field()` that returns brightness per cell). the factory, the tuning knobs, and the gallery tile all derive from that single entry, and a half-registration won't compile. pure math, fully self-contained, a good first PR.
+- **a preset (a look).** pure data: an existing pattern plus a spectrum, a one-line blurb, and the name of the feed it reads (blank if it reads nothing, which also decides its catalog shelf). paint fire with an ocean gradient and it's a new look with zero code.
+- **a protocol adapter for neuron-host.** a small codec that talks to the internal bus. OpenRGB and Chroma REST already exist; wanted next are things like OBS, MQTT, WLED, MIDI. well-scoped, with a capture-and-replay harness to prove it.
+
+### bigger pieces, if you want to own a real chunk
+
+- **the linux / mac port.** the core already ports. the platform-specific parts (HID, audio, the layered overlays, raw input, the window manager) already sit behind seams that compile as inert stubs off windows, so porting is a matter of filling those in: a hidraw or IOKit transport, an ALSA/PipeWire/CoreAudio control, a layered-surface backend, an input source, a window-manager impl. the hidraw transport alone lights up all of device control and the whole CLI on linux.
+
+that isn't a guess — it's checked. `neuron` (the core), `neuron-cli`, `neuron-host`, `neuron-testkit` and `engram` all compile clean on linux today, with nothing installed but a c compiler, and CI keeps them that way on every push. only the GUI crate doesn't, and it fails in exactly one place: ten errors, every one in the overlay instruments (teleport, whiteboard, glance, curtain), whose windows bodies still need factoring out. so the port isn't a green field — it's a hidraw transport away from a working CLI, and one welded chunk away from the rest. it's a real project, so open an issue before diving in and we'll agree on the first backend and the shape of the seam.
+- **another vendor entirely (logitech and friends).** the straight answer: there's no vendor abstraction yet. the wire format is razer-specific above the HID transport, so native logitech (HID++) means first extracting a device-protocol trait and then writing an implementation of it. that's a real project, so talk to me about the shape before you start. if what you actually want is other-brand *lighting*, the far better path, once it exists, is driving those devices through a neuron-host OpenRGB *client* and letting neuron be the sync hub, instead of reverse-engineering each vendor. today neuron-host only runs the OpenRGB *server* side (other tools drive neuron); the client half that would reach out to another OpenRGB-speaking app or device is planned, not built, and it's a well-scoped chunk to pick up. one thing to avoid outright: the per-vendor LED-SDK DLLs (the razer/corsair/logitech "chroma-like" SDKs). they're anti-cheat bait and a maintenance sinkhole.
 
 ## the layout
 
@@ -39,10 +47,13 @@ the rule everywhere: semantics live in `neuron-core` as typed, tested code; devi
 every change runs the same suite i do. green before you open the PR:
 
 ```
-cargo test --workspace
-cargo clippy --workspace
-cargo fmt --all
+cargo test --workspace     # the gate. green, or it doesn't go in.
+cargo clippy --workspace   # read it. it's advisory today (see below).
 ```
+
+CI runs the same two on every push and PR, so you'll see the result on your branch either way.
+
+**don't run `cargo fmt --all`.** the source is hand-formatted and there's no `rustfmt.toml` pinning that style, so a blanket format rewrites ~1900 sites across the repo and buries your actual change in noise. match the style of the code around you instead. same story with clippy: there are ~120 existing warnings, mostly pedantic, so it's a thing to read rather than a wall to clear — just don't add new ones in code you touch.
 
 three hard invariants:
 
@@ -56,6 +67,7 @@ the diagnostics bench on the system page is the "prove it works" surface: read-o
 
 - kill the running tray instance before a release build. windows locks the live `.exe` and the build fails.
 - don't run two builds at once. it corrupts the incremental cache (you'll get bogus `LNK2019 anon.*.llvm`); clear `target/debug/incremental` to recover.
+- `cargo clean` is safe. your config does not live in `target/` — a source build puts the run root in `%LOCALAPPDATA%\neuron` for exactly that reason (see [where your config lives](README.md#where-your-config-lives)). test binaries are the exception on purpose: they live in `target/*/deps`, so their run root stays beside them and the suite can never touch your real profiles.
 - editing source on windows: don't round-trip repo files through `Get/Set-Content` in powershell 5.1. it re-encodes UTF-8 as ANSI and leaves mojibake. use an editor that keeps UTF-8.
 
 ## sending a change

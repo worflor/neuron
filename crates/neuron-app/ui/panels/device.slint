@@ -1035,7 +1035,7 @@ export component DevicePanel inherits VerticalLayout {
     // The ADVANCED disclosure sits at the BOTTOM of the inspector's own wheel-only scroller, so
     // everything it reveals lands below the fold: the row looks dead even though it worked. That
     // exact illusion cost three separate investigations (see the note at the Flickable below, and
-    // docs/UX-PENTEST.md) — a reveal you cannot see is indistinguishable from a reveal that did not
+    // docs/archive/UX-PENTEST-2026-08-04.md) — a reveal you cannot see is indistinguishable from a reveal that did not
     // happen. Opening now scrolls its own content into view.
     //
     // WHY A TIMER rather than scrolling in the click handler: the drawer's height eases open over

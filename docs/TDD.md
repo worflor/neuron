@@ -1,9 +1,11 @@
-> **🤖 agent-generated · live context doc**
-> *not official docs.* an LLM wrote this while building neuron. it may be
-> stale, wrong, or slop — or it may be load-bearing and exactly right.
-> code is the source of truth; verify before you lean on it.
+> **kind:** app-level technical design — how neuron is built. The living architecture
+> doc, and the map most worth reading first. What it *does* is [`GDD.md`](GDD.md).
 >
-> **kind:** app-level technical design (the living architecture doc) · **as of:** 2026-06-19, §8 test-surface refreshed 2026-07-09 (pre-release hardening) · **trust:** high — broadly matches the tree; the map most worth reading first
+> **as of:** 2026-06-19; §8 test-surface refreshed 2026-07-09 · **trust:** high, broadly
+> matches the tree.
+>
+> **🤖 agent-generated.** An LLM wrote this while building neuron. It may be stale or
+> wrong. The code is the source of truth; verify before you lean on a detail.
 
 # Neuron Technical Design Document
 
@@ -769,4 +771,15 @@ Neuron is ready to replace Synapse for daily use when these checks are true on t
 
 ## 11. Related Docs
 
-- `README.md`: product narrative, user-facing feature map, commands, and honesty/status.
+- [`../AGENTS.md`](../AGENTS.md): the orientation doc — the tree, the gates, the three
+  hard invariants, and what "verified" has to mean before you claim it. Start there.
+- [`GDD.md`](GDD.md): feature design. Every subsystem in depth, and why each is shaped
+  the way it is. The counterpart to this document.
+- [`PROTOCOL-HOST.md`](PROTOCOL-HOST.md): the design record for `crates/neuron-host` —
+  the ownership arbiter, the signal bus, the supervision model, and the wire formats
+  each adapter speaks.
+- [`STATUS.md`](STATUS.md): what actually works today, graded solid to barely-started.
+  The honest counterweight to this document's "how it is designed to work".
+- [`../README.md`](../README.md): the product front door, plus the proven / gated /
+  absent device-write ledger.
+- [`archive/`](archive/): dated snapshots. Not current, not authoritative.
