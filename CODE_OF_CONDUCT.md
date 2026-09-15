@@ -58,16 +58,24 @@ representative at an online or offline event.
 
 ## Enforcement
 
-Instances of abusive, harassing, or otherwise unacceptable behavior may be
-reported to the community leaders responsible for enforcement at
-**conduct@woflo.dev**.
+neuron is maintained by one person, and there is deliberately no contact address
+here. An address that nobody is reliably watching is worse than none, because it
+looks like a channel and isn't one. Reports go through GitHub instead:
 
-All complaints will be reviewed and investigated promptly and fairly.
+- **[Report abuse to GitHub](https://github.com/contact/report-abuse)** for
+  harassment, threats, or anything that breaks GitHub's own Terms of Service.
+  This is the right route for anything serious. It is private, it does not depend
+  on the maintainer being available, and GitHub can act on accounts in ways a
+  project maintainer cannot.
+- **On the project itself** — an off-the-rails thread, a comment that needs
+  removing — flag it in the thread or open an issue. The maintainer can moderate
+  anything inside this repository.
 
-neuron is maintained by one person, so that address reaches one inbox and there
-is no review window to promise. It is read, and reports stay private.
+All complaints will be reviewed and investigated as fairly as one person can
+manage. There is no response window to promise, and pretending otherwise would be
+the kind of dishonesty this project exists to avoid.
 
-All community leaders are obligated to respect the privacy and security of the
+Whoever is enforcing this is obligated to respect the privacy and security of the
 reporter of any incident.
 
 ## Enforcement Guidelines
