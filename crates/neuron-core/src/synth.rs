@@ -90,42 +90,51 @@ struct CatalogEntry {
     size: u8,
     args: &'static [u8],
     setters: &'static [Setter],
+    /// Does an answer here prove the board has ADDRESSABLE LIGHTING?
+    ///
+    /// Class alone does not. The legacy-era lighting getters live in class 0x03 — but so does
+    /// `game_mode` (0x03/0x80), which is a keyboard POLICY read about the Win-key kill and says
+    /// nothing whatsoever about LEDs. Inferring "legacy lighting" from `class == 0x03` therefore
+    /// grew a full lighting block, with unprobed 0x03/0x0A + 0x03/0x0B writes at tx 0x3F, on any
+    /// board that merely answered the game-mode getter. Evidence is per-COMMAND, so it is recorded
+    /// per-command.
+    proves_lighting: bool,
 }
 
 /// The universal command catalog — the union of the builtin defs' command maps.
 const CATALOG: &[CatalogEntry] = &[
-    CatalogEntry { name: "firmware_version", class: 0x00, id: 0x81, size: 0x02, args: &[], setters: &[] },
-    CatalogEntry { name: "serial", class: 0x00, id: 0x82, size: 0x16, args: &[], setters: &[] },
-    CatalogEntry { name: "device_mode", class: 0x00, id: 0x84, size: 0x02, args: &[], setters: &[] },
+    CatalogEntry { name: "firmware_version", class: 0x00, id: 0x81, size: 0x02, args: &[], setters: &[], proves_lighting: false },
+    CatalogEntry { name: "serial", class: 0x00, id: 0x82, size: 0x16, args: &[], setters: &[], proves_lighting: false },
+    CatalogEntry { name: "device_mode", class: 0x00, id: 0x84, size: 0x02, args: &[], setters: &[], proves_lighting: false },
     CatalogEntry {
         name: "polling_rate", class: 0x00, id: 0x85, size: 0x01, args: &[],
-        setters: &[Setter { name: "set_polling", class: 0x00, id: 0x05, size: 0x01 }],
+        setters: &[Setter { name: "set_polling", class: 0x00, id: 0x05, size: 0x01 }], proves_lighting: false,
     },
     CatalogEntry {
         name: "polling2", class: 0x00, id: 0xC0, size: 0x01, args: &[],
-        setters: &[Setter { name: "set_polling2", class: 0x00, id: 0x40, size: 0x02 }],
+        setters: &[Setter { name: "set_polling2", class: 0x00, id: 0x40, size: 0x02 }], proves_lighting: false,
     },
     CatalogEntry {
         name: "dpi", class: 0x04, id: 0x85, size: 0x07, args: &[],
-        setters: &[Setter { name: "set_dpi", class: 0x04, id: 0x05, size: 0x07 }],
+        setters: &[Setter { name: "set_dpi", class: 0x04, id: 0x05, size: 0x07 }], proves_lighting: false,
     },
     CatalogEntry {
         name: "dpi_stages", class: 0x04, id: 0x83, size: 0x26, args: &[],
-        setters: &[Setter { name: "set_dpi_stages", class: 0x04, id: 0x06, size: 0x26 }],
+        setters: &[Setter { name: "set_dpi_stages", class: 0x04, id: 0x06, size: 0x26 }], proves_lighting: false,
     },
-    CatalogEntry { name: "dpi_stages_active", class: 0x04, id: 0x86, size: 0x26, args: &[], setters: &[] },
-    CatalogEntry { name: "battery_level", class: 0x07, id: 0x80, size: 0x02, args: &[], setters: &[] },
-    CatalogEntry { name: "charging_status", class: 0x07, id: 0x84, size: 0x02, args: &[], setters: &[] },
-    CatalogEntry { name: "storage_info", class: 0x06, id: 0x8E, size: 0x20, args: &[], setters: &[] },
-    CatalogEntry { name: "storage_counts", class: 0x06, id: 0x80, size: 0x20, args: &[], setters: &[] },
-    CatalogEntry { name: "storage_directory", class: 0x06, id: 0x8D, size: 0x20, args: &[], setters: &[] },
+    CatalogEntry { name: "dpi_stages_active", class: 0x04, id: 0x86, size: 0x26, args: &[], setters: &[], proves_lighting: false },
+    CatalogEntry { name: "battery_level", class: 0x07, id: 0x80, size: 0x02, args: &[], setters: &[], proves_lighting: false },
+    CatalogEntry { name: "charging_status", class: 0x07, id: 0x84, size: 0x02, args: &[], setters: &[], proves_lighting: false },
+    CatalogEntry { name: "storage_info", class: 0x06, id: 0x8E, size: 0x20, args: &[], setters: &[], proves_lighting: false },
+    CatalogEntry { name: "storage_counts", class: 0x06, id: 0x80, size: 0x20, args: &[], setters: &[], proves_lighting: false },
+    CatalogEntry { name: "storage_directory", class: 0x06, id: 0x8D, size: 0x20, args: &[], setters: &[], proves_lighting: false },
     // Matrix-era lighting getters (class 0x0F). brightness reads the VISIBLE region 0x04 —
     // the same region set_brightness writes (the read/write-region mismatch was a live bug).
     CatalogEntry {
         name: "brightness", class: 0x0F, id: 0x84, size: 0x03, args: &[0x00, 0x04],
-        setters: &[Setter { name: "set_brightness", class: 0x0F, id: 0x04, size: 0x03 }],
+        setters: &[Setter { name: "set_brightness", class: 0x0F, id: 0x04, size: 0x03 }], proves_lighting: true,
     },
-    CatalogEntry { name: "lighting_state", class: 0x0F, id: 0x82, size: 0x20, args: &[], setters: &[] },
+    CatalogEntry { name: "lighting_state", class: 0x0F, id: 0x82, size: 0x20, args: &[], setters: &[], proves_lighting: true },
     // FIRMWARE GAME MODE (legacy-era, class 0x03) — the keyboard's own FN+F10 Win-key kill
     // (GAME_LED state). CONFIRMED on the BlackWidow Chroma V2 (2026-07-07). The getter probe is
     // READ-ONLY (args [varstore, GAME_LED]), and ONLY legacy-era boards answer class 0x03, so a
@@ -134,12 +143,12 @@ const CATALOG: &[CatalogEntry] = &[
     // the catalog's first-answering-wins name-collision rule does NOT apply here.
     CatalogEntry {
         name: "game_mode", class: 0x03, id: 0x80, size: 0x03, args: &[0x00, 0x08],
-        setters: &[Setter { name: "set_game_mode", class: 0x03, id: 0x00, size: 0x03 }],
+        setters: &[Setter { name: "set_game_mode", class: 0x03, id: 0x00, size: 0x03 }], proves_lighting: false,
     },
     // Legacy-era lighting getters (class 0x03). `lighting_state` intentionally reuses the
     // matrix entry's name — first-answering dialect wins the slot (matrix is probed first).
-    CatalogEntry { name: "lighting_state", class: 0x03, id: 0x88, size: 0x06, args: &[], setters: &[] },
-    CatalogEntry { name: "lighting_caps", class: 0x03, id: 0x89, size: 0x07, args: &[], setters: &[] },
+    CatalogEntry { name: "lighting_state", class: 0x03, id: 0x88, size: 0x06, args: &[], setters: &[], proves_lighting: true },
+    CatalogEntry { name: "lighting_caps", class: 0x03, id: 0x89, size: 0x07, args: &[], setters: &[], proves_lighting: true },
 ];
 
 /// OpenRazer's per-receiver SET→GET wait for "new mouse receiver" wireless dongles (µs).
@@ -164,6 +173,12 @@ pub fn stream_wait_for(roundtrip_ms: u64, wireless_capable: bool) -> u64 {
         0
     }
 }
+
+/// The parrot canary: a (class, id, size) triple no Razer device implements. Class 0xFE is outside
+/// every documented command class and the id is getter-shaped, so a well-behaved board answers
+/// UNSUPPORTED (or nothing at all) and only a pipe that rubber-stamps everything answers SUCCESS.
+/// Kept next to the probe window because it shares the probe's discipline: read-only, one round-trip.
+const CANARY: (u8, u8, u8) = (0xFE, 0xFE, 0x02);
 
 /// Per-command probe window (2ms polls): ~320ms covers the slowest awake wireless round-trip.
 const PROBE_POLLS: usize = 160;
@@ -410,6 +425,18 @@ pub fn synthesize(t: &dyn Transport, ctx: &SynthCtx) -> Option<Synthesis> {
     // the pipe but doesn't count toward the latency sample.
     timed_exec(t, 0x00, 0x81, 0x02, &[], QUALIFY_POLLS)?;
 
+    // PARROT CANARY. `timed_exec` believes the reply's STATUS byte, which is the only signal the
+    // wire gives — but a board that answers SUCCESS-with-an-empty-body to *everything* (observed;
+    // see dialect.rs's razer-audio notes) turns that belief into a fully forged capability map,
+    // setters included. So ask it something no device implements. A real board replies UNSUPPORTED
+    // or stays mute; a parrot says SUCCESS, and one SUCCESS here invalidates every other answer
+    // this pipe could give.
+    //
+    // Getter-shaped (id >= 0x80) so the canary itself honours the module's no-writes rule.
+    if timed_exec(t, CANARY.0, CANARY.1, CANARY.2, &[], PROBE_POLLS).is_some() {
+        return None;
+    }
+
     // Measure the link: median of three firmware round-trips.
     let mut samples: Vec<u64> = (0..3)
         .filter_map(|_| {
@@ -436,10 +463,16 @@ pub fn synthesize(t: &dyn Transport, ctx: &SynthCtx) -> Option<Synthesis> {
                 .map(|&b| b as char)
                 .collect();
         }
-        match (e.class, e.id) {
-            (0x0F, _) => matrix = true,
-            (0x03, _) => legacy = true,
-            _ => {}
+        // LIGHTING EVIDENCE IS PER-COMMAND. Keying this on `class` alone was the defect: the
+        // game-mode getter is class 0x03, so any board that answered it — a keyboard with no
+        // addressable LEDs at all — grew a full legacy lighting block carrying unprobed
+        // 0x03/0x0A + 0x03/0x0B writes. Only a getter that actually reads LIGHTING counts.
+        if e.proves_lighting {
+            match e.class {
+                0x0F => matrix = true,
+                0x03 => legacy = true,
+                _ => {}
+            }
         }
         commands
             .entry(e.name.to_string())

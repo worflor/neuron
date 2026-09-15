@@ -93,7 +93,7 @@ impl Binding {
         let pid_ok = self
             .pid
             .as_ref()
-            .is_none_or(|p| p.eq_ignore_ascii_case(&ev.pid));
+            .is_none_or(|p| p.eq_ignore_ascii_case(&ev.pid_hex()));
         ev.is_press() && pid_ok && ev.has(self.page, self.usage)
     }
 }
@@ -246,14 +246,16 @@ mod tests {
 
     fn ev(pid: &str, page: u16, usage: u16) -> ControlEvent {
         ControlEvent {
-            pid: pid.into(),
+            pid: crate::controls::source_pid(pid),
+            stream: crate::controls::Stream::RawInput,
             hits: vec![(page, usage)],
             raw: vec![],
         }
     }
     fn release(pid: &str) -> ControlEvent {
         ControlEvent {
-            pid: pid.into(),
+            pid: crate::controls::source_pid(pid),
+            stream: crate::controls::Stream::RawInput,
             hits: vec![],
             raw: vec![],
         }

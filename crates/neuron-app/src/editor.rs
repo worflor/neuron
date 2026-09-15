@@ -1891,7 +1891,7 @@ mod tests {
                 Trigger::Input {
                     page: 0x0C,
                     usage: 0xE9,
-                    pid: Some(0x0529),
+                    pid: Some(neuron::registry::CanonicalPid::of(0x0529)),
                 },
                 build_action("key", "f"),
             ),
@@ -1935,7 +1935,7 @@ mod tests {
             Trigger::Input {
                 page: 0x0C,
                 usage: 0xE9,
-                pid: Some(0x0529),
+                pid: Some(neuron::registry::CanonicalPid::of(0x0529)),
             },
             build_action("key", "f"),
             false,
@@ -1958,7 +1958,7 @@ mod tests {
             Trigger::Input {
                 page: 0x0C,
                 usage: 0xE9,
-                pid: Some(0x0529),
+                pid: Some(neuron::registry::CanonicalPid::of(0x0529)),
             },
             build_action("key", "g"),
             false,
@@ -2115,7 +2115,7 @@ mod tests {
         let side = Trigger::Input {
             page: 0x09,
             usage: 5,
-            pid: Some(0x1234),
+            pid: Some(neuron::registry::CanonicalPid::of(0x1234)),
         };
         set_sniper_button(side.clone(), 800).unwrap();
         assert_eq!(sniper_binding(), Some((side, 800)));

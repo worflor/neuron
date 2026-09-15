@@ -16,7 +16,8 @@ nothing here is a promise or a date. it's the current reality and the direction,
 
 | area | state | where it's at |
 |---|---|---|
-| device control (dpi, polling, brightness, battery, reads, side-plate, scroll stage) | 🟢 solid | daily-driven, read-back verified. a few writes stay gated until a capture confirms them (see the [honesty table](../README.md#honesty-proven-gated-absent)). |
+| device control (dpi, polling, brightness, battery, reads, scroll stage) | 🟢 solid | daily-driven, read-back verified. a few writes stay gated until a capture confirms them (see the [honesty table](../README.md#honesty-proven-gated-absent)). |
+| side plate (naga swappable plates) | 🟢 solid | the mouse pushes a report on every swap; neuron debounces the seating bounce, tells a real swap apart from the device re-announcing its state, names the plate from registry data — and **binds now scope to the seated plate**. a plate is a latched context layer, so `plate:12-button` binds are live exactly while that plate is on the mouse, swapping displaces them rather than stacking, and detaching clears them. a held hypershift layer still outranks a plate layer: what you're doing beats what's merely true. |
 | trigger → action spine (binds, hypershift, app-focus) | 🟢 solid | the core. one engine, well-tested. |
 | the arm gate (observe · device · input · live) | 🟢 solid | the trust model under everything else: you pick whether neuron may read, write to the device, synthesize input, or all of it — and writes-paused blocks every write, from the GUI and from bound actions alike. does what you said, nothing else. |
 | audio control (mute / gain / output-flip) | 🟢 solid | rides the OS mixer APIs. |
@@ -36,7 +37,7 @@ nothing here is a promise or a date. it's the current reality and the direction,
 | integrations, on your terms | 🟠 early | games and apps can push into your lighting through the neuron-host hub (it speaks Chroma and OpenRGB). the point was never that it speaks them — it's that *you* decide what they're allowed to do to your base, how it blends, and that off stays off for real, unlike the thing this replaces. the pipes work; the control surface and the clean-teardown guarantees are what i'm still hardening. |
 | chroma interpretation & dynamic redraw | ⚪ planned | the next step for integrations: richer ways to *interpret* what a game or app feeds in, and redrawing the board dynamically off that input instead of just passing it through. i know what i want here; none of it is in the code yet. |
 | momentary mic / push-to-talk | 🟠 built, under-tested | wired end-to-end (press holds the mute, release restores it) with teardown guards so a held mic never strands across a config swap, respawn, or exit. light real-world mileage. |
-| cross-platform (linux / mac) | ⚪ planned | windows only today. the seams exist and compile as inert stubs; the backends aren't written. a great place to help, see [contributing](../README.md#contributing). |
+| cross-platform (linux / mac) | ⚪ planned | windows only today — no backend is written, so nothing actually *runs* elsewhere. what's real is that the seams hold: the core, the CLI, the host, the testkit and engram all compile clean on linux with just a c compiler, and CI checks that on every push so they can't quietly rot. the GUI crate is the exception, failing with ten errors all inside the overlay instruments. a great place to help, see [contributing](../README.md#contributing). |
 
 ## a bit more on the moving pieces
 

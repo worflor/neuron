@@ -166,29 +166,6 @@ pub fn start() {
         "startup-order contract: glue::install_ui must run before hidwatch::start — early mute events would silently drop (main.rs wiring)"
     );
     registry(); // pre-warm (surface a load error early; cache for the hot path)
-    // RAZER-dialect DPI mice only — `arm_new`'s shape path and `decode`'s 04/05 arms both speak the
-    // razer push vocabulary, so membership here must mean "this pid's family is razer", not merely
-    // "this pid has DPI". Without the dialect filter, a future non-razer DPI def (e.g. hidpp) would
-    // arm here and have its reports parsed as razer bytes — a foreign `05 02` misread as a DPI
-    // announce could even trigger a reconcile write. A non-razer family's pipes still arm through
-    // the def/dialect paths, which carry their own vendor gates.
-    // OWNED EVENT pids, not just mode pids: a HyperSpeed receiver exposes its own sideband
-    // collections under the DONGLE's pid (`event_alias_pids`), and the mouse's driver-mode
-    // side-plate events ride there — those collections belong to THIS reader, not macrokeys.
-    let mouse_pids: HashSet<u16> = match registry() {
-        Some(r) => r
-            .devices
-            .iter()
-            .filter(|d| d.dialect == "razer" && d.supports(neuron::registry::Capability::Dpi))
-            .flat_map(|d| d.owned_event_pids())
-            .collect(),
-        None => {
-            if verbose() {
-                eprintln!("[hidwatch] registry load failed; not listening");
-            }
-            return;
-        }
-    };
 
     // Armed collection paths — shared so the monitor and the reader threads (which remove their own
     // path on exit) agree on what's live, so a REPLUG re-arms instead of staying deaf.
@@ -196,7 +173,11 @@ pub fn start() {
     // MicBridge readiness. Who owns the signal depends on what the initial pass actually learned —
     // and the three cases are genuinely different; collapsing them (an earlier version signalled
     // unconditionally, a later one treated every zero alike) is what reopened the launch race.
-    match arm_new(&mouse_pids, &armed, true) {
+    //
+    // A registry that will not load yields an EMPTY pid set, which `arm_new` reports as `Some(0)`
+    // — enumeration worked, nothing matched. That is the honest read, and the monitor below keeps
+    // retrying the load, so a transient failure costs one pass instead of the whole session.
+    match arm_new(&mouse_event_pids(), &armed, true) {
         // ENUMERATION FAILED — we learned nothing. Claiming readiness here would release the
         // `mic_mute` unit to read a possibly PRE-bridge OS mute, which is exactly the race this
         // exists to kill. Stay silent: the unit's own timeout backstops it, and the monitor's next
@@ -215,15 +196,212 @@ pub fn start() {
         Some(_) => {}
     }
 
+    // The OS tells us the instant a device interface arrives; the poll below is only the backstop.
+    let wake = spawn_hotplug_notifier();
+
     let mon = armed.clone();
     crate::worker::spawn_detached("neuron-hidwatch-mon", move || loop {
-        thread::sleep(HOTPLUG_POLL);
+        // Wait for a device-arrival notification, or fall through on the backstop interval. The
+        // poll ALONE used to be the mechanism, which meant every dongle replug, hub glitch, or
+        // sleep/wake left the mouse's event readers unarmed for up to HOTPLUG_POLL — and the
+        // Naga's side-plate keys ride those readers, so the plate went dead for up to 20s and
+        // then silently came back. The notification collapses that to the settle delay.
+        //
+        // With NO notifier (a platform without a backend, or a registration the OS refused) the
+        // wait is the plain interval — the pre-existing behaviour. Blocking here is not optional:
+        // this arm is what paces the loop, so a missing notifier must still sleep rather than spin.
+        let woken = match wake.as_ref() {
+            Some(rx) => rx.recv_timeout(HOTPLUG_POLL).is_ok(),
+            None => {
+                thread::sleep(HOTPLUG_POLL);
+                false
+            }
+        };
+        if woken {
+            // USB enumeration fires a burst of arrivals (one per interface/collection) and the
+            // collections are not all openable at the first one. Let the device settle, then drain
+            // the rest of the burst so it costs ONE arm pass rather than one per interface.
+            thread::sleep(HOTPLUG_SETTLE);
+            if let Some(rx) = wake.as_ref() {
+                while rx.try_recv().is_ok() {}
+            }
+        }
+        // Recomputed EVERY pass, never captured once: the pid set is derived from the registry, and
+        // the registry can both arrive late (a load that failed at startup) and change (a device
+        // that adopts itself at runtime). A snapshot taken in `start` would freeze both out until
+        // the next app restart.
+        //
         // `gate_seeds = false`: the MicBridge countdown belongs to the INITIAL pass only — it has
         // long since run out (or been backstopped by the reconcile timeout) by the time a hotplug
         // arm lands, and decrementing it here would underflow. A late-arriving mic still corrects
         // the pill through its own bridge → `notify_hardware_mute` push.
-        arm_new(&mouse_pids, &mon, false);
+        arm_new(&mouse_event_pids(), &mon, false);
     });
+}
+
+/// The Razer DPI-mouse pids whose EVENT collections this module owns, read fresh from the current
+/// registry snapshot. An unloadable registry yields an EMPTY set rather than an error: the two
+/// family-general arm paths (a def's declared `[events]` pipe, a dialect's push vocabulary) do not
+/// consult this set at all, so the mic bridge still arms while the mouse paths simply wait for the
+/// registry to show up.
+///
+/// RAZER-dialect DPI mice only — `arm_new`'s shape path and `decode`'s 04/05 arms both speak the
+/// razer push vocabulary, so membership here must mean "this pid's family is razer", not merely
+/// "this pid has DPI". Without the dialect filter, a future non-razer DPI def (e.g. hidpp) would
+/// arm here and have its reports parsed as razer bytes — a foreign `05 02` misread as a DPI
+/// announce could even trigger a reconcile write.
+///
+/// OWNED EVENT pids, not just mode pids: a HyperSpeed receiver exposes its own sideband collections
+/// under the DONGLE's pid (`event_alias_pids`), and the mouse's driver-mode side-plate events ride
+/// there — those collections belong to THIS reader, not macrokeys.
+fn mouse_event_pids() -> HashSet<u16> {
+    let Some(r) = registry() else {
+        if verbose() {
+            eprintln!("[hidwatch] registry unavailable this pass — mouse pids empty, retrying");
+        }
+        return HashSet::new();
+    };
+    r.devices
+        .iter()
+        .filter(|d| d.dialect == "razer" && d.supports(neuron::registry::Capability::Dpi))
+        .flat_map(|d| d.owned_event_pids())
+        .collect()
+}
+
+// ── HOTPLUG NOTIFIER ────────────────────────────────────────────────────────────────────────────
+//
+// Windows will TELL us when a HID interface arrives (`WM_DEVICECHANGE`), which turns the arm pass
+// from a 20-second poll into a reaction. This is a message-only window on its own thread whose
+// entire job is to nudge the monitor loop; it never touches device state itself, so the arm logic
+// stays in one place and the unsafe surface stays this small.
+//
+// The poll is KEPT as a backstop, deliberately: notification delivery depends on the pump staying
+// alive and on the OS classing the change as an interface arrival, and neither is worth betting
+// the side plate on. Belt and braces — the notifier makes it fast, the poll makes it certain.
+
+/// How long to let a freshly-arrived device settle before enumerating. USB brings interfaces up
+/// over several milliseconds and a collection can be present but not yet openable at the first
+/// notification; enumerating too eagerly just fails and waits for the backstop.
+const HOTPLUG_SETTLE: Duration = Duration::from_millis(250);
+
+/// The monitor's wake sender. Process-global because there is exactly one notifier and one
+/// monitor, both owned by [`start`] — the same single-owner model the rest of this module uses.
+static NOTIFY_TX: Mutex<Option<std::sync::mpsc::Sender<()>>> = Mutex::new(None);
+
+/// Announce a device-interface change to the monitor loop. Never blocks and never panics: a full
+/// or disconnected channel just means the monitor is already about to run a pass.
+fn notify_hotplug() {
+    if let Some(tx) = NOTIFY_TX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+    {
+        let _ = tx.send(());
+    }
+}
+
+/// Start the OS device-arrival notifier. `None` means the monitor runs on its poll alone — the
+/// pre-existing behaviour, so every failure here degrades to "slower", never to "broken".
+#[cfg(windows)]
+fn spawn_hotplug_notifier() -> Option<std::sync::mpsc::Receiver<()>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    *NOTIFY_TX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tx);
+    crate::worker::spawn_detached("neuron-hidwatch-notify", || unsafe { notifier_pump() });
+    Some(rx)
+}
+
+#[cfg(not(windows))]
+fn spawn_hotplug_notifier() -> Option<std::sync::mpsc::Receiver<()>> {
+    // No backend yet — the monitor's poll is the whole mechanism on this platform.
+    None
+}
+
+/// The notifier thread: a message-only window registered for HID device-interface changes, then a
+/// message pump for the life of the process.
+#[cfg(windows)]
+unsafe fn notifier_pump() {
+    use windows_sys::Win32::Devices::HumanInterfaceDevice::GUID_DEVINTERFACE_HID;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, RegisterClassW,
+        RegisterDeviceNotificationW, TranslateMessage, DBT_DEVICEARRIVAL,
+        DBT_DEVICEREMOVECOMPLETE, DBT_DEVTYP_DEVICEINTERFACE, DEVICE_NOTIFY_WINDOW_HANDLE,
+        DEV_BROADCAST_DEVICEINTERFACE_W, HWND_MESSAGE, MSG, WM_DEVICECHANGE, WNDCLASSW,
+    };
+
+    unsafe extern "system" fn wndproc(
+        hwnd: windows_sys::Win32::Foundation::HWND,
+        msg: u32,
+        wparam: windows_sys::Win32::Foundation::WPARAM,
+        lparam: windows_sys::Win32::Foundation::LPARAM,
+    ) -> windows_sys::Win32::Foundation::LRESULT {
+        // ARRIVAL and REMOVE-COMPLETE both matter: an arrival is a pipe to arm, and a completed
+        // removal is the first half of a replug (and the moment a stale reader's path frees up),
+        // so re-enumerating on it keeps `armed` honest without waiting for the backstop.
+        if msg == WM_DEVICECHANGE
+            && (wparam as u32 == DBT_DEVICEARRIVAL || wparam as u32 == DBT_DEVICEREMOVECOMPLETE)
+        {
+            notify_hotplug();
+        }
+        unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+    }
+
+    let class: Vec<u16> = "NeuronHidHotplug\0".encode_utf16().collect();
+    let mut wc: WNDCLASSW = std::mem::zeroed();
+    wc.lpfnWndProc = Some(wndproc);
+    wc.lpszClassName = class.as_ptr();
+    // A zero return means the class already exists (a previous `start`) — harmless, and
+    // CreateWindowExW below still resolves it by name.
+    RegisterClassW(&wc);
+
+    let hwnd = CreateWindowExW(
+        0,
+        class.as_ptr(),
+        class.as_ptr(),
+        0,
+        0,
+        0,
+        0,
+        0,
+        HWND_MESSAGE, // message-only: no taskbar entry, no paint, no input
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        std::ptr::null(),
+    );
+    if hwnd.is_null() {
+        if verbose() {
+            eprintln!("[hidwatch] hotplug window failed — falling back to the poll backstop");
+        }
+        return;
+    }
+
+    let mut filter: DEV_BROADCAST_DEVICEINTERFACE_W = std::mem::zeroed();
+    filter.dbcc_size = std::mem::size_of::<DEV_BROADCAST_DEVICEINTERFACE_W>() as u32;
+    filter.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
+    // Scoped to the HID interface class: this module only ever arms HID collections, so a volume
+    // mount or a network adapter must not cost an enumeration.
+    filter.dbcc_classguid = GUID_DEVINTERFACE_HID;
+    let handle = RegisterDeviceNotificationW(
+        hwnd as _,
+        std::ptr::addr_of!(filter).cast(),
+        DEVICE_NOTIFY_WINDOW_HANDLE,
+    );
+    if handle.is_null() {
+        if verbose() {
+            eprintln!("[hidwatch] device notification refused — falling back to the poll backstop");
+        }
+        return;
+    }
+
+    // Pump for the life of the process. The registration and the window are deliberately NEVER
+    // torn down: this thread is detached and lives as long as the app, so there is no shutdown
+    // path that could leave a dangling notification handle.
+    let mut msg: MSG = std::mem::zeroed();
+    while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
 }
 
 /// Enumerate and spawn a reader for any event-carrying mouse collection not already armed.
@@ -581,10 +759,12 @@ fn mute_state_changed(path: &DevicePath, muted: bool) -> bool {
 fn fire_mic_tap(pid: u16) {
     crate::dispatch::inject_trigger(neuron::engine::Trigger::MicTap);
     let (page, usage) = neuron::controls::MIC_TAP;
+    // Canonical at the door, like every other producer — this injection site is exactly the one
+    // that used to ship a raw link-mode pid and silently fail to match a pid-scoped bind.
     crate::dispatch::inject_trigger(neuron::engine::Trigger::Input {
         page,
         usage,
-        pid: Some(pid),
+        pid: Some(neuron::registry::CanonicalPid::of(pid)),
     });
 }
 
@@ -844,13 +1024,13 @@ fn inject_deferred_buttons(buf: &[u8], pid: u16) {
     if verbose() {
         eprintln!("[hidwatch] pid={pid:04x} deferred buttons hits={hits:02x?}");
     }
-    let canon = neuron::registry::canonical_event_pid(pid);
-    debug_assert!(
-        canon < 0x1000,
-        "Razer pid {canon:#06x} would alias the 0xF000 deferred-button bucket prefix"
-    );
+    // The stream is a FIELD, not a prefix packed into the pid. The old form
+    // (`0xF000 | canon & 0x0FFF`) silently truncated any pid >= 0x1000, so two devices sharing
+    // their low 12 bits collapsed onto one identity — guarded only by a `debug_assert`, which is
+    // compiled out of the builds people actually run. There is no mask here to get wrong.
     neuron::controls::inject_event(neuron::controls::ControlEvent {
-        pid: format!("{:04x}", 0xF000u16 | (canon & 0x0FFF)),
+        pid: Some(neuron::registry::CanonicalPid::of(pid)),
+        stream: neuron::controls::Stream::Deferred,
         hits,
         raw: buf.to_vec(),
     });
@@ -1101,6 +1281,10 @@ fn flush_batch(pid: u16, b: Batch) {
         }
         if let Some((_, id, label)) = b.plate {
             neuron::confirm::prime_side_plate(pid, id as u32, &label);
+            // A state-announce burst is how we learn the plate on wake/replug WITHOUT carding it.
+            // The latch still has to happen: the binds must follow the hardware whether we found
+            // out by watching a swap or by the mouse telling us what it already had.
+            latch_plate_layer(id, &label);
         }
     } else {
         if let Some((_, v)) = b.dpi {
@@ -1111,8 +1295,19 @@ fn flush_batch(pid: u16, b: Batch) {
         }
         if let Some((_, id, label)) = b.plate {
             neuron::confirm::observe_side_plate(pid, id as u32, &label);
+            latch_plate_layer(id, &label);
         }
     }
+}
+
+/// Make the seated plate the engine's latched context, so a plate-scoped bind is live exactly
+/// while its plate is on the mouse. Strap-code `0` is DETACHED and clears the slot — with no plate
+/// there are no plate buttons, so leaving the last plate's binds live would be a lie.
+///
+/// The layer NAME comes from the registry label, so adding a plate is a TOML edit plus a bind.
+fn latch_plate_layer(id: u8, label: &str) {
+    let layer = (id != 0).then(|| neuron::engine::side_plate_layer(label));
+    crate::dispatch::latch_context(neuron::engine::SLOT_SIDE_PLATE, layer);
 }
 
 /// Open `pid`'s control interface (registry cached) and read battery % + charging. On a charge-read

@@ -916,6 +916,13 @@ fn twin_cmd(action: TwinCmd) -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    // Before ANY config read: carry a build-tree config universe forward (see
+    // `runroot::adopt_legacy_run_root`). Both binaries do this because either one can be the first
+    // to start after an upgrade, and they share one config universe — whoever gets there first
+    // migrates, the other no-ops.
+    if let Some((from, to)) = neuron::runroot::adopt_legacy_run_root() {
+        eprintln!("carried config forward: {} -> {}", from.display(), to.display());
+    }
     let cli = Cli::parse();
     let reg = Registry::load()?;
     // Adoption is NOT a startup step (it would give read-only commands a hidden HID-probe + file
@@ -3949,7 +3956,7 @@ fn save_gui_rules(rules: Vec<neuron::engine::Rule>) -> Result<()> {
 /// `(page, usage, pid)` — the native `Trigger::Input` form the GUI captures too. ESC or a 30 s
 /// timeout cancels. Skips left-mouse so a stray click can't self-bind.
 #[cfg(windows)]
-fn capture_sniper_control() -> Option<(u16, u16, Option<u16>)> {
+fn capture_sniper_control() -> Option<(u16, u16, Option<neuron::registry::CanonicalPid>)> {
     use std::cell::Cell;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Instant;
@@ -3958,8 +3965,9 @@ fn capture_sniper_control() -> Option<(u16, u16, Option<u16>)> {
     // prefer the same-device keyboard identity if it follows.
     const TWIN_SETTLE: std::time::Duration = std::time::Duration::from_millis(80);
     let stop = AtomicBool::new(false);
-    let found: Cell<Option<(u16, u16, Option<u16>)>> = Cell::new(None);
-    let parked: Cell<Option<(u16, u16, Option<u16>, Instant)>> = Cell::new(None);
+    let found: Cell<Option<(u16, u16, Option<neuron::registry::CanonicalPid>)>> = Cell::new(None);
+    let parked: Cell<Option<(u16, u16, Option<neuron::registry::CanonicalPid>, Instant)>> =
+        Cell::new(None);
     neuron::controls::listen_until(
         Some(30),
         &stop,
@@ -3969,16 +3977,10 @@ fn capture_sniper_control() -> Option<(u16, u16, Option<u16>)> {
                 if (page, usage) == (0x09, 1) {
                     return; // left mouse operates the terminal, not a bindable control
                 }
-                // device-scoped, macro page included: strip the macro stream's edge-bucket
-                // prefix back to the canonical device pid (mirrors the GUI capture; the strip is
-                // MACRO-PAGE-ONLY, like `controls::hit_trigger`).
-                let pid = u16::from_str_radix(&ev.pid, 16).ok().map(|p| {
-                    if page == neuron::controls::RAZER_MACRO_PAGE && p & 0xF000 == 0xF000 {
-                        p & 0x0FFF
-                    } else {
-                        p
-                    }
-                });
+                // Device-scoped, macro page included. Nothing to unpack: the deferred-button
+                // stream is its own field on the event now, so `ev.pid` is already the canonical
+                // device whichever stream carried the press.
+                let pid = ev.pid;
                 match parked.get() {
                     None if page == neuron::controls::RAZER_MACRO_PAGE => {
                         parked.set(Some((page, usage, pid, Instant::now())));
@@ -4013,7 +4015,7 @@ fn capture_sniper_control() -> Option<(u16, u16, Option<u16>)> {
     found.get()
 }
 #[cfg(not(windows))]
-fn capture_sniper_control() -> Option<(u16, u16, Option<u16>)> {
+fn capture_sniper_control() -> Option<(u16, u16, Option<neuron::registry::CanonicalPid>)> {
     None
 }
 

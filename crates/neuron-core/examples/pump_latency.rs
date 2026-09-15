@@ -278,7 +278,11 @@ fn inject(hits: Vec<(u16, u16)>) {
         .chain(hits.iter().map(|&(_, u)| u as u8))
         .collect();
     controls::inject_event(ControlEvent {
-        pid: MACRO_PID.into(),
+        // The deferred-button stream is a STREAM now, not a pid prefix (see `controls::Stream`).
+        pid: u16::from_str_radix(MACRO_PID, 16)
+            .ok()
+            .map(neuron::registry::CanonicalPid::of),
+        stream: controls::Stream::Deferred,
         hits,
         raw,
     });

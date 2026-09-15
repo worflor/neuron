@@ -54,7 +54,7 @@ thread_local! {
 pub struct CapturedControl {
     pub page: u16,
     pub usage: u16,
-    pub pid: Option<u16>,
+    pub pid: Option<neuron::registry::CanonicalPid>,
 }
 
 /// Process-global "a press-to-bind capture is in flight" — read by the live key DISPATCHER (which
@@ -222,7 +222,7 @@ pub fn begin_control(
 }
 
 /// Run the stashed control handler on the UI thread (stale generations are inert; see finish_vk).
-fn finish_ctl(gen: u64, pkt: Option<(u16, u16, Option<u16>)>) {
+fn finish_ctl(gen: u64, pkt: Option<(u16, u16, Option<neuron::registry::CanonicalPid>)>) {
     if GENERATION.with(|g| g.get()) != gen {
         return;
     }
@@ -265,16 +265,10 @@ impl ControlCaptureState {
         if (page, usage) == (0x09, 1) {
             return None;
         }
-        // Injected macro/deferred reports historically carry `0xF000 | canonical pid`; the new
-        // resident observer already supplies the canonical pid, while this keeps the standalone
-        // fallback and old injected path compatible.
-        let pid = u16::from_str_radix(&ev.pid, 16).ok().map(|p| {
-            if page == neuron::controls::RAZER_MACRO_PAGE && p & 0xF000 == 0xF000 {
-                p & 0x0FFF
-            } else {
-                p
-            }
-        });
+        // Every source — resident observer, injected deferred-button report, standalone fallback —
+        // hands over the canonical device identity directly now; the stream it arrived on is a
+        // separate field, so there is no bucket prefix left to unpack.
+        let pid = ev.pid;
         let control = CapturedControl { page, usage, pid };
         match self.macro_candidate {
             None if page == neuron::controls::RAZER_MACRO_PAGE => {
@@ -579,12 +573,13 @@ mod tests {
         let mut state = ControlCaptureState::default();
         let control = state
             .observe(&neuron::controls::ControlEvent {
-                pid: "00a7".into(),
+                pid: Some(neuron::registry::CanonicalPid::of(0x00a7)),
+                    stream: neuron::controls::Stream::RawInput,
                 hits: vec![(0x07, 0x1E)],
                 raw: Vec::new(),
             })
             .expect("ordinary keyboard edge captures immediately");
-        assert_eq!((control.page, control.usage, control.pid), (0x07, 0x1E, Some(0x00A7)));
+        assert_eq!((control.page, control.usage, control.pid), (0x07, 0x1E, Some(neuron::registry::CanonicalPid::of(0x00A7))));
     }
 
     /// The resident observer fans out EVERY control edge in the process (the pump is a global
@@ -599,7 +594,8 @@ mod tests {
         assert!(
             state
                 .observe(&neuron::controls::ControlEvent {
-                    pid: "00a7".into(),
+                    pid: Some(neuron::registry::CanonicalPid::of(0x00a7)),
+                    stream: neuron::controls::Stream::RawInput,
                     hits: vec![(0x09, 1)],
                     raw: Vec::new(),
                 })
@@ -608,12 +604,13 @@ mod tests {
         );
         let control = state
             .observe(&neuron::controls::ControlEvent {
-                pid: "00a7".into(),
+                pid: Some(neuron::registry::CanonicalPid::of(0x00a7)),
+                    stream: neuron::controls::Stream::RawInput,
                 hits: vec![(0x09, 4)],
                 raw: Vec::new(),
             })
             .expect("a side button is a bindable control");
-        assert_eq!((control.page, control.usage, control.pid), (0x09, 4, Some(0x00A7)));
+        assert_eq!((control.page, control.usage, control.pid), (0x09, 4, Some(neuron::registry::CanonicalPid::of(0x00A7))));
     }
 
     #[cfg(windows)]
@@ -623,7 +620,12 @@ mod tests {
         assert!(
             state
                 .observe(&neuron::controls::ControlEvent {
-                    pid: "f0a7".into(),
+                    // The receiver's deferred-button stream, reporting the MOUSE's own identity.
+                    // It used to arrive as bucket pid 0xF0A7 that the capture path had to strip
+                    // back to 0x00A7 before it could recognise the twin; the stream is its own
+                    // field now, so the two events already agree on the device.
+                    pid: Some(neuron::registry::CanonicalPid::of(0x00a7)),
+                    stream: neuron::controls::Stream::Deferred,
                     hits: vec![(neuron::controls::RAZER_MACRO_PAGE, 0x20)],
                     raw: Vec::new(),
                 })
@@ -632,12 +634,13 @@ mod tests {
         );
         let control = state
             .observe(&neuron::controls::ControlEvent {
-                pid: "00a7".into(),
+                pid: Some(neuron::registry::CanonicalPid::of(0x00a7)),
+                    stream: neuron::controls::Stream::RawInput,
                 hits: vec![(0x07, 0x1E)],
                 raw: Vec::new(),
             })
             .expect("same-device keyboard twin wins");
-        assert_eq!((control.page, control.usage, control.pid), (0x07, 0x1E, Some(0x00A7)));
+        assert_eq!((control.page, control.usage, control.pid), (0x07, 0x1E, Some(neuron::registry::CanonicalPid::of(0x00A7))));
     }
 
     #[cfg(windows)]
@@ -648,7 +651,7 @@ mod tests {
                 CapturedControl {
                     page: neuron::controls::RAZER_MACRO_PAGE,
                     usage: 0x22,
-                    pid: Some(0x0221),
+                    pid: Some(neuron::registry::CanonicalPid::of(0x0221)),
                 },
                 std::time::Instant::now() - TWIN_SETTLE,
             )),
@@ -656,7 +659,7 @@ mod tests {
         let control = state.settled().expect("expired candidate commits");
         assert_eq!(
             (control.page, control.usage, control.pid),
-            (neuron::controls::RAZER_MACRO_PAGE, 0x22, Some(0x0221))
+            (neuron::controls::RAZER_MACRO_PAGE, 0x22, Some(neuron::registry::CanonicalPid::of(0x0221)))
         );
         // Reading the settled value is side-effect free; the caller returns immediately.
         assert!(state.settled().is_some());

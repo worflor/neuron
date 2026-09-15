@@ -367,7 +367,6 @@ mod tests {
     // These drive the real `poll` over a real loopback socket pair, feeding SERVER frames (which
     // are unmasked, per the RFC — masking is the client's obligation).
 
-    use std::io::{Read as _, Write as _};
     use std::net::{TcpListener, TcpStream as StdTcpStream};
 
     /// A server frame: `fin` + opcode + unmasked payload.

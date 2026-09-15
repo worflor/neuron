@@ -38,8 +38,14 @@ pub enum Trigger {
     Input {
         page: u16,
         usage: u16,
+        /// Restrict to a source device. [`CanonicalPid`](crate::registry::CanonicalPid), not a raw
+        /// `u16`: one physical device presents a different USB pid per link mode (wired / dongle /
+        /// bluetooth) plus its receiver's own sideband pid, so a bind captured on the dongle used
+        /// to die the moment you plugged the cable in. The type canonicalizes at every door —
+        /// construction AND deserialization — so a rule and an event cannot disagree about which
+        /// device they mean.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        pid: Option<u16>,
+        pid: Option<crate::registry::CanonicalPid>,
     },
     /// A recognized drawn glyph (spellweaving) — the name of a template in the gesture Vault.
     /// Struct variant (`{ kind = "gesture", name = "..." }`) because `Trigger` is internally
@@ -73,7 +79,7 @@ impl Trigger {
                 // device identity there (two boards share the macro code space, so "which device"
                 // is signal, not noise). Device-any binds stay clean.
                 match pid {
-                    Some(p) => format!("{name} @pid {p:04x}"),
+                    Some(p) => format!("{name} @pid {p}"),
                     None => name,
                 }
             }
@@ -180,6 +186,29 @@ pub struct Engine {
     pub layers: BTreeMap<String, Vec<Rule>>,
     /// Currently-held layer names. A layer's rules dispatch iff its name is in this set.
     held: BTreeSet<String>,
+    /// LATCHED context layers, keyed by SLOT — a layer that is active because of a persistent
+    /// FACT about the hardware rather than because a key is down.
+    ///
+    /// The motivating case is the Naga's swappable side plates. A seated plate is not an event you
+    /// bind to and it is not a profile: it is a fact that decides WHICH BINDS EXIST. Modelling it
+    /// as a trigger would answer the wrong question (a plate swap is rarely the thing you want to
+    /// act on), and modelling it as a profile dimension would multiply out to (app x plate) and
+    /// force N*M profiles to say "my Discord binds, on whichever plate is on".
+    ///
+    /// So it reuses the layer machinery that already works, with one difference from `held`: a slot
+    /// holds AT MOST ONE layer, and latching a new one displaces the old. Seating the 6-button
+    /// plate cannot leave the 12-button plate's binds live.
+    latched: BTreeMap<String, String>,
+}
+
+/// The latch slot the seated side plate occupies. One slot, because a mouse has one plate on it.
+pub const SLOT_SIDE_PLATE: &str = "side_plate";
+
+/// The layer name a seated plate latches, from its registry label ("12-button" -> "plate:12-button").
+/// Data-driven: the labels come from the device def's `[side_plates]` map, so a new plate is a TOML
+/// edit and a bind, never a code change.
+pub fn side_plate_layer(label: &str) -> String {
+    format!("plate:{label}")
 }
 
 impl Engine {
@@ -189,6 +218,7 @@ impl Engine {
             rules,
             layers: BTreeMap::new(),
             held: BTreeSet::new(),
+            latched: BTreeMap::new(),
         }
     }
 
@@ -217,6 +247,7 @@ impl Engine {
             rules: base,
             layers,
             held: BTreeSet::new(),
+            latched: BTreeMap::new(),
         }
     }
 
@@ -275,8 +306,46 @@ impl Engine {
     }
 
     /// Release every held layer (e.g. on focus loss / daemon pause, so a layer can't get stuck).
+    ///
+    /// LATCHED layers deliberately survive this. A held layer is a key someone might still be
+    /// holding when focus goes away, so it must be dropped or it strands. A latched layer is a
+    /// physical fact — the plate is still bolted to the mouse whether or not this app has focus —
+    /// so clearing it would silently disable that plate's binds until the next swap.
     pub fn release_all(&mut self) {
         self.held.clear();
+    }
+
+    // --- latched-context state (side plate, and anything else that is a persistent fact) -------
+
+    /// Latch `layer` into `slot`, displacing whatever that slot held. `None` clears the slot (the
+    /// plate was detached). Returns true if the slot actually changed, so callers can avoid
+    /// re-announcing a no-op.
+    pub fn latch(&mut self, slot: impl Into<String>, layer: Option<String>) -> bool {
+        let slot = slot.into();
+        let prev = match layer {
+            Some(l) => self.latched.insert(slot, l.clone()).filter(|p| *p == l).is_some(),
+            None => self.latched.remove(&slot).is_none(),
+        };
+        !prev
+    }
+
+    /// The layer currently latched into `slot`, if any.
+    pub fn latched_layer(&self, slot: &str) -> Option<&str> {
+        self.latched.get(slot).map(String::as_str)
+    }
+
+    /// Every layer whose rules currently dispatch: held (momentary) plus latched (contextual).
+    /// The one definition, so `matching`/`dispatch` and any UI readout cannot disagree.
+    pub fn active_layers(&self) -> impl Iterator<Item = &str> {
+        self.held
+            .iter()
+            .map(String::as_str)
+            .chain(self.latched.values().map(String::as_str))
+    }
+
+    /// Is `layer` currently active — held OR latched?
+    pub fn is_active(&self, layer: &str) -> bool {
+        self.held.contains(layer) || self.latched.values().any(|l| l == layer)
     }
 
     /// Is this layer currently held?
@@ -332,10 +401,10 @@ impl Engine {
                     pid: fpid,
                 },
             ) => {
-                rp == fp
-                    && ru == fu
-                    && rpid
-                        .is_none_or(|p| Some(crate::registry::canonical_event_pid(p)) == *fpid)
+                // Both sides are CanonicalPid, so this is plain equality — no canonicalize call
+                // to forget, and no asymmetry where the rule is normalized and the event is not
+                // (which is exactly how the mic-tap producer used to slip through).
+                rp == fp && ru == fu && rpid.is_none_or(|p| Some(p) == *fpid)
             }
             (Trigger::AppFocus { app: needle }, Trigger::AppFocus { app }) => {
                 app.to_lowercase().contains(&needle.to_lowercase())
@@ -348,12 +417,21 @@ impl Engine {
     /// HyperShift layers. Read-only — for previewing what a trigger would do, and the basis of
     /// [`dispatch`](Engine::dispatch).
     ///
-    /// Order is deterministic: held layers first (sorted by name), then the base — so a held
-    /// HyperShift binding for an input is seen *before* the base binding for the same input. Use
+    /// Order is deterministic: HELD layers first (sorted by name), then LATCHED context layers
+    /// (the seated side plate), then the base — so a momentary HyperShift binding outranks a
+    /// plate-scoped one, which in turn outranks the base binding for the same input. Use
     /// [`resolve_top`](Engine::resolve_top) when only the winning (override) action should fire.
+    ///
+    /// Held before latched is deliberate: holding a key is an ACT, seating a plate is a STATE, and
+    /// the thing the user is doing right now should win over the thing that is merely true.
     pub fn resolve(&self, fired: &Trigger) -> Vec<&Rule> {
         let mut out = Vec::new();
-        for layer in self.held.iter() {
+        for layer in self.held.iter().map(String::as_str).chain(
+            self.latched
+                .values()
+                .map(String::as_str)
+                .filter(|l| !self.held.contains(*l)),
+        ) {
             if let Some(rules) = self.layers.get(layer) {
                 out.extend(rules.iter().filter(|r| Self::matches(&r.trigger, fired)));
             }
@@ -432,6 +510,99 @@ impl Engine {
 }
 
 #[cfg(test)]
+mod latched_context_tests {
+    use super::*;
+    use crate::action::Action;
+
+    fn plate_engine() -> Engine {
+        // One button, bound differently per plate, plus a base bind for the same control.
+        let t = || Trigger::Input { page: 0xFF1A, usage: 0x20, pid: None };
+        Engine::from_rules(vec![
+            Rule::new(t(), Action::Run { cmd: "base".into() }),
+            Rule::on_layer(side_plate_layer("12-button"), t(), Action::Run { cmd: "twelve".into() }),
+            Rule::on_layer(side_plate_layer("6-button"), t(), Action::Run { cmd: "six".into() }),
+        ])
+    }
+
+    fn cmds(e: &Engine) -> Vec<String> {
+        e.resolve(&Trigger::Input { page: 0xFF1A, usage: 0x20, pid: None })
+            .iter()
+            .filter_map(|r| match &r.action {
+                Action::Run { cmd } => Some(cmd.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// THE POINT OF THE FEATURE. A plate-scoped bind is live exactly while its plate is seated,
+    /// and seating a different plate displaces it — it does not stack. Before this, a plate swap
+    /// changed nothing at all: binds for buttons that had physically left the mouse stayed in the
+    /// map and silently did nothing.
+    #[test]
+    fn a_seated_plate_scopes_its_binds_and_a_swap_displaces_them() {
+        let mut e = plate_engine();
+        assert_eq!(cmds(&e), vec!["base"], "no plate seated → only the base bind");
+
+        e.latch(SLOT_SIDE_PLATE, Some(side_plate_layer("12-button")));
+        assert_eq!(cmds(&e), vec!["twelve", "base"], "the seated plate's layer comes first");
+
+        // Swap. The 12-button binds must not survive onto a 6-button plate whose buttons 7..12
+        // do not physically exist.
+        e.latch(SLOT_SIDE_PLATE, Some(side_plate_layer("6-button")));
+        assert_eq!(cmds(&e), vec!["six", "base"], "one slot holds one plate — never both");
+
+        // Detached: no plate, no plate binds.
+        e.latch(SLOT_SIDE_PLATE, None);
+        assert_eq!(cmds(&e), vec!["base"], "a detached plate leaves nothing latched");
+    }
+
+    /// A held key is an ACT; a seated plate is a STATE. What the user is doing right now outranks
+    /// what merely happens to be true, so a HyperShift bind wins over a plate-scoped one.
+    #[test]
+    fn held_layers_outrank_latched_context() {
+        let t = Trigger::Input { page: 0xFF1A, usage: 0x20, pid: None };
+        let mut e = plate_engine();
+        e.layers.entry("sniper".into()).or_default().push(Rule::on_layer(
+            "sniper",
+            t.clone(),
+            Action::Run { cmd: "sniper".into() },
+        ));
+        e.latch(SLOT_SIDE_PLATE, Some(side_plate_layer("12-button")));
+        e.hold("sniper");
+        assert_eq!(cmds(&e), vec!["sniper", "twelve", "base"]);
+    }
+
+    /// `release_all` exists so a held key cannot strand when focus is lost. The plate is still
+    /// bolted to the mouse, so clearing it there would silently kill that plate's binds until the
+    /// next physical swap — which for a plate you never swap means forever.
+    #[test]
+    fn release_all_drops_held_layers_but_never_the_seated_plate() {
+        let mut e = plate_engine();
+        e.latch(SLOT_SIDE_PLATE, Some(side_plate_layer("12-button")));
+        e.hold("sniper");
+        e.release_all();
+        assert!(!e.is_active("sniper"), "a held layer must not strand across focus loss");
+        assert_eq!(
+            e.latched_layer(SLOT_SIDE_PLATE),
+            Some(side_plate_layer("12-button").as_str()),
+            "the plate did not leave the mouse just because the app lost focus"
+        );
+        assert_eq!(cmds(&e), vec!["twelve", "base"]);
+    }
+
+    /// Re-latching the SAME plate is a no-op, so a device that re-announces its state on wake or
+    /// replug (which the Naga does, in a burst) cannot churn the engine or re-log a transition.
+    #[test]
+    fn re_latching_the_same_plate_reports_no_change() {
+        let mut e = plate_engine();
+        assert!(e.latch(SLOT_SIDE_PLATE, Some(side_plate_layer("12-button"))), "first seat changes");
+        assert!(!e.latch(SLOT_SIDE_PLATE, Some(side_plate_layer("12-button"))), "re-announce is a no-op");
+        assert!(e.latch(SLOT_SIDE_PLATE, None), "detach changes");
+        assert!(!e.latch(SLOT_SIDE_PLATE, None), "already detached is a no-op");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::action::Action;
@@ -441,7 +612,7 @@ mod tests {
         let t = Trigger::Input {
             page: 0x0C,
             usage: 0xE9,
-            pid: Some(0x0529),
+            pid: Some(crate::registry::CanonicalPid::of(0x0529)),
         };
         let s = toml::to_string(&t).unwrap();
         assert!(s.contains("kind = \"input\""));
@@ -490,13 +661,13 @@ mod tests {
         let fired = Trigger::Input {
             page: 0x0C,
             usage: 0xE9,
-            pid: Some(0x0221),
+            pid: Some(crate::registry::CanonicalPid::of(0x0221)),
         };
         assert!(Engine::matches(&rule, &fired));
         let restricted = Trigger::Input {
             page: 0x0C,
             usage: 0xE9,
-            pid: Some(0x0529),
+            pid: Some(crate::registry::CanonicalPid::of(0x0529)),
         };
         assert!(
             !Engine::matches(&restricted, &fired),

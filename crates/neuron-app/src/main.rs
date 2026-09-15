@@ -81,9 +81,18 @@ struct Resident {
 
 fn main() {
     // Config never depends on the process CWD: every Neuron runtime path resolves through
-    // `neuron::runroot::run_root()` (the exe's directory, or NEURON_RUN_DIR), so an HKCU Run
-    // autostart from C:\Windows\System32 and a shell launch from anywhere read the SAME config.
-    // No cwd pin — the CWD stays the user's, as any CLI-adjacent process should leave it.
+    // `neuron::runroot::run_root()` (the exe's directory when that's a home we may keep data in,
+    // else %LOCALAPPDATA%\neuron, else NEURON_RUN_DIR), so an autostart from C:\Windows\System32
+    // and a shell launch from anywhere read the SAME config. No cwd pin — the CWD stays the
+    // user's, as any CLI-adjacent process should leave it.
+
+    // FIRST, before ANY config read: carry a build-tree config universe forward. A self-built
+    // install used to keep every profile/macro/gesture in `target\release`, where a routine
+    // `cargo clean` destroys them (and the `backups/` safety net with them, since it lived in
+    // there too). Copies once, never clobbers, no-ops afterwards.
+    if let Some((from, to)) = neuron::runroot::adopt_legacy_run_root() {
+        eprintln!("[neuron] carried config forward: {} -> {}", from.display(), to.display());
+    }
 
     // PROFILER (inert unless NEURON_PROFILE is set): 1 Hz hot-path counters + per-thread/sidecar
     // CPU to neuron_profile.log, so a "never stops" spin localizes to a counter or a thread.

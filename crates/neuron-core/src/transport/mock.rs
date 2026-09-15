@@ -652,36 +652,31 @@ mod tests {
 
     // ── executable evidence of two confirmed defects ──────────────────────────────────────────
     //
-    // These assert the behaviour synthesis SHOULD have. They fail today. They are `#[ignore]`d so
-    // the suite stays green while the defects are open — run with `cargo test -- --ignored`.
-    // Delete the ignore attribute as part of the fix; that is the acceptance criterion.
+    // These assert the behaviour synthesis should have. Both defects are now FIXED and the tests
+    // run in the normal suite — the acceptance criterion was exactly "delete the ignore".
 
+    /// FIXED. Synthesis now opens with a CANARY: a command no device implements. A board that
+    /// answers SUCCESS to that has invalidated every other answer it could give, so synthesis
+    /// refuses the pipe outright instead of minting a capability map — writes included — from
+    /// what is provably noise. Trusting the status byte was the whole defect; the canary is what
+    /// makes the status byte trustworthy.
     #[test]
-    #[ignore = "OPEN DEFECT: synthesis trusts the status byte, so a parroting board mints a \
-                fully-false capability map including WRITE commands. See dialect.rs's razer-audio \
-                notes for the live observation this phantom reproduces."]
     fn a_parroting_board_must_not_mint_capabilities_it_never_proved() {
         let phantom = Arc::new(MockDevice::razer(0x9999, "Parrot").parroting());
         let ctx = SynthCtx::from_info(&phantom.info);
-        let s = synthesize(&phantom.handle(), &ctx)
-            .expect("the parrot answers the qualify getter, so synthesis proceeds");
-
-        // Every one of these is a WRITE the phantom never demonstrated. A device that answers
-        // SUCCESS-with-an-empty-body to everything has proved nothing at all.
-        for forged in ["set_dpi", "set_polling", "set_polling2", "set_brightness"] {
-            assert!(
-                !s.def.commands.contains_key(forged),
-                "synthesis granted the WRITE `{forged}` to a board that only parrots — an \
-                 all-zero body is not evidence"
-            );
-        }
+        assert!(
+            synthesize(&phantom.handle(), &ctx).is_none(),
+            "a pipe that rubber-stamps every command has proved nothing, so there is no honest \
+             def to emit for it — any capability minted here would be entirely forged"
+        );
     }
 
+    /// FIXED. Lighting evidence is now per-COMMAND (`CatalogEntry::proves_lighting`) rather than
+    /// per class, so answering the class-0x03 game-mode getter — a keyboard POLICY read about the
+    /// Win-key kill — no longer implies class-0x03 LIGHTING. The old inference grew a full legacy
+    /// lighting block, carrying unprobed 0x03/0x0A + 0x03/0x0B writes at tx 0x3F, onto boards with
+    /// no addressable LEDs at all.
     #[test]
-    #[ignore = "OPEN DEFECT: synth.rs sets legacy=true for ANY answering class 0x03, and the \
-                catalog's game_mode getter IS class 0x03/0x80 — so a board with no lighting at \
-                all grows a full legacy lighting block with unprobed 0x03/0x0A + 0x03/0x0B \
-                writes at tx 0x3F."]
     fn a_board_with_only_game_mode_must_not_grow_a_lighting_block() {
         let phantom = Arc::new(
             MockDevice::razer(0x8888, "Game mode only")

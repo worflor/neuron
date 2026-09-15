@@ -1730,7 +1730,7 @@ mod tests {
         let from = Trigger::Input {
             page: 0x09,
             usage: 0x05,
-            pid: Some(0x00A8),
+            pid: Some(crate::registry::CanonicalPid::of(0x00A8)),
         };
         let rule = button_remap(from.clone(), Action::Key { key: "f".into() }, false).unwrap();
         assert_eq!(rule.trigger, from);

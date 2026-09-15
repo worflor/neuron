@@ -8,10 +8,35 @@
 //! on *meaning* ("Volume Up", "Phone Mute"), not fragile raw bytes. `watch` prints them;
 //! `run` (see `bindings`) dispatches them into actions like "set the real mic's gain".
 
+/// WHICH of a device's independent input streams carried a report.
+///
+/// A Razer device presents its normal buttons over Raw Input and its DEFERRED buttons (the macro
+/// keys, the Naga's side-plate grid) over a separate driver-mode pipe. The two report independently
+/// and must never be diffed against each other — a press on one is not a release on the other.
+///
+/// This used to be encoded by BIT-PACKING a marker into the pid (`0xF000 | pid & 0x0FFF`), which
+/// meant the stream and the identity shared one 16-bit namespace: any pid ≥ 0x1000 silently
+/// truncated, and two physically different devices could collapse onto one identity in the held
+/// registry and in every pid-scoped bind. A `debug_assert` guarded it, and `debug_assert` is
+/// compiled out of the build users run. Splitting the stream into its own field means the
+/// truncation has nowhere to happen: no mask, no prefix, no reachable collision.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Default)]
+pub enum Stream {
+    /// The device's normal Raw-Input reports.
+    #[default]
+    RawInput,
+    /// The driver-mode deferred-button pipe (macro keys, side-plate grid).
+    Deferred,
+}
+
 /// One decoded control report from a Razer device.
 #[derive(Clone, Debug, Default)]
 pub struct ControlEvent {
-    pub pid: String,           // source device, e.g. "0529"
+    /// Source device, canonicalized ([`CanonicalPid`]). `None` when the source has no usable pid
+    /// — an audio endpoint, or a synthetic injection with no device behind it.
+    pub pid: Option<crate::registry::CanonicalPid>,
+    /// Which of the device's streams this came from; its own dimension, never packed into `pid`.
+    pub stream: Stream,
     pub hits: Vec<(u16, u16)>, // active (usage_page, usage) pairs ("buttons currently down")
     pub raw: Vec<u8>,          // raw HID report bytes (full transparency)
 }
@@ -24,6 +49,15 @@ impl ControlEvent {
     /// True on a "press" (any usage active) vs the matching release report (none active).
     pub fn is_press(&self) -> bool {
         !self.hits.is_empty()
+    }
+    /// The source pid as lowercase hex, or `""` when there is none — the display/log form, and
+    /// what the legacy `[[bindings]]` `pid = "0529"` string field matches against.
+    pub fn pid_hex(&self) -> String {
+        self.pid.map(|p| p.to_string()).unwrap_or_default()
+    }
+    /// The bucket a [`HoldEdges`] diff keys on: identity AND stream, as separate values.
+    pub fn bucket(&self) -> (Option<crate::registry::CanonicalPid>, Stream) {
+        (self.pid, self.stream)
     }
 }
 
@@ -84,15 +118,9 @@ const INJECT_PENDING_MAX: usize = 64;
 pub fn inject_event(ev: ControlEvent) {
     // Injected sources (macro keys / deferred buttons) feed the shared held-state registry too,
     // so they are first-class candidates for held binds (the cast trigger) exactly like a native
-    // control. The registry speaks the device's canonical identity, so strip the synthetic
-    // edge-bucket prefix (see `hit_trigger`) before recording.
-    note_held(
-        &format!("inject:{}", ev.pid),
-        u16::from_str_radix(&ev.pid, 16)
-            .ok()
-            .map(|p| if p & 0xF000 == 0xF000 { p & 0x0FFF } else { p }),
-        &ev.hits,
-    );
+    // control. The registry speaks the device's canonical identity — which `ev.pid` now simply IS,
+    // with the stream carried alongside it instead of packed into the same 16 bits.
+    note_held(&format!("inject:{}", ev.pid_hex()), ev.pid, &ev.hits);
     // Stamp BEFORE taking the lock: the stamp means "when this edge became visible to us", and lock
     // acquisition is part of the delivery cost we want the hop to include, not excluded from it.
     let ev = Injected {
@@ -281,9 +309,9 @@ pub fn watch(seconds: u64) {
                 .map(|b| format!("{b:02X} "))
                 .collect();
             if decoded.is_empty() {
-                println!("  [PID {}] {hex}", ev.pid);
+                println!("  [PID {}] {hex}", ev.pid_hex());
             } else {
-                println!("  [PID {}] {}   raw: {hex}", ev.pid, decoded.join(", "));
+                println!("  [PID {}] {}   raw: {hex}", ev.pid_hex(), decoded.join(", "));
             }
             count += 1;
         },
@@ -475,24 +503,17 @@ use crate::profile::AppRules;
 /// is retained for the watch/printout path and back-compat.
 pub fn event_trigger(ev: &ControlEvent) -> Option<Trigger> {
     let &(page, usage) = ev.hits.first()?;
-    let pid = u16::from_str_radix(&ev.pid, 16).ok();
-    Some(hit_trigger(page, usage, pid))
+    Some(hit_trigger(page, usage, ev.pid))
 }
 
 /// Map a single decoded `(page, usage)` hit + source pid to its [`Trigger::Input`].
 ///
-/// Macro-page events ride a synthetic edge-bucket pid (`0xF000 | canonical device pid`) so their
-/// [`HoldEdges`] bucket never collides with the same device's Raw-Input streams. The TRIGGER,
-/// though, speaks the device's canonical identity — strip the bucket prefix here so pid-scoped
-/// macro/deferred-button binds (a Naga side-plate key, a BlackWidow M-key) match their device.
-fn hit_trigger(page: u16, usage: u16, pid: Option<u16>) -> Trigger {
-    let pid = pid.map(|p| {
-        if page == RAZER_MACRO_PAGE && p & 0xF000 == 0xF000 {
-            crate::registry::canonical_event_pid(p & 0x0FFF)
-        } else {
-            p
-        }
-    });
+/// There is nothing to unpack any more. The deferred-button stream used to ride a synthetic
+/// `0xF000 | pid` bucket pid that this function had to strip back off; the stream is now its own
+/// field on [`ControlEvent`], so a device's identity arrives here already canonical and whole, from
+/// either stream. A pid-scoped bind on a Naga side-plate key and one on its normal buttons name the
+/// same device because they ARE the same value.
+fn hit_trigger(page: u16, usage: u16, pid: Option<crate::registry::CanonicalPid>) -> Trigger {
     Trigger::Input { page, usage, pid }
 }
 
@@ -522,9 +543,12 @@ pub enum InputEdge {
 /// report independently and a release on one must not look like a release on the other.
 #[derive(Default)]
 pub struct HoldEdges {
-    /// Previously-down `(page, usage)` controls, keyed by source pid (`None` = unknown pid bucket).
+    /// Previously-down `(page, usage)` controls, keyed by (source device, stream) — `None` pid is
+    /// the unknown-source bucket. The STREAM is part of the key because one device drives two
+    /// independent input streams (see [`Stream`]); before it was a key it was a bit packed into the
+    /// pid, which is how a pid >= 0x1000 could have aliased two devices onto one bucket.
     /// Kept sorted/deduped: input reports are tiny, so a compact `Vec` beats a tree here.
-    down: std::collections::HashMap<Option<u16>, Vec<(u16, u16)>>,
+    down: std::collections::HashMap<(Option<crate::registry::CanonicalPid>, Stream), Vec<(u16, u16)>>,
 }
 
 impl HoldEdges {
@@ -540,10 +564,13 @@ impl HoldEdges {
     /// An empty report (`hits == []`) is the all-released edge for that device: it yields an `Up`
     /// for every control that was down — no more `release_all()`-on-any-empty over-reach.
     pub fn edges(&mut self, ev: &ControlEvent) -> Vec<InputEdge> {
-        let pid = u16::from_str_radix(&ev.pid, 16).ok();
+        let pid = ev.pid;
         let mut now = ev.hits.clone();
         normalize_hits(&mut now);
-        let prev = self.down.entry(pid).or_default();
+        // Keyed on (identity, stream): the same device's Raw-Input and deferred-button streams
+        // report independently, so diffing one against the other would read a press on the grid as
+        // a release of a normal button.
+        let prev = self.down.entry(ev.bucket()).or_default();
         let mut out = Vec::with_capacity(now.len().saturating_add(prev.len()));
         // down edges: in `now`, not in `prev`.
         for &(p, u) in &now {
@@ -586,8 +613,10 @@ fn normalize_hits(hits: &mut Vec<(u16, u16)>) {
 pub struct ControlRef {
     pub page: u16,
     pub usage: u16,
+    /// Canonical source device, so a `ControlRef` bind and a spine rule agree on identity by type
+    /// rather than by convention (see [`CanonicalPid`](crate::registry::CanonicalPid)).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pid: Option<u16>,
+    pub pid: Option<crate::registry::CanonicalPid>,
 }
 
 impl<'de> serde::Deserialize<'de> for ControlRef {
@@ -601,7 +630,7 @@ impl<'de> serde::Deserialize<'de> for ControlRef {
                 page: u16,
                 usage: u16,
                 #[serde(default)]
-                pid: Option<u16>,
+                pid: Option<crate::registry::CanonicalPid>,
             },
         }
         match Raw::deserialize(d)? {
@@ -661,7 +690,7 @@ impl ControlRef {
             (p, u) => control_label(p, u),
         };
         match self.pid {
-            Some(p) => format!("{name} @{p:04x}"),
+            Some(p) => format!("{name} @{p}"),
             None => name,
         }
     }
@@ -782,7 +811,9 @@ pub fn control_to_vk(page: u16, usage: u16) -> Option<i32> {
 // same pid) sends independent snapshots per interface — pid-keying would let a mouse click
 // clobber a held side-plate key. Consumers poll [`control_held`]; the same shared-stateless-state
 // model as `capture::set_macro_held` (each consumer keeps its own prev[] and edge-detects).
-static HELD: std::sync::Mutex<Vec<(String, Option<u16>, Vec<(u16, u16)>)>> =
+static HELD: std::sync::Mutex<
+    Vec<(String, Option<crate::registry::CanonicalPid>, Vec<(u16, u16)>)>,
+> =
     std::sync::Mutex::new(Vec::new());
 
 // Passive observers of the resident pump's already-decoded control stream. Unlike `INJECT`, this
@@ -837,9 +868,13 @@ pub fn observe_controls() -> ControlObserver {
     ControlObserver { id, rx }
 }
 
-fn publish_control_observation(pid: Option<u16>, hits: &[(u16, u16)]) {
+fn publish_control_observation(
+    pid: Option<crate::registry::CanonicalPid>,
+    hits: &[(u16, u16)],
+) {
     let ev = ControlEvent {
-        pid: pid.map(|p| format!("{p:04x}")).unwrap_or_default(),
+        pid,
+        stream: Stream::RawInput,
         hits: hits.to_vec(),
         raw: Vec::new(),
     };
@@ -851,7 +886,11 @@ fn publish_control_observation(pid: Option<u16>, hits: &[(u16, u16)]) {
 
 /// Record one input source's full current down-set (the same snapshot shape [`HoldEdges`] diffs).
 /// An empty set removes the entry, so the list stays bounded by "devices with something held".
-pub(crate) fn note_held(source: &str, pid: Option<u16>, hits: &[(u16, u16)]) {
+pub(crate) fn note_held(
+    source: &str,
+    pid: Option<crate::registry::CanonicalPid>,
+    hits: &[(u16, u16)],
+) {
     let mut set = hits.to_vec();
     normalize_hits(&mut set);
     let mut g = HELD.lock().unwrap_or_else(|e| e.into_inner());
@@ -874,22 +913,18 @@ pub(crate) fn note_held(source: &str, pid: Option<u16>, hits: &[(u16, u16)]) {
     publish_control_observation(pid, &set);
 }
 
-/// Canonicalize a decode-time pid hex string onto the owning device's event identity — the one
-/// transformation between "the pid this event physically arrived under" (a link-mode or
-/// receiver-sideband pid) and "the device the user bound". See [`crate::registry::
-/// canonical_event_pid`]; an unparseable pid passes through untouched.
-pub(crate) fn canonical_pid_hex(pid: String) -> String {
-    match u16::from_str_radix(&pid, 16) {
-        Ok(p) => {
-            let c = crate::registry::canonical_event_pid(p);
-            if c == p {
-                pid
-            } else {
-                format!("{c:04x}")
-            }
-        }
-        Err(_) => pid,
-    }
+/// The canonical source identity for a device path — the one transformation between "the pid this
+/// event physically arrived under" (a link-mode or receiver-sideband pid) and "the device the user
+/// bound". `None` when the path carries no parseable pid (an audio endpoint, a virtual source):
+/// that is an honest "no device here", not a zero that would collide with a real one.
+///
+/// This replaces a hex-STRING round trip (`String -> u16 -> canonicalize -> String`) that every
+/// decode site had to remember to call. Returning the typed
+/// [`CanonicalPid`](crate::registry::CanonicalPid) means a site that forgets doesn't compile.
+pub(crate) fn source_pid(pid_hex: &str) -> Option<crate::registry::CanonicalPid> {
+    u16::from_str_radix(pid_hex, 16)
+        .ok()
+        .map(crate::registry::CanonicalPid::of)
 }
 
 /// Is any live Raw-Input pump feeding the registry? Every listen loop registers an inject drain
@@ -903,13 +938,15 @@ pub fn held_registry_live() -> bool {
 /// Whether `(page, usage)` is currently held — device-aware. `pid = Some(p)` counts only presses
 /// from device `p`; `None` counts any source (the device-any semantics `Trigger::Input` rules
 /// already have). Returns `None` when no pump is alive to feed the registry (caller falls back).
-pub fn control_held(page: u16, usage: u16, pid: Option<u16>) -> Option<bool> {
+pub fn control_held(
+    page: u16,
+    usage: u16,
+    pid: Option<crate::registry::CanonicalPid>,
+) -> Option<bool> {
     if !held_registry_live() {
         return None;
     }
-    // registry entries carry canonical pids (decode canonicalizes) — canonicalize the QUERY too,
-    // so a bind persisted with a link-mode pid before canonicalization keeps reading its hold.
-    let pid = pid.map(crate::registry::canonical_event_pid);
+    // Both sides are already canonical by construction — no normalize-the-query step to forget.
     let g = HELD.lock().unwrap_or_else(|e| e.into_inner());
     Some(g.iter().any(|(_, src_pid, set)| {
         (pid.is_none() || pid == *src_pid) && set.binary_search(&(page, usage)).is_ok()
@@ -937,7 +974,11 @@ mod control_ref_tests {
             toml::from_str("trigger = { page = 7, usage = 30, pid = 168 }").unwrap();
         assert_eq!(
             modern.trigger,
-            ControlRef { page: 0x07, usage: 0x1E, pid: Some(0x00a8) }
+            ControlRef {
+                page: 0x07,
+                usage: 0x1E,
+                pid: Some(crate::registry::CanonicalPid::of(0x00a8)),
+            }
         );
         // serialize → reparse roundtrip (always the table form on the way out).
         let out = toml::to_string(&modern.trigger).unwrap();
@@ -963,41 +1004,75 @@ mod control_ref_tests {
     }
 
     #[test]
-    fn macro_bucket_pids_strip_to_the_canonical_device() {
-        // A deferred-button/macro event rides bucket pid 0xF000|canonical; its TRIGGER must speak
-        // the device. 0xF0A7 → the Naga's canonical 0x00A7 (identity through the builtin defs).
+    fn deferred_stream_and_raw_input_share_one_device_identity() {
+        // A deferred-button/macro event and a normal button press from the SAME device must
+        // produce the same pid in their triggers. This used to require unpacking a synthetic
+        // `0xF000 | pid` bucket; now the stream is its own field, so identity arrives whole.
+        let naga = crate::registry::CanonicalPid::of(0x00A7);
         let ev = ControlEvent {
-            pid: "f0a7".into(),
+            pid: Some(naga),
+            stream: Stream::Deferred,
             hits: vec![(RAZER_MACRO_PAGE, 0x22)],
             raw: Vec::new(),
         };
         assert_eq!(
             event_trigger(&ev),
-            Some(Trigger::Input {
-                page: RAZER_MACRO_PAGE,
-                usage: 0x22,
-                pid: Some(0x00A7),
-            })
+            Some(Trigger::Input { page: RAZER_MACRO_PAGE, usage: 0x22, pid: Some(naga) })
         );
-        // a non-macro page never strips (0xF0.. would be a genuinely weird real pid — keep it).
-        let ev2 = ControlEvent { pid: "0221".into(), hits: vec![(0x07, 0x1E)], raw: Vec::new() };
+        let ev2 = ControlEvent {
+            pid: Some(crate::registry::CanonicalPid::of(0x0221)),
+            stream: Stream::RawInput,
+            hits: vec![(0x07, 0x1E)],
+            raw: Vec::new(),
+        };
         assert_eq!(
             event_trigger(&ev2),
-            Some(Trigger::Input { page: 0x07, usage: 0x1E, pid: Some(0x0221) })
+            Some(Trigger::Input {
+                page: 0x07,
+                usage: 0x1E,
+                pid: Some(crate::registry::CanonicalPid::of(0x0221)),
+            })
         );
+    }
+
+    /// THE REGRESSION THE OLD BUCKET SCHEME COULD NOT SURVIVE. `0xF000 | (pid & 0x0FFF)` truncated
+    /// silently for any pid >= 0x1000, so two different devices whose low 12 bits matched collapsed
+    /// onto ONE bucket — a press on one read as a press on the other, in the held registry and in
+    /// every pid-scoped bind. Only a `debug_assert` stood in the way, and that is compiled out of
+    /// release builds. With the stream split out of the identity there is no mask left to alias.
+    #[test]
+    fn devices_sharing_low_12_bits_never_alias() {
+        let a = crate::registry::CanonicalPid::of(0x00A7);
+        let b = crate::registry::CanonicalPid::of(0x10A7); // same low 12 bits as `a`
+        assert_ne!(a, b, "a 16-bit identity must keep all 16 bits");
+
+        let mut edges = HoldEdges::new();
+        let press = |pid, stream| ControlEvent {
+            pid: Some(pid),
+            stream,
+            hits: vec![(0x09, 4)],
+            raw: Vec::new(),
+        };
+        assert_eq!(edges.edges(&press(a, Stream::RawInput)).len(), 1, "a presses");
+        // If `b` aliased onto `a`'s bucket this would be diffed as "already down" and yield
+        // nothing. It must be its own down edge.
+        assert_eq!(edges.edges(&press(b, Stream::RawInput)).len(), 1, "b is a separate device");
+        // Same device, other stream: also its own bucket, so the grid and the normal buttons
+        // cannot read as releases of each other.
+        assert_eq!(edges.edges(&press(a, Stream::Deferred)).len(), 1, "streams are separate");
     }
 
     #[test]
     fn passive_observer_receives_the_normalized_held_stream() {
         let observer = observe_controls();
-        let pid = 0xEFFE;
+        let pid = crate::registry::CanonicalPid::of(0xEFFE);
         note_held("observer-regression", Some(pid), &[(0x09, 5), (0x07, 0x1E)]);
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
         let ev = loop {
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             let ev = observer.recv_timeout(left).expect("held update reaches passive capture tap");
-            if ev.pid == "effe" {
+            if ev.pid_hex() == "effe" {
                 break ev;
             }
         };
@@ -1011,21 +1086,26 @@ mod control_ref_tests {
     fn held_registry_is_device_aware_and_snapshot_replacing() {
         // No live pump in tests → the public query reports "no registry"; drive the internals.
         assert_eq!(control_held(0x07, 0x1E, None), None);
-        note_held("test:naga-kbd", Some(0xa8), &[(0x07, 0x1E)]);
-        note_held("test:kbd", Some(0x221), &[(0x07, 0x1E)]);
+        note_held("test:naga-kbd", Some(crate::registry::CanonicalPid::of(0xa8)), &[(0x07, 0x1E)]);
+        note_held("test:kbd", Some(crate::registry::CanonicalPid::of(0x221)), &[(0x07, 0x1E)]);
         {
             let g = HELD.lock().unwrap();
-            let hit = |pid: Option<u16>| {
+            let hit = |pid: Option<crate::registry::CanonicalPid>| {
                 g.iter().any(|(_, p, set)| {
                     (pid.is_none() || pid == *p) && set.binary_search(&(0x07, 0x1E)).is_ok()
                 })
             };
-            assert!(hit(Some(0xa8)) && hit(Some(0x221)) && hit(None));
-            assert!(!g.iter().any(|(_, p, _)| *p == Some(0x99)), "unknown pid holds nothing");
+            assert!(hit(Some(crate::registry::CanonicalPid::of(0xa8)))
+                && hit(Some(crate::registry::CanonicalPid::of(0x221)))
+                && hit(None));
+            assert!(
+                !g.iter().any(|(_, p, _)| *p == Some(crate::registry::CanonicalPid::of(0x99))),
+                "unknown pid holds nothing"
+            );
         }
         // a mouse-interface snapshot from the SAME device must not clobber the keyboard
         // interface's held key — entries are per SOURCE, not per pid.
-        note_held("test:naga-mouse", Some(0xa8), &[(0x09, 1)]);
+        note_held("test:naga-mouse", Some(crate::registry::CanonicalPid::of(0xa8)), &[(0x09, 1)]);
         {
             let g = HELD.lock().unwrap();
             assert!(
@@ -1035,9 +1115,9 @@ mod control_ref_tests {
             );
         }
         // an empty snapshot releases (and drops) the source.
-        note_held("test:naga-kbd", Some(0xa8), &[]);
-        note_held("test:naga-mouse", Some(0xa8), &[]);
-        note_held("test:kbd", Some(0x221), &[]);
+        note_held("test:naga-kbd", Some(crate::registry::CanonicalPid::of(0xa8)), &[]);
+        note_held("test:naga-mouse", Some(crate::registry::CanonicalPid::of(0xa8)), &[]);
+        note_held("test:kbd", Some(crate::registry::CanonicalPid::of(0x221)), &[]);
         assert!(HELD.lock().unwrap().iter().all(|(s, _, _)| !s.starts_with("test:")));
     }
 }
@@ -1051,7 +1131,11 @@ mod control_ref_tests {
 /// * `mic-gain-set` -> [`Action::MicGainSet`] (absolute percentage)
 /// * `run`          -> [`Action::Run`] (shell command)
 pub fn binding_rule(b: &Binding) -> Option<Rule> {
-    let pid = b.pid.as_ref().and_then(|p| u16::from_str_radix(p, 16).ok());
+    let pid = b
+        .pid
+        .as_ref()
+        .and_then(|p| u16::from_str_radix(p, 16).ok())
+        .map(crate::registry::CanonicalPid::of);
     let trigger = Trigger::Input {
         page: b.page,
         usage: b.usage,
@@ -1658,7 +1742,8 @@ mod spine_tests {
         // BUFFERED and handed to the first sink that registers — so no first keypress is lost.
         // (No listen loop runs in tests, so INJECT starts empty here, exercising the buffer path.)
         let ev = ControlEvent {
-            pid: "f042".into(),
+            pid: crate::registry::CanonicalPid::of(0xf042).into(),
+            stream: crate::controls::Stream::RawInput,
             hits: vec![(RAZER_MACRO_PAGE, 0x20)],
             raw: vec![0x04, 0x20],
         };
@@ -1705,7 +1790,8 @@ mod spine_tests {
         assert!(signaled(wake_b), "wake_pump signals listener B — every listener, not just one");
         // inject_event (broadcast) must wake both in place AND deliver the edge
         let ev = ControlEvent {
-            pid: "f042".into(),
+            pid: crate::registry::CanonicalPid::of(0xf042).into(),
+            stream: crate::controls::Stream::RawInput,
             hits: vec![(RAZER_MACRO_PAGE, 0x21)],
             raw: vec![0x04, 0x21],
         };
@@ -1751,7 +1837,8 @@ mod spine_tests {
     #[test]
     fn event_trigger_uses_first_hit_and_pid() {
         let ev = ControlEvent {
-            pid: "0529".into(),
+            pid: crate::registry::CanonicalPid::of(0x0529).into(),
+            stream: crate::controls::Stream::RawInput,
             hits: vec![(0x0C, 0xE9)],
             raw: vec![],
         };
@@ -1761,12 +1848,13 @@ mod spine_tests {
             Trigger::Input {
                 page: 0x0C,
                 usage: 0xE9,
-                pid: Some(0x0529)
+                pid: Some(crate::registry::CanonicalPid::of(0x0529))
             }
         );
         // a release report (no hits) yields no trigger (it drives hold edges, not dispatch).
         let rel = ControlEvent {
-            pid: "0529".into(),
+            pid: crate::registry::CanonicalPid::of(0x0529).into(),
+            stream: crate::controls::Stream::RawInput,
             hits: vec![],
             raw: vec![],
         };
@@ -1777,7 +1865,8 @@ mod spine_tests {
     fn hold_edges_diffs_down_and_up() {
         let mut he = HoldEdges::new();
         let ev = |hits: Vec<(u16, u16)>| ControlEvent {
-            pid: "00a8".into(),
+            pid: crate::registry::CanonicalPid::of(0x00a8).into(),
+            stream: crate::controls::Stream::RawInput,
             hits,
             raw: vec![],
         };
@@ -1788,7 +1877,7 @@ mod spine_tests {
             vec![InputEdge::Down(Trigger::Input {
                 page: 0x09,
                 usage: 0x01,
-                pid: Some(0x00a8)
+                pid: Some(crate::registry::CanonicalPid::of(0x00a8))
             })]
         );
         // now press B while A stays down -> only B is a new Down (A is NOT re-emitted).
@@ -1798,7 +1887,7 @@ mod spine_tests {
             vec![InputEdge::Down(Trigger::Input {
                 page: 0x09,
                 usage: 0x02,
-                pid: Some(0x00a8)
+                pid: Some(crate::registry::CanonicalPid::of(0x00a8))
             })],
             "a second button held with the first dispatches; the first is not dropped or re-fired"
         );
@@ -1809,7 +1898,7 @@ mod spine_tests {
             vec![InputEdge::Up(Trigger::Input {
                 page: 0x09,
                 usage: 0x01,
-                pid: Some(0x00a8)
+                pid: Some(crate::registry::CanonicalPid::of(0x00a8))
             })],
             "releasing one button yields an Up for ONLY that button"
         );
@@ -1820,7 +1909,7 @@ mod spine_tests {
             vec![InputEdge::Up(Trigger::Input {
                 page: 0x09,
                 usage: 0x02,
-                pid: Some(0x00a8)
+                pid: Some(crate::registry::CanonicalPid::of(0x00a8))
             })]
         );
     }
@@ -1829,12 +1918,14 @@ mod spine_tests {
     fn hold_edges_are_per_device() {
         let mut he = HoldEdges::new();
         let a = ControlEvent {
-            pid: "00a8".into(),
+            pid: crate::registry::CanonicalPid::of(0x00a8).into(),
+            stream: crate::controls::Stream::RawInput,
             hits: vec![(0x09, 0x01)],
             raw: vec![],
         };
         let b_empty = ControlEvent {
-            pid: "0221".into(),
+            pid: crate::registry::CanonicalPid::of(0x0221).into(),
+            stream: crate::controls::Stream::RawInput,
             hits: vec![],
             raw: vec![],
         };
@@ -2826,14 +2917,11 @@ pub(crate) mod win {
                                                 }
                                             }
                                         }
-                                        let pid = super::canonical_pid_hex(pid_from_path(&path));
-                                        super::note_held(
-                                            &path,
-                                            u16::from_str_radix(&pid, 16).ok(),
-                                            &hits,
-                                        );
+                                        let pid = super::source_pid(&pid_from_path(&path));
+                                        super::note_held(&path, pid, &hits);
                                         on_event(&ControlEvent {
                                             pid,
+                                            stream: super::Stream::RawInput,
                                             hits,
                                             raw: report,
                                         });
@@ -2863,12 +2951,15 @@ pub(crate) mod win {
                                             {
                                                 let physkey =
                                                     kb.MakeCode | if e0 { 0x100 } else { 0 };
-                                                // canonical identity, so a pid-scoped remap keeps
-                                                // working when the same device rides its dongle.
-                                                let pid = crate::registry::canonical_event_pid(
-                                                    u16::from_str_radix(&pid_from_path(&path), 16)
-                                                        .unwrap_or(0),
-                                                );
+                                                // The shim's door canonicalizes; hand it the raw
+                                                // pid off the wire rather than canonicalizing here
+                                                // too (one door, not a convention repeated at
+                                                // every call site).
+                                                let pid = u16::from_str_radix(
+                                                    &pid_from_path(&path),
+                                                    16,
+                                                )
+                                                .unwrap_or(0);
                                                 crate::intercept::on_raw_keyboard(physkey, !up, pid);
                                             }
                                             let set = down_sets.entry(path.clone()).or_default();
@@ -2883,16 +2974,15 @@ pub(crate) mod win {
                                                 false // auto-repeat: already down, no new edge
                                             };
                                             if changed {
-                                                let pid = super::canonical_pid_hex(
-                                                    pid_from_path(&path),
-                                                );
+                                                let pid = super::source_pid(&pid_from_path(&path));
                                                 super::note_held(
                                                     &path,
-                                                    u16::from_str_radix(&pid, 16).ok(),
+                                                    pid,
                                                     set,
                                                 );
                                                 on_event(&ControlEvent {
                                                     pid,
+                                                    stream: super::Stream::RawInput,
                                                     hits: set.clone(),
                                                     raw: Vec::new(),
                                                 });
@@ -2920,10 +3010,12 @@ pub(crate) mod win {
                                             // click and replay unclaimed-device ones. The twin
                                             // of the keyboard feed above; no-op unless armed.
                                             {
-                                                let pid = crate::registry::canonical_event_pid(
-                                                    u16::from_str_radix(&pid_from_path(&path), 16)
-                                                        .unwrap_or(0),
-                                                );
+                                                // Raw pid; `on_raw_mouse` canonicalizes at its door.
+                                                let pid = u16::from_str_radix(
+                                                    &pid_from_path(&path),
+                                                    16,
+                                                )
+                                                .unwrap_or(0);
                                                 for &(d, u, n) in &BTN {
                                                     if (3..=5).contains(&n) {
                                                         if flags & d != 0 {
@@ -2954,16 +3046,15 @@ pub(crate) mod win {
                                                 }
                                             }
                                             if changed {
-                                                let pid = super::canonical_pid_hex(
-                                                    pid_from_path(&path),
-                                                );
+                                                let pid = super::source_pid(&pid_from_path(&path));
                                                 super::note_held(
                                                     &path,
-                                                    u16::from_str_radix(&pid, 16).ok(),
+                                                    pid,
                                                     set,
                                                 );
                                                 on_event(&ControlEvent {
                                                     pid,
+                                                    stream: super::Stream::RawInput,
                                                     hits: set.clone(),
                                                     raw: Vec::new(),
                                                 });
@@ -2999,7 +3090,8 @@ pub(crate) mod win {
                     down_sets.clear();
                     for path in stale {
                         on_event(&ControlEvent {
-                            pid: pid_from_path(&path),
+                            pid: super::source_pid(&pid_from_path(&path)),
+                            stream: super::Stream::RawInput,
                             hits: Vec::new(),
                             raw: Vec::new(),
                         });

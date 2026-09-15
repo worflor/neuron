@@ -71,6 +71,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_Networking_WinSock",        # SOCKET_ADDRESS (IP_ADAPTER_ADDRESSES struct deps)
     "Win32_NetworkManagement_WiFi",    # WlanOpenHandle/QueryInterface — the connected SSID
     "Win32_Devices_Bluetooth",         # BluetoothFindFirstRadio — is a BT radio present
+    "Win32_Devices_HumanInterfaceDevice", # GUID_DEVINTERFACE_HID — scope the hotplug notification to HID
     # crash recovery:
     "Win32_System_Threading",          # GetCurrentThreadId for flight-event attribution
     "Win32_System_Recovery",           # RegisterApplicationRestart — OS respawns us after a crash

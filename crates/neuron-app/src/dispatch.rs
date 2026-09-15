@@ -42,6 +42,13 @@ use std::time::{Duration, Instant};
 enum LiveCommand {
     Reload,
     Inject(Trigger),
+    /// Latch a context layer into a slot (`None` clears it). The seated side plate rides this:
+    /// hidwatch decodes the plate's pushed report, and the live engine turns that fact into
+    /// "these binds exist right now".
+    Latch {
+        slot: String,
+        layer: Option<String>,
+    },
     ToggleHyperShift(Sender<bool>),
     ReconcileGamingHook,
     ApplyProfile {
@@ -96,6 +103,17 @@ pub fn reload_generation() -> u64 {
 /// intents, turbo, the SAFE-mode gate and the live readout all compose identically.
 /// Queue a trigger for the live worker's next tick. Callable from any thread; a no-op burden if
 /// the worker isn't running (the queue is drained only by it, and bounded by real user gestures).
+/// Latch a context layer (the seated side plate) into the live engine, or clear it with `None`.
+///
+/// A plate is not an event and not a profile: it is a persistent fact that decides WHICH BINDS
+/// EXIST. Routing it through the same worker as every other live command keeps engine mutation on
+/// one thread, so the plate can never race a reload or a profile apply.
+pub fn latch_context(slot: &str, layer: Option<String>) {
+    if !send_live(LiveCommand::Latch { slot: slot.to_string(), layer }) {
+        crate::flight::trace("plate", "latch dropped (live worker absent)", 0);
+    }
+}
+
 pub fn inject_trigger(t: Trigger) {
     crate::flight::trace("cast", "trigger injected", 0);
     if !send_live(LiveCommand::Inject(t)) {
@@ -663,7 +681,7 @@ fn interceptor_owns(t: &Trigger) -> bool {
             page,
             usage,
             pid: Some(pid),
-        } => neuron::intercept::owns(*page, *usage, *pid),
+        } => neuron::intercept::owns(*page, *usage, pid.get()),
         _ => false,
     }
 }
@@ -779,6 +797,20 @@ fn live_tick(ctx: &mut LiveCtx) -> Duration {
         match cmd {
             LiveCommand::Reload => ctx.reload_pending = true,
             LiveCommand::Inject(trigger) => ctx.injected.push(trigger),
+            LiveCommand::Latch { slot, layer } => {
+                // Engine mutation stays on this one thread, like every other live command.
+                // `flight::trace` takes &'static str, so the transition is the message and the
+                // detail rides the recorder's numeric arg (layer name length is a cheap witness
+                // that a DIFFERENT layer landed, without allocating in the live loop).
+                let len = layer.as_deref().map(str::len).unwrap_or(0) as u64;
+                if ctx.rt.borrow_mut().engine.latch(&slot, layer) {
+                    crate::flight::trace(
+                        "plate",
+                        if len > 0 { "context layer latched" } else { "context layer cleared" },
+                        len,
+                    );
+                }
+            }
             LiveCommand::ToggleHyperShift(reply) => {
                 ctx.hypershift_latch = !ctx.hypershift_latch;
                 let _ = reply.send(ctx.hypershift_latch);
@@ -2453,9 +2485,10 @@ mod tests {
                     } else {
                         set.remove(&(0x09, usage));
                     }
-                    let pid = if device == 0 { "00a8" } else { "0221" };
+                    let pid = neuron::registry::CanonicalPid::of(if device == 0 { 0x00a8 } else { 0x0221 });
                     let ev = ControlEvent {
-                        pid: pid.into(),
+                        pid: Some(pid),
+                        stream: neuron::controls::Stream::RawInput,
                         hits: set.iter().cloned().collect(),
                         raw: Vec::new(),
                     };

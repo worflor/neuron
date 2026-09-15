@@ -228,10 +228,12 @@ fn decode(buf: &[u8], pid: u16) {
     // keys, which arrive via Raw Input under the real PID. Built from the CANONICAL event pid so
     // the device identity the bucket carries (and `hit_trigger` strips back out for pid-scoped
     // macro binds) is stable across link modes.
-    let canon = neuron::registry::canonical_event_pid(pid);
-    debug_assert!(canon < 0x1000, "Razer pid {canon:#06x} would alias the 0xF000 macro-bucket prefix");
+    // Stream as a field, not a prefix bit-packed into the identity — see `controls::Stream`.
+    // The old `0xF000 | canon & 0x0FFF` form truncated any pid >= 0x1000 behind a `debug_assert`
+    // that release builds drop, aliasing two devices onto one bucket.
     neuron::controls::inject_event(neuron::controls::ControlEvent {
-        pid: format!("{:04x}", 0xF000u16 | (canon & 0x0FFF)),
+        pid: Some(neuron::registry::CanonicalPid::of(pid)),
+        stream: neuron::controls::Stream::Deferred,
         hits,
         raw: buf.to_vec(),
     });

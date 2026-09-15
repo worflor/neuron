@@ -54,7 +54,9 @@ pub enum KeyOut {
 /// scancode on any other device is replayed unchanged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Remap {
-    pub pid: u16,
+    /// Canonical source device — the same identity the rule spine and the held registry speak, so
+    /// the shim cannot disagree with them about which device a claim belongs to.
+    pub pid: crate::registry::CanonicalPid,
     pub from: u16,
     pub to: KeyOut,
 }
@@ -134,7 +136,12 @@ impl Interceptor {
     /// inject — the target key if `pid` matches a remap for this scancode, else the original
     /// (another device sent it). `None` if there's no pending match (e.g. an injected replay's own
     /// Raw-Input echo, or a scancode we don't remap).
-    pub fn on_rawinput(&mut self, scancode: u16, down: bool, pid: u16) -> Option<Inject> {
+    pub fn on_rawinput(
+        &mut self,
+        scancode: u16,
+        down: bool,
+        pid: crate::registry::CanonicalPid,
+    ) -> Option<Inject> {
         let pos = self
             .pending
             .iter()
@@ -182,7 +189,7 @@ impl Interceptor {
 
     /// Is there a remap for this (physkey, device pid)? Lets the live dispatcher SKIP its own
     /// host-side handling of a trigger the shim already owns (avoids the double-send).
-    pub fn has_remap(&self, physkey: u16, pid: u16) -> bool {
+    pub fn has_remap(&self, physkey: u16, pid: crate::registry::CanonicalPid) -> bool {
         self.by_scancode
             .get(&physkey)
             .is_some_and(|v| v.iter().any(|r| r.pid == pid))
@@ -190,7 +197,7 @@ impl Interceptor {
 
     /// Like [`has_remap`], but ONLY for replacement remaps ([`KeyOut::Scancode`]). Swallow claims
     /// don't count — the dispatcher must still fire their actions (see the module-level `owns`).
-    pub fn has_key_remap(&self, physkey: u16, pid: u16) -> bool {
+    pub fn has_key_remap(&self, physkey: u16, pid: crate::registry::CanonicalPid) -> bool {
         self.by_scancode.get(&physkey).is_some_and(|v| {
             v.iter()
                 .any(|r| r.pid == pid && matches!(r.to, KeyOut::Scancode(_)))
@@ -203,7 +210,12 @@ impl Interceptor {
     /// Unlike [`on_rawinput`], this never touches `pending` (the Windows correlation path). The
     /// Windows/macOS backends use `on_hook`+`on_rawinput`; a grab backend uses this instead.
     /// `None` = the key is claimed with [`KeyOut::Swallow`] — emit nothing.
-    pub fn resolve_direct(&self, physkey: u16, down: bool, pid: u16) -> Option<Inject> {
+    pub fn resolve_direct(
+        &self,
+        physkey: u16,
+        down: bool,
+        pid: crate::registry::CanonicalPid,
+    ) -> Option<Inject> {
         match self
             .by_scancode
             .get(&physkey)
@@ -344,10 +356,9 @@ pub fn claim_for_rule(rule: &crate::engine::Rule) -> Option<Remap> {
         } => (
             *page,
             *usage,
-            // raw-input attribution feeds this shim CANONICAL pids (controls decode
-            // canonicalizes) — canonicalize the rule's stored pid to match, so a bind persisted
-            // with a link-mode pid before canonicalization keeps owning its key.
-            crate::registry::canonical_event_pid(*pid),
+            // Already canonical on both sides by type — the rule carries a CanonicalPid and so
+            // does the raw-input attribution that resolves it.
+            *pid,
         ),
         _ => return None,
     };
@@ -421,8 +432,7 @@ fn compose_remaps(
 /// (a device-any bind would eat the key on EVERY keyboard — never) and on a keyboard page the
 /// platform can hook. `None` otherwise.
 pub fn swallow_for_control(ctl: crate::controls::ControlRef) -> Option<Remap> {
-    // canonical, like every pid the raw-input attribution hands this shim.
-    let pid = crate::registry::canonical_event_pid(ctl.pid?);
+    let pid = ctl.pid?;
     let from = match ctl.page {
         0x07 => sys::physkey_for_usage(ctl.usage)?,
         0xFF07 => ctl.usage,
@@ -444,6 +454,7 @@ pub fn swallow_for_control(ctl: crate::controls::ControlRef) -> Option<Remap> {
 /// bound action (skipping it would make every swallowed bind dead). `false` when disarmed or on
 /// an unclaimable page.
 pub fn owns(page: u16, usage: u16, pid: u16) -> bool {
+    let pid = crate::registry::CanonicalPid::of(pid);
     // While paused the shim owns nothing, so the live dispatcher must NOT skip its own dispatch on
     // our behalf — otherwise the edge falls through the gap between the two of us.
     if standing_down() {
@@ -490,8 +501,11 @@ fn hook_edge(physkey: u16, down: bool) -> bool {
 }
 
 /// The RAW-INPUT reader's per-edge call (from `controls::listen`): attribute a swallowed keystroke
-/// to its device and inject the resolved key. No-op unless armed. `pid` is the source device pid.
+/// to its device and inject the resolved key. No-op unless armed. `pid` is the RAW pid straight off
+/// the wire — this is one of the two doors where it becomes a canonical identity, so callers never
+/// have to know the rule.
 pub fn on_raw_keyboard(physkey: u16, down: bool, pid: u16) {
+    let pid = crate::registry::CanonicalPid::of(pid);
     // Paused means transparent in BOTH directions: no swallow above, no inject here.
     if standing_down() {
         return;
@@ -839,12 +853,21 @@ mod sys {
 mod tests {
     use super::*;
 
-    const NAGA: u16 = 0x00a8;
-    const KBD: u16 = 0x0221;
+    const NAGA_RAW: u16 = 0x00a8;
+    const KBD_RAW: u16 = 0x0221;
+    /// Test devices as the spine sees them. `CanonicalPid::of` is not `const`, so these are
+    /// functions — which is also the honest shape: canonicalization is a lookup against the loaded
+    /// registry, not a compile-time constant.
+    fn naga() -> crate::registry::CanonicalPid {
+        crate::registry::CanonicalPid::of(NAGA_RAW)
+    }
+    fn kbd() -> crate::registry::CanonicalPid {
+        crate::registry::CanonicalPid::of(KBD_RAW)
+    }
     // '=' scancode 0x0D remapped to 'g' scancode 0x22, on the Naga only.
     fn eq_to_g() -> Remap {
         Remap {
-            pid: NAGA,
+            pid: naga(),
             from: 0x0D,
             to: KeyOut::Scancode(0x22),
         }
@@ -856,15 +879,15 @@ mod tests {
         i.set_remaps([eq_to_g()]);
         // The '=' scancode is remapped, so the hook swallows it (device unknown at hook time).
         assert!(i.on_hook(0x0D, true, 1000));
-        // Raw-Input arrives ~0.5ms later attributing it to the NAGA -> emit 'g'.
+        // Raw-Input arrives ~0.5ms later attributing it to the naga() -> emit 'g'.
         assert_eq!(
-            i.on_rawinput(0x0D, true, NAGA),
+            i.on_rawinput(0x0D, true, naga()),
             Some(Inject { scancode: 0x22, down: true })
         );
         // The release edge, same path.
         assert!(i.on_hook(0x0D, false, 1400));
         assert_eq!(
-            i.on_rawinput(0x0D, false, NAGA),
+            i.on_rawinput(0x0D, false, naga()),
             Some(Inject { scancode: 0x22, down: false })
         );
         assert_eq!(i.pending_len(), 0, "both edges resolved");
@@ -873,7 +896,7 @@ mod tests {
         assert!(i.on_hook(0x0D, true, 2000));
         // ...but Raw-Input attributes it to the KEYBOARD -> replay the ORIGINAL '=' unchanged.
         assert_eq!(
-            i.on_rawinput(0x0D, true, KBD),
+            i.on_rawinput(0x0D, true, kbd()),
             Some(Inject { scancode: 0x0D, down: true })
         );
     }
@@ -913,7 +936,7 @@ mod tests {
         );
 
         // A paused shim is transparent even while armed, so it must claim ownership of nothing.
-        assert!(!owns(0x07, 0x2E, NAGA), "a paused shim owns no trigger");
+        assert!(!owns(0x07, 0x2E, NAGA_RAW), "a paused shim owns no trigger");
 
         set_paused(false);
         ACTIVE.store(was_active, Ordering::SeqCst);
@@ -939,7 +962,7 @@ mod tests {
         let mut i = Interceptor::new();
         i.set_remaps([eq_to_g()]);
         // A Raw-Input event with no matching pending entry (e.g. our own replay's echo) -> None.
-        assert_eq!(i.on_rawinput(0x0D, true, KBD), None);
+        assert_eq!(i.on_rawinput(0x0D, true, kbd()), None);
     }
 
     #[test]
@@ -952,13 +975,13 @@ mod tests {
         assert_eq!(i.pending_len(), 2);
         // First Raw-Input (Naga) resolves the OLDEST -> 'g'.
         assert_eq!(
-            i.on_rawinput(0x0D, true, NAGA),
+            i.on_rawinput(0x0D, true, naga()),
             Some(Inject { scancode: 0x22, down: true })
         );
         assert_eq!(i.pending_len(), 1);
         // Second resolves the remaining one.
         assert_eq!(
-            i.on_rawinput(0x0D, true, NAGA),
+            i.on_rawinput(0x0D, true, naga()),
             Some(Inject { scancode: 0x22, down: true })
         );
         assert_eq!(i.pending_len(), 0);
@@ -971,17 +994,17 @@ mod tests {
         i.set_remaps([eq_to_g()]);
         // Naga '=' -> 'g' directly.
         assert_eq!(
-            i.resolve_direct(0x0D, true, NAGA),
+            i.resolve_direct(0x0D, true, naga()),
             Some(Inject { scancode: 0x22, down: true })
         );
         // The same key from another device -> passed through unchanged.
         assert_eq!(
-            i.resolve_direct(0x0D, true, KBD),
+            i.resolve_direct(0x0D, true, kbd()),
             Some(Inject { scancode: 0x0D, down: true })
         );
         // An unremapped key -> unchanged, and no pending state was touched.
         assert_eq!(
-            i.resolve_direct(0x1E, false, NAGA),
+            i.resolve_direct(0x1E, false, naga()),
             Some(Inject { scancode: 0x1E, down: false })
         );
         assert_eq!(i.pending_len(), 0);
@@ -999,24 +1022,24 @@ mod tests {
         let ctl = crate::controls::ControlRef {
             page: 0x07,
             usage: 0x1E, // the side-plate '1'
-            pid: Some(NAGA),
+            pid: Some(naga()),
         };
         // the same key carries a plain Key remap rule AND is the held cast trigger.
         let engine = Engine::from_rules(vec![
             Rule::new(
-                Trigger::Input { page: 0x07, usage: 0x1E, pid: Some(NAGA) },
+                Trigger::Input { page: 0x07, usage: 0x1E, pid: Some(naga()) },
                 Action::Key { key: "g".into() },
             ),
             // an unrelated remap on another key must survive untouched.
             Rule::new(
-                Trigger::Input { page: 0x07, usage: 0x1F, pid: Some(NAGA) },
+                Trigger::Input { page: 0x07, usage: 0x1F, pid: Some(naga()) },
                 Action::Key { key: "h".into() },
             ),
         ]);
         let remaps = compose_remaps(&engine, Some(ctl));
-        // stored pids canonicalize through the registry: the dongle pid (00a8, the test's NAGA)
+        // stored pids canonicalize through the registry: the dongle pid (00a8, the test's naga())
         // composes into claims under the Naga's canonical identity (00a7, its first mode).
-        let canon = crate::registry::canonical_event_pid(NAGA);
+        let canon = naga();
         let from = sys::physkey_for_usage(0x1E).expect("'1' has a scancode");
         let on_trigger: Vec<_> = remaps
             .iter()
@@ -1043,22 +1066,22 @@ mod tests {
         let engine = Engine::from_rules(vec![
             // keyboard key → Key: a replacement remap
             Rule::new(
-                Trigger::Input { page: 0x07, usage: 0x1E, pid: Some(0x0221) },
+                Trigger::Input { page: 0x07, usage: 0x1E, pid: Some(crate::registry::CanonicalPid::of(0x0221)) },
                 Action::Key { key: "g".into() },
             ),
             // keyboard key → a macro: swallow (the action is the meaning now)
             Rule::new(
-                Trigger::Input { page: 0x07, usage: 0x1F, pid: Some(0x0221) },
+                Trigger::Input { page: 0x07, usage: 0x1F, pid: Some(crate::registry::CanonicalPid::of(0x0221)) },
                 Action::Run { cmd: "echo m".into() },
             ),
             // mouse X1 → anything: swallow in the mouse namespace
             Rule::new(
-                Trigger::Input { page: 0x09, usage: 4, pid: Some(0x0221) },
+                Trigger::Input { page: 0x09, usage: 4, pid: Some(crate::registry::CanonicalPid::of(0x0221)) },
                 Action::Key { key: "q".into() },
             ),
             // LEFT mouse button: never claimed, no matter the bind
             Rule::new(
-                Trigger::Input { page: 0x09, usage: 1, pid: Some(0x0221) },
+                Trigger::Input { page: 0x09, usage: 1, pid: Some(crate::registry::CanonicalPid::of(0x0221)) },
                 Action::Run { cmd: "echo m".into() },
             ),
             // device-any: never claimed (a global swallow would eat every device's key)
@@ -1086,12 +1109,12 @@ mod tests {
     fn owns_counts_key_remaps_but_never_swallow_claims() {
         let mut i = Interceptor::new();
         i.set_remaps([
-            Remap { pid: NAGA, from: 0x0D, to: KeyOut::Scancode(0x22) },
-            Remap { pid: NAGA, from: 0x02, to: KeyOut::Swallow },
+            Remap { pid: naga(), from: 0x0D, to: KeyOut::Scancode(0x22) },
+            Remap { pid: naga(), from: 0x02, to: KeyOut::Swallow },
         ]);
-        assert!(i.has_key_remap(0x0D, NAGA), "a replacement remap is owned");
-        assert!(!i.has_key_remap(0x02, NAGA), "a swallow claim is NOT owned");
-        assert!(i.has_remap(0x02, NAGA), "…but it IS a claim (the hook swallows it)");
+        assert!(i.has_key_remap(0x0D, naga()), "a replacement remap is owned");
+        assert!(!i.has_key_remap(0x02, naga()), "a swallow claim is NOT owned");
+        assert!(i.has_remap(0x02, naga()), "…but it IS a claim (the hook swallows it)");
     }
 
     /// A held-bind claim (the cast trigger on a specific device) swallows that device's
@@ -1101,23 +1124,23 @@ mod tests {
         let mut i = Interceptor::new();
         // '1' scancode 0x02 claimed as a held bind on the Naga.
         i.set_remaps([Remap {
-            pid: NAGA,
+            pid: naga(),
             from: 0x02,
             to: KeyOut::Swallow,
         }]);
         assert!(i.on_hook(0x02, true, 1000), "claimed scancode is swallowed at hook time");
         // Naga attribution -> nothing injected: the '1' never reaches the desktop.
-        assert_eq!(i.on_rawinput(0x02, true, NAGA), None);
+        assert_eq!(i.on_rawinput(0x02, true, naga()), None);
         // The real keyboard's '1' is swallowed then replayed unchanged.
         assert!(i.on_hook(0x02, true, 2000));
         assert_eq!(
-            i.on_rawinput(0x02, true, KBD),
+            i.on_rawinput(0x02, true, kbd()),
             Some(Inject { scancode: 0x02, down: true })
         );
         // Grab-model path agrees.
-        assert_eq!(i.resolve_direct(0x02, true, NAGA), None);
+        assert_eq!(i.resolve_direct(0x02, true, naga()), None);
         assert_eq!(
-            i.resolve_direct(0x02, true, KBD),
+            i.resolve_direct(0x02, true, kbd()),
             Some(Inject { scancode: 0x02, down: true })
         );
     }

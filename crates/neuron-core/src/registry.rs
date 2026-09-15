@@ -419,6 +419,53 @@ fn event_identity_tables(
     g.clone()
 }
 
+/// A device's EVENT identity, canonicalized — the type the whole input spine speaks.
+///
+/// ## Why this is a type and not a `u16`
+/// Canonicalization used to be a CONVENTION: every producer of an event or a rule was supposed to
+/// remember to call [`canonical_event_pid`], and `Engine::matches` papered over the gap by
+/// canonicalizing one side at compare time. That is a rule you can only enforce by remembering it,
+/// and the codebase had already forgotten once (a mic-tap injection shipped a raw link-mode pid).
+/// The failure is silent and remote: a bind simply stops matching, on someone else's dongle.
+///
+/// So the invariant moved into the type. [`CanonicalPid::of`] is the ONLY way to build one from a
+/// raw pid and it canonicalizes; `Deserialize` canonicalizes too, so a rule persisted years ago
+/// under a link-mode pid is corrected the moment it loads. A raw `u16` cannot reach a rule, an
+/// event, the held registry, or a dedup key without passing through that one door — which means
+/// the next producer someone adds is checked by the compiler instead of by review.
+///
+/// Serialization is TRANSPARENT: a persisted rule is still `pid = 424` on disk, so every existing
+/// config file round-trips unchanged.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, serde::Serialize)]
+#[serde(transparent)]
+pub struct CanonicalPid(u16);
+
+impl CanonicalPid {
+    /// THE door. Canonicalizes `raw` onto the owning device's event identity.
+    pub fn of(raw: u16) -> Self {
+        CanonicalPid(canonical_event_pid(raw))
+    }
+    /// The underlying pid, for display/logging and for the few places that must speak the wire
+    /// (`{:04x}` formatting, a registry lookup keyed on the raw number).
+    pub fn get(self) -> u16 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for CanonicalPid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:04x}", self.0)
+    }
+}
+
+/// Canonicalizes on the way IN, so a rule written before this type existed (or hand-edited with a
+/// link-mode pid) is corrected at load rather than silently failing to match forever.
+impl<'de> serde::Deserialize<'de> for CanonicalPid {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        u16::deserialize(d).map(CanonicalPid::of)
+    }
+}
+
 /// The canonical EVENT pid for `pid`: the first declared mode of the def that owns it (via
 /// [`DeviceDef::owned_event_pids`]), or `pid` unchanged when no def claims it — or when no
 /// registry has loaded yet (identity is the honest degraded answer, retried next call).
