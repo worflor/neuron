@@ -2,20 +2,18 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
 
-//! Resident-citizenship BUDGET lane — run the real binary inside a Windows Job Object,
+//! Resident-citizenship budget lane — run the real binary inside a Windows Job Object,
 //! sample its resource footprint through scripted phases, and hold it to explicit budgets.
 //!
-//! Why a Job Object: everything the app spawns lands in the job too, so the CHILD-PROCESS
-//! CENSUS is exact (the warm python macro-host sidecar is expected; anything else is a
-//! finding), and teardown is `TerminateJobObject` — one call, no orphans, even if the app
-//! wedges. Why the real binary: allocator behavior, Slint/GPU surfaces, timers, and thread
-//! spawns only exist in the shipped artifact; an in-process harness can't see them.
+//! A Job Object makes the child-process census exact (everything the app spawns lands in
+//! the job too; the warm python macro-host sidecar is expected, anything else is a finding),
+//! and teardown is `TerminateJobObject` - one call, no orphans, even if the app wedges. The
+//! real binary is used because allocator behavior, Slint/GPU surfaces, timers, and thread
+//! spawns only exist in the shipped artifact.
 //!
-//! Baselines vs budgets: every run WRITES what it observed (a JSON the caller can diff or
-//! archive) and ASSERTS only the ceilings in [`Budgets`]. Ceilings carry headroom over the
-//! recorded 2026-07-10 baseline (release build, tray-resident, lighting streaming, two
-//! devices): idle CPU 0.91% of total, private 255 MB, working set 65 MB, 497 handles,
-//! 33 threads, one python child. Tightening a ceiling is a deliberate act, not drift.
+//! Every run writes what it observed (a JSON the caller can diff or archive) and asserts
+//! only the ceilings in [`Budgets`], which carry headroom over the recorded hardware
+//! baseline. Tightening a ceiling is a deliberate act, not drift.
 
 #![cfg(windows)]
 
@@ -103,11 +101,11 @@ pub struct Resident {
 unsafe impl Send for Resident {}
 
 impl Resident {
-    /// Launch `exe` (with args) inside a fresh Job Object, with NO race window for a child to
-    /// escape: the app is created SUSPENDED, assigned to the job before it runs a single
+    /// Launch `exe` (with args) inside a fresh Job Object, with no race window for a child to
+    /// escape: the app is created suspended, assigned to the job before it runs a single
     /// instruction, then resumed. Once a process is in a job every process it spawns joins
-    /// automatically, so `TerminateJobObject` on Drop reaps the whole tree — the sidecar
-    /// included — with no orphans. The exe must NOT be running already outside the job.
+    /// automatically, so `TerminateJobObject` on Drop reaps the whole tree with no orphans.
+    /// The exe must not already be running outside the job.
     pub fn launch(exe: &Path, args: &[&str]) -> Result<Resident> {
         let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
         if job.is_null() {
@@ -311,13 +309,12 @@ fn snapshot_processes() -> Result<Vec<(u32, u32, u32, String)>> {
     Ok(rows)
 }
 
-/// The AUTHORITATIVE process membership of the job — every process the kernel says the job owns.
-/// Unlike a parent-tree walk this CANNOT miss a REPARENTED process (one whose parent exited and
-/// Windows reparented it to the system) — which is exactly what a sneaky fire-and-forget spawner
-/// looks like, the case the child-process allowlist exists to catch. A tree-walk census failing
-/// OPEN on that case would be a safety check blind to its own threat model. Fixed 1024-entry
-/// buffer: the entries are pointer-sized (ULONG_PTR), and a test-lane job owning >1024 processes
-/// is itself catastrophic, so we assert rather than grow.
+/// The authoritative process membership of the job - every process the kernel says it owns.
+/// Unlike a parent-tree walk this cannot miss a reparented process (one whose parent exited
+/// and Windows reparented it to the system), which is exactly what a fire-and-forget spawner
+/// looks like and what the child-process allowlist exists to catch. Fixed 1024-entry buffer
+/// (entries are pointer-sized); a job owning more than that is catastrophic, so this asserts
+/// rather than grows.
 fn job_process_ids(job: HANDLE) -> Result<Vec<u32>> {
     const CAP: usize = 1024;
     #[repr(C)]
@@ -406,12 +403,11 @@ fn resume_process_main_thread(pid: u32) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// Put a cheap child in `job` for the census to find, with NO race: the process is created
-    /// SUSPENDED (so it never runs — `/c exit` never executes) and assigned to the job before it
-    /// could touch anything. We NEVER resume it; it sits inert until we kill it, so the census sees
-    /// a deterministic member. Crucially we do NOT put the TEST's OWN process in a job —
-    /// job assignment is irreversible and process-wide, so it would constrain (and on close could
-    /// kill) the whole `cargo test` runner and contaminate every other test in the binary.
+    /// Put a cheap child in `job` for the census to find, with no race: the process is created
+    /// suspended (so `/c exit` never runs) and assigned to the job before it can touch anything;
+    /// it is never resumed, so the census sees a deterministic member. The test's own process
+    /// is never put in a job - job assignment is irreversible and process-wide, so it would
+    /// constrain (and on close could kill) the whole `cargo test` runner.
     fn suspended_child_in(job: HANDLE) -> std::process::Child {
         let child = std::process::Command::new("cmd.exe")
             .args(["/c", "exit"]) // never executes — the process stays suspended
@@ -427,9 +423,8 @@ mod tests {
         child
     }
 
-    // Always-on coverage for the census PRIMITIVES (`job_process_ids` + `census`) — the
-    // QueryInformationJobObject buffer handling and the snapshot join that the heavy, opt-in
-    // real-binary budget lane otherwise exercises only under NEURON_BUDGET_EXE. Two members so the
+    // Always-on coverage for the census primitives (`job_process_ids` + `census`), otherwise
+    // exercised only under the opt-in NEURON_BUDGET_EXE real-binary lane. Two members so the
     // pid-list count/extraction runs past the trivial single-entry case.
     #[test]
     fn census_reports_job_members_by_pid_and_name() {

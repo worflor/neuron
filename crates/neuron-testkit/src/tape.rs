@@ -16,8 +16,8 @@
 //! snapshot of each bookkeeping section (session table, app registry, control roster).
 //!
 //! Because the game paints at ~10 fps and the sampler polls at ~15 Hz, the tape holds
-//! essentially every distinct frame; what a poll-sampler cannot promise is sub-poll WRITE
-//! ORDER between sections that changed in the same tick — treat same-tick records as one
+//! essentially every distinct frame; what a poll-sampler cannot promise is sub-poll write
+//! order between sections that changed in the same tick - treat same-tick records as one
 //! logical frame fanned out, which is also what the lockstep record counts show.
 //!
 //! ## Format (little-endian, records back to back, no file header)
@@ -34,7 +34,7 @@
 //! ## Measured truths of the reference tape (pinned by tests)
 //!
 //! * Steady frame cadence ≈ 10 fps: keyboard-buffer inter-record p50 ≈ 96 ms (87–149 ms).
-//! * One logical frame fans out to THREE buffers in lockstep: `kbd-buffer` (device-type
+//! * One logical frame fans out to three buffers in lockstep: `kbd-buffer` (device-type
 //!   0x01), `dev-type80`, and `big-stream` carry identical record counts.
 //! * A device buffer is `[header .. 0x50) [pixel array]`, 4 bytes per pixel; a combat
 //!   keyboard frame lights ~720 pixels in a handful of distinct colors. Byte 3 of a pixel
@@ -193,7 +193,7 @@ pub struct PixelView<'a> {
 }
 
 impl<'a> PixelView<'a> {
-    /// View a KEYBOARD buffer record's pixel array.
+    /// View a keyboard buffer record's pixel array.
     pub fn of(record: &'a Record) -> PixelView<'a> {
         PixelView { bytes: &record.bytes, count: KBD_PIXEL_COUNT }
     }
@@ -289,8 +289,8 @@ mod tests {
         let mid = frames[frames.len() / 2];
         let view = PixelView::of(mid);
         let lit = view.lit();
-        // Recorded reality: a combat frame lights the whole 720-slot array; fail if the
-        // array offset/stride/count ever drifts (collapses lit to ~0 or misreads junk).
+        // A combat frame lights the whole 720-slot array; fail if the array offset/stride/
+        // count ever drifts (collapses lit to ~0 or misreads junk).
         assert!(
             (100..=KBD_PIXEL_COUNT).contains(&lit.len()),
             "lit pixel count {} outside the measured envelope (array = {KBD_PIXEL_COUNT})",
@@ -301,7 +301,7 @@ mod tests {
             palette.len() >= 2,
             "a combat frame paints multiple colors, got {palette:?}"
         );
-        // byte 3 is a per-key flag, not color — the observed vocabulary is tiny.
+        // byte 3 is a per-key flag, not color; the observed vocabulary is tiny.
         let flags: std::collections::BTreeSet<u8> = lit.iter().map(|(_, p)| p[3]).collect();
         assert!(
             flags.len() <= 8,
@@ -318,8 +318,8 @@ mod tests {
     }
 
     /// Build one raw `.tape` record: header fields plus a gzip payload made by compressing
-    /// `payload`. `declared_raw_len` is written into the header as-is (may deliberately
-    /// disagree with `payload.len()` to simulate a corrupt/hostile header).
+    /// `payload`. `declared_raw_len` is written as-is (may deliberately disagree with
+    /// `payload.len()` to simulate a corrupt/hostile header).
     fn build_record(guid: &str, note: &str, t_ms: u64, declared_raw_len: u32, payload: &[u8]) -> Vec<u8> {
         use std::io::Write as _;
         let mut gz = Vec::new();
@@ -340,10 +340,9 @@ mod tests {
 
     #[test]
     fn hostile_raw_len_errors_without_huge_allocation() {
-        // raw_len claims ~4 GiB while the actual gzip payload is a couple bytes. Pre-fix this
-        // called Vec::with_capacity(raw_len) before any validation; now raw_len never sizes
-        // an allocation, so this must fail fast on the length mismatch instead of hanging or
-        // aborting the process with an OOM.
+        // raw_len claims ~4 GiB while the actual gzip payload is a couple bytes; raw_len must
+        // never size an allocation, so this must fail fast on the length mismatch instead of
+        // hanging or aborting with an OOM.
         let data = build_record("hostile-guid", "hostile", 1, u32::MAX, b"hi");
         let err = Tape::parse(&data).err().expect("u32::MAX raw_len must not parse cleanly");
         assert!(
@@ -370,9 +369,8 @@ mod tests {
     #[test]
     fn inflate_past_hard_cap_errors() {
         // A record that honestly (declared == actual) inflates past MAX_RECORD_BYTES must
-        // still be rejected — the cap is a hard ceiling, not just a mismatch check. Zeros
-        // compress to almost nothing, so this stays a fast test despite the large logical
-        // payload.
+        // still be rejected: the cap is a hard ceiling, not just a mismatch check. Zeros
+        // compress to almost nothing, so this stays a fast test.
         let big_len = MAX_RECORD_BYTES + 1024;
         let payload = vec![0u8; big_len];
         let data = build_record("oversize-guid", "oversize", 3, big_len as u32, &payload);
@@ -399,9 +397,8 @@ mod tests {
     use proptest::prelude::*;
     use std::sync::OnceLock;
 
-    /// Reference tape bytes, read once and cached. House rule: never skip a fixture-backed
-    /// test silently — if the recorded-reality corpus is missing, panic loudly so the gap is
-    /// impossible to miss.
+    /// Reference tape bytes, read once and cached. Never skip a fixture-backed test
+    /// silently - panic loudly if the recorded-reality corpus is missing.
     fn real_tape_bytes() -> &'static [u8] {
         static BYTES: OnceLock<Vec<u8>> = OnceLock::new();
         BYTES.get_or_init(|| {
@@ -489,7 +486,7 @@ mod tests {
             // The only hard requirement: never panic. `Err` is fine.
             let result = Tape::parse(&window);
             if let Ok(t) = result {
-                // Structural sanity on anything that DID decode: the hard cap must hold, and
+                // Structural sanity on anything that did decode: the hard cap must hold, and
                 // the query API must not panic when driven over whatever came out.
                 for r in &t.records {
                     prop_assert!(r.bytes.len() <= MAX_RECORD_BYTES);
