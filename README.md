@@ -1,7 +1,8 @@
 # neuron
 
 a lean, mean, do-what-i-say control layer for razer gear, built by Woflo Labs
-as an *anti-synapse*.
+as an *anti-synapse*. (woflo labs is a publishing name, not a company — it's me,
+one person, obsessed with research in my free time.)
 
 one small binary. no account, no cloud, no telemetry. no "please update razer central." it talks to your mouse and keyboard directly: the same `razer_report` HID bytes synapse sends, worked out from wire captures (USBPcap), the open-source [openrazer](https://github.com/openrazer/openrazer) driver, and a lot of live probing. it does exactly what you tell it then fricks off. no kernel driver, no vendor SDK 😳
 

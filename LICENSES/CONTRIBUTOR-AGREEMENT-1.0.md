@@ -3,11 +3,11 @@
 Version 1.0, July 19, 2026. This agreement becomes effective for a contributor
 only through the acceptance workflow identified in `CONTRIBUTING.md`.
 
-Copyright (c) 2026 Michael Bickford. Everyone is permitted to copy and
+Copyright (c) 2026 Woflo Labs. Everyone is permitted to copy and
 distribute verbatim copies of this agreement for reviewing, accepting,
 recording, or documenting contributions to a Covered Project. Modified
 agreement texts must use a different name and must not imply endorsement by
-Michael Bickford or Woflo Labs.
+Woflo Labs.
 
 This agreement is between Michael Bickford, publishing as Woflo Labs (the
 **Project Steward**), and the person or entity accepting it (**You**). A

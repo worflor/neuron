@@ -27,7 +27,7 @@ call is still the one being honoured.
 ---
 ## 0. The one-sentence thesis
 
-**We are not building an app with integrations. We are building a local, honest,
+**I am not building an app with integrations. I am building a local, honest,
 capability-driven *protocol hub* — the one place where games, sensors, sound,
 screen, lights, creator tools, and hardware all meet and can be wired to each
 other, with neuron's engine as the routing logic in the middle. The peripherals
@@ -37,7 +37,7 @@ The differentiator nobody in the prior art got right: **ownership & teardown as
 first-class.** Every conflict in this space (the "bad rave" blinking, "close the
 other app first", lighting frozen-on after a game exits) is the same root bug —
 two sources writing one device with no arbiter, so it's last-writer-wins and it
-flickers. We model ownership. We are the only hub you never have to close to run
+flickers. Neuron models ownership. It is the only hub you never have to close to run
 another.
 
 ---
@@ -68,7 +68,7 @@ These come from the project's standing preferences.
 5. **Capability-driven all the way.** A new device is a TOML, not a code change.
    A new protocol is a small codec adapter, not a new subsystem. The UI renders
    from declared capabilities. Point this same philosophy *north* (at protocols)
-   that we already point *south* (at devices).
+   that neuron already points *south* (at devices).
 
 6. **Focused face, contained depth.** Lead with one thing it's obviously great at;
    the depth is revealed as you go, never dumped on the front door. Resist the
@@ -95,13 +95,13 @@ If a port can't pass these four, it's slop no matter how good the demo looks.
 
 ## 3. Protocol landscape (the northbound surface)
 
-The reframe: we RE'd the **southbound** protocols (toward silicon). The opportunity
-is the **northbound** surface (toward OS/games/network/room). Our app can be a
-**polyglot in both directions**: a *sink* that ingests and a *source* that emits.
-Signals flow IN (telemetry, sensors, SDK effects, app events) → through our engine
-(conditions + layers + `act` verbs) → signals flow OUT (device writes, virtual
-devices, re-emitted SDK effects, automations). **It's a bus, and we already built
-the junction box.**
+The reframe: the **southbound** protocols (toward silicon) are the ones already
+reverse-engineered. The opportunity is the **northbound** surface (toward
+OS/games/network/room). The app can be a **polyglot in both directions**: a *sink*
+that ingests and a *source* that emits. Signals flow IN (telemetry, sensors, SDK
+effects, app events) → through the engine (conditions + layers + `act` verbs) →
+signals flow OUT (device writes, virtual devices, re-emitted SDK effects,
+automations). **It's a bus, and the junction box is already built.**
 
 ### 3.1 ⭐ THE KEY FINDING — be a protocol SERVER, not a DLL parasite
 
@@ -139,7 +139,7 @@ cross-check), `Vaskivskyi/ha-chroma`.
   - `CHROMA_CUSTOM2` — newer keyboards, **8×24** grid
   - analogous for /mouse (CUSTOM2 grid), /mousepad, /headset, /keypad, /chromalink
   - response `{"result": <code>}`.
-- Colors are **BGR**, not RGB. Grid → real keys via our capability/layout TOML.
+- Colors are **BGR**, not RGB. Grid → real keys via the capability/layout TOML.
 
 ### 3.3 OpenRGB SDK protocol (TCP 6742) — build FIRST
 Fully open, versioned, cross-platform binary TCP. **16-byte header:**
@@ -162,7 +162,7 @@ min/max/current, matrix, segments in v4+), LED[] array, direct colors[] array,
 integration + openrgb-python + community scripts drive OUR devices. Client → pull
 in other-brand devices, become the mixed-rig sync hub. Rust crates to crib:
 `openrgb-rs`/`openrgb2` (nicoulaj). **Recommend building this first** — it forces
-our device/effect model to be cleanly externally-addressable, the best pressure
+neuron's device/effect model to be cleanly externally-addressable, the best pressure
 test for the internal model.
 
 ### 3.4 Meta-RGB prior art (architecture references)
@@ -217,7 +217,7 @@ External-Sim-Integration schema** so new games are a data file, not a parser.
 - **Bitfocus Companion "Satellite"** (open TCP 16622/WS 16623, no auth) — lets
   neuron *present as a Stream Deck surface* + inherit Companion's 100+ downstream
   tools. Plus `elgato-streamdeck` crate drives *real* Stream Decks over raw HID
-  (same paradigm as our Razer RE). Two-way Stream Deck citizenship, no Elgato app.
+  (same paradigm as the Razer RE). Two-way Stream Deck citizenship, no Elgato app.
 
 ### 3.7 System / media / ambient sources
 - **Media now-playing** — SMTC (`windows::Media::Control`) + MPRIS (`mpris` crate).
@@ -235,7 +235,7 @@ External-Sim-Integration schema** so new games are a data file, not a parser.
   reverse-engineered, defensive version-check) / LHM WMI+HTTP fallback; RTSS shmem
   for FPS (undocumented, Windows-only). Poll 1-2Hz, best-effort optional providers.
 - **System events** — battery (`starship-battery`, X-platform); session lock/unlock
-  (Win `WM_WTSSESSION_CHANGE`; Linux logind D-Bus) → ties into our `curtain`
+  (Win `WM_WTSSESSION_CHANGE`; Linux logind D-Bus) → ties into the `curtain`
   concept (auto-arm on lock); idle (`user-idle`); network/VPN (per-OS shim).
   Notifications read-back = high friction, deprioritize.
 
@@ -245,23 +245,23 @@ External-Sim-Integration schema** so new games are a data file, not a parser.
   native HA entities, bidirectional. Follows OpenRGB's official-HA-integration
   precedent. Turns neuron into a first-class citizen of the automation graph.
 - **WLED** (raw per-LED UDP 21324, WARLS) — standout payoff:effort. Open, no-auth
-  UDP LED stream → our *existing* Pattern×Spectrum compositor drives keyboard AND
+  UDP LED stream → the *existing* Pattern×Spectrum compositor drives keyboard AND
   room LEDs through **one pipeline**. Parity by construction.
 - **OSC** (`rosc`) — cheap; unlocks creative space nothing else touches: VJ
   (Resolume), theatrical cue (QLab), VRChat avatar puppeting from a mouse dial.
-  UDP, address-pattern maps ~1:1 onto our verb model.
+  UDP, address-pattern maps ~1:1 onto the verb model.
 - **MIDI** (`midir`) — near-free on Linux/macOS (virtual ports just work); Windows
   needs loopMIDI or a small `teVirtualMIDI` FFI shim (Windows MIDI Services will
   erase this friction soon). Dials/keys → CC/note → DAW/OBS/VJ; MIDI in → macros.
 - **Virtual gamepad** — Win: `vigem-client` (pure-Rust; ViGEmBus archived but
   works); Linux: uinput (`evdevil`); macOS: ~nothing. Teardown bites hardest here:
-  **release every button on exit** (our held-key-RAII concern exactly).
+  **release every button on exit** (the held-key-RAII concern exactly).
 - **Local smart lights** — Hue Entertainment API (DTLS-PSK UDP 2100, low-latency,
   hand-roll DTLS — phase 2), WLED (above), LIFX LAN (UDP 56700, documented),
   Nanoleaf (local HTTP+token), Govee LAN. All LOCAL, non-cloud.
 - **Unified `act` control surface** — one JSON-RPC-ish schema over multiple
   transports: WebSocket (browser/phone), named-pipe/unix-socket (AHK/Python/Lua),
-  stdin (CLI). *This is one thing, not per-client.* Our `act` verbs turned outward.
+  stdin (CLI). *This is one thing, not per-client.* The `act` verbs turned outward.
 
 ### 3.9 The full port map, ranked by mechanic value
 **Tier 1 (build first — highest parity, cleanest lifecycle, fully local):**
@@ -292,7 +292,7 @@ External-Sim-Integration schema** so new games are a data file, not a parser.
 ## 4. THE ARCHITECTURE (first-principles, the crown jewels)
 
 ### 4.1 Model ownership as a first-class thing (the differentiator)
-Every conflict is an ownership bug. Nobody modeled it. **We extend our layered
+Every conflict is an ownership bug. Nobody modeled it. **Neuron extends its layered
 compositor so every source is a LAYER WITH AN OWNER, PRIORITY, AND LIFECYCLE:**
 
 ```
@@ -320,13 +320,13 @@ Generalizes beyond lighting: `act`/input ownership, device-tuning claims, etc.
 ### 4.2 Protocols are codecs at the edges; the model is the center
 One canonical internal representation:
 - a **spatial device/zone/LED model** = union of Chroma's 6×22 / 8×24 grid,
-  OpenRGB's zones/matrices/segments, and our real device layouts (from capability
+  OpenRGB's zones/matrices/segments, and the real device layouts (from capability
   TOML).
 - a **named signal namespace** for telemetry/events (`cs2.health`, `gpu.temp`,
   `obs.scene`, `race.rpm`, `discord.speaking`, `now_playing.changed`, ...).
 
 Every protocol is a **thin adapter that ONLY talks to the bus, never to device
-I/O.** Adding a protocol = a small, isolated, testable codec that inherits all our
+I/O.** Adding a protocol = a small, isolated, testable codec that inherits all the
 correctness for free. This is SimHub's "normalize once, bind anywhere" + OpenRGB's
 controller model, done deliberately instead of accreted.
 
@@ -348,7 +348,7 @@ describes it to the Chroma grid mapper. Honesty pushed down to the handshake.
 ### 4.5 Publish OUR OWN protocol, open + versioned, from commit one
 OpenRGB became a standard because its protocol was documented + stable, so others
 integrated *with* it (HA integrated OpenRGB, not Razer). Be the OpenRGB of the next
-generation — but our surface is lighting **+ macros + tuning + telemetry**, not
+generation — but this surface is lighting **+ macros + tuning + telemetry**, not
 lighting-only. Version it, document the wire format, keep backward-compat.
 
 ### 4.6 No fragility
@@ -360,15 +360,15 @@ cross-platform-by-traits discipline is what makes this hold on Win/Linux/Mac.
 ### 4.7 Capture-and-replay as the test methodology
 The RE community's superpower is packet captures. Capture real Chroma/OpenRGB/
 telemetry traffic once, replay against adapters in unit tests → protocol
-correctness with zero hardware, deterministic, regression-proof. This is how we
+correctness with zero hardware, deterministic, regression-proof. This is how I
 avoid OpenRGB's "device support = graveyard of unresolved GitHub issues" fate.
 
 ---
 
 ## 5. Host design — immortal, redundant, simple (math-stack inspired)
 
-The goal: make the host truly immortal, redundant, and simple, using our own
-math stack as inspiration. That stack is the **AR(2) eigenmotion oscillator**
+The goal: make the host truly immortal, redundant, and simple, using the project's
+own math stack as inspiration. That stack is the **AR(2) eigenmotion oscillator**
 `z[n] = K·z[n-1] − G·z[n-2]` — cascaded macro+micro oscillators + residuals, per
 `glyph.rs` / `engram` / `.gwyph`.
 
@@ -413,7 +413,7 @@ recurrence determine behavior:
   lets us tune overshoot/settling deliberately.
 - The same `GlyphFit{k, g, lambda1, lambda2}` machinery in `glyph.rs` can *analyze*
   a live crash-interval series → if measured |λ| drifts toward 1, the subsystem is
-  going unstable → escalate. **We can literally fit an oscillator to failure
+  going unstable → escalate. **You can literally fit an oscillator to failure
   telemetry and read off stability.**
 
 ### 5.4 Cascade / residual as tiered supervision (redundancy structure)
@@ -427,7 +427,7 @@ residual (what neither captured). Map directly onto a supervision hierarchy:
 - **energy-capture metric** (engram's `macro_capture`/`micro_capture`/
   `residual_energy`) becomes a **health score**: what fraction of "failure energy"
   was absorbed at each tier vs. leaked to residual. A rising residual ratio = the
-  system is failing in ways our supervisors don't model yet.
+  system is failing in ways the supervisors don't model yet.
 
 ### 5.5 Reconstructable state — corrected after implementation
 The original idea here (kept for the record): a rich stream reduces to a tiny
@@ -518,7 +518,7 @@ above describes what exists; these are the acknowledged holes.
   off and authenticated before `act` verbs are exposed on any socket. The lighting
   plane is what is exposed today; the control plane is not finished, which is the
   reason `act` is not reachable from the network.
-- **A published neuron protocol spec.** §4.5 argues for publishing our own versioned
+- **A published neuron protocol spec.** §4.5 argues for publishing a versioned
   protocol from commit one. It has not been written down, so the honest position is
   that the surface is not yet a commitment anyone should build against.
 - **Most of the port map in §3.9.** Telemetry ingest, MQTT/Home Assistant, and the

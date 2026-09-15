@@ -2,10 +2,10 @@
 
 Version 1.0, July 19, 2026.
 
-Copyright (c) 2026 Michael Bickford. Everyone is permitted to copy and
+Copyright (c) 2026 Woflo Labs. Everyone is permitted to copy and
 distribute verbatim copies of this exception text with GPL-covered Neuron
 material. Modified exception texts must use a different name and must not imply
-endorsement by Michael Bickford or Woflo Labs.
+endorsement by Woflo Labs.
 
 This is an additional permission under section 7 of the GNU General Public
 License, version 3.

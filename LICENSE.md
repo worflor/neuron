@@ -1,11 +1,11 @@
 # Neuron license
 
-Copyright (c) 2026 Michael Bickford ("Woflo"), publishing as Woflo Labs.
+Copyright (c) 2026 Woflo Labs.
 
 Permission is granted to copy and distribute this Work Notice verbatim with
 Neuron. A modified Work Notice may accompany a permitted modified version of
 Neuron, but it must accurately identify the licenses and applicable notices and
-must not imply endorsement by Michael Bickford or Woflo Labs.
+must not imply endorsement by Woflo Labs.
 
 Neuron is built in public, but not every part of it is released under the same
 terms. Most of the project is GPL; a small reusable research core uses the Woflo
@@ -95,5 +95,6 @@ Neither license grants trademark rights in Woflo Labs, Neuron, Whisper, Engram,
 Glyph, Logos, or related names and visual identities, except the descriptive
 attribution allowed by the applicable license.
 
-Woflo Labs is Michael Bickford's publishing and independent research identity,
-not a separate incorporated entity as of this notice.
+Woflo Labs is the publishing and independent research identity of one
+individual, not a separate incorporated entity as of this notice. The Licensor
+is identified above.

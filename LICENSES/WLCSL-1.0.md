@@ -2,10 +2,9 @@
 
 Version 1.0, July 19, 2026. A Work Notice must expressly adopt this license.
 
-Copyright (c) 2026 Michael Bickford. Everyone is permitted to copy and
-distribute verbatim copies of this license text. Modified license texts must use
-a different name and must not imply endorsement by Woflo Labs or Michael
-Bickford.
+Copyright (c) 2026 Woflo Labs. Everyone is permitted to copy and distribute
+verbatim copies of this license text. Modified license texts must use a
+different name and must not imply endorsement by Woflo Labs.
 
 ## 1. Purpose
 
@@ -389,6 +388,6 @@ courts located in Ontario, Canada.
 
 ---
 
-Woflo Labs is the publishing and research identity used by Michael Bickford. It
-is not represented by this license as a separate legal entity unless a Work
-Notice expressly identifies a successor entity as the Licensor.
+Woflo Labs is the publishing and research identity of one individual. It is not
+represented by this license as a separate legal entity unless a Work Notice
+expressly identifies a successor entity as the Licensor.
