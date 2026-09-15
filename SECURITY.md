@@ -6,7 +6,7 @@ neuron injects input, writes to your hardware, and runs code you wrote. that's a
 
 **input injection is arm-gated.** every synthesised keystroke, click, and process spawn goes through one process-wide switch that starts *disarmed*. only the running daemon or GUI ever flips it on, and arming takes a deliberate confirm. tests can't arm it (there's a test whose only job is enforcing that). if that gate can be flipped by anything other than a deliberate user action, that's a vulnerability and i want to hear about it.
 
-**device writes verify themselves.** writes default to volatile (`NOSTORE`), read back the matching getter, and hard-error on a mismatch rather than reporting a silent success. anything without a trusted opcode refuses instead of guessing. no kernel driver, no vendor SDK, just HID feature reports on an access-zero handle.
+**device writes verify themselves.** writes default to volatile (`NOSTORE`), except `neuron scroll <stage>`, which stores onboard by default like synapse (`--volatile` opts out). every write reads back the matching getter and hard-errors on a mismatch rather than reporting a silent success. anything without a trusted opcode refuses instead of guessing. no kernel driver, no vendor SDK, just HID feature reports on an access-zero handle.
 
 **neuron-host opens local surfaces, and every one of them is reachable by anything already running on your machine.** here's the complete list:
 

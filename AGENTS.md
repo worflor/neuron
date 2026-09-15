@@ -129,8 +129,9 @@ flips it. Tests cannot arm it, and a dedicated test enforces that. If you are
 touching anything that synthesizes input, you are touching this, and it is `risky`
 work by definition.
 
-**Read-back verification.** Device writes default to volatile (`NOSTORE`), re-read
-the matching getter, and hard-error on a mismatch rather than reporting a silent
+**Read-back verification.** Device writes default to volatile (`NOSTORE`) (the one
+exception is `scroll`, which stores onboard by default to match Synapse), re-read the
+matching getter, and hard-error on a mismatch rather than reporting a silent
 success. A capability with no trusted opcode refuses rather than guessing. New writes
 stay behind a `NEURON_*_WRITE` feature gate until a wire capture confirms them. A
 wrong guess must fail loud; it must never brick anything.

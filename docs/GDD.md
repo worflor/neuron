@@ -204,7 +204,7 @@ reads are free and always safe. writes are where people get burned, so every one
 
 1. **backup first.** before any "safe" write, neuron can snapshot the device's entire getter space (every class × id) to `backups/*.json`, the known-good reference you diff a fresh read against (`neuron verify`) when you want to prove nothing drifted.
 2. **driver mode.** host control only renders in device-mode `0x03`: razer gates it, synapse flips it, so does `neuron mode driver`. it's idempotent and reverts when you reopen synapse or power-cycle.
-3. **volatile first.** writes default to `NOSTORE`: they take effect now but aren't flashed to onboard memory unless you ask (`--persist`). nothing permanent happens until a clean round-trip proves the opcode.
+3. **volatile first.** writes default to `NOSTORE`: they take effect now but aren't flashed to onboard memory unless you ask (`--persist`). the one exception is the scroll-wheel stage, which `neuron scroll` stores onboard by default because that's what synapse sends; `--volatile` opts out. nothing permanent happens until a clean round-trip proves the opcode.
 4. **read-back verify.** after the write, neuron re-reads the matching getter and confirms the bytes it sent actually landed. a mismatch is a hard error (`VERIFY FAILED, write NOT trusted`), never a silent success.
 
 and when there's no opcode it actually trusts, it just refuses. no guessing at your hardware. the full ledger of what's proven, gated, and missing is down in [the honesty ledger](../README.md#honesty-proven-gated-absent).
