@@ -42,17 +42,61 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
+  # STATIC CRT, or the zip doesn't launch on a clean machine. By default a Rust MSVC binary
+  # imports VCRUNTIME140.dll, which is NOT part of Windows. It ships with the Visual C++
+  # Redistributable, which most gaming PCs happen to have and a fresh install often doesn't.
+  # Without it, the user double-clicks and gets a missing-DLL dialog with no explanation.
+  # (Checked: both binaries from a local release build import it.) +crt-static links the
+  # runtime into the exe instead. The api-ms-win-crt-* imports are the Universal CRT, which IS
+  # part of Windows 10+, so those are fine. Scoped to this workflow only, so everyday local
+  # builds and ci.yml's cache are untouched.
+  RUSTFLAGS: -C target-feature=+crt-static
+
 jobs:
   windows:
     name: windows x86_64
     runs-on: windows-latest
-    timeout-minutes: 60
+    # 180, not 60. This runs `-Mode full`: the test compile (measured ~22 min on this runner),
+    # a clippy compile, four feature checks, and a ThinLTO release build, all on 2 cores. 60
+    # would time out, and a timed-out release saves no cache, so it would time out forever.
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
 
+      # A release must never ship a version that disagrees with the binary. `neuron --version`
+      # reports Cargo.toml's workspace version, so the tag has to say the same thing.
+      - name: Tag matches Cargo version
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF#refs/tags/}"
+          cargo_ver="v$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+          # `v0.1.0` and suffixed labels like `v0.1.0-mk1` both match Cargo `0.1.0`.
+          if [ "${tag%%-*}" != "$cargo_ver" ]; then
+            echo "::error::tag $tag does not match Cargo.toml's workspace version ($cargo_ver). Bump [workspace.package] version, commit, then tag."
+            exit 1
+          fi
+          echo "tag $tag matches Cargo $cargo_ver"
+
+      # Provenance attestations only work on PUBLIC repos on GitHub's Free, Pro and Team plans.
+      # SOURCE.txt tells users to verify one, so a real tagged release from a private repo
+      # would ship a promise it can't keep. Tag pushes fail fast here instead; a manual test
+      # run (workflow_dispatch) is allowed through and just skips attestation, with a warning.
+      - name: Releases need a public repo
+        if: github.event_name == 'push' && github.event.repository.private
+        shell: bash
+        run: |
+          echo "::error::this repo is private, so the build provenance attestation cannot be created. Make the repo public, then push the tag again."
+          exit 1
+
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy # -Mode full runs clippy; without this it reports a phantom failure
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true # same reason as ci.yml: a failed run must still warm the cache
 
       # Same cache as ci.yml — build.rs fetches a ~46 MB CPython tarball on a miss.
       - name: Cache the bundled CPython tarball
@@ -128,9 +172,18 @@ jobs:
       # The $0 answer to "is this really your binary": signed provenance tying the artifact to
       # this commit + this workflow. Verify with `gh attestation verify <zip> --repo <owner/repo>`.
       - name: Attest build provenance
+        if: ${{ !github.event.repository.private }}
         uses: actions/attest-build-provenance@v2
         with:
           subject-path: dist/${{ env.name }}.zip
+
+      - name: Warn when there is no attestation
+        if: ${{ github.event.repository.private }}
+        shell: bash
+        run: |
+          msg="TEST BUILD ONLY: the repo is private, so this zip has NO provenance attestation, and its SOURCE.txt tells users to verify one. Delete this draft; do not publish it."
+          echo "::warning::$msg"
+          echo "### $msg" >> "$GITHUB_STEP_SUMMARY"
 
       # `gh` is preinstalled on the runner, so this needs no third-party action.
       - name: Publish draft release
