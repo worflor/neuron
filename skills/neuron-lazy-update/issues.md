@@ -63,7 +63,31 @@ missing. Gather what applies, running only read-only commands:
 | diagnostics | ask the user to run the bench on the SYSTEM page and paste it; you can't run it |
 | crash log | `neuron-crash.log` in the config folder, if it exists; only the relevant lines |
 
-Write it like this:
+### Make it good, cheaply
+
+A good issue is one the maintainer can act on without writing back to ask. Usually the user's own
+description is enough, so start from that. Add only what's missing, in this order, and stop as soon
+as the issue can be acted on:
+
+1. **Ask what only the user can answer, and nothing else.** At most two or three short questions,
+   asked together in one message. The ones that matter most: *what exactly did you do, step by
+   step?* · *what did you expect instead?* · *does it happen every time?* · *did it ever work?*
+   Skip any the conversation already answers.
+2. **If it's visual** (lighting looks wrong, a UI element is misplaced or clipped, an overlay
+   misbehaves), ask for a screenshot, or a short clip if it moves. One image beats a paragraph.
+   GitHub can't take the image from you, so tell the user to drag it into the issue form.
+3. **Reproduce it, but only by reading.** If one read-only command shows the problem, such as
+   `neuron.exe dpi` returning an unexpected value, run it and paste the output. Never change a
+   setting to reproduce something unless the user agrees to it.
+4. **One or two web searches, only when they add something triage needs.** Examples: Razer's own
+   documentation of how the feature is supposed to behave, a known Windows issue that matches, or
+   the page for the exact device model. Link the single most useful result. No search is fine;
+   link-stuffing is not.
+
+Don't pad. Two sharp sentences are better than a long report that repeats itself. If you've done
+steps 1–4 and something's still unclear, write that down under *anything else* rather than guessing.
+
+### Write it like this
 
 - **Title:** what breaks, specifically. `DPI resets to 800 after sleep on Naga V2 Pro`, not
   `DPI bug`.
