@@ -88,7 +88,7 @@ passes locally it passes in CI, by construction rather than by convention.
 .\validate.ps1 -Locked       # add --locked, exactly reproducing a CI run
 ```
 
-CI runs `-Mode ci` on Windows and `-Mode seams` on Linux, and only when code actually
+CI runs exactly this on Windows, and `-Mode seams` on Linux, and only when code actually
 changed — a docs-only push skips the build jobs. Lint is deliberately advisory; the
 reasoning is in the script next to the command, along with what would have to happen
 for it to become a gate.

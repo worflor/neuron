@@ -14,10 +14,11 @@
 # windows lane, the linux seams lane, and local use without a second implementation.
 #
 # Usage:
-#   .\validate.ps1                # quick  - build + test. Run this before you commit.
-#   .\validate.ps1 -Mode ci       # quick + advisory clippy. What the windows CI job runs.
+#   .\validate.ps1                # quick  - build + test. BOTH the windows CI job and what you
+#                                 #          run before committing. The same thing, on purpose.
 #   .\validate.ps1 -Mode seams    # the portable crates + advisory fmt. The linux CI job.
-#   .\validate.ps1 -Mode full     # everything below, incl. the feature matrix. Slow, thorough.
+#   .\validate.ps1 -Mode full     # + clippy, the feature matrix, a release build, and the
+#                                 #   no-hardware ignored tests. Slow. Run it before a release.
 #   .\validate.ps1 -Locked        # add --locked (CI always does; use it to reproduce a CI run)
 #
 # WHAT IS DELIBERATELY NOT HERE: the hardware probes. Nine tests are #[ignore]d because they
@@ -29,7 +30,7 @@
 
 [CmdletBinding()]
 param(
-    [ValidateSet('quick', 'ci', 'seams', 'full')]
+    [ValidateSet('quick', 'seams', 'full')]
     [string]$Mode = 'quick',
     [switch]$Locked
 )
@@ -128,12 +129,16 @@ if ($Mode -eq 'seams') {
 # suite cannot reach real hardware, and a dedicated test forbids arming input. That is why
 # this is safe to run on a shared runner - and also why a green suite is NOT verification of
 # a user-facing change. See AGENTS.md.
-if ($Mode -in @('quick', 'ci', 'full')) {
+if ($Mode -in @('quick', 'full')) {
     Invoke-Gate 'build' { cargo build --workspace @lock }
     Invoke-Gate 'test'  { cargo test  --workspace @lock }
 }
 
-if ($Mode -in @('ci', 'full')) {
+# Clippy is a SECOND full compilation of the workspace (different flags, different artifacts)
+# for a signal that is advisory anyway. On the windows runner, at a 2x billing multiplier,
+# that roughly doubles the cost of every push to learn nothing that blocks a merge. So it
+# lives in `full` - run it before a release, or locally whenever you like.
+if ($Mode -eq 'full') {
     Invoke-Advisory 'clippy' { cargo clippy --workspace --all-targets @lock }
 }
 

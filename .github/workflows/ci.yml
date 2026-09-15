@@ -20,11 +20,15 @@
 #     +-- test  (windows, 2x)  only if code changed
 #     +-- seams (linux,   1x)  only if code changed
 #
-# A docs-only push - which is most of them around a release - now costs about ten seconds
-# instead of a full windows build plus a linux build. The previous version also ran fmt and
-# clippy on a SECOND windows runner, which meant paying the 2x multiplier twice to build the
-# same tree; clippy now rides along on the test runner whose cache is already warm, and fmt
-# moved to linux because formatting is pure parsing and needs no platform.
+# A docs-only push - which is most of them around a release - costs about six seconds instead
+# of a full windows build plus a linux build.
+#
+# The previous version also ran fmt and clippy on a SECOND windows runner: paying the 2x
+# multiplier twice to compile the same tree, for two signals that are advisory and cannot
+# block anything. fmt moved to the linux lane, because formatting is pure parsing and needs no
+# platform. clippy moved to `-Mode full`, because it is a whole second compilation of the
+# workspace and running it on every push roughly doubled the cost of the expensive job to
+# learn nothing that gates a merge. Run it before a release, or locally, whenever you want it.
 #
 # WHY A `gate` JOB INSTEAD OF `paths-ignore`: a skipped-by-`if` job still REPORTS, so it
 # satisfies a required status check. A path-filtered workflow simply never runs, and if
@@ -111,13 +115,24 @@ jobs:
     needs: gate
     if: needs.gate.outputs.code == 'true'
     runs-on: windows-latest
-    timeout-minutes: 45
+    # 90, not 45. The first cold run - no rust cache, no CPython cache, the whole workspace
+    # plus every test binary from scratch on a 2-core runner - hit exactly 45 minutes and was
+    # cancelled, which is also why nothing got cached. This needs enough headroom to finish
+    # ONCE; after that the cache makes it a fraction of this. If a warm run ever approaches
+    # 90 minutes, something is wrong and the timeout should stay put while you find out what.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      # cache-on-failure is load-bearing, not a nicety. rust-cache only saves on success by
+      # default, so a job that times out saves NOTHING - the next run starts cold, takes just
+      # as long, times out again, and CI is permanently stuck with no way to warm itself.
+      # That is exactly what happened on the first run of this workflow.
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
 
       # THE NEURON-SPECIFIC ONE. `crates/neuron-core/build.rs` downloads a ~46 MB
       # python-build-standalone tarball, sha256-checks it against the release manifest, then
@@ -132,7 +147,7 @@ jobs:
 
       - name: validate
         shell: pwsh
-        run: ./validate.ps1 -Mode ${{ inputs.depth == 'full' && 'full' || 'ci' }}
+        run: ./validate.ps1 -Mode ${{ inputs.depth == 'full' && 'full' || 'quick' }}
 
   seams:
     name: cross-platform seams (linux)
@@ -149,7 +164,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
+      # cache-on-failure is load-bearing, not a nicety. rust-cache only saves on success by
+      # default, so a job that times out saves NOTHING - the next run starts cold, takes just
+      # as long, times out again, and CI is permanently stuck with no way to warm itself.
+      # That is exactly what happened on the first run of this workflow.
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - name: Cache the bundled CPython tarball
         uses: actions/cache@v4
         with:

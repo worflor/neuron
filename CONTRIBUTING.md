@@ -50,7 +50,7 @@ every change runs the same suite i do. green before you open the PR:
 .\validate.ps1             # build + test. green, or it doesn't go in.
 ```
 
-that's the whole gate, and it's one script on purpose: CI *calls it* instead of listing its own cargo commands, so what you run locally and what runs on your PR can't drift apart. `-Mode full` adds the feature matrix, a release build, and the ignored tests that don't need hardware. `-Mode ci` and `-Mode seams` are what the two CI jobs run, if you want to reproduce one exactly.
+that's the whole gate, and it's one script on purpose: CI *calls it* instead of listing its own cargo commands, so what you run locally and what runs on your PR can't drift apart. `-Mode full` adds the feature matrix, a release build, and the ignored tests that don't need hardware. the windows CI job runs the plain form above, and `-Mode seams` is the linux one, if you want to reproduce either exactly.
 
 CI runs on every push and PR — though only when code actually changed, so a docs-only PR won't sit there building rust for ten minutes.
 
