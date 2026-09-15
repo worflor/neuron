@@ -131,6 +131,7 @@ jobs:
           cp target/release/neuron.exe     "dist/$name/"
           cp README.md LICENSE.md THIRD-PARTY-NOTICES.md SECURITY.md "dist/$name/"
           cp -r LICENSES "dist/$name/"
+          cp -r skills "dist/$name/"
           cat > "dist/$name/SOURCE.txt" <<EOF
           neuron ${{ steps.v.outputs.version }} — windows x86_64
 
@@ -179,11 +180,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # Hand-written notes in .github/releases/<tag>.md win; otherwise GitHub generates them.
+          notes=".github/releases/${{ steps.v.outputs.version }}.md"
+          if [ -f "$notes" ]; then notes_args=(--notes-file "$notes"); else notes_args=(--generate-notes); fi
           gh release create "${{ steps.v.outputs.version }}" \
             "dist/${{ env.name }}.zip" \
             "dist/SHA256SUMS.txt" \
             --draft \
             --title "neuron ${{ steps.v.outputs.version }}" \
-            --generate-notes \
+            "${notes_args[@]}" \
             || gh release upload "${{ steps.v.outputs.version }}" \
                  "dist/${{ env.name }}.zip" "dist/SHA256SUMS.txt" --clobber

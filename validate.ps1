@@ -100,6 +100,18 @@ if ($Mode -eq 'seams') {
     # fmt is pure parsing - no platform, no build - so it rides the cheap linux lane rather
     # than burning windows minutes at a 2x multiplier.
     Invoke-Advisory 'rustfmt' { cargo fmt --all --check }
+
+    # Shipped scripts (the skill's updater) run on end users' machines; a syntax error there
+    # is a broken install that no cargo gate would catch.
+    Invoke-Gate 'parse PowerShell scripts' {
+        $bad = 0
+        foreach ($f in (git ls-files '*.ps1')) {
+            $errs = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $f).Path, [ref]$null, [ref]$errs)
+            foreach ($e in $errs) { Write-Host "${f}:$($e.Extent.StartLineNumber): $($e.Message)"; $bad++ }
+        }
+        $global:LASTEXITCODE = [int]($bad -gt 0)
+    }
 }
 
 # ── the suite ──────────────────────────────────────────────────────────────────────────
