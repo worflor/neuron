@@ -8,13 +8,18 @@
 # never source — must not be committed.
 /vendor/
 
-# Binary blobs never belong in source. This covers the raw Chroma capture dumps
-# (docs/chroma-shm-capture/) AND the codec's include_bytes! assets under
-# crates/neuron-host/src/adapters/chroma_shm_data/ — they live on disk so the local
-# build/tests resolve them, but stay out of git. If any ever needs committing, force it
-# with `git add -f <path>`.
+# Binary blobs generally don't belong in source. This covers the raw Chroma capture
+# dumps under docs/chroma-shm-capture/, which are research scratch and stay out.
 *.bin
 /docs/chroma-shm-capture/
+
+# EXCEPT the chroma_shm codec's assets, which are SOURCE, not scratch. chroma_shm.rs
+# does include_bytes! on keystream.bin, so without it in git a fresh clone cannot
+# compile neuron-host AT ALL — and since neuron-app depends on it, that means the whole
+# project. The overwatch-*.bin fixtures are the same story for `cargo test`. This blanket
+# rule used to swallow all six, and CI caught it on its first ever run: nobody had built
+# this repo from a clean clone. ~152 KB total, fixed contents, no churn.
+!/crates/neuron-host/src/adapters/chroma_shm_data/*.bin
 
 # Runtime diagnostics and crash artifacts
 # Transient build/test console captures (agents and humans redirecting cargo output while
