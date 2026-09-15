@@ -90,9 +90,13 @@ a thing that remaps your buttons and runs python on a keypress is, by definition
 
 ## get it
 
-### build
+### with an agent
 
-**using an AI agent?** point it at [`skills/neuron-lazy-update`](skills/neuron-lazy-update/SKILL.md). it installs, updates, rolls back and drives neuron step by step, verifies every download, never touches your config, and tells you what it noticed. it's written so a small model can follow it. a script does the risky parts.
+if you'd rather not do any of this by hand, point your AI agent at [`skills/neuron-lazy-update`](skills/neuron-lazy-update/SKILL.md). it's in the repo, and in every release zip.
+
+it can install or update neuron, roll back a bad update, run CLI commands for you, and answer questions from the docs. when something doesn't work, it looks into it first, and offers to draft a proper issue only if it turns out to be a real, unreported bug. it checks every download before installing and never touches your config. it's written to be followed step by step, so it doesn't need a frontier model.
+
+### build
 
 tagged releases publish a windows zip: both binaries, the license bundle, and a `SOURCE.txt` naming the exact commit it was built from. if the releases page is empty, none has been cut yet — build from source below, which is the same thing by hand.
 
