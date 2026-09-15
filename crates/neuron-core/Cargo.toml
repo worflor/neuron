@@ -95,6 +95,13 @@ sha2 = "0.10"
 tar = "0.4"
 flate2 = "1"
 
+# The Linux HID transport (transport/hidraw.rs): raw ioctl/poll/read/flock syscalls against
+# /dev/hidrawN. No higher-level hidapi/nix wrapper — the surface needed (a handful of ioctls,
+# poll, flock) is small enough that a direct libc binding stays simpler than a dependency that
+# would pull in its own abstraction over the same syscalls.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies.windows-sys]
 version = "0.59"
 features = [

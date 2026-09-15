@@ -3365,6 +3365,7 @@ dependencies = [
  "dirs",
  "engram",
  "flate2",
+ "libc",
  "proptest",
  "quick-xml 0.36.2",
  "serde",

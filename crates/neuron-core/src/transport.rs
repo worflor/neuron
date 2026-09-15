@@ -68,6 +68,15 @@ impl DevicePath {
     pub fn from_str_for_tests(s: &str) -> DevicePath {
         DevicePath(OsString::from(s))
     }
+
+    /// Build from a native path string — the Linux (and any future plain-`OsString`-keyed POSIX)
+    /// backend's production constructor, the non-Windows counterpart to [`from_wide`](Self::from_wide).
+    /// No wide-string ceremony needed off Windows: the platform's own path bytes round-trip
+    /// losslessly through `OsString` already.
+    #[cfg(not(windows))]
+    pub fn from_str(s: &str) -> DevicePath {
+        DevicePath(OsString::from(s))
+    }
 }
 
 /// One enumerated HID collection.
@@ -115,9 +124,40 @@ impl HidDeviceInfo {
 /// - what survives — vid/pid plus the container id (`8&2f5ca30f&0&0001`) — is what actually
 ///   differs between two identical devices plugged into different USB ports.
 ///
+/// Linux `/sys/...` shape (see `transport/hidraw.rs`), e.g.
+/// `/sys/devices/pci0000:00/usb1/1-2/1-2:1.0/0003:1532:0091.0001/hidraw/hidraw0#col01`:
+/// the USB DEVICE node is the bare bus-port component (`1-2`, or `1-2.4` behind a hub) that
+/// appears BEFORE its own interface's child node (`1-2:1.0` = device `1-2`, config 1, interface
+/// 0). Truncating the path to end at that component — dropping the interface, the HID bus device
+/// (which embeds a global per-interface counter, e.g. `...0091.0001`), the hidraw node name, and
+/// the `#colNN` suffix — collapses every interface and collection of one physical mouse to one
+/// instance, while two identical mice on different ports keep their different bus-port component
+/// and stay distinct. A Windows-shaped path has no `/`-separated component matching this pattern,
+/// so this is a no-op for it.
+fn truncate_at_usb_device_node(path: &str) -> &str {
+    fn is_usb_device_component(s: &str) -> bool {
+        !s.is_empty()
+            && s.contains('-')
+            && !s.contains(':')
+            && s.chars().all(|c| c.is_ascii_digit() || c == '-' || c == '.')
+    }
+    let parts: Vec<&str> = path.split('/').collect();
+    match parts.iter().rposition(|s| is_usb_device_component(s)) {
+        Some(idx) => {
+            // Byte offset of the end of the matched component: sum of every component up to and
+            // including it, plus its separating '/' — minus the one trailing separator that isn't
+            // actually in the string.
+            let end = parts[..=idx].iter().map(|s| s.len() + 1).sum::<usize>() - 1;
+            &path[..end]
+        }
+        None => path,
+    }
+}
+
 /// Regex-free by design (no new dependency): lowercase + segment filtering only.
 pub fn path_instance(path: &str) -> String {
-    let lower = path.to_ascii_lowercase();
+    let truncated = truncate_at_usb_device_node(path);
+    let lower = truncated.to_ascii_lowercase();
     // Drop the trailing "#{...}" interface-class guid, if present.
     let without_guid = match lower.rfind("#{") {
         Some(i) => &lower[..i],
@@ -177,20 +217,27 @@ pub struct WireLock {
     local: Mutex<()>,
     #[cfg(windows)]
     os: Option<windows_hid::OsWireMutex>,
+    /// The `flock(2)`-based kernel half on Linux — see `transport/hidraw.rs::OsWireFlock`. Same
+    /// role as `os` above, just a different OS primitive.
+    #[cfg(target_os = "linux")]
+    os: Option<hidraw::OsWireFlock>,
 }
 
 impl WireLock {
-    /// A process-local-only lock — for test fakes and non-Windows backends (no kernel half).
+    /// A process-local-only lock — for test fakes and platforms with no kernel half.
     pub fn new_local() -> WireLock {
         WireLock {
             local: Mutex::new(()),
             #[cfg(windows)]
             os: None,
+            #[cfg(target_os = "linux")]
+            os: None,
         }
     }
 
-    /// The full lock for a real device pipe: local mutex + (Windows) the named kernel mutex
-    /// derived from the path, shared by every neuron process that opens this pipe.
+    /// The full lock for a real device pipe: local mutex + the OS kernel half (Windows: a named
+    /// mutex; Linux: an `flock`) derived from the path, shared by every neuron process that opens
+    /// this pipe.
     fn for_path(path: &DevicePath) -> WireLock {
         #[cfg(windows)]
         {
@@ -199,7 +246,14 @@ impl WireLock {
                 os: windows_hid::OsWireMutex::for_path(path),
             }
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
+        {
+            WireLock {
+                local: Mutex::new(()),
+                os: hidraw::OsWireFlock::for_path(path),
+            }
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             let _ = path;
             WireLock::new_local()
@@ -212,9 +266,13 @@ impl WireLock {
         let local = self.local.lock().unwrap_or_else(PoisonError::into_inner);
         #[cfg(windows)]
         let os_held = self.os.as_ref().is_some_and(|m| m.acquire());
+        #[cfg(target_os = "linux")]
+        let os_held = self.os.as_ref().is_some_and(|m| m.acquire());
         WireGuard {
             _local: local,
             #[cfg(windows)]
+            os: if os_held { self.os.as_ref() } else { None },
+            #[cfg(target_os = "linux")]
             os: if os_held { self.os.as_ref() } else { None },
         }
     }
@@ -222,14 +280,26 @@ impl WireLock {
 
 /// RAII guard from [`WireLock::acquire`]. `!Send` by construction (holds a `MutexGuard`), which
 /// also guarantees the kernel mutex is released by the thread that acquired it — a Win32
-/// `ReleaseMutex` requirement.
+/// `ReleaseMutex` requirement (and, on Linux, keeps `flock`'s acquire/release on the one thread
+/// that logically owns the conversation, even though `flock` itself has no such requirement).
 pub struct WireGuard<'a> {
     _local: std::sync::MutexGuard<'a, ()>,
     #[cfg(windows)]
     os: Option<&'a windows_hid::OsWireMutex>,
+    #[cfg(target_os = "linux")]
+    os: Option<&'a hidraw::OsWireFlock>,
 }
 
 #[cfg(windows)]
+impl Drop for WireGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(m) = self.os {
+            m.release();
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 impl Drop for WireGuard<'_> {
     fn drop(&mut self) {
         if let Some(m) = self.os {
@@ -520,6 +590,16 @@ pub fn open_reader(path: &DevicePath) -> Result<Box<dyn InputReader>> {
 #[cfg(windows)]
 mod windows_hid;
 
+#[cfg(target_os = "linux")]
+mod hidraw;
+
+// Compiled on every platform — see the module doc for why (its tests should run in Windows CI
+// too, since the byte-level parsing logic has no OS dependency). Its only production caller is
+// `hidraw.rs`, so a non-Linux build has nothing that calls `parse` outside `#[cfg(test)]` — expected,
+// not a bug.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod hid_descriptor;
+
 #[cfg(any(test, feature = "mock-transport"))]
 pub mod mock;
 
@@ -538,19 +618,34 @@ fn platform_open_reader(path: &DevicePath) -> Result<Box<dyn InputReader>> {
     Ok(Box::new(windows_hid::WinHidReader::open(path)?))
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 fn platform_enumerate() -> Result<Vec<HidDeviceInfo>> {
-    anyhow::bail!("transport not implemented on this platform yet (hidapi backend pending)")
+    hidraw::enumerate()
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+fn platform_open_path(path: &DevicePath) -> Result<Box<dyn Transport>> {
+    Ok(Box::new(hidraw::HidRaw::open(path)?))
+}
+
+#[cfg(target_os = "linux")]
+fn platform_open_reader(path: &DevicePath) -> Result<Box<dyn InputReader>> {
+    Ok(Box::new(hidraw::HidRawReader::open(path)?))
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn platform_enumerate() -> Result<Vec<HidDeviceInfo>> {
+    anyhow::bail!("transport not implemented on this platform yet (hidapi/IOKit backend pending)")
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 fn platform_open_path(_path: &DevicePath) -> Result<Box<dyn Transport>> {
-    anyhow::bail!("transport not implemented on this platform yet (hidapi backend pending)")
+    anyhow::bail!("transport not implemented on this platform yet (hidapi/IOKit backend pending)")
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 fn platform_open_reader(_path: &DevicePath) -> Result<Box<dyn InputReader>> {
-    anyhow::bail!("transport not implemented on this platform yet (hidapi backend pending)")
+    anyhow::bail!("transport not implemented on this platform yet (hidapi/IOKit backend pending)")
 }
 
 #[cfg(test)]
@@ -720,6 +815,61 @@ mod tests {
         assert!(
             t.read_input(&mut buf, 100).is_err(),
             "a feature-only transport must ERROR (not Ok(0)) when asked for an input report"
+        );
+    }
+
+    // ── path_instance ──────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn windows_shaped_paths_are_unchanged_by_the_linux_truncation() {
+        // Windows-shaped path, matching `path_instance`'s own doc-comment example — the Linux
+        // addition (`truncate_at_usb_device_node`) must be a no-op here: still collapses two
+        // collections of one keyboard, still tells apart two different container ids.
+        let a = r"\\?\hid#vid_1532&pid_0221&mi_01&col02#8&2f5ca30f&0&0001#{4d1e55b2-f16f-11cf-88cb-001111000030}";
+        let a2 = r"\\?\hid#vid_1532&pid_0221&mi_00&col01#8&2f5ca30f&0&0001#{4d1e55b2-f16f-11cf-88cb-001111000030}";
+        let b = r"\\?\hid#vid_1532&pid_0221&mi_01&col02#8&9999aaaa&0&0002#{4d1e55b2-f16f-11cf-88cb-001111000030}";
+        assert_eq!(
+            path_instance(a),
+            path_instance(a2),
+            "two collections of one Windows device must still collapse"
+        );
+        assert_ne!(
+            path_instance(a),
+            path_instance(b),
+            "two different container ids must still stay distinct"
+        );
+    }
+
+    #[test]
+    fn linux_interfaces_of_one_device_collapse_to_one_instance() {
+        let iface0 = "/sys/devices/pci0000:00/0000:00:14.0/usb1/1-2/1-2:1.0/0003:1532:0091.0001/hidraw/hidraw0#col01";
+        let iface1 = "/sys/devices/pci0000:00/0000:00:14.0/usb1/1-2/1-2:1.1/0003:1532:0092.0002/hidraw/hidraw1#col01";
+        assert_eq!(
+            path_instance(iface0),
+            path_instance(iface1),
+            "two interfaces of the SAME physical device (same bus-port `1-2`) must collapse"
+        );
+    }
+
+    #[test]
+    fn linux_collections_behind_one_interface_collapse_to_one_instance() {
+        let col1 = "/sys/devices/pci0000:00/0000:00:14.0/usb1/1-2/1-2:1.0/0003:1532:0091.0001/hidraw/hidraw0#col01";
+        let col2 = "/sys/devices/pci0000:00/0000:00:14.0/usb1/1-2/1-2:1.0/0003:1532:0091.0001/hidraw/hidraw0#col02";
+        assert_eq!(
+            path_instance(col1),
+            path_instance(col2),
+            "two top-level collections behind the SAME hidraw node must collapse"
+        );
+    }
+
+    #[test]
+    fn linux_devices_on_different_ports_stay_distinct() {
+        let port2 = "/sys/devices/pci0000:00/0000:00:14.0/usb1/1-2/1-2:1.0/0003:1532:0091.0001/hidraw/hidraw0#col01";
+        let port3 = "/sys/devices/pci0000:00/0000:00:14.0/usb1/1-3/1-3:1.0/0003:1532:0093.0001/hidraw/hidraw2#col01";
+        assert_ne!(
+            path_instance(port2),
+            path_instance(port3),
+            "two identical mice on different ports (`1-2` vs `1-3`) must stay distinct"
         );
     }
 
