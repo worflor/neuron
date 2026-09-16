@@ -1,6 +1,6 @@
 ---
 name: neuron-lazy-update
-description: Install, update, roll back, or uninstall neuron (the open, no-account Razer control app for Windows), drive its `neuron` CLI safely, and answer questions about it. Use when a user asks to install or update neuron, check which version they have, change a device setting through the CLI, fix a neuron problem, or asks how neuron works. Written so small models can follow it step by step. A bundled script does the risky parts and reports plain status lines.
+description: Install, update, roll back, or uninstall neuron (the open, no-account Razer control app - app plus CLI on Windows, CLI on Linux), drive its `neuron` CLI safely, and answer questions about it. Use when a user asks to install or update neuron, check which version they have, change a device setting through the CLI, fix a neuron problem, or asks how neuron works. Written so small models can follow it step by step. A bundled script does the risky parts and reports plain status lines.
 ---
 
 # neuron: the lazy man's auto-update

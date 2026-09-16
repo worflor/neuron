@@ -3,6 +3,9 @@
 The CLI is `neuron.exe`, in the install folder next to `neuron-app.exe`. It uses the same engine
 and the same config as the app. Run it with its full path, or from inside that folder.
 
+On Linux it is just `neuron`, wherever the user put it, and it is the whole product there — there
+is no app to sit beside. Everything below applies unchanged; drop the `.exe` and the `.\`.
+
 ## Find the right command
 
 Don't guess command names. Ask the CLI:

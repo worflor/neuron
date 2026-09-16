@@ -3,6 +3,10 @@
 Everything here goes through one script: `scripts/neuron-update.ps1`, in this skill's folder.
 It works in the Windows PowerShell that comes with Windows. Nothing extra needs installing.
 
+**Windows only.** The script installs the Windows release zip and manages the Windows app. On
+Linux, neuron ships a CLI tarball instead and there is no updater script yet — do it by hand,
+see [Linux, by hand](#linux-by-hand) at the bottom. Do not point the script at a Linux box.
+
 ## How to run the script
 
 ```powershell
@@ -126,3 +130,26 @@ Confirm each step with the user first. Don't delete anything they haven't agreed
 - `-ZipPath <zip>` installs a release zip the user already downloaded. `SHA256SUMS.txt` must sit next
   to it, or be passed with `-SumsPath`.
 - `-NoRelaunch` leaves neuron closed afterwards.
+
+## Linux, by hand
+
+The Linux asset is `neuron-<version>-linux-x86_64.tar.gz` and it holds the CLI only — there is no
+tray, no GUI, and nothing running in the background, so an update is just replacing one file.
+There is no script for this yet; walk the user through it instead of improvising one.
+
+1. Find the newest release and its two assets on
+   `https://github.com/worflor/neuron/releases`, or with `gh release download` if they have `gh`.
+2. Verify before extracting — `sha256sum -c SHA256SUMS.txt --ignore-missing` in the download
+   folder. If it doesn't say `OK`, stop and tell the user; do not install it.
+3. Extract with `tar -xzf neuron-<version>-linux-x86_64.tar.gz`, then move `neuron` wherever they
+   keep binaries (`~/.local/bin` needs no root).
+4. **First install only:** the udev rule, or every command needs `sudo`. The exact two commands
+   are in the archive's `SOURCE.txt`; they copy `70-neuron.rules` into `/etc/udev/rules.d/` and
+   reload udev. The device must be replugged afterwards.
+5. Confirm with `neuron --version`, then `neuron list`.
+
+If `neuron list` says no device but one is plugged in, the udev rule is the first suspect: have
+them run it once with `sudo`. If `sudo neuron list` finds the device and a plain one doesn't,
+that is the rule, not neuron. Say so plainly — and note that Linux device support has not been
+verified against real hardware by anyone yet, so a genuine bug there is worth an issue
+([issues.md](issues.md)).
