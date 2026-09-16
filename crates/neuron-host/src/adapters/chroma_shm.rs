@@ -1946,6 +1946,68 @@ pub mod server {
         use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
         use windows_sys::Win32::System::Threading::{ReleaseMutex, WaitForSingleObject};
 
+        /// Read-only snapshot of whatever Chroma server is live right now: who is registered,
+        /// which session is active, what the roster says, and whether any device buffer is
+        /// receiving frames. Attaches with `ShmServer::open`, which maps existing sections and
+        /// creates nothing, so it is safe to run against a server serving a live game.
+        ///
+        /// `cargo test -p neuron-host --features bridge chroma_peek -- --ignored --nocapture`
+        #[test]
+        #[ignore = "needs a live Chroma server (neuron's or the vendor's) on this machine"]
+        fn chroma_peek() {
+            let srv = match ShmServer::open() {
+                Ok(s) => s,
+                Err(e) => {
+                    println!("no Chroma server to attach to: {e}");
+                    return;
+                }
+            };
+
+            match srv.section_bytes(SESSION_TABLE).as_deref().and_then(parse_session_table) {
+                Some(t) => println!(
+                    "session table: active_count={} session_id={:#x} session_handle={:#010x}",
+                    t.active_count, t.session_id, t.session_handle
+                ),
+                None => println!("session table: no active session (nobody painting)"),
+            }
+
+            match srv.section_bytes(APP_REGISTRY) {
+                Some(b) => {
+                    let apps = parse_app_registry(&b);
+                    println!("app registry: {} entry(s)", apps.len());
+                    for a in &apps {
+                        println!("   id={:#x} {}", a.id, a.name);
+                    }
+                }
+                None => println!("app registry: section absent"),
+            }
+
+            match srv.section_bytes(CONTROL_SECTION).as_deref().and_then(parse_roster) {
+                Some((n, first)) => println!("roster: {n} device(s), first = {first:?}"),
+                None => println!("roster: unreadable"),
+            }
+
+            for o in OBJECTS.iter() {
+                let Kind::Section(_) = o.kind else { continue };
+                if !o.note.starts_with("device buffer") {
+                    continue;
+                }
+                let Some(b) = srv.section_bytes(o.guid) else { continue };
+                match newest_record_meta(&b) {
+                    Some((id, ts)) => {
+                        let effect = parse_frame(&b)
+                            .map(|(h, units)| {
+                                let lit = units.iter().filter(|u| !u.is_zero()).count();
+                                format!("device_type={:#04x} ({} lit of {})", h.device_type, lit, units.len())
+                            })
+                            .unwrap_or_else(|| "unparsed".into());
+                        println!("{}: newest record id={id:#x} ts={ts} {effect}  [{}]", o.guid, o.note);
+                    }
+                    None => println!("{}: idle (no records)  [{}]", o.guid, o.note),
+                }
+            }
+        }
+
         /// A client that WAITS on one of the server's mutexes must not block on us. Proven by
         /// waiting from another thread with a zero timeout: on an owned mutex that returns
         /// WAIT_TIMEOUT (ownership is per-thread), on an unowned one it acquires immediately.
