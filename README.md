@@ -9,7 +9,7 @@ one small binary. no account, no cloud, no telemetry. no "please update razer ce
 | | |
 |---|---|
 | **what** | one tray-resident binary (CLI + GUI) built to replace razer synapse |
-| **platform** | windows today (linux/mac kept behind seams, not yet implemented) |
+| **platform** | windows (app + CLI). linux ships the CLI — builds, tested, but not yet run against a real device by anyone; no mac |
 | **hardware** | razer mice + keyboards over raw HID; daily-driven (and hardware-verified) on a Naga V2 Pro + BlackWidow Chroma V2; any other `razer_report` device should adopt itself via auto-synthesis |
 | **install** | build from source: `cargo build --release` |
 | **footprint** | no driver, no account, no runtime, no cloud; your config is plain TOML |
@@ -184,7 +184,9 @@ what you write stays yours. the checkbox on a pull request gives Woflo Labs enou
 
 the full per-feature status (solid to barely-started) lives in [state of the project](docs/STATUS.md); this section is just the device-write ledger.
 
-it's **windows-only right now** because that's what i'm on. the guts are written to port (HID, audio, raw input, overlays, foreground detection all sit behind seams), but the code behind those seams is Windows today; everywhere else honestly says "not supported". the linux/mac backends still need writing.
+the **GUI is windows-only** because that's what i'm on — the tray, the overlays, input synthesis and audio all sit behind seams, and the code behind those seams is win32 today.
+
+**linux gets the CLI**, and that's a real thing, not a gesture: the whole workspace compiles there, the entire suite passes there on every push, and the hidraw transport is written straight against the kernel's interfaces. the release tarball carries it plus the udev rule you need. what i can't tell you is whether it actually drives your mouse, because i don't have a linux box with a razer device on it — nothing has touched a wire there yet. if you try it, [tell me what happened](https://github.com/worflor/neuron/issues), good or bad. mac is unwritten.
 
 and i'm not pretending this is the most mature or the broadest thing in the space. on linux, [openrazer](https://github.com/openrazer/openrazer) is the real, decade-hardened answer (kernel driver, a couple hundred devices, an actual community), so use it. if you want one panel for every RGB brand under the sun, that's [OpenRGB](https://openrgb.org). neuron is deliberately narrow: one vendor, one desk, gone deep. that narrowness is the point.
 

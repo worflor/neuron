@@ -29,7 +29,10 @@ Short answers you can give directly. Check the linked source if the user wants m
 - **Which devices work?** Razer devices that speak `razer_report`. Two are hardware-verified:
   Naga V2 Pro and BlackWidow Chroma V2. Others should adopt themselves automatically, but aren't
   verified. (`docs/STATUS.md`)
-- **Linux or Mac?** Not yet. Windows only. (`docs/STATUS.md`)
+- **Linux or Mac?** Linux gets the CLI (a `-linux-x86_64.tar.gz` asset); install the bundled
+  `70-neuron.rules` first or hidraw stays root-only. It builds and its tests pass, but no one has
+  run it against a real device yet, so treat problems as findings worth reporting. The GUI is
+  Windows-only, and there is no Mac build. (`docs/STATUS.md`)
 - **Why does Windows warn when I run it?** It isn't code-signed. The release carries a provenance
   attestation you can verify instead. (`README.md`, *get it*)
 - **Where are my settings?** In the install folder next to the exes, or in `%LOCALAPPDATA%\neuron`
