@@ -89,22 +89,27 @@ passes locally it passes in CI, by construction rather than by convention.
 .\validate.ps1 -Locked       # add --locked, exactly reproducing a CI run
 ```
 
-CI runs exactly this on Windows, and `-Mode seams` on Linux, and only when code actually
-changed — a docs-only push skips the build jobs. Lint is deliberately advisory; the
-reasoning is in the script next to the command, along with what would have to happen
-for it to become a gate.
+CI runs exactly this on Windows and on Linux, and only when code actually changed — a
+docs-only push skips the build jobs. Lint is deliberately advisory; the reasoning is in the
+script next to the command, along with what would have to happen for it to become a gate.
 
-**On Linux or macOS**, install PowerShell 7 and run the seams lane instead:
+**On Linux**, install PowerShell 7 and run the same thing:
 
 ```bash
-pwsh ./validate.ps1 -Mode seams
+pwsh ./validate.ps1
 ```
 
-That is the only mode that works off Windows. Plain `validate.ps1` tests the whole
-workspace, and `neuron-app` does not compile off Windows yet (its overlay instruments are
-still Win32-only). The seams lane checks the crates that do port and runs the rustfmt
-advisory, which is exactly what CI's Linux job runs. Say in your PR that the Windows suite
-was not run locally, and CI will run it.
+The whole workspace compiles and the whole suite passes on Linux, so this is a real gate
+there, not a smoke test. What it does *not* prove is Windows behaviour: the platform-specific
+halves (input synthesis, the overlays, the tray, audio) are inert stubs off Windows, and a
+test that exercises them is asserting the stub. If you touched one of those, say in your PR
+that the Windows suite was not run locally, and CI will run it.
+
+The platform-free gates — rustfmt and a parse of every shipped `.ps1` — have their own lane:
+
+```bash
+pwsh ./validate.ps1 -Mode lint
+```
 
 ### Do not
 

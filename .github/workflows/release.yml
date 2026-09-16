@@ -2,17 +2,27 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
 
-# Cut a release ZIP.
+# Cut a release.
 #
 # Runs only on a pushed version tag (`v0.1.0`, `v0.2.0-mk1`, …) or a manual
 # `workflow_dispatch` - never on push to main or on pull requests; `ci.yml` covers those.
+#
+# Three stages, because there are now two platforms to ship:
+#
+#   preflight (linux, ~10s)  - the refusals: tag vs Cargo version, private repo
+#     +-- windows            - the app + the CLI, zipped
+#     +-- linux              - the CLI + the udev rule, tarballed
+#           +-- publish      - one checksum file, one attestation pass, one draft release
+#
+# The two build jobs never publish anything themselves: a release with half its assets, or two
+# SHA256SUMS files disagreeing about what the release contains, is worse than no release.
 #
 # Opens the release as a draft: nothing is publicly visible until reviewed and published.
 # Flip `--draft` below to publish straight away.
 #
 # No code signing: an OV certificate needs hardware-token/cloud-HSM storage and still doesn't
 # clear SmartScreen on its own. Instead this attaches build provenance - a cryptographic
-# attestation binding the zip to the exact commit and workflow run, verifiable with
+# attestation binding each artifact to the exact commit and workflow run, verifiable with
 # `gh attestation verify` - proving where the binary came from.
 
 name: release
@@ -36,20 +46,13 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
-  # Static CRT, or the zip doesn't launch on a clean machine: a Rust MSVC binary otherwise
-  # imports VCRUNTIME140.dll (ships with the VC++ Redistributable, not with Windows itself),
-  # so a fresh install without it gets a missing-DLL dialog. +crt-static links the runtime in
-  # instead; the api-ms-win-crt-* imports are the Universal CRT and are part of Windows 10+.
-  # Scoped to this workflow only, so local builds and ci.yml's cache are untouched.
-  RUSTFLAGS: -C target-feature=+crt-static
-
 jobs:
-  windows:
-    name: windows x86_64
-    runs-on: windows-latest
-    # `-Mode full` runs the test compile, a clippy compile, four feature checks, and a ThinLTO
-    # release build, all on 2 cores - 60 min would time out before that finishes.
-    timeout-minutes: 180
+  preflight:
+    name: refusals
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.v.outputs.version }}
     steps:
       - uses: actions/checkout@v7
 
@@ -72,29 +75,13 @@ jobs:
       # Provenance attestations only work on public repos. SOURCE.txt tells users to verify
       # one, so a tagged release from a private repo would ship a promise it can't keep. Tag
       # pushes fail fast here; a manual test run (workflow_dispatch) skips attestation instead,
-      # with a warning.
+      # with a warning. Refusing in preflight means neither build job burns minutes first.
       - name: Releases need a public repo
         if: github.event_name == 'push' && github.event.repository.private
         shell: bash
         run: |
           echo "::error::this repo is private, so the build provenance attestation cannot be created. Make the repo public, then push the tag again."
           exit 1
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy # -Mode full runs clippy; without this it reports a phantom failure
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: true # same reason as ci.yml: a failed run must still warm the cache
-
-      # Same cache as ci.yml - build.rs fetches a ~46 MB CPython tarball on a miss.
-      - name: Cache the bundled CPython tarball
-        uses: actions/cache@v6
-        with:
-          path: vendor/pbs-cache
-          key: pbs-${{ runner.os }}-${{ hashFiles('crates/neuron-core/build.rs') }}
-          restore-keys: pbs-${{ runner.os }}-
 
       - name: Resolve version
         id: v
@@ -105,6 +92,40 @@ jobs:
           else
             echo "version=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
           fi
+
+  windows:
+    name: windows x86_64
+    needs: preflight
+    runs-on: windows-latest
+    # `-Mode full` runs the test compile, a clippy compile, four feature checks, and a ThinLTO
+    # release build, all on 2 cores - 60 min would time out before that finishes.
+    timeout-minutes: 180
+    env:
+      # Static CRT, or the zip doesn't launch on a clean machine: a Rust MSVC binary otherwise
+      # imports VCRUNTIME140.dll (ships with the VC++ Redistributable, not with Windows itself),
+      # so a fresh install without it gets a missing-DLL dialog. +crt-static links the runtime in
+      # instead; the api-ms-win-crt-* imports are the Universal CRT and are part of Windows 10+.
+      # Scoped to this JOB: the same flag against glibc produces a binary whose DNS and user
+      # lookups break, so the linux job must not inherit it.
+      RUSTFLAGS: -C target-feature=+crt-static
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy # -Mode full runs clippy; without this it reports a phantom failure
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true # same reason as ci.yml: a failed run must still warm the cache
+
+      # Same cache as ci.yml - build.rs fetches a 22 MB CPython tarball on a miss, then slims it.
+      - name: Cache the bundled CPython tarball
+        uses: actions/cache@v6
+        with:
+          path: vendor/pbs-cache
+          key: pbs-${{ runner.os }}-${{ hashFiles('crates/neuron-core/build.rs') }}
+          restore-keys: pbs-${{ runner.os }}-
 
       # The gates run against a release too - a tag must not ship something main wouldn't
       # accept. Runs the full pass (feature matrix + no-hardware ignored tests), the same
@@ -125,7 +146,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          name="neuron-${{ steps.v.outputs.version }}-windows-x86_64"
+          name="neuron-${{ needs.preflight.outputs.version }}-windows-x86_64"
           mkdir -p "dist/$name"
           cp target/release/neuron-app.exe "dist/$name/"
           cp target/release/neuron.exe     "dist/$name/"
@@ -133,7 +154,7 @@ jobs:
           cp -r LICENSES "dist/$name/"
           cp -r skills "dist/$name/"
           cat > "dist/$name/SOURCE.txt" <<EOF
-          neuron ${{ steps.v.outputs.version }} — windows x86_64
+          neuron ${{ needs.preflight.outputs.version }} — windows x86_64
 
           Built by GitHub Actions from:
             repository : ${{ github.server_url }}/${{ github.repository }}
@@ -151,26 +172,137 @@ jobs:
           EOF
           echo "name=$name" >> "$GITHUB_ENV"
 
-      - name: Zip + checksum
+      - name: Zip
         shell: pwsh
-        run: |
-          Compress-Archive -Path "dist/$env:name" -DestinationPath "dist/$env:name.zip"
-          $h = (Get-FileHash "dist/$env:name.zip" -Algorithm SHA256).Hash.ToLower()
-          "$h  $env:name.zip" | Out-File -FilePath "dist/SHA256SUMS.txt" -Encoding utf8
+        run: Compress-Archive -Path "dist/$env:name" -DestinationPath "dist/$env:name.zip"
 
-      # Signed provenance tying the artifact to this commit + this workflow. Verify with
-      # `gh attestation verify <zip> --repo <owner/repo>`.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-windows
+          path: dist/${{ env.name }}.zip
+          if-no-files-found: error
+
+  linux:
+    name: linux x86_64
+    needs: preflight
+    # ubuntu-22.04, deliberately, NOT ubuntu-latest: a glibc binary runs on the glibc it was
+    # built against or newer, never older. 22.04 ships glibc 2.35, which covers every currently
+    # supported Ubuntu/Debian/Fedora; building on 24.04 (2.39) would refuse to start on a 22.04
+    # desktop for no gain. A musl build would drop the floor entirely, but it also drops
+    # `dlopen`, which the audio and X11 layers will want when they land.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Cache the bundled CPython tarball
+        uses: actions/cache@v6
+        with:
+          path: vendor/pbs-cache
+          key: pbs-${{ runner.os }}-${{ hashFiles('crates/neuron-core/build.rs') }}
+          restore-keys: pbs-${{ runner.os }}-
+
+      - name: validate
+        shell: pwsh
+        run: ./validate.ps1
+
+      # Only the CLI. neuron-app compiles here, but its tray, overlays and input synthesis are
+      # inert stubs off windows, so shipping it would be shipping a window that does nothing.
+      # The CLI is the whole device layer, and on linux it is the product.
+      - name: build
+        run: cargo build --release -p neuron-cli --locked
+
+      - name: Stage the package
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="neuron-${{ needs.preflight.outputs.version }}-linux-x86_64"
+          mkdir -p "dist/$name"
+          cp target/release/neuron "dist/$name/"
+          cp README.md LICENSE.md THIRD-PARTY-NOTICES.md SECURITY.md "dist/$name/"
+          cp -r LICENSES "dist/$name/"
+          cp -r skills "dist/$name/"
+          cp packaging/linux/70-neuron.rules "dist/$name/"
+          cat > "dist/$name/SOURCE.txt" <<EOF
+          neuron ${{ needs.preflight.outputs.version }} — linux x86_64 (CLI)
+
+          Built by GitHub Actions from:
+            repository : ${{ github.server_url }}/${{ github.repository }}
+            commit     : ${{ github.sha }}
+            source     : ${{ github.server_url }}/${{ github.repository }}/tree/${{ github.sha }}
+            run        : ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          Built against glibc 2.35 (Ubuntu 22.04), so it runs on that or newer.
+
+          This archive ships the CLI only — the GUI's tray, overlays and input synthesis are
+          windows-only today. Device control, lighting and profiles all work here.
+
+          Install the udev rule first, or hidraw stays root-only:
+
+            sudo cp 70-neuron.rules /etc/udev/rules.d/
+            sudo udevadm control --reload-rules && sudo udevadm trigger
+
+          Then replug the device (the rule applies when it next appears).
+
+          Verify the build provenance — it proves this binary came from the commit above:
+
+            gh attestation verify $name.tar.gz --repo ${{ github.repository }}
+
+          Corresponding source for this binary is the commit linked above, per GPL-3.0-or-later.
+          EOF
+          # -C so the archive holds `<name>/...` and not the `dist/` prefix.
+          tar -czf "dist/$name.tar.gz" -C dist "$name"
+          echo "name=$name" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-linux
+          path: dist/${{ env.name }}.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: draft release
+    needs: [preflight, windows, linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7 # for .github/releases/<tag>.md
+
+      # Both packages, flattened into one dir: `merge-multiple` drops the per-artifact folder
+      # so SHA256SUMS.txt lists the names people actually download.
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: package-*
+          merge-multiple: true
+
+      - name: Checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          ls -l
+          sha256sum neuron-*-*.zip neuron-*-*.tar.gz > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      # Signed provenance tying each artifact to this commit + this workflow. Verify with
+      # `gh attestation verify <file> --repo <owner/repo>`.
       - name: Attest build provenance
         if: ${{ !github.event.repository.private }}
         uses: actions/attest-build-provenance@v4
         with:
-          subject-path: dist/${{ env.name }}.zip
+          subject-path: |
+            dist/*.zip
+            dist/*.tar.gz
 
       - name: Warn when there is no attestation
         if: ${{ github.event.repository.private }}
         shell: bash
         run: |
-          msg="TEST BUILD ONLY: the repo is private, so this zip has NO provenance attestation, and its SOURCE.txt tells users to verify one. Delete this draft; do not publish it."
+          msg="TEST BUILD ONLY: the repo is private, so these artifacts have NO provenance attestation, and their SOURCE.txt tells users to verify one. Delete this draft; do not publish it."
           echo "::warning::$msg"
           echo "### $msg" >> "$GITHUB_STEP_SUMMARY"
 
@@ -179,15 +311,15 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.preflight.outputs.version }}
         run: |
+          set -euo pipefail
           # Hand-written notes in .github/releases/<tag>.md win; otherwise GitHub generates them.
-          notes=".github/releases/${{ steps.v.outputs.version }}.md"
+          notes=".github/releases/${VERSION}.md"
           if [ -f "$notes" ]; then notes_args=(--notes-file "$notes"); else notes_args=(--generate-notes); fi
-          gh release create "${{ steps.v.outputs.version }}" \
-            "dist/${{ env.name }}.zip" \
-            "dist/SHA256SUMS.txt" \
+          assets=(dist/*.zip dist/*.tar.gz dist/SHA256SUMS.txt)
+          gh release create "$VERSION" "${assets[@]}" \
             --draft \
-            --title "neuron ${{ steps.v.outputs.version }}" \
+            --title "neuron $VERSION" \
             "${notes_args[@]}" \
-            || gh release upload "${{ steps.v.outputs.version }}" \
-                 "dist/${{ env.name }}.zip" "dist/SHA256SUMS.txt" --clobber
+            || gh release upload "$VERSION" "${assets[@]}" --clobber

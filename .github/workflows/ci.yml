@@ -15,11 +15,14 @@
 # linux `gate` job decides whether the expensive windows job wakes up at all:
 #
 #   gate  (linux, ~10s, 1x)  - did any code change?
-#     +-- test  (windows, 2x)  only if code changed
-#     +-- seams (linux,   1x)  only if code changed
+#     +-- test (windows, 2x)  only if code changed
+#     +-- test (linux,   1x)  only if code changed; also runs the platform-free lint lane
 #
-# fmt runs on the linux lane (pure parsing, no platform needed); clippy lives in `-Mode full`
-# since it's a second full workspace compile that gates nothing.
+# Both test jobs run the SAME mode: the workspace builds and passes its suite on linux now, so
+# linux is a real platform here, not a compile-only smoke test. (It was `-Mode seams` - a check
+# of the crates that ported - for exactly as long as the app didn't build there.) fmt and the
+# shipped-script parse ride the linux job since they need no platform; clippy lives in
+# `-Mode full`, being a second full workspace compile that gates nothing.
 #
 # A `gate` job rather than `paths-ignore`: a skipped-by-`if` job still reports, satisfying a
 # required status check, where a path-filtered workflow simply never runs.
@@ -130,8 +133,9 @@ jobs:
         with:
           cache-on-failure: true
 
-      # `crates/neuron-core/build.rs` downloads a ~46 MB python-build-standalone tarball,
-      # sha256-checks it, then embeds it. Uncached, every cold run re-downloads it.
+      # `crates/neuron-core/build.rs` downloads a python-build-standalone tarball (22 MB for
+      # windows, 34 MB for linux), sha256-checks it, slims it, then embeds it. Uncached, every
+      # cold run re-downloads and re-slims it.
       - name: Cache the bundled CPython tarball
         uses: actions/cache@v6
         with:
@@ -143,14 +147,15 @@ jobs:
         shell: pwsh
         run: ./validate.ps1 -Mode ${{ inputs.depth == 'full' && 'full' || 'quick' }}
 
-  seams:
-    name: cross-platform seams (linux)
+  linux:
+    name: test (linux)
     needs: gate
     if: needs.gate.outputs.code == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    # Does NOT claim neuron runs on linux - it claims the cross-platform seams still compile.
-    # Excluded crate and reasoning live in validate.ps1, next to the command.
+    # Same suite as the windows job, on a runner that isn't billed at 2x. 45 rather than 60: the
+    # linux lane has no GUI toolkit to build (the tray and its GTK/X11 dependencies are windows-
+    # only by target), so it compiles less.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -168,4 +173,10 @@ jobs:
 
       - name: validate
         shell: pwsh
-        run: ./validate.ps1 -Mode seams
+        run: ./validate.ps1 -Mode ${{ inputs.depth == 'full' && 'full' || 'quick' }}
+
+      # After the suite, not before: a formatting advisory should never be what you see instead
+      # of a test failure. It cannot fail the job either way.
+      - name: lint
+        shell: pwsh
+        run: ./validate.ps1 -Mode lint

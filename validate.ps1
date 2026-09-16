@@ -6,13 +6,15 @@
 #
 # CI and local runs call this same script so they can't drift; ci.yml only picks which mode
 # runs on which runner. PowerShell because pwsh ships preinstalled on both windows-latest and
-# ubuntu-latest runners, covering the windows lane, the linux seams lane, and local use with
-# one implementation.
+# ubuntu-latest runners, covering the windows lane, the linux lane, and local use with one
+# implementation.
 #
 # Usage:
 #   .\validate.ps1                # quick - the suite (compiles everything on the way). Same
-#                                 #   as the windows CI job and what you run before committing.
-#   .\validate.ps1 -Mode seams    # the portable crates + advisory fmt. The linux CI job.
+#                                 #   as both CI test jobs and what you run before committing.
+#                                 #   Runs on windows AND on linux; each proves its own platform.
+#   .\validate.ps1 -Mode lint     # rustfmt + the shipped scripts. Compiles nothing and cares
+#                                 #   about no platform, so CI rides it on the cheap linux lane.
 #   .\validate.ps1 -Mode full     # + clippy, the feature matrix, a release build, and the
 #                                 #   no-hardware ignored tests. Slow. Run before a release.
 #   .\validate.ps1 -Locked        # add --locked (CI always does; use it to reproduce a CI run)
@@ -23,7 +25,7 @@
 
 [CmdletBinding()]
 param(
-    [ValidateSet('quick', 'seams', 'full')]
+    [ValidateSet('quick', 'lint', 'full')]
     [string]$Mode = 'quick',
     [switch]$Locked
 )
@@ -97,17 +99,14 @@ function Invoke-Advisory($name, [scriptblock]$body) {
 
 Write-Host "neuron validate - mode: $Mode" -ForegroundColor White
 
-# ── the portable crates ───────────────────────────────────────────────────────────────────
-# This does NOT claim neuron runs on linux; it claims the cross-platform seams still compile
-# (stubs inert off windows, so nothing else would notice them rotting). neuron-app is
-# excluded - it fails with ~10 errors, all in the overlay instruments (CONTRIBUTING.md's
-# "one welded chunk"). Add it once those are factored out.
-if ($Mode -eq 'seams') {
-    Invoke-Gate 'check the porting seams' {
-        cargo check -p neuron -p neuron-cli -p neuron-host -p neuron-testkit -p engram @lock
-    }
-    # fmt is pure parsing - no platform, no build - so it rides the cheap linux lane rather
-    # than burning windows minutes at a 2x multiplier.
+# ── the platform-free gates ────────────────────────────────────────────────────────────────
+# Neither of these compiles anything or cares which OS it is on.
+#
+# This lane used to be `seams`: a `cargo check` of the subset of crates that ported, standing in
+# for a linux build nobody could run. The whole workspace now compiles AND passes its suite on
+# linux, so the linux CI job runs `quick` like windows does, and a check of a subset would prove
+# strictly less than the suite already does.
+if ($Mode -eq 'lint') {
     Invoke-Advisory 'rustfmt' { cargo fmt --all --check }
 
     # Shipped scripts (the skill's updater) run on end users' machines; a syntax error there
