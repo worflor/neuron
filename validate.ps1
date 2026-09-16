@@ -53,6 +53,15 @@ if (-not $env:CI -and -not $env:CARGO_BUILD_JOBS) {
 $lock = @()
 if ($Locked) { $lock = @('--locked') }
 
+# neuron-app is the windows GUI. It compiles off windows, but every platform surface in it (tray,
+# overlays, input synthesis, audio) is an inert stub there, and building it pulls a fontconfig /
+# X11 / Wayland dev stack in to render a window that does nothing. Off windows the suite covers
+# what linux actually ships: the core, the CLI, the host, engram, the testkit. To build the app on
+# linux anyway (working on the linux GUI), install that stack and run cargo directly.
+# $env:OS is set on windows and nowhere else, so this works under both PS 5.1 and pwsh 7.
+$scope = @()
+if ($env:OS -ne 'Windows_NT') { $scope = @('--exclude', 'neuron-app') }
+
 $script:Failures = @()
 $script:Advisories = @()
 
@@ -100,12 +109,7 @@ function Invoke-Advisory($name, [scriptblock]$body) {
 Write-Host "neuron validate - mode: $Mode" -ForegroundColor White
 
 # ── the platform-free gates ────────────────────────────────────────────────────────────────
-# Neither of these compiles anything or cares which OS it is on.
-#
-# This lane used to be `seams`: a `cargo check` of the subset of crates that ported, standing in
-# for a linux build nobody could run. The whole workspace now compiles AND passes its suite on
-# linux, so the linux CI job runs `quick` like windows does, and a check of a subset would prove
-# strictly less than the suite already does.
+# Neither compiles anything or cares which OS it is on, so CI rides them on the linux runner.
 if ($Mode -eq 'lint') {
     Invoke-Advisory 'rustfmt' { cargo fmt --all --check }
 
@@ -132,7 +136,7 @@ if ($Mode -in @('quick', 'full')) {
     # a separate `cargo build` first doubles the workspace compile for ~2 min of actual test
     # execution. `-Mode full` (and the release workflow) still does a real release build, so
     # the final non-test link is proven before anything ships.
-    Invoke-Gate 'test' { cargo test --workspace @lock }
+    Invoke-Gate 'test' { cargo test --workspace @scope @lock }
 }
 
 # Clippy is a second full compilation of the workspace for a signal that's advisory anyway,
@@ -156,7 +160,7 @@ if ($Mode -eq 'full') {
 
     # The release profile is what ships, and it is a different codegen path (ThinLTO,
     # stripped) with its own way of breaking.
-    Invoke-Gate 'release build' { cargo build --workspace --release @lock }
+    Invoke-Gate 'release build' { cargo build --workspace --release @scope @lock }
 
     # The #[ignore]d tests that need no hardware: the python sidecar death-race pair (CPython
     # is bundled by build.rs) and the .gwyph reference emitter.

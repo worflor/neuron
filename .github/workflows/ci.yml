@@ -18,11 +18,9 @@
 #     +-- test (windows, 2x)  only if code changed
 #     +-- test (linux,   1x)  only if code changed; also runs the platform-free lint lane
 #
-# Both test jobs run the SAME mode: the workspace builds and passes its suite on linux now, so
-# linux is a real platform here, not a compile-only smoke test. (It was `-Mode seams` - a check
-# of the crates that ported - for exactly as long as the app didn't build there.) fmt and the
-# shipped-script parse ride the linux job since they need no platform; clippy lives in
-# `-Mode full`, being a second full workspace compile that gates nothing.
+# Both test jobs run the same mode; each proves its own platform. fmt and the shipped-script
+# parse ride the linux job since they need no platform; clippy lives in `-Mode full`, being a
+# second full workspace compile that gates nothing.
 #
 # A `gate` job rather than `paths-ignore`: a skipped-by-`if` job still reports, satisfying a
 # required status check, where a path-filtered workflow simply never runs.
@@ -152,9 +150,8 @@ jobs:
     needs: gate
     if: needs.gate.outputs.code == 'true'
     runs-on: ubuntu-latest
-    # Same suite as the windows job, on a runner that isn't billed at 2x. 45 rather than 60: the
-    # linux lane has no GUI toolkit to build (the tray and its GTK/X11 dependencies are windows-
-    # only by target), so it compiles less.
+    # 45 rather than the windows job's 60: tray-icon and global-hotkey are windows-only by target,
+    # so this lane builds no GTK/X11 stack.
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
@@ -175,8 +172,7 @@ jobs:
         shell: pwsh
         run: ./validate.ps1 -Mode ${{ inputs.depth == 'full' && 'full' || 'quick' }}
 
-      # After the suite, not before: a formatting advisory should never be what you see instead
-      # of a test failure. It cannot fail the job either way.
+      # After the suite so a formatting advisory never masks a test failure. Cannot fail the job.
       - name: lint
         shell: pwsh
         run: ./validate.ps1 -Mode lint

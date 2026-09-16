@@ -100,11 +100,14 @@ script next to the command, along with what would have to happen for it to becom
 pwsh ./validate.ps1
 ```
 
-The whole workspace compiles and the whole suite passes on Linux, so this is a real gate
-there, not a smoke test. What it does *not* prove is Windows behaviour: the platform-specific
-halves (input synthesis, the overlays, the tray, audio) are inert stubs off Windows, and a
-test that exercises them is asserting the stub. If you touched one of those, say in your PR
-that the Windows suite was not run locally, and CI will run it.
+That runs everything Linux ships — the core, the CLI, the host, engram, the testkit — and it
+passes, so it is a real gate there, not a smoke test. Two things it does not cover. It skips
+`neuron-app`, the Windows GUI: that crate compiles on Linux, but every surface in it is an
+inert stub there and building it pulls in a fontconfig/X11/Wayland dev stack (install that
+stack and run cargo directly if you are working on the Linux GUI). And it cannot prove Windows
+behaviour: a test that exercises a Win32 seam off Windows is asserting the stub. If you touched
+input, the overlays, the tray or audio, say in your PR that the Windows suite was not run
+locally, and CI will run it.
 
 The platform-free gates — rustfmt and a parse of every shipped `.ps1` — have their own lane:
 

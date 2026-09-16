@@ -7,15 +7,15 @@
 # Runs only on a pushed version tag (`v0.1.0`, `v0.2.0-mk1`, …) or a manual
 # `workflow_dispatch` - never on push to main or on pull requests; `ci.yml` covers those.
 #
-# Three stages, because there are now two platforms to ship:
+# Two platforms, three stages:
 #
 #   preflight (linux, ~10s)  - the refusals: tag vs Cargo version, private repo
 #     +-- windows            - the app + the CLI, zipped
 #     +-- linux              - the CLI + the udev rule, tarballed
 #           +-- publish      - one checksum file, one attestation pass, one draft release
 #
-# The two build jobs never publish anything themselves: a release with half its assets, or two
-# SHA256SUMS files disagreeing about what the release contains, is worse than no release.
+# The build jobs upload artifacts and publish nothing, so one checksum file covers both assets
+# and a failed platform cannot leave a half-populated release behind.
 #
 # Opens the release as a draft: nothing is publicly visible until reviewed and published.
 # Flip `--draft` below to publish straight away.
@@ -105,8 +105,8 @@ jobs:
       # imports VCRUNTIME140.dll (ships with the VC++ Redistributable, not with Windows itself),
       # so a fresh install without it gets a missing-DLL dialog. +crt-static links the runtime in
       # instead; the api-ms-win-crt-* imports are the Universal CRT and are part of Windows 10+.
-      # Scoped to this JOB: the same flag against glibc produces a binary whose DNS and user
-      # lookups break, so the linux job must not inherit it.
+      # Job-scoped: the same flag against glibc breaks NSS (DNS and user lookups), so the linux
+      # job must not inherit it.
       RUSTFLAGS: -C target-feature=+crt-static
     steps:
       - uses: actions/checkout@v7
@@ -185,11 +185,10 @@ jobs:
   linux:
     name: linux x86_64
     needs: preflight
-    # ubuntu-22.04, deliberately, NOT ubuntu-latest: a glibc binary runs on the glibc it was
-    # built against or newer, never older. 22.04 ships glibc 2.35, which covers every currently
-    # supported Ubuntu/Debian/Fedora; building on 24.04 (2.39) would refuse to start on a 22.04
-    # desktop for no gain. A musl build would drop the floor entirely, but it also drops
-    # `dlopen`, which the audio and X11 layers will want when they land.
+    # ubuntu-22.04, not ubuntu-latest: a glibc binary runs on the glibc it was built against or
+    # newer, never older. 22.04 ships glibc 2.35, the floor this ships against; 24.04's 2.39
+    # would refuse to start on a 22.04 desktop. musl would drop the floor further but also drops
+    # `dlopen`, which the audio and X11 layers need.
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     steps:
@@ -209,9 +208,8 @@ jobs:
         shell: pwsh
         run: ./validate.ps1
 
-      # Only the CLI. neuron-app compiles here, but its tray, overlays and input synthesis are
-      # inert stubs off windows, so shipping it would be shipping a window that does nothing.
-      # The CLI is the whole device layer, and on linux it is the product.
+      # CLI only: neuron-app compiles here, but its tray, overlays and input synthesis are inert
+      # stubs off windows.
       - name: build
         run: cargo build --release -p neuron-cli --locked
 

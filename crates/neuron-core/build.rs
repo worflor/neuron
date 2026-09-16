@@ -45,11 +45,10 @@ fn main() {
         ),
     };
 
-    // `install_only_stripped`, not `install_only`: PBS ships the same tree with debug symbols
-    // removed, for every triple we map. It is the only thing that makes the UNIX bundles sane —
-    // upstream Linux carries its debug info INSIDE the ELF binaries (`libpython3.12.so.1.0` alone is
-    // 218 MB unstripped, 32 MB stripped), where Windows parks it in sibling `.pdb` files that the
-    // prune list can simply drop. Linux: 111 MB → 34 MB before we prune a single path.
+    // `install_only_stripped`, not `install_only`: the same tree with debug symbols removed,
+    // published for every triple we map. Unix carries its debug info inside the ELF binaries
+    // (`libpython3.12.so.1.0` is 218 MB unstripped, 32 MB stripped), where no path-based prune
+    // list can reach it; Windows parks it in sibling `.pdb` files the prune list drops.
     let asset = format!("cpython-{PYVER}+{TAG}-{triple}-install_only_stripped.tar.gz");
     let cache_dir = repo_vendor_cache();
     std::fs::create_dir_all(&cache_dir)
@@ -208,8 +207,8 @@ fn slim_tarball(src: &Path, dest: &Path) {
 ///
 /// python-build-standalone lays the stdlib out differently per platform — `python/Lib/…` on
 /// Windows, `python/lib/python3.12/…` everywhere else — so the stdlib rules are expressed as names
-/// RELATIVE to the stdlib root that [`stdlib_rel`] finds, rather than as literal path fragments.
-/// A Windows-shaped `/Lib/…` list silently pruned nothing at all on Linux.
+/// relative to the stdlib root that [`stdlib_rel`] finds, not as literal path fragments. A literal
+/// `/Lib/…` fragment matches nothing off Windows, and prunes nothing, silently.
 ///
 /// Drops, and ONLY these (the prune list):
 ///   * `*.pdb`                  — Windows debug symbols (~82 MB), useless at runtime
@@ -267,7 +266,7 @@ fn should_prune(raw_path: &str) -> bool {
     false
 }
 
-/// The part of `p` BELOW the CPython stdlib root, if `p` is inside one. `/`-normalized input.
+/// The part of `p` below the CPython stdlib root, if `p` is inside one. `/`-normalized input.
 ///
 /// Two layouts, both anchored at the tarball's `python/` prefix:
 ///   * Windows — `python/Lib/<rel>`

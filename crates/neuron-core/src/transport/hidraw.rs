@@ -97,6 +97,24 @@ fn is_disconnect(errno: i32) -> bool {
     errno == libc::ENODEV || errno == libc::EPIPE
 }
 
+/// Run a syscall, retrying while it fails with `EINTR`; returns its non-negative result or the
+/// failing error. The feature ioctls and an output write block for the length of a USB control
+/// transfer, so a signal delivered in that window (a timer, SIGCHLD, a terminal resize) would
+/// otherwise surface as a failed device write for a request the device would have serviced.
+/// Unlike [`poll_read`], these carry no deadline, so retrying cannot extend a caller's timeout.
+fn retry_eintr(mut call: impl FnMut() -> isize) -> std::result::Result<isize, std::io::Error> {
+    loop {
+        let ret = call();
+        if ret >= 0 {
+            return Ok(ret);
+        }
+        let err = last_os_error();
+        if errno_of(&err) != libc::EINTR {
+            return Err(err);
+        }
+    }
+}
+
 // ── sysfs enumeration ──────────────────────────────────────────────────────────────────────────
 
 /// Parse a `hidraw*/device/uevent` file's `HID_ID=bus:vendor:product` line (hex, each field 4-8
@@ -337,9 +355,8 @@ impl Transport for HidRaw {
 
     fn set_feature(&self, buf: &[u8]) -> Result<()> {
         let req = feature_ioctl(HIDIOCSFEATURE_NR, buf.len());
-        let ret = unsafe { libc::ioctl(self.fd, req as _, buf.as_ptr()) };
-        if ret < 0 {
-            let err = last_os_error();
+        let ret = retry_eintr(|| unsafe { libc::ioctl(self.fd, req as _, buf.as_ptr()) } as isize);
+        if let Err(err) = ret {
             if is_disconnect(errno_of(&err)) {
                 bail!("device disconnected: {err}");
             }
@@ -350,28 +367,30 @@ impl Transport for HidRaw {
 
     fn get_feature(&self, buf: &mut [u8]) -> Result<usize> {
         let req = feature_ioctl(HIDIOCGFEATURE_NR, buf.len());
-        let ret = unsafe { libc::ioctl(self.fd, req as _, buf.as_mut_ptr()) };
-        if ret < 0 {
-            let err = last_os_error();
-            if is_disconnect(errno_of(&err)) {
-                bail!("device disconnected: {err}");
+        let ret = match retry_eintr(|| unsafe { libc::ioctl(self.fd, req as _, buf.as_mut_ptr()) } as isize) {
+            Ok(n) => n,
+            Err(err) => {
+                if is_disconnect(errno_of(&err)) {
+                    bail!("device disconnected: {err}");
+                }
+                bail!("HIDIOCGFEATURE failed: {err}");
             }
-            bail!("HIDIOCGFEATURE failed: {err}");
-        }
+        };
         // The hidraw driver's GFEATURE ioctl returns the number of bytes actually transferred —
         // the real short-read count, same contract as `HidD_GetFeature`'s length on Windows.
         Ok(ret as usize)
     }
 
     fn write_output(&self, buf: &[u8]) -> Result<()> {
-        let n = unsafe { libc::write(self.fd, buf.as_ptr().cast(), buf.len()) };
-        if n < 0 {
-            let err = last_os_error();
-            if is_disconnect(errno_of(&err)) {
-                bail!("device disconnected: {err}");
+        let n = match retry_eintr(|| unsafe { libc::write(self.fd, buf.as_ptr().cast(), buf.len()) }) {
+            Ok(n) => n,
+            Err(err) => {
+                if is_disconnect(errno_of(&err)) {
+                    bail!("device disconnected: {err}");
+                }
+                bail!("write(2) (output report) failed: {err}");
             }
-            bail!("write(2) (output report) failed: {err}");
-        }
+        };
         // An output report is a single fixed-size frame — a real HID device never accepts a
         // partial one, so a short write here means the report did NOT land as sent. `write(2)` on
         // a character device can return fewer bytes than requested without erroring; trust the
@@ -386,7 +405,7 @@ impl Transport for HidRaw {
         // Request/reply contract: a timeout here IS the caller's answer, not a spurious wakeup to
         // loop past — so `poll_read`'s `Ok(None)` becomes an honest error, mirroring
         // `WinHid::read_input`.
-        match poll_read(self.fd, buf, timeout_ms as i32)? {
+        match poll_read(self.fd, buf, timeout_ms.min(i32::MAX as u32) as i32)? {
             Some(n) => Ok(n),
             None => bail!("read_input timed out after {timeout_ms} ms"),
         }
@@ -525,6 +544,38 @@ impl Drop for OsWireFlock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A feature ioctl blocks for a whole USB control transfer, so an interrupting signal must not
+    /// surface as a failed device write. Drives the retry with a caller-set errno rather than a
+    /// real signal, so the test is deterministic.
+    #[test]
+    fn retry_eintr_retries_only_while_the_errno_is_eintr() {
+        let mut calls = 0;
+        let out = retry_eintr(|| {
+            calls += 1;
+            unsafe { *libc::__errno_location() = libc::EINTR };
+            if calls < 3 {
+                -1
+            } else {
+                7
+            }
+        });
+        assert_eq!(out.ok(), Some(7), "retries past EINTR and returns the eventual result");
+        assert_eq!(calls, 3);
+
+        let mut calls = 0;
+        let out = retry_eintr(|| {
+            calls += 1;
+            unsafe { *libc::__errno_location() = libc::EIO };
+            -1
+        });
+        assert_eq!(
+            out.err().and_then(|e| e.raw_os_error()),
+            Some(libc::EIO),
+            "any other errno is returned, not retried"
+        );
+        assert_eq!(calls, 1);
+    }
 
     // ── pure parsing ───────────────────────────────────────────────────────────────────────────
 
