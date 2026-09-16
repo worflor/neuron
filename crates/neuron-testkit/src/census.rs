@@ -150,85 +150,24 @@ pub fn settle(deadline: Duration) -> Census {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, PoisonError};
-    use windows_sys::Win32::Foundation::HANDLE;
-    use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject, INFINITE};
 
-    // `cargo test` runs a binary's tests on multiple threads, but a Census reads whole-process
-    // state, so racing tests would see each other's threads/handles as unexplained drift.
-    // Serializes only the tests in this module; see `neuron-host/tests/churn.rs` for the same
-    // pattern applied to a whole dedicated test binary.
-    static LOCK: Mutex<()> = Mutex::new(());
-
+    /// The comparison itself, on hand-built samples: growth past slack fails, growth within it
+    /// passes, and shrinkage is never a leak. Deterministic — it samples no process state, so it
+    /// cannot be confused by whatever else the test binary is doing.
+    ///
+    /// The live counterpart, which leaks a real thread and watches this fire, is
+    /// `tests/census_live.rs`: it needs a test binary to itself.
     #[test]
-    fn spawn_and_join_threads_converges() {
-        let _guard = LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-        let baseline = settle(Duration::from_secs(2));
-        let handles: Vec<_> = (0..16)
-            .map(|_| std::thread::spawn(|| std::thread::sleep(Duration::from_millis(5))))
-            .collect();
-        for h in handles {
-            h.join().expect("join spawned thread");
-        }
-        let post = settle(Duration::from_secs(2));
-        assert_converges(baseline, post, CensusTolerance::default(), "spawn_and_join_threads");
-    }
+    fn growth_past_slack_fails_and_shrinkage_never_does() {
+        let tol = CensusTolerance { threads_slack: 1, handles_slack: 8 };
+        let census = |threads, handles| Census { threads, handles };
+        let fails = |a: Census, b: Census| {
+            std::panic::catch_unwind(move || assert_converges(a, b, tol, "unit")).is_err()
+        };
 
-    #[test]
-    fn open_and_close_events_converges() {
-        let _guard = LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-        let baseline = settle(Duration::from_secs(2));
-        for _ in 0..32 {
-            let h: HANDLE = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
-            assert!(!h.is_null(), "CreateEventW failed");
-            unsafe { CloseHandle(h) };
-        }
-        let post = settle(Duration::from_secs(2));
-        assert_converges(baseline, post, CensusTolerance::default(), "open_and_close_events");
-    }
-
-    /// Proves the detector actually detects: leak a thread genuinely blocked (not merely
-    /// forgotten-but-finished) on a never-signaled event, show `assert_converges` fails via
-    /// `catch_unwind`, then signal the event so the thread exits before the test ends.
-    #[test]
-    fn assert_converges_catches_a_leaked_thread() {
-        let _guard = LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-        let baseline = settle(Duration::from_secs(2));
-
-        let ev: HANDLE = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
-        assert!(!ev.is_null(), "CreateEventW failed");
-        // HANDLE (a raw pointer type) is not Send; smuggle it across the thread boundary as an
-        // integer: it's an opaque OS handle, never dereferenced as memory, so this is sound.
-        //
-        // Leak three threads, not one: the default tolerance allows growth of 1, so a single
-        // leaked thread sits exactly on the slack boundary and the detector stays silent. All
-        // three park on one manual-reset event, so the single SetEvent below releases all of them.
-        let ev_addr = ev as usize;
-        for _ in 0..3 {
-            let leaker = std::thread::spawn(move || {
-                let ev = ev_addr as HANDLE;
-                unsafe { WaitForSingleObject(ev, INFINITE) };
-            });
-            // No JoinHandle survives past this point — a genuine dangling thread, not a
-            // detached-but-already-finished one.
-            std::mem::forget(leaker);
-        }
-
-        // Give the leaked thread a moment to actually reach the wait before sampling it.
-        std::thread::sleep(Duration::from_millis(50));
-        let post = Census::now();
-
-        let result = std::panic::catch_unwind(|| {
-            assert_converges(baseline, post, CensusTolerance::default(), "leaked_thread");
-        });
-        assert!(result.is_err(), "assert_converges must fail on a genuinely leaked thread");
-
-        // Release the leaked thread and wait for the census to reflect it (still holding LOCK)
-        // before returning, so the next test's baseline isn't sampled mid-teardown.
-        unsafe {
-            SetEvent(ev);
-            CloseHandle(ev);
-        }
-        let _ = settle(Duration::from_secs(2));
+        assert!(!fails(census(10, 100), census(11, 108)), "growth exactly at slack is allowed");
+        assert!(fails(census(10, 100), census(12, 100)), "one thread past slack is a leak");
+        assert!(fails(census(10, 100), census(10, 109)), "one handle past slack is a leak");
+        assert!(!fails(census(10, 100), census(2, 40)), "shrinkage is not a leak");
     }
 }
