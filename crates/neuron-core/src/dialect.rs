@@ -14,7 +14,7 @@
 use crate::protocol::{reply_status, Report, Status, BUF_LEN};
 use crate::transport::{HidDeviceInfo, Transport};
 use anyhow::{bail, Result};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Razer's USB vendor id — the razer_report bus signature's first half. Canonical home is here
 /// (the dialect that owns the signature); `synth.rs` keeps its own copy until the wave-2
@@ -242,30 +242,8 @@ impl Dialect for RazerDialect {
         let cmd_id = spec_id;
         let out = frame(transaction_id, spec_class, spec_id, size, args);
         t.set_feature(&out)?;
-
-        // Poll on a BACKOFF, not a flat 10ms. Same total budget and the same re-arm cadence as the
-        // 60×10ms loop this replaces, both now expressed in time rather than iteration count, so a
-        // slow wireless link is treated exactly as before. What changes is the floor: a wired
-        // device answers its first poll, and it used to pay 10ms to be asked. Every command in the
-        // app pays that floor, and a settings change is four commands deep behind a UI callback.
-        //
-        // The first wait is not zero on purpose. The device holds its last reply until the next
-        // one lands, so reading before it has answered can hand back the PREVIOUS conversation's
-        // frame — and `reply_status`'s class/id echo cannot catch that when the same getter runs
-        // twice in a row, which is exactly what `verify_getter` does after every write. A settle
-        // delay is what makes the echo check meaningful. 600µs is OpenRazer's own
-        // `razer_send_payload` settle (usleep_range(600, 800)), i.e. the figure the reference
-        // implementation trusts against this hardware.
-        const SETTLE: Duration = Duration::from_micros(600);
-        const MAX_WAIT: Duration = Duration::from_millis(10);
-        const BUDGET: Duration = Duration::from_millis(600); // 60 × 10ms
-        const REARM_EVERY: Duration = Duration::from_millis(120); // every 12th of the old poll
-        let start = Instant::now();
-        let mut wait = SETTLE;
-        let mut next_rearm = start + REARM_EVERY;
-        loop {
-            std::thread::sleep(wait);
-            wait = (wait * 2).min(MAX_WAIT);
+        for i in 0..60 {
+            std::thread::sleep(Duration::from_millis(10));
             let mut b = [0u8; BUF_LEN];
             b[0] = 0x00; // report id for the GET
             // A razer_report reply is a FIXED 91-byte frame: anything shorter is a partial transfer,
@@ -288,14 +266,9 @@ impl Dialect for RazerDialect {
                     }
                 }
             }
-            let now = Instant::now();
-            if now.duration_since(start) >= BUDGET {
-                break;
-            }
-            if now >= next_rearm {
+            if i % 12 == 11 {
                 // re-arm if the device stayed busy (wireless round-trip can be slow)
                 t.set_feature(&out)?;
-                next_rearm = now + REARM_EVERY;
             }
         }
         bail!("timed out waiting for reply to {cmd_class:#04x}/{cmd_id:#04x}")
