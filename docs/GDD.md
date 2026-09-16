@@ -73,7 +73,7 @@ polling covers both the legacy divisor path (1000/500/250/125 Hz) and the hi-res
 
 ### lighting
 
-razer's lighting hardware speaks two dialects, and neuron confirmed both live: the **legacy** keyboard class `0x03` (effect-first, key-grid) and the **matrix** modern class `0x0F` (per-LED). neuron's model covers both. semantics in code, every opcode / matrix dimension / effect-id in device TOML, so a new device is a new file, not a recompile. three things run on that model:
+razer's lighting hardware speaks two dialects, and neuron confirmed both live: the **legacy** keyboard class `0x03` (effect-first, key-grid) and the **matrix** modern class `0x0F` (per-LED). neuron's model covers both. semantics in code, every opcode / matrix dimension / effect-id in device TOML, which the device itself fills in when first seen. three things run on that model:
 
 - **native firmware effects** (off / static / breathing / spectrum / wave / reactive / starlight, where the firmware has them) invoked by their real effect-id byte and run on-device. they survive synapse being uninstalled, and on matrix devices persist to onboard memory.
 - **per-key custom frames** painted at the device's *true* LED count, one report per matrix row, never downsampled. you can paint directly on the device in the GUI.
@@ -248,7 +248,9 @@ neuron discover
 
 point it at any `razer_report` device and it pokes the whole command space (finding the right pipe by vendor id and a 91-byte feature report, wherever it lives) then sorts each reply by its *shape*: an enum, a level, an x/y pair, a table, a string. line two devices up and the pattern falls out: a command they both answer is shared protocol, one only a single device answers is that device's own trick. nothing hardcoded.
 
-it's already fingerprinted a keyboard it had no entry for, and `discover --emit` drops a starter TOML for each unknown device. curated device defs live in the source tree at `crates/neuron-core/devices/`; auto-synthesized ones land in the run root's `devices/auto/` (and a curated file shadows the auto one). adding a device is writing a file, not writing code.
+an unknown razer device adopts itself the first time anything touches it: probed, synthesized, and written to the run root's `devices/auto/razer-<pid>.toml` as a complete def. `neuron adopt` (or `discover --emit`) forces the pass by hand; `adopt --dry-run` prints the TOML instead of writing it.
+
+the file is the memo, not the input — it records what the device answered, and is ordinary editable config from then on. curated defs in `crates/neuron-core/devices/` shadow an auto one, and exist for the few things no getter reveals: a wire-captured command, a side-plate map, a transaction-id era the heuristic guessed wrong.
 
 ## the app
 

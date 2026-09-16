@@ -168,7 +168,7 @@ gui         neuron-app  [--safe · --tray · --purge-synapse · --scan-synapse]
 
 neuron is one person, one desk, one vendor gone deep. that's the point, but it also means a handful of pieces are wide open, and some are shaped so you can own one cleanly without reading the whole tree.
 
-the honest map of what's pickable — a new razer device (a TOML file, not a recompile), a lighting pattern (one registry entry plus a `field()` generator), a preset (pure data, zero code), a neuron-host protocol adapter, or one of the bigger chunks like the linux/mac port — is in **[CONTRIBUTING.md](CONTRIBUTING.md)**, graded by how much groundwork is already done. the board, **[neuron · orbit](https://github.com/users/worflor/projects/1)**, is the front door: anything in *Up for grabs* is blessed and ready to claim.
+the honest map of what's pickable — a device's wire-captured leftovers (scroll stages, side-plate maps), a lighting pattern (one registry entry plus a `field()` generator), a preset (pure data, zero code), a neuron-host protocol adapter, or one of the bigger chunks like the linux/mac port — is in **[CONTRIBUTING.md](CONTRIBUTING.md)**, graded by how much groundwork is already done. the board, **[neuron · orbit](https://github.com/users/worflor/projects/1)**, is the front door: anything in *Up for grabs* is blessed and ready to claim.
 
 new to the tree entirely? **[AGENTS.md](AGENTS.md)** is the fast orientation — the layout, the three hard invariants, and what "verified" has to mean here before you claim it.
 

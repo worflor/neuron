@@ -65,7 +65,8 @@ These come from the project's standing preferences.
    telemetry. No always-on elevated service (that was the literal root of
    CVE-2021-44226). One killable userspace binary.
 
-5. **Capability-driven all the way.** A new device is a TOML, not a code change.
+5. **Capability-driven all the way.** A device describes itself: probed and
+   synthesized at runtime.
    A new protocol is a small codec adapter, not a new subsystem. The UI renders
    from declared capabilities. Point this same philosophy *north* (at protocols)
    that neuron already points *south* (at devices).
