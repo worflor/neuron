@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 // ── helpers ───────────────────────────────────────────────────────────────────────────────────────
 
-/// The markers an effectful verb returns when it did NOTHING. `[disarmed]` is the arm gate; off
+/// The markers an effectful verb returns when it did nothing. `[disarmed]` is the arm gate; off
 /// Windows a verb with no platform implementation (key/click/mouse/clipboard synthesis all route
 /// through `SendInput`) answers `[unsupported]` before the gate is ever reached. Both mean the one
 /// thing this test cares about: nothing left the process.

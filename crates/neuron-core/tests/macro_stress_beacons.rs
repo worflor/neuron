@@ -31,7 +31,7 @@ use std::sync::mpsc::{channel, Receiver};
 use std::time::{Duration, Instant};
 
 /// What `neuron.key` answers when it synthesizes nothing. `[disarmed]` is the arm gate; off Windows
-/// the platform check fires FIRST (there is no `SendInput` to reach) and answers `[unsupported]`.
+/// the platform check runs first (there is no `SendInput` to reach) and answers `[unsupported]`.
 /// Either marker proves the same thing here: no input reached the OS.
 #[cfg(windows)]
 const KEY_NO_OP: &str = "[disarmed]";
