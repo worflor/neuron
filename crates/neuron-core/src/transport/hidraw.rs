@@ -279,10 +279,10 @@ fn enumerate_in(class_root: &Path) -> Result<Vec<HidDeviceInfo>> {
 // ── poll-bounded read, shared by the Transport's read_input and InputReader ──────────────────────
 
 /// One bounded read: `poll(2)` up to `timeout_ms`, then `read(2)`. `Ok(Some(n))` = data, `Ok(None)`
-/// = the wait elapsed with nothing to read (NOT an error), `Err` = a real failure — `ENODEV`/
-/// `EPIPE` (device gone) get an explicit message, anything else the raw OS error. Retries both
-/// `poll` and `read` on `EINTR`, so a caller never sees a signal-interrupted wait as either a
-/// timeout or a failure — a signal must SHORTEN the remaining wait, never restart it, or a request/
+/// = the wait elapsed with nothing to read (not an error), `Err` = a real failure, classified by
+/// [`device_err`] so a removal and a stall read differently. Retries both `poll` and `read` on
+/// `EINTR`, so a caller never sees a signal-interrupted wait as either a timeout or a failure — a
+/// signal must shorten the remaining wait, never restart it, or a request/
 /// reply caller's timeout (its actual answer, not a spurious wakeup — see `read_input`) could be
 /// extended arbitrarily by repeated interruptions.
 fn poll_read(fd: RawFd, buf: &mut [u8], timeout_ms: i32) -> Result<Option<usize>> {
@@ -319,10 +319,7 @@ fn poll_read(fd: RawFd, buf: &mut [u8], timeout_ms: i32) -> Result<Option<usize>
             if errno == libc::EINTR {
                 continue;
             }
-            if is_disconnect(errno) {
-                bail!("device disconnected: {err}");
-            }
-            bail!("read(2) failed: {err}");
+            return Err(device_err("read(2)", &err));
         }
         return Ok(Some(n as usize));
     }

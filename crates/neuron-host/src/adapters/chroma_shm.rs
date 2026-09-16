@@ -756,7 +756,7 @@ pub mod server {
         s.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
-    /// Create one of the server's named mutexes, NEVER taking initial ownership.
+    /// Create one of the server's named mutexes, without taking initial ownership.
     ///
     /// What the capture actually established about these is existence: they are present while the
     /// vendor server runs and absent when it is stopped (the running-vs-stopped object diff). A
@@ -765,7 +765,7 @@ pub mod server {
     /// Ownership is also not what a liveness probe reads. `OpenMutexW` returning a handle is the
     /// probe — that is exactly how [`ShmServer::mask_worn`] checks for a live server — and it
     /// succeeds on an unowned mutex. Taking ownership adds nothing to that signal and takes
-    /// something away: a Win32 mutex is owned by a THREAD, so any OTHER process waiting on it
+    /// something away: a Win32 mutex is owned by a thread, so another process waiting on it
     /// blocks until the owner releases. This server never releases (there is no `ReleaseMutex`
     /// anywhere in the crate), so an owned mutex is an indefinite block for any client that waits
     /// rather than probes. `wear_mask`'s arbitration mutexes already pass 0 for the same reason.
@@ -2008,7 +2008,7 @@ pub mod server {
             }
         }
 
-        /// A client that WAITS on one of the server's mutexes must not block on us. Proven by
+        /// A client that waits on one of the server's mutexes must not block on us. Proven by
         /// waiting from another thread with a zero timeout: on an owned mutex that returns
         /// WAIT_TIMEOUT (ownership is per-thread), on an unowned one it acquires immediately.
         ///
@@ -2016,7 +2016,7 @@ pub mod server {
         /// visibility across sessions, not in ownership semantics.
         #[test]
         fn a_server_mutex_never_blocks_a_waiting_client() {
-            let name = wide(&format!("Local\neuron-shm-mutex-test-{}", std::process::id()));
+            let name = wide(&format!(r"Local\neuron-shm-mutex-test-{}", std::process::id()));
             let h = create_named_mutex(std::ptr::null(), &name);
             assert!(!h.is_null(), "CreateMutexW failed");
 
@@ -2035,7 +2035,8 @@ pub mod server {
             unsafe { CloseHandle(h) };
             assert_eq!(
                 waited, WAIT_OBJECT_0,
-                "another thread must be able to take the mutex; a non-zero result here means we                  created it owned, which blocks a waiting Chroma client indefinitely"
+                "another thread must be able to take the mutex; a non-zero result means we created \
+                 it owned, which blocks a waiting Chroma client indefinitely"
             );
         }
     }

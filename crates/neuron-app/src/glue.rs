@@ -1451,7 +1451,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 // reconcile inside refresh_devices isn't clobbered.
                 app.global::<State>()
                     .set_status_line("devices re-scanned".into());
-                refresh_devices(&app, &sh);
+                spawn_background_scan(&app.as_weak());
             }
         });
     });
@@ -1572,7 +1572,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                     st.set_polling_hz(hz as f32);
                 }
                 st.set_status_line(msg.into());
-                refresh_devices(&app, &sh);
+                spawn_background_scan(&app.as_weak());
             }
         });
     });
@@ -1643,7 +1643,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                     .into(),
                 );
                 // re-seed the rows from the device so the readouts match what was just committed.
-                refresh_devices(&app, &sh);
+                spawn_background_scan(&app.as_weak());
             }
         });
     });
@@ -3550,7 +3550,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                                             s.rt.gaming_mode = policy;
                                         }
                                         refresh_profiles(&app, sh);
-                                        refresh_devices(&app, sh);
+                                        spawn_background_scan(&app.as_weak());
                                         // Restart lighting on the now-freed SELECTED device: the profile's
                                         // stack if it sets one, else the look that was streaming before
                                         // apply — so an empty-lighting profile keeps the current look (not
@@ -7583,7 +7583,7 @@ pub fn refresh_plated_row(app: &AppWindow) {
 /// APPLIED (or provably never will be — every early exit drops it too). At most one scan
 /// result can ever be in flight, so results can't arrive out of order by construction.
 /// Set when a rescan was asked for while one was already in flight. The in-flight scan may have
-/// enumerated BEFORE the write that asked, so its rows can be a version behind; whoever lands a
+/// enumerated before the write that asked, so its rows can be a version behind; whoever lands a
 /// scan checks this and kicks one more. Without it, the refused kick is simply lost and the rows
 /// keep showing the pre-write value until something else happens to rescan.
 static RESCAN_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
