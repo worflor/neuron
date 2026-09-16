@@ -1375,71 +1375,6 @@ pub fn install(app: &AppWindow) -> SharedRt {
     // for adoption probes and vitals reads. `with_shared` (not a captured `sh`) is what lets the
     // hop-back closure reach `AppRuntime` without moving the (`!Send`) `Rc<RefCell<Shared>>`
     // through the spawned thread.
-    /// Kick ONE guarded background hardware scan (worker enumerates + reads off-thread, result
-    /// hops back to the UI thread and lands through the shared `apply_scanned_devices` tail).
-    /// Shared by the ADOPT_WATCH_TIMER tick AND the stale-result re-kick below — one spawn shape,
-    /// so the two callers can't drift. No-op if a scan is already in flight (the one-slot guard).
-    ///
-    /// SLOT LIFETIME = scan lifetime INCLUDING the UI-thread application (review finding,
-    /// 2026-07-09): releasing the slot at scan-end let the 1s timer launch scan B (resolved
-    /// against a pre-adoption registry) while scan A's result still sat in the event-loop queue —
-    /// A's completion would then mark stale and try to re-kick, the re-kick would no-op against
-    /// B's held slot, and B would land LAST with old-registry rows and a clean flag, with the
-    /// timer already stopped by the successful adoption. The RAII `SlotHeld` below closes that:
-    /// the slot travels worker → event-loop closure and releases only when the result has been
-    /// APPLIED (or provably never will be — every early exit drops it too). At most one scan
-    /// result can ever be in flight, so results can't arrive out of order by construction.
-    fn spawn_background_scan(w: &slint::Weak<AppWindow>) {
-        if !crate::runtime::scan_bg_try_start() {
-            return; // a scan from an earlier kick hasn't finished yet
-        }
-        /// Releases the scan slot on drop — whichever exit path runs (worker panic, no result,
-        /// dead event loop, dead window, normal application), the slot can never leak shut.
-        struct SlotHeld;
-        impl Drop for SlotHeld {
-            fn drop(&mut self) {
-                crate::runtime::scan_bg_finish();
-            }
-        }
-        let slot = SlotHeld;
-        let w2 = w.clone();
-        // `slot` rides INSIDE the closure, so its Drop already releases the scan slot on a spawn
-        // refusal (Builder::spawn drops the un-run closure, guard included) exactly as it does on
-        // every in-body exit path below — a genuine fire-and-forget from the primitives' point of
-        // view, nothing else to report.
-        crate::worker::spawn_detached("neuron-glue-scan", move || {
-            let scanned = std::panic::catch_unwind(crate::runtime::scan_hardware);
-            let Ok(Some((infos, devs))) = scanned else {
-                drop(slot); // no result will ever apply — free the slot for the next tick
-                return;
-            };
-            // Hop back to the UI thread to touch Slint state / AppRuntime — neither is
-            // Send, so `with_shared` (the UI-thread-local set up in `install`) replaces
-            // moving `sh` into this worker. The slot rides INSIDE the closure: if the event
-            // loop is gone (Err) or the window died, the dropped closure releases it.
-            let _ = slint::invoke_from_event_loop(move || {
-                let slot = slot;
-                let Some(app) = w2.upgrade() else { return };
-                let w3 = app.as_weak();
-                with_shared(move |sh| {
-                    let (rows, stale) = sh.borrow_mut().rt.finish_background_scan(infos, devs);
-                    apply_scanned_devices(&app, sh, rows);
-                    // STALE: an adoption finished while this scan was in flight — the rows just
-                    // applied were resolved against the pre-adoption registry and may omit the
-                    // new device. The timer can NOT be trusted to correct this (the successful
-                    // adoption is what clears `adoption_pending()`, stopping the timer), so
-                    // answer it here with one more guarded scan against the now-fresh registry.
-                    // Release-then-claim is safe: this closure runs ON the UI thread, the same
-                    // thread the timer tick runs on — nothing can interleave between the drop
-                    // and the re-kick's try_start.
-                    if stale {
-                        drop(slot);
-                        spawn_background_scan(&w3);
-                    }
-                });
-            });
-        });
-    }
     {
         let w = app.as_weak();
         let sh = shared.clone();
@@ -6761,7 +6696,13 @@ fn perf(w: &slint::Weak<AppWindow>, sh: &SharedRt, op: impl FnOnce(&mut AppRunti
         let st = app.global::<State>();
         st.set_perf_status(msg.clone().into());
         st.set_status_line(msg.into());
-        refresh_devices(&app, sh);
+        // The rows come from a BACKGROUND rescan, not a synchronous one. `refresh_devices` ->
+        // `scan_devices` enumerates and opens every unit, which the timer path already moved
+        // off-thread for exactly this reason; doing it inline here put that same
+        // hundreds-of-ms stall at the end of every device write, on top of the write's own
+        // round-trips. The status line above is already set, so the window stays live and the
+        // rows land a moment later.
+        spawn_background_scan(w);
     }
 }
 
@@ -6781,7 +6722,13 @@ fn status(w: &slint::Weak<AppWindow>, sh: &SharedRt, op: impl FnOnce(&mut AppRun
             op(&mut s.rt)
         };
         app.global::<State>().set_status_line(msg.into());
-        refresh_devices(&app, sh);
+        // The rows come from a BACKGROUND rescan, not a synchronous one. `refresh_devices` ->
+        // `scan_devices` enumerates and opens every unit, which the timer path already moved
+        // off-thread for exactly this reason; doing it inline here put that same
+        // hundreds-of-ms stall at the end of every device write, on top of the write's own
+        // round-trips. The status line above is already set, so the window stays live and the
+        // rows land a moment later.
+        spawn_background_scan(w);
     }
 }
 
@@ -7619,6 +7566,81 @@ pub fn refresh_plated_row(app: &AppWindow) {
             rows.set_row_data(i, row);
         }
     }
+}
+
+/// Kick ONE guarded background hardware scan (worker enumerates + reads off-thread, result
+/// hops back to the UI thread and lands through the shared `apply_scanned_devices` tail).
+/// Shared by the ADOPT_WATCH_TIMER tick AND the stale-result re-kick below — one spawn shape,
+/// so the two callers can't drift. No-op if a scan is already in flight (the one-slot guard).
+///
+/// SLOT LIFETIME = scan lifetime INCLUDING the UI-thread application (review finding,
+/// 2026-07-09): releasing the slot at scan-end let the 1s timer launch scan B (resolved
+/// against a pre-adoption registry) while scan A's result still sat in the event-loop queue —
+/// A's completion would then mark stale and try to re-kick, the re-kick would no-op against
+/// B's held slot, and B would land LAST with old-registry rows and a clean flag, with the
+/// timer already stopped by the successful adoption. The RAII `SlotHeld` below closes that:
+/// the slot travels worker → event-loop closure and releases only when the result has been
+/// APPLIED (or provably never will be — every early exit drops it too). At most one scan
+/// result can ever be in flight, so results can't arrive out of order by construction.
+/// Set when a rescan was asked for while one was already in flight. The in-flight scan may have
+/// enumerated BEFORE the write that asked, so its rows can be a version behind; whoever lands a
+/// scan checks this and kicks one more. Without it, the refused kick is simply lost and the rows
+/// keep showing the pre-write value until something else happens to rescan.
+static RESCAN_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn spawn_background_scan(w: &slint::Weak<AppWindow>) {
+    if !crate::runtime::scan_bg_try_start() {
+        // Don't drop it — record it, so the in-flight scan re-kicks when it lands.
+        RESCAN_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+        return;
+    }
+    /// Releases the scan slot on drop — whichever exit path runs (worker panic, no result,
+    /// dead event loop, dead window, normal application), the slot can never leak shut.
+    struct SlotHeld;
+    impl Drop for SlotHeld {
+        fn drop(&mut self) {
+            crate::runtime::scan_bg_finish();
+        }
+    }
+    let slot = SlotHeld;
+    let w2 = w.clone();
+    // `slot` rides INSIDE the closure, so its Drop already releases the scan slot on a spawn
+    // refusal (Builder::spawn drops the un-run closure, guard included) exactly as it does on
+    // every in-body exit path below — a genuine fire-and-forget from the primitives' point of
+    // view, nothing else to report.
+    crate::worker::spawn_detached("neuron-glue-scan", move || {
+        let scanned = std::panic::catch_unwind(crate::runtime::scan_hardware);
+        let Ok(Some((infos, devs))) = scanned else {
+            drop(slot); // no result will ever apply — free the slot for the next tick
+            return;
+        };
+        // Hop back to the UI thread to touch Slint state / AppRuntime — neither is
+        // Send, so `with_shared` (the UI-thread-local set up in `install`) replaces
+        // moving `sh` into this worker. The slot rides INSIDE the closure: if the event
+        // loop is gone (Err) or the window died, the dropped closure releases it.
+        let _ = slint::invoke_from_event_loop(move || {
+            let slot = slot;
+            let Some(app) = w2.upgrade() else { return };
+            let w3 = app.as_weak();
+            with_shared(move |sh| {
+                let (rows, stale) = sh.borrow_mut().rt.finish_background_scan(infos, devs);
+                apply_scanned_devices(&app, sh, rows);
+                // STALE: an adoption finished while this scan was in flight — the rows just
+                // applied were resolved against the pre-adoption registry and may omit the
+                // new device. The timer can NOT be trusted to correct this (the successful
+                // adoption is what clears `adoption_pending()`, stopping the timer), so
+                // answer it here with one more guarded scan against the now-fresh registry.
+                // Release-then-claim is safe: this closure runs ON the UI thread, the same
+                // thread the timer tick runs on — nothing can interleave between the drop
+                // and the re-kick's try_start.
+                let asked_again = RESCAN_REQUESTED.swap(false, std::sync::atomic::Ordering::SeqCst);
+                if stale || asked_again {
+                    drop(slot);
+                    spawn_background_scan(&w3);
+                }
+            });
+        });
+    });
 }
 
 pub fn refresh_devices(app: &AppWindow, sh: &SharedRt) {
