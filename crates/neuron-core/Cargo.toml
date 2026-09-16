@@ -86,9 +86,10 @@ dirs = "6"
 # `ureq` is a small blocking HTTP client (rustls, no OpenSSL); `sha2` checks the download
 # against the release's SHA256SUMS manifest. Neither ships in the final binary.
 #
-# `tar` + `flate2` are reused from [dependencies] to stream-slim the upstream install_only
-# tarball at build time (drop debug symbols, pip/ensurepip/venv, test suite, idlelib/lib2to3/
-# turtledemo, __pycache__ dupes) before embedding it. Adds no new crate to the graph.
+# `tar` + `flate2` are reused from [dependencies] to stream-slim the upstream
+# install_only_stripped tarball at build time (drop pip/ensurepip/venv, test suite, idlelib/
+# lib2to3/turtledemo, C headers, __pycache__ dupes) before embedding it. Adds no new crate to
+# the graph.
 [build-dependencies]
 ureq = "3"
 sha2 = "0.10"

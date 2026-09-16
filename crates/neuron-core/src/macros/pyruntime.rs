@@ -229,14 +229,23 @@ mod tests {
     #[test]
     fn embedded_tarball_is_nonempty() {
         // include_bytes! of the build.rs-SLIMMED tarball must be substantial (a real CPython, just
-        // with the .pdb/pip/test/__pycache__ weight stripped — ~15-20 MB compressed vs the ~44 MB
-        // upstream). Floor guards a corrupt/empty embed; the ceiling proves slimming actually ran
-        // (an un-slimmed bundle is ~44 MB).
+        // with the pip/ensurepip/headers/__pycache__ weight dropped). The floor guards a
+        // corrupt/empty embed; the ceiling catches an embed that skipped slimming entirely.
+        //
+        // The ceiling is per-platform because the upstreams are: PBS's `install_only_stripped` is
+        // ~22 MB for windows-msvc and ~34 MB for linux-gnu (unix keeps a 32 MB `libpython*.so`
+        // and a 31 MB interpreter that Windows splits into DLL + pruned `.pdb`). Measured slims:
+        // ~13.7 MB Windows, ~29 MB Linux. Size alone is a coarse signal — the real proof that the
+        // prune list bit is `slim_tarball_keeps_essentials_drops_prune_list` below.
+        #[cfg(windows)]
+        const CEILING: usize = 20_000_000;
+        #[cfg(not(windows))]
+        const CEILING: usize = 32_000_000;
         let n = PY_TARBALL.len();
         assert!(n > 10_000_000, "embedded python tarball looks too small: {n} bytes");
         assert!(
-            n < 35_000_000,
-            "embedded python tarball looks un-slimmed ({n} bytes; upstream is ~44 MB)"
+            n < CEILING,
+            "embedded python tarball looks un-slimmed ({n} bytes; ceiling {CEILING})"
         );
     }
 
@@ -280,7 +289,13 @@ mod tests {
             let lp = p.to_ascii_lowercase();
             assert!(!lp.ends_with(".pdb"), "slim tarball still has debug symbols: {p}");
             assert!(!lp.contains("ensurepip"), "slim tarball still has ensurepip: {p}");
-            assert!(!lp.contains("/lib/test/"), "slim tarball still has the test suite: {p}");
+            // The stdlib root is `python/Lib/` on Windows and `python/lib/python3.12/` elsewhere,
+            // so match the regression suite in both layouts (a `/lib/test/`-only check passed on
+            // Linux for the wrong reason).
+            assert!(
+                !lp.contains("/lib/test/") && !lp.contains("/python3.12/test/"),
+                "slim tarball still has the test suite: {p}"
+            );
             assert!(
                 !lp.contains("/site-packages/pip"),
                 "slim tarball still has pip: {p}"

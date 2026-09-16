@@ -6,13 +6,14 @@
 //! Build script: BUNDLE a private CPython into `neuron`.
 //!
 //! It maps the Cargo build TARGET to a `python-build-standalone` (PBS) release triple, makes sure a
-//! verified copy of that triple's `install_only` tarball lives in `<repo>/vendor/pbs-cache/`
+//! verified copy of that triple's `install_only_stripped` tarball lives in `<repo>/vendor/pbs-cache/`
 //! (downloading + sha256-checking it on a cache miss), and exports the cached tarball's path so the
 //! crate can `include_bytes!` it (see `src/macros/pyruntime.rs`). The interpreter is then unpacked
 //! into the user's data dir at runtime — no system Python, no env-var hacks.
 //!
-//! GROUND TRUTH (pinned): PBS release tag `20260610`, CPython `3.12.13`, variant `install_only`.
-//! Asset:  cpython-<PYVER>+<TAG>-<TRIPLE>-install_only.tar.gz
+//! GROUND TRUTH (pinned): PBS release tag `20260610`, CPython `3.12.13`, variant
+//! `install_only_stripped`.
+//! Asset:  cpython-<PYVER>+<TAG>-<TRIPLE>-install_only_stripped.tar.gz
 //! URL:    https://github.com/astral-sh/python-build-standalone/releases/download/<TAG>/<asset>
 //!         (the literal `+` in the asset name is `%2B` in the URL).
 //! Integrity: this release ships ONE `SHA256SUMS` manifest (NOT per-asset `.sha256` siblings —
@@ -44,7 +45,12 @@ fn main() {
         ),
     };
 
-    let asset = format!("cpython-{PYVER}+{TAG}-{triple}-install_only.tar.gz");
+    // `install_only_stripped`, not `install_only`: PBS ships the same tree with debug symbols
+    // removed, for every triple we map. It is the only thing that makes the UNIX bundles sane —
+    // upstream Linux carries its debug info INSIDE the ELF binaries (`libpython3.12.so.1.0` alone is
+    // 218 MB unstripped, 32 MB stripped), where Windows parks it in sibling `.pdb` files that the
+    // prune list can simply drop. Linux: 111 MB → 34 MB before we prune a single path.
+    let asset = format!("cpython-{PYVER}+{TAG}-{triple}-install_only_stripped.tar.gz");
     let cache_dir = repo_vendor_cache();
     std::fs::create_dir_all(&cache_dir)
         .unwrap_or_else(|e| panic!("create pbs cache dir {}: {e}", cache_dir.display()));
@@ -198,18 +204,25 @@ fn slim_tarball(src: &Path, dest: &Path) {
 }
 
 /// Decide whether a tar entry should be DROPPED from the slim interpreter. KEEP everything this
-/// doesn't reject (when unsure, keep). The path is normalized `\`→`/` first; the directory patterns
-/// match python-build-standalone's layout (`python/Lib/…`, `python/Lib/site-packages/…`).
+/// doesn't reject (when unsure, keep). The path is normalized `\`→`/` first.
+///
+/// python-build-standalone lays the stdlib out differently per platform — `python/Lib/…` on
+/// Windows, `python/lib/python3.12/…` everywhere else — so the stdlib rules are expressed as names
+/// RELATIVE to the stdlib root that [`stdlib_rel`] finds, rather than as literal path fragments.
+/// A Windows-shaped `/Lib/…` list silently pruned nothing at all on Linux.
 ///
 /// Drops, and ONLY these (the prune list):
-///   * `*.pdb`                  — debug symbols (~82 MB), useless at runtime
+///   * `*.pdb`                  — Windows debug symbols (~82 MB), useless at runtime
 ///   * `*/__pycache__/*`        — byte-compiled dupes; CPython rebuilds .pyc on first import
-///   * `*/Lib/test/*`           — the CPython regression suite (KEEP `/Lib/unittest/`)
-///   * `*/Lib/idlelib/*`        — the IDLE editor
-///   * `*/Lib/lib2to3/*`        — the py2→3 fixers
-///   * `*/Lib/ensurepip/*`      — the pip bootstrapper
-///   * `*/Lib/venv/*`           — the venv builder
-///   * `*/Lib/turtledemo/*`     — turtle DEMOS (KEEP `/Lib/turtle.py` + tkinter/tcl)
+///   * `<stdlib>/test/*`        — the CPython regression suite (KEEP `<stdlib>/unittest/`)
+///   * `<stdlib>/idlelib/*`     — the IDLE editor
+///   * `<stdlib>/lib2to3/*`     — the py2→3 fixers
+///   * `<stdlib>/ensurepip/*`   — the pip bootstrapper (and its bundled ~1.8 MB wheel)
+///   * `<stdlib>/venv/*`        — the venv builder
+///   * `<stdlib>/turtledemo/*`  — turtle DEMOS (KEEP `<stdlib>/turtle.py` + tkinter/tcl)
+///   * `<stdlib>/config-*/*`    — the unix build config (Makefile, `libpython*.a`); only ever used
+///     to COMPILE against this interpreter, and nothing we ship compiles C extensions
+///   * `python/include/*`       — the C headers, same reason
 ///   * `*/site-packages/{pip,setuptools,pkg_resources,_distutils_hack}*` — packaging machinery
 ///     (the prefix also catches the matching `*.dist-info` dirs, e.g. `pip-26.1.2.dist-info`)
 fn should_prune(raw_path: &str) -> bool {
@@ -221,16 +234,26 @@ fn should_prune(raw_path: &str) -> bool {
     if p.contains("/__pycache__/") {
         return true;
     }
-    const STDLIB_DROP: [&str; 6] = [
-        "/Lib/test/",
-        "/Lib/idlelib/",
-        "/Lib/lib2to3/",
-        "/Lib/ensurepip/",
-        "/Lib/venv/",
-        "/Lib/turtledemo/",
-    ];
-    if STDLIB_DROP.iter().any(|s| p.contains(s)) {
+    if p.starts_with("python/include/") {
         return true;
+    }
+    if let Some(rel) = stdlib_rel(&p) {
+        const STDLIB_DROP: [&str; 6] = [
+            "test/",
+            "idlelib/",
+            "lib2to3/",
+            "ensurepip/",
+            "venv/",
+            "turtledemo/",
+        ];
+        if STDLIB_DROP.iter().any(|s| rel.starts_with(s)) {
+            return true;
+        }
+        // `config-3.12-x86_64-linux-gnu/` and friends — the name carries the platform, so match the
+        // prefix rather than enumerating triples.
+        if rel.starts_with("config-") {
+            return true;
+        }
     }
     const SITE_DROP: [&str; 4] = [
         "/site-packages/pip",
@@ -242,6 +265,24 @@ fn should_prune(raw_path: &str) -> bool {
         return true;
     }
     false
+}
+
+/// The part of `p` BELOW the CPython stdlib root, if `p` is inside one. `/`-normalized input.
+///
+/// Two layouts, both anchored at the tarball's `python/` prefix:
+///   * Windows — `python/Lib/<rel>`
+///   * unix    — `python/lib/python3.12/<rel>` (the version is read from the path, not assumed)
+///
+/// The unix arm deliberately requires the `python3.` segment: `python/lib/` also holds
+/// `libpython3.12.so`, `libtcl9.0.so` and the tcl data dirs, none of which are stdlib and none of
+/// which the stdlib rules should ever reach. Pure + total → unit-testable (see `tests` below).
+fn stdlib_rel(p: &str) -> Option<&str> {
+    if let Some(rel) = p.strip_prefix("python/Lib/") {
+        return Some(rel);
+    }
+    let rest = p.strip_prefix("python/lib/")?;
+    let (dir, rel) = rest.split_once('/')?;
+    dir.starts_with("python3.").then_some(rel)
 }
 
 /// Map a Cargo/Rust target triple to the python-build-standalone release triple.
@@ -412,5 +453,61 @@ mod tests {
     #[test]
     fn hex_is_lowercase_and_padded() {
         assert_eq!(hex(&[0x00, 0x0f, 0xff, 0xa0]), "000fffa0");
+    }
+
+    #[test]
+    fn stdlib_rel_finds_both_layouts() {
+        assert_eq!(stdlib_rel("python/Lib/encodings/utf_8.py"), Some("encodings/utf_8.py"));
+        assert_eq!(
+            stdlib_rel("python/lib/python3.12/encodings/utf_8.py"),
+            Some("encodings/utf_8.py")
+        );
+        // `python/lib/` is NOT the stdlib on unix — the shared libs and tcl data live there too.
+        assert_eq!(stdlib_rel("python/lib/libpython3.12.so.1.0"), None);
+        assert_eq!(stdlib_rel("python/lib/tcl9.0/encoding/cp936.enc"), None);
+        assert_eq!(stdlib_rel("python/bin/python3.12"), None);
+    }
+
+    /// The prune list must bite IDENTICALLY on both layouts. It once read `/Lib/ensurepip/` only,
+    /// which matched nothing on Linux and quietly shipped an un-slimmed interpreter.
+    #[test]
+    fn prune_list_is_layout_symmetric() {
+        for stdlib in ["python/Lib", "python/lib/python3.12"] {
+            for drop in [
+                "test/test_os.py",
+                "idlelib/idle.py",
+                "lib2to3/refactor.py",
+                "ensurepip/_bundled/pip-25.0.1-py3-none-any.whl",
+                "venv/__init__.py",
+                "turtledemo/clock.py",
+                "config-3.12-x86_64-linux-gnu/libpython3.12.a",
+            ] {
+                let p = format!("{stdlib}/{drop}");
+                assert!(should_prune(&p), "should have pruned {p}");
+            }
+            for keep in [
+                "unittest/case.py",
+                "turtle.py",
+                "encodings/utf_8.py",
+                "tkinter/__init__.py",
+                "site-packages/README.txt",
+            ] {
+                let p = format!("{stdlib}/{keep}");
+                assert!(!should_prune(&p), "should have KEPT {p}");
+            }
+        }
+    }
+
+    #[test]
+    fn prune_list_covers_the_platform_specific_weight() {
+        assert!(should_prune("python/python312.pdb"));
+        assert!(should_prune("python/Lib/asyncio/__pycache__/base_events.cpython-312.pyc"));
+        assert!(should_prune("python/include/python3.12/Python.h"));
+        assert!(should_prune("python/lib/python3.12/site-packages/pip/__init__.py"));
+        assert!(should_prune("python/lib/python3.12/site-packages/pip-25.0.1.dist-info/RECORD"));
+        // The interpreter itself and its shared library are the whole point of the bundle.
+        assert!(!should_prune("python/bin/python3.12"));
+        assert!(!should_prune("python/lib/libpython3.12.so.1.0"));
+        assert!(!should_prune("python/python.exe"));
     }
 }

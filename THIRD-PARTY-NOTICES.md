@@ -28,18 +28,21 @@ binary itself, so it carries the heaviest distribution obligation in this file.
 `build.rs` (`crates/neuron-core/build.rs`) downloads, sha256-verifies (against
 the release's published `SHA256SUMS` manifest), and caches the source tarball,
 then strips it (`ensure_slim` / `slim_tarball`, dropping `.pdb` symbols,
-`ensurepip`/`pip`/`venv`/`test`/`idlelib`/`lib2to3`/`turtledemo`, and
-`__pycache__`) into the slim tarball that is actually embedded.
+`ensurepip`/`pip`/`venv`/`test`/`idlelib`/`lib2to3`/`turtledemo`, the C headers
+and unix build config, and `__pycache__`) into the slim tarball that is actually
+embedded.
 
 **Exact distribution, pinned:**
 
 - Distributor: [`astral-sh/python-build-standalone`](https://github.com/astral-sh/python-build-standalone) ("PBS")
 - Release tag: `20260610`
 - CPython version: `3.12.13`
-- Variant: `install_only` (the minimal runtime archive; PBS also ships a
-  larger "full"/build archive with a `PYTHON.json` per-component licensing
-  manifest and full build artifacts, but Neuron does not use that variant)
-- Asset name pattern: `cpython-3.12.13+20260610-<triple>-install_only.tar.gz`
+- Variant: `install_only_stripped` (the minimal runtime archive, with debug
+  symbols removed; PBS also ships a larger "full"/build archive with a
+  `PYTHON.json` per-component licensing manifest and full build artifacts, but
+  Neuron does not use that variant)
+- Asset name pattern:
+  `cpython-3.12.13+20260610-<triple>-install_only_stripped.tar.gz`
 - Supported build targets / PBS triples: `x86_64-pc-windows-msvc`,
   `aarch64-pc-windows-msvc`, `x86_64-apple-darwin`, `aarch64-apple-darwin`,
   `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,
@@ -48,9 +51,10 @@ then strips it (`ensure_slim` / `slim_tarball`, dropping `.pdb` symbols,
 ### CPython / PSF license
 
 Python and its documentation are licensed under the Python Software Foundation
-License Version 2. The verbatim license text shipped inside the `install_only`
-tarball at `python/LICENSE.txt` (confirmed present, unpruned, in the slim
-tarball Neuron actually embeds) is reproduced below in full, exactly as
+License Version 2. The verbatim license text shipped inside the
+`install_only_stripped` tarball (at `python/LICENSE.txt` on Windows,
+`python/lib/python3.12/LICENSE.txt` elsewhere; confirmed present, unpruned, in
+the slim tarball Neuron actually embeds) is reproduced below in full, exactly as
 shipped:
 
 ```
@@ -566,7 +570,7 @@ Neuron unpacks at first use.)
 
 ### Other components linked into the bundled interpreter
 
-The `install_only` tarball (unlike PBS's larger "full" archive) does not ship
+The `install_only_stripped` tarball (unlike PBS's larger "full" archive) does not ship
 a `PYTHON.json` per-component licensing manifest. Cargo cannot resolve
 licenses for material that isn't a Rust crate, so the components below were
 identified directly from the tarball's own file listing
@@ -592,7 +596,7 @@ itself. python-build-standalone (the build tooling/project, as distinct from
 the CPython binaries it produces) is itself released under MPL-2.0; Neuron
 does not modify or redistribute that tooling, only its output artifact.
 
-**Resolved.** The `install_only` variant does not carry individual upstream
+**Resolved.** The `install_only_stripped` variant does not carry individual upstream
 LICENSE files for OpenSSL, SQLite, or libffi the way it does for bzip2 and
 Tcl/Tk (those two are folded into `python/LICENSE.txt`), so the required texts
 are reproduced verbatim below from each project's own release, at the version
