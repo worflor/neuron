@@ -600,6 +600,12 @@ mod hidraw;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod hid_descriptor;
 
+// Fixture format + the cross-check that re-parses captured descriptors against Windows' own caps.
+// Compiled everywhere for the same reason hid_descriptor is: the comparison is byte-level, and it
+// is worth running on both CI lanes. Its writers are the `#[ignore]`d capture tests.
+#[cfg_attr(not(test), allow(dead_code))]
+mod parity;
+
 #[cfg(any(test, feature = "mock-transport"))]
 pub mod mock;
 

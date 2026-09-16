@@ -1,0 +1,57 @@
+{
+  "source": "windows-hidp-getcaps",
+  "vid": 5426,
+  "pid": 545,
+  "product": "Razer BlackWidow Chroma V2",
+  "collections": [
+    {
+      "usage_page": 1,
+      "usage": 2,
+      "feature_len": 91,
+      "input_len": 9,
+      "output_len": 0
+    },
+    {
+      "usage_page": 1,
+      "usage": 6,
+      "feature_len": 0,
+      "input_len": 16,
+      "output_len": 0
+    },
+    {
+      "usage_page": 12,
+      "usage": 1,
+      "feature_len": 0,
+      "input_len": 3,
+      "output_len": 0
+    },
+    {
+      "usage_page": 1,
+      "usage": 6,
+      "feature_len": 0,
+      "input_len": 9,
+      "output_len": 2
+    },
+    {
+      "usage_page": 12,
+      "usage": 1,
+      "feature_len": 0,
+      "input_len": 16,
+      "output_len": 0
+    },
+    {
+      "usage_page": 1,
+      "usage": 128,
+      "feature_len": 0,
+      "input_len": 16,
+      "output_len": 0
+    },
+    {
+      "usage_page": 1,
+      "usage": 0,
+      "feature_len": 0,
+      "input_len": 16,
+      "output_len": 0
+    }
+  ]
+}

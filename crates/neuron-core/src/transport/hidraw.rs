@@ -786,6 +786,121 @@ mod tests {
 
     // ── live checkpoint ────────────────────────────────────────────────────────────────────────
 
+    /// Capture the Linux half of a HID parity fixture for every Razer device on this machine: the
+    /// raw report descriptor from sysfs, plus what our parser makes of it. Pairs with the Windows
+    /// half (`transport::windows_hid::tests::capture_parity_fixture`) so
+    /// `transport::parity::tests::parser_agrees_with_windows_caps` can cross-check the two on every
+    /// CI run afterwards, with no device attached.
+    ///
+    /// Reads `/sys` only — it opens no `/dev/hidraw*` node and writes nothing to any device.
+    ///
+    /// `cargo test -p neuron --lib transport::hidraw::tests::capture_parity_fixture -- --ignored --nocapture`
+    #[test]
+    #[ignore = "captures a fixture from the HID devices present on this machine"]
+    fn capture_parity_fixture() {
+        use crate::transport::parity::{encode_hex, Capture};
+        const RAZER: u16 = 0x1532;
+
+        let mut by_pid: std::collections::BTreeMap<u16, Capture> = std::collections::BTreeMap::new();
+        let entries = std::fs::read_dir("/sys/class/hidraw").expect("no /sys/class/hidraw on this machine");
+        for entry in entries.flatten() {
+            let device_dir = entry.path().join("device");
+            let Ok(uevent) = std::fs::read_to_string(device_dir.join("uevent")) else {
+                continue;
+            };
+            let Some((_bus, vid, pid)) = parse_hid_id(&uevent) else {
+                continue;
+            };
+            if vid != RAZER {
+                continue;
+            }
+            let Ok(desc) = std::fs::read(device_dir.join("report_descriptor")) else {
+                continue;
+            };
+            let product = std::fs::canonicalize(entry.path())
+                .ok()
+                .and_then(|p| usb_product_string(&p))
+                .unwrap_or_default();
+
+            let cap = by_pid.entry(pid).or_insert_with(|| Capture {
+                source: "linux-report-descriptor".into(),
+                vid,
+                pid,
+                product: product.clone(),
+                report_descriptor_hex: Some(String::new()),
+                collections: Vec::new(),
+            });
+            if cap.product.is_empty() {
+                cap.product = product;
+            }
+            // One fixture per device, but a device has several hidraw interfaces, each with its own
+            // descriptor. Concatenating them is exactly right for this purpose: descriptors are a
+            // flat item stream, and the parser treats each top-level Application collection
+            // independently, so the parse of the concatenation is the union of the parses — which
+            // is the set Windows enumerates per device.
+            if let Some(hex) = cap.report_descriptor_hex.as_mut() {
+                hex.push_str(&encode_hex(&desc));
+            }
+            println!("{:?}: {} descriptor bytes", entry.path(), desc.len());
+        }
+
+        assert!(!by_pid.is_empty(), "no Razer devices present — nothing to capture");
+        for (pid, cap) in by_pid.iter_mut() {
+            cap.collections = cap.reparse().expect("the captured descriptor re-parses");
+            let path = cap.write("linux").expect("write fixture");
+            println!(
+                "{pid:04x} {:<28} {} collection(s) -> {}",
+                cap.product,
+                cap.collections.len(),
+                path.display()
+            );
+            for c in &cap.collections {
+                println!(
+                    "    {:#06x}/{:#06x}  feature={:<4} input={:<4} output={}",
+                    c.usage_page, c.usage, c.feature_len, c.input_len, c.output_len
+                );
+            }
+        }
+    }
+
+    /// Read one feature report from every Razer collection that declares one, and report the byte
+    /// count the kernel actually transferred. The hardware checkpoint for `HIDIOCGFEATURE`: its
+    /// return value is the real transferred length, and this is where that stops being a claim
+    /// from a header file.
+    ///
+    /// A feature READ, never a write. A device that answers nothing is reported, not failed.
+    ///
+    /// `cargo test -p neuron --lib transport::hidraw::tests::live_feature_read -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs a Razer device present on this machine"]
+    fn live_feature_read() {
+        const RAZER: u16 = 0x1532;
+        let _wire = crate::transport::allow_real_hardware();
+        let devices = crate::transport::enumerate().expect("enumerate");
+        let mut tried = 0;
+        for d in devices.iter().filter(|d| d.vid == RAZER && d.feature_len > 1) {
+            tried += 1;
+            print!(
+                "{:04x}:{:04x} {:#06x}/{:#06x} feature_len={} -> ",
+                d.vid, d.pid, d.usage_page, d.usage, d.feature_len
+            );
+            match crate::transport::open_path(&d.path) {
+                Ok(t) => {
+                    let mut buf = vec![0u8; d.feature_len as usize];
+                    match t.get_feature(&mut buf) {
+                        Ok(n) => println!(
+                            "HIDIOCGFEATURE returned {n} byte(s){}",
+                            if n as u16 == d.feature_len { " (== feature_len)" } else { " (SHORT)" }
+                        ),
+                        Err(e) => println!("get_feature failed: {e}"),
+                    }
+                }
+                Err(e) => println!("open failed: {e}"),
+            }
+        }
+        assert!(tried > 0, "no Razer collection with a feature report — nothing to read");
+    }
+
     /// LIVE enumeration probe: prints what this machine's `enumerate()` sees. For the hardware
     /// checkpoint — run with a real Razer device (or any HID device) plugged into WSL via
     /// `usbipd`/passthrough:

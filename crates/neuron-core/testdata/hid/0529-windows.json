@@ -1,0 +1,29 @@
+{
+  "source": "windows-hidp-getcaps",
+  "vid": 5426,
+  "pid": 1321,
+  "product": "Razer USB Sound Card",
+  "collections": [
+    {
+      "usage_page": 12,
+      "usage": 1,
+      "feature_len": 0,
+      "input_len": 33,
+      "output_len": 37
+    },
+    {
+      "usage_page": 11,
+      "usage": 5,
+      "feature_len": 0,
+      "input_len": 2,
+      "output_len": 2
+    },
+    {
+      "usage_page": 65440,
+      "usage": 1,
+      "feature_len": 41,
+      "input_len": 0,
+      "output_len": 0
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "source": "windows-hidp-getcaps",
+  "vid": 5426,
+  "pid": 1386,
+  "product": "Razer Seiren V3 Mini",
+  "collections": [
+    {
+      "usage_page": 12,
+      "usage": 1,
+      "feature_len": 64,
+      "input_len": 64,
+      "output_len": 64
+    }
+  ]
+}

@@ -640,3 +640,65 @@ impl Transport for WinHid {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::transport::parity::{Capture, Collection};
+
+    /// Capture the Windows half of a HID parity fixture for every Razer device attached to this
+    /// machine: the report lengths `HidP_GetCaps` derives from each device's own descriptor.
+    /// Read-only — it enumerates and reads caps, and writes nothing to any device.
+    ///
+    /// `cargo test -p neuron --lib transport::windows_hid::tests::capture_parity_fixture -- --ignored --nocapture`
+    #[test]
+    #[ignore = "captures a fixture from the HID devices attached to this machine"]
+    fn capture_parity_fixture() {
+        const RAZER: u16 = 0x1532;
+        let _wire = crate::transport::allow_real_hardware();
+        let found = crate::transport::enumerate().expect("enumerate");
+
+        let mut by_pid: std::collections::BTreeMap<u16, Capture> = std::collections::BTreeMap::new();
+        for d in found.into_iter().filter(|d| d.vid == RAZER) {
+            let entry = by_pid.entry(d.pid).or_insert_with(|| Capture {
+                source: "windows-hidp-getcaps".into(),
+                vid: d.vid,
+                pid: d.pid,
+                product: d.product.clone(),
+                report_descriptor_hex: None,
+                collections: Vec::new(),
+            });
+            if entry.product.is_empty() {
+                entry.product = d.product.clone();
+            }
+            let col = Collection {
+                usage_page: d.usage_page,
+                usage: d.usage,
+                feature_len: d.feature_len,
+                input_len: d.input_len,
+                output_len: d.output_len,
+            };
+            // One HID interface per top-level collection on Windows, so a repeated usage pair is
+            // the same collection seen twice, not a second one.
+            if !entry.collections.contains(&col) {
+                entry.collections.push(col);
+            }
+        }
+
+        assert!(!by_pid.is_empty(), "no Razer devices attached — nothing to capture");
+        for (pid, cap) in &by_pid {
+            let path = cap.write("windows").expect("write fixture");
+            println!(
+                "{pid:04x} {:<28} {} collection(s) -> {}",
+                cap.product,
+                cap.collections.len(),
+                path.display()
+            );
+            for c in &cap.collections {
+                println!(
+                    "    {:#06x}/{:#06x}  feature={:<4} input={:<4} output={}",
+                    c.usage_page, c.usage, c.feature_len, c.input_len, c.output_len
+                );
+            }
+        }
+    }
+}

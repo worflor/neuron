@@ -470,72 +470,8 @@ mod tests {
         assert!(caps.is_empty());
     }
 
-    // ── parity fixture harness ────────────────────────────────────────────────────────────────
-
-    #[derive(serde::Deserialize)]
-    struct Fixture {
-        descriptor_hex: String,
-        collections: Vec<FixtureCollection>,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct FixtureCollection {
-        usage_page: u16,
-        usage: u16,
-        feature_len: u16,
-        input_len: u16,
-        output_len: u16,
-    }
-
-    fn decode_hex(s: &str) -> Option<Vec<u8>> {
-        let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
-        if s.len() % 2 != 0 {
-            return None;
-        }
-        (0..s.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
-            .collect()
-    }
-
-    /// Discovers `crates/neuron-core/testdata/hid/*.json`, each holding a real device's report
-    /// descriptor (hex) plus the expected per-collection caps AS REPORTED BY WINDOWS
-    /// (`HidP_GetCaps`), and asserts this parser agrees byte-for-byte. With no fixtures present —
-    /// the state today; real captures from the owner's hardware land later at the hardware
-    /// checkpoint — this passes trivially, same as an empty test list.
-    #[test]
-    fn parity_fixtures_agree_with_windows() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/hid");
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(e) => e,
-            Err(_) => return, // no fixtures directory yet
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            let text = std::fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("reading fixture {path:?}: {e}"));
-            let fixture: Fixture = serde_json::from_str(&text)
-                .unwrap_or_else(|e| panic!("parsing fixture {path:?}: {e}"));
-            let bytes = decode_hex(&fixture.descriptor_hex)
-                .unwrap_or_else(|| panic!("bad descriptor_hex in fixture {path:?}"));
-            let got = parse(&bytes);
-            assert_eq!(
-                got.len(),
-                fixture.collections.len(),
-                "collection count mismatch in {path:?}"
-            );
-            for (i, (g, want)) in got.iter().zip(fixture.collections.iter()).enumerate() {
-                assert_eq!(g.usage_page, want.usage_page, "{path:?} collection {i}: usage_page");
-                assert_eq!(g.usage, want.usage, "{path:?} collection {i}: usage");
-                assert_eq!(g.feature_len, want.feature_len, "{path:?} collection {i}: feature_len");
-                assert_eq!(g.input_len, want.input_len, "{path:?} collection {i}: input_len");
-                assert_eq!(g.output_len, want.output_len, "{path:?} collection {i}: output_len");
-            }
-        }
-    }
+    // The cross-check against Windows HidP_GetCaps lives in `super::parity`, which owns the
+    // fixture format and the capture tests that write each half.
 
     proptest::proptest! {
         /// However hostile the bytes, the parser must return, never panic. This is the exit
