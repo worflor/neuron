@@ -756,6 +756,24 @@ pub mod server {
         s.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
+    /// Create one of the server's named mutexes, NEVER taking initial ownership.
+    ///
+    /// What the capture actually established about these is existence: they are present while the
+    /// vendor server runs and absent when it is stopped (the running-vs-stopped object diff). A
+    /// diff cannot observe ownership, so ownership is not a fact we have.
+    ///
+    /// Ownership is also not what a liveness probe reads. `OpenMutexW` returning a handle is the
+    /// probe — that is exactly how [`ShmServer::mask_worn`] checks for a live server — and it
+    /// succeeds on an unowned mutex. Taking ownership adds nothing to that signal and takes
+    /// something away: a Win32 mutex is owned by a THREAD, so any OTHER process waiting on it
+    /// blocks until the owner releases. This server never releases (there is no `ReleaseMutex`
+    /// anywhere in the crate), so an owned mutex is an indefinite block for any client that waits
+    /// rather than probes. `wear_mask`'s arbitration mutexes already pass 0 for the same reason.
+    fn create_named_mutex(sa: *const SECURITY_ATTRIBUTES, name: &[u16]) -> HANDLE {
+        const NOT_INITIAL_OWNER: i32 = 0;
+        unsafe { CreateMutexW(sa, NOT_INITIAL_OWNER, name.as_ptr()) }
+    }
+
     /// A held security descriptor granting Everyone full access — matches the
     /// real server's DACL so the game can open our objects.
     struct EveryoneSa(PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES);
@@ -879,8 +897,9 @@ pub mod server {
                         if !h.is_null() { handles.push(h); }
                     }
                     Kind::Mutex => {
-                        // Held (owned) so a client liveness probe sees the server alive.
-                        let h = unsafe { CreateMutexW(sa.ptr(), 1, name.as_ptr()) };
+                        // Exists for the server's lifetime (that is the liveness signal), unowned
+                        // so a waiting client is never blocked on us — see `create_named_mutex`.
+                        let h = create_named_mutex(sa.ptr(), &name);
                         if !h.is_null() { handles.push(h); }
                     }
                     Kind::Unknown => {}
@@ -1300,7 +1319,7 @@ pub mod server {
         mutex_names.push(format!("{MASK_PERUSER_MUTEX}{user}"));
         for g in &mutex_names {
             let w = wide(&format!("Global\\{g}"));
-            let h = unsafe { CreateMutexW(sa.ptr(), 0, w.as_ptr()) };
+            let h = create_named_mutex(sa.ptr(), &w);
             if !h.is_null() {
                 held.push(SendHandle(h));
             }
@@ -1919,6 +1938,43 @@ pub mod server {
             for h in &self.handles {
                 unsafe { CloseHandle(*h) };
             }
+        }
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+        use windows_sys::Win32::System::Threading::{ReleaseMutex, WaitForSingleObject};
+
+        /// A client that WAITS on one of the server's mutexes must not block on us. Proven by
+        /// waiting from another thread with a zero timeout: on an owned mutex that returns
+        /// WAIT_TIMEOUT (ownership is per-thread), on an unowned one it acquires immediately.
+        ///
+        /// Uses the `Local\` namespace so the test needs no elevation; `Global\` differs only in
+        /// visibility across sessions, not in ownership semantics.
+        #[test]
+        fn a_server_mutex_never_blocks_a_waiting_client() {
+            let name = wide(&format!("Local\neuron-shm-mutex-test-{}", std::process::id()));
+            let h = create_named_mutex(std::ptr::null(), &name);
+            assert!(!h.is_null(), "CreateMutexW failed");
+
+            let addr = h as usize;
+            let waited = std::thread::spawn(move || {
+                let h = addr as HANDLE;
+                let r = unsafe { WaitForSingleObject(h, 0) };
+                if r == WAIT_OBJECT_0 {
+                    unsafe { ReleaseMutex(h) };
+                }
+                r
+            })
+            .join()
+            .expect("join waiter");
+
+            unsafe { CloseHandle(h) };
+            assert_eq!(
+                waited, WAIT_OBJECT_0,
+                "another thread must be able to take the mutex; a non-zero result here means we                  created it owned, which blocks a waiting Chroma client indefinitely"
+            );
         }
     }
 }
