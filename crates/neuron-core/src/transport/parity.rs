@@ -115,10 +115,16 @@ pub fn decode_hex(hex: &str) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
 
-    /// Every Windows collection must appear in the Linux parse of the same device's descriptor,
-    /// with identical report lengths. Extra Linux collections are reported, not failed: Windows
-    /// hides a collection whose interface this process could not open, and that asymmetry is not
-    /// a parsing defect.
+    /// Every collection our parser derives must appear in the Windows caps for the same device,
+    /// with identical report lengths. The claim is that we never invent a report shape, which is
+    /// the one that matters: a length we made up is a wrong number of bytes on the wire.
+    ///
+    /// The other direction is NOT asserted, because Windows genuinely reports collections that do
+    /// not exist at the USB level. A Naga V2 Pro shows two — `0x000c/0x0001` at 3 bytes and
+    /// `0x0001/0x0080` at 2 — on paths under `mi_00&col03&colNN`, whose PnP parent is Razer's own
+    /// `RZVIRTUAL` bus, not the USB device. They are fabricated by the vendor driver and no Linux
+    /// kernel will ever enumerate them. Windows-only collections are printed, so the asymmetry
+    /// stays visible rather than being asserted away.
     ///
     /// With no fixtures captured yet this passes while saying so — the pair needs a physical
     /// device on a machine running both platforms. Capturing one is the point of the `#[ignore]`d
@@ -148,31 +154,31 @@ mod tests {
                 .unwrap_or_else(|| panic!("{} has no usable report_descriptor_hex", linux_path.display()));
             pairs += 1;
 
-            // Membership, not first-match: one device really does expose the same usage pair more
+            // Membership, not position: one device really does expose the same usage pair more
             // than once with different report shapes (a Naga V2 Pro reports 0x0001/0x0002 twice,
             // once with a 91-byte feature report and once with none), so the pair alone does not
-            // identify a collection. The claim is that every shape Windows reports is a shape we
-            // also derived.
-            for expect in &win.collections {
-                if parsed.contains(expect) {
+            // identify a collection.
+            for got in &parsed {
+                if win.collections.contains(got) {
                     continue;
                 }
-                let same_usage: Vec<String> = parsed
+                let same_usage: Vec<String> = win
+                    .collections
                     .iter()
-                    .filter(|c| c.usage_page == expect.usage_page && c.usage == expect.usage)
+                    .filter(|c| c.usage_page == got.usage_page && c.usage == got.usage)
                     .map(|c| format!("feature={} input={} output={}", c.feature_len, c.input_len, c.output_len))
                     .collect();
                 panic!(
-                    "{} {:04x}:{:04x} collection {:#06x}/{:#06x}: Windows reports feature={} input={} \
-                     output={}, our parser derived {}",
+                    "{} {:04x}:{:04x} collection {:#06x}/{:#06x}: we derived feature={} input={} \
+                     output={} from the report descriptor, Windows reports {}",
                     win.product,
                     win.vid,
                     win.pid,
-                    expect.usage_page,
-                    expect.usage,
-                    expect.feature_len,
-                    expect.input_len,
-                    expect.output_len,
+                    got.usage_page,
+                    got.usage,
+                    got.feature_len,
+                    got.input_len,
+                    got.output_len,
                     if same_usage.is_empty() {
                         "no collection with that usage at all".to_string()
                     } else {
@@ -180,15 +186,12 @@ mod tests {
                     }
                 );
             }
-            for extra in &parsed {
-                if !win
-                    .collections
-                    .iter()
-                    .any(|c| c.usage_page == extra.usage_page && c.usage == extra.usage)
-                {
+            for extra in &win.collections {
+                if !parsed.contains(extra) {
                     println!(
-                        "{:04x}: collection {:#06x}/{:#06x} parsed on linux but absent from the windows caps",
-                        win.pid, extra.usage_page, extra.usage
+                        "{:04x}: windows reports {:#06x}/{:#06x} feature={} input={} output={}, which no \
+                         USB report descriptor declares (RZVIRTUAL, or an interface linux did not see)",
+                        win.pid, extra.usage_page, extra.usage, extra.feature_len, extra.input_len, extra.output_len
                     );
                 }
             }

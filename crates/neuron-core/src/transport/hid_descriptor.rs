@@ -204,8 +204,16 @@ pub fn parse(desc: &[u8]) -> Vec<CollectionCaps> {
                                 TAG_OUTPUT => KIND_OUTPUT,
                                 _ => KIND_FEATURE,
                             };
-                            let add = u64::from(globals.report_size) * u64::from(globals.report_count);
-                            *bits[idx][kind].entry(globals.report_id).or_insert(0) += add;
+                            // Saturating, both times. Report Size and Report Count are whatever
+                            // 32-bit values the descriptor declares, and a descriptor is untrusted
+                            // input from whatever got plugged in: their product reaches u64::MAX,
+                            // and a second such item overflows the running total. Debug builds
+                            // panic there; release builds wrap, which is worse — a wrapped total
+                            // becomes a plausible-looking report length that is simply wrong.
+                            // Saturating leaves an absurd length that the caller treats as absurd.
+                            let add = u64::from(globals.report_size).saturating_mul(u64::from(globals.report_count));
+                            let slot = bits[idx][kind].entry(globals.report_id).or_insert(0);
+                            *slot = slot.saturating_add(add);
                         }
                     }
                     _ => {}
@@ -468,6 +476,35 @@ mod tests {
         assert!(caps.is_empty());
         let caps = parse(&[]);
         assert!(caps.is_empty());
+    }
+
+    /// A descriptor declaring the largest Report Size and Report Count the item encoding allows,
+    /// twice, overflows a u64 bit total. Found by `parser_never_panics`; kept as a named case
+    /// because the consequence in a release build is not a panic but a wrapped total, which would
+    /// read back as an ordinary, wrong report length.
+    #[test]
+    fn absurd_report_size_and_count_saturate() {
+        let max32 = |tag: u8| {
+            let mut v = vec![(tag << 4) | (0b01 << 2) | 0b11]; // Global, 4 bytes of data
+            v.extend_from_slice(&u32::MAX.to_le_bytes());
+            v
+        };
+        let mut desc = vec![0x05, 0x01, 0x09, 0x01, 0xA1, 0x01]; // Usage Page 1, Usage 1, Application
+        for _ in 0..2 {
+            desc.extend(max32(TAG_REPORT_SIZE));
+            desc.extend(max32(TAG_REPORT_COUNT));
+            desc.extend_from_slice(&[0x81, 0x02]); // Input
+        }
+        desc.push(0xC0); // End Collection
+
+        let caps = parse(&desc);
+        assert_eq!(caps.len(), 1);
+        assert_eq!(
+            caps[0].input_len,
+            u16::MAX,
+            "an absurd declared length clamps to an absurd value, rather than wrapping into a \
+             plausible one"
+        );
     }
 
     // The cross-check against Windows HidP_GetCaps lives in `super::parity`, which owns the

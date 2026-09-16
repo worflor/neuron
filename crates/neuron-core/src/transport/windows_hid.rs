@@ -677,6 +677,15 @@ mod tests {
                 input_len: d.input_len,
                 output_len: d.output_len,
             };
+            println!(
+                "  {:#06x}/{:#06x} f={:<4} i={:<4} o={:<4} {}",
+                d.usage_page,
+                d.usage,
+                d.feature_len,
+                d.input_len,
+                d.output_len,
+                d.path.as_os_str().to_string_lossy()
+            );
             // One HID interface per top-level collection on Windows, so a repeated usage pair is
             // the same collection seen twice, not a second one.
             if !entry.collections.contains(&col) {

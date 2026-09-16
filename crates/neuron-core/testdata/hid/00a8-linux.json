@@ -1,0 +1,79 @@
+{
+  "source": "linux-report-descriptor",
+  "vid": 5426,
+  "pid": 168,
+  "product": "Razer Naga V2 Pro",
+  "report_descriptor_hex": "05010906a101050719e029e715002501750195088102810119002aff00150026ff007508950681000508190129031500250175019503910295059101c005010902a1010901a10005091901290515002501750195058102750195038103750195088103050c0a38021581257f750895018106050109381581257f7508950181060930093116008026ff7f751095028106c00600ff0902150025017508955ab101c005010906a1018501050719e029e71500250175019508810219002aff00150026ff007508950e81000508190129031500250175019503910295059101c005010902a101850a0901a100050919012906150025017501950681027501950281030600ff0940750895021581257f8102050109381581257f7508950181060930093116008026ff7f751095028106c0c0050c0901a101850219002a3c021500263c029501751081007508950d8101c005010980a10185031981298315002501750195038102950581017508950e8101c005010900a10185040903150026ff00350046ff007508950f8100c005010900a10185050903150026ff00350046ff007508950f8100c005010900a10185080903150026ff00350046ff007508950f8100c005010900a10185090903150026ff00350046ff007508950f8100c0",
+  "collections": [
+    {
+      "usage_page": 1,
+      "usage": 6,
+      "feature_len": 0,
+      "input_len": 9,
+      "output_len": 2
+    },
+    {
+      "usage_page": 1,
+      "usage": 2,
+      "feature_len": 91,
+      "input_len": 9,
+      "output_len": 0
+    },
+    {
+      "usage_page": 1,
+      "usage": 6,
+      "feature_len": 0,
+      "input_len": 16,
+      "output_len": 2
+    },
+    {
+      "usage_page": 1,
+      "usage": 2,
+      "feature_len": 0,
+      "input_len": 9,
+      "output_len": 0
+    },
+    {
+      "usage_page": 12,
+      "usage": 1,
+      "feature_len": 0,
+      "input_len": 16,
+      "output_len": 0
+    },
+    {
+      "usage_page": 1,
+      "usage": 128,
+      "feature_len": 0,
+      "input_len": 16,
+      "output_len": 0
+    },
+    {
+      "usage_page": 1,
+      "usage": 0,
+      "feature_len": 0,
+      "input_len": 16,
+      "output_len": 0
+    },
+    {
+      "usage_page": 1,
+      "usage": 0,
+      "feature_len": 0,
+      "input_len": 16,
+      "output_len": 0
+    },
+    {
+      "usage_page": 1,
+      "usage": 0,
+      "feature_len": 0,
+      "input_len": 16,
+      "output_len": 0
+    },
+    {
+      "usage_page": 1,
+      "usage": 0,
+      "feature_len": 0,
+      "input_len": 16,
+      "output_len": 0
+    }
+  ]
+}

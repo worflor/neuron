@@ -84,17 +84,35 @@ fn last_os_error() -> std::io::Error {
     std::io::Error::last_os_error()
 }
 
-/// `errno` for a failed syscall as an owned code, so callers can special-case ENODEV/EPIPE (device
-/// unplugged) without a second `errno()` read racing a subsequent call.
+/// `errno` for a failed syscall as an owned code, so callers can classify it (see [`is_disconnect`]
+/// and [`device_err`]) without a second `errno()` read racing a subsequent call.
 fn errno_of(err: &std::io::Error) -> i32 {
     err.raw_os_error().unwrap_or(0)
 }
 
-/// True for the errno pair that means "the device is gone" — unplugged mid-conversation (ENODEV)
-/// or the far end of the pipe closed under us (EPIPE). Both get a distinctly-worded error so a
-/// caller's disconnect handling doesn't have to string-match a generic I/O failure.
+/// True for the errno values that mean "the device is gone": ENODEV ("Device was removed") and
+/// ESHUTDOWN ("disabled ... such as a physical disconnect"), per the kernel's USB error codes.
+/// Both get a distinctly-worded error so a caller's disconnect handling doesn't have to
+/// string-match a generic I/O failure.
+///
+/// EPIPE is deliberately not here. It is the kernel's "Endpoint stalled": the device answered the
+/// control transfer by refusing it, which is exactly what a device does for a report it does not
+/// support. The same doc notes a host controller may also emit EPIPE in the window before the hub
+/// driver processes a real removal, so presence is decided by re-enumerating, not by one errno.
 fn is_disconnect(errno: i32) -> bool {
-    errno == libc::ENODEV || errno == libc::EPIPE
+    errno == libc::ENODEV || errno == libc::ESHUTDOWN
+}
+
+/// The error for one failed device request, naming a stall as a stall rather than a disconnect.
+fn device_err(what: &str, err: &std::io::Error) -> anyhow::Error {
+    let errno = errno_of(err);
+    if is_disconnect(errno) {
+        anyhow::anyhow!("device disconnected: {err}")
+    } else if errno == libc::EPIPE {
+        anyhow::anyhow!("{what}: the device refused the request (endpoint stalled): {err}")
+    } else {
+        anyhow::anyhow!("{what} failed: {err}")
+    }
 }
 
 /// Run a syscall, retrying while it fails with `EINTR`; returns its non-negative result or the
@@ -364,10 +382,7 @@ impl Transport for HidRaw {
         let req = feature_ioctl(HIDIOCSFEATURE_NR, buf.len());
         let ret = retry_eintr(|| unsafe { libc::ioctl(self.fd, req as _, buf.as_ptr()) } as isize);
         if let Err(err) = ret {
-            if is_disconnect(errno_of(&err)) {
-                bail!("device disconnected: {err}");
-            }
-            bail!("HIDIOCSFEATURE failed: {err}");
+            return Err(device_err("HIDIOCSFEATURE", &err));
         }
         Ok(())
     }
@@ -376,12 +391,7 @@ impl Transport for HidRaw {
         let req = feature_ioctl(HIDIOCGFEATURE_NR, buf.len());
         let ret = match retry_eintr(|| unsafe { libc::ioctl(self.fd, req as _, buf.as_mut_ptr()) } as isize) {
             Ok(n) => n,
-            Err(err) => {
-                if is_disconnect(errno_of(&err)) {
-                    bail!("device disconnected: {err}");
-                }
-                bail!("HIDIOCGFEATURE failed: {err}");
-            }
+            Err(err) => return Err(device_err("HIDIOCGFEATURE", &err)),
         };
         // The hidraw driver's GFEATURE ioctl returns the number of bytes actually transferred —
         // the real short-read count, same contract as `HidD_GetFeature`'s length on Windows.
@@ -391,12 +401,7 @@ impl Transport for HidRaw {
     fn write_output(&self, buf: &[u8]) -> Result<()> {
         let n = match retry_eintr(|| unsafe { libc::write(self.fd, buf.as_ptr().cast(), buf.len()) }) {
             Ok(n) => n,
-            Err(err) => {
-                if is_disconnect(errno_of(&err)) {
-                    bail!("device disconnected: {err}");
-                }
-                bail!("write(2) (output report) failed: {err}");
-            }
+            Err(err) => return Err(device_err("write(2) (output report)", &err)),
         };
         // An output report is a single fixed-size frame — a real HID device never accepts a
         // partial one, so a short write here means the report did NOT land as sent. `write(2)` on
@@ -582,6 +587,24 @@ mod tests {
             "any other errno is returned, not retried"
         );
         assert_eq!(calls, 1);
+    }
+
+    /// A stalled request is not a missing device. A Seiren V3 Mini answering HIDIOCGFEATURE with
+    /// EPIPE was reported as "device disconnected" while sitting plugged in and enumerating fine,
+    /// which would have had callers dropping a present device.
+    #[test]
+    fn a_stall_is_not_a_disconnect() {
+        assert!(is_disconnect(libc::ENODEV), "ENODEV: device was removed");
+        assert!(is_disconnect(libc::ESHUTDOWN), "ESHUTDOWN: disabled, e.g. physical disconnect");
+        assert!(!is_disconnect(libc::EPIPE), "EPIPE is a stall, not a removal");
+        assert!(!is_disconnect(libc::EIO));
+
+        let stall = device_err("HIDIOCGFEATURE", &std::io::Error::from_raw_os_error(libc::EPIPE)).to_string();
+        assert!(stall.contains("refused the request"), "{stall}");
+        assert!(!stall.contains("disconnected"), "{stall}");
+
+        let gone = device_err("HIDIOCGFEATURE", &std::io::Error::from_raw_os_error(libc::ENODEV)).to_string();
+        assert!(gone.contains("device disconnected"), "{gone}");
     }
 
     // ── pure parsing ───────────────────────────────────────────────────────────────────────────

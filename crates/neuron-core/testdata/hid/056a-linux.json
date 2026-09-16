@@ -1,0 +1,16 @@
+{
+  "source": "linux-report-descriptor",
+  "vid": 5426,
+  "pid": 1386,
+  "product": "Razer Seiren V3 Mini",
+  "report_descriptor_hex": "050c0901a1018501150025010601ff0901750195018106050c09e975019501814209e2950181060601ff090195028106050c09ea7501950181420601ff090195068106050c09cd09cf09b509b6950481020607ff09017508950d81060900950f91020607ff090185077508953f8106090191020901b1020607ff090185057508950f8106090191020901b102c0",
+  "collections": [
+    {
+      "usage_page": 12,
+      "usage": 1,
+      "feature_len": 64,
+      "input_len": 64,
+      "output_len": 64
+    }
+  ]
+}
