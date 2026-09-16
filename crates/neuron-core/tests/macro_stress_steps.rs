@@ -11,7 +11,8 @@
 //!
 //! STRICTLY NON-DESTRUCTIVE — the sidecar runs with input DISARMED for the whole test, so every
 //! effectful helper (`type_text`/`hotkey`/`click`/`scroll`/`mouse_to`/`clipboard_set`/`run`/`focus`)
-//! NO-OPS and returns its `[disarmed]` marker: NO real keystrokes, clicks, mouse moves, clipboard
+//! NO-OPS and returns a no-op marker (`[disarmed]`, or `[unsupported]` where the platform has no
+//! implementation at all): NO real keystrokes, clicks, mouse moves, clipboard
 //! writes, or process spawns ever happen. We assert behavior via the macro's RETURN value, the macro
 //! LOG (notify lines), and BEACON events. The macros dir is isolated to a private temp cwd. Skips
 //! cleanly if the bundled python can't materialize.
@@ -24,6 +25,34 @@ use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 // ── helpers ───────────────────────────────────────────────────────────────────────────────────────
+
+/// The markers an effectful verb returns when it did NOTHING. `[disarmed]` is the arm gate; off
+/// Windows a verb with no platform implementation (key/click/mouse/clipboard synthesis all route
+/// through `SendInput`) answers `[unsupported]` before the gate is ever reached. Both mean the one
+/// thing this test cares about: nothing left the process.
+const NO_OP_MARKERS: [&str; 2] = ["[disarmed]", "[unsupported]"];
+
+/// Did the verb no-op?
+fn no_op(r: &str) -> bool {
+    NO_OP_MARKERS.iter().any(|m| r.contains(m))
+}
+
+/// Does `r` report a bad key NAME? Only Windows can: `_vk` (the name→virtual-key table) lives
+/// inside the shim's `if _IS_WIN:` block, so elsewhere the platform check answers `[unsupported]`
+/// before any name is ever parsed. That is the honest report off Windows — the verb has no
+/// implementation there at all, so a typo in it is not the interesting failure.
+fn bad_key_reported(r: &str) -> bool {
+    if cfg!(windows) {
+        r.contains("unknown key")
+    } else {
+        no_op(r)
+    }
+}
+
+/// How many verbs no-opped in a joined result.
+fn no_ops(r: &str) -> usize {
+    NO_OP_MARKERS.iter().map(|m| r.matches(m).count()).sum()
+}
 
 /// Register `src` as `id`, INVOKE it (blocking, disarmed), unregister, and return the one-line
 /// invoke result (`macro '<id>': <value>` / `... ran` / `... error: <e>`).
@@ -132,7 +161,7 @@ fn run_step_phases(host: &MacroHost) {
     // ════════════════ TYPE ════════════════
     // Type_empty_string
     let r = run(host, "s_type_empty", "def macro(ctx):\n    return str(neuron.type_text(''))\n", &dflt);
-    assert!(r.contains("[disarmed]") && !r.contains("error"), "type('') disarmed: {r}");
+    assert!(no_op(&r) && !r.contains("error"), "type('') disarmed: {r}");
     // Type_long_unicode_string (12k chars: emoji + combining + zero-width + Arabic)
     let r = run(
         host,
@@ -140,7 +169,7 @@ fn run_step_phases(host: &MacroHost) {
         "def macro(ctx):\n    s = ('\\U0001F600\\u0301\\u200B\\u0627') * 3000\n    return str(neuron.type_text(s))\n",
         &dflt,
     );
-    assert!(r.contains("[disarmed]") && !r.contains("error"), "12k-unicode type disarmed completes: {r}");
+    assert!(no_op(&r) && !r.contains("error"), "12k-unicode type disarmed completes: {r}");
     // Type_value_expression: ctx.selection.upper()
     let r = run(
         host,
@@ -156,28 +185,28 @@ fn run_step_phases(host: &MacroHost) {
         "def macro(ctx):\n    return '|'.join(str(neuron.type_ghost('t', sp)) for sp in ['fast','slow','borderline'])\n",
         &dflt,
     );
-    assert!(r.contains("[disarmed]") && !r.contains("error"), "ghost speeds disarmed: {r}");
+    assert!(no_op(&r) && !r.contains("error"), "ghost speeds disarmed: {r}");
     // Type_ghost_speed_invalid (tolerant)
     let r = run(host, "s_ghost_bad", "def macro(ctx):\n    return str(neuron.type_ghost('x', 'invalid_speed'))\n", &dflt);
-    assert!(r.contains("[disarmed]") && !r.contains("error"), "invalid ghost speed tolerated disarmed: {r}");
+    assert!(no_op(&r) && !r.contains("error"), "invalid ghost speed tolerated disarmed: {r}");
     eprintln!("[steps] TYPE ok");
 
     // ════════════════ PRESS / KEY ════════════════
     // Press_empty_keys -> hotkey() with no keys: validity passes, gate returns [disarmed]
     let r = run(host, "s_press_empty", "def macro(ctx):\n    return str(neuron.hotkey())\n", &dflt);
-    assert!(r.contains("[disarmed]") && !r.contains("error"), "empty hotkey disarmed no-op: {r}");
+    assert!(no_op(&r) && !r.contains("error"), "empty hotkey disarmed no-op: {r}");
     // Press_valid_chord
     let r = run(host, "s_press_ok", "def macro(ctx):\n    return str(neuron.hotkey('ctrl','c'))\n", &dflt);
-    assert!(r.contains("[disarmed]"), "valid chord disarmed: {r}");
+    assert!(no_op(&r), "valid chord disarmed: {r}");
     // Press_invalid_key_name -> validity is checked BEFORE the gate, so it surfaces clearly
     let r = run(host, "s_press_bad", "def macro(ctx):\n    return str(neuron.hotkey('ctrl','invalid_key_xyz'))\n", &dflt);
-    assert!(r.contains("unknown key"), "invalid chord key must surface clearly: {r}");
+    assert!(bad_key_reported(&r), "invalid chord key must surface clearly: {r}");
     // KeyPress_valid_key
     let r = run(host, "s_key_ok", "def macro(ctx):\n    return str(neuron.key('enter'))\n", &dflt);
-    assert!(r.contains("[disarmed]"), "valid key disarmed: {r}");
+    assert!(no_op(&r), "valid key disarmed: {r}");
     // KeyPress_unknown_key
     let r = run(host, "s_key_bad", "def macro(ctx):\n    return str(neuron.key('not_a_real_key'))\n", &dflt);
-    assert!(r.contains("unknown key"), "unknown key surfaces clearly: {r}");
+    assert!(bad_key_reported(&r), "unknown key surfaces clearly: {r}");
     eprintln!("[steps] PRESS/KEY ok");
 
     // ════════════════ CLICK / SCROLL / MOVETO ════════════════
@@ -187,32 +216,32 @@ fn run_step_phases(host: &MacroHost) {
         "def macro(ctx):\n    return '|'.join(str(neuron.click(b)) for b in ['left','right','middle'])\n",
         &dflt,
     );
-    assert_eq!(r.matches("[disarmed]").count(), 3, "all three buttons disarmed: {r}");
+    assert_eq!(no_ops(&r), 3, "all three buttons disarmed: {r}");
     let r = run(host, "s_click_bad", "def macro(ctx):\n    return str(neuron.click('top'))\n", &dflt);
-    assert!(r.contains("[disarmed]") && !r.contains("error"), "invalid button disarmed no-op: {r}");
+    assert!(no_op(&r) && !r.contains("error"), "invalid button disarmed no-op: {r}");
     let r = run(
         host,
         "s_scroll",
         "def macro(ctx):\n    return '|'.join(str(neuron.scroll(n)) for n in [5,-3,0])\n",
         &dflt,
     );
-    assert_eq!(r.matches("[disarmed]").count(), 3, "scroll +/-/0 disarmed: {r}");
+    assert_eq!(no_ops(&r), 3, "scroll +/-/0 disarmed: {r}");
     let r = run(host, "s_scroll_huge", "def macro(ctx):\n    return str(neuron.scroll(100000))\n", &dflt);
-    assert!(r.contains("[disarmed]") && !r.contains("error"), "huge scroll no overflow disarmed: {r}");
+    assert!(no_op(&r) && !r.contains("error"), "huge scroll no overflow disarmed: {r}");
     let r = run(
         host,
         "s_moveto",
         "def macro(ctx):\n    return '|'.join(str(neuron.mouse_to(x,y)) for (x,y) in [(0,0),(1920,1080),(-100,5000)])\n",
         &dflt,
     );
-    assert_eq!(r.matches("[disarmed]").count(), 3, "moveto coords disarmed: {r}");
+    assert_eq!(no_ops(&r), 3, "moveto coords disarmed: {r}");
     eprintln!("[steps] CLICK/SCROLL/MOVETO ok");
 
     // ════════════════ COPY / PASTE ════════════════
     let r = run(host, "s_copy_empty", "def macro(ctx):\n    return str(neuron.clipboard_set(''))\n", &dflt);
-    assert!(r.contains("[disarmed]"), "copy('') disarmed: {r}");
+    assert!(no_op(&r), "copy('') disarmed: {r}");
     let r = run(host, "s_copy_big", "def macro(ctx):\n    s = 'x' * 5000000\n    return str(neuron.clipboard_set(s))\n", &dflt);
-    assert!(r.contains("[disarmed]") && !r.contains("error"), "5MB copy disarmed completes: {r}");
+    assert!(no_op(&r) && !r.contains("error"), "5MB copy disarmed completes: {r}");
     let r = run(
         host,
         "s_copy_val",
@@ -221,27 +250,27 @@ fn run_step_phases(host: &MacroHost) {
     );
     assert!(r.contains("TEST"), "copy value expression evaluates: {r}");
     let r = run(host, "s_paste", "def macro(ctx):\n    return str(neuron.hotkey('ctrl','v'))\n", &dflt);
-    assert!(r.contains("[disarmed]"), "paste (ctrl+v) disarmed: {r}");
+    assert!(no_op(&r), "paste (ctrl+v) disarmed: {r}");
     eprintln!("[steps] COPY/PASTE ok");
 
     // ════════════════ OPEN (process spawn — disarmed = never spawns) ════════════════
     let r = run(host, "s_open_ff", "def macro(ctx):\n    return str(neuron.run('echo test'))\n", &dflt);
-    assert!(r.contains("[disarmed]"), "fire-and-forget run disarmed never spawns: {r}");
+    assert!(no_op(&r), "fire-and-forget run disarmed never spawns: {r}");
     // Open_with_capture: disarmed run(wait=True) returns the [disarmed] marker (NOT a (code,stdout)
     // tuple — that only happens ARMED). Asserting the real, non-destructive disarmed contract.
     let r = run(host, "s_open_cap", "def macro(ctx):\n    out = neuron.run('echo test', wait=True)\n    return repr(out)\n", &dflt);
-    assert!(r.contains("[disarmed]"), "captured disarmed run yields the marker: {r}");
+    assert!(no_op(&r), "captured disarmed run yields the marker: {r}");
     // Open_capture_failing_command: still disarmed (armed process-capture is out of scope for a
     // strictly non-destructive suite — it would spawn a real subprocess).
     let r = run(host, "s_open_fail", "def macro(ctx):\n    out = neuron.run('exit 1', wait=True)\n    return repr(out)\n", &dflt);
-    assert!(r.contains("[disarmed]"), "failing-cmd capture disarmed: {r}");
+    assert!(no_op(&r), "failing-cmd capture disarmed: {r}");
     eprintln!("[steps] OPEN ok");
 
     // ════════════════ FOCUS ════════════════
     let r = run(host, "s_focus_ok", "def macro(ctx):\n    return str(neuron.focus('Notepad'))\n", &dflt);
-    assert!(r.contains("[disarmed]"), "focus disarmed no-op: {r}");
+    assert!(no_op(&r), "focus disarmed no-op: {r}");
     let r = run(host, "s_focus_no", "def macro(ctx):\n    return str(neuron.focus('WindowThatDoesNotExist_XYZ'))\n", &dflt);
-    assert!(r.contains("[disarmed]") && !r.contains("error"), "focus missing window disarmed: {r}");
+    assert!(no_op(&r) && !r.contains("error"), "focus missing window disarmed: {r}");
     eprintln!("[steps] FOCUS ok");
 
     // ════════════════ WAIT ════════════════
@@ -393,7 +422,7 @@ fn run_step_phases(host: &MacroHost) {
         &dflt,
     );
     assert!(!r.contains("error"), "the all-effects macro completes: {r}");
-    assert_eq!(r.matches("[disarmed]").count(), 8, "all 8 effectful steps must no-op (disarmed): {r}");
+    assert_eq!(no_ops(&r), 8, "all 8 effectful steps must no-op (disarmed): {r}");
     eprintln!("[steps] DISARM-ALL ok");
 
     // ════════════════ BEACON (Ask / choose) ════════════════

@@ -38,6 +38,14 @@ use std::os::windows::process::CommandExt;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+/// What `neuron.key` answers when it synthesizes nothing. `[disarmed]` is the arm gate; off Windows
+/// the platform check fires FIRST (there is no `SendInput` to reach) and answers `[unsupported]`.
+/// Either marker proves the same thing here: no input reached the OS.
+#[cfg(windows)]
+const KEY_NO_OP: &str = "[disarmed]";
+#[cfg(not(windows))]
+const KEY_NO_OP: &str = "[unsupported]";
+
 // ── shared helpers ───────────────────────────────────────────────────────────────────────────────
 
 /// Run the bundled interpreter with `-c <code>`; return (success, stdout, stderr). No state change.
@@ -505,7 +513,7 @@ fn pyruntime_sidecar_stress_e2e() {
         assert!(host.fire_mock("pr_mockkey", &cx("m")).contains("dispatched"));
         let n = drain_notifies(&rx, Duration::from_millis(800), Duration::from_secs(10));
         assert!(
-            n.iter().any(|(_, t)| t.contains("mockkey='[disarmed]'")),
+            n.iter().any(|(_, t)| t.contains(&format!("mockkey='{KEY_NO_OP}'"))),
             "a mock fire suppresses input even under armed (per-fire gate): {n:?}"
         );
         assert_eq!(num_after(&host.invoke("pr_pid", &cx("p")), "pid="), Some(new as u64), "same respawned pid throughout");

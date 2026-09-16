@@ -41,6 +41,14 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
+/// What `neuron.key` answers when it synthesizes nothing. `[disarmed]` is the arm gate; off Windows
+/// the platform check fires FIRST (there is no `SendInput` to reach) and answers `[unsupported]`.
+/// Either marker proves the same thing here: no input reached the OS.
+#[cfg(windows)]
+const KEY_NO_OP: &str = "[disarmed]";
+#[cfg(not(windows))]
+const KEY_NO_OP: &str = "[unsupported]";
+
 /// The sidecar's per-macro queue cap (`_FIRE_QUEUE_MAX` in `neuron_host.py`). Mirror it here; if you
 /// change one, change both — these tests assert exact cap behaviour against it.
 const QMAX: usize = 256;
@@ -433,8 +441,9 @@ fn fire_queue_stress_e2e() {
         let mock = find("mock").expect("the mock fire completed");
         assert!(real.contains("ask=True"), "real fire's beacon answered: {real}");
         assert!(mock.contains("ask=True"), "mock fire raises the REAL beacon and is answerable: {mock}");
-        assert!(real.contains("key='[disarmed]'"), "real fire is disarmed → input no-op (non-destructive): {real}");
-        assert!(mock.contains("key='[disarmed]'"), "mock fire forces input no-op for that fire: {mock}");
+        let no_op = format!("key='{KEY_NO_OP}'");
+        assert!(real.contains(&no_op), "real fire is disarmed → input no-op (non-destructive): {real}");
+        assert!(mock.contains(&no_op), "mock fire forces input no-op for that fire: {mock}");
         host.unregister("fqe");
     }
 

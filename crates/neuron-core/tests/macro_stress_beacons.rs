@@ -30,6 +30,14 @@ use std::collections::HashSet;
 use std::sync::mpsc::{channel, Receiver};
 use std::time::{Duration, Instant};
 
+/// What `neuron.key` answers when it synthesizes nothing. `[disarmed]` is the arm gate; off Windows
+/// the platform check fires FIRST (there is no `SendInput` to reach) and answers `[unsupported]`.
+/// Either marker proves the same thing here: no input reached the OS.
+#[cfg(windows)]
+const KEY_NO_OP: &str = "[disarmed]";
+#[cfg(not(windows))]
+const KEY_NO_OP: &str = "[unsupported]";
+
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 // PURE RADIAL MATH — the answer wheel's geometry (no sidecar; each is independent + parallel-safe)
 // ─────────────────────────────────────────────────────────────────────────────────────────────
@@ -602,7 +610,7 @@ fn beacon_stress_e2e() {
     // reach the human. So the beacon must rise (and be answerable) while an input verb no-ops.
     // (We can only verify the non-destructive observable: the whole test is DISARMED, so we cannot
     // arm real input to distinguish mock from disarm for key synthesis — we verify the beacon rises
-    // under mock and the device verb returns the suppressed marker.)
+    // under mock and the device verb returns a suppressed marker, whichever one the platform has.)
     {
         let rx = host.beacon_events();
         host.register(
@@ -618,9 +626,10 @@ fn beacon_stress_e2e() {
         host.answer(pid, Some(0));
         std::thread::sleep(Duration::from_millis(400));
         let log = host.drain_log();
+        let no_op = format!("mock ask=True key='{KEY_NO_OP}'");
         assert!(
-            log.iter().any(|l| l.contains("mock ask=True key='[disarmed]'")),
-            "mock: beacon answered True AND the input verb no-opped ([disarmed]): {log:?}"
+            log.iter().any(|l| l.contains(&no_op)),
+            "mock: beacon answered True AND the input verb no-opped ({no_op}): {log:?}"
         );
     }
 
