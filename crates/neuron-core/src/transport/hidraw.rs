@@ -207,8 +207,15 @@ fn usb_product_string(canonical_hidraw_path: &Path) -> Option<String> {
 /// process can't fully read (races with unplug, a permission-locked file) is silently skipped,
 /// same as Windows' `query` returning `None`.
 pub fn enumerate() -> Result<Vec<HidDeviceInfo>> {
+    enumerate_in(Path::new("/sys/class/hidraw"))
+}
+
+/// [`enumerate`] against an arbitrary hidraw class root, so the walk can be driven over a synthetic
+/// sysfs tree in tests. Nothing here opens `/dev`; it is pure filesystem reads plus descriptor
+/// parsing.
+fn enumerate_in(class_root: &Path) -> Result<Vec<HidDeviceInfo>> {
     let mut out = Vec::new();
-    let entries = match std::fs::read_dir("/sys/class/hidraw") {
+    let entries = match std::fs::read_dir(class_root) {
         Ok(d) => d,
         // No hidraw class at all (module not loaded, or a non-Linux-HID system) — an honest empty
         // bus, matching how the Windows backend reports "nothing found" rather than erroring.
@@ -672,6 +679,109 @@ mod tests {
         );
         b.release();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── enumeration over a synthetic sysfs tree ────────────────────────────────────────────────
+
+    /// Build one hidraw node under `base`, shaped like real sysfs: the class entry is a symlink
+    /// into the device tree, `hidrawN/device` is a symlink to the HID interface dir holding
+    /// `uevent` + `report_descriptor`, and the USB device dir two levels up holds `product`.
+    /// Returns the canonical path the walk should report for it.
+    fn fake_hidraw_node(base: &Path, port: &str, node: &str, hid_id: &str, desc: &[u8], product: &str) -> PathBuf {
+        use std::os::unix::fs::symlink;
+        let usb_dev = base.join("devices").join(port);
+        let iface = usb_dev.join(format!("0003:1532:005A.{port}"));
+        let hidraw_dir = iface.join("hidraw").join(node);
+        std::fs::create_dir_all(&hidraw_dir).expect("hidraw dir");
+        std::fs::write(usb_dev.join("product"), format!("{product}\n")).expect("product");
+        std::fs::write(iface.join("uevent"), format!("DRIVER=hid-generic\nHID_ID={hid_id}\n")).expect("uevent");
+        std::fs::write(iface.join("report_descriptor"), desc).expect("report_descriptor");
+        symlink("../..", hidraw_dir.join("device")).expect("device symlink");
+
+        let class_root = base.join("class").join("hidraw");
+        std::fs::create_dir_all(&class_root).expect("class root");
+        symlink(&hidraw_dir, class_root.join(node)).expect("class symlink");
+        std::fs::canonicalize(&hidraw_dir).expect("canonical hidraw dir")
+    }
+
+    /// Two top-level Application collections on one interface: a vendor page carrying a 90-byte
+    /// feature report (the razer_report shape) and a Generic Desktop mouse carrying an input
+    /// report. Written as raw bytes because the item builders live in `hid_descriptor`'s own
+    /// tests.
+    const TWO_COLLECTION_DESC: &[u8] = &[
+        0x06, 0x00, 0xFF, // Usage Page (vendor 0xFF00)
+        0x09, 0x01, // Usage (1)
+        0xA1, 0x01, // Collection (Application)
+        0x75, 0x08, //   Report Size (8)
+        0x95, 0x5A, //   Report Count (90)
+        0xB1, 0x02, //   Feature
+        0xC0, // End Collection
+        0x05, 0x01, // Usage Page (Generic Desktop)
+        0x09, 0x02, // Usage (Mouse)
+        0xA1, 0x01, // Collection (Application)
+        0x75, 0x08, //   Report Size (8)
+        0x95, 0x01, //   Report Count (1)
+        0x81, 0x02, //   Input
+        0xC0, // End Collection
+    ];
+
+    /// The enumeration walk end to end, against a synthetic sysfs tree: one interface per device,
+    /// one `HidDeviceInfo` per top-level collection, report lengths from the descriptor, the
+    /// product string read from the USB parent, and the collection index encoded into the path.
+    /// This is the path that decides WHICH device a write reaches, and no hardware is needed to
+    /// prove its shape.
+    #[test]
+    fn enumerates_a_synthetic_sysfs_tree() {
+        let base = std::env::temp_dir().join(format!("neuron-sysfs-{}-a", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let canonical = fake_hidraw_node(&base, "1-2", "hidraw0", "0003:00001532:0000005A", TWO_COLLECTION_DESC, "Razer Naga V2 Pro");
+
+        let found = enumerate_in(&base.join("class").join("hidraw")).expect("enumerate");
+        assert_eq!(found.len(), 2, "one entry per top-level collection");
+
+        let vendor = &found[0];
+        assert_eq!((vendor.vid, vendor.pid), (0x1532, 0x005A));
+        assert_eq!((vendor.usage_page, vendor.usage), (0xFF00, 0x0001));
+        assert_eq!(vendor.feature_len, 91, "90 data bytes + the report-ID byte");
+        assert_eq!(vendor.product, "Razer Naga V2 Pro", "product comes from the USB parent dir");
+        assert_eq!(
+            vendor.path,
+            encode_path(&canonical.to_string_lossy(), 1),
+            "the path is the CANONICAL device-tree path, not the class symlink"
+        );
+
+        let mouse = &found[1];
+        assert_eq!((mouse.usage_page, mouse.usage), (0x0001, 0x0002));
+        assert_eq!(mouse.input_len, 2);
+        assert_eq!(mouse.path, encode_path(&canonical.to_string_lossy(), 2));
+        assert_ne!(vendor.path, mouse.path, "collections of one interface stay addressable apart");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// What the walk must SKIP: a non-USB/Bluetooth bus, and a node whose sysfs files are missing
+    /// (an unplug racing the walk). Neither may fail the enumeration or emit an entry.
+    #[test]
+    fn enumeration_skips_other_buses_and_unreadable_nodes() {
+        let base = std::env::temp_dir().join(format!("neuron-sysfs-{}-b", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let class_root = base.join("class").join("hidraw");
+
+        // I2C (bus 0x0018) — a laptop touchpad, not something to talk razer_report at.
+        fake_hidraw_node(&base, "1-3", "hidraw1", "0018:00001532:0000005A", TWO_COLLECTION_DESC, "I2C HID");
+        assert!(enumerate_in(&class_root).expect("enumerate").is_empty(), "non-USB/BT buses are skipped");
+
+        // A class entry with no readable device dir at all.
+        std::fs::create_dir_all(class_root.join("hidraw9")).expect("bare node");
+        assert!(
+            enumerate_in(&class_root).expect("enumerate").is_empty(),
+            "a node whose files can't be read is skipped, not an error"
+        );
+
+        // A missing class root is an empty bus, not a failure.
+        assert!(enumerate_in(&base.join("class").join("nope")).expect("enumerate").is_empty());
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     // ── live checkpoint ────────────────────────────────────────────────────────────────────────
