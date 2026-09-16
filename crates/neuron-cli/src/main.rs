@@ -3178,6 +3178,19 @@ fn prof_pump_cmd() {
 }
 
 fn run_daemon(reg: &Registry, seconds: Option<u64>, safe: bool) {
+    // The daemon is a loop around an input source and an action dispatcher, and off Windows both
+    // are stubs: it would print "listening", wake zero times, and fire nothing. Refuse instead.
+    #[cfg(not(windows))]
+    {
+        let _ = (reg, seconds, safe);
+        println!(
+            "the remap daemon is Windows-only for now: control events and action dispatch have no \
+             backend on this platform, so it would listen forever and fire nothing."
+        );
+        println!("device control works here — try `neuron list`, `dpi`, `lighting`, `profile`, `remap`.");
+        return;
+    }
+
     // ARM real input synthesis for live use. This is the one place the CLI daemon flips the
     // process-wide safety gate ON so bound key/click/macro actions actually fire. `--safe` keeps
     // it DISARMED: the Engine still resolves every trigger and prints what it WOULD do, but
@@ -3477,6 +3490,16 @@ fn run_listen(_reg: &Registry, seconds: Option<u64>, _rt: neuron::controls::Runt
 }
 
 fn audio_cmd(action: AudioCmd) -> Result<()> {
+    // The audio layer is Core Audio (WASAPI) only. Off Windows every endpoint query returns an
+    // empty set, which reads as "this machine has no audio" rather than "neuron can't see it".
+    #[cfg(not(windows))]
+    {
+        let _ = action;
+        anyhow::bail!(
+            "audio endpoints are Windows-only for now: neuron reads them through Core Audio and \
+             has no PipeWire/ALSA backend yet, so it can see none of yours."
+        );
+    }
     match action {
         AudioCmd::List => audio_list(),
         AudioCmd::Monitor { seconds } => audio_monitor(seconds),
@@ -4028,6 +4051,18 @@ fn capture_sniper_control() -> Option<(u16, u16, Option<neuron::registry::Canoni
 /// by PRESSING it; `--dpi` sets the precision DPI. The bind lives in `profiles/gui.rules.toml` (the
 /// same store the GUI edits) and the resident neuron app enforces the hold. Nothing hardcoded.
 fn sniper_cmd(rebind: bool, dpi_override: Option<u16>) -> Result<()> {
+    // Sniper authors a rule keyed to a control you press, and the resident app enforces the hold.
+    // Off Windows there is neither control capture to learn the button nor a daemon to enforce it,
+    // so the prompt would wait for a press that can never arrive.
+    #[cfg(not(windows))]
+    {
+        let _ = (rebind, dpi_override);
+        anyhow::bail!(
+            "sniper is Windows-only for now: it needs control capture to learn your button, and a \
+             running neuron to hold the DPI while you press it. Neither exists on this platform yet."
+        );
+    }
+
     use neuron::action::Action;
     use neuron::engine::{Rule, Trigger};
 
