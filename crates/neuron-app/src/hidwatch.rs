@@ -968,6 +968,7 @@ fn decode(
         // announce path judges the announced DPI alone, so the belt is what covers the 2026-07-23
         // factory-table shape.
         0x0c => {
+            note_wake(pid);
             let reassert = reassert_due(pid);
             crate::worker::spawn_detached("neuron-hidwatch-charge", move || {
                 match settle_charge(pid) {
@@ -1447,6 +1448,31 @@ fn reassert_due(pid: u16) -> bool {
     }
 }
 
+/// Per-pid moment of the last `05 0c` power poke — the one unambiguous "this device just woke"
+/// signal the firmware gives us.
+fn wake_stamps() -> &'static Mutex<HashMap<u16, Instant>> {
+    static W: OnceLock<Mutex<HashMap<u16, Instant>>> = OnceLock::new();
+    W.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Note that `pid` just announced a power event.
+fn note_wake(pid: u16) {
+    let mut map = wake_stamps().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    map.insert(pid, Instant::now());
+}
+
+/// Did `pid` wake within the last [`WAKE_CONTEXT`]? Used only to decide whether an announce neuron
+/// cannot attribute is more likely the user's hand or the firmware reloading state.
+fn recent_wake(pid: u16) -> bool {
+    let map = wake_stamps().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    map.get(&pid).is_some_and(|t| t.elapsed() < WAKE_CONTEXT)
+}
+
+/// How long after a power poke an unattributable DPI announce is read as part of the wake rather
+/// than as a person pressing a button. Generous next to a wake burst (a few ms) and far shorter
+/// than any session of actual use, so it costs at most one adoption right after a wake.
+const WAKE_CONTEXT: Duration = Duration::from_secs(10);
+
 /// Hand back the window [`reassert_due`] just claimed, so another trigger for the SAME wake can
 /// still take it.
 ///
@@ -1549,6 +1575,7 @@ fn maybe_reconcile_announced(pid: u16, announced: u16) {
     let mode = neuron::writes::device_mode(&d);
     if mode != Some(0x03) {
         reassert_release(pid);
+        adopt_unattributable(pid, announced);
         crate::flight::trace(
             "dpi",
             "announce foreign but the button is not ours to attribute",
@@ -1563,6 +1590,52 @@ fn maybe_reconcile_announced(pid: u16, announced: u16) {
     }
     crate::flight::trace("dpi", "announce foreign; healing", u64::from(announced));
     reconcile_now(pid, &d);
+}
+
+/// Learn a DPI neuron could not attribute but has good reason to believe the user chose.
+///
+/// Declining to HEAL is only half of respecting a firmware-owned DPI button. The recorded intent is
+/// what `reassert_feel` enforces on every wake, and it is mode-blind — so leaving it stale means the
+/// user's press stands until the mouse next sleeps and is then quietly undone. That is the same
+/// symptom as a device that changes its own DPI, produced by neuron instead of by the firmware.
+///
+/// Two conditions, and both are needed:
+///
+///   * the value is one of the stages the user THEMSELVES configured. A cycle button can only land
+///     on a configured stop, so a value outside the table was not a press — that is the shape the
+///     2026-07-07 trap had (factory 16000 against a `[800, 30000]` table), and adopting it would
+///     launder a corruption into the record.
+///   * no power poke in the last [`WAKE_CONTEXT`]. A restore arrives as part of a wake; a person
+///     pressing a button is using a mouse that is already awake. This is the only signal that
+///     separates the two, and without it the ambiguity is genuine — a wake that restores the OTHER
+///     configured stage is indistinguishable from a press, by construction.
+///
+/// Records only the active DPI, never the stage table: the table is the user's configuration and a
+/// press does not edit it.
+fn adopt_unattributable(pid: u16, announced: u16) {
+    let Some(intent) = neuron::feel_intent::get(pid) else {
+        return; // nothing configured, so nothing to keep coherent
+    };
+    if !intent.stages.contains(&announced) {
+        return;
+    }
+    if recent_wake(pid) {
+        crate::flight::trace("dpi", "not adopted: arrived with a wake", u64::from(announced));
+        return;
+    }
+    match neuron::feel_intent::record_dpi(pid, announced, announced) {
+        Ok(()) => {
+            crate::flight::trace("dpi", "adopted the user's onboard choice", u64::from(announced));
+            if verbose() {
+                eprintln!("[hidwatch] pid={pid:04x}: adopted onboard DPI {announced} as intent");
+            }
+        }
+        Err(e) => {
+            if verbose() {
+                eprintln!("[hidwatch] pid={pid:04x}: adopting onboard DPI {announced} failed: {e}");
+            }
+        }
+    }
 }
 
 /// Run the disagreement-gated reconcile against an already-opened, already-family-checked device and
@@ -1618,6 +1691,26 @@ mod tests {
 
     // The Naga V2 Pro's dongle PID — the device that ships the `[side_plates]` map.
     const NAGA_PID: u16 = 0x00A8;
+
+    /// The wake stamp is what separates "the user pressed a button" from "the firmware reloaded
+    /// state" on a device whose DPI button neuron cannot attribute. It must decay.
+    #[test]
+    fn a_wake_is_only_recent_for_as_long_as_the_window_says() {
+        const PID: u16 = 0xFE02; // a pid no other test drives
+        assert!(!recent_wake(PID), "a device that never woke must not look freshly woken");
+        note_wake(PID);
+        assert!(recent_wake(PID), "a poke just seen is wake context");
+        // Stamp it far enough back that the window has certainly closed, without sleeping.
+        {
+            let mut map = wake_stamps().lock().unwrap();
+            map.insert(PID, neuron::timing::ago(WAKE_CONTEXT + Duration::from_secs(1)));
+        }
+        assert!(
+            !recent_wake(PID),
+            "past the window an unattributable announce is a person, not a restore"
+        );
+        wake_stamps().lock().unwrap().remove(&PID);
+    }
 
     /// A trigger that looks and declines must leave the window for one that would actually heal.
     #[test]
