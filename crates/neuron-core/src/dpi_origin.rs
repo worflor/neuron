@@ -27,7 +27,17 @@
 //!   tray, which never saw that write happen.
 //!
 //! A value accounted for by either is left alone. Only a value accounted for by NEITHER is
-//! [`Origin::Foreign`] — nobody asked for it, so the device did it to itself, so heal it.
+//! [`Origin::Foreign`] — nobody asked for it, so the device did it to itself.
+//!
+//! ## What this can and cannot speak for
+//!
+//! Attribution covers changes that PASS THROUGH neuron. Whether a given change does is a property
+//! of the device's mode, not of this module: in driver mode the firmware defers its DPI button to
+//! the host, so every legitimate change is one neuron wrote; in normal mode the firmware walks the
+//! cycle itself and only announces the result, and that announce is indistinguishable here from a
+//! stale restore. [`Origin::Foreign`] therefore means "neuron cannot account for this", not "the
+//! user did not do this" — a caller acting on it owes its own check that neuron was in a position
+//! to know. `hidwatch::maybe_reconcile_announced` is the worked example.
 //!
 //! ## No expiry, deliberately
 //!

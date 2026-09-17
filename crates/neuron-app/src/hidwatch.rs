@@ -1501,7 +1501,9 @@ fn maybe_reassert(pid: u16) {
 ///     `neuron dpi …` run in another process arrives on).
 ///   • [`Origin::Unknown`] — no recorded intent for this device, so nothing to compare and nothing a
 ///     reassert could write anyway.
-///   • [`Origin::Foreign`] — accounted for by neither. The device moved itself. Heal it.
+///   • [`Origin::Foreign`] — accounted for by neither. Heal it, but only past the custody gate
+///     below: attribution can only speak for changes that pass through neuron, and in normal mode
+///     the DPI button does not.
 ///
 /// Same `dialect != "razer"` family gate as [`maybe_reassert`]: the varstore getters the reconcile
 /// reads are razer-framed, so bail before any read on a non-razer def `open_device` resolved by pid.
@@ -1520,7 +1522,6 @@ fn maybe_reconcile_announced(pid: u16, announced: u16) {
         }
         return;
     }
-    crate::flight::trace("dpi", "announce foreign; healing", u64::from(announced));
     let Some(d) = open_device(pid) else {
         reassert_release(pid);
         return;
@@ -1529,6 +1530,38 @@ fn maybe_reconcile_announced(pid: u16, announced: u16) {
         reassert_release(pid);
         return;
     }
+    // THE CUSTODY GATE, and the reason provenance alone is not enough here. Attribution can only
+    // account for DPI changes that PASS THROUGH neuron, and which changes those are is decided by
+    // the device's mode: in driver mode the firmware defers its DPI button to us (see
+    // [`fulfill_button`]), so every legitimate change is one we wrote and stamped, and an
+    // unattributed one really is the device moving on its own. In NORMAL mode the firmware walks
+    // the cycle ITSELF and merely announces the result — that announce is the user's thumb, and
+    // nothing distinguishes it from a stale restore at this point. Healing it would fight them.
+    //
+    // An UNREADABLE mode is treated as "not ours" for the same reason, and it is not hypothetical:
+    // the Naga V2 Pro dongle does not support the `00/84` getter at all (probed 2026-09-16), so on
+    // that device this path never heals — and neither does [`fulfill_button`], which declines on the
+    // same `Some(0x03)` test, so its DPI button is firmware-owned end to end.
+    //
+    // Declining here does not leave such a device unprotected: the `05 0c` power poke and
+    // `startup_reassert` still reconcile it, and both are WAKE-triggered rather than button-
+    // triggered, so neither can be provoked by a press.
+    let mode = neuron::writes::device_mode(&d);
+    if mode != Some(0x03) {
+        reassert_release(pid);
+        crate::flight::trace(
+            "dpi",
+            "announce foreign but the button is not ours to attribute",
+            u64::from(mode.unwrap_or(0xFF)),
+        );
+        if verbose() {
+            eprintln!(
+                "[hidwatch] pid={pid:04x}: DPI announce {announced} foreign, but device_mode={mode:?} is not driver — no reconcile"
+            );
+        }
+        return;
+    }
+    crate::flight::trace("dpi", "announce foreign; healing", u64::from(announced));
     reconcile_now(pid, &d);
 }
 
