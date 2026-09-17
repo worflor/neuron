@@ -109,6 +109,30 @@ pub fn record_stages(pid: u16, stages: &[u16], active: u8) -> anyhow::Result<()>
     save_file(&f)
 }
 
+/// This pid's record exactly as stored, empty or not — the counterpart to [`restore`], for a caller
+/// that must be able to put things back the way they were.
+pub fn snapshot(pid: u16) -> Option<FeelIntent> {
+    load_file().devices.get(&pid_key(pid)).cloned()
+}
+
+/// Put `prev` back, as taken by [`snapshot`]. `None` removes the entry.
+///
+/// Intent is recorded BEFORE the device write that fulfils it (see [`crate::capability::set_dpi`]),
+/// so a refused write has to be able to undo the claim — otherwise the record would assert a
+/// sensitivity the hardware never took, and the next reassert would enforce it.
+pub fn restore(pid: u16, prev: Option<FeelIntent>) -> anyhow::Result<()> {
+    let mut f = load_file();
+    match prev {
+        Some(i) => {
+            f.devices.insert(pid_key(pid), i);
+        }
+        None => {
+            f.devices.remove(&pid_key(pid));
+        }
+    }
+    save_file(&f)
+}
+
 /// Forget a device's record (e.g. the user explicitly resets to hardware defaults).
 pub fn clear(pid: u16) -> anyhow::Result<()> {
     let mut f = load_file();

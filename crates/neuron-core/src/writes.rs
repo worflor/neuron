@@ -351,6 +351,17 @@ impl DpiStage {
     }
 }
 
+/// Which stage a table actually lands on, given a requested index.
+///
+/// The firmware has no say and neither does the caller: an out-of-range request is CLAMPED to the
+/// last stage rather than refused. That is one rule, and it has to be one function — the stage
+/// writer stamps the resulting DPI as the value the device is about to announce, and if its notion
+/// of "active" ever drifted from the payload's, the write would go out unattributed and the wake
+/// reconcile would fight it. An empty table has no active stage; callers reject that before here.
+fn active_index(stage_count: usize, active_idx: u8) -> usize {
+    usize::from(active_idx).min(stage_count.saturating_sub(1))
+}
+
 /// Build the DPI-stage SET payload from a stage list and the active index (0-based API).
 ///
 /// Layout (the exact inverse of the proven read at 0x04/0x83):
@@ -377,7 +388,7 @@ pub fn build_dpi_stages_payload(
         );
     }
     let count = stages.len() as u8;
-    let active = active_idx.min(count.saturating_sub(1));
+    let active = active_index(stages.len(), active_idx) as u8;
     let mut buf = vec![0u8; DPI_STAGES_SIZE as usize];
     buf[0] = store.byte();
     buf[1] = active + 1; // 1-based on the wire — 0 is REJECTED by the firmware (probed live)
@@ -446,33 +457,72 @@ pub fn read_persisted_dpi_stages(d: &Device) -> Vec<u16> {
 /// verify step is the safety net: if the device doesn't echo the table we wrote, this returns an
 /// error and the table is treated as not applied. Default `store` (Volatile) keeps nothing
 /// permanent until a clean round-trip.
-pub fn set_dpi_stages(d: &Device, stages: &[DpiStage], active_idx: u8, store: Store) -> Result<()> {
+/// `cause` is threaded through for the same reason [`crate::capability::set_dpi`] takes one: landing
+/// a stage table also lands its ACTIVE stage as the live DPI (firmware behaviour), so this write
+/// produces a `05 02` announce exactly like a direct DPI set does. Without attribution here, neuron
+/// would see its own stage-table apply come back and try to heal it.
+pub fn set_dpi_stages(
+    d: &Device,
+    stages: &[DpiStage],
+    active_idx: u8,
+    store: Store,
+    cause: crate::dpi_origin::Cause,
+) -> Result<()> {
     // HARDWARE-PROVEN (Naga V2 Pro, 2026-06): SET 0x04/0x06 write + 0x04/0x86 read-back verified
     // live — wrote a 3-stage [400/800/1600] change and the user's real 2-stage [800/30000] back,
     // both round-tripped. Opcode is OpenRazer-confirmed (razer_chroma_misc_set_dpi_stages, PR#1138).
     // No env gate needed; the internal read-back verify (below) is the safety net.
+    //
+    // Built BEFORE anything is claimed, so a table this device could never accept (an empty list, a
+    // list longer than the hardware table) fails without having recorded a write.
     let payload = build_dpi_stages_payload(stages, active_idx, store)?;
-    ensure_driver(d);
-    d.exec_dynamic(CLASS_DPI, ID_DPI_STAGES_SET, DPI_STAGES_SIZE, &payload)
-        .map_err(|e| anyhow::anyhow!("DPI-stage write (0x04/0x06) was not accepted: {e}"))?;
 
-    // Read-back verify ON THE PLANE WE WROTE: the table body (from active_idx onward) must echo
-    // what we wrote. The old arg-less read-back landed on whichever plane the firmware defaults
-    // to — a Persist write with a diverged volatile plane then verify-failed against the WRONG
-    // plane's bytes. Passing the store byte as the getter arg reads the written plane itself.
-    let expect = &payload[1..];
-    let got = d
-        .exec_dynamic(CLASS_DPI, ID_DPI_STAGES_GET, DPI_STAGES_SIZE, &[store.byte()])
-        .map_err(|e| anyhow::anyhow!("stage-table read-back (0x04/0x86) failed: {e}"))?;
-    if got.get(1..1 + expect.len()) != Some(expect) {
-        bail!(
-            "VERIFY FAILED on DPI stages ({:?} plane): wrote {} but device reports {} — write NOT trusted",
-            store,
-            hex_slice(expect),
-            hex_slice(&got[1..(1 + expect.len()).min(got.len())]),
-        );
+    // The active stage becomes the live DPI, so THAT is the value the device will announce — read
+    // through the same clamp the payload used, never the raw request, or a clamped write would go
+    // out unattributed. Claimed before the bytes leave and rolled back below if the table does not
+    // land, exactly as in `capability::set_dpi`.
+    let landing = stages.get(active_index(stages.len(), active_idx));
+    let prev_stamp = landing.map(|a| crate::dpi_origin::expect(d.pid, a.x, cause));
+    let prev_intent = (cause.is_durable() && landing.is_some()).then(|| {
+        let snap = crate::feel_intent::snapshot(d.pid);
+        let xs: Vec<u16> = stages.iter().map(|s| s.x).collect();
+        let _ = crate::feel_intent::record_stages(d.pid, &xs, active_index(stages.len(), active_idx) as u8);
+        snap
+    });
+
+    let landed = (|| -> Result<()> {
+        ensure_driver(d);
+        d.exec_dynamic(CLASS_DPI, ID_DPI_STAGES_SET, DPI_STAGES_SIZE, &payload)
+            .map_err(|e| anyhow::anyhow!("DPI-stage write (0x04/0x06) was not accepted: {e}"))?;
+
+        // Read-back verify ON THE PLANE WE WROTE: the table body (from active_idx onward) must echo
+        // what we wrote. The old arg-less read-back landed on whichever plane the firmware defaults
+        // to — a Persist write with a diverged volatile plane then verify-failed against the WRONG
+        // plane's bytes. Passing the store byte as the getter arg reads the written plane itself.
+        let expect = &payload[1..];
+        let got = d
+            .exec_dynamic(CLASS_DPI, ID_DPI_STAGES_GET, DPI_STAGES_SIZE, &[store.byte()])
+            .map_err(|e| anyhow::anyhow!("stage-table read-back (0x04/0x86) failed: {e}"))?;
+        if got.get(1..1 + expect.len()) != Some(expect) {
+            bail!(
+                "VERIFY FAILED on DPI stages ({:?} plane): wrote {} but device reports {} — write NOT trusted",
+                store,
+                hex_slice(expect),
+                hex_slice(&got[1..(1 + expect.len()).min(got.len())]),
+            );
+        }
+        Ok(())
+    })();
+
+    if landed.is_err() {
+        if let Some(prev) = prev_stamp {
+            crate::dpi_origin::rollback(d.pid, prev);
+        }
+        if let Some(snap) = prev_intent {
+            let _ = crate::feel_intent::restore(d.pid, snap);
+        }
     }
-    Ok(())
+    landed
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -516,7 +566,7 @@ pub fn reassert_feel(d: &Device, intent: &crate::feel_intent::FeelIntent) -> Res
             let live_xs = decode_dpi_stages(&plane);
             let live_active = decode_dpi_active(&plane).unwrap_or(0);
             if live_xs != intent.stages || live_active != intent.active {
-                set_dpi_stages(d, &stages, intent.active, store)
+                set_dpi_stages(d, &stages, intent.active, store, crate::dpi_origin::Cause::Reassert)
                     .map_err(|e| anyhow::anyhow!("{label} stage reassert failed: {e}"))?;
                 done.push(format!(
                     "{label} stages [{}] active {}",
@@ -539,7 +589,7 @@ pub fn reassert_feel(d: &Device, intent: &crate::feel_intent::FeelIntent) -> Res
             let live_x = ((a[1] as u16) << 8) | a[2] as u16;
             let live_y = ((a[3] as u16) << 8) | a[4] as u16;
             if (live_x, live_y) != (want_x, want_y) {
-                crate::capability::set_dpi(d, want_x, want_y, store)
+                crate::capability::set_dpi(d, want_x, want_y, store, crate::dpi_origin::Cause::Reassert)
                     .map_err(|e| anyhow::anyhow!("{label} dpi reassert failed: {e}"))?;
                 done.push(format!("{label} dpi {want_x}"));
             }
@@ -596,7 +646,7 @@ pub fn reconcile_volatile_with_persisted(d: &Device) -> Result<Vec<String>> {
         let live_active = decode_dpi_active(&volatile).unwrap_or(0);
         if live_xs != want_xs || live_active != want_active {
             let stages: Vec<DpiStage> = want_xs.iter().map(|&x| DpiStage::symmetric(x)).collect();
-            set_dpi_stages(d, &stages, want_active, Store::Volatile)
+            set_dpi_stages(d, &stages, want_active, Store::Volatile, crate::dpi_origin::Cause::Reassert)
                 .map_err(|e| anyhow::anyhow!("volatile stage reconcile failed: {e}"))?;
             done.push(format!(
                 "stages [{}] active {}",
@@ -624,7 +674,7 @@ pub fn reconcile_volatile_with_persisted(d: &Device) -> Result<Vec<String>> {
     let live_x = ((volatile_dpi[1] as u16) << 8) | volatile_dpi[2] as u16;
     let live_y = ((volatile_dpi[3] as u16) << 8) | volatile_dpi[4] as u16;
     if want_x > 0 && (want_x != live_x || want_y != live_y) {
-        crate::capability::set_dpi(d, want_x, want_y, Store::Volatile)
+        crate::capability::set_dpi(d, want_x, want_y, Store::Volatile, crate::dpi_origin::Cause::Reassert)
             .map_err(|e| anyhow::anyhow!("volatile dpi reconcile failed: {e}"))?;
         done.push(format!("dpi {want_x}"));
     }
@@ -632,56 +682,8 @@ pub fn reconcile_volatile_with_persisted(d: &Device) -> Result<Vec<String>> {
     Ok(done)
 }
 
-/// Pure membership test: is `announced` one of the DPI values in the persisted stage `cycle`? The
-/// device's onboard DPI-cycle button can ONLY ever land on a value that IS in the persisted cycle —
-/// cycle values are BY DEFINITION the legitimate stops the firmware walks — so a hit means "the
-/// user's thumb chose this, leave it." A miss means the announced DPI came from somewhere the user
-/// never configured: the trap-proven stale wake-restore's factory 16000 is the live proof (dpi_trap.log
-/// 08:39 — a wake self-announced 16000, absent from the user's `[800,30000]` cycle). Split out from
-/// [`announced_dpi_is_foreign`] so the rule is unit-testable without a device.
-fn dpi_in_cycle(cycle: &[u16], announced: u16) -> bool {
-    cycle.contains(&announced)
-}
-
-/// Is `announced` a FOREIGN DPI — one nobody legitimate chose? Reads this device's PERSISTED stage
-/// cycle (`0x04/0x86` with `[PERSISTED]`, decoded to its X list) and applies the [`dpi_in_cycle`]
-/// membership rule. This is the anti-fight-the-user gate for the `05 02` DPI-announce wake trigger,
-/// which fires on EVERY device-side DPI change — the user's onboard button-cycle AND the stale
-/// wake-restore alike — so the announce alone cannot tell a legitimate step from corruption; the
-/// persisted cycle can.
-///
-/// * `Some(false)` — `announced` IS a member of the persisted cycle → a legitimate onboard cycle-step
-///   by the user's button (cycle values are by definition members) → the caller does NOTHING (a
-///   reconcile would snap the cursor back against the user's thumb).
-/// * `Some(true)` — the cycle is non-empty and `announced` is NOT in it → nobody legitimate chose it
-///   (the trap-proven wake-restore: the 08:39 incident announced factory 16000 with NO `05 0c` power
-///   event, so the power-event trigger missed the wake and the stale plane sat uncorrected) → the
-///   caller runs [`reconcile_volatile_with_persisted`] (its own disagreement gate keeps the write
-///   minimal).
-/// * `None` — the persisted cycle is UNREADABLE (asleep link / short reply / empty table). Missing
-///   evidence is NEVER grounds to reconcile: the caller does nothing rather than heal against a value
-///   it can't corroborate.
-///
-/// Reads only (never gated). The device-truth cycle is supplied here; the pure rule lives in
-/// [`dpi_in_cycle`] so it needs no hardware to test.
-pub fn announced_dpi_is_foreign(d: &Device, announced: u16) -> Option<bool> {
-    // HOST INTENT FIRST: the recorded feel intent is the authority the firmware can't corrupt
-    // (the 2026-07-23 incident put the FACTORY table in both varstore planes, so a membership
-    // test against the device's own cycle would have blessed factory values as legitimate).
-    if let Some(i) = crate::feel_intent::get(d.pid) {
-        if !i.stages.is_empty() {
-            return Some(!dpi_in_cycle(&i.stages, announced));
-        }
-    }
-    let persisted = d
-        .exec_dynamic(CLASS_DPI, ID_DPI_STAGES_GET, DPI_STAGES_SIZE, &[PERSISTED])
-        .ok()?;
-    let cycle = decode_dpi_stages(&persisted);
-    if cycle.is_empty() {
-        return None; // unreadable / empty cycle → no evidence → caller must do nothing
-    }
-    Some(!dpi_in_cycle(&cycle, announced))
-}
+// Whether a device-announced DPI is worth reconciling is decided in `crate::dpi_origin`, from the
+// cause recorded when the write happened, not from the announced value.
 
 // ---------------------------------------------------------------------------------------------
 // 2. SCROLL STAGES — HyperScroll (class 0x0B). Least-proven path: feature-gated.
@@ -1713,19 +1715,6 @@ mod tests {
     }
 
     #[test]
-    fn dpi_in_cycle_gates_the_announce_reconcile() {
-        // MEMBER → a legitimate onboard-button cycle-step (the caller leaves it; never fought).
-        assert!(dpi_in_cycle(&[800, 30000], 800));
-        assert!(dpi_in_cycle(&[800, 30000], 30000));
-        // NON-MEMBER → the trap-proven stale wake-restore: factory 16000 is not in the user's
-        // `[800,30000]` cycle, so nobody legitimate chose it → foreign → reconcile (dpi_trap.log 08:39).
-        assert!(!dpi_in_cycle(&[800, 30000], 16000));
-        // EMPTY cycle has no members. `announced_dpi_is_foreign` maps an empty/unreadable cycle to
-        // None upstream (never reconcile on missing evidence); the pure rule just reports "no member".
-        assert!(!dpi_in_cycle(&[], 800));
-    }
-
-    #[test]
     fn button_remap_emits_input_to_action_rule() {
         let from = Trigger::Input {
             page: 0x09,
@@ -2069,5 +2058,71 @@ mod tests {
         );
         set_lift_off_distance(&lod_device(&phantom), 2)
             .expect_err("an unplugged device must never yield a trusted write");
+    }
+    // ── PROVENANCE: a claim only stands if the write did ───────────────────────────────────────
+    // `capability::set_dpi` records the value in `dpi_origin` (and, for a durable cause, in
+    // `feel_intent`) BEFORE the bytes go out, because the device can announce faster than the
+    // setter returns. The rollback is what keeps that honest. These drive the real funnel against a
+    // phantom that refuses the write, so a regression that deleted the rollback would fail here —
+    // the `dpi_origin` unit tests only pin the ledger's own bookkeeping, not its call sites.
+
+    // Pids with no entry in any real `feel-intent.toml`, so these judge the ledger alone — and ONE
+    // EACH, because the ledger is process-global and cargo runs these two in parallel: sharing a pid
+    // let one test's cleanup erase the other's stamp mid-assertion.
+    const REFUSED_PID: u16 = 0xFE03;
+    const LANDED_PID: u16 = 0xFE04;
+
+    fn dpi_device(phantom: &Arc<MockDevice>, pid: u16) -> Device {
+        let def: crate::registry::DeviceDef =
+            toml::from_str(include_str!("../devices/razer-naga-v2-pro.toml")).unwrap();
+        Device::with_transport(def, pid, Box::new(phantom.handle()))
+    }
+
+    #[test]
+    fn a_refused_dpi_write_does_not_leave_a_claim_behind() {
+        use crate::dpi_origin::{classify, expect, forget, Cause, Origin};
+        let phantom = Arc::new(
+            MockDevice::razer(REFUSED_PID, "phantom naga")
+                .answering(CLASS_DEVICE_MODE, ID_DEVICE_MODE_GET, &[DRIVER_MODE])
+                .faulting(Fault::Yank),
+        );
+        let d = dpi_device(&phantom, REFUSED_PID);
+
+        forget(REFUSED_PID);
+        let _ = expect(REFUSED_PID, 30000, Cause::Momentary); // a write that DID land, earlier
+
+        crate::capability::set_dpi(&d, 800, 800, Store::Volatile, Cause::Momentary)
+            .expect_err("a yanked device must not yield a trusted write");
+
+        assert_ne!(
+            classify(REFUSED_PID, 800),
+            Origin::Echo(Cause::Momentary),
+            "the ledger claimed a value the device never took, so a later drift to it would be waved through as our own echo"
+        );
+        assert_eq!(
+            classify(REFUSED_PID, 30000),
+            Origin::Echo(Cause::Momentary),
+            "rolling back the failed write must not also erase the last one that succeeded"
+        );
+        forget(REFUSED_PID);
+    }
+
+    #[test]
+    fn a_dpi_write_that_lands_keeps_its_claim() {
+        use crate::dpi_origin::{classify, forget, Cause, Origin};
+        // The control run: same plumbing, no fault. Without this, the test above would pass just as
+        // well against a funnel that never stamped anything at all.
+        let phantom = Arc::new(
+            MockDevice::razer(LANDED_PID, "phantom naga")
+                .answering(CLASS_DEVICE_MODE, ID_DEVICE_MODE_GET, &[DRIVER_MODE])
+                .answering(CLASS_DPI, 0x05, &[]), // set_dpi, per the Naga def
+        );
+        let d = dpi_device(&phantom, LANDED_PID);
+
+        forget(LANDED_PID);
+        crate::capability::set_dpi(&d, 800, 800, Store::Volatile, Cause::Momentary)
+            .expect("the honest phantom accepts the write");
+        assert_eq!(classify(LANDED_PID, 800), Origin::Echo(Cause::Momentary));
+        forget(LANDED_PID);
     }
 }

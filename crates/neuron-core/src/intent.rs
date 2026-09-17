@@ -58,10 +58,17 @@ fn next_dpi(cur: u16, step: i32, stages: &[u16]) -> u16 {
 /// Run the shared device/profile subset of [`Intent`].
 ///
 /// Returns `None` for app/window/instrument intents that only `neuron-app` can satisfy.
+///
+/// `cause` says WHERE this intent came from, and only the caller can know: the same `DpiSet` is a
+/// macro verb here and a bound key there, and the onboard DPI button arrives as a `DpiCycle` that is
+/// the user's thumb rather than software. It is threaded into every DPI write this runs (see
+/// [`crate::dpi_origin`]) so the announce those writes provoke is recognised as ours, and it decides
+/// whether the result becomes durable intent.
 pub fn run_shared_intent(
     devices: &mut DeviceSession<'_>,
     cursor: &mut impl ProfileCursor,
     intent: &Intent,
+    cause: crate::dpi_origin::Cause,
 ) -> Option<String> {
     use Intent::*;
 
@@ -82,7 +89,7 @@ pub fn run_shared_intent(
             // can't ask the mouse for an impossible sensitivity.
             let dpi = (*dpi).clamp(100, 30_000);
             match devices.with_writable("set_dpi", |d| {
-                cap::set_dpi(d, dpi, dpi, cap::Store::Persist)?;
+                cap::set_dpi(d, dpi, dpi, cap::Store::Persist, cause)?;
                 Ok(d.pid) // carry the acting device's pid for the per-device confirm de-dup
             }) {
                 Ok(pid) => {
@@ -114,7 +121,7 @@ pub fn run_shared_intent(
                 };
                 let cur = cap::dpi(d).map(|(x, _)| x)?;
                 let next = next_dpi(cur, dir.step(), &stages);
-                cap::set_dpi(d, next, next, cap::Store::Volatile)?;
+                cap::set_dpi(d, next, next, cap::Store::Volatile, cause)?;
                 Ok((d.pid, cur, next))
             });
             match result {
@@ -225,6 +232,7 @@ mod tests {
             &mut devices,
             &mut cursor,
             &Intent::Banish(WindowPick::Focused),
+            crate::dpi_origin::Cause::UserApplied,
         );
         assert_eq!(result, None);
     }
@@ -253,7 +261,12 @@ mod tests {
         let mut devices = DeviceSession::new(&reg);
         let mut cursor = Cursor::default();
 
-        let result = run_shared_intent(&mut devices, &mut cursor, &Intent::DpiSet(800));
+        let result = run_shared_intent(
+            &mut devices,
+            &mut cursor,
+            &Intent::DpiSet(800),
+            crate::dpi_origin::Cause::UserApplied,
+        );
 
         crate::writes::set_writes_paused(saved);
         assert_eq!(result.as_deref(), Some("[writes paused]"));

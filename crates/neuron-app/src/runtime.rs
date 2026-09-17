@@ -705,15 +705,9 @@ impl AppRuntime {
                 // then onboard-persist so hardware truth survives power-cycles and zero-software
                 // operation. A device without a working persist plane keeps the volatile success
                 // (its durability is the host's feel-intent reassert-on-wake instead).
-                match cap::set_dpi(&d, dpi, dpi, cap::Store::Volatile) {
+                match cap::set_dpi(&d, dpi, dpi, cap::Store::Volatile, neuron::dpi_origin::Cause::UserApplied) {
                     Ok(_) => {
-                        let onboard = cap::set_dpi(&d, dpi, dpi, cap::Store::Persist);
-                        // Record the HOST intent — the authority every wake/announce reassert
-                        // heals from. Disk trouble is a log-line, not a failed apply (the device
-                        // write already landed).
-                        if let Err(e) = neuron::feel_intent::record_dpi(d.pid, dpi, dpi) {
-                            eprintln!("[feel-intent] record dpi failed: {e}");
-                        }
+                        let onboard = cap::set_dpi(&d, dpi, dpi, cap::Store::Persist, neuron::dpi_origin::Cause::UserApplied);
                         // confirmation fires past the committed write — same as apply_polling /
                         // apply_brightness. Absolute set → no prior read, so no old→new.
                         neuron::confirm::dpi(d.pid, dpi as u32, None);
@@ -814,16 +808,12 @@ impl AppRuntime {
             Ok(d) => {
                 let _ = d.run("device_mode");
                 // DUAL-PLANE by design (2026-07-23): volatile (acts now) then onboard-persist
-                // (survives power-cycle / zero-software) — see apply_dpi. Host intent is recorded
-                // as the reassert authority either way.
-                match neuron::writes::set_dpi_stages(&d, &stages, active, cap::Store::Volatile) {
+                // (survives power-cycle / zero-software) — see apply_dpi. The writer records the
+                // host feel intent itself, from the declared cause.
+                match neuron::writes::set_dpi_stages(&d, &stages, active, cap::Store::Volatile, neuron::dpi_origin::Cause::UserApplied) {
                     Ok(()) => {
                         let onboard =
-                            neuron::writes::set_dpi_stages(&d, &stages, active, cap::Store::Persist);
-                        let xs: Vec<u16> = stages.iter().map(|s| s.x).collect();
-                        if let Err(e) = neuron::feel_intent::record_stages(d.pid, &xs, active) {
-                            eprintln!("[feel-intent] record stages failed: {e}");
-                        }
+                            neuron::writes::set_dpi_stages(&d, &stages, active, cap::Store::Persist, neuron::dpi_origin::Cause::UserApplied);
                         match onboard {
                             Ok(()) => format!(
                                 "DPI stages [{}] active {} (saved to mouse)",

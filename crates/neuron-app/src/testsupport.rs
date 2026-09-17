@@ -299,6 +299,91 @@ mod conventions {
         );
     }
 
+    // ── convention regression: no Instant - Duration in production code ────────────────────────
+    //
+    // On Windows an `Instant` is a `QueryPerformanceCounter` reading whose zero is SYSTEM BOOT, so
+    // `Instant::now() - Duration::from_secs(60)` panics for the first minute of every uptime — and
+    // the tray is launched by a logon scheduled task, which is exactly then. The seed-a-stale-stamp
+    // idiom these sites all wanted is `neuron::timing::ago`, which clamps to the clock origin
+    // instead of overflowing.
+    //
+    // `Duration - Duration` is banned by the same rule, deliberately: it panics on overflow too,
+    // and `checked_sub` is the honest spelling there as well. No exemptions — `timing.rs` itself
+    // uses `checked_sub` and so passes on its own merits.
+    #[test]
+    fn no_instant_minus_duration_in_production_code() {
+        let root = workspace_root();
+        let crates_dir = root.join("crates");
+        let mut files = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&crates_dir) {
+            for entry in entries.flatten() {
+                let src = entry.path().join("src");
+                if src.is_dir() {
+                    collect_rs_files(&src, &mut files);
+                }
+            }
+        }
+        assert!(
+            files.len() > 50,
+            "the workspace crate sweep under {} found only {} .rs file(s) — path resolution is broken",
+            crates_dir.display(),
+            files.len(),
+        );
+
+        let mut offenders = Vec::new();
+        for file in &files {
+            for (line, pat) in instant_minus_duration(file) {
+                offenders.push(format!("{}:{line} ({pat})", file.display()));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "seed backdated stamps with neuron::timing::ago(d) (or checked_sub) — subtracting a              Duration panics when the process is younger than the offset, which on Windows means              every boot
+{}",
+            offenders.join("
+")
+        );
+    }
+
+    /// `file:line` for every `Instant::now() - Duration`-shaped subtraction in `path`'s production
+    /// region. Same whitespace-collapse + `//`-strip treatment as [`bare_poison_unwraps`], so a
+    /// chain wrapped across lines is still caught and a doc comment naming the pattern is not.
+    /// Matches the two spellings that reach the panicking `Sub` impls: `Instant::now()-` (the
+    /// literal landmine) and `-Duration::from` (a backdated stamp off an `Instant` or `Duration`
+    /// variable, e.g. `now - Duration::from_secs(10)`).
+    fn instant_minus_duration(path: &Path) -> Vec<(usize, &'static str)> {
+        let Ok(content) = std::fs::read_to_string(path) else {
+            return Vec::new();
+        };
+        let production = strip_test_region(&content);
+
+        let mut haystack = String::with_capacity(production.len());
+        let mut line_at: Vec<usize> = Vec::with_capacity(production.len());
+        for (i, line) in production.lines().enumerate() {
+            let code = match line.find("//") {
+                Some(idx) => &line[..idx],
+                None => line,
+            };
+            for ch in code.chars().filter(|c| !c.is_whitespace()) {
+                haystack.push(ch);
+                line_at.push(i + 1);
+            }
+        }
+
+        let mut hits = Vec::new();
+        for needle in ["Instant::now()-", "-Duration::from"] {
+            let mut start = 0;
+            while let Some(pos) = haystack[start..].find(needle) {
+                let abs = start + pos;
+                hits.push((line_at.get(abs).copied().unwrap_or(0), needle));
+                start = abs + 1;
+            }
+        }
+        hits.sort_unstable();
+        hits.dedup();
+        hits
+    }
+
     /// `file:line` for every raw `thread::spawn(` or `thread::Builder` (with or without a `std::`
     /// prefix) in `path`'s production region. Whitespace-collapsed first (mirrors
     /// `bare_poison_unwraps`), so a call wrapped across lines is still caught; `//` line comments are

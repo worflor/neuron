@@ -477,18 +477,18 @@ fn main() {
     // once per episode and never flood the flight ring that holds the diagnosis). None = armed.
     let stall_name: RefCell<Option<String>> = RefCell::new(None);
     // RELIABILITY panel freshness: refresh the uptime/heartbeats/crash readout ~1s (not every 60ms).
-    let reliab_seen: RefCell<Instant> = RefCell::new(Instant::now() - Duration::from_secs(2));
-    let slow_seen: RefCell<Instant> = RefCell::new(Instant::now() - Duration::from_secs(2));
+    let reliab_seen: RefCell<Instant> = RefCell::new(neuron::timing::ago(Duration::from_secs(2)));
+    let slow_seen: RefCell<Instant> = RefCell::new(neuron::timing::ago(Duration::from_secs(2)));
     // CONNECTIONS event pokes: this consumer's last-seen host-bus stamp (each poller owns one so
     // two consumers can't swallow each other's wake-up).
     let host_events_seen: std::cell::Cell<u64> = std::cell::Cell::new(0);
-    let tray_seen: RefCell<Instant> = RefCell::new(Instant::now() - Duration::from_secs(2));
-    let status_tick_seen: RefCell<Instant> = RefCell::new(Instant::now() - Duration::from_secs(2));
+    let tray_seen: RefCell<Instant> = RefCell::new(neuron::timing::ago(Duration::from_secs(2)));
+    let status_tick_seen: RefCell<Instant> = RefCell::new(neuron::timing::ago(Duration::from_secs(2)));
     // VITALS pump edge-tracker: true once a `vitals` layer is live, so we FORCE a prompt read on the
     // rising edge (the surface just lit) and merely throttle-refresh after. false = no vitals surface up.
     let vitals_seen: RefCell<bool> = RefCell::new(false);
     // …and a ~1s steady-state gate so the pump enumerates at most ~1Hz while a vitals surface is up.
-    let vitals_pump_seen: RefCell<Instant> = RefCell::new(Instant::now() - Duration::from_secs(2));
+    let vitals_pump_seen: RefCell<Instant> = RefCell::new(neuron::timing::ago(Duration::from_secs(2)));
     timer.start(
         slint::TimerMode::Repeated,
         Duration::from_millis(60),

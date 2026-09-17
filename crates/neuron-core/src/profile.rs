@@ -496,12 +496,10 @@ impl Profile {
                     .dpi
                     .and_then(|cur| self.dpi_stages.iter().position(|&s| s == cur))
                     .unwrap_or(0) as u8;
-                writes::set_dpi_stages(d, &stages, active, store).map(|()| (d.pid, active))
+                writes::set_dpi_stages(d, &stages, active, store, crate::dpi_origin::Cause::UserApplied)
+                    .map(|()| (d.pid, active))
             }) {
-                Ok((pid, active)) => {
-                    // record the HOST feel intent — the authority wake/announce reasserts heal
-                    // from (a disk failure is inert here; the device write already landed).
-                    let _ = crate::feel_intent::record_stages(pid, &self.dpi_stages, active);
+                Ok((_pid, active)) => {
                     r.applied.push(format!(
                         "dpi stages [{}] active {}",
                         self.dpi_stages
@@ -516,10 +514,9 @@ impl Profile {
             }
         } else if let Some(dpi) = self.dpi {
             match devices.with_writable("set_dpi", |d| {
-                cap::set_dpi(d, dpi, dpi, store).map(|()| d.pid)
+                cap::set_dpi(d, dpi, dpi, store, crate::dpi_origin::Cause::UserApplied).map(|()| d.pid)
             }) {
-                Ok(pid) => {
-                    let _ = crate::feel_intent::record_dpi(pid, dpi, dpi);
+                Ok(_pid) => {
                     r.applied.push(format!("dpi {dpi}"));
                 }
                 Err(e) => r.skipped.push(format!("dpi: {e}")),

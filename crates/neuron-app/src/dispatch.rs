@@ -1193,7 +1193,7 @@ fn sniper_press(
     let _gates = crate::host::io_gate_all();
     let base = devices.borrow_mut().with_writable("set_dpi", |d| {
         let (base_x, _) = neuron::capability::dpi(d)?;
-        neuron::capability::set_dpi(d, dpi, dpi, neuron::capability::Store::Volatile)?;
+        neuron::capability::set_dpi(d, dpi, dpi, neuron::capability::Store::Volatile, neuron::dpi_origin::Cause::Momentary)?;
         Ok((base_x, d.pid))
     });
     if let Ok((base_x, pid)) = base {
@@ -1230,7 +1230,7 @@ fn sniper_release(
             // same wire discipline as the press: the restore is read-back verified
             let _gates = crate::host::io_gate_all();
             let ok = devices.borrow_mut().with_writable("set_dpi", |d| {
-                neuron::capability::set_dpi(d, base, base, neuron::capability::Store::Volatile)
+                neuron::capability::set_dpi(d, base, base, neuron::capability::Store::Volatile, neuron::dpi_origin::Cause::Momentary)
             });
             if ok.is_ok() {
                 neuron::confirm::sniper(pid, base as u32, None, false);
@@ -1271,7 +1271,7 @@ fn sniper_release_all(
     let _gates = crate::host::io_gate_all(); // park the lighting writers for the restore batch
     for (base, pid) in bases {
         let ok = devices.borrow_mut().with_writable("set_dpi", |d| {
-            neuron::capability::set_dpi(d, base, base, neuron::capability::Store::Volatile)
+            neuron::capability::set_dpi(d, base, base, neuron::capability::Store::Volatile, neuron::dpi_origin::Cause::Momentary)
         });
         if ok.is_ok() {
             neuron::confirm::sniper(pid, base as u32, None, false);
@@ -1441,7 +1441,12 @@ fn run_intent(
     // and the new profile's dark. Keyed on the CURSOR actually moving, so a failed switch (a target
     // that no longer loads) costs nothing.
     let before = neuron::profile::active();
-    let out = neuron::intent::run_shared_intent(devices, &mut cursor, intent)
+    let out = neuron::intent::run_shared_intent(
+        devices,
+        &mut cursor,
+        intent,
+        neuron::dpi_origin::Cause::UserApplied,
+    )
         .unwrap_or_else(|| "instrument routed".into());
     if neuron::profile::active() != before {
         request_reload();
@@ -1880,7 +1885,7 @@ mod tests {
         // trust it, so a future unserialized pauser fails loudly instead of intermittently.
         assert!(
             !neuron::writes::writes_paused(),
-            "writes are paused, so the switch below is gated: something flipped the process-wide              gate without taking cwd_guard"
+            "writes are paused, so the switch below is gated: something flipped the process-wide gate without taking cwd_guard"
         );
         // fixture first, so a failure below points at the routing rather than the setup.
         assert!(

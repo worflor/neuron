@@ -878,6 +878,11 @@ fn decode(
     if buf[0] == 0x04 {
         match button_intent(buf[1]) {
             Some(intent) => {
+                // The other candidate explanation for a DPI that moved on its own: the firmware
+                // handing us a deferred button we then faithfully act on. `DpiCycle` writes the
+                // volatile plane only and records no feel intent, so a spurious one is
+                // indistinguishable from a wake-restore afterwards — but distinguishable HERE.
+                crate::flight::trace("dpi", "deferred button intent", u64::from(buf[1]));
                 if let Some(tx) = button_worker() {
                     let _ = tx.send((pid, intent));
                 }
@@ -902,6 +907,11 @@ fn decode(
         0x02 => {
             let dpi = u16::from_be_bytes([buf[2], buf[3]]) as u32;
             if (100..=30_000).contains(&dpi) {
+                // The wander this subsystem exists to catch is silent by nature — it happens while
+                // the user is away and the only witness is the device's own announce. A breadcrumb
+                // costs a pointer store and puts the value in the flight recorder, so the next
+                // occurrence is evidence in `neuron-crash.log` rather than a bug report from memory.
+                crate::flight::trace("dpi", "device announced dpi", u64::from(dpi));
                 batch_push(pid, Push::Dpi(dpi));
                 // WAKE-RECONCILE, SECOND TRIGGER. The `05 0c` power poke is NOT emitted on every wake:
                 // dpi_trap.log 08:39 (resident app) caught a wake that restored DPI 16000 and announced
@@ -909,14 +919,15 @@ fn decode(
                 // stale plane sat uncorrected. The DPI-announce is the RELIABLE signal: it fires on
                 // every device-side DPI change, including the stale restore itself (the device confesses
                 // its own corruption). But unlike the `05 0c` reassert (unconditional), this trigger is
-                // MEMBERSHIP-GATED — the announce ALSO fires when the user's onboard DPI button walks
-                // the cycle, and snapping that back would fight the user's thumb — so the worker heals
-                // only a value FOREIGN to the persisted cycle (`maybe_reconcile_announced`). The decision
+                // ATTRIBUTED: the announce also fires for neuron's own writes and for the user's
+                // onboard DPI button, so `maybe_reconcile_announced` heals only a value that
+                // `neuron::dpi_origin` can account for to neither. The decision
                 // to admit this wake is made SYNCHRONOUSLY via the SAME 5s per-pid `reassert_due`
                 // debounce the `05 0c` hook uses: whichever trigger sees a given wake FIRST stamps the
-                // window and the other bows out, so one wake never double-fires a reconcile. The check
-                // itself (persisted-cycle read + reconcile = control-pipe round-trips that must never
-                // block this reader) rides its own off-thread worker.
+                // window and the other bows out, so one wake never double-fires a reconcile. A trigger
+                // that then declines hands the window back (`reassert_release`). The work itself rides
+                // an off-thread worker — the classification reads host state, and a reconcile is
+                // control-pipe round-trips that must never block this reader.
                 if reassert_due(pid) {
                     let announced = dpi as u16;
                     crate::worker::spawn_detached("neuron-hidwatch-dpi", move || {
@@ -951,8 +962,11 @@ fn decode(
         // equal what the volatile plane already held, the device emits no `05 02`). Both triggers funnel
         // into ONE debounced reconcile via the shared `reassert_due` stamps — whichever fires first for
         // a given wake wins the window — so this belt never double-fires against the announce path. The
-        // `05 0c` reassert stays UNCONDITIONAL (no membership gate): a power poke is never a user's
-        // onboard DPI button, so there is no legitimate cycle-step to protect here.
+        // `05 0c` reassert stays UNCONDITIONAL: a power poke is never a user's onboard DPI button, so
+        // there is nothing here to attribute and nothing to protect. It is also the only path that
+        // still catches a corrupted STAGE TABLE whose active DPI happens to match intent — the
+        // announce path judges the announced DPI alone, so the belt is what covers the 2026-07-23
+        // factory-table shape.
         0x0c => {
             let reassert = reassert_due(pid);
             crate::worker::spawn_detached("neuron-hidwatch-charge", move || {
@@ -1062,10 +1076,12 @@ fn deferred_hits(buf: &[u8]) -> Vec<(u16, u16)> {
 /// presses = 3 steps).
 ///
 /// INTERPLAY (DpiCycle): the volatile DPI write `run_shared_intent` makes here itself provokes a
-/// device `05 02` DPI-announce. That announce feeds `maybe_reconcile_announced`, whose membership gate
-/// recognizes an IN-CYCLE value and stays out of the way (it heals only values foreign to the persisted
-/// cycle) — so our own cycle-step is never fought. That quiet depends on the active profile's
-/// `dpi_stages` matching the device's persisted cycle; profile apply writes BOTH, so keep them synced.
+/// device `05 02` DPI-announce, which feeds `maybe_reconcile_announced`. Our own step is never fought
+/// because the write recorded itself in `neuron::dpi_origin` first, so the announce classifies as an
+/// echo. That used to depend on the announced value happening to be a member of the device's
+/// persisted cycle — which meant it also depended on the active profile's `dpi_stages` matching that
+/// cycle, and quietly stopped being true for anyone whose stage list had drifted. It no longer
+/// depends on either.
 fn button_intent(code: u8) -> Option<neuron::action::Intent> {
     use neuron::action::{Direction, Intent};
     match code {
@@ -1121,7 +1137,12 @@ fn fulfill_button(pid: u16, intent: neuron::action::Intent) {
     };
     let mut devices = neuron::device::DeviceSession::new(reg);
     let mut cursor = neuron::intent::ProcessProfileCursor;
-    if let Some(msg) = neuron::intent::run_shared_intent(&mut devices, &mut cursor, &intent) {
+    if let Some(msg) = neuron::intent::run_shared_intent(
+        &mut devices,
+        &mut cursor,
+        &intent,
+        neuron::dpi_origin::Cause::UserCycled,
+    ) {
         if verbose() {
             eprintln!("[hidwatch] pid={pid:04x}: 04-family button -> {msg}");
         }
@@ -1426,6 +1447,20 @@ fn reassert_due(pid: u16) -> bool {
     }
 }
 
+/// Hand back the window [`reassert_due`] just claimed, so another trigger for the SAME wake can
+/// still take it.
+///
+/// The debounce exists to stop a wake burst queueing several reconciles, and it treats the three
+/// triggers as interchangeable. They are not: the `05 02` announce is the only one that can decline
+/// (an announce that is our own echo, or that matches what the user configured, must heal nothing),
+/// and until this existed a declining announce still burned the window — silencing the unconditional
+/// `05 0c` belt for the next five seconds. Whoever decides NOT to heal releases, so the claim tracks
+/// reconciles actually run rather than glances taken.
+fn reassert_release(pid: u16) {
+    let mut map = reassert_stamps().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    map.remove(&pid);
+}
+
 /// Reconcile `pid`'s volatile DPI plane with its persisted truth after a wake — the Synapse duty
 /// neuron owes for a device whose onboard-profile flash reloads factory tables on wake (see
 /// `writes::reconcile_volatile_with_persisted` for the trap). NO device-mode gate: the reconcile was
@@ -1453,43 +1488,54 @@ fn maybe_reassert(pid: u16) {
     reconcile_now(pid, &d);
 }
 
-/// The DPI-ANNOUNCE (`05 02`) wake worker — the MEMBERSHIP-GATED sibling of [`maybe_reassert`]. Runs
-/// off the reader after the shared [`reassert_due`] debounce admitted this wake. The announce fires on
-/// EVERY device-side DPI change, so before healing we must tell a legitimate onboard-button cycle-step
-/// apart from the trap-proven stale wake-restore — `writes::announced_dpi_is_foreign` reads the
-/// device's PERSISTED cycle and tests membership:
-///   • `Some(false)` — `announced` is a cycle member → the user's onboard button chose it → do NOTHING
-///     (a reconcile would snap the cursor back against the user's thumb).
-///   • `Some(true)`  — the value is in no configured stage → nobody legitimate chose it (the 08:39
-///     wake-restore's factory 16000, which arrived with no `05 0c` power event) → run the reconcile.
-///   • `None`        — the persisted cycle is unreadable → do NOTHING (never heal on missing evidence).
-/// Same `dialect != "razer"` family gate as [`maybe_reassert`]: the varstore getters are razer-framed,
-/// so bail before any read on a non-razer def that `open_device` resolved by pid.
+/// The DPI-ANNOUNCE (`05 02`) worker. Runs off the reader after the shared [`reassert_due`] debounce
+/// admitted this event.
+///
+/// The announce fires on EVERY device-side DPI change — neuron's own writes coming back, the user's
+/// onboard button, and a wake restoring a stale plane — and the report itself carries nothing that
+/// tells them apart. It does not have to: [`neuron::dpi_origin::classify`] answers from what was
+/// recorded when the write happened, so this is a lookup rather than an inference.
+///
+///   • [`Origin::Echo`] — a write this process made. Ours; nothing to heal.
+///   • [`Origin::Configured`] — what the user's durable record says they want (this is the channel a
+///     `neuron dpi …` run in another process arrives on).
+///   • [`Origin::Unknown`] — no recorded intent for this device, so nothing to compare and nothing a
+///     reassert could write anyway.
+///   • [`Origin::Foreign`] — accounted for by neither. The device moved itself. Heal it.
+///
+/// Same `dialect != "razer"` family gate as [`maybe_reassert`]: the varstore getters the reconcile
+/// reads are razer-framed, so bail before any read on a non-razer def `open_device` resolved by pid.
 fn maybe_reconcile_announced(pid: u16, announced: u16) {
+    use neuron::dpi_origin::Origin;
+    // Classified BEFORE opening the device: the answer is host-side, and a device that has gone back
+    // to sleep must not turn "this was our own write" into an open failure.
+    let origin = neuron::dpi_origin::classify(pid, announced);
+    if origin != Origin::Foreign {
+        // Release the window: this glance ran no reconcile, and the `05 0c` belt may still have a
+        // real claim on the same wake.
+        reassert_release(pid);
+        crate::flight::trace("dpi", "announce accounted for; not healed", u64::from(announced));
+        if verbose() {
+            eprintln!("[hidwatch] pid={pid:04x}: DPI announce {announced} is {origin:?}; no reconcile");
+        }
+        return;
+    }
+    crate::flight::trace("dpi", "announce foreign; healing", u64::from(announced));
     let Some(d) = open_device(pid) else {
+        reassert_release(pid);
         return;
     };
     if d.def.dialect != "razer" {
+        reassert_release(pid);
         return;
     }
-    match neuron::writes::announced_dpi_is_foreign(&d, announced) {
-        Some(true) => reconcile_now(pid, &d),
-        _ => {
-            // Some(false) = legitimate onboard cycle-step; None = unreadable/empty cycle. Either way no
-            // heal — the anti-fight-the-user gate and the never-reconcile-on-missing-evidence rule.
-            if verbose() {
-                eprintln!(
-                    "[hidwatch] pid={pid:04x}: DPI announce {announced} not foreign; no reconcile"
-                );
-            }
-        }
-    }
+    reconcile_now(pid, &d);
 }
 
 /// Run the disagreement-gated reconcile against an already-opened, already-family-checked device and
 /// log the outcome. SHARED by both wake triggers — the `05 0c` power poke ([`maybe_reassert`], which
 /// reaches here unconditionally) and the `05 02` DPI-announce ([`maybe_reconcile_announced`], which
-/// reaches here only past the foreign-membership gate) — so the "a rare debounced device-integrity
+/// reaches here only for a DPI no writer and no record accounts for) — so the "a rare device-integrity
 /// event earns a line even without NEURON_HIDWATCH; the read/verify inside the write is the safety
 /// net" logging is identical on both paths.
 fn reconcile_now(pid: u16, d: &neuron::device::Device) {
@@ -1539,6 +1585,26 @@ mod tests {
 
     // The Naga V2 Pro's dongle PID — the device that ships the `[side_plates]` map.
     const NAGA_PID: u16 = 0x00A8;
+
+    /// A trigger that looks and declines must leave the window for one that would actually heal.
+    #[test]
+    fn releasing_the_debounce_hands_the_wake_back_to_the_other_triggers() {
+        // A pid no other test drives, so the process-global stamp map can't be raced.
+        const PID: u16 = 0xFE01;
+        reassert_release(PID);
+        assert!(reassert_due(PID), "a fresh pid's first claim must be admitted");
+        assert!(
+            !reassert_due(PID),
+            "the debounce still has to collapse a burst into one claim"
+        );
+        // The announce path's decline: it glanced, healed nothing, and gives the window back.
+        reassert_release(PID);
+        assert!(
+            reassert_due(PID),
+            "after a release the 05 0c belt must still be able to claim this wake"
+        );
+        reassert_release(PID);
+    }
 
     /// Deferred-button classification: plate keys become bindable macro-page hits, the cycle
     /// codes stay with the intent path, zeros are padding, and an all-released report is empty

@@ -2921,8 +2921,8 @@ fn dpi_stages_cmd(reg: &Registry, stages: &[u16], active: u8, persist: bool) -> 
     // "nothing was written" from "the live plane took it and onboard didn't", and those need
     // different reactions from the user — the second leaves the mouse acting correctly right now but
     // liable to revert on a power-cycle.
-    let res = writes::set_dpi_stages(&d, &st, active_idx, cap::Store::Volatile).and_then(|()| {
-        writes::set_dpi_stages(&d, &st, active_idx, cap::Store::Persist).map_err(|e| {
+    let res = writes::set_dpi_stages(&d, &st, active_idx, cap::Store::Volatile, neuron::dpi_origin::Cause::UserApplied).and_then(|()| {
+        writes::set_dpi_stages(&d, &st, active_idx, cap::Store::Persist, neuron::dpi_origin::Cause::UserApplied).map_err(|e| {
             anyhow::anyhow!(
                 "the LIVE plane accepted the stage table but the ONBOARD write failed, so the two \
                  planes are now DIVERGED (the mouse behaves correctly now, but may revert to its \
@@ -2932,11 +2932,6 @@ fn dpi_stages_cmd(reg: &Registry, stages: &[u16], active: u8, persist: bool) -> 
     });
     restore_custody_if_visitor(&d, prior);
     res?;
-    // Record the HOST feel intent — the authority the app's wake/startup reasserts heal from
-    // (whichever front door applied it). A disk failure is a note, not a failed apply.
-    if let Err(e) = neuron::feel_intent::record_stages(d.pid, stages, active_idx) {
-        println!("  note: feel-intent record failed: {e}");
-    }
     println!("  done — write verified against the device's stage-table read-back.");
     Ok(())
 }
@@ -3244,7 +3239,12 @@ fn run_daemon(reg: &Registry, seconds: Option<u64>, safe: bool) {
 #[cfg(windows)]
 fn run_intent(devices: &mut DeviceSession<'_>, intent: &neuron::action::Intent) -> String {
     let mut cursor = CliProfileCursor;
-    neuron::intent::run_shared_intent(devices, &mut cursor, intent)
+    neuron::intent::run_shared_intent(
+        devices,
+        &mut cursor,
+        intent,
+        neuron::dpi_origin::Cause::UserApplied,
+    )
         .unwrap_or_else(|| "app intent needs the resident app - run neuron-app".into())
 }
 
@@ -3787,13 +3787,13 @@ fn dpi_cmd(reg: &Registry, value: Option<u16>) -> Result<()> {
         // VISITOR discipline: capture the mode we found, write, then restore it whatever happens —
         // the whole reason `dpi_trap` looped was this verb leaving the driver lease held on exit.
         let prior = ensure_driver(&d);
-        let res = cap::set_dpi(&d, v, v, cap::Store::Persist);
+        let res = cap::set_dpi(&d, v, v, cap::Store::Persist, neuron::dpi_origin::Cause::UserApplied);
         // volatile too — a Persist write lands onboard; the LIVE plane must match right now
         // (dual-plane discipline, same as the app's apply_dpi).
         // Name WHICH plane landed if the pair breaks apart (see `dpi_stages_cmd`). Here the order is
         // reversed, so a partial failure means onboard holds the new DPI while the live plane does not.
         let res_vol = res.and_then(|()| {
-            cap::set_dpi(&d, v, v, cap::Store::Volatile).map_err(|e| {
+            cap::set_dpi(&d, v, v, cap::Store::Volatile, neuron::dpi_origin::Cause::UserApplied).map_err(|e| {
                 anyhow::anyhow!(
                     "the ONBOARD plane accepted DPI {v} but the LIVE write failed, so the two planes \
                      are now DIVERGED (the mouse may keep its old sensitivity until a reconnect or \
@@ -3803,9 +3803,6 @@ fn dpi_cmd(reg: &Registry, value: Option<u16>) -> Result<()> {
         });
         restore_custody_if_visitor(&d, prior);
         res_vol?;
-        if let Err(e) = neuron::feel_intent::record_dpi(d.pid, v, v) {
-            println!("note: feel-intent record failed: {e}");
-        }
     }
     // Read-back runs AFTER the restore — getters are mode-independent, so verified/MISMATCH still holds.
     let (x, y) = cap::dpi(&d)?;

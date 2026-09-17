@@ -343,7 +343,7 @@ fn ingest(slots: &mut Vec<Slot>, card: CardData) {
             deadline: now + HOLD,
             cur_y: 0.0,
             seeded: false,
-            bump_since: now - Duration::from_secs(10),
+            bump_since: neuron::timing::ago(Duration::from_secs(10)),
         },
     );
 }
@@ -395,7 +395,7 @@ fn ingest_ask(slots: &mut Vec<Slot>, pid: u64, _macro_id: &str, question: &str, 
             deadline: now + Duration::from_secs(86_400),
             cur_y: 0.0,
             seeded: false,
-            bump_since: now - Duration::from_secs(10),
+            bump_since: neuron::timing::ago(Duration::from_secs(10)),
         },
     );
 }
@@ -960,7 +960,7 @@ impl Music {
     fn new() -> Music {
         Music {
             deg: 0,
-            at: Instant::now() - Duration::from_secs(60),
+            at: neuron::timing::ago(Duration::from_secs(60)),
         }
     }
 

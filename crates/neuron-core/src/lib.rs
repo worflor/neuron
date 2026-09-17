@@ -43,6 +43,7 @@ pub mod controls;
 pub mod curtain;
 pub mod device;
 pub mod dialect;
+pub mod dpi_origin;
 pub mod discover;
 pub mod effects;
 pub mod engine;

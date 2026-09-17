@@ -110,7 +110,32 @@ impl Store {
 }
 
 /// Set sensitivity (DPI), X and Y, big-endian. `store` picks volatile vs onboard-persistent.
-pub fn set_dpi(dev: &Device, x: u16, y: u16, store: Store) -> Result<()> {
+///
+/// `cause` is not decoration. It is recorded in [`crate::dpi_origin`] before the bytes go out, which
+/// is what later lets a device-pushed DPI announce be recognised as this write coming back rather
+/// than as the device drifting on its own; and when [`crate::dpi_origin::Cause::is_durable`] holds,
+/// it also writes [`crate::feel_intent`], the record every wake reassert heals from. Both live here
+/// rather than at the call sites so that adding a new way to change DPI cannot skip either one —
+/// the reconcile's correctness depends on every writer declaring itself, which is the type system's
+/// job now rather than a convention six call sites had to remember.
+pub fn set_dpi(dev: &Device, x: u16, y: u16, store: Store, cause: crate::dpi_origin::Cause) -> Result<()> {
+    // Both provenance channels are claimed BEFORE the write, and rolled back if it is refused.
+    //
+    // The ordering is the point. The device can announce the new value before this call returns, so
+    // an announce that overtook its own record would be judged against stale evidence and "healed"
+    // straight back — neuron fighting a write it had just made. The on-disk half is what makes this
+    // hold across processes: a `neuron dpi 800` in a terminal is observed by the resident tray only
+    // as a device announce, and the record is the sole thing that tells the tray a human asked for
+    // it. Recorded after the write instead, the tray could read the old value and undo the command.
+    let prev_stamp = crate::dpi_origin::expect(dev.pid, x, cause);
+    let prev_intent = cause.is_durable().then(|| {
+        let snap = crate::feel_intent::snapshot(dev.pid);
+        // A failed record is swallowed, never propagated as a failed write: the device half still
+        // stands, and the cost of a lost record is a reassert that does nothing, not a wrong
+        // sensitivity.
+        let _ = crate::feel_intent::record_dpi(dev.pid, x, y);
+        snap
+    });
     let args = [
         store.byte(),
         (x >> 8) as u8,
@@ -120,7 +145,13 @@ pub fn set_dpi(dev: &Device, x: u16, y: u16, store: Store) -> Result<()> {
         0x00,
         0x00,
     ];
-    dev.run_args("set_dpi", &args)?;
+    if let Err(e) = dev.run_args("set_dpi", &args) {
+        crate::dpi_origin::rollback(dev.pid, prev_stamp);
+        if let Some(snap) = prev_intent {
+            let _ = crate::feel_intent::restore(dev.pid, snap);
+        }
+        return Err(e);
+    }
     Ok(())
 }
 

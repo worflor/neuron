@@ -653,7 +653,7 @@ mod tests {
                     usage: 0x22,
                     pid: Some(neuron::registry::CanonicalPid::of(0x0221)),
                 },
-                std::time::Instant::now() - TWIN_SETTLE,
+                neuron::timing::ago(TWIN_SETTLE),
             )),
         };
         let control = state.settled().expect("expired candidate commits");

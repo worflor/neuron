@@ -1048,7 +1048,12 @@ fn run_act(verb: &str, arg: &Value) -> (bool, String) {
     };
     let mut devices = crate::device::DeviceSession::new(reg);
     let mut cursor = crate::intent::ProcessProfileCursor;
-    match crate::intent::run_shared_intent(&mut devices, &mut cursor, &intent) {
+    match crate::intent::run_shared_intent(
+        &mut devices,
+        &mut cursor,
+        &intent,
+        crate::dpi_origin::Cause::UserApplied,
+    ) {
         Some(msg) => (true, msg),
         None => (false, "that action isn't available to macros".into()),
     }

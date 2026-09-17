@@ -273,7 +273,7 @@ mod imp {
         let mut session_exchanges: u32 = 0;
         let mut down = false;
         let mut esc_was = false;
-        let mut last_sent = Instant::now() - std::time::Duration::from_secs(1);
+        let mut last_sent = neuron::timing::ago(std::time::Duration::from_secs(1));
 
         crate::flight::trace(
             "knockback",

@@ -61,7 +61,7 @@
 //! fails noisily when refused — is invasive. See [`boost_input_thread`]'s doc for what to reach for
 //! if that ever changes.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Pause for `d` as part of a macro's timeline, and record how far it overshot.
 ///
@@ -185,10 +185,26 @@ fn boost_impl() -> bool {
     false
 }
 
+/// An `Instant` `d` in the past — clamped to the clock's origin instead of panicking when the
+/// process is younger than `d`.
+///
+/// `Instant::now() - d` is the obvious spelling and it panics. On Windows an `Instant` is a
+/// `QueryPerformanceCounter` reading whose zero is system boot, so subtracting a minute from "now"
+/// overflows for the first minute of every uptime — and a logon-launched process starts exactly
+/// then.
+///
+/// Callers use this to seed a "last seen" stamp far enough back that the first comparison reads as
+/// stale. When the clamp bites the stamp is the clock origin instead, so that first comparison
+/// reads as recent — a cosmetic miss in the opening seconds of a boot, which is the whole reason
+/// this is a clamp and not a panic.
+pub fn ago(d: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_sub(d).unwrap_or(now)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Instant;
 
     /// `SLEEP_ERROR` is a process-global histogram and cargo runs this module's tests in PARALLEL, so
     /// every test that sleeps would otherwise be recording into the same counter another test is
@@ -385,6 +401,19 @@ mod tests {
             "five more boosts on the SAME thread added {} phantom threads to the count",
             after_many - after_first
         );
+    }
+
+    #[test]
+    fn ago_clamps_instead_of_overflowing_the_clock_origin() {
+        let now = Instant::now();
+        let ordinary = ago(Duration::from_secs(10));
+        assert!(ordinary <= now, "an ordinary lookback must not land in the future");
+
+        // The boot-time case, forced: no process is ever this old, so the subtraction cannot be
+        // satisfied and the panic-free path is the ONLY one this can take. `Instant::now() - d`
+        // here would abort the test.
+        let absurd = ago(Duration::from_secs(60 * 60 * 24 * 365 * 1000));
+        assert!(absurd <= Instant::now(), "the clamped stamp must still be in the past");
     }
 
     #[test]

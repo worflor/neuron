@@ -50,7 +50,7 @@ impl AppFocusSwitch {
 
     #[cfg(test)]
     fn force_due(&mut self) {
-        self.last_check = Instant::now() - self.interval;
+        self.last_check = crate::timing::ago(self.interval);
     }
 }
 
