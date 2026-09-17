@@ -646,7 +646,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn resident_capture_commits_a_lone_macro_key_after_settle() {
-        let mut state = ControlCaptureState {
+        let state = ControlCaptureState {
             macro_candidate: Some((
                 CapturedControl {
                     page: neuron::controls::RAZER_MACRO_PAGE,

@@ -125,24 +125,135 @@ mod conventions {
         }
     }
 
-    /// This codebase's tests live in a trailing `#[cfg(test)]\nmod tests { ... }` block that runs to
-    /// EOF. Truncate at the FIRST line whose trimmed content is exactly `#[cfg(test)]` — everything
-    /// from there on is test code, where a bare `.lock().unwrap()` is fine (a poisoned lock in a test
-    /// SHOULD panic loudly). Verified against the real repo layout: every file in the audited census
-    /// has exactly one such marker, opening a `mod tests` that runs to the file's last line (including
-    /// `macro_host.rs`, which has production code both well before AND for hundreds of lines up to its
-    /// single trailing `#[cfg(test)]`) — so a naive truncation at the first marker is exactly right
-    /// here. `dispatch.rs` has one too (at its own trailing tests module) and is already clean, so it
-    /// must scan to zero — if it doesn't, this truncation heuristic is the thing that's wrong.
-    fn strip_test_region(src: &str) -> &str {
-        let mut offset = 0;
-        for line in src.lines() {
-            if line.trim() == "#[cfg(test)]" {
-                return &src[..offset];
+    /// A line with its trailing `//` comment removed — but only a REAL comment, not a `//` that
+    /// happens to sit inside a string literal.
+    ///
+    /// Cutting at the first `//` looks equivalent and is not. This very module contains
+    /// `line.find("//")`, and truncating that line there discards the `{` that follows it, which
+    /// unbalanced the brace count in [`strip_test_region`] and closed the `conventions` module ~450
+    /// lines early — silently handing its own needle literals to the scanners as if they were
+    /// production code. Every scanner here shares this, so one line cannot mislead them differently.
+    fn code_only(line: &str) -> &str {
+        let b = line.as_bytes();
+        let mut in_str = false;
+        let mut prev_escape = false;
+        let mut i = 0;
+        while i < b.len() {
+            // `/`, `"` and `'` are ASCII, so an index landing on one is always a char boundary
+            // even when the line holds multi-byte text.
+            if !in_str {
+                if b[i] == b'\'' {
+                    if let Some(end) = char_literal_end(b, i) {
+                        i = end + 1; // step over the whole literal, contents and all
+                        continue;
+                    }
+                }
+                if b[i] == b'/' && b.get(i + 1) == Some(&b'/') {
+                    return &line[..i];
+                }
             }
-            offset += line.len() + 1; // the '\n' this `lines()` iteration consumed
+            if b[i] == b'"' && !prev_escape {
+                in_str = !in_str;
+            }
+            prev_escape = b[i] == b'\\' && !prev_escape;
+            i += 1;
         }
-        src
+        line
+    }
+
+    /// Index of the closing quote of a CHAR LITERAL starting at `i`, or `None` when that quote opens
+    /// something else.
+    ///
+    /// Needed because a char literal can contain the very delimiters the scanners key on — this
+    /// module writes `b'"'`, and reading that quote as the start of a string swallowed the rest of
+    /// its line, brace and all. The `None` case is the reason this cannot just scan to the next
+    /// quote: a LIFETIME (`'a`) has no closing quote, and treating one as a literal would eat
+    /// arbitrary code after it.
+    fn char_literal_end(b: &[u8], i: usize) -> Option<usize> {
+        if b.get(i + 1) == Some(&b'\\') {
+            // An escape of any length: '\n', '\'', '\\', '\x41', '\u{1F600}'.
+            (i + 2..b.len()).find(|&j| b[j] == b'\'')
+        } else {
+            // A single character, which may be multi-byte: find the next quote, but only accept it
+            // as a literal if it is close enough to be one.
+            (i + 2..=(i + 5).min(b.len().saturating_sub(1)))
+                .find(|&j| b[j] == b'\'')
+                .filter(|&j| std::str::from_utf8(&b[i + 1..j]).is_ok_and(|s| s.chars().count() == 1))
+        }
+    }
+
+    /// `(opens, closes)` for the braces in `code` that actually delimit blocks — ignoring any inside
+    /// a string or a char literal, either of which can legally contain one.
+    fn count_braces(code: &str) -> (usize, usize) {
+        let b = code.as_bytes();
+        let (mut opens, mut closes) = (0usize, 0usize);
+        let mut in_str = false;
+        let mut prev_escape = false;
+        let mut i = 0;
+        while i < b.len() {
+            if !in_str && b[i] == b'\'' {
+                if let Some(end) = char_literal_end(b, i) {
+                    i = end + 1;
+                    continue;
+                }
+            }
+            match b[i] {
+                b'"' if !prev_escape => in_str = !in_str,
+                b'{' if !in_str => opens += 1,
+                b'}' if !in_str => closes += 1,
+                _ => {}
+            }
+            prev_escape = b[i] == b'\\' && !prev_escape;
+            i += 1;
+        }
+        (opens, closes)
+    }
+
+    /// The production text of `src`: everything except the items gated behind `#[cfg(test)]`.
+    ///
+    /// Test code is exempt from these conventions on purpose — a poisoned lock in a test SHOULD
+    /// panic loudly, and a test may spawn a raw thread. What matters is where the exemption STOPS.
+    /// This used to truncate at the FIRST `#[cfg(test)]` and treat the rest of the file as tests, on
+    /// the stated assumption that every file had exactly one, opening a trailing `mod tests`. That
+    /// assumption was wrong: more than twenty files carry a `#[cfg(test)]`-gated helper or `use`
+    /// well before their test module — `glue.rs` has four markers, `logos.rs` nine — so everything
+    /// after the first one, often most of the file, was silently exempt from all three conventions.
+    /// It never failed; it just quietly stopped looking.
+    ///
+    /// So skip each gated ITEM instead of the tail of the file: a braced item (`mod`, `fn`, `impl`)
+    /// is skipped by brace matching, a statement item (`use`, `const`) to its terminating `;`.
+    /// Braces inside line comments and string literals are ignored, since either would unbalance the
+    /// count and swallow the rest of the file — reinstating the very bug this replaces.
+    fn strip_test_region(src: &str) -> String {
+        let lines: Vec<&str> = src.lines().collect();
+        let mut kept = String::with_capacity(src.len());
+        let mut i = 0;
+        while i < lines.len() {
+            if lines[i].trim() != "#[cfg(test)]" {
+                kept.push_str(lines[i]);
+                kept.push('\n');
+                i += 1;
+                continue;
+            }
+            // Skip the attribute, then the single item it gates.
+            i += 1;
+            let mut depth = 0usize;
+            let mut opened = false;
+            while i < lines.len() {
+                let code = code_only(lines[i]);
+                let (opens, closes) = count_braces(code);
+                depth = depth + opens - closes.min(depth + opens);
+                opened |= opens > 0;
+                i += 1;
+                if opened && depth == 0 {
+                    break; // braced item closed
+                }
+                if !opened && code.trim_end().ends_with(';') {
+                    break; // statement item (a gated `use`/`const`)
+                }
+            }
+        }
+        kept
     }
 
     /// `file:line` for every bare `.lock()/.read()/.write()` + `.unwrap()` pair in `path`'s
@@ -161,10 +272,7 @@ mod conventions {
         let mut haystack = String::with_capacity(production.len());
         let mut line_at: Vec<usize> = Vec::with_capacity(production.len());
         for (i, line) in production.lines().enumerate() {
-            let code = match line.find("//") {
-                Some(idx) => &line[..idx],
-                None => line,
-            };
+            let code = code_only(line);
             for ch in code.chars().filter(|c| !c.is_whitespace()) {
                 haystack.push(ch);
                 line_at.push(i + 1); // 1-indexed, matching editor/compiler convention
@@ -360,10 +468,7 @@ mod conventions {
         let mut haystack = String::with_capacity(production.len());
         let mut line_at: Vec<usize> = Vec::with_capacity(production.len());
         for (i, line) in production.lines().enumerate() {
-            let code = match line.find("//") {
-                Some(idx) => &line[..idx],
-                None => line,
-            };
+            let code = code_only(line);
             for ch in code.chars().filter(|c| !c.is_whitespace()) {
                 haystack.push(ch);
                 line_at.push(i + 1);

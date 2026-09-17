@@ -1428,7 +1428,12 @@ pub fn write_proof_frames() {
     crate::overlay::proof_arm(&dir.to_string_lossy(), crop, scale);
 
     let (tx, rx) = std::sync::mpsc::channel();
-    let engine = std::thread::spawn(move || run(rx));
+    // `spawn_named` rather than the detached primitives: this harness JOINS the engine at the end to
+    // know every frame has been rendered, and the three `spawn_*` helpers return only `bool`. A
+    // refusal here is fatal on purpose — a proof run that silently rendered nothing would be worse
+    // than one that stops.
+    let engine = crate::worker::spawn_named("neuron-notif-proof", move || run(rx))
+        .expect("the proof harness cannot render without its engine thread");
 
     // A deterministic script through the REAL constructors — one card of each shape the surface
     // has to lay out, then a coalesce onto a live card (the bump), then the stack drains. Timed so
