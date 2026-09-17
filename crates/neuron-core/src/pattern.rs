@@ -1203,15 +1203,43 @@ impl Pattern for Heat {
     }
 }
 
+/// Deterministic 2-D value noise in 0..1 — smooth knot-interpolated hash fields, sampled by the
+/// flicker octaves below. Pure fn: same arguments, same answer, on any machine, forever.
+fn value_noise(sx: f32, sy: f32, seed: f32) -> f32 {
+    let ix = sx.floor();
+    let iy = sy.floor();
+    let fx = sx - ix;
+    let fy = sy - iy;
+    let ux = fx * fx * (3.0 - 2.0 * fx);
+    let uy = fy * fy * (3.0 - 2.0 * fy);
+    let h = |a: f32, b: f32| {
+        let n = (a * 127.1 + b * 311.7 + seed * 74.7).sin() * 43758.5453;
+        n - n.floor()
+    };
+    let a = h(ix, iy);
+    let b = h(ix + 1.0, iy);
+    let c = h(ix, iy + 1.0);
+    let d = h(ix + 1.0, iy + 1.0);
+    a + (b - a) * ux + (c - a) * uy + (a - b - c + d) * ux * uy
+}
+
 /// Per-column luminance flicker in 0..1 — multiplies a cell's heat-colour so the flame varies in
-/// BRIGHTNESS, not only along the ramp. Two incommensurate sines per column make an organic wobble; the
-/// DEPTH ramps with heat (hot tips flicker hard, cool embers barely waver). ≥0.5 even at the tips so a
-/// lick dims but never blinks fully out. A pure fn of column + time (the sim's seed row carries the rand).
+/// BRIGHTNESS, not only along the ramp. Four octaves of weighted value noise per column (a slow
+/// sway, the main dance, a shimmer, fine grain — finer octaves carry less weight, so the wobble is
+/// red-heavy rather than white) — a campfire commits low and dances fast, instead of the old
+/// two-sines' even wobble. Depth still ramps with heat (hot tips flicker more, cool embers barely
+/// waver). ≥0.5 even at the tips so a lick dims but never blinks fully out. A pure fn of column +
+/// time — stateless, so the flicker can't drift from the sim's own seeded row.
 fn fire_flicker(x: usize, t: f32, speed: f32, heat: f32) -> f32 {
     let xf = x as f32;
-    let a = (t * 9.0 * speed + xf * 1.7).sin();
-    let b = (t * 13.0 * speed + xf * 0.6 + 2.0).sin();
-    let mix = 0.5 + 0.5 * (0.6 * a + 0.4 * b);
+    let tt = t * speed;
+    // spatial frequencies ≈ 0.25 / 0.6 / 1.4 / 3.1 columns, temporal ≈ 4 / 11 / 28 / 65 Hz at
+    // speed 1 — adjacent columns stay coherent at the low octaves and decorrelate at the top.
+    let sway = value_noise(xf * 0.25, tt * 4.0, 11.0);
+    let dance = value_noise(xf * 0.60, tt * 11.0, 37.0);
+    let shimmer = value_noise(xf * 1.40, tt * 28.0, 59.0);
+    let grain = value_noise(xf * 3.10, tt * 65.0, 97.0);
+    let mix = (sway * 0.30 + dance * 0.34 + shimmer * 0.22 + grain * 0.14).clamp(0.0, 1.0);
     let depth = 0.06 + 0.34 * heat.clamp(0.0, 1.0);
     (1.0 - depth + depth * mix).clamp(0.0, 1.0)
 }
@@ -1676,7 +1704,9 @@ fn draw_comet(inten: &mut [f32], ucoord: &mut [f32], b: &CometBody, r: usize, c:
     let trail = b.trail.max(2.0);
     let mut d = 0.0;
     while d <= trail {
-        let f = 1.0 - d / trail; // 1 at the head → 0 at the tail end
+        // photographic streak falloff (f^1.6): the head burns sharp and the tail dims fast, so the
+        // streak has a crisp leading edge instead of a linear ramp that glows too long at the rear.
+        let f = (1.0 - d / trail).powf(1.6); // 1 at the head → 0 at the tail end
         let whiteness = ((f - 0.7) / 0.3).clamp(0.0, 1.0); // only the front of the streak whitens
         let v = b.bright * f;
         if v > 0.0 {
@@ -2042,7 +2072,7 @@ impl Pattern for Thermal {
         }
         // emit (u = temperature clamped to the ramp, intensity = breath × heat-haze shimmer). A fresh
         // flare (temp > 1) clamps u to the spectrum's hot/white end.
-        let breath = 0.94 + 0.06 * (t * TAU / 6.0).sin();
+        let breath = 0.94 + 0.06 * crate::effects::breathe_shape(t * TAU / 6.0);
         let cells = (0..n)
             .map(|i| {
                 let temp = self.heat[i].max(0.0);
@@ -2266,7 +2296,7 @@ impl Pattern for Meter {
                 self.last_t = t;
                 let rate = (0.4 + 2.0 * cpu.clamp(0.0, 1.0)) * spd;
                 self.breath_phase = (self.breath_phase + rate * dt).rem_euclid(1.0);
-                let breath = (0.85 + 0.15 * (self.breath_phase * TAU).sin()).clamp(0.0, 1.0);
+                let breath = (0.85 + 0.15 * crate::effects::breathe_shape(self.breath_phase * TAU)).clamp(0.0, 1.0);
                 Field::Scalar(render_load_meter(self.source, cpu, ram, breath, r, c))
             }
         }
@@ -2299,8 +2329,9 @@ fn paint_audio_tint(tone: f32, level: f32, n: usize) -> Vec<Cell> {
 /// board breathing (the rate rising with CPU). `source` selects `cpu`/`ram` (one full-board bar) or
 /// `load` (CPU on the top half, RAM on the bottom). Each lit cell emits `u = the zone's load` (so the
 /// spectrum's calm→urgent ramp colours the bar by load) and `intensity = the breath` (the fractional
-/// leading edge dims smoothly). `breath` is the caller's integrated breathe envelope (a wrapped phase's
-/// sin, in 0..1) — passed in, never re-derived from an absolute clock. Deterministic + testable.
+/// leading edge dims smoothly). `breath` is the caller's integrated breathe envelope
+/// (`0.85 + 0.15·breathe_shape`, in 0..1) — passed in, never re-derived from an absolute clock.
+/// Deterministic + testable.
 fn render_load_meter(source: u8, cpu: f32, ram: f32, breath: f32, r: usize, c: usize) -> Vec<Cell> {
     let mut cells = vec![Cell::new(0.0, 0.0); r * c];
     let cpu = cpu.clamp(0.0, 1.0);
@@ -2345,6 +2376,7 @@ pub struct Screen {
     dims: (u8, u8),
     speed: f32,
     saturation: f32,
+    last_t: f32,
 }
 
 impl Pattern for Screen {
@@ -2353,11 +2385,14 @@ impl Pattern for Screen {
         self.saturation = p.f32("saturation", 1.0);
     }
 
-    fn field(&mut self, rows: u8, cols: u8, _t: f32) -> Field {
+    fn field(&mut self, rows: u8, cols: u8, t: f32) -> Field {
         let n = rows as usize * cols as usize;
         if self.dims != (rows, cols) {
             self.prev = vec![Rgb::BLACK; n];
             self.dims = (rows, cols);
+            // anchor one reference tick back so the change frame eases a single step (as the old
+            // per-frame `ease` did) instead of stalling at dt=0
+            self.last_t = t - 1.0 / 60.0;
         }
         if n == 0 {
             return Field::Color(Vec::new());
@@ -2365,8 +2400,13 @@ impl Pattern for Screen {
         crate::screen_ambient::ensure();
         let (gc, gr, grid) = crate::screen_ambient::grid();
         let ease = (0.25 * self.speed).clamp(0.04, 1.0);
+        // frame-rate-independent ease: `ease` is the fraction closed per 60Hz frame — fold the real
+        // elapsed dt in so a slow renderer still catches the screen at the same chase speed.
+        let dt = (t - self.last_t).clamp(0.0, 0.25);
+        self.last_t = t;
+        let k = 1.0 - (1.0 - ease).powf(60.0 * dt);
         let boost = (self.saturation - 1.0).max(0.0);
-        self.prev = render_ambient(&grid, gc, gr, &self.prev, rows, cols, ease, boost);
+        self.prev = render_ambient(&grid, gc, gr, &self.prev, rows, cols, k, boost);
         Field::Color(self.prev.clone())
     }
 }
@@ -3605,6 +3645,37 @@ mod tests {
     /// Total heat (the `u` coordinate) in the TOP half — how far the flame climbs.
     fn heat_top(cells: &[Cell], rows: usize, cols: usize) -> f32 {
         cells[0..(rows / 2) * cols].iter().map(|c| c.u).sum()
+    }
+
+    #[test]
+    fn fire_flicker_is_pure_ranged_and_heat_ramped() {
+        // deterministic: same column + time → same flicker, forever (stateless, no RNG in the loop).
+        for x in 0..20 {
+            assert_eq!(fire_flicker(x, 3.14159, 1.0, 0.5), fire_flicker(x, 3.14159, 1.0, 0.5));
+        }
+        // always a valid multiplier in (0, 1], with the ≥0.5 tip floor the comment promises.
+        let mut seen_high = false;
+        for x in 0..40 {
+            for k in 0..30 {
+                let v = fire_flicker(x, k as f32 * 0.13, 1.0, 1.0);
+                assert!((0.5..=1.0).contains(&v), "hot tips flicker hard but never blink out ({v})");
+                seen_high |= v > 0.9;
+            }
+        }
+        assert!(seen_high, "the flame reaches near-full brightness sometimes");
+        // two streams at different speeds drift apart over time (they AREN'T static per column).
+        let mut diverged = false;
+        for k in 0..200 {
+            let (a, b) = (fire_flicker(3, k as f32 * 0.05, 1.0, 1.0), fire_flicker(3, k as f32 * 0.05, 2.0, 1.0));
+            diverged |= (a - b).abs() > 1e-3;
+        }
+        assert!(diverged, "speed must push the flicker to a different rhythm");
+        // adjacent columns share low-octave coherence without pinning identical (no full-board strobe).
+        let mut differs = false;
+        for k in (0..120).step_by(2) {
+            differs |= fire_flicker(2, k as f32 * 0.05, 1.0, 1.0) != fire_flicker(3, k as f32 * 0.05, 1.0, 1.0);
+        }
+        assert!(differs, "neighbouring columns house different flames");
     }
 
     #[test]

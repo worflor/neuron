@@ -931,7 +931,7 @@ mod imp {
             x1: i32,
             y1: i32,
         ) {
-            let breathe = 0.92 + 0.08 * ((frame as f32) * 0.045).sin();
+            let breathe = 0.92 + 0.08 * neuron::effects::breathe_shape((frame as f32) * 0.045);
             let r2 = radius * radius;
             for yy in y0.max(0)..y1.min(H) {
                 let dy = yy as f32 - CY;
@@ -1943,7 +1943,7 @@ mod imp {
                         mode,
                         WeaveMode::Twin { .. } | WeaveMode::NotifyStack
                     ) {
-                        let breathe = 0.85 + 0.15 * ((frame as f32) * 0.12).sin();
+                        let breathe = 0.85 + 0.15 * neuron::effects::breathe_shape((frame as f32) * 0.12);
                         splat_glow(&mut buf.glow, CX, CY, 26.0, 0.16 * charge * breathe);
                         splat_white(&mut buf.white, CX, CY, 7.0, 0.10 * charge);
                     }
@@ -2035,7 +2035,7 @@ mod imp {
                         let pulse = if fading {
                             1.0
                         } else {
-                            0.82 + 0.18 * ((frame as f32) * 0.18).sin()
+                            0.82 + 0.18 * neuron::effects::breathe_shape((frame as f32) * 0.18)
                         };
                         if n > 1 {
                             splat_glow(&mut buf.glow, CX + hx, CY + hy, 11.0, 0.16 * pulse); // head bloom
@@ -2166,7 +2166,7 @@ mod imp {
                             // materializes on entry (wireframe → built as presence crosses 0.5),
                             // breathes while alive, dims when unfed — the login IS the fidget.
                             let fx = sl - 30.0;
-                            let breathe = 0.78 + 0.22 * (tc * 0.045).sin();
+                            let breathe = 0.78 + 0.22 * neuron::effects::breathe_shape(tc * 0.045);
                             let p = presence.clamp(0.0, 1.0);
                             let twin_violet = (0.72, 0.65, 1.0);
                             if p < 0.45 {
@@ -2237,7 +2237,7 @@ mod imp {
                                     // the open BLUEPRINT — the unfinished line. It pulses gently:
                                     // the itch made visible. Strike it and it builds.
                                     3 => {
-                                        let pulse = 0.65 + 0.35 * (tc * 0.07).sin();
+                                        let pulse = 0.65 + 0.35 * neuron::effects::breathe_shape(tc * 0.07);
                                         hard_construct(
                                             &mut buf, cx, cy, b.r, 6, 0.4, b.rgb, pulse, true,
                                         );
@@ -2627,7 +2627,7 @@ mod imp {
                             let (di, dn) = (depth.0, depth.1);
                             if dn > 1 {
                                 let (px, py) = (CX + ghost.0 + 16.0, CY + ghost.1 - 4.0);
-                                let pulse = 0.6 + 0.4 * ((frame as f32) * 0.12).sin();
+                                let pulse = 0.6 + 0.4 * neuron::effects::breathe_shape((frame as f32) * 0.12);
                                 for layer in 0..dn.min(6) {
                                     let yy = py + layer as f32 * 5.0; // top = surface, down = deeper
                                     let lit = layer == di;
@@ -3232,7 +3232,7 @@ mod imp {
     /// visible cards. A short `card_frame` body with a small accent count; never a full card. ALL
     /// colour is the live material accent.
     fn draw_tail_pill(buf: &mut Buffers, cx: f32, cy: f32, frame: u32, accent: (f32, f32, f32), n: u32) {
-        let breath = 0.82 + 0.18 * ((frame as f32) * 0.05).sin();
+        let breath = 0.82 + 0.18 * neuron::effects::breathe_shape((frame as f32) * 0.05);
         // the tail pill has no per-slot fade of its own (it appears with the stack it summarises).
         card_frame(buf, cx, cy, STACK_HALF - 1.0, STACK_TAIL_H * 0.5, 9.0, accent, breath, false, 1.0);
         // SAFETY: same GDI text rasterization the render thread does everywhere; we're on that thread.
@@ -3276,7 +3276,7 @@ mod imp {
         // per frame would be waste) + a brighter tab breath, so a card that just updated visibly
         // "lands" again. `scale` rides 1.0→~1.06→1.0 over BUMP_MS (the engine's easing).
         let pop = (c.scale - 1.0).max(0.0);
-        let breath = (0.82 + 0.18 * ((frame as f32) * 0.05).sin()) * (1.0 + pop * 2.5);
+        let breath = (0.82 + 0.18 * neuron::effects::breathe_shape((frame as f32) * 0.05)) * (1.0 + pop * 2.5);
         let half = STACK_HALF;
         let ry = (h * 0.5).max(8.0);
         // CHROME — the same crafted frame, its half-extents nudged out by the bump pop and its tab
@@ -3425,7 +3425,7 @@ mod imp {
     ) {
         let a = d.alpha.clamp(0.0, 1.0);
         let rv = d.reveal.clamp(0.0, 1.0);
-        let breath = 0.82 + 0.18 * ((frame as f32) * 0.05).sin();
+        let breath = 0.82 + 0.18 * neuron::effects::breathe_shape((frame as f32) * 0.05);
         let h = 84.0;
         let ry = h * 0.5;
         let cx = STACK_AX;
@@ -3758,7 +3758,7 @@ mod imp {
             return;
         }
         let rad = (CX - 26.0).min(150.0);
-        let breathe = 0.72 + 0.28 * ((frame as f32) * 0.06).sin();
+        let breathe = 0.72 + 0.28 * neuron::effects::breathe_shape((frame as f32) * 0.06);
         let aimed_mag = (aim.0 * aim.0 + aim.1 * aim.1).sqrt();
         let idle = aimed_mag < 6.0;
         // the aimed wedge — a small threshold so it lights as you move, well before the commit radius.
@@ -3944,7 +3944,7 @@ mod imp {
     /// landing marker wears, miniature, in the directed-intent palette (an anchor is a place you
     /// CAN return to, shown quietly — not a destructive state, so it stays phosphor, never warn).
     fn warpstone_pip(buf: &mut Buffers, cx: f32, cy: f32, frame: u32) {
-        let breathe = 0.78 + 0.22 * ((frame as f32) * 0.08).sin();
+        let breathe = 0.78 + 0.22 * neuron::effects::breathe_shape((frame as f32) * 0.08);
         // a faint cross-tick ring (a moored stone) + a white core bead
         let rr = 4.6;
         for k in 0..18 {
@@ -4560,7 +4560,7 @@ mod imp {
                     ); // ink stroke
                 }
                 WedgeGlyph::Knockback => {
-                    let pulse = 0.85 + 0.15 * ((frame as f32) * 0.12).sin();
+                    let pulse = 0.85 + 0.15 * neuron::effects::breathe_shape((frame as f32) * 0.12);
                     varc(m, cx, cy, 0.3 * r * pulse, 0.0, TAU, sr, b);
                     varc(m, cx, cy, 0.58 * r * pulse, 0.0, TAU, sr, 0.7 * b);
                     varc(m, cx, cy, 0.86 * r * pulse, 0.0, TAU, sr, 0.4 * b);
@@ -4863,7 +4863,7 @@ mod imp {
         if w.glyph == WedgeGlyph::Blank && w.value.is_none() {
             return;
         }
-        let breathe = 0.85 + 0.15 * ((frame as f32) * 0.1).sin();
+        let breathe = 0.85 + 0.15 * neuron::effects::breathe_shape((frame as f32) * 0.1);
         let r = if hot { 18.0 } else { 12.0 };
         let bright = if hot {
             (1.05 + flare * 0.4) * breathe
@@ -4933,6 +4933,10 @@ mod imp {
             let y = cy + p[1] * scale;
             if let Some((px, py)) = prev {
                 let hue = i as f32 * 6.0 + frame as f32 * 1.5;
+                // spatial falloff like the comet's: the freshly-traced tip burns and the old tail
+                // fades away, so the ghost reads as a bar of light receding instead of a flat line.
+                let tip = i as f32 / (ghost.len() - 1) as f32;
+                let b = bright * (0.30 + 0.70 * tip);
                 let d = ((x - px).powi(2) + (y - py).powi(2)).sqrt();
                 let steps = (d / 3.0).ceil().max(1.0) as i32;
                 for s in 0..=steps {
@@ -4942,14 +4946,14 @@ mod imp {
                         px + (x - px) * u,
                         py + (y - py) * u,
                         2.4,
-                        bright,
+                        b,
                     );
                     splat_prism(
                         buf,
                         px + (x - px) * u,
                         py + (y - py) * u,
                         2.0,
-                        bright * 0.5,
+                        b * 0.5,
                         hsv(hue, 0.7, 1.0),
                     );
                 }
@@ -5071,7 +5075,7 @@ mod imp {
         let glow = glow.clamp(0.0, 1.0);
         let r = 150.0_f32; // arc radius
         let f = frame as f32;
-        let breathe = 0.85 + 0.15 * (f * 0.08).sin();
+        let breathe = 0.85 + 0.15 * neuron::effects::breathe_shape(f * 0.08);
         let span = 0.75 * TAU; // 270° sweep, gap centered on the bottom
         let start = 0.625 * TAU; // begin at 225° clockwise-from-north = lower-left
                                  // a point on the arc for parameter t in 0..1 (clockwise-from-north, like the ask wheel)

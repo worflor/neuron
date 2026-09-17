@@ -309,7 +309,9 @@ pub enum GhostSpeed {
 }
 
 impl GhostSpeed {
-    /// (base ms per char, ± jitter ms). The jitter keeps the cadence from being a metronome.
+    /// `(base ms per char, jitter scale ms)` — shared with the Python host's `type_ghost`. The
+    /// jitter keeps the cadence from being a metronome, and it is a one-sided slow tail (see
+    /// [`ghost_type`]), not a symmetric ±.
     pub fn timing(self) -> (u64, u64) {
         match self {
             GhostSpeed::Instant => (0, 0),
@@ -1220,11 +1222,18 @@ fn ghost_type(text: &str, speed: GhostSpeed) {
         if jit == 0 {
             return base;
         }
-        rng ^= rng << 13;
-        rng ^= rng >> 7;
-        rng ^= rng << 17;
-        // base ± jit, never below zero
-        (base + rng % (jit * 2 + 1)).saturating_sub(jit)
+        // organic cadence: a bell-ish jitter with a one-sided SLOW tail, floored at zero, instead of
+        // a flat ±uniform — mirrors the Python host's `type_ghost` (base + max(0, gauss(0.1·jit,
+        // 0.35·jit))), so both ghost typers share one feel. The sum of three uniforms is the bell.
+        let mut u = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            (rng >> 11) as f32 / (1u64 << 53) as f32
+        };
+        let z = (u() + u() + u() - 1.5) / 0.5; // mean 0, unit variance
+        let tail = (0.1 + 0.35 * z) * jit as f32;
+        base + tail.max(0.0) as u64
     };
     let chars: Vec<char> = text.chars().collect();
     let mut i = 0;
@@ -1245,7 +1254,17 @@ fn ghost_type(text: &str, speed: GhostSpeed) {
             _ => unsafe { win_key::unicode(c) },
         }
         i += 1;
-        let d = delay();
+        let mut d = delay();
+        // a longer beat after word and sentence breaks, like a typist finishing a phrase (the same
+        // multipliers, applied only mid-text, as the Python host's `type_ghost` — so the two paths
+        // stay in step right down to the trailing pause there is no reason to take)
+        if i < chars.len() {
+            match chars[i - 1] {
+                ' ' => d = d * 16 / 10,
+                '.' | ',' | ';' | ':' | '!' | '?' | '\u{2026}' => d = d * 24 / 10,
+                _ => {}
+            }
+        }
         if d > 0 {
             std::thread::sleep(Duration::from_millis(d));
         } else if i % 64 == 0 {

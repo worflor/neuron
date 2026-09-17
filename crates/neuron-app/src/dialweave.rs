@@ -17,6 +17,7 @@
 use crate::beacon::audio_cache::short_device;
 use neuron::action::DialTarget;
 use neuron::audio::VolumeCtl;
+use std::time::Instant;
 
 /// The live state of one slide.
 pub struct Dial {
@@ -26,6 +27,9 @@ pub struct Dial {
     pub value: f32,
     /// last stroke point (canvas-relative), for per-frame velocity
     last: Option<(f64, f64)>,
+    /// when the last point arrived — the dt basis for the smoothing (points do not always land
+    /// on the 16ms tick, and surrender at the end of a slide is even slower)
+    last_at: Option<Instant>,
     /// smoothed turn-speed 0..1 — drives the gauge's pulse (coarse vs fine reads on the glass)
     pub speed: f32,
     /// the resolved endpoint's friendly name ("Headset"), shown in the gauge hub
@@ -39,6 +43,7 @@ impl Default for Dial {
             ctl: None,
             value: 0.5,
             last: None,
+            last_at: None,
             speed: 0.0,
             device: String::new(),
         }
@@ -61,6 +66,7 @@ impl Dial {
         self.ctl = ep.and_then(|e| VolumeCtl::open(&e.id));
         self.value = self.ctl.as_ref().map(|c| c.get_volume()).unwrap_or(0.5);
         self.last = None;
+        self.last_at = None;
         self.speed = 0.0;
     }
 
@@ -77,6 +83,16 @@ impl Dial {
     /// Integrate a fresh stroke point into the value, apply it live, and return the overlay's
     /// `(label, fill, glow)` — the gauge's reading, height, and pulse.
     pub fn step(&mut self, pt: (f64, f64)) -> (String, f32, f32) {
+        // a per-point dt, with the 60Hz capture tick as the reference unit: a coalesced burst or a
+        // slow drain reads the same as a steady stream, so the old constant-per-point terms (which
+        // silently assumed ~16ms spacing) stop calibrating the tuning to the machine's timing.
+        let now = Instant::now();
+        let dt = self
+            .last_at
+            .map(|a| now.duration_since(a).as_secs_f32().clamp(0.0, 0.25))
+            .unwrap_or(1.0 / 60.0);
+        self.last_at = Some(now);
+        let dtn = dt * 60.0; // 1 at the reference tick
         if let Some(prev) = self.last {
             let (dx, dy) = (pt.0 - prev.0, pt.1 - prev.1);
             // the DOMINANT axis this frame: up / right = more, down / left = less. A curve
@@ -84,16 +100,19 @@ impl Dial {
             let raw = if dy.abs() >= dx.abs() { -dy } else { dx };
             let mag = raw.abs();
             // super-linear: the linear term gives fine control at a crawl; the squared term
-            // accelerates a fast sweep into a slam. Per-frame change is capped so one coalesced
-            // burst can't teleport the value.
-            let accel = (mag * 0.0011 + mag * mag * 0.00013).min(0.16);
+            // accelerates a fast sweep into a slam. `accel` is scaled by the elapsed dt so the
+            // tuning is frame-rate-independent, then hard-capped per event so one coalesced burst
+            // (a big dt) can't teleport the value — the cap must come AFTER the scale to do that.
+            let accel = ((mag * 0.0011 + mag * mag * 0.00013) * dtn as f64).min(0.16);
             self.value = (self.value + (raw.signum() * accel) as f32).clamp(0.0, 1.0);
             if let Some(c) = &self.ctl {
                 c.set_volume(self.value);
             }
-            self.speed = self.speed * 0.7 + ((mag as f32) * 0.02).min(1.0) * 0.3;
+            let target = (mag as f32 * 0.02).min(1.0);
+            let keep = (0.7f32).powf(60.0 * dt); // exponential smoothing, normalized to 60Hz ticks
+            self.speed = self.speed * keep + target * (1.0 - keep);
         } else {
-            self.speed *= 0.85; // decay the pulse while the hand is still
+            self.speed *= (0.85f32).powf(60.0 * dt); // pulse decay, same 60Hz normalization as above
         }
         self.last = Some(pt);
         self.reading()

@@ -313,8 +313,11 @@ impl Palette {
             Motion::Breathe { speed, depth } => {
                 let col = self.sample(u);
                 let d = depth.clamp(0.0, 1.0);
-                // raised-cosine dip in [1-d, 1]: full bright at the crest, dimmed by `depth` at the trough
-                let f = 1.0 - d * (0.5 - 0.5 * (t * TAU * speed).cos());
+                // asymmetric breathe (quick inhale, crest hold, long relax) dip in [1-d, 1]: full
+                // bright at the crest, dimmed by `depth` at the trough. Phase is shifted a third of a
+                // cycle so the crest (not the zero-crossing) sits at t=0, as the old cos did — but the
+                // shape's positive-shifted mean means this reads a touch brighter overall than cosine.
+                let f = 1.0 - d * 0.5 * (1.0 - crate::effects::breathe_shape(t * TAU * speed + TAU / 3.0));
                 col.scale_f(f)
             }
             Motion::Flow { speed, chaos } => self.sample(flow_u(u, t, speed, chaos)),

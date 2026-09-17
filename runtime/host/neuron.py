@@ -826,7 +826,8 @@ def type_text(s):
     return True
 
 
-# the SAME timing the native ghost-paste uses: (base ms/char, ± jitter ms). Instant is opt-in.
+# the SAME base timing the native ghost-paste uses: (base ms/char, jitter ms — the scale of a
+# one-sided slow tail, not a symmetric ±). Instant is opt-in.
 _GHOST_SPEED = {
     "instant": (0, 0),
     "borderline": (9, 5),
@@ -865,7 +866,19 @@ def type_ghost(s, speed="borderline"):
             code = ord(ch)
             _send_keys([_mk_unicode(code, False), _mk_unicode(code, True)])
         i += 1
-        d = base + (random.randint(-jit, jit) if jit else 0)
+        # organic keystroke timing: a Gaussian centered on base with a heavier, one-sided SLOW tail
+        # (a stalled sort-of-miss, never a negative delay) — the keystroke-dynamics rhythm instead of
+        # a flat uniform wobble.
+        d = base
+        if jit:
+            d = max(0.0, base + random.gauss(jit * 0.1, jit * 0.35))
+        # a longer beat after word and sentence breaks, like a typist finishing a phrase
+        if 0 < i < n:
+            prev_c = chars[i - 1]
+            if prev_c in ".,;:!?\u2026":
+                d *= 2.4
+            elif prev_c == " ":
+                d *= 1.6
         if d > 0:
             time.sleep(d / 1000.0)
     return True

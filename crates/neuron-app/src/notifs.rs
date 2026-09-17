@@ -140,8 +140,9 @@ const BUMP_MS: f32 = 120.0;
 /// What fraction of [`LEAVE_MS`] the FADE gets. The collapse still runs the full window (it owns
 /// closing the column gap); the card is visually gone by ~60% of it, so nobody watches the squash.
 const LEAVE_FADE_FRAC: f32 = 0.6;
-/// Reflow spring constant — fraction of the remaining gap closed per ~16ms tick (≈150ms settle).
-/// Crisp, not bouncy: a simple exponential approach, no overshoot.
+/// Reflow spring constant — fraction of the remaining gap closed per 60Hz tick (≈150ms settle).
+/// Crisp, not bouncy: a simple exponential approach, no overshoot. Applied with a dt-normalized
+/// exponent so a slower tick still settles in the same wall time.
 const REFLOW_K: f32 = 0.32;
 /// The engine's tick period while any note is alive (≈60fps).
 const TICK: Duration = Duration::from_millis(16);
@@ -214,6 +215,7 @@ pub fn run(rx: Receiver<Note>) {
     let mut music = Music::new();
     let mut slots: Vec<Slot> = Vec::new();
     let mut pushed_empty = false; // whether we've already told the overlay the stack went empty
+    let mut last_tick: Option<Instant> = None; // the reflow spring's dt anchor (reset while idle)
 
     loop {
         // No live cards → BLOCK until the next note (zero idle cost). With cards alive, wait only a
@@ -245,6 +247,7 @@ pub fn run(rx: Receiver<Note>) {
                 }
                 pushed_empty = true;
             }
+            last_tick = None; // start the spring fresh on the next card (no catapult from idle)
             continue;
         }
         pushed_empty = false;
@@ -255,7 +258,14 @@ pub fn run(rx: Receiver<Note>) {
         // "off" for confirmations (the ask is never gated), so default to top-centre then.
         let (nx, ny) = p.notif_place_xy().unwrap_or((0.5, 0.0));
         let ov = overlay.get_or_insert_with(crate::overlay::SpellOverlay::spawn);
-        reflow(&mut slots, mode); // ease the column toward its targets, then snapshot to the overlay
+        // real elapsed dt (bounded) — the reflow spring is dt-normalized, so a stalled/drained
+        // capture thread can't lag the column motion behind real wall time.
+        let now = Instant::now();
+        let dt = last_tick
+            .map(|t| now.duration_since(t).as_secs_f32().clamp(0.0, 0.25))
+            .unwrap_or(1.0 / 60.0);
+        last_tick = Some(now);
+        reflow(&mut slots, mode, dt); // ease the column toward its targets, then snapshot to the overlay
         let (slot_views, digest, tail) = present(&slots, mode);
         ov.stack(slot_views, mode_code(mode), (nx, ny), digest, tail);
     }
@@ -472,8 +482,9 @@ fn ease_out(t: f32) -> f32 {
 /// spring, ≈150ms settle, no overshoot), so when a card enters/leaves its neighbours GLIDE into the
 /// new gap instead of jumping. Mode-aware: Latest/Digest stack everything at y=0 (one spot); Stack
 /// lays a column. A fresh slot is SEEDED at its target (+ an entry slide handled by the overlay's
-/// alpha) so it doesn't sweep up from y=0 on its first frame. Must run before [`present`].
-fn reflow(slots: &mut [Slot], mode: StackMode) {
+/// alpha) so it doesn't sweep up from y=0 on its first frame. `dt` is the real elapsed seconds since
+/// the last tick (the spring is dt-normalized to 60Hz). Must run before [`present`].
+fn reflow(slots: &mut [Slot], mode: StackMode, dt: f32) {
     let now = Instant::now();
     // compute targets (independent of cur_y), then ease each toward its target.
     let mut targets: Vec<f32> = Vec::with_capacity(slots.len());
@@ -519,7 +530,8 @@ fn reflow(slots: &mut [Slot], mode: StackMode) {
             s.cur_y = t + ENTRY_SLIDE_PX;
             s.seeded = true;
         } else {
-            s.cur_y += (t - s.cur_y) * REFLOW_K; // crisp exponential approach
+            let k = 1.0 - (1.0 - REFLOW_K).powf(60.0 * dt); // dt-normalized crisp exponential approach
+            s.cur_y += (t - s.cur_y) * k;
         }
     }
 }

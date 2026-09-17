@@ -115,6 +115,33 @@ pub fn blend_px(under: Rgb, over: Rgb, mode: Blend) -> Rgb {
     }
 }
 
+// ── breathe shape — the shared "living light" envelope ─────────────────────────────────────
+
+/// The breathing envelope every alive effect exhales with: the same period as `sin`, but shaped
+/// like a real resting breath — a quick inhale, a short dwell at the crest, then a long relax
+/// (≈1:2 I:E with an ~7% top hold) — instead of a symmetric up-down wobble. `phase` is in RADIANS
+/// (one cycle per TAU); output spans −1 at the trough to +1 at the crest, so a caller keeps its
+/// existing `centre + amp * …` structure and only swaps the `sin` for a breathe.
+pub fn breathe_shape(phase: f32) -> f32 {
+    let t = (phase / std::f32::consts::TAU).rem_euclid(1.0);
+    // the inhale completes in the first third of the cycle and crests at sin's 90°; it then HOLDS,
+    // and the relax runs the remaining ~60% — long enough that the follow-through visibly drifts
+    // back down instead of snapping.
+    const INHALE: f32 = 1.0 / 3.0;
+    const CREST: f32 = 0.07;
+    const REST: f32 = 1.0 - INHALE - CREST;
+    let theta = if t < INHALE {
+        let u = t / INHALE;
+        let e = u * u * (3.0 - 2.0 * u); // smooth in, so the crest lands full, not peaked
+        std::f32::consts::FRAC_PI_2 * e
+    } else if t < INHALE + CREST {
+        std::f32::consts::FRAC_PI_2 // the dwell
+    } else {
+        std::f32::consts::FRAC_PI_2 + std::f32::consts::FRAC_PI_2 * 3.0 * (t - INHALE - CREST) / REST
+    };
+    theta.sin()
+}
+
 // ── colour-wheel helpers — shared by the Spectrum's hue motion ────────────────────────────
 
 /// Derive a hue (degrees, 0..360) from an Rgb. A greyscale/near-black colour has no hue, so it falls
@@ -198,5 +225,26 @@ mod tests {
         assert_eq!(jitter_hue(Rgb::new(40, 40, 40), 90.0), Rgb::new(40, 40, 40));
         // zero rotation is identity
         assert_eq!(jitter_hue(Rgb::new(1, 2, 3), 0.0), Rgb::new(1, 2, 3));
+    }
+
+    #[test]
+    fn breathe_shape_is_an_asymmetric_1_2_breath() {
+        let n = 240;
+        let vals: Vec<f32> = (0..=n)
+            .map(|k| breathe_shape(std::f32::consts::TAU * k as f32 / n as f32))
+            .collect();
+        let above = vals.iter().filter(|&&v| v > 0.0).count();
+        let below = vals.iter().filter(|&&v| v < 0.0).count();
+        // the positive (inhale + crest-hold) half owns the larger share of the cycle; the exhale
+        // sprint down through zero is the shorter leg (1:2 I:E, not a 1:1 sine)
+        assert!(above > n * 55 / 100, "the inhale-and-hold side should dominate the cycle (above={above})");
+        assert!(below < n * 45 / 100, "the through-zero exhale should take the short leg (below={below})");
+        // full −1..+1 range like sin, so `centre + amp * shape` behaves exactly like the old sine
+        let peak = vals.iter().cloned().fold(f32::MIN, f32::max);
+        let trough = vals.iter().cloned().fold(f32::MAX, f32::min);
+        assert!(peak > 0.995 && trough < -0.995, "must swing the full range ({peak}, {trough})");
+        // the crest actually HOLDS (a plateau, not a poke) — several samples sit at the top
+        let near_top = vals.iter().filter(|&&v| v > 0.999).count();
+        assert!(near_top >= 4, "the crest must dwell, not spike ({near_top})");
     }
 }
