@@ -580,19 +580,6 @@ fn main() {
                     }
                 }
 
-                // SIDE PLATE: the swappable plate is push-only (no getter), so the selected mouse's
-                // readout follows the last plate the device pushed (recorded in the confirmation core
-                // by hidwatch). Cheap last-known read; only writes on a change. The instant swap
-                // feedback is the confirmation card — this keeps the DEVICE-page readout honest.
-                if slow_due {
-                    crate::glue::refresh_selected_plate(app);
-                    // and the DEVICE-LIST row the plate belongs under — patched in place, not rebuilt.
-                    crate::glue::refresh_plated_row(app);
-                    // (the old ~1s LIVE mic-mute poll that lived here is GONE — a physical tap-mute now
-                    // reaches the device panel event-driven, via hidwatch's registry-driven bridge ->
-                    // glue::notify_hardware_mute, so there's nothing left to poll.)
-                }
-
                 // LINK lamp: lights only while the live loop is alive.
                 if slow_due {
                     if let Some(live) = r.live.as_ref() {

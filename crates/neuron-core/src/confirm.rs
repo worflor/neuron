@@ -20,6 +20,7 @@
 use std::collections::HashMap;
 use std::sync::mpsc::Sender;
 use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
 /// What changed. Drives the per-event config gate AND the visual/sonic leitmotif — one identity
 /// shared across the light (hue) and the sound (tonal centre).
@@ -136,10 +137,18 @@ struct Baselines {
     scroll: u32,
     plate: u32,
     plate_label: Option<String>,
+    /// When this device last told us something. `None` until it ever has.
+    ///
+    /// Exists to ORDER a push against a device scan. A scan reads the hardware at one instant and
+    /// lands on the UI some hundreds of milliseconds later; a push that arrives inside that gap
+    /// describes a newer reality than the scan does, and applying the scan's rows blind would
+    /// revert it with nothing left to correct it until the next change. Whoever merges the two
+    /// compares this against the moment the scan STARTED reading.
+    at: Option<Instant>,
 }
 impl Default for Baselines {
     fn default() -> Self {
-        Baselines { dpi: 0, scroll: 0, plate: PLATE_UNKNOWN, plate_label: None }
+        Baselines { dpi: 0, scroll: 0, plate: PLATE_UNKNOWN, plate_label: None, at: None }
     }
 }
 
@@ -156,6 +165,27 @@ fn baselines() -> &'static Mutex<HashMap<u16, Baselines>> {
 fn with_baseline<R>(pid: u16, f: impl FnOnce(&mut Baselines) -> R) -> R {
     let mut g = baselines().lock().unwrap_or_else(|p| p.into_inner());
     f(g.entry(pid).or_default())
+}
+
+/// Like [`with_baseline`], but also stamps the device as having just spoken. Every site that WRITES
+/// a baseline goes through this; a site that only reads must not, or a read would forge freshness.
+fn with_baseline_observed<R>(pid: u16, f: impl FnOnce(&mut Baselines) -> R) -> R {
+    with_baseline(pid, |b| {
+        b.at = Some(Instant::now());
+        f(b)
+    })
+}
+
+/// This device's last pushed DPI, but only if it arrived after `since`. `None` when the device has
+/// said nothing, has never reported a DPI, or last spoke before `since`.
+///
+/// The one question a scan-merge needs answered: is there an observation strictly newer than the
+/// hardware read I am about to apply? Because the device pushes on EVERY change, a later
+/// observation is by construction fresher than the scan's value.
+pub fn dpi_since(pid: u16, since: Instant) -> Option<u32> {
+    let g = baselines().lock().unwrap_or_else(|p| p.into_inner());
+    let b = g.get(&pid)?;
+    (b.dpi > 0 && b.at.is_some_and(|t| t > since)).then_some(b.dpi)
 }
 
 fn cell() -> &'static Mutex<Option<Sender<Confirmation>>> {
@@ -185,7 +215,7 @@ pub fn emit(c: Confirmation) {
 
 /// DPI committed to `value` (was `prev`) on device `pid`, on the 100..30000 track.
 pub fn dpi(pid: u16, value: u32, prev: Option<u32>) {
-    with_baseline(pid, |b| b.dpi = value); // baseline for THIS device's event de-dup
+    with_baseline_observed(pid, |b| b.dpi = value); // baseline for THIS device's event de-dup
     emit(Confirmation {
         kind: Kind::Dpi,
         shape: Shape::Ranged {
@@ -256,7 +286,7 @@ pub fn brightness(pct: u32, prev: Option<u32>) {
 
 /// A sensitivity / scroll stage committed to `value` on device `pid`, on a 0..`max` track.
 pub fn scroll(pid: u16, value: u32, max: u32, prev: Option<u32>) {
-    with_baseline(pid, |b| b.scroll = value); // baseline for THIS device's event de-dup
+    with_baseline_observed(pid, |b| b.scroll = value); // baseline for THIS device's event de-dup
     emit(Confirmation {
         kind: Kind::Scroll,
         shape: Shape::Ranged {
@@ -383,7 +413,7 @@ pub fn observe_scroll(pid: u16, stage: u32, max: u32) {
 pub fn observe_side_plate(pid: u16, id: u32, label: &str) {
     // Swap this device's plate baseline AND refresh its readout atomically under one lock, so a same-
     // code re-report or a detach still keeps the readout honest. `prev` is this pid's last known.
-    let prev = with_baseline(pid, |b| {
+    let prev = with_baseline_observed(pid, |b| {
         let prev = b.plate;
         b.plate = id;
         b.plate_label = Some(label.to_string());
@@ -409,19 +439,19 @@ pub fn observe_side_plate(pid: u16, id: u32, label: &str) {
 
 /// Learn device `pid`'s current DPI without carding (a wake/reconnect state sync). See module note above.
 pub fn prime_dpi(pid: u16, value: u32) {
-    with_baseline(pid, |b| b.dpi = value);
+    with_baseline_observed(pid, |b| b.dpi = value);
 }
 
 /// Learn device `pid`'s current scroll/sensitivity stage without carding (state sync). See [`prime_dpi`].
 pub fn prime_scroll(pid: u16, stage: u32) {
-    with_baseline(pid, |b| b.scroll = stage);
+    with_baseline_observed(pid, |b| b.scroll = stage);
 }
 
 /// Learn device `pid`'s current side plate without carding (state sync): updates that device's de-dup
 /// baseline AND its GUI readout label (the plate has no getter), exactly like [`observe_side_plate`]'s
 /// readout path, but emits no card. See [`prime_dpi`].
 pub fn prime_side_plate(pid: u16, id: u32, label: &str) {
-    with_baseline(pid, |b| {
+    with_baseline_observed(pid, |b| {
         b.plate = id;
         b.plate_label = Some(label.to_string());
     });

@@ -1297,12 +1297,16 @@ fn flush_batch(pid: u16, b: Batch) {
     if is_sync {
         if let Some((_, v)) = b.dpi {
             neuron::confirm::prime_dpi(pid, v);
+            // A wake sync is silent as a NOTIFICATION, never as a fact: the view must still show
+            // what the device came back holding.
+            crate::glue::post_observation(pid, crate::glue::Observed::Dpi(v));
         }
         if let Some((_, v)) = b.scroll {
             neuron::confirm::prime_scroll(pid, v);
         }
         if let Some((_, id, label)) = b.plate {
             neuron::confirm::prime_side_plate(pid, id as u32, &label);
+            crate::glue::post_observation(pid, crate::glue::Observed::Plate(label.clone()));
             // A state-announce burst is how we learn the plate on wake/replug WITHOUT carding it.
             // The latch still has to happen: the binds must follow the hardware whether we found
             // out by watching a swap or by the mouse telling us what it already had.
@@ -1311,12 +1315,14 @@ fn flush_batch(pid: u16, b: Batch) {
     } else {
         if let Some((_, v)) = b.dpi {
             neuron::confirm::observe_dpi(pid, v);
+            crate::glue::post_observation(pid, crate::glue::Observed::Dpi(v));
         }
         if let Some((_, v)) = b.scroll {
             neuron::confirm::observe_scroll(pid, v, SCROLL_STAGE_MAX);
         }
         if let Some((_, id, label)) = b.plate {
             neuron::confirm::observe_side_plate(pid, id as u32, &label);
+            crate::glue::post_observation(pid, crate::glue::Observed::Plate(label.clone()));
             latch_plate_layer(id, &label);
         }
     }

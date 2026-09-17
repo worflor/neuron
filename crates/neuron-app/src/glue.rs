@@ -7512,58 +7512,82 @@ fn load_macro_into_editor(app: &AppWindow, id: &str) {
     st.invoke_refresh_macro_blocks(src.into());
 }
 
-/// Keep the selected device's SIDE-PLATE readout honest with the last plate the mouse pushed. The
-/// plate is detected ONLY by a device-pushed report (no getter to poll), so we read the last-observed
-/// plate the confirmation core recorded (hidwatch feeds it on every swap) and surface it. Cheap — a
-/// brief mutex read + a string compare — so the main tick can call it; it only writes on a change.
-/// Only a selected mouse WITH a [side_plates] map ever shows a value (others read ""). The instant
-/// feedback on a swap is the confirmation CARD; this readout follows within a tick.
-pub fn refresh_selected_plate(app: &AppWindow) {
-    use slint::Model;
-    let st = app.global::<State>();
-    if !st.get_sel_can_plate() {
-        if !st.get_selected_plate().is_empty() {
-            st.set_selected_plate("".into());
-        }
-        return;
-    }
-    // The selected device's pid keys its OWN plate readout (per-pid; a sibling mouse's swap can't leak
-    // into this card).
-    let pid = {
-        let i = st.get_selected_device();
-        (i >= 0)
-            .then(|| st.get_devices().row_data(i as usize))
-            .flatten()
-            .and_then(|r| u16::from_str_radix(r.pid.as_str(), 16).ok())
-            .unwrap_or(0)
-    };
-    let label = neuron::confirm::last_plate(pid).unwrap_or_default();
-    if st.get_selected_plate().as_str() != label {
-        st.set_selected_plate(label.into());
-    }
+/// A state change a device PUSHED, on its way to the view.
+///
+/// One arm per observable so the shim below stays one function as more are wired through it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Observed {
+    Dpi(u32),
+    /// The swappable side plate's resolved label ("12-button", "detached", …).
+    Plate(String),
 }
 
-/// Keep the DEVICE-LIST row's PLATE readout live with the last plate the mouse pushed. The plate is
-/// push-only (no getter), so a periodic rescan can't carry it — instead this patches the plated row's
-/// `plate` field IN PLACE (via `set_row_data`, NOT a full list rebuild) whenever the last-known plate
-/// changes. Cheap: a mutex read + a per-row string compare; it writes a single row only on an actual
-/// change, and only for capability-`plate` rows (every other row stays untouched).
-pub fn refresh_plated_row(app: &AppWindow) {
+/// Post a device-pushed observation onto the UI thread.
+///
+/// The device reports every onboard change within milliseconds, and until this existed that report
+/// stopped at the notification core: the view only learned device state from a full hardware scan,
+/// so the DPI on screen stayed wrong until something happened to trigger one. This is the last hop
+/// of a path that already existed, not a second path — the same reach-back
+/// [`notify_hardware_mute`] uses, from the same reader threads.
+///
+/// Deliberately a two-line shim: every decision lives in [`apply_observation`], which takes an
+/// `&AppWindow` and so can be driven directly by a test without the global handle or an event loop.
+pub fn post_observation(pid: u16, obs: Observed) {
+    let Some(weak) = UI.get() else { return };
+    let weak = weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        let Some(app) = weak.upgrade() else { return };
+        apply_observation(&app, pid, obs);
+    });
+}
+
+/// Land an observation on the view: patch the owning device's ROW, and re-seed the editable control
+/// only when the user is not mid-edit.
+///
+/// Row and draft are different questions. The row is what the hardware says and is always corrected.
+/// The draft is what the user is typing, and stomping it mid-edit would be worse than the staleness
+/// this fixes — so it moves only when it still equals what the row said a moment ago, which is
+/// exactly the case where nobody has touched it.
+///
+/// Gated on device IDENTITY, never on selection: the same rule [`notify_hardware_mute`] records as a
+/// past bug, where gating on selection silently dropped a correct value because nothing was selected
+/// yet at launch.
+pub fn apply_observation(app: &AppWindow, pid: u16, obs: Observed) {
     use slint::Model;
     let st = app.global::<State>();
     let rows = st.get_devices();
     for i in 0..rows.row_count() {
         let Some(mut row) = rows.row_data(i) else { continue };
-        if !row.cap_plate {
+        if u16::from_str_radix(row.pid.as_str(), 16).ok() != Some(pid) {
             continue;
         }
-        // Each plated device shows ITS OWN last-known plate (per-pid), never a shared global value, so
-        // two plated mice can't cross-contaminate each other's row readout.
-        let pid = u16::from_str_radix(row.pid.as_str(), 16).unwrap_or(0);
-        let label = neuron::confirm::last_plate(pid).unwrap_or_default();
-        if row.plate.as_str() != label {
-            row.plate = label.into();
-            rows.set_row_data(i, row);
+        let selected = st.get_selected_device() == i as i32;
+        match &obs {
+            Observed::Dpi(dpi) => {
+                let text: slint::SharedString = format!("{dpi}").into();
+                if !row.cap_dpi || row.dpi == text {
+                    continue; // not this row's business, or already current — no repaint
+                }
+                let was = row.dpi.clone();
+                row.dpi = text;
+                rows.set_row_data(i, row);
+                // Only the SELECTED row owns the editable fader, and only an untouched draft follows.
+                if selected && was.trim().parse::<f32>().ok() == Some(st.get_dpi()) {
+                    st.set_dpi(*dpi as f32);
+                }
+            }
+            Observed::Plate(label) => {
+                let text: slint::SharedString = label.as_str().into();
+                if !row.cap_plate || row.plate == text {
+                    continue;
+                }
+                row.plate = text.clone();
+                rows.set_row_data(i, row);
+                // The plate has no editable twin, so the readout simply follows.
+                if selected && st.get_selected_plate() != text {
+                    st.set_selected_plate(text);
+                }
+            }
         }
     }
 }
@@ -7609,6 +7633,9 @@ fn spawn_background_scan(w: &slint::Weak<AppWindow>) {
     // every in-body exit path below — a genuine fire-and-forget from the primitives' point of
     // view, nothing else to report.
     crate::worker::spawn_detached("neuron-glue-scan", move || {
+        // Stamped before the hardware is touched, so anything the device pushes from here on is
+        // provably newer than what this scan is about to report.
+        let started = std::time::Instant::now();
         let scanned = std::panic::catch_unwind(crate::runtime::scan_hardware);
         let Ok(Some((infos, devs))) = scanned else {
             drop(slot); // no result will ever apply — free the slot for the next tick
@@ -7624,7 +7651,7 @@ fn spawn_background_scan(w: &slint::Weak<AppWindow>) {
             let w3 = app.as_weak();
             with_shared(move |sh| {
                 let (rows, stale) = sh.borrow_mut().rt.finish_background_scan(infos, devs);
-                apply_scanned_devices(&app, sh, rows);
+                apply_scanned_devices(&app, sh, rows, started);
                 // STALE: an adoption finished while this scan was in flight — the rows just
                 // applied were resolved against the pre-adoption registry and may omit the
                 // new device. The timer can NOT be trusted to correct this (the successful
@@ -7648,8 +7675,9 @@ pub fn refresh_devices(app: &AppWindow, sh: &SharedRt) {
     // synchronous path for explicit refreshes and callbacks. The ADOPT_WATCH_TIMER's background
     // scan reaches the SAME row-building/selection tail below through `apply_scanned_devices`
     // with worker-computed rows — one tail, two drivers, so the paths can never drift apart.
+    let started = std::time::Instant::now();
     let devs = sh.borrow_mut().rt.scan_devices(); // also heals a stale selected_pid
-    apply_scanned_devices(app, sh, devs);
+    apply_scanned_devices(app, sh, devs, started);
 }
 
 /// The shared row-building + selection-restore tail of a device scan: everything AFTER the rows
@@ -7657,7 +7685,12 @@ pub fn refresh_devices(app: &AppWindow, sh: &SharedRt) {
 /// asynchronously by the ADOPT_WATCH_TIMER (whose worker thread computed the rows off-thread and
 /// hopped them back — the UI-thread-stall fix; see the timer install). Pure UI-state application:
 /// no enumeration, no device opens.
-fn apply_scanned_devices(app: &AppWindow, sh: &SharedRt, devs: Vec<crate::runtime::DeviceState>) {
+fn apply_scanned_devices(
+    app: &AppWindow,
+    sh: &SharedRt,
+    devs: Vec<crate::runtime::DeviceState>,
+    scan_started: std::time::Instant,
+) {
     // keep the selection on the SAME control PLANE across a rescan, by (id, dialect): the unit id
     // (path instance / audio endpoint id) AND the plane's family. On a future multi-family unit the
     // id alone would ambiguously match either of the unit's two channel rows; the dialect pins the
@@ -7683,7 +7716,14 @@ fn apply_scanned_devices(app: &AppWindow, sh: &SharedRt, devs: Vec<crate::runtim
             mode: d.mode.clone().into(),
             connected: d.connected,
             firmware: d.firmware.clone().into(),
-            dpi: d.dpi.clone().into(),
+            // A push that landed WHILE this scan was in flight describes a newer device than the
+            // scan read, so it wins. Without this the scan silently reverts it and nothing corrects
+            // the view until the next change — the same stale readout this push path exists to fix,
+            // reintroduced by the path that was supposed to be authoritative.
+            dpi: match neuron::confirm::dpi_since(d.pid, scan_started) {
+                Some(v) => format!("{v}").into(),
+                None => d.dpi.clone().into(),
+            },
             polling: d.polling.clone().into(),
             brightness: d.brightness.clone().into(),
             battery: d.battery.clone().into(),
@@ -7710,8 +7750,8 @@ fn apply_scanned_devices(app: &AppWindow, sh: &SharedRt, devs: Vec<crate::runtim
             cap_plate: d.cap_plate,
             cap_game_mode: d.cap_game_mode,
             // SIDE PLATE (push-only, no getter): seed the row from THIS device's last pushed plate
-            // (per-pid). refresh_plated_row keeps it live in place after this. Non-plated devices show
-            // nothing.
+            // (per-pid). A device-pushed swap patches it in place after this, via
+            // `post_observation`. Non-plated devices show nothing.
             plate: if d.cap_plate {
                 neuron::confirm::last_plate(d.pid).unwrap_or_default().into()
             } else {

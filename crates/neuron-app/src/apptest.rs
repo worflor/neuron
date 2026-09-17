@@ -34,18 +34,37 @@ fn try_window() -> Option<AppWindow> {
     // `AppWindow::new()` initializes the (winit/software) backend lazily; on a machine with no
     // windowing it returns an Err instead of panicking. Either way we don't crash the suite.
     match std::panic::catch_unwind(AppWindow::new) {
-        Ok(Ok(app)) => Some(app),
+        Ok(Ok(app)) => {
+            WINDOW_TAKEN.store(true, std::sync::atomic::Ordering::SeqCst);
+            Some(app)
+        }
         _ => {
             assert!(
                 std::env::var_os("NEURON_REQUIRE_GUI").is_none(),
-                "NEURON_REQUIRE_GUI is set but no windowing backend is available — \
-                 this environment cannot provide the GUI coverage it promises"
+                "NEURON_REQUIRE_GUI is set but no window is available — this environment cannot \
+                 provide the GUI coverage it promises"
             );
-            eprintln!("skipping: no windowing backend available (GUI test ran zero assertions)");
+            // Name WHICH of the two reasons this is. They are not the same problem, and reporting
+            // both as the first hid the second: a headless runner is a legitimate skip, whereas a
+            // process that has already spent its one window is a HARNESS limit quietly eating
+            // coverage. Measured 2026-09-17: only the first `AppWindow::new()` in a process
+            // succeeds (it reproduces under `--test-threads=1`, so it is not a threading artifact),
+            // which means at most one of this module's windowed tests asserts anything per run.
+            if WINDOW_TAKEN.load(std::sync::atomic::Ordering::SeqCst) {
+                eprintln!(
+                    "SKIPPED WITH ZERO ASSERTIONS: this process already created its one window, \
+                     so this test verified NOTHING. Run it alone to exercise it for real."
+                );
+            } else {
+                eprintln!("skipping: no windowing backend available (GUI test ran zero assertions)");
+            }
             None
         }
     }
 }
+
+/// Whether this process has already handed out its one window. See [`try_window`].
+static WINDOW_TAKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Headless launch smoke: build the window, install the whole glue, and confirm the engine pushed
 /// real data into the view (devices model + effects exist as models, status is set). This is the
@@ -774,4 +793,60 @@ fn hypershift_rule_remove_targets_its_own_tier() {
         rules[0].layer.is_none(),
         "the surviving rule is the BASE one"
     );
+}
+
+// ── DEVICE PUSH -> VIEW ────────────────────────────────────────────────────────────────────────
+// The device announces every onboard change over HID within milliseconds. `apply_observation` is
+// where that lands on the view, and it takes an `&AppWindow` precisely so this can drive it
+// directly — no global handle, no event loop, no hardware.
+//
+// ONE test for three scenarios, deliberately. Only the FIRST `AppWindow::new()` in a process
+// succeeds; every later one fails and `try_window` skips. Split across three `#[test]`s, two of
+// them reported green having asserted nothing — the exact failure mode this module's own header
+// warns about. Sharing one window keeps all three real whenever this test is the one that gets it.
+
+/// Seed one selected, DPI-capable row for `pid` reading `dpi`, with the draft fader agreeing.
+fn seed_one_device(app: &AppWindow, pid: &str, dpi: &str) {
+    use crate::ui::DeviceRow;
+    let st = app.global::<State>();
+    let row = DeviceRow {
+        pid: pid.into(),
+        dpi: dpi.into(),
+        cap_dpi: true,
+        connected: true,
+        ..Default::default()
+    };
+    st.set_devices(slint::ModelRc::new(slint::VecModel::from(vec![row])));
+    st.set_selected_device(0);
+    st.set_dpi(dpi.parse::<f32>().unwrap());
+}
+
+fn row_dpi(app: &AppWindow) -> String {
+    use slint::Model;
+    app.global::<State>().get_devices().row_data(0).unwrap().dpi.to_string()
+}
+
+#[test]
+fn a_device_push_lands_on_the_view_without_stomping_an_edit() {
+    let Some(app) = try_window() else { return };
+    let st = app.global::<State>();
+
+    // 1. An untouched fader follows the device instead of sitting on a stale number.
+    seed_one_device(&app, "00a8", "30000");
+    glue::apply_observation(&app, 0x00a8, glue::Observed::Dpi(800));
+    assert_eq!(row_dpi(&app), "800", "the row must show what the device reported");
+    assert_eq!(st.get_dpi(), 800.0, "an untouched fader follows the device");
+
+    // 2. A half-finished edit is the one thing a background push must not overwrite.
+    seed_one_device(&app, "00a8", "30000");
+    st.set_dpi(1234.0); // the user has dragged the fader and not applied yet
+    glue::apply_observation(&app, 0x00a8, glue::Observed::Dpi(800));
+    assert_eq!(row_dpi(&app), "800", "the row still tells the truth about the hardware");
+    assert_eq!(st.get_dpi(), 1234.0, "the in-progress edit survives");
+
+    // 3. A second mouse cycling its own DPI must not repaint this one.
+    seed_one_device(&app, "00a8", "30000");
+    glue::apply_observation(&app, 0x0084, glue::Observed::Dpi(400));
+    assert_eq!(row_dpi(&app), "30000");
+    assert_eq!(st.get_dpi(), 30000.0);
 }
