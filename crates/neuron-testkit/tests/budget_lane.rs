@@ -48,7 +48,7 @@ fn resident_footprint_stays_within_budget() {
     // Two-point leak slope: a steady resident may jitter, but a second idle window that
     // grew by >10% in handles or >32 MB private in 30 s is a leak, not jitter.
     assert!(
-        idle2.handles as f64 <= idle1.handles as f64 * 1.10 + 16.0,
+        f64::from(idle2.handles) <= f64::from(idle1.handles) * 1.10 + 16.0,
         "handle growth across idle windows: {} -> {}",
         idle1.handles,
         idle2.handles

@@ -4,7 +4,7 @@
 
 //! Integration tests: full end-to-end pipeline on real text.
 //!
-//! Feeds article-shaped .txt fixtures through ByteHistogram → encode →
+//! Feeds article-shaped .txt fixtures through `ByteHistogram` → encode →
 //! wire → decode, verifying the complete pipeline.
 
 use engram::brain::Brain;
@@ -27,12 +27,12 @@ const GOLDEN_DIR: &str = "../rag_tests/engram/cache/_golden_vectors";
 /// back to the external golden corpus. Panics loudly if neither is
 /// readable — tests must never silently skip for a missing corpus.
 fn load_text(name: &str) -> String {
-    let fixture_path = format!("{}/{}.txt", FIXTURES_DIR, name);
+    let fixture_path = format!("{FIXTURES_DIR}/{name}.txt");
     if let Ok(t) = std::fs::read_to_string(&fixture_path) {
         return t;
     }
 
-    let golden_path = format!("{}/{}.txt", GOLDEN_DIR, name);
+    let golden_path = format!("{GOLDEN_DIR}/{name}.txt");
     if let Ok(t) = std::fs::read_to_string(&golden_path) {
         return t;
     }
@@ -56,7 +56,7 @@ fn histogram_produces_valid_trajectories() {
 
         let (traj, t) = histogram::text_to_trajectory(&text, histogram::default_chunk_size());
 
-        assert!(t >= 4, "{}: only {} chunks (need ≥4)", name, t);
+        assert!(t >= 4, "{name}: only {t} chunks (need ≥4)");
         assert_eq!(traj.len(), t * histogram::embedding_dim());
 
         // Each row should sum to ~1.0 (normalized frequencies)
@@ -64,10 +64,7 @@ fn histogram_produces_valid_trajectories() {
             let sum: f32 = (0..256).map(|d| traj[row * 256 + d]).sum();
             assert!(
                 (sum - 1.0).abs() < 1e-4,
-                "{} row {}: sum = {}",
-                name,
-                row,
-                sum
+                "{name} row {row}: sum = {sum}"
             );
         }
     }
@@ -88,15 +85,14 @@ fn encode_decode_roundtrip_all_articles() {
 
         assert_eq!(packet.dim, dim);
         assert_eq!(packet.length, t);
-        assert!(!packet.blocks.is_empty(), "{}: no blocks", name);
-        assert!(packet.capture() > 0.0, "{}: zero capture", name);
+        assert!(!packet.blocks.is_empty(), "{name}: no blocks");
+        assert!(packet.capture() > 0.0, "{name}: zero capture");
 
         let decoded = decode(&packet);
         assert_eq!(
             decoded.len(),
             traj.len(),
-            "{}: decoded length mismatch",
-            name
+            "{name}: decoded length mismatch"
         );
 
         // Roundtrip error bounded by quantization
@@ -112,9 +108,7 @@ fn encode_decode_roundtrip_all_articles() {
         // prediction residuals can exceed this for high-frequency content.
         assert!(
             max_err < 1.0,
-            "{}: max roundtrip error = {} (too high)",
-            name,
-            max_err
+            "{name}: max roundtrip error = {max_err} (too high)"
         );
     }
 }
@@ -135,7 +129,7 @@ fn wire_roundtrip_all_articles() {
         // Full wire roundtrip
         let wire_bytes = to_wire(&packet);
         let wire_packet =
-            from_wire(&wire_bytes).unwrap_or_else(|| panic!("{}: wire parse failed", name));
+            from_wire(&wire_bytes).unwrap_or_else(|| panic!("{name}: wire parse failed"));
 
         assert_eq!(wire_packet.dim, dim);
         assert_eq!(wire_packet.length, t);
@@ -158,7 +152,7 @@ fn wire_roundtrip_all_articles() {
         );
 
         let compact_packet = from_wire_compact(&compact_bytes)
-            .unwrap_or_else(|| panic!("{}: compact parse failed", name));
+            .unwrap_or_else(|| panic!("{name}: compact parse failed"));
         assert_eq!(compact_packet.dim, dim);
         assert_eq!(compact_packet.length, t);
     }
@@ -218,8 +212,8 @@ fn brain_measure_after_absorb() {
     // Measure each article — the one absorbed into its own well should be closest
     for (name, traj, t) in &trajs {
         let result = brain.measure(traj, *t);
-        assert!(result.capture > 0.0, "{}: zero capture on measure", name);
-        assert!(result.drift >= 0.0, "{}: negative drift", name);
+        assert!(result.capture > 0.0, "{name}: zero capture on measure");
+        assert!(result.drift >= 0.0, "{name}: negative drift");
     }
 }
 
@@ -258,9 +252,7 @@ fn brain_save_load_roundtrip() {
         for j in 0..brain.pairs {
             assert!(
                 (lw.sum_k[j] - well.sum_k[j]).norm() < 1e-10,
-                "well {} pair {} K mismatch",
-                name,
-                j
+                "well {name} pair {j} K mismatch"
             );
         }
     }
@@ -295,9 +287,7 @@ fn encoding_modes_are_realistic() {
         // Byte histograms should have oscillatory structure
         assert!(
             cascaded + linear > 0,
-            "{}: no CASCADED or LINEAR blocks ({} blocks total)",
-            name,
-            total
+            "{name}: no CASCADED or LINEAR blocks ({total} blocks total)"
         );
 
         // Capture should be meaningful for text
@@ -331,10 +321,7 @@ fn compression_ratio_is_meaningful() {
         // Compact should be much smaller (no residuals)
         assert!(
             compact_size < raw_size,
-            "{}: compact {} >= raw {}",
-            name,
-            compact_size,
-            raw_size
+            "{name}: compact {compact_size} >= raw {raw_size}"
         );
 
         eprintln!(

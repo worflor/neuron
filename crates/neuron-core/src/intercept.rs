@@ -68,6 +68,7 @@ pub struct Remap {
 pub const MOUSE_PHYSKEY_BASE: u16 = 0x8000;
 
 /// Encode a Button-page usage (3..=5) as its mouse physkey.
+#[must_use]
 pub fn mouse_physkey(button: u16) -> u16 {
     MOUSE_PHYSKEY_BASE | button
 }
@@ -99,6 +100,7 @@ pub struct Interceptor {
 }
 
 impl Interceptor {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -114,6 +116,7 @@ impl Interceptor {
     }
 
     /// True if ANY device remap involves this scancode — the hook swallows it (device unknown yet).
+    #[must_use]
     pub fn is_remapped_scancode(&self, scancode: u16) -> bool {
         self.by_scancode.contains_key(&scancode)
     }
@@ -178,17 +181,20 @@ impl Interceptor {
     }
 
     /// Pending count — for diagnostics/tests.
+    #[must_use]
     pub fn pending_len(&self) -> usize {
         self.pending.len()
     }
 
     /// True if no remaps are configured (the whole shim is a no-op).
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.by_scancode.is_empty()
     }
 
     /// Is there a remap for this (physkey, device pid)? Lets the live dispatcher SKIP its own
     /// host-side handling of a trigger the shim already owns (avoids the double-send).
+    #[must_use]
     pub fn has_remap(&self, physkey: u16, pid: crate::registry::CanonicalPid) -> bool {
         self.by_scancode
             .get(&physkey)
@@ -197,6 +203,7 @@ impl Interceptor {
 
     /// Like [`has_remap`], but ONLY for replacement remaps ([`KeyOut::Scancode`]). Swallow claims
     /// don't count — the dispatcher must still fire their actions (see the module-level `owns`).
+    #[must_use]
     pub fn has_key_remap(&self, physkey: u16, pid: crate::registry::CanonicalPid) -> bool {
         self.by_scancode.get(&physkey).is_some_and(|v| {
             v.iter()
@@ -210,6 +217,7 @@ impl Interceptor {
     /// Unlike [`on_rawinput`], this never touches `pending` (the Windows correlation path). The
     /// Windows/macOS backends use `on_hook`+`on_rawinput`; a grab backend uses this instead.
     /// `None` = the key is claimed with [`KeyOut::Swallow`] — emit nothing.
+    #[must_use]
     pub fn resolve_direct(
         &self,
         physkey: u16,
@@ -343,6 +351,7 @@ pub fn configure(remaps: Vec<Remap>) {
 /// Cross-platform: the ONLY OS-specific step is [`sys::physkey_for_usage`] (HID usage → platform
 /// key-id — scancodes on Windows, evdev keycodes on Linux, …). A new platform gets this for free
 /// once its `sys` fills that one function.
+#[must_use]
 pub fn claim_for_rule(rule: &crate::engine::Rule) -> Option<Remap> {
     use crate::action::Action;
     use crate::engine::Trigger;
@@ -380,7 +389,7 @@ pub fn claim_for_rule(rule: &crate::engine::Rule) -> Option<Remap> {
     // "additive, not a rebind" feel this shim exists to kill.
     let to = match &rule.action {
         Action::Key { key } if page != 0x09 => {
-            KeyOut::Scancode(sys::physkey_for_usage(crate::action::hid_usage_for_key(key)? as u16)?)
+            KeyOut::Scancode(sys::physkey_for_usage(u16::from(crate::action::hid_usage_for_key(key)?))?)
         }
         _ => KeyOut::Swallow,
     };
@@ -432,6 +441,7 @@ fn compose_remaps(
 /// The swallow-only [`Remap`] for a held-bind control, when the shim can express it: pid-scoped
 /// (a device-any bind would eat the key on EVERY keyboard — never) and on a keyboard page the
 /// platform can hook. `None` otherwise.
+#[must_use]
 pub fn swallow_for_control(ctl: crate::controls::ControlRef) -> Option<Remap> {
     let pid = ctl.pid?;
     let from = match ctl.page {
@@ -609,7 +619,7 @@ mod sys {
         crate::controls::win::usage_to_physkey(usage)
     }
 
-    /// SendInput one keyboard event BY SCANCODE, stamped with our signature so the hook passes it.
+    /// `SendInput` one keyboard event BY SCANCODE, stamped with our signature so the hook passes it.
     /// Gated on the arm kill-switch (like `action::win_key`). `physkey = scancode | 0x100 if E0`.
     pub fn inject(physkey: u16, down: bool) {
         if !crate::action::input_armed() {
@@ -635,7 +645,7 @@ mod sys {
                 },
             },
         };
-        unsafe { SendInput(1, &input, std::mem::size_of::<INPUT>() as i32) };
+        unsafe { SendInput(1, &raw const input, std::mem::size_of::<INPUT>() as i32) };
     }
 
     unsafe extern "system" fn proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -706,13 +716,13 @@ mod sys {
             installed.store(true, Ordering::SeqCst);
         }
         let mut msg: MSG = unsafe { std::mem::zeroed() };
-        unsafe { PeekMessageW(&mut msg, std::ptr::null_mut(), WM_USER, WM_USER, PM_NOREMOVE) };
+        unsafe { PeekMessageW(&raw mut msg, std::ptr::null_mut(), WM_USER, WM_USER, PM_NOREMOVE) };
         pump_tid.store(unsafe { GetCurrentThreadId() }, Ordering::SeqCst);
         if h.is_null() {
             return;
         }
         loop {
-            let r = unsafe { GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) };
+            let r = unsafe { GetMessageW(&raw mut msg, std::ptr::null_mut(), 0, 0) };
             if r <= 0 {
                 break;
             }
@@ -768,7 +778,7 @@ mod sys {
 
     pub fn install() {
         install_for("neuron-remap-hook", &PUMP, &PUMP_TID, &INSTALLED, || {
-            pump_main_for(WH_KEYBOARD_LL, proc, &INSTALLED, &HANDLE, &PUMP_TID)
+            pump_main_for(WH_KEYBOARD_LL, proc, &INSTALLED, &HANDLE, &PUMP_TID);
         });
     }
 
@@ -778,7 +788,7 @@ mod sys {
 
     pub fn install_mouse() {
         install_for("neuron-remap-mhook", &M_PUMP, &M_PUMP_TID, &M_INSTALLED, || {
-            pump_main_for(WH_MOUSE_LL, mouse_proc, &M_INSTALLED, &M_HANDLE, &M_PUMP_TID)
+            pump_main_for(WH_MOUSE_LL, mouse_proc, &M_INSTALLED, &M_HANDLE, &M_PUMP_TID);
         });
     }
 
@@ -786,7 +796,7 @@ mod sys {
         uninstall_for(&M_PUMP, &M_PUMP_TID);
     }
 
-    /// SendInput one mouse-button event (3=middle, 4=X1, 5=X2), stamped with our signature so the
+    /// `SendInput` one mouse-button event (3=middle, 4=X1, 5=X2), stamped with our signature so the
     /// mouse hook passes it — the replay path for a swallowed click that turned out to belong to
     /// an unclaimed device. Gated on the arm kill-switch like every injection.
     pub fn inject_mouse(button: u16, down: bool) {
@@ -796,10 +806,10 @@ mod sys {
         let (flags, data) = match (button, down) {
             (3, true) => (MOUSEEVENTF_MIDDLEDOWN, 0u32),
             (3, false) => (MOUSEEVENTF_MIDDLEUP, 0),
-            (4, true) => (MOUSEEVENTF_XDOWN, XBUTTON1 as u32),
-            (4, false) => (MOUSEEVENTF_XUP, XBUTTON1 as u32),
-            (5, true) => (MOUSEEVENTF_XDOWN, XBUTTON2 as u32),
-            (5, false) => (MOUSEEVENTF_XUP, XBUTTON2 as u32),
+            (4, true) => (MOUSEEVENTF_XDOWN, u32::from(XBUTTON1)),
+            (4, false) => (MOUSEEVENTF_XUP, u32::from(XBUTTON1)),
+            (5, true) => (MOUSEEVENTF_XDOWN, u32::from(XBUTTON2)),
+            (5, false) => (MOUSEEVENTF_XUP, u32::from(XBUTTON2)),
             _ => return,
         };
         let input = INPUT {
@@ -815,7 +825,7 @@ mod sys {
                 },
             },
         };
-        unsafe { SendInput(1, &input, std::mem::size_of::<INPUT>() as i32) };
+        unsafe { SendInput(1, &raw const input, std::mem::size_of::<INPUT>() as i32) };
     }
 }
 

@@ -55,8 +55,7 @@ fn env_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         std::env::var("NEURON_LATENCY")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(false)
+            .is_ok_and(|v| v != "0" && !v.is_empty())
     })
 }
 
@@ -133,7 +132,7 @@ pub fn start() {
 /// and nowhere better to complain to.
 fn append(path: &std::path::Path, text: &str) {
     use std::io::Write;
-    if std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) > LOG_MAX_BYTES {
+    if std::fs::metadata(path).map_or(0, |m| m.len()) > LOG_MAX_BYTES {
         // Restart rather than rotate: a second file would double the disk a forgotten flag can eat,
         // which is the exact thing being guarded against.
         let _ = std::fs::write(path, b"");

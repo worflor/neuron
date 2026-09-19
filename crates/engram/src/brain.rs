@@ -37,6 +37,7 @@ pub struct Well {
 
 impl Well {
     /// Create an empty well for P pairs.
+    #[must_use]
     pub fn new(p: usize) -> Self {
         Self {
             sum_k: vec![Complex64::ZERO; p],
@@ -45,6 +46,7 @@ impl Well {
     }
 
     /// The centroid: mean K across all absorbed blocks.
+    #[must_use]
     pub fn centroid(&self) -> Vec<Complex64> {
         if self.count == 0 {
             return self.sum_k.clone();
@@ -62,7 +64,7 @@ impl Well {
     }
 }
 
-/// A dream buffer entry: one article's K, G, and pair_rms means.
+/// A dream buffer entry: one article's K, G, and `pair_rms` means.
 #[derive(Debug, Clone)]
 pub struct DreamEntry {
     pub k: Vec<Complex64>,
@@ -105,6 +107,7 @@ pub struct Brain {
 
 impl Brain {
     /// Create a new empty brain.
+    #[must_use]
     pub fn new(dim: usize, alpha: f32) -> Self {
         Self {
             dim,
@@ -122,6 +125,7 @@ impl Brain {
     }
 
     /// Dream buffer capacity.
+    #[must_use]
     pub fn dream_capacity(&self) -> usize {
         500_usize.max(self.dim * DREAM_CAP_PER_DIM)
     }
@@ -173,7 +177,7 @@ impl Brain {
     }
 
     /// Find the nearest well to an observation centroid.
-    /// Returns (well_name, rms_distance).
+    /// Returns (`well_name`, `rms_distance`).
     pub fn nearest_well(&mut self, obs_centroid: &[Complex64]) -> (String, f64) {
         let centroids = self.well_centroids().clone();
         if centroids.is_empty() {
@@ -201,7 +205,7 @@ impl Brain {
     }
 
     /// Distance from an observation centroid to every established well.
-    /// Returns HashMap<well_name, distance> for wells with count >= MIN_WELL_BLOCKS.
+    /// Returns `HashMap`<`well_name`, distance> for wells with count >= `MIN_WELL_BLOCKS`.
     pub fn well_profile(&mut self, obs_centroid: &[Complex64]) -> HashMap<String, f64> {
         let centroids = self.well_centroids().clone();
         let p = self.pairs;
@@ -385,9 +389,9 @@ impl Brain {
             nn_dists.push(best);
         }
 
-        nn_dists.sort_by(|a, b| a.total_cmp(b));
+        nn_dists.sort_by(f64::total_cmp);
         let typical_gap = if nn_dists.len() % 2 == 0 {
-            (nn_dists[nn_dists.len() / 2 - 1] + nn_dists[nn_dists.len() / 2]) / 2.0
+            f64::midpoint(nn_dists[nn_dists.len() / 2 - 1], nn_dists[nn_dists.len() / 2])
         } else {
             nn_dists[nn_dists.len() / 2]
         };
@@ -433,7 +437,7 @@ impl Brain {
             start: 0,
             length: t,
             macro_k: fit.k,
-            macro_g: fit.g.clone(),
+            macro_g: fit.g,
             micro_ks: Vec::new(),
             micro_gs: Vec::new(),
             residuals: Vec::new(),
@@ -463,7 +467,7 @@ impl Brain {
 
     /// Measure an observation against the brain's wells.
     ///
-    /// Returns (drift, texture, combined, nearest_well, well_distance, capture).
+    /// Returns (drift, texture, combined, `nearest_well`, `well_distance`, capture).
     pub fn measure(&mut self, observation: &[f32], t: usize) -> MeasureResult {
         let dim = self.dim;
         let p = self.pairs;
@@ -522,7 +526,7 @@ impl Brain {
 
         // Drift: normalized by global centroid scale
         let drift = if let Some(gc) = self.global_centroid() {
-            let scale = (gc.iter().map(|c| c.norm_sqr()).sum::<f64>() / p as f64)
+            let scale = (gc.iter().map(num_complex::Complex::norm_sqr).sum::<f64>() / p as f64)
                 .sqrt()
                 .max(MACHINE_EPS);
             (well_distance / scale * 100.0).min(100.0)
@@ -544,7 +548,8 @@ impl Brain {
         }
     }
 
-    /// Number of established wells (count >= MIN_WELL_BLOCKS).
+    /// Number of established wells (count >= `MIN_WELL_BLOCKS`).
+    #[must_use]
     pub fn established_well_count(&self) -> usize {
         self.wells
             .values()
@@ -665,7 +670,7 @@ mod tests {
 
         // Absorb some data first
         for i in 0..20 {
-            let traj = make_trajectory(50, 8, 0.3 + i as f64 * 0.01);
+            let traj = make_trajectory(50, 8, 0.3 + f64::from(i) * 0.01);
             brain.fast_absorb(&traj, 50, Some("music"));
         }
 

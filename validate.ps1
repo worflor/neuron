@@ -13,10 +13,12 @@
 #   .\validate.ps1                # quick - the suite (compiles everything on the way). Same
 #                                 #   as both CI test jobs and what you run before committing.
 #                                 #   Runs on windows AND on linux; each proves its own platform.
-#   .\validate.ps1 -Mode lint     # rustfmt + the shipped scripts. Compiles nothing and cares
-#                                 #   about no platform, so CI rides it on the cheap linux lane.
-#   .\validate.ps1 -Mode full     # + clippy, the feature matrix, a release build, and the
-#                                 #   no-hardware ignored tests. Slow. Run before a release.
+#   .\validate.ps1 -Mode lint     # rustfmt, shell/ps parse, cargo-deny, and cargo-audit.
+#                                 #   Compiles nothing and cares about no platform, so CI
+#                                 #   rides it on the cheap linux lane.
+#   .\validate.ps1 -Mode full     # + clippy (as gate, -D warnings), the feature matrix,
+#                                 #   a release build, and the no-hardware ignored tests.
+#                                 #   Slow. Run before a release.
 #   .\validate.ps1 -Locked        # add --locked (CI always does; use it to reproduce a CI run)
 #
 # Deliberately not here: hardware probes and perf benches. Eight tests are #[ignore]d because
@@ -141,6 +143,23 @@ if ($Mode -eq 'lint') {
         }
         $global:LASTEXITCODE = [int]($bad -gt 0)
     }
+
+    # Supply-chain policy enforcement: cargo-deny checks licenses, advisories, bans, and
+    # sources against the policy in deny.toml. Requires `cargo install cargo-deny`.
+    if (Get-Command cargo-deny -ErrorAction SilentlyContinue) {
+        Invoke-Gate 'cargo deny' { cargo deny check }
+    } else {
+        Write-Host "skipped: cargo deny (cargo-deny not installed; cargo install cargo-deny)" -ForegroundColor DarkGray
+    }
+
+    # Vulnerability scanning: cargo-audit checks Cargo.lock against the RustSec advisory
+    # database. Requires `cargo install cargo-audit`. Overlaps with cargo-deny advisories
+    # but is the canonical source and catches things deny may miss.
+    if (Get-Command cargo-audit -ErrorAction SilentlyContinue) {
+        Invoke-Gate 'cargo audit' { cargo audit --deny warnings }
+    } else {
+        Write-Host "skipped: cargo audit (cargo-audit not installed; cargo install cargo-audit)" -ForegroundColor DarkGray
+    }
 }
 
 # ── the suite ──────────────────────────────────────────────────────────────────────────
@@ -156,10 +175,11 @@ if ($Mode -in @('quick', 'full')) {
     Invoke-Gate 'test' { cargo test --workspace @scope @lock }
 }
 
-# Clippy is a second full compilation of the workspace for a signal that's advisory anyway,
-# so it lives in `full` rather than doubling the cost of every push.
+# Clippy: the workspace lints catch real bugs (unwrap/expect in prod code, panics, etc).
+# Advisory for now — promote to Invoke-Gate once the existing ~N violations are cleared.
+# The workspace [lints] section is the source of truth; this just runs the analysis.
 if ($Mode -eq 'full') {
-    Invoke-Advisory 'clippy' { cargo clippy --workspace --all-targets @lock }
+    Invoke-Advisory 'clippy' { cargo clippy --workspace --all-targets -- -D warnings -A unsafe-code @lock }
 }
 
 # ── full only ─────────────────────────────────────────────────────────────────────────────

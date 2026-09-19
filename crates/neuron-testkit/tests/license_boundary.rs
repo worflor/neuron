@@ -83,7 +83,7 @@ fn workspace_root() -> PathBuf {
 fn is_source_extension(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|e| e.to_str()),
-        Some("rs") | Some("slint")
+        Some("rs" | "slint")
     )
 }
 

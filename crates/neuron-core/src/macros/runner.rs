@@ -71,7 +71,7 @@ fn pool() -> Option<&'static Pool> {
         for i in 0..WORKERS {
             let rx = rx.clone();
             if crate::worker::spawn_detached(&format!("neuron-macro-{i}"), move || {
-                worker_loop(&rx)
+                worker_loop(&rx);
             }) {
                 started += 1;
             }
@@ -178,7 +178,7 @@ mod tests {
     /// Take the pool lock and wait for the pool to go idle, so each test starts from the same state
     /// regardless of what ran before it.
     fn exclusive_pool() -> std::sync::MutexGuard<'static, ()> {
-        let guard = POOL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = POOL_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // Drain: push one job per worker and wait for all of them. They can only all complete once
         // every worker has finished whatever it was carrying, which is a definitive idle signal — far
         // more reliable than sleeping and hoping.

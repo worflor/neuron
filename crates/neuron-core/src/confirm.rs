@@ -62,6 +62,7 @@ impl Kind {
         Kind::SidePlate,
     ];
     /// Stable slug — the config key and the leitmotif identity seed.
+    #[must_use]
     pub fn slug(self) -> &'static str {
         match self {
             Kind::Dpi => "dpi",
@@ -163,7 +164,7 @@ fn baselines() -> &'static Mutex<HashMap<u16, Baselines>> {
 /// Run `f` against `pid`'s baselines, creating a default entry on first touch. The lock is released
 /// when this returns — callers that also [`emit`] do so OUTSIDE it, so no consumer runs under the lock.
 fn with_baseline<R>(pid: u16, f: impl FnOnce(&mut Baselines) -> R) -> R {
-    let mut g = baselines().lock().unwrap_or_else(|p| p.into_inner());
+    let mut g = baselines().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     f(g.entry(pid).or_default())
 }
 
@@ -182,8 +183,9 @@ fn with_baseline_observed<R>(pid: u16, f: impl FnOnce(&mut Baselines) -> R) -> R
 /// The one question a scan-merge needs answered: is there an observation strictly newer than the
 /// hardware read I am about to apply? Because the device pushes on EVERY change, a later
 /// observation is by construction fresher than the scan's value.
+#[must_use]
 pub fn dpi_since(pid: u16, since: Instant) -> Option<u32> {
-    let g = baselines().lock().unwrap_or_else(|p| p.into_inner());
+    let g = baselines().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let b = g.get(&pid)?;
     (b.dpi > 0 && b.at.is_some_and(|t| t > since)).then_some(b.dpi)
 }
@@ -219,7 +221,7 @@ pub fn dpi(pid: u16, value: u32, prev: Option<u32>) {
     emit(Confirmation {
         kind: Kind::Dpi,
         shape: Shape::Ranged {
-            value: value as f64,
+            value: f64::from(value),
             min: 100.0,
             max: 30_000.0,
             unit: "DPI",
@@ -241,7 +243,7 @@ pub fn sniper(pid: u16, value: u32, prev: Option<u32>, engaged: bool) {
     emit(Confirmation {
         kind: Kind::Sniper,
         shape: Shape::Ranged {
-            value: value as f64,
+            value: f64::from(value),
             min: 100.0,
             max: 30_000.0,
             unit: "DPI",
@@ -257,7 +259,7 @@ pub fn polling(hz: u32, prev: Option<u32>) {
     emit(Confirmation {
         kind: Kind::Polling,
         shape: Shape::Ranged {
-            value: hz as f64,
+            value: f64::from(hz),
             min: 125.0,
             max: 8_000.0,
             unit: "Hz",
@@ -273,7 +275,7 @@ pub fn brightness(pct: u32, prev: Option<u32>) {
     emit(Confirmation {
         kind: Kind::Brightness,
         shape: Shape::Ranged {
-            value: pct as f64,
+            value: f64::from(pct),
             min: 0.0,
             max: 100.0,
             unit: "%",
@@ -290,9 +292,9 @@ pub fn scroll(pid: u16, value: u32, max: u32, prev: Option<u32>) {
     emit(Confirmation {
         kind: Kind::Scroll,
         shape: Shape::Ranged {
-            value: value as f64,
+            value: f64::from(value),
             min: 0.0,
-            max: max.max(1) as f64,
+            max: f64::from(max.max(1)),
             unit: "",
         },
         title: "Sensitivity".into(),
@@ -310,11 +312,11 @@ pub fn profile(name: &str, prev: Option<&str>) {
         },
         title: "Profile".into(),
         ident: "profile".into(),
-        prev: prev.map(|s| s.to_string()),
+        prev: prev.map(std::string::ToString::to_string),
     });
 }
 
-/// A HyperShift layer engaged (`engaged = true`) or released. Distinct layers get distinct idents
+/// A `HyperShift` layer engaged (`engaged = true`) or released. Distinct layers get distinct idents
 /// so engaging one doesn't collapse another's card.
 pub fn layer(name: &str, engaged: bool) {
     emit(Confirmation {
@@ -350,7 +352,7 @@ pub fn battery(pct: u32, title: &str, prev: Option<u32>) {
     emit(Confirmation {
         kind: Kind::Battery,
         shape: Shape::Ranged {
-            value: pct as f64,
+            value: f64::from(pct),
             min: 0.0,
             max: 100.0,
             unit: "%",
@@ -460,8 +462,9 @@ pub fn prime_side_plate(pid: u16, id: u32, label: &str) {
 /// The last side-plate label device `pid` pushed, if any has been observed since launch. Surfaced on
 /// the DEVICE page per device (the plate is push-only, so this last-known value is the honest readout).
 /// `None` until the first observation for that pid.
+#[must_use]
 pub fn last_plate(pid: u16) -> Option<String> {
-    let g = baselines().lock().unwrap_or_else(|p| p.into_inner());
+    let g = baselines().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     g.get(&pid).and_then(|b| b.plate_label.clone())
 }
 
@@ -485,7 +488,7 @@ mod tests {
     /// Reset `pid`'s de-dup baselines to "nothing observed yet" — equivalent to a fresh launch for that
     /// device. Removing the entry hands back a `Default` on next touch.
     fn reset_baseline(pid: u16) {
-        let mut g = baselines().lock().unwrap_or_else(|p| p.into_inner());
+        let mut g = baselines().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         g.remove(&pid);
     }
 
@@ -496,7 +499,7 @@ mod tests {
     /// race `pid`'s readout between this returning and the assertion. That post-lock read was the real
     /// cause of the rare parallel-run flake; asserting on this returned snapshot removes it.
     fn capture_side_plates(pid: u16, f: impl FnOnce()) -> (Vec<Confirmation>, Option<String>) {
-        let _g = TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         reset_baseline(pid);
         let (tx, rx) = mpsc::channel();
         set_sink(Some(tx));
@@ -578,7 +581,7 @@ mod tests {
         // never suppress or misattribute the other's. Under the old PROCESS-GLOBAL baseline, after A set
         // it to 800, B's genuine change TO 800 (B was at 400) would read `== prev` and be silently
         // swallowed. Per-pid, each device de-dups only against itself.
-        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         reset_baseline(PID_A);
         reset_baseline(PID_B);
         let (tx, rx) = mpsc::channel();
@@ -606,7 +609,7 @@ mod tests {
     fn side_plate_readout_is_per_pid() {
         // Each device's plate readout is independent: a swap on A must not change B's last-known plate,
         // and a real plate on each cards from ITS OWN baseline.
-        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         reset_baseline(PID_A);
         reset_baseline(PID_B);
         let (tx, rx) = mpsc::channel();

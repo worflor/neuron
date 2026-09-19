@@ -47,6 +47,7 @@ pub struct Cell {
 }
 
 impl Cell {
+    #[must_use]
     pub fn new(u: f32, intensity: f32) -> Cell {
         Cell { u, intensity }
     }
@@ -63,6 +64,7 @@ pub enum Field {
 }
 
 impl Field {
+    #[must_use]
     pub fn len(&self) -> usize {
         match self {
             Field::Scalar(v) => v.len(),
@@ -70,6 +72,7 @@ impl Field {
         }
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -77,6 +80,7 @@ impl Field {
     /// Resolve this field to concrete colours via `spectrum` at time `t`. A `Scalar` cell becomes
     /// `spectrum.at(t, u).scale_f(intensity)`; a `Color` cell passes through unchanged (the spectrum is
     /// ignored). This is the per-layer core of the render pipeline (region mask + blend come on top).
+    #[must_use]
     pub fn render(&self, spectrum: &Spectrum, t: f32) -> Vec<Rgb> {
         match self {
             Field::Scalar(cells) => cells
@@ -106,6 +110,7 @@ pub struct Bounds {
 
 impl Bounds {
     /// The whole board — origin `(0, 0)`, full extent. The placement a region-less layer occupies.
+    #[must_use]
     pub fn board(rows: u8, cols: u8) -> Bounds {
         Bounds { row0: 0, col0: 0, rows, cols }
     }
@@ -115,12 +120,13 @@ impl Bounds {
     /// of the board are skipped (defensive); if none are in range the result also falls back to the full
     /// board. Scattered cells collapse to the single ENCLOSING rectangle (the bbox), never the literal
     /// cells — the placement is a rectangle, the region mask still carves the exact shape on top.
+    #[must_use]
     pub fn from_region(region: &[u32], rows: u8, cols: u8) -> Bounds {
         if region.is_empty() || rows == 0 || cols == 0 {
             return Bounds::board(rows, cols);
         }
-        let c = cols as u32;
-        let n = rows as u32 * c;
+        let c = u32::from(cols);
+        let n = u32::from(rows) * c;
         let (mut r0, mut c0, mut r1, mut c1) = (u32::MAX, u32::MAX, 0u32, 0u32);
         let mut any = false;
         for &i in region {
@@ -158,6 +164,7 @@ impl Bounds {
 /// selection itself (or anything above it) leaves the index put, only clamped to the new last layer. An
 /// emptied stack (`new_len == 0`) has no selection → `0`. Pure, so the glue can't get the below-the-
 /// selection case wrong (the old single-clamp left `selected` pointing one layer too high).
+#[must_use]
 pub fn selection_after_remove(removed: usize, selected: usize, new_len: usize) -> usize {
     if new_len == 0 {
         return 0;
@@ -172,11 +179,12 @@ pub fn selection_after_remove(removed: usize, selected: usize, new_len: usize) -
 /// board returns an EMPTY vec — the canonical "region-less / full board" the [`Compositor`] treats as no
 /// mask (so a full-board drag and a Reset converge honestly). Otherwise the enclosed cells, row-major. A
 /// degenerate board (`rows`/`cols` == 0) yields empty. Pure, so the placement math is tested away from Slint.
+#[must_use]
 pub fn region_from_rect(r0: i32, c0: i32, r1: i32, c1: i32, rows: u8, cols: u8) -> Vec<u32> {
     if rows == 0 || cols == 0 {
         return Vec::new();
     }
-    let (rmax, cmax) = (rows as i32 - 1, cols as i32 - 1);
+    let (rmax, cmax) = (i32::from(rows) - 1, i32::from(cols) - 1);
     let rlo = r0.min(r1).clamp(0, rmax);
     let rhi = r0.max(r1).clamp(0, rmax);
     let clo = c0.min(c1).clamp(0, cmax);
@@ -188,7 +196,7 @@ pub fn region_from_rect(r0: i32, c0: i32, r1: i32, c1: i32, rows: u8, cols: u8) 
     let mut v = Vec::with_capacity(((rhi - rlo + 1) * (chi - clo + 1)) as usize);
     for r in rlo..=rhi {
         for c in clo..=chi {
-            v.push((r as u32) * cols as u32 + c as u32);
+            v.push((r as u32) * u32::from(cols) + c as u32);
         }
     }
     v
@@ -210,7 +218,7 @@ pub trait Pattern: Send {
     /// Receive the placement rect this layer occupies; placement-aware patterns render relative to it,
     /// the rest ignore it, defaulted like [`set_frame`](Pattern::set_frame). The compositor computes it
     /// from the layer's region ([`Bounds::from_region`]) and calls this once per tick before [`field`]
-    /// (Pattern::field), so a bounds-aware pattern always sees its current rect.
+    /// (`Pattern::field`), so a bounds-aware pattern always sees its current rect.
     fn set_bounds(&mut self, _b: Bounds) {}
 
     /// Emit this tick's field for a `rows`×`cols` matrix at elapsed time `t` (seconds).
@@ -228,26 +236,29 @@ pub trait Pattern: Send {
 pub struct Params(pub BTreeMap<String, f32>);
 
 impl Params {
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
     /// Read a continuous knob (or `default` if unset).
+    #[must_use]
     pub fn f32(&self, key: &str, default: f32) -> f32 {
         self.0.get(key).copied().unwrap_or(default)
     }
 
     /// Read an enum-index knob (or `default` if unset), rounded to the nearest whole value.
+    #[must_use]
     pub fn u8(&self, key: &str, default: u8) -> u8 {
         self.0
             .get(key)
-            .map(|v| v.round().clamp(0.0, 255.0) as u8)
-            .unwrap_or(default)
+            .map_or(default, |v| v.round().clamp(0.0, 255.0) as u8)
     }
 
     /// Read a toggle knob (or `default` if unset) — true at/above 0.5.
+    #[must_use]
     pub fn bool(&self, key: &str, default: bool) -> bool {
-        self.0.get(key).map(|v| *v >= 0.5).unwrap_or(default)
+        self.0.get(key).map_or(default, |v| *v >= 0.5)
     }
 
     /// Set a knob value.
@@ -257,12 +268,13 @@ impl Params {
 
     /// A param bag pre-filled with every default from a pattern's schema — the starting values the
     /// inspector shows for a freshly-applied layer. Unknown patterns yield an empty bag.
+    #[must_use]
     pub fn defaults_for(pattern: &str) -> Params {
         let mut p = Params::default();
         for prm in pattern_params(pattern) {
             match prm.kind {
                 ParamKind::Range { default, .. } => p.set(prm.key, default),
-                ParamKind::Enum { default, .. } => p.set(prm.key, default as f32),
+                ParamKind::Enum { default, .. } => p.set(prm.key, f32::from(default)),
                 ParamKind::Toggle { default } => p.set(prm.key, if default { 1.0 } else { 0.0 }),
                 ParamKind::Color => {} // patterns carry no colour params (colour is the spectrum)
             }
@@ -316,6 +328,7 @@ impl Default for LayerDef {
 
 impl LayerDef {
     /// Build the live, configured [`Pattern`] for this layer (or `None` if the pattern key is unknown).
+    #[must_use]
     pub fn make_pattern(&self) -> Option<Box<dyn Pattern>> {
         let mut p = make_pattern(&self.pattern)?;
         p.configure(&self.params);
@@ -611,6 +624,7 @@ static REGISTRY: &[PatternDef] = &[
 const ACCENT: Rgb = Rgb::new(0x4A, 0xF2, 0xB0);
 
 /// The full registry slice — the tile catalog reads this.
+#[must_use]
 pub fn registry() -> &'static [PatternDef] {
     REGISTRY
 }
@@ -619,6 +633,7 @@ pub fn registry() -> &'static [PatternDef] {
 /// rain+comet pattern whose `mode` knob cross-linked the two tiles) aliases to `rain` — a saved
 /// streak layer keeps rendering (mode 0 = rain unchanged; the rare mode-1 comet layer lands on
 /// rain's `matrix` submode and re-picks its own Comet tile in one click).
+#[must_use]
 pub fn pattern_def(key: &str) -> Option<&'static PatternDef> {
     let key = if key.eq_ignore_ascii_case("streak") { "rain" } else { key };
     REGISTRY.iter().find(|d| d.key.eq_ignore_ascii_case(key))
@@ -626,21 +641,25 @@ pub fn pattern_def(key: &str) -> Option<&'static PatternDef> {
 
 /// Build a fresh, UNCONFIGURED pattern instance by key (the factory). `None` for an unknown key.
 /// (Use [`LayerDef::make_pattern`] to build one already configured with a layer's params.)
+#[must_use]
 pub fn make_pattern(key: &str) -> Option<Box<dyn Pattern>> {
     pattern_def(key).map(|d| (d.make)())
 }
 
 /// The typed param schema the inspector auto-renders for a pattern (empty for an unknown key).
+#[must_use]
 pub fn pattern_params(key: &str) -> Vec<Param> {
     pattern_def(key).map(|d| (d.params)()).unwrap_or_default()
 }
 
 /// The built-in default spectrum for a pattern (`None` for an unknown key).
+#[must_use]
 pub fn default_spectrum(key: &str) -> Option<Spectrum> {
     pattern_def(key).map(|d| (d.default_spectrum)())
 }
 
 /// Every registered pattern key, in registry order.
+#[must_use]
 pub fn pattern_keys() -> Vec<&'static str> {
     REGISTRY.iter().map(|d| d.key).collect()
 }
@@ -649,14 +668,16 @@ pub fn pattern_keys() -> Vec<&'static str> {
 /// editor is meaningful for it? Registry-driven. An unknown key assumes `true` — the safe default
 /// (show the editor rather than silently hide it). `false` for the full-colour patterns (`screen`,
 /// `custom`, `vitals`). Replaces app-side string-matching on the pattern key.
+#[must_use]
 pub fn pattern_has_spectrum(key: &str) -> bool {
-    pattern_def(key).map(|d| d.has_spectrum).unwrap_or(true)
+    pattern_def(key).is_none_or(|d| d.has_spectrum)
 }
 
 /// Is this pattern a device-telemetry READOUT (a gauge, not a decorative effect)? Registry-driven;
 /// `true` only for `vitals`, unknown → `false`. Replaces app-side string-matching on the pattern key.
+#[must_use]
 pub fn pattern_is_readout(key: &str) -> bool {
-    pattern_def(key).map(|d| d.readout).unwrap_or(false)
+    pattern_def(key).is_some_and(|d| d.readout)
 }
 
 // ─────────────────────────────────── the render clock (one epoch, one formula) ─────────────
@@ -674,6 +695,7 @@ pub fn render_epoch() -> Instant {
 /// Quantise an elapsed time (seconds) to whole `1/fps` steps — floor `elapsed·fps` back to `/fps`. The
 /// ONE render-clock formula the GUI preview and the device `animate` loop both run, so their phases step
 /// identically (chunky at 6 fps, smooth at 30). `fps` is floored to ≥1 (a 0 would divide by zero).
+#[must_use]
 pub fn quantized_t(elapsed_secs: f32, fps: u32) -> f32 {
     let fps = fps.max(1) as f32;
     (elapsed_secs * fps).floor() / fps
@@ -687,6 +709,7 @@ pub fn quantized_t(elapsed_secs: f32, fps: u32) -> f32 {
 /// ms precision forever. Sibling of weave.rs `seconds()`. The noise/absolute-`t` fields are periodic, so
 /// the one reseed per ~68min is imperceptible; speed-scaled motion now rides dt accumulators (Axis/Radial/
 /// Flow/Meter) and never sees the reseed at all.
+#[must_use]
 pub fn render_elapsed() -> f32 {
     (render_epoch().elapsed().as_millis() % 4_096_000) as f32 * 1e-3
 }
@@ -1213,7 +1236,7 @@ fn value_noise(sx: f32, sy: f32, seed: f32) -> f32 {
     let ux = fx * fx * (3.0 - 2.0 * fx);
     let uy = fy * fy * (3.0 - 2.0 * fy);
     let h = |a: f32, b: f32| {
-        let n = (a * 127.1 + b * 311.7 + seed * 74.7).sin() * 43758.5453;
+        let n = (a * 127.1 + b * 311.7 + seed * 74.7).sin() * 43_758.547;
         n - n.floor()
     };
     let a = h(ix, iy);
@@ -1368,7 +1391,7 @@ impl Rain {
         let matrix = self.mode == 1;
         let decay = if matrix { 0.90 } else { 0.80 };
         let advance = if matrix { 0.30 } else { 0.22 };
-        for v in self.level.iter_mut() {
+        for v in &mut self.level {
             *v *= decay;
             if *v < 0.02 {
                 *v = 0.0;
@@ -1596,7 +1619,7 @@ impl Comet {
         const ADVANCE: f32 = 0.45;
         const RESPAWN_MIN: f32 = 1.0;
         const RESPAWN_SPAN: f32 = 6.0;
-        for v in self.burst.iter_mut() {
+        for v in &mut self.burst {
             *v *= BURST_DECAY;
             if *v < 0.02 {
                 *v = 0.0;
@@ -1783,7 +1806,7 @@ impl Pattern for Sparkle {
         }
         // fade every cell toward dark — FADE is the twinkle length (higher → faster decay → crisper sparks).
         let decay = 0.04 * self.speed.max(0.1) * self.fade.clamp(0.1, 4.0);
-        for l in self.level.iter_mut() {
+        for l in &mut self.level {
             *l = (*l - decay).max(0.0);
         }
         let cells = self.level.iter().map(|&l| Cell::new(0.0, l)).collect();
@@ -1842,7 +1865,7 @@ impl Pattern for Ignite {
         });
         // fade — FADE is the trail length (higher → faster decay → a snappier glow).
         let decay = 0.06 * self.fade.clamp(0.1, 4.0);
-        for l in self.level.iter_mut() {
+        for l in &mut self.level {
             *l = (*l - decay).max(0.0);
         }
         let cells = self.level.iter().map(|&l| Cell::new(0.0, l)).collect();
@@ -2271,14 +2294,12 @@ impl Pattern for Meter {
                 let src = if self.source == 1 { "mic" } else { "speakers" };
                 crate::audio_spectrum::ensure(src);
                 let region = (self.focus as usize).min(crate::audio_spectrum::REGIONS - 1);
-                let (level, tone) = crate::audio_spectrum::signal()
-                    .map(|s| (s.levels[region], s.tone))
-                    .unwrap_or_else(|| {
+                let (level, tone) = crate::audio_spectrum::signal().map_or_else(|| {
                         // no PCM stream (off-platform / exotic endpoint) — the honest OS peak
                         // instead, with the colour parked mid-gradient (no tone data to hear).
                         crate::audio_level::ensure(src);
                         (crate::audio_level::level(), 0.5)
-                    });
+                    }, |s| (s.levels[region], s.tone));
                 // dt from the shared render clock (0.25 cap absorbs pauses; covers a 6fps board's 167ms)
                 let dt = (t - self.last_t).clamp(0.0, 0.25);
                 self.last_t = t;
@@ -2530,6 +2551,7 @@ impl Pattern for Vitals {
 /// `pub` because the app's lighting-page renders the vitals TILE thumbnail through this SAME renderer
 /// (over `Bounds::board`) instead of the key-anchored [`render_vitals`](crate::lighting::render_vitals),
 /// so the swatch matches the APPLIED layer at any grid size rather than reading ~all-black off-keyboard.
+#[must_use]
 pub fn render_vitals_bounds(v: crate::lighting::Vitals, rows: u8, cols: u8, b: Bounds, phase: f32) -> Vec<Rgb> {
     let (br, bc) = (rows as usize, cols as usize);
     let mut f = vec![Rgb::BLACK; br * bc];
@@ -2538,7 +2560,7 @@ pub fn render_vitals_bounds(v: crate::lighting::Vitals, rows: u8, cols: u8, b: B
         return f;
     }
     // BATTERY GAUGE — round(pct% × width) columns lit; any non-zero battery lights ≥1 (1% ≠ empty).
-    let pct = v.battery_pct.min(100) as f32;
+    let pct = f32::from(v.battery_pct.min(100));
     let lit = if v.battery_pct == 0 {
         0
     } else {
@@ -2628,12 +2650,12 @@ fn placement_field(bounds: Option<Bounds>, rows: u8, cols: u8, intensity: f32) -
         return Field::Scalar(vec![Cell::new(0.0, 0.0); n]);
     }
     let bounds = bounds.unwrap_or_else(|| Bounds::board(rows, cols));
-    let span = bounds.cols.max(1) as f32 - 1.0;
+    let span = f32::from(bounds.cols.max(1)) - 1.0;
     let mut cells = Vec::with_capacity(n);
     for _r in 0..rows {
         for c in 0..cols {
             let u = if span > 0.0 {
-                ((c.saturating_sub(bounds.col0)) as f32 / span).clamp(0.0, 1.0)
+                (f32::from(c.saturating_sub(bounds.col0)) / span).clamp(0.0, 1.0)
             } else {
                 0.0
             };
@@ -2680,7 +2702,7 @@ impl Pattern for MicLight {
     }
 }
 
-/// MODE HELD — the live input mode as a paintable layer: lights while a hold layer (HyperShift)
+/// MODE HELD — the live input mode as a paintable layer: lights while a hold layer (`HyperShift`)
 /// or a sniper hold is engaged, per the `signal` knob. Fed edge-accurately by the dispatch loop
 /// ([`crate::lighting::publish_hold`]); before the live loop has ever published (or after it
 /// stops and pushes the default) there is no mode to show and the layer is dark. Paint it over
@@ -2851,6 +2873,7 @@ impl Preset {
     /// from the registry truth (`readout` / `live_input`) plus the two fed-but-not-readout patterns
     /// (`meter` reads audio/load, `screen` reads your desktop), so a new preset lands on the right
     /// shelf for free.
+    #[must_use]
     pub fn group(&self) -> &'static str {
         if pattern_is_readout(self.pattern) || matches!(self.pattern, "meter" | "screen") {
             "data"
@@ -2862,6 +2885,7 @@ impl Preset {
     }
 
     /// Build the [`LayerDef`] this preset describes (a fresh layer ready to composite/persist).
+    #[must_use]
     pub fn to_layer(&self) -> LayerDef {
         LayerDef {
             pattern: self.pattern.into(),
@@ -2883,6 +2907,7 @@ impl Preset {
 
 /// The PRESET catalog — the full effect set collapsed onto the thirteen shapes, in grid order. The single
 /// source for the (phase-3) tile grid. Each is pure data: a pattern key, param overrides, and a spectrum.
+#[must_use]
 pub fn presets() -> Vec<Preset> {
     vec![
         Preset { slug: "static", label: "Static", pattern: "uniform", params: pp_none, spectrum: sp_static,
@@ -2932,11 +2957,13 @@ pub fn presets() -> Vec<Preset> {
 
 /// Look up a preset by its stable slug (case-insensitive). The single resolver the GUI tile picker
 /// and the Synapse importer both use.
+#[must_use]
 pub fn preset_by_slug(slug: &str) -> Option<Preset> {
     presets().into_iter().find(|p| p.slug.eq_ignore_ascii_case(slug))
 }
 
 /// Build the [`LayerDef`] a preset slug describes (a fresh layer), or `None` for an unknown slug.
+#[must_use]
 pub fn preset_layer(slug: &str) -> Option<LayerDef> {
     preset_by_slug(slug).map(|p| p.to_layer())
 }
@@ -2945,6 +2972,7 @@ pub fn preset_layer(slug: &str) -> Option<LayerDef> {
 /// user has customised it past any preset. The lighting page uses this to highlight the active tile —
 /// a freshly-picked preset highlights its tile; editing a stop/knob clears the highlight (honest: the
 /// look is now bespoke, not a named preset).
+#[must_use]
 pub fn slug_for_layer(def: &LayerDef) -> Option<&'static str> {
     presets().into_iter().find_map(|p| {
         let l = p.to_layer();
@@ -3038,6 +3066,7 @@ pub struct Compositor {
 impl Compositor {
     /// Build the live stack from serialisable [`LayerDef`]s — resolves + configures each pattern (an
     /// unknown key falls back to a benign `uniform`) and sorts each region mask for the binary-search test.
+    #[must_use]
     pub fn from_defs(defs: &[LayerDef]) -> Compositor {
         let layers = defs
             .iter()
@@ -3063,7 +3092,7 @@ impl Compositor {
     pub fn render(&mut self, rows: u8, cols: u8, t: f32) -> Vec<Rgb> {
         let n = rows as usize * cols as usize;
         let mut out = vec![Rgb::BLACK; n];
-        for layer in self.layers.iter_mut() {
+        for layer in &mut self.layers {
             if !layer.enabled {
                 continue;
             }
@@ -3165,7 +3194,7 @@ mod tests {
     /// on the same lock the other global-poking tests use.
     #[test]
     fn onair_lights_only_when_the_broadcast_says_live_and_never_goes_stale() {
-        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         use crate::lighting::{clear_broadcast, publish_broadcast, Broadcast};
         clear_broadcast();
         let def = preset_layer("onair").expect("onair preset");
@@ -3188,7 +3217,7 @@ mod tests {
 
     #[test]
     fn onair_signal_knob_picks_which_truth_and_standby_traces_placement() {
-        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         use crate::lighting::{clear_broadcast, publish_broadcast, Broadcast};
         // signal = record: a running RECORDING lights it, a live stream alone does not.
         let mut def = preset_layer("onair").expect("onair preset");
@@ -3215,7 +3244,7 @@ mod tests {
 
     #[test]
     fn miclight_renders_the_shown_state_and_never_guesses() {
-        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let def = preset_layer("miclight").expect("miclight preset");
         assert_eq!(def.blend, Blend::Cut, "a readout preset composites as a cutout");
         let mut comp = Compositor::from_defs(&[def]);
@@ -3239,7 +3268,7 @@ mod tests {
 
     #[test]
     fn modeheld_follows_the_dispatch_hold_state() {
-        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         use crate::lighting::{clear_hold, publish_hold, HoldState};
         clear_hold();
         let accent = Rgb::new(0x4A, 0xF2, 0xB0);
@@ -3265,7 +3294,7 @@ mod tests {
 
     #[test]
     fn signal_layer_renders_its_channel_as_level_or_glow() {
-        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         use crate::lighting::set_signal;
         set_signal(0, 0.0);
         set_signal(1, 0.0);
@@ -3301,7 +3330,7 @@ mod tests {
 
     #[test]
     fn onair_composites_as_a_cutout_over_the_users_own_lighting() {
-        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         use crate::lighting::{clear_broadcast, publish_broadcast, Broadcast};
         clear_broadcast();
         // a teal base with an onair layer painted on cells {1, 2} of a 1×4 strip
@@ -3861,7 +3890,7 @@ mod tests {
         // they ride Razer's `0x04` report into `capture::macro_key_down`. This verifies the bridge:
         // a fresh M1 down-edge lights M1's cell exactly once, a still-held M1 does NOT re-fire, and a
         // release→re-press fires again — the same shared-held-state down-edge model the VK path uses.
-        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let m1 = crate::lighting::razer_key_cell("M1").expect("M1 has a standard cell");
         assert_eq!(m1, (1, 0), "M1 lives at (row 1, col 0)");
@@ -4308,7 +4337,7 @@ mod tests {
     #[test]
     fn vitals_pattern_gates_on_a_published_source() {
         // Serialised: the vitals feed is a process-global, so don't race a test that also publishes.
-        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // No source published → the board idles dark (a Color field of black), like the quiet meter.
         crate::lighting::clear_vitals();
         let mut p = make_pattern("vitals").expect("vitals pattern builds");
@@ -4340,7 +4369,7 @@ mod tests {
     #[test]
     fn vitals_overlay_cuts_out_over_the_base() {
         // Serialised: the vitals feed is a process-global, so don't race a publisher.
-        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (rows, cols) = (2u8, 8u8);
         let base_col = Rgb::new(30, 90, 180);
         // a solid-lit base beneath a Cut-blended vitals overlay (the readout preset's default blend).
@@ -4364,7 +4393,7 @@ mod tests {
         crate::lighting::publish_vitals(crate::lighting::Vitals {
             battery_pct: 50, charging: false, active_stage: 0, stage_count: 1,
         });
-        let mut comp = Compositor::from_defs(&[base.clone(), vitals.clone()]);
+        let mut comp = Compositor::from_defs(&[base, vitals]);
         let out = comp.render(rows, cols, 0.0);
         // 50% over 8 cols → the left 4 columns light at the gauge colour; the right 4 pass through.
         let lit = crate::lighting::battery_color(50);

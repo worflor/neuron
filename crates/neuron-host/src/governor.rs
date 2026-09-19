@@ -41,7 +41,7 @@ pub struct Config {
     pub step: Duration,
     /// Pressure injected per crash.
     pub impulse: f64,
-    /// Restart delay = base + pressure × per_unit (clamped to max).
+    /// Restart delay = base + pressure × `per_unit` (clamped to max).
     pub base_delay: Duration,
     pub delay_per_unit: Duration,
     pub max_delay: Duration,
@@ -53,6 +53,7 @@ impl Config {
     /// Critically-damped default: repeated root λ (0 < λ < 1) ⇒ K = 2λ, G = λ².
     /// Impulse response is (a + b·n)·λⁿ — a brief rise, then monotone decay,
     /// no oscillation.
+    #[must_use]
     pub fn critically_damped(lambda: f64) -> Config {
         Config {
             k: 2.0 * lambda,
@@ -68,6 +69,7 @@ impl Config {
 
     /// Jury stability criterion for `x² − Kx + G` (roots strictly inside the
     /// unit circle): |G| < 1 and |K| < 1 + G.
+    #[must_use]
     pub fn is_stable(&self) -> bool {
         self.g.abs() < 1.0 && self.k.abs() < 1.0 + self.g
     }
@@ -84,6 +86,7 @@ pub struct Ledger {
 }
 
 impl Ledger {
+    #[must_use]
     pub fn absorption(&self) -> f64 {
         if self.crashes == 0 {
             1.0

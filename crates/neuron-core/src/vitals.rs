@@ -49,7 +49,7 @@ fn freshness_for(batt: u8) -> Duration {
         0..=5 => Duration::from_secs(5),
         6..=10 => Duration::from_secs(10),
         11..=20 => Duration::from_secs(20),
-        _ => Duration::from_secs(60),
+        _ => Duration::from_mins(1),
     }
 }
 
@@ -110,7 +110,7 @@ pub fn observe(pid: u16, batt: u8, charging: bool, from_event: bool) {
         if v.batt == UNREAD {
             // first sample = silent baseline, UNLESS it's a real event on a freshly-plugged device.
             if from_event && charging {
-                cards.push((batt as u32, "Charging", None));
+                cards.push((u32::from(batt), "Charging", None));
             }
         } else {
             let prev = v.batt;
@@ -119,20 +119,20 @@ pub fn observe(pid: u16, batt: u8, charging: bool, from_event: bool) {
                 if !charging && batt <= WARN_AT[0] {
                     // unplugged INTO a warning zone — lead with the warning (it conveys on-battery too).
                     let title = if batt <= CRIT { "Battery critical" } else { "Battery low" };
-                    cards.push((batt as u32, title, Some(prev as u32)));
+                    cards.push((u32::from(batt), title, Some(u32::from(prev))));
                 } else {
                     let title = if charging { "Charging" } else { "On battery" };
-                    cards.push((batt as u32, title, Some(prev as u32)));
+                    cards.push((u32::from(batt), title, Some(u32::from(prev))));
                 }
             }
             if charging && batt >= 100 && prev < 100 {
-                cards.push((100, "Fully charged", Some(prev as u32)));
+                cards.push((100, "Fully charged", Some(u32::from(prev))));
             }
             if !charging && charging == v.charging {
                 // pure discharge (no flip this frame): fire on the most-urgent downward crossing.
                 if let Some(&t) = WARN_AT.iter().rev().find(|&&t| prev > t && batt <= t) {
                     let title = if t <= CRIT { "Battery critical" } else { "Battery low" };
-                    cards.push((batt as u32, title, Some(prev as u32)));
+                    cards.push((u32::from(batt), title, Some(u32::from(prev))));
                 }
             }
         }
@@ -155,11 +155,11 @@ mod tests {
 
     #[test]
     fn freshness_tightens_as_battery_drops() {
-        assert_eq!(freshness_for(80), Duration::from_secs(60));
+        assert_eq!(freshness_for(80), Duration::from_mins(1));
         assert_eq!(freshness_for(20), Duration::from_secs(20));
         assert_eq!(freshness_for(10), Duration::from_secs(10));
         assert_eq!(freshness_for(5), Duration::from_secs(5));
-        assert_eq!(freshness_for(UNREAD), Duration::from_secs(60));
+        assert_eq!(freshness_for(UNREAD), Duration::from_mins(1));
     }
 
     #[test]

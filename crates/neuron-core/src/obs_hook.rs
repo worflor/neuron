@@ -46,6 +46,7 @@ pub fn clear_sink() {
 
 /// Route an OBS verb through the installed sink. `None` = no sink installed
 /// (the caller reports "OBS not connected"); `Some((ok,msg))` = the sink ran.
+#[must_use]
 pub fn dispatch(verb: &str, arg: &Value) -> Option<(bool, String)> {
     let g = cell().read().unwrap_or_else(|e| e.into_inner());
     g.as_ref().map(|f| f(verb, arg))

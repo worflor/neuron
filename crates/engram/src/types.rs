@@ -74,16 +74,19 @@ pub struct Packet {
 
 impl Packet {
     /// Total signal energy across all blocks.
+    #[must_use]
     pub fn total_energy(&self) -> f64 {
         self.blocks.iter().map(|b| b.signal_energy).sum()
     }
 
     /// Total residual energy across all blocks.
+    #[must_use]
     pub fn residual_energy(&self) -> f64 {
         self.blocks.iter().map(|b| b.residual_energy).sum()
     }
 
     /// Energy capture percentage.
+    #[must_use]
     pub fn capture(&self) -> f64 {
         let te = self.total_energy();
         if te < MACHINE_EPS {
@@ -104,6 +107,7 @@ pub struct FitResult {
 impl FitResult {
     /// Linear fallback: constant velocity (K=2, G=1).
     #[inline]
+    #[must_use]
     pub const fn linear() -> Self {
         Self {
             k: LINEAR_K,

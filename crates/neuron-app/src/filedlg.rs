@@ -46,18 +46,18 @@ fn finish(path: String) {
     }
 }
 
-/// Run the native OpenFileDialog (PowerShell/WinForms) and return the selected path, or "" if the
+/// Run the native `OpenFileDialog` (PowerShell/WinForms) and return the selected path, or "" if the
 /// user cancelled or the dialog could not be shown.
 #[cfg(windows)]
 fn open_dialog() -> String {
-    const SCRIPT: &str = r#"
+    const SCRIPT: &str = r"
 Add-Type -AssemblyName System.Windows.Forms | Out-Null
 $d = New-Object System.Windows.Forms.OpenFileDialog
 $d.Title = 'Select a Synapse export'
 $d.Filter = 'Synapse exports (*.synapse3;*.ChromaEffects)|*.synapse3;*.ChromaEffects|All files (*.*)|*.*'
 $d.CheckFileExists = $true
 if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.FileName) }
-"#;
+";
     let out = std::process::Command::new("powershell")
         .args(["-NoProfile", "-STA", "-Command", SCRIPT])
         .output();

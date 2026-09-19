@@ -39,7 +39,7 @@ pub trait FrameSink {
     /// silicon; dedup then believes a row is current while the board disagrees. Always one row —
     /// never a full-board resend, which on a legacy per-row board is a ~12ms row-by-row wipe that
     /// reads as a periodic full-board FLASH. The writer sweeps the whole board one row per tick
-    /// after content stops (see HealPolicy). Default no-op for stateless sinks.
+    /// after content stops (see `HealPolicy`). Default no-op for stateless sinks.
     fn refresh(&mut self) {}
 }
 
@@ -69,7 +69,7 @@ const QUIET_SWEEP_AT: u64 = 8;
 /// left in peace).
 const QUIET_SWEEP_LEN: u64 = 8;
 
-/// When to re-assert a row — pure, injected-tick, testable (the WriterCore
+/// When to re-assert a row — pure, injected-tick, testable (the `WriterCore`
 /// discipline). The writer asks `due()` at the top of a tick, resets both dedup
 /// caches when it says so, then reports what the tick did via
 /// `tick(healed, content_changed)`. A heal tick's rewrite is NOT content
@@ -81,6 +81,7 @@ pub struct HealPolicy {
 }
 
 impl HealPolicy {
+    #[must_use]
     pub fn new() -> Self {
         // Born idle: no heals until the first real frame lands (an unclaimed
         // or never-painted board has nothing to un-tear).
@@ -96,6 +97,7 @@ impl HealPolicy {
     ///   • JUST STOPPED (`QUIET_SWEEP_AT`..`+LEN` ticks since the last change):
     ///     heal every tick — a short one-row-per-tick SWEEP that re-asserts the
     ///     whole final frame — then go quiescent (silent on a static board).
+    #[must_use]
     pub fn due(&self) -> bool {
         if self.since_change < QUIET_SWEEP_AT {
             self.since_heal >= ACTIVE_HEAL_TICKS
@@ -135,12 +137,13 @@ pub const MAX_WRITER_FPS: u32 = 30;
 /// remainder; overrun → no sleep AND accumulated lag clamped to one `dt`, preserving sub-frame
 /// cadence phase without catch-up bursts. (The inline predecessor discarded ALL phase on overrun
 /// — exactly the copy-drift the shared helper exists to prevent.)
+#[must_use]
 pub fn pace(deadline: Instant, now: Instant, dt: Duration) -> (Instant, Duration) {
     if deadline > now {
         (deadline, deadline - now)
     } else {
         let lag = now - deadline;
-        let clamped = if lag > dt { deadline + (lag - dt) } else { deadline };
+        let clamped = if lag > dt { deadline + lag.checked_sub(dt).unwrap() } else { deadline };
         (clamped, Duration::ZERO)
     }
 }
@@ -151,6 +154,7 @@ pub struct WriterCore {
 }
 
 impl WriterCore {
+    #[must_use]
     pub fn new() -> Self {
         WriterCore { last: None }
     }
@@ -234,7 +238,7 @@ impl WriterPauser {
 /// device writes are short USB transfers with their own sub-second driver-level timeouts, so this
 /// deadline is an empirical margin over that, not a derived guarantee — it exists specifically so
 /// `join_bounded`'s backstop, not the loop's own logic, is what bounds a stuck sink.
-const WRITER_DROP_DEADLINE: Duration = Duration::from_millis(1000);
+const WRITER_DROP_DEADLINE: Duration = Duration::from_secs(1);
 
 /// The paced writer thread for one surface. Dropping it stops and joins.
 pub struct Writer {
@@ -326,17 +330,14 @@ impl Writer {
                         }
                         false
                     }));
-                    match step {
-                        Ok(wrote) => heal.tick(healing, wrote && !healing),
-                        Err(_) => {
-                            heal.tick(healing, false);
-                            faults += 1;
-                            if faults == 1 {
-                                eprintln!(
-                                    "neuron-writer-{surface}: sink/handle fault contained; \
-                                     writer continues"
-                                );
-                            }
+                    if let Ok(wrote) = step { heal.tick(healing, wrote && !healing) } else {
+                        heal.tick(healing, false);
+                        faults += 1;
+                        if faults == 1 {
+                            eprintln!(
+                                "neuron-writer-{surface}: sink/handle fault contained; \
+                                 writer continues"
+                            );
                         }
                     }
                     // Deadline pacing via the SAME pure math `Lights::animate` uses (see `pace`
@@ -354,6 +355,7 @@ impl Writer {
     }
 
     /// The pause valve for transient-I/O coordination (see [`WriterPauser`]).
+    #[must_use]
     pub fn pauser(&self) -> WriterPauser {
         WriterPauser { pause: self.pause.clone(), parked: self.parked.clone() }
     }
@@ -376,6 +378,7 @@ pub struct MockSink {
 }
 
 impl MockSink {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }

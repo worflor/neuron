@@ -31,7 +31,7 @@ impl ProfileCursor for ProcessProfileCursor {
     }
 }
 
-/// How many HyperScroll wheel stages [`Intent::ScrollStageCycle`] cycles over. The device exposes no
+/// How many `HyperScroll` wheel stages [`Intent::ScrollStageCycle`] cycles over. The device exposes no
 /// active-stage getter and there's no per-profile stage count yet, so this is the common enabled-stage
 /// count (tactile / free-spin / smart-reel); the resident cursor wraps within it. Make profile-driven
 /// when a stage-count source lands.
@@ -42,14 +42,13 @@ pub const SCROLL_STAGE_COUNT: u8 = 3;
 /// testable — the cycle's whole policy in one place.
 fn next_dpi(cur: u16, step: i32, stages: &[u16]) -> u16 {
     if stages.is_empty() {
-        return (cur as i32 + step * 200).clamp(100, 30_000) as u16;
+        return (i32::from(cur) + step * 200).clamp(100, 30_000) as u16;
     }
     let idx = stages
         .iter()
         .enumerate()
-        .min_by_key(|(_, &s)| (s as i32 - cur as i32).abs())
-        .map(|(i, _)| i)
-        .unwrap_or(0);
+        .min_by_key(|(_, &s)| (i32::from(s) - i32::from(cur)).abs())
+        .map_or(0, |(i, _)| i);
     let n = stages.len() as i32;
     let next = (idx as i32 + step).rem_euclid(n) as usize;
     stages[next].clamp(100, 30_000)
@@ -70,7 +69,7 @@ pub fn run_shared_intent(
     intent: &Intent,
     cause: crate::dpi_origin::Cause,
 ) -> Option<String> {
-    use Intent::*;
+    use Intent::{Teleport, Whiteboard, Knockback, Glance, Summon, Banish, Pin, Kill, Tether, Dial, Control, Echo, DpiSet, DpiCycle, ScrollStageCycle, ProfileSwitch, ProfileCycle};
 
     match intent {
         Teleport | Whiteboard | Knockback | Glance(_) | Summon(..) | Banish(_) | Pin(_)
@@ -95,7 +94,7 @@ pub fn run_shared_intent(
                 Ok(pid) => {
                     // confirmation fires ONLY past the committed write (set is absolute — no prior
                     // read, so no old→new).
-                    crate::confirm::dpi(pid, dpi as u32, None);
+                    crate::confirm::dpi(pid, u32::from(dpi), None);
                     format!("DPI -> {dpi}")
                 }
                 Err(e) => format!("DPI set failed: {e}"),
@@ -127,7 +126,7 @@ pub fn run_shared_intent(
             match result {
                 Ok((pid, cur, next)) => {
                     // the read-back gave us the prior DPI too — a true old→new confirmation.
-                    crate::confirm::dpi(pid, next as u32, Some(cur as u32));
+                    crate::confirm::dpi(pid, u32::from(next), Some(u32::from(cur)));
                     format!("DPI cycle {} -> {next}", dir.label())
                 }
                 Err(e) => format!("DPI cycle skipped ({e})"),
@@ -147,7 +146,7 @@ pub fn run_shared_intent(
                     crate::writes::set_scroll_stage_cursor(next);
                     // confirm past the committed stage-select — a true old→new (we held the prior
                     // cursor). Was missing, so cycling sensitivity earned no card.
-                    crate::confirm::scroll(pid, next as u32, SCROLL_STAGE_COUNT as u32, Some(prev as u32));
+                    crate::confirm::scroll(pid, u32::from(next), u32::from(SCROLL_STAGE_COUNT), Some(u32::from(prev)));
                     format!("scroll stage {} -> {next}", dir.label())
                 }
                 Err(e) => format!("scroll stage skipped ({e})"),

@@ -39,6 +39,7 @@ pub static SIDECAR_PID: AtomicU32 = AtomicU32::new(0);
 
 /// Whether `NEURON_PROFILE` was requested. The logger checks this before spawning; hot paths don't
 /// need to (a relaxed increment costs nothing meaningful even when nobody reads it).
+#[must_use]
 pub fn enabled() -> bool {
     std::env::var_os("NEURON_PROFILE").is_some()
 }
@@ -152,12 +153,12 @@ pub mod pump {
     }
 
     /// Call once per `on_tick`, with the listener's id and the cadence (ms) it is about to wait.
-    /// Records the gap since THIS listener's previous tick; past `cadence * FACTOR` (min FLOOR_MS)
+    /// Records the gap since THIS listener's previous tick; past `cadence * FACTOR` (min `FLOOR_MS`)
     /// it counts the event and — only on that listener's silent→starved transition — logs ONE line,
     /// so a wedged pump is never silent, never spams, and a healthy listener never masks it.
     pub fn record_tick(listener_id: u64, cadence_ms: u32) {
         let now_ms = epoch().elapsed().as_millis() as u64;
-        let mut map = tick_state().lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = tick_state().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let entry = map
             .entry(listener_id)
             .or_insert(TickState { last_ms: None, starved: false });
@@ -166,7 +167,7 @@ pub mod pump {
             return; // first tick for this listener — no prior gap to measure
         };
         let gap = now_ms.saturating_sub(last);
-        let threshold = (cadence_ms as u64)
+        let threshold = u64::from(cadence_ms)
             .saturating_mul(STARVATION_FACTOR)
             .max(STARVATION_FLOOR_MS);
         if gap > threshold {
@@ -187,7 +188,7 @@ pub mod pump {
     pub fn forget_listener(listener_id: u64) {
         tick_state()
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&listener_id);
     }
 
@@ -221,7 +222,7 @@ pub mod pump {
         use super::*;
 
         /// Serializes the watchdog tests: each asserts an exact delta on the process-global
-        /// STARVATION_EVENTS counter, so they must not run concurrently with each other.
+        /// `STARVATION_EVENTS` counter, so they must not run concurrently with each other.
         static WATCHDOG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
         #[test]
@@ -246,7 +247,7 @@ pub mod pump {
 
         #[test]
         fn tick_gap_far_past_cadence_counts_as_starvation() {
-            let _g = WATCHDOG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let _g = WATCHDOG_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let _ = epoch(); // start the clock before we measure real elapsed time
             let listener = 0xD060_0001; // a unique id so this test can't collide with others
             forget_listener(listener); // clean slate
@@ -267,7 +268,7 @@ pub mod pump {
             // The blocking pump legitimately idles up to ~1000ms between ticks; with a matching
             // cadence hint that gap is NORMAL, not starvation (the old fixed 50ms threshold would
             // have false-flagged it every idle second).
-            let _g = WATCHDOG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let _g = WATCHDOG_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let _ = epoch();
             let listener = 0xD060_0004;
             forget_listener(listener);
@@ -283,7 +284,7 @@ pub mod pump {
         fn one_listeners_health_does_not_mask_anothers_starvation() {
             // The multi-listener fix: a healthy listener ticking briskly must NOT hide a different
             // listener that has gone silent (the old shared-timestamp watchdog did exactly that).
-            let _g = WATCHDOG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let _g = WATCHDOG_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let _ = epoch();
             let healthy = 0xD060_0002;
             let stalled = 0xD060_0003;

@@ -56,6 +56,7 @@ pub fn exec(
 }
 
 /// Classify a response by its information structure (the Logos-spirit seed).
+#[must_use]
 pub fn classify(a: &[u8; 80]) -> &'static str {
     let p = &a[..20];
     let nz = p.iter().filter(|&&b| b != 0).count();
@@ -76,6 +77,7 @@ pub fn classify(a: &[u8; 80]) -> &'static str {
 }
 
 /// Human hint for a command class (emergent grouping; the class itself is discovered).
+#[must_use]
 pub fn class_hint(c: u8) -> &'static str {
     match c {
         0x00 => "device-info",
@@ -120,6 +122,7 @@ pub fn fingerprint(t: &dyn Transport, tid: u8) -> (Vec<u8>, Vec<(u8, u8, &'stati
 }
 
 /// Discover every connected Razer `razer_report` device and fingerprint it. Zero registry.
+#[must_use]
 pub fn discover() -> Vec<DeviceFp> {
     let infos = match transport::enumerate() {
         Ok(v) => v,

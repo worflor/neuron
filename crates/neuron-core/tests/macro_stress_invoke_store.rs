@@ -9,12 +9,12 @@
 //!     not).
 //!   * `neuron.store/load/forget/stored` — the per-macro JSON KV store: basic persistence, per-macro
 //!     namespace isolation, atomic-write integrity under a hammering loop, forget (single + all),
-//!     stored()-returns-a-copy, big values, unicode, special-char keys, the NEURON_MACRO_STATE
+//!     stored()-returns-a-copy, big values, unicode, special-char keys, the `NEURON_MACRO_STATE`
 //!     override, survival across a sidecar respawn, concurrent access, missing-key defaults, and
 //!     graceful degradation from a corrupted file.
 //!
 //! ALL of it runs against the REAL python sidecar, DISARMED, with the macros dir isolated into a temp
-//! cwd and the KV store isolated via NEURON_MACRO_STATE into a second temp dir (both removed after).
+//! cwd and the KV store isolated via `NEURON_MACRO_STATE` into a second temp dir (both removed after).
 //! The Macro Host is a process-global singleton and the cwd/env are process-global, so — exactly like
 //! the existing e2e tests — everything is ONE serial `#[test]` with sequential phases. The state-dir
 //! env var is set BEFORE the first host call so the sidecar inherits it at spawn.
@@ -26,7 +26,7 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-/// Path to a macro's on-disk KV store under the test's NEURON_MACRO_STATE dir. The macro ids used
+/// Path to a macro's on-disk KV store under the test's `NEURON_MACRO_STATE` dir. The macro ids used
 /// here are all plain `[a-z0-9_]`, so the sidecar's filename sanitizer is an identity map on them.
 fn store_path(state_dir: &Path, id: &str) -> PathBuf {
     state_dir.join(format!("{id}.json"))
@@ -67,7 +67,7 @@ fn wait_log(needle: &str, dur: Duration) -> Vec<String> {
 
 #[test]
 fn invoke_store_stress_e2e() {
-    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let pid = std::process::id();
     let tmp = std::env::temp_dir().join(format!("neuron_invstore_{pid}"));
     let state = shared_state_dir();
@@ -274,7 +274,7 @@ fn invoke_store_stress_e2e() {
     // ensure the writer is finished, then the final file is valid with all 26 keys.
     let _ = wait_log("atomic done 26", Duration::from_secs(5));
     let fin = read_store(&state, "store_atomic").expect("final atomic store parses");
-    assert_eq!(fin.as_object().map(|m| m.len()), Some(26), "all 26 keys present, file intact");
+    assert_eq!(fin.as_object().map(serde_json::Map::len), Some(26), "all 26 keys present, file intact");
     eprintln!("store atomicity: {reads} concurrent reads, every one parsed cleanly");
 
     // ── store_forget_single_key ────────────────────────────────────────────────────────────────
@@ -366,7 +366,7 @@ fn invoke_store_stress_e2e() {
     // Completion is still explicit rather than sleep-based: filesystem/AV latency is external and
     // variable even though the four macro namespaces no longer serialize each other in-process.
     // Wait for all four completion lines before inspecting final files.
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_mins(1);
     let mut acc = Vec::new();
     let needles = ["P conc done 50", "Q conc done 50", "R conc done 50", "S conc done 50"];
     loop {
@@ -443,7 +443,7 @@ fn invoke_store_stress_e2e() {
             "store_conc_s", "store_missing", "store_corrupt", "store_persist", "store_kill",
         ]
         .iter()
-        .map(|s| s.to_string()),
+        .map(std::string::ToString::to_string),
     );
     for id in ids {
         host.unregister(&id);
@@ -462,7 +462,7 @@ fn invoke_store_stress_e2e() {
 ///
 /// Root cause: `neuron.invoke(wait=False)` dispatches the child fire with `rid: None`
 /// (runtime/host/neuron.py `invoke`), and the host reader's result handler
-/// (macro_host.rs `reader_loop`, the `Some("result")` arm) gated ALL log/error surfacing behind
+/// (`macro_host.rs` `reader_loop`, the `Some("result")` arm) gated ALL log/error surfacing behind
 /// `if let Some(rid) = v.get("rid").and_then(Value::as_u64)`, so a null-rid result was discarded
 /// before the "no waiter -> surface to the log" branch was reached. A top-level `fire_async` (which
 /// uses a NUMERIC rid with no waiter) logged correctly — only the wait=False sub-fire was a black hole.
@@ -472,7 +472,7 @@ fn invoke_store_stress_e2e() {
 /// its first banner line). So an async-invoked child's crash now reaches the log like any other fire.
 #[test]
 fn bug_invoke_wait_false_child_output_is_dropped() {
-    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let pid = std::process::id();
     let tmp = std::env::temp_dir().join(format!("neuron_invbug_{pid}"));
     // The SAME store dir the main e2e uses — see `shared_state_dir`: the singleton sidecar bakes in

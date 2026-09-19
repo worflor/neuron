@@ -135,6 +135,7 @@ impl Resident {
         Ok(Resident { job, child })
     }
 
+    #[must_use]
     pub fn pid(&self) -> u32 {
         self.child.id()
     }
@@ -153,8 +154,7 @@ impl Resident {
         std::thread::sleep(window);
         let dt = t0.elapsed().as_secs_f64();
         let cores = std::thread::available_parallelism()
-            .map(|n| n.get() as f64)
-            .unwrap_or(1.0);
+            .map_or(1.0, |n| n.get() as f64);
 
         let (threads, children, family) = census(self.job, self.pid())?;
         if !family.contains(&self.pid()) {
@@ -259,10 +259,10 @@ fn proc_cpu_seconds_by_pid(pid: u32) -> Option<f64> {
     let mut exit: FILETIME = unsafe { std::mem::zeroed() };
     let mut kernel: FILETIME = unsafe { std::mem::zeroed() };
     let mut user: FILETIME = unsafe { std::mem::zeroed() };
-    if unsafe { GetProcessTimes(h.0, &mut creation, &mut exit, &mut kernel, &mut user) } == 0 {
+    if unsafe { GetProcessTimes(h.0, &raw mut creation, &raw mut exit, &raw mut kernel, &raw mut user) } == 0 {
         return None;
     }
-    let ft = |f: FILETIME| ((f.dwHighDateTime as u64) << 32 | f.dwLowDateTime as u64) as f64 * 1e-7;
+    let ft = |f: FILETIME| (u64::from(f.dwHighDateTime) << 32 | u64::from(f.dwLowDateTime)) as f64 * 1e-7;
     Some(ft(kernel) + ft(user))
 }
 
@@ -271,11 +271,11 @@ fn proc_mem_handles(pid: u32) -> Option<(u64, u64, u32)> {
     let h = ProcHandle::open(pid)?;
     let mut pmc: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
     pmc.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
-    if unsafe { K32GetProcessMemoryInfo(h.0, &mut pmc, pmc.cb) } == 0 {
+    if unsafe { K32GetProcessMemoryInfo(h.0, &raw mut pmc, pmc.cb) } == 0 {
         return None;
     }
     let mut handles: u32 = 0;
-    if unsafe { GetProcessHandleCount(h.0, &mut handles) } == 0 {
+    if unsafe { GetProcessHandleCount(h.0, &raw mut handles) } == 0 {
         handles = 0;
     }
     Some((pmc.PagefileUsage as u64, pmc.WorkingSetSize as u64, handles))
@@ -290,7 +290,7 @@ fn snapshot_processes() -> Result<Vec<(u32, u32, u32, String)>> {
     let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
     entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
     let mut rows = Vec::new();
-    let mut ok = unsafe { Process32FirstW(snap, &mut entry) };
+    let mut ok = unsafe { Process32FirstW(snap, &raw mut entry) };
     while ok != 0 {
         let len = entry
             .szExeFile
@@ -303,7 +303,7 @@ fn snapshot_processes() -> Result<Vec<(u32, u32, u32, String)>> {
             entry.cntThreads,
             String::from_utf16_lossy(&entry.szExeFile[..len]),
         ));
-        ok = unsafe { Process32NextW(snap, &mut entry) };
+        ok = unsafe { Process32NextW(snap, &raw mut entry) };
     }
     unsafe { CloseHandle(snap) };
     Ok(rows)
@@ -327,7 +327,7 @@ fn job_process_ids(job: HANDLE) -> Result<Vec<u32>> {
         QueryInformationJobObject(
             job,
             JobObjectBasicProcessIdList,
-            &mut buf as *mut _ as *mut core::ffi::c_void,
+            (&raw mut buf).cast::<core::ffi::c_void>(),
             std::mem::size_of::<JobPidList>() as u32,
             std::ptr::null_mut(),
         )
@@ -377,13 +377,13 @@ fn resume_process_main_thread(pid: u32) -> Result<()> {
     let mut te: THREADENTRY32 = unsafe { std::mem::zeroed() };
     te.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
     let mut tid = None;
-    let mut ok = unsafe { Thread32First(snap, &mut te) };
+    let mut ok = unsafe { Thread32First(snap, &raw mut te) };
     while ok != 0 {
         if te.th32OwnerProcessID == pid {
             tid = Some(te.th32ThreadID);
             break;
         }
-        ok = unsafe { Thread32Next(snap, &mut te) };
+        ok = unsafe { Thread32Next(snap, &raw mut te) };
     }
     unsafe { CloseHandle(snap) };
     let tid = tid.context("suspended app has no thread in the snapshot")?;
@@ -460,7 +460,7 @@ mod tests {
             "census non-root children {children:?} should name cmd.exe"
         );
 
-        for k in kids.iter_mut() {
+        for k in &mut kids {
             let _ = k.kill(); // terminate the suspended members; they were never resumed
         }
         unsafe { CloseHandle(job) };

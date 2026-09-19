@@ -3,7 +3,7 @@
 // Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
 
 //! The system tray — the 90% surface. A resident `TrayIcon` with a menu (active profile +
-//! quick-switch, HyperShift toggle, brightness/DPI quick controls, effects quick-pick, Open,
+//! quick-switch, `HyperShift` toggle, brightness/DPI quick controls, effects quick-pick, Open,
 //! Settings sub-toggles, Quit). Events arrive on tray-icon's + global-hotkey's static channels;
 //! we drain them from the Slint event loop via a `Timer` (the loop stays alive with no window).
 //!
@@ -241,7 +241,7 @@ fn build_menu(snap: &TraySnapshot) -> (Menu, HashMap<String, TrayAction>) {
 }
 
 /// Register OS-wide hotkeys (best-effort; failures are non-fatal — the tray menu still works).
-/// Ctrl+Alt+H toggles HyperShift, Ctrl+Alt+P pauses writes, Ctrl+Alt+N opens the window.
+/// Ctrl+Alt+H toggles `HyperShift`, Ctrl+Alt+P pauses writes, Ctrl+Alt+N opens the window.
 #[cfg(windows)]
 fn register_hotkeys(map: &mut HashMap<String, TrayAction>) -> Option<GlobalHotKeyManager> {
     use global_hotkey::hotkey::{Code, HotKey, Modifiers};

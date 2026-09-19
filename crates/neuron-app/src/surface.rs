@@ -8,7 +8,7 @@
 //! the whiteboard canvas + palette, the glance frame) is the *same* Win32 recipe: register a
 //! `WNDCLASS`, `CreateWindowExW(WS_POPUP | WS_EX_LAYERED | …)`, allocate a top-down 32bpp BGRA
 //! `CreateDIBSection` into a memory DC, draw premultiplied pixels into the bits, and push the frame
-//! to screen with `UpdateLayeredWindow` + a `BLENDFUNCTION` (AC_SRC_OVER + AC_SRC_ALPHA). That
+//! to screen with `UpdateLayeredWindow` + a `BLENDFUNCTION` (`AC_SRC_OVER` + `AC_SRC_ALPHA`). That
 //! boilerplate used to be hand-duplicated at every site; it now lives here, once.
 //!
 //! Cross-platform seam: this is the single file a non-Windows backend reimplements. The public type
@@ -37,8 +37,8 @@ mod imp {
         ULW_ALPHA, WNDCLASSW, WNDPROC, WS_EX_LAYERED, WS_POPUP,
     };
 
-    /// The shared `BLENDFUNCTION`: per-pixel alpha over whatever's underneath (AC_SRC_OVER +
-    /// AC_SRC_ALPHA). `alpha` is the window-wide constant alpha multiplied on top (255 = none).
+    /// The shared `BLENDFUNCTION`: per-pixel alpha over whatever's underneath (`AC_SRC_OVER` +
+    /// `AC_SRC_ALPHA`). `alpha` is the window-wide constant alpha multiplied on top (255 = none).
     /// This is the ONE blend descriptor — `glance.rs` no longer rolls its own `#[repr(C)] Blend`.
     #[inline]
     fn blend(alpha: u8) -> BLENDFUNCTION {
@@ -92,18 +92,18 @@ mod imp {
         let b = blend(alpha);
         match pos {
             Some(p) => {
-                UpdateLayeredWindow(hwnd, screen, &p, &size, mem, &src, 0, &b, ULW_ALPHA);
+                UpdateLayeredWindow(hwnd, screen, &raw const p, &raw const size, mem, &raw const src, 0, &raw const b, ULW_ALPHA);
             }
             None => {
                 UpdateLayeredWindow(
                     hwnd,
                     screen,
                     std::ptr::null(),
-                    &size,
+                    &raw const size,
                     mem,
-                    &src,
+                    &raw const src,
                     0,
-                    &b,
+                    &raw const b,
                     ULW_ALPHA,
                 );
             }
@@ -134,9 +134,9 @@ mod imp {
                 let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
                 let bmp = CreateDIBSection(
                     dc,
-                    &bmi,
+                    &raw const bmi,
                     DIB_RGB_COLORS,
-                    &mut bits,
+                    &raw mut bits,
                     std::ptr::null_mut(),
                     0,
                 ) as HBITMAP;
@@ -144,13 +144,13 @@ mod imp {
                     DeleteDC(dc);
                     return None;
                 }
-                SelectObject(dc, bmp as _);
+                SelectObject(dc, bmp.cast());
                 Some(Dib { dc, bmp })
             }
         }
     }
 
-    /// How to build one layered surface. Each call site has its OWN class name, ex_style, window
+    /// How to build one layered surface. Each call site has its OWN class name, `ex_style`, window
     /// style, size, and optional custom wndproc / cursor — captured here so the seam never
     /// homogenizes them.
     pub struct SurfaceSpec<'a> {
@@ -233,7 +233,7 @@ mod imp {
                     lpszMenuName: std::ptr::null(),
                     lpszClassName: cls.as_ptr(),
                 };
-                RegisterClassW(&wc);
+                RegisterClassW(&raw const wc);
                 let hwnd = CreateWindowExW(
                     // OR the layered bit in unconditionally — this seam's whole contract is a
                     // present-via-UpdateLayeredWindow surface, so a caller must never be able to
@@ -260,9 +260,9 @@ mod imp {
                 let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
                 let dib = CreateDIBSection(
                     screen,
-                    &bmi,
+                    &raw const bmi,
                     DIB_RGB_COLORS,
-                    &mut bits,
+                    &raw mut bits,
                     std::ptr::null_mut(),
                     0,
                 ) as HBITMAP;
@@ -275,14 +275,14 @@ mod imp {
                     DestroyWindow(hwnd);
                     return None;
                 }
-                let old = SelectObject(mem, dib as _);
+                let old = SelectObject(mem, dib.cast());
                 LayeredSurface {
                     hwnd,
                     screen,
                     mem,
                     dib,
                     old,
-                    bits: bits as *mut u32,
+                    bits: bits.cast::<u32>(),
                 }
                 .into()
             }
@@ -324,7 +324,7 @@ mod imp {
         pub fn into_hwnd(self) -> HWND {
             unsafe {
                 SelectObject(self.mem, self.old);
-                DeleteObject(self.dib as _);
+                DeleteObject(self.dib.cast());
                 DeleteDC(self.mem);
                 ReleaseDC(std::ptr::null_mut(), self.screen);
                 let hwnd = self.hwnd;
@@ -341,7 +341,7 @@ mod imp {
                 // SelectObject(old) → DeleteObject(dib) → DeleteDC(mem) → ReleaseDC(screen) →
                 // DestroyWindow(hwnd).
                 SelectObject(self.mem, self.old);
-                DeleteObject(self.dib as _);
+                DeleteObject(self.dib.cast());
                 DeleteDC(self.mem);
                 ReleaseDC(std::ptr::null_mut(), self.screen);
                 DestroyWindow(self.hwnd);

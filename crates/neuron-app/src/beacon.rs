@@ -354,7 +354,7 @@ pub fn start(weak: slint::Weak<AppWindow>) {
 /// whenever no beacon is pending: waits for the user's cast activation rhythm, streams the
 /// stroke to the overlay, resolves it through the ONE cast resolver (radial ⊆ glyph, spell
 /// assist included), and INJECTS the resolved trigger into the live dispatch worker — so a
-/// flick or a glyph composes with HyperShift layers, intents, turbo, SAFE mode and the live
+/// flick or a glyph composes with `HyperShift` layers, intents, turbo, SAFE mode and the live
 /// readout exactly like a hardware button. Stands down instantly when a beacon arrives, when
 /// the editor takes the trigger, or when the config generation moves (a re-bound trigger or
 /// edited rhythm applies on the very next weave).
@@ -519,8 +519,7 @@ fn live_weave(
         let board_key = slots
             .iter()
             .find(|s| s.action == neuron::action::Action::Whiteboard)
-            .map(|s| s.ctl)
-            .unwrap_or(cast.trigger);
+            .map_or(cast.trigger, |s| s.ctl);
         if kb_ctl == Some(board_key) {
             post_status(
                 weak,
@@ -539,8 +538,7 @@ fn live_weave(
         slots
             .iter()
             .find(|s| s.action == neuron::action::Action::Whiteboard)
-            .map(|s| s.ctl)
-            .unwrap_or(cast.trigger)
+            .map_or(cast.trigger, |s| s.ctl)
     });
     if request == 1 {
         if board_ctl == Some(cast.trigger) {
@@ -743,7 +741,7 @@ fn live_weave(
         600,
         &cancel,
         |id| {
-            crate::flight::trace("weave", "activated", id as u64);
+            crate::flight::trace("weave", "activated", u64::from(id));
             // the instrument materializes the moment its rhythm lands
             active.set(id);
             match id {
@@ -815,7 +813,7 @@ fn live_weave(
             1 => {
                 // the ghost: cursor's map spot + drag·gain (same math commit() warps with)
                 if let Some(s) = snap.borrow().as_ref() {
-                    let d = pts.last().map(|c| (c.re, c.im)).unwrap_or((0.0, 0.0));
+                    let d = pts.last().map_or((0.0, 0.0), |c| (c.re, c.im));
                     ghost_d.set(d); // the scry dwell clock reads this
                     let o = s.project(s.cursor.0, s.cursor.1);
                     overlay.push(vec![(
@@ -889,7 +887,7 @@ fn live_weave(
                 // forecast shown is byte-identical to an unthrottled recompute at the moments it
                 // DOES recompute — only redundant DTW passes are skipped.
                 if matches!(cast.mode, neuron::cast::Mode::Gesture) && pts.len() >= 8 {
-                    let tip = pts.last().map(|c| (c.re, c.im)).unwrap_or((0.0, 0.0));
+                    let tip = pts.last().map_or((0.0, 0.0), |c| (c.re, c.im));
                     let due = match last_predict_at.get() {
                         None => true, // the first eligible tick always predicts, exactly as before
                         Some(at) => {
@@ -943,7 +941,7 @@ fn live_weave(
     crate::flight::trace(
         "weave",
         "capture done",
-        result.as_ref().map(|(id, _)| *id as u64).unwrap_or(99),
+        result.as_ref().map_or(99, |(id, _)| u64::from(*id)),
     );
 
     // ── FIRE-VIA-THE-SPINE rhythm ── a rhythm bound to an arbitrary action landed: the capture
@@ -1066,43 +1064,40 @@ fn live_weave(
                 post_status(weak, msg);
                 return;
             }
-            match cast.resolve(&path, &vault) {
-                Some(r) => {
-                    overlay.recognized(true);
-                    overlay.end();
-                    // Emit the STRUCTURED trigger and let the live Engine do the firing — never
-                    // run the action here, or layers/intents/SAFE/readout would fork.
-                    let trigger = match r.sector {
-                        Some(s) => neuron::engine::Trigger::RadialSector {
-                            menu: neuron::controls::CAST_MENU.into(),
-                            sector: s as u8,
-                        },
-                        None => neuron::engine::Trigger::Gesture {
-                            name: r.label.clone(),
-                        },
-                    };
-                    crate::dispatch::inject_trigger(trigger);
-                    if r.assisted {
-                        post_status(weak, format!("weave \u{2248} {} (spell assist)", r.label));
-                    }
+            if let Some(r) = cast.resolve(&path, &vault) {
+                overlay.recognized(true);
+                overlay.end();
+                // Emit the STRUCTURED trigger and let the live Engine do the firing — never
+                // run the action here, or layers/intents/SAFE/readout would fork.
+                let trigger = match r.sector {
+                    Some(s) => neuron::engine::Trigger::RadialSector {
+                        menu: neuron::controls::CAST_MENU.into(),
+                        sector: s as u8,
+                    },
+                    None => neuron::engine::Trigger::Gesture {
+                        name: r.label.clone(),
+                    },
+                };
+                crate::dispatch::inject_trigger(trigger);
+                if r.assisted {
+                    post_status(weak, format!("weave \u{2248} {} (spell assist)", r.label));
                 }
-                None => {
-                    let (dx, dy) = neuron::radial::net_displacement(&path);
-                    let net = (dx * dx + dy * dy).sqrt();
-                    if net < cast.deadzone {
-                        // a release inside the centre dead-zone is the CLEAN CANCEL — no action,
-                        // no nag, no fizzle flash. The wheel just closes (same cost as a peek).
-                        overlay.end();
-                    } else {
-                        // an unrecognized stroke that DID travel out fizzles softly — a miss costs
-                        // nothing, but the readout says WHY so a real attempt is never a mystery.
-                        overlay.recognized(false);
-                        overlay.end();
-                        post_status(
-                            weak,
-                            "weave fizzled \u{2014} not a clean flick and no glyph matched".into(),
-                        );
-                    }
+            } else {
+                let (dx, dy) = neuron::radial::net_displacement(&path);
+                let net = (dx * dx + dy * dy).sqrt();
+                if net < cast.deadzone {
+                    // a release inside the centre dead-zone is the CLEAN CANCEL — no action,
+                    // no nag, no fizzle flash. The wheel just closes (same cost as a peek).
+                    overlay.end();
+                } else {
+                    // an unrecognized stroke that DID travel out fizzles softly — a miss costs
+                    // nothing, but the readout says WHY so a real attempt is never a mystery.
+                    overlay.recognized(false);
+                    overlay.end();
+                    post_status(
+                        weak,
+                        "weave fizzled \u{2014} not a clean flick and no glyph matched".into(),
+                    );
                 }
             }
         }
@@ -1138,7 +1133,7 @@ fn control_mode(g: &crate::control::Glance) -> crate::overlay::WeaveMode {
     // the output device + its level, from the off-thread audio cache (instant, never COM here).
     let ac = audio_cache::snap();
     let out = ac.out_name.clone().unwrap_or_else(|| "—".into());
-    let out_fill = ac.out.map(|(lvl, _)| lvl).unwrap_or(0.0);
+    let out_fill = ac.out.map_or(0.0, |(lvl, _)| lvl);
     let bt = if g.bt_present {
         "on \u{00b7} flick"
     } else {
@@ -1219,7 +1214,7 @@ fn resolve_fan(cast: &neuron::cast::CastConfig, path: &[neuron::glyph::C]) -> Op
 }
 
 /// The SECOND-TIER fan options per wedge (index = sector): a wedge whose action FANS (today,
-/// OutputFlip) lists its sub-options; everything else is empty. Generic — any future fannable
+/// `OutputFlip`) lists its sub-options; everything else is empty. Generic — any future fannable
 /// action plugs in here.
 #[cfg(windows)]
 fn radial_fans(cast: &neuron::cast::CastConfig) -> Vec<Vec<crate::overlay::FanView>> {
@@ -1275,7 +1270,7 @@ fn radial_fans(cast: &neuron::cast::CastConfig) -> Vec<Vec<crate::overlay::FanVi
         .collect()
 }
 
-/// The current foreground top-level window (its GA_ROOT), for marking the live summon-fan option.
+/// The current foreground top-level window (its `GA_ROOT`), for marking the live summon-fan option.
 #[cfg(windows)]
 fn foreground_hwnd() -> isize {
     use windows_sys::Win32::UI::WindowsAndMessaging::{GetAncestor, GetForegroundWindow, GA_ROOT};
@@ -1301,7 +1296,7 @@ pub(crate) mod audio_cache {
     use std::sync::Mutex;
 
     /// Trim an audio endpoint name to the identifying part: the hardware in parentheses if
-    /// present ("Headset Earphone (Razer BlackShark V2)" → "Razer BlackShark V2"), else the
+    /// present ("Headset Earphone (Razer `BlackShark` V2)" → "Razer `BlackShark` V2"), else the
     /// name, capped.
     pub(crate) fn short_device(name: &str) -> String {
         let core = match (name.find('('), name.rfind(')')) {
@@ -1475,7 +1470,7 @@ fn wedge_view(a: &neuron::action::Action) -> crate::overlay::WedgeView {
         Action::OutputFlip { .. } => mk(
             WedgeGlyph::Flip,
             "flip output",
-            ac.out_name.clone(),
+            ac.out_name,
             Tone::Active,
             None,
         ),
@@ -1645,9 +1640,7 @@ fn wedge_view(a: &neuron::action::Action) -> crate::overlay::WedgeView {
                 ObsOp::Scene => ("scene", false),
                 ObsOp::Mute => ("obs mute", false),
             };
-            let detail = if !s.connected {
-                Some("OBS not connected".to_string())
-            } else {
+            let detail = if s.connected {
                 match op {
                     ObsOp::Scene => Some(format!("\u{2192} {arg}")),
                     ObsOp::Stream if s.streaming => Some("LIVE".to_string()),
@@ -1657,6 +1650,8 @@ fn wedge_view(a: &neuron::action::Action) -> crate::overlay::WedgeView {
                     ObsOp::Mute if !arg.is_empty() => Some(arg.clone()),
                     _ => None,
                 }
+            } else {
+                Some("OBS not connected".to_string())
             };
             let tone = if !s.connected {
                 Tone::Inert
@@ -1766,10 +1761,10 @@ fn aim_tick(
         match held_at {
             Some(i) if depth.get() > 0 && held != 0 && ticks == 0 => {
                 depth.set(i as i32); // re-seat onto the held window's new index, stay on it
-                hover.set(stack.first().map(|w| w.hwnd).unwrap_or(0));
+                hover.set(stack.first().map_or(0, |w| w.hwnd));
             }
             _ => {
-                let front = stack.first().map(|w| w.hwnd).unwrap_or(0);
+                let front = stack.first().map_or(0, |w| w.hwnd);
                 // staying on the same held window (a scroll tick) must NOT count as a new column,
                 // or the very scroll that descends would reset the dial it just turned.
                 if front != hover.get() && !(held_at.is_some() && depth.get() > 0) {
@@ -1782,13 +1777,13 @@ fn aim_tick(
             let i = (depth.get().max(0) as usize).min(stack.len() - 1);
             let w = stack[i];
             depth_pips = (i as i32, stack.len() as i32); // teach the descent when windows overlap
-            hot = s.index_of(w.hwnd).map(|i| i as i32).unwrap_or(-1);
+            hot = s.index_of(w.hwnd).map_or(-1, |i| i as i32);
             aimed_realm.set(false);
             aimed_cell.set(s.cell_screen(w.rect));
             sel = Some((w.hwnd, w.rect, (tx, ty)));
         }
     }
-    let sel_h = sel.map(|(hw, ..)| hw).unwrap_or(0);
+    let sel_h = sel.map_or(0, |(hw, ..)| hw);
     if let Some((_, rect, warp)) = sel {
         aimed_rect.set(rect);
         aimed_warp.set(warp);
@@ -2013,7 +2008,7 @@ fn present(
         Some(idx) => {
             macro_host().answer(p.pid, Some(idx));
             overlay.recognized(true);
-            let picked = p.options.get(idx).map(String::as_str).unwrap_or("?");
+            let picked = p.options.get(idx).map_or("?", String::as_str);
             post_status(weak, format!("beacon \u{2192} {picked} \u{00b7} {}", p.text));
         }
         None => {

@@ -24,7 +24,7 @@
 //!   construction, not by tuning folklore.
 //!
 //! The kernel owns NO sockets, NO device handles, NO threads. Adapters (Chroma
-//! REST, OpenRGB TCP, telemetry listeners) and the single device-writer live
+//! REST, `OpenRGB` TCP, telemetry listeners) and the single device-writer live
 //! outside and talk to it; because it holds no I/O it has almost nothing that
 //! *can* crash, and because state lives behind one owner there is no shared
 //! mutex to poison.
@@ -69,7 +69,7 @@ pub struct Kernel {
     pub bus: Bus,
     /// Declared surfaces, in declaration order (adapters enumerate these).
     pub(crate) infos: Vec<SurfaceInfo>,
-    /// Next SourceId to issue; starts at 1, so 0 is never issued.
+    /// Next `SourceId` to issue; starts at 1, so 0 is never issued.
     pub(crate) next_source: u64,
     /// Human names for sources ("Overwatch", "openrgb: hass") — advisory
     /// identity for the GUI's ownership truth, set by adapters the moment
@@ -78,6 +78,7 @@ pub struct Kernel {
 }
 
 impl Kernel {
+    #[must_use]
     pub fn new() -> Self {
         Kernel {
             arbiter: Arbiter::new(),

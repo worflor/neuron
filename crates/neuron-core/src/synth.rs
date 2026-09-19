@@ -7,8 +7,8 @@
 //! The two builtin defs were reverse-engineered by probing the `razer_report` getter space
 //! and watching the device answer SUCCESS / UNSUPPORTED per command. That loop is mechanical,
 //! so this module runs it automatically: probe an unknown Razer control pipe against the
-//! UNIVERSAL COMMAND CATALOG (the union of the proven builtin specs — cross-checked with OpenRazer,
-//! hardware-verified on the Naga V2 Pro + BlackWidow Chroma V2), keep exactly the commands the
+//! UNIVERSAL COMMAND CATALOG (the union of the proven builtin specs — cross-checked with `OpenRazer`,
+//! hardware-verified on the Naga V2 Pro + `BlackWidow` Chroma V2), keep exactly the commands the
 //! device says yes to, detect the lighting dialect from which lighting getters answer, measure
 //! the link's real round-trip to pick `stream_wait_us`, and assemble a complete [`DeviceDef`].
 //!
@@ -34,7 +34,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-/// The razer_report bus signature — now OWNED by the dialect that defines the family
+/// The `razer_report` bus signature — now OWNED by the dialect that defines the family
 /// ([`crate::dialect`], `RazerDialect::claims`); re-exported here so the `neuron::synth::RAZER_VID`
 /// / `RAZER_FEATURE_LEN` paths the app/CLI already resolve through keep compiling unchanged, and
 /// synth's own probe filters below stay one edit from the signature's single home.
@@ -151,14 +151,14 @@ const CATALOG: &[CatalogEntry] = &[
     CatalogEntry { name: "lighting_caps", class: 0x03, id: 0x89, size: 0x07, args: &[], setters: &[], proves_lighting: true },
 ];
 
-/// OpenRazer's per-receiver SET→GET wait for "new mouse receiver" wireless dongles (µs).
+/// `OpenRazer`'s per-receiver SET→GET wait for "new mouse receiver" wireless dongles (µs).
 const WIRELESS_STREAM_WAIT_US: u64 = 31_000;
 /// Round-trips at/above this are a slow (wireless) link that needs the stream wait.
 const WIRELESS_ROUNDTRIP_MS: u64 = 15;
 
 /// `stream_wait_us` for the synthesized def. A wireless link overruns without pacing —
 /// streamed lighting writes outrun the host→dongle→device round-trip and DROP frames (the
-/// FLICKER) — so it gets OpenRazer's receiver wait. Wirelessness is detected two ways,
+/// FLICKER) — so it gets `OpenRazer`'s receiver wait. Wirelessness is detected two ways,
 /// either sufficing, because the LIVE-VERIFIED failure mode of latency alone is a dongle
 /// that ACKs getters in ~6ms yet still needs the write pacing (the Naga's receiver did
 /// exactly that):
@@ -166,6 +166,7 @@ const WIRELESS_ROUNDTRIP_MS: u64 = 15;
 ///   * a battery (`wireless_capable`) — a battery-bearing board is built to run wireless,
 ///     and the wait on a wired link only lowers the stream fps ceiling, never corrupts;
 ///     flicker-by-default on a real dongle would be the dishonest failure mode.
+#[must_use]
 pub fn stream_wait_for(roundtrip_ms: u64, wireless_capable: bool) -> u64 {
     if roundtrip_ms >= WIRELESS_ROUNDTRIP_MS || wireless_capable {
         WIRELESS_STREAM_WAIT_US
@@ -252,6 +253,7 @@ pub struct SynthCtx {
 }
 
 impl SynthCtx {
+    #[must_use]
     pub fn from_info(i: &HidDeviceInfo) -> Self {
         SynthCtx {
             vid: i.vid,
@@ -417,7 +419,7 @@ fn legacy_lighting(rows: u8, cols: u8) -> LightingDef {
 }
 
 /// Probe one Razer control pipe and synthesize its complete [`DeviceDef`]. Read-only.
-/// `None` when the pipe never answers the firmware getter (not a talking razer_report pipe —
+/// `None` when the pipe never answers the firmware getter (not a talking `razer_report` pipe —
 /// e.g. a secondary collection that enumerates with the right shape but stays mute).
 pub fn synthesize(t: &dyn Transport, ctx: &SynthCtx) -> Option<Synthesis> {
     // Wake + qualify: the first command to a sleeping wireless device can take an outlier
@@ -629,6 +631,7 @@ struct EmitNotes {
 /// Serialize a synthesized def to the same commented-TOML shape as the curated files. The
 /// output parses back into an identical [`DeviceDef`] (round-trip tested) — from here on
 /// it's plain config the user owns.
+#[must_use]
 pub fn emit_toml(s: &Synthesis) -> String {
     let d = &s.def;
     // The warning block is DERIVED from which synthesis fields wear a wrapper, not hand-written:
@@ -813,6 +816,7 @@ pub fn heal_auto_tx(dialect_id: &str, pid: u16, def: &DeviceDef, verified_tx: u8
 pub type AdoptKey = (&'static str, u16);
 
 /// The adoption key for an enumerated pipe, when some family claims it.
+#[must_use]
 pub fn adopt_key(info: &HidDeviceInfo) -> Option<AdoptKey> {
     crate::dialect::claimed_by(info).map(|d| (d.id(), info.pid))
 }
@@ -841,6 +845,7 @@ pub struct Adoption {
 /// the synthesizing DIALECT's id so two families that share a pid can't collide on one filename:
 /// `devices/auto/<dialect_id>-<pid>.toml`. Razer's id is literally "razer", so every existing
 /// auto file name (`razer-<pid>.toml`) is IDENTICAL — the generalization renames nothing on disk.
+#[must_use]
 pub fn auto_def_path(dialect_id: &str, pid: u16) -> PathBuf {
     crate::runroot::run_root()
         .join("devices")
@@ -953,6 +958,7 @@ fn adopt_filtered(reg: &Registry, only: Option<&[AdoptKey]>) -> Result<Adoption>
 /// adoption is worth spawning at all. Generalized the same way as [`adopt_filtered`]: a pipe is
 /// adoptable iff a dialect claims it (was: the hardcoded razer signature), so a new dialect's
 /// unknown pipes light this up with no change here.
+#[must_use]
 pub fn unknown_present(reg: &Registry) -> Vec<u16> {
     let Ok(infos) = transport::enumerate() else {
         return Vec::new();
@@ -986,8 +992,9 @@ pub struct UnclaimedPipe {
 /// and which the registry doesn't resolve. This is the data source for the failed-adoption
 /// surface (wave 2b — the dim "our vendor's hardware, no protocol we speak" row) and the parking
 /// spot the audio-sidecar recon (DIALECT-RND §audio: the 41-byte sound card, the 64-byte Seiren)
-/// reads from. Pure enumeration — dedupe by (pid, usage_page, usage), no probing (you cannot
+/// reads from. Pure enumeration — dedupe by (pid, `usage_page`, usage), no probing (you cannot
 /// safely sweep a framing you don't know).
+#[must_use]
 pub fn unclaimed_pipes(reg: &Registry) -> Vec<UnclaimedPipe> {
     let Ok(infos) = transport::enumerate() else {
         return Vec::new();
@@ -999,6 +1006,7 @@ pub fn unclaimed_pipes(reg: &Registry) -> Vec<UnclaimedPipe> {
 /// [`unclaimed_pipes`] (which delegates here after enumerating). The app's `scan_devices` is already
 /// holding its HID enumeration when it wants the failed-adoption rows, so it calls THIS and avoids a
 /// second `transport::enumerate()` per scan tick. Pure over the slice; same keep/dedupe rule.
+#[must_use]
 pub fn unclaimed_from(reg: &Registry, infos: &[HidDeviceInfo]) -> Vec<UnclaimedPipe> {
     // The DRIVEN-UNIT shield, unit-identity edition (Ruling C.2). The old `find_by_pid(...).is_some()`
     // suppression kept a RECOGNIZED device's sibling collections (the Naga alone has ~11 non-control
@@ -1014,7 +1022,7 @@ pub fn unclaimed_from(reg: &Registry, infos: &[HidDeviceInfo]) -> Vec<UnclaimedP
     let driven: std::collections::HashSet<String> = infos
         .iter()
         .filter(|c| reg.find_for_pipe(c).is_some())
-        .map(|c| c.instance())
+        .map(super::transport::HidDeviceInfo::instance)
         .collect();
     let mut out: Vec<UnclaimedPipe> = Vec::new();
     for i in infos {
@@ -1060,7 +1068,7 @@ mod tests {
     use crate::protocol::{Report, BUF_LEN};
     use std::sync::Mutex;
 
-    /// A scripted razer_report device: answers SUCCESS (with canned args) for the (class, id)
+    /// A scripted `razer_report` device: answers SUCCESS (with canned args) for the (class, id)
     /// pairs it "supports", UNSUPPORTED for everything else — the same yes/no contract the
     /// real firmware gives the probe.
     struct MockDevice {
@@ -1132,7 +1140,7 @@ mod tests {
         .with_args(0x00, 0x82, b"UNIT12345SERIAL")
     }
 
-    /// A legacy-era wired keyboard shaped like the BlackWidow Chroma V2. Answers the FIRMWARE
+    /// A legacy-era wired keyboard shaped like the `BlackWidow` Chroma V2. Answers the FIRMWARE
     /// GAME MODE getter (0x03/0x80) too — the Win-key-kill probe legacy boards respond to.
     fn mock_legacy_keyboard() -> MockDevice {
         MockDevice::new(&[

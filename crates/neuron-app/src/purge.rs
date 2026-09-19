@@ -101,7 +101,7 @@ unsafe fn pwstr(p: *const u16) -> String {
 pub fn is_elevated() -> bool {
     unsafe {
         let mut token: HANDLE = std::ptr::null_mut();
-        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) == 0 {
             return false;
         }
         let mut elev = TOKEN_ELEVATION { TokenIsElevated: 0 };
@@ -109,9 +109,9 @@ pub fn is_elevated() -> bool {
         let ok = GetTokenInformation(
             token,
             TokenElevation,
-            &mut elev as *mut _ as *mut _,
+            &raw mut elev as *mut _,
             std::mem::size_of::<TOKEN_ELEVATION>() as u32,
-            &mut ret_len,
+            &raw mut ret_len,
         );
         CloseHandle(token);
         ok != 0 && elev.TokenIsElevated != 0
@@ -161,7 +161,7 @@ fn image_path(pid: u32) -> Option<String> {
         let mut buf = [0u16; 1024];
         let mut len = buf.len() as u32;
         // dwflags 0 = PROCESS_NAME_WIN32 (drive-letter path, not the \Device\… native form).
-        let ok = QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut len);
+        let ok = QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &raw mut len);
         CloseHandle(h);
         if ok != 0 && len > 0 {
             Some(String::from_utf16_lossy(&buf[..len as usize]))
@@ -195,7 +195,7 @@ fn snapshot() -> Vec<Proc> {
         }
         let mut e: PROCESSENTRY32W = std::mem::zeroed();
         e.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
-        if Process32FirstW(snap, &mut e) != 0 {
+        if Process32FirstW(snap, &raw mut e) != 0 {
             loop {
                 let pid = e.th32ProcessID;
                 out.push(Proc {
@@ -203,7 +203,7 @@ fn snapshot() -> Vec<Proc> {
                     ppid: e.th32ParentProcessID,
                     path: image_path(pid),
                 });
-                if Process32NextW(snap, &mut e) == 0 {
+                if Process32NextW(snap, &raw mut e) == 0 {
                     break;
                 }
             }
@@ -282,7 +282,7 @@ fn find_rats(procs: &[Proc]) -> Vec<Rat> {
     rats
 }
 
-/// TerminateProcess one pid; true if it actually died at our hand.
+/// `TerminateProcess` one pid; true if it actually died at our hand.
 fn terminate(pid: u32) -> bool {
     unsafe {
         let h = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
@@ -299,7 +299,7 @@ fn terminate(pid: u32) -> bool {
 // SERVICES — enumerate the whole SCM, keep Razer's, demote to manual + stop them
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// A discovered Razer service. `key` is what OpenServiceW wants; the rest is for the report.
+/// A discovered Razer service. `key` is what `OpenServiceW` wants; the rest is for the report.
 pub struct Svc {
     pub key: String,
     pub display: String,
@@ -307,25 +307,25 @@ pub struct Svc {
     pub running: bool,
 }
 
-/// The service's launch command (binary path, possibly quoted with args), via QueryServiceConfigW.
+/// The service's launch command (binary path, possibly quoted with args), via `QueryServiceConfigW`.
 unsafe fn service_bin(svc: HANDLE) -> Option<String> {
     let mut needed = 0u32;
     // First call sizes the buffer (it fails with ERROR_INSUFFICIENT_BUFFER and sets `needed`).
-    QueryServiceConfigW(svc, std::ptr::null_mut(), 0, &mut needed);
+    QueryServiceConfigW(svc, std::ptr::null_mut(), 0, &raw mut needed);
     if needed == 0 {
         return None;
     }
     let mut buf = vec![0u8; needed as usize];
     if QueryServiceConfigW(
         svc,
-        buf.as_mut_ptr() as *mut QUERY_SERVICE_CONFIGW,
+        buf.as_mut_ptr().cast::<QUERY_SERVICE_CONFIGW>(),
         needed,
-        &mut needed,
+        &raw mut needed,
     ) == 0
     {
         return None;
     }
-    let cfg = &*(buf.as_ptr() as *const QUERY_SERVICE_CONFIGW);
+    let cfg = &*buf.as_ptr().cast::<QUERY_SERVICE_CONFIGW>();
     Some(pwstr(cfg.lpBinaryPathName))
 }
 
@@ -345,9 +345,9 @@ fn discover_services(scm: HANDLE) -> Vec<Svc> {
             SERVICE_STATE_ALL,
             std::ptr::null_mut(),
             0,
-            &mut needed,
-            &mut count,
-            &mut resume,
+            &raw mut needed,
+            &raw mut count,
+            &raw mut resume,
             std::ptr::null(),
         );
         if needed == 0 {
@@ -361,16 +361,16 @@ fn discover_services(scm: HANDLE) -> Vec<Svc> {
             SERVICE_STATE_ALL,
             buf.as_mut_ptr(),
             buf.len() as u32,
-            &mut needed,
-            &mut count,
-            &mut resume,
+            &raw mut needed,
+            &raw mut count,
+            &raw mut resume,
             std::ptr::null(),
         ) == 0
         {
             return found;
         }
         let entries =
-            std::slice::from_raw_parts(buf.as_ptr() as *const ENUM_SERVICE_STATUS_PROCESSW, count as usize);
+            std::slice::from_raw_parts(buf.as_ptr().cast::<ENUM_SERVICE_STATUS_PROCESSW>(), count as usize);
         for e in entries {
             let key = pwstr(e.lpServiceName);
             let display = pwstr(e.lpDisplayName);
@@ -389,7 +389,7 @@ fn discover_services(scm: HANDLE) -> Vec<Svc> {
                     b
                 }
             };
-            let path_says_razer = bin.as_deref().map(is_razer_path).unwrap_or(false);
+            let path_says_razer = bin.as_deref().is_some_and(is_razer_path);
 
             if name_says_razer || path_says_razer {
                 found.push(Svc {
@@ -439,7 +439,7 @@ fn neutralize_service(scm: HANDLE, key: &str) -> (bool, bool) {
         // STOP gracefully through the SCM (not a TerminateProcess — a clean stop won't trip a
         // failure-action restart), then wait out STOP_PENDING so its children are gone before the sweep.
         let mut status: SERVICE_STATUS = std::mem::zeroed();
-        let rc = ControlService(svc, SERVICE_CONTROL_STOP, &mut status);
+        let rc = ControlService(svc, SERVICE_CONTROL_STOP, &raw mut status);
         let mut stopped = rc != 0;
         if rc == 0 && GetLastError() == ERROR_SERVICE_NOT_ACTIVE {
             stopped = true; // already down — fine
@@ -447,7 +447,7 @@ fn neutralize_service(scm: HANDLE, key: &str) -> (bool, bool) {
         if stopped {
             for _ in 0..20 {
                 // keep waiting only while it's actively STOP_PENDING; bail once stopped or wedged.
-                if QueryServiceStatus(svc, &mut status) != 0
+                if QueryServiceStatus(svc, &raw mut status) != 0
                     && status.dwCurrentState == SERVICE_STOP_PENDING
                 {
                     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -478,8 +478,8 @@ fn do_purge() -> (u32, u32, u32) {
         if !scm.is_null() {
             for s in discover_services(scm) {
                 let (st, di) = neutralize_service(scm, &s.key);
-                stopped += st as u32;
-                demoted += di as u32;
+                stopped += u32::from(st);
+                demoted += u32::from(di);
             }
             CloseServiceHandle(scm);
         }

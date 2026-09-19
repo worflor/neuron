@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
 
-//! Proof that the BUNDLED CPython is real and runs — with NO system Python involved.
+//! Proof that the BUNDLED `CPython` is real and runs — with NO system Python involved.
 //!
 //!   * [`bundled_python_materializes_and_runs`] — `ensure_runtime()` extracts the embedded
 //!     interpreter, then we EXECUTE it with `-c "import sys,ctypes,ast; print(sys.version_info)"`
-//!     and assert it runs cleanly and reports CPython >= 3.12 (ctypes + ast import, per ground
+//!     and assert it runs cleanly and reports `CPython` >= 3.12 (ctypes + ast import, per ground
 //!     truth). This is the interpreter the sidecar will spawn — no PATH, no `NEURON_PYTHON`.
 //!   * [`bundled_sidecar_fires_a_macro`] — register + fire a macro through the warm sidecar, which
 //!     spawns from the bundled interpreter, and confirm the fire's value came back. End-to-end

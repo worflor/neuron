@@ -81,7 +81,7 @@ impl Snapshot {
         )
     }
 
-    /// Uniform map scale: the virtual screen's long edge fits MAP_EDGE.
+    /// Uniform map scale: the virtual screen's long edge fits `MAP_EDGE`.
     pub fn scale(&self) -> f32 {
         MAP_EDGE / (self.vw.max(self.vh).max(1) as f32)
     }
@@ -91,8 +91,8 @@ impl Snapshot {
     /// parks on a dead edge).
     pub fn target_of(&self, ddx: f64, ddy: f64) -> (i32, i32) {
         let s = self.scale().max(1e-6);
-        let x = self.cursor.0 as f64 + (ddx * GHOST_GAIN as f64) / s as f64;
-        let y = self.cursor.1 as f64 + (ddy * GHOST_GAIN as f64) / s as f64;
+        let x = f64::from(self.cursor.0) + (ddx * f64::from(GHOST_GAIN)) / f64::from(s);
+        let y = f64::from(self.cursor.1) + (ddy * f64::from(GHOST_GAIN)) / f64::from(s);
         (
             (x.round() as i32).clamp(self.vx + 1, self.vx + self.vw - 2),
             (y.round() as i32).clamp(self.vy + 1, self.vy + self.vh - 2),
@@ -204,7 +204,7 @@ impl Snapshot {
                     let b = self.realm_blob(ri, wi);
                     if gx >= b[0] && gx < b[2] && gy >= b[1] && gy < b[3] {
                         let z = self.realms[ri].windows[wi].z;
-                        if best.map(|(bz, _)| z < bz).unwrap_or(true) {
+                        if best.map_or(true, |(bz, _)| z < bz) {
                             best = Some((z, wi));
                         }
                     }
@@ -300,13 +300,13 @@ impl Snapshot {
                 .filter_map(|&h| {
                     if let Some(w) = self.windows.iter().find(|w| w.hwnd == h) {
                         let c = r(w.rect);
-                        Some(((c[0] + c[2]) / 2.0, (c[1] + c[3]) / 2.0))
+                        Some((f32::midpoint(c[0], c[2]), f32::midpoint(c[1], c[3])))
                     } else {
                         // a tether on another desktop: pin it to the centre of its realm blob
                         self.realms.iter().enumerate().find_map(|(ri, rm)| {
                             rm.windows.iter().position(|w| w.hwnd == h).map(|wi| {
                                 let b = self.realm_blob(ri, wi);
-                                ((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0)
+                                (f32::midpoint(b[0], b[2]), f32::midpoint(b[1], b[3]))
                             })
                         })
                     }
@@ -322,7 +322,7 @@ impl Snapshot {
     }
 }
 
-/// Photograph the desk: monitors via EnumDisplayMonitors, windows via EnumWindows (visible,
+/// Photograph the desk: monitors via `EnumDisplayMonitors`, windows via `EnumWindows` (visible,
 /// titled, uncloaked, non-tool, z-capped). Best-effort — a missing piece degrades the map,
 /// never the warp.
 #[cfg(windows)]
@@ -365,7 +365,7 @@ pub fn snapshot() -> Snapshot {
             let _ = DwmGetWindowAttribute(
                 hwnd,
                 DWMWA_CLOAKED as u32,
-                &mut cloaked as *mut u32 as *mut _,
+                &raw mut cloaked as *mut _,
                 std::mem::size_of::<u32>() as u32,
             );
             let other_desktop = cloaked == 2;
@@ -373,7 +373,7 @@ pub fn snapshot() -> Snapshot {
                 return 1;
             }
             let mut r: RECT = std::mem::zeroed();
-            if GetWindowRect(hwnd, &mut r) == 0 || r.right - r.left < 60 || r.bottom - r.top < 40 {
+            if GetWindowRect(hwnd, &raw mut r) == 0 || r.right - r.left < 60 || r.bottom - r.top < 40 {
                 return 1;
             }
             let z = v.len(); // EnumWindows walks in z-order, top first
@@ -393,10 +393,10 @@ pub fn snapshot() -> Snapshot {
             std::ptr::null_mut(),
             std::ptr::null(),
             Some(mon_cb),
-            &mut monitors as *mut _ as isize,
+            &raw mut monitors as isize,
         );
         let mut all: Vec<WinBlob> = Vec::new();
-        EnumWindows(Some(win_cb), &mut all as *mut _ as isize);
+        EnumWindows(Some(win_cb), &raw mut all as isize);
         // split: the current desk keeps its windows; other-desktop ones group into REALMS by
         // their real desktop id (IVirtualDesktopManager). If the shell COM isn't reachable,
         // they degrade into one combined realm — still reachable, just less sorted.
@@ -409,22 +409,19 @@ pub fn snapshot() -> Snapshot {
                 windows.push(w);
                 continue;
             }
-            let id = vdm.as_ref().map(|v| v.desktop_of(w.hwnd)).unwrap_or(0);
-            let ri = match realm_ids.iter().position(|&g| g == id) {
-                Some(i) => i,
-                None => {
-                    realm_ids.push(id);
-                    realms.push(Realm {
-                        guid: id,
-                        windows: Vec::new(),
-                    });
-                    realms.len() - 1
-                }
+            let id = vdm.as_ref().map_or(0, |v| v.desktop_of(w.hwnd));
+            let ri = if let Some(i) = realm_ids.iter().position(|&g| g == id) { i } else {
+                realm_ids.push(id);
+                realms.push(Realm {
+                    guid: id,
+                    windows: Vec::new(),
+                });
+                realms.len() - 1
             };
             realms[ri].windows.push(w);
         }
         let mut cur = POINT { x: 0, y: 0 };
-        GetCursorPos(&mut cur);
+        GetCursorPos(&raw mut cur);
         Snapshot {
             vx: GetSystemMetrics(SM_XVIRTUALSCREEN),
             vy: GetSystemMetrics(SM_YVIRTUALSCREEN),
@@ -470,10 +467,10 @@ mod vdm {
 
     /// Pack a shell desktop GUID into a u128 realm key (and back).
     fn pack(g: &GUID) -> u128 {
-        ((g.data1 as u128) << 96)
-            | ((g.data2 as u128) << 80)
-            | ((g.data3 as u128) << 64)
-            | u64::from_be_bytes(g.data4) as u128
+        (u128::from(g.data1) << 96)
+            | (u128::from(g.data2) << 80)
+            | (u128::from(g.data3) << 64)
+            | u128::from(u64::from_be_bytes(g.data4))
     }
 
     fn unpack(id: u128) -> GUID {
@@ -490,7 +487,7 @@ mod vdm {
         pub fn desktop_of(&self, hwnd: isize) -> u128 {
             unsafe {
                 let mut g = GUID::from_u128(0);
-                if ((**self.0).get_desktop_id)(self.0 as *mut c_void, hwnd, &mut g) == 0 {
+                if ((**self.0).get_desktop_id)(self.0.cast::<c_void>(), hwnd, &raw mut g) == 0 {
                     pack(&g)
                 } else {
                     0
@@ -507,7 +504,7 @@ mod vdm {
             }
             unsafe {
                 let g = unpack(realm);
-                ((**self.0).move_to_desktop)(self.0 as *mut c_void, hwnd, &g) == 0
+                ((**self.0).move_to_desktop)(self.0.cast::<c_void>(), hwnd, &raw const g) == 0
             }
         }
     }
@@ -515,7 +512,7 @@ mod vdm {
     impl Drop for Vdm {
         fn drop(&mut self) {
             unsafe {
-                ((**self.0).release)(self.0 as *mut c_void);
+                ((**self.0).release)(self.0.cast::<c_void>());
             }
         }
     }
@@ -530,11 +527,11 @@ mod vdm {
                 std::ptr::null_mut(),
                 CLSCTX_ALL,
                 &IID_VDM,
-                &mut p,
+                &raw mut p,
             ) == 0
                 && !p.is_null()
             {
-                Some(Vdm(p as *mut *const Vtbl))
+                Some(Vdm(p.cast::<*const Vtbl>()))
             } else {
                 None
             }
@@ -551,7 +548,7 @@ pub fn snapshot() -> Snapshot {
 /// falls back to the frontmost blob under the point) forward too. An other-desktop pick makes
 /// Windows switch desktops natively via the focus. Returns the status line. NOT arm-gated by
 /// design choice: moving your own cursor at your own deliberate gesture is navigation, not input
-/// synthesis into an app. (SendInput is untouched.)
+/// synthesis into an app. (`SendInput` is untouched.)
 #[cfg(windows)]
 pub fn commit(snap: &Snapshot, ddx: f64, ddy: f64, chosen: Option<isize>) -> String {
     use windows_sys::Win32::UI::WindowsAndMessaging::SetCursorPos;
@@ -681,7 +678,7 @@ fn scry_thread(rx: std::sync::mpsc::Receiver<ScryCmd>) {
             lpszMenuName: std::ptr::null(),
             lpszClassName: cls.as_ptr(),
         };
-        RegisterClassW(&wc);
+        RegisterClassW(&raw const wc);
         let hwnd = CreateWindowExW(
             WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
             cls.as_ptr(),
@@ -763,8 +760,8 @@ fn scry_thread(rx: std::sync::mpsc::Receiver<ScryCmd>) {
                         // is tight — never the old fixed (and often awkward) reach from the cursor,
                         // never landing on the map. Clamped fully onto the cell's monitor.
                         const GAP: i32 = 14;
-                        let cx = (near.0 + near.2) / 2;
-                        let (wl, wt, wr, wb) = work_area((cx, (near.1 + near.3) / 2));
+                        let cx = i32::midpoint(near.0, near.2);
+                        let (wl, wt, wr, wb) = work_area((cx, i32::midpoint(near.1, near.3)));
                         let px = (cx - pw / 2).clamp(wl, (wr - pw).max(wl));
                         let mut py = near.1 - GAP - ph; // just above the cell
                         if py < wt {
@@ -775,7 +772,7 @@ fn scry_thread(rx: std::sync::mpsc::Receiver<ScryCmd>) {
                         ShowWindow(hwnd, SW_SHOWNOACTIVATE);
                         portal = Some((px, py, pw, ph));
                         ShowWindow(frame_win, SW_SHOWNOACTIVATE); // the sparkle frame rides along
-                        if DwmRegisterThumbnail(hwnd, src as _, &mut thumb) == 0 {
+                        if DwmRegisterThumbnail(hwnd, src as _, &raw mut thumb) == 0 {
                             let props = DWM_THUMBNAIL_PROPERTIES {
                                 dwFlags: DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE,
                                 rcDestination: RECT {
@@ -794,7 +791,7 @@ fn scry_thread(rx: std::sync::mpsc::Receiver<ScryCmd>) {
                                 fVisible: 1,
                                 fSourceClientAreaOnly: 0,
                             };
-                            DwmUpdateThumbnailProperties(thumb, &props);
+                            DwmUpdateThumbnailProperties(thumb, &raw const props);
                         }
                     }
                     ScryCmd::Aim { .. } => unreachable!("split above"),
@@ -839,9 +836,9 @@ fn scry_thread(rx: std::sync::mpsc::Receiver<ScryCmd>) {
             // the message pump is NOT contained: a panic across the `extern "system"` window-proc
             // ABI aborts the process, so catch_unwind here would be misleading dead code.
             let mut msg: MSG = std::mem::zeroed();
-            while PeekMessageW(&mut msg, hwnd, 0, 0, PM_REMOVE) != 0 {
-                TranslateMessage(&msg);
-                DispatchMessageW(&msg);
+            while PeekMessageW(&raw mut msg, hwnd, 0, 0, PM_REMOVE) != 0 {
+                TranslateMessage(&raw const msg);
+                DispatchMessageW(&raw const msg);
             }
             std::thread::sleep(std::time::Duration::from_millis(16));
         }
@@ -870,7 +867,7 @@ unsafe fn work_area(p: (i32, i32)) -> (i32, i32, i32, i32) {
         let mon = MonitorFromPoint(POINT { x: p.0, y: p.1 }, MONITOR_DEFAULTTONEAREST);
         let mut mi: MONITORINFO = std::mem::zeroed();
         mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
-        if !mon.is_null() && GetMonitorInfoW(mon, &mut mi) != 0 {
+        if !mon.is_null() && GetMonitorInfoW(mon, &raw mut mi) != 0 {
             (
                 mi.rcWork.left,
                 mi.rcWork.top,
@@ -1118,15 +1115,15 @@ pub fn auto_sort(snap: &Snapshot, hwnd: isize) -> String {
         if w.hwnd == hwnd {
             continue;
         }
-        let cx = (w.rect.0 + w.rect.2) / 2;
-        let cy = (w.rect.1 + w.rect.3) / 2;
+        let cx = i32::midpoint(w.rect.0, w.rect.2);
+        let cy = i32::midpoint(w.rect.1, w.rect.3);
         for (i, m) in snap.monitors.iter().enumerate() {
             if cx >= m.0 && cx < m.2 && cy >= m.1 && cy < m.3 {
                 if !me.is_empty() && exe_stem(w.hwnd) == me {
                     kin[i] += 1;
                 }
-                let ox = (w.rect.2.min(m.2) - w.rect.0.max(m.0)).max(0) as i64;
-                let oy = (w.rect.3.min(m.3) - w.rect.1.max(m.1)).max(0) as i64;
+                let ox = i64::from((w.rect.2.min(m.2) - w.rect.0.max(m.0)).max(0));
+                let oy = i64::from((w.rect.3.min(m.3) - w.rect.1.max(m.1)).max(0));
                 cover[i] += ox * oy;
             }
         }
@@ -1144,12 +1141,11 @@ pub fn auto_sort(snap: &Snapshot, hwnd: isize) -> String {
                 .enumerate()
                 .min_by_key(|(i, &c)| {
                     let m = snap.monitors[*i];
-                    let area = ((m.2 - m.0) as i64 * (m.3 - m.1) as i64).max(1);
+                    let area = (i64::from(m.2 - m.0) * i64::from(m.3 - m.1)).max(1);
                     // coverage RATIO, so a big monitor isn't "emptier" by sheer size
                     c * 10_000 / area
                 })
-                .map(|(i, _)| i)
-                .unwrap_or(0),
+                .map_or(0, |(i, _)| i),
             "the emptiest glass",
         ),
     };
@@ -1159,7 +1155,7 @@ pub fn auto_sort(snap: &Snapshot, hwnd: isize) -> String {
         snap.vx + snap.vw,
         snap.vy + snap.vh,
     ));
-    move_center(hwnd, (m.0 + m.2) / 2, (m.1 + m.3) / 2, true);
+    move_center(hwnd, i32::midpoint(m.0, m.2), i32::midpoint(m.1, m.3), true);
     format!("sorted \u{2192} {why}")
 }
 
@@ -1188,8 +1184,7 @@ fn current_realm() -> Option<u128> {
             return None;
         }
         let id = vdm::open()
-            .map(|v| v.desktop_of(hwnd as isize))
-            .unwrap_or(0);
+            .map_or(0, |v| v.desktop_of(hwnd as isize));
         DestroyWindow(hwnd);
         (id != 0).then_some(id)
     }
@@ -1214,14 +1209,14 @@ fn move_center(hwnd: isize, x: i32, y: i32, focus: bool) {
             ShowWindow(hwnd as _, SW_RESTORE);
         }
         let mut r: RECT = std::mem::zeroed();
-        if GetWindowRect(hwnd as _, &mut r) == 0 {
+        if GetWindowRect(hwnd as _, &raw mut r) == 0 {
             return;
         }
         let (w, h) = (r.right - r.left, r.bottom - r.top);
         let mon = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST);
         let mut mi: MONITORINFO = std::mem::zeroed();
         mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
-        let wa = if GetMonitorInfoW(mon, &mut mi) != 0 {
+        let wa = if GetMonitorInfoW(mon, &raw mut mi) != 0 {
             mi.rcWork
         } else {
             RECT {
@@ -1322,7 +1317,7 @@ pub(crate) fn force_foreground(hwnd: isize) {
 #[cfg(windows)]
 fn attach(a: u32, b: u32, on: bool) -> bool {
     use windows_sys::Win32::System::Threading::AttachThreadInput;
-    unsafe { AttachThreadInput(a, b, if on { 1 } else { 0 }) != 0 }
+    unsafe { AttachThreadInput(a, b, i32::from(on)) != 0 }
 }
 
 /// A zero-delta relative mouse move — real input that moves nothing and clicks nothing, just
@@ -1346,7 +1341,7 @@ fn whisper_input() {
         },
     };
     unsafe {
-        SendInput(1, &input, std::mem::size_of::<INPUT>() as i32);
+        SendInput(1, &raw const input, std::mem::size_of::<INPUT>() as i32);
     }
 }
 
@@ -1360,7 +1355,7 @@ pub(crate) fn exe_stem(hwnd: isize) -> String {
     use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
     unsafe {
         let mut pid = 0u32;
-        GetWindowThreadProcessId(hwnd as _, &mut pid);
+        GetWindowThreadProcessId(hwnd as _, &raw mut pid);
         if pid == 0 {
             return String::new();
         }
@@ -1370,7 +1365,7 @@ pub(crate) fn exe_stem(hwnd: isize) -> String {
         }
         let mut buf = [0u16; 512];
         let mut len = buf.len() as u32;
-        let ok = QueryFullProcessImageNameW(proc, 0, buf.as_mut_ptr(), &mut len);
+        let ok = QueryFullProcessImageNameW(proc, 0, buf.as_mut_ptr(), &raw mut len);
         windows_sys::Win32::Foundation::CloseHandle(proc);
         if ok == 0 {
             return String::new();
@@ -1528,7 +1523,7 @@ pub mod click_guard {
                     return;
                 }
                 let mut msg: MSG = std::mem::zeroed();
-                while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {}
+                while GetMessageW(&raw mut msg, std::ptr::null_mut(), 0, 0) > 0 {}
             });
         });
     }

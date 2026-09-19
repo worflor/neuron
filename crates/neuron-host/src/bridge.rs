@@ -24,7 +24,7 @@
 //! - **Legacy boards stream at full rate.** The old "legacy drops writes above
 //!   ~6fps" belief was FOLKLORE from the ACK'd path's 10ms poll sleep — a live
 //!   wire probe (`neuron::device::tests::live_stream_strategy_probe`) measured
-//!   the BlackWidow Chroma V2 sustaining 30fps clean. Legacy's real quirk is
+//!   the `BlackWidow` Chroma V2 sustaining 30fps clean. Legacy's real quirk is
 //!   burst sensitivity, handled by the sink's 2ms per-row breathe (below), not
 //!   by an fps cap.
 //! - **No hotplug yet**: a device that vanishes goes dormant (decimated
@@ -106,6 +106,7 @@ impl LiveContent for CompositorContent {
 /// vs dongle count as the same *model* but distinct link personalities). Used
 /// as-is when this (codename, pid) is unique among discovered devices; see
 /// [`surface_key_dup`] for what two+ identical units get instead.
+#[must_use]
 pub fn surface_key(def: &DeviceDef, pid: u16) -> String {
     format!("{}-{:04x}", def.codename, pid)
 }
@@ -130,7 +131,7 @@ fn surface_key_dup(def: &DeviceDef, pid: u16, instance: &str) -> String {
 fn fnv1a(s: &str) -> u64 {
     let mut hash: u64 = 0xcbf29ce484222325;
     for b in s.bytes() {
-        hash ^= b as u64;
+        hash ^= u64::from(b);
         hash = hash.wrapping_mul(0x100000001b3);
     }
     hash
@@ -143,6 +144,7 @@ fn fnv1a(s: &str) -> u64 {
 pub use neuron::transport::path_instance;
 
 /// Heuristic until the TOMLs carry an explicit kind (see module docs).
+#[must_use]
 pub fn surface_kind(def: &DeviceDef) -> SurfaceKind {
     if def.supports(Capability::Dpi) || def.supports(Capability::SetDpi) {
         SurfaceKind::Mouse
@@ -173,6 +175,7 @@ fn surface_info_with_key(def: &DeviceDef, key: String) -> Option<SurfaceInfo> {
 
 /// A device def → the surface it exposes, keyed the common way (bare `codename-pid`, see
 /// [`surface_key`]). `None` for devices without a lighting block.
+#[must_use]
 pub fn surface_info(def: &DeviceDef, pid: u16) -> Option<SurfaceInfo> {
     surface_info_with_key(def, surface_key(def, pid))
 }
@@ -191,6 +194,7 @@ pub struct Discovered {
 
 /// Enumerate HID and match against the registry — the only I/O in discovery, split out so
 /// [`discover_from`] stays pure and testable with synthetic HID lists.
+#[must_use]
 pub fn discover(reg: &Registry) -> Vec<Discovered> {
     let Ok(hids) = transport::enumerate() else {
         return Vec::new();
@@ -294,6 +298,7 @@ pub struct HidSink {
 }
 
 impl HidSink {
+    #[must_use]
     pub fn new(def: DeviceDef, pid: u16, path: DevicePath) -> HidSink {
         let light = def
             .lighting
@@ -318,7 +323,7 @@ impl HidSink {
 /// The board's honest maximum stream rate.
 ///
 /// Legacy boards were long capped at 6 fps on "frames drop above ~6" folklore — but a live wire
-/// probe (`device::tests::live_stream_strategy_probe`, BlackWidow Chroma V2) measured the REAL
+/// probe (`device::tests::live_stream_strategy_probe`, `BlackWidow` Chroma V2) measured the REAL
 /// cost: ~1ms per feature report under the production set+drain discipline, a full 7-report frame
 /// in <10ms, 30 fps sustained for 90 frames with zero failures/overruns and the device healthy
 /// after. The old ceiling came from the ACK'd write path (10ms first-poll sleep × 7 reports ≈
@@ -351,7 +356,7 @@ impl FrameSink for HidSink {
         // nulled `last`, forcing the very next frame to repaint every row —
         // a ~12ms row-by-row wipe on a legacy board = a visible full-board
         // FLASH. Holding `last` makes that gap invisible.
-        if frame.iter().all(|c| c.is_none()) {
+        if frame.iter().all(std::option::Option::is_none) {
             return;
         }
         if self.skips > 0 {
@@ -361,29 +366,23 @@ impl FrameSink for HidSink {
         // Open + take host control (driver-mode) lazily and idempotently;
         // while the device is unreachable, degrade to decimated retries.
         if self.dev.is_none() {
-            match Device::open_path(self.def.clone(), self.pid, &self.path) {
-                Ok(d) => {
-                    self.dev = Some(d);
-                    self.controlled = false;
-                    self.last = None; // fresh handle: never assume board state
-                }
-                Err(_) => {
-                    self.skips = 32;
-                    return;
-                }
+            if let Ok(d) = Device::open_path(self.def.clone(), self.pid, &self.path) {
+                self.dev = Some(d);
+                self.controlled = false;
+                self.last = None; // fresh handle: never assume board state
+            } else {
+                self.skips = 32;
+                return;
             }
         }
         let dev = self.dev.as_ref().expect("opened above");
         if !self.controlled {
-            match Lights::new(dev, self.light.clone()).ensure_control() {
-                Ok(()) => self.controlled = true,
-                Err(_) => {
-                    // Unreachable mid-session (sleep/unplug): drop the handle
-                    // so the next attempt reopens from scratch.
-                    self.dev = None;
-                    self.skips = 32;
-                    return;
-                }
+            if let Ok(()) = Lights::new(dev, self.light.clone()).ensure_control() { self.controlled = true } else {
+                // Unreachable mid-session (sleep/unplug): drop the handle
+                // so the next attempt reopens from scratch.
+                self.dev = None;
+                self.skips = 32;
+                return;
             }
         }
         let px: Vec<CoreRgb> = frame
@@ -456,7 +455,7 @@ pub struct Bridge {
     /// lands on exactly that unit's surface.
     by_unit: HashMap<String, String>,
     /// Per-surface pace shared between the writer AND that surface's
-    /// CompositorContent — the GUI fps slider writes here and both follow.
+    /// `CompositorContent` — the GUI fps slider writes here and both follow.
     paces: HashMap<String, Arc<AtomicU32>>,
     grids: HashMap<String, (u8, u8)>,
     /// Per-surface pause valves — how transient readers (getter sweeps,
@@ -472,28 +471,33 @@ impl Bridge {
     /// callers WITHOUT a unit in hand (pid-level config operations), applying to every surface
     /// is honest mirroring; anything addressing one physical unit resolves via
     /// [`key_for_unit`](Bridge::key_for_unit) instead.
+    #[must_use]
     pub fn keys_for_pid(&self, pid: u16) -> &[String] {
-        self.by_pid.get(&pid).map(|v| v.as_slice()).unwrap_or(&[])
+        self.by_pid.get(&pid).map(std::vec::Vec::as_slice).unwrap_or(&[])
     }
 
     /// The one surface key belonging to a physical unit ([`path_instance`]) — the precise
     /// resolution for per-unit operations. `None` when that unit isn't bridged (no lighting
     /// block, or it appeared after attach); callers must NOT fall back to a pid sibling — that
     /// would silently retarget a different physical device.
+    #[must_use]
     pub fn key_for_unit(&self, unit: &str) -> Option<&String> {
         self.by_unit.get(unit)
     }
 
+    #[must_use]
     pub fn unit_surfaces(&self) -> Vec<(String, String)> {
         self.by_unit.iter().map(|(unit, key)| (unit.clone(), key.clone())).collect()
     }
 
     /// The surface's writer pause valve (see [`WriterPauser`]) — `None` if
     /// the surface isn't bridged.
+    #[must_use]
     pub fn pauser(&self, key: &str) -> Option<WriterPauser> {
         self.pausers.get(key).cloned()
     }
 
+    #[must_use]
     pub fn pace(&self, key: &str) -> Option<Arc<AtomicU32>> {
         self.paces.get(key).cloned()
     }
@@ -513,14 +517,15 @@ impl Bridge {
         }
     }
 
-    /// The device's LED matrix shape (rows, cols) — what CompositorContent
-    /// needs to render the app's LayerDefs onto this surface.
+    /// The device's LED matrix shape (rows, cols) — what `CompositorContent`
+    /// needs to render the app's `LayerDefs` onto this surface.
+    #[must_use]
     pub fn grid_of(&self, key: &str) -> Option<(u8, u8)> {
         self.grids.get(key).copied()
     }
 }
 
-/// Writer-thread QoS — called ON the writer thread (the sink factory runs
+/// Writer-thread `QoS` — called ON the writer thread (the sink factory runs
 /// there). A 30fps stream needs ~33ms cycles from `thread::sleep`, but when a
 /// fullscreen game has focus Windows coarsens background timers to ~15.6ms
 /// and deprioritizes the thread — the writer then blows deadlines and drops

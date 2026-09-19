@@ -57,6 +57,7 @@ fn matches(prefix: &str, path: &str) -> bool {
 }
 
 impl Bus {
+    #[must_use]
     pub fn new() -> Self {
         Bus { retained: HashMap::new(), subs: Vec::new() }
     }
@@ -92,10 +93,12 @@ impl Bus {
 
     /// Point read of the retained truth — for pull-style consumers (a readout
     /// pattern sampling `gpu.temp` once per frame) that don't want a channel.
+    #[must_use]
     pub fn get(&self, path: &str) -> Option<&Value> {
         self.retained.get(path)
     }
 
+    #[must_use]
     pub fn subscriber_count(&self) -> usize {
         self.subs.len()
     }

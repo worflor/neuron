@@ -78,9 +78,8 @@ impl WsStream {
         // RFC only asks that it vary. Time + address entropy is ample.
         let seed = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0)
-            ^ (&sock as *const _ as u64);
+            .map_or(0, |d| d.as_nanos() as u64)
+            ^ (&raw const sock as u64);
         let key = crate::crypto::base64(&seed.to_le_bytes()[..]);
         let req = format!(
             "GET {path} HTTP/1.1\r\n\
@@ -280,7 +279,7 @@ fn encode_frame(op: u8, payload: &[u8], mask: u32) -> Vec<u8> {
     let n = payload.len();
     if n < 126 {
         out.push(0x80 | n as u8);
-    } else if n <= u16::MAX as usize {
+    } else if u16::try_from(n).is_ok() {
         out.push(0x80 | 126);
         out.extend_from_slice(&(n as u16).to_be_bytes());
     } else {

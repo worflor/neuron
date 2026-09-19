@@ -28,6 +28,7 @@ pub enum RuntimeMode {
 }
 
 impl RuntimeMode {
+    #[must_use]
     pub fn from_state(s: SafetyState) -> Self {
         match (s.writes_paused, s.input_armed) {
             (true, false) => RuntimeMode::Observe,
@@ -37,6 +38,7 @@ impl RuntimeMode {
         }
     }
 
+    #[must_use]
     pub fn state(self) -> SafetyState {
         match self {
             RuntimeMode::Observe => SafetyState {
@@ -80,6 +82,7 @@ pub fn set_state(state: SafetyState) {
     set_writes_paused(state.writes_paused);
 }
 
+#[must_use]
 pub fn state() -> SafetyState {
     SafetyState {
         input_armed: input_armed(),
@@ -87,6 +90,7 @@ pub fn state() -> SafetyState {
     }
 }
 
+#[must_use]
 pub fn mode() -> RuntimeMode {
     RuntimeMode::from_state(state())
 }
@@ -137,7 +141,7 @@ mod tests {
     }
 
     /// Pins the safety state machine directly against [`RuntimeMode::state`]: each stance's
-    /// (writes_paused, input_armed) pair, AND that [`RuntimeMode::from_state`] is its exact inverse —
+    /// (`writes_paused`, `input_armed`) pair, AND that [`RuntimeMode::from_state`] is its exact inverse —
     /// so a caller that reads back a state via `from_state` always recovers the mode that produced it
     /// (no two modes may share a state, no state may resolve to the wrong mode).
     #[test]

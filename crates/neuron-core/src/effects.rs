@@ -73,6 +73,7 @@ pub enum Blend {
 }
 
 impl Blend {
+    #[must_use]
     pub fn from_str(s: &str) -> Blend {
         match s.to_lowercase().as_str() {
             "add" => Blend::Add,
@@ -81,6 +82,7 @@ impl Blend {
             _ => Blend::Normal,
         }
     }
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Blend::Add => "add",
@@ -92,6 +94,7 @@ impl Blend {
 }
 
 /// Composite `over` onto `under` by `mode` — the per-cell core the [`Compositor`](crate::pattern::Compositor) runs.
+#[must_use]
 pub fn blend_px(under: Rgb, over: Rgb, mode: Blend) -> Rgb {
     match mode {
         Blend::Normal => over,
@@ -101,7 +104,7 @@ pub fn blend_px(under: Rgb, over: Rgb, mode: Blend) -> Rgb {
             under.b.saturating_add(over.b),
         ),
         Blend::Screen => {
-            let s = |a: u8, b: u8| (255 - ((255 - a as u16) * (255 - b as u16) / 255)) as u8;
+            let s = |a: u8, b: u8| (255 - ((255 - u16::from(a)) * (255 - u16::from(b)) / 255)) as u8;
             Rgb::new(s(under.r, over.r), s(under.g, over.g), s(under.b, over.b))
         }
         // Cutout: black = "nothing to say" (fall through); anything lit replaces at true colour.
@@ -122,6 +125,7 @@ pub fn blend_px(under: Rgb, over: Rgb, mode: Blend) -> Rgb {
 /// (≈1:2 I:E with an ~7% top hold) — instead of a symmetric up-down wobble. `phase` is in RADIANS
 /// (one cycle per TAU); output spans −1 at the trough to +1 at the crest, so a caller keeps its
 /// existing `centre + amp * …` structure and only swaps the `sin` for a breathe.
+#[must_use]
 pub fn breathe_shape(phase: f32) -> f32 {
     let t = (phase / std::f32::consts::TAU).rem_euclid(1.0);
     // the inhale completes in the first third of the cycle and crests at sin's 90°; it then HOLDS,
@@ -146,10 +150,11 @@ pub fn breathe_shape(phase: f32) -> f32 {
 
 /// Derive a hue (degrees, 0..360) from an Rgb. A greyscale/near-black colour has no hue, so it falls
 /// back to a pleasant aurora green (≈150°) rather than collapsing to red.
+#[must_use]
 pub fn rgb_hue(c: Rgb) -> f32 {
-    let r = c.r as f32 / 255.0;
-    let g = c.g as f32 / 255.0;
-    let b = c.b as f32 / 255.0;
+    let r = f32::from(c.r) / 255.0;
+    let g = f32::from(c.g) / 255.0;
+    let b = f32::from(c.b) / 255.0;
     let max = r.max(g).max(b);
     let min = r.min(g).min(b);
     let d = max - min;
@@ -168,11 +173,12 @@ pub fn rgb_hue(c: Rgb) -> f32 {
 
 /// Rotate a colour's HUE by `deg` degrees, preserving its saturation/value. A near-grey colour (no
 /// chroma to turn) is returned unchanged. This is what [`Motion::Cycle`](crate::spectrum::Motion) uses.
+#[must_use]
 pub fn jitter_hue(base: Rgb, deg: f32) -> Rgb {
     if deg == 0.0 {
         return base;
     }
-    let (rf, gf, bf) = (base.r as f32 / 255.0, base.g as f32 / 255.0, base.b as f32 / 255.0);
+    let (rf, gf, bf) = (f32::from(base.r) / 255.0, f32::from(base.g) / 255.0, f32::from(base.b) / 255.0);
     let max = rf.max(gf).max(bf);
     let min = rf.min(gf).min(bf);
     if max - min < 0.02 {
@@ -240,8 +246,8 @@ mod tests {
         assert!(above > n * 55 / 100, "the inhale-and-hold side should dominate the cycle (above={above})");
         assert!(below < n * 45 / 100, "the through-zero exhale should take the short leg (below={below})");
         // full −1..+1 range like sin, so `centre + amp * shape` behaves exactly like the old sine
-        let peak = vals.iter().cloned().fold(f32::MIN, f32::max);
-        let trough = vals.iter().cloned().fold(f32::MAX, f32::min);
+        let peak = vals.iter().copied().fold(f32::MIN, f32::max);
+        let trough = vals.iter().copied().fold(f32::MAX, f32::min);
         assert!(peak > 0.995 && trough < -0.995, "must swing the full range ({peak}, {trough})");
         // the crest actually HOLDS (a plateau, not a poke) — several samples sit at the top
         let near_top = vals.iter().filter(|&&v| v > 0.999).count();

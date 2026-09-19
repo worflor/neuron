@@ -26,6 +26,7 @@ pub enum ConfigKind {
 }
 
 impl ConfigKind {
+    #[must_use]
     pub fn label(self) -> &'static str {
         match self {
             ConfigKind::Dpi => "dpi",
@@ -51,6 +52,7 @@ pub struct Found {
 
 /// Stable vendor data roots, resolved from the environment. Only "Razer" is fixed; the OS data
 /// dirs come from env, so this is correct across Windows versions and Synapse versions.
+#[must_use]
 pub fn locate_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
     for var in ["PROGRAMDATA", "LOCALAPPDATA", "APPDATA", "USERPROFILE"] {
@@ -70,7 +72,7 @@ fn is_config_ext(p: &Path) -> bool {
     matches!(
         p.extension()
             .and_then(|e| e.to_str())
-            .map(|e| e.to_lowercase())
+            .map(str::to_lowercase)
             .as_deref(),
         Some("xml" | "json" | "dat" | "config")
     )
@@ -100,6 +102,7 @@ fn read_head(p: &Path, max_bytes: usize) -> String {
 
 /// Classify a config text by the signals it carries (lowercased substring match on element /
 /// key names). These names are stable in MEANING across Synapse versions even as schemas change.
+#[must_use]
 pub fn classify_text(text: &str) -> Vec<ConfigKind> {
     let t = text.to_lowercase();
     let has = |kws: &[&str]| kws.iter().any(|k| t.contains(k));
@@ -157,6 +160,7 @@ pub fn classify_text(text: &str) -> Vec<ConfigKind> {
 }
 
 /// Walk the roots and classify candidate config files (bounded for safety).
+#[must_use]
 pub fn harvest(roots: &[PathBuf], max_files: usize, max_bytes: usize) -> Vec<Found> {
     let mut out = Vec::new();
     for r in roots {
@@ -190,7 +194,7 @@ fn walk(
         if p.is_dir() {
             walk(&p, depth + 1, max_depth, out, max_files, max_bytes);
         } else if is_config_ext(&p) {
-            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            let size = entry.metadata().map_or(0, |m| m.len());
             let name = p
                 .file_name()
                 .and_then(|s| s.to_str())
@@ -221,6 +225,7 @@ fn walk(
 
 /// Mine (key, value) pairs from a harvested file — the actual eatable values. Handles JSON
 /// (parse + recurse for signal keys) and XML/text (known element tags). Bounded to the head.
+#[must_use]
 pub fn extract(f: &Found) -> Vec<(String, String)> {
     if f.encrypted || f.head.is_empty() {
         return Vec::new();
@@ -340,10 +345,10 @@ mod tests {
 <DeviceSettings><Id>262145</Id><MicVolume>65</MicVolume><HeadphoneVolume>50</HeadphoneVolume>
 <MicState>true</MicState><SamplingRate>SamplingRate_48</SamplingRate></DeviceSettings>"#;
 
-    const MAPPINGS: &str = r#"<DefaultMappings><MappingList><Mapping>
+    const MAPPINGS: &str = r"<DefaultMappings><MappingList><Mapping>
 <MappingGroup>Multimedia</MappingGroup><InputType>BroadcasterInput</InputType>
 <BroadcasterInput>TopButtonClick</BroadcasterInput>
-<MultimediaAssignment>MuteMic</MultimediaAssignment></Mapping></MappingList></DefaultMappings>"#;
+<MultimediaAssignment>MuteMic</MultimediaAssignment></Mapping></MappingList></DefaultMappings>";
 
     #[test]
     fn classifies_audio_and_profile_settings() {

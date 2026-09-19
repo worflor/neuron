@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Open `path` for writing CREATED RESTRICTIVE: on Unix the file is born 0o600 (owner-only), so
-/// secret-bearing bytes (app.toml carries host_obs_password) are never readable by other local
+/// secret-bearing bytes (app.toml carries `host_obs_password`) are never readable by other local
 /// users even for an instant — permissions are WIDENED to match the real destination only after
 /// the bytes are down, never the other way around. On Windows, `std::fs::Permissions` models only
 /// the readonly bit; confidentiality comes from the parent directory's inherited ACL, and every
@@ -80,6 +80,7 @@ pub trait SalvageLoad: Sized + Default + DeserializeOwned {
     fn path() -> PathBuf;
 
     /// Fallback when the file is ABSENT or not even valid TOML. Defaults to `Self::default()`.
+    #[must_use]
     fn fallback() -> Self {
         Self::default()
     }
@@ -89,6 +90,7 @@ pub trait SalvageLoad: Sized + Default + DeserializeOwned {
 
     /// Load the config, recovering as much as possible. NEVER errors, and never destroys the user's
     /// bytes: a degraded load copies the original to `<file>.bad` before returning anything.
+    #[must_use]
     fn load() -> Self {
         Self::load_from(&Self::path())
     }
@@ -96,6 +98,7 @@ pub trait SalvageLoad: Sized + Default + DeserializeOwned {
     /// The salvaging load, parameterised on `path` — factored out of [`load`](Self::load) so the
     /// whole choreography (fast path → backup → field-by-field salvage → fallback) can be tested
     /// against a temp file without a process-global path. Callers use `load()`.
+    #[must_use]
     fn load_from(path: &Path) -> Self {
         // Read RAW BYTES first: `read_to_string` would conflate "file absent" with "file exists but
         // isn't valid UTF-8", and the latter is exactly a degraded file whose bytes must be backed up
@@ -155,6 +158,7 @@ pub trait SalvageLoad: Sized + Default + DeserializeOwned {
 
 /// One scalar/struct field. `None` = key absent OR malformed; a malformed value warns by name and the
 /// caller keeps its default. `file` is the config name for the warning.
+#[must_use]
 pub fn salvage_field<T: DeserializeOwned>(table: &toml::Table, key: &str, file: &str) -> Option<T> {
     let v = table.get(key)?;
     match v.clone().try_into() {
@@ -168,6 +172,7 @@ pub fn salvage_field<T: DeserializeOwned>(table: &toml::Table, key: &str, file: 
 
 /// A `Vec` field, salvaged PER ELEMENT: malformed elements are dropped (each warned, with its index)
 /// and the good ones kept IN ORDER. `None` = key absent or not an array (caller keeps its default).
+#[must_use]
 pub fn salvage_vec<T: DeserializeOwned>(table: &toml::Table, key: &str, file: &str) -> Option<Vec<T>> {
     let v = table.get(key)?;
     let toml::Value::Array(items) = v else {
@@ -191,6 +196,7 @@ pub fn salvage_vec<T: DeserializeOwned>(table: &toml::Table, key: &str, file: &s
 /// silently remap positions. Instead each bad element warns (with its index) and is replaced by
 /// `T::default()` IN PLACE, so every surviving element keeps its exact index. `None` = key absent
 /// or not an array (caller keeps its default).
+#[must_use]
 pub fn salvage_vec_positional<T: DeserializeOwned + Default>(
     table: &toml::Table,
     key: &str,
@@ -218,6 +224,7 @@ pub fn salvage_vec_positional<T: DeserializeOwned + Default>(
 
 /// A map field, salvaged PER ENTRY (e.g. cast's `gestures`). `None` = key absent or not a table
 /// (caller keeps its default). Malformed entries are dropped (each warned, by name); the rest survive.
+#[must_use]
 pub fn salvage_map<T: DeserializeOwned>(
     table: &toml::Table,
     key: &str,
@@ -287,7 +294,7 @@ macro_rules! salvage_fields {
 /// config that stays malformed on disk gets `load_from`'d on every run, and without this fast path
 /// each of those runs would pay for a full temp create+write+fsync only to discover during
 /// publication that the identical bytes were already backed up. The pre-scan is an optimization
-/// only, not the correctness guarantee — see the AlreadyExists arm below for the race-safe check.
+/// only, not the correctness guarantee — see the `AlreadyExists` arm below for the race-safe check.
 fn backup_degraded_bytes(path: &Path, raw: &[u8]) {
     // FAST PATH: scan the nine slots BEFORE staging any temp write. A config that stays malformed
     // on disk hits `load_from` on every run, and without this pre-scan each of those runs pays for
@@ -832,7 +839,7 @@ mod tests {
         let stem = target.file_name().unwrap().to_str().unwrap();
         let found = std::fs::read_dir(std::env::temp_dir())
             .unwrap()
-            .filter_map(|e| e.ok())
+            .filter_map(std::result::Result::ok)
             .any(|e| {
                 let name = e.file_name();
                 let name = name.to_string_lossy();
@@ -954,12 +961,12 @@ mod tests {
         let stem = target.file_name().unwrap().to_str().unwrap();
         let found_overflow = std::fs::read_dir(std::env::temp_dir())
             .unwrap()
-            .filter_map(|e| e.ok())
+            .filter_map(std::result::Result::ok)
             .any(|e| {
                 let name = e.file_name();
                 let name = name.to_string_lossy();
                 if name.starts_with("neuron.") && name.contains(stem) && name.ends_with(".bad") {
-                    std::fs::read(e.path()).map(|b| b == b"original-9").unwrap_or(false)
+                    std::fs::read(e.path()).is_ok_and(|b| b == b"original-9")
                 } else {
                     false
                 }
@@ -983,7 +990,7 @@ mod tests {
     /// The one claim the whole module leans on: `atomic_write` must be able to overwrite a file
     /// that already exists, not just create a fresh one. `std::fs::rename`'s replace-on-Windows
     /// behaviour is doc'd but unverified in this codebase — every `Struct::save()` (Profile,
-    /// Bindings, FeelConfig, Prefs, cast, apps, CLI sidecars) is a SECOND-OR-LATER write onto a
+    /// Bindings, `FeelConfig`, Prefs, cast, apps, CLI sidecars) is a SECOND-OR-LATER write onto a
     /// path that already exists, so a rename that only works on an absent destination would make
     /// every one of them fail after the very first save. Proven directly, twice over (plain
     /// overwrite, then a same-length overwrite so a stale destination can't coincidentally still
@@ -1081,7 +1088,7 @@ mod tests {
         // no stray `.tmp` sibling is left behind after a successful write.
         let leftovers: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
-            .filter_map(|e| e.ok())
+            .filter_map(std::result::Result::ok)
             .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
             .collect();
         assert!(leftovers.is_empty(), "atomic_write left a temp file: {leftovers:?}");
@@ -1298,7 +1305,7 @@ mod tests {
 
         let entries: Vec<String> = std::fs::read_dir(&dir)
             .unwrap()
-            .filter_map(|e| e.ok())
+            .filter_map(std::result::Result::ok)
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(
@@ -1507,7 +1514,7 @@ mod tests {
             // invalid UTF-8 (almost always — the rare valid ones are covered by the arms below too).
             proptest::collection::vec(any::<u8>(), 0..48),
             // valid UTF-8, essentially never valid TOML.
-            "\\PC{0,60}".prop_map(|s| s.into_bytes()),
+            "\\PC{0,60}".prop_map(std::string::String::into_bytes),
             // valid TOML, but shaped nothing like `Rich` (unrelated keys/values).
             arb_toml_value(3).prop_map(|v| {
                 let mut t = toml::Table::new();
@@ -1583,8 +1590,7 @@ mod tests {
                 let base = bad_sibling(&path);
                 let found = (0..=8).any(|i| {
                     std::fs::read(bad_slot_path(&base, i))
-                        .map(|b| b == bytes)
-                        .unwrap_or(false)
+                        .is_ok_and(|b| b == bytes)
                 });
                 prop_assert!(found, "degraded bytes must survive verbatim in some .bad* sibling");
             }
@@ -1663,17 +1669,14 @@ mod tests {
             let mut t = toml::Table::new();
             t.insert("items".to_string(), val.clone());
             let got = salvage_vec::<i64>(&t, "items", "t.toml");
-            match val {
-                toml::Value::Array(items) => {
-                    let expected: Vec<i64> = items
-                        .iter()
-                        .filter_map(|v| v.clone().try_into::<i64>().ok())
-                        .collect();
-                    prop_assert!(got.as_ref().map(|v| v.len()).unwrap_or(0) <= items.len());
-                    prop_assert_eq!(got, Some(expected));
-                }
-                _ => prop_assert_eq!(got, None),
-            }
+            if let toml::Value::Array(items) = val {
+                let expected: Vec<i64> = items
+                    .iter()
+                    .filter_map(|v| v.clone().try_into::<i64>().ok())
+                    .collect();
+                prop_assert!(got.as_ref().map_or(0, std::vec::Vec::len) <= items.len());
+                prop_assert_eq!(got, Some(expected));
+            } else { prop_assert_eq!(got, None) }
         }
 
         /// `salvage_vec_positional`'s documented contract: the output length is EXACTLY the input
@@ -1684,17 +1687,14 @@ mod tests {
             let mut t = toml::Table::new();
             t.insert("items".to_string(), val.clone());
             let got = salvage_vec_positional::<i64>(&t, "items", "t.toml");
-            match val {
-                toml::Value::Array(items) => {
-                    let expected: Vec<i64> = items
-                        .iter()
-                        .map(|v| v.clone().try_into::<i64>().unwrap_or_default())
-                        .collect();
-                    prop_assert_eq!(got.as_ref().map(Vec::len), Some(items.len()));
-                    prop_assert_eq!(got, Some(expected));
-                }
-                _ => prop_assert_eq!(got, None),
-            }
+            if let toml::Value::Array(items) = val {
+                let expected: Vec<i64> = items
+                    .iter()
+                    .map(|v| v.clone().try_into::<i64>().unwrap_or_default())
+                    .collect();
+                prop_assert_eq!(got.as_ref().map(Vec::len), Some(items.len()));
+                prop_assert_eq!(got, Some(expected));
+            } else { prop_assert_eq!(got, None) }
         }
 
         /// `salvage_map`'s documented contract: every surviving key is a SUBSET of the input
@@ -1705,22 +1705,19 @@ mod tests {
             let mut t = toml::Table::new();
             t.insert("m".to_string(), val.clone());
             let got = salvage_map::<i64>(&t, "m", "t.toml");
-            match val {
-                toml::Value::Table(entries) => {
-                    let got = got.expect("m is a table, so salvage_map must return Some");
-                    for (k, v) in got.iter() {
-                        prop_assert!(entries.contains_key(k), "key `{k}` was not in the input table");
-                        let want: i64 = entries
-                            .get(k)
-                            .expect("checked contains_key above")
-                            .clone()
-                            .try_into::<i64>()
-                            .expect("surviving entries must actually parse");
-                        prop_assert_eq!(*v, want);
-                    }
+            if let toml::Value::Table(entries) = val {
+                let got = got.expect("m is a table, so salvage_map must return Some");
+                for (k, v) in &got {
+                    prop_assert!(entries.contains_key(k), "key `{k}` was not in the input table");
+                    let want: i64 = entries
+                        .get(k)
+                        .expect("checked contains_key above")
+                        .clone()
+                        .try_into::<i64>()
+                        .expect("surviving entries must actually parse");
+                    prop_assert_eq!(*v, want);
                 }
-                _ => prop_assert_eq!(got, None),
-            }
+            } else { prop_assert_eq!(got, None) }
         }
     }
 
@@ -1762,13 +1759,13 @@ mod tests {
             prop_assert_eq!(got.keep, orig_keep, "the published file's content must be read, not the stray temp");
             prop_assert_eq!(
                 std::fs::read(&path).unwrap(),
-                original.clone().into_bytes(),
+                original.into_bytes(),
                 "the good file must be untouched by an unrelated stray sibling"
             );
 
             // the real overwrite must still fully succeed (never a torn mix) despite the stray.
             atomic_write(&path, new_bytes.as_bytes()).unwrap();
-            prop_assert_eq!(std::fs::read(&path).unwrap(), new_bytes.clone().into_bytes());
+            prop_assert_eq!(std::fs::read(&path).unwrap(), new_bytes.into_bytes());
 
             // atomic_write always mints its OWN fresh unique temp name — it must never adopt,
             // repair, or clobber a stray pre-existing temp it didn't create itself.

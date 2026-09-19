@@ -35,14 +35,14 @@
 //! same way as their defs grow `[events]` entries.
 //!
 //! DRIVER-MODE BUTTON EVENTS — a SECOND report family, the `04` lead byte, captured live off the Naga
-//! V2 Pro (pid 0x00A8) 2026-07-07. In driver mode (device_mode 0x03) the firmware STOPS acting on its
+//! V2 Pro (pid 0x00A8) 2026-07-07. In driver mode (`device_mode` 0x03) the firmware STOPS acting on its
 //! own onboard DPI/scroll/profile buttons; it DEFERS them to the resident software as bare "the button
 //! happened" events (Synapse silently implements the semantics). While neuron holds the driver lease
 //! for its lighting stream that duty is OURS or those buttons go dead:
 //!   `04 52 …` → DPI-stage button      `04 57 …` → scroll-sensitivity button
 //!   `04 50 …` → profile button        `04 00 …` → ANY button's release (buf[1]=0x00 — ignored)
 //! The event carries NO stage index and NO direction — software owns the cycle. `decode` maps the code
-//! to an [`Intent`] and hands it to a single SERIAL worker that — gated on a FRESH device_mode==0x03
+//! to an [`Intent`] and hands it to a single SERIAL worker that — gated on a FRESH `device_mode==0x03`
 //! read — fulfills it through `neuron::intent::run_shared_intent`, the same cycle policy the CLI/GUI
 //! use. This is neuron honouring the driver-mode custody contract: hold the lease, own the buttons.
 //!
@@ -135,7 +135,7 @@ fn verbose() -> bool {
 /// new arms see the new one. The leak is bounded by adoption events (rare — a few per session at most),
 /// not a per-frame cost, which is the deliberate trade for keeping the zero-alloc `&'static` reader path.
 pub fn registry() -> Option<&'static neuron::registry::Registry> {
-    let mut cell = reg_cell().lock().unwrap_or_else(|p| p.into_inner());
+    let mut cell = reg_cell().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if cell.is_none() {
         *cell = neuron::registry::Registry::load()
             .ok()
@@ -149,7 +149,7 @@ pub fn registry() -> Option<&'static neuron::registry::Registry> {
 /// see the newly-adopted/edited defs on the next re-arm/select, not only after a restart.
 pub fn reload_registry() {
     if let Ok(r) = neuron::registry::Registry::load() {
-        *reg_cell().lock().unwrap_or_else(|p| p.into_inner()) = Some(&*Box::leak(Box::new(r)));
+        *reg_cell().lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(&*Box::leak(Box::new(r)));
     }
 }
 
@@ -199,7 +199,7 @@ pub fn start() {
     // The OS tells us the instant a device interface arrives; the poll below is only the backstop.
     let wake = spawn_hotplug_notifier();
 
-    let mon = armed.clone();
+    let mon = armed;
     crate::worker::spawn_detached("neuron-hidwatch-mon", move || loop {
         // Wait for a device-arrival notification, or fall through on the backstop interval. The
         // poll ALONE used to be the mechanism, which meant every dongle replug, hub glitch, or
@@ -210,12 +210,9 @@ pub fn start() {
         // With NO notifier (a platform without a backend, or a registration the OS refused) the
         // wait is the plain interval — the pre-existing behaviour. Blocking here is not optional:
         // this arm is what paces the loop, so a missing notifier must still sleep rather than spin.
-        let woken = match wake.as_ref() {
-            Some(rx) => rx.recv_timeout(HOTPLUG_POLL).is_ok(),
-            None => {
-                thread::sleep(HOTPLUG_POLL);
-                false
-            }
+        let woken = if let Some(rx) = wake.as_ref() { rx.recv_timeout(HOTPLUG_POLL).is_ok() } else {
+            thread::sleep(HOTPLUG_POLL);
+            false
         };
         if woken {
             // USB enumeration fires a burst of arrivals (one per interface/collection) and the
@@ -251,7 +248,7 @@ pub fn start() {
 /// arm here and have its reports parsed as razer bytes — a foreign `05 02` misread as a DPI
 /// announce could even trigger a reconcile write.
 ///
-/// OWNED EVENT pids, not just mode pids: a HyperSpeed receiver exposes its own sideband collections
+/// OWNED EVENT pids, not just mode pids: a `HyperSpeed` receiver exposes its own sideband collections
 /// under the DONGLE's pid (`event_alias_pids`), and the mouse's driver-mode side-plate events ride
 /// there — those collections belong to THIS reader, not macrokeys.
 fn mouse_event_pids() -> HashSet<u16> {
@@ -264,7 +261,7 @@ fn mouse_event_pids() -> HashSet<u16> {
     r.devices
         .iter()
         .filter(|d| d.dialect == "razer" && d.supports(neuron::registry::Capability::Dpi))
-        .flat_map(|d| d.owned_event_pids())
+        .flat_map(neuron::registry::DeviceDef::owned_event_pids)
         .collect()
 }
 
@@ -353,7 +350,7 @@ unsafe fn notifier_pump() {
     wc.lpszClassName = class.as_ptr();
     // A zero return means the class already exists (a previous `start`) — harmless, and
     // CreateWindowExW below still resolves it by name.
-    RegisterClassW(&wc);
+    RegisterClassW(&raw const wc);
 
     let hwnd = CreateWindowExW(
         0,
@@ -383,7 +380,7 @@ unsafe fn notifier_pump() {
     // mount or a network adapter must not cost an enumeration.
     filter.dbcc_classguid = GUID_DEVINTERFACE_HID;
     let handle = RegisterDeviceNotificationW(
-        hwnd as _,
+        hwnd.cast(),
         std::ptr::addr_of!(filter).cast(),
         DEVICE_NOTIFY_WINDOW_HANDLE,
     );
@@ -398,9 +395,9 @@ unsafe fn notifier_pump() {
     // torn down: this thread is detached and lives as long as the app, so there is no shutdown
     // path that could leave a dangling notification handle.
     let mut msg: MSG = std::mem::zeroed();
-    while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
+    while GetMessageW(&raw mut msg, std::ptr::null_mut(), 0, 0) > 0 {
+        TranslateMessage(&raw const msg);
+        DispatchMessageW(&raw const msg);
     }
 }
 
@@ -511,7 +508,7 @@ fn spawn_reader(
     // `armed` claimed this collection's path in `arm_new` before this spawn — the release below is
     // the ONE place that un-claims it (on open failure, on read-loop exit, on a spawn refusal/panic),
     // so the monitor can always retry a stranded claim instead of a collection going deaf forever.
-    let release_armed = armed.clone();
+    let release_armed = armed;
     let release_path = path.clone();
     crate::worker::spawn_guarded(
         "neuron-hidwatch",
@@ -599,18 +596,15 @@ fn spawn_reader(
                             // its own success/failure inside the worker.
                             crate::worker::spawn_notify(
                                 "neuron-hidwatch-batt",
-                                move || match read_battery(pid) {
-                                    Some((b, c)) => {
-                                        neuron::vitals::observe(pid, b, c, false);
-                                        true
+                                move || if let Some((b, c)) = read_battery(pid) {
+                                    neuron::vitals::observe(pid, b, c, false);
+                                    true
+                                } else {
+                                    neuron::vitals::mark_stale(pid);
+                                    if verbose() {
+                                        eprintln!("[hidwatch] pid={pid:04x}: battery read failed");
                                     }
-                                    None => {
-                                        neuron::vitals::mark_stale(pid);
-                                        if verbose() {
-                                            eprintln!("[hidwatch] pid={pid:04x}: battery read failed");
-                                        }
-                                        false
-                                    }
+                                    false
                                 },
                                 move |ran| {
                                     if ran.is_none() {
@@ -667,7 +661,7 @@ fn mute_products_store() -> &'static Mutex<HashSet<String>> {
 /// Snapshot of every USB product string a hardware-mute-pushing collection has armed under, this
 /// session. `glue::endpoint_has_hardware_mute` reads this to decide whether an audio endpoint's mute
 /// is hardware-owned — discovered from what the dialect layer actually CLAIMED and armed, not from a
-/// registry def (a def with its own `[events]` MuteState entry is a SEPARATE, additional check there).
+/// registry def (a def with its own `[events]` `MuteState` entry is a SEPARATE, additional check there).
 pub fn hardware_mute_products() -> Vec<String> {
     mute_products_store().lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().cloned().collect()
 }
@@ -686,7 +680,7 @@ pub fn mute_writable_products() -> Vec<String> {
 }
 
 /// Bridge an audio device's firmware tap-mute (its pushed `05 11 <state>`-shaped report) to the
-/// OS/Core-Audio capture mute, the shared mic-state provider, and the UI — the MuteState handler for
+/// OS/Core-Audio capture mute, the shared mic-state provider, and the UI — the `MuteState` handler for
 /// [`decode`]. Setting the OS mute lights up the whole chain the resident dispatch loop already
 /// watches (Discord/games follow the OS mute the same way Synapse used to drive it), with no extra UI
 /// plumbing beyond the two explicit nudges below.
@@ -753,7 +747,7 @@ fn mute_state_changed(path: &DevicePath, muted: bool) -> bool {
 }
 
 /// A PHYSICAL mic tap fires `Trigger::MicTap` and its synthetic raw-Input twin, through the same
-/// engine seam a hardware button uses (`dispatch::inject_trigger`), so it composes with HyperShift
+/// engine seam a hardware button uses (`dispatch::inject_trigger`), so it composes with `HyperShift`
 /// layers / intents / SAFE-mode exactly like any other control. Mirrors the pair the dispatch
 /// detector fires — but sourced from the HID edge, so it is immediate and needs no inference.
 fn fire_mic_tap(pid: u16) {
@@ -905,7 +899,7 @@ fn decode(
     match buf[1] {
         // DPI changed: X then Y as big-endian u16 (device sets both axes together).
         0x02 => {
-            let dpi = u16::from_be_bytes([buf[2], buf[3]]) as u32;
+            let dpi = u32::from(u16::from_be_bytes([buf[2], buf[3]]));
             if (100..=30_000).contains(&dpi) {
                 // The wander this subsystem exists to catch is silent by nature — it happens while
                 // the user is away and the only witness is the device's own announce. A breadcrumb
@@ -931,14 +925,14 @@ fn decode(
                 if reassert_due(pid) {
                     let announced = dpi as u16;
                     crate::worker::spawn_detached("neuron-hidwatch-dpi", move || {
-                        maybe_reconcile_announced(pid, announced)
+                        maybe_reconcile_announced(pid, announced);
                     });
                 }
             }
         }
         // Scroll / sensitivity stage changed: stage index in byte[2], bounded by the real stage count.
         0x3a => {
-            let stage = buf[2] as u32;
+            let stage = u32::from(buf[2]);
             if (1..=SCROLL_STAGE_MAX).contains(&stage) {
                 batch_push(pid, Push::Scroll(stage));
             }
@@ -971,13 +965,10 @@ fn decode(
             note_wake(pid);
             let reassert = reassert_due(pid);
             crate::worker::spawn_detached("neuron-hidwatch-charge", move || {
-                match settle_charge(pid) {
-                    Some((b, c)) => neuron::vitals::observe(pid, b, c, true),
-                    None => {
-                        neuron::vitals::mark_stale(pid);
-                        if verbose() {
-                            eprintln!("[hidwatch] pid={pid:04x}: charge settle read failed");
-                        }
+                if let Some((b, c)) = settle_charge(pid) { neuron::vitals::observe(pid, b, c, true) } else {
+                    neuron::vitals::mark_stale(pid);
+                    if verbose() {
+                        eprintln!("[hidwatch] pid={pid:04x}: charge settle read failed");
                     }
                 }
                 if reassert {
@@ -1008,7 +999,7 @@ fn decode(
 }
 
 /// The PURE half of the hardware-mute event path: resolve one pushed report against the two-layer
-/// event vocabulary and, when it names a MuteState, read the state bit the payload carries
+/// event vocabulary and, when it names a `MuteState`, read the state bit the payload carries
 /// (`report[2]`: 0=live, 1=muted). Resolution order is the contract [`decode`] promises — a def's own
 /// `[events]` table FIRST (the per-device OVERRIDE), the family vocabulary
 /// (`Dialect::default_event_for`) second — so a device with a curated def always wins over the
@@ -1054,7 +1045,7 @@ fn inject_deferred_buttons(buf: &[u8], pid: u16) {
 /// The pure half of [`inject_deferred_buttons`]: which held codes in a `04` report are bindable
 /// controls. Only codes in the OBSERVED deferred-button region qualify — FN (0x01) and the
 /// button block 0x20..=0x5F (M-keys, side-plate keys, and the cycle buttons live here; captured
-/// live from the BlackWidow + Naga and matching OpenRazer's razer_raw_event vocabulary). Cycle-
+/// live from the `BlackWidow` + Naga and matching `OpenRazer`'s `razer_raw_event` vocabulary). Cycle-
 /// intent codes stay with the intent path, and anything OUTSIDE the region is a status byte some
 /// future firmware may put on the 04 report — never a phantom bindable press.
 fn deferred_hits(buf: &[u8]) -> Vec<(u16, u16)> {
@@ -1064,7 +1055,7 @@ fn deferred_hits(buf: &[u8]) -> Vec<(u16, u16)> {
         .filter(|&c| {
             (c == 0x01 || (0x20..=0x5F).contains(&c)) && button_intent(c).is_none()
         })
-        .map(|c| (neuron::controls::RAZER_MACRO_PAGE, c as u16))
+        .map(|c| (neuron::controls::RAZER_MACRO_PAGE, u16::from(c)))
         .collect()
 }
 
@@ -1108,12 +1099,12 @@ fn button_worker() -> Option<std::sync::mpsc::Sender<(u16, neuron::action::Inten
         // press can't kill the serial button worker for the rest of the run.
         crate::worker::drain(rx, "neuron-hidwatch-button", |(pid, intent)| {
             fulfill_button(pid, intent);
-        })
+        });
     })
 }
 
 /// Fulfill one deferred-button request on the serial worker (never the reader). The DRIVER-MODE GATE:
-/// read device_mode FRESH per press and act only when it reads 0x03. WHY act only in driver mode — in
+/// read `device_mode` FRESH per press and act only when it reads 0x03. WHY act only in driver mode — in
 /// NORMAL mode (0x00) the firmware acts on the button ITSELF and merely announces the result via the
 /// 05-family, so cycling here too would DOUBLE-APPLY; in driver mode the firmware defers and the 04
 /// event is a REQUEST we must satisfy. WHY fresh, not cached — the lighting stream's driver lease comes
@@ -1161,7 +1152,7 @@ fn plate_label(pid: u16, id: u8) -> String {
     registry()
         .and_then(|r| r.devices.iter().find(|d| d.product_ids().any(|p| p == pid)))
         .and_then(|d| d.side_plate_label(id))
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
         .unwrap_or_else(|| format!("plate {id}"))
 }
 
@@ -1227,15 +1218,15 @@ fn batch_push_at(pid: u16, ev: Push, now: Instant) {
             .or_insert_with(|| BatchState { batch: Batch::EMPTY, generation: 0 });
         match ev {
             Push::Dpi(v) => {
-                let t = st.batch.dpi.map(|(t, _)| t).unwrap_or(now);
+                let t = st.batch.dpi.map_or(now, |(t, _)| t);
                 st.batch.dpi = Some((t, v));
             }
             Push::Scroll(v) => {
-                let t = st.batch.scroll.map(|(t, _)| t).unwrap_or(now);
+                let t = st.batch.scroll.map_or(now, |(t, _)| t);
                 st.batch.scroll = Some((t, v));
             }
             Push::Plate(id, label) => {
-                let t = st.batch.plate.as_ref().map(|(t, _, _)| *t).unwrap_or(now);
+                let t = st.batch.plate.as_ref().map_or(now, |(t, _, _)| *t);
                 st.batch.plate = Some((t, id, label));
             }
         }
@@ -1305,7 +1296,7 @@ fn flush_batch(pid: u16, b: Batch) {
             neuron::confirm::prime_scroll(pid, v);
         }
         if let Some((_, id, label)) = b.plate {
-            neuron::confirm::prime_side_plate(pid, id as u32, &label);
+            neuron::confirm::prime_side_plate(pid, u32::from(id), &label);
             crate::glue::post_observation(pid, crate::glue::Observed::Plate(label.clone()));
             // A state-announce burst is how we learn the plate on wake/replug WITHOUT carding it.
             // The latch still has to happen: the binds must follow the hardware whether we found
@@ -1321,7 +1312,7 @@ fn flush_batch(pid: u16, b: Batch) {
             neuron::confirm::observe_scroll(pid, v, SCROLL_STAGE_MAX);
         }
         if let Some((_, id, label)) = b.plate {
-            neuron::confirm::observe_side_plate(pid, id as u32, &label);
+            neuron::confirm::observe_side_plate(pid, u32::from(id), &label);
             crate::glue::post_observation(pid, crate::glue::Observed::Plate(label.clone()));
             latch_plate_layer(id, &label);
         }
@@ -1502,7 +1493,7 @@ fn reassert_release(pid: u16) {
 /// disagreement gate (it writes nothing when the two planes already agree) provides the do-no-harm
 /// property the mode gate was only approximating. Runs on the charge worker thread (off the reader).
 /// Logs the outcome (a rare, debounced device-integrity event earns a line even without
-/// NEURON_HIDWATCH; the read/verify inside the write is the safety net so a failure is honest, never a
+/// `NEURON_HIDWATCH`; the read/verify inside the write is the safety net so a failure is honest, never a
 /// silent corruption).
 fn maybe_reassert(pid: u16) {
     let Some(d) = open_device(pid) else {
@@ -1648,7 +1639,7 @@ fn adopt_unattributable(pid: u16, announced: u16) {
 /// log the outcome. SHARED by both wake triggers — the `05 0c` power poke ([`maybe_reassert`], which
 /// reaches here unconditionally) and the `05 02` DPI-announce ([`maybe_reconcile_announced`], which
 /// reaches here only for a DPI no writer and no record accounts for) — so the "a rare device-integrity
-/// event earns a line even without NEURON_HIDWATCH; the read/verify inside the write is the safety
+/// event earns a line even without `NEURON_HIDWATCH`; the read/verify inside the write is the safety
 /// net" logging is identical on both paths.
 fn reconcile_now(pid: u16, d: &neuron::device::Device) {
     // HOST INTENT FIRST (2026-07-23): the device's own persisted plane is corruptible — the

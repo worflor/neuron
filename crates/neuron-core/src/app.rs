@@ -45,7 +45,7 @@ pub fn foreground_app() -> Option<String> {
             return None;
         }
         let mut pid: u32 = 0;
-        GetWindowThreadProcessId(hwnd, &mut pid);
+        GetWindowThreadProcessId(hwnd, &raw mut pid);
         if pid == 0 {
             return None;
         }
@@ -54,7 +54,7 @@ pub fn foreground_app() -> Option<String> {
         // dispatch or macro-host locks the callers may already hold.
         if let Some((h, p, name)) = FOREGROUND_MEMO
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
         {
             if (*h, *p) == key {
@@ -67,16 +67,16 @@ pub fn foreground_app() -> Option<String> {
         }
         let mut buf = [0u16; 260];
         let mut len = buf.len() as u32;
-        let ok = QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut len);
+        let ok = QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &raw mut len);
         CloseHandle(h);
         if ok == 0 || len == 0 {
             return None;
         }
         let path = String::from_utf16_lossy(&buf[..len as usize]);
-        let name = path.rsplit(['\\', '/']).next().map(|s| s.to_lowercase())?;
+        let name = path.rsplit(['\\', '/']).next().map(str::to_lowercase)?;
         // Memoize only a SUCCESSFUL resolve. Caching a failure would mean a window we momentarily
         // could not query stayed unknown for as long as it kept focus.
-        *FOREGROUND_MEMO.lock().unwrap_or_else(|e| e.into_inner()) =
+        *FOREGROUND_MEMO.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
             Some((key.0, key.1, name.clone()));
         Some(name)
     }
@@ -89,7 +89,7 @@ pub fn foreground_app() -> Option<String> {
 pub fn forget_foreground_memo() {
     #[cfg(windows)]
     {
-        *FOREGROUND_MEMO.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *FOREGROUND_MEMO.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 }
 

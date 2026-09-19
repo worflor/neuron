@@ -18,7 +18,7 @@ const WIRE_MAGIC: [u8; 2] = *b"EN";
 /// Full format (with residuals).
 const WIRE_VERSION_FULL: u8 = 1;
 
-/// Compact/brain format (K,G + pair_rms only, no residuals).
+/// Compact/brain format (K,G + `pair_rms` only, no residuals).
 const WIRE_VERSION_COMPACT: u8 = 2;
 
 // ─── Zigzag + Varint ────────────────────────────────────────────────
@@ -29,7 +29,7 @@ fn zigzag_encode(v: i32) -> u32 {
     ((v << 1) ^ (v >> 31)) as u32
 }
 
-/// Zigzag decode: inverse of zigzag_encode.
+/// Zigzag decode: inverse of `zigzag_encode`.
 #[inline]
 fn zigzag_decode(v: u32) -> i32 {
     ((v >> 1) as i32) ^ -((v & 1) as i32)
@@ -66,7 +66,7 @@ fn unpack_varints(data: &[u8], count: usize) -> (Vec<i32>, usize) {
             }
             let byte = data[pos];
             pos += 1;
-            result |= ((byte & 0x7F) as u32) << shift;
+            result |= u32::from(byte & 0x7F) << shift;
             if byte & 0x80 == 0 {
                 break;
             }
@@ -123,8 +123,8 @@ fn write_complex_f32(buf: &mut Vec<u8>, c: Complex64) {
 
 /// Read a complex value from two f32 (re, im).
 fn read_complex_f32(data: &[u8], pos: &mut usize) -> Complex64 {
-    let re = read_f32_le(data, pos) as f64;
-    let im = read_f32_le(data, pos) as f64;
+    let re = f64::from(read_f32_le(data, pos));
+    let im = f64::from(read_f32_le(data, pos));
     Complex64::new(re, im)
 }
 
@@ -146,9 +146,9 @@ fn f32_to_f16(v: f32) -> u16 {
 }
 
 fn f16_to_f32(bits: u16) -> f32 {
-    let sign = ((bits >> 15) & 1) as u32;
-    let exp = ((bits >> 10) & 0x1F) as u32;
-    let frac = (bits & 0x3FF) as u32;
+    let sign = u32::from((bits >> 15) & 1);
+    let exp = u32::from((bits >> 10) & 0x1F);
+    let frac = u32::from(bits & 0x3FF);
 
     if exp == 0 {
         if frac == 0 {
@@ -174,11 +174,13 @@ fn f16_to_f32(bits: u16) -> f32 {
 // ─── Serialization ─────────────────────────────────────────────────
 
 /// Serialize a Packet to wire bytes (full format).
+#[must_use]
 pub fn to_wire(packet: &Packet) -> Vec<u8> {
     to_wire_inner(packet, false)
 }
 
 /// Serialize a Packet to compact/brain wire bytes (no residuals).
+#[must_use]
 pub fn to_wire_compact(packet: &Packet) -> Vec<u8> {
     to_wire_inner(packet, true)
 }
@@ -302,11 +304,13 @@ fn to_wire_inner(packet: &Packet, compact: bool) -> Vec<u8> {
 }
 
 /// Deserialize wire bytes back to a Packet.
+#[must_use]
 pub fn from_wire(data: &[u8]) -> Option<Packet> {
     from_wire_inner(data, false)
 }
 
 /// Deserialize compact wire bytes back to a Packet.
+#[must_use]
 pub fn from_wire_compact(data: &[u8]) -> Option<Packet> {
     from_wire_inner(data, true)
 }
@@ -348,7 +352,7 @@ fn from_wire_inner(data: &[u8], expect_compact: bool) -> Option<Packet> {
         // Pairing
         pairing.clear();
         for _ in 0..dim {
-            pairing.push(read_u16_le(data, &mut pos) as i32);
+            pairing.push(i32::from(read_u16_le(data, &mut pos)));
         }
         // Seeds
         for d in 0..dim {
@@ -537,10 +541,7 @@ mod tests {
             // f16 has ~3 decimal digits of precision
             assert!(
                 err < v.abs() * 0.01 + 0.001,
-                "f16 roundtrip: {} → {} (err={})",
-                v,
-                back,
-                err
+                "f16 roundtrip: {v} → {back} (err={err})"
             );
         }
     }

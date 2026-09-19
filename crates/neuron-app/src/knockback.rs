@@ -101,7 +101,7 @@ use crate::beacon::post_status;
 
 #[cfg(windows)]
 mod imp {
-    use super::*;
+    use super::{AppWindow, Ordering};
     use crate::overlay::{SpellOverlay, TwinBeat, WeaveMode};
     use neuron::rhythm::{DetectorConfig, MotifBuilder, MotifConfig, OnsetDetector, OnsetKind};
     use neuron::twin::{Emergent, Familiar, Judgment, Knockback, TwinConfig};
@@ -144,7 +144,7 @@ mod imp {
     fn cursor() -> (f32, f32) {
         let mut p = POINT { x: 0, y: 0 };
         unsafe {
-            GetCursorPos(&mut p);
+            GetCursorPos(&raw mut p);
         }
         (p.x as f32, p.y as f32)
     }
@@ -278,7 +278,7 @@ mod imp {
         crate::flight::trace(
             "knockback",
             "session enter",
-            ((trigger.page as u64) << 16) | trigger.usage as u64,
+            (u64::from(trigger.page) << 16) | u64::from(trigger.usage),
         );
         loop {
             if super::STOP.load(Ordering::SeqCst) {
@@ -503,7 +503,7 @@ mod imp {
         }
 
         // leaving: stop guarding the trigger, finish any pending phrase, persist the brain.
-        crate::flight::trace("knockback", "session exit", session_exchanges as u64);
+        crate::flight::trace("knockback", "session exit", u64::from(session_exchanges));
         crate::flight::pulse_clear(crate::flight::organ::KNOCKBACK);
         crate::teleport::click_guard::disarm();
         if let Some(m) = builder.flush() {
@@ -702,7 +702,7 @@ mod imp {
                     }
                     if builder.pending_len() > 0 {
                         let since =
-                            t.saturating_sub(p0 + live.last().map(|b| b.t_rel).unwrap_or(0));
+                            t.saturating_sub(p0 + live.last().map_or(0, |b| b.t_rel));
                         seal = 1.0 - (since as f32 / PHRASE_GAP_MS as f32).clamp(0.0, 1.0);
                     }
                 }

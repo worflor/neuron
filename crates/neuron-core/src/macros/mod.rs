@@ -4,8 +4,8 @@
 
 //! The macro engine — the power tier of the spine.
 //!
-//! A Neuron macro is **Python**, run by the [`MacroHost`] — a bundled private CPython kept warm as a
-//! sidecar process. Macros do LITERALLY ANYTHING a program can (real CPython: `ctypes` into raw
+//! A Neuron macro is **Python**, run by the [`MacroHost`] — a bundled private `CPython` kept warm as a
+//! sidecar process. Macros do LITERALLY ANYTHING a program can (real `CPython`: `ctypes` into raw
 //! Win32, `subprocess`, sockets, files — unsandboxed). They're registered once (imports warmed) and
 //! a trigger calls the already-resident function with the captured [`Context`], so dispatch is
 //! warm/real-time and the input thread never spawns or imports. A crashing macro takes down only the
@@ -127,6 +127,7 @@ pub fn spawn_external_path(path: &std::path::Path) -> std::io::Result<Child> {
 
 /// Resolve and run a [`ScriptRef`] — the entry point `Action::Script` delegates to (context-free
 /// convenience; the spine uses [`run_script_ctx`]).
+#[must_use]
 pub fn run_script(script: &ScriptRef) -> String {
     run_script_ctx(script, &Context::capture())
 }
@@ -134,6 +135,7 @@ pub fn run_script(script: &ScriptRef) -> String {
 /// Context-aware dispatch — the spine's path. A [`ScriptKind::Python`] macro is FIRED ASYNC against
 /// the trigger-time `ctx` (never blocking the dispatch thread — the result lands in the macro log);
 /// Shell/File shell out and ignore `ctx`.
+#[must_use]
 pub fn run_script_ctx(script: &ScriptRef, ctx: &Context) -> String {
     match script.kind {
         ScriptKind::Python => macro_host().fire_async(&script.id, ctx),
@@ -144,6 +146,7 @@ pub fn run_script_ctx(script: &ScriptRef, ctx: &Context) -> String {
 
 /// Run a python macro by id and WAIT (bounded) for its result — the GUI "test run" + CLI path.
 /// NEVER call from the input/UI thread.
+#[must_use]
 pub fn test_python_macro(id: &str, ctx: &Context) -> String {
     macro_host().invoke(id, ctx)
 }
@@ -153,6 +156,7 @@ pub fn test_python_macro(id: &str, ctx: &Context) -> String {
 /// Run an inline command line through the OS interpreter (cmd on Windows, sh elsewhere) —
 /// [`ScriptKind::Shell`]. Fire-and-forget; returns a one-line result. Honors the process-spawn arm
 /// gate (disarmed/test/verify => report, spawn nothing) and strips armed authority from the child.
+#[must_use]
 pub fn run_shell(cmd: &str) -> String {
     if !crate::action::process_spawn_armed() {
         return format!("shell `{cmd}` [disarmed]");
@@ -162,6 +166,7 @@ pub fn run_shell(cmd: &str) -> String {
 
 /// Run an external script/executable by path (.ps1/.py/.exe) — [`ScriptKind::File`]. Returns a
 /// one-line result. Arm-gated like the inline shell-out.
+#[must_use]
 pub fn run_external(path: &str) -> String {
     if !crate::action::process_spawn_armed() {
         return format!("launch `{path}` [disarmed]");

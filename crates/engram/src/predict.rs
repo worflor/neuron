@@ -12,8 +12,8 @@
 //!
 //! Same optimization philosophy as fit.rs:
 //! - Vectorize across pairs: inner loop over P pairs, SIMD-friendly
-//! - SoA layout: separate real/imaginary for auto-vectorization
-//! - FMA: mul_add patterns throughout
+//! - `SoA` layout: separate real/imaginary for auto-vectorization
+//! - FMA: `mul_add` patterns throughout
 //! - Zero unnecessary allocation
 
 use num_complex::Complex64;
@@ -22,6 +22,7 @@ use num_complex::Complex64;
 ///
 /// Returns a vector of `length` predicted values.
 #[inline]
+#[must_use]
 pub fn predict_pair(
     seed1: Complex64, // z[n-1] (most recent)
     seed2: Complex64, // z[n-2]
@@ -45,7 +46,7 @@ pub fn predict_pair(
 
 /// Predict P independent AR(2) oscillators forward simultaneously.
 ///
-/// THE SAME ELDRITCH OPTIMIZATION as fit_all: the pair dimension IS
+/// THE SAME ELDRITCH OPTIMIZATION as `fit_all`: the pair dimension IS
 /// the SIMD dimension. Outer loop over time, inner loop over all P pairs.
 ///
 /// Input layout (all length P, contiguous for SIMD):
@@ -53,7 +54,8 @@ pub fn predict_pair(
 ///   seed2[P] — z[n-2] for each pair
 ///   k[P], g[P] — oscillator coefficients
 ///
-/// Output: row-major [length × P] complex, matching fit_all's input format.
+/// Output: row-major [length × P] complex, matching `fit_all`'s input format.
+#[must_use]
 pub fn predict_all(
     seed1: &[Complex64],
     seed2: &[Complex64],
@@ -118,7 +120,7 @@ pub fn predict_all(
 
 /// Predict P oscillators into a pre-allocated output slice.
 ///
-/// Same as predict_all but writes into `out[offset..offset + length*p]`,
+/// Same as `predict_all` but writes into `out[offset..offset + length*p]`,
 /// avoiding allocation. Used by the block encoder for cascaded prediction.
 pub fn predict_all_into(
     seed1: &[Complex64],
@@ -174,6 +176,7 @@ pub fn predict_all_into(
 ///
 /// Each pair spans two adjacent dimensions (re, im). Returns [P] RMS values.
 #[inline]
+#[must_use]
 pub fn compute_pair_rms(residuals: &[f32], length: usize, dim: usize) -> Vec<f32> {
     let p = dim / 2;
     let mut rms = vec![0.0_f64; p];
@@ -181,8 +184,8 @@ pub fn compute_pair_rms(residuals: &[f32], length: usize, dim: usize) -> Vec<f32
     for t in 0..length {
         let row = t * dim;
         for j in 0..p {
-            let re = residuals[row + j * 2] as f64;
-            let im = residuals[row + j * 2 + 1] as f64;
+            let re = f64::from(residuals[row + j * 2]);
+            let im = f64::from(residuals[row + j * 2 + 1]);
             rms[j] = re.mul_add(re, im.mul_add(im, rms[j]));
         }
     }
@@ -196,6 +199,7 @@ pub fn compute_pair_rms(residuals: &[f32], length: usize, dim: usize) -> Vec<f32
 /// D must be even. Adjacent dimensions pair into complex: (d[2i], d[2i+1]) → re + i·im.
 /// This is the coordinate system: even dims are real, odd dims are imaginary.
 #[inline]
+#[must_use]
 pub fn to_complex(data: &[f32], t: usize, dim: usize) -> Vec<Complex64> {
     debug_assert_eq!(dim % 2, 0, "dimension must be even for complex pairing");
     let p = dim / 2;
@@ -205,8 +209,8 @@ pub fn to_complex(data: &[f32], t: usize, dim: usize) -> Vec<Complex64> {
         let base = row * dim;
         for j in 0..p {
             out.push(Complex64::new(
-                data[base + j * 2] as f64,
-                data[base + j * 2 + 1] as f64,
+                f64::from(data[base + j * 2]),
+                f64::from(data[base + j * 2 + 1]),
             ));
         }
     }
@@ -216,8 +220,9 @@ pub fn to_complex(data: &[f32], t: usize, dim: usize) -> Vec<Complex64> {
 
 /// Convert complex pairs [T × P] back to float trajectory [T × D].
 ///
-/// Inverse of to_complex. Interleaves real and imaginary back to [T × D] f32.
+/// Inverse of `to_complex`. Interleaves real and imaginary back to [T × D] f32.
 #[inline]
+#[must_use]
 pub fn from_complex(z: &[Complex64], t: usize, p: usize) -> Vec<f32> {
     let dim = p * 2;
     let mut out = Vec::with_capacity(t * dim);
@@ -237,6 +242,7 @@ pub fn from_complex(z: &[Complex64], t: usize, p: usize) -> Vec<f32> {
 ///
 /// Both inputs are [length × dim] f32. Returns [length × dim] f32 residuals.
 #[inline]
+#[must_use]
 pub fn compute_residuals(actual: &[f32], predicted: &[f32]) -> Vec<f32> {
     debug_assert_eq!(actual.len(), predicted.len());
     actual
@@ -248,10 +254,11 @@ pub fn compute_residuals(actual: &[f32], predicted: &[f32]) -> Vec<f32> {
 
 /// Sum of squared values (energy) in a float slice.
 #[inline]
+#[must_use]
 pub fn energy(data: &[f32]) -> f64 {
     data.iter()
         .map(|&x| {
-            let xd = x as f64;
+            let xd = f64::from(x);
             xd * xd
         })
         .sum()
@@ -304,7 +311,7 @@ mod tests {
         // fit a cosine, then predict — should match the original
         let freq = 2.0 * PI / 10.0;
         let z: Vec<Complex64> = (0..100)
-            .map(|i| Complex64::new((freq * i as f64).cos(), 0.0))
+            .map(|i| Complex64::new((freq * f64::from(i)).cos(), 0.0))
             .collect();
 
         let result = crate::fit::fit_pair(&z);
@@ -312,7 +319,7 @@ mod tests {
 
         for i in 0..98 {
             let err = (pred[i] - z[i + 2]).norm();
-            assert!(err < 0.05, "step {}: error = {}", i, err);
+            assert!(err < 0.05, "step {i}: error = {err}");
         }
     }
 
@@ -341,7 +348,7 @@ mod tests {
             let individual = predict_pair(seed1[j], seed2[j], k[j], g[j], length);
             for n in 0..length {
                 let err = (all[n * p + j] - individual[n]).norm();
-                assert!(err < 1e-12, "pair {} step {}: error = {}", j, n, err);
+                assert!(err < 1e-12, "pair {j} step {n}: error = {err}");
             }
         }
     }
@@ -380,7 +387,7 @@ mod tests {
         assert_eq!(back.len(), data.len());
 
         for (a, b) in data.iter().zip(back.iter()) {
-            assert!((a - b).abs() < 1e-6, "{} != {}", a, b);
+            assert!((a - b).abs() < 1e-6, "{a} != {b}");
         }
     }
 
@@ -396,7 +403,7 @@ mod tests {
         for &r in &rms {
             // each pair sums re² + im² = 1 + 1 = 2 per timestep
             // mean = 2, sqrt(2) ≈ 1.4142
-            assert!((r - std::f32::consts::SQRT_2).abs() < 1e-5, "rms = {}", r);
+            assert!((r - std::f32::consts::SQRT_2).abs() < 1e-5, "rms = {r}");
         }
     }
 
@@ -442,8 +449,7 @@ mod tests {
         }
         assert!(
             max_err < 0.2,
-            "max prediction error = {} (should be small for smooth signal)",
-            max_err
+            "max prediction error = {max_err} (should be small for smooth signal)"
         );
     }
 }

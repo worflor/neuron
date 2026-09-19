@@ -93,7 +93,7 @@ pub enum Action {
     /// **Daemon intent** — set the mouse DPI to an absolute value. Daemon-handled like
     /// [`Action::DpiCycle`] (no device handle at the `Action` layer).
     DpiSet { dpi: u16 },
-    /// **Daemon intent** — request a HyperScroll scroll-wheel stage cycle. The confirmed device
+    /// **Daemon intent** — request a `HyperScroll` scroll-wheel stage cycle. The confirmed device
     /// command is currently set-only (`writes::set_scroll_stage`); there is no active-stage getter,
     /// so resident runtimes must keep an explicit cursor before this can be a true cycle.
     ScrollStageCycle { dir: Direction },
@@ -254,6 +254,7 @@ pub enum ObsOp {
 }
 
 impl ObsOp {
+    #[must_use]
     pub fn label(self) -> &'static str {
         match self {
             ObsOp::Stream => "stream",
@@ -278,12 +279,14 @@ pub enum DialTarget {
 }
 
 impl DialTarget {
+    #[must_use]
     pub fn label(self) -> &'static str {
         match self {
             DialTarget::OutputVolume => "volume",
             DialTarget::MicVolume => "mic",
         }
     }
+    #[must_use]
     pub fn parse(s: &str) -> DialTarget {
         match s.trim().to_lowercase().as_str() {
             "mic" | "mic-volume" | "mic-vol" => DialTarget::MicVolume,
@@ -312,6 +315,7 @@ impl GhostSpeed {
     /// `(base ms per char, jitter scale ms)` — shared with the Python host's `type_ghost`. The
     /// jitter keeps the cadence from being a metronome, and it is a one-sided slow tail (see
     /// [`ghost_type`]), not a symmetric ±.
+    #[must_use]
     pub fn timing(self) -> (u64, u64) {
         match self {
             GhostSpeed::Instant => (0, 0),
@@ -320,6 +324,7 @@ impl GhostSpeed {
             GhostSpeed::Normal => (165, 60),
         }
     }
+    #[must_use]
     pub fn label(self) -> &'static str {
         match self {
             GhostSpeed::Instant => "instant",
@@ -328,6 +333,7 @@ impl GhostSpeed {
             GhostSpeed::Normal => "normal",
         }
     }
+    #[must_use]
     pub fn parse(s: &str) -> GhostSpeed {
         match s.trim().to_lowercase().as_str() {
             "instant" => GhostSpeed::Instant,
@@ -353,6 +359,7 @@ pub enum MomentaryMode {
 }
 
 impl MomentaryMode {
+    #[must_use]
     pub fn label(self) -> &'static str {
         match self {
             MomentaryMode::Flip => "flip",
@@ -360,6 +367,7 @@ impl MomentaryMode {
             MomentaryMode::Mute => "mute",
         }
     }
+    #[must_use]
     pub fn parse(s: &str) -> MomentaryMode {
         match s.trim().to_lowercase().as_str() {
             "talk" | "ptt" | "push-to-talk" => MomentaryMode::Talk,
@@ -368,6 +376,7 @@ impl MomentaryMode {
         }
     }
     /// Given the mic's rest mute-state, the `(while-held, on-release)` mute-states.
+    #[must_use]
     pub fn states(self, rest_muted: bool) -> (bool, bool) {
         match self {
             MomentaryMode::Flip => (!rest_muted, rest_muted),
@@ -391,6 +400,7 @@ pub enum WindowPick {
 }
 
 impl WindowPick {
+    #[must_use]
     pub fn label(self) -> &'static str {
         match self {
             WindowPick::Focused => "focused",
@@ -398,6 +408,7 @@ impl WindowPick {
             WindowPick::Behind => "behind",
         }
     }
+    #[must_use]
     pub fn parse(s: &str) -> WindowPick {
         match s.trim().to_lowercase().as_str() {
             "hover" | "under" | "cursor" => WindowPick::Hover,
@@ -421,6 +432,7 @@ pub enum SummonMode {
 }
 
 impl SummonMode {
+    #[must_use]
     pub fn label(self) -> &'static str {
         match self {
             SummonMode::Focus => "focus",
@@ -428,6 +440,7 @@ impl SummonMode {
             SummonMode::Toggle => "toggle",
         }
     }
+    #[must_use]
     pub fn parse(s: &str) -> SummonMode {
         match s.trim().to_lowercase().as_str() {
             "here" => SummonMode::Here,
@@ -454,12 +467,14 @@ pub enum TetherMode {
 }
 
 impl TetherMode {
+    #[must_use]
     pub fn label(self) -> &'static str {
         match self {
             TetherMode::Mark => "mark",
             TetherMode::Wormhole => "wormhole",
         }
     }
+    #[must_use]
     pub fn parse(s: &str) -> TetherMode {
         match s.trim().to_lowercase().as_str() {
             "wormhole" | "portal" | "swap" => TetherMode::Wormhole,
@@ -487,6 +502,7 @@ pub enum MouseButtonKind {
 
 impl MouseButtonKind {
     /// Short human label.
+    #[must_use]
     pub fn label(self) -> &'static str {
         match self {
             MouseButtonKind::Left => "left-click",
@@ -516,6 +532,7 @@ pub enum MediaKind {
 
 impl MediaKind {
     /// The Windows virtual-key for this transport control.
+    #[must_use]
     pub fn vk(self) -> u16 {
         match self {
             MediaKind::PlayPause => 0xB3,  // VK_MEDIA_PLAY_PAUSE
@@ -528,6 +545,7 @@ impl MediaKind {
         }
     }
     /// Short human label.
+    #[must_use]
     pub fn label(self) -> &'static str {
         match self {
             MediaKind::PlayPause => "play/pause",
@@ -542,6 +560,7 @@ impl MediaKind {
     /// Parse the friendly key-name strings the migration importer emits (`"media-play-pause"`,
     /// `"volume-up"`, …) into a typed `MediaKind`, so a `Key { key: "media-*" }` an older import
     /// produced can be recognized as a media transport key. `None` for a non-media name.
+    #[must_use]
     pub fn from_key_name(name: &str) -> Option<MediaKind> {
         Some(match name {
             "media-play-pause" | "media-play" | "play-pause" => MediaKind::PlayPause,
@@ -566,6 +585,7 @@ pub enum Direction {
 
 impl Direction {
     /// Short human label.
+    #[must_use]
     pub fn label(self) -> &'static str {
         match self {
             Direction::Up => "up",
@@ -573,6 +593,7 @@ impl Direction {
         }
     }
     /// +1 for `Up`, -1 for `Down` — the step the daemon applies to a stage/profile index.
+    #[must_use]
     pub fn step(self) -> i32 {
         match self {
             Direction::Up => 1,
@@ -607,7 +628,7 @@ impl Direction {
 /// carry their full target, so they need no current read.)
 ///
 /// [`ScrollStageCycle`](Intent::ScrollStageCycle) is intentionally still an intent, but it is not
-/// fully applied by the resident runtimes yet: the confirmed HyperScroll command is set-only and
+/// fully applied by the resident runtimes yet: the confirmed `HyperScroll` command is set-only and
 /// the device exposes no active-stage getter, so a correct cycle needs a resident cursor/list first.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Intent {
@@ -616,7 +637,7 @@ pub enum Intent {
     DpiCycle(Direction),
     /// Set DPI to an absolute value (no current read needed — the value is carried).
     DpiSet(u16),
-    /// Request HyperScroll stage cycling. The confirmed write is set-only today, so live runtimes
+    /// Request `HyperScroll` stage cycling. The confirmed write is set-only today, so live runtimes
     /// report this as pending until they own a trustworthy active-stage cursor/list.
     ScrollStageCycle(Direction),
     /// Switch to the named profile (absolute — the target name is carried).
@@ -704,6 +725,7 @@ fn toggle() -> String {
 
 impl Action {
     /// A short human description (for `show`, logs, and a future GUI label).
+    #[must_use]
     pub fn describe(&self) -> String {
         match self {
             Action::Noop => "—".into(),
@@ -803,6 +825,7 @@ impl Action {
     /// returns `None` (it fully runs in [`run_ctx`](Action::run_ctx)). This is the documented
     /// contract between an `Action` and the daemon: *if `intent()` is `Some`, run THAT against live
     /// state; otherwise just call `run_ctx`.*
+    #[must_use]
     pub fn intent(&self) -> Option<Intent> {
         match self {
             Action::DpiCycle { dir } => Some(Intent::DpiCycle(*dir)),
@@ -830,6 +853,7 @@ impl Action {
     /// to repeat — what the daemon needs to drive the held-down autofire loop. `None` for every
     /// non-turbo action. The daemon: on the trigger's *down* edge, fire `action` every
     /// `1000/cps` ms until the *up* edge.
+    #[must_use]
     pub fn turbo(&self) -> Option<(u16, &Action)> {
         match self {
             Action::Turbo { action, cps } => Some((*cps, action)),
@@ -846,6 +870,7 @@ impl Action {
     /// The live dispatcher uses this to skip the expensive [`Context::capture`] (a clipboard open +
     /// foreground-window + process-image probe — a full OS round-trip that contends process-wide) on
     /// the common case where nothing matched needs it. Capture is paid only when a macro will read it.
+    #[must_use]
     pub fn needs_context(&self) -> bool {
         match self {
             Action::Script { .. } => true,
@@ -859,6 +884,7 @@ impl Action {
     /// returns a short result line for logging. Equivalent to [`Action::run_ctx`] against an
     /// empty [`Context`] — kept for callers (the CLI, `bindings.rs`, `cast.rs`) that don't
     /// snapshot the world before firing.
+    #[must_use]
     pub fn run(&self) -> String {
         self.run_ctx(&Context::default())
     }
@@ -872,6 +898,7 @@ impl Action {
     /// macro see a *consistent* snapshot: every step of a `Sequence`, and a `Script`, reason about
     /// the same foreground/clipboard the trigger fired against — and can `restore_foreground()`
     /// the original window after a sub-second in-game macro.
+    #[must_use]
     pub fn run_ctx(&self, ctx: &Context) -> String {
         match self {
             Action::Noop => "noop".into(),
@@ -989,6 +1016,7 @@ fn obs_control(op: ObsOp, arg: &str) -> String {
 
 impl ScriptKind {
     /// Short tag for `describe`/logs.
+    #[must_use]
     pub fn label(&self) -> &'static str {
         match self {
             ScriptKind::Python => "python",
@@ -1093,7 +1121,7 @@ fn run_sequence_sync(steps: &[Step], ctx: &Context) -> String {
             (action, h) => {
                 let _ = action.run_ctx(ctx);
                 if h > 0 {
-                    crate::timing::sleep_precise(Duration::from_millis(h as u64));
+                    crate::timing::sleep_precise(Duration::from_millis(u64::from(h)));
                 }
             }
         }
@@ -1102,7 +1130,7 @@ fn run_sequence_sync(steps: &[Step], ctx: &Context) -> String {
             // scheduler tick, so every inter-step delay under ~16ms silently became ~16ms and a macro
             // written with 2ms spacing ran roughly eight times slower than authored. See `crate::timing`.
             crate::timing::sleep_precise(Duration::from_millis(
-                step.delay_ms.min(STEP_MS_CAP) as u64,
+                u64::from(step.delay_ms.min(STEP_MS_CAP)),
             ));
         }
     }
@@ -1116,7 +1144,7 @@ fn run_sequence_sync(steps: &[Step], ctx: &Context) -> String {
 /// Press a mouse button DOWN, hold `hold_ms`, then release — the mouse analogue of [`hold_key`].
 #[cfg(windows)]
 fn hold_mouse(button: MouseButtonKind, hold_ms: u32) -> String {
-    unsafe { win_mouse::hold(button, hold_ms as u64) };
+    unsafe { win_mouse::hold(button, u64::from(hold_ms)) };
     format!("held mouse {button:?} {hold_ms}ms")
 }
 
@@ -1216,8 +1244,7 @@ fn ghost_type(text: &str, speed: GhostSpeed) {
         ^ (text.len() as u64).wrapping_mul(0x2545_F491_4F6C_DD1D)
         ^ std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_nanos() as u64);
     let mut delay = move || -> u64 {
         if jit == 0 {
             return base;
@@ -1284,7 +1311,7 @@ enum ClipText {
     Busy,
 }
 
-/// The current clipboard as text (CF_UNICODETEXT). Retries the open briefly so a momentary
+/// The current clipboard as text (`CF_UNICODETEXT`). Retries the open briefly so a momentary
 /// contention reads as [`ClipText::Busy`] rather than a false [`ClipText::Empty`].
 #[cfg(windows)]
 fn clipboard_text() -> ClipText {
@@ -1314,7 +1341,7 @@ fn clipboard_text() -> ClipText {
         let out = if h.is_null() {
             ClipText::Empty
         } else {
-            let p = GlobalLock(h as _) as *const u16;
+            let p = GlobalLock(h.cast()) as *const u16;
             if p.is_null() {
                 ClipText::Empty
             } else {
@@ -1323,7 +1350,7 @@ fn clipboard_text() -> ClipText {
                     len += 1;
                 }
                 let s = String::from_utf16_lossy(std::slice::from_raw_parts(p, len));
-                GlobalUnlock(h as _);
+                GlobalUnlock(h.cast());
                 ClipText::Text(s)
             }
         };
@@ -1377,7 +1404,7 @@ fn hold_key(name: &str, hold_ms: u32) -> String {
     }
     // Precise: a "hold W for 2ms" that really holds for 15ms is a different input to a game than the
     // one the macro author wrote. See `crate::timing`.
-    crate::timing::sleep_precise(Duration::from_millis(hold_ms as u64));
+    crate::timing::sleep_precise(Duration::from_millis(u64::from(hold_ms)));
     drop(held); // release in reverse press order (also fires if the sleep above unwinds)
     format!("held [{name}] {hold_ms}ms (vk 0x{vk:02X})")
 }
@@ -1519,6 +1546,7 @@ fn out_mute(_d: Option<&str>, _m: &str) -> String {
 /// digits, F-keys, the nav cluster, numpad, punctuation, side-specific modifiers, media transport —
 /// plus a transparent `0xNN` hex literal so NOTHING a capture can produce is unnameable. The
 /// canonical inverse is [`key_param_for_vk`]; the two round-trip.
+#[must_use]
 pub fn vk_for(name: &str) -> Option<u16> {
     let n = name.trim().to_lowercase();
     if n.len() == 1 {
@@ -1620,6 +1648,7 @@ pub fn vk_for(name: &str) -> Option<u16> {
 /// same code, so press-to-bind capture can write what the engine reads (no friendly-display-name /
 /// config-name mismatch). Total over 1..256: anything without a word name gets the transparent
 /// `0xNN` hex form rather than being unrepresentable.
+#[must_use]
 pub fn key_param_for_vk(vk: u16) -> String {
     match vk {
         v if (0x41..=0x5A).contains(&v) => ((v as u8 as char).to_ascii_lowercase()).to_string(),
@@ -1692,6 +1721,7 @@ pub fn key_param_for_vk(vk: u16) -> String {
 /// DEVICE-SIDE button remap ([`crate::writes::set_mouse_button_key`]). `None` for anything a single
 /// device usage can't express — chords (`"ctrl+s"`), media keys, numpad, or unknown names — so the
 /// caller falls back to host-side dispatch. The inverse of `controls::kbd_usage_name`.
+#[must_use]
 pub fn hid_usage_for_key(key: &str) -> Option<u8> {
     let raw = key.trim();
     if raw.is_empty() || raw.contains('+') {
@@ -1775,6 +1805,7 @@ pub fn hid_usage_for_key(key: &str) -> Option<u8> {
 /// Split a `+`-chord key name into `(modifier VKs, the final key name)`. Only the canonical
 /// modifier names chord (`ctrl`/`shift`/`alt`/`win` and their sided forms) so names that legally
 /// CONTAIN a `+` — `num+`, `=` — never mis-split. A bare modifier name is just a key, not a chord.
+#[must_use]
 pub fn parse_combo(name: &str) -> (Vec<u16>, String) {
     const MODS: &[(&str, u16)] = &[
         ("ctrl", 0x11),
@@ -1838,6 +1869,7 @@ fn press_key(name: &str) -> String {
 /// behaves like the real key (Windows supplies the auto-repeat). Empty result = unknown key (no-op).
 /// (Distinct from the timed `hold_key(name, hold_ms)` above, which is a single press-wait-release.)
 #[cfg(windows)]
+#[must_use]
 pub fn press_and_hold(name: &str) -> Vec<u16> {
     let (mods, key) = parse_combo(name);
     let Some(vk) = vk_for(&key) else {
@@ -2083,6 +2115,7 @@ pub fn arm_input(on: bool) {
 }
 
 /// Whether real keyboard/mouse synthesis is currently permitted (default `false`).
+#[must_use]
 pub fn input_armed() -> bool {
     crate::safety::input_armed()
 }
@@ -2099,6 +2132,7 @@ pub fn input_armed() -> bool {
 /// side-effect. Build-toolchain spawns (rustc/rustup in the compile + verify pipeline) are NOT
 /// routed through here — they are the macro *compiler*, not the macro's runtime behavior, and must
 /// run during verification regardless of arm state.
+#[must_use]
 pub fn process_spawn_armed() -> bool {
     input_armed()
 }
@@ -2145,7 +2179,7 @@ mod win_key {
         if !super::input_armed() {
             return;
         }
-        emit(1, &input);
+        emit(1, &raw const input);
     }
 
     /// Press a key down (no release) — pairs with [`up`] for real held-key macros.
@@ -2169,7 +2203,7 @@ mod win_key {
 
     /// Type ONE character as a Unicode scan-code (down+up per UTF-16 unit) — layout-independent,
     /// so ghost-paste types any glyph regardless of the active keyboard. Surrogate pairs send
-    /// both units. The synthesised events carry KEYEVENTF_UNICODE (wVk = 0).
+    /// both units. The synthesised events carry `KEYEVENTF_UNICODE` (wVk = 0).
     pub unsafe fn unicode(c: char) {
         if !super::input_armed() {
             return;
@@ -2890,7 +2924,7 @@ cmd = "echo hi""#,
         );
     }
 
-    /// The describe() labels for the new variants are human-readable.
+    /// The `describe()` labels for the new variants are human-readable.
     #[test]
     fn new_variants_describe_is_human() {
         assert!(Action::MouseButton {

@@ -78,11 +78,13 @@ impl Cause {
     /// The two `false` arms are the load-bearing ones. A momentary dip is not a preference, and a
     /// reassert writing intent back into `feel_intent` would be a feedback loop that can only
     /// launder drift into truth.
+    #[must_use]
     pub fn is_durable(self) -> bool {
         matches!(self, Cause::UserApplied | Cause::UserCycled)
     }
 
     /// A short, stable label for logs and flight-recorder breadcrumbs.
+    #[must_use]
     pub fn label(self) -> &'static str {
         match self {
             Cause::UserApplied => "user-applied",
@@ -160,6 +162,7 @@ pub fn classify(pid: u16, announced: u16) -> Origin {
 /// `writes::dpi_in_cycle` used to keep the old membership rule testable. Order matters: our own
 /// write is checked first, so a reassert or a sniper dip is recognised as ours even while it
 /// disagrees with durable intent (which, mid-sniper, it is supposed to).
+#[must_use]
 pub fn decide(
     last_write: Option<(u16, Cause)>,
     intent_dpi: Option<u16>,

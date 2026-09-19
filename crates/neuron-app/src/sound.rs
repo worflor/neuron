@@ -10,7 +10,7 @@
 //! with an Acquire load, spawns [`neuron::tone::Voice`]s into a fixed pool, and mixes them per
 //! sample (the same `Voice` an audition WAV uses, so what you heard is what plays). The whole synth
 //! is hand-rolled in `neuron::tone`; cpal is only the device handoff, so this is fully cross-platform
-//! (WASAPI / CoreAudio / ALSA) with no platform code here.
+//! (WASAPI / `CoreAudio` / ALSA) with no platform code here.
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SizedSample};
@@ -33,10 +33,10 @@ struct Shared {
 /// Pack a note into one 64-bit word: freq (f32 bits) | velocity (u8) | timbre id (u8) | delay ms (u16).
 /// A single atomic word means the consumer can never read a half-written note.
 fn pack(freq: f32, vel: f32, tid: u8, delay_ms: u16) -> u64 {
-    (freq.to_bits() as u64)
+    u64::from(freq.to_bits())
         | (((vel.clamp(0.0, 1.0) * 255.0) as u64) << 32)
-        | ((tid as u64) << 40)
-        | ((delay_ms as u64) << 48)
+        | (u64::from(tid) << 40)
+        | (u64::from(delay_ms) << 48)
 }
 
 fn unpack(p: u64) -> (f32, f32, u8, u16) {
@@ -80,7 +80,7 @@ impl SoundEngine {
             }
         }?;
         stream.play().ok()?;
-        crate::flight::trace("audio", "stream open", config.sample_rate.0 as u64);
+        crate::flight::trace("audio", "stream open", u64::from(config.sample_rate.0));
         Some(SoundEngine {
             shared,
             head: 0,
@@ -129,14 +129,14 @@ where
                     tail = tail.wrapping_add(1);
                     if voices.len() < MAX_VOICES {
                         let (freq, vel, tid, delay_ms) = unpack(packed);
-                        let delay = (delay_ms as f32 * sr / 1000.0) as u32;
+                        let delay = (f32::from(delay_ms) * sr / 1000.0) as u32;
                         voices.push(Voice::strike_after(freq, vel, Timbre::by_id(tid), sr, delay));
                     }
                 }
                 let vol = f32::from_bits(shared.volume.load(Ordering::Relaxed));
                 for frame in out.chunks_mut(channels) {
                     let mut s = 0.0f32;
-                    for v in voices.iter_mut() {
+                    for v in &mut voices {
                         s += v.next();
                     }
                     let mono = T::from_sample(soft_clip(s * vol));

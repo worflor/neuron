@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: LicenseRef-WLCSL-1.0
 // See ../LICENSE.md.
 
-//! ByteHistogram: zero-dependency text embedding.
+//! `ByteHistogram`: zero-dependency text embedding.
 //!
 //! Byte frequency histograms over 512-byte windows.
 //! 256 dimensions, one per byte value. No external model needed.
@@ -16,14 +16,16 @@ const MIN_CHUNKS: usize = 4;
 
 /// Convert text (UTF-8 bytes) to a trajectory of byte frequency histograms.
 ///
-/// Returns \[T × 256\] f32 row-major, where T = floor(len / chunk_size).
-/// Returns empty vec if text is too short (< chunk_size * MIN_CHUNKS bytes).
+/// Returns \[T × 256\] f32 row-major, where T = floor(len / `chunk_size`).
+/// Returns empty vec if text is too short (< `chunk_size` * `MIN_CHUNKS` bytes).
+#[must_use]
 pub fn text_to_trajectory(text: &str, chunk_size: usize) -> (Vec<f32>, usize) {
     let data = text.as_bytes();
     bytes_to_trajectory(data, chunk_size)
 }
 
 /// Convert raw bytes to a trajectory of byte frequency histograms.
+#[must_use]
 pub fn bytes_to_trajectory(data: &[u8], chunk_size: usize) -> (Vec<f32>, usize) {
     let cs = if chunk_size == 0 {
         DEFAULT_CHUNK
@@ -61,11 +63,13 @@ pub fn bytes_to_trajectory(data: &[u8], chunk_size: usize) -> (Vec<f32>, usize) 
 }
 
 /// Default chunk size.
+#[must_use]
 pub const fn default_chunk_size() -> usize {
     DEFAULT_CHUNK
 }
 
 /// Embedding dimension (always 256).
+#[must_use]
 pub const fn embedding_dim() -> usize {
     256
 }
@@ -111,7 +115,7 @@ mod tests {
 
         for chunk in 0..t {
             let sum: f32 = (0..256).map(|d| traj[chunk * 256 + d]).sum();
-            assert!((sum - 1.0).abs() < 1e-5, "chunk {} sum = {}", chunk, sum);
+            assert!((sum - 1.0).abs() < 1e-5, "chunk {chunk} sum = {sum}");
         }
     }
 
@@ -131,8 +135,7 @@ mod tests {
         let eng_ascii_mass: f32 = (32..127).map(|d| eng_traj[d]).sum();
         assert!(
             eng_ascii_mass > 0.9,
-            "english ascii mass = {}",
-            eng_ascii_mass
+            "english ascii mass = {eng_ascii_mass}"
         );
 
         // Uniform binary should be flat

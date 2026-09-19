@@ -61,9 +61,11 @@ pub struct Pocket {
 }
 
 impl Pocket {
+    #[must_use]
     pub fn empty() -> Self {
         Self::default()
     }
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.formats.is_empty()
     }
@@ -76,6 +78,7 @@ impl Pocket {
 
     /// A content-typed summary of what's inside, for the GUI to render a live representation of the
     /// data rather than a static label. Pure (no OS calls): derived from the captured bytes.
+    #[must_use]
     pub fn view(&self) -> PocketView {
         if self.is_empty() {
             return PocketView::default();
@@ -150,6 +153,7 @@ impl Pocket {
     /// structure (text / files / images each read as a family) so a glance "quickly communicates
     /// it" while the exact shape is unique to those exact bytes. Pairs with [`PocketView::summary`]
     /// for the legible half. Bundles both via [`Pocket::sigil`].
+    #[must_use]
     pub fn sigil(&self, samples: usize) -> Sigil {
         let v = self.view();
         Sigil {
@@ -164,6 +168,7 @@ impl Pocket {
     /// integration as [`crate::twin::Familiar::sigil_path`]; the *spectrum* is the data's, not the
     /// brain's. Empty pocket → empty path. (Hashes the whole payload, so call it on change, not
     /// per-frame.)
+    #[must_use]
     pub fn sigil_path(&self, samples: usize) -> Vec<(f32, f32)> {
         if self.is_empty() || samples < 2 {
             return Vec::new();
@@ -220,6 +225,7 @@ impl Pocket {
 
     /// The sigil as a standalone hard-light SVG — reuses the spellweaving sigil renderer so a
     /// pocket's fingerprint can be SEEN headlessly (`neuron pocket <name> --sigil out.svg`).
+    #[must_use]
     pub fn sigil_svg(&self, size: f32) -> String {
         crate::scene::sigil_scene(&self.sigil_path(256), size).to_svg()
     }
@@ -237,13 +243,13 @@ pub struct Sigil {
 /// FNV-1a step over a byte run (folds a payload into the sigil seed).
 fn mix(mut h: u64, bytes: &[u8]) -> u64 {
     for &b in bytes {
-        h ^= b as u64;
+        h ^= u64::from(b);
         h = h.wrapping_mul(0x100_0000_01b3);
     }
     h
 }
 
-/// SplitMix64 — a tiny deterministic PRNG for the sigil spectrum (no `rand` dep, matching the
+/// `SplitMix64` — a tiny deterministic PRNG for the sigil spectrum (no `rand` dep, matching the
 /// project's lean ethos and the effects engine's hand-rolled generators).
 struct SplitMix64(u64);
 
@@ -290,6 +296,7 @@ pub struct PocketView {
 }
 
 impl PocketView {
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.kind == PocketKind::Empty
     }
@@ -588,7 +595,7 @@ fn disk_dir() -> PathBuf {
 fn fnv1a(s: &str) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for &byte in s.as_bytes() {
-        h ^= byte as u64;
+        h ^= u64::from(byte);
         h = h.wrapping_mul(0x100000001b3);
     }
     h
@@ -790,12 +797,13 @@ pub mod testclip {
     const CF_UNICODETEXT: u32 = 13;
 
     fn utf16le(s: &str) -> Vec<u8> {
-        let mut b: Vec<u8> = s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        let mut b: Vec<u8> = s.encode_utf16().flat_map(u16::to_le_bytes).collect();
         b.extend_from_slice(&[0, 0]); // NUL terminator
         b
     }
 
-    /// A single-format CF_UNICODETEXT text pocket — for seeding the fake clipboard or a slot.
+    /// A single-format `CF_UNICODETEXT` text pocket — for seeding the fake clipboard or a slot.
+    #[must_use]
     pub fn text_pocket(s: &str) -> Pocket {
         Pocket {
             formats: vec![ClipFormat {
@@ -950,7 +958,7 @@ mod imp {
     }
 
     /// Copy one format's bytes out of its global memory block. Returns None for handle-only formats
-    /// (CF_BITMAP / CF_PALETTE / metafiles) that aren't `GlobalLock`-able.
+    /// (`CF_BITMAP` / `CF_PALETTE` / metafiles) that aren't `GlobalLock`-able.
     unsafe fn snapshot_one(fmt: u32) -> Option<Vec<u8>> {
         // A handful of PREDEFINED clipboard formats hand back a GDI/handle object, NOT an HGLOBAL
         // movable-memory block: CF_BITMAP -> HBITMAP, CF_PALETTE -> HPALETTE, CF_ENHMETAFILE ->
@@ -1005,7 +1013,7 @@ mod imp {
                     GlobalFree(h);
                     continue;
                 }
-                std::ptr::copy_nonoverlapping(f.bytes.as_ptr(), dst as *mut u8, f.bytes.len());
+                std::ptr::copy_nonoverlapping(f.bytes.as_ptr(), dst.cast::<u8>(), f.bytes.len());
                 GlobalUnlock(h);
                 // On success the system OWNS the block; on failure we must free it.
                 if SetClipboardData(f.id, h).is_null() {
@@ -1034,7 +1042,7 @@ mod tests {
     use super::*;
 
     fn utf16le(s: &str) -> Vec<u8> {
-        let mut b: Vec<u8> = s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        let mut b: Vec<u8> = s.encode_utf16().flat_map(u16::to_le_bytes).collect();
         b.extend_from_slice(&[0, 0]); // NUL terminator
         b
     }
@@ -1215,7 +1223,7 @@ mod tests {
         let (to_clip, new_pocket) = (empty.clone(), full.clone());
         assert!(to_clip.is_empty() && !new_pocket.is_empty());
         // restore: live empty, stored full -> clipboard full, pocket empty
-        let (to_clip, new_pocket) = (full.clone(), empty.clone());
+        let (to_clip, new_pocket) = (full, empty);
         assert!(!to_clip.is_empty() && new_pocket.is_empty());
     }
 

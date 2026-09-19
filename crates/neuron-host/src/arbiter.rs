@@ -46,7 +46,7 @@ pub mod band {
     /// app's own base-layer stack today, not as an out-of-app claimant. The
     /// band stays as the designed slot for a future out-of-app ambient source.
     pub const AMBIENT: i32 = 1_000;
-    /// Live protocol sessions: a Chroma game, an OpenRGB client.
+    /// Live protocol sessions: a Chroma game, an `OpenRGB` client.
     pub const SESSION: i32 = 10_000;
     /// Explicit user overrides ("hold this color while I hold the key").
     pub const OVERRIDE: i32 = 100_000;
@@ -109,7 +109,7 @@ impl BlendMode {
     /// with round-to-nearest on the `/255`.
     #[inline]
     fn channel(self, under: u8, over: u8) -> u8 {
-        let (u, o) = (under as u16, over as u16);
+        let (u, o) = (u16::from(under), u16::from(over));
         match self {
             BlendMode::Over => over,
             BlendMode::Add => (u + o).min(255) as u8,
@@ -122,6 +122,7 @@ impl BlendMode {
     /// Apply the mode across all three channels. `Over` short-circuits to `over` so the
     /// overwhelmingly common opaque/fade path does zero per-channel work.
     #[inline]
+    #[must_use]
     pub fn apply(self, under: Rgb, over: Rgb) -> Rgb {
         match self {
             BlendMode::Over => over,
@@ -135,11 +136,13 @@ impl BlendMode {
 
     /// Pack into a single byte, for sharing the live blend policy across threads via an
     /// atomic (see the native-Chroma game layers). Round-trips through [`from_bits`].
+    #[must_use]
     pub fn to_bits(self) -> u8 {
         self as u8
     }
 
     /// Unpack a [`to_bits`] byte; any unknown value falls back to `Over`.
+    #[must_use]
     pub fn from_bits(bits: u8) -> BlendMode {
         match bits {
             1 => BlendMode::Screen,
@@ -553,6 +556,7 @@ pub enum Lease {
 }
 
 impl Lease {
+    #[must_use]
     pub fn heartbeat(ttl: Duration, now: Instant) -> Lease {
         Lease::Heartbeat { ttl, deadline: now + ttl }
     }
@@ -661,6 +665,7 @@ pub struct Arbiter {
 }
 
 impl Arbiter {
+    #[must_use]
     pub fn new() -> Self {
         Arbiter { surfaces: HashMap::new(), next_layer: 1, next_seq: 1 }
     }
@@ -674,6 +679,7 @@ impl Arbiter {
             .or_insert(Surface { leds, layers: Vec::new() });
     }
 
+    #[must_use]
     pub fn surface_leds(&self, key: &str) -> Option<usize> {
         self.surfaces.get(key).map(|s| s.leds)
     }
@@ -726,7 +732,7 @@ impl Arbiter {
 
     /// Explicit release by id.
     pub fn release(&mut self, id: LayerId) -> Option<Released> {
-        for (key, s) in self.surfaces.iter_mut() {
+        for (key, s) in &mut self.surfaces {
             if let Some(pos) = s.layers.iter().position(|l| l.id == id) {
                 let l = s.layers.remove(pos);
                 return Some(Released {
@@ -745,7 +751,7 @@ impl Arbiter {
     /// this once and the source's whole footprint is gone.
     pub fn release_owner(&mut self, owner: SourceId) -> Vec<Released> {
         let mut out = Vec::new();
-        for (key, s) in self.surfaces.iter_mut() {
+        for (key, s) in &mut self.surfaces {
             s.layers.retain(|l| {
                 if l.owner == owner {
                     out.push(Released {
@@ -776,6 +782,7 @@ impl Arbiter {
     /// level from the last resolve — a mid-fade claim can lag the pixels by one tick, but
     /// the endpoints (dormant/invisible vs painting) it must never get wrong are steady
     /// state, and there it agrees with the screen exactly.
+    #[must_use]
     pub fn claims(&self, surface: &str, now: Instant) -> Vec<(SourceId, i32)> {
         let Some(s) = self.surfaces.get(surface) else {
             return Vec::new();
@@ -794,7 +801,7 @@ impl Arbiter {
     /// the lapse is *reported*, never what gets painted.
     pub fn sweep(&mut self, now: Instant) -> Vec<Released> {
         let mut out = Vec::new();
-        for (key, s) in self.surfaces.iter_mut() {
+        for (key, s) in &mut self.surfaces {
             s.layers.retain(|l| {
                 if l.lease.alive(now) {
                     true
@@ -838,7 +845,7 @@ impl Arbiter {
                 match &mut s.layers[idx].content {
                     Content::Fill(c) => {
                         let c = *c;
-                        for cell in frame.iter_mut() {
+                        for cell in &mut frame {
                             *cell = Some(c); // opaque: claims every cell (lower layers gone)
                         }
                         continue;
@@ -877,7 +884,7 @@ impl Arbiter {
 /// every LED every frame) and correct for a fade; a game layer at `a=0.3` shows 30 %
 /// game over 70 % of the user's base.
 fn blend(under: Rgb, over: Rgb, a: f32) -> Rgb {
-    let mix = |u: u8, o: u8| (u as f32 * (1.0 - a) + o as f32 * a + 0.5) as u8;
+    let mix = |u: u8, o: u8| (f32::from(u) * (1.0 - a) + f32::from(o) * a + 0.5) as u8;
     Rgb(mix(under.0, over.0), mix(under.1, over.1), mix(under.2, over.2))
 }
 

@@ -127,6 +127,7 @@ pub struct Service<T> {
 }
 
 impl<T> Service<T> {
+    #[must_use]
     pub const fn new() -> Self {
         Service {
             inner: Mutex::new(None),
@@ -210,16 +211,13 @@ where
 {
     let mut consecutive = 0u32;
     for item in rx {
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(item))) {
-            Ok(()) => consecutive = 0,
-            Err(_) => {
-                // The panic hook already logged the payload+backtrace; escalate here only to
-                // surface a worker STUCK panicking on every item (a deterministic bug), without
-                // spamming a line per command.
-                consecutive += 1;
-                if consecutive == 1 || consecutive.is_multiple_of(16) {
-                    eprintln!("[worker] {name}: item panicked (contained), {consecutive} in a row");
-                }
+        if let Ok(()) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(item))) { consecutive = 0 } else {
+            // The panic hook already logged the payload+backtrace; escalate here only to
+            // surface a worker STUCK panicking on every item (a deterministic bug), without
+            // spamming a line per command.
+            consecutive += 1;
+            if consecutive == 1 || consecutive.is_multiple_of(16) {
+                eprintln!("[worker] {name}: item panicked (contained), {consecutive} in a row");
             }
         }
     }
@@ -392,9 +390,8 @@ mod tests {
         let sink = seen.clone();
         spawn_detached("t-drain", move || {
             drain(rx, "t-drain", move |v| {
-                if v == 2 {
-                    panic!("bad item 2"); // must NOT kill the loop
-                }
+                // must NOT kill the loop
+                assert!(v != 2, "bad item 2");
                 sink.lock().unwrap().push(v);
             });
         });

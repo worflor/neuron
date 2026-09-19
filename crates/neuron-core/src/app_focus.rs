@@ -19,10 +19,12 @@ pub struct AppFocusSwitch {
 }
 
 impl AppFocusSwitch {
+    #[must_use]
     pub fn new() -> Self {
         Self::with_interval(DEFAULT_POLL_INTERVAL)
     }
 
+    #[must_use]
     pub fn with_interval(interval: Duration) -> Self {
         AppFocusSwitch {
             last: None,
@@ -80,7 +82,7 @@ mod tests {
 
     #[test]
     fn cadence_suppresses_early_samples() {
-        let mut switch = AppFocusSwitch::with_interval(Duration::from_secs(60));
+        let mut switch = AppFocusSwitch::with_interval(Duration::from_mins(1));
         assert_eq!(switch.poll_with(|| Some("a.exe".into())), None);
         switch.force_due();
         assert_eq!(

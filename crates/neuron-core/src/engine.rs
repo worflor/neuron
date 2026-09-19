@@ -5,7 +5,7 @@
 //! The unified spine: `Trigger -> Action`.
 //!
 //! The keystone insight of the whole project — bindings, spellweaving (gestures), the radial
-//! menu, app-aware switching, HyperShift layers, the mic tap, AND macros are all the SAME
+//! menu, app-aware switching, `HyperShift` layers, the mic tap, AND macros are all the SAME
 //! primitive: *something happened* ([`Trigger`]) *so do this* ([`crate::action::Action`]). This
 //! module is the one dispatcher they collapse into. `bindings.rs`, `cast.rs` and the run-daemon
 //! are views over this spine; downstream they migrate to producing [`Trigger`]s and registering
@@ -57,8 +57,8 @@ pub enum Trigger {
     AppFocus { app: String },
     /// A physical tap on the Seiren mic (detected via the Core-Audio mute toggle).
     MicTap,
-    /// A held HyperShift / momentary layer is active — the named layer's second-tier bindings
-    /// apply while the trigger is down (the software HyperShift the cast hold-model provides).
+    /// A held `HyperShift` / momentary layer is active — the named layer's second-tier bindings
+    /// apply while the trigger is down (the software `HyperShift` the cast hold-model provides).
     Hold { layer: String },
     /// A spellweaving CAST RHYTHM on the cast trigger — `taps` quick taps then hold (0 = the
     /// plain hold). This makes each weave rhythm a FIRST-CLASS trigger the engine resolves to an
@@ -69,6 +69,7 @@ pub enum Trigger {
 
 impl Trigger {
     /// A short human description (for `show`, logs, and the GUI rule list).
+    #[must_use]
     pub fn describe(&self) -> String {
         match self {
             Trigger::Input { page, usage, pid } => {
@@ -96,11 +97,11 @@ impl Trigger {
 /// One spine entry: when `trigger` fires, run `action`. This is the row the GUI edits and the
 /// importer emits — the entire remap/macro/cast surface is a `Vec<Rule>`.
 ///
-/// ## HyperShift fidelity (`layer`)
-/// A rule may belong to a named **HyperShift layer** rather than the base map. When `layer` is
+/// ## `HyperShift` fidelity (`layer`)
+/// A rule may belong to a named **`HyperShift` layer** rather than the base map. When `layer` is
 /// `Some("sniper")`, this rule only dispatches while that layer is *held* (see [`Engine`]). This
 /// makes an imported held-layer bind FIRST-CLASS: the migration importer tags a Synapse
-/// `IsHyperShift=true` mapping with the layer it belongs to, so a surviving HyperShift rule is no
+/// `IsHyperShift=true` mapping with the layer it belongs to, so a surviving `HyperShift` rule is no
 /// longer emitted indistinguishably from a base rule. `None` = a base-layer rule (the default).
 ///
 /// Serde: `layer` defaults to `None` and is skipped when absent, so every pre-existing serialized
@@ -109,13 +110,14 @@ impl Trigger {
 pub struct Rule {
     pub trigger: Trigger,
     pub action: Action,
-    /// The HyperShift layer this rule belongs to, or `None` for a base-layer rule.
+    /// The `HyperShift` layer this rule belongs to, or `None` for a base-layer rule.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub layer: Option<String>,
 }
 
 impl Rule {
-    /// A base-layer rule (no HyperShift layer).
+    /// A base-layer rule (no `HyperShift` layer).
+    #[must_use]
     pub fn new(trigger: Trigger, action: Action) -> Self {
         Rule {
             trigger,
@@ -123,7 +125,7 @@ impl Rule {
             layer: None,
         }
     }
-    /// A rule that lives on a named HyperShift layer — only dispatches while that layer is held.
+    /// A rule that lives on a named `HyperShift` layer — only dispatches while that layer is held.
     pub fn on_layer(layer: impl Into<String>, trigger: Trigger, action: Action) -> Self {
         Rule {
             trigger,
@@ -131,6 +133,7 @@ impl Rule {
             layer: Some(layer.into()),
         }
     }
+    #[must_use]
     pub fn summary(&self) -> String {
         match &self.layer {
             Some(l) => format!(
@@ -158,14 +161,14 @@ pub struct RuleDoc {
     pub rules: Vec<Rule>,
 }
 
-/// The unified dispatcher. Holds the base [`Rule`] set plus any named **HyperShift layers**
+/// The unified dispatcher. Holds the base [`Rule`] set plus any named **`HyperShift` layers**
 /// (parallel rule sets), and tracks which layers are currently *held*. On a [`Trigger`] it finds
 /// every matching rule — across the base layer and all active held layers — and runs its action.
 /// This replaces the per-subsystem dispatch in `bindings.rs` and `cast.rs`: they become producers
 /// of [`Trigger`]s feeding one `Engine`.
 ///
-/// ## HyperShift (held layers) — the keystone
-/// HyperShift is, in Synapse's own model, a parallel `IsHyperShift=true` binding list: a second
+/// ## `HyperShift` (held layers) — the keystone
+/// `HyperShift` is, in Synapse's own model, a parallel `IsHyperShift=true` binding list: a second
 /// tier of mappings that apply **while a hold key is down**. Neuron's cast hold-model is the same
 /// idea. Here it is first-class: a [`Trigger::Hold { layer }`] press makes the named layer
 /// *active*, and while active that layer's rules are dispatched ON TOP of the base. The same
@@ -180,8 +183,8 @@ pub struct RuleDoc {
 pub struct Engine {
     /// The base rules (order = priority; all matches fire, like the old bindings dispatch).
     pub rules: Vec<Rule>,
-    /// Named HyperShift layers: each is a parallel rule set that applies only while its layer is
-    /// in [`held`](Engine::held). Sorted (BTreeMap) so dispatch order across layers is
+    /// Named `HyperShift` layers: each is a parallel rule set that applies only while its layer is
+    /// in [`held`](Engine::held). Sorted (`BTreeMap`) so dispatch order across layers is
     /// deterministic.
     pub layers: BTreeMap<String, Vec<Rule>>,
     /// Currently-held layer names. A layer's rules dispatch iff its name is in this set.
@@ -207,12 +210,14 @@ pub const SLOT_SIDE_PLATE: &str = "side_plate";
 /// The layer name a seated plate latches, from its registry label ("12-button" -> "plate:12-button").
 /// Data-driven: the labels come from the device def's `[side_plates]` map, so a new plate is a TOML
 /// edit and a bind, never a code change.
+#[must_use]
 pub fn side_plate_layer(label: &str) -> String {
     format!("plate:{label}")
 }
 
 impl Engine {
     /// Build an engine from a base rule set (no layers).
+    #[must_use]
     pub fn new(rules: Vec<Rule>) -> Self {
         Engine {
             rules,
@@ -222,9 +227,9 @@ impl Engine {
         }
     }
 
-    /// Build an engine from a FLAT rule list, grouping rules into the base map vs named HyperShift
+    /// Build an engine from a FLAT rule list, grouping rules into the base map vs named `HyperShift`
     /// layers by each rule's [`Rule::layer`] tag. This is the bridge from the importer / on-disk
-    /// config (a single `Vec<Rule>` where HyperShift membership is carried per-rule) to the
+    /// config (a single `Vec<Rule>` where `HyperShift` membership is carried per-rule) to the
     /// [`Engine`]'s base-plus-layers shape:
     ///
     /// * `layer == None`   -> appended to [`Engine::rules`] (the base map).
@@ -234,6 +239,7 @@ impl Engine {
     /// priority. This reconciles with [`with_layer_rule`](Engine::with_layer_rule): both feed the
     /// same `layers` map, so an engine built `from_rules` behaves identically to one assembled with
     /// the builders. The rules' `layer` tags are retained as-is (the grouping is non-destructive).
+    #[must_use]
     pub fn from_rules(rules: Vec<Rule>) -> Self {
         let mut base = Vec::new();
         let mut layers: BTreeMap<String, Vec<Rule>> = BTreeMap::new();
@@ -254,7 +260,8 @@ impl Engine {
     /// The inverse of [`from_rules`](Engine::from_rules): flatten the base map + all named layers
     /// back into one `Vec<Rule>` (base first, then layers in sorted name order), each rule carrying
     /// its `layer` tag. Lets the GUI/importer round-trip an engine through a flat config list
-    /// without losing HyperShift membership.
+    /// without losing `HyperShift` membership.
+    #[must_use]
     pub fn to_rules(&self) -> Vec<Rule> {
         let mut out: Vec<Rule> = self
             .rules
@@ -274,12 +281,13 @@ impl Engine {
     }
 
     /// Add a base rule (builder-style chaining for setup code).
+    #[must_use]
     pub fn with_rule(mut self, rule: Rule) -> Self {
         self.rules.push(rule);
         self
     }
 
-    /// Add a rule to a named HyperShift layer (builder-style). The layer is created on first use.
+    /// Add a rule to a named `HyperShift` layer (builder-style). The layer is created on first use.
     pub fn with_layer_rule(mut self, layer: impl Into<String>, rule: Rule) -> Self {
         self.layers.entry(layer.into()).or_default().push(rule);
         self
@@ -323,7 +331,7 @@ impl Engine {
     pub fn latch(&mut self, slot: impl Into<String>, layer: Option<String>) -> bool {
         let slot = slot.into();
         let prev = match layer {
-            Some(l) => self.latched.insert(slot, l.clone()).filter(|p| *p == l).is_some(),
+            Some(l) => self.latched.insert(slot, l.clone()).as_ref().is_some_and(|p| *p == l),
             None => self.latched.remove(&slot).is_none(),
         };
         !prev
@@ -344,23 +352,25 @@ impl Engine {
     }
 
     /// Is `layer` currently active — held OR latched?
+    #[must_use]
     pub fn is_active(&self, layer: &str) -> bool {
         self.held.contains(layer) || self.latched.values().any(|l| l == layer)
     }
 
     /// Is this layer currently held?
+    #[must_use]
     pub fn is_held(&self, layer: &str) -> bool {
         self.held.contains(layer)
     }
 
-    /// The set of currently-held layer names (for the GUI/tray "HyperShift active" indicator).
+    /// The set of currently-held layer names (for the GUI/tray "`HyperShift` active" indicator).
     pub fn held_layers(&self) -> impl Iterator<Item = &str> {
         self.held.iter().map(String::as_str)
     }
 
     /// Convenience: drive a [`Trigger::Hold`] edge directly. `down=true` holds the layer,
     /// `down=false` releases it. For any other trigger this is a no-op returning `false`. The
-    /// daemon calls this on the hold key's press/release so HyperShift activation stays in the
+    /// daemon calls this on the hold key's press/release so `HyperShift` activation stays in the
     /// one spine (a `Hold` trigger is both "fire its rule" AND "toggle its layer").
     pub fn drive_hold(&mut self, trigger: &Trigger, down: bool) -> bool {
         if let Trigger::Hold { layer } = trigger {
@@ -387,6 +397,7 @@ impl Engine {
     /// This is the in-place MIGRATION for every rule store at once (gui rules, sidecars,
     /// bindings.toml, imports) — no file rewrite. An unknown pid canonicalizes to itself, so
     /// this stays pure identity for non-registry devices.
+    #[must_use]
     pub fn matches(rule_trigger: &Trigger, fired: &Trigger) -> bool {
         match (rule_trigger, fired) {
             (
@@ -414,11 +425,11 @@ impl Engine {
     }
 
     /// Find every rule whose trigger matches `fired`, across the base layer and all currently-held
-    /// HyperShift layers. Read-only — for previewing what a trigger would do, and the basis of
+    /// `HyperShift` layers. Read-only — for previewing what a trigger would do, and the basis of
     /// [`dispatch`](Engine::dispatch).
     ///
     /// Order is deterministic: HELD layers first (sorted by name), then LATCHED context layers
-    /// (the seated side plate), then the base — so a momentary HyperShift binding outranks a
+    /// (the seated side plate), then the base — so a momentary `HyperShift` binding outranks a
     /// plate-scoped one, which in turn outranks the base binding for the same input. Use
     /// [`resolve_top`](Engine::resolve_top) when only the winning (override) action should fire.
     ///
@@ -444,11 +455,12 @@ impl Engine {
         out
     }
 
-    /// Which named HyperShift layer(s) this trigger ACTIVATES — i.e. layers that contain a rule
+    /// Which named `HyperShift` layer(s) this trigger ACTIVATES — i.e. layers that contain a rule
     /// whose trigger matches `fired`. Unlike [`resolve`](Engine::resolve), this scans every layer
     /// UNCONDITIONALLY (held or not), because it answers "if this input is pressed, which layers
-    /// should become held?" — the daemon's HyperShift hold-edge question. Returns sorted, de-duped
+    /// should become held?" — the daemon's `HyperShift` hold-edge question. Returns sorted, de-duped
     /// layer names.
+    #[must_use]
     pub fn layers_activated_by(&self, fired: &Trigger) -> Vec<String> {
         let mut out: Vec<String> = self
             .layers
@@ -462,9 +474,10 @@ impl Engine {
     }
 
     /// Resolve to the single highest-priority matching rule, if any: a held-layer match wins over
-    /// a base match for the same trigger (true HyperShift *override* semantics — while held, the
+    /// a base match for the same trigger (true `HyperShift` *override* semantics — while held, the
     /// layer's binding replaces the base one rather than firing alongside it). Within the same
     /// tier the first listed rule wins.
+    #[must_use]
     pub fn resolve_top(&self, fired: &Trigger) -> Option<&Rule> {
         self.resolve(fired).into_iter().next()
     }
@@ -479,6 +492,7 @@ impl Engine {
     /// `ctx` lets context-aware actions (a `Script`, a `Sequence` containing one) reason about a
     /// consistent foreground/cwd/clipboard/selection captured when the trigger fired. Returns one
     /// log line per fired rule.
+    #[must_use]
     pub fn dispatch(&self, fired: &Trigger, ctx: &Context) -> Vec<String> {
         let mut log = Vec::new();
         for rule in self.resolve(fired) {
@@ -489,8 +503,9 @@ impl Engine {
     }
 
     /// Dispatch ONLY the winning override rule (see [`resolve_top`](Engine::resolve_top)) — for
-    /// remap-style triggers where a held HyperShift binding should *replace* the base binding, not
+    /// remap-style triggers where a held `HyperShift` binding should *replace* the base binding, not
     /// stack with it. Returns the single log line, or `None` if nothing matched.
+    #[must_use]
     pub fn dispatch_top(&self, fired: &Trigger, ctx: &Context) -> Option<String> {
         let rule = self.resolve_top(fired)?;
         Some(format!(
@@ -504,6 +519,7 @@ impl Engine {
     /// [`Context`] now (foreground app / cwd / clipboard / selection / window-to-restore) so the
     /// fired actions see the moment the trigger occurred. Equivalent to
     /// `self.dispatch(fired, &Context::capture())`.
+    #[must_use]
     pub fn fire(&self, fired: &Trigger) -> Vec<String> {
         self.dispatch(fired, &Context::capture())
     }
@@ -557,14 +573,14 @@ mod latched_context_tests {
     }
 
     /// A held key is an ACT; a seated plate is a STATE. What the user is doing right now outranks
-    /// what merely happens to be true, so a HyperShift bind wins over a plate-scoped one.
+    /// what merely happens to be true, so a `HyperShift` bind wins over a plate-scoped one.
     #[test]
     fn held_layers_outrank_latched_context() {
         let t = Trigger::Input { page: 0xFF1A, usage: 0x20, pid: None };
         let mut e = plate_engine();
         e.layers.entry("sniper".into()).or_default().push(Rule::on_layer(
             "sniper",
-            t.clone(),
+            t,
             Action::Run { cmd: "sniper".into() },
         ));
         e.latch(SLOT_SIDE_PLATE, Some(side_plate_layer("12-button")));
@@ -1055,8 +1071,7 @@ mod tests {
             // The spine threads the ctx into run_ctx, which now hands a long macro to a worker thread
             // (so dispatch never blocks) — it reports "running" with the right step count.
             log[0].contains("running macro (2 steps)"),
-            "macro dispatched through the spine: {:?}",
-            log
+            "macro dispatched through the spine: {log:?}"
         );
     }
 
@@ -1079,8 +1094,7 @@ mod tests {
         assert_eq!(log.len(), 1);
         assert!(
             log[0].contains("[disarmed]"),
-            "spine must not spawn while disarmed: {:?}",
-            log
+            "spine must not spawn while disarmed: {log:?}"
         );
     }
 

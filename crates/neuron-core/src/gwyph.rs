@@ -192,6 +192,7 @@ fn push_varuint(buf: &mut Vec<u8>, v: u32) {
 ///
 /// Points outside `[0,1]` are clamped by the q15 quantizer; normalize to taste before calling
 /// (preserve aspect, and record the transform alongside, if the absolute geometry matters).
+#[must_use]
 pub fn encode_stroke(points: &[[f32; 2]], style: &StrokeStyle) -> Vec<u8> {
     let n = points.len();
 
@@ -200,8 +201,8 @@ pub fn encode_stroke(points: &[[f32; 2]], style: &StrokeStyle) -> Vec<u8> {
         .iter()
         .map(|p| {
             [
-                quant_q15(p[0]) as i32,
-                quant_q15(p[1]) as i32,
+                i32::from(quant_q15(p[0])),
+                i32::from(quant_q15(p[1])),
                 0,
                 0,
                 0,
@@ -262,7 +263,7 @@ mod tests {
         loop {
             let b = d[*off];
             *off += 1;
-            out |= ((b & 0x7f) as u32) << shift;
+            out |= u32::from(b & 0x7f) << shift;
             if b & 0x80 == 0 {
                 break;
             }
@@ -271,7 +272,7 @@ mod tests {
         out
     }
     fn read_u16(d: &[u8], off: &mut usize) -> u16 {
-        let v = (d[*off] as u16) | ((d[*off + 1] as u16) << 8);
+        let v = u16::from(d[*off]) | (u16::from(d[*off + 1]) << 8);
         *off += 2;
         v
     }
@@ -351,15 +352,15 @@ mod tests {
             return Vec::new();
         }
         let mut seed0 = [0i32; 5];
-        for s in seed0.iter_mut() {
-            *s = read_u16(payload, &mut off) as i32;
+        for s in &mut seed0 {
+            *s = i32::from(read_u16(payload, &mut off));
         }
         if n == 1 {
             return vec![seed0];
         }
         let mut seed1 = [0i32; 5];
-        for s in seed1.iter_mut() {
-            *s = read_u16(payload, &mut off) as i32;
+        for s in &mut seed1 {
+            *s = i32::from(read_u16(payload, &mut off));
         }
         if n == 2 {
             return vec![seed0, seed1];
@@ -374,7 +375,7 @@ mod tests {
         let got = decode_file(&file);
         assert_eq!(got.len(), points.len(), "point count");
         for (i, (g, p)) in got.iter().zip(points.iter()).enumerate() {
-            let want = [quant_q15(p[0]) as i32, quant_q15(p[1]) as i32, 0, 0, 0];
+            let want = [i32::from(quant_q15(p[0])), i32::from(quant_q15(p[1])), 0, 0, 0];
             assert_eq!(*g, want, "point {i} mismatch (q15)");
         }
     }
@@ -436,7 +437,7 @@ mod tests {
         // expected q15 points the reference reader should reproduce.
         let q15: Vec<[i32; 2]> = pts
             .iter()
-            .map(|p| [quant_q15(p[0]) as i32, quant_q15(p[1]) as i32])
+            .map(|p| [i32::from(quant_q15(p[0])), i32::from(quant_q15(p[1]))])
             .collect();
         let json: Vec<String> = q15.iter().map(|p| format!("[{},{}]", p[0], p[1])).collect();
         std::fs::write(

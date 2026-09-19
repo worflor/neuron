@@ -16,11 +16,11 @@ use crate::transport::{HidDeviceInfo, Transport};
 use anyhow::{bail, Result};
 use std::time::Duration;
 
-/// Razer's USB vendor id — the razer_report bus signature's first half. Canonical home is here
+/// Razer's USB vendor id — the `razer_report` bus signature's first half. Canonical home is here
 /// (the dialect that owns the signature); `synth.rs` keeps its own copy until the wave-2
 /// consolidation folds direct consumers onto the dialect.
 pub const RAZER_VID: u16 = 0x1532;
-/// The universal razer_report control-pipe signature: a 91-byte feature report. (Same note as
+/// The universal `razer_report` control-pipe signature: a 91-byte feature report. (Same note as
 /// [`RAZER_VID`] — duplicated in `synth.rs` until wave 2.)
 pub const RAZER_FEATURE_LEN: u16 = 91;
 
@@ -45,7 +45,7 @@ pub trait Dialect: Send + Sync {
     /// `claims` — a family that can frame a pipe obviously recognizes it. A dialect OVERRIDES this
     /// to widen to its whole vendor when it recognizes HARDWARE whose pipe SHAPES it cannot (yet)
     /// speak — Razer's audio sidecars enumerate under vid 0x1532 but with 41/64-byte reports, not
-    /// the 91-byte razer_report control pipe. Interested-but-unclaimed pipes feed the UNCLAIMED
+    /// the 91-byte `razer_report` control pipe. Interested-but-unclaimed pipes feed the UNCLAIMED
     /// LEDGER ([`crate::synth::unclaimed_pipes`]): the honest "this IS our vendor's hardware, but
     /// no protocol we speak" surface (the wave-2b failed-adoption row), as opposed to a pipe no
     /// family is even curious about, which is simply not ours.
@@ -108,7 +108,7 @@ pub trait Dialect: Send + Sync {
     /// Release the family's CUSTODY of a device back to firmware — the rest-state restore that
     /// runs at stream teardown and app exit (DIALECT-RND "Device-mode lifecycle"). Per-family
     /// because custody is a per-family concept: razer's driver mode is a LEASE this hook returns
-    /// (device_mode -> 0x00, re-enabling onboard buttons/FN and firmware wake-restore); HID++
+    /// (`device_mode` -> 0x00, re-enabling onboard buttons/FN and firmware wake-restore); HID++
     /// devices are never in our custody (no mode concept — the default no-op IS the correct
     /// release). A dialect that takes custody in exec/streaming MUST override this.
     fn release_custody(&self, t: &dyn Transport, def: &crate::registry::DeviceDef) -> Result<()> {
@@ -156,7 +156,7 @@ pub trait Dialect: Send + Sync {
     }
 }
 
-/// Build the outgoing 91-byte razer_report feature buffer once, in ONE place. Both [`exec`] and
+/// Build the outgoing 91-byte `razer_report` feature buffer once, in ONE place. Both [`exec`] and
 /// [`exec_fast`] frame through here (DIALECT-RND ruling: `send_lighting_fast`'s duplicated
 /// `Report::command → to_buf` build collapses to this). Args past the 80-byte body are dropped,
 /// exactly as `Report::command` + the old per-loop copy did.
@@ -180,7 +180,7 @@ const DEVICE_MODE_CLASS: u8 = 0x00;
 const DEVICE_MODE_SET_ID: u8 = 0x04;
 const DEVICE_MODE_NORMAL: u8 = 0x00;
 
-/// The razer_report family: the 90-byte vendor report, its CRC, and the busy-poll exec discipline.
+/// The `razer_report` family: the 90-byte vendor report, its CRC, and the busy-poll exec discipline.
 /// The only family with hardware on this desk today; every builtin/auto def speaks it.
 pub struct RazerDialect;
 
@@ -193,7 +193,7 @@ impl Dialect for RazerDialect {
         info.vid == RAZER_VID && info.feature_len == RAZER_FEATURE_LEN
     }
 
-    /// The razer_report control-pipe rule: the def's stored `usage_page`/`usage`/`feature_report_len`
+    /// The `razer_report` control-pipe rule: the def's stored `usage_page`/`usage`/`feature_report_len`
     /// triple must equal the enumerated collection's. (This is the exact comparison that used to live
     /// inline in `DeviceDef::matches_control`, moved behind the seam so HID++ can answer differently.)
     fn matches_control(&self, def: &crate::registry::DeviceDef, info: &HidDeviceInfo) -> bool {
@@ -204,7 +204,7 @@ impl Dialect for RazerDialect {
     }
 
     /// Widen to the whole Razer VENDOR: any 0x1532 pipe is Razer hardware even when its report
-    /// shape is not razer_report (the 41-byte USB sound card, the 64-byte Seiren). Those pipes are
+    /// shape is not `razer_report` (the 41-byte USB sound card, the 64-byte Seiren). Those pipes are
     /// interested-but-unclaimed until their own dialects exist — they belong on the unclaimed
     /// ledger, not invisible.
     fn interested(&self, info: &HidDeviceInfo) -> bool {
@@ -212,7 +212,7 @@ impl Dialect for RazerDialect {
     }
 
     /// Delegate to the existing, hardware-proven razer probe. `synthesize` already stamps
-    /// `dialect: "razer"` on the def it emits, so the claiming pass's mistag debug_assert holds.
+    /// `dialect: "razer"` on the def it emits, so the claiming pass's mistag `debug_assert` holds.
     fn probe(
         &self,
         t: &dyn Transport,
@@ -302,10 +302,10 @@ impl Dialect for RazerDialect {
         }
     }
 
-    /// Return the driver-mode LEASE: device_mode -> NORMAL (0x00), re-enabling the board's onboard
+    /// Return the driver-mode LEASE: `device_mode` -> NORMAL (0x00), re-enabling the board's onboard
     /// buttons/FN combos and the firmware's own wake-restore (DIALECT-RND "Device-mode lifecycle").
     /// Framed through this dialect's own `exec` (tx = the def's transaction id), so the bytes are
-    /// razer_report and the ACK is awaited — byte-identical to the raw `writes::set_device_mode(d,
+    /// `razer_report` and the ACK is awaited — byte-identical to the raw `writes::set_device_mode(d,
     /// 0x00)` this REPLACES at teardown, now dialect-routed so a non-razer def can never receive it.
     fn release_custody(&self, t: &dyn Transport, def: &crate::registry::DeviceDef) -> Result<()> {
         self.exec(
@@ -324,16 +324,16 @@ impl Dialect for RazerDialect {
 static RAZER: RazerDialect = RazerDialect;
 
 /// The Consumer-Control usage pair the razer-audio family's control pipe rides (Seiren V3 Mini,
-/// hardware-verified 2026-07-08) — distinct from razer_report's mouse/keyboard vendor placement.
+/// hardware-verified 2026-07-08) — distinct from `razer_report`'s mouse/keyboard vendor placement.
 const AUDIO_USAGE_PAGE: u16 = 0x000C;
 const AUDIO_USAGE: u16 = 0x0001;
-/// The razer-audio family's feature-report length — a 64-byte envelope, not razer_report's 91.
+/// The razer-audio family's feature-report length — a 64-byte envelope, not `razer_report`'s 91.
 const AUDIO_FEATURE_LEN: u16 = 64;
-/// The razer-audio envelope's HID report id (buf[0]) — razer_report's is 0x00.
+/// The razer-audio envelope's HID report id (buf[0]) — `razer_report`'s is 0x00.
 const AUDIO_REPORT_ID: u8 = 0x07;
 /// The razer-audio envelope's total buffer length.
 const AUDIO_BUF_LEN: usize = 64;
-/// The command BODY inside the audio envelope: buf[9..62], 53 bytes (vs razer_report's 80-byte
+/// The command BODY inside the audio envelope: buf[9..62], 53 bytes (vs `razer_report`'s 80-byte
 /// body at buf[9..89]) — buf[62] is CRC, buf[63] is reserved.
 const AUDIO_BODY_LEN: usize = 53;
 /// The transaction id [`RazerAudioDialect::read_audio_mute`] frames its getter with — the same
@@ -343,8 +343,8 @@ const AUDIO_MUTE_READ_TX: u8 = 0x1F;
 
 /// Razer's SECOND wire family (dialect #3): its audio-peripheral control pipe — a 64-byte feature
 /// envelope, HID report id 0x07, on the device's Consumer-Control collection rather than
-/// razer_report's mouse/keyboard vendor placement. Hardware-verified live on a Seiren V3 Mini
-/// (vid 0x1532 pid 0x056A, 2026-07-08): getters class 0x00 id 0x82 (serial) and 0x84 (device_mode)
+/// `razer_report`'s mouse/keyboard vendor placement. Hardware-verified live on a Seiren V3 Mini
+/// (vid 0x1532 pid 0x056A, 2026-07-08): getters class 0x00 id 0x82 (serial) and 0x84 (`device_mode`)
 /// answered Status Success with class/id echoed. CRITICAL finding from that same session: the
 /// device PARROTS Success+echo with all-zero args for ~485 of 512 unknown (class,id) headers — a
 /// probe-synthesized command map from this family is untrustworthy and [`RazerAudioDialect::probe`]
@@ -368,7 +368,7 @@ impl Dialect for RazerAudioDialect {
             && info.feature_len == AUDIO_FEATURE_LEN
     }
 
-    /// The same triple-compare rule razer_report uses (mirrors [`RazerDialect::matches_control`]):
+    /// The same triple-compare rule `razer_report` uses (mirrors [`RazerDialect::matches_control`]):
     /// this family also picks its control pipe by the def's stored `usage_page`/`usage`/
     /// `feature_report_len`, compared against the enumerated collection's.
     fn matches_control(&self, def: &crate::registry::DeviceDef, info: &HidDeviceInfo) -> bool {
@@ -558,11 +558,11 @@ impl Dialect for RazerAudioDialect {
     }
 }
 
-/// Build the razer-audio family's 64-byte request: report id [`AUDIO_REPORT_ID`] (razer_report's is
+/// Build the razer-audio family's 64-byte request: report id [`AUDIO_REPORT_ID`] (`razer_report`'s is
 /// 0x00), the SAME field slots as [`frame`] (status/tx/size/class/id at buf[1]/[2]/[6]/[7]/[8] —
 /// [`reply_status`]'s echo filter reads only those, so it is reused unchanged for this envelope), a
 /// [`AUDIO_BODY_LEN`]-byte arg body at buf[9..62], and CRC = XOR(buf[2..=61]) at buf[62] (buf[63]
-/// reserved). Args past the body are dropped, exactly as [`frame`] drops args past razer_report's
+/// reserved). Args past the body are dropped, exactly as [`frame`] drops args past `razer_report`'s
 /// 80-byte body.
 fn frame_audio(tx: u8, class: u8, id: u8, size: u8, args: &[u8]) -> [u8; AUDIO_BUF_LEN] {
     let mut b = [0u8; AUDIO_BUF_LEN];
@@ -593,8 +593,8 @@ static HIDPP: crate::hidpp::HidppDialect = crate::hidpp::HidppDialect;
 static RAZER_AUDIO: RazerAudioDialect = RazerAudioDialect;
 
 /// The static dialect registry — slice order is claim order (razer first as the proven family, then
-/// razer-audio, then hidpp; razer_report and razer-audio pipes are disjoint shapes on the same VID so
-/// order between them is immaterial for claiming). No lazy_static/once_cell: a `static` slice over
+/// razer-audio, then hidpp; `razer_report` and razer-audio pipes are disjoint shapes on the same VID so
+/// order between them is immaterial for claiming). No `lazy_static/once_cell`: a `static` slice over
 /// the `static` items is a plain const initializer (the `&Dialect → &dyn Dialect` unsizing happens in
 /// const context).
 static DIALECTS: &[&dyn Dialect] = &[&RAZER, &RAZER_AUDIO, &HIDPP];
@@ -604,16 +604,19 @@ static DIALECTS: &[&dyn Dialect] = &[&RAZER, &RAZER_AUDIO, &HIDPP];
 /// registry def's own `event_pipe_matches` says yes; `hidwatch::decode` then resolves the actual
 /// event via the def first (per-device override) and this dialect's `default_event_for` second
 /// (family fallback). `None` when no registered family pushes anything on this shape.
+#[must_use]
 pub fn event_dialect_for(info: &HidDeviceInfo) -> Option<&'static dyn Dialect> {
     dialects().iter().copied().find(|d| d.pushes_events(info))
 }
 
 /// The static dialect registry, in claim order.
+#[must_use]
 pub fn dialects() -> &'static [&'static dyn Dialect] {
     DIALECTS
 }
 
 /// Resolve a dialect by its `DeviceDef.dialect` id. `None` for an id no family claims.
+#[must_use]
 pub fn by_id(id: &str) -> Option<&'static dyn Dialect> {
     dialects().iter().copied().find(|d| d.id() == id)
 }
@@ -621,6 +624,7 @@ pub fn by_id(id: &str) -> Option<&'static dyn Dialect> {
 /// The first dialect that `claims` this pipe (slice order = claim order). `None` when no family
 /// speaks its wire shape. The app's adoption machinery routes on THIS instead of a hardcoded
 /// vendor+report-len test, so a new dialect makes its devices adoptable with zero app changes.
+#[must_use]
 pub fn claimed_by(info: &HidDeviceInfo) -> Option<&'static dyn Dialect> {
     dialects().iter().copied().find(|d| d.claims(info))
 }
@@ -631,9 +635,9 @@ mod tests {
     use crate::transport::DevicePath;
     use std::sync::{Arc, Mutex};
 
-    /// A razer_report device that RECORDS the exact request buffer and replies SUCCESS echoing the
+    /// A `razer_report` device that RECORDS the exact request buffer and replies SUCCESS echoing the
     /// command's class/id — enough to pin the bytes the dialect puts on the wire AND prove the
-    /// reply round-trips back through `reply_status`. Simplified from synth.rs's MockDevice.
+    /// reply round-trips back through `reply_status`. Simplified from synth.rs's `MockDevice`.
     struct RecordingMock {
         last: Mutex<Option<[u8; BUF_LEN]>>,
     }
@@ -776,8 +780,8 @@ mod tests {
         assert!(!RazerDialect.claims(&info(0x046D, 91)), "Logitech VID");
     }
 
-    /// Build a minimal DeviceDef with a given dialect tag + control triple, via TOML (the only
-    /// public constructor). vendor_id 5426 = 0x1532; the rest is inert for matches_control.
+    /// Build a minimal `DeviceDef` with a given dialect tag + control triple, via TOML (the only
+    /// public constructor). `vendor_id` 5426 = 0x1532; the rest is inert for `matches_control`.
     fn def_with(dialect: &str, usage_page: u16, usage: u16, feature_report_len: u16) -> crate::registry::DeviceDef {
         let text = format!(
             "name = \"T\"\ncodename = \"t\"\ndialect = \"{dialect}\"\nvendor_id = 5426\ntransaction_id = 31\n\
@@ -833,7 +837,7 @@ mod tests {
         assert_eq!(by_id("razer").unwrap().id(), "razer");
         // Wave 3 registered hidpp — it resolves and its probe ADOPTS (spec-implemented,
         // hardware-unverified; see the hidpp module's EXPERIMENTAL banner).
-        assert_eq!(by_id("hidpp").map(|d| d.id()), Some("hidpp"));
+        assert_eq!(by_id("hidpp").map(super::Dialect::id), Some("hidpp"));
         assert!(by_id("nope").is_none());
     }
 
@@ -876,7 +880,7 @@ mod tests {
             path: DevicePath::from_str_for_tests("x"),
             product: String::new(),
         };
-        assert_eq!(claimed_by(&info(0x1532, 91)).map(|d| d.id()), Some("razer"));
+        assert_eq!(claimed_by(&info(0x1532, 91)).map(super::Dialect::id), Some("razer"));
         assert!(claimed_by(&info(0x1532, 41)).is_none(), "interested but unclaimed");
         assert!(claimed_by(&info(0x046D, 91)).is_none(), "foreign vendor");
     }
@@ -1043,7 +1047,7 @@ mod tests {
     #[test]
     fn event_dialect_for_resolves_the_pushing_family_only() {
         assert_eq!(
-            event_dialect_for(&audio_pipe(RAZER_VID, 0x000C, 0x0001, 64)).map(|d| d.id()),
+            event_dialect_for(&audio_pipe(RAZER_VID, 0x000C, 0x0001, 64)).map(super::Dialect::id),
             Some("razer-audio")
         );
         assert!(event_dialect_for(&audio_pipe(RAZER_VID, 0x000C, 0x0001, 91)).is_none(), "razer_report's shape pushes nothing family-wide");
@@ -1175,7 +1179,7 @@ mod tests {
         }
 
         fn get_feature(&self, buf: &mut [u8]) -> anyhow::Result<usize> {
-            let (want_class, want_id) = LAST_SENT.with(|c| c.get());
+            let (want_class, want_id) = LAST_SENT.with(std::cell::Cell::get);
             let (cur_class, cur_id) = {
                 let st = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 (st.class, st.id)

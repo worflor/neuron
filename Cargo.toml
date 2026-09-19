@@ -92,3 +92,118 @@ opt-level = 3
 
 [profile.dev.package.neuron]
 opt-level = 3
+
+# ── lints ───────────────────────────────────────────────────────────────────────────────
+# Centralized lint policy — every crate inherits with `lints.workspace = true`.
+# rustc lints enforce correctness and documentation; clippy lints enforce idiomatic,
+# performant, safe code. The pedantic group is warn-by-default with select overrides.
+[workspace.lints.rust]
+# Deny immediately-fatal or unsound patterns.
+# unsafe_code: module-level forbid/deny in neuron-host enforces strict safety.
+# Workspace-level is warn so FFI-heavy crates (neuron-testkit, neuron-core) compile.
+unsafe_code = "warn"
+unused_imports = "deny"
+unused_variables = "deny"
+unused_mut = "deny"
+unused_assignments = "deny"
+unused_parens = "deny"
+unused_braces = "deny"
+arithmetic_overflow = "deny"
+unused_doc_comments = "deny"
+ellipsis_inclusive_range_patterns = "deny"
+unreachable_patterns = "deny"
+non_ascii_idents = "deny"
+keyword_idents_2024 = "allow"  # `gen` is used as an identifier; edition 2021, safe to ignore
+
+# Warn on things that are usually bugs or missed opportunities.
+dead_code = "warn"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+# Start from pedantic (warn, not deny) — false positives get `#[allow]` locally.
+pedantic = { level = "warn", priority = -1 }
+
+# ── deny: patterns that are bugs or security-relevant ──────────────────────────────────
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+dbg_macro = "deny"
+exit = "deny"
+get_unwrap = "deny"
+# indexing_slicing: ~366 violations — promote to deny once bounds checks are added
+indexing_slicing = "allow"
+# integer_division_remainder_used: too aggressive for a math-heavy codebase
+integer_division_remainder_used = "allow"
+
+# ── deny: correctness / suspicious patterns ───────────────────────────────────────────
+eq_op = "deny"
+bool_assert_comparison = "deny"
+match_ref_pats = "deny"
+redundant_closure_for_method_calls = "warn"
+manual_map = "deny"
+manual_is_some_and = "deny"
+needless_borrowed_reference = "deny"
+collapsible_if = "deny"
+collapsible_else_if = "deny"
+match_single_binding = "deny"
+needless_return = "deny"
+useless_format = "deny"
+write_with_newline = "deny"
+uninlined_format_args = "warn"
+
+# ── warn: performance ─────────────────────────────────────────────────────────────────
+trivially_copy_pastable_by_value = "warn"
+redundant_clone = "deny"
+manual_memcpy = "warn"
+manual_str_repeat = "warn"
+needless_collect = "warn"
+items_after_statements = "warn"
+
+# ── warn: style and clarity ──────────────────────────────────────────────────────────
+module_name_repetitions = "allow"  # common in this codebase (e.g. profile::Profile)
+must_use_candidate = "warn"  # promote to deny once existing violations are cleared
+semicolon_if_nothing_returned = "warn"
+if_not_else = "warn"
+match_same_arms = "warn"
+redundant_else = "warn"
+single_match_else = "warn"
+used_underscore_binding = "warn"
+unnested_or_patterns = "warn"
+option_if_let_else = "warn"
+needless_pass_by_value = "warn"
+from_over_into = "deny"
+transmute_ptr_to_ptr = "deny"
+# as_conversions: ~194 violations — promote to deny once existing code uses explicit From/Into
+as_conversions = "allow"
+# cast_*: ~150 violations from pedantic — promote to deny once numeric code uses explicit casts
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+# similar_names: ~35 violations — promote to deny once variable names are disambiguated
+similar_names = "allow"
+# doc lints: promote to deny once doc coverage is complete
+doc_markdown = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+too_many_lines = "allow"
+
+# ── restrict: language features we ban in this codebase ───────────────────────────────
+# These restrict valid Rust to enforce our conventions. Cherry-picked, not the full group.
+enum_glob_use = "deny"
+# implicit_reexports = "deny"  # too noisy with re-exports in mod.rs
+mixed_imports = "deny"
+string_add = "deny"
+string_to_string = "deny"
+try_unwrap = "deny"
+verbose_file_reads = "deny"
+format_push_string = "deny"
+redundant_type_annotations = "warn"
+create_dir = "deny"
+path_ends_with_ext = "deny"
+

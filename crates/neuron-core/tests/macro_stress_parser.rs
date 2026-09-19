@@ -3,7 +3,7 @@
 // Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
 
 //! NON-DESTRUCTIVE stress tests for the macro PARSER + codegen — the two-way bridge between a macro's
-//! Python source and the typed [`MacroNode`] tree (`parse_macro` in the warm CPython sidecar; the
+//! Python source and the typed [`MacroNode`] tree (`parse_macro` in the warm `CPython` sidecar; the
 //! Rust inverse [`nodes_to_source`]). Covers the audit gaps: deep expression/flow nesting, Unicode in
 //! Values, extreme-size sources, the full Python operator set, malformed-input recovery, Raw-node
 //! preservation, idempotent round-trips, concurrent + high-volume parsing, and summarize coverage.
@@ -11,7 +11,7 @@
 //! STRICTLY NON-DESTRUCTIVE: parse-only / codegen-only. No macro is ever EXECUTED, the sidecar runs
 //! with input DISARMED, and the macros dir is isolated to a private temp cwd and cleaned up. The
 //! pure-Rust phases (codegen + summarize) need no sidecar and run unconditionally; the round-trip /
-//! parse-load phases need the bundled CPython and skip cleanly if it can't materialize.
+//! parse-load phases need the bundled `CPython` and skip cleanly if it can't materialize.
 
 use neuron::macros::macro_host::FIRE_BUDGET;
 use neuron::macros::{
@@ -85,7 +85,7 @@ fn deep_nested_expression_codegen_is_safe() {
     eprintln!("[parser pure] deep_nested_expression_codegen_is_safe OK");
 }
 
-/// `summarize_step_label_coverage`: EVERY MacroNode arm produces a non-empty, human label (no arm
+/// `summarize_step_label_coverage`: EVERY `MacroNode` arm produces a non-empty, human label (no arm
 /// falls through to nothing), including empty/minimal Values.
 #[test]
 fn summarize_step_label_coverage() {
@@ -414,7 +414,7 @@ fn rt(host: &MacroHost, nodes: &[MacroNode]) {
     assert_eq!(parsed.as_slice(), nodes, "round-trip mismatch.\nsrc:\n{src}");
 }
 
-/// A left-nested chain of `+` Bins, `depth` deep (the parser yields a left-nested BinOp tree).
+/// A left-nested chain of `+` Bins, `depth` deep (the parser yields a left-nested `BinOp` tree).
 fn nested_bin(depth: usize) -> Value {
     let mut v = s("x");
     for _ in 0..depth {

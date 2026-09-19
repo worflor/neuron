@@ -53,6 +53,7 @@ pub enum Ease {
 
 impl Ease {
     /// Shape a 0..1 factor by this ease. Always returns 0..1.
+    #[must_use]
     pub fn apply(self, x: f32) -> f32 {
         let x = x.clamp(0.0, 1.0);
         match self {
@@ -68,6 +69,7 @@ impl Ease {
         }
     }
 
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Ease::Linear => "linear",
@@ -77,6 +79,7 @@ impl Ease {
     }
 
     /// Parse a tag, defaulting to [`Ease::Linear`] for anything unrecognised.
+    #[must_use]
     pub fn from_str(s: &str) -> Ease {
         match s.to_ascii_lowercase().as_str() {
             "smooth" => Ease::Smooth,
@@ -99,6 +102,7 @@ pub enum Loop {
 }
 
 impl Loop {
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Loop::Once => "once",
@@ -108,6 +112,7 @@ impl Loop {
     }
 
     /// Parse a tag, defaulting to [`Loop::Loop`] for anything unrecognised.
+    #[must_use]
     pub fn from_str(s: &str) -> Loop {
         match s.to_ascii_lowercase().as_str() {
             "once" => Loop::Once,
@@ -131,6 +136,7 @@ pub enum Interp {
 }
 
 impl Interp {
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Interp::Rgb => "rgb",
@@ -139,6 +145,7 @@ impl Interp {
     }
 
     /// Parse a tag, defaulting to [`Interp::Rgb`] for anything unrecognised.
+    #[must_use]
     pub fn from_str(s: &str) -> Interp {
         match s.to_ascii_lowercase().as_str() {
             "hsv" => Interp::Hsv,
@@ -167,6 +174,7 @@ pub enum Motion {
 
 impl Motion {
     /// The stable tag (`"hold"`, `"drift"`, …).
+    #[must_use]
     pub fn kind(&self) -> &'static str {
         match self {
             Motion::Hold => "hold",
@@ -178,6 +186,7 @@ impl Motion {
     }
 
     /// The motion rate (0 for [`Motion::Hold`]).
+    #[must_use]
     pub fn speed(&self) -> f32 {
         match *self {
             Motion::Hold => 0.0,
@@ -191,6 +200,7 @@ impl Motion {
     /// Build a motion from its parts — the data-driven constructor the serde layer and the (phase-3)
     /// motion editor share. Unknown `kind` -> [`Motion::Hold`]; `depth`/`chaos` fall back to a sane
     /// default when the chosen motion needs one.
+    #[must_use]
     pub fn from_parts(kind: &str, speed: f32, depth: Option<f32>, chaos: Option<f32>) -> Motion {
         match kind.to_ascii_lowercase().as_str() {
             "drift" => Motion::Drift { speed },
@@ -218,6 +228,7 @@ pub struct Stop {
 }
 
 impl Stop {
+    #[must_use]
     pub fn new(col: Rgb, at: f32) -> Stop {
         Stop { col, at }
     }
@@ -235,6 +246,7 @@ pub struct Palette {
 
 impl Palette {
     /// A solid single-colour palette (one stop, no motion).
+    #[must_use]
     pub fn solid(c: Rgb) -> Palette {
         Palette {
             stops: vec![Stop::new(c, 0.0)],
@@ -244,6 +256,7 @@ impl Palette {
     }
 
     /// An evenly-spaced static gradient from a colour list (stop `i` sits at `i/(n-1)`).
+    #[must_use]
     pub fn gradient(cols: Vec<Rgb>) -> Palette {
         let n = cols.len();
         let stops = cols
@@ -259,6 +272,7 @@ impl Palette {
     }
 
     /// An arbitrary palette — the stops are sorted on construction so the sampler's bracket scan holds.
+    #[must_use]
     pub fn new(mut stops: Vec<Stop>, motion: Motion) -> Palette {
         stops.sort_by(|a, b| a.at.total_cmp(&b.at));
         Palette {
@@ -272,6 +286,7 @@ impl Palette {
     /// [`Interp`] space. 0 stops -> black; 1 stop -> that colour; `u` below the first / above the last
     /// clamps to the end stop. Cheap: O(stops). RGB interp keeps gradients predictable; HSV interp takes
     /// the shortest hue path for vivid blends. (Hue MOTION over time still lives in [`Motion::Cycle`].)
+    #[must_use]
     pub fn sample(&self, u: f32) -> Rgb {
         let stops = &self.stops;
         match stops.len() {
@@ -301,6 +316,7 @@ impl Palette {
 
     /// Sample the palette at `(t, u)`, applying its [`Motion`]. This is the per-frame colour program:
     /// Drift/Flow shift the lookup `u`; Cycle rotates the sampled hue; Breathe modulates brightness.
+    #[must_use]
     pub fn at(&self, t: f32, u: f32) -> Rgb {
         match self.motion {
             Motion::Hold => self.sample(u),
@@ -377,6 +393,7 @@ pub struct Frame {
 
 impl Frame {
     /// A frame holding `palette` with no crossfade (the single-frame default).
+    #[must_use]
     pub fn new(palette: Palette) -> Frame {
         Frame {
             palette,
@@ -387,6 +404,7 @@ impl Frame {
     }
 
     /// A solid single-colour frame.
+    #[must_use]
     pub fn solid(c: Rgb) -> Frame {
         Frame::new(Palette::solid(c))
     }
@@ -410,6 +428,7 @@ impl Default for Spectrum {
 
 impl Spectrum {
     /// A solid single-colour spectrum.
+    #[must_use]
     pub fn solid(c: Rgb) -> Spectrum {
         Spectrum {
             seq: vec![Frame::solid(c)],
@@ -419,6 +438,7 @@ impl Spectrum {
 
     /// True when this is a single solid colour (one frame, one Hold stop) — the "colour-driven" case a
     /// single-colour override (CLI `--color`, a colour-knob layer) should repaint.
+    #[must_use]
     pub fn is_solid(&self) -> bool {
         self.seq.len() == 1
             && self.seq[0].palette.motion == Motion::Hold
@@ -430,6 +450,7 @@ impl Spectrum {
     /// flat static one. The Synapse importer uses this for single-colour effects so their animation
     /// survives the colour swap — replacing the whole spectrum with `solid(c)` silently dropped the only
     /// motion a breathing layer had.
+    #[must_use]
     pub fn recolored(&self, c: Rgb) -> Spectrum {
         let mut s = self.clone();
         for f in &mut s.seq {
@@ -441,6 +462,7 @@ impl Spectrum {
     }
 
     /// A static evenly-spaced gradient.
+    #[must_use]
     pub fn gradient(cols: Vec<Rgb>) -> Spectrum {
         Spectrum {
             seq: vec![Frame::new(Palette::gradient(cols))],
@@ -449,6 +471,7 @@ impl Spectrum {
     }
 
     /// A single-frame spectrum wrapping an arbitrary palette (stops + motion).
+    #[must_use]
     pub fn from_palette(p: Palette) -> Spectrum {
         Spectrum {
             seq: vec![Frame::new(p)],
@@ -458,6 +481,7 @@ impl Spectrum {
 
     /// A sequenced spectrum (a timeline of frames) under a play policy. An empty `frames` collapses
     /// to a black solid so the sampler always has something to show.
+    #[must_use]
     pub fn sequence(frames: Vec<Frame>, play: Loop) -> Spectrum {
         if frames.is_empty() {
             return Spectrum::solid(Rgb::BLACK);
@@ -468,9 +492,10 @@ impl Spectrum {
     /// Sample the colour at animation time `t` (seconds) for the spectrum coordinate `u` (0..1).
     ///
     /// Resolution: total duration `Σ(hold+fade)` -> a forward position under `play` (Once clamps, Loop
-    /// wraps, PingPong reflects) -> the active frame + the eased crossfade with the previous frame
+    /// wraps, `PingPong` reflects) -> the active frame + the eased crossfade with the previous frame
     /// during its `fade` window -> each frame's palette is sampled WITH its motion at `t` -> the two are
     /// blended by the eased fade factor. Fully N-generic; O(stops) per call.
+    #[must_use]
     pub fn at(&self, t: f32, u: f32) -> Rgb {
         let n = self.seq.len();
         if n == 0 {
@@ -534,6 +559,7 @@ impl Spectrum {
 }
 
 /// A 7-stop full-circle rainbow — a convenient default for spatial patterns (Axis/Radial).
+#[must_use]
 pub fn rainbow() -> Spectrum {
     Spectrum::gradient(vec![
         Rgb::from_hsv(0.0, 1.0, 1.0),
@@ -560,7 +586,7 @@ fn blend_stops(a: Rgb, b: Rgb, f: f32, interp: Interp) -> Rgb {
 /// Decompose an [`Rgb`] into (hue°, saturation 0..1, value 0..1). Hue reuses [`rgb_hue`](crate::effects::rgb_hue)
 /// (which falls back to a stable aurora-green for an achromatic colour, so the short-path stays defined).
 fn rgb_to_hsv(c: Rgb) -> (f32, f32, f32) {
-    let (r, g, b) = (c.r as f32 / 255.0, c.g as f32 / 255.0, c.b as f32 / 255.0);
+    let (r, g, b) = (f32::from(c.r) / 255.0, f32::from(c.g) / 255.0, f32::from(c.b) / 255.0);
     let max = r.max(g).max(b);
     let min = r.min(g).min(b);
     let s = if max <= 0.0 { 0.0 } else { (max - min) / max };
@@ -771,7 +797,7 @@ fn table_to_palette(
         Some(k) => Motion::from_parts(&k, speed.unwrap_or(1.0), depth, chaos),
         None => Motion::Hold,
     };
-    let interp = interp.as_deref().map(Interp::from_str).unwrap_or(Interp::Rgb);
+    let interp = interp.as_deref().map_or(Interp::Rgb, Interp::from_str);
     Ok(Palette { stops, motion, interp })
 }
 
@@ -785,7 +811,7 @@ impl FrameTable {
             self.chaos,
             self.interp,
         )?;
-        let ease = self.ease.as_deref().map(Ease::from_str).unwrap_or(Ease::Linear);
+        let ease = self.ease.as_deref().map_or(Ease::Linear, Ease::from_str);
         Ok(Frame {
             palette,
             hold: self.hold,
@@ -913,9 +939,9 @@ mod tests {
     }
 
     fn approx(a: Rgb, b: Rgb, tol: i32) -> bool {
-        (a.r as i32 - b.r as i32).abs() <= tol
-            && (a.g as i32 - b.g as i32).abs() <= tol
-            && (a.b as i32 - b.b as i32).abs() <= tol
+        (i32::from(a.r) - i32::from(b.r)).abs() <= tol
+            && (i32::from(a.g) - i32::from(b.g)).abs() <= tol
+            && (i32::from(a.b) - i32::from(b.b)).abs() <= tol
     }
 
     // REGRESSION (importer): recolouring a breathing spectrum must keep it BREATHING, not flatten it to a
@@ -976,13 +1002,13 @@ mod tests {
                 },
                 Layer {
                     pattern: "flow".into(),
-                    spectrum: flow.clone(),
+                    spectrum: flow,
                     blend: "add".into(),
                     enabled: true,
                 },
                 Layer {
                     pattern: "seqd".into(),
-                    spectrum: seq.clone(),
+                    spectrum: seq,
                     blend: "screen".into(),
                     enabled: false,
                 },
@@ -1043,13 +1069,13 @@ mod tests {
                 layers: vec![
                     Layer {
                         pattern: "thermal".into(),
-                        spectrum: thermal.clone(),
+                        spectrum: thermal,
                         blend: "screen".into(),
                         enabled: true,
                     },
                     Layer {
                         pattern: "flow".into(),
-                        spectrum: aurora.clone(),
+                        spectrum: aurora,
                         blend: "add".into(),
                         enabled: true,
                     },
@@ -1386,12 +1412,12 @@ mod tests {
             "HSV midpoint of red→blue is vivid magenta, got {mid:?}"
         );
         // saturated, not grey: the channel spread is wide (a grey would have r≈g≈b).
-        let spread = mid.r.max(mid.b) as i32 - mid.g as i32;
+        let spread = i32::from(mid.r.max(mid.b)) - i32::from(mid.g);
         assert!(spread > 200, "magenta is far from grey (spread {spread})");
         // and it's brighter/more vivid than the muddy RGB midpoint (128,0,128).
         let rgb_mid = Palette::gradient(vec![Rgb::new(255, 0, 0), Rgb::new(0, 0, 255)]).sample(0.5);
         assert!(
-            mid.r as i32 + mid.b as i32 > rgb_mid.r as i32 + rgb_mid.b as i32,
+            i32::from(mid.r) + i32::from(mid.b) > i32::from(rgb_mid.r) + i32::from(rgb_mid.b),
             "HSV magenta {mid:?} is more vivid than RGB {rgb_mid:?}"
         );
         // endpoints are still exact in either space.

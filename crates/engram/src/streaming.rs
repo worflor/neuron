@@ -41,6 +41,7 @@ pub struct StreamEncoder {
 
 impl StreamEncoder {
     /// Create a new streaming encoder for dimension D.
+    #[must_use]
     pub fn new(dim: usize) -> Self {
         Self {
             dim,
@@ -57,6 +58,7 @@ impl StreamEncoder {
     }
 
     /// Number of buffered samples.
+    #[must_use]
     pub fn buffered(&self) -> usize {
         self.buf.len() / self.dim
     }
@@ -88,8 +90,8 @@ impl StreamEncoder {
 
             let mut sq = 0.0_f64;
             for d in 0..dim {
-                let pred = 2.0 * prev1[d] as f64 - prev2[d] as f64;
-                let diff = curr[d] as f64 - pred;
+                let pred = 2.0 * f64::from(prev1[d]) - f64::from(prev2[d]);
+                let diff = f64::from(curr[d]) - pred;
                 sq = diff.mul_add(diff, sq);
             }
             let err = sq.sqrt();
@@ -118,8 +120,8 @@ impl StreamEncoder {
 
             let mut sq = 0.0_f64;
             for d in 0..dim {
-                let pred = 2.0 * prev1[d] as f64 - prev2[d] as f64;
-                let diff = curr[d] as f64 - pred;
+                let pred = 2.0 * f64::from(prev1[d]) - f64::from(prev2[d]);
+                let diff = f64::from(curr[d]) - pred;
                 sq = diff.mul_add(diff, sq);
             }
             if sq.sqrt() > self.threshold {
@@ -174,7 +176,7 @@ mod tests {
 
         for i in 0..200 {
             let sample: Vec<f32> = (0..dim)
-                .map(|d| (0.3 * i as f64 + d as f64 * 0.5).sin() as f32)
+                .map(|d| (0.3 * f64::from(i) + d as f64 * 0.5).sin() as f32)
                 .collect();
 
             if let Some(blk) = enc.push(&sample) {
@@ -201,7 +203,7 @@ mod tests {
         // Smooth signal for 80 samples
         for i in 0..80 {
             let sample: Vec<f32> = (0..dim)
-                .map(|d| (0.1 * i as f64 + d as f64 * 0.2).sin() as f32)
+                .map(|d| (0.1 * f64::from(i) + d as f64 * 0.2).sin() as f32)
                 .collect();
             if let Some(blk) = enc.push(&sample) {
                 blocks.push(blk);
@@ -211,7 +213,7 @@ mod tests {
         // Sudden jump
         for i in 80..160 {
             let sample: Vec<f32> = (0..dim)
-                .map(|d| 100.0 + (2.0 * i as f64 + d as f64).cos() as f32)
+                .map(|d| 100.0 + (2.0 * f64::from(i) + d as f64).cos() as f32)
                 .collect();
             if let Some(blk) = enc.push(&sample) {
                 blocks.push(blk);
