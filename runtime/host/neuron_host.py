@@ -160,11 +160,16 @@ def _validate_bound_module(source):
             and isinstance(stmt.value.value, str)
         ):
             continue
-        if isinstance(stmt, (ast.Import, ast.ImportFrom)):
-            names = [a.name.split(".", 1)[0] for a in stmt.names]
-            if isinstance(stmt, ast.ImportFrom) and stmt.module:
-                names.append(stmt.module.split(".", 1)[0])
-            if any(n not in _BOUND_IMPORTS and n != "neuron" for n in names):
+        if isinstance(stmt, ast.Import):
+            roots = [a.name.split(".", 1)[0] for a in stmt.names]
+            if any(root not in _BOUND_IMPORTS and root != "neuron" for root in roots):
+                raise ValueError("module import requires RAW mode")
+            continue
+        if isinstance(stmt, ast.ImportFrom):
+            if stmt.level:
+                raise ValueError("relative imports require RAW mode")
+            root = (stmt.module or "").split(".", 1)[0]
+            if root not in _BOUND_IMPORTS and root != "neuron":
                 raise ValueError("module import requires RAW mode")
             continue
         if isinstance(stmt, ast.Assign):

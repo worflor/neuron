@@ -45,7 +45,7 @@ fn macro_host_warm_persists_and_isolates_errors() {
 
     // A macro that reports the SIDECAR's pid + reads the marshalled context.
     let ok_src =
-        "import os\ndef macro(ctx):\n    return 'pid=%d app=%s' % (os.getpid(), ctx.app)\n";
+        "# neuron: raw\nimport os\ndef macro(ctx):\n    return 'pid=%d app=%s' % (os.getpid(), ctx.app)\n";
     host.register("e2e_ok", ok_src)
         .expect("register clean macro");
 
@@ -84,7 +84,7 @@ fn macro_host_warm_persists_and_isolates_errors() {
     // Error isolation: a raising macro surfaces its error, but the SAME sidecar keeps serving.
     host.register(
         "e2e_boom",
-        "def macro(ctx):\n    raise ValueError('intentional')\n",
+        "# neuron: raw\ndef macro(ctx):\n    raise ValueError('intentional')\n",
     )
     .unwrap();
     let err = host.invoke("e2e_boom", &ctx);

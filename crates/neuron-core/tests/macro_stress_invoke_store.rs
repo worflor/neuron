@@ -417,7 +417,7 @@ fn invoke_store_stress_e2e() {
     .unwrap();
     assert!(host.invoke("store_persist", &ctx).contains("stored"), "first fire stores the survivor");
     // crash the sidecar (its whole reason to exist is to contain this).
-    host.register("store_kill", "import os\ndef macro(ctx):\n    os._exit(1)\n").unwrap();
+    host.register("store_kill", "# neuron: raw\nimport os\ndef macro(ctx):\n    os._exit(1)\n").unwrap();
     let _ = host.fire_async("store_kill", &ctx);
     // the next call respawns + re-registers; the store on disk is intact -> the value is still there.
     let mut loaded = String::new();

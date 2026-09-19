@@ -356,9 +356,9 @@ fn pyruntime_sidecar_stress_e2e() {
     let _ = host.ensure_warm();
 
     // utility macros that survive respawns (in the manifest) — a pid reporter and a hard-crasher.
-    host.register("pr_pid", "import os\ndef macro(ctx):\n    return 'pid=%d' % os.getpid()\n")
+    host.register("pr_pid", "# neuron: raw\nimport os\ndef macro(ctx):\n    return 'pid=%d' % os.getpid()\n")
         .expect("register pr_pid");
-    host.register("pr_boom", "import os\ndef macro(ctx):\n    os._exit(7)\n")
+    host.register("pr_boom", "# neuron: raw\nimport os\ndef macro(ctx):\n    os._exit(7)\n")
         .expect("register pr_boom");
 
     // ── PHASE 1: REGISTER WITH A BAD IMPORT — surfaced as Err, sidecar stays warm ────────────────
@@ -390,7 +390,7 @@ fn pyruntime_sidecar_stress_e2e() {
     {
         host.register(
             "pr_nested",
-            "import ctypes\ndef macro(ctx):\n    import ssl\n    return 'sslctx=%s ctypes=%s' % (ssl.SSLContext.__name__, ctypes.__name__)\n",
+            "# neuron: raw\nimport ctypes\ndef macro(ctx):\n    import ssl\n    return 'sslctx=%s ctypes=%s' % (ssl.SSLContext.__name__, ctypes.__name__)\n",
         )
         .expect("register pr_nested");
         let r = host.invoke("pr_nested", &cx("n"));
@@ -434,7 +434,7 @@ fn pyruntime_sidecar_stress_e2e() {
     {
         let ids: Vec<String> = (0..20).map(|i| format!("pr_cf{i}")).collect();
         for id in &ids {
-            host.register(id, "import os\ndef macro(ctx):\n    notify('cf %s pid=%d' % (ctx.app, os.getpid()))\n")
+            host.register(id, "# neuron: raw\nimport os\ndef macro(ctx):\n    notify('cf %s pid=%d' % (ctx.app, os.getpid()))\n")
                 .unwrap_or_else(|e| panic!("register {id}: {e}"));
         }
         let rx = host.beacon_events();

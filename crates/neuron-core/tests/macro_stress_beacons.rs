@@ -676,7 +676,7 @@ fn beacon_stress_e2e() {
         drop(host.beacon_events());
         host.register(
             "bs_flood",
-            "import os\ndef macro(ctx):\n    return 'pid=%d a=%r' % (os.getpid(), ask('q', timeout=0.05))\n",
+            "# neuron: raw\nimport os\ndef macro(ctx):\n    return 'pid=%d a=%r' % (os.getpid(), ask('q', timeout=0.05))\n",
         )
         .expect("register bs_flood");
         host.drain_log();
@@ -712,7 +712,7 @@ fn beacon_stress_e2e() {
         let _ = recv_ask(&rx, Duration::from_secs(10));
         let _ = recv_ask(&rx, Duration::from_secs(10));
 
-        host.register("bs_crash", "import os\ndef macro(ctx):\n    os._exit(1)\n").unwrap();
+        host.register("bs_crash", "# neuron: raw\nimport os\ndef macro(ctx):\n    os._exit(1)\n").unwrap();
         let _ = host.fire_async("bs_crash", &ctx); // the sidecar dies under it
 
         // the death must surface as a RetireAll.

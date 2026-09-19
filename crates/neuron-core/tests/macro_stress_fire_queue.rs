@@ -57,7 +57,8 @@ const QMAX: usize = 256;
 /// its worker on a beacon `ask` (held until the test answers it) — that's how we freeze a worker so
 /// the queue fills deterministically. Any other fire just notifies its sequence tag + the sidecar pid
 /// (so completions ride the unbounded beacon channel and prove the same warm process served them).
-const HOLDFIRE: &str = r#"import os
+const HOLDFIRE: &str = r#"# neuron: raw
+import os
 def macro(ctx):
     a = ctx.app or ""
     if a.startswith("HOLD"):
@@ -307,9 +308,9 @@ fn fire_queue_stress_e2e() {
     {
         const N: usize = 300;
         host.register("fqc", HOLDFIRE).expect("register fqc");
-        host.register("fqc_pid", "import os\ndef macro(ctx):\n    return 'pid=%d' % os.getpid()\n")
+        host.register("fqc_pid", "# neuron: raw\nimport os\ndef macro(ctx):\n    return 'pid=%d' % os.getpid()\n")
             .expect("register fqc_pid");
-        host.register("fqc_boom", "import os\ndef macro(ctx):\n    os._exit(7)\n").expect("register fqc_boom");
+        host.register("fqc_boom", "# neuron: raw\nimport os\ndef macro(ctx):\n    os._exit(7)\n").expect("register fqc_boom");
         let rx = host.beacon_events();
         host.drain_log();
 
@@ -370,7 +371,7 @@ fn fire_queue_stress_e2e() {
     {
         host.register(
             "fqd",
-            "import os, time\ndef macro(ctx):\n    time.sleep(1.2)\n    notify('slept %s pid=%d' % (ctx.app, os.getpid()))\n",
+            "# neuron: raw\nimport os, time\ndef macro(ctx):\n    time.sleep(1.2)\n    notify('slept %s pid=%d' % (ctx.app, os.getpid()))\n",
         )
         .expect("register fqd");
         let rx = host.beacon_events();

@@ -96,8 +96,11 @@ def macro(ctx):
     assert!(tmp.join("raw_touch.txt").exists(), "RAW file write did not land");
 
     // Same-domain synchronous invocation keeps native Python return values.
-    host.register("bound_num", "def macro(ctx):\n    return 7\n")
-        .expect("register BOUND numeric callee");
+    host.register(
+        "bound_num",
+        "from collections import deque\ndef macro(ctx):\n    return deque([7])[0]\n",
+    )
+    .expect("register BOUND numeric callee with curated from-import");
     host.register(
         "bound_same_domain",
         "def macro(ctx):\n    return neuron.invoke('bound_num') + 1\n",
@@ -188,9 +191,30 @@ def macro(ctx):
         std::thread::sleep(Duration::from_millis(20));
     }
 
+    // Process isolation is structural too: killing RAW must not disturb the warm BOUND interpreter.
+    host.register(
+        "bound_survivor",
+        "COUNT = [0]\ndef macro(ctx):\n    COUNT[0] += 1\n    return COUNT[0]\n",
+    )
+    .expect("register BOUND survivor");
+    assert!(host.invoke("bound_survivor", &ctx).contains("1"));
+    host.register(
+        "raw_crash",
+        "# neuron: raw\nimport os\ndef macro(ctx):\n    os._exit(23)\n",
+    )
+    .expect("register RAW crash");
+    let _ = host.fire_async("raw_crash", &ctx);
+    std::thread::sleep(Duration::from_millis(250));
+    assert!(
+        host.invoke("bound_survivor", &ctx).contains("2"),
+        "RAW process death reset or disturbed the BOUND interpreter"
+    );
+
     for id in [
         "bound_surface",
         "raw_surface",
+        "bound_survivor",
+        "raw_crash",
         "bound_num",
         "bound_same_domain",
         "bound_target",

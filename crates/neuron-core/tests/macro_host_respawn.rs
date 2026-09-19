@@ -61,7 +61,7 @@ fn dead_sidecar_never_blocks_and_the_next_use_heals_it() {
     }
     host.set_armed(false); // read-only macro; no input synthesis needed for this proof
 
-    let src = "import os\ndef macro(ctx):\n    return 'pid=%d app=%s' % (os.getpid(), ctx.app)\n";
+    let src = "# neuron: raw\nimport os\ndef macro(ctx):\n    return 'pid=%d app=%s' % (os.getpid(), ctx.app)\n";
     host.register("respawn_ok", src).expect("register clean macro");
     let ctx = Context::synthetic(Some("e2e.exe".into()), None, None, None, None);
 
@@ -144,7 +144,7 @@ fn dead_sidecar_never_blocks_and_the_next_use_heals_it() {
     let hang_t0 = Instant::now();
     let hung = host.register(
         "respawn_hung",
-        "while True:\n    pass\n\ndef macro(ctx):\n    return 'never'\n",
+        "# neuron: raw\nwhile True:\n    pass\n\ndef macro(ctx):\n    return 'never'\n",
     );
     assert!(hung.is_err(), "hung top-level registration unexpectedly succeeded");
     assert!(

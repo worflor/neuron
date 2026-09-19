@@ -90,11 +90,23 @@ fn act_protocol_stress_e2e() {
     host.set_armed(false); // DISARMED throughout — no real device/audio write can occur.
     let ctx = Context::synthetic(Some("act.exe".into()), None, None, None, None);
 
-    // a pid reporter that survives respawns (in the manifest) — its pid must be IDENTICAL at the end,
-    // proving NO act (unknown verb, malformed arg, forced timeout, concurrency) ever crashed the sidecar.
-    host.register("act_pid", "import os\ndef macro(ctx):\n    return 'pid=%d' % os.getpid()\n")
-        .expect("register act_pid");
-    let pid_start = num_after(&run(host, "act_pid", &ctx), "pid=").expect("warm sidecar pid");
+    // Two liveness canaries, one per interpreter. The RAW pid catches a protocol-side respawn; the
+    // BOUND module counter catches a capability-side respawn without granting BOUND access to os.
+    host.register(
+        "act_pid",
+        "# neuron: raw\nimport os\ndef macro(ctx):\n    return 'pid=%d' % os.getpid()\n",
+    )
+    .expect("register RAW act pid");
+    let pid_start = num_after(&run(host, "act_pid", &ctx), "pid=").expect("warm RAW sidecar pid");
+    host.register(
+        "act_bound_alive",
+        "COUNT = [0]\ndef macro(ctx):\n    COUNT[0] += 1\n    return 'count=%d' % COUNT[0]\n",
+    )
+    .expect("register BOUND liveness canary");
+    assert!(
+        run(host, "act_bound_alive", &ctx).contains("count=1"),
+        "BOUND liveness canary starts at one"
+    );
 
     // ── VERB ROUTING through act -> run_act -> reply (zero hardware access) ───────────────────────
     // Each effectful verb is sent UNGATED with an argument run_act REJECTS before building any device
@@ -102,22 +114,22 @@ fn act_protocol_stress_e2e() {
     // hardware. The unknown verb proves the catch-all error arm. `_act` is the protocol entry point.
     host.register(
         "act_route",
-        "def macro(ctx):\n\
-        \x20   dpi_bad = neuron._act('dpi', 'NaN', gated=False)\n\
-        \x20   bri_bad = neuron._act('brightness', 'NaN', gated=False)\n\
-        \x20   prof_empty = neuron._act('profile', '', gated=False)\n\
-        \x20   unknown = neuron._act('totally_bogus_verb', gated=False)\n\
-        \x20   return 'dpi=[%s] bri=[%s] prof=[%s] unk=[%s]' % (dpi_bad, bri_bad, prof_empty, unknown)\n",
+        "# neuron: raw\ndef macro(ctx):\n\
+        \x20   dpi = neuron._act('dpi', 'NaN', gated=False)\n\
+        \x20   bogus = neuron._act('totally_bogus_verb', gated=False)\n\
+        \x20   sense = neuron._act('active_profile', gated=False)\n\
+        \x20   return 'dpi=[%s] bogus=[%s] sense=[%s]' % (dpi, bogus, sense)\n",
     )
     .unwrap();
     let r = run(host, "act_route", &ctx);
-    assert!(r.contains("dpi(n): n must be a number"), "dpi verb routes to run_act + validates: {r}");
-    assert!(r.contains("brightness(pct): pct must be a number"), "brightness verb routes + validates: {r}");
     assert!(
-        r.contains("profile(name): name must be a non-empty string"),
-        "profile verb routes + validates: {r}"
+        r.contains("dpi=[[disarmed]]") && r.contains("bogus=[[disarmed]]"),
+        "forged effectful/unknown act frames must fail closed at the Rust arm gate: {r}"
     );
-    assert!(r.contains("unknown device verb 'totally_bogus_verb'"), "an unknown verb routes to a clean error: {r}");
+    assert!(
+        !r.contains("sense=[[disarmed]]"),
+        "a read-only act must still reach the host while disarmed: {r}"
+    );
 
     // ── SENSE reads (ungated): documented return SHAPE, device-present OR absent ──────────────────
     // The macro itself type-checks each sense so the assertion is robust on any machine: battery is a
@@ -182,7 +194,7 @@ fn act_protocol_stress_e2e() {
     // never "[disarmed]"). That's the whole gated/ungated distinction in one fire.
     host.register(
         "act_gate_contrast",
-        "def macro(ctx):\n\
+        "# neuron: raw\ndef macro(ctx):\n\
         \x20   w = neuron._act('dpi', 1600, gated=True)\n\
         \x20   r = neuron._act('current_dpi', gated=False)\n\
         \x20   return 'write=[%s] read=[%s]' % (w, r)\n",
@@ -200,19 +212,25 @@ fn act_protocol_stress_e2e() {
     // marker, so a cross-wired rid would surface the WRONG verb in a slot. Each must carry its own.
     host.register(
         "act_rid_seq",
-        "def macro(ctx):\n\
-        \x20   a = neuron._act('rid_alpha', gated=False)\n\
-        \x20   b = neuron._act('rid_bravo', gated=False)\n\
-        \x20   c = neuron._act('rid_charlie', gated=False)\n\
-        \x20   d = neuron._act('rid_delta', gated=False)\n\
+        "# neuron: raw\ndef macro(ctx):\n\
+        \x20   neuron.store('a', 'A')\n\
+        \x20   neuron.store('b', 'B')\n\
+        \x20   neuron.store('c', 'C')\n\
+        \x20   neuron.store('d', 'D')\n\
+        \x20   a = neuron._act('state_load', {'key': 'a'}, gated=False)\n\
+        \x20   b = neuron._act('state_load', {'key': 'b'}, gated=False)\n\
+        \x20   c = neuron._act('state_load', {'key': 'c'}, gated=False)\n\
+        \x20   d = neuron._act('state_load', {'key': 'd'}, gated=False)\n\
         \x20   return 'a=[%s] b=[%s] c=[%s] d=[%s]' % (a, b, c, d)\n",
     )
     .unwrap();
     let r = run(host, "act_rid_seq", &ctx);
-    assert!(r.contains("a=[unknown device verb 'rid_alpha']"), "rid slot a is its own reply: {r}");
-    assert!(r.contains("b=[unknown device verb 'rid_bravo']"), "rid slot b is its own reply: {r}");
-    assert!(r.contains("c=[unknown device verb 'rid_charlie']"), "rid slot c is its own reply: {r}");
-    assert!(r.contains("d=[unknown device verb 'rid_delta']"), "rid slot d is its own reply: {r}");
+    for (slot, value) in [("a", "A"), ("b", "B"), ("c", "C"), ("d", "D")] {
+        assert!(
+            r.contains(&format!("{slot}=[{{\"found\":true,\"value\":\"{value}\"}}]")),
+            "rid slot {slot} received the wrong state reply: {r}"
+        );
+    }
 
     // ── TIMEOUT + LATE REPLY ─────────────────────────────────────────────────────────────────────
     // A forced-zero timeout makes `_act` give up before any reply can possibly round-trip — it returns
@@ -220,17 +238,18 @@ fn act_protocol_stress_e2e() {
     // (the slot was already popped), and the very next act on the same worker still works cleanly.
     host.register(
         "act_timeout",
-        "def macro(ctx):\n\
+        "# neuron: raw\ndef macro(ctx):\n\
+        \x20   neuron.store('after', 'ok')\n\
         \x20   t = neuron._act('active_profile', timeout=0, gated=False)\n\
-        \x20   n = neuron._act('after_timeout_probe', gated=False)\n\
+        \x20   n = neuron._act('state_load', {'key': 'after'}, gated=False)\n\
         \x20   return 'timed=[%s] next=[%s]' % (t, n)\n",
     )
     .unwrap();
     let r = run(host, "act_timeout", &ctx);
     assert!(r.contains("timed=[[timed out]]"), "a reply that can't arrive in time yields a timeout marker, not a hang: {r}");
     assert!(
-        r.contains("next=[unknown device verb 'after_timeout_probe']"),
-        "after a timeout (+ a dropped late reply), the next act still works: {r}"
+        r.contains("next=[{\"found\":true,\"value\":\"ok\"}]"),
+        "after a timeout (+ a dropped late reply), the next act still gets its own response: {r}"
     );
 
     // ── CONCURRENT acts from MANY worker threads don't cross wires ────────────────────────────────
@@ -241,7 +260,9 @@ fn act_protocol_stress_e2e() {
     for tag in tags {
         host.register(
             &format!("act_conc_{tag}"),
-            &format!("def macro(ctx):\n    return neuron._act('conc_{tag}', gated=False)\n"),
+            &format!(
+                "# neuron: raw\ndef macro(ctx):\n    neuron.store('tag', '{tag}')\n    return neuron._act('state_load', {{'key': 'tag'}}, gated=False)\n"
+            ),
         )
         .unwrap();
     }
@@ -259,23 +280,26 @@ fn act_protocol_stress_e2e() {
     for h in handles {
         let (tag, r) = h.join().expect("concurrent act thread joins");
         assert!(
-            r.contains(&format!("unknown device verb 'conc_{tag}'")),
-            "concurrent act for '{tag}' got its OWN reply (no cross-wire): {r}"
+            r.contains(&format!("\"value\":\"{tag}\"")),
+            "concurrent act for '{tag}' got another worker's reply: {r}"
         );
     }
 
-    // ── SIDECAR SURVIVED EVERYTHING ──────────────────────────────────────────────────────────────
-    // No malformed arg, unknown verb, forced timeout, or burst of concurrent acts may crash/respawn
-    // the firewalled sidecar — the pid must be unchanged from the very first fire.
-    let pid_end = num_after(&run(host, "act_pid", &ctx), "pid=").expect("sidecar still warm");
+    // ── BOTH SIDECARS SURVIVED EVERYTHING ─────────────────────────────────────────────────────────
+    let pid_end = num_after(&run(host, "act_pid", &ctx), "pid=").expect("RAW sidecar still warm");
     assert_eq!(
         pid_end, pid_start,
-        "the act protocol must never crash or respawn the sidecar (pid {pid_start} -> {pid_end})"
+        "raw act protocol traffic respawned its sidecar (pid {pid_start} -> {pid_end})"
+    );
+    let bound_end = run(host, "act_bound_alive", &ctx);
+    assert!(
+        bound_end.contains("count=2"),
+        "BOUND helper traffic respawned its sidecar and reset module state: {bound_end}"
     );
 
     // ── teardown ─────────────────────────────────────────────────────────────────────────────────
     let mut ids: Vec<String> = vec![
-        "act_pid", "act_route", "act_senses", "act_gated", "act_gate_contrast", "act_rid_seq",
+        "act_pid", "act_bound_alive", "act_route", "act_senses", "act_gated", "act_gate_contrast", "act_rid_seq",
         "act_timeout",
     ]
     .into_iter()
