@@ -229,8 +229,16 @@ if ($Mode -eq 'full') {
     Invoke-Gate 'ignored: python sidecar death-race' {
         cargo test -p neuron @lock -- --ignored --nocapture death_race
     }
-    Invoke-Gate 'ignored: gwyph reference emitter' {
-        cargo test -p neuron @lock -- --ignored --nocapture emit_sample_for_reference_reader
+    $sampleDir = Join-Path ([IO.Path]::GetTempPath()) 'neuron-validate-gwyph'
+    New-Item -ItemType Directory -Force -Path $sampleDir | Out-Null
+    $previousSampleDir = $env:GWYPH_SAMPLE_DIR
+    try {
+        $env:GWYPH_SAMPLE_DIR = $sampleDir
+        Invoke-Gate 'ignored: gwyph reference emitter' {
+            cargo test -p neuron @lock -- --ignored --nocapture emit_sample_for_reference_reader
+        }
+    } finally {
+        $env:GWYPH_SAMPLE_DIR = $previousSampleDir
     }
 }
 
