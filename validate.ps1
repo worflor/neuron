@@ -158,6 +158,24 @@ if ($Mode -eq 'full') {
         }
     }
 
+    # A running neuron holds a write lock on its own exe, so the release link fails with a
+    # bare LNK1104 that says nothing about why. Anyone who daily-drives neuron hits this the
+    # first time they run the full gate.
+    Invoke-Gate 'release target is writable' {
+        $locked = @()
+        foreach ($exe in @('neuron-app.exe', 'neuron.exe')) {
+            $path = Join-Path (Join-Path $PSScriptRoot 'targetelease') $exe
+            if (-not (Test-Path -LiteralPath $path)) { continue }
+            try { $fs = [IO.File]::Open($path, 'Open', 'ReadWrite', 'None'); $fs.Close() }
+            catch { $locked += $exe }
+        }
+        if ($locked.Count -gt 0) {
+            Write-Host "running, so the release build cannot link over it: $($locked -join ', ')"
+            Write-Host "quit neuron from the tray (or run .elease.ps1, which stops it for you) and rerun."
+        }
+        $global:LASTEXITCODE = [int]($locked.Count -gt 0)
+    }
+
     # The release profile is what ships, and it is a different codegen path (ThinLTO,
     # stripped) with its own way of breaking.
     Invoke-Gate 'release build' { cargo build --workspace --release @scope @lock }

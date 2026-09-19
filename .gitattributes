@@ -1,0 +1,16 @@
+# Every text file is LF in the repository and LF on disk. Without this, a contributor whose
+# git has core.autocrlf=true commits CRLF and every line of the file reads as changed, which
+# buries the real diff. The blobs here are already LF, so this pins what is true rather than
+# converting anything.
+* text=auto eol=lf
+
+# Binary, and never line-ending-converted: chroma_shm.rs does include_bytes! on keystream.bin
+# and the capture fixtures, so a byte rewritten here is a build or test failure.
+*.bin   binary
+*.png   binary
+*.dll   binary
+*.tape  binary
+
+# Generated. Collapsed in review and excluded from language stats.
+Cargo.lock              linguist-generated
+THIRD-PARTY-NOTICES.md  linguist-generated
