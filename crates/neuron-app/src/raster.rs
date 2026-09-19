@@ -206,7 +206,7 @@ impl<'a, T: Copy> RasterBuf<'a, T> {
     /// snapshot argument without borrowing `&mut self` away).
     pub fn as_view(&self) -> RasterView<'_, T> {
         RasterView {
-            px: self.px as *const T,
+            px: self.px.cast_const(),
             w: self.w,
             h: self.h,
             _marker: PhantomData,

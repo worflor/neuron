@@ -244,12 +244,12 @@ fn run(mut my_gen: u64, mut source: String) {
                 publish([0.0; REGIONS], 0.0, false);
                 return;
             }
-            repoint = if st.gen != my_gen {
+            repoint = if st.gen == my_gen {
+                false
+            } else {
                 my_gen = st.gen;
                 source = st.source.clone();
                 true
-            } else {
-                false
             };
         }
         if repoint {
@@ -529,7 +529,7 @@ impl Loudness {
 /// the level at 0 the colour is invisible anyway, and holding avoids a re-entry jump.
 fn analyze(ring: &[f32], rate: u32, dt: f32, st: &mut Loudness) -> Signal {
     let dbs = tilted_band_dbs(ring, rate, &mut st.scratch);
-    let max_db = dbs.iter().cloned().fold(f32::MIN, f32::max);
+    let max_db = dbs.iter().copied().fold(f32::MIN, f32::max);
     let live_signal = max_db >= GATE_DB;
     let dt = dt.max(0.0);
 
@@ -601,12 +601,9 @@ mod imp {
                 self.ctl = self.open_ctl();
             }
             let ctl = self.ctl.as_ref()?;
-            match ctl.read_into(out) {
-                Some(_) => Some(ctl.rate()),
-                None => {
-                    self.ctl = None;
-                    None
-                }
+            if ctl.read_into(out).is_some() { Some(ctl.rate()) } else {
+                self.ctl = None;
+                None
             }
         }
     }

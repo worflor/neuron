@@ -5,7 +5,7 @@
 //! Block decoding: the inverse of encode.
 //!
 //! Reconstructs the trajectory from oscillator parameters + quantized residuals.
-//! decode_block is purely causal: micro seeds come from already-decoded data.
+//! `decode_block` is purely causal: micro seeds come from already-decoded data.
 
 use crate::encode::dequantize;
 use crate::predict::{from_complex, predict_all, to_complex};
@@ -13,6 +13,7 @@ use crate::segment::undo_pairing;
 use crate::types::{Block, MIN_BLOCK, Mode, Packet, SEED_COUNT};
 
 /// Decode a single block back to a trajectory segment \[length × dim\].
+#[must_use]
 pub fn decode_block(block: &Block, dim: usize) -> Vec<f32> {
     let length = block.length;
     let p = dim / 2;
@@ -104,6 +105,7 @@ pub fn decode_block(block: &Block, dim: usize) -> Vec<f32> {
 }
 
 /// Decode a full Packet back to trajectory \[T × D\].
+#[must_use]
 pub fn decode(packet: &Packet) -> Vec<f32> {
     if packet.length == 0 {
         return Vec::new();
@@ -197,8 +199,7 @@ mod tests {
         // With 8-bit quantization, error is bounded
         assert!(
             max_err < 1.0,
-            "max roundtrip error = {} (should be small for smooth signal)",
-            max_err
+            "max roundtrip error = {max_err} (should be small for smooth signal)"
         );
     }
 
@@ -226,7 +227,7 @@ mod tests {
         }
 
         // Linear ramp should be nearly perfect (linear mode)
-        assert!(max_err < 0.5, "ramp roundtrip error = {}", max_err);
+        assert!(max_err < 0.5, "ramp roundtrip error = {max_err}");
     }
 
     #[test]
@@ -243,18 +244,17 @@ mod tests {
             })
             .collect();
 
-        let orig_energy: f64 = w.iter().map(|&x| (x as f64) * (x as f64)).sum();
+        let orig_energy: f64 = w.iter().map(|&x| f64::from(x) * f64::from(x)).sum();
 
         let packet = encode(&w, t, dim, None);
         let decoded = decode(&packet);
-        let dec_energy: f64 = decoded.iter().map(|&x| (x as f64) * (x as f64)).sum();
+        let dec_energy: f64 = decoded.iter().map(|&x| f64::from(x) * f64::from(x)).sum();
 
         // Energy should be within 50% (quantization loses some)
         let ratio = dec_energy / orig_energy;
         assert!(
             ratio > 0.5 && ratio < 2.0,
-            "energy ratio = {} (should be ~1.0)",
-            ratio
+            "energy ratio = {ratio} (should be ~1.0)"
         );
     }
 }

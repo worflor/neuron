@@ -89,7 +89,7 @@ mod imp {
         let first = found[0].1.clone();
         let mut cur = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
         unsafe {
-            windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut cur);
+            windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos(&raw mut cur);
         }
         // Only latch SHOWING once the Show actually went out. If the worker was refused, the
         // overlay never opened, so leaving SHOWING false keeps the NEXT toggle a Show (a retry),
@@ -166,7 +166,7 @@ mod imp {
     }
 
     /// Every visible, titled, non-self window whose title OR exe stem contains the needle —
-    /// frontmost first (EnumWindows walks z-order), capped at 9 (a 3×3 wall of glass is the
+    /// frontmost first (`EnumWindows` walks z-order), capped at 9 (a 3×3 wall of glass is the
     /// honest ceiling for readable tiles).
     fn find_all(needle: &str) -> Vec<Found> {
         use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT};
@@ -189,7 +189,7 @@ mod imp {
                     return 1;
                 }
                 let mut pid = 0u32;
-                GetWindowThreadProcessId(hwnd, &mut pid);
+                GetWindowThreadProcessId(hwnd, &raw mut pid);
                 if pid == s.me {
                     return 1; // never glance at our own surfaces
                 }
@@ -203,7 +203,7 @@ mod imp {
                 let exe = crate::teleport::exe_stem(hwnd as isize);
                 if hay.contains(&s.needle) || (!exe.is_empty() && exe.contains(&s.needle)) {
                     let mut r: RECT = std::mem::zeroed();
-                    if GetWindowRect(hwnd, &mut r) != 0 && r.right - r.left > 40 {
+                    if GetWindowRect(hwnd, &raw mut r) != 0 && r.right - r.left > 40 {
                         s.hits
                             .push((hwnd as isize, title, (r.left, r.top, r.right, r.bottom)));
                     }
@@ -217,7 +217,7 @@ mod imp {
                 me: windows_sys::Win32::System::Threading::GetCurrentProcessId(),
                 hits: Vec::new(),
             };
-            EnumWindows(Some(cb), &mut s as *mut _ as isize);
+            EnumWindows(Some(cb), &raw mut s as isize);
             s.hits
         }
     }
@@ -227,7 +227,7 @@ mod imp {
     static ANCHOR: AtomicU64 = AtomicU64::new(u64::MAX);
 
     fn pack(x: i32, y: i32) -> u64 {
-        ((x as u32 as u64) << 32) | (y as u32 as u64)
+        (u64::from(x as u32) << 32) | u64::from(y as u32)
     }
 
     fn unpack(v: u64) -> Option<(i32, i32)> {
@@ -313,7 +313,7 @@ mod imp {
         rmoved: bool,
         /// you're THROUGH this portal right now (the frame burns as the possession ring)
         possessed: bool,
-        /// last constant alpha blended (avoid redundant UpdateLayeredWindow calls)
+        /// last constant alpha blended (avoid redundant `UpdateLayeredWindow` calls)
         alpha: i32,
         /// collapsed to just the bracket
         collapsed: bool,
@@ -443,7 +443,7 @@ mod imp {
                             }
                             // apply remembered collapse state (the bracket folds to the tile's
                             // corner unless the user parked it somewhere this session)
-                            for t in tiles.iter_mut() {
+                            for t in &mut tiles {
                                 if t.collapsed {
                                     ShowWindow(t.win, SW_HIDE);
                                     if !t.parked {
@@ -459,9 +459,9 @@ mod imp {
                 // pump every tile window
                 for t in &tiles {
                     let mut msg: MSG = std::mem::zeroed();
-                    while PeekMessageW(&mut msg, t.win, 0, 0, PM_REMOVE) != 0 {
-                        TranslateMessage(&msg);
-                        DispatchMessageW(&msg);
+                    while PeekMessageW(&raw mut msg, t.win, 0, 0, PM_REMOVE) != 0 {
+                        TranslateMessage(&raw const msg);
+                        DispatchMessageW(&raw const msg);
                     }
                 }
                 // the per-frame tail — input edges, the possession state machine, tile geometry and
@@ -474,7 +474,7 @@ mod imp {
                 let rmb_edge = rmb && !prev_rmb;
                 let esc = neuron::glyph::key_down(0x1B);
                 let mut cur = POINT { x: 0, y: 0 };
-                GetCursorPos(&mut cur);
+                GetCursorPos(&raw mut cur);
                 let cursor = (cur.x, cur.y);
 
                 // ── STEP IN (a double-click on the glass): possess the source through the portal ──
@@ -682,7 +682,7 @@ mod imp {
                             right: 0,
                             bottom: 0,
                         };
-                        if GetWindowRect(tiles[i].win, &mut r) != 0 {
+                        if GetWindowRect(tiles[i].win, &raw mut r) != 0 {
                             let pos = (r.left, r.top);
                             let dim = ((r.right - r.left).max(1), (r.bottom - r.top).max(1));
                             if dim != tiles[i].size {
@@ -740,7 +740,7 @@ mod imp {
                 // ── keep every frame seated: position/size follow the tile (or the parked mark),
                 // hover/count/collapse changes repaint, proximity fades the collapsed brackets ──
                 let count = tiles.len();
-                for t in tiles.iter_mut() {
+                for t in &mut tiles {
                     sync_frame(t, count, cursor);
                 }
                 // sources that closed take their tiles with them — and their session memory: Windows
@@ -849,9 +849,9 @@ mod imp {
             );
             let ox = (mr.min(tr) - ml.max(tl)).max(0);
             let oy = (mb.min(tb) - mt.max(tt)).max(0);
-            let overlap = ox as i64 * oy as i64;
-            let smaller = (mw as i64 * mh as i64)
-                .min(t.size.0 as i64 * t.size.1 as i64)
+            let overlap = i64::from(ox) * i64::from(oy);
+            let smaller = (i64::from(mw) * i64::from(mh))
+                .min(i64::from(t.size.0) * i64::from(t.size.1))
                 .max(1);
             if overlap * 4 > smaller {
                 return true;
@@ -917,7 +917,7 @@ mod imp {
             lpszClassName: cls.as_ptr(),
         };
         unsafe {
-            RegisterClassW(&wc);
+            RegisterClassW(&raw const wc);
         }
     }
 
@@ -963,7 +963,7 @@ mod imp {
                     let f = frame_of(hwnd);
                     if !f.is_null() {
                         let mut r: RECT = std::mem::zeroed();
-                        if GetWindowRect(hwnd, &mut r) != 0 {
+                        if GetWindowRect(hwnd, &raw mut r) != 0 {
                             SetWindowPos(
                                 f,
                                 HWND_TOPMOST,
@@ -978,10 +978,10 @@ mod imp {
                     DefWindowProcW(hwnd, msg, wparam, lparam)
                 }
                 WM_NCHITTEST => {
-                    let x = (lparam & 0xffff) as i16 as i32;
-                    let y = ((lparam >> 16) & 0xffff) as i16 as i32;
+                    let x = i32::from((lparam & 0xffff) as i16);
+                    let y = i32::from(((lparam >> 16) & 0xffff) as i16);
                     let mut r: RECT = std::mem::zeroed();
-                    GetWindowRect(hwnd, &mut r);
+                    GetWindowRect(hwnd, &raw mut r);
                     let l = x < r.left + M;
                     let rt = x >= r.right - M;
                     let tp = y < r.top + M;
@@ -1003,8 +1003,8 @@ mod imp {
                 // STEP IN: a double-click on the glass — hand the engine the tile + click point; it
                 // owns the mapping (through any crop) and the warp + the way home.
                 WM_LBUTTONDBLCLK => {
-                    let x = (lparam & 0xffff) as i16 as i32;
-                    let y = ((lparam >> 16) & 0xffff) as i16 as i32;
+                    let x = i32::from((lparam & 0xffff) as i16);
+                    let y = i32::from(((lparam >> 16) & 0xffff) as i16);
                     *STEP_IN
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner) =
@@ -1087,7 +1087,7 @@ mod imp {
             SetWindowLongPtrW(win, GWLP_USERDATA, (aspect * 4096.0) as isize);
             ShowWindow(win, SW_SHOWNOACTIVATE);
             let mut thumb: isize = 0;
-            if DwmRegisterThumbnail(win, src as _, &mut thumb) == 0 {
+            if DwmRegisterThumbnail(win, src as _, &raw mut thumb) == 0 {
                 let props = DWM_THUMBNAIL_PROPERTIES {
                     dwFlags: DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE,
                     rcDestination: RECT {
@@ -1106,7 +1106,7 @@ mod imp {
                     fVisible: 1,
                     fSourceClientAreaOnly: 0,
                 };
-                DwmUpdateThumbnailProperties(thumb, &props);
+                DwmUpdateThumbnailProperties(thumb, &raw const props);
             }
             // the FRAME: a per-pixel-alpha layered sibling (hairline + corner bracket). The tile
             // carries its frame's handle as a window prop so the modal drag loop can keep the frame
@@ -1129,7 +1129,7 @@ mod imp {
             );
             if !frame.is_null() {
                 let prop: Vec<u16> = "nframe\0".encode_utf16().collect();
-                SetPropW(win, prop.as_ptr(), frame as _);
+                SetPropW(win, prop.as_ptr(), frame.cast());
                 ShowWindow(frame, SW_SHOWNOACTIVATE);
             }
             Some(Tile {
@@ -1208,7 +1208,7 @@ mod imp {
             fSourceClientAreaOnly: 0,
         };
         unsafe {
-            DwmUpdateThumbnailProperties(t.thumb, &props);
+            DwmUpdateThumbnailProperties(t.thumb, &raw const props);
         }
     }
 
@@ -1220,7 +1220,7 @@ mod imp {
         use windows_sys::Win32::Foundation::RECT;
         use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect;
         let mut r: RECT = unsafe { std::mem::zeroed() };
-        unsafe { GetWindowRect(t.src as _, &mut r) };
+        unsafe { GetWindowRect(t.src as _, &raw mut r) };
         (0, 0, (r.right - r.left).max(1), (r.bottom - r.top).max(1))
     }
 
@@ -1237,15 +1237,15 @@ mod imp {
         };
         unsafe {
             let mut wr: RECT = std::mem::zeroed();
-            if GetWindowRect(t.src as _, &mut wr) == 0 {
+            if GetWindowRect(t.src as _, &raw mut wr) == 0 {
                 return None;
             }
             let (rl, rt, rr, rb) = shown_region(t);
-            let px = rl + ((cx as i64 * (rr - rl).max(1) as i64) / t.size.0.max(1) as i64) as i32;
-            let py = rt + ((cy as i64 * (rb - rt).max(1) as i64) / t.size.1.max(1) as i64) as i32;
+            let px = rl + ((i64::from(cx) * i64::from((rr - rl).max(1))) / i64::from(t.size.0.max(1))) as i32;
+            let py = rt + ((i64::from(cy) * i64::from((rb - rt).max(1))) / i64::from(t.size.1.max(1))) as i32;
             let home = GetAncestor(GetForegroundWindow(), GA_ROOT) as isize;
             let mut c = POINT { x: 0, y: 0 };
-            GetCursorPos(&mut c);
+            GetCursorPos(&raw mut c);
             if IsIconic(t.src as _) != 0 {
                 ShowWindow(t.src as _, SW_RESTORE);
             }
@@ -1301,9 +1301,9 @@ mod imp {
         );
         let (rl, rt, rr, rb) = unsafe { shown_region(t) };
         let map_x =
-            |v: i32| rl + ((v as i64 * (rr - rl).max(1) as i64) / t.size.0.max(1) as i64) as i32;
+            |v: i32| rl + ((i64::from(v) * i64::from((rr - rl).max(1))) / i64::from(t.size.0.max(1))) as i32;
         let map_y =
-            |v: i32| rt + ((v as i64 * (rb - rt).max(1) as i64) / t.size.1.max(1) as i64) as i32;
+            |v: i32| rt + ((i64::from(v) * i64::from((rb - rt).max(1))) / i64::from(t.size.1.max(1))) as i32;
         let (cl, ct, cr, cb) = (map_x(sx0), map_y(sy0), map_x(sx1), map_y(sy1));
         if cr - cl < 24 || cb - ct < 24 {
             return; // a sliver isn't a view — too-small cuts are ignored, not committed
@@ -1325,7 +1325,7 @@ mod imp {
         }
     }
 
-    /// Re-lock a tile's aspect (the WM_SIZING constraint) + re-fit its glass to it (area preserved),
+    /// Re-lock a tile's aspect (the `WM_SIZING` constraint) + re-fit its glass to it (area preserved),
     /// then re-aim the thumbnail. Shared by carve and heal.
     unsafe fn reshape(t: &mut Tile, aspect: f32, mem: &mut Memory) {
         use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -1365,7 +1365,7 @@ mod imp {
                 DestroyWindow(t.frame);
             }
             if !t.fbmp.is_null() {
-                DeleteObject(t.fbmp as _);
+                DeleteObject(t.fbmp.cast());
             }
             if !t.fdc.is_null() {
                 DeleteDC(t.fdc);
@@ -1391,7 +1391,7 @@ mod imp {
             lpszClassName: cls.as_ptr(),
         };
         unsafe {
-            RegisterClassW(&wc);
+            RegisterClassW(&raw const wc);
         }
     }
 
@@ -1411,10 +1411,10 @@ mod imp {
         const HTTRANSPARENT: isize = -1;
         if msg == WM_NCHITTEST {
             unsafe {
-                let x = (lparam & 0xffff) as i16 as i32;
-                let y = ((lparam >> 16) & 0xffff) as i16 as i32;
+                let x = i32::from((lparam & 0xffff) as i16);
+                let y = i32::from(((lparam >> 16) & 0xffff) as i16);
                 let mut r: RECT = std::mem::zeroed();
-                GetWindowRect(hwnd, &mut r);
+                GetWindowRect(hwnd, &raw mut r);
                 return if x < r.left + CORNER && y < r.top + CORNER {
                     HTCLIENT
                 } else {
@@ -1462,7 +1462,7 @@ mod imp {
             use windows_sys::Win32::Foundation::RECT;
             use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect;
             let mut r: RECT = unsafe { std::mem::zeroed() };
-            unsafe { GetWindowRect(t.frame, &mut r) };
+            unsafe { GetWindowRect(t.frame, &raw mut r) };
             (r.left, r.top) != pos
         };
         if dirty {
@@ -1491,7 +1491,7 @@ mod imp {
         unsafe {
             if sz != t.fsize || t.fdc.is_null() {
                 if !t.fbmp.is_null() {
-                    DeleteObject(t.fbmp as _);
+                    DeleteObject(t.fbmp.cast());
                     t.fbmp = std::ptr::null_mut();
                 }
                 if !t.fdc.is_null() {
@@ -1505,7 +1505,7 @@ mod imp {
                     None => return,
                 };
                 t.fdc = dib.dc;
-                t.fbmp = dib.bmp as _;
+                t.fbmp = dib.bmp.cast();
                 t.fsize = sz;
             }
             // resolve the live pixel pointer from the kept bitmap
@@ -1514,12 +1514,12 @@ mod imp {
                 use windows_sys::Win32::Graphics::Gdi::{GetObjectW, BITMAP};
                 let mut bm: BITMAP = std::mem::zeroed();
                 if GetObjectW(
-                    t.fbmp as _,
+                    t.fbmp.cast(),
                     std::mem::size_of::<BITMAP>() as i32,
-                    &mut bm as *mut _ as *mut _,
+                    &raw mut bm as *mut _,
                 ) != 0
                 {
-                    bits = bm.bmBits as *mut u32;
+                    bits = bm.bmBits.cast::<u32>();
                 }
             }
             if bits.is_null() {
@@ -1583,8 +1583,8 @@ mod imp {
         }
     }
 
-    /// Position + size + blend the frame in ONE UpdateLayeredWindow call (atomic on screen) — via
-    /// the shared `surface::present_dc` seam (the one BLENDFUNCTION, AC_SRC_OVER + AC_SRC_ALPHA).
+    /// Position + size + blend the frame in ONE `UpdateLayeredWindow` call (atomic on screen) — via
+    /// the shared `surface::present_dc` seam (the one BLENDFUNCTION, `AC_SRC_OVER` + `AC_SRC_ALPHA`).
     unsafe fn blend_frame(t: &Tile, pos: (i32, i32), sz: (i32, i32), alpha: u8) {
         use windows_sys::Win32::Foundation::POINT;
         use windows_sys::Win32::Graphics::Gdi::{GetDC, ReleaseDC};

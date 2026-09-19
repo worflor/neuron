@@ -45,6 +45,7 @@ pub enum Weave {
 }
 
 impl Weave {
+    #[must_use]
     pub fn label(self) -> &'static str {
         match self {
             Weave::Radial => "radial (simple)",

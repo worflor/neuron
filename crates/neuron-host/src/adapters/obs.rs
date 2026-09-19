@@ -75,7 +75,7 @@ pub struct Step {
 pub struct ObsClient {
     password: String,
     pub identified: bool,
-    /// Monotonic request-id source (echoed in RequestResponse; we don't yet
+    /// Monotonic request-id source (echoed in `RequestResponse`; we don't yet
     /// correlate responses, but a stable id is protocol-correct).
     next_req: u64,
 }
@@ -146,7 +146,7 @@ impl ObsClient {
         Step { send: vec![identify], ..Default::default() }
     }
 
-    /// Map a RequestResponse (op 7) to an event, for the resync trio. A failed
+    /// Map a `RequestResponse` (op 7) to an event, for the resync trio. A failed
     /// request carries no `responseData`, so every getter yields None → inert.
     fn on_response(&self, v: &Json) -> Option<ObsEvent> {
         let d = json_get(v, "d")?;

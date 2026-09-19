@@ -83,17 +83,20 @@ pub struct Rgb {
 }
 
 impl Rgb {
+    #[must_use]
     pub const fn new(r: u8, g: u8, b: u8) -> Rgb {
         Rgb { r, g, b }
     }
     /// `#rrggbb` for SVG.
+    #[must_use]
     pub fn hex(self) -> String {
         format!("#{:02x}{:02x}{:02x}", self.r, self.g, self.b)
     }
     /// Linear blend toward `other` by `t` in `[0,1]`.
+    #[must_use]
     pub fn lerp(self, other: Rgb, t: f32) -> Rgb {
         let t = t.clamp(0.0, 1.0);
-        let f = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t).round() as u8;
+        let f = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * t).round() as u8;
         Rgb {
             r: f(self.r, other.r),
             g: f(self.g, other.g),
@@ -102,6 +105,7 @@ impl Rgb {
     }
     /// Shift hue around the colour wheel by `deg` degrees (the weave's earned palette depth and
     /// per-voice tint). Cheap HSV round-trip.
+    #[must_use]
     pub fn rotate_hue(self, deg: f32) -> Rgb {
         let (h, s, v) = rgb_to_hsv(self);
         hsv_to_rgb((h + deg).rem_euclid(360.0), s, v)
@@ -109,7 +113,7 @@ impl Rgb {
 }
 
 fn rgb_to_hsv(c: Rgb) -> (f32, f32, f32) {
-    let (r, g, b) = (c.r as f32 / 255.0, c.g as f32 / 255.0, c.b as f32 / 255.0);
+    let (r, g, b) = (f32::from(c.r) / 255.0, f32::from(c.g) / 255.0, f32::from(c.b) / 255.0);
     let max = r.max(g).max(b);
     let min = r.min(g).min(b);
     let d = max - min;
@@ -258,6 +262,7 @@ pub struct Scene {
 }
 
 impl Scene {
+    #[must_use]
     pub fn new(w: f32, h: f32) -> Scene {
         Scene {
             w,
@@ -269,15 +274,18 @@ impl Scene {
     pub fn push(&mut self, p: Prim) {
         self.prims.push(p);
     }
+    #[must_use]
     pub fn len(&self) -> usize {
         self.prims.len()
     }
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.prims.is_empty()
     }
 
     /// Serialize to a standalone SVG. A tight bloom (hard light has a *thin* halo, not a soft
     /// cloud) plus additive prismatic edges = the refraction look. Deterministic.
+    #[must_use]
     pub fn to_svg(&self) -> String {
         let mut s = String::with_capacity(8192);
         let _ = write!(
@@ -578,6 +586,7 @@ fn facets(energy: f32) -> u32 {
 /// Render the twin's reply as a row of hard-light beat-constructs strung on a light-beam, the
 /// open blueprint at the end. `frame` in `[0,1]` sweeps the play-head left→right (a sequence of
 /// frames *builds* the phrase construct by construct). `mood` washes a faint ambient bloom.
+#[must_use]
 pub fn knockback_scene(kb: &Knockback, frame: f32, mood: Option<&Emergent>) -> Scene {
     let mut sc = Scene::new(SCENE_W, SCENE_H);
     let baseline = SCENE_H * 0.42;
@@ -631,7 +640,7 @@ pub fn knockback_scene(kb: &Knockback, frame: f32, mood: Option<&Emergent>) -> S
             TWIN
         };
         let radius = if is_flourish { 40.0 } else { 32.0 };
-        let sides = facets(o.energy) + if is_flourish { 1 } else { 0 };
+        let sides = facets(o.energy) + u32::from(is_flourish);
         // a gentle per-beat rotation so the lattice reads as built, not stamped
         let rot = o.voice.spin * 0.6 + i as f32 * 0.3;
         sc.push(Prim::Construct {
@@ -650,8 +659,7 @@ pub fn knockback_scene(kb: &Knockback, frame: f32, mood: Option<&Emergent>) -> S
         let last_x = kb
             .onsets
             .last()
-            .map(|o| margin + (o.t_ms as f32 / total) * usable)
-            .unwrap_or(margin);
+            .map_or(margin, |o| margin + (o.t_ms as f32 / total) * usable);
         let gap_x = (last_x + usable * 0.10).min(SCENE_W - margin * 0.4);
         sc.push(Prim::Blueprint {
             cx: gap_x,
@@ -677,6 +685,7 @@ pub struct BraidSeg {
 /// Render the living weave — a row of interlocking hard-light shards along the bottom, one per
 /// exchange, oldest left. `palette_depth` rotates the hue as storms are survived. The weave is
 /// the score, the save file, and the art, crystallized.
+#[must_use]
 pub fn weave_scene(segs: &[BraidSeg], palette_depth: u32) -> Scene {
     let mut sc = Scene::new(SCENE_W, 120.0);
     if segs.is_empty() {
@@ -716,6 +725,7 @@ pub fn weave_scene(segs: &[BraidSeg], palette_depth: u32) -> Scene {
 
 /// Render the personal sigil — a normalized `[-1,1]²` path from [`crate::twin::Familiar::sigil_path`]
 /// — as a closed prismatic hard-light glyph pinned at crystalline nodes. The proof-of-self.
+#[must_use]
 pub fn sigil_scene(path: &[(f32, f32)], size: f32) -> Scene {
     let mut sc = Scene::new(size, size);
     if path.len() < 2 {
@@ -765,6 +775,7 @@ pub const STAGE_STAFF_HALF: f32 = 185.0;
 /// Render the live session stage exactly as the overlay lays it out: staff beam, the familiar
 /// at the staff's head, the beats standing on the beam, the seal-arc around the newest player
 /// strike, the weave strip below, and the quiet caption. `seal` < 0 hides the arc.
+#[must_use]
 pub fn stage_scene(
     beats: &[StageBeat],
     seal: f32,
@@ -856,7 +867,7 @@ pub fn stage_scene(
                 last_player = Some((bx, by, b.r));
             }
             k => {
-                let extra = if k == 2 { 1 } else { 0 };
+                let extra = u32::from(k == 2);
                 sc.push(Prim::Construct {
                     cx: bx,
                     cy: by,
@@ -930,6 +941,7 @@ pub fn stage_scene(
 }
 
 /// A compact readout strip for the panel: the live signals as quiet monospace.
+#[must_use]
 pub fn signals_strip(turn: &TwinTurn) -> Scene {
     let mut sc = Scene::new(SCENE_W, 40.0);
     sc.bg = VOID;

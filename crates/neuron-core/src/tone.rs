@@ -30,6 +30,7 @@ const LN_1000: f32 = 6.907_755; // ln(1000): exp decay constant for a -60 dB (T6
 pub const PENTATONIC: [i32; 5] = [0, 2, 4, 7, 9];
 
 /// Semitones from A4 (440 Hz) → frequency in Hz, 12-tone equal temperament.
+#[must_use]
 pub fn hz_from_a4(semitones: f32) -> f32 {
     440.0 * (semitones / 12.0).exp2()
 }
@@ -37,6 +38,7 @@ pub fn hz_from_a4(semitones: f32) -> f32 {
 /// A pentatonic position → semitones from A4. `degree` indexes the 5-note scale and wraps into
 /// octaves (degree 5 is the root one octave up; negative descends). `root` transposes the whole
 /// scale (semitones from A4); 0 = A.
+#[must_use]
 pub fn pentatonic_semitones(degree: i32, root: i32) -> f32 {
     let n = PENTATONIC.len() as i32;
     let octave = degree.div_euclid(n);
@@ -45,6 +47,7 @@ pub fn pentatonic_semitones(degree: i32, root: i32) -> f32 {
 }
 
 /// Frequency (Hz) of a pentatonic degree over a root (semitones from A4).
+#[must_use]
 pub fn pentatonic_hz(degree: i32, root: i32) -> f32 {
     hz_from_a4(pentatonic_semitones(degree, root))
 }
@@ -107,15 +110,16 @@ impl Timbre {
     ];
 
     /// Resolve a palette slug (config/UI) to a timbre; unknown falls back to the default pulse.
+    #[must_use]
     pub fn from_slug(slug: &str) -> Timbre {
         Self::PALETTES
             .iter()
             .find(|(s, _)| *s == slug)
-            .map(|(_, t)| *t)
-            .unwrap_or(Self::PULSE)
+            .map_or(Self::PULSE, |(_, t)| *t)
     }
 
     /// Compact palette id (0 = pulse) for packing into a real-time strike event.
+    #[must_use]
     pub fn id_of(slug: &str) -> u8 {
         Self::PALETTES
             .iter()
@@ -124,13 +128,15 @@ impl Timbre {
     }
 
     /// Timbre for a packed palette id (out-of-range → default pulse).
+    #[must_use]
     pub fn by_id(id: u8) -> Timbre {
-        Self::PALETTES.get(id as usize).map(|(_, t)| *t).unwrap_or(Self::PULSE)
+        Self::PALETTES.get(id as usize).map_or(Self::PULSE, |(_, t)| *t)
     }
 }
 
 /// Inverse A-weighting gain (IEC 61672), gentled to 60% and clamped, so notes read evenly in
 /// perceived loudness across pitch instead of bass sounding weak and the mids jumping out.
+#[must_use]
 pub fn loudness_gain(f: f32) -> f32 {
     let f2 = f * f;
     let num = 12194.0_f32.powi(2) * f2 * f2;
@@ -162,6 +168,7 @@ pub struct Voice {
 
 impl Voice {
     /// Strike a note NOW: carrier `freq` Hz, `velocity` 0..1, through `timbre`, at sample rate `sr`.
+    #[must_use]
     pub fn strike(freq: f32, velocity: f32, timbre: Timbre, sr: f32) -> Voice {
         let lp_k = 1.0 - (-TAU * timbre.lowpass / sr).exp();
         Voice {
@@ -182,6 +189,7 @@ impl Voice {
 
     /// Strike a note that sounds after `delay_samples` of silence — lets a whole multi-note cue
     /// gesture be fired into the engine at once, the voices self-scheduling their own onsets.
+    #[must_use]
     pub fn strike_after(freq: f32, velocity: f32, timbre: Timbre, sr: f32, delay_samples: u32) -> Voice {
         let mut v = Self::strike(freq, velocity, timbre, sr);
         v.delay = delay_samples;
@@ -189,6 +197,7 @@ impl Voice {
     }
 
     /// Has the note's tail fallen below audibility? (The voice can be reclaimed.)
+    #[must_use]
     pub fn done(&self) -> bool {
         self.done
     }
@@ -229,6 +238,7 @@ impl Voice {
 /// Cubic soft-clip (C¹-continuous, ×1.5 makeup so a full-scale input maps to ±1). The safety net
 /// that keeps overlapping voices from clipping harshly — odd-harmonic warmth, not a hard edge.
 #[inline]
+#[must_use]
 pub fn soft_clip(x: f32) -> f32 {
     // A NaN sample must never reach cpal — `x.clamp` alone passes NaN straight through
     // (`f32::clamp` returns `self` when neither comparison against `min`/`max` is true,
@@ -254,6 +264,7 @@ pub struct Hit {
 /// Render `hits` into a mono buffer of `len` samples at `sr`, summing overlapping voices, then a
 /// `master` gain and the cubic soft-clip safety net. Pure (same `Voice` the live engine runs), so
 /// an audition WAV sounds identical to playback.
+#[must_use]
 pub fn render(hits: &[Hit], len: usize, sr: f32, master: f32) -> Vec<f32> {
     let mut buf = vec![0.0f32; len];
     for h in hits {
@@ -264,7 +275,7 @@ pub fn render(hits: &[Hit], len: usize, sr: f32, master: f32) -> Vec<f32> {
             i += 1;
         }
     }
-    for s in buf.iter_mut() {
+    for s in &mut buf {
         *s = soft_clip(*s * master);
     }
     buf

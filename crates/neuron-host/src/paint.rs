@@ -5,13 +5,13 @@
 //! The external-paint policy engine — the one place a protocol adapter's frame
 //! becomes a fade-ramped, mode-aware, scope-gated arbiter layer.
 //!
-//! Every protocol face (Chroma REST, Chroma SHM, OpenRGB) paints "someone
+//! Every protocol face (Chroma REST, Chroma SHM, `OpenRGB`) paints "someone
 //! else's" lighting over the user's base. Three concerns are common to all of
 //! them and have nothing to do with the wire protocol, so they live here once
 //! instead of three times:
 //!
 //! - [`PaintPolicy`] — the user's settings for a whole family of external
-//!   paint ("game Chroma", "OpenRGB clients"): blend mode, strength, fade time,
+//!   paint ("game Chroma", "`OpenRGB` clients"): blend mode, strength, fade time,
 //!   and an optional per-surface allow-set. Lock-free reads (atomics + an
 //!   `RwLock` only on the rarely-touched allow-set) because it is sampled once
 //!   per LED-resolve on the kernel actor thread while the settings page writes
@@ -45,8 +45,8 @@ const MIN_VISIBLE_ALPHA: f32 = 0.001;
 /// One family of external paint's live settings, shared behind an `Arc` between
 /// the GUI (which writes it) and the kernel actor thread (which samples it once
 /// per resolve). There are two instances by design — one for the Chroma faces,
-/// one for OpenRGB clients — so the settings page describes "game lighting" and
-/// "OpenRGB clients" without leaking how a given source talks to Neuron.
+/// one for `OpenRGB` clients — so the settings page describes "game lighting" and
+/// "`OpenRGB` clients" without leaking how a given source talks to Neuron.
 ///
 /// Every field is read lock-free in the hot path: the three scalars are atomics
 /// and the allow-set sits behind an `RwLock` touched only when the user changes
@@ -77,14 +77,16 @@ impl Default for PaintPolicy {
 impl PaintPolicy {
     /// A default policy (Screen blend, full strength, 450ms fade, all surfaces)
     /// behind an `Arc` for sharing with the adapters that read it.
+    #[must_use]
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
     }
 
     /// An opaque, instant, unscoped policy: `Over` blend, full strength, no
     /// fade. This is "show the client's paint exactly as sent" — the honest
-    /// default for OpenRGB config tools, which expect a set colour to appear
+    /// default for `OpenRGB` config tools, which expect a set colour to appear
     /// as-is rather than merged/faded over the base.
+    #[must_use]
     pub fn opaque() -> Arc<Self> {
         Arc::new(Self {
             blend: AtomicU8::new(BlendMode::Over.to_bits()),
@@ -106,7 +108,7 @@ impl PaintPolicy {
         self.blend.store(blend.to_bits(), Ordering::Relaxed);
         self.strength.store(strength.clamp(0, 100), Ordering::Relaxed);
         self.fade_ms.store(fade_ms.clamp(0, 2500), Ordering::Relaxed);
-        *self.surfaces.write().unwrap_or_else(|e| e.into_inner()) = surfaces;
+        *self.surfaces.write().unwrap_or_else(std::sync::PoisonError::into_inner) = surfaces;
     }
 
     pub fn blend_mode(&self) -> BlendMode {
@@ -116,7 +118,7 @@ impl PaintPolicy {
     /// Strength as an opacity fraction in `[0,1]` — the multiplier applied on
     /// top of a [`FadeRamp`] value to get a layer's final alpha.
     pub fn alpha(&self) -> f32 {
-        self.strength.load(Ordering::Relaxed) as f32 / 100.0
+        f32::from(self.strength.load(Ordering::Relaxed)) / 100.0
     }
 
     /// Configured crossfade duration in seconds (0 = instant).
@@ -133,7 +135,7 @@ impl PaintPolicy {
     pub fn allows_key(&self, key: &str) -> bool {
         self.surfaces
             .read()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             .is_none_or(|set| set.contains(key))
     }
@@ -157,11 +159,13 @@ pub struct FadeRamp {
 impl FadeRamp {
     /// A ramp seeded at `initial` (a fresh face starts at `0.0` and fades in; a
     /// re-claim of a source already on screen starts at `1.0` to avoid a dip).
+    #[must_use]
     pub fn new(initial: f32) -> FadeRamp {
         FadeRamp { value: initial.clamp(0.0, 1.0), last: None }
     }
 
     /// The current ramp value without advancing it.
+    #[must_use]
     pub fn value(&self) -> f32 {
         self.value
     }
@@ -172,8 +176,7 @@ impl FadeRamp {
     pub fn advance(&mut self, now: Instant, target: f32, fade_secs: f32) -> f32 {
         let dt = self
             .last
-            .map(|t| now.duration_since(t).as_secs_f32())
-            .unwrap_or(0.0)
+            .map_or(0.0, |t| now.duration_since(t).as_secs_f32())
             .min(0.25);
         self.last = Some(now);
         let step = if fade_secs > 0.0 { dt / fade_secs } else { 1.0 };
@@ -196,6 +199,7 @@ impl FadeRamp {
 /// board (the "TINT" bug). `Screen` and `Add` are the identity on black, so
 /// dropping their black cells to transparent costs nothing and lets a single
 /// rule cover every non-`Over` mode instead of special-casing `Multiply`.
+#[must_use]
 pub fn merge_cells(mode: BlendMode, cells: &[Option<Rgb>]) -> Vec<Option<Rgb>> {
     if mode == BlendMode::Over {
         return cells.to_vec();
@@ -266,7 +270,7 @@ impl LiveContent for PolicyLayer {
         if self.level <= MIN_VISIBLE_ALPHA {
             return vec![None; self.leds];
         }
-        let buf = self.cells.lock().unwrap_or_else(|e| e.into_inner());
+        let buf = self.cells.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         merge_cells(self.policy.blend_mode(), &buf)
     }
 

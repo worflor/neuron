@@ -62,15 +62,15 @@ impl Default for RadialMenu {
 
 impl RadialMenu {
     /// Label for a sector: configured item, else its bearing name.
+    #[must_use]
     pub fn label(&self, sector: usize) -> String {
         self.items
             .get(sector)
-            .filter(|it| !it.label.is_empty())
-            .map(|it| it.label.clone())
-            .unwrap_or_else(|| compass(sector, self.sectors))
+            .filter(|it| !it.label.is_empty()).map_or_else(|| compass(sector, self.sectors), |it| it.label.clone())
     }
 
     /// Resolve a captured flick to a sector, or None if it was under the deadzone (cancel).
+    #[must_use]
     pub fn select(&self, path: &[C]) -> Option<usize> {
         let (dx, dy) = net_displacement(path);
         if (dx * dx + dy * dy).sqrt() < self.deadzone {
@@ -82,6 +82,7 @@ impl RadialMenu {
 
 /// Net displacement of a captured path (last − first). The path is cumulative positions
 /// starting near the origin, so this is the cursor offset at release.
+#[must_use]
 pub fn net_displacement(path: &[C]) -> (f64, f64) {
     match (path.first(), path.last()) {
         (Some(a), Some(b)) => (b.re - a.re, b.im - a.im),
@@ -91,6 +92,7 @@ pub fn net_displacement(path: &[C]) -> (f64, f64) {
 
 /// Bucket a screen-space direction (dx right+, dy down+) into a sector index.
 /// Sector 0 = North (up), increasing clockwise. N must be >= 1.
+#[must_use]
 pub fn sector_for(dx: f64, dy: f64, n: usize) -> usize {
     if n == 0 {
         return 0;
@@ -111,6 +113,7 @@ pub fn sector_for(dx: f64, dy: f64, n: usize) -> usize {
 
 /// The screen-space bearing (radians, `atan2(dy, dx)` with dy DOWN-positive: east=0, south=+π/2,
 /// west=±π, north=−π/2) of prompt option `i` of `n`. Option 0 sits at WEST; the rest step clockwise.
+#[must_use]
 pub fn wedge_bearing(i: usize, n: usize) -> f64 {
     std::f64::consts::PI - (i as f64) * (TAU / n.max(1) as f64)
 }
@@ -118,6 +121,7 @@ pub fn wedge_bearing(i: usize, n: usize) -> f64 {
 /// A prompt wedge's arc width (radians) — capped at 90° so small wheels keep deliberate pass gaps,
 /// shrinking to tile the circle as `n` grows. A SINGLE option (a confirm) owns the WHOLE circle, so
 /// any committed flick confirms it — a release without a flick still passes via the deadzone.
+#[must_use]
 pub fn wedge_arc(n: usize) -> f64 {
     if n <= 1 {
         return TAU;
@@ -128,6 +132,7 @@ pub fn wedge_arc(n: usize) -> f64 {
 /// Resolve a prompt flick `(dx, dy)` to a chosen option index, or `None` = PASS (under the deadzone,
 /// or in a gap between wedges → the macro's default). The single source of truth both the beacon
 /// verdict and the overlay highlight read, so they can never disagree. Pure + testable.
+#[must_use]
 pub fn pick_wedge(dx: f64, dy: f64, deadzone: f64, n: usize) -> Option<usize> {
     if n == 0 || (dx * dx + dy * dy).sqrt() < deadzone {
         return None;
@@ -149,6 +154,7 @@ fn ang_dist(a: f64, b: f64) -> f64 {
 /// history still votes (the Logos-attention idea, arc-length-normalized so it's speed- and
 /// scale-invariant). A change of mind (left… no, RIGHT), a circling approach, a wandering
 /// start — all resolve to where the hand MEANT to end, not to geometric purity.
+#[must_use]
 pub fn intent_vector(path: &[C]) -> (f64, f64) {
     if path.len() < 2 {
         return (0.0, 0.0);
@@ -187,12 +193,14 @@ pub const FLICK_JITTER: f64 = 15.0;
 /// `arc = 2π·deadzone / n ≥ FLICK_JITTER` → `n ≤ 2π·deadzone / FLICK_JITTER`. The default
 /// deadzone (40) yields 16; raise the deadzone (longer, more deliberate flicks) and the wheel can
 /// honestly carry more wedges. Floor of 4 (below that the formula is moot, a wheel needs quadrants).
+#[must_use]
 pub fn max_sectors(deadzone: f64) -> usize {
     ((TAU * deadzone.max(1.0)) / FLICK_JITTER).floor().max(4.0) as usize
 }
 
 /// A bearing name for a sector. Uses 8-wind compass names when they line up (n divides 8),
 /// otherwise the wedge's centre bearing in degrees.
+#[must_use]
 pub fn compass(sector: usize, n: usize) -> String {
     const W8: [&str; 8] = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"];
     if n != 0 && 8 % n == 0 {
@@ -245,12 +253,12 @@ mod tests {
         // and so must the wedge, even though the stroke is anything but a pure flick.
         let mut pts: Vec<C> = (0..40)
             .map(|i| C {
-                re: -(i as f64) * 6.0,
+                re: -f64::from(i) * 6.0,
                 im: 0.0,
             })
             .collect();
         pts.extend((0..80).map(|i| C {
-            re: -240.0 + i as f64 * 6.0,
+            re: -240.0 + f64::from(i) * 6.0,
             im: 0.0,
         }));
         let (ix, iy) = intent_vector(&pts);
@@ -262,7 +270,7 @@ mod tests {
         // a circling approach that EXITS upward reads as north
         let mut circ: Vec<C> = (0..60)
             .map(|i| {
-                let a = i as f64 / 60.0 * std::f64::consts::TAU;
+                let a = f64::from(i) / 60.0 * std::f64::consts::TAU;
                 C {
                     re: 60.0 * a.sin(),
                     im: 60.0 * (1.0 - a.cos()),
@@ -271,7 +279,7 @@ mod tests {
             .collect();
         circ.extend((0..50).map(|i| C {
             re: 0.0,
-            im: -(i as f64) * 5.0,
+            im: -f64::from(i) * 5.0,
         }));
         let (ix, iy) = intent_vector(&circ);
         assert!(
@@ -282,7 +290,7 @@ mod tests {
         // a clean flick still reads exactly as itself
         let flick: Vec<C> = (0..30)
             .map(|i| C {
-                re: i as f64 * 5.0,
+                re: f64::from(i) * 5.0,
                 im: 0.0,
             })
             .collect();
@@ -320,7 +328,7 @@ mod tests {
         assert_eq!(sector_for(0.0, -1.0, 12), 0);
         // every direction maps into range
         for deg in (0..360).step_by(7) {
-            let r = (deg as f64).to_radians();
+            let r = f64::from(deg).to_radians();
             // bearing->screen: dx=sin, dy=-cos
             let s = sector_for(r.sin(), -r.cos(), 12);
             assert!(s < 12);

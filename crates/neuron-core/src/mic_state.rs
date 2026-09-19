@@ -116,6 +116,7 @@ fn window_open() -> bool {
 /// last poll): is our own write still pending? Just reports whether the window is open; a non-edge
 /// can't be the write surfacing, so it never consumes. Kept distinct from
 /// [`consume_self_write_on_edge`] so the edge case can CLOSE the window and this cannot.
+#[must_use]
 pub fn in_self_write_window() -> bool {
     window_open()
 }
@@ -124,7 +125,7 @@ pub fn in_self_write_window() -> bool {
 /// should this edge be credited to NEURON rather than the user?
 ///
 /// If our write is still pending (window open), THIS edge is that write finally surfacing in the
-/// cache — however delayed. Consume the window (close it) and return `true` to suppress MicTap: the
+/// cache — however delayed. Consume the window (close it) and return `true` to suppress `MicTap`: the
 /// write produces exactly ONE edge, so once we've attributed it, the window's job is done and any
 /// FURTHER edge is genuinely external. Closing on the edge — not on a wall clock — is what makes the
 /// suppression robust to an arbitrarily-delayed cache observation (endpoint stall / pump starvation),
@@ -154,7 +155,7 @@ fn now_ms() -> u64 {
 }
 
 /// Whether a sampler thread is alive (the control block; no repointing — there is only one
-/// default mic — so a plain flag suffices where audio_level needs a generation counter).
+/// default mic — so a plain flag suffices where `audio_level` needs a generation counter).
 fn running() -> &'static Mutex<bool> {
     static R: OnceLock<Mutex<bool>> = OnceLock::new();
     R.get_or_init(|| Mutex::new(false))
@@ -168,7 +169,7 @@ const IDLE_STOP_MS: u64 = 2000;
 
 /// Start the sampler (idempotent, cheap to call every frame — the `miclight` pattern does).
 pub fn ensure() {
-    let mut on = running().lock().unwrap_or_else(|p| p.into_inner());
+    let mut on = running().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if *on {
         return;
     }
@@ -179,7 +180,7 @@ pub fn ensure() {
     // so a failed spawn can never leave the sampler latched "on" and block every later `ensure`.
     crate::worker::spawn_guarded(
         "neuron-mic-state",
-        || *running().lock().unwrap_or_else(|p| p.into_inner()) = false,
+        || *running().lock().unwrap_or_else(std::sync::PoisonError::into_inner) = false,
         run,
     );
 }
@@ -240,17 +241,14 @@ fn run() {
         // (Re-)resolve the default capture endpoint on the first tick and every ~1s after —
         // a swapped default mic or an unplug is picked up within a second.
         if tick.is_multiple_of(RERESOLVE_TICKS) {
-            match crate::audio::resolve_capture(None) {
-                Some(ep) => {
-                    if ep.id != ctl_id || ctl.is_none() {
-                        ctl = crate::audio::VolumeCtl::open(&ep.id);
-                        ctl_id = ep.id;
-                    }
+            if let Some(ep) = crate::audio::resolve_capture(None) {
+                if ep.id != ctl_id || ctl.is_none() {
+                    ctl = crate::audio::VolumeCtl::open(&ep.id);
+                    ctl_id = ep.id;
                 }
-                None => {
-                    ctl = None;
-                    ctl_id.clear();
-                }
+            } else {
+                ctl = None;
+                ctl_id.clear();
             }
         }
         tick = tick.wrapping_add(1);
@@ -290,12 +288,12 @@ mod tests {
 
     /// Open the window as if the write happened at `at` — so expiry is testable without sleeping.
     fn arm_at(at: Instant) {
-        *last_self_write().lock().unwrap_or_else(|e| e.into_inner()) = Some(at);
+        *last_self_write().lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(at);
     }
 
     #[test]
     fn no_write_means_an_edge_is_the_users() {
-        let _guard = LATCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = LATCH_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         reset_self_mute_write();
         assert!(!in_self_write_window(), "no window open");
         assert!(
@@ -306,7 +304,7 @@ mod tests {
 
     #[test]
     fn our_writes_edge_is_consumed_exactly_once() {
-        let _guard = LATCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = LATCH_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         reset_self_mute_write();
         note_self_mute_write();
         assert!(in_self_write_window(), "a non-edge poll still sees the window open");
@@ -321,7 +319,7 @@ mod tests {
     #[test]
     fn a_non_edge_poll_does_not_consume_the_window() {
         // The un-changed polls before our write surfaces must NOT close the window — only the edge.
-        let _guard = LATCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = LATCH_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         reset_self_mute_write();
         note_self_mute_write();
         for _ in 0..8 {
@@ -334,7 +332,7 @@ mod tests {
     fn the_backstop_ttl_closes_a_write_that_never_produced_an_edge() {
         // If our write never surfaces as an edge (write didn't land / endpoint vanished), the TTL is
         // the only thing that stops the window swallowing a later real tap.
-        let _guard = LATCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = LATCH_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         reset_self_mute_write();
         let Some(stale) = Instant::now().checked_sub(SELF_WRITE_QUIET + Duration::from_millis(200))
         else {

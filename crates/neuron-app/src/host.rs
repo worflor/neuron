@@ -17,7 +17,7 @@
 //!   layer** via [`CompositorContent`] — the SAME `Compositor` + render epoch
 //!   + quantized clock as the GUI preview, so "the preview provably matches
 //!   the board" still holds;
-//! - the **Chroma** (`54235`, games) and **OpenRGB** (`6742`, tools) servers
+//! - the **Chroma** (`54235`, games) and **`OpenRGB`** (`6742`, tools) servers
 //!   run per their own gates, so Overwatch or Home Assistant paints layers
 //!   ABOVE the base and — the whole point — the base animation returns the
 //!   instant they let go: no flicker, no stuck lighting, no cleanup code;
@@ -78,10 +78,10 @@ struct HostState {
     /// External-paint policy for the CHROMA faces (REST + native SHM), fed by the "chroma games"
     /// settings lane. Separate from `openrgb_policy` so games and tools can blend differently.
     chroma_policy: Arc<PaintPolicy>,
-    /// External-paint policy for OpenRGB clients, fed by the "openrgb tools" settings lane.
+    /// External-paint policy for `OpenRGB` clients, fed by the "openrgb tools" settings lane.
     openrgb_policy: Arc<PaintPolicy>,
     /// Why the NATIVE (Win32 SHM) Chroma face didn't come up, if it didn't: an elevation note
-    /// (`Global\` objects need SeCreateGlobalPrivilege) vs "Razer's server already owns the
+    /// (`Global\` objects need `SeCreateGlobalPrivilege`) vs "Razer's server already owns the
     /// objects". `None` = it came up, or was never asked to. Surfaced honestly in [`Status`].
     chroma_native_error: Option<String>,
     /// The bus listener that pokes [`HOST_EVENTS_STAMP`] on every `host.*` signal (see
@@ -181,7 +181,7 @@ impl ObsFollower {
         // ObsFollower owns this handle and joins it on Drop — routed through the handle-returning
         // primitive.
         let thread = crate::worker::spawn_named("neuron-obs-follow", move || {
-            follow(handle, control, &flag)
+            follow(handle, control, &flag);
         })
         .expect("spawn obs follower");
         ObsFollower { stop, thread: Some(thread) }
@@ -225,26 +225,23 @@ fn follow(handle: HostHandle, control: ObsControl, stop: &AtomicBool) {
     // never assumed from what we remember.
     let mut reborn = false;
     while !stop.load(Ordering::Relaxed) {
-        let sig = match &rx {
-            Some(r) => match r.recv_timeout(Duration::from_millis(250)) {
-                Ok(s) => Some(s),
-                Err(RecvTimeoutError::Timeout) => None,
-                // Kernel rebirth closes subscriptions — resubscribe below.
-                Err(RecvTimeoutError::Disconnected) => {
-                    rx = None;
-                    reborn = true;
-                    continue;
-                }
-            },
-            None => {
-                thread::sleep(Duration::from_millis(250));
-                rx = handle.subscribe("obs");
-                if rx.is_some() && reborn {
-                    reborn = false;
-                    control.send(ObsCmd::Resync);
-                }
+        let sig = if let Some(r) = &rx { match r.recv_timeout(Duration::from_millis(250)) {
+            Ok(s) => Some(s),
+            Err(RecvTimeoutError::Timeout) => None,
+            // Kernel rebirth closes subscriptions — resubscribe below.
+            Err(RecvTimeoutError::Disconnected) => {
+                rx = None;
+                reborn = true;
                 continue;
             }
+        } } else {
+            thread::sleep(Duration::from_millis(250));
+            rx = handle.subscribe("obs");
+            if rx.is_some() && reborn {
+                reborn = false;
+                control.send(ObsCmd::Resync);
+            }
+            continue;
         };
         if let Some(sig) = sig {
             // Mirror first (brief lock), then feed the lighting slot, hooks
@@ -265,13 +262,13 @@ fn follow(handle: HostHandle, control: ObsControl, stop: &AtomicBool) {
             publish_broadcast_from(&snap);
             match (sig.path.as_str(), &sig.value) {
                 ("obs.streaming", Value::Bool(b)) => {
-                    hook_on_change("on_obs_stream", &mut prev_stream, *b)
+                    hook_on_change("on_obs_stream", &mut prev_stream, *b);
                 }
                 ("obs.recording", Value::Bool(b)) => {
-                    hook_on_change("on_obs_record", &mut prev_record, *b)
+                    hook_on_change("on_obs_record", &mut prev_record, *b);
                 }
                 ("obs.scene", Value::Text(s)) => {
-                    hook_on_change("on_obs_scene", &mut prev_scene, s.clone())
+                    hook_on_change("on_obs_scene", &mut prev_scene, s.clone());
                 }
                 _ => {}
             }
@@ -342,7 +339,7 @@ impl HostEventsListener {
         // HostEventsListener owns this handle and joins it on Drop — routed through the
         // handle-returning primitive.
         let thread = crate::worker::spawn_named("neuron-host-events", move || {
-            host_events_loop(handle, &flag)
+            host_events_loop(handle, &flag);
         })
         .expect("spawn host events listener");
         HostEventsListener { stop, thread: Some(thread) }
@@ -365,18 +362,15 @@ fn host_events_loop(handle: HostHandle, stop: &AtomicBool) {
     use std::sync::mpsc::RecvTimeoutError;
     let mut rx = handle.subscribe("host");
     while !stop.load(Ordering::Relaxed) {
-        match &rx {
-            Some(r) => match r.recv_timeout(Duration::from_millis(250)) {
-                Ok(_) => {
-                    HOST_EVENTS_STAMP.fetch_add(1, Ordering::Relaxed);
-                }
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => rx = None,
-            },
-            None => {
-                thread::sleep(Duration::from_millis(250));
-                rx = handle.subscribe("host");
+        if let Some(r) = &rx { match r.recv_timeout(Duration::from_millis(250)) {
+            Ok(_) => {
+                HOST_EVENTS_STAMP.fetch_add(1, Ordering::Relaxed);
             }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => rx = None,
+        } } else {
+            thread::sleep(Duration::from_millis(250));
+            rx = handle.subscribe("host");
         }
     }
 }
@@ -410,7 +404,7 @@ pub struct Status {
     pub obs_streaming: bool,
     pub obs_recording: bool,
     /// The LIVE protocol clients, per adapter: Chroma game sessions (TTL-honest)
-    /// and OpenRGB tool connections (socket-scoped), each cross-referenced
+    /// and `OpenRGB` tool connections (socket-scoped), each cross-referenced
     /// against the arbiter's claims — so the card can say "Overwatch is
     /// painting your keyboard" from the same leased truth the boards obey.
     pub chroma_clients: Vec<ClientStatus>,
@@ -439,7 +433,7 @@ pub struct NativeChroma {
     /// nobody the game itself — cross-referenced against the ARBITER's live claims, not the raw
     /// telemetry above (which only ever describes what the SHM face decoded, never who else is on
     /// top of it). `None` when the game wins at least one of its claimed surfaces; `Some(name)`
-    /// when a foreign owner (a REST Chroma client, an OpenRGB tool) tops every one of them — the
+    /// when a foreign owner (a REST Chroma client, an `OpenRGB` tool) tops every one of them — the
     /// game is connected and painting into shared memory, but the board shows someone else.
     pub covered_by: Option<String>,
 }
@@ -457,7 +451,7 @@ pub struct NativeChromaStream {
 /// One connected protocol client, as the CONNECTIONS card reads it.
 #[derive(Clone, Debug)]
 pub struct ClientStatus {
-    /// The name it announced (a Chroma init title, an OpenRGB SET_CLIENT_NAME);
+    /// The name it announced (a Chroma init title, an `OpenRGB` `SET_CLIENT_NAME`);
     /// "" = connected but never named itself.
     pub name: String,
     /// The surface kinds ("keyboard", "mouse", …) where this client currently
@@ -626,7 +620,7 @@ pub fn apply_protocol_prefs() {
                 s.handle.clone(),
                 Arc::clone(&s.chroma_policy),
             )
-            .ok()
+            .ok();
         }
         (false, true) => s.chroma = None, // Drop joins the accept loop
         _ => {}
@@ -662,7 +656,7 @@ pub fn apply_protocol_prefs() {
                 s.handle.clone(),
                 Arc::clone(&s.openrgb_policy),
             )
-            .ok()
+            .ok();
         }
         (false, true) => s.orgb = None,
         _ => {}
@@ -797,7 +791,7 @@ fn connect_obs(s: &mut HostState) {
                     (Some(t), _) => (t.to_string(), String::new()),
                     (None, Some(t)) => (
                         t.to_string(),
-                        arg.get("data").map(|d| d.to_string()).unwrap_or_default(),
+                        arg.get("data").map(std::string::ToString::to_string).unwrap_or_default(),
                     ),
                     _ => (String::new(), String::new()),
                 };
@@ -1214,7 +1208,7 @@ fn bring_up(g: &mut Option<HostState>) -> bool {
 /// claim's owner (paired with its label, when the adapter named it) for each surface the SHM face
 /// holds a claim on, decide whether the game wins anywhere. If it does, `None` — uncontested (or
 /// at least not fully covered). If it wins NOWHERE and some other FOREIGN owner (a REST Chroma
-/// client, an OpenRGB tool — foreign means "not the app's base" throughout this module, see
+/// client, an `OpenRGB` tool — foreign means "not the app's base" throughout this module, see
 /// [`board_owner`]) tops at least one of those surfaces, `Some(name)` — the game is connected and
 /// painting into shared memory, but the board shows a rival client. The app's own base winning is
 /// deliberately NOT coverage: that's the "my lighting always wins" suppressed case, which the
@@ -1389,7 +1383,7 @@ fn status_of(g: &Option<HostState>) -> Status {
                     s.chroma_native_error.clone()
                 },
                 openrgb_serving: s.orgb.is_some(),
-                obs_connected: s.obs.as_ref().is_some_and(|c| c.is_connected()),
+                obs_connected: s.obs.as_ref().is_some_and(neuron_host::net::ObsConnection::is_connected),
                 obs_scene: obs.scene,
                 obs_streaming: obs.streaming,
                 obs_recording: obs.recording,
@@ -1509,7 +1503,7 @@ pub enum BoardOwner {
 /// foreign client — and, distinctly, whether a foreign client is present but
 /// LOST to your base (policy = my lighting wins). Names come from the kernel's
 /// per-owner labels, set by the adapter the instant the client announced
-/// itself (a Chroma session's title, an OpenRGB client's name); an unnamed
+/// itself (a Chroma session's title, an `OpenRGB` client's name); an unnamed
 /// client reads as "another app".
 pub fn board_owner(pid: u16, unit: &str) -> BoardOwner {
     let g = guard();

@@ -27,6 +27,7 @@ const K: [u32; 64] = [
 ];
 
 /// SHA-256 of `msg` → 32 raw bytes. FIPS 180-4.
+#[must_use]
 pub fn sha256(msg: &[u8]) -> [u8; 32] {
     let mut h: [u32; 8] = [
         0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
@@ -99,6 +100,7 @@ pub fn sha256(msg: &[u8]) -> [u8; 32] {
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 /// Standard base64 with `=` padding.
+#[must_use]
 pub fn base64(data: &[u8]) -> String {
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
@@ -107,7 +109,7 @@ pub fn base64(data: &[u8]) -> String {
             *chunk.get(1).unwrap_or(&0),
             *chunk.get(2).unwrap_or(&0),
         ];
-        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | (b[2] as u32);
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
         out.push(B64[((n >> 18) & 0x3f) as usize] as char);
         out.push(B64[((n >> 12) & 0x3f) as usize] as char);
         out.push(if chunk.len() > 1 { B64[((n >> 6) & 0x3f) as usize] as char } else { '=' });
@@ -120,6 +122,7 @@ pub fn base64(data: &[u8]) -> String {
 /// `base64( sha256( base64(sha256(password + salt)) + challenge ) )`.
 /// Only needed when the server's `Hello` carries an `authentication` object
 /// (i.e. the user set a password); a passwordless server skips this entirely.
+#[must_use]
 pub fn obs_auth(password: &str, salt: &str, challenge: &str) -> String {
     let secret = base64(&sha256(format!("{password}{salt}").as_bytes()));
     base64(&sha256(format!("{secret}{challenge}").as_bytes()))

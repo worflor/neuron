@@ -11,11 +11,11 @@
 //!     keys/clicks/macros actually fire — remaps work out of the box;
 //!   * builds the ONE unified [`Engine`] from every on-disk config (bindings/cast/hypershift/
 //!     app-rules) via [`neuron::controls::build_runtime`];
-//!   * activates the GamingMode `WH_KEYBOARD_LL` suppression hook (which self-hosts a dedicated
+//!   * activates the `GamingMode` `WH_KEYBOARD_LL` suppression hook (which self-hosts a dedicated
 //!     message-pump thread in `neuron::hook`, so it is immune to this loop's blocking device I/O —
 //!     an LL hook Windows silently bypasses if its installing thread misses the ~300 ms timeout);
 //!   * on each Raw-Input event translates to a [`Trigger`] and dispatches through the Engine —
-//!     HyperShift hold edges via held-layer state, daemon [`Intent`]s routed (DPI / scroll /
+//!     `HyperShift` hold edges via held-layer state, daemon [`Intent`]s routed (DPI / scroll /
 //!     profile), Turbo repeated while held, the mic-tap + app-focus polled on the tick;
 //!   * posts live status (last trigger fired, active layer, focused app) back to the UI thread via
 //!     [`slint::invoke_from_event_loop`].
@@ -25,7 +25,7 @@
 //! NEVER constructed by the UI tests (which build `State` + glue but never call `start`), and it is
 //! the GUI's safe-mode toggle — not this module — that decides whether [`neuron::action::arm_input`]
 //! is flipped on. When the GUI is in safe-mode (disarmed via `--safe` or Settings), the loop still runs and
-//! resolves every trigger, but SendInput / process-spawn stay no-ops (the core arm gate). So tests
+//! resolves every trigger, but `SendInput` / process-spawn stay no-ops (the core arm gate). So tests
 //! never arm and never start this runtime.
 
 use crate::ui::{AppWindow, State};
@@ -99,7 +99,7 @@ pub fn reload_generation() -> u64 {
 
 /// Triggers INJECTED by other live subsystems — today the weave watcher (a resolved radial flick
 /// or glyph from the beacon/weave thread). Drained by the worker's tick (~5 ms), so an injected
-/// trigger dispatches through the ONE Engine exactly like a hardware event: HyperShift layers,
+/// trigger dispatches through the ONE Engine exactly like a hardware event: `HyperShift` layers,
 /// intents, turbo, the SAFE-mode gate and the live readout all compose identically.
 /// Queue a trigger for the live worker's next tick. Callable from any thread; a no-op burden if
 /// the worker isn't running (the queue is drained only by it, and bounded by real user gestures).
@@ -132,9 +132,9 @@ pub fn last_action_desc() -> Option<String> {
         .clone()
 }
 
-/// Live mirror of "is the HyperShift layer currently held?" — updated every status tick from the
+/// Live mirror of "is the `HyperShift` layer currently held?" — updated every status tick from the
 /// engine's real held-layer set (source of truth). Read by the cast overlay (`beacon`) to swap the
-/// radial to its HyperShift set; an atomic so it crosses to the overlay loop without a lock.
+/// radial to its `HyperShift` set; an atomic so it crosses to the overlay loop without a lock.
 static HYPERSHIFT_HELD: AtomicBool = AtomicBool::new(false);
 
 /// Live mirrors of the two hold edges the lighting engine's `modeheld` DATA layer renders: is ANY
@@ -153,7 +153,7 @@ fn push_hold_state() {
     });
 }
 
-/// Flip the software HyperShift latch, returning the NEW state. The SHIFT pill lights from the
+/// Flip the software `HyperShift` latch, returning the NEW state. The SHIFT pill lights from the
 /// engine's real held-layers via the status post — one source of truth, no UI-side write.
 pub fn toggle_hypershift_latch() -> bool {
     let (tx, rx) = channel();
@@ -192,7 +192,7 @@ pub fn apply_profile(name: String, persist: bool) -> Result<ProfileApplyResult, 
         .map_err(|_| format!("profile '{name}' apply timed out"))?
 }
 
-/// Whether a HyperShift layer is held right now (the radial swaps to its HyperShift set on this).
+/// Whether a `HyperShift` layer is held right now (the radial swaps to its `HyperShift` set on this).
 pub fn hypershift_held() -> bool {
     HYPERSHIFT_HELD.load(Ordering::Relaxed)
 }
@@ -204,7 +204,7 @@ pub struct LiveStatus {
     pub last_trigger: String,
     /// The result line of the last dispatched action.
     pub last_action: String,
-    /// Currently-held HyperShift layer names, joined (empty = base layer only).
+    /// Currently-held `HyperShift` layer names, joined (empty = base layer only).
     pub held_layers: String,
     /// The current foreground app exe (app-aware switch input).
     pub focused_app: String,
@@ -228,9 +228,9 @@ pub struct LiveRuntime {
 impl LiveRuntime {
     /// Start the live device-event loop on a worker thread. `armed` arms real input synthesis
     /// (the GUI passes its safe-mode toggle here); when `false` the loop runs in observe/dry-run
-    /// mode (the core arm gate keeps SendInput a no-op). `weak` lets the worker post status back.
+    /// mode (the core arm gate keeps `SendInput` a no-op). `weak` lets the worker post status back.
     ///
-    /// LIVE-PATH ONLY: call this from `main`, never from a test or from glue::install.
+    /// LIVE-PATH ONLY: call this from `main`, never from a test or from `glue::install`.
     pub fn start(weak: slint::Weak<AppWindow>, armed: bool) -> Self {
         let id = NEXT_LIVE_ID.fetch_add(1, Ordering::SeqCst);
         let stop = Arc::new(AtomicBool::new(false));
@@ -317,8 +317,8 @@ struct LiveCtx<'a> {
     weak: slint::Weak<AppWindow>,
     /// Edge-detector: a Razer report is the SET of buttons currently down, so we DIFF successive
     /// reports into per-button down/up edges. This fixes multi-button chords (every newly-pressed
-    /// control dispatches, not just the first hit) and precise HyperShift release (only the input
-    /// that actually went up releases ITS layer — no blanket release_all on any empty report).
+    /// control dispatches, not just the first hit) and precise `HyperShift` release (only the input
+    /// that actually went up releases ITS layer — no blanket `release_all` on any empty report).
     edges: RefCell<HoldEdges>,
     /// MOMENTARY MIC held state: trigger -> (mic device, mute-state to restore on release). A held
     /// momentary action the stateless dispatch can't express — the edge loop owns its press/release.
@@ -333,7 +333,7 @@ struct LiveCtx<'a> {
     sniper: SniperMap,
     turbos: RefCell<TurboRuntime>,
     live_rx: Receiver<LiveCommand>,
-    /// Dispatch's OWN previous mic-mute cache sample — the stream it edge-detects on to fire MicTap
+    /// Dispatch's OWN previous mic-mute cache sample — the stream it edge-detects on to fire `MicTap`
     /// on a real external toggle. SEPARATE from `glue::mic_tap_baseline` (the pill's shown value): a
     /// fresher source (the launch reconcile unit) can seed the baseline while dispatch's 400ms cache
     /// still lags, and edge-detecting against that cross-source value would misread the lag as a
@@ -351,7 +351,7 @@ struct LiveCtx<'a> {
     hypershift_latch: bool,
     applied_hypershift_latch: bool,
     gaming_policy_dirty: bool,
-    /// GamingMode suppression hook handle. `None` in every `#[cfg(test)]`-built `LiveCtx` (see
+    /// `GamingMode` suppression hook handle. `None` in every `#[cfg(test)]`-built `LiveCtx` (see
     /// [`LiveCtx::for_tests`]) — a test must never touch the real Win32 LL hook.
     hook: Option<neuron::hook::Hook>,
 }
@@ -671,7 +671,7 @@ fn run_worker(weak: slint::Weak<AppWindow>, stop: Arc<AtomicBool>, live_rx: Rece
 }
 
 /// The live worker's per-event edge handler — the exact body of `run_worker`'s old `on_event`
-/// closure, verbatim (capture-active check, edge loop, down/up arms, publish_held), now callable
+/// closure, verbatim (capture-active check, edge loop, down/up arms, `publish_held`), now callable
 /// one edge at a time so a test can drive it directly instead of only through the immortal loop.
 /// Does the device-side remap shim own this trigger? Only pid-scoped keyboard-page `Input`
 /// triggers can be shim-owned; everything else dispatches through the engine as before.
@@ -759,7 +759,7 @@ const POLL_CADENCE: Duration = Duration::from_millis(50);
 /// Nothing in the active engine needs periodic polling — a generous idle cadence. Once the
 /// blocking-wait rewrite lands, the wake event (not this hint) delivers real work instantly; this
 /// value only bounds how long the pump would otherwise sit blocked with nothing to do.
-const IDLE_CADENCE: Duration = Duration::from_millis(1000);
+const IDLE_CADENCE: Duration = Duration::from_secs(1);
 
 /// Wall-clock cadence for the mic-tap / app-focus polls, independent of the pump's own (variable)
 /// cadence. Matches the ~50ms the old fixed-5ms pump delivered via its `tick % 10` gate.
@@ -802,7 +802,7 @@ fn live_tick(ctx: &mut LiveCtx) -> Duration {
                 // `flight::trace` takes &'static str, so the transition is the message and the
                 // detail rides the recorder's numeric arg (layer name length is a cheap witness
                 // that a DIFFERENT layer landed, without allocating in the live loop).
-                let len = layer.as_deref().map(str::len).unwrap_or(0) as u64;
+                let len = layer.as_deref().map_or(0, str::len) as u64;
                 if ctx.rt.borrow_mut().engine.latch(&slot, layer) {
                     crate::flight::trace(
                         "plate",
@@ -1041,7 +1041,7 @@ fn live_tick(ctx: &mut LiveCtx) -> Duration {
 type MomentaryMap =
     std::cell::RefCell<std::collections::HashMap<neuron::engine::Trigger, (Option<String>, bool)>>;
 
-/// Open the mic VolumeCtl for a momentary action's (optional) device, WITH the resolved endpoint id.
+/// Open the mic `VolumeCtl` for a momentary action's (optional) device, WITH the resolved endpoint id.
 /// Callers need the id to ask `neuron::audio::is_default_capture_id` before arming the echo latch: a
 /// momentary bound to a NAMED secondary mic must not arm a latch the dispatch detector (which only
 /// ever samples the DEFAULT endpoint) would then consume against an unrelated real tap.
@@ -1149,9 +1149,9 @@ fn sniper_forget_baseline(
     // their cached handle instead of opening a second one against the same pipe.
     let live = devices
         .borrow_mut()
-        .with_writable("set_dpi", |d| neuron::capability::dpi(d));
+        .with_writable("set_dpi", neuron::capability::dpi);
     if let Ok((x, _)) = live {
-        neuron::confirm::prime_dpi(pid, x as u32);
+        neuron::confirm::prime_dpi(pid, u32::from(x));
     }
 }
 
@@ -1204,7 +1204,7 @@ fn sniper_press(
         // its OWN confirmation kind (gated separately from plain DPI, default off) — and the
         // constructor updates the pid's DPI baseline either way, so the mouse's echo of this
         // write is absorbed instead of carding as a spurious "DPI changed" mid-game.
-        neuron::confirm::sniper(pid, dpi as u32, Some(base_x as u32), true);
+        neuron::confirm::sniper(pid, u32::from(dpi), Some(u32::from(base_x)), true);
         // the mode-light edge: a sniper hold is now live.
         SNIPER_HELD.store(true, Ordering::Relaxed);
         push_hold_state();
@@ -1233,7 +1233,7 @@ fn sniper_release(
                 neuron::capability::set_dpi(d, base, base, neuron::capability::Store::Volatile, neuron::dpi_origin::Cause::Momentary)
             });
             if ok.is_ok() {
-                neuron::confirm::sniper(pid, base as u32, None, false);
+                neuron::confirm::sniper(pid, u32::from(base), None, false);
             }
         }
         // the mode-light edge: only dark when NO sniper hold remains (two thumbs, one truth).
@@ -1274,7 +1274,7 @@ fn sniper_release_all(
             neuron::capability::set_dpi(d, base, base, neuron::capability::Store::Volatile, neuron::dpi_origin::Cause::Momentary)
         });
         if ok.is_ok() {
-            neuron::confirm::sniper(pid, base as u32, None, false);
+            neuron::confirm::sniper(pid, u32::from(base), None, false);
         }
     }
 }
@@ -1528,7 +1528,7 @@ fn apply_profile_live(
 }
 
 /// Publish the current held-layer set into the status (so the header SHIFT pill reflects live
-/// HyperShift). Only posts when it changed (cheap on the hot path).
+/// `HyperShift`). Only posts when it changed (cheap on the hot path).
 fn publish_held(
     rt: &std::cell::RefCell<neuron::controls::Runtime>,
     status: &Arc<Mutex<LiveStatus>>,
@@ -1550,11 +1550,11 @@ fn publish_held(
     push_hold_state();
     let changed = {
         let mut s = status.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if s.held_layers != held {
+        if s.held_layers == held {
+            false
+        } else {
             s.held_layers = held;
             true
-        } else {
-            false
         }
     };
     if changed {
@@ -1610,7 +1610,7 @@ fn post_status(weak: &slint::Weak<AppWindow>, status: &Arc<Mutex<LiveStatus>>) {
             if !live_cursor.is_empty() {
                 crate::glue::note_live_profile(&app, &live_cursor);
             }
-            st.set_live_held(snap.held_layers.clone().into());
+            st.set_live_held(snap.held_layers.into());
         }
     });
 }

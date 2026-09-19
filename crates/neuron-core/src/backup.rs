@@ -6,7 +6,7 @@
 //! device's entire getter space (raw bytes + structural classification) to a timestamped JSON,
 //! so any future write can be diffed against, verified, and rolled back to a known-good prior
 //! state. This is the foundation the hardware-native features (firmware button mapping / onboard
-//! HyperShift / storage / settings writes) build on — no write is "safe" without it.
+//! `HyperShift` / storage / settings writes) build on — no write is "safe" without it.
 
 use serde::{Deserialize, Serialize};
 
@@ -40,19 +40,23 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    #[must_use]
     pub fn filename(&self) -> String {
         format!("neuron-backup-{:04x}-{}.json", self.pid, self.unix_time)
     }
 
+    #[must_use]
     pub fn to_json(&self) -> String {
         serde_json::to_string_pretty(self).unwrap_or_default()
     }
 
+    #[must_use]
     pub fn from_json(s: &str) -> Option<Snapshot> {
         serde_json::from_str(s).ok()
     }
 
     /// Total getters captured across all interfaces.
+    #[must_use]
     pub fn getter_count(&self) -> usize {
         self.interfaces.iter().map(|i| i.getters.len()).sum()
     }
@@ -60,6 +64,7 @@ impl Snapshot {
     /// Diff against another snapshot of the same device: returns the getters whose raw bytes
     /// differ (by class/id). This is the verify/round-trip primitive — after a write, re-snapshot
     /// and diff to confirm ONLY the intended bytes changed.
+    #[must_use]
     pub fn diff<'a>(&'a self, other: &'a Snapshot) -> Vec<Changed<'a>> {
         let mut out = Vec::new();
         for ai in &self.interfaces {
@@ -107,6 +112,7 @@ pub struct Changed<'a> {
 }
 
 /// Format an 80-byte payload as space-separated hex (the lossless on-disk form).
+#[must_use]
 pub fn hex80(a: &[u8; 80]) -> String {
     a.iter()
         .map(|b| format!("{b:02X}"))

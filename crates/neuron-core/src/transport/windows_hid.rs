@@ -3,8 +3,8 @@
 // Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
 
 //! Windows HID transport via the Win32 API (windows-sys). Mirrors the proven approach:
-//! open the control collection with dwDesiredAccess = 0 (Windows blocks GENERIC_R/W on a
-//! mouse, but HidD_Get/SetFeature use FILE_ANY_ACCESS IOCTLs, so access=0 works).
+//! open the control collection with dwDesiredAccess = 0 (Windows blocks `GENERIC_R/W` on a
+//! mouse, but `HidD_Get/SetFeature` use `FILE_ANY_ACCESS` IOCTLs, so access=0 works).
 
 use super::{wire_lock_for, DevicePath, HidDeviceInfo, Transport, WireLock};
 use anyhow::{bail, Result};
@@ -136,12 +136,12 @@ unsafe fn overlapped_read_timed(handle: HANDLE, buf: &mut [u8], timeout_ms: u32)
     let mut ov: Overlapped = std::mem::zeroed();
     ov.h_event = ev;
     let mut got: u32 = 0;
-    let ov_ptr = &mut ov as *mut Overlapped as *mut c_void;
+    let ov_ptr = (&raw mut ov).cast::<c_void>();
     let started = ReadFile(
         handle,
-        buf.as_mut_ptr() as *mut c_void,
+        buf.as_mut_ptr().cast::<c_void>(),
         buf.len() as u32,
-        &mut got,
+        &raw mut got,
         ov_ptr,
     );
     if started == 0 {
@@ -156,11 +156,11 @@ unsafe fn overlapped_read_timed(handle: HANDLE, buf: &mut [u8], timeout_ms: u32)
             // a dangling overlapped read into this buffer is a use-after-free. `GetOverlappedResult`
             // with `wait=TRUE` blocks until the kernel confirms the cancellation actually landed.
             CancelIo(handle);
-            let _ = GetOverlappedResult(handle, ov_ptr, &mut got, 1 /* bWait */);
+            let _ = GetOverlappedResult(handle, ov_ptr, &raw mut got, 1 /* bWait */);
             CloseHandle(ev);
             return Ok(None);
         }
-        if GetOverlappedResult(handle, ov_ptr, &mut got, 0) == 0 {
+        if GetOverlappedResult(handle, ov_ptr, &raw mut got, 0) == 0 {
             CloseHandle(ev);
             bail!("GetOverlappedResult (overlapped read) failed");
         }
@@ -199,17 +199,17 @@ unsafe fn query(path: &[u16]) -> Option<HidDeviceInfo> {
     let mut info = None;
     let mut attr: HIDD_ATTRIBUTES = std::mem::zeroed();
     attr.Size = std::mem::size_of::<HIDD_ATTRIBUTES>() as u32;
-    if HidD_GetAttributes(h, &mut attr) != 0 {
+    if HidD_GetAttributes(h, &raw mut attr) != 0 {
         let mut pp: isize = 0; // PHIDP_PREPARSED_DATA is an opaque isize in windows-sys
-        if HidD_GetPreparsedData(h, &mut pp) != 0 {
+        if HidD_GetPreparsedData(h, &raw mut pp) != 0 {
             let mut caps: HIDP_CAPS = std::mem::zeroed();
-            if HidP_GetCaps(pp, &mut caps) == HIDP_OK {
+            if HidP_GetCaps(pp, &raw mut caps) == HIDP_OK {
                 // Product string (IOCTL_HID_GET_PRODUCT_STRING is FILE_ANY_ACCESS, so it works
                 // on this access-0 handle like Get/SetFeature). Best-effort: empty on failure.
                 let mut prod = [0u16; 127];
                 let product = if HidD_GetProductString(
                     h,
-                    prod.as_mut_ptr() as *mut c_void,
+                    prod.as_mut_ptr().cast::<c_void>(),
                     (prod.len() * 2) as u32,
                 ) != 0
                 {
@@ -245,9 +245,9 @@ pub fn enumerate() -> Result<Vec<HidDeviceInfo>> {
     let mut out = Vec::new();
     unsafe {
         let mut guid: GUID = std::mem::zeroed();
-        HidD_GetHidGuid(&mut guid);
+        HidD_GetHidGuid(&raw mut guid);
         let set = SetupDiGetClassDevsW(
-            &guid,
+            &raw const guid,
             ptr::null(),
             ptr::null_mut(),
             DIGCF_PRESENT | DIGCF_DEVICEINTERFACE,
@@ -260,7 +260,7 @@ pub fn enumerate() -> Result<Vec<HidDeviceInfo>> {
         loop {
             let mut ifa: SP_DEVICE_INTERFACE_DATA = std::mem::zeroed();
             ifa.cbSize = std::mem::size_of::<SP_DEVICE_INTERFACE_DATA>() as u32;
-            if SetupDiEnumDeviceInterfaces(set, ptr::null_mut(), &guid, idx, &mut ifa) == 0 {
+            if SetupDiEnumDeviceInterfaces(set, ptr::null_mut(), &raw const guid, idx, &raw mut ifa) == 0 {
                 break;
             }
             idx += 1;
@@ -268,29 +268,29 @@ pub fn enumerate() -> Result<Vec<HidDeviceInfo>> {
             let mut req = 0u32;
             SetupDiGetDeviceInterfaceDetailW(
                 set,
-                &ifa,
+                &raw const ifa,
                 ptr::null_mut(),
                 0,
-                &mut req,
+                &raw mut req,
                 ptr::null_mut(),
             );
             if req == 0 {
                 continue;
             }
             let mut buf = vec![0u8; req as usize];
-            let detail = buf.as_mut_ptr() as *mut SP_DEVICE_INTERFACE_DETAIL_DATA_W;
+            let detail = buf.as_mut_ptr().cast::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>();
             // cbSize is the size of the fixed header: 8 on 64-bit, 6 on 32-bit.
             (*detail).cbSize = if cfg!(target_pointer_width = "64") {
                 8
             } else {
                 6
             };
-            if SetupDiGetDeviceInterfaceDetailW(set, &ifa, detail, req, &mut req, ptr::null_mut())
+            if SetupDiGetDeviceInterfaceDetailW(set, &raw const ifa, detail, req, &raw mut req, ptr::null_mut())
                 == 0
             {
                 continue;
             }
-            let path_ptr = ptr::addr_of!((*detail).DevicePath) as *const u16;
+            let path_ptr = ptr::addr_of!((*detail).DevicePath).cast::<u16>();
             let path = wide_from_ptr(path_ptr);
             if let Some(info) = query(&path) {
                 out.push(info);
@@ -303,14 +303,14 @@ pub fn enumerate() -> Result<Vec<HidDeviceInfo>> {
 
 pub struct WinHid {
     handle: HANDLE,
-    /// Whether `handle` was opened with GENERIC_WRITE. The feature-report path (Get/SetFeature) is
-    /// FILE_ANY_ACCESS and works at access 0 either way; only `write_output` (a real WriteFile)
+    /// Whether `handle` was opened with `GENERIC_WRITE`. The feature-report path (Get/SetFeature) is
+    /// `FILE_ANY_ACCESS` and works at access 0 either way; only `write_output` (a real `WriteFile`)
     /// needs write access, so this lets it error HONESTLY when we only got the access-0 fallback.
     can_write: bool,
     /// Kept so `read_input` can lazily open its OWN overlapped read handle on first use (the trait
     /// method takes `&self`). The proven feature-report handle can't do a timed read.
     path: DevicePath,
-    /// Lazily-opened GENERIC_READ + FILE_FLAG_OVERLAPPED handle for `read_input`. `Mutex` gives the
+    /// Lazily-opened `GENERIC_READ` + `FILE_FLAG_OVERLAPPED` handle for `read_input`. `Mutex` gives the
     /// interior mutability the `&self` trait method needs; `WinHid` is single-threaded per `Device`
     /// so the lock is uncontended. `None` until the first `read_input`.
     read_handle: Mutex<Option<HANDLE>>,
@@ -460,7 +460,7 @@ unsafe impl Sync for OsWireMutex {}
 
 impl OsWireMutex {
     /// The named mutex for a device pipe. The name must be STABLE ACROSS PROCESSES, so it's an
-    /// FNV-1a hash of the path's UTF-16 units — NOT `DefaultHasher`, whose SipHash keys are
+    /// FNV-1a hash of the path's UTF-16 units — NOT `DefaultHasher`, whose `SipHash` keys are
     /// randomized per process (two processes would derive two different names and never meet).
     /// `Local\` namespace = this login session, the only place two neuron processes coexist
     /// (and it needs no privilege, unlike `Global\`).
@@ -468,7 +468,7 @@ impl OsWireMutex {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
         for unit in path.to_wide_nul() {
             for b in unit.to_le_bytes() {
-                h = (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3);
+                h = (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
             }
         }
         Self::open_named(&format!("Local\\neuron-wire-{h:016x}"))
@@ -487,7 +487,7 @@ impl OsWireMutex {
     pub(super) fn open_named(name: &str) -> Option<OsWireMutex> {
         unsafe {
             let mut sd: SECURITY_DESCRIPTOR = std::mem::zeroed();
-            let psd = &mut sd as *mut SECURITY_DESCRIPTOR as *mut c_void;
+            let psd = (&raw mut sd).cast::<c_void>();
             if InitializeSecurityDescriptor(psd, SECURITY_DESCRIPTOR_REVISION) == 0 {
                 return None;
             }
@@ -504,7 +504,7 @@ impl OsWireMutex {
             let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
             // bInitialOwner = FALSE: creating must not implicitly acquire — acquisition is
             // exclusively WireLock::acquire's job, or the create-path would deadlock itself.
-            let handle = CreateMutexW(&sa, 0, wide.as_ptr());
+            let handle = CreateMutexW(&raw const sa, 0, wide.as_ptr());
             if handle.is_null() {
                 None
             } else {
@@ -556,7 +556,7 @@ impl Transport for WinHid {
 
     fn set_feature(&self, buf: &[u8]) -> Result<()> {
         unsafe {
-            if HidD_SetFeature(self.handle, buf.as_ptr() as *const c_void, buf.len() as u32) == 0 {
+            if HidD_SetFeature(self.handle, buf.as_ptr().cast::<c_void>(), buf.len() as u32) == 0 {
                 bail!("HidD_SetFeature failed");
             }
         }
@@ -566,7 +566,7 @@ impl Transport for WinHid {
         unsafe {
             if HidD_GetFeature(
                 self.handle,
-                buf.as_mut_ptr() as *mut c_void,
+                buf.as_mut_ptr().cast::<c_void>(),
                 buf.len() as u32,
             ) == 0
             {
@@ -592,9 +592,9 @@ impl Transport for WinHid {
             let mut written: u32 = 0;
             if WriteFile(
                 self.handle,
-                buf.as_ptr() as *const c_void,
+                buf.as_ptr().cast::<c_void>(),
                 buf.len() as u32,
-                &mut written,
+                &raw mut written,
                 ptr::null_mut(),
             ) == 0
             {

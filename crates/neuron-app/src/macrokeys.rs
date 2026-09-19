@@ -8,7 +8,7 @@
 //! PUSHES a vendor HID input report on a readable sibling collection (the generic-desktop `u=0x0000`
 //! collection — the same place a Razer mouse's event reports ride): report id `0x04`, 16 bytes,
 //! carrying the ARRAY of currently-held macro-key codes (`0x20`=M1, `0x21`=M2 … `0x01`=FN,
-//! `0x00`=released). Captured live from a BlackWidow Chroma V2 and matching OpenRazer's
+//! `0x00`=released). Captured live from a `BlackWidow` Chroma V2 and matching `OpenRazer`'s
 //! `razer_raw_event` — the `0x04` report is a Razer PROTOCOL constant, not a per-board fact.
 //!
 //! We read that report and inject each held code as a bindable `(RAZER_MACRO_PAGE, code)` control via
@@ -64,7 +64,7 @@ pub fn start() {
         .devices
         .iter()
         .filter(|d| d.supports(Capability::Dpi))
-        .flat_map(|d| d.owned_event_pids())
+        .flat_map(neuron::registry::DeviceDef::owned_event_pids)
         .collect();
 
     ensure_driver_mode(reg, &mouse_pids);
@@ -72,8 +72,8 @@ pub fn start() {
     let armed: Arc<Mutex<HashSet<DevicePath>>> = Arc::new(Mutex::new(HashSet::new()));
     arm_new(&mouse_pids, &armed);
 
-    let mon = armed.clone();
-    let mice = mouse_pids.clone();
+    let mon = armed;
+    let mice = mouse_pids;
     crate::worker::spawn_detached("neuron-macrokeys-mon", move || loop {
         thread::sleep(HOTPLUG_POLL);
         if let Some(reg) = registry() {
@@ -145,7 +145,7 @@ fn spawn_reader(pid: u16, path: DevicePath, armed: Arc<Mutex<HashSet<DevicePath>
     // `armed` claimed this collection's path in `arm_new` before this spawn — the release below is
     // the ONE place that un-claims it (open failure, read-loop exit, spawn refusal/panic), so the
     // monitor can always retry a stranded claim instead of a collection going deaf forever.
-    let release_armed = armed.clone();
+    let release_armed = armed;
     let release_path = path.clone();
     crate::worker::spawn_guarded(
         "neuron-macrokeys",
@@ -206,7 +206,7 @@ fn decode(buf: &[u8], pid: u16) {
         .iter()
         .copied()
         .filter(|&c| c != 0)
-        .map(|c| (neuron::controls::RAZER_MACRO_PAGE, c as u16))
+        .map(|c| (neuron::controls::RAZER_MACRO_PAGE, u16::from(c)))
         .collect();
     if verbose() {
         eprintln!("[macrokeys] pid={pid:04x} macro hits={hits:02x?}");

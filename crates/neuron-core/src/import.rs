@@ -13,9 +13,9 @@
 //! * `*.synapse3` — a device profile ZIP: `DeviceInfo.xml` (Name/PID/VID/Serial),
 //!   `Profiles/<guid>.xml`, `Macros/` (often empty), and `Features/<profileGuid>/<featureGuid>.xml`
 //!   one per capability. Capabilities are keyed by a **stable feature-GUID** identical across
-//!   devices (LedBrightness 6c91bf99, PollingRate 1ca05056, DPI bc7fc799, DPIStages 25f22ab7,
-//!   ScrollWheel 27838d6a, ScrollWheelStages 429f8d88, GamingMode a04163a1, LedPowerSettings
-//!   a8664fc4, InGamePollingRate 8997620a, LightingEffects 03bec892, Mappings 762555eb) — import
+//!   devices (`LedBrightness` 6c91bf99, `PollingRate` 1ca05056, DPI bc7fc799, `DPIStages` 25f22ab7,
+//!   `ScrollWheel` 27838d6a, `ScrollWheelStages` 429f8d88, `GamingMode` a04163a1, `LedPowerSettings`
+//!   a8664fc4, `InGamePollingRate` 8997620a, `LightingEffects` 03bec892, Mappings 762555eb) — import
 //!   by GUID is version/device-agnostic for free.
 //! * `*.ChromaEffects` — one XML: `Mode` basic (named effect + palette) or advanced (per-cell /
 //!   per-layer). An advanced stack maps WHOLE onto Neuron's compositor — every animated layer
@@ -24,7 +24,7 @@
 //!
 //! ## Normalization (drop the noise)
 //! Mappings: drop identity binds (a key that maps to its own default scancode = Synapse's default
-//! fill, not user intent) and the HyperShift identity fill; split base vs `IsHyperShift`; resolve
+//! fill, not user intent) and the `HyperShift` identity fill; split base vs `IsHyperShift`; resolve
 //! DKM/HID/Mouse input -> a friendly [`crate::engine::Trigger`] + typed [`crate::action::Action`].
 //! Lighting: `basic` -> a named effect + colour on the [`Profile`]; `advanced` -> a Neuron
 //! compositor layer stack (one [`crate::pattern::LayerDef`] per animated layer) plus, if present, a
@@ -68,6 +68,7 @@ impl FeatureGuid {
     /// known capability. Matches on the leading GUID segment (the first dash-group), which is the
     /// stable part identical across devices. Returns `None` for GUIDs Neuron doesn't ingest
     /// (forward-compatible: an unknown feature is logged + skipped, not an error).
+    #[must_use]
     pub fn from_guid(guid: &str) -> Option<FeatureGuid> {
         // The first 8 hex chars (before the first '-') uniquely identify the capability.
         let head = guid.split('-').next().unwrap_or(guid).to_ascii_lowercase();
@@ -88,6 +89,7 @@ impl FeatureGuid {
     }
 
     /// Human label for notes/logs.
+    #[must_use]
     pub fn label(self) -> &'static str {
         match self {
             FeatureGuid::LedBrightness => "LedBrightness",
@@ -112,7 +114,7 @@ impl FeatureGuid {
 pub struct Imported {
     /// The settings bundle (DPI/polling/brightness/lighting/idle/...), all optional.
     pub profile: Profile,
-    /// The remap/macro surface as spine rules (base + HyperShift split is encoded in each
+    /// The remap/macro surface as spine rules (base + `HyperShift` split is encoded in each
     /// rule's `Trigger`/`Action`).
     pub rules: Vec<Rule>,
     /// Non-fatal notes (skipped layers, unrecognized GUIDs, fields Neuron can't yet store) for
@@ -142,7 +144,7 @@ pub fn import_export(path: &Path) -> Result<Imported> {
 pub fn import_export_bytes(bytes: &[u8]) -> Result<Imported> {
     let zip = zip::ZipArchive::new(Cursor::new(bytes))
         .context("export is not a ZIP (Synapse exports are ZIPs with a fake extension)")?;
-    let names: Vec<String> = zip.file_names().map(|s| s.to_string()).collect();
+    let names: Vec<String> = zip.file_names().map(std::string::ToString::to_string).collect();
     let has_device_info = names.iter().any(|n| n.ends_with("DeviceInfo.xml"));
     if has_device_info {
         import_synapse3(bytes)
@@ -152,7 +154,7 @@ pub fn import_export_bytes(bytes: &[u8]) -> Result<Imported> {
     }
 }
 
-/// Parse a `*.synapse3` device-profile ZIP into an [`Imported`] bundle (DeviceInfo + Features +
+/// Parse a `*.synapse3` device-profile ZIP into an [`Imported`] bundle (`DeviceInfo` + Features +
 /// Mappings).
 pub fn import_synapse3(zip_bytes: &[u8]) -> Result<Imported> {
     let mut zip = zip::ZipArchive::new(Cursor::new(zip_bytes)).context("opening .synapse3 ZIP")?;
@@ -173,19 +175,19 @@ pub fn import_synapse3(zip_bytes: &[u8]) -> Result<Imported> {
     let profile_member = zip
         .file_names()
         .find(|n| n.contains("Profiles/") && n.ends_with(".xml"))
-        .map(|s| s.to_string());
+        .map(std::string::ToString::to_string);
     let profile_name = profile_member
         .and_then(|n| read_member(&mut zip, &n))
         .and_then(|xml| scalar(&xml, "Name"));
     out.profile.name = profile_name
-        .clone()
+        
         .unwrap_or_else(|| "synapse-import".to_string());
 
     // ── features: dispatch each Features/<profile>/<guid>.xml on its stable GUID ──────────────
     let feature_members: Vec<String> = zip
         .file_names()
         .filter(|n| n.contains("Features/") && n.ends_with(".xml"))
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
         .collect();
 
     for member in feature_members {
@@ -224,7 +226,7 @@ pub fn import_chroma_effects(zip_bytes: &[u8]) -> Result<Imported> {
     let members: Vec<String> = zip
         .file_names()
         .filter(|n| n.ends_with(".xml"))
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
         .collect();
     if members.is_empty() {
         anyhow::bail!("no XML inside .ChromaEffects archive");
@@ -297,8 +299,7 @@ fn ingest_feature(feat: FeatureGuid, xml: &str, out: &mut Imported) {
             // mouse export) sets nothing.
             let on = |tag: &str| {
                 scalar(xml, tag)
-                    .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
-                    .unwrap_or(false)
+                    .is_some_and(|s| s == "1" || s.eq_ignore_ascii_case("true"))
             };
             out.profile.disable_alt_tab = on("DisableAltTabState");
             out.profile.disable_win = on("DisableWinState") || on("DisableWindowsKeyState");
@@ -321,8 +322,7 @@ fn ingest_feature(feat: FeatureGuid, xml: &str, out: &mut Imported) {
             // LED idle-off timeout -> Profile.idle_secs (lossless). Only when the idle state is
             // enabled (<IdleState>1</IdleState>); a disabled idle leaves it unset.
             let enabled = scalar(xml, "IdleState")
-                .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
-                .unwrap_or(true);
+                .is_none_or(|s| s == "1" || s.eq_ignore_ascii_case("true"));
             let secs = scalar(xml, "IdleStateValue").and_then(|s| s.parse::<u32>().ok());
             if let Some(secs) = secs {
                 if enabled {
@@ -358,9 +358,9 @@ fn ingest_feature(feat: FeatureGuid, xml: &str, out: &mut Imported) {
     }
 }
 
-/// The `<Mode>` of the active HyperScroll stage — read from inside the `<ActiveScrollStage>`
+/// The `<Mode>` of the active `HyperScroll` stage — read from inside the `<ActiveScrollStage>`
 /// block (the authoritative active marker), not the first `<Mode>` in the document. Returns the
-/// mode name (e.g. "FreeScroll") or `None` if the block/mode is absent.
+/// mode name (e.g. "`FreeScroll`") or `None` if the block/mode is absent.
 fn active_scroll_mode(xml: &str) -> Option<String> {
     let block = split_blocks(xml, "ActiveScrollStage").into_iter().next()?;
     scalar(&block, "Mode")
@@ -402,8 +402,7 @@ fn parse_dpi_stages(xml: &str) -> Vec<DpiStage> {
         let dpi = scalar(&block, "X").and_then(|s| s.parse::<u16>().ok());
         // A per-stage <Active>false</Active> marks a DISABLED slot.
         let disabled = scalar(&block, "Active")
-            .map(|s| s.eq_ignore_ascii_case("false"))
-            .unwrap_or(false);
+            .is_some_and(|s| s.eq_ignore_ascii_case("false"));
         if let Some(dpi) = dpi {
             stages.push(DpiStage {
                 dpi,
@@ -436,21 +435,19 @@ fn ingest_lighting(xml: &str, out: &mut Imported) {
         let effect = scalar(xml, "Effect").unwrap_or_else(|| "static".to_string());
         let color = first_rzcolor(xml);
         let layer = map_synapse_effect(&effect)
-            .and_then(crate::pattern::preset_layer)
-            .map(|mut l| {
+            .and_then(crate::pattern::preset_layer).map_or_else(|| crate::pattern::LayerDef {
+                pattern: "uniform".into(),
+                spectrum: crate::spectrum::Spectrum::solid(
+                    color.unwrap_or_else(|| Rgb::new(0x4A, 0xF2, 0xB0)),
+                ),
+                ..Default::default()
+            }, |mut l| {
                 if synapse_effect_is_colored(&effect) {
                     if let Some(c) = color {
                         l.spectrum = l.spectrum.recolored(c);
                     }
                 }
                 l
-            })
-            .unwrap_or_else(|| crate::pattern::LayerDef {
-                pattern: "uniform".into(),
-                spectrum: crate::spectrum::Spectrum::solid(
-                    color.unwrap_or_else(|| Rgb::new(0x4A, 0xF2, 0xB0)),
-                ),
-                ..Default::default()
             });
         out.profile.lighting = vec![layer];
         return;
@@ -550,7 +547,7 @@ fn map_synapse_effect(name: &str) -> Option<&'static str> {
     }
 }
 
-/// Whether a Synapse advanced-layer effect carries a meaningful SINGLE colour (so its imported RzColor
+/// Whether a Synapse advanced-layer effect carries a meaningful SINGLE colour (so its imported `RzColor`
 /// should become the layer's solid spectrum). The rainbow/ramp effects (wave/colorwheel/cycle/fire) own
 /// their palette, so their imported colour is ignored.
 fn synapse_effect_is_colored(name: &str) -> bool {
@@ -601,7 +598,7 @@ fn first_rzcolor(xml: &str) -> Option<Rgb> {
 
 /// Parse the Mappings file into spine [`Rule`]s. Each `<Mapping>` is a physical input -> a typed
 /// assignment group; we drop identity/default binds (a key -> its own default scancode, or a
-/// HyperShift slot left as identity/Disable) and split base vs HyperShift.
+/// `HyperShift` slot left as identity/Disable) and split base vs `HyperShift`.
 fn ingest_mappings(xml: &str, out: &mut Imported) {
     let mut base = 0usize;
     let mut hyper = 0usize;
@@ -610,8 +607,7 @@ fn ingest_mappings(xml: &str, out: &mut Imported) {
 
     for block in split_blocks(xml, "Mapping") {
         let is_hyper = scalar(&block, "IsHyperShift")
-            .map(|s| s == "true")
-            .unwrap_or(false);
+            .is_some_and(|s| s == "true");
 
         let Some((trigger, input_default_scancode)) = mapping_trigger(&block, is_hyper) else {
             dropped_unhandled += 1;
@@ -655,14 +651,13 @@ fn ingest_mappings(xml: &str, out: &mut Imported) {
     }
 
     out.note(format!(
-        "mappings: {} base + {} hypershift bind(s) imported; dropped {} identity/default + {} unhandled",
-        base, hyper, dropped_identity, dropped_unhandled
+        "mappings: {base} base + {hyper} hypershift bind(s) imported; dropped {dropped_identity} identity/default + {dropped_unhandled} unhandled"
     ));
 }
 
 /// Build the [`Trigger`] for a `<Mapping>` block. Returns the trigger plus, for `KeyInput`, the
 /// key's DEFAULT scancode (so an assignment to that same scancode can be recognized as identity
-/// fill and dropped). HyperShift membership is encoded first-class on the emitted [`Rule`] via
+/// fill and dropped). `HyperShift` membership is encoded first-class on the emitted [`Rule`] via
 /// `Rule::on_layer("hypershift", …)` (see [`ingest_mappings`]) — the engine groups by that layer
 /// tag — so the trigger here is just the physical input; base vs held-layer is preserved by the
 /// rule's `layer`, not folded into the trigger.
@@ -719,9 +714,9 @@ fn mapping_trigger(block: &str, _is_hyper: bool) -> Option<(Trigger, Option<u16>
 #[derive(Debug)]
 enum ActionOutcome {
     Action(Action),
-    /// A KeyGroup that just re-types a scancode (carry it so the caller can detect identity fill).
+    /// A `KeyGroup` that just re-types a scancode (carry it so the caller can detect identity fill).
     Identity(u16),
-    /// Explicitly drop (Disable group, or a HyperShift identity slot).
+    /// Explicitly drop (Disable group, or a `HyperShift` identity slot).
     Drop,
     /// A group we recognize but can't yet represent as an Action.
     Unhandled,
@@ -837,7 +832,7 @@ fn profile_switch_action(block: &str) -> ActionOutcome {
 
 /// A `<KeyGroup><KeyAssignment>` -> press a key. Prefer the explicit `<VirtualKey>` (custom
 /// remaps carry it); fall back to mapping the scancode. Returns `Identity(scancode)` when only a
-/// bare scancode is present and no VirtualKey (so the caller can drop default fill).
+/// bare scancode is present and no `VirtualKey` (so the caller can drop default fill).
 fn key_group_action(block: &str) -> ActionOutcome {
     let vk = scalar(block, "VirtualKey").and_then(|s| s.parse::<u16>().ok());
     if let Some(vk) = vk {
@@ -881,7 +876,7 @@ fn mouse_group_action(block: &str) -> ActionOutcome {
     }
 }
 
-/// Map a Synapse MultimediaAssignment to a first-class typed [`Action::Media`] (was previously a
+/// Map a Synapse `MultimediaAssignment` to a first-class typed [`Action::Media`] (was previously a
 /// stringly `Key { key: "media-*" }`). The typed variant is the clean config-row the GUI edits.
 fn multimedia_action(m: &str) -> Action {
     let kind = match m {
@@ -937,7 +932,7 @@ fn mouse_input_usage(name: &str) -> Option<u16> {
     })
 }
 
-/// Map a DKM slot id (DKM_M_01, DKM_SB_03, DKM_RZR, DKM_GAME, DKM_57, ...) to a stable private
+/// Map a DKM slot id (`DKM_M_01`, `DKM_SB_03`, `DKM_RZR`, `DKM_GAME`, `DKM_57`, ...) to a stable private
 /// usage ordinal. We hash the trailing token: numeric suffixes map directly; named slots get a
 /// small fixed table.
 fn dkm_slot_usage(slot: &str) -> Option<u16> {
@@ -1451,14 +1446,14 @@ mod tests {
     /// across whole (4 layers), nothing dropped. Synthetic so it runs on CI (no user file needed).
     #[test]
     fn chroma_advanced_maps_every_animated_layer() {
-        let xml = r#"<LightingEffects><Mode>advanced</Mode><EffectLayers>
+        let xml = r"<LightingEffects><Mode>advanced</Mode><EffectLayers>
             <EffectLayer><Effect>fire</Effect></EffectLayer>
             <EffectLayer><Effect>reactive</Effect>
                 <Colors><RzColor><Green>255</Green></RzColor></Colors></EffectLayer>
             <EffectLayer><Effect>audiometer</Effect>
                 <Colors><RzColor><Blue>255</Blue></RzColor></Colors></EffectLayer>
             <EffectLayer><Effect>colorwheel</Effect></EffectLayer>
-        </EffectLayers></LightingEffects>"#;
+        </EffectLayers></LightingEffects>";
         let mut out = Imported::default();
         ingest_lighting(xml, &mut out);
         // each Synapse effect maps onto its preset's PATTERN: fire→heat, reactive→ignite,
@@ -1527,8 +1522,8 @@ mod tests {
     #[test]
     fn basic_lighting_imports_named_effect_and_color() {
         // Mouse LightingEffects = basic / static / green.
-        let xml = r#"<LightingEffects><Mode>basic</Mode><Effect>static</Effect>
-            <Colors><RzColor><Green>255</Green></RzColor></Colors></LightingEffects>"#;
+        let xml = r"<LightingEffects><Mode>basic</Mode><Effect>static</Effect>
+            <Colors><RzColor><Green>255</Green></RzColor></Colors></LightingEffects>";
         let mut out = Imported::default();
         ingest_lighting(xml, &mut out);
         // a basic "static" effect has no preset -> one solid `uniform` layer in the imported colour.
@@ -1549,11 +1544,11 @@ mod tests {
     fn dpi_top_level_active_index_parsed() {
         // Synthetic, version-independent: enabled stages have NO <Active>; disabled have
         // <Active>false</Active>; the file-level <Active> is the index into the enabled list.
-        let xml = r#"<DPIStages><Stages>
+        let xml = r"<DPIStages><Stages>
             <DPIStage><X>800</X><Y>800</Y></DPIStage>
             <DPIStage><X>1600</X><Y>1600</Y></DPIStage>
             <DPIStage><X>3200</X><Y>3200</Y><Active>false</Active></DPIStage>
-        </Stages><Active>1</Active></DPIStages>"#;
+        </Stages><Active>1</Active></DPIStages>";
         assert_eq!(
             top_level_dpi_active(xml),
             Some(1),
@@ -1587,8 +1582,8 @@ mod tests {
         }
     }
 
-    /// Fix #2: the active HyperScroll stage is the `<Mode>` inside `<ActiveScrollStage>`
-    /// (FreeScroll), not the first `<Mode>` in the document (Adaptive).
+    /// Fix #2: the active `HyperScroll` stage is the `<Mode>` inside `<ActiveScrollStage>`
+    /// (`FreeScroll`), not the first `<Mode>` in the document (Adaptive).
     #[test]
     fn scroll_stage_active_is_freescroll_not_adaptive() {
         let Some(xml) = read(&format!(
@@ -1620,7 +1615,7 @@ mod tests {
     }
 
     /// Fix #3: the keyboard's Profile-group binds (HID101->"launcher", DKM_M_02->"other") migrate
-    /// as Action::ProfileSwitch instead of vanishing.
+    /// as `Action::ProfileSwitch` instead of vanishing.
     #[test]
     fn keyboard_profile_switch_binds_present() {
         let Some(_) = read(&format!(r"{SYNX}\DeviceInfo.xml")) else {
@@ -1646,19 +1641,19 @@ mod tests {
         );
     }
 
-    /// Profile-switch resolution directly (synthetic, both InputTypes).
+    /// Profile-switch resolution directly (synthetic, both `InputTypes`).
     #[test]
     fn profile_group_resolves_to_profile_switch() {
-        let block = r#"<MappingGroup>Profile</MappingGroup><InputType>KeyInput</InputType>
+        let block = r"<MappingGroup>Profile</MappingGroup><InputType>KeyInput</InputType>
             <KeyInput><HID_Page>7</HID_Page><HID_Id>101</HID_Id></KeyInput>
-            <ProfileGroup><Name>launcher</Name><ProfileId>x</ProfileId></ProfileGroup>"#;
+            <ProfileGroup><Name>launcher</Name><ProfileId>x</ProfileId></ProfileGroup>";
         match mapping_action(block, "Profile") {
             ActionOutcome::Action(Action::ProfileSwitch { name }) => assert_eq!(name, "launcher"),
             other => panic!("expected ProfileSwitch, got {other:?}"),
         }
     }
 
-    /// Fix #4: imported HyperShift binds are tagged onto the "hypershift" layer (base vs held-layer
+    /// Fix #4: imported `HyperShift` binds are tagged onto the "hypershift" layer (base vs held-layer
     /// preserved first-class, regroup-able by `Engine::from_rules`).
     #[test]
     fn mouse_hypershift_binds_tagged_on_layer() {
@@ -1679,9 +1674,9 @@ mod tests {
         );
         assert!(base > 0, "base rules still present (got {base})");
         // The engine must group them: hypershift rules land in the layer, base in the base set.
-        let eng = crate::engine::Engine::from_rules(imp.rules.clone());
+        let eng = crate::engine::Engine::from_rules(imp.rules);
         assert_eq!(
-            eng.layers.get("hypershift").map(|v| v.len()),
+            eng.layers.get("hypershift").map(std::vec::Vec::len),
             Some(hyper),
             "layer grouped"
         );
@@ -1693,19 +1688,19 @@ mod tests {
     #[test]
     fn cycle_and_mouse_groups_emit_new_variants() {
         // Sensitivity DPI_CycleUp -> DpiCycle{Up}
-        let sens = r#"<SensitivityGroup><SensitivityAssignment>DPI_CycleUp</SensitivityAssignment></SensitivityGroup>"#;
+        let sens = r"<SensitivityGroup><SensitivityAssignment>DPI_CycleUp</SensitivityAssignment></SensitivityGroup>";
         assert!(matches!(
             mapping_action(sens, "Sensitivity"),
             ActionOutcome::Action(Action::DpiCycle { dir: Direction::Up })
         ));
         // Scrolling Cycle_Up_Scroll_Wheel_Stages -> ScrollStageCycle{Up}
-        let scr = r#"<ScrollingGroup><ScrollingAssignment>Cycle_Up_Scroll_Wheel_Stages</ScrollingAssignment></ScrollingGroup>"#;
+        let scr = r"<ScrollingGroup><ScrollingAssignment>Cycle_Up_Scroll_Wheel_Stages</ScrollingAssignment></ScrollingGroup>";
         assert!(matches!(
             mapping_action(scr, "Scrolling"),
             ActionOutcome::Action(Action::ScrollStageCycle { dir: Direction::Up })
         ));
         // ProfileNavigation CycleUp -> ProfileCycle{Up}
-        let nav = r#"<ProfileNavigationGroup><ProfileNavigationAssignment>CycleUp</ProfileNavigationAssignment></ProfileNavigationGroup>"#;
+        let nav = r"<ProfileNavigationGroup><ProfileNavigationAssignment>CycleUp</ProfileNavigationAssignment></ProfileNavigationGroup>";
         assert!(matches!(
             mapping_action(nav, "ProfileNavigation"),
             ActionOutcome::Action(Action::ProfileCycle { dir: Direction::Up })
@@ -1770,7 +1765,7 @@ mod tests {
         );
     }
 
-    /// Fix #6a: LedPowerSettings IdleStateValue -> Profile.idle_secs (60s on the real mouse).
+    /// Fix #6a: `LedPowerSettings` `IdleStateValue` -> `Profile.idle_secs` (60s on the real mouse).
     #[test]
     fn led_power_populates_idle_secs() {
         let Some(xml) = read(&format!(
@@ -1784,7 +1779,7 @@ mod tests {
         assert_eq!(out.profile.idle_secs, Some(60), "idle-off after 60s");
     }
 
-    /// Fix #6b: GamingMode DisableAltTabState=1 -> Profile.disable_alt_tab (keyboard export).
+    /// Fix #6b: `GamingMode` DisableAltTabState=1 -> `Profile.disable_alt_tab` (keyboard export).
     #[test]
     fn gaming_mode_populates_disable_alt_tab() {
         let Some(xml) = read(&format!(
@@ -1808,7 +1803,7 @@ mod tests {
         );
     }
 
-    /// Fix #6c: InGamePollingRate -> Profile.in_game_polling lossless pair (1000/1000 on mouse).
+    /// Fix #6c: `InGamePollingRate` -> `Profile.in_game_polling` lossless pair (1000/1000 on mouse).
     #[test]
     fn in_game_polling_populates_pair() {
         let Some(xml) = read(&format!(
@@ -1835,13 +1830,13 @@ mod tests {
     /// profile's lighting stack (one [R,G,B] per painted cell) instead of flattening to one colour.
     #[test]
     fn advanced_static_frame_is_lossless() {
-        let xml = r#"<LightingEffects><Mode>advanced</Mode><EffectLayers>
+        let xml = r"<LightingEffects><Mode>advanced</Mode><EffectLayers>
             <EffectLayer><Effect>static</Effect><Regions><EffectRegion><Colors>
                 <RzColor><Red>255</Red></RzColor>
                 <RzColor><Green>255</Green></RzColor>
                 <RzColor><Blue>255</Blue></RzColor>
             </Colors></EffectRegion></Regions></EffectLayer>
-        </EffectLayers></LightingEffects>"#;
+        </EffectLayers></LightingEffects>";
         let mut out = Imported::default();
         ingest_lighting(xml, &mut out);
         // one custom layer whose frame is the per-LED cells, verbatim.
@@ -1858,7 +1853,7 @@ mod tests {
         );
     }
 
-    /// The user's real .ChromaEffects export (fire + reactive + audiometer + colorwheel, no static
+    /// The user's real .`ChromaEffects` export (fire + reactive + audiometer + colorwheel, no static
     /// layer) now comes across WHOLE as a Neuron compositor stack — every animated layer mapped, a
     /// composite lighting mode set, and (since no layer is static) no per-LED frame fabricated.
     #[test]
@@ -2062,7 +2057,7 @@ mod tests {
     }
 
     /// Unbalanced / hostile XML through the block splitter and scalar puller: stray closes,
-    /// deep nesting, interleaved tags, NUL-laden text. The parsers are iterative and quick_xml
+    /// deep nesting, interleaved tags, NUL-laden text. The parsers are iterative and `quick_xml`
     /// name-checking rejects mismatches — this pins that NO shape panics or hangs, including the
     /// stray-close case that a `usize` depth underflow would have turned into a crash.
     #[test]

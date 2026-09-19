@@ -23,7 +23,7 @@ fn hexdump(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02X} ")).collect()
 }
 
-/// Read one feature report at `report_id` (buf[0]=id, as HidD_GetFeature requires). `None` = refused.
+/// Read one feature report at `report_id` (buf[0]=id, as `HidD_GetFeature` requires). `None` = refused.
 fn read_feature(path: &transport::DevicePath, report_id: u8) -> Option<Vec<u8>> {
     let t = transport::open_path(path).ok()?;
     let mut buf = vec![0u8; BUF];
@@ -31,7 +31,7 @@ fn read_feature(path: &transport::DevicePath, report_id: u8) -> Option<Vec<u8>> 
     t.get_feature(&mut buf).ok().map(|_| buf)
 }
 
-/// Send a razer_report REQUEST in the 64-byte / id-0x07 envelope and read the reply on the SAME
+/// Send a `razer_report` REQUEST in the 64-byte / id-0x07 envelope and read the reply on the SAME
 /// handle. Read-only when `id` is a getter (0x80 bit). CRC = XOR(buf[2..=61]) @ buf[62].
 fn razer_query(path: &transport::DevicePath, class: u8, id: u8, size: u8) -> Option<[u8; BUF]> {
     let t = transport::open_path(path).ok()?;
@@ -140,7 +140,7 @@ fn drain(rx: &std::sync::mpsc::Receiver<u8>, ms: u64) -> Option<u8> {
     last
 }
 
-/// Send a razer_report command (set_feature only, no reply read) in the 64B / id-0x07 envelope.
+/// Send a `razer_report` command (`set_feature` only, no reply read) in the 64B / id-0x07 envelope.
 fn razer_set(path: &transport::DevicePath, class: u8, id: u8, arg: u8) -> bool {
     let Ok(t) = transport::open_path(path) else {
         return false;
@@ -279,7 +279,7 @@ fn manual(info: &transport::HidDeviceInfo) -> anyhow::Result<()> {
 }
 
 /// Dump the mute register's STRUCTURE (read-only) to inform the setter shape: the full 0x08/0x88
-/// reply (data_size + all body bytes), the same getter probed with store-selector args (does it have
+/// reply (`data_size` + all body bytes), the same getter probed with store-selector args (does it have
 /// volatile/persisted planes like DPI?), and the whole class-0x08 getter map (0x80..=0x8F) so we see
 /// every register the mute class exposes.
 fn muteinfo(info: &transport::HidDeviceInfo) -> anyhow::Result<()> {
@@ -457,7 +457,7 @@ fn trymute(info: &transport::HidDeviceInfo) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// READ-ONLY getter MAP: on a reused handle, first self-test the write path (device_mode getter must
+/// READ-ONLY getter MAP: on a reused handle, first self-test the write path (`device_mode` getter must
 /// echo), then sweep every getter (class 0x00..=0x3F, id 0x80..=0xBF) and print each LIVE reply (one
 /// that echoes our class/id — i.e. not stale) with its first 12 arg bytes. Run this ONCE with the mic
 /// MUTED and once LIVE, then `diff` the two dumps: the getter whose bytes differ is the mute register,
@@ -506,7 +506,7 @@ fn readmap(info: &transport::HidDeviceInfo) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Send one razer_report command on a REUSED handle (no per-command CreateFile — the discovery
+/// Send one `razer_report` command on a REUSED handle (no per-command `CreateFile` — the discovery
 /// sweep sends thousands, so the handle open dominates otherwise). Envelope: report id 0x07, txid
 /// 0x1F, CRC XOR(buf[2..=61]) @ buf[62]. Args placed from buf[9].
 fn send_cmd(t: &dyn Transport, class: u8, id: u8, size: u8, args: &[u8]) {
@@ -610,7 +610,7 @@ fn discover(info: &transport::HidDeviceInfo) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Passively read the vendor collection's INPUT reports (direct ReadFile, bypassing Raw Input's
+/// Passively read the vendor collection's INPUT reports (direct `ReadFile`, bypassing Raw Input's
 /// cooked path) while the user taps the physical mute. Fully read-only. If the self-contained
 /// firmware pushes a report on state change, the tap-mute byte shows up here directly.
 fn input_watch(info: &transport::HidDeviceInfo) -> anyhow::Result<()> {

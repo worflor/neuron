@@ -18,7 +18,7 @@ pub fn firmware(dev: &Device) -> Result<String> {
 /// Battery charge as a percentage. Device reports 0..=255; we scale to 0..=100.
 pub fn battery_percent(dev: &Device) -> Result<u8> {
     let a = dev.run("battery_level")?;
-    let raw = a[1] as u32; // byte[1] carries the level (byte[0] observed 0)
+    let raw = u32::from(a[1]); // byte[1] carries the level (byte[0] observed 0)
     Ok(((raw * 100 + 127) / 255) as u8)
 }
 
@@ -34,16 +34,16 @@ pub fn device_mode(dev: &Device) -> Result<u8> {
     Ok(a[0])
 }
 
-/// Firmware GAME MODE — the keyboard's own FN+F10-toggled Win-key kill (the GAME_LED state). When
+/// Firmware GAME MODE — the keyboard's own FN+F10-toggled Win-key kill (the `GAME_LED` state). When
 /// ON, the board eats the Windows key in FIRMWARE with ZERO software running: it is the device-
 /// PHYSICAL sibling of the host-side KEY GUARD chord swallows (which live in `crate::hook`). This
 /// is exactly what silently ate the user's Win key on 2026-07-07 while every host layer read clean.
 ///
-/// Hardware-confirmed on the BlackWidow Chroma V2 (2026-07-07): the getter (0x03/0x80, baked args
+/// Hardware-confirmed on the `BlackWidow` Chroma V2 (2026-07-07): the getter (0x03/0x80, baked args
 /// `[varstore, GAME_LED 0x08]`) echoes the state at response arg[2] (0 = off, nonzero = on).
 ///
 /// NOTE the FN+F10 hardware toggle itself only works in NORMAL device mode — in driver mode the
-/// board defers FN combos to software (OpenRazer #1174 is the same bug class), so while neuron is
+/// board defers FN combos to software (`OpenRazer` #1174 is the same bug class), so while neuron is
 /// driving the board the SOFTWARE path ([`set_game_mode`]) is the reliable way to flip it.
 pub fn game_mode(dev: &Device) -> Result<bool> {
     let a = dev.run("game_mode")?;
@@ -52,7 +52,7 @@ pub fn game_mode(dev: &Device) -> Result<bool> {
 
 /// Set the firmware GAME MODE (the Win-key kill) on/off, then READ-BACK VERIFY it landed. Writes via
 /// `set_game_mode` (0x03/0x00, args `[varstore, GAME_LED 0x08, state]`) — the hardware-confirmed
-/// setter (2026-07-07: `[00 08 00]` ACKed and read back, the GAME_LED visibly went dark on the
+/// setter (2026-07-07: `[00 08 00]` `ACKed` and read back, the `GAME_LED` visibly went dark on the
 /// software write) — then re-reads the [`game_mode`] getter and bails with an honest MISMATCH error
 /// if the board doesn't report the state we asked for. This mirrors the verify-gated discipline of
 /// `writes::verify_getter` in spirit; a plain re-read + compare is enough here since both the setter
@@ -62,7 +62,7 @@ pub fn game_mode(dev: &Device) -> Result<bool> {
 /// the firmware Win-key kill surfaced beside it. See [`game_mode`]'s note on why the software path is
 /// the reliable one while neuron holds the board in driver mode.
 pub fn set_game_mode(dev: &Device, on: bool) -> Result<()> {
-    let state = on as u8;
+    let state = u8::from(on);
     dev.run_args("set_game_mode", &[0x00, 0x08, state])?;
     // Read-back verify: a lighting/LED write can ACK yet not land, so we never trust the write —
     // the getter must echo the state we asked for, or this is a failure (not a silent success).
@@ -75,11 +75,11 @@ pub fn set_game_mode(dev: &Device, on: bool) -> Result<()> {
     Ok(())
 }
 
-/// Current sensitivity, (DPI_X, DPI_Y). Response is [varstore, X_hi, X_lo, Y_hi, Y_lo].
+/// Current sensitivity, (`DPI_X`, `DPI_Y`). Response is [varstore, `X_hi`, `X_lo`, `Y_hi`, `Y_lo`].
 pub fn dpi(dev: &Device) -> Result<(u16, u16)> {
     let a = dev.run("dpi")?;
-    let x = ((a[1] as u16) << 8) | a[2] as u16;
-    let y = ((a[3] as u16) << 8) | a[4] as u16;
+    let x = (u16::from(a[1]) << 8) | u16::from(a[2]);
+    let y = (u16::from(a[3]) << 8) | u16::from(a[4]);
     Ok((x, y))
 }
 
@@ -94,12 +94,14 @@ pub enum Store {
 
 impl Store {
     /// The varstore arg byte.
+    #[must_use]
     pub fn byte(self) -> u8 {
         match self {
             Store::Volatile => 0x00,
             Store::Persist => 0x01,
         }
     }
+    #[must_use]
     pub fn from_persist(persist: bool) -> Self {
         if persist {
             Store::Persist
@@ -158,7 +160,7 @@ pub fn set_dpi(dev: &Device, x: u16, y: u16, store: Store, cause: crate::dpi_ori
 /// Polling rate in Hz. Device reports a divisor of 1000 (1→1000, 2→500, 4→250, 8→125).
 pub fn polling_rate_hz(dev: &Device) -> Result<u32> {
     let a = dev.run("polling_rate")?;
-    let div = a[0] as u32;
+    let div = u32::from(a[0]);
     Ok(1000u32.checked_div(div).unwrap_or(0))
 }
 
@@ -171,10 +173,10 @@ pub fn set_polling_hz(dev: &Device, hz: u32) -> Result<u32> {
         _ => 8,
     };
     dev.run_args("set_polling", &[div])?;
-    Ok(1000 / div as u32)
+    Ok(1000 / u32::from(div))
 }
 
-/// Map a target Hz to the hi-res polling code (OpenRazer polling2: 0x01=8000 … 0x40=125Hz).
+/// Map a target Hz to the hi-res polling code (`OpenRazer` polling2: 0x01=8000 … 0x40=125Hz).
 fn polling2_code(hz: u32) -> u8 {
     match hz {
         h if h >= 8000 => 0x01,
@@ -188,6 +190,7 @@ fn polling2_code(hz: u32) -> u8 {
 }
 
 /// Inverse of [`polling2_code`].
+#[must_use]
 pub fn polling2_code_to_hz(code: u8) -> u32 {
     match code {
         0x01 => 8000,
@@ -202,7 +205,8 @@ pub fn polling2_code_to_hz(code: u8) -> u32 {
 }
 
 /// Hi-res polling rate via the newer command (0x00/0xC0), if the device exposes it. Returns `None`
-/// when the device only has the legacy divisor path. Confirmed opcode (OpenRazer polling2).
+/// when the device only has the legacy divisor path. Confirmed opcode (`OpenRazer` polling2).
+#[must_use]
 pub fn polling_rate_hz_hires(dev: &Device) -> Option<u32> {
     let a = dev.run("polling2").ok()?;
     let hz = polling2_code_to_hz(a.first().copied().unwrap_or(0));
@@ -210,7 +214,7 @@ pub fn polling_rate_hz_hires(dev: &Device) -> Option<u32> {
 }
 
 /// Set polling via the hi-res command (0x00/0x40 = `[arg0, code]`) — supports up to 8000Hz on
-/// devices that have a HyperPolling path. Returns the Hz actually selected.
+/// devices that have a `HyperPolling` path. Returns the Hz actually selected.
 pub fn set_polling_hz_hires(dev: &Device, hz: u32) -> Result<u32> {
     let code = polling2_code(hz);
     dev.run_args("set_polling2", &[0x00, code])?;
@@ -221,19 +225,19 @@ pub fn set_polling_hz_hires(dev: &Device, hz: u32) -> Result<u32> {
 ///
 /// Two honest write paths, decided by the device's DATA: matrix-era boards expose a top-level
 /// `set_brightness` command ([varstore, led 0x04, level]); legacy boards wire brightness inside
-/// the `[lighting]` block instead (the BlackWidow's 0x03/0x03 with its own baked [varstore, led]
+/// the `[lighting]` block instead (the `BlackWidow`'s 0x03/0x03 with its own baked [varstore, led]
 /// prefix). The old matrix-only path made the GUI's apply fail on the keyboard with "has no
-/// command 'set_brightness'" even though the board CAN set brightness — a dialect leak, not a
+/// command '`set_brightness`'" even though the board CAN set brightness — a dialect leak, not a
 /// missing capability.
 ///
 /// The `store` parameter applies to the TOP-LEVEL-command dialect only. The lighting-block
 /// fallback uses the SPEC'S OWN baked varstore byte (the legacy dialect's single hardware-proven
-/// layout, e.g. the BlackWidow's `args = [0x01, 0x05]`); `store` is deliberately NOT spliced into
+/// layout, e.g. the `BlackWidow`'s `args = [0x01, 0x05]`); `store` is deliberately NOT spliced into
 /// that legacy prefix, because a volatile-varstore legacy brightness write is an unproven byte
 /// combination this write path refuses to invent (verify-gated culture: no unproven bytes on the
 /// wire).
 pub fn set_brightness(dev: &Device, pct: u8, store: Store) -> Result<()> {
-    let level = (pct.min(100) as u16 * 255 / 100) as u8;
+    let level = (u16::from(pct.min(100)) * 255 / 100) as u8;
     if dev.def.has_command("set_brightness") {
         dev.run_args("set_brightness", &[store.byte(), 0x04, level])?;
         return Ok(());
@@ -258,7 +262,7 @@ pub fn set_brightness(dev: &Device, pct: u8, store: Store) -> Result<()> {
 /// Lighting brightness as a percentage. Response arg[2] is raw 0..255 (Synapse shows %).
 pub fn brightness_percent(dev: &Device) -> Result<u8> {
     let a = dev.run("brightness")?;
-    Ok(((a[2] as u32 * 100 + 127) / 255) as u8)
+    Ok(((u32::from(a[2]) * 100 + 127) / 255) as u8)
 }
 
 /// The single onboard pool. Everything — macros, profiles, our files — draws from the
@@ -273,12 +277,15 @@ pub struct Storage {
 
 impl Storage {
     /// Free = immediately-available + reclaimable (matches Synapse's "free").
+    #[must_use]
     pub fn free_bytes(&self) -> u32 {
         self.avail_bytes + self.recycle_bytes
     }
+    #[must_use]
     pub fn used_bytes(&self) -> u32 {
         self.max_bytes.saturating_sub(self.free_bytes())
     }
+    #[must_use]
     pub fn pct_remaining(&self) -> u32 {
         (self.free_bytes() * 100)
             .checked_div(self.max_bytes)
@@ -311,7 +318,7 @@ pub fn storage_counts(dev: &Device) -> Result<(u8, u8)> {
 // needed) and pairs with the verify-gated `writes::set_idle_secs`. The reply carries a big-endian
 // u16 of seconds; `0` = "never sleep / stay awake".
 
-/// Power class + idle-timeout getter (matches `writes::set_idle_secs`'s CLASS_POWER/ID_IDLE_GET).
+/// Power class + idle-timeout getter (matches `writes::set_idle_secs`'s `CLASS_POWER/ID_IDLE_GET`).
 const CLASS_POWER: u8 = 0x07;
 const ID_IDLE_GET: u8 = 0x83;
 const IDLE_SIZE: u8 = 0x02;
@@ -328,7 +335,7 @@ pub fn idle_timeout_secs(dev: &Device) -> Result<u16> {
 /// Decode the big-endian u16 seconds from an idle-timeout reply payload (bytes 0..2). Pure, so the
 /// decode is unit-testable without a device, and it is the exact inverse of `writes::build_idle_payload`.
 fn decode_idle_secs(reply: &[u8]) -> u16 {
-    ((reply[0] as u16) << 8) | reply[1] as u16
+    (u16::from(reply[0]) << 8) | u16::from(reply[1])
 }
 
 #[cfg(test)]
@@ -429,8 +436,8 @@ mod tests {
         let stages = [crate::writes::DpiStage { x: 16000, y: 16000 }];
         let p = crate::writes::build_dpi_stages_payload(&stages, 0, Store::Volatile).unwrap();
         // Record body at offset 3: [id, Xhi, Xlo, Yhi, Ylo, 0, 0].
-        let x = ((p[4] as u16) << 8) | p[5] as u16;
-        let y = ((p[6] as u16) << 8) | p[7] as u16;
+        let x = (u16::from(p[4]) << 8) | u16::from(p[5]);
+        let y = (u16::from(p[6]) << 8) | u16::from(p[7]);
         assert_eq!((x, y), (16000, 16000));
     }
 }

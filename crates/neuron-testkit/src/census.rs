@@ -7,7 +7,7 @@
 //! [`budget`](crate::budget) censuses a child process (the real shipped binary) through a Job
 //! Object, for whole-app resident-footprint budgets. This module censuses the current process —
 //! cheap enough for an ordinary `cargo test` — to prove that one type's construct/use/drop
-//! cycle leaves no threads or handles behind. Same FFI style as `budget.rs` (ToolHelp for
+//! cycle leaves no threads or handles behind. Same FFI style as `budget.rs` (`ToolHelp` for
 //! thread enumeration), reusing the same `windows-sys` features this crate already enables.
 
 #![cfg(windows)]
@@ -25,7 +25,7 @@ use windows_sys::Win32::System::Threading::{
 /// A snapshot of the CURRENT process's thread and handle counts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Census {
-    /// Live threads owned by this process, per a ToolHelp thread snapshot filtered to our own
+    /// Live threads owned by this process, per a `ToolHelp` thread snapshot filtered to our own
     /// pid (mirrors `budget.rs`'s `census` join, minus the job-membership step).
     pub threads: usize,
     /// Open kernel handles, per `GetProcessHandleCount` on our own pseudo-handle.
@@ -36,6 +36,7 @@ impl Census {
     /// Sample right now. Best-effort: a failed Win32 query reads as 0 for that field rather than
     /// panicking — a census is a diagnostic, and a transient query failure must not itself fail
     /// an unrelated test.
+    #[must_use]
     pub fn now() -> Census {
         Census {
             threads: current_process_thread_count(),
@@ -48,7 +49,7 @@ fn current_process_handle_count() -> usize {
     // GetCurrentProcess returns a constant pseudo-handle (-1) that is never closed.
     let h = unsafe { GetCurrentProcess() };
     let mut handles: u32 = 0;
-    if unsafe { GetProcessHandleCount(h, &mut handles) } == 0 {
+    if unsafe { GetProcessHandleCount(h, &raw mut handles) } == 0 {
         0
     } else {
         handles as usize
@@ -64,12 +65,12 @@ fn current_process_thread_count() -> usize {
     let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
     entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
     let mut count = 0usize;
-    let mut ok = unsafe { Thread32First(snap, &mut entry) };
+    let mut ok = unsafe { Thread32First(snap, &raw mut entry) };
     while ok != 0 {
         if entry.th32OwnerProcessID == pid {
             count += 1;
         }
-        ok = unsafe { Thread32Next(snap, &mut entry) };
+        ok = unsafe { Thread32Next(snap, &raw mut entry) };
     }
     unsafe { CloseHandle(snap) };
     count
@@ -130,6 +131,7 @@ pub fn assert_converges(baseline: Census, post: Census, tolerance: CensusToleran
 /// closure returned, not that the kernel has finished reclaiming the thread), so sampling
 /// immediately after a join/close is exactly the timing-flake this avoids. Returns the last
 /// census either way; residual drift shows up honestly in `assert_converges`'s failure message.
+#[must_use]
 pub fn settle(deadline: Duration) -> Census {
     const POLL_INTERVAL: Duration = Duration::from_millis(20);
     let start = Instant::now();

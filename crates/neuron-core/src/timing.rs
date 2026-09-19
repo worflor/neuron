@@ -150,6 +150,7 @@ pub fn boosted_thread_count() -> u64 {
 }
 
 /// One line describing this process's input-scheduling posture, for diagnostics.
+#[must_use]
 pub fn posture() -> String {
     if !priority_enabled() {
         return "input priority: DEFAULT (NEURON_INPUT_PRIORITY opt-out set)".into();
@@ -165,8 +166,7 @@ fn priority_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         std::env::var("NEURON_INPUT_PRIORITY")
-            .map(|v| v != "default" && v != "0")
-            .unwrap_or(true)
+            .map_or(true, |v| v != "default" && v != "0")
     })
 }
 
@@ -197,6 +197,7 @@ fn boost_impl() -> bool {
 /// stale. When the clamp bites the stamp is the clock origin instead, so that first comparison
 /// reads as recent — a cosmetic miss in the opening seconds of a boot, which is the whole reason
 /// this is a clamp and not a panic.
+#[must_use]
 pub fn ago(d: Duration) -> Instant {
     let now = Instant::now();
     now.checked_sub(d).unwrap_or(now)
@@ -214,7 +215,7 @@ mod tests {
 
     #[test]
     fn a_zero_sleep_returns_immediately_and_records_nothing() {
-        let _guard = SLEEP_HIST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = SLEEP_HIST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::latency::SLEEP_ERROR.reset();
         let t = Instant::now();
         sleep_precise(Duration::ZERO);
@@ -228,7 +229,7 @@ mod tests {
 
     #[test]
     fn sleep_never_returns_early() {
-        let _guard = SLEEP_HIST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = SLEEP_HIST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // The one hard contract: a step's pause may overshoot, but returning EARLY would reorder a
         // macro's keystrokes relative to the app receiving them, which is a correctness bug.
         for ms in [1u64, 3, 7] {
@@ -284,7 +285,7 @@ mod tests {
     /// still applies everywhere, so the test keeps teeth on every machine rather than vanishing.
     #[test]
     fn short_sleeps_are_not_rounded_up_to_the_scheduler_tick() {
-        let _guard = SLEEP_HIST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = SLEEP_HIST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let want = Duration::from_millis(2);
         // Take the BEST of many attempts: the claim is about the mechanism's CAPABILITY, so only one
         // clean sample is needed to prove it, while any single sample can be stolen by an unrelated
@@ -316,7 +317,7 @@ mod tests {
 
     #[test]
     fn sleep_error_is_recorded_as_overshoot() {
-        let _guard = SLEEP_HIST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = SLEEP_HIST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::latency::SLEEP_ERROR.reset();
         sleep_precise(Duration::from_millis(2));
         assert_eq!(crate::latency::SLEEP_ERROR.count(), 1, "the step's timing error was recorded");
@@ -412,7 +413,7 @@ mod tests {
         // The boot-time case, forced: no process is ever this old, so the subtraction cannot be
         // satisfied and the panic-free path is the ONLY one this can take. `Instant::now() - d`
         // here would abort the test.
-        let absurd = ago(Duration::from_secs(60 * 60 * 24 * 365 * 1000));
+        let absurd = ago(Duration::from_hours(8760000));
         assert!(absurd <= Instant::now(), "the clamped stamp must still be in the past");
     }
 

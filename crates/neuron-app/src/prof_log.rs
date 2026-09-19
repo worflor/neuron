@@ -53,7 +53,7 @@ fn run() {
         let mut burn: Vec<(u32, String, u64)> = now_thr
             .iter()
             .map(|(tid, (name, ticks))| {
-                let p = prev_thr.get(tid).map(|(_, v)| *v).unwrap_or(0);
+                let p = prev_thr.get(tid).map_or(0, |(_, v)| *v);
                 (*tid, name.clone(), ticks.saturating_sub(p))
             })
             .collect();
@@ -105,7 +105,7 @@ fn run() {
 
 #[cfg(windows)]
 fn ft(f: &windows_sys::Win32::Foundation::FILETIME) -> u64 {
-    ((f.dwHighDateTime as u64) << 32) | (f.dwLowDateTime as u64)
+    (u64::from(f.dwHighDateTime) << 32) | u64::from(f.dwLowDateTime)
 }
 
 /// Map of tid -> (thread name, cumulative kernel+user CPU in 100ns ticks) for THIS process.
@@ -128,20 +128,20 @@ fn thread_cpu() -> std::collections::HashMap<u32, (String, u64)> {
         }
         let mut te: THREADENTRY32 = std::mem::zeroed();
         te.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
-        let mut ok = Thread32First(snap, &mut te);
+        let mut ok = Thread32First(snap, &raw mut te);
         while ok != 0 {
             if te.th32OwnerProcessID == me {
                 let h = OpenThread(THREAD_QUERY_INFORMATION, 0, te.th32ThreadID);
                 if !h.is_null() {
                     let (mut c, mut e, mut k, mut u): (FILETIME, FILETIME, FILETIME, FILETIME) =
                         std::mem::zeroed();
-                    if GetThreadTimes(h, &mut c, &mut e, &mut k, &mut u) != 0 {
+                    if GetThreadTimes(h, &raw mut c, &raw mut e, &raw mut k, &raw mut u) != 0 {
                         map.insert(te.th32ThreadID, (thread_name(h), ft(&k) + ft(&u)));
                     }
                     CloseHandle(h);
                 }
             }
-            ok = Thread32Next(snap, &mut te);
+            ok = Thread32Next(snap, &raw mut te);
         }
         CloseHandle(snap);
     }
@@ -149,13 +149,13 @@ fn thread_cpu() -> std::collections::HashMap<u32, (String, u64)> {
 }
 
 /// Best-effort thread name via `GetThreadDescription` (the code names its worker threads). The
-/// returned buffer is `LocalAlloc`'d; we intentionally don't free it (no Win32_System_Memory
-/// feature here) — a few bytes per thread per second, only while NEURON_PROFILE is on.
+/// returned buffer is `LocalAlloc`'d; we intentionally don't free it (no `Win32_System_Memory`
+/// feature here) — a few bytes per thread per second, only while `NEURON_PROFILE` is on.
 #[cfg(windows)]
 unsafe fn thread_name(h: windows_sys::Win32::Foundation::HANDLE) -> String {
     use windows_sys::Win32::System::Threading::GetThreadDescription;
     let mut p: *mut u16 = std::ptr::null_mut();
-    if GetThreadDescription(h, &mut p) >= 0 && !p.is_null() {
+    if GetThreadDescription(h, &raw mut p) >= 0 && !p.is_null() {
         let len = (0..).take_while(|&i| *p.add(i) != 0).count();
         return String::from_utf16_lossy(std::slice::from_raw_parts(p, len));
     }
@@ -179,7 +179,7 @@ fn process_cpu(pid: u32) -> u64 {
         }
         let (mut c, mut e, mut k, mut u): (FILETIME, FILETIME, FILETIME, FILETIME) =
             std::mem::zeroed();
-        let r = if GetProcessTimes(h, &mut c, &mut e, &mut k, &mut u) != 0 {
+        let r = if GetProcessTimes(h, &raw mut c, &raw mut e, &raw mut k, &raw mut u) != 0 {
             ft(&k) + ft(&u)
         } else {
             0

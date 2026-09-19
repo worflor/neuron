@@ -108,6 +108,7 @@ pub struct MockDevice {
 impl MockDevice {
     /// A phantom shaped like a Razer `razer_report` control pipe: VID 0x1532, 91-byte feature
     /// report — the exact signature `RazerDialect::claims` matches on.
+    #[must_use]
     pub fn razer(pid: u16, product: &str) -> Self {
         Self::new(HidDeviceInfo {
             vid: 0x1532,
@@ -126,6 +127,7 @@ impl MockDevice {
 
     /// A phantom with a caller-built enumeration record — for non-Razer shapes (a third-party
     /// keyboard, an output-report family, an unclaimed pipe).
+    #[must_use]
     pub fn new(info: HidDeviceInfo) -> Self {
         MockDevice {
             info,
@@ -235,6 +237,7 @@ pub struct MockHandle(Arc<MockDevice>);
 
 impl MockHandle {
     /// The phantom behind this handle, for assertions.
+    #[must_use]
     pub fn device(&self) -> &Arc<MockDevice> {
         &self.0
     }
@@ -320,6 +323,7 @@ pub struct MockReader {
 }
 
 impl MockReader {
+    #[must_use]
     pub fn new(frames: Vec<Vec<u8>>) -> Self {
         MockReader {
             frames: Mutex::new(frames.into()),
@@ -353,6 +357,7 @@ pub struct MockBackend {
 }
 
 impl MockBackend {
+    #[must_use]
     pub fn new() -> Self {
         MockBackend::default()
     }
@@ -428,6 +433,7 @@ impl Backend for MockBackend {
 /// [`super::install_backend`] is process-global (like `failpoint::arm` and
 /// `testsupport::cwd_guard`), so two tests installing phantoms concurrently would observe each
 /// other's hardware. Take this before installing; hold it for the test body.
+#[must_use]
 pub fn test_lock() -> &'static Mutex<()> {
     static LOCK: Mutex<()> = Mutex::new(());
     &LOCK
@@ -440,7 +446,7 @@ mod tests {
     use crate::transport;
 
     /// The one getter `synthesize` qualifies a pipe with — a phantom that stays mute here is
-    /// treated as "not a talking razer_report pipe" and synthesis returns `None`.
+    /// treated as "not a talking `razer_report` pipe" and synthesis returns `None`.
     const FIRMWARE: (u8, u8) = (0x00, 0x81);
 
     fn guarded<T>(body: impl FnOnce() -> T) -> T {

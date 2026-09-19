@@ -29,25 +29,28 @@ pub struct Rgb {
 }
 
 impl Rgb {
+    #[must_use]
     pub const fn new(r: u8, g: u8, b: u8) -> Self {
         Rgb { r, g, b }
     }
     pub const BLACK: Rgb = Rgb::new(0, 0, 0);
 
     /// Scale brightness by a 0..=100 percentage.
+    #[must_use]
     pub fn scale(self, pct: u8) -> Rgb {
-        let p = pct.min(100) as u16;
+        let p = u16::from(pct.min(100));
         Rgb {
-            r: (self.r as u16 * p / 100) as u8,
-            g: (self.g as u16 * p / 100) as u8,
-            b: (self.b as u16 * p / 100) as u8,
+            r: (u16::from(self.r) * p / 100) as u8,
+            g: (u16::from(self.g) * p / 100) as u8,
+            b: (u16::from(self.b) * p / 100) as u8,
         }
     }
 
     /// Scale brightness by a 0.0..=1.0 factor (float precision — for smooth sinusoidal glow).
+    #[must_use]
     pub fn scale_f(self, f: f32) -> Rgb {
         let f = f.clamp(0.0, 1.0);
-        let m = |x: u8| (x as f32 * f).round() as u8;
+        let m = |x: u8| (f32::from(x) * f).round() as u8;
         Rgb {
             r: m(self.r),
             g: m(self.g),
@@ -56,9 +59,10 @@ impl Rgb {
     }
 
     /// Linear interpolate a..b by t in 0.0..=1.0.
+    #[must_use]
     pub fn lerp(a: Rgb, b: Rgb, t: f32) -> Rgb {
         let t = t.clamp(0.0, 1.0);
-        let m = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+        let m = |x: u8, y: u8| (f32::from(x) + (f32::from(y) - f32::from(x)) * t).round() as u8;
         Rgb {
             r: m(a.r, b.r),
             g: m(a.g, b.g),
@@ -67,6 +71,7 @@ impl Rgb {
     }
 
     /// HSV with h in 0..360, s,v in 0..=1 — the basis for spectrum/wave emulation.
+    #[must_use]
     pub fn from_hsv(h: f32, s: f32, v: f32) -> Rgb {
         let h = h.rem_euclid(360.0);
         let c = v * s;
@@ -88,11 +93,13 @@ impl Rgb {
         }
     }
 
+    #[must_use]
     pub fn to_hex(self) -> String {
         format!("{:02X}{:02X}{:02X}", self.r, self.g, self.b)
     }
 
     /// Parse "RRGGBB" (optional leading #).
+    #[must_use]
     pub fn parse(s: &str) -> Option<Rgb> {
         let s = s.trim_start_matches('#');
         if s.len() != 6 {
@@ -165,6 +172,7 @@ impl Effect {
         Effect::Starlight,
     ];
 
+    #[must_use]
     pub fn name(self) -> &'static str {
         match self {
             Effect::Off => "off",
@@ -177,6 +185,7 @@ impl Effect {
         }
     }
 
+    #[must_use]
     pub fn from_name(s: &str) -> Option<Effect> {
         Effect::ALL
             .into_iter()
@@ -184,6 +193,7 @@ impl Effect {
     }
 
     /// Does this effect take a base colour argument?
+    #[must_use]
     pub fn uses_color(self) -> bool {
         matches!(self, Effect::Static | Effect::Breathing | Effect::Reactive)
     }
@@ -192,6 +202,7 @@ impl Effect {
     /// Reactive needs keypress input from firmware; Starlight's emulation renders a flat static
     /// fill (see `render_frame`), which is NOT starlight — advertising it would be a silent lie,
     /// the same reason Reactive is excluded. Both come back if/when a real host animation ships.
+    #[must_use]
     pub fn is_emulatable(self) -> bool {
         !matches!(self, Effect::Reactive | Effect::Starlight)
     }
@@ -224,7 +235,7 @@ pub struct LightingDef {
     #[serde(default)]
     pub effects: BTreeMap<String, u8>,
     /// Effect-id that DISPLAYS a written custom frame. PER-ERA (this is the easy one to get wrong):
-    /// OpenRazer's *standard* matrix (legacy keyboards) uses 0x05 (CUSTOMFRAME) — the default — but the
+    /// `OpenRazer`'s *standard* matrix (legacy keyboards) uses 0x05 (CUSTOMFRAME) — the default — but the
     /// *extended* matrix (newer mice, class 0x0F) uses **0x08**, and on those devices 0x05 often means a
     /// real native effect (REACTIVE on the Naga), so leaving the default there sets reactive every frame
     /// and the stream flickers. Extended-matrix devices MUST set `custom_id = 0x08` in their TOML.
@@ -245,13 +256,15 @@ fn default_custom_id() -> u8 {
 }
 
 impl LightingDef {
+    #[must_use]
     pub fn led_count(&self) -> usize {
         self.rows as usize * self.cols as usize
     }
 
     /// The command to DISPLAY a written custom frame (CUSTOMFRAME effect). Legacy keyboards
-    /// take `[custom_id, varstore]` (effect-first, OpenRazer standard: `0x03/0x0A` args `05 00`,
-    /// data_size 0x02); matrix takes the prefix then the id.
+    /// take `[custom_id, varstore]` (effect-first, `OpenRazer` standard: `0x03/0x0A` args `05 00`,
+    /// `data_size` 0x02); matrix takes the prefix then the id.
+    #[must_use]
     pub fn custom_display_report(&self) -> Report {
         let (args, size) = match self.protocol {
             // OpenRazer standard_matrix_effect_custom_frame: [CUSTOMFRAME, varstore], data_size 0x02.
@@ -272,11 +285,13 @@ impl LightingDef {
     }
 
     /// Native (firmware) support for an effect?
+    #[must_use]
     pub fn supports_native(&self, e: Effect) -> bool {
         self.effects.contains_key(e.name())
     }
 
     /// Effects this device can do at all (native OR Neuron-emulated via custom frames).
+    #[must_use]
     pub fn available(&self) -> Vec<Effect> {
         Effect::ALL
             .into_iter()
@@ -290,13 +305,14 @@ impl LightingDef {
     /// fixed protocol prefix (e.g. matrix `[varstore, led_id]`); we append effect-id + colour.
     /// Returns None if the device lacks the effect natively.
     ///
-    /// The two eras lay the effect command out differently (OpenRazer `razerchromacommon.c`):
+    /// The two eras lay the effect command out differently (`OpenRazer` `razerchromacommon.c`):
     ///   * MATRIX (extended, class 0x0F): `[varstore, led, effect_id, 00, 00, 01, r, g, b]` with
     ///     the colour effects carrying a `00 00 01` one-colour preamble; `data_size = args.len()`.
     ///   * LEGACY (standard, class 0x03/0x0A): `effect_id` is `arguments[0]` directly (NO prefix),
-    ///     followed by each effect's OWN sub-args, and OpenRazer sends a FIXED per-effect
+    ///     followed by each effect's OWN sub-args, and `OpenRazer` sends a FIXED per-effect
     ///     `data_size` (static 0x04, off/spectrum 0x01, wave 0x02, reactive 0x05, breathing 0x08).
     ///     We reproduce those byte-for-byte so the board actually repaints instead of ACK-and-ignore.
+    #[must_use]
     pub fn native_effect_report(&self, e: Effect, color: Option<Rgb>, persist: bool) -> Option<Report> {
         let id = *self.effects.get(e.name())?;
         match self.protocol {
@@ -362,6 +378,7 @@ impl LightingDef {
 
     /// Break a full-device frame (`led_count` colours, row-major) into per-row custom-frame
     /// reports. This is how both eras paint at true resolution + how emulation streams.
+    #[must_use]
     pub fn frame_reports(&self, frame: &[Rgb]) -> Vec<Report> {
         (0..self.rows as usize)
             .filter_map(|row| self.row_report(frame, row))
@@ -373,6 +390,7 @@ impl LightingDef {
     /// misconfigured `cols == 0` / 0-length frame). Splitting one row out (vs the whole frame) is
     /// what lets the animate loop DEDUP: it sends only the rows whose bytes actually changed since
     /// the last paint, so a static effect re-sends nothing after the first frame.
+    #[must_use]
     pub fn row_report(&self, frame: &[Rgb], row: usize) -> Option<Report> {
         let cf = self.custom_frame.as_ref()?;
         // Stay within the device's real row count even if a generator handed us an over-long frame
@@ -419,9 +437,10 @@ impl LightingDef {
     }
 
     /// Build the brightness report (level 0..=255), if the device exposes the command.
+    #[must_use]
     pub fn brightness_report(&self, pct: u8) -> Option<Report> {
         let b = self.brightness.as_ref()?;
-        let level = (pct.min(100) as u16 * 255 / 100) as u8;
+        let level = (u16::from(pct.min(100)) * 255 / 100) as u8;
         let mut args = b.args.clone();
         args.push(level);
         Some(Report {
@@ -441,13 +460,13 @@ pub struct Report {
     pub class: u8,
     pub id: u8,
     pub args: Vec<u8>,
-    /// Optional transaction_id override carried from the source [`CommandSpec`]. `None` =
+    /// Optional `transaction_id` override carried from the source [`CommandSpec`]. `None` =
     /// use the device default (so non-overriding devices stay byte-identical). The Chroma V2's
     /// effect / custom-frame commands set this to 0x3F; brightness/getters leave it `None`.
     pub tx: Option<u8>,
-    /// Optional `data_size` override (the razer_report `data_size` byte). `None` = derive it
+    /// Optional `data_size` override (the `razer_report` `data_size` byte). `None` = derive it
     /// from `args.len()` (what every Matrix-era write did, so the Naga stays byte-identical).
-    /// LEGACY (class 0x03) standard-matrix commands MUST send OpenRazer's FIXED data_size —
+    /// LEGACY (class 0x03) standard-matrix commands MUST send `OpenRazer`'s FIXED `data_size` —
     /// e.g. custom-frame is always 0x46, breathing always 0x08 — regardless of the actual arg
     /// count, or the firmware ACKs the malformed packet and never repaints. Builders that need
     /// the fixed value set this; matrix builders leave it `None`.
@@ -456,6 +475,7 @@ pub struct Report {
 
 impl Report {
     /// Transparent hex preview (the "raw, transparent" motto) — what would hit the wire.
+    #[must_use]
     pub fn preview(&self) -> String {
         let a: String = self.args.iter().map(|b| format!("{b:02X} ")).collect();
         // data_size is the explicit size if set (legacy fixed value) else the arg count.
@@ -477,6 +497,7 @@ impl Report {
 /// `phase` is 0.0..1.0 animation progress; `base` the user colour. This is the unifier — it
 /// gives the legacy keyboard effects its firmware never had, and lets the mic/gesture engines
 /// drive lighting later (a frame is just `Vec<Rgb>`).
+#[must_use]
 pub fn render_frame(effect: Effect, rows: u8, cols: u8, phase: f32, base: Rgb) -> Vec<Rgb> {
     let (rows, cols) = (rows as usize, cols as usize);
     let n = rows * cols;
@@ -515,6 +536,7 @@ pub fn render_frame(effect: Effect, rows: u8, cols: u8, phase: f32, base: Rgb) -
 // Verified on hardware and cross-checked against OpenRazer's `KEY_MAPPING`.
 
 /// Resolve a key name or alias to its standard `(row, column)` LED cell.
+#[must_use]
 pub fn razer_key_cell(name: &str) -> Option<(u8, u8)> {
     Some(match name {
         // ── Row 0: macro M6, ESC, F-row, the print/scroll/pause cluster, logo ──
@@ -647,8 +669,9 @@ pub const MACRO_KEY_NAMES: [&str; 6] = ["M1", "M2", "M3", "M4", "M5", "M6"];
 
 /// The held-state index (0-based) for a Razer Driver-Mode macro report CODE: `0x20`→0 (M1), `0x21`→1
 /// (M2) … `0x25`→5 (M6). Any other code — including FN (`0x01`) and released (`0x00`) — returns `None`.
-/// The sequential `0x20..=0x25` numbering is the Razer PROTOCOL convention (matches OpenRazer's
+/// The sequential `0x20..=0x25` numbering is the Razer PROTOCOL convention (matches `OpenRazer`'s
 /// `razer_raw_event`), not a per-board fact. Pairs with [`MACRO_KEY_NAMES`] to map a held code to its cell.
+#[must_use]
 pub fn macro_code_index(code: u8) -> Option<usize> {
     // `then` (lazy) not `then_some` (eager): `code - 0x20` underflows u8 for codes below 0x20
     // (e.g. released 0x00, FN 0x01) and would panic in debug if evaluated unconditionally.
@@ -658,6 +681,7 @@ pub fn macro_code_index(code: u8) -> Option<usize> {
 /// The full key map walked in reading order (row 0 → row 5, left → right), one CANONICAL name per
 /// physical key (no aliases). This is the order `neuron lighting keytest` lights the board in, and the
 /// list the duplicate-cell test iterates. Every name here resolves through [`razer_key_cell`].
+#[must_use]
 pub fn razer_keyboard_keys() -> &'static [&'static str] {
     &[
         // row 0
@@ -705,6 +729,7 @@ const VK_NUMPAD: [&str; 10] = [
 /// modifiers `0x10`/`0x11`/`0x12` return `None` — the generics fire ALONGSIDE the specific L/R variant,
 /// so mapping them too would double-light. An accurate reactive surface never lies. Every produced name
 /// is guaranteed to resolve in [`razer_key_cell`].
+#[must_use]
 pub fn vk_to_name(vk: i32) -> Option<&'static str> {
     Some(match vk {
         0x41..=0x5A => VK_LETTERS[(vk - 0x41) as usize], // A..Z
@@ -771,6 +796,7 @@ pub fn vk_to_name(vk: i32) -> Option<&'static str> {
 /// key→cell table so vitals / keytest / Reactive land on a key's true position. Razer keyboards have ONE
 /// LED per key, so this resolves to exactly ONE cell per pressed key; a key whose board has no LED at
 /// that cell simply lights nothing.
+#[must_use]
 pub fn vk_to_key_cell(vk: i32) -> Option<(u8, u8)> {
     razer_key_cell(vk_to_name(vk)?)
 }
@@ -818,11 +844,12 @@ pub struct Vitals {
 /// left" at a glance with the DANGER zone unmistakable: **≤25% holds solid RED**, 25–55% ramps
 /// RED→AMBER, >55% ramps AMBER→GREEN. The flat red plateau below 25% means a low pack (e.g. the
 /// Naga's live 20%) is clearly red, never an ambiguous orange. Continuous and pure.
+#[must_use]
 pub fn battery_color(pct: u8) -> Rgb {
     const GREEN: Rgb = Rgb::new(0, 255, 40);
     const AMBER: Rgb = Rgb::new(255, 140, 0);
     const RED: Rgb = Rgb::new(255, 0, 0);
-    let p = pct.min(100) as f32 / 100.0;
+    let p = f32::from(pct.min(100)) / 100.0;
     if p <= 0.25 {
         RED // flat red danger plateau — anything at/under a quarter pack reads as RED, not orange.
     } else if p <= 0.55 {
@@ -855,6 +882,7 @@ pub(crate) const VITALS_CYAN: Rgb = Rgb::new(0, 200, 255);
 /// Every other key is OFF. The map is consulted per cell, so if a device's matrix doesn't carry a
 /// given key the surface simply skips it — never out-of-bounds. `phase` is 0.0..1.0 (only the
 /// charging crest uses it; pass 0.0 for a static paint). Pure — no I/O, fully unit-testable.
+#[must_use]
 pub fn render_vitals(v: Vitals, rows: u8, cols: u8, phase: f32) -> Vec<Rgb> {
     let (rows_u, cols_u) = (rows as usize, cols as usize);
     let mut f = vec![Rgb::BLACK; rows_u * cols_u];
@@ -874,7 +902,7 @@ pub fn render_vitals(v: Vitals, rows: u8, cols: u8, phase: f32) -> Vec<Rgb> {
 
     // BATTERY GAUGE — the number row. round(pct% × N) keys lit; any non-zero battery lights ≥1.
     let n = BATTERY_TRACK_KEYS.len();
-    let pct = v.battery_pct.min(100) as f32;
+    let pct = f32::from(v.battery_pct.min(100));
     let lit = if v.battery_pct == 0 {
         0
     } else {
@@ -935,21 +963,21 @@ fn vitals_slot() -> &'static Mutex<Option<Vitals>> {
 pub fn publish_vitals(v: Vitals) {
     // poison-tolerant (a panic while another thread held the lock must not wedge the vitals feed) — the
     // snapshot is plain Copy data, so recovering the guard can't observe a torn value.
-    *vitals_slot().lock().unwrap_or_else(|p| p.into_inner()) = Some(v);
+    *vitals_slot().lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(v);
 }
 
 /// The most recently published device vitals, or `None` if nothing has been published yet. The
 /// `vitals` pattern reads this per frame and renders dark on `None` (honest: a live readout with no
 /// source). `pub(crate)` — only the pattern pulls it; the app is the writer via [`publish_vitals`].
 pub(crate) fn latest_vitals() -> Option<Vitals> {
-    *vitals_slot().lock().unwrap_or_else(|p| p.into_inner())
+    *vitals_slot().lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Test-only reset of the published snapshot back to `None`, so a test can exercise the no-source
 /// (idle-dark) path deterministically regardless of what other tests have published into the global.
 #[cfg(test)]
 pub(crate) fn clear_vitals() {
-    *vitals_slot().lock().unwrap_or_else(|p| p.into_inner()) = None;
+    *vitals_slot().lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
 }
 
 // ── the live BROADCAST feed: the app pushes, the `onair` lighting pattern pulls ──────────
@@ -982,19 +1010,19 @@ fn broadcast_slot() -> &'static Mutex<Option<Broadcast>> {
 /// follower calls this on every announced change, and pushes a disconnected default when the
 /// connection tears down — so the pattern can never render a stale "live".
 pub fn publish_broadcast(b: Broadcast) {
-    *broadcast_slot().lock().unwrap_or_else(|p| p.into_inner()) = Some(b);
+    *broadcast_slot().lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(b);
 }
 
 /// The most recently published broadcast state (`None` before the first publish — renders dark,
 /// honest). `pub(crate)` — only the pattern pulls it; the app is the writer.
 pub(crate) fn latest_broadcast() -> Option<Broadcast> {
-    *broadcast_slot().lock().unwrap_or_else(|p| p.into_inner())
+    *broadcast_slot().lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Test-only reset, mirroring [`clear_vitals`].
 #[cfg(test)]
 pub(crate) fn clear_broadcast() {
-    *broadcast_slot().lock().unwrap_or_else(|p| p.into_inner()) = None;
+    *broadcast_slot().lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
 }
 
 // ── the live HOLD-STATE feed: the dispatch loop pushes, the `modeheld` pattern pulls ─────
@@ -1007,7 +1035,7 @@ pub(crate) fn clear_broadcast() {
 /// The held input modes the `modeheld` pattern visualises.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct HoldState {
-    /// ANY hold layer is engaged (HyperShift and friends — the header SHIFT pill's truth).
+    /// ANY hold layer is engaged (`HyperShift` and friends — the header SHIFT pill's truth).
     pub layer: bool,
     /// A sniper hold is live (DPI dropped until release).
     pub sniper: bool,
@@ -1021,18 +1049,18 @@ fn hold_slot() -> &'static Mutex<Option<HoldState>> {
 /// Publish the current hold state — the dispatch loop calls this on edges (and cheaply per
 /// tick: one lock, one copy).
 pub fn publish_hold(h: HoldState) {
-    *hold_slot().lock().unwrap_or_else(|p| p.into_inner()) = Some(h);
+    *hold_slot().lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(h);
 }
 
 /// The latest hold state (`None` before the live loop first publishes — renders dark).
 pub(crate) fn latest_hold() -> Option<HoldState> {
-    *hold_slot().lock().unwrap_or_else(|p| p.into_inner())
+    *hold_slot().lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Test-only reset, mirroring [`clear_vitals`].
 #[cfg(test)]
 pub(crate) fn clear_hold() {
-    *hold_slot().lock().unwrap_or_else(|p| p.into_inner()) = None;
+    *hold_slot().lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
 }
 
 // ── the SIGNAL channels: macros write, the `signal` pattern pulls ────────────────────────
@@ -1064,11 +1092,11 @@ pub fn set_signal(channel: usize, value: f32) {
 }
 
 /// Read a signal channel (0-indexed; out-of-range reads 0.0). Lock-free, cheap per frame.
+#[must_use]
 pub fn signal(channel: usize) -> f32 {
     signal_slots()
         .get(channel)
-        .map(|s| f32::from_bits(s.load(std::sync::atomic::Ordering::Relaxed)))
-        .unwrap_or(0.0)
+        .map_or(0.0, |s| f32::from_bits(s.load(std::sync::atomic::Ordering::Relaxed)))
 }
 
 // ── backend facade: one lighting API over both Chroma eras ──────────────────────────────
@@ -1083,6 +1111,7 @@ pub struct Canvas {
 }
 
 impl Canvas {
+    #[must_use]
     pub fn new(rows: u8, cols: u8) -> Self {
         Canvas {
             rows,
@@ -1147,6 +1176,7 @@ pub fn changed_rows_into(prev: Option<&[Rgb]>, cur: &[Rgb], cols: usize, out: &m
 
 /// Owned-Vec convenience wrapper over [`changed_rows_into`] (the hot loop uses the `_into` form to
 /// reuse its buffer; tests and one-shot callers use this). Same semantics.
+#[must_use]
 pub fn changed_rows(prev: Option<&[Rgb]>, cur: &[Rgb], cols: usize) -> Vec<usize> {
     let mut out = Vec::new();
     changed_rows_into(prev, cur, cols, &mut out);
@@ -1168,6 +1198,7 @@ pub const MAX_STREAM_FPS: u32 = 30;
 /// deadline is nudged forward so accumulated lag can never exceed one `dt` — a slow frame is
 /// absorbed without letting the cadence drift or burst-fire a catch-up storm after a stall. The
 /// caller advances `deadline += dt` for the next frame before calling.
+#[must_use]
 pub fn pace(
     deadline: std::time::Instant,
     now: std::time::Instant,
@@ -1178,12 +1209,13 @@ pub fn pace(
         (deadline, deadline - now)
     } else {
         let lag = now - deadline;
-        let clamped = if lag > dt { deadline + (lag - dt) } else { deadline };
+        let clamped = if lag > dt { deadline + lag.checked_sub(dt).unwrap() } else { deadline };
         (clamped, Duration::ZERO)
     }
 }
 
 impl<'a> Lights<'a> {
+    #[must_use]
     pub fn new(dev: &'a crate::device::Device, def: LightingDef) -> Self {
         Lights { dev, def, controlled: std::cell::Cell::new(false) }
     }
@@ -1201,7 +1233,7 @@ impl<'a> Lights<'a> {
         if self.controlled.get() {
             return Ok(());
         }
-        if self.dev.run("device_mode").map(|m| m[0]).unwrap_or(0) != 0x03 {
+        if self.dev.run("device_mode").map_or(0, |m| m[0]) != 0x03 {
             crate::writes::set_device_mode(self.dev, 0x03)?;
         }
         self.controlled.set(true);
@@ -1299,7 +1331,7 @@ impl<'a> Lights<'a> {
         let mut next = run_start; // deadline-pacing anchor (separate from the wall-clock phase).
         while !stop() && run_start.elapsed().as_secs_f64() < secs as f64 {
             let fps = fps().clamp(1, MAX_STREAM_FPS);
-            let dt = Duration::from_millis(1000 / fps as u64);
+            let dt = Duration::from_millis(1000 / u64::from(fps));
             // Quantize the SHARED render clock to 1/fps steps via the ONE helper the GUI preview also
             // calls (`quantized_t` off the process-global `render_epoch`), so the on-screen mirror steps
             // in the identical discrete frames the device does (chunky at 6fps, smooth at 30) — same
@@ -1400,8 +1432,8 @@ mod tests {
         assert_eq!(Rgb::from_hsv(120.0, 1.0, 1.0), Rgb::new(0, 255, 0));
     }
 
-    /// A standard-matrix (class 0x03) keyboard like the BlackWidow Chroma V2: effect-first,
-    /// no varstore/led prefix, FIXED per-command data_size. Mirrors the V2 registry TOML.
+    /// A standard-matrix (class 0x03) keyboard like the `BlackWidow` Chroma V2: effect-first,
+    /// no varstore/led prefix, FIXED per-command `data_size`. Mirrors the V2 registry TOML.
     fn legacy_def() -> LightingDef {
         let mut effects = BTreeMap::new();
         effects.insert("off".into(), 0x00);

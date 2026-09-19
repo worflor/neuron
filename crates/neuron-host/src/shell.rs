@@ -21,8 +21,8 @@
 //!   deliberately NOT reborn: sessions must re-claim, exactly the lease
 //!   contract, so a fault can never resurrect a dead session's paint. There is
 //!   no data journal behind this: every owner (app base, Chroma REST, Chroma
-//!   SHM, OpenRGB) already carries its own tested reassert/recovery path —
-//!   a REST heartbeat, an OpenRGB idle-tick reassert, an SHM refresh, an
+//!   SHM, `OpenRGB`) already carries its own tested reassert/recovery path —
+//!   a REST heartbeat, an `OpenRGB` idle-tick reassert, an SHM refresh, an
 //!   app-base heartbeat — and all of it is `Content::Live` (closures), which
 //!   a data log cannot replay by construction. Recovery is owner-driven by
 //!   design, not seed-driven;
@@ -94,6 +94,7 @@ pub struct Host {
 }
 
 impl Host {
+    #[must_use]
     pub fn spawn() -> Host {
         let (tx, rx) = channel();
         let thread = crate::worker::spawn_named("neuron-host-kernel", move || run(rx))
@@ -101,6 +102,7 @@ impl Host {
         Host { tx, thread: Some(thread) }
     }
 
+    #[must_use]
     pub fn handle(&self) -> HostHandle {
         HostHandle { tx: self.tx.clone() }
     }
@@ -157,6 +159,7 @@ impl HostHandle {
 
     /// Subscribe to bus signals by prefix (see [`crate::bus::Bus::subscribe`]).
     /// The receiver closes on kernel rebirth — resubscribe on disconnect.
+    #[must_use]
     pub fn subscribe(&self, prefix: &str) -> Option<Receiver<Signal>> {
         self.request(|reply| Cmd::Subscribe { prefix: prefix.into(), reply })
     }
@@ -164,6 +167,7 @@ impl HostHandle {
     /// The alive claims on a surface, topmost first, with adapter-provided
     /// names attached — the "who is controlling this board" readout. Empty if
     /// the kernel is gone or the surface unknown.
+    #[must_use]
     pub fn claims(&self, surface: &str, now: Instant) -> Vec<Claim> {
         self.request(|reply| Cmd::Claims { surface: surface.into(), now, reply })
             .unwrap_or_default()

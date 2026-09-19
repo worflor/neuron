@@ -125,8 +125,7 @@ fn main() -> anyhow::Result<()> {
         .surfaces
         .iter()
         .find(|s| matches!(s.kind, SurfaceKind::Keyboard))
-        .map(|s| s.leds)
-        .unwrap_or(132);
+        .map_or(132, |s| s.leds);
     let mut analyzer = ChromaAnalyzer::new(kbd_leds);
 
     let mut last_ts: HashMap<u8, u32> = HashMap::new();
@@ -160,7 +159,7 @@ fn main() -> anyhow::Result<()> {
                         eta_ms as f32 / 1000.0
                     ),
                     LightEvent::Pulse { led, hz, .. } => {
-                        println!("◈  {} pulsing @ {hz:.1} Hz (alert / ready?)", key_at(led))
+                        println!("◈  {} pulsing @ {hz:.1} Hz (alert / ready?)", key_at(led));
                     }
                     _ => {} // Onset/Offset are the raw substrate — too chatty to print
                 }
@@ -175,9 +174,7 @@ fn main() -> anyhow::Result<()> {
                 let app = server
                     .registered_apps()
                     .into_iter()
-                    .next()
-                    .map(|a| a.name)
-                    .unwrap_or_else(|| "(unregistered)".to_string());
+                    .next().map_or_else(|| "(unregistered)".to_string(), |a| a.name);
                 let mut line = format!("· {app}  ");
                 for a in &acts {
                     let live = last_ts.get(&a.device_type).is_none_or(|&p| a.timestamp_ms != p);

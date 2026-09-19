@@ -220,8 +220,7 @@ pub fn crash_log_path() -> std::path::PathBuf {
 /// honest "has this app ever fallen over?" count, read straight from the on-disk record.
 pub fn crash_dump_count() -> usize {
     std::fs::read_to_string(crash_log_path())
-        .map(|s| s.matches("dump reason:").count())
-        .unwrap_or(0)
+        .map_or(0, |s| s.matches("dump reason:").count())
 }
 
 /// Every running organ whose heart has been silent longer than `max_age_ms`:
@@ -275,7 +274,7 @@ pub fn dump(w: &mut dyn std::io::Write) {
             let _ = writeln!(
                 w,
                 "  t+{:>9.3}s [{:>5}] {:<10} {} ({arg})",
-                t as f64 / 1000.0,
+                f64::from(t) / 1000.0,
                 id,
                 cat,
                 msg

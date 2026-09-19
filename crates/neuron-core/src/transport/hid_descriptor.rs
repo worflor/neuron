@@ -129,8 +129,8 @@ pub fn parse(desc: &[u8]) -> Vec<CollectionCaps> {
         let data = &desc[data_start..data_end];
         let value: u32 = match data_len {
             0 => 0,
-            1 => data[0] as u32,
-            2 => u16::from_le_bytes([data[0], data[1]]) as u32,
+            1 => u32::from(data[0]),
+            2 => u32::from(u16::from_le_bytes([data[0], data[1]])),
             _ => u32::from_le_bytes([data[0], data[1], data[2], data[3]]),
         };
 
@@ -262,11 +262,11 @@ mod tests {
     }
     /// Main item (1-byte data).
     fn main1(tag: u8, val: u8) -> Vec<u8> {
-        vec![(tag << 4) | (0b00 << 2) | 0b01, val]
+        vec![(tag << 4) | 0b01, val]
     }
     /// Main item with no data (End Collection).
     fn main0(tag: u8) -> Vec<u8> {
-        vec![(tag << 4) | (0b00 << 2)]
+        vec![(tag << 4)]
     }
 
     fn concat(parts: Vec<Vec<u8>>) -> Vec<u8> {
@@ -293,8 +293,8 @@ mod tests {
 
     /// The standard boot-keyboard descriptor, HID 1.11 Appendix B.1 / E.6: modifier byte (8 Input
     /// bits) + reserved byte (8 Input bits) + 5-bit LED report + 3-bit LED padding (both Output)
-    /// + 6-byte keycode array (48 Input bits). Input total 64 bits = 8 bytes -> input_len 9.
-    /// Output total 8 bits = 1 byte -> output_len 2.
+    /// + 6-byte keycode array (48 Input bits). Input total 64 bits = 8 bytes -> `input_len` 9.
+    /// Output total 8 bits = 1 byte -> `output_len` 2.
     #[test]
     fn standard_boot_keyboard_descriptor() {
         let desc = concat(vec![
@@ -441,7 +441,7 @@ mod tests {
     /// high 16 bits, overriding the current global Usage Page for the collection it opens.
     #[test]
     fn extended_usage_carries_its_own_usage_page() {
-        let mut desc = vec![(0u8 << 4) | (0b01 << 2) | 0b01, 0x01]; // Usage Page = 0x01 (global)
+        let mut desc = vec![(0b01 << 2) | 0b01, 0x01]; // Usage Page = 0x01 (global)
         desc.push((TAG_LOCAL_USAGE << 4) | (0b10 << 2) | 0b11); // Usage, 4-byte data
         desc.extend_from_slice(&0x000C_0001u32.to_le_bytes()); // page 0x000C usage 0x0001
         desc.extend(main1(TAG_COLLECTION, 0x01));

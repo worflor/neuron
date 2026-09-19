@@ -27,7 +27,7 @@ const MAX_QUANT: f32 = ((1_u32 << (QUANT_BITS - 1)) - 1) as f32;
 
 /// Quantize residuals per-pair. Returns (quantized i8 as f32, scales\[P\]).
 ///
-/// Each pair gets its own scale factor = max_abs / 127.
+/// Each pair gets its own scale factor = `max_abs` / 127.
 /// Zero-scale pairs (silence) produce zero output.
 fn quantize(residuals: &[f32], length: usize, dim: usize) -> (Vec<f32>, Vec<f32>) {
     let p = dim / 2;
@@ -77,6 +77,7 @@ fn quantize(residuals: &[f32], length: usize, dim: usize) -> (Vec<f32>, Vec<f32>
 }
 
 /// Dequantize: reconstruct float residuals from quantized values + scales.
+#[must_use]
 pub fn dequantize(quant: &[f32], scales: &[f32], length: usize, dim: usize) -> Vec<f32> {
     let p = dim / 2;
     let mut out = vec![0.0_f32; length * dim];
@@ -96,6 +97,7 @@ pub fn dequantize(quant: &[f32], scales: &[f32], length: usize, dim: usize) -> V
 ///
 /// Tries Cascaded (macro + micro oscillators) and Linear (constant velocity),
 /// picks the mode with lower residual energy. Static and Raw are early exits.
+#[must_use]
 pub fn encode_block(
     data: &[f32],  // [length × dim] row-major
     seed1: &[f32], // [dim] — z[n-1]
@@ -313,10 +315,10 @@ fn micro_seeds(macro_resid: &[f32], ss: usize, dim: usize) -> (Vec<f32>, Vec<f32
 /// Variance of data (sum of squared deviations from mean, normalized).
 fn compute_variance(data: &[f32], length: usize, dim: usize) -> f64 {
     let n = (length * dim) as f64;
-    let mean: f64 = data.iter().map(|&x| x as f64).sum::<f64>() / n;
+    let mean: f64 = data.iter().map(|&x| f64::from(x)).sum::<f64>() / n;
     data.iter()
         .map(|&x| {
-            let d = x as f64 - mean;
+            let d = f64::from(x) - mean;
             d * d
         })
         .sum::<f64>()
@@ -326,6 +328,7 @@ fn compute_variance(data: &[f32], length: usize, dim: usize) -> f64 {
 /// Encode a full trajectory into a Packet.
 ///
 /// The main entry point: pairing → segmentation → block encoding → assembly.
+#[must_use]
 pub fn encode(
     trajectory: &[f32], // [T × D] row-major
     t: usize,
@@ -349,12 +352,9 @@ pub fn encode(
 
     // Derive or use given pairing
     let owned_pairing;
-    let pair_ref = match pairing {
-        Some(p) => p,
-        None => {
-            owned_pairing = derive_pairing(trajectory, t, dim);
-            &owned_pairing
-        }
+    let pair_ref = if let Some(p) = pairing { p } else {
+        owned_pairing = derive_pairing(trajectory, t, dim);
+        &owned_pairing
     };
 
     // Apply pairing to reorder dimensions
@@ -458,7 +458,7 @@ mod tests {
         for (a, b) in resid.iter().zip(back.iter()) {
             let err = (a - b).abs();
             let max_err = scales.iter().copied().fold(0.0_f32, f32::max) * 2.0;
-            assert!(err < max_err + 1e-5, "err = {}, max = {}", err, max_err);
+            assert!(err < max_err + 1e-5, "err = {err}, max = {max_err}");
         }
     }
 

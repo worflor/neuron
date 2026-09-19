@@ -7,7 +7,7 @@
 //! Logitech `cpg-docs` documentation (URLs in the frame/reshape comments below), NOT observed on a
 //! wire — there is no Logitech device on the development desk. The dialect CLAIMS its pipes, is
 //! INTERESTED at vendor granularity, and now ADOPTS: [`HidppDialect::probe`] is REAL — it pings
-//! IRoot, enumerates the battery/DPI features, and synthesizes a [`crate::synth::Synthesis`] via the
+//! `IRoot`, enumerates the battery/DPI features, and synthesizes a [`crate::synth::Synthesis`] via the
 //! `pub(crate)` [`crate::synth::Synthesis::from_probe`] mint seam. What is still missing is HARDWARE:
 //! the emitted defs land as `devices/auto/hidpp-<pid>.toml` and are honest-but-UNVERIFIED — the wire
 //! layouts they encode have never round-tripped against a real Logitech device. Anyone with the
@@ -49,7 +49,7 @@
 //! ## The semantic reply contract (the load-bearing design point)
 //! Everything above the dialect line is dialect-BLIND: `capability::battery_percent` reads
 //! `args[1]` as a 0..255 raw level and scales it `*100/255`; `capability::dpi` reads `args[1..5]`
-//! as big-endian X_hi,X_lo,Y_hi,Y_lo. Those decoders must keep working unchanged for a HID++ mouse.
+//! as big-endian `X_hi,X_lo,Y_hi,Y_lo`. Those decoders must keep working unchanged for a HID++ mouse.
 //! So a dialect's `exec` RESHAPES its raw reply into exactly the arg layout those decoders expect —
 //! HID++ returns battery as a 0..100 PERCENTAGE, we scale it back up into the 0..255 space and land
 //! it at `args[1]`; HID++ returns a single big-endian DPI, we mirror it onto the X and Y pairs at
@@ -238,7 +238,7 @@ fn reshape(tag: u8, payload: &[u8]) -> [u8; 80] {
             // (cpg-docs / lekensteyn x1000; 0 = unknown). `capability::battery_percent` reads
             // args[1] as a 0..255 raw level and computes (raw*100+127)/255, so scale the percentage
             // UP into that 0..255 space and land it at args[1] (round-trips: 85% ↔ 217).
-            let pct = payload.first().copied().unwrap_or(0) as u32;
+            let pct = u32::from(payload.first().copied().unwrap_or(0));
             out[1] = ((pct * 255 + 50) / 100).min(255) as u8;
         }
         RESHAPE_DPI => {
@@ -281,13 +281,13 @@ impl Dialect for HidppDialect {
     ///     we require only ">= short", not an exact class length — a 7/20/64-byte input all qualify.
     ///
     /// Byte-length convention (stated so the next reader doesn't re-derive it): `output_len`/
-    /// `input_len` are HIDP_CAPS `OutputReportByteLength`/`InputReportByteLength`, which INCLUDE the
+    /// `input_len` are `HIDP_CAPS` `OutputReportByteLength`/`InputReportByteLength`, which INCLUDE the
     /// leading report-id byte. So `SHORT_LEN` 7 / `LONG_LEN` 20 here are the FULL on-wire lengths
     /// (report id + payload: 7 = id+6, 20 = id+19), directly comparable to HID++'s SHORT/LONG message
     /// lengths — no ±1 report-id adjustment is needed on either side.
     ///
     /// Receivers are excluded ([`RECEIVER_PIDS`]): they answer on HID++ 1.0 registers / pairing slots
-    /// `1..=6`, not the corded [`DEVICE_INDEX`] `0xFF` this dialect addresses — see the DEVICE_INDEX note.
+    /// `1..=6`, not the corded [`DEVICE_INDEX`] `0xFF` this dialect addresses — see the `DEVICE_INDEX` note.
     fn claims(&self, info: &HidDeviceInfo) -> bool {
         let output_is_hidpp_class = info.output_len == SHORT_LEN || info.output_len == LONG_LEN as u16;
         let input_carries_reply = info.input_len >= SHORT_LEN;
@@ -519,14 +519,14 @@ impl Dialect for HidppDialect {
 pub struct HidppProbe {
     pub protocol_major: u8,
     pub protocol_minor: u8,
-    /// Resolved feature INDEX for 0x1000 BatteryLevelStatus, when the device reports it.
+    /// Resolved feature INDEX for 0x1000 `BatteryLevelStatus`, when the device reports it.
     pub battery_feature: Option<u8>,
-    /// Resolved feature INDEX for 0x2201 AdjustableDPI, when the device reports it.
+    /// Resolved feature INDEX for 0x2201 `AdjustableDPI`, when the device reports it.
     pub dpi_feature: Option<u8>,
 }
 
 /// Diagnostic probe of a live HID++ pipe: ping IRoot.getProtocolVersion (require >= 2.0), then
-/// IRoot.getFeature() for battery (0x1000) and DPI (0x2201). Read-only — getters only, never a
+/// `IRoot.getFeature()` for battery (0x1000) and DPI (0x2201). Read-only — getters only, never a
 /// blind write into an unknown framing. `None` if the pipe never answered a valid 2.0 ping (so it
 /// is not a HID++ 2.0 pipe of ours). [`HidppDialect::probe`] now builds on this exact wire path to
 /// synthesize a real def; this stays as the standalone READ-ONLY diagnostic (protocol + feature
@@ -556,7 +556,7 @@ pub fn probe_report(t: &dyn Transport) -> Option<HidppProbe> {
 }
 
 /// IRoot.getFeature(featureId) → feature INDEX, or `None` when the device lacks it (index 0 is
-/// reserved for IRoot itself, so 0 means "not present"). featureId is sent big-endian (MSB first).
+/// reserved for `IRoot` itself, so 0 means "not present"). featureId is sent big-endian (MSB first).
 fn get_feature_index(t: &dyn Transport, feature_id: u16) -> Option<u8> {
     let params = [(feature_id >> 8) as u8, feature_id as u8];
     let req = build_long(IROOT_FEATURE, IROOT_FN_GET_FEATURE, &params);
@@ -792,8 +792,8 @@ mod tests {
         assert!(HidppDialect.claims(&info_pid(HIDPP_VID, 0xC088, LONG_LEN as u16, LONG_LEN as u16)), "a direct-attached mouse pid with a HID++ shape is claimed");
     }
 
-    /// A minimal hidpp-tagged DeviceDef with a chosen control usage pair (feature_report_len is
-    /// deliberately 0 — meaningless for HID++). vendor_id 1133 = 0x046D.
+    /// A minimal hidpp-tagged `DeviceDef` with a chosen control usage pair (`feature_report_len` is
+    /// deliberately 0 — meaningless for HID++). `vendor_id` 1133 = 0x046D.
     fn hidpp_def(usage_page: u16, usage: u16) -> crate::registry::DeviceDef {
         let text = format!(
             "name = \"L\"\ncodename = \"l\"\ndialect = \"hidpp\"\nvendor_id = 1133\ntransaction_id = 0\n\
@@ -887,7 +887,7 @@ mod tests {
         let out = HidppDialect
             .exec(&mock, d.transaction_id, bat.class, bat.id, bat.size, &bat.args)
             .expect("battery reply reshapes");
-        let pct = (out[1] as u32 * 100 + 127) / 255;
+        let pct = (u32::from(out[1]) * 100 + 127) / 255;
         assert_eq!(pct, 85, "reshaped args[1] decodes back to the reported 85%");
     }
 
@@ -963,7 +963,7 @@ mod tests {
                 let out = reshape(RESHAPE_BATTERY, &payload);
                 let expected = match payload.first().copied() {
                     None => 0u8,
-                    Some(pct) => (((pct as u32) * 255 + 50) / 100).min(255) as u8,
+                    Some(pct) => ((u32::from(pct) * 255 + 50) / 100).min(255) as u8,
                 };
                 prop_assert_eq!(out[1], expected);
                 // Every other byte of the 80-byte output stays untouched-zero — RESHAPE_BATTERY

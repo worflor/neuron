@@ -26,6 +26,7 @@ pub enum Status {
 }
 
 impl Status {
+    #[must_use]
     pub fn from_u8(v: u8) -> Self {
         match v {
             0 => Status::New,
@@ -52,6 +53,7 @@ pub struct Report {
 
 impl Report {
     /// Build an outgoing command (status 0, no remaining packets, zero args).
+    #[must_use]
     pub fn command(transaction_id: u8, class: u8, id: u8, size: u8) -> Self {
         Report {
             status: 0,
@@ -64,6 +66,7 @@ impl Report {
     }
 
     /// Serialize into the 91-byte HID feature buffer (with report-id and CRC).
+    #[must_use]
     pub fn to_buf(&self) -> [u8; BUF_LEN] {
         let mut b = [0u8; BUF_LEN];
         b[0] = 0x00; // HID report id
@@ -80,6 +83,7 @@ impl Report {
     }
 
     /// Parse a 91-byte reply buffer.
+    #[must_use]
     pub fn from_buf(b: &[u8; BUF_LEN]) -> Self {
         let mut args = [0u8; 80];
         args.copy_from_slice(&b[9..89]);
@@ -93,12 +97,14 @@ impl Report {
         }
     }
 
+    #[must_use]
     pub fn status(&self) -> Status {
         Status::from_u8(self.status)
     }
 }
 
 /// Razer CRC: XOR of buffer bytes [3..=88].
+#[must_use]
 pub fn crc(buf: &[u8; BUF_LEN]) -> u8 {
     buf[3..=88].iter().fold(0u8, |c, &b| c ^ b)
 }
@@ -110,15 +116,16 @@ pub fn crc(buf: &[u8; BUF_LEN]) -> u8 {
 /// buffer is not (yet) our reply — cross-talk from another command, so keep polling.
 ///
 /// Takes a SLICE, not `&[u8; BUF_LEN]`: offsets 1/7/8 sit at the SAME place in every razer-family
-/// envelope this codebase speaks — the 91-byte razer_report buffer AND the razer-audio dialect's
+/// envelope this codebase speaks — the 91-byte `razer_report` buffer AND the razer-audio dialect's
 /// 64-byte envelope ([`crate::dialect::RazerAudioDialect`], HARDWARE FACTS-verified on the Seiren
 /// V3 Mini 2026-07-08) — so one echo filter serves both instead of each dialect hand-rolling its
 /// own copy. Every existing caller passes `&[u8; BUF_LEN]`, which coerces to `&[u8]` at the call
-/// site — zero behavior change for razer_report.
+/// site — zero behavior change for `razer_report`.
 ///
 /// Relaxing the parameter from `&[u8; BUF_LEN]` to `&[u8]` gave up the compile-time length proof, so
 /// a runtime guard restores it: a buffer too short to hold offsets 1/7/8 is `None` (not our reply,
 /// keep polling) — a truncated read can never panic here.
+#[must_use]
 pub fn reply_status(b: &[u8], class: u8, id: u8) -> Option<Status> {
     if b.len() <= 8 {
         return None;
@@ -165,8 +172,8 @@ mod tests {
         assert_eq!(reply_status(&[], 0x04, 0x85), None, "empty slice");
     }
 
-    /// `to_buf`/`from_buf` must round-trip EVERY field losslessly — not just class/id/data_size
-    /// (already covered by `roundtrip_and_crc`), but status, transaction_id, and the full 80-byte
+    /// `to_buf`/`from_buf` must round-trip EVERY field losslessly — not just `class/id/data_size`
+    /// (already covered by `roundtrip_and_crc`), but status, `transaction_id`, and the full 80-byte
     /// args payload at its exact offsets, since a shifted or truncated arg copy would silently
     /// corrupt device commands.
     #[test]

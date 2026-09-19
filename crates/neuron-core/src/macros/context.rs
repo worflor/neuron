@@ -26,6 +26,7 @@ pub struct WindowHandle(pub isize);
 
 impl WindowHandle {
     /// Is this a real (non-null) handle?
+    #[must_use]
     pub fn is_some(&self) -> bool {
         self.0 != 0
     }
@@ -64,6 +65,7 @@ impl Context {
     /// `explorer_path` re-derived both for itself. `latency::CTX_CAPTURE` is what shows the
     /// difference; `latency::CTX_CLIPBOARD` is what proved the clipboard was NOT the expensive part
     /// (~78µs of ~734µs), which is what pointed here instead.
+    #[must_use]
     pub fn capture() -> Self {
         let prev_window = foreground_window();
         let app = foreground_app();
@@ -80,6 +82,7 @@ impl Context {
 
     /// Build a Context directly from explicit fields. Used by the dry-run interpreter and the
     /// verify-gate fuzzer to feed a macro adversarial / synthetic worlds without touching the OS.
+    #[must_use]
     pub fn synthetic(
         app: Option<String>,
         window_title: Option<String>,
@@ -100,26 +103,32 @@ impl Context {
     // --- prelude accessors (the `ctx.*()` surface macros call) ---------------------------
 
     /// Foreground app exe name (lowercased).
+    #[must_use]
     pub fn app(&self) -> Option<&str> {
         self.app.as_deref()
     }
     /// Foreground window title.
+    #[must_use]
     pub fn title(&self) -> Option<&str> {
         self.window_title.as_deref()
     }
     /// The Explorer/terminal path of the foreground window.
+    #[must_use]
     pub fn cwd(&self) -> Option<&std::path::Path> {
         self.cwd.as_deref()
     }
     /// Clipboard text.
+    #[must_use]
     pub fn clipboard(&self) -> Option<&str> {
         self.clipboard.as_deref()
     }
     /// Selected text.
+    #[must_use]
     pub fn selection(&self) -> Option<&str> {
         self.selection.as_deref()
     }
     /// The window that had focus before the macro fired.
+    #[must_use]
     pub fn prev_window(&self) -> WindowHandle {
         self.prev_window
     }
@@ -127,6 +136,7 @@ impl Context {
     /// Restore focus to the window that was foreground when the trigger fired — the last act of
     /// a quick in-game macro ("focus Discord, type, Alt-Tab back"). Returns `true` if the call
     /// succeeded. No-op (returns `false`) on a null handle or non-Windows.
+    #[must_use]
     pub fn restore_foreground(&self) -> bool {
         restore_foreground(self.prev_window)
     }

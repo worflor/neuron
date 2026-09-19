@@ -61,7 +61,7 @@ pub fn parse(path: &str) -> ParseResult {
                 });
             }
             if !s.dpi_stages.is_empty() {
-                let stg: Vec<String> = s.dpi_stages.iter().map(|x| x.to_string()).collect();
+                let stg: Vec<String> = s.dpi_stages.iter().map(std::string::ToString::to_string).collect();
                 lines.push(PreviewLine {
                     label: "STAGES".into(),
                     detail: stg.join("/"),
@@ -160,7 +160,7 @@ pub fn apply(imp: &Imported) -> Result<String, String> {
         let mut p = imp.profile.clone();
         p.name = name.clone();
         match p.save() {
-            Ok(_) => wrote.push(format!("profile '{}'", p.name)),
+            Ok(()) => wrote.push(format!("profile '{}'", p.name)),
             Err(e) => return Err(format!("profile save failed: {e}")),
         }
     }

@@ -9,7 +9,7 @@
 //! whole testing strategy: everything interesting was already proven without
 //! a socket, so the pump can be boring — accept, read, feed, write, and on
 //! ANY exit call `disconnected()` so the connection's paint footprint releases
-//! (the OpenRGB equivalent of a heartbeat lapse; teardown stays the default
+//! (the `OpenRGB` equivalent of a heartbeat lapse; teardown stays the default
 //! path even when a client is kill -9'd).
 //!
 //! Binding is loopback-only by design (local-first: the network surface of
@@ -37,7 +37,7 @@ use crate::paint::PaintPolicy;
 use crate::shell::HostHandle;
 use crate::ws::{WsIn, WsStream};
 
-/// OpenRGB's well-known SDK port.
+/// `OpenRGB`'s well-known SDK port.
 pub const OPENRGB_ADDR: &str = "127.0.0.1:6742";
 
 /// obs-websocket's default port.
@@ -62,11 +62,13 @@ impl HostLock {
     /// Acquire the machine-wide election lock at [`HOST_ELECT_ADDR`]. `None` = another neuron
     /// host already owns this machine (the caller must not attach bridges, spawn writers, or
     /// bind adapters).
+    #[must_use]
     pub fn acquire() -> Option<HostLock> {
         HostLock::acquire_at(HOST_ELECT_ADDR)
     }
 
     /// For tests: acquire on an explicit addr.
+    #[must_use]
     pub fn acquire_at(addr: &str) -> Option<HostLock> {
         let listener = TcpListener::bind(addr).ok()?;
         listener.set_nonblocking(true).ok()?;
@@ -76,8 +78,8 @@ impl HostLock {
     }
 }
 
-/// The live OpenRGB client roster: connection id → (kernel owner, announced
-/// name). Maintained by the pump (insert on accept, name on SET_CLIENT_NAME,
+/// The live `OpenRGB` client roster: connection id → (kernel owner, announced
+/// name). Maintained by the pump (insert on accept, name on `SET_CLIENT_NAME`,
 /// remove on EVERY exit path — the same discipline as the claim release), so
 /// the status card reads who's connected without asking the sockets anything.
 type OrgbRoster = Arc<Mutex<HashMap<u64, (crate::arbiter::SourceId, String)>>>;
@@ -88,9 +90,9 @@ type OrgbRoster = Arc<Mutex<HashMap<u64, (crate::arbiter::SourceId, String)>>>;
 /// timeout), with margin for the accept thread's own connection-reaping join. Connection
 /// threads race toward exit concurrently with the accept thread, so this is NOT additive across
 /// however many clients are connected.
-const ORGB_SERVER_DROP_DEADLINE: Duration = Duration::from_millis(1000);
+const ORGB_SERVER_DROP_DEADLINE: Duration = Duration::from_secs(1);
 
-/// A running OpenRGB TCP server. Dropping it stops the accept loop, joins
+/// A running `OpenRGB` TCP server. Dropping it stops the accept loop, joins
 /// every connection thread, and thereby releases every client's claims.
 pub struct OrgbServer {
     stop: Arc<AtomicBool>,
@@ -100,7 +102,7 @@ pub struct OrgbServer {
 }
 
 impl OrgbServer {
-    /// Bind and serve with the default OpenRGB paint policy ([`PaintPolicy::opaque`]
+    /// Bind and serve with the default `OpenRGB` paint policy ([`PaintPolicy::opaque`]
     /// — show the client's paint as sent). `addr` is usually [`OPENRGB_ADDR`];
     /// tests pass `127.0.0.1:0` for an ephemeral port. A bind failure is returned
     /// as-is — on the well-known port it means "another host instance owns this
@@ -110,7 +112,7 @@ impl OrgbServer {
     }
 
     /// Bind and serve, wiring every connection to a shared [`PaintPolicy`] (the
-    /// OpenRGB family's blend/strength/fade/scope settings). The app passes the
+    /// `OpenRGB` family's blend/strength/fade/scope settings). The app passes the
     /// policy it also drives from the settings page.
     pub fn bind_with_policy(
         addr: &str,
@@ -125,7 +127,7 @@ impl OrgbServer {
         let roster: OrgbRoster = Arc::new(Mutex::new(HashMap::new()));
         let shared = roster.clone();
         let accept = crate::worker::spawn_named("neuron-orgb-accept", move || {
-            accept_loop(listener, handle, stop_flag, shared, policy)
+            accept_loop(listener, handle, stop_flag, shared, policy);
         })
         .expect("spawn accept thread");
         Ok(OrgbServer {
@@ -136,6 +138,7 @@ impl OrgbServer {
         })
     }
 
+    #[must_use]
     pub fn addr(&self) -> SocketAddr {
         self.addr
     }
@@ -180,7 +183,7 @@ fn accept_loop(
                 let conn_id = next_conn;
                 next_conn += 1;
                 if let Ok(t) = crate::worker::spawn_named("neuron-orgb-conn", move || {
-                    serve_conn(stream, handle, stop, roster, conn_id, policy)
+                    serve_conn(stream, handle, stop, roster, conn_id, policy);
                 }) {
                     conns.push(t);
                 }
@@ -293,14 +296,14 @@ fn serve_conn(
 }
 
 /// A running Chroma REST server: minimal HTTP/1.1 over std TCP, feeding the
-/// pure [`ChromaServer`] state machine. Unlike OpenRGB, a Chroma "session"
+/// pure [`ChromaServer`] state machine. Unlike `OpenRGB`, a Chroma "session"
 /// is NOT a TCP connection (games may reconnect per request) — lifecycle is
 /// the 15s heartbeat lease inside the state machine, so this pump has no
 /// disconnect duty at all; it only moves requests and responses.
 /// Bound on [`ChromaHttpServer`]'s teardown — same reasoning as [`ORGB_SERVER_DROP_DEADLINE`]
 /// (nonblocking accept polled ≤50ms, connections bounded by a 100ms read timeout plus a 500ms
 /// write timeout).
-const CHROMA_SERVER_DROP_DEADLINE: Duration = Duration::from_millis(1000);
+const CHROMA_SERVER_DROP_DEADLINE: Duration = Duration::from_secs(1);
 
 pub struct ChromaHttpServer {
     stop: Arc<AtomicBool>,
@@ -329,7 +332,7 @@ impl ChromaHttpServer {
         let server = Arc::new(Mutex::new(ChromaServer::with_policy(policy)));
         let shared = server.clone();
         let accept = crate::worker::spawn_named("neuron-chroma-accept", move || {
-            chroma_accept_loop(listener, handle, shared, stop_flag)
+            chroma_accept_loop(listener, handle, shared, stop_flag);
         })
         .expect("spawn chroma accept thread");
         Ok(ChromaHttpServer {
@@ -340,6 +343,7 @@ impl ChromaHttpServer {
         })
     }
 
+    #[must_use]
     pub fn addr(&self) -> SocketAddr {
         self.addr
     }
@@ -378,7 +382,7 @@ fn chroma_accept_loop(
                 let server = server.clone();
                 let stop = stop.clone();
                 if let Ok(t) = crate::worker::spawn_named("neuron-chroma-conn", move || {
-                    serve_chroma_conn(stream, handle, server, stop)
+                    serve_chroma_conn(stream, handle, server, stop);
                 }) {
                     conns.push(t);
                 }
@@ -587,6 +591,7 @@ impl ObsConnection {
     /// obs-websocket password (empty = no auth). Returns immediately; the
     /// connection establishes in the background and re-establishes if OBS
     /// restarts. Publishes `obs.connected` (bool) plus per-event signals.
+    #[must_use]
     pub fn start(addr: &str, password: &str, host: HostHandle) -> ObsConnection {
         let (tx, rx) = std::sync::mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
@@ -604,7 +609,7 @@ impl ObsConnection {
                 &mut thread_host,
                 &stop_flag,
                 &conn_flag,
-            )
+            );
         })
         .expect("spawn obs thread");
         ObsConnection {
@@ -616,12 +621,14 @@ impl ObsConnection {
         }
     }
 
+    #[must_use]
     pub fn control(&self) -> ObsControl {
         self.control.clone()
     }
 
     /// Has the websocket authenticated with OBS? (For the GUI's connected-state
     /// readout; a running-but-not-yet-connected connection returns false.)
+    #[must_use]
     pub fn is_connected(&self) -> bool {
         self.connected.load(Ordering::Relaxed)
     }
@@ -653,20 +660,17 @@ fn obs_run(
     while !stop.load(Ordering::Relaxed) {
         // "127.0.0.1:4455" -> host header "127.0.0.1".
         let host_hdr = addr.split(':').next().unwrap_or("localhost");
-        match WsStream::connect(addr, host_hdr, "/") {
-            Ok(ws) => {
-                backoff = Duration::from_millis(500); // reset on a good connect
-                obs_session(ws, password, rx, host, stop, connected);
-                connected.store(false, Ordering::Relaxed);
-                host.publish("obs.connected", Value::Bool(false));
-            }
-            Err(_) => {
-                // OBS not running / obs-websocket off: wait and retry, capped.
-                // Drain any stale queued commands so they don't pile up.
-                while rx.try_recv().is_ok() {}
-                sleep_interruptible(backoff, stop);
-                backoff = (backoff * 2).min(Duration::from_secs(10));
-            }
+        if let Ok(ws) = WsStream::connect(addr, host_hdr, "/") {
+            backoff = Duration::from_millis(500); // reset on a good connect
+            obs_session(ws, password, rx, host, stop, connected);
+            connected.store(false, Ordering::Relaxed);
+            host.publish("obs.connected", Value::Bool(false));
+        } else {
+            // OBS not running / obs-websocket off: wait and retry, capped.
+            // Drain any stale queued commands so they don't pile up.
+            while rx.try_recv().is_ok() {}
+            sleep_interruptible(backoff, stop);
+            backoff = (backoff * 2).min(Duration::from_secs(10));
         }
     }
 }
@@ -749,7 +753,7 @@ fn publish_obs_event(host: &mut HostHandle, ev: ObsEvent) {
         ObsEvent::Recording(on) => host.publish("obs.recording", Value::Bool(on)),
         ObsEvent::Scene(name) => host.publish("obs.scene", Value::Text(name)),
         ObsEvent::InputMute { name, muted } => {
-            host.publish(&format!("obs.mute.{name}"), Value::Bool(muted))
+            host.publish(&format!("obs.mute.{name}"), Value::Bool(muted));
         }
     }
 }

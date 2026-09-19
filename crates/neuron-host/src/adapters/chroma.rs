@@ -30,13 +30,13 @@
 //!
 //! Deliberate decisions where sources disagree (capture/replay will settle):
 //! - **POST stores an effect (returns `id`) without applying; PUT applies.**
-//!   The official SDK's create/apply split (UnityChromaSDK flow) — and a
+//!   The official SDK's create/apply split (`UnityChromaSDK` flow) — and a
 //!   preload-style client creating many effects up front must not flash each
 //!   one on creation. python-chroma-rest-server applies on POST; we follow
 //!   the SDK contract instead.
-//! - Firmware effect names over REST (CHROMA_WAVE etc.): the official REST
-//!   device pages document only NONE/STATIC/CUSTOM/CUSTOM_KEY/CUSTOM2, so we
-//!   refuse others with INVALID_PARAMETER rather than fake them.
+//! - Firmware effect names over REST (`CHROMA_WAVE` etc.): the official REST
+//!   device pages document only `NONE/STATIC/CUSTOM/CUSTOM_KEY/CUSTOM2`, so we
+//!   refuse others with `INVALID_PARAMETER` rather than fake them.
 //! - Session ids are minted in a port-plausible range (≥54236): the official
 //!   init reply's sessionid doubles as a per-session PORT in some client
 //!   flows; a future pump can bind those ports, and ids like 1,2,3 would be
@@ -105,7 +105,7 @@ impl HttpResponse {
 /// What a stored/applied effect does to its device.
 #[derive(Clone)]
 enum Action {
-    /// CHROMA_NONE: release the session's layer on that device.
+    /// `CHROMA_NONE`: release the session's layer on that device.
     Clear,
     Paint(Paint),
 }
@@ -155,6 +155,7 @@ pub struct ChromaServer {
 }
 
 impl ChromaServer {
+    #[must_use]
     pub fn new() -> ChromaServer {
         ChromaServer::with_policy(PaintPolicy::new())
     }
@@ -167,6 +168,7 @@ impl ChromaServer {
     /// TTL-filtered with the same 15s contract the prune uses, so a vanished
     /// game stops being REPORTED at the same moment its paint expires — even
     /// before the next request-driven prune actually sweeps the entry.
+    #[must_use]
     pub fn sessions(&self, now: Instant) -> Vec<(SourceId, String)> {
         self.sessions
             .values()
@@ -557,7 +559,7 @@ impl ChromaServer {
             let existing = live.get(&surface.key).map(|dl| dl.layer);
             if let Some(layer) = existing {
                 if let Some(dl) = live.get(&surface.key) {
-                    *dl.cells.lock().unwrap_or_else(|e| e.into_inner()) = cells.clone();
+                    *dl.cells.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = cells.clone();
                 }
                 if host.refresh(layer, now) {
                     continue;
@@ -644,7 +646,7 @@ fn parse_effect(v: &serde_json::Value) -> Option<Action> {
     match effect {
         "CHROMA_NONE" => Some(Action::Clear),
         "CHROMA_STATIC" => {
-            let color = v.pointer("/param/color").and_then(|c| c.as_u64())?;
+            let color = v.pointer("/param/color").and_then(serde_json::Value::as_u64)?;
             Some(Action::Paint(Paint::Fill(bgr(color as u32))))
         }
         "CHROMA_CUSTOM" | "CHROMA_CUSTOM2" | "CHROMA_CUSTOM_KEY" => {
@@ -704,7 +706,7 @@ fn parse_grid(v: &serde_json::Value) -> Option<Vec<Vec<u32>>> {
 /// Map a source grid onto a surface. Grid targets map (row, col)→row*cols+col
 /// with honest cropping (a 6×22 effect on a smaller board paints what fits);
 /// linear targets fill index-by-index. Unpainted cells stay `None` so lower
-/// layers show through per-LED. Bounds-guarded so a mis-declared SurfaceInfo
+/// layers show through per-LED. Bounds-guarded so a mis-declared `SurfaceInfo`
 /// (leds < rows*cols) degrades instead of panicking.
 fn grid_to_cells(grid: &[Vec<u32>], surface: &SurfaceInfo) -> Vec<Option<Rgb>> {
     let mut cells = vec![None; surface.leds];

@@ -42,3 +42,6 @@ features = [
 # crate's test binary, and the ctor hook in the test module denies hardware before any test runs.
 neuron = { path = "../neuron-core", features = ["mock-transport"] }
 ctor = "0.2"
+
+[lints]
+workspace = true

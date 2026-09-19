@@ -64,7 +64,7 @@ impl Dial {
             .map(|e| short_device(&e.name))
             .unwrap_or_default();
         self.ctl = ep.and_then(|e| VolumeCtl::open(&e.id));
-        self.value = self.ctl.as_ref().map(|c| c.get_volume()).unwrap_or(0.5);
+        self.value = self.ctl.as_ref().map_or(0.5, neuron::audio::VolumeCtl::get_volume);
         self.last = None;
         self.last_at = None;
         self.speed = 0.0;
@@ -77,7 +77,7 @@ impl Dial {
 
     /// Is the turned endpoint muted right now? — rings the gauge red.
     pub fn muted(&self) -> bool {
-        self.ctl.as_ref().map(|c| c.get_mute()).unwrap_or(false)
+        self.ctl.as_ref().is_some_and(neuron::audio::VolumeCtl::get_mute)
     }
 
     /// Integrate a fresh stroke point into the value, apply it live, and return the overlay's
@@ -89,8 +89,7 @@ impl Dial {
         let now = Instant::now();
         let dt = self
             .last_at
-            .map(|a| now.duration_since(a).as_secs_f32().clamp(0.0, 0.25))
-            .unwrap_or(1.0 / 60.0);
+            .map_or(1.0 / 60.0, |a| now.duration_since(a).as_secs_f32().clamp(0.0, 0.25));
         self.last_at = Some(now);
         let dtn = dt * 60.0; // 1 at the reference tick
         if let Some(prev) = self.last {
@@ -103,7 +102,7 @@ impl Dial {
             // accelerates a fast sweep into a slam. `accel` is scaled by the elapsed dt so the
             // tuning is frame-rate-independent, then hard-capped per event so one coalesced burst
             // (a big dt) can't teleport the value — the cap must come AFTER the scale to do that.
-            let accel = ((mag * 0.0011 + mag * mag * 0.00013) * dtn as f64).min(0.16);
+            let accel = ((mag * 0.0011 + mag * mag * 0.00013) * f64::from(dtn)).min(0.16);
             self.value = (self.value + (raw.signum() * accel) as f32).clamp(0.0, 1.0);
             if let Some(c) = &self.ctl {
                 c.set_volume(self.value);

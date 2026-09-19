@@ -190,7 +190,7 @@ pub(crate) fn summon_hwnd(hwnd: isize, mode: SummonMode) -> String {
 /// `ShellExecuteW("open", name)` resolves exactly like Win+R / the Start search: it consults the
 /// App Paths registry key and PATH, so a bare `brave`/`code`/`wt` finds the real exe without a full
 /// path. Spawning a process is a real side-effect, so it honours the SAME arm gate as `Run`/scripts
-/// (a launch a window-verb couldn't already do must not fire in safe mode). ShellExecute returns a
+/// (a launch a window-verb couldn't already do must not fire in safe mode). `ShellExecute` returns a
 /// value > 32 on success; anything else (most often "not found") is reported honestly.
 fn launch(needle: &str) -> String {
     let name = needle.trim();
@@ -249,7 +249,7 @@ pub fn banish(pick: WindowPick) -> String {
 
 // ── KILL (force-terminate the owning process) ──────────────────────────────────────────────────────
 
-/// Force-TERMINATE the process owning the picked window — not a polite WM_CLOSE, the hard
+/// Force-TERMINATE the process owning the picked window — not a polite `WM_CLOSE`, the hard
 /// `TerminateProcess` for a hung app. Gated by the arm switch (safe-mode suppresses it) since it's
 /// destructive and unrecoverable. `Behind` falls back to the focused window (killing every buried
 /// app at once would be a footgun).
@@ -324,7 +324,7 @@ pub fn pin(pick: WindowPick) -> String {
 
 /// Predict the pin toggle for `pick` (read-only): the window a press targets + whether it's
 /// ALREADY pinned — so the wedge can say "unpin" on a pinned window instead of always claiming
-/// "pin" (the same label-lies-about-the-press bug the tether had). `Behind` → focused, like pin().
+/// "pin" (the same label-lies-about-the-press bug the tether had). `Behind` → focused, like `pin()`.
 pub fn pin_preview(pick: WindowPick) -> Option<(String, bool)> {
     let hwnd = match pick {
         WindowPick::Hover => os().under_cursor(),
@@ -352,7 +352,7 @@ fn stones() -> &'static std::sync::Mutex<std::collections::HashMap<String, Ancho
 
 /// The windows currently holding a tether anchor (any slot) — so the teleport map can SHOW where
 /// your warpstones are while you aim. Dead/closed windows are filtered out (a stone whose window
-/// is gone is as good as unset, exactly as [`tether`] treats it). Order is arbitrary (HashMap).
+/// is gone is as good as unset, exactly as [`tether`] treats it). Order is arbitrary (`HashMap`).
 pub fn tether_hwnds() -> Vec<isize> {
     stones()
         .lock()
@@ -440,7 +440,7 @@ pub fn tether(slot: &str) -> String {
                 stones()
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(key.clone(), a);
+                    .insert(key, a);
                 format!("\u{1f5ff} tethered{label} \u{2192} {}", os().title_of(a.hwnd))
             }
             None => "nothing to tether to here".into(),
@@ -625,7 +625,7 @@ mod imp {
 
         fn cursor_pos(&self) -> (i32, i32) {
             let mut c = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
-            unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut c) };
+            unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos(&raw mut c) };
             (c.x, c.y)
         }
 
@@ -645,7 +645,7 @@ mod imp {
             let mut pid = 0u32;
             unsafe {
                 windows_sys::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(
-                    hwnd as _, &mut pid,
+                    hwnd as _, &raw mut pid,
                 );
             }
             pid
@@ -695,7 +695,7 @@ mod imp {
             };
             unsafe {
                 let mut p = POINT { x: 0, y: 0 };
-                GetCursorPos(&mut p);
+                GetCursorPos(&raw mut p);
                 let h = WindowFromPoint(p);
                 if h.is_null() {
                     return None;
@@ -712,7 +712,7 @@ mod imp {
         }
 
         /// Every visible, titled, non-tool top-level window that is mostly HIDDEN behind others —
-        /// found by sampling its interior against the live z-order (WindowFromPoint resolves to the
+        /// found by sampling its interior against the live z-order (`WindowFromPoint` resolves to the
         /// root that actually owns each pixel). A window <30% visible is "behind" and gets swept.
         fn occluded(&self) -> Vec<isize> {
             use windows_sys::Win32::Foundation::{HWND, LPARAM, POINT};
@@ -762,7 +762,7 @@ mod imp {
             }
             let mut out: Vec<isize> = Vec::new();
             unsafe {
-                EnumWindows(Some(cb), &mut out as *mut _ as isize);
+                EnumWindows(Some(cb), &raw mut out as isize);
             }
             out
         }
@@ -850,7 +850,7 @@ mod imp {
         }
 
         /// Warp the cursor to (x, y) and HOLD it there for a breath. A bare `SetCursorPos` loses the
-        /// race the user reported: `force_foreground` whispers a SendInput move, the OS still has
+        /// race the user reported: `force_foreground` whispers a `SendInput` move, the OS still has
         /// in-flight physical mouse deltas queued, and the user's own hand keeps moving — all of which
         /// overwrite the cursor the instant after the set, so it snaps back and "continues moving as
         /// if it never teleported". Re-asserting the target on a tight ~90ms settle absorbs that
@@ -871,7 +871,7 @@ mod imp {
                 for _ in 0..16 {
                     std::thread::sleep(std::time::Duration::from_millis(6));
                     let mut c = POINT { x: 0, y: 0 };
-                    GetCursorPos(&mut c);
+                    GetCursorPos(&raw mut c);
                     if (c.x - x).abs() <= 1 && (c.y - y).abs() <= 1 {
                         stable += 1;
                         if stable >= 2 {
@@ -933,7 +933,7 @@ mod imp {
         };
         unsafe {
             let mut pid = 0u32;
-            GetWindowThreadProcessId(hwnd as _, &mut pid);
+            GetWindowThreadProcessId(hwnd as _, &raw mut pid);
             if pid == GetCurrentProcessId() {
                 return true; // never our own overlay / tiles / palette
             }
@@ -953,7 +953,7 @@ mod imp {
         use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect;
         unsafe {
             let mut r: RECT = std::mem::zeroed();
-            if GetWindowRect(hwnd as _, &mut r) == 0 {
+            if GetWindowRect(hwnd as _, &raw mut r) == 0 {
                 None
             } else {
                 Some((r.left, r.top, r.right, r.bottom))

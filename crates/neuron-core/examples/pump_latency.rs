@@ -88,8 +88,7 @@ fn main() {
         .iter()
         .position(|a| a == "--load-priority")
         .and_then(|i| args.get(i + 1))
-        .map(|v| v == "above")
-        .unwrap_or(false);
+        .is_some_and(|v| v == "above");
 
     println!("neuron pump latency — the REAL listen_until pump, real inject_event, real engine");
     println!(
@@ -177,11 +176,11 @@ fn main() {
                     // this thread touches them) — they exist because `listen_until` wants Fn closures.
                     let list = {
                         let _t = latency::start(&latency::EDGE_DIFF);
-                        edges.lock().unwrap_or_else(|e| e.into_inner()).edges(ev)
+                        edges.lock().unwrap_or_else(std::sync::PoisonError::into_inner).edges(ev)
                     };
                     for edge in list {
                         if let InputEdge::Down(trigger) = edge {
-                            let mut exec = exec.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut exec = exec.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                             if exec.fire(&engine, &trigger, &mut NullIntents).is_some() {
                                 dispatched.fetch_add(1, Ordering::Relaxed);
                             }
@@ -193,7 +192,7 @@ fn main() {
                     // The live worker's idle cadence. Deliberately LONG: it proves the wake event —
                     // not a timeout — is what returns the wait. If the hop were riding the cadence
                     // instead, `inject_hop` would read as hundreds of milliseconds.
-                    Duration::from_millis(1000)
+                    Duration::from_secs(1)
                 },
             );
         })

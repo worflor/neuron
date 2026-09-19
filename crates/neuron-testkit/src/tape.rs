@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
 
-//! ChromaTape — a timestamped recording of the native Chroma shared-memory sections while a
+//! `ChromaTape` — a timestamped recording of the native Chroma shared-memory sections while a
 //! real game paints, and the decoder that replays it into tests.
 //!
 //! ## Provenance
@@ -150,11 +150,13 @@ impl Tape {
     }
 
     /// Records of one section, in capture order.
+    #[must_use]
     pub fn section(&self, note: &str) -> Vec<&Record> {
         self.records.iter().filter(|r| r.note == note).collect()
     }
 
     /// Record count per section nickname.
+    #[must_use]
     pub fn census(&self) -> BTreeMap<String, usize> {
         let mut m = BTreeMap::new();
         for r in &self.records {
@@ -164,6 +166,7 @@ impl Tape {
     }
 
     /// Inter-record intervals (ms) for a section, transitions included.
+    #[must_use]
     pub fn intervals_ms(&self, note: &str) -> Vec<u64> {
         let recs = self.section(note);
         recs.windows(2).map(|w| w[1].t_ms - w[0].t_ms).collect()
@@ -171,6 +174,7 @@ impl Tape {
 
     /// Median of the STEADY cadence for a section — intervals under `cut_ms` (scene
     /// transitions excluded). None when fewer than two steady intervals exist.
+    #[must_use]
     pub fn steady_cadence_p50(&self, note: &str, cut_ms: u64) -> Option<u64> {
         let mut steady: Vec<u64> = self
             .intervals_ms(note)
@@ -194,11 +198,13 @@ pub struct PixelView<'a> {
 
 impl<'a> PixelView<'a> {
     /// View a keyboard buffer record's pixel array.
+    #[must_use]
     pub fn of(record: &'a Record) -> PixelView<'a> {
         PixelView { bytes: &record.bytes, count: KBD_PIXEL_COUNT }
     }
 
     /// View with an explicit pixel count (other device-type buffers have smaller arrays).
+    #[must_use]
     pub fn with_count(record: &'a Record, count: usize) -> PixelView<'a> {
         PixelView { bytes: &record.bytes, count }
     }
@@ -214,6 +220,7 @@ impl<'a> PixelView<'a> {
     }
 
     /// Pixels whose color bytes (b0..b2) are non-zero — the lit portion of the frame.
+    #[must_use]
     pub fn lit(&self) -> Vec<(usize, [u8; 4])> {
         self.pixels()
             .filter(|(_, p)| p[0] != 0 || p[1] != 0 || p[2] != 0)
@@ -221,6 +228,7 @@ impl<'a> PixelView<'a> {
     }
 
     /// Distinct lit colors (b0..b2 triples).
+    #[must_use]
     pub fn palette(&self) -> Vec<[u8; 3]> {
         let mut set = std::collections::BTreeSet::new();
         for (_, p) in self.lit() {

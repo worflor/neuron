@@ -70,3 +70,6 @@ neuron-testkit = { path = "../neuron-testkit" }
 # the ctor hook in lib.rs denies hardware before any test runs.
 neuron = { path = "../neuron-core", features = ["mock-transport"] }
 ctor = "0.2"
+
+[lints]
+workspace = true

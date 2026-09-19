@@ -15,7 +15,7 @@
 //!      go a hair early" still counts); a failed rhythm resets instantly and silently.
 //!   4. **Fidgeting is not an error.** Any phrase that resolves to nothing costs nothing: no
 //!      lockout, no cooldown, no error spam. Spamming re-arms within one poll tick.
-//!   5. **A layer is a stance.** HyperShift gets the four stance modes games standardized —
+//!   5. **A layer is a stance.** `HyperShift` gets the four stance modes games standardized —
 //!      hold (momentary), latch (tap on/off), smart (tap latches, hold is momentary), one-shot
 //!      (the next press is shifted, then auto-drops). Razer ships hold-only; this is the fix.
 //!
@@ -42,6 +42,7 @@ pub struct Phrase(pub Vec<Sym>);
 
 impl Phrase {
     /// The classic: press and it's live (zero added latency).
+    #[must_use]
     pub fn hold() -> Self {
         Phrase(vec![Sym::Hold])
     }
@@ -69,6 +70,7 @@ impl Phrase {
     }
 
     /// "tap tap hold" — the inverse of [`parse`].
+    #[must_use]
     pub fn describe(&self) -> String {
         self.0
             .iter()
@@ -82,6 +84,7 @@ impl Phrase {
 
     /// Ends in a hold → capture lives WHILE the final press is held (release ends it).
     /// All-taps → the phrase TOGGLES capture (the next tap ends it).
+    #[must_use]
     pub fn ends_in_hold(&self) -> bool {
         self.0.last() == Some(&Sym::Hold)
     }
@@ -89,6 +92,7 @@ impl Phrase {
     /// The MODE shape of a phrase: `Some(n)` if it's exactly "n taps then a hold" — the grammar
     /// the multi-instrument trigger dispatcher multiplexes on (hold = weave, tap-hold = teleport,
     /// tap-tap-hold = whiteboard…). `None` for anything else (toggle phrases, hold-mid-phrase).
+    #[must_use]
     pub fn taps_then_hold(&self) -> Option<u8> {
         let (last, taps) = self.0.split_last()?;
         if *last != Sym::Hold || taps.iter().any(|s| *s != Sym::Tap) || taps.len() > 250 {
@@ -98,10 +102,11 @@ impl Phrase {
     }
 
     /// Normalize a recorded edge sequence into a phrase: press durations quantize against
-    /// `hold_ms` (shorter = tap, longer = hold-and-end). `presses` are (down_ms, up_ms) pairs in
+    /// `hold_ms` (shorter = tap, longer = hold-and-end). `presses` are (`down_ms`, `up_ms`) pairs in
     /// any consistent clock; an unterminated final press records as a Hold. Gaps are NOT encoded
     /// (the grammar is rhythm-shape, not tempo — matching applies the user's live tempo instead),
     /// which is what makes a sloppy re-performance still match a tight recording.
+    #[must_use]
     pub fn from_recording(presses: &[(u64, Option<u64>)], cfg: &FeelConfig) -> Option<Self> {
         if presses.is_empty() {
             return None;
@@ -139,7 +144,7 @@ pub struct FeelConfig {
     /// ("released a hair early" must not eat the gesture's tail).
     #[serde(default = "d_coyote_ms")]
     pub coyote_ms: u64,
-    /// The HyperShift stance (see [`LayerMode`]).
+    /// The `HyperShift` stance (see [`LayerMode`]).
     #[serde(default)]
     pub hypershift: LayerMode,
 }
@@ -166,12 +171,14 @@ impl Default for FeelConfig {
 }
 
 impl FeelConfig {
+    #[must_use]
     pub fn path() -> PathBuf {
         crate::runroot::run_root().join("feel.toml")
     }
 
     /// Load from `feel.toml`, salvaging field-by-field (a malformed timing no longer silently resets
     /// every feel/hypershift setting) and never clobbering the file — see [`crate::salvage::SalvageLoad`].
+    #[must_use]
     pub fn load() -> Self {
         <Self as crate::salvage::SalvageLoad>::load()
     }
@@ -199,7 +206,7 @@ impl crate::salvage::SalvageLoad for FeelConfig {
     }
 }
 
-/// The HyperShift STANCE — how the layer trigger behaves. Razer ships `Hold` only (toggle has
+/// The `HyperShift` STANCE — how the layer trigger behaves. Razer ships `Hold` only (toggle has
 /// been a years-old community request); games solved this long ago, so Neuron offers the set.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -217,6 +224,7 @@ pub enum LayerMode {
 }
 
 impl LayerMode {
+    #[must_use]
     pub fn parse(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "latch" => LayerMode::Latch,
@@ -225,6 +233,7 @@ impl LayerMode {
             _ => LayerMode::Hold,
         }
     }
+    #[must_use]
     pub fn describe(&self) -> &'static str {
         match self {
             LayerMode::Hold => "hold",
@@ -266,6 +275,7 @@ pub struct PhraseWatcher {
 }
 
 impl PhraseWatcher {
+    #[must_use]
     pub fn new(phrase: Phrase, cfg: &FeelConfig) -> Self {
         PhraseWatcher {
             phrase,

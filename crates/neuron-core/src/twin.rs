@@ -22,7 +22,7 @@
 //!   way to make the game hard is to *be* hard; slow down and the twin settles to you.
 //!
 //! Everything emergent (Storm / Stillpoint / Haunting / Sigil) is a rule over these
-//! signals, not a subsystem. Determinism is load-bearing: all randomness is a SplitMix64
+//! signals, not a subsystem. Determinism is load-bearing: all randomness is a `SplitMix64`
 //! seeded from the exchange index, so a given script of motifs always yields an identical
 //! brain — which is exactly what the simulated-player tests assert.
 
@@ -94,16 +94,20 @@ pub struct Knockback {
 }
 
 impl Knockback {
+    #[must_use]
     pub fn len(&self) -> usize {
         self.onsets.len()
     }
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.onsets.is_empty()
     }
+    #[must_use]
     pub fn duration_ms(&self) -> u64 {
-        self.onsets.last().map(|o| o.t_ms).unwrap_or(0)
+        self.onsets.last().map_or(0, |o| o.t_ms)
     }
     /// Onsets/sec of the played phrase (for ceiling assertions and the readout).
+    #[must_use]
     pub fn density(&self) -> f32 {
         if self.onsets.len() < 2 {
             return 0.0;
@@ -223,6 +227,7 @@ pub struct Familiar {
 
 impl Familiar {
     /// Birth a fresh familiar with no rhythm of its own.
+    #[must_use]
     pub fn new(cfg: TwinConfig) -> Self {
         let dim = crate::rhythm::EMBED_DIM;
         Familiar {
@@ -247,10 +252,12 @@ impl Familiar {
         }
     }
 
+    #[must_use]
     pub fn config(&self) -> &TwinConfig {
         &self.cfg
     }
 
+    #[must_use]
     pub fn signals(&self) -> Signals {
         Signals {
             novelty: self.novelty,
@@ -262,6 +269,7 @@ impl Familiar {
         }
     }
 
+    #[must_use]
     pub fn ceiling(&self) -> Ceiling {
         self.mirror.ceiling()
     }
@@ -390,7 +398,7 @@ impl Familiar {
 
         // the flourish: continue the rhythm with the fitted oscillator.
         let flourish = self.flourish(motif, &ceil, twin_voice);
-        let mut last_t = onsets.last().map(|o| o.t_ms).unwrap_or(0);
+        let mut last_t = onsets.last().map_or(0, |o| o.t_ms);
         for (ioi, energy) in flourish {
             let step = (ioi.max(ceil.min_ioi_ms as u64)).max(40);
             last_t += step;
@@ -414,7 +422,7 @@ impl Familiar {
         }
     }
 
-    /// Predict the next `1..=max_flourish` beats as (ioi_ms, energy) pairs by fitting a
+    /// Predict the next `1..=max_flourish` beats as (`ioi_ms`, energy) pairs by fitting a
     /// damped oscillator over the motif's (ioi-ratio, energy) feature series and spinning it
     /// forward. Falls back to a gentle echo when the phrase is too short to fit.
     fn flourish(&mut self, motif: &Motif, ceil: &Ceiling, _voice: Voice) -> Vec<(u64, f32)> {
@@ -430,8 +438,8 @@ impl Familiar {
             let mut z: Vec<C> = Vec::with_capacity(n);
             // align energies to interval index (use the later onset's energy per interval)
             for (k, &ioi) in iois.iter().enumerate() {
-                let ratio = ioi as f64 / med as f64;
-                let energy = motif.onsets[k + 1].energy as f64;
+                let ratio = ioi as f64 / f64::from(med);
+                let energy = f64::from(motif.onsets[k + 1].energy);
                 z.push(C::new(ratio, energy));
             }
             if z.len() >= 3 {
@@ -447,8 +455,8 @@ impl Familiar {
                         let ratio = next.re.clamp(0.25, 4.0);
                         let energy = (next.im as f32).clamp(0.1, 1.0);
                         // a featherweight deterministic flourish: nudge the timing slightly
-                        let jit = 1.0 + self.rng.jitter(0.06) as f64;
-                        let ioi = (med as f64 * ratio * jit).round() as u64;
+                        let jit = 1.0 + f64::from(self.rng.jitter(0.06));
+                        let ioi = (f64::from(med) * ratio * jit).round() as u64;
                         out.push((ioi.max(ceil.min_ioi_ms as u64), energy));
                     }
                     return out;
@@ -458,7 +466,7 @@ impl Familiar {
 
         // echo fallback: repeat the last interval, slightly softened.
         let last_ioi = motif.iois().last().copied().unwrap_or(med as u64);
-        let last_e = motif.onsets.last().map(|o| o.energy).unwrap_or(0.5);
+        let last_e = motif.onsets.last().map_or(0.5, |o| o.energy);
         (0..count)
             .map(|_| {
                 (
@@ -488,9 +496,7 @@ impl Familiar {
         let picks: Vec<Motif> = ranked.into_iter().take(3).cloned().collect();
         let ceil = self.mirror.ceiling();
         let voice = picks
-            .first()
-            .map(|m| m.dominant_voice())
-            .unwrap_or_else(Voice::neutral);
+            .first().map_or_else(Voice::neutral, super::rhythm::Motif::dominant_voice);
 
         let mut onsets = Vec::new();
         let mut t = 0u64;
@@ -506,7 +512,7 @@ impl Familiar {
                 });
             }
             // a breath between braided strands
-            t = onsets.last().map(|o| o.t_ms).unwrap_or(t) + (ceil.min_ioi_ms as u64) * 2;
+            t = onsets.last().map_or(t, |o| o.t_ms) + (ceil.min_ioi_ms as u64) * 2;
             let _ = i;
         }
         clamp_density(&mut onsets, ceil.density);
@@ -521,6 +527,7 @@ impl Familiar {
 
     /// Summon a haunting: an old motif (early memories preferred) replayed faded. Returns
     /// the phrase and its age in exchanges, or None if there's no deep history yet.
+    #[must_use]
     pub fn haunting(&self) -> Option<(Knockback, usize)> {
         if self.ring.len() < 8 {
             return None;
@@ -558,6 +565,7 @@ impl Familiar {
     /// The personal sigil: a drawing no other human could generate, grown from the running
     /// distribution of the player's eigen-vocabulary (the brain's dream buffer of per-motif
     /// K). Returns a normalized 2D path in `[-1,1]²`, ready to render or export as SVG.
+    #[must_use]
     pub fn sigil_path(&self, samples: usize) -> Vec<(f32, f32)> {
         // Build a small oscillator bank from the spread of remembered K eigenvalues and run
         // it forward — the same predict-from-fit that generates knockbacks, turned to ink.
@@ -612,6 +620,7 @@ impl Familiar {
         path
     }
 
+    #[must_use]
     pub fn memory_len(&self) -> usize {
         self.ring.len()
     }
@@ -619,6 +628,7 @@ impl Familiar {
     // ── persistence ────────────────────────────────────────────────────────
 
     /// Serialize the whole familiar: the Engram brain plus the game-side rings and signals.
+    #[must_use]
     pub fn save(&self) -> Vec<u8> {
         let brain_bytes = brain_io::save(&self.brain);
         let side = SideSave {
@@ -644,6 +654,7 @@ impl Familiar {
     }
 
     /// Restore a familiar from [`Familiar::save`] bytes.
+    #[must_use]
     pub fn load(data: &[u8]) -> Option<Familiar> {
         if data.len() < 9 || &data[..4] != b"KNBK" || data[4] != 1 {
             return None;
@@ -678,6 +689,7 @@ impl Familiar {
     }
 
     /// The raw brain, for diagnostics (`neuron twin`) and tests.
+    #[must_use]
     pub fn brain(&self) -> &Brain {
         &self.brain
     }

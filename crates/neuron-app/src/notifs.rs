@@ -98,7 +98,7 @@ static MACRO_SEQ: AtomicU64 = AtomicU64::new(0);
 /// Each call gets a UNIQUE ident (`macro:{id}:{seq}`), so an LLM macro that emits several distinct
 /// `neuron.notify()` lines becomes several SEPARATE stacked cards — none collapsed into one (the user
 /// must never miss a line). The macro API itself is unchanged: no new argument, no new host protocol —
-/// the uniqueness is invented entirely on this side. It rides the same engine, so the live Kind::Macro
+/// the uniqueness is invented entirely on this side. It rides the same engine, so the live `Kind::Macro`
 /// notif toggle gates it exactly like every other card.
 pub fn post_macro(id: &str, text: &str) {
     let Some(tx) = NOTE_SINK.get() else {
@@ -262,8 +262,7 @@ pub fn run(rx: Receiver<Note>) {
         // capture thread can't lag the column motion behind real wall time.
         let now = Instant::now();
         let dt = last_tick
-            .map(|t| now.duration_since(t).as_secs_f32().clamp(0.0, 0.25))
-            .unwrap_or(1.0 / 60.0);
+            .map_or(1.0 / 60.0, |t| now.duration_since(t).as_secs_f32().clamp(0.0, 0.25));
         last_tick = Some(now);
         reflow(&mut slots, mode, dt); // ease the column toward its targets, then snapshot to the overlay
         let (slot_views, digest, tail) = present(&slots, mode);
@@ -402,7 +401,7 @@ fn ingest_ask(slots: &mut Vec<Slot>, pid: u64, _macro_id: &str, question: &str, 
             phase_since: now,
             // far-future: an ask is PERSISTENT — `tick_phases` never expires it (it ignores the
             // deadline for ask slots), but a sane value keeps the field honest.
-            deadline: now + Duration::from_secs(86_400),
+            deadline: now + Duration::from_hours(24),
             cur_y: 0.0,
             seeded: false,
             bump_since: neuron::timing::ago(Duration::from_secs(10)),
@@ -517,7 +516,10 @@ fn reflow(slots: &mut [Slot], mode: StackMode, dt: f32) {
         }
     }
     for (s, &t) in slots.iter_mut().zip(targets.iter()) {
-        if !s.seeded {
+        if s.seeded {
+            let k = 1.0 - (1.0 - REFLOW_K).powf(60.0 * dt); // dt-normalized crisp exponential approach
+            s.cur_y += (t - s.cur_y) * k;
+        } else {
             // SEED a fresh card a touch PAST its slot — further from the corner — so the spring
             // pulls it back toward the edge: a crisp slide-in riding the fade-up.
             //
@@ -529,9 +531,6 @@ fn reflow(slots: &mut [Slot], mode: StackMode, dt: f32) {
             // into the screen and can never clip, at any of the nine placements.
             s.cur_y = t + ENTRY_SLIDE_PX;
             s.seeded = true;
-        } else {
-            let k = 1.0 - (1.0 - REFLOW_K).powf(60.0 * dt); // dt-normalized crisp exponential approach
-            s.cur_y += (t - s.cur_y) * k;
         }
     }
 }
@@ -789,7 +788,7 @@ pub fn card_layout(shape: CardShape) -> CardLayout {
     // and the chip+margin. Whichever is taller sets each edge: a SHORT card can never squish the chip
     // (the chip floor wins → a guaranteed CHIP_MARGIN of air); a TALL card keeps that same margin (the
     // text wins, the chip rides the headline). This single rule replaces every per-variant tuning. ──
-    let chip_cy = (cluster_top + cluster_bot) / 2.0;
+    let chip_cy = f32::midpoint(cluster_top, cluster_bot);
     let top = 0.0_f32.min(chip_cy - CHIP_HALF - CHIP_MARGIN);
     let bot = text_bot.max(chip_cy + CHIP_HALF + CHIP_MARGIN);
 
@@ -972,7 +971,7 @@ impl Music {
     fn new() -> Music {
         Music {
             deg: 0,
-            at: neuron::timing::ago(Duration::from_secs(60)),
+            at: neuron::timing::ago(Duration::from_mins(1)),
         }
     }
 
@@ -1024,7 +1023,7 @@ impl Music {
                 _ => vec![(base, 0.85, 0)],
             },
         };
-        self.deg = notes.last().map(|n| n.0).unwrap_or(base);
+        self.deg = notes.last().map_or(base, |n| n.0);
         self.at = now;
         (notes, None)
     }
@@ -1138,8 +1137,7 @@ fn range_fill(c: &Confirmation) -> (f32, f32) {
                 .prev
                 .as_deref()
                 .and_then(|p| p.parse::<f64>().ok())
-                .map(|p| (((p - min) / span) as f32).clamp(0.0, 1.0))
-                .unwrap_or(-1.0);
+                .map_or(-1.0, |p| (((p - min) / span) as f32).clamp(0.0, 1.0));
             (fill, prev_fill)
         }
         Shape::Discrete { .. } => (-1.0, -1.0),
@@ -1229,8 +1227,7 @@ fn pseudo_rand() -> usize {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos() as usize)
-        .unwrap_or(0)
+        .map_or(0, |d| d.subsec_nanos() as usize)
 }
 
 #[cfg(test)]
@@ -1460,7 +1457,7 @@ pub fn write_proof_frames() {
         })
     };
     let ranged = |v: f32, unit: &'static str| Shape::Ranged {
-        value: v as f64,
+        value: f64::from(v),
         min: 100.0,
         max: 30_000.0,
         unit,

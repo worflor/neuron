@@ -8,7 +8,7 @@
 //!
 //! Authored spine bindings live in `profiles/gui.rules.toml` — a `Vec<Rule>` sidecar exactly like
 //! the migration importer writes, so `controls::load_rule_sidecars` (and thus `build_runtime`, the
-//! live dispatch path) picks them up verbatim, HyperShift layer tags and all. This is strictly more
+//! live dispatch path) picks them up verbatim, `HyperShift` layer tags and all. This is strictly more
 //! powerful than `bindings.toml` (the full typed `Action` enum, not 4 string actions), and keeps the
 //! GUI's authored binds in one inspectable file.
 
@@ -586,7 +586,7 @@ fn build_mute(p: &str) -> Action {
     let (target_mode, device) = split_device(p);
     let toks: Vec<String> = target_mode
         .split_whitespace()
-        .map(|s| s.to_ascii_lowercase())
+        .map(str::to_ascii_lowercase)
         .collect();
     let mic = toks.iter().any(|t| t == "mic");
     let mode = if toks.iter().any(|t| t == "on") {
@@ -636,8 +636,8 @@ pub fn validate_action(id: &str, param: &str) -> Result<(), String> {
     // the palette's `required` flag is the single source of truth for "blank won't commit" — the
     // optional ones (volume, mute, tether, banish, …) default sensibly, so a blank is fine.
     let entry = ACTION_PALETTE.iter().find(|t| t.0 == id);
-    let hint = entry.map(|t| t.2).unwrap_or("");
-    let required = entry.map(|t| t.4).unwrap_or(false);
+    let hint = entry.map_or("", |t| t.2);
+    let required = entry.is_some_and(|t| t.4);
     if required && p.is_empty() {
         return Err(format!("this action needs a parameter — {hint}"));
     }
@@ -656,7 +656,7 @@ pub fn validate_action(id: &str, param: &str) -> Result<(), String> {
         }
         // summon needs a window to find; the mode after the · is optional.
         "summon" => {
-            let window = p.split_once('\u{00b7}').map(|(w, _)| w.trim()).unwrap_or(p);
+            let window = p.split_once('\u{00b7}').map_or(p, |(w, _)| w.trim());
             if window.is_empty() {
                 Err("summon needs a window (title or exe) to find".into())
             } else {
@@ -1049,7 +1049,7 @@ pub enum AddOutcome {
 }
 
 /// Author one rule (a captured HID control trigger -> a chosen Action), optionally on the
-/// HyperShift layer. Re-binding an already-bound trigger REPLACES its action in place (the
+/// `HyperShift` layer. Re-binding an already-bound trigger REPLACES its action in place (the
 /// behaviour every keybind UI trains users to expect) instead of silently stacking a duplicate.
 pub fn add_gui_rule(
     trigger: Trigger,
@@ -1187,7 +1187,7 @@ pub fn edit_gui_rule_in_tier(
     save_gui_rules(&rules)
 }
 
-/// The HyperShift HOLD KEY — the control you hold to REACH the second layer. Stored as a `Noop` rule
+/// The `HyperShift` HOLD KEY — the control you hold to REACH the second layer. Stored as a `Noop` rule
 /// on the "hypershift" layer: the engine activates a layer for ANY input with a rule on it, so a Noop
 /// rule is a pure activator (it holds the layer, does nothing itself). Exactly one hold key — setting
 /// a new one replaces the old.
@@ -1200,7 +1200,7 @@ pub fn set_hypershift_hold(trigger: Trigger) -> Result<(), String> {
     save_gui_rules(&rules)
 }
 
-/// Clear the HyperShift hold key (drop its Noop activator). Idempotent.
+/// Clear the `HyperShift` hold key (drop its Noop activator). Idempotent.
 pub fn clear_hypershift_hold() -> Result<(), String> {
     let mut rules = load_gui_rules();
     let before = rules.len();
@@ -1221,7 +1221,7 @@ pub fn save_cast(cast: &CastConfig) -> Result<(), String> {
     neuron::salvage::atomic_write(&CastConfig::path(), body.as_bytes()).map_err(|e| e.to_string())
 }
 
-/// Set sector `i`'s action in the base OR HyperShift radial (`hyper`), growing the vec as needed,
+/// Set sector `i`'s action in the base OR `HyperShift` radial (`hyper`), growing the vec as needed,
 /// then save. The two sets share the editor — only the target Vec differs.
 pub fn set_sector_action_on(
     cast: &mut CastConfig,
@@ -1293,7 +1293,7 @@ pub fn set_sniper_button(trigger: Trigger, dpi: u16) -> Result<(), String> {
 pub fn set_sniper_dpi(dpi: u16) -> Result<bool, String> {
     let mut rules = load_gui_rules();
     let mut found = false;
-    for r in rules.iter_mut() {
+    for r in &mut rules {
         if let Action::Sniper { dpi: d } = &mut r.action {
             *d = dpi;
             found = true;

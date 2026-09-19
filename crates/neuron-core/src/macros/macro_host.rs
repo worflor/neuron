@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
 
-//! the Macro Host — Neuron's macro runtime. A bundled private CPython, run as ONE warm sidecar
+//! the Macro Host — Neuron's macro runtime. A bundled private `CPython`, run as ONE warm sidecar
 //! process. Macros are real Python (`import ctypes`/`subprocess`/anything — full unsandboxed
 //! power, "as if it were a program"); they're registered once (imports warmed) and a trigger is a
 //! tiny framed message that calls the already-resident function. No per-press spawn, no per-press
@@ -133,11 +133,11 @@ const BREAKER_MAX: u32 = 4;
 const BREAKER_WINDOW: Duration = Duration::from_secs(30);
 const BREAKER_COOLDOWN: Duration = Duration::from_secs(20);
 
-/// The process-global MacroHost. Lazily created (does NOT spawn the sidecar until first use or an
+/// The process-global `MacroHost`. Lazily created (does NOT spawn the sidecar until first use or an
 /// explicit [`MacroHost::ensure_warm`] at app launch).
 static MACRO_HOST: OnceLock<MacroHost> = OnceLock::new();
 
-/// Reach the process-global MacroHost.
+/// Reach the process-global `MacroHost`.
 pub fn macro_host() -> &'static MacroHost {
     MACRO_HOST.get_or_init(MacroHost::new)
 }
@@ -874,11 +874,10 @@ impl MacroHost {
             let warm = g
                 .session
                 .as_ref()
-                .map(|s| {
+                .is_some_and(|s| {
                     let st = s.shared.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     st.warm && !st.dead
-                })
-                .unwrap_or(false);
+                });
             if warm {
                 let generation = g.generations.get(id).copied().unwrap_or(0);
                 let s = g.session.as_mut().unwrap();
@@ -897,10 +896,10 @@ impl MacroHost {
         }
         // not warm (or contended): kick a deduplicated background warm and report — never block.
         self.spawn_background_warm();
-        if !self.available() {
-            "[python runtime unavailable]".into()
-        } else {
+        if self.available() {
             format!("macro '{id}' — sidecar warming, press again")
+        } else {
+            "[python runtime unavailable]".into()
         }
     }
 
@@ -945,9 +944,7 @@ impl MacroHost {
         match rx.recv_timeout(budget) {
             Ok(v) if v.get("ok").and_then(Value::as_bool) == Some(true) => v
                 .get("value")
-                .and_then(Value::as_str)
-                .map(|s| format!("macro '{id}': {s}"))
-                .unwrap_or_else(|| format!("macro '{id}' ran")),
+                .and_then(Value::as_str).map_or_else(|| format!("macro '{id}' ran"), |s| format!("macro '{id}': {s}")),
             Ok(v) => format!(
                 "macro '{id}' error: {}",
                 v.get("error")
@@ -1008,8 +1005,7 @@ impl MacroHost {
         let dead = g
             .session
             .as_ref()
-            .map(|s| s.shared.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).dead)
-            .unwrap_or(true);
+            .is_none_or(|s| s.shared.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).dead);
         if !dead {
             return Ok(());
         }
@@ -1143,7 +1139,7 @@ fn spawn_session(armed: bool, log: LogRing, beacon: BeaconSlot) -> Result<Sessio
         let shared = shared.clone();
         let stdin_weak = Arc::downgrade(&stdin);
         crate::worker::spawn_named("macro-host-reader", move || {
-            reader_loop(stdout, shared, beacon, stdin_weak)
+            reader_loop(stdout, shared, beacon, stdin_weak);
         })
         .ok()
     };
@@ -1434,8 +1430,7 @@ fn reader_loop(
                 st.dead = false;
                 shared.cv.notify_all();
             }
-            Some("result") | Some("checked") | Some("pong") | Some("registered")
-            | Some("prepared") | Some("committed") | Some("parsed") => {
+            Some("result" | "checked" | "pong" | "registered" | "prepared" | "committed" | "parsed") => {
                 // Hand the frame to its waiter if one is registered. A `result` with NO waiter —
                 // whether the rid is null (a fire-and-forget `invoke(wait=False)` child, dispatched
                 // with `rid: None`) OR a numeric rid nobody is waiting on (a top-level `fire_async`,
@@ -1617,7 +1612,7 @@ fn ctx_json(ctx: &crate::macros::context::Context, armed: bool) -> Value {
 ///      app-materialized `host/` dir either way (so the protocol scripts are always the right ones).
 ///   2. **the BUNDLED runtime** — the interpreter `neuron` ships in its own binary and materializes
 ///      into the user's data dir ([`crate::macros::ensure_runtime`]). The default ship path: a
-///      known-good CPython, zero user setup, no system-PATH probing, no env-var hacks.
+///      known-good `CPython`, zero user setup, no system-PATH probing, no env-var hacks.
 ///
 /// There is NO system-PATH discovery: `neuron` carries its own Python, so the macro tier never
 /// depends on what (if anything) the user has installed. An `Err` here means a real IO failure
@@ -1637,6 +1632,7 @@ fn resolve_runtime() -> Result<crate::macros::Runtime, String> {
 // ── macro persistence (macros/scripts/<id>.py) ──────────────────────────────────────────────────
 
 /// Directory holding python macro sources (in the run root, like the rest of Neuron's config).
+#[must_use]
 pub fn macros_dir() -> PathBuf {
     crate::runroot::run_root().join("macros").join("scripts")
 }
@@ -1735,7 +1731,7 @@ fn load_option_values(id: &str) -> Value {
     // A leaf lock: nothing else is acquired while it is held, so it cannot participate in a deadlock
     // even though `fire_dispatch` calls this while holding the host's own lock.
     {
-        let cache = option_cache().lock().unwrap_or_else(|e| e.into_inner());
+        let cache = option_cache().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(v) = cache.get(id) {
             return v.clone();
         }
@@ -1759,7 +1755,7 @@ fn load_option_values(id: &str) -> Value {
 fn cache_if_absent(id: &str, value: Value) -> Value {
     option_cache()
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .entry(id.to_string())
         .or_insert(value)
         .clone()
@@ -1779,7 +1775,7 @@ fn read_option_values_from_disk(id: &str) -> Value {
 fn invalidate_option_cache(id: &str) {
     option_cache()
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .remove(id);
 }
 
@@ -1791,7 +1787,7 @@ fn write_option_values(id: &str, values: &Value) -> Result<(), String> {
     // followed by the user testing the macro, and that press should not have to go to disk either.
     option_cache()
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(id.to_string(), values.clone());
     Ok(())
 }
@@ -1817,7 +1813,7 @@ mod option_cache_tests {
         // back as `{}` again and this would fail.
         option_cache()
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(id.to_string(), json!({"sentinel": 42}));
         assert_eq!(
             load_option_values(id),
@@ -1848,7 +1844,7 @@ mod option_cache_tests {
         // The UI's save lands first.
         option_cache()
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(id.to_string(), json!({"v": "new"}));
         // The slow reader now finishes and tries to cache the value it read BEFORE that save.
         let got = cache_if_absent(id, json!({"v": "old"}));
@@ -1874,7 +1870,7 @@ mod option_cache_tests {
         invalidate_option_cache(b);
         option_cache()
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(a.to_string(), json!({"who": "a"}));
         assert_eq!(load_option_values(a), json!({"who": "a"}));
         assert_eq!(load_option_values(b), json!({}), "b did not inherit a's options");
@@ -1893,12 +1889,9 @@ fn seed_option_defaults(id: &str, manifest: &Value) {
     // it is how a hand-edited options file gets picked up (see `option_cache`).
     invalidate_option_cache(id);
     let mut values = load_option_values(id);
-    let map = match values.as_object_mut() {
-        Some(m) => m,
-        None => {
-            values = json!({});
-            values.as_object_mut().unwrap()
-        }
+    let map = if let Some(m) = values.as_object_mut() { m } else {
+        values = json!({});
+        values.as_object_mut().unwrap()
     };
     let mut changed = false;
     for o in opts {
@@ -1919,6 +1912,7 @@ fn seed_option_defaults(id: &str, manifest: &Value) {
 }
 
 /// Scan macros/scripts/*.py into (id, source) pairs (id = file stem).
+#[must_use]
 pub fn scan_macro_dir() -> Vec<(String, String)> {
     let mut out = Vec::new();
     if let Ok(rd) = std::fs::read_dir(macros_dir()) {
@@ -1940,6 +1934,7 @@ pub fn scan_macro_dir() -> Vec<(String, String)> {
 }
 
 /// The names of all macros currently on disk (for the GUI/CLI list).
+#[must_use]
 pub fn list_macros() -> Vec<String> {
     let mut v: Vec<String> = scan_macro_dir().into_iter().map(|(id, _)| id).collect();
     v.sort();
@@ -1947,6 +1942,7 @@ pub fn list_macros() -> Vec<String> {
 }
 
 /// Load a macro's source from disk by id.
+#[must_use]
 pub fn load_macro(id: &str) -> Option<String> {
     validate_macro_id(id).ok()?;
     std::fs::read_to_string(macro_path(id)).ok()
@@ -2121,7 +2117,7 @@ mod tests {
             .status();
     }
 
-    /// Race (b): the request's insert lands AFTER mark_dead's clear (freeze the REQUEST side).
+    /// Race (b): the request's insert lands AFTER `mark_dead`'s clear (freeze the REQUEST side).
     /// Proves: the request still resolves within its budget (never hangs past it), the pending map
     /// is empty afterward (no permanent leak — only the documented timeout-bounded delay), and a
     /// subsequent request against the auto-respawned session succeeds.
@@ -2201,7 +2197,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// Race (c): mark_dead's clear lands AFTER a concurrent request's insert (freeze the DEATH
+    /// Race (c): `mark_dead`'s clear lands AFTER a concurrent request's insert (freeze the DEATH
     /// side) — the opposite interleave of the test above, exercising `mark_dead.before_clear`
     /// instead of `pending_insert.before`. Same invariants: bounded, no leaked waiter, recovers.
     #[test]

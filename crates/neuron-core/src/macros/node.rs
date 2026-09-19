@@ -7,13 +7,13 @@
 //! A macro is the ordered statements inside `def macro(ctx):`; the wrapper `def` is implicit, so a
 //! macro is modelled as a `Vec<MacroNode>` (its body). The mapping is BIDIRECTIONAL:
 //!
-//!   * Python -> nodes ("parse") happens in the warm CPython sidecar via `ast` (it owns the real
+//!   * Python -> nodes ("parse") happens in the warm `CPython` sidecar via `ast` (it owns the real
 //!     grammar — we never re-implement Python parsing in Rust). See [`crate::macros::macro_host`]'s
 //!     `parse_macro`, which sends a `parse` frame and deserializes the JSON the host emits.
 //!   * nodes -> Python ("codegen") is [`nodes_to_source`], here, in pure Rust: instant, no process,
 //!     no Python required. It emits a full `def macro(ctx):` module that re-parses to the same tree.
 //!
-//! The JSON shape is the wire format both sides agree on: `#[serde(tag = "kind")]` snake_case, so a
+//! The JSON shape is the wire format both sides agree on: `#[serde(tag = "kind")]` `snake_case`, so a
 //! node is e.g. `{"kind":"type","text":{...},"ghost":false}`. The Python `_parse_nodes` emits exactly
 //! this and serde here deserializes it; [`nodes_to_source`] is its exact inverse for the modelled
 //! statements.
@@ -36,7 +36,7 @@ use serde::{Deserialize, Serialize};
 /// ([`value_to_source`]); the sidecar's `_parse_value` is its inverse over the `ast`. The variants
 /// climb from concrete literals up to the [`Value::Raw`] escape hatch (any expression verbatim), so a
 /// parameter can be a literal, a captured-world read, a name, a transform chain, a binary expression,
-/// or — when nothing else fits — arbitrary Python. KEEP the `v` tag + snake_case stable: it's the
+/// or — when nothing else fits — arbitrary Python. KEEP the `v` tag + `snake_case` stable: it's the
 /// cross-language wire contract, exactly like [`MacroNode`]'s `kind`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "v", rename_all = "snake_case")]
@@ -73,6 +73,7 @@ pub enum Value {
 
 impl Value {
     /// A convenience constructor for an empty string literal — the default for a text-ish param.
+    #[must_use]
     pub fn empty_str() -> Value {
         Value::Str { s: String::new() }
     }
@@ -132,7 +133,7 @@ pub fn value_to_source(value: &Value) -> String {
 /// any unmodelled statement verbatim. Every data parameter is a [`Value`] (an expression tree), so
 /// `neuron.type_text(ctx.selection.upper())` is fully modelled — the text is a `Value`, not a string.
 ///
-/// Serde uses an internally-tagged `kind` discriminator in snake_case, so the JSON the Python host
+/// Serde uses an internally-tagged `kind` discriminator in `snake_case`, so the JSON the Python host
 /// emits (`_parse_nodes`) and the JSON serde produces/consumes here are identical. KEEP this tag +
 /// casing stable — it is the cross-language contract.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -219,6 +220,7 @@ const INDENT: &str = "    ";
 /// Emit a valid Python double-quoted string literal for `s` (escaping `\`, `"`, newlines, tabs,
 /// carriage returns, and other control chars) so the generated source always re-parses to the same
 /// string value. Mirrors what Python's own `repr`/`ast.unparse` would accept on the way back in.
+#[must_use]
 pub fn py_str_literal(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
@@ -244,6 +246,7 @@ pub fn py_str_literal(s: &str) -> String {
 /// `pass`. The output is the exact inverse of the sidecar's parse for every modelled statement, so
 /// `parse(nodes_to_source(parse(src))) == parse(src)` (round-trip stable). [`MacroNode::Raw`] is
 /// emitted verbatim, re-indented to its nesting level.
+#[must_use]
 pub fn nodes_to_source(nodes: &[MacroNode]) -> String {
     let mut out = String::from("def macro(ctx):\n");
     if nodes.is_empty() {
@@ -411,16 +414,16 @@ fn emit_node(node: &MacroNode, level: usize, out: &mut String) {
             // the except keyword always appears when the arm has nodes (a try with no except is
             // not valid Python; an empty modelled except is not emitted — that node would not have
             // been parsed from a no-except try in the first place).
-            if !except_.is_empty() {
-                indent(level, out);
-                out.push_str("except Exception:\n");
-                emit_block(except_, level + 1, out);
-            } else {
+            if except_.is_empty() {
                 // a Try node with an empty except still needs a valid handler to be runnable Python.
                 indent(level, out);
                 out.push_str("except Exception:\n");
                 indent(level + 1, out);
                 out.push_str("pass\n");
+            } else {
+                indent(level, out);
+                out.push_str("except Exception:\n");
+                emit_block(except_, level + 1, out);
             }
         }
 
@@ -1428,7 +1431,7 @@ mod codegen_parse_proptests {
     //! `source == source'` after only one hop; we require the SECOND hop to be a byte-identical no-op
     //! (`p0 == p1` and `codegen(p1) == codegen(p0's reparse)`), exactly like the corpus fixture sweep.
     //!
-    //! Needs the bundled CPython sidecar (the parse half is real `ast`, not reimplemented in Rust —
+    //! Needs the bundled `CPython` sidecar (the parse half is real `ast`, not reimplemented in Rust —
     //! see this module's top doc comment). Skips cleanly (asserts nothing) when it can't materialize,
     //! matching every other sidecar-dependent test in this codebase; `MacroHost::available()` is a
     //! cheap path-resolution check, not a spawn, so this costs nothing when the runtime is present but
@@ -1448,21 +1451,21 @@ mod codegen_parse_proptests {
     /// no escaping and MUST be valid identifiers or the generated source is simply invalid Python.
     fn arb_ident() -> impl proptest::strategy::Strategy<Value = String> {
         proptest::sample::select(&["x", "y", "z", "n", "i", "line", "val", "tmp", "acc", "out"][..])
-            .prop_map(|s| s.to_string())
+            .prop_map(std::string::ToString::to_string)
     }
 
     /// The known `ctx.<field>` names (mirrors the doc comment on [`Value::Ctx`]) — also a bare
     /// identifier splice, so also restricted rather than arbitrary.
     fn arb_ctx_field() -> impl proptest::strategy::Strategy<Value = String> {
         proptest::sample::select(&["selection", "clipboard", "app", "title", "cwd"][..])
-            .prop_map(|s| s.to_string())
+            .prop_map(std::string::ToString::to_string)
     }
 
     /// A real Python binary/boolean operator token (mirrors the sets the integration stress test
     /// exercises) — also a raw splice with no escaping, so restricted to the valid vocabulary.
     fn arb_bin_op() -> impl proptest::strategy::Strategy<Value = String> {
         proptest::sample::select(&["+", "-", "*", "==", "!=", "<", "and", "or", "in"][..])
-            .prop_map(|s| s.to_string())
+            .prop_map(std::string::ToString::to_string)
     }
 
     /// String DATA (goes through `py_str_literal`, so genuinely arbitrary — same texture as the

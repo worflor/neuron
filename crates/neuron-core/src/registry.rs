@@ -10,7 +10,7 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 
 /// A single vendor command: class / id / requested data size, plus any fixed leading
-/// argument bytes (e.g. varstore + led_id for lighting).
+/// argument bytes (e.g. varstore + `led_id` for lighting).
 #[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
 pub struct CommandSpec {
     pub class: u8,
@@ -18,7 +18,7 @@ pub struct CommandSpec {
     pub size: u8,
     #[serde(default)]
     pub args: Vec<u8>,
-    /// Optional per-command transaction_id override. Most commands use the device-default
+    /// Optional per-command `transaction_id` override. Most commands use the device-default
     /// [`DeviceDef::transaction_id`]; a few command families (e.g. the Chroma V2's lighting
     /// EFFECT / CUSTOM-FRAME writes, which need 0x3F while its getters use 0xFF) wire a
     /// different tx. When `None`, the device default is used — so devices that set no override
@@ -43,7 +43,7 @@ pub struct ControlInterface {
 }
 
 /// The serde default for [`DeviceDef::dialect`]: every TOML that predates the dialect field
-/// speaks razer_report, so an absent key means "razer".
+/// speaks `razer_report`, so an absent key means "razer".
 fn default_dialect() -> String {
     "razer".into()
 }
@@ -106,14 +106,14 @@ pub struct DeviceDef {
     /// Microseconds the transport must WAIT between a feature-report SET and the GET that drains its
     /// reply — the command's round-trip + processing time. A wireless dongle is SLOW here: reading the
     /// reply (or firing the next command) before that completes OVERRUNS the device and drops frames —
-    /// the lighting FLICKER. OpenRazer calibrates this per receiver (a "new mouse receiver" like the
+    /// the lighting FLICKER. `OpenRazer` calibrates this per receiver (a "new mouse receiver" like the
     /// Naga V2 Pro's dongle ≈ 31000µs; a wired board ≈ 0). The fast streaming write
     /// ([`crate::device::Device::send_lighting_fast`]) sleeps this. `0` (the default) = no wait, correct
     /// for wired/legacy boards, which are paced slowly anyway.
     #[serde(default)]
     pub stream_wait_us: u64,
     pub modes: Vec<Mode>,
-    /// USB pids that carry this device's EVENTS but are not the device itself — e.g. a HyperSpeed
+    /// USB pids that carry this device's EVENTS but are not the device itself — e.g. a `HyperSpeed`
     /// receiver's own sideband HID collections (the DONGLE's pid, distinct from the paired
     /// device's per-link-mode pids in `modes`). Owning these pids does two things: input readers
     /// scope them to this device's family (the keyboard-side macro reader must not claim a
@@ -151,9 +151,11 @@ impl DeviceDef {
     pub fn owned_event_pids(&self) -> impl Iterator<Item = u16> + '_ {
         self.product_ids().chain(self.event_alias_pids.iter().copied())
     }
+    #[must_use]
     pub fn mode_for(&self, pid: u16) -> Option<&Mode> {
         self.modes.iter().find(|m| m.product_id == pid)
     }
+    #[must_use]
     pub fn command(&self, name: &str) -> Option<&CommandSpec> {
         self.commands.get(name)
     }
@@ -164,12 +166,14 @@ impl DeviceDef {
     /// Route through the family seam so no caller has to know which rule applies. FAIL CLOSED on an
     /// unknown dialect (Finding 2's sibling): a def whose family we can't identify matches NOTHING —
     /// it must never be selected and opened into bytes we can't safely frame.
+    #[must_use]
     pub fn matches_control(&self, info: &crate::transport::HidDeviceInfo) -> bool {
         crate::dialect::by_id(&self.dialect).is_some_and(|d| d.matches_control(self, info))
     }
 
     /// Does this device have a swappable SIDE-PLATE map (a `[side_plates]` table)? The push-only
     /// plate detection (see [`DeviceDef::side_plates`]) is the gate for surfacing the plate readout.
+    #[must_use]
     pub fn has_side_plates(&self) -> bool {
         self.side_plates.is_some()
     }
@@ -178,17 +182,19 @@ impl DeviceDef {
     /// (never a hardcoded id→label table in logic). `None` for an unknown code or a device with no
     /// plates — the caller decides how to degrade (the decode site shows a transparent "plate N").
     /// Strap-code `0` (none/detached) is handled at the call site, so it is absent from the map.
+    #[must_use]
     pub fn side_plate_label(&self, id: u8) -> Option<&str> {
         self.side_plates
             .as_ref()?
             .get(&id.to_string())
-            .map(|s| s.as_str())
+            .map(std::string::String::as_str)
     }
 
     /// Does this device's registry expose a command under `name`? The registry-driven answer to
     /// "can I run this on this device" — cheaper and more honest than a hardcoded per-device match.
     /// Callers (CLI/GUI) use it to grey-out a control the device can't do rather than firing a
     /// command that will time out or return Unsupported.
+    #[must_use]
     pub fn has_command(&self, name: &str) -> bool {
         self.commands.contains_key(name)
     }
@@ -198,6 +204,7 @@ impl DeviceDef {
     /// name. It maps the capability to the registry command(s) it needs (a capability is present iff
     /// every required command is present), plus the structural facts (lighting block) that aren't
     /// commands. Purely a *read* over the registry — it changes nothing in the proven write path.
+    #[must_use]
     pub fn supports(&self, cap: Capability) -> bool {
         // SetBrightness has TWO honest write paths — the matrix top-level command OR the
         // lighting block's brightness spec (the legacy dialect; see capability::set_brightness).
@@ -216,9 +223,10 @@ impl DeviceDef {
 
     /// Decode a device-PUSHED report against this def's `[events]` vocabulary. Matches on `report`'s
     /// first two bytes only (the report-kind lead byte + sub-kind byte, e.g. `05 11`) — any further
-    /// length/shape policy for the resolved [`EventKind`] (e.g. reading `report[2]` for MuteState's
+    /// length/shape policy for the resolved [`EventKind`] (e.g. reading `report[2]` for `MuteState`'s
     /// state bit) belongs to the caller, not this lookup. `None` for a too-short report, a device with
     /// no `[events]` block, or a lead-byte pair the vocabulary doesn't name.
+    #[must_use]
     pub fn event_for(&self, report: &[u8]) -> Option<EventKind> {
         if report.len() < 2 {
             return None;
@@ -230,6 +238,7 @@ impl DeviceDef {
     /// Does this def's `[events]` vocabulary ride the collection (`page`, `usage`, `flen`)? The arming
     /// check a collection-enumeration filter (`hidwatch`'s) tests before spawning a reader — false for
     /// a device with no `[events]` block, so a def that never pushes anything never arms one.
+    #[must_use]
     pub fn event_pipe_matches(&self, page: u16, usage: u16, flen: u16) -> bool {
         self.events
             .as_ref()
@@ -239,6 +248,7 @@ impl DeviceDef {
     /// Does this def's `[events]` vocabulary declare `kind` at all (any collection)? The CAPABILITY
     /// check for a UI gate ("is this device's mute hardware-owned") — distinct from
     /// `event_pipe_matches`, which tests the arming collection rather than the vocabulary's contents.
+    #[must_use]
     pub fn has_event(&self, kind: EventKind) -> bool {
         self.events.as_ref().is_some_and(|e| e.reports.values().any(|k| *k == kind))
     }
@@ -248,12 +258,14 @@ impl DeviceDef {
     /// for hidwatch, with an honest empty `[commands]` — and such a def must not grow a device-list
     /// row: its user-facing face is its Core-Audio endpoint row, and a second, knob-less HID row is
     /// exactly the double-listing the unclaimed-footnote rework removed.
+    #[must_use]
     pub fn is_operable(&self) -> bool {
         !self.commands.is_empty() || self.lighting.is_some()
     }
 
     /// Every semantic [`Capability`] this device currently exposes (registry-driven). Lets a GUI
     /// enumerate "what can this device actually do" without probing hardware or hardcoding a table.
+    #[must_use]
     pub fn capabilities(&self) -> Vec<Capability> {
         Capability::ALL
             .iter()
@@ -283,9 +295,9 @@ pub enum Capability {
     Polling,
     /// Write the legacy polling-rate divisor (0x00/0x05).
     SetPolling,
-    /// Hi-res (HyperPolling) read (0x00/0xC0).
+    /// Hi-res (`HyperPolling`) read (0x00/0xC0).
     Polling2,
-    /// Hi-res (HyperPolling) write up to 8000Hz (0x00/0x40).
+    /// Hi-res (`HyperPolling`) write up to 8000Hz (0x00/0x40).
     SetPolling2,
     /// Select the active scroll-wheel stage (wire-confirmed 0x15/0x00).
     SetScrollStage,
@@ -299,7 +311,7 @@ pub enum Capability {
     Storage,
     /// Any unified lighting (a `[lighting]` block is present).
     Lighting,
-    /// Read the keyboard's FIRMWARE game mode (the FN+F10 Win-key kill / GAME_LED state).
+    /// Read the keyboard's FIRMWARE game mode (the FN+F10 Win-key kill / `GAME_LED` state).
     GameMode,
     /// Write the keyboard's firmware game mode (the Win-key kill) — the getter verifies the write.
     SetGameMode,
@@ -328,6 +340,7 @@ impl Capability {
 
     /// The registry command name(s) this capability needs (all must be present). The single source
     /// that maps a semantic capability to the proven opcode names in the device TOMLs.
+    #[must_use]
     pub fn required_commands(self) -> &'static [&'static str] {
         match self {
             Capability::Dpi => &["dpi"],
@@ -351,11 +364,13 @@ impl Capability {
 
     /// Whether the capability additionally requires a `[lighting]` block (a structural fact, not a
     /// command). Only [`Capability::Lighting`] does.
+    #[must_use]
     pub fn requires_lighting(self) -> bool {
         matches!(self, Capability::Lighting)
     }
 
     /// A short, human label for the capability (GUI/CLI surfacing).
+    #[must_use]
     pub fn label(self) -> &'static str {
         match self {
             Capability::Dpi => "DPI (read)",
@@ -442,11 +457,13 @@ pub struct CanonicalPid(u16);
 
 impl CanonicalPid {
     /// THE door. Canonicalizes `raw` onto the owning device's event identity.
+    #[must_use]
     pub fn of(raw: u16) -> Self {
         CanonicalPid(canonical_event_pid(raw))
     }
     /// The underlying pid, for display/logging and for the few places that must speak the wire
     /// (`{:04x}` formatting, a registry lookup keyed on the raw number).
+    #[must_use]
     pub fn get(self) -> u16 {
         self.0
     }
@@ -469,6 +486,7 @@ impl<'de> serde::Deserialize<'de> for CanonicalPid {
 /// The canonical EVENT pid for `pid`: the first declared mode of the def that owns it (via
 /// [`DeviceDef::owned_event_pids`]), or `pid` unchanged when no def claims it — or when no
 /// registry has loaded yet (identity is the honest degraded answer, retried next call).
+#[must_use]
 pub fn canonical_event_pid(pid: u16) -> u16 {
     event_identity_tables()
         .and_then(|t| t.0.get(&pid).copied())
@@ -479,6 +497,7 @@ pub fn canonical_event_pid(pid: u16) -> u16 {
 /// device's own link-mode pid? Readers use this to keep alias collections on a short leash:
 /// deferred-button events only — never intents, settings pushes, or getter opens (an alias pid is
 /// not a control pipe; opening it can't answer).
+#[must_use]
 pub fn is_event_alias_pid(pid: u16) -> bool {
     event_identity_tables().is_some_and(|t| t.1.contains(&pid))
 }
@@ -488,11 +507,12 @@ pub fn is_event_alias_pid(pid: u16) -> bool {
 /// first-match trust order.
 ///
 /// SCOPE, honestly: the map is keyed by pid ALONE because the event stream is — a `ControlEvent`
-/// carries only its source pid, and every consumer downstream (HoldEdges buckets, rule matching,
+/// carries only its source pid, and every consumer downstream (`HoldEdges` buckets, rule matching,
 /// the held registry) already lives in that pid-only namespace. A cross-vendor pid collision
 /// would conflate devices HERE exactly as it already would THERE; widening event identity to
 /// (vendor, pid) is a spine-wide change, not a map-shape fix, and is out of scope until a real
 /// colliding device shows up.
+#[must_use]
 pub fn build_canonical_map(devices: &[DeviceDef]) -> std::collections::HashMap<u16, u16> {
     let mut map = std::collections::HashMap::new();
     for def in devices {
@@ -570,7 +590,7 @@ impl Registry {
         // NEURON_PURE_DISCOVERY=1 skips them, forcing EVERY device through the emergent path
         // (probe → `crate::synth` → devices/auto/) — the live end-to-end test for auto-adoption
         // on hardware that normally has a curated def. Off (unset) in any real run.
-        if std::env::var("NEURON_PURE_DISCOVERY").map(|v| v != "1").unwrap_or(true) {
+        if std::env::var("NEURON_PURE_DISCOVERY").map_or(true, |v| v != "1") {
             const BUILTINS: &[&str] = &[
                 include_str!("../devices/razer-naga-v2-pro.toml"),
                 include_str!("../devices/razer-blackwidow-chroma-v2.toml"),
@@ -641,6 +661,7 @@ impl Registry {
         Ok(Registry { devices })
     }
 
+    #[must_use]
     pub fn find_by_pid(&self, vid: u16, pid: u16) -> Option<&DeviceDef> {
         self.devices
             .iter()
@@ -649,8 +670,8 @@ impl Registry {
 
     /// Every def covering (vid, pid) — the multi-family view. `find_by_pid` keeps its
     /// first-match semantics for PID-level questions (labels, capability display, healing);
-    /// PIPE resolution must use find_for_pipe, which lets each family's def test the collection
-    /// with its own matches_control rule.
+    /// PIPE resolution must use `find_for_pipe`, which lets each family's def test the collection
+    /// with its own `matches_control` rule.
     pub fn defs_for_pid(&self, vid: u16, pid: u16) -> impl Iterator<Item = &DeviceDef> {
         self.devices
             .iter()
@@ -659,9 +680,10 @@ impl Registry {
 
     /// THE pipe-precise resolver: the first def (trust order) whose family claims this exact
     /// collection as its control pipe. With one def per pid this is exactly the old
-    /// find_by_pid + matches_control pair; with two families on one pid, each pipe reaches
+    /// `find_by_pid` + `matches_control` pair; with two families on one pid, each pipe reaches
     /// the def that can actually drive it (the review-blocking gap: first-match-by-pid made
     /// the second family permanently unopenable).
+    #[must_use]
     pub fn find_for_pipe(&self, info: &crate::transport::HidDeviceInfo) -> Option<&DeviceDef> {
         self.defs_for_pid(info.vid, info.pid)
             .find(|d| d.matches_control(info))
@@ -674,6 +696,7 @@ impl Registry {
     /// second-family pipe (a hidpp/audio-sidecar collection on that same pid), stranding it forever.
     /// Keyed on the CLAIMING dialect (from `synth::adopt_key`), a pipe is known only when ITS family
     /// is already in the registry, so a still-unadopted family on a shared pid stays adoptable.
+    #[must_use]
     pub fn knows_family(&self, vid: u16, pid: u16, dialect_id: &str) -> bool {
         self.defs_for_pid(vid, pid).any(|d| d.dialect == dialect_id)
     }
@@ -803,7 +826,7 @@ mod tests {
         assert_eq!(bw.side_plate_label(3), None);
     }
 
-    /// A minimal-but-valid DeviceDef: just the identity fields `subsumed`/`find_by_pid` read
+    /// A minimal-but-valid `DeviceDef`: just the identity fields `subsumed`/`find_by_pid` read
     /// (vendor + a single mode pid), everything else stubbed. Distinct `codename` so end-to-end
     /// resolution can tell two same-NAMED defs apart — the whole point of the fix.
     fn mini(name: &str, codename: &str, vid: u16, pid: u16) -> DeviceDef {
@@ -994,7 +1017,7 @@ mod tests {
         ))
         .unwrap();
         assert!(
-            !subsumed(&[naga.clone()], &partial),
+            !subsumed(&[naga], &partial),
             "a def bringing ANY new pid is not subsumed"
         );
     }
@@ -1033,7 +1056,7 @@ mod tests {
         // same dialect + same pid → still subsumed (curated-shadows-auto unchanged WITHIN a family).
         let razer_again = mini_dialect("Combo", "razer-dup", 0x046D, 0x0042, "razer");
         assert!(
-            subsumed(&[razer.clone()], &razer_again),
+            subsumed(&[razer], &razer_again),
             "same family + same pid = dead weight (first-match resolves it) — unchanged within a family"
         );
     }

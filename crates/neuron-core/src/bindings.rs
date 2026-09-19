@@ -11,7 +11,7 @@
 //! [`crate::controls::binding_rule`] lifts each known binding action onto that typed engine.
 //!
 //! ## Defaults are intentionally EMPTY (not the knob/mute remaps)
-//! The shipped default is no bindings, because the BlackShark V2 knob + mute toggle are
+//! The shipped default is no bindings, because the `BlackShark` V2 knob + mute toggle are
 //! hardware-internal and emit NOTHING to the host (confirmed via Raw Input / Core-Audio monitor / no
 //! Windows OSD) — so the once-imagined "knob -> Seiren gain" / "mute -> Seiren mute" defaults are
 //! dead at the hardware level and there is no honest universal default to ship. The daemon still
@@ -55,6 +55,7 @@ pub struct Binding {
 }
 
 impl Binding {
+    #[must_use]
     pub fn summary(&self) -> String {
         let src = format!(
             "{} (0x{:02X}/0x{:02X}){}",
@@ -89,6 +90,7 @@ impl Binding {
     }
 
     /// Does this binding's trigger match a control event? (pure, side-effect free)
+    #[must_use]
     pub fn matches(&self, ev: &ControlEvent) -> bool {
         let pid_ok = self
             .pid
@@ -145,12 +147,14 @@ pub struct Bindings {
 }
 
 impl Bindings {
+    #[must_use]
     pub fn path() -> PathBuf {
         crate::runroot::run_root().join("bindings.toml")
     }
 
     /// Load from disk, salvaging field-by-field so one malformed binding can't wipe the whole file
     /// (and never clobbering the user's bytes — see [`crate::salvage::SalvageLoad`]).
+    #[must_use]
     pub fn load() -> Self {
         <Self as crate::salvage::SalvageLoad>::load()
     }
@@ -160,10 +164,11 @@ impl Bindings {
         crate::salvage::atomic_write(&Self::path(), s.as_bytes()).map_err(|e| e.to_string())
     }
 
-    /// Default bindings. Empty on purpose: the BlackShark knob/mute are hardware-internal
+    /// Default bindings. Empty on purpose: the `BlackShark` knob/mute are hardware-internal
     /// (no host-visible event — see `bind init` template), so there's no honest universal
     /// default to ship. The daemon still detects + logs mic taps so the live capability is
     /// visible; `bind init` writes a commented template with working examples.
+    #[must_use]
     pub fn default_for_user() -> Self {
         Bindings::default()
     }

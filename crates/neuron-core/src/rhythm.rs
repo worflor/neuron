@@ -53,6 +53,7 @@ pub struct Voice {
 impl Voice {
     /// The plain voice every session starts with before any shape is carved: a clean,
     /// upright, medium-decay ring.
+    #[must_use]
     pub fn neutral() -> Voice {
         Voice {
             spin: 0.0,
@@ -65,6 +66,7 @@ impl Voice {
 
     /// Carve a voice from a stroke's eigenmotion fit. Uses the dominant eigenvalue (the
     /// one further from the origin — the mode that actually shapes the motion).
+    #[must_use]
     pub fn from_fit(f: &GlyphFit) -> Voice {
         let (dom, _sub) = if f.lambda1.abs() >= f.lambda2.abs() {
             (f.lambda1, f.lambda2)
@@ -87,8 +89,8 @@ impl Voice {
         // hue: fold the full -1..1 spin onto the colour wheel.
         let hue = ((spin * 0.5) + 0.5).rem_euclid(1.0);
         // class: quantize the spin into VOICE_CLASSES bins (handedness is identity).
-        let class = (((spin * 0.5 + 0.5) * VOICE_CLASSES as f32) as i32)
-            .clamp(0, VOICE_CLASSES as i32 - 1) as u8;
+        let class = (((spin * 0.5 + 0.5) * f32::from(VOICE_CLASSES)) as i32)
+            .clamp(0, i32::from(VOICE_CLASSES) - 1) as u8;
 
         Voice {
             spin,
@@ -163,6 +165,7 @@ pub struct OnsetDetector {
 }
 
 impl OnsetDetector {
+    #[must_use]
     pub fn new(cfg: DetectorConfig) -> Self {
         OnsetDetector {
             cfg,
@@ -178,6 +181,7 @@ impl OnsetDetector {
         self.voice = v;
     }
 
+    #[must_use]
     pub fn voice(&self) -> Voice {
         self.voice
     }
@@ -264,15 +268,19 @@ pub struct Motif {
 }
 
 impl Motif {
+    #[must_use]
     pub fn len(&self) -> usize {
         self.onsets.len()
     }
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.onsets.is_empty()
     }
+    #[must_use]
     pub fn start_ms(&self) -> u64 {
-        self.onsets.first().map(|o| o.t_ms).unwrap_or(0)
+        self.onsets.first().map_or(0, |o| o.t_ms)
     }
+    #[must_use]
     pub fn duration_ms(&self) -> u64 {
         match (self.onsets.first(), self.onsets.last()) {
             (Some(a), Some(b)) => b.t_ms.saturating_sub(a.t_ms),
@@ -280,6 +288,7 @@ impl Motif {
         }
     }
     /// Inter-onset intervals in milliseconds (length = len-1).
+    #[must_use]
     pub fn iois(&self) -> Vec<u64> {
         self.onsets
             .windows(2)
@@ -288,6 +297,7 @@ impl Motif {
     }
     /// Median inter-onset interval — the motif's own tempo. Falls back to a moderate
     /// 300 ms for a single hit so downstream maths never divides by zero.
+    #[must_use]
     pub fn median_ioi(&self) -> f32 {
         let mut iois = self.iois();
         if iois.is_empty() {
@@ -301,10 +311,12 @@ impl Motif {
             iois[mid] as f32
         }
     }
+    #[must_use]
     pub fn total_energy(&self) -> f32 {
         self.onsets.iter().map(|o| o.energy).sum()
     }
     /// Onsets per second over the motif's span (its density).
+    #[must_use]
     pub fn density(&self) -> f32 {
         let d = self.duration_ms();
         if d == 0 {
@@ -314,6 +326,7 @@ impl Motif {
     }
     /// IOIs as ratios of the median — the rhythm's *shape*, independent of absolute speed.
     /// This is what the twin learns, so it mirrors your pattern, not your wrist's tempo.
+    #[must_use]
     pub fn normalized(&self) -> Vec<f32> {
         let med = self.median_ioi().max(1.0);
         self.iois().iter().map(|&i| i as f32 / med).collect()
@@ -331,14 +344,11 @@ impl Motif {
             .iter()
             .enumerate()
             .max_by_key(|(_, &c)| c)
-            .map(|(i, _)| i)
-            .unwrap_or(0);
+            .map_or(0, |(i, _)| i);
         // return a representative voice of that class
         self.onsets
             .iter()
-            .find(|o| o.voice.class as usize == best)
-            .map(|o| o.voice)
-            .unwrap_or_else(Voice::neutral)
+            .find(|o| o.voice.class as usize == best).map_or_else(Voice::neutral, |o| o.voice)
     }
 }
 
@@ -350,6 +360,7 @@ pub struct MotifBuilder {
 }
 
 impl MotifBuilder {
+    #[must_use]
     pub fn new(cfg: MotifConfig) -> Self {
         MotifBuilder {
             cfg,
@@ -405,6 +416,7 @@ impl MotifBuilder {
         }
     }
 
+    #[must_use]
     pub fn pending_len(&self) -> usize {
         self.pending.len()
     }
@@ -462,6 +474,7 @@ fn deposit(env: &mut [f32], center: f32, energy: f32, decay: f32) {
 /// the `EMBED_DIM` most recent envelope samples. This is the standard phase-space lift —
 /// the AR(2)-per-pair oscillator that Engram fits over it captures the rhythm's spectral
 /// content, and spinning that oscillator forward predicts the next beats: the flourish.
+#[must_use]
 pub fn embed_motif(m: &Motif) -> (Vec<f32>, usize, usize) {
     let env = envelope(m, EMBED_ROWS);
     let mut traj = vec![0.0f32; EMBED_ROWS * EMBED_DIM];
@@ -488,6 +501,7 @@ pub struct PeakTracker {
 }
 
 impl PeakTracker {
+    #[must_use]
     pub fn new(initial: f32, attack: f32, decay: f32) -> Self {
         PeakTracker {
             value: initial,
@@ -503,6 +517,7 @@ impl PeakTracker {
         };
         self.value += rate * (x - self.value);
     }
+    #[must_use]
     pub fn value(&self) -> f32 {
         self.value
     }
@@ -558,6 +573,7 @@ impl MirrorStats {
         self.energy.update(peak_e);
     }
 
+    #[must_use]
     pub fn ceiling(&self) -> Ceiling {
         Ceiling {
             min_ioi_ms: (1000.0 / self.tempo_speed.value().max(0.1)).clamp(60.0, 2000.0),
@@ -577,6 +593,7 @@ impl MirrorStats {
 /// This is the alphabet the Logos predictor consumes: a player who repeats a groove emits
 /// a low-surprise byte stream; a player breaking new ground emits a high-surprise one. The
 /// twin's stream and the player's stream cross-predicting each other *is* sync.
+#[must_use]
 pub fn onset_byte(ioi_ms: u64, energy: f32, voice_class: u8) -> u8 {
     // log-IOI bucket: map ~16 ms..~2 s across 8 buckets (log2 of ioi/16, clamped).
     let ioi = ioi_ms.max(1) as f32;
@@ -588,6 +605,7 @@ pub fn onset_byte(ioi_ms: u64, energy: f32, voice_class: u8) -> u8 {
 
 /// Turn a closed motif into its byte string for the attention organ. The first onset uses
 /// the motif's median IOI as a stand-in gap.
+#[must_use]
 pub fn motif_bytes(m: &Motif) -> Vec<u8> {
     if m.onsets.is_empty() {
         return Vec::new();
@@ -641,7 +659,7 @@ mod tests {
         let n = 64;
         let z: Vec<C> = (0..n)
             .map(|i| {
-                let th = 2.0 * std::f64::consts::PI * i as f64 / 16.0;
+                let th = 2.0 * std::f64::consts::PI * f64::from(i) / 16.0;
                 C::new(th.cos(), th.sin())
             })
             .collect();
@@ -657,13 +675,13 @@ mod tests {
         let n = 64;
         let ccw: Vec<C> = (0..n)
             .map(|i| {
-                let th = 2.0 * std::f64::consts::PI * i as f64 / 16.0;
+                let th = 2.0 * std::f64::consts::PI * f64::from(i) / 16.0;
                 C::new(th.cos(), th.sin())
             })
             .collect();
         let cw: Vec<C> = (0..n)
             .map(|i| {
-                let th = 2.0 * std::f64::consts::PI * i as f64 / 16.0;
+                let th = 2.0 * std::f64::consts::PI * f64::from(i) / 16.0;
                 C::new(th.cos(), -th.sin())
             })
             .collect();
@@ -770,7 +788,7 @@ mod tests {
         let fast = motif(&[0, 125, 250, 325, 450]);
         let fnorm = fast.normalized();
         for (a, b) in norm.iter().zip(fnorm.iter()) {
-            assert!((a - b).abs() < 0.05, "{} vs {}", a, b);
+            assert!((a - b).abs() < 0.05, "{a} vs {b}");
         }
     }
 
@@ -795,7 +813,7 @@ mod tests {
         assert_eq!(traj.len(), EMBED_ROWS * EMBED_DIM);
         // the envelope is non-trivial: there is real energy in the trajectory
         let total: f32 = traj.iter().map(|x| x.abs()).sum();
-        assert!(total > 0.5, "embedding should carry energy, got {}", total);
+        assert!(total > 0.5, "embedding should carry energy, got {total}");
     }
 
     #[test]
@@ -815,11 +833,10 @@ mod tests {
         let fcont = from_complex(&cont, 16, p);
         assert_eq!(fcont.len(), 16 * dim);
         // continuation must be finite and bounded (stable oscillator)
-        let maxv = fcont.iter().cloned().fold(0.0f32, |a, b| a.max(b.abs()));
+        let maxv = fcont.iter().copied().fold(0.0f32, |a, b| a.max(b.abs()));
         assert!(
             maxv.is_finite() && maxv < 50.0,
-            "continuation exploded: {}",
-            maxv
+            "continuation exploded: {maxv}"
         );
     }
 

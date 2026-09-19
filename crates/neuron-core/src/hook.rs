@@ -67,6 +67,7 @@ fn is_win(vk: u32) -> bool {
 /// Update the running modifier state from one event — the hook calls this BEFORE [`decide`] so the
 /// Alt key's own up/down is tracked. Returns the new state. Kept separate (and pure) so the tests
 /// can drive a sequence of events deterministically.
+#[must_use]
 pub fn track(mut mods: Mods, ev: KeyEvent) -> Mods {
     if is_alt(ev.vk) {
         mods.alt = ev.down;
@@ -83,6 +84,7 @@ pub fn track(mut mods: Mods, ev: KeyEvent) -> Mods {
 /// * **F4** down while **Alt** held -> Alt+F4 -> swallow if `policy` disables Alt+F4.
 ///
 /// Everything else passes through. This is exactly what the hook callback returns `1` (eat) on.
+#[must_use]
 pub fn decide(policy: &GamingMode, ev: KeyEvent, mods: Mods) -> bool {
     if !ev.down {
         return false; // never swallow a key-up (avoid stuck modifiers)
@@ -212,7 +214,7 @@ mod sys {
         // controller's `PostThreadMessageW(WM_QUIT)` can never race a not-yet-created queue
         // (PostThreadMessage fails against a thread that has not yet called a message function).
         let mut msg: MSG = unsafe { std::mem::zeroed() };
-        unsafe { PeekMessageW(&mut msg, std::ptr::null_mut(), WM_USER, WM_USER, PM_NOREMOVE) };
+        unsafe { PeekMessageW(&raw mut msg, std::ptr::null_mut(), WM_USER, WM_USER, PM_NOREMOVE) };
         // Handshake LAST: once this is non-zero the controller knows INSTALLED is settled + has our
         // tid. If the install failed we still publish (so the controller stops spin-waiting) then
         // return — there is nothing to pump.
@@ -223,7 +225,7 @@ mod sys {
         // Blocking pump: `GetMessageW` returns >0 for a normal message, 0 on WM_QUIT (our stop
         // signal), -1 on error. The LL hook callback runs INSIDE this call while it blocks.
         loop {
-            let r = unsafe { GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) };
+            let r = unsafe { GetMessageW(&raw mut msg, std::ptr::null_mut(), 0, 0) };
             if r <= 0 {
                 break; // WM_QUIT (0) or error (-1) -> tear down + exit.
             }
@@ -336,6 +338,7 @@ pub struct Hook {
 
 impl Hook {
     /// True if this handle installed a live hook (false when the policy suppressed nothing).
+    #[must_use]
     pub fn active(&self) -> bool {
         self.active
     }
@@ -363,6 +366,7 @@ impl Drop for Hook {
 /// **Live-path only.** This touches the global desktop; never call it from a test. (The pure
 /// [`decide`] policy is what tests verify.)
 #[cfg(windows)]
+#[must_use]
 pub fn install(policy: GamingMode) -> Hook {
     let active = sys::install(policy);
     Hook { active }
@@ -376,6 +380,7 @@ pub fn install(_policy: GamingMode) -> Hook {
 
 /// True if a gaming-mode hook is currently installed (Windows; always `false` elsewhere).
 #[cfg(windows)]
+#[must_use]
 pub fn is_installed() -> bool {
     sys::is_installed()
 }
@@ -395,7 +400,7 @@ pub fn is_installed() -> bool {
 use std::sync::Mutex as StdMutex;
 
 /// The desired gaming-mode policy the live thread should enforce. Set by whichever client applies a
-/// profile (CLI `profile apply` path / GUI on_apply_profile); read by [`reconcile`] on the listener
+/// profile (CLI `profile apply` path / GUI `on_apply_profile`); read by [`reconcile`] on the listener
 /// thread. Defaults to "suppress nothing", so until a gaming-mode profile is applied nothing hooks.
 static DESIRED_POLICY: StdMutex<GamingMode> = StdMutex::new(GamingMode {
     disable_alt_tab: false,
