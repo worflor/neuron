@@ -4192,17 +4192,16 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 "neuron-glue-testbeacon",
                 move || {
                     let host = neuron::macros::macro_host();
-                    // make sure the sidecar knows this macro (sync its current source from disk), then mock-fire.
-                    if let Some((_, src)) = neuron::macros::macro_host::scan_macro_dir()
+                    let Some((_, src)) = neuron::macros::macro_host::scan_macro_dir()
                         .into_iter()
                         .find(|(mid, _)| *mid == id)
-                    {
-                        let _ = host.register(&id, &src);
-                    }
+                    else {
+                        return format!("macro '{id}' not found on disk");
+                    };
                     let ctx = neuron::macros::Context::capture();
-                    // SURFACE the result — a silent button is the worst UX. If the bundled python
-                    // runtime can't be materialized (a rare IO failure), say so plainly.
-                    host.fire_mock(&id, &ctx)
+                    // Preview the file itself instead of re-registering it: a test button must never
+                    // mutate the live registry or durable source merely to show a beacon.
+                    host.fire_source_mock(&id, &src, &ctx)
                 },
                 move |result: Option<String>| {
                     // a successful dispatch raises a beacon that mirror_count will clear the gate for;
@@ -4224,8 +4223,8 @@ pub fn install(app: &AppWindow) -> SharedRt {
             );
         });
     });
-    // TEST ASKS (macro editor): the SAFE, learn-by-doing companion to "test run". Registers the LIVE
-    // editor source + fire_mock so ONLY its neuron.ask() beacons rise (input forced disarmed — no real
+    // TEST ASKS (macro editor): the SAFE, learn-by-doing companion to "test run". Mock-fires the LIVE
+    // editor source directly so ONLY its neuron.ask() beacons rise (input forced disarmed — no real
     // effects), reusing the EXACT SYSTEM→BEACONS pipeline. A curious user discovers the ask/beacon
     // system by seeing it: write an ask, click, watch the strip rise, answer it. No explanatory wall.
     bind(app, &shared, |app, _sh| {
@@ -4267,9 +4266,8 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 "neuron-glue-testasks",
                 move || {
                     let host = neuron::macros::macro_host();
-                    let _ = host.register(&id, &source);
                     let ctx = neuron::macros::Context::capture();
-                    host.fire_mock(&id, &ctx)
+                    host.fire_source_mock(&id, &source, &ctx)
                 },
                 move |result: Option<String>| {
                     // a failed dispatch (or no result at all) raises no beacon, so release the shared
@@ -4408,8 +4406,8 @@ pub fn install(app: &AppWindow) -> SharedRt {
             }
         });
     });
-    // DELETE BEACON (SYSTEM panel): remove a macro's .py from disk, then refresh the registry so the
-    // row vanishes. The warm sidecar re-syncs from disk on its next spawn, so file removal is enough.
+    // DELETE BEACON (SYSTEM panel): remove the source and evict the warm registry immediately, then
+    // refresh the catalog. A deleted macro must stop existing now, not after a process restart.
     bind(app, &shared, |app, _sh| {
         let w = app.as_weak();
         app.global::<State>().on_delete_beacon(move |id| {
@@ -4431,7 +4429,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
             }
         });
     });
-    // TEST: register the current source under its name and run it ONCE against the live context.
+    // TEST: run the editor source ONCE against the live context without saving or registering it.
     bind(app, &shared, |app, _sh| {
         let w = app.as_weak();
         app.global::<State>().on_macro_test(move |name, src| {
@@ -4461,15 +4459,9 @@ pub fn install(app: &AppWindow) -> SharedRt {
                     },
                     move || {
                     let host = neuron::macros::macro_host();
-                    let reg = host.register(&name, &source);
-                    let (result, log) = match reg {
-                        Ok(()) => {
-                            let ctx = neuron::macros::Context::capture();
-                            let r = neuron::macros::test_python_macro(&name, &ctx);
-                            (r, host.drain_log())
-                        }
-                        Err(e) => (format!("register failed: {}", first_line(&e)), Vec::new()),
-                    };
+                    let ctx = neuron::macros::Context::capture();
+                    let result = host.invoke_source(&name, &source, &ctx);
+                    let log = host.drain_log();
                     let _ = slint::invoke_from_event_loop(move || {
                         if let Some(app) = back.upgrade() {
                             let st = app.global::<State>();

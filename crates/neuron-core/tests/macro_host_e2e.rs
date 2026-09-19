@@ -99,6 +99,91 @@ fn macro_host_warm_persists_and_isolates_errors() {
         "a raising macro must NOT respawn the sidecar"
     );
 
+    // A failed REPLACEMENT is different from a macro that raises when fired: module top-level
+    // execution happens during register. The old callable + file are the last-known-good revision
+    // and must survive a broken edit.
+    let stable_src = "def macro(ctx):\n    return 'stable-old'\n";
+    host.register("e2e_stable", stable_src).expect("register stable baseline");
+    let bad = host.register(
+        "e2e_stable",
+        "raise RuntimeError('broken candidate')\ndef macro(ctx):\n    return 'never'\n",
+    );
+    assert!(bad.is_err(), "broken replacement must be rejected");
+    let stable_after = host.invoke("e2e_stable", &ctx);
+    assert!(
+        stable_after.contains("stable-old"),
+        "failed replacement destroyed the live last-known-good macro: {stable_after}"
+    );
+    assert_eq!(
+        neuron::macros::macro_host::load_macro("e2e_stable").as_deref(),
+        Some(stable_src),
+        "failed replacement must not overwrite the durable source"
+    );
+
+    // A queued fire belongs to the revision that accepted it. Hold generation N's first fire long
+    // enough to queue a second, publish N+1, then prove that queued N work is REFUSED rather than
+    // silently executing the new callable.
+    host.register(
+        "e2e_generation",
+        "import time\ndef macro(ctx):\n    print('old:' + ctx.app)\n    time.sleep(0.4)\n",
+    )
+    .expect("register generation baseline");
+    host.drain_log();
+    let first = Context::synthetic(Some("first".into()), None, None, None, None);
+    let second = Context::synthetic(Some("second".into()), None, None, None, None);
+    assert!(host.fire_async("e2e_generation", &first).contains("dispatched"));
+    assert!(host.fire_async("e2e_generation", &second).contains("dispatched"));
+    std::thread::sleep(Duration::from_millis(80));
+    host.register(
+        "e2e_generation",
+        "def macro(ctx):\n    return 'new:' + ctx.app\n",
+    )
+    .expect("publish generation replacement");
+    std::thread::sleep(Duration::from_millis(700));
+    let generation_log = host.drain_log();
+    assert!(
+        generation_log.iter().any(|l| l.contains("old:first")),
+        "the already-running old revision should finish: {generation_log:?}"
+    );
+    assert!(
+        generation_log.iter().any(|l| l.contains("queued for generation")),
+        "queued old work must be refused at the revision boundary: {generation_log:?}"
+    );
+    assert!(
+        !generation_log.iter().any(|l| l.contains("new:second")),
+        "a queued generation-N fire executed generation N+1: {generation_log:?}"
+    );
+    let newest = host.invoke(
+        "e2e_generation",
+        &Context::synthetic(Some("third".into()), None, None, None, None),
+    );
+    assert!(newest.contains("new:third"), "new fires use the published revision: {newest}");
+
+    // Source execution is the editor/--file path: it runs real Python but is never registered or
+    // persisted as a side effect of testing it.
+    let candidate = host.invoke_source(
+        "e2e_candidate",
+        "def macro(ctx):\n    return 'candidate-only'\n",
+        &ctx,
+    );
+    assert!(candidate.contains("candidate-only"), "source candidate did not run: {candidate}");
+    assert!(
+        neuron::macros::macro_host::load_macro("e2e_candidate").is_none(),
+        "source test unexpectedly created macros/scripts/e2e_candidate.py"
+    );
+
+    // Delete is runtime truth immediately, not a hint for the next process restart.
+    host.register("e2e_delete", "def macro(ctx):\n    return 'present'\n")
+        .expect("register delete target");
+    neuron::macros::macro_host::delete_macro("e2e_delete").expect("delete target");
+    let deleted = host.invoke("e2e_delete", &ctx);
+    assert!(
+        deleted.contains("not registered"),
+        "deleted macro remained callable in the warm sidecar: {deleted}"
+    );
+
+    host.unregister("e2e_generation");
+    host.unregister("e2e_stable");
     host.unregister("e2e_ok");
     host.unregister("e2e_boom");
     std::env::set_current_dir(prev).ok();
