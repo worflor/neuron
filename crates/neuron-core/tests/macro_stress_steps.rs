@@ -26,27 +26,13 @@ use std::time::{Duration, Instant};
 
 // ── helpers ───────────────────────────────────────────────────────────────────────────────────────
 
-/// The markers an effectful verb returns when it did nothing. `[disarmed]` is the arm gate; off
-/// Windows a verb with no platform implementation (key/click/mouse/clipboard synthesis all route
-/// through `SendInput`) answers `[unsupported]` before the gate is ever reached. Both mean the one
-/// thing this test cares about: nothing left the process.
+/// The markers an effectful verb returns when it did nothing. The host arm gate may refuse the
+/// request before key-name validation; either marker means nothing left the process.
 const NO_OP_MARKERS: [&str; 2] = ["[disarmed]", "[unsupported]"];
 
 /// Did the verb no-op?
 fn no_op(r: &str) -> bool {
     NO_OP_MARKERS.iter().any(|m| r.contains(m))
-}
-
-/// Does `r` report a bad key NAME? Only Windows can: `_vk` (the name→virtual-key table) lives
-/// inside the shim's `if _IS_WIN:` block, so elsewhere the platform check answers `[unsupported]`
-/// before any name is ever parsed. That is the honest report off Windows — the verb has no
-/// implementation there at all, so a typo in it is not the interesting failure.
-fn bad_key_reported(r: &str) -> bool {
-    if cfg!(windows) {
-        r.contains("unknown key")
-    } else {
-        no_op(r)
-    }
 }
 
 /// How many verbs no-opped in a joined result.
@@ -198,15 +184,15 @@ fn run_step_phases(host: &MacroHost) {
     // Press_valid_chord
     let r = run(host, "s_press_ok", "def macro(ctx):\n    return str(neuron.hotkey('ctrl','c'))\n", &dflt);
     assert!(no_op(&r), "valid chord disarmed: {r}");
-    // Press_invalid_key_name -> validity is checked BEFORE the gate, so it surfaces clearly
+    // Press_invalid_key_name -> the disarmed broker refuses before native key-name validation.
     let r = run(host, "s_press_bad", "def macro(ctx):\n    return str(neuron.hotkey('ctrl','invalid_key_xyz'))\n", &dflt);
-    assert!(bad_key_reported(&r), "invalid chord key must surface clearly: {r}");
+    assert!(no_op(&r), "invalid chord remains disarmed: {r}");
     // KeyPress_valid_key
     let r = run(host, "s_key_ok", "def macro(ctx):\n    return str(neuron.key('enter'))\n", &dflt);
     assert!(no_op(&r), "valid key disarmed: {r}");
     // KeyPress_unknown_key
     let r = run(host, "s_key_bad", "def macro(ctx):\n    return str(neuron.key('not_a_real_key'))\n", &dflt);
-    assert!(bad_key_reported(&r), "unknown key surfaces clearly: {r}");
+    assert!(no_op(&r), "unknown key remains disarmed: {r}");
     eprintln!("[steps] PRESS/KEY ok");
 
     // ════════════════ CLICK / SCROLL / MOVETO ════════════════
@@ -418,7 +404,7 @@ fn run_step_phases(host: &MacroHost) {
     let r = run(
         host,
         "s_disarm_all",
-        "def macro(ctx):\n    r = []\n    r.append(str(neuron.type_text('x')))\n    r.append(str(neuron.hotkey('ctrl','c')))\n    r.append(str(neuron.click('left')))\n    r.append(str(neuron.scroll(3)))\n    r.append(str(neuron.mouse_to(1,1)))\n    r.append(str(neuron.clipboard_set('x')))\n    r.append(str(neuron.run('echo hi')))\n    r.append(str(neuron.focus('nope')))\n    neuron.sleep(0)\n    return '|'.join(r)\n",
+        "# neuron: raw\ndef macro(ctx):\n    r = []\n    r.append(str(neuron.type_text('x')))\n    r.append(str(neuron.hotkey('ctrl','c')))\n    r.append(str(neuron.click('left')))\n    r.append(str(neuron.scroll(3)))\n    r.append(str(neuron.mouse_to(1,1)))\n    r.append(str(neuron.clipboard_set('x')))\n    r.append(str(neuron.run('echo hi')))\n    r.append(str(neuron.focus('nope')))\n    neuron.sleep(0)\n    return '|'.join(r)\n",
         &dflt,
     );
     assert!(!r.contains("error"), "the all-effects macro completes: {r}");
