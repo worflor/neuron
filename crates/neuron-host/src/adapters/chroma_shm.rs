@@ -1969,6 +1969,7 @@ pub mod server {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use super::super::{CONTROL_SECTION, parse_roster};
         use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
         use windows_sys::Win32::System::Threading::{ReleaseMutex, WaitForSingleObject};
 
