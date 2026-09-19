@@ -387,20 +387,42 @@ impl MacroHost {
     /// Register (or replace) a macro and publish the new revision only after it is durable.
     ///
     /// Python PREPARES the namespace first but does not expose it to fires. The source is then
-    /// atomically committed to disk + the durable manifest, and only then is the prepared callable
-    /// made live. A bad edit or failed write therefore cannot destroy the last-known-good revision.
+    /// atomically written to disk, then the prepared callable is committed. Only after the commit
+    /// acknowledgement does dispatch see the new manifest and generation. A failed final commit
+    /// restores the previous source and retires the uncertain sidecar session.
     pub fn register(&self, id: &str, source: &str) -> Result<(), String> {
         validate_macro_id(id)?;
         let _mutation = self
             .mutations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous_source = load_macro(id);
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let (token, opts, shared) = self.prepare_register(id, source, generation)?;
 
         if let Err(e) = write_macro_file(id, source) {
             self.discard_prepared(&shared, token);
             return Err(format!("persist macro '{id}': {e}"));
+        }
+
+        if let Err(commit_err) = self.commit_prepared(&shared, token) {
+            self.retire_control_session(&shared);
+            let rollback = match previous_source.as_deref() {
+                Some(old) => write_macro_file(id, old),
+                None => match std::fs::remove_file(macro_path(id)) {
+                    Ok(()) => Ok(()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(e) => Err(e.to_string()),
+                },
+            };
+            return match rollback {
+                Ok(()) => Err(format!(
+                    "macro '{id}' reload failed after persistence; previous revision restored: {commit_err}"
+                )),
+                Err(rollback_err) => Err(format!(
+                    "macro '{id}' reload failed and durable rollback also failed: {commit_err}; rollback: {rollback_err}"
+                )),
+            };
         }
 
         {
@@ -411,17 +433,6 @@ impl MacroHost {
                 g.options.insert(id.to_string(), opts.clone());
             } else {
                 g.options.remove(id);
-            }
-        }
-
-        if let Err(commit_err) = self.commit_prepared(&shared, token) {
-            // Disk + manifest are authoritative now. A lost final ack is recovered by rebuilding
-            // this exact session from durable truth before reporting success.
-            self.retire_control_session(&shared);
-            if let Err(recover_err) = self.ensure_warm() {
-                return Err(format!(
-                    "macro '{id}' saved, but live reload failed: {commit_err}; recovery: {recover_err}"
-                ));
             }
         }
 
