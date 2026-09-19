@@ -1377,6 +1377,123 @@ fn open_capable(cap: crate::registry::Capability) -> Option<crate::device::Devic
 /// one source of truth. Reads (`battery`/`current_dpi`/`active_profile`/`scroll_stage`) let a macro
 /// SENSE live state and react. Audio + brightness reuse the same Core-Audio / capability code the
 /// bound actions use. Returns `(ok, message)` — for a read, the message IS the value.
+
+fn macro_state_dir() -> PathBuf {
+    if let Some(p) = std::env::var_os("NEURON_MACRO_STATE") {
+        return PathBuf::from(p);
+    }
+    dirs::data_local_dir()
+        .unwrap_or_else(|| std::env::temp_dir().join("neuron-data"))
+        .join("neuron")
+        .join("macro_state")
+}
+
+fn macro_state_path(id: &str) -> PathBuf {
+    macro_state_dir().join(format!("{id}.json"))
+}
+
+fn macro_state_lock(id: &str) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+    let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    locks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(id.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+fn macro_state_read(id: &str) -> serde_json::Map<String, Value> {
+    std::fs::read_to_string(macro_state_path(id))
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default()
+}
+
+fn macro_state_write(id: &str, map: &serde_json::Map<String, Value>) -> Result<(), String> {
+    let path = macro_state_path(id);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let body = serde_json::to_vec(map).map_err(|e| e.to_string())?;
+    let mut last = None;
+    for attempt in 0..40 {
+        match crate::salvage::atomic_write(&path, &body) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                let transient = cfg!(windows) && matches!(e.raw_os_error(), Some(5 | 32));
+                if !transient || attempt == 39 {
+                    return Err(e.to_string());
+                }
+                last = Some(e);
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+    }
+    Err(last.map(|e| e.to_string()).unwrap_or_else(|| "state write failed".into()))
+}
+
+fn run_state_act(id: &str, verb: &str, arg: &Value) -> Option<(bool, String)> {
+    if !verb.starts_with("state_") {
+        return None;
+    }
+    if validate_macro_id(id).is_err() {
+        return Some((false, "invalid macro id for state".into()));
+    }
+    let lock = macro_state_lock(id);
+    let _guard = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    match verb {
+        "state_store" => {
+            let Some(key) = arg.get("key").and_then(Value::as_str) else {
+                return Some((false, "state_store: missing key".into()));
+            };
+            let value = arg.get("value").cloned().unwrap_or(Value::Null);
+            let mut map = macro_state_read(id);
+            map.insert(key.to_string(), value);
+            Some(match macro_state_write(id, &map) {
+                Ok(()) => (true, "true".into()),
+                Err(e) => (false, format!("state write failed: {e}")),
+            })
+        }
+        "state_load" => {
+            let Some(key) = arg.get("key").and_then(Value::as_str) else {
+                return Some((false, "state_load: missing key".into()));
+            };
+            let map = macro_state_read(id);
+            let payload = match map.get(key) {
+                Some(v) => json!({"found": true, "value": v}),
+                None => json!({"found": false}),
+            };
+            Some((true, payload.to_string()))
+        }
+        "state_forget" => {
+            if arg.is_null() {
+                let ok = match std::fs::remove_file(macro_state_path(id)) {
+                    Ok(()) => true,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+                    Err(_) => false,
+                };
+                return Some((ok, if ok { "true" } else { "false" }.into()));
+            }
+            let Some(key) = arg.as_str() else {
+                return Some((false, "state_forget: key must be a string or null".into()));
+            };
+            let mut map = macro_state_read(id);
+            map.remove(key);
+            Some(match macro_state_write(id, &map) {
+                Ok(()) => (true, "true".into()),
+                Err(e) => (false, format!("state write failed: {e}")),
+            })
+        }
+        "state_stored" => {
+            let map = macro_state_read(id);
+            Some((true, Value::Object(map).to_string()))
+        }
+        _ => Some((false, format!("unknown state verb '{verb}'"))),
+    }
+}
+
 fn run_act(_mode: MacroMode, _macro_id: &str, verb: &str, arg: &Value, mock: bool) -> (bool, String) {
     use crate::action::{Direction, Intent};
     use crate::capability as cap;
@@ -1404,6 +1521,10 @@ fn run_act(_mode: MacroMode, _macro_id: &str, verb: &str, arg: &Value, mock: boo
             }
         }
         _ => {}
+    }
+
+    if let Some(result) = run_state_act(_macro_id, verb, arg) {
+        return result;
     }
 
     // The host is the authority boundary. Python's helper-side gate is useful fast feedback, but a

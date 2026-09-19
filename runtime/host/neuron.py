@@ -419,9 +419,13 @@ def _state_write(mid, d):
 
 
 def store(key, value):
-    """Persist a JSON-able `value` under `key` for THIS macro — survives across fires and restarts.
-    Per-macro namespace, atomic write. Returns True on success. (Big/looping values? keep it small —
-    this is settings + counters + memory, not a database.)"""
+    """Persist a JSON-able value under key for THIS macro."""
+    if _BOUND:
+        try:
+            _json.dumps(value)
+        except Exception:
+            return False
+        return _act("state_store", {"key": str(key), "value": value}, gated=False) == "true"
     mid = getattr(_tls, "mid", "?")
     with _state_lock_for(mid):
         d = _state_read(mid)
@@ -430,14 +434,24 @@ def store(key, value):
 
 
 def load(key, default=None):
-    """Read a value saved by store() for THIS macro (or `default` if unset). Never raises."""
+    """Read a value saved by store() for THIS macro (or default if unset). Never raises."""
+    if _BOUND:
+        raw = _act("state_load", {"key": str(key)}, gated=False)
+        try:
+            payload = _json.loads(raw)
+            return payload.get("value") if payload.get("found") else default
+        except Exception:
+            return default
     mid = getattr(_tls, "mid", "?")
     with _state_lock_for(mid):
         return _state_read(mid).get(str(key), default)
 
 
 def forget(key=None):
-    """Delete one stored key, or (key=None) wipe THIS macro's whole store. Returns True on success."""
+    """Delete one stored key, or (key=None) wipe THIS macro's whole store."""
+    if _BOUND:
+        arg = None if key is None else str(key)
+        return _act("state_forget", arg, gated=False) == "true"
     mid = getattr(_tls, "mid", "?")
     with _state_lock_for(mid):
         if key is None:
@@ -455,6 +469,13 @@ def forget(key=None):
 
 def stored():
     """The whole stored dict for THIS macro (a copy)."""
+    if _BOUND:
+        raw = _act("state_stored", gated=False)
+        try:
+            value = _json.loads(raw)
+            return value if isinstance(value, dict) else {}
+        except Exception:
+            return {}
     mid = getattr(_tls, "mid", "?")
     with _state_lock_for(mid):
         return dict(_state_read(mid))
