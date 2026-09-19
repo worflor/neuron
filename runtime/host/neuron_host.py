@@ -755,7 +755,6 @@ def main():
                 if item[0] == mid:
                     _staged.pop(token, None)
             _retire_fire_worker(mid)
-            _nh._retire_state_lock(mid)
         elif t == "ping":
             _send({"t": "pong", "rid": msg.get("rid")})
         elif t == "shutdown":

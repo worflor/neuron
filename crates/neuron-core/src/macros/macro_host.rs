@@ -1985,6 +1985,33 @@ mod tests {
     }
 
     #[test]
+    fn directory_scan_ignores_noncanonical_python_stems() {
+        let _env = crate::runroot::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = std::env::temp_dir().join(format!(
+            "neuron_macro_scan_identity_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        {
+            let _pin = crate::runroot::RunDirPin::to(&tmp);
+            let dir = macros_dir();
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("good_id.py"), "def macro(ctx):\n    pass\n").unwrap();
+            std::fs::write(dir.join("bad name.py"), "def macro(ctx):\n    pass\n").unwrap();
+            let found = scan_macro_dir();
+            assert!(found.iter().any(|(id, _)| id == "good_id"));
+            assert!(
+                found.iter().all(|(id, _)| id != "bad name"),
+                "a filename that cannot be a MacroId entered the runtime registry"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn breaker_trips_after_repeated_crashes_then_resets() {
         let mut b = Breaker::default();
         for _ in 0..=BREAKER_MAX {

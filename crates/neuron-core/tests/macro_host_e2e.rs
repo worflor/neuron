@@ -120,6 +120,45 @@ fn macro_host_warm_persists_and_isolates_errors() {
         "failed replacement must not overwrite the durable source"
     );
 
+    // A queued fire belongs to the revision that accepted it. Hold generation N's first fire long
+    // enough to queue a second, publish N+1, then prove that queued N work is REFUSED rather than
+    // silently executing the new callable.
+    host.register(
+        "e2e_generation",
+        "import time\ndef macro(ctx):\n    print('old:' + ctx.app)\n    time.sleep(0.4)\n",
+    )
+    .expect("register generation baseline");
+    host.drain_log();
+    let first = Context::synthetic(Some("first".into()), None, None, None, None);
+    let second = Context::synthetic(Some("second".into()), None, None, None, None);
+    assert!(host.fire_async("e2e_generation", &first).contains("dispatched"));
+    assert!(host.fire_async("e2e_generation", &second).contains("dispatched"));
+    std::thread::sleep(Duration::from_millis(80));
+    host.register(
+        "e2e_generation",
+        "def macro(ctx):\n    return 'new:' + ctx.app\n",
+    )
+    .expect("publish generation replacement");
+    std::thread::sleep(Duration::from_millis(700));
+    let generation_log = host.drain_log();
+    assert!(
+        generation_log.iter().any(|l| l.contains("old:first")),
+        "the already-running old revision should finish: {generation_log:?}"
+    );
+    assert!(
+        generation_log.iter().any(|l| l.contains("queued for generation")),
+        "queued old work must be refused at the revision boundary: {generation_log:?}"
+    );
+    assert!(
+        !generation_log.iter().any(|l| l.contains("new:second")),
+        "a queued generation-N fire executed generation N+1: {generation_log:?}"
+    );
+    let newest = host.invoke(
+        "e2e_generation",
+        &Context::synthetic(Some("third".into()), None, None, None, None),
+    );
+    assert!(newest.contains("new:third"), "new fires use the published revision: {newest}");
+
     // Source execution is the editor/--file path: it runs real Python but is never registered or
     // persisted as a side effect of testing it.
     let candidate = host.invoke_source(
@@ -143,6 +182,7 @@ fn macro_host_warm_persists_and_isolates_errors() {
         "deleted macro remained callable in the warm sidecar: {deleted}"
     );
 
+    host.unregister("e2e_generation");
     host.unregister("e2e_stable");
     host.unregister("e2e_ok");
     host.unregister("e2e_boom");

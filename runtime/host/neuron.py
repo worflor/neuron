@@ -278,7 +278,9 @@ def invoke(name, wait=True, **opts):
     """Run ANOTHER macro by id, as a subroutine — the composition primitive.
 
     wait=True (default): run it INLINE on this thread and return its value (its `return`), so you can
-    branch on the result. wait=False: queue it on its OWN serial worker (fire-and-forget) and return
+    branch on the result. This is SUBROUTINE semantics: it intentionally bypasses the target's fire
+    queue and may overlap a separately-fired instance of that target. wait=False queues it on the
+    target's OWN serial worker (fire-and-forget) and return
     None at once. Keyword args become the invoked macro's options (read with neuron.option(...)). The
     invoked macro shares THIS fire's captured world (ctx). Returns None if `name` isn't a registered
     macro or the call would nest deeper than the cycle guard allows. Never raises."""
@@ -339,12 +341,6 @@ def _state_lock_for(mid):
             lock = threading.Lock()
             _state_locks[key] = lock
         return lock
-
-
-def _retire_state_lock(mid):
-    """Forget an unregistered macro's lock object. Any in-flight holder keeps its own reference."""
-    with _state_locks_guard:
-        _state_locks.pop(str(mid), None)
 
 
 # Windows AV/indexer handle-steals clear in low single-digit milliseconds; 40 tries * 25ms = up to 1s
