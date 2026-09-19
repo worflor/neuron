@@ -1647,6 +1647,47 @@ pub fn macros_dir() -> PathBuf {
     crate::runroot::run_root().join("macros").join("scripts")
 }
 
+const BOUND_DEFAULT_MIGRATION: &str = ".bound_default_v1";
+
+/// Preserve the pre-policy contract exactly once. Every Python file already present when this build
+/// first observes the macro directory came from the unrestricted era, so stamp it RAW atomically.
+/// The marker is written last; interruption retries idempotently instead of silently downgrading old
+/// code into the new BOUND default.
+fn migrate_legacy_macro_dir(dir: &std::path::Path) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let marker = dir.join(BOUND_DEFAULT_MIGRATION);
+    if marker.exists() {
+        return Ok(());
+    }
+    let rd = std::fs::read_dir(dir).map_err(|e| e.to_string())?;
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|x| x.to_str()) != Some("py") {
+            continue;
+        }
+        let src = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        let raw = match crate::macros::mode_from_source(&src) {
+            Ok(crate::macros::MacroMode::Raw) => src,
+            Ok(crate::macros::MacroMode::Bound) => {
+                crate::macros::set_source_mode(&src, crate::macros::MacroMode::Raw)
+            }
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        };
+        if raw != src {
+            crate::salvage::atomic_write(&path, raw.as_bytes()).map_err(|e| e.to_string())?;
+        }
+    }
+    crate::salvage::atomic_write(
+        &marker,
+        b"pre-BOUND macros were stamped '# neuron: raw' once; new macros default BOUND.\n",
+    )
+    .map_err(|e| e.to_string())
+}
+
+fn ensure_macro_policy_migration() -> Result<(), String> {
+    migrate_legacy_macro_dir(&macros_dir())
+}
+
 /// Exemplar macros shipped with the binary (id, source). Written to disk on a truly-fresh install
 /// so a new user has a working `neuron.ask` macro to read, run, and copy from.
 pub const DEFAULT_MACROS: &[(&str, &str)] =
@@ -1663,6 +1704,11 @@ pub const DEFAULT_MACROS: &[(&str, &str)] =
 /// Best-effort: IO errors are swallowed, matching the rest of this module's persistence.
 pub fn seed_default_macros() {
     let dir = macros_dir();
+    // Run the authority migration BEFORE writing bundled examples. Existing user files therefore
+    // retain RAW, while examples created by this build are genuinely new and stay BOUND.
+    if ensure_macro_policy_migration().is_err() {
+        return;
+    }
     let marker = dir.join(".defaults_seeded");
     if marker.exists() {
         return;
@@ -1926,6 +1972,10 @@ fn seed_option_defaults(id: &str, manifest: &Value) {
 
 /// Scan macros/scripts/*.py into (id, source) pairs (id = file stem).
 pub fn scan_macro_dir() -> Vec<(String, String)> {
+    if let Err(e) = ensure_macro_policy_migration() {
+        eprintln!("[macro] legacy authority migration failed: {e}");
+        return Vec::new();
+    }
     let mut out = Vec::new();
     if let Ok(rd) = std::fs::read_dir(macros_dir()) {
         for e in rd.flatten() {
@@ -1955,6 +2005,7 @@ pub fn list_macros() -> Vec<String> {
 /// Load a macro's source from disk by id.
 pub fn load_macro(id: &str) -> Option<String> {
     validate_macro_id(id).ok()?;
+    ensure_macro_policy_migration().ok()?;
     std::fs::read_to_string(macro_path(id)).ok()
 }
 
@@ -1995,6 +2046,35 @@ mod tests {
         assert_eq!(sanitize_id("ok_name-1"), "ok_name-1");
         assert_eq!(sanitize_id("../etc/passwd"), "___etc_passwd");
         assert_eq!(sanitize_id("a b.c"), "a_b_c");
+    }
+
+    #[test]
+    fn legacy_macro_migration_is_one_shot_and_new_files_stay_bound() {
+        let dir = std::env::temp_dir().join(format!(
+            "neuron_macro_policy_migration_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = dir.join("old.py");
+        std::fs::write(&old, "def macro(ctx):\n    return 1\n").unwrap();
+
+        migrate_legacy_macro_dir(&dir).unwrap();
+        let migrated = std::fs::read_to_string(&old).unwrap();
+        assert_eq!(
+            crate::macros::mode_from_source(&migrated).unwrap(),
+            crate::macros::MacroMode::Raw
+        );
+
+        let fresh = dir.join("fresh.py");
+        std::fs::write(&fresh, "def macro(ctx):\n    return 2\n").unwrap();
+        migrate_legacy_macro_dir(&dir).unwrap();
+        let fresh_src = std::fs::read_to_string(&fresh).unwrap();
+        assert_eq!(
+            crate::macros::mode_from_source(&fresh_src).unwrap(),
+            crate::macros::MacroMode::Bound
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
