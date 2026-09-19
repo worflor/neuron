@@ -27,6 +27,9 @@ import struct
 import threading
 import traceback
 
+_HOST_MODE = os.environ.get("NEURON_MACRO_MODE", "raw").strip().lower()
+_BOUND = _HOST_MODE == "bound"
+
 # ── isolate the protocol channel from macro output (must happen first) ──────────────────────────
 _PROTO = os.fdopen(os.dup(1), "wb", buffering=0)   # our private copy of the real stdout = protocol
 _IN = os.fdopen(os.dup(0), "rb", buffering=0)       # the real stdin = host -> sidecar control
@@ -723,7 +726,8 @@ _nh._set_host_dispatch(_dispatch_fire)   # neuron.invoke(wait=False): enqueue on
 
 
 def main():
-    _send({"t": "ready", "py": sys.version.split()[0], "platform": sys.platform})
+    _send({"t": "ready", "py": sys.version.split()[0], "platform": sys.platform,
+           "mode": _HOST_MODE})
     while True:
         try:
             msg = _read_frame()

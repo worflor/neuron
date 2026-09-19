@@ -35,6 +35,8 @@ __all__ = [
 ]
 
 _IS_WIN = sys.platform == "win32"
+_MODE = os.environ.get("NEURON_MACRO_MODE", "raw").strip().lower()
+_BOUND = _MODE == "bound"
 _armed = False
 
 
@@ -143,6 +145,8 @@ def __getattr__(name):
 _host_send = None
 _ask_lock = threading.Lock()
 _ask_seq = [0]
+# Keep prompt ids globally distinct even though RAW and BOUND allocate them independently.
+_ASK_PREFIX = (1 << 63) if _BOUND else 0
 _asks = {}  # pid -> {"event": Event, "choice": int|None}  (chosen option index, or None = passed)
 
 
@@ -172,7 +176,7 @@ def _prompt(text, options, timeout=300, description=""):
     ev = threading.Event()
     with _ask_lock:
         _ask_seq[0] += 1
-        pid = _ask_seq[0]
+        pid = _ASK_PREFIX | _ask_seq[0]
         _asks[pid] = {"event": ev, "choice": None}
     _host_send({
         "t": "prompt", "pid": pid, "id": getattr(_tls, "mid", "?"),

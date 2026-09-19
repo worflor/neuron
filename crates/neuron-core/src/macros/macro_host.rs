@@ -30,7 +30,7 @@
 //! blocking [`invoke`]/[`check`] are for the GUI "test run" + CLI only, always with a hard budget.
 
 use crate::macros::node::{MacroDocument, MacroNode};
-use crate::macros::policy::mode_from_source;
+use crate::macros::policy::{mode_from_source, MacroMode};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{BufReader, Read, Write};
@@ -295,9 +295,14 @@ impl Breaker {
 }
 
 struct Inner {
+    /// RAW is also the compiler/control lane: parse/check never execute user source.
     session: Option<Session>,
+    /// BOUND never cohabits an interpreter with unrestricted Python.
+    bound_session: Option<Session>,
     /// id -> python source. The single source of truth for re-registration after a respawn.
     manifest: BTreeMap<String, String>,
+    /// id -> source-owned execution domain.
+    modes: BTreeMap<String, MacroMode>,
     /// id -> active source generation. Fires carry this number so queued work can never cross a
     /// hot-reload boundary and accidentally execute a newer callable than the trigger selected.
     generations: BTreeMap<String, u64>,
@@ -305,6 +310,59 @@ struct Inner {
     /// The GUI renders controls from this; the user's chosen VALUES live on disk (`options_path`).
     options: BTreeMap<String, Value>,
     breaker: Breaker,
+    bound_breaker: Breaker,
+}
+
+fn lane_session(g: &Inner, mode: MacroMode) -> Option<&Session> {
+    match mode {
+        MacroMode::Raw => g.session.as_ref(),
+        MacroMode::Bound => g.bound_session.as_ref(),
+    }
+}
+
+fn lane_session_mut(g: &mut Inner, mode: MacroMode) -> Option<&mut Session> {
+    match mode {
+        MacroMode::Raw => g.session.as_mut(),
+        MacroMode::Bound => g.bound_session.as_mut(),
+    }
+}
+
+fn lane_take(g: &mut Inner, mode: MacroMode) -> Option<Session> {
+    match mode {
+        MacroMode::Raw => g.session.take(),
+        MacroMode::Bound => g.bound_session.take(),
+    }
+}
+
+fn lane_set(g: &mut Inner, mode: MacroMode, session: Session) {
+    match mode {
+        MacroMode::Raw => g.session = Some(session),
+        MacroMode::Bound => g.bound_session = Some(session),
+    }
+}
+
+fn lane_breaker_mut(g: &mut Inner, mode: MacroMode) -> &mut Breaker {
+    match mode {
+        MacroMode::Raw => &mut g.breaker,
+        MacroMode::Bound => &mut g.bound_breaker,
+    }
+}
+
+fn lane_for_shared(g: &Inner, shared: &Arc<Shared>) -> Option<MacroMode> {
+    if g.session
+        .as_ref()
+        .is_some_and(|s| Arc::ptr_eq(&s.shared, shared))
+    {
+        Some(MacroMode::Raw)
+    } else if g
+        .bound_session
+        .as_ref()
+        .is_some_and(|s| Arc::ptr_eq(&s.shared, shared))
+    {
+        Some(MacroMode::Bound)
+    } else {
+        None
+    }
 }
 
 /// The process-global macro runtime.
@@ -319,8 +377,9 @@ pub struct MacroHost {
     /// always lock-free and instant — it can never stall behind a cold-spawn warm-wait. The spawn
     /// reads this for the initial + warm-handshake arm state, so a respawn always reflects current.
     armed: AtomicBool,
-    /// At most one background warm thread in flight (a burst of cold fires must not spawn one each).
+    /// At most one background warm thread per execution domain.
     warm_in_flight: AtomicBool,
+    bound_warm_in_flight: AtomicBool,
     /// The macro-log ring, owned here so it survives session respawns (each Session's `Shared.log`
     /// is a clone of this Arc).
     log: LogRing,
@@ -334,15 +393,19 @@ impl MacroHost {
         MacroHost {
             inner: Mutex::new(Inner {
                 session: None,
+                bound_session: None,
                 manifest: BTreeMap::new(),
+                modes: BTreeMap::new(),
                 generations: BTreeMap::new(),
                 options: BTreeMap::new(),
                 breaker: Breaker::default(),
+                bound_breaker: Breaker::default(),
             }),
             mutations: Mutex::new(()),
             next_generation: AtomicU64::new(1),
             armed: AtomicBool::new(false),
             warm_in_flight: AtomicBool::new(false),
+            bound_warm_in_flight: AtomicBool::new(false),
             log: Arc::new(Mutex::new(VecDeque::new())),
             beacon: Arc::new(Mutex::new(None)),
         }
@@ -363,8 +426,10 @@ impl MacroHost {
     /// answering late is always safe.
     pub fn answer(&self, pid: u64, choice: Option<usize>) {
         let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(s) = g.session.as_mut() {
-            let _ = s.send(&json!({"t": "answer", "pid": pid, "choice": choice}));
+        for mode in [MacroMode::Raw, MacroMode::Bound] {
+            if let Some(s) = lane_session_mut(&mut g, mode) {
+                let _ = s.send(&json!({"t": "answer", "pid": pid, "choice": choice}));
+            }
         }
     }
 
@@ -376,8 +441,10 @@ impl MacroHost {
     pub fn set_armed(&self, on: bool) {
         self.armed.store(on, Ordering::SeqCst);
         if let Ok(mut g) = self.inner.try_lock() {
-            if let Some(s) = g.session.as_mut() {
-                let _ = s.send(&json!({"t": "armed", "on": on}));
+            for mode in [MacroMode::Raw, MacroMode::Bound] {
+                if let Some(s) = lane_session_mut(&mut g, mode) {
+                    let _ = s.send(&json!({"t": "armed", "on": on}));
+                }
             }
         }
     }
@@ -398,14 +465,21 @@ impl MacroHost {
     /// restores the previous source and retires the uncertain sidecar session.
     pub fn register(&self, id: &str, source: &str) -> Result<(), String> {
         validate_macro_id(id)?;
-        mode_from_source(source)?;
+        let mode = mode_from_source(source)?;
         let _mutation = self
             .mutations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let previous_source = load_macro(id);
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
-        let (token, opts, shared) = self.prepare_register(id, source, generation)?;
+        let old_mode = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .modes
+            .get(id)
+            .copied();
+        let (token, opts, shared) = self.prepare_register(id, source, generation, mode)?;
 
         if let Err(e) = write_macro_file(id, source) {
             self.discard_prepared(&shared, token);
@@ -435,7 +509,13 @@ impl MacroHost {
         {
             let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             g.manifest.insert(id.to_string(), source.to_string());
+            g.modes.insert(id.to_string(), mode);
             g.generations.insert(id.to_string(), generation);
+            if let Some(old) = old_mode.filter(|old| *old != mode) {
+                if let Some(s) = lane_session_mut(&mut g, old) {
+                    let _ = s.send(&json!({"t": "unregister", "id": id}));
+                }
+            }
             if opts.is_array() {
                 g.options.insert(id.to_string(), opts.clone());
             } else {
@@ -453,11 +533,12 @@ impl MacroHost {
         id: &str,
         source: &str,
         generation: u64,
+        mode: MacroMode,
     ) -> Result<(u64, Value, Arc<Shared>), String> {
         let (rx, shared, rid, sent) = {
             let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            self.ensure_locked(&mut g)?;
-            let s = g.session.as_mut().unwrap();
+            self.ensure_lane_locked(&mut g, mode)?;
+            let s = lane_session_mut(&mut g, mode).unwrap();
             let rid = s.shared.next_rid.fetch_add(1, Ordering::Relaxed);
             let (tx, rx) = channel();
             let shared = Arc::clone(&s.shared);
@@ -511,13 +592,10 @@ impl MacroHost {
     fn commit_prepared(&self, shared: &Arc<Shared>, token: u64) -> Result<(), String> {
         let (rx, rid, sent) = {
             let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let Some(s) = g
-                .session
-                .as_mut()
-                .filter(|s| Arc::ptr_eq(&s.shared, shared))
-            else {
+            let Some(mode) = lane_for_shared(&g, shared) else {
                 return Err("prepared macro session was replaced before commit".into());
             };
+            let s = lane_session_mut(&mut g, mode).unwrap();
             let rid = s.shared.next_rid.fetch_add(1, Ordering::Relaxed);
             let (tx, rx) = channel();
             shared
@@ -556,12 +634,10 @@ impl MacroHost {
 
     fn discard_prepared(&self, shared: &Arc<Shared>, token: u64) {
         let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(s) = g
-            .session
-            .as_mut()
-            .filter(|s| Arc::ptr_eq(&s.shared, shared))
-        {
-            let _ = s.send(&json!({"t": "discard_register", "token": token}));
+        if let Some(mode) = lane_for_shared(&g, shared) {
+            if let Some(s) = lane_session_mut(&mut g, mode) {
+                let _ = s.send(&json!({"t": "discard_register", "token": token}));
+            }
         }
     }
 
@@ -609,10 +685,13 @@ impl MacroHost {
     fn forget_live(&self, id: &str) {
         let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         g.manifest.remove(id);
+        g.modes.remove(id);
         g.generations.remove(id);
         g.options.remove(id);
-        if let Some(s) = g.session.as_mut() {
-            let _ = s.send(&json!({"t": "unregister", "id": id}));
+        for mode in [MacroMode::Raw, MacroMode::Bound] {
+            if let Some(s) = lane_session_mut(&mut g, mode) {
+                let _ = s.send(&json!({"t": "unregister", "id": id}));
+            }
         }
     }
 
@@ -621,8 +700,8 @@ impl MacroHost {
     pub fn check(&self, source: &str) -> Result<Vec<String>, String> {
         let (rx, shared, rid, rid_send) = {
             let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            self.ensure_locked(&mut g)?;
-            let s = g.session.as_mut().unwrap();
+            self.ensure_lane_locked(&mut g, MacroMode::Raw)?;
+            let s = lane_session_mut(&mut g, MacroMode::Raw).unwrap();
             let rid = s.shared.next_rid.fetch_add(1, Ordering::Relaxed);
             let (tx, rx) = channel();
             let shared = Arc::clone(&s.shared);
@@ -665,8 +744,8 @@ impl MacroHost {
         let mode = mode_from_source(source).map_err(|msg| ParseError::Policy { line: 1, msg })?;
         let (rx, shared, rid, sent) = {
             let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            self.ensure_locked(&mut g).map_err(host_err)?;
-            let s = g.session.as_mut().unwrap();
+            self.ensure_lane_locked(&mut g, MacroMode::Raw).map_err(host_err)?;
+            let s = lane_session_mut(&mut g, MacroMode::Raw).unwrap();
             let rid = s.shared.next_rid.fetch_add(1, Ordering::Relaxed);
             let (tx, rx) = channel();
             let shared = Arc::clone(&s.shared);
@@ -732,13 +811,17 @@ impl MacroHost {
         ctx: &crate::macros::context::Context,
         budget: Duration,
     ) -> String {
+        let mode = match mode_from_source(source) {
+            Ok(mode) => mode,
+            Err(e) => return format!("[macro policy error: {e}]"),
+        };
         let (rx, shared, rid, sent) = {
             let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Err(e) = self.ensure_locked(&mut g) {
+            if let Err(e) = self.ensure_lane_locked(&mut g, mode) {
                 return format!("[{e}]");
             }
             let armed = self.armed.load(Ordering::SeqCst);
-            let s = g.session.as_mut().unwrap();
+            let s = lane_session_mut(&mut g, mode).unwrap();
             let rid = s.shared.next_rid.fetch_add(1, Ordering::Relaxed);
             let (tx, rx) = channel();
             let shared = Arc::clone(&s.shared);
@@ -804,18 +887,20 @@ impl MacroHost {
         mock: bool,
     ) -> String {
         crate::prof::bump(&crate::prof::MACRO_FIRE);
+        let mode = match mode_from_source(source) {
+            Ok(mode) => mode,
+            Err(e) => return format!("[macro policy error: {e}]"),
+        };
         let armed = !mock && self.armed.load(Ordering::SeqCst);
         if let Ok(mut g) = self.inner.try_lock() {
-            let warm = g
-                .session
-                .as_ref()
+            let warm = lane_session(&g, mode)
                 .map(|s| {
                     let st = s.shared.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     st.warm && !st.dead
                 })
                 .unwrap_or(false);
             if warm {
-                let s = g.session.as_mut().unwrap();
+                let s = lane_session_mut(&mut g, mode).unwrap();
                 let rid = s.shared.next_rid.fetch_add(1, Ordering::Relaxed);
                 let options = if validate_macro_id(id).is_ok() {
                     load_option_values(id)
@@ -833,14 +918,15 @@ impl MacroHost {
                 })) {
                     return format!("macro '{id}' source dispatched");
                 }
-                g.session = None;
+                let doomed = lane_take(&mut g, mode);
                 drop(g);
-                self.spawn_background_warm();
+                drop(doomed);
+                self.spawn_background_warm(mode);
                 return format!("macro '{id}' source dropped (sidecar died — warming, press again)");
             }
             drop(g);
         }
-        self.spawn_background_warm();
+        self.spawn_background_warm(mode);
         if !self.available() {
             "[python runtime unavailable]".into()
         } else {
@@ -875,34 +961,41 @@ impl MacroHost {
     ) -> String {
         crate::prof::bump(&crate::prof::MACRO_FIRE);
         let armed = !mock && self.armed.load(Ordering::SeqCst);
-        // try_lock — if another thread is mid-spawn holding the lock, do NOT wait; fall to "warming".
         if let Ok(mut g) = self.inner.try_lock() {
-            let warm = g
-                .session
-                .as_ref()
-                .map(|s| {
-                    let st = s.shared.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                    st.warm && !st.dead
-                })
-                .unwrap_or(false);
-            if warm {
-                let generation = g.generations.get(id).copied().unwrap_or(0);
-                let s = g.session.as_mut().unwrap();
-                let rid = s.shared.next_rid.fetch_add(1, Ordering::Relaxed);
-                if s.send(&json!({"t": "fire", "rid": rid, "id": id, "generation": generation, "ctx": ctx_json(ctx, armed), "options": load_option_values(id), "mock": mock})) {
-                    return format!("macro '{id}' dispatched");
+            if let Some(mode) = g.modes.get(id).copied() {
+                let warm = lane_session(&g, mode)
+                    .map(|s| {
+                        let st = s.shared.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        st.warm && !st.dead
+                    })
+                    .unwrap_or(false);
+                if warm {
+                    let generation = g.generations.get(id).copied().unwrap_or(0);
+                    let s = lane_session_mut(&mut g, mode).unwrap();
+                    let rid = s.shared.next_rid.fetch_add(1, Ordering::Relaxed);
+                    if s.send(&json!({
+                        "t": "fire", "rid": rid, "id": id, "generation": generation,
+                        "ctx": ctx_json(ctx, armed), "options": load_option_values(id), "mock": mock
+                    })) {
+                        return format!("macro '{id}' dispatched");
+                    }
+                    let doomed = lane_take(&mut g, mode);
+                    drop(g);
+                    drop(doomed);
+                    self.spawn_background_warm(mode);
+                    return format!("macro '{id}' dropped (sidecar died — warming, press again)");
                 }
-                // pipe broke between the warm-check and the write — the sidecar just died. The fire
-                // is genuinely lost (the non-blocking contract forbids re-queueing here); say so.
-                g.session = None;
                 drop(g);
-                self.spawn_background_warm();
-                return format!("macro '{id}' dropped (sidecar died — warming, press again)");
+                self.spawn_background_warm(mode);
+            } else {
+                drop(g);
+                self.spawn_background_warm(MacroMode::Raw);
+                self.spawn_background_warm(MacroMode::Bound);
             }
-            drop(g);
+        } else {
+            self.spawn_background_warm(MacroMode::Raw);
+            self.spawn_background_warm(MacroMode::Bound);
         }
-        // not warm (or contended): kick a deduplicated background warm and report — never block.
-        self.spawn_background_warm();
         if !self.available() {
             "[python runtime unavailable]".into()
         } else {
@@ -927,12 +1020,14 @@ impl MacroHost {
     ) -> String {
         let (rx, shared, rid, sent) = {
             let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Err(e) = self.ensure_locked(&mut g) {
+            self.sync_manifest(&mut g);
+            let mode = g.modes.get(id).copied().unwrap_or(MacroMode::Raw);
+            if let Err(e) = self.ensure_lane_locked(&mut g, mode) {
                 return format!("[{e}]");
             }
             let armed = self.armed.load(Ordering::SeqCst);
             let generation = g.generations.get(id).copied().unwrap_or(0);
-            let s = g.session.as_mut().unwrap();
+            let s = lane_session_mut(&mut g, mode).unwrap();
             let rid = s.shared.next_rid.fetch_add(1, Ordering::Relaxed);
             let (tx, rx) = channel();
             let shared = Arc::clone(&s.shared);
@@ -978,7 +1073,12 @@ impl MacroHost {
     /// sidecar — GUI launch, `macro run <name>`, a respawn after a crash — sees the same world.
     pub fn ensure_warm(&self) -> Result<(), String> {
         let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.ensure_locked(&mut g)
+        self.sync_manifest(&mut g);
+        self.ensure_lane_locked(&mut g, MacroMode::Raw)?;
+        if g.modes.values().any(|m| *m == MacroMode::Bound) {
+            self.ensure_lane_locked(&mut g, MacroMode::Bound)?;
+        }
+        Ok(())
     }
 
     /// Drain the macro-log ring (the sidecar's stderr: prints + tracebacks). Newest last. Reads the
@@ -989,19 +1089,14 @@ impl MacroHost {
 
     // ── internals ──────────────────────────────────────────────────────────────────────────
 
-    /// A control-plane timeout means the Python main loop is no longer trustworthy. Retire only
-    /// the session that serviced the timed-out request; recovery may already have replaced it.
+    /// A control-plane timeout means one Python main loop is no longer trustworthy. Retire exactly
+    /// the execution domain that owned the timed-out Shared.
     fn retire_control_session(&self, shared: &Arc<Shared>) {
         let doomed = {
             let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let same = g
-                .session
-                .as_ref()
-                .map(|s| Arc::ptr_eq(&s.shared, shared))
-                .unwrap_or(false);
-            if same {
-                g.breaker.record_crash();
-                g.session.take()
+            if let Some(mode) = lane_for_shared(&g, shared) {
+                lane_breaker_mut(&mut g, mode).record_crash();
+                lane_take(&mut g, mode)
             } else {
                 None
             }
@@ -1009,111 +1104,132 @@ impl MacroHost {
         drop(doomed);
     }
 
-    /// Ensure a warm session exists (spawn + register-all if not). Caller holds the inner lock.
-    fn ensure_locked(&self, g: &mut Inner) -> Result<(), String> {
-        let dead = g
-            .session
-            .as_ref()
+    fn sync_manifest(&self, g: &mut Inner) {
+        for (id, src) in scan_macro_dir() {
+            if !g.manifest.contains_key(&id) {
+                let Ok(mode) = mode_from_source(&src) else {
+                    eprintln!("[macro] '{id}' has invalid execution policy; skipped until edited");
+                    continue;
+                };
+                let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+                g.manifest.insert(id.clone(), src);
+                g.modes.insert(id.clone(), mode);
+                g.generations.insert(id, generation);
+            } else {
+                if !g.generations.contains_key(&id) {
+                    let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+                    g.generations.insert(id.clone(), generation);
+                }
+                if !g.modes.contains_key(&id) {
+                    if let Some(src) = g.manifest.get(&id) {
+                        if let Ok(mode) = mode_from_source(src) {
+                            g.modes.insert(id.clone(), mode);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Ensure one execution domain is warm. RAW and BOUND never share a Python process.
+    fn ensure_lane_locked(&self, g: &mut Inner, mode: MacroMode) -> Result<(), String> {
+        self.sync_manifest(g);
+        let dead = lane_session(g, mode)
             .map(|s| s.shared.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).dead)
             .unwrap_or(true);
         if !dead {
             return Ok(());
         }
-        if g.session.is_some() {
-            // the old session died — count it and drop it (Drop reaps the process).
-            g.breaker.record_crash();
-            g.session = None;
+        if lane_session(g, mode).is_some() {
+            lane_breaker_mut(g, mode).record_crash();
+            let old = lane_take(g, mode);
+            drop(old);
         }
-        if g.breaker.tripped() {
-            return Err(
-                "macro sidecar disabled (crashed repeatedly — re-enable in Settings)".into(),
-            );
+        if lane_breaker_mut(g, mode).tripped() {
+            return Err(format!(
+                "{} macro sidecar disabled (crashed repeatedly — re-enable in Settings)",
+                mode.label()
+            ));
         }
-        // Sync the on-disk macros (macros/scripts/*.py) into the manifest at EVERY spawn — a macro
-        // saved by `macro add`/the GUI must exist for `macro run <name>` too, not only after the
-        // GUI's warm-up happened to run. In-memory sources win (or_insert): a just-registered
-        // edit must not be shadowed by a stale file read.
-        for (id, src) in scan_macro_dir() {
-            if !g.manifest.contains_key(&id) {
-                let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
-                g.manifest.insert(id.clone(), src);
-                g.generations.insert(id, generation);
-            } else if !g.generations.contains_key(&id) {
-                let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
-                g.generations.insert(id, generation);
-            }
-        }
-        // a spawn/warm TIMEOUT is also a crash for breaker purposes — otherwise a sidecar that boots
-        // but never sends `ready` would be respawned forever (a ~20s storm the breaker exists to stop).
         let session = match spawn_session(
+            mode,
             self.armed.load(Ordering::SeqCst),
             self.log.clone(),
             self.beacon.clone(),
         ) {
             Ok(s) => s,
             Err(e) => {
-                g.breaker.record_crash();
+                lane_breaker_mut(g, mode).record_crash();
                 return Err(e);
             }
         };
-        // a healthy warm clears the crash history (the breaker only trips on a real storm).
-        g.breaker.reset();
-        // register every known macro independently (one bad macro must not brick the rest). The
-        // reader surfaces any registration failure to the log ring (no waiter needed here).
+        lane_breaker_mut(g, mode).reset();
+
         let mut sess = session;
         for (id, src) in &g.manifest {
+            if g.modes.get(id).copied() != Some(mode) {
+                continue;
+            }
             let generation = g.generations.get(id).copied().unwrap_or(0);
             let rid = sess.shared.next_rid.fetch_add(1, Ordering::Relaxed);
             let _ = sess.send(&json!({
-                "t": "register",
-                "rid": rid,
-                "id": id,
-                "source": src,
-                "generation": generation,
+                "t": "register", "rid": rid, "id": id, "source": src, "generation": generation,
             }));
         }
-        // Warm/spawn-path race window: a request that read the OLD (dead) session's `dead` flag as
-        // false just before this replaces it can still be mid-flight against the old `Shared` right
-        // up until this assignment lands — freezing here lets a death-race test confirm the NEXT
-        // lookup after this point reliably sees the fresh session (no torn/partial swap).
         crate::failpoint!("macro_host.ensure_locked.before_replace");
-        g.session = Some(sess);
+        lane_set(g, mode, sess);
         Ok(())
     }
 
-    /// Kick a background thread to warm the sidecar without blocking the caller (the fire path).
-    /// Deduplicated: at most ONE background warm exists at a time, so a burst of cold fires (the
-    /// normal state right after a crash) can't spawn a thread each.
-    fn spawn_background_warm(&self) {
+    fn warm_latch(&self, mode: MacroMode) -> &AtomicBool {
+        match mode {
+            MacroMode::Raw => &self.warm_in_flight,
+            MacroMode::Bound => &self.bound_warm_in_flight,
+        }
+    }
+
+    fn spawn_background_warm(&self, mode: MacroMode) {
         let me: &'static MacroHost = macro_host();
         if me
-            .warm_in_flight
+            .warm_latch(mode)
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
-            return; // a warm is already in flight
+            return;
         }
-        // The latch is cleared by the release — which runs on completion, panic, OR a spawn
-        // refusal — so a failed warm can never latch `warm_in_flight` true and block every later
-        // recovery attempt for the rest of the run.
+        let label = match mode {
+            MacroMode::Raw => "macro-host-warm-raw",
+            MacroMode::Bound => "macro-host-warm-bound",
+        };
         crate::worker::spawn_guarded(
-            "macro-host-warm",
-            || me.warm_in_flight.store(false, Ordering::Release),
+            label,
+            move || me.warm_latch(mode).store(false, Ordering::Release),
             move || {
-                let _ = me.ensure_warm();
+                let mut g = me.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let _ = me.ensure_lane_locked(&mut g, mode);
             },
         );
     }
+
 }
 
 /// Spawn one sidecar process + its reader/logger threads, and wait until the `ready` frame arrives.
 /// `log` is the persistent MacroHost-level ring this session feeds (so its output outlives it);
 /// `beacon` is the Macro Host-level prompt-listener slot the reader routes ask/notify frames to.
-fn spawn_session(armed: bool, log: LogRing, beacon: BeaconSlot) -> Result<Session, String> {
+fn spawn_session(
+    mode: MacroMode,
+    armed: bool,
+    log: LogRing,
+    beacon: BeaconSlot,
+) -> Result<Session, String> {
     let rt = resolve_runtime()?;
 
     let mut cmd = Command::new(&rt.python);
     cmd.arg(&rt.host_script)
+        .env("NEURON_MACRO_MODE", match mode {
+            MacroMode::Raw => "raw",
+            MacroMode::Bound => "bound",
+        })
         .current_dir(&rt.host_dir) // so `import neuron` finds the co-located host/neuron.py
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1125,8 +1241,10 @@ fn spawn_session(armed: bool, log: LogRing, beacon: BeaconSlot) -> Result<Sessio
         .spawn()
         .map_err(|e| format!("spawn python sidecar: {e}"))?;
 
-    // hand the sidecar's PID to the profiler so it can sample the Python process's CPU.
-    crate::prof::SIDECAR_PID.store(child.id(), std::sync::atomic::Ordering::Relaxed);
+    // Keep the legacy profiler slot pointed at RAW. BOUND has independent process lifetime.
+    if mode == MacroMode::Raw {
+        crate::prof::SIDECAR_PID.store(child.id(), std::sync::atomic::Ordering::Relaxed);
+    }
 
     let stdin = Arc::new(Mutex::new(child.stdin.take().ok_or("no child stdin")?));
     let stdout = child.stdout.take().ok_or("no child stdout")?;
@@ -1148,15 +1266,23 @@ fn spawn_session(armed: bool, log: LogRing, beacon: BeaconSlot) -> Result<Sessio
     let reader = {
         let shared = shared.clone();
         let stdin_weak = Arc::downgrade(&stdin);
-        crate::worker::spawn_named("macro-host-reader", move || {
-            reader_loop(stdout, shared, beacon, stdin_weak)
+        let name = match mode {
+            MacroMode::Raw => "macro-host-reader-raw",
+            MacroMode::Bound => "macro-host-reader-bound",
+        };
+        crate::worker::spawn_named(name, move || {
+            reader_loop(stdout, shared, beacon, stdin_weak, mode)
         })
         .ok()
     };
     // logger thread: macro output off child STDERR -> bounded ring.
     let logger = {
         let shared = shared.clone();
-        crate::worker::spawn_named("macro-host-logger", move || {
+        let name = match mode {
+            MacroMode::Raw => "macro-host-logger-raw",
+            MacroMode::Bound => "macro-host-logger-bound",
+        };
+        crate::worker::spawn_named(name, move || {
                 let mut r = BufReader::new(stderr);
                 let mut line = Vec::new();
                 let mut byte = [0u8; 1];
@@ -1412,6 +1538,7 @@ fn reader_loop(
     shared: Arc<Shared>,
     beacon: BeaconSlot,
     stdin: Weak<Mutex<ChildStdin>>,
+    mode: MacroMode,
 ) {
     let mut r = BufReader::new(stdout);
     loop {
@@ -1435,6 +1562,18 @@ fn reader_loop(
         crate::prof::bump(&crate::prof::READER_FRAME);
         match v.get("t").and_then(Value::as_str) {
             Some("ready") => {
+                let expected = match mode {
+                    MacroMode::Raw => "raw",
+                    MacroMode::Bound => "bound",
+                };
+                if v.get("mode").and_then(Value::as_str) != Some(expected) {
+                    shared.push_log(format!(
+                        "[macro host] refused mismatched sidecar: expected {expected}, got {:?}",
+                        v.get("mode")
+                    ));
+                    break;
+                }
+                shared.push_log(format!("[macro host] {expected} ready"));
                 let mut st = shared.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 st.warm = true;
                 st.dead = false;
