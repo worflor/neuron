@@ -142,17 +142,62 @@ def _literal_expr(node):
         return False
 
 
+def _policy_fail(node, msg):
+    line = getattr(node, "lineno", 1) or 1
+    raise ValueError("line %d: %s" % (line, msg))
+
+
 def _validate_bound_module(source):
-    """Refuse ambient authority and registration-time executable module initialization."""
+    """Pure AST policy pass for BOUND. Never executes user code."""
     import ast
     tree = ast.parse(source)
+    future_annotations = any(
+        isinstance(stmt, ast.ImportFrom)
+        and stmt.module == "__future__"
+        and any(alias.name == "annotations" for alias in stmt.names)
+        for stmt in tree.body
+    )
+    raw_builtins = {
+        "open", "eval", "exec", "compile", "input", "breakpoint",
+        "getattr", "setattr", "delattr", "globals", "locals", "vars", "dir", "type",
+    }
 
+    # Whole-tree authority checks apply inside macro/helper bodies too, so Check and Save fail before
+    # a restricted call is ever reached at runtime.
     for node in ast.walk(tree):
-        if isinstance(node, ast.Attribute) and node.attr.startswith("_"):
-            raise ValueError("private/dunder attribute access requires RAW mode")
-        if isinstance(node, ast.Name) and node.id.startswith("__"):
-            raise ValueError("dunder names require RAW mode")
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                root = alias.name.split(".", 1)[0]
+                if root not in _BOUND_IMPORTS and root != "neuron":
+                    _policy_fail(node, "import %r requires RAW mode" % root)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                _policy_fail(node, "relative imports require RAW mode")
+            root = (node.module or "").split(".", 1)[0]
+            if root not in _BOUND_IMPORTS and root != "neuron":
+                _policy_fail(node, "import %r requires RAW mode" % root)
+        elif isinstance(node, ast.Attribute) and node.attr.startswith("_"):
+            _policy_fail(node, "private/dunder attribute access requires RAW mode")
+        elif isinstance(node, ast.Name):
+            if node.id.startswith("__"):
+                _policy_fail(node, "dunder names require RAW mode")
+            if isinstance(node.ctx, ast.Load) and node.id in raw_builtins:
+                _policy_fail(node, "%s requires RAW mode" % node.id)
+        elif isinstance(node, ast.Call):
+            fn = node.func
+            helper = None
+            if isinstance(fn, ast.Name):
+                helper = fn.id
+            elif (
+                isinstance(fn, ast.Attribute)
+                and isinstance(fn.value, ast.Name)
+                and fn.value.id == "neuron"
+            ):
+                helper = fn.attr
+            if helper in _RAW_ONLY_HELPERS:
+                _policy_fail(node, "neuron.%s requires RAW mode" % helper)
 
+    # Registration itself may execute module-level syntax. Keep BOUND top-level declarative.
     for stmt in tree.body:
         if (
             isinstance(stmt, ast.Expr)
@@ -160,32 +205,22 @@ def _validate_bound_module(source):
             and isinstance(stmt.value.value, str)
         ):
             continue
-        if isinstance(stmt, ast.Import):
-            roots = [a.name.split(".", 1)[0] for a in stmt.names]
-            if any(root not in _BOUND_IMPORTS and root != "neuron" for root in roots):
-                raise ValueError("module import requires RAW mode")
-            continue
-        if isinstance(stmt, ast.ImportFrom):
-            if stmt.level:
-                raise ValueError("relative imports require RAW mode")
-            root = (stmt.module or "").split(".", 1)[0]
-            if root not in _BOUND_IMPORTS and root != "neuron":
-                raise ValueError("module import requires RAW mode")
+        if isinstance(stmt, (ast.Import, ast.ImportFrom)):
             continue
         if isinstance(stmt, ast.Assign):
             if not _literal_expr(stmt.value):
-                raise ValueError("executable module assignment requires RAW mode")
+                _policy_fail(stmt, "executable module assignment requires RAW mode")
             continue
         if isinstance(stmt, ast.AnnAssign):
             if stmt.value is not None and not _literal_expr(stmt.value):
-                raise ValueError("executable module assignment requires RAW mode")
+                _policy_fail(stmt, "executable module assignment requires RAW mode")
             continue
         if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
             if stmt.decorator_list:
-                raise ValueError("decorators execute at registration and require RAW mode")
+                _policy_fail(stmt, "decorators execute at registration and require RAW mode")
             defaults = list(stmt.args.defaults) + [d for d in stmt.args.kw_defaults if d is not None]
             if any(not _literal_expr(d) for d in defaults):
-                raise ValueError("executable function defaults require RAW mode")
+                _policy_fail(stmt, "executable function defaults require RAW mode")
             annotations = [a.annotation for a in stmt.args.args + stmt.args.kwonlyargs if a.annotation]
             if stmt.args.vararg and stmt.args.vararg.annotation:
                 annotations.append(stmt.args.vararg.annotation)
@@ -193,13 +228,15 @@ def _validate_bound_module(source):
                 annotations.append(stmt.args.kwarg.annotation)
             if stmt.returns:
                 annotations.append(stmt.returns)
-            if annotations:
-                raise ValueError("runtime-evaluated function annotations require RAW mode")
+            if annotations and not future_annotations:
+                _policy_fail(stmt, "runtime-evaluated function annotations require RAW mode")
             continue
-        raise ValueError(
+        _policy_fail(
+            stmt,
             "%s at module scope executes during registration and requires RAW mode"
-            % type(stmt).__name__
+            % type(stmt).__name__,
         )
+    return tree
 
 
 _macros = {}   # id -> callable(ctx)
@@ -314,17 +351,24 @@ def _read_options(raw):
     return out
 
 
-def _check(source):
-    """Syntax + top-level def/class names. ast.parse only — no exec, zero side effects."""
+def _check(source, mode="raw"):
+    """Syntax + BOUND policy + top-level def/class names. Pure AST; never executes user source."""
     import ast
     try:
-        tree = ast.parse(source.lstrip("\ufeff"))  # same editor-BOM tolerance as _register
-        defs = [n.name for n in tree.body
-                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]
+        tree = ast.parse(source.lstrip("\ufeff"))
+        if mode == "bound":
+            tree = _validate_bound_module(source.lstrip("\ufeff"))
+        defs = [
+            n.name for n in tree.body
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        ]
         has_entry = any(d in ("macro", "main") for d in defs)
         return True, defs, has_entry, None
-    except SyntaxError:
-        return False, [], False, traceback.format_exc()
+    except SyntaxError as e:
+        line = e.lineno or 0
+        return False, [], False, "line %d: %s" % (line, e.msg)
+    except (ValueError, ImportError) as e:
+        return False, [], False, str(e)
 
 
 # -- bidirectional macro model: Python source -> a typed NODE TREE (the visual-constructor model) --
@@ -896,7 +940,9 @@ def main():
         elif t == "discard_register":
             _discard_register(msg.get("token"))
         elif t == "check":
-            ok, defs, has_entry, err = _check(msg.get("source") or "")
+            ok, defs, has_entry, err = _check(
+                msg.get("source") or "", msg.get("mode") or "raw"
+            )
             _send({"t": "checked", "rid": msg.get("rid"), "ok": ok,
                    "defs": defs, "has_entry": has_entry, "error": err})
         elif t == "parse":

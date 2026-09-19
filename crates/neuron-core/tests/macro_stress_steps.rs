@@ -254,15 +254,15 @@ fn run_step_phases(host: &MacroHost) {
     eprintln!("[steps] COPY/PASTE ok");
 
     // ════════════════ OPEN (process spawn — disarmed = never spawns) ════════════════
-    let r = run(host, "s_open_ff", "def macro(ctx):\n    return str(neuron.run('echo test'))\n", &dflt);
+    let r = run(host, "s_open_ff", "# neuron: raw\ndef macro(ctx):\n    return str(neuron.run('echo test'))\n", &dflt);
     assert!(no_op(&r), "fire-and-forget run disarmed never spawns: {r}");
     // Open_with_capture: disarmed run(wait=True) returns the [disarmed] marker (NOT a (code,stdout)
     // tuple — that only happens ARMED). Asserting the real, non-destructive disarmed contract.
-    let r = run(host, "s_open_cap", "def macro(ctx):\n    out = neuron.run('echo test', wait=True)\n    return repr(out)\n", &dflt);
+    let r = run(host, "s_open_cap", "# neuron: raw\ndef macro(ctx):\n    out = neuron.run('echo test', wait=True)\n    return repr(out)\n", &dflt);
     assert!(no_op(&r), "captured disarmed run yields the marker: {r}");
     // Open_capture_failing_command: still disarmed (armed process-capture is out of scope for a
     // strictly non-destructive suite — it would spawn a real subprocess).
-    let r = run(host, "s_open_fail", "def macro(ctx):\n    out = neuron.run('exit 1', wait=True)\n    return repr(out)\n", &dflt);
+    let r = run(host, "s_open_fail", "# neuron: raw\ndef macro(ctx):\n    out = neuron.run('exit 1', wait=True)\n    return repr(out)\n", &dflt);
     assert!(no_op(&r), "failing-cmd capture disarmed: {r}");
     eprintln!("[steps] OPEN ok");
 

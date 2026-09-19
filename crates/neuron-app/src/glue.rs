@@ -3878,7 +3878,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
     });
 
     // ── Macro authoring (Python: check syntax -> save+register -> test run) ──
-    // CHECK: ast.parse only (no execution) — the honest "dry-run" for full-power Python.
+    // CHECK: pure AST syntax + source-owned BOUND/RAW policy (no execution).
     bind(app, &shared, |app, _sh| {
         let w = app.as_weak();
         app.global::<State>().on_macro_check(move |src| {
@@ -3888,7 +3888,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                     return;
                 }
                 st.set_macro_busy(true);
-                st.set_macro_status("checking syntax…".into());
+                st.set_macro_status("checking macro…".into());
                 let source = src.to_string();
                 let back = app.as_weak();
                 let release_w = app.as_weak();
@@ -3914,16 +3914,16 @@ pub fn install(app: &AppWindow) -> SharedRt {
                                     st.set_macro_dryrun(ModelRc::new(VecModel::from(lines)));
                                     st.set_macro_status(
                                         if has_entry {
-                                            "syntax ok — has a macro(ctx) entry. Save to register, Test to run.".into()
+                                            "compiler ok — has a macro(ctx) entry. Save to register, Test to run.".into()
                                         } else {
-                                            "syntax ok — but no `def macro(ctx):` entry point yet".to_string()
+                                            "compiler ok — but no `def macro(ctx):` entry point yet".to_string()
                                         }
                                         .into(),
                                     );
                                 }
                                 Err(e) => {
                                     st.set_macro_dryrun(ModelRc::new(VecModel::<SharedString>::default()));
-                                    st.set_macro_status(format!("syntax error: {}", first_line(&e)).into());
+                                    st.set_macro_status(format!("check failed: {}", first_line(&e)).into());
                                 }
                             }
                         }

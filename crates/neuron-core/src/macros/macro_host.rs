@@ -468,6 +468,7 @@ impl MacroHost {
     pub fn register(&self, id: &str, source: &str) -> Result<(), String> {
         validate_macro_id(id)?;
         let mode = mode_from_source(source)?;
+        self.check(source)?;
         let _mutation = self
             .mutations
             .lock()
@@ -700,6 +701,11 @@ impl MacroHost {
     /// Syntax-check + list top-level defs WITHOUT executing (the honest "dry-run" — Python is
     /// full-power, so we never claim a behavioural trace). Returns the def names on success.
     pub fn check(&self, source: &str) -> Result<Vec<String>, String> {
+        let mode = mode_from_source(source)?;
+        let mode_name = match mode {
+            MacroMode::Bound => "bound",
+            MacroMode::Raw => "raw",
+        };
         let (rx, shared, rid, rid_send) = {
             let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             self.ensure_lane_locked(&mut g, MacroMode::Raw)?;
@@ -708,7 +714,9 @@ impl MacroHost {
             let (tx, rx) = channel();
             let shared = Arc::clone(&s.shared);
             shared.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(rid, tx);
-            let ok = s.send(&json!({"t": "check", "rid": rid, "source": source}));
+            let ok = s.send(&json!({
+                "t": "check", "rid": rid, "source": source, "mode": mode_name
+            }));
             (rx, shared, rid, ok)
         };
         if !rid_send {

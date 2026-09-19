@@ -45,6 +45,22 @@ fn bound_and_raw_are_distinct_authority_domains() {
     // Everything registered after this point is genuinely new source and absence of a pragma means BOUND.
     assert!(neuron::macros::macro_host::scan_macro_dir().is_empty());
 
+    // Check is a compiler-policy pass, not merely syntax. BOUND gets a precise RAW-required
+    // diagnostic before any candidate executes; the same code is valid when source opts RAW.
+    for (src, needle) in [
+        ("def macro(ctx):\n    neuron.run('echo nope')\n", "neuron.run requires RAW mode"),
+        ("def macro(ctx):\n    import os\n", "import 'os' requires RAW mode"),
+        ("def macro(ctx):\n    open('nope.txt', 'w')\n", "open requires RAW mode"),
+    ] {
+        let err = host.check(src).expect_err("BOUND authority violation must fail compiler check");
+        assert!(err.contains(needle), "policy diagnostic {err:?} did not contain {needle:?}");
+        assert!(err.contains("line 2:"), "policy diagnostic should name the source line: {err}");
+    }
+    assert!(
+        host.check("# neuron: raw\ndef macro(ctx):\n    neuron.run('echo allowed-when-armed')\n").is_ok(),
+        "the exact RAW directive must make the full-Python source compiler-valid"
+    );
+
     host.register(
         "bound_surface",
         r#"def macro(ctx):
