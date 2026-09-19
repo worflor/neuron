@@ -457,12 +457,15 @@ impl MacroHost {
         resolve_runtime().is_ok()
     }
 
-    /// Register (or replace) a macro and publish the new revision only after it is durable.
+    /// Register (or replace) a macro as one durable/live publication.
     ///
-    /// Python PREPARES the namespace first but does not expose it to fires. The source is then
-    /// atomically written to disk, then the prepared callable is committed. Only after the commit
-    /// acknowledgement does dispatch see the new manifest and generation. A failed final commit
-    /// restores the previous source and retires the uncertain sidecar session.
+    /// The sidecar PREPARES the candidate invisibly. Source then lands atomically on disk. Only
+    /// after the target runtime acknowledges COMMIT do the manifest, mode and generation become
+    /// visible to dispatch; a mode switch retires the old lane only after that publication.
+    ///
+    /// A lost final commit acknowledgement is treated as failure, not guessed success: retire the
+    /// candidate session and restore the prior durable source so the next use reconstructs the
+    /// last-known-good revision.
     pub fn register(&self, id: &str, source: &str) -> Result<(), String> {
         validate_macro_id(id)?;
         let mode = mode_from_source(source)?;
@@ -471,7 +474,6 @@ impl MacroHost {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let previous_source = load_macro(id);
-        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let old_mode = self
             .inner
             .lock()
@@ -479,6 +481,7 @@ impl MacroHost {
             .modes
             .get(id)
             .copied();
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let (token, opts, shared) = self.prepare_register(id, source, generation, mode)?;
 
         if let Err(e) = write_macro_file(id, source) {
@@ -511,15 +514,15 @@ impl MacroHost {
             g.manifest.insert(id.to_string(), source.to_string());
             g.modes.insert(id.to_string(), mode);
             g.generations.insert(id.to_string(), generation);
-            if let Some(old) = old_mode.filter(|old| *old != mode) {
-                if let Some(s) = lane_session_mut(&mut g, old) {
-                    let _ = s.send(&json!({"t": "unregister", "id": id}));
-                }
-            }
             if opts.is_array() {
                 g.options.insert(id.to_string(), opts.clone());
             } else {
                 g.options.remove(id);
+            }
+            if let Some(old) = old_mode.filter(|old| *old != mode) {
+                if let Some(s) = lane_session_mut(&mut g, old) {
+                    let _ = s.send(&json!({"t": "unregister", "id": id}));
+                }
             }
         }
 
