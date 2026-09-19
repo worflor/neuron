@@ -525,21 +525,21 @@ fn pyruntime_sidecar_stress_e2e() {
     // ── PHASE 7: BEACON delivery across a respawn — RetireDomain, then fresh asks work ──────────────
     {
         let rx = host.beacon_events();
-        host.register("pr_inflight", "def macro(ctx):\n    ask('hold', timeout=30)\n").expect("register pr_inflight");
+        host.register("pr_inflight", "# neuron: raw\ndef macro(ctx):\n    ask('hold', timeout=30)\n").expect("register RAW pr_inflight");
         assert!(host.fire_async("pr_inflight", &cx("i")).contains("dispatched"));
         let _ = recv_ask(&rx, Duration::from_secs(15)); // an ask is open when the rug is pulled
 
         let old = pid_via_invoke(host, "pr_pid").unwrap_or_else(current_pid);
         fire_crash(host, "pr_boom");
-        assert!(wait_retire_all(&rx, Duration::from_secs(15)), "a crash must void every open prompt with RetireDomain");
+        assert!(wait_retire_all(&rx, Duration::from_secs(15)), "a RAW crash must retire the RAW prompt domain");
         std::thread::sleep(Duration::from_millis(400));
         let new = wait_respawn(host, old, "pr_pid");
         assert_ne!(new, old, "respawn after the beacon crash");
 
         // the respawned sidecar takes a fresh ask and answers it.
         let rx = host.beacon_events();
-        host.register("pr_revive", "def macro(ctx):\n    return 'rv=%r' % ask('revive?', timeout=15)\n")
-            .expect("register pr_revive");
+        host.register("pr_revive", "# neuron: raw\ndef macro(ctx):\n    return 'rv=%r' % ask('revive?', timeout=15)\n")
+            .expect("register RAW pr_revive");
         let (tx, done) = std::sync::mpsc::channel();
         {
             let c = cx("rv");
