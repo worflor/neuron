@@ -58,6 +58,11 @@ neuron-crash.log
 # Local project notes and scratch files. Useful while building Neuron, but not
 # part of the public repository.
 /.local/
+# Licence drafts and correspondence kept beside the repo for convenience. Empty in a
+# clone; ignored so a future `git add -A` can never publish one by accident.
+/legal/
+# Agent harness state (worktrees, task locks). Machine-local, never source.
+/.claude/
 # Internal UX pentest write-up — working notes, not published docs.
 /docs/UX-PENTEST.md
 

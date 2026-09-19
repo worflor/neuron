@@ -1256,15 +1256,20 @@ fn split_blocks(xml: &str, tag: &str) -> Vec<String> {
 mod tests {
     use super::*;
 
-    // The real decoded Synapse exports live on the user's Desktop. These tests parse them
-    // directly and assert ground-truth values. They're gated on the files existing so the suite
-    // still passes on machines without them (CI), but run live on the dev box.
-    const SYNX: &str = r"C:\Users\<user>\Desktop\_synx"; // keyboard .synapse3 (extracted)
-    const MOUSE: &str = r"C:\Users\<user>\Desktop\_mouse"; // Naga .synapse3 (extracted)
-    const SYNXL: &str = r"C:\Users\<user>\Desktop\_synxL"; // .ChromaEffects (extracted)
+    // Ground-truth tests against real decoded Synapse exports. Those are somebody's personal
+    // config, so they are not in the repo: point NEURON_SYNAPSE_FIXTURES at a directory holding
+    // the three extracted exports and these run against them. Without it every one of them
+    // skips, so the suite passes anywhere, CI included.
+    const SYNX: &str = "_synx"; // keyboard .synapse3 (extracted)
+    const MOUSE: &str = "_mouse"; // Naga .synapse3 (extracted)
+    const SYNXL: &str = "_synxL"; // .ChromaEffects (extracted)
+
+    fn fixtures() -> Option<std::path::PathBuf> {
+        std::env::var_os("NEURON_SYNAPSE_FIXTURES").map(std::path::PathBuf::from)
+    }
 
     fn read(path: &str) -> Option<String> {
-        std::fs::read_to_string(path).ok()
+        std::fs::read_to_string(fixtures()?.join(path)).ok()
     }
 
     #[test]
@@ -1952,7 +1957,7 @@ mod tests {
             let mut zw = zip::ZipWriter::new(&mut cur);
             let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored);
-            let base = Path::new(root);
+            let base = &fixtures().expect("caller checks the fixtures exist first").join(root);
             for entry in walk(base) {
                 let rel = entry
                     .strip_prefix(base)
