@@ -1898,11 +1898,38 @@ fn press_mouse(button: MouseButtonKind) -> String {
 /// Narrow native effects exposed to the BOUND macro broker. These reuse the same SendInput gate and
 /// key/mouse primitives as ordinary Actions; Python no longer owns a parallel input implementation.
 pub(crate) fn macro_key(name: &str) -> String {
+    if !input_armed() {
+        return "[disarmed]".into();
+    }
     press_key(name)
 }
 
 pub(crate) fn macro_hotkey(keys: &[String]) -> String {
-    press_key(&keys.join("+"))
+    if !input_armed() {
+        return "[disarmed]".into();
+    }
+    let mut vks = Vec::with_capacity(keys.len());
+    for key in keys {
+        let Some(vk) = vk_for(key) else {
+            return format!("[unknown key {key:?}]");
+        };
+        vks.push(vk);
+    }
+    #[cfg(windows)]
+    unsafe {
+        for vk in &vks {
+            win_key::down(*vk);
+        }
+        for vk in vks.iter().rev() {
+            win_key::up(*vk);
+        }
+        return "ok".into();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = vks;
+        "[unsupported]".into()
+    }
 }
 
 pub(crate) fn macro_key_down(name: &str) -> String {
@@ -1977,13 +2004,23 @@ pub(crate) fn macro_type_ghost(text: &str, speed: &str) -> String {
     }
 }
 
+fn macro_mouse_button_kind(button: &str) -> Option<MouseButtonKind> {
+    match button.trim().to_lowercase().as_str() {
+        "left" => Some(MouseButtonKind::Left),
+        "right" => Some(MouseButtonKind::Right),
+        "middle" => Some(MouseButtonKind::Middle),
+        "back" | "x1" => Some(MouseButtonKind::Back),
+        "forward" | "x2" => Some(MouseButtonKind::Forward),
+        _ => None,
+    }
+}
+
 pub(crate) fn macro_click(button: &str) -> String {
-    let button = match button.trim().to_lowercase().as_str() {
-        "right" => MouseButtonKind::Right,
-        "middle" => MouseButtonKind::Middle,
-        "back" | "x1" => MouseButtonKind::Back,
-        "forward" | "x2" => MouseButtonKind::Forward,
-        _ => MouseButtonKind::Left,
+    if !input_armed() {
+        return "[disarmed]".into();
+    }
+    let Some(button) = macro_mouse_button_kind(button) else {
+        return format!("[unknown mouse button {button:?}]");
     };
     press_mouse(button)
 }
@@ -2382,6 +2419,15 @@ mod tests {
         );
         assert_eq!(vk_for("f24"), Some(0x87));
         assert_eq!(vk_for("not-a-key"), None);
+    }
+
+    #[test]
+    fn bound_mouse_button_parser_fails_closed() {
+        assert_eq!(macro_mouse_button_kind("left"), Some(MouseButtonKind::Left));
+        assert_eq!(macro_mouse_button_kind("x1"), Some(MouseButtonKind::Back));
+        assert_eq!(macro_mouse_button_kind("forward"), Some(MouseButtonKind::Forward));
+        assert_eq!(macro_mouse_button_kind("garbage"), None);
+        assert_eq!(macro_mouse_button_kind(""), None);
     }
 
     #[test]

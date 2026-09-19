@@ -1685,7 +1685,10 @@ fn run_act(_mode: MacroMode, _macro_id: &str, verb: &str, arg: &Value, mock: boo
             let dx = arg.get("dx").and_then(Value::as_i64);
             let dy = arg.get("dy").and_then(Value::as_i64);
             match (dx, dy) {
-                (Some(dx), Some(dy)) => Some(crate::action::macro_mouse_move(dx as i32, dy as i32)),
+                (Some(dx), Some(dy)) => Some(crate::action::macro_mouse_move(
+                    dx.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+                    dy.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+                )),
                 _ => None,
             }
         }
@@ -1693,7 +1696,10 @@ fn run_act(_mode: MacroMode, _macro_id: &str, verb: &str, arg: &Value, mock: boo
             let x = arg.get("x").and_then(Value::as_i64);
             let y = arg.get("y").and_then(Value::as_i64);
             match (x, y) {
-                (Some(x), Some(y)) => Some(crate::action::macro_mouse_to(x as i32, y as i32)),
+                (Some(x), Some(y)) => Some(crate::action::macro_mouse_to(
+                    x.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+                    y.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+                )),
                 _ => None,
             }
         }
