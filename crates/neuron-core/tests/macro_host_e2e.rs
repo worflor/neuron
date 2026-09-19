@@ -99,6 +99,51 @@ fn macro_host_warm_persists_and_isolates_errors() {
         "a raising macro must NOT respawn the sidecar"
     );
 
+    // A failed REPLACEMENT is different from a macro that raises when fired: module top-level
+    // execution happens during register. The old callable + file are the last-known-good revision
+    // and must survive a broken edit.
+    let stable_src = "def macro(ctx):\n    return 'stable-old'\n";
+    host.register("e2e_stable", stable_src).expect("register stable baseline");
+    let bad = host.register(
+        "e2e_stable",
+        "raise RuntimeError('broken candidate')\ndef macro(ctx):\n    return 'never'\n",
+    );
+    assert!(bad.is_err(), "broken replacement must be rejected");
+    let stable_after = host.invoke("e2e_stable", &ctx);
+    assert!(
+        stable_after.contains("stable-old"),
+        "failed replacement destroyed the live last-known-good macro: {stable_after}"
+    );
+    assert_eq!(
+        neuron::macros::macro_host::load_macro("e2e_stable").as_deref(),
+        Some(stable_src),
+        "failed replacement must not overwrite the durable source"
+    );
+
+    // Source execution is the editor/--file path: it runs real Python but is never registered or
+    // persisted as a side effect of testing it.
+    let candidate = host.invoke_source(
+        "e2e_candidate",
+        "def macro(ctx):\n    return 'candidate-only'\n",
+        &ctx,
+    );
+    assert!(candidate.contains("candidate-only"), "source candidate did not run: {candidate}");
+    assert!(
+        neuron::macros::macro_host::load_macro("e2e_candidate").is_none(),
+        "source test unexpectedly created macros/scripts/e2e_candidate.py"
+    );
+
+    // Delete is runtime truth immediately, not a hint for the next process restart.
+    host.register("e2e_delete", "def macro(ctx):\n    return 'present'\n")
+        .expect("register delete target");
+    neuron::macros::macro_host::delete_macro("e2e_delete").expect("delete target");
+    let deleted = host.invoke("e2e_delete", &ctx);
+    assert!(
+        deleted.contains("not registered"),
+        "deleted macro remained callable in the warm sidecar: {deleted}"
+    );
+
+    host.unregister("e2e_stable");
     host.unregister("e2e_ok");
     host.unregister("e2e_boom");
     std::env::set_current_dir(prev).ok();
