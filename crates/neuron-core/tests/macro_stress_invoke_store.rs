@@ -349,8 +349,9 @@ fn invoke_store_stress_e2e() {
 
     // ── store_concurrent_access_multiple_macros ────────────────────────────────────────────────
     // Four DIFFERENT macros fire concurrently (distinct serial workers), each writing 50 keys into
-    // its OWN namespace. The global store lock serializes I/O so no file tears; each file ends with
-    // exactly its own 50 keys (no cross-macro leakage, no lost writes).
+    // its OWN namespace. Each namespace has its own store lock: writes within one file stay atomic
+    // while unrelated macros can make progress in parallel. Every file must end with exactly its own
+    // 50 keys (no cross-macro leakage, no lost writes).
     for tag in ["P", "Q", "R", "S"] {
         let id = format!("store_conc_{}", tag.to_lowercase());
         let src = format!(
@@ -362,15 +363,9 @@ fn invoke_store_stress_e2e() {
     for tag in ["p", "q", "r", "s"] {
         assert!(host.fire_async(&format!("store_conc_{tag}"), &ctx).contains("dispatched"));
     }
-    // The four macros share ONE process-global store lock (`_state_lock` in neuron.py) that spans
-    // each store()'s whole load->mutate->atomic-replace, by design (see store_atomic_write_safety
-    // above) — so 4 macros * 50 writes = 200 serialized disk round-trips contending for one lock.
-    // Under real load (a loaded CI box, a concurrent workspace build) that serialization can take
-    // seconds, not milliseconds. The old wait here keyed off ONE macro's completion line (whichever
-    // happened to finish first) plus a fixed 300ms grace — the other three could still be mid-loop
-    // at that point, so the read below would observe a genuinely-incomplete-but-still-in-flight file
-    // and misreport it as a lost write. Wait for ALL FOUR completion lines instead — that is the
-    // actual finish signal — with a deadline generous enough to survive real contention.
+    // Completion is still explicit rather than sleep-based: filesystem/AV latency is external and
+    // variable even though the four macro namespaces no longer serialize each other in-process.
+    // Wait for all four completion lines before inspecting final files.
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut acc = Vec::new();
     let needles = ["P conc done 50", "Q conc done 50", "R conc done 50", "S conc done 50"];

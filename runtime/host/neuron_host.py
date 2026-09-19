@@ -530,6 +530,13 @@ _FIRE_STOP = object()
 # capped, and a full queue DROPS THE NEWEST fire (with a log line) rather than blocking the protocol
 # loop — a blocked loop would deafen the whole sidecar.
 _FIRE_QUEUE_MAX = 256
+# Per-id caps are not a process cap: many distinct ids could each create a worker + 256-item queue.
+# Bound BOTH dimensions globally so a generated macro storm cannot turn variety into unbounded threads
+# or memory. Slots are acquired before enqueue/worker creation and released on finish/refusal/retire.
+_FIRE_TOTAL_MAX = 1024
+_FIRE_WORKER_MAX = 128
+_fire_slots = threading.BoundedSemaphore(_FIRE_TOTAL_MAX)
+_fire_worker_slots = threading.BoundedSemaphore(_FIRE_WORKER_MAX)
 # Editor/CLI source tests run outside the registry so they can never persist or replace a live macro.
 # Bound their concurrency: a candidate can deliberately loop forever, but it can consume at most this
 # many daemon workers before further tests are refused instead of growing threads without limit.
@@ -570,19 +577,25 @@ def _fire(mid, generation, ctx, opts, mock=False):
 
 def _fire_worker(mid, q):
     """One macro's serial fire loop: in-order execution, results framed back as they finish."""
-    while True:
-        msg = q.get()
-        if msg is _FIRE_STOP:
-            return
-        ok, val, log = _fire(
-            mid,
-            msg.get("generation"),
-            msg.get("ctx") or {},
-            msg.get("options") or {},
-            bool(msg.get("mock")),
-        )
-        _send({"t": "result", "rid": msg.get("rid"), "ok": ok,
-               "value": val, "error": (None if ok else log), "log": (log if ok else None)})
+    try:
+        while True:
+            msg = q.get()
+            if msg is _FIRE_STOP:
+                return
+            try:
+                ok, val, log = _fire(
+                    mid,
+                    msg.get("generation"),
+                    msg.get("ctx") or {},
+                    msg.get("options") or {},
+                    bool(msg.get("mock")),
+                )
+                _send({"t": "result", "rid": msg.get("rid"), "ok": ok,
+                       "value": val, "error": (None if ok else log), "log": (log if ok else None)})
+            finally:
+                _fire_slots.release()
+    finally:
+        _fire_worker_slots.release()
 
 
 def _dispatch_fire(msg):
@@ -593,16 +606,32 @@ def _dispatch_fire(msg):
         return
     if msg.get("generation") is None:
         msg["generation"] = _gens.get(mid, 0)
+    if not _fire_slots.acquire(blocking=False):
+        _send({"t": "result", "rid": msg.get("rid"), "ok": False, "value": None,
+               "error": "macro fire budget full (%d total)" % _FIRE_TOTAL_MAX, "log": None})
+        return
     with _fire_lock:
         q = _fire_queues.get(mid)
         if q is None:
+            if not _fire_worker_slots.acquire(blocking=False):
+                _fire_slots.release()
+                _send({"t": "result", "rid": msg.get("rid"), "ok": False, "value": None,
+                       "error": "macro worker budget full (%d ids)" % _FIRE_WORKER_MAX, "log": None})
+                return
             q = queue.Queue(maxsize=_FIRE_QUEUE_MAX)
             _fire_queues[mid] = q
-            threading.Thread(target=_fire_worker, args=(mid, q),
-                             name="fire-%s" % mid, daemon=True).start()
+            try:
+                threading.Thread(target=_fire_worker, args=(mid, q),
+                                 name="fire-%s" % mid, daemon=True).start()
+            except BaseException:
+                _fire_queues.pop(mid, None)
+                _fire_worker_slots.release()
+                _fire_slots.release()
+                raise
     try:
         q.put_nowait(msg)
     except queue.Full:
+        _fire_slots.release()
         sys.stderr.write("[neuron] macro '%s' fire queue full (%d) — dropped a fire\n"
                          % (mid, _FIRE_QUEUE_MAX))
 
@@ -615,9 +644,11 @@ def _retire_fire_worker(mid):
             return
         while True:
             try:
-                q.get_nowait()
+                item = q.get_nowait()
             except queue.Empty:
                 break
+            if item is not _FIRE_STOP:
+                _fire_slots.release()
         q.put_nowait(_FIRE_STOP)
 
 
@@ -724,6 +755,7 @@ def main():
                 if item[0] == mid:
                     _staged.pop(token, None)
             _retire_fire_worker(mid)
+            _nh._retire_state_lock(mid)
         elif t == "ping":
             _send({"t": "pong", "rid": msg.get("rid")})
         elif t == "shutdown":

@@ -312,13 +312,14 @@ def invoke(name, wait=True, **opts):
 
 # ── persistent state: a tiny per-macro key/value store that survives across fires AND restarts ──
 # JSON on disk, one file per macro id (a stable per-user dir; override with NEURON_MACRO_STATE).
-# Writes are atomic (temp + os.replace) so a crash mid-write can't corrupt the store. A single lock
-# serializes all store I/O — it's cold, never a hot path.
+# Writes are atomic (temp + os.replace) so a crash mid-write can't corrupt the store. Each macro
+# owns its own lock: load→mutate→replace stays serialized within ONE namespace while unrelated
+# macros can persist concurrently instead of head-of-line blocking behind somebody else's AV retry.
 #
 # UNDER LOAD: Windows Defender / Search Indexer / backup agents routinely grab a *transient* handle
 # on a file the instant it's created or renamed — open()/os.replace() then raises PermissionError
 # ("Access is denied", WinError 5) or OSError 32 (sharing violation) for a few milliseconds, even
-# though nothing in-process is contending (the module-level lock already rules that out). This has
+# though nothing in-process is contending (the per-macro lock already rules that out). This has
 # nothing to do with our own concurrency: it's an external, self-clearing lock on the file. The fix
 # is a short bounded retry around the actual filesystem calls — NOT a broader lock, since the
 # contender isn't another thread of ours. A real (non-transient) I/O error still surfaces after the
@@ -326,7 +327,25 @@ def invoke(name, wait=True, **opts):
 import json as _json  # noqa: E402
 import time as _time  # noqa: E402
 
-_state_lock = threading.Lock()
+_state_locks = {}
+_state_locks_guard = threading.Lock()
+
+
+def _state_lock_for(mid):
+    key = str(mid)
+    with _state_locks_guard:
+        lock = _state_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _state_locks[key] = lock
+        return lock
+
+
+def _retire_state_lock(mid):
+    """Forget an unregistered macro's lock object. Any in-flight holder keeps its own reference."""
+    with _state_locks_guard:
+        _state_locks.pop(str(mid), None)
+
 
 # Windows AV/indexer handle-steals clear in low single-digit milliseconds; 40 tries * 25ms = up to 1s
 # of retrying before we give up, which is generous for a "cold, never a hot path" store.
@@ -405,7 +424,7 @@ def store(key, value):
     Per-macro namespace, atomic write. Returns True on success. (Big/looping values? keep it small —
     this is settings + counters + memory, not a database.)"""
     mid = getattr(_tls, "mid", "?")
-    with _state_lock:
+    with _state_lock_for(mid):
         d = _state_read(mid)
         d[str(key)] = value
         return _state_write(mid, d)
@@ -414,14 +433,14 @@ def store(key, value):
 def load(key, default=None):
     """Read a value saved by store() for THIS macro (or `default` if unset). Never raises."""
     mid = getattr(_tls, "mid", "?")
-    with _state_lock:
+    with _state_lock_for(mid):
         return _state_read(mid).get(str(key), default)
 
 
 def forget(key=None):
     """Delete one stored key, or (key=None) wipe THIS macro's whole store. Returns True on success."""
     mid = getattr(_tls, "mid", "?")
-    with _state_lock:
+    with _state_lock_for(mid):
         if key is None:
             try:
                 os.remove(_state_path(mid))
@@ -438,7 +457,7 @@ def forget(key=None):
 def stored():
     """The whole stored dict for THIS macro (a copy)."""
     mid = getattr(_tls, "mid", "?")
-    with _state_lock:
+    with _state_lock_for(mid):
         return dict(_state_read(mid))
 
 
