@@ -1,13 +1,24 @@
 # Install, update, roll back, uninstall
 
-Everything here goes through one script: `scripts/neuron-update.ps1`, in this skill's folder.
-It works in the Windows PowerShell that comes with Windows. Nothing extra needs installing.
+Everything here goes through one script, one per platform, in this skill's `scripts/` folder:
 
-**Windows only.** The script installs the Windows release zip and manages the Windows app. On
-Linux, neuron ships a CLI tarball instead and there is no updater script yet — do it by hand,
-see [Linux, by hand](#linux-by-hand) at the bottom. Do not point the script at a Linux box.
+| platform | script | runs in |
+|---|---|---|
+| Windows | `neuron-update.ps1` | the Windows PowerShell that comes with Windows |
+| Linux | `neuron-update.sh` | bash, with `curl` and `tar` |
+
+Nothing extra needs installing. **Pick by the machine the user is on, and never point one at the
+other platform.** Both speak the same output protocol and the same `RESULT:` codes, so every
+table below applies to either — only the command line differs.
+
+The Windows release is the app plus the CLI, so updating it closes and reopens neuron. The Linux
+release is the CLI alone: nothing is resident, so there is no process to stop, and one extra
+first-install step (a udev rule) that Windows does not have. Both keep the user's config beside
+the binary and never touch it.
 
 ## How to run the script
+
+On Windows:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File "<path to skill>\scripts\neuron-update.ps1" -Action check
@@ -15,6 +26,17 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "<path to skill>\scripts\neu
 
 `-ExecutionPolicy Bypass` applies to that single command only. It doesn't change any system
 setting.
+
+On Linux:
+
+```bash
+bash "<path to skill>/scripts/neuron-update.sh" --action check
+```
+
+The flags map one to one: `-Action` is `--action`, `-InstallDir` is `--install-dir`, `-Version`
+is `--version`, `-AllowDowngrade` is `--allow-downgrade`. The one that differs by name is the
+local-file mode, because the platforms ship different archives: `-ZipPath` on Windows,
+`--archive` on Linux. Never run either script with `sudo`.
 
 Read the output as lines:
 
@@ -49,8 +71,16 @@ Read the output as lines:
 
 ## Install (first time)
 
+Both platforms install the same way: into a per-user directory the user can write to without
+becoming root. neuron then keeps its config in that same directory, beside the binary, which is
+what makes the install portable — the whole folder can be moved or copied and the setup goes
+with it. Installing somewhere the user cannot write splits config into a second location, so
+don't.
+
+### Windows
+
 1. Recommend this folder: `%LOCALAPPDATA%\Programs\neuron`. It's per-user and writable, and needs
-   no admin rights. neuron keeps its config next to the exes there.
+   no admin rights.
 2. Don't install under `C:\Program Files`. The user can't write there without admin, and config
    would end up split across two folders.
 3. Confirm with the user, then run:
@@ -65,19 +95,47 @@ Read the output as lines:
    `neuron-app.exe` as administrator one time (right-click → Run as administrator), then turns on
    "start with windows" on the SYSTEM page. Explain that; don't do it for them.
 
+### Linux
+
+1. The default is `~/.local/share/neuron` (`$XDG_DATA_HOME/neuron` when that is set). It needs no
+   root and needs no flag — leave `--install-dir` off unless the user wants it elsewhere.
+2. Confirm with the user, then run:
+
+   ```bash
+   bash "<path to skill>/scripts/neuron-update.sh" --action apply
+   ```
+
+3. `RESULT: installed` means the files are in place. The script then tells you two things worth
+   passing on: `config_dir`, which is where their profiles and binds will live, and a
+   `NOT_ON_PATH` flag if they'd have to type the full path to run it.
+4. **`FLAG: NO_UDEV_RULE` is the one that matters.** Without the rule, `/dev/hidraw*` stays
+   root-only and `neuron list` finds nothing even though everything installed correctly. The
+   archive ships `70-neuron.rules` and `SOURCE.txt` has the exact two commands. It is one `sudo`,
+   it is a system-wide change, and it is the user's to make — show them the commands, explain what
+   they do, and let them run them. The device has to be replugged afterwards.
+5. There is no autostart step and no tray: the Linux build is the CLI, so nothing runs in the
+   background until the user runs `neuron run`.
+
 ## Roll back
 
-If an update went wrong, confirm with the user, then run `-Action rollback`. It restores the files
-from the most recent backup in `.neuron-update-backup` inside the install folder.
+If an update went wrong, confirm with the user, then run `-Action rollback` (`--action rollback`
+on Linux). It restores the files from the most recent backup in `.neuron-update-backup` inside the
+install folder. Only files a release ships were backed up and only those come back, so the user's
+config is not affected either way.
 
 ## Admin rights
 
-`needs-admin` means one of two things, and a `FLAG` line says which:
+Windows reports `needs-admin`, Linux reports `needs-root`. Either way a `FLAG` line says which
+problem it is, and the answer is never to rerun the script elevated:
 
-- `CANNOT_STOP`: neuron is running elevated. Ask the user to right-click the tray icon, quit neuron,
-  then run the update again.
-- `NOT_WRITABLE`: the install folder needs admin rights. Suggest reinstalling to
-  `%LOCALAPPDATA%\Programs\neuron` instead of running as administrator.
+- `CANNOT_STOP` (Windows): neuron is running elevated. Ask the user to right-click the tray icon,
+  quit neuron, then run the update again.
+- `NOT_WRITABLE`: the install folder needs privileges the user doesn't have. Suggest reinstalling
+  to a per-user folder instead — `%LOCALAPPDATA%\Programs\neuron` on Windows,
+  `~/.local/share/neuron` on Linux.
+
+The udev rule is the one thing that genuinely needs `sudo`, and the user runs it themselves. It is
+a separate, system-wide step, not part of installing.
 
 ## Source builds
 
@@ -101,6 +159,12 @@ Confirm each step with the user first. Don't delete anything they haven't agreed
    folder. Ask whether they want to keep a copy of the `profiles` folder and `*.toml` files first.
 4. If `%LOCALAPPDATA%\neuron` exists, it holds config as well. Ask before deleting it.
 
+On Linux there is no tray and no autostart, so steps 1 and 2 don't apply. Delete the install
+folder (`~/.local/share/neuron` by default), with the same warning about config living in it, and
+check `~/.local/share/neuron` separately if they installed somewhere else. Two leftovers to ask
+about: any symlink they made into `~/.local/bin`, and `/etc/udev/rules.d/70-neuron.rules`, which
+needs `sudo rm` and which they may want to keep if they use other Razer tooling.
+
 ## Flags
 
 | FLAG | meaning | what to tell the user or do |
@@ -120,36 +184,52 @@ Confirm each step with the user first. Don't delete anything they haven't agreed
 | `CLI_VERSION_MISMATCH` | `neuron.exe` reports a different version than the release | report it; it may be a packaging mistake |
 | `OLD_BACKUPS` | more than three update backups kept | offer to delete the older ones |
 | `NO_RELEASE_INFO` | GitHub couldn't be reached | check internet; the repo may not be public yet |
-| `ASSETS_MISSING` / `BAD_ZIP` | the release is incomplete | report it on the issues page |
+| `ASSETS_MISSING` / `BAD_ZIP` / `BAD_ARCHIVE` | the release is incomplete | report it on the issues page |
 | `COPY_FAILED` / `VERIFY_FAILED` | install went wrong partway; the backup was restored | show the lines |
 | `NO_BACKUP` | nothing to roll back to | tell the user |
+| `NO_UDEV_RULE` (Linux) | `/dev/hidraw*` is still root-only | install finished fine, but `neuron list` will find nothing until the user runs the two `sudo` commands from `SOURCE.txt` and replugs the device |
+| `NOT_ON_PATH` (Linux) | the install folder isn't on `PATH` | they'd have to type the full path; offer the symlink line the flag prints |
+| `MISSING_TOOL` (Linux, STOP) | `curl` or `tar` isn't installed | tell them which one; their package manager has it |
+| `DOWNLOAD_FAILED` (Linux) | an asset couldn't be fetched | check internet, then retry |
+| `ARCHIVE_MISSING` (Linux) | `--archive` points at nothing | check the path |
 
 ## Offline or specific versions
 
-- `-Version v0.1.0` installs that tag instead of the latest.
-- `-ZipPath <zip>` installs a release zip the user already downloaded. `SHA256SUMS.txt` must sit next
-  to it, or be passed with `-SumsPath`.
-- `-NoRelaunch` leaves neuron closed afterwards.
+- `-Version v0.1.0` / `--version v0.1.0` installs that tag instead of the latest.
+- `-ZipPath <zip>` (Windows) or `--archive <tar.gz>` (Linux) installs an archive the user already
+  downloaded. `SHA256SUMS.txt` must sit next to it, or be passed with `-SumsPath` / `--sums`.
+- `-NoRelaunch` (Windows) leaves neuron closed afterwards. Linux has nothing to relaunch.
 
-## Linux, by hand
+## Linux: no device found
 
-The Linux asset is `neuron-<version>-linux-x86_64.tar.gz` and it holds the CLI only — there is no
-tray, no GUI, and nothing running in the background, so an update is just replacing one file.
-There is no script for this yet; walk the user through it instead of improvising one.
+This is the common one, and it is almost never a neuron bug. Work through it in order:
 
-1. Find the newest release and its two assets on
-   `https://github.com/worflor/neuron/releases`, or with `gh release download` if they have `gh`.
-2. Verify before extracting — `sha256sum -c SHA256SUMS.txt --ignore-missing` in the download
-   folder. If it doesn't say `OK`, stop and tell the user; do not install it.
-3. Extract with `tar -xzf neuron-<version>-linux-x86_64.tar.gz`, then move `neuron` wherever they
-   keep binaries (`~/.local/bin` needs no root).
-4. **First install only:** the udev rule, or every command needs `sudo`. The exact two commands
-   are in the archive's `SOURCE.txt`; they copy `70-neuron.rules` into `/etc/udev/rules.d/` and
-   reload udev. The device must be replugged afterwards.
-5. Confirm with `neuron --version`, then `neuron list`.
+1. Is the udev rule installed? `ls /etc/udev/rules.d/70-neuron.rules`. If it isn't, that's the
+   answer — the two commands are in the archive's `SOURCE.txt`, the user runs them, then replugs.
+2. Was the device replugged after the rule went in? The rule applies when the device next appears,
+   not retroactively.
+3. Does `sudo neuron list` find it when a plain `neuron list` doesn't? Then it is permissions, so
+   it is the rule, not neuron. Say that plainly rather than suggesting they keep using `sudo`.
+4. No systemd-logind (some minimal or non-systemd distros)? `uaccess` does nothing there. The rule
+   file has a commented-out `plugdev` group line for exactly that case; the user swaps which line
+   is active and adds themselves to the group.
 
-If `neuron list` says no device but one is plugged in, the udev rule is the first suspect: have
-them run it once with `sudo`. If `sudo neuron list` finds the device and a plain one doesn't,
-that is the rule, not neuron. Say so plainly — and note that Linux device support has not been
-verified against real hardware by anyone yet, so a genuine bug there is worth an issue
-([issues.md](issues.md)).
+If all four check out and the device still isn't found, that is worth an issue — and a genuinely
+useful one, because **no Razer device has been plugged into a Linux box running neuron by anyone
+yet**. Say so honestly; the user is not doing something wrong, they are first. See
+[issues.md](issues.md).
+
+## Doing it by hand
+
+The script is the supported path, but nothing it does is magic, and a user who wants to see each
+step can do this instead. Do not improvise a different order — this is the same sequence.
+
+```bash
+sha256sum -c SHA256SUMS.txt --ignore-missing   # must say OK, or stop
+tar -xzf neuron-<version>-linux-x86_64.tar.gz
+mv neuron-<version>-linux-x86_64 ~/.local/share/neuron
+~/.local/share/neuron/neuron --version
+```
+
+Then the udev rule once, from `SOURCE.txt`, and a replug. The only thing lost by doing it this way
+is the backup the script would have taken, so there is nothing to roll back to afterwards.

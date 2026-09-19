@@ -113,6 +113,23 @@ Write-Host "neuron validate - mode: $Mode" -ForegroundColor White
 if ($Mode -eq 'lint') {
     Invoke-Advisory 'rustfmt' { cargo fmt --all --check }
 
+    # The other half of the shipped updater. Same reasoning as the PowerShell gate below, and the
+    # linux CI lane always has bash; a windows contributor without it gets an advisory, not a
+    # failure, because git-for-windows ships one but nothing guarantees it is on PATH.
+    $shGate = {
+        $bad = 0
+        foreach ($f in (git ls-files '*.sh')) {
+            bash -n $f
+            if ($LASTEXITCODE -ne 0) { $bad++ }
+        }
+        $global:LASTEXITCODE = [int]($bad -gt 0)
+    }
+    if (Get-Command bash -ErrorAction SilentlyContinue) {
+        Invoke-Gate 'parse shell scripts' $shGate
+    } else {
+        Write-Host "skipped: parse shell scripts (no bash on PATH)" -ForegroundColor DarkGray
+    }
+
     # Shipped scripts (the skill's updater) run on end users' machines; a syntax error there
     # is a broken install that no cargo gate would catch.
     Invoke-Gate 'parse PowerShell scripts' {

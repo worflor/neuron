@@ -11,7 +11,7 @@ one small binary. no account, no cloud, no telemetry. no "please update razer ce
 | **what** | one tray-resident binary (CLI + GUI) built to replace razer synapse |
 | **platform** | windows (app + CLI). linux ships the CLI — builds, tested, but not yet run against a real device by anyone; no mac |
 | **hardware** | razer mice + keyboards over raw HID; daily-driven (and hardware-verified) on a Naga V2 Pro + BlackWidow Chroma V2; any other `razer_report` device should adopt itself via auto-synthesis |
-| **install** | build from source: `cargo build --release` |
+| **install** | unpack a release archive anywhere writable (portable — config lives beside the binary), or build from source: `cargo build --release` |
 | **footprint** | no driver, no account, no runtime, no cloud; your config is plain TOML |
 | **license** | most of Neuron is GPL-3.0-or-later with a linking exception; Engram and the eigenmotion research modules have separate Woflo Labs community-source terms. [the exact split](LICENSE.md) |
 
@@ -92,13 +92,15 @@ a thing that remaps your buttons and runs python on a keypress is, by definition
 
 ### with an agent
 
-if you'd rather not do any of this by hand, point your AI agent at [`skills/neuron-lazy-update`](skills/neuron-lazy-update/SKILL.md). it's in the repo, and in every release zip.
+if you'd rather not do any of this by hand, point your AI agent at [`skills/neuron-lazy-update`](skills/neuron-lazy-update/SKILL.md). it's in the repo, and in every release archive.
 
 it can install or update neuron, roll back a bad update, run CLI commands for you, and answer questions from the docs. when something doesn't work, it looks into it first, and offers to draft a proper issue only if it turns out to be a real, unreported bug. it checks every download before installing and never touches your config. it's written to be followed step by step, so it doesn't need a frontier model.
 
+the script under it does the risky parts and reports plain status lines, one per platform — `neuron-update.ps1` for windows, `neuron-update.sh` for linux. you can run either yourself without an agent anywhere in the loop; `--action check` (or `-Action check`) only reads.
+
 ### build
 
-tagged releases publish a windows zip: both binaries, the license bundle, and a `SOURCE.txt` naming the exact commit it was built from. if the releases page is empty, none has been cut yet — build from source below, which is the same thing by hand.
+tagged releases publish a windows zip (both binaries) and a linux tarball (the CLI), each with the license bundle, the agent skill, and a `SOURCE.txt` naming the exact commit it was built from. if the releases page is empty, none has been cut yet — build from source below, which is the same thing by hand.
 
 the zip is **not code-signed**, and that's a decision rather than an oversight. a certificate that would satisfy SmartScreen costs a few hundred a year *and still* doesn't clear the warning until a build accrues download reputation, so it buys a dialog change, not trust. instead every release carries a **build provenance attestation** — proof, signed by github, that the zip came from a specific commit and workflow run:
 
@@ -115,13 +117,15 @@ cargo build --release      # -> target/release/neuron.exe (CLI) + neuron-app.exe
 
 ### where your config lives
 
-both binaries resolve every runtime path against one **run root**, so the tray app (autostarted from `System32`) and a CLI you type from anywhere read the same config. it is never the working directory. the run root is:
+both binaries resolve every runtime path against one **run root**, so the tray app (autostarted from `System32`) and a CLI you type from anywhere read the same config. it is never the working directory. the same three rules decide it on both platforms:
 
-- **`%LOCALAPPDATA%\neuron`** when you build from source — because the exe sits in `target\release`, and config kept *there* is one `cargo clean` from gone, with the `backups/` folder going down with it. it moves out of the build tree so the build tree stays disposable.
-- **the exe's own folder**, for a normal install in a writable location — the portable layout: copy the folder, keep your setup.
+- **the binary's own folder**, for a normal install somewhere writable — the portable layout: copy the folder, keep your setup. this is what a release archive gives you, unpacked anywhere you like, on either platform.
+- **the per-user data dir** when the binary's folder isn't a home we may write to — `%LOCALAPPDATA%\neuron` on windows, `$XDG_DATA_HOME/neuron` (usually `~/.local/share/neuron`) on linux. that's what you get building from source, because the binary sits in `target/`, and config kept *there* is one `cargo clean` from gone, with the `backups/` folder going down with it. it moves out of the build tree so the build tree stays disposable.
 - **`NEURON_RUN_DIR`** whenever you set it, which wins over both. pin it if you want your config somewhere specific.
 
-upgrading from a build that kept config in `target\release`? the first launch carries it forward and prints where it went. it copies rather than moves, so the old folder stays put as a backup until you clean it.
+a symlink on your `PATH` doesn't change any of this: the binary resolves its real location, so config stays in the install folder and `~/.local/bin/neuron` is safe.
+
+upgrading from a build that kept config in `target/release`? the first launch carries it forward and prints where it went. it copies rather than moves, so the old folder stays put as a backup until you clean it.
 
 the normal `--release` build is tuned for snappy runtime (ThinLTO, stripped). use `--profile release-size` if you want it small, `--profile release-fast` if you want it quick, and `RUSTFLAGS="-C target-cpu=native"` outside the repo for native codegen. we keep cargo's default `unwind` (not `abort`), deliberately (see the comment in `Cargo.toml`): cleanup still runs when something panics, so the app never leaves your gear in a state you didn't ask for. every panic gets logged.
 
