@@ -242,7 +242,7 @@ fn recv_ask(rx: &Receiver<BeaconEvent>, dur: Duration) -> (u64, String) {
     }
 }
 
-/// Wait for `RetireAll` within `dur`.
+/// Wait for `RetireDomain` within `dur`.
 fn wait_retire_all(rx: &Receiver<BeaconEvent>, dur: Duration) -> bool {
     let deadline = Instant::now() + dur;
     loop {
@@ -251,7 +251,7 @@ fn wait_retire_all(rx: &Receiver<BeaconEvent>, dur: Duration) -> bool {
             return false;
         }
         match rx.recv_timeout(left) {
-            Ok(BeaconEvent::RetireAll) => return true,
+            Ok(BeaconEvent::RetireDomain { mode: neuron::macros::MacroMode::Raw }) => return true,
             Ok(_) => continue,
             Err(_) => return false,
         }
@@ -522,7 +522,7 @@ fn pyruntime_sidecar_stress_e2e() {
         host.unregister("pr_mockkey");
     }
 
-    // ── PHASE 7: BEACON delivery across a respawn — RetireAll, then fresh asks work ──────────────
+    // ── PHASE 7: BEACON delivery across a respawn — RetireDomain, then fresh asks work ──────────────
     {
         let rx = host.beacon_events();
         host.register("pr_inflight", "def macro(ctx):\n    ask('hold', timeout=30)\n").expect("register pr_inflight");
@@ -531,7 +531,7 @@ fn pyruntime_sidecar_stress_e2e() {
 
         let old = pid_via_invoke(host, "pr_pid").unwrap_or_else(current_pid);
         fire_crash(host, "pr_boom");
-        assert!(wait_retire_all(&rx, Duration::from_secs(15)), "a crash must void every open prompt with RetireAll");
+        assert!(wait_retire_all(&rx, Duration::from_secs(15)), "a crash must void every open prompt with RetireDomain");
         std::thread::sleep(Duration::from_millis(400));
         let new = wait_respawn(host, old, "pr_pid");
         assert_ne!(new, old, "respawn after the beacon crash");

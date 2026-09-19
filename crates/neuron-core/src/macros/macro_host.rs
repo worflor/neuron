@@ -88,8 +88,8 @@ pub enum BeaconEvent {
     },
     /// A prompt resolved without the UI (sidecar-side timeout) — withdraw it from display.
     Retire { pid: u64 },
-    /// Every open prompt is void (the sidecar died/respawned) — clear the queue.
-    RetireAll,
+    /// Every prompt owned by one execution domain is void (that sidecar died/respawned).
+    RetireDomain { mode: MacroMode },
     /// A macro's fire-and-forget status line (`neuron.notify("…")`) — show it, don't block.
     Notify { macro_id: String, text: String },
 }
@@ -2038,8 +2038,8 @@ fn reader_loop(
             _ => {}
         }
     }
-    // every open prompt died with this sidecar — clear any UI queue before reporting the death.
-    beacon_deliver(&beacon, BeaconEvent::RetireAll);
+    // Only prompts owned by THIS sidecar died. The other execution domain may still be healthy.
+    beacon_deliver(&beacon, BeaconEvent::RetireDomain { mode });
     shared.mark_dead();
 }
 

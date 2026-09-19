@@ -16,7 +16,7 @@
 //!     never blocks another (the fire-storm phase saturates THREE at once).
 //!   * IN-ORDER PER MACRO — one macro's queued fires execute strictly in enqueue order.
 //!   * CRASH DROPS THE QUEUE (no zombie re-run) — a sidecar crash with a full queue drops every
-//!     in-flight fire (they are NOT re-run on respawn) and surfaces RetireAll.
+//!     in-flight fire (they are NOT re-run on respawn) and surfaces RetireDomain.
 //!   * FIRE_BUDGET timeout under pressure — a blocking `invoke` behind a busy queue times out at the
 //!     budget (not earlier, not hung) and its fire is not stranded (it lands in the log when it runs).
 //!   * PER-THREAD STDOUT ISOLATION — concurrent fires each capture their own stdout (`_ThreadStdout`),
@@ -92,7 +92,7 @@ fn recv_ask(rx: &Receiver<BeaconEvent>, dur: Duration) -> (u64, String) {
     }
 }
 
-/// Receive the next `RetireAll`, returning whether it arrived before `dur`.
+/// Receive the next `RetireDomain`, returning whether it arrived before `dur`.
 fn wait_retire_all(rx: &Receiver<BeaconEvent>, dur: Duration) -> bool {
     let deadline = Instant::now() + dur;
     loop {
@@ -101,7 +101,7 @@ fn wait_retire_all(rx: &Receiver<BeaconEvent>, dur: Duration) -> bool {
             return false;
         }
         match rx.recv_timeout(left) {
-            Ok(BeaconEvent::RetireAll) => return true,
+            Ok(BeaconEvent::RetireDomain { mode: neuron::macros::MacroMode::Raw }) => return true,
             Ok(_) => continue,
             Err(_) => return false,
         }
@@ -301,9 +301,9 @@ fn fire_queue_stress_e2e() {
         }
     }
 
-    // ── PHASE C: SIDECAR CRASH WITH A FULL QUEUE — drop, RetireAll, respawn, NO zombie re-run ────
+    // ── PHASE C: SIDECAR CRASH WITH A FULL QUEUE — drop, RetireDomain, respawn, NO zombie re-run ────
     // Fill one macro's queue, then crash the sidecar. The 256 buffered fires die WITH the process —
-    // they must NOT be re-run on respawn. The crash surfaces RetireAll; the respawned sidecar (new
+    // they must NOT be re-run on respawn. The crash surfaces RetireDomain; the respawned sidecar (new
     // pid) serves a fresh fire.
     {
         const N: usize = 300;
@@ -322,7 +322,7 @@ fn fire_queue_stress_e2e() {
         let _ = host.fire_async("fqc_boom", &cx("x")); // a DIFFERENT macro's worker hard-exits the process
         assert!(
             wait_retire_all(&rx, Duration::from_secs(15)),
-            "a sidecar crash with a full queue must surface RetireAll (every open prompt is void)"
+            "a sidecar crash with a full queue must surface RetireDomain (every open prompt is void)"
         );
 
         // respawn: the next blocking call re-warms + re-registers; loop until the pid actually changes.

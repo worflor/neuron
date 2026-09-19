@@ -21,7 +21,8 @@
 //! click-through and only a deliberate committed flick can ever resolve a prompt.
 //!
 //! Asks queue: one shows at a time, the header pill counts the rest. A sidecar-side timeout (or a
-//! sidecar respawn) RETIRES the prompt — the [`BeaconEvent::Retire`]/[`RetireAll`] routes set the
+//! sidecar respawn) RETIRES the prompt — [`BeaconEvent::Retire`] is one prompt and
+//! [`BeaconEvent::RetireDomain`] is only the prompts owned by the sidecar that died.
 //! presented prompt's stop flag and the capture withdraws without committing anything.
 //!
 //! Threading: a ROUTER thread drains the Macro Host's event stream and only touches shared state
@@ -34,7 +35,7 @@
 //! READS input state (the same promise as press-to-bind).
 
 use crate::ui::{AppWindow, State};
-use neuron::macros::{macro_host, BeaconEvent};
+use neuron::macros::{macro_host, BeaconEvent, MacroMode};
 use slint::ComponentHandle;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -128,6 +129,14 @@ fn weave_may_capture() -> bool {
 }
 
 /// One queued ask, as the presenter sees it.
+fn prompt_mode(pid: u64) -> MacroMode {
+    if pid & (1u64 << 63) != 0 {
+        MacroMode::Bound
+    } else {
+        MacroMode::Raw
+    }
+}
+
 struct Prompt {
     pid: u64,
     macro_id: String,
@@ -237,12 +246,14 @@ pub fn start(weak: slint::Weak<AppWindow>) {
                             drop(g);
                             mirror_count(&weak, &shared);
                         }
-                        BeaconEvent::RetireAll => {
+                        BeaconEvent::RetireDomain { mode } => {
                             let (q, _) = &*shared;
                             let mut g = q.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                            g.queue.clear();
-                            if let Some((_, stop)) = &g.current {
-                                stop.store(true, Ordering::SeqCst);
+                            g.queue.retain(|p| prompt_mode(p.pid) != mode);
+                            if let Some((pid, stop)) = &g.current {
+                                if prompt_mode(*pid) == mode {
+                                    stop.store(true, Ordering::SeqCst);
+                                }
                             }
                             drop(g);
                             mirror_count(&weak, &shared);

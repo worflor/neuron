@@ -697,48 +697,52 @@ fn beacon_stress_e2e() {
         assert!(host.drain_log().len() <= 400, "the macro-log ring stayed bounded under the flood");
     }
 
-    // ── PHASE O: SIDECAR CRASH -> RetireAll, THEN CLEAN RESPAWN ────────────────────────────────
-    // A macro crashes the firewalled sidecar (its whole reason to exist). The host must emit a single
-    // RetireAll (every open prompt is void) and then transparently respawn + re-register so the very
-    // next ask works. ONE deliberate crash, well under the circuit breaker's ceiling.
+    // ── PHASE O: RAW CRASH RETIRES RAW ONLY; BOUND ASKS SURVIVE ────────────────────────────────
     {
         let rx = host.beacon_events();
-        // two long asks in flight when the crash lands.
         host.register("bs_inflight_a", "def macro(ctx):\n    ask('a', timeout=15)\n").unwrap();
         host.register("bs_inflight_b", "def macro(ctx):\n    ask('b', timeout=15)\n").unwrap();
         assert!(host.fire_async("bs_inflight_a", &ctx).contains("dispatched"));
         assert!(host.fire_async("bs_inflight_b", &ctx).contains("dispatched"));
-        // make sure both prompts are actually open before we pull the rug.
-        let _ = recv_ask(&rx, Duration::from_secs(10));
-        let _ = recv_ask(&rx, Duration::from_secs(10));
+        let (pid_a, ..) = recv_ask(&rx, Duration::from_secs(10));
+        let (pid_b, ..) = recv_ask(&rx, Duration::from_secs(10));
 
         host.register("bs_crash", "# neuron: raw\nimport os\ndef macro(ctx):\n    os._exit(1)\n").unwrap();
-        let _ = host.fire_async("bs_crash", &ctx); // the sidecar dies under it
+        let _ = host.fire_async("bs_crash", &ctx);
 
-        // the death must surface as a RetireAll.
         let deadline = Instant::now() + Duration::from_secs(15);
-        let mut saw_retire_all = false;
+        let mut saw_raw_retire = false;
         while Instant::now() < deadline {
             match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-                Ok(BeaconEvent::RetireAll) => {
-                    saw_retire_all = true;
+                Ok(BeaconEvent::RetireDomain { mode: neuron::macros::MacroMode::Raw }) => {
+                    saw_raw_retire = true;
                     break;
+                }
+                Ok(BeaconEvent::RetireDomain { mode: neuron::macros::MacroMode::Bound }) => {
+                    panic!("RAW crash retired the healthy BOUND prompt domain");
                 }
                 Ok(_) => continue,
                 Err(_) => break,
             }
         }
-        assert!(saw_retire_all, "a sidecar crash must emit RetireAll (every open prompt is void)");
+        assert!(saw_raw_retire, "RAW sidecar crash must retire only the RAW prompt domain");
+
+        // Both BOUND asks are still owned by the healthy interpreter and remain answerable.
+        host.answer(pid_a, Some(0));
+        host.answer(pid_b, Some(0));
         drop(rx);
 
-        // RESPAWN: the host re-warms + re-registers transparently; a fresh ask round-trips again.
+        // The RAW lane itself respawns and serves a fresh RAW ask.
         let rx = host.beacon_events();
-        host.register("bs_revive", "def macro(ctx):\n    return 'rv=%r' % ask('revive?', timeout=15)\n")
-            .expect("re-register on the respawned sidecar");
+        host.register(
+            "bs_revive",
+            "# neuron: raw\ndef macro(ctx):\n    return 'rv=%r' % ask('revive?', timeout=15)\n",
+        )
+        .expect("register on the respawned RAW sidecar");
         let res = invoke_async("bs_revive", &ctx);
         let (pid, ..) = recv_ask(&rx, Duration::from_secs(15));
         host.answer(pid, Some(0));
-        assert!(result(&res).contains("rv=True"), "the respawned sidecar serves a fresh beacon");
+        assert!(result(&res).contains("rv=True"), "the respawned RAW sidecar serves a fresh beacon");
     }
 
     // ── teardown ───────────────────────────────────────────────────────────────────────────────
