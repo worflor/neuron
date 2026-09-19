@@ -2700,7 +2700,7 @@ fn macro_cmd(action: MacroCmd) -> Result<()> {
                             macro_host().answer(pid, ans);
                         }
                         BeaconEvent::Notify { macro_id, text } => eprintln!("[{macro_id}] {text}"),
-                        BeaconEvent::Retire { .. } | BeaconEvent::RetireAll => {}
+                        BeaconEvent::Retire { .. } | BeaconEvent::RetireDomain { .. } => {}
                     }
                 }
             });

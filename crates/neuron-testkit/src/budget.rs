@@ -6,7 +6,7 @@
 //! sample its resource footprint through scripted phases, and hold it to explicit budgets.
 //!
 //! A Job Object makes the child-process census exact (everything the app spawns lands in
-//! the job too; the warm python macro-host sidecar is expected, anything else is a finding),
+//! the job too; warm python macro-host sidecars are expected, anything else is a finding),
 //! and teardown is `TerminateJobObject` - one call, no orphans, even if the app wedges. The
 //! real binary is used because allocator behavior, Slint/GPU surfaces, timers, and thread
 //! spawns only exist in the shipped artifact.
@@ -76,7 +76,7 @@ pub struct Sample {
     pub phase: String,
     pub seconds: f64,
     /// CPU as a percentage of TOTAL machine CPU, summed over the app AND every descendant
-    /// (the macro-host sidecar counts — it is part of the resident footprint on the user's box).
+    /// (macro-host sidecars count — they are part of the resident footprint on the user's box).
     pub cpu_pct_of_total: f64,
     /// Private commit summed over the app + descendants.
     pub private_bytes: u64,

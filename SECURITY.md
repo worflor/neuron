@@ -19,9 +19,13 @@ that permission isn't a choice i get to make — a game opens these with `FILE_M
 
 treat anything with local code execution as able to paint your keyboard. none of these surfaces synthesize input, write to a device beyond lighting, or touch the filesystem. host integration can be turned off entirely with `NEURON_HOST=0`.
 
-**macros are unsandboxed on purpose.** the bundled CPython runs *your* macro files as a subprocess with full `ctypes` / `subprocess` / socket / filesystem access. that's the feature, not an oversight: a macro can do anything a program you ran can do. the friendly helpers respect the arm gate; raw `ctypes` past them does not. don't run a macro file you didn't read, exactly like any other script. the sidecar being a separate process is a *reliability* boundary (a segfaulting macro can't take the app down), not a security one.
+**macros have two explicit authority tiers.** new macros are **BOUND** by default: ordinary Python computation runs in a dedicated warm interpreter, while input, clipboard, focus, device/audio/OBS effects and persistent macro state go through Neuron's Rust broker. BOUND removes ambient file/process/network/native-FFI access from the supported Python surface and Rust re-checks the arm/mock gate before effectful broker actions land. BOUND is *policy containment*, not a promise that CPython is a hostile-code security sandbox; don't treat untrusted code as safe merely because it is BOUND.
 
-**no network, no account, no telemetry.** config is plain TOML on your disk. nothing phones home. nothing leaves your machine at runtime: the only runtime connection is the opt-in loopback link to OBS above. the only thing that touches the internet at all is the build script fetching (and sha256-verifying) the CPython tarball at build time.
+**RAW is still full Python on purpose.** one source-owned compiler line — `# neuron: raw` — moves that macro into a separate unrestricted warm CPython process with normal `ctypes` / `subprocess` / socket / filesystem authority. the GUI toggle edits that exact line; there is no hidden authority preference. pre-BOUND macros are stamped RAW once during migration so an upgrade does not silently take power away. RAW code can deliberately bypass Neuron's helpers and arm gate through ambient APIs, so read RAW macro source exactly as you would any other program you run.
+
+BOUND and RAW never share an interpreter. a RAW crash cannot corrupt BOUND runtime state, and a BOUND macro cannot invoke a RAW macro as an authority tunnel; RAW may invoke BOUND, which still executes inside BOUND. the process boundary remains a reliability boundary for RAW and an important structural policy boundary for BOUND, but neither tier is marketed as adversarial-code isolation.
+
+**no account, no telemetry, no Neuron cloud.** config is plain TOML on your disk and Neuron itself does not phone home. the built-in runtime network surface is the opt-in loopback OBS connection above; RAW macros can of course open arbitrary network connections because they are ordinary Python. the build script also fetches and sha256-verifies the bundled CPython tarball at build time.
 
 ## reporting something
 

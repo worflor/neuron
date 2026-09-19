@@ -31,6 +31,45 @@
 //! *some* node) without ever losing or mangling code we don't model.
 
 use serde::{Deserialize, Serialize};
+use crate::macros::policy::{set_source_mode, MacroMode};
+
+/// A whole macro module as the visual constructor understands it. The node tree owns only the
+/// entry function body; prefix/suffix preserve every module-level byte around it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MacroDocument {
+    pub mode: MacroMode,
+    pub prefix: String,
+    /// Exact source from the entry's decorators/def line through the line before its first AST
+    /// statement. This keeps `main`, async/signatures/annotations, and leading body comments.
+    pub header: String,
+    pub body: Vec<MacroNode>,
+    pub suffix: String,
+}
+
+/// Rebuild a document after a canvas edit without discarding module-level source or silently
+/// canonicalizing the entry function boundary. Only the typed body is regenerated.
+pub fn document_to_source(doc: &MacroDocument) -> String {
+    let mut out = doc.prefix.clone();
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    if doc.header.is_empty() {
+        out.push_str(&nodes_to_source(&doc.body));
+    } else {
+        out.push_str(&doc.header);
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&nodes_to_body_source(&doc.body));
+    }
+    if !doc.suffix.is_empty() {
+        if !out.ends_with('\n') && !doc.suffix.starts_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&doc.suffix);
+    }
+    set_source_mode(&out, doc.mode)
+}
 
 /// A VALUE — a small expression tree behind every data parameter. Codegens to one Python expression
 /// ([`value_to_source`]); the sidecar's `_parse_value` is its inverse over the `ast`. The variants
@@ -249,6 +288,14 @@ pub fn py_str_literal(s: &str) -> String {
 #[must_use]
 pub fn nodes_to_source(nodes: &[MacroNode]) -> String {
     let mut out = String::from("def macro(ctx):\n");
+    out.push_str(&nodes_to_body_source(nodes));
+    out
+}
+
+/// Codegen only the entry body at one indentation level. MacroDocument uses this so canvas edits
+/// preserve the original function wrapper instead of replacing `main`, async/signatures, or comments.
+pub fn nodes_to_body_source(nodes: &[MacroNode]) -> String {
+    let mut out = String::new();
     if nodes.is_empty() {
         out.push_str(INDENT);
         out.push_str("pass\n");
@@ -617,6 +664,22 @@ mod tests {
     }
 
     // ── node codegen ──────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn document_codegen_keeps_module_source_and_mode() {
+        let doc = MacroDocument {
+            mode: MacroMode::Raw,
+            prefix: "import re\n\nNEURON_OPTIONS = []\n\n".into(),
+            header: "def main(ctx):\n    # preserved entry comment\n".into(),
+            body: vec![MacroNode::Notify { text: Value::str("ok") }],
+            suffix: "\ndef helper():\n    return 1\n".into(),
+        };
+        let src = document_to_source(&doc);
+        assert!(src.starts_with("# neuron: raw\nimport re\n"));
+        assert!(src.contains("NEURON_OPTIONS = []\n"));
+        assert!(src.contains("def main(ctx):\n    # preserved entry comment\n    neuron.notify(\"ok\")\n"));
+        assert!(src.ends_with("def helper():\n    return 1\n"));
+    }
 
     #[test]
     fn empty_macro_is_pass() {

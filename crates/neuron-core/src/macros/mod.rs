@@ -23,12 +23,14 @@
 pub mod context;
 pub mod macro_host;
 pub mod node;
+pub mod policy;
 pub mod pyruntime;
 pub mod runner;
 
 pub use context::Context;
-pub use macro_host::{macro_host, parse_macro, BeaconEvent, MacroHost, ParseError, ParseResult};
-pub use node::{nodes_to_source, py_str_literal, summarize, value_to_source, MacroNode, Value};
+pub use macro_host::{macro_host, parse_document, parse_macro, BeaconEvent, DocumentParseResult, MacroHost, ParseError, ParseResult};
+pub use node::{document_to_source, nodes_to_source, py_str_literal, summarize, value_to_source, MacroDocument, MacroNode, Value};
+pub use policy::{mode_from_source, set_source_mode, MacroMode, RAW_DIRECTIVE};
 pub use pyruntime::{ensure_runtime, Runtime};
 
 use crate::action::{ScriptKind, ScriptRef};

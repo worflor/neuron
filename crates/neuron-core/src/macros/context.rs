@@ -294,6 +294,33 @@ fn restore_foreground(_h: WindowHandle) -> bool {
     false
 }
 
+/// Focus an exact window title for the BOUND macro broker. Host-side arm enforcement means Python
+/// cannot bypass SAFE mode by reaching a lower-level helper.
+pub(crate) fn focus_title(title: &str) -> String {
+    if !crate::action::input_armed() {
+        return "[disarmed]".into();
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowW, SetForegroundWindow};
+        let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+        let hwnd = unsafe { FindWindowW(std::ptr::null(), wide.as_ptr()) };
+        if hwnd.is_null() {
+            return "window not found".into();
+        }
+        return if unsafe { SetForegroundWindow(hwnd) } != 0 {
+            "ok".into()
+        } else {
+            "focus refused".into()
+        };
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = title;
+        "[unsupported]".into()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

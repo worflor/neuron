@@ -45,9 +45,9 @@ to be clear, i love my razer hardware. this is anti-*synapse*: a multi-process, 
 
 neuron is the opposite design, on purpose:
 
-- **one process, lazily windowed.** tray-resident, ~14 MB idle on my machine. the live remap loop runs *inside* it. there's no second, third, fourth daemon.
+- **one resident app process, lazily windowed.** tray-resident, ~14 MB idle on my machine. the live remap loop runs *inside* it. Python macros use warm isolated worker processes only when the macro tier is active; they are not separate device-control daemons.
 - **no cloud, no account.** your config is plain TOML on your disk. you can read it, diff it, and check it into git if you want :P
-- **deterministic.** it changes what you ask and nothing else. no surprise re-enables, no "smart" anything you turned off three separate times. plus you can add custom macros using raw python to LITERALLY do whatever you want. true freedom (be safe)
+- **deterministic.** it changes what you ask and nothing else. no surprise re-enables, no "smart" anything you turned off three separate times. new Python macros start BOUND to Neuron's capability surface; add `# neuron: raw` when you deliberately want full Python to LITERALLY do whatever you want. true freedom, with the escalation visible in source.
 - **on-device first.** push settings to the mouse's onboard memory and you can uninstall *everything*. the dream is no software at all. (older hardware has no onboard storage, so we make do.)
 
 i'll be honest about the name, though: neuron isn't a faithful, minimal re-implementation of synapse. it's closer to *synapse+++*: it does **more** (gestures, an open effects engine, real-code macros, a whiteboard tool built in, a suite of hand-built actions). all of it is built low-level, and every decision has a reason i can point at. it's meant for *me*, and replacing slop with slop would defeat the whole point. more, sure. bloat, never.
@@ -74,7 +74,7 @@ the short tour. each line links into [the feature doc](docs/GDD.md), which has t
 | **[audio](docs/GDD.md#audio)** | mute and gain for any mic or output, and flipping your default device, from a binding. your mic's mute is itself a trigger. |
 | **[the spine](docs/GDD.md#the-spine)** | binds, hypershift layers with four stances (hold · latch · smart · one-shot), side-plate layers that scope binds to the plate actually seated on the mouse, and app-aware profile switching with a fallback so closing a game puts you back. |
 | **[spellweaving](docs/GDD.md#spellweaving)** | hold, weave a stroke, release, and it fires as a real keybind. recognised by **eigenmotion** — a stroke fit as a damped complex oscillator, where the eigenvalues are the stroke's identity, so it's invariant to where you drew it, how big, and how fast. the same capture drives a family of instruments: teleport, tether, whiteboard, glance, window verbs, dial, knockback, control. |
-| **[macros & beacons](docs/GDD.md#macros--beacons)** | a bundled CPython that stays **warm**, so firing a macro is basically a function call. unsandboxed on purpose, in its own process so it can't take the app down. every macro gets a frozen snapshot of where you were when you fired it, a key-value store that survives restarts, and the ability to call another macro. a macro can also stop and *ask* you something without stealing focus. don't want to write python? there's a block builder that writes it for you, losslessly both ways. |
+| **[macros & beacons](docs/GDD.md#macros--beacons)** | bundled CPython stays **warm** in two authority domains: new macros are BOUND to Neuron's brokered capabilities, while `# neuron: raw` is the explicit full-Python escape hatch. every macro gets a frozen trigger snapshot, persistent state, macro composition, and beacons; RAW and BOUND never share an interpreter. don't want to write Python? the block builder edits the same source document and preserves module-level code/metadata while you work visually. |
 | **[life after synapse](docs/GDD.md#life-after-synapse)** | import your synapse export (it's a zip of plaintext XML), purge synapse off the machine properly, and point `neuron discover` at hardware it's never seen to fingerprint it into a TOML. |
 | **[the app](docs/GDD.md#the-app)** | a tray-resident GUI in four sections — device, lighting, input, system — plus profiles as one object: its settings, its lighting, and its binds. |
 
@@ -142,7 +142,7 @@ neuron lighting mirror               paint one device's vitals onto another's LE
 neuron backup                        snapshot every device's full state
 neuron import-export prof.synapse3 --apply   eat a synapse export
 neuron run                           the remap daemon (esc to stop; --safe = observe only)
-neuron macro add lift my.py          register a python macro into the warm sidecar
+neuron macro add lift my.py          register a python macro into the warm macro runtime
 neuron macro prelude                 the `neuron` module reference (ctx + helpers + ask/notify)
 ```
 
@@ -211,7 +211,7 @@ every device write is sorted by how sure i am of it:
 things it flat-out doesn't do, so you know before you install:
 
 - **doesn't crack synapse's encrypted cloud profiles.** the AES'd account cache is the lock-in, and we don't touch it. the plaintext in-app *export* is what migration can read.
-- **doesn't sandbox your macros.** full unsandboxed CPython is the point: a macro can do anything a program can. the arm gate guards the *convenience* helpers, not the raw APIs you reach past them into.
+- **doesn't pretend CPython is a hostile-code sandbox.** BOUND is the safer default capability tier, not an adversarial isolation promise. RAW remains full unsandboxed Python one explicit source line away; if you choose RAW, it can do anything your user account can.
 - **no telemetry, no account, no cloud.**
 
 ## philosophy / non-goals

@@ -4,14 +4,13 @@
 """
 neuron — the host module every Macro Host macro can use.
 
-FULL RAW POWER IS YOURS. A macro is real CPython in a real process: `import ctypes` and call any
-Win32 entry point, `import subprocess` and run anything, open sockets, read/write files — literally
-anything a program can do. These helpers are just the common conveniences so you don't have to.
+RAW macros are ordinary full-power CPython. BOUND macros receive this module only through a public
+capability proxy: computation stays Python, while machine effects are brokered by the Rust host.
+The same helper names work in both modes; arbitrary process execution requires RAW.
 
-The INPUT-SYNTHESIS helpers (key, type_text, mouse_*, click, scroll, hotkey, run) honour Neuron's
-SAFE/disarm switch: when input is disarmed they no-op and return a "[disarmed]" marker instead of
-firing — so SAFE mode is a real guardrail on this convenience layer. Reaching past them (raw
-ctypes SendInput) does NOT consult the gate — that's your own rope, by design.
+SAFE/disarm is enforced twice for brokered effects: the helper gives immediate feedback and Rust
+re-checks before acting. RAW code may deliberately bypass helpers through ctypes; that is the explicit
+authority escalation selected by "# neuron: raw".
 """
 
 import sys
@@ -35,6 +34,8 @@ __all__ = [
 ]
 
 _IS_WIN = sys.platform == "win32"
+_MODE = os.environ.get("NEURON_MACRO_MODE", "raw").strip().lower()
+_BOUND = _MODE == "bound"
 _armed = False
 
 
@@ -143,6 +144,8 @@ def __getattr__(name):
 _host_send = None
 _ask_lock = threading.Lock()
 _ask_seq = [0]
+# Keep prompt ids globally distinct even though RAW and BOUND allocate them independently.
+_ASK_PREFIX = (1 << 63) if _BOUND else 0
 _asks = {}  # pid -> {"event": Event, "choice": int|None}  (chosen option index, or None = passed)
 
 
@@ -172,7 +175,7 @@ def _prompt(text, options, timeout=300, description=""):
     ev = threading.Event()
     with _ask_lock:
         _ask_seq[0] += 1
-        pid = _ask_seq[0]
+        pid = _ASK_PREFIX | _ask_seq[0]
         _asks[pid] = {"event": ev, "choice": None}
     _host_send({
         "t": "prompt", "pid": pid, "id": getattr(_tls, "mid", "?"),
@@ -275,23 +278,48 @@ def _ctx_payload():
 
 
 def invoke(name, wait=True, **opts):
-    """Run ANOTHER macro by id, as a subroutine — the composition primitive.
+    """Run another macro by id.
 
-    wait=True (default): run it INLINE on this thread and return its value (its `return`), so you can
-    branch on the result. This is SUBROUTINE semantics: it intentionally bypasses the target's fire
-    queue and may overlap a separately-fired instance of that target. wait=False queues it on the
-    target's OWN serial worker (fire-and-forget) and return
-    None at once. Keyword args become the invoked macro's options (read with neuron.option(...)). The
-    invoked macro shares THIS fire's captured world (ctx). Returns None if `name` isn't a registered
-    macro or the call would nest deeper than the cycle guard allows. Never raises."""
+    Same-domain calls keep their existing direct semantics. Cross-domain calls go back through the
+    Rust host so a RAW caller may invoke BOUND without moving that callee into the RAW interpreter.
+    Authority is monotonic: BOUND -> RAW is refused. Cross-domain return values cross the protocol
+    as strings; same-domain synchronous calls still return the original Python value.
+    """
     fn = _host_lookup(name) if _host_lookup else None
     if fn is None:
-        return None
+        raw = _act(
+            "invoke",
+            {
+                "id": str(name),
+                "wait": bool(wait),
+                "ctx": _ctx_payload(),
+                "options": dict(opts),
+            },
+            timeout=305.0 if wait else 5.0,
+            gated=False,
+        )
+        try:
+            payload = _json.loads(raw)
+        except Exception:
+            return None
+        if not payload.get("found"):
+            return None
+        if payload.get("error"):
+            sys.stderr.write("[neuron.invoke %s] %s\n" % (name, payload.get("error")))
+            return None
+        return payload.get("value") if wait else None
+
     if not wait:
         if _host_dispatch:
-            _host_dispatch({"id": name, "rid": None, "ctx": _ctx_payload(),
-                            "options": dict(opts), "mock": getattr(_tls, "mock", False)})
+            _host_dispatch({
+                "id": name,
+                "rid": None,
+                "ctx": _ctx_payload(),
+                "options": dict(opts),
+                "mock": getattr(_tls, "mock", False),
+            })
         return None
+
     depth = getattr(_tls, "invoke_depth", 0)
     if depth >= _INVOKE_MAX_DEPTH:
         return None
@@ -416,9 +444,13 @@ def _state_write(mid, d):
 
 
 def store(key, value):
-    """Persist a JSON-able `value` under `key` for THIS macro — survives across fires and restarts.
-    Per-macro namespace, atomic write. Returns True on success. (Big/looping values? keep it small —
-    this is settings + counters + memory, not a database.)"""
+    """Persist a JSON-able value under key for THIS macro."""
+    if _BOUND:
+        try:
+            _json.dumps(value)
+        except Exception:
+            return False
+        return _act("state_store", {"key": str(key), "value": value}, gated=False) == "true"
     mid = getattr(_tls, "mid", "?")
     with _state_lock_for(mid):
         d = _state_read(mid)
@@ -427,14 +459,24 @@ def store(key, value):
 
 
 def load(key, default=None):
-    """Read a value saved by store() for THIS macro (or `default` if unset). Never raises."""
+    """Read a value saved by store() for THIS macro (or default if unset). Never raises."""
+    if _BOUND:
+        raw = _act("state_load", {"key": str(key)}, gated=False)
+        try:
+            payload = _json.loads(raw)
+            return payload.get("value") if payload.get("found") else default
+        except Exception:
+            return default
     mid = getattr(_tls, "mid", "?")
     with _state_lock_for(mid):
         return _state_read(mid).get(str(key), default)
 
 
 def forget(key=None):
-    """Delete one stored key, or (key=None) wipe THIS macro's whole store. Returns True on success."""
+    """Delete one stored key, or (key=None) wipe THIS macro's whole store."""
+    if _BOUND:
+        arg = None if key is None else str(key)
+        return _act("state_forget", arg, gated=False) == "true"
     mid = getattr(_tls, "mid", "?")
     with _state_lock_for(mid):
         if key is None:
@@ -452,6 +494,13 @@ def forget(key=None):
 
 def stored():
     """The whole stored dict for THIS macro (a copy)."""
+    if _BOUND:
+        raw = _act("state_stored", gated=False)
+        try:
+            value = _json.loads(raw)
+            return value if isinstance(value, dict) else {}
+        except Exception:
+            return {}
     mid = getattr(_tls, "mid", "?")
     with _state_lock_for(mid):
         return dict(_state_read(mid))
@@ -490,7 +539,10 @@ def _act(verb, arg=None, timeout=5.0, gated=True):
         _act_seq[0] += 1
         rid = _act_seq[0]
         _acts[rid] = {"event": ev, "ok": False, "msg": None}
-    _host_send({"t": "act", "rid": rid, "verb": verb, "arg": arg})
+    _host_send({
+        "t": "act", "rid": rid, "id": getattr(_tls, "mid", "?"),
+        "verb": verb, "arg": arg, "mock": getattr(_tls, "mock", False),
+    })
     done = ev.wait(timeout)
     with _act_lock:
         slot = _acts.pop(rid, None)
@@ -777,6 +829,8 @@ if _IS_WIN:
 
 def key(name):
     """Press a key by name ('f', 'enter', 'f5', 'ctrl'…). down+up. Arm-gated."""
+    if _BOUND:
+        return _act("key", str(name))
     if not _IS_WIN:
         return "[unsupported]"
     vk = _vk(name)
@@ -789,6 +843,8 @@ def key(name):
 
 
 def key_down(name):
+    if _BOUND:
+        return _act("key_down", str(name))
     if not _IS_WIN:
         return "[unsupported]"
     vk = _vk(name)
@@ -801,6 +857,8 @@ def key_down(name):
 
 
 def key_up(name):
+    if _BOUND:
+        return _act("key_up", str(name))
     if not _IS_WIN:
         return "[unsupported]"
     vk = _vk(name)
@@ -814,6 +872,8 @@ def key_up(name):
 
 def hotkey(*keys):
     """Fire a chord: hotkey('ctrl','shift','v'). down in order, up in reverse. Arm-gated."""
+    if _BOUND:
+        return _act("hotkey", [str(k) for k in keys])
     if not _IS_WIN:
         return "[unsupported]"
     vks = [_vk(k) for k in keys]
@@ -827,6 +887,8 @@ def hotkey(*keys):
 
 def type_text(s):
     """Type a literal Unicode string as keystrokes, all at once. Arm-gated."""
+    if _BOUND:
+        return _act("type_text", str(s))
     if not _IS_WIN:
         return "[unsupported]"
     if _gated():
@@ -852,10 +914,11 @@ _GHOST_SPEED = {
 
 
 def type_ghost(s, speed="borderline"):
-    """GHOST-TYPE a string: keystroke by keystroke with jittered, organic timing — the same
-    pipeline the native ghost-paste action uses, so it lands in game chats / RDP / VMs that block
-    paste. `speed` = 'instant' | 'borderline' | 'fast' | 'normal'. Real Enter for newlines, Tab
-    for tabs. Re-checks the arm gate before every key. Arm-gated."""
+    """GHOST-TYPE a string with the native ghost-paste cadence. Arm-gated."""
+    if _BOUND:
+        # normal pace is ~165ms/char plus pauses; size the reply wait to the requested work.
+        timeout = max(5.0, len(str(s)) * 0.35 + 2.0)
+        return _act("type_ghost", {"text": str(s), "speed": str(speed)}, timeout=timeout)
     if not _IS_WIN:
         return "[unsupported]"
     if _gated():
@@ -901,6 +964,8 @@ def type_ghost(s, speed="borderline"):
 
 def mouse_move(dx, dy):
     """Move the cursor by a relative delta. Arm-gated."""
+    if _BOUND:
+        return _act("mouse_move", {"dx": int(dx), "dy": int(dy)})
     if not _IS_WIN:
         return "[unsupported]"
     if _gated():
@@ -911,6 +976,8 @@ def mouse_move(dx, dy):
 
 def mouse_to(x, y):
     """Move the cursor to an absolute primary-screen pixel. Arm-gated."""
+    if _BOUND:
+        return _act("mouse_to", {"x": int(x), "y": int(y)})
     if not _IS_WIN:
         return "[unsupported]"
     if _gated():
@@ -925,6 +992,8 @@ def mouse_to(x, y):
 
 def click(button="left"):
     """Click a mouse button ('left'|'right'|'middle'). Arm-gated."""
+    if _BOUND:
+        return _act("click", str(button))
     if not _IS_WIN:
         return "[unsupported]"
     if _gated():
@@ -942,6 +1011,8 @@ def click(button="left"):
 
 def scroll(notches):
     """Scroll the wheel by `notches` (positive = up/away). Arm-gated."""
+    if _BOUND:
+        return _act("scroll", int(notches))
     if not _IS_WIN:
         return "[unsupported]"
     if _gated():
@@ -952,6 +1023,9 @@ def scroll(notches):
 
 def clipboard_get():
     """Read the clipboard's Unicode text (read-only, never gated). None if empty/non-text."""
+    if _BOUND:
+        s = _act("clipboard_get", gated=False)
+        return None if not s or str(s).startswith("[") else s
     if not _IS_WIN:
         return None
     if _user32.OpenClipboard(0) == 0:
@@ -973,6 +1047,8 @@ def clipboard_get():
 
 def clipboard_set(s):
     """Put a string on the clipboard (CF_UNICODETEXT). Arm-gated (it mutates user state)."""
+    if _BOUND:
+        return _act("clipboard_set", str(s))
     if not _IS_WIN:
         return "[unsupported]"
     if _gated():
@@ -996,8 +1072,9 @@ def clipboard_set(s):
 
 
 def run(cmd, wait=False):
-    """Run a command line. Fire-and-forget by default; wait=True returns (code, stdout). Arm-gated
-    (process spawn is a real side effect). Armed authority is stripped from the child's env."""
+    """Run a command line. Arbitrary process execution is the explicit RAW escape hatch."""
+    if _BOUND:
+        return "[requires RAW]"
     if _gated():
         return "[disarmed]"
     env = dict(os.environ)
@@ -1014,8 +1091,9 @@ def run(cmd, wait=False):
 
 
 def focus(title):
-    """Bring a window to the foreground by exact title. Arm-gated. (Best-effort; Windows may keep
-    foreground lock — for restoring the pre-macro window prefer the host's restore path.)"""
+    """Bring a window to the foreground by exact title. Arm-gated."""
+    if _BOUND:
+        return _act("focus", str(title))
     if not _IS_WIN:
         return "[unsupported]"
     if _gated():

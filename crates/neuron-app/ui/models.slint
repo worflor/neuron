@@ -322,5 +322,6 @@ export struct MacroCard {
     summary: string,  // emergent plain-English "what it does", from its nodes
     steps: int,       // total node count (depth-included) — a size-at-a-glance
     options: int,     // declared options (its NEURON_OPTIONS entries)
+    mode: string,     // "BOUND" | "RAW", derived from source policy
     trigger: string,  // the binding(s) that fire it, or "(unbound)"
 }

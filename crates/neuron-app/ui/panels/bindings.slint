@@ -129,6 +129,10 @@ component MacroCardEl inherits Rectangle {
                 overflow: elide;
                 vertical-alignment: center;
             }
+            Pill {
+                text: root.c.mode;
+                live: root.c.mode == "RAW";
+            }
             // the binding(s) that fire it — dim when nothing does ("(unbound)"), accent when bound.
             Mono {
                 text: root.c.trigger;
@@ -1292,6 +1296,15 @@ export component BindingsPanel inherits VerticalLayout {
                         Rectangle {}
                         if State.macro-parsing && !State.macro-code-view : Pill { text: "READING"; live: true; }
                         if State.macro-busy : Pill { text: "WORKING"; live: true; }
+                        VerticalLayout {
+                            alignment: center;
+                            Toggle {
+                                width: 116px;
+                                caption: "RAW";
+                                checked: State.macro-raw;
+                                toggled(on) => { State.set-macro-raw(on); }
+                            }
+                        }
                         // BLOCKS ⇄ CODE — the same macro, two presentations: a visual node-blocks canvas
                         // or the raw Python. Switching TO blocks re-parses the current source so the
                         // canvas reflects whatever the code view holds. The fused SplitToggle IS the mode

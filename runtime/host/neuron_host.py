@@ -4,9 +4,9 @@
 #
 # neuron_host.py — the resident program inside the Macro Host sidecar.
 #
-# Neuron starts ONE bundled-CPython process running this script and keeps it warm: every macro is
-# exec'd once (imports warmed) into a registry, and a trigger is a tiny framed message that calls
-# the already-resident function. No per-press spawn, no per-press import. Real-time.
+# Neuron may run TWO independent warm copies of this script: BOUND and RAW. Each process receives
+# only macros for its execution domain, execs them once (imports warmed), and serves tiny framed
+# fire messages against already-resident callables. No per-press spawn or import.
 #
 # THE LOAD-BEARING ISOLATION (read this before touching the I/O):
 #   The control protocol must NEVER share a stream with a macro's own output. A macro that does
@@ -26,6 +26,10 @@ import queue
 import struct
 import threading
 import traceback
+import builtins as _builtins
+
+_HOST_MODE = os.environ.get("NEURON_MACRO_MODE", "raw").strip().lower()
+_BOUND = _HOST_MODE == "bound"
 
 # ── isolate the protocol channel from macro output (must happen first) ──────────────────────────
 _PROTO = os.fdopen(os.dup(1), "wb", buffering=0)   # our private copy of the real stdout = protocol
@@ -80,6 +84,161 @@ import neuron as _nh  # noqa: E402  (after the fd dance, intentionally)
 
 _nh._set_host_send(_send)  # give the beacon layer (ask/notify) the framed protocol writer
 
+# BOUND is policy containment, not a claim that CPython can execute hostile code safely. Its purpose
+# is to make ordinary and agent-authored macros capability-first while RAW remains one source line
+# away. Reflective/private surfaces are refused rather than advertised as contained.
+_BOUND_IMPORTS = {
+    "__future__", "collections", "datetime", "functools", "itertools", "json", "math",
+    "operator", "random", "re", "statistics", "string", "time",
+}
+_RAW_ONLY_HELPERS = {"run"}
+
+
+def _requires_raw(*_args, **_kwargs):
+    return "[requires RAW]"
+
+
+class _BoundNeuron:
+    __slots__ = ()
+
+    def __getattr__(self, name):
+        if name not in _nh.__all__:
+            raise AttributeError("bound neuron has no capability %r" % name)
+        if name in _RAW_ONLY_HELPERS:
+            return _requires_raw
+        return getattr(_nh, name)
+
+
+_BOUND_NEURON = _BoundNeuron()
+_REAL_IMPORT = _builtins.__import__
+
+
+def _bound_import(name, globals=None, locals=None, fromlist=(), level=0):
+    root = name.split(".", 1)[0]
+    if level:
+        raise ImportError("relative imports require RAW mode")
+    if root == "neuron":
+        return _BOUND_NEURON
+    if root not in _BOUND_IMPORTS:
+        raise ImportError("import %r requires RAW mode" % root)
+    return _REAL_IMPORT(name, globals, locals, fromlist, level)
+
+
+_BOUND_BUILTINS = dict(vars(_builtins))
+for _name in (
+    "open", "eval", "exec", "compile", "input", "breakpoint",
+    "getattr", "setattr", "delattr", "globals", "locals", "vars", "dir", "type",
+):
+    _BOUND_BUILTINS.pop(_name, None)
+_BOUND_BUILTINS["__import__"] = _bound_import
+
+
+def _literal_expr(node):
+    import ast
+    try:
+        ast.literal_eval(node)
+        return True
+    except Exception:
+        return False
+
+
+def _policy_fail(node, msg):
+    line = getattr(node, "lineno", 1) or 1
+    raise ValueError("line %d: %s" % (line, msg))
+
+
+def _validate_bound_module(source):
+    """Pure AST policy pass for BOUND. Never executes user code."""
+    import ast
+    tree = ast.parse(source)
+    future_annotations = any(
+        isinstance(stmt, ast.ImportFrom)
+        and stmt.module == "__future__"
+        and any(alias.name == "annotations" for alias in stmt.names)
+        for stmt in tree.body
+    )
+    raw_builtins = {
+        "open", "eval", "exec", "compile", "input", "breakpoint",
+        "getattr", "setattr", "delattr", "globals", "locals", "vars", "dir", "type",
+    }
+
+    # Whole-tree authority checks apply inside macro/helper bodies too, so Check and Save fail before
+    # a restricted call is ever reached at runtime.
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                root = alias.name.split(".", 1)[0]
+                if root not in _BOUND_IMPORTS and root != "neuron":
+                    _policy_fail(node, "import %r requires RAW mode" % root)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                _policy_fail(node, "relative imports require RAW mode")
+            root = (node.module or "").split(".", 1)[0]
+            if root not in _BOUND_IMPORTS and root != "neuron":
+                _policy_fail(node, "import %r requires RAW mode" % root)
+        elif isinstance(node, ast.Attribute) and node.attr.startswith("_"):
+            _policy_fail(node, "private/dunder attribute access requires RAW mode")
+        elif isinstance(node, ast.Name):
+            if node.id.startswith("__"):
+                _policy_fail(node, "dunder names require RAW mode")
+            if isinstance(node.ctx, ast.Load) and node.id in raw_builtins:
+                _policy_fail(node, "%s requires RAW mode" % node.id)
+        elif isinstance(node, ast.Call):
+            fn = node.func
+            helper = None
+            if isinstance(fn, ast.Name):
+                helper = fn.id
+            elif (
+                isinstance(fn, ast.Attribute)
+                and isinstance(fn.value, ast.Name)
+                and fn.value.id == "neuron"
+            ):
+                helper = fn.attr
+            if helper in _RAW_ONLY_HELPERS:
+                _policy_fail(node, "neuron.%s requires RAW mode" % helper)
+
+    # Registration itself may execute module-level syntax. Keep BOUND top-level declarative.
+    for stmt in tree.body:
+        if (
+            isinstance(stmt, ast.Expr)
+            and isinstance(stmt.value, ast.Constant)
+            and isinstance(stmt.value.value, str)
+        ):
+            continue
+        if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+            continue
+        if isinstance(stmt, ast.Assign):
+            if not _literal_expr(stmt.value):
+                _policy_fail(stmt, "executable module assignment requires RAW mode")
+            continue
+        if isinstance(stmt, ast.AnnAssign):
+            if stmt.value is not None and not _literal_expr(stmt.value):
+                _policy_fail(stmt, "executable module assignment requires RAW mode")
+            continue
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if stmt.decorator_list:
+                _policy_fail(stmt, "decorators execute at registration and require RAW mode")
+            defaults = list(stmt.args.defaults) + [d for d in stmt.args.kw_defaults if d is not None]
+            if any(not _literal_expr(d) for d in defaults):
+                _policy_fail(stmt, "executable function defaults require RAW mode")
+            annotations = [a.annotation for a in stmt.args.args + stmt.args.kwonlyargs if a.annotation]
+            if stmt.args.vararg and stmt.args.vararg.annotation:
+                annotations.append(stmt.args.vararg.annotation)
+            if stmt.args.kwarg and stmt.args.kwarg.annotation:
+                annotations.append(stmt.args.kwarg.annotation)
+            if stmt.returns:
+                annotations.append(stmt.returns)
+            if annotations and not future_annotations:
+                _policy_fail(stmt, "runtime-evaluated function annotations require RAW mode")
+            continue
+        _policy_fail(
+            stmt,
+            "%s at module scope executes during registration and requires RAW mode"
+            % type(stmt).__name__,
+        )
+    return tree
+
+
 _macros = {}   # id -> callable(ctx)
 _gens = {}     # id -> active source generation
 _staged = {}   # token -> (id, callable, options, generation), invisible until commit
@@ -87,23 +246,28 @@ _errors = {}   # id -> last register/compile traceback (shown verbatim; never fa
 
 
 def _compile_candidate(mid, source):
-    """Compile + execute one candidate namespace without mutating the live registry."""
-    # Notepad/PowerShell save UTF-8 WITH a BOM; compile() rejects U+FEFF as a stray
-    # non-printable. A macro must never fail for how an editor chose to save it.
+    """Compile one candidate namespace under this sidecar's execution domain."""
     source = source.lstrip("\ufeff")
-    g = {"__name__": "neuron_macro_%s" % mid, "neuron": _nh}
-    # inject the helper surface as bare globals too, so a macro can call clipboard_set(...)
-    # without the `neuron.` prefix (both styles work). `ctx` is EXCLUDED: snapshotting it at
-    # register time would freeze a stale world — macros read the live one via the function
-    # argument (`def macro(ctx):`) or `neuron.ctx` (per-thread, resolved at fire time).
+    if _BOUND:
+        _validate_bound_module(source)
+        helper = _BOUND_NEURON
+        g = {
+            "__name__": "neuron_macro_%s" % mid,
+            "__builtins__": _BOUND_BUILTINS,
+            "neuron": helper,
+        }
+    else:
+        helper = _nh
+        g = {"__name__": "neuron_macro_%s" % mid, "neuron": helper}
+
     for name in _nh.__all__:
         if name == "ctx":
             continue
-        g[name] = getattr(_nh, name)
+        g[name] = getattr(helper, name)
     exec(compile(source, "<macro %s>" % mid, "exec"), g)
     fn = g.get("macro") or g.get("main")
     if not callable(fn):
-        raise ValueError("a macro must define `def macro(ctx):` (or `def main(ctx):`)")
+        raise ValueError("a macro must define \`def macro(ctx):\` (or \`def main(ctx):\`)")
     return fn, _read_options(g.get("NEURON_OPTIONS"))
 
 
@@ -187,17 +351,24 @@ def _read_options(raw):
     return out
 
 
-def _check(source):
-    """Syntax + top-level def/class names. ast.parse only — no exec, zero side effects."""
+def _check(source, mode="raw"):
+    """Syntax + BOUND policy + top-level def/class names. Pure AST; never executes user source."""
     import ast
     try:
-        tree = ast.parse(source.lstrip("\ufeff"))  # same editor-BOM tolerance as _register
-        defs = [n.name for n in tree.body
-                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]
+        tree = ast.parse(source.lstrip("\ufeff"))
+        if mode == "bound":
+            tree = _validate_bound_module(source.lstrip("\ufeff"))
+        defs = [
+            n.name for n in tree.body
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        ]
         has_entry = any(d in ("macro", "main") for d in defs)
         return True, defs, has_entry, None
-    except SyntaxError:
-        return False, [], False, traceback.format_exc()
+    except SyntaxError as e:
+        line = e.lineno or 0
+        return False, [], False, "line %d: %s" % (line, e.msg)
+    except (ValueError, ImportError) as e:
+        return False, [], False, str(e)
 
 
 # -- bidirectional macro model: Python source -> a typed NODE TREE (the visual-constructor model) --
@@ -474,21 +645,54 @@ def _node_for_stmt(stmt):
 
 
 def _parse_nodes(source):
-    """Python source -> {"ok": true, "nodes": [...]} (the MacroNode wire shape), or
-    {"ok": false, "error": {"line", "msg"}} on a SyntaxError -- never raises."""
+    """Python source -> typed entry body plus exact module/entry source around it."""
     import ast
     try:
-        tree = ast.parse(source.lstrip("﻿"))  # same editor-BOM tolerance as _check/_register
+        tree = ast.parse(source.lstrip("\ufeff"))
     except SyntaxError as e:
         return {"ok": False, "error": {"line": e.lineno, "msg": str(e.msg)}}
-    # the macro body is the statements inside `def macro(ctx):` (or `def main(ctx):`). If there is no
-    # such def (a half-written macro), model the WHOLE module body so it still maps.
+
     body = tree.body
+    prefix = ""
+    header = "def macro(ctx):\n"
+    suffix = ""
+    entry = None
     for n in tree.body:
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in ("macro", "main"):
+            entry = n
             body = n.body
             break
-    return {"ok": True, "nodes": [_node_for_stmt(s) for s in body]}
+
+    if entry is not None:
+        lines = source.splitlines(keepends=True)
+        starts = [entry.lineno] + [d.lineno for d in entry.decorator_list]
+        start = max(0, min(starts) - 1)
+        end = entry.end_lineno or entry.lineno
+        prefix = "".join(lines[:start])
+        if body:
+            body_line = body[0].lineno - 1
+            header = "".join(lines[start:body_line])
+            # If the first statement shares a physical line with the suite colon, preserve the
+            # actual def/main/async/signature prefix and expand only the body onto visual lines.
+            # AST col offsets are UTF-8 byte offsets, so slice bytes rather than Python codepoints.
+            inline_prefix = (
+                lines[body_line].encode("utf-8")[:body[0].col_offset].decode("utf-8").rstrip()
+            )
+            if inline_prefix.strip():
+                header += inline_prefix + "\n"
+        else:
+            header = "".join(lines[start:end])
+            if not header.endswith("\n"):
+                header += "\n"
+        suffix = "".join(lines[end:])
+
+    return {
+        "ok": True,
+        "nodes": [_node_for_stmt(s) for s in body],
+        "prefix": prefix,
+        "header": header,
+        "suffix": suffix,
+    }
 
 
 # ── concurrent fires: one SERIAL worker per macro id ─────────────────────────────────────────────
@@ -696,7 +900,8 @@ _nh._set_host_dispatch(_dispatch_fire)   # neuron.invoke(wait=False): enqueue on
 
 
 def main():
-    _send({"t": "ready", "py": sys.version.split()[0], "platform": sys.platform})
+    _send({"t": "ready", "py": sys.version.split()[0], "platform": sys.platform,
+           "mode": _HOST_MODE})
     while True:
         try:
             msg = _read_frame()
@@ -735,14 +940,18 @@ def main():
         elif t == "discard_register":
             _discard_register(msg.get("token"))
         elif t == "check":
-            ok, defs, has_entry, err = _check(msg.get("source") or "")
+            ok, defs, has_entry, err = _check(
+                msg.get("source") or "", msg.get("mode") or "raw"
+            )
             _send({"t": "checked", "rid": msg.get("rid"), "ok": ok,
                    "defs": defs, "has_entry": has_entry, "error": err})
         elif t == "parse":
             # source -> typed node tree (the visual macro constructor's model). Pure ast, no exec.
             res = _parse_nodes(msg.get("source") or "")
             _send({"t": "parsed", "rid": msg.get("rid"), "ok": res.get("ok", False),
-                   "nodes": res.get("nodes"), "error": res.get("error")})
+                   "nodes": res.get("nodes"), "prefix": res.get("prefix"),
+                   "header": res.get("header"), "suffix": res.get("suffix"),
+                   "error": res.get("error")})
         elif t == "armed":
             _nh._set_armed(bool(msg.get("on")))
         elif t == "unregister":

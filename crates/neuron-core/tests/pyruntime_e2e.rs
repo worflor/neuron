@@ -80,7 +80,7 @@ fn bundled_sidecar_fires_a_macro() {
     host.set_armed(false); // read-only macro; no input synthesis
 
     // A macro that proves it ran ON the bundled interpreter: report sys.executable + a value.
-    let src = "import sys\ndef macro(ctx):\n    return 'exec=%s ok' % sys.executable\n";
+    let src = "# neuron: raw\nimport sys\ndef macro(ctx):\n    return 'exec=%s ok' % sys.executable\n";
     host.register("bundled_fire", src)
         .expect("register on bundled sidecar");
 

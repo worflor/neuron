@@ -494,15 +494,18 @@ The GUI and live dispatcher keep write pause state synchronized by not owning du
 
 ### 5.6 Macro Flow
 
-Python macros run through the Macro Host sidecar, not inside the app process. The GUI warms the sidecar after startup. Macro check/save/test paths use worker threads; syntax checking no longer waits on the sidecar from the UI callback.
+Python macros run through the Macro Host, never inside the app process. It owns two independently supervised warm bundled-CPython domains: BOUND (default) and RAW (`# neuron: raw`). Macro check/save/test paths use worker threads; registered dispatch remains non-blocking and performs only in-memory routing plus framed IPC on the live path.
 
 Safety model:
 
-- `Action::Run`, shell/file script tiers, input injection, and macro helper input synthesis respect the arm gate.
-- Shell/file launchers scrub the legacy `NEURON_INPUT_ARMED` environment variable as defense-in-depth, but runtime authority is the in-process safety state and explicit Macro Host arm frames.
-- The Macro Host uses `NEURON_PYTHON` or a bundled `runtime/python` interpreter when present. Falling back to system Python on `PATH` requires `NEURON_ALLOW_SYSTEM_PYTHON=1`.
-- Raw Python can still do arbitrary process actions by design; this is not sandboxed.
-- Macro beacon prompts route through `beacon.rs` so asking the user does not block the UI thread or the live dispatch worker.
+- BOUND and RAW never share an interpreter; each has its own warm session, breaker, queues and crash recovery.
+- BOUND receives curated imports/builtins and the public `neuron` capability proxy. Input, clipboard, focus, device/audio/OBS effects and persistent macro state are brokered through Rust.
+- Rust re-checks arm/mock state before effectful broker work. Python's helper-side check is ergonomic feedback, not the authority boundary.
+- BOUND is policy containment, not a hostile-code security sandbox. RAW remains unrestricted CPython by design and may bypass Neuron's arm gate through ambient APIs.
+- `# neuron: raw` is source-owned policy; the GUI edits that exact directive. Existing pre-policy files are migrated to RAW once so upgrades preserve authority.
+- Cross-domain invocation is monotonic: BOUND → RAW is refused; RAW → BOUND executes the target in the BOUND process.
+- The Macro Host uses the bundled runtime by default; `NEURON_PYTHON` is the explicit operator interpreter override. It does not discover Python from `PATH`.
+- Macro beacon prompts route through `beacon.rs`; prompt ids are domain-distinct and a dead sidecar retires only its own prompts.
 
 ### 5.7 Device Identity, Discovery, And Input Decode
 
@@ -687,14 +690,16 @@ Mitigation:
 
 ### Risk: Unsafe/App-Level Power
 
-Neuron deliberately runs unsandboxed Python and can synthesize input. The real protection is transparency and gates, not containment. System Python fallback is now explicit opt-in; raw shell strings remain a powerful trusted escape hatch rather than a sandboxed primitive.
+Neuron deliberately keeps a full-power RAW Python tier and can synthesize input. BOUND reduces ambient authority by routing ordinary macros through explicit capabilities, but it is not a hostile-code sandbox. The protection model is source-visible authority, process separation, host-side gates, and fail-closed broker semantics.
 
 Mitigation:
 
 - Maintain disarmed default for tests and non-live paths.
-- Keep `process_spawn_armed` and macro helper gates covered by tests.
-- Prefer structured program/argv launch forms for new features; keep raw shell as an explicit trusted escape hatch.
-- UI should make observe/device/input/live stance obvious and fast to change.
+- Keep host-side effect gating covered independently of Python helper checks.
+- Keep BOUND and RAW in separate interpreters and preserve the BOUND → RAW invocation prohibition.
+- Treat `# neuron: raw` and raw shell strings as explicit trusted escape hatches.
+- Prefer structured broker capabilities for new effects instead of expanding BOUND ambient authority.
+- UI should derive authority from source and make BOUND/RAW plus observe/device/input/live stance obvious.
 
 ### Risk: Cross-Platform Runtime Boundary
 
