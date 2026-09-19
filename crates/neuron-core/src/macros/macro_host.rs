@@ -14,7 +14,8 @@
 //! process means RAW cannot monkeypatch underneath the capability tier. Each lane has independent
 //! crash recovery/breaking. This is policy structure + reliability, not a claim that CPython itself
 //! is a hostile-code sandbox.
-//!//! ## Transport (the load-bearing isolation)
+//!
+//! ## Transport (the load-bearing isolation)
 //! Three standard pipes, the protocol NEVER on a stream a macro can reach:
 //!   * host→sidecar control  = child STDIN  (framed JSON)
 //!   * sidecar→host protocol = child STDOUT — but the host script dups its real stdout aside as the
