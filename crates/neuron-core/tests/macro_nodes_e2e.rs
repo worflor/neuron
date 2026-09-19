@@ -325,6 +325,18 @@ fn macro_nodes_round_trip_is_stable() {
     );
     assert_round_trip(raw_call, &rc);
 
+    // Whole-document parsing preserves the ACTUAL entry wrapper even when a hand-written entry
+    // uses a one-line suite. A canvas edit may expand the body, but must not rename main->macro or
+    // discard its signature/header metadata.
+    let one_line = "# neuron: raw\n# keep-header\ndef main(ctx, n=3): return n\n";
+    let one_doc = host.parse_document(one_line).expect("parse one-line document");
+    assert_eq!(one_doc.mode, neuron::macros::MacroMode::Raw);
+    let one_regen = neuron::macros::document_to_source(&one_doc);
+    assert!(one_regen.starts_with("# neuron: raw\n# keep-header\n"));
+    assert!(
+        one_regen.contains("def main(ctx, n=3):\n    return n\n"),
+        "one-line entry wrapper was canonicalized or lost: {one_regen}"
+    );
     // 23) MALFORMED source -> the Syntax error variant, NOT a panic and NOT a Host error.
     match host.parse_macro("def macro(ctx):\n    if neuron.ask(\"q\"\n") {
         Err(ParseError::Syntax { line, msg }) => {

@@ -625,15 +625,21 @@ def _parse_nodes(source):
         start = max(0, min(starts) - 1)
         end = entry.end_lineno or entry.lineno
         prefix = "".join(lines[:start])
-        if body and body[0].lineno > entry.lineno:
-            body_start = body[0].lineno - 1
-            header = "".join(lines[start:body_start])
-        elif not body:
+        if body:
+            body_line = body[0].lineno - 1
+            header = "".join(lines[start:body_line])
+            # If the first statement shares a physical line with the suite colon, preserve the
+            # actual def/main/async/signature prefix and expand only the body onto visual lines.
+            # AST col offsets are UTF-8 byte offsets, so slice bytes rather than Python codepoints.
+            inline_prefix = (
+                lines[body_line].encode("utf-8")[:body[0].col_offset].decode("utf-8").rstrip()
+            )
+            if inline_prefix.strip():
+                header += inline_prefix + "\n"
+        else:
             header = "".join(lines[start:end])
             if not header.endswith("\n"):
                 header += "\n"
-        else:
-            header = "def macro(ctx):\n"
         suffix = "".join(lines[end:])
 
     return {
