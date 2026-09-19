@@ -2121,14 +2121,15 @@ fn migrate_legacy_macro_dir(dir: &std::path::Path) -> Result<(), String> {
         return Ok(());
     }
     let rd = std::fs::read_dir(dir).map_err(|e| e.to_string())?;
-    for entry in rd.flatten() {
+    for entry in rd {
+        let entry = entry.map_err(|e| e.to_string())?;
         let path = entry.path();
         if path.extension().and_then(|x| x.to_str()) != Some("py") {
             continue;
         }
         let src = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
         let raw = match crate::macros::mode_from_source(&src) {
-            Ok(crate::macros::MacroMode::Raw) => src,
+            Ok(crate::macros::MacroMode::Raw) => continue,
             Ok(crate::macros::MacroMode::Bound) => {
                 crate::macros::set_source_mode(&src, crate::macros::MacroMode::Raw)
             }
@@ -2519,6 +2520,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let old = dir.join("old.py");
         std::fs::write(&old, "def macro(ctx):\n    return 1\n").unwrap();
+        let already_raw = dir.join("already_raw.py");
+        let raw_source = "# neuron: raw\ndef macro(ctx):\n    return 3\n";
+        std::fs::write(&already_raw, raw_source).unwrap();
 
         migrate_legacy_macro_dir(&dir).unwrap();
         let migrated = std::fs::read_to_string(&old).unwrap();
@@ -2526,6 +2530,7 @@ mod tests {
             crate::macros::mode_from_source(&migrated).unwrap(),
             crate::macros::MacroMode::Raw
         );
+        assert_eq!(std::fs::read_to_string(&already_raw).unwrap(), raw_source);
 
         let fresh = dir.join("fresh.py");
         std::fs::write(&fresh, "def macro(ctx):\n    return 2\n").unwrap();

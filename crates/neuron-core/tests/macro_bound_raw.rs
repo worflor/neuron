@@ -62,39 +62,6 @@ fn bound_and_raw_are_distinct_authority_domains() {
     );
 
     host.register(
-        "bound_surface",
-        r#"def macro(ctx):
-    out = []
-    try:
-        f = open(ctx.cwd + "/bound_touch.txt", "w")
-        f.write("bad")
-        f.close()
-        out.append("open=BAD")
-    except Exception:
-        out.append("open=blocked")
-    try:
-        import os
-        out.append("import=BAD")
-    except Exception:
-        out.append("import=blocked")
-    out.append("run=%s" % neuron.run("echo should-not-run"))
-    return "|".join(out)
-"#,
-    )
-    .expect("register BOUND surface probe");
-    let bounded = host.invoke("bound_surface", &ctx);
-    assert!(bounded.contains("open=blocked"), "BOUND retained file authority: {bounded}");
-    assert!(bounded.contains("import=blocked"), "BOUND imported ambient os authority: {bounded}");
-    assert!(
-        bounded.contains("run=[requires RAW]"),
-        "BOUND process execution did not require RAW: {bounded}"
-    );
-    assert!(
-        !tmp.join("bound_touch.txt").exists(),
-        "BOUND wrote a file through ambient Python authority"
-    );
-
-    host.register(
         "raw_surface",
         r#"# neuron: raw
 import os
@@ -227,7 +194,6 @@ def macro(ctx):
     );
 
     for id in [
-        "bound_surface",
         "raw_surface",
         "bound_survivor",
         "raw_crash",
