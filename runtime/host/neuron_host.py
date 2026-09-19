@@ -84,34 +84,39 @@ _macros = {}   # id -> callable(ctx)
 _errors = {}   # id -> last register/compile traceback (shown verbatim; never faked)
 
 
+def _compile_candidate(mid, source):
+    """Compile + execute one candidate namespace without mutating the live registry."""
+    # Notepad/PowerShell save UTF-8 WITH a BOM; compile() rejects U+FEFF as a stray
+    # non-printable. A macro must never fail for how an editor chose to save it.
+    source = source.lstrip("\ufeff")
+    g = {"__name__": "neuron_macro_%s" % mid, "neuron": _nh}
+    # inject the helper surface as bare globals too, so a macro can call clipboard_set(...)
+    # without the `neuron.` prefix (both styles work). `ctx` is EXCLUDED: snapshotting it at
+    # register time would freeze a stale world — macros read the live one via the function
+    # argument (`def macro(ctx):`) or `neuron.ctx` (per-thread, resolved at fire time).
+    for name in _nh.__all__:
+        if name == "ctx":
+            continue
+        g[name] = getattr(_nh, name)
+    exec(compile(source, "<macro %s>" % mid, "exec"), g)
+    fn = g.get("macro") or g.get("main")
+    if not callable(fn):
+        raise ValueError("a macro must define `def macro(ctx):` (or `def main(ctx):`)")
+    return fn, _read_options(g.get("NEURON_OPTIONS"))
+
+
 def _register(mid, source):
-    """exec a macro source once into its own namespace; capture `macro`/`main` as the entry."""
+    """Replace a live macro only after its candidate namespace finished successfully."""
     try:
-        # Notepad/PowerShell save UTF-8 WITH a BOM; compile() rejects U+FEFF as a stray
-        # non-printable. A macro must never fail for how an editor chose to save it.
-        source = source.lstrip("\ufeff")
-        g = {"__name__": "neuron_macro_%s" % mid, "neuron": _nh}
-        # inject the helper surface as bare globals too, so a macro can call clipboard_set(...)
-        # without the `neuron.` prefix (both styles work). `ctx` is EXCLUDED: snapshotting it at
-        # register time would freeze a stale world — macros read the live one via the function
-        # argument (`def macro(ctx):`) or `neuron.ctx` (per-thread, resolved at fire time).
-        for name in _nh.__all__:
-            if name == "ctx":
-                continue
-            g[name] = getattr(_nh, name)
-        exec(compile(source, "<macro %s>" % mid, "exec"), g)
-        fn = g.get("macro") or g.get("main")
-        if not callable(fn):
-            raise ValueError("a macro must define `def macro(ctx):` (or `def main(ctx):`)")
+        fn, opts = _compile_candidate(mid, source)
         _macros[mid] = fn
+        _opts[mid] = opts
         _errors.pop(mid, None)
-        _opts[mid] = _read_options(g.get("NEURON_OPTIONS"))
-        return True, _opts[mid]
+        return True, opts
     except BaseException:
+        # Keep the last-known-good callable/options alive. A typo in an edit is not a delete.
         tb = traceback.format_exc()
         _errors[mid] = tb
-        _macros.pop(mid, None)
-        _opts.pop(mid, None)
         return False, tb
 
 
@@ -489,16 +494,19 @@ sys.stdout = _stdout_mux
 
 _fire_queues = {}   # mid -> queue.Queue of fire msgs (one serial worker each)
 _fire_lock = threading.Lock()
+_FIRE_STOP = object()
 # A macro fired faster than it runs can't grow its backlog without bound: the per-macro queue is
 # capped, and a full queue DROPS THE NEWEST fire (with a log line) rather than blocking the protocol
 # loop — a blocked loop would deafen the whole sidecar.
 _FIRE_QUEUE_MAX = 256
+# Editor/CLI source tests run outside the registry so they can never persist or replace a live macro.
+# Bound their concurrency: a candidate can deliberately loop forever, but it can consume at most this
+# many daemon workers before further tests are refused instead of growing threads without limit.
+_EPHEMERAL_MAX = 4
+_ephemeral_slots = threading.BoundedSemaphore(_EPHEMERAL_MAX)
 
 
-def _fire(mid, ctx, opts, mock=False):
-    fn = _macros.get(mid)
-    if fn is None:
-        return False, None, _errors.get(mid, "macro '%s' not registered" % mid)
+def _fire_callable(mid, fn, ctx, opts, mock=False):
     _nh._set_ctx(ctx)
     _nh._set_mid(mid)
     _nh._set_options(opts)
@@ -516,10 +524,19 @@ def _fire(mid, ctx, opts, mock=False):
         _stdout_mux._local.target = None
 
 
+def _fire(mid, ctx, opts, mock=False):
+    fn = _macros.get(mid)
+    if fn is None:
+        return False, None, _errors.get(mid, "macro '%s' not registered" % mid)
+    return _fire_callable(mid, fn, ctx, opts, mock)
+
+
 def _fire_worker(mid, q):
     """One macro's serial fire loop: in-order execution, results framed back as they finish."""
     while True:
         msg = q.get()
+        if msg is _FIRE_STOP:
+            return
         ok, val, log = _fire(mid, msg.get("ctx") or {}, msg.get("options") or {}, bool(msg.get("mock")))
         _send({"t": "result", "rid": msg.get("rid"), "ok": ok,
                "value": val, "error": (None if ok else log), "log": (log if ok else None)})
@@ -527,6 +544,10 @@ def _fire_worker(mid, q):
 
 def _dispatch_fire(msg):
     mid = msg.get("id")
+    if _macros.get(mid) is None:
+        _send({"t": "result", "rid": msg.get("rid"), "ok": False, "value": None,
+               "error": _errors.get(mid, "macro '%s' not registered" % mid), "log": None})
+        return
     with _fire_lock:
         q = _fire_queues.get(mid)
         if q is None:
@@ -539,6 +560,58 @@ def _dispatch_fire(msg):
     except queue.Full:
         sys.stderr.write("[neuron] macro '%s' fire queue full (%d) — dropped a fire\n"
                          % (mid, _FIRE_QUEUE_MAX))
+
+
+def _retire_fire_worker(mid):
+    """Discard queued work and retire this id's serial worker after unregister."""
+    with _fire_lock:
+        q = _fire_queues.pop(mid, None)
+        if q is None:
+            return
+        while True:
+            try:
+                q.get_nowait()
+            except queue.Empty:
+                break
+        q.put_nowait(_FIRE_STOP)
+
+
+def _fire_source(msg):
+    """Compile + run one non-persistent source candidate on a bounded disposable worker."""
+    try:
+        mid = msg.get("id") or "__source__"
+        try:
+            fn, _ = _compile_candidate(mid, msg.get("source") or "")
+            ok, val, log = _fire_callable(
+                mid,
+                fn,
+                msg.get("ctx") or {},
+                msg.get("options") or {},
+                bool(msg.get("mock")),
+            )
+        except BaseException:
+            ok, val, log = False, None, traceback.format_exc()
+        _send({"t": "result", "rid": msg.get("rid"), "ok": ok,
+               "value": val, "error": (None if ok else log), "log": (log if ok else None)})
+    finally:
+        _ephemeral_slots.release()
+
+
+def _dispatch_source(msg):
+    if not _ephemeral_slots.acquire(blocking=False):
+        _send({"t": "result", "rid": msg.get("rid"), "ok": False, "value": None,
+               "error": "too many source tests are still running", "log": None})
+        return
+    try:
+        threading.Thread(
+            target=_fire_source,
+            args=(msg,),
+            name="source-%s" % (msg.get("id") or "test"),
+            daemon=True,
+        ).start()
+    except BaseException:
+        _ephemeral_slots.release()
+        raise
 
 
 # give the helper layer its two cross-macro hooks, now that the registry + dispatcher both exist:
@@ -558,6 +631,8 @@ def main():
         t = msg.get("t")
         if t == "fire":
             _dispatch_fire(msg)
+        elif t == "fire_source":
+            _dispatch_source(msg)
         elif t == "answer":
             # the user's (or host's) pick on an open prompt — wake the waiting macro.
             _nh._deliver_answer(msg.get("pid"), msg.get("choice"))
@@ -581,9 +656,11 @@ def main():
         elif t == "armed":
             _nh._set_armed(bool(msg.get("on")))
         elif t == "unregister":
-            _macros.pop(msg.get("id"), None)
-            _errors.pop(msg.get("id"), None)
-            _opts.pop(msg.get("id"), None)
+            mid = msg.get("id")
+            _macros.pop(mid, None)
+            _errors.pop(mid, None)
+            _opts.pop(mid, None)
+            _retire_fire_worker(mid)
         elif t == "ping":
             _send({"t": "pong", "rid": msg.get("rid")})
         elif t == "shutdown":
