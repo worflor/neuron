@@ -137,6 +137,34 @@ fn dead_sidecar_never_blocks_and_the_next_use_heals_it() {
     );
     eprintln!("recovered: pid {pid_before} -> {pid_after} (automatic on next use, no explicit re-warm)");
 
+    // A process can be alive while its CONTROL LOOP is dead: registration executes module top-level
+    // code on that loop, so an infinite top-level statement used to leave a forever-"warm" but deaf
+    // sidecar. The register deadline must retire that process, leave no durable candidate behind,
+    // and let the next normal use heal exactly like a crash does.
+    let hang_t0 = Instant::now();
+    let hung = host.register(
+        "respawn_hung",
+        "while True:\n    pass\n\ndef macro(ctx):\n    return 'never'\n",
+    );
+    assert!(hung.is_err(), "hung top-level registration unexpectedly succeeded");
+    assert!(
+        hang_t0.elapsed() < Duration::from_secs(8),
+        "hung registration exceeded its bounded control-plane deadline: {:?}",
+        hang_t0.elapsed()
+    );
+    assert!(
+        neuron::macros::macro_host::load_macro("respawn_hung").is_none(),
+        "a timed-out candidate must never become durable"
+    );
+
+    let healed_again = host.invoke("respawn_ok", &ctx);
+    let pid_after_hang = pid_of(&healed_again)
+        .unwrap_or_else(|| panic!("invoke after control-plane timeout did not recover: {healed_again}"));
+    assert_ne!(
+        pid_after_hang, pid_after,
+        "control-plane timeout must retire the deaf sidecar before the next use"
+    );
+
     host.unregister("respawn_ok");
     std::env::set_current_dir(prev).ok();
     let _ = std::fs::remove_dir_all(&tmp);
