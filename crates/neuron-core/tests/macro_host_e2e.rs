@@ -102,11 +102,11 @@ fn macro_host_warm_persists_and_isolates_errors() {
     // A failed REPLACEMENT is different from a macro that raises when fired: module top-level
     // execution happens during register. The old callable + file are the last-known-good revision
     // and must survive a broken edit.
-    let stable_src = "def macro(ctx):\n    return 'stable-old'\n";
-    host.register("e2e_stable", stable_src).expect("register stable baseline");
+    let stable_src = "# neuron: raw\ndef macro(ctx):\n    return 'stable-old'\n";
+    host.register("e2e_stable", stable_src).expect("register stable RAW baseline");
     let bad = host.register(
         "e2e_stable",
-        "raise RuntimeError('broken candidate')\ndef macro(ctx):\n    return 'never'\n",
+        "# neuron: raw\nraise RuntimeError('broken candidate')\ndef macro(ctx):\n    return 'never'\n",
     );
     assert!(bad.is_err(), "broken replacement must be rejected");
     let stable_after = host.invoke("e2e_stable", &ctx);
