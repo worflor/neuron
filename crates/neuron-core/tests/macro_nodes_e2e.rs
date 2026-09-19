@@ -332,7 +332,7 @@ fn macro_nodes_round_trip_is_stable() {
     let one_doc = host.parse_document(one_line).expect("parse one-line document");
     assert_eq!(one_doc.mode, neuron::macros::MacroMode::Raw);
     let one_regen = neuron::macros::document_to_source(&one_doc);
-    assert!(one_regen.starts_with("# neuron: raw\n# keep-header\n"));
+    assert!(one_regen.starts_with("# neuron: raw\n# keep-header\n"), "regenerated header: {one_regen:?}");
     assert!(
         one_regen.contains("def main(ctx, n=3):\n    return n\n"),
         "one-line entry wrapper was canonicalized or lost: {one_regen}"

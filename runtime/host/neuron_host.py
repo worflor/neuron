@@ -949,7 +949,9 @@ def main():
             # source -> typed node tree (the visual macro constructor's model). Pure ast, no exec.
             res = _parse_nodes(msg.get("source") or "")
             _send({"t": "parsed", "rid": msg.get("rid"), "ok": res.get("ok", False),
-                   "nodes": res.get("nodes"), "error": res.get("error")})
+                   "nodes": res.get("nodes"), "prefix": res.get("prefix"),
+                   "header": res.get("header"), "suffix": res.get("suffix"),
+                   "error": res.get("error")})
         elif t == "armed":
             _nh._set_armed(bool(msg.get("on")))
         elif t == "unregister":
