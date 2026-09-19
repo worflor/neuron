@@ -1010,8 +1010,6 @@ impl MacroHost {
             "[python runtime unavailable]".into()
         } else {
             format!("macro '{id}' — sidecar warming, press again")
-        } else {
-            "[python runtime unavailable]".into()
         }
     }
 
