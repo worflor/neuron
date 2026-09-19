@@ -1895,6 +1895,147 @@ fn press_mouse(button: MouseButtonKind) -> String {
     format!("mouse {}: windows-only", button.label())
 }
 
+/// Narrow native effects exposed to the BOUND macro broker. These reuse the same SendInput gate and
+/// key/mouse primitives as ordinary Actions; Python no longer owns a parallel input implementation.
+pub(crate) fn macro_key(name: &str) -> String {
+    press_key(name)
+}
+
+pub(crate) fn macro_hotkey(keys: &[String]) -> String {
+    press_key(&keys.join("+"))
+}
+
+pub(crate) fn macro_key_down(name: &str) -> String {
+    if !input_armed() {
+        return "[disarmed]".into();
+    }
+    let Some(vk) = vk_for(name) else {
+        return format!("[unknown key {name:?}]");
+    };
+    #[cfg(windows)]
+    unsafe {
+        win_key::down(vk);
+        return "ok".into();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = vk;
+        "[unsupported]".into()
+    }
+}
+
+pub(crate) fn macro_key_up(name: &str) -> String {
+    if !input_armed() {
+        return "[disarmed]".into();
+    }
+    let Some(vk) = vk_for(name) else {
+        return format!("[unknown key {name:?}]");
+    };
+    #[cfg(windows)]
+    unsafe {
+        win_key::up(vk);
+        return "ok".into();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = vk;
+        "[unsupported]".into()
+    }
+}
+
+pub(crate) fn macro_type_text(text: &str) -> String {
+    if !input_armed() {
+        return "[disarmed]".into();
+    }
+    #[cfg(windows)]
+    unsafe {
+        for ch in text.chars() {
+            win_key::unicode(ch);
+        }
+        return "ok".into();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = text;
+        "[unsupported]".into()
+    }
+}
+
+pub(crate) fn macro_type_ghost(text: &str, speed: &str) -> String {
+    if !input_armed() {
+        return "[disarmed]".into();
+    }
+    #[cfg(windows)]
+    {
+        ghost_type(text, GhostSpeed::parse(speed));
+        return "ok".into();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (text, speed);
+        "[unsupported]".into()
+    }
+}
+
+pub(crate) fn macro_click(button: &str) -> String {
+    let button = match button.trim().to_lowercase().as_str() {
+        "right" => MouseButtonKind::Right,
+        "middle" => MouseButtonKind::Middle,
+        "back" | "x1" => MouseButtonKind::Back,
+        "forward" | "x2" => MouseButtonKind::Forward,
+        _ => MouseButtonKind::Left,
+    };
+    press_mouse(button)
+}
+
+pub(crate) fn macro_scroll(notches: i32) -> String {
+    if !input_armed() {
+        return "[disarmed]".into();
+    }
+    #[cfg(windows)]
+    unsafe {
+        win_mouse::scroll_vertical(notches);
+        return "ok".into();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = notches;
+        "[unsupported]".into()
+    }
+}
+
+pub(crate) fn macro_mouse_move(dx: i32, dy: i32) -> String {
+    if !input_armed() {
+        return "[disarmed]".into();
+    }
+    #[cfg(windows)]
+    unsafe {
+        win_mouse::move_relative(dx, dy);
+        return "ok".into();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (dx, dy);
+        "[unsupported]".into()
+    }
+}
+
+pub(crate) fn macro_mouse_to(x: i32, y: i32) -> String {
+    if !input_armed() {
+        return "[disarmed]".into();
+    }
+    #[cfg(windows)]
+    unsafe {
+        win_mouse::move_absolute_screen(x, y);
+        return "ok".into();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (x, y);
+        "[unsupported]".into()
+    }
+}
+
 /// Arm or disarm real input synthesis process-wide.
 ///
 /// The authority lives in [`crate::safety`], not in the process environment. The Macro Host receives
@@ -2023,9 +2164,10 @@ mod win_key {
 mod win_mouse {
     use super::MouseButtonKind;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
-        MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_RIGHTDOWN,
-        MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, MOUSE_EVENT_FLAGS,
+        SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
+        MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
+        MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL,
+        MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, MOUSE_EVENT_FLAGS,
     };
 
     // These live under `WindowsAndMessaging` in windows-sys; inlined as literals (their values are
@@ -2103,6 +2245,27 @@ mod win_mouse {
                 send(&[mk(MOUSEEVENTF_HWHEEL, WHEEL_DELTA)]);
             }
         }
+    }
+
+    pub unsafe fn scroll_vertical(notches: i32) {
+        send(&[mk(MOUSEEVENTF_WHEEL, notches.saturating_mul(WHEEL_DELTA))]);
+    }
+
+    pub unsafe fn move_relative(dx: i32, dy: i32) {
+        let mut input = mk(MOUSEEVENTF_MOVE, 0);
+        input.Anonymous.mi.dx = dx;
+        input.Anonymous.mi.dy = dy;
+        send(&[input]);
+    }
+
+    pub unsafe fn move_absolute_screen(x: i32, y: i32) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::GetSystemMetrics;
+        let w = GetSystemMetrics(0).max(1);
+        let h = GetSystemMetrics(1).max(1);
+        let mut input = mk(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE, 0);
+        input.Anonymous.mi.dx = x.saturating_mul(65535) / w;
+        input.Anonymous.mi.dy = y.saturating_mul(65535) / h;
+        send(&[input]);
     }
 
     /// Press a button DOWN, hold `ms`, then release — the mouse analogue of a held key. The release

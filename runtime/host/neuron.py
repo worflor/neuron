@@ -4,14 +4,13 @@
 """
 neuron — the host module every Macro Host macro can use.
 
-FULL RAW POWER IS YOURS. A macro is real CPython in a real process: `import ctypes` and call any
-Win32 entry point, `import subprocess` and run anything, open sockets, read/write files — literally
-anything a program can do. These helpers are just the common conveniences so you don't have to.
+RAW macros are ordinary full-power CPython. BOUND macros receive this module only through a public
+capability proxy: computation stays Python, while machine effects are brokered by the Rust host.
+The same helper names work in both modes; arbitrary process execution requires RAW.
 
-The INPUT-SYNTHESIS helpers (key, type_text, mouse_*, click, scroll, hotkey, run) honour Neuron's
-SAFE/disarm switch: when input is disarmed they no-op and return a "[disarmed]" marker instead of
-firing — so SAFE mode is a real guardrail on this convenience layer. Reaching past them (raw
-ctypes SendInput) does NOT consult the gate — that's your own rope, by design.
+SAFE/disarm is enforced twice for brokered effects: the helper gives immediate feedback and Rust
+re-checks before acting. RAW code may deliberately bypass helpers through ctypes; that is the explicit
+authority escalation selected by "# neuron: raw".
 """
 
 import sys
@@ -494,7 +493,10 @@ def _act(verb, arg=None, timeout=5.0, gated=True):
         _act_seq[0] += 1
         rid = _act_seq[0]
         _acts[rid] = {"event": ev, "ok": False, "msg": None}
-    _host_send({"t": "act", "rid": rid, "verb": verb, "arg": arg})
+    _host_send({
+        "t": "act", "rid": rid, "id": getattr(_tls, "mid", "?"),
+        "verb": verb, "arg": arg, "mock": getattr(_tls, "mock", False),
+    })
     done = ev.wait(timeout)
     with _act_lock:
         slot = _acts.pop(rid, None)
@@ -781,6 +783,8 @@ if _IS_WIN:
 
 def key(name):
     """Press a key by name ('f', 'enter', 'f5', 'ctrl'…). down+up. Arm-gated."""
+    if _BOUND:
+        return _act("key", str(name))
     if not _IS_WIN:
         return "[unsupported]"
     vk = _vk(name)
@@ -793,6 +797,8 @@ def key(name):
 
 
 def key_down(name):
+    if _BOUND:
+        return _act("key_down", str(name))
     if not _IS_WIN:
         return "[unsupported]"
     vk = _vk(name)
@@ -805,6 +811,8 @@ def key_down(name):
 
 
 def key_up(name):
+    if _BOUND:
+        return _act("key_up", str(name))
     if not _IS_WIN:
         return "[unsupported]"
     vk = _vk(name)
@@ -818,6 +826,8 @@ def key_up(name):
 
 def hotkey(*keys):
     """Fire a chord: hotkey('ctrl','shift','v'). down in order, up in reverse. Arm-gated."""
+    if _BOUND:
+        return _act("hotkey", [str(k) for k in keys])
     if not _IS_WIN:
         return "[unsupported]"
     vks = [_vk(k) for k in keys]
@@ -831,6 +841,8 @@ def hotkey(*keys):
 
 def type_text(s):
     """Type a literal Unicode string as keystrokes, all at once. Arm-gated."""
+    if _BOUND:
+        return _act("type_text", str(s))
     if not _IS_WIN:
         return "[unsupported]"
     if _gated():
@@ -856,10 +868,11 @@ _GHOST_SPEED = {
 
 
 def type_ghost(s, speed="borderline"):
-    """GHOST-TYPE a string: keystroke by keystroke with jittered, organic timing — the same
-    pipeline the native ghost-paste action uses, so it lands in game chats / RDP / VMs that block
-    paste. `speed` = 'instant' | 'borderline' | 'fast' | 'normal'. Real Enter for newlines, Tab
-    for tabs. Re-checks the arm gate before every key. Arm-gated."""
+    """GHOST-TYPE a string with the native ghost-paste cadence. Arm-gated."""
+    if _BOUND:
+        # normal pace is ~165ms/char plus pauses; size the reply wait to the requested work.
+        timeout = max(5.0, len(str(s)) * 0.35 + 2.0)
+        return _act("type_ghost", {"text": str(s), "speed": str(speed)}, timeout=timeout)
     if not _IS_WIN:
         return "[unsupported]"
     if _gated():
@@ -905,6 +918,8 @@ def type_ghost(s, speed="borderline"):
 
 def mouse_move(dx, dy):
     """Move the cursor by a relative delta. Arm-gated."""
+    if _BOUND:
+        return _act("mouse_move", {"dx": int(dx), "dy": int(dy)})
     if not _IS_WIN:
         return "[unsupported]"
     if _gated():
@@ -915,6 +930,8 @@ def mouse_move(dx, dy):
 
 def mouse_to(x, y):
     """Move the cursor to an absolute primary-screen pixel. Arm-gated."""
+    if _BOUND:
+        return _act("mouse_to", {"x": int(x), "y": int(y)})
     if not _IS_WIN:
         return "[unsupported]"
     if _gated():
@@ -929,6 +946,8 @@ def mouse_to(x, y):
 
 def click(button="left"):
     """Click a mouse button ('left'|'right'|'middle'). Arm-gated."""
+    if _BOUND:
+        return _act("click", str(button))
     if not _IS_WIN:
         return "[unsupported]"
     if _gated():
@@ -946,6 +965,8 @@ def click(button="left"):
 
 def scroll(notches):
     """Scroll the wheel by `notches` (positive = up/away). Arm-gated."""
+    if _BOUND:
+        return _act("scroll", int(notches))
     if not _IS_WIN:
         return "[unsupported]"
     if _gated():
@@ -956,6 +977,9 @@ def scroll(notches):
 
 def clipboard_get():
     """Read the clipboard's Unicode text (read-only, never gated). None if empty/non-text."""
+    if _BOUND:
+        s = _act("clipboard_get", gated=False)
+        return None if not s or str(s).startswith("[") else s
     if not _IS_WIN:
         return None
     if _user32.OpenClipboard(0) == 0:
@@ -977,6 +1001,8 @@ def clipboard_get():
 
 def clipboard_set(s):
     """Put a string on the clipboard (CF_UNICODETEXT). Arm-gated (it mutates user state)."""
+    if _BOUND:
+        return _act("clipboard_set", str(s))
     if not _IS_WIN:
         return "[unsupported]"
     if _gated():
@@ -1000,8 +1026,9 @@ def clipboard_set(s):
 
 
 def run(cmd, wait=False):
-    """Run a command line. Fire-and-forget by default; wait=True returns (code, stdout). Arm-gated
-    (process spawn is a real side effect). Armed authority is stripped from the child's env."""
+    """Run a command line. Arbitrary process execution is the explicit RAW escape hatch."""
+    if _BOUND:
+        return "[requires RAW]"
     if _gated():
         return "[disarmed]"
     env = dict(os.environ)
@@ -1018,8 +1045,9 @@ def run(cmd, wait=False):
 
 
 def focus(title):
-    """Bring a window to the foreground by exact title. Arm-gated. (Best-effort; Windows may keep
-    foreground lock — for restoring the pre-macro window prefer the host's restore path.)"""
+    """Bring a window to the foreground by exact title. Arm-gated."""
+    if _BOUND:
+        return _act("focus", str(title))
     if not _IS_WIN:
         return "[unsupported]"
     if _gated():

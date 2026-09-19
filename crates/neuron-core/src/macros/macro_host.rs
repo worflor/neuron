@@ -1377,7 +1377,7 @@ fn open_capable(cap: crate::registry::Capability) -> Option<crate::device::Devic
 /// one source of truth. Reads (`battery`/`current_dpi`/`active_profile`/`scroll_stage`) let a macro
 /// SENSE live state and react. Audio + brightness reuse the same Core-Audio / capability code the
 /// bound actions use. Returns `(ok, message)` — for a read, the message IS the value.
-fn run_act(verb: &str, arg: &Value) -> (bool, String) {
+fn run_act(_mode: MacroMode, _macro_id: &str, verb: &str, arg: &Value, mock: bool) -> (bool, String) {
     use crate::action::{Direction, Intent};
     use crate::capability as cap;
 
@@ -1404,6 +1404,66 @@ fn run_act(verb: &str, arg: &Value) -> (bool, String) {
             }
         }
         _ => {}
+    }
+
+    // The host is the authority boundary. Python's helper-side gate is useful fast feedback, but a
+    // forged act frame must still be unable to synthesize input, mutate the clipboard/audio/device,
+    // focus windows or drive an external integration while SAFE mode is active.
+    let read_only = matches!(
+        verb,
+        "active_profile" | "scroll_stage" | "battery" | "current_dpi" | "clipboard_get" | "obs_get" | "signal"
+    );
+    if !read_only && (mock || !crate::action::input_armed()) {
+        return (false, "[disarmed]".into());
+    }
+
+    // ── BOUND HOST EFFECTS: same native input/clipboard/focus primitives Neuron already owns ─────
+    let native = match verb {
+        "key" => arg.as_str().map(crate::action::macro_key),
+        "key_down" => arg.as_str().map(crate::action::macro_key_down),
+        "key_up" => arg.as_str().map(crate::action::macro_key_up),
+        "hotkey" => arg.as_array().map(|a| {
+            let keys: Vec<String> = a.iter().filter_map(Value::as_str).map(str::to_string).collect();
+            crate::action::macro_hotkey(&keys)
+        }),
+        "type_text" => arg.as_str().map(crate::action::macro_type_text),
+        "type_ghost" => {
+            let text = arg.get("text").and_then(Value::as_str);
+            let speed = arg.get("speed").and_then(Value::as_str).unwrap_or("borderline");
+            text.map(|text| crate::action::macro_type_ghost(text, speed))
+        }
+        "click" => arg.as_str().map(crate::action::macro_click),
+        "scroll" => arg.as_i64().map(|n| crate::action::macro_scroll(n.clamp(i32::MIN as i64, i32::MAX as i64) as i32)),
+        "mouse_move" => {
+            let dx = arg.get("dx").and_then(Value::as_i64);
+            let dy = arg.get("dy").and_then(Value::as_i64);
+            match (dx, dy) {
+                (Some(dx), Some(dy)) => Some(crate::action::macro_mouse_move(dx as i32, dy as i32)),
+                _ => None,
+            }
+        }
+        "mouse_to" => {
+            let x = arg.get("x").and_then(Value::as_i64);
+            let y = arg.get("y").and_then(Value::as_i64);
+            match (x, y) {
+                (Some(x), Some(y)) => Some(crate::action::macro_mouse_to(x as i32, y as i32)),
+                _ => None,
+            }
+        }
+        "clipboard_get" => return (true, crate::pocket::macro_clipboard_get().unwrap_or_default()),
+        "clipboard_set" => {
+            return match arg.as_str() {
+                Some(text) if crate::pocket::macro_clipboard_set(text) => (true, "ok".into()),
+                Some(_) => (false, "clipboard write failed".into()),
+                None => (false, "clipboard_set(text): text must be a string".into()),
+            }
+        }
+        "focus" => arg.as_str().map(crate::macros::context::focus_title),
+        _ => None,
+    };
+    if let Some(msg) = native {
+        let ok = !msg.starts_with('[') && !msg.starts_with("unknown") && !msg.ends_with("failed");
+        return (ok, msg);
     }
 
     // ── AUDIO: the system mixer (mic capture + output render), via Core Audio ────────────────────
@@ -1703,6 +1763,8 @@ fn reader_loop(
                     .unwrap_or("")
                     .to_string();
                 let arg = v.get("arg").cloned().unwrap_or(Value::Null);
+                let macro_id = v.get("id").and_then(Value::as_str).unwrap_or("?").to_string();
+                let mock = v.get("mock").and_then(Value::as_bool).unwrap_or(false);
                 let stdin = stdin.clone();
                 // The `act_result` frame is MANDATORY — the macro blocks on it. The worker only
                 // RUNS the verb and returns its outcome; `done` sends the frame exactly once,
@@ -1710,7 +1772,7 @@ fn reader_loop(
                 // failure result in the latter cases) — so the macro can never hang waiting.
                 crate::worker::spawn_notify(
                     "macro-host-act",
-                    move || run_act(&verb, &arg),
+                    move || run_act(mode, &macro_id, &verb, &arg, mock),
                     move |outcome| {
                         let (ok, msg) = outcome.unwrap_or_else(|| {
                             (false, "act worker could not run (thread refused or panicked)".into())

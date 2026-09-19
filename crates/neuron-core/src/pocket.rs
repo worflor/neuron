@@ -738,6 +738,29 @@ fn read_clip_state() -> ClipState {
 }
 
 /// Write the clipboard — the in-memory test clipboard if installed, else the OS.
+/// Text-only capability used by the BOUND macro broker. It goes through the same full clipboard
+/// serializer/test seam as pockets, so it inherits the process-wide clipboard lock and retry rules.
+pub(crate) fn macro_clipboard_get() -> Option<String> {
+    match read_clip_state() {
+        ClipState::Carryable(p) => p.get(CF_UNICODETEXT).map(utf16_to_string),
+        ClipState::Empty | ClipState::Uncarryable => None,
+    }
+}
+
+pub(crate) fn macro_clipboard_set(text: &str) -> bool {
+    if !crate::action::input_armed() {
+        return false;
+    }
+    let mut bytes: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    bytes.extend_from_slice(&[0, 0]);
+    set_clipboard(&Pocket {
+        formats: vec![ClipFormat {
+            id: CF_UNICODETEXT,
+            bytes,
+        }],
+    })
+}
+
 fn set_clipboard(p: &Pocket) -> bool {
     let mut g = fake_clip().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     match g.as_ref() {

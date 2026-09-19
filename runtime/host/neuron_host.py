@@ -26,6 +26,7 @@ import queue
 import struct
 import threading
 import traceback
+import builtins as _builtins
 
 _HOST_MODE = os.environ.get("NEURON_MACRO_MODE", "raw").strip().lower()
 _BOUND = _HOST_MODE == "bound"
@@ -83,6 +84,119 @@ import neuron as _nh  # noqa: E402  (after the fd dance, intentionally)
 
 _nh._set_host_send(_send)  # give the beacon layer (ask/notify) the framed protocol writer
 
+# BOUND is policy containment, not a claim that CPython can execute hostile code safely. Its purpose
+# is to make ordinary and agent-authored macros capability-first while RAW remains one source line
+# away. Reflective/private surfaces are refused rather than advertised as contained.
+_BOUND_IMPORTS = {
+    "__future__", "collections", "datetime", "functools", "itertools", "json", "math",
+    "operator", "random", "re", "statistics", "string", "time",
+}
+_RAW_ONLY_HELPERS = {"run"}
+
+
+def _requires_raw(*_args, **_kwargs):
+    return "[requires RAW]"
+
+
+class _BoundNeuron:
+    __slots__ = ()
+
+    def __getattr__(self, name):
+        if name not in _nh.__all__:
+            raise AttributeError("bound neuron has no capability %r" % name)
+        if name in _RAW_ONLY_HELPERS:
+            return _requires_raw
+        return getattr(_nh, name)
+
+
+_BOUND_NEURON = _BoundNeuron()
+_REAL_IMPORT = _builtins.__import__
+
+
+def _bound_import(name, globals=None, locals=None, fromlist=(), level=0):
+    root = name.split(".", 1)[0]
+    if level:
+        raise ImportError("relative imports require RAW mode")
+    if root == "neuron":
+        return _BOUND_NEURON
+    if root not in _BOUND_IMPORTS:
+        raise ImportError("import %r requires RAW mode" % root)
+    return _REAL_IMPORT(name, globals, locals, fromlist, level)
+
+
+_BOUND_BUILTINS = dict(vars(_builtins))
+for _name in (
+    "open", "eval", "exec", "compile", "input", "breakpoint",
+    "getattr", "setattr", "delattr", "globals", "locals", "vars", "dir", "type",
+):
+    _BOUND_BUILTINS.pop(_name, None)
+_BOUND_BUILTINS["__import__"] = _bound_import
+
+
+def _literal_expr(node):
+    import ast
+    try:
+        ast.literal_eval(node)
+        return True
+    except Exception:
+        return False
+
+
+def _validate_bound_module(source):
+    """Refuse ambient authority and registration-time executable module initialization."""
+    import ast
+    tree = ast.parse(source)
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and node.attr.startswith("_"):
+            raise ValueError("private/dunder attribute access requires RAW mode")
+        if isinstance(node, ast.Name) and node.id.startswith("__"):
+            raise ValueError("dunder names require RAW mode")
+
+    for stmt in tree.body:
+        if (
+            isinstance(stmt, ast.Expr)
+            and isinstance(stmt.value, ast.Constant)
+            and isinstance(stmt.value.value, str)
+        ):
+            continue
+        if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+            names = [a.name.split(".", 1)[0] for a in stmt.names]
+            if isinstance(stmt, ast.ImportFrom) and stmt.module:
+                names.append(stmt.module.split(".", 1)[0])
+            if any(n not in _BOUND_IMPORTS and n != "neuron" for n in names):
+                raise ValueError("module import requires RAW mode")
+            continue
+        if isinstance(stmt, ast.Assign):
+            if not _literal_expr(stmt.value):
+                raise ValueError("executable module assignment requires RAW mode")
+            continue
+        if isinstance(stmt, ast.AnnAssign):
+            if stmt.value is not None and not _literal_expr(stmt.value):
+                raise ValueError("executable module assignment requires RAW mode")
+            continue
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if stmt.decorator_list:
+                raise ValueError("decorators execute at registration and require RAW mode")
+            defaults = list(stmt.args.defaults) + [d for d in stmt.args.kw_defaults if d is not None]
+            if any(not _literal_expr(d) for d in defaults):
+                raise ValueError("executable function defaults require RAW mode")
+            annotations = [a.annotation for a in stmt.args.args + stmt.args.kwonlyargs if a.annotation]
+            if stmt.args.vararg and stmt.args.vararg.annotation:
+                annotations.append(stmt.args.vararg.annotation)
+            if stmt.args.kwarg and stmt.args.kwarg.annotation:
+                annotations.append(stmt.args.kwarg.annotation)
+            if stmt.returns:
+                annotations.append(stmt.returns)
+            if annotations:
+                raise ValueError("runtime-evaluated function annotations require RAW mode")
+            continue
+        raise ValueError(
+            "%s at module scope executes during registration and requires RAW mode"
+            % type(stmt).__name__
+        )
+
+
 _macros = {}   # id -> callable(ctx)
 _gens = {}     # id -> active source generation
 _staged = {}   # token -> (id, callable, options, generation), invisible until commit
@@ -90,23 +204,28 @@ _errors = {}   # id -> last register/compile traceback (shown verbatim; never fa
 
 
 def _compile_candidate(mid, source):
-    """Compile + execute one candidate namespace without mutating the live registry."""
-    # Notepad/PowerShell save UTF-8 WITH a BOM; compile() rejects U+FEFF as a stray
-    # non-printable. A macro must never fail for how an editor chose to save it.
+    """Compile one candidate namespace under this sidecar's execution domain."""
     source = source.lstrip("\ufeff")
-    g = {"__name__": "neuron_macro_%s" % mid, "neuron": _nh}
-    # inject the helper surface as bare globals too, so a macro can call clipboard_set(...)
-    # without the `neuron.` prefix (both styles work). `ctx` is EXCLUDED: snapshotting it at
-    # register time would freeze a stale world — macros read the live one via the function
-    # argument (`def macro(ctx):`) or `neuron.ctx` (per-thread, resolved at fire time).
+    if _BOUND:
+        _validate_bound_module(source)
+        helper = _BOUND_NEURON
+        g = {
+            "__name__": "neuron_macro_%s" % mid,
+            "__builtins__": _BOUND_BUILTINS,
+            "neuron": helper,
+        }
+    else:
+        helper = _nh
+        g = {"__name__": "neuron_macro_%s" % mid, "neuron": helper}
+
     for name in _nh.__all__:
         if name == "ctx":
             continue
-        g[name] = getattr(_nh, name)
+        g[name] = getattr(helper, name)
     exec(compile(source, "<macro %s>" % mid, "exec"), g)
     fn = g.get("macro") or g.get("main")
     if not callable(fn):
-        raise ValueError("a macro must define `def macro(ctx):` (or `def main(ctx):`)")
+        raise ValueError("a macro must define \`def macro(ctx):\` (or \`def main(ctx):\`)")
     return fn, _read_options(g.get("NEURON_OPTIONS"))
 
 
