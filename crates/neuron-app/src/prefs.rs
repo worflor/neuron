@@ -82,7 +82,7 @@ pub struct Prefs {
     /// Default is the house look, Directed Intent.
     #[serde(default = "default_material")]
     pub weave_material: String,
-    /// PHOENIX — let the OS relaunch Neuron after a crash/hang (RegisterApplicationRestart). Default
+    /// PHOENIX — let the OS relaunch Neuron after a crash/hang (`RegisterApplicationRestart`). Default
     /// ON: the always-on flight recorder + an automatic respawn is the whole reliability story. Takes
     /// effect at the next launch (the OS registration happens once, at startup).
     #[serde(default = "default_true")]
@@ -158,7 +158,7 @@ pub struct Prefs {
     #[serde(default = "default_stack_mode")]
     pub notif_stack: String,
     /// CONNECTIONS master switch — let other software drive the lighting THROUGH neuron's arbiter
-    /// (games speak Razer Chroma, tools speak OpenRGB), composing ABOVE the configured base stack
+    /// (games speak Razer Chroma, tools speak `OpenRGB`), composing ABOVE the configured base stack
     /// instead of fighting it for the device. Default OFF: turning it on opens two loopback ports
     /// and changes who may paint the boards — that stays a conscious opt-in (SYSTEM → CONNECTIONS).
     #[serde(default)]
@@ -167,7 +167,7 @@ pub struct Prefs {
     /// Gated by `host_enabled`; default ON so enabling connections is one switch, not three.
     #[serde(default = "default_true")]
     pub host_chroma: bool,
-    /// Serve the OpenRGB SDK protocol (localhost:6742) — what RGB tools / Home Assistant speak.
+    /// Serve the `OpenRGB` SDK protocol (localhost:6742) — what RGB tools / Home Assistant speak.
     /// Gated by `host_enabled`; default ON, same one-switch reasoning as `host_chroma`.
     #[serde(default = "default_true")]
     pub host_openrgb: bool,
@@ -178,7 +178,7 @@ pub struct Prefs {
     #[serde(default)]
     pub host_obs: bool,
     /// CHROMA (games) paint lane — HOW a game's Chroma frame combines with your base lighting,
-    /// the emergent config no last-writer-wins tool (Synapse, OpenRGB) can offer because only an
+    /// the emergent config no last-writer-wins tool (Synapse, `OpenRGB`) can offer because only an
     /// arbiter has the concept: "replace" (the game takes the keys it paints outright), "merge"
     /// (default — SCREENED over your base so its bright keys punch through while your lighting
     /// stays underneath), "boost" (added) or "tint" (multiplied). Applies live to REST + native
@@ -192,19 +192,19 @@ pub struct Prefs {
     #[serde(default = "default_chroma_paint_fade_ms")]
     pub host_chroma_paint_fade_ms: u32,
     /// OPENRGB (tools) paint lane — same domain as the Chroma lane, its own settings. Defaults to
-    /// "replace" so OpenRGB config tools keep their classic hard-takeover feel (a set colour
+    /// "replace" so `OpenRGB` config tools keep their classic hard-takeover feel (a set colour
     /// appears as-sent) until the user opts into blending.
     #[serde(default = "default_openrgb_paint_mode")]
     pub host_openrgb_paint_mode: String,
-    /// OpenRGB paint opacity, 0..=100.
+    /// `OpenRGB` paint opacity, 0..=100.
     #[serde(default = "default_paint_strength")]
     pub host_openrgb_paint_strength: u8,
-    /// OpenRGB crossfade time in milliseconds, 0..=2500. Default 0 (instant), matching the
+    /// `OpenRGB` crossfade time in milliseconds, 0..=2500. Default 0 (instant), matching the
     /// hard-takeover default mode.
     #[serde(default)]
     pub host_openrgb_paint_fade_ms: u32,
     /// UNIVERSAL hands-off list: physical device ids excluded from ALL external paint (Chroma AND
-    /// OpenRGB). Empty means every attached lighting-capable device is included, including future
+    /// `OpenRGB`). Empty means every attached lighting-capable device is included, including future
     /// hotplug.
     #[serde(default)]
     pub host_paint_disabled_devices: Vec<String>,
@@ -890,12 +890,12 @@ pub fn set_host_chroma(v: bool) -> String {
     }
 }
 
-/// Read the OpenRGB (tools) protocol gate (default ON; meaningful only while connections are open).
+/// Read the `OpenRGB` (tools) protocol gate (default ON; meaningful only while connections are open).
 pub fn host_openrgb() -> bool {
     Prefs::load().host_openrgb
 }
 
-/// Persist the OpenRGB protocol gate, returning a user-facing status line.
+/// Persist the `OpenRGB` protocol gate, returning a user-facing status line.
 pub fn set_host_openrgb(v: bool) -> String {
     let mut p = Prefs::load();
     p.host_openrgb = v;
@@ -960,7 +960,7 @@ fn normalize_paint_mode(v: &str) -> &'static str {
     }
 }
 
-/// The SplitToggle index for a paint mode (0 replace, 1 merge, 2 boost, 3 tint).
+/// The `SplitToggle` index for a paint mode (0 replace, 1 merge, 2 boost, 3 tint).
 fn paint_mode_index(mode: &str) -> i32 {
     match mode {
         "replace" => 0,

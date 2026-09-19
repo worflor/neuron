@@ -90,7 +90,7 @@ fn mem_load_norm(pct: u32) -> f32 {
 /// dead-code warning on a non-Windows build, where only the inert `stub` reads the counters.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn filetime_to_u64(low: u32, high: u32) -> u64 {
-    ((high as u64) << 32) | (low as u64)
+    (u64::from(high) << 32) | u64::from(low)
 }
 
 /// The published smoothed CPU load (0.0..=1.0) stored as `f32` bits — read lock-free in [`cpu`].
@@ -116,7 +116,7 @@ fn inner() -> &'static Mutex<bool> {
     I.get_or_init(|| Mutex::new(false))
 }
 
-const SAMPLE_INTERVAL: Duration = Duration::from_millis(1000); // ~1Hz; CPU load needs a delta gap
+const SAMPLE_INTERVAL: Duration = Duration::from_secs(1); // ~1Hz; CPU load needs a delta gap
 const IDLE_STOP_MS: u64 = 4000; // stop the thread if no getter read in ~4s
 
 /// Start the sampler if it isn't already running. Idempotent — a call while it's alive is a no-op
@@ -218,7 +218,7 @@ mod imp {
         let mut kernel = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
         let mut user = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
         // SAFETY: three valid out-pointers to stack FILETIMEs; the call only writes through them.
-        let ok = unsafe { GetSystemTimes(&mut idle, &mut kernel, &mut user) };
+        let ok = unsafe { GetSystemTimes(&raw mut idle, &raw mut kernel, &raw mut user) };
         if ok == 0 {
             return None;
         }
@@ -257,7 +257,7 @@ mod imp {
         // writes within the struct we pass.
         let mut m: MemoryStatusEx = unsafe { std::mem::zeroed() };
         m.dw_length = std::mem::size_of::<MemoryStatusEx>() as u32;
-        let ok = unsafe { GlobalMemoryStatusEx(&mut m) };
+        let ok = unsafe { GlobalMemoryStatusEx(&raw mut m) };
         if ok == 0 {
             return None;
         }

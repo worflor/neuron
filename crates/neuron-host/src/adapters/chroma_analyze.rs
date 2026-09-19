@@ -37,8 +37,9 @@ pub type Rgb = (u8, u8, u8);
 /// Perceptual luminance in `[0, 1]`: sRGB channels gamma-linearised (≈2.2) then
 /// weighted by the Rec.709 coefficients. Brightness ramps read monotonically in this
 /// space, which is what the ramp/pulse detectors assume.
+#[must_use]
 pub fn luma(c: Rgb) -> f32 {
-    let lin = |v: u8| (v as f32 / 255.0).powf(2.2);
+    let lin = |v: u8| (f32::from(v) / 255.0).powf(2.2);
     0.2126 * lin(c.0) + 0.7152 * lin(c.1) + 0.0722 * lin(c.2)
 }
 
@@ -133,10 +134,12 @@ pub struct ChromaAnalyzer {
 }
 
 impl ChromaAnalyzer {
+    #[must_use]
     pub fn new(leds: usize) -> ChromaAnalyzer {
         ChromaAnalyzer::with_config(leds, Config::default())
     }
 
+    #[must_use]
     pub fn with_config(leds: usize, cfg: Config) -> ChromaAnalyzer {
         ChromaAnalyzer {
             tracks: (0..leds).map(|_| Track::new()).collect(),
@@ -238,7 +241,7 @@ fn window_stats(hist: &VecDeque<Sample>) -> (f32, f32, f32, f32, f32, u32, f32) 
     let t0 = hist.front().unwrap().ts;
     let (mut sx, mut sy, mut sxx, mut sxy) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
     let (mut lo, mut hi, mut sum) = (f32::MAX, f32::MIN, 0.0f32);
-    for s in hist.iter() {
+    for s in hist {
         let x = s.ts.wrapping_sub(t0) as f32 / 1000.0; // seconds
         let y = s.luma;
         sx += x;

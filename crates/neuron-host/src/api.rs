@@ -4,7 +4,7 @@
 
 //! The host API seam — the ONE surface adapters talk to.
 //!
-//! Adapters (Chroma REST, OpenRGB TCP, telemetry, the device writer) never
+//! Adapters (Chroma REST, `OpenRGB` TCP, telemetry, the device writer) never
 //! touch the arbiter/bus directly and never see each other. They speak this
 //! trait, which has two implementations:
 //!
@@ -21,7 +21,7 @@
 //! Design notes:
 //! - [`LeaseSpec`] instead of raw `Lease`: adapters state INTENT ("15s ttl"),
 //!   the kernel computes deadlines — adapters never do time arithmetic.
-//! - [`HostApi::next_source`]: SourceIds are issued by the kernel, so two
+//! - [`HostApi::next_source`]: `SourceIds` are issued by the kernel, so two
 //!   adapters can never collide on an owner id.
 //! - Surface identity metadata (name/kind/grid) lives HERE, not in the
 //!   arbiter — the arbiter is pure ownership math over (key, led-count);
@@ -33,7 +33,7 @@ use crate::arbiter::{Content, LayerId, Rgb, SourceId};
 use crate::bus::Value;
 
 /// What kind of thing a surface is — the vocabulary shared by protocol
-/// adapters (Chroma device endpoints, OpenRGB device types) and, later, the
+/// adapters (Chroma device endpoints, `OpenRGB` device types) and, later, the
 /// neuron-core registry bridge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SurfaceKind {
@@ -66,6 +66,7 @@ pub struct SurfaceInfo {
 
 impl SurfaceInfo {
     /// Convenience for grid surfaces; leds is derived, so the two can't drift.
+    #[must_use]
     pub fn grid(key: &str, name: &str, kind: SurfaceKind, rows: usize, cols: usize) -> Self {
         SurfaceInfo {
             key: key.to_string(),

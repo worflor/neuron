@@ -50,7 +50,7 @@ pub struct Profile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub in_game_polling: Option<(u32, u32)>,
     /// Gaming-mode: disable Alt+Tab while this profile is active (Synapse `GamingMode`
-    /// DisableAltTabState). Enforced host-side by the daemon.
+    /// `DisableAltTabState`). Enforced host-side by the daemon.
     #[serde(default, skip_serializing_if = "is_false")]
     pub disable_alt_tab: bool,
     /// Gaming-mode: disable the Windows key while active.
@@ -74,6 +74,7 @@ fn is_false(b: &bool) -> bool {
 
 /// The `profiles/` directory (profiles + their `.rules.toml`/`.frame.toml` sidecars) in the run
 /// root — the ONE derivation every profile/sidecar reader and writer shares.
+#[must_use]
 pub fn profiles_dir() -> PathBuf {
     crate::runroot::run_root().join("profiles")
 }
@@ -123,6 +124,7 @@ pub fn name_conflict(name: &str) -> Option<String> {
 }
 
 impl Profile {
+    #[must_use]
     pub fn path(name: &str) -> PathBuf {
         profiles_dir().join(format!("{}.toml", sanitize(name)))
     }
@@ -132,6 +134,7 @@ impl Profile {
     /// case-insensitive, so `"my game/2"` and `"my_game_2"` — and `"Valorant"` and `"valorant"` — all
     /// resolve to the SAME `.toml`. Overwrite/de-collision checks MUST compare this, not the raw name,
     /// or the "capture vs overwrite" button lies and a save silently clobbers an existing profile.
+    #[must_use]
     pub fn file_key(name: &str) -> String {
         sanitize(name).to_lowercase()
     }
@@ -144,6 +147,7 @@ impl Profile {
     /// nonexistent nested dir (`profiles/FPS/competitive.rules.toml`) — so the write failed after the
     /// profile had already been saved, and the daemon (which globs `profiles/*.rules.toml`) would
     /// never have found it anyway. Every name-derived sidecar path MUST go through here.
+    #[must_use]
     pub fn rules_path(name: &str) -> PathBuf {
         Self::path(name).with_extension("rules.toml")
     }
@@ -156,6 +160,7 @@ impl Profile {
     /// still listed, and its delete would have taken `gui.rules.toml` — every bind authored in the
     /// app — with it, exactly the loss the reservation exists to prevent. Every destructive path
     /// resolves the sidecar through here, so ownership is decided once instead of at each call site.
+    #[must_use]
     pub fn owned_rules_path(name: &str) -> Option<PathBuf> {
         // Compared on the on-disk KEY, like every other identity decision here. A raw filename
         // comparison would have missed `GUI.toml`: Windows filenames are case-insensitive, so its
@@ -170,6 +175,7 @@ impl Profile {
     /// (GUI wizard, CLI `import-export --apply`) MUST resolve through here before calling `save()`
     /// or deriving a sidecar path, so a blank-named import always lands as the same visible,
     /// selectable `imported` profile regardless of which front door it came through.
+    #[must_use]
     pub fn resolve_import_name(name: &str) -> String {
         let n = name.trim();
         if n.is_empty() {
@@ -184,10 +190,10 @@ impl Profile {
     /// exactly, which makes a re-import (or the idempotent retry after a failed sidecar write) update
     /// in place. Any other occupant of the same file key — a DIFFERENT display name that merely
     /// sanitizes to the same stem (see [`file_key`](Self::file_key): "FPS/competitive" vs
-    /// "FPS_competitive", or a case-only variant on Windows' case-insensitive filesystem), or a file
+    /// "`FPS_competitive`", or a case-only variant on Windows' case-insensitive filesystem), or a file
     /// too corrupt to read a name out of — must NOT be silently replaced: the name gets a " (2)" /
     /// " (3)" … suffix until it lands on a free key. Every importer (GUI wizard, CLI --apply) MUST
-    /// resolve through here, not just resolve_import_name, before saving.
+    /// resolve through here, not just `resolve_import_name`, before saving.
     /// No-clobber is now UNCONDITIONAL: exhausting the " (2)".." (99)" search returns an `Err`
     /// (never falls back to the already-proven-occupied base) — see `de_collide_with`.
     /// Also guards the rules-only sidecar: an importer that writes an empty profile skips the
@@ -359,6 +365,7 @@ impl Profile {
     }
 
     /// True if the profile sets nothing (useful guard before save).
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.dpi.is_none()
             && self.dpi_stages.is_empty()
@@ -374,6 +381,7 @@ impl Profile {
     /// system key-chords". `is_empty`, `summary`, and the sheet's saved-row badge all consult this, so
     /// adding a 5th chord updates one place and no call site can silently forget it. (The LIVE-preview
     /// mirror of this predicate is `State.gaming-live` in the UI, derived over the same four flags.)
+    #[must_use]
     pub fn has_gaming(&self) -> bool {
         self.disable_alt_tab || self.disable_win || self.disable_alt_f4 || self.disable_alt_esc
     }
@@ -382,6 +390,7 @@ impl Profile {
     /// mapping `apply()`'s `ApplyReport.gaming_mode` and the launch `gaming_hook_policy` reconcile
     /// unit (`neuron-app`'s `glue.rs`) both consult, so a profile's suppression policy reads the SAME
     /// whether it came from a live apply or from re-deriving the active profile at startup.
+    #[must_use]
     pub fn gaming_mode(&self) -> GamingMode {
         GamingMode::from_profile(
             self.disable_alt_tab,
@@ -396,29 +405,27 @@ impl Profile {
     /// "Axis" there). A hand-painted/imported frame is `"custom"`; a lone procedural layer names its
     /// PRESET (e.g. `"wave"`, matching the live effect label) — falling back to the pattern label —
     /// and a taller stack counts its layers. `""` when the profile sets no lighting.
+    #[must_use]
     pub fn lighting_label(&self) -> String {
         if self.lighting.is_empty() {
             String::new()
         } else if self.lighting.iter().any(|l| l.pattern == "custom") {
             "custom".to_string()
         } else if self.lighting.len() == 1 {
-            crate::pattern::slug_for_layer(&self.lighting[0])
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| {
+            crate::pattern::slug_for_layer(&self.lighting[0]).map_or_else(|| {
                     let key = self.lighting[0].pattern.as_str();
-                    crate::pattern::pattern_def(key)
-                        .map(|d| d.label.to_string())
-                        .unwrap_or_else(|| key.to_string())
-                })
+                    crate::pattern::pattern_def(key).map_or_else(|| key.to_string(), |d| d.label.to_string())
+                }, std::string::ToString::to_string)
         } else {
             format!("{} fx", self.lighting.len())
         }
     }
 
+    #[must_use]
     pub fn summary(&self) -> String {
         let mut parts = Vec::new();
         if !self.dpi_stages.is_empty() {
-            let s: Vec<String> = self.dpi_stages.iter().map(|s| s.to_string()).collect();
+            let s: Vec<String> = self.dpi_stages.iter().map(std::string::ToString::to_string).collect();
             parts.push(format!("dpi[{}]", s.join("/")));
         } else if let Some(d) = self.dpi {
             parts.push(format!("dpi {d}"));
@@ -465,6 +472,7 @@ impl Profile {
     /// `persist` selects volatile-vs-onboard ([`Store`]); the DERIVED writes (DPI-stage table,
     /// idle-timeout, in-game polling) are all verify-gated inside [`crate::writes`] — a wrong opcode
     /// surfaces as a `skipped`/error note, never a fabricated success.
+    #[must_use]
     pub fn apply(&self, reg: &Registry) -> ApplyReport {
         let mut devices = crate::device::DeviceSession::new(reg);
         // A one-shot apply (CLI / headless) has no live compositor stream, so it PAINTS the lighting.
@@ -504,7 +512,7 @@ impl Profile {
                         "dpi stages [{}] active {}",
                         self.dpi_stages
                             .iter()
-                            .map(|s| s.to_string())
+                            .map(std::string::ToString::to_string)
                             .collect::<Vec<_>>()
                             .join("/"),
                         active
@@ -525,12 +533,7 @@ impl Profile {
 
         // --- Polling: in-game (wired/dongle) split first if present, else plain single rate. ---
         if let Some((wired, dongle)) = self.in_game_polling {
-            if !writes::ingame_poll_write_enabled() {
-                r.gated.push(format!(
-                    "in-game polling {wired}/{dongle} Hz: {}",
-                    writes::ingame_poll_write_disabled_message()
-                ));
-            } else {
+            if writes::ingame_poll_write_enabled() {
                 match devices.with_command("set_polling", |d| {
                     writes::set_in_game_polling(d, wired, dongle)
                 }) {
@@ -541,6 +544,11 @@ impl Profile {
                         .gated
                         .push(format!("in-game polling {wired}/{dongle} Hz: {e}")),
                 }
+            } else {
+                r.gated.push(format!(
+                    "in-game polling {wired}/{dongle} Hz: {}",
+                    writes::ingame_poll_write_disabled_message()
+                ));
             }
         } else if let Some(hz) = self.polling_hz {
             match devices.with_writable("set_polling", |d| cap::set_polling_hz(d, hz)) {
@@ -568,16 +576,16 @@ impl Profile {
             // key off that command. In practice this means idle-off only targets a device with the
             // power/battery class (the Naga mouse) — NOT a lit-but-batteryless keyboard (the
             // BlackWidow has no battery_level command), which is the correct scope for a sleep timer.
-            if !writes::idle_write_enabled() {
-                r.gated.push(format!(
-                    "idle-off {secs}s: {}",
-                    writes::idle_write_disabled_message()
-                ));
-            } else {
+            if writes::idle_write_enabled() {
                 match devices.with_command("battery_level", |d| writes::set_idle_secs(d, secs)) {
                     Ok(()) => r.applied.push(format!("idle-off {secs}s")),
                     Err(e) => r.gated.push(format!("idle-off {secs}s: {e}")),
                 }
+            } else {
+                r.gated.push(format!(
+                    "idle-off {secs}s: {}",
+                    writes::idle_write_disabled_message()
+                ));
             }
         }
 
@@ -644,6 +652,7 @@ impl ApplyReport {
     /// "applied 'chill': brightness 100%" — a clean success — while its DPI and polling silently did
     /// not happen, and the sheet's own LIVE row sat a hundred pixels away showing the device didn't
     /// match. Reporting what a write did NOT do is the same rule the device-write ledger follows.
+    #[must_use]
     pub fn summary(&self) -> String {
         let mut parts = self.applied.clone();
         if self.gaming_mode.any() {
@@ -741,6 +750,7 @@ fn open_selected_device(reg: &Registry, pid: u16, unit: &str, dialect: &str) -> 
 /// plane: a plane without numeric getters captures none (honest — you captured what that plane
 /// does), and the no-selection fallback stays capability-based (`open_with_command("dpi")`), the
 /// capability-aware resolution the review asked about.
+#[must_use]
 pub fn capture_from_devices(
     reg: &Registry,
     name: &str,
@@ -783,7 +793,7 @@ pub fn capture_from_devices(
             p.brightness = Some(b);
         }
         if let Ok(secs) = crate::capability::idle_timeout_secs(&d) {
-            p.idle_secs = Some(secs as u32);
+            p.idle_secs = Some(u32::from(secs));
         }
     }
     // Lighting is NOT captured from raw device state: the profile's lighting is a `Vec<LayerDef>`
@@ -793,6 +803,7 @@ pub fn capture_from_devices(
 }
 
 /// Names of all saved profiles.
+#[must_use]
 pub fn list() -> Vec<String> {
     let mut out = Vec::new();
     if let Ok(rd) = std::fs::read_dir(profiles_dir()) {
@@ -828,6 +839,7 @@ pub enum ProfileEntry {
 }
 
 /// Every saved profile, in name order, with unreadable ones reported rather than dropped.
+#[must_use]
 pub fn load_all() -> Vec<ProfileEntry> {
     list()
         .into_iter()
@@ -900,6 +912,7 @@ pub fn set_active(name: &str) {
 /// this a pure function of (cursor, run root): a process that has already chosen a profile is never
 /// second-guessed by a stale file, and clearing the cursor deletes the file, so an empty cell
 /// restores to empty rather than resurrecting the old name.
+#[must_use]
 pub fn restore_active_once() -> String {
     let current = active();
     if !current.is_empty() {
@@ -939,6 +952,7 @@ pub fn active() -> String {
 /// `(i + step).rem_euclid(len)` bug that always landed on profile 1 / the last regardless of where
 /// you were). `names` must be non-empty — the caller short-circuits the empty case. Shared by the
 /// CLI daemon and the GUI dispatch so the two clients can't drift.
+#[must_use]
 pub fn cycle_index(names: &[String], current: &str, step: i32) -> usize {
     // Matched on the on-disk KEY, not the raw string. `names` and the cursor do not always come
     // from the same place — a ProfileSwitch stores the rule's DISPLAY name while the candidate list
@@ -960,6 +974,7 @@ pub fn cycle_index(names: &[String], current: &str, step: i32) -> usize {
 /// moved, which reads as a broken button rather than a broken profile. A profile you cannot apply
 /// is not a cycle destination; it stays visible (and fixable) in the sheet, which is where it
 /// belongs.
+#[must_use]
 pub fn cycle_candidates() -> Vec<String> {
     load_all()
         .into_iter()
@@ -1006,6 +1021,7 @@ pub enum FocusVerdict<'a> {
 
 impl<'a> FocusVerdict<'a> {
     /// The profile this verdict wants applied, if any.
+    #[must_use]
     pub fn profile(&self) -> Option<&'a str> {
         match self {
             FocusVerdict::Rule { profile, .. } | FocusVerdict::Fallback { profile } => Some(profile),
@@ -1013,6 +1029,7 @@ impl<'a> FocusVerdict<'a> {
         }
     }
     /// The index of the winning rule, for the UI's "this contact is closed" lamp (`-1` when none).
+    #[must_use]
     pub fn rule_index(&self) -> i32 {
         match self {
             FocusVerdict::Rule { index, .. } => *index as i32,
@@ -1022,15 +1039,17 @@ impl<'a> FocusVerdict<'a> {
 }
 
 impl AppRules {
+    #[must_use]
     pub fn path() -> PathBuf {
         crate::runroot::run_root().join("apps.toml")
     }
     /// Load from disk, salvaging rule-by-rule so one malformed rule can't silently drop every
     /// auto-switch rule (and never clobbering the file — see [`crate::salvage::SalvageLoad`]).
+    #[must_use]
     pub fn load() -> Self {
         <Self as crate::salvage::SalvageLoad>::load()
     }
-    /// Persist to `apps.toml`, atomically (temp file + rename). The ONE place AppRules is
+    /// Persist to `apps.toml`, atomically (temp file + rename). The ONE place `AppRules` is
     /// serialized and written — every caller (GUI, CLI) goes through here instead of hand-rolling
     /// its own `toml::to_string_pretty` + write, so a future call site can't reintroduce a
     /// truncating `std::fs::write` that bypasses the durability `load()`'s `SalvageLoad` recovery
@@ -1050,6 +1069,7 @@ impl AppRules {
     /// is what lights up.
     ///
     /// An empty needle is skipped: it would match every app, which is what the fallback is for.
+    #[must_use]
     pub fn resolve(&self, exe: &str) -> FocusVerdict<'_> {
         let focused = exe.to_lowercase();
         match self
@@ -1070,6 +1090,7 @@ impl AppRules {
 
     /// The profile to apply for a focused exe name, or `None` to stay put. Thin sugar over
     /// [`resolve`](Self::resolve) for callers that don't need to know which rule won.
+    #[must_use]
     pub fn profile_for(&self, exe: &str) -> Option<&str> {
         self.resolve(exe).profile()
     }
@@ -1093,6 +1114,7 @@ impl AppRules {
     /// Every rule whose target profile no longer exists on disk, by index. A dangling rule fails
     /// silently at focus-switch time (the apply just errors into the status line), so the UI marks
     /// these instead of rendering them identically to healthy ones.
+    #[must_use]
     pub fn dangling(&self, saved: &[String]) -> Vec<usize> {
         let known: std::collections::HashSet<String> =
             saved.iter().map(|n| Profile::file_key(n)).collect();
@@ -1291,7 +1313,7 @@ mod tests {
 
     #[test]
     fn cycle_index_steps_from_current_with_wraparound() {
-        let names: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        let names: Vec<String> = ["a", "b", "c"].iter().map(std::string::ToString::to_string).collect();
         // forward wraps c -> a.
         assert_eq!(cycle_index(&names, "a", 1), 1);
         assert_eq!(cycle_index(&names, "b", 1), 2);
@@ -1309,7 +1331,7 @@ mod tests {
     /// on the on-disk key. Without it, cycling after a switch silently restarted from index 0.
     #[test]
     fn cycle_index_matches_a_profile_by_its_on_disk_key() {
-        let names: Vec<String> = ["my game 2", "b"].iter().map(|s| s.to_string()).collect();
+        let names: Vec<String> = ["my game 2", "b"].iter().map(std::string::ToString::to_string).collect();
         assert_eq!(cycle_index(&names, "my_game_2", 1), 1, "stem finds its display name");
         assert_eq!(cycle_index(&names, "My Game 2", 1), 1, "and case-folded too");
         // a genuinely unknown cursor still starts the cycle at the beginning.

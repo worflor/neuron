@@ -32,11 +32,13 @@ pub struct Vault {
 }
 
 impl Vault {
+    #[must_use]
     pub fn path() -> PathBuf {
         // alongside the binaries; keeps the gesture set portable with the install.
         crate::runroot::run_root().join("gestures.json")
     }
 
+    #[must_use]
     pub fn load() -> Self {
         Self::load_from(&Self::path()).unwrap_or_default()
     }
@@ -77,6 +79,7 @@ impl Vault {
     }
 
     /// The exemplar polyline for a template by name (empty if absent / pre-exemplar template).
+    #[must_use]
     pub fn exemplar(&self, name: &str) -> &[[f32; 2]] {
         self.templates
             .iter()
@@ -89,6 +92,7 @@ impl Vault {
     /// `(name, score, runner_up_score)`; `None` only for an empty vault. Use [`recognize`] for
     /// the gated verdict; use this to show "≈ what it's becoming" live, or to assist-snap a
     /// near-miss (see `CastConfig::assist`).
+    #[must_use]
     pub fn predict(&self, query: &GestureWord) -> Option<(String, f64, Option<f64>)> {
         let mut ranked: Vec<(&str, f64)> = self
             .templates
@@ -102,6 +106,7 @@ impl Vault {
 
     /// 1-NN recognition. Returns (name, score) for the best match within threshold,
     /// plus the runner-up score for confidence reporting.
+    #[must_use]
     pub fn recognize(&self, query: &GestureWord) -> Recognition {
         let mut ranked: Vec<(&str, f64)> = self
             .templates

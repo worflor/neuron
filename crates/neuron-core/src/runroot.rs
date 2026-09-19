@@ -212,6 +212,7 @@ fn user_data_root() -> Option<PathBuf> {
 /// has config). Call once at startup, BEFORE anything reads config.
 ///
 /// Returns `Some((from, to))` when entries were actually carried over.
+#[must_use]
 pub fn adopt_legacy_run_root() -> Option<(PathBuf, PathBuf)> {
     if std::env::var_os("NEURON_RUN_DIR").is_some_and(|v| !v.is_empty()) {
         return None; // an explicit anchor is the user's choice — never second-guess it
@@ -301,6 +302,7 @@ pub struct RunDirPin {
 }
 
 impl RunDirPin {
+    #[must_use]
     pub fn to(dir: &std::path::Path) -> Self {
         let prev = std::env::var_os("NEURON_RUN_DIR");
         std::env::set_var("NEURON_RUN_DIR", dir);

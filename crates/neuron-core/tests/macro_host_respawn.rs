@@ -82,8 +82,7 @@ fn dead_sidecar_never_blocks_and_the_next_use_heals_it() {
     let killed = std::process::Command::new("taskkill")
         .args(["/F", "/PID", &pid_before.to_string()])
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+        .is_ok_and(|s| s.success());
     #[cfg(not(windows))]
     let killed = std::process::Command::new("kill")
         .args(["-9", &pid_before.to_string()])

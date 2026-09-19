@@ -19,14 +19,14 @@
 //! * **DPI-stage apply** — write the full DPI stage LIST (the cycle), not just the active DPI
 //!   (active-stage read = `dpi_stages` class 0x04/0x86; SET = 0x04/0x06, hardware-proven, verified
 //!   against the 0x04/0x86 read-back).
-//! * **Scroll-stage apply** — write HyperScroll wheel stages (class 0x0B; user has two).
-//! * **HyperShift** — produce software hold-layer rules for the cast/Engine path. No onboard
-//!   HyperShift Mapping write API is exposed until the firmware layout is proven.
+//! * **Scroll-stage apply** — write `HyperScroll` wheel stages (class 0x0B; user has two).
+//! * **`HyperShift`** — produce software hold-layer rules for the cast/Engine path. No onboard
+//!   `HyperShift` Mapping write API is exposed until the firmware layout is proven.
 //! * **Sensor/power writes** — expose verified LOD, idle, polling, and Snap Tap helpers. Debounce is
 //!   intentionally absent: no opcode/getter has been proven for this hardware yet.
 //!
 //! ## The gate (every write goes through it)
-//! 1. **Driver mode** — Razer gates host control behind device_mode 0x03 (00/04 = [0x03,0x00]).
+//! 1. **Driver mode** — Razer gates host control behind `device_mode` 0x03 (00/04 = [0x03,0x00]).
 //!    [`ensure_driver`] flips it idempotently; reopening Synapse / power-cycling reverts it.
 //! 2. **Volatile first** — write NOSTORE ([`Store::Volatile`], varstore byte 0x00) so nothing is
 //!    flashed to onboard memory until a write has proven correct. Persist is opt-in per call.
@@ -42,7 +42,7 @@
 //! OpenRazer-confirmed `razer_chroma_misc_set_dpi_stages`, PR #1138). It is implemented with the
 //! exact read layout (0x04/0x86) inverted and is additionally **verify-gated**: it refuses to claim
 //! success unless the read-back against 0x04/0x86 matches. No env gate — the internal read-back is
-//! the safety net. `set_scroll_stages` (class 0x0B HyperScroll) is the least-proven path and is behind the
+//! the safety net. `set_scroll_stages` (class 0x0B `HyperScroll`) is the least-proven path and is behind the
 //! `hyperscroll-write` feature flag — the byte layout is the best structural reconstruction from
 //! the decoded `ScrollWheelStages` export and MUST be confirmed on hardware before trusting it.
 
@@ -72,6 +72,7 @@ pub fn set_writes_paused(paused: bool) {
 /// Whether device writes are currently paused process-wide (the kill-switch). The live dispatch
 /// path (CLI daemon + GUI worker) checks this before any device write so the GUI/`--safe` toggle
 /// freezes the headline live remaps too — not just the GUI config panels.
+#[must_use]
 pub fn writes_paused() -> bool {
     crate::safety::writes_paused()
 }
@@ -81,7 +82,7 @@ pub fn writes_paused() -> bool {
 // ---------------------------------------------------------------------------------------------
 
 /// Device-mode getter/setter codes — the ONE home of the device-mode opcode; every mode switch
-/// (ensure_driver, the CLI `mode` verb, macro-key arming, lighting's take-control) routes through
+/// (`ensure_driver`, the CLI `mode` verb, macro-key arming, lighting's take-control) routes through
 /// [`set_device_mode`] and these consts. (Verified live: `mode driver` flips 00/04=[0x03,0x00];
 /// lighting/DPI writes only land in driver mode.)
 pub const CLASS_DEVICE_MODE: u8 = 0x00;
@@ -90,7 +91,7 @@ pub const ID_DEVICE_MODE_SET: u8 = 0x04;
 const DRIVER_MODE: u8 = 0x03;
 
 /// The raw device-mode switch: `(class 0x00, id 0x04, size 0x02, args [mode, 0x00])`. This is
-/// [`ensure_driver`]'s unconditional building block (no read-first guard — that's ensure_driver's
+/// [`ensure_driver`]'s unconditional building block (no read-first guard — that's `ensure_driver`'s
 /// job), exported so the CLI's explicit `neuron mode` verb and the app's macro-key arming don't
 /// re-derive the opcode. Returns the device's reply body. driver=0x03, hardware=0x00.
 ///
@@ -110,8 +111,7 @@ pub fn set_device_mode(d: &Device, mode: u8) -> Result<[u8; 80]> {
 pub fn ensure_driver(d: &Device) -> u8 {
     let prior = d
         .exec_dynamic(CLASS_DEVICE_MODE, ID_DEVICE_MODE_GET, 0x02, &[])
-        .map(|a| a[0])
-        .unwrap_or(0);
+        .map_or(0, |a| a[0]);
     if prior != DRIVER_MODE {
         let _ = set_device_mode(d, DRIVER_MODE);
     }
@@ -124,6 +124,7 @@ pub fn ensure_driver(d: &Device) -> u8 {
 /// wake" assumption the 2026-07-07 trap DISPROVED, since a NORMAL-mode wake restored stale volatile
 /// state too; the reconcile is now disagreement-gated and mode-independent, see
 /// [`reconcile_volatile_with_persisted`].)
+#[must_use]
 pub fn device_mode(d: &Device) -> Option<u8> {
     d.exec_dynamic(CLASS_DEVICE_MODE, ID_DEVICE_MODE_GET, 0x02, &[])
         .ok()
@@ -134,6 +135,7 @@ pub fn device_mode(d: &Device) -> Option<u8> {
 /// driver-mode-only duties without leaking [`DRIVER_MODE`]. A getter that doesn't answer reads as
 /// `false`. (It NO LONGER gates the wake-reconcile — the 2026-07-07 trap disproved the "driver mode
 /// owns the wake" premise — but is kept as the honest read-only mode probe.)
+#[must_use]
 pub fn is_driver_mode(d: &Device) -> bool {
     device_mode(d) == Some(DRIVER_MODE)
 }
@@ -215,6 +217,7 @@ pub const THUMB_STOCK_USAGES: [u8; 12] =
 /// Resolve a captured keypad usage (what a *stock* thumb button emits) to its physical button id
 /// (`0x40..=0x4B`). `None` if `usage` isn't one of the 12 stock keypad keys — i.e. not a thumb
 /// button we can address at the device, so the caller leaves it to host-side dispatch.
+#[must_use]
 pub fn thumb_button_id_for_usage(usage: u8) -> Option<u8> {
     THUMB_STOCK_USAGES
         .iter()
@@ -260,6 +263,7 @@ pub fn reset_thumb_buttons(d: &Device) -> Result<()> {
 /// Does this device speak the class-0x15 button-function protocol? A read-only probe of a known
 /// 0x15 getter (the serial, `15/8B`): a successful reply means the Synapse-4 button-map family is
 /// present, so device-side remaps are safe to apply. Cheap; call once when arming the live loop.
+#[must_use]
 pub fn supports_button_remap(d: &Device) -> bool {
     d.exec_dynamic(CLASS_BUTTON_FUNC, 0x8B, 0x20, &[]).is_ok()
 }
@@ -333,7 +337,7 @@ const PERSISTED: u8 = 0x01;
 const VOLATILE: u8 = 0x00;
 /// Read/write payload size for the stage table (matches the registry `dpi_stages` size 0x26 = 38).
 const DPI_STAGES_SIZE: u8 = 0x26;
-/// Per-stage record stride in the table body: {stage_id, X_hi, X_lo, Y_hi, Y_lo, 0, 0}.
+/// Per-stage record stride in the table body: {`stage_id`, `X_hi`, `X_lo`, `Y_hi`, `Y_lo`, 0, 0}.
 const DPI_STAGE_STRIDE: usize = 7;
 
 /// One DPI stage as it sits in the table.
@@ -346,6 +350,7 @@ pub struct DpiStage {
 }
 
 impl DpiStage {
+    #[must_use]
     pub fn symmetric(dpi: u16) -> Self {
         DpiStage { x: dpi, y: dpi }
     }
@@ -411,6 +416,7 @@ pub fn build_dpi_stages_payload(
 /// records (empty hardware slots) are skipped and an out-of-range `count` is clamped to what the
 /// buffer holds. Pure (slice in, Vec out) so it needs no hardware. Every consumer imports THIS —
 /// the terrain survey found three drifted copies (CLI, profile capture, app perf-snapshot).
+#[must_use]
 pub fn decode_dpi_stages(s: &[u8]) -> Vec<u16> {
     if s.len() < 3 {
         return Vec::new();
@@ -420,7 +426,7 @@ pub fn decode_dpi_stages(s: &[u8]) -> Vec<u16> {
     for i in 0..count {
         let off = 3 + i * DPI_STAGE_STRIDE; // [id, X_hi, X_lo, Y_hi, Y_lo, 0, 0]
         if off + 2 < s.len() {
-            let x = ((s[off + 1] as u16) << 8) | s[off + 2] as u16;
+            let x = (u16::from(s[off + 1]) << 8) | u16::from(s[off + 2]);
             if x > 0 {
                 out.push(x);
             }
@@ -433,6 +439,7 @@ pub fn decode_dpi_stages(s: &[u8]) -> Vec<u16> {
 /// byte is 1-BASED (probed live: the firmware REJECTS a 0 in the setter; the getter echoes the
 /// same numbering) — the old raw passthrough marked the WRONG stage as active, one past reality.
 /// A wire 0 means "no active stage reported" → None. The companion inverse to [`decode_dpi_stages`].
+#[must_use]
 pub fn decode_dpi_active(s: &[u8]) -> Option<u8> {
     s.get(1).copied().filter(|&b| b > 0).map(|b| b - 1)
 }
@@ -440,9 +447,10 @@ pub fn decode_dpi_active(s: &[u8]) -> Option<u8> {
 /// Read the device's PERSISTED onboard DPI stage table (0x04/0x86, persisted plane) as the X-axis
 /// cycle values. Empty on any failure (no getter answer / asleep wireless) — callers treat that as
 /// "no onboard cycle known", never an error. This is THE stage source the FEEL page writes and the
-/// firmware itself walks in normal mode — so the software DpiCycle (the deferred-button duty neuron
+/// firmware itself walks in normal mode — so the software `DpiCycle` (the deferred-button duty neuron
 /// takes while holding driver-mode custody) reads it too, keeping the button's behaviour identical
 /// whichever side of the custody line owns it.
+#[must_use]
 pub fn read_persisted_dpi_stages(d: &Device) -> Vec<u16> {
     d.exec_dynamic(CLASS_DPI, ID_DPI_STAGES_GET, DPI_STAGES_SIZE, &[PERSISTED])
         .map(|a| decode_dpi_stages(&a))
@@ -570,7 +578,7 @@ pub fn reassert_feel(d: &Device, intent: &crate::feel_intent::FeelIntent) -> Res
                     .map_err(|e| anyhow::anyhow!("{label} stage reassert failed: {e}"))?;
                 done.push(format!(
                     "{label} stages [{}] active {}",
-                    intent.stages.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(","),
+                    intent.stages.iter().map(std::string::ToString::to_string).collect::<Vec<_>>().join(","),
                     intent.active + 1
                 ));
             }
@@ -586,8 +594,8 @@ pub fn reassert_feel(d: &Device, intent: &crate::feel_intent::FeelIntent) -> Res
             let Ok(a) = d.exec_dynamic(CLASS_DPI, ID_DPI_GET, DPI_GET_SIZE, &[vs]) else {
                 continue;
             };
-            let live_x = ((a[1] as u16) << 8) | a[2] as u16;
-            let live_y = ((a[3] as u16) << 8) | a[4] as u16;
+            let live_x = (u16::from(a[1]) << 8) | u16::from(a[2]);
+            let live_y = (u16::from(a[3]) << 8) | u16::from(a[4]);
             if (live_x, live_y) != (want_x, want_y) {
                 crate::capability::set_dpi(d, want_x, want_y, store, crate::dpi_origin::Cause::Reassert)
                     .map_err(|e| anyhow::anyhow!("{label} dpi reassert failed: {e}"))?;
@@ -603,9 +611,9 @@ pub fn reassert_feel(d: &Device, intent: &crate::feel_intent::FeelIntent) -> Res
 /// device's persisted plane — the user's intent — over whatever the wake left live. Only touches the
 /// DPI plane (lighting re-streams continuously and needs no reconcile).
 ///
-/// THE STORE (trap-proven TWICE, dpi_trap.log 2026-07-07): the persisted (onboard varstore) plane is
+/// THE STORE (trap-proven TWICE, `dpi_trap.log` 2026-07-07): the persisted (onboard varstore) plane is
 /// the user's intent, and a wake that loads ANYTHING else must be healed. The first trap blamed
-/// driver mode (device_mode 0x03) — "software owns volatile state, and neuron holds the lease with
+/// driver mode (`device_mode` 0x03) — "software owns volatile state, and neuron holds the lease with
 /// nobody on wake duty." The 07:42-07:51 re-run DISPROVED that gate: with the Naga in NORMAL mode
 /// (0x00) and BOTH varstores verified clean ([800,30000] active 1), a sleep/wake STILL restored the
 /// volatile plane to the FACTORY table ([800,16000,…] active 2, DPI 16000) while persisted stayed
@@ -652,7 +660,7 @@ pub fn reconcile_volatile_with_persisted(d: &Device) -> Result<Vec<String>> {
                 "stages [{}] active {}",
                 want_xs
                     .iter()
-                    .map(|x| x.to_string())
+                    .map(std::string::ToString::to_string)
                     .collect::<Vec<_>>()
                     .join(","),
                 want_active + 1
@@ -669,10 +677,10 @@ pub fn reconcile_volatile_with_persisted(d: &Device) -> Result<Vec<String>> {
     let volatile_dpi = d
         .exec_dynamic(CLASS_DPI, ID_DPI_GET, DPI_GET_SIZE, &[VOLATILE])
         .map_err(|e| anyhow::anyhow!("volatile dpi read (0x04/0x85) failed: {e}"))?;
-    let want_x = ((persisted_dpi[1] as u16) << 8) | persisted_dpi[2] as u16;
-    let want_y = ((persisted_dpi[3] as u16) << 8) | persisted_dpi[4] as u16;
-    let live_x = ((volatile_dpi[1] as u16) << 8) | volatile_dpi[2] as u16;
-    let live_y = ((volatile_dpi[3] as u16) << 8) | volatile_dpi[4] as u16;
+    let want_x = (u16::from(persisted_dpi[1]) << 8) | u16::from(persisted_dpi[2]);
+    let want_y = (u16::from(persisted_dpi[3]) << 8) | u16::from(persisted_dpi[4]);
+    let live_x = (u16::from(volatile_dpi[1]) << 8) | u16::from(volatile_dpi[2]);
+    let live_y = (u16::from(volatile_dpi[3]) << 8) | u16::from(volatile_dpi[4]);
     if want_x > 0 && (want_x != live_x || want_y != live_y) {
         crate::capability::set_dpi(d, want_x, want_y, Store::Volatile, crate::dpi_origin::Cause::Reassert)
             .map_err(|e| anyhow::anyhow!("volatile dpi reconcile failed: {e}"))?;
@@ -689,7 +697,7 @@ pub fn reconcile_volatile_with_persisted(d: &Device) -> Result<Vec<String>> {
 // 2. SCROLL STAGES — HyperScroll (class 0x0B). Least-proven path: feature-gated.
 // ---------------------------------------------------------------------------------------------
 
-/// HyperScroll class. The user has two scroll modes (tactile/free-spin) the wheel cycles. The READ
+/// `HyperScroll` class. The user has two scroll modes (tactile/free-spin) the wheel cycles. The READ
 /// of `ScrollWheelStages` decoded as a small table; the SET layout below is the structural
 /// reconstruction and is the LEAST certain write in this module — hence it is gated behind an
 /// explicit runtime opt-in (the `NEURON_HYPERSCROLL_WRITE` env flag) plus the hardware-verify note.
@@ -709,7 +717,7 @@ const CLASS_SCROLL: u8 = 0x15;
 const ID_SCROLL_STAGE_SET: u8 = 0x00;
 const SCROLL_STAGE_SIZE: u8 = 0x02;
 
-/// Whether the unverified HyperScroll device-write path is enabled. Two independent gates open it:
+/// Whether the unverified `HyperScroll` device-write path is enabled. Two independent gates open it:
 /// the compile-time `hyperscroll-write` Cargo feature (the clean, preferred gate) OR the
 /// `NEURON_HYPERSCROLL_WRITE` env var (a runtime escape hatch so the layout can be probed without a
 /// rebuild). Either one suffices; both default off.
@@ -717,7 +725,7 @@ fn hyperscroll_write_enabled() -> bool {
     cfg!(feature = "hyperscroll-write") || std::env::var_os("NEURON_HYPERSCROLL_WRITE").is_some()
 }
 
-/// Build the HyperScroll stage SET payload (structural reconstruction from `ScrollWheelStages`):
+/// Build the `HyperScroll` stage SET payload (structural reconstruction from `ScrollWheelStages`):
 /// `[varstore, active_idx, count, {stage_id, mode} * count]` where `mode` is the per-stage scroll
 /// mode byte (e.g. 0x00 tactile / 0x01 free-spin). Pure, so the layout is unit-testable even with
 /// the feature off-by-default at the device-write boundary.
@@ -743,7 +751,7 @@ pub fn build_scroll_stages_payload(modes: &[u8], active_idx: u8, store: Store) -
     Ok(buf)
 }
 
-/// Write HyperScroll wheel stages (class 0x0B), GATED + verify-gated. Off by default: refuses
+/// Write `HyperScroll` wheel stages (class 0x0B), GATED + verify-gated. Off by default: refuses
 /// unless `NEURON_HYPERSCROLL_WRITE` is set, because the class 0x0B byte layout still needs live RE
 /// confirmation. The payload builder is always compiled & tested; only the device write is gated.
 ///
@@ -785,11 +793,12 @@ pub fn set_scroll_stages(d: &Device, modes: &[u8], active_idx: u8, store: Store)
 /// Pure (no I/O) so the exact byte layout is unit-testable, matching the other proven builders.
 /// `store` picks volatile vs onboard-persist; `stage` is the 1-based stage value Synapse cycles
 /// over the ENABLED stages (captured live as `[01 01]` / `[01 02]`).
+#[must_use]
 pub fn build_scroll_stage_payload(stage: u8, store: Store) -> [u8; 2] {
     [store.byte(), stage]
 }
 
-/// Select the active scroll-wheel stage. CAPTURED LIVE from Synapse via USBPcap (2026-06):
+/// Select the active scroll-wheel stage. CAPTURED LIVE from Synapse via `USBPcap` (2026-06):
 /// class 0x15 / id 0x00, size 0x02, payload `[store, stage]` (Synapse sent store=0x01=persist).
 /// `stage` is the 1-based stage value Synapse cycles over the ENABLED stages. The per-stage
 /// tension/steps curves are host-side software (never written to the device), so this only switches
@@ -833,9 +842,10 @@ pub fn set_scroll_stage_cursor(stage: u8) {
 
 /// Step a 1-based stage cursor by `step` (+1 / -1) over `count` stages, wrapping at both ends. Pure +
 /// testable; `count == 0` and `cur == 0` collapse to 1 so it can never return an invalid stage.
+#[must_use]
 pub fn cycle_scroll_stage(cur: u8, step: i32, count: u8) -> u8 {
-    let n = count.max(1) as i32;
-    let cur0 = (cur.max(1) as i32 - 1).rem_euclid(n);
+    let n = i32::from(count.max(1));
+    let cur0 = (i32::from(cur.max(1)) - 1).rem_euclid(n);
     ((cur0 + step).rem_euclid(n) + 1) as u8
 }
 
@@ -858,6 +868,7 @@ const IDLE_SIZE: u8 = 0x02;
 /// the SET 0x07/0x03, Naga V2 Pro round-trip 2026-07-02), so the app + CLI crates enable the
 /// `idle-power-write` Cargo feature; the `NEURON_IDLE_WRITE` env stays as a runtime escape hatch
 /// for builds without it. A bare library build still defaults to no device writes.
+#[must_use]
 pub fn idle_write_enabled() -> bool {
     cfg!(feature = "idle-power-write") || std::env::var_os("NEURON_IDLE_WRITE").is_some()
 }
@@ -870,8 +881,9 @@ pub(crate) fn idle_write_disabled_message() -> &'static str {
 
 /// Build the LED idle/power timeout SET payload: a big-endian u16 of seconds. `0` means "never
 /// sleep / stay lit". Pure (no I/O) so the byte layout is unit-testable with the write gated off.
+#[must_use]
 pub fn build_idle_payload(secs: u32) -> Vec<u8> {
-    let s = secs.min(u16::MAX as u32) as u16;
+    let s = secs.min(u32::from(u16::MAX)) as u16;
     vec![(s >> 8) as u8, s as u8]
 }
 
@@ -912,17 +924,18 @@ pub fn set_idle_secs(d: &Device, secs: u32) -> Result<()> {
 // ---------------------------------------------------------------------------------------------
 
 const CLASS_POLLING: u8 = 0x00;
-/// EXTENDED HyperPolling getter (hi-res rate read). Reply `args[0]` = the rate bitmask.
+/// EXTENDED `HyperPolling` getter (hi-res rate read). Reply `args[0]` = the rate bitmask.
 const ID_HYPERPOLL_GET: u8 = 0xC0;
-/// EXTENDED HyperPolling setter (hi-res rate write). args = `[0x00, bitmask]`.
+/// EXTENDED `HyperPolling` setter (hi-res rate write). args = `[0x00, bitmask]`.
 const ID_HYPERPOLL_SET: u8 = 0x40;
 const HYPERPOLL_SET_SIZE: u8 = 0x02;
 const HYPERPOLL_GET_SIZE: u8 = 0x01;
 
-/// Independent gate for the EXTENDED HyperPolling write. Off by default; the `ingame-poll-write`
+/// Independent gate for the EXTENDED `HyperPolling` write. Off by default; the `ingame-poll-write`
 /// Cargo feature or `NEURON_INGAME_POLL_WRITE` env opens it. The plain single-rate `set_polling`
 /// (0x00/0x05, ≤1000Hz) is proven and lives in `capability`; THIS is the >1000Hz path, which we
-/// can't confirm without a HyperPolling dongle (PID 0x00B3).
+/// can't confirm without a `HyperPolling` dongle (PID 0x00B3).
+#[must_use]
 pub fn ingame_poll_write_enabled() -> bool {
     cfg!(feature = "ingame-poll-write") || std::env::var_os("NEURON_INGAME_POLL_WRITE").is_some()
 }
@@ -936,6 +949,7 @@ pub(crate) fn ingame_poll_write_disabled_message() -> &'static str {
 
 /// Map a polling rate in Hz to the Razer divisor byte (1=1000, 2=500, 4=250, 8=125). Same snapping
 /// as `capability::set_polling_hz`. The LEGACY (≤1000Hz, 0x00/0x05) encoding. Pure & unit-testable.
+#[must_use]
 pub fn polling_divisor(hz: u32) -> u8 {
     match hz {
         h if h >= 1000 => 1,
@@ -945,10 +959,11 @@ pub fn polling_divisor(hz: u32) -> u8 {
     }
 }
 
-/// Map a polling rate in Hz to the EXTENDED HyperPolling bitmask byte (OpenRazer polling2):
+/// Map a polling rate in Hz to the EXTENDED `HyperPolling` bitmask byte (`OpenRazer` polling2):
 /// 8000→0x01, 4000→0x02, 2000→0x04, 1000→0x08, 500→0x10, 250→0x20, 125→0x40. An unrecognised rate
 /// snaps DOWN to the nearest supported tier (so a stray value never writes an undefined bitmask).
 /// Pure & unit-testable.
+#[must_use]
 pub fn hyperpoll_bitmask(hz: u32) -> u8 {
     match hz {
         h if h >= 8000 => 0x01,
@@ -961,22 +976,23 @@ pub fn hyperpoll_bitmask(hz: u32) -> u8 {
     }
 }
 
-/// Build the EXTENDED HyperPolling SET payload: `[0x00, bitmask]` (the 0x00/0x40 command). Pure &
+/// Build the EXTENDED `HyperPolling` SET payload: `[0x00, bitmask]` (the 0x00/0x40 command). Pure &
 /// testable. The leading `0x00` is the fixed arg0; the bitmask is [`hyperpoll_bitmask`] of the rate.
+#[must_use]
 pub fn build_in_game_polling_payload(hz: u32) -> Vec<u8> {
     vec![0x00, hyperpoll_bitmask(hz)]
 }
 
-/// Write the EXTENDED HyperPolling (hi-res >1000Hz) rate, GATED + verify-gated + hardware-flagged.
+/// Write the EXTENDED `HyperPolling` (hi-res >1000Hz) rate, GATED + verify-gated + hardware-flagged.
 ///
-/// CONFIDENCE: the OLD opcode (0x00/0x06) was NONEXISTENT (timed out); 0x00/0x40 is the OpenRazer-
+/// CONFIDENCE: the OLD opcode (0x00/0x06) was NONEXISTENT (timed out); 0x00/0x40 is the `OpenRazer`-
 /// confirmed extended command (HIGH confidence). It is a SINGLE device-wide hi-res rate (the prior
 /// "wired vs dongle split" was the wrong 0x06 model), so the wired tier is the rate written — the
 /// `dongle_hz` arg is kept for call-site compatibility and ignored. Gated by
 /// [`ingame_poll_write_enabled`] (we can't confirm without a 0x00B3 dongle); `verify_getter` re-reads
 /// 0x00/0xC0 and confirms the bitmask echoes back, so a wrong opcode errors rather than "working".
 ///
-/// HARDWARE-VERIFY: on a HyperPolling dongle (PID 0x00B3) / Viper-8K-class mouse, set
+/// HARDWARE-VERIFY: on a `HyperPolling` dongle (PID 0x00B3) / Viper-8K-class mouse, set
 /// `NEURON_INGAME_POLL_WRITE=1`, write a hi-res rate, re-read 0x00/0xC0 and confirm the bitmask echo.
 pub fn set_in_game_polling(d: &Device, wired_hz: u32, _dongle_hz: u32) -> Result<()> {
     let payload = build_in_game_polling_payload(wired_hz);
@@ -1012,7 +1028,7 @@ pub fn set_in_game_polling(d: &Device, wired_hz: u32, _dongle_hz: u32) -> Result
 
 /// Sensor lift-off-distance class (the Razer "sensor config" class). SET = 0x0B/0x0B (symmetric LOD),
 /// GET = 0x0B/0x85. razerctl-derived, OpenRazer-cross-checked. Note this is the SAME class byte as
-/// HyperScroll (CLASS_HYPERSCROLL above) — the class is shared; the id distinguishes the command.
+/// `HyperScroll` (`CLASS_HYPERSCROLL` above) — the class is shared; the id distinguishes the command.
 const CLASS_SENSOR: u8 = 0x0B;
 const ID_LOD_SET: u8 = 0x0B;
 const ID_LOD_GET: u8 = 0x85;
@@ -1047,7 +1063,7 @@ const LOD_LAND_MAX: u8 = 25;
 /// symmetric `level`: 0 = low, 1 = medium, 2 = high. Verify-gated (no env gate).
 ///
 /// CONFIDENCE: HARDWARE-CONFIRMED on the Naga V2 Pro (2026-06 — `low` and `high` both written and the
-/// 0x0B/0x85 read-back echoed each). razerctl-derived, cross-checked vs OpenRazer. The getter
+/// 0x0B/0x85 read-back echoed each). razerctl-derived, cross-checked vs `OpenRazer`. The getter
 /// read-back is the safety net: a wrong write (or a device lacking the sensor class) returns an error,
 /// never a false success — so this needs no env flag (same trust tier as `set_dpi_stages`).
 ///
@@ -1100,6 +1116,7 @@ pub fn lift_off_distance(d: &Device) -> Result<u8> {
 /// asymmetric mode (`args[2] == 0x04`); `None` when symmetric / unreadable / asleep. Reads are never
 /// gated. The wire stores `value-1`, so we add 1 back to recover the user-facing level (lift 2..=26,
 /// landing 1..=25). The companion to [`lift_off_distance`] (which reads the symmetric level).
+#[must_use]
 pub fn lift_off_async(d: &Device) -> Option<(u8, u8)> {
     let args = d.exec_dynamic(CLASS_SENSOR, ID_LOD_GET, LOD_GET_SIZE, &[]).ok()?;
     if args[2] == LOD_MODE_ASYMMETRIC {
@@ -1114,7 +1131,7 @@ pub fn lift_off_async(d: &Device) -> Option<(u8, u8)> {
 ///
 /// CONFIDENCE: HARDWARE-CONFIRMED on the Naga V2 Pro (2026-07 — an async lift/landing pair was
 /// written and the 0x0B/0x85 getter echoed `mode=async, lift, landing`; the physical split verified
-/// by feel — tracking cut out high, re-acquired low). razerctl-derived, cross-checked vs OpenRazer.
+/// by feel — tracking cut out high, re-acquired low). razerctl-derived, cross-checked vs `OpenRazer`.
 /// The shared 0x0B/0x85 read-back is the safety net: if the device doesn't echo the pair, this
 /// returns an error rather than a false success (same trust tier as `set_dpi_stages` /
 /// `set_lift_off_distance`).
@@ -1191,7 +1208,7 @@ pub fn set_lift_off_asymmetric(d: &Device, lift: u8, landing: u8) -> Result<()> 
 //     the user's BlackWidow Chroma V2 (2017, PID 0x0221) predates the feature and cannot do it.
 // ---------------------------------------------------------------------------------------------
 
-/// Snap Tap (SOCD) class + ids — OpenRazer #2754. SET 0x02/0x27, GET 0x02/0xA7, payload 0x0F bytes.
+/// Snap Tap (SOCD) class + ids — `OpenRazer` #2754. SET 0x02/0x27, GET 0x02/0xA7, payload 0x0F bytes.
 const CLASS_SNAP_TAP: u8 = 0x02;
 const ID_SNAP_TAP_SET: u8 = 0x27;
 const ID_SNAP_TAP_GET: u8 = 0xA7;
@@ -1215,6 +1232,7 @@ pub struct SnapTapPair {
 
 impl SnapTapPair {
     /// The default counter-strafe pair, `A`/`D`.
+    #[must_use]
     pub fn ad() -> Self {
         SnapTapPair {
             a: SNAP_TAP_KEY_A,
@@ -1227,6 +1245,7 @@ impl SnapTapPair {
 /// Cargo feature or the `NEURON_SNAP_TAP_WRITE` env var opens it. The builder + verify path are
 /// always compiled & tested; only the device write is gated — and only on a board that actually
 /// supports the feature (the UI gates that with a supported-PID allowlist; here we won't fire blind).
+#[must_use]
 pub fn snap_tap_write_enabled() -> bool {
     cfg!(feature = "snap-tap-write") || std::env::var_os("NEURON_SNAP_TAP_WRITE").is_some()
 }
@@ -1238,7 +1257,7 @@ pub(crate) fn snap_tap_write_disabled_message() -> &'static str {
      the 0x02/0xA7 round-trip. (Integration: promote to a `snap-tap-write` Cargo feature.)"
 }
 
-/// Build the Snap Tap (SOCD) SET payload from a list of key-pairs — OpenRazer #2754's layout:
+/// Build the Snap Tap (SOCD) SET payload from a list of key-pairs — `OpenRazer` #2754's layout:
 /// `[enable, count, {key_a, key_b} * count, 0-pad to SNAP_TAP_SIZE]`. `enable` is 0/1; `count` is
 /// how many pairs follow. Pure (no I/O) so the byte layout is unit-testable with the write gated off.
 /// An empty pair list writes `enable=0, count=0` (the "disable Snap Tap" payload).
@@ -1251,7 +1270,7 @@ pub fn build_snap_tap_payload(pairs: &[SnapTapPair], enable: bool) -> Result<Vec
     }
     let mut buf = vec![0u8; SNAP_TAP_SIZE as usize];
     let on = enable && !pairs.is_empty();
-    buf[0] = on as u8;
+    buf[0] = u8::from(on);
     buf[1] = if on { pairs.len() as u8 } else { 0 };
     if on {
         for (i, p) in pairs.iter().enumerate() {
@@ -1267,11 +1286,11 @@ pub fn build_snap_tap_payload(pairs: &[SnapTapPair], enable: bool) -> Result<Vec
 /// confirmation on a supporting board). `writes_paused`-guarded like the other live writes.
 ///
 /// CONFIDENCE: the {class 0x02, SET id 0x27, GET id 0xA7, size 0x0F, up-to-4 pairs} layout is from
-/// OpenRazer issue #2754 (MEDIUM confidence — decoded, not yet round-tripped here). Because it has a
+/// `OpenRazer` issue #2754 (MEDIUM confidence — decoded, not yet round-tripped here). Because it has a
 /// getter (0xA7), it IS verify-gatable: `verify_getter` re-reads 0x02/0xA7 and confirms the
 /// `[enable, count, pairs..]` we wrote echo back, so a wrong layout errors rather than "working".
 ///
-/// HARDWARE-VERIFY: on a Snap-Tap-capable keyboard (BlackWidow V4 Pro/TKL, Huntsman V3), set
+/// HARDWARE-VERIFY: on a Snap-Tap-capable keyboard (`BlackWidow` V4 Pro/TKL, Huntsman V3), set
 /// `NEURON_SNAP_TAP_WRITE=1`, write the A/D pair, then re-read 0x02/0xA7 and confirm the echo. If it
 /// doesn't echo, the layout/opcode is wrong — adjust [`build_snap_tap_payload`] and re-verify.
 pub fn set_snap_tap(d: &Device, pairs: &[SnapTapPair], enable: bool) -> Result<()> {
@@ -1301,14 +1320,15 @@ pub fn set_snap_tap(d: &Device, pairs: &[SnapTapPair], enable: bool) -> Result<(
 /// Did the last lighting write LAND? Reads the def's `lighting_state` getter and compares the
 /// echoed effect byte against `expected_effect`. The Naga TOML authored this getter "to verify
 /// a lighting write actually landed" — this is its first actual consumer (survey 2026-07-06).
-/// None = device has no lighting_state getter (verification impossible, not a failure).
+/// None = device has no `lighting_state` getter (verification impossible, not a failure).
 ///
-/// Layout is per-era (read the two device TOMLs' lighting_state comments): the MATRIX state
+/// Layout is per-era (read the two device TOMLs' `lighting_state` comments): the MATRIX state
 /// (class 0x0F/0x82) is `[varstore, led, effect, param, brightness, …]` so the effect sits at
 /// byte [2] and we compare it exactly. The LEGACY state (class 0x03/0x88, size 6) does NOT map to
 /// a clean effect byte, so legacy verification is COARSE: an ALL-ZERO reply means nothing is lit
 /// (the write didn't land), any nonzero byte in the state means it did — enough to tell "the tx
 /// reached the LEDs" from "the tx no-op'd", which is all the heal needs.
+#[must_use]
 pub fn lighting_landed(d: &Device, def: &DeviceDef, expected_effect: u8) -> Option<bool> {
     let cmd = def.command("lighting_state")?;
     let got = d.exec_dynamic(cmd.class, cmd.id, cmd.size, &cmd.args).ok()?;
@@ -1327,10 +1347,11 @@ pub fn lighting_landed(d: &Device, def: &DeviceDef, expected_effect: u8) -> Opti
 /// FIRST-LIGHT HEAL (DIALECT-RND): on an AUTO def whose lighting writes may ride a wrong era-
 /// heuristic tx (writes don't echo honesty — a wrong tx ACKs then no-ops), re-issue the custom-
 /// frame DISPLAY report at each tx cohort candidate (0x1F, 0x3F, 0xFF, 0x9F), read back
-/// lighting_state after each, and return the FIRST tx that verifiably landed. Starts with the
+/// `lighting_state` after each, and return the FIRST tx that verifiably landed. Starts with the
 /// def's current tx (already-right = no extra writes). None = nothing verified (device asleep /
 /// no getter) — caller leaves the def alone. Writes are the same volatile lighting writes the
 /// caller was already streaming; no new write class is introduced.
+#[must_use]
 pub fn first_light_heal(d: &Device, def: &DeviceDef) -> Option<u8> {
     let l = def.lighting.as_ref()?;
     // The custom-frame DISPLAY report — the write whose landing we're proving. Its data_size is the
@@ -1403,6 +1424,7 @@ impl Chord {
     pub const ALL: [Chord; 4] = [Chord::AltTab, Chord::Win, Chord::AltF4, Chord::AltEsc];
 
     /// The human label for this chord (what the apply summary / UI shows).
+    #[must_use]
     pub fn label(self) -> &'static str {
         match self {
             Chord::AltTab => "Alt+Tab",
@@ -1417,6 +1439,7 @@ impl GamingMode {
     /// Build from a profile's four gaming-mode toggles. `disable_alt_esc` has no *Synapse-import*
     /// source, but it IS a native profile field (the Key Guard's fourth toggle), so a profile carries
     /// it and apply restores it like the other three — no more special-cased live-only bolt-on.
+    #[must_use]
     pub fn from_profile(
         disable_alt_tab: bool,
         disable_win: bool,
@@ -1431,22 +1454,25 @@ impl GamingMode {
         }
     }
     /// True if anything is suppressed (so the daemon only installs the hook when needed).
+    #[must_use]
     pub fn any(&self) -> bool {
         self.disable_alt_tab || self.disable_win || self.disable_alt_f4 || self.disable_alt_esc
     }
     /// The labels of every chord this policy suppresses, in canonical [`Chord::ALL`] order — the ONE
     /// source of the apply-summary chord list (so the summary can't drift from `suppresses`).
+    #[must_use]
     pub fn suppressed_labels(&self) -> Vec<&'static str> {
         Chord::ALL
             .iter()
             .copied()
             .filter(|c| self.suppresses(*c))
-            .map(|c| c.label())
+            .map(Chord::label)
             .collect()
     }
 
     /// Whether a given chord should be swallowed under this policy. The host-side enforcement
     /// primitive: the daemon's hook calls this on each candidate chord.
+    #[must_use]
     pub fn suppresses(&self, chord: Chord) -> bool {
         match chord {
             Chord::AltTab => self.disable_alt_tab,
@@ -1474,12 +1500,13 @@ pub struct ButtonRemap {
     pub action: Action,
     /// Reserved for a future firmware-mapping payload; empty for the host-side remap path.
     pub assignment: Vec<u8>,
-    /// Whether this lives on the held HyperShift layer (parallel second-tier map) or the base.
+    /// Whether this lives on the held `HyperShift` layer (parallel second-tier map) or the base.
     pub hypershift: bool,
 }
 
 impl ButtonRemap {
-    /// A host-side remap (the BlackWidow path, and the Naga path until onboard Mapping is RE'd).
+    /// A host-side remap (the `BlackWidow` path, and the Naga path until onboard Mapping is RE'd).
+    #[must_use]
     pub fn host(from: Trigger, action: Action, hypershift: bool) -> Self {
         ButtonRemap {
             from,
@@ -1522,7 +1549,7 @@ pub fn button_remap(source_input: Trigger, action: Action, hypershift: bool) -> 
 //    Host-side software HyperShift.
 // ---------------------------------------------------------------------------------------------
 
-/// Program/register a HyperShift hold-layer. HOST-SIDE (the software HyperShift, working today):
+/// Program/register a `HyperShift` hold-layer. HOST-SIDE (the software `HyperShift`, working today):
 /// returns the spine [`Rule`]s for the held layer named `layer`. Each remap becomes an
 /// `Input -> Action` rule; the daemon applies them only while the `Hold { layer }` trigger is
 /// active (the cast hold-model + `GetAsyncKeyState` on the layer's trigger VK). This is exactly
@@ -1602,7 +1629,7 @@ mod tests {
         let mut recovered = Vec::new();
         for i in 0..count {
             let off = 3 + i * 7;
-            let x = ((p[off + 1] as u16) << 8) | p[off + 2] as u16;
+            let x = (u16::from(p[off + 1]) << 8) | u16::from(p[off + 2]);
             recovered.push(x);
         }
         assert_eq!(recovered, vec![400, 3200, 6400]);
@@ -1690,8 +1717,8 @@ mod tests {
         // id=1, X=1600 (0x0640), Y=800 (0x0320)
         assert_eq!(&p[3..10], &[0x01, 0x06, 0x40, 0x03, 0x20, 0x00, 0x00]);
         // Decode it back exactly as the wire-reader would and recover both axes.
-        let x = ((p[4] as u16) << 8) | p[5] as u16;
-        let y = ((p[6] as u16) << 8) | p[7] as u16;
+        let x = (u16::from(p[4]) << 8) | u16::from(p[5]);
+        let y = (u16::from(p[6]) << 8) | u16::from(p[7]);
         assert_eq!((x, y), (1600, 800));
     }
 

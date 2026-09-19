@@ -12,7 +12,7 @@
 //! Honest about reach: NETWORK (ethernet vs wifi + SSID + whether you're actually online) and
 //! BLUETOOTH presence are GLANCED via plain Win32 (IP Helper / WLAN / the Bluetooth radio find) —
 //! no elevation, instant. The OUTPUT side reuses the audio layer's flip. The Bluetooth RADIO
-//! on/off is the one thing Win32 can't flip without WinRT (`Windows.Devices.Radios`); rather than
+//! on/off is the one thing Win32 can't flip without `WinRT` (`Windows.Devices.Radios`); rather than
 //! pretend, the bluetooth flick opens the Settings page that does — an honest one-tap seam.
 
 #![cfg(windows)]
@@ -74,7 +74,7 @@ pub fn glance() -> Glance {
 }
 
 /// Walk the adapters and pick the one carrying the default route (a non-loopback adapter that is
-/// UP and has a gateway). Reads its IfType (ethernet vs wifi) + friendly name. The presence of a
+/// UP and has a gateway). Reads its `IfType` (ethernet vs wifi) + friendly name. The presence of a
 /// gateway on an up adapter is our "online" signal — honest without an active probe.
 fn net_glance() -> Glance {
     use windows_sys::Win32::NetworkManagement::IpHelper::{
@@ -100,8 +100,8 @@ fn net_glance() -> Glance {
             AF_UNSPEC,
             flags,
             std::ptr::null(),
-            buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH,
-            &mut size,
+            buf.as_mut_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>(),
+            &raw mut size,
         );
         if rc == 111 {
             // ERROR_BUFFER_OVERFLOW — grow to the size it told us and retry once.
@@ -110,14 +110,14 @@ fn net_glance() -> Glance {
                 AF_UNSPEC,
                 flags,
                 std::ptr::null(),
-                buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH,
-                &mut size,
+                buf.as_mut_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>(),
+                &raw mut size,
             );
         }
         if rc != 0 {
             return out; // no adapters readable — report offline honestly
         }
-        let mut p = buf.as_ptr() as *const IP_ADAPTER_ADDRESSES_LH;
+        let mut p = buf.as_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>();
         // prefer an adapter that is UP AND has a gateway (the real online route); remember the
         // first up-with-gateway we see — adapters enumerate in the OS's binding order (best first).
         while !p.is_null() {
@@ -153,12 +153,12 @@ fn wifi_ssid() -> String {
         let mut neg: u32 = 0;
         let mut h: HANDLE = std::ptr::null_mut();
         // client version 2 — the modern WLAN API. A failure here = no WLAN service (no wifi).
-        if WlanOpenHandle(2, std::ptr::null(), &mut neg, &mut h) != 0 || h.is_null() {
+        if WlanOpenHandle(2, std::ptr::null(), &raw mut neg, &raw mut h) != 0 || h.is_null() {
             return String::new();
         }
         let mut ssid = String::new();
         let mut list: *mut WLAN_INTERFACE_INFO_LIST = std::ptr::null_mut();
-        if WlanEnumInterfaces(h, std::ptr::null(), &mut list) == 0 && !list.is_null() {
+        if WlanEnumInterfaces(h, std::ptr::null(), &raw mut list) == 0 && !list.is_null() {
             let n = (*list).dwNumberOfItems as usize;
             let items = (*list).InterfaceInfo.as_ptr();
             for i in 0..n {
@@ -170,11 +170,11 @@ fn wifi_ssid() -> String {
                 let mut data: *mut std::ffi::c_void = std::ptr::null_mut();
                 if WlanQueryInterface(
                     h,
-                    &info.InterfaceGuid,
+                    &raw const info.InterfaceGuid,
                     wlan_intf_opcode_current_connection,
                     std::ptr::null(),
-                    &mut data_size,
-                    &mut data,
+                    &raw mut data_size,
+                    &raw mut data,
                     std::ptr::null_mut(),
                 ) == 0
                     && !data.is_null()
@@ -196,7 +196,7 @@ fn wifi_ssid() -> String {
     }
 }
 
-/// Is a Bluetooth radio installed? (We never toggle it from here — Win32 can't without WinRT — but
+/// Is a Bluetooth radio installed? (We never toggle it from here — Win32 can't without `WinRT` — but
 /// a radio's presence decides whether the toggle SEAM is worth offering.)
 fn bluetooth_present() -> bool {
     use windows_sys::Win32::Devices::Bluetooth::{
@@ -208,7 +208,7 @@ fn bluetooth_present() -> bool {
             dwSize: std::mem::size_of::<BLUETOOTH_FIND_RADIO_PARAMS>() as u32,
         };
         let mut radio: HANDLE = std::ptr::null_mut();
-        let find = BluetoothFindFirstRadio(&params, &mut radio);
+        let find = BluetoothFindFirstRadio(&raw const params, &raw mut radio);
         if find.is_null() {
             return false;
         }
@@ -221,7 +221,7 @@ fn bluetooth_present() -> bool {
 }
 
 /// THE BLUETOOTH SEAM — open the Settings page that toggles the radio. The actual on/off lives in
-/// WinRT (`Windows.Devices.Radios`, not in windows-sys); rather than fake a toggle we can't do,
+/// `WinRT` (`Windows.Devices.Radios`, not in windows-sys); rather than fake a toggle we can't do,
 /// land the user exactly one tap from it. Honest, no elevation. Returns the status line.
 pub fn open_bluetooth() -> String {
     if open_settings("ms-settings:bluetooth") {
@@ -232,9 +232,9 @@ pub fn open_bluetooth() -> String {
 }
 
 /// Toggle the Bluetooth RADIO in place (item 18 — "lemme toggle Bluetooth real quick", not a seam).
-/// The radio power lives in WinRT (`Windows.Devices.Radios`), which windows-sys can't reach without
+/// The radio power lives in `WinRT` (`Windows.Devices.Radios`), which windows-sys can't reach without
 /// pulling in the heavy `windows` crate, so we drive it through a hidden PowerShell that flips the
-/// first Bluetooth radio's state. If WinRT access is denied (or there's no radio), the script lands
+/// first Bluetooth radio's state. If `WinRT` access is denied (or there's no radio), the script lands
 /// on the Settings page instead — so a press is never a no-op. Arm-gated like every process spawn;
 /// disarmed → just the (harmless) seam.
 pub fn bluetooth_toggle() -> String {
@@ -244,7 +244,7 @@ pub fn bluetooth_toggle() -> String {
     }
     // the canonical PS 5.1 WinRT-await pattern (AsTask reflection), with the settings seam as the
     // in-script fallback. Single-quoted PS strings keep the literal backtick in `IAsyncOperation`1`.
-    const SCRIPT: &str = r#"
+    const SCRIPT: &str = r"
 try {
   $g = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
   function Await($op,$t){ $n = $g.MakeGenericMethod($t).Invoke($null,@($op)); $n.Wait(-1) | Out-Null; $n.Result }
@@ -255,7 +255,7 @@ try {
   $bt = $rs | Where-Object { $_.Kind -eq 'Bluetooth' } | Select-Object -First 1
   if ($bt) { $s = if ($bt.State -eq 'On') { 'Off' } else { 'On' }; [void](Await ($bt.SetStateAsync($s)) ([Windows.Devices.Radios.RadioAccessStatus])) } else { throw 'no radio' }
 } catch { Start-Process 'ms-settings:bluetooth' }
-"#;
+";
     match std::process::Command::new("powershell")
         .args([
             "-NoProfile",

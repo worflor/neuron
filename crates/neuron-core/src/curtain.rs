@@ -11,7 +11,7 @@
 //!
 //! ## Why it is NOT `SC_MONITORPOWER`
 //! This used to be "monitors off": a real DPMS monitor power-off. That tears the display link all the
-//! way down; on a DisplayPort + NVIDIA rig Windows reads it as a hot-unplug, collapses the desktop
+//! way down; on a `DisplayPort` + NVIDIA rig Windows reads it as a hot-unplug, collapses the desktop
 //! onto the surviving panel, and the cold renegotiation on wake reads exactly like a frozen machine
 //! you must restart. The opposite of "hide fast, come back fast". The curtain is a pure user-space
 //! overlay — an opaque window and a poll loop — so it can't do any of that.
@@ -146,11 +146,11 @@ fn run() {
             // smeared over the black. The live cursor is also the tell that this is a veil, not a dead
             // monitor.
             hCursor: LoadCursorW(std::ptr::null_mut(), 32512 as _), // IDC_ARROW
-            hbrBackground: GetStockObject(BLACK_BRUSH) as _,
+            hbrBackground: GetStockObject(BLACK_BRUSH).cast(),
             lpszMenuName: std::ptr::null(),
             lpszClassName: cls_name.as_ptr(),
         };
-        RegisterClassW(&wc);
+        RegisterClassW(&raw const wc);
 
         // The virtual screen spans every monitor (and the gaps): SM_XVIRTUALSCREEN=76, Y=77, CX=78,
         // CY=79. One opaque window over all of it hides everything in a single surface.
@@ -198,9 +198,9 @@ fn run() {
         // Pump our thread's messages so the window paints and stays responsive.
         unsafe {
             let mut msg: MSG = std::mem::zeroed();
-            while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
-                TranslateMessage(&msg);
-                DispatchMessageW(&msg);
+            while PeekMessageW(&raw mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+                TranslateMessage(&raw const msg);
+                DispatchMessageW(&raw const msg);
             }
         }
 
@@ -273,9 +273,9 @@ fn run() {
         }
         // Flush the destroy so the window is really gone before the thread exits.
         let mut msg: MSG = std::mem::zeroed();
-        while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+        while PeekMessageW(&raw mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+            TranslateMessage(&raw const msg);
+            DispatchMessageW(&raw const msg);
         }
     }
 }
@@ -294,7 +294,7 @@ fn paint_frame(hwnd: windows_sys::Win32::Foundation::HWND, t: f32, intensity: f3
 
     unsafe {
         let mut rc: RECT = std::mem::zeroed();
-        if GetClientRect(hwnd, &mut rc) == 0 {
+        if GetClientRect(hwnd, &raw mut rc) == 0 {
             return;
         }
         let cw = (rc.right - rc.left).max(1);
@@ -348,8 +348,8 @@ fn paint_frame(hwnd: windows_sys::Win32::Foundation::HWND, t: f32, intensity: f3
                 0,
                 bw,
                 bh,
-                buf.as_ptr() as *const _,
-                &bmi,
+                buf.as_ptr().cast(),
+                &raw const bmi,
                 DIB_RGB_COLORS,
                 SRCCOPY,
             );
@@ -378,12 +378,12 @@ unsafe fn force_foreground(hwnd: windows_sys::Win32::Foundation::HWND) {
         }
         let fg_thread = GetWindowThreadProcessId(fg, std::ptr::null_mut());
         let our_thread = GetCurrentThreadId();
-        if fg_thread != our_thread {
+        if fg_thread == our_thread {
+            SetForegroundWindow(hwnd);
+        } else {
             AttachThreadInput(our_thread, fg_thread, 1);
             SetForegroundWindow(hwnd);
             AttachThreadInput(our_thread, fg_thread, 0);
-        } else {
-            SetForegroundWindow(hwnd);
         }
     }
 }

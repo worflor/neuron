@@ -41,6 +41,7 @@ pub struct FeelIntent {
 impl FeelIntent {
     /// True when nothing has ever been recorded — a reassert must then fall back to
     /// device-derived truth (or do nothing), never invent values.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.dpi.is_none() && self.stages.is_empty()
     }
@@ -75,6 +76,7 @@ fn save_file(f: &FileShape) -> anyhow::Result<()> {
 }
 
 /// The recorded intent for `pid`, if any non-empty one exists.
+#[must_use]
 pub fn get(pid: u16) -> Option<FeelIntent> {
     let f = load_file();
     f.devices.get(&pid_key(pid)).filter(|i| !i.is_empty()).cloned()
@@ -111,6 +113,7 @@ pub fn record_stages(pid: u16, stages: &[u16], active: u8) -> anyhow::Result<()>
 
 /// This pid's record exactly as stored, empty or not — the counterpart to [`restore`], for a caller
 /// that must be able to put things back the way they were.
+#[must_use]
 pub fn snapshot(pid: u16) -> Option<FeelIntent> {
     load_file().devices.get(&pid_key(pid)).cloned()
 }

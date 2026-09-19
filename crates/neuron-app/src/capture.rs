@@ -163,7 +163,7 @@ fn held_modifiers(_pressed: i32) -> Vec<&'static str> {
 }
 
 fn finish_chord(gen: u64, code: i32, mods: Vec<&'static str>, name: String) {
-    if GENERATION.with(|g| g.get()) != gen {
+    if GENERATION.with(std::cell::Cell::get) != gen {
         return;
     }
     let weak = CAP_WINDOW.with(|c| c.borrow().clone());
@@ -221,9 +221,9 @@ pub fn begin_control(
     );
 }
 
-/// Run the stashed control handler on the UI thread (stale generations are inert; see finish_vk).
+/// Run the stashed control handler on the UI thread (stale generations are inert; see `finish_vk`).
 fn finish_ctl(gen: u64, pkt: Option<(u16, u16, Option<neuron::registry::CanonicalPid>)>) {
-    if GENERATION.with(|g| g.get()) != gen {
+    if GENERATION.with(std::cell::Cell::get) != gen {
         return;
     }
     let weak = CAP_WINDOW.with(|c| c.borrow().clone());
@@ -426,7 +426,7 @@ pub fn begin_keyseq(app: &AppWindow, on_done: impl Fn(&AppWindow, Option<String>
 }
 
 fn finish_seq(gen: u64, grammar: Option<String>) {
-    if GENERATION.with(|g| g.get()) != gen {
+    if GENERATION.with(std::cell::Cell::get) != gen {
         return;
     }
     let weak = CAP_WINDOW.with(|c| c.borrow().clone());

@@ -10,7 +10,7 @@
 //!     the blocking macro resumes with that verdict (True / False / default-on-dismiss).
 //!   * CONCURRENCY — a macro blocked on its worker (sleep/ask) does NOT stall other macros
 //!     (per-macro serial queues), and one macro's rapid fires execute IN ORDER.
-//!   * NOTIFY — `neuron.notify` surfaces as a BeaconEvent + a macro-log line.
+//!   * NOTIFY — `neuron.notify` surfaces as a `BeaconEvent` + a macro-log line.
 //!
 //! Skips cleanly (not a failure) when no python runtime is resolvable.
 
@@ -232,7 +232,7 @@ fn beacon_protocol_round_trips_without_a_gui() {
         "both macros' prompts must be open at once: {open:?}"
     );
     for (pid, text) in &open {
-        host.answer(*pid, Some(if text == "question A" { 0 } else { 1 })); // A -> yes(0), B -> no(1)
+        host.answer(*pid, Some(usize::from(text != "question A"))); // A -> yes(0), B -> no(1)
     }
     std::thread::sleep(Duration::from_millis(600));
     let log = host.drain_log();

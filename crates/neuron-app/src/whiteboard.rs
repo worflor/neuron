@@ -18,7 +18,7 @@
 //! these directly once the codec port lands (the in-memory model already matches the format's
 //! pen-stroke shape).
 //!
-//! Honesty rules: the canvas never takes input (WS_EX_TRANSPARENT), drawing reads only the
+//! Honesty rules: the canvas never takes input (`WS_EX_TRANSPARENT`), drawing reads only the
 //! cursor, and nothing here consults the input-arm gate because nothing synthesizes input.
 
 use crate::ui::{AppWindow, State};
@@ -144,7 +144,7 @@ static PAL_PIN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::n
 static PAL_POS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
 
 fn pack_pos(x: i32, y: i32) -> u64 {
-    ((x as u32 as u64) << 32) | (y as u32 as u64)
+    (u64::from(x as u32) << 32) | u64::from(y as u32)
 }
 
 fn unpack_pos(v: u64) -> Option<(i32, i32)> {
@@ -276,11 +276,11 @@ enum Cmd {
     Visible(bool),
     /// LASER (presentation) mode — none of these touch the kept ink; they live on a time-fading
     /// overlay so a presenter can point and react without leaving marks behind.
-    ///   LaserBegin start a new trail RUN carrying the CURRENT pen — the trail renders in the same
+    ///   `LaserBegin` start a new trail RUN carrying the CURRENT pen — the trail renders in the same
     ///             material/size you're holding (no hardcoded laser look) and never bridges a lift
-    ///   LaserPt   extend the live laser trail to this screen point (a comet that lingers ~2.5s)
-    ///   LaserLift the hold ended — stop extending; the tail fades on its own
-    ///   PingWheel  show/move the reactionary-ping radial at the cursor, sector under the aim lit
+    ///   `LaserPt`   extend the live laser trail to this screen point (a comet that lingers ~2.5s)
+    ///   `LaserLift` the hold ended — stop extending; the tail fades on its own
+    ///   `PingWheel`  show/move the reactionary-ping radial at the cursor, sector under the aim lit
     ///   Ping       drop a comms ping of this kind at a screen point (blooms, then fades)
     LaserBegin {
         color: u32,
@@ -440,8 +440,7 @@ fn session_loop(weak: &slint::Weak<AppWindow>) {
     let vk = slots
         .iter()
         .find(|s| s.action == neuron::action::Action::Whiteboard)
-        .map(|s| s.ctl)
-        .unwrap_or(cast.trigger);
+        .map_or(cast.trigger, |s| s.ctl);
     let feel = neuron::feel::FeelConfig::load();
     let gen = crate::dispatch::reload_generation();
     let done = || {
@@ -484,7 +483,7 @@ fn session_loop(weak: &slint::Weak<AppWindow>) {
                 pen.color,
                 pen.width,
             ),
-        )
+        );
     };
     {
         let pen = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).pen;
@@ -643,12 +642,12 @@ fn draw_stroke(
     // INK STABILIZATION — speed-adaptive EMA on the cursor. Slow, deliberate strokes get the
     // most settling (where hand tremor lives); fast strokes ride nearly raw so the line never
     // lags a flick. Tuned to read like a gentle ~4% tablet smoothing — felt, not seen.
-    let mut sx = start.0 as f64;
-    let mut sy = start.1 as f64;
+    let mut sx = f64::from(start.0);
+    let mut sy = f64::from(start.1);
     while neuron::glyph::control_down(vk) && !cancel() {
         let p = cursor_pos();
-        let dx = p.0 as f64 - sx;
-        let dy = p.1 as f64 - sy;
+        let dx = f64::from(p.0) - sx;
+        let dy = f64::from(p.1) - sy;
         let speed = (dx * dx + dy * dy).sqrt(); // px per 6ms tick
         let alpha = (0.30 + speed * 0.035).clamp(0.30, 0.95);
         sx += dx * alpha;
@@ -670,7 +669,7 @@ fn draw_stroke(
         .then(|| {
             let body: Vec<neuron::glyph::C> = pts
                 .iter()
-                .map(|p| neuron::glyph::C::new(p.0 as f64, p.1 as f64))
+                .map(|p| neuron::glyph::C::new(f64::from(p.0), f64::from(p.1)))
                 .collect();
             neuron::shapes::snap(&body)
         })
@@ -694,7 +693,7 @@ fn draw_stroke(
 }
 
 /// LASER mode's hold: feed a fading pointer trail (never kept ink). Streams the cursor to the
-/// canvas as `LaserPt`; on release the trail lifts and fades itself over LASER_MS. No shape-snap,
+/// canvas as `LaserPt`; on release the trail lifts and fades itself over `LASER_MS`. No shape-snap,
 /// no smoothing settle — a laser is raw and immediate.
 #[cfg(windows)]
 fn laser_trail(
@@ -716,12 +715,12 @@ fn laser_trail(
     // the SAME speed-adaptive EMA the pen uses (draw_stroke): the laser followed the RAW cursor and
     // so beaded at every jitter while the pen blends — smoothing the path makes the trail one clean
     // ribbon, not a string of dots. Slow moves settle most (where tremor lives); flicks ride near-raw.
-    let mut sx = start.0 as f64;
-    let mut sy = start.1 as f64;
+    let mut sx = f64::from(start.0);
+    let mut sy = f64::from(start.1);
     while neuron::glyph::control_down(vk) && !cancel() {
         let p = cursor_pos();
-        let dx = p.0 as f64 - sx;
-        let dy = p.1 as f64 - sy;
+        let dx = f64::from(p.0) - sx;
+        let dy = f64::from(p.1) - sy;
         let speed = (dx * dx + dy * dy).sqrt();
         let alpha = (0.30 + speed * 0.035).clamp(0.30, 0.95);
         sx += dx * alpha;
@@ -923,10 +922,10 @@ fn classify_command(pts: &[(i32, i32)]) -> Command {
     }
     let (sx, sy) = pts[0];
     let (ex, ey) = *pts.last().unwrap();
-    let net = (((ex - sx).pow(2) + (ey - sy).pow(2)) as f64).sqrt();
+    let net = f64::from((ex - sx).pow(2) + (ey - sy).pow(2)).sqrt();
     let arc: f64 = pts
         .windows(2)
-        .map(|w| (((w[1].0 - w[0].0).pow(2) + (w[1].1 - w[0].1).pow(2)) as f64).sqrt())
+        .map(|w| f64::from((w[1].0 - w[0].0).pow(2) + (w[1].1 - w[0].1).pow(2)).sqrt())
         .sum();
     let (mut x0, mut y0, mut x1, mut y1) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
     for p in pts {
@@ -935,7 +934,7 @@ fn classify_command(pts: &[(i32, i32)]) -> Command {
         x1 = x1.max(p.0);
         y1 = y1.max(p.1);
     }
-    let diag = ((((x1 - x0).pow(2)) + ((y1 - y0).pow(2))) as f64)
+    let diag = f64::from(((x1 - x0).pow(2)) + ((y1 - y0).pow(2)))
         .sqrt()
         .max(1.0);
     // direction reversals along the dominant axis (zig-zag) AND the perpendicular axis (wave),
@@ -984,8 +983,8 @@ fn classify_command(pts: &[(i32, i32)]) -> Command {
         let max_dev = pts
             .iter()
             .map(|p| {
-                (((ex - sx) as f64) * ((sy - p.1) as f64)
-                    - ((sx - p.0) as f64) * ((ey - sy) as f64))
+                (f64::from(ex - sx) * f64::from(sy - p.1)
+                    - f64::from(sx - p.0) * f64::from(ey - sy))
                     .abs()
                     / chord
             })
@@ -1029,7 +1028,7 @@ fn cursor_pos() -> (i32, i32) {
     #[cfg(windows)]
     unsafe {
         let mut p = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
-        windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut p);
+        windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos(&raw mut p);
         (p.x, p.y)
     }
     #[cfg(not(windows))]
@@ -1225,7 +1224,7 @@ mod imp {
                             // snapshot the canvas: the stroke composites over THIS substrate so
                             // every joint re-resolves correctly as the field deepens.
                             std::ptr::copy_nonoverlapping(
-                                px as *const u32,
+                                px.cast_const(),
                                 base.as_mut_ptr(),
                                 count,
                             );
@@ -1325,7 +1324,7 @@ mod imp {
                             // LIVE feedback: light up what the in-flight command would act on.
                             let local: Vec<(f64, f64)> = path
                                 .iter()
-                                .map(|(x, y)| ((x - vx) as f64, (y - vy) as f64))
+                                .map(|(x, y)| (f64::from(x - vx), f64::from(y - vy)))
                                 .collect();
                             let (set, color) = match kind {
                                 Command::Scribble | Command::Slash => {
@@ -1350,7 +1349,7 @@ mod imp {
                             // and crossing a SELECTION takes all of it (one gesture, one intent).
                             let local: Vec<(f64, f64)> = path
                                 .iter()
-                                .map(|(x, y)| ((x - vx) as f64, (y - vy) as f64))
+                                .map(|(x, y)| (f64::from(x - vx), f64::from(y - vy)))
                                 .collect();
                             let doomed = crossed_set(&strokes, &local, &selected);
                             if !doomed.is_empty() {
@@ -1381,7 +1380,7 @@ mod imp {
                             // rest — the retroactive, opt-in shape-set.
                             let local: Vec<(f64, f64)> = path
                                 .iter()
-                                .map(|(x, y)| ((x - vx) as f64, (y - vy) as f64))
+                                .map(|(x, y)| (f64::from(x - vx), f64::from(y - vy)))
                                 .collect();
                             let targets = crossed_set(&strokes, &local, &[]);
                             for &i in &targets {
@@ -1389,7 +1388,7 @@ mod imp {
                                     let body: Vec<neuron::glyph::C> = s
                                         .pts
                                         .iter()
-                                        .map(|p| neuron::glyph::C::new(p.0 as f64, p.1 as f64))
+                                        .map(|p| neuron::glyph::C::new(f64::from(p.0), f64::from(p.1)))
                                         .collect();
                                     match neuron::shapes::snap(&body) {
                                         Some(shape) => {
@@ -1413,7 +1412,7 @@ mod imp {
                             // the LASSO: a stroke is taken when most of it lives inside the loop.
                             let local: Vec<(f64, f64)> = poly
                                 .iter()
-                                .map(|(x, y)| ((x - vx) as f64, (y - vy) as f64))
+                                .map(|(x, y)| (f64::from(x - vx), f64::from(y - vy)))
                                 .collect();
                             selected = lasso_set(&strokes, &local);
                             marked.clear();
@@ -1423,7 +1422,7 @@ mod imp {
                             if !selected.is_empty() && (dx != 0 || dy != 0) {
                                 for &i in &selected {
                                     if let Some(s) = strokes.get_mut(i) {
-                                        for p in s.pts.iter_mut() {
+                                        for p in &mut s.pts {
                                             p.0 += dx;
                                             p.1 += dy;
                                         }
@@ -1483,12 +1482,11 @@ mod imp {
                             let _ = reply.send(had);
                         }
                         Cmd::HitSelection(x, y, reply) => {
-                            let p = ((x - vx) as f64, (y - vy) as f64);
+                            let p = (f64::from(x - vx), f64::from(y - vy));
                             let hit = selected.iter().any(|&i| {
                                 strokes
                                     .get(i)
-                                    .map(|s| stroke_hit_wide(s, p, 28.0))
-                                    .unwrap_or(false)
+                                    .is_some_and(|s| stroke_hit_wide(s, p, 28.0))
                             });
                             let _ = reply.send(hit);
                         }
@@ -1501,7 +1499,7 @@ mod imp {
                                 redo.push((last, s));
                                 selected.retain(|&i| i != last);
                                 // indices above the removed slot shift down by one
-                                for i in selected.iter_mut() {
+                                for i in &mut selected {
                                     if *i > last {
                                         *i -= 1;
                                     }
@@ -1518,7 +1516,7 @@ mod imp {
                             if let Some((at, s)) = redo.pop() {
                                 let at = at.min(strokes.len());
                                 strokes.insert(at, s);
-                                for i in selected.iter_mut() {
+                                for i in &mut selected {
                                     if *i >= at {
                                         *i += 1;
                                     }
@@ -1698,7 +1696,7 @@ mod imp {
                     // whole path into the now-clean field (cleared above, so it never polluted the
                     // committed strokes at a crossing), then composite it over the fresh base.
                     if let Some(s) = live.as_ref() {
-                        std::ptr::copy_nonoverlapping(px as *const u32, base.as_mut_ptr(), count);
+                        std::ptr::copy_nonoverlapping(px.cast_const(), base.as_mut_ptr(), count);
                         if !s.pts.is_empty() {
                             let reach = (s.width / 2.0).max(1.0) + 2.0;
                             let mut bb: Option<Region> = None;
@@ -1750,7 +1748,7 @@ mod imp {
                     // onto THIS each frame (so nothing accumulates and the strokes never repaint
                     // just because a ping pulsed). A live stroke makes the snapshot provisional —
                     // the overlay layer doesn't run while inking anyway.
-                    std::ptr::copy_nonoverlapping(px as *const u32, clean.as_mut_ptr(), count);
+                    std::ptr::copy_nonoverlapping(px.cast_const(), clean.as_mut_ptr(), count);
                     clean_valid = true;
                     dirty = true;
                 }
@@ -1784,7 +1782,7 @@ mod imp {
                         // draws the prism INTO clean — so the laser/ping rebuild needs bare strokes.
                         if !clean_valid {
                             std::ptr::write_bytes(px, 0, count);
-                            for s in strokes.iter() {
+                            for s in &strokes {
                                 render_stroke(
                                     pixbuf!(px),
                                     fieldbuf!(dmin.as_mut_ptr()),
@@ -1793,7 +1791,7 @@ mod imp {
                                 );
                             }
                             std::ptr::copy_nonoverlapping(
-                                px as *const u32,
+                                px.cast_const(),
                                 clean.as_mut_ptr(),
                                 count,
                             );
@@ -1846,9 +1844,9 @@ mod imp {
                 // window-proc ABI aborts the process, so catch_unwind here would be dead code.
                 // pump so the window stays healthy
                 let mut msg: MSG = std::mem::zeroed();
-                while PeekMessageW(&mut msg, hwnd, 0, 0, PM_REMOVE) != 0 {
-                    TranslateMessage(&msg);
-                    DispatchMessageW(&msg);
+                while PeekMessageW(&raw mut msg, hwnd, 0, 0, PM_REMOVE) != 0 {
+                    TranslateMessage(&raw const msg);
+                    DispatchMessageW(&raw const msg);
                 }
                 if false {
                     break 'run; // the channel closing ends the loop; the label documents intent
@@ -1891,7 +1889,7 @@ mod imp {
                 let inside = s
                     .pts
                     .iter()
-                    .filter(|p| in_poly((p.0 as f64, p.1 as f64), poly))
+                    .filter(|p| in_poly((f64::from(p.0), f64::from(p.1)), poly))
                     .count();
                 inside * 2 > s.pts.len() // majority rule
             })
@@ -1905,14 +1903,14 @@ mod imp {
         if path.is_empty() || s.pts.is_empty() {
             return false;
         }
-        let reach = ERASE_REACH + s.width as f64 / 2.0;
+        let reach = ERASE_REACH + f64::from(s.width) / 2.0;
         // inflated bbox rejection
         let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
         for p in &s.pts {
-            x0 = x0.min(p.0 as f64);
-            y0 = y0.min(p.1 as f64);
-            x1 = x1.max(p.0 as f64);
-            y1 = y1.max(p.1 as f64);
+            x0 = x0.min(f64::from(p.0));
+            y0 = y0.min(f64::from(p.1));
+            x1 = x1.max(f64::from(p.0));
+            y1 = y1.max(f64::from(p.1));
         }
         if !path.iter().any(|p| {
             p.0 >= x0 - reach && p.0 <= x1 + reach && p.1 >= y0 - reach && p.1 <= y1 + reach
@@ -1922,7 +1920,7 @@ mod imp {
         if path.len() == 1 || s.pts.len() == 1 {
             let pt_hit = |q: (f64, f64)| {
                 if s.pts.len() == 1 {
-                    let d = ((s.pts[0].0 as f64 - q.0).powi(2) + (s.pts[0].1 as f64 - q.1).powi(2))
+                    let d = ((f64::from(s.pts[0].0) - q.0).powi(2) + (f64::from(s.pts[0].1) - q.1).powi(2))
                         .sqrt();
                     d <= reach
                 } else {
@@ -1936,8 +1934,8 @@ mod imp {
                 seg_seg_dist(
                     pw[0],
                     pw[1],
-                    (sw[0].0 as f64, sw[0].1 as f64),
-                    (sw[1].0 as f64, sw[1].1 as f64),
+                    (f64::from(sw[0].0), f64::from(sw[0].1)),
+                    (f64::from(sw[1].0), f64::from(sw[1].1)),
                 ) <= reach
             })
         })
@@ -1972,8 +1970,8 @@ mod imp {
         for i in 2..src.len() - 2 {
             let (mut ax, mut ay) = (0i64, 0i64);
             for p in &src[i - 2..=i + 2] {
-                ax += p.0 as i64;
-                ay += p.1 as i64;
+                ax += i64::from(p.0);
+                ay += i64::from(p.1);
             }
             s.pts[i] = ((ax / 5) as i32, (ay / 5) as i32);
         }
@@ -2020,27 +2018,27 @@ mod imp {
 
     /// `stroke_hit` with a custom reach (the selection's grab halo is friendlier than an eraser).
     fn stroke_hit_wide(s: &Stroke, p: (f64, f64), reach: f64) -> bool {
-        let reach = reach + s.width as f64 / 2.0;
+        let reach = reach + f64::from(s.width) / 2.0;
         if s.pts.len() == 1 {
-            let d = ((s.pts[0].0 as f64 - p.0).powi(2) + (s.pts[0].1 as f64 - p.1).powi(2)).sqrt();
+            let d = ((f64::from(s.pts[0].0) - p.0).powi(2) + (f64::from(s.pts[0].1) - p.1).powi(2)).sqrt();
             return d <= reach;
         }
         s.pts.windows(2).any(|w| {
             let (a, b) = (w[0], w[1]);
-            seg_dist(p, (a.0 as f64, a.1 as f64), (b.0 as f64, b.1 as f64)) <= reach
+            seg_dist(p, (f64::from(a.0), f64::from(a.1)), (f64::from(b.0), f64::from(b.1))) <= reach
         })
     }
 
     /// Does the eraser point come within reach of this stroke's polyline?
     fn stroke_hit(s: &Stroke, p: (f64, f64)) -> bool {
-        let reach = ERASE_REACH + s.width as f64 / 2.0;
+        let reach = ERASE_REACH + f64::from(s.width) / 2.0;
         if s.pts.len() == 1 {
-            let d = ((s.pts[0].0 as f64 - p.0).powi(2) + (s.pts[0].1 as f64 - p.1).powi(2)).sqrt();
+            let d = ((f64::from(s.pts[0].0) - p.0).powi(2) + (f64::from(s.pts[0].1) - p.1).powi(2)).sqrt();
             return d <= reach;
         }
         s.pts.windows(2).any(|w| {
             let (a, b) = (w[0], w[1]);
-            seg_dist(p, (a.0 as f64, a.1 as f64), (b.0 as f64, b.1 as f64)) <= reach
+            seg_dist(p, (f64::from(a.0), f64::from(a.1)), (f64::from(b.0), f64::from(b.1))) <= reach
         })
     }
 
@@ -2136,7 +2134,7 @@ mod imp {
         (x0, y0, x1, y1)
     }
 
-    /// Return a carved region to the field's resting state (f32::MAX).
+    /// Return a carved region to the field's resting state (`f32::MAX`).
     fn reset_region(dmin: &mut FieldBuf, r: Region) {
         for yy in r.1..=r.3 {
             if let Some(row) = dmin.row_range_mut(yy, r.0, r.2) {
@@ -2706,25 +2704,22 @@ mod imp {
                 if d > rad + 2.0 {
                     continue;
                 }
-                let (col, al) = match material_mat {
-                    Some(m) => {
-                        // analytic field gradient = the segment normal (so the rim/facets resolve)
-                        let (ax, ay) = (a.0 as f32, a.1 as f32);
-                        let (bx, by) = (b.0 as f32, b.1 as f32);
-                        let (cx, cy) = (ax + (bx - ax) * t, ay + (by - ay) * t);
-                        let (mut gx, mut gy) = (xx as f32 - cx, yy as f32 - cy);
-                        let gl = (gx * gx + gy * gy).sqrt().max(1e-3);
-                        gx /= gl;
-                        gy /= gl;
-                        material_core(d, rad, gx, gy, xx as f32, yy as f32, mt, m)
-                    }
-                    None => {
-                        // the pen's OWN brush — the laser is the same media, just fading. (arc = 0:
-                        // the along-stroke streak doesn't vary on a transient pointer; the across/
-                        // tooth grain via d,x,y still reads, so crayon/chalk look like themselves.)
-                        let al = brush_alpha(pen.brush, false, 0x1A5E, d, rad, 0.0, xx, yy);
-                        (pen.color, al)
-                    }
+                let (col, al) = if let Some(m) = material_mat {
+                    // analytic field gradient = the segment normal (so the rim/facets resolve)
+                    let (ax, ay) = (a.0 as f32, a.1 as f32);
+                    let (bx, by) = (b.0 as f32, b.1 as f32);
+                    let (cx, cy) = (ax + (bx - ax) * t, ay + (by - ay) * t);
+                    let (mut gx, mut gy) = (xx as f32 - cx, yy as f32 - cy);
+                    let gl = (gx * gx + gy * gy).sqrt().max(1e-3);
+                    gx /= gl;
+                    gy /= gl;
+                    material_core(d, rad, gx, gy, xx as f32, yy as f32, mt, m)
+                } else {
+                    // the pen's OWN brush — the laser is the same media, just fading. (arc = 0:
+                    // the along-stroke streak doesn't vary on a transient pointer; the across/
+                    // tooth grain via d,x,y still reads, so crayon/chalk look like themselves.)
+                    let al = brush_alpha(pen.brush, false, 0x1A5E, d, rad, 0.0, xx, yy);
+                    (pen.color, al)
                 };
                 let al = (al as f32 * amp) as u32;
                 if al == 0 {
@@ -2893,9 +2888,9 @@ mod imp {
     }
 
     /// A PING — a comms mark a presenter drops, with a CUSTOM animation per kind, all inheriting one
-    /// base (a material ping_ring in the pen colour + the kind's SYMBOL): Here focuses rings inward;
+    /// base (a material `ping_ring` in the pen colour + the kind's SYMBOL): Here focuses rings inward;
     /// Bang shockwaves + pops + shakes; Ask bobs in curiously; Yes/No draw their mark on; Arrow
-    /// thrusts forward with a motion-trail. Everything fades over PING_MS.
+    /// thrusts forward with a motion-trail. Everything fades over `PING_MS`.
     #[allow(clippy::too_many_arguments)] // a raster primitive's varyings, not an API smell
     fn draw_ping(px: &mut PixelBuf, cx: i32, cy: i32, kind: PingKind, color: u32, age_ms: f32) {
         {
@@ -3536,9 +3531,9 @@ mod palette {
         if msg == WM_NCHITTEST {
             unsafe {
                 let mut r: WRECT = std::mem::zeroed();
-                if GetWindowRect(hwnd, &mut r) != 0 {
-                    let x = (lparam & 0xFFFF) as i16 as i32 - r.left;
-                    let y = ((lparam >> 16) & 0xFFFF) as i16 as i32 - r.top;
+                if GetWindowRect(hwnd, &raw mut r) != 0 {
+                    let x = i32::from((lparam & 0xFFFF) as i16) - r.left;
+                    let y = i32::from(((lparam >> 16) & 0xFFFF) as i16) - r.top;
                     let in_controls = (5..=21).contains(&y) && x >= W - 46;
                     if x >= BX && y < TITLE_H && !in_controls {
                         return HTCAPTION;
@@ -3601,7 +3596,7 @@ mod palette {
                             Some(p) if PAL_PIN.load(SeqCst) => p,
                             _ => {
                                 let mut c = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
-                                GetCursorPos(&mut c);
+                                GetCursorPos(&raw mut c);
                                 (c.x + 14, c.y + 14)
                             }
                         };
@@ -3644,13 +3639,13 @@ mod palette {
 
                 // pump (HTCAPTION drags run their modal loop in here)
                 let mut msg: MSG = std::mem::zeroed();
-                while PeekMessageW(&mut msg, hwnd, 0, 0, PM_REMOVE) != 0 {
-                    TranslateMessage(&msg);
-                    DispatchMessageW(&msg);
+                while PeekMessageW(&raw mut msg, hwnd, 0, 0, PM_REMOVE) != 0 {
+                    TranslateMessage(&raw const msg);
+                    DispatchMessageW(&raw const msg);
                 }
                 // a finished drag parks the palette (remembered, pinned or not)
                 let mut wr: windows_sys::Win32::Foundation::RECT = std::mem::zeroed();
-                windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut wr);
+                windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &raw mut wr);
                 if (wr.left, wr.top) != expected && !neuron::glyph::key_down(0x01) {
                     expected = (wr.left, wr.top);
                     PAL_POS.store(super::pack_pos(wr.left, wr.top), SeqCst);
@@ -3661,7 +3656,7 @@ mod palette {
 
                 // hover + clicks by geometry, against the LIVE window position
                 let mut p = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
-                GetCursorPos(&mut p);
+                GetCursorPos(&raw mut p);
                 let (lx, ly) = (p.x - wr.left, p.y - wr.top);
                 let over = (0..W).contains(&lx) && (0..H).contains(&ly);
                 let now_hover = if over {
@@ -3870,7 +3865,7 @@ mod palette {
                     // bookkeeping is low-risk anyway) on its own hot lane: a panicked frame is a
                     // dropped frame, throttled so a deterministic paint panic can't storm the log.
                     crate::worker::contain_frame("neuron-board-palette", &mut frame_panics, || {
-                        surface.paint(&its, hover, &st, sca)
+                        surface.paint(&its, hover, &st, sca);
                     });
                 }
                 std::thread::sleep(std::time::Duration::from_millis(16));
@@ -3878,7 +3873,7 @@ mod palette {
         }
     }
 
-    /// The palette's drawing surface: a 32-bit DIB presented via UpdateLayeredWindow, so the
+    /// The palette's drawing surface: a 32-bit DIB presented via `UpdateLayeredWindow`, so the
     /// gap between base and dock is REAL transparency (and click-through). GDI draws the
     /// furniture; a per-panel alpha pass makes the panels opaque; the brush previews are
     /// rendered with the actual media engine (`imp::brush_alpha`) — the dock shows the ink
@@ -3947,10 +3942,10 @@ mod palette {
                     right: DOCK_W,
                     bottom: DOCK_H,
                 };
-                FillRect(dc, &base_rect, bg);
-                FrameRect(dc, &base_rect, line);
-                FillRect(dc, &dock_rect, bg);
-                FrameRect(dc, &dock_rect, line);
+                FillRect(dc, &raw const base_rect, bg);
+                FrameRect(dc, &raw const base_rect, line);
+                FillRect(dc, &raw const dock_rect, bg);
+                FrameRect(dc, &raw const dock_rect, line);
                 // base window-bar: a hairline under the title says "this strip is the handle"
                 let bar = RECT {
                     left: BX,
@@ -3958,7 +3953,7 @@ mod palette {
                     right: W,
                     bottom: TITLE_H,
                 };
-                FillRect(dc, &bar, line);
+                FillRect(dc, &raw const bar, line);
                 // dock separator between media and sizes
                 let sep = RECT {
                     left: 6,
@@ -3966,7 +3961,7 @@ mod palette {
                     right: DOCK_W - 6,
                     bottom: 173,
                 };
-                FillRect(dc, &sep, line);
+                FillRect(dc, &raw const sep, line);
 
                 let face: Vec<u16> = "Consolas\0".encode_utf16().collect();
                 let font = CreateFontW(
@@ -3978,10 +3973,10 @@ mod palette {
                     0,
                     0,
                     0,
-                    DEFAULT_CHARSET as u32,
+                    u32::from(DEFAULT_CHARSET),
                     0,
                     0,
-                    CLEARTYPE_QUALITY as u32,
+                    u32::from(CLEARTYPE_QUALITY),
                     0,
                     face.as_ptr(),
                 );
@@ -3994,14 +3989,14 @@ mod palette {
                     0,
                     0,
                     0,
-                    DEFAULT_CHARSET as u32,
+                    u32::from(DEFAULT_CHARSET),
                     0,
                     0,
-                    CLEARTYPE_QUALITY as u32,
+                    u32::from(CLEARTYPE_QUALITY),
                     0,
                     face.as_ptr(),
                 );
-                let old_font = SelectObject(dc, font as _);
+                let old_font = SelectObject(dc, font.cast());
                 SetBkMode(dc, TRANSPARENT as i32);
                 // nameplate
                 let tick = RECT {
@@ -4010,12 +4005,12 @@ mod palette {
                     right: BX + 11,
                     bottom: 19,
                 };
-                FillRect(dc, &tick, accent);
+                FillRect(dc, &raw const tick, accent);
                 SetTextColor(dc, rgb(0xd7dde6));
                 let title: Vec<u16> = "BOARD".encode_utf16().collect();
                 TextOutW(dc, BX + 17, 6, title.as_ptr(), title.len() as i32);
                 // footer hints — in LASER mode the gestures re-skin, so the hint follows suit.
-                SelectObject(dc, small as _);
+                SelectObject(dc, small.cast());
                 SetTextColor(dc, rgb(0x5b6470));
                 let hints: [&str; 2] = if st.laser {
                     [
@@ -4045,7 +4040,7 @@ mod palette {
                         Item::Size(i) => (SIZES[*i % SIZES.len()] - st.pen.width).abs() < 0.05,
                         Item::Swatch(i) => PALETTE[*i % PALETTE.len()] == st.pen.color,
                         Item::Preset(i) => {
-                            st.presets.get(*i).map(|p| *p == st.pen).unwrap_or(false)
+                            st.presets.get(*i).is_some_and(|p| *p == st.pen)
                         }
                         Item::Pin => pinned,
                         _ => false,
@@ -4061,13 +4056,13 @@ mod palette {
                         Item::Size(i) => {
                             FrameRect(dc, r, if active { accent } else { line });
                             let rad = [2, 3, 5, 8][*i % 4];
-                            let (cx, cy) = ((r.left + r.right) / 2, (r.top + r.bottom) / 2);
+                            let (cx, cy) = (i32::midpoint(r.left, r.right), i32::midpoint(r.top, r.bottom));
                             let dot =
                                 CreateSolidBrush(rgb(if active { st.pen.color } else { 0x9aa1ac }));
-                            let old = SelectObject(dc, dot as _);
+                            let old = SelectObject(dc, dot.cast());
                             Ellipse(dc, cx - rad, cy - rad, cx + rad, cy + rad);
                             SelectObject(dc, old);
-                            DeleteObject(dot as _);
+                            DeleteObject(dot.cast());
                         }
                         Item::Swatch(i) => {
                             let sw = CreateSolidBrush(rgb(PALETTE[*i % PALETTE.len()]));
@@ -4077,21 +4072,21 @@ mod palette {
                                 right: r.right - 2,
                                 bottom: r.bottom - 2,
                             };
-                            FillRect(dc, &inner, sw);
-                            DeleteObject(sw as _);
+                            FillRect(dc, &raw const inner, sw);
+                            DeleteObject(sw.cast());
                             FrameRect(dc, r, if active { white } else { line });
                         }
                         Item::Preset(i) => {
                             FrameRect(dc, r, if active { accent } else { line });
                             if let Some(p) = st.presets.get(*i) {
                                 let rad = ((p.width / 2.0).clamp(2.5, 9.0)) as i32;
-                                let (cx, cy) = (r.left + 16, (r.top + r.bottom) / 2);
+                                let (cx, cy) = (r.left + 16, i32::midpoint(r.top, r.bottom));
                                 let dot = CreateSolidBrush(rgb(p.color));
-                                let old = SelectObject(dc, dot as _);
+                                let old = SelectObject(dc, dot.cast());
                                 Ellipse(dc, cx - rad, cy - rad, cx + rad, cy + rad);
                                 SelectObject(dc, old);
-                                DeleteObject(dot as _);
-                                SelectObject(dc, small as _);
+                                DeleteObject(dot.cast());
+                                SelectObject(dc, small.cast());
                                 SetTextColor(dc, rgb(0x9aa1ac));
                                 let init = &p.brush.name()[..1];
                                 let wide: Vec<u16> = init.encode_utf16().collect();
@@ -4105,7 +4100,7 @@ mod palette {
                             }
                         }
                         Item::Pin => {
-                            SelectObject(dc, small as _);
+                            SelectObject(dc, small.cast());
                             SetTextColor(
                                 dc,
                                 if pinned {
@@ -4120,7 +4115,7 @@ mod palette {
                             TextOutW(dc, r.left + 1, r.top + 2, t.as_ptr(), t.len() as i32);
                         }
                         Item::Close => {
-                            SelectObject(dc, font as _);
+                            SelectObject(dc, font.cast());
                             SetTextColor(
                                 dc,
                                 if hover == Some(*it) {
@@ -4142,7 +4137,7 @@ mod palette {
                                 right: BX + 216,
                                 bottom: 132,
                             };
-                            FrameRect(dc, &outer, line);
+                            FrameRect(dc, &raw const outer, line);
                             for dx in [BX + 74, BX + 144] {
                                 let div = RECT {
                                     left: dx - 1,
@@ -4150,14 +4145,14 @@ mod palette {
                                     right: dx,
                                     bottom: 128,
                                 };
-                                FillRect(dc, &div, line);
+                                FillRect(dc, &raw const div, line);
                             }
                             let label = match it {
                                 Item::Undo => "undo",
                                 Item::Redo => "redo",
                                 _ => "clear",
                             };
-                            SelectObject(dc, small as _);
+                            SelectObject(dc, small.cast());
                             SetTextColor(
                                 dc,
                                 if hover == Some(*it) {
@@ -4182,7 +4177,7 @@ mod palette {
                         Item::Laser => {
                             let on = st.laser;
                             FrameRect(dc, r, if on { accent } else { line });
-                            SelectObject(dc, font as _);
+                            SelectObject(dc, font.cast());
                             SetTextColor(dc, if on { rgb(0x4af2b0) } else { rgb(0x9aa1ac) });
                             let wide: Vec<u16> = "laser".encode_utf16().collect();
                             TextOutW(
@@ -4206,7 +4201,7 @@ mod palette {
                                 Item::Quit => "end session",
                                 _ => unreachable!(),
                             };
-                            SelectObject(dc, font as _);
+                            SelectObject(dc, font.cast());
                             SetTextColor(
                                 dc,
                                 if *it == Item::Quit {
@@ -4227,10 +4222,10 @@ mod palette {
                     }
                 }
                 SelectObject(dc, old_font);
-                DeleteObject(font as _);
-                DeleteObject(small as _);
+                DeleteObject(font.cast());
+                DeleteObject(small.cast());
                 for b in [bg, line, hov, accent, white, danger] {
-                    DeleteObject(b as _);
+                    DeleteObject(b.cast());
                 }
 
                 // ── alpha pass: panels become opaque; the gap stays REAL transparent air
@@ -4251,7 +4246,7 @@ mod palette {
                 for (r, it) in its {
                     if let Item::BrushK(i) = it {
                         let brush = BRUSHES[*i % BRUSHES.len()];
-                        let cy = (r.top + r.bottom) / 2;
+                        let cy = i32::midpoint(r.top, r.bottom);
                         let rad = 4.5f32;
                         for xx in (r.left + 4)..(r.right - 4) {
                             let s = (xx - r.left - 4) as f32 * 3.0; // stretched longitude

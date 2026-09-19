@@ -104,7 +104,7 @@ pub fn snap(path: &[C]) -> Option<Shape> {
     // ── closed figures: corners lead, the eigen corpus arbitrates ────────
     let corners = corners_cyclic(&r);
     let (x0, y0, x1, y1) = bbox(path);
-    let (cx, cy) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
+    let (cx, cy) = (f64::midpoint(x0, x1), f64::midpoint(y0, y1));
     match corners.len() {
         3 => Some(Shape::Triangle {
             a: (r[corners[0]].re, r[corners[0]].im),
@@ -163,6 +163,7 @@ pub fn snap(path: &[C]) -> Option<Shape> {
 /// The UNICODE GEOMETRY corpus — each entry is a codepoint's canonical shape, synthesized, in
 /// both windings (CW ≠ CCW in the eigen space, by design). This is the seed corpus for
 /// geometric-identity recognition; the spellcasting engine can train against the same alphabet.
+#[must_use]
 pub fn corpus() -> Vec<(char, Vec<C>)> {
     let n = 96;
     let tau = std::f64::consts::TAU;
@@ -179,6 +180,7 @@ pub fn corpus() -> Vec<(char, Vec<C>)> {
 /// Best corpus identity for a stroke, or `None` when no identity clearly owns it. The margin is
 /// judged against the nearest OTHER identity (the same character's other winding agreeing with
 /// the winner is confirmation, not competition).
+#[must_use]
 pub fn corpus_best(path: &[C]) -> Option<char> {
     let cfg = glyph::GlyphConfig::default();
     let word = glyph::analyze(path, &cfg);
@@ -196,8 +198,7 @@ pub fn corpus_best(path: &[C]) -> Option<char> {
     let rival = scored
         .iter()
         .find(|(k, _)| *k != best)
-        .map(|(_, d)| *d)
-        .unwrap_or(f64::MAX);
+        .map_or(f64::MAX, |(_, d)| *d);
     if rival - best_d < CLEAR_WINNER * best_d.max(1e-9) {
         return None;
     }
@@ -265,6 +266,7 @@ fn try_arrow(path: &[C], r: &[C]) -> Option<Shape> {
 }
 
 /// Render a snapped shape back into a polyline (the whiteboard draws polylines — one ink model).
+#[must_use]
 pub fn polyline(shape: &Shape) -> Vec<(f64, f64)> {
     match shape {
         Shape::Line { a, b } => vec![*a, *b],
@@ -294,7 +296,7 @@ pub fn polyline(shape: &Shape) -> Vec<(f64, f64)> {
         ],
         Shape::Ellipse { cx, cy, rx, ry } => (0..=64)
             .map(|i| {
-                let a = i as f64 / 64.0 * std::f64::consts::TAU;
+                let a = f64::from(i) / 64.0 * std::f64::consts::TAU;
                 (cx + rx * a.cos(), cy + ry * a.sin())
             })
             .collect(),
@@ -302,6 +304,7 @@ pub fn polyline(shape: &Shape) -> Vec<(f64, f64)> {
 }
 
 /// The unicode identity of a snapped shape — for status lines ("✨ set: △") and the corpus story.
+#[must_use]
 pub fn identity(shape: &Shape) -> char {
     match shape {
         Shape::Line { .. } => '─',
@@ -314,6 +317,7 @@ pub fn identity(shape: &Shape) -> char {
 }
 
 /// A synthetic rectangle perimeter (n points, w×h, optionally reversed winding) — the □ template.
+#[must_use]
 pub fn synth_rect(n: usize, w: f64, h: f64, reverse: bool) -> Vec<C> {
     let per = 2.0 * (w + h);
     let mut pts: Vec<C> = (0..n)
@@ -338,6 +342,7 @@ pub fn synth_rect(n: usize, w: f64, h: f64, reverse: bool) -> Vec<C> {
 }
 
 /// A synthetic equilateral-ish triangle perimeter — the △ template.
+#[must_use]
 pub fn synth_triangle(n: usize, side: f64, reverse: bool) -> Vec<C> {
     let h = side * 0.866;
     let verts = [(side / 2.0, 0.0), (side, h), (0.0, h)];
@@ -565,10 +570,10 @@ mod tests {
     #[test]
     fn arrow_snaps() {
         // shaft straight right, then a small back-flick (the drawn head)
-        let mut pts: Vec<C> = (0..70).map(|i| C::new(i as f64 * 6.0, 0.0)).collect();
+        let mut pts: Vec<C> = (0..70).map(|i| C::new(f64::from(i) * 6.0, 0.0)).collect();
         let tip = *pts.last().unwrap();
         for i in 1..=12 {
-            pts.push(C::new(tip.re - i as f64 * 4.0, tip.im - i as f64 * 3.0));
+            pts.push(C::new(tip.re - f64::from(i) * 4.0, tip.im - f64::from(i) * 3.0));
         }
         let stroke = add_noise(&pts, 1.5, 23);
         match snap(&stroke) {
@@ -595,7 +600,7 @@ mod tests {
         let n = 200;
         let stroke: Vec<C> = (0..n)
             .map(|i| {
-                let t = i as f64 / n as f64 * std::f64::consts::TAU;
+                let t = f64::from(i) / f64::from(n) * std::f64::consts::TAU;
                 // a 10-vertex star polygon radius alternation
                 let k = (i * 10 / n) % 2;
                 let r = if k == 0 { 200.0 } else { 90.0 };

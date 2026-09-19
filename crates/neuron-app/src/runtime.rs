@@ -12,7 +12,7 @@
 //! that re-enumerates its own device handle.
 //!
 //! Direct typed calls only — no serde-over-IPC. The GUI is a thin view over Profile / Bindings /
-//! CastConfig / Engine.
+//! `CastConfig` / Engine.
 
 use neuron::bindings::Bindings;
 use neuron::capability::{self as cap, Store};
@@ -41,7 +41,7 @@ pub struct DeviceState {
     /// The control PLANE's family (`DeviceDef::dialect`) — selection identity is (pid, unit,
     /// dialect) because one physical unit may carry several protocol families' control pipes, each
     /// its own plane. Rows are PER-PLANE: today every desk unit is N=1 (one plane per unit) so the
-    /// list is byte-identical, but a future multi-family unit (razer_report + an audio dialect on
+    /// list is byte-identical, but a future multi-family unit (`razer_report` + an audio dialect on
     /// one pid) lists one channel row per plane, and every routing decision keys off this rather
     /// than first-family-wins.
     pub dialect: String,
@@ -106,7 +106,7 @@ pub struct AnimStream {
 /// `adopt_unknown_in_background` gates each re-probe on AND the window `adoption_pending` (the
 /// watch-timer gate) uses to decide a retry is coming due — so a silent unknown device keeps the
 /// timer alive just long enough to rescan once per window and adopt within ~a minute of waking.
-const SYNTH_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
+const SYNTH_RETRY: std::time::Duration = std::time::Duration::from_mins(1);
 
 /// The resident runtime state. UI-thread owned (held in an `Rc<RefCell<_>>` by the glue).
 pub struct AppRuntime {
@@ -153,7 +153,7 @@ pub struct AppRuntime {
     /// identity, never bare pid: two families can share a pid, so a bare-pid ledger would conflate
     /// their retry state (and let one family's strike silence the other). Not every scan tick — but
     /// not once-per-run either: a wireless device DEEP-asleep at first probe only wakes on user
-    /// input, so unanswered keys retry on a slow cadence (SYNTH_RETRY) and adopt within a minute of
+    /// input, so unanswered keys retry on a slow cadence (`SYNTH_RETRY`) and adopt within a minute of
     /// waking. Each retry increments the strike; a key that reaches [`UNRESPONSIVE_STRIKES`]
     /// surfaces as a dim "answered nothing" placeholder row instead of staying invisible. A key
     /// that leaves enumeration is forgotten immediately (unplug → replug = the natural instant
@@ -164,7 +164,7 @@ pub struct AppRuntime {
     /// a new device is visible the instant it's plugged in, not after the multi-second probe.
     synth_inflight: Arc<std::sync::Mutex<std::collections::HashSet<AdoptKey>>>,
     /// [`AdoptKey`]s with a LIVE probe thread RIGHT NOW — the spawn guard that keeps the single-probe
-    /// invariant even when a probe outlives the SYNTH_RETRY cadence (a stuck/slow wireless probe
+    /// invariant even when a probe outlives the `SYNTH_RETRY` cadence (a stuck/slow wireless probe
     /// can exceed 60s, and re-pushing the key then would spawn a SECOND overlapping probe for it).
     /// Distinct from `synth_inflight`, which only drives the transient "learning…" row for a key's
     /// FIRST attempt: this set spans every attempt (first and retry) and gates spawning, not UI.
@@ -177,7 +177,7 @@ pub struct AppRuntime {
     /// learning→real adoption flip, a user-edited devices/auto file), so a same-unit selection
     /// after a bump must re-seed. Bumped at every site that reassigns `self.registry`.
     pub registry_gen: u64,
-    /// The (unit, dialect, registry_gen) the inspector panel was last seeded for — the select
+    /// The (unit, dialect, `registry_gen`) the inspector panel was last seeded for — the select
     /// path's reseed decision. The seed identity is the control PLANE (unit + family), not the bare
     /// unit: a selection reseeds iff this differs from the newly selected plane's key, which catches
     /// a different unit, a same unit whose def changed under a reload, AND (on a future multi-family
@@ -205,7 +205,7 @@ pub struct AppRuntime {
 /// why. Mirrors `pump_vitals`'s local `IN_FLIGHT` and `synth_running`'s spawn guard.
 static SCAN_BG_INFLIGHT: AtomicBool = AtomicBool::new(false);
 
-/// Claim the background-scan slot; `false` if one is already running. The ADOPT_WATCH_TIMER tick
+/// Claim the background-scan slot; `false` if one is already running. The `ADOPT_WATCH_TIMER` tick
 /// (glue.rs) calls this before spawning, so a slow scan (a sleepy wireless device's open can take
 /// hundreds of ms) can never stack a second overlapping one under the 1s cadence.
 pub fn scan_bg_try_start() -> bool {
@@ -220,7 +220,7 @@ pub fn scan_bg_finish() {
 
 /// Adoption strikes at which a still-unrecognized, still-enumerated pid stops being merely retried
 /// and starts SURFACING as a dim "unresponsive · answered nothing" placeholder row. Three tries
-/// (~3 SYNTH_RETRY windows) is enough to distinguish "asleep, will wake" from "claimed but never
+/// (~3 `SYNTH_RETRY` windows) is enough to distinguish "asleep, will wake" from "claimed but never
 /// answers" without flashing a scary row at every device that's briefly slow to first-probe.
 const UNRESPONSIVE_STRIKES: u32 = 3;
 
@@ -235,7 +235,7 @@ impl AppRuntime {
             match e {
                 neuron::profile::ProfileEntry::Ok(p) => profiles.push(*p),
                 neuron::profile::ProfileEntry::Broken { name, why } => {
-                    broken_profiles.push((name, why))
+                    broken_profiles.push((name, why));
                 }
             }
         }
@@ -263,16 +263,14 @@ impl AppRuntime {
             .find(|p| {
                 !remembered.is_empty()
                     && Profile::file_key(&p.name) == Profile::file_key(&remembered)
-            })
-            .map(|p| p.name.clone())
-            .unwrap_or_else(|| "—".to_string());
+            }).map_or_else(|| "—".to_string(), |p| p.name.clone());
         // …and seed the runtime's gaming-mode copy from that same profile. The startup reconcile
         // unit installs the HOOK from the cursor, but THIS copy is what a capture reads: left at
         // default, re-capturing the profile you are already on would silently drop its key guards.
         let gaming_mode = profiles
             .iter()
             .find(|p| p.name == active_profile)
-            .map(|p| p.gaming_mode())
+            .map(neuron::profile::Profile::gaming_mode)
             .unwrap_or_default();
         AppRuntime {
             registry,
@@ -363,7 +361,7 @@ impl AppRuntime {
     /// bookkeeping, the transient learning/placeholder rows, the unclaimed ledger, selection
     /// healing). No device I/O happens here — `infos`/`out` are the worker's plain-data result —
     /// so this is cheap and safe to call straight from the UI thread once
-    /// `slint::invoke_from_event_loop` hops the result back (see the ADOPT_WATCH_TIMER install in
+    /// `slint::invoke_from_event_loop` hops the result back (see the `ADOPT_WATCH_TIMER` install in
     /// glue.rs, the fix for the UI-thread stall this split exists for).
     ///
     /// The `bool` in the return is the STALE flag: `true` means an adoption finished between the
@@ -480,7 +478,7 @@ impl AppRuntime {
             // a real row, so this one branch still covers both first-scan auto-pick and stale-plane
             // healing (the empty dialect is just as un-matchable as the empty unit already was).
             let first = out.iter().find(|d| !d.adopting);
-            self.selected_pid = first.map(|d| d.pid).unwrap_or(0);
+            self.selected_pid = first.map_or(0, |d| d.pid);
             self.selected_unit = first.map(|d| d.instance.clone()).unwrap_or_default();
             self.selected_dialect = first.map(|d| d.dialect.clone()).unwrap_or_default();
         }
@@ -488,7 +486,7 @@ impl AppRuntime {
     }
 
     /// Spawn one background auto-adoption (`neuron::synth`) per UNKNOWN Razer pid seen this
-    /// run: any razer_report pipe the registry can't resolve gets probed + synthesized into
+    /// run: any `razer_report` pipe the registry can't resolve gets probed + synthesized into
     /// devices/auto/<pid>.toml off-thread, then `synth_dirty` makes the next scan tick reload
     /// the registry. Zero cost when everything is recognized (the common case — a pid-set
     /// diff over the enumeration the scan already did). The probe is safe to run while the
@@ -566,8 +564,7 @@ impl AppRuntime {
             let strikes = self
                 .synth_attempted
                 .get(&key)
-                .map(|(_, n)| *n)
-                .unwrap_or(0);
+                .map_or(0, |(_, n)| *n);
             self.synth_attempted.insert(key, (now, strikes + 1));
         }
         if let Ok(mut inflight) = self.synth_inflight.lock() {
@@ -623,16 +620,15 @@ impl AppRuntime {
             || self
                 .synth_inflight
                 .lock()
-                .map(|s| !s.is_empty())
-                .unwrap_or(false)
+                .is_ok_and(|s| !s.is_empty())
     }
 
     /// Does the adoption machinery need the watch timer to keep ticking — active work NOW, or a
     /// RETRY coming due? `adoption_active` alone goes false after a FAILED first probe (inflight
-    /// cleared, nothing dirty), which used to put the timer to sleep and orphan the SYNTH_RETRY
+    /// cleared, nothing dirty), which used to put the timer to sleep and orphan the `SYNTH_RETRY`
     /// cadence entirely (the "adopts within a minute of waking" promise had no driver). The retry
     /// half is a pure in-memory check over `synth_attempted` — no enumeration, no device I/O — so
-    /// an attached-but-silent unknown device costs one real rescan per SYNTH_RETRY window and a
+    /// an attached-but-silent unknown device costs one real rescan per `SYNTH_RETRY` window and a
     /// flag check per tick, nothing more. Self-cleaning: unplugging the device lets the next scan
     /// retain the key out of `synth_attempted`, and the gate goes permanently quiet.
     pub fn adoption_pending(&self) -> bool {
@@ -706,13 +702,13 @@ impl AppRuntime {
                 // operation. A device without a working persist plane keeps the volatile success
                 // (its durability is the host's feel-intent reassert-on-wake instead).
                 match cap::set_dpi(&d, dpi, dpi, cap::Store::Volatile, neuron::dpi_origin::Cause::UserApplied) {
-                    Ok(_) => {
+                    Ok(()) => {
                         let onboard = cap::set_dpi(&d, dpi, dpi, cap::Store::Persist, neuron::dpi_origin::Cause::UserApplied);
                         // confirmation fires past the committed write — same as apply_polling /
                         // apply_brightness. Absolute set → no prior read, so no old→new.
-                        neuron::confirm::dpi(d.pid, dpi as u32, None);
+                        neuron::confirm::dpi(d.pid, u32::from(dpi), None);
                         match onboard {
-                            Ok(_) => format!("DPI -> {dpi} (saved to mouse)"),
+                            Ok(()) => format!("DPI -> {dpi} (saved to mouse)"),
                             Err(e) => format!("DPI -> {dpi} (onboard save unavailable: {e})"),
                         }
                     }
@@ -749,8 +745,8 @@ impl AppRuntime {
         }
         match self.open_selected() {
             Ok(d) => match cap::set_brightness(&d, pct, self.store()) {
-                Ok(_) => {
-                    neuron::confirm::brightness(pct as u32, None);
+                Ok(()) => {
+                    neuron::confirm::brightness(u32::from(pct), None);
                     format!("brightness -> {pct}%")
                 }
                 Err(e) => format!("brightness failed: {e}"),
@@ -834,7 +830,7 @@ impl AppRuntime {
         }
     }
 
-    /// Apply HyperScroll wheel stages (class 0x0B) — verify-gated + hardware-pending; surfaces the
+    /// Apply `HyperScroll` wheel stages (class 0x0B) — verify-gated + hardware-pending; surfaces the
     /// honest gated message when the env flag is unset. `list` is "/"-separated mode names/bytes.
     pub fn apply_scroll_stages(&self, list: &str) -> String {
         // map "tactile"/"free" friendly names to mode bytes (0 tactile / 1 free-spin).
@@ -878,7 +874,7 @@ impl AppRuntime {
         }
     }
 
-    /// Apply the LED idle-off timeout (seconds) — verify-gated (NEURON_IDLE_WRITE), honest [gated].
+    /// Apply the LED idle-off timeout (seconds) — verify-gated (`NEURON_IDLE_WRITE`), honest [gated].
     pub fn apply_idle(&self, secs: u32) -> String {
         if self.writes_paused() {
             return "writes paused".into();
@@ -892,7 +888,7 @@ impl AppRuntime {
         }
     }
 
-    /// Apply the in-game polling split (wired/dongle Hz) — verify-gated (NEURON_INGAME_POLL_WRITE).
+    /// Apply the in-game polling split (wired/dongle Hz) — verify-gated (`NEURON_INGAME_POLL_WRITE`).
     pub fn apply_ingame_polling(&self, wired: u32, dongle: u32) -> String {
         if self.writes_paused() {
             return "writes paused".into();
@@ -907,7 +903,7 @@ impl AppRuntime {
     }
 
     /// Apply the symmetric LIFT-OFF DISTANCE level (0 low / 1 medium / 2 high) — verify-gated
-    /// (`writes::set_lift_off_distance` re-reads 0x0B/0x85) + env-gated (NEURON_LOD_WRITE).
+    /// (`writes::set_lift_off_distance` re-reads 0x0B/0x85) + env-gated (`NEURON_LOD_WRITE`).
     pub fn apply_lift_off_distance(&self, level: u8) -> String {
         if self.writes_paused() {
             return "writes paused".into();
@@ -956,7 +952,7 @@ impl AppRuntime {
     /// Apply Snap Tap (SOCD) on/off — the MECHANICAL ADVANTAGES "edge" write. Verify-gated +
     /// env-gated (`writes::set_snap_tap` re-reads 0x02/0xA7; `NEURON_SNAP_TAP_WRITE` opens the
     /// boundary). Uses the default A/D counter-strafe pair. Honest `[gated]` on hardware that can't
-    /// do it (the user's BlackWidow Chroma V2), exactly like the LOD / idle / in-game-polling writes.
+    /// do it (the user's `BlackWidow` Chroma V2), exactly like the LOD / idle / in-game-polling writes.
     pub fn apply_snap_tap(&self, enable: bool) -> String {
         if self.writes_paused() {
             return "writes paused".into();
@@ -1008,7 +1004,7 @@ impl AppRuntime {
 
     /// Effects available on the selected device (native first, then emulated).
     pub fn effects(&self) -> Vec<(String, bool, bool)> {
-        match self.selected_def().and_then(|d| d.lighting.clone()) {
+        match self.selected_def().and_then(|d| d.lighting) {
             Some(def) => def
                 .available()
                 .into_iter()
@@ -1023,20 +1019,19 @@ impl AppRuntime {
     /// implying hardware that isn't there.
     pub fn grid_dims(&self) -> (u8, u8) {
         self.selected_def()
-            .and_then(|d| d.lighting.clone())
-            .map(|l| (l.rows, l.cols))
-            .unwrap_or((0, 0))
+            .and_then(|d| d.lighting)
+            .map_or((0, 0), |l| (l.rows, l.cols))
     }
 
     /// The selected device's kind hint ("keyboard"/"mouse"/…) — drives the procedural chassis
     /// the lighting render draws around the LED lattice. Empty when nothing is selected.
     pub fn grid_kind(&self) -> &'static str {
-        self.selected_def().map(|d| icon_for(&d)).unwrap_or("")
+        self.selected_def().map_or("", |d| icon_for(&d))
     }
 
     /// The DEFAULT streaming fps for the selected lit device + whether it's a LEGACY board (the
     /// GUI's protocol note). Both protocols now default to 30: the old legacy-6 seed encoded
-    /// "frames drop above ~6" folklore that a live wire probe falsified — the BlackWidow sustains
+    /// "frames drop above ~6" folklore that a live wire probe falsified — the `BlackWidow` sustains
     /// 30 fps cleanly under the production write discipline (see `max_fps_for` in the host bridge
     /// for the measurements). `None` when the selection has no lighting. Seeds the GUI fps control
     /// on selection — the user tunes from there.
@@ -1067,7 +1062,7 @@ impl AppRuntime {
                 }
                 let col = if eff.uses_color() { Some(color) } else { None };
                 match lights.set_effect(eff, col, self.persist) {
-                    Ok(_) => format!("effect -> {name}"),
+                    Ok(()) => format!("effect -> {name}"),
                     Err(e) => format!("effect failed: {e}"),
                 }
             }
@@ -1340,7 +1335,7 @@ impl AppRuntime {
             match e {
                 neuron::profile::ProfileEntry::Ok(p) => self.profiles.push(*p),
                 neuron::profile::ProfileEntry::Broken { name, why } => {
-                    self.broken_profiles.push((name, why))
+                    self.broken_profiles.push((name, why));
                 }
             }
         }
@@ -1395,7 +1390,7 @@ impl AppRuntime {
         p.lighting = lighting;
 
         match p.save() {
-            Ok(_) => {
+            Ok(()) => {
                 self.reload_profiles();
                 format!("captured profile '{name}': {}", p.summary())
             }
@@ -1411,7 +1406,7 @@ impl AppRuntime {
         let r = Profile::delete(name);
         self.reload_profiles();
         match r {
-            Ok(_) => {
+            Ok(()) => {
                 // a deleted profile can't stay "active" — the header pill must drop to none.
                 // Compare against the PROCESS-WIDE cursor too, not just our display copy: an
                 // async apply updates the cell on its worker before this copy catches up, and
@@ -1698,7 +1693,7 @@ impl AppRuntime {
 
         // 4) lighting test pattern — build a real test frame WITHOUT writing it (proves the
         //    render/canvas path end-to-end; sending is gated/optional).
-        match self.selected_def().and_then(|d| d.lighting.clone()) {
+        match self.selected_def().and_then(|d| d.lighting) {
             Some(def) => {
                 let mut canvas = neuron::lighting::Canvas::new(def.rows, def.cols);
                 // a diagonal accent sweep — deterministic, easy to eyeball if pushed.
@@ -1978,7 +1973,7 @@ pub struct PerfSnapshot {
     pub lod_async: Option<(u8, u8)>,
     pub lod_level: Option<u8>,
     /// The keyboard's FIRMWARE game mode (the FN+F10 Win-key kill), best-effort. `None` on a device
-    /// with no game_mode getter (every mouse) or an unreadable/asleep board — the KEY GUARD card's
+    /// with no `game_mode` getter (every mouse) or an unreadable/asleep board — the KEY GUARD card's
     /// firmware sibling row seeds its toggle from this.
     pub game_mode: Option<bool>,
 }
@@ -2032,8 +2027,8 @@ pub fn read_perf_snapshot(pid: u16, unit: &str, dialect: &str) -> PerfSnapshot {
 
 /// Resolve the SELECTED control plane among enumerated pipes: the pipe of `unit` (pid-healed
 /// when the unit left) whose resolving def speaks `dialect`. Empty dialect = first resolvable
-/// plane (pre-selection / stateless callers). The one resolution rule for open_selected,
-/// selected_def, and the perf snapshot — first-family-wins on a multi-plane unit was the
+/// plane (pre-selection / stateless callers). The one resolution rule for `open_selected`,
+/// `selected_def`, and the perf snapshot — first-family-wins on a multi-plane unit was the
 /// review-caught identity gap. Two passes like `open_selected`'s old shape: pass 0 exact unit,
 /// pass 1 pid-only healing; within a pass, `find_for_pipe` gives the family-aware control def and
 /// we accept iff the dialect gate passes. Today N=1 (one plane per unit) so pass 0 finds the exact
@@ -2215,7 +2210,7 @@ fn scan_units(registry: &Registry, infos: &[transport::HidDeviceInfo]) -> Vec<De
         });
     }
     let mut out = Vec::new();
-    for u in units.iter() {
+    for u in &units {
         // Duplicate group = other units sharing this (codename, pid). Numbering is by
         // instance ORDER, not enumeration order, so "· 1"/"· 2" stay glued to the same
         // physical unit across rescans (enumeration order is not stable; instances are).
@@ -2251,7 +2246,7 @@ fn scan_units(registry: &Registry, infos: &[transport::HidDeviceInfo]) -> Vec<De
 /// of ms on a sleepy wireless device), and hands back plain data. `None` on an enumerate failure,
 /// mirroring `scan_devices`'s own early return (no partial/stale bookkeeping on a failed scan).
 ///
-/// Running this off the UI thread is the whole fix for the ADOPT_WATCH_TIMER stall (glue.rs):
+/// Running this off the UI thread is the whole fix for the `ADOPT_WATCH_TIMER` stall (glue.rs):
 /// that 1s timer used to call `scan_devices` — this exact I/O — synchronously on the UI thread
 /// once a second for as long as anything was unadopted, freezing the window in a way the
 /// organ-stall watchdog can't see (the UI tick itself is the stall). The caller spawns a thread
@@ -2273,9 +2268,7 @@ fn read_device_state(
     feed_vitals: bool,
 ) -> DeviceState {
     let mode = def
-        .mode_for(pid)
-        .map(|m| m.name.clone())
-        .unwrap_or_else(|| "?".into());
+        .mode_for(pid).map_or_else(|| "?".into(), |m| m.name.clone());
     let icon = icon_for(def);
     let mut st = DeviceState {
         name: def.name.clone(),
@@ -2344,7 +2337,7 @@ fn read_device_state(
                 .unwrap_or(false);
             st.charging = charging;
             st.battery = format!("{b}%");
-            st.battery_frac = Some((b as f32 / 100.0).clamp(0.0, 1.0));
+            st.battery_frac = Some((f32::from(b) / 100.0).clamp(0.0, 1.0));
             // passive scan (from_event = false): feed the edge-detector off this read we already
             // did — but only from the one designated unit per pid (the detector is pid-keyed;
             // two twins feeding it would interleave two batteries and fabricate edges).
@@ -2423,8 +2416,7 @@ fn snapshot_device(def: &DeviceDef, pid: u16, path: &transport::DevicePath) -> S
         name: def.name.clone(),
         unix_time: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0),
+            .map_or(0, |d| d.as_secs()),
         interfaces: vec![IfaceSnap {
             usage_page: ci.usage_page,
             usage: ci.usage,
@@ -2435,7 +2427,7 @@ fn snapshot_device(def: &DeviceDef, pid: u16, path: &transport::DevicePath) -> S
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join(snap.filename());
     match std::fs::write(&path, snap.to_json()) {
-        Ok(_) => format!(
+        Ok(()) => format!(
             "backed up {} getters -> {}",
             snap.getter_count(),
             path.display()

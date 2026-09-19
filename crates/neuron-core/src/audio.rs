@@ -36,7 +36,7 @@
 //! verb to `imp` WITHOUT a matching `stub` entry still compiles on Windows and surfaces only as a
 //! missing symbol on a non-Windows build. MAINTENANCE: after changing this surface, run
 //! `cargo check -p neuron --target x86_64-unknown-linux-gnu` to confirm `stub` still mirrors `imp`.
-//! A real ALSA/Pulse (Linux) or CoreAudio (macOS) backend is then a single `mod` of the same names.
+//! A real ALSA/Pulse (Linux) or `CoreAudio` (macOS) backend is then a single `mod` of the same names.
 
 #[cfg(windows)]
 pub use imp::*;
@@ -61,7 +61,7 @@ pub enum Flow {
 }
 
 impl Flow {
-    /// EDataFlow value expected by `IMMDeviceEnumerator::EnumAudioEndpoints`.
+    /// `EDataFlow` value expected by `IMMDeviceEnumerator::EnumAudioEndpoints`.
     #[cfg_attr(not(windows), allow(dead_code))]
     fn edata(self) -> i32 {
         match self {
@@ -69,6 +69,7 @@ impl Flow {
             Flow::Capture => 1,
         }
     }
+    #[must_use]
     pub fn label(self) -> &'static str {
         match self {
             Flow::Capture => "capture",
@@ -92,6 +93,7 @@ impl Flow {
 /// is a substring of every name, so treating it as a match would resolve "unknown device" to
 /// "whichever endpoint enumerates first" — exactly the wrong-device mute write a review caught.
 /// That invariant is enforced HERE, at the root, not by guard comments at call sites.
+#[must_use]
 pub fn endpoint_matches_product(endpoint_name: &str, product: &str) -> bool {
     let p = product.trim();
     !p.is_empty() && endpoint_name.to_lowercase().contains(&p.to_lowercase())
@@ -106,6 +108,7 @@ pub fn endpoint_matches_product(endpoint_name: &str, product: &str) -> bool {
 /// default mic whenever the two happen to agree on a value. Kept here beside
 /// [`endpoint_matches_product`] so the "is this the mic we speak for?" question has ONE answer, at
 /// the root, rather than a re-derived comparison at each call site.
+#[must_use]
 pub fn is_default_capture_id(id: &str) -> bool {
     resolve_capture(None).is_some_and(|ep| ep.id == id)
 }
@@ -114,6 +117,7 @@ pub fn is_default_capture_id(id: &str) -> bool {
 /// The product-name form, for event sources that know a device by its product string rather than an
 /// endpoint id — e.g. a hardware-mute push, which must only speak for the pill when the mic that
 /// pushed it IS the default one.
+#[must_use]
 pub fn default_capture_matches_product(product: &str) -> bool {
     resolve_capture(None).is_some_and(|ep| endpoint_matches_product(&ep.name, product))
 }
@@ -145,6 +149,7 @@ pub fn explicit_needle(device: Option<&str>) -> Option<&str> {
 ///
 /// Split out of `imp::resolve_capture` so the preference order is unit-testable without a live
 /// COM enumerator (the COM side now does exactly one `collect()` and calls this).
+#[must_use]
 pub fn pick_by_needles<'a>(
     candidates: &'a [Endpoint],
     explicit: Option<&str>,
@@ -169,6 +174,7 @@ pub fn pick_by_needles<'a>(
 /// (when one is given and it actually matches a candidate); else the first enumerated candidate;
 /// else `None`. Split out for the same reason as `pick_by_needles` — one place, one set of tests,
 /// pinning the order without a live COM enumerator or a live default-endpoint call.
+#[must_use]
 pub fn pick_render<'a>(
     candidates: &'a [Endpoint],
     explicit: Option<&str>,
@@ -525,7 +531,7 @@ mod imp {
         s.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
-    /// Initialise COM (MTA) for this thread. S_FALSE (already-init) is fine.
+    /// Initialise COM (MTA) for this thread. `S_FALSE` (already-init) is fine.
     fn com_init() {
         unsafe {
             let _ = CoInitializeEx(std::ptr::null(), COINIT_MULTITHREADED as u32);
@@ -540,7 +546,7 @@ mod imp {
                 std::ptr::null_mut(),
                 CLSCTX_ALL,
                 &IID_IMM_DEVICE_ENUMERATOR,
-                &mut p,
+                &raw mut p,
             );
             if hr < 0 {
                 return std::ptr::null_mut();
@@ -552,7 +558,7 @@ mod imp {
     unsafe fn device_id(dev: *mut c_void) -> String {
         let vt = vtbl::<ImmDeviceVtbl>(dev);
         let mut idp: *mut u16 = std::ptr::null_mut();
-        if ((*vt).get_id)(dev, &mut idp) < 0 {
+        if ((*vt).get_id)(dev, &raw mut idp) < 0 {
             return String::new();
         }
         let s = wide_to_string(idp);
@@ -563,13 +569,13 @@ mod imp {
     unsafe fn device_name(dev: *mut c_void) -> String {
         let vt = vtbl::<ImmDeviceVtbl>(dev);
         let mut store: *mut c_void = std::ptr::null_mut();
-        if ((*vt).open_property_store)(dev, STGM_READ, &mut store) < 0 || store.is_null() {
+        if ((*vt).open_property_store)(dev, STGM_READ, &raw mut store) < 0 || store.is_null() {
             return String::new();
         }
         let svt = vtbl::<IPropertyStoreVtbl>(store);
         let mut pv = PropVariant::zeroed();
         let mut name = String::new();
-        if ((*svt).get_value)(store, &PKEY_DEVICE_FRIENDLY_NAME, &mut pv) >= 0 && pv.vt == VT_LPWSTR
+        if ((*svt).get_value)(store, &PKEY_DEVICE_FRIENDLY_NAME, &raw mut pv) >= 0 && pv.vt == VT_LPWSTR
         {
             name = wide_to_string(pv.val);
             CoTaskMemFree(pv.val as *const c_void); // == PropVariantClear for VT_LPWSTR
@@ -587,16 +593,16 @@ mod imp {
             &IID_IAUDIO_ENDPOINT_VOLUME,
             CLSCTX_ALL,
             std::ptr::null_mut(),
-            &mut vol,
+            &raw mut vol,
         );
         if hr < 0 || vol.is_null() {
             return (std::ptr::null_mut(), 0.0, false);
         }
         let vvt = vtbl::<IAudioEndpointVolumeVtbl>(vol);
         let mut scalar = 0f32;
-        let _ = ((*vvt).get_master_scalar)(vol, &mut scalar);
+        let _ = ((*vvt).get_master_scalar)(vol, &raw mut scalar);
         let mut m = 0i32;
-        let _ = ((*vvt).get_mute)(vol, &mut m);
+        let _ = ((*vvt).get_mute)(vol, &raw mut m);
         (vol, scalar, m != 0)
     }
 
@@ -613,15 +619,15 @@ mod imp {
         unsafe {
             let evt = vtbl::<ImmDeviceEnumeratorVtbl>(en);
             let mut coll: *mut c_void = std::ptr::null_mut();
-            if ((*evt).enum_audio_endpoints)(en, flow.edata(), DEVICE_STATE_ACTIVE, &mut coll) >= 0
+            if ((*evt).enum_audio_endpoints)(en, flow.edata(), DEVICE_STATE_ACTIVE, &raw mut coll) >= 0
                 && !coll.is_null()
             {
                 let cvt = vtbl::<ImmDeviceCollectionVtbl>(coll);
                 let mut n = 0u32;
-                let _ = ((*cvt).get_count)(coll, &mut n);
+                let _ = ((*cvt).get_count)(coll, &raw mut n);
                 for i in 0..n {
                     let mut dev: *mut c_void = std::ptr::null_mut();
-                    if ((*cvt).item)(coll, i, &mut dev) < 0 || dev.is_null() {
+                    if ((*cvt).item)(coll, i, &raw mut dev) < 0 || dev.is_null() {
                         continue;
                     }
                     let id = device_id(dev);
@@ -650,6 +656,7 @@ mod imp {
     }
 
     /// Enumerate active endpoints of one flow with their current volume/mute.
+    #[must_use]
     pub fn endpoints(flow: Flow) -> Vec<Endpoint> {
         collect(flow, true)
     }
@@ -661,6 +668,7 @@ mod imp {
 
     impl VolumeCtl {
         /// Open by exact endpoint id (as returned in `Endpoint::id`).
+        #[must_use]
         pub fn open(id: &str) -> Option<Self> {
             com_init();
             let en = create_enumerator();
@@ -671,7 +679,7 @@ mod imp {
                 let evt = vtbl::<ImmDeviceEnumeratorVtbl>(en);
                 let wid = to_wide(id);
                 let mut dev: *mut c_void = std::ptr::null_mut();
-                let hr = ((*evt).get_device)(en, wid.as_ptr(), &mut dev);
+                let hr = ((*evt).get_device)(en, wid.as_ptr(), &raw mut dev);
                 release(en);
                 if hr < 0 || dev.is_null() {
                     return None;
@@ -686,11 +694,12 @@ mod imp {
             }
         }
 
+        #[must_use]
         pub fn get_volume(&self) -> f32 {
             unsafe {
                 let vt = vtbl::<IAudioEndpointVolumeVtbl>(self.vol);
                 let mut s = 0f32;
-                let _ = ((*vt).get_master_scalar)(self.vol, &mut s);
+                let _ = ((*vt).get_master_scalar)(self.vol, &raw mut s);
                 s
             }
         }
@@ -718,12 +727,13 @@ mod imp {
             unsafe {
                 let vt = vtbl::<IAudioEndpointVolumeVtbl>(self.vol);
                 let mut m = 0i32;
-                if ((*vt).get_mute)(self.vol, &mut m) < 0 {
+                if ((*vt).get_mute)(self.vol, &raw mut m) < 0 {
                     return None; // GetMute failed — we do NOT know the state
                 }
                 Some(m != 0)
             }
         }
+        #[must_use]
         pub fn get_mute(&self) -> bool {
             self.try_get_mute().unwrap_or(false)
         }
@@ -744,7 +754,7 @@ mod imp {
             }
             unsafe {
                 let vt = vtbl::<IAudioEndpointVolumeVtbl>(self.vol);
-                ((*vt).set_mute)(self.vol, mute as i32, std::ptr::null()) >= 0 // true only if it landed
+                ((*vt).set_mute)(self.vol, i32::from(mute), std::ptr::null()) >= 0 // true only if it landed
             }
         }
         pub fn toggle_mute(&self) -> bool {
@@ -772,7 +782,7 @@ mod imp {
             &IID_IAUDIO_METER_INFORMATION,
             CLSCTX_ALL,
             std::ptr::null_mut(),
-            &mut meter,
+            &raw mut meter,
         );
         if hr < 0 {
             std::ptr::null_mut()
@@ -791,6 +801,7 @@ mod imp {
     impl MeterCtl {
         /// Open the meter on the current DEFAULT render endpoint (the speakers/headset the OSD
         /// shows) — so the effect follows "the sound I actually hear". `None` if nothing resolves.
+        #[must_use]
         pub fn open_default_render() -> Option<Self> {
             com_init();
             let en = create_enumerator();
@@ -801,7 +812,7 @@ mod imp {
                 let evt = vtbl::<ImmDeviceEnumeratorVtbl>(en);
                 let mut dev: *mut c_void = std::ptr::null_mut();
                 // (Render = 0, eConsole = 0) — the current default output.
-                let hr = ((*evt).get_default)(en, 0, 0, &mut dev);
+                let hr = ((*evt).get_default)(en, 0, 0, &raw mut dev);
                 release(en);
                 if hr < 0 || dev.is_null() {
                     return None;
@@ -819,6 +830,7 @@ mod imp {
         /// Open the meter on an EXACT endpoint id (capture OR render) — so a channel strip can show
         /// the live level of the specific device it controls, not just the default output. Mirror of
         /// [`VolumeCtl::open`], activating the meter interface instead of the volume one.
+        #[must_use]
         pub fn open(id: &str) -> Option<Self> {
             com_init();
             let en = create_enumerator();
@@ -829,7 +841,7 @@ mod imp {
                 let evt = vtbl::<ImmDeviceEnumeratorVtbl>(en);
                 let wid = to_wide(id);
                 let mut dev: *mut c_void = std::ptr::null_mut();
-                let hr = ((*evt).get_device)(en, wid.as_ptr(), &mut dev);
+                let hr = ((*evt).get_device)(en, wid.as_ptr(), &raw mut dev);
                 release(en);
                 if hr < 0 || dev.is_null() {
                     return None;
@@ -850,11 +862,12 @@ mod imp {
         /// returns a failure HRESULT (e.g. `AUDCLNT_E_DEVICE_INVALIDATED`); a caller that discards it
         /// reads 0.0 forever with a dead handle. The sampler uses this to DROP and re-open on failure
         /// so a device change self-heals instead of zeroing the meter permanently.
+        #[must_use]
         pub fn try_peak(&self) -> Option<f32> {
             unsafe {
                 let vt = vtbl::<IAudioMeterInformationVtbl>(self.meter);
                 let mut p = 0f32;
-                let hr = ((*vt).get_peak_value)(self.meter, &mut p);
+                let hr = ((*vt).get_peak_value)(self.meter, &raw mut p);
                 if hr < 0 {
                     None
                 } else {
@@ -866,6 +879,7 @@ mod imp {
         /// The current peak sample value (0.0..=1.0), or 0.0 on failure — the lenient read kept for
         /// callers that don't distinguish "silent" from "handle dead". The live sampler uses the
         /// error-aware [`try_peak`](Self::try_peak) instead so it can re-open an invalidated handle.
+        #[must_use]
         pub fn peak(&self) -> f32 {
             self.try_peak().unwrap_or(0.0)
         }
@@ -970,10 +984,10 @@ mod imp {
     /// + dwChannelMask u32) — the standard KSDATAFORMAT subtypes share their GUID tail, so `Data1`
     /// alone disambiguates float vs PCM.
     unsafe fn parse_mix_format(p: *const u8) -> Option<(u32, u16, SampleFmt)> {
-        let f = &*(p as *const WaveFormatEx);
+        let f = &*p.cast::<WaveFormatEx>();
         let (tag, bits, cb) = (f.tag, f.bits, f.cb_size);
         let eff_tag = if tag == WAVE_FORMAT_EXTENSIBLE && cb >= 22 {
-            std::ptr::read_unaligned(p.add(24) as *const u32) as u16
+            std::ptr::read_unaligned(p.add(24).cast::<u32>()) as u16
         } else {
             tag
         };
@@ -1001,6 +1015,7 @@ mod imp {
     impl CaptureCtl {
         /// Open a LOOPBACK capture on the current default render endpoint — the analyser's
         /// "speakers" source. `None` if anything in the chain fails to resolve.
+        #[must_use]
         pub fn open_loopback_default() -> Option<Self> {
             com_init();
             let en = create_enumerator();
@@ -1011,7 +1026,7 @@ mod imp {
                 let evt = vtbl::<ImmDeviceEnumeratorVtbl>(en);
                 let mut dev: *mut c_void = std::ptr::null_mut();
                 // (Render = 0, eConsole = 0) — the output the user actually hears.
-                let hr = ((*evt).get_default)(en, 0, 0, &mut dev);
+                let hr = ((*evt).get_default)(en, 0, 0, &raw mut dev);
                 release(en);
                 if hr < 0 || dev.is_null() {
                     return None;
@@ -1023,6 +1038,7 @@ mod imp {
         }
 
         /// Open a plain capture stream on an EXACT endpoint id (a mic) — the analyser's "mic" source.
+        #[must_use]
         pub fn open_capture(id: &str) -> Option<Self> {
             com_init();
             let en = create_enumerator();
@@ -1033,7 +1049,7 @@ mod imp {
                 let evt = vtbl::<ImmDeviceEnumeratorVtbl>(en);
                 let wid = to_wide(id);
                 let mut dev: *mut c_void = std::ptr::null_mut();
-                let hr = ((*evt).get_device)(en, wid.as_ptr(), &mut dev);
+                let hr = ((*evt).get_device)(en, wid.as_ptr(), &raw mut dev);
                 release(en);
                 if hr < 0 || dev.is_null() {
                     return None;
@@ -1049,14 +1065,14 @@ mod imp {
         unsafe fn from_device(dev: *mut c_void, loopback: bool) -> Option<Self> {
             let dvt = vtbl::<ImmDeviceVtbl>(dev);
             let mut client: *mut c_void = std::ptr::null_mut();
-            if ((*dvt).activate)(dev, &IID_IAUDIO_CLIENT, CLSCTX_ALL, std::ptr::null_mut(), &mut client) < 0
+            if ((*dvt).activate)(dev, &IID_IAUDIO_CLIENT, CLSCTX_ALL, std::ptr::null_mut(), &raw mut client) < 0
                 || client.is_null()
             {
                 return None;
             }
             let cvt = vtbl::<IAudioClientVtbl>(client);
             let mut fmt_ptr: *mut u8 = std::ptr::null_mut();
-            if ((*cvt).get_mix_format)(client, &mut fmt_ptr) < 0 || fmt_ptr.is_null() {
+            if ((*cvt).get_mix_format)(client, &raw mut fmt_ptr) < 0 || fmt_ptr.is_null() {
                 release(client);
                 return None;
             }
@@ -1084,7 +1100,7 @@ mod imp {
                 return None;
             }
             let mut capture: *mut c_void = std::ptr::null_mut();
-            if ((*cvt).get_service)(client, &IID_IAUDIO_CAPTURE_CLIENT, &mut capture) < 0
+            if ((*cvt).get_service)(client, &IID_IAUDIO_CAPTURE_CLIENT, &raw mut capture) < 0
                 || capture.is_null()
             {
                 release(client);
@@ -1105,6 +1121,7 @@ mod imp {
         }
 
         /// The stream's sample rate (Hz) — the mix rate the mono samples arrive at.
+        #[must_use]
         pub fn rate(&self) -> u32 {
             self.rate
         }
@@ -1121,7 +1138,7 @@ mod imp {
                 let vt = vtbl::<IAudioCaptureClientVtbl>(self.capture);
                 loop {
                     let mut next = 0u32;
-                    if ((*vt).get_next_packet_size)(self.capture, &mut next) < 0 {
+                    if ((*vt).get_next_packet_size)(self.capture, &raw mut next) < 0 {
                         return None;
                     }
                     if next == 0 {
@@ -1132,9 +1149,9 @@ mod imp {
                     let mut flags = 0u32;
                     if ((*vt).get_buffer)(
                         self.capture,
-                        &mut data,
-                        &mut frames,
-                        &mut flags,
+                        &raw mut data,
+                        &raw mut frames,
+                        &raw mut flags,
                         std::ptr::null_mut(),
                         std::ptr::null_mut(),
                     ) < 0
@@ -1155,7 +1172,7 @@ mod imp {
                             SampleFmt::I16 => {
                                 let s = std::slice::from_raw_parts(data as *const i16, n * ch);
                                 for f in s.chunks_exact(ch) {
-                                    let sum: f32 = f.iter().map(|&v| v as f32).sum();
+                                    let sum: f32 = f.iter().map(|&v| f32::from(v)).sum();
                                     out.push(sum / (ch as f32 * 32768.0));
                                 }
                             }
@@ -1185,6 +1202,7 @@ mod imp {
     /// [`super::endpoint_matches_product`] predicate — case-insensitive containment, and an EMPTY
     /// needle identifies NOTHING, so this returns `None` rather than an arbitrary first mic).
     /// This is how a binding resolves "my real mic" to a concrete endpoint id.
+    #[must_use]
     pub fn find_capture(needle: &str) -> Option<Endpoint> {
         // light path: we only need name+id to resolve, not every endpoint's volume.
         collect(Flow::Capture, false)
@@ -1198,6 +1216,7 @@ mod imp {
     /// preference order, never to "first endpoint". The decision itself (which candidate wins) is
     /// [`super::pick_by_needles`] — pure, unit-tested — so this is just ONE enumeration handed to
     /// it (previously up to three: `find_capture` per fallback needle, then a bare `collect`).
+    #[must_use]
     pub fn resolve_capture(device: Option<&str>) -> Option<Endpoint> {
         let candidates = collect(Flow::Capture, false);
         super::pick_by_needles(&candidates, super::explicit_needle(device), &["seiren", "razer"])
@@ -1207,6 +1226,7 @@ mod imp {
     /// Find the first RENDER endpoint (speakers / headphones / sound card) that identifies as
     /// `needle` — the output mirror of [`find_capture`], same shared identity predicate (empty
     /// needle → `None`).
+    #[must_use]
     pub fn find_render(needle: &str) -> Option<Endpoint> {
         collect(Flow::Render, false)
             .into_iter()
@@ -1220,6 +1240,7 @@ mod imp {
     /// [`resolve_capture`]. The decision is [`super::pick_render`] — pure, unit-tested; the default
     /// endpoint id is only fetched when there's no explicit needle to short-circuit on (the same
     /// COM call the original inline version made, just relocated).
+    #[must_use]
     pub fn resolve_render(device: Option<&str>) -> Option<Endpoint> {
         let explicit = super::explicit_needle(device);
         let candidates = collect(Flow::Render, false);
@@ -1228,6 +1249,7 @@ mod imp {
     }
 
     /// The id of the current DEFAULT render endpoint (the eConsole role) — the "current output".
+    #[must_use]
     pub fn default_render_id() -> Option<String> {
         com_init();
         let en = create_enumerator();
@@ -1238,16 +1260,16 @@ mod imp {
             let evt = vtbl::<ImmDeviceEnumeratorVtbl>(en);
             let mut dev: *mut c_void = std::ptr::null_mut();
             // (Render = 0, eConsole = 0)
-            let hr = ((*evt).get_default)(en, 0, 0, &mut dev);
+            let hr = ((*evt).get_default)(en, 0, 0, &raw mut dev);
             release(en);
             if hr < 0 || dev.is_null() {
                 return None;
             }
             let dvt = vtbl::<ImmDeviceVtbl>(dev);
             let mut idp: *mut u16 = std::ptr::null_mut();
-            let id = if ((*dvt).get_id)(dev, &mut idp) >= 0 && !idp.is_null() {
+            let id = if ((*dvt).get_id)(dev, &raw mut idp) >= 0 && !idp.is_null() {
                 let s = wide_to_string(idp);
-                CoTaskMemFree(idp as *mut _);
+                CoTaskMemFree(idp.cast());
                 s
             } else {
                 String::new()
@@ -1261,7 +1283,7 @@ mod imp {
     const CLSID_POLICY_CONFIG: GUID = GUID::from_u128(0x870AF99C_171D_4F9E_AF0D_E63DF40C2BC9);
     const IID_POLICY_CONFIG: GUID = GUID::from_u128(0xF8679F50_850A_41CF_9C72_430F290290C8);
 
-    /// IPolicyConfig — only `set_default_endpoint` is called; the earlier slots are declared (in
+    /// `IPolicyConfig` — only `set_default_endpoint` is called; the earlier slots are declared (in
     /// interface order) purely so its vtable offset (13) lands correctly. ABI padding.
     #[repr(C)]
     struct PolicyConfigVtbl {
@@ -1293,7 +1315,7 @@ mod imp {
                 std::ptr::null_mut(),
                 CLSCTX_ALL,
                 &IID_POLICY_CONFIG,
-                &mut pc,
+                &raw mut pc,
             );
             if hr < 0 || pc.is_null() {
                 return false;
@@ -1313,6 +1335,7 @@ mod imp {
     /// The ordered set of render endpoints OUTPUT FLIP / its fan offers: the named ones that are
     /// actually present (in the order given — the user's intended cycle), else everything
     /// connected. Disconnected names are simply absent (remembered by name, skipped when away).
+    #[must_use]
     pub fn flip_candidates(names: &[String]) -> Vec<Endpoint> {
         let all = collect(Flow::Render, false);
         if names.is_empty() {
@@ -1332,6 +1355,7 @@ mod imp {
     }
 
     /// Make `id` the default render endpoint (all roles) — the fan's pick commits through here.
+    #[must_use]
     pub fn set_default(id: &str) -> bool {
         set_default_endpoint(id)
     }
@@ -1339,6 +1363,7 @@ mod imp {
     /// OUTPUT FLIP: step the default render endpoint to the NEXT in `names` (substring matches,
     /// disconnected ones simply absent so they're skipped); empty `names` = cycle every connected
     /// render endpoint. Returns the status line for the readout.
+    #[must_use]
     pub fn flip_output(names: &[String]) -> String {
         let candidates = flip_candidates(names);
         if candidates.is_empty() {
@@ -1371,7 +1396,7 @@ mod imp {
 /// `wm.rs`'s `stub::Null`: the no-op bodies touch no platform API, so compiling them on every
 /// target costs nothing and keeps the off-Windows surface type-checked on each build (drift in
 /// the inert form can't hide until someone cross-compiles). Off-Windows there is no Core-Audio /
-/// ALSA / CoreAudio backend wired yet, so every read answers empty/None/0.0/false and every act
+/// ALSA / `CoreAudio` backend wired yet, so every read answers empty/None/0.0/false and every act
 /// is a no-op — an HONEST silent surface, not a fake. A real Linux/macOS backend replaces this
 /// `mod` with one that implements the same names. `#![allow(dead_code)]`: on Windows nothing in
 /// this module is reached (the live surface is `mod imp`), so its items would otherwise warn.

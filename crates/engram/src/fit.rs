@@ -15,10 +15,10 @@
 //! 2. SINGLE-PASS RMS: algebraic RMS from cross-correlation terms.
 //!    no second traversal of the data.
 //!
-//! 3. SoA LAYOUT: separate real/imaginary arrays for auto-vectorization.
+//! 3. `SoA` LAYOUT: separate real/imaginary arrays for auto-vectorization.
 //!    LLVM vectorizes simple f64 loops but not Complex64 loops.
 //!
-//! 4. FMA: mul_add patterns that compile to fused multiply-add.
+//! 4. FMA: `mul_add` patterns that compile to fused multiply-add.
 //!
 //! 5. RECIPROCAL DIVISION: one 1/det instead of two divisions.
 
@@ -28,6 +28,7 @@ use num_complex::Complex64;
 /// Fit a single AR(2) oscillator to a contiguous complex time series.
 /// Single pass with algebraic RMS. Used for individual pair fitting.
 #[inline]
+#[must_use]
 pub fn fit_pair(z: &[Complex64]) -> FitResult {
     let t = z.len();
     if t < SEED_COUNT + 1 {
@@ -118,12 +119,13 @@ fn solve_and_rms(
 /// Fit P independent AR(2) oscillators from a row-major [T x P] matrix.
 ///
 /// THE ELDRITCH OPTIMIZATION: processes all P pairs per timestep.
-/// The pair dimension IS the SIMD dimension. SoA layout enables
+/// The pair dimension IS the SIMD dimension. `SoA` layout enables
 /// LLVM auto-vectorization: each inner loop iteration processes
-/// P/SIMD_WIDTH pairs in parallel (P=150, AVX2=4 lanes → ~38 ops).
+/// `P/SIMD_WIDTH` pairs in parallel (P=150, AVX2=4 lanes → ~38 ops).
 ///
 /// One pass through time. All pairs at once. Perfect cache access.
 /// No threading overhead. No allocation beyond the accumulators.
+#[must_use]
 pub fn fit_all(z_c: &[Complex64], t: usize, p: usize) -> FitAllResult {
     debug_assert_eq!(z_c.len(), t * p, "z_c length must be T * P");
 
@@ -202,6 +204,7 @@ pub fn fit_all(z_c: &[Complex64], t: usize, p: usize) -> FitAllResult {
 
 /// Fit a single pair from a strided matrix. Zero allocation.
 #[inline]
+#[must_use]
 pub fn fit_pair_strided(z_c: &[Complex64], t: usize, p: usize, pair: usize) -> FitResult {
     if t < SEED_COUNT + 1 {
         return FitResult::linear();
@@ -252,7 +255,7 @@ mod tests {
     #[test]
     fn fit_pair_linear_ramp() {
         let z: Vec<Complex64> = (0..50)
-            .map(|i| Complex64::new(i as f64 * 0.01, 0.0))
+            .map(|i| Complex64::new(f64::from(i) * 0.01, 0.0))
             .collect();
         let result = fit_pair(&z);
         assert!(
@@ -265,7 +268,7 @@ mod tests {
     #[test]
     fn fit_pair_pure_cosine() {
         let z: Vec<Complex64> = (0..100)
-            .map(|i| Complex64::new((2.0 * PI * i as f64 / 10.0).cos(), 0.0))
+            .map(|i| Complex64::new((2.0 * PI * f64::from(i) / 10.0).cos(), 0.0))
             .collect();
         let result = fit_pair(&z);
         assert!(result.rms < 0.01, "rms = {}", result.rms);
@@ -278,7 +281,7 @@ mod tests {
     fn fit_pair_complex_exponential() {
         let z: Vec<Complex64> = (0..80)
             .map(|i| {
-                let theta = 2.0 * PI * i as f64 / 8.0;
+                let theta = 2.0 * PI * f64::from(i) / 8.0;
                 Complex64::new(theta.cos(), theta.sin())
             })
             .collect();
@@ -291,7 +294,7 @@ mod tests {
         let z: Vec<Complex64> = (0..60)
             .map(|i| {
                 let decay = 0.95_f64.powi(i);
-                Complex64::new(decay * (2.0 * PI * i as f64 / 12.0).cos(), 0.0)
+                Complex64::new(decay * (2.0 * PI * f64::from(i) / 12.0).cos(), 0.0)
             })
             .collect();
         let result = fit_pair(&z);
@@ -320,8 +323,8 @@ mod tests {
         let z: Vec<Complex64> = (0..40)
             .map(|i| {
                 Complex64::new(
-                    (i as f64 * 0.7).sin() + (i as f64 * 0.3).cos(),
-                    (i as f64 * 0.5).sin(),
+                    (f64::from(i) * 0.7).sin() + (f64::from(i) * 0.3).cos(),
+                    (f64::from(i) * 0.5).sin(),
                 )
             })
             .collect();
@@ -363,13 +366,11 @@ mod tests {
             let individual = fit_pair(&col);
             assert!(
                 (result.k[pair] - individual.k).norm() < 1e-10,
-                "pair {} K mismatch",
-                pair
+                "pair {pair} K mismatch"
             );
             assert!(
                 (result.g[pair] - individual.g).norm() < 1e-10,
-                "pair {} G mismatch",
-                pair
+                "pair {pair} G mismatch"
             );
         }
     }

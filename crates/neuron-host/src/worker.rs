@@ -4,7 +4,7 @@
 
 //! The named-thread primitive for neuron-host's lifecycle threads (protocol servers, per-socket
 //! connection handlers, the OBS bridge, the paced writer, the SHM arbiter). Every one of these is
-//! OWNED by a struct that `.join()`s its handle on Drop/stop, so they need the JoinHandle back —
+//! OWNED by a struct that `.join()`s its handle on Drop/stop, so they need the `JoinHandle` back —
 //! the fire-and-forget helpers in neuron-core can't express that. This is a local, pure-`std`
 //! mirror of `neuron::worker::spawn_named`: the host kernel keeps `neuron` an OPTIONAL dependency
 //! (see this crate's Cargo.toml) and must build without it, so it cannot reach across for the

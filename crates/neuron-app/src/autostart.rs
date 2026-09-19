@@ -2,15 +2,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
 
-//! Start-with-Windows — via the Scheduled Task "Neuron (elevated tray)" (RunLevel Highest),
+//! Start-with-Windows — via the Scheduled Task "Neuron (elevated tray)" (`RunLevel` Highest),
 //! NOT an HKCU Run-key entry. Elevation is load-bearing: the native Chroma SHM server creates
-//! `Global\` objects (SeCreateGlobalPrivilege), and an unelevated autostart silently degrades
+//! `Global\` objects (`SeCreateGlobalPrivilege`), and an unelevated autostart silently degrades
 //! every boot to REST-only — the exact failure the Run-key launcher used to cause. The task is
 //! also the launch vehicle release.ps1 and manual relaunches go through (`schtasks /run`), so
 //! MANUAL re-registers it WITHOUT the logon trigger — never disabled (a disabled task can't
 //! be `/run`), never deleted.
 //!
-//! Managing a HighestAvailable task needs an elevated caller. The resident instance IS
+//! Managing a `HighestAvailable` task needs an elevated caller. The resident instance IS
 //! elevated (it was launched by this very task); an unelevated instance gets an honest
 //! "access denied" status line and the selector snaps back via `launch_mode_now()`.
 
@@ -97,7 +97,7 @@ fn register_task(with_logon: bool) -> Result<(), String> {
     let tmp = std::env::temp_dir().join("neuron-autostart-task.xml");
     // UTF-16LE with BOM, matching the XML declaration.
     let mut bytes: Vec<u8> = vec![0xFF, 0xFE];
-    bytes.extend(xml.encode_utf16().flat_map(|u| u.to_le_bytes()));
+    bytes.extend(xml.encode_utf16().flat_map(u16::to_le_bytes));
     if let Err(e) = std::fs::write(&tmp, bytes) {
         return Err(format!("task xml write failed: {e}"));
     }
@@ -131,16 +131,14 @@ pub fn reap_legacy_run_key() -> Option<bool> {
     let present = std::process::Command::new("reg")
         .args(["query", LEGACY_RUN_KEY, "/v", LEGACY_VALUE])
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+        .is_ok_and(|o| o.status.success());
     if !present {
         return None;
     }
     let deleted = std::process::Command::new("reg")
         .args(["delete", LEGACY_RUN_KEY, "/v", LEGACY_VALUE, "/f"])
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+        .is_ok_and(|o| o.status.success());
     if deleted {
         eprintln!("neuron: removed the retired unelevated Run-key launcher (the task owns startup)");
     } else {
@@ -162,8 +160,7 @@ pub fn migrate_legacy_run_key() {
     let present = std::process::Command::new("reg")
         .args(["query", LEGACY_RUN_KEY, "/v", LEGACY_VALUE])
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+        .is_ok_and(|o| o.status.success());
     if !present {
         return;
     }
@@ -174,10 +171,9 @@ pub fn migrate_legacy_run_key() {
     let healthy = is_enabled()
         && task_command()
             .zip(std::env::current_exe().ok())
-            .map(|(cmd, exe)| {
+            .is_some_and(|(cmd, exe)| {
                 cmd.eq_ignore_ascii_case(&exe.to_string_lossy())
-            })
-            .unwrap_or(false);
+            });
     if healthy || register_task(true).is_ok() {
         // reap prints its own failure detail; only a confirmed delete is a completed migration.
         if reap_legacy_run_key() == Some(true) {

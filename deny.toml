@@ -1,0 +1,57 @@
+# SPDX-FileCopyrightText: 2026 Woflo Labs
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
+# cargo-deny policy — enforce supply-chain hygiene on every CI build.
+# Run: cargo deny check advisories licenses bans sources
+
+# ── advisories ─────────────────────────────────────────────────────────────────────────
+[advisories]
+vulnerability = "deny"
+unmaintained = "warn"
+yanked = "warn"
+notice = "warn"
+# Paths to ignore with documented justification (append RUSTSEC-XXXX-XXXX entries here).
+ignore = []
+
+# ── licenses ───────────────────────────────────────────────────────────────────────────
+[licenses]
+unlicensed = "deny"
+# Copyleft and weak-copyleft are forbidden; only permissive licenses.
+copyleft = "deny"
+# Allowlist — anything not listed is denied.
+default = "deny"
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "BSL-1.0",
+    "Unicode-3.0",
+    "OpenSSL",
+]
+
+# ── bans ───────────────────────────────────────────────────────────────────────────────
+[bans]
+# Warn (don't fail) on duplicate versions — common in the Rust ecosystem and sometimes
+# unavoidable (e.g. syn 1 vs syn 2 during a migration period).
+multiple-versions = "warn"
+# No wildcard path deps.
+wildcards = "deny"
+# Highlight all duplicates in output for manual review.
+highlight = "all"
+# Specific crates that are known to cause issues or have better alternatives.
+# Uncomment and fill as needed:
+# deny = [
+#     { name = "openssl", wrappers = ["openssl-sys"] },
+# ]
+
+# ── sources ────────────────────────────────────────────────────────────────────────────
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

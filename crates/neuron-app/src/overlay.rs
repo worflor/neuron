@@ -47,7 +47,7 @@ pub fn fan_pick(aim: (f32, f32), wedge: i32, sectors: u8, m: usize, rim: f32) ->
     if reach < rim * FAN_REACH {
         return -1; // hasn't pushed out into the second tier yet
     }
-    let n = sectors.max(1) as f32;
+    let n = f32::from(sectors.max(1));
     let slice = std::f32::consts::TAU / n;
     let span = (slice * 1.3 * m as f32).min(std::f32::consts::TAU * 0.7);
     let bearing = wedge as f32 / n * std::f32::consts::TAU;
@@ -545,8 +545,8 @@ mod imp {
         /// `crop` = (x, y, w, h) in buffer space.
         pub fn arm(dir: &str, crop: (i32, i32, i32, i32), scale: u32) {
             let _ = std::fs::create_dir_all(dir);
-            *DIR.lock().unwrap_or_else(|e| e.into_inner()) = dir.to_string();
-            *CROP.lock().unwrap_or_else(|e| e.into_inner()) = crop;
+            *DIR.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = dir.to_string();
+            *CROP.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = crop;
             SCALE.store(scale.clamp(1, 12), Ordering::Relaxed);
             SEQ.store(0, Ordering::Relaxed);
             ARMED.store(true, Ordering::Release);
@@ -577,7 +577,7 @@ mod imp {
             if !ARMED.load(Ordering::Acquire) {
                 return;
             }
-            let (cx, cy, cw, ch) = *CROP.lock().unwrap_or_else(|e| e.into_inner());
+            let (cx, cy, cw, ch) = *CROP.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let (cw, ch) = (cw.max(1), ch.max(1));
             let k = SCALE.load(Ordering::Relaxed).max(1) as i32;
             let mut img = image::RgbaImage::new((cw * k) as u32, (ch * k) as u32);
@@ -610,7 +610,7 @@ mod imp {
                 }
             }
             let n = SEQ.fetch_add(1, Ordering::Relaxed);
-            let dir = DIR.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let dir = DIR.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
             let path = std::path::Path::new(&dir).join(format!("frame_{n:04}.png"));
             let _ = img.save(&path);
             if n == 0 {
@@ -1157,7 +1157,7 @@ mod imp {
             0,
             0,
             0,
-            DEFAULT_CHARSET as u32,
+            u32::from(DEFAULT_CHARSET),
             0,
             0,
             // GRAYSCALE AA, deliberately not ClearType. The mask this builds is a MONOCHROME
@@ -1167,7 +1167,7 @@ mod imp {
             // subpixel it happened to land on — at 11px the prev-row type came out visibly uneven,
             // some strokes bright and some nearly gone. Grayscale AA puts true coverage in every
             // channel, which is exactly what a one-channel read wants.
-            ANTIALIASED_QUALITY as u32,
+            u32::from(ANTIALIASED_QUALITY),
             0,
             face.as_ptr(),
         );
@@ -1175,14 +1175,14 @@ mod imp {
             DeleteDC(dc);
             return None;
         }
-        let old_font = SelectObject(dc, font as _);
+        let old_font = SelectObject(dc, font.cast());
         let mut size = SIZE { cx: 0, cy: 0 };
-        if GetTextExtentPoint32W(dc, wide.as_ptr(), wide.len() as i32, &mut size) == 0
+        if GetTextExtentPoint32W(dc, wide.as_ptr(), wide.len() as i32, &raw mut size) == 0
             || size.cx <= 0
             || size.cy <= 0
         {
             SelectObject(dc, old_font);
-            DeleteObject(font as _);
+            DeleteObject(font.cast());
             DeleteDC(dc);
             return None;
         }
@@ -1191,16 +1191,16 @@ mod imp {
         bmi.bmiHeader.biWidth = tw;
         bmi.bmiHeader.biHeight = -th;
         let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
-        let dib = CreateDIBSection(dc, &bmi, DIB_RGB_COLORS, &mut bits, std::ptr::null_mut(), 0)
+        let dib = CreateDIBSection(dc, &raw const bmi, DIB_RGB_COLORS, &raw mut bits, std::ptr::null_mut(), 0)
             as HBITMAP;
         if dib.is_null() || bits.is_null() {
             SelectObject(dc, old_font);
-            DeleteObject(font as _);
+            DeleteObject(font.cast());
             DeleteDC(dc);
             return None;
         }
-        let old_bmp = SelectObject(dc, dib as _);
-        let px_buf = bits as *mut u32;
+        let old_bmp = SelectObject(dc, dib.cast());
+        let px_buf = bits.cast::<u32>();
         let n = (tw * th) as usize;
         for i in 0..n {
             *px_buf.add(i) = 0; // DIB memory isn't guaranteed zeroed
@@ -1215,8 +1215,8 @@ mod imp {
         }
         SelectObject(dc, old_bmp);
         SelectObject(dc, old_font);
-        DeleteObject(dib as _);
-        DeleteObject(font as _);
+        DeleteObject(dib.cast());
+        DeleteObject(font.cast());
         DeleteDC(dc);
         Some(TextRaster { w: tw, h: th, mask })
     }
@@ -1342,9 +1342,9 @@ mod imp {
                 let mut dbg_cover = 0usize; // tiles composited this frame (slow-frame diagnostic)
                 let mut dbg_painted = 0usize; // pixels that hit the FULL material pipeline this frame
                 let mut msg: MSG = std::mem::zeroed();
-                while PeekMessageW(&mut msg, hwnd, 0, 0, PM_REMOVE) != 0 {
-                    TranslateMessage(&msg);
-                    DispatchMessageW(&msg);
+                while PeekMessageW(&raw mut msg, hwnd, 0, 0, PM_REMOVE) != 0 {
+                    TranslateMessage(&raw const msg);
+                    DispatchMessageW(&raw const msg);
                 }
                 let mut quit = false;
                 while let Ok(cmd) = rx.try_recv() {
@@ -1506,7 +1506,7 @@ mod imp {
                             mode = m;
                             if !same_kind {
                                 let mut cur = POINT { x: 0, y: 0 };
-                                GetCursorPos(&mut cur);
+                                GetCursorPos(&raw mut cur);
                                 origin = place_window(&mode, cur);
                                 // move, then force to the VERY TOP of the topmost band (above the
                                 // taskbar/shell): a plain HWND_TOPMOST on an already-topmost window
@@ -1699,7 +1699,7 @@ mod imp {
                             // monitor corner; recompute the origin and only move when it changed (so
                             // a steady stack doesn't thrash SetWindowPos every frame).
                             let mut cur = POINT { x: 0, y: 0 };
-                            GetCursorPos(&mut cur);
+                            GetCursorPos(&raw mut cur);
                             let new_origin = stack_origin(place, cur);
                             let switched = !matches!(mode, WeaveMode::NotifyStack);
                             mode = WeaveMode::NotifyStack;
@@ -1800,7 +1800,7 @@ mod imp {
                             }
                         }
                     }
-                    for p in particles.iter_mut() {
+                    for p in &mut particles {
                         p.x += p.vx;
                         p.y += p.vy;
                         p.vy += 0.035;
@@ -2291,7 +2291,7 @@ mod imp {
                                             0.18 * bright,
                                             b.rgb,
                                         );
-                                        let extra = if b.kind == 2 { 1 } else { 0 };
+                                        let extra = u32::from(b.kind == 2);
                                         hard_construct(
                                             &mut buf,
                                             cx,
@@ -2353,7 +2353,7 @@ mod imp {
                             sector_wheel(&mut buf.glow, &mut buf.white, *sectors, live, flare);
                             // each wedge is a live instrument CARD (icon → value → title) at its
                             // slice bearing; the aimed one blooms. The wheel SHOWS its state.
-                            let n = (*sectors).max(1) as f32;
+                            let n = f32::from((*sectors).max(1));
                             let rad = (CX - 26.0).min(150.0);
                             for (i, w) in wedge_views.iter().enumerate() {
                                 let ca = i as f32 / n * TAU;
@@ -2506,8 +2506,8 @@ mod imp {
                             let am = (aim.0 * aim.0 + aim.1 * aim.1).sqrt();
                             if am >= 6.0
                                 && neuron::radial::pick_wedge(
-                                    aim.0 as f64,
-                                    aim.1 as f64,
+                                    f64::from(aim.0),
+                                    f64::from(aim.1),
                                     6.0,
                                     ask_opts.len(),
                                 )
@@ -3002,7 +3002,7 @@ mod imp {
                     if prof_n >= 60 {
                         eprintln!(
                             "[overlay] frame avg {:.1}ms  max {:.1}ms  (last 60)",
-                            prof_us as f64 / prof_n as f64 / 1000.0,
+                            prof_us as f64 / f64::from(prof_n) / 1000.0,
                             prof_max as f64 / 1000.0
                         );
                         prof_us = 0;
@@ -3065,13 +3065,13 @@ mod imp {
         if dx.abs() + dy.abs() < 6.0 {
             return -1; // inside the deadzone — no pick yet
         }
-        let n = sectors.max(1) as f32;
+        let n = f32::from(sectors.max(1));
         // screen y is down; North = up = -y. angle measured clockwise from North.
         let mut a = dx.atan2(-dy); // 0 at North, +clockwise
         if a < 0.0 {
             a += TAU;
         }
-        ((a / TAU * n).round() as i32) % sectors as i32
+        ((a / TAU * n).round() as i32) % i32::from(sectors)
     }
 
     fn splat(buf: &mut [f32], cx: f32, cy: f32, radius: f32, bright: f32) {
@@ -3095,11 +3095,11 @@ mod imp {
     }
     #[inline]
     fn splat_glow(buf: &mut [f32], cx: f32, cy: f32, r: f32, b: f32) {
-        splat(buf, cx, cy, r, b)
+        splat(buf, cx, cy, r, b);
     }
     #[inline]
     fn splat_white(buf: &mut [f32], cx: f32, cy: f32, r: f32, b: f32) {
-        splat(buf, cx, cy, r, b)
+        splat(buf, cx, cy, r, b);
     }
 
     /// LEGIBILITY POCKET — pour a little of the gathering dusk *under* a glyph or label so its
@@ -3287,10 +3287,10 @@ mod imp {
         // its hairline too (card_frame's border is at full accent; layer a small dimming isn't easy,
         // so we accept the chrome at full and fade the CONTENT — the dominant visual — by alpha).
         // LAYOUT — left-anchored block past the tab + glyph chip (fixed column width).
-        let lw = c.title.as_ref().map(|t| t.w).unwrap_or(0) as f32;
-        let vw = c.value.as_ref().map(|t| t.w).unwrap_or(0) as f32;
+        let lw = c.title.as_ref().map_or(0, |t| t.w) as f32;
+        let vw = c.value.as_ref().map_or(0, |t| t.w) as f32;
         let bw = c.body.iter().map(|t| t.w as f32).fold(0.0, f32::max);
-        let pw = c.prev.as_ref().map(|t| t.w).unwrap_or(0) as f32;
+        let pw = c.prev.as_ref().map_or(0, |t| t.w) as f32;
         let arrow = if c.dir != 0 { NOTIFY_ARROW } else { 0.0 };
         let text_w = lw.max(vw + arrow).max(bw).max(pw);
         // chip-centre + text-left x come from the shared spec (one source of truth with the box sizing).
@@ -3762,7 +3762,7 @@ mod imp {
         let aimed_mag = (aim.0 * aim.0 + aim.1 * aim.1).sqrt();
         let idle = aimed_mag < 6.0;
         // the aimed wedge — a small threshold so it lights as you move, well before the commit radius.
-        let live = neuron::radial::pick_wedge(aim.0 as f64, aim.1 as f64, 6.0, n);
+        let live = neuron::radial::pick_wedge(f64::from(aim.0), f64::from(aim.1), 6.0, n);
         let half = (neuron::radial::wedge_arc(n) as f32) * 0.5;
         for i in 0..n {
             let b = neuron::radial::wedge_bearing(i, n) as f32; // atan2(dy,dx): E=0, S=+, W=±π, N=−
@@ -4067,13 +4067,13 @@ mod imp {
     /// The cursor's monitor work area (left, top, right, bottom) — full-virtual-screen fallback.
     /// An AUTO-HIDE taskbar reserves NO work area (rcWork == rcMonitor), so a bottom-corner card would
     /// land where the bar pops up and read as "behind the taskbar". We reserve the taskbar's OWN edge
-    /// ourselves (via the AppBar API, which reports it even when hidden), but only when the work area
+    /// ourselves (via the `AppBar` API, which reports it even when hidden), but only when the work area
     /// didn't already exclude it — so a normal pinned taskbar isn't double-subtracted.
     unsafe fn monitor_work(pt: POINT) -> (i32, i32, i32, i32) {
         let mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
         let mut mi: MONITORINFO = std::mem::zeroed();
         mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
-        if mon.is_null() || GetMonitorInfoW(mon, &mut mi) == 0 {
+        if mon.is_null() || GetMonitorInfoW(mon, &raw mut mi) == 0 {
             return (pt.x - W, pt.y - H, pt.x + W, pt.y + H); // degenerate fallback: centered, unclamped
         }
         let (mut l, mut t, mut r, mut b) = (
@@ -4102,13 +4102,13 @@ mod imp {
         (l, t, r, b)
     }
 
-    /// The Windows taskbar's edge + bounding rect via the AppBar API — reported even for an auto-hide
-    /// bar (unlike rcWork or a bare GetWindowRect, which can miss a hidden bar). `None` if unavailable.
+    /// The Windows taskbar's edge + bounding rect via the `AppBar` API — reported even for an auto-hide
+    /// bar (unlike rcWork or a bare `GetWindowRect`, which can miss a hidden bar). `None` if unavailable.
     unsafe fn taskbar_rect() -> Option<(u32, windows_sys::Win32::Foundation::RECT)> {
         use windows_sys::Win32::UI::Shell::{SHAppBarMessage, ABM_GETTASKBARPOS, APPBARDATA};
         let mut abd: APPBARDATA = std::mem::zeroed();
         abd.cbSize = std::mem::size_of::<APPBARDATA>() as u32;
-        if SHAppBarMessage(ABM_GETTASKBARPOS, &mut abd) != 0 {
+        if SHAppBarMessage(ABM_GETTASKBARPOS, &raw mut abd) != 0 {
             Some((abd.uEdge, abd.rc))
         } else {
             None
@@ -4134,10 +4134,10 @@ mod imp {
     /// snapped corner, so a centre placement renders a CENTRED column and a corner placement hugs that
     /// corner (the same free placement the single card had).
     ///
-    /// X — the card block (buffer x∈[STACK_AX-STACK_HALF, STACK_AX+STACK_HALF]) is CENTRED on
+    /// X — the card block (buffer x∈[STACK_AX-STACK_HALF, `STACK_AX+STACK_HALF`]) is CENTRED on
     /// `nx`: its screen centre lands at `l + nx*(r-l)`, then the whole block is CLAMPED inside
     /// `[l+pad, r-pad]` so it never runs off-screen (nx≈0.5 → centred, nx≈1 → hugs the right,
-    /// nx≈0 → hugs the left). We keep STACK_AX as the buffer centre and shift the WINDOW (like the
+    /// nx≈0 → hugs the left). We keep `STACK_AX` as the buffer centre and shift the WINDOW (like the
     /// single card did via `place_window`), so the cover/draw never move in the buffer.
     ///
     /// Y — the block's anchor lands at the EXACT `t + ny*(b-t)` (free, like x), and the GROWTH
@@ -4456,7 +4456,7 @@ mod imp {
                             b,
                         ),
                         WedgeGlyph::Banish => {
-                            arrowhead(m, (cx - 0.05 * r, cy + 0.9 * r), (0.0, 1.0), 0.3 * r, sr, b)
+                            arrowhead(m, (cx - 0.05 * r, cy + 0.9 * r), (0.0, 1.0), 0.3 * r, sr, b);
                         }
                         WedgeGlyph::Pin => {
                             // a pin tack stuck into the title bar
@@ -4963,7 +4963,7 @@ mod imp {
     }
 
     fn sector_wheel(glow: &mut [f32], white: &mut [f32], sectors: u8, live: i32, flare: f32) {
-        let n = sectors.max(1) as i32;
+        let n = i32::from(sectors.max(1));
         let rad = (CX - 26.0).min(150.0);
         // outer ring — DENSE enough that the material body fills a continuous glowing arc (sparse
         // samples read as dead green dots: only the accent rim shows on a thin, low-density mark;
@@ -5013,9 +5013,9 @@ mod imp {
         if m == 0 {
             return;
         }
-        let center = wedge as f32 / sectors.max(1) as f32 * TAU; // the parent wedge's bearing
+        let center = wedge as f32 / f32::from(sectors.max(1)) * TAU; // the parent wedge's bearing
                                                                  // the fan spans wider than one slice: ~1.3 slices per option, capped to a comfortable arc
-        let slice = TAU / sectors.max(1) as f32;
+        let slice = TAU / f32::from(sectors.max(1));
         let span = (slice * 1.3 * m as f32).min(TAU * 0.7);
         let fan_r = rim + 46.0; // it lives OUTSIDE the wheel
                                 // a faint connector from the rim out to the fan, so the eye follows the spring

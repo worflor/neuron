@@ -41,7 +41,7 @@ pub enum Origin {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     /// A file-mapping (shared memory) of the given observed mapped-region size
-    /// (bytes; VirtualQuery rounding to allocation granularity).
+    /// (bytes; `VirtualQuery` rounding to allocation granularity).
     Section(usize),
     Event,
     Mutex,
@@ -62,16 +62,17 @@ pub struct Obj {
 
 impl Obj {
     /// The full NT object name the game and server rendezvous on.
+    #[must_use]
     pub fn name(&self) -> String {
         format!("Global\\{{{}}}", self.guid)
     }
 }
 
 /// The security descriptor we put on our objects: DACL granting **Everyone
-/// (`WD`) GenericAll** — critically including READ. The game's worker maps every
+/// (`WD`) `GenericAll`** — critically including READ. The game's worker maps every
 /// object with `MapViewOfFile(FILE_MAP_ALL_ACCESS = 0xf001f)`, which REQUIRES
 /// read access; a write-only DACL (the earlier `0x1f0003`, missing the 0x4 read
-/// bit) made every neuron object fail to map with ACCESS_DENIED, so the worker
+/// bit) made every neuron object fail to map with `ACCESS_DENIED`, so the worker
 /// bailed before establishing a session and the game never painted. `GA` grants
 /// full section/event/mutex access to any opener — verified against the game.
 pub const SECURITY_SDDL: &str = "D:(A;;GA;;;WD)";
@@ -213,6 +214,7 @@ pub struct SessionTable {
 }
 
 /// Parse the session/priority table. `None` if too short or no active session.
+#[must_use]
 pub fn parse_session_table(buf: &[u8]) -> Option<SessionTable> {
     if buf.len() < 0x14 {
         return None;
@@ -242,6 +244,7 @@ pub const APP_REGISTRY_RECORD0: usize = 0x200;
 pub const APP_REGISTRY_STRIDE: usize = 0x210;
 
 /// Parse the app registry into its populated entries (id + exe name).
+#[must_use]
 pub fn parse_app_registry(buf: &[u8]) -> Vec<AppEntry> {
     let count = if buf.len() >= 4 {
         u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize
@@ -267,6 +270,7 @@ pub fn parse_app_registry(buf: &[u8]) -> Vec<AppEntry> {
 
 /// The device roster ([`CONTROL_SECTION`] / `96264859`): a `u32` header then
 /// UTF-16 device-instance strings. Returns `(header, first_instance)`.
+#[must_use]
 pub fn parse_roster(buf: &[u8]) -> Option<(u32, String)> {
     if buf.len() < 6 {
         return None;
@@ -290,10 +294,11 @@ pub const NOTIFY_SERVER_TO_CLIENT: &str = "DA5A60F0-A3C5-4335-A039-BCC6136C61A3"
 /// connected: `Global\<exe>_rz` with the exe name lowercased (e.g.
 /// `Global\overwatch_rz`). Enumerating these owned mutexes is how the server
 /// learns which apps are live.
+#[must_use]
 pub fn rz_mutex_name(exe_name: &str) -> String {
     // Strip any path, drop the extension, lowercase, append `_rz`.
     let base = exe_name.rsplit(['\\', '/']).next().unwrap_or(exe_name);
-    let stem = base.rsplit_once('.').map(|(s, _)| s).unwrap_or(base);
+    let stem = base.rsplit_once('.').map_or(base, |(s, _)| s);
     format!("Global\\{}_rz", stem.to_ascii_lowercase())
 }
 
@@ -310,6 +315,7 @@ pub const DEVICE_SECTIONS: &[(u8, &str)] = &[
 ];
 
 /// The section GUID that carries a given device-class bit, if known.
+#[must_use]
 pub fn device_section(device_type: u8) -> Option<&'static str> {
     DEVICE_SECTIONS.iter().find(|(t, _)| *t == device_type).map(|(_, g)| *g)
 }
@@ -326,7 +332,7 @@ pub const RECORD_MAGIC: u16 = 0xffff;
 
 /// The protocol's per-frame XOR keystream (512 bytes). A game writes a *stable* per-key
 /// state, then obfuscates each ring frame before committing it: every colour byte is
-/// XORed with `KEYSTREAM[phase + channel*0x81]`, where `phase = frame_timestamp & 0x7f`
+/// `XORed` with `KEYSTREAM[phase + channel*0x81]`, where `phase = frame_timestamp & 0x7f`
 /// (clamped so `phase+0x183 < 512`). The key is uniform across keys and rotates with the
 /// millisecond clock, so the raw buffer *looks* like the whole board strobing through
 /// random colours while the true state sits still underneath. Un-XOR with the same
@@ -357,10 +363,12 @@ pub struct ColorUnit(pub [u8; 4]);
 
 impl ColorUnit {
     /// The raw 4 bytes exactly as they sit in shared memory.
+    #[must_use]
     pub fn raw(self) -> [u8; 4] {
         self.0
     }
     /// True if every byte is zero (an unlit LED / possible record padding).
+    #[must_use]
     pub fn is_zero(self) -> bool {
         self.0 == [0, 0, 0, 0]
     }
@@ -368,6 +376,7 @@ impl ColorUnit {
     /// three bytes are `[R, G, B]` in the same channel order the REST adapter's `bgr()`
     /// uses (R = low byte); byte 3 is a per-LED flag we don't consume. Both faces decode
     /// colour identically.
+    #[must_use]
     pub fn rgb(self) -> (u8, u8, u8) {
         (self.0[0], self.0[1], self.0[2])
     }
@@ -386,6 +395,7 @@ pub struct RecordHeader {
 
 /// Parse the record header at the start of `buf`. Returns `None` if `buf` is too
 /// short or the `0xffff` magic is absent (i.e. not a populated device record).
+#[must_use]
 pub fn parse_record_header(buf: &[u8]) -> Option<RecordHeader> {
     if buf.len() < GRID_OFFSET {
         return None;
@@ -405,6 +415,7 @@ pub fn parse_record_header(buf: &[u8]) -> Option<RecordHeader> {
 /// [`GRID_OFFSET`] up to the record delimiter (`<zero word><handle><0x0c>`) or
 /// the end of the buffer. Returns the header and the units. `None` if there is
 /// no valid populated record (e.g. an all-zero / offline section).
+#[must_use]
 pub fn parse_frame(section: &[u8]) -> Option<(RecordHeader, Vec<ColorUnit>)> {
     // The section is a RING of frame records (each tagged `ff ff NN 00` at its
     // start, `stride` bytes apart). `u32@0` is the WRITE HEAD — the slot the game
@@ -555,6 +566,7 @@ fn newest_slot_ff(section: &[u8]) -> Option<usize> {
 /// name. These are the protocol's internal codes (remapped from the public effect enum
 /// before writing) — observed against live frames, where `7` = the per-key CUSTOM grid a
 /// game paints. Lets neuron see *what* the game is doing, not just the pixels.
+#[must_use]
 pub fn effect_name(code: u32) -> &'static str {
     match code {
         0 => "None",
@@ -583,6 +595,7 @@ pub struct DeviceActivity {
 
 impl DeviceActivity {
     /// Readable name for this device's current effect.
+    #[must_use]
     pub fn effect(&self) -> &'static str {
         effect_name(self.effect_code)
     }
@@ -622,6 +635,7 @@ fn ts_offset(section: &[u8]) -> usize {
 /// the raw telemetry behind [`ShmServer::device_activity`]. The timestamp is the frame's
 /// `GetTickCount64` low 32 bits (ms since boot), at [`ts_offset`] into the record, so
 /// successive reads give the game's real update cadence and tell live from idle.
+#[must_use]
 pub fn newest_record_meta(section: &[u8]) -> Option<(u32, u32)> {
     let ff = newest_slot_ff(section)?;
     let o = ff + ts_offset(section);
@@ -670,6 +684,7 @@ fn frame_phase(section: &[u8], ff: usize) -> Option<usize> {
 /// different timestamps/phases) decode to a byte-identical image (dark-blue board,
 /// amber WASD, teal ability keys). No averaging, no smoothing, zero lag — the strobe
 /// was never real, just the cipher.
+#[must_use]
 pub fn parse_frame_decoded(section: &[u8]) -> Option<(RecordHeader, Vec<ColorUnit>)> {
     let (header, raw) = parse_frame(section)?;
     // The newest slot's record tag — the same slot `parse_frame` read — so we key the
@@ -705,6 +720,7 @@ pub fn client_objects() -> impl Iterator<Item = &'static Obj> {
 }
 
 /// Every shared-memory section (name + size) we must create, biggest first.
+#[must_use]
 pub fn sections() -> Vec<(&'static str, usize)> {
     let mut v: Vec<(&'static str, usize)> = OBJECTS
         .iter()
@@ -731,7 +747,7 @@ pub fn sections() -> Vec<(&'static str, usize)> {
 #[cfg(all(windows, feature = "bridge"))]
 #[allow(unsafe_code)]
 pub mod server {
-    use super::*;
+    use super::{SECURITY_SDDL, OBJECTS, Origin, Kind, APP_REGISTRY, device_section, ColorUnit, DEVICE_SECTIONS, parse_frame, parse_frame_decoded, DeviceActivity, newest_record_meta, effect_name, AppEntry, parse_app_registry, SessionTable, SESSION_TABLE, parse_session_table, rz_mutex_name, APP_REGISTRY_RECORD0, client_objects};
     use std::io;
     use windows_sys::Win32::Foundation::{
         CloseHandle, LocalFree, HANDLE, INVALID_HANDLE_VALUE,
@@ -783,7 +799,7 @@ pub mod server {
             let mut psd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
             let ok = unsafe {
                 ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                    sddl.as_ptr(), 1, &mut psd, std::ptr::null_mut(),
+                    sddl.as_ptr(), 1, &raw mut psd, std::ptr::null_mut(),
                 )
             };
             if ok == 0 {
@@ -797,13 +813,13 @@ pub mod server {
             Ok(EveryoneSa(psd, sa))
         }
         fn ptr(&self) -> *const SECURITY_ATTRIBUTES {
-            &self.1
+            &raw const self.1
         }
     }
     impl Drop for EveryoneSa {
         fn drop(&mut self) {
             if !self.0.is_null() {
-                unsafe { LocalFree(self.0 as _) };
+                unsafe { LocalFree(self.0.cast()) };
             }
         }
     }
@@ -820,9 +836,9 @@ pub mod server {
     #[derive(Debug)]
     pub enum CreateError {
         /// The named objects already exist — the real Razer server is running.
-        /// Stand down and let it serve (the OpenRGB "port busy" rule).
+        /// Stand down and let it serve (the `OpenRGB` "port busy" rule).
         AlreadyServing,
-        /// An OS error (usually: not elevated — `Global\` needs SeCreateGlobal).
+        /// An OS error (usually: not elevated — `Global\` needs `SeCreateGlobal`).
         Io(io::Error),
     }
     impl std::fmt::Display for CreateError {
@@ -889,7 +905,7 @@ pub mod server {
                             return Err(io::Error::last_os_error().into());
                         }
                         sections.push(MappedSection {
-                            guid: o.guid, mapping, view: view.Value as *mut u8, size,
+                            guid: o.guid, mapping, view: view.Value.cast::<u8>(), size,
                         });
                     }
                     Kind::Event => {
@@ -913,12 +929,11 @@ pub mod server {
                 sections
                     .iter()
                     .find(|s| s.guid == guid)
-                    .map(|s| (s.view as usize, s.size))
-                    .unwrap_or((0, 0))
+                    .map_or((0, 0), |s| (s.view as usize, s.size))
             };
             let appreg = find_sec(APP_REGISTRY);
             let sessinfo = find_sec(SESSION_INFO);
-            let keyboard = device_section(0x01).map(find_sec).unwrap_or((0, 0));
+            let keyboard = device_section(0x01).map_or((0, 0), find_sec);
             // `wear_mask` can decline (`None`) if another thread in THIS process won the
             // `mask_worn()` race above and already claimed the single in-process arbiter slot
             // (see `claim_mask_slot`) — the same "a live server owns arbitration" signal as the
@@ -937,7 +952,7 @@ pub mod server {
         /// does not serve or handshake; the live server ingests the game's Chroma,
         /// and neuron opens the same device buffers and mirrors them onto the
         /// hardware like any other effect. Opens each section for WRITE, because
-        /// the Everyone DACL grants `0x1f0003` (QUERY|MAP_WRITE) but not MAP_READ;
+        /// the Everyone DACL grants `0x1f0003` (`QUERY|MAP_WRITE`) but not `MAP_READ`;
         /// a writable view is still readable. Sections that don't exist yet (game/
         /// on-demand) are simply skipped. Errors only if nothing could be opened
         /// (no server running).
@@ -961,7 +976,7 @@ pub mod server {
                         continue;
                     }
                     sections.push(MappedSection {
-                        guid: o.guid, mapping, view: view.Value as *mut u8, size,
+                        guid: o.guid, mapping, view: view.Value.cast::<u8>(), size,
                     });
                 }
             }
@@ -978,7 +993,7 @@ pub mod server {
         ///
         /// A Chroma section is interior-mutable shared memory: the connected game writes it
         /// cross-process, and our own `chroma-arbiter` thread writes the app-registry /
-        /// SessionInfo pages during activation (see [`write_grant`]). So we must NEVER hand out
+        /// `SessionInfo` pages during activation (see [`write_grant`]). So we must NEVER hand out
         /// a `&[u8]` borrowed into a live page — a reference whose bytes change underneath it is
         /// aliasing UB (it lets the compiler assume the bytes are stable / `noalias`), and it is
         /// exactly the invariant the arbiter's writes would violate. Instead every read takes a
@@ -1007,6 +1022,7 @@ pub mod server {
 
         /// Decode the current frame of every device section that a game has
         /// written, as `(device_type, colour grid)`. Empty until a game paints.
+        #[must_use]
         pub fn read_device_frames(&self) -> Vec<(u8, Vec<ColorUnit>)> {
             DEVICE_SECTIONS
                 .iter()
@@ -1022,6 +1038,7 @@ pub mod server {
         /// device's frame with the timestamp keystream (see [`parse_frame_decoded`]),
         /// yielding the game's real, stable per-key state. This is what a live game's
         /// frame must be PAINTED from — the raw single-slot read is obfuscated noise.
+        #[must_use]
         pub fn read_device_frames_decoded(&self) -> Vec<(u8, Vec<ColorUnit>)> {
             DEVICE_SECTIONS
                 .iter()
@@ -1036,6 +1053,7 @@ pub mod server {
         /// Every painted device's current frame as decoded `(device_type, RGB
         /// LEDs)` — the neutral format the arbiter consumes (same shape the REST
         /// adapter produces from effect commands).
+        #[must_use]
         pub fn frames(&self) -> Vec<(u8, Vec<(u8, u8, u8)>)> {
             self.read_device_frames()
                 .into_iter()
@@ -1048,6 +1066,7 @@ pub mod server {
         /// timestamp of its newest frame. Diff the timestamp across calls for the
         /// game's real update rate; a stalled timestamp means idle. Free telemetry:
         /// it's all in the record header we already read.
+        #[must_use]
         pub fn device_activity(&self) -> Vec<DeviceActivity> {
             DEVICE_SECTIONS
                 .iter()
@@ -1064,11 +1083,12 @@ pub mod server {
         /// (the keyboard's if it's painting, else the first lit device's). `None` when
         /// nothing is lit. Pure telemetry for the CONNECTIONS card — no allocation
         /// beyond the decode it already does.
+        #[must_use]
         pub fn live_summary(&self) -> Option<(usize, &'static str)> {
             let mut lit = 0usize;
             let mut kbd_effect = None;
             let mut any_effect = None;
-            for &(dt, guid) in DEVICE_SECTIONS.iter() {
+            for &(dt, guid) in DEVICE_SECTIONS {
                 let Some(bytes) = self.section_bytes(guid) else { continue };
                 let Some((effect_code, _)) = newest_record_meta(&bytes) else { continue };
                 let Some((_, units)) = parse_frame_decoded(&bytes) else { continue };
@@ -1091,6 +1111,7 @@ pub mod server {
         /// One device's decoded frame plus its write timestamp (ms) — the pair a
         /// fading layer needs: the pixels to paint and the clock to tell whether the
         /// game is still actively driving this device.
+        #[must_use]
         pub fn decoded_frame_with_ts(&self, device_type: u8) -> Option<(u32, Vec<ColorUnit>)> {
             let guid = device_section(device_type)?;
             let bytes = self.section_bytes(guid)?;
@@ -1100,6 +1121,7 @@ pub mod server {
         }
 
         /// The apps currently registered in the app registry (`D4E1A960`).
+        #[must_use]
         pub fn registered_apps(&self) -> Vec<AppEntry> {
             self.section_bytes(APP_REGISTRY).map(|b| parse_app_registry(&b)).unwrap_or_default()
         }
@@ -1110,17 +1132,20 @@ pub mod server {
         /// and the PID tracks the process exactly, so this is the honest "a game is
         /// connected" signal the fading layer gates on: a registry row that lingers
         /// after a game exits has a dead PID, so it never keeps the layer lit.
+        #[must_use]
         pub fn any_client_connected(&self) -> bool {
             self.registered_apps().iter().any(|a| process_alive(a.id))
         }
 
         /// The most recent session-table entry, if any (`D41D8537`).
+        #[must_use]
         pub fn latest_session(&self) -> Option<SessionTable> {
             self.section_bytes(SESSION_TABLE).and_then(|b| parse_session_table(&b))
         }
 
         /// True if a specific app (by exe name) holds its `Global\<exe>_rz`
         /// registration mutex — i.e. is currently connected.
+        #[must_use]
         pub fn app_connected(&self, exe_name: &str) -> bool {
             const MUTEX_ALL_ACCESS: u32 = 0x001F_0001;
             let full = wide(&rz_mutex_name(exe_name));
@@ -1148,7 +1173,7 @@ pub mod server {
             return false;
         }
         let mut code: u32 = 0;
-        let ok = unsafe { GetExitCodeProcess(h, &mut code) };
+        let ok = unsafe { GetExitCodeProcess(h, &raw mut code) };
         unsafe { CloseHandle(h) };
         ok != 0 && code == STILL_ACTIVE
     }
@@ -1193,14 +1218,14 @@ pub mod server {
         "{798D9FEC-789F-46FD-B3D9-359C8E81DD11}",
         "{841EB9A8-6DA7-479E-94DC-C23B95FFDF43}",
     ];
-    /// The client session worker's wake event — SetEvent to deliver the grant.
+    /// The client session worker's wake event — `SetEvent` to deliver the grant.
     const SESSION_WORKER_EVENT: &str = "{B8B918C0-9790-47F2-AC7A-F36B8414140C}";
-    /// The per-key ACTIVATION event — SetEvent ~60ms AFTER the grant. This is the signal
+    /// The per-key ACTIVATION event — `SetEvent` ~60ms AFTER the grant. This is the signal
     /// that flips the game from a uniform muted/black frame to painting its real per-key
     /// colour. Without it the game registers and streams frames, but every key stays the
     /// muted clear colour (the whole "connects but paints nothing" symptom).
     const ACTIVATE_EVENT: &str = "{A84AF9C8-EFE0-430D-871C-10DA760C2CCD}";
-    /// The SessionInfo section the grant writes its {event-type, session-id} slots into.
+    /// The `SessionInfo` section the grant writes its {event-type, session-id} slots into.
     const SESSION_INFO: &str = "821AA2A2-8215-4A16-BE9D-7CD8CEBDC398";
     /// The Chroma client DLL a game loads — the marker we scan processes for.
     const CHROMA_CLIENT_DLL: &str = "rzchromasdk64.dll";
@@ -1298,7 +1323,7 @@ pub mod server {
     /// Stand up the full arbitration: hold the mutexes + signalled events, then run the
     /// one-shot grant/activate loop on a background thread (NO pulse — see the arbiter
     /// block above). `appreg`/`sessinfo` are the mapped `(pointer, size)` of the
-    /// app-registry and SessionInfo sections the grant writes.
+    /// app-registry and `SessionInfo` sections the grant writes.
     ///
     /// Returns `None` if another [`MaskGuard`] already owns the single in-process arbiter
     /// slot ([`claim_mask_slot`]) — the caller (only [`ShmServer::create`]) must treat this
@@ -1338,7 +1363,7 @@ pub mod server {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop_thread = std::sync::Arc::clone(&stop);
         let thread = crate::worker::spawn_named("chroma-arbiter", move || {
-            arbiter_loop(appreg, sessinfo, keyboard, stop_thread)
+            arbiter_loop(appreg, sessinfo, keyboard, stop_thread);
         })
         .ok();
         Some(MaskGuard { held, stop, thread })
@@ -1346,7 +1371,7 @@ pub mod server {
 
     /// How often the quiet arbiter checks its state. Client-owned transport objects make
     /// discovery happen on the next tick; they are hints, not correctness requirements.
-    const ARBITER_TICK: std::time::Duration = std::time::Duration::from_millis(2000);
+    const ARBITER_TICK: std::time::Duration = std::time::Duration::from_secs(2);
 
     /// Even when every client-owned event was transient (or a newer SDK changes which one
     /// survives), authoritative process/module discovery still runs at this bounded cadence.
@@ -1433,7 +1458,7 @@ pub mod server {
     /// flips the board from a uniform muted frame to the game's real per-key colour.
     ///
     /// # Safety
-    /// `appreg`/`sessinfo` must be the live mapped views of the app-registry / SessionInfo
+    /// `appreg`/`sessinfo` must be the live mapped views of the app-registry / `SessionInfo`
     /// sections with the given sizes; only this thread writes them.
     unsafe fn activate_once(appreg: (usize, usize), sessinfo: (usize, usize), pid: u32, sess: u32) {
         write_grant(appreg, sessinfo, pid, sess);
@@ -1443,7 +1468,7 @@ pub mod server {
     }
 
     /// The MEMORY half of activation: stamp the grant records into the mapped app-registry and
-    /// SessionInfo pages. Split out from [`activate_once`] so the exact byte layout is unit-tested
+    /// `SessionInfo` pages. Split out from [`activate_once`] so the exact byte layout is unit-tested
     /// without the kernel-event signalling + timing. These are raw stores into interior-mutable
     /// shared memory; only the single `chroma-arbiter` thread ever writes these bytes, and readers
     /// snapshot the same pages by volatile copy (see [`ShmServer::section_bytes`]) — so no `&`/
@@ -1456,15 +1481,15 @@ pub mod server {
         let (ap, ap_size) = appreg;
         if ap != 0 && ap_size >= APP_REGISTRY_RECORD0 + 0x10 {
             let p = ap as *mut u8;
-            std::ptr::write_unaligned(p as *mut u32, 1); // app count = 1
-            std::ptr::write_unaligned(p.add(APP_REGISTRY_RECORD0 + 0x0c) as *mut u32, pid); // PID @ +0x20c
+            std::ptr::write_unaligned(p.cast::<u32>(), 1); // app count = 1
+            std::ptr::write_unaligned(p.add(APP_REGISTRY_RECORD0 + 0x0c).cast::<u32>(), pid); // PID @ +0x20c
         }
         let (sp, sp_size) = sessinfo;
         if sp != 0 && sp_size >= 12 {
             let s = sp as *mut u8;
-            std::ptr::write_unaligned(s as *mut u32, 0); // head
-            std::ptr::write_unaligned(s.add(4) as *mut u32, 8); // slot0 event-type 8 (grant access)
-            std::ptr::write_unaligned(s.add(8) as *mut u32, sess); // slot0 session id
+            std::ptr::write_unaligned(s.cast::<u32>(), 0); // head
+            std::ptr::write_unaligned(s.add(4).cast::<u32>(), 8); // slot0 event-type 8 (grant access)
+            std::ptr::write_unaligned(s.add(8).cast::<u32>(), sess); // slot0 session id
         }
     }
 
@@ -1664,7 +1689,7 @@ pub mod server {
     /// The interactive session id for a pid (games run in the console session, usually 1).
     fn pid_session(pid: u32) -> u32 {
         let mut sess: u32 = 0;
-        if unsafe { ProcessIdToSessionId(pid, &mut sess) } != 0 {
+        if unsafe { ProcessIdToSessionId(pid, &raw mut sess) } != 0 {
             sess
         } else {
             1
@@ -1687,7 +1712,7 @@ pub mod server {
         let mut pe: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
         pe.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
         let mut found = None;
-        if unsafe { Process32FirstW(snap, &mut pe) } != 0 {
+        if unsafe { Process32FirstW(snap, &raw mut pe) } != 0 {
             loop {
                 let pid = pe.th32ProcessID;
                 if pid > 4 {
@@ -1701,7 +1726,7 @@ pub mod server {
                         break;
                     }
                 }
-                if unsafe { Process32NextW(snap, &mut pe) } == 0 {
+                if unsafe { Process32NextW(snap, &raw mut pe) } == 0 {
                     break;
                 }
             }
@@ -1720,7 +1745,7 @@ pub mod server {
         let mut me: MODULEENTRY32W = unsafe { std::mem::zeroed() };
         me.dwSize = std::mem::size_of::<MODULEENTRY32W>() as u32;
         let mut hit = false;
-        if unsafe { Module32FirstW(snap, &mut me) } != 0 {
+        if unsafe { Module32FirstW(snap, &raw mut me) } != 0 {
             loop {
                 let end = me.szModule.iter().position(|&c| c == 0).unwrap_or(me.szModule.len());
                 let name = String::from_utf16_lossy(&me.szModule[..end]).to_lowercase();
@@ -1728,7 +1753,7 @@ pub mod server {
                     hit = true;
                     break;
                 }
-                if unsafe { Module32NextW(snap, &mut me) } == 0 {
+                if unsafe { Module32NextW(snap, &raw mut me) } == 0 {
                     break;
                 }
             }
@@ -1792,10 +1817,11 @@ pub mod server {
 
     /// How many leading decoded units to skip before physical LED 0, by device CLASS —
     /// NOT a blind global. A keyboard's grid reserves one cell ahead of its key matrix,
-    /// so key 0 is decoded unit 1 (verified live on a BlackWidow). No other class shows
+    /// so key 0 is decoded unit 1 (verified live on a `BlackWidow`). No other class shows
     /// that pad, and the record is otherwise "one unit per LED", so every non-keyboard
     /// class maps unit i → LED i straight. Unverified classes default to 0 so a
     /// mouse/mousepad frame is never shifted a pixel; a real capture can promote it later.
+    #[must_use]
     pub fn chroma_grid_lead(device_type: u8) -> usize {
         match device_type {
             0x01 => 1, // keyboard — the reserved leading cell, confirmed on hardware
@@ -1930,7 +1956,7 @@ pub mod server {
             for s in &self.sections {
                 unsafe {
                     UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
-                        Value: s.view as *mut core::ffi::c_void,
+                        Value: s.view.cast::<core::ffi::c_void>(),
                     });
                     CloseHandle(s.mapping);
                 }

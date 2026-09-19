@@ -62,11 +62,11 @@ pub struct CastConfig {
     #[serde(default)]
     pub radial: Vec<Action>,
     /// HYPERSHIFT RADIAL — a parallel wedge set (SAME sector count + same backend as `radial`) shown
-    /// only while a HyperShift layer is held, when `hyper_radial_on`. Just a second action vector the
+    /// only while a `HyperShift` layer is held, when `hyper_radial_on`. Just a second action vector the
     /// overlay swaps to; everything else (resolve/render/edit) is reused. Off by default.
     #[serde(default)]
     pub hyper_radial: Vec<Action>,
-    /// Enable the HyperShift radial swap. OFF by default — the wheel stays the same under HyperShift
+    /// Enable the `HyperShift` radial swap. OFF by default — the wheel stays the same under `HyperShift`
     /// until you opt in.
     #[serde(default)]
     pub hyper_radial_on: bool,
@@ -111,6 +111,7 @@ impl ModeSlot {
     /// dispatches on): 0 = the weave; 1 = teleport's dedicated aim; 2 = whiteboard's session;
     /// `100 + taps` = a generic "fire via `Trigger::Cast { taps }`" rhythm (any other bound
     /// action — routed back through the engine spine rather than a hard-wired instrument).
+    #[must_use]
     pub fn capture_id(&self) -> u32 {
         if self.is_weave {
             0
@@ -118,7 +119,7 @@ impl ModeSlot {
             match self.action {
                 Action::Teleport => 1,
                 Action::Whiteboard => 2,
-                _ => 100 + self.taps as u32,
+                _ => 100 + u32::from(self.taps),
             }
         }
     }
@@ -126,6 +127,7 @@ impl ModeSlot {
 
 /// Human label for a "N taps then hold" rhythm — "hold", "tap hold", "tap tap hold", … (used in
 /// honest collision complaints and the GUI rhythm-map rows).
+#[must_use]
 pub fn taps_phrase(taps: u8) -> String {
     let mut parts: Vec<&str> = vec!["tap"; taps as usize];
     parts.push("hold");
@@ -219,12 +221,14 @@ pub struct Resolved {
 }
 
 impl CastConfig {
+    #[must_use]
     pub fn path() -> PathBuf {
         crate::runroot::run_root().join("cast.toml")
     }
-    /// The radial action set to use RIGHT NOW: the HyperShift set when a HyperShift layer is held AND
+    /// The radial action set to use RIGHT NOW: the `HyperShift` set when a `HyperShift` layer is held AND
     /// it's enabled AND populated; otherwise the base set. An empty/disabled hyper set transparently
-    /// falls back, so the wheel never goes blank under HyperShift just because it isn't authored yet.
+    /// falls back, so the wheel never goes blank under `HyperShift` just because it isn't authored yet.
+    #[must_use]
     pub fn active_radial(&self, hypershift_held: bool) -> &[Action] {
         if hypershift_held && self.hyper_radial_on && !self.hyper_radial.is_empty() {
             &self.hyper_radial
@@ -235,6 +239,7 @@ impl CastConfig {
     /// Load from disk, salvaging field-by-field (scalars, the radial/rhythm arrays element-wise, and
     /// the gesture map entry-wise) so one malformed value can't reset the whole cast config — and
     /// never clobbering the file. See [`crate::salvage::SalvageLoad`].
+    #[must_use]
     pub fn load() -> Self {
         <Self as crate::salvage::SalvageLoad>::load()
     }
@@ -250,6 +255,7 @@ impl CastConfig {
     ///     says so.
     ///
     /// Returns (slots, complaints) — complaints are honest status lines, never silent.
+    #[must_use]
     pub fn mode_slots(&self) -> (Vec<ModeSlot>, Vec<String>) {
         let mut slots: Vec<ModeSlot> = Vec::new();
         let mut complaints = Vec::new();
@@ -301,6 +307,7 @@ impl CastConfig {
 
     /// The parsed activation rhythm (an unparseable string degrades to the classic hold —
     /// a config typo must never brick the cast trigger).
+    #[must_use]
     pub fn phrase(&self) -> crate::feel::Phrase {
         crate::feel::Phrase::parse(&self.activation).unwrap_or_else(|_| crate::feel::Phrase::hold())
     }
@@ -343,8 +350,7 @@ impl CastConfig {
             if let Some((name, score, runner_up)) = vault.predict(&q) {
                 let within = score <= vault.config.threshold * (1.0 + self.assist);
                 let clear = runner_up
-                    .map(|ru| ru - score >= 0.25 * score)
-                    .unwrap_or(true);
+                    .is_none_or(|ru| ru - score >= 0.25 * score);
                 if within && clear {
                     let action = self.gestures.get(&name).cloned().unwrap_or_default();
                     return Some(Resolved {
@@ -368,6 +374,7 @@ impl CastConfig {
     /// displacement (ending back at the center is a cancel, never a misfire). A circling
     /// approach, a changed mind, a wandering start all land the wedge the hand MEANT — no
     /// geometric-purity gate demands penmanship.
+    #[must_use]
     pub fn resolve(&self, path: &[C], vault: &Vault) -> Option<Resolved> {
         if path.len() < 3 {
             return None;
@@ -637,7 +644,7 @@ gestures = "nope"
     fn flick(dx: f64, dy: f64) -> Vec<C> {
         // a straight committed flick: ~100 units in a direction
         (0..20)
-            .map(|i| C::new(dx * i as f64 * 5.0, dy * i as f64 * 5.0))
+            .map(|i| C::new(dx * f64::from(i) * 5.0, dy * f64::from(i) * 5.0))
             .collect()
     }
 

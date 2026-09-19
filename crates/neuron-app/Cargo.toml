@@ -94,3 +94,6 @@ proptest = "1"
 # ctor hook in testsupport denies hardware before any test runs, same as neuron-core's own tests.
 neuron = { path = "../neuron-core", features = ["mock-transport"] }
 ctor = "0.2"
+
+[lints]
+workspace = true

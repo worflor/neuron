@@ -206,7 +206,7 @@ fn main() {
             total += took;
             worst = worst.max(took);
         }
-        let mean = total.as_secs_f64() * 1000.0 / n as f64;
+        let mean = total.as_secs_f64() * 1000.0 / f64::from(n);
         println!(
             "  asked {req_ms:>2}ms  ->  mean {mean:>6.2}ms  (over by {:>5.2}ms)   worst {:>6.2}ms",
             mean - req_ms as f64,

@@ -79,7 +79,7 @@ pub fn ui_installed() -> bool {
 }
 
 /// The device registry — delegates to the ONE shared, RELOADABLE app-layer cache
-/// ([`crate::hidwatch::registry`]) rather than a second private OnceLock that would freeze a startup
+/// ([`crate::hidwatch::registry`]) rather than a second private `OnceLock` that would freeze a startup
 /// snapshot while hidwatch's/runtime's reloaded (the reload-mismatch a review caught). Used by
 /// [`endpoint_has_hardware_mute`] on device SELECT (not a hot path); one shared source keeps the
 /// def-based capability check consistent with hidwatch arming after an adoption reload.
@@ -93,7 +93,7 @@ fn registry() -> Option<&'static neuron::registry::Registry> {
 ///   * `hidwatch::hardware_mute_products()` — the EMERGENT capability surface, populated from LIVE
 ///     dialect claiming (e.g. razer-audio's family-wide tap-mute vocabulary arming on the Seiren's
 ///     Consumer-Control pipe) — never from a def.
-///   * a registry def that both declares a MuteState push (`[events]`) AND identifies this endpoint
+///   * a registry def that both declares a `MuteState` push (`[events]`) AND identifies this endpoint
 ///     by the def's `name`. Defs are the PER-DEVICE override layer, so this stays a live, additional
 ///     check alongside the emergent one — a curated def naming a device the dialect surface hasn't
 ///     (yet) armed still counts.
@@ -219,7 +219,7 @@ pub fn publish_mic_state(muted: bool) {
         }
         *base = Some(muted);
     }
-    crate::flight::trace("reconcile", "mic published", muted as u64);
+    crate::flight::trace("reconcile", "mic published", u64::from(muted));
     let Some(weak) = UI.get() else { return };
     let weak = weak.clone();
     let _ = slint::invoke_from_event_loop(move || {
@@ -294,7 +294,7 @@ fn scroll_stage_truth() -> crate::reconcile::Truth<String> {
     crate::reconcile::Truth::Unknown
 }
 
-/// CHUNK D's RECORD step: publish `truth` to the HyperScroll editor field the UI reads
+/// CHUNK D's RECORD step: publish `truth` to the `HyperScroll` editor field the UI reads
 /// (`State.scroll-stages`), replacing the old hardcoded `"tactile/free"` Slint default. `Unknown`
 /// renders the same dash convention as `sniper-button`'s "unset" state, un-appliable (`valid` off,
 /// so the apply key stays disabled until the user supplies a real value) but NOT `error` — unread
@@ -355,13 +355,13 @@ impl TileProfAcc {
     }
     fn flush(&mut self) {
         let secs = self.last_print.elapsed().as_secs_f64().max(1e-6);
-        let n = self.ticks.max(1) as f64;
+        let n = f64::from(self.ticks.max(1));
         let gen_total: f64 = self.gen.values().sum::<f64>() / n;
         eprintln!(
             "PROF: tick_total={:.3}ms tiles={} rate≈{:.1}Hz gen_total={:.3}ms preview_total={:.3}ms upload={:.3}ms",
             self.tick_total_us / n / 1000.0,
             self.gen.len(),
-            self.ticks as f64 / secs,
+            f64::from(self.ticks) / secs,
             gen_total / 1000.0,
             self.prev.values().sum::<f64>() / n / 1000.0,
             self.upload_us / n / 1000.0,
@@ -444,9 +444,7 @@ fn current_action(st: &State) -> (String, String) {
     let idx = st.get_action_choice().max(0) as usize;
     let id = st
         .get_action_choices()
-        .row_data(idx)
-        .map(|c| c.id.to_string())
-        .unwrap_or_else(|| "noop".into());
+        .row_data(idx).map_or_else(|| "noop".into(), |c| c.id.to_string());
     (id, st.get_action_param().to_string())
 }
 
@@ -496,7 +494,7 @@ fn init_action_palette(app: &AppWindow) {
             param_hint: (*hint).into(),
             header: false,
             required: *required,
-            tier: *tier as i32,
+            tier: i32::from(*tier),
         });
     }
     let st = app.global::<State>();
@@ -505,14 +503,13 @@ fn init_action_palette(app: &AppWindow) {
     if st
         .get_action_choices()
         .row_data(st.get_action_choice().max(0) as usize)
-        .map(|c| c.header)
-        .unwrap_or(true)
+        .map_or(true, |c| c.header)
     {
         st.set_action_choice(1); // the first entry under the first header
     }
 }
 
-/// Preset the shared ActionPicker to reflect an existing action — the edit-shows-current contract.
+/// Preset the shared `ActionPicker` to reflect an existing action — the edit-shows-current contract.
 /// An unbound target presets to "nothing (unbind)" with a CLEARED param, so the previous editor's
 /// leftovers can never be committed by accident.
 fn preset_picker(st: &State, action: &neuron::action::Action) {
@@ -583,15 +580,12 @@ fn with_shared(f: impl FnOnce(&SharedRt)) {
 }
 
 /// Parse the current light-color hex into an `Rgb`. Falls back to the LAST-GOOD brush colour
-/// (which on_color_changed maintains) — NEVER a hardcoded accent the user didn't choose.
+/// (which `on_color_changed` maintains) — NEVER a hardcoded accent the user didn't choose.
 fn brush(app: &AppWindow) -> Rgb {
     let st = app.global::<State>();
-    match Rgb::parse(&st.get_light_color()) {
-        Some(c) => c,
-        None => {
-            let b = st.get_brush_color();
-            Rgb::new(b.red(), b.green(), b.blue())
-        }
+    if let Some(c) = Rgb::parse(&st.get_light_color()) { c } else {
+        let b = st.get_brush_color();
+        Rgb::new(b.red(), b.green(), b.blue())
     }
 }
 
@@ -667,7 +661,7 @@ fn render_material_bufs(
 }
 
 /// Upload rendered swatches into the gallery rows IN PLACE (UI thread). Row
-/// writes (not model swaps) keep the cards — TouchAreas, hover — alive.
+/// writes (not model swaps) keep the cards — `TouchAreas`, hover — alive.
 ///
 /// A/B CROSSFADE: each card carries two swatch slots. A fresh frame lands in
 /// whichever slot is HIDDEN, then `material-show-alt` flips once for the
@@ -864,7 +858,7 @@ fn first_line(s: &str) -> String {
     s.lines().next().unwrap_or(s).trim().to_string()
 }
 
-/// A node's KIND tag — the stable string the flat model + the edit-ops key on (matches MacroBlock's
+/// A node's KIND tag — the stable string the flat model + the edit-ops key on (matches `MacroBlock`'s
 /// `kind` field). One mapping so the canvas, the add-defaults, and the flatten never drift.
 fn macro_kind(node: &MacroNode) -> &'static str {
     match node {
@@ -1221,7 +1215,7 @@ fn split_keys(v: &str) -> Vec<String> {
     v.split(['+', ',', ' '])
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(|s| s.to_lowercase())
+        .map(str::to_lowercase)
         .collect()
 }
 
@@ -1244,7 +1238,7 @@ fn edit_node_value(node: &mut MacroNode, v: String) {
         MacroNode::Wait { ms } => *ms = Value::raw(v.trim()),
         MacroNode::Ask { question, .. } => *question = Value::Str { s: v },
         MacroNode::If { cond, .. } | MacroNode::RepeatWhile { cond, .. } => {
-            *cond = Value::raw(v.trim())
+            *cond = Value::raw(v.trim());
         }
         MacroNode::RepeatN { count, .. } => *count = Value::raw(v.trim()),
         // compound flow displays → split on the display separator.
@@ -1283,7 +1277,7 @@ fn edit_node_value(node: &mut MacroNode, v: String) {
 }
 
 /// After ANY tree mutation: regenerate the Python source from the tree (pure Rust codegen, instant),
-/// push it into `macro-source` WITH the dirty-guard set (so the CodeArea's `edited` hook skips the
+/// push it into `macro-source` WITH the dirty-guard set (so the `CodeArea`'s `edited` hook skips the
 /// re-parse), recompute `macro-has-ask`, and re-flatten the tree into `macro-blocks`. The canvas + the
 /// code view both stay current off the one source of truth, synchronously, no Python in the loop.
 fn regenerate_from_tree(st: &State, tree: &[MacroNode]) {
@@ -1381,7 +1375,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
         ADOPT_WATCH_TIMER.with(|t| {
             t.start(
                 slint::TimerMode::Repeated,
-                std::time::Duration::from_millis(1000),
+                std::time::Duration::from_secs(1),
                 move || {
                     // Just a liveness check here — the window handle itself is only needed once
                     // the background scan lands, where the spawn's hop upgrades it fresh.
@@ -1444,7 +1438,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
     // ── Device ───────────────────────────────────────────────────────────
     bind(app, &shared, |app, sh| {
         let w = app.as_weak();
-        let sh = sh.clone();
+        let _sh = sh.clone();
         app.global::<State>().on_refresh_devices(move || {
             if let Some(app) = w.upgrade() {
                 // status first, so a "selected device disconnected — switched" notice from the
@@ -1716,8 +1710,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                             let uses = st
                                 .get_effects()
                                 .row_data(sel as usize)
-                                .map(|e| e.uses_color)
-                                .unwrap_or(false);
+                                .is_some_and(|e| e.uses_color);
                             if uses {
                                 st.invoke_apply_effect(sel);
                             }
@@ -1827,7 +1820,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                         // painting on top / a named client connected-but-losing
                         // (the "my lighting wins" policy). Three honest states,
                         // one of which no last-writer-wins tool can even see.
-                        use crate::host::BoardOwner::*;
+                        use crate::host::BoardOwner::{Yours, Painting, Suppressed};
                         let (painting, suppressed, app) = match crate::host::board_owner(pid, &unit)
                         {
                             Yours => (false, false, String::new()),
@@ -1880,8 +1873,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 // but DRIVE them from the shared quantized clock above, not a reset-on-rebuild anchor.
                 let stale = c
                     .as_ref()
-                    .map(|(r, cr, cc, _)| *r != rev || *cr != rows || *cc != cols)
-                    .unwrap_or(true);
+                    .map_or(true, |(r, cr, cc, _)| *r != rev || *cr != rows || *cc != cols);
                 if stale {
                     // ONLY on a real rebuild (the stack revision or the grid dims changed) do we clone the
                     // stack into fresh generators — the clone deferred from the cheap read above.
@@ -2105,8 +2097,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                         let sel = s.selected_layer;
                         s.light_layers
                             .get(sel)
-                            .map(|l| neuron::pattern::pattern_is_readout(&l.pattern))
-                            .unwrap_or(false)
+                            .is_some_and(|l| neuron::pattern::pattern_is_readout(&l.pattern))
                     };
                     // a READOUT (vitals) layer needs live source data to show anything — kick a prompt,
                     // forced publish so the preview lights at once instead of waiting for the heartbeat.
@@ -2238,11 +2229,11 @@ pub fn install(app: &AppWindow) -> SharedRt {
                                         .filter(|&a| a < p)
                                         .fold(f32::NEG_INFINITY, f32::max);
                                     let t = if right.is_finite() {
-                                        (p + right) / 2.0
+                                        f32::midpoint(p, right)
                                     } else if left.is_finite() {
-                                        (p + left) / 2.0
+                                        f32::midpoint(p, left)
                                     } else if p <= 0.5 {
-                                        (p + 1.0) / 2.0 // a lone stop: open room toward the right end
+                                        f32::midpoint(p, 1.0) // a lone stop: open room toward the right end
                                     } else {
                                         p / 2.0 // …or toward the left when it sits past centre
                                     };
@@ -2322,13 +2313,10 @@ pub fn install(app: &AppWindow) -> SharedRt {
                             })
                         })
                     };
-                    let idx = match hit {
-                        Some(i) => i,
-                        None => {
-                            let mut inserted = 0usize;
-                            edit_active_palette(&app, &sh, |pal| inserted = pal.add_stop(at));
-                            inserted
-                        }
+                    let idx = if let Some(i) = hit { i } else {
+                        let mut inserted = 0usize;
+                        edit_active_palette(&app, &sh, |pal| inserted = pal.add_stop(at));
+                        inserted
                     };
                     app.global::<State>().set_light_sel_stop(idx as i32);
                 }
@@ -2403,7 +2391,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                                 d.spectrum.seq.insert(fr + 1, clone);
                             }
                         }
-                        let len = s.light_layers.get(sel).map(|d| d.spectrum.seq.len()).unwrap_or(1);
+                        let len = s.light_layers.get(sel).map_or(1, |d| d.spectrum.seq.len());
                         s.active_frame = (s.active_frame + 1).min(len.saturating_sub(1));
                         s.layers_rev += 1;
                     }
@@ -2425,7 +2413,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                                 d.spectrum.seq.remove(i);
                             }
                         }
-                        let len = s.light_layers.get(sel).map(|d| d.spectrum.seq.len()).unwrap_or(1);
+                        let len = s.light_layers.get(sel).map_or(1, |d| d.spectrum.seq.len());
                         s.active_frame = s.active_frame.min(len.saturating_sub(1));
                         s.layers_rev += 1;
                     }
@@ -2465,7 +2453,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                     {
                         let mut s = sh.borrow_mut();
                         let sel = s.selected_layer;
-                        let len = s.light_layers.get(sel).map(|d| d.spectrum.seq.len()).unwrap_or(1);
+                        let len = s.light_layers.get(sel).map_or(1, |d| d.spectrum.seq.len());
                         s.active_frame = (idx.max(0) as usize).min(len.saturating_sub(1));
                     }
                     refresh_layers(&app, &sh);
@@ -2709,7 +2697,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                             let bbox = neuron::pattern::Bounds::from_region(&region, rows, cols);
                             s.light_layers[sel].region = region;
                             s.layers_rev += 1;
-                            Some((bbox.rows as i32, bbox.cols as i32, full))
+                            Some((i32::from(bbox.rows), i32::from(bbox.cols), full))
                         }
                     };
                     if let Some((rext, cext, full)) = committed {
@@ -2740,8 +2728,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                         let should = s
                             .light_layers
                             .get(sel)
-                            .map(|d| !d.region.is_empty())
-                            .unwrap_or(false);
+                            .is_some_and(|d| !d.region.is_empty());
                         if should {
                             s.light_layers[sel].region.clear();
                             s.layers_rev += 1;
@@ -2935,67 +2922,64 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 let sh = sh.clone();
                 crate::capture::begin_control(&app, move |app, captured| {
                     let st = app.global::<State>();
-                    match captured {
-                        Some(c) => {
-                            // stash the captured (page,usage,pid) for add-binding, show its name.
-                            CAPTURED_CONTROL.with(|cell| *cell.borrow_mut() = Some(c));
-                            // a friendly, layout-independent control name ("F13", "Button 4",
-                            // "Left Ctrl"), device-scoped when the capture carries a pid — the
-                            // label tells the truth about WHICH device's key this bind owns.
-                            let label = neuron::controls::ControlRef {
+                    if let Some(c) = captured {
+                        // stash the captured (page,usage,pid) for add-binding, show its name.
+                        CAPTURED_CONTROL.with(|cell| *cell.borrow_mut() = Some(c));
+                        // a friendly, layout-independent control name ("F13", "Button 4",
+                        // "Left Ctrl"), device-scoped when the capture carries a pid — the
+                        // label tells the truth about WHICH device's key this bind owns.
+                        let label = neuron::controls::ControlRef {
+                            page: c.page,
+                            usage: c.usage,
+                            pid: c.pid,
+                        }
+                        .label();
+                        st.set_bind_trigger_label(label.into());
+                        st.set_bind_trigger_ready(true);
+                        // DUPLICATE-TRIGGER honesty: if another rule on the SAME target layer
+                        // already claims this control, say so. The live executor RESOLVES + RUNS
+                        // every matching rule (not first-wins), so a second bind replaces nothing
+                        // — both fire. Skipped while EDITING (a rebind would match its own rule).
+                        if st.get_editing_rule() >= 0 {
+                            st.set_dup_trigger_note("".into());
+                        } else {
+                            let trigger = neuron::engine::Trigger::Input {
                                 page: c.page,
                                 usage: c.usage,
                                 pid: c.pid,
-                            }
-                            .label();
-                            st.set_bind_trigger_label(label.into());
-                            st.set_bind_trigger_ready(true);
-                            // DUPLICATE-TRIGGER honesty: if another rule on the SAME target layer
-                            // already claims this control, say so. The live executor RESOLVES + RUNS
-                            // every matching rule (not first-wins), so a second bind replaces nothing
-                            // — both fire. Skipped while EDITING (a rebind would match its own rule).
-                            if st.get_editing_rule() >= 0 {
-                                st.set_dup_trigger_note("".into());
+                            };
+                            let hyper = st.get_bind_hypershift();
+                            let engine = neuron::engine::Engine::from_rules(
+                                sh.borrow().rt.spine_rules(),
+                            );
+                            let existing = if hyper {
+                                engine.layers.values().flatten().find(|r| {
+                                    r.action != neuron::action::Action::Noop
+                                        && neuron::engine::Engine::matches(&r.trigger, &trigger)
+                                })
                             } else {
-                                let trigger = neuron::engine::Trigger::Input {
-                                    page: c.page,
-                                    usage: c.usage,
-                                    pid: c.pid,
-                                };
-                                let hyper = st.get_bind_hypershift();
-                                let engine = neuron::engine::Engine::from_rules(
-                                    sh.borrow().rt.spine_rules(),
-                                );
-                                let existing = if hyper {
-                                    engine.layers.values().flatten().find(|r| {
-                                        r.action != neuron::action::Action::Noop
-                                            && neuron::engine::Engine::matches(&r.trigger, &trigger)
-                                    })
-                                } else {
-                                    engine
-                                        .rules
-                                        .iter()
-                                        .find(|r| neuron::engine::Engine::matches(&r.trigger, &trigger))
-                                };
-                                st.set_dup_trigger_note(
-                                    match existing {
-                                        Some(r) => format!(
-                                            "already wired to {} — saving replaces nothing; both will fire",
-                                            r.action.describe()
-                                        ),
-                                        None => String::new(),
-                                    }
-                                    .into(),
-                                );
-                            }
-                            st.set_status_line(
-                                "control captured — pick an action, then Add".into(),
+                                engine
+                                    .rules
+                                    .iter()
+                                    .find(|r| neuron::engine::Engine::matches(&r.trigger, &trigger))
+                            };
+                            st.set_dup_trigger_note(
+                                match existing {
+                                    Some(r) => format!(
+                                        "already wired to {} — saving replaces nothing; both will fire",
+                                        r.action.describe()
+                                    ),
+                                    None => String::new(),
+                                }
+                                .into(),
                             );
                         }
-                        None => {
-                            st.set_dup_trigger_note("".into());
-                            st.set_status_line("capture cancelled".into());
-                        }
+                        st.set_status_line(
+                            "control captured — pick an action, then Add".into(),
+                        );
+                    } else {
+                        st.set_dup_trigger_note("".into());
+                        st.set_status_line("capture cancelled".into());
                     }
                 });
             }
@@ -3089,7 +3073,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                                 page: *page,
                                 usage: *usage,
                                 pid: *pid,
-                            })
+                            });
                         });
                         neuron::controls::control_label(*page, *usage)
                     }
@@ -3146,12 +3130,9 @@ pub fn install(app: &AppWindow) -> SharedRt {
                         usage: c.usage,
                         pid: c.pid,
                     },
-                    None => match crate::editor::gui_rule_in_tier(n, hyper) {
-                        Some(r) => r.trigger,
-                        None => {
-                            st.set_status_line("that binding is gone — reload and try again".into());
-                            return;
-                        }
+                    None => if let Some(r) = crate::editor::gui_rule_in_tier(n, hyper) { r.trigger } else {
+                        st.set_status_line("that binding is gone — reload and try again".into());
+                        return;
                     },
                 };
                 match crate::editor::edit_gui_rule_in_tier(n, hyper, trigger, action) {
@@ -3397,7 +3378,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
         let sh = sh.clone();
         app.global::<State>().on_set_weave_assist(move |level| {
             if let Some(app) = w.upgrade() {
-                let v = (level as f64).clamp(0.0, 0.6);
+                let v = f64::from(level).clamp(0.0, 0.6);
                 let saved = {
                     let mut s = sh.borrow_mut();
                     s.rt.cast.assist = v;
@@ -3522,20 +3503,17 @@ pub fn install(app: &AppWindow) -> SharedRt {
                                     // process-wide cursor naming a profile that no longer exists, and
                                     // the next live-trigger status post re-asserts it forever.
                                     let loaded_lighting =
-                                        match neuron::profile::Profile::load(&applied.name) {
-                                            Ok(p) => {
-                                                st.set_active_profile(applied.name.clone().into());
-                                                // the profile's binds sidecar is only in scope
-                                                // while it is active — re-read the spine.
-                                                crate::dispatch::request_reload();
-                                                Some(p.lighting)
-                                            }
-                                            Err(_) => {
-                                                neuron::profile::set_active("");
-                                                st.set_active_profile("\u{2014}".into());
-                                                crate::dispatch::request_reload();
-                                                None
-                                            }
+                                        if let Ok(p) = neuron::profile::Profile::load(&applied.name) {
+                                            st.set_active_profile(applied.name.clone().into());
+                                            // the profile's binds sidecar is only in scope
+                                            // while it is active — re-read the spine.
+                                            crate::dispatch::request_reload();
+                                            Some(p.lighting)
+                                        } else {
+                                            neuron::profile::set_active("");
+                                            st.set_active_profile("\u{2014}".into());
+                                            crate::dispatch::request_reload();
+                                            None
                                         };
                                     let profile_exists = loaded_lighting.is_some();
                                     with_shared(|sh| {
@@ -3666,7 +3644,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 let st = app.global::<State>();
                 // a deleted ACTIVE profile must drop the header pill to none.
                 let active = sh.borrow().rt.active_profile.clone();
-                st.set_active_profile(active.clone().into());
+                st.set_active_profile(active.into());
                 // its binds sidecar went with it (Profile::delete owns both files) — re-read.
                 crate::dispatch::request_reload();
                 st.set_status_line(msg.into());
@@ -3721,7 +3699,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 refresh_app_rules(&app, &sh);
                 let st = app.global::<State>();
                 let active = sh.borrow().rt.active_profile.clone();
-                st.set_active_profile(active.clone().into());
+                st.set_active_profile(active.into());
                 st.set_status_line(msg.into());
             }
         });
@@ -5031,7 +5009,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 let msg = crate::prefs::set_host_chroma_paint_strength(v.round() as u8);
                 crate::host::apply_protocol_prefs();
                 let st = app.global::<State>();
-                st.set_host_chroma_strength(crate::prefs::host_chroma_paint_strength() as f32);
+                st.set_host_chroma_strength(f32::from(crate::prefs::host_chroma_paint_strength()));
                 st.set_status_line(msg.into());
             }
         });
@@ -5074,7 +5052,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 let msg = crate::prefs::set_host_openrgb_paint_strength(v.round() as u8);
                 crate::host::apply_protocol_prefs();
                 let st = app.global::<State>();
-                st.set_host_openrgb_strength(crate::prefs::host_openrgb_paint_strength() as f32);
+                st.set_host_openrgb_strength(f32::from(crate::prefs::host_openrgb_paint_strength()));
                 st.set_status_line(msg.into());
             }
         });
@@ -5362,7 +5340,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                                 .into(),
                             ),
                             Err(e) => {
-                                st.set_status_line(format!("activation not saved: {e}").into())
+                                st.set_status_line(format!("activation not saved: {e}").into());
                             }
                         }
                     }
@@ -5862,9 +5840,8 @@ pub fn install(app: &AppWindow) -> SharedRt {
                     .cast
                     .rhythm_actions
                     .iter()
-                    .find(|rb| rb.taps as i32 == taps)
-                    .map(|rb| rb.action.clone())
-                    .unwrap_or(neuron::action::Action::Noop);
+                    .find(|rb| i32::from(rb.taps) == taps)
+                    .map_or(neuron::action::Action::Noop, |rb| rb.action.clone());
                 preset_picker(&st, &cur);
                 // one editor owns the shared picker at a time — close the radial + glyph editors.
                 st.set_editing_sector(-1);
@@ -6032,7 +6009,7 @@ fn init_perf_controls(app: &AppWindow) {
     match crate::editor::sniper_binding() {
         Some((trigger, dpi)) => {
             if dpi != 0 {
-                st.set_sniper_dpi(dpi as f32);
+                st.set_sniper_dpi(f32::from(dpi));
             }
             let label = match &trigger {
                 neuron::engine::Trigger::Input { page, usage, .. } => {
@@ -6076,7 +6053,7 @@ fn seed_perf_async(app: &AppWindow, sh: &SharedRt, resume_lighting: bool) {
     };
     let w = app.as_weak();
     let unit_for_work = unit.clone();
-    let dialect_for_work = dialect.clone();
+    let dialect_for_work = dialect;
     // resume_lighting rides THIS worker's completion on purpose (see the doc comment above) — a
     // spawn refusal or a worker panic must not silently skip it, or a newly-selected board would
     // just stay dark with no error, and the readouts would stay pinned on "…" forever. Wiring this
@@ -6107,7 +6084,7 @@ fn seed_perf_async(app: &AppWindow, sh: &SharedRt, resume_lighting: bool) {
                 match snap.idle_secs {
                     Some(s) => {
                         st.set_idle_readout(format!("{s}s").into());
-                        st.set_idle_secs(s as f32);
+                        st.set_idle_secs(f32::from(s));
                         st.set_idle_secs_text(s.to_string().into());
                     }
                     None => st.set_idle_readout("—".into()),
@@ -6128,19 +6105,19 @@ fn seed_perf_async(app: &AppWindow, sh: &SharedRt, resume_lighting: bool) {
                 // list), and only when it actually indexes inside the seeded stages.
                 if let Some(idx) = snap.dpi_active {
                     if (idx as usize) < snap.dpi_stages.len() {
-                        st.set_dpi_active_stage(idx as i32);
+                        st.set_dpi_active_stage(i32::from(idx));
                     }
                 }
                 sync_stage_nums(&st);
                 if let Some((lift, land)) = snap.lod_async {
                     st.set_lod_async(true);
-                    st.set_lod_lift(lift as i32);
-                    st.set_lod_land(land as i32);
+                    st.set_lod_lift(i32::from(lift));
+                    st.set_lod_land(i32::from(land));
                     st.set_lod_readout(format!("lift {lift} / land {land}").into());
                 } else if let Some(lvl) = snap.lod_level {
                     st.set_lod_async(false);
-                    st.set_lod_level(lvl as i32);
-                    st.set_lod_readout(lod_level_label(lvl as i32).into());
+                    st.set_lod_level(i32::from(lvl));
+                    st.set_lod_readout(lod_level_label(i32::from(lvl)).into());
                 } else {
                     st.set_lod_readout("\u{2014}".into());
                 }
@@ -6204,7 +6181,7 @@ fn maybe_first_light_heal(app: &AppWindow, sh: &SharedRt, pid: u16, unit: &str) 
     }
     let dirty = sh.borrow().rt.synth_dirty_handle();
     let current_tx = def.transaction_id;
-    let dialect = def.dialect.clone();
+    let dialect = def.dialect;
     let unit = unit.to_string();
     let w = app.as_weak();
     // `healed_units` above is a permanent once-per-unit-per-run marker, not a busy latch — nothing
@@ -6276,7 +6253,7 @@ fn parse_dpi_stage_editor(list: &str) -> DpiStageParse {
         .filter(|t| !t.is_empty())
     {
         match tok.parse::<u16>() {
-            Ok(v) if (DPI_MIN..=DPI_MAX).contains(&v) => nums.push(v as i32),
+            Ok(v) if (DPI_MIN..=DPI_MAX).contains(&v) => nums.push(i32::from(v)),
             _ => bad.push(tok.to_string()),
         }
     }
@@ -6335,7 +6312,7 @@ struct ScrollStageParse {
     note: String,
 }
 
-/// The "nothing read off the hardware yet" sentinel the HyperScroll editor carries before a real
+/// The "nothing read off the hardware yet" sentinel the `HyperScroll` editor carries before a real
 /// read lands (mirrored as `State.scroll-stages`'s default in state.slint, guarded by
 /// `state_slint_default_no_longer_hardcodes_the_fake_scroll_stage`). It is a SENTINEL WE WROTE,
 /// never something the user typed — see `parse_scroll_stage_editor`.
@@ -6630,7 +6607,7 @@ fn install_perf_callbacks(app: &AppWindow, shared: &SharedRt) {
                         Ok(()) => {
                             crate::dispatch::request_reload(); // the live worker adopts the sniper rule
                             st.set_sniper_button(name.clone().into());
-                            st.set_sniper_dpi(dpi as f32);
+                            st.set_sniper_dpi(f32::from(dpi));
                             st.set_perf_status(
                                 format!("sniper armed — hold {name} for {dpi} DPI").into(),
                             );
@@ -6738,7 +6715,7 @@ fn refresh_idle_readout(app: &AppWindow, sh: &SharedRt) {
     match sh.borrow().rt.read_idle_secs() {
         Some(s) => {
             st.set_idle_readout(format!("{s}s").into());
-            st.set_idle_secs(s as f32);
+            st.set_idle_secs(f32::from(s));
             st.set_idle_secs_text(s.to_string().into());
             sync_idle_editor(&st);
         }
@@ -6756,10 +6733,10 @@ fn lod_level_label(level: i32) -> &'static str {
     }
 }
 
-/// Whether a Razer product-id takes the EXTENDED HyperPolling (>1000Hz, 0x00/0x40) path. RE finding
-/// (OpenRazer): OpenRazer routes the Naga V2 Pro's stock links (0x00A7 wired / 0x00A8 dongle / 0x00A9
+/// Whether a Razer product-id takes the EXTENDED `HyperPolling` (>1000Hz, 0x00/0x40) path. RE finding
+/// (OpenRazer): `OpenRazer` routes the Naga V2 Pro's stock links (0x00A7 wired / 0x00A8 dongle / 0x00A9
 /// BT) to the LEGACY path, capped at 1000Hz — so 2000–8000Hz cannot work there. Only the separate
-/// HyperPolling Wireless Dongle (PID 0x00B3) drives the extended command on hardware we can vouch for.
+/// `HyperPolling` Wireless Dongle (PID 0x00B3) drives the extended command on hardware we can vouch for.
 /// (Viper-8K-class mice also take it, but their exact PIDs aren't confirmed here — add them once
 /// verified rather than guess.) A PID allowlist (not a registry capability) because the registry's
 /// `SetPolling2` is opcode-presence, not link-mode reach.
@@ -6769,8 +6746,8 @@ fn pid_supports_hyperpoll(pid: u16) -> bool {
 
 /// Whether a Razer keyboard product-id supports SNAP TAP (SOCD) — the MECHANICAL ADVANTAGES gate. A
 /// Synapse-4-era firmware feature, so this is a PID ALLOWLIST (not a registry capability — the
-/// feature has no read-only descriptor flag): BlackWidow V4 Pro (0x0287) / V4 75% (0x02A5) / V4 TKL
-/// (0x028B) and the Huntsman V3 Pro family (0x02A6 / 0x02A7 / 0x02A8). The user's BlackWidow Chroma
+/// feature has no read-only descriptor flag): `BlackWidow` V4 Pro (0x0287) / V4 75% (0x02A5) / V4 TKL
+/// (0x028B) and the Huntsman V3 Pro family (0x02A6 / 0x02A7 / 0x02A8). The user's `BlackWidow` Chroma
 /// V2 (0x0221, 2017) predates the feature → false. Extend as more supporting boards are confirmed.
 fn pid_supports_snap_tap(pid: u16) -> bool {
     matches!(
@@ -6793,8 +6770,7 @@ fn refresh_snap_tap(app: &AppWindow, _sh: &SharedRt) {
         rows.row_data(i).is_some_and(|r| {
             r.kind == "keyboard"
                 && u16::from_str_radix(r.pid.as_str(), 16)
-                    .map(pid_supports_snap_tap)
-                    .unwrap_or(false)
+                    .is_ok_and(pid_supports_snap_tap)
         })
     });
     if !any_capable {
@@ -6811,15 +6787,15 @@ fn refresh_lod_readout(app: &AppWindow, sh: &SharedRt) {
     // ASYMMETRIC first: a Some means the device reports split mode (args[2] == 0x04).
     if let Some((lift, land)) = sh.borrow().rt.lift_off_async() {
         st.set_lod_async(true);
-        st.set_lod_lift(lift as i32);
-        st.set_lod_land(land as i32);
+        st.set_lod_lift(i32::from(lift));
+        st.set_lod_land(i32::from(land));
         st.set_lod_readout(format!("lift {lift} / land {land}").into());
         return;
     }
     // Otherwise SYMMETRIC (or unreadable).
     match sh.borrow().rt.lift_off_distance() {
         Some(lvl) => {
-            let lvl = lvl.min(2) as i32;
+            let lvl = i32::from(lvl.min(2));
             st.set_lod_async(false);
             st.set_lod_level(lvl);
             st.set_lod_readout(lod_level_label(lvl).into());
@@ -7389,7 +7365,7 @@ fn collect_macro_ids(action: &neuron::action::Action, out: &mut Vec<String>) {
     use neuron::action::{Action, ScriptKind};
     match action {
         Action::Script { script } if script.kind == ScriptKind::Python => {
-            out.push(script.id.clone())
+            out.push(script.id.clone());
         }
         Action::Sequence { steps } => {
             for s in steps {
@@ -7434,7 +7410,7 @@ static MACRO_CATALOG_BUILDING: std::sync::atomic::AtomicBool =
 /// summary walked from its OWN nodes (neuron-core's `summarize`), its node count, its declared option
 /// count, and the trigger(s) that fire it. The cheap parts (the file list, option counts, the trigger
 /// cross-ref) run here on the UI thread; the per-macro PARSE the summary needs goes through the warm
-/// sidecar (blocks up to FIRE_BUDGET), so it runs OFF the UI thread and posts the finished model back.
+/// sidecar (blocks up to `FIRE_BUDGET`), so it runs OFF the UI thread and posts the finished model back.
 fn refresh_macro_catalog(app: &AppWindow) {
     use std::sync::atomic::Ordering;
     let macros = neuron::macros::macro_host::scan_macro_dir();
@@ -7594,7 +7570,7 @@ pub fn apply_observation(app: &AppWindow, pid: u16, obs: Observed) {
 
 /// Kick ONE guarded background hardware scan (worker enumerates + reads off-thread, result
 /// hops back to the UI thread and lands through the shared `apply_scanned_devices` tail).
-/// Shared by the ADOPT_WATCH_TIMER tick AND the stale-result re-kick below — one spawn shape,
+/// Shared by the `ADOPT_WATCH_TIMER` tick AND the stale-result re-kick below — one spawn shape,
 /// so the two callers can't drift. No-op if a scan is already in flight (the one-slot guard).
 ///
 /// SLOT LIFETIME = scan lifetime INCLUDING the UI-thread application (review finding,
@@ -7682,7 +7658,7 @@ pub fn refresh_devices(app: &AppWindow, sh: &SharedRt) {
 
 /// The shared row-building + selection-restore tail of a device scan: everything AFTER the rows
 /// are known. Driven synchronously by [`refresh_devices`] (which scans on the calling thread) and
-/// asynchronously by the ADOPT_WATCH_TIMER (whose worker thread computed the rows off-thread and
+/// asynchronously by the `ADOPT_WATCH_TIMER` (whose worker thread computed the rows off-thread and
 /// hopped them back — the UI-thread-stall fix; see the timer install). Pure UI-state application:
 /// no enumeration, no device opens.
 fn apply_scanned_devices(
@@ -8016,11 +7992,11 @@ pub fn refresh_pockets_if_changed(app: &AppWindow) {
     thread_local! { static LAST: std::cell::Cell<u64> = const { std::cell::Cell::new(u64::MAX) }; }
     let g = neuron::pocket::generation();
     let changed = LAST.with(|l| {
-        if l.get() != g {
+        if l.get() == g {
+            false
+        } else {
             l.set(g);
             true
-        } else {
-            false
         }
     });
     if changed {
@@ -8028,7 +8004,7 @@ pub fn refresh_pockets_if_changed(app: &AppWindow) {
     }
 }
 
-/// Map a Trigger to its short kind tag (for the rule list's left mark). Mirrors runtime::trigger_kind.
+/// Map a Trigger to its short kind tag (for the rule list's left mark). Mirrors `runtime::trigger_kind`.
 fn trigger_kind_str(t: &neuron::engine::Trigger) -> &'static str {
     use neuron::engine::Trigger;
     match t {
@@ -8049,8 +8025,7 @@ fn profile_bind_count(name: &str) -> i32 {
     std::fs::read_to_string(path)
         .ok()
         .and_then(|s| toml::from_str::<neuron::engine::RuleDoc>(&s).ok())
-        .map(|d| d.rules.len() as i32)
-        .unwrap_or(0)
+        .map_or(0, |d| d.rules.len() as i32)
 }
 
 pub fn refresh_profiles(app: &AppWindow, sh: &SharedRt) {
@@ -8061,14 +8036,14 @@ pub fn refresh_profiles(app: &AppWindow, sh: &SharedRt) {
             .iter()
             .map(|p| {
                 // the card's readout strip: real captured values, not one prose summary string.
-                let dpi = if !p.dpi_stages.is_empty() {
+                let dpi = if p.dpi_stages.is_empty() {
+                    p.dpi.map(|d| d.to_string()).unwrap_or_default()
+                } else {
                     p.dpi_stages
                         .iter()
                         .map(u16::to_string)
                         .collect::<Vec<_>>()
                         .join("/")
-                } else {
-                    p.dpi.map(|d| d.to_string()).unwrap_or_default()
                 };
                 ProfileRow {
                     name: p.name.clone().into(),
@@ -8136,8 +8111,7 @@ pub fn refresh_profiles(app: &AppWindow, sh: &SharedRt) {
         .iter()
         .skip(1)
         .position(|n| n.as_str() == default_name)
-        .map(|i| i as i32 + 1)
-        .unwrap_or(0);
+        .map_or(0, |i| i as i32 + 1);
     let st = app.global::<State>();
     st.set_default_profile(default_name.into());
     st.set_fallback_options(ModelRc::new(VecModel::from(fallback)));
@@ -8154,7 +8128,7 @@ pub fn refresh_profiles(app: &AppWindow, sh: &SharedRt) {
 /// The bare app name for a save-name suggestion: the focused executable's filename, minus ".exe"
 /// and ONLY the Unreal packaging suffix ("…-Win64-Shipping" → peel the config tag then the platform
 /// tag as EXACT suffixes). NEVER a general hyphen/underscore cut — real names carry those
-/// ("Counter-Strike", "Apex_Legends" must survive whole, or zero-typing capture mis-names them).
+/// ("Counter-Strike", "`Apex_Legends`" must survive whole, or zero-typing capture mis-names them).
 fn app_stem(focused: &str) -> &str {
     let base = focused
         .rsplit(['\\', '/'])
@@ -8199,10 +8173,10 @@ pub fn refresh_profile_suggestion(app: &AppWindow, focused: &str) {
         // 2. a value descriptor from what's live right now.
         let dpi = st.get_dpi() as i32;
         let eff = st.get_light_effect().to_string();
-        if !eff.is_empty() {
-            format!("{dpi} {eff}")
-        } else {
+        if eff.is_empty() {
             format!("{dpi} dpi")
+        } else {
+            format!("{dpi} {eff}")
         }
     };
     // 3. de-collide: "valorant", "valorant 2", ...
@@ -8280,7 +8254,7 @@ pub fn refresh_rhythms(app: &AppWindow, sh: &SharedRt) {
                 .find(|rb| rb.taps == taps && rb.action != neuron::action::Action::Noop)
                 .map(|rb| rb.action.describe());
             RhythmBindRow {
-                taps: taps as i32,
+                taps: i32::from(taps),
                 label: rhythm_symbols(taps).into(),
                 desc: action.clone().unwrap_or_default().into(),
                 bound: action.is_some(),
@@ -8298,7 +8272,7 @@ pub fn refresh_gestures(app: &AppWindow, sh: &SharedRt) {
             .templates
             .iter()
             .map(|t| {
-                let action = s.rt.cast.gestures.get(&t.name).map(|a| a.describe());
+                let action = s.rt.cast.gestures.get(&t.name).map(neuron::action::Action::describe);
                 GlyphChip {
                     name: t.name.clone().into(),
                     action: action.clone().unwrap_or_default().into(),
@@ -8326,7 +8300,7 @@ pub fn refresh_radial(app: &AppWindow, sh: &SharedRt) {
             let label = neuron::radial::compass(i, n);
             let action = set
                 .get(i)
-                .map(|a| a.describe())
+                .map(neuron::action::Action::describe)
                 .unwrap_or_else(|| "—".into());
             RadialSector {
                 label: label.into(),
@@ -8463,7 +8437,7 @@ fn save_lighting(sh: &SharedRt) {
 /// regardless of how the app later exits; and once after the event loop returns (`main`) so a tray-quit
 /// can't drop a still-debounced knob edit. Must run on the UI thread (the snapshot is thread-local).
 pub fn flush_lighting_save() {
-    LIGHT_SAVE_TIMER.with(|t| t.stop());
+    LIGHT_SAVE_TIMER.with(slint::Timer::stop);
     let pending = LIGHT_PENDING.with(|p| p.borrow_mut().take());
     if let Some((pid, fps, layers)) = pending {
         if let Err(e) = crate::prefs::set_device_light(
@@ -8671,7 +8645,7 @@ fn schedule_lighting_apply(app: &AppWindow, sh: &SharedRt) {
     if !LIGHTING_READY.load(std::sync::atomic::Ordering::Acquire) {
         return;
     }
-    if SUPPRESS_LIGHT_APPLY.with(|s| s.get()) {
+    if SUPPRESS_LIGHT_APPLY.with(std::cell::Cell::get) {
         return;
     }
     if app.global::<State>().get_writes_paused() {
@@ -8726,7 +8700,7 @@ pub fn restore_lighting(app: &AppWindow, sh: &SharedRt) {
 /// every LED, so anything beneath it is occluded dead weight — the push therefore COLLAPSES the stack
 /// to the single layer it now IS. What you painted becomes the lighting, whole and unified: no ghost
 /// effect riding invisibly underneath. The caller follows with `refresh_layers`, whose AUTO-APPLY streams
-/// this custom layer to the board as a StaticFrame — so the commit IS the paint reaching the device, with
+/// this custom layer to the board as a `StaticFrame` — so the commit IS the paint reaching the device, with
 /// no separate one-shot write (the old `rt.push_frame` path this used to ride alongside is gone).
 fn commit_custom_layer(sh: &SharedRt, frame: &[Rgb]) {
     let cells: Vec<[u8; 3]> = frame.iter().map(|c| [c.r, c.g, c.b]).collect();
@@ -9095,8 +9069,7 @@ fn render_light_tiles(app: &AppWindow, sh: &SharedRt, t: f32) {
         .light_layers
         .iter()
         .find(|d| d.pattern == "meter")
-        .map(|d| (d.params.f32("source", 0.0), d.params.f32("focus", 0.0)))
-        .unwrap_or((0.0, 0.0));
+        .map_or((0.0, 0.0), |d| (d.params.f32("source", 0.0), d.params.f32("focus", 0.0)));
     // cache one COMPOSITOR per effect across ticks so stateful patterns (heat/sparkle/streak — and
     // the audio meter's per-instance level ballistics) animate; keyed by slug. Rebuilt only when
     // the grid dims change.
@@ -9311,7 +9284,7 @@ fn params_for(def: &neuron::pattern::LayerDef) -> Vec<EffectParam> {
                     fmin: 0.0,
                     fmax: 0.0,
                     options: ModelRc::new(VecModel::from(opts)),
-                    ival: def.params.u8(p.key, default) as i32,
+                    ival: i32::from(def.params.u8(p.key, default)),
                     hex: "".into(),
                     col: slint::Color::default(),
                     bval: false,
@@ -9349,8 +9322,7 @@ fn tile_slug_for_layer(def: &neuron::pattern::LayerDef) -> &'static str {
         neuron::pattern::presets()
             .into_iter()
             .find(|p| p.pattern == def.pattern)
-            .map(|p| p.slug)
-            .unwrap_or("static")
+            .map_or("static", |p| p.slug)
     })
 }
 
@@ -9388,10 +9360,10 @@ fn project_placement(app: &AppWindow, region: &[u32], rows: u8, cols: u8) {
     let b = neuron::pattern::Bounds::from_region(region, rows, cols);
     st.set_light_layer_placed(true);
     st.set_light_place_label(format!("{}×{} block", b.rows, b.cols).into());
-    st.set_light_place_r0(b.row0 as i32);
-    st.set_light_place_c0(b.col0 as i32);
-    st.set_light_place_r1(b.row0 as i32 + b.rows as i32 - 1);
-    st.set_light_place_c1(b.col0 as i32 + b.cols as i32 - 1);
+    st.set_light_place_r0(i32::from(b.row0));
+    st.set_light_place_c0(i32::from(b.col0));
+    st.set_light_place_r1(i32::from(b.row0) + i32::from(b.rows) - 1);
+    st.set_light_place_c1(i32::from(b.col0) + i32::from(b.cols) - 1);
 }
 
 /// Project the layer stack into the unified surface: the active tile slug (the selected layer), the
@@ -9578,8 +9550,8 @@ pub fn init_grid(app: &AppWindow, sh: &SharedRt) {
     let n = rows as usize * cols as usize;
     let px: Vec<slint::Color> = vec![GRID_OFF; n];
     let st = app.global::<State>();
-    st.set_grid_rows(rows as i32);
-    st.set_grid_cols(cols as i32);
+    st.set_grid_rows(i32::from(rows));
+    st.set_grid_cols(i32::from(cols));
     st.set_grid_kind(kind.into());
     st.set_grid_px(ModelRc::new(VecModel::from(px)));
     // seed the streamed-effect fps from the selected device's protocol default (30 for both — the
@@ -9624,13 +9596,13 @@ fn phrase_symbols(pattern: &str) -> String {
 /// and the engine's own tap count for that phrase). `weave-taps` is derived the SAME way the
 /// engine derives it in `CastConfig::mode_slots` (`phrase().taps_then_hold().unwrap_or(0)`) so a
 /// non-hold-terminated phrase (e.g. "tap tap") reports 0, exactly like the engine — never the
-/// SplitToggle's preset INDEX, which only coincidentally lines up for presets 0/1/2.
+/// `SplitToggle`'s preset INDEX, which only coincidentally lines up for presets 0/1/2.
 fn sync_activation_view(st: &State, pattern: &str) {
     st.set_activation_pattern(pattern.into());
     st.set_activation_display(phrase_symbols(pattern).into());
     let phrase =
         neuron::feel::Phrase::parse(pattern).unwrap_or_else(|_| neuron::feel::Phrase::hold());
-    st.set_weave_taps(phrase.taps_then_hold().unwrap_or(0) as i32);
+    st.set_weave_taps(i32::from(phrase.taps_then_hold().unwrap_or(0)));
 }
 
 /// Set true to ABORT an in-flight weave capture (glyph recorder or radial preview) — the capture
@@ -9972,7 +9944,7 @@ fn app_window_focused() -> bool {
             return false;
         }
         let mut pid: u32 = 0;
-        GetWindowThreadProcessId(hwnd, &mut pid);
+        GetWindowThreadProcessId(hwnd, &raw mut pid);
         pid == GetCurrentProcessId()
     }
 }
@@ -10068,9 +10040,7 @@ fn record_rich_stroke(app: &AppWindow, sh: &SharedRt) {
                 match saved {
                     Some(Ok((json, _gwyph, n))) => {
                         let name = json
-                            .file_name()
-                            .map(|s| s.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| "stroke.json".into());
+                            .file_name().map_or_else(|| "stroke.json".into(), |s| s.to_string_lossy().into_owned());
                         st.set_gesture_status(
                             format!("saved strokes/{name} ({n} pts) + .gwyph · click to reveal").into(),
                         );
@@ -10150,18 +10120,15 @@ fn preview_radial(app: &AppWindow, sh: &SharedRt) {
             if let Some(app) = w.upgrade() {
                 let st = app.global::<State>();
                 // (capturing-gesture is cleared by run_guarded's RAII guard on worker exit)
-                match pick {
-                    Some(s) => {
-                        st.set_radial_preview_sector(s as i32);
-                        let name = neuron::radial::compass(s, sectors);
-                        st.set_radial_status(format!("flick → wedge {s} ({name})").into());
-                    }
-                    None => {
-                        st.set_radial_preview_sector(-1);
-                        st.set_radial_status(
-                            "flick too short — move further from center, then release".into(),
-                        );
-                    }
+                if let Some(s) = pick {
+                    st.set_radial_preview_sector(s as i32);
+                    let name = neuron::radial::compass(s, sectors);
+                    st.set_radial_status(format!("flick → wedge {s} ({name})").into());
+                } else {
+                    st.set_radial_preview_sector(-1);
+                    st.set_radial_status(
+                        "flick too short — move further from center, then release".into(),
+                    );
                 }
             }
         });
@@ -10296,10 +10263,10 @@ pub fn refresh_host_status(app: &AppWindow) {
     st.set_host_openrgb(crate::prefs::host_openrgb());
     st.set_host_obs(crate::prefs::host_obs());
     st.set_host_chroma_mode(crate::prefs::host_chroma_paint_mode_index());
-    st.set_host_chroma_strength(crate::prefs::host_chroma_paint_strength() as f32);
+    st.set_host_chroma_strength(f32::from(crate::prefs::host_chroma_paint_strength()));
     st.set_host_chroma_fade(crate::prefs::host_chroma_paint_fade_ms() as f32);
     st.set_host_openrgb_mode(crate::prefs::host_openrgb_paint_mode_index());
-    st.set_host_openrgb_strength(crate::prefs::host_openrgb_paint_strength() as f32);
+    st.set_host_openrgb_strength(f32::from(crate::prefs::host_openrgb_paint_strength()));
     st.set_host_openrgb_fade(crate::prefs::host_openrgb_paint_fade_ms() as f32);
     st.set_host_base_always_wins(crate::prefs::host_base_always_wins());
     refresh_host_paint_devices(app);

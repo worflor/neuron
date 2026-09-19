@@ -2,40 +2,40 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
 
-//! OpenRGB SDK protocol adapter (server side) — the proving ground.
+//! `OpenRGB` SDK protocol adapter (server side) — the proving ground.
 //!
-//! Implements the OpenRGB network protocol (TCP 6742) as a PURE per-connection
+//! Implements the `OpenRGB` network protocol (TCP 6742) as a PURE per-connection
 //! state machine: [`OrgbConn::feed`] takes raw bytes in and returns reply bytes
 //! out; kernel effects go through `&mut dyn HostApi`; time is injected. The
 //! socket pump lives in the process shell and stays dumb — which is what makes
 //! captured client traffic replayable in unit tests.
 //!
-//! Being an OpenRGB *server* means Home Assistant's official OpenRGB
+//! Being an `OpenRGB` *server* means Home Assistant's official `OpenRGB`
 //! integration, openrgb-python, and every community effect script can drive
 //! neuron's devices with zero neuron-specific code: the ecosystem plug-in
 //! path in executable form.
 //!
-//! Wire format verified byte-for-byte against the OpenRGB sources
-//! (NetworkProtocol.h/.cpp, RGBController.h/.cpp GetDeviceDescription /
-//! ReadDeviceDescription, NetworkServer.cpp handlers) and cross-checked
+//! Wire format verified byte-for-byte against the `OpenRGB` sources
+//! (NetworkProtocol.h/.cpp, RGBController.h/.cpp `GetDeviceDescription` /
+//! `ReadDeviceDescription`, NetworkServer.cpp handlers) and cross-checked
 //! against Documentation/OpenRGBSDK.md and the openrgb-python client — see
 //! the R&D session's protocol-research report. Key facts encoded here:
 //!
-//! - 16-byte header: `"ORGB"` magic, u32 dev_idx, u32 pkt_id, u32 pkt_size;
+//! - 16-byte header: `"ORGB"` magic, u32 `dev_idx`, u32 `pkt_id`, u32 `pkt_size`;
 //!   native byte order in the reference impl == little-endian in practice.
 //! - Strings: u16 length INCLUDING the NUL terminator, bytes end with `\0`.
-//! - RGBColor on the wire: bytes `[R, G, B, 0x00]` (`ToRGBColor` packs
+//! - `RGBColor` on the wire: bytes `[R, G, B, 0x00]` (`ToRGBColor` packs
 //!   `0x00BBGGRR` and it's memcpy'd LE).
 //! - Controller-data fields are version-gated: vendor(v1), mode
 //!   brightness(v3), zone segments(v4), zone flags + LED alt names +
 //!   controller flags(v5). We support v5 and serialize at whatever version
-//!   the client asks for in each REQUEST_CONTROLLER_DATA payload.
+//!   the client asks for in each `REQUEST_CONTROLLER_DATA` payload.
 //! - A protocol-0 server sends NO reply to id 40; we're v5, so we always
 //!   reply with our version (the reference server replies unconditionally
 //!   with its own).
 //!
-//! OWNERSHIP MODEL: an OpenRGB connection is a session. Its paint claims are
-//! `LeaseSpec::Pinned` — the OpenRGB protocol has no heartbeat, and a client
+//! OWNERSHIP MODEL: an `OpenRGB` connection is a session. Its paint claims are
+//! `LeaseSpec::Pinned` — the `OpenRGB` protocol has no heartbeat, and a client
 //! that sets a static color rightly expects it to stay while it's connected —
 //! and the pump MUST call [`OrgbConn::disconnected`] when the socket drops,
 //! which releases the whole footprint. After disconnect the arbiter falls
@@ -72,7 +72,7 @@ pub mod ids {
     pub const SETCUSTOMMODE: u32 = 1100;
 }
 
-/// OpenRGB `device_type` enum values (RGBController.h).
+/// `OpenRGB` `device_type` enum values (RGBController.h).
 fn device_type(kind: SurfaceKind) -> i32 {
     match kind {
         SurfaceKind::Keyboard => 5,
@@ -84,8 +84,9 @@ fn device_type(kind: SurfaceKind) -> i32 {
     }
 }
 
-/// Frame an OpenRGB packet (used for replies here, and by the socket pump,
+/// Frame an `OpenRGB` packet (used for replies here, and by the socket pump,
 /// integration tests, and the future client mode).
+#[must_use]
 pub fn packet(dev_idx: u32, pkt_id: u32, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(16 + payload.len());
     out.extend_from_slice(MAGIC);
@@ -125,7 +126,7 @@ impl W {
     fn i32(&mut self, v: i32) {
         self.0.extend_from_slice(&v.to_le_bytes());
     }
-    /// OpenRGB string: u16 length incl. NUL, then bytes, then NUL.
+    /// `OpenRGB` string: u16 length incl. NUL, then bytes, then NUL.
     fn str(&mut self, s: &str) {
         self.u16((s.len() + 1) as u16);
         self.0.extend_from_slice(s.as_bytes());
@@ -136,9 +137,9 @@ impl W {
     }
 }
 
-/// Serialize one surface as an OpenRGB controller-data block at `ver`,
+/// Serialize one surface as an `OpenRGB` controller-data block at `ver`,
 /// with `colors` as the current per-LED state (the kernel's resolved truth —
-/// an OpenRGB client reading device state sees what is actually painted).
+/// an `OpenRGB` client reading device state sees what is actually painted).
 fn serialize_controller(info: &SurfaceInfo, colors: &[Rgb], ver: u32) -> Vec<u8> {
     let mut w = W::new();
     w.i32(device_type(info.kind));
@@ -178,27 +179,24 @@ fn serialize_controller(info: &SurfaceInfo, colors: &[Rgb], ver: u32) -> Vec<u8>
     // the surface is a grid, LINEAR (1) otherwise.
     w.u16(1); // num_zones
     w.str("Main");
-    match info.grid {
-        Some(g) => {
-            w.i32(2); // ZONE_TYPE_MATRIX
-            w.u32(info.leds as u32);
-            w.u32(info.leds as u32);
-            w.u32(info.leds as u32);
-            // matrix_len = 2*u32 (h,w) + h*w*u32 map
-            w.u16((8 + 4 * g.rows * g.cols) as u16);
-            w.u32(g.rows as u32);
-            w.u32(g.cols as u32);
-            for i in 0..(g.rows * g.cols) {
-                w.u32(i as u32); // identity: cell (r,c) = LED r*cols+c
-            }
+    if let Some(g) = info.grid {
+        w.i32(2); // ZONE_TYPE_MATRIX
+        w.u32(info.leds as u32);
+        w.u32(info.leds as u32);
+        w.u32(info.leds as u32);
+        // matrix_len = 2*u32 (h,w) + h*w*u32 map
+        w.u16((8 + 4 * g.rows * g.cols) as u16);
+        w.u32(g.rows as u32);
+        w.u32(g.cols as u32);
+        for i in 0..(g.rows * g.cols) {
+            w.u32(i as u32); // identity: cell (r,c) = LED r*cols+c
         }
-        None => {
-            w.i32(1); // ZONE_TYPE_LINEAR
-            w.u32(info.leds as u32);
-            w.u32(info.leds as u32);
-            w.u32(info.leds as u32);
-            w.u16(0); // no matrix
-        }
+    } else {
+        w.i32(1); // ZONE_TYPE_LINEAR
+        w.u32(info.leds as u32);
+        w.u32(info.leds as u32);
+        w.u32(info.leds as u32);
+        w.u16(0); // no matrix
     }
     if ver >= 4 {
         w.u16(0); // num_segments
@@ -240,7 +238,7 @@ struct Shadow {
 
 impl Shadow {
     fn snapshot(&self) -> Vec<Option<Rgb>> {
-        self.cells.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.cells.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
     }
 }
 
@@ -253,8 +251,8 @@ pub struct OrgbConn {
     /// a client that never negotiates is treated as protocol 0).
     pub client_version: u32,
     shadows: HashMap<u32, Shadow>,
-    /// The OpenRGB family's paint policy (blend, strength, fade, device scope):
-    /// every claim rides through a [`PolicyLayer`] reading it, so OpenRGB now
+    /// The `OpenRGB` family's paint policy (blend, strength, fade, device scope):
+    /// every claim rides through a [`PolicyLayer`] reading it, so `OpenRGB` now
     /// honours the same user settings the Chroma faces do.
     policy: Arc<PaintPolicy>,
     /// The surface list (name, led count) as of the last [`check_hotplug`]
@@ -288,16 +286,13 @@ impl OrgbConn {
         loop {
             // Resync to magic if needed.
             if self.buf.len() >= 4 && &self.buf[..4] != MAGIC {
-                match self.buf.windows(4).position(|w| w == MAGIC) {
-                    Some(pos) => {
-                        self.buf.drain(..pos);
-                    }
-                    None => {
-                        // Keep the last 3 bytes — they may be a magic prefix.
-                        let keep = self.buf.len().saturating_sub(3);
-                        self.buf.drain(..keep);
-                        break;
-                    }
+                if let Some(pos) = self.buf.windows(4).position(|w| w == MAGIC) {
+                    self.buf.drain(..pos);
+                } else {
+                    // Keep the last 3 bytes — they may be a magic prefix.
+                    let keep = self.buf.len().saturating_sub(3);
+                    self.buf.drain(..keep);
+                    break;
                 }
             }
             if self.buf.len() < 16 {
@@ -323,18 +318,20 @@ impl OrgbConn {
 
     /// This connection's kernel-issued owner id — how the host's status readout
     /// attributes arbiter claims to THIS client, exactly.
+    #[must_use]
     pub fn owner(&self) -> SourceId {
         self.owner
     }
 
-    /// The name the client announced via SET_CLIENT_NAME ("" until it does).
+    /// The name the client announced via `SET_CLIENT_NAME` ("" until it does).
+    #[must_use]
     pub fn client_name(&self) -> &str {
         &self.client_name
     }
 
     /// The socket dropped. Releases this connection's entire paint footprint —
     /// the arbiter falls back to whatever is underneath. The pump MUST call
-    /// this; it is the OpenRGB equivalent of the Chroma heartbeat lapse.
+    /// this; it is the `OpenRGB` equivalent of the Chroma heartbeat lapse.
     pub fn disconnected(&mut self, host: &mut dyn HostApi) {
         host.release_owner(self.owner);
         self.shadows.clear();
@@ -349,7 +346,7 @@ impl OrgbConn {
     /// active client recovers on its next `paint` (set-or-claim), but a SILENT
     /// one — a config tool that set a colour once and idled — would stay
     /// "connected but dark" indefinitely. The pump calls this each idle tick:
-    /// any shadowed layer whose lease has vanished (a PINNED OpenRGB claim only
+    /// any shadowed layer whose lease has vanished (a PINNED `OpenRGB` claim only
     /// disappears on a sweep, i.e. a rebirth) is re-claimed from its retained
     /// cells, and the client label is re-applied (the reborn kernel's labels map
     /// is empty). A no-op when nothing is painted or every layer is still alive.
@@ -398,8 +395,8 @@ impl OrgbConn {
         }
     }
 
-    /// Idle-tick hotplug check: the OpenRGB protocol has the server PUSH
-    /// DEVICE_LIST_UPDATED (id 100, zero-length payload) whenever the device
+    /// Idle-tick hotplug check: the `OpenRGB` protocol has the server PUSH
+    /// `DEVICE_LIST_UPDATED` (id 100, zero-length payload) whenever the device
     /// list changes, so a listening client (Home Assistant, an effect script)
     /// knows to re-request controller data instead of polling. We have no
     /// event to hang this on, so the pump calls this once per idle tick
@@ -408,12 +405,12 @@ impl OrgbConn {
     /// seen last tick and returns the packet exactly when it changed.
     ///
     /// The baseline is normally seeded when the client enumerates the device
-    /// list (REQUEST_CONTROLLER_COUNT), so a hotplug after enumeration is caught
+    /// list (`REQUEST_CONTROLLER_COUNT`), so a hotplug after enumeration is caught
     /// on the next tick. If this runs before any enumeration (baseline still
     /// unset), the first call only seeds and never sends — a client that hasn't
     /// read the list yet has nothing stale to invalidate. Not version-gated:
     /// the packet carries no version-dependent payload (it is a bare
-    /// notification, unlike REQUEST_CONTROLLER_DATA's version-serialized
+    /// notification, unlike `REQUEST_CONTROLLER_DATA`'s version-serialized
     /// block above), and the reference server pushes it to every connected
     /// client regardless of what protocol version that client negotiated.
     pub fn check_hotplug(&mut self, host: &mut dyn HostApi) -> Vec<u8> {
@@ -594,7 +591,7 @@ impl OrgbConn {
             // shared buffer (cells moved, no clone). Only a swept lease falls through
             // to a re-claim, so we never write into a buffer we're about to abandon.
             if host.refresh(layer, now) {
-                *shadow.cells.lock().unwrap_or_else(|e| e.into_inner()) = cells;
+                *shadow.cells.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = cells;
                 return;
             }
             // Lease was swept (a kernel rebirth): drop the stale shadow, re-claim.

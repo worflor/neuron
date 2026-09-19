@@ -12,16 +12,16 @@
 //!   [DIM: 4B LE]
 //!   [PAIRS: 4B LE]
 //!   [ALPHA: 4B LE f32]
-//!   [TOTAL_ABSORBED: 4B LE]
-//!   [NEXT_WELL_ID: 4B LE]
-//!   [NAME_LEN: 2B LE] [NAME: utf8]
-//!   [REF_PAIRING_PRESENT: 1B] [if present: DIM × 4B LE i32]
-//!   [N_WELLS: 4B LE]
+//!   [`TOTAL_ABSORBED`: 4B LE]
+//!   [`NEXT_WELL_ID`: 4B LE]
+//!   [`NAME_LEN`: 2B LE] [NAME: utf8]
+//!   [`REF_PAIRING_PRESENT`: 1B] [if present: DIM × 4B LE i32]
+//!   [`N_WELLS`: 4B LE]
 //!   for each well:
-//!     [WELL_NAME_LEN: 2B LE] [WELL_NAME: utf8]
+//!     [`WELL_NAME_LEN`: 2B LE] [`WELL_NAME`: utf8]
 //!     [COUNT: 4B LE]
-//!     [SUM_K: PAIRS × 16B (re:f64 + im:f64)]
-//!   [N_DREAM: 4B LE]
+//!     [`SUM_K`: PAIRS × 16B (re:f64 + im:f64)]
+//!   [`N_DREAM`: 4B LE]
 //!   for each dream entry:
 //!     [K: PAIRS × 16B] [G: PAIRS × 16B] [S: PAIRS × 4B f32]
 
@@ -32,6 +32,7 @@ const MAGIC: [u8; 4] = *b"ENBR";
 const VERSION: u8 = 1;
 
 /// Serialize a Brain to bytes.
+#[must_use]
 pub fn save(brain: &Brain) -> Vec<u8> {
     let p = brain.pairs;
     let mut buf = Vec::with_capacity(64 * 1024);
@@ -98,6 +99,7 @@ pub fn save(brain: &Brain) -> Vec<u8> {
 }
 
 /// Deserialize a Brain from bytes.
+#[must_use]
 pub fn load(data: &[u8]) -> Option<Brain> {
     if data.len() < 5 || data[..4] != MAGIC {
         return None;
@@ -276,8 +278,8 @@ mod tests {
 
         for i in 0..5 {
             brain.dream.push(DreamEntry {
-                k: vec![Complex64::new(i as f64 * 0.1, 0.0); p],
-                g: vec![Complex64::new(0.0, i as f64 * 0.2); p],
+                k: vec![Complex64::new(f64::from(i) * 0.1, 0.0); p],
+                g: vec![Complex64::new(0.0, f64::from(i) * 0.2); p],
                 s: vec![i as f32 * 0.5; p],
             });
         }
@@ -297,7 +299,7 @@ mod tests {
         // Absorb a few trajectories
         for i in 0..10 {
             let traj: Vec<f32> = (0..50 * 8)
-                .map(|j| ((j as f64 + i as f64 * 100.0) * 0.1).sin() as f32)
+                .map(|j| ((f64::from(j) + f64::from(i) * 100.0) * 0.1).sin() as f32)
                 .collect();
             brain.fast_absorb(&traj, 50, Some("domain_a"));
         }

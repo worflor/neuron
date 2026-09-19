@@ -151,13 +151,11 @@ fn main() {
                 .open(flight::crash_log_path())
             {
                 let loc = info
-                    .location()
-                    .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
-                    .unwrap_or_else(|| "?".into());
+                    .location().map_or_else(|| "?".into(), |l| format!("{}:{}:{}", l.file(), l.line(), l.column()));
                 let msg = info
                     .payload()
                     .downcast_ref::<&str>()
-                    .map(|s| s.to_string())
+                    .map(std::string::ToString::to_string)
                     .or_else(|| info.payload().downcast_ref::<String>().cloned())
                     .unwrap_or_else(|| "<non-string panic>".into());
                 let _ = writeln!(
@@ -260,7 +258,7 @@ fn main() {
         let _ = SetProcessInformation(
             GetCurrentProcess(),
             ProcessPowerThrottling,
-            &state as *const _ as *const core::ffi::c_void,
+            &raw const state as *const core::ffi::c_void,
             std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
         );
     }
@@ -655,7 +653,17 @@ fn main() {
                 if status_due {
                     let text = st.get_status_line().to_string();
                     let mut seen = status_seen.borrow_mut();
-                    if text != seen.0 {
+                    if text == seen.0 {
+                        let age = seen.1.elapsed();
+                        if age > Duration::from_secs(30) && text != "ready" {
+                            st.set_status_line("ready".into());
+                            st.set_status_kind("info".into());
+                            st.set_status_stale(true);
+                            *seen = ("ready".into(), Instant::now());
+                        } else if age > Duration::from_secs(8) && !st.get_status_stale() {
+                            st.set_status_stale(true);
+                        }
+                    } else {
                         *seen = (text.clone(), Instant::now());
                         // classify once, centrally: failures get the alarm tint.
                         let t = text.to_lowercase();
@@ -675,16 +683,6 @@ fn main() {
                         .any(|n| t.contains(n));
                         st.set_status_kind(if err { "err".into() } else { "info".into() });
                         st.set_status_stale(false);
-                    } else {
-                        let age = seen.1.elapsed();
-                        if age > Duration::from_secs(30) && text != "ready" {
-                            st.set_status_line("ready".into());
-                            st.set_status_kind("info".into());
-                            st.set_status_stale(true);
-                            *seen = ("ready".into(), Instant::now());
-                        } else if age > Duration::from_secs(8) && !st.get_status_stale() {
-                            st.set_status_stale(true);
-                        }
                     }
                 }
 
@@ -738,7 +736,7 @@ fn main() {
 
 /// Best-effort: release every recognized, connected device's CUSTODY back to firmware on app exit.
 /// Custody is a per-FAMILY concept routed through the def's dialect (`Device::release_custody`): a
-/// razer board returns its driver-mode lease (device_mode -> NORMAL), a never-in-custody family
+/// razer board returns its driver-mode lease (`device_mode` -> NORMAL), a never-in-custody family
 /// no-ops rather than being handed a razer-framed mode packet. Driver mode is a lease held for the
 /// duration of streams/writes; leaving a razer device in it orphans its onboard buttons/FN and the
 /// wake-restore duty (the trap where the Naga woke announcing a stale DPI 16000). One release per
@@ -862,7 +860,7 @@ fn raise_self() {
     unsafe extern "system" fn cb(h: HWND, l: LPARAM) -> BOOL {
         let out = &mut *(l as *mut isize);
         let mut pid = 0u32;
-        GetWindowThreadProcessId(h, &mut pid);
+        GetWindowThreadProcessId(h, &raw mut pid);
         if pid == GetCurrentProcessId() && IsWindowVisible(h) != 0 {
             let mut buf = [0u16; 16];
             let n = GetWindowTextW(h, buf.as_mut_ptr(), buf.len() as i32).max(0) as usize;
@@ -875,7 +873,7 @@ fn raise_self() {
     }
     let mut found: isize = 0;
     unsafe {
-        EnumWindows(Some(cb), &mut found as *mut isize as LPARAM);
+        EnumWindows(Some(cb), &raw mut found as LPARAM);
     }
     if found != 0 {
         crate::teleport::force_foreground(found);

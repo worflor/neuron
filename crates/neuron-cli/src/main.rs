@@ -44,7 +44,7 @@ struct Cli {
 enum Cmd {
     /// List connected, recognized Razer devices
     List,
-    /// Self-emergent capability discovery: probe ANY Razer razer_report device, no registry
+    /// Self-emergent capability discovery: probe ANY Razer `razer_report` device, no registry
     Discover {
         /// adopt unknown devices: synthesize a FULL device def per unknown device and write it
         /// to devices/auto/ in the run folder (same as `neuron adopt`)
@@ -83,7 +83,7 @@ enum Cmd {
         #[arg(long)]
         persist: bool,
     },
-    /// HyperScroll active wheel stage (tactile / free-spin / ...): no value shows the current stage;
+    /// `HyperScroll` active wheel stage (tactile / free-spin / ...): no value shows the current stage;
     /// a value selects it via the wire-confirmed `set_scroll_stage` write (class 0x15/0x00).
     Scroll {
         /// the 1-based stage to make active (omit to just read the current stage)
@@ -144,7 +144,7 @@ enum Cmd {
         action: GestureCmd,
     },
     /// Audio endpoints (Core Audio) — cross-device remap targets: real mic gain & mute.
-    /// This is the exact OS path Synapse's WinAudio uses; no vendor RE needed.
+    /// This is the exact OS path Synapse's `WinAudio` uses; no vendor RE needed.
     Audio {
         #[command(subcommand)]
         action: AudioCmd,
@@ -242,7 +242,7 @@ enum Cmd {
         #[arg(long)]
         apply: bool,
     },
-    /// Python macros — the power tier of the spine. Real CPython run by the warm Macro Host sidecar:
+    /// Python macros — the power tier of the spine. Real `CPython` run by the warm Macro Host sidecar:
     /// full unsandboxed power (ctypes/subprocess/anything), registered once, fired by name.
     Macro {
         #[command(subcommand)]
@@ -272,7 +272,7 @@ enum Cmd {
         #[arg(long)]
         sigil: Option<String>,
     },
-    /// Read-only: interrogate a device's razer_report getter space with raw bytes.
+    /// Read-only: interrogate a device's `razer_report` getter space with raw bytes.
     /// `neuron probe 0221 --scan`  or  `neuron probe 0221 06 8e`
     Probe {
         /// device product id in hex, e.g. 0221 (keyboard) or 00a8 (mouse)
@@ -399,7 +399,7 @@ enum MacroCmd {
     /// List the python macros registered under `macros/scripts/`.
     List,
     /// Add a macro from a Python FILE: stores it under `macros/scripts/<name>.py` and registers it
-    /// into the warm MacroHost (so a syntax error surfaces now). The body defines `def macro(ctx):`
+    /// into the warm `MacroHost` (so a syntax error surfaces now). The body defines `def macro(ctx):`
     /// and may `import neuron` (ctx + key/clipboard/mouse/run helpers) or reach past it into any
     /// raw API (`import ctypes`, `subprocess`, …).
     Add {
@@ -528,7 +528,7 @@ enum LightingCmd {
     /// name — and flag any that don't, for a map correction. Uses the ACK'd on-demand custom-frame
     /// paint (not streaming). Prints `lighting: <KEY> (row N, col M)` per key; ESC stops early.
     Keytest {
-        /// keyboard PID (hex); default = the BlackWidow Chroma V2 (0221)
+        /// keyboard PID (hex); default = the `BlackWidow` Chroma V2 (0221)
         #[arg(long, default_value = "0221")]
         pid: String,
         /// how long to hold each key lit, in milliseconds
@@ -545,7 +545,7 @@ enum LightingCmd {
     /// you can map real footprints from hardware truth. Prints `cell (row N, col M)` per cell; ESC
     /// stops early; clears the board at the end.
     Cellsweep {
-        /// keyboard PID (hex); default = the BlackWidow Chroma V2 (0221)
+        /// keyboard PID (hex); default = the `BlackWidow` Chroma V2 (0221)
         #[arg(long, default_value = "0221")]
         pid: String,
         /// how long to hold each cell lit, in milliseconds
@@ -573,7 +573,7 @@ enum LightingCmd {
         /// last column of the block, inclusive (0-based)
         #[arg(long)]
         to: u8,
-        /// keyboard PID (hex); default = the BlackWidow Chroma V2 (0221)
+        /// keyboard PID (hex); default = the `BlackWidow` Chroma V2 (0221)
         #[arg(long, default_value = "0221")]
         pid: String,
         /// block colour as RRGGBB (default: a bright cyan)
@@ -638,7 +638,7 @@ enum AudioCmd {
     },
 }
 
-/// Default HyperShift trigger: mouse thumb button 1 (VK_XBUTTON1 = 0x05). Hold it,
+/// Default `HyperShift` trigger: mouse thumb button 1 (`VK_XBUTTON1` = 0x05). Hold it,
 /// draw, release. Override with --trigger <vk> (e.g. 0x02 right, 0x06 thumb2, 0x12 alt).
 const DEFAULT_TRIGGER: i32 = 0x05;
 
@@ -789,18 +789,13 @@ fn twin_cmd(action: TwinCmd) -> Result<()> {
             }
         }
         TwinCmd::Stats { file } => {
-            let path = file
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(twin_default_path);
-            let fam = match std::fs::read(&path).ok().and_then(|b| Familiar::load(&b)) {
-                Some(f) => f,
-                None => {
-                    println!(
-                        "no familiar at {} — play `neuron twin demo` first.",
-                        path.display()
-                    );
-                    return Ok(());
-                }
+            let path = file.map_or_else(twin_default_path, std::path::PathBuf::from);
+            let fam = if let Some(f) = std::fs::read(&path).ok().and_then(|b| Familiar::load(&b)) { f } else {
+                println!(
+                    "no familiar at {} — play `neuron twin demo` first.",
+                    path.display()
+                );
+                return Ok(());
             };
             let g = fam.signals();
             let c = fam.ceiling();
@@ -818,21 +813,17 @@ fn twin_cmd(action: TwinCmd) -> Result<()> {
         }
         TwinCmd::Sigil { out, file, size } => {
             use neuron::twin::TwinConfig;
-            let fam = match file
+            let fam = if let Some(f) = file
                 .map(std::path::PathBuf::from)
                 .or_else(|| Some(twin_default_path()))
                 .and_then(|p| std::fs::read(p).ok())
-                .and_then(|b| Familiar::load(&b))
-            {
-                Some(f) => f,
-                None => {
-                    // grow one quickly so the export always works
-                    let mut f = Familiar::new(TwinConfig::default());
-                    for i in 0..40 {
-                        f.receive(&scripted_motif(i));
-                    }
-                    f
+                .and_then(|b| Familiar::load(&b)) { f } else {
+                // grow one quickly so the export always works
+                let mut f = Familiar::new(TwinConfig::default());
+                for i in 0..40 {
+                    f.receive(&scripted_motif(i));
                 }
+                f
             };
             let path = fam.sigil_path(360);
             let sc = neuron::scene::sigil_scene(&path, size as f32);
@@ -1131,8 +1122,7 @@ fn profile_cmd(reg: &Registry, action: ProfileCmd) -> Result<()> {
             let binds = std::fs::read_to_string(&sidecar)
                 .ok()
                 .and_then(|s| toml::from_str::<neuron::engine::RuleDoc>(&s).ok())
-                .map(|d| d.rules.len())
-                .unwrap_or(0);
+                .map_or(0, |d| d.rules.len());
             if !yes {
                 println!("'{name}': {}", p.summary());
                 if binds > 0 {
@@ -1224,44 +1214,41 @@ fn profile_cmd(reg: &Registry, action: ProfileCmd) -> Result<()> {
         ProfileCmd::Capture { name } => profile_capture(reg, &name)?,
         ProfileCmd::Autoswitch { app, profile } => {
             use neuron::profile::{AppRule, AppRules};
-            match (app, profile) {
-                (Some(a), Some(p)) => {
-                    // the rule is only as real as its target — the GUI refuses a typo'd profile,
-                    // and the CLI used to accept one and fail forever at focus-switch time.
-                    if Profile::load(&p).is_err() {
-                        bail!("no profile '{p}' · save it first (neuron profile list)");
-                    }
-                    let mut rules = AppRules::load();
-                    rules.rules.push(AppRule {
-                        app: a.clone(),
-                        profile: p.clone(),
-                    });
-                    rules.save().map_err(|e| anyhow::anyhow!("saving apps.toml: {e}"))?;
+            if let (Some(a), Some(p)) = (app, profile) {
+                // the rule is only as real as its target — the GUI refuses a typo'd profile,
+                // and the CLI used to accept one and fail forever at focus-switch time.
+                if Profile::load(&p).is_err() {
+                    bail!("no profile '{p}' · save it first (neuron profile list)");
+                }
+                let mut rules = AppRules::load();
+                rules.rules.push(AppRule {
+                    app: a.clone(),
+                    profile: p.clone(),
+                });
+                rules.save().map_err(|e| anyhow::anyhow!("saving apps.toml: {e}"))?;
+                println!(
+                    "rule added: focus '{a}' -> profile '{p}'  ({})",
+                    AppRules::path().display()
+                );
+            } else {
+                let rules = AppRules::load();
+                let now = neuron::app::foreground_app();
+                println!("focused app: {}", now.as_deref().unwrap_or("(unknown)"));
+                if rules.rules.is_empty() {
                     println!(
-                        "rule added: focus '{a}' -> profile '{p}'  ({})",
-                        AppRules::path().display()
+                        "no rules yet — add one: neuron profile autoswitch <app> <profile>"
                     );
                 }
-                _ => {
-                    let rules = AppRules::load();
-                    let now = neuron::app::foreground_app();
-                    println!("focused app: {}", now.as_deref().unwrap_or("(unknown)"));
-                    if rules.rules.is_empty() {
-                        println!(
-                            "no rules yet — add one: neuron profile autoswitch <app> <profile>"
-                        );
-                    }
-                    for r in &rules.rules {
-                        let hit = now
-                            .as_deref()
-                            .is_some_and(|n| n.contains(&r.app.to_lowercase()));
-                        println!(
-                            "  '{}' -> {}{}",
-                            r.app,
-                            r.profile,
-                            if hit { "   <= active" } else { "" }
-                        );
-                    }
+                for r in &rules.rules {
+                    let hit = now
+                        .as_deref()
+                        .is_some_and(|n| n.contains(&r.app.to_lowercase()));
+                    println!(
+                        "  '{}' -> {}{}",
+                        r.app,
+                        r.profile,
+                        if hit { "   <= active" } else { "" }
+                    );
                 }
             }
         }
@@ -1384,8 +1371,7 @@ fn cast_run(trigger_override: Option<i32>) {
     let cfg = CastConfig::load();
     let vault = Vault::load();
     let trigger = trigger_override
-        .map(neuron::controls::ControlRef::from_vk)
-        .unwrap_or(cfg.trigger);
+        .map_or(cfg.trigger, neuron::controls::ControlRef::from_vk);
     println!(
         "Cast engine — mode={:?}, trigger={}, {} wheel wedge(s), {} glyph(s), {} recorded template(s).",
         cfg.mode,
@@ -1604,7 +1590,7 @@ fn lighting_run(
     Ok(())
 }
 
-/// Read the mouse's current active DPI stage as (active_idx 0-based, stage_count). The active stage
+/// Read the mouse's current active DPI stage as (`active_idx` 0-based, `stage_count`). The active stage
 /// is the reply to the GET dpi-stages command `0x04/0x86` (`dpi_stages_active`): `args[1]` is the
 /// active index, `args[2]` the count — live-confirmed. Falls back to `dpi_stages` (0x04/0x83) if the
 /// user-configured-stage getter isn't present. Returns None if neither answers (e.g. asleep mouse).
@@ -1641,9 +1627,9 @@ fn read_mouse_vitals(d: &Device, last: Option<lighting::Vitals>) -> lighting::Vi
 }
 
 /// CROSS-DEVICE DATA SURFACE — the on-thesis flagship. neuron is ONE process speaking BOTH the Naga
-/// (data SOURCE) and the BlackWidow (data SINK), so it can paint the mouse's live battery / charge /
+/// (data SOURCE) and the `BlackWidow` (data SINK), so it can paint the mouse's live battery / charge /
 /// active-DPI-stage onto the keyboard's LED matrix — a cross-device layer Synapse (siloed) and
-/// OpenRazer (no cross-device layer) structurally cannot do.
+/// `OpenRazer` (no cross-device layer) structurally cannot do.
 ///
 /// The loop runs at ~1s cadence: read the mouse vitals -> render the vitals frame (`render_vitals`,
 /// the SAME reusable core the GUI will call) -> paint it to the keyboard via the ACK'd custom-frame
@@ -1714,7 +1700,7 @@ fn lighting_mirror(reg: &Registry, seconds: Option<u64>) -> Result<()> {
             }
             last = Some(v);
         }
-        std::thread::sleep(Duration::from_millis(1000));
+        std::thread::sleep(Duration::from_secs(1));
     }
     println!("stopped.");
     Ok(())
@@ -1951,7 +1937,7 @@ fn lighting_show(reg: &Registry) -> Result<()> {
     }
     for (def, pid) in devs {
         let l = def.lighting.as_ref().unwrap();
-        let native: Vec<&str> = l.effects.keys().map(|s| s.as_str()).collect();
+        let native: Vec<&str> = l.effects.keys().map(std::string::String::as_str).collect();
         let avail: Vec<&str> = l.available().iter().map(|e| e.name()).collect();
         println!("{} [{}]  pid={pid:04x}", def.name, def.codename);
         println!(
@@ -2206,7 +2192,7 @@ fn lighting_effect(
                         // matrix args = [varstore, led, effect_id, ...]; effect-id is arg[2].
                         match rep.args.get(2).copied() {
                             Some(want) if st[2] == want => {
-                                println!("     verified: device state shows effect 0x{:02X}.", st[2])
+                                println!("     verified: device state shows effect 0x{:02X}.", st[2]);
                             }
                             Some(want) => println!(
                                 "     ? state shows effect 0x{:02X} but we wrote 0x{want:02X} — check region/mode.",
@@ -2294,8 +2280,7 @@ fn backup_cmd(reg: &Registry, pid_filter: Option<&str>) -> Result<()> {
     let infos = transport::enumerate()?;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
 
     let mut seen = std::collections::BTreeSet::new();
     let mut targets: Vec<(u16, u16, String)> = Vec::new();
@@ -2333,7 +2318,7 @@ fn backup_cmd(reg: &Registry, pid_filter: Option<&str>) -> Result<()> {
 }
 
 /// Set the device control mode (the switch Synapse flips to take host control). Reversible.
-/// Standard razer_report: class 0x00 / id 0x04, args = [mode, 0x00]; driver=0x03, hardware=0x00.
+/// Standard `razer_report`: class 0x00 / id 0x04, args = [mode, 0x00]; driver=0x03, hardware=0x00.
 fn mode_cmd(reg: &Registry, mode_str: &str, pid_str: &str) -> Result<()> {
     let mode: u8 = parse_device_mode(mode_str)?;
     let pid = parse_hex16(pid_str)?;
@@ -2442,8 +2427,7 @@ fn verify_cmd(file: &str) -> Result<()> {
     }
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
     let current = snapshot_device(snap.vid, snap.pid, snap.name.clone(), &infos, now);
     let changed = snap.diff(&current);
     println!(
@@ -2729,7 +2713,7 @@ fn macro_cmd(action: MacroCmd) -> Result<()> {
             // a generous budget: a beacon-asking macro waits on the HUMAN at this very terminal.
             println!(
                 "{}",
-                macro_host().invoke_with_budget(&id, &ctx, std::time::Duration::from_secs(600))
+                macro_host().invoke_with_budget(&id, &ctx, std::time::Duration::from_mins(10))
             );
             // surface any macro print()/traceback the sidecar logged.
             for line in macro_host().drain_log() {
@@ -2821,7 +2805,7 @@ fn parse_probe_target(class: Option<&str>, id: Option<&str>) -> Result<Option<(u
 // clear error instead of being written (or silently clamped) and then reported as if it took. These
 // are the inverse of Synapse's "looks applied" lie — neuron never claims a write it didn't make.
 
-/// Hard DPI ceiling — the Focus Pro 30K's max; mirrors the cycle/intent clamp band (100..30_000).
+/// Hard DPI ceiling — the Focus Pro 30K's max; mirrors the cycle/intent clamp band (`100..30_000`).
 const DPI_CEILING: u16 = 30_000;
 /// A sane DPI floor — Razer sensors bottom out around 100.
 const DPI_FLOOR: u16 = 100;
@@ -2906,7 +2890,7 @@ fn dpi_stages_cmd(reg: &Registry, stages: &[u16], active: u8, persist: bool) -> 
     // hardware truth survives power-cycles — the volatile-only default is how the factory table
     // kept resurrecting. `--persist` is still accepted but is now the standing behaviour.
     let _ = persist;
-    let list: Vec<String> = stages.iter().map(|v| v.to_string()).collect();
+    let list: Vec<String> = stages.iter().map(std::string::ToString::to_string).collect();
     println!(
         "setting DPI stages [{}] active {} (live + onboard)...",
         list.join("/"),
@@ -2946,7 +2930,7 @@ fn lod_cmd(reg: &Registry, lift: Option<u8>, landing: Option<u8>, sym: Option<u8
         Some((lf, la)) => println!("  LOD now: ASYMMETRIC — lift {lf} / landing {la}"),
         None => println!(
             "  LOD now: symmetric level {}",
-            writes::lift_off_distance(d).map(|v| v.to_string()).unwrap_or_else(|_| "?".into())
+            writes::lift_off_distance(d).map_or_else(|_| "?".into(), |v| v.to_string())
         ),
     };
     println!("current lift-off state:");
@@ -2998,7 +2982,7 @@ fn lod_cmd(reg: &Registry, lift: Option<u8>, landing: Option<u8>, sym: Option<u8
     Ok(())
 }
 
-/// Select the active HyperScroll wheel stage via the wire-confirmed `set_scroll_stage` write
+/// Select the active `HyperScroll` wheel stage via the wire-confirmed `set_scroll_stage` write
 /// (class 0x15/0x00). With no value, explains there's no read getter for the active stage.
 fn scroll_cmd(reg: &Registry, stage: Option<u8>, volatile: bool) -> Result<()> {
     let d = open_with_command(reg, "set_scroll_stage")?;
@@ -3038,7 +3022,7 @@ fn scroll_cmd(reg: &Registry, stage: Option<u8>, volatile: bool) -> Result<()> {
     Ok(())
 }
 
-/// Read-only razer_report getter probe. Opens the device by PID (its 91-byte feature pipe)
+/// Read-only `razer_report` getter probe. Opens the device by PID (its 91-byte feature pipe)
 /// and fires getter commands, dumping raw replies — the transparent way to see exactly what
 /// a device exposes (and what it does NOT, e.g. onboard storage).
 fn probe_cmd(pid: &str, class: Option<&str>, id: Option<&str>, scan: bool) -> Result<()> {
@@ -3106,7 +3090,7 @@ fn probe_cmd(pid: &str, class: Option<&str>, id: Option<&str>, scan: bool) -> Re
     if !any {
         match explicit {
             Some((c, i)) => {
-                println!("  {c:02X}/{i:02X} not supported on any interface of this device")
+                println!("  {c:02X}/{i:02X} not supported on any interface of this device");
             }
             None => println!("  (no getters responded)"),
         }
@@ -3323,7 +3307,7 @@ fn run_listen(reg: &Registry, seconds: Option<u64>, rt: neuron::controls::Runtim
             println!("  (watching '{}' for taps via mute-toggle)\n", e.name);
         }
     }
-    let mut last_mute = ctl.as_ref().map(|c| c.get_mute());
+    let mut last_mute = ctl.as_ref().map(neuron::audio::VolumeCtl::get_mute);
     let mut switcher = neuron::app_focus::AppFocusSwitch::new();
     let mut tick = 0u32;
     // The profile the spine was last assembled for. A profile carries its `<name>.rules.toml`
@@ -3461,7 +3445,7 @@ fn run_listen(reg: &Registry, seconds: Option<u64>, rt: neuron::controls::Runtim
                 if let Some(name) = target {
                     let line = run_intent(
                         &mut devices.borrow_mut(),
-                        &neuron::action::Intent::ProfileSwitch(name.clone()),
+                        &neuron::action::Intent::ProfileSwitch(name),
                     );
                     println!("  {line}");
                     // Only rebuild when the switch actually landed — the cursor is the authority.
@@ -3519,7 +3503,7 @@ fn audio_cmd(action: AudioCmd) -> Result<()> {
     Ok(())
 }
 
-/// Poll Razer audio endpoints for volume/mute changes. The BlackShark knob/mute and the
+/// Poll Razer audio endpoints for volume/mute changes. The `BlackShark` knob/mute and the
 /// Seiren tap surface as Core Audio changes (UAC feature-unit), not Raw Input HID — this is
 /// the channel a Core-Audio-based remap listens on.
 #[cfg(windows)]
@@ -3551,7 +3535,7 @@ fn audio_monitor(seconds: u64) {
     );
     let start = Instant::now();
     while start.elapsed().as_secs() < seconds {
-        for (name, ctl, v, m) in watched.iter_mut() {
+        for (name, ctl, v, m) in &mut watched {
             let nv = ctl.get_volume();
             let nm = ctl.get_mute();
             if (nv - *v).abs() > 0.001 {
@@ -3732,7 +3716,7 @@ fn restore_custody_if_visitor(d: &Device, prior: u8) {
 
 /// Adoption is a property of DEVICE RESOLUTION, not process startup: the first time a command
 /// actually reaches for the bus and comes up short (or enumerates it), unknown Razer hardware is
-/// learned (synth::adopt_unknown → devices/auto/<pid>.toml) and the registry reloaded — so
+/// learned (`synth::adopt_unknown` → devices/auto/<pid>.toml) and the registry reloaded — so
 /// `neuron battery` works out of the box on brand-new hardware, while read-only surfaces
 /// (pocket --list, profile list, …) never probe HID or write files. Once per process.
 fn adopt_and_reload() -> Option<Registry> {
@@ -3893,11 +3877,11 @@ fn brightness_cmd(reg: &Registry, pct: Option<u8>) -> Result<()> {
     Ok(())
 }
 
-/// Keyboard FIRMWARE game mode — the FN+F10 Win-key kill (GAME_LED state). No arg reads it; `on`/
+/// Keyboard FIRMWARE game mode — the FN+F10 Win-key kill (`GAME_LED` state). No arg reads it; `on`/
 /// `off` sets it. This is the DEVICE-side kill (firmware, zero software) — the hardware sibling of
 /// the host-side KEY GUARD chord swallows; it's what silently ate the user's Win key. Resolves the
-/// keyboard by CAPABILITY (never enumeration order) — the SetGameMode setter for a write, the
-/// GameMode getter for a bare read — mirroring `brightness_cmd`'s adopt-on-miss retry and its
+/// keyboard by CAPABILITY (never enumeration order) — the `SetGameMode` setter for a write, the
+/// `GameMode` getter for a bare read — mirroring `brightness_cmd`'s adopt-on-miss retry and its
 /// read/write capability split. The write is read-back verified inside `cap::set_game_mode` (bails on a
 /// MISMATCH), so a returned Ok already means the board reports the state we asked for.
 fn gamemode_cmd(reg: &Registry, state: Option<&str>) -> Result<()> {
@@ -4393,7 +4377,7 @@ fn list(reg: &Registry) -> Result<()> {
         // find_for_pipe: one line per DRIVEN control pipe — on a two-family pid each pipe lists
         // under the family that frames it, rather than both collapsing to find_by_pid's first def.
         if let Some(def) = reg.find_for_pipe(i) {
-            let mode = def.mode_for(i.pid).map(|m| m.name.as_str()).unwrap_or("?");
+            let mode = def.mode_for(i.pid).map_or("?", |m| m.name.as_str());
             println!(
                 "{}  [{}]  pid={:04x}  mode={}",
                 def.name, def.codename, i.pid, mode
@@ -4516,9 +4500,7 @@ fn adopt_cmd(reg: &Registry, dry_run: bool) -> Result<()> {
             }
             any = true;
             let known = reg
-                .find_by_pid(i.vid, i.pid)
-                .map(|d| format!("known: curated def '{}' would shadow this", d.name))
-                .unwrap_or_else(|| "unknown: `neuron adopt` would write this".into());
+                .find_by_pid(i.vid, i.pid).map_or_else(|| "unknown: `neuron adopt` would write this".into(), |d| format!("known: curated def '{}' would shadow this", d.name));
             println!(
                 "# ── pid {:04x} · round-trip ~{}ms · {} ──────────────────────\n",
                 i.pid, s.roundtrip_ms, known

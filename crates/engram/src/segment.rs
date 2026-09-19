@@ -5,8 +5,8 @@
 //! Trajectory segmentation and dimension pairing.
 //!
 //! Three responsibilities:
-//! 1. derive_pairing: find natural complex pairs from correlation structure
-//! 2. derive_block_sizes: autocorrelation-driven macro/micro sizing
+//! 1. `derive_pairing`: find natural complex pairs from correlation structure
+//! 2. `derive_block_sizes`: autocorrelation-driven macro/micro sizing
 //! 3. segment: cut trajectory at phase transitions (3-sigma rule)
 
 use crate::types::MIN_BLOCK;
@@ -24,6 +24,7 @@ const MAX_LAG: usize = 128;
 /// are the original dimension indices for pair k.
 ///
 /// Cost: O(D² · T) for correlation + O(D²) for greedy matching.
+#[must_use]
 pub fn derive_pairing(w: &[f32], t: usize, dim: usize) -> Vec<i32> {
     debug_assert_eq!(dim % 2, 0);
     let p = dim / 2;
@@ -37,7 +38,7 @@ pub fn derive_pairing(w: &[f32], t: usize, dim: usize) -> Vec<i32> {
     for row in 0..t {
         let base = row * dim;
         for d in 0..dim {
-            means[d] += w[base + d] as f64;
+            means[d] += f64::from(w[base + d]);
         }
     }
     let inv_t = 1.0 / t as f64;
@@ -50,7 +51,7 @@ pub fn derive_pairing(w: &[f32], t: usize, dim: usize) -> Vec<i32> {
     for row in 0..t {
         let base = row * dim;
         for d in 0..dim {
-            let v = w[base + d] as f64 - means[d];
+            let v = f64::from(w[base + d]) - means[d];
             norms[d] = v.mul_add(v, norms[d]);
         }
     }
@@ -66,10 +67,10 @@ pub fn derive_pairing(w: &[f32], t: usize, dim: usize) -> Vec<i32> {
     for row in 0..t {
         let base = row * dim;
         for i in 0..dim {
-            let vi = (w[base + i] as f64 - means[i]) / norms[i];
+            let vi = (f64::from(w[base + i]) - means[i]) / norms[i];
             // self-correlation = 1.0, skip it (we zero diagonal below)
             for j in (i + 1)..dim {
-                let vj = (w[base + j] as f64 - means[j]) / norms[j];
+                let vj = (f64::from(w[base + j]) - means[j]) / norms[j];
                 corr[i * dim + j] = vi.mul_add(vj, corr[i * dim + j]);
             }
         }
@@ -124,7 +125,8 @@ pub fn derive_pairing(w: &[f32], t: usize, dim: usize) -> Vec<i32> {
 /// Apply a pairing permutation to reorder dimensions.
 ///
 /// Input: w\[T × D\] row-major, pairing\[D\].
-/// Output: w_p\[T × D\] with columns reordered by pairing.
+/// Output: `w_p`\[T × D\] with columns reordered by pairing.
+#[must_use]
 pub fn apply_pairing(w: &[f32], t: usize, dim: usize, pairing: &[i32]) -> Vec<f32> {
     let mut out = vec![0.0_f32; t * dim];
     for row in 0..t {
@@ -136,6 +138,7 @@ pub fn apply_pairing(w: &[f32], t: usize, dim: usize, pairing: &[i32]) -> Vec<f3
 }
 
 /// Undo a pairing permutation (inverse permutation).
+#[must_use]
 pub fn undo_pairing(w: &[f32], t: usize, dim: usize, pairing: &[i32]) -> Vec<f32> {
     let mut out = vec![0.0_f32; t * dim];
     for row in 0..t {
@@ -164,7 +167,7 @@ fn autocorrelation_length(w: &[f32], t: usize, dim: usize) -> usize {
         let base_next = (i + 1) * dim;
         let mut sq_sum = 0.0_f64;
         for d in 0..dim {
-            let diff = w[base_next + d] as f64 - w[base_curr + d] as f64;
+            let diff = f64::from(w[base_next + d]) - f64::from(w[base_curr + d]);
             sq_sum = diff.mul_add(diff, sq_sum);
         }
         vel_norm.push(sq_sum.sqrt());
@@ -201,6 +204,7 @@ fn autocorrelation_length(w: &[f32], t: usize, dim: usize) -> usize {
 ///
 /// macro = autocorrelation length (capped at 128)
 /// micro = macro / 4 (harmonic separation ratio)
+#[must_use]
 pub fn derive_block_sizes(w: &[f32], t: usize, dim: usize) -> (usize, usize) {
     let mac = MAX_BLOCK.min(autocorrelation_length(w, t, dim).max(MIN_BLOCK));
     let mic = (mac / 4).max(MIN_BLOCK);
@@ -225,8 +229,8 @@ fn linear_prediction_errors(w: &[f32], t: usize, dim: usize) -> Vec<f64> {
         let base_2 = (i - 2) * dim;
         let mut sq = 0.0_f64;
         for d in 0..dim {
-            let pred = 2.0 * w[base_1 + d] as f64 - w[base_2 + d] as f64;
-            let diff = w[base + d] as f64 - pred;
+            let pred = 2.0 * f64::from(w[base_1 + d]) - f64::from(w[base_2 + d]);
+            let diff = f64::from(w[base + d]) - pred;
             sq = diff.mul_add(diff, sq);
         }
         errors.push(sq.sqrt());
@@ -238,9 +242,10 @@ fn linear_prediction_errors(w: &[f32], t: usize, dim: usize) -> Vec<f64> {
 /// Segment a trajectory into blocks at phase transitions.
 ///
 /// Uses the 3-sigma rule: a new segment starts when the linear prediction
-/// error exceeds mean + 3·std. Also forces a split at max_block length.
+/// error exceeds mean + 3·std. Also forces a split at `max_block` length.
 ///
 /// Returns Vec<(start, end)> segment boundaries.
+#[must_use]
 pub fn segment(w: &[f32], t: usize, dim: usize, max_block: usize) -> Vec<(usize, usize)> {
     if t <= MIN_BLOCK {
         return if t > 0 { vec![(0, t)] } else { Vec::new() };
@@ -326,7 +331,7 @@ mod tests {
         let pair0 = (pairing[0].min(pairing[1]), pairing[0].max(pairing[1]));
         let pair1 = (pairing[2].min(pairing[3]), pairing[2].max(pairing[3]));
         let mut pairs = [pair0, pair1];
-        pairs.sort();
+        pairs.sort_unstable();
         assert_eq!(pairs, [(0, 1), (2, 3)]);
     }
 
@@ -389,9 +394,7 @@ mod tests {
         for (s, e) in &segs {
             assert!(
                 e - s >= MIN_BLOCK || *e == t,
-                "segment ({}, {}) too short",
-                s,
-                e
+                "segment ({s}, {e}) too short"
             );
         }
     }

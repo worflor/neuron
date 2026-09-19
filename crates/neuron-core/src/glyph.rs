@@ -36,31 +36,39 @@ pub struct C {
 // not worth operator-overloading churn across the eigenmotion math.
 #[allow(clippy::should_implement_trait)]
 impl C {
+    #[must_use]
     pub fn new(re: f64, im: f64) -> C {
         C { re, im }
     }
+    #[must_use]
     pub fn abs(self) -> f64 {
         self.re.hypot(self.im)
     }
+    #[must_use]
     pub fn arg(self) -> f64 {
         self.im.atan2(self.re)
     }
+    #[must_use]
     pub fn add(self, o: C) -> C {
         C::new(self.re + o.re, self.im + o.im)
     }
+    #[must_use]
     pub fn sub(self, o: C) -> C {
         C::new(self.re - o.re, self.im - o.im)
     }
+    #[must_use]
     pub fn mul(self, o: C) -> C {
         C::new(
             self.re * o.re - self.im * o.im,
             self.re * o.im + self.im * o.re,
         )
     }
+    #[must_use]
     pub fn scale(self, s: f64) -> C {
         C::new(self.re * s, self.im * s)
     }
     /// Principal complex square root.
+    #[must_use]
     pub fn sqrt(self) -> C {
         let r = self.abs();
         let re = ((r + self.re) * 0.5).max(0.0).sqrt();
@@ -96,17 +104,17 @@ fn quantize_q14(k: C, g: C) -> (i32, i32, i32, i32) {
     let mut ki = clamp_i16(k.im * Q14);
     let mut gr = clamp_i16(g.re * Q14);
     let mut gi = clamp_i16(g.im * Q14);
-    let gm2 = (gr as f64) * (gr as f64) + (gi as f64) * (gi as f64);
+    let gm2 = f64::from(gr) * f64::from(gr) + f64::from(gi) * f64::from(gi);
     if gm2 > G_MAG2_MAX {
         let s = Q14 / gm2.sqrt();
-        gr = (gr as f64 * s).round_ties_even() as i32;
-        gi = (gi as f64 * s).round_ties_even() as i32;
+        gr = (f64::from(gr) * s).round_ties_even() as i32;
+        gi = (f64::from(gi) * s).round_ties_even() as i32;
     }
-    let km2 = (kr as f64) * (kr as f64) + (ki as f64) * (ki as f64);
+    let km2 = f64::from(kr) * f64::from(kr) + f64::from(ki) * f64::from(ki);
     if km2 > K_MAG2_MAX {
         let s = (2.0 * Q14) / km2.sqrt();
-        kr = (kr as f64 * s).round_ties_even() as i32;
-        ki = (ki as f64 * s).round_ties_even() as i32;
+        kr = (f64::from(kr) * s).round_ties_even() as i32;
+        ki = (f64::from(ki) * s).round_ties_even() as i32;
     }
     (kr, ki, gr, gi)
 }
@@ -128,6 +136,7 @@ pub struct GlyphFit {
 
 /// Fit z[n] = K·z[n-1] − G·z[n-2] by complex least-squares over the whole slice.
 /// `z` must include the 2 history samples at its front.
+#[must_use]
 pub fn fit(z: &[C]) -> Option<GlyphFit> {
     let len = z.len();
     if len < 3 {
@@ -170,8 +179,8 @@ pub fn fit(z: &[C]) -> Option<GlyphFit> {
 
     let (ks, gs) = stabilize(kf, gf);
     let (kr, ki, gr, gi) = quantize_q14(ks, gs);
-    let k = C::new(kr as f64 / Q14, ki as f64 / Q14);
-    let g = C::new(gr as f64 / Q14, gi as f64 / Q14);
+    let k = C::new(f64::from(kr) / Q14, f64::from(ki) / Q14);
+    let g = C::new(f64::from(gr) / Q14, f64::from(gi) / Q14);
     Some(finalize(z, k, g, (kr, ki), (gr, gi)))
 }
 
@@ -248,6 +257,7 @@ pub struct Sig {
     pub resid_norm: f64, // residual / mean step — irregularity
 }
 
+#[must_use]
 pub fn signature(f: &GlyphFit) -> Sig {
     let dom = if f.lambda1.abs() >= f.lambda2.abs() {
         f.lambda1
@@ -271,6 +281,7 @@ fn ang_dist(a: f64, b: f64) -> f64 {
 
 /// Weighted distance between window signatures. Curvature keeps its sign, so +ω (one
 /// handedness) and −ω (the other) are far apart — CW and CCW are different gestures.
+#[must_use]
 pub fn sig_distance(a: Sig, b: Sig, cfg: &GlyphConfig) -> f64 {
     let dm = a.mag - b.mag;
     let dr = ang_dist(a.rot, b.rot);
@@ -279,6 +290,7 @@ pub fn sig_distance(a: Sig, b: Sig, cfg: &GlyphConfig) -> f64 {
 }
 
 /// Length-normalized DTW between two signature sequences (gesture words).
+#[must_use]
 pub fn dtw(a: &[Sig], b: &[Sig], cfg: &GlyphConfig) -> f64 {
     let (n, m) = (a.len(), b.len());
     if n == 0 || m == 0 {
@@ -310,6 +322,7 @@ pub fn dtw(a: &[Sig], b: &[Sig], cfg: &GlyphConfig) -> f64 {
 /// Resample a path to `n` points equidistant along its arc length ($1-recognizer style).
 /// This is what makes a gesture read the same drawn fast or slow, large or small —
 /// while preserving direction and shape.
+#[must_use]
 pub fn resample_uniform(points: &[C], n: usize) -> Vec<C> {
     if points.len() < 2 || n < 2 {
         return points.to_vec();
@@ -354,6 +367,7 @@ pub fn resample_uniform(points: &[C], n: usize) -> Vec<C> {
 
 // ── segmentation (port of phaseBoundaryScore / chooseBlockLen) ───────────────
 
+#[must_use]
 pub fn phase_boundary_score(z: &[C], at: usize) -> f64 {
     if at < 1 || at + 2 >= z.len() {
         return 0.0;
@@ -380,6 +394,7 @@ pub fn phase_boundary_score(z: &[C], at: usize) -> f64 {
     turn * 1.05 + jerk * 0.9 + speed_shock * 0.55 + speed_valley + curvature_flip
 }
 
+#[must_use]
 pub fn choose_block_len(z: &[C], start: usize) -> usize {
     let remaining = z.len() - start;
     let max_len = GLYPH_BLOCK_SIZE.min(remaining);
@@ -405,6 +420,7 @@ pub fn choose_block_len(z: &[C], start: usize) -> usize {
     best_len
 }
 
+#[must_use]
 pub fn segment(z: &[C]) -> Vec<(usize, usize)> {
     let mut segs = Vec::new();
     if z.len() < 3 {
@@ -422,6 +438,7 @@ pub fn segment(z: &[C]) -> Vec<(usize, usize)> {
     segs
 }
 
+#[must_use]
 pub fn velocities(z: &[C]) -> Vec<C> {
     if z.len() < 2 {
         return Vec::new();
@@ -441,6 +458,7 @@ fn position_mean_step(z: &[C]) -> f64 {
 }
 
 /// Per-block velocity-domain fits over the raw path (no resampling).
+#[must_use]
 pub fn fit_sequence(z: &[C]) -> Vec<GlyphFit> {
     segment(z)
         .into_iter()
@@ -583,6 +601,7 @@ fn resample_weighted(points: &[C], weights: &[f64], n: usize) -> Vec<C> {
 /// translation-invariant like plain arc-length resampling, but it stops blunting the cusps/loops of
 /// complex strokes — the shredded-into-tiny-blocks jaggedness — because the detail actually gets
 /// sampled. `cfg.resample` still sets the base density; the turning term adds resolution on top.
+#[must_use]
 pub fn prepare(z: &[C], cfg: &GlyphConfig) -> Vec<C> {
     if z.len() < 3 {
         return z.to_vec();
@@ -622,6 +641,7 @@ pub fn prepare(z: &[C], cfg: &GlyphConfig) -> Vec<C> {
 /// stable-length curvature/damping profile that doesn't reshuffle under noise, which is
 /// what makes DTW matching reliable. (Phase-boundary [`fit_sequence`] stays for the
 /// codec / structural view.)
+#[must_use]
 pub fn signature_sequence(z: &[C], cfg: &GlyphConfig) -> Vec<Sig> {
     windows_sigs(&prepare(z, cfg))
 }
@@ -670,6 +690,7 @@ pub struct Invariants {
 }
 
 /// Compute the invariants from a prepared (resampled+smoothed) path.
+#[must_use]
 pub fn invariants(r: &[C]) -> Invariants {
     use std::f64::consts::{PI, TAU};
     let v = velocities(r);
@@ -702,6 +723,7 @@ pub fn invariants(r: &[C]) -> Invariants {
     }
 }
 
+#[must_use]
 pub fn invariant_distance(a: Invariants, b: Invariants) -> f64 {
     // winding weighted hardest: it's the topological class (loops + handedness).
     let dw = a.winding - b.winding;
@@ -720,6 +742,7 @@ pub struct GestureWord {
 }
 
 /// Full analysis of a raw path into a [`GestureWord`].
+#[must_use]
 pub fn analyze(z: &[C], cfg: &GlyphConfig) -> GestureWord {
     let r = prepare(z, cfg);
     GestureWord {
@@ -729,6 +752,7 @@ pub fn analyze(z: &[C], cfg: &GlyphConfig) -> GestureWord {
 }
 
 /// Distance between two gesture words: eigenmotion DTW + weighted invariant distance.
+#[must_use]
 pub fn word_distance(q: &GestureWord, t: &GestureWord, cfg: &GlyphConfig) -> f64 {
     dtw(&q.sigs, &t.sigs, cfg) + cfg.w_invariant * invariant_distance(q.inv, t.inv)
 }
@@ -737,6 +761,7 @@ pub fn word_distance(q: &GestureWord, t: &GestureWord, cfg: &GlyphConfig) -> f64
 /// normalized to a centered unit box (the longer axis spans roughly -0.5..0.5, aspect preserved).
 /// Stored on a template so a live overlay can ghost "the ideal shape this is becoming", scaled to
 /// wherever the hand is actually drawing. Empty for a degenerate stroke.
+#[must_use]
 pub fn exemplar_path(z: &[C], cfg: &GlyphConfig) -> Vec<[f32; 2]> {
     let p = prepare(z, cfg);
     if p.len() < 2 {
@@ -758,6 +783,7 @@ pub fn exemplar_path(z: &[C], cfg: &GlyphConfig) -> Vec<[f32; 2]> {
 
 // ── synthetic shapes (validation) ────────────────────────────────────────────
 
+#[must_use]
 pub fn synth_line(n: usize) -> Vec<C> {
     (0..n)
         .map(|i| C::new(3.0 * i as f64, 1.5 * i as f64))
@@ -765,12 +791,14 @@ pub fn synth_line(n: usize) -> Vec<C> {
 }
 
 /// Circle of radius r. ω > 0 is one handedness, ω < 0 the other (CW vs CCW).
+#[must_use]
 pub fn synth_circle(n: usize, r: f64, omega: f64) -> Vec<C> {
     (0..n)
         .map(|i| C::new(r * (i as f64 * omega).cos(), r * (i as f64 * omega).sin()))
         .collect()
 }
 
+#[must_use]
 pub fn synth_spiral(n: usize, r0: f64, rho: f64, omega: f64) -> Vec<C> {
     (0..n)
         .map(|i| {
@@ -783,6 +811,7 @@ pub fn synth_spiral(n: usize, r0: f64, rho: f64, omega: f64) -> Vec<C> {
         .collect()
 }
 
+#[must_use]
 pub fn synth_line_then_circle(line_n: usize, circ_n: usize, r: f64, omega: f64) -> Vec<C> {
     let mut v = synth_line(line_n);
     let last = *v.last().unwrap();
@@ -795,6 +824,7 @@ pub fn synth_line_then_circle(line_n: usize, circ_n: usize, r: f64, omega: f64) 
 }
 
 /// A "V" / checkmark: down-right reach, sharp corner, up-right reach.
+#[must_use]
 pub fn synth_vee(n: usize, size: f64) -> Vec<C> {
     let half = n / 2;
     let mut v = Vec::new();
@@ -809,6 +839,7 @@ pub fn synth_vee(n: usize, size: f64) -> Vec<C> {
 }
 
 /// An "S": one arc, then the opposite-handed arc (curvature flips sign mid-gesture).
+#[must_use]
 pub fn synth_ess(n: usize, r: f64, omega: f64) -> Vec<C> {
     let half = n / 2;
     let mut v = synth_circle(half, r, omega);
@@ -822,6 +853,7 @@ pub fn synth_ess(n: usize, r: f64, omega: f64) -> Vec<C> {
 }
 
 /// Deterministic LCG jitter for noise-robustness tests (no rng dep, seed-varied).
+#[must_use]
 pub fn add_noise(z: &[C], sigma: f64, seed: u64) -> Vec<C> {
     let mut s = seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1);
     let mut nxt = || {
@@ -841,6 +873,7 @@ pub fn add_noise(z: &[C], sigma: f64, seed: u64) -> Vec<C> {
 /// Hold-and-do: wait for the `trigger` control to be pressed, capture sensor-true motion while
 /// it's held, stop on release. The classic activation — `capture_phrase` with a plain hold.
 #[cfg(windows)]
+#[must_use]
 pub fn capture_held(trigger: crate::controls::ControlRef, max_pts: usize) -> Vec<C> {
     capture_phrase(
         trigger,
@@ -1059,6 +1092,7 @@ pub fn capture_slots_until(
 /// Take (and clear) the scroll-wheel notches the capture's raw-input drain accumulated — the
 /// DEPTH DIAL a live consumer (teleport's stack descent) reads mid-capture. Positive = wheel up.
 #[cfg(windows)]
+#[must_use]
 pub fn take_wheel_ticks() -> i32 {
     raw_input::take_wheel_ticks()
 }
@@ -1073,6 +1107,7 @@ pub fn take_wheel_ticks() -> i32 {
 /// keeps those clicks from reaching the apps under the pinned cursor.
 /// Returns (left-downs, right-downs, right-ups).
 #[cfg(windows)]
+#[must_use]
 pub fn take_click_edges() -> (i32, i32, i32) {
     raw_input::take_click_edges()
 }
@@ -1083,6 +1118,7 @@ pub fn take_click_edges() -> (i32, i32, i32) {
 }
 
 #[cfg(windows)]
+#[must_use]
 pub fn key_down(vk: i32) -> bool {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
     unsafe { (GetAsyncKeyState(vk) as u16 & 0x8000) != 0 }
@@ -1102,7 +1138,7 @@ pub fn key_down(_vk: i32) -> bool {
 pub fn control_down(ctl: crate::controls::ControlRef) -> bool {
     match crate::controls::control_held(ctl.page, ctl.usage, ctl.pid) {
         Some(down) => down,
-        None => ctl.vk_hint().map(key_down).unwrap_or(false),
+        None => ctl.vk_hint().is_some_and(key_down),
     }
 }
 
@@ -1141,7 +1177,7 @@ mod raw_input {
             lpszMenuName: std::ptr::null(),
             lpszClassName: cls.as_ptr(),
         };
-        RegisterClassW(&wc); // idempotent — "already exists" is fine, we only need the name live
+        RegisterClassW(&raw const wc); // idempotent — "already exists" is fine, we only need the name live
         let hwnd = CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             cls.as_ptr(),
@@ -1165,7 +1201,7 @@ mod raw_input {
             dwFlags: RIDEV_INPUTSINK,
             hwndTarget: hwnd,
         };
-        if RegisterRawInputDevices(&rid, 1, std::mem::size_of::<RAWINPUTDEVICE>() as u32) == 0 {
+        if RegisterRawInputDevices(&raw const rid, 1, std::mem::size_of::<RAWINPUTDEVICE>() as u32) == 0 {
             DestroyWindow(hwnd);
             return None;
         }
@@ -1223,10 +1259,10 @@ mod raw_input {
         )
     }
 
-    /// Drain pending WM_INPUT; push accumulated absolute positions. Returns true if any
+    /// Drain pending `WM_INPUT`; push accumulated absolute positions. Returns true if any
     /// motion arrived. `acc` is the running (x,y) integral of relative deltas.
     ///
-    /// When `want_stamps`, each pushed point also appends its source WM_INPUT's `msg.time` (ms
+    /// When `want_stamps`, each pushed point also appends its source `WM_INPUT`'s `msg.time` (ms
     /// since boot, the OS's per-event timestamp) to `stamps`, kept index-aligned with `pts` — the
     /// research-capture path ([`super::capture_phrase_until_stamped`]) reads it for true Δt. The
     /// normal path passes `false` (and a throwaway buffer), so its behaviour is unchanged. NB:
@@ -1243,14 +1279,14 @@ mod raw_input {
         let header = std::mem::size_of::<RAWINPUTHEADER>() as u32;
         let mut moved = false;
         let mut msg: MSG = std::mem::zeroed();
-        while PeekMessageW(&mut msg, hwnd, 0, 0, PM_REMOVE) != 0 {
+        while PeekMessageW(&raw mut msg, hwnd, 0, 0, PM_REMOVE) != 0 {
             if msg.message == WM_INPUT {
                 let mut size: u32 = 0;
                 GetRawInputData(
                     msg.lParam as HRAWINPUT,
                     RID_INPUT,
                     std::ptr::null_mut(),
-                    &mut size,
+                    &raw mut size,
                     header,
                 );
                 if size > 0 {
@@ -1258,15 +1294,15 @@ mod raw_input {
                     let got = GetRawInputData(
                         msg.lParam as HRAWINPUT,
                         RID_INPUT,
-                        buf.as_mut_ptr() as *mut c_void,
-                        &mut size,
+                        buf.as_mut_ptr().cast::<c_void>(),
+                        &raw mut size,
                         header,
                     );
                     if got != u32::MAX && got > 0 {
-                        let ri = &*(buf.as_ptr() as *const RAWINPUT);
+                        let ri = &*buf.as_ptr().cast::<RAWINPUT>();
                         if ri.header.dwType == RIM_TYPEMOUSE {
-                            let dx = ri.data.mouse.lLastX as f64;
-                            let dy = ri.data.mouse.lLastY as f64;
+                            let dx = f64::from(ri.data.mouse.lLastX);
+                            let dy = f64::from(ri.data.mouse.lLastY);
                             if dx != 0.0 || dy != 0.0 {
                                 acc.0 += dx;
                                 acc.1 += dy;
@@ -1281,7 +1317,7 @@ mod raw_input {
                             let flags = ri.data.mouse.Anonymous.Anonymous.usButtonFlags;
                             if flags & 0x0400 != 0 {
                                 let delta =
-                                    ri.data.mouse.Anonymous.Anonymous.usButtonData as i16 as i32;
+                                    i32::from(ri.data.mouse.Anonymous.Anonymous.usButtonData as i16);
                                 WHEEL.fetch_add(delta, std::sync::atomic::Ordering::SeqCst);
                             }
                             // click edges feed the spectral verbs (RI_MOUSE_*_BUTTON_DOWN/UP)
@@ -1298,8 +1334,8 @@ mod raw_input {
                     }
                 }
             }
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+            TranslateMessage(&raw const msg);
+            DispatchMessageW(&raw const msg);
         }
         moved
     }
@@ -1360,7 +1396,7 @@ mod raw_input {
                     return None;
                 }
                 let now = Instant::now();
-                for k in keys.iter_mut() {
+                for k in &mut keys {
                     let is_down = super::control_down(k.ctl);
                     if is_down && !k.down {
                         // press edge: stale taps die after gap_ms of silence
@@ -1423,12 +1459,11 @@ mod raw_input {
             let ctl = slots
                 .iter()
                 .find(|s| s.id == id)
-                .map(|s| s.ctl)
-                .unwrap_or(crate::controls::ControlRef {
+                .map_or(crate::controls::ControlRef {
                     page: 0,
                     usage: 0,
                     pid: None,
-                });
+                }, |s| s.ctl);
             // cursor pinned for the stroke, exactly like every other weave.
             let _cursor = super::cursor_lock::CursorLock::engage();
             on_activated(id);
@@ -1523,7 +1558,61 @@ mod raw_input {
             let mut pts: Vec<C> = Vec::new();
             acc = (0.0, 0.0);
 
-            if !toggle {
+            if toggle {
+                // ── toggle capture: runs until the NEXT tap of the trigger (or ESC) ──
+                // First let the activating press release (its motion already counts).
+                while super::control_down(trigger) {
+                    if drain(hwnd, &mut acc, &mut pts, stamps_out, want_stamps) {
+                        if pts.len() >= max_pts {
+                            compact(&mut pts);
+                        }
+                        on_progress(&pts);
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                // capture until the closing tap's DOWN edge (responsive close) or ESC.
+                // SAFETY DEADMAN (mirrors the hold branch): a 60s cap so a closing tap that never
+                // registers — a flickered/missed key edge mid-stroke — can't strand this loop with the
+                // cursor LOCKED. 60s is far longer than any real glyph, even a deliberately slow one.
+                let toggle_start = Instant::now();
+                let mut last_motion = Instant::now();
+                loop {
+                    if stop() {
+                        DestroyWindow(hwnd);
+                        return Ok(Vec::new());
+                    }
+                    // deadman (see the hold branch): research path commits on 30s idle, normal path
+                    // discards on a hard 60s cap.
+                    let timed_out = if want_stamps {
+                        last_motion.elapsed() > Duration::from_secs(30)
+                    } else {
+                        toggle_start.elapsed() > Duration::from_mins(1)
+                    };
+                    if timed_out {
+                        if want_stamps {
+                            break; // commit
+                        }
+                        DestroyWindow(hwnd);
+                        return Ok(Vec::new());
+                    }
+                    if super::key_down(0x1B) || super::control_down(trigger) {
+                        break;
+                    }
+                    if drain(hwnd, &mut acc, &mut pts, stamps_out, want_stamps) {
+                        last_motion = Instant::now();
+                        if pts.len() >= max_pts {
+                            compact(&mut pts);
+                        }
+                        on_progress(&pts);
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                // swallow the closing press so it can't double as the next phrase's first tap
+                // (activation-to-deactivate must be free, not a hidden re-activation).
+                while super::control_down(trigger) {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            } else {
                 // ── hold capture: while the final press is held. A full buffer THINS
                 // (compact) and keeps capturing — no gesture ever self-terminates. ──
                 // SAFETY DEADMAN (see capture_slots): a 30s cap so a stuck key-state can't spin
@@ -1578,60 +1667,6 @@ mod raw_input {
                     }
                     std::thread::sleep(Duration::from_millis(2));
                 }
-            } else {
-                // ── toggle capture: runs until the NEXT tap of the trigger (or ESC) ──
-                // First let the activating press release (its motion already counts).
-                while super::control_down(trigger) {
-                    if drain(hwnd, &mut acc, &mut pts, stamps_out, want_stamps) {
-                        if pts.len() >= max_pts {
-                            compact(&mut pts);
-                        }
-                        on_progress(&pts);
-                    }
-                    std::thread::sleep(Duration::from_millis(2));
-                }
-                // capture until the closing tap's DOWN edge (responsive close) or ESC.
-                // SAFETY DEADMAN (mirrors the hold branch): a 60s cap so a closing tap that never
-                // registers — a flickered/missed key edge mid-stroke — can't strand this loop with the
-                // cursor LOCKED. 60s is far longer than any real glyph, even a deliberately slow one.
-                let toggle_start = Instant::now();
-                let mut last_motion = Instant::now();
-                loop {
-                    if stop() {
-                        DestroyWindow(hwnd);
-                        return Ok(Vec::new());
-                    }
-                    // deadman (see the hold branch): research path commits on 30s idle, normal path
-                    // discards on a hard 60s cap.
-                    let timed_out = if want_stamps {
-                        last_motion.elapsed() > Duration::from_secs(30)
-                    } else {
-                        toggle_start.elapsed() > Duration::from_secs(60)
-                    };
-                    if timed_out {
-                        if want_stamps {
-                            break; // commit
-                        }
-                        DestroyWindow(hwnd);
-                        return Ok(Vec::new());
-                    }
-                    if super::key_down(0x1B) || super::control_down(trigger) {
-                        break;
-                    }
-                    if drain(hwnd, &mut acc, &mut pts, stamps_out, want_stamps) {
-                        last_motion = Instant::now();
-                        if pts.len() >= max_pts {
-                            compact(&mut pts);
-                        }
-                        on_progress(&pts);
-                    }
-                    std::thread::sleep(Duration::from_millis(2));
-                }
-                // swallow the closing press so it can't double as the next phrase's first tap
-                // (activation-to-deactivate must be free, not a hidden re-activation).
-                while super::control_down(trigger) {
-                    std::thread::sleep(Duration::from_millis(2));
-                }
             }
             DestroyWindow(hwnd);
             Ok(pts)
@@ -1663,14 +1698,14 @@ mod cursor_lock {
         pub fn engage() -> Self {
             unsafe {
                 let mut p = POINT { x: 0, y: 0 };
-                if GetCursorPos(&mut p) != 0 {
+                if GetCursorPos(&raw mut p) != 0 {
                     let r = RECT {
                         left: p.x,
                         top: p.y,
                         right: p.x + 1,
                         bottom: p.y + 1,
                     };
-                    ClipCursor(&r);
+                    ClipCursor(&raw const r);
                     ShowCursor(0);
                     return CursorLock { engaged: true };
                 }
@@ -1709,7 +1744,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn compact_preserves_endpoints_and_order() {
-        let mut pts: Vec<C> = (0..601).map(|i| C::new(i as f64, (i * 2) as f64)).collect();
+        let mut pts: Vec<C> = (0..601).map(|i| C::new(f64::from(i), f64::from(i * 2))).collect();
         let (first, last) = (pts[0], pts[600]);
         raw_input::compact(&mut pts);
         assert!(pts.len() <= 302, "must roughly halve: {}", pts.len());
@@ -2052,7 +2087,7 @@ mod tests {
                 total += 1;
             }
         }
-        let acc = correct as f64 / total as f64;
+        let acc = f64::from(correct) / f64::from(total);
         assert!(
             acc >= 0.9,
             "classifier accuracy {acc:.2} ({correct}/{total}) below 0.9"
@@ -2401,7 +2436,7 @@ mod tests {
                 ("empty", vec![]),
                 ("single_point", vec![C::new(1.0, 2.0)]),
                 ("two_identical_points", vec![C::new(3.0, 3.0), C::new(3.0, 3.0)]),
-                ("all_collinear", (0..40).map(|i| C::new(i as f64, 2.0 * i as f64)).collect()),
+                ("all_collinear", (0..40).map(|i| C::new(f64::from(i), 2.0 * f64::from(i))).collect()),
                 (
                     "extreme_magnitude",
                     vec![

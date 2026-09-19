@@ -36,7 +36,7 @@
 //! peak this tick". The neutral [`run`] loop owns all the timing/smoothing and just calls
 //! `Sampler::sample()`. Adding a platform is therefore implementing ONE small type, not editing the
 //! loop: the Windows one ([`imp::Sampler`], Core-Audio) is selected on Windows; off-Windows the inert
-//! [`stub::Sampler`] returns `None` so the board idles honestly dark. Drop a CoreAudio / PipeWire
+//! [`stub::Sampler`] returns `None` so the board idles honestly dark. Drop a `CoreAudio` / `PipeWire`
 //! `Sampler` into the cfg below and the whole provider works unchanged. (`mod stub` is ALWAYS
 //! compiled — never cfg-gated — so its surface is type-checked on every build, the same drift guard
 //! `audio.rs` uses; the porting TODOs sit on its `sample`.)
@@ -169,12 +169,12 @@ fn run(mut my_gen: u64, mut source: String) {
                 LEVEL_BITS.store(0f32.to_bits(), Ordering::Relaxed);
                 return;
             }
-            repoint = if st.gen != my_gen {
+            repoint = if st.gen == my_gen {
+                false
+            } else {
                 my_gen = st.gen;
                 source = st.source.clone();
                 true
-            } else {
-                false
             };
         }
         if repoint {
@@ -184,7 +184,7 @@ fn run(mut my_gen: u64, mut source: String) {
         // ── sample (platform seam) → boost → envelope. `None` = no signal this tick (dead/absent
         // handle, which the sampler will re-resolve next tick); treat it as silence so the envelope
         // decays rather than holding a stale peak. ──
-        let raw = sampler.sample().map(boost).unwrap_or(0.0);
+        let raw = sampler.sample().map_or(0.0, boost);
         smooth = envelope_step(smooth, raw);
         LEVEL_BITS.store(smooth.to_bits(), Ordering::Relaxed);
 

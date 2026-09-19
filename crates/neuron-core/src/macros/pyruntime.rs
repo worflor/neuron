@@ -4,7 +4,7 @@
 
 //! The BUNDLED Python runtime — app-OWNED, app-MATERIALIZED.
 //!
-//! `neuron` embeds a private CPython (a `python-build-standalone` tarball, chosen for the build
+//! `neuron` embeds a private `CPython` (a `python-build-standalone` tarball, chosen for the build
 //! target by `build.rs`) and the two host scripts (`neuron_host.py` + `neuron.py`) directly in the
 //! binary. On first use [`ensure_runtime`] unpacks the interpreter into the user's data dir and
 //! drops the host scripts beside each other, then hands back the three paths the sidecar spawn
@@ -12,10 +12,10 @@
 //! system Python, never a PATH probe, never an env-var hack.
 //!
 //! ## Why materialize to disk (not run from memory)
-//! CPython is a real interpreter that wants a real filesystem: its stdlib, `DLLs`/`lib`, and the
+//! `CPython` is a real interpreter that wants a real filesystem: its stdlib, `DLLs`/`lib`, and the
 //! host scripts must exist as files for `python neuron_host.py` to import them. We extract ONCE
 //! (idempotent: a present interpreter binary short-circuits) into a versioned dir, so an app
-//! update that bumps the pinned CPython lands in a NEW dir and the old one is simply unused.
+//! update that bumps the pinned `CPython` lands in a NEW dir and the old one is simply unused.
 //!
 //! ## Crash-safety + concurrency
 //! Extraction is ATOMIC: we unpack into a sibling temp dir and `rename` it into place, so a build
@@ -36,7 +36,7 @@ use std::sync::{Mutex, OnceLock};
 
 /// The embedded interpreter tarball (gzip'd tar) chosen by build.rs for this build's target.
 static PY_TARBALL: &[u8] = include_bytes!(env!("NEURON_PY_TARBALL"));
-/// The bundled CPython version (e.g. "3.12.13"), for the versioned runtime dir name.
+/// The bundled `CPython` version (e.g. "3.12.13"), for the versioned runtime dir name.
 const PY_VER: &str = env!("NEURON_PY_VER");
 /// The PBS triple the embedded interpreter was built for, for the versioned runtime dir name.
 const PY_TRIPLE: &str = env!("NEURON_PY_TRIPLE");
@@ -62,6 +62,7 @@ pub struct Runtime {
 /// The embedded `neuron.py` host-module source — the macro author's reference (`neuron macro
 /// prelude` prints it). Returned straight from the binary, so it's always the version this build
 /// ships, with no dependency on a materialized runtime.
+#[must_use]
 pub fn host_module_source() -> &'static str {
     NEURON_PY
 }
@@ -75,7 +76,7 @@ fn slot() -> &'static Mutex<Option<Runtime>> {
     RUNTIME.get_or_init(|| Mutex::new(None))
 }
 
-/// Materialize (idempotently) the bundled CPython + host scripts and return their paths.
+/// Materialize (idempotently) the bundled `CPython` + host scripts and return their paths.
 ///
 /// Cheap on the warm path (already-materialized → a clone of the cached struct). On a cold call it
 /// extracts the embedded interpreter to `<data>/neuron/runtime/py-<ver>-<triple>/` (atomic
@@ -160,15 +161,12 @@ fn extract_interpreter(py_dir: &Path) -> Result<(), String> {
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
+            .map_or(0, |d| d.as_nanos())
     );
     let tmp = py_dir.with_file_name(format!(
         "{}.{stamp}",
         py_dir
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "py".into())
+            .file_name().map_or_else(|| "py".into(), |s| s.to_string_lossy().into_owned())
     ));
     // Clean any stale temp from a previously-killed extract.
     let _ = std::fs::remove_dir_all(&tmp);

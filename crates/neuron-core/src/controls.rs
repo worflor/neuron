@@ -4,7 +4,7 @@
 
 //! Control-event listener + decoder — the foundation for remapping. Captures Raw Input
 //! (INPUTSINK) from the headset's Consumer (knob/media) and Telephony (mute) collections and
-//! decodes each report into semantic `(usage_page, usage)` pairs via HidP — so bindings match
+//! decodes each report into semantic `(usage_page, usage)` pairs via `HidP` — so bindings match
 //! on *meaning* ("Volume Up", "Phone Mute"), not fragile raw bytes. `watch` prints them;
 //! `run` (see `bindings`) dispatches them into actions like "set the real mic's gain".
 
@@ -43,19 +43,23 @@ pub struct ControlEvent {
 
 impl ControlEvent {
     /// True if this report has a given (page, usage) active.
+    #[must_use]
     pub fn has(&self, page: u16, usage: u16) -> bool {
         self.hits.contains(&(page, usage))
     }
     /// True on a "press" (any usage active) vs the matching release report (none active).
+    #[must_use]
     pub fn is_press(&self) -> bool {
         !self.hits.is_empty()
     }
     /// The source pid as lowercase hex, or `""` when there is none — the display/log form, and
     /// what the legacy `[[bindings]]` `pid = "0529"` string field matches against.
+    #[must_use]
     pub fn pid_hex(&self) -> String {
         self.pid.map(|p| p.to_string()).unwrap_or_default()
     }
     /// The bucket a [`HoldEdges`] diff keys on: identity AND stream, as separate values.
+    #[must_use]
     pub fn bucket(&self) -> (Option<crate::registry::CanonicalPid>, Stream) {
         (self.pid, self.stream)
     }
@@ -130,11 +134,11 @@ pub fn inject_event(ev: ControlEvent) {
         ev,
         at: std::time::Instant::now(),
     };
-    let mut sinks = INJECT.lock().unwrap_or_else(|e| e.into_inner());
+    let mut sinks = INJECT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if sinks.is_empty() {
         // No drain exists yet — hold the edge until one registers (INJECT lock still held, so a
         // concurrent inject_register either sees this in PENDING or runs after we push a sink).
-        let mut pending = INJECT_PENDING.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pending = INJECT_PENDING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         pending.push(ev);
         if pending.len() > INJECT_PENDING_MAX {
             // Past the cap, drop the OLDEST — deliberately, not the newest: a listener that arms very
@@ -176,10 +180,10 @@ fn inject_register() -> (u64, std::sync::mpsc::Receiver<Injected>, isize) {
     // Hold the INJECT lock across the pending drain (same lock order as inject_event: INJECT then
     // PENDING) so the handoff is atomic — an inject_event racing us either buffered into PENDING
     // (we drain it here) or will broadcast to the sink we're about to push. Never lost, never doubled.
-    let mut sinks = INJECT.lock().unwrap_or_else(|e| e.into_inner());
+    let mut sinks = INJECT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     for ev in INJECT_PENDING
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .drain(..)
     {
         let _ = tx.send(ev);
@@ -191,7 +195,7 @@ fn inject_register() -> (u64, std::sync::mpsc::Receiver<Injected>, isize) {
 /// Drop a listen loop's drain registration (its receiver is gone) and close its wake event.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn inject_unregister(id: u64) {
-    let mut sinks = INJECT.lock().unwrap_or_else(|e| e.into_inner());
+    let mut sinks = INJECT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     // Remove + close under the INJECT lock so `wake_pump` (which signals every registered handle
     // while holding this same lock) can never race a SetEvent against a handle we're closing.
     if let Some(pos) = sinks.iter().position(|(i, _, _)| *i == id) {
@@ -201,6 +205,7 @@ fn inject_unregister(id: u64) {
 }
 
 /// Friendly name for the common control usages we expect (printing only).
+#[must_use]
 pub fn usage_name(page: u16, usage: u16) -> &'static str {
     match (page, usage) {
         MIC_TAP => "Mic Tap",
@@ -262,9 +267,7 @@ fn kbd_usage_name(usage: u16) -> Option<&'static str> {
 /// or an exotic key stays bindable and legible, never blank.
 pub fn control_label(page: u16, usage: u16) -> String {
     match page {
-        0x07 => kbd_usage_name(usage)
-            .map(str::to_string)
-            .unwrap_or_else(|| format!("Key 0x{usage:02X}")),
+        0x07 => kbd_usage_name(usage).map_or_else(|| format!("Key 0x{usage:02X}"), str::to_string),
         0xFF07 => format!("Scancode 0x{usage:03X}"),
         0x09 => format!("Button {usage}"),
         // Razer macro keys: the protocol code → a stable name. M1=0x20.. (EMERGENT: any code the
@@ -506,6 +509,7 @@ use crate::profile::AppRules;
 /// (the multi-button / HyperShift-hold-plus-press case). The live daemon should prefer
 /// [`HoldEdges::edges`], which diffs successive reports into per-button down/up edges. This helper
 /// is retained for the watch/printout path and back-compat.
+#[must_use]
 pub fn event_trigger(ev: &ControlEvent) -> Option<Trigger> {
     let &(page, usage) = ev.hits.first()?;
     Some(hit_trigger(page, usage, ev.pid))
@@ -527,7 +531,7 @@ fn hit_trigger(page: u16, usage: u16, pid: Option<crate::registry::CanonicalPid>
 pub enum InputEdge {
     /// A control that was NOT down in the previous report is now down — dispatch this trigger.
     Down(Trigger),
-    /// A control that WAS down is now released — release any HyperShift layer it activated.
+    /// A control that WAS down is now released — release any `HyperShift` layer it activated.
     Up(Trigger),
 }
 
@@ -537,9 +541,9 @@ pub enum InputEdge {
 ///
 /// Why this exists (the two bugs it fixes):
 /// * **multi-button drop** — [`event_trigger`] kept only `hits.first()`, so a second control held
-///   at the same time (a HyperShift hold key + another button) never dispatched. [`edges`] yields a
+///   at the same time (a `HyperShift` hold key + another button) never dispatched. [`edges`] yields a
 ///   [`InputEdge::Down`] for EVERY newly-pressed control.
-/// * **stuck / over-eager HyperShift release** — the old loop called `release_all()` on any
+/// * **stuck / over-eager `HyperShift` release** — the old loop called `release_all()` on any
 ///   empty-hits report, dropping every held layer the instant ANY button went up. [`edges`] yields
 ///   a precise [`InputEdge::Up`] only for the control that actually transitioned to released, so a
 ///   caller can release exactly that input's layer (see [`HoldEdges` usage] in the daemons).
@@ -557,6 +561,7 @@ pub struct HoldEdges {
 }
 
 impl HoldEdges {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -649,6 +654,7 @@ impl ControlRef {
     /// Map a legacy Windows virtual-key to its control identity (device-any). An unknown VK
     /// degrades to the historical default trigger (XBUTTON1) rather than an unbindable ghost —
     /// a config typo must never brick the cast engine.
+    #[must_use]
     pub fn from_vk(vk: i32) -> Self {
         let (page, usage) = vk_to_control(vk).unwrap_or((0x09, 4));
         ControlRef {
@@ -660,6 +666,7 @@ impl ControlRef {
 
     /// The equivalent [`Trigger::Input`] — a `ControlRef` bind and a spine rule are the SAME
     /// identity, so features holding one can talk to the engine without translation.
+    #[must_use]
     pub fn to_trigger(self) -> Trigger {
         Trigger::Input {
             page: self.page,
@@ -672,17 +679,20 @@ impl ControlRef {
     /// degraded fallback (polling `GetAsyncKeyState` when no Raw-Input pump is alive — the CLI
     /// one-shots) and for the mouse-only click-guard arming. Macro keys and exotic controls have
     /// no VK — they are exactly the controls the registry path exists for.
+    #[must_use]
     pub fn vk_hint(self) -> Option<i32> {
         control_to_vk(self.page, self.usage)
     }
 
     /// True for the five standard mouse buttons (Button page 1..=5).
+    #[must_use]
     pub fn is_mouse_button(self) -> bool {
         self.page == 0x09 && (1..=5).contains(&self.usage)
     }
 
     /// Human label: the shared control name, plus the device scope when pid-bound — the honest
     /// "this key on THIS device" the old VK label couldn't say.
+    #[must_use]
     pub fn label(self) -> String {
         // the five standard mouse buttons keep their friendly names (label parity with the old
         // VK captures); everything else speaks the shared control vocabulary.
@@ -703,6 +713,7 @@ impl ControlRef {
 
 /// Legacy VK → control identity. Mouse buttons map to the Button page; keyboard keys to their HID
 /// Keyboard/Keypad usage. `None` for VKs with no stable control identity.
+#[must_use]
 pub fn vk_to_control(vk: i32) -> Option<(u16, u16)> {
     Some(match vk {
         0x01 => (0x09, 1),
@@ -752,6 +763,7 @@ pub fn vk_to_control(vk: i32) -> Option<(u16, u16)> {
 }
 
 /// Control identity → legacy VK (the inverse of [`vk_to_control`], for the degraded fallbacks).
+#[must_use]
 pub fn control_to_vk(page: u16, usage: u16) -> Option<i32> {
     match page {
         0x09 => Some(match usage {
@@ -764,9 +776,9 @@ pub fn control_to_vk(page: u16, usage: u16) -> Option<i32> {
         }),
         0x07 => Some(match usage {
             0x27 => 0x30,
-            u @ 0x1E..=0x26 => (u - 0x1E) as i32 + 0x31,
-            u @ 0x04..=0x1D => (u - 0x04) as i32 + 0x41,
-            u @ 0x3A..=0x45 => (u - 0x3A) as i32 + 0x70,
+            u @ 0x1E..=0x26 => i32::from(u - 0x1E) + 0x31,
+            u @ 0x04..=0x1D => i32::from(u - 0x04) + 0x41,
+            u @ 0x3A..=0x45 => i32::from(u - 0x3A) + 0x70,
             0x2A => 0x08,
             0x2B => 0x09,
             0x28 => 0x0D,
@@ -856,7 +868,7 @@ impl Drop for ControlObserver {
     fn drop(&mut self) {
         CONTROL_OBSERVERS
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .retain(|(id, _)| *id != self.id);
     }
 }
@@ -868,7 +880,7 @@ pub fn observe_controls() -> ControlObserver {
     let id = CONTROL_OBSERVER_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     CONTROL_OBSERVERS
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .push((id, tx));
     ControlObserver { id, rx }
 }
@@ -885,7 +897,7 @@ fn publish_control_observation(
     };
     CONTROL_OBSERVERS
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .retain(|(_, tx)| tx.send(ev.clone()).is_ok());
 }
 
@@ -898,7 +910,7 @@ pub(crate) fn note_held(
 ) {
     let mut set = hits.to_vec();
     normalize_hits(&mut set);
-    let mut g = HELD.lock().unwrap_or_else(|e| e.into_inner());
+    let mut g = HELD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     match g.iter_mut().position(|(s, _, _)| s == source) {
         Some(i) if set.is_empty() => {
             g.swap_remove(i);
@@ -938,7 +950,7 @@ pub(crate) fn source_pid(pid_hex: &str) -> Option<crate::registry::CanonicalPid>
 /// bookkeeping. When this is false (CLI one-shots, tests), [`control_held`] returns `None` and
 /// callers degrade to their legacy VK poll.
 pub fn held_registry_live() -> bool {
-    !INJECT.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+    !INJECT.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty()
 }
 
 /// Whether `(page, usage)` is currently held — device-aware. `pid = Some(p)` counts only presses
@@ -953,7 +965,7 @@ pub fn control_held(
         return None;
     }
     // Both sides are already canonical by construction — no normalize-the-query step to forget.
-    let g = HELD.lock().unwrap_or_else(|e| e.into_inner());
+    let g = HELD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     Some(g.iter().any(|(_, src_pid, set)| {
         (pid.is_none() || pid == *src_pid) && set.binary_search(&(page, usage)).is_ok()
     }))
@@ -1171,7 +1183,7 @@ pub fn binding_rule(b: &Binding) -> Option<Rule> {
 /// The assembled live runtime: the one [`Engine`] every input source dispatches through, plus the
 /// bits the daemon needs that aren't expressible as plain `Rule`s.
 pub struct Runtime {
-    /// The unified dispatcher (base rules + named HyperShift layers).
+    /// The unified dispatcher (base rules + named `HyperShift` layers).
     pub engine: Engine,
     /// The app-aware auto-switch ROUTING TABLE. Deliberately not folded into `engine`: see the
     /// note in [`build_runtime_from`]. Both the dispatcher and the UI lamp resolve a focused app
@@ -1191,7 +1203,7 @@ pub struct Runtime {
     pub cast_sectors: usize,
     /// The radial menu name the cast wedges are registered under (matches the rules built here).
     pub cast_menu: String,
-    /// Per-input HyperShift bookkeeping: which layer(s) each currently-held input activated, keyed
+    /// Per-input `HyperShift` bookkeeping: which layer(s) each currently-held input activated, keyed
     /// by the activating [`Trigger`]. Lets a release of a SPECIFIC input drop ONLY that input's
     /// layer(s) — instead of the old `release_all()`-on-any-release that dropped every layer the
     /// moment any unrelated button went up.
@@ -1223,9 +1235,10 @@ impl Runtime {
     }
 
     /// Does the active engine bind a `Trigger::MicTap` or `Trigger::AppFocus` anywhere (base or
-    /// any HyperShift layer)? Cheap — a cached bool from build time (see `poll_needed`'s doc), not
+    /// any `HyperShift` layer)? Cheap — a cached bool from build time (see `poll_needed`'s doc), not
     /// a live scan. The pump-cadence seam uses this to decide whether the live worker still needs
     /// its ~50ms periodic-poll cadence or can idle.
+    #[must_use]
     pub fn needs_periodic_poll(&self) -> bool {
         self.poll_needed
     }
@@ -1239,6 +1252,7 @@ impl Runtime {
     /// If this trigger fires a [`crate::action::Action::MomentaryMic`], its `(device, mode)` — so
     /// the daemon's edge loop can do the press on DOWN and the restore on UP (a held action the
     /// stateless dispatch can't express on its own). `None` if no momentary-mic binds this input.
+    #[must_use]
     pub fn momentary_mic_for(
         &self,
         trigger: &Trigger,
@@ -1255,6 +1269,7 @@ impl Runtime {
     /// daemon's edge loop can snapshot+drop the DPI on DOWN and restore it on UP (a held action the
     /// stateless dispatch can't express). `None` if no sniper binds this input, or if its `dpi` is 0
     /// (an un-configured bind — never drop to 0 DPI). Mirrors [`momentary_mic_for`].
+    #[must_use]
     pub fn sniper_dpi_for(&self, trigger: &Trigger) -> Option<u16> {
         for rule in self.engine.resolve(trigger) {
             if let crate::action::Action::Sniper { dpi } = &rule.action {
@@ -1269,6 +1284,7 @@ impl Runtime {
     /// on DOWN, key up on UP), the way a real key behaves. `None` if no key remap binds this input
     /// (it then dispatches normally as a one-shot). Mirrors [`momentary_mic_for`] — both express a
     /// held action the stateless [`crate::action::Action`] layer (which can only tap) cannot.
+    #[must_use]
     pub fn key_remap_for(&self, trigger: &Trigger) -> Option<String> {
         for rule in self.engine.resolve(trigger) {
             if let crate::action::Action::Key { key } = &rule.action {
@@ -1278,7 +1294,7 @@ impl Runtime {
         None
     }
 
-    /// Handle an input DOWN edge for HyperShift, in the configured STANCE:
+    /// Handle an input DOWN edge for `HyperShift`, in the configured STANCE:
     ///   * `Hold` — the layer lives while the input is held (Razer's behaviour).
     ///   * `Latch` — this press toggles the layer on/off; the up edge is ignored.
     ///   * `Smart` — the layer holds immediately (usable right now); the UP edge decides:
@@ -1342,7 +1358,7 @@ impl Runtime {
         }
     }
 
-    /// Handle an input UP edge for HyperShift. In the `Hold` stance this releases exactly the
+    /// Handle an input UP edge for `HyperShift`. In the `Hold` stance this releases exactly the
     /// layer(s) this input activated; in `Smart` it classifies the press (tap = latch, long =
     /// momentary end); the latch/one-shot stances ignore up edges entirely.
     pub fn release_for_input(&mut self, trigger: &Trigger) {
@@ -1363,8 +1379,7 @@ impl Runtime {
                 let dur_ms = self
                     .down_at
                     .remove(trigger)
-                    .map(|t| t.elapsed().as_millis() as u64)
-                    .unwrap_or(u64::MAX);
+                    .map_or(u64::MAX, |t| t.elapsed().as_millis() as u64);
                 if let Some(layers) = self.held_by.remove(trigger) {
                     for l in &layers {
                         if dur_ms < self.hold_ms {
@@ -1406,12 +1421,12 @@ impl Runtime {
         }
     }
 
-    /// Is `layer` still activated by some physically-held input (the held_by map)?
+    /// Is `layer` still activated by some physically-held input (the `held_by` map)?
     fn kept_by_inputs(&self, layer: &str) -> bool {
         self.held_by.values().any(|v| v.iter().any(|x| x == layer))
     }
 
-    /// Reconcile a SOFTWARE latch on a named layer (the tray/hotkey "HyperShift ON" toggle, as
+    /// Reconcile a SOFTWARE latch on a named layer (the tray/hotkey "`HyperShift` ON" toggle, as
     /// opposed to a physically-held input). `on` asserts the layer held; `!on` releases it — but
     /// ONLY if neither a physically-held input nor a stance latch still owns it, so dropping the
     /// tray latch can't yank a layer out from under a finger (or a latched stance). Engine layers
@@ -1449,13 +1464,14 @@ pub const CAST_MENU: &str = "comms";
 /// 2. **`cast.toml`** radial wedges -> [`Trigger::RadialSector`] rules (one per bound sector) and
 ///    glyph spells -> [`Trigger::Gesture`] rules.
 /// 3. **`profiles/*.rules.toml`** sidecars (the migration importer's spine output, and any future
-///    GUI-authored rules) -> their `Rule`s verbatim, *including* HyperShift `layer` tags, so an
+///    GUI-authored rules) -> their `Rule`s verbatim, *including* `HyperShift` `layer` tags, so an
 ///    imported held-layer bind dispatches as a real layer.
 /// 4. **`apps.toml`** app-switch rules -> [`Trigger::AppFocus`] -> [`Action::ProfileSwitch`] rules,
 ///    so focus-driven profile switching is the same spine primitive (a daemon intent).
 ///
 /// Returns a [`Runtime`] (the engine + the leftovers the daemon needs). Pure aside from reading the
 /// config files; safe to call at daemon startup.
+#[must_use]
 pub fn build_runtime() -> Runtime {
     let bindings = Bindings::load();
     let cast = CastConfig::load();
@@ -1473,6 +1489,7 @@ pub fn build_runtime() -> Runtime {
 /// Testable core of [`build_runtime`]: assemble the [`Runtime`] from already-loaded configs. Keeps
 /// the file IO ([`build_runtime`]) separate from the pure rule-folding so the mapping is unit-
 /// testable without touching disk.
+#[must_use]
 pub fn build_runtime_from(
     bindings: &Bindings,
     cast: &CastConfig,
@@ -1588,6 +1605,7 @@ pub const GUI_RULES_FILE: &str = "gui.rules.toml";
 /// sets on your keyboard at once, and deleting a profile left its binds firing forever. The import
 /// wizard's own status line says "press apply on the profile to make it live" — this makes that
 /// true. A profile is one object: settings, lighting, AND binds.
+#[must_use]
 pub fn sidecar_is_live(file_name: &str, active_profile: &str) -> bool {
     if file_name == GUI_RULES_FILE {
         return true;
@@ -1605,10 +1623,12 @@ pub fn sidecar_is_live(file_name: &str, active_profile: &str) -> bool {
 /// `Vec<Rule>`. Missing dir degrades to an empty list rather than failing the daemon; a sidecar that
 /// won't parse is reported through [`take_sidecar_faults`] so a client can say so instead of the
 /// user's binds quietly not existing.
+#[must_use]
 pub fn load_rule_sidecars() -> Vec<Rule> {
     load_rule_sidecars_with(|name| sidecar_is_live(name, &crate::profile::active()))
 }
 
+#[must_use]
 pub fn load_rule_sidecars_except(excluded_file_name: &str) -> Vec<Rule> {
     let active = crate::profile::active();
     load_rule_sidecars_with(move |name| {
@@ -1742,7 +1762,7 @@ mod spine_tests {
 
     #[test]
     fn injected_event_before_any_listener_is_buffered_then_delivered() {
-        let _guard = INJECT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = INJECT_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // The startup race (issue: first macro keypress dropped): the macro-key reader can push an
         // injected control BEFORE the live-dispatch listener registers its drain. The event must be
         // BUFFERED and handed to the first sink that registers — so no first keypress is lost.
@@ -1760,7 +1780,7 @@ mod spine_tests {
             .expect("the pre-registration macro keypress was delivered to the new sink");
         assert_eq!(got.ev.hits, ev.hits, "the buffered keypress survived the race");
         // and once a sink exists, further injects broadcast straight through (no second buffering).
-        inject_event(ev.clone());
+        inject_event(ev);
         assert!(
             rx.try_recv().is_ok(),
             "post-registration events broadcast directly to the live sink"
@@ -1782,7 +1802,7 @@ mod spine_tests {
         fn signaled(h: isize) -> bool {
             unsafe { WaitForSingleObject(h as HANDLE, 0) == WAIT_OBJECT_0 }
         }
-        let _guard = INJECT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = INJECT_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (id_a, _rx_a, wake_a) = inject_register();
         let (id_b, rx_b, wake_b) = inject_register();
         assert!(wake_a != 0 && wake_b != 0, "each listener minted its own wake event");
@@ -1823,7 +1843,7 @@ mod spine_tests {
         fn signaled(h: isize) -> bool {
             unsafe { WaitForSingleObject(h as HANDLE, 0) == WAIT_OBJECT_0 }
         }
-        let _guard = INJECT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = INJECT_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // The resident dispatch pump, blocked in its wait.
         let (id, _rx, wake) = inject_register();
         let _ = signaled(wake); // clean, non-signaled slate
@@ -2427,12 +2447,12 @@ fn signal_listeners(sinks: &[(u64, std::sync::mpsc::Sender<Injected>, isize)]) {
 fn signal_listeners(_sinks: &[(u64, std::sync::mpsc::Sender<Injected>, isize)]) {}
 
 /// Wake EVERY registered listen loop by signaling its wake event. Called by every producer of
-/// listener work — `neuron-app`'s `send_live` (a LiveCommand for the resident worker), the runtime's
+/// listener work — `neuron-app`'s `send_live` (a `LiveCommand` for the resident worker), the runtime's
 /// stop, and (in place) `inject_event` — so the pump drains the work on its next wait return instead
 /// of sitting out its cadence. Wakes ALL listeners, not just one: see the module note above on why a
 /// single shared event is wrong. Safe to call from any thread; no-op off-Windows.
 pub fn wake_pump() {
-    let sinks = INJECT.lock().unwrap_or_else(|e| e.into_inner());
+    let sinks = INJECT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     signal_listeners(&sinks);
 }
 
@@ -2465,7 +2485,7 @@ struct WaitPlan {
 /// Turn an `on_tick` cadence hint into a concrete Win32 wait recipe (see [`WaitPlan`]).
 #[cfg(windows)]
 fn plan_wait(cadence: std::time::Duration) -> WaitPlan {
-    let ms = cadence.as_millis().clamp(1, u32::MAX as u128) as u32;
+    let ms = cadence.as_millis().clamp(1, u128::from(u32::MAX)) as u32;
     let turbo = cadence < std::time::Duration::from_millis(16);
     WaitPlan {
         use_timer: turbo,
@@ -2484,7 +2504,7 @@ mod plan_wait_tests {
 
     #[test]
     fn idle_cadence_is_a_plain_long_timeout() {
-        let plan = plan_wait(Duration::from_millis(1000));
+        let plan = plan_wait(Duration::from_secs(1));
         assert!(!plan.use_timer);
         assert_eq!(plan.timeout_ms, 1000);
     }
@@ -2645,7 +2665,7 @@ pub(crate) mod win {
 
     unsafe fn device_path(hdev: isize) -> String {
         let mut size: u32 = 0;
-        GetRawInputDeviceInfoW(hdev as _, RIDI_DEVICENAME, std::ptr::null_mut(), &mut size);
+        GetRawInputDeviceInfoW(hdev as _, RIDI_DEVICENAME, std::ptr::null_mut(), &raw mut size);
         if size == 0 || size > 1024 {
             return String::new();
         }
@@ -2653,8 +2673,8 @@ pub(crate) mod win {
         let got = GetRawInputDeviceInfoW(
             hdev as _,
             RIDI_DEVICENAME,
-            buf.as_mut_ptr() as *mut c_void,
-            &mut size,
+            buf.as_mut_ptr().cast::<c_void>(),
+            &raw mut size,
         );
         if got == u32::MAX {
             return String::new();
@@ -2669,7 +2689,7 @@ pub(crate) mod win {
             hdev as _,
             RIDI_PREPARSEDDATA,
             std::ptr::null_mut(),
-            &mut size,
+            &raw mut size,
         );
         if size == 0 || size > 1 << 20 {
             return Vec::new();
@@ -2678,8 +2698,8 @@ pub(crate) mod win {
         let got = GetRawInputDeviceInfoW(
             hdev as _,
             RIDI_PREPARSEDDATA,
-            buf.as_mut_ptr() as *mut c_void,
-            &mut size,
+            buf.as_mut_ptr().cast::<c_void>(),
+            &raw mut size,
         );
         if got == u32::MAX {
             return Vec::new();
@@ -2704,7 +2724,7 @@ pub(crate) mod win {
             page,
             0,
             list.as_mut_ptr(),
-            &mut len,
+            &raw mut len,
             pp,
             report.as_mut_ptr(),
             report.len() as u32,
@@ -2821,7 +2841,7 @@ pub(crate) mod win {
             // `NEURON_PUMP=poll` is the field escape hatch back to the old busy sleep, in case the
             // blocking wait ever needs to be ruled out live without a rebuild. Read ONCE — the
             // env var doesn't change mid-run.
-            let use_wait = std::env::var("NEURON_PUMP").map(|v| v != "poll").unwrap_or(true);
+            let use_wait = std::env::var("NEURON_PUMP").map_or(true, |v| v != "poll");
             // THIS listener's own wake event (minted by `inject_register` above; see `wake_pump`'s
             // note on why each listener needs its own). A producer `SetEvent`s it to turn queued
             // work into an instant wake instead of waiting out the cadence. May be 0 (null) if
@@ -2867,7 +2887,7 @@ pub(crate) mod win {
                 }
                 let mut msg: MSG = std::mem::zeroed();
                 let mut got_msg = false; // prof: this iteration's wake-reason (see record_wake below)
-                while PeekMessageW(&mut msg, hwnd, 0, 0, PM_REMOVE) != 0 {
+                while PeekMessageW(&raw mut msg, hwnd, 0, 0, PM_REMOVE) != 0 {
                     got_msg = true;
                     if msg.message == WM_INPUT {
                         n_input += 1;
@@ -2876,7 +2896,7 @@ pub(crate) mod win {
                             msg.lParam as HRAWINPUT,
                             RID_INPUT,
                             std::ptr::null_mut(),
-                            &mut size,
+                            &raw mut size,
                             header,
                         );
                         if size > 0 && size < 4096 {
@@ -2884,12 +2904,12 @@ pub(crate) mod win {
                             let got = GetRawInputData(
                                 msg.lParam as HRAWINPUT,
                                 RID_INPUT,
-                                buf.as_mut_ptr() as *mut c_void,
-                                &mut size,
+                                buf.as_mut_ptr().cast::<c_void>(),
+                                &raw mut size,
                                 header,
                             );
                             if got != u32::MAX && got > 0 {
-                                let ri = &*(buf.as_ptr() as *const RAWINPUT);
+                                let ri = &*buf.as_ptr().cast::<RAWINPUT>();
                                 let hdev = ri.header.hDevice as isize;
                                 match ri.header.dwType {
                                     // ── ANY HID device: gamepad, multi-button mouse, the headset knob,
@@ -3074,8 +3094,8 @@ pub(crate) mod win {
                             }
                         }
                     }
-                    TranslateMessage(&msg);
-                    DispatchMessageW(&msg);
+                    TranslateMessage(&raw const msg);
+                    DispatchMessageW(&raw const msg);
                 }
                 // FOCUS-LOSS SAFETY NET (the down-set's teardown, mirroring the engine's focus-loss
                 // release_all): a key/button released while another app — or the secure desktop /
@@ -3134,7 +3154,7 @@ pub(crate) mod win {
                 // ~1s) is never mistaken for starvation. See prof::pump.
                 crate::prof::pump::record_tick(
                     inject_id,
-                    cadence.as_millis().min(u32::MAX as u128) as u32,
+                    cadence.as_millis().min(u128::from(u32::MAX)) as u32,
                 );
                 if use_wait {
                     let plan = super::plan_wait(cadence);
@@ -3148,7 +3168,7 @@ pub(crate) mod win {
                     }
                     if plan.use_timer && !timer.is_null() {
                         // Relative (negative) due time — see `WaitPlan::due_100ns`'s doc.
-                        SetWaitableTimer(timer, &plan.due_100ns, 0, None, std::ptr::null(), 0);
+                        SetWaitableTimer(timer, &raw const plan.due_100ns, 0, None, std::ptr::null(), 0);
                         handles[n as usize] = timer;
                         n += 1;
                     } else if !timer.is_null() {

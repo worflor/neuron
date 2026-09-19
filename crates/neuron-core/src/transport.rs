@@ -5,7 +5,7 @@
 //! Platform-agnostic transport: send/receive HID feature reports to the control pipe.
 //!
 //! Windows uses the native `windows-sys` path (open with access=0, feature IOCTLs are
-//! FILE_ANY_ACCESS — which is how you talk to a protected HID mouse). Other platforms
+//! `FILE_ANY_ACCESS` — which is how you talk to a protected HID mouse). Other platforms
 //! can drop in a hidapi/hidraw impl behind the same trait later.
 //!
 //! [`Transport::wire_lock`] serializes conversations from separate handles opened on the SAME
@@ -35,6 +35,7 @@ pub struct DevicePath(OsString);
 
 impl DevicePath {
     /// The backend converts this to its native path type (e.g. wide chars on Windows).
+    #[must_use]
     pub fn as_os_str(&self) -> &OsStr {
         &self.0
     }
@@ -42,6 +43,7 @@ impl DevicePath {
     /// Build from a Windows wide string, stripping a trailing NUL if present so the stored key is
     /// the bare path. (The NUL is re-added on demand by [`to_wide_nul`].)
     #[cfg(windows)]
+    #[must_use]
     pub fn from_wide(w: &[u16]) -> DevicePath {
         use std::os::windows::ffi::OsStringExt;
         let trimmed = match w.last() {
@@ -54,6 +56,7 @@ impl DevicePath {
     /// The NUL-terminated wide string `CreateFileW` consumes. The terminator is centralized here so
     /// no caller can forget it.
     #[cfg(windows)]
+    #[must_use]
     pub fn to_wide_nul(&self) -> Vec<u16> {
         use std::os::windows::ffi::OsStrExt;
         self.0.encode_wide().chain(std::iter::once(0)).collect()
@@ -65,6 +68,7 @@ impl DevicePath {
     /// depending on a platform backend. Not for production use — real paths come from
     /// `enumerate()`.
     #[doc(hidden)]
+    #[must_use]
     pub fn from_str_for_tests(s: &str) -> DevicePath {
         DevicePath(OsString::from(s))
     }
@@ -86,9 +90,9 @@ pub struct HidDeviceInfo {
     pub usage_page: u16,
     pub usage: u16,
     pub feature_len: u16,
-    /// The collection's OUTPUT/INPUT report byte lengths (HIDP_CAPS `OutputReportByteLength` /
+    /// The collection's OUTPUT/INPUT report byte lengths (`HIDP_CAPS` `OutputReportByteLength` /
     /// `InputReportByteLength`), the second wire surface's signature. `feature_len` above is the
-    /// razer_report control pipe's shape; these are what a request/reply-over-output/input family
+    /// `razer_report` control pipe's shape; these are what a request/reply-over-output/input family
     /// (HID++: a 7-byte short or 20-byte long report) is recognized by. Zero when the OS reports no
     /// output/input report on this collection (feature-only pipes). Kept alongside `feature_len` so
     /// a `Dialect::claims` can test whichever surface it rides.
@@ -103,6 +107,7 @@ pub struct HidDeviceInfo {
 
 impl HidDeviceInfo {
     /// The identity of the PHYSICAL unit this collection belongs to — see [`path_instance`].
+    #[must_use]
     pub fn instance(&self) -> String {
         path_instance(&self.path.0.to_string_lossy())
     }
@@ -155,6 +160,7 @@ fn truncate_at_usb_device_node(path: &str) -> &str {
 }
 
 /// Regex-free by design (no new dependency): lowercase + segment filtering only.
+#[must_use]
 pub fn path_instance(path: &str) -> String {
     let truncated = truncate_at_usb_device_node(path);
     let lower = truncated.to_ascii_lowercase();
@@ -176,7 +182,7 @@ pub fn path_instance(path: &str) -> String {
         .join("#")
 }
 
-/// Process-global DevicePath → wire-lock registry. Strong Arcs, never evicted: the set of
+/// Process-global `DevicePath` → wire-lock registry. Strong Arcs, never evicted: the set of
 /// control pipes on one machine in one boot is tiny (a handful), and a stable Arc means two
 /// opens at any two times always share the same lock.
 static WIRE_LOCKS: LazyLock<Mutex<HashMap<DevicePath, Arc<WireLock>>>> =
@@ -225,6 +231,7 @@ pub struct WireLock {
 
 impl WireLock {
     /// A process-local-only lock — for test fakes and platforms with no kernel half.
+    #[must_use]
     pub fn new_local() -> WireLock {
         WireLock {
             local: Mutex::new(()),
@@ -265,7 +272,7 @@ impl WireLock {
     pub fn acquire(&self) -> WireGuard<'_> {
         let local = self.local.lock().unwrap_or_else(PoisonError::into_inner);
         #[cfg(windows)]
-        let os_held = self.os.as_ref().is_some_and(|m| m.acquire());
+        let os_held = self.os.as_ref().is_some_and(windows_hid::OsWireMutex::acquire);
         #[cfg(target_os = "linux")]
         let os_held = self.os.as_ref().is_some_and(|m| m.acquire());
         WireGuard {
@@ -312,7 +319,7 @@ impl Drop for WireGuard<'_> {
 ///
 /// Two wire surfaces live here. The PROVEN one is the feature-report request/reply pair
 /// ([`set_feature`](Transport::set_feature)/[`get_feature`](Transport::get_feature)) — how
-/// `razer_report` talks (a SetFeature IOCTL request, a GetFeature IOCTL reply). The SECOND surface
+/// `razer_report` talks (a `SetFeature` IOCTL request, a `GetFeature` IOCTL reply). The SECOND surface
 /// ([`write_output`](Transport::write_output)/[`read_input`](Transport::read_input)) is for
 /// families whose requests ride an OUTPUT report (`WriteFile`) and whose replies arrive as INPUT
 /// reports (`ReadFile`) — the shape HID++ uses (DIALECT-RND survey ruling: "HID++ requests ride
@@ -351,10 +358,10 @@ pub trait Transport {
         anyhow::bail!("transport does not carry input reports")
     }
 
-    /// The per-pipe WIRE LOCK shared by every transport opened on the same DevicePath, or None for
-    /// a transport with no shared identity (test fakes). A razer_report conversation is a
+    /// The per-pipe WIRE LOCK shared by every transport opened on the same `DevicePath`, or None for
+    /// a transport with no shared identity (test fakes). A `razer_report` conversation is a
     /// SetFeature→GetFeature(s) pair on one firmware control pipe; two handles interleaving pairs
-    /// cross-read replies. The conversation OWNER (a Dialect's exec/exec_fast, a
+    /// cross-read replies. The conversation OWNER (a Dialect's `exec/exec_fast`, a
     /// probe loop) holds this for the duration of ONE request/reply conversation — not per call,
     /// which couldn't keep the pair atomic. Cross-PROCESS too on Windows: [`WireLock`] layers a
     /// named kernel mutex under the process-local one, so a `neuron-cli` write serializes against
@@ -394,6 +401,7 @@ pub enum ReadStep {
 
 /// Classify one `InputReader::read` result into the loop action a caller should take. See
 /// [`ReadStep`] for the contract each variant implies.
+#[must_use]
 pub fn classify_read(result: Result<Option<usize>>) -> ReadStep {
     match result {
         Ok(Some(n)) => ReadStep::Data(n),
@@ -668,7 +676,7 @@ mod tests {
     // instantiation covers every instantiation.
     static_assertions::assert_not_impl_any!(WireGuard<'static>: Send);
 
-    /// A feature-report-only transport (like a razer_report mock): it implements the pull surface
+    /// A feature-report-only transport (like a `razer_report` mock): it implements the pull surface
     /// and inherits the DEFAULT output/input bodies. Pins that a family which never carries
     /// output/input reports still gets an honest error, not silence, from the second surface.
     struct FeatureOnly;
@@ -891,7 +899,7 @@ mod tests {
     }
 
     /// A scripted fake `InputReader` — no OS handle, just a canned outcome per call — standing in
-    /// for `WinHidReader` so the CALLER LOOP contract (the thing hidwatch/macrokeys/seiren_probe
+    /// for `WinHidReader` so the CALLER LOOP contract (the thing `hidwatch/macrokeys/seiren_probe`
     /// all copy) is provable headless: a timeout must never look like "device gone", and a real
     /// error must always end the loop.
     struct ScriptedReader {

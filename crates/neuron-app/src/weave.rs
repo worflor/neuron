@@ -452,7 +452,7 @@ pub mod tempo {
 #[inline]
 pub fn phase(hz: f32) -> f32 {
     let secs = shimmer_epoch().elapsed().as_secs_f64();
-    let turn = (secs * hz as f64).rem_euclid(1.0); // 0..1 of a revolution — bounded, precise
+    let turn = (secs * f64::from(hz)).rem_euclid(1.0); // 0..1 of a revolution — bounded, precise
     (turn * std::f64::consts::TAU) as f32
 }
 
@@ -2129,7 +2129,7 @@ pub fn weave_proof_sheet(t: f32) -> (usize, usize, Vec<u8>) {
 
 /// Write the proof as an ANIMATED GIF (one screen: every material × every colour, the stroke tapering
 /// through all sizes, looping ~2.4s) + a single PNG still + the GALLERY sheet (the metaball swatches
-/// as the MATERIAL page renders them). Rows = materials (DirectedIntent, Fluid Thought, Materialized
+/// as the MATERIAL page renders them). Rows = materials (`DirectedIntent`, Fluid Thought, Materialized
 /// Desire, Gentle Breeze, Sudden Insight, Molten Resolve); columns = weave colour.
 pub fn write_proof_sheets() {
     use image::codecs::gif::{GifEncoder, Repeat};

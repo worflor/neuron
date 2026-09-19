@@ -319,6 +319,7 @@ pub struct Timer {
 
 impl Timer {
     /// Elapsed so far, without ending the measurement.
+    #[must_use]
     pub fn elapsed(&self) -> Duration {
         self.start.elapsed()
     }
@@ -400,6 +401,7 @@ pub fn with_edge<T>(origin: Instant, f: impl FnOnce() -> T) -> T {
 
 /// The edge origin this thread is servicing, if any — so work handed to another thread (a macro
 /// worker) can carry the measurement with it via [`adopt`].
+#[must_use]
 pub fn origin() -> Option<Instant> {
     EDGE_ORIGIN.get()
 }
@@ -431,6 +433,7 @@ pub fn adopt(origin: Option<Instant>) {
 /// `false` for every rule after the one that emitted the first keystroke, quietly putting a process
 /// spawn back on the dispatch pump whenever a binding's Key rule happened to be ordered before its
 /// Shell rule.
+#[must_use]
 pub fn servicing_input_edge() -> bool {
     ON_INPUT_PATH.get()
 }
@@ -528,7 +531,7 @@ mod tests {
     static SHARED_STAGE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn shared_stages() -> std::sync::MutexGuard<'static, ()> {
-        SHARED_STAGE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        SHARED_STAGE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     #[test]

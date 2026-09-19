@@ -48,6 +48,7 @@ pub const MOUSE_VKS: [i32; 5] = [
 pub const VK_ESCAPE: i32 = 0x1B;
 
 /// True if `vk` is one of the mouse buttons (vs a keyboard key).
+#[must_use]
 pub fn is_mouse_vk(vk: i32) -> bool {
     MOUSE_VKS.contains(&vk)
 }
@@ -57,6 +58,7 @@ pub fn is_mouse_vk(vk: i32) -> bool {
 /// else falls back to a transparent `VK 0x..` (we never hide the real value — the design motto).
 ///
 /// This is the name a press-to-bind UI shows the moment the user releases the control.
+#[must_use]
 pub fn vk_name(vk: i32) -> String {
     match vk {
         0x01 => "Left Mouse".into(),
@@ -110,6 +112,7 @@ impl Drop for KeyReadGuard {
 /// Suppress live keyboard reads on the current thread for the lifetime of the returned guard — so a
 /// hot, reactivity-irrelevant render (the lighting tile grid) skips the per-key `GetAsyncKeyState`
 /// syscalls entirely. See [`SUPPRESS_KEY_READS`].
+#[must_use]
 pub fn suppress_key_reads() -> KeyReadGuard {
     SUPPRESS_KEY_READS.with(|s| s.set(true));
     KeyReadGuard(())
@@ -119,8 +122,9 @@ pub fn suppress_key_reads() -> KeyReadGuard {
 /// regardless of the input-arm gate. Returns `false` immediately (no syscall) while a
 /// [`suppress_key_reads`] guard is active on this thread.
 #[cfg(windows)]
+#[must_use]
 pub fn key_down(vk: i32) -> bool {
-    if SUPPRESS_KEY_READS.with(|s| s.get()) {
+    if SUPPRESS_KEY_READS.with(std::cell::Cell::get) {
         return false;
     }
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
@@ -155,7 +159,7 @@ pub fn set_macro_held(mask: u8) {
 /// suppression `key_down` honours, so the lighting tile-grid thumbnails skip the macro scan too. `i ≥ 8`
 /// is always `false` (the mask is 8 bits). Pure read of shared state — safe regardless of the input gate.
 pub fn macro_key_down(i: usize) -> bool {
-    if SUPPRESS_KEY_READS.with(|s| s.get()) {
+    if SUPPRESS_KEY_READS.with(std::cell::Cell::get) {
         return false;
     }
     i < 8 && (MACRO_HELD.load(std::sync::atomic::Ordering::Relaxed) & (1 << i)) != 0

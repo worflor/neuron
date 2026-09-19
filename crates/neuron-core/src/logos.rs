@@ -73,8 +73,8 @@ impl Tree {
     #[inline]
     fn predict(&self, ctx: usize, node: usize) -> (f64, f64) {
         let i = self.cell(ctx, node);
-        let c0 = self.c[i] as f64;
-        let c1 = self.c[i + 1] as f64;
+        let c0 = f64::from(self.c[i]);
+        let c1 = f64::from(self.c[i + 1]);
         let n = c0 + c1;
         let p1 = (c1 + self.alpha) / (n + 2.0 * self.alpha);
         (p1, n)
@@ -132,10 +132,10 @@ impl MatchAxis {
         if n < 4 {
             return None;
         }
-        let h = ((self.hist[n - 1] as u64) << 24)
-            ^ ((self.hist[n - 2] as u64) << 16)
-            ^ ((self.hist[n - 3] as u64) << 8)
-            ^ (self.hist[n - 4] as u64);
+        let h = (u64::from(self.hist[n - 1]) << 24)
+            ^ (u64::from(self.hist[n - 2]) << 16)
+            ^ (u64::from(self.hist[n - 3]) << 8)
+            ^ u64::from(self.hist[n - 4]);
         let h = (h.wrapping_mul(2654435761)) & self.mask;
         Some(h as usize)
     }
@@ -144,7 +144,7 @@ impl MatchAxis {
     fn predict(&self) -> Option<(u8, f64)> {
         if self.match_pos >= 0 && (self.match_pos as usize) < self.hist.len() {
             let b = self.hist[self.match_pos as usize];
-            let conf = 1.0 - (-(self.run as f64) / 4.0).exp(); // grows with run length
+            let conf = 1.0 - (-f64::from(self.run) / 4.0).exp(); // grows with run length
             Some((b, conf))
         } else {
             None
@@ -249,7 +249,7 @@ impl Model {
         let inv = 1.0 / det;
         let k = (self.e_sta * self.e_sbb - self.e_sab * self.e_stb) * inv;
         let g = (self.e_saa * self.e_stb - self.e_sab * self.e_sta) * inv;
-        let pred = k * self.prev1 as f64 - g * self.prev2 as f64;
+        let pred = k * f64::from(self.prev1) - g * f64::from(self.prev2);
         (pred.round().clamp(0.0, 255.0)) as usize
     }
 
@@ -258,14 +258,14 @@ impl Model {
     fn vol_bin(&self) -> usize {
         let mut s: u32 = 0;
         for &b in &self.vwin {
-            s += b as u32;
+            s += u32::from(b);
         }
         // log2 of the sum, capped to 16 bins
         let l = if s == 0 { 0 } else { 32 - s.leading_zeros() };
         (l as usize).min(15)
     }
 
-    /// The U-axis context for the current bit lane: (prev1_bit<<1)|prev2_bit within lane k.
+    /// The U-axis context for the current bit lane: (`prev1_bit`<<`1)|prev2_bit` within lane k.
     #[inline]
     fn u_ctx(&self) -> usize {
         let b1 = ((self.prev1 >> self.bit_k) & 1) as usize;
@@ -323,7 +323,7 @@ impl Model {
 
         // M-axis: independent log-odds injection.
         if let Some((mbyte, conf)) = self.m.predict() {
-            let mbit = ((mbyte >> self.bit_k) & 1) as f64;
+            let mbit = f64::from((mbyte >> self.bit_k) & 1);
             // a confident match pushes the bit toward its predicted value
             let strength = 3.0 * conf; // log-odds magnitude
             let logit_m = if mbit > 0.5 { strength } else { -strength };
@@ -372,9 +372,9 @@ impl Model {
     fn end_byte(&mut self, byte: u8) {
         // E-axis decayed AR(2) stats (decay older evidence, fold in the new triple)
         const DECAY: f64 = 0.98;
-        let t = byte as f64;
-        let a = self.prev1 as f64;
-        let b = self.prev2 as f64;
+        let t = f64::from(byte);
+        let a = f64::from(self.prev1);
+        let b = f64::from(self.prev2);
         self.e_saa = self.e_saa * DECAY + a * a;
         self.e_sbb = self.e_sbb * DECAY + b * b;
         self.e_sab = self.e_sab * DECAY + a * b;
@@ -439,6 +439,7 @@ pub struct LogosStream {
 }
 
 impl LogosStream {
+    #[must_use]
     pub fn new() -> LogosStream {
         LogosStream {
             model: Model::new(0),
@@ -504,6 +505,7 @@ const LOGOS_MODE: u8 = 0x00;
 /// coding does not help, so output is never more than `len + 1`. Test-only forward-work for
 /// the `.gwyph` codec — no runtime caller yet.
 #[cfg(test)]
+#[must_use]
 pub fn encode(data: &[u8]) -> Vec<u8> {
     if data.is_empty() {
         return Vec::new();
@@ -536,12 +538,13 @@ pub fn encode(data: &[u8]) -> Vec<u8> {
 
 /// Decompress `len` bytes from `[mode byte][payload]`. Test-only (see [`encode`]).
 #[cfg(test)]
+#[must_use]
 pub fn decode(data: &[u8], len: usize) -> Vec<u8> {
     if len == 0 {
         return Vec::new();
     }
     match data[0] {
-        RAW_MODE => data[1..1 + len].to_vec(),
+        RAW_MODE => data[1..=len].to_vec(),
         LOGOS_MODE => {
             let mut model = Model::new(0);
             let mut dec = RangeDecoder::new(&data[1..]);
@@ -583,7 +586,7 @@ impl RangeEncoder {
 
     fn encode_bit(&mut self, p1: f64, bit: u8) {
         // split point for bit==1 region
-        let mut split = ((self.range as f64) * p1) as u32;
+        let mut split = (f64::from(self.range) * p1) as u32;
         if split == 0 {
             split = 1;
         }
@@ -593,7 +596,7 @@ impl RangeEncoder {
         if bit == 1 {
             self.range = split;
         } else {
-            self.low += split as u64;
+            self.low += u64::from(split);
             self.range -= split;
         }
         // renormalize: emit top byte whenever range shrinks below 2^24
@@ -633,7 +636,7 @@ impl<'a> RangeDecoder<'a> {
             pos: 0,
         };
         for _ in 0..5 {
-            d.code = (d.code << 8) | d.next_byte() as u64;
+            d.code = (d.code << 8) | u64::from(d.next_byte());
         }
         d
     }
@@ -646,7 +649,7 @@ impl<'a> RangeDecoder<'a> {
     }
 
     fn decode_bit(&mut self, p1: f64) -> u8 {
-        let mut split = ((self.range as f64) * p1) as u32;
+        let mut split = (f64::from(self.range) * p1) as u32;
         if split == 0 {
             split = 1;
         }
@@ -654,16 +657,16 @@ impl<'a> RangeDecoder<'a> {
             split = self.range - 1;
         }
         let offset = self.code - self.low;
-        let bit = if offset < split as u64 {
+        let bit = if offset < u64::from(split) {
             self.range = split;
             1
         } else {
-            self.low += split as u64;
+            self.low += u64::from(split);
             self.range -= split;
             0
         };
         while self.range < (1 << 24) {
-            self.code = ((self.code << 8) | self.next_byte() as u64) & 0xFF_FFFF_FFFF;
+            self.code = ((self.code << 8) | u64::from(self.next_byte())) & 0xFF_FFFF_FFFF;
             self.low = (self.low << 8) & 0xFF_FFFF_FFFF;
             self.range <<= 8;
         }

@@ -169,8 +169,8 @@ fn intent_vector_survives_complex_strokes_into_wedges() {
     let dz = 40.0;
 
     // CHANGED MIND: far left… no, RIGHT. The hand meant east.
-    let mut changed: Vec<C> = (0..40).map(|i| C { re: -(i as f64) * 6.0, im: 0.0 }).collect();
-    changed.extend((0..80).map(|i| C { re: -240.0 + i as f64 * 6.0, im: 0.0 }));
+    let mut changed: Vec<C> = (0..40).map(|i| C { re: -f64::from(i) * 6.0, im: 0.0 }).collect();
+    changed.extend((0..80).map(|i| C { re: -240.0 + f64::from(i) * 6.0, im: 0.0 }));
     let (ix, iy) = intent_vector(&changed);
     assert!(ix > 0.0, "changed-mind intent points right (ix={ix})");
     assert_eq!(pick_wedge(ix, iy, dz, 2), Some(1), "changed-mind -> N=2 wheel reads NO (east)");
@@ -179,11 +179,11 @@ fn intent_vector_survives_complex_strokes_into_wedges() {
     // CIRCLING approach that EXITS straight up — the exit flick dominates -> north.
     let mut circ: Vec<C> = (0..60)
         .map(|i| {
-            let a = i as f64 / 60.0 * std::f64::consts::TAU;
+            let a = f64::from(i) / 60.0 * std::f64::consts::TAU;
             C { re: 60.0 * a.sin(), im: 60.0 * (1.0 - a.cos()) }
         })
         .collect();
-    circ.extend((0..50).map(|i| C { re: 0.0, im: -(i as f64) * 5.0 }));
+    circ.extend((0..50).map(|i| C { re: 0.0, im: -f64::from(i) * 5.0 }));
     let (ix, iy) = intent_vector(&circ);
     assert!(iy < 0.0, "circle-exit intent points up (iy={iy})");
     // N=4 choose wheel: west=0, south=1, east=2, NORTH=3.
@@ -192,7 +192,7 @@ fn intent_vector_survives_complex_strokes_into_wedges() {
     // WOBBLE: a rightward flick carrying lateral noise still reads as a clean east intent.
     let wobble: Vec<C> = (0..40)
         .map(|i| {
-            let t = i as f64;
+            let t = f64::from(i);
             C { re: t * 5.0, im: (t * 0.7).sin() * 8.0 }
         })
         .collect();
@@ -653,7 +653,7 @@ fn beacon_stress_e2e() {
         let mut answered = 0;
         while answered < 9 {
             let (pid, mid, ..) = recv_ask(&rx, Duration::from_secs(10));
-            let choice = if mid == "bs_mm_b" { 1 } else { 0 };
+            let choice = usize::from(mid == "bs_mm_b");
             host.answer(pid, Some(choice));
             answered += 1;
         }

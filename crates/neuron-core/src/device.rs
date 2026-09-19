@@ -3,7 +3,7 @@
 // Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
 
 //! A live device: the control transport + its registry definition, with wire exec routed through
-//! the device's protocol [`Dialect`](crate::dialect::Dialect) (razer_report today).
+//! the device's protocol [`Dialect`](crate::dialect::Dialect) (`razer_report` today).
 
 use crate::dialect::Dialect;
 use crate::registry::{CommandSpec, DeviceDef};
@@ -35,6 +35,7 @@ impl Device {
     /// what `open_path` does one line below. `#[doc(hidden)]` keeps it out of the public surface,
     /// matching [`DevicePath::from_str_for_tests`](crate::transport::DevicePath::from_str_for_tests).
     #[doc(hidden)]
+    #[must_use]
     pub fn with_transport(def: DeviceDef, pid: u16, transport: Box<dyn Transport>) -> Self {
         Device {
             def,
@@ -89,7 +90,7 @@ impl Device {
     /// connected device that exposes a [`Capability`](crate::registry::Capability), not a single
     /// literal command name. Some capabilities have MORE THAN ONE wire dialect — `SetBrightness` is
     /// satisfied by either the matrix top-level `set_brightness` command OR a legacy `[lighting]`
-    /// block's brightness spec (the BlackWidow Chroma V2) — so resolving those by a single command
+    /// block's brightness spec (the `BlackWidow` Chroma V2) — so resolving those by a single command
     /// name reintroduces the exact dialect leak [`DeviceDef::supports`](crate::registry::DeviceDef::supports)
     /// exists to prevent: a legacy board that CAN set brightness reads as "no such command" and is
     /// never selected. Route dual-dialect writes through here so the capability gate decides.
@@ -171,12 +172,12 @@ impl Device {
     }
 
     /// Fast streaming write: send the report, wait the device's round-trip, then drain the reply ONCE
-    /// (no busy-poll retry loop). The razer_report protocol requires the response to be read before the
+    /// (no busy-poll retry loop). The `razer_report` protocol requires the response to be read before the
     /// next command — skip it and the device ignores every subsequent write (frozen frame). It ALSO
     /// requires giving the link time to carry the command: on a 2.4 GHz dongle the SET round-trips
     /// host→dongle→mouse→back, and reading/firing again before that completes overruns the device and
     /// DROPS frames — the lighting FLICKER. `stream_wait_us` (registry data; ~31ms for the Naga's
-    /// wireless receiver, 0 for wired boards) is exactly OpenRazer's per-receiver `wait_us`. Wired/legacy
+    /// wireless receiver, 0 for wired boards) is exactly `OpenRazer`'s per-receiver `wait_us`. Wired/legacy
     /// boards keep their ~1-2ms cost; the wireless mouse trades a lower ceiling (~16fps) for stability.
     ///
     /// ROUTED through the device's protocol [`Dialect`](crate::dialect::Dialect): the
@@ -206,7 +207,7 @@ impl Device {
     /// Release this family's CUSTODY of the device back to firmware — the rest-state restore run at
     /// stream teardown and app exit (DIALECT-RND "Device-mode lifecycle"). Teardown surfaces call
     /// THIS, never a raw device-mode write: the release routes through the def's [`Dialect`], so a
-    /// razer board returns its driver-mode lease (device_mode -> 0x00, re-enabling onboard buttons/FN
+    /// razer board returns its driver-mode lease (`device_mode` -> 0x00, re-enabling onboard buttons/FN
     /// + firmware wake-restore) while a HID++ (or any never-in-custody) family no-ops instead of
     /// receiving a razer-framed mode packet it would misread. FAIL CLOSED on an unknown dialect,
     /// exactly like [`exec_dynamic_tx`](Self::exec_dynamic_tx) — a def we can't identify gets no bytes.
@@ -265,6 +266,7 @@ pub struct DeviceSession<'a> {
 }
 
 impl<'a> DeviceSession<'a> {
+    #[must_use]
     pub fn new(reg: &'a crate::registry::Registry) -> Self {
         DeviceSession {
             reg,
@@ -279,6 +281,7 @@ impl<'a> DeviceSession<'a> {
         self.driver_ready.clear();
     }
 
+    #[must_use]
     pub fn registry(&self) -> &'a crate::registry::Registry {
         self.reg
     }
@@ -434,7 +437,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    /// The exact resolution gap this capability path closes: the legacy BlackWidow has NO top-level
+    /// The exact resolution gap this capability path closes: the legacy `BlackWidow` has NO top-level
     /// `set_brightness` command (its brightness lives in the `[lighting]` block), so the command-name
     /// resolver (`open_with_command`) never selected it — yet it CAN set brightness. `open_with_capability`
     /// keys off the SAME `def.supports(cap)` predicate, which honors the lighting dialect. Pins that the
@@ -554,7 +557,7 @@ mod tests {
 
     /// Proves that `DeviceSession::with_writable` invalidates and retries a stale handle once.
     /// Drives the REAL retry code through the `with_writable_via` seam (no
-    /// `transport::enumerate()`, no real hardware): attempt 1 resolves a fresh `Device`, ensure_driver's
+    /// `transport::enumerate()`, no real hardware): attempt 1 resolves a fresh `Device`, `ensure_driver`'s
     /// handshake succeeds (device is alive), then the write itself discovers the handle just went
     /// stale (models a wireless sleep landing between resolve and write) and fails. `with_writable`
     /// must invalidate, resolve a SECOND fresh handle, re-run the driver handshake on it, and retry the
@@ -571,7 +574,7 @@ mod tests {
         let op_calls = Arc::new(AtomicUsize::new(0));
 
         let resolve = {
-            let bw = bw.clone();
+            let bw = bw;
             let dead = dead.clone();
             let device_mode_sets = device_mode_sets.clone();
             let resolve_calls = resolve_calls.clone();
@@ -596,7 +599,7 @@ mod tests {
         let mut session = DeviceSession::new(&reg);
         let out = {
             let op_calls = op_calls.clone();
-            let dead = dead.clone();
+            let dead = dead;
             session.with_writable_via("test-write", resolve, move |d: &Device| {
                 let n = op_calls.fetch_add(1, Ordering::SeqCst) + 1;
                 if n == 1 {
@@ -640,9 +643,9 @@ mod tests {
         let resolve_calls = Arc::new(AtomicUsize::new(0));
 
         let resolve = {
-            let bw = bw.clone();
-            let dead = dead.clone();
-            let device_mode_sets = device_mode_sets.clone();
+            let bw = bw;
+            let dead = dead;
+            let device_mode_sets = device_mode_sets;
             let resolve_calls = resolve_calls.clone();
             move |_reg: &crate::registry::Registry| -> Result<Device> {
                 resolve_calls.fetch_add(1, Ordering::SeqCst);
@@ -682,13 +685,13 @@ mod tests {
     }
 
     /// LIVE stream-strategy probe — quantifies what one custom-frame report costs on the wire under
-    /// four different SET/GET disciplines, on the real BlackWidow. Run with the app STOPPED (two
+    /// four different SET/GET disciplines, on the real `BlackWidow`. Run with the app STOPPED (two
     /// writers on one control pipe corrupt both):
     /// `cargo test -p neuron --lib device::tests::live_stream_strategy_probe -- --ignored --nocapture`
     ///
-    /// Background: the stream path (`send_lighting_fast`) does SetFeature + an IMMEDIATE GetFeature
+    /// Background: the stream path (`send_lighting_fast`) does `SetFeature` + an IMMEDIATE `GetFeature`
     /// drain (wired `stream_wait_us` = 0). Razer firmware needs ~600-900µs to process a command
-    /// before it can answer; a too-early GetFeature can stall the control pipe for milliseconds.
+    /// before it can answer; a too-early `GetFeature` can stall the control pipe for milliseconds.
     /// A frame on this board = 7 reports, so per-report waste × 14 transfers decides the real fps
     /// ceiling — Synapse animates this same board far faster than the ~6fps we HISTORICALLY
     /// believed was the hardware limit (this probe falsified that: 30fps sustained clean under

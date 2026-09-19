@@ -102,7 +102,7 @@ pub fn encode_hex(bytes: &[u8]) -> String {
 
 /// `None` on an odd length or a non-hex digit.
 pub fn decode_hex(hex: &str) -> Option<Vec<u8>> {
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return None;
     }
     (0..hex.len())
@@ -121,7 +121,7 @@ mod tests {
     ///
     /// The other direction is NOT asserted, because Windows genuinely reports collections that do
     /// not exist at the USB level. A Naga V2 Pro shows two — `0x000c/0x0001` at 3 bytes and
-    /// `0x0001/0x0080` at 2 — on paths under `mi_00&col03&colNN`, whose PnP parent is Razer's own
+    /// `0x0001/0x0080` at 2 — on paths under `mi_00&col03&colNN`, whose `PnP` parent is Razer's own
     /// `RZVIRTUAL` bus, not the USB device. They are fabricated by the vendor driver and no Linux
     /// kernel will ever enumerate them. Windows-only collections are printed, so the asymmetry
     /// stays visible rather than being asserted away.

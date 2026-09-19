@@ -75,9 +75,9 @@ pub(crate) fn boost_saturation(c: Rgb, amount: f32) -> Rgb {
         return c;
     }
     // Rec.601 luma — the grey level the chroma is measured against.
-    let luma = 0.299 * c.r as f32 + 0.587 * c.g as f32 + 0.114 * c.b as f32;
+    let luma = 0.299 * f32::from(c.r) + 0.587 * f32::from(c.g) + 0.114 * f32::from(c.b);
     let push = |x: u8| {
-        let v = luma + (x as f32 - luma) * (1.0 + amount);
+        let v = luma + (f32::from(x) - luma) * (1.0 + amount);
         v.round().clamp(0.0, 255.0) as u8
     };
     Rgb::new(push(c.r), push(c.g), push(c.b))
@@ -198,7 +198,7 @@ fn run_loop() {
             if prof_last.elapsed() >= Duration::from_secs(1) {
                 eprintln!(
                     "PROF: screen_ambient grab avg={:.3}ms grabs/s={} (always-on whole-desktop StretchBlt)",
-                    prof_us / prof_n.max(1) as f64 / 1000.0,
+                    prof_us / f64::from(prof_n.max(1)) / 1000.0,
                     prof_n
                 );
                 prof_n = 0;
@@ -293,7 +293,7 @@ mod imp {
             // screen region); MSDN says set the brush origin right after switching to HALFTONE.
             SetStretchBltMode(mem, HALFTONE);
             let mut pt: POINT = std::mem::zeroed();
-            SetBrushOrgEx(mem, 0, 0, &mut pt);
+            SetBrushOrgEx(mem, 0, 0, &raw mut pt);
             let blit = StretchBlt(
                 mem, 0, 0, cols as i32, rows as i32, screen, vx, vy, vw, vh, SRCCOPY,
             );
@@ -323,8 +323,8 @@ mod imp {
                     bmp,
                     0,
                     rows as u32,
-                    buf.as_mut_ptr() as *mut core::ffi::c_void,
-                    &mut bi,
+                    buf.as_mut_ptr().cast::<core::ffi::c_void>(),
+                    &raw mut bi,
                     DIB_RGB_COLORS,
                 );
                 if got != 0 {
