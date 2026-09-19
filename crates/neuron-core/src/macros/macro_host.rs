@@ -2558,6 +2558,20 @@ mod tests {
     }
 
     #[test]
+    fn rust_refuses_effectful_act_frames_while_disarmed() {
+        crate::action::arm_input(false);
+        let (ok, msg) = run_act(
+            MacroMode::Bound,
+            "forged_bound",
+            "clipboard_set",
+            &json!("must-not-land"),
+            false,
+        );
+        assert!(!ok, "forged effect frame bypassed the host authority check");
+        assert_eq!(msg, "[disarmed]");
+    }
+
+    #[test]
     fn breaker_trips_after_repeated_crashes_then_resets() {
         let mut b = Breaker::default();
         for _ in 0..=BREAKER_MAX {
