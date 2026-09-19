@@ -474,21 +474,48 @@ def _node_for_stmt(stmt):
 
 
 def _parse_nodes(source):
-    """Python source -> {"ok": true, "nodes": [...]} (the MacroNode wire shape), or
-    {"ok": false, "error": {"line", "msg"}} on a SyntaxError -- never raises."""
+    """Python source -> typed entry body plus exact module/entry source around it."""
     import ast
     try:
-        tree = ast.parse(source.lstrip("﻿"))  # same editor-BOM tolerance as _check/_register
+        tree = ast.parse(source.lstrip("\ufeff"))
     except SyntaxError as e:
         return {"ok": False, "error": {"line": e.lineno, "msg": str(e.msg)}}
-    # the macro body is the statements inside `def macro(ctx):` (or `def main(ctx):`). If there is no
-    # such def (a half-written macro), model the WHOLE module body so it still maps.
+
     body = tree.body
+    prefix = ""
+    header = "def macro(ctx):\n"
+    suffix = ""
+    entry = None
     for n in tree.body:
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in ("macro", "main"):
+            entry = n
             body = n.body
             break
-    return {"ok": True, "nodes": [_node_for_stmt(s) for s in body]}
+
+    if entry is not None:
+        lines = source.splitlines(keepends=True)
+        starts = [entry.lineno] + [d.lineno for d in entry.decorator_list]
+        start = max(0, min(starts) - 1)
+        end = entry.end_lineno or entry.lineno
+        prefix = "".join(lines[:start])
+        if body and body[0].lineno > entry.lineno:
+            body_start = body[0].lineno - 1
+            header = "".join(lines[start:body_start])
+        elif not body:
+            header = "".join(lines[start:end])
+            if not header.endswith("\n"):
+                header += "\n"
+        else:
+            header = "def macro(ctx):\n"
+        suffix = "".join(lines[end:])
+
+    return {
+        "ok": True,
+        "nodes": [_node_for_stmt(s) for s in body],
+        "prefix": prefix,
+        "header": header,
+        "suffix": suffix,
+    }
 
 
 # ── concurrent fires: one SERIAL worker per macro id ─────────────────────────────────────────────

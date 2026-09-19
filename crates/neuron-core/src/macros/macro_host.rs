@@ -29,7 +29,8 @@
 //! Nothing here ever blocks the input/UI thread: [`fire_async`] dispatches and returns; the
 //! blocking [`invoke`]/[`check`] are for the GUI "test run" + CLI only, always with a hard budget.
 
-use crate::macros::node::MacroNode;
+use crate::macros::node::{MacroDocument, MacroNode};
+use crate::macros::policy::mode_from_source;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{BufReader, Read, Write};
@@ -102,6 +103,8 @@ pub enum ParseError {
     /// The source didn't parse. `line` is the 1-based line (0 if Python gave none); `msg` is
     /// Python's syntax-error message.
     Syntax { line: u32, msg: String },
+    /// The source's leading Neuron compiler directive is malformed or contradictory.
+    Policy { line: u32, msg: String },
     /// The sidecar/runtime couldn't service the request (no python, pipe broken, did not answer).
     Host { msg: String },
 }
@@ -110,6 +113,7 @@ impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ParseError::Syntax { line, msg } => write!(f, "syntax error (line {line}): {msg}"),
+            ParseError::Policy { line, msg } => write!(f, "macro policy error (line {line}): {msg}"),
             ParseError::Host { msg } => write!(f, "{msg}"),
         }
     }
@@ -120,6 +124,8 @@ impl std::error::Error for ParseError {}
 /// The outcome of parsing a macro's Python source into the typed node tree: the macro body as an
 /// ordered `Vec<MacroNode>` on success, or a [`ParseError`].
 pub type ParseResult = Result<Vec<MacroNode>, ParseError>;
+/// Whole-module parse for the visual constructor: preserved module/entry source + typed body.
+pub type DocumentParseResult = Result<MacroDocument, ParseError>;
 
 /// Hard ceiling on a single blocking macro invocation (test-run / CLI). The input path uses
 /// [`fire_async`] and never waits at all.
@@ -392,6 +398,7 @@ impl MacroHost {
     /// restores the previous source and retires the uncertain sidecar session.
     pub fn register(&self, id: &str, source: &str) -> Result<(), String> {
         validate_macro_id(id)?;
+        mode_from_source(source)?;
         let _mutation = self
             .mutations
             .lock()
@@ -651,16 +658,11 @@ impl MacroHost {
         }
     }
 
-    /// Parse a macro's Python `source` into the typed [`MacroNode`] tree (the macro body — the
-    /// statements inside `def macro(ctx):`). The sidecar's `ast` does the real parsing; this just
-    /// frames the request and deserializes the reply. The DUAL of [`crate::macros::nodes_to_source`]
-    /// (nodes -> source, in Rust): together they make the visual constructor's mapping two-way.
-    ///
-    /// A `SyntaxError` in the source is the EXPECTED half-typed case and comes back as
-    /// [`ParseError::Syntax`] with the line + message — it never panics or kills the sidecar. No
-    /// python runtime / broken pipe / no answer -> [`ParseError::Host`]. Bounded by [`FIRE_BUDGET`];
-    /// like [`check`](MacroHost::check), do NOT call from the input/UI thread.
-    pub fn parse_macro(&self, source: &str) -> ParseResult {
+    /// Parse a whole Python macro module for the visual constructor. Python owns the grammar and
+    /// returns the typed entry-body nodes plus exact source around/at that entry; Rust owns the
+    /// Neuron compiler directive and never executes source merely to discover authority.
+    pub fn parse_document(&self, source: &str) -> DocumentParseResult {
+        let mode = mode_from_source(source).map_err(|msg| ParseError::Policy { line: 1, msg })?;
         let (rx, shared, rid, sent) = {
             let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             self.ensure_locked(&mut g).map_err(host_err)?;
@@ -680,22 +682,21 @@ impl MacroHost {
         match rx.recv_timeout(FIRE_BUDGET) {
             Ok(v) if v.get("ok").and_then(Value::as_bool) == Some(true) => {
                 let nodes = v.get("nodes").cloned().unwrap_or(Value::Null);
-                serde_json::from_value::<Vec<MacroNode>>(nodes).map_err(|e| {
-                    host_err(format!("sidecar returned malformed node JSON: {e}"))
+                let body = serde_json::from_value::<Vec<MacroNode>>(nodes)
+                    .map_err(|e| host_err(format!("sidecar returned malformed node JSON: {e}")))?;
+                Ok(MacroDocument {
+                    mode,
+                    prefix: v.get("prefix").and_then(Value::as_str).unwrap_or("").to_string(),
+                    header: v.get("header").and_then(Value::as_str).unwrap_or("").to_string(),
+                    body,
+                    suffix: v.get("suffix").and_then(Value::as_str).unwrap_or("").to_string(),
                 })
             }
-            // a parse that ran but found a SyntaxError -> the structured {line, msg} error.
             Ok(v) => {
                 let err = v.get("error");
-                let line = err
-                    .and_then(|e| e.get("line"))
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0) as u32;
-                let msg = err
-                    .and_then(|e| e.get("msg"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("syntax error")
-                    .to_string();
+                let line = err.and_then(|e| e.get("line")).and_then(Value::as_u64).unwrap_or(0) as u32;
+                let msg = err.and_then(|e| e.get("msg")).and_then(Value::as_str)
+                    .unwrap_or("syntax error").to_string();
                 Err(ParseError::Syntax { line, msg })
             }
             Err(_) => {
@@ -704,6 +705,11 @@ impl MacroHost {
                 Err(host_err("sidecar parse timed out — session retired"))
             }
         }
+    }
+
+    /// Body-only compatibility view over parse_document.
+    pub fn parse_macro(&self, source: &str) -> ParseResult {
+        self.parse_document(source).map(|doc| doc.body)
     }
 
     /// Run source once without registering or persisting it. This is the editor/CLI candidate path:
@@ -1956,6 +1962,10 @@ pub fn load_macro(id: &str) -> Option<String> {
 /// `register`/`scan_macro_dir` are reachable both as methods and module functions). Parses macro
 /// `source` into the typed [`MacroNode`] tree; pair with [`crate::macros::nodes_to_source`] for the
 /// inverse. Do NOT call from the input/UI thread (it can block up to [`FIRE_BUDGET`]).
+pub fn parse_document(source: &str) -> DocumentParseResult {
+    macro_host().parse_document(source)
+}
+
 pub fn parse_macro(source: &str) -> ParseResult {
     macro_host().parse_macro(source)
 }

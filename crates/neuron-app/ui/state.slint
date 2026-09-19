@@ -468,11 +468,12 @@ export global State {
     in-out property <float> out-gain: 100;
     in-out property <bool> out-muted: false;
     callback refresh-out();
-    // macro authoring: write PYTHON -> check (syntax) -> save+register -> test run.
-    // A macro is real CPython run warm by the Macro Host sidecar (full power: ctypes/subprocess/
-    // anything). `def macro(ctx):` is the entry; `import neuron` gives ctx + key/clipboard/mouse/run.
+    // macro authoring: source is runtime truth. New source is BOUND; one compiler line opts into RAW
+    // full-power CPython. The UI toggle edits that line rather than storing a second preference.
     in-out property <string> macro-name: "";          // the macro's name (file stem + registry id)
     in-out property <string> macro-source: "";
+    in-out property <bool> macro-raw: false;           // derived from "# neuron: raw" in macro-source
+    callback set-macro-raw(bool);                      // edits that source directive, never hidden state
     in-out property <[string]> macro-dryrun;          // defs found (after check) / log lines (after test)
     in-out property <string> macro-status: "";
     in-out property <bool> macro-busy: false;
@@ -495,7 +496,7 @@ export global State {
     // BIDIRECTIONAL SYNC (no loops): a canvas edit regenerates the source AND sets `macro-source-dirty`
     // so the code editor's `edited` hook knows that change came from codegen and skips the re-parse. A
     // change the USER types in code view leaves the flag false → `refresh-macro-blocks` re-parses OFF the
-    // UI thread (parse_macro blocks up to FIRE_BUDGET) and, on Ok, RESEEDS the tree + repopulates blocks;
+    // UI thread (parse_document blocks up to FIRE_BUDGET) and, on Ok, RESEEDS the document + blocks;
     // on a syntax error it KEEPS the last good blocks (the canvas never blanks) + shows "line N: msg".
     in-out property <bool> macro-code-view: true;    // CODE-first by default; false = the blocks canvas
     in-out property <[MacroBlock]> macro-blocks;
@@ -516,8 +517,8 @@ export global State {
     callback refresh-macro-blocks(string);           // (source) -> parse off-thread -> reseed tree + set macro-blocks/-error
     callback macro-check(string);                     // ast.parse only — no execution
     callback macro-save(string, string);              // (name, source) -> persist + register warm
-    callback macro-test(string, string);              // (name, source) -> register + run once now
-    // (name, source) -> register the LIVE editor source + fire_mock so ONLY its neuron.ask() beacons
+    callback macro-test(string, string);              // (name, source) -> run candidate once, never persist
+    // (name, source) -> mock-fire LIVE editor source so ONLY its neuron.ask() beacons
     // rise (input disarmed — nothing real runs), the SAME pipeline as SYSTEM→BEACONS' test. A safe way
     // to discover + learn the ask/beacon syntax by seeing it work.
     callback test-asks(string, string);

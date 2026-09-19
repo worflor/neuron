@@ -27,7 +27,7 @@ use crate::ui::{
     SpectrumStop,
     State, Theme,
 };
-use neuron::macros::{value_to_source, MacroNode, Value};
+use neuron::macros::{document_to_source, value_to_source, MacroDocument, MacroMode, MacroNode, Value};
 use neuron::import::Imported;
 use neuron::lighting::Rgb;
 use slint::{
@@ -419,11 +419,9 @@ pub struct Shared {
     /// for the common single-frame (non-sequenced) case; clamped to the active spectrum's length.
     pub active_frame: usize,
     pub layers_rev: u64,
-    /// The macro CONSTRUCTOR's working tree — the source of truth behind the blocks canvas. Every
-    /// canvas edit (edit-step / add-step / delete-step / move-step) mutates THIS, then Rust regenerates
-    /// `macro-source` (via `nodes_to_source`) and re-flattens it into `macro-blocks`. A successful
-    /// code-view parse reseeds it. Held here so it survives across callbacks (it IS the macro's shape).
-    pub macro_tree: Vec<MacroNode>,
+    /// The macro constructor's whole working document. The typed tree owns the entry body while the
+    /// preserved prefix/suffix carry imports, options, helpers and compiler metadata through canvas edits.
+    pub macro_doc: MacroDocument,
 }
 
 pub type SharedRt = Rc<RefCell<Shared>>;
@@ -1282,37 +1280,27 @@ fn edit_node_value(node: &mut MacroNode, v: String) {
     }
 }
 
-/// After ANY tree mutation: regenerate the Python source from the tree (pure Rust codegen, instant),
-/// push it into `macro-source` WITH the dirty-guard set (so the CodeArea's `edited` hook skips the
-/// re-parse), recompute `macro-has-ask`, and re-flatten the tree into `macro-blocks`. The canvas + the
-/// code view both stay current off the one source of truth, synchronously, no Python in the loop.
-fn regenerate_from_tree(st: &State, tree: &[MacroNode]) {
-    let source = neuron::macros::nodes_to_source(tree);
+/// After a structural canvas mutation, rebuild the module from the whole document and re-flatten
+/// its body. Module-level source and the execution-mode directive survive unchanged.
+fn regenerate_from_document(st: &State, doc: &MacroDocument) {
+    let source = document_to_source(doc);
     st.set_macro_has_ask(source.contains("neuron.ask"));
-    // ARM the dirty-guard only when the code editor is actually mounted (the user is in code view):
-    // a programmatic `set_macro_source` updates the CodeArea via its <=> binding but does NOT fire
-    // `edited`, so arming it while the canvas is showing would leave it stuck true and mis-flag the
-    // user's next code-view keystroke. Canvas edits happen while !code-view, so this stays false then.
+    st.set_macro_raw(doc.mode == MacroMode::Raw);
     if st.get_macro_code_view() {
         st.set_macro_source_dirty(true);
     }
     st.set_macro_source(source.into());
     let mut blocks = Vec::new();
-    flatten_macro(tree, 0, "", &mut blocks);
+    flatten_macro(&doc.body, 0, "", &mut blocks);
     st.set_macro_blocks(ModelRc::new(VecModel::from(blocks)));
 }
 
-/// After a VALUE-ONLY edit (edit-step): regenerate the Python source from the tree and recompute
-/// `macro-has-ask`, but DO NOT re-flatten into `macro-blocks`. A value edit changes a node's param,
-/// not the macro's STRUCTURE — so the flat model's row layout is unchanged, and re-setting it would
-/// rebuild every `MacroBlockEl` (losing the caret / focus of the very field being typed in, and on a
-/// blur-commit yanking focus mid-gesture). The live field already shows the typed text; the model's
-/// now-stale `value` is harmless because it's only re-read on the NEXT structural re-flatten (add /
-/// delete / move), which reads the now-correct tree. This is what makes click-away commit + smooth
-/// typing possible. Structural ops still call `regenerate_from_tree` (which DOES re-flatten).
-fn regenerate_source_only(st: &State, tree: &[MacroNode]) {
-    let source = neuron::macros::nodes_to_source(tree);
+/// A value-only edit changes source but not row structure, so keep the current flat model mounted
+/// to preserve field focus/caret and rebuild only the module source.
+fn regenerate_source_only(st: &State, doc: &MacroDocument) {
+    let source = document_to_source(doc);
     st.set_macro_has_ask(source.contains("neuron.ask"));
+    st.set_macro_raw(doc.mode == MacroMode::Raw);
     if st.get_macro_code_view() {
         st.set_macro_source_dirty(true);
     }
@@ -1332,9 +1320,14 @@ pub fn install(app: &AppWindow) -> SharedRt {
         selected_layer: 0,
         active_frame: 0,
         layers_rev: 0,
-        // the macro constructor starts empty; the canvas's root +add invites the first step, or a
-        // parse of an existing macro's source (on entering the editor) reseeds it.
-        macro_tree: Vec::new(),
+        // Fresh authoring starts BOUND; loading/parsing source replaces this whole document.
+        macro_doc: MacroDocument {
+            mode: MacroMode::Bound,
+            prefix: String::new(),
+            header: "def macro(ctx):\n".into(),
+            body: Vec::new(),
+            suffix: String::new(),
+        },
     }));
     UI_SHARED.with(|s| *s.borrow_mut() = Some(shared.clone()));
     let st = app.global::<State>();
@@ -3952,15 +3945,22 @@ pub fn install(app: &AppWindow) -> SharedRt {
             if let Some(app) = w.upgrade() {
                 let st = app.global::<State>();
                 let source = src.to_string();
-                // an empty editor has no steps and no error — reset the tree to empty and flatten it,
-                // which emits just the root +add invitation (the canvas's "build it here" entry point).
-                // No parse, no thread.
+                // Empty source is a fresh BOUND document with no module baggage.
                 if source.trim().is_empty() {
-                    with_shared(|sh| sh.borrow_mut().macro_tree.clear());
+                    with_shared(|sh| {
+                        sh.borrow_mut().macro_doc = MacroDocument {
+                            mode: MacroMode::Bound,
+                            prefix: String::new(),
+                            header: "def macro(ctx):\n".into(),
+                            body: Vec::new(),
+                            suffix: String::new(),
+                        };
+                    });
                     let mut blocks = Vec::new();
                     flatten_macro(&[], 0, "", &mut blocks);
                     st.set_macro_blocks(ModelRc::new(VecModel::from(blocks)));
                     st.set_macro_parse_error("".into());
+                    st.set_macro_raw(false);
                     st.set_macro_parsing(false);
                     return;
                 }
@@ -3981,23 +3981,26 @@ pub fn install(app: &AppWindow) -> SharedRt {
                         });
                     },
                     move || {
-                    let result = neuron::macros::parse_macro(&source);
+                    let result = neuron::macros::parse_document(&source);
                     let _ = slint::invoke_from_event_loop(move || {
                         if let Some(app) = back.upgrade() {
                             let st = app.global::<State>();
                             match result {
-                                Ok(nodes) => {
+                                Ok(doc) => {
                                     let mut blocks = Vec::new();
-                                    flatten_macro(&nodes, 0, "", &mut blocks);
+                                    flatten_macro(&doc.body, 0, "", &mut blocks);
                                     st.set_macro_blocks(ModelRc::new(VecModel::from(blocks)));
                                     st.set_macro_parse_error("".into());
-                                    // RESEED the working tree from the parsed source so canvas edits
-                                    // build ON what the code view holds (the source is the truth a
-                                    // user just typed; the canvas must inherit it, not stomp it).
-                                    with_shared(|sh| sh.borrow_mut().macro_tree = nodes.clone());
+                                    st.set_macro_raw(doc.mode == MacroMode::Raw);
+                                    with_shared(|sh| sh.borrow_mut().macro_doc = doc.clone());
                                 }
                                 // KEEP the last blocks — the canvas stays readable while you fix the line.
                                 Err(neuron::macros::ParseError::Syntax { line, msg }) => {
+                                    st.set_macro_parse_error(
+                                        format!("line {line}: {}", first_line(&msg)).into(),
+                                    );
+                                }
+                                Err(neuron::macros::ParseError::Policy { line, msg }) => {
                                     st.set_macro_parse_error(
                                         format!("line {line}: {}", first_line(&msg)).into(),
                                     );
@@ -4033,16 +4036,16 @@ pub fn install(app: &AppWindow) -> SharedRt {
         app.global::<State>().on_edit_step(move |path, value| {
             if let Some(app) = w.upgrade() {
                 let mut shared = sh.borrow_mut();
-                if let Some(node) = node_at_path(&mut shared.macro_tree, &path) {
+                if let Some(node) = node_at_path(&mut shared.macro_doc.body, &path) {
                     let v = value.to_string();
                     edit_node_value(node, v);
-                    let tree = shared.macro_tree.clone();
+                    let doc = shared.macro_doc.clone();
                     drop(shared);
                     // VALUE-ONLY: refresh the source (the code view + has-ask), but DON'T re-flatten —
                     // re-setting `macro-blocks` would rebuild this field and steal its caret/focus. The
                     // field already shows the typed text; the model re-reads the tree on the next
                     // structural edit. This is the commit-on-blur + no-cursor-jank fix.
-                    regenerate_source_only(&app.global::<State>(), &tree);
+                    regenerate_source_only(&app.global::<State>(), &doc);
                 }
             }
         });
@@ -4058,7 +4061,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                     return;
                 };
                 let mut shared = sh.borrow_mut();
-                if let Some(body) = body_at_context(&mut shared.macro_tree, &insert) {
+                if let Some(body) = body_at_context(&mut shared.macro_doc.body, &insert) {
                     body.push(node);
                     // the new node's PATH — the focus-on-add target. Root context ("") makes a bare
                     // index ("3"); a branch context ("1.yes") makes "1.yes.<idx>". For an `ask` this is
@@ -4069,14 +4072,14 @@ pub fn install(app: &AppWindow) -> SharedRt {
                     } else {
                         format!("{insert}.{new_idx}")
                     };
-                    let tree = shared.macro_tree.clone();
+                    let doc = shared.macro_doc.clone();
                     drop(shared);
                     let st = app.global::<State>();
                     // re-flatten FIRST (structure changed → the new row must exist), THEN arm the focus
                     // target so the freshly-rendered field's `init` finds it and grabs the caret. A
                     // `raw` (code) step renders no inline field — it's edited in the code view — so skip
                     // arming focus for it (nothing to focus; leaving the target set would be untidy).
-                    regenerate_from_tree(&st, &tree);
+                    regenerate_from_document(&st, &doc);
                     if kind != "raw" {
                         st.set_macro_focus_path(focus_path.into());
                     }
@@ -4091,11 +4094,11 @@ pub fn install(app: &AppWindow) -> SharedRt {
         app.global::<State>().on_delete_step(move |path| {
             if let Some(app) = w.upgrade() {
                 let mut shared = sh.borrow_mut();
-                if let Some((body, idx)) = parent_body_and_index(&mut shared.macro_tree, &path) {
+                if let Some((body, idx)) = parent_body_and_index(&mut shared.macro_doc.body, &path) {
                     body.remove(idx);
-                    let tree = shared.macro_tree.clone();
+                    let doc = shared.macro_doc.clone();
                     drop(shared);
-                    regenerate_from_tree(&app.global::<State>(), &tree);
+                    regenerate_from_document(&app.global::<State>(), &doc);
                 }
             }
         });
@@ -4107,13 +4110,13 @@ pub fn install(app: &AppWindow) -> SharedRt {
         app.global::<State>().on_move_step(move |path, dir| {
             if let Some(app) = w.upgrade() {
                 let mut shared = sh.borrow_mut();
-                if let Some((body, idx)) = parent_body_and_index(&mut shared.macro_tree, &path) {
+                if let Some((body, idx)) = parent_body_and_index(&mut shared.macro_doc.body, &path) {
                     let target = idx as i32 + dir;
                     if target >= 0 && (target as usize) < body.len() {
                         body.swap(idx, target as usize);
-                        let tree = shared.macro_tree.clone();
+                        let doc = shared.macro_doc.clone();
                         drop(shared);
-                        regenerate_from_tree(&app.global::<State>(), &tree);
+                        regenerate_from_document(&app.global::<State>(), &doc);
                     }
                 }
             }
@@ -4316,7 +4319,29 @@ pub fn install(app: &AppWindow) -> SharedRt {
         let w = app.as_weak();
         app.global::<State>().on_note_macro_source(move |s| {
             if let Some(app) = w.upgrade() {
-                app.global::<State>().set_macro_has_ask(s.contains("neuron.ask"));
+                let st = app.global::<State>();
+                st.set_macro_has_ask(s.contains("neuron.ask"));
+                if let Ok(mode) = neuron::macros::mode_from_source(&s) {
+                    st.set_macro_raw(mode == MacroMode::Raw);
+                }
+            }
+        });
+    });
+    // RAW is compiler metadata, not a preference: edit the one source directive then feed the result
+    // back through the same document parser that code-view edits use.
+    bind(app, &shared, |app, _sh| {
+        let w = app.as_weak();
+        app.global::<State>().on_set_macro_raw(move |on| {
+            if let Some(app) = w.upgrade() {
+                let st = app.global::<State>();
+                let mode = if on { MacroMode::Raw } else { MacroMode::Bound };
+                let source = neuron::macros::set_source_mode(&st.get_macro_source(), mode);
+                st.set_macro_raw(on);
+                if st.get_macro_code_view() {
+                    st.set_macro_source_dirty(true);
+                }
+                st.set_macro_source(source.clone().into());
+                st.invoke_refresh_macro_blocks(source.into());
             }
         });
     });
@@ -7464,6 +7489,9 @@ fn refresh_macro_catalog(app: &AppWindow) {
                     Err(_) => ("couldn't read steps (syntax error?)".to_string(), 0),
                 };
                 let options = option_count_from_source(&src);
+                let mode = neuron::macros::mode_from_source(&src)
+                    .map(|m| m.label())
+                    .unwrap_or("INVALID");
                 let trigger = match triggers.get(&id) {
                     Some(ts) if !ts.is_empty() => ts.join("  \u{00b7}  "),
                     _ => "(unbound)".to_string(),
@@ -7473,6 +7501,7 @@ fn refresh_macro_catalog(app: &AppWindow) {
                     summary: summary.into(),
                     steps,
                     options,
+                    mode: mode.into(),
                     trigger: trigger.into(),
                 }
             })
@@ -7498,6 +7527,9 @@ fn load_macro_into_editor(app: &AppWindow, id: &str) {
     let st = app.global::<State>();
     st.set_macro_name(id.into());
     st.set_macro_has_ask(src.contains("neuron.ask"));
+    if let Ok(mode) = neuron::macros::mode_from_source(&src) {
+        st.set_macro_raw(mode == MacroMode::Raw);
+    }
     st.set_macro_source(src.clone().into());
     st.set_macro_status(format!("loaded '{id}' \u{2014} edit it, then save").into());
     // off-thread parse -> blocks + working-tree reseed (refresh-macro-blocks owns both); one path.
