@@ -123,6 +123,10 @@ on Linux). It restores the files from the most recent backup in `.neuron-update-
 install folder. Only files a release ships were backed up and only those come back, so the user's
 config is not affected either way.
 
+`RESULT: rolled-back` means it's done — read the `installed_version` line above it back to the
+user, because that is the version they are now on. `RESULT: blocked` with `NO_BACKUP` means there
+was never an update to undo, which is the case on a fresh install.
+
 ## Admin rights
 
 Windows reports `needs-admin`, Linux reports `needs-root`. Either way a `FLAG` line says which
@@ -191,7 +195,7 @@ needs `sudo rm` and which they may want to keep if they use other Razer tooling.
 | `NOT_ON_PATH` (Linux) | the install folder isn't on `PATH` | they'd have to type the full path; offer the symlink line the flag prints |
 | `MISSING_TOOL` (Linux, STOP) | `curl` or `tar` isn't installed | tell them which one; their package manager has it |
 | `DOWNLOAD_FAILED` (Linux) | an asset couldn't be fetched | check internet, then retry |
-| `ARCHIVE_MISSING` (Linux) | `--archive` points at nothing | check the path |
+| `ZIP_MISSING` / `ARCHIVE_MISSING` | `-ZipPath` / `--archive` points at nothing | check the path |
 
 ## Offline or specific versions
 
