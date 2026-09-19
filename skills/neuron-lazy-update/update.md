@@ -13,8 +13,8 @@ table below applies to either — only the command line differs.
 
 The Windows release is the app plus the CLI, so updating it closes and reopens neuron. The Linux
 release is the CLI alone: nothing is resident, so there is no process to stop, and one extra
-first-install step (a udev rule) that Windows does not have. Both keep the user's config beside
-the binary and never touch it.
+first-install step (a udev rule) that Windows does not have. Neither script ever touches the
+user's config.
 
 ## How to run the script
 

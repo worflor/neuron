@@ -113,9 +113,9 @@ Write-Host "neuron validate - mode: $Mode" -ForegroundColor White
 if ($Mode -eq 'lint') {
     Invoke-Advisory 'rustfmt' { cargo fmt --all --check }
 
-    # The other half of the shipped updater. Same reasoning as the PowerShell gate below, and the
-    # linux CI lane always has bash; a windows contributor without it gets an advisory, not a
-    # failure, because git-for-windows ships one but nothing guarantees it is on PATH.
+    # The other half of the shipped updater, same reasoning as the PowerShell gate below. Skipped
+    # rather than failed when bash is absent: the linux CI lane always has one, a windows
+    # contributor may not.
     $shGate = {
         $bad = 0
         foreach ($f in (git ls-files '*.sh')) {
@@ -175,20 +175,19 @@ if ($Mode -eq 'full') {
         }
     }
 
-    # A running neuron holds a write lock on its own exe, so the release link fails with a
-    # bare LNK1104 that says nothing about why. Anyone who daily-drives neuron hits this the
-    # first time they run the full gate.
+    # A running neuron holds a write lock on its own exe, so the release link below fails with a
+    # bare LNK1104 that names no cause.
     Invoke-Gate 'release target is writable' {
         $locked = @()
         foreach ($exe in @('neuron-app.exe', 'neuron.exe')) {
-            $path = Join-Path (Join-Path $PSScriptRoot 'targetelease') $exe
+            $path = Join-Path (Join-Path $PSScriptRoot 'target\release') $exe
             if (-not (Test-Path -LiteralPath $path)) { continue }
             try { $fs = [IO.File]::Open($path, 'Open', 'ReadWrite', 'None'); $fs.Close() }
             catch { $locked += $exe }
         }
         if ($locked.Count -gt 0) {
             Write-Host "running, so the release build cannot link over it: $($locked -join ', ')"
-            Write-Host "quit neuron from the tray (or run .elease.ps1, which stops it for you) and rerun."
+            Write-Host "quit neuron from the tray (or run .\release.ps1, which stops it for you) and rerun."
         }
         $global:LASTEXITCODE = [int]($locked.Count -gt 0)
     }

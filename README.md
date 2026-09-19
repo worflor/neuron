@@ -15,7 +15,7 @@ one small binary. no account, no cloud, no telemetry. no "please update razer ce
 | **footprint** | no driver, no account, no runtime, no cloud; your config is plain TOML |
 | **license** | most of Neuron is GPL-3.0-or-later with a linking exception; Engram and the eigenmotion research modules have separate Woflo Labs community-source terms. [the exact split](LICENSE.md) |
 
-> **status: public beta mk1.** windows-first, single dev, very much a personal project with too much ambition. mk1 is the same release language my other tools use, and it means exactly this: until now the only eyes and hands on this thing were mine. it works on my desk every day but *obviously* hasn't been tested on yours, and that gap is the whole definition. once it has survived desks that aren't mine, it graduates to mk2. where each feature actually stands, solid to barely-started, is tracked in [state of the project](docs/STATUS.md).
+> **status: public beta mk1.** windows-first, single dev, very much a personal project with too much ambition. mk1 is the same release language my other tools use, and it means exactly this: until now the only eyes and hands on this thing were mine. it works on my desk every day but *obviously* hasn't been tested on yours, and that gap is the whole definition. that goes for getting it onto your desk too: the windows install path has been run end to end here, the linux one has only been tested against synthetic archives, and no razer device has ever been plugged into a linux box running neuron. once it has survived desks that aren't mine, it graduates to mk2. where each feature actually stands, and what evidence is behind each one, is tracked in [state of the project](docs/STATUS.md).
 
 ---
 

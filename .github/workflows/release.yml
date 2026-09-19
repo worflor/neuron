@@ -245,19 +245,14 @@ jobs:
 
           Then replug the device (the rule applies when it next appears).
 
-          The install is portable: neuron keeps its config next to the binary for as long as that
-          directory is writable, so move or copy the folder and your setup goes with it. Extract
-          it wherever you like — ~/.local/share/neuron needs no root. If the binary ends up
-          somewhere it cannot write, config falls back to \$XDG_DATA_HOME/neuron (that is
-          ~/.local/share/neuron), and \$NEURON_RUN_DIR overrides both.
+          Extract this anywhere you can write — ~/.local/share/neuron needs no root. The install
+          is portable: config lives beside the binary, so the folder moves as one. README.md has
+          the details.
 
-          To install or update without doing any of this by hand, point an AI agent at the
-          bundled skill — skills/neuron-lazy-update/ — or run its script yourself:
+          To install or update without doing it by hand, the bundled skill under skills/ drives
+          this, and verifies the checksum and attestation before it touches anything:
 
             bash skills/neuron-lazy-update/scripts/neuron-update.sh --action check
-
-          It verifies the checksum and the provenance attestation before it installs anything,
-          backs up what it overwrites, and can roll back.
 
           Verify the build provenance — it proves this binary came from the commit above:
 

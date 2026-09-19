@@ -5,10 +5,9 @@
 
 # Install, update, or roll back a neuron release install on Linux.
 #
-# The Linux release is the CLI only: no tray, no GUI, nothing resident. That makes this the
-# simpler half of the pair - there is no process to stop and no autostart to preserve. What it
-# still owes the user is everything the Windows script does around the copy: verify before
-# trusting, back up before overwriting, and read the result back afterwards.
+# The Linux release is the CLI only, so unlike the Windows script there is no process to stop
+# and no autostart to preserve. Everything around the copy is the same: verify the download,
+# back up what gets overwritten, read the version back afterwards.
 #
 # Output protocol, meant to be read by an agent, identical to neuron-update.ps1:
 #   key: value         facts
@@ -74,8 +73,7 @@ esac
 
 # ── helpers ───────────────────────────────────────────────────────────────────────────────────
 
-# A release tarball is unpacked by a tool that may not be present. Say so once, up front, rather
-# than failing halfway through an install.
+# Named up front rather than failing halfway through an install.
 need() {
     command -v "$1" >/dev/null 2>&1 && return 0
     flag 'MISSING_TOOL' "this needs '$1', which is not on PATH (STOP)"
@@ -159,8 +157,8 @@ installed=0
 say 'install_dir' "$install_dir"
 say 'installed' "$([ $installed -eq 1 ] && echo true || echo false)"
 
-# The udev rule is what stands between the user and "no devices found". It is a one-time sudo the
-# script deliberately does not perform: installing a system-wide rule is the user's decision.
+# Missing rule is the usual cause of "no devices found". Flagged, never fixed here: installing a
+# system-wide rule is a one-time sudo and the user's decision.
 if [ ! -f "$UDEV_RULE" ]; then
     flag 'NO_UDEV_RULE' "no $UDEV_RULE, so /dev/hidraw* stays root-only and 'neuron list' will likely find nothing. The archive ships 70-neuron.rules; installing it is one sudo, and the two commands are in SOURCE.txt. Do not run them for the user."
 fi
@@ -375,9 +373,8 @@ if [ -n "$new_version" ] && [ "$(parse_version "$cli_out")" != "$(parse_version 
     flag 'CLI_VERSION_MISMATCH' "neuron reports '$cli_out' but SOURCE.txt says $new_version"
 fi
 
-# The run root follows the binary: config lands next to it while this directory stays writable,
-# which is what makes the install portable. Worth stating, because it is where the user's
-# profiles and binds will be.
+# The run root follows the binary: config lands beside it while this directory stays writable,
+# which is what makes the install portable.
 say 'config_dir' "$install_dir (portable: config sits beside the binary)"
 
 case ":$PATH:" in

@@ -1,7 +1,6 @@
-# Every text file is LF in the repository and LF on disk. Without this, a contributor whose
-# git has core.autocrlf=true commits CRLF and every line of the file reads as changed, which
-# buries the real diff. The blobs here are already LF, so this pins what is true rather than
-# converting anything.
+# Every text file is LF in the repository and LF on disk. Without this a contributor whose git
+# has core.autocrlf=true commits CRLF, and every line of the file reads as changed. The blobs
+# are already LF, so this pins what is true rather than converting anything.
 * text=auto eol=lf
 
 # Binary, and never line-ending-converted: chroma_shm.rs does include_bytes! on keystream.bin
