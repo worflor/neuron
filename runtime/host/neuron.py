@@ -278,23 +278,48 @@ def _ctx_payload():
 
 
 def invoke(name, wait=True, **opts):
-    """Run ANOTHER macro by id, as a subroutine — the composition primitive.
+    """Run another macro by id.
 
-    wait=True (default): run it INLINE on this thread and return its value (its `return`), so you can
-    branch on the result. This is SUBROUTINE semantics: it intentionally bypasses the target's fire
-    queue and may overlap a separately-fired instance of that target. wait=False queues it on the
-    target's OWN serial worker (fire-and-forget) and return
-    None at once. Keyword args become the invoked macro's options (read with neuron.option(...)). The
-    invoked macro shares THIS fire's captured world (ctx). Returns None if `name` isn't a registered
-    macro or the call would nest deeper than the cycle guard allows. Never raises."""
+    Same-domain calls keep their existing direct semantics. Cross-domain calls go back through the
+    Rust host so a RAW caller may invoke BOUND without moving that callee into the RAW interpreter.
+    Authority is monotonic: BOUND -> RAW is refused. Cross-domain return values cross the protocol
+    as strings; same-domain synchronous calls still return the original Python value.
+    """
     fn = _host_lookup(name) if _host_lookup else None
     if fn is None:
-        return None
+        raw = _act(
+            "invoke",
+            {
+                "id": str(name),
+                "wait": bool(wait),
+                "ctx": _ctx_payload(),
+                "options": dict(opts),
+            },
+            timeout=305.0 if wait else 5.0,
+            gated=False,
+        )
+        try:
+            payload = _json.loads(raw)
+        except Exception:
+            return None
+        if not payload.get("found"):
+            return None
+        if payload.get("error"):
+            sys.stderr.write("[neuron.invoke %s] %s\n" % (name, payload.get("error")))
+            return None
+        return payload.get("value") if wait else None
+
     if not wait:
         if _host_dispatch:
-            _host_dispatch({"id": name, "rid": None, "ctx": _ctx_payload(),
-                            "options": dict(opts), "mock": getattr(_tls, "mock", False)})
+            _host_dispatch({
+                "id": name,
+                "rid": None,
+                "ctx": _ctx_payload(),
+                "options": dict(opts),
+                "mock": getattr(_tls, "mock", False),
+            })
         return None
+
     depth = getattr(_tls, "invoke_depth", 0)
     if depth >= _INVOKE_MAX_DEPTH:
         return None

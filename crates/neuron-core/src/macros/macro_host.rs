@@ -1494,6 +1494,123 @@ fn run_state_act(id: &str, verb: &str, arg: &Value) -> Option<(bool, String)> {
     }
 }
 
+
+fn run_cross_invoke(
+    caller_mode: MacroMode,
+    target: &str,
+    arg: &Value,
+    mock: bool,
+) -> (bool, String) {
+    if validate_macro_id(target).is_err() {
+        return (true, json!({"found": false}).to_string());
+    }
+    let wait = arg.get("wait").and_then(Value::as_bool).unwrap_or(true);
+    let ctx = arg.get("ctx").cloned().unwrap_or_else(|| json!({}));
+    let options = arg.get("options").cloned().unwrap_or_else(|| json!({}));
+
+    let host = macro_host();
+    let prepared = {
+        let mut g = host.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        host.sync_manifest(&mut g);
+        let Some(target_mode) = g.modes.get(target).copied() else {
+            return (true, json!({"found": false}).to_string());
+        };
+        if caller_mode == MacroMode::Bound && target_mode == MacroMode::Raw {
+            return (
+                false,
+                json!({"found": true, "error": "BOUND cannot invoke RAW"}).to_string(),
+            );
+        }
+        if let Err(e) = host.ensure_lane_locked(&mut g, target_mode) {
+            return (false, json!({"found": true, "error": e}).to_string());
+        }
+        let generation = g.generations.get(target).copied().unwrap_or(0);
+        let s = lane_session_mut(&mut g, target_mode).unwrap();
+        let rid = s.shared.next_rid.fetch_add(1, Ordering::Relaxed);
+        let shared = Arc::clone(&s.shared);
+        if wait {
+            let (tx, rx) = channel();
+            shared
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(rid, tx);
+            let sent = s.send(&json!({
+                "t": "fire",
+                "rid": rid,
+                "id": target,
+                "generation": generation,
+                "ctx": ctx,
+                "options": options,
+                "mock": mock,
+            }));
+            (Some(rx), shared, rid, sent)
+        } else {
+            let sent = s.send(&json!({
+                "t": "fire",
+                "rid": Value::Null,
+                "id": target,
+                "generation": generation,
+                "ctx": ctx,
+                "options": options,
+                "mock": mock,
+            }));
+            (None, shared, rid, sent)
+        }
+    };
+
+    let (rx, shared, rid, sent) = prepared;
+    if !sent {
+        if rx.is_some() {
+            shared
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&rid);
+        }
+        host.retire_control_session(&shared);
+        return (
+            false,
+            json!({"found": true, "error": "target sidecar pipe broken"}).to_string(),
+        );
+    }
+    let Some(rx) = rx else {
+        return (true, json!({"found": true, "queued": true}).to_string());
+    };
+
+    match rx.recv_timeout(Duration::from_secs(300)) {
+        Ok(v) if v.get("ok").and_then(Value::as_bool) == Some(true) => (
+            true,
+            json!({
+                "found": true,
+                "ok": true,
+                "value": v.get("value").cloned().unwrap_or(Value::Null),
+            })
+            .to_string(),
+        ),
+        Ok(v) => (
+            true,
+            json!({
+                "found": true,
+                "ok": false,
+                "error": v.get("error").and_then(Value::as_str).unwrap_or("invoked macro failed"),
+            })
+            .to_string(),
+        ),
+        Err(_) => {
+            shared
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&rid);
+            (
+                false,
+                json!({"found": true, "error": "cross-domain invoke timed out"}).to_string(),
+            )
+        }
+    }
+}
+
 fn run_act(_mode: MacroMode, _macro_id: &str, verb: &str, arg: &Value, mock: bool) -> (bool, String) {
     use crate::action::{Direction, Intent};
     use crate::capability as cap;
@@ -1525,6 +1642,12 @@ fn run_act(_mode: MacroMode, _macro_id: &str, verb: &str, arg: &Value, mock: boo
 
     if let Some(result) = run_state_act(_macro_id, verb, arg) {
         return result;
+    }
+    if verb == "invoke" {
+        let Some(target) = arg.get("id").and_then(Value::as_str) else {
+            return (false, json!({"found": false}).to_string());
+        };
+        return run_cross_invoke(_mode, target, arg, mock);
     }
 
     // The host is the authority boundary. Python's helper-side gate is useful fast feedback, but a
