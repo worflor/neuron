@@ -2681,11 +2681,6 @@ fn macro_cmd(action: MacroCmd) -> Result<()> {
                 (Some(n), None) => (n, None),
                 (None, None) => bail!("pass a macro --name or a --file to run"),
             };
-            if let Some(src) = src {
-                if let Err(e) = macro_host().register(&id, &src) {
-                    bail!("register '{id}': {e}");
-                }
-            }
             // Service BEACONS on the terminal: a macro's neuron.ask() becomes a y/n prompt here
             // (the GUI presents the same event as the binary radial). Daemon-style thread — it
             // blocks on stdin between prompts and dies with the process.
@@ -2726,11 +2721,22 @@ fn macro_cmd(action: MacroCmd) -> Result<()> {
                 }
             });
             let ctx = macros::Context::capture();
-            // a generous budget: a beacon-asking macro waits on the HUMAN at this very terminal.
-            println!(
-                "{}",
-                macro_host().invoke_with_budget(&id, &ctx, std::time::Duration::from_secs(600))
-            );
+            // A file is an ad-hoc candidate, not an implicit `macro add`: run its exact source
+            // without writing macros/scripts or replacing a registered macro of the same stem.
+            let result = match src.as_deref() {
+                Some(source) => macro_host().invoke_source_with_budget(
+                    &id,
+                    source,
+                    &ctx,
+                    std::time::Duration::from_secs(600),
+                ),
+                None => macro_host().invoke_with_budget(
+                    &id,
+                    &ctx,
+                    std::time::Duration::from_secs(600),
+                ),
+            };
+            println!("{result}");
             // surface any macro print()/traceback the sidecar logged.
             for line in macro_host().drain_log() {
                 println!("  | {line}");
