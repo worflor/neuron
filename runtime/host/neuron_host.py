@@ -81,6 +81,8 @@ import neuron as _nh  # noqa: E402  (after the fd dance, intentionally)
 _nh._set_host_send(_send)  # give the beacon layer (ask/notify) the framed protocol writer
 
 _macros = {}   # id -> callable(ctx)
+_gens = {}     # id -> active source generation
+_staged = {}   # token -> (id, callable, options, generation), invisible until commit
 _errors = {}   # id -> last register/compile traceback (shown verbatim; never faked)
 
 
@@ -105,19 +107,48 @@ def _compile_candidate(mid, source):
     return fn, _read_options(g.get("NEURON_OPTIONS"))
 
 
-def _register(mid, source):
-    """Replace a live macro only after its candidate namespace finished successfully."""
+def _register(mid, source, generation=0):
+    """Register durable source immediately (startup/respawn path)."""
     try:
         fn, opts = _compile_candidate(mid, source)
         _macros[mid] = fn
         _opts[mid] = opts
+        _gens[mid] = int(generation or 0)
         _errors.pop(mid, None)
         return True, opts
     except BaseException:
-        # Keep the last-known-good callable/options alive. A typo in an edit is not a delete.
         tb = traceback.format_exc()
         _errors[mid] = tb
         return False, tb
+
+
+def _prepare_register(token, mid, source, generation):
+    """Compile a candidate but do not make it callable yet."""
+    try:
+        fn, opts = _compile_candidate(mid, source)
+        _staged[token] = (mid, fn, opts, int(generation or 0))
+        return True, opts
+    except BaseException:
+        tb = traceback.format_exc()
+        _errors[mid] = tb
+        _staged.pop(token, None)
+        return False, tb
+
+
+def _commit_register(token):
+    item = _staged.pop(token, None)
+    if item is None:
+        return False, "prepared macro no longer exists"
+    mid, fn, opts, generation = item
+    _macros[mid] = fn
+    _opts[mid] = opts
+    _gens[mid] = generation
+    _errors.pop(mid, None)
+    return True, None
+
+
+def _discard_register(token):
+    _staged.pop(token, None)
 
 
 _opts = {}  # id -> the macro's declared option manifest (a sanitized list of dicts)
@@ -524,10 +555,16 @@ def _fire_callable(mid, fn, ctx, opts, mock=False):
         _stdout_mux._local.target = None
 
 
-def _fire(mid, ctx, opts, mock=False):
+def _fire(mid, generation, ctx, opts, mock=False):
     fn = _macros.get(mid)
     if fn is None:
         return False, None, _errors.get(mid, "macro '%s' not registered" % mid)
+    active = _gens.get(mid, 0)
+    if generation is not None and int(generation) != active:
+        return False, None, (
+            "macro '%s' fire was queued for generation %s; active generation is %s"
+            % (mid, generation, active)
+        )
     return _fire_callable(mid, fn, ctx, opts, mock)
 
 
@@ -537,7 +574,13 @@ def _fire_worker(mid, q):
         msg = q.get()
         if msg is _FIRE_STOP:
             return
-        ok, val, log = _fire(mid, msg.get("ctx") or {}, msg.get("options") or {}, bool(msg.get("mock")))
+        ok, val, log = _fire(
+            mid,
+            msg.get("generation"),
+            msg.get("ctx") or {},
+            msg.get("options") or {},
+            bool(msg.get("mock")),
+        )
         _send({"t": "result", "rid": msg.get("rid"), "ok": ok,
                "value": val, "error": (None if ok else log), "log": (log if ok else None)})
 
@@ -548,6 +591,8 @@ def _dispatch_fire(msg):
         _send({"t": "result", "rid": msg.get("rid"), "ok": False, "value": None,
                "error": _errors.get(mid, "macro '%s' not registered" % mid), "log": None})
         return
+    if msg.get("generation") is None:
+        msg["generation"] = _gens.get(mid, 0)
     with _fire_lock:
         q = _fire_queues.get(mid)
         if q is None:
@@ -640,10 +685,24 @@ def main():
             # a device verb (neuron.dpi/profile/…) finished on the host — wake the waiting helper.
             _nh._deliver_act(msg.get("rid"), msg.get("ok"), msg.get("msg"))
         elif t == "register":
-            ok, extra = _register(msg.get("id"), msg.get("source") or "")
+            ok, extra = _register(
+                msg.get("id"), msg.get("source") or "", msg.get("generation") or 0
+            )
             # on success `extra` is the declared option manifest; on failure it's the traceback.
             _send({"t": "registered", "rid": msg.get("rid"), "id": msg.get("id"), "ok": ok,
                    "error": (None if ok else extra), "options": (extra if ok else None)})
+        elif t == "prepare_register":
+            token = msg.get("token")
+            ok, extra = _prepare_register(
+                token, msg.get("id"), msg.get("source") or "", msg.get("generation") or 0
+            )
+            _send({"t": "prepared", "rid": msg.get("rid"), "ok": ok,
+                   "error": (None if ok else extra), "options": (extra if ok else None)})
+        elif t == "commit_register":
+            ok, err = _commit_register(msg.get("token"))
+            _send({"t": "committed", "rid": msg.get("rid"), "ok": ok, "error": err})
+        elif t == "discard_register":
+            _discard_register(msg.get("token"))
         elif t == "check":
             ok, defs, has_entry, err = _check(msg.get("source") or "")
             _send({"t": "checked", "rid": msg.get("rid"), "ok": ok,
@@ -658,8 +717,12 @@ def main():
         elif t == "unregister":
             mid = msg.get("id")
             _macros.pop(mid, None)
+            _gens.pop(mid, None)
             _errors.pop(mid, None)
             _opts.pop(mid, None)
+            for token, item in list(_staged.items()):
+                if item[0] == mid:
+                    _staged.pop(token, None)
             _retire_fire_worker(mid)
         elif t == "ping":
             _send({"t": "pong", "rid": msg.get("rid")})
