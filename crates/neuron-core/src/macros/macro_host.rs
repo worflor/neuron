@@ -373,49 +373,76 @@ impl MacroHost {
         resolve_runtime().is_ok()
     }
 
-    /// Register (or replace) a macro by id with its python `source` and PERSIST it to disk. Blocks
-    /// briefly for the sidecar's ack so a syntax error surfaces to the GUI/CLI. Safe to call from
-    /// non-input threads (the GUI save, CLI add) — NOT the 1000 Hz path.
+    /// Register (or replace) a macro by id with its python source and PERSIST it to disk. Blocks
+    /// briefly for the sidecar's ack so a syntax/load error surfaces to the GUI/CLI. The live
+    /// callable changes first, but durable state is committed only after that candidate succeeds;
+    /// a failed replacement therefore leaves the prior file, manifest, and callable intact.
     pub fn register(&self, id: &str, source: &str) -> Result<(), String> {
-        // persist first (the manifest mirrors disk; a respawn re-reads from here)
-        write_macro_file(id, source)?;
-        let rx = {
+        validate_macro_id(id)?;
+        let previous = load_macro(id);
+        let (opts, shared) = self.register_live(id, source)?;
+
+        // The candidate is live but not yet durable. If persistence fails, retire this session so
+        // the next use rebuilds from the still-authoritative manifest; best-effort restore the old
+        // file as well in case the failed write truncated it.
+        if let Err(e) = write_macro_file(id, source) {
+            match previous {
+                Some(ref old) => {
+                    let _ = std::fs::write(macro_path(id), old);
+                }
+                None => {
+                    let _ = std::fs::remove_file(macro_path(id));
+                }
+            }
+            self.retire_control_session(&shared);
+            return Err(format!("persist macro '{id}': {e}"));
+        }
+
+        {
             let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             g.manifest.insert(id.to_string(), source.to_string());
+            if opts.is_array() {
+                g.options.insert(id.to_string(), opts.clone());
+            } else {
+                g.options.remove(id);
+            }
+        }
+        seed_option_defaults(id, &opts);
+        Ok(())
+    }
+
+    /// Register a candidate in the warm sidecar without changing disk or the durable manifest.
+    fn register_live(&self, id: &str, source: &str) -> Result<(Value, Arc<Shared>), String> {
+        let (rx, shared, rid, sent) = {
+            let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             self.ensure_locked(&mut g)?;
             let s = g.session.as_mut().unwrap();
             let rid = s.shared.next_rid.fetch_add(1, Ordering::Relaxed);
             let (tx, rx) = channel();
-            s.shared.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(rid, tx);
-            if !s.send(&json!({"t": "register", "rid": rid, "id": id, "source": source})) {
-                return Err("sidecar pipe broken".into());
-            }
-            rx
+            let shared = Arc::clone(&s.shared);
+            shared.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(rid, tx);
+            let sent = s.send(&json!({"t": "register", "rid": rid, "id": id, "source": source}));
+            (rx, shared, rid, sent)
         };
-        // wait for the registered ack (bounded) outside the lock
+        if !sent {
+            shared.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&rid);
+            self.retire_control_session(&shared);
+            return Err("sidecar pipe broken".into());
+        }
         match rx.recv_timeout(FIRE_BUDGET) {
             Ok(v) if v.get("ok").and_then(Value::as_bool) == Some(true) => {
-                // capture the macro's declared option manifest + seed any missing values to their
-                // declared defaults, so a plugin works out of the box and the GUI has something
-                // to render the moment it's added.
-                let opts = v.get("options").cloned().unwrap_or(Value::Null);
-                {
-                    let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if opts.is_array() {
-                        g.options.insert(id.to_string(), opts.clone());
-                    } else {
-                        g.options.remove(id);
-                    }
-                }
-                seed_option_defaults(id, &opts);
-                Ok(())
+                Ok((v.get("options").cloned().unwrap_or(Value::Null), shared))
             }
             Ok(v) => Err(v
                 .get("error")
                 .and_then(Value::as_str)
                 .unwrap_or("register failed")
                 .to_string()),
-            Err(_) => Err("sidecar did not acknowledge (it may have crashed)".into()),
+            Err(_) => {
+                shared.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&rid);
+                self.retire_control_session(&shared);
+                Err("sidecar register timed out — session retired".into())
+            }
         }
     }
 
@@ -435,9 +462,15 @@ impl MacroHost {
         write_option_values(id, values)
     }
 
-    /// Remove a macro (disk + manifest + sidecar registry).
+    /// Remove a macro from disk and from the live/durable registries.
     pub fn unregister(&self, id: &str) {
         let _ = std::fs::remove_file(macro_path(id));
+        let _ = std::fs::remove_file(options_path(id));
+        invalidate_option_cache(id);
+        self.forget_live(id);
+    }
+
+    fn forget_live(&self, id: &str) {
         let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         g.manifest.remove(id);
         g.options.remove(id);
@@ -462,6 +495,7 @@ impl MacroHost {
         };
         if !rid_send {
             shared.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&rid);
+            self.retire_control_session(&shared);
             return Err("sidecar pipe broken".into());
         }
         match rx.recv_timeout(FIRE_BUDGET) {
@@ -481,7 +515,8 @@ impl MacroHost {
                 .to_string()),
             Err(_) => {
                 shared.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&rid);
-                Err("sidecar did not answer".into())
+                self.retire_control_session(&shared);
+                Err("sidecar check timed out — session retired".into())
             }
         }
     }
@@ -509,6 +544,7 @@ impl MacroHost {
         };
         if !sent {
             shared.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&rid);
+            self.retire_control_session(&shared);
             return Err(host_err("sidecar pipe broken"));
         }
         match rx.recv_timeout(FIRE_BUDGET) {
@@ -534,8 +570,145 @@ impl MacroHost {
             }
             Err(_) => {
                 shared.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&rid);
-                Err(host_err("sidecar did not answer"))
+                self.retire_control_session(&shared);
+                Err(host_err("sidecar parse timed out — session retired"))
             }
+        }
+    }
+
+    /// Run source once without registering or persisting it. This is the editor/CLI candidate path:
+    /// module top-level code and the macro body execute on a bounded disposable Python worker, while
+    /// the live registry and on-disk script remain untouched.
+    pub fn invoke_source(
+        &self,
+        id: &str,
+        source: &str,
+        ctx: &crate::macros::context::Context,
+    ) -> String {
+        self.invoke_source_with_budget(id, source, ctx, FIRE_BUDGET)
+    }
+
+    /// invoke_source with an explicit human-scale wait budget.
+    pub fn invoke_source_with_budget(
+        &self,
+        id: &str,
+        source: &str,
+        ctx: &crate::macros::context::Context,
+        budget: Duration,
+    ) -> String {
+        let (rx, shared, rid, sent) = {
+            let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Err(e) = self.ensure_locked(&mut g) {
+                return format!("[{e}]");
+            }
+            let armed = self.armed.load(Ordering::SeqCst);
+            let s = g.session.as_mut().unwrap();
+            let rid = s.shared.next_rid.fetch_add(1, Ordering::Relaxed);
+            let (tx, rx) = channel();
+            let shared = Arc::clone(&s.shared);
+            shared.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(rid, tx);
+            let options = if validate_macro_id(id).is_ok() {
+                load_option_values(id)
+            } else {
+                json!({})
+            };
+            let sent = s.send(&json!({
+                "t": "fire_source",
+                "rid": rid,
+                "id": id,
+                "source": source,
+                "ctx": ctx_json(ctx, armed),
+                "options": options,
+                "mock": false,
+            }));
+            (rx, shared, rid, sent)
+        };
+        if !sent {
+            shared.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&rid);
+            self.retire_control_session(&shared);
+            return "[sidecar pipe broken]".into();
+        }
+        match rx.recv_timeout(budget) {
+            Ok(v) if v.get("ok").and_then(Value::as_bool) == Some(true) => v
+                .get("value")
+                .and_then(Value::as_str)
+                .map(|s| format!("macro '{id}': {s}"))
+                .unwrap_or_else(|| format!("macro '{id}' ran")),
+            Ok(v) => format!(
+                "macro '{id}' error: {}",
+                v.get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("(no detail)")
+            ),
+            Err(_) => {
+                shared.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&rid);
+                format!(
+                    "macro '{id}' still running (waiting on a beacon or a slow call?) — \
+                     result will land in the macro log"
+                )
+            }
+        }
+    }
+
+    /// Mock-fire unsaved source without entering the registry.
+    pub fn fire_source_mock(
+        &self,
+        id: &str,
+        source: &str,
+        ctx: &crate::macros::context::Context,
+    ) -> String {
+        self.fire_source_dispatch(id, source, ctx, true)
+    }
+
+    fn fire_source_dispatch(
+        &self,
+        id: &str,
+        source: &str,
+        ctx: &crate::macros::context::Context,
+        mock: bool,
+    ) -> String {
+        crate::prof::bump(&crate::prof::MACRO_FIRE);
+        let armed = !mock && self.armed.load(Ordering::SeqCst);
+        if let Ok(mut g) = self.inner.try_lock() {
+            let warm = g
+                .session
+                .as_ref()
+                .map(|s| {
+                    let st = s.shared.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    st.warm && !st.dead
+                })
+                .unwrap_or(false);
+            if warm {
+                let s = g.session.as_mut().unwrap();
+                let rid = s.shared.next_rid.fetch_add(1, Ordering::Relaxed);
+                let options = if validate_macro_id(id).is_ok() {
+                    load_option_values(id)
+                } else {
+                    json!({})
+                };
+                if s.send(&json!({
+                    "t": "fire_source",
+                    "rid": rid,
+                    "id": id,
+                    "source": source,
+                    "ctx": ctx_json(ctx, armed),
+                    "options": options,
+                    "mock": mock,
+                })) {
+                    return format!("macro '{id}' source dispatched");
+                }
+                g.session = None;
+                drop(g);
+                self.spawn_background_warm();
+                return format!("macro '{id}' source dropped (sidecar died — warming, press again)");
+            }
+            drop(g);
+        }
+        self.spawn_background_warm();
+        if !self.available() {
+            "[python runtime unavailable]".into()
+        } else {
+            format!("macro '{id}' source — sidecar warming, press again")
         }
     }
 
@@ -677,6 +850,26 @@ impl MacroHost {
     }
 
     // ── internals ──────────────────────────────────────────────────────────────────────────
+
+    /// A control-plane timeout means the Python main loop is no longer trustworthy. Retire only
+    /// the session that serviced the timed-out request; recovery may already have replaced it.
+    fn retire_control_session(&self, shared: &Arc<Shared>) {
+        let doomed = {
+            let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let same = g
+                .session
+                .as_ref()
+                .map(|s| Arc::ptr_eq(&s.shared, shared))
+                .unwrap_or(false);
+            if same {
+                g.breaker.record_crash();
+                g.session.take()
+            } else {
+                None
+            }
+        };
+        drop(doomed);
+    }
 
     /// Ensure a warm session exists (spawn + register-all if not). Caller holds the inner lock.
     fn ensure_locked(&self, g: &mut Inner) -> Result<(), String> {
@@ -1351,6 +1544,14 @@ fn sanitize_id(id: &str) -> String {
         .collect()
 }
 
+fn validate_macro_id(id: &str) -> Result<(), String> {
+    if id.is_empty() || sanitize_id(id) != id {
+        Err("macro name may contain only ASCII letters, digits, '_' and '-'".into())
+    } else {
+        Ok(())
+    }
+}
+
 fn write_macro_file(id: &str, source: &str) -> Result<(), String> {
     let dir = macros_dir();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -1599,6 +1800,7 @@ pub fn list_macros() -> Vec<String> {
 
 /// Load a macro's source from disk by id.
 pub fn load_macro(id: &str) -> Option<String> {
+    validate_macro_id(id).ok()?;
     std::fs::read_to_string(macro_path(id)).ok()
 }
 
@@ -1610,13 +1812,15 @@ pub fn parse_macro(source: &str) -> ParseResult {
     macro_host().parse_macro(source)
 }
 
-/// Delete a macro's source file (`macros/scripts/<id>.py`) by id.
-///
-/// Removing the file is sufficient: the warm sidecar re-syncs its registry from disk on its next
-/// spawn, so there's no separate deregister step. The id is sanitised to the same on-disk stem used
-/// when the file was written.
+/// Delete a macro from disk and from the warm/durable registry immediately.
 pub fn delete_macro(id: &str) -> std::io::Result<()> {
-    std::fs::remove_file(macro_path(id))
+    validate_macro_id(id)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    std::fs::remove_file(macro_path(id))?;
+    let _ = std::fs::remove_file(options_path(id));
+    invalidate_option_cache(id);
+    macro_host().forget_live(id);
+    Ok(())
 }
 
 /// Serializes every test that exclusively drives — or outright KILLS — the process-global
@@ -1637,6 +1841,14 @@ mod tests {
         assert_eq!(sanitize_id("ok_name-1"), "ok_name-1");
         assert_eq!(sanitize_id("../etc/passwd"), "___etc_passwd");
         assert_eq!(sanitize_id("a b.c"), "a_b_c");
+    }
+
+    #[test]
+    fn macro_ids_are_canonical_instead_of_lossily_aliased() {
+        assert!(validate_macro_id("ok_name-1").is_ok());
+        for bad in ["", "a b", "a/b", "a:b", "../same"] {
+            assert!(validate_macro_id(bad).is_err(), "{bad:?} must not become a different file key");
+        }
     }
 
     #[test]
