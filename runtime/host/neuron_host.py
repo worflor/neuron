@@ -4,9 +4,9 @@
 #
 # neuron_host.py — the resident program inside the Macro Host sidecar.
 #
-# Neuron starts ONE bundled-CPython process running this script and keeps it warm: every macro is
-# exec'd once (imports warmed) into a registry, and a trigger is a tiny framed message that calls
-# the already-resident function. No per-press spawn, no per-press import. Real-time.
+# Neuron may run TWO independent warm copies of this script: BOUND and RAW. Each process receives
+# only macros for its execution domain, execs them once (imports warmed), and serves tiny framed
+# fire messages against already-resident callables. No per-press spawn or import.
 #
 # THE LOAD-BEARING ISOLATION (read this before touching the I/O):
 #   The control protocol must NEVER share a stream with a macro's own output. A macro that does

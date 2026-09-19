@@ -170,17 +170,25 @@ new input is the whole reason for building an engine instead of a settings panel
 
 a macro is just an `Action` that happens to be a sequence of steps, or a whole python script.
 
-python is the fun tier. write a file with `def macro(ctx):` and neuron runs it in a bundled CPython that stays **warm in the background** (the *Macro Host*): loaded once, imports already paid for, so firing it is basically a function call, well under a frame. (plain key→key remaps never touch python at all; those are free.)
+python is the fun tier. write a file with `def macro(ctx):` and neuron keeps bundled CPython **warm in the background** (the *Macro Host*), so firing an already-loaded macro is basically a function call. plain key→key remaps still never touch Python at all.
 
-it's **unsandboxed on purpose.** `ctypes` into raw win32, `subprocess`, sockets, files: whatever a program can do, your macro can do. the friendly helpers (`neuron.key` / `type_text` / `click` / `clipboard` / `run`) respect the [arm gate](#the-arm-gate) and quietly do nothing while input's disarmed; reach past them into raw `ctypes` and you're on your own. that's the trade.
+new macros start **BOUND**. they get ordinary Python computation plus the public `neuron` capability surface, while machine effects and persistent macro state cross the Rust host boundary. BOUND deliberately withholds ambient filesystem/process/network/native-FFI access from the supported language surface, and Rust independently re-checks the arm/mock gate before effectful broker requests land. this is policy containment for ordinary and agent-authored macros, not a claim that CPython safely contains hostile code.
 
-it runs in its own process, so it can't take the app down with it. a macro that segfaults (easy to do with raw `ctypes`) only kills the sidecar, which respawns in the background while the app holding your hardware never flinches. one that crashes on *every* press hits a circuit breaker instead of pinning a core forever.
+need the whole language with the whole machine? add exactly one source line:
 
-every macro gets a snapshot of **where you were when you fired it**: foreground app, window title, working dir, clipboard, the window you came from. it's frozen at trigger time, so the whole run reasons about one consistent moment (focus discord, type, alt-tab back). each macro also runs on its own queue: spam one and its fires stay in order; a slow one waiting on the network blocks nobody else.
+```python
+# neuron: raw
+```
 
-a macro can drive neuron itself, too. through the same path a bound trigger uses it can set DPI, flip a profile, nudge brightness, mute the mic, read the battery, check which profile is live, each change popping the same confirmation card a button press would. it gets a little **key-value store** that survives restarts, and it can **call another macro** like a subroutine (with a guard so nothing loops forever). macros compose.
+that macro runs **RAW** in a separate warm interpreter with normal `ctypes`, `subprocess`, sockets and filesystem access — the old full-power contract, still there on purpose. existing pre-BOUND macros are stamped RAW once on upgrade so nothing silently loses authority. the Workshop's RAW toggle literally adds/removes that line; source is the setting.
 
-don't want to write python? the GUI has a **block builder**: drag typed nodes (type, click, open, ask, notify, plus `if` / `repeat` / `for-each`) and it writes the source for you, losslessly both ways. blocks or code, same macro.
+BOUND and RAW do not share an interpreter. a RAW crash cannot poison BOUND, and composition is authority-monotonic: BOUND → RAW is refused; RAW → BOUND is allowed but the callee stays inside BOUND. each domain has its own crash breaker and recovery. a broken RAW pointer can still kill only the RAW worker, not the app controlling your hardware.
+
+every macro gets a snapshot of **where you were when you fired it**: foreground app, window title, working dir, clipboard, the window you came from. it's frozen at trigger time, so the whole run reasons about one consistent moment. each macro also runs on its own bounded serial queue; different macros can run concurrently. synchronous same-domain `invoke(wait=True)` is intentionally subroutine semantics and can overlap a separately-fired target, while async invoke enters the target's queue.
+
+a macro can drive neuron itself, too. through the broker it can set DPI, flip a profile, nudge brightness, mute the mic, read the battery, check which profile is live, use a **key-value store** that survives restarts, and **call another macro**. BOUND's store is host-owned but file-compatible with RAW, so changing modes does not fork its memory.
+
+don't want to write python? the GUI has a **block builder**: drag typed nodes (type, click, open, ask, notify, plus `if` / `repeat` / `for-each`) and it edits the same Python source document. module-level imports, options, helpers, comments around the entry, and the BOUND/RAW directive survive structural edits; statements the visual model does not understand remain raw Python nodes.
 
 > this replaced an earlier engine that compiled your *Rust* to a dll at trigger time and hot-loaded it. genuinely sub-microsecond, genuinely a pain: whole toolchain, compile-at-press lag. the Macro Host keeps the speed without the jank.
 

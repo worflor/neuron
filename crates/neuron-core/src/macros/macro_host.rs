@@ -2,21 +2,19 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
 
-//! the Macro Host — Neuron's macro runtime. A bundled private CPython, run as ONE warm sidecar
-//! process. Macros are real Python (`import ctypes`/`subprocess`/anything — full unsandboxed
-//! power, "as if it were a program"); they're registered once (imports warmed) and a trigger is a
-//! tiny framed message that calls the already-resident function. No per-press spawn, no per-press
-//! import — real-time for triggered macros. The native [`crate::action`] engine still owns
-//! per-frame key→key remaps at literal 0ns; the Macro Host never touches the 1000 Hz input path.
+//! the Macro Host — Neuron's Python macro runtime. Bundled CPython stays warm in two independent
+//! execution domains: BOUND (the default capability surface) and RAW (explicit `# neuron: raw`,
+//! unrestricted Python). Macros are registered once and a trigger is a tiny framed message to the
+//! already-resident callable; there is no per-press spawn/import. The native [`crate::action`]
+//! engine still owns per-frame key→key remaps at literal 0ns; the Macro Host never enters that path.
 //!
-//! ## Why a sidecar (not in-process)
-//! A macro doing raw `ctypes` is one bad pointer from a segfault. In-process that would take down
-//! the app that controls the user's hardware. The sidecar is FIREWALLED: a crashing/hanging macro
-//! kills only the sidecar, which the host respawns + re-registers in the background while the main
-//! app never hitches. This is strictly safer than the cdylib tower it replaces (which could only
-//! *detach-and-leak* a runaway thread inside the app).
-//!
-//! ## Transport (the load-bearing isolation)
+//! ## Why two sidecars (not in-process, not one shared interpreter)
+//! RAW `ctypes` is one bad pointer from a segfault, and unrestricted Python can mutate process-wide
+//! interpreter state. Keeping RAW out-of-process protects the app; keeping BOUND in a DIFFERENT
+//! process means RAW cannot monkeypatch underneath the capability tier. Each lane has independent
+//! crash recovery/breaking. This is policy structure + reliability, not a claim that CPython itself
+//! is a hostile-code sandbox.
+//!//! ## Transport (the load-bearing isolation)
 //! Three standard pipes, the protocol NEVER on a stream a macro can reach:
 //!   * host→sidecar control  = child STDIN  (framed JSON)
 //!   * sidecar→host protocol = child STDOUT — but the host script dups its real stdout aside as the
