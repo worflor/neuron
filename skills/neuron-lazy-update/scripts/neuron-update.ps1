@@ -293,7 +293,7 @@ if (-not $ZipPath -and (Get-Command gh -ErrorAction SilentlyContinue)) {
     $ErrorActionPreference = 'Continue'
     $att = & gh attestation verify $zip --repo $Repo 2>&1 | Out-String
     if ($LASTEXITCODE -eq 0) { Say 'attestation' 'ok' }
-    # v0.1.0 was built locally before release attestations existed. Later releases must attest.
+    # Only v0.1.0's locally built asset treats missing provenance as nonfatal.
     elseif ($target -eq 'v0.1.0' -and $att -match 'HTTP 404: Not Found.*\/attestations\/sha256:') { Flag 'ATTESTATION_UNAVAILABLE' 'v0.1.0 has no provenance attestation. The checksum matched, but build provenance could not be verified.' }
     elseif ($att -match 'auth login|not logged') { Flag 'ATTESTATION_SKIPPED' 'gh is installed but not logged in, so provenance was not checked. The checksum still matched.' }
     else { Flag 'ATTESTATION_FAILED' "gh attestation verify failed (STOP): $($att.Trim())"; Finish 'blocked' }
