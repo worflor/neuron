@@ -137,7 +137,7 @@ pub fn begin_chord(app: &AppWindow, on_done: impl Fn(&AppWindow, i32, &[&str], &
 
 /// The modifier names held *right now*, excluding `pressed` itself (so a captured Ctrl press is
 /// "ctrl", not "ctrl+ctrl"). Side-agnostic — chords serialize with the generic names.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn held_modifiers(pressed: i32) -> Vec<&'static str> {
     use neuron::capture::key_down;
     let mut mods = Vec::new();
@@ -157,7 +157,7 @@ fn held_modifiers(pressed: i32) -> Vec<&'static str> {
     mods
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 fn held_modifiers(_pressed: i32) -> Vec<&'static str> {
     Vec::new()
 }
@@ -244,19 +244,19 @@ fn finish_ctl(gen: u64, pkt: Option<(u16, u16, Option<neuron::registry::Canonica
 }
 
 /// How long a macro-page candidate waits for its possible keyboard twin.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 const TWIN_SETTLE: std::time::Duration = std::time::Duration::from_millis(80);
 
 /// Pure selection state shared by resident-stream capture and the no-resident fallback below.
 /// One physical Naga press can emit TWO events: its fixed keyboard usage plus the receiver's vendor
 /// deferred-button code. Prefer the keyboard identity because the input interceptor can replace it.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 #[derive(Default)]
 struct ControlCaptureState {
     macro_candidate: Option<(CapturedControl, std::time::Instant)>,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 impl ControlCaptureState {
     fn observe(&mut self, ev: &neuron::controls::ControlEvent) -> Option<CapturedControl> {
         let &(page, usage) = ev.hits.first()?;
@@ -300,7 +300,7 @@ impl ControlCaptureState {
 /// target window per process and usage pair; the old transient listener stole those registrations,
 /// then left the live dispatcher deaf after a rebind. A standalone listener remains only as the
 /// honest fallback when no resident pump exists.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn capture_control_until(stop: &AtomicBool) -> Option<CapturedControl> {
     if neuron::controls::held_registry_live() {
         capture_control_from_resident(stop)
@@ -309,7 +309,7 @@ fn capture_control_until(stop: &AtomicBool) -> Option<CapturedControl> {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn capture_control_from_resident(stop: &AtomicBool) -> Option<CapturedControl> {
     use std::sync::mpsc::RecvTimeoutError;
     use std::time::{Duration, Instant};
@@ -339,7 +339,7 @@ fn capture_control_from_resident(stop: &AtomicBool) -> Option<CapturedControl> {
 
 /// CLI/headless fallback for the rare case where the GUI resident pump is not alive. With no
 /// resident owner there is nothing to steal, so a temporary Raw-Input listener is correct here.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn capture_control_standalone(stop: &AtomicBool) -> Option<CapturedControl> {
     use std::cell::{Cell, RefCell};
 
@@ -366,7 +366,7 @@ fn capture_control_standalone(stop: &AtomicBool) -> Option<CapturedControl> {
     found.get()
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 fn capture_control_until(_stop: &AtomicBool) -> Option<CapturedControl> {
     None
 }
@@ -448,7 +448,7 @@ fn finish_seq(gen: u64, grammar: Option<String>) {
 /// The recording loop: poll keyboard edges, time holds and gaps, render the grammar. Holds under
 /// 150 ms read as taps and gaps under 120 ms as "as fast as you can" — the grammar stays clean for
 /// normal playing and exact where your timing was deliberate (rounded to 10 ms).
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn record_keyseq_until(stop: &AtomicBool) -> Option<String> {
     use neuron::capture::{is_mouse_vk, key_down, VK_ESCAPE};
     use std::time::Instant;
@@ -558,7 +558,7 @@ fn record_keyseq_until(stop: &AtomicBool) -> Option<String> {
     Some(out.join(" "))
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 fn record_keyseq_until(_stop: &AtomicBool) -> Option<String> {
     None
 }
@@ -566,6 +566,7 @@ fn record_keyseq_until(_stop: &AtomicBool) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    static CAPTURE_STATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[cfg(windows)]
     #[test]
@@ -678,6 +679,7 @@ mod tests {
     /// `end_capture_without_window`, which is what this pins.
     #[test]
     fn a_capture_that_outlives_its_window_never_leaves_the_dispatcher_gated() {
+        let _state = CAPTURE_STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // Simulate the state a live capture leaves behind, then the dead-window completion.
         CAPTURE_ACTIVE.store(true, Ordering::Relaxed);
         neuron::intercept::set_paused(true);
@@ -711,6 +713,7 @@ mod tests {
     /// silent bind of VK 0.
     #[test]
     fn cancel_lowers_the_gate_and_arms_the_stop_flag() {
+        let _state = CAPTURE_STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let stop = Arc::new(AtomicBool::new(false));
         CANCEL.with(|c| *c.borrow_mut() = Some(stop.clone()));
         CAPTURE_ACTIVE.store(true, Ordering::Relaxed);
@@ -730,6 +733,7 @@ mod tests {
     /// what keeps "click bind, change your mind, click bind again" from eating the second bind.
     #[test]
     fn a_stale_completion_cannot_disturb_the_capture_that_replaced_it() {
+        let _state = CAPTURE_STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let stale_gen = GENERATION.with(|g| {
             let v = g.get() + 1;
             g.set(v);

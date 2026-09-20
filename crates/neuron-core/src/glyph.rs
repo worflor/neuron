@@ -991,12 +991,22 @@ pub fn capture_phrase_until_stamped(
     (pts, stamps)
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+#[path = "glyph_linux.rs"]
+mod linux_capture;
+
+#[cfg(target_os = "linux")]
+pub use linux_capture::{
+    capture_held, capture_held_with, capture_phrase, capture_phrase_until,
+    capture_phrase_until_stamped, capture_slots_until,
+};
+
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn capture_held(_trigger: crate::controls::ControlRef, _max_pts: usize) -> Vec<C> {
     Vec::new()
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn capture_held_with(
     _trigger: crate::controls::ControlRef,
     _max_pts: usize,
@@ -1005,7 +1015,7 @@ pub fn capture_held_with(
     Vec::new()
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn capture_phrase(
     _trigger: crate::controls::ControlRef,
     _phrase: &crate::feel::Phrase,
@@ -1016,7 +1026,7 @@ pub fn capture_phrase(
     Vec::new()
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn capture_phrase_until(
     _trigger: crate::controls::ControlRef,
     _phrase: &crate::feel::Phrase,
@@ -1028,7 +1038,7 @@ pub fn capture_phrase_until(
     Vec::new()
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn capture_phrase_until_stamped(
     _trigger: crate::controls::ControlRef,
     _phrase: &crate::feel::Phrase,
@@ -1077,7 +1087,7 @@ pub fn capture_slots_until(
     raw_input::capture_slots(slots, cfg, max_pts, stop, on_activated, on_progress)
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn capture_slots_until(
     _slots: &[CaptureSlot],
     _cfg: &crate::feel::FeelConfig,
@@ -1097,7 +1107,10 @@ pub fn take_wheel_ticks() -> i32 {
     raw_input::take_wheel_ticks()
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+pub fn take_wheel_ticks() -> i32 { crate::linux_input::take_wheel_ticks() }
+
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn take_wheel_ticks() -> i32 {
     0
 }
@@ -1112,7 +1125,10 @@ pub fn take_click_edges() -> (i32, i32, i32) {
     raw_input::take_click_edges()
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+pub fn take_click_edges() -> (i32, i32, i32) { crate::linux_input::take_click_edges() }
+
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn take_click_edges() -> (i32, i32, i32) {
     (0, 0, 0)
 }
@@ -1124,10 +1140,11 @@ pub fn key_down(vk: i32) -> bool {
     unsafe { (GetAsyncKeyState(vk) as u16 & 0x8000) != 0 }
 }
 
-#[cfg(not(windows))]
-pub fn key_down(_vk: i32) -> bool {
-    false
-}
+#[cfg(target_os = "linux")]
+pub fn key_down(vk: i32) -> bool { crate::capture::key_down(vk) }
+
+#[cfg(not(any(windows, target_os = "linux")))]
+pub fn key_down(_vk: i32) -> bool { false }
 
 /// Device-aware held-state for one control — the read every capture loop uses for its trigger.
 /// Primary source: the shared Raw-Input held registry (`controls::control_held`), which knows the

@@ -41,7 +41,14 @@
 #[cfg(windows)]
 pub use imp::*;
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+#[path = "audio_linux.rs"]
+mod linux;
+
+#[cfg(target_os = "linux")]
+pub use linux::*;
+
+#[cfg(not(any(windows, target_os = "linux")))]
 pub use stub::*;
 
 /// One audio endpoint (a capture or render device) as the OS sees it.

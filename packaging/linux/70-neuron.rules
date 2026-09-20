@@ -9,6 +9,7 @@
 # 1532 (Razer): no other device on the system is affected.
 #
 # Install:
+#   sudo modprobe uinput
 #   sudo cp 70-neuron.rules /etc/udev/rules.d/
 #   sudo udevadm control --reload-rules && sudo udevadm trigger
 # Then replug the device (or log out and back in) so the new permissions apply.
@@ -17,6 +18,17 @@
 # so it needs its own rule; neuron has not been verified over Bluetooth anyway.
 KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1532", TAG+="uaccess"
 
+# The resident app reads Razer evdev events for device-aware binds. Grant only the active
+# desktop user access, as for hidraw; other vendors' keyboards stay untouched.
+KERNEL=="event*", SUBSYSTEM=="input", ATTRS{idVendor}=="1532", TAG+="uaccess"
+
+# uinput is the kernel's virtual input endpoint. The app needs it to replay a grabbed device
+# before any remap can be armed, and for ordinary key/mouse actions. This grants the active seat
+# user access without giving an unattended service or every local account synthetic input.
+KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess"
+
 # On a distro without systemd-logind, `uaccess` does nothing. Use a group instead: comment out the
 # line above, uncomment this one, and make sure your user is in the `plugdev` group.
 #KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1532", MODE="0660", GROUP="plugdev"
+#KERNEL=="event*", SUBSYSTEM=="input", ATTRS{idVendor}=="1532", MODE="0660", GROUP="input"
+#KERNEL=="uinput", SUBSYSTEM=="misc", MODE="0660", GROUP="input"

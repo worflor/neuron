@@ -1148,7 +1148,25 @@ fn hold_mouse(button: MouseButtonKind, hold_ms: u32) -> String {
     format!("held mouse {button:?} {hold_ms}ms")
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+fn hold_mouse(button: MouseButtonKind, hold_ms: u32) -> String {
+    let code = match button {
+        MouseButtonKind::Left => 0x110,
+        MouseButtonKind::Right => 0x111,
+        MouseButtonKind::Middle => 0x112,
+        MouseButtonKind::Back => 0x113,
+        MouseButtonKind::Forward => 0x114,
+        _ => return press_mouse(button),
+    };
+    if !crate::linux_input::emit_key(code, true) {
+        return "hold mouse: uinput unavailable".into();
+    }
+    std::thread::sleep(std::time::Duration::from_millis(hold_ms as u64));
+    let _ = crate::linux_input::emit_key(code, false);
+    format!("held mouse {button:?} {hold_ms}ms")
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 fn hold_mouse(_button: MouseButtonKind, hold_ms: u32) -> String {
     std::thread::sleep(std::time::Duration::from_millis(hold_ms as u64));
     "hold mouse: windows-only".into()
@@ -1858,10 +1876,31 @@ fn press_key(name: &str) -> String {
     format!("pressed [{name}] (vk 0x{vk:02X})")
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 fn press_key(name: &str) -> String {
-    format!("key '{name}': windows-only")
+    let (mods, key) = parse_combo(name);
+    let Some(code) = crate::linux_input::keycode_for_name(&key) else {
+        return format!("unknown key '{name}'");
+    };
+    let Some(mods) = mods.into_iter().map(crate::linux_input::keycode_for_vk).collect::<Option<Vec<_>>>() else {
+        return format!("unknown modifier in '{name}'");
+    };
+    let mut held = Vec::new();
+    for modifier in mods {
+        if !crate::linux_input::emit_key(modifier, true) {
+            release_keys(&held);
+            return "key: uinput unavailable".into();
+        }
+        held.push(modifier);
+    }
+    let pressed = crate::linux_input::emit_key(code, true);
+    if pressed { let _ = crate::linux_input::emit_key(code, false); }
+    for modifier in held.into_iter().rev() { let _ = crate::linux_input::emit_key(modifier, false); }
+    if pressed { format!("pressed [{name}]") } else { "key: uinput unavailable".into() }
 }
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn press_key(name: &str) -> String { format!("key '{name}': unsupported") }
 
 /// Press and HOLD a key combo (modifiers + key), returning the VKs now held in press order — so the
 /// caller releases them on the trigger's UP edge via [`release_keys`]. The held twin of
@@ -1897,12 +1936,31 @@ pub fn release_keys(vks: &[u16]) {
     }
 }
 
-#[cfg(not(windows))]
-pub fn press_and_hold(_name: &str) -> Vec<u16> {
-    Vec::new()
+#[cfg(target_os = "linux")]
+pub fn press_and_hold(name: &str) -> Vec<u16> {
+    let (mods, key) = parse_combo(name);
+    let Some(code) = crate::linux_input::keycode_for_name(&key) else { return Vec::new() };
+    let Some(mods) = mods.into_iter().map(crate::linux_input::keycode_for_vk).collect::<Option<Vec<_>>>() else { return Vec::new() };
+    let mut held = Vec::new();
+    for modifier in mods.into_iter().chain(std::iter::once(code)) {
+        if !crate::linux_input::emit_key(modifier, true) {
+            release_keys(&held);
+            return Vec::new();
+        }
+        held.push(modifier);
+    }
+    held
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+pub fn release_keys(codes: &[u16]) {
+    for &code in codes.iter().rev() { let _ = crate::linux_input::emit_key(code, false); }
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+pub fn press_and_hold(_name: &str) -> Vec<u16> { Vec::new() }
+
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn release_keys(_vks: &[u16]) {}
 
 #[cfg(windows)]
@@ -1911,10 +1969,13 @@ fn press_media(key: MediaKind) -> String {
     format!("media {} (vk 0x{:02X})", key.label(), key.vk())
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 fn press_media(key: MediaKind) -> String {
-    format!("media {}: windows-only", key.label())
+    format!("media {}: {}", key.label(), press_key(&key_param_for_vk(key.vk())))
 }
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn press_media(key: MediaKind) -> String { format!("media {}: unsupported", key.label()) }
 
 #[cfg(windows)]
 fn press_mouse(button: MouseButtonKind) -> String {
@@ -1922,10 +1983,31 @@ fn press_mouse(button: MouseButtonKind) -> String {
     format!("mouse {}", button.label())
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 fn press_mouse(button: MouseButtonKind) -> String {
-    format!("mouse {}: windows-only", button.label())
+    use evdev::RelativeAxisCode;
+    let emitted = match button {
+        MouseButtonKind::ScrollLeft => crate::linux_input::emit_relative(RelativeAxisCode::REL_HWHEEL, -1),
+        MouseButtonKind::ScrollRight => crate::linux_input::emit_relative(RelativeAxisCode::REL_HWHEEL, 1),
+        button => {
+            let code = match button {
+                MouseButtonKind::Left => 0x110,
+                MouseButtonKind::Right => 0x111,
+                MouseButtonKind::Middle => 0x112,
+                MouseButtonKind::Back => 0x113,
+                MouseButtonKind::Forward => 0x114,
+                _ => unreachable!(),
+            };
+            let down = crate::linux_input::emit_key(code, true);
+            let up = crate::linux_input::emit_key(code, false);
+            down && up
+        }
+    };
+    if emitted { format!("mouse {}", button.label()) } else { "mouse: uinput unavailable".into() }
 }
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn press_mouse(button: MouseButtonKind) -> String { format!("mouse {}: unsupported", button.label()) }
 
 /// Narrow native effects exposed to the BOUND macro broker. These reuse the same SendInput gate and
 /// key/mouse primitives as ordinary Actions; Python no longer owns a parallel input implementation.
@@ -1957,7 +2039,22 @@ pub(crate) fn macro_hotkey(keys: &[String]) -> String {
         }
         "ok".into()
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    {
+        let Some(codes) = vks.into_iter().map(crate::linux_input::keycode_for_vk).collect::<Option<Vec<_>>>() else {
+            return "[unsupported key]".into();
+        };
+        let expected = codes.len();
+        let mut held = Vec::new();
+        for code in codes {
+            if !crate::linux_input::emit_key(code, true) { break; }
+            held.push(code);
+        }
+        let success = held.len() == expected;
+        release_keys(&held);
+        if success { "ok".into() } else { "[uinput unavailable]".into() }
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         let _ = vks;
         "[unsupported]".into()
@@ -1976,7 +2073,14 @@ pub(crate) fn macro_key_down(name: &str) -> String {
         win_key::down(vk);
         "ok".into()
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    {
+        match crate::linux_input::keycode_for_vk(vk) {
+            Some(code) if crate::linux_input::emit_key(code, true) => "ok".into(),
+            _ => "[uinput unavailable or unsupported key]".into(),
+        }
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         let _ = vk;
         "[unsupported]".into()
@@ -1995,7 +2099,14 @@ pub(crate) fn macro_key_up(name: &str) -> String {
         win_key::up(vk);
         "ok".into()
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    {
+        match crate::linux_input::keycode_for_vk(vk) {
+            Some(code) if crate::linux_input::emit_key(code, false) => "ok".into(),
+            _ => "[uinput unavailable or unsupported key]".into(),
+        }
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         let _ = vk;
         "[unsupported]".into()
@@ -2066,7 +2177,16 @@ pub(crate) fn macro_scroll(notches: i32) -> String {
         win_mouse::scroll_vertical(notches);
         "ok".into()
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    {
+        use evdev::RelativeAxisCode;
+        if crate::linux_input::emit_relative(RelativeAxisCode::REL_WHEEL, notches) {
+            "ok".into()
+        } else {
+            "[uinput unavailable]".into()
+        }
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         let _ = notches;
         "[unsupported]".into()
@@ -2082,7 +2202,14 @@ pub(crate) fn macro_mouse_move(dx: i32, dy: i32) -> String {
         win_mouse::move_relative(dx, dy);
         "ok".into()
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    {
+        use evdev::RelativeAxisCode;
+        let x = dx == 0 || crate::linux_input::emit_relative(RelativeAxisCode::REL_X, dx);
+        let y = dy == 0 || crate::linux_input::emit_relative(RelativeAxisCode::REL_Y, dy);
+        if x && y { "ok".into() } else { "[uinput unavailable]".into() }
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         let _ = (dx, dy);
         "[unsupported]".into()
@@ -2880,7 +3007,7 @@ cmd = "echo hi""#,
     }
 
     /// `run()` smoke: every new variant runs without panicking and reports something sensible.
-    /// (On non-Windows the synth actions report "windows-only" but still don't panic.) The
+    /// (The synth actions stay disarmed in tests but still don't panic.) The
     /// daemon-intent variants must NOT claim to have done device work — they report an "intent".
     #[test]
     fn new_variants_run_smoke() {

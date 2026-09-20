@@ -102,6 +102,7 @@ flate2 = "1"
 # would pull in its own abstraction over the same syscalls.
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+evdev = "0.13.2"
 
 [target.'cfg(windows)'.dependencies.windows-sys]
 version = "0.59"

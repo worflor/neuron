@@ -61,6 +61,8 @@ pub mod hook;
 pub mod import;
 pub mod intent;
 pub mod intercept;
+#[cfg(target_os = "linux")]
+pub mod linux_input;
 pub mod latency;
 pub mod lighting;
 pub mod logos;

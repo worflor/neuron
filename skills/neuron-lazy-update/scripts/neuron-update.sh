@@ -159,7 +159,7 @@ say 'installed' "$([ $installed -eq 1 ] && echo true || echo false)"
 # Missing rule is the usual cause of "no devices found". Flagged, never fixed here: installing a
 # system-wide rule is a one-time sudo and the user's decision.
 if [ ! -f "$UDEV_RULE" ]; then
-    flag 'NO_UDEV_RULE' "no $UDEV_RULE, so /dev/hidraw* stays root-only and 'neuron list' will likely find nothing. The archive ships 70-neuron.rules; installing it is one sudo, and the two commands are in SOURCE.txt. Do not run them for the user."
+    flag 'NO_UDEV_RULE' "no $UDEV_RULE, so Razer hidraw/evdev access and uinput replay may be unavailable. The archive ships 70-neuron.rules; install it for the active desktop user, then reload udev rules and replug the device."
 fi
 
 current=''

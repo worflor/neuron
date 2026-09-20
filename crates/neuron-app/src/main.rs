@@ -359,7 +359,7 @@ fn main() {
     // starts disarmed (observe/dry-run). The loop builds the unified Engine, installs the GamingMode
     // hook, and posts last-trigger/active-layer back to the UI.
     let safe = std::env::args().any(|a| a == "--safe");
-    let input_supported = cfg!(windows);
+    let input_supported = neuron::controls::live_input_available();
     let armed = input_supported && !safe;
     // Build the weak handle + set the view inside a SHORT borrow, then start the worker and store it
     // in a SEPARATE borrow (the worker must not be created while a borrow of `resident` is held).
@@ -373,7 +373,7 @@ fn main() {
         st.set_runtime_active(input_supported);
         st.set_status_line(
             if !input_supported {
-                "device settings and lighting are available; live remaps need a Linux input backend"
+                "live input unavailable: grant access to /dev/input and /dev/uinput"
             } else if armed {
                 "live dispatch ARMED - GUI remaps fire (toggle safe-mode in Settings to disarm)"
             } else {
@@ -601,7 +601,7 @@ fn main() {
                 // LINK lamp: lights only while the live loop is alive.
                 if slow_due {
                     if let Some(live) = r.live.as_ref() {
-                        let running = input_supported && live.running();
+                        let running = neuron::controls::live_input_available() && live.running();
                         if st.get_runtime_active() != running {
                             st.set_runtime_active(running);
                         }

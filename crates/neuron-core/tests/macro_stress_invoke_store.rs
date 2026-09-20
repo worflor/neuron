@@ -257,6 +257,7 @@ fn invoke_store_stress_e2e() {
     assert!(host.fire_async("store_atomic", &ctx).contains("dispatched"));
     let p = store_path(&state, "store_atomic");
     let mut reads = 0u32;
+    let mut completed = false;
     let read_deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < read_deadline {
         if let Ok(s) = std::fs::read_to_string(&p) {
@@ -268,11 +269,16 @@ fn invoke_store_stress_e2e() {
         }
         // also stop once the writer reports completion.
         if macro_host().drain_log().iter().any(|l| l.contains("atomic done 26")) {
+            completed = true;
             break;
         }
     }
     // ensure the writer is finished, then the final file is valid with all 26 keys.
-    let _ = wait_log("atomic done 26", Duration::from_secs(5));
+    if !completed {
+        let log = wait_log("atomic done 26", Duration::from_secs(300));
+        assert!(log.iter().any(|line| line.contains("atomic done 26")),
+            "store writer did not report completion: {log:?}");
+    }
     let fin = read_store(&state, "store_atomic").expect("final atomic store parses");
     assert_eq!(fin.as_object().map(serde_json::Map::len), Some(26), "all 26 keys present, file intact");
     eprintln!("store atomicity: {reads} concurrent reads, every one parsed cleanly");

@@ -77,7 +77,7 @@ Core long-lived workers:
 - Optional overlay/window instrument workers, such as spell overlay, teleport scry, whiteboard, knockback, and glance helpers.
 - On Windows, audio cache worker in `beacon::audio_cache` so Core Audio reads do not block hot input paths.
 
-Cross-platform state today is explicit but incomplete. The architecture has transport traits and non-Windows stubs, but the live HID backend and several app runtime features are Windows-only. The daily-driver runtime is Windows-first until the transport identity model and backend implementations are made platform-neutral.
+Cross-platform state today is explicit but still hardware-unverified on Linux. Linux has hidraw transport, evdev/uinput live input, a GTK overlay, and PulseAudio-compatible audio. Windows remains the daily-driver runtime with real Razer device verification; Linux input and HID need the same native hardware exercise.
 
 ## 4. Core Runtime Loop And Logical Flow
 
@@ -703,7 +703,7 @@ Mitigation:
 
 ### Risk: Cross-Platform Runtime Boundary
 
-The core HID path identity is backend-owned and Linux has a hidraw transport and GUI. Live input capture/synthesis, overlays and audio still need Linux backends, and the hidraw transport has not been verified on real hardware. The app must report unavailable live commands rather than claiming they are armed.
+The core HID path identity is backend-owned. Linux has hidraw, evdev/uinput input capture and synthesis, a GTK/Cairo overlay, and PulseAudio-compatible control and capture. The hidraw and evdev/uinput paths have not been verified on real Razer hardware, and overlay placement depends on the compositor. The app must report unavailable live input when device access is missing rather than claiming it is armed.
 
 Mitigation:
 

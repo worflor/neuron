@@ -419,7 +419,14 @@ pub struct TwinBeat {
 #[cfg(windows)]
 pub use imp::SpellOverlay;
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+#[path = "overlay_linux.rs"]
+mod linux;
+
+#[cfg(target_os = "linux")]
+pub use linux::SpellOverlay;
+
+#[cfg(not(any(windows, target_os = "linux")))]
 pub use stub::SpellOverlay;
 
 // ── the notification PROOF TAP's public face (see `imp::proof`) ────────────────────────────────
@@ -453,7 +460,7 @@ pub fn proof_frames() -> u32 {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 mod stub {
     use super::{DigestView, GlyphHint, NotifySlot, WeaveMode};
     /// No-op overlay until the per-OS body lands (see module docs).

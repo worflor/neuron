@@ -19,8 +19,9 @@ If you only take three things away, take these:
 neuron is a tray-resident replacement for Razer Synapse: an app and CLI over one
 core that speaks `razer_report` HID directly. No account, no cloud, no telemetry,
 no kernel driver, no vendor SDK. Windows and Linux ship both executables. Linux
-has a GUI and hidraw transport, but live input, overlays, and audio still need
-native backends; the transport has never touched a real device. Mac is unwritten.
+uses hidraw for device reports, evdev/uinput for live input, GTK for overlays,
+and PulseAudio-compatible audio. The Linux HID and input paths have not been
+verified on real hardware. Mac is unwritten.
 
 The whole product is one primitive:
 

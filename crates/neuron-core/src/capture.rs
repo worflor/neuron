@@ -131,13 +131,16 @@ pub fn key_down(vk: i32) -> bool {
     // SAFETY: GetAsyncKeyState is a pure read of the async key state for a valid VK in 0..256.
     unsafe { (GetAsyncKeyState(vk) as u16 & 0x8000) != 0 }
 }
-#[cfg(not(windows))]
-pub fn key_down(_vk: i32) -> bool {
+#[cfg(target_os = "linux")]
+pub fn key_down(vk: i32) -> bool {
     if SUPPRESS_KEY_READS.with(|s| s.get()) {
         return false;
     }
-    false
+    crate::linux_input::physical_key_down(vk)
 }
+
+#[cfg(not(any(windows, target_os = "linux")))]
+pub fn key_down(_vk: i32) -> bool { false }
 
 /// Held-state bitmask for the Razer macro keys — bit `i` = the i-th macro key (M(i+1)) currently held.
 /// The macro keys arrive on Razer's Driver-Mode `0x04` HID report (decoded by `neuron-app::macrokeys`),
@@ -167,7 +170,7 @@ pub fn macro_key_down(i: usize) -> bool {
 
 /// Snapshot which of all 256 virtual-keys are currently down — the *baseline* a capture starts
 /// from, so a key already held when capture begins is ignored (we only detect a fresh press).
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn baseline() -> [bool; 256] {
     let mut b = [false; 256];
     for (vk, slot) in b.iter_mut().enumerate() {
@@ -181,18 +184,18 @@ fn baseline() -> [bool; 256] {
 /// the capture, e.g. the user closed the bind dialog). Keys already held when capture starts are
 /// ignored (baseline-then-detect). The GUI's press-to-bind owns an `Arc<AtomicBool>` and clones it
 /// into the capture worker. Blocking; run on a worker thread in a GUI.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 pub fn capture_keypress_until(stop: &std::sync::atomic::AtomicBool) -> Option<i32> {
     capture_filtered_until(stop, |_| true)
 }
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn capture_keypress_until(_stop: &std::sync::atomic::AtomicBool) -> Option<i32> {
     None
 }
 
 /// Core capture loop: snapshot the baseline, then poll until a key passing `accept` transitions
 /// down (returns its VK), ESC is pressed, or `stop` is set (both return `None`).
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn capture_filtered_until(
     stop: &std::sync::atomic::AtomicBool,
     accept: impl Fn(i32) -> bool,

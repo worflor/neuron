@@ -471,6 +471,10 @@ pub fn owns(page: u16, usage: u16, pid: u16) -> bool {
     if standing_down() {
         return false;
     }
+    #[cfg(target_os = "linux")]
+    if !crate::linux_input::grabbed(pid) {
+        return false;
+    }
     let physkey = match page {
         0x07 => match sys::physkey_for_usage(usage) {
             Some(p) => p,
@@ -493,6 +497,33 @@ pub fn deactivate() {
     }
     sys::uninstall();
     sys::uninstall_mouse();
+}
+
+/// Whether this physical Linux device has a claim that requires exclusive replay. A listener
+/// creates its uinput mirror before taking the grab, and releases the grab on any replay fault.
+#[cfg(target_os = "linux")]
+pub fn linux_wants_grab(pid: crate::registry::CanonicalPid) -> bool {
+    if standing_down() || !crate::action::input_armed() {
+        return false;
+    }
+    CORE.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .is_some_and(|core| core.by_scancode.values().flatten().any(|claim| claim.pid == pid))
+}
+
+/// Resolve one key from an already-grabbed, device-identified evdev stream. The original event
+/// passes through whenever the shim is paused or disarmed; only an active device claim can eat it.
+#[cfg(target_os = "linux")]
+pub fn linux_resolve(physkey: u16, down: bool, pid: crate::registry::CanonicalPid) -> Option<Inject> {
+    if standing_down() || !crate::action::input_armed() {
+        return Some(Inject { scancode: physkey, down });
+    }
+    let core = CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    match core.as_ref() {
+        Some(core) => core.resolve_direct(physkey, down, pid),
+        None => Some(Inject { scancode: physkey, down }),
+    }
 }
 
 /// The HOOK's per-edge decision: should this keystroke be swallowed? Called from the LL hook proc
@@ -829,30 +860,30 @@ mod sys {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 mod sys {
-    //! Non-Windows placeholder — the ONE module a Linux/macOS port fills. The shared code (the
-    //! correlation core, arming, engine wiring) is complete and portable; only these verbs are
-    //! OS-specific. Today they no-op, so the shim compiles everywhere but only *acts* on Windows.
-    //!
-    //! ## Filling this in
-    //! **Linux (evdev + uinput) — the simplest of the three.** `EVIOCGRAB` a specific `/dev/input`
-    //! node: that yields device-identified events AND suppresses them from the rest of the system
-    //! in ONE step, so the swallow-and-replay correlation is NOT needed. `install` spawns a reader
-    //! thread that, per grabbed event, calls [`super::Interceptor::resolve_direct`] (device known,
-    //! no `pending`) and injects the result via `uinput`. `physkey_for_usage`: HID usage → evdev
-    //! keycode.
-    //!
-    //! **macOS (CGEventTap + IOHIDManager).** A keyboard `CGEventTapCreate` tap can suppress and
-    //! reinject in place; device attribution is the hard part (taps don't carry the device), so
-    //! correlate against `IOHIDManager` the way Windows correlates against Raw-Input — REUSE the
-    //! swallow/attribute core ([`super::Interceptor::on_hook`] + `on_rawinput`). `physkey_for_usage`:
-    //! HID usage → the platform virtual keycode.
-
-    /// No key-id map yet → [`super::claim_for_rule`] builds nothing, so the shim stays inert here.
-    pub fn physkey_for_usage(_usage: u16) -> Option<u16> {
-        None
+    pub fn physkey_for_usage(usage: u16) -> Option<u16> {
+        crate::linux_input::keycode_for_usage(usage)
     }
+    pub fn inject(physkey: u16, down: bool) {
+        let _ = crate::linux_input::emit_key(physkey, down);
+    }
+    pub fn inject_mouse(button: u16, down: bool) {
+        let code = match button {
+            1..=5 => 0x10F + button,
+            _ => return,
+        };
+        let _ = crate::linux_input::emit_key(code, down);
+    }
+    pub fn install() {}
+    pub fn uninstall() {}
+    pub fn install_mouse() {}
+    pub fn uninstall_mouse() {}
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+mod sys {
+    pub fn physkey_for_usage(_usage: u16) -> Option<u16> { None }
     pub fn inject(_physkey: u16, _down: bool) {}
     pub fn inject_mouse(_button: u16, _down: bool) {}
     pub fn install() {}

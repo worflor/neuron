@@ -56,13 +56,16 @@ Working tree at build: $dirty
 ELF glibc symbol floor: $floor
 
 Run ./neuron-app for the GUI or ./neuron for the CLI. The GUI needs GTK 3,
-AppIndicator, libxdo, libxkbcommon-x11 and a graphical desktop session.
-On Ubuntu, libxkbcommon-x11 is provided by libxkbcommon-x11-0. Global hotkeys use X11.
+AppIndicator, libxdo, libxkbcommon-x11, pactl, parec and a graphical desktop session.
+On Ubuntu, libxkbcommon-x11 is provided by libxkbcommon-x11-0 and pactl/parec
+by pulseaudio-utils. Global hotkeys use X11.
 
-For non-root hidraw access, from this extracted directory run:
+For non-root Razer hidraw/evdev access and uinput output, from this directory run:
+  sudo modprobe uinput
   sudo install -m 0644 70-neuron.rules /etc/udev/rules.d/70-neuron.rules
   sudo udevadm control --reload-rules && sudo udevadm trigger
-Reconnect the device after installing the rule.
+Reconnect the device after installing the rule. Persist uinput loading with your
+distribution's modules-load mechanism if it is not loaded at boot.
 
 This build has no GitHub Actions provenance attestation. Check SHA256SUMS.txt
 against the downloaded files and review the source commit above. The matching

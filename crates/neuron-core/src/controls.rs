@@ -27,6 +27,9 @@ pub enum Stream {
     RawInput,
     /// The driver-mode deferred-button pipe (macro keys, side-plate grid).
     Deferred,
+    /// One Linux evdev event node. A device's keyboard and mouse nodes report independent
+    /// snapshots even when they share a product id; diffing them together loses held buttons.
+    Evdev(u64),
 }
 
 /// One decoded control report from a Razer device.
@@ -291,6 +294,22 @@ pub fn control_label(page: u16, usage: u16) -> String {
 /// handled separately; an empty page just decodes to nothing, so a comprehensive list is free.)
 pub const PROBE_PAGES: [u16; 5] = [0x01, 0x07, 0x09, 0x0B, 0x0C];
 
+/// Whether this host can receive physical controls and synthesize action output. Linux needs
+/// access to both evdev and uinput; the GUI uses this to keep its arm control honest.
+pub fn live_input_available() -> bool {
+    #[cfg(windows)]
+    { true }
+    #[cfg(target_os = "linux")]
+    {
+        std::path::Path::new("/dev/input").is_dir()
+            && crate::linux_input::output_ready()
+            && evdev::enumerate().any(|(_, device)|
+                !device.name().is_some_and(|name| name.starts_with("neuron ")))
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    { false }
+}
+
 #[cfg(windows)]
 pub fn watch(seconds: u64) {
     let mut count = 0u32;
@@ -330,9 +349,19 @@ pub fn watch(seconds: u64) {
     println!("\ncaptured {count} Razer control event(s).");
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+pub fn watch(seconds: u64) {
+    static NEVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    linux::listen(Some(seconds), &NEVER, true, false, |ev| {
+        if ev.is_press() {
+            println!("[PID {}] {:?}", ev.pid_hex(), ev.hits);
+        }
+    }, || std::time::Duration::from_millis(50));
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn watch(_seconds: u64) {
-    println!("control watching is Windows-only for now");
+    println!("control watching is unsupported on this platform");
 }
 
 /// Listen for control events, dispatching each to `on_event`, until `seconds` elapse (or
@@ -361,9 +390,17 @@ pub fn listen(
     });
 }
 
-#[cfg(not(windows))]
-pub fn listen(_seconds: Option<u64>, _on_event: impl FnMut(&ControlEvent), _on_tick: impl FnMut()) {
+#[cfg(target_os = "linux")]
+pub fn listen(seconds: Option<u64>, on_event: impl FnMut(&ControlEvent), mut on_tick: impl FnMut()) {
+    static NEVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    linux::listen(seconds, &NEVER, true, true, on_event, move || {
+        on_tick();
+        std::time::Duration::from_millis(5)
+    });
 }
+
+#[cfg(not(any(windows, target_os = "linux")))]
+pub fn listen(_seconds: Option<u64>, _on_event: impl FnMut(&ControlEvent), _on_tick: impl FnMut()) {}
 
 /// Stop-signalled variant of [`listen`] — the primitive a GUI worker thread drives. Identical to
 /// [`listen`] (registers Raw Input on a hidden top-level window, decodes each report and calls
@@ -453,7 +490,7 @@ pub fn listen_until(
 /// `#[cfg]` pair (Win32 body + inert body) is the right tool here — unlike the multi-primitive
 /// window-manager seam, which needed a trait to abstract 22 separate Win32 calls. Both arms keep
 /// byte-identical signatures so the caller is platform-agnostic.
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn listen_until(
     seconds: Option<u64>,
     stop: &std::sync::atomic::AtomicBool,
@@ -472,6 +509,17 @@ pub fn listen_until(
         let _cadence = on_tick();
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
+}
+
+#[cfg(target_os = "linux")]
+pub fn listen_until(
+    seconds: Option<u64>,
+    stop: &std::sync::atomic::AtomicBool,
+    esc_stops: bool,
+    on_event: impl FnMut(&ControlEvent),
+    on_tick: impl FnMut() -> std::time::Duration,
+) {
+    linux::listen(seconds, stop, esc_stops, !esc_stops, on_event, on_tick);
 }
 
 // ─────────────────────────── the live spine: configs -> one Engine ───────────────────────────
@@ -2537,6 +2585,225 @@ mod plan_wait_tests {
         // would busy-spin `MsgWaitForMultipleObjectsEx`, defeating the entire point).
         let plan = plan_wait(Duration::from_micros(100));
         assert!(plan.timeout_ms >= 1);
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod linux {
+    use super::{ControlEvent, Stream};
+    use crate::registry::CanonicalPid;
+    use evdev::{Device, EventType, InputEvent, SynchronizationCode};
+    use std::collections::{HashMap, HashSet};
+    use std::os::fd::AsRawFd;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    struct Source {
+        path: PathBuf,
+        stream: Stream,
+        device: Device,
+        pid: CanonicalPid,
+        hits: Vec<(u16, u16)>,
+        replay: Option<evdev::uinput::VirtualDevice>,
+        packet: Vec<InputEvent>,
+        retry_after: Instant,
+    }
+
+    impl Drop for Source {
+        fn drop(&mut self) {
+            crate::linux_input::forget_physical_device(&self.path);
+            if self.replay.is_some() {
+                crate::linux_input::note_grab(self.pid, false);
+                let _ = self.device.ungrab();
+            }
+        }
+    }
+
+    fn forget_source(path: &Path, source: &Source, on_event: &mut impl FnMut(&ControlEvent)) {
+        let ev = ControlEvent {
+            pid: Some(source.pid), stream: source.stream,
+            hits: Vec::new(), raw: Vec::new(),
+        };
+        super::note_held(&path.to_string_lossy(), ev.pid, &[]);
+        on_event(&ev);
+    }
+
+    fn scan(sources: &mut HashMap<PathBuf, Source>, on_event: &mut impl FnMut(&ControlEvent)) {
+        static NEXT_STREAM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let devices: Vec<(PathBuf, Device)> = evdev::enumerate().collect();
+        let seen: HashSet<&PathBuf> = devices.iter().map(|(path, _)| path).collect();
+        let gone: Vec<PathBuf> = sources.keys().filter(|path| !seen.contains(*path)).cloned().collect();
+        for path in gone {
+            if let Some(source) = sources.remove(&path) { forget_source(&path, &source, on_event); }
+        }
+        for (path, device) in devices {
+            if sources.contains_key(&path)
+                || device.name().is_some_and(|name| name.starts_with("neuron "))
+            {
+                continue;
+            }
+            if device.set_nonblocking(true).is_err() {
+                continue;
+            }
+            let pid = CanonicalPid::of(device.input_id().product());
+            sources.insert(path.clone(), Source {
+                path,
+                stream: Stream::Evdev(NEXT_STREAM.fetch_add(1, Ordering::Relaxed)),
+                device, pid, hits: Vec::new(), replay: None,
+                packet: Vec::new(), retry_after: Instant::now(),
+            });
+        }
+    }
+
+    fn reconcile_grab(source: &mut Source, allow_grab: bool) {
+        // CanonicalPid is product-only; a same-numbered third-party device must never inherit
+        // a Razer remap claim and become exclusively grabbed by accident.
+        let wanted = allow_grab && source.device.input_id().vendor() == 0x1532
+            && crate::intercept::linux_wants_grab(source.pid)
+            && crate::linux_input::output_ready();
+        if !wanted {
+            if source.replay.is_some() {
+                let _ = source.device.ungrab();
+                source.replay = None;
+                crate::linux_input::note_grab(source.pid, false);
+            }
+            return;
+        }
+        if source.replay.is_some() || Instant::now() < source.retry_after {
+            return;
+        }
+        // The replay device must exist before EVIOCGRAB. On any failure the physical device
+        // remains with the compositor and desktop; no key is swallowed speculatively.
+        let Ok(replay) = crate::linux_input::virtual_for_device(&source.device) else {
+            source.retry_after = Instant::now() + Duration::from_secs(2);
+            return;
+        };
+        if source.device.grab().is_ok() {
+            source.replay = Some(replay);
+            crate::linux_input::note_grab(source.pid, true);
+        } else {
+            source.retry_after = Instant::now() + Duration::from_secs(2);
+        }
+    }
+
+    fn process(
+        path: &Path,
+        source: &mut Source,
+        event: InputEvent,
+        esc_stops: bool,
+        on_event: &mut impl FnMut(&ControlEvent),
+    ) -> bool {
+        if event.event_type() == EventType::SYNCHRONIZATION {
+            if event.code() == SynchronizationCode::SYN_REPORT.0 && !source.packet.is_empty() {
+                flush_replay(source);
+            }
+            return false;
+        }
+        if event.event_type() != EventType::KEY {
+            if event.event_type() == EventType::RELATIVE {
+                crate::linux_input::note_relative(event.code(), event.value());
+            }
+            if source.replay.is_some() {
+                source.packet.push(event);
+            }
+            return false;
+        }
+        let code = event.code();
+        let value = event.value();
+        if value != 0 && value != 1 {
+            if source.replay.is_some() {
+                source.packet.push(event);
+            }
+            return false;
+        }
+        let hit = crate::linux_input::hit_for_keycode(code);
+        if value == 1 {
+            if !source.hits.contains(&hit) { source.hits.push(hit); }
+        } else {
+            source.hits.retain(|h| *h != hit);
+        }
+        crate::linux_input::note_physical_key(path, code, value == 1);
+        crate::linux_input::note_mouse_button(code, value == 1);
+        if source.replay.is_some() {
+            let physkey = if hit.0 == 0x09 { crate::intercept::mouse_physkey(hit.1) } else { code };
+            if let Some(output) = crate::intercept::linux_resolve(physkey, value == 1, source.pid) {
+                let out_code = if output.scancode & crate::intercept::MOUSE_PHYSKEY_BASE != 0 {
+                    0x10F + (output.scancode & !crate::intercept::MOUSE_PHYSKEY_BASE)
+                } else { output.scancode };
+                source.packet.push(InputEvent::new(EventType::KEY.0, out_code, i32::from(output.down)));
+            }
+            // A bound action can spend tens of milliseconds on HID or audio I/O. Physical
+            // pass-through must reach the desktop before the dispatcher runs that action.
+            flush_replay(source);
+        }
+        let ev = ControlEvent {
+            pid: Some(source.pid), stream: source.stream,
+            hits: source.hits.clone(),
+            raw: [code.to_le_bytes().as_slice(), value.to_le_bytes().as_slice()].concat(),
+        };
+        super::note_held(&path.to_string_lossy(), ev.pid, &ev.hits);
+        crate::latency::with_edge(Instant::now(), || on_event(&ev));
+        esc_stops && code == evdev::KeyCode::KEY_ESC.0 && value == 1
+    }
+
+    fn flush_replay(source: &mut Source) {
+        if source.packet.is_empty() { return; }
+        if source.replay.as_mut().is_some_and(|dev| dev.emit(&source.packet).is_err()) {
+            let _ = source.device.ungrab();
+            source.replay = None;
+            crate::linux_input::note_grab(source.pid, false);
+            source.retry_after = Instant::now() + Duration::from_secs(2);
+        }
+        source.packet.clear();
+    }
+
+    pub fn listen(
+        seconds: Option<u64>, stop: &AtomicBool, esc_stops: bool, allow_grab: bool,
+        mut on_event: impl FnMut(&ControlEvent), mut on_tick: impl FnMut() -> Duration,
+    ) {
+        let (inject_id, injected, _) = super::inject_register();
+        let started = Instant::now();
+        let mut last_scan = crate::timing::ago(Duration::from_secs(3));
+        let mut sources = HashMap::<PathBuf, Source>::new();
+        while !stop.load(Ordering::Relaxed) && seconds.is_none_or(|s| started.elapsed().as_secs() < s) {
+            if last_scan.elapsed() >= Duration::from_secs(2) {
+                scan(&mut sources, &mut on_event);
+                last_scan = Instant::now();
+            }
+            for source in sources.values_mut() { reconcile_grab(source, allow_grab); }
+            for event in injected.try_iter() {
+                crate::latency::with_edge(event.at, || on_event(&event.ev));
+            }
+            let mut end_on_escape = false;
+            let mut dead = Vec::new();
+            for (path, source) in &mut sources {
+                let fetched = source.device.fetch_events().map(|events| events.collect::<Vec<_>>());
+                let events = match fetched {
+                    Ok(events) => events,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    Err(_) => {
+                        dead.push(path.clone());
+                        continue;
+                    }
+                };
+                for event in events {
+                    end_on_escape |= process(path, source, event, esc_stops, &mut on_event);
+                }
+            }
+            for path in dead {
+                if let Some(source) = sources.remove(&path) { forget_source(&path, &source, &mut on_event); }
+            }
+            if end_on_escape { break; }
+            let cadence = on_tick().min(Duration::from_millis(50));
+            let mut fds: Vec<libc::pollfd> = sources.values().map(|source| libc::pollfd {
+                fd: source.device.as_raw_fd(), events: libc::POLLIN, revents: 0,
+            }).collect();
+            let timeout = cadence.as_millis().clamp(1, 50) as i32;
+            // SAFETY: poll only borrows the contiguous pollfd array for the duration of this call.
+            unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout); }
+        }
+        super::inject_unregister(inject_id);
     }
 }
 

@@ -4649,8 +4649,8 @@ pub fn install(app: &AppWindow) -> SharedRt {
         app.global::<State>().on_toggle_input_armed(move || {
             if let Some(app) = w.upgrade() {
                 let st = app.global::<State>();
-                if !cfg!(windows) {
-                    st.set_status_line("live input needs a Linux backend".into());
+                if !neuron::controls::live_input_available() {
+                    st.set_status_line("live input unavailable: check /dev/input and /dev/uinput access".into());
                     return;
                 }
                 let armed = !neuron::action::input_armed();
@@ -4677,7 +4677,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
         app.global::<State>().on_set_arm_stance(move |m| {
             if let Some(app) = w.upgrade() {
                 let st = app.global::<State>();
-                let m = if cfg!(windows) { m } else { match m { 2 => 0, 3 => 1, _ => m } };
+                let m = if neuron::controls::live_input_available() { m } else { match m { 2 => 0, 3 => 1, _ => m } };
                 let mode = match m {
                     1 => neuron::safety::RuntimeMode::Device,
                     2 => neuron::safety::RuntimeMode::Input,

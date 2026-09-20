@@ -10,12 +10,13 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use std::fmt::Write as _;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 use neuron::{
-    audio,
     device::DeviceSession,
     executor::{DispatchExecutor, DispatchOutcome, IntentRunner, TurboRuntime},
 };
+#[cfg(any(windows, target_os = "linux"))]
+use neuron::audio;
 use neuron::{
     backup,
     bindings::Bindings,
@@ -2758,7 +2759,7 @@ fn parse_hex16(s: &str) -> Result<u16> {
 
 /// A parsed `--mute on|off|toggle` request — the pure decode shared by `audio mic` and `audio out`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "linux", test))]
 enum MuteAction {
     On,
     Off,
@@ -2768,7 +2769,7 @@ enum MuteAction {
 /// Parse a `--mute` value string into a [`MuteAction`]. Accepts the friendly synonyms the CLI has
 /// always taken (on/true/1/mute, off/false/0/unmute, toggle). Pure + case-insensitive, so the whole
 /// accepted-vocabulary is unit-testable without touching Core Audio.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "linux", test))]
 fn parse_mute(s: &str) -> Result<MuteAction> {
     match s.to_lowercase().as_str() {
         "on" | "true" | "1" | "mute" => Ok(MuteAction::On),
@@ -3169,7 +3170,7 @@ fn prof_pump_cmd() {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn run_daemon(reg: &Registry, seconds: Option<u64>, safe: bool) {
     // ARM real input synthesis for live use. This is the one place the CLI daemon flips the
     // process-wide safety gate ON so bound key/click/macro actions actually fire. `--safe` keeps
@@ -3183,8 +3184,10 @@ fn run_daemon(reg: &Registry, seconds: Option<u64>, safe: bool) {
         neuron::writes::set_writes_paused(true);
         println!("Neuron daemon — SAFE MODE: input DISARMED + device writes PAUSED (observe + dry-run only).");
     } else {
-        neuron::action::arm_input(true);
+        let available = neuron::controls::live_input_available();
+        neuron::action::arm_input(available);
         neuron::writes::set_writes_paused(false);
+        if !available { println!("live input unavailable: check /dev/input and /dev/uinput access"); }
     }
 
     // Restore the remembered profile cursor FIRST — before the spine is built. A profile's
@@ -3218,7 +3221,7 @@ fn run_daemon(reg: &Registry, seconds: Option<u64>, safe: bool) {
     println!("\nstopped.");
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 fn run_daemon(_reg: &Registry, _seconds: Option<u64>, _safe: bool) {
     println!(
         "the remap daemon is Windows-only for now: control events and action dispatch have no \
@@ -3230,7 +3233,7 @@ fn run_daemon(_reg: &Registry, _seconds: Option<u64>, _safe: bool) {
 /// Carry out a daemon [`Intent`] — the typed work an `Action` delegates because the stateless
 /// Action layer has no device handle / profile store / stage cursor. The Engine reports the
 /// intent (a clean dry-run line); HERE is where it becomes real device/profile state.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn run_intent(devices: &mut DeviceSession<'_>, intent: &neuron::action::Intent) -> String {
     let mut cursor = CliProfileCursor;
     neuron::intent::run_shared_intent(
@@ -3242,10 +3245,10 @@ fn run_intent(devices: &mut DeviceSession<'_>, intent: &neuron::action::Intent) 
         .unwrap_or_else(|| "app intent needs the resident app - run neuron-app".into())
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 struct CliProfileCursor;
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 impl neuron::intent::ProfileCursor for CliProfileCursor {
     fn active_profile(&self) -> String {
         daemon_active_profile()
@@ -3259,11 +3262,11 @@ impl neuron::intent::ProfileCursor for CliProfileCursor {
 /// `profile::active()` cell the GUI and every other apply path use — so a button-cycle and a manual
 /// `profile apply` never disagree about "what's applied now". (This used to be a thread-local that
 /// diverged from the global, so a cycle could step from a stale cursor.)
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn daemon_active_profile() -> String {
     neuron::profile::active()
 }
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn set_daemon_active_profile(name: &str) {
     neuron::profile::set_active(name);
 }
@@ -3273,25 +3276,29 @@ fn set_daemon_active_profile(name: &str) {
 /// state, and drive a held-down [`Action::Turbo`] autofire while the trigger stays down. This is
 /// the single dispatch entry the run-daemon uses for buttons, the mic tap, gestures, radial flicks
 /// and app focus alike — the "one dispatcher" made live.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 struct CliIntentRunner<'a, 'reg> {
     devices: &'a mut DeviceSession<'reg>,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 impl IntentRunner for CliIntentRunner<'_, '_> {
     fn run_intent(&mut self, intent: &neuron::action::Intent) -> String {
         run_intent(self.devices, intent)
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn fire_trigger(
     devices: &mut DeviceSession<'_>,
     exec: &mut DispatchExecutor,
     rt: &mut neuron::controls::Runtime,
     trigger: &neuron::engine::Trigger,
 ) -> Option<DispatchOutcome> {
+    #[cfg(target_os = "linux")]
+    if let neuron::engine::Trigger::Input { page, usage, pid: Some(pid) } = trigger {
+        if neuron::intercept::owns(*page, *usage, pid.get()) { return None; }
+    }
     let mut intents = CliIntentRunner { devices };
     let outcome = exec.fire(&rt.engine, trigger, &mut intents)?;
     rt.note_fired(trigger);
@@ -3304,11 +3311,14 @@ fn fire_trigger(
 /// Audio, so a toggle = a physical tap -> a [`Trigger::MicTap`]) and the foreground app (a focus
 /// change -> a [`Trigger::AppFocus`]). Backward compatible: the same bindings/cast/app configs,
 /// now executed through the spine instead of three separate dispatchers.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn run_listen(reg: &Registry, seconds: Option<u64>, rt: neuron::controls::Runtime) {
     use neuron::controls::{HoldEdges, InputEdge, MIC_TAP};
     use neuron::engine::Trigger;
     use std::cell::RefCell;
+
+    #[cfg(target_os = "linux")]
+    neuron::intercept::configure_from_engine_with(&rt.engine, Some(rt.cast_trigger));
 
     let mic = audio::resolve_capture(None);
     let ctl = mic.as_ref().and_then(|e| audio::VolumeCtl::open(&e.id));
@@ -3391,6 +3401,11 @@ fn run_listen(reg: &Registry, seconds: Option<u64>, rt: neuron::controls::Runtim
                 if now != spine_profile {
                     spine_profile = now;
                     *rt.borrow_mut() = neuron::controls::build_runtime();
+                    #[cfg(target_os = "linux")]
+                    {
+                        let runtime = rt.borrow();
+                        neuron::intercept::configure_from_engine_with(&runtime.engine, Some(runtime.cast_trigger));
+                    }
                 }
             }
             {
@@ -3472,11 +3487,13 @@ fn run_listen(reg: &Registry, seconds: Option<u64>, rt: neuron::controls::Runtim
             }
         },
     );
+    #[cfg(target_os = "linux")]
+    neuron::intercept::deactivate();
     // measurement harness read-out: this session's pump counters (see `neuron prof pump`).
     prof_pump_cmd();
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn audio_cmd(action: AudioCmd) -> Result<()> {
     match action {
         AudioCmd::List => audio_list(),
@@ -3497,7 +3514,7 @@ fn audio_cmd(action: AudioCmd) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 fn audio_cmd(_action: AudioCmd) -> Result<()> {
     anyhow::bail!(
         "audio endpoints are Windows-only for now: neuron reads them through Core Audio and \
@@ -3508,7 +3525,7 @@ fn audio_cmd(_action: AudioCmd) -> Result<()> {
 /// Poll Razer audio endpoints for volume/mute changes. The `BlackShark` knob/mute and the
 /// Seiren tap surface as Core Audio changes (UAC feature-unit), not Raw Input HID — this is
 /// the channel a Core-Audio-based remap listens on.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn audio_monitor(seconds: u64) {
     use std::time::{Duration, Instant};
     let mut watched: Vec<(String, audio::VolumeCtl, f32, bool)> = Vec::new();
@@ -3562,7 +3579,7 @@ fn audio_monitor(seconds: u64) {
     println!("\ndone.");
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn audio_list() {
     for flow in [audio::Flow::Capture, audio::Flow::Render] {
         let eps = audio::endpoints(flow);
@@ -3584,7 +3601,7 @@ fn audio_list() {
 
 /// Resolve the capture endpoint to act on (shared logic in `audio::resolve_capture`):
 /// explicit needle, else the user's Razer/Seiren mic, else the first capture endpoint.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn resolve_mic(device: Option<&str>) -> Result<neuron::audio::Endpoint> {
     audio::resolve_capture(device).ok_or_else(|| match device {
         Some(n) => anyhow::anyhow!("no capture device matching '{n}'"),
@@ -3592,7 +3609,7 @@ fn resolve_mic(device: Option<&str>) -> Result<neuron::audio::Endpoint> {
     })
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn audio_mic(
     device: Option<String>,
     gain: Option<f32>,
@@ -3639,7 +3656,7 @@ fn audio_mic(
 
 /// Show or control an OUTPUT endpoint (headphones / sound card / speakers) — the render mirror of
 /// `audio_mic`, resolving generically by name substring or the system's active output.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn audio_out(
     device: Option<String>,
     vol: Option<f32>,
