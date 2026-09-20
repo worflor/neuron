@@ -1955,7 +1955,7 @@ pub(crate) fn macro_hotkey(keys: &[String]) -> String {
         for vk in vks.iter().rev() {
             win_key::up(*vk);
         }
-        return "ok".into();
+        "ok".into()
     }
     #[cfg(not(windows))]
     {
@@ -1974,7 +1974,7 @@ pub(crate) fn macro_key_down(name: &str) -> String {
     #[cfg(windows)]
     unsafe {
         win_key::down(vk);
-        return "ok".into();
+        "ok".into()
     }
     #[cfg(not(windows))]
     {
@@ -1993,7 +1993,7 @@ pub(crate) fn macro_key_up(name: &str) -> String {
     #[cfg(windows)]
     unsafe {
         win_key::up(vk);
-        return "ok".into();
+        "ok".into()
     }
     #[cfg(not(windows))]
     {
@@ -2011,7 +2011,7 @@ pub(crate) fn macro_type_text(text: &str) -> String {
         for ch in text.chars() {
             win_key::unicode(ch);
         }
-        return "ok".into();
+        "ok".into()
     }
     #[cfg(not(windows))]
     {
@@ -2027,7 +2027,7 @@ pub(crate) fn macro_type_ghost(text: &str, speed: &str) -> String {
     #[cfg(windows)]
     {
         ghost_type(text, GhostSpeed::parse(speed));
-        return "ok".into();
+        "ok".into()
     }
     #[cfg(not(windows))]
     {
@@ -2064,7 +2064,7 @@ pub(crate) fn macro_scroll(notches: i32) -> String {
     #[cfg(windows)]
     unsafe {
         win_mouse::scroll_vertical(notches);
-        return "ok".into();
+        "ok".into()
     }
     #[cfg(not(windows))]
     {
@@ -2080,7 +2080,7 @@ pub(crate) fn macro_mouse_move(dx: i32, dy: i32) -> String {
     #[cfg(windows)]
     unsafe {
         win_mouse::move_relative(dx, dy);
-        return "ok".into();
+        "ok".into()
     }
     #[cfg(not(windows))]
     {
@@ -2096,7 +2096,7 @@ pub(crate) fn macro_mouse_to(x: i32, y: i32) -> String {
     #[cfg(windows)]
     unsafe {
         win_mouse::move_absolute_screen(x, y);
-        return "ok".into();
+        "ok".into()
     }
     #[cfg(not(windows))]
     {

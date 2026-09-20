@@ -981,7 +981,7 @@ mod imp {
 
     /// Parse the (rate, channels, sample format) out of a `GetMixFormat` result. For an EXTENSIBLE
     /// format the tag lives in `SubFormat.Data1` (byte offset 24: the 18-byte header + wValidBits u16
-    /// + dwChannelMask u32) — the standard KSDATAFORMAT subtypes share their GUID tail, so `Data1`
+    /// and dwChannelMask u32) — the standard KSDATAFORMAT subtypes share their GUID tail, so `Data1`
     /// alone disambiguates float vs PCM.
     unsafe fn parse_mix_format(p: *const u8) -> Option<(u32, u16, SampleFmt)> {
         let f = &*p.cast::<WaveFormatEx>();

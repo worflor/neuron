@@ -1,5 +1,6 @@
 # Rust build output
 /target/
+/dist/
 # side target dirs used by review/CI agents (cargo --target-dir into the repo) — pure build cache
 /.review-target/
 

@@ -74,6 +74,7 @@ pub enum Blend {
 
 impl Blend {
     #[must_use]
+    #[allow(clippy::should_implement_trait)] // Unknown names intentionally map to Normal.
     pub fn from_str(s: &str) -> Blend {
         match s.to_lowercase().as_str() {
             "add" => Blend::Add,

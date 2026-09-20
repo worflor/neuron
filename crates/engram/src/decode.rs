@@ -51,11 +51,7 @@ pub fn decode_block(block: &Block, dim: usize) -> Vec<f32> {
 
             // Cascaded: spin up micro oscillators on sub-blocks
             let n_sub = block.micro_ks.len();
-            let micro_size = if n_sub > 0 {
-                (length / n_sub).max(MIN_BLOCK)
-            } else {
-                length
-            };
+            let micro_size = (length / n_sub).max(MIN_BLOCK);
             let mut micro_pred = vec![0.0_f32; length * dim];
 
             for si in 0..n_sub {

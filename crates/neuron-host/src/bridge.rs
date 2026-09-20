@@ -185,6 +185,7 @@ pub fn surface_info(def: &DeviceDef, pid: u16) -> Option<SurfaceInfo> {
 pub struct Discovered {
     pub info: SurfaceInfo,
     def: DeviceDef,
+    light: LightingDef,
     pid: u16,
     path: DevicePath,
     /// The physical unit this surface belongs to ([`path_instance`]) — what
@@ -248,6 +249,7 @@ fn discover_from(hids: &[HidDeviceInfo], reg: &Registry) -> Vec<Discovered> {
     matched
         .into_iter()
         .filter_map(|m| {
+            let light = m.def.lighting.clone()?;
             let dup = counts[&(m.def.codename.clone(), m.pid)] > 1;
             let key = if dup {
                 surface_key_dup(&m.def, m.pid, &m.instance)
@@ -258,6 +260,7 @@ fn discover_from(hids: &[HidDeviceInfo], reg: &Registry) -> Vec<Discovered> {
             Some(Discovered {
                 info,
                 def: m.def,
+                light,
                 pid: m.pid,
                 path: m.path,
                 instance: m.instance,
@@ -299,11 +302,7 @@ pub struct HidSink {
 
 impl HidSink {
     #[must_use]
-    pub fn new(def: DeviceDef, pid: u16, path: DevicePath) -> HidSink {
-        let light = def
-            .lighting
-            .clone()
-            .expect("bridge only sinks lighting devices");
+    pub fn new(def: DeviceDef, pid: u16, path: DevicePath, light: LightingDef) -> HidSink {
         HidSink {
             def,
             pid,
@@ -375,7 +374,9 @@ impl FrameSink for HidSink {
                 return;
             }
         }
-        let dev = self.dev.as_ref().expect("opened above");
+        let Some(dev) = self.dev.as_ref() else {
+            return;
+        };
         if !self.controlled {
             if let Ok(()) = Lights::new(dev, self.light.clone()).ensure_control() { self.controlled = true } else {
                 // Unreachable mid-session (sleep/unplug): drop the handle
@@ -473,7 +474,7 @@ impl Bridge {
     /// [`key_for_unit`](Bridge::key_for_unit) instead.
     #[must_use]
     pub fn keys_for_pid(&self, pid: u16) -> &[String] {
-        self.by_pid.get(&pid).map(std::vec::Vec::as_slice).unwrap_or(&[])
+        self.by_pid.get(&pid).map_or(&[], std::vec::Vec::as_slice)
     }
 
     /// The one surface key belonging to a physical unit ([`path_instance`]) — the precise
@@ -504,6 +505,7 @@ impl Bridge {
 
     /// Live re-pace, same contract as the app's `set_anim_fps`. `false` if
     /// the surface isn't bridged.
+    #[must_use]
     pub fn set_fps(&self, key: &str, fps: u32) -> bool {
         match self.paces.get(key) {
             Some(p) => {
@@ -562,7 +564,7 @@ fn writer_thread_qos() {
 /// rate; each board is clamped to its honest maximum. The sink RECIPE crosses
 /// into the writer thread; the device opens there (lazily, with retry), so an
 /// asleep or slow-to-wake device delays nothing and races nobody.
-pub fn attach(reg: &Registry, host: &HostHandle, fps: u32) -> Bridge {
+pub fn attach(reg: &Registry, host: &HostHandle, fps: u32) -> std::io::Result<Bridge> {
     let mut surfaces = Vec::new();
     let mut writers = Vec::new();
     let mut by_pid = HashMap::new();
@@ -582,19 +584,17 @@ pub fn attach(reg: &Registry, host: &HostHandle, fps: u32) -> Bridge {
             .push(key.clone());
         by_unit.insert(d.instance.clone(), key.clone());
         paces.insert(key.clone(), pace.clone());
-        if let Some(l) = d.def.lighting.as_ref() {
-            grids.insert(key.clone(), (l.rows, l.cols));
-        }
+        grids.insert(key.clone(), (d.light.rows, d.light.cols));
         surfaces.push(d.info);
-        let (def, pid, path) = (d.def, d.pid, d.path);
+        let (def, pid, path, light) = (d.def, d.pid, d.path, d.light);
         let writer = Writer::spawn_paced(host.clone(), key.clone(), pace, move || {
             writer_thread_qos();
-            HidSink::new(def, pid, path)
-        });
+            HidSink::new(def, pid, path, light)
+        })?;
         pausers.insert(key, writer.pauser());
         writers.push(writer);
     }
-    Bridge {
+    Ok(Bridge {
         surfaces,
         by_pid,
         by_unit,
@@ -602,7 +602,7 @@ pub fn attach(reg: &Registry, host: &HostHandle, fps: u32) -> Bridge {
         grids,
         pausers,
         _writers: writers,
-    }
+    })
 }
 
 #[cfg(test)]

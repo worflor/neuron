@@ -501,7 +501,7 @@ fn init_action_palette(app: &AppWindow) {
     if st
         .get_action_choices()
         .row_data(st.get_action_choice().max(0) as usize)
-        .map_or(true, |c| c.header)
+        .is_none_or(|c| c.header)
     {
         st.set_action_choice(1); // the first entry under the first header
     }
@@ -930,7 +930,7 @@ fn macro_value(node: &MacroNode) -> String {
         MacroNode::Press { keys } => keys.join("+"),
         MacroNode::KeyPress { name } => name.clone(),
         MacroNode::Click { button } => button.clone(),
-        MacroNode::Paste | MacroNode::Stop => String::new(),
+        MacroNode::Paste | MacroNode::Stop | MacroNode::Try { .. } => String::new(),
         MacroNode::Ask { question, .. } => value_to_source(question),
         MacroNode::If { cond, .. } | MacroNode::RepeatWhile { cond, .. } => value_to_source(cond),
         MacroNode::RepeatN { count, .. } => value_to_source(count),
@@ -938,7 +938,6 @@ fn macro_value(node: &MacroNode) -> String {
             format!("{var} in {}", value_to_source(source))
         }
         MacroNode::SetVar { name, value } => format!("{name} = {}", value_to_source(value)),
-        MacroNode::Try { .. } => String::new(),
         MacroNode::Raw { code } => code.clone(),
     }
 }
@@ -1380,7 +1379,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                     }
                     spawn_background_scan(&w);
                 },
-            )
+            );
         });
     }
     refresh_rules(app, &shared);
@@ -1866,14 +1865,16 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 // but DRIVE them from the shared quantized clock above, not a reset-on-rebuild anchor.
                 let stale = c
                     .as_ref()
-                    .map_or(true, |(r, cr, cc, _)| *r != rev || *cr != rows || *cc != cols);
+                    .is_none_or(|(r, cr, cc, _)| *r != rev || *cr != rows || *cc != cols);
                 if stale {
                     // ONLY on a real rebuild (the stack revision or the grid dims changed) do we clone the
                     // stack into fresh generators — the clone deferred from the cheap read above.
                     let defs = sh.borrow().light_layers.clone();
                     *c = Some((rev, rows, cols, neuron::pattern::Compositor::from_defs(&defs)));
                 }
-                let (_, _, _, comp) = c.as_mut().unwrap();
+                let Some((_, _, _, comp)) = c.as_mut() else {
+                    return;
+                };
                 let frame = comp.render(rows as u8, cols as u8, t);
                 let px: Vec<slint::Color> = frame
                     .iter()
@@ -3571,7 +3572,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                                     with_shared(|sh| {
                                         if !prev_lighting.is_empty() {
                                             let mut s = sh.borrow_mut();
-                                            s.light_layers = prev_lighting.clone();
+                                            s.light_layers.clone_from(&prev_lighting);
                                             s.selected_layer = s.light_layers.len().saturating_sub(1);
                                             s.layers_rev += 1;
                                         }
@@ -3586,7 +3587,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                                     with_shared(|sh| {
                                         if !prev_lighting.is_empty() {
                                             let mut s = sh.borrow_mut();
-                                            s.light_layers = prev_lighting.clone();
+                                            s.light_layers.clone_from(&prev_lighting);
                                             s.selected_layer = s.light_layers.len().saturating_sub(1);
                                             s.layers_rev += 1;
                                         }
@@ -3973,12 +3974,8 @@ pub fn install(app: &AppWindow) -> SharedRt {
                                     with_shared(|sh| sh.borrow_mut().macro_doc = doc.clone());
                                 }
                                 // KEEP the last blocks — the canvas stays readable while you fix the line.
-                                Err(neuron::macros::ParseError::Syntax { line, msg }) => {
-                                    st.set_macro_parse_error(
-                                        format!("line {line}: {}", first_line(&msg)).into(),
-                                    );
-                                }
-                                Err(neuron::macros::ParseError::Policy { line, msg }) => {
+                                Err(neuron::macros::ParseError::Syntax { line, msg }
+                                | neuron::macros::ParseError::Policy { line, msg }) => {
                                     st.set_macro_parse_error(
                                         format!("line {line}: {}", first_line(&msg)).into(),
                                     );
@@ -4652,6 +4649,10 @@ pub fn install(app: &AppWindow) -> SharedRt {
         app.global::<State>().on_toggle_input_armed(move || {
             if let Some(app) = w.upgrade() {
                 let st = app.global::<State>();
+                if !cfg!(windows) {
+                    st.set_status_line("live input needs a Linux backend".into());
+                    return;
+                }
                 let armed = !neuron::action::input_armed();
                 neuron::action::arm_input(armed);
                 neuron::macros::macro_host().set_armed(armed); // mirror SAFE/arm into the macro sidecar
@@ -4676,6 +4677,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
         app.global::<State>().on_set_arm_stance(move |m| {
             if let Some(app) = w.upgrade() {
                 let st = app.global::<State>();
+                let m = if cfg!(windows) { m } else { match m { 2 => 0, 3 => 1, _ => m } };
                 let mode = match m {
                     1 => neuron::safety::RuntimeMode::Device,
                     2 => neuron::safety::RuntimeMode::Input,
@@ -7466,8 +7468,7 @@ fn refresh_macro_catalog(app: &AppWindow) {
                 };
                 let options = option_count_from_source(&src);
                 let mode = neuron::macros::mode_from_source(&src)
-                    .map(|m| m.label())
-                    .unwrap_or("INVALID");
+                    .map_or("INVALID", neuron::macros::MacroMode::label);
                 let trigger = match triggers.get(&id) {
                     Some(ts) if !ts.is_empty() => ts.join("  \u{00b7}  "),
                     _ => "(unbound)".to_string(),
@@ -7970,7 +7971,8 @@ fn sigil_commands(path: &[(f32, f32)]) -> String {
     let mut s = String::with_capacity(path.len() * 16);
     for (i, &(x, y)) in path.iter().enumerate() {
         s.push_str(if i == 0 { "M " } else { " L " });
-        s.push_str(&format!("{x:.4} {y:.4}"));
+        use std::fmt::Write as _;
+        let _ = write!(s, "{x:.4} {y:.4}");
     }
     s.push_str(" Z");
     s
@@ -8323,9 +8325,7 @@ pub fn refresh_radial(app: &AppWindow, sh: &SharedRt) {
         .map(|i| {
             let label = neuron::radial::compass(i, n);
             let action = set
-                .get(i)
-                .map(neuron::action::Action::describe)
-                .unwrap_or_else(|| "—".into());
+                .get(i).map_or_else(|| "—".into(), neuron::action::Action::describe);
             RadialSector {
                 label: label.into(),
                 action: action.into(),
@@ -9679,6 +9679,7 @@ fn weave_capture(
     // let the sigil fade on its own time — the capture (and the user's next weave) doesn't wait.
     // fire-and-forget: `overlay` is dropped INSIDE the closure, so a spawn refusal drops it
     // (and fades it) immediately instead of leaking — nothing else to report.
+    #[cfg(windows)]
     crate::worker::spawn_detached("neuron-glue-fade", move || {
         std::thread::sleep(std::time::Duration::from_millis(350));
         drop(overlay);
@@ -9689,10 +9690,13 @@ fn weave_capture(
 /// First free auto-name for a new glyph. After deletes, `len+1` can collide with a survivor and
 /// upsert would silently OVERWRITE that template — scan for the first unused index instead.
 fn free_glyph_name(vault: &neuron::gesture::Vault) -> String {
-    (1..)
-        .map(|i| format!("glyph_{i}"))
-        .find(|n| !vault.templates.iter().any(|t| &t.name == n))
-        .expect("unbounded range yields a free name")
+    for i in 1..=vault.templates.len() {
+        let name = format!("glyph_{i}");
+        if !vault.templates.iter().any(|t| t.name == name) {
+            return name;
+        }
+    }
+    format!("glyph_{}", vault.templates.len() + 1)
 }
 
 /// The armor EVERY GUI capture worker runs inside — the resilience the live cast-weave already has
@@ -9942,6 +9946,7 @@ fn weave_capture_stamped(
     overlay.end();
     // fire-and-forget: `overlay` is dropped INSIDE the closure, so a spawn refusal drops it
     // (and fades it) immediately instead of leaking — nothing else to report.
+    #[cfg(windows)]
     crate::worker::spawn_detached("neuron-glue-fade", move || {
         std::thread::sleep(std::time::Duration::from_millis(350));
         drop(overlay);
@@ -10937,14 +10942,14 @@ mod macro_canvas_tests {
         assert_eq!(rows[1], ("step".into(), "1".into(), "ask".into()));
         assert_eq!(rows[2], ("lane".into(), "1".into(), "yes".into()));
         assert_eq!(rows[3], ("step".into(), "1.yes.0".into(), "notify".into()));
-        assert_eq!(rows[4], ("add".into(), "1.yes".into(), "".into()));
+        assert_eq!(rows[4], ("add".into(), "1.yes".into(), String::new()));
         assert_eq!(rows[5], ("lane".into(), "1".into(), "no".into()));
         assert_eq!(rows[6], ("step".into(), "1.no.0".into(), "open".into()));
-        assert_eq!(rows[7], ("add".into(), "1.no".into(), "".into()));
+        assert_eq!(rows[7], ("add".into(), "1.no".into(), String::new()));
         assert_eq!(rows[8], ("step".into(), "2".into(), "press".into()));
         // the FINAL row is the root add-point (insert context "").
         let last = rows.last().unwrap();
-        assert_eq!(last, &("add".into(), "".into(), "".into()));
+        assert_eq!(last, &("add".into(), String::new(), String::new()));
     }
 
     /// the generalized flatten exposes EVERY flow kind's lanes (if→then/else, for_each→body,
@@ -11063,7 +11068,7 @@ mod reconcile_units_tests {
 
     #[test]
     fn gaming_mode_derivation_matches_each_profile_flag() {
-        let _guard = GAMING_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = GAMING_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut p = neuron::profile::Profile::default();
         p.disable_alt_tab = true;
         p.disable_win = false;
@@ -11078,7 +11083,7 @@ mod reconcile_units_tests {
 
     #[test]
     fn gaming_mode_derivation_all_flags_set() {
-        let _guard = GAMING_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = GAMING_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut p = neuron::profile::Profile::default();
         p.disable_alt_tab = true;
         p.disable_win = true;
@@ -11090,7 +11095,7 @@ mod reconcile_units_tests {
 
     #[test]
     fn gaming_mode_derivation_no_flags_is_default() {
-        let _guard = GAMING_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = GAMING_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let p = neuron::profile::Profile::default();
         assert_eq!(p.gaming_mode(), GamingMode::default());
         assert!(!p.gaming_mode().any());
@@ -11100,7 +11105,7 @@ mod reconcile_units_tests {
 
     #[test]
     fn no_active_profile_resolves_to_default_policy() {
-        let _guard = GAMING_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = GAMING_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _cwd = crate::testsupport::cwd_guard("gaming_reconcile_no_active");
         neuron::profile::set_active("");
         let policy = gaming_policy_for_active_profile();
@@ -11110,7 +11115,7 @@ mod reconcile_units_tests {
 
     #[test]
     fn active_profile_with_gaming_flags_resolves_matching_policy() {
-        let _guard = GAMING_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = GAMING_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _cwd = crate::testsupport::cwd_guard("gaming_reconcile_active");
         let mut p = neuron::profile::Profile::default();
         p.name = "gm-test-profile".into();
@@ -11130,7 +11135,7 @@ mod reconcile_units_tests {
 
     #[test]
     fn active_profile_naming_a_deleted_file_resolves_to_default_not_a_panic() {
-        let _guard = GAMING_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = GAMING_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _cwd = crate::testsupport::cwd_guard("gaming_reconcile_gone");
         neuron::profile::set_active("no-such-profile-on-disk");
         let policy = gaming_policy_for_active_profile();
@@ -11142,7 +11147,7 @@ mod reconcile_units_tests {
 
     #[test]
     fn gaming_unit_publish_leaves_hook_policy_matching_derivation() {
-        let _guard = GAMING_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = GAMING_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _cwd = crate::testsupport::cwd_guard("gaming_reconcile_publish");
         let saved_hook_policy = neuron::hook::policy(); // restore so this test can't leak into others
 
@@ -11168,7 +11173,7 @@ mod reconcile_units_tests {
 
     #[test]
     fn gaming_unit_publish_with_no_active_profile_clears_hook_to_default() {
-        let _guard = GAMING_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = GAMING_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _cwd = crate::testsupport::cwd_guard("gaming_reconcile_publish_clear");
         let saved_hook_policy = neuron::hook::policy();
 

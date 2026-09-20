@@ -1099,9 +1099,9 @@ fn scan_key_presses(
     mut on_press: impl FnMut(usize, usize),
 ) -> u32 {
     let mut presses = 0u32;
-    for vk in 1..256usize {
+    for (vk, was_down) in prev.iter_mut().take(256).enumerate().skip(1) {
         let down = crate::capture::key_down(vk as i32);
-        if down && !prev[vk] {
+        if down && !*was_down {
             presses += 1;
             if let Some((ry, cx)) = crate::lighting::vk_to_key_cell(vk as i32) {
                 let (ry, cx) = (ry as usize, cx as usize);
@@ -1110,7 +1110,7 @@ fn scan_key_presses(
                 }
             }
         }
-        prev[vk] = down;
+        *was_down = down;
     }
     // The macro keys (M1..M6) don't ride Windows VKs — bridge their shared held-state with the SAME
     // down-edge logic so the same press lights the same cell. Length-guarded so a `prev` shorter than
@@ -2246,6 +2246,7 @@ fn heat_shimmer(x: usize, y: usize, t: f32, temp: f32) -> f32 {
 ///   * **brightness** (intensity) = the LOUDNESS — VU-integrated and auto-gained with crest
 ///     headroom, so the board pumps with the beat at any listening volume and true silence is an
 ///     honestly dark board.
+///
 /// Where Synapse's meter slides one colour by raw amplitude, this hears WHAT is playing, not just
 /// how loud — the EQ depth a single level number can't carry. If no PCM stream can open it
 /// degrades to the OS peak (brightness only, mid-gradient colour).
@@ -2459,6 +2460,7 @@ impl Pattern for StaticFrame {
 /// The pure Ambient renderer (no capture I/O) — maps each board cell to its matching SCREEN ZONE and
 /// eases the previous frame toward it (gentle temporal smoothing). `ease` is the per-frame lerp factor,
 /// `boost` the saturation amount. Deterministic + testable; an all-black grid → a dark board (honest).
+#[allow(clippy::too_many_arguments)]
 fn render_ambient(
     grid: &[Rgb],
     gcols: usize,
@@ -3680,7 +3682,7 @@ mod tests {
     fn fire_flicker_is_pure_ranged_and_heat_ramped() {
         // deterministic: same column + time → same flicker, forever (stateless, no RNG in the loop).
         for x in 0..20 {
-            assert_eq!(fire_flicker(x, 3.14159, 1.0, 0.5), fire_flicker(x, 3.14159, 1.0, 0.5));
+            assert_eq!(fire_flicker(x, std::f32::consts::PI, 1.0, 0.5), fire_flicker(x, std::f32::consts::PI, 1.0, 0.5));
         }
         // always a valid multiplier in (0, 1], with the ≥0.5 tip floor the comment promises.
         let mut seen_high = false;
@@ -4309,13 +4311,13 @@ mod tests {
             VSnap { battery_pct: 100, charging: false, active_stage: 0, stage_count: 1 },
             4, 4, Bounds { row0: 1, col0: 1, rows: 2, cols: 2 }, 0.0,
         );
-        for i in 0..16usize {
+        for (i, cell) in sub.iter().enumerate() {
             let (r, c) = (i / 4, i % 4);
             let inside = (1..=2).contains(&r) && (1..=2).contains(&c);
             if inside {
-                assert_ne!(sub[i], Rgb::BLACK, "cell {i} inside the rect lights");
+                assert_ne!(*cell, Rgb::BLACK, "cell {i} inside the rect lights");
             } else {
-                assert_eq!(sub[i], Rgb::BLACK, "cell {i} outside the rect stays dark");
+                assert_eq!(*cell, Rgb::BLACK, "cell {i} outside the rect stays dark");
             }
         }
     }
@@ -4444,12 +4446,12 @@ mod tests {
         assert_eq!(px.len(), rows as usize * cols as usize, "output is always board-sized");
         // Only the single in-board cell of the oversized rect (row 1, col 2) can light; the rest of the
         // rect is clipped away. (100% over a 9-wide rect lights all 9 cols, but only col 2 exists here.)
-        for i in 0..px.len() {
+        for (i, cell) in px.iter().enumerate() {
             let (r, c) = (i / cols as usize, i % cols as usize);
             if r == 1 && c == 2 {
-                assert_ne!(px[i], Rgb::BLACK, "the one in-board cell of the oversized rect lights");
+                assert_ne!(*cell, Rgb::BLACK, "the one in-board cell of the oversized rect lights");
             } else {
-                assert_eq!(px[i], Rgb::BLACK, "clipped / out-of-rect cells stay dark");
+                assert_eq!(*cell, Rgb::BLACK, "clipped / out-of-rect cells stay dark");
             }
         }
     }

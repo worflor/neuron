@@ -25,9 +25,9 @@ use neuron_host::shell::Host;
 
 fn main() -> anyhow::Result<()> {
     let reg = neuron::registry::Registry::load()?;
-    let host = Host::spawn();
+    let host = Host::spawn()?;
 
-    let bridged = bridge::attach(&reg, &host.handle(), 30);
+    let bridged = bridge::attach(&reg, &host.handle(), 30)?;
     if bridged.surfaces.is_empty() {
         eprintln!("no bridgeable devices found (registry knows none of the connected hardware)");
     }
@@ -65,7 +65,7 @@ fn main() -> anyhow::Result<()> {
     let mut line = String::new();
     if std::io::stdin().read_line(&mut line).unwrap_or(0) == 0 {
         loop {
-            std::thread::sleep(Duration::from_secs(3600));
+            std::thread::sleep(Duration::from_hours(1));
         }
     }
     Ok(())

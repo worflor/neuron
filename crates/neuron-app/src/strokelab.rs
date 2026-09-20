@@ -12,14 +12,8 @@
 //! Per capture it emits two siblings under `./strokes/`:
 //!   * `stroke_<id>.gwyph` — the canonical Whisper Glyph file (lossless points; re-encodable by the
 //!     external toolchain's real codec, so eigenmotion numbers stay authoritative to *that* codec).
-//!   * `stroke_<id>.json` — the bundle, in three separated sections:
-//!       - `raw`         — the ground-truth signal: full-resolution points (device counts) + real
-//!                         per-sample timestamps (from each motion event's `WM_INPUT` time).
-//!       - `recognition` — Neuron's own engine (`glyph.rs`): the prepared/exemplar paths, the
-//!                         `GestureWord` (velocity-domain, scale/speed-invariant), the per-window
-//!                         eigen-fits, and — if the vault is non-empty — what this stroke matched.
-//!       - `codec`       — the compression view: the raw stroke through the `engram` trajectory
-//!                         codec (macro+micro cascaded oscillators, energy capture), and the gwyph.
+//!   * `stroke_<id>.json` — a bundle with `raw` full-resolution points and event timestamps,
+//!     `recognition` engine features and any vault match, and `codec` trajectory compression data.
 //!
 //! Nothing here touches the recognizer, the vault, or `gestures.json`. It is purely additive.
 
@@ -288,7 +282,7 @@ fn build_bundle(
     let (timestamps_ms, duration_ms) = if stamps.len() == path.len() && !stamps.is_empty() {
         let t0 = stamps[0];
         let rel: Vec<u32> = stamps.iter().map(|t| t.wrapping_sub(t0)).collect();
-        let dur = *rel.last().unwrap();
+        let dur = stamps[stamps.len() - 1].wrapping_sub(t0);
         (Some(rel), Some(dur))
     } else {
         (None, None)
@@ -450,7 +444,7 @@ mod tests {
             "expected duration 178ms from the synthetic stamps"
         );
         // engram produced a real decomposition (at least one block, finite capture).
-        assert!(bundle.codec.engram.length == 90);
+        assert_eq!(bundle.codec.engram.length, 90);
         assert!(bundle.codec.engram.capture_pct.is_finite());
         assert!(!bundle.recognition.fits.is_empty(), "per-window eigen-fits");
     }

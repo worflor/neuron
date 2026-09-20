@@ -1508,6 +1508,7 @@ mod raw_input {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn capture_phrase(
         trigger: crate::controls::ControlRef,
         phrase: &crate::feel::Phrase,

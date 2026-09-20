@@ -24,6 +24,7 @@ pub fn start() {}
 #[cfg(windows)]
 fn run() {
     use neuron::prof;
+    use std::fmt::Write as _;
     use std::io::Write;
     use std::sync::atomic::Ordering;
 
@@ -44,7 +45,7 @@ fn run() {
             let d = now.wrapping_sub(prev[i]);
             prev[i] = now;
             if d > 0 {
-                line.push_str(&format!(" {label}={d}"));
+                let _ = write!(line, " {label}={d}");
             }
         }
 
@@ -57,13 +58,13 @@ fn run() {
                 (*tid, name.clone(), ticks.saturating_sub(p))
             })
             .collect();
-        burn.sort_by(|a, b| b.2.cmp(&a.2));
+        burn.sort_by_key(|entry| std::cmp::Reverse(entry.2));
         prev_thr = now_thr;
         for (tid, name, d) in burn.iter().take(5) {
             let pct = (*d as f64) / 1e7; // 100ns ticks accrued over ~1s -> fraction of one core
             if pct >= 0.01 {
                 let who = if name.is_empty() { format!("tid{tid}") } else { name.clone() };
-                line.push_str(&format!(" [{who} {:.0}%]", pct * 100.0));
+                let _ = write!(line, " [{who} {:.0}%]", pct * 100.0);
             }
         }
 
@@ -74,10 +75,10 @@ fn run() {
             .filter(|&vk| neuron::glyph::key_down(vk))
             .collect();
         if !down.is_empty() {
-            line.push_str(&format!(
+            let _ = write!(line,
                 " DOWN[{}]",
                 down.iter().map(|vk| format!("vk{vk:#x}")).collect::<Vec<_>>().join(",")
-            ));
+            );
         }
 
         // the Python sidecar's CPU (a spin that lives in the macro host, not in Rust)
@@ -88,7 +89,7 @@ fn run() {
             prev_sc = now_sc;
             let pct = (d as f64) / 1e7;
             if pct >= 0.01 {
-                line.push_str(&format!(" [sidecar(py {pid}) {:.0}%]", pct * 100.0));
+                let _ = write!(line, " [sidecar(py {pid}) {:.0}%]", pct * 100.0);
             }
         }
 
@@ -104,7 +105,7 @@ fn run() {
 }
 
 #[cfg(windows)]
-fn ft(f: &windows_sys::Win32::Foundation::FILETIME) -> u64 {
+fn ft(f: windows_sys::Win32::Foundation::FILETIME) -> u64 {
     (u64::from(f.dwHighDateTime) << 32) | u64::from(f.dwLowDateTime)
 }
 
@@ -136,7 +137,7 @@ fn thread_cpu() -> std::collections::HashMap<u32, (String, u64)> {
                     let (mut c, mut e, mut k, mut u): (FILETIME, FILETIME, FILETIME, FILETIME) =
                         std::mem::zeroed();
                     if GetThreadTimes(h, &raw mut c, &raw mut e, &raw mut k, &raw mut u) != 0 {
-                        map.insert(te.th32ThreadID, (thread_name(h), ft(&k) + ft(&u)));
+                        map.insert(te.th32ThreadID, (thread_name(h), ft(k) + ft(u)));
                     }
                     CloseHandle(h);
                 }
@@ -149,15 +150,20 @@ fn thread_cpu() -> std::collections::HashMap<u32, (String, u64)> {
 }
 
 /// Best-effort thread name via `GetThreadDescription` (the code names its worker threads). The
-/// returned buffer is `LocalAlloc`'d; we intentionally don't free it (no `Win32_System_Memory`
-/// feature here) — a few bytes per thread per second, only while `NEURON_PROFILE` is on.
+/// returned buffer is `LocalAlloc`'d and must be released with `LocalFree`.
 #[cfg(windows)]
 unsafe fn thread_name(h: windows_sys::Win32::Foundation::HANDLE) -> String {
+    use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::System::Threading::GetThreadDescription;
     let mut p: *mut u16 = std::ptr::null_mut();
     if GetThreadDescription(h, &raw mut p) >= 0 && !p.is_null() {
-        let len = (0..).take_while(|&i| *p.add(i) != 0).count();
-        return String::from_utf16_lossy(std::slice::from_raw_parts(p, len));
+        let mut len = 0;
+        while *p.add(len) != 0 {
+            len += 1;
+        }
+        let name = String::from_utf16_lossy(std::slice::from_raw_parts(p, len));
+        LocalFree(p.cast());
+        return name;
     }
     String::new()
 }
@@ -180,7 +186,7 @@ fn process_cpu(pid: u32) -> u64 {
         let (mut c, mut e, mut k, mut u): (FILETIME, FILETIME, FILETIME, FILETIME) =
             std::mem::zeroed();
         let r = if GetProcessTimes(h, &raw mut c, &raw mut e, &raw mut k, &raw mut u) != 0 {
-            ft(&k) + ft(&u)
+            ft(k) + ft(u)
         } else {
             0
         };

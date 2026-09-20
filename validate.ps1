@@ -55,14 +55,9 @@ if (-not $env:CI -and -not $env:CARGO_BUILD_JOBS) {
 $lock = @()
 if ($Locked) { $lock = @('--locked') }
 
-# neuron-app is the windows GUI. It compiles off windows, but every platform surface in it (tray,
-# overlays, input synthesis, audio) is an inert stub there, and building it pulls a fontconfig /
-# X11 / Wayland dev stack in to render a window that does nothing. Off windows the suite covers
-# what linux actually ships: the core, the CLI, the host, engram, the testkit. To build the app on
-# linux anyway (working on the linux GUI), install that stack and run cargo directly.
-# $env:OS is set on windows and nowhere else, so this works under both PS 5.1 and pwsh 7.
+# The Linux release includes the app, so both platforms validate the complete workspace.
+# Linux builders need the Slint backend and GTK/AppIndicator development libraries installed.
 $scope = @()
-if ($env:OS -ne 'Windows_NT') { $scope = @('--exclude', 'neuron-app') }
 
 $script:Failures = @()
 $script:Advisories = @()
@@ -88,9 +83,8 @@ function Invoke-Gate($name, [scriptblock]$body) {
 # Advisory. Reported, never fatal.
 #
 # The source is hand-formatted with no rustfmt.toml pinning that style (`cargo fmt --all
-# --check` reports ~1873 diffs; clippy ~123 mostly-pedantic warnings), so gating on either
-# today means a permanently red CI or a blanket reformat that destroys git blame. Report,
-# don't block. Promote to Invoke-Gate once the warnings are actually cleared.
+# --check` reports ~1873 diffs). Keep rustfmt advisory until the project chooses a pinned
+# style and can adopt it without rewriting unrelated code.
 function Invoke-Advisory($name, [scriptblock]$body) {
     Write-Step "$name (advisory)"
     $prev = $ErrorActionPreference          # same native-stderr reasoning as Invoke-Gate
@@ -176,10 +170,10 @@ if ($Mode -in @('quick', 'full')) {
 }
 
 # Clippy: the workspace lints catch real bugs (unwrap/expect in prod code, panics, etc).
-# Advisory for now — promote to Invoke-Gate once the existing ~N violations are cleared.
-# The workspace [lints] section is the source of truth; this just runs the analysis.
+# Keep it a gate now that the baseline is clear. The workspace lint policy permits
+# necessary OS FFI while pure modules can forbid unsafe code locally.
 if ($Mode -eq 'full') {
-    Invoke-Advisory 'clippy' { cargo clippy --workspace --all-targets -- -D warnings -A unsafe-code @lock }
+    Invoke-Gate 'clippy' { cargo clippy --workspace --all-targets @scope @lock -- -D warnings }
 }
 
 # ── full only ─────────────────────────────────────────────────────────────────────────────
@@ -199,8 +193,9 @@ if ($Mode -eq 'full') {
     # bare LNK1104 that names no cause.
     Invoke-Gate 'release target is writable' {
         $locked = @()
+        $targetRoot = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $PSScriptRoot 'target' }
         foreach ($exe in @('neuron-app.exe', 'neuron.exe')) {
-            $path = Join-Path (Join-Path $PSScriptRoot 'target\release') $exe
+            $path = Join-Path (Join-Path $targetRoot 'release') $exe
             if (-not (Test-Path -LiteralPath $path)) { continue }
             try { $fs = [IO.File]::Open($path, 'Open', 'ReadWrite', 'None'); $fs.Close() }
             catch { $locked += $exe }

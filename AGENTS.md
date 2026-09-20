@@ -16,11 +16,11 @@ If you only take three things away, take these:
 
 ## What this is, in four lines
 
-neuron is a tray-resident replacement for Razer Synapse: one small binary (CLI +
-GUI) that speaks `razer_report` HID directly. No account, no cloud, no telemetry, no
-kernel driver, no vendor SDK. The GUI is Windows-only. Linux runs the CLI: the whole
-workspace builds and the whole suite passes there, on a hidraw transport that is
-written and tested but has never touched a real device. Mac is unwritten.
+neuron is a tray-resident replacement for Razer Synapse: an app and CLI over one
+core that speaks `razer_report` HID directly. No account, no cloud, no telemetry,
+no kernel driver, no vendor SDK. Windows and Linux ship both executables. Linux
+has a GUI and hidraw transport, but live input, overlays, and audio still need
+native backends; the transport has never touched a real device. Mac is unwritten.
 
 The whole product is one primitive:
 
@@ -91,8 +91,8 @@ passes locally it passes in CI, by construction rather than by convention.
 ```
 
 CI runs exactly this on Windows and on Linux, and only when code actually changed — a
-docs-only push skips the build jobs. Lint is deliberately advisory; the reasoning is in the
-script next to the command, along with what would have to happen for it to become a gate.
+docs-only push skips the build jobs. Clippy is a gate in full mode; rustfmt remains
+advisory because the source uses an unpinned hand-formatting style.
 
 **On Linux**, install PowerShell 7 and run the same thing:
 
@@ -100,14 +100,11 @@ script next to the command, along with what would have to happen for it to becom
 pwsh ./validate.ps1
 ```
 
-That runs everything Linux ships — the core, the CLI, the host, engram, the testkit — and it
-passes, so it is a real gate there, not a smoke test. Two things it does not cover. It skips
-`neuron-app`, the Windows GUI: that crate compiles on Linux, but every surface in it is an
-inert stub there and building it pulls in a fontconfig/X11/Wayland dev stack (install that
-stack and run cargo directly if you are working on the Linux GUI). And it cannot prove Windows
-behaviour: a test that exercises a Win32 seam off Windows is asserting the stub. If you touched
-input, the overlays, the tray or audio, say in your PR that the Windows suite was not run
-locally, and CI will run it.
+That runs the complete Linux workspace, including `neuron-app`. Install the Slint
+fontconfig/X11/Wayland and GTK/AppIndicator development libraries first. The gate
+cannot prove hardware behavior without a real device, or Windows behavior when a
+Win32 seam resolves to a Linux stub. If you touched input, overlays, the tray, or
+audio, name the platform and hardware you tested in the PR.
 
 The platform-free gates — rustfmt and a parse of every shipped `.ps1` — have their own lane:
 

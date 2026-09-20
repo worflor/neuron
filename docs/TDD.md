@@ -703,12 +703,12 @@ Mitigation:
 
 ### Risk: Cross-Platform Runtime Boundary
 
-The core transport abstraction exists, but current HID path identity is still Windows-shaped and the GUI live runtime is Windows-only. Non-Windows builds must remain honest about unavailable device control instead of silently accepting live commands.
+The core HID path identity is backend-owned and Linux has a hidraw transport and GUI. Live input capture/synthesis, overlays and audio still need Linux backends, and the hidraw transport has not been verified on real hardware. The app must report unavailable live commands rather than claiming they are armed.
 
 Mitigation:
 
 - Keep platform capability reporting explicit in the UI and CLI.
-- Replace Windows-specific path identity with an opaque backend-owned device identity before adding macOS/Linux HID backends.
+- Keep opaque backend-owned device identity when adding another HID transport.
 - Keep platform-specific hooks, Raw Input, purge/admin helpers, and COM audio behind clear modules/features.
 
 **Cross-platform readiness scorecard** (a few of these seams have since landed, so verify each against the tree before relying on it):

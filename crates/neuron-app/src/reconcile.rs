@@ -289,7 +289,9 @@ fn run_scope(scope: Scope, timeout: Duration) {
             break;
         }
         // Safe: `pending` is non-empty here (the loop above would have `break`d otherwise).
-        let earliest = pending.iter().map(|(_, d)| *d).min().unwrap();
+        let Some(earliest) = pending.iter().map(|(_, d)| *d).min() else {
+            break;
+        };
         wait_for_progress_or_deadline(earliest, || {
             pending.iter().any(|(u, _)| deps_ready(u.deps))
         });
@@ -320,7 +322,7 @@ mod tests {
     /// Common setup: hold the serialization lock, start with a clean readiness/registry slate, and
     /// make sure the worker is running (idempotent — later tests' calls are no-ops).
     fn setup() -> std::sync::MutexGuard<'static, ()> {
-        let guard = RECONCILE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = RECONCILE_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         reset_readiness();
         reset_registry();
         start();

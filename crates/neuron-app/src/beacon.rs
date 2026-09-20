@@ -916,7 +916,7 @@ fn live_weave(
                                     meter: None,
                                 };
                             } else {
-                                view.title = name.clone();
+                                view.title.clone_from(&name);
                             }
                             let ghost = vault.exemplar(&name).to_vec();
                             overlay.hint(Some(crate::overlay::GlyphHint {
@@ -1305,7 +1305,9 @@ pub(crate) mod audio_cache {
         };
         let core = if core.is_empty() { name.trim() } else { core };
         if core.chars().count() > 22 {
-            core.chars().take(21).collect::<String>() + "\u{2026}"
+            let mut label: String = core.chars().take(21).collect();
+            label.push('\u{2026}');
+            label
         } else {
             core.to_string()
         }
@@ -1999,26 +2001,22 @@ fn present(
                     overlay.end();
                 }
                 std::thread::sleep(std::time::Duration::from_millis(120));
-                continue;
             }
         }
     };
 
-    match verdict {
-        Some(idx) => {
-            macro_host().answer(p.pid, Some(idx));
-            overlay.recognized(true);
-            let picked = p.options.get(idx).map_or("?", String::as_str);
-            post_status(weak, format!("beacon \u{2192} {picked} \u{00b7} {}", p.text));
-        }
-        None => {
-            // passed, or retired without a flick (timeout / supersede / link loss). Hand the macro
-            // its default NOW so an abandoned prompt never pins the worker until the full sidecar-side
-            // timeout — harmless if the sidecar already timed out or died (an expired pid is ignored).
-            macro_host().answer(p.pid, None);
-            overlay.recognized(false);
-            post_status(weak, format!("beacon passed \u{00b7} {}", p.text));
-        }
+    if let Some(idx) = verdict {
+        macro_host().answer(p.pid, Some(idx));
+        overlay.recognized(true);
+        let picked = p.options.get(idx).map_or("?", String::as_str);
+        post_status(weak, format!("beacon \u{2192} {picked} \u{00b7} {}", p.text));
+    } else {
+        // passed, or retired without a flick (timeout / supersede / link loss). Hand the macro
+        // its default NOW so an abandoned prompt never pins the worker until the full sidecar-side
+        // timeout — harmless if the sidecar already timed out or died (an expired pid is ignored).
+        macro_host().answer(p.pid, None);
+        overlay.recognized(false);
+        post_status(weak, format!("beacon passed \u{00b7} {}", p.text));
     }
     // the flare/fizzle fades on its own render thread — the overlay is persistent (the
     // presenter's), so nothing here waits on an animation before the next prompt or weave.
@@ -2165,7 +2163,7 @@ mod tests {
 
     impl OwnershipGuard {
         fn take() -> Self {
-            let lock = OWNERSHIP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let lock = OWNERSHIP_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let editor = super::EDITOR_WEAVE.load(std::sync::atomic::Ordering::SeqCst);
             let presenting = super::BEACON_PRESENTING.load(std::sync::atomic::Ordering::SeqCst);
             Self {

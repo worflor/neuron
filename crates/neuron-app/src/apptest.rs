@@ -33,33 +33,30 @@ use slint::ComponentHandle;
 fn try_window() -> Option<AppWindow> {
     // `AppWindow::new()` initializes the (winit/software) backend lazily; on a machine with no
     // windowing it returns an Err instead of panicking. Either way we don't crash the suite.
-    match std::panic::catch_unwind(AppWindow::new) {
-        Ok(Ok(app)) => {
-            WINDOW_TAKEN.store(true, std::sync::atomic::Ordering::SeqCst);
-            Some(app)
-        }
-        _ => {
-            assert!(
-                std::env::var_os("NEURON_REQUIRE_GUI").is_none(),
-                "NEURON_REQUIRE_GUI is set but no window is available — this environment cannot \
-                 provide the GUI coverage it promises"
+    if let Ok(Ok(app)) = std::panic::catch_unwind(AppWindow::new) {
+        WINDOW_TAKEN.store(true, std::sync::atomic::Ordering::SeqCst);
+        Some(app)
+    } else {
+        assert!(
+            std::env::var_os("NEURON_REQUIRE_GUI").is_none(),
+            "NEURON_REQUIRE_GUI is set but no window is available — this environment cannot \
+             provide the GUI coverage it promises"
+        );
+        // Name WHICH of the two reasons this is. They are not the same problem, and reporting
+        // both as the first hid the second: a headless runner is a legitimate skip, whereas a
+        // process that has already spent its one window is a HARNESS limit quietly eating
+        // coverage. Measured 2026-09-17: only the first `AppWindow::new()` in a process
+        // succeeds (it reproduces under `--test-threads=1`, so it is not a threading artifact),
+        // which means at most one of this module's windowed tests asserts anything per run.
+        if WINDOW_TAKEN.load(std::sync::atomic::Ordering::SeqCst) {
+            eprintln!(
+                "SKIPPED WITH ZERO ASSERTIONS: this process already created its one window, \
+                 so this test verified NOTHING. Run it alone to exercise it for real."
             );
-            // Name WHICH of the two reasons this is. They are not the same problem, and reporting
-            // both as the first hid the second: a headless runner is a legitimate skip, whereas a
-            // process that has already spent its one window is a HARNESS limit quietly eating
-            // coverage. Measured 2026-09-17: only the first `AppWindow::new()` in a process
-            // succeeds (it reproduces under `--test-threads=1`, so it is not a threading artifact),
-            // which means at most one of this module's windowed tests asserts anything per run.
-            if WINDOW_TAKEN.load(std::sync::atomic::Ordering::SeqCst) {
-                eprintln!(
-                    "SKIPPED WITH ZERO ASSERTIONS: this process already created its one window, \
-                     so this test verified NOTHING. Run it alone to exercise it for real."
-                );
-            } else {
-                eprintln!("skipping: no windowing backend available (GUI test ran zero assertions)");
-            }
-            None
+        } else {
+            eprintln!("skipping: no windowing backend available (GUI test ran zero assertions)");
         }
+        None
     }
 }
 
@@ -82,7 +79,7 @@ fn headless_launch_smoke() {
     assert_eq!(st.get_page(), 0);
     // the glue set an initial brush colour from the accent.
     let brush = st.get_brush_color();
-    assert!(brush.red() as u32 + brush.green() as u32 + brush.blue() as u32 > 0);
+    assert!(u32::from(brush.red()) + u32::from(brush.green()) + u32::from(brush.blue()) > 0);
     // models are populated objects (length may be 0 with no device, but the model must exist).
     let _ = st.get_devices();
     let _ = st.get_effects();

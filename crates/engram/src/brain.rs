@@ -138,15 +138,9 @@ impl Brain {
 
     /// Get all well centroids (cached).
     pub fn well_centroids(&mut self) -> &HashMap<String, Vec<Complex64>> {
-        if self.centroid_cache.is_none() {
-            let centroids: HashMap<String, Vec<Complex64>> = self
-                .wells
-                .iter()
-                .map(|(name, well)| (name.clone(), well.centroid()))
-                .collect();
-            self.centroid_cache = Some(centroids);
-        }
-        self.centroid_cache.as_ref().unwrap()
+        self.centroid_cache.get_or_insert_with(|| {
+            self.wells.iter().map(|(name, well)| (name.clone(), well.centroid())).collect()
+        })
     }
 
     /// Global centroid: mean across all well centroids.
@@ -197,7 +191,7 @@ impl Brain {
             let dist = (sum_sq / p as f64).sqrt();
             if dist < best_dist {
                 best_dist = dist;
-                best_name = name.clone();
+                best_name.clone_from(name);
             }
         }
 
@@ -268,13 +262,8 @@ impl Brain {
             self.route_unsupervised(&obs_centroid)
         };
 
-        // Create well if needed
-        if !self.wells.contains_key(&well_name) {
-            self.wells.insert(well_name.clone(), Well::new(p));
-        }
-
         // Absorb all block K values into the well
-        let well = self.wells.get_mut(&well_name).unwrap();
+        let well = self.wells.entry(well_name.clone()).or_insert_with(|| Well::new(p));
         for k in &obs_ks {
             well.absorb(k);
         }
@@ -417,15 +406,15 @@ impl Brain {
         }
 
         // Derive reference pairing on first trajectory
-        if self.reference_pairing.is_none() {
-            self.reference_pairing = Some(derive_pairing(trajectory, t, dim));
-        }
+        let pairing = self.reference_pairing
+            .get_or_insert_with(|| derive_pairing(trajectory, t, dim))
+            .clone();
 
         let wp = crate::segment::apply_pairing(
             trajectory,
             t,
             dim,
-            self.reference_pairing.as_ref().unwrap(),
+            &pairing,
         );
 
         let z = to_complex(&wp, t, dim);
@@ -458,7 +447,7 @@ impl Brain {
             alpha: self.alpha,
             macro_block: t,
             micro_block: MIN_BLOCK,
-            pairing: self.reference_pairing.clone().unwrap(),
+            pairing,
             blocks: vec![blk],
         };
 

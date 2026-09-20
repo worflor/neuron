@@ -175,16 +175,15 @@ impl ObsFollower {
     /// `control` is the connection's command channel — the follower uses it to
     /// demand a full re-announcement (`ObsCmd::Resync`) when the kernel is
     /// reborn underneath it (see [`follow`]).
-    fn start(handle: HostHandle, control: ObsControl) -> ObsFollower {
+    fn start(handle: HostHandle, control: ObsControl) -> std::io::Result<ObsFollower> {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
         // ObsFollower owns this handle and joins it on Drop — routed through the handle-returning
         // primitive.
         let thread = crate::worker::spawn_named("neuron-obs-follow", move || {
             follow(handle, control, &flag);
-        })
-        .expect("spawn obs follower");
-        ObsFollower { stop, thread: Some(thread) }
+        })?;
+        Ok(ObsFollower { stop, thread: Some(thread) })
     }
 }
 
@@ -252,7 +251,7 @@ fn follow(handle: HostHandle, control: ObsControl, stop: &AtomicBool) {
                     ("obs.connected", Value::Bool(b)) => m.connected = *b,
                     ("obs.streaming", Value::Bool(b)) => m.streaming = *b,
                     ("obs.recording", Value::Bool(b)) => m.recording = *b,
-                    ("obs.scene", Value::Text(s)) => m.scene = s.clone(),
+                    ("obs.scene", Value::Text(s)) => m.scene.clone_from(s),
                     // obs.mute.<input> stays bus-only for now (macros can
                     // obs_request their way to it).
                     _ => {}
@@ -333,16 +332,15 @@ struct HostEventsListener {
 }
 
 impl HostEventsListener {
-    fn start(handle: HostHandle) -> HostEventsListener {
+    fn start(handle: HostHandle) -> std::io::Result<HostEventsListener> {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
         // HostEventsListener owns this handle and joins it on Drop — routed through the
         // handle-returning primitive.
         let thread = crate::worker::spawn_named("neuron-host-events", move || {
             host_events_loop(handle, &flag);
-        })
-        .expect("spawn host events listener");
-        HostEventsListener { stop, thread: Some(thread) }
+        })?;
+        Ok(HostEventsListener { stop, thread: Some(thread) })
     }
 }
 
@@ -510,7 +508,7 @@ pub fn set_enabled(on: bool) -> String {
         (false, false) => "connections already closed".into(),
         (true, false) => {
             if bring_up(&mut g) {
-                let s = status_of(&g);
+                let s = status_of(g.as_ref());
                 format!(
                     "connections open — {} device(s), chroma {}, openrgb {}",
                     s.devices,
@@ -693,7 +691,13 @@ pub fn reconnect_obs() {
 /// passwordless OBS — the common local default).
 fn connect_obs(s: &mut HostState) {
     let pw = crate::prefs::host_obs_password();
-    let conn = ObsConnection::start(OBS_ADDR, &pw, s.handle.clone());
+    let conn = match ObsConnection::start(OBS_ADDR, &pw, s.handle.clone()) {
+        Ok(conn) => conn,
+        Err(err) => {
+            eprintln!("neuron-host: OBS listener failed to start: {err}");
+            return;
+        }
+    };
     let control = conn.control();
     neuron::obs_hook::set_sink(Box::new(move |verb, arg| {
         // ── SENSE: `obs_get(probe)` reads the follower's mirror — no websocket
@@ -825,8 +829,16 @@ fn connect_obs(s: &mut HostState) {
     // The follower gets the connection's control channel so a kernel rebirth can
     // demand a fresh resync from OBS (the reborn bus starts empty — see `follow`).
     let follow_control = conn.control();
+    let follower = match ObsFollower::start(s.handle.clone(), follow_control) {
+        Ok(follower) => follower,
+        Err(err) => {
+            neuron::obs_hook::clear_sink();
+            eprintln!("neuron-host: OBS follower failed to start: {err}");
+            return;
+        }
+    };
     s.obs = Some(conn);
-    s.obs_follow = Some(ObsFollower::start(s.handle.clone(), follow_control));
+    s.obs_follow = Some(follower);
 }
 
 /// The live native-Chroma face: the server handle (kept alive so the `Global\` objects
@@ -1125,12 +1137,30 @@ fn bring_up(g: &mut Option<HostState>) -> bool {
     let Ok(reg) = neuron::registry::Registry::load() else {
         return false;
     };
-    let host = Host::spawn();
+    let host = match Host::spawn() {
+        Ok(host) => host,
+        Err(err) => {
+            eprintln!("neuron-host: kernel failed to start: {err}");
+            return false;
+        }
+    };
     let handle = host.handle();
     let mut h = host.handle();
-    let host_events = HostEventsListener::start(host.handle());
+    let host_events = match HostEventsListener::start(host.handle()) {
+        Ok(listener) => listener,
+        Err(err) => {
+            eprintln!("neuron-host: event listener failed to start: {err}");
+            return false;
+        }
+    };
     let base_owner = h.next_source();
-    let bridge = bridge::attach(&reg, &handle, 30);
+    let bridge = match bridge::attach(&reg, &handle, 30) {
+        Ok(bridge) => bridge,
+        Err(err) => {
+            eprintln!("neuron-host: device writer failed to start: {err}");
+            return false;
+        }
+    };
     // Two paint policies by design — one for the Chroma faces (games), one for OpenRGB (tools) —
     // so the settings page can blend each family differently. Both fed from prefs now.
     let chroma_policy = PaintPolicy::new();
@@ -1236,7 +1266,7 @@ fn covered_by_decision(
 /// [`Status`] stays platform-uniform.
 #[cfg(windows)]
 fn native_chroma_status(
-    chroma_shm: &Option<ChromaShm>,
+    chroma_shm: Option<&ChromaShm>,
     handle: &HostHandle,
     base_owner: SourceId,
     now: Instant,
@@ -1267,7 +1297,7 @@ fn native_chroma_status(
                 counts.push((bucket, 1));
             }
         }
-        counts.sort_by(|a, b| b.1.cmp(&a.1));
+        counts.sort_by_key(|entry| std::cmp::Reverse(entry.1));
         counts.into_iter().take(3).map(|(color, _)| color).collect()
     }
 
@@ -1332,7 +1362,7 @@ fn native_chroma_status(
 
 #[cfg(not(windows))]
 fn native_chroma_status(
-    _chroma_shm: &Option<ChromaShm>,
+    _chroma_shm: Option<&ChromaShm>,
     _handle: &HostHandle,
     _base_owner: SourceId,
     _now: Instant,
@@ -1340,7 +1370,7 @@ fn native_chroma_status(
     (false, None)
 }
 
-fn status_of(g: &Option<HostState>) -> Status {
+fn status_of(g: Option<&HostState>) -> Status {
     match g {
         Some(s) => {
             let obs = obs_snapshot();
@@ -1368,7 +1398,7 @@ fn status_of(g: &Option<HostState>) -> Status {
                 .map(|o| client_statuses(o.clients(), &boards, openrgb_muted))
                 .unwrap_or_default();
             let (chroma_native_serving, chroma_native_game) =
-                native_chroma_status(&s.chroma_shm, &s.handle, s.base_owner, now);
+                native_chroma_status(s.chroma_shm.as_ref(), &s.handle, s.base_owner, now);
             Status {
                 active: true,
                 devices: s.bridge.surfaces.len(),
@@ -1449,7 +1479,7 @@ fn kind_word(kind: neuron_host::api::SurfaceKind) -> &'static str {
 
 /// The SYSTEM card readout.
 pub fn status() -> Status {
-    status_of(&guard())
+    status_of(guard().as_ref())
 }
 
 /// Is the host live (i.e. should the app route lighting through it rather
@@ -1679,12 +1709,15 @@ pub fn set_lighting(pid: u16, unit: &str, defs: Vec<LayerDef>, fps: u32) -> bool
             if existing.band == want_band && h.set_content(existing.layer, content.clone(), now) {
                 // Keep the retained defs current with what's actually rendering,
                 // so a later rebirth recovery rebuilds THIS stack, not a stale one.
-                s.base.get_mut(&key).expect("just matched").defs = defs.clone();
+                if let Some(base) = s.base.get_mut(&key) {
+                    base.defs.clone_from(&defs);
+                }
                 any = true;
                 continue;
             }
-            let old = s.base.remove(&key).expect("just matched");
-            h.release(old.layer);
+            if let Some(old) = s.base.remove(&key) {
+                h.release(old.layer);
+            }
         }
         if let Some(layer) = h.claim(
             &key,
@@ -1714,7 +1747,9 @@ pub fn set_fps(pid: u16, unit: &str, fps: u32) {
     let g = guard();
     if let Some(s) = g.as_ref() {
         for key in surface_keys(&s.bridge, pid, unit) {
-            s.bridge.set_fps(&key, fps);
+            if !s.bridge.set_fps(&key, fps) {
+                eprintln!("neuron-host: no writer for surface {key}");
+            }
         }
     }
 }

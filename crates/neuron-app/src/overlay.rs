@@ -1436,9 +1436,8 @@ mod imp {
                                     // wears the wifi/ethernet icon + tone; OUTPUT (west) shows the
                                     // device + a level meter; BLUETOOTH (east) is the toggle seam.
                                     let net_glyph = match link {
-                                        2 => WedgeGlyph::Network,  // wifi
                                         1 => WedgeGlyph::Ethernet, // the wire
-                                        _ => WedgeGlyph::Network,
+                                        _ => WedgeGlyph::Network,  // wifi or unknown
                                     };
                                     let net_tone = if *link == 0 { Tone::Off } else { Tone::Live };
                                     let card =
@@ -1487,7 +1486,7 @@ mod imp {
                                         rasterize_text(&ellipsize(&h.view.title, 18), 13);
                                 }
                                 WeaveMode::Twin { hint, .. } if *hint != twin_hint_str => {
-                                    twin_hint_str = hint.clone();
+                                    twin_hint_str.clone_from(hint);
                                     twin_hint = if hint.is_empty() {
                                         None
                                     } else {
@@ -2985,7 +2984,7 @@ mod imp {
                         WeaveMode::Map { .. } => "Map",
                         WeaveMode::Twin { .. } => "Twin",
                         WeaveMode::NotifyStack => "NotifyStack",
-                        _ => "other",
+                        WeaveMode::Control { .. } => "Control",
                     };
                     eprintln!(
                         "[OVL slow] {}ms mode={m} visible={visible} fading={fading} cover={dbg_cover}/{} painted={dbg_painted} pts={} particles={}",
@@ -3764,7 +3763,7 @@ mod imp {
         // the aimed wedge — a small threshold so it lights as you move, well before the commit radius.
         let live = neuron::radial::pick_wedge(f64::from(aim.0), f64::from(aim.1), 6.0, n);
         let half = (neuron::radial::wedge_arc(n) as f32) * 0.5;
-        for i in 0..n {
+        for (i, label) in labels.iter().enumerate() {
             let b = neuron::radial::wedge_bearing(i, n) as f32; // atan2(dy,dx): E=0, S=+, W=±π, N=−
             let is_accent = i == 0;
             let hot = live == Some(i);
@@ -3814,7 +3813,7 @@ mod imp {
             }
             // the option LABEL, just inside its node — accent (prism+core) for option 0, else the
             // material (glow+core), so a label always shades like the wedge it names.
-            if let Some(t) = &labels[i] {
+            if let Some(t) = label {
                 let (lx, ly) = (CX + b.cos() * rad * 0.62, CY + b.sin() * rad * 0.62);
                 let lhot = if hot { 1.0 } else { 0.55 };
                 text_pocket(buf, t, lx, ly, 0.30);
@@ -3964,7 +3963,9 @@ mod imp {
     /// Shorten a caption to `max` chars with an ellipsis (the strip/wheel is not a text editor).
     fn ellipsize(s: &str, max: usize) -> String {
         if s.chars().count() > max {
-            s.chars().take(max.saturating_sub(1)).collect::<String>() + "…"
+            let mut label: String = s.chars().take(max.saturating_sub(1)).collect();
+            label.push('…');
+            label
         } else {
             s.to_string()
         }

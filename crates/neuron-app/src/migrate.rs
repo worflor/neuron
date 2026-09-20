@@ -158,7 +158,7 @@ pub fn apply(imp: &Imported) -> Result<String, String> {
     // persist, so a plain `save()` writes everything in one step.
     if !imp.profile.is_empty() {
         let mut p = imp.profile.clone();
-        p.name = name.clone();
+        p.name.clone_from(&name);
         match p.save() {
             Ok(()) => wrote.push(format!("profile '{}'", p.name)),
             Err(e) => return Err(format!("profile save failed: {e}")),

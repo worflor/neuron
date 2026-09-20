@@ -1141,6 +1141,7 @@ pub fn lift_off_async(d: &Device) -> Option<(u8, u8)> {
 /// 2. STEP2:         `id=0x0B, size=4, args=[0x00, 0x04, 0x04, 0x00]`
 /// 3. SET lift+land: `id=0x05, size=4, args=[0x00, 0x04, lift-1, landing-1]`
 ///    (LIFT range 2..=26, LANDING range 1..=25 — abstract level indices, NOT mm; written as value-1.)
+///
 /// Then VERIFY by reading the shared getter `0x0B/0x85 size 1` once and confirming
 /// `args[2]==0x04 && args[4]==lift-1 && args[5]==landing-1`. (To go BACK to even/symmetric, call
 /// [`set_lift_off_distance`], which writes args[2]=0x01 — or send the documented disable-async

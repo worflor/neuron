@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
 
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable)]
+
 //! TASK 2 (first half): real concurrent claim fights through the actor.
 //!
 //! Every arbiter/shell test elsewhere in this crate is single-threaded —
@@ -31,7 +33,7 @@ const BANDS: [i32; 4] = [band::BASE, band::AMBIENT, band::SESSION, band::OVERRID
 
 #[test]
 fn concurrent_claim_fight_resolves_consistently_with_no_panic_and_unique_ids() {
-    let host = Host::spawn();
+    let host = Host::spawn().expect("spawn host");
     let mut setup = host.handle();
     setup.declare(SurfaceInfo::grid("kbd", "Board", SurfaceKind::Keyboard, 1, 1));
 

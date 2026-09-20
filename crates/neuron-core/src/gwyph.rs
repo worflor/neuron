@@ -225,13 +225,13 @@ pub fn encode_stroke(points: &[[f32; 2]], style: &StrokeStyle) -> Vec<u8> {
     w.u16(((style.width * 256.0).round() as i64).clamp(1, 65535) as u16);
     w.varuint(n as u32);
     if n >= 1 {
-        for c in 0..GLYPH_CHANNELS {
-            w.u16(q[0][c] as u16);
+        for channel in &q[0] {
+            w.u16(*channel as u16);
         }
     }
     if n >= 2 {
-        for c in 0..GLYPH_CHANNELS {
-            w.u16(q[1][c] as u16);
+        for channel in &q[1] {
+            w.u16(*channel as u16);
         }
     }
     if n >= 3 {

@@ -63,14 +63,6 @@ fn main() {
     if !tarball.exists() {
         // Cache miss: download the tarball + the release SHA256SUMS manifest, verify, then commit.
         ensure_tarball(&tarball, triple, &asset);
-    } else {
-        // Cache hit: trust it (it was verified when first written) so offline/incremental builds
-        // never touch the network. A corrupt cache surfaces later as an extraction error, not a
-        // silent wrong-Python — and deleting the file forces a re-fetch.
-        println!(
-            "cargo:warning=neuron: reusing cached CPython tarball {}",
-            tarball.display()
-        );
     }
 
     // SLIM the verified upstream tarball into a sibling `<asset>.slim.tar.gz` (stream-filter; see
@@ -103,10 +95,6 @@ fn manifest_build_rs() -> PathBuf {
 /// a warm cache is a no-op — keeping incremental builds fast and the embedded blob/link small).
 fn ensure_slim(src: &Path, slim: &Path, build_rs: &Path) {
     if !needs_reslim(slim, build_rs) {
-        println!(
-            "cargo:warning=neuron: reusing cached SLIM CPython tarball {}",
-            slim.display()
-        );
         return;
     }
     println!(

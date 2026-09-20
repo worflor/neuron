@@ -737,9 +737,10 @@ pub fn validate_action(id: &str, param: &str) -> Result<(), String> {
         // profile: up/down/blank cycles (always ok); a name must be an existing profile.
         "profile" => {
             let l = p.to_lowercase();
-            if p.is_empty() || l == "up" || l == "down" || l == "next" || l == "prev" {
-                Ok(())
-            } else if neuron::profile::list().iter().any(|n| n == p) {
+            if p.is_empty()
+                || matches!(l.as_str(), "up" | "down" | "next" | "prev")
+                || neuron::profile::list().iter().any(|n| n == p)
+            {
                 Ok(())
             } else {
                 Err(format!(
@@ -1909,7 +1910,7 @@ mod tests {
             },
         ];
         let doc = RuleDoc {
-            rules: rules.clone(),
+            rules,
         };
         let body = toml::to_string_pretty(&doc).unwrap();
         let back: RuleDoc = toml::from_str(&body).unwrap();

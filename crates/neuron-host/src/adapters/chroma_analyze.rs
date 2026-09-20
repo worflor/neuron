@@ -194,7 +194,9 @@ impl ChromaAnalyzer {
 
             // ── ramp (rising fill) + pulse (periodic) need a populated window ──
             if t.hist.len() >= 5 {
-                let (slope, span_s, lo, hi, mean, upcross, mono_frac) = window_stats(&t.hist);
+                let Some((slope, span_s, lo, hi, mean, upcross, mono_frac)) = window_stats(&t.hist) else {
+                    continue;
+                };
 
                 // Ramp: a sustained monotonic rise, not a one-sample step (a flash has
                 // low mono_frac — one jump then flat — so it's rejected here). ETA
@@ -236,9 +238,11 @@ impl ChromaAnalyzer {
 /// luma slope (per second), time span (s), min/max/mean luma, count of mean-
 /// upcrossings (≈ pulse cycles), and the fraction of adjacent samples that rose
 /// (monotonicity — separates a sustained ramp from a single step/flash).
-fn window_stats(hist: &VecDeque<Sample>) -> (f32, f32, f32, f32, f32, u32, f32) {
+fn window_stats(hist: &VecDeque<Sample>) -> Option<(f32, f32, f32, f32, f32, u32, f32)> {
+    let first = hist.front()?;
+    let last = hist.back()?;
     let n = hist.len() as f32;
-    let t0 = hist.front().unwrap().ts;
+    let t0 = first.ts;
     let (mut sx, mut sy, mut sxx, mut sxy) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
     let (mut lo, mut hi, mut sum) = (f32::MAX, f32::MIN, 0.0f32);
     for s in hist {
@@ -259,10 +263,10 @@ fn window_stats(hist: &VecDeque<Sample>) -> (f32, f32, f32, f32, f32, u32, f32) 
         0.0
     };
     let mean = sum / n;
-    let span_s = hist.back().unwrap().ts.wrapping_sub(t0) as f32 / 1000.0;
+    let span_s = last.ts.wrapping_sub(t0) as f32 / 1000.0;
     let mut upcross = 0u32;
     let mut rose = 0u32;
-    let mut prev = hist.front().unwrap().luma;
+    let mut prev = first.luma;
     for s in hist.iter().skip(1) {
         if prev < mean && s.luma >= mean {
             upcross += 1;
@@ -277,7 +281,7 @@ fn window_stats(hist: &VecDeque<Sample>) -> (f32, f32, f32, f32, f32, u32, f32) 
     } else {
         0.0
     };
-    (slope, span_s, lo, hi, mean, upcross, mono_frac)
+    Some((slope, span_s, lo, hi, mean, upcross, mono_frac))
 }
 
 #[cfg(test)]

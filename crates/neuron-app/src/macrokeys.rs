@@ -176,8 +176,7 @@ fn spawn_reader(pid: u16, path: DevicePath, armed: Arc<Mutex<HashSet<DevicePath>
             loop {
                 match neuron::transport::classify_read(reader.read(&mut buf)) {
                     neuron::transport::ReadStep::Data(n) if n > 0 => decode(&buf[..n], pid),
-                    neuron::transport::ReadStep::Data(_) => {} // zero-length read — keep listening
-                    neuron::transport::ReadStep::Idle => {} // read timed out — keep listening
+                    neuron::transport::ReadStep::Data(_) | neuron::transport::ReadStep::Idle => {}
                     neuron::transport::ReadStep::Gone => {
                         // unplugged — release un-claims `path` so the monitor re-arms.
                         if verbose() {

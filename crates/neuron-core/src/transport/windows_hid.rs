@@ -123,6 +123,7 @@ extern "system" {
 ///     "fails" (e.g. the read had already completed the instant before `CancelIo` ran) —
 ///     `GetOverlappedResult(wait=TRUE)` still blocks until the kernel is done with the buffer
 ///     either way, so there is no path out of this function with I/O still pending.
+///
 /// A panic between `ReadFile` and this function's return would unwind through the same code path
 /// (Rust doesn't skip drops/cleanup here — there IS no separate cleanup to skip, since this
 /// function contains no early-return before the cancel-and-reap sequence completes; the only heap

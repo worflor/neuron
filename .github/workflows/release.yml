@@ -194,6 +194,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+      - name: Linux GUI build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libxdo-dev libayatana-appindicator3-dev libfontconfig1-dev libasound2-dev libudev-dev
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
@@ -208,10 +212,8 @@ jobs:
         shell: pwsh
         run: ./validate.ps1
 
-      # CLI only: neuron-app compiles here, but its tray, overlays and input synthesis are inert
-      # stubs off windows.
       - name: build
-        run: cargo build --release -p neuron-cli --locked
+        run: cargo build --release -p neuron-app -p neuron-cli --locked
 
       - name: Stage the package
         shell: bash
@@ -219,13 +221,13 @@ jobs:
           set -euo pipefail
           name="neuron-${{ needs.preflight.outputs.version }}-linux-x86_64"
           mkdir -p "dist/$name"
-          cp target/release/neuron "dist/$name/"
+          cp target/release/neuron target/release/neuron-app "dist/$name/"
           cp README.md LICENSE.md THIRD-PARTY-NOTICES.md SECURITY.md "dist/$name/"
           cp -r LICENSES "dist/$name/"
           cp -r skills "dist/$name/"
           cp packaging/linux/70-neuron.rules "dist/$name/"
           cat > "dist/$name/SOURCE.txt" <<EOF
-          neuron ${{ needs.preflight.outputs.version }} — linux x86_64 (CLI)
+          neuron ${{ needs.preflight.outputs.version }} — linux x86_64 (app + CLI)
 
           Built by GitHub Actions from:
             repository : ${{ github.server_url }}/${{ github.repository }}
@@ -235,8 +237,9 @@ jobs:
 
           Built against glibc 2.35 (Ubuntu 22.04), so it runs on that or newer.
 
-          This archive ships the CLI only — the GUI's tray, overlays and input synthesis are
-          windows-only today. Device control, lighting and profiles all work here.
+          Run ./neuron-app for the GUI or ./neuron for the CLI. The GUI uses GTK 3,
+          AppIndicator and libxdo. Global hotkeys use X11. Live input remaps, overlays,
+          and audio controls still need Linux backends.
 
           Install the udev rule first, or hidraw stays root-only:
 

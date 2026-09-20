@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
 
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable)]
+
 //! Lifecycle churn -- the unit-level sibling of the whole-app resident BUDGET lane
 //! (`neuron-testkit::budget`). Every thread-owning type in this crate (`OrgbServer`,
 //! `ChromaHttpServer`, `ObsConnection`, `Writer`) grew a bounded, join-on-Drop teardown so a
@@ -77,7 +79,7 @@ fn poke_tcp(addr: std::net::SocketAddr) {
 #[test]
 fn orgb_server_churn_leaves_no_threads_or_handles() {
     let _guard = CENSUS_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-    let host = Host::spawn();
+    let host = Host::spawn().expect("spawn host");
 
     // Warmup: first bind/accept pays for anything lazily initialized (loader, CRT, DNS/loopback
     // route caches) that a baseline taken before it would wrongly count as "leaked" later.
@@ -96,7 +98,7 @@ fn orgb_server_churn_leaves_no_threads_or_handles() {
 #[test]
 fn chroma_http_server_churn_leaves_no_threads_or_handles() {
     let _guard = CENSUS_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-    let host = Host::spawn();
+    let host = Host::spawn().expect("spawn host");
 
     poke_tcp(ChromaHttpServer::bind("127.0.0.1:0", host.handle()).expect("warmup bind").addr());
 
@@ -116,7 +118,7 @@ fn chroma_http_server_churn_leaves_no_threads_or_handles() {
 fn spawn_use_drop_writer(host: &Host, surface: &str) {
     let sink = MockSink::new();
     let probe = sink.clone();
-    let writer = Writer::spawn(host.handle(), surface, 30, move || sink);
+    let writer = Writer::spawn(host.handle(), surface, 30, move || sink).expect("spawn writer");
     let deadline = Instant::now() + Duration::from_millis(500);
     while probe.last().is_none() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(5));
@@ -128,7 +130,7 @@ fn spawn_use_drop_writer(host: &Host, surface: &str) {
 #[test]
 fn writer_churn_leaves_no_threads_or_handles() {
     let _guard = CENSUS_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-    let host = Host::spawn();
+    let host = Host::spawn().expect("spawn host");
     let mut h = host.handle();
     h.declare(SurfaceInfo::grid("kbd", "Board", SurfaceKind::Keyboard, 1, 1));
     let owner = h.next_source();
@@ -158,7 +160,7 @@ fn writer_churn_leaves_no_threads_or_handles() {
 /// this is that promise exercised across many lifecycles, not just one (`net.rs`'s
 /// `obs_connection_drop_is_bounded_*` test only proves ONE cycle is bounded).
 fn spawn_use_drop_obs(host: &Host, dead: &str) {
-    let conn = ObsConnection::start(dead, "", host.handle());
+    let conn = ObsConnection::start(dead, "", host.handle()).expect("spawn OBS listener");
     thread::sleep(Duration::from_millis(10)); // let the retry loop actually start dialing
     drop(conn);
 }
@@ -166,7 +168,7 @@ fn spawn_use_drop_obs(host: &Host, dead: &str) {
 #[test]
 fn obs_connection_churn_leaves_no_threads_or_handles() {
     let _guard = CENSUS_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-    let host = Host::spawn();
+    let host = Host::spawn().expect("spawn host");
     let dead = dead_addr();
 
     spawn_use_drop_obs(&host, &dead); // warmup
@@ -189,7 +191,7 @@ fn obs_connection_churn_leaves_no_threads_or_handles() {
 #[test]
 fn combined_churn_of_every_thread_owning_type_leaves_no_threads_or_handles() {
     let _guard = CENSUS_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-    let host = Host::spawn();
+    let host = Host::spawn().expect("spawn host");
     let mut h = host.handle();
     h.declare(SurfaceInfo::grid("kbd", "Board", SurfaceKind::Keyboard, 1, 1));
     let owner = h.next_source();

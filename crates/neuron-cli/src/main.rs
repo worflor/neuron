@@ -3,17 +3,21 @@
 // Additional permission: Neuron-Woflo Research Components Exception 1.0.
 // See ../../../LICENSE.md.
 
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::float_cmp, clippy::drop_non_drop, clippy::field_reassign_with_default))]
+
 //! Neuron CLI — the lightweight, open replacement for Razer Synapse.
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use std::fmt::Write as _;
 #[cfg(windows)]
 use neuron::{
+    audio,
     device::DeviceSession,
     executor::{DispatchExecutor, DispatchOutcome, IntentRunner, TurboRuntime},
 };
 use neuron::{
-    audio, backup,
+    backup,
     bindings::Bindings,
     capability as cap,
     cast::CastConfig,
@@ -927,7 +931,7 @@ fn main() -> Result<()> {
         Cmd::List => list(&reg)?,
         Cmd::Discover { emit } => discover_cmd(emit),
         Cmd::Adopt { dry_run } => adopt_cmd(&reg, dry_run)?,
-        Cmd::Info => info(&open_first(&reg)?)?,
+        Cmd::Info => info(&open_first(&reg)?),
         Cmd::Battery => {
             // Resolve by CAPABILITY, not enumeration order — "the device with a battery",
             // never "the first device" (which is a keyboard whenever one sorts first). Via the
@@ -1168,7 +1172,7 @@ fn profile_cmd(reg: &Registry, action: ProfileCmd) -> Result<()> {
             let mut rules = neuron::profile::AppRules::load();
             let mut moved = 0;
             for r in rules.rules.iter_mut().filter(|r| r.profile == from) {
-                r.profile = landed.clone();
+                r.profile.clone_from(&landed);
                 moved += 1;
             }
             if rules.default.as_deref() == Some(from.as_str()) {
@@ -1450,7 +1454,7 @@ fn radial_pick(trigger: i32, sectors: usize) {
 }
 
 /// Recognized, connected devices that declare a `[lighting]` block.
-fn lit_devices(reg: &Registry) -> Result<Vec<(DeviceDef, u16)>> {
+fn lit_devices(reg: &Registry) -> Result<Vec<(DeviceDef, u16, lighting::LightingDef)>> {
     let mut out = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
     for i in &transport::enumerate()? {
@@ -1459,8 +1463,10 @@ fn lit_devices(reg: &Registry) -> Result<Vec<(DeviceDef, u16)>> {
         if let Some(def) = reg.find_for_pipe(i) {
             // one lighting row per (pid, family) — two families on one pid are two independently-
             // drivable lighting planes, and the pid-only key silently dropped the second (review-caught).
-            if def.lighting.is_some() && seen.insert((i.pid, def.dialect.clone())) {
-                out.push((def.clone(), i.pid));
+            if let Some(light) = &def.lighting {
+                if seen.insert((i.pid, def.dialect.clone())) {
+                    out.push((def.clone(), i.pid, light.clone()));
+                }
             }
         }
     }
@@ -1568,13 +1574,12 @@ fn lighting_run(
         Some(s) => Some(parse_hex16(s)?),
         None => None,
     };
-    let (def, pid) = lit_devices(reg)?
+    let (def, pid, l) = lit_devices(reg)?
         .into_iter()
-        .find(|(d, p)| {
-            want.is_none_or(|w| w == *p) && d.lighting.as_ref().unwrap().custom_frame.is_some()
+        .find(|(_, p, light)| {
+            want.is_none_or(|w| w == *p) && light.custom_frame.is_some()
         })
         .ok_or_else(|| anyhow::anyhow!("no custom-frame-capable lit device found"))?;
-    let l = def.lighting.clone().unwrap();
     let d = Device::open(def.clone(), pid)?;
 
     // The orchestration (driver mode, frame streaming, fire-and-forget) is the backend's job; the
@@ -1640,13 +1645,12 @@ fn lighting_mirror(reg: &Registry, seconds: Option<u64>) -> Result<()> {
 
     // SINK: the keyboard — the first custom-frame-capable lit device. (lit_devices yields every lit
     // device; we want one that can paint a per-LED frame, which is the keyboard's legacy matrix.)
-    let (kbd_def, kbd_pid) = lit_devices(reg)?
+    let (kbd_def, kbd_pid, kbd_l) = lit_devices(reg)?
         .into_iter()
-        .find(|(d, _)| d.lighting.as_ref().unwrap().custom_frame.is_some())
+        .find(|(_, _, light)| light.custom_frame.is_some())
         .ok_or_else(|| {
             anyhow::anyhow!("no custom-frame-capable lit device found (is the keyboard connected?)")
         })?;
-    let kbd_l = kbd_def.lighting.clone().unwrap();
     let (rows, cols) = (kbd_l.rows, kbd_l.cols);
     let kbd = Device::open(kbd_def.clone(), kbd_pid)?;
     let lights = lighting::Lights::new(&kbd, kbd_l);
@@ -1719,15 +1723,14 @@ fn lighting_keytest(reg: &Registry, pid: &str, dwell: u64, color: Option<&str>) 
         Some(s) => Rgb::parse(s).ok_or_else(|| anyhow::anyhow!("bad colour '{s}', want RRGGBB"))?,
         None => Rgb::new(0, 200, 255), // bright cyan accent
     };
-    let (def, pid) = lit_devices(reg)?
+    let (def, pid, l) = lit_devices(reg)?
         .into_iter()
-        .find(|(d, p)| *p == want && d.lighting.as_ref().unwrap().custom_frame.is_some())
+        .find(|(_, p, light)| *p == want && light.custom_frame.is_some())
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "no custom-frame-capable lit device with pid {want:04x} (is the keyboard connected?)"
             )
         })?;
-    let l = def.lighting.clone().unwrap();
     let (rows, cols) = (l.rows as usize, l.cols as usize);
     let n = rows * cols;
     let d = Device::open(def.clone(), pid)?;
@@ -1795,15 +1798,14 @@ fn lighting_cellsweep(
         Some(s) => Rgb::parse(s).ok_or_else(|| anyhow::anyhow!("bad colour '{s}', want RRGGBB"))?,
         None => Rgb::new(0, 200, 255), // bright cyan accent (same as keytest)
     };
-    let (def, pid) = lit_devices(reg)?
+    let (def, pid, l) = lit_devices(reg)?
         .into_iter()
-        .find(|(d, p)| *p == want && d.lighting.as_ref().unwrap().custom_frame.is_some())
+        .find(|(_, p, light)| *p == want && light.custom_frame.is_some())
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "no custom-frame-capable lit device with pid {want:04x} (is the keyboard connected?)"
             )
         })?;
-    let l = def.lighting.clone().unwrap();
     let (rows, cols) = (l.rows as usize, l.cols as usize);
     let n = rows * cols;
     let d = Device::open(def.clone(), pid)?;
@@ -1880,15 +1882,14 @@ fn lighting_cells(
         None => Rgb::new(0, 200, 255), // bright cyan accent (same as keytest/cellsweep)
     };
     let (lo, hi) = (from.min(to), from.max(to)); // tolerate --from/--to given in either order
-    let (def, pid) = lit_devices(reg)?
+    let (def, pid, l) = lit_devices(reg)?
         .into_iter()
-        .find(|(d, p)| *p == want && d.lighting.as_ref().unwrap().custom_frame.is_some())
+        .find(|(_, p, light)| *p == want && light.custom_frame.is_some())
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "no custom-frame-capable lit device with pid {want:04x} (is the keyboard connected?)"
             )
         })?;
-    let l = def.lighting.clone().unwrap();
     let (rows, cols) = (l.rows as usize, l.cols as usize);
     let n = rows * cols;
     let row_u = row as usize;
@@ -1935,8 +1936,7 @@ fn lighting_show(reg: &Registry) -> Result<()> {
         println!("No lighting-capable Razer devices connected.");
         return Ok(());
     }
-    for (def, pid) in devs {
-        let l = def.lighting.as_ref().unwrap();
+    for (def, pid, l) in devs {
         let native: Vec<&str> = l.effects.keys().map(std::string::String::as_str).collect();
         let avail: Vec<&str> = l.available().iter().map(|e| e.name()).collect();
         println!("{} [{}]  pid={pid:04x}", def.name, def.codename);
@@ -2023,7 +2023,7 @@ fn lighting_effect(
     };
     let devs: Vec<_> = lit_devices(reg)?
         .into_iter()
-        .filter(|(_, pid)| want_pid.is_none_or(|w| w == *pid))
+        .filter(|(_, pid, _)| want_pid.is_none_or(|w| w == *pid))
         .collect();
     if devs.is_empty() {
         println!("No matching lighting-capable Razer devices connected.");
@@ -2035,8 +2035,7 @@ fn lighting_effect(
         "{mode} '{}' — exact bytes per device (one command, each dialect):\n",
         eff.name()
     );
-    for (def, pid) in devs {
-        let l = def.lighting.as_ref().unwrap();
+    for (def, pid, l) in devs {
         println!("{}  pid={pid:04x}  [{:?}]", def.name, l.protocol);
 
         // EMULATION PATH: compute a frame host-side and stream it as custom-frame rows, then
@@ -2136,8 +2135,8 @@ fn lighting_effect(
             println!("  not supported on this device");
         }
         let bright = brightness.and_then(|b| l.brightness_report(b));
-        if let Some(rep) = &bright {
-            println!("  brightness {}%:  {}", brightness.unwrap(), rep.preview());
+        if let (Some(value), Some(rep)) = (brightness, &bright) {
+            println!("  brightness {value}%:  {}", rep.preview());
         }
 
         if apply {
@@ -2171,7 +2170,10 @@ fn lighting_effect(
                 .or_else(|_| d.run("brightness"))
                 .ok();
             if let Some(p) = &prior {
-                let hex: String = p[..8].iter().map(|b| format!("{b:02X} ")).collect();
+                let mut hex = String::new();
+                for b in &p[..8] {
+                    let _ = write!(hex, "{b:02X} ");
+                }
                 println!("     prior state (restore ref): {hex}");
             }
             print!("  -> applying… ");
@@ -2756,6 +2758,7 @@ fn parse_hex16(s: &str) -> Result<u16> {
 
 /// A parsed `--mute on|off|toggle` request — the pure decode shared by `audio mic` and `audio out`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(windows, test))]
 enum MuteAction {
     On,
     Off,
@@ -2765,6 +2768,7 @@ enum MuteAction {
 /// Parse a `--mute` value string into a [`MuteAction`]. Accepts the friendly synonyms the CLI has
 /// always taken (on/true/1/mute, off/false/0/unmute, toggle). Pure + case-insensitive, so the whole
 /// accepted-vocabulary is unit-testable without touching Core Audio.
+#[cfg(any(windows, test))]
 fn parse_mute(s: &str) -> Result<MuteAction> {
     match s.to_lowercase().as_str() {
         "on" | "true" | "1" | "mute" => Ok(MuteAction::On),
@@ -3051,7 +3055,10 @@ fn probe_cmd(pid: &str, class: Option<&str>, id: Option<&str>, scan: bool) -> Re
     );
 
     let dump = |up: u16, us: u16, class: u8, id: u8, a: &[u8; 80]| {
-        let hex: String = a[..24].iter().map(|b| format!("{b:02X} ")).collect();
+        let mut hex = String::new();
+        for b in &a[..24] {
+            let _ = write!(hex, "{b:02X} ");
+        }
         println!(
             "  [{up:04x}/{us:04x}] {:02X}/{:02X} {:<16} {:<13} {hex}",
             class,
@@ -3162,20 +3169,8 @@ fn prof_pump_cmd() {
     }
 }
 
+#[cfg(windows)]
 fn run_daemon(reg: &Registry, seconds: Option<u64>, safe: bool) {
-    // The daemon is a loop around an input source and an action dispatcher, and off Windows both
-    // are stubs: it would print "listening", wake zero times, and fire nothing. Refuse instead.
-    #[cfg(not(windows))]
-    {
-        let _ = (reg, seconds, safe);
-        println!(
-            "the remap daemon is Windows-only for now: control events and action dispatch have no \
-             backend on this platform, so it would listen forever and fire nothing."
-        );
-        println!("device control works here — try `neuron list`, `dpi`, `lighting`, `profile`, `remap`.");
-        return;
-    }
-
     // ARM real input synthesis for live use. This is the one place the CLI daemon flips the
     // process-wide safety gate ON so bound key/click/macro actions actually fire. `--safe` keeps
     // it DISARMED: the Engine still resolves every trigger and prints what it WOULD do, but
@@ -3221,6 +3216,15 @@ fn run_daemon(reg: &Registry, seconds: Option<u64>, safe: bool) {
     }
     run_listen(reg, seconds, rt);
     println!("\nstopped.");
+}
+
+#[cfg(not(windows))]
+fn run_daemon(_reg: &Registry, _seconds: Option<u64>, _safe: bool) {
+    println!(
+        "the remap daemon is Windows-only for now: control events and action dispatch have no \
+         backend on this platform, so it would listen forever and fire nothing."
+    );
+    println!("device control works here — try `neuron list`, `dpi`, `lighting`, `profile`, `remap`.");
 }
 
 /// Carry out a daemon [`Intent`] — the typed work an `Action` delegates because the stateless
@@ -3472,24 +3476,8 @@ fn run_listen(reg: &Registry, seconds: Option<u64>, rt: neuron::controls::Runtim
     prof_pump_cmd();
 }
 
-#[cfg(not(windows))]
-fn run_listen(_reg: &Registry, seconds: Option<u64>, _rt: neuron::controls::Runtime) {
-    neuron::controls::listen(seconds, |_ev| {}, || {});
-    // measurement harness read-out: honestly zero off-Windows (no pump source there yet).
-    prof_pump_cmd();
-}
-
+#[cfg(windows)]
 fn audio_cmd(action: AudioCmd) -> Result<()> {
-    // The audio layer is Core Audio (WASAPI) only. Off Windows every endpoint query returns an
-    // empty set, which reads as "this machine has no audio" rather than "neuron can't see it".
-    #[cfg(not(windows))]
-    {
-        let _ = action;
-        anyhow::bail!(
-            "audio endpoints are Windows-only for now: neuron reads them through Core Audio and \
-             has no PipeWire/ALSA backend yet, so it can see none of yours."
-        );
-    }
     match action {
         AudioCmd::List => audio_list(),
         AudioCmd::Monitor { seconds } => audio_monitor(seconds),
@@ -3507,6 +3495,14 @@ fn audio_cmd(action: AudioCmd) -> Result<()> {
         } => audio_out(device, vol, nudge, mute)?,
     }
     Ok(())
+}
+
+#[cfg(not(windows))]
+fn audio_cmd(_action: AudioCmd) -> Result<()> {
+    anyhow::bail!(
+        "audio endpoints are Windows-only for now: neuron reads them through Core Audio and \
+         has no PipeWire/ALSA backend yet, so it can see none of yours."
+    );
 }
 
 /// Poll Razer audio endpoints for volume/mute changes. The `BlackShark` knob/mute and the
@@ -3566,11 +3562,7 @@ fn audio_monitor(seconds: u64) {
     println!("\ndone.");
 }
 
-#[cfg(not(windows))]
-fn audio_monitor(_seconds: u64) {
-    println!("audio monitor is Windows-only");
-}
-
+#[cfg(windows)]
 fn audio_list() {
     for flow in [audio::Flow::Capture, audio::Flow::Render] {
         let eps = audio::endpoints(flow);
@@ -3592,6 +3584,7 @@ fn audio_list() {
 
 /// Resolve the capture endpoint to act on (shared logic in `audio::resolve_capture`):
 /// explicit needle, else the user's Razer/Seiren mic, else the first capture endpoint.
+#[cfg(windows)]
 fn resolve_mic(device: Option<&str>) -> Result<neuron::audio::Endpoint> {
     audio::resolve_capture(device).ok_or_else(|| match device {
         Some(n) => anyhow::anyhow!("no capture device matching '{n}'"),
@@ -3599,6 +3592,7 @@ fn resolve_mic(device: Option<&str>) -> Result<neuron::audio::Endpoint> {
     })
 }
 
+#[cfg(windows)]
 fn audio_mic(
     device: Option<String>,
     gain: Option<f32>,
@@ -3645,6 +3639,7 @@ fn audio_mic(
 
 /// Show or control an OUTPUT endpoint (headphones / sound card / speakers) — the render mirror of
 /// `audio_mic`, resolving generically by name substring or the system's active output.
+#[cfg(windows)]
 fn audio_out(
     device: Option<String>,
     vol: Option<f32>,
@@ -3946,10 +3941,12 @@ fn key_down(_vk: i32) -> bool {
 // (its immortal listener owns the DPI drop/restore, like every other bind). No `sniper.toml`, no
 // standalone GetAsyncKeyState loop — one config, one dispatcher, CLI and GUI can't drift.
 
+#[cfg(windows)]
 fn gui_rules_path() -> std::path::PathBuf {
     neuron::profile::profiles_dir().join("gui.rules.toml")
 }
 
+#[cfg(windows)]
 fn load_gui_rules() -> Vec<neuron::engine::Rule> {
     std::fs::read_to_string(gui_rules_path())
         .ok()
@@ -3958,6 +3955,7 @@ fn load_gui_rules() -> Vec<neuron::engine::Rule> {
         .unwrap_or_default()
 }
 
+#[cfg(windows)]
 fn save_gui_rules(rules: Vec<neuron::engine::Rule>) -> Result<()> {
     std::fs::create_dir_all(neuron::profile::profiles_dir())?;
     let doc = neuron::engine::RuleDoc { rules };
@@ -4028,28 +4026,13 @@ fn capture_sniper_control() -> Option<(u16, u16, Option<neuron::registry::Canoni
     );
     found.get()
 }
-#[cfg(not(windows))]
-fn capture_sniper_control() -> Option<(u16, u16, Option<neuron::registry::CanonicalPid>)> {
-    None
-}
 
 /// Sniper / on-the-fly DPI: author the held `Action::Sniper` rule (hold a control -> precision DPI,
 /// release -> restore). `--bind` — or a first run with nothing bound yet — captures the hold control
 /// by PRESSING it; `--dpi` sets the precision DPI. The bind lives in `profiles/gui.rules.toml` (the
 /// same store the GUI edits) and the resident neuron app enforces the hold. Nothing hardcoded.
+#[cfg(windows)]
 fn sniper_cmd(rebind: bool, dpi_override: Option<u16>) -> Result<()> {
-    // Sniper authors a rule keyed to a control you press, and the resident app enforces the hold.
-    // Off Windows there is neither control capture to learn the button nor a daemon to enforce it,
-    // so the prompt would wait for a press that can never arrive.
-    #[cfg(not(windows))]
-    {
-        let _ = (rebind, dpi_override);
-        anyhow::bail!(
-            "sniper is Windows-only for now: it needs control capture to learn your button, and a \
-             running neuron to hold the DPI while you press it. Neither exists on this platform yet."
-        );
-    }
-
     use neuron::action::Action;
     use neuron::engine::{Rule, Trigger};
 
@@ -4070,7 +4053,15 @@ fn sniper_cmd(rebind: bool, dpi_override: Option<u16>) -> Result<()> {
         }
     }
 
-    if rebind || existing.is_none() {
+    if let Some(i) = existing.filter(|_| !rebind) {
+        rules[i].action = Action::Sniper { dpi };
+        let label = match &rules[i].trigger {
+            Trigger::Input { page, usage, .. } => neuron::controls::control_label(*page, *usage),
+            other => other.describe(),
+        };
+        save_gui_rules(rules)?;
+        println!("sniper: hold {label} -> {dpi} DPI.");
+    } else {
         println!("Press the control you want as your sniper hold button (ESC to cancel)...");
         let Some((page, usage, pid)) = capture_sniper_control() else {
             bail!("cancelled — sniper unchanged");
@@ -4081,18 +4072,17 @@ fn sniper_cmd(rebind: bool, dpi_override: Option<u16>) -> Result<()> {
         rules.push(Rule::new(Trigger::Input { page, usage, pid }, Action::Sniper { dpi }));
         save_gui_rules(rules)?;
         println!("sniper armed: hold {label} -> {dpi} DPI.");
-    } else {
-        let i = existing.unwrap();
-        rules[i].action = Action::Sniper { dpi };
-        let label = match &rules[i].trigger {
-            Trigger::Input { page, usage, .. } => neuron::controls::control_label(*page, *usage),
-            other => other.describe(),
-        };
-        save_gui_rules(rules)?;
-        println!("sniper: hold {label} -> {dpi} DPI.");
     }
     println!("The neuron app enforces this hold while it runs (the resident dispatcher).");
     Ok(())
+}
+
+#[cfg(not(windows))]
+fn sniper_cmd(_rebind: bool, _dpi_override: Option<u16>) -> Result<()> {
+    anyhow::bail!(
+        "sniper is Windows-only for now: it needs control capture to learn your button, and a \
+         running neuron to hold the DPI while you press it. Neither exists on this platform yet."
+    );
 }
 
 fn storage_status(reg: &Registry, raw: bool) -> Result<()> {
@@ -4104,7 +4094,8 @@ fn storage_status(reg: &Registry, raw: bool) -> Result<()> {
     let (macros, profiles) = cap::storage_counts(&d).unwrap_or((0, 0));
     let pct = s.pct_remaining();
     let filled = (pct as usize * 20) / 100;
-    let bar: String = "#".repeat(filled) + &"-".repeat(20 - filled);
+    let mut bar = "#".repeat(filled);
+    bar.push_str(&"-".repeat(20 - filled));
 
     println!(
         "Onboard pool — {} ({} KB, one shared space)",
@@ -4155,7 +4146,7 @@ fn hex_dump(a: &[u8; 80], n: usize) -> String {
 
 fn gesture_cmd(action: GestureCmd) -> Result<()> {
     match action {
-        GestureCmd::Selftest => gesture_selftest(),
+        GestureCmd::Selftest => gesture_selftest()?,
         GestureCmd::Record { name, trigger } => gesture_record(&name, trigger)?,
         GestureCmd::Match { trigger } => gesture_match(trigger)?,
         GestureCmd::List => gesture_list(),
@@ -4191,24 +4182,24 @@ fn report_fit(label: &str, f: &glyph::GlyphFit, expect: Option<(f64, f64)>) {
     }
 }
 
-fn gesture_selftest() {
-    use glyph::*;
+fn gesture_selftest() -> Result<()> {
+    use glyph::{add_noise, analyze, fit, fit_sequence, synth_circle, synth_line, synth_line_then_circle, synth_spiral, signature, C, GlyphConfig};
     let cfg = GlyphConfig::default();
     println!("glyph eigenmotion self-test\n");
 
     println!("== single-block fit vs known eigenvalues ==");
-    report_fit("line", &fit(&synth_line(64)).unwrap(), Some((1.0, 0.0)));
+    report_fit("line", &fit(&synth_line(64)).ok_or_else(|| anyhow::anyhow!("line fit failed"))?, Some((1.0, 0.0)));
     for omega in [0.20_f64, 0.50, 1.00] {
         report_fit(
             &format!("circle w={omega:.2}"),
-            &fit(&synth_circle(256, 500.0, omega)).unwrap(),
+            &fit(&synth_circle(256, 500.0, omega)).ok_or_else(|| anyhow::anyhow!("circle fit failed"))?,
             Some((1.0, omega)),
         );
     }
     for (rho, omega) in [(0.99_f64, 0.30_f64), (0.97, 0.60)] {
         report_fit(
             &format!("spiral p={rho:.2} w={omega:.2}"),
-            &fit(&synth_spiral(256, 600.0, rho, omega)).unwrap(),
+            &fit(&synth_spiral(256, 600.0, rho, omega)).ok_or_else(|| anyhow::anyhow!("spiral fit failed"))?,
             Some((rho, omega)),
         );
     }
@@ -4251,6 +4242,7 @@ fn gesture_selftest() {
             r.score
         );
     }
+    Ok(())
 }
 
 fn gesture_record(name: &str, trigger: i32) -> Result<()> {
@@ -4550,7 +4542,7 @@ fn open_first(reg: &Registry) -> Result<Device> {
     bail!("no recognized Razer device connected")
 }
 
-fn info(d: &Device) -> Result<()> {
+fn info(d: &Device) {
     println!("{} [{}]", d.def.name, d.def.codename);
     println!("  pid:      {:04x}", d.pid);
     if let Ok(fw) = cap::firmware(d) {
@@ -4581,7 +4573,6 @@ fn info(d: &Device) -> Result<()> {
             s.max_macros
         );
     }
-    Ok(())
 }
 
 // ───────────────────────────────────────── tests ──────────────────────────────────────────────

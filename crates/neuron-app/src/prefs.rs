@@ -625,7 +625,7 @@ pub fn ui_accent() -> String {
 pub fn set_ui_accent(hex: &str) -> String {
     let v = normalize_hex(hex);
     let mut p = Prefs::load();
-    p.ui_accent = v.clone();
+    p.ui_accent.clone_from(&v);
     match p.save() {
         Ok(()) => format!("interface accent → #{v} (saved to app.toml)"),
         Err(e) => format!("save failed: {e}"),
@@ -641,7 +641,7 @@ pub fn weave_accent() -> String {
 pub fn set_weave_accent(hex: &str) -> String {
     let v = normalize_hex(hex);
     let mut p = Prefs::load();
-    p.weave_accent = v.clone();
+    p.weave_accent.clone_from(&v);
     match p.save() {
         Ok(()) => format!("weave accent → #{v} (saved to app.toml)"),
         Err(e) => format!("save failed: {e}"),
@@ -1257,7 +1257,7 @@ mod tests {
                 },
             ],
         };
-        set_device_light(pid, state.clone()).expect("save lighting");
+        set_device_light(pid, state).expect("save lighting");
         let back = device_light(pid).expect("lighting reloads");
         assert_eq!(back.fps, 12);
         assert!(back.legacy_data.is_none());
@@ -1388,7 +1388,7 @@ mod tests {
         let got = Prefs::load();
         // only the corrupted field defaults; EVERY other field must have survived the salvage.
         let mut expect = want;
-        expect.notif_sound = d.notif_sound.clone();
+        expect.notif_sound = d.notif_sound;
         assert_eq!(
             got, expect,
             "a field reverted to default → its `salvage!` line is missing from from_table_salvaging"

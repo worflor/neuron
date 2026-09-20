@@ -5,9 +5,8 @@
 
 # Install, update, or roll back a neuron release install on Linux.
 #
-# The Linux release is the CLI only, so unlike the Windows script there is no process to stop
-# and no autostart to preserve. Everything around the copy is the same: verify the download,
-# back up what gets overwritten, read the version back afterwards.
+# The Linux release includes the app and CLI. Verify the download, refuse to replace a
+# running app, back up what gets overwritten, and read the version back afterwards.
 #
 # Output protocol, meant to be read by an agent, identical to neuron-update.ps1:
 #   key: value         facts
@@ -306,6 +305,9 @@ if [ -z "$payload_dir" ] || [ ! -f "$payload_dir/neuron" ]; then
     finish 'error'
 fi
 chmod +x "$payload_dir/neuron" 2>/dev/null || true
+if [ -f "$payload_dir/neuron-app" ]; then
+    chmod +x "$payload_dir/neuron-app" 2>/dev/null || true
+fi
 new_version="$(installed_version_of "$payload_dir" || true)"
 say 'new_version' "${new_version:-unknown}"
 
@@ -324,6 +326,11 @@ if [ $installed -eq 1 ] && [ -n "$current" ] && [ -n "$new_version" ]; then
 fi
 
 # ── install ───────────────────────────────────────────────────────────────────────────────────
+
+if command -v pgrep >/dev/null 2>&1 && pgrep -x neuron-app >/dev/null 2>&1; then
+    flag 'APP_RUNNING' 'quit the resident app from its tray menu, then rerun the update (STOP)'
+    finish 'blocked'
+fi
 
 mkdir -p "$install_dir" 2>/dev/null || true
 if [ ! -d "$install_dir" ] || [ ! -w "$install_dir" ]; then
@@ -356,6 +363,9 @@ if ! copy_tree "$payload_dir" "$install_dir"; then
     finish 'error'
 fi
 chmod +x "$install_dir/neuron" 2>/dev/null || true
+if [ -f "$install_dir/neuron-app" ]; then
+    chmod +x "$install_dir/neuron-app" 2>/dev/null || true
+fi
 
 # ── verify ────────────────────────────────────────────────────────────────────────────────────
 

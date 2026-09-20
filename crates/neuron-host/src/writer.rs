@@ -143,7 +143,7 @@ pub fn pace(deadline: Instant, now: Instant, dt: Duration) -> (Instant, Duration
         (deadline, deadline - now)
     } else {
         let lag = now - deadline;
-        let clamped = if lag > dt { deadline + lag.checked_sub(dt).unwrap() } else { deadline };
+        let clamped = if lag > dt { now.checked_sub(dt).unwrap_or(deadline) } else { deadline };
         (clamped, Duration::ZERO)
     }
 }
@@ -258,7 +258,7 @@ impl Writer {
         surface: impl Into<String>,
         fps: u32,
         make_sink: impl FnOnce() -> S + Send + 'static,
-    ) -> Writer {
+    ) -> std::io::Result<Writer> {
         Self::spawn_paced(api, surface, Arc::new(AtomicU32::new(fps)), make_sink)
     }
 
@@ -271,7 +271,7 @@ impl Writer {
         surface: impl Into<String>,
         fps: Arc<AtomicU32>,
         make_sink: impl FnOnce() -> S + Send + 'static,
-    ) -> Writer {
+    ) -> std::io::Result<Writer> {
         let surface = surface.into();
         let stop = Arc::new(AtomicBool::new(false));
         let stop_flag = stop.clone();
@@ -349,9 +349,8 @@ impl Writer {
                         thread::sleep(nap);
                     }
                 }
-            })
-            .expect("spawn writer thread");
-        Writer { stop, pause, parked, thread: Some(thread) }
+            })?;
+        Ok(Writer { stop, pause, parked, thread: Some(thread) })
     }
 
     /// The pause valve for transient-I/O coordination (see [`WriterPauser`]).
@@ -426,7 +425,7 @@ mod tests {
         use crate::arbiter::{band, Content};
         use crate::shell::Host;
 
-        let host = Host::spawn();
+        let host = Host::spawn().expect("spawn host");
         let mut h = host.handle();
         h.declare(SurfaceInfo::grid("kbd", "Board", SurfaceKind::Keyboard, 1, 1));
         let owner = h.next_source();
@@ -441,8 +440,7 @@ mod tests {
         .unwrap();
 
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
-        let sink_gate = gate.clone();
-        let writer = Writer::spawn(host.handle(), "kbd", 100, move || BlockingSink { gate: sink_gate });
+        let writer = Writer::spawn(host.handle(), "kbd", 100, move || BlockingSink { gate }).expect("spawn writer");
 
         // Give the writer a moment to reach its first `sink.write` and wedge inside it.
         thread::sleep(Duration::from_millis(100));
@@ -569,7 +567,7 @@ mod tests {
         use crate::arbiter::{band, Content};
         use crate::shell::Host;
 
-        let host = Host::spawn();
+        let host = Host::spawn().expect("spawn host");
         let mut h = host.handle();
         h.declare(SurfaceInfo::grid("kbd", "Board", SurfaceKind::Keyboard, 1, 1));
         let owner = h.next_source();
@@ -577,8 +575,7 @@ mod tests {
             .unwrap();
 
         let sink = MockSink::new();
-        let writer_sink = sink.clone();
-        let writer = Writer::spawn(host.handle(), "kbd", 100, move || writer_sink);
+        let writer = Writer::spawn(host.handle(), "kbd", 100, move || sink).expect("spawn writer");
         let pauser = writer.pauser();
         // Let the writer come up and flow (parked = false).
         thread::sleep(Duration::from_millis(50));
@@ -647,7 +644,7 @@ mod tests {
             }
         }
 
-        let host = Host::spawn();
+        let host = Host::spawn().expect("spawn host");
         let mut h = host.handle();
         h.declare(SurfaceInfo::grid("kbd", "Board", SurfaceKind::Keyboard, 1, 1));
         let owner = h.next_source();
@@ -665,7 +662,7 @@ mod tests {
         let writer_sink = sink.clone();
         // MAX_WRITER_FPS (30) — the pipeline's real ceiling — so the millisecond bounds below read
         // directly as "N missed ticks" at the writer's actual pace, not an arbitrary test-only rate.
-        let writer = Writer::spawn(host.handle(), "kbd", MAX_WRITER_FPS, move || writer_sink);
+        let writer = Writer::spawn(host.handle(), "kbd", MAX_WRITER_FPS, move || writer_sink).expect("spawn writer");
         let pauser = writer.pauser();
 
         // Let the writer come up and stream a handful of ever-changing frames.
@@ -717,7 +714,7 @@ mod tests {
         // burst) and must never produce a negative/nonsensical sleep.
         let dt = Duration::from_secs(1) / 30;
         let deadline = Instant::now();
-        let wake = deadline + Duration::from_secs(8 * 3600);
+        let wake = deadline + Duration::from_hours(8);
         let (next, nap) = pace(deadline, wake, dt);
         assert_eq!(nap, Duration::ZERO, "a massive overrun must not produce a sleep at all");
         assert!(next <= wake, "the clamped deadline must not still be hours in the past");

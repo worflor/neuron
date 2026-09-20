@@ -94,12 +94,10 @@ pub struct Host {
 }
 
 impl Host {
-    #[must_use]
-    pub fn spawn() -> Host {
+    pub fn spawn() -> std::io::Result<Host> {
         let (tx, rx) = channel();
-        let thread = crate::worker::spawn_named("neuron-host-kernel", move || run(rx))
-            .expect("spawn kernel actor");
-        Host { tx, thread: Some(thread) }
+        let thread = crate::worker::spawn_named("neuron-host-kernel", move || run(rx))?;
+        Ok(Host { tx, thread: Some(thread) })
     }
 
     #[must_use]
@@ -261,8 +259,10 @@ fn run(rx: Receiver<Cmd>) {
     // or timeout would then drop BOTH sessions' claims. Carry the high-water mark
     // across rebirths so an id is never reused while its original owner may live.
     let mut next_source: u64 = 1;
-    let mut governor =
-        Governor::new(Config::critically_damped(0.8)).expect("default governor config is stable");
+    let Ok(mut governor) = Governor::new(Config::critically_damped(0.8)) else {
+        eprintln!("neuron-host: invalid default governor configuration");
+        return;
+    };
     loop {
         let mut kernel = Kernel::new();
         kernel.next_source = next_source;
@@ -302,10 +302,9 @@ fn serve(kernel: &mut Kernel, rx: &Receiver<Cmd>, seed: &mut Vec<SurfaceInfo>) -
     let mut last_sweep = Instant::now();
     loop {
         match rx.recv_timeout(SWEEP_PERIOD) {
-            Ok(Cmd::Shutdown) => return Flow::Stop,
+            Ok(Cmd::Shutdown) | Err(RecvTimeoutError::Disconnected) => return Flow::Stop,
             Ok(cmd) => apply(kernel, seed, cmd),
             Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => return Flow::Stop,
         }
         let now = Instant::now();
         if now.duration_since(last_sweep) >= SWEEP_PERIOD {
@@ -373,7 +372,7 @@ fn apply(kernel: &mut Kernel, seed: &mut Vec<SurfaceInfo>, cmd: Cmd) {
         }
         #[cfg(test)]
         Cmd::Poison => panic!("test poison"),
-        Cmd::Shutdown => unreachable!("handled in serve"),
+        Cmd::Shutdown => {},
     }
 }
 
@@ -407,7 +406,7 @@ mod tests {
             }
         }
 
-        let host = Host::spawn();
+        let host = Host::spawn().expect("spawn host");
         let mut h = host.handle();
         h.declare(SurfaceInfo::grid("kbd", "Board", SurfaceKind::Keyboard, 1, 1));
         let owner = h.next_source();
@@ -455,7 +454,7 @@ mod tests {
         // The emergent config no last-writer-wins tool can represent: name a
         // session, and read whether it WINS or is SUPPRESSED purely from band
         // ordering — the exact query the LIGHTING truth strip runs.
-        let host = Host::spawn();
+        let host = Host::spawn().expect("spawn host");
         let mut h = host.handle();
         h.declare(SurfaceInfo::grid("kbd", "Board", SurfaceKind::Keyboard, 1, 1));
         let now = Instant::now();
@@ -490,7 +489,7 @@ mod tests {
 
     #[test]
     fn round_trip_through_the_actor() {
-        let host = Host::spawn();
+        let host = Host::spawn().expect("spawn host");
         let mut h = host.handle();
         h.declare(SurfaceInfo::grid("kbd", "Board", SurfaceKind::Keyboard, 2, 3));
         let owner = h.next_source();
@@ -506,7 +505,7 @@ mod tests {
 
     #[test]
     fn sweep_publishes_observable_teardown() {
-        let host = Host::spawn();
+        let host = Host::spawn().expect("spawn host");
         let mut h = host.handle();
         h.declare(SurfaceInfo::grid("kbd", "Board", SurfaceKind::Keyboard, 1, 1));
         let events = host.handle().subscribe("host.layer").expect("subscribe");
@@ -531,7 +530,7 @@ mod tests {
 
     #[test]
     fn kernel_fault_rebirths_with_surfaces_but_without_claims() {
-        let host = Host::spawn();
+        let host = Host::spawn().expect("spawn host");
         let mut h = host.handle();
         h.declare(SurfaceInfo::grid("kbd", "Board", SurfaceKind::Keyboard, 1, 1));
         let owner = h.next_source();
@@ -570,7 +569,7 @@ mod tests {
         // A surviving session keeps its old owner id across a kernel fault. The
         // reborn kernel must NOT hand that same id to a new caller, or an
         // owner-wide `release_owner` from either would drop both.
-        let host = Host::spawn();
+        let host = Host::spawn().expect("spawn host");
         let mut h = host.handle();
         let a = h.next_source();
         let b = h.next_source();
@@ -599,7 +598,7 @@ mod tests {
 
     #[test]
     fn claim_fight_survives_poisoning_mid_fight() {
-        let host = Host::spawn();
+        let host = Host::spawn().expect("spawn host");
         let mut setup = host.handle();
         setup.declare(SurfaceInfo::grid("kbd", "Board", SurfaceKind::Keyboard, 1, 1));
 
@@ -694,7 +693,7 @@ mod tests {
         // This test's whole point is proving that degrade is FAST, not a
         // hang, whichever branch (kept-absorbing vs escalated) the burst
         // actually lands in on this machine.
-        let host = Host::spawn();
+        let host = Host::spawn().expect("spawn host");
         let mut setup = host.handle();
         setup.declare(SurfaceInfo::grid("kbd", "Board", SurfaceKind::Keyboard, 1, 1));
 

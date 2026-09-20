@@ -280,10 +280,10 @@ fn encode_frame(op: u8, payload: &[u8], mask: u32) -> Vec<u8> {
     if n < 126 {
         out.push(0x80 | n as u8);
     } else if u16::try_from(n).is_ok() {
-        out.push(0x80 | 126);
+        out.push(0x80 | 0x7e);
         out.extend_from_slice(&(n as u16).to_be_bytes());
     } else {
-        out.push(0x80 | 127);
+        out.push(0x80 | 0x7f);
         out.extend_from_slice(&(n as u64).to_be_bytes());
     }
     out.extend_from_slice(&m);
@@ -375,7 +375,7 @@ mod tests {
         let n = payload.len();
         if n < 126 {
             out.push(n as u8);
-        } else if n <= u16::MAX as usize {
+        } else if u16::try_from(n).is_ok() {
             out.push(126);
             out.extend_from_slice(&(n as u16).to_be_bytes());
         } else {

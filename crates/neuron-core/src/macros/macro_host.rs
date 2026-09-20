@@ -1385,7 +1385,6 @@ fn open_capable(cap: crate::registry::Capability) -> Option<crate::device::Devic
 /// one source of truth. Reads (`battery`/`current_dpi`/`active_profile`/`scroll_stage`) let a macro
 /// SENSE live state and react. Audio + brightness reuse the same Core-Audio / capability code the
 /// bound actions use. Returns `(ok, message)` — for a read, the message IS the value.
-
 fn macro_state_dir() -> PathBuf {
     if let Some(p) = std::env::var_os("NEURON_MACRO_STATE") {
         return PathBuf::from(p);
@@ -2485,7 +2484,7 @@ pub fn parse_macro(source: &str) -> ParseResult {
 pub fn delete_macro(id: &str) -> std::io::Result<()> {
     macro_host()
         .delete(id)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+        .map_err(std::io::Error::other)
 }
 
 /// Serializes every test that exclusively drives — or outright KILLS — the process-global

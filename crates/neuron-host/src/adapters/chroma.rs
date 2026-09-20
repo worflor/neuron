@@ -347,7 +347,7 @@ impl ChromaServer {
             s.last_seen = now;
         }
         match results.len() {
-            1 => HttpResponse::json(200, results.pop().unwrap()),
+            1 => HttpResponse::json(200, results.remove(0)),
             _ => HttpResponse::json(
                 200,
                 serde_json::json!({ "result": rz::SUCCESS, "results": results }),
@@ -373,7 +373,9 @@ impl ChromaServer {
         let mut results = Vec::new();
         let mut only_id = String::new();
         {
-            let s = self.sessions.get_mut(&id).expect("parse_request checked the session");
+            let Some(s) = self.sessions.get_mut(&id) else {
+                return HttpResponse::err(404, rz::NOT_FOUND);
+            };
             s.last_seen = now;
             for action in effects {
                 let eid = format!("neuron-{:08x}", self.next_effect);
@@ -423,7 +425,7 @@ impl ChromaServer {
             s.last_seen = now;
         }
         match results.len() {
-            1 => HttpResponse::json(200, results.pop().unwrap()),
+            1 => HttpResponse::json(200, results.remove(0)),
             _ => HttpResponse::json(
                 200,
                 serde_json::json!({ "result": rz::SUCCESS, "results": results }),
@@ -559,7 +561,7 @@ impl ChromaServer {
             let existing = live.get(&surface.key).map(|dl| dl.layer);
             if let Some(layer) = existing {
                 if let Some(dl) = live.get(&surface.key) {
-                    *dl.cells.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = cells.clone();
+                    (*dl.cells.lock().unwrap_or_else(std::sync::PoisonError::into_inner)).clone_from(&cells);
                 }
                 if host.refresh(layer, now) {
                     continue;
@@ -846,7 +848,7 @@ mod tests {
         // survives with its owner id and retained content.
         let mut reborn = kernel();
         assert!(
-            reborn.resolve("kbd", now).unwrap().iter().all(|c| c.is_none()),
+            reborn.resolve("kbd", now).unwrap().iter().all(std::option::Option::is_none),
             "reborn kernel starts dark"
         );
 
@@ -934,7 +936,7 @@ mod tests {
             now,
         );
         let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
-        assert_eq!(v["results"].as_array().map(|a| a.len()), Some(2));
+        assert_eq!(v["results"].as_array().map(std::vec::Vec::len), Some(2));
         // Applied in sequence: the last one is showing.
         assert_eq!(k.resolve("kbd", now).unwrap()[0], Some(Rgb(0, 0, 255)));
     }

@@ -31,6 +31,7 @@
 //!   * **static gradient** (≥2 evenly-spaced stops, no motion, 1 frame) -> an array of hex,
 //!   * **+motion / uneven stops** (1 frame) -> a palette table `{ stops, motion, speed, .. }`,
 //!   * **sequence** (>1 frame) -> a keyframe table `{ play, seq = [ frame tables ] }`.
+//!
 //! Deserialisation accepts all four shapes. `Rgb` itself is a hex string (the project-wide convention).
 
 use crate::lighting::Rgb;
@@ -80,6 +81,7 @@ impl Ease {
 
     /// Parse a tag, defaulting to [`Ease::Linear`] for anything unrecognised.
     #[must_use]
+    #[allow(clippy::should_implement_trait)] // Unknown names preserve the default easing.
     pub fn from_str(s: &str) -> Ease {
         match s.to_ascii_lowercase().as_str() {
             "smooth" => Ease::Smooth,
@@ -113,6 +115,7 @@ impl Loop {
 
     /// Parse a tag, defaulting to [`Loop::Loop`] for anything unrecognised.
     #[must_use]
+    #[allow(clippy::should_implement_trait)] // Unknown names preserve the default loop mode.
     pub fn from_str(s: &str) -> Loop {
         match s.to_ascii_lowercase().as_str() {
             "once" => Loop::Once,
@@ -146,6 +149,7 @@ impl Interp {
 
     /// Parse a tag, defaulting to [`Interp::Rgb`] for anything unrecognised.
     #[must_use]
+    #[allow(clippy::should_implement_trait)] // Unknown names preserve the default interpolation.
     pub fn from_str(s: &str) -> Interp {
         match s.to_ascii_lowercase().as_str() {
             "hsv" => Interp::Hsv,
