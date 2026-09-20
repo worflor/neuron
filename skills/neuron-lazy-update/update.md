@@ -1,20 +1,18 @@
 # Install, update, roll back, uninstall
 
-Everything here goes through one script, one per platform, in this skill's `scripts/` folder:
+The released Windows package uses the updater script in this skill's `scripts/` folder:
 
 | platform | script | runs in |
 |---|---|---|
 | Windows | `neuron-update.ps1` | the Windows PowerShell that comes with Windows |
-| Linux | `neuron-update.sh` | bash, with `curl` and `tar` |
+| Linux (future package) | `neuron-update.sh` | bash, with `curl` and `tar` |
 
-Nothing extra needs installing. **Pick by the machine the user is on, and never point one at the
-other platform.** Both speak the same output protocol and the same `RESULT:` codes, so every
-table below applies to either — only the command line differs.
+v0.1.0 has no Linux asset. **Do not run the Linux updater against that release.** The Linux
+script and archive steps below are for a future packaged release. For now, build from source as
+described in the [README](../../README.md).
 
-The Windows release is the app plus the CLI, so updating it closes and reopens neuron. The Linux
-release is the CLI alone: nothing is resident, so there is no process to stop, and one extra
-first-install step (a udev rule) that Windows does not have. Neither script ever touches the
-user's config.
+The Windows release includes the app and CLI, so updating it closes and reopens neuron. The
+updater does not touch user config.
 
 ## How to run the script
 
@@ -27,7 +25,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "<path to skill>\scripts\neu
 `-ExecutionPolicy Bypass` applies to that single command only. It doesn't change any system
 setting.
 
-On Linux:
+On Linux, after a package is published:
 
 ```bash
 bash "<path to skill>/scripts/neuron-update.sh" --action check
@@ -44,7 +42,7 @@ Read the output as lines:
 - `FLAG: CODE - text` is something to tell the user. `(STOP)` in the text means stop.
 - `RESULT: code` is always the last line, and it tells you what to do next.
 
-## Update (the common case)
+## Update (Windows release)
 
 1. **Check.** Run `-Action check`.
 2. **Decide from the `RESULT`:**
@@ -71,11 +69,9 @@ Read the output as lines:
 
 ## Install (first time)
 
-Both platforms install the same way: into a per-user directory the user can write to without
-becoming root. neuron then keeps its config in that same directory, beside the binary, which is
-what makes the install portable — the whole folder can be moved or copied and the setup goes
-with it. Installing somewhere the user cannot write splits config into a second location, so
-don't.
+Install into a per-user directory that is writable without elevation. Neuron keeps config
+beside the binaries there, so the folder remains portable. A protected install directory
+moves config to a second location.
 
 ### Windows
 
@@ -97,24 +93,9 @@ don't.
 
 ### Linux
 
-1. The default is `~/.local/share/neuron` (`$XDG_DATA_HOME/neuron` when that is set). It needs no
-   root and needs no flag — leave `--install-dir` off unless the user wants it elsewhere.
-2. Confirm with the user, then run:
-
-   ```bash
-   bash "<path to skill>/scripts/neuron-update.sh" --action apply
-   ```
-
-3. `RESULT: installed` means the files are in place. The script then tells you two things worth
-   passing on: `config_dir`, which is where their profiles and binds will live, and a
-   `NOT_ON_PATH` flag if they'd have to type the full path to run it.
-4. **`FLAG: NO_UDEV_RULE` is the one that matters.** Without the rule, `/dev/hidraw*` stays
-   root-only and `neuron list` finds nothing even though everything installed correctly. The
-   archive ships `70-neuron.rules` and `SOURCE.txt` has the exact two commands. It is one `sudo`,
-   it is a system-wide change, and it is the user's to make — show them the commands, explain what
-   they do, and let them run them. The device has to be replugged afterwards.
-5. There is no autostart step and no tray: the Linux build is the CLI, so nothing runs in the
-   background until the user runs `neuron run`.
+There is no Linux release asset to install or update in v0.1.0. Build from source using the
+[README](../../README.md). The GUI exists but its live input, overlay, and audio paths are
+incomplete on `main`. The updater script remains for a future Linux package.
 
 ## Roll back
 
@@ -163,11 +144,9 @@ Confirm each step with the user first. Don't delete anything they haven't agreed
    folder. Ask whether they want to keep a copy of the `profiles` folder and `*.toml` files first.
 4. If `%LOCALAPPDATA%\neuron` exists, it holds config as well. Ask before deleting it.
 
-On Linux there is no tray and no autostart, so steps 1 and 2 don't apply. Delete the install
-folder (`~/.local/share/neuron` by default), with the same warning about config living in it, and
-check `~/.local/share/neuron` separately if they installed somewhere else. Two leftovers to ask
-about: any symlink they made into `~/.local/bin`, and `/etc/udev/rules.d/70-neuron.rules`, which
-needs `sudo rm` and which they may want to keep if they use other Razer tooling.
+For a Linux source build, follow its run-root setting in the README before deleting files. A
+local symlink in `~/.local/bin` and an installed `/etc/udev/rules.d/70-neuron.rules` are separate
+from the build directory; ask before removing either.
 
 ## Flags
 
@@ -225,8 +204,7 @@ yet**. Say so honestly; the user is not doing something wrong, they are first. S
 
 ## Doing it by hand
 
-The script is the supported path, but nothing it does is magic, and a user who wants to see each
-step can do this instead. Do not improvise a different order — this is the same sequence.
+For a future Linux release archive, the script can perform these steps. v0.1.0 has no such asset.
 
 ```bash
 sha256sum -c SHA256SUMS.txt --ignore-missing   # must say OK, or stop

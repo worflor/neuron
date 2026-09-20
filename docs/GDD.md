@@ -59,7 +59,7 @@ polling and brightness aren't in that list on purpose. you set them from the GUI
 
 ## talks to your gear
 
-first, the part that makes any of it possible: how neuron reaches a protected device without a driver. razer's vendor control collection answers `HidD_Get/SetFeature`, and those IOCTLs are `FILE_ANY_ACCESS`, so neuron opens the device with `dwDesiredAccess = 0`. windows blocks `GENERIC_READ/WRITE` on a mouse; it doesn't block access-zero feature reports. that one trick is the whole foundation: same bytes as synapse, no kernel anything. it's also why neuron can't get swept into the windows-defender "vulnerable driver" quarantine that got OpenRGB, SignalRGB, and FanControl flagged in 2025 (the WinRing0 mess): plain HID feature reports skip the signed-driver circus entirely.
+first, how neuron reaches a protected device without installing a driver. razer's vendor control collection answers `HidD_Get/SetFeature`, and those IOCTLs are `FILE_ANY_ACCESS`, so neuron opens the device with `dwDesiredAccess = 0`. windows blocks `GENERIC_READ/WRITE` on a mouse; it doesn't block access-zero feature reports. that gives neuron the same feature-report path synapse uses without bundling a kernel driver, and avoids the vulnerable-driver dependency that has caused trouble for other RGB tools.
 
 ### device control
 

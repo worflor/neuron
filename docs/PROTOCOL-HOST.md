@@ -3,14 +3,13 @@
 > app-wide architecture is [`TDD.md`](TDD.md); what the hub does for a user is
 > [`GDD.md`](GDD.md#talks-to-your-gear).
 >
-> **🤖 agent-generated.** An LLM wrote this while building neuron. It may be stale or
-> wrong. The code is the source of truth; verify before you lean on a detail.
+> **provenance:** drafted with LLM assistance during implementation. Verify wire
+> details and current behavior against the code.
 
 # Neuron Protocol Host
 
-**Purpose:** the durable design record behind making neuron a *local protocol host* —
-the hub that speaks RGB, telemetry, creator, and automation protocols, built from
-first principles rather than by wrapping vendor SDKs.
+**Purpose:** design and implementation notes for neuron's local protocol host:
+lighting ownership, signal routing, and protocol adapters.
 
 **Status: built and shipped.** `crates/neuron-host` exists and is natively integrated
 into the app: the kernel (arbiter, bus, journal, restart governor), a device writer,
@@ -20,29 +19,23 @@ own lighting runs as the arbiter's animated BASE layer and games paint above it;
 `NEURON_HOST=0` opts out entirely. What is *not* built is named in
 [§6](#6-what-is-not-built-yet).
 
-The sections below are the reasoning, not a plan. Where a section describes a
-mechanism, that mechanism is in the tree; where it describes a judgement call, that
-call is still the one being honoured.
+This document includes implemented behavior and planned adapters. Check the
+current code before relying on a wire detail.
 
 ---
-## 0. The one-sentence thesis
+## 0. The central design
 
-**I am not building an app with integrations. I am building a local, honest,
-capability-driven *protocol hub* — the one place where games, sensors, sound,
-screen, lights, creator tools, and hardware all meet and can be wired to each
-other, with neuron's engine as the routing logic in the middle. The peripherals
-are just the first things plugged in.**
+Neuron accepts signals from supported integrations, arbitrates lighting
+ownership, and writes the resulting state to the device. More input and output
+protocols can connect through the same host as their adapters are built.
 
-The differentiator nobody in the prior art got right: **ownership & teardown as
-first-class.** Every conflict in this space (the "bad rave" blinking, "close the
-other app first", lighting frozen-on after a game exits) is the same root bug —
-two sources writing one device with no arbiter, so it's last-writer-wins and it
-flickers. Neuron models ownership. It is the only hub you never have to close to run
-another.
+**Ownership and teardown are explicit.** Without an arbiter, two sources writing
+one device can flicker or leave lighting stuck after a game exits. The host tracks
+which layer owns an effect and restores the base when that layer ends.
 
 ---
 
-## 1. Guiding principles (the soul — do not violate)
+## 1. Guiding principles
 
 These come from the project's standing preferences.
 
@@ -51,15 +44,12 @@ These come from the project's standing preferences.
    workshop you visit, not a daemon holding the peripheral hostage. Test for every
    feature: *"if neuron isn't running, what breaks?"* — drive that toward nothing.
 
-2. **Honesty is the moat.** Every knob reflects what the hardware *actually*
-   reports. No dead knobs, no fake success, no marketing lies. In a category where
-   everyone lies in both marketing and UI, being the tool that tells the truth
-   about your own hardware is an unfakeable advantage. Degrade *visibly*.
+2. **Report actual device state.** Every knob reflects what the hardware reports.
+   Unknown capabilities stay unavailable, and failures are visible.
 
-3. **"Immersive" = mechanic correctness, NOT garnish.** Reactive lightshows bolted
-   on events are slop. What matters is: truthful **State**, real **Latency**, clean
-   **Teardown**, honest **Parity** with the native tool. A shift light is a precise
-   *instrument* (is it correct + lag-free?), not a rainbow that pulses on kills.
+3. **Make integration behavior correct.** A reactive effect needs accurate state,
+   low latency, clean teardown, and parity with its source. A shift light should
+   follow the actual shift point promptly.
 
 4. **Local-first, no account, minimal privilege.** Loopback by default. No
    telemetry. No always-on elevated service (that was the literal root of
@@ -88,9 +78,7 @@ Every integration — ingest or emit — ships **only** if it passes:
   lighting frozen-on. *(Every one of these is a named Synapse failure.)*
 - **Parity** — does it do what the native tool does, correctly, no worse?
 
-If a port can't pass these four, it's slop no matter how good the demo looks.
-
----
+An adapter is ready when it meets all four checks.
 
 ---
 
@@ -213,8 +201,8 @@ External-Sim-Integration schema** so new games are a data file, not a parser.
   opt-in, never core.
 - **Discord RPC** (local IPC named-pipe/unix-socket) — `SPEAKING_START/STOP` →
   on-air indicator. Local-clean. Voice state only for users sharing your channel.
-- **VTube Studio** (local WS 8001) — sleeper: feed device telemetry → avatar
-  params (battery/mic/macro-state → model reacts physically). Nobody does this.
+- **VTube Studio** (local WS 8001) — planned: feed device telemetry to avatar
+  parameters such as battery, mic, and macro state.
 - **Bitfocus Companion "Satellite"** (open TCP 16622/WS 16623, no auth) — lets
   neuron *present as a Stream Deck surface* + inherit Companion's 100+ downstream
   tools. Plus `elgato-streamdeck` crate drives *real* Stream Decks over raw HID
@@ -290,11 +278,11 @@ External-Sim-Integration schema** so new games are a data file, not a parser.
 
 ---
 
-## 4. THE ARCHITECTURE (first-principles, the crown jewels)
+## 4. Architecture
 
-### 4.1 Model ownership as a first-class thing (the differentiator)
-Every conflict is an ownership bug. Nobody modeled it. **Neuron extends its layered
-compositor so every source is a LAYER WITH AN OWNER, PRIORITY, AND LIFECYCLE:**
+### 4.1 Model lighting ownership explicitly
+Two sources writing one device need an arbiter. Neuron gives each layer an owner,
+priority, and lifecycle:
 
 ```
 Layer {
@@ -393,9 +381,8 @@ adapter cannot corrupt kernel state because it never holds a lock on it.
 Each protocol (Chroma REST, OpenRGB TCP, telemetry UDP, OBS ws, ...) is a task
 that ONLY talks to the bus, spawned under a supervisor. If an adapter panics (a
 malformed packet from some game), `catch_unwind` at the task boundary contains it,
-**its layer is released (clean teardown by construction), and it restarts.** One
-adapter dying can NEVER take the kernel or another adapter down. *That's* the
-redundancy and the immortality — death is local and cheap.
+**its layer is released and it restarts.** Adapter failures are contained at
+the task boundary so the host can continue serving other adapters.
 
 ### 5.3 Supervision as a DAMPED OSCILLATOR (the real math)
 This is where AR(2) stops being a metaphor and becomes the control law.
@@ -507,8 +494,8 @@ macro engine are just two of its subscribers.
 
 ## 6. What is not built yet
 
-Named explicitly so this doc stops being a plan and starts being a record. Everything
-above describes what exists; these are the acknowledged holes.
+These are the main planned pieces. Earlier sections also discuss design intent;
+check the code for current behavior.
 
 - **The OpenRGB *client* half.** Today the hub runs the OpenRGB *server* side: other
   tools drive neuron. The client half — neuron reaching out to another

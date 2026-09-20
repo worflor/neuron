@@ -1,15 +1,13 @@
 > **kind:** app-level technical design — how neuron is built. The living architecture
 > doc, and the map most worth reading first. What it *does* is [`GDD.md`](GDD.md).
 >
-> **as of:** 2026-06-19; §8 test-surface refreshed 2026-07-09 · **trust:** high, broadly
-> matches the tree.
->
-> **🤖 agent-generated.** An LLM wrote this while building neuron. It may be stale or
-> wrong. The code is the source of truth; verify before you lean on a detail.
+> **provenance:** drafted with LLM assistance during implementation. Sections may
+> predate the current code; verify details against the tree. The runtime boundary
+> was updated in September 2026.
 
 # Neuron Technical Design Document
 
-Updated: 2026-06-19
+Original draft: 2026-06-19
 
 ## 1. Purpose
 
@@ -77,7 +75,7 @@ Core long-lived workers:
 - Optional overlay/window instrument workers, such as spell overlay, teleport scry, whiteboard, knockback, and glance helpers.
 - On Windows, audio cache worker in `beacon::audio_cache` so Core Audio reads do not block hot input paths.
 
-Cross-platform state today is explicit but incomplete. The architecture has transport traits and non-Windows stubs, but the live HID backend and several app runtime features are Windows-only. The daily-driver runtime is Windows-first until the transport identity model and backend implementations are made platform-neutral.
+Linux has a hidraw transport and Slint GUI. On `main`, live input, overlays and audio still need native backends; that work continues on `codex/linux-runtime-parity`. Windows is the daily-driver runtime with real Razer hardware verification. Linux HID and input paths still need a native hardware run.
 
 ## 4. Core Runtime Loop And Logical Flow
 
@@ -703,7 +701,7 @@ Mitigation:
 
 ### Risk: Cross-Platform Runtime Boundary
 
-The core HID path identity is backend-owned and Linux has a hidraw transport and GUI. Live input capture/synthesis, overlays and audio still need Linux backends, and the hidraw transport has not been verified on real hardware. The app must report unavailable live commands rather than claiming they are armed.
+The core HID path identity is backend-owned. Linux has hidraw and a GUI; live input, overlays and audio are incomplete on `main` and in development on `codex/linux-runtime-parity`. The HID and input paths have not been verified on real Razer hardware. The app must report unavailable live commands rather than claiming they are armed.
 
 Mitigation:
 
@@ -711,21 +709,17 @@ Mitigation:
 - Keep opaque backend-owned device identity when adding another HID transport.
 - Keep platform-specific hooks, Raw Input, purge/admin helpers, and COM audio behind clear modules/features.
 
-**Cross-platform readiness scorecard** (a few of these seams have since landed, so verify each against the tree before relying on it):
+**Cross-platform readiness on `main`:**
 
-| Subsystem | Rating | The one change that unlocks portability |
+| Subsystem | Current state | Remaining check |
 |---|---|---|
-| Engine / Trigger spine (`engine.rs`, `controls.rs` core) | **Ready** | Already pure & portable — leave it. |
-| Audio synthesis (`tone.rs`, cpal output `sound.rs`) | **Ready** | Pure FM + cpal; the model to copy. |
-| Resolve pipeline (`cast.rs`, `glyph.rs`, `radial.rs`) | **Ready** | Pure math. |
-| OS audio control (`audio.rs`) | **Needs a seam** | `AudioControl` trait; ~9 stubs → one inert impl. |
-| HID transport (`transport.rs`, `windows_hid.rs`) | **Needs a seam** | Opaque `DevicePath` instead of `Vec<u16>`, then drop in a hidraw/IOKit backend. |
-| Window mgmt (`wm.rs`, `glance.rs`, `teleport.rs`, `whiteboard.rs`) | **Windows-welded** | One `WindowManager` trait + portable cycle/order logic above it. |
-| Layered overlay surface (overlay / teleport / whiteboard / glance) | **Windows-welded** | Extract one `LayeredSurface` type; it becomes the single port target. |
-| Curtain (`curtain.rs`) | **Needs a seam** | `mod imp` / `mod stub` split like `overlay.rs`. |
-| Live input + dispatch worker (`dispatch.rs run_worker`) | **Windows-welded** | `InputSource` trait + platform-neutral edge/turbo/routing loop. |
-
-The *core* is ready; the *driver and surfaces* are welded. Every welded/seam row shares one remedy shape — a minimal trait with the portable logic hoisted above it — and `Transport` + cpal already prove the house can do it.
+| Engine and trigger resolution | Portable core | Keep platform effects behind existing seams. |
+| HID transport | Windows verified; Linux hidraw implemented | Exercise Linux feature reports on real Razer hardware. |
+| Main GUI and tray | Windows daily-driven; Linux Slint window and GTK tray build | Exercise Linux desktop behavior outside WSL2. |
+| OS audio control | Windows implemented | Linux backend on `codex/linux-runtime-parity` needs integration and desktop testing. |
+| Live input and dispatch | Windows implemented | Linux evdev/uinput work is on the parity branch; test with real input hardware. |
+| Overlays and window instruments | Windows implemented | Linux overlay prototype needs the Windows visual renderer and compositor testing. |
+| macOS | No backend | Transport, input, audio, surfaces and window management. |
 
 ### Risk: Docs Drift
 
@@ -733,7 +727,7 @@ Feature-level design notes are implementation plans, not the source of truth for
 
 Mitigation:
 
-- Treat this file as the current app-level TDD.
+- Use this file as an architecture map and verify implementation details against the code.
 - Keep feature-specific docs under `docs/` but link their status to actual code.
 - Update this TDD when new workers, config files, or dispatch sources are added.
 

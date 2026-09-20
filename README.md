@@ -9,9 +9,9 @@ two small executables, one shared core. no account, no cloud, no telemetry. no "
 | | |
 |---|---|
 | **what** | a tray-resident app and a CLI built to replace razer synapse |
-| **platform** | windows and linux (app + CLI). linux hardware control has not yet been tried on a real razer device; no mac |
-| **hardware** | razer mice + keyboards over raw HID; daily-driven (and hardware-verified) on a Naga V2 Pro + BlackWidow Chroma V2; any other `razer_report` device should adopt itself via auto-synthesis |
-| **install** | unpack a release archive anywhere writable (portable — config lives beside the binary), or build from source: `cargo build --release` |
+| **platform** | windows app + CLI in v0.1.0. linux app + CLI build from source, but the linux release is deferred and hardware control is unverified; no mac |
+| **hardware** | razer mice + keyboards over raw HID; daily-driven and hardware-verified on a Naga V2 Pro + BlackWidow Chroma V2; other `razer_report` devices can be probed for auto-synthesis but need their own hardware checks |
+| **install** | use the windows installer or unpack its portable zip anywhere writable, or build from source: `cargo build --release` |
 | **footprint** | no vendor driver, account, or cloud; your config is plain TOML |
 | **license** | most of Neuron is GPL-3.0-or-later with a linking exception; Engram and the eigenmotion research modules have separate Woflo Labs community-source terms. [the exact split](LICENSE.md) |
 
@@ -92,7 +92,7 @@ a thing that remaps your buttons and runs python on a keypress is, by definition
 
 ### with an agent
 
-if you'd rather not do any of this by hand, point your AI agent at [`skills/neuron-lazy-update`](skills/neuron-lazy-update/SKILL.md). it's in the repo, and in every release archive.
+if you'd rather not install the windows release by hand, point your AI agent at [`skills/neuron-lazy-update`](skills/neuron-lazy-update/SKILL.md). it's in the repo and the windows packages. the linux updater waits for a linux release asset.
 
 it can install or update neuron, roll back a bad update, run CLI commands for you, and answer questions from the docs. when something doesn't work, it looks into it first, and offers to draft a proper issue only if it turns out to be a real, unreported bug. it checks every download before installing and never touches your config. it's written to be followed step by step, so it doesn't need a frontier model.
 
@@ -100,9 +100,9 @@ the script under it does the risky parts and reports plain status lines, one per
 
 ### build
 
-releases provide a windows installer, a portable windows zip, and a linux tarball. both platform archives contain the app and CLI. each archive includes the license bundle, the agent skill, and a `SOURCE.txt` naming its source commit and build method. if the releases page is empty, build from source below.
+v0.1.0 provides a windows installer and portable zip, each with the app and CLI. both include the license bundle, the agent skill, and a `SOURCE.txt` naming the source commit and build method. linux packaging is deferred; the source still builds there.
 
-the windows builds are **not code-signed**. windows SmartScreen may warn on first run. check `SHA256SUMS.txt` against the downloaded installer, zip, or tarball, then read the packaged `SOURCE.txt` for the exact commit and build method. github-built artifacts may also carry a provenance attestation; locally built artifacts do not. when an attestation is attached, verify it with:
+the windows builds are **not code-signed**. windows SmartScreen may warn on first run. check `SHA256SUMS.txt` against the downloaded installer or zip, then read the packaged `SOURCE.txt` for the exact commit and build method. github-built artifacts may also carry a provenance attestation; locally built artifacts do not. when an attestation is attached, verify it with:
 
 ```
 gh attestation verify neuron-<version>-windows-x86_64.zip --repo worflor/neuron
@@ -190,9 +190,9 @@ the full per-feature status (solid to barely-started) lives in [state of the pro
 
 the **linux GUI** runs the same slint window, device settings and lighting editor, with a GTK tray menu and best-effort global hotkeys. it needs GTK 3, AppIndicator, libxdo and libxkbcommon-x11 at runtime (`libxkbcommon-x11-0` on Ubuntu). windows-specific overlays, live input capture/synthesis, and audio controls still need linux backends; the app reports that limitation rather than claiming remaps are armed.
 
-**linux gets the app and CLI**: the complete workspace is built and tested there, and the hidraw transport uses the kernel's own interfaces. the release tarball carries both binaries and the udev rule you need. what i can't tell you is whether it actually drives your mouse, because i don't have a linux box with a razer device on it — nothing has touched a wire there yet. if you try it, [tell me what happened](https://github.com/worflor/neuron/issues), good or bad. mac is unwritten.
+**linux is in progress**: the CLI builds and passes local tests, and the GUI opens, but v0.1.0 has no linux download. the [runtime parity branch](https://github.com/worflor/neuron/tree/codex/linux-runtime-parity) has work in progress on live input, overlays, and audio; its overlay still needs the windows renderer's full look. no razer device has tested the linux HID or input paths yet. if you try a source build, [tell me what happened](https://github.com/worflor/neuron/issues). mac is unwritten.
 
-and i'm not pretending this is the most mature or the broadest thing in the space. on linux, [openrazer](https://github.com/openrazer/openrazer) is the real, decade-hardened answer (kernel driver, a couple hundred devices, an actual community), so use it. if you want one panel for every RGB brand under the sun, that's [OpenRGB](https://openrgb.org). neuron is deliberately narrow: one vendor, one desk, gone deep. that narrowness is the point.
+on linux, [openrazer](https://github.com/openrazer/openrazer) is the mature option while neuron's hardware path gets real-device testing. if you want one panel for every RGB brand under the sun, that's [OpenRGB](https://openrgb.org). neuron is deliberately narrow: one vendor, one desk, gone deep. that narrowness is the point.
 
 every device write is sorted by how sure i am of it:
 
