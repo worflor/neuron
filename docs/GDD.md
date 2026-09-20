@@ -254,9 +254,9 @@ it works out which services are razer's by asking windows who installed them (no
 neuron discover
 ```
 
-point it at any `razer_report` device and it pokes the whole command space (finding the right pipe by vendor id and a 91-byte feature report, wherever it lives) then sorts each reply by its *shape*: an enum, a level, an x/y pair, a table, a string. line two devices up and the pattern falls out: a command they both answer is shared protocol, one only a single device answers is that device's own trick. nothing hardcoded.
+point it at a `razer_report` candidate and it probes the command space (finding the right pipe by vendor id and a 91-byte feature report, wherever it lives) then sorts each reply by its *shape*: an enum, a level, an x/y pair, a table, a string. line two devices up and the pattern falls out: a command they both answer is shared protocol, one only a single device answers is that device's own trick. this gives unfamiliar devices a starting definition; each device family still needs its own checks before we call its controls verified.
 
-an unknown razer device adopts itself the first time anything touches it: probed, synthesized, and written to the run root's `devices/auto/razer-<pid>.toml` as a complete def. `neuron adopt` (or `discover --emit`) forces the pass by hand; `adopt --dry-run` prints the TOML instead of writing it.
+an unfamiliar device can be probed, synthesized, and written to the run root's `devices/auto/razer-<pid>.toml` as a starting def. `neuron adopt` (or `discover --emit`) forces the pass by hand; `adopt --dry-run` prints the TOML instead of writing it.
 
 the file is the memo, not the input — it records what the device answered, and is ordinary editable config from then on. curated defs in `crates/neuron-core/devices/` shadow an auto one, and exist for the few things no getter reveals: a wire-captured command, a side-plate map, a transaction-id era the heuristic guessed wrong.
 

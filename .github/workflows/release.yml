@@ -7,15 +7,13 @@
 # Runs only on a pushed version tag (`v0.1.0`, `v0.2.0-mk1`, …) or a manual
 # `workflow_dispatch` - never on push to main or on pull requests; `ci.yml` covers those.
 #
-# Two platforms, three stages:
+# Windows release, three stages:
 #
 #   preflight (linux, ~10s)  - the refusals: tag vs Cargo version, private repo
 #     +-- windows            - the app + the CLI, zipped
-#     +-- linux              - the CLI + the udev rule, tarballed
 #           +-- publish      - one checksum file, one attestation pass, one draft release
 #
-# The build jobs upload artifacts and publish nothing, so one checksum file covers both assets
-# and a failed platform cannot leave a half-populated release behind.
+# The build job uploads an artifact and publishes nothing until the final stage.
 #
 # Opens the release as a draft: nothing is publicly visible until reviewed and published.
 # Flip `--draft` below to publish straight away.
@@ -105,8 +103,7 @@ jobs:
       # imports VCRUNTIME140.dll (ships with the VC++ Redistributable, not with Windows itself),
       # so a fresh install without it gets a missing-DLL dialog. +crt-static links the runtime in
       # instead; the api-ms-win-crt-* imports are the Universal CRT and are part of Windows 10+.
-      # Job-scoped: the same flag against glibc breaks NSS (DNS and user lookups), so the linux
-      # job must not inherit it.
+      # Job-scoped: the same flag against glibc breaks NSS (DNS and user lookups).
       RUSTFLAGS: -C target-feature=+crt-static
     steps:
       - uses: actions/checkout@v7
@@ -182,107 +179,15 @@ jobs:
           path: dist/${{ env.name }}.zip
           if-no-files-found: error
 
-  linux:
-    name: linux x86_64
-    needs: preflight
-    # ubuntu-22.04, not ubuntu-latest: a glibc binary runs on the glibc it was built against or
-    # newer, never older. 22.04 ships glibc 2.35, the floor this ships against; 24.04's 2.39
-    # would refuse to start on a 22.04 desktop. musl would drop the floor further but also drops
-    # `dlopen`, which the audio and X11 layers need.
-    runs-on: ubuntu-22.04
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Linux GUI build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libxdo-dev libayatana-appindicator3-dev libfontconfig1-dev libasound2-dev libudev-dev
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: true
-      - name: Cache the bundled CPython tarball
-        uses: actions/cache@v6
-        with:
-          path: vendor/pbs-cache
-          key: pbs-${{ runner.os }}-${{ hashFiles('crates/neuron-core/build.rs') }}
-          restore-keys: pbs-${{ runner.os }}-
-
-      - name: validate
-        shell: pwsh
-        run: ./validate.ps1
-
-      - name: build
-        run: cargo build --release -p neuron-app -p neuron-cli --locked
-
-      - name: Stage the package
-        shell: bash
-        run: |
-          set -euo pipefail
-          name="neuron-${{ needs.preflight.outputs.version }}-linux-x86_64"
-          mkdir -p "dist/$name"
-          cp target/release/neuron target/release/neuron-app "dist/$name/"
-          cp README.md LICENSE.md THIRD-PARTY-NOTICES.md SECURITY.md "dist/$name/"
-          cp -r LICENSES "dist/$name/"
-          cp -r skills "dist/$name/"
-          cp packaging/linux/70-neuron.rules "dist/$name/"
-          cat > "dist/$name/SOURCE.txt" <<EOF
-          neuron ${{ needs.preflight.outputs.version }} — linux x86_64 (app + CLI)
-
-          Built by GitHub Actions from:
-            repository : ${{ github.server_url }}/${{ github.repository }}
-            commit     : ${{ github.sha }}
-            source     : ${{ github.server_url }}/${{ github.repository }}/tree/${{ github.sha }}
-            run        : ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-
-          Built against glibc 2.35 (Ubuntu 22.04), so it runs on that or newer.
-
-          Run ./neuron-app for the GUI or ./neuron for the CLI. The GUI uses GTK 3,
-          AppIndicator, libxdo and libxkbcommon-x11. Global hotkeys use X11. Live input remaps, overlays,
-          and audio controls still need Linux backends.
-
-          Install the udev rule first, or hidraw stays root-only:
-
-            sudo cp 70-neuron.rules /etc/udev/rules.d/
-            sudo udevadm control --reload-rules && sudo udevadm trigger
-
-          Then replug the device (the rule applies when it next appears).
-
-          Extract this anywhere you can write — ~/.local/share/neuron needs no root. The install
-          is portable: config lives beside the binary, so the folder moves as one. README.md has
-          the details.
-
-          To install or update without doing it by hand, the bundled skill under skills/ drives
-          this, and verifies the checksum and attestation before it touches anything:
-
-            bash skills/neuron-lazy-update/scripts/neuron-update.sh --action check
-
-          Verify the build provenance — it proves this binary came from the commit above:
-
-            gh attestation verify $name.tar.gz --repo ${{ github.repository }}
-
-          Corresponding source for this binary is the commit linked above, per GPL-3.0-or-later.
-          EOF
-          # -C so the archive holds `<name>/...` and not the `dist/` prefix.
-          tar -czf "dist/$name.tar.gz" -C dist "$name"
-          echo "name=$name" >> "$GITHUB_ENV"
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: package-linux
-          path: dist/${{ env.name }}.tar.gz
-          if-no-files-found: error
-
   publish:
     name: draft release
-    needs: [preflight, windows, linux]
+    needs: [preflight, windows]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7 # for .github/releases/<tag>.md
 
-      # Both packages, flattened into one dir: `merge-multiple` drops the per-artifact folder
-      # so SHA256SUMS.txt lists the names people actually download.
+      # Flatten the package artifact so SHA256SUMS.txt lists the downloaded filename.
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -295,7 +200,7 @@ jobs:
           set -euo pipefail
           cd dist
           ls -l
-          sha256sum neuron-*-*.zip neuron-*-*.tar.gz > SHA256SUMS.txt
+          sha256sum neuron-*-*.zip > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       # Signed provenance tying each artifact to this commit + this workflow. Verify with
@@ -306,7 +211,6 @@ jobs:
         with:
           subject-path: |
             dist/*.zip
-            dist/*.tar.gz
 
       - name: Warn when there is no attestation
         if: ${{ github.event.repository.private }}
@@ -327,7 +231,7 @@ jobs:
           # Hand-written notes in .github/releases/<tag>.md win; otherwise GitHub generates them.
           notes=".github/releases/${VERSION}.md"
           if [ -f "$notes" ]; then notes_args=(--notes-file "$notes"); else notes_args=(--generate-notes); fi
-          assets=(dist/*.zip dist/*.tar.gz dist/SHA256SUMS.txt)
+          assets=(dist/*.zip dist/SHA256SUMS.txt)
           gh release create "$VERSION" "${assets[@]}" \
             --draft \
             --title "neuron $VERSION" \

@@ -162,7 +162,8 @@ from the build directory; ask before removing either.
 | `TASK_ELSEWHERE` | autostart points at a different neuron folder | ask which install they mean |
 | `SOURCE_BUILD` | developer build | see **Source builds** |
 | `NO_SOURCE_TXT` | not installed from a release zip | fine; version shown is best effort |
-| `ATTESTATION_SKIPPED` | `gh` isn't logged in, so provenance wasn't checked | fine; the checksum still matched |
+| `ATTESTATION_UNAVAILABLE` | the locally built v0.1.0 asset has no provenance attestation | the checksum matched; tell the user build provenance was not verified |
+| `ATTESTATION_SKIPPED` | `gh` isn't logged in, so provenance wasn't checked | the checksum matched; tell the user provenance was not verified |
 | `SAME_VERSION` | reinstalling the version already there | fine |
 | `CLI_VERSION_MISMATCH` | `neuron.exe` reports a different version than the release | report it; it may be a packaging mistake |
 | `OLD_BACKUPS` | more than three update backups kept | offer to delete the older ones |

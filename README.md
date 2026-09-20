@@ -1,8 +1,8 @@
 # neuron
 
 a lean, mean, do-what-i-say control layer for razer gear, built by Woflo Labs
-as an *anti-synapse*. (woflo labs is a publishing name, not a company — it's me,
-one person, obsessed with research in my free time.)
+as an *anti-synapse*. (woflo labs is a publishing name, not a company - it's me,
+one person, obsessed with research in my free time)
 
 two small executables, one shared core. no account, no cloud, no telemetry. no "please update razer central." it talks to your mouse and keyboard directly: the same `razer_report` HID bytes synapse sends, worked out from wire captures (USBPcap), the open-source [openrazer](https://github.com/openrazer/openrazer) driver, and a lot of live probing. it does exactly what you tell it then fricks off. no kernel driver, no vendor SDK 😳
 
@@ -39,7 +39,7 @@ honestly, is **[state of the project](docs/STATUS.md)**.
 
 ## why this exists
 
-i ran synapse 1. then 2... and hated it but survived with it. then 3 came out and i reluctantly downloaded it, but it's *still synapse*. i figured 3 was the floor. then **4**??? and one day the app told me i *had* to update!? i said nuh uh. neuron started roughly there. (the other half of the spark: i wanted to use my mouse's onboard storage like a little usb drive. and cast spells.)
+i ran synapse 1. then 2... and hated it but survived with it. then 3 came out and i reluctantly downloaded it, but it's *still synapse*. i figured 3 was the ceiling. then **4**??? and one day the app told me i *had* to update!? i said nuh uh. neuron started roughly there. (the other half of the spark: i wanted to use my mouse's onboard storage like a little usb drive. and cast spells.)
 
 to be clear, i love my razer hardware. this is anti-*synapse*: a multi-process, account-gated, cloud-synced ~2GB install that re-enables features you turned off, forgets settings, phones home, and bolts a login screen onto your *mouse dpi*. a fine idea drowned in shittification.
 
@@ -95,6 +95,8 @@ a thing that remaps your buttons and runs python on a keypress is, by definition
 if you'd rather not install the windows release by hand, point your AI agent at [`skills/neuron-lazy-update`](skills/neuron-lazy-update/SKILL.md). it's in the repo and the windows packages. the linux updater waits for a linux release asset.
 
 it can install or update neuron, roll back a bad update, run CLI commands for you, and answer questions from the docs. when something doesn't work, it looks into it first, and offers to draft a proper issue only if it turns out to be a real, unreported bug. it checks every download before installing and never touches your config. it's written to be followed step by step, so it doesn't need a frontier model.
+
+for something that looks broken, start with [troubleshooting and bug reports](skills/neuron-lazy-update/issues.md): known limits, setup checks, existing reports, then a useful issue if it is new. for writing Python macros, [macros in neuron](skills/neuron-macros/SKILL.md) covers the API, authority modes, beacons, and how to check a macro before running it.
 
 the script under it does the risky parts and reports plain status lines, one per platform — `neuron-update.ps1` for windows, `neuron-update.sh` for linux. you can run either yourself without an agent anywhere in the loop; `--action check` (or `-Action check`) only reads.
 
@@ -188,11 +190,9 @@ what you write stays yours. the checkbox on a pull request gives Woflo Labs enou
 
 the full per-feature status (solid to barely-started) lives in [state of the project](docs/STATUS.md); this section is just the device-write ledger.
 
-the **linux GUI** runs the same slint window, device settings and lighting editor, with a GTK tray menu and best-effort global hotkeys. it needs GTK 3, AppIndicator, libxdo and libxkbcommon-x11 at runtime (`libxkbcommon-x11-0` on Ubuntu). windows-specific overlays, live input capture/synthesis, and audio controls still need linux backends; the app reports that limitation rather than claiming remaps are armed.
+**linux is in progress**: the CLI builds and passes local tests, and a GUI opens, but v0.1.0 has no linux download. the [runtime parity branch](https://github.com/worflor/neuron/tree/codex/linux-runtime-parity) has work in progress on live input, overlays, and audio; its overlay still needs the windows renderer's full look. no razer device has tested the linux HID or input paths yet. if you try a source build, [tell me what happened](https://github.com/worflor/neuron/issues). mac seam is unwritten.
 
-**linux is in progress**: the CLI builds and passes local tests, and the GUI opens, but v0.1.0 has no linux download. the [runtime parity branch](https://github.com/worflor/neuron/tree/codex/linux-runtime-parity) has work in progress on live input, overlays, and audio; its overlay still needs the windows renderer's full look. no razer device has tested the linux HID or input paths yet. if you try a source build, [tell me what happened](https://github.com/worflor/neuron/issues). mac is unwritten.
-
-on linux, [openrazer](https://github.com/openrazer/openrazer) is the mature option while neuron's hardware path gets real-device testing. if you want one panel for every RGB brand under the sun, that's [OpenRGB](https://openrgb.org). neuron is deliberately narrow: one vendor, one desk, gone deep. that narrowness is the point.
+on linux, [openrazer](https://github.com/openrazer/openrazer) is the mature option while neuron's hardware path gets real-device testing. if you want one panel for every RGB brand under the sun, that's [OpenRGB](https://openrgb.org). neuron is deliberately narrow: one vendor, one desk, gone deep.
 
 every device write is sorted by how sure i am of it:
 

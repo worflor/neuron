@@ -44,7 +44,7 @@ code; device wiring lives in data.**
 | crate | what it is |
 |---|---|
 | `crates/neuron-core` | The headless engine: HID protocol, device registry, lighting, the trigger/action spine, gestures, macros, profiles, and the process-wide safety gates. Portable by construction. |
-| `crates/neuron-app` | The Windows GUI (Slint) and the live driver. Tray-resident; the remap loop runs inside it. |
+| `crates/neuron-app` | The Slint GUI and live driver. Windows is the release target; Linux has a partial source-build runtime. |
 | `crates/neuron-cli` | A thin front-end over core, plus a headless daemon run path. |
 | `crates/neuron-host` | The protocol hub: ownership arbiter, signal bus, and the OpenRGB / Chroma adapters other apps drive neuron through. |
 | `crates/engram` | Woflo Labs trajectory codec — the eigenmotion math behind gesture recognition. Its own license; see `LICENSE.md`. |
@@ -68,6 +68,7 @@ one).
 | How to send a change | [`CONTRIBUTING.md`](CONTRIBUTING.md) |
 | The label taxonomy, if you're filing or picking up issues | [`.github/LABELS.md`](.github/LABELS.md) |
 | You're helping a *user* install, update, or run neuron, not changing its code | [`skills/neuron-lazy-update/SKILL.md`](skills/neuron-lazy-update/SKILL.md) |
+| You're writing a Python macro or using beacons | [`skills/neuron-macros/SKILL.md`](skills/neuron-macros/SKILL.md) |
 
 **The code is the source of truth.** `docs/TDD.md` and `docs/PROTOCOL-HOST.md` both
 carry a banner saying an LLM wrote them while building neuron. That banner is
