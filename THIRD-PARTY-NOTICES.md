@@ -970,7 +970,7 @@ copied from:
 
 ## 6. Source vs. binary releases
 
-v0.1.0 ships prebuilt Windows installer and portable ZIP assets as well as source.
+v0.1.1 ships prebuilt Windows installer and portable ZIP assets as well as source.
 The notices below apply to distributed binaries:
 
 - The embedded-CPython notice (§1) and this file's existence at all matter

@@ -34,6 +34,7 @@ $Repo = 'worflor/neuron'
 $Task = 'Neuron (elevated tray)'
 $BackupRoot = '.neuron-update-backup'
 $DefaultDir = Join-Path $env:LOCALAPPDATA 'Programs\neuron'
+$ReleaseViaGh = $false
 
 function Say($k, $v) { Write-Output ("{0}: {1}" -f $k, $v) }
 function Flag($code, $text) { Write-Output ("FLAG: {0} - {1}" -f $code, $text) }
@@ -178,12 +179,25 @@ function Start-Neuron($dir, $taskDir) {
 
 function Get-Release($tag) {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    $url = if ($tag) { "https://api.github.com/repos/$Repo/releases/tags/$tag" } else { "https://api.github.com/repos/$Repo/releases/latest" }
-    try {
-        return Invoke-RestMethod -Uri $url -Headers @{ 'User-Agent' = 'neuron-lazy-update' } -TimeoutSec 30
-    } catch {
-        return $null
+    $route = if ($tag) { "repos/$Repo/releases/tags/$tag" } else { "repos/$Repo/releases?per_page=20" }
+    $data = $null
+    if (Get-Command gh -ErrorAction SilentlyContinue) {
+        $ErrorActionPreference = 'Continue'
+        $raw = & gh api $route 2>&1 | Out-String
+        if ($LASTEXITCODE -eq 0) {
+            try {
+                $data = $raw | ConvertFrom-Json
+                $script:ReleaseViaGh = $true
+            } catch { }
+        }
     }
+    if (-not $data) {
+        try {
+            $data = Invoke-RestMethod -Uri "https://api.github.com/$route" -Headers @{ 'User-Agent' = 'neuron-lazy-update' } -TimeoutSec 30 -ErrorAction Stop
+        } catch { return $null }
+    }
+    if ($tag) { return $data }
+    return $data | Where-Object { -not $_.draft } | Select-Object -First 1
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -266,8 +280,14 @@ if ($ZipPath) {
 
     $zip = Join-Path $work $zipAsset.name
     $sums = Join-Path $work 'SHA256SUMS.txt'
-    Invoke-WebRequest -Uri $zipAsset.browser_download_url -OutFile $zip -UseBasicParsing -Headers @{ 'User-Agent' = 'neuron-lazy-update' }
-    Invoke-WebRequest -Uri $sumAsset.browser_download_url -OutFile $sums -UseBasicParsing -Headers @{ 'User-Agent' = 'neuron-lazy-update' }
+    if ($ReleaseViaGh) {
+        $ErrorActionPreference = 'Continue'
+        $download = & gh release download $target --repo $Repo --dir $work --pattern $zipAsset.name --pattern 'SHA256SUMS.txt' --clobber 2>&1 | Out-String
+        if ($LASTEXITCODE -ne 0) { Flag 'DOWNLOAD_FAILED' "gh could not download release $target`: $($download.Trim())"; Finish 'error' }
+    } else {
+        Invoke-WebRequest -Uri $zipAsset.browser_download_url -OutFile $zip -UseBasicParsing -Headers @{ 'User-Agent' = 'neuron-lazy-update' }
+        Invoke-WebRequest -Uri $sumAsset.browser_download_url -OutFile $sums -UseBasicParsing -Headers @{ 'User-Agent' = 'neuron-lazy-update' }
+    }
 }
 
 if ($Action -eq 'check') {
@@ -293,8 +313,8 @@ if (-not $ZipPath -and (Get-Command gh -ErrorAction SilentlyContinue)) {
     $ErrorActionPreference = 'Continue'
     $att = & gh attestation verify $zip --repo $Repo 2>&1 | Out-String
     if ($LASTEXITCODE -eq 0) { Say 'attestation' 'ok' }
-    # Only v0.1.0's locally built asset treats missing provenance as nonfatal.
-    elseif ($target -eq 'v0.1.0' -and $att -match 'HTTP 404: Not Found.*\/attestations\/sha256:') { Flag 'ATTESTATION_UNAVAILABLE' 'v0.1.0 has no provenance attestation. The checksum matched, but build provenance could not be verified.' }
+    # These locally built releases have no GitHub Actions provenance attestation.
+    elseif ($target -in @('v0.1.0', 'v0.1.1') -and $att -match 'HTTP 404: Not Found.*\/attestations\/sha256:') { Flag 'ATTESTATION_UNAVAILABLE' "$target has no provenance attestation. The checksum matched, but build provenance could not be verified." }
     elseif ($att -match 'auth login|not logged') { Flag 'ATTESTATION_SKIPPED' 'gh is installed but not logged in, so provenance was not checked. The checksum still matched.' }
     else { Flag 'ATTESTATION_FAILED' "gh attestation verify failed (STOP): $($att.Trim())"; Finish 'blocked' }
 } elseif (-not $ZipPath) {

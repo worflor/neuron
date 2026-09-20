@@ -9,7 +9,7 @@ two small executables, one shared core. no account, no cloud, no telemetry. no "
 | | |
 |---|---|
 | **what** | a tray-resident app and a CLI built to replace razer synapse |
-| **platform** | windows app + CLI in v0.1.0. linux app + CLI build from source, but the linux release is deferred and hardware control is unverified; no mac |
+| **platform** | windows app + CLI in v0.1.1. linux app + CLI build from source, but the linux release is deferred and hardware control is unverified; no mac |
 | **hardware** | razer mice + keyboards over raw HID; daily-driven and hardware-verified on a Naga V2 Pro + BlackWidow Chroma V2; other `razer_report` devices can be probed for auto-synthesis but need their own hardware checks |
 | **install** | use the windows installer or unpack its portable zip anywhere writable, or build from source: `cargo build --release` |
 | **footprint** | no vendor driver, account, or cloud; your config is plain TOML |
@@ -102,7 +102,7 @@ the script under it does the risky parts and reports plain status lines, one per
 
 ### build
 
-v0.1.0 provides a windows installer and portable zip, each with the app and CLI. both include the license bundle, the agent skill, and a `SOURCE.txt` naming the source commit and build method. linux packaging is deferred; the source still builds there.
+v0.1.1 provides a windows installer and portable zip, each with the app and CLI. both include the license bundle, the agent skills, and a `SOURCE.txt` naming the source commit and build method. linux packaging is deferred; the source still builds there.
 
 the windows builds are **not code-signed**. windows SmartScreen may warn on first run. check `SHA256SUMS.txt` against the downloaded installer or zip, then read the packaged `SOURCE.txt` for the exact commit and build method. github-built artifacts may also carry a provenance attestation; locally built artifacts do not. when an attestation is attached, verify it with:
 
@@ -190,7 +190,7 @@ what you write stays yours. the checkbox on a pull request gives Woflo Labs enou
 
 the full per-feature status (solid to barely-started) lives in [state of the project](docs/STATUS.md); this section is just the device-write ledger.
 
-**linux is in progress**: the CLI builds and passes local tests, and a GUI opens, but v0.1.0 has no linux download. the [runtime parity branch](https://github.com/worflor/neuron/tree/codex/linux-runtime-parity) has work in progress on live input, overlays, and audio; its overlay still needs the windows renderer's full look. no razer device has tested the linux HID or input paths yet. if you try a source build, [tell me what happened](https://github.com/worflor/neuron/issues). mac seam is unwritten.
+**linux is in progress**: the CLI builds and passes local tests, and a GUI opens, but v0.1.1 has no linux download. the [runtime parity branch](https://github.com/worflor/neuron/tree/codex/linux-runtime-parity) has work in progress on live input, overlays, and audio; its overlay still needs the windows renderer's full look. no razer device has tested the linux HID or input paths yet. if you try a source build, [tell me what happened](https://github.com/worflor/neuron/issues). mac seam is unwritten.
 
 on linux, [openrazer](https://github.com/openrazer/openrazer) is the mature option while neuron's hardware path gets real-device testing. if you want one panel for every RGB brand under the sun, that's [OpenRGB](https://openrgb.org). neuron is deliberately narrow: one vendor, one desk, gone deep.
 

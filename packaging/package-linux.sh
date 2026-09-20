@@ -4,9 +4,9 @@
 # Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
 
 set -euo pipefail
-version="${1:-v0.1.0}"
+version="${1:-v0.1.1}"
 [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]] || {
-    echo 'version must look like v0.1.0 or v0.1.0-rc1' >&2
+    echo 'version must look like v0.1.1 or v0.1.1-rc1' >&2
     exit 2
 }
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

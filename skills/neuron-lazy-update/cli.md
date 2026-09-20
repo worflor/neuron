@@ -3,7 +3,7 @@
 The CLI is `neuron.exe`, in the install folder next to `neuron-app.exe`. It uses the same engine
 and the same config as the app. Run it with its full path, or from inside that folder.
 
-On Linux a source build produces `neuron` and a partial `neuron-app`. v0.1.0 has no Linux download.
+On Linux a source build produces `neuron` and a partial `neuron-app`. v0.1.1 has no Linux download.
 The CLI commands below use `neuron` there; drop the `.exe` and the `.\`.
 
 ## Find the right command
