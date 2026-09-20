@@ -250,13 +250,14 @@ fn invoke_store_stress_e2e() {
     // never a torn one. Any successful, non-empty read that fails to parse would be a real corruption.
     host.register(
         "store_atomic",
-        "def macro(ctx):\n    for i in range(500):\n        neuron.store('k%d' % (i % 26), i)\n    print('atomic done %d' % len(neuron.stored()))\n",
+        "# neuron: raw\ndef macro(ctx):\n    for i in range(500):\n        neuron.store('k%d' % (i % 26), i)\n    print('atomic done %d' % len(neuron.stored()))\n",
     )
     .unwrap();
     host.drain_log();
     assert!(host.fire_async("store_atomic", &ctx).contains("dispatched"));
     let p = store_path(&state, "store_atomic");
     let mut reads = 0u32;
+    let mut writer_done = false;
     let read_deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < read_deadline {
         if let Ok(s) = std::fs::read_to_string(&p) {
@@ -268,11 +269,18 @@ fn invoke_store_stress_e2e() {
         }
         // also stop once the writer reports completion.
         if macro_host().drain_log().iter().any(|l| l.contains("atomic done 26")) {
+            writer_done = true;
             break;
         }
     }
-    // ensure the writer is finished, then the final file is valid with all 26 keys.
-    let _ = wait_log("atomic done 26", Duration::from_secs(5));
+    // The first 26 writes already populate every key. Require the completion signal before
+    // testing another macro, or its fire can queue behind the remaining writes and time out.
+    if !writer_done {
+        writer_done = wait_log("atomic done 26", Duration::from_secs(15))
+            .iter()
+            .any(|l| l.contains("atomic done 26"));
+    }
+    assert!(writer_done, "atomic writer did not finish before the next macro test");
     let fin = read_store(&state, "store_atomic").expect("final atomic store parses");
     assert_eq!(fin.as_object().map(serde_json::Map::len), Some(26), "all 26 keys present, file intact");
     eprintln!("store atomicity: {reads} concurrent reads, every one parsed cleanly");
@@ -283,7 +291,8 @@ fn invoke_store_stress_e2e() {
         "def macro(ctx):\n    neuron.store('a', 1)\n    neuron.store('b', 2)\n    neuron.store('c', 3)\n    neuron.forget('b')\n    return 'a=%r b=%r c=%r' % (neuron.load('a'), neuron.load('b'), neuron.load('c'))\n",
     )
     .unwrap();
-    assert!(host.invoke("store_forget1", &ctx).contains("a=1 b=None c=3"), "forget(key) drops only that key");
+    let r = host.invoke("store_forget1", &ctx);
+    assert!(r.contains("a=1 b=None c=3"), "forget(key) drops only that key: {r}");
 
     // ── store_forget_all_keys ──────────────────────────────────────────────────────────────────
     host.register(
