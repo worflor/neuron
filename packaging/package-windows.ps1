@@ -3,14 +3,14 @@
 # Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
 
 param(
-    [string]$Version = 'v0.1.0',
+    [string]$Version = 'v0.1.1',
     [switch]$SkipBuild,
     [switch]$AllowDirty
 )
 
 $ErrorActionPreference = 'Stop'
 if ($Version -notmatch '^v(\d+\.\d+\.\d+)(?:-[A-Za-z0-9.-]+)?$') {
-    throw "version must look like v0.1.0 or v0.1.0-rc1"
+    throw "version must look like v0.1.1 or v0.1.1-rc1"
 }
 $appVersion = $Matches[1]
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path

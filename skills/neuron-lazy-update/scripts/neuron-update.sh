@@ -220,7 +220,8 @@ else
     if [ -n "$version" ]; then
         api="https://api.github.com/repos/$REPO/releases/tags/$version"
     else
-        api="https://api.github.com/repos/$REPO/releases/latest"
+        # /releases/latest excludes prereleases; the list includes the published beta.
+        api="https://api.github.com/repos/$REPO/releases?per_page=1"
     fi
     rel="$work/release.json"
     if ! curl -fsSL -H 'User-Agent: neuron-lazy-update' -o "$rel" "$api"; then

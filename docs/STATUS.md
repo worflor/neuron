@@ -1,6 +1,6 @@
 # neuron: state of the project
 
-v0.1.0 is a Windows beta. This page tracks what has been exercised on hardware, what is implemented but needs more use, and what is still planned. The [README](../README.md) has the device-write ledger.
+v0.1.1 is a Windows beta. This page tracks what has been exercised on hardware, what is implemented but needs more use, and what is still planned. The [README](../README.md) has the device-write ledger.
 
 | grade | meaning |
 |---|---|
@@ -32,9 +32,9 @@ v0.1.0 is a Windows beta. This page tracks what has been exercised on hardware, 
 | CLI and headless daemon | 🟠 under-tested | The installed Windows CLI has driven real hardware and shares the GUI's core engine. Its broad command surface and daemon path have had less day-to-day use. |
 | Protocol host | 🟠 early | Chroma and OpenRGB input paths reach the lighting arbiter. Ownership controls and teardown are still being hardened. Richer Chroma interpretation and dynamic redraw are planned. |
 | Momentary mic | 🟠 under-tested | Press holds mute and release restores it. Config swaps, worker respawn and exit release held state; the path has had limited real-world use. |
-| Install and update | 🟡 works, polishing | The Windows package was installed into a clean folder, checked for runtime DLLs, and used to drive hardware through the installed CLI. The v0.1.0 ZIP bundles an older updater that blocks online apply for users signed into `gh`, because these local assets have no attestation; use a manual install or the local ZIP path for that release. Linux update logic has synthetic install, rollback and checksum tests, but no released Linux package or native installation run. |
+| Install and update | 🟡 works, polishing | The v0.1.0 Windows package was installed into a clean folder, checked for runtime DLLs, and used to drive hardware through the installed CLI. Its bundled updater cannot discover prereleases or apply an online update with authenticated `gh`; v0.1.1 corrects those paths. Linux update logic has synthetic install, rollback and checksum tests, but no released Linux package or native installation run. |
 | Linux HID | 🟠 hardware-unverified | The hidraw transport builds and passes local tests under WSL2. No Razer device has exercised its feature-report path on Linux. |
-| Linux GUI | 🟠 partial | The source builds a Slint window with device settings, lighting editor, GTK tray and best-effort hotkeys. Live input, audio and overlay work is on [`codex/linux-runtime-parity`](https://github.com/worflor/neuron/tree/codex/linux-runtime-parity). Its overlay does not yet match Windows, and its input path needs a native desktop and hardware run. v0.1.0 has no Linux download. |
+| Linux GUI | 🟠 partial | The source builds a Slint window with device settings, lighting editor, GTK tray and best-effort hotkeys. Live input, audio and overlay work is on [`codex/linux-runtime-parity`](https://github.com/worflor/neuron/tree/codex/linux-runtime-parity). Its overlay does not yet match Windows, and its input path needs a native desktop and hardware run. v0.1.1 has no Linux download. |
 | macOS | ⚪ planned | No backend or release build. |
 
 For device-write evidence and feature gates, see the [README ledger](../README.md#honesty-proven-gated-absent). If a feature marked solid breaks, please [report the device and steps to reproduce](https://github.com/worflor/neuron/issues).

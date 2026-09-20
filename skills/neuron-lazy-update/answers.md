@@ -29,12 +29,12 @@ Short answers you can give directly. Check the linked source if the user wants m
 - **Which devices work?** Naga V2 Pro and BlackWidow Chroma V2 have hardware-verified controls.
   Other `razer_report` devices can be probed, but need their own hardware checks. BlackShark V2,
   its USB sound card, and Seiren V3 Mini have also been tested as audio devices. (`docs/STATUS.md`)
-- **Linux or Mac?** v0.1.0 has no Linux download. The Linux CLI builds and passes local tests, and
+- **Linux or Mac?** v0.1.1 has no Linux download. The Linux CLI builds and passes local tests, and
   a partial GUI runs from source; the [runtime parity branch](https://github.com/worflor/neuron/tree/codex/linux-runtime-parity)
   has unfinished input, overlay, and audio work. No Razer hardware has verified the Linux HID or
   input paths. There is no macOS build. (`docs/STATUS.md`)
 - **Why does Windows warn when I run it?** The binaries are not code-signed. Check
-  `SHA256SUMS.txt`; `SOURCE.txt` identifies the source commit. The locally built v0.1.0 assets
+  `SHA256SUMS.txt`; `SOURCE.txt` identifies the source commit. The locally built Windows assets
   have no provenance attestation. (`README.md`, *get it*)
 - **Where are my settings?** In the install folder next to the exes, or in `%LOCALAPPDATA%\neuron`
   if the install folder isn't writable.
