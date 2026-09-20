@@ -55,7 +55,7 @@ if (-not $env:CI -and -not $env:CARGO_BUILD_JOBS) {
 $lock = @()
 if ($Locked) { $lock = @('--locked') }
 
-# The Linux release includes the app, so both platforms validate the complete workspace.
+# Both platforms validate the complete source workspace, including the Linux app work.
 # Linux builders need the Slint backend and GTK/AppIndicator development libraries installed.
 $scope = @()
 

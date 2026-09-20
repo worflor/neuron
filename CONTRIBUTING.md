@@ -86,6 +86,6 @@ small, self-contained PRs get reviewed fastest. if you're planning something big
 
 most of neuron is GPL-3.0-or-later with the Neuron-Woflo exception. Engram and the three reusable research modules named in [LICENSE.md](LICENSE.md) use the Woflo Labs Community Source License instead; a contribution follows the license of the path where it lands.
 
-you keep ownership of what you write. checking the pull request box accepts the [Woflo Labs Contributor Agreement 1.0](LICENSES/CONTRIBUTOR-AGREEMENT-1.0.md) for that contribution, which gives Woflo Labs room to maintain and license the project while keeping accepted public work available in source form. if an employer, client, or school might control the work, make sure you have permission before submitting it.
+you keep ownership of what you write. checking the pull request box accepts the [Woflo Labs Contributor Agreement 1.0](LICENSES/CONTRIBUTOR-AGREEMENT-1.0.md) for that contribution. it lets me use accepted work under the project's public license and, if needed, future public or commercial licenses. work I publish must also remain available in source form under a public project license; it cannot go solely into a private or commercial edition. if an employer, client, or school might control the work, make sure you have permission before submitting it.
 
 thanks for being here. build something you'd want to use.

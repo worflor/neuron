@@ -567,6 +567,10 @@ fn record_keyseq_until(_stop: &AtomicBool) -> Option<String> {
 mod tests {
     use super::*;
 
+    // These tests manipulate the same process-global capture and intercept latches.
+    // Run their critical sections serially so one test cannot clear another's gate.
+    static CAPTURE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[cfg(windows)]
     #[test]
     fn resident_capture_keeps_the_device_identity_for_an_ordinary_key() {
@@ -678,6 +682,7 @@ mod tests {
     /// `end_capture_without_window`, which is what this pins.
     #[test]
     fn a_capture_that_outlives_its_window_never_leaves_the_dispatcher_gated() {
+        let _guard = CAPTURE_TEST_LOCK.lock().expect("capture test lock");
         // Simulate the state a live capture leaves behind, then the dead-window completion.
         CAPTURE_ACTIVE.store(true, Ordering::Relaxed);
         neuron::intercept::set_paused(true);
@@ -711,6 +716,7 @@ mod tests {
     /// silent bind of VK 0.
     #[test]
     fn cancel_lowers_the_gate_and_arms_the_stop_flag() {
+        let _guard = CAPTURE_TEST_LOCK.lock().expect("capture test lock");
         let stop = Arc::new(AtomicBool::new(false));
         CANCEL.with(|c| *c.borrow_mut() = Some(stop.clone()));
         CAPTURE_ACTIVE.store(true, Ordering::Relaxed);
@@ -730,6 +736,7 @@ mod tests {
     /// what keeps "click bind, change your mind, click bind again" from eating the second bind.
     #[test]
     fn a_stale_completion_cannot_disturb_the_capture_that_replaced_it() {
+        let _guard = CAPTURE_TEST_LOCK.lock().expect("capture test lock");
         let stale_gen = GENERATION.with(|g| {
             let v = g.get() + 1;
             g.set(v);
