@@ -238,7 +238,7 @@ jobs:
           Built against glibc 2.35 (Ubuntu 22.04), so it runs on that or newer.
 
           Run ./neuron-app for the GUI or ./neuron for the CLI. The GUI uses GTK 3,
-          AppIndicator and libxdo. Global hotkeys use X11. Live input remaps, overlays,
+          AppIndicator, libxdo and libxkbcommon-x11. Global hotkeys use X11. Live input remaps, overlays,
           and audio controls still need Linux backends.
 
           Install the udev rule first, or hidraw stays root-only:

@@ -15,7 +15,7 @@ two small executables, one shared core. no account, no cloud, no telemetry. no "
 | **footprint** | no vendor driver, account, or cloud; your config is plain TOML |
 | **license** | most of Neuron is GPL-3.0-or-later with a linking exception; Engram and the eigenmotion research modules have separate Woflo Labs community-source terms. [the exact split](LICENSE.md) |
 
-> **status: beta mk1.** windows-first, single dev, very much a personal project with too much ambition. mk1 is the same release language my other tools use, and it means exactly this: until now the only eyes and hands on this thing were mine. it works on my desk every day but *obviously* hasn't been tested on yours, and that gap is the whole definition. that goes for getting it onto your desk too: the windows install path has been run end to end here, the linux one has only been tested against synthetic archives, and no razer device has ever been plugged into a linux box running neuron. once it has survived desks that aren't mine, it graduates to mk2. where each feature actually stands, and what evidence is behind each one, is tracked in [state of the project](docs/STATUS.md).
+> **status: beta mk1.** windows-first, single dev, very much a personal project with too much ambition. mk1 is the same release language my other tools use, and it means exactly this: until now the only eyes and hands on this thing were mine. it works on my desk every day but *obviously* hasn't been tested on yours, and that gap is the whole definition. that goes for getting it onto your desk too: the windows install path has been run end to end here, the linux GUI has opened under WSL2 and its CLI has run on Ubuntu 22.04, but no razer device has ever been plugged into a linux box running neuron. once it has survived desks that aren't mine, it graduates to mk2. where each feature actually stands, and what evidence is behind each one, is tracked in [state of the project](docs/STATUS.md).
 
 ---
 
@@ -188,7 +188,7 @@ what you write stays yours. the checkbox on a pull request gives Woflo Labs enou
 
 the full per-feature status (solid to barely-started) lives in [state of the project](docs/STATUS.md); this section is just the device-write ledger.
 
-the **linux GUI** runs the same slint window, device settings and lighting editor, with a GTK tray menu and best-effort global hotkeys. windows-specific overlays, live input capture/synthesis, and audio controls still need linux backends; the app reports that limitation rather than claiming remaps are armed.
+the **linux GUI** runs the same slint window, device settings and lighting editor, with a GTK tray menu and best-effort global hotkeys. it needs GTK 3, AppIndicator, libxdo and libxkbcommon-x11 at runtime (`libxkbcommon-x11-0` on Ubuntu). windows-specific overlays, live input capture/synthesis, and audio controls still need linux backends; the app reports that limitation rather than claiming remaps are armed.
 
 **linux gets the app and CLI**: the complete workspace is built and tested there, and the hidraw transport uses the kernel's own interfaces. the release tarball carries both binaries and the udev rule you need. what i can't tell you is whether it actually drives your mouse, because i don't have a linux box with a razer device on it — nothing has touched a wire there yet. if you try it, [tell me what happened](https://github.com/worflor/neuron/issues), good or bad. mac is unwritten.
 

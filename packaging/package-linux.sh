@@ -56,7 +56,8 @@ Working tree at build: $dirty
 ELF glibc symbol floor: $floor
 
 Run ./neuron-app for the GUI or ./neuron for the CLI. The GUI needs GTK 3,
-AppIndicator, libxdo and a graphical desktop session. Global hotkeys use X11.
+AppIndicator, libxdo, libxkbcommon-x11 and a graphical desktop session.
+On Ubuntu, libxkbcommon-x11 is provided by libxkbcommon-x11-0. Global hotkeys use X11.
 
 For non-root hidraw access, from this extracted directory run:
   sudo install -m 0644 70-neuron.rules /etc/udev/rules.d/70-neuron.rules
