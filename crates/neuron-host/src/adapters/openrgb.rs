@@ -507,9 +507,6 @@ impl OrgbConn {
                     self.apply_single(dev_idx, idx, color, host, now);
                 }
             }
-            ids::SETCUSTOMMODE => {
-                // We are always in "Direct"; nothing to switch. No reply.
-            }
             ids::REQUEST_PROFILE_LIST | ids::REQUEST_PLUGIN_LIST => {
                 // MUST be answered (audit finding): openrgb-python's
                 // constructor BLOCKS on these when the negotiated version
@@ -524,6 +521,7 @@ impl OrgbConn {
                 out.extend_from_slice(&packet(0, pkt_id, &payload));
             }
             _ => {
+                // SETCUSTOMMODE is a no-op: we are always in "Direct".
                 // Truly reply-less commands (rescan, profile save/load/delete,
                 // zone resize, mode updates): the reference server sends no
                 // reply for these either; silence is conformant.

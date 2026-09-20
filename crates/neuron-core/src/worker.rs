@@ -148,6 +148,7 @@ impl<T> Default for Service<T> {
 ///   * the worker EXITS later (a setup-failure `return`, or a panic that escaped the loop's own
 ///     [`contain`]/[`drain`]/[`contain_frame`] containment) → its liveness flag drops, and the
 ///     next lookup re-spawns a fresh worker on a fresh channel.
+///
 /// This makes the module thesis TOTAL: there is never a cached sender feeding a dead receiver for
 /// longer than one lookup (a bare `OnceLock` could strand it for the whole process lifetime — every
 /// later `send` vanishing into a dead channel). `None` means the worker can't start right now; the

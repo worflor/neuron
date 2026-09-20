@@ -109,7 +109,7 @@ pub fn is_elevated() -> bool {
         let ok = GetTokenInformation(
             token,
             TokenElevation,
-            &raw mut elev as *mut _,
+            (&raw mut elev).cast(),
             std::mem::size_of::<TOKEN_ELEVATION>() as u32,
             &raw mut ret_len,
         );
@@ -315,7 +315,8 @@ unsafe fn service_bin(svc: HANDLE) -> Option<String> {
     if needed == 0 {
         return None;
     }
-    let mut buf = vec![0u8; needed as usize];
+    // SAFETY: usize storage aligns QUERY_SERVICE_CONFIGW and keeps returned string pointers live.
+    let mut buf = vec![0usize; (needed as usize).div_ceil(std::mem::size_of::<usize>())];
     if QueryServiceConfigW(
         svc,
         buf.as_mut_ptr().cast::<QUERY_SERVICE_CONFIGW>(),
@@ -353,14 +354,15 @@ fn discover_services(scm: HANDLE) -> Vec<Svc> {
         if needed == 0 {
             return found;
         }
-        let mut buf = vec![0u8; needed as usize];
+        // SAFETY: service records require pointer alignment stronger than Vec<u8> guarantees.
+        let mut buf = vec![0usize; (needed as usize).div_ceil(std::mem::size_of::<usize>())];
         if EnumServicesStatusExW(
             scm,
             SC_ENUM_PROCESS_INFO,
             SERVICE_WIN32,
             SERVICE_STATE_ALL,
-            buf.as_mut_ptr(),
-            buf.len() as u32,
+            buf.as_mut_ptr().cast::<u8>(),
+            needed,
             &raw mut needed,
             &raw mut count,
             &raw mut resume,
@@ -369,6 +371,12 @@ fn discover_services(scm: HANDLE) -> Vec<Svc> {
         {
             return found;
         }
+        if count as usize > (buf.len() * std::mem::size_of::<usize>())
+            / std::mem::size_of::<ENUM_SERVICE_STATUS_PROCESSW>()
+        {
+            return found;
+        }
+        // SAFETY: the API succeeded, the returned count fits the aligned buffer, and buf stays live.
         let entries =
             std::slice::from_raw_parts(buf.as_ptr().cast::<ENUM_SERVICE_STATUS_PROCESSW>(), count as usize);
         for e in entries {
@@ -563,6 +571,7 @@ pub fn run_purge_and_log() {
 /// disabling anything. Validates the detection on a live machine. Unelevated misses SYSTEM process
 /// paths but still lists every Razer service.
 pub fn scan_and_log() {
+    use std::fmt::Write as _;
     use std::io::Write as _;
     let procs = snapshot();
     let rats = find_rats(&procs);
@@ -582,30 +591,30 @@ pub fn scan_and_log() {
     };
 
     let mut report = String::new();
-    report.push_str(&format!(
-        "[scan] elevated={}  rat-processes={}  razer-services={}\n",
+    let _ = writeln!(report,
+        "[scan] elevated={}  rat-processes={}  razer-services={}",
         is_elevated(),
         rats.len(),
         svcs.len()
-    ));
+    );
     report.push_str("-- PROCESSES (would TerminateProcess) --\n");
     for r in &rats {
-        report.push_str(&format!(
-            "  {:<5}  pid={:<6}  {}\n",
+        let _ = writeln!(report,
+            "  {:<5}  pid={:<6}  {}",
             if r.root { "ROOT" } else { "child" },
             r.pid,
             r.path
-        ));
+        );
     }
     report.push_str("-- SERVICES (would demote to manual + stop) --\n");
     for s in &svcs {
-        report.push_str(&format!(
-            "  {:<7}  {}  [{}]  {}\n",
+        let _ = writeln!(report,
+            "  {:<7}  {}  [{}]  {}",
             if s.running { "RUNNING" } else { "stopped" },
             s.key,
             s.display,
             s.bin
-        ));
+        );
     }
 
     print!("{report}");

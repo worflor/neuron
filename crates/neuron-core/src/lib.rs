@@ -3,6 +3,8 @@
 // Additional permission: Neuron-Woflo Research Components Exception 1.0.
 // See ../../../LICENSE.md.
 
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::float_cmp, clippy::drop_non_drop, clippy::field_reassign_with_default))]
+
 //! Neuron — open, lightweight control for Razer devices. The anti-Synapse.
 //!
 //! Design principle: **semantics in code, wiring in data**. Capability *types* live in

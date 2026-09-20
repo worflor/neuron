@@ -653,7 +653,9 @@ fn draw_stroke(
         sx += dx * alpha;
         sy += dy * alpha;
         let q = (sx.round() as i32, sy.round() as i32);
-        let lp = *pts.last().unwrap();
+        let Some(&lp) = pts.last() else {
+            break;
+        };
         if (q.0 - lp.0).pow(2) + (q.1 - lp.1).pow(2) > 4 {
             let _ = tx.send(Cmd::Pt(q.0, q.1));
             pts.push(q);
@@ -806,7 +808,9 @@ fn command_stroke(
     let mut last_mark = std::time::Instant::now();
     while neuron::glyph::control_down(vk) && !cancel() {
         let p = cursor_pos();
-        let lp = *pts.last().unwrap();
+        let Some(&lp) = pts.last() else {
+            break;
+        };
         if (p.0 - lp.0).pow(2) + (p.1 - lp.1).pow(2) > 4 {
             let _ = tx.send(Cmd::Pt(p.0, p.1));
             pts.push(p);
@@ -921,7 +925,9 @@ fn classify_command(pts: &[(i32, i32)]) -> Command {
         return Command::None;
     }
     let (sx, sy) = pts[0];
-    let (ex, ey) = *pts.last().unwrap();
+    let Some(&(ex, ey)) = pts.last() else {
+        return Command::None;
+    };
     let net = f64::from((ex - sx).pow(2) + (ey - sy).pow(2)).sqrt();
     let arc: f64 = pts
         .windows(2)
@@ -1780,7 +1786,9 @@ mod imp {
                         // selection PRISM is only ever absent here when there is no selection —
                         // every selection-state change funnels through a `full` repaint, which
                         // draws the prism INTO clean — so the laser/ping rebuild needs bare strokes.
-                        if !clean_valid {
+                        if clean_valid {
+                            std::ptr::copy_nonoverlapping(clean.as_ptr(), px, count);
+                        } else {
                             std::ptr::write_bytes(px, 0, count);
                             for s in &strokes {
                                 render_stroke(
@@ -1796,8 +1804,6 @@ mod imp {
                                 count,
                             );
                             clean_valid = true;
-                        } else {
-                            std::ptr::copy_nonoverlapping(clean.as_ptr(), px, count);
                         }
                         frame = frame.wrapping_add(1);
                         if !selected.is_empty() {
@@ -4188,18 +4194,12 @@ mod palette {
                                 wide.len() as i32,
                             );
                         }
-                        _ => {
+                        Item::Veil | Item::Quit => {
                             FrameRect(dc, r, if *it == Item::Quit { danger } else { line });
-                            let label = match it {
-                                Item::Veil => {
-                                    if st.veiled {
-                                        "unveil ink"
-                                    } else {
-                                        "veil ink"
-                                    }
-                                }
-                                Item::Quit => "end session",
-                                _ => unreachable!(),
+                            let label = if *it == Item::Veil {
+                                if st.veiled { "unveil ink" } else { "veil ink" }
+                            } else {
+                                "end session"
                             };
                             SelectObject(dc, font.cast());
                             SetTextColor(

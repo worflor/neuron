@@ -463,7 +463,7 @@ pub fn listen_until(
 ) {
     use std::time::Instant;
     let start = Instant::now();
-    while seconds.map_or(true, |s| start.elapsed().as_secs() < s) {
+    while seconds.is_none_or(|s| start.elapsed().as_secs() < s) {
         if stop.load(std::sync::atomic::Ordering::Relaxed) {
             break;
         }
@@ -557,8 +557,13 @@ pub struct HoldEdges {
     /// independent input streams (see [`Stream`]); before it was a key it was a bit packed into the
     /// pid, which is how a pid >= 0x1000 could have aliased two devices onto one bucket.
     /// Kept sorted/deduped: input reports are tiny, so a compact `Vec` beats a tree here.
-    down: std::collections::HashMap<(Option<crate::registry::CanonicalPid>, Stream), Vec<(u16, u16)>>,
+    down: DownByStream,
 }
+
+type DownByStream = std::collections::HashMap<
+    (Option<crate::registry::CanonicalPid>, Stream),
+    Vec<(u16, u16)>,
+>;
 
 impl HoldEdges {
     #[must_use]
@@ -828,10 +833,8 @@ pub fn control_to_vk(page: u16, usage: u16) -> Option<i32> {
 // same pid) sends independent snapshots per interface — pid-keying would let a mouse click
 // clobber a held side-plate key. Consumers poll [`control_held`]; the same shared-stateless-state
 // model as `capture::set_macro_held` (each consumer keeps its own prev[] and edge-detects).
-static HELD: std::sync::Mutex<
-    Vec<(String, Option<crate::registry::CanonicalPid>, Vec<(u16, u16)>)>,
-> =
-    std::sync::Mutex::new(Vec::new());
+type HeldControls = Vec<(String, Option<crate::registry::CanonicalPid>, Vec<(u16, u16)>)>;
+static HELD: std::sync::Mutex<HeldControls> = std::sync::Mutex::new(Vec::new());
 
 // Passive observers of the resident pump's already-decoded control stream. Unlike `INJECT`, this
 // is NOT another input source and owns no Win32 registration: it is a tap on `note_held`, the one

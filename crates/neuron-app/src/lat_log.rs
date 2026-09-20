@@ -205,7 +205,7 @@ mod tests {
             return;
         }
         append(&log, "fresh line after the cap");
-        let len = std::fs::metadata(&log).map(|m| m.len()).unwrap_or(u64::MAX);
+        let len = std::fs::metadata(&log).map_or(u64::MAX, |m| m.len());
         assert!(
             len < LOG_MAX_BYTES,
             "the log was {len} bytes after appending past the {LOG_MAX_BYTES}-byte cap — it never \

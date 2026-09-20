@@ -523,9 +523,9 @@ fn hue_of((r, g, b): (f32, f32, f32)) -> f32 {
     if d <= 1e-6 {
         return 0.0;
     }
-    let h = if max == r {
+    let h = if r >= g && r >= b {
         ((g - b) / d).rem_euclid(6.0)
-    } else if max == g {
+    } else if g >= b {
         (b - r) / d + 2.0
     } else {
         (r - g) / d + 4.0
@@ -1616,7 +1616,6 @@ pub fn preset(surface: Surface) -> Material {
                 gain: 1.4,
                 ramp: Ramp::Water,
                 mix: Mix::Screen,
-                ..Layer::ZERO
             };
             // the wet SKIN — a near-white-cyan meniscus snapping at the silhouette. Gain is MODEST on purpose:
             // the Fresnel shell peaks on the fading flank, so at a THIN stroke (only as wide as the meniscus)
@@ -1775,7 +1774,6 @@ pub fn preset(surface: Surface) -> Material {
                 gain: 1.7,
                 ramp: Ramp::AccentHot,
                 mix: Mix::Screen,
-                ..Layer::ZERO
             };
             knobs[0] = Knob {
                 label: "strike rate",

@@ -3,6 +3,8 @@
 // Additional permission: Neuron-Woflo Research Components Exception 1.0.
 // See ../../../LICENSE.md.
 
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::float_cmp, clippy::drop_non_drop, clippy::field_reassign_with_default))]
+
 //! neuron-host — the kernel of the protocol host.
 //!
 //! Every RGB-ecosystem conflict in the wild (Synapse-vs-SignalRGB "bad rave"

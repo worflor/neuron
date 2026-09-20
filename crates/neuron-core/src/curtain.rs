@@ -53,7 +53,6 @@ pub struct CurtainFrame {
     pub intensity: f32,
 }
 
-#[cfg(windows)]
 type Painter = dyn Fn(&CurtainFrame) -> Vec<u8> + Send + Sync;
 #[cfg(windows)]
 static PAINTER: std::sync::Mutex<Option<Box<Painter>>> = std::sync::Mutex::new(None);
@@ -66,7 +65,7 @@ pub fn set_painter(f: Box<Painter>) {
     *PAINTER.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(f);
 }
 #[cfg(not(windows))]
-pub fn set_painter(_f: Box<dyn Fn(&CurtainFrame) -> Vec<u8> + Send + Sync>) {}
+pub fn set_painter(_f: Box<Painter>) {}
 
 /// One curtain at a time. A second fire while it's up is a no-op — the reveal is the user's next
 /// key/click, which the live curtain's own poll already catches; a second window would just stack.

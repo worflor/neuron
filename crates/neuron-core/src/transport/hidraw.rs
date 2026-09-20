@@ -169,7 +169,7 @@ fn stable_hash(bytes: &[u8]) -> u64 {
 /// Encode a `DevicePath` for one top-level collection: the hidraw node's canonical sysfs path,
 /// plus a 1-based 2-digit collection index. `col_index` must be 1-99.
 fn encode_path(canonical_sysfs_path: &str, col_index: u32) -> DevicePath {
-    DevicePath::from_str(&format!("{canonical_sysfs_path}#col{col_index:02}"))
+    DevicePath::from_linux_path(&format!("{canonical_sysfs_path}#col{col_index:02}"))
 }
 
 /// Split an encoded `DevicePath` back into its sysfs path and collection index. Pure (no `/sys`

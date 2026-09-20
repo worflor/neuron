@@ -94,6 +94,7 @@ pub trait Dialect: Send + Sync {
     /// The fire-and-drain streaming write (lighting frames): send, wait the link's round-trip,
     /// drain the reply ONCE (no retry loop). The wait discipline (`stream_wait_us`) is registry
     /// data passed in by the caller — not read from a def here, so this stays a pure wire op.
+    #[allow(clippy::too_many_arguments)]
     fn exec_fast(
         &self,
         t: &dyn Transport,

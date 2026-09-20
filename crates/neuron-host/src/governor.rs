@@ -207,11 +207,11 @@ mod tests {
                 // One crash: base + 1.0×per_unit = 750ms. Cheap containment.
                 assert_eq!(d, Duration::from_millis(750));
             }
-            v => panic!("unexpected {v:?}"),
+            v @ Verdict::Escalate => panic!("unexpected {v:?}"),
         }
         // After a long quiet period the pressure has fully dissipated — the
         // stability guarantee observed: the system FORGETS.
-        let later = t0 + Duration::from_secs(300);
+        let later = t0 + Duration::from_mins(5);
         assert!(g.pressure(later) < 1e-3, "pressure {} should have decayed", g.pressure(later));
         assert_eq!(g.ledger, Ledger { crashes: 1, absorbed: 1, escalated: 0 });
     }

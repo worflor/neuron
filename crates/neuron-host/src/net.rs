@@ -128,8 +128,7 @@ impl OrgbServer {
         let shared = roster.clone();
         let accept = crate::worker::spawn_named("neuron-orgb-accept", move || {
             accept_loop(listener, handle, stop_flag, shared, policy);
-        })
-        .expect("spawn accept thread");
+        })?;
         Ok(OrgbServer {
             stop,
             accept: Some(accept),
@@ -280,7 +279,6 @@ fn serve_conn(
                     if !hotplug.is_empty() && stream.write_all(&hotplug).is_err() {
                         break;
                     }
-                    continue;
                 }
                 Err(_) => break, // reset/abort — same teardown as EOF
             }
@@ -333,8 +331,7 @@ impl ChromaHttpServer {
         let shared = server.clone();
         let accept = crate::worker::spawn_named("neuron-chroma-accept", move || {
             chroma_accept_loop(listener, handle, shared, stop_flag);
-        })
-        .expect("spawn chroma accept thread");
+        })?;
         Ok(ChromaHttpServer {
             stop,
             accept: Some(accept),
@@ -431,9 +428,7 @@ fn serve_chroma_conn(
             match stream.read(&mut chunk) {
                 Ok(0) => return, // EOF between requests: normal
                 Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                    continue;
-                }
+                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
                 Err(_) => return,
             }
         };
@@ -490,7 +485,6 @@ fn parse_http_request(buf: &[u8]) -> Option<(HttpRequest, usize)> {
 
 fn write_http_response(stream: &mut TcpStream, resp: &HttpResponse) -> std::io::Result<()> {
     let reason = match resp.status {
-        200 => "OK",
         400 => "Bad Request",
         404 => "Not Found",
         _ => "OK",
@@ -591,8 +585,7 @@ impl ObsConnection {
     /// obs-websocket password (empty = no auth). Returns immediately; the
     /// connection establishes in the background and re-establishes if OBS
     /// restarts. Publishes `obs.connected` (bool) plus per-event signals.
-    #[must_use]
-    pub fn start(addr: &str, password: &str, host: HostHandle) -> ObsConnection {
+    pub fn start(addr: &str, password: &str, host: HostHandle) -> std::io::Result<ObsConnection> {
         let (tx, rx) = std::sync::mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let stop_flag = stop.clone();
@@ -610,15 +603,14 @@ impl ObsConnection {
                 &stop_flag,
                 &conn_flag,
             );
-        })
-        .expect("spawn obs thread");
-        ObsConnection {
+        })?;
+        Ok(ObsConnection {
             stop,
             thread: Some(thread),
             control: ObsControl { tx },
             connected,
             host,
-        }
+        })
     }
 
     #[must_use]
@@ -775,7 +767,10 @@ fn json_str_lit(s: &str) -> String {
             '\t' => out.push_str("\\t"),
             '\u{8}' => out.push_str("\\b"),
             '\u{c}' => out.push_str("\\f"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c if (c as u32) < 0x20 => {
+                use std::fmt::Write;
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
             _ => out.push(c),
         }
     }
@@ -826,7 +821,7 @@ mod tests {
 
     #[test]
     fn a_real_tcp_client_negotiates_paints_and_releases_on_disconnect() {
-        let host = Host::spawn();
+        let host = Host::spawn().expect("spawn host");
         let mut h = host.handle();
         h.declare(SurfaceInfo::grid(
             "kbd",
@@ -954,7 +949,7 @@ mod tests {
 
     #[test]
     fn chroma_http_round_trip_over_a_real_socket() {
-        let host = Host::spawn();
+        let host = Host::spawn().expect("spawn host");
         let mut h = host.handle();
         h.declare(SurfaceInfo::grid(
             "kbd",
@@ -1039,7 +1034,7 @@ mod tests {
         // A client that connects and never reads or writes — the pump's connection thread sits
         // in its read loop. Whether or not this particular scenario ever triggers the write-side
         // timeout, Drop must be bounded regardless.
-        let host = Host::spawn();
+        let host = Host::spawn().expect("spawn host");
         let server = OrgbServer::bind("127.0.0.1:0", host.handle()).expect("bind ephemeral");
         let client = TcpStream::connect(server.addr()).expect("connect");
         thread::sleep(Duration::from_millis(50)); // let the conn thread actually start
@@ -1050,7 +1045,7 @@ mod tests {
 
     #[test]
     fn chroma_server_drop_is_bounded_with_a_silent_client() {
-        let host = Host::spawn();
+        let host = Host::spawn().expect("spawn host");
         let server = ChromaHttpServer::bind("127.0.0.1:0", host.handle()).expect("bind ephemeral");
         let client = TcpStream::connect(server.addr()).expect("connect");
         thread::sleep(Duration::from_millis(50));
@@ -1076,8 +1071,8 @@ mod tests {
         })
         .expect("spawn silent peer");
 
-        let host = Host::spawn();
-        let conn = ObsConnection::start(&addr, "", host.handle());
+        let host = Host::spawn().expect("spawn host");
+        let conn = ObsConnection::start(&addr, "", host.handle()).expect("spawn OBS listener");
         // Give it time to dial in and start (and, pre-fix, wedge inside) the handshake read.
         thread::sleep(Duration::from_millis(200));
 
@@ -1087,7 +1082,7 @@ mod tests {
 
     #[test]
     fn well_known_port_double_bind_fails_the_second_host() {
-        let host = Host::spawn();
+        let host = Host::spawn().expect("spawn host");
         let first = OrgbServer::bind("127.0.0.1:0", host.handle()).expect("first bind");
         let addr = first.addr().to_string();
         // Same port again: refused — the single-instance signal.

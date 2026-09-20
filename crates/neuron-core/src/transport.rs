@@ -78,7 +78,7 @@ impl DevicePath {
     /// No wide-string ceremony needed off Windows: the platform's own path bytes round-trip
     /// losslessly through `OsString` already.
     #[cfg(not(windows))]
-    pub fn from_str(s: &str) -> DevicePath {
+    pub fn from_linux_path(s: &str) -> DevicePath {
         DevicePath(OsString::from(s))
     }
 }

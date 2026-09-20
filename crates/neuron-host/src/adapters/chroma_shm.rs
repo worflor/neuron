@@ -729,7 +729,7 @@ pub fn sections() -> Vec<(&'static str, usize)> {
             _ => None,
         })
         .collect();
-    v.sort_by(|a, b| b.1.cmp(&a.1));
+    v.sort_by_key(|entry| std::cmp::Reverse(entry.1));
     v
 }
 
@@ -861,7 +861,7 @@ pub mod server {
         sections: Vec<MappedSection>,
         handles: Vec<HANDLE>, // events + mutexes we created (kept alive)
         _sa: Option<EveryoneSa>,
-        _mask: Option<MaskGuard>, // the arbitration mask (create-mode only)
+        mask: Option<MaskGuard>, // the arbitration mask (create-mode only)
     }
 
     impl ShmServer {
@@ -944,7 +944,7 @@ pub mod server {
                 Some(m) => m,
                 None => return Err(CreateError::AlreadyServing),
             };
-            Ok(ShmServer { sections, handles, _sa: Some(sa), _mask: Some(mask) })
+            Ok(ShmServer { sections, handles, _sa: Some(sa), mask: Some(mask) })
         }
 
         /// Attach to an ALREADY-RUNNING Chroma server's objects (Razer's real
@@ -986,7 +986,7 @@ pub mod server {
                     "no Chroma server objects to open — is Razer's Chroma server running?",
                 ));
             }
-            Ok(ShmServer { sections, handles: Vec::new(), _sa: None, _mask: None })
+            Ok(ShmServer { sections, handles: Vec::new(), _sa: None, mask: None })
         }
 
         /// Snapshot a mapped section's current bytes into an OWNED buffer.
@@ -1425,26 +1425,22 @@ pub mod server {
         let mut activated: Option<u32> = None; // the PID we've activated
         let mut discovery = ClientDiscovery::armed(std::time::Instant::now());
         while !stop.load(Ordering::Relaxed) {
-            match activated {
+            if let Some(pid) = activated {
                 // Activated: the only ongoing work is a cheap liveness check. A dead PID
                 // (game closed) → drop it so a relaunch is picked up. Nothing is re-poked.
-                Some(pid) => {
-                    if !process_alive(pid) {
-                        activated = None;
-                        discovery.rearm(std::time::Instant::now());
-                    }
+                if !process_alive(pid) {
+                    activated = None;
+                    discovery.rearm(std::time::Instant::now());
                 }
-                // No game yet: client-owned objects are cheap positive hints, while the
-                // bounded fallback is the correctness path when a hint was transient or a
-                // newer SDK no longer creates the exact object an older capture showed.
-                None => {
-                    let now = std::time::Instant::now();
-                    if discovery.scan_due(now, client_transport_present()) {
-                        discovery.note_scan(now);
-                        if let Some(pid) = find_chroma_client() {
-                            unsafe { activate_once(appreg, sessinfo, pid, pid_session(pid)) };
-                            activated = Some(pid);
-                        }
+            } else {
+                // Client-owned objects are cheap positive hints; the bounded fallback catches
+                // transient hints and newer SDKs that use different objects.
+                let now = std::time::Instant::now();
+                if discovery.scan_due(now, client_transport_present()) {
+                    discovery.note_scan(now);
+                    if let Some(pid) = find_chroma_client() {
+                        unsafe { activate_once(appreg, sessinfo, pid, pid_session(pid)) };
+                        activated = Some(pid);
                     }
                 }
             }
@@ -1952,7 +1948,7 @@ pub mod server {
     impl Drop for ShmServer {
         fn drop(&mut self) {
             // Stop the arbiter thread FIRST — it writes into the sections we unmap below.
-            self._mask.take();
+            drop(self.mask.take());
             for s in &self.sections {
                 unsafe {
                     UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
@@ -2014,7 +2010,7 @@ pub mod server {
                 None => println!("roster: unreadable"),
             }
 
-            for o in OBJECTS.iter() {
+            for o in OBJECTS {
                 let Kind::Section(_) = o.kind else { continue };
                 if !o.note.starts_with("device buffer") {
                     continue;
@@ -2022,12 +2018,10 @@ pub mod server {
                 let Some(b) = srv.section_bytes(o.guid) else { continue };
                 match newest_record_meta(&b) {
                     Some((id, ts)) => {
-                        let effect = parse_frame(&b)
-                            .map(|(h, units)| {
+                        let effect = parse_frame(&b).map_or_else(|| "unparsed".into(), |(h, units)| {
                                 let lit = units.iter().filter(|u| !u.is_zero()).count();
                                 format!("device_type={:#04x} ({} lit of {})", h.device_type, lit, units.len())
-                            })
-                            .unwrap_or_else(|| "unparsed".into());
+                            });
                         println!("{}: newest record id={id:#x} ts={ts} {effect}  [{}]", o.guid, o.note);
                     }
                     None => println!("{}: idle (no records)  [{}]", o.guid, o.note),
@@ -2188,7 +2182,7 @@ mod tests {
         // Handle bytes in memory are `f6 b3 b7 0c`; as LE u32 the 0x0c record
         // delimiter is the high byte. This is the value that tags frame records.
         assert_eq!(s.session_handle, 0x0c_b7_b3_f6);
-        assert_eq!(s.session_handle >> 24, RECORD_MARKER_DELIM as u32);
+        assert_eq!(s.session_handle >> 24, u32::from(RECORD_MARKER_DELIM));
         // An all-zero table = nobody painting.
         assert!(parse_session_table(&vec![0u8; 4096]).is_none());
     }

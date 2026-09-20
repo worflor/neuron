@@ -1,5 +1,6 @@
 # Rust build output
-/target/
+/target
+/dist/
 # side target dirs used by review/CI agents (cargo --target-dir into the repo) — pure build cache
 /.review-target/
 
@@ -44,7 +45,7 @@ neuron-crash.log
 # ROOT (not repo-wide) and matches any root dir containing `target-lane`, which also catches a
 # bash-mangled CARGO_TARGET_DIR that strips path separators into one root dir name
 # (e.g. `UsersMicha...target-lane-runroot/`), seen 2026-07-10.
-/*target-lane*/
+/*target-lane*
 
 # Local/generated runtime state
 /runtime/host/__pycache__/

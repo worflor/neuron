@@ -294,7 +294,7 @@ mod tests {
     /// The standard boot-keyboard descriptor, HID 1.11 Appendix B.1 / E.6: modifier byte (8 Input
     /// bits) + reserved byte (8 Input bits) + 5-bit LED report + 3-bit LED padding (both Output)
     /// + 6-byte keycode array (48 Input bits). Input total 64 bits = 8 bytes -> `input_len` 9.
-    /// Output total 8 bits = 1 byte -> `output_len` 2.
+    ///   Output total 8 bits = 1 byte -> `output_len` 2.
     #[test]
     fn standard_boot_keyboard_descriptor() {
         let desc = concat(vec![

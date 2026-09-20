@@ -831,8 +831,8 @@ fn live_tick(ctx: &mut LiveCtx) -> Duration {
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
                         s.last_trigger = format!("profile {name}");
-                        s.last_action = applied.summary.clone();
-                        s.active_profile = name.clone();
+                        s.last_action.clone_from(&applied.summary);
+                        s.active_profile.clone_from(&name);
                     }
                     post_status(&ctx.weak, &ctx.status);
                 }
@@ -1017,7 +1017,7 @@ fn live_tick(ctx: &mut LiveCtx) -> Duration {
                 .status
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            s.focused_app = app.clone();
+            s.focused_app.clone_from(&app);
         }
         post_status(&ctx.weak, &ctx.status);
         // Stamped for the same reason as the mic tap: a focus change is an edge the user causes, and a
@@ -1047,8 +1047,8 @@ type MomentaryMap =
 /// ever samples the DEFAULT endpoint) would then consume against an unrelated real tap.
 /// Cross-platform via the `audio` seam: off-Windows `VolumeCtl::open` returns `None` (no audio
 /// backend), so the whole momentary path falls through to a no-op without any cfg gating here.
-fn open_mic(device: &Option<String>) -> Option<(String, neuron::audio::VolumeCtl)> {
-    neuron::audio::resolve_capture(device.as_deref())
+fn open_mic(device: Option<&str>) -> Option<(String, neuron::audio::VolumeCtl)> {
+    neuron::audio::resolve_capture(device)
         .and_then(|e| neuron::audio::VolumeCtl::open(&e.id).map(|c| (e.id, c)))
 }
 
@@ -1077,7 +1077,7 @@ fn momentary_press(
     let Some((device, mode)) = rt.borrow().momentary_mic_for(trigger) else {
         return;
     };
-    if let Some((id, ctl)) = open_mic(&device) {
+    if let Some((id, ctl)) = open_mic(device.as_deref()) {
         let (while_held, on_release) = mode.states(ctl.get_mute());
         // Open the self-write window only if the write CHANGES the OS state (`set_mute` returns that).
         // A no-op write is no transition, so the dispatch poll sees no edge and a window would only
@@ -1093,7 +1093,7 @@ fn momentary_press(
 /// A trigger's UP edge: restore the mic to its resting state.
 fn momentary_release(held: &MomentaryMap, trigger: &neuron::engine::Trigger) {
     if let Some((device, restore)) = held.borrow_mut().remove(trigger) {
-        if let Some((id, ctl)) = open_mic(&device) {
+        if let Some((id, ctl)) = open_mic(device.as_deref()) {
             let changed = ctl.set_mute(restore);
             note_mic_write_if_default(&id, changed); // only on a real transition — see momentary_press
         }
@@ -1104,7 +1104,7 @@ fn momentary_release(held: &MomentaryMap, trigger: &neuron::engine::Trigger) {
 /// momentary can never strand the mic flipped.
 fn momentary_release_all(held: &MomentaryMap) {
     for (_, (device, restore)) in held.borrow_mut().drain() {
-        if let Some((id, ctl)) = open_mic(&device) {
+        if let Some((id, ctl)) = open_mic(device.as_deref()) {
             let changed = ctl.set_mute(restore);
             note_mic_write_if_default(&id, changed); // only on a real transition — see momentary_press
         }
@@ -1352,8 +1352,8 @@ fn fire_trigger(
     rt.note_fired(trigger);
     {
         let mut s = status.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        s.last_trigger = outcome.trigger.clone();
-        s.last_action = outcome.action.clone();
+        s.last_trigger.clone_from(&outcome.trigger);
+        s.last_action.clone_from(&outcome.action);
         s.fired += 1;
         // carry the cursor so a live ProfileSwitch/Cycle shows in the header within this post.
         s.active_profile = neuron::profile::active();
@@ -1649,7 +1649,7 @@ mod tests {
         // A push-to-talk TAP: press writes, release writes, both inside ONE ~400ms cache window. The
         // cache can then surface the INTERMEDIATE muted state late — an edge that looks exactly like
         // a physical tap but is entirely neuron's own doing. Neither our-write edge may fire.
-        let _g = MIC_SEQ_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = MIC_SEQ_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         neuron::mic_state::reset_self_mute_write();
         let mut last = Some(false); // resting: unmuted, and the detector has seen that
         neuron::mic_state::note_self_mute_write(); // press (window opens)
@@ -1671,7 +1671,7 @@ mod tests {
         // THE finding this rewrite fixes. Suppression closes on the EDGE, not a wall clock — so even
         // if the cache is stalled far past any fixed duration, our write's edge (whenever it finally
         // surfaces) is still attributed to us. A fixed-timer window would have fired a phantom here.
-        let _g = MIC_SEQ_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = MIC_SEQ_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         neuron::mic_state::reset_self_mute_write();
         let mut last = Some(false);
         neuron::mic_state::note_self_mute_write(); // our write
@@ -1686,7 +1686,7 @@ mod tests {
     fn seq_an_external_change_with_no_window_fires_once() {
         // The case the detector still exists for: ANOTHER APP changed our mute. (A physical Seiren
         // tap does NOT come through here — hidwatch fires it from the HID edge directly.)
-        let _g = MIC_SEQ_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = MIC_SEQ_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         neuron::mic_state::reset_self_mute_write();
         let mut last = Some(false);
         assert!(detect(&mut last, true), "another app muted us — fire MicTap");
@@ -1698,7 +1698,7 @@ mod tests {
     fn seq_a_non_edge_sample_never_consumes_the_window() {
         // The un-changed polls between our write and its cache edge must leave the window ARMED — a
         // design that consumed on every sample lost it before the edge arrived and fired a phantom.
-        let _g = MIC_SEQ_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = MIC_SEQ_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         neuron::mic_state::reset_self_mute_write();
         let mut last = Some(false);
         neuron::mic_state::note_self_mute_write(); // e.g. hidwatch bridging a hardware tap
@@ -1736,7 +1736,7 @@ mod tests {
     #[test]
     fn cycle_index_steps_from_current_with_wraparound() {
         use neuron::profile::cycle_index;
-        let names: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        let names: Vec<String> = ["a", "b", "c"].iter().map(std::string::ToString::to_string).collect();
         // forward from each position wraps c -> a.
         assert_eq!(cycle_index(&names, "a", 1), 1, "a +1 -> b");
         assert_eq!(cycle_index(&names, "b", 1), 2, "b +1 -> c");
@@ -1960,7 +1960,7 @@ mod tests {
             .borrow_mut()
             .insert(trigger.clone(), (800, 0, PROFILE_GEN.load(Ordering::Relaxed)));
         ctx.turbos.borrow_mut().start(vec![neuron::executor::TurboStart {
-            trigger: trigger.clone(),
+            trigger,
             action: neuron::action::Action::Echo,
             cps: 100, // clamped max cps -> ~10ms interval
         }]);
@@ -2128,10 +2128,10 @@ mod tests {
         let mut b = DispatchBreaker::new();
         let t0 = Instant::now();
         for i in 0..DISPATCH_BREAKER_MAX {
-            b.record_fault(t0 + Duration::from_millis(i as u64 * 10));
+            b.record_fault(t0 + Duration::from_millis(u64::from(i) * 10));
             assert!(!b.tripped(), "the {}th fault must not trip yet (MAX={})", i + 1, DISPATCH_BREAKER_MAX);
         }
-        b.record_fault(t0 + Duration::from_millis(DISPATCH_BREAKER_MAX as u64 * 10));
+        b.record_fault(t0 + Duration::from_millis(u64::from(DISPATCH_BREAKER_MAX) * 10));
         assert!(b.tripped(), "exceeding MAX faults inside the window must trip the breaker");
     }
 
@@ -2163,16 +2163,16 @@ mod tests {
         let mut b = DispatchBreaker::new();
         let t0 = Instant::now();
         for i in 0..=DISPATCH_BREAKER_MAX {
-            b.record_fault(t0 + Duration::from_millis(i as u64));
+            b.record_fault(t0 + Duration::from_millis(u64::from(i)));
         }
         assert!(b.tripped());
         b.reset();
         assert!(!b.tripped(), "reset must un-trip immediately");
         // and the fault history is really gone, not just the flag: it takes a full fresh burst to
         // trip again, not one more fault riding on the old count.
-        let t1 = t0 + Duration::from_secs(60);
+        let t1 = t0 + Duration::from_mins(1);
         for i in 0..DISPATCH_BREAKER_MAX {
-            b.record_fault(t1 + Duration::from_millis(i as u64));
+            b.record_fault(t1 + Duration::from_millis(u64::from(i)));
             assert!(!b.tripped(), "post-reset fault #{i} alone must not re-trip");
         }
     }
@@ -2188,7 +2188,7 @@ mod tests {
         let mut b = DispatchBreaker::new();
         let t0 = Instant::now();
         for i in 0..=DISPATCH_BREAKER_MAX {
-            b.record_fault(t0 + Duration::from_millis(i as u64));
+            b.record_fault(t0 + Duration::from_millis(u64::from(i)));
         }
         assert!(b.tripped(), "setup: the breaker must be tripped before this test proves anything");
 
@@ -2261,7 +2261,7 @@ mod tests {
             /// needing a real mic/device — so the "no stranded held key" law gets exercised even when
             /// no real hardware answers `sniper_press`/`momentary_press` in this environment.
             SeedGhostHold,
-            NoOp,
+            Idle,
         }
 
         // ApplyProfile was DROPPED from the alphabet: exercising it for real needs an on-disk
@@ -2307,7 +2307,7 @@ mod tests {
                 4 => Op::ToggleHyperShift,
                 5 => Op::SeedGhostHold,
                 6 => Op::Burst(1 + rng.next_range(4) as u8),
-                _ => Op::NoOp,
+                _ => Op::Idle,
             }
         }
 
@@ -2340,7 +2340,7 @@ mod tests {
                 .map(|(_, s)| (1u32, s))
                 .collect();
             if branches.is_empty() {
-                branches.push((1, Just(Op::NoOp).boxed()));
+                branches.push((1, Just(Op::Idle).boxed()));
             }
             Union::new_weighted(branches).boxed()
         }
@@ -2408,7 +2408,7 @@ mod tests {
             let held_keys = ctx.held_keys.borrow().len().min(255) as u8;
             let sniper = ctx.sniper.borrow().len().min(255) as u8;
             let layers = ctx.rt.borrow().engine.held_layers().count().min(255) as u8;
-            let latch = ctx.hypershift_latch as u8;
+            let latch = u8::from(ctx.hypershift_latch);
             let fired = (ctx
                 .status
                 .lock()
@@ -2472,7 +2472,7 @@ mod tests {
             ghost_marker: &Trigger,
         ) {
             match op {
-                Op::NoOp => {}
+                Op::Idle => {}
                 Op::Tick => {
                     live_tick(ctx);
                 }
@@ -2483,7 +2483,7 @@ mod tests {
                 }
                 Op::RawEdge { device, button, pressed } => {
                     let device: u8 = *device % 2;
-                    let usage = 1u16 + (*button as u16 % 5);
+                    let usage = 1u16 + (u16::from(*button) % 5);
                     let set = active.entry(device).or_default();
                     if *pressed {
                         set.insert((0x09, usage));
@@ -2494,7 +2494,7 @@ mod tests {
                     let ev = ControlEvent {
                         pid: Some(pid),
                         stream: neuron::controls::Stream::RawInput,
-                        hits: set.iter().cloned().collect(),
+                        hits: set.iter().copied().collect(),
                         raw: Vec::new(),
                     };
                     live_edge(ctx, &ev);
@@ -2639,7 +2639,7 @@ mod tests {
                 seen.extend(digests);
 
                 // reward every category this episode drew from, proportional to the surprise it found.
-                let reward = (surprise as f64).max(0.01);
+                let reward = f64::from(surprise).max(0.01);
                 for &i in &included {
                     weights[i] += reward / included.len() as f64;
                 }

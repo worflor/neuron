@@ -150,14 +150,17 @@ jobs:
     needs: gate
     if: needs.gate.outputs.code == 'true'
     runs-on: ubuntu-latest
-    # 45 rather than the windows job's 60: tray-icon and global-hotkey are windows-only by target,
-    # so this lane builds no GTK/X11 stack.
-    timeout-minutes: 45
+    # The Linux app is part of the suite and links GTK/AppIndicator/X11 dependencies.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
+          components: rustfmt, clippy
+      - name: Linux GUI build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libxdo-dev libayatana-appindicator3-dev libfontconfig1-dev libasound2-dev libudev-dev
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true

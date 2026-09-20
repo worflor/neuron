@@ -305,7 +305,10 @@ fn spawn_hotplug_notifier() -> Option<std::sync::mpsc::Receiver<()>> {
     *NOTIFY_TX
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tx);
-    crate::worker::spawn_detached("neuron-hidwatch-notify", || unsafe { notifier_pump() });
+    if !crate::worker::spawn_detached("neuron-hidwatch-notify", || unsafe { notifier_pump() }) {
+        *NOTIFY_TX.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        return None;
+    }
     Some(rx)
 }
 
@@ -614,8 +617,7 @@ fn spawn_reader(
                             );
                         }
                     }
-                    neuron::transport::ReadStep::Data(_) => {} // zero-length read — keep listening
-                    neuron::transport::ReadStep::Idle => {} // read timed out — keep listening
+                    neuron::transport::ReadStep::Data(_) | neuron::transport::ReadStep::Idle => {}
                     neuron::transport::ReadStep::Gone => {
                         // unplugged / device gone — release un-claims `path` so the monitor re-arms.
                         if verbose() {
@@ -1151,9 +1153,7 @@ fn plate_label(pid: u16, id: u8) -> String {
     }
     registry()
         .and_then(|r| r.devices.iter().find(|d| d.product_ids().any(|p| p == pid)))
-        .and_then(|d| d.side_plate_label(id))
-        .map(std::string::ToString::to_string)
-        .unwrap_or_else(|| format!("plate {id}"))
+        .and_then(|d| d.side_plate_label(id)).map_or_else(|| format!("plate {id}"), std::string::ToString::to_string)
 }
 
 /// One device-pushed settings change, on its way into the batch.
@@ -1279,11 +1279,9 @@ fn flush_batch(pid: u16, b: Batch) {
             firsts.push(*t);
         }
     }
-    let is_sync = firsts.len() >= 2 && {
-        let lo = *firsts.iter().min().unwrap();
-        let hi = *firsts.iter().max().unwrap();
-        hi.duration_since(lo) <= BURST_SPAN
-    };
+    let is_sync = firsts.len() >= 2
+        && firsts.iter().min().zip(firsts.iter().max())
+            .is_some_and(|(lo, hi)| hi.duration_since(*lo) <= BURST_SPAN);
 
     if is_sync {
         if let Some((_, v)) = b.dpi {
@@ -1776,13 +1774,6 @@ mod tests {
         buf[3] = b3;
         decode(&buf, NAGA_PID, &test_path(), None, None, "");
     }
-    fn dpi_report(dpi: u16) {
-        let [hi, lo] = dpi.to_be_bytes();
-        feed(0x02, hi, lo);
-    }
-    fn scroll_report(stage: u8) {
-        feed(0x3a, stage, 0);
-    }
     fn plate_report(id: u8) {
         feed(0x0e, id, 0);
     }
@@ -1803,10 +1794,9 @@ mod tests {
         // adopted def appear in the device list while event arming + mute gating kept the startup
         // snapshot until restart — so pin that a reload actually SWAPS the snapshot. (Old readers
         // keeping their previous leaked snapshot is by design; new reads must see the new one.)
-        let before = registry().expect("registry loads on a dev checkout")
-            as *const neuron::registry::Registry;
+        let before = std::ptr::from_ref::<neuron::registry::Registry>(registry().expect("registry loads on a dev checkout"));
         reload_registry();
-        let after = registry().expect("registry reloads") as *const neuron::registry::Registry;
+        let after = std::ptr::from_ref::<neuron::registry::Registry>(registry().expect("registry reloads"));
         assert!(
             !std::ptr::eq(before, after),
             "reload_registry must swap in a freshly loaded snapshot, not keep the startup one"
@@ -2090,7 +2080,7 @@ mod tests {
     // they are out of headless scope — honestly excluded rather than faked.
     #[test]
     fn hotplug_burst_stresses_global_maps_without_corruption() {
-        let _g = BATCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = BATCH_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         const THREADS: u16 = 16;
         const ITERS: usize = 50;
@@ -2136,7 +2126,7 @@ mod tests {
         // every pid the burst touched settled to a CLEAN (fully-flushed) batch — no half-applied
         // state from the storm survives quiescence, whether the pid was shared or exclusive.
         {
-            let map = batches().lock().unwrap_or_else(|e| e.into_inner());
+            let map = batches().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             for t in 0..THREADS {
                 let pid = if t % 2 == 0 { SHARED_PID } else { 0xE100 + t };
                 let st = map
@@ -2156,7 +2146,7 @@ mod tests {
         // one — never a phantom key (a torn write landing under the wrong pid) and never a dropped
         // one (contention on the shared pid losing a write outright).
         {
-            let map = reassert_stamps().lock().unwrap_or_else(|e| e.into_inner());
+            let map = reassert_stamps().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             assert!(map.contains_key(&SHARED_PID), "the shared pid must have a reassert stamp");
             for t in (1..THREADS).step_by(2) {
                 let pid = 0xE100 + t;
@@ -2212,9 +2202,9 @@ mod tests {
         // waits for PENDING_FLUSHES to hit zero — provable quiescence, no fixed sleep for a loaded
         // machine to outrun — then clear the maps we filled.
         settle();
-        batches().lock().unwrap_or_else(|e| e.into_inner()).clear();
-        reassert_stamps().lock().unwrap_or_else(|e| e.into_inner()).clear();
-        mute_products_store().lock().unwrap_or_else(|e| e.into_inner()).clear();
-        mute_writable_store().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        batches().lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+        reassert_stamps().lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+        mute_products_store().lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+        mute_writable_store().lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
     }
 }

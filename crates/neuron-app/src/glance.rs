@@ -1516,7 +1516,7 @@ mod imp {
                 if GetObjectW(
                     t.fbmp.cast(),
                     std::mem::size_of::<BITMAP>() as i32,
-                    &raw mut bm as *mut _,
+                    (&raw mut bm).cast(),
                 ) != 0
                 {
                     bits = bm.bmBits.cast::<u32>();

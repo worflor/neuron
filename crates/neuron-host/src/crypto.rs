@@ -133,7 +133,12 @@ mod tests {
     use super::*;
 
     fn hex(b: &[u8]) -> String {
-        b.iter().map(|x| format!("{x:02x}")).collect()
+        use std::fmt::Write as _;
+        let mut hex = String::new();
+        for x in b {
+            let _ = write!(hex, "{x:02x}");
+        }
+        hex
     }
 
     // NIST known-answer vectors — the whole point of the crate: pin the

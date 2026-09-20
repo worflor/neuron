@@ -218,7 +218,8 @@ fn read_f32(data: &[u8], pos: &mut usize) -> f32 {
 }
 
 fn read_f64(data: &[u8], pos: &mut usize) -> f64 {
-    let bytes: [u8; 8] = data[*pos..*pos + 8].try_into().unwrap();
+    let bytes = [data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3],
+        data[*pos + 4], data[*pos + 5], data[*pos + 6], data[*pos + 7]];
     let v = f64::from_le_bytes(bytes);
     *pos += 8;
     v

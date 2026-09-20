@@ -845,9 +845,7 @@ impl Arbiter {
                 match &mut s.layers[idx].content {
                     Content::Fill(c) => {
                         let c = *c;
-                        for cell in &mut frame {
-                            *cell = Some(c); // opaque: claims every cell (lower layers gone)
-                        }
+                        frame.fill(Some(c)); // opaque: claims every cell (lower layers gone)
                         continue;
                     }
                     Content::Cells(v) => (v, 1.0, BlendMode::Over),
@@ -1093,7 +1091,7 @@ mod tests {
             )
             .unwrap();
         }
-        let wake = t0 + Duration::from_secs(8 * 3600);
+        let wake = t0 + Duration::from_hours(8);
         let released = a.sweep(wake);
         assert_eq!(released.len(), 3, "every heartbeat claim must lapse across an 8h jump");
         assert!(released.iter().all(|r| r.why == ReleaseWhy::Expired));
@@ -1239,7 +1237,7 @@ mod model_props {
                         };
                         let content = Content::Fill(Rgb(owner, 0, 0));
                         let id = a
-                            .claim(SURFACES[surface as usize], SourceId(owner as u64), band, lease, content)
+                            .claim(SURFACES[surface as usize], SourceId(u64::from(owner)), band, lease, content)
                             .expect("surface pre-declared, claim must succeed");
                         slots.push(Slot {
                             real_id: id,
@@ -1290,9 +1288,9 @@ mod model_props {
                     }
                     ModelOp::ReleaseOwner { owner } => {
                         let expected = slots.iter().filter(|s| s.present && s.owner == owner).count();
-                        let released = a.release_owner(SourceId(owner as u64));
+                        let released = a.release_owner(SourceId(u64::from(owner)));
                         prop_assert_eq!(released.len(), expected);
-                        for s in slots.iter_mut() {
+                        for s in &mut slots {
                             if s.present && s.owner == owner {
                                 s.present = false;
                             }
@@ -1305,7 +1303,7 @@ mod model_props {
                             .count();
                         let released = a.sweep(now);
                         prop_assert_eq!(released.len(), expected);
-                        for s in slots.iter_mut() {
+                        for s in &mut slots {
                             if s.present && s.ttl_ms.is_some_and(|_| now_ms >= s.deadline_ms) {
                                 s.present = false;
                             }

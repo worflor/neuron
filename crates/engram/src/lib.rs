@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: LicenseRef-WLCSL-1.0
 // See ../LICENSE.md.
 
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::float_cmp, clippy::drop_non_drop, clippy::field_reassign_with_default))]
+#![forbid(unsafe_code)]
+
 //! The Whisper Engram Universal Trajectory Codec
 //!
 //! Any signal that moves through a high-dimensional space over time is a

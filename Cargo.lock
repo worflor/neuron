@@ -3388,6 +3388,7 @@ dependencies = [
  "ctor 0.2.9",
  "engram",
  "global-hotkey",
+ "gtk",
  "image",
  "neuron",
  "neuron-host",

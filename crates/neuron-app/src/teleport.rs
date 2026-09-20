@@ -204,7 +204,7 @@ impl Snapshot {
                     let b = self.realm_blob(ri, wi);
                     if gx >= b[0] && gx < b[2] && gy >= b[1] && gy < b[3] {
                         let z = self.realms[ri].windows[wi].z;
-                        if best.map_or(true, |(bz, _)| z < bz) {
+                        if best.is_none_or(|(bz, _)| z < bz) {
                             best = Some((z, wi));
                         }
                     }
@@ -365,7 +365,7 @@ pub fn snapshot() -> Snapshot {
             let _ = DwmGetWindowAttribute(
                 hwnd,
                 DWMWA_CLOAKED as u32,
-                &raw mut cloaked as *mut _,
+                (&raw mut cloaked).cast(),
                 std::mem::size_of::<u32>() as u32,
             );
             let other_desktop = cloaked == 2;
@@ -794,7 +794,7 @@ fn scry_thread(rx: std::sync::mpsc::Receiver<ScryCmd>) {
                             DwmUpdateThumbnailProperties(thumb, &raw const props);
                         }
                     }
-                    ScryCmd::Aim { .. } => unreachable!("split above"),
+                    ScryCmd::Aim { .. } => {},
                 }
             }
             });
@@ -1657,10 +1657,10 @@ mod tests {
     fn target_math_holds() {
         let d = desk();
         assert_eq!(d.target_of(0.0, 0.0), (960, 540), "no drag = stay");
-        let s = d.scale() as f64;
+        let s = f64::from(d.scale());
         let (x, _) = d.target_of(100.0, 0.0);
-        let expect = 960.0 + 100.0 * GHOST_GAIN as f64 / s;
-        assert!((x as f64 - expect).abs() < 1.0, "drag scales by gain/scale");
+        let expect = 960.0 + 100.0 * f64::from(GHOST_GAIN) / s;
+        assert!((f64::from(x) - expect).abs() < 1.0, "drag scales by gain/scale");
         assert_eq!(d.target_of(1e9, 0.0).0, 3838, "clamped to the desk's edge");
         assert_eq!(d.target_of(-1e9, -1e9), (1, 1));
     }
@@ -1752,10 +1752,10 @@ mod tests {
             "carried keeps its size"
         );
         assert!(
-            ((c[0] + c[2]) / 2.0 - g.0).abs() < 0.001,
+            (f32::midpoint(c[0], c[2]) - g.0).abs() < 0.001,
             "carried centers on the ghost"
         );
-        assert!(((c[1] + c[3]) / 2.0 - g.1).abs() < 0.001);
+        assert!((f32::midpoint(c[1], c[3]) - g.1).abs() < 0.001);
         assert!((cursor.0 - d.project(960, 540).0).abs() < 0.001);
         assert_eq!(d.index_of(3), Some(2));
     }
@@ -1777,8 +1777,8 @@ mod tests {
         assert!(blob[1] >= card[1] && blob[3] <= card[3]);
         // hitting the blob names the window; hitting the card's empty corner still aims the
         // realm (frontmost fallback); missing the strip entirely is None.
-        let cx = (blob[0] + blob[2]) / 2.0;
-        let cy = (blob[1] + blob[3]) / 2.0;
+        let cx = f32::midpoint(blob[0], blob[2]);
+        let cy = f32::midpoint(blob[1], blob[3]);
         assert_eq!(d.realm_hit(cx, cy), Some((0, Some(0))));
         assert_eq!(d.realm_hit(card[0] + 1.0, card[1] + 1.0), Some((0, None)));
         assert_eq!(d.realm_hit(0.0, -200.0), None);

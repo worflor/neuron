@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
 
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable)]
+
 //! The capstone: every piece composed, end to end.
 //!
 //! An OpenRGB client's raw wire bytes flow through the adapter, over the
@@ -35,7 +37,7 @@ fn eventually(sink: &MockSink, timeout: Duration, pred: impl Fn(&[Option<Rgb>]) 
 
 #[test]
 fn wire_bytes_to_device_frames_with_clean_fallback() {
-    let host = Host::spawn();
+    let host = Host::spawn().expect("spawn host");
 
     // The app declares a keyboard and its configured base lighting (green).
     let mut h = host.handle();
@@ -55,7 +57,7 @@ fn wire_bytes_to_device_frames_with_clean_fallback() {
     // factory runs on the writer thread — where a real HID sink is born).
     let sink = MockSink::new();
     let writer_sink = sink.clone();
-    let _writer = Writer::spawn(host.handle(), "kbd", 50, move || writer_sink);
+    let _writer = Writer::spawn(host.handle(), "kbd", 50, move || writer_sink).expect("spawn writer");
 
     assert!(
         eventually(&sink, Duration::from_secs(2), |f| f

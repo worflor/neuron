@@ -204,6 +204,7 @@ impl Voice {
 
     /// Generate one sample and advance. Returns 0.0 once `done` (or while still delayed).
     #[inline]
+    #[allow(clippy::should_implement_trait)] // Completion yields silence, not Iterator's None.
     pub fn next(&mut self) -> f32 {
         if self.done {
             return 0.0;

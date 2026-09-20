@@ -68,7 +68,7 @@ pub fn cwd_guard(tag: &str) -> CwdGuard {
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
     // Recover from a poisoned lock: a panicking test must not wedge every later cwd test.
-    let lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let lock = CWD_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let prev = std::env::current_dir().unwrap();
     let prev_run_dir = std::env::var_os("NEURON_RUN_DIR");
     let tmp = std::env::temp_dir().join(format!(

@@ -3,6 +3,11 @@
 // Additional permission: Neuron-Woflo Research Components Exception 1.0.
 // See ../../../LICENSE.md.
 
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::float_cmp, clippy::drop_non_drop, clippy::field_reassign_with_default))]
+// The app compiles Windows overlay and desktop seams on Linux so shared UI code can use
+// the same types. Those dormant seam methods are checked by the compiler there.
+#![cfg_attr(target_os = "linux", allow(dead_code))]
+
 //! Neuron resident app — the ONE long-lived process. Tray-resident: the Slint event loop runs
 //! with NO window shown; the main window is built once before the event loop, may start hidden,
 //! and is hidden on close while its handle/glue are retained. The tray menu
@@ -51,6 +56,8 @@ mod strokelab;
 mod surface;
 mod teleport;
 mod tray;
+// Slint expands this module from generated Rust outside our source lint policy.
+#[allow(warnings, clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::todo)]
 mod ui;
 mod weave;
 mod whiteboard;
@@ -258,7 +265,7 @@ fn main() {
         let _ = SetProcessInformation(
             GetCurrentProcess(),
             ProcessPowerThrottling,
-            &raw const state as *const core::ffi::c_void,
+            (&raw const state).cast::<core::ffi::c_void>(),
             std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
         );
     }
@@ -302,13 +309,17 @@ fn main() {
     // Build the window eagerly — WITHOUT showing it — so the LIVE dispatch loop has a stable
     // handle to post status into (the software renderer makes a hidden window's idle cost
     // negligible). Whether it shows is decided below, so a `--tray` boot never flashes a frame.
-    build_window(&resident);
+    if !build_window(&resident) {
+        return;
+    }
 
     // Seed the tray from the real resident runtime instead of a throwaway config load. The window is
     // still hidden, so tray-start remains headless while startup avoids duplicate runtime IO.
     let (profiles, effects, active, paused) = {
         let r = resident.borrow();
-        let shared = r.shared.as_ref().expect("window built eagerly above");
+        let Some(shared) = r.shared.as_ref() else {
+            return;
+        };
         let s = shared.borrow();
         (
             s.rt.profiles
@@ -323,7 +334,13 @@ fn main() {
             neuron::writes::writes_paused(),
         )
     };
-    let tray = Rc::new(Tray::build(&profiles, &effects, &active, paused, false));
+    let tray = match Tray::build(&profiles, &effects, &active, paused, false) {
+        Ok(tray) => Rc::new(tray),
+        Err(err) => {
+            eprintln!("neuron-app: tray failed to start: {err}");
+            return;
+        }
+    };
 
     // Hidden start is an AUTOSTART behaviour: `--tray` (the Run-key launch) honours the persisted
     // start-minimized preference. A deliberate double-click ALWAYS shows the window — a brand-new
@@ -342,18 +359,21 @@ fn main() {
     // starts disarmed (observe/dry-run). The loop builds the unified Engine, installs the GamingMode
     // hook, and posts last-trigger/active-layer back to the UI.
     let safe = std::env::args().any(|a| a == "--safe");
-    let armed = !safe;
+    let input_supported = cfg!(windows);
+    let armed = input_supported && !safe;
     // Build the weak handle + set the view inside a SHORT borrow, then start the worker and store it
     // in a SEPARATE borrow (the worker must not be created while a borrow of `resident` is held).
     let weak = {
         let r = resident.borrow();
-        let app = r.window.as_ref().expect("window built eagerly above");
+        let Some(app) = r.window.as_ref() else {
+            return;
+        };
         let st = app.global::<State>();
         st.set_input_armed(armed);
-        st.set_runtime_active(cfg!(windows));
+        st.set_runtime_active(input_supported);
         st.set_status_line(
-            if !cfg!(windows) {
-                "live dispatch unavailable on this platform (device backend not implemented)"
+            if !input_supported {
+                "device settings and lighting are available; live remaps need a Linux input backend"
             } else if armed {
                 "live dispatch ARMED - GUI remaps fire (toggle safe-mode in Settings to disarm)"
             } else {
@@ -581,7 +601,7 @@ fn main() {
                 // LINK lamp: lights only while the live loop is alive.
                 if slow_due {
                     if let Some(live) = r.live.as_ref() {
-                        let running = live.running();
+                        let running = input_supported && live.running();
                         if st.get_runtime_active() != running {
                             st.set_runtime_active(running);
                         }
@@ -709,7 +729,9 @@ fn main() {
     );
 
     // Run the loop tray-resident. `quit_event_loop` (tray Quit) is the only exit.
-    slint::run_event_loop_until_quit().expect("event loop failed");
+    if let Err(err) = slint::run_event_loop_until_quit() {
+        eprintln!("neuron-app: event loop failed: {err}");
+    }
     // Drop the UI tick timer FIRST, then flush. `flush_lighting_save` already stops its OWN debounce
     // timer (LIGHT_SAVE_TIMER) and runs single-threaded after the loop has ended, so no UI-timer tick
     // can fire during it — its RefCell borrow is uncontended. Dropping the tick timer here is belt-
@@ -797,15 +819,21 @@ fn select_renderer_backend() {
 
 /// Create the window + install glue if not already present — WITHOUT showing it. Quick actions
 /// need the runtime, not a window in the user's face.
-fn build_window(resident: &Rc<RefCell<Resident>>) {
+fn build_window(resident: &Rc<RefCell<Resident>>) -> bool {
     debug_assert!(
         host::start_attempted(),
         "startup-order contract: host::start must run before build_window — restore_lighting (run inside build_window) needs the host routing decision already made (main.rs wiring)"
     );
     if resident.borrow().window.is_some() {
-        return;
+        return true;
     }
-    let app = AppWindow::new().expect("failed to create window");
+    let app = match AppWindow::new() {
+        Ok(app) => app,
+        Err(err) => {
+            eprintln!("neuron-app: failed to create window: {err}");
+            return false;
+        }
+    };
     let shared = glue::install(&app);
 
     // DEV: `NEURON_START_PAGE=<n>` opens directly on that page (0 = bindings, 1 = lighting, …) —
@@ -832,11 +860,14 @@ fn build_window(resident: &Rc<RefCell<Resident>>) {
     let mut r = resident.borrow_mut();
     r.window = Some(app);
     r.shared = Some(shared);
+    true
 }
 
 /// Show + focus the (already-built) window — the deliberate "open Neuron" action.
 fn show_window(resident: &Rc<RefCell<Resident>>) {
-    build_window(resident);
+    if !build_window(resident) {
+        return;
+    }
     if let Some(app) = resident.borrow().window.as_ref() {
         let _ = app.show();
         app.window().set_minimized(false);
@@ -889,7 +920,9 @@ fn handle_tray(resident: &Rc<RefCell<Resident>>, action: TrayAction) {
     // tray-first launch (--tray) the window is never built at startup, so without this the quick
     // controls (brightness/DPI/profile/HyperShift/pause) silently no-op. `build_window` is
     // idempotent and does NOT show anything — it just makes the runtime/State reachable.
-    build_window(resident);
+    if !build_window(resident) {
+        return;
+    }
     match action {
         TrayAction::Open => {
             flight::trace("life", "window show requested (tray)", 0);
@@ -897,7 +930,9 @@ fn handle_tray(resident: &Rc<RefCell<Resident>>, action: TrayAction) {
         }
         TrayAction::Quit => {
             flight::trace("life", "quit requested (tray)", 0);
-            slint::quit_event_loop().unwrap();
+            if let Err(err) = slint::quit_event_loop() {
+                eprintln!("neuron-app: failed to quit event loop: {err}");
+            }
         }
         TrayAction::GotoSettings => {
             show_window(resident);

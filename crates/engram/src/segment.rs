@@ -291,8 +291,7 @@ pub fn segment(w: &[f32], t: usize, dim: usize, max_block: usize) -> Vec<(usize,
     // Final segment
     if block_start < t {
         // Merge trailing short segment with previous
-        if t - block_start < MIN_BLOCK && !segments.is_empty() {
-            let last = segments.last_mut().unwrap();
+        if t - block_start < MIN_BLOCK && let Some(last) = segments.last_mut() {
             last.1 = t;
         } else {
             segments.push((block_start, t));

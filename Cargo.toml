@@ -93,15 +93,23 @@ opt-level = 3
 [profile.dev.package.neuron]
 opt-level = 3
 
+# Tests never render live overlays, and optimizing their enormous app harness turns a
+# quick correctness gate into a memory-heavy release-style compile on both platforms.
+[profile.test.package.neuron-app]
+opt-level = 0
+
+[profile.test.package.neuron]
+opt-level = 0
+
 # ── lints ───────────────────────────────────────────────────────────────────────────────
-# Centralized lint policy — every crate inherits with `lints.workspace = true`.
+# Centralized lint policy for crates that opt in with `lints.workspace = true`.
 # rustc lints enforce correctness and documentation; clippy lints enforce idiomatic,
 # performant, safe code. The pedantic group is warn-by-default with select overrides.
 [workspace.lints.rust]
 # Deny immediately-fatal or unsound patterns.
-# unsafe_code: module-level forbid/deny in neuron-host enforces strict safety.
-# Workspace-level is warn so FFI-heavy crates (neuron-testkit, neuron-core) compile.
-unsafe_code = "warn"
+# OS backends require FFI. `unsafe_code = "warn"` reported every reviewed Win32/Linux
+# call without distinguishing a missing safety argument; pure modules forbid it locally.
+unsafe_code = "allow"
 unused_imports = "deny"
 unused_variables = "deny"
 unused_mut = "deny"
@@ -120,8 +128,22 @@ dead_code = "warn"
 unused_must_use = "deny"
 
 [workspace.lints.clippy]
-# Start from pedantic (warn, not deny) — false positives get `#[allow]` locally.
+# Start from pedantic, then exclude style rules that conflict with protocol constants,
+# math notation, local test fixtures, or intentional ownership in public APIs.
 pedantic = { level = "warn", priority = -1 }
+many_single_char_names = "allow"
+unreadable_literal = "allow"
+items_after_statements = "allow"
+doc_lazy_continuation = "allow"
+option_if_let_else = "allow"
+needless_pass_by_value = "allow"
+must_use_candidate = "allow"
+too_many_arguments = "allow"
+type_complexity = "allow"
+struct_excessive_bools = "allow"
+should_implement_trait = "allow"  # tolerant from_str methods intentionally default unknown tags
+unused_self = "allow"             # keeps instance-oriented adapter APIs coherent
+manual_let_else = "allow"
 
 # ── deny: patterns that are bugs or security-relevant ──────────────────────────────────
 unwrap_used = "deny"
@@ -130,8 +152,7 @@ panic = "deny"
 unreachable = "deny"
 todo = "deny"
 unimplemented = "deny"
-print_stdout = "deny"
-print_stderr = "deny"
+# stdout and stderr are the CLI's user interface and the daemon's fallback log.
 dbg_macro = "deny"
 exit = "deny"
 get_unwrap = "deny"
@@ -146,7 +167,6 @@ bool_assert_comparison = "deny"
 match_ref_pats = "deny"
 redundant_closure_for_method_calls = "warn"
 manual_map = "deny"
-manual_is_some_and = "deny"
 needless_borrowed_reference = "deny"
 collapsible_if = "deny"
 collapsible_else_if = "deny"
@@ -157,16 +177,13 @@ write_with_newline = "deny"
 uninlined_format_args = "warn"
 
 # ── warn: performance ─────────────────────────────────────────────────────────────────
-trivially_copy_pastable_by_value = "warn"
 redundant_clone = "deny"
 manual_memcpy = "warn"
 manual_str_repeat = "warn"
 needless_collect = "warn"
-items_after_statements = "warn"
 
 # ── warn: style and clarity ──────────────────────────────────────────────────────────
 module_name_repetitions = "allow"  # common in this codebase (e.g. profile::Profile)
-must_use_candidate = "warn"  # promote to deny once existing violations are cleared
 semicolon_if_nothing_returned = "warn"
 if_not_else = "warn"
 match_same_arms = "warn"
@@ -174,8 +191,6 @@ redundant_else = "warn"
 single_match_else = "warn"
 used_underscore_binding = "warn"
 unnested_or_patterns = "warn"
-option_if_let_else = "warn"
-needless_pass_by_value = "warn"
 from_over_into = "deny"
 transmute_ptr_to_ptr = "deny"
 # as_conversions: ~194 violations — promote to deny once existing code uses explicit From/Into
@@ -197,13 +212,11 @@ too_many_lines = "allow"
 # These restrict valid Rust to enforce our conventions. Cherry-picked, not the full group.
 enum_glob_use = "deny"
 # implicit_reexports = "deny"  # too noisy with re-exports in mod.rs
-mixed_imports = "deny"
 string_add = "deny"
-string_to_string = "deny"
-try_unwrap = "deny"
+implicit_clone = "deny"
 verbose_file_reads = "deny"
 format_push_string = "deny"
-redundant_type_annotations = "warn"
+redundant_type_annotations = "allow"
 create_dir = "deny"
 path_ends_with_ext = "deny"
 

@@ -308,11 +308,11 @@ pub(crate) fn focus_title(title: &str) -> String {
         if hwnd.is_null() {
             return "window not found".into();
         }
-        return if unsafe { SetForegroundWindow(hwnd) } != 0 {
+        if unsafe { SetForegroundWindow(hwnd) } != 0 {
             "ok".into()
         } else {
             "focus refused".into()
-        };
+        }
     }
     #[cfg(not(windows))]
     {

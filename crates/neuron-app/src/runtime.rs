@@ -26,6 +26,7 @@ use neuron::registry::{DeviceDef, Registry};
 use neuron::synth::{adopt_key, AdoptKey};
 use neuron::transport;
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
@@ -1451,10 +1452,12 @@ impl AppRuntime {
                     .count();
                 let mut msg = format!("deleted '{name}'");
                 if refs > 0 {
-                    msg.push_str(&format!(" · {refs} app rule(s) still point at it"));
+                    use std::fmt::Write as _;
+                    let _ = write!(msg, " · {refs} app rule(s) still point at it");
                 }
                 if let Some(note) = cleared_fallback {
-                    msg.push_str(&format!(" · it was the fallback, now stay put{note}"));
+                    use std::fmt::Write as _;
+                    let _ = write!(msg, " · it was the fallback, now stay put{note}");
                 }
                 msg
             }
@@ -1484,12 +1487,12 @@ impl AppRuntime {
                 // leave the header naming a profile that no longer exists under that name. (Core
                 // already moved the process cursor; this is the app's copy of it.)
                 if was_active {
-                    self.active_profile = landed.clone();
+                    self.active_profile.clone_from(&landed);
                     neuron::profile::set_active(&landed);
                 }
                 let mut retargeted = 0;
                 for r in self.app_rules.rules.iter_mut().filter(|r| r.profile == from) {
-                    r.profile = landed.clone();
+                    r.profile.clone_from(&landed);
                     retargeted += 1;
                 }
                 if self.app_rules.default.as_deref() == Some(from) {
@@ -2224,7 +2227,7 @@ fn scan_units(registry: &Registry, infos: &[transport::HidDeviceInfo]) -> Vec<De
         // charge/drop edges. Route it from the pid's lowest instance only — one stable unit.
         let feed_vitals = twins.iter().min().copied() == Some(u.instance.as_str());
         let mut st = read_device_state(&u.def, u.pid, &u.path, feed_vitals);
-        st.instance = u.instance.clone();
+        st.instance.clone_from(&u.instance);
         if twins.len() > 1 {
             let nth = {
                 let mut sorted = twins.clone();
@@ -2398,7 +2401,10 @@ fn snapshot_device(def: &DeviceDef, pid: u16, path: &transport::DevicePath) -> S
             if let Ok(a) = d.exec_dynamic(class, id, 0x20, &[]) {
                 let kind = discover::classify(&a);
                 if kind != "empty" {
-                    let raw: String = a.iter().map(|b| format!("{b:02x}")).collect();
+                    let mut raw = String::new();
+                    for b in &a {
+                        let _ = write!(raw, "{b:02x}");
+                    }
                     getters.push(GetterSnap {
                         class,
                         id,

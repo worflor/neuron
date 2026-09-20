@@ -612,13 +612,13 @@ mod tests {
         // Escapes are assembled at runtime so this source stays ASCII and the
         // test provably exercises the \u path, not the raw-byte path.
         // BMP escape: u00dc decodes to Ü
-        let bmp = String::from(r#"{"n":""#) + "\\u00dcberblick" + r#""}"#;
-        let v = parse_json(&bmp).unwrap();
+        let bmp = concat!(r#"{"n":""#, "\\u00dcberblick", r#""}"#);
+        let v = parse_json(bmp).unwrap();
         assert_eq!(json_str(&v, "n").as_deref(), Some("Überblick"));
         // Astral char as a JSON surrogate pair (how escaping encoders emit emoji):
         // 🎥 = U+1F3A5 (movie camera)
-        let astral = String::from(r#"{"n":"live "#) + "\\ud83c\\udfa5" + r#" now"}"#;
-        let v = parse_json(&astral).unwrap();
+        let astral = concat!(r#"{"n":"live "#, "\\ud83c\\udfa5", r#" now"}"#);
+        let v = parse_json(astral).unwrap();
         assert_eq!(json_str(&v, "n").as_deref(), Some("live \u{1F3A5} now"));
         // A lone surrogate half is tolerated as U+FFFD, never a corrupt string or a dropped frame.
         let v = parse_json(r#"{"n":"bad \ud83c half"}"#).unwrap();
@@ -824,7 +824,7 @@ mod tests {
                     "rpcVersion": 1,
                     "requestId": "x",
                     "eventType": kind,
-                    "eventData": inner.clone(),
+                    "eventData": inner,
                     "requestType": kind,
                     "responseData": inner,
                 }

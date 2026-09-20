@@ -19,6 +19,8 @@ const TXID: u8 = 0x1F;
 use neuron::transport::{self, ReadStep, Transport};
 use std::time::{Duration, Instant};
 
+type Args = fn(u8) -> Vec<u8>;
+
 fn hexdump(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02X} ")).collect()
 }
@@ -427,7 +429,7 @@ fn trymute(info: &transport::HidDeviceInfo) -> anyhow::Result<()> {
     // Class 0x08 is the mute register (0x88 reads it). Sweep every id in this class with the arg
     // layouts a state setter plausibly uses, using the GETTER as the oracle (read-back == target).
     // Bounded to class 0x08 so the blast radius is just this one register.
-    let layouts: [(u8, fn(u8) -> Vec<u8>); 4] = [
+    let layouts: [(u8, Args); 4] = [
         (0x02, |v| vec![0x01, v]), // mirror getter [selector 0x01, state]
         (0x01, |v| vec![v]),       // bare state
         (0x02, |v| vec![0x00, v]), // [00, state]
@@ -564,7 +566,7 @@ fn discover(info: &transport::HidDeviceInfo) -> anyhow::Result<()> {
     let t = t.as_ref();
 
     // arg layouts a binary-state setter plausibly uses (name, size, |val| -> args):
-    let layouts: [(&str, u8, fn(u8) -> Vec<u8>); 3] = [
+    let layouts: [(&str, u8, Args); 3] = [
         ("[v]", 0x01, |v| vec![v]),
         ("[v,00]", 0x02, |v| vec![v, 0x00]),
         ("[00,v]", 0x02, |v| vec![0x00, v]), // varstore/selector + state

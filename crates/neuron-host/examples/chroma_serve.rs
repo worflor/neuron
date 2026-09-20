@@ -15,6 +15,7 @@
 
 #[cfg(all(windows, feature = "bridge"))]
 fn main() {
+    use std::fmt::Write as _;
     use neuron_host::adapters::chroma_shm::server::ShmServer;
     use std::{thread, time::Duration};
 
@@ -39,10 +40,10 @@ fn main() {
 
         let mut line = String::new();
         if !apps.is_empty() {
-            line += &format!("apps={apps:?} ");
+            let _ = write!(line, "apps={apps:?} ");
         }
         if let Some(s) = session {
-            line += &format!("session(pid={} access={}) ", s.session_id, s.active_count);
+            let _ = write!(line, "session(pid={} access={}) ", s.session_id, s.active_count);
         }
         for (dt, leds) in &srv.frames() {
             let class = match dt {
@@ -50,7 +51,7 @@ fn main() {
                 0x08 => "mousepad", 0x10 => "keypad", 0x80 => "chromalink", _ => "dev",
             };
             let (r, g, b) = leds.first().copied().unwrap_or((0, 0, 0));
-            line += &format!("[{class}: {} LEDs rgb({r},{g},{b})] ", leds.len());
+            let _ = write!(line, "[{class}: {} LEDs rgb({r},{g},{b})] ", leds.len());
         }
         let _ = &frames;
         if !line.is_empty() && line != last {

@@ -208,7 +208,7 @@ impl Device {
     /// stream teardown and app exit (DIALECT-RND "Device-mode lifecycle"). Teardown surfaces call
     /// THIS, never a raw device-mode write: the release routes through the def's [`Dialect`], so a
     /// razer board returns its driver-mode lease (`device_mode` -> 0x00, re-enabling onboard buttons/FN
-    /// + firmware wake-restore) while a HID++ (or any never-in-custody) family no-ops instead of
+    /// and firmware wake-restore) while a HID++ (or any never-in-custody) family no-ops instead of
     /// receiving a razer-framed mode packet it would misread. FAIL CLOSED on an unknown dialect,
     /// exactly like [`exec_dynamic_tx`](Self::exec_dynamic_tx) — a def we can't identify gets no bytes.
     pub fn release_custody(&self) -> Result<()> {
@@ -574,7 +574,6 @@ mod tests {
         let op_calls = Arc::new(AtomicUsize::new(0));
 
         let resolve = {
-            let bw = bw;
             let dead = dead.clone();
             let device_mode_sets = device_mode_sets.clone();
             let resolve_calls = resolve_calls.clone();
@@ -599,7 +598,6 @@ mod tests {
         let mut session = DeviceSession::new(&reg);
         let out = {
             let op_calls = op_calls.clone();
-            let dead = dead;
             session.with_writable_via("test-write", resolve, move |d: &Device| {
                 let n = op_calls.fetch_add(1, Ordering::SeqCst) + 1;
                 if n == 1 {
@@ -643,9 +641,6 @@ mod tests {
         let resolve_calls = Arc::new(AtomicUsize::new(0));
 
         let resolve = {
-            let bw = bw;
-            let dead = dead;
-            let device_mode_sets = device_mode_sets;
             let resolve_calls = resolve_calls.clone();
             move |_reg: &crate::registry::Registry| -> Result<Device> {
                 resolve_calls.fetch_add(1, Ordering::SeqCst);

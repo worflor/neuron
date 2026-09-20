@@ -57,7 +57,6 @@ impl Link {
 
 // IfType codes (IP Helper) — declared locally; the windows-sys consts live behind a heavier
 // feature and these two never change.
-const IF_TYPE_ETHERNET: u32 = 6;
 const IF_TYPE_WIFI: u32 = 71; // IF_TYPE_IEEE80211
 const IF_TYPE_LOOPBACK: u32 = 24;
 
@@ -95,7 +94,8 @@ fn net_glance() -> Glance {
     unsafe {
         // size the buffer (it asks for the length, then we fill); 15 KB is the usual first guess.
         let mut size: u32 = 15 * 1024;
-        let mut buf = vec![0u8; size as usize];
+        // SAFETY: usize storage aligns the adapter records, which Vec<u8> cannot guarantee.
+        let mut buf = vec![0usize; (size as usize).div_ceil(std::mem::size_of::<usize>())];
         let mut rc = GetAdaptersAddresses(
             AF_UNSPEC,
             flags,
@@ -105,7 +105,7 @@ fn net_glance() -> Glance {
         );
         if rc == 111 {
             // ERROR_BUFFER_OVERFLOW — grow to the size it told us and retry once.
-            buf = vec![0u8; size as usize];
+            buf = vec![0usize; (size as usize).div_ceil(std::mem::size_of::<usize>())];
             rc = GetAdaptersAddresses(
                 AF_UNSPEC,
                 flags,
@@ -127,7 +127,6 @@ fn net_glance() -> Glance {
             if up && has_gw && a.IfType != IF_TYPE_LOOPBACK {
                 out.link = match a.IfType {
                     IF_TYPE_WIFI => Link::WiFi,
-                    IF_TYPE_ETHERNET => Link::Ethernet,
                     // a VPN/cellular/other still counts as a live route — name it, call it online.
                     _ => Link::Ethernet,
                 };

@@ -984,14 +984,14 @@ mod tests {
         // is fresh — it MUST NOT be dropped.
         let same_name_new_pid = mini(&naga.name, "Ghost", naga.vendor_id, 0x0999);
         assert!(
-            !subsumed(&[naga.clone()], &same_name_new_pid),
+            !subsumed(std::slice::from_ref(&naga), &same_name_new_pid),
             "a fresh pid must load even when the display name collides"
         );
 
         // (b) curated-shadows-auto: re-parsing the same builtin brings no new pid → dead weight.
         let (naga_again, _) = builtins();
         assert!(
-            subsumed(&[naga.clone()], &naga_again),
+            subsumed(std::slice::from_ref(&naga), &naga_again),
             "a fully-covered def is subsumed (first-match-wins already resolves its pids)"
         );
 
@@ -1050,7 +1050,7 @@ mod tests {
         let hidpp = mini_dialect("Combo", "hidpp-side", 0x046D, 0x0042, "hidpp");
         // same pid + same NAME + DIFFERENT dialect → NOT subsumed (the second family still loads).
         assert!(
-            !subsumed(&[razer.clone()], &hidpp),
+            !subsumed(std::slice::from_ref(&razer), &hidpp),
             "a different-dialect def on the same pid brings a new family — not subsumed"
         );
         // same dialect + same pid → still subsumed (curated-shadows-auto unchanged WITHIN a family).

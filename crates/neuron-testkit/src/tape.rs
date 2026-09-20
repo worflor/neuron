@@ -80,9 +80,10 @@ pub struct Record {
 impl std::fmt::Debug for Record {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Record")
+            .field("guid", &self.guid)
             .field("note", &self.note)
             .field("t_ms", &self.t_ms)
-            .field("len", &self.bytes.len())
+            .field("bytes", &self.bytes.len())
             .finish()
     }
 }
@@ -115,9 +116,9 @@ impl Tape {
                 .context("note not ascii")?
                 .trim()
                 .to_string();
-            let t_ms = u64::from_le_bytes(data[off + 48..off + 56].try_into().unwrap());
-            let raw_len = u32::from_le_bytes(data[off + 56..off + 60].try_into().unwrap()) as usize;
-            let gz_len = u32::from_le_bytes(data[off + 60..off + 64].try_into().unwrap()) as usize;
+            let t_ms = u64::from_le_bytes(data[off + 48..off + 56].try_into().context("timestamp field")?);
+            let raw_len = u32::from_le_bytes(data[off + 56..off + 60].try_into().context("raw length field")?) as usize;
+            let gz_len = u32::from_le_bytes(data[off + 60..off + 64].try_into().context("compressed length field")?) as usize;
             off += 64;
             if data.len() - off < gz_len {
                 bail!("truncated gz payload for '{note}' at offset {off}");
@@ -606,10 +607,10 @@ mod tests {
             // Also exercise the fixed KEYBOARD-count path (PixelView::of) over the same
             // arbitrary, possibly-undersized, possibly-unaligned payload.
             let kbd_view = PixelView::of(&record);
-            let kbd_pixels: Vec<_> = kbd_view.pixels().collect();
+            let kbd_pixels = kbd_view.pixels().count();
             let kbd_start = PIXEL_ARRAY_OFFSET.min(len);
             let kbd_end = (PIXEL_ARRAY_OFFSET + KBD_PIXEL_COUNT * PIXEL_STRIDE).min(len);
-            prop_assert_eq!(kbd_pixels.len(), (kbd_end - kbd_start) / PIXEL_STRIDE);
+            prop_assert_eq!(kbd_pixels, (kbd_end - kbd_start) / PIXEL_STRIDE);
         }
     }
 }

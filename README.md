@@ -4,18 +4,18 @@ a lean, mean, do-what-i-say control layer for razer gear, built by Woflo Labs
 as an *anti-synapse*. (woflo labs is a publishing name, not a company — it's me,
 one person, obsessed with research in my free time.)
 
-one small binary. no account, no cloud, no telemetry. no "please update razer central." it talks to your mouse and keyboard directly: the same `razer_report` HID bytes synapse sends, worked out from wire captures (USBPcap), the open-source [openrazer](https://github.com/openrazer/openrazer) driver, and a lot of live probing. it does exactly what you tell it then fricks off. no kernel driver, no vendor SDK 😳
+two small executables, one shared core. no account, no cloud, no telemetry. no "please update razer central." it talks to your mouse and keyboard directly: the same `razer_report` HID bytes synapse sends, worked out from wire captures (USBPcap), the open-source [openrazer](https://github.com/openrazer/openrazer) driver, and a lot of live probing. it does exactly what you tell it then fricks off. no kernel driver, no vendor SDK 😳
 
 | | |
 |---|---|
-| **what** | one tray-resident binary (CLI + GUI) built to replace razer synapse |
-| **platform** | windows (app + CLI). linux ships the CLI — builds, tested, but not yet run against a real device by anyone; no mac |
+| **what** | a tray-resident app and a CLI built to replace razer synapse |
+| **platform** | windows and linux (app + CLI). linux hardware control has not yet been tried on a real razer device; no mac |
 | **hardware** | razer mice + keyboards over raw HID; daily-driven (and hardware-verified) on a Naga V2 Pro + BlackWidow Chroma V2; any other `razer_report` device should adopt itself via auto-synthesis |
 | **install** | unpack a release archive anywhere writable (portable — config lives beside the binary), or build from source: `cargo build --release` |
-| **footprint** | no driver, no account, no runtime, no cloud; your config is plain TOML |
+| **footprint** | no vendor driver, account, or cloud; your config is plain TOML |
 | **license** | most of Neuron is GPL-3.0-or-later with a linking exception; Engram and the eigenmotion research modules have separate Woflo Labs community-source terms. [the exact split](LICENSE.md) |
 
-> **status: public beta mk1.** windows-first, single dev, very much a personal project with too much ambition. mk1 is the same release language my other tools use, and it means exactly this: until now the only eyes and hands on this thing were mine. it works on my desk every day but *obviously* hasn't been tested on yours, and that gap is the whole definition. that goes for getting it onto your desk too: the windows install path has been run end to end here, the linux one has only been tested against synthetic archives, and no razer device has ever been plugged into a linux box running neuron. once it has survived desks that aren't mine, it graduates to mk2. where each feature actually stands, and what evidence is behind each one, is tracked in [state of the project](docs/STATUS.md).
+> **status: beta mk1.** windows-first, single dev, very much a personal project with too much ambition. mk1 is the same release language my other tools use, and it means exactly this: until now the only eyes and hands on this thing were mine. it works on my desk every day but *obviously* hasn't been tested on yours, and that gap is the whole definition. that goes for getting it onto your desk too: the windows install path has been run end to end here, the linux GUI has opened under WSL2 and its CLI has run on Ubuntu 22.04, but no razer device has ever been plugged into a linux box running neuron. once it has survived desks that aren't mine, it graduates to mk2. where each feature actually stands, and what evidence is behind each one, is tracked in [state of the project](docs/STATUS.md).
 
 ---
 
@@ -100,15 +100,15 @@ the script under it does the risky parts and reports plain status lines, one per
 
 ### build
 
-tagged releases publish a windows zip (both binaries) and a linux tarball (the CLI), each with the license bundle, the agent skill, and a `SOURCE.txt` naming the exact commit it was built from. if the releases page is empty, none has been cut yet — build from source below, which is the same thing by hand.
+releases provide a windows installer, a portable windows zip, and a linux tarball. both platform archives contain the app and CLI. each archive includes the license bundle, the agent skill, and a `SOURCE.txt` naming its source commit and build method. if the releases page is empty, build from source below.
 
-the zip is **not code-signed**, and that's a decision rather than an oversight. a certificate that would satisfy SmartScreen costs a few hundred a year *and still* doesn't clear the warning until a build accrues download reputation, so it buys a dialog change, not trust. instead every release carries a **build provenance attestation** — proof, signed by github, that the zip came from a specific commit and workflow run:
+the windows builds are **not code-signed**. windows SmartScreen may warn on first run. check `SHA256SUMS.txt` against the downloaded installer, zip, or tarball, then read the packaged `SOURCE.txt` for the exact commit and build method. github-built artifacts may also carry a provenance attestation; locally built artifacts do not. when an attestation is attached, verify it with:
 
 ```
 gh attestation verify neuron-<version>-windows-x86_64.zip --repo worflor/neuron
 ```
 
-that answers the question a signature only gestures at ("did this really come from that source?"), and you can check it yourself instead of trusting a publisher name. windows will still warn on first run: *more info → run anyway*. the release also ships `SHA256SUMS.txt`.
+the installer places neuron in `%LOCALAPPDATA%\Programs\Neuron` and adds a Start menu shortcut. the zip stays portable: extract it anywhere writable and run `neuron-app.exe`.
 
 ```
 cargo build --release      # -> target/release/neuron.exe (CLI) + neuron-app.exe (GUI)
@@ -188,9 +188,9 @@ what you write stays yours. the checkbox on a pull request gives Woflo Labs enou
 
 the full per-feature status (solid to barely-started) lives in [state of the project](docs/STATUS.md); this section is just the device-write ledger.
 
-the **GUI is windows-only** because that's what i'm on — the tray, the overlays, input synthesis and audio all sit behind seams, and the code behind those seams is win32 today.
+the **linux GUI** runs the same slint window, device settings and lighting editor, with a GTK tray menu and best-effort global hotkeys. it needs GTK 3, AppIndicator, libxdo and libxkbcommon-x11 at runtime (`libxkbcommon-x11-0` on Ubuntu). windows-specific overlays, live input capture/synthesis, and audio controls still need linux backends; the app reports that limitation rather than claiming remaps are armed.
 
-**linux gets the CLI**, and that's a real thing, not a gesture: the whole workspace compiles there, the entire suite passes there on every push, and the hidraw transport is written straight against the kernel's interfaces. the release tarball carries it plus the udev rule you need. what i can't tell you is whether it actually drives your mouse, because i don't have a linux box with a razer device on it — nothing has touched a wire there yet. if you try it, [tell me what happened](https://github.com/worflor/neuron/issues), good or bad. mac is unwritten.
+**linux gets the app and CLI**: the complete workspace is built and tested there, and the hidraw transport uses the kernel's own interfaces. the release tarball carries both binaries and the udev rule you need. what i can't tell you is whether it actually drives your mouse, because i don't have a linux box with a razer device on it — nothing has touched a wire there yet. if you try it, [tell me what happened](https://github.com/worflor/neuron/issues), good or bad. mac is unwritten.
 
 and i'm not pretending this is the most mature or the broadest thing in the space. on linux, [openrazer](https://github.com/openrazer/openrazer) is the real, decade-hardened answer (kernel driver, a couple hundred devices, an actual community), so use it. if you want one panel for every RGB brand under the sun, that's [OpenRGB](https://openrgb.org). neuron is deliberately narrow: one vendor, one desk, gone deep. that narrowness is the point.
 

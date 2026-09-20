@@ -18,6 +18,7 @@
 
 #[cfg(all(windows, feature = "bridge"))]
 fn main() -> anyhow::Result<()> {
+    use std::fmt::Write as _;
     use neuron_host::adapters::chroma_shm::server::{ChromaShmLayer, CreateError, ShmServer};
     use neuron_host::paint::PaintPolicy;
     use neuron_host::api::{HostApi, LeaseSpec, SurfaceKind};
@@ -54,8 +55,8 @@ fn main() -> anyhow::Result<()> {
 
     // 2. Discover real hardware → surfaces with paced HID writers.
     let reg = neuron::registry::Registry::load()?;
-    let host = Host::spawn();
-    let bridged = bridge::attach(&reg, &host.handle(), 30);
+    let host = Host::spawn()?;
+    let bridged = bridge::attach(&reg, &host.handle(), 30)?;
     if bridged.surfaces.is_empty() {
         eprintln!("no bridgeable devices found — nothing to paint.");
         return Ok(());
@@ -179,7 +180,7 @@ fn main() -> anyhow::Result<()> {
                 for a in &acts {
                     let live = last_ts.get(&a.device_type).is_none_or(|&p| a.timestamp_ms != p);
                     last_ts.insert(a.device_type, a.timestamp_ms);
-                    line += &format!(
+                    let _ = write!(line,
                         "{}={}{}  ",
                         device_name(a.device_type),
                         a.effect(),
