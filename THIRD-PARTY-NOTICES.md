@@ -970,9 +970,8 @@ copied from:
 
 ## 6. Source vs. binary releases
 
-mk1 ("public beta mk1") ships as a source checkout: `cargo build --release`
-is the documented install path today. Several obligations in this file only
-bite once Neuron starts shipping prebuilt binaries to other people:
+v0.1.0 ships prebuilt Windows installer and portable ZIP assets as well as source.
+The notices below apply to distributed binaries:
 
 - The embedded-CPython notice (§1) and this file's existence at all matter
   most for a **binary** release, because that is the form in which
@@ -987,7 +986,4 @@ bite once Neuron starts shipping prebuilt binaries to other people:
   from-source build by an end user for their own use does not by itself
   trigger a redistribution obligation; handing a *built* binary to someone
   else does.
-- Nothing in this file changes if mk1 stays source-only for a while longer:
-  it exists now so that whenever prebuilt binaries do start shipping, the
-  obligations are already documented and don't need to be reconstructed
-  under release pressure.
+- The Windows release packages include this file alongside the license bundle.

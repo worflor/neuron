@@ -1,6 +1,6 @@
 # contributing to neuron
 
-neuron is one person, one desk, one vendor gone deep. that's the point, but it also means whole pieces are wide open, and some are shaped so you can own one cleanly without reading the entire tree. if you want to join me in making this actually useful, there's plenty of room. here's how to jump in without friction.
+neuron is a one-person project with room for focused contributions. you can work on a device, lighting pattern, preset, or protocol adapter without learning the whole tree.
 
 ## where the work lives
 
@@ -18,26 +18,22 @@ the honest map, graded by how much groundwork is already done.
 
 ### pieces you can pick up cleanly
 
-- **the parts of a razer device no getter reveals.** a device adopts itself: `synth.rs` probes the getter space, keeps the commands it says yes to, detects its lighting dialect, measures the link's round-trip, and writes a complete def to `devices/auto/razer-<pid>.toml`. what's left for a person is what a device can't be asked about — wire-captured commands like `set_scroll_stage`, side-plate push-report maps, a transaction-id era the heuristic guessed wrong, or a lighting dialect that is neither legacy nor matrix (that one needs rust in `writes.rs`). a curated def in `crates/neuron-core/devices/` shadows the auto one once you've proven something better. `neuron adopt --dry-run` prints the synthesized TOML without writing it, which is how you check synthesis against a device you know, and read-back verify guards every write, so a wrong guess fails loud instead of bricking anything.
+- **the parts of a razer device no getter reveals.** `synth.rs` probes known getter space, keeps supported commands, detects the lighting dialect, measures round-trip time, and writes a device definition to `devices/auto/razer-<pid>.toml`. Hardware still needs a person to verify commands without getters: scroll-stage writes, side-plate reports, transaction IDs, or an unfamiliar lighting dialect. A curated definition in `crates/neuron-core/devices/` shadows an auto one once verified. `neuron adopt --dry-run` prints synthesized TOML without writing it. Unknown writes stay gated; implemented writes read back and report mismatches.
 - **a lighting pattern.** (a new shape and motion, not a firmware effect: no protocol work involved.) one entry in the pattern registry plus the generator (a `field()` that returns brightness per cell). the factory, the tuning knobs, and the gallery tile all derive from that single entry, and a half-registration won't compile. pure math, fully self-contained, a good first PR. claimable as [#13](https://github.com/worflor/neuron/issues/13).
 - **a preset (a look).** pure data: an existing pattern plus a spectrum, a one-line blurb, and the name of the feed it reads (blank if it reads nothing, which also decides its catalog shelf). paint fire with an ocean gradient and it's a new look with zero code. claimable as [#12](https://github.com/worflor/neuron/issues/12).
 - **a protocol adapter for neuron-host.** a small codec that talks to the internal bus. OpenRGB, Chroma (REST and native shared memory) and OBS already exist; wanted next are things like MQTT, WLED, MIDI. well-scoped, with a capture-and-replay harness to prove it.
 
 ### bigger pieces, if you want to own a real chunk
 
-- **the linux / mac port.** the platform-specific parts (HID, audio, the layered overlays, raw input, the window manager) sit behind seams, so porting is a matter of filling those in: a transport, an ALSA/PipeWire/CoreAudio control, a layered-surface backend, an input source, a window-manager impl.
-
-on linux the first of those is done. the whole workspace compiles there, the entire suite passes there on every push (CI runs the same script it runs on windows), and there's a hidraw transport written against the kernel's own interfaces — sysfs enumeration, `HIDIOCGFEATURE`/`HIDIOCSFEATURE`, `flock` for the wire lock — plus a udev rule in `packaging/linux/`. releases ship a linux CLI tarball.
-
-so the two most valuable things you can do here are unglamorous. **one: plug a razer device into a linux box and run it.** nothing in that transport has ever touched a wire; every linux test is against mocks and parsed descriptors. a single "it enumerated, here's what `neuron info` said" is worth more than any amount of further code. **two: the linux GUI** — the app builds but its tray, overlays, input and audio are stubs, so it opens a window that does nothing. that's the welded chunk now, and it's a real project: comment on [#1](https://github.com/worflor/neuron/issues/1) first and we'll agree the shape. mac is a green field; same seams, an IOKit transport instead.
-- **another vendor entirely (logitech and friends).** further along than you'd think: devices speak through a `Dialect` trait, razer is dialect #1, and logitech HID++ 2.0 is already dialect #2 — it claims its pipes, probes, and synthesizes a device def. what it has never had is a real logitech device: every byte layout came from libratbag / Solaar / Logitech's docs and none of it is wire-verified, because there's no logitech gear on this desk. so if you own some, that's the most valuable thing here: [#2](https://github.com/worflor/neuron/issues/2). it's still in *Triage* on the board rather than *Up for grabs*, so comment there first and we'll agree the scope before you start. a whole *new* vendor means writing another `Dialect` impl — a real project, so talk to me about the shape first. if what you actually want is other-brand *lighting*, the far better path, once it exists, is driving those devices through a neuron-host OpenRGB *client* and letting neuron be the sync hub, instead of reverse-engineering each vendor. today neuron-host only runs the OpenRGB *server* side (other tools drive neuron); the client half that would reach out to another OpenRGB-speaking app or device is planned, not built, and it's a well-scoped chunk ([#9](https://github.com/worflor/neuron/issues/9), also still in *Triage*, so comment before starting). one thing to avoid outright: the per-vendor LED-SDK DLLs (the razer/corsair/logitech "chroma-like" SDKs). they're anti-cheat bait and a maintenance sinkhole.
+- **the linux runtime and mac port.** Linux has a hidraw transport and a Slint GUI with device settings, lighting editor, GTK tray, and best-effort global hotkeys. The CLI builds and passes local tests, but v0.1.0 has no Linux package and no Razer hardware verification. Live input, overlays, and audio are being developed on [`codex/linux-runtime-parity`](https://github.com/worflor/neuron/tree/codex/linux-runtime-parity); the overlay still needs visual parity with Windows. A native Linux hardware run is the most useful next check. Mac has no backend yet. Discuss the scope on [#1](https://github.com/worflor/neuron/issues/1) before starting platform work.
+- **another vendor.** Device protocols use a `Dialect` trait. Razer and Logitech HID++ 2.0 dialects exist, but no Logitech device has been tested on hardware; its byte layouts come from libratbag, Solaar and Logitech documentation. If you can test one, start with [#2](https://github.com/worflor/neuron/issues/2). Other-brand lighting can use a future OpenRGB *client* adapter ([#9](https://github.com/worflor/neuron/issues/9)); neuron-host currently provides the server side only. New vendor dialects need design discussion before implementation. Avoid per-vendor LED SDK DLLs because they add driver and maintenance risk.
 
 ## the layout
 
 so you know where things live:
 
 - `neuron-core` is the headless engine (protocol, registry, lighting, the trigger/action spine, gestures, macros) and it's portable by construction.
-- `neuron-app` is the windows GUI and the live driver.
+- `neuron-app` is the GUI and live driver on Windows; its Linux GUI has partial runtime backends.
 - `neuron-cli` is a thin front-end.
 - `neuron-host` is a separate protocol hub (an OpenRGB / Chroma-REST bridge, so neuron can drive a mixed-brand rig).
 - `engram` is the Woflo Labs gesture codec, included under its own terms.
@@ -52,19 +48,19 @@ every change runs the same suite i do. green before you open the PR:
 .\validate.ps1             # the suite. green, or it doesn't go in.
 ```
 
-that's the whole gate, and it's one script on purpose: CI *calls it* instead of listing its own cargo commands, so what you run locally and what runs on your PR can't drift apart. `-Mode full` adds clippy, the feature matrix, a release build, and the ignored tests that don't need hardware. both CI test jobs — windows and linux — run the plain form above, so either one is reproducible locally.
+CI is configured to call the same script instead of maintaining separate cargo commands. `-Mode full` adds Clippy, the feature matrix, a release build, and ignored tests that need no hardware. A local pass checks the code gates; it cannot prove behavior on hardware you did not test.
 
-CI runs on every push and PR — though only when code actually changed, so a docs-only PR won't sit there building rust for ten minutes.
+The CI build jobs are configured for code changes; docs-only changes skip them.
 
-**on linux?** install PowerShell 7 and run `pwsh ./validate.ps1` — same command, and it passes, with no system packages to install first. it runs everything linux ships and skips `neuron-app`, the windows GUI: that crate does compile on linux, but it's all stubs there and building it drags in a fontconfig/X11/Wayland dev stack (install that and run cargo directly if the linux GUI is what you're working on). it also can't prove windows behaviour — a test hitting a win32 seam off windows is asserting the stub — so if you touched input, the overlays, the tray or audio, say in your PR that you couldn't run the windows suite and CI will run it for you. (`-Mode lint` is the rustfmt + shipped-script lane, if you want just that.) on mac, nothing is written yet.
+**on linux?** Install PowerShell 7 and the Slint fontconfig/X11/Wayland and GTK/AppIndicator development libraries, then run `pwsh ./validate.ps1`. The Linux gate includes `neuron-app`. It cannot prove Windows behavior or real-device HID and input behavior. For input, overlays, tray, or audio changes, name the platform and hardware you tested. `-Mode lint` runs the formatting and PowerShell parse checks. Mac has no implementation yet.
 
-**don't run `cargo fmt --all`.** the source is hand-formatted and there's no `rustfmt.toml` pinning that style, so a blanket format rewrites ~1900 sites across the repo and buries your actual change in noise. match the style of the code around you instead. same story with clippy: there are ~120 existing warnings, mostly pedantic, so it's a thing to read rather than a wall to clear — just don't add new ones in code you touch.
+**don't run `cargo fmt --all`.** the source is hand-formatted and there's no `rustfmt.toml` pinning that style, so a blanket format rewrites ~1900 sites across the repo and buries your change in noise. match the surrounding style. Clippy is a gate in full mode; address warnings in code you change.
 
 three hard invariants:
 
 1. **tests may never arm input.** there's a test whose only job is enforcing that. don't break it.
-2. **device writes read-back-verify, or they stay gated.** a write either confirms itself against the device's own bytes, or it lives behind a `NEURON_*_WRITE` gate until a capture proves it. a wrong guess should fail loud, never brick anything.
-3. **more, never bloat.** neuron does a lot on purpose, but every addition earns its place. replacing slop with slop defeats the whole point.
+2. **device writes read-back-verify, or they stay gated.** a write either confirms itself against the device's own bytes, or it lives behind a `NEURON_*_WRITE` gate until a capture proves it. a mismatch must fail loudly; do not infer hardware safety from a passing unit test.
+3. **more, never bloat.** neuron does a lot on purpose, but every addition must justify its complexity and background cost.
 
 the diagnostics bench on the system page is the "prove it works" surface: read-only, always safe, and the fastest way to show a change actually landed on real hardware instead of just compiling.
 

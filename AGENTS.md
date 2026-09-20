@@ -18,9 +18,10 @@ If you only take three things away, take these:
 
 neuron is a tray-resident replacement for Razer Synapse: an app and CLI over one
 core that speaks `razer_report` HID directly. No account, no cloud, no telemetry,
-no kernel driver, no vendor SDK. Windows and Linux ship both executables. Linux
-has a GUI and hidraw transport, but live input, overlays, and audio still need
-native backends; the transport has never touched a real device. Mac is unwritten.
+no kernel driver, no vendor SDK. v0.1.0 ships the Windows app and CLI. Linux
+builds both from source, with a GUI and hidraw transport; its release is deferred
+while live input, overlays, audio, and hardware behavior are verified. Runtime
+backend work is on `codex/linux-runtime-parity`. Mac is unwritten.
 
 The whole product is one primitive:
 
@@ -81,18 +82,18 @@ can be stale. Verify against the tree before you lean on a detail.
 .\validate.ps1
 ```
 
-That compiles the whole workspace and runs the suite — the same definition CI runs, because CI
-literally invokes this script rather than spelling out its own cargo commands. If it
-passes locally it passes in CI, by construction rather than by convention.
+That compiles the whole workspace and runs the suite. The CI workflows invoke
+this script rather than maintaining separate cargo commands. A local pass
+checks the same code gates; it cannot replace a platform or hardware run.
 
 ```powershell
 .\validate.ps1 -Mode full    # + feature matrix, release build, the CI-safe ignored tests
 .\validate.ps1 -Locked       # add --locked, exactly reproducing a CI run
 ```
 
-CI runs exactly this on Windows and on Linux, and only when code actually changed — a
-docs-only push skips the build jobs. Clippy is a gate in full mode; rustfmt remains
-advisory because the source uses an unpinned hand-formatting style.
+The Windows and Linux CI jobs are configured to run this when code changes; a
+docs-only push skips the build jobs. Clippy is a gate in full mode; rustfmt
+remains advisory because the source uses an unpinned hand-formatting style.
 
 **On Linux**, install PowerShell 7 and run the same thing:
 
@@ -140,7 +141,7 @@ exception is `scroll`, which stores onboard by default to match Synapse), re-rea
 matching getter, and hard-error on a mismatch rather than reporting a silent
 success. A capability with no trusted opcode refuses rather than guessing. New writes
 stay behind a `NEURON_*_WRITE` feature gate until a wire capture confirms them. A
-wrong guess must fail loud; it must never brick anything.
+an unverified guess must stay gated, and a read-back mismatch must fail loudly.
 
 **Honesty over polish.** When neuron doesn't know something about the hardware, it
 says so. The README's proven / gated / absent ledger and the grading in

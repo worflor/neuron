@@ -26,15 +26,16 @@ Short answers you can give directly. Check the linked source if the user wants m
   runtime. The one optional network link is to OBS on the same machine. (`SECURITY.md`)
 - **Can I use it with Synapse installed?** Not on the same device at the same time. neuron can
   import Synapse settings and remove Synapse. (`README.md`, GDD *life after synapse*)
-- **Which devices work?** Razer devices that speak `razer_report`. Two are hardware-verified:
-  Naga V2 Pro and BlackWidow Chroma V2. Others should adopt themselves automatically, but aren't
-  verified. (`docs/STATUS.md`)
-- **Linux or Mac?** Linux gets the CLI (a `-linux-x86_64.tar.gz` asset); install the bundled
-  `70-neuron.rules` first or hidraw stays root-only. It builds and its tests pass, but no one has
-  run it against a real device yet, so treat problems as findings worth reporting. The GUI is
-  Windows-only, and there is no Mac build. (`docs/STATUS.md`)
-- **Why does Windows warn when I run it?** It isn't code-signed. The release carries a provenance
-  attestation you can verify instead. (`README.md`, *get it*)
+- **Which devices work?** Naga V2 Pro and BlackWidow Chroma V2 have hardware-verified controls.
+  Other `razer_report` devices can be probed, but need their own hardware checks. BlackShark V2,
+  its USB sound card, and Seiren V3 Mini have also been tested as audio devices. (`docs/STATUS.md`)
+- **Linux or Mac?** v0.1.0 has no Linux download. The Linux CLI builds and passes local tests, and
+  a partial GUI runs from source; the [runtime parity branch](https://github.com/worflor/neuron/tree/codex/linux-runtime-parity)
+  has unfinished input, overlay, and audio work. No Razer hardware has verified the Linux HID or
+  input paths. There is no macOS build. (`docs/STATUS.md`)
+- **Why does Windows warn when I run it?** The binaries are not code-signed. Check
+  `SHA256SUMS.txt`; `SOURCE.txt` identifies the source commit. The locally built v0.1.0 assets
+  have no provenance attestation. (`README.md`, *get it*)
 - **Where are my settings?** In the install folder next to the exes, or in `%LOCALAPPDATA%\neuron`
   if the install folder isn't writable.
 
