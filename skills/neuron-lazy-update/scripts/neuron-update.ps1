@@ -44,7 +44,7 @@ function Finish($code) {
     exit 0
 }
 
-# "v0.1.0-mk1" / "neuron 0.1.0" -> [version]0.1.0
+# "v1.2.3-rc1" / "neuron 1.2.3" -> [version]1.2.3
 function Parse-Version($s) {
     if ($s -match '(\d+)\.(\d+)\.(\d+)') { return [version]("{0}.{1}.{2}" -f $Matches[1], $Matches[2], $Matches[3]) }
     return $null
@@ -379,12 +379,13 @@ if (-not $expected) { Flag 'NOT_IN_CHECKSUMS' "$zipName is not listed in SHA256S
 if ($expected -ne $actual) { Flag 'HASH_MISMATCH' 'the zip does not match its published checksum (STOP). Do not install it.'; Finish 'blocked' }
 Say 'checksum' 'ok'
 
+# Only the locally built stable beta releases through 0.1.2 lack Actions attestations.
+$unattestedLocalBuild = $target -match '^v\d+\.\d+\.\d+$' -and (Parse-Version $target) -le [version]'0.1.2'
 if (-not $ZipPath -and (Get-Command gh -ErrorAction SilentlyContinue)) {
     $ErrorActionPreference = 'Continue'
     $att = & gh attestation verify $zip --repo $Repo 2>&1 | Out-String
     if ($LASTEXITCODE -eq 0) { Say 'attestation' 'ok' }
-    # These locally built releases have no GitHub Actions provenance attestation.
-    elseif ($target -in @('v0.1.0', 'v0.1.1', 'v0.1.2') -and $att -match 'HTTP 404: Not Found.*\/attestations\/sha256:') { Flag 'ATTESTATION_UNAVAILABLE' "$target has no provenance attestation. The checksum matched, but build provenance could not be verified." }
+    elseif ($unattestedLocalBuild -and $att -match 'HTTP 404: Not Found.*\/attestations\/sha256:') { Flag 'ATTESTATION_UNAVAILABLE' "$target has no provenance attestation. The checksum matched, but build provenance could not be verified." }
     elseif ($att -match 'auth login|not logged') { Flag 'ATTESTATION_SKIPPED' 'gh is installed but not logged in, so provenance was not checked. The checksum still matched.' }
     else { Flag 'ATTESTATION_FAILED' "gh attestation verify failed (STOP): $($att.Trim())"; Finish 'blocked' }
 } elseif (-not $ZipPath) {

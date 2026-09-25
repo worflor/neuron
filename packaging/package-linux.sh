@@ -4,13 +4,25 @@
 # Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
 
 set -euo pipefail
-version="${1:-v0.1.2}"
-[[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]] || {
-    echo 'version must look like v0.1.2 or v0.1.2-rc1' >&2
-    exit 2
-}
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo"
+package_id="$(cargo pkgid -p neuron-cli --locked)"
+[[ "$package_id" =~ \#([0-9]+\.[0-9]+\.[0-9]+)$ ]] || {
+    echo 'could not read the workspace version from cargo' >&2
+    exit 2
+}
+workspace_version="${BASH_REMATCH[1]}"
+version="${1:-v$workspace_version}"
+[[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]] || {
+    echo 'version must look like v1.2.3 or v1.2.3-rc1' >&2
+    exit 2
+}
+package_version="${version#v}"
+package_version="${package_version%%-*}"
+[[ "$package_version" == "$workspace_version" ]] || {
+    echo "package version $version does not match workspace v$workspace_version" >&2
+    exit 2
+}
 head="$(git rev-parse HEAD)"
 dirty=clean
 if [[ -n "$(git status --porcelain)" ]]; then
@@ -30,6 +42,10 @@ app="$CARGO_TARGET_DIR/release/neuron-app"
 for bin in "$cli" "$app"; do
     [[ -x "$bin" ]] || { echo "release binary missing: $bin" >&2; exit 2; }
 done
+[[ "$("$cli" --version)" == "neuron $workspace_version" ]] || {
+    echo "release CLI version does not match package $version" >&2
+    exit 2
+}
 floor="$(readelf -W --version-info "$cli" "$app" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -Vu | tail -1)"
 [[ -n "$floor" ]] || { echo 'could not determine glibc requirement' >&2; exit 2; }
 
@@ -52,7 +68,7 @@ Neuron $version — Linux x86_64 app and CLI
 Repository: https://github.com/worflor/neuron
 Commit: $head
 Build: local Linux release
-Working tree at build: $dirty
+Working tree at packaging: $dirty
 ELF glibc symbol floor: $floor
 
 Run ./neuron-app for the GUI or ./neuron for the CLI. The GUI needs GTK 3,

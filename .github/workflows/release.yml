@@ -4,13 +4,13 @@
 
 # Cut a release.
 #
-# Runs only on a pushed version tag (`v0.1.0`, `v0.2.0-mk1`, …) or a manual
+# Runs only on a pushed version tag or a manual
 # `workflow_dispatch` - never on push to main or on pull requests; `ci.yml` covers those.
 #
 # Windows release, three stages:
 #
 #   preflight (linux, ~10s)  - the refusals: tag vs Cargo version, private repo
-#     +-- windows            - the app + the CLI, zipped
+#     +-- windows            - installer + portable ZIP
 #           +-- publish      - one checksum file, one attestation pass, one draft release
 #
 # The build job uploads an artifact and publishes nothing until the final stage.
@@ -32,9 +32,8 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version label for a manual build (e.g. v0.1.0-test)"
-        required: true
-        default: v0.0.0-dev
+        description: "Version label for a manual build (defaults to the workspace version)"
+        required: false
 
 permissions:
   contents: write # create the release + upload assets
@@ -54,21 +53,31 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # A release must never ship a version that disagrees with the binary. `neuron --version`
-      # reports Cargo.toml's workspace version, so the tag has to say the same thing.
-      - name: Tag matches Cargo version
-        if: github.event_name == 'push'
+      # A release label must agree with the binary version, whether tagged or manual.
+      - name: Resolve and verify version
+        id: v
         shell: bash
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF#refs/tags/}"
-          cargo_ver="v$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
-          # `v0.1.0` and suffixed labels like `v0.1.0-mk1` both match Cargo `0.1.0`.
-          if [ "${tag%%-*}" != "$cargo_ver" ]; then
-            echo "::error::tag $tag does not match Cargo.toml's workspace version ($cargo_ver). Bump [workspace.package] version, commit, then tag."
+          package_id="$(cargo pkgid -p neuron-cli --locked)"
+          if [[ ! "$package_id" =~ \#([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "::error::could not read the workspace version from cargo"
             exit 1
           fi
-          echo "tag $tag matches Cargo $cargo_ver"
+          cargo_ver="v${BASH_REMATCH[1]}"
+          if [ "${{ github.event_name }}" = "push" ]; then
+            version="${GITHUB_REF#refs/tags/}"
+          else
+            version="${REQUESTED_VERSION:-$cargo_ver}"
+          fi
+          if [[ ! "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]] ||
+             [ "${version%%-*}" != "$cargo_ver" ]; then
+            echo "::error::release label $version does not match workspace version $cargo_ver"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
       # Provenance attestations only work on public repos. SOURCE.txt tells users to verify
       # one, so a tagged release from a private repo would ship a promise it can't keep. Tag
@@ -80,16 +89,6 @@ jobs:
         run: |
           echo "::error::this repo is private, so the build provenance attestation cannot be created. Make the repo public, then push the tag again."
           exit 1
-
-      - name: Resolve version
-        id: v
-        shell: bash
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "version=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
-          fi
 
   windows:
     name: windows x86_64
@@ -131,58 +130,19 @@ jobs:
         shell: pwsh
         run: ./validate.ps1 -Mode full
 
-      # -Mode full already produced the release binaries; this is a cached no-op so the
-      # packaging step below never depends on that implementation detail.
-      - name: build
-        run: cargo build --release --workspace --locked
-
-      - name: build protected Chroma broker
-        run: cargo build --release -p neuron-host --features bridge --bin neuron-chroma-broker --locked
-
-      # Stage the zip. The license bundle ships with the binary, not just in the repo: neuron
-      # is GPL-3.0-or-later, so a binary release carries its terms and a pointer back to the
-      # exact source it was built from.
-      - name: Stage the package
-        shell: bash
-        run: |
-          set -euo pipefail
-          name="neuron-${{ needs.preflight.outputs.version }}-windows-x86_64"
-          mkdir -p "dist/$name"
-          cp target/release/neuron-app.exe "dist/$name/"
-          cp target/release/neuron.exe     "dist/$name/"
-          cp target/release/neuron-chroma-broker.exe "dist/$name/"
-          cp packaging/windows/install-chroma-broker.ps1 "dist/$name/"
-          cp README.md CHANGELOG.md LICENSE.md THIRD-PARTY-NOTICES.md SECURITY.md "dist/$name/"
-          cp -r LICENSES "dist/$name/"
-          cp -r skills "dist/$name/"
-          cp -r docs "dist/$name/"
-          cat > "dist/$name/SOURCE.txt" <<EOF
-          neuron ${{ needs.preflight.outputs.version }} — windows x86_64
-
-          Built by GitHub Actions from:
-            repository : ${{ github.server_url }}/${{ github.repository }}
-            commit     : ${{ github.sha }}
-            source     : ${{ github.server_url }}/${{ github.repository }}/tree/${{ github.sha }}
-            run        : ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-
-          This build is NOT code-signed. Windows SmartScreen will warn on first run;
-          "More info" -> "Run anyway". Rather than trusting that dialog, verify the build
-          provenance — it proves this binary came from the commit above:
-
-            gh attestation verify $name.zip --repo ${{ github.repository }}
-
-          Corresponding source for this binary is the commit linked above, per GPL-3.0-or-later.
-          EOF
-          echo "name=$name" >> "$GITHUB_ENV"
-
-      - name: Zip
+      # The same package script used for local smoke builds creates both assets.
+      - name: Package installer and portable ZIP
         shell: pwsh
-        run: Compress-Archive -Path "dist/$env:name" -DestinationPath "dist/$env:name.zip"
+        env:
+          CARGO_TARGET_DIR: target
+        run: ./packaging/package-windows.ps1 -Version '${{ needs.preflight.outputs.version }}'
 
       - uses: actions/upload-artifact@v4
         with:
           name: package-windows
-          path: dist/${{ env.name }}.zip
+          path: |
+            dist/*-setup.exe
+            dist/*.zip
           if-no-files-found: error
 
   publish:
@@ -206,7 +166,7 @@ jobs:
           set -euo pipefail
           cd dist
           ls -l
-          sha256sum neuron-*-*.zip > SHA256SUMS.txt
+          sha256sum neuron-*-windows-x86_64-setup.exe neuron-*-windows-x86_64.zip > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       # Signed provenance tying each artifact to this commit + this workflow. Verify with
@@ -216,6 +176,7 @@ jobs:
         uses: actions/attest-build-provenance@v4
         with:
           subject-path: |
+            dist/*-setup.exe
             dist/*.zip
 
       - name: Warn when there is no attestation
@@ -237,7 +198,7 @@ jobs:
           # Hand-written notes in .github/releases/<tag>.md win; otherwise GitHub generates them.
           notes=".github/releases/${VERSION}.md"
           if [ -f "$notes" ]; then notes_args=(--notes-file "$notes"); else notes_args=(--generate-notes); fi
-          assets=(dist/*.zip dist/SHA256SUMS.txt)
+          assets=(dist/*-setup.exe dist/*.zip dist/SHA256SUMS.txt)
           gh release create "$VERSION" "${assets[@]}" \
             --draft \
             --title "neuron $VERSION" \

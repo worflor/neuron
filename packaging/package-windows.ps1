@@ -3,18 +3,35 @@
 # Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
 
 param(
-    [string]$Version = 'v0.1.2',
+    [string]$Version,
     [switch]$SkipBuild,
     [switch]$AllowDirty
 )
 
 $ErrorActionPreference = 'Stop'
+$repo = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+$packageId = (& cargo pkgid --manifest-path (Join-Path $repo 'Cargo.toml') -p neuron-cli --locked).Trim()
+if ($LASTEXITCODE -ne 0 -or $packageId -notmatch '#(\d+\.\d+\.\d+)$') {
+    throw 'could not read the workspace version from cargo'
+}
+$workspaceVersion = $Matches[1]
+if (-not $Version) { $Version = "v$workspaceVersion" }
 if ($Version -notmatch '^v(\d+\.\d+\.\d+)(?:-[A-Za-z0-9.-]+)?$') {
-    throw "version must look like v0.1.2 or v0.1.2-rc1"
+    throw 'version must look like v1.2.3 or v1.2.3-rc1'
 }
 $appVersion = $Matches[1]
-$repo = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$target = Join-Path $repo 'target-lane-release-static'
+if ($appVersion -ne $workspaceVersion) {
+    throw "package version $Version does not match workspace v$workspaceVersion"
+}
+$target = if ($env:CARGO_TARGET_DIR) {
+    if ([IO.Path]::IsPathRooted($env:CARGO_TARGET_DIR)) {
+        [IO.Path]::GetFullPath($env:CARGO_TARGET_DIR)
+    } else {
+        [IO.Path]::GetFullPath((Join-Path $repo $env:CARGO_TARGET_DIR))
+    }
+} else {
+    Join-Path $repo 'target-lane-release-static'
+}
 $dist = Join-Path $repo 'dist'
 $name = "neuron-$Version-windows-x86_64"
 $stage = Join-Path $dist $name
@@ -49,6 +66,10 @@ try {
             throw "release binary missing: $exe"
         }
     }
+    $cliVersion = (& (Join-Path $bin 'neuron.exe') --version).Trim()
+    if ($LASTEXITCODE -ne 0 -or $cliVersion -ne "neuron $appVersion") {
+        throw "release CLI version does not match package $Version`: $cliVersion"
+    }
 
     New-Item -ItemType Directory -Force -Path $dist | Out-Null
     if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
@@ -69,16 +90,26 @@ try {
         Copy-Item -LiteralPath $sourcePath -Destination $destinationPath
     }
 
+    $buildMethod = if ($env:GITHUB_ACTIONS -eq 'true') {
+        'GitHub Actions Windows MSVC release, static C runtime'
+    } else {
+        'local Windows MSVC release, static C runtime'
+    }
+    $provenance = if ($env:GITHUB_ACTIONS -eq 'true') {
+        'If attached to the release, verify the GitHub Actions provenance attestation.'
+    } else {
+        'This build has no GitHub Actions provenance attestation.'
+    }
     $source = @"
 Neuron $Version — Windows x86_64
 Repository: https://github.com/worflor/neuron
 Commit: $head
-Build: local Windows MSVC release, static C runtime
-Working tree at build: $(if ($dirty) { 'modified' } else { 'clean' })
+Build: $buildMethod
+Working tree at packaging: $(if ($dirty) { 'modified' } else { 'clean' })
 
-This build has no GitHub Actions provenance attestation. Check SHA256SUMS.txt
-against the downloaded files and review the source commit above. The binary is
-not code signed. The matching source and license terms are in the repository.
+$provenance Check SHA256SUMS.txt against the downloaded files and review the
+source commit above. The binary is not code signed. The matching source and
+license terms are in the repository.
 "@
     [IO.File]::WriteAllText((Join-Path $stage 'SOURCE.txt'), $source,
         [Text.UTF8Encoding]::new($false))
@@ -87,7 +118,13 @@ not code signed. The matching source and license terms are in the repository.
 
     $iscc = (Get-Command ISCC.exe -ErrorAction SilentlyContinue | Select-Object -First 1).Source
     if (-not $iscc) {
-        $iscc = Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe'
+        foreach ($candidate in @(
+            (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe'),
+            (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'),
+            (Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe')
+        )) {
+            if (Test-Path -LiteralPath $candidate) { $iscc = $candidate; break }
+        }
     }
     if (-not (Test-Path -LiteralPath $iscc)) {
         throw 'Inno Setup 6 compiler missing (install JRSoftware.InnoSetup)'
@@ -97,7 +134,13 @@ not code signed. The matching source and license terms are in the repository.
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $setup)) {
         throw 'Windows installer compilation failed'
     }
-    Write-Host "Packaged $zip and $setup"
+    $checksums = @($setup, $zip) | ForEach-Object {
+        '{0}  {1}' -f (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash.ToLowerInvariant(),
+            (Split-Path -Leaf $_)
+    }
+    [IO.File]::WriteAllText((Join-Path $dist 'SHA256SUMS.txt'),
+        (($checksums -join "`n") + "`n"), [Text.UTF8Encoding]::new($false))
+    Write-Host "Packaged $setup, $zip and SHA256SUMS.txt"
 } finally {
     Pop-Location
 }

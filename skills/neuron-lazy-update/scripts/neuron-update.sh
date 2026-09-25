@@ -88,7 +88,7 @@ sha256_of() {
     fi
 }
 
-# "v0.1.0-mk1" / "neuron 0.1.0" -> "0.1.0". Empty when there is no version-shaped substring.
+# "v1.2.3-rc1" / "neuron 1.2.3" -> "1.2.3". Empty when there is no version-shaped substring.
 parse_version() {
     printf '%s' "$1" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1
 }
