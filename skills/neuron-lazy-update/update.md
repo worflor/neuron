@@ -7,7 +7,7 @@ The released Windows package uses the updater script in this skill's `scripts/` 
 | Windows | `neuron-update.ps1` | the Windows PowerShell that comes with Windows |
 | Linux (future package) | `neuron-update.sh` | bash, with `curl` and `tar` |
 
-v0.1.1 has no Linux asset. **Do not run the Linux updater against that release.** The Linux
+No Linux asset is published yet. **Do not run the Linux updater against a Windows-only release.** The Linux
 script and archive steps below are for a future packaged release. For now, build from source as
 described in the [README](../../README.md).
 
@@ -96,7 +96,7 @@ moves config to a second location.
 
 ### Linux
 
-There is no Linux release asset to install or update in v0.1.1. Build from source using the
+There is no Linux release asset to install or update yet. Build from source using the
 [README](../../README.md). The GUI exists but its live input, overlay, and audio paths are
 incomplete on `main`. The updater script remains for a future Linux package.
 
@@ -182,7 +182,7 @@ from the build directory; ask before removing either.
 | `RELAUNCH_SKIPPED` | the updater is elevated, so relaunch would inherit administrator privileges | start neuron from a normal PowerShell after the update |
 | `SOURCE_BUILD` | developer build | see **Source builds** |
 | `NO_SOURCE_TXT` | not installed from a release zip | fine; version shown is best effort |
-| `ATTESTATION_UNAVAILABLE` | the locally built v0.1.0 and v0.1.1 assets have no provenance attestation | the checksum matched; tell the user build provenance was not verified |
+| `ATTESTATION_UNAVAILABLE` | the locally built v0.1.0, v0.1.1, and v0.1.2 assets have no provenance attestation | the checksum matched; tell the user build provenance was not verified |
 | `ATTESTATION_SKIPPED` | `gh` isn't logged in, so provenance wasn't checked | the checksum matched; tell the user provenance was not verified |
 | `SAME_VERSION` | reinstalling the version already there | fine |
 | `CLI_VERSION_MISMATCH` | `neuron.exe` reports a different version than the release | report it; it may be a packaging mistake |
@@ -228,7 +228,7 @@ yet**. Say so honestly; the user is not doing something wrong, they are first. S
 
 ## Doing it by hand
 
-For a future Linux release archive, the script can perform these steps. v0.1.1 has no such asset.
+For a future Linux release archive, the script can perform these steps. No such asset is published yet.
 
 ```bash
 sha256sum -c SHA256SUMS.txt --ignore-missing   # must say OK, or stop

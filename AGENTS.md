@@ -19,7 +19,7 @@ If you only take three things away, take these:
 neuron is a tray-resident replacement for Razer Synapse: an app and CLI over one
 core that speaks `razer_report` HID directly. An experimental Logitech HID++ dialect
 does read-only adoption without hardware verification. No account, no cloud, no telemetry,
-no kernel driver, no vendor SDK. v0.1.1 ships the Windows app and CLI. Linux
+no kernel driver, no vendor SDK. Windows ships the app and CLI. Linux
 builds both from source, with a GUI and hidraw transport; its release is deferred
 while live input, overlays, audio, and hardware behavior are verified. Runtime
 backend work is on `codex/linux-runtime-parity`. Mac is unwritten.

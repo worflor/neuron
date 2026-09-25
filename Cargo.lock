@@ -3582,7 +3582,7 @@ dependencies = [
 
 [[package]]
 name = "neuron"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "dirs",
@@ -3604,7 +3604,7 @@ dependencies = [
 
 [[package]]
 name = "neuron-app"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "cpal",
@@ -3627,7 +3627,7 @@ dependencies = [
 
 [[package]]
 name = "neuron-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -3640,7 +3640,7 @@ dependencies = [
 
 [[package]]
 name = "neuron-host"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "ctor 0.2.9",
@@ -3655,7 +3655,7 @@ dependencies = [
 
 [[package]]
 name = "neuron-testkit"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "flate2",

@@ -57,6 +57,18 @@ Limited. The tray retries native attachment when the broker starts after it. A s
 Windows account that elevates through a different administrator account cannot use this
 same-user broker task yet; REST remains available.
 
+Neuron’s tray and protocol processing run without administrator privileges. The optional
+Windows broker only creates and holds the fixed native Chroma sections; frame parsing,
+lighting arbitration, and device access remain in the regular runtime. The broker must
+not load user configuration, execute macros, accept general commands, or become a shared
+privileged backend for other features.
+
+The current broker uses a protected executable and an elevated task tied to the installing
+account. This deployment requires administrator-managed updates and does not support
+standard accounts using another account’s administrator credentials. Live game
+compatibility and demand for those account configurations should guide whether to replace
+it with an installer-managed service using only the required privileges.
+
 ## Local Chroma lab
 
 The `bridge` test suite uses captured native section bytes and synthetic local objects. It can

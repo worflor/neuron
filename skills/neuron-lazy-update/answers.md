@@ -30,7 +30,7 @@ Short answers you can give directly. Check the linked source if the user wants m
 - **Which devices work?** Naga V2 Pro and BlackWidow Chroma V2 have hardware-verified controls.
   Other `razer_report` devices can be probed, but need their own hardware checks. BlackShark V2,
   its USB sound card, and Seiren V3 Mini have also been tested as audio devices. (`docs/STATUS.md`)
-- **Linux or Mac?** v0.1.1 has no Linux download. The Linux CLI builds and passes local tests, and
+- **Linux or Mac?** No Linux download is published yet. The Linux CLI builds and passes local tests, and
   a partial GUI runs from source; the [runtime parity branch](https://github.com/worflor/neuron/tree/codex/linux-runtime-parity)
   has unfinished input, overlay, and audio work. No Razer hardware has verified the Linux HID or
   input paths. There is no macOS build. (`docs/STATUS.md`)

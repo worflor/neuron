@@ -384,7 +384,7 @@ if (-not $ZipPath -and (Get-Command gh -ErrorAction SilentlyContinue)) {
     $att = & gh attestation verify $zip --repo $Repo 2>&1 | Out-String
     if ($LASTEXITCODE -eq 0) { Say 'attestation' 'ok' }
     # These locally built releases have no GitHub Actions provenance attestation.
-    elseif ($target -in @('v0.1.0', 'v0.1.1') -and $att -match 'HTTP 404: Not Found.*\/attestations\/sha256:') { Flag 'ATTESTATION_UNAVAILABLE' "$target has no provenance attestation. The checksum matched, but build provenance could not be verified." }
+    elseif ($target -in @('v0.1.0', 'v0.1.1', 'v0.1.2') -and $att -match 'HTTP 404: Not Found.*\/attestations\/sha256:') { Flag 'ATTESTATION_UNAVAILABLE' "$target has no provenance attestation. The checksum matched, but build provenance could not be verified." }
     elseif ($att -match 'auth login|not logged') { Flag 'ATTESTATION_SKIPPED' 'gh is installed but not logged in, so provenance was not checked. The checksum still matched.' }
     else { Flag 'ATTESTATION_FAILED' "gh attestation verify failed (STOP): $($att.Trim())"; Finish 'blocked' }
 } elseif (-not $ZipPath) {

@@ -6,7 +6,9 @@
 - Added software and opt-in WGPU renderers. OpenGL remains the default after higher WGPU idle use in local profiling.
 - Hardened Razer replies, HID++ adoption, and device write verification; fixed intercepted-key release and sniper DPI restoration on the correct mouse.
 - Serialized profile updates and migration across processes; unresolved recovery errors now stop loading or startup.
-- Replaced elevated autostart with a limited task, paused writes in safe mode, and added an administrator-installed Chroma shared-memory broker.
+- Changed Windows autostart to run without administrator privileges.
+- Safe mode now starts with input disarmed and device writes paused.
+- Added an optional Windows broker for native Chroma shared memory.
 - Bounded integration clients, validated OBS input, fixed Chroma RGB decoding, and preserved local edits during Linux updater rollback.
 
 ## v0.1.1
