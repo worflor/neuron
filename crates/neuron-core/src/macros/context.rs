@@ -5,19 +5,17 @@
 //! The macro Context API — the world a macro reacts to.
 //!
 //! A context-aware macro asks "where am I?" before it acts: which app is focused, what's the
-//! window title, what folder is Explorer showing, what's on the clipboard, what text is
-//! selected, and which window had focus *before* this macro fired (so it can restore it after a
+//! window title, what folder is Explorer showing, what's on the clipboard, and which window had
+//! focus *before* this macro fired (so it can restore it after a
 //! sub-second in-game action). This struct is the `ctx` the `neuron-macro` prelude exposes.
 //!
 //! The fields are a SNAPSHOT (captured once when a trigger fires) so a macro sees a consistent
 //! world. The `capture()` constructor reads the live OS state.
 //!
-//! Windows implementations are REAL here (the spine handed over stubs; the macro agent wired the
-//! actual Win32 calls): `GetForegroundWindow`/`GetWindowTextW` for the title, the clipboard via
-//! `OpenClipboard`+`CF_UNICODETEXT`, the foreground HWND captured as an `isize` and restored with
-//! `SetForegroundWindow`. The Explorer-path and selection probes are best-effort and degrade to
-//! `None` when not resolvable (Explorer-path needs the shell-windows COM walk; selection needs a
-//! guarded clipboard probe) — never panicking. On non-Windows everything is `None`.
+//! Windows captures use `GetForegroundWindow`/`GetWindowTextW` for the title, read-only clipboard
+//! access, and a best-effort Explorer path. Live selection is deliberately unavailable: probing
+//! it by sending Copy would change the user's clipboard. Synthetic contexts may supply selection.
+//! On non-Windows the platform probes return `None`.
 
 /// An opaque OS window handle, captured so focus can be restored later. Stored as a pointer-
 //  sized integer to stay `Copy`/serde-free and platform-neutral at this layer.
@@ -44,8 +42,8 @@ pub struct Context {
     pub cwd: Option<std::path::PathBuf>,
     /// Current clipboard text (Unicode). `None` if empty / non-text.
     pub clipboard: Option<String>,
-    /// The currently-selected text, if obtainable (UI Automation / clipboard probe). `None`
-    /// if no selection or not resolvable.
+    /// Selected text supplied by a synthetic context. Live capture leaves this `None` because
+    /// obtaining it through Copy would change the user's clipboard.
     pub selection: Option<String>,
     /// The window that had focus when the trigger fired — restore it after the macro
     /// (`restore_foreground`). Default = null handle.
@@ -73,7 +71,7 @@ impl Context {
         Context {
             cwd: explorer_path(app.as_deref(), window_title.as_deref()),
             clipboard: clipboard_text(),
-            selection: selection_text(),
+            selection: None,
             app,
             window_title,
             prev_window,
@@ -244,15 +242,6 @@ fn clipboard_text() -> Option<String> {
 }
 
 #[cfg(windows)]
-fn selection_text() -> Option<String> {
-    // A reliable selection probe means synthesizing Ctrl+C and reading the clipboard back — but
-    // that MUTATES the user's clipboard and only works in apps that honor copy, so it is unsafe to
-    // do implicitly inside a read-only `capture()`. We leave selection as None here; a macro that
-    // genuinely wants the selection calls the prelude's explicit (clipboard-clobbering) helper.
-    None
-}
-
-#[cfg(windows)]
 fn foreground_window() -> WindowHandle {
     use windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
     unsafe { WindowHandle(GetForegroundWindow() as isize) }
@@ -279,10 +268,6 @@ fn explorer_path(_app: Option<&str>, _title: Option<&str>) -> Option<std::path::
 }
 #[cfg(not(windows))]
 fn clipboard_text() -> Option<String> {
-    None
-}
-#[cfg(not(windows))]
-fn selection_text() -> Option<String> {
     None
 }
 #[cfg(not(windows))]

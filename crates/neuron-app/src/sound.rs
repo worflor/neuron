@@ -22,12 +22,28 @@ const RING: usize = 256; // power of two
 const MASK: usize = RING - 1;
 const MAX_VOICES: usize = 24; // generous polyphony for overlapping rings; excess strikes are dropped
 
-/// Shared between the producer (engine thread) and the consumer (audio callback). Only `head` and
-/// `volume` cross threads atomically; the slots carry packed notes.
+/// Shared between the producer (engine thread) and the consumer (audio callback). The cursors and
+/// volume cross threads atomically; the slots carry packed notes.
 struct Shared {
     slots: [AtomicU64; RING],
     head: AtomicUsize,  // producer's write cursor (monotonic)
+    tail: AtomicUsize,  // consumer's read cursor (monotonic)
     volume: AtomicU32,  // master gain, f32 bits, 0..1
+}
+
+impl Shared {
+    // On overload, reject the newest note so unread notes remain intact and in order.
+    fn try_push(&self, head: &mut usize, packed: u64) -> bool {
+        let tail = self.tail.load(Ordering::Acquire);
+        if head.wrapping_sub(tail) >= RING {
+            return false;
+        }
+
+        self.slots[*head & MASK].store(packed, Ordering::Relaxed);
+        *head = head.wrapping_add(1);
+        self.head.store(*head, Ordering::Release);
+        true
+    }
 }
 
 /// Pack a note into one 64-bit word: freq (f32 bits) | velocity (u8) | timbre id (u8) | delay ms (u16).
@@ -66,6 +82,7 @@ impl SoundEngine {
         let shared = Arc::new(Shared {
             slots: std::array::from_fn(|_| AtomicU64::new(0)),
             head: AtomicUsize::new(0),
+            tail: AtomicUsize::new(0),
             volume: AtomicU32::new(volume.clamp(0.0, 1.0).to_bits()),
         });
         let fmt = supported.sample_format();
@@ -90,10 +107,8 @@ impl SoundEngine {
 
     /// Schedule a note: `freq` Hz, `vel` 0..1, palette `tid`, sounding after `delay_ms`. Lock-free.
     pub fn strike(&mut self, freq: f32, vel: f32, tid: u8, delay_ms: u16) {
-        let i = self.head & MASK;
-        self.shared.slots[i].store(pack(freq, vel, tid, delay_ms), Ordering::Relaxed);
-        self.head = self.head.wrapping_add(1);
-        self.shared.head.store(self.head, Ordering::Release);
+        self.shared
+            .try_push(&mut self.head, pack(freq, vel, tid, delay_ms));
     }
 
     /// Live master volume (0..1).
@@ -133,6 +148,7 @@ where
                         voices.push(Voice::strike_after(freq, vel, Timbre::by_id(tid), sr, delay));
                     }
                 }
+                shared.tail.store(tail, Ordering::Release);
                 let vol = f32::from_bits(shared.volume.load(Ordering::Relaxed));
                 for frame in out.chunks_mut(channels) {
                     let mut s = 0.0f32;
@@ -153,4 +169,53 @@ where
             None,
         )
         .ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shared() -> Shared {
+        Shared {
+            slots: std::array::from_fn(|_| AtomicU64::new(0)),
+            head: AtomicUsize::new(0),
+            tail: AtomicUsize::new(0),
+            volume: AtomicU32::new(1.0f32.to_bits()),
+        }
+    }
+
+    #[test]
+    fn full_ring_drops_new_note_without_overwriting_unread_notes() {
+        let ring = shared();
+        let mut head = 0;
+
+        for note in 1..=RING as u64 {
+            assert!(ring.try_push(&mut head, note));
+        }
+        assert!(!ring.try_push(&mut head, RING as u64 + 1));
+        assert_eq!(ring.head.load(Ordering::Acquire), RING);
+
+        for tail in 0..RING {
+            assert_eq!(ring.slots[tail & MASK].load(Ordering::Relaxed), tail as u64 + 1);
+        }
+    }
+
+    #[test]
+    fn consumed_slots_can_be_reused_after_wraparound() {
+        let ring = shared();
+        let mut head = 0;
+
+        for note in 1..=RING as u64 {
+            assert!(ring.try_push(&mut head, note));
+        }
+        let mut tail = 0;
+        let published_head = ring.head.load(Ordering::Acquire);
+        assert_eq!(published_head - tail, RING);
+        tail = published_head;
+        ring.tail.store(tail, Ordering::Release);
+
+        assert!(ring.try_push(&mut head, RING as u64 + 1));
+        assert_eq!(ring.slots[0].load(Ordering::Relaxed), RING as u64 + 1);
+        assert_eq!(ring.head.load(Ordering::Acquire), RING + 1);
+    }
 }

@@ -6,12 +6,8 @@
 //! the generated component API (set properties, invoke callbacks, assert state). This exercises the
 //! actual `.slint` view and the Rust↔UI glue contract — the previously-untested surface.
 //!
-//! Two tiers:
-//!   * a HEADLESS LAUNCH SMOKE test — build the window + install the full glue, prove it doesn't
-//!     panic and the engine populated the view models. Skips gracefully if no windowing backend is
-//!     available (CI without a display), so it never spuriously fails the build.
-//!   * STATE-DRIVE tests — invoke real callbacks (page nav, diagnostics, macro dry-run, the safety
-//!     gate, sector count) and assert the resulting `State` — the behaviour the user sees.
+//! Each window test runs in its own process on Windows. Slint supplies only one usable window per
+//! test process here, so running the tests together used to report green after skipping assertions.
 //!
 //! All driving happens on the test thread, which Slint treats as the UI thread once a backend is
 //! initialized; no event loop needs to spin for property/callback access.
@@ -63,10 +59,54 @@ fn try_window() -> Option<AppWindow> {
 /// Whether this process has already handed out its one window. See [`try_window`].
 static WINDOW_TAKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+#[test]
+fn gui_tests_in_fresh_processes() {
+    use std::process::Command;
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
+        assert!(
+            std::env::var_os("NEURON_REQUIRE_GUI").is_none(),
+            "NEURON_REQUIRE_GUI is set but no Linux display is available"
+        );
+        eprintln!("GUI child tests skipped: no Linux display is available");
+        return;
+    }
+    let exe = std::env::current_exe().expect("current test executable");
+    let listing = Command::new(&exe)
+        .args(["--list", "--ignored", "apptest::"])
+        .output()
+        .expect("list isolated GUI tests");
+    assert!(listing.status.success(), "libtest could not list the GUI tests");
+    let names: Vec<_> = String::from_utf8_lossy(&listing.stdout)
+        .lines()
+        .filter_map(|line| line.strip_suffix(": test"))
+        .filter(|name| name.starts_with("apptest::"))
+        .map(str::to_owned)
+        .collect();
+    assert!(names.len() >= 25, "only {} GUI tests found", names.len());
+    let mut failures = Vec::new();
+    for name in names {
+        let output = Command::new(&exe)
+            .args(["--ignored", "--exact", &name])
+            .env("NEURON_REQUIRE_GUI", "1")
+            .output()
+            .expect("launch isolated GUI test");
+        if !output.status.success() || !String::from_utf8_lossy(&output.stdout).contains("running 1 test") {
+            failures.push(format!(
+                "{name}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "GUI tests failed:\n{}", failures.join("\n"));
+}
+
 /// Headless launch smoke: build the window, install the whole glue, and confirm the engine pushed
 /// real data into the view (devices model + effects exist as models, status is set). This is the
 /// "the GUI actually comes up wired to the core" guarantee.
 #[test]
+#[ignore = "run by gui_tests_in_fresh_processes"]
 fn headless_launch_smoke() {
     let Some(app) = try_window() else {
         eprintln!("skipping: no windowing backend available");
@@ -90,6 +130,7 @@ fn headless_launch_smoke() {
 /// Four sections (DEVICE / LIGHTING / INPUT / SYSTEM); INPUT has two depths via `input-view`;
 /// profiles open as a SHEET, not a page.
 #[test]
+#[ignore = "run by gui_tests_in_fresh_processes"]
 fn nav_pages_switch() {
     let Some(app) = try_window() else { return };
     let _shared = glue::install(&app);
@@ -116,6 +157,7 @@ fn nav_pages_switch() {
 // lock; taking it keeps the window exclusive. Found via an intermittent auto-switch failure
 // that looked like a routing bug.
 #[test]
+#[ignore = "run by gui_tests_in_fresh_processes"]
 fn safety_gate_toggles() {
     let _cwd = crate::testsupport::cwd_guard("apptest_safety_gate");
     let Some(app) = try_window() else { return };
@@ -134,6 +176,7 @@ fn safety_gate_toggles() {
 /// here, because firing it to ARM would set the process-wide gate that could let a concurrent macro
 /// test inject. Disarming-direction safety + the default invariant are what matter.
 #[test]
+#[ignore = "run by gui_tests_in_fresh_processes"]
 fn input_arm_gate_defaults_safe() {
     let Some(app) = try_window() else { return };
     let _shared = glue::install(&app);
@@ -154,6 +197,7 @@ fn input_arm_gate_defaults_safe() {
 /// announces the probe; the rows land via invoke_from_event_loop when the worker finishes (the
 /// probe content itself is covered by runtime.rs's direct run_diagnostics tests).
 #[test]
+#[ignore = "run by gui_tests_in_fresh_processes"]
 fn diagnostics_callback_starts_probe_run() {
     let Some(app) = try_window() else { return };
     let _shared = glue::install(&app);
@@ -172,18 +216,20 @@ fn diagnostics_callback_starts_probe_run() {
 /// The macro CHECK callback syntax-checks a Python macro WITHOUT executing it. It starts the
 /// sidecar wait off-thread so the UI callback returns immediately.
 #[test]
+#[ignore = "run by gui_tests_in_fresh_processes"]
 fn macro_check_callback_reports() {
     let Some(app) = try_window() else { return };
     let _shared = glue::install(&app);
     let st = app.global::<State>();
     st.invoke_macro_check("def macro(ctx):\n    return ctx.app\n".into());
     assert!(st.get_macro_busy());
-    assert_eq!(st.get_macro_status(), "checking syntax…");
+    assert_eq!(st.get_macro_status(), "checking macro…");
 }
 
 /// The radial sector-count callback updates the count, rebuilds the sector model, PERSISTS to
-/// cast.toml (a restart must not silently revert the wheel), and clamps to the sane 2..16 range.
+/// cast.toml (a restart must not silently revert the wheel), and clamps to the 3..16 range.
 #[test]
+#[ignore = "run by gui_tests_in_fresh_processes"]
 fn radial_sector_count_updates_and_persists() {
     let Some(app) = try_window() else { return };
     // set-sector-count now writes cast.toml — isolate in a temp cwd.
@@ -197,7 +243,7 @@ fn radial_sector_count_updates_and_persists() {
     // persisted: a fresh load sees 12.
     assert_eq!(neuron::cast::CastConfig::load().sectors, 12);
     // clamped: a wild value can't outrun the COMPUTED cap (2π·deadzone/jitter; 16 at the
-    // default 40-count deadzone) and a wheel never drops below quadrants.
+    // default 40-count deadzone) and a wheel never drops below three directions.
     st.invoke_set_sector_count(100);
     assert_eq!(st.get_radial_sectors(), 16);
     assert_eq!(
@@ -206,12 +252,13 @@ fn radial_sector_count_updates_and_persists() {
         "the cap is derived from the deadzone"
     );
     st.invoke_set_sector_count(1);
-    assert_eq!(st.get_radial_sectors(), 4);
+    assert_eq!(st.get_radial_sectors(), 3);
 }
 
 /// The import wizard flag is a plain UI flag (Settings opens it; apply/close clears it). Driving it
 /// proves the overlay flow toggles.
 #[test]
+#[ignore = "run by gui_tests_in_fresh_processes"]
 fn import_wizard_flag_toggles() {
     let Some(app) = try_window() else { return };
     let _shared = glue::install(&app);
@@ -226,6 +273,7 @@ fn import_wizard_flag_toggles() {
 /// Re-scanning devices through the callback repopulates the devices model and sets a status line —
 /// the Device panel's primary read action, driven headlessly (0 devices is fine; the model exists).
 #[test]
+#[ignore = "run by gui_tests_in_fresh_processes"]
 fn refresh_devices_callback_runs() {
     let Some(app) = try_window() else { return };
     let _shared = glue::install(&app);
@@ -242,6 +290,7 @@ fn refresh_devices_callback_runs() {
 /// property the per-device panel gates on, so a click genuinely swaps the shown settings. Audio rows
 /// are emergent (no hardcoding): they carry a Core-Audio kind + endpoint id and no HID pid.
 #[test]
+#[ignore = "run by gui_tests_in_fresh_processes"]
 fn device_list_unifies_audio_and_selection_swaps_kind() {
     let Some(app) = try_window() else { return };
     let _shared = glue::install(&app);
@@ -309,6 +358,7 @@ fn device_list_unifies_audio_and_selection_swaps_kind() {
 /// Reloading bindings rebuilds both rule models and reports the assembled spine size — proving the
 /// Bindings panel's two rule layers wire to the engine's Trigger→Action assembly.
 #[test]
+#[ignore = "run by gui_tests_in_fresh_processes"]
 fn reload_bindings_callback_assembles_spine() {
     let Some(app) = try_window() else { return };
     let _shared = glue::install(&app);
@@ -325,6 +375,7 @@ fn reload_bindings_callback_assembles_spine() {
 /// recolours exactly that cell. With NO lit device the dims are the honest (0,0) sentinel and the
 /// panel renders its empty state instead of a fake matrix — both worlds are valid here.
 #[test]
+#[ignore = "run by gui_tests_in_fresh_processes"]
 fn lighting_grid_paints_a_cell() {
     let Some(app) = try_window() else { return };
     let _shared = glue::install(&app);
@@ -371,6 +422,7 @@ fn lighting_grid_paints_a_cell() {
 /// Changing the light-colour hex through the callback re-parses the brush colour (the colour field's
 /// live preview swatch + paint brush both read brush-color).
 #[test]
+#[ignore = "run by gui_tests_in_fresh_processes"]
 fn lighting_color_change_parses_brush() {
     let Some(app) = try_window() else { return };
     let _shared = glue::install(&app);
@@ -386,6 +438,7 @@ fn lighting_color_change_parses_brush() {
 /// depths) plus the import + profiles overlays, the full navigable surface. (Property access on
 /// a non-shown window is valid in Slint.)
 #[test]
+#[ignore = "run by gui_tests_in_fresh_processes"]
 fn all_panels_reachable() {
     let Some(app) = try_window() else { return };
     let _shared = glue::install(&app);
@@ -411,6 +464,7 @@ fn all_panels_reachable() {
 /// must carry every editor option so the picker can author a real Action — proving the bindings /
 /// radial / gesture editors have something to pick.
 #[test]
+#[ignore = "run by gui_tests_in_fresh_processes"]
 fn action_palette_populated() {
     let Some(app) = try_window() else { return };
     let _shared = glue::install(&app);
@@ -446,6 +500,7 @@ fn action_palette_populated() {
 /// Setting an activation rhythm persists to cast.toml, updates both view properties (pattern +
 /// symbol readout), and refuses an unparseable phrase without mutating anything.
 #[test]
+#[ignore = "run by gui_tests_in_fresh_processes"]
 fn activation_rhythm_sets_and_persists() {
     let Some(app) = try_window() else { return };
     let _cwd = crate::testsupport::cwd_guard("apptest_activation");
@@ -471,6 +526,7 @@ fn activation_rhythm_sets_and_persists() {
 
 /// Setting the HyperShift stance persists to feel.toml and reports the stance in plain words.
 #[test]
+#[ignore = "run by gui_tests_in_fresh_processes"]
 fn hypershift_stance_sets_and_persists() {
     let Some(app) = try_window() else { return };
     let _cwd = crate::testsupport::cwd_guard("apptest_stance");
@@ -491,6 +547,7 @@ fn hypershift_stance_sets_and_persists() {
 /// inactive — the UI invariant the CaptureOverlay + add-flow read. This NEVER starts a capture
 /// worker (which would poll real input) — it asserts the safe default state only.
 #[test]
+#[ignore = "run by gui_tests_in_fresh_processes"]
 fn press_to_bind_surface_defaults_clean() {
     let Some(app) = try_window() else { return };
     let _shared = glue::install(&app);
@@ -505,6 +562,7 @@ fn press_to_bind_surface_defaults_clean() {
 /// The radial per-sector editor: selecting a sector to edit sets `editing-sector`; cancelling clears
 /// it. Drives the real callbacks (no device, no input).
 #[test]
+#[ignore = "run by gui_tests_in_fresh_processes"]
 fn radial_sector_editor_targets_a_wedge() {
     // `invoke_set_sector_count` persists cast.toml through the run root — take the process-wide
     // guard like every other run-root-mutating test, so the write lands in a private temp dir.
@@ -523,6 +581,7 @@ fn radial_sector_editor_targets_a_wedge() {
 
 /// The gesture->action binder: choosing a glyph sets the bind target (the editor opens for it).
 #[test]
+#[ignore = "run by gui_tests_in_fresh_processes"]
 fn gesture_bind_sets_target() {
     let Some(app) = try_window() else { return };
     let _shared = glue::install(&app);
@@ -536,6 +595,7 @@ fn gesture_bind_sets_target() {
 /// loop" contract is gone). Per the input-safety rule, this test does NOT fire it to ARM — it
 /// asserts the safe default. The flip behaviour is the same `arm_input` gate covered by core.
 #[test]
+#[ignore = "run by gui_tests_in_fresh_processes"]
 fn input_arm_single_callback_defaults_safe() {
     let Some(app) = try_window() else { return };
     let _shared = glue::install(&app);
@@ -560,6 +620,7 @@ fn input_arm_single_callback_defaults_safe() {
 // lock; taking it keeps the window exclusive. Found via an intermittent auto-switch failure
 // that looked like a routing bug.
 #[test]
+#[ignore = "run by gui_tests_in_fresh_processes"]
 fn perf_controls_honor_paused_gate() {
     let _cwd = crate::testsupport::cwd_guard("apptest_perf_paused");
     let Some(app) = try_window() else { return };
@@ -588,6 +649,7 @@ fn perf_controls_honor_paused_gate() {
 /// (changing speaker volume / muting them), which a test must never do. Their wiring is covered by
 /// the editor's `build_action` unit tests + the manual-run path; this asserts the panel reads live.
 #[test]
+#[ignore = "run by gui_tests_in_fresh_processes"]
 fn output_audio_controls_are_wired() {
     let Some(app) = try_window() else { return };
     let _shared = glue::install(&app);
@@ -608,6 +670,7 @@ fn output_audio_controls_are_wired() {
 /// regression in either audio direction is caught. READ-ONLY: refresh only — `set-mic-gain` /
 /// `toggle-mic-mute` mutate the user's live mic and must not fire in a test.
 #[test]
+#[ignore = "run by gui_tests_in_fresh_processes"]
 fn mic_audio_controls_are_wired() {
     let Some(app) = try_window() else { return };
     let _shared = glue::install(&app);
@@ -625,6 +688,7 @@ fn mic_audio_controls_are_wired() {
 /// gesture can drive headphone / sound-card volume + mute — the new bindable actions this pass
 /// surfaced. The palette ids must match the editor's `build_action` arms.
 #[test]
+#[ignore = "run by gui_tests_in_fresh_processes"]
 fn action_palette_has_output_audio() {
     let Some(app) = try_window() else { return };
     let _shared = glue::install(&app);
@@ -658,6 +722,7 @@ fn action_palette_has_output_audio() {
 /// SERVICE itself is live-path only (started by `main`, never by glue), so installing the glue must
 /// not present anything.
 #[test]
+#[ignore = "run by gui_tests_in_fresh_processes"]
 fn beacon_state_is_inert_and_defer_pref_persists() {
     let Some(app) = try_window() else { return };
     let _shared = glue::install(&app);
@@ -681,6 +746,7 @@ fn beacon_state_is_inert_and_defer_pref_persists() {
 // lock; taking it keeps the window exclusive. Found via an intermittent auto-switch failure
 // that looked like a routing bug.
 #[test]
+#[ignore = "run by gui_tests_in_fresh_processes"]
 fn all_perf_controls_have_callbacks() {
     let _cwd = crate::testsupport::cwd_guard("apptest_perf_callbacks");
     let Some(app) = try_window() else { return };
@@ -712,6 +778,7 @@ fn all_perf_controls_have_callbacks() {
 /// the add now VALIDATES its target: a rule pointing at a profile that doesn't exist is refused
 /// (it could only ever fail silently at focus-switch time).
 #[test]
+#[ignore = "run by gui_tests_in_fresh_processes"]
 fn app_rule_add_then_remove() {
     let Some(app) = try_window() else { return };
     // `apps.toml` + profiles/ resolve via the run root; isolate (and serialize via the shared guard).
@@ -749,6 +816,7 @@ fn app_rule_add_then_remove() {
 /// single remove-rule(int) mapped hyper row indices against the BASE list and deleted the wrong
 /// rule (or refused with a lying message).
 #[test]
+#[ignore = "run by gui_tests_in_fresh_processes"]
 fn hypershift_rule_remove_targets_its_own_tier() {
     let Some(app) = try_window() else { return };
     let _cwd = crate::testsupport::cwd_guard("apptest_hyper_remove");
@@ -824,6 +892,7 @@ fn row_dpi(app: &AppWindow) -> String {
 }
 
 #[test]
+#[ignore = "run by gui_tests_in_fresh_processes"]
 fn a_device_push_lands_on_the_view_without_stomping_an_edit() {
     let Some(app) = try_window() else { return };
     let st = app.global::<State>();

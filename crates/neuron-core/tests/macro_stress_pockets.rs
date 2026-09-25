@@ -13,7 +13,7 @@
 //! and writes the OS clipboard; here we install an IN-MEMORY clipboard via the `pocket::testclip`
 //! seam (off in production), so every move runs against a fake cell. Durable state is isolated to a
 //! private temp dir (cwd + NEURON_RUN_DIR both pinned there — the crate resolves `runtime/pockets/`
-//! via the run root) and cleaned up. The process arm gate is restored on exit.
+//! via the run root) and cleaned up. The process arm gate stays disarmed throughout.
 //!
 //! ONE monolithic test on purpose: the pocket store, the generation counter, the fake clipboard, and
 //! the process cwd are all PROCESS-GLOBAL, so the phases run serially (no intra-process races), the
@@ -95,8 +95,8 @@ fn pocket_stress() {
     // so the crate's `runtime/pockets/` and this file's cwd-relative DISK_DIR mean the same place.
     let _run_pin = neuron::runroot::RunDirPin::to(&tmp);
 
-    // Remember the real arm state and force a known one; restored at the end.
-    let prev_armed = safety::input_armed();
+    // Real input remains disarmed; only the fake clipboard can be authorized.
+    assert!(!safety::input_armed());
 
     // Route every clipboard read/write to the in-memory seam — the OS clipboard is now untouchable.
     testclip::install_empty();
@@ -108,7 +108,7 @@ fn pocket_stress() {
 
     // ── teardown (always) ────────────────────────────────────────────────────────────────────────
     testclip::uninstall();
-    safety::set_input_armed(prev_armed);
+    assert!(!safety::input_armed());
     std::env::set_current_dir(&prev).ok();
     let _ = std::fs::remove_dir_all(&tmp);
 
@@ -121,7 +121,7 @@ fn run_phases() {
     // ── 1. disarmed_stash_noop ─────────────────────────────────────────────────────────────────
     // activate() while disarmed must change NOTHING and report [disarmed].
     {
-        safety::set_input_armed(false);
+        testclip::authorize_moves(false);
         testclip::reset_store();
         testclip::install_text("clipdata");
         let g0 = generation();
@@ -139,7 +139,7 @@ fn run_phases() {
 
     // ── 2. stash_clipboard_to_pocket ───────────────────────────────────────────────────────────
     {
-        safety::set_input_armed(true);
+        testclip::authorize_moves(true);
         testclip::reset_store();
         testclip::install_text("hello");
         let g0 = generation();
@@ -153,7 +153,7 @@ fn run_phases() {
 
     // ── 3. restore_pocket_to_clipboard (continues from #2: pocket 's' holds 'hello') ───────────
     {
-        safety::set_input_armed(true);
+        testclip::authorize_moves(true);
         let g1 = generation();
         let r = activate("s", false);
         assert!(
@@ -172,7 +172,7 @@ fn run_phases() {
 
     // ── 4. swap_exchange_both_full ─────────────────────────────────────────────────────────────
     {
-        safety::set_input_armed(true);
+        testclip::authorize_moves(true);
         testclip::reset_store();
         testclip::install_text("P");
         activate("sw", false); // stash P: pocket=P, clipboard empty
@@ -195,7 +195,7 @@ fn run_phases() {
 
     // ── 5. noop_both_empty ─────────────────────────────────────────────────────────────────────
     {
-        safety::set_input_armed(true);
+        testclip::authorize_moves(true);
         testclip::reset_store();
         testclip::install_empty();
         let g0 = generation();
@@ -208,7 +208,7 @@ fn run_phases() {
 
     // ── 6. persist_flag_enables_durability ─────────────────────────────────────────────────────
     {
-        safety::set_input_armed(true);
+        testclip::authorize_moves(true);
         testclip::reset_store();
         let _ = std::fs::remove_dir_all(DISK_DIR);
         testclip::install_text("durable!");
@@ -224,7 +224,7 @@ fn run_phases() {
 
     // ── 7. ephemeral_no_disk_write ─────────────────────────────────────────────────────────────
     {
-        safety::set_input_armed(true);
+        testclip::authorize_moves(true);
         testclip::reset_store();
         let _ = std::fs::remove_dir_all(DISK_DIR);
         testclip::install_text("ephemeral");
@@ -238,7 +238,7 @@ fn run_phases() {
 
     // ── 8. generation_counter_increments ───────────────────────────────────────────────────────
     {
-        safety::set_input_armed(true);
+        testclip::authorize_moves(true);
         testclip::reset_store();
         let g0 = generation();
         testclip::install_text("a");
@@ -256,7 +256,7 @@ fn run_phases() {
 
     // ── 9. slot_identity_and_sharing ───────────────────────────────────────────────────────────
     {
-        safety::set_input_armed(true);
+        testclip::authorize_moves(true);
         // same slot name shares one register (a stash then a restore on it round-trips the content).
         testclip::reset_store();
         testclip::install_text("A1");
@@ -283,7 +283,7 @@ fn run_phases() {
 
     // ── 10. views_api_public_query ─────────────────────────────────────────────────────────────
     {
-        safety::set_input_armed(true);
+        testclip::authorize_moves(true);
         testclip::reset_store();
         let _ = std::fs::remove_dir_all(DISK_DIR);
         testclip::install_text("aa");
@@ -307,7 +307,7 @@ fn run_phases() {
 
     // ── 11. view_of_single_slot_query ──────────────────────────────────────────────────────────
     {
-        safety::set_input_armed(true);
+        testclip::authorize_moves(true);
         testclip::reset_store();
         testclip::install_text("xx");
         activate("ex", false);
@@ -318,7 +318,7 @@ fn run_phases() {
 
     // ── 12. sigil_deterministic_per_slot ───────────────────────────────────────────────────────
     {
-        safety::set_input_armed(true);
+        testclip::authorize_moves(true);
         testclip::reset_store();
         testclip::install_text("sigil-content");
         activate("sg", false);
@@ -340,7 +340,7 @@ fn run_phases() {
 
     // ── 13. empty_durable_pocket_file_deletion ─────────────────────────────────────────────────
     {
-        safety::set_input_armed(true);
+        testclip::authorize_moves(true);
         testclip::reset_store();
         let _ = std::fs::remove_dir_all(DISK_DIR);
         let baseline = file_names(); // tolerate any straggler write from an earlier phase
@@ -365,7 +365,7 @@ fn run_phases() {
 
     // ── 14. multi_format_fidelity_in_activate (text + image + files in one pocket) ──────────────
     {
-        safety::set_input_armed(true);
+        testclip::authorize_moves(true);
         testclip::reset_store();
         let p = Pocket {
             formats: vec![
@@ -384,7 +384,7 @@ fn run_phases() {
 
     // ── 15. parse_disk_malformed_data_graceful ─────────────────────────────────────────────────
     {
-        safety::set_input_armed(true);
+        testclip::authorize_moves(true);
         testclip::reset_store();
         let _ = std::fs::remove_dir_all(DISK_DIR);
         // write a VALID durable pocket first.
@@ -408,7 +408,7 @@ fn run_phases() {
 
     // ── 16. uncarryable_clipboard_content_refused ──────────────────────────────────────────────
     {
-        safety::set_input_armed(true); // even armed, an uncarryable clipboard is refused
+        testclip::authorize_moves(true); // even armed, an uncarryable clipboard is refused
         testclip::reset_store();
         testclip::install_uncarryable();
         let g0 = generation();
@@ -424,7 +424,7 @@ fn run_phases() {
 
     // ── 17. large_payload_stress (5 MB) ────────────────────────────────────────────────────────
     {
-        safety::set_input_armed(true);
+        testclip::authorize_moves(true);
         testclip::reset_store();
         let big = vec![0xABu8; 5 * 1024 * 1024];
         let p = Pocket { formats: vec![ClipFormat { id: 0xC100, bytes: big }] };
@@ -440,7 +440,7 @@ fn run_phases() {
 
     // ── 18. many_formats_fidelity (10 formats, through disk) ────────────────────────────────────
     {
-        safety::set_input_armed(true);
+        testclip::authorize_moves(true);
         testclip::reset_store();
         let _ = std::fs::remove_dir_all(DISK_DIR);
         let mut formats = vec![
@@ -467,7 +467,7 @@ fn run_phases() {
 
     // ── 19. concurrent_slot_access_isolation ───────────────────────────────────────────────────
     {
-        safety::set_input_armed(true);
+        testclip::authorize_moves(true);
         testclip::reset_store();
         // seed 5 slots with distinct content sequentially (deterministic).
         for i in 0..5 {
@@ -516,7 +516,7 @@ fn run_phases() {
 
     // ── 20. (audit case fnv1a) hash slot-name collision zero ───────────────────────────────────
     {
-        safety::set_input_armed(true);
+        testclip::authorize_moves(true);
         testclip::reset_store();
         let _ = std::fs::remove_dir_all(DISK_DIR);
         let baseline = file_names(); // tolerate any straggler write from an earlier phase
@@ -544,7 +544,7 @@ fn run_phases() {
     // move NOTHING — the pocketed payload stays in the slot (not silently consumed), the
     // clipboard is untouched, the generation doesn't bump, and the status says so honestly.
     {
-        safety::set_input_armed(true);
+        testclip::authorize_moves(true);
         testclip::reset_store();
         // seed the slot through a WORKING clipboard first: pocket <- "precious".
         testclip::install_text("precious");

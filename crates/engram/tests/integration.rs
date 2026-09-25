@@ -15,8 +15,9 @@ use engram::histogram;
 use engram::types::Mode;
 use engram::wire::{from_wire, from_wire_compact, to_wire, to_wire_compact};
 
-/// In-repo fixture corpus (checked in, always available).
-const FIXTURES_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+/// Cargo runs integration tests from the package root. A relative path also survives a shared
+/// target cache reused by another worktree, whose compiled `CARGO_MANIFEST_DIR` would be stale.
+const FIXTURES_DIR: &str = "tests/fixtures";
 
 /// External golden vector corpus, used when present (e.g. some CI/dev
 /// setups vendor a larger real-article corpus outside the repo). Falls

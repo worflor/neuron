@@ -72,9 +72,11 @@ fn main() {
         "{}.slim.tar.gz",
         asset.strip_suffix(".tar.gz").unwrap_or(&asset)
     ));
-    // Deleting the slim forces a re-slim on the next build (cargo only re-runs a build script when a
-    // declared input changes).
+    let slim_stamp = slim.with_extension("slim-inputs");
+    // Deleting either cache artifact forces revalidation/re-slimming (cargo only re-runs a build
+    // script when a declared input changes).
     println!("cargo:rerun-if-changed={}", slim.display());
+    println!("cargo:rerun-if-changed={}", slim_stamp.display());
     ensure_slim(&tarball, &slim, &manifest_build_rs());
 
     // Hand the crate the absolute SLIM tarball path + the identity it was built for.
@@ -90,11 +92,15 @@ fn manifest_build_rs() -> PathBuf {
         .join("build.rs")
 }
 
-/// Ensure a SLIMMED copy of `src` exists at `slim`, (re)building it only on a cache miss: when
-/// `slim` is MISSING or OLDER than `build_rs` (so editing the prune list in build.rs re-slims, while
-/// a warm cache is a no-op — keeping incremental builds fast and the embedded blob/link small).
+/// Ensure a SLIMMED copy of `src` exists at `slim`, rebuilding when either input's content changes.
 fn ensure_slim(src: &Path, slim: &Path, build_rs: &Path) {
-    if !needs_reslim(slim, build_rs) {
+    let source_hash = file_sha256(src)
+        .unwrap_or_else(|e| panic!("neuron: hash upstream tarball {}: {e}", src.display()));
+    let build_hash = file_sha256(build_rs)
+        .unwrap_or_else(|e| panic!("neuron: hash build script {}: {e}", build_rs.display()));
+    let stamp = slim.with_extension("slim-inputs");
+    let identity = slim_identity(&source_hash, &build_hash);
+    if !needs_reslim(slim, &stamp, &identity) {
         return;
     }
     println!(
@@ -102,26 +108,54 @@ fn ensure_slim(src: &Path, slim: &Path, build_rs: &Path) {
         slim.display()
     );
     slim_tarball(src, slim);
+    let tmp_stamp = stamp.with_extension("slim-inputs.partial");
+    std::fs::write(&tmp_stamp, identity)
+        .unwrap_or_else(|e| panic!("neuron: write slim cache identity {}: {e}", tmp_stamp.display()));
+    replace_file(&tmp_stamp, &stamp)
+        .unwrap_or_else(|e| panic!("neuron: commit slim cache identity {}: {e}", stamp.display()));
 }
 
-/// A re-slim is needed iff the slim file is absent, or it predates `build_rs` (the prune list moved).
-/// If either mtime can't be read we err toward NOT re-slimming a present cache (avoid churn); a
-/// missing slim always re-slims.
-fn needs_reslim(slim: &Path, build_rs: &Path) -> bool {
-    let Ok(slim_m) = slim.metadata().and_then(|m| m.modified()) else {
-        return true; // missing/unreadable slim → (re)build it
-    };
-    match build_rs.metadata().and_then(|m| m.modified()) {
-        Ok(build_m) => slim_m < build_m, // re-slim if the prune list is newer than the cache
-        Err(_) => false,                 // can't compare → trust the present cache
+fn slim_identity(source_hash: &str, build_hash: &str) -> String {
+    format!("source={source_hash}\nbuild={build_hash}\n")
+}
+
+/// A cache is fresh only when its slim output and exact input identity marker both exist.
+fn needs_reslim(slim: &Path, stamp: &Path, identity: &str) -> bool {
+    !slim.is_file() || std::fs::read_to_string(stamp).map_or(true, |saved| saved != identity)
+}
+
+fn file_sha256(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut hash = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hash.update(&buf[..n]);
     }
+    Ok(hex(&hash.finalize()))
+}
+
+/// Replace a cache file portably. Windows rename does not replace an existing destination; if
+/// interrupted after removal, the missing cache is detected and rebuilt on the next invocation.
+fn replace_file(tmp: &Path, dest: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    match std::fs::remove_file(dest) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    std::fs::rename(tmp, dest)
 }
 
 /// Stream-filter `src` (a gzip'd tar) into `dest`, KEEPING every entry [`should_prune`] doesn't
 /// reject. Reads via `flate2::read::GzDecoder` + `tar::Archive::entries()` and writes the kept
 /// entries to a fresh `tar::Builder` over `flate2::write::GzEncoder`, copying each entry's UPSTREAM
 /// header so mode/mtime are preserved (so unix `python/bin/python3` stays executable). Written
-/// ATOMICALLY (temp + rename) so a killed build never leaves a half-slim that looks cached. Panics
+/// through a temp file so a killed build never leaves a half-slim that looks cached. Panics
 /// with a clear message on any IO/format failure — a broken bundle must fail the build, not ship a
 /// Python that can't run.
 fn slim_tarball(src: &Path, dest: &Path) {
@@ -133,7 +167,7 @@ fn slim_tarball(src: &Path, dest: &Path) {
     let gz_in = flate2::read::GzDecoder::new(BufReader::new(in_f));
     let mut archive = tar::Archive::new(gz_in);
 
-    // Atomic temp sibling: write fully, then rename into place.
+    // Temp sibling: write fully, then replace the cached copy.
     let tmp = dest.with_file_name(format!(
         "{}.partial",
         dest.file_name()
@@ -185,7 +219,7 @@ fn slim_tarball(src: &Path, dest: &Path) {
     buf.into_inner()
         .unwrap_or_else(|e| panic!("neuron: flush slim tarball: {e}"));
 
-    std::fs::rename(&tmp, dest)
+    replace_file(&tmp, dest)
         .unwrap_or_else(|e| panic!("neuron: commit slim tarball to {}: {e}", dest.display()));
     println!("cargo:warning=neuron: slimmed CPython tarball — kept {kept} entries, dropped {skipped}");
 }
@@ -323,8 +357,8 @@ fn repo_vendor_cache() -> PathBuf {
         .join("pbs-cache")
 }
 
-/// Download `asset` (+ verify against the release SHA256SUMS manifest), writing it ATOMICALLY to
-/// `dest` (download to a sibling temp file, fsync-by-rename) so a killed build never leaves a
+/// Download `asset` (+ verify against the release SHA256SUMS manifest), writing it to
+/// `dest` through a sibling temp file so a killed build never leaves a
 /// half-tarball that looks cached. Panics with a clear message on any failure — a broken bundle
 /// must fail the build, not ship a Python that isn't there.
 fn ensure_tarball(dest: &Path, triple: &str, asset: &str) {
@@ -364,7 +398,7 @@ fn ensure_tarball(dest: &Path, triple: &str, asset: &str) {
     let tmp = dest.with_extension("gz.partial");
     std::fs::write(&tmp, &bytes)
         .unwrap_or_else(|e| panic!("write temp tarball {}: {e}", tmp.display()));
-    std::fs::rename(&tmp, dest)
+    replace_file(&tmp, dest)
         .unwrap_or_else(|e| panic!("commit tarball to {}: {e}", dest.display()));
     println!(
         "cargo:warning=neuron: cached + verified CPython tarball at {}",
@@ -440,6 +474,14 @@ mod tests {
     #[test]
     fn hex_is_lowercase_and_padded() {
         assert_eq!(hex(&[0x00, 0x0f, 0xff, 0xa0]), "000fffa0");
+    }
+
+    #[test]
+    fn slim_identity_tracks_both_upstream_and_prune_script_content() {
+        let original = slim_identity("upstream-a", "build-a");
+        assert_eq!(original, slim_identity("upstream-a", "build-a"));
+        assert_ne!(original, slim_identity("upstream-b", "build-a"));
+        assert_ne!(original, slim_identity("upstream-a", "build-b"));
     }
 
     #[test]

@@ -112,70 +112,88 @@ pub fn load(data: &[u8]) -> Option<Brain> {
         return None;
     }
 
-    let dim = read_u32(data, &mut pos) as usize;
-    let pairs = read_u32(data, &mut pos) as usize;
-    let alpha = read_f32(data, &mut pos);
-    let total_absorbed = read_u32(data, &mut pos) as usize;
-    let next_well_id = read_u32(data, &mut pos) as usize;
+    let dim = read_u32(data, &mut pos)? as usize;
+    let pairs = read_u32(data, &mut pos)? as usize;
+    let alpha = read_f32(data, &mut pos)?;
+    let total_absorbed = read_u32(data, &mut pos)? as usize;
+    let next_well_id = read_u32(data, &mut pos)? as usize;
+    if pairs != dim / 2 {
+        return None;
+    }
 
     // Name
-    let name_len = read_u16(data, &mut pos) as usize;
-    let name = std::str::from_utf8(&data[pos..pos + name_len])
+    let name_len = read_u16(data, &mut pos)? as usize;
+    let name_bytes = take(data, &mut pos, name_len)?;
+    let name = std::str::from_utf8(name_bytes)
         .ok()?
         .to_string();
-    pos += name_len;
 
     // Reference pairing
-    let has_pairing = data[pos];
-    pos += 1;
+    let has_pairing = *take(data, &mut pos, 1)?.first()?;
     let reference_pairing = if has_pairing == 1 {
+        if dim > data.len().saturating_sub(pos) / 4 {
+            return None;
+        }
         let mut pairing = Vec::with_capacity(dim);
         for _ in 0..dim {
-            pairing.push(read_i32(data, &mut pos));
+            pairing.push(read_i32(data, &mut pos)?);
         }
         Some(pairing)
-    } else {
+    } else if has_pairing == 0 {
         None
+    } else {
+        return None;
     };
 
     // Wells
-    let n_wells = read_u32(data, &mut pos) as usize;
+    let n_wells = read_u32(data, &mut pos)? as usize;
+    let well_payload = pairs.checked_mul(16)?;
+    let min_well_size = 6_usize.checked_add(well_payload)?;
+    if n_wells > data.len().saturating_sub(pos) / min_well_size {
+        return None;
+    }
     let mut wells = std::collections::HashMap::with_capacity(n_wells);
     for _ in 0..n_wells {
-        let wname_len = read_u16(data, &mut pos) as usize;
-        let wname = std::str::from_utf8(&data[pos..pos + wname_len])
+        let wname_len = read_u16(data, &mut pos)? as usize;
+        let wname_bytes = take(data, &mut pos, wname_len)?;
+        let wname = std::str::from_utf8(wname_bytes)
             .ok()?
             .to_string();
-        pos += wname_len;
-        let count = read_u32(data, &mut pos) as usize;
+        let count = read_u32(data, &mut pos)? as usize;
         let mut sum_k = Vec::with_capacity(pairs);
         for _ in 0..pairs {
-            let re = read_f64(data, &mut pos);
-            let im = read_f64(data, &mut pos);
+            let re = read_f64(data, &mut pos)?;
+            let im = read_f64(data, &mut pos)?;
             sum_k.push(Complex64::new(re, im));
         }
         wells.insert(wname, Well { sum_k, count });
     }
 
     // Dream buffer
-    let n_dream = read_u32(data, &mut pos) as usize;
+    let n_dream = read_u32(data, &mut pos)? as usize;
+    let dream_item_size = pairs.checked_mul(36)?;
+    if (dream_item_size == 0 && n_dream != 0)
+        || n_dream > data.len().saturating_sub(pos) / dream_item_size.max(1)
+    {
+        return None;
+    }
     let mut dream = Vec::with_capacity(n_dream);
     for _ in 0..n_dream {
         let mut k = Vec::with_capacity(pairs);
         for _ in 0..pairs {
-            let re = read_f64(data, &mut pos);
-            let im = read_f64(data, &mut pos);
+            let re = read_f64(data, &mut pos)?;
+            let im = read_f64(data, &mut pos)?;
             k.push(Complex64::new(re, im));
         }
         let mut g = Vec::with_capacity(pairs);
         for _ in 0..pairs {
-            let re = read_f64(data, &mut pos);
-            let im = read_f64(data, &mut pos);
+            let re = read_f64(data, &mut pos)?;
+            let im = read_f64(data, &mut pos)?;
             g.push(Complex64::new(re, im));
         }
         let mut s = Vec::with_capacity(pairs);
         for _ in 0..pairs {
-            s.push(read_f32(data, &mut pos));
+            s.push(read_f32(data, &mut pos)?);
         }
         dream.push(DreamEntry { k, g, s });
     }
@@ -188,41 +206,36 @@ pub fn load(data: &[u8]) -> Option<Brain> {
     brain.total_absorbed = total_absorbed;
     brain.next_well_id = next_well_id;
 
-    Some(brain)
+    (pos == data.len()).then_some(brain)
 }
 
 // --- LE helpers ---
 
-fn read_u16(data: &[u8], pos: &mut usize) -> u16 {
-    let v = u16::from_le_bytes([data[*pos], data[*pos + 1]]);
-    *pos += 2;
-    v
+fn take<'a>(data: &'a [u8], pos: &mut usize, len: usize) -> Option<&'a [u8]> {
+    let end = pos.checked_add(len)?;
+    let bytes = data.get(*pos..end)?;
+    *pos = end;
+    Some(bytes)
 }
 
-fn read_u32(data: &[u8], pos: &mut usize) -> u32 {
-    let v = u32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]);
-    *pos += 4;
-    v
+fn read_u16(data: &[u8], pos: &mut usize) -> Option<u16> {
+    Some(u16::from_le_bytes(take(data, pos, 2)?.try_into().ok()?))
 }
 
-fn read_i32(data: &[u8], pos: &mut usize) -> i32 {
-    let v = i32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]);
-    *pos += 4;
-    v
+fn read_u32(data: &[u8], pos: &mut usize) -> Option<u32> {
+    Some(u32::from_le_bytes(take(data, pos, 4)?.try_into().ok()?))
 }
 
-fn read_f32(data: &[u8], pos: &mut usize) -> f32 {
-    let v = f32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]);
-    *pos += 4;
-    v
+fn read_i32(data: &[u8], pos: &mut usize) -> Option<i32> {
+    Some(i32::from_le_bytes(take(data, pos, 4)?.try_into().ok()?))
 }
 
-fn read_f64(data: &[u8], pos: &mut usize) -> f64 {
-    let bytes = [data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3],
-        data[*pos + 4], data[*pos + 5], data[*pos + 6], data[*pos + 7]];
-    let v = f64::from_le_bytes(bytes);
-    *pos += 8;
-    v
+fn read_f32(data: &[u8], pos: &mut usize) -> Option<f32> {
+    Some(f32::from_le_bytes(take(data, pos, 4)?.try_into().ok()?))
+}
+
+fn read_f64(data: &[u8], pos: &mut usize) -> Option<f64> {
+    Some(f64::from_le_bytes(take(data, pos, 8)?.try_into().ok()?))
 }
 
 #[cfg(test)]
@@ -327,5 +340,31 @@ mod tests {
         assert!(load(b"XXXX").is_none());
         assert!(load(b"").is_none());
         assert!(load(b"ENB").is_none());
+    }
+
+    #[test]
+    fn every_truncated_prefix_returns_none() {
+        let bytes = save(&Brain::new(8, 0.005));
+        for end in 0..bytes.len() {
+            assert!(load(&bytes[..end]).is_none(), "accepted prefix ending at {end}");
+        }
+    }
+
+    #[test]
+    fn hostile_counts_return_none_without_allocating_from_them() {
+        let bytes = save(&Brain::new(8, 0.005));
+
+        let mut huge_wells = bytes.clone();
+        huge_wells[28..32].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(load(&huge_wells).is_none());
+
+        let mut huge_dream = bytes;
+        huge_dream[32..36].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(load(&huge_dream).is_none());
+
+        let mut huge_dimension = save(&Brain::new(8, 0.005));
+        huge_dimension[5..9].copy_from_slice(&u32::MAX.to_le_bytes());
+        huge_dimension[9..13].copy_from_slice(&0_u32.to_le_bytes());
+        assert!(load(&huge_dimension).is_none());
     }
 }

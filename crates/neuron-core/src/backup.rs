@@ -61,9 +61,10 @@ impl Snapshot {
         self.interfaces.iter().map(|i| i.getters.len()).sum()
     }
 
-    /// Diff against another snapshot of the same device: returns the getters whose raw bytes
-    /// differ (by class/id). This is the verify/round-trip primitive — after a write, re-snapshot
-    /// and diff to confirm ONLY the intended bytes changed.
+    /// Diff against another snapshot of the same device: returns getters whose raw bytes differ
+    /// or that were added or removed (by interface usage and class/id). This is the
+    /// verify/round-trip primitive — after a write, re-snapshot and diff to confirm ONLY the
+    /// intended bytes changed.
     #[must_use]
     pub fn diff<'a>(&'a self, other: &'a Snapshot) -> Vec<Changed<'a>> {
         let mut out = Vec::new();
@@ -86,15 +87,36 @@ impl Snapshot {
                     Some(a) => out.push(Changed {
                         class: ag.class,
                         id: ag.id,
-                        before,
+                        before: Some(before),
                         after: Some(a),
                     }),
                     None => out.push(Changed {
                         class: ag.class,
                         id: ag.id,
-                        before,
+                        before: Some(before),
                         after: None,
                     }),
+                }
+            }
+        }
+        for bi in &other.interfaces {
+            let ai = self
+                .interfaces
+                .iter()
+                .find(|x| x.usage_page == bi.usage_page && x.usage == bi.usage);
+            for bg in &bi.getters {
+                let exists_before = ai.is_some_and(|ai| {
+                    ai.getters
+                        .iter()
+                        .any(|g| g.class == bg.class && g.id == bg.id)
+                });
+                if !exists_before {
+                    out.push(Changed {
+                        class: bg.class,
+                        id: bg.id,
+                        before: None,
+                        after: Some(&bg.raw),
+                    });
                 }
             }
         }
@@ -102,12 +124,12 @@ impl Snapshot {
     }
 }
 
-/// A getter whose value changed between two snapshots (the unit of write verification).
+/// A getter whose value changed, appeared, or disappeared between two snapshots.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Changed<'a> {
     pub class: u8,
     pub id: u8,
-    pub before: &'a str,
+    pub before: Option<&'a str>,
     pub after: Option<&'a str>,
 }
 
@@ -174,8 +196,43 @@ mod tests {
         let d = before.diff(&after);
         assert_eq!(d.len(), 1, "only the brightness getter changed");
         assert_eq!((d[0].class, d[0].id), (0x0F, 0x84));
-        assert_eq!(d[0].before, "00 05 80");
+        assert_eq!(d[0].before, Some("00 05 80"));
         assert_eq!(d[0].after, Some("00 05 FF"));
+    }
+
+    #[test]
+    fn diff_includes_getters_present_only_after() {
+        let before = snap(vec![(0x00, 0x82, "AA")]);
+        let after = snap(vec![(0x00, 0x82, "AA"), (0x04, 0x85, "new")]);
+
+        let d = before.diff(&after);
+        assert_eq!(d.len(), 1);
+        assert_eq!((d[0].class, d[0].id), (0x04, 0x85));
+        assert_eq!(d[0].before, None);
+        assert_eq!(d[0].after, Some("new"));
+    }
+
+    #[test]
+    fn diff_includes_getters_on_new_interfaces() {
+        let mut before = snap(vec![]);
+        before.interfaces.clear();
+        let mut after = before.clone();
+        after.interfaces.push(IfaceSnap {
+            usage_page: 0xFF00,
+            usage: 1,
+            getters: vec![GetterSnap {
+                class: 0x02,
+                id: 0x81,
+                kind: "new".into(),
+                raw: "bytes".into(),
+            }],
+        });
+
+        let d = before.diff(&after);
+        assert_eq!(d.len(), 1);
+        assert_eq!((d[0].class, d[0].id), (0x02, 0x81));
+        assert_eq!(d[0].before, None);
+        assert_eq!(d[0].after, Some("bytes"));
     }
 
     #[test]

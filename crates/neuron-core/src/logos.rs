@@ -108,42 +108,51 @@ impl Tree {
 // it injects log-odds rather than joining the Born mix.
 
 struct MatchAxis {
-    hist: Vec<u8>,
-    last_seen: Vec<i64>, // hash(order-4) → last index, -1 if none
-    match_pos: i64,
+    hist: Vec<u8>, // circular window; indices are absolute stream positions modulo its length
+    next_index: usize,
+    last_seen: Vec<usize>, // hash(order-4) → last index, usize::MAX if none
+    match_pos: Option<usize>,
     run: u32,
     mask: u64,
 }
 
+const MATCH_HISTORY_CAP: usize = 1 << 16;
+
 impl MatchAxis {
     fn new() -> MatchAxis {
         MatchAxis {
-            hist: Vec::new(),
-            last_seen: vec![-1; 1 << 20],
-            match_pos: -1,
+            hist: vec![0; MATCH_HISTORY_CAP],
+            next_index: 0,
+            last_seen: vec![usize::MAX; 1 << 20],
+            match_pos: None,
             run: 0,
             mask: (1 << 20) - 1,
         }
     }
 
     #[inline]
+    fn byte_at(&self, index: usize) -> Option<u8> {
+        (index < self.next_index && self.next_index - index <= MATCH_HISTORY_CAP)
+            .then(|| self.hist[index & (MATCH_HISTORY_CAP - 1)])
+    }
+
+    #[inline]
     fn hash4(&self) -> Option<usize> {
-        let n = self.hist.len();
+        let n = self.next_index;
         if n < 4 {
             return None;
         }
-        let h = (u64::from(self.hist[n - 1]) << 24)
-            ^ (u64::from(self.hist[n - 2]) << 16)
-            ^ (u64::from(self.hist[n - 3]) << 8)
-            ^ u64::from(self.hist[n - 4]);
+        let h = (u64::from(self.byte_at(n - 1)?) << 24)
+            ^ (u64::from(self.byte_at(n - 2)?) << 16)
+            ^ (u64::from(self.byte_at(n - 3)?) << 8)
+            ^ u64::from(self.byte_at(n - 4)?);
         let h = (h.wrapping_mul(2654435761)) & self.mask;
         Some(h as usize)
     }
 
     /// The predicted next byte (if a match is active) and a confidence in `[0, 1]`.
     fn predict(&self) -> Option<(u8, f64)> {
-        if self.match_pos >= 0 && (self.match_pos as usize) < self.hist.len() {
-            let b = self.hist[self.match_pos as usize];
+        if let Some(b) = self.match_pos.and_then(|pos| self.byte_at(pos)) {
             let conf = 1.0 - (-f64::from(self.run) / 4.0).exp(); // grows with run length
             Some((b, conf))
         } else {
@@ -154,23 +163,31 @@ impl MatchAxis {
     /// After a byte is finalized: verify/extend the match, then record the new context.
     fn end_byte(&mut self, byte: u8) {
         // did the active match correctly predict this byte?
-        if let Some((pred, _)) = self.predict() {
-            if pred == byte {
-                self.run += 1;
-                self.match_pos += 1;
-            } else {
-                self.run = 0;
-                self.match_pos = -1;
+        if self.match_pos.is_some() {
+            match self.predict() {
+                Some((pred, _)) if pred == byte => {
+                    self.run += 1;
+                    self.match_pos = self.match_pos.map(|pos| pos + 1);
+                }
+                _ => {
+                    self.run = 0;
+                    self.match_pos = None;
+                }
             }
         }
-        self.hist.push(byte);
+        let current = self.next_index;
+        self.hist[current & (MATCH_HISTORY_CAP - 1)] = byte;
+        self.next_index += 1;
         if let Some(h) = self.hash4() {
             let prev = self.last_seen[h];
-            self.last_seen[h] = self.hist.len() as i64 - 1;
-            if self.match_pos < 0 && prev >= 0 {
+            self.last_seen[h] = self.next_index - 1;
+            if self.match_pos.is_none() && prev != usize::MAX {
                 // start a new match just past the remembered context
-                self.match_pos = prev + 1;
-                self.run = 0;
+                let candidate = prev + 1;
+                if self.byte_at(candidate).is_some() {
+                    self.match_pos = Some(candidate);
+                    self.run = 0;
+                }
             }
         }
     }
@@ -336,9 +353,9 @@ impl Model {
 
     #[inline]
     fn above_byte(&self) -> u8 {
-        let n = self.m.hist.len();
+        let n = self.m.next_index;
         if self.stride > 0 && n >= self.stride {
-            self.m.hist[n - self.stride]
+            self.m.byte_at(n - self.stride).unwrap_or(0)
         } else {
             0
         }
@@ -677,6 +694,34 @@ impl<'a> RangeDecoder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn match_axis_history_is_bounded_and_keeps_recent_matches() {
+        let mut axis = MatchAxis::new();
+        let count = MATCH_HISTORY_CAP + 128;
+        for i in 0..count {
+            axis.end_byte((i & 3) as u8);
+        }
+
+        assert_eq!(axis.hist.len(), MATCH_HISTORY_CAP);
+        assert_eq!(axis.next_index, count);
+        assert_eq!(axis.byte_at(count - MATCH_HISTORY_CAP), Some(((count - MATCH_HISTORY_CAP) & 3) as u8));
+        assert_eq!(axis.byte_at(count - MATCH_HISTORY_CAP - 1), None);
+        assert!(axis.predict().is_some(), "a recent repeating context still activates a match after wraparound");
+    }
+
+    #[test]
+    fn match_axis_drops_predictions_from_evicted_history() {
+        let mut axis = MatchAxis::new();
+        axis.hist[0] = 0xA5;
+        axis.next_index = MATCH_HISTORY_CAP + 1;
+        axis.match_pos = Some(0);
+
+        assert_eq!(axis.predict(), None, "an evicted source byte cannot be used as a prediction");
+        axis.end_byte(0xA5);
+        assert_eq!(axis.match_pos, None, "the expired match is cleared on the next finalized byte");
+        assert_eq!(axis.run, 0);
+    }
 
     fn round_trip(data: &[u8]) {
         let enc = encode(data);

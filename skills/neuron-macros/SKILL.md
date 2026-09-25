@@ -5,8 +5,8 @@ description: Create or revise Neuron Python macros, including beacons and integr
 
 # Macros in Neuron
 
-A macro is a Python file with `def macro(ctx):`. Neuron runs it in a warm
-CPython worker when a bound trigger fires. `ctx` is a snapshot of the
+A macro is a Python file with `def macro(ctx):`. Neuron starts its CPython
+worker when input is armed or an editor action needs it, then keeps it warm. `ctx` is a snapshot of the
 foreground app, window, working directory and clipboard at trigger time.
 
 ## Use the installed API

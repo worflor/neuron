@@ -59,6 +59,15 @@ use crate::paint::{PaintPolicy, PolicyLayer};
 /// the session after the timeout — the app must re-init).
 pub const SESSION_TTL: Duration = Duration::from_secs(15);
 
+/// Bound the memory retained by clients that keep sessions alive indefinitely.
+const MAX_SESSIONS: usize = 64;
+/// Bound preloaded effects retained by one live session.
+const MAX_STORED_EFFECTS: usize = 256;
+/// Bound cells retained by one parsed effect; 8×24 keyboard CUSTOM2 remains supported.
+const MAX_GRID_CELLS: usize = 512;
+/// Bound user-authored title bytes retained by one live session.
+const MAX_SESSION_TITLE_BYTES: usize = 256;
+
 /// First minted session id — in port-space above the SDK's own 54235 (see
 /// module docs).
 const FIRST_SESSION_ID: u64 = 54236;
@@ -72,6 +81,8 @@ mod rz {
     /// of the requested kind exists (audit: python-chroma-rest-server maps its
     /// no-device case to exactly this).
     pub const DEVICE_NOT_AVAILABLE: i64 = 4319;
+    /// `ERROR_OUTOFMEMORY`: the server cannot retain more client state.
+    pub const RESOURCE_EXHAUSTED: i64 = 14;
 }
 
 pub struct HttpRequest {
@@ -232,8 +243,14 @@ impl ChromaServer {
         let title = info
             .get("title")
             .and_then(|t| t.as_str())
-            .unwrap_or("unnamed chroma app")
-            .to_string();
+            .unwrap_or("unnamed chroma app");
+        if title.len() > MAX_SESSION_TITLE_BYTES {
+            return HttpResponse::err(400, rz::INVALID_PARAMETER);
+        }
+        if self.sessions.len() >= MAX_SESSIONS {
+            return HttpResponse::err(503, rz::RESOURCE_EXHAUSTED);
+        }
+        let title = title.to_string();
         let id = self.next_id;
         self.next_id += 1;
         let owner = host.next_source();
@@ -369,6 +386,12 @@ impl ChromaServer {
             Ok(v) => v,
             Err(resp) => return resp,
         };
+        let Some(session) = self.sessions.get(&id) else {
+            return HttpResponse::err(404, rz::NOT_FOUND);
+        };
+        if session.effects.len().saturating_add(effects.len()) > MAX_STORED_EFFECTS {
+            return HttpResponse::err(503, rz::RESOURCE_EXHAUSTED);
+        }
         let batch = effects.len() > 1;
         let mut results = Vec::new();
         let mut only_id = String::new();
@@ -696,7 +719,17 @@ fn parse_grid(v: &serde_json::Value) -> Option<Vec<Vec<u32>>> {
     if arr.is_empty() {
         return Some(Vec::new());
     }
+    if arr.len() > MAX_GRID_CELLS {
+        return None;
+    }
     if arr[0].is_array() {
+        let mut cell_count = 0usize;
+        for row in arr {
+            cell_count = cell_count.checked_add(row.as_array()?.len())?;
+            if cell_count > MAX_GRID_CELLS {
+                return None;
+            }
+        }
         arr.iter()
             .map(|row| row.as_array()?.iter().map(|c| c.as_u64().map(|c| c as u32)).collect())
             .collect()
@@ -804,6 +837,204 @@ mod tests {
         );
         assert_eq!(r.status, 200);
         assert!(srv.sessions(now).is_empty());
+    }
+
+    #[test]
+    fn init_rejects_over_capacity_and_delete_releases_capacity() {
+        let mut k = kernel();
+        let now = Instant::now();
+        let mut srv = srv();
+        for _ in 0..MAX_SESSIONS {
+            open_session(&mut srv, &mut k, now);
+        }
+        let full = srv.handle(
+            &req("POST", "/razer/chromasdk", serde_json::json!({ "title": "Overflow" })),
+            &mut k,
+            now,
+        );
+        assert_eq!(full.status, 503);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&full.body).unwrap()["result"],
+            rz::RESOURCE_EXHAUSTED
+        );
+        assert_eq!(srv.sessions.len(), MAX_SESSIONS);
+
+        let first = FIRST_SESSION_ID;
+        let deleted = srv.handle(
+            &req("DELETE", &format!("/razer/chromasdk/sess/{first}"), serde_json::json!({})),
+            &mut k,
+            now,
+        );
+        assert_eq!(deleted.status, 200);
+        open_session(&mut srv, &mut k, now);
+        assert_eq!(srv.sessions.len(), MAX_SESSIONS);
+    }
+
+    #[test]
+    fn stored_effect_limit_rejects_whole_batch_and_delete_frees_slot() {
+        let mut k = kernel();
+        let now = Instant::now();
+        let mut srv = srv();
+        let id = open_session(&mut srv, &mut k, now);
+        for _ in 0..MAX_STORED_EFFECTS - 1 {
+            let r = srv.handle(
+                &req(
+                    "POST",
+                    &format!("/razer/chromasdk/sess/{id}/keyboard"),
+                    serde_json::json!({ "effect": "CHROMA_STATIC", "param": { "color": 1 } }),
+                ),
+                &mut k,
+                now,
+            );
+            assert_eq!(r.status, 200);
+        }
+        let batch = srv.handle(
+            &req(
+                "POST",
+                &format!("/razer/chromasdk/sess/{id}/keyboard"),
+                serde_json::json!({ "effects": [
+                    { "effect": "CHROMA_STATIC", "param": { "color": 2 } },
+                    { "effect": "CHROMA_STATIC", "param": { "color": 3 } },
+                ] }),
+            ),
+            &mut k,
+            now,
+        );
+        assert_eq!(batch.status, 503);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&batch.body).unwrap()["result"],
+            rz::RESOURCE_EXHAUSTED
+        );
+        assert_eq!(
+            srv.sessions[&id].effects.len(),
+            MAX_STORED_EFFECTS - 1,
+            "rejected batch inserts no prefix"
+        );
+
+        let single = srv.handle(
+            &req(
+                "POST",
+                &format!("/razer/chromasdk/sess/{id}/keyboard"),
+                serde_json::json!({ "effect": "CHROMA_STATIC", "param": { "color": 4 } }),
+            ),
+            &mut k,
+            now,
+        );
+        assert_eq!(single.status, 200);
+        let effect_id = serde_json::from_str::<serde_json::Value>(&single.body).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(srv.sessions[&id].effects.len(), MAX_STORED_EFFECTS);
+
+        let overflow = srv.handle(
+            &req(
+                "POST",
+                &format!("/razer/chromasdk/sess/{id}/keyboard"),
+                serde_json::json!({ "effect": "CHROMA_STATIC", "param": { "color": 6 } }),
+            ),
+            &mut k,
+            now,
+        );
+        assert_eq!(overflow.status, 503, "a later request still counts stored effects");
+        assert_eq!(srv.sessions[&id].effects.len(), MAX_STORED_EFFECTS);
+
+        let freed = srv.handle(
+            &req(
+                "DELETE",
+                &format!("/razer/chromasdk/sess/{id}/effect"),
+                serde_json::json!({ "id": effect_id }),
+            ),
+            &mut k,
+            now,
+        );
+        assert_eq!(freed.status, 200);
+        assert_eq!(srv.sessions[&id].effects.len(), MAX_STORED_EFFECTS - 1);
+        let replacement = srv.handle(
+            &req(
+                "POST",
+                &format!("/razer/chromasdk/sess/{id}/keyboard"),
+                serde_json::json!({ "effect": "CHROMA_STATIC", "param": { "color": 5 } }),
+            ),
+            &mut k,
+            now,
+        );
+        assert_eq!(
+            replacement.status, 200,
+            "DELETE immediately restores one create slot"
+        );
+        assert_eq!(srv.sessions[&id].effects.len(), MAX_STORED_EFFECTS);
+    }
+
+    #[test]
+    fn oversized_grids_are_rejected_without_retaining_an_effect_id() {
+        let mut k = kernel();
+        let now = Instant::now();
+        let mut srv = srv();
+        let id = open_session(&mut srv, &mut k, now);
+        let nested = vec![vec![1u32; 24]; 23];
+        let flat = vec![1u32; MAX_GRID_CELLS + 1];
+
+        for grid in [serde_json::json!(nested), serde_json::json!(flat)] {
+            let r = srv.handle(
+                &req(
+                    "POST",
+                    &format!("/razer/chromasdk/sess/{id}/keyboard"),
+                    serde_json::json!({ "effect": "CHROMA_CUSTOM", "param": grid }),
+                ),
+                &mut k,
+                now,
+            );
+            assert_eq!(r.status, 400);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&r.body).unwrap()["result"],
+                rz::INVALID_PARAMETER
+            );
+        }
+        assert!(srv.sessions[&id].effects.is_empty());
+        assert_eq!(srv.next_effect, 1, "invalid grids must not mint stored effect ids");
+    }
+
+    #[test]
+    fn init_rejects_titles_over_the_retained_byte_limit() {
+        let mut k = kernel();
+        let mut srv = srv();
+        let r = srv.handle(
+            &req(
+                "POST",
+                "/razer/chromasdk",
+                serde_json::json!({ "title": "x".repeat(MAX_SESSION_TITLE_BYTES + 1) }),
+            ),
+            &mut k,
+            Instant::now(),
+        );
+        assert_eq!(r.status, 400);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&r.body).unwrap()["result"],
+            rz::INVALID_PARAMETER
+        );
+        assert!(srv.sessions.is_empty());
+    }
+
+    #[test]
+    fn expired_sessions_are_pruned_before_init_capacity_check() {
+        let mut k = kernel();
+        let now = Instant::now();
+        let mut srv = srv();
+        for _ in 0..MAX_SESSIONS {
+            open_session(&mut srv, &mut k, now);
+        }
+        let next = now + SESSION_TTL + Duration::from_secs(1);
+        let opened = srv.handle(
+            &req("POST", "/razer/chromasdk", serde_json::json!({ "title": "After TTL" })),
+            &mut k,
+            next,
+        );
+        assert_eq!(opened.status, 200);
+        assert_eq!(
+            srv.sessions.len(), 1,
+            "expired sessions release their slots before capacity is checked"
+        );
     }
 
     #[test]

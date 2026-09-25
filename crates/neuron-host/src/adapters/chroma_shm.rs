@@ -832,6 +832,92 @@ pub mod server {
         size: usize,
     }
 
+    impl Drop for MappedSection {
+        fn drop(&mut self) {
+            unsafe {
+                UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: self.view.cast::<core::ffi::c_void>(),
+                });
+                CloseHandle(self.mapping);
+            }
+        }
+    }
+
+    /// Holds the fixed Chroma sections open so a limited tray can adopt them. The broker only
+    /// creates sections; the tray still owns arbitration, decoding and device output.
+    pub struct SectionSeed {
+        mappings: Vec<HANDLE>,
+        security_attributes: EveryoneSa,
+    }
+
+    impl SectionSeed {
+        pub fn create() -> Result<Self, CreateError> {
+            if mask_worn() {
+                return Err(CreateError::AlreadyServing);
+            }
+            Self::create_named(super::sections().into_iter().map(|(guid, size)| {
+                (format!("Global\\{{{guid}}}"), size)
+            }))
+        }
+
+        fn create_named(names: impl IntoIterator<Item = (String, usize)>) -> Result<Self, CreateError> {
+            let sa = EveryoneSa::new()?;
+            let mut seed = Self { mappings: Vec::new(), security_attributes: sa };
+            for (name, size) in names {
+                let name = wide(&name);
+                // SAFETY: the name and exact size come only from the fixed, audited object map.
+                let mapping = unsafe {
+                    CreateFileMappingW(
+                        INVALID_HANDLE_VALUE, seed.security_attributes.ptr(), PAGE_READWRITE,
+                        0, size as u32, name.as_ptr(),
+                    )
+                };
+                if mapping.is_null() {
+                    return Err(io::Error::last_os_error().into());
+                }
+                // An existing mapping may be smaller than the capture. Mapping the requested
+                // length fails in that case, before the tray can report native service as ready.
+                let view = unsafe { MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, size) };
+                if view.Value.is_null() {
+                    let err = io::Error::last_os_error();
+                    unsafe { CloseHandle(mapping) };
+                    return Err(err.into());
+                }
+                unsafe { UnmapViewOfFile(view) };
+                seed.mappings.push(mapping);
+            }
+            Ok(seed)
+        }
+
+        #[must_use]
+        pub fn section_count(&self) -> usize {
+            self.mappings.len()
+        }
+    }
+
+    impl Drop for SectionSeed {
+        fn drop(&mut self) {
+            for mapping in self.mappings.drain(..) {
+                unsafe { CloseHandle(mapping) };
+            }
+        }
+    }
+
+    /// Cheap readiness probe for a tray that started before the protected broker. It opens
+    /// existing mappings only; no privilege, section creation or device I/O is involved.
+    #[must_use]
+    pub fn seeded_sections_present() -> bool {
+        for (guid, _) in super::sections() {
+            let name = wide(&format!("Global\\{{{guid}}}"));
+            let mapping = unsafe { OpenFileMappingW(FILE_MAP_ALL_ACCESS, 0, name.as_ptr()) };
+            if mapping.is_null() {
+                return false;
+            }
+            unsafe { CloseHandle(mapping) };
+        }
+        true
+    }
+
     /// Why [`ShmServer::create`] declined.
     #[derive(Debug)]
     pub enum CreateError {
@@ -859,7 +945,7 @@ pub mod server {
     /// objects; then it creates nothing and `_sa` is `None`.
     pub struct ShmServer {
         sections: Vec<MappedSection>,
-        handles: Vec<HANDLE>, // events + mutexes we created (kept alive)
+        handles: Vec<SendHandle>, // events + mutexes we created (kept alive)
         _sa: Option<EveryoneSa>,
         mask: Option<MaskGuard>, // the arbitration mask (create-mode only)
     }
@@ -910,13 +996,15 @@ pub mod server {
                     }
                     Kind::Event => {
                         let h = unsafe { CreateEventW(sa.ptr(), 1, 0, name.as_ptr()) };
-                        if !h.is_null() { handles.push(h); }
+                        if h.is_null() { return Err(io::Error::last_os_error().into()); }
+                        handles.push(SendHandle(h));
                     }
                     Kind::Mutex => {
                         // Exists for the server's lifetime (that is the liveness signal), unowned
                         // so a waiting client is never blocked on us — see `create_named_mutex`.
                         let h = create_named_mutex(sa.ptr(), &name);
-                        if !h.is_null() { handles.push(h); }
+                        if h.is_null() { return Err(io::Error::last_os_error().into()); }
+                        handles.push(SendHandle(h));
                     }
                     Kind::Unknown => {}
                 }
@@ -940,10 +1028,7 @@ pub mod server {
             // early check, just caught after the TOCTOU window instead of before it. Treat it
             // identically: stand down rather than let two `chroma-arbiter` threads write the
             // same shared pages.
-            let mask = match wear_mask(&sa, appreg, sessinfo, keyboard) {
-                Some(m) => m,
-                None => return Err(CreateError::AlreadyServing),
-            };
+            let mask = wear_mask(&sa, appreg, sessinfo, keyboard)?;
             Ok(ShmServer { sections, handles, _sa: Some(sa), mask: Some(mask) })
         }
 
@@ -1055,7 +1140,7 @@ pub mod server {
         /// adapter produces from effect commands).
         #[must_use]
         pub fn frames(&self) -> Vec<(u8, Vec<(u8, u8, u8)>)> {
-            self.read_device_frames()
+            self.read_device_frames_decoded()
                 .into_iter()
                 .map(|(dt, units)| (dt, units.iter().map(|u| u.rgb()).collect()))
                 .collect()
@@ -1256,6 +1341,11 @@ pub mod server {
     // A raw handle we promise to use soundly across threads (named kernel objects).
     struct SendHandle(HANDLE);
     unsafe impl Send for SendHandle {}
+    impl Drop for SendHandle {
+        fn drop(&mut self) {
+            unsafe { CloseHandle(self.0) };
+        }
+    }
 
     /// The single in-process arbiter slot. `mask_worn()` above is a CROSS-process check
     /// (it opens a named kernel mutex) and has a TOCTOU window: two threads racing
@@ -1282,9 +1372,7 @@ pub mod server {
             .is_ok()
     }
 
-    /// Release the in-process arbiter slot. Called exactly once, from [`MaskGuard::drop`]
-    /// (never from an error path — [`wear_mask`] only returns a `MaskGuard` after a
-    /// successful claim, so drop is the only place that owns a claim to give back).
+    /// Release the in-process arbiter slot after the guard drops or mask setup fails.
     fn release_mask_slot() {
         MASK_CLAIMED.store(false, std::sync::atomic::Ordering::Release);
     }
@@ -1313,9 +1401,7 @@ pub mod server {
             if let Some(t) = self.thread.take() {
                 crate::worker::join_bounded(t, MASK_GUARD_DROP_DEADLINE, "chroma-arbiter");
             }
-            for h in &self.held {
-                unsafe { CloseHandle(h.0) };
-            }
+            self.held.clear();
             release_mask_slot();
         }
     }
@@ -1325,17 +1411,16 @@ pub mod server {
     /// block above). `appreg`/`sessinfo` are the mapped `(pointer, size)` of the
     /// app-registry and `SessionInfo` sections the grant writes.
     ///
-    /// Returns `None` if another [`MaskGuard`] already owns the single in-process arbiter
-    /// slot ([`claim_mask_slot`]) — the caller (only [`ShmServer::create`]) must treat this
-    /// exactly like [`CreateError::AlreadyServing`] and stand down, never wearing a second mask.
+    /// Refuses a second in-process arbiter and fails if a required mask object or thread cannot
+    /// start. Partial masks must never be reported as native Chroma service.
     fn wear_mask(
         sa: &EveryoneSa,
         appreg: (usize, usize),
         sessinfo: (usize, usize),
         keyboard: (usize, usize),
-    ) -> Option<MaskGuard> {
+    ) -> Result<MaskGuard, CreateError> {
         if !claim_mask_slot() {
-            return None;
+            return Err(CreateError::AlreadyServing);
         }
         let mut held = Vec::new();
         // Arbitration mutexes: the three fixed + one per interactive user.
@@ -1345,9 +1430,11 @@ pub mod server {
         for g in &mutex_names {
             let w = wide(&format!("Global\\{g}"));
             let h = create_named_mutex(sa.ptr(), &w);
-            if !h.is_null() {
-                held.push(SendHandle(h));
+            if h.is_null() {
+                release_mask_slot();
+                return Err(io::Error::last_os_error().into());
             }
+            held.push(SendHandle(h));
         }
         // Events the game wants held SIGNALLED. Created manual-reset + START signalled and
         // kept alive in `held` for the server's lifetime. A manual-reset event stays set
@@ -1356,17 +1443,24 @@ pub mod server {
         for g in MASK_SIGNALLED_EVENTS {
             let w = wide(&format!("Global\\{g}"));
             let h = unsafe { CreateEventW(sa.ptr(), 1, 1, w.as_ptr()) }; // manual-reset, START signalled
-            if !h.is_null() {
-                held.push(SendHandle(h));
+            if h.is_null() {
+                release_mask_slot();
+                return Err(io::Error::last_os_error().into());
             }
+            held.push(SendHandle(h));
         }
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop_thread = std::sync::Arc::clone(&stop);
         let thread = crate::worker::spawn_named("chroma-arbiter", move || {
             arbiter_loop(appreg, sessinfo, keyboard, stop_thread);
-        })
-        .ok();
-        Some(MaskGuard { held, stop, thread })
+        });
+        match thread {
+            Ok(thread) => Ok(MaskGuard { held, stop, thread: Some(thread) }),
+            Err(err) => {
+                release_mask_slot();
+                Err(err.into())
+            }
+        }
     }
 
     /// How often the quiet arbiter checks its state. Client-owned transport objects make
@@ -1949,17 +2043,8 @@ pub mod server {
         fn drop(&mut self) {
             // Stop the arbiter thread FIRST — it writes into the sections we unmap below.
             drop(self.mask.take());
-            for s in &self.sections {
-                unsafe {
-                    UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
-                        Value: s.view.cast::<core::ffi::c_void>(),
-                    });
-                    CloseHandle(s.mapping);
-                }
-            }
-            for h in &self.handles {
-                unsafe { CloseHandle(*h) };
-            }
+            self.sections.clear();
+            self.handles.clear();
         }
     }
     #[cfg(test)]
@@ -1968,6 +2053,121 @@ pub mod server {
         use super::super::{CONTROL_SECTION, parse_roster};
         use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
         use windows_sys::Win32::System::Threading::{ReleaseMutex, WaitForSingleObject};
+
+        fn seed_test_name() -> String {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos();
+            format!(r"Local\neuron-chroma-seed-{}-{stamp}", std::process::id())
+        }
+
+        #[test]
+        fn section_seed_keeps_a_mapping_open_until_drop() {
+            let name = seed_test_name();
+            let seed = SectionSeed::create_named([(name.clone(), 4096)]).expect("seed local mapping");
+            assert_eq!(seed.section_count(), 1);
+            let wide_name = wide(&name);
+            let opened = unsafe { OpenFileMappingW(FILE_MAP_ALL_ACCESS, 0, wide_name.as_ptr()) };
+            assert!(!opened.is_null(), "limited client can open the seeded mapping");
+            unsafe { CloseHandle(opened) };
+            drop(seed);
+            let after = unsafe { OpenFileMappingW(FILE_MAP_ALL_ACCESS, 0, wide_name.as_ptr()) };
+            assert!(after.is_null(), "the final handle closes when the seed drops");
+        }
+
+        /// A local named mapping exercises the broker-to-client contract without claiming any
+        /// Global Chroma names. The captured device page is copied through the same volatile
+        /// snapshot path used by `ShmServer`, then decoded by the production parser.
+        ///
+        /// `cargo test -p neuron-host --features bridge synthetic_mapping_snapshot_decodes_frame -- --nocapture`
+        #[test]
+        fn synthetic_mapping_snapshot_decodes_frame() {
+            let name = seed_test_name();
+            let bytes = include_bytes!("chroma_shm_data/overwatch-keyboard-section.bin");
+            let seed = SectionSeed::create_named([(name.clone(), bytes.len())])
+                .expect("create synthetic broker mapping");
+            let wide_name = wide(&name);
+            let client = unsafe { OpenFileMappingW(FILE_MAP_ALL_ACCESS, 0, wide_name.as_ptr()) };
+            assert!(!client.is_null(), "synthetic client opens broker mapping");
+            let view = unsafe { MapViewOfFile(client, FILE_MAP_ALL_ACCESS, 0, 0, bytes.len()) };
+            assert!(!view.Value.is_null(), "synthetic client maps broker section");
+            // SAFETY: the view is writable and exactly `bytes.len()` bytes, matching the mapped
+            // section. This simulates one completed game frame in shared memory.
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), view.Value.cast::<u8>(), bytes.len()) };
+
+            let reader_mapping = unsafe { OpenFileMappingW(FILE_MAP_WRITE, 0, wide_name.as_ptr()) };
+            assert!(!reader_mapping.is_null(), "read-alongside client opens mapping");
+            let reader_view = unsafe { MapViewOfFile(reader_mapping, FILE_MAP_WRITE, 0, 0, bytes.len()) };
+            assert!(!reader_view.Value.is_null(), "read-alongside client maps section");
+            let server = ShmServer {
+                sections: vec![MappedSection {
+                    guid: super::super::device_section(0x01).expect("keyboard section"),
+                    mapping: reader_mapping,
+                    view: reader_view.Value.cast::<u8>(),
+                    size: bytes.len(),
+                }],
+                handles: Vec::new(),
+                _sa: None,
+                mask: None,
+            };
+            let raw_frames = server.read_device_frames();
+            assert_eq!(raw_frames.len(), 1);
+            assert_eq!(raw_frames[0].0, 0x01);
+            assert!(!raw_frames[0].1.is_empty());
+            assert!(raw_frames[0].1.iter().all(|u| u.raw() == [0x56, 0x57, 0xf6, 0x02]));
+
+            let decoded_frames = server.read_device_frames_decoded();
+            let fixture_decode = super::super::parse_frame_decoded(bytes).expect("decode captured frame");
+            assert_eq!(decoded_frames.len(), 1);
+            assert_eq!(decoded_frames[0], (0x01, fixture_decode.1));
+
+            let rgb_frames = server.frames();
+            assert_eq!(rgb_frames.len(), 1);
+            assert_eq!(rgb_frames[0].0, 0x01);
+            assert_eq!(
+                rgb_frames[0].1,
+                decoded_frames[0].1.iter().map(|u| u.rgb()).collect::<Vec<_>>(),
+            );
+
+            drop(server);
+            unsafe {
+                UnmapViewOfFile(view);
+                CloseHandle(client);
+            }
+            drop(seed);
+        }
+
+        #[test]
+        fn section_seed_rejects_an_existing_undersized_mapping() {
+            let name = seed_test_name();
+            let wide_name = wide(&name);
+            let small = unsafe {
+                CreateFileMappingW(
+                    INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE,
+                    0, 4096, wide_name.as_ptr(),
+                )
+            };
+            assert!(!small.is_null(), "create undersized local mapping");
+            let result = SectionSeed::create_named([(name, 8192)]);
+            assert!(result.is_err(), "a stale small section cannot pass readiness");
+            unsafe { CloseHandle(small) };
+        }
+
+        /// A broker install check. Opens every fixed section from this test process at Limited
+        /// privilege and creates no objects or device output.
+        #[test]
+        #[ignore = "needs the protected Chroma broker running on this machine"]
+        fn chroma_broker_seeded_sections_present() {
+            assert!(seeded_sections_present(), "a required native Chroma section is absent or inaccessible");
+        }
+
+        /// Confirms a live tray owns the native server mask without creating or writing it.
+        #[test]
+        #[ignore = "needs the regular tray serving native Chroma on this machine"]
+        fn chroma_live_mask_worn() {
+            assert!(mask_worn(), "the regular tray is not serving native Chroma");
+        }
 
         /// Read-only snapshot of whatever Chroma server is live right now: who is registered,
         /// which session is active, what the roster says, and whether any device buffer is

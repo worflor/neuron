@@ -127,3 +127,11 @@ features = [
 [dev-dependencies]
 proptest = "1"
 static_assertions = "1.1"
+ureq = "3"
+sha2 = "0.10"
+tar = "0.4"
+flate2 = "1"
+
+[[test]]
+name = "build_script"
+path = "build.rs"

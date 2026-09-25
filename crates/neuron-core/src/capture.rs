@@ -147,11 +147,81 @@ pub fn key_down(_vk: i32) -> bool {
 /// and detects its own down-edges off this shared state, so neither drains the other — exactly how the
 /// VK path already works (a consume-once queue would let one consumer steal the press from the other).
 static MACRO_HELD: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static KEY_TRANSITIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(windows)]
+static KEY_WAKE_EVENTS: std::sync::Mutex<Vec<isize>> = std::sync::Mutex::new(Vec::new());
+
+/// One subscriber's event for raw-input state changes. Each watcher gets its own event so a
+/// transition can wake every consumer, even when several capture windows are listening.
+#[cfg(windows)]
+pub struct KeyTransitionWake(isize);
+
+#[cfg(windows)]
+impl KeyTransitionWake {
+    #[must_use]
+    pub fn handle(&self) -> windows_sys::Win32::Foundation::HANDLE {
+        self.0 as windows_sys::Win32::Foundation::HANDLE
+    }
+}
+
+#[cfg(windows)]
+impl Drop for KeyTransitionWake {
+    fn drop(&mut self) {
+        let mut events = KEY_WAKE_EVENTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        events.retain(|&h| h != self.0);
+        // SAFETY: the handle was created by subscribe_key_transitions, and is no longer visible
+        // to the producer while the registry lock is held.
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.handle()); }
+    }
+}
+
+/// Subscribe a capture window to held-state transitions from the input listener.
+#[cfg(windows)]
+#[must_use]
+pub fn subscribe_key_transitions() -> Option<KeyTransitionWake> {
+    // SAFETY: unnamed, initially clear auto-reset event with no security descriptor.
+    let handle = unsafe {
+        windows_sys::Win32::System::Threading::CreateEventW(
+            std::ptr::null(), 0, 0, std::ptr::null(),
+        )
+    };
+    if handle.is_null() {
+        return None;
+    }
+    let wake = KeyTransitionWake(handle as isize);
+    KEY_WAKE_EVENTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(wake.0);
+    Some(wake)
+}
+
+/// A shared change stamp for lighting consumers that sample key state. Each consumer retains its
+/// own last stamp, so the device stream and preview can both observe the same transition.
+#[must_use]
+pub fn key_transition_generation() -> u64 {
+    KEY_TRANSITIONS.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Called by the input listener on a real keyboard down/up transition.
+pub fn note_key_transition() {
+    KEY_TRANSITIONS.fetch_add(1, std::sync::atomic::Ordering::Release);
+    #[cfg(windows)]
+    {
+        let events = KEY_WAKE_EVENTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for &handle in events.iter() {
+            // SAFETY: each handle is held open by its subscriber while present in the registry.
+            unsafe { windows_sys::Win32::System::Threading::SetEvent(
+                handle as windows_sys::Win32::Foundation::HANDLE,
+            ); }
+        }
+    }
+}
 
 /// Store the live macro-key held mask — called by the macro-key reader on EVERY `0x04` report,
 /// including an all-released report (mask `0`), so RELEASES propagate and the next press re-detects.
 pub fn set_macro_held(mask: u8) {
-    MACRO_HELD.store(mask, std::sync::atomic::Ordering::Relaxed);
+    if MACRO_HELD.swap(mask, std::sync::atomic::Ordering::Relaxed) != mask {
+        note_key_transition();
+    }
 }
 
 /// Whether the `i`-th macro key (M(i+1)) is currently held — the macro-key analogue of [`key_down`].
@@ -262,5 +332,20 @@ mod tests {
         // On non-Windows this is a stub; on Windows it is a pure read. Either way: no panic,
         // and it never synthesises input (so it is gate-independent).
         let _ = key_down(0x41);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn key_transition_wakes_every_capture_subscriber() {
+        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+        let first = subscribe_key_transitions().expect("first wake event");
+        let second = subscribe_key_transitions().expect("second wake event");
+        note_key_transition();
+        // SAFETY: both subscriber handles remain open for these nonblocking waits.
+        unsafe {
+            assert_eq!(WaitForSingleObject(first.handle(), 0), WAIT_OBJECT_0);
+            assert_eq!(WaitForSingleObject(second.handle(), 0), WAIT_OBJECT_0);
+        }
     }
 }

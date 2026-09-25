@@ -61,6 +61,23 @@ fn grid_wire(c: slint::Color) -> Rgb {
     }
 }
 
+/// Update the live LED model in place, creating it only when its shape is wrong.
+/// Animated previews call this repeatedly; row writes preserve the rendered items.
+fn update_grid_model(state: &State, px: Vec<slint::Color>) {
+    let existing = state.get_grid_px();
+    if let Some(model) = existing.as_any().downcast_ref::<VecModel<slint::Color>>() {
+        if model.row_count() == px.len() {
+            for (i, color) in px.into_iter().enumerate() {
+                if model.row_data(i) != Some(color) {
+                    model.set_row_data(i, color);
+                }
+            }
+            return;
+        }
+    }
+    state.set_grid_px(ModelRc::new(VecModel::from(px)));
+}
+
 /// The app's weak handle, installed ONCE at startup — the reach-back a non-UI subsystem
 /// (`hidwatch`'s hardware-mute bridge, off a reader thread) needs to post onto the UI thread without
 /// being threaded through as a parameter down through `hidwatch`/`decode`/`bridge_mic_mute`.
@@ -448,12 +465,24 @@ fn current_action(st: &State) -> (String, String) {
 
 /// The ARM stance (0 OBSERVE · 1 DEVICE · 2 INPUT · 3 LIVE) from the two live gates: writes-paused +
 /// input-armed. The segmented selector and the two header pills both reflect this one truth.
-fn arm_stance(paused: bool, armed: bool) -> i32 {
+pub(crate) fn arm_stance(paused: bool, armed: bool) -> i32 {
     match (paused, armed) {
         (true, false) => 0,
         (false, false) => 1,
         (true, true) => 2,
         (false, true) => 3,
+    }
+}
+
+/// Every GUI path into input authority uses the same two-click confirmation.
+fn confirm_input_arm(st: &State) -> bool {
+    if st.get_input_arm_pending() {
+        st.set_input_arm_pending(false);
+        true
+    } else {
+        st.set_input_arm_pending(true);
+        st.set_status_line("arm input & macros? confirm within 2.5s".into());
+        false
     }
 }
 
@@ -648,9 +677,9 @@ fn render_material_bufs(
     let t = t * 0.5;
     // HQ: render ABOVE the display size (tiles ~168px) so the swatch downsamples crisp, not blurry.
     let (w, h) = (220usize, 132usize); // 5:3 aspect
-    mats.iter()
-        .map(|m| {
-            let rgba = crate::weave::material_preview_rgba(m, w, h, t);
+    crate::weave::material_previews_rgba(mats, w, h, t)
+        .into_iter()
+        .map(|rgba| {
             let mut buf = SharedPixelBuffer::<Rgba8Pixel>::new(w as u32, h as u32);
             buf.make_mut_bytes().copy_from_slice(&rgba);
             buf
@@ -675,16 +704,35 @@ fn upload_material_cards(app: &AppWindow, bufs: Vec<SharedPixelBuffer<Rgba8Pixel
     match existing.as_any().downcast_ref::<VecModel<MaterialCard>>() {
         Some(vm) if vm.row_count() == n => {
             let showing_alt = state.get_material_show_alt();
+            let same_pixels = |image: &Image, buf: &SharedPixelBuffer<Rgba8Pixel>| {
+                image.to_rgba8().is_some_and(|current| {
+                    current.width() == buf.width()
+                        && current.height() == buf.height()
+                        && current.as_bytes() == buf.as_bytes()
+                })
+            };
+            // A static frame needs neither texture uploads nor another crossfade.
+            let changed = bufs.iter().enumerate().any(|(i, buf)| {
+                vm.row_data(i).is_none_or(|row| {
+                    let shown = if showing_alt { &row.swatch_alt } else { &row.swatch };
+                    !same_pixels(shown, buf)
+                })
+            });
+            if !changed {
+                return;
+            }
             for (i, buf) in bufs.into_iter().enumerate() {
                 if let Some(mut row) = vm.row_data(i) {
-                    let img = Image::from_rgba8(buf);
                     // write the slot the user is NOT looking at
                     if showing_alt {
-                        row.swatch = img;
-                    } else {
-                        row.swatch_alt = img;
+                        if !same_pixels(&row.swatch, &buf) {
+                            row.swatch = Image::from_rgba8(buf);
+                            vm.set_row_data(i, row);
+                        }
+                    } else if !same_pixels(&row.swatch_alt, &buf) {
+                        row.swatch_alt = Image::from_rgba8(buf);
+                        vm.set_row_data(i, row);
                     }
-                    vm.set_row_data(i, row);
                 }
             }
             // one flip for the whole batch → every tile fades in step
@@ -1387,8 +1435,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
     // a truly-fresh install gets the bundled exemplar macro before the registry first reads disk.
     neuron::macros::macro_host::seed_default_macros();
     refresh_beacon_macros(app);
-    // the WORKSHOP catalog — every macro on disk as an emergent card (off-thread parse for summaries).
-    refresh_macro_catalog(app);
+    // The WORKSHOP catalog parses macros through Python; build it when the user opens BINDINGS.
     // seed the macro constructor's canvas so its root +add exists from FIRST paint. The editor opens
     // in BLOCKS mode, but `refresh-macro-blocks` only fires on a toggle-to-blocks — so without this an
     // empty canvas had no +add and the very first step was unreachable until a code-view round-trip
@@ -1849,7 +1896,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 let n = (rows * cols) as usize;
                 if is_empty {
                     // an empty stack = a dark device; mirror that honestly
-                    st.set_grid_px(ModelRc::new(VecModel::from(vec![GRID_OFF; n])));
+                    update_grid_model(&st, vec![GRID_OFF; n]);
                     cache.replace(None);
                     return;
                 }
@@ -1880,7 +1927,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
                     .iter()
                     .map(|p| grid_display(p.r, p.g, p.b))
                     .collect();
-                st.set_grid_px(ModelRc::new(VecModel::from(px)));
+                update_grid_model(&st, px);
             }
         });
     });
@@ -4654,8 +4701,17 @@ pub fn install(app: &AppWindow) -> SharedRt {
                     return;
                 }
                 let armed = !neuron::action::input_armed();
+                if armed && !confirm_input_arm(&st) {
+                    return;
+                }
+                st.set_input_arm_pending(false);
                 neuron::action::arm_input(armed);
                 neuron::macros::macro_host().set_armed(armed); // mirror SAFE/arm into the macro sidecar
+                if armed {
+                    crate::worker::spawn_detached("neuron-macro-warm", || {
+                        let _ = neuron::macros::macro_host().ensure_warm();
+                    });
+                }
                 st.set_input_armed(armed);
                 st.set_arm_stance(arm_stance(neuron::writes::writes_paused(), armed));
                 st.set_status_line(
@@ -4687,6 +4743,10 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 let safety = mode.state();
                 let paused = safety.writes_paused;
                 let armed = safety.input_armed;
+                if armed && !neuron::action::input_armed() && !confirm_input_arm(&st) {
+                    return;
+                }
+                st.set_input_arm_pending(false);
                 let was_paused = neuron::writes::writes_paused(); // the gate BEFORE this stance move
                 let stopped_anim = {
                     let mut s = sh.borrow_mut();
@@ -4698,6 +4758,11 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 };
                 neuron::safety::set_mode(mode);
                 neuron::macros::macro_host().set_armed(armed);
+                if armed {
+                    crate::worker::spawn_detached("neuron-macro-warm", || {
+                        let _ = neuron::macros::macro_host().ensure_warm();
+                    });
+                }
                 if stopped_anim {
                     st.set_animating(false);
                     st.set_applied_effect(-1);
@@ -6836,6 +6901,7 @@ fn refresh_lod_readout(app: &AppWindow, sh: &SharedRt) {
 /// expects a profile to be.
 pub fn note_live_profile(app: &AppWindow, name: &str) {
     let st = app.global::<State>();
+    refresh_active_apply(&st);
     let changed = st.get_active_profile() != name;
     if changed {
         st.set_active_profile(name.into());
@@ -6916,6 +6982,12 @@ pub fn note_live_profile(app: &AppWindow, name: &str) {
         flush_lighting_save();
         let _ = reapply_all_boards(app, sh);
     });
+}
+
+fn refresh_active_apply(st: &State) {
+    let missing = neuron::profile::active_missing();
+    st.set_profile_degraded_count(missing.len() as i32);
+    st.set_profile_degraded_detail(missing.join(" · ").into());
 }
 
 /// The focused app changed — light the app-rule contact that's currently winning.
@@ -7430,7 +7502,7 @@ static MACRO_CATALOG_BUILDING: std::sync::atomic::AtomicBool =
 /// count, and the trigger(s) that fire it. The cheap parts (the file list, option counts, the trigger
 /// cross-ref) run here on the UI thread; the per-macro PARSE the summary needs goes through the warm
 /// sidecar (blocks up to `FIRE_BUDGET`), so it runs OFF the UI thread and posts the finished model back.
-fn refresh_macro_catalog(app: &AppWindow) {
+pub(crate) fn refresh_macro_catalog(app: &AppWindow) {
     use std::sync::atomic::Ordering;
     let macros = neuron::macros::macro_host::scan_macro_dir();
     if macros.is_empty() {
@@ -7721,7 +7793,7 @@ fn apply_scanned_devices(
             // scan read, so it wins. Without this the scan silently reverts it and nothing corrects
             // the view until the next change — the same stale readout this push path exists to fix,
             // reintroduced by the path that was supposed to be authoritative.
-            dpi: match neuron::confirm::dpi_since(d.pid, scan_started) {
+            dpi: match neuron::confirm::dpi_since_unit(d.pid, &d.instance, scan_started) {
                 Some(v) => format!("{v}").into(),
                 None => d.dpi.clone().into(),
             },
@@ -8144,6 +8216,7 @@ pub fn refresh_profiles(app: &AppWindow, sh: &SharedRt) {
     st.set_fallback_index(fallback_idx);
     st.set_profiles(ModelRc::new(VecModel::from(rows)));
     st.set_profile_names(ModelRc::new(VecModel::from(names)));
+    refresh_active_apply(&st);
     drop(s);
     // seed the low-friction save name (a device page write already told us what we're tuning —
     // never make the user re-type it) from the focused app, else a value descriptor.

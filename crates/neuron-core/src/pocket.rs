@@ -35,7 +35,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 // Standard clipboard format ids (stable Win32 constants; spelled out so this file needs no extra
@@ -319,6 +319,7 @@ fn slots() -> &'static Mutex<HashMap<String, Slot>> {
 /// Bumped on every successful move. The GUI watches this so it rebuilds its pocket representation
 /// (which re-hashes payloads to draw sigils) ONLY when something actually changed — never per-frame.
 static GEN: AtomicU64 = AtomicU64::new(0);
+static FAKE_MOVE_AUTHORIZED: AtomicBool = AtomicBool::new(false);
 
 /// The change counter — increments each time a pocket's contents move. See [`GEN`].
 pub fn generation() -> u64 {
@@ -361,7 +362,7 @@ pub fn activate(slot: &str, persist: bool) -> String {
         return format!("pocket{tag}: nothing to move");
     }
     // The move writes the clipboard, which mutates user state — gate it like every other synthesis.
-    if !crate::action::input_armed() {
+    if !crate::action::input_armed() && !FAKE_MOVE_AUTHORIZED.load(Ordering::SeqCst) {
         return format!("pocket{tag} [disarmed]");
     }
 
@@ -785,6 +786,11 @@ fn set_clipboard(p: &Pocket) -> bool {
         None => {}
     }
     drop(g);
+    // A fake move authorization must never fall through to the real clipboard if a test
+    // uninstalls its fake between the gate check and this write.
+    if !crate::action::input_armed() {
+        return false;
+    }
     imp::set_clipboard(p)
 }
 
@@ -792,7 +798,7 @@ fn set_clipboard(p: &Pocket) -> bool {
 /// non-destructively (it never touches the real OS clipboard). OFF in production unless installed.
 #[doc(hidden)]
 pub mod testclip {
-    use super::{fake_clip, load_all, slots, ClipFormat, FakeClip, Pocket, Slot};
+    use super::{fake_clip, load_all, slots, ClipFormat, FakeClip, Pocket, Slot, FAKE_MOVE_AUTHORIZED, Ordering};
 
     const CF_UNICODETEXT: u32 = 13;
 
@@ -849,7 +855,12 @@ pub mod testclip {
     }
     /// Uninstall the in-memory clipboard (restore OS-clipboard routing).
     pub fn uninstall() {
+        FAKE_MOVE_AUTHORIZED.store(false, Ordering::SeqCst);
         *fake_clip().lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+    /// Authorize pocket moves only against the installed in-memory clipboard.
+    pub fn authorize_moves(on: bool) {
+        FAKE_MOVE_AUTHORIZED.store(on, Ordering::SeqCst);
     }
     /// Clear the in-memory pocket store (the slot map) for test isolation.
     pub fn reset_store() {

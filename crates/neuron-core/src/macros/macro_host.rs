@@ -138,8 +138,8 @@ const BREAKER_MAX: u32 = 4;
 const BREAKER_WINDOW: Duration = Duration::from_secs(30);
 const BREAKER_COOLDOWN: Duration = Duration::from_secs(20);
 
-/// The process-global `MacroHost`. Lazily created (does NOT spawn the sidecar until first use or an
-/// explicit [`MacroHost::ensure_warm`] at app launch).
+/// The process-global `MacroHost`. Lazily created; the sidecar starts on first Python operation
+/// or explicit [`MacroHost::ensure_warm`].
 static MACRO_HOST: OnceLock<MacroHost> = OnceLock::new();
 
 /// Reach the process-global `MacroHost`.
@@ -1075,10 +1075,10 @@ impl MacroHost {
         }
     }
 
-    /// Spawn + warm the sidecar at app launch (off the UI thread). Idempotent; errors are
+    /// Spawn + warm the sidecar on demand (off the UI thread). Idempotent; errors are
     /// returned for surfacing but never fatal (the macro tier just stays disabled). The on-disk
     /// macro scan lives in the spawn path itself (see [`ensure_locked`]), so EVERY road to a warm
-    /// sidecar — GUI launch, `macro run <name>`, a respawn after a crash — sees the same world.
+    /// sidecar — deliberate GUI arm, `macro run <name>`, a respawn after a crash — sees the same world.
     pub fn ensure_warm(&self) -> Result<(), String> {
         let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         self.sync_manifest(&mut g);
@@ -2656,9 +2656,10 @@ mod tests {
     /// Shared setup for both death-race tests: isolate the run root, ensure a warm host with one
     /// registered echo macro, and return (host, ctx, tmp dir to clean up). Skips (returns `None`)
     /// when no bundled python runtime resolves — the same honest skip every other sidecar test uses.
-    fn death_race_setup(tag: &str) -> Option<(&'static MacroHost, crate::macros::context::Context, PathBuf)> {
+    fn death_race_setup(tag: &str) -> Option<(&'static MacroHost, crate::macros::context::Context, PathBuf, crate::runroot::RunDirPin)> {
         let tmp = std::env::temp_dir().join(format!("neuron_failpoint_race_{tag}_{}", std::process::id()));
         std::fs::create_dir_all(&tmp).ok()?;
+        let pin = crate::runroot::RunDirPin::to(&tmp);
         let host = macro_host();
         if !host.available() {
             eprintln!("skipping macro_host death-race ({tag}): bundled python runtime did not materialize");
@@ -2667,12 +2668,14 @@ mod tests {
         }
         host.set_armed(false); // the test macro is read-only; no input synthesis needed
         let src = "def macro(ctx):\n    return 'ok'\n";
-        if let Err(e) = host.register("fp_death_race", src) {
-            eprintln!("skipping macro_host death-race ({tag}): register failed: {e}");
-            let _ = std::fs::remove_dir_all(&tmp);
-            return None;
-        }
-        Some((host, death_race_ctx(), tmp))
+        host.register("fp_death_race", src)
+            .unwrap_or_else(|e| panic!("death-race setup ({tag}) failed to register macro: {e}"));
+        Some((host, death_race_ctx(), tmp, pin))
+    }
+
+    fn death_race_pid(host: &MacroHost) -> u32 {
+        let g = host.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        g.bound_session.as_ref().expect("BOUND macro session must be live").child.id()
     }
 
     #[cfg(windows)]
@@ -2700,12 +2703,11 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _env = crate::runroot::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some((host, ctx, tmp)) = death_race_setup("insert_after_clear") else { return };
-        let _pin = crate::runroot::RunDirPin::to(&tmp);
+        let Some((host, ctx, tmp, _pin)) = death_race_setup("insert_after_clear") else { return };
 
         let baseline = host.invoke("fp_death_race", &ctx);
         assert!(baseline.contains("ok"), "baseline invoke failed: {baseline}");
-        let pid_before = crate::prof::SIDECAR_PID.load(Ordering::Relaxed);
+        let pid_before = death_race_pid(host);
 
         // Freeze the NEXT insert-before-send window so mark_dead's clear (triggered by the kill
         // below) lands first, and the request's own insert follows it.
@@ -2754,7 +2756,7 @@ mod tests {
         // recovery: the next request must succeed against a freshly respawned sidecar.
         let healed = host.invoke("fp_death_race", &ctx);
         assert!(healed.contains("ok"), "post-race recovery failed: {healed}");
-        let pid_after = crate::prof::SIDECAR_PID.load(Ordering::Relaxed);
+        let pid_after = death_race_pid(host);
         // A live sidecar answering "ok" above already proves recovery respawned the child;
         // do NOT assert the PID changed — Windows can legitimately reuse the just-freed PID
         // for the respawn, which is not a recovery failure. Keep the read for the log only.
@@ -2779,12 +2781,11 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _env = crate::runroot::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some((host, ctx, tmp)) = death_race_setup("clear_after_insert") else { return };
-        let _pin = crate::runroot::RunDirPin::to(&tmp);
+        let Some((host, ctx, tmp, _pin)) = death_race_setup("clear_after_insert") else { return };
 
         let baseline = host.invoke("fp_death_race", &ctx);
         assert!(baseline.contains("ok"), "baseline invoke failed: {baseline}");
-        let pid_before = crate::prof::SIDECAR_PID.load(Ordering::Relaxed);
+        let pid_before = death_race_pid(host);
 
         // Freeze mark_dead itself (the reader thread, on EOF) right before it clears `pending`, so
         // a concurrent request's insert can land first.
@@ -2831,7 +2832,7 @@ mod tests {
 
         let healed = host.invoke("fp_death_race", &ctx);
         assert!(healed.contains("ok"), "post-race recovery failed: {healed}");
-        let pid_after = crate::prof::SIDECAR_PID.load(Ordering::Relaxed);
+        let pid_after = death_race_pid(host);
         // A live sidecar answering "ok" above already proves recovery respawned the child;
         // do NOT assert the PID changed — Windows can legitimately reuse the just-freed PID
         // for the respawn, which is not a recovery failure. Keep the read for the log only.

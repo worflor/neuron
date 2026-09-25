@@ -1351,20 +1351,28 @@ impl<'a> Lights<'a> {
 
             // Push only the changed rows; LATCH (commit the frame) only if we actually wrote ≥1 row.
             let mut sent_any = false;
+            let mut frame_complete = true;
             for &row in &changed {
                 if let Some(rep) = self.def.row_report(&frame, row) {
-                    self.dev.send_lighting_fast(&rep);
+                    if !self.dev.send_lighting_fast(&rep) {
+                        frame_complete = false;
+                        break;
+                    }
                     sent_any = true;
                 }
             }
-            if sent_any {
-                self.dev.send_lighting_fast(&display);
+            if sent_any && frame_complete && !self.dev.send_lighting_fast(&display) {
+                frame_complete = false;
             }
 
-            // Refresh the dedup cache IN PLACE (reuse the buffer; don't realloc each tick).
-            let buf = last_frame.get_or_insert_with(|| Vec::with_capacity(frame.len()));
-            buf.clear();
-            buf.extend_from_slice(&frame);
+            // An incomplete drain leaves device state uncertain; resend the next frame.
+            if frame_complete {
+                let buf = last_frame.get_or_insert_with(|| Vec::with_capacity(frame.len()));
+                buf.clear();
+                buf.extend_from_slice(&frame);
+            } else {
+                last_frame = None;
+            }
 
             // DEADLINE pacing: anchor the next wake to `next += dt` rather than `sleep(dt - work)`,
             // so a slow frame is compensated and the cadence can't drift; an overrun skips the sleep

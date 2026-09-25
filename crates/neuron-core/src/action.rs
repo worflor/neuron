@@ -2120,6 +2120,25 @@ pub fn input_armed() -> bool {
     crate::safety::input_armed()
 }
 
+/// Send Windows input only while the process-wide arm gate is open. Returns the number of
+/// events accepted by Windows; zero means disarmed or no event was accepted.
+#[cfg(windows)]
+pub fn send_win_input(inputs: &[windows_sys::Win32::UI::Input::KeyboardAndMouse::INPUT]) -> u32 {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{SendInput, INPUT};
+    if !input_armed() || inputs.is_empty() {
+        return 0;
+    }
+    let Ok(count) = u32::try_from(inputs.len()) else { return 0; };
+    let start = std::time::Instant::now();
+    // SAFETY: the slice is valid for `count` INPUT values for the duration of this call.
+    let sent = unsafe { SendInput(count, inputs.as_ptr(), std::mem::size_of::<INPUT>() as i32) };
+    crate::latency::SEND_INPUT.record(start.elapsed());
+    if sent > 0 {
+        crate::latency::mark_output();
+    }
+    sent
+}
+
 /// Whether process-spawning side-effects (`Action::Run`, macro `ScriptKind::Shell` / `File`, and
 /// the macro prelude's `run()` helper) are currently permitted. Tied to the SAME process-wide arm
 /// gate as [`input_armed`]: a macro that shells out `calc.exe` or `format C:` is just as much a
@@ -2140,7 +2159,7 @@ pub fn process_spawn_armed() -> bool {
 #[cfg(windows)]
 mod win_key {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
+        INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
         KEYEVENTF_UNICODE,
     };
 
@@ -2160,26 +2179,9 @@ mod win_key {
         }
     }
 
-    /// Issue one `SendInput` call — the single door every synthesised keystroke leaves through, so
-    /// it is the one honest place to stamp the latency instrument.
-    ///
-    /// `mark_output` runs AFTER the call, not before: the moment that matters to the user is when the
-    /// OS accepted the keystroke, so `press_to_output` should include the syscall rather than stop
-    /// just short of it. (It is a no-op unless this thread is servicing an input edge that has not
-    /// produced output yet — see `crate::latency`.)
-    unsafe fn emit(n: u32, inputs: *const INPUT) {
-        let t = std::time::Instant::now();
-        SendInput(n, inputs, std::mem::size_of::<INPUT>() as i32);
-        crate::latency::SEND_INPUT.record(t.elapsed());
-        crate::latency::mark_output();
-    }
-
     /// Send a single keyboard event (down or up).
     unsafe fn send_one(input: INPUT) {
-        if !super::input_armed() {
-            return;
-        }
-        emit(1, &raw const input);
+        super::send_win_input(std::slice::from_ref(&input));
     }
 
     /// Press a key down (no release) — pairs with [`up`] for real held-key macros.
@@ -2198,7 +2200,7 @@ mod win_key {
             return;
         }
         let inputs = [mk(vk, 0), mk(vk, KEYEVENTF_KEYUP)];
-        emit(inputs.len() as u32, inputs.as_ptr());
+        super::send_win_input(&inputs);
     }
 
     /// Type ONE character as a Unicode scan-code (down+up per UTF-16 unit) — layout-independent,
@@ -2227,7 +2229,7 @@ mod win_key {
             seq.push(uni(u, false));
             seq.push(uni(u, true));
         }
-        emit(seq.len() as u32, seq.as_ptr());
+        super::send_win_input(&seq);
     }
 }
 
@@ -2235,7 +2237,7 @@ mod win_key {
 mod win_mouse {
     use super::MouseButtonKind;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
+        INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
         MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
         MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL,
         MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, MOUSE_EVENT_FLAGS,
@@ -2266,21 +2268,9 @@ mod win_mouse {
         }
     }
 
-    /// Send a slice of mouse inputs in one atomic `SendInput` call. Instrumented for the same reason
-    /// as `win_key::emit` — a click is an output edge like a keystroke, and a mouse-bound macro's
-    /// `press_to_output` must read the same as a key-bound one's.
+    /// Send a slice of mouse inputs through the shared process-wide arm gate.
     unsafe fn send(inputs: &[INPUT]) {
-        if !super::input_armed() {
-            return;
-        }
-        let t = std::time::Instant::now();
-        SendInput(
-            inputs.len() as u32,
-            inputs.as_ptr(),
-            std::mem::size_of::<INPUT>() as i32,
-        );
-        crate::latency::SEND_INPUT.record(t.elapsed());
-        crate::latency::mark_output();
+        super::send_win_input(inputs);
     }
 
     /// Synthesize a full click (down+up) for a button, or one wheel notch for a scroll direction.

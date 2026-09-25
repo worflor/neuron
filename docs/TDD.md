@@ -50,24 +50,26 @@ Important non-code state:
 
 Startup flow:
 
-1. Pin the current directory to the executable directory so autostart does not read/write config under `C:\Windows\System32`.
+1. Set the disarmed startup stance, then resolve the run root from `NEURON_RUN_DIR`, a writable portable install directory, or per-user data. Config paths do not depend on the process current directory. A legacy build-tree migration holds a cross-process lock through marker creation, every no-clobber copy, and marker removal; an incomplete migration stops startup before config is read.
 2. Handle special one-shot paths: `--weave-proof` and, on Windows, `--purge-synapse`.
 3. Install panic logging and native-fault breadcrumbs into `neuron-crash.log`.
 4. On Windows, register application restart when Phoenix is enabled.
 5. On Windows, initialize COM as STA for winit/Slint/tray compatibility.
 6. Build the Slint window eagerly but hidden, install `glue`, and retain the window plus app runtime in `Resident`.
 7. Seed the tray from that real resident runtime, avoiding a second throwaway config/runtime load.
-8. Set the process-wide input arm state and start live dispatch with `dispatch::LiveRuntime::start`. On non-Windows builds, the UI reports live dispatch as unavailable instead of pretending a device backend exists.
-9. Warm the Python Macro Host sidecar on a background thread.
+8. Start live dispatch with `dispatch::LiveRuntime::start`. On non-Windows builds, the UI reports live dispatch as unavailable instead of pretending a device backend exists.
+9. Leave the Python Macro Host sidecar cold until input is armed or a macro editor action needs it.
 10. Start the beacon/spellweaving service.
 11. Show the window unless launch preferences request tray startup. `--tray` only starts hidden when `app.toml` says start-minimized; autostart can be configured for tray or visible-window launch.
 12. Run `slint::run_event_loop_until_quit`.
 
 The app is a single process, but not a single thread. Slint is the owner of UI state; worker threads post plain data back through `slint::invoke_from_event_loop`.
 
+The default Slint UI renderer is FemtoVG/OpenGL; software is compiled in and can be selected with `NEURON_RENDERER=software` for a machine with weak graphics support. A build with `wgpu-renderer` accepts `NEURON_RENDERER=wgpu` for an experimental WGPU UI path. WGPU can target Vulkan or Direct3D 12 on Windows and Metal on macOS, depending on the adapter and driver, but this does not establish neuron runtime support on those platforms. The layered Windows overlays and material composition remain CPU code. Backend selection precedes graphics-device initialization when the window opens, so a successful selection is not a fallback guarantee for a later driver failure. On the development machine WGPU increased idle CPU and memory, so it remains opt-in.
+
 Core long-lived workers:
 
-- UI event loop and 60 ms tray/hotkey pump in `main.rs`; slower housekeeping such as status aging, safety projection, tray menu sync, and reliability refresh is cadence-gated instead of recomputed every tick.
+- UI event loop and tray/hotkey event wake in `main.rs`; a 500 ms timer handles status aging, safety projection, tray menu sync, and reliability refresh.
 - On Windows, live dispatch worker in `dispatch.rs`; on non-Windows no live worker/command sender is installed and the UI reports the backend unavailable.
 - Beacon router and weave presenter in `beacon.rs`.
 - Python Macro Host sidecar and event reader in `neuron-core/src/macros`.
@@ -201,7 +203,7 @@ sequenceDiagram
     Glue->>Runtime: load registry, prefs, profiles, rules
     Main->>Tray: seed menu from resident Runtime
     Main->>Live: start(weak AppWindow, armed)
-    Main->>Macro: warm sidecar on background thread
+    Main->>Macro: set disarmed state; leave sidecar cold
     Main->>Beacon: start spellweaving/prompt service
     Main->>App: show window unless launch prefs request tray
     Main->>App: run Slint event loop
@@ -356,7 +358,8 @@ stateDiagram-v2
 Safety invariants:
 
 - Tests must not arm real input.
-- `neuron-app --safe` disarms input and macro sidecar authority, but does not automatically pause the global write gate.
+- A normal Windows GUI launch arms input when live dispatch starts, after the process has initialized disarmed. Crash recovery waits for a fresh user arm.
+- `neuron-app --safe` sets Observe mode before host or window startup, disarming input and pausing device writes.
 - `neuron-cli run --safe` disarms input and pauses writes.
 - App/window intents are routed before the device write gate; device/profile intents are routed after it.
 
@@ -364,9 +367,10 @@ Safety invariants:
 
 The current code is cleaner than the original shape, but these are still deliberate boundaries:
 
-- The 60 ms UI timer is still the tray/hotkey pump. Slower UI housekeeping is cadence-gated, not fully event-driven.
+- Tray and hotkey actions wake the UI event loop directly. A 500 ms timer handles aging status and background recovery.
 - Foreground app switching still polls the active app on the live worker. A platform event hook would be more elegant on Windows, with polling as fallback for cross-platform backends.
-- Macro Host warmup is a startup latency tradeoff. It is off the UI thread, but it is still an eager sidecar cost.
+- Macro Host stays cold at normal startup even though live dispatch arms input. A first macro, a later manual arm, or a macro editor action warms it on demand.
+- Typing Heat samples OS key state after Raw Input transitions, with a 500 ms reconciliation scan when a transient capture redirects the listener. The lighting stream still renders at its selected frame rate while active.
 - `DeviceSession` caches by command, not by physical-device object. That is simple and avoids most repeated enumeration/handshake cost, but a per-physical-device cache would be tighter if multiple hot commands pound the same device.
 
 ## 5. Core Event Flow
@@ -383,7 +387,7 @@ write state -> save if needed -> refresh invalidated models -> request live relo
 
 Examples:
 
-- GUI-authored binding edits update `profiles/gui.rules.toml`, refresh rule views, and call `dispatch::request_reload`. Imported sidecars can live in any `profiles/*.rules.toml`; `bindings.toml` is lifted into typed `Trigger::Input -> Action` rules by the live builder.
+- GUI-authored binding edits update the always-live `profiles/gui.rules.toml`, refresh rule views, and call `dispatch::request_reload`. Imported `<name>.rules.toml` binds join the engine only while that profile is active; `bindings.toml` is lifted into typed `Trigger::Input -> Action` rules by the live builder.
 - Cast/radial/glyph edits save `cast.toml` or `gestures.json`, refresh their panels, and call `dispatch::request_reload`.
 - App rules save `apps.toml`, refresh rule views, and call `dispatch::request_reload`.
 - Profile apply writes live device/profile state, updates gaming-mode policy for the low-level hook, and mirrors the active profile into the process-global profile cursor used by live profile cycling.
@@ -440,10 +444,12 @@ The engine folds:
 - `cast.toml` radial sectors into `Trigger::RadialSector` rules.
 - `cast.toml` glyph bindings into `Trigger::Gesture` rules.
 - HyperShift radial sectors into layer-tagged rules when enabled.
-- `profiles/*.rules.toml` sidecars verbatim, preserving `Rule.layer`.
+- `profiles/gui.rules.toml` and the active profile's `<name>.rules.toml` sidecar, preserving `Rule.layer`.
 - `apps.toml` into `Trigger::AppFocus -> Action::ProfileSwitch` rules.
 
 The GUI rule table uses the same `build_runtime_from(...).engine.to_rules()` assembly for read-only rows, excluding only `profiles/gui.rules.toml` so GUI-authored rows can remain removable with stable edit indexes.
+
+Profile delete, rename, save, and imported-rules writes share an on-disk lifecycle lock. A rules loader also takes that lock and repairs an interrupted delete before reading: it restores a staged sidecar when its profile still exists and finishes deleting the stage when the profile is gone. Conflicting canonical and staged sidecars are preserved and reported. Profile listing and rules loading stop on a recovery failure.
 
 The matcher itself is `neuron-core/src/engine.rs`. It supports exact trigger matching, PID-optional input matching, substring app-focus matching, held-layer resolution, and deterministic ordering: held layers first, base layer last.
 
@@ -509,9 +515,11 @@ Safety model:
 
 Everything in §5.5 assumes a device is already *modeled*. This is how one gets modeled, and how its live button/event reports are read. The seam is the `Dialect` trait (`neuron-core/src/dialect.rs`): bytes live below it, `Capability` semantics above it, and per-device wiring (opcodes, geometry, quirks) lives in TOML neither layer hardcodes.
 
-**Claiming is pipe-shape, never PID.** `claimed_by(info)` walks `DIALECTS = [razer, razer-audio, hidpp]` and returns the first whose `claims()` matches the HID pipe's signature — razer by `vid==0x1532 && feature_len==91`, razer-audio by the 64-byte Consumer-Control envelope, hidpp by output/input report shape. So a new device with a known shape auto-adopts with no code; a new *wire shape* lands on the unclaimed ledger (`synth.rs unclaimed_from`, surfaced as the device-page "N razer vendor pipes · no shared protocol" footer) until a dialect is written for it. The razer-audio dialect (Seiren) is the worked example of adding a third family: one `DIALECTS` entry, nothing above the seam changes.
+**Claiming is pipe-shape, never PID alone.** `claimed_by(info)` walks `DIALECTS = [razer, razer-audio, hidpp]` and returns the first whose `claims()` matches the HID pipe's signature — razer by `vid==0x1532 && feature_len==91`, razer-audio by the 64-byte Consumer-Control envelope, hidpp by a direct-attached Logitech pipe with a 20-byte LONG output report and a reply-capable input report. SHORT-only output pipes remain unclaimed until request framing exists. A new *wire shape* lands on the unclaimed ledger (`synth.rs unclaimed_from`, surfaced as the device-page "N razer vendor pipes · no shared protocol" footer) until a dialect is written for it. The razer-audio dialect (Seiren) is the worked example of adding another family: one `DIALECTS` entry, nothing above the seam changes.
 
 **Synthesis mints evidence-typed beliefs.** `discover.rs`/`synth.rs` probe the getter space read-only against a universal command catalog, keep only commands the device answers SUCCESS for, and emit a paired setter only when its getter answered ("writes are not probes"). `Proven<T>` has no public constructor outside the probe, so code above the seam cannot forge evidence; `Heuristic<T>` marks era-inference (tx cohort, and the rows×cols geometry guess — mouse `(1,2)` else keyboard `(6,22)`, the one fact no getter reveals). The result is written to `devices/auto/<dialect>-<pid>.toml`; a curated `devices/*.toml` shadows it. The one field synthesis cannot prove is the transaction id (a wrong-tx write ACKs then no-ops); `first_light_heal` walks the cohort `[0x1F,0x3F,0xFF,0x9F]` on first lighting apply and rewrites the auto file when read-back proves a different tx.
+
+**Razer replies are complete frames.** The 91-byte dialect and discovery path require a full transfer, report id 0, matching transaction/class/id, valid XOR CRC, a bounded data size and zero reserved tail before consuming status or args. The wire CRC excludes status and transaction bytes; the transaction echo rejects stale replies but cannot checksum those bytes. The 64-byte audio family has its own envelope and still uses the shared class/id echo filter. Fast lighting writes drain one reply; a failed or malformed drain invalidates the stream's frame cache so the next tick resends. These receive checks have deterministic mock coverage and still need a fresh live hardware run.
 
 **Input decode (`hidwatch.rs decode`)** reads device-pushed reports on the readable sibling pipes in priority order: a def's own `[events]` table, then the dialect's family vocabulary (`default_event_for`, e.g. razer-audio's `05 11` tap-mute), then the hardcoded 04/05 families:
 
@@ -541,7 +549,7 @@ The GUI combines them into four stances:
 
 Tests must never arm real input. The live dispatch worker starts only from `main`, not from UI tests.
 
-`neuron-app --safe` is narrower than the Observe stance: it disarms input and the macro sidecar, but does not by itself pause the global device-write gate. `neuron-cli run --safe` disarms input and pauses device writes.
+`neuron-app --safe` and `neuron-cli run --safe` both start in Observe: input disarmed and device writes paused. The app selects that stance before opening device or macro services.
 
 ### 6.2 Hot Path Blocking
 

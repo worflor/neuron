@@ -1294,6 +1294,7 @@ fn foreground_hwnd() -> isize {
 /// the cache serves last-known — the cast always proceeds.
 pub(crate) mod audio_cache {
     use std::sync::Mutex;
+    use std::time::{Duration, Instant};
 
     /// Trim an audio endpoint name to the identifying part: the hardware in parentheses if
     /// present ("Headset Earphone (Razer `BlackShark` V2)" → "Razer `BlackShark` V2"), else the
@@ -1360,6 +1361,12 @@ pub(crate) mod audio_cache {
     });
     static START: std::sync::Once = std::sync::Once::new();
 
+    struct Topology {
+        snap: Snap,
+        out_ctl: Option<neuron::audio::VolumeCtl>,
+        mic_ctl: Option<neuron::audio::VolumeCtl>,
+    }
+
     pub fn snap() -> Snap {
         CACHE
             .lock()
@@ -1370,39 +1377,48 @@ pub(crate) mod audio_cache {
     /// Spawn the refresher once (from `beacon::start`). Idempotent.
     pub fn ensure() {
         START.call_once(|| {
-            crate::worker::spawn_detached("neuron-audio-cache", || loop {
-                let s = read();
-                *CACHE
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = s;
-                std::thread::sleep(std::time::Duration::from_millis(400));
+            crate::worker::spawn_detached("neuron-audio-cache", || {
+                // Endpoint discovery and COM activation are much costlier than reading held controls.
+                let mut topology = read_topology();
+                let mut topology_at = Instant::now();
+                let mut publish_topology = true;
+                loop {
+                    if topology_at.elapsed() >= Duration::from_secs(2) {
+                        topology = read_topology();
+                        topology_at = Instant::now();
+                        publish_topology = true;
+                    }
+                    let out = topology.out_ctl.as_ref().map(|c| (c.get_volume(), c.get_mute()));
+                    let mic = topology.mic_ctl.as_ref().map(|c| (c.get_volume(), c.get_mute()));
+                    let mut cache = CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if publish_topology {
+                        *cache = topology.snap.clone();
+                        publish_topology = false;
+                    }
+                    cache.out = out;
+                    cache.mic = mic;
+                    drop(cache);
+                    std::thread::sleep(Duration::from_millis(400));
+                }
             });
         });
     }
 
-    fn read() -> Snap {
+    fn read_topology() -> Topology {
         let default_id = neuron::audio::default_render_id();
-        let renders: Vec<(String, String)> = neuron::audio::endpoints(neuron::audio::Flow::Render)
+        let renders: Vec<(String, String)> = neuron::audio::flip_candidates(&[])
             .into_iter()
             .map(|e| (e.name, e.id))
             .collect();
-        // the default render's reading + short name (resolve via the cached default id)
         let out_ep = neuron::audio::resolve_render(None);
         let out_name = out_ep
             .as_ref()
             .map(|e| short_device(&e.name));
-        let out = out_ep
-            .and_then(|e| neuron::audio::VolumeCtl::open(&e.id))
-            .map(|c| (c.get_volume(), c.get_mute()));
-        let mic = neuron::audio::resolve_capture(None)
-            .and_then(|e| neuron::audio::VolumeCtl::open(&e.id))
-            .map(|c| (c.get_volume(), c.get_mute()));
-        Snap {
-            out,
-            mic,
-            out_name,
-            renders,
-            default_id,
+        Topology {
+            snap: Snap { out_name, renders, default_id, ..Snap::default() },
+            out_ctl: out_ep.and_then(|e| neuron::audio::VolumeCtl::open(&e.id)),
+            mic_ctl: neuron::audio::resolve_capture(None)
+                .and_then(|e| neuron::audio::VolumeCtl::open(&e.id)),
         }
     }
 }

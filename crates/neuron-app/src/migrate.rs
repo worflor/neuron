@@ -165,7 +165,7 @@ pub fn apply(imp: &Imported) -> Result<String, String> {
         }
     }
     if !imp.rules.is_empty() {
-        match save_rules_sidecar(&name, &imp.rules) {
+        match save_rules_sidecar(&name, &imp.rules, !imp.profile.is_empty()) {
             Ok(path) => wrote.push(format!("{} binding(s) -> {}", imp.rules.len(), path)),
             Err(e) => return Err(format!("rules save failed: {e}")),
         }
@@ -178,7 +178,7 @@ pub fn apply(imp: &Imported) -> Result<String, String> {
 
 /// Write the imported rules to the sidecar PAIRED with the profile (`<sanitized-name>.rules.toml`,
 /// flat in `profiles/`). Returns the path written.
-fn save_rules_sidecar(name: &str, rules: &[neuron::engine::Rule]) -> Result<String, String> {
+fn save_rules_sidecar(name: &str, rules: &[neuron::engine::Rule], require_profile: bool) -> Result<String, String> {
     use neuron::engine::RuleDoc;
     std::fs::create_dir_all(neuron::profile::profiles_dir()).map_err(|e| e.to_string())?;
     // Derive from the profile's canonical path (same sanitization) so the sidecar can never diverge
@@ -188,7 +188,7 @@ fn save_rules_sidecar(name: &str, rules: &[neuron::engine::Rule]) -> Result<Stri
         rules: rules.to_vec(),
     };
     let body = toml::to_string_pretty(&doc).map_err(|e| e.to_string())?;
-    neuron::salvage::atomic_write(&path, body.as_bytes()).map_err(|e| e.to_string())?;
+    neuron::profile::Profile::write_rules(name, body.as_bytes(), require_profile)?;
     Ok(path.display().to_string())
 }
 

@@ -10,7 +10,7 @@ two small executables, one shared core. no account, no cloud, no telemetry. no "
 |---|---|
 | **what** | a tray-resident app and a CLI built to replace razer synapse |
 | **platform** | windows app + CLI in v0.1.1. linux app + CLI build from source, but the linux release is deferred and hardware control is unverified; no mac |
-| **hardware** | razer mice + keyboards over raw HID; daily-driven and hardware-verified on a Naga V2 Pro + BlackWidow Chroma V2; other `razer_report` devices can be probed for auto-synthesis but need their own hardware checks |
+| **hardware** | razer mice + keyboards over raw HID; daily-driven and hardware-verified on a Naga V2 Pro + BlackWidow Chroma V2. other `razer_report` devices need their own checks. experimental Logitech HID++ discovery is read-only and has no hardware verification |
 | **install** | use the windows installer or unpack its portable zip anywhere writable, or build from source: `cargo build --release` |
 | **footprint** | no vendor driver, account, or cloud; your config is plain TOML |
 | **license** | most of Neuron is GPL-3.0-or-later with a linking exception; Engram and the eigenmotion research modules have separate Woflo Labs community-source terms. [the exact split](LICENSE.md) |
@@ -45,7 +45,7 @@ to be clear, i love my razer hardware. this is anti-*synapse*: a multi-process, 
 
 neuron is the opposite design, on purpose:
 
-- **one resident app process, lazily windowed.** tray-resident, ~14 MB idle on my machine. the live remap loop runs *inside* it. Python macros use warm isolated worker processes only when the macro tier is active; they are not separate device-control daemons.
+- **one resident app process, with a hidden window in tray mode.** the live remap loop runs *inside* it. Python workers start on the first macro, a manual arm, or an editor action; they are not separate device-control daemons.
 - **no cloud, no account.** your config is plain TOML on your disk. you can read it, diff it, and check it into git if you want :P
 - **deterministic.** it changes what you ask and nothing else. no surprise re-enables, no "smart" anything you turned off three separate times. new Python macros start BOUND to Neuron's capability surface; add `# neuron: raw` when you deliberately want full Python to LITERALLY do whatever you want. true freedom, with the escalation visible in source.
 - **on-device first.** push settings to the mouse's onboard memory and you can uninstall *everything*. the dream is no software at all. (older hardware has no onboard storage, so we make do.)
@@ -74,7 +74,7 @@ the short tour. each line links into [the feature doc](docs/GDD.md), which has t
 | **[audio](docs/GDD.md#audio)** | mute and gain for any mic or output, and flipping your default device, from a binding. your mic's mute is itself a trigger. |
 | **[the spine](docs/GDD.md#the-spine)** | binds, hypershift layers with four stances (hold · latch · smart · one-shot), side-plate layers that scope binds to the plate actually seated on the mouse, and app-aware profile switching with a fallback so closing a game puts you back. |
 | **[spellweaving](docs/GDD.md#spellweaving)** | hold, weave a stroke, release, and it fires as a real keybind. recognised by **eigenmotion** — a stroke fit as a damped complex oscillator, where the eigenvalues are the stroke's identity, so it's invariant to where you drew it, how big, and how fast. the same capture drives a family of instruments: teleport, tether, whiteboard, glance, window verbs, dial, knockback, control. |
-| **[macros & beacons](docs/GDD.md#macros--beacons)** | bundled CPython stays **warm** in two authority domains: new macros are BOUND to Neuron's brokered capabilities, while `# neuron: raw` is the explicit full-Python escape hatch. every macro gets a frozen trigger snapshot, persistent state, macro composition, and beacons; RAW and BOUND never share an interpreter. don't want to write Python? the block builder edits the same source document and preserves module-level code/metadata while you work visually. |
+| **[macros & beacons](docs/GDD.md#macros--beacons)** | bundled CPython starts on demand and stays **warm** in two authority domains: new macros are BOUND to Neuron's brokered capabilities, while `# neuron: raw` is the explicit full-Python escape hatch. every macro gets a frozen trigger snapshot, persistent state, macro composition, and beacons; RAW and BOUND never share an interpreter. don't want to write Python? the block builder edits the same source document and preserves module-level code/metadata while you work visually. |
 | **[life after synapse](docs/GDD.md#life-after-synapse)** | import your synapse export (it's a zip of plaintext XML), purge synapse off the machine properly, and point `neuron discover` at hardware it's never seen to fingerprint it into a TOML. |
 | **[the app](docs/GDD.md#the-app)** | a tray-resident GUI in four sections — device, lighting, input, system — plus profiles as one object: its settings, its lighting, and its binds. |
 
@@ -112,10 +112,17 @@ gh attestation verify neuron-<version>-windows-x86_64.zip --repo worflor/neuron
 
 the installer places neuron in `%LOCALAPPDATA%\Programs\Neuron` and adds a Start menu shortcut. the zip stays portable: extract it anywhere writable and run `neuron-app.exe`.
 
+packages built from current source also carry an optional native Chroma broker. its
+[one-time protected setup](docs/PROTOCOL-HOST.md) needs an administrator PowerShell under the
+same Windows account; the tray and macros stay at limited privilege. Chroma REST and OpenRGB
+do not need that setup.
+
 ```
 cargo build --release      # -> target/release/neuron.exe (CLI) + neuron-app.exe (GUI)
 .\validate.ps1             # the gates: the suite, disarmed. the same ones CI runs.
 ```
+
+if the window cannot open on a VM, remote desktop, or an older graphics driver, launch the app with `NEURON_RENDERER=software`. that selects Slint's software UI renderer for that run; it does not change device control or the Windows overlay instruments.
 
 ### where your config lives
 
@@ -127,7 +134,7 @@ both binaries resolve every runtime path against one **run root**, so the tray a
 
 a symlink on your `PATH` doesn't change any of this: the binary resolves its real location, so config stays in the install folder and `~/.local/bin/neuron` is safe.
 
-upgrading from a build that kept config in `target/release`? the first launch carries it forward and prints where it went. it copies rather than moves, so the old folder stays put as a backup until you clean it.
+upgrading from a build that kept config in `target/release`? the first launch carries it forward and prints where it went. it copies rather than moves, so the old folder stays put as a backup until you clean it. if that copy fails, neuron reports the error and stops before using partial config; the next launch retries.
 
 the normal `--release` build is tuned for snappy runtime (ThinLTO, stripped). use `--profile release-size` if you want it small, `--profile release-fast` if you want it quick, and `RUSTFLAGS="-C target-cpu=native"` outside the repo for native codegen. we keep cargo's default `unwind` (not `abort`), deliberately (see the comment in `Cargo.toml`): cleanup still runs when something panics, so the app never leaves your gear in a state you didn't ask for. every panic gets logged.
 
@@ -144,7 +151,7 @@ neuron lighting mirror               paint one device's vitals onto another's LE
 neuron backup                        snapshot every device's full state
 neuron import-export prof.synapse3 --apply   eat a synapse export
 neuron run                           the remap daemon (esc to stop; --safe = observe only)
-neuron macro add lift my.py          register a python macro into the warm macro runtime
+neuron macro add lift my.py          register a python macro
 neuron macro prelude                 the `neuron` module reference (ctx + helpers + ask/notify)
 ```
 
@@ -192,14 +199,15 @@ the full per-feature status (solid to barely-started) lives in [state of the pro
 
 **linux is in progress**: the CLI builds and passes local tests, and a GUI opens, but v0.1.1 has no linux download. the [runtime parity branch](https://github.com/worflor/neuron/tree/codex/linux-runtime-parity) has work in progress on live input, overlays, and audio; its overlay still needs the windows renderer's full look. no razer device has tested the linux HID or input paths yet. if you try a source build, [tell me what happened](https://github.com/worflor/neuron/issues). mac seam is unwritten.
 
-on linux, [openrazer](https://github.com/openrazer/openrazer) is the mature option while neuron's hardware path gets real-device testing. if you want one panel for every RGB brand under the sun, that's [OpenRGB](https://openrgb.org). neuron is deliberately narrow: one vendor, one desk, gone deep.
+on linux, [openrazer](https://github.com/openrazer/openrazer) is the mature option while neuron's hardware path gets real-device testing. if you want one panel for every RGB brand under the sun, that's [OpenRGB](https://openrgb.org). neuron's verified writes remain Razer-focused; the experimental HID++ dialect only discovers read-only Logitech capabilities so far.
 
 every device write is sorted by how sure i am of it:
 
 | capability | status |
 |---|---|
 | reads: dpi, battery, polling, brightness, storage, lighting state | **proven** on hardware |
-| dpi · polling · brightness · lighting writes | **proven** on hardware |
+| dpi · polling · lighting writes | **proven** on hardware; current setters require matching read-back |
+| brightness write | **verified** only on devices with a matching getter; legacy BlackWidow brightness has no paired getter and now requires `NEURON_BRIGHTNESS_WRITE=1` for an explicitly unverified write |
 | dpi-stage table · scroll-stage select | **wire-confirmed** off synapse (USBPcap) + round-tripped |
 | symmetric lift-off distance | **proven**: reads back clean on the Naga |
 | asymmetric lift-off distance (split lift/landing) | **proven**: set/read round-trip on the Naga (the `0x0B/0x85` getter echoes mode=async + the lift/landing pair; the physical split confirmed by feel) |

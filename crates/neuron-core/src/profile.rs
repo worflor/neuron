@@ -7,6 +7,8 @@
 //! kit. Switch them by hand now; auto-switch per focused app later. Plain TOML in `profiles/`.
 
 use serde::{Deserialize, Serialize};
+use std::fs::{File, OpenOptions};
+use std::io;
 use std::path::PathBuf;
 
 use crate::capability::{self as cap, Store};
@@ -77,6 +79,53 @@ fn is_false(b: &bool) -> bool {
 #[must_use]
 pub fn profiles_dir() -> PathBuf {
     crate::runroot::run_root().join("profiles")
+}
+
+/// Hold the on-disk profile lifecycle lock while reading paired profile/rules state. A process
+/// interrupted during deletion may leave a staged sidecar; recovery runs before the caller reads.
+/// Dropping the returned file releases the lock on Windows, Linux, and macOS.
+pub fn lock_and_recover() -> io::Result<File> {
+    let dir = profiles_dir();
+    std::fs::create_dir_all(&dir)?;
+    let file = OpenOptions::new().read(true).write(true).create(true).truncate(false)
+        .open(dir.join(".lifecycle.lock"))?;
+    file.lock()?;
+    recover_staged_deletes(&dir)?;
+    Ok(file)
+}
+
+fn path_present(path: &std::path::Path) -> io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+fn recover_staged_deletes(dir: &std::path::Path) -> io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        let Some((sidecar_name, suffix)) = name.rsplit_once(".deleting-") else { continue };
+        let Some(stem) = sidecar_name.strip_suffix(".rules.toml") else { continue };
+        let Some((pid, id)) = suffix.split_once('-') else { continue };
+        if !pid.bytes().all(|b| b.is_ascii_digit()) || !id.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let profile = dir.join(format!("{stem}.toml"));
+        if path_present(&profile)? {
+            let sidecar = dir.join(sidecar_name);
+            if path_present(&sidecar)? {
+                return Err(io::Error::new(io::ErrorKind::AlreadyExists,
+                    format!("profile recovery kept both {} and {}", sidecar.display(), path.display())));
+            }
+            std::fs::rename(&path, sidecar)?;
+        } else {
+            std::fs::remove_file(path)?;
+        }
+    }
+    Ok(())
 }
 
 /// The stem the GUI's own authored rules live under (`gui.rules.toml`) — NOT a profile, and the
@@ -248,16 +297,10 @@ impl Profile {
     ///
     /// Missing files are not an error: delete is idempotent, and a profile with no sidecar is the
     /// common case. Only a real IO failure (permissions, a lock) surfaces.
-    /// ORDER MATTERS, and it is sidecar-first. Deleting a file cannot be rolled back (the contents
-    /// are gone), so the two removals are sequenced by which half-done state is survivable:
-    ///
-    /// * sidecar gone, profile left  — the profile is still listed and still deletable; you retry.
-    /// * profile gone, sidecar left  — an ORPHAN, which is the exact failure this function exists to
-    ///   prevent: the loader would fold those binds in for a profile that no longer exists, with no
-    ///   UI able to remove them, and the name would stay reserved against a re-import.
-    ///
-    /// So the sidecar goes first and a failure there aborts before the profile is touched.
+    /// Move the sidecar out of the loader's glob before removing the profile. If profile removal
+    /// fails, put the sidecar back so a failed delete cannot silently lose its binds.
     pub fn delete(name: &str) -> Result<(), String> {
+        let _lifecycle = lock_and_recover().map_err(|e| format!("profile recovery: {e}"))?;
         let remove = |path: PathBuf| -> Result<(), String> {
             match std::fs::remove_file(&path) {
                 Ok(()) => Ok(()),
@@ -269,10 +312,36 @@ impl Profile {
         };
         // `owned_rules_path` is None for a stray `gui.toml`, whose derived sidecar is the app's own
         // authored binds — delete the profile, never those.
-        if let Some(sidecar) = Self::owned_rules_path(name) {
-            remove(sidecar)?;
+        static DELETE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let owned = Self::owned_rules_path(name);
+        let has_sidecar = owned.as_ref()
+            .map(|p| path_present(p).map_err(|e| format!("{}: {e}", p.display())))
+            .transpose()?.unwrap_or(false);
+        let staged = if has_sidecar {
+            let sidecar = owned.ok_or_else(|| "missing rules path".to_string())?;
+            let kind = std::fs::symlink_metadata(&sidecar)
+                .map_err(|e| format!("{}: {e}", sidecar.display()))?.file_type();
+            if !kind.is_file() && !kind.is_symlink() {
+                return Err(format!("{} is not a rules file", sidecar.display()));
+            }
+            let id = DELETE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let temp = sidecar.with_extension(format!("toml.deleting-{}-{id}", std::process::id()));
+            if temp.exists() {
+                return Err(format!("refusing to overwrite staged rules {}", temp.display()));
+            }
+            std::fs::rename(&sidecar, &temp)
+                .map_err(|e| format!("{}: {e}", sidecar.display()))?;
+            Some((sidecar, temp))
+        } else {
+            None
+        };
+        if let Err(err) = remove(Self::path(name)) {
+            if let Some((sidecar, temp)) = staged {
+                std::fs::rename(&temp, &sidecar)
+                    .map_err(|restore| format!("{err}; restoring {}: {restore}", sidecar.display()))?;
+            }
+            return Err(err);
         }
-        remove(Self::path(name))?;
         // A deleted profile cannot stay the active one. Clearing here (not only in the GUI's own
         // delete path) means the CLI gets it too, so `active()` and `profiles/.active` can't be
         // left naming a file that isn't there — which would also keep a sidecar scope pinned to it.
@@ -282,6 +351,9 @@ impl Profile {
         // sidecar scope keyed off it — pointing at a profile that is gone.
         if Self::file_key(&active()) == Self::file_key(name) {
             set_active("");
+        }
+        if let Some((_, temp)) = staged {
+            remove(temp)?;
         }
         Ok(())
     }
@@ -294,6 +366,7 @@ impl Profile {
     /// The sidecar moves with the profile because the two are one object (see [`delete`](Self::delete));
     /// leaving it under the old stem would strand the binds under a name nothing loads.
     pub fn rename(from: &str, to: &str) -> Result<String, String> {
+        let _lifecycle = lock_and_recover().map_err(|e| format!("profile recovery: {e}"))?;
         if let Some(why) = name_conflict(to) {
             return Err(why);
         }
@@ -311,14 +384,14 @@ impl Profile {
         if Self::file_key(&target) == from_key {
             // same file (a case-only or punctuation-only edit): rewrite the display name in place.
             p.name = target.clone();
-            p.save()?;
+            p.save_unlocked()?;
             return Ok(target);
         }
         // Three steps, each with a rollback, because a partial rename is worse than no rename: two
         // profile files claiming one sidecar means the next load, delete, or re-import picks up
         // whichever it happens to see first.
         p.name = target.clone();
-        p.save()?;
+        p.save_unlocked()?;
         // The sidecar follows — unless the source is a stray `gui.toml`, whose derived sidecar is
         // the app's own authored binds and belongs to nobody's profile. A missing one is simply
         // nothing to move.
@@ -359,9 +432,24 @@ impl Profile {
     /// Persist the profile as plain TOML. Lighting lives in the profile itself now (the `lighting`
     /// layer stack), so there is no sidecar to reconcile — one write, done.
     pub fn save(&self) -> Result<(), String> {
+        let _lifecycle = lock_and_recover().map_err(|e| format!("profile recovery: {e}"))?;
+        self.save_unlocked()
+    }
+
+    fn save_unlocked(&self) -> Result<(), String> {
         std::fs::create_dir_all(profiles_dir()).map_err(|e| e.to_string())?;
         let s = toml::to_string_pretty(self).map_err(|e| e.to_string())?;
         crate::salvage::atomic_write(&Self::path(&self.name), s.as_bytes()).map_err(|e| e.to_string())
+    }
+
+    /// Write this profile's rules under the same lifecycle lock used by delete and rename.
+    /// `require_profile` is false only for a deliberately rules-only import.
+    pub fn write_rules(name: &str, body: &[u8], require_profile: bool) -> Result<(), String> {
+        let _lifecycle = lock_and_recover().map_err(|e| format!("profile recovery: {e}"))?;
+        if require_profile && !path_present(&Self::path(name)).map_err(|e| e.to_string())? {
+            return Err(format!("profile '{name}' disappeared before its rules could be saved"));
+        }
+        crate::salvage::atomic_write(&Self::rules_path(name), body).map_err(|e| e.to_string())
     }
 
     /// True if the profile sets nothing (useful guard before save).
@@ -508,6 +596,7 @@ impl Profile {
                     .map(|()| (d.pid, active))
             }) {
                 Ok((_pid, active)) => {
+                    r.dpi_applied = true;
                     r.applied.push(format!(
                         "dpi stages [{}] active {}",
                         self.dpi_stages
@@ -525,6 +614,7 @@ impl Profile {
                 cap::set_dpi(d, dpi, dpi, store, crate::dpi_origin::Cause::UserApplied).map(|()| d.pid)
             }) {
                 Ok(_pid) => {
+                    r.dpi_applied = true;
                     r.applied.push(format!("dpi {dpi}"));
                 }
                 Err(e) => r.skipped.push(format!("dpi: {e}")),
@@ -633,6 +723,8 @@ impl Profile {
 /// A structured report so CLI and GUI render apply identically instead of each re-deriving it.
 #[derive(Clone, Debug, Default)]
 pub struct ApplyReport {
+    /// A DPI or DPI-stage write completed with device read-back verification.
+    pub dpi_applied: bool,
     /// Fields that wrote + verified successfully.
     pub applied: Vec<String>,
     /// Fields skipped because no connected device owns the capability (or it was asleep).
@@ -802,29 +894,37 @@ pub fn capture_from_devices(
     p
 }
 
-/// Names of all saved profiles.
-#[must_use]
-pub fn list() -> Vec<String> {
+/// Names of all saved profiles. Recovery and directory failures are returned to the caller so
+/// an unresolved lifecycle conflict cannot be mistaken for a valid profile list.
+pub fn try_list() -> io::Result<Vec<String>> {
+    let _lifecycle = lock_and_recover()?;
     let mut out = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(profiles_dir()) {
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.extension().and_then(|x| x.to_str()) == Some("toml") {
-                if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
-                    // Skip SIDECARS: rules/frame live beside the profile as `<name>.rules.toml` /
-                    // `<name>.frame.toml`, so their file_stem still carries `.rules` / `.frame`. A
-                    // real profile file is `<sanitized>.toml`, and sanitize() maps every `.` to `_`
-                    // — so a dot in the stem means it's a sidecar, never a profile.
-                    if stem.contains('.') {
-                        continue;
-                    }
-                    out.push(stem.to_string());
+    for e in std::fs::read_dir(profiles_dir())? {
+        let p = e?.path();
+        if p.extension().and_then(|x| x.to_str()) == Some("toml") {
+            if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                // Skip SIDECARS: rules/frame live beside the profile as `<name>.rules.toml` /
+                // `<name>.frame.toml`, so their file_stem still carries `.rules` / `.frame`. A
+                // real profile file is `<sanitized>.toml`, and sanitize() maps every `.` to `_`
+                // — so a dot in the stem means it's a sidecar, never a profile.
+                if stem.contains('.') {
+                    continue;
                 }
+                out.push(stem.to_string());
             }
         }
     }
     out.sort();
-    out
+    Ok(out)
+}
+
+/// Best-effort names for display-only callers. No unresolved lifecycle state is exposed.
+#[must_use]
+pub fn list() -> Vec<String> {
+    try_list().unwrap_or_else(|e| {
+        eprintln!("profile list: {e}");
+        Vec::new()
+    })
 }
 
 /// One entry from [`load_all`] — a profile that parsed, or the name + reason one didn't.
@@ -841,7 +941,14 @@ pub enum ProfileEntry {
 /// Every saved profile, in name order, with unreadable ones reported rather than dropped.
 #[must_use]
 pub fn load_all() -> Vec<ProfileEntry> {
-    list()
+    let names = match try_list() {
+        Ok(names) => names,
+        Err(e) => return vec![ProfileEntry::Broken {
+            name: "profiles/".into(),
+            why: format!("profile recovery: {e}"),
+        }],
+    };
+    names
         .into_iter()
         .map(|n| match Profile::load(&n) {
             Ok(p) => ProfileEntry::Ok(Box::new(p)),
@@ -866,6 +973,7 @@ pub fn load_all() -> Vec<ProfileEntry> {
 /// intents). Mirrors the `hook::set_policy` carrier pattern: a tiny global so two threads that
 /// can't see each other's state agree on the cursor a `ProfileCycle` steps from.
 static ACTIVE: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+static ACTIVE_APPLY: std::sync::Mutex<Option<(String, Vec<String>)>> = std::sync::Mutex::new(None);
 
 /// Where the cursor is remembered between runs. A tiny run-root state file rather than a GUI
 /// preference, because the CLI daemon needs the same answer: a profile's binds sidecar is in scope
@@ -883,12 +991,32 @@ fn active_cursor_path() -> PathBuf {
 /// switch that just happened.
 pub fn set_active(name: &str) {
     *ACTIVE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = name.to_string();
+    *ACTIVE_APPLY.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     let path = active_cursor_path();
     if name.is_empty() {
         let _ = std::fs::remove_file(&path);
     } else if std::fs::create_dir_all(profiles_dir()).is_ok() {
         let _ = crate::salvage::atomic_write(&path, name.as_bytes());
     }
+}
+
+/// Keep the unresolved fields from the most recent apply with the active cursor. This is session
+/// evidence, not persisted hardware truth: after a restart no device write has been re-verified.
+pub fn note_apply_report(name: &str, report: &ApplyReport) {
+    let missing = report.skipped.iter().cloned()
+        .chain(report.gated.iter().map(|item| format!("{item} [gated]")))
+        .collect();
+    *ACTIVE_APPLY.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some((name.to_string(), missing));
+}
+
+#[must_use]
+pub fn active_missing() -> Vec<String> {
+    let name = active();
+    ACTIVE_APPLY.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .filter(|(applied, _)| applied == &name)
+        .map_or_else(Vec::new, |(_, missing)| missing.clone())
 }
 
 /// Restore the remembered cursor at startup, returning the profile name (empty if none).
@@ -931,6 +1059,7 @@ pub fn restore_active() -> String {
         .filter(|s| !s.is_empty() && Profile::load(s).is_ok())
         .unwrap_or_default();
     *ACTIVE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = name.clone();
+    *ACTIVE_APPLY.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     name
 }
 
@@ -1543,6 +1672,26 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
+    #[test]
+    fn failed_profile_delete_restores_its_rules() {
+        let _g = crate::runroot::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = std::env::temp_dir().join(format!("neuron_profile_delete_failure_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _pin = crate::runroot::RunDirPin::to(&tmp);
+        std::fs::create_dir_all(profiles_dir()).unwrap();
+        std::fs::create_dir(Profile::path("fps")).unwrap(); // remove_file must fail on a directory
+        let rules = b"# keep the user's binds\nrules = []\n";
+        std::fs::write(Profile::rules_path("fps"), rules).unwrap();
+
+        assert!(Profile::delete("fps").is_err());
+        assert_eq!(std::fs::read(Profile::rules_path("fps")).unwrap(), rules);
+        assert!(Profile::path("fps").is_dir());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     /// The name that would have eaten the user's own binds. A profile called "gui" derives
     /// `profiles/gui.rules.toml` — which IS the app's authored rule set — so deleting that profile
     /// would delete every bind authored in the app, and renaming another profile onto it would
@@ -1893,6 +2042,57 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
+    #[test]
+    fn interrupted_delete_recovers_rules_without_overwriting_a_conflict() {
+        let _g = crate::runroot::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prev = std::env::var_os("NEURON_RUN_DIR");
+        let tmp = std::env::temp_dir().join(format!("neuron_profile_delete_recover_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::set_var("NEURON_RUN_DIR", &tmp);
+
+        let profile = Profile { name: "fps".into(), dpi: Some(800), ..Default::default() };
+        profile.save().unwrap();
+        let rules = Profile::rules_path("fps");
+        std::fs::write(&rules, b"rules = []\n").unwrap();
+        let staged = rules.with_extension("toml.deleting-123-1");
+        std::fs::rename(&rules, &staged).unwrap();
+        drop(lock_and_recover().unwrap());
+        assert_eq!(std::fs::read(&rules).unwrap(), b"rules = []\n");
+        assert!(!staged.exists());
+
+        std::fs::rename(&rules, &staged).unwrap();
+        std::fs::write(&rules, b"new owner\n").unwrap();
+        let gui_doc = crate::engine::RuleDoc {
+            rules: vec![crate::engine::Rule::new(
+                crate::engine::Trigger::MicTap,
+                crate::action::Action::DpiSet { dpi: 800 },
+            )],
+        };
+        std::fs::write(profiles_dir().join("gui.rules.toml"), toml::to_string(&gui_doc).unwrap()).unwrap();
+        assert_eq!(lock_and_recover().unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(try_list().is_err(), "an unresolved lifecycle conflict blocks enumeration");
+        assert!(matches!(load_all().as_slice(), [ProfileEntry::Broken { name, .. }] if name == "profiles/"));
+        assert!(crate::controls::load_rule_sidecars().is_empty(), "no sidecar may activate during a recovery conflict");
+        assert!(crate::controls::take_sidecar_faults().iter().any(|(name, _)| name == "profiles/"));
+        assert_eq!(std::fs::read(&rules).unwrap(), b"new owner\n");
+        assert_eq!(std::fs::read(&staged).unwrap(), b"rules = []\n");
+        std::fs::remove_file(&rules).unwrap();
+        std::fs::remove_file(Profile::path("fps")).unwrap();
+        drop(lock_and_recover().unwrap());
+        assert!(!staged.exists());
+        drop(lock_and_recover().unwrap());
+        assert!(Profile::write_rules("fps", b"rules = []\n", true).is_err());
+        assert!(!rules.exists(), "a late rules writer cannot recreate binds after deletion");
+
+        match prev {
+            Some(v) => std::env::set_var("NEURON_RUN_DIR", v),
+            None => std::env::remove_var("NEURON_RUN_DIR"),
+        }
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
     /// The routing verdict: first match wins, an unmatched app falls back, and the rule the lamp
     /// lights is the rule that fired. Overlapping needles are the case that used to break — the
     /// engine fired every match, so "rome" (listed second) beat "chrome" on `chrome.exe` while the
@@ -2190,6 +2390,7 @@ persist = false
     #[test]
     fn apply_report_summary_renders_gaming_mode_and_gated() {
         let r = ApplyReport {
+            dpi_applied: true,
             applied: vec!["dpi 1600".into(), "brightness 80%".into()],
             skipped: vec!["lighting wave: no lit device".into()],
             gated: vec!["idle-off 300s: ... gated ...".into()],

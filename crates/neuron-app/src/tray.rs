@@ -15,7 +15,9 @@
 #[cfg(any(windows, target_os = "linux"))]
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager};
 #[cfg(any(windows, target_os = "linux"))]
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+#[cfg(any(windows, target_os = "linux"))]
+use std::sync::mpsc::{self, Receiver};
 #[cfg(any(windows, target_os = "linux"))]
 use std::collections::HashMap;
 #[cfg(any(windows, target_os = "linux"))]
@@ -39,7 +41,30 @@ pub enum TrayAction {
     DpiDown,
 }
 
-/// The truth the menu renders — kept to diff against so an idle 60ms tick costs one Vec compare.
+#[cfg(any(windows, target_os = "linux"))]
+enum QueuedEvent {
+    Menu(MenuEvent),
+    Icon,
+    Hotkey(GlobalHotKeyEvent),
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+thread_local! {
+    static EVENT_WAKE: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+fn wake_event_loop() {
+    let _ = slint::invoke_from_event_loop(|| {
+        EVENT_WAKE.with(|slot| {
+            if let Some(wake) = slot.borrow().as_ref() {
+                wake();
+            }
+        });
+    });
+}
+
+/// The tray menu state, compared before applying refreshes so unchanged values stay untouched.
 #[derive(Clone, PartialEq, Default)]
 pub struct TraySnapshot {
     pub profiles: Vec<String>,
@@ -67,6 +92,7 @@ impl Tray {
     }
 
     pub fn sync(&self, _snap: &TraySnapshot, _force: bool) {}
+    pub fn install_wake(&self, _wake: impl Fn() + 'static) {}
 
     pub fn poll(&self) -> Vec<TrayAction> {
         Vec::new()
@@ -84,6 +110,8 @@ pub struct Tray {
     menu_map: RefCell<HashMap<String, TrayAction>>,
     /// what the current menu shows (the diff key for `sync`).
     snapshot: RefCell<TraySnapshot>,
+    events: RefCell<Option<Receiver<QueuedEvent>>>,
+    menu_clicked: Cell<bool>,
 }
 
 #[cfg(any(windows, target_os = "linux"))]
@@ -124,13 +152,45 @@ impl Tray {
             hotkey_map,
             menu_map: RefCell::new(map),
             snapshot: RefCell::new(snap),
+            events: RefCell::new(None),
+            menu_clicked: Cell::new(false),
         })
+    }
+
+    /// Forward tray and hotkey events to the UI loop as they arrive, so resident status polling
+    /// can run slowly without delaying the controls people use from the tray.
+    pub fn install_wake(&self, wake: impl Fn() + 'static) {
+        EVENT_WAKE.with(|slot| *slot.borrow_mut() = Some(Box::new(wake)));
+        let (tx, rx) = mpsc::sync_channel(64);
+        *self.events.borrow_mut() = Some(rx);
+        let menu_tx = tx.clone();
+        MenuEvent::set_event_handler(Some(move |ev| {
+            if menu_tx.try_send(QueuedEvent::Menu(ev)).is_ok() {
+                wake_event_loop();
+            }
+        }));
+        let icon_tx = tx.clone();
+        TrayIconEvent::set_event_handler(Some(move |ev| {
+            if matches!(ev, TrayIconEvent::Click { button: tray_icon::MouseButton::Left, .. })
+                && icon_tx.try_send(QueuedEvent::Icon).is_ok()
+            {
+                wake_event_loop();
+            }
+        }));
+        GlobalHotKeyEvent::set_event_handler(Some(move |ev: GlobalHotKeyEvent| {
+            if ev.state == global_hotkey::HotKeyState::Pressed
+                && tx.try_send(QueuedEvent::Hotkey(ev)).is_ok()
+            {
+                wake_event_loop();
+            }
+        }));
     }
 
     /// Rebuild the menu if the live truth differs from what's shown (or `force`, which repairs
     /// muda's client-side check auto-toggle after a menu click that didn't change model state).
     /// Cheap when nothing changed: one snapshot compare, zero Win32 calls.
     pub fn sync(&self, snap: &TraySnapshot, force: bool) {
+        let force = force | self.menu_clicked.replace(false);
         if !force && *self.snapshot.borrow() == *snap {
             return;
         }
@@ -148,6 +208,25 @@ impl Tray {
         }
 
         let mut out = Vec::new();
+        if let Some(rx) = self.events.borrow().as_ref() {
+            while let Ok(ev) = rx.try_recv() {
+                match ev {
+                    QueuedEvent::Menu(ev) => {
+                        self.menu_clicked.set(true);
+                        if let Some(a) = self.menu_map.borrow().get(&ev.id.0) {
+                            out.push(a.clone());
+                        }
+                    }
+                    QueuedEvent::Icon => out.push(TrayAction::Open),
+                    QueuedEvent::Hotkey(ev) => {
+                        if let Some(a) = self.hotkey_map.get(&format!("hk:{}", ev.id)) {
+                            out.push(a.clone());
+                        }
+                    }
+                }
+            }
+            return out;
+        }
         while let Ok(ev) = MenuEvent::receiver().try_recv() {
             if let Some(a) = self.menu_map.borrow().get(&ev.id.0) {
                 out.push(a.clone());

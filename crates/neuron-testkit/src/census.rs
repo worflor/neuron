@@ -12,9 +12,10 @@
 
 #![cfg(windows)]
 
+use std::io;
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{CloseHandle, ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
 };
@@ -33,47 +34,60 @@ pub struct Census {
 }
 
 impl Census {
-    /// Sample right now. Best-effort: a failed Win32 query reads as 0 for that field rather than
-    /// panicking — a census is a diagnostic, and a transient query failure must not itself fail
-    /// an unrelated test.
+    /// Sample right now. A failed OS query fails the test instead of disguising an unmeasured
+    /// resource as zero and allowing a leak assertion to pass.
     #[must_use]
     pub fn now() -> Census {
-        Census {
-            threads: current_process_thread_count(),
-            handles: current_process_handle_count(),
-        }
+        Self::try_now().unwrap_or_else(|err| panic!("resource census failed: {err}"))
+    }
+
+    /// Sample without panicking, for diagnostic callers that can report the OS error themselves.
+    pub fn try_now() -> io::Result<Census> {
+        Ok(Census {
+            threads: current_process_thread_count()?,
+            handles: current_process_handle_count()?,
+        })
     }
 }
 
-fn current_process_handle_count() -> usize {
+fn current_process_handle_count() -> io::Result<usize> {
     // GetCurrentProcess returns a constant pseudo-handle (-1) that is never closed.
     let h = unsafe { GetCurrentProcess() };
     let mut handles: u32 = 0;
     if unsafe { GetProcessHandleCount(h, &raw mut handles) } == 0 {
-        0
+        Err(io::Error::last_os_error())
     } else {
-        handles as usize
+        Ok(handles as usize)
     }
 }
 
-fn current_process_thread_count() -> usize {
+fn current_process_thread_count() -> io::Result<usize> {
     let pid = unsafe { GetCurrentProcessId() };
     let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
     if snap == INVALID_HANDLE_VALUE {
-        return 0;
+        return Err(io::Error::last_os_error());
     }
     let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
     entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
     let mut count = 0usize;
     let mut ok = unsafe { Thread32First(snap, &raw mut entry) };
+    if ok == 0 {
+        let err = io::Error::last_os_error();
+        unsafe { CloseHandle(snap) };
+        return Err(err);
+    }
     while ok != 0 {
         if entry.th32OwnerProcessID == pid {
             count += 1;
         }
         ok = unsafe { Thread32Next(snap, &raw mut entry) };
     }
+    let end = io::Error::last_os_error();
     unsafe { CloseHandle(snap) };
-    count
+    if end.raw_os_error() != Some(ERROR_NO_MORE_FILES as i32) {
+        return Err(end);
+    }
+    Ok(count)
 }
 
 /// How far a post-churn [`Census`] may drift from its baseline and still count as "converged".
@@ -106,6 +120,8 @@ impl Default for CensusTolerance {
 /// leaving the process cleaner. An absolute `|post - baseline|` check would false-fail on that
 /// shrinkage, which a whole-process census in a shared test binary routinely sees.
 pub fn assert_converges(baseline: Census, post: Census, tolerance: CensusTolerance, label: &str) {
+    assert!(baseline.threads > 0 && baseline.handles > 0 && post.threads > 0 && post.handles > 0,
+        "{label}: census missing a resource measurement — baseline {baseline:?}, post {post:?}");
     let thread_growth = post.threads.saturating_sub(baseline.threads);
     let handle_growth = post.handles.saturating_sub(baseline.handles);
     assert!(
@@ -171,5 +187,7 @@ mod tests {
         assert!(fails(census(10, 100), census(12, 100)), "one thread past slack is a leak");
         assert!(fails(census(10, 100), census(10, 109)), "one handle past slack is a leak");
         assert!(!fails(census(10, 100), census(2, 40)), "shrinkage is not a leak");
+        assert!(fails(census(10, 100), census(0, 100)), "missing thread sample cannot pass");
+        assert!(fails(census(10, 100), census(10, 0)), "missing handle sample cannot pass");
     }
 }

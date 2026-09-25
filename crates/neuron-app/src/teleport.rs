@@ -1324,8 +1324,11 @@ fn attach(a: u32, b: u32, on: bool) -> bool {
 /// enough to mark this process as the input source so the foreground handoff is permitted.
 #[cfg(windows)]
 fn whisper_input() {
+    if !neuron::action::input_armed() {
+        return;
+    }
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_MOVE, MOUSEINPUT,
+        INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_MOVE, MOUSEINPUT,
     };
     let input = INPUT {
         r#type: INPUT_MOUSE,
@@ -1340,9 +1343,7 @@ fn whisper_input() {
             },
         },
     };
-    unsafe {
-        SendInput(1, &raw const input, std::mem::size_of::<INPUT>() as i32);
-    }
+    neuron::action::send_win_input(std::slice::from_ref(&input));
 }
 
 /// The exe file stem (lowercase) owning a window — the kinship key for auto-sort and the
@@ -1382,8 +1383,11 @@ pub(crate) fn exe_stem(hwnd: isize) -> String {
 /// `banish_new` for Win+Ctrl+D. Arm-gated by the caller.
 #[cfg(windows)]
 fn send_chord(vks: &[u16]) {
+    if !neuron::action::input_armed() {
+        return;
+    }
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
+        INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
     };
     let mk = |vk: u16, up: bool| INPUT {
         r#type: INPUT_KEYBOARD,
@@ -1399,13 +1403,7 @@ fn send_chord(vks: &[u16]) {
     };
     let mut seq: Vec<INPUT> = vks.iter().map(|&v| mk(v, false)).collect();
     seq.extend(vks.iter().rev().map(|&v| mk(v, true)));
-    unsafe {
-        SendInput(
-            seq.len() as u32,
-            seq.as_ptr(),
-            std::mem::size_of::<INPUT>() as i32,
-        );
-    }
+    neuron::action::send_win_input(&seq);
 }
 
 // ── CLICK GUARD — swallow L/R clicks while a weave aims (the spectral verbs read them via raw

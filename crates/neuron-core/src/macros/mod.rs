@@ -138,7 +138,12 @@ pub fn run_script(script: &ScriptRef) -> String {
 #[must_use]
 pub fn run_script_ctx(script: &ScriptRef, ctx: &Context) -> String {
     match script.kind {
-        ScriptKind::Python => macro_host().fire_async(&script.id, ctx),
+        ScriptKind::Python => {
+            if !crate::action::input_armed() {
+                return format!("macro '{}' [disarmed]", script.id);
+            }
+            macro_host().fire_async(&script.id, ctx)
+        }
         ScriptKind::Shell => run_shell(&script.id),
         ScriptKind::File => run_external(&script.id),
     }
@@ -218,10 +223,7 @@ impl Launch {
 fn launch(what: Launch) -> String {
     let label = what.what();
     if !crate::latency::servicing_input_edge() {
-        return match what.start() {
-            Ok(_) => format!("ran `{label}`"),
-            Err(e) => format!("launch failed: {e}"),
-        };
+        return start_inline(&what, &label);
     }
     let job = what.clone();
     let job_label = label.clone();
@@ -272,10 +274,17 @@ fn launch(what: Launch) -> String {
         // No pool at all is an infrastructure failure, not overload: the worker threads could not be
         // created. Falling back to a synchronous spawn costs this one press its latency, which is far
         // better than the feature simply not working.
-        runner::Submitted::NoPool => match what.start() {
-            Ok(_) => format!("ran `{label}`"),
-            Err(e) => format!("launch failed: {e}"),
-        },
+        runner::Submitted::NoPool => start_inline(&what, &label),
+    }
+}
+
+fn start_inline(what: &Launch, label: &str) -> String {
+    if !crate::action::process_spawn_armed() {
+        return format!("launch `{label}` [disarmed]");
+    }
+    match what.start() {
+        Ok(_) => format!("ran `{label}`"),
+        Err(e) => format!("launch failed: {e}"),
     }
 }
 
@@ -396,16 +405,25 @@ mod tests {
             line.starts_with("launching"),
             "expected an immediate hand-off from the input path, got: {line}"
         );
-        // And off the input path it stays synchronous, so a CLI that exits at once still reports truth.
+        // Off the input path, the fallback checks the gate again before spawning. Tests stay
+        // disarmed, so it must refuse instead of starting a process.
         let line = launch(what);
         assert!(
-            line.starts_with("ran") || line.starts_with("launch failed"),
-            "expected a synchronous, resolved result off the input path, got: {line}"
+            line.contains("[disarmed]"),
+            "the inline fallback must recheck the disarmed process gate: {line}"
         );
     }
 
     #[test]
-    fn run_script_ctx_routes_shell_and_file_without_a_sidecar() {
+    fn inline_launch_fallback_rechecks_process_spawn_gate() {
+        assert!(!crate::action::process_spawn_armed());
+        let what = Launch::Shell(if cfg!(windows) { "cd ." } else { "true" }.into());
+        let label = what.what();
+        assert!(start_inline(&what, &label).contains("[disarmed]"));
+    }
+
+    #[test]
+    fn run_script_ctx_disarmed_without_a_sidecar() {
         // The non-Python tiers don't touch the Macro Host — they must work (report disarmed) even with
         // no python runtime present, proving the spine can always dispatch them.
         let ctx = Context::synthetic(Some("game.exe".into()), None, None, None, None);
@@ -419,5 +437,10 @@ mod tests {
             kind: ScriptKind::File,
         };
         assert!(run_script_ctx(&file, &ctx).contains("[disarmed]"));
+        let python = ScriptRef {
+            id: "any_macro".into(),
+            kind: ScriptKind::Python,
+        };
+        assert!(run_script_ctx(&python, &ctx).contains("[disarmed]"));
     }
 }

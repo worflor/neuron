@@ -9,8 +9,10 @@
 //! Macro Host mirror should route through this module instead of each owning a separate flag.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 static INPUT_ARMED: AtomicBool = AtomicBool::new(false);
+static INPUT_GATE_TRANSITION: Mutex<()> = Mutex::new(());
 static WRITES_PAUSED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,7 +64,14 @@ impl RuntimeMode {
 }
 
 pub fn set_input_armed(on: bool) {
-    INPUT_ARMED.store(on, Ordering::SeqCst);
+    #[cfg(test)]
+    assert!(!on, "unit tests may never arm real input");
+    let _transition = INPUT_GATE_TRANSITION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if on {
+        INPUT_ARMED.store(true, Ordering::SeqCst);
+    } else {
+        crate::intercept::disarm_input_with(|| INPUT_ARMED.store(false, Ordering::SeqCst));
+    }
 }
 
 pub fn input_armed() -> bool {
@@ -162,15 +171,12 @@ mod tests {
         }
     }
 
-    /// The wiring guarantee: `set_mode` must synchronize BOTH process-global gates atomically enough
-    /// that the global getters (`input_armed`/`writes_paused`) and `mode()` all agree with the stance
-    /// just set — for every one of the four stances, not just the common ones. No real input is armed
-    /// by this: nothing in a unit test binary reads `INPUT_ARMED` to synthesize an actual keystroke, and
-    /// the flag is forced back off before this test returns (see [`Restore`]).
+    /// The process-global wiring is exercised only for disarmed stances. Armed stances are covered
+    /// by the pure state-machine test above; no test may transiently enable real input.
     #[test]
-    fn set_mode_synchronizes_both_gates_for_every_stance() {
+    fn set_mode_synchronizes_both_gates_when_disarmed() {
         let _r = Restore::acquire();
-        for stance in [RuntimeMode::Observe, RuntimeMode::Device, RuntimeMode::Input, RuntimeMode::Live] {
+        for stance in [RuntimeMode::Observe, RuntimeMode::Device] {
             set_mode(stance);
             let expected = stance.state();
             assert_eq!(input_armed(), expected.input_armed, "{stance:?} input_armed getter");
@@ -181,12 +187,11 @@ mod tests {
     }
 
     /// Setting the SAME stance twice must be a no-op the second time — no toggling, no flicker. Covers
-    /// both a "gates off" stance (Device) and a "gates on" stance (Live) so idempotency isn't accidental
-    /// symmetry around one flag value.
+    /// both disarmed write stances so idempotency is not accidental symmetry around one value.
     #[test]
     fn set_mode_is_idempotent() {
         let _r = Restore::acquire();
-        for mode in [RuntimeMode::Device, RuntimeMode::Live] {
+        for mode in [RuntimeMode::Device, RuntimeMode::Observe] {
             set_mode(mode);
             let first = state();
             set_mode(mode);
@@ -209,12 +214,14 @@ mod tests {
         assert!(writes_paused(), "writes_paused reflects the setter");
         assert!(!input_armed(), "flipping writes_paused must not arm input");
 
-        set_input_armed(true);
-        assert!(input_armed(), "input_armed reflects the setter");
-        assert!(writes_paused(), "arming input must not un-pause writes — the two gates are independent");
-
         set_input_armed(false);
         assert!(!input_armed());
         assert!(writes_paused(), "disarming input must not touch writes_paused");
+    }
+
+    #[test]
+    #[should_panic(expected = "unit tests may never arm real input")]
+    fn tests_cannot_arm_input() {
+        set_input_armed(true);
     }
 }

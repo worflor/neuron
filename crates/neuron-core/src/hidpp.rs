@@ -43,8 +43,10 @@
 //!   long   0x11       ..            ..             ..                   16 bytes (total 20)
 //! ```
 //! Function occupies the high nibble of byte 3, softwareId the low nibble; a reply echoes the
-//! softwareId so a client can tell its own replies apart. We frame everything as LONG reports and
-//! use a fixed [`SW_ID`] nibble. HID++ 2.0 is big-endian for multi-byte values.
+//! softwareId so a client can tell its own replies apart. This implementation frames requests as
+//! LONG reports and uses a fixed [`SW_ID`] nibble. Pipes that only advertise SHORT output reports
+//! are not claimed until short-request framing is implemented. HID++ 2.0 is big-endian for
+//! multi-byte values.
 //!
 //! ## The semantic reply contract (the load-bearing design point)
 //! Everything above the dialect line is dialect-BLIND: `capability::battery_percent` reads
@@ -275,10 +277,10 @@ impl Dialect for HidppDialect {
     /// `read_input` the reply (see the claiming-contract module doc) — a pipe advertising only ONE
     /// direction can never complete that flow, so it is NOT claimed (it lands on the `interested()`
     /// ledger instead):
-    ///   * output side — a HID++ CLASS request report: short [`SHORT_LEN`] (7) or long [`LONG_LEN`] (20).
-    ///   * input side — able to CARRY the reply: `input_len >= SHORT_LEN`. HID++ replies to a SHORT
-    ///     request may arrive as a LONG report (libratbag hidpp-dissector: 0x10 short / 0x11 long), so
-    ///     we require only ">= short", not an exact class length — a 7/20/64-byte input all qualify.
+    ///   * output side — a LONG HID++ request report of [`LONG_LEN`] (20) bytes. This dialect only
+    ///     emits LONG reports; a SHORT-only output pipe is recognized but stays unclaimed.
+    ///   * input side — able to CARRY the reply: `input_len >= SHORT_LEN`. The reply fields used by
+    ///     the probe fit in a SHORT report, and longer input reports are also accepted.
     ///
     /// Byte-length convention (stated so the next reader doesn't re-derive it): `output_len`/
     /// `input_len` are `HIDP_CAPS` `OutputReportByteLength`/`InputReportByteLength`, which INCLUDE the
@@ -289,11 +291,11 @@ impl Dialect for HidppDialect {
     /// Receivers are excluded ([`RECEIVER_PIDS`]): they answer on HID++ 1.0 registers / pairing slots
     /// `1..=6`, not the corded [`DEVICE_INDEX`] `0xFF` this dialect addresses — see the `DEVICE_INDEX` note.
     fn claims(&self, info: &HidDeviceInfo) -> bool {
-        let output_is_hidpp_class = info.output_len == SHORT_LEN || info.output_len == LONG_LEN as u16;
+        let output_supports_long_requests = info.output_len == LONG_LEN as u16;
         let input_carries_reply = info.input_len >= SHORT_LEN;
         info.vid == HIDPP_VID
             && !is_receiver_pid(info.pid)
-            && output_is_hidpp_class
+            && output_supports_long_requests
             && input_carries_reply
     }
 
@@ -407,7 +409,7 @@ impl Dialect for HidppDialect {
                 usage_page: ctx.usage_page,
                 usage: ctx.usage,
                 // Stored from the enumerated pipe for completeness, but HID++ MATCHING rides
-                // `claims()` (VID + the 7/20-byte report shape), NOT the feature-report length —
+                // `claims()` (VID + 20-byte LONG output shape), NOT the feature-report length —
                 // HID++ uses output/input reports, so this length is informational here.
                 feature_report_len: ctx.feature_len,
             },
@@ -494,14 +496,15 @@ impl Dialect for HidppDialect {
         size: u8,
         args: &[u8],
         stream_wait_us: u64,
-    ) {
+    ) -> bool {
         let _ = (transaction_id, size);
         let params = args.get(1..).unwrap_or(&[]);
         let req = build_long(class, id, params);
-        let _ = t.write_output(&req);
+        let sent = t.write_output(&req).is_ok();
         if stream_wait_us > 0 {
             std::thread::sleep(std::time::Duration::from_micros(stream_wait_us));
         }
+        sent
     }
 
     // NB: `release_custody` is INTENTIONALLY NOT overridden — the trait's default no-op is the
@@ -604,7 +607,7 @@ mod tests {
     /// in FIFO order. Implements ONLY the output/input surface (the feature-report methods bail, as
     /// a real HID++ collection would). This is the whole point of the transport extension.
     struct MockHidpp {
-        writes: Mutex<Vec<[u8; LONG_LEN]>>,
+        writes: Mutex<Vec<Vec<u8>>>,
         inbox: Mutex<VecDeque<Vec<u8>>>,
     }
 
@@ -615,8 +618,8 @@ mod tests {
                 inbox: Mutex::new(frames.into_iter().collect()),
             }
         }
-        fn last_write(&self) -> [u8; LONG_LEN] {
-            *self.writes.lock().unwrap().last().expect("a request was written")
+        fn last_write(&self) -> Vec<u8> {
+            self.writes.lock().unwrap().last().expect("a request was written").clone()
         }
     }
 
@@ -628,10 +631,7 @@ mod tests {
             bail!("hidpp mock carries no feature reports")
         }
         fn write_output(&self, buf: &[u8]) -> Result<()> {
-            let mut b = [0u8; LONG_LEN];
-            let n = buf.len().min(LONG_LEN);
-            b[..n].copy_from_slice(&buf[..n]);
-            self.writes.lock().unwrap().push(b);
+            self.writes.lock().unwrap().push(buf.to_vec());
             Ok(())
         }
         fn read_input(&self, buf: &mut [u8], _timeout_ms: u32) -> Result<usize> {
@@ -698,7 +698,8 @@ mod tests {
         assert_eq!(report.battery_feature, Some(0x06));
         assert_eq!(report.dpi_feature, Some(0x07));
         // The FIRST thing written must be the exact ping golden.
-        let first = mock.writes.lock().unwrap()[0];
+        let first = mock.writes.lock().unwrap()[0].clone();
+        assert_eq!(first.len(), LONG_LEN, "probe emits a full advertised LONG output report");
         assert_eq!(first[..7], [0x11, 0xFF, 0x00, 0x1A, 0x00, 0x00, PING_TOKEN]);
     }
 
@@ -734,7 +735,9 @@ mod tests {
         assert_eq!(out[1], 217, "85% scaled into the 0..255 space at args[1]");
         assert_eq!(out[0], 0, "args[0] stays clear (the semantic decoder ignores it)");
         // And the request stripped the tag: params are empty, feature/fn framed correctly.
-        assert_eq!(mock.last_write()[..4], [0x11, 0xFF, 0x06, func_swid(0x00)]);
+        let request = mock.last_write();
+        assert_eq!(request.len(), LONG_LEN, "exec emits a full LONG output report");
+        assert_eq!(request[..4], [0x11, 0xFF, 0x06, func_swid(0x00)]);
     }
 
     #[test]
@@ -764,12 +767,12 @@ mod tests {
     fn claims_matrix() {
         // A claimable pipe needs BOTH a HID++ CLASS output report AND an input able to carry the reply.
         assert!(HidppDialect.claims(&info(HIDPP_VID, 20, 20)), "20-byte out + 20-byte in = HID++ long, bidirectional");
-        assert!(HidppDialect.claims(&info(HIDPP_VID, 7, 20)), "7-byte out + long in = short request, long reply");
-        assert!(HidppDialect.claims(&info(HIDPP_VID, 7, 7)), "7-byte out + 7-byte in = HID++ short, both directions");
+        assert!(!HidppDialect.claims(&info(HIDPP_VID, 7, 20)), "short-only output is gated because this dialect writes long requests");
+        assert!(!HidppDialect.claims(&info(HIDPP_VID, 7, 7)), "short-only bidirectional pipe is gated until short framing exists");
         assert!(HidppDialect.claims(&info(HIDPP_VID, 20, 64)), "input >= short carries the reply (a 64-byte input qualifies)");
         // One-direction collections can never complete write_output → read_input:
         assert!(!HidppDialect.claims(&info(HIDPP_VID, 20, 0)), "output-only (no input report) can't carry a reply");
-        assert!(!HidppDialect.claims(&info(HIDPP_VID, 7, 0)), "output-only short pipe can't carry a reply");
+        assert!(!HidppDialect.claims(&info(HIDPP_VID, 7, 0)), "output-only short pipe is unsupported and can't carry a reply");
         assert!(!HidppDialect.claims(&info(HIDPP_VID, 0, 20)), "input-only (no output report) can't send a request");
         // Wrong report shape / wrong vendor:
         assert!(!HidppDialect.claims(&info(HIDPP_VID, 64, 64)), "Logitech + 64-byte report ≠ HID++");
@@ -806,7 +809,7 @@ mod tests {
 
     #[test]
     fn matches_control_rides_shape_plus_usage_not_feature_len() {
-        // HID++ control matching = claims() (VID + 7/20-byte report shape) AND the stored usage pair;
+        // HID++ control matching = claims() (VID + 20-byte LONG output shape) AND the stored usage pair;
         // the feature_report_len is meaningless. The usage pair is what disambiguates a receiver's
         // several HID++-shaped collections — right shape, wrong usage is a SIBLING pipe, not control.
         let def = hidpp_def(0x0001, 0x0002);
@@ -830,8 +833,8 @@ mod tests {
             "right report SHAPE but a different usage = a sibling collection, not control"
         );
         assert!(
-            !def.matches_control(&pipe(0x0001, 0x0002, 64, 64)),
-            "matching usage but a non-HID++ report shape = not claimed at all"
+            !def.matches_control(&pipe(0x0001, 0x0002, 7, 20)),
+            "matching usage but a short-only output shape = not claimed at all"
         );
     }
 

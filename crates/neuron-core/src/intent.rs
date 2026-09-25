@@ -69,6 +69,18 @@ pub fn run_shared_intent(
     intent: &Intent,
     cause: crate::dpi_origin::Cause,
 ) -> Option<String> {
+    run_shared_intent_observe(devices, cursor, intent, cause, |_| {})
+}
+
+/// Like [`run_shared_intent`], with the verified profile apply report delivered to the caller.
+/// Rejected intents, paused writes, and unavailable profiles never invoke the observer.
+pub fn run_shared_intent_observe(
+    devices: &mut DeviceSession<'_>,
+    cursor: &mut impl ProfileCursor,
+    intent: &Intent,
+    cause: crate::dpi_origin::Cause,
+    mut on_profile_applied: impl FnMut(&crate::profile::ApplyReport),
+) -> Option<String> {
     use Intent::{Teleport, Whiteboard, Knockback, Glance, Summon, Banish, Pin, Kill, Tether, Dial, Control, Echo, DpiSet, DpiCycle, ScrollStageCycle, ProfileSwitch, ProfileCycle};
 
     match intent {
@@ -89,12 +101,12 @@ pub fn run_shared_intent(
             let dpi = (*dpi).clamp(100, 30_000);
             match devices.with_writable("set_dpi", |d| {
                 cap::set_dpi(d, dpi, dpi, cap::Store::Persist, cause)?;
-                Ok(d.pid) // carry the acting device's pid for the per-device confirm de-dup
+                Ok((d.pid, d.dpi_unit.clone())) // preserve the selected physical unit in the confirm baseline
             }) {
-                Ok(pid) => {
+                Ok((pid, unit)) => {
                     // confirmation fires ONLY past the committed write (set is absolute — no prior
                     // read, so no old→new).
-                    crate::confirm::dpi(pid, u32::from(dpi), None);
+                    crate::confirm::dpi_unit(pid, &unit, u32::from(dpi), None);
                     format!("DPI -> {dpi}")
                 }
                 Err(e) => format!("DPI set failed: {e}"),
@@ -121,12 +133,12 @@ pub fn run_shared_intent(
                 let cur = cap::dpi(d).map(|(x, _)| x)?;
                 let next = next_dpi(cur, dir.step(), &stages);
                 cap::set_dpi(d, next, next, cap::Store::Volatile, cause)?;
-                Ok((d.pid, cur, next))
+                Ok((d.pid, d.dpi_unit.clone(), cur, next))
             });
             match result {
-                Ok((pid, cur, next)) => {
+                Ok((pid, unit, cur, next)) => {
                     // the read-back gave us the prior DPI too — a true old→new confirmation.
-                    crate::confirm::dpi(pid, u32::from(next), Some(u32::from(cur)));
+                    crate::confirm::dpi_unit(pid, &unit, u32::from(next), Some(u32::from(cur)));
                     format!("DPI cycle {} -> {next}", dir.label())
                 }
                 Err(e) => format!("DPI cycle skipped ({e})"),
@@ -159,7 +171,9 @@ pub fn run_shared_intent(
                 // the caller's live compositor (the GUI streams it) so we never fight a running stream
                 // for the device here. (Lighting-on-auto-switch in a headless daemon is a follow-up.)
                 let rep = p.apply_with_session(devices, false);
+                on_profile_applied(&rep);
                 cursor.set_active_profile(name);
+                profile::note_apply_report(name, &rep);
                 // The gaming-mode guards are HOST-side policy, not a device write, so applying the
                 // profile does not install them — this does. Without it an auto-switch (or a bound
                 // profile key) changed your DPI but left the previous profile's Alt+Tab/Win
@@ -186,7 +200,9 @@ pub fn run_shared_intent(
                 Ok(p) => {
                     let prev = cursor.active_profile();
                     let rep = p.apply_with_session(devices, false); // settings only (see ProfileSwitch)
+                    on_profile_applied(&rep);
                     cursor.set_active_profile(&name);
+                    profile::note_apply_report(&name, &rep);
                     crate::hook::set_policy(rep.gaming_mode); // see ProfileSwitch
                     crate::confirm::profile(&name, Some(&prev));
                     format!("profile cycle {} -> {name}: {}", dir.label(), rep.summary())
@@ -227,6 +243,7 @@ mod tests {
         };
         let mut devices = DeviceSession::new(&reg);
         let mut cursor = Cursor::default();
+
         let result = run_shared_intent(
             &mut devices,
             &mut cursor,
@@ -260,14 +277,24 @@ mod tests {
         let mut devices = DeviceSession::new(&reg);
         let mut cursor = Cursor::default();
 
-        let result = run_shared_intent(
+        let dpi_result = run_shared_intent(
             &mut devices,
             &mut cursor,
             &Intent::DpiSet(800),
             crate::dpi_origin::Cause::UserApplied,
         );
+        let mut observed = 0;
+        let result = run_shared_intent_observe(
+            &mut devices,
+            &mut cursor,
+            &Intent::ProfileSwitch("unavailable-profile".into()),
+            crate::dpi_origin::Cause::UserApplied,
+            |_| observed += 1,
+        );
 
         crate::writes::set_writes_paused(saved);
+        assert_eq!(dpi_result.as_deref(), Some("[writes paused]"));
         assert_eq!(result.as_deref(), Some("[writes paused]"));
+        assert_eq!(observed, 0, "a refused profile intent cannot invalidate a held DPI snapshot");
     }
 }

@@ -243,6 +243,7 @@ fn main() {
     }
 
     if arm {
+        // These cases emit input. Keep them behind the explicit --arm opt-in.
         hook_cost_case();
     }
 
@@ -261,6 +262,7 @@ fn main() {
 /// by stopping the running app, so the user's live setup is never disturbed to take the reading.
 #[cfg(windows)]
 fn hook_cost_case() {
+    assert!(neuron::action::input_armed(), "output probe requires --arm");
     use windows_sys::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, WH_KEYBOARD_LL,
@@ -343,8 +345,7 @@ fn hook_cost_case() {
 
     let t = Instant::now();
     for _ in 0..reps {
-        // SAFETY: one call carrying the same 2*batch events the loop above sent across `batch` calls.
-        unsafe { send_raw_batch(batch) };
+        send_armed_batch(batch);
     }
     let batched = t.elapsed();
     println!(
@@ -364,11 +365,11 @@ unsafe fn send_raw_noop() {
     unsafe { SendInput(0, std::ptr::null(), std::mem::size_of::<INPUT>() as i32) };
 }
 
-/// `n` full keystrokes (down+up of the undefined VK) delivered in ONE `SendInput` call.
+/// `n` full keystrokes (down+up of the undefined VK) delivered through the armed output gate.
 #[cfg(windows)]
-unsafe fn send_raw_batch(n: usize) {
+fn send_armed_batch(n: usize) {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
+        INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
     };
     let mk = |up: bool| INPUT {
         r#type: INPUT_KEYBOARD,
@@ -387,13 +388,8 @@ unsafe fn send_raw_batch(n: usize) {
         seq.push(mk(false));
         seq.push(mk(true));
     }
-    unsafe {
-        SendInput(
-            seq.len() as u32,
-            seq.as_ptr(),
-            std::mem::size_of::<INPUT>() as i32,
-        )
-    };
+    assert_eq!(neuron::action::send_win_input(&seq), seq.len() as u32,
+        "the output probe did not deliver every event; its timing would be invalid");
 }
 
 #[cfg(not(windows))]

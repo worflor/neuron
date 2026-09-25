@@ -8,9 +8,10 @@
 //!   1. **An input is a rhythm, not a switch.** Down/up edges over one control form a *phrase* of
 //!      symbols (`tap`, `hold`): single click, double-tap-then-hold, triple-tap — all phrases, all
 //!      bindable. Presets cover the sane ones; a recorded rhythm normalizes into the same grammar.
-//!   2. **Activate at the earliest unambiguous moment.** A phrase fires on its FINAL press's DOWN
-//!      edge (the fighting-game rule), so plain `hold` keeps ZERO added latency and `tap tap hold`
-//!      costs only the taps themselves. Nothing waits for a classification it doesn't need.
+//!   2. **Activate at the earliest unambiguous moment.** A hold-ending phrase fires on its final
+//!      press's DOWN edge, so plain `hold` keeps ZERO added latency and `tap tap hold` costs only
+//!      the taps themselves. An all-tap phrase fires when its final press is released short, once
+//!      its tap duration is known.
 //!   3. **Forgiveness, not lag.** Coyote time keeps the stroke alive briefly after release ("let
 //!      go a hair early" still counts); a failed rhythm resets instantly and silently.
 //!   4. **Fidgeting is not an error.** Any phrase that resolves to nothing costs nothing: no
@@ -28,7 +29,7 @@ use std::path::PathBuf;
 /// One symbol of a press phrase.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Sym {
-    /// A press shorter than `hold_ms`.
+    /// A press released in less than `hold_ms`.
     Tap,
     /// A press held past `hold_ms`. Always the LAST symbol of a phrase (you can't keep tapping
     /// a rhythm while holding).
@@ -83,7 +84,7 @@ impl Phrase {
     }
 
     /// Ends in a hold → capture lives WHILE the final press is held (release ends it).
-    /// All-taps → the phrase TOGGLES capture (the next tap ends it).
+    /// All-taps → the phrase TOGGLES capture after the final press is released short.
     #[must_use]
     pub fn ends_in_hold(&self) -> bool {
         self.0.last() == Some(&Sym::Hold)
@@ -249,8 +250,9 @@ impl LayerMode {
 pub enum Watch {
     /// Still reading the rhythm (or idle).
     Pending,
-    /// The phrase completed on this sample's DOWN edge — start the capture NOW.
-    /// `toggle` = the phrase was all taps: capture runs until the next tap, not while held.
+    /// The phrase completed on this sample — start the capture NOW.
+    /// `toggle` = the phrase was all taps: activation is after a short release, and capture runs
+    /// until the next tap, not while held.
     Activated { toggle: bool },
     /// The rhythm broke (wrong press shape / gap expired). Cost: nothing. The breaking press,
     /// if any, has already been re-considered as the start of a fresh phrase.
@@ -258,7 +260,8 @@ pub enum Watch {
 }
 
 /// The pure activation state machine: feed it (time, is-down) samples from any poll loop and it
-/// tells you the moment the configured phrase completes. Edge detection, tap/hold classification,
+/// tells you the moment the configured phrase completes. Hold-ending phrases complete on the final
+/// down edge; all-tap phrases complete on the final short release. Edge detection, classification,
 /// gap expiry, and instant re-arm all live here — deterministic and unit-tested, no clocks.
 #[derive(Clone, Debug)]
 pub struct PhraseWatcher {
@@ -319,14 +322,13 @@ impl PhraseWatcher {
             }
             self.down_at = Some(t_ms);
             self.up_at = None;
-            // the FINAL symbol activates on its DOWN edge — the earliest unambiguous moment.
-            // (For `hold` finals the capture-while-held loop verifies the hold by existing; a
-            // too-short press just yields an empty/deadzone stroke — fidget-safe by design.)
-            if self.idx == self.phrase.0.len() - 1 {
-                let toggle = !self.phrase.ends_in_hold();
+            // A final hold is unambiguous on down; a final tap must wait for its release.
+            if self.idx == self.phrase.0.len() - 1
+                && self.phrase.0[self.idx] == Sym::Hold
+            {
                 self.reset();
                 self.was_down = down;
-                return Watch::Activated { toggle };
+                return Watch::Activated { toggle: false };
             }
             return Watch::Pending;
         }
@@ -334,8 +336,17 @@ impl PhraseWatcher {
         if released_edge {
             if let Some(d) = self.down_at.take() {
                 let dur = t_ms.saturating_sub(d);
-                // mid-phrase presses must be TAPS (a hold can only end a phrase, and the final
-                // symbol already activated on its down edge above).
+                let final_tap = self.idx == self.phrase.0.len() - 1
+                    && self.phrase.0[self.idx] == Sym::Tap;
+                if final_tap {
+                    if dur < self.hold_ms {
+                        self.reset();
+                        return Watch::Activated { toggle: true };
+                    }
+                    self.reset();
+                    return Watch::Reset;
+                }
+                // Every non-final symbol must be a tap.
                 if dur < self.hold_ms {
                     self.idx += 1;
                     self.up_at = Some(t_ms);
@@ -347,11 +358,13 @@ impl PhraseWatcher {
             }
         }
 
-        // a mid-phrase press being held past hold_ms can never become a tap — break early so
-        // the user isn't left holding a dead rhythm.
+        // A press expected to be a tap cannot recover after hold_ms — break early so the user
+        // isn't left holding a dead rhythm.
         if down {
             if let Some(d) = self.down_at {
-                if self.idx < self.phrase.0.len() - 1 && t_ms.saturating_sub(d) >= self.hold_ms {
+                if self.phrase.0[self.idx] == Sym::Tap
+                    && t_ms.saturating_sub(d) >= self.hold_ms
+                {
                     self.reset();
                     self.was_down = true;
                     return Watch::Reset;
@@ -483,10 +496,19 @@ mod tests {
     }
 
     #[test]
-    fn double_tap_toggle_activates_on_second_down() {
+    fn double_tap_toggle_waits_for_the_final_short_release() {
         let mut w = PhraseWatcher::new(Phrase::parse("tap tap").unwrap(), &cfg());
         let out = run(&mut w, &[(0, true), (60, false), (140, true)]);
-        assert_eq!(out, vec![(140, Watch::Activated { toggle: true })]);
+        assert!(out.is_empty(), "a press-down cannot yet be classified as a tap");
+        assert_eq!(w.feed(200, false), Watch::Activated { toggle: true });
+    }
+
+    #[test]
+    fn long_final_press_cannot_activate_a_tap_toggle() {
+        let mut w = PhraseWatcher::new(Phrase::parse("tap tap").unwrap(), &cfg());
+        let out = run(&mut w, &[(0, true), (60, false), (140, true), (340, true)]);
+        assert_eq!(out, vec![(340, Watch::Reset)]);
+        assert_eq!(w.feed(350, false), Watch::Pending);
     }
 
     #[test]

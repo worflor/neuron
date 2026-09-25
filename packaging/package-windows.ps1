@@ -38,10 +38,13 @@ try {
         $env:RUSTFLAGS = '-C target-feature=+crt-static'
         & cargo build --release -p neuron-app -p neuron-cli --locked
         if ($LASTEXITCODE -ne 0) { throw 'Windows release build failed' }
+        & cargo build --release -p neuron-host --features bridge --bin neuron-chroma-broker --locked
+        if ($LASTEXITCODE -ne 0) { throw 'Chroma broker release build failed' }
     }
 
     $bin = Join-Path $target 'release'
-    foreach ($exe in @('neuron-app.exe', 'neuron.exe')) {
+    $executables = @('neuron-app.exe', 'neuron.exe', 'neuron-chroma-broker.exe')
+    foreach ($exe in $executables) {
         if (-not (Test-Path -LiteralPath (Join-Path $bin $exe))) {
             throw "release binary missing: $exe"
         }
@@ -50,12 +53,20 @@ try {
     New-Item -ItemType Directory -Force -Path $dist | Out-Null
     if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
     New-Item -ItemType Directory -Path $stage | Out-Null
-    Copy-Item -LiteralPath @((Join-Path $bin 'neuron-app.exe'), (Join-Path $bin 'neuron.exe')) -Destination $stage
-    foreach ($file in @('README.md', 'LICENSE.md', 'THIRD-PARTY-NOTICES.md', 'SECURITY.md')) {
+    Copy-Item -LiteralPath @($executables | ForEach-Object { Join-Path $bin $_ }) -Destination $stage
+    Copy-Item -LiteralPath (Join-Path $repo 'packaging/windows/install-chroma-broker.ps1') -Destination $stage
+    foreach ($file in @('README.md', 'CHANGELOG.md', 'LICENSE.md', 'THIRD-PARTY-NOTICES.md', 'SECURITY.md')) {
         Copy-Item -LiteralPath (Join-Path $repo $file) -Destination $stage
     }
-    foreach ($dir in @('LICENSES', 'skills')) {
-        Copy-Item -LiteralPath (Join-Path $repo $dir) -Destination $stage -Recurse
+    # Stage repository assets from the tracked manifest. A developer's docs/ tree may also
+    # contain ignored raw device captures; those are local research data, not package content.
+    $trackedAssets = @(& git -c core.quotePath=false ls-files -- LICENSES skills docs)
+    if ($LASTEXITCODE -ne 0) { throw 'git ls-files failed while staging package assets' }
+    foreach ($relative in $trackedAssets) {
+        $sourcePath = Join-Path $repo $relative
+        $destinationPath = Join-Path $stage $relative
+        New-Item -ItemType Directory -Force -Path (Split-Path $destinationPath -Parent) | Out-Null
+        Copy-Item -LiteralPath $sourcePath -Destination $destinationPath
     }
 
     $source = @"
@@ -81,7 +92,7 @@ not code signed. The matching source and license terms are in the repository.
     if (-not (Test-Path -LiteralPath $iscc)) {
         throw 'Inno Setup 6 compiler missing (install JRSoftware.InnoSetup)'
     }
-    & $iscc "/DAppVersion=$appVersion" "/DStageDir=$stage" "/O$dist" `
+    & $iscc "/DAppVersion=$appVersion" "/DPackageLabel=$Version" "/DStageDir=$stage" "/O$dist" `
         (Join-Path $PSScriptRoot 'windows\neuron.iss')
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $setup)) {
         throw 'Windows installer compilation failed'

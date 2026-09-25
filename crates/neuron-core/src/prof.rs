@@ -28,7 +28,7 @@ prof_counters!(
     CAPTURE_ARM = "capture_arm",         // glyph.rs setup() — a raw-input window created + registered
     CAPTURE_POLL = "capture_poll",       // glyph.rs activation-wait poll tick (~333/s per armed capture)
     ROUTER_EVENT = "router_event",       // beacon.rs router — one per BeaconEvent drained
-    OVERLAY_FRAME = "overlay_frame",     // overlay.rs render loop — one per frame (~60/s active, ~60/s idle)
+    OVERLAY_FRAME = "overlay_frame",     // overlay.rs render loop — one per frame while visible; hidden waits for events
     MACRO_FIRE = "macro_fire",           // macro_host fire_dispatch — one per macro fire sent
     READER_FRAME = "reader_frame",       // macro_host reader_loop — one per protocol frame from the sidecar
 );

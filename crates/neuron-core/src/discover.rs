@@ -8,7 +8,7 @@
 //! reveal two different feature suites from this one routine — the universal-tool brain.
 
 use crate::dialect::{RAZER_FEATURE_LEN, RAZER_VID};
-use crate::protocol::{reply_status, Report, Status, BUF_LEN};
+use crate::protocol::{razer_reply_status, Report, Status, BUF_LEN};
 use crate::transport::{self, Transport};
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -38,9 +38,8 @@ pub fn exec(
     for i in 0..40 {
         std::thread::sleep(Duration::from_millis(8));
         let mut b = [0u8; BUF_LEN];
-        if t.get_feature(&mut b).is_ok() {
-            // Shared echo filter (dialect seam): accept only a reply echoing our class/id.
-            if let Some(status) = reply_status(&b, class, id) {
+        if t.get_feature(&mut b).is_ok_and(|n| n >= BUF_LEN) {
+            if let Some(status) = razer_reply_status(&b, tid, class, id) {
                 match status {
                     Status::Success => return Some(Report::from_buf(&b).args),
                     Status::Fail | Status::Unsupported => return None,
@@ -161,7 +160,8 @@ pub fn discover() -> Vec<DeviceFp> {
 
 #[cfg(test)]
 mod tests {
-    use super::classify;
+    use super::{classify, exec};
+    use crate::transport::Transport;
 
     fn args(prefix: &[u8]) -> [u8; 80] {
         let mut a = [0u8; 80];
@@ -185,5 +185,20 @@ mod tests {
         );
         // an ascii serial
         assert_eq!(classify(&args(b"IO1735F09002641")), "string");
+    }
+
+    #[test]
+    fn short_success_read_cannot_synthesize_a_capability() {
+        struct ShortReply;
+        impl Transport for ShortReply {
+            fn set_feature(&self, _buf: &[u8]) -> anyhow::Result<()> { Ok(()) }
+            fn get_feature(&self, buf: &mut [u8]) -> anyhow::Result<usize> {
+                buf[1] = 2;
+                buf[7] = 4;
+                buf[8] = 0x85;
+                Ok(9)
+            }
+        }
+        assert!(exec(&ShortReply, 0x1F, 4, 0x85, 2, &[]).is_none());
     }
 }

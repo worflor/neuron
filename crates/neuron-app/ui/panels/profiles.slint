@@ -204,7 +204,7 @@ export component ProfilesMenu inherits VerticalLayout {
         // right-hand signal slot — the active profile's name, or nothing at all when none is active
         // (an absent pill says "none" more quietly than a badge that has to spell it out).
         if State.active-profile != "—" : Pill {
-            text: State.active-profile;
+            text: State.profile-degraded-count > 0 ? State.active-profile + " · DEGRADED " + State.profile-degraded-count : State.active-profile;
             live: true;
         }
     }
@@ -214,6 +214,12 @@ export component ProfilesMenu inherits VerticalLayout {
     // content — one vertical rhythm driven by layout spacing (no hand-tuned spacer rectangles)
     VerticalLayout {
         spacing: Theme.gap;
+
+        if State.profile-degraded-count > 0 : VerticalLayout {
+            spacing: 7px;
+            Mono { text: "DEGRADED · " + State.profile-degraded-detail; color: Theme.warn; wrap: word-wrap; }
+            Button { text: "retry profile"; clicked => { State.apply-profile(State.active-profile); State.profile-sheet-open = false; } }
+        }
 
         // ── SAVED — the primary list (pick one to apply) ──
         HorizontalLayout {

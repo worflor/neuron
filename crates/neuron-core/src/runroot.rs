@@ -16,6 +16,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::{fs::{File, OpenOptions}, io};
 
 /// Every config entry (file or directory) the run root owns — the ONE list, so the migration in
 /// [`adopt_legacy_run_root`] can never drift out of sync with what the path helpers actually
@@ -77,6 +78,9 @@ const LIVE_MARKERS: &[&str] = &[
     "glance.toml",
     "twin.knbk",
 ];
+
+const MIGRATION_MARKER: &str = ".neuron-legacy-migration";
+const MIGRATION_LOCK: &str = ".neuron-legacy-migration.lock";
 
 /// The directory every runtime-config path is resolved against. User-supplied CLI path arguments
 /// (imports/exports) deliberately do NOT go through here — those stay relative to the user's CWD.
@@ -211,32 +215,128 @@ fn user_data_root() -> Option<PathBuf> {
 /// own, so it can never overwrite live data, and is a no-op once it has run (the destination now
 /// has config). Call once at startup, BEFORE anything reads config.
 ///
-/// Returns `Some((from, to))` when entries were actually carried over.
-#[must_use]
-pub fn adopt_legacy_run_root() -> Option<(PathBuf, PathBuf)> {
+/// Returns `Some((from, to))` when entries were carried over. An incomplete migration is an
+/// error: callers must stop before loading or writing a partial destination.
+pub fn adopt_legacy_run_root() -> io::Result<Option<(PathBuf, PathBuf)>> {
     if std::env::var_os("NEURON_RUN_DIR").is_some_and(|v| !v.is_empty()) {
-        return None; // an explicit anchor is the user's choice — never second-guess it
+        return Ok(None); // an explicit anchor is the user's choice — never second-guess it
     }
     let root = run_root();
-    let exe = exe_dir()?;
+    let Some(exe) = exe_dir() else { return Ok(None) };
     if exe == root {
-        return None; // still a portable home — nothing moved
+        return Ok(None); // still a portable home — nothing moved
     }
     if !matches!(build_tree_role(&exe), Some(BuildTreeRole::Deployed)) {
-        return None; // only the build-tree case is a known-lossy home
+        return Ok(None); // only the build-tree case is a known-lossy home
     }
-    if LIVE_MARKERS.iter().any(|e| root.join(e).exists()) {
-        return None; // the destination is already live — never clobber it
+    let _lock = migration_lock(&root)?;
+    let pending = root.join(MIGRATION_MARKER);
+    let legacy = if pending.exists() {
+        read_migration_source(&pending)?.ok_or_else(|| io::Error::new(
+            io::ErrorKind::InvalidData, "legacy migration marker has no source"))?
+    } else {
+        if LIVE_MARKERS.iter().any(|e| root.join(e).exists()) {
+            return Ok(None); // the destination is already live — never clobber it
+        }
+        let Some(legacy) = richest_legacy_home(&exe) else { return Ok(None) };
+        legacy
+    };
+    let carried = migrate_legacy_entries_locked(&root, &legacy, copy_entry)?;
+    Ok((carried > 0).then_some((legacy, root)))
+}
+
+fn migration_lock(root: &Path) -> io::Result<File> {
+    std::fs::create_dir_all(root)?;
+    let file = OpenOptions::new().read(true).write(true).create(true).truncate(false)
+        .open(root.join(MIGRATION_LOCK))?;
+    file.lock()?;
+    Ok(file)
+}
+
+fn read_migration_source(marker: &Path) -> std::io::Result<Option<PathBuf>> {
+    let value = std::fs::read_to_string(marker)?;
+    let path = PathBuf::from(value.trim_end_matches(['\r', '\n']));
+    Ok((!path.as_os_str().is_empty()).then_some(path))
+}
+
+/// Copy a legacy config tree while leaving a recoverable marker until every entry is complete.
+/// An interrupted copy can then resume even though its own partial files make the destination look
+/// live. Existing files are still never overwritten by `copy_entry`.
+#[cfg(test)]
+fn migrate_legacy_entries<F>(root: &Path, legacy: &Path, mut copy: F) -> std::io::Result<usize>
+where
+    F: FnMut(&Path, &Path) -> std::io::Result<()>,
+{
+    let _lock = migration_lock(root)?;
+    migrate_legacy_entries_locked(root, legacy, &mut copy)
+}
+
+fn migrate_legacy_entries_locked<F>(root: &Path, legacy: &Path, mut copy: F) -> io::Result<usize>
+where
+    F: FnMut(&Path, &Path) -> io::Result<()>,
+{
+    let marker = root.join(MIGRATION_MARKER);
+    if marker.exists() {
+        if read_migration_source(&marker)?.as_deref() != Some(legacy) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "a different legacy migration is already pending",
+            ));
+        }
+    } else {
+        if LIVE_MARKERS.iter().any(|e| root.join(e).exists()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "destination already contains live config",
+            ));
+        }
+        std::fs::create_dir_all(root)?;
+        let partial = root.join(format!("{MIGRATION_MARKER}.partial-{}", std::process::id()));
+        let _ = std::fs::remove_file(&partial);
+        std::fs::write(&partial, legacy.to_string_lossy().as_bytes())?;
+        if install_without_overwrite(&partial, &marker)? {
+            // This process installed the recovery record.
+        } else {
+            let _ = std::fs::remove_file(&partial);
+            if read_migration_source(&marker)?.as_deref() != Some(legacy) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "a different legacy migration is already pending",
+                ));
+            }
+        }
     }
-    let legacy = richest_legacy_home(&exe)?;
+
     let mut carried = 0usize;
     for entry in CONFIG_ENTRIES {
         let src = legacy.join(entry);
-        if src.exists() && copy_entry(&src, &root.join(entry)).is_ok() {
+        if src.exists() {
+            copy(&src, &root.join(entry))?;
             carried += 1;
         }
     }
-    (carried > 0).then_some((legacy, root))
+    std::fs::remove_file(marker)?;
+    Ok(carried)
+}
+
+/// Publish a complete temporary file without replacing a destination another process may have
+/// created. A hard link is an atomic no-clobber install on supported filesystems, including NTFS.
+/// The temp and destination are siblings, so they share a filesystem. If linking is unsupported,
+/// fail the migration rather than risk overwriting a concurrent install.
+fn install_without_overwrite(tmp: &Path, dest: &Path) -> std::io::Result<bool> {
+    let result = std::fs::hard_link(tmp, dest);
+
+    match result {
+        Ok(()) => {
+            std::fs::remove_file(tmp)?;
+            Ok(true)
+        }
+        Err(_e) if dest.exists() => {
+            let _ = std::fs::remove_file(tmp);
+            Ok(false)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Which build-tree directory holds the config universe worth carrying forward.
@@ -288,7 +388,14 @@ fn copy_entry(src: &Path, dst: &Path) -> std::io::Result<()> {
         if let Some(parent) = dst.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::copy(src, dst).map(|_| ())
+        let mut temp_name = std::ffi::OsString::from(".neuron-migrate-");
+        temp_name.push(std::process::id().to_string());
+        temp_name.push("-");
+        temp_name.push(dst.file_name().unwrap_or_default());
+        let temp = dst.with_file_name(temp_name);
+        let _ = std::fs::remove_file(&temp);
+        std::fs::copy(src, &temp)?;
+        install_without_overwrite(&temp, dst).map(|_| ())
     }
 }
 
@@ -469,6 +576,108 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dest);
     }
 
+    #[test]
+    fn interrupted_migration_resumes_without_overwriting_live_destination_files() {
+        let base = std::env::temp_dir().join(format!("neuron_runroot_resume_{}", std::process::id()));
+        let legacy = base.join("target").join("release");
+        let dest = base.join("user-home");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(legacy.join("profiles")).unwrap();
+        std::fs::write(legacy.join("profiles").join("main.toml"), "legacy profile").unwrap();
+        std::fs::write(legacy.join("app.toml"), "legacy app").unwrap();
+
+        let mut attempts = 0;
+        let failed = migrate_legacy_entries(&dest, &legacy, |src, dst| {
+            attempts += 1;
+            if attempts == 2 {
+                return Err(std::io::Error::other("injected copy failure"));
+            }
+            copy_entry(src, dst)
+        });
+        assert!(failed.is_err());
+        assert!(dest.join(MIGRATION_MARKER).is_file());
+        assert_eq!(
+            std::fs::read_to_string(dest.join("profiles").join("main.toml")).unwrap(),
+            "legacy profile"
+        );
+
+        // Independent config can appear before retry; it remains authoritative and is not replaced.
+        std::fs::write(dest.join("app.toml"), "independent live app").unwrap();
+        let carried = migrate_legacy_entries(&dest, &legacy, copy_entry).unwrap();
+        assert!(carried > 0);
+        assert!(!dest.join(MIGRATION_MARKER).exists());
+        assert_eq!(
+            std::fs::read_to_string(dest.join("app.toml")).unwrap(),
+            "independent live app"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest.join("profiles").join("main.toml")).unwrap(),
+            "legacy profile"
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn concurrent_migrators_wait_for_the_marker_owner_to_finish() {
+        let base = std::env::temp_dir().join(format!("neuron_runroot_serial_{}", std::process::id()));
+        let legacy = base.join("target").join("release");
+        let dest = base.join("user-home");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(legacy.join("profiles")).unwrap();
+        std::fs::write(legacy.join("profiles").join("main.toml"), "legacy profile").unwrap();
+        std::fs::write(legacy.join("app.toml"), "legacy app").unwrap();
+
+        let (inside_tx, inside_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let a_root = dest.clone();
+        let a_legacy = legacy.clone();
+        let first = std::thread::spawn(move || {
+            migrate_legacy_entries(&a_root, &a_legacy, |_, _| {
+                inside_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Err(io::Error::other("first migrator failed"))
+            })
+        });
+        inside_rx.recv().unwrap();
+        assert!(dest.join(MIGRATION_MARKER).is_file());
+
+        let (copy_tx, copy_rx) = std::sync::mpsc::channel();
+        let b_root = dest.clone();
+        let b_legacy = legacy.clone();
+        let second = std::thread::spawn(move || {
+            migrate_legacy_entries(&b_root, &b_legacy, |src, dst| {
+                copy_tx.send(()).unwrap();
+                copy_entry(src, dst)
+            })
+        });
+        assert!(copy_rx.recv_timeout(std::time::Duration::from_millis(100)).is_err(),
+            "a second migrator must not copy while the first owns the transaction");
+        release_tx.send(()).unwrap();
+        assert!(first.join().unwrap().is_err());
+        assert!(second.join().unwrap().is_ok());
+        assert!(!dest.join(MIGRATION_MARKER).exists());
+        assert_eq!(std::fs::read_to_string(dest.join("app.toml")).unwrap(), "legacy app");
+        assert_eq!(std::fs::read_to_string(dest.join("profiles/main.toml")).unwrap(), "legacy profile");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn independent_live_config_blocks_migration_before_marker_creation() {
+        let base = std::env::temp_dir().join(format!("neuron_runroot_live_{}", std::process::id()));
+        let legacy = base.join("target").join("release");
+        let dest = base.join("user-home");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(legacy.join("app.toml"), "legacy").unwrap();
+        std::fs::write(dest.join("app.toml"), "live").unwrap();
+
+        assert!(migrate_legacy_entries(&dest, &legacy, copy_entry).is_err());
+        assert!(!dest.join(MIGRATION_MARKER).exists());
+        assert_eq!(std::fs::read_to_string(dest.join("app.toml")).unwrap(), "live");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
     /// THE BUG THIS SHIPPED WITH, ONCE. `runtime/` is shared between the run root (which keeps
     /// `twin.knbk` and `pockets/` there) and the bundled-CPython extraction, which materializes
     /// the interpreter into `data_local_dir()/neuron/runtime` — the SAME directory the run root
@@ -522,6 +731,41 @@ mod tests {
             "the destination's own file wins; a migration adds, it does not replace"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn simultaneous_file_commits_cannot_replace_each_other() {
+        let base = std::env::temp_dir().join(format!("neuron_runroot_race_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let dest = base.join("config.toml");
+        let a = base.join("a.partial");
+        let b = base.join("b.partial");
+        std::fs::write(&a, "first source").unwrap();
+        std::fs::write(&b, "second source").unwrap();
+
+        let gate = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let workers: Vec<_> = [a.clone(), b.clone()]
+            .into_iter()
+            .map(|tmp| {
+                let gate = gate.clone();
+                let dest = dest.clone();
+                std::thread::spawn(move || {
+                    gate.wait();
+                    install_without_overwrite(&tmp, &dest).unwrap()
+                })
+            })
+            .collect();
+        gate.wait();
+        let installed = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .filter(|&won| won)
+            .count();
+        assert_eq!(installed, 1, "exactly one complete file may win the commit");
+        let final_value = std::fs::read_to_string(dest).unwrap();
+        assert!(final_value == "first source" || final_value == "second source");
+        let _ = std::fs::remove_dir_all(base);
     }
 
     /// A repo holds both `target/release` and `target/debug`, and either binary can start first

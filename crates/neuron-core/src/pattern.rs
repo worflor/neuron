@@ -1084,8 +1084,9 @@ pub const KEY_SCAN_SLOTS: usize = 256 + 6;
 /// press that resolves to a real board cell within `r`×`c` via the standard Razer keymap
 /// ([`crate::lighting::vk_to_key_cell`]). A key the map doesn't carry (mouse buttons, generic modifiers,
 /// media keys) resolves to None and fires nothing — an accurate reactive surface never lights a key you
-/// didn't press. Returns the TOTAL fresh-press count (incl. unmapped keys), which Thermal uses as its
-/// typing-rate signal. Off Windows the read is a no-op, so nothing ever fires.
+/// didn't press. With `count_unmapped`, returns the total fresh-press count for Thermal's typing-rate
+/// signal. Other effects skip unmapped VK queries and count only keys that can light a cell.
+/// Off Windows the read is a no-op, so nothing ever fires.
 ///
 /// Beyond the VKs it also scans the 6 Razer macro keys (M1..M6), which arrive on Razer's Driver-Mode
 /// `0x04` report — NOT as VKs — via [`crate::capture::macro_key_down`] (suppression-aware, like
@@ -1096,14 +1097,21 @@ fn scan_key_presses(
     prev: &mut [bool],
     r: usize,
     c: usize,
+    count_unmapped: bool,
     mut on_press: impl FnMut(usize, usize),
 ) -> u32 {
     let mut presses = 0u32;
     for (vk, was_down) in prev.iter_mut().take(256).enumerate().skip(1) {
+        let cell = crate::lighting::vk_to_key_cell(vk as i32);
+        // Visual key effects only paint mapped LEDs. Skip the OS query for keys that
+        // cannot affect their output; Thermal still counts every key for typing rate.
+        if !count_unmapped && cell.is_none() {
+            continue;
+        }
         let down = crate::capture::key_down(vk as i32);
         if down && !*was_down {
             presses += 1;
-            if let Some((ry, cx)) = crate::lighting::vk_to_key_cell(vk as i32) {
+            if let Some((ry, cx)) = cell {
                 let (ry, cx) = (ry as usize, cx as usize);
                 if ry < r && cx < c {
                     on_press(ry, cx);
@@ -1133,6 +1141,12 @@ fn scan_key_presses(
         prev[slot] = down;
     }
     presses
+}
+
+fn key_scan_due(last_generation: Option<u64>, generation: u64, since_scan: f32) -> bool {
+    // A transient capture can redirect Raw Input away from the resident listener; the fallback
+    // eventually reconciles the actual OS key state without polling every rendered frame.
+    last_generation != Some(generation) || since_scan >= 0.5
 }
 
 // ───────────────────────────────────── Heat (the Fire shape) ──────────────────────────────────
@@ -1685,7 +1699,7 @@ impl Pattern for Comet {
         }
         // BREAK on fresh key-downs that hit a live head (the same safe down-edge scan reactive uses).
         let mut hits: Vec<(usize, usize)> = Vec::new();
-        scan_key_presses(&mut self.prev, r, c, |ry, cx| hits.push((ry, cx)));
+        scan_key_presses(&mut self.prev, r, c, false, |ry, cx| hits.push((ry, cx)));
         for (ry, cx) in hits {
             self.break_at(ry as f32, cx as f32, r, c);
         }
@@ -1849,7 +1863,7 @@ impl Pattern for Ignite {
         }
         let glow = self.glow;
         let level = &mut self.level;
-        scan_key_presses(&mut self.prev, r, c, |ry, cx| {
+        scan_key_presses(&mut self.prev, r, c, false, |ry, cx| {
             let cell = ry * c + cx;
             level[cell] = 1.0;
             if glow {
@@ -1935,7 +1949,7 @@ impl Pattern for Ring {
             return Field::Scalar(Vec::new());
         }
         let mut spawns: Vec<(usize, usize)> = Vec::new();
-        scan_key_presses(&mut self.prev, r, c, |ry, cx| spawns.push((ry, cx)));
+        scan_key_presses(&mut self.prev, r, c, false, |ry, cx| spawns.push((ry, cx)));
         for (ry, cx) in spawns {
             self.spawn(ry as f32, cx as f32, t);
         }
@@ -2053,6 +2067,8 @@ pub struct Thermal {
     sensitivity: f32,
     fade: f32,
     last_t: f32,
+    last_key_scan_t: f32,
+    last_key_generation: Option<u64>,
 }
 
 impl Pattern for Thermal {
@@ -2071,6 +2087,7 @@ impl Pattern for Thermal {
             self.rate = 0.0;
             self.dims = (rows, cols);
             self.last_t = t;
+            self.last_key_generation = None;
         }
         if n == 0 {
             return Field::Scalar(Vec::new());
@@ -2085,7 +2102,14 @@ impl Pattern for Thermal {
         diffuse_field(&mut self.heat, &mut self.scratch, r, c, dt);
         // detect fresh key-downs: count ALL of them (the typing RATE) and record each pressed key's cell.
         let mut pending: Vec<(usize, usize)> = Vec::new();
-        let presses = scan_key_presses(&mut self.prev, r, c, |ry, cx| pending.push((ry, cx)));
+        let generation = crate::capture::key_transition_generation();
+        let presses = if key_scan_due(self.last_key_generation, generation, t - self.last_key_scan_t) {
+            self.last_key_generation = Some(generation);
+            self.last_key_scan_t = t;
+            scan_key_presses(&mut self.prev, r, c, true, |ry, cx| pending.push((ry, cx)))
+        } else {
+            0
+        };
         // update the typing-RATE EMA, then DEPOSIT — the rate sets the deposit PEAK (fast typing →
         // white-hot, slow → dim embers — speed → INTENSITY, not coverage).
         self.rate = step_rate(self.rate, presses, dt, fade);
@@ -2096,9 +2120,14 @@ impl Pattern for Thermal {
         // emit (u = temperature clamped to the ramp, intensity = breath × heat-haze shimmer). A fresh
         // flare (temp > 1) clamps u to the spectrum's hot/white end.
         let breath = 0.94 + 0.06 * crate::effects::breathe_shape(t * TAU / 6.0);
-        let cells = (0..n)
-            .map(|i| {
-                let temp = self.heat[i].max(0.0);
+        let cells = self.heat.iter_mut()
+            .enumerate()
+            .map(|(i, heat)| {
+                let temp = (*heat).max(0.0);
+                if temp < 0.002 {
+                    *heat = 0.0;
+                    return Cell::new(0.0, 1.0);
+                }
                 let (x, y) = (i % c, i / c);
                 let shimmer = heat_shimmer(x, y, t, temp);
                 Cell::new(temp.min(1.0), (breath * shimmer).clamp(0.0, 1.0))
@@ -3905,7 +3934,7 @@ mod tests {
         // thread-local that defaults off, so reads on this fresh test thread are NOT suppressed.)
         let count_m1 = |prev: &mut Vec<bool>| {
             let mut hits = 0u32;
-            scan_key_presses(prev, rows, cols, |ry, cx| {
+            scan_key_presses(prev, rows, cols, true, |ry, cx| {
                 if (ry, cx) == (m1r, m1c) {
                     hits += 1;
                 }
@@ -3999,6 +4028,22 @@ mod tests {
         assert!(typed > idle, "fresh presses raise the typing rate");
         assert!(deposit_peak(1.0, 1.0) > deposit_peak(0.0, 1.0), "a faster rate lands hotter");
         assert!(deposit_peak(0.5, 2.0) > deposit_peak(0.5, 1.0), "sensitivity scales the deposit");
+    }
+
+    #[test]
+    fn thermal_cold_frame_does_not_animate_without_typing() {
+        let mut thermal = Thermal::default();
+        let first = scalar(thermal.field(6, 22, 0.0));
+        let later = scalar(thermal.field(6, 22, 3.0));
+        assert_eq!(first, later, "a cold board should not stream changing frames at rest");
+    }
+
+    #[test]
+    fn thermal_key_scan_wakes_on_edge_and_rechecks_after_lost_events() {
+        assert!(key_scan_due(None, 0, 0.0));
+        assert!(!key_scan_due(Some(4), 4, 0.49));
+        assert!(key_scan_due(Some(4), 5, 0.01));
+        assert!(key_scan_due(Some(4), 4, 0.5));
     }
 
     // ── Meter (Audio Meter + Pulse) — the pure renderers ────────────────────────────────────────

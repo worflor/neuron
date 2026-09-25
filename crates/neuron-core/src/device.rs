@@ -14,6 +14,8 @@ use std::collections::{HashMap, HashSet};
 pub struct Device {
     pub def: DeviceDef,
     pub pid: u16,
+    /// Stable physical-unit identity shared by that unit's HID collections.
+    pub dpi_unit: String,
     transport: Box<dyn Transport>,
 }
 
@@ -40,6 +42,7 @@ impl Device {
         Device {
             def,
             pid,
+            dpi_unit: format!("pid:{pid:04x}"),
             transport,
         }
     }
@@ -50,6 +53,7 @@ impl Device {
         Ok(Device {
             def,
             pid,
+            dpi_unit: crate::transport::path_instance(&path.as_os_str().to_string_lossy()),
             transport,
         })
     }
@@ -84,6 +88,20 @@ impl Device {
             }
         }
         bail!("no connected device supports '{cmd}'")
+    }
+
+    /// Open a command pipe for one physical unit. A missing unit is an error: a held operation
+    /// must never move to another same-PID device after a reconnect or enumeration change.
+    pub fn open_with_command_unit(
+        reg: &crate::registry::Registry,
+        cmd: &str,
+        pid: u16,
+        unit: &str,
+    ) -> Result<Self> {
+        let infos = transport::enumerate()?;
+        let (info, def) = command_unit_candidate(&infos, reg, cmd, pid, unit)
+            .with_context(|| format!("physical unit '{unit}' no longer exposes '{cmd}'"))?;
+        Device::open_path(def, info.pid, &info.path)
     }
 
     /// The SEMANTIC sibling of [`open_with_command`](Self::open_with_command): resolve the first
@@ -183,7 +201,7 @@ impl Device {
     /// ROUTED through the device's protocol [`Dialect`](crate::dialect::Dialect): the
     /// build-frame/set/wait/drain body now lives in `dialect::RazerDialect::exec_fast`, which
     /// receives `self.def.stream_wait_us` as the wait discipline — byte-identical to before.
-    pub fn send_lighting_fast(&self, rep: &crate::lighting::Report) {
+    pub fn send_lighting_fast(&self, rep: &crate::lighting::Report) -> bool {
         let size = rep.size.unwrap_or_else(|| rep.args.len().min(80) as u8);
         let tx = rep.tx.unwrap_or(self.def.transaction_id);
         // Fire-and-forget path: a silent no-op on a mistagged def is the SAFE failure (Finding 2).
@@ -191,7 +209,7 @@ impl Device {
         // already refuses to select such a def — so reaching here at all means a def slipped through;
         // the right move is to put NOTHING on the wire rather than razer-frame it blindly.
         let Ok(dialect) = self.dialect() else {
-            return;
+            return false;
         };
         dialect.exec_fast(
             self.transport.as_ref(),
@@ -201,7 +219,7 @@ impl Device {
             size,
             &rep.args,
             self.def.stream_wait_us,
-        );
+        )
     }
 
     /// Release this family's CUSTODY of the device back to firmware — the rest-state restore run at
@@ -236,11 +254,28 @@ impl Device {
     }
 }
 
+fn command_unit_candidate<'a>(
+    infos: &'a [transport::HidDeviceInfo],
+    reg: &crate::registry::Registry,
+    cmd: &str,
+    pid: u16,
+    unit: &str,
+) -> Option<(&'a transport::HidDeviceInfo, DeviceDef)> {
+    infos.iter().find_map(|info| {
+        if info.pid != pid || info.instance() != unit {
+            return None;
+        }
+        let def = reg.find_for_pipe(info)?;
+        def.command(cmd).map(|_| (info, def.clone()))
+    })
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct DeviceKey {
     vendor_id: u16,
     product_id: u16,
     name: String,
+    unit: String,
 }
 
 impl DeviceKey {
@@ -249,6 +284,7 @@ impl DeviceKey {
             vendor_id: d.def.vendor_id,
             product_id: d.pid,
             name: d.def.name.clone(),
+            unit: d.dpi_unit.clone(),
         }
     }
 }
@@ -378,6 +414,22 @@ impl<'a> DeviceSession<'a> {
         self.with_writable_via(cmd, |reg| Device::open_with_command(reg, cmd), op)
     }
 
+    /// Like [`Self::with_writable`], but pinned to one physical unit across cache reuse and
+    /// stale-handle retry. If that unit disappears, no other same-PID device receives the write.
+    pub fn with_writable_unit<T>(
+        &mut self,
+        cmd: &str,
+        pid: u16,
+        unit: &str,
+        mut op: impl FnMut(&Device) -> Result<T>,
+    ) -> Result<T> {
+        let key = format!("unit:{pid:04x}:{}:{unit}:{cmd}", unit.len());
+        self.with_writable_via(&key, |reg| Device::open_with_command_unit(reg, cmd, pid, unit), |d| {
+            anyhow::ensure!(d.pid == pid && d.dpi_unit == unit, "resolved a different physical unit for '{cmd}'");
+            op(d)
+        })
+    }
+
     /// Run one writable operation resolved by CAPABILITY, reopening/re-handshaking once if the
     /// cached handle failed. The capability sibling of [`with_writable`](Self::with_writable): for a
     /// capability with more than one wire dialect (today only `SetBrightness` — top-level command vs
@@ -437,6 +489,37 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
+    #[test]
+    fn command_unit_resolution_never_selects_a_same_pid_twin() {
+        let def: DeviceDef =
+            toml::from_str(include_str!("../devices/razer-naga-v2-pro.toml")).unwrap();
+        let reg = crate::registry::Registry { devices: vec![def] };
+        let make_info = |serial: &str| transport::HidDeviceInfo {
+            vid: 0x1532,
+            pid: 0x00A8,
+            usage_page: 0x0001,
+            usage: 0x0002,
+            feature_len: 91,
+            input_len: 0,
+            output_len: 0,
+            path: DevicePath::from_str_for_tests(&format!(
+                r"\\?\hid#vid_1532&pid_00a8&mi_00&col01#{serial}#{{4d1e55b2-f16f-11cf-88cb-001111000030}}"
+            )),
+            product: String::new(),
+        };
+        let infos = [make_info("unit-a"), make_info("unit-b")];
+        let unit_a = infos[0].instance();
+        let unit_b = infos[1].instance();
+        assert_ne!(unit_a, unit_b);
+        let (chosen, _) = command_unit_candidate(&infos, &reg, "set_dpi", 0x00A8, &unit_b)
+            .expect("the second physical unit has the command");
+        assert_eq!(chosen.path, infos[1].path);
+        assert!(command_unit_candidate(&infos[..1], &reg, "set_dpi", 0x00A8, &unit_b).is_none(),
+            "when the held unit is gone, its twin must not receive the restore");
+        assert!(command_unit_candidate(&infos, &reg, "set_dpi", 0x00A7, &unit_a).is_none(),
+            "pid and physical unit must both match");
+    }
+
     /// The exact resolution gap this capability path closes: the legacy `BlackWidow` has NO top-level
     /// `set_brightness` command (its brightness lives in the `[lighting]` block), so the command-name
     /// resolver (`open_with_command`) never selected it — yet it CAN set brightness. `open_with_capability`
@@ -479,6 +562,7 @@ mod tests {
         let dev = Device {
             def,
             pid: 0x0221,
+            dpi_unit: "test:0221".into(),
             transport: Box::new(PanicOnIo),
         };
         // ACK'd path: an Err that names the offending dialect, raised BEFORE any transport I/O.
@@ -524,7 +608,7 @@ mod tests {
     #[derive(Clone)]
     struct DiesOnce {
         dead: Arc<AtomicBool>,
-        last: Arc<Mutex<(u8, u8)>>,
+        last: Arc<Mutex<(u8, u8, u8, u8)>>,
         device_mode_sets: Arc<AtomicUsize>,
     }
 
@@ -534,7 +618,7 @@ mod tests {
                 bail!("stale handle: set_feature failed (simulated unplug/sleep)");
             }
             let (class, id) = (buf[7], buf[8]);
-            *self.last.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = (class, id);
+            *self.last.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = (buf[2], class, id, buf[6]);
             if class == crate::writes::CLASS_DEVICE_MODE && id == crate::writes::ID_DEVICE_MODE_SET {
                 self.device_mode_sets.fetch_add(1, Ordering::SeqCst);
             }
@@ -545,8 +629,8 @@ mod tests {
             if self.dead.load(Ordering::SeqCst) {
                 bail!("stale handle: get_feature failed (simulated unplug/sleep)");
             }
-            let (class, id) = *self.last.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let mut rep = Report::command(0x1F, class, id, 0);
+            let (tx, class, id, size) = *self.last.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut rep = Report::command(tx, class, id, size);
             rep.status = 0x02; // Success
             let out = rep.to_buf();
             let n = buf.len().min(out.len());
@@ -586,9 +670,10 @@ mod tests {
                 Ok(Device {
                     def: bw.clone(),
                     pid: 0x0221,
+                    dpi_unit: "test:0221".into(),
                     transport: Box::new(DiesOnce {
                         dead: dead.clone(),
-                        last: Arc::new(Mutex::new((0u8, 0u8))),
+                        last: Arc::new(Mutex::new((0u8, 0u8, 0u8, 0u8))),
                         device_mode_sets: device_mode_sets.clone(),
                     }),
                 })
@@ -647,9 +732,10 @@ mod tests {
                 Ok(Device {
                     def: bw.clone(),
                     pid: 0x0221,
+                    dpi_unit: "test:0221".into(),
                     transport: Box::new(DiesOnce {
                         dead: dead.clone(),
-                        last: Arc::new(Mutex::new((0u8, 0u8))),
+                        last: Arc::new(Mutex::new((0u8, 0u8, 0u8, 0u8))),
                         device_mode_sets: device_mode_sets.clone(),
                     }),
                 })

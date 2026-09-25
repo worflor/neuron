@@ -11,9 +11,9 @@
 //!   * [`bundled_sidecar_fires_a_macro`] — register + fire a macro through the warm sidecar, which
 //!     spawns from the bundled interpreter, and confirm the fire's value came back. End-to-end
 //!     proof the sidecar runs on the app-owned Python.
-//!   * [`triple_mapping_is_total_over_supported_targets`] — mirrors build.rs's `target_to_triple`
-//!     and checks every supported triple maps + an unsupported one returns None. (build.rs's own
-//!     `#[cfg(test)]` block isn't run by `cargo test`, so the contract is mirrored here.)
+//!
+//! The build script's target mapping and slimming rules run as a separate test target using the
+//! actual `build.rs` source, avoiding a duplicate mapping that can drift.
 
 use neuron::macros::{ensure_runtime, macro_host, Context};
 use std::process::Command;
@@ -106,47 +106,4 @@ fn bundled_sidecar_fires_a_macro() {
         "fire should report the bundled interpreter as sys.executable: {r}"
     );
     eprintln!("bundled sidecar fired a macro: {r}");
-}
-
-// ── mirror of build.rs::target_to_triple (build.rs' own cfg(test) block isn't run by cargo test) ──
-
-/// EXACT mirror of `crates/neuron-core/build.rs::target_to_triple`. If you change one, change both.
-fn target_to_triple(target: &str) -> Option<&'static str> {
-    Some(match target {
-        "x86_64-pc-windows-msvc" => "x86_64-pc-windows-msvc",
-        "aarch64-pc-windows-msvc" => "aarch64-pc-windows-msvc",
-        "x86_64-apple-darwin" => "x86_64-apple-darwin",
-        "aarch64-apple-darwin" => "aarch64-apple-darwin",
-        "x86_64-unknown-linux-gnu" => "x86_64-unknown-linux-gnu",
-        "aarch64-unknown-linux-gnu" => "aarch64-unknown-linux-gnu",
-        "x86_64-unknown-linux-musl" => "x86_64-unknown-linux-musl",
-        "aarch64-unknown-linux-musl" => "aarch64-unknown-linux-musl",
-        _ => return None,
-    })
-}
-
-#[test]
-fn triple_mapping_is_total_over_supported_targets() {
-    let supported = [
-        "x86_64-pc-windows-msvc",
-        "aarch64-pc-windows-msvc",
-        "x86_64-apple-darwin",
-        "aarch64-apple-darwin",
-        "x86_64-unknown-linux-gnu",
-        "aarch64-unknown-linux-gnu",
-        "x86_64-unknown-linux-musl",
-        "aarch64-unknown-linux-musl",
-    ];
-    for t in supported {
-        assert_eq!(target_to_triple(t), Some(t), "{t} must map to itself");
-    }
-    // Unsupported targets must be a clean None (build.rs panics on these — never a silent miss).
-    for bad in [
-        "x86_64-pc-windows-gnu",
-        "wasm32-unknown-unknown",
-        "mips64-unknown-linux-gnuabi64",
-        "",
-    ] {
-        assert!(target_to_triple(bad).is_none(), "{bad} must be unsupported");
-    }
 }

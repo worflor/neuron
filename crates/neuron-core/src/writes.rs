@@ -490,7 +490,7 @@ pub fn set_dpi_stages(
     // out unattributed. Claimed before the bytes leave and rolled back below if the table does not
     // land, exactly as in `capability::set_dpi`.
     let landing = stages.get(active_index(stages.len(), active_idx));
-    let prev_stamp = landing.map(|a| crate::dpi_origin::expect(d.pid, a.x, cause));
+    let prev_stamp = landing.map(|a| crate::dpi_origin::expect(d.pid, &d.dpi_unit, a.x, cause));
     let prev_intent = (cause.is_durable() && landing.is_some()).then(|| {
         let snap = crate::feel_intent::snapshot(d.pid);
         let xs: Vec<u16> = stages.iter().map(|s| s.x).collect();
@@ -524,7 +524,7 @@ pub fn set_dpi_stages(
 
     if landed.is_err() {
         if let Some(prev) = prev_stamp {
-            crate::dpi_origin::rollback(d.pid, prev);
+            crate::dpi_origin::rollback(d.pid, &d.dpi_unit, prev);
         }
         if let Some(snap) = prev_intent {
             let _ = crate::feel_intent::restore(d.pid, snap);
@@ -2116,23 +2116,23 @@ mod tests {
         );
         let d = dpi_device(&phantom, REFUSED_PID);
 
-        forget(REFUSED_PID);
-        let _ = expect(REFUSED_PID, 30000, Cause::Momentary); // a write that DID land, earlier
+        forget(REFUSED_PID, &d.dpi_unit);
+        let _ = expect(REFUSED_PID, &d.dpi_unit, 30000, Cause::Momentary); // a write that DID land, earlier
 
         crate::capability::set_dpi(&d, 800, 800, Store::Volatile, Cause::Momentary)
             .expect_err("a yanked device must not yield a trusted write");
 
         assert_ne!(
-            classify(REFUSED_PID, 800),
+            classify(REFUSED_PID, &d.dpi_unit, 800),
             Origin::Echo(Cause::Momentary),
             "the ledger claimed a value the device never took, so a later drift to it would be waved through as our own echo"
         );
         assert_eq!(
-            classify(REFUSED_PID, 30000),
+            classify(REFUSED_PID, &d.dpi_unit, 30000),
             Origin::Echo(Cause::Momentary),
             "rolling back the failed write must not also erase the last one that succeeded"
         );
-        forget(REFUSED_PID);
+        forget(REFUSED_PID, &d.dpi_unit);
     }
 
     #[test]
@@ -2143,14 +2143,15 @@ mod tests {
         let phantom = Arc::new(
             MockDevice::razer(LANDED_PID, "phantom naga")
                 .answering(CLASS_DEVICE_MODE, ID_DEVICE_MODE_GET, &[DRIVER_MODE])
-                .answering(CLASS_DPI, 0x05, &[]), // set_dpi, per the Naga def
+                .answering(CLASS_DPI, 0x05, &[]) // set_dpi, per the Naga def
+                .answering(CLASS_DPI, 0x85, &[0, 0x03, 0x20, 0x03, 0x20]),
         );
         let d = dpi_device(&phantom, LANDED_PID);
 
-        forget(LANDED_PID);
+        forget(LANDED_PID, &d.dpi_unit);
         crate::capability::set_dpi(&d, 800, 800, Store::Volatile, Cause::Momentary)
             .expect("the honest phantom accepts the write");
-        assert_eq!(classify(LANDED_PID, 800), Origin::Echo(Cause::Momentary));
-        forget(LANDED_PID);
+        assert_eq!(classify(LANDED_PID, &d.dpi_unit, 800), Origin::Echo(Cause::Momentary));
+        forget(LANDED_PID, &d.dpi_unit);
     }
 }

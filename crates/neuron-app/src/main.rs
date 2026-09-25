@@ -86,7 +86,25 @@ struct Resident {
     live: Option<dispatch::LiveRuntime>,
 }
 
+/// Resolve process authority before any startup path can restore a device stream.
+fn initial_runtime_mode(safe: bool) -> neuron::safety::RuntimeMode {
+    if safe {
+        neuron::safety::RuntimeMode::Observe
+    } else {
+        // Keep input disarmed until the GUI is ready to start live dispatch.
+        neuron::safety::RuntimeMode::Device
+    }
+}
+
+fn arm_live_dispatch(safe: bool, respawned: bool, input_supported: bool) -> bool {
+    input_supported && !safe && !respawned
+}
+
 fn main() {
+    let safe = std::env::args().any(|a| a == "--safe");
+    let respawned = std::env::args().any(|a| a == "--respawned");
+    let startup_mode = initial_runtime_mode(safe);
+    neuron::safety::set_mode(startup_mode);
     // Config never depends on the process CWD: every Neuron runtime path resolves through
     // `neuron::runroot::run_root()` (the exe's directory when that's a home we may keep data in,
     // else %LOCALAPPDATA%\neuron, else NEURON_RUN_DIR), so an autostart from C:\Windows\System32
@@ -97,8 +115,15 @@ fn main() {
     // install used to keep every profile/macro/gesture in `target\release`, where a routine
     // `cargo clean` destroys them (and the `backups/` safety net with them, since it lived in
     // there too). Copies once, never clobbers, no-ops afterwards.
-    if let Some((from, to)) = neuron::runroot::adopt_legacy_run_root() {
-        eprintln!("[neuron] carried config forward: {} -> {}", from.display(), to.display());
+    match neuron::runroot::adopt_legacy_run_root() {
+        Ok(Some((from, to))) => {
+            eprintln!("[neuron] carried config forward: {} -> {}", from.display(), to.display());
+        }
+        Ok(None) => {}
+        Err(err) => {
+            eprintln!("[neuron] config migration incomplete: {err}; leaving the app closed so it cannot write partial config");
+            std::process::exit(1);
+        }
     }
 
     // PROFILER (inert unless NEURON_PROFILE is set): 1 Hz hot-path counters + per-thread/sidecar
@@ -186,8 +211,7 @@ fn main() {
     //   2. RegisterApplicationRestart asks WINDOWS ITSELF to relaunch us after a crash or hang
     //      (the same mechanism browsers/Office use). The OS enforces the anti-crash-loop rule
     //      (only fires after 60s of uptime), we pass `--tray --respawned` so the relaunch comes
-    //      back quietly and says what happened. A fault in a DLL we don't own becomes a blip:
-    //      the tray icon returns, configs reload, live dispatch re-arms.
+    //      back quietly and says what happened. Input remains disarmed after recovery.
     #[cfg(windows)]
     unsafe {
         use windows_sys::Win32::System::Diagnostics::Debug::{
@@ -227,14 +251,13 @@ fn main() {
     }
     flight::trace("life", "app start", 0);
 
-    // STARTUP SELF-HEAL (after the crash hooks — its child-process calls get logged like
-    // everything else): migrate a leftover HKCU Run-key launcher (unelevated — native Chroma
-    // dead every boot, and a double-launch beside the task) to the elevated scheduled task,
-    // preserving the autostart intent. Replace-then-remove: the key only goes once the task
-    // holds the trigger. autostart::set() migrates on toggle too; this covers users who never
-    // touch the launch selector.
+    // Retire a previously installed elevated task, then carry a legacy Run-key autostart into
+    // the limited task. The task must never elevate this user-writable app and its RAW macros.
     #[cfg(windows)]
-    autostart::migrate_legacy_run_key();
+    {
+        autostart::retire_elevated_task();
+        autostart::migrate_legacy_run_key();
+    }
 
     // ── POWER-THROTTLING OPT-OUT (Win11 background QoS) ───────────────────
     // When a fullscreen game has focus, Windows puts unfocused processes on
@@ -285,16 +308,7 @@ fn main() {
         live: None,
     }));
 
-    // ── RENDERER SELECTION (prefer GPU, fall back to software) ────────────
-    // PREFER femtovg (GPU): it's why the UI feels instant on a real GPU — and the user's machine has
-    // one, so this is the path that's taken there. But a VM / RDP / headless / bad-driver host has no
-    // usable OpenGL context, and a GPU-only build can't open its window AT ALL there. So select the
-    // backend BEFORE the first `AppWindow::new()`: ask for femtovg, and if that selection fails, fall
-    // back to the software renderer so the UI ALWAYS opens (slower, but it opens). `select()` sets the
-    // platform on success and does NOT on failure, so the software retry is safe to call afterwards.
-    // (Belt-and-suspenders: even when femtovg is selected here, the winit backend itself auto-falls-
-    // back to software at WINDOW-creation time if GL init then fails — that's why renderer-software is
-    // compiled in. This explicit selection additionally covers an event-loop/init failure at select.)
+    // Select before the first Slint window. Keep software compiled for hosts with no GPU context.
     select_renderer_backend();
 
     // Bring up the PROTOCOL HOST (if the CONNECTIONS pref opts in — default OFF)
@@ -341,26 +355,34 @@ fn main() {
             return;
         }
     };
+    {
+        let wake_tray = tray.clone();
+        let wake_resident = resident.clone();
+        tray.install_wake(move || {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                for action in wake_tray.poll() {
+                    handle_tray(&wake_resident, action);
+                }
+            }));
+        });
+    }
 
     // Hidden start is an AUTOSTART behaviour: `--tray` (the Run-key launch) honours the persisted
     // start-minimized preference. A deliberate double-click ALWAYS shows the window — a brand-new
     // user must never be greeted by nothing but a tray icon they don't know exists.
     let start_hidden = std::env::args().any(|a| a == "--tray") && prefs::start_minimized();
     // An OS-relaunch after a crash announces itself honestly (and lands in the flight record).
-    let respawned = std::env::args().any(|a| a == "--respawned");
     if respawned {
         flight::trace("life", "respawned after a crash", 0);
     }
 
     // ── START LIVE DISPATCH (the headline) ────────────────────────────────
     // The device-event runtime starts here, on the REAL app-run path only (never from a test —
-    // tests construct State + glue but never reach main). It ARMS input by default so GUI-bound
-    // remaps fire out of the box; the Settings SAFE-MODE toggle is the disarm switch. `--safe`
-    // starts disarmed (observe/dry-run). The loop builds the unified Engine, installs the GamingMode
+    // tests construct State + glue but never reach main). A normal Windows launch arms input here
+    // so tray remaps work after logon. `--safe` and crash recovery stay disarmed. The loop installs the GamingMode
     // hook, and posts last-trigger/active-layer back to the UI.
-    let safe = std::env::args().any(|a| a == "--safe");
     let input_supported = cfg!(windows);
-    let armed = input_supported && !safe;
+    let armed = arm_live_dispatch(safe, respawned, input_supported);
     // Build the weak handle + set the view inside a SHORT borrow, then start the worker and store it
     // in a SEPARATE borrow (the worker must not be created while a borrow of `resident` is held).
     let weak = {
@@ -370,14 +392,19 @@ fn main() {
         };
         let st = app.global::<State>();
         st.set_input_armed(armed);
+        st.set_arm_stance(glue::arm_stance(neuron::writes::writes_paused(), armed));
         st.set_runtime_active(input_supported);
         st.set_status_line(
             if !input_supported {
                 "device settings and lighting are available; live remaps need a Linux input backend"
+            } else if respawned {
+                "recovered from a crash — input safe; arm again when ready"
+            } else if safe {
+                "SAFE MODE — input disarmed and device writes paused"
             } else if armed {
-                "live dispatch ARMED - GUI remaps fire (toggle safe-mode in Settings to disarm)"
+                "live dispatch ARMED — remaps and macros fire"
             } else {
-                "live dispatch running - SAFE MODE (observe/dry-run, nothing injected)"
+                "device mode — lighting and settings live; input safe until armed"
             }
             .into(),
         );
@@ -388,20 +415,11 @@ fn main() {
     // window where a fire could slip through against the intended gate). Not debug_assert-able like
     // the other two startup-order contracts in this file (`glue::install_ui` before `hidwatch::start`,
     // `host::start` before `build_window`): `false` is a legitimate armed state, so there's no wrong
-    // value to catch — only a wrong ORDER, which this comment is the guard against. This only sets an
-    // atomic + a non-blocking frame; the sidecar itself is warmed below, off-thread.
+    // value to catch — only a wrong ORDER, which this comment is the guard against.
     neuron::macros::macro_host().set_armed(armed);
 
     let live = dispatch::LiveRuntime::start(weak.clone(), armed);
     resident.borrow_mut().live = Some(live);
-
-    // ── WARM THE MACRO HOST (off the UI thread) ───────────────────────
-    // Spawn the bundled-CPython sidecar once and register every macros/scripts/*.py into it, so a
-    // triggered python macro fires warm (no per-press spawn/import). The input path + hardware
-    // control are live immediately regardless; the macro tier just becomes ready a beat later.
-    crate::worker::spawn_detached("neuron-macro-warm", || {
-        let _ = neuron::macros::macro_host().ensure_warm();
-    });
 
     // ── NOTIFICATION ENGINE ───────────────────────────────────────────
     // Register the confirmation sink (the core's structural one-way door) and hand its receiver to a
@@ -484,8 +502,8 @@ fn main() {
 
     // Pump tray + hotkey events from the event loop, and keep the cheap truths honest each tick:
     // the LINK lamp, the ARMED pill (the gate is a process-global others can flip), the tray menu
-    // (profiles/effects/checks), and the status line's freshness. A 60ms cadence is invisibly
-    // responsive and keeps idle cost near zero (true to the anti-bloat motto).
+    // (profiles/effects/checks), and the status line's freshness. Tray and hotkey actions wake
+    // the UI directly, so this background refresh can use a slower cadence.
     let poll_tray = tray.clone();
     let poll_res = resident.clone();
     let timer = slint::Timer::default();
@@ -507,9 +525,10 @@ fn main() {
     let vitals_seen: RefCell<bool> = RefCell::new(false);
     // …and a ~1s steady-state gate so the pump enumerates at most ~1Hz while a vitals surface is up.
     let vitals_pump_seen: RefCell<Instant> = RefCell::new(neuron::timing::ago(Duration::from_secs(2)));
+    let macro_catalog_seen = std::cell::Cell::new(false);
     timer.start(
         slint::TimerMode::Repeated,
-        Duration::from_millis(60),
+        Duration::from_millis(500),
         move || {
             // ── ARMORED TICK ── a panic in this closure would unwind into winit's FFI and take
             // the whole event loop with it. Contain it: the fault is logged (panic hook + flight
@@ -526,6 +545,14 @@ fn main() {
                     return;
                 };
                 let st = app.global::<State>();
+                if !macro_catalog_seen.get()
+                    && st.get_window_shown()
+                    && st.get_page() == 2
+                    && st.get_input_view() == 0
+                {
+                    macro_catalog_seen.set(true);
+                    crate::glue::refresh_macro_catalog(app);
+                }
                 let now = Instant::now();
                 let slow_due = {
                     let mut seen = slow_seen.borrow_mut();
@@ -613,7 +640,9 @@ fn main() {
                     let mut seen = reliab_seen.borrow_mut();
                     if seen.elapsed() >= Duration::from_secs(1) {
                         *seen = Instant::now();
-                        crate::glue::refresh_reliability(app);
+                        if st.get_window_shown() && st.get_page() == 3 {
+                            crate::glue::refresh_reliability(app);
+                        }
                         // HOST BASE RECOVERY: if the protocol-host kernel took a contained fault and
                         // was reborn, every lease was swept — including the app's own animated base
                         // layer (leases are never reborn). Re-claim any base whose kernel layer
@@ -665,6 +694,7 @@ fn main() {
                     let armed_now = neuron::action::input_armed();
                     if st.get_input_armed() != armed_now {
                         st.set_input_armed(armed_now);
+                        st.set_arm_stance(glue::arm_stance(neuron::writes::writes_paused(), armed_now));
                         neuron::macros::macro_host().set_armed(armed_now); // keep the macro sidecar's gate honest
                     }
                 }
@@ -793,28 +823,43 @@ fn restore_devices_to_firmware() {
     }
 }
 
-/// Choose the Slint renderer backend BEFORE any window is created: prefer femtovg (GPU), fall back to
-/// the software renderer if femtovg can't be selected. Keeps the GPU path on a GPU machine while
-/// guaranteeing the UI opens on a host with no usable OpenGL context (VM / RDP / headless / bad
-/// drivers). Both renderers are compiled in (see Cargo.toml). Never panics — a host where even the
-/// software backend can't be set is one no renderer choice could rescue, so we log and let the later
-/// `AppWindow::new()` surface the failure honestly.
+/// Choose the Slint UI renderer before creating a window. The default prefers OpenGL;
+/// `NEURON_RENDERER=software` avoids a graphics context on weak drivers, while `wgpu`
+/// opts into the experimental WGPU path when compiled. Slint initializes the graphics
+/// device later, when the window opens, so selection alone cannot prove it will work.
 fn select_renderer_backend() {
-    if let Err(gpu_err) = slint::BackendSelector::new()
-        .renderer_name("femtovg".into())
-        .select()
-    {
-        eprintln!(
-            "neuron: GPU (femtovg) renderer unavailable ({gpu_err}); falling back to software renderer"
-        );
-        flight::trace("life", "femtovg unavailable — software fallback", 0);
-        if let Err(sw_err) = slint::BackendSelector::new()
-            .renderer_name("software".into())
+    let request = std::env::var("NEURON_RENDERER").unwrap_or_default();
+    #[cfg(not(feature = "wgpu-renderer"))]
+    if request == "wgpu" {
+        eprintln!("neuron: WGPU renderer requested, but this build lacks the wgpu-renderer feature");
+    }
+    let candidates: &[&str] = match request.as_str() {
+        "wgpu" => &["femtovg-wgpu", "femtovg", "software"],
+        "software" => &["software", "femtovg"],
+        "" | "femtovg" => &["femtovg", "software"],
+        other => {
+            eprintln!("neuron: unknown renderer {other:?}; using the default");
+            &["femtovg", "software"]
+        }
+    };
+    for &renderer in candidates {
+        #[cfg(not(feature = "wgpu-renderer"))]
+        if renderer == "femtovg-wgpu" {
+            continue;
+        }
+        match slint::BackendSelector::new()
+            .renderer_name(renderer.into())
             .select()
         {
-            eprintln!("neuron: software renderer also unavailable ({sw_err}); the UI may not open");
+            Ok(()) => {
+                return;
+            }
+            Err(err) => {
+                eprintln!("neuron: {renderer} renderer unavailable ({err})");
+            }
         }
     }
+    eprintln!("neuron: no renderer could be selected; the UI may not open");
 }
 
 /// Create the window + install glue if not already present — WITHOUT showing it. Quick actions
@@ -834,6 +879,16 @@ fn build_window(resident: &Rc<RefCell<Resident>>) -> bool {
             return false;
         }
     };
+    #[cfg(feature = "wgpu-renderer")]
+    if std::env::var("NEURON_RENDERER").as_deref() == Ok("wgpu") {
+        if let Err(err) = app.window().set_rendering_notifier(|state, api| {
+            if matches!(state, slint::RenderingState::RenderingSetup) {
+                eprintln!("neuron: UI renderer initialized with {api:?}");
+            }
+        }) {
+            eprintln!("neuron: renderer diagnostics unavailable ({err})");
+        }
+    }
     let shared = glue::install(&app);
 
     // DEV: `NEURON_START_PAGE=<n>` opens directly on that page (0 = bindings, 1 = lighting, …) —
@@ -916,10 +971,8 @@ fn raise_self() {
 /// the tray mid-game must never yank a 1240px window over the game. Only Open/Settings show.
 fn handle_tray(resident: &Rc<RefCell<Resident>>, action: TrayAction) {
     flight::trace("tray", "action", 0);
-    // Every quick action drives the State callbacks, which need the window BUILT (not shown). In
-    // tray-first launch (--tray) the window is never built at startup, so without this the quick
-    // controls (brightness/DPI/profile/HyperShift/pause) silently no-op. `build_window` is
-    // idempotent and does NOT show anything — it just makes the runtime/State reachable.
+    // Quick actions need the hidden window's State callbacks. Keep this idempotent guard so
+    // the callbacks remain reachable if window construction moves later in startup.
     if !build_window(resident) {
         return;
     }
@@ -1005,5 +1058,21 @@ fn nudge_dpi(resident: &Rc<RefCell<Resident>>, delta: f32) {
         let v = (st.get_dpi() + delta).clamp(100.0, 30000.0);
         st.set_dpi(v);
         st.invoke_apply_dpi(v);
+    }
+}
+
+#[cfg(test)]
+mod startup_policy_tests {
+    use super::*;
+
+    #[test]
+    fn startup_waits_for_live_dispatch_and_safe_pauses_writes() {
+        assert_eq!(initial_runtime_mode(false), neuron::safety::RuntimeMode::Device);
+        assert_eq!(initial_runtime_mode(true), neuron::safety::RuntimeMode::Observe);
+        assert!(!initial_runtime_mode(false).state().input_armed);
+        assert!(arm_live_dispatch(false, false, true), "normal Windows tray launch keeps remaps live");
+        assert!(!arm_live_dispatch(true, false, true), "safe mode disarms input");
+        assert!(!arm_live_dispatch(false, true, true), "crash recovery waits for a fresh arm");
+        assert!(!arm_live_dispatch(false, false, false), "unsupported input cannot arm");
     }
 }

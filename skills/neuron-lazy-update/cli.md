@@ -73,8 +73,9 @@ retry with other values.
 - **`run`** starts the remap daemon. If the neuron app is already running, that means two things
   handling the same buttons. Only run it if the user asks, and suggest `run --safe` to watch without
   acting.
-- **`macro run`** and any `.py` macro file run real, unsandboxed Python. Only run macros the user
-  wrote or has read.
+- **`macro run`** executes BOUND Python by default; `# neuron: raw` in a file's header opts into
+  ordinary Python with file, network and process access. RAW module-level code can run even when
+  the CLI's Neuron effect gate is disarmed. Only run macros the user wrote or has read.
 - **`probe`**, **`discover`** and **`adopt`** are for supporting new or unknown hardware. They're
   not needed for everyday use.
 - **`neuron-app.exe --purge-synapse`** stops and disables Razer Synapse's services and needs admin.

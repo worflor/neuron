@@ -653,6 +653,8 @@ component PingGrid inherits VerticalLayout {
 }
 
 export component SettingsPanel inherits VerticalLayout {
+    in property <length> viewport-top;
+    in property <length> viewport-bottom;
     spacing: 0;
     // Is the RIGHT COLUMN too narrow to seat the notification placer (348px) beside a workable
     // 4-card ping row? Measured HERE, at the panel root — its width is imposed by the page
@@ -663,14 +665,16 @@ export component SettingsPanel inherits VerticalLayout {
     property <bool> narrow-col: self.width - 380px - Theme.gap-col < 792px;
     // the curated accent hues live ONCE in `Palette.accent` (controls.slint), shared with the LIGHTING
     // colour picker so the two never drift. The ColorPickers below pull straight from it.
-    // animate the material gallery swatches only while SYSTEM is open, and only at ~10fps — the
+    // animate the material gallery swatches only while SYSTEM is visible, and only at ~10fps — the
     // shaders render Rust-side on a worker, and the tiles GPU-crossfade between consecutive frames
     // (see the material-grid Images), so the motion reads display-rate smooth at a tenth of the
     // render cost. The tick period MUST equal the tiles' crossfade duration (100ms): the fade is
     // what fills the gap between frames. The cast itself runs at its own 60fps on the overlay.
     Timer {
         interval: 100ms;
-        running: State.page == 3;
+        running: State.window-shown && State.page == 3
+            && material-grid.absolute-position.y < root.viewport-bottom
+            && material-grid.absolute-position.y + material-grid.height > root.viewport-top;
         triggered => { State.material-preview-tick(); }
     }
     PanelHead {
@@ -714,7 +718,7 @@ export component SettingsPanel inherits VerticalLayout {
                             toggled(v) => { State.toggle-writes-paused(); }
                         }
                         Toggle {
-                            caption: "input & macros";
+                            caption: State.input-arm-pending ? "confirm input & macros" : "input & macros";
                             checked: State.input-armed;
                             toggled(v) => { State.toggle-input-armed(); }
                         }

@@ -128,13 +128,11 @@ export component AppWindow inherits Window {
     // make it look right / make input do things / set it up + prove it works. PROFILES is a
     // global affordance (the header sheet), not a seat. Index == State.page.
     property <[string]> sections: ["DEVICE", "LIGHTING", "INPUT", "SYSTEM"];
-    // ARMING REAL INPUT deserves friction: first click on the SAFE pill arms the question,
-    // a second click within 2.5s commits. Disarming (ARMED -> SAFE) is always one click.
-    property <bool> arm-confirm: false;
+    // The Rust gate owns confirmation for every arming surface; the UI clears its prompt on timeout.
     Timer {
         interval: Theme.confirm-window;
-        running: root.arm-confirm;
-        triggered => { root.arm-confirm = false; }
+        running: State.input-arm-pending;
+        triggered => { State.input-arm-pending = false; }
     }
 
     keys := FocusScope {
@@ -145,7 +143,7 @@ export component AppWindow inherits Window {
                 if (State.import-open) { State.import-open = false; return accept; }
                 if (State.profile-sheet-open) { State.profile-sheet-open = false; return accept; }
                 if (State.guide-open) { State.guide-close(); return accept; }
-                if (root.arm-confirm) { root.arm-confirm = false; return accept; }
+                if (State.input-arm-pending) { State.input-arm-pending = false; return accept; }
                 if (State.editing-sector >= 0) { State.editing-sector = -1; return accept; }
                 if (State.gesture-bind-target != "") { State.gesture-bind-target = ""; return accept; }
                 // …nothing matched: pull focus back to nav (so ESC backs OUT of a focused text field
@@ -239,7 +237,9 @@ export component AppWindow inherits Window {
                             }
                             // PROFILE — opens the profiles sheet (save/apply/rules from anywhere).
                             Pill {
-                                text: State.active-profile == "—" ? "NO PROFILE" : State.active-profile;
+                                text: State.active-profile == "—" ? "NO PROFILE"
+                                    : State.profile-degraded-count > 0 ? State.active-profile + " · DEGRADED " + State.profile-degraded-count
+                                    : State.active-profile;
                                 live: State.active-profile != "—";
                                 clickable: true;
                                 clicked => { State.refresh-profile-suggestion(); State.profile-sheet-open = true; }
@@ -282,7 +282,12 @@ export component AppWindow inherits Window {
                         // held-stroke engine). Same spine, same action palette, one home.
                         PanelSlot { active: State.page == 2 && State.input-view == 0; bp_page := PanelPage { bp := BindingsPanel {} } }
                         PanelSlot { active: State.page == 2 && State.input-view == 1; PanelPage { SpellweavingPanel {} } }
-                        PanelSlot { active: State.page == 3; PanelPage { SettingsPanel {} } }
+                        PanelSlot { active: State.page == 3; system_page := PanelPage {
+                            SettingsPanel {
+                                viewport-top: system_page.absolute-position.y;
+                                viewport-bottom: system_page.absolute-position.y + system_page.height;
+                            }
+                        } }
                         // "author a macro" (SYSTEM→BEACONS) lands here: once INPUT→DIRECT is active,
                         // defer one frame (so the panel has laid out + macro-y is valid), then scroll
                         // the page to the MACRO editor and clear the request. One-shot — clearing the
@@ -387,18 +392,11 @@ export component AppWindow inherits Window {
                             // lit in either loud state — accent when ARMED, warn when ARM?; SAFE is the
                             // unlit gutter (StatusLamp draws lamp-off + the text-dim ink, hover→text-mid).
                             StatusLamp {
-                                text: State.input-armed ? "armed" : root.arm-confirm ? "arm?" : "safe";
-                                lit: State.input-armed || root.arm-confirm;
+                                text: State.input-armed ? "armed" : State.input-arm-pending ? "arm?" : "safe";
+                                lit: State.input-armed || State.input-arm-pending;
                                 tint: State.input-armed ? Theme.accent : Theme.warn;
                                 clickable: true;
-                                clicked => {
-                                    if (State.input-armed || root.arm-confirm) {
-                                        State.toggle-input-armed();
-                                        root.arm-confirm = false;
-                                    } else {
-                                        root.arm-confirm = true;
-                                    }
-                                }
+                                clicked => { State.toggle-input-armed(); }
                             }
                         }
 

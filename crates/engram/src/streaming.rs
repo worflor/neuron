@@ -32,8 +32,8 @@ pub struct StreamEncoder {
     err_sq_sum: f64,
     err_count: usize,
 
-    /// Block counter for start offsets.
-    block_idx: usize,
+    /// Number of emitted data samples, excluding the overlapping seed rows.
+    emitted_samples: usize,
 
     /// Whether block sizes have been calibrated.
     calibrated: bool,
@@ -52,7 +52,7 @@ impl StreamEncoder {
             err_sum: 0.0,
             err_sq_sum: 0.0,
             err_count: 0,
-            block_idx: 0,
+            emitted_samples: 0,
             calibrated: false,
         }
     }
@@ -152,7 +152,7 @@ impl StreamEncoder {
         let data = &self.buf[SEED_COUNT * dim..];
 
         let mut blk = encode_block(data, seed1, seed2, length, dim, self.micro_size);
-        blk.start = self.block_idx * self.max_block + SEED_COUNT;
+        blk.start = self.emitted_samples + SEED_COUNT;
 
         // Keep last two samples as seeds for next block
         let keep_start = (t - 2) * dim;
@@ -160,7 +160,7 @@ impl StreamEncoder {
         self.buf.clear();
         self.buf.extend_from_slice(&kept);
 
-        self.block_idx += 1;
+        self.emitted_samples += length;
         blk
     }
 }
@@ -257,5 +257,28 @@ mod tests {
             "should emit at least one block, got {}",
             blocks.len()
         );
+    }
+
+    #[test]
+    fn phase_short_block_keeps_following_start_contiguous() {
+        let dim = 4;
+        let mut enc = StreamEncoder::new(dim);
+        enc.calibrated = true;
+        enc.max_block = MIN_BLOCK + 10;
+        enc.threshold = 0.0;
+        enc.err_count = 1;
+
+        let mut blocks = Vec::new();
+        for i in 0..(SEED_COUNT + MIN_BLOCK + enc.max_block) {
+            let value = if i == SEED_COUNT + MIN_BLOCK - 1 { 10.0 } else { 0.0 };
+            let sample = vec![value; dim];
+            if let Some(block) = enc.push(&sample) {
+                blocks.push(block);
+            }
+        }
+
+        assert!(blocks.len() >= 2, "expected a short block and its successor");
+        assert_eq!(blocks[0].length, MIN_BLOCK);
+        assert_eq!(blocks[1].start, blocks[0].start + blocks[0].length);
     }
 }

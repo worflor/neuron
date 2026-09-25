@@ -77,6 +77,12 @@ pub const MIC_TAP: (u16, u16) = (0xF000, 0x01);
 /// what the hardware reports. Decoded by the keyboard macro reader, labelled by [`control_label`].
 pub const RAZER_MACRO_PAGE: u16 = 0xFF1A;
 
+/// Reserved Keyboard/Keypad identities for legacy generic modifier keys. They are not HID usages;
+/// held-state lookup treats each as a query matching the corresponding left or right usage.
+pub const CONTROL_ANY_SHIFT: u16 = 0xE8;
+pub const CONTROL_ANY_CTRL: u16 = 0xE9;
+pub const CONTROL_ANY_ALT: u16 = 0xEA;
+
 // ── injected HID input sources (broadcast) ──────────────────────────────────────────────────────
 // Raw Input only delivers the OS-cooked collections (keyboard/mouse/consumer). Vendor input that
 // rides a SEPARATE readable collection — Razer macro keys via the `0x04` report, and any future
@@ -620,8 +626,10 @@ fn normalize_hits(hits: &mut Vec<(u16, u16)>) {
 // device-scoped remap shim, and un-nameable in device terms. `ControlRef` closes the split: it IS
 // the `Trigger::Input` identity, made storable by feature configs (cast.toml today).
 
-/// A persisted reference to one physical control, in the SAME namespace as
+/// A persisted reference to one physical control, in the SAME field namespace as
 /// [`Trigger::Input`]: HID usage `page` + `usage`, optionally scoped to a source device `pid`.
+/// The three reserved generic modifier identities represent an either-side query, not a raw HID
+/// event usage.
 /// Deserializes from either the modern table form (`{ page = 9, usage = 5, pid = 0xa8 }`) or a
 /// LEGACY bare virtual-key integer (`trigger = 6`) — old configs keep working unchanged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
@@ -669,8 +677,9 @@ impl ControlRef {
         }
     }
 
-    /// The equivalent [`Trigger::Input`] — a `ControlRef` bind and a spine rule are the SAME
-    /// identity, so features holding one can talk to the engine without translation.
+    /// The equivalent [`Trigger::Input`] identity. Generic modifier usages are reserved query
+    /// identities; callers matching live keyboard events must use [`control_held`] so either side
+    /// is recognized.
     #[must_use]
     pub fn to_trigger(self) -> Trigger {
         Trigger::Input {
@@ -707,6 +716,9 @@ impl ControlRef {
             (0x09, 3) => "Middle Mouse".to_string(),
             (0x09, 4) => "Mouse 4 (thumb 1)".to_string(),
             (0x09, 5) => "Mouse 5 (thumb 2)".to_string(),
+            (0x07, CONTROL_ANY_SHIFT) => "Shift (either side)".to_string(),
+            (0x07, CONTROL_ANY_CTRL) => "Ctrl (either side)".to_string(),
+            (0x07, CONTROL_ANY_ALT) => "Alt (either side)".to_string(),
             (p, u) => control_label(p, u),
         };
         match self.pid {
@@ -746,9 +758,12 @@ pub fn vk_to_control(vk: i32) -> Option<(u16, u16)> {
         0x28 => (0x07, 0x51),                                // Down
         0x2D => (0x07, 0x49),                                // Insert
         0x2E => (0x07, 0x4C),                                // Delete
-        0x10 | 0xA0 => (0x07, 0xE1),                         // (Left) Shift
-        0x11 | 0xA2 => (0x07, 0xE0),                         // (Left) Ctrl
-        0x12 | 0xA4 => (0x07, 0xE2),                         // (Left) Alt
+        0x10 => (0x07, CONTROL_ANY_SHIFT),                   // Generic Shift (either side)
+        0x11 => (0x07, CONTROL_ANY_CTRL),                    // Generic Ctrl (either side)
+        0x12 => (0x07, CONTROL_ANY_ALT),                     // Generic Alt (either side)
+        0xA0 => (0x07, 0xE1),                                // Left Shift
+        0xA2 => (0x07, 0xE0),                                // Left Ctrl
+        0xA4 => (0x07, 0xE2),                                // Left Alt
         0xA1 => (0x07, 0xE5),                                // Right Shift
         0xA3 => (0x07, 0xE4),                                // Right Ctrl
         0xA5 => (0x07, 0xE6),                                // Right Alt
@@ -800,12 +815,15 @@ pub fn control_to_vk(page: u16, usage: u16) -> Option<i32> {
             0x51 => 0x28,
             0x49 => 0x2D,
             0x4C => 0x2E,
-            0xE1 => 0x10,
-            0xE0 => 0x11,
-            0xE2 => 0x12,
+            0xE1 => 0xA0,
+            0xE0 => 0xA2,
+            0xE2 => 0xA4,
             0xE5 => 0xA1,
             0xE4 => 0xA3,
             0xE6 => 0xA5,
+            CONTROL_ANY_SHIFT => 0x10,
+            CONTROL_ANY_CTRL => 0x11,
+            CONTROL_ANY_ALT => 0x12,
             0x33 => 0xBA,
             0x2E => 0xBB,
             0x36 => 0xBC,
@@ -956,9 +974,10 @@ pub fn held_registry_live() -> bool {
     !INJECT.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty()
 }
 
-/// Whether `(page, usage)` is currently held — device-aware. `pid = Some(p)` counts only presses
-/// from device `p`; `None` counts any source (the device-any semantics `Trigger::Input` rules
-/// already have). Returns `None` when no pump is alive to feed the registry (caller falls back).
+/// Whether `(page, usage)` is currently held — device-aware. The reserved generic modifier
+/// identities match either left or right; other usages match exactly. `pid = Some(p)` counts only
+/// presses from device `p`; `None` counts any source. Returns `None` when no pump is alive to feed
+/// the registry (caller falls back).
 pub fn control_held(
     page: u16,
     usage: u16,
@@ -970,8 +989,23 @@ pub fn control_held(
     // Both sides are already canonical by construction — no normalize-the-query step to forget.
     let g = HELD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     Some(g.iter().any(|(_, src_pid, set)| {
-        (pid.is_none() || pid == *src_pid) && set.binary_search(&(page, usage)).is_ok()
+        (pid.is_none() || pid == *src_pid)
+            && set
+                .iter()
+                .any(|&(held_page, held)| usage_matches(page, usage, held_page, held))
     }))
+}
+
+fn usage_matches(page: u16, query: u16, held_page: u16, held: u16) -> bool {
+    if page != held_page {
+        return false;
+    }
+    match (page, query) {
+        (0x07, CONTROL_ANY_SHIFT) => matches!(held, 0xE1 | 0xE5),
+        (0x07, CONTROL_ANY_CTRL) => matches!(held, 0xE0 | 0xE4),
+        (0x07, CONTROL_ANY_ALT) => matches!(held, 0xE2 | 0xE6),
+        _ => query == held,
+    }
 }
 
 #[cfg(test)]
@@ -1012,15 +1046,39 @@ mod control_ref_tests {
         for vk in 1..256 {
             if let Some((page, usage)) = vk_to_control(vk) {
                 let back = control_to_vk(page, usage).expect("mapped VK must map back");
-                // sided modifiers collapse onto the generic VK — everything else is exact.
-                let generic = match vk {
-                    0xA0 => 0x10,
-                    0xA2 => 0x11,
-                    0xA4 => 0x12,
-                    v => v,
-                };
-                assert_eq!(back, generic, "vk 0x{vk:02X} roundtrip");
+                assert_eq!(back, vk, "vk 0x{vk:02X} roundtrip");
             }
+        }
+    }
+
+    #[test]
+    fn generic_modifier_controls_match_either_side_and_keep_stable_identity() {
+        for (vk, usage, left, right, name) in [
+            (0x10, CONTROL_ANY_SHIFT, 0xE1, 0xE5, "Shift (either side)"),
+            (0x11, CONTROL_ANY_CTRL, 0xE0, 0xE4, "Ctrl (either side)"),
+            (0x12, CONTROL_ANY_ALT, 0xE2, 0xE6, "Alt (either side)"),
+        ] {
+            let control = ControlRef::from_vk(vk);
+            assert_eq!((control.page, control.usage), (0x07, usage));
+            assert_eq!(control_to_vk(control.page, control.usage), Some(vk));
+            assert_eq!(control.label(), name);
+            assert!(usage_matches(0x07, usage, 0x07, left));
+            assert!(usage_matches(0x07, usage, 0x07, right));
+            assert!(!usage_matches(0x07, usage, 0x07, 0x04));
+            assert!(!usage_matches(0x07, usage, 0x09, left));
+
+            let serialized = toml::to_string(&control).unwrap();
+            let restored: ControlRef = toml::from_str(&serialized).unwrap();
+            assert_eq!(restored, control, "identity survives config round-trip");
+        }
+    }
+
+    #[test]
+    fn sided_modifier_controls_keep_sided_fallbacks() {
+        for (vk, usage) in [(0xA0, 0xE1), (0xA1, 0xE5), (0xA2, 0xE0), (0xA3, 0xE4), (0xA4, 0xE2), (0xA5, 0xE6)] {
+            let control = ControlRef::from_vk(vk);
+            assert_eq!((control.page, control.usage), (0x07, usage));
+            assert_eq!(control.vk_hint(), Some(vk));
         }
     }
 
@@ -1657,6 +1715,16 @@ fn load_rule_sidecars_with(include: impl Fn(&str) -> bool) -> Vec<Rule> {
     use crate::engine::RuleDoc;
     let mut out = Vec::new();
     let mut faults = Vec::new();
+    let _lifecycle = match crate::profile::lock_and_recover() {
+        Ok(lock) => lock,
+        Err(e) => {
+            faults.push(("profiles/".to_string(), format!("profile recovery: {e}")));
+            *SIDECAR_FAULTS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = faults;
+            return Vec::new();
+        }
+    };
     // The fault list is published on EVERY path, including the early return below. Returning before
     // the store left the previous load's faults standing, so a fixed sidecar would keep reporting
     // its old error (and a directory that vanished would keep reporting a file that no longer
@@ -2538,6 +2606,34 @@ mod plan_wait_tests {
         let plan = plan_wait(Duration::from_micros(100));
         assert!(plan.timeout_ms >= 1);
     }
+
+    #[test]
+    fn wait_queue_must_be_drained_without_a_window_filter() {
+        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+        use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, MsgWaitForMultipleObjectsEx, PeekMessageW,
+            PostThreadMessageW, MSG, MWMO_INPUTAVAILABLE, PM_REMOVE, QS_ALLINPUT, WM_APP,
+        };
+
+        // SAFETY: the hidden window and the posted message belong to this test thread.
+        unsafe {
+            let cls: Vec<u16> = "Static\0".encode_utf16().collect();
+            let hwnd = CreateWindowExW(0, cls.as_ptr(), std::ptr::null(), 0, 0, 0, 0, 0,
+                std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null());
+            assert!(!hwnd.is_null());
+            let mut msg: MSG = std::mem::zeroed();
+            while PeekMessageW(&raw mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {}
+            assert_ne!(PostThreadMessageW(GetCurrentThreadId(), WM_APP + 17, 0, 0), 0);
+            assert_eq!(PeekMessageW(&raw mut msg, hwnd, 0, 0, PM_REMOVE), 0);
+            assert_eq!(MsgWaitForMultipleObjectsEx(0, std::ptr::null(), 0, QS_ALLINPUT,
+                MWMO_INPUTAVAILABLE), WAIT_OBJECT_0);
+            assert!(win::peek_thread_message(&mut msg));
+            assert!(msg.hwnd.is_null());
+            assert_eq!(msg.message, WM_APP + 17);
+            DestroyWindow(hwnd);
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -2562,7 +2658,7 @@ pub(crate) mod win {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DestroyWindow, DispatchMessageW, GetForegroundWindow,
         MsgWaitForMultipleObjectsEx, PeekMessageW, TranslateMessage, MSG, MWMO_INPUTAVAILABLE,
-        PM_REMOVE, QS_ALLINPUT, WM_INPUT,
+        PM_REMOVE, QS_ALLINPUT, WM_INPUT, WM_QUIT,
     };
 
     // RAWKEYBOARD.Flags bits (windows-sys doesn't name them).
@@ -2740,6 +2836,12 @@ pub(crate) mod win {
         }
     }
 
+    #[inline]
+    pub(super) fn peek_thread_message(msg: &mut MSG) -> bool {
+        // SAFETY: `msg` is a valid output buffer and the caller owns this thread's queue.
+        unsafe { PeekMessageW(msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 }
+    }
+
     pub fn listen(
         seconds: Option<u64>,
         stop: &std::sync::atomic::AtomicBool,
@@ -2865,7 +2967,7 @@ pub(crate) mod win {
             } else {
                 std::ptr::null_mut()
             };
-            while seconds.is_none_or(|s| start.elapsed().as_secs() < s) {
+            'listen: while seconds.is_none_or(|s| start.elapsed().as_secs() < s) {
                 iter_start.set(Instant::now());
                 first_edge_pending.set(true);
                 // A GUI worker thread (or any caller of `listen_until`) flips this to tear the
@@ -2887,12 +2989,24 @@ pub(crate) mod win {
                         rids.len() as u32,
                         std::mem::size_of::<RAWINPUTDEVICE>() as u32,
                     );
+                    crate::capture::note_key_transition();
                 }
                 let mut msg: MSG = std::mem::zeroed();
                 let mut got_msg = false; // prof: this iteration's wake-reason (see record_wake below)
-                while PeekMessageW(&raw mut msg, hwnd, 0, 0, PM_REMOVE) != 0 {
-                    got_msg = true;
-                    if msg.message == WM_INPUT {
+                // MsgWaitForMultipleObjectsEx watches this THREAD's whole queue. Drain the
+                // same queue: filtering PeekMessage to `hwnd` leaves a thread message or a
+                // second window's message pending, so MWMO_INPUTAVAILABLE returns at once
+                // forever and the resident dispatch worker burns a core while idle.
+                // A finite batch lets stop, command delivery and periodic safety work run
+                // even if a high-report-rate device keeps the message queue nonempty.
+                let mut message_budget = 256;
+                while message_budget > 0 && peek_thread_message(&mut msg) {
+                    message_budget -= 1;
+                    if msg.message == WM_QUIT {
+                        break 'listen;
+                    }
+                    if msg.hwnd == hwnd && msg.message == WM_INPUT {
+                        got_msg = true;
                         n_input += 1;
                         let mut size: u32 = 0;
                         GetRawInputData(
@@ -3005,6 +3119,7 @@ pub(crate) mod win {
                                                 false // auto-repeat: already down, no new edge
                                             };
                                             if changed {
+                                                crate::capture::note_key_transition();
                                                 let pid = super::source_pid(&pid_from_path(&path));
                                                 super::note_held(
                                                     &path,
@@ -3119,6 +3234,9 @@ pub(crate) mod win {
                         .map(|(path, _)| path.clone())
                         .collect();
                     down_sets.clear();
+                    if !stale.is_empty() {
+                        crate::capture::note_key_transition();
+                    }
                     for path in stale {
                         on_event(&ControlEvent {
                             pid: super::source_pid(&pid_from_path(&path)),

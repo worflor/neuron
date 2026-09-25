@@ -111,7 +111,7 @@ pub struct Confirmation {
 static SINK: OnceLock<Mutex<Option<Sender<Confirmation>>>> = OnceLock::new();
 
 // De-dup baselines for OBSERVED changes (the events a device PUSHES — e.g. an onboard DPI button),
-// kept PER PHYSICAL DEVICE (keyed by USB product id). A device double-sends each event AND may echo a
+// kept PER PHYSICAL DEVICE (keyed by USB pid plus stable HID path identity when available). A device double-sends each event AND may echo a
 // host-initiated write, so naive emission would double-card. Every confirmation records the value it
 // carried against ITS OWN device's baseline; an OBSERVED event only fires if it differs from that
 // device's last value. This unifies the two sources for one device — a host write (`dpi`/`scroll`)
@@ -132,7 +132,7 @@ static SINK: OnceLock<Mutex<Option<Sender<Confirmation>>>> = OnceLock::new();
 const PLATE_UNKNOWN: u32 = u32::MAX;
 
 /// One physical device's de-dup baselines. `dpi`/`scroll` of `0` = "unknown yet" (no confirmation seen
-/// for this pid since launch); `plate` of [`PLATE_UNKNOWN`] is the equivalent for the side plate.
+/// for this baseline key since launch); `plate` of [`PLATE_UNKNOWN`] is the equivalent for the side plate.
 struct Baselines {
     dpi: u32,
     scroll: u32,
@@ -153,25 +153,42 @@ impl Default for Baselines {
     }
 }
 
-/// The per-pid de-dup baselines, lazily created. `confirm` stays PURE — a std `HashMap` behind a
+/// The per-device de-dup baselines, lazily created. `confirm` stays PURE — a std `HashMap` behind a
 /// `Mutex`, no platform deps. The lock is taken poison-tolerantly at every site so a transient panic in
 /// one consumer can't cascade-fail the de-dup for every device.
-fn baselines() -> &'static Mutex<HashMap<u16, Baselines>> {
-    static B: OnceLock<Mutex<HashMap<u16, Baselines>>> = OnceLock::new();
+type BaselineKey = (u16, Option<String>);
+
+fn baselines() -> &'static Mutex<HashMap<BaselineKey, Baselines>> {
+    static B: OnceLock<Mutex<HashMap<BaselineKey, Baselines>>> = OnceLock::new();
     B.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Run `f` against `pid`'s baselines, creating a default entry on first touch. The lock is released
 /// when this returns — callers that also [`emit`] do so OUTSIDE it, so no consumer runs under the lock.
 fn with_baseline<R>(pid: u16, f: impl FnOnce(&mut Baselines) -> R) -> R {
+    with_baseline_unit(pid, None, f)
+}
+
+fn with_baseline_unit<R>(pid: u16, unit: Option<&str>, f: impl FnOnce(&mut Baselines) -> R) -> R {
     let mut g = baselines().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    f(g.entry(pid).or_default())
+    f(g.entry((pid, unit.map(str::to_owned))).or_default())
 }
 
 /// Like [`with_baseline`], but also stamps the device as having just spoken. Every site that WRITES
 /// a baseline goes through this; a site that only reads must not, or a read would forge freshness.
 fn with_baseline_observed<R>(pid: u16, f: impl FnOnce(&mut Baselines) -> R) -> R {
     with_baseline(pid, |b| {
+        b.at = Some(Instant::now());
+        f(b)
+    })
+}
+
+fn with_baseline_observed_unit<R>(
+    pid: u16,
+    unit: &str,
+    f: impl FnOnce(&mut Baselines) -> R,
+) -> R {
+    with_baseline_unit(pid, Some(unit), |b| {
         b.at = Some(Instant::now());
         f(b)
     })
@@ -185,8 +202,18 @@ fn with_baseline_observed<R>(pid: u16, f: impl FnOnce(&mut Baselines) -> R) -> R
 /// observation is by construction fresher than the scan's value.
 #[must_use]
 pub fn dpi_since(pid: u16, since: Instant) -> Option<u32> {
+    dpi_since_key(pid, None, since)
+}
+
+/// The last pushed DPI for one known physical unit, if it arrived after `since`.
+#[must_use]
+pub fn dpi_since_unit(pid: u16, unit: &str, since: Instant) -> Option<u32> {
+    dpi_since_key(pid, Some(unit), since)
+}
+
+fn dpi_since_key(pid: u16, unit: Option<&str>, since: Instant) -> Option<u32> {
     let g = baselines().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let b = g.get(&pid)?;
+    let b = g.get(&(pid, unit.map(str::to_owned)))?;
     (b.dpi > 0 && b.at.is_some_and(|t| t > since)).then_some(b.dpi)
 }
 
@@ -226,6 +253,19 @@ pub fn dpi(pid: u16, value: u32, prev: Option<u32>) {
             max: 30_000.0,
             unit: "DPI",
         },
+        title: "DPI".into(),
+        ident: "dpi".into(),
+        prev: prev.map(|p| p.to_string()),
+    });
+}
+
+/// DPI committed to `value` on the identified physical unit. Use `dpi` when no unit identity is
+/// available; that legacy path remains isolated from unit-scoped baselines.
+pub fn dpi_unit(pid: u16, unit: &str, value: u32, prev: Option<u32>) {
+    with_baseline_observed_unit(pid, unit, |b| b.dpi = value);
+    emit(Confirmation {
+        kind: Kind::Dpi,
+        shape: Shape::Ranged { value: f64::from(value), min: 100.0, max: 30_000.0, unit: "DPI" },
         title: "DPI".into(),
         ident: "dpi".into(),
         prev: prev.map(|p| p.to_string()),
@@ -395,6 +435,27 @@ pub fn observe_dpi(pid: u16, value: u32) {
     dpi(pid, value, if prev == 0 { None } else { Some(prev) });
 }
 
+/// Unit-scoped counterpart to [`sniper`], keeping a held-DPI baseline isolated from same-PID twins.
+pub fn sniper_unit(pid: u16, unit: &str, value: u32, prev: Option<u32>, engaged: bool) {
+    with_baseline_unit(pid, Some(unit), |b| b.dpi = value);
+    emit(Confirmation {
+        kind: Kind::Sniper,
+        shape: Shape::Ranged { value: f64::from(value), min: 100.0, max: 30_000.0, unit: "DPI" },
+        title: if engaged { "Sniper on" } else { "Sniper off" }.into(),
+        ident: "sniper".into(),
+        prev: prev.map(|p| p.to_string()),
+    });
+}
+
+/// Observe a pushed DPI report for one physical unit, suppressing repeats against that unit only.
+pub fn observe_dpi_unit(pid: u16, unit: &str, value: u32) {
+    let prev = with_baseline_unit(pid, Some(unit), |b| b.dpi);
+    if value == prev {
+        return;
+    }
+    dpi_unit(pid, unit, value, if prev == 0 { None } else { Some(prev) });
+}
+
 /// Device `pid` reported its scroll/sensitivity stage is now `stage` (its onboard stage button), on a
 /// 1..`max` track. Same per-device de-dup contract as [`observe_dpi`].
 pub fn observe_scroll(pid: u16, stage: u32, max: u32) {
@@ -444,6 +505,11 @@ pub fn prime_dpi(pid: u16, value: u32) {
     with_baseline_observed(pid, |b| b.dpi = value);
 }
 
+/// Learn one physical unit's current DPI without carding.
+pub fn prime_dpi_unit(pid: u16, unit: &str, value: u32) {
+    with_baseline_observed_unit(pid, unit, |b| b.dpi = value);
+}
+
 /// Learn device `pid`'s current scroll/sensitivity stage without carding (state sync). See [`prime_dpi`].
 pub fn prime_scroll(pid: u16, stage: u32) {
     with_baseline_observed(pid, |b| b.scroll = stage);
@@ -465,7 +531,7 @@ pub fn prime_side_plate(pid: u16, id: u32, label: &str) {
 #[must_use]
 pub fn last_plate(pid: u16) -> Option<String> {
     let g = baselines().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    g.get(&pid).and_then(|b| b.plate_label.clone())
+    g.get(&(pid, None)).and_then(|b| b.plate_label.clone())
 }
 
 #[cfg(test)]
@@ -489,7 +555,12 @@ mod tests {
     /// device. Removing the entry hands back a `Default` on next touch.
     fn reset_baseline(pid: u16) {
         let mut g = baselines().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        g.remove(&pid);
+        g.remove(&(pid, None));
+    }
+
+    fn reset_unit_baseline(pid: u16, unit: &str) {
+        let mut g = baselines().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        g.remove(&(pid, Some(unit.to_owned())));
     }
 
     /// Drive `f` with a fresh plate baseline FOR `pid` + a private sink, and return the SIDE-PLATE
@@ -603,6 +674,33 @@ mod tests {
         // exactly three cards: B@400, A@800, B@800 — proving B's 800 was NOT suppressed by A's baseline,
         // and the trailing repeat added nothing (per-pid same-value de-dup still holds).
         assert_eq!(vals, vec![400.0, 800.0, 800.0], "per-pid baselines must not conflate across mice");
+    }
+
+    #[test]
+    fn dpi_dedup_is_per_physical_unit_for_same_pid() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        const PID: u16 = 0x00A8;
+        let unit_a = "hid-unit-a";
+        let unit_b = "hid-unit-b";
+        reset_unit_baseline(PID, unit_a);
+        reset_unit_baseline(PID, unit_b);
+        let (tx, rx) = mpsc::channel();
+        set_sink(Some(tx));
+        observe_dpi_unit(PID, unit_a, 400);
+        observe_dpi_unit(PID, unit_b, 800);
+        observe_dpi_unit(PID, unit_a, 800); // genuine A change, despite B already being at 800
+        observe_dpi_unit(PID, unit_a, 800); // A's duplicate is absorbed
+        set_sink(None);
+
+        let vals: Vec<f64> = rx
+            .try_iter()
+            .filter(|c| c.kind == Kind::Dpi)
+            .filter_map(|c| match c.shape {
+                Shape::Ranged { value, .. } => Some(value),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(vals, vec![400.0, 800.0, 800.0]);
     }
 
     #[test]

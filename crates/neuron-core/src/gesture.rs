@@ -8,7 +8,7 @@
 //! attunable DTW distance; matches above `config.threshold` are rejected as "unknown",
 //! so an unrecognized scribble doesn't fire a random action.
 
-use crate::glyph::{word_distance, GestureWord, GlyphConfig};
+use crate::glyph::{word_distance_with_scratch, GestureWord, GlyphConfig};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -94,36 +94,20 @@ impl Vault {
     /// near-miss (see `CastConfig::assist`).
     #[must_use]
     pub fn predict(&self, query: &GestureWord) -> Option<(String, f64, Option<f64>)> {
-        let mut ranked: Vec<(&str, f64)> = self
-            .templates
-            .iter()
-            .map(|t| (t.name.as_str(), word_distance(query, &t.word, &self.config)))
-            .collect();
-        ranked.sort_by(|a, b| a.1.total_cmp(&b.1));
-        let (name, score) = ranked.first().map(|(n, s)| (n.to_string(), *s))?;
-        Some((name, score, ranked.get(1).map(|(_, s)| *s)))
+        self.best_two(query).map(|(name, score, runner_up)| (name.to_string(), score, runner_up))
     }
 
     /// 1-NN recognition. Returns (name, score) for the best match within threshold,
     /// plus the runner-up score for confidence reporting.
     #[must_use]
     pub fn recognize(&self, query: &GestureWord) -> Recognition {
-        let mut ranked: Vec<(&str, f64)> = self
-            .templates
-            .iter()
-            .map(|t| (t.name.as_str(), word_distance(query, &t.word, &self.config)))
-            .collect();
-        ranked.sort_by(|a, b| a.1.total_cmp(&b.1));
-
-        let best = ranked.first().map(|(n, s)| (n.to_string(), *s));
-        let runner_up = ranked.get(1).map(|(_, s)| *s);
-        match best {
-            Some((name, score)) if score <= self.config.threshold => Recognition {
-                name: Some(name),
+        match self.best_two(query) {
+            Some((name, score, runner_up)) if score <= self.config.threshold => Recognition {
+                name: Some(name.to_string()),
                 score,
                 runner_up,
             },
-            Some((_, score)) => Recognition {
+            Some((_, score, runner_up)) => Recognition {
                 name: None,
                 score,
                 runner_up,
@@ -134,6 +118,22 @@ impl Vault {
                 runner_up: None,
             },
         }
+    }
+
+    fn best_two(&self, query: &GestureWord) -> Option<(&str, f64, Option<f64>)> {
+        let mut dp = Vec::new();
+        let mut best: Option<(&str, f64)> = None;
+        let mut second: Option<f64> = None;
+        for t in &self.templates {
+            let score = word_distance_with_scratch(query, &t.word, &self.config, &mut dp);
+            if best.is_none_or(|(_, s)| score.total_cmp(&s).is_lt()) {
+                second = best.map(|(_, s)| s);
+                best = Some((t.name.as_str(), score));
+            } else if second.is_none_or(|s| score.total_cmp(&s).is_lt()) {
+                second = Some(score);
+            }
+        }
+        best.map(|(name, score)| (name, score, second))
     }
 }
 
@@ -147,7 +147,31 @@ pub struct Recognition {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::glyph::{analyze, synth_circle, synth_line};
+    use crate::glyph::{analyze, synth_circle, synth_line, word_distance};
+
+    #[test]
+    fn streaming_rank_matches_stable_full_rank_with_ties() {
+        let cfg = GlyphConfig::default();
+        let line = analyze(&synth_line(80), &cfg);
+        let circle = analyze(&synth_circle(80, 300.0, 0.08), &cfg);
+        let mut vault = Vault::default();
+        vault.upsert("line-first", line.clone());
+        vault.upsert("circle", circle.clone());
+        vault.upsert("line-second", line.clone());
+        vault.upsert("line-third", line.clone());
+
+        for query in [&line, &circle] {
+            let mut ranked: Vec<_> = vault.templates.iter().map(|t| {
+                (t.name.as_str(), word_distance(query, &t.word, &vault.config))
+            }).collect();
+            ranked.sort_by(|a, b| a.1.total_cmp(&b.1));
+            let expected = (ranked[0].0, ranked[0].1, Some(ranked[1].1));
+            let actual = vault.best_two(query).unwrap();
+            assert_eq!(actual.0, expected.0);
+            assert_eq!(actual.1.to_bits(), expected.1.to_bits());
+            assert_eq!(actual.2.map(f64::to_bits), expected.2.map(f64::to_bits));
+        }
+    }
 
     #[test]
     fn vault_roundtrips_through_json() {

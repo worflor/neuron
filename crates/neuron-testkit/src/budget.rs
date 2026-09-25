@@ -6,7 +6,7 @@
 //! sample its resource footprint through scripted phases, and hold it to explicit budgets.
 //!
 //! A Job Object makes the child-process census exact (everything the app spawns lands in
-//! the job too; warm python macro-host sidecars are expected, anything else is a finding),
+//! the job too; a disarmed tray launch should have no sidecar),
 //! and teardown is `TerminateJobObject` - one call, no orphans, even if the app wedges. The
 //! real binary is used because allocator behavior, Slint/GPU surfaces, timers, and thread
 //! spawns only exist in the shipped artifact.
@@ -38,8 +38,9 @@ use windows_sys::Win32::System::ProcessStatus::{
     K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
 };
 use windows_sys::Win32::System::Threading::{
-    GetProcessHandleCount, GetProcessTimes, OpenProcess, OpenThread, ResumeThread,
-    CREATE_SUSPENDED, PROCESS_QUERY_LIMITED_INFORMATION, THREAD_SUSPEND_RESUME,
+    GetProcessHandleCount, GetProcessIoCounters, GetProcessTimes, OpenProcess, OpenThread,
+    ResumeThread, IO_COUNTERS, CREATE_SUSPENDED, PROCESS_QUERY_LIMITED_INFORMATION,
+    THREAD_SUSPEND_RESUME,
 };
 
 /// Ceilings the resident app must stay under. Fields are generous over the recorded
@@ -65,7 +66,7 @@ impl Default for Budgets {
             private_bytes: 400 * 1024 * 1024,
             handles: 900,
             threads: 48,
-            allowed_children: &["python.exe"],
+            allowed_children: &[],
         }
     }
 }
@@ -82,6 +83,11 @@ pub struct Sample {
     pub private_bytes: u64,
     /// Working set summed over the app + descendants.
     pub working_set_bytes: u64,
+    /// Process I/O includes filesystem, devices, and sockets; these are window deltas.
+    pub io_read_bytes: u64,
+    pub io_write_bytes: u64,
+    pub io_read_ops: u64,
+    pub io_write_ops: u64,
     /// Open handles summed over the app + descendants.
     pub handles: u32,
     /// Threads summed over the app + descendants.
@@ -146,9 +152,14 @@ impl Resident {
     pub fn sample(&mut self, phase: &str, window: Duration) -> Result<Sample> {
         // CPU delta must survive a sidecar respawn mid-window: capture t0 CPU per pid, and at
         // t1 credit each pid only its OWN delta (a pid new at t1 contributes 0 this window).
-        let cpu0: HashMap<u32, f64> = job_process_ids(self.job)?
-            .into_iter()
-            .map(|p| (p, proc_cpu_seconds_by_pid(p).unwrap_or(0.0)))
+        let initial_pids = job_process_ids(self.job)?;
+        let cpu0: HashMap<u32, f64> = initial_pids
+            .iter()
+            .map(|&p| (p, proc_cpu_seconds_by_pid(p).unwrap_or(0.0)))
+            .collect();
+        let io0: HashMap<u32, IO_COUNTERS> = initial_pids
+            .iter()
+            .filter_map(|&p| proc_io_by_pid(p).map(|io| (p, io)))
             .collect();
         let t0 = Instant::now();
         std::thread::sleep(window);
@@ -163,6 +174,8 @@ impl Resident {
         let mut cpu_delta = 0.0;
         let mut private_bytes = 0u64;
         let mut working_set_bytes = 0u64;
+        let (mut io_read_bytes, mut io_write_bytes) = (0u64, 0u64);
+        let (mut io_read_ops, mut io_write_ops) = (0u64, 0u64);
         let mut handles = 0u32;
         for &p in &family {
             let now = proc_cpu_seconds_by_pid(p).unwrap_or(0.0);
@@ -172,6 +185,13 @@ impl Resident {
                 working_set_bytes += ws;
                 handles += h;
             }
+            if let Some(now) = proc_io_by_pid(p) {
+                let before = io0.get(&p).unwrap_or(&now);
+                io_read_bytes += now.ReadTransferCount.saturating_sub(before.ReadTransferCount);
+                io_write_bytes += now.WriteTransferCount.saturating_sub(before.WriteTransferCount);
+                io_read_ops += now.ReadOperationCount.saturating_sub(before.ReadOperationCount);
+                io_write_ops += now.WriteOperationCount.saturating_sub(before.WriteOperationCount);
+            }
         }
 
         Ok(Sample {
@@ -180,6 +200,10 @@ impl Resident {
             cpu_pct_of_total: cpu_delta / dt * 100.0 / cores,
             private_bytes,
             working_set_bytes,
+            io_read_bytes,
+            io_write_bytes,
+            io_read_ops,
+            io_write_ops,
             handles,
             threads,
             children,
@@ -264,6 +288,12 @@ fn proc_cpu_seconds_by_pid(pid: u32) -> Option<f64> {
     }
     let ft = |f: FILETIME| (u64::from(f.dwHighDateTime) << 32 | u64::from(f.dwLowDateTime)) as f64 * 1e-7;
     Some(ft(kernel) + ft(user))
+}
+
+fn proc_io_by_pid(pid: u32) -> Option<IO_COUNTERS> {
+    let h = ProcHandle::open(pid)?;
+    let mut io: IO_COUNTERS = unsafe { std::mem::zeroed() };
+    (unsafe { GetProcessIoCounters(h.0, &raw mut io) } != 0).then_some(io)
 }
 
 /// (private commit, working set, open handles) for one pid. None if it exited.

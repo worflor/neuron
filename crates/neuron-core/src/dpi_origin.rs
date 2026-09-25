@@ -114,8 +114,9 @@ pub enum Origin {
 }
 
 /// Last value this process wrote to each device, and why.
-fn ledger() -> &'static Mutex<HashMap<u16, (u16, Cause)>> {
-    static L: OnceLock<Mutex<HashMap<u16, (u16, Cause)>>> = OnceLock::new();
+type Ledger = Mutex<HashMap<(u16, String), (u16, Cause)>>;
+fn ledger() -> &'static Ledger {
+    static L: OnceLock<Ledger> = OnceLock::new();
     L.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -127,9 +128,9 @@ fn ledger() -> &'static Mutex<HashMap<u16, (u16, Cause)>> {
 /// and "healed" — neuron fighting its own write.
 /// Returns whatever the ledger held before, for [`rollback`] if the write does not land.
 #[must_use = "a write that fails must roll the stamp back, or the ledger claims a value the device never took"]
-pub fn expect(pid: u16, x: u16, cause: Cause) -> Option<(u16, Cause)> {
+pub fn expect(pid: u16, unit: &str, x: u16, cause: Cause) -> Option<(u16, Cause)> {
     let mut map = ledger().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    map.insert(pid, (x, cause))
+    map.insert((pid, unit.to_owned()), (x, cause))
 }
 
 /// Undo an [`expect`] whose write failed, putting `prev` back.
@@ -138,19 +139,19 @@ pub fn expect(pid: u16, x: u16, cause: Cause) -> Option<(u16, Cause)> {
 /// the device really arriving at that value later (the exact drift this module exists to catch)
 /// would then be waved through as our own echo. Restores the PREVIOUS entry rather than clearing,
 /// so a failed write cannot also erase the record of the last one that succeeded.
-pub fn rollback(pid: u16, prev: Option<(u16, Cause)>) {
+pub fn rollback(pid: u16, unit: &str, prev: Option<(u16, Cause)>) {
     let mut map = ledger().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     match prev {
-        Some(entry) => map.insert(pid, entry),
-        None => map.remove(&pid),
+        Some(entry) => map.insert((pid, unit.to_owned()), entry),
+        None => map.remove(&(pid, unit.to_owned())),
     };
 }
 
 /// Classify a DPI the device announced for `pid`, against both channels. See [`Origin`].
-pub fn classify(pid: u16, announced: u16) -> Origin {
+pub fn classify(pid: u16, unit: &str, announced: u16) -> Origin {
     let last_write = {
         let map = ledger().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        map.get(&pid).copied()
+        map.get(&(pid, unit.to_owned())).copied()
     };
     let intent_dpi = crate::feel_intent::get(pid).and_then(|i| i.dpi).map(|(x, _)| x);
     decide(last_write, intent_dpi, announced)
@@ -181,9 +182,9 @@ pub fn decide(
 }
 
 /// Drop `pid`'s ledger entry, so the next announce is judged purely against durable intent.
-pub fn forget(pid: u16) {
+pub fn forget(pid: u16, unit: &str) {
     let mut map = ledger().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    map.remove(&pid);
+    map.remove(&(pid, unit.to_owned()));
 }
 
 #[cfg(test)]
@@ -193,36 +194,38 @@ mod tests {
     // Pids no other test drives — the ledger is process-global and the suite runs in parallel.
     const PID_A: u16 = 0xFD01;
     const PID_B: u16 = 0xFD02;
+    const UNIT_A: &str = "unit-a";
+    const UNIT_B: &str = "unit-b";
 
     #[test]
     fn our_own_write_is_recognised_as_an_echo_whatever_the_cause() {
         for cause in [Cause::UserApplied, Cause::UserCycled, Cause::Momentary, Cause::Reassert] {
-            forget(PID_A);
-            let _ = expect(PID_A, 1600, cause);
+            forget(PID_A, UNIT_A);
+            let _ = expect(PID_A, UNIT_A, 1600, cause);
             assert_eq!(
-                classify(PID_A, 1600),
+                classify(PID_A, UNIT_A, 1600),
                 Origin::Echo(cause),
                 "a value this process just wrote must never be treated as drift"
             );
         }
-        forget(PID_A);
+        forget(PID_A, UNIT_A);
     }
 
     #[test]
     fn a_rolled_back_stamp_restores_the_previous_write_not_a_blank() {
-        forget(PID_A);
-        let _ = expect(PID_A, 30000, Cause::UserApplied);
+        forget(PID_A, UNIT_A);
+        let _ = expect(PID_A, UNIT_A, 30000, Cause::UserApplied);
         // A write that is refused by the device must leave no trace of itself...
-        let prev = expect(PID_A, 800, Cause::UserApplied);
-        rollback(PID_A, prev);
+        let prev = expect(PID_A, UNIT_A, 800, Cause::UserApplied);
+        rollback(PID_A, UNIT_A, prev);
         // ...and must not take the last GOOD stamp with it.
-        assert_eq!(classify(PID_A, 30000), Origin::Echo(Cause::UserApplied));
+        assert_eq!(classify(PID_A, UNIT_A, 30000), Origin::Echo(Cause::UserApplied));
         // The value that never landed is not ours, so a device arriving there is still drift.
         assert_eq!(
             decide(Some((30000, Cause::UserApplied)), Some(30000), 800),
             Origin::Foreign
         );
-        forget(PID_A);
+        forget(PID_A, UNIT_A);
     }
 
     #[test]
@@ -288,14 +291,29 @@ mod tests {
     #[test]
     fn the_ledger_round_trips_through_the_process_global_lookup() {
         // `decide` carries the rule; this covers the wiring `classify` puts in front of it.
-        forget(PID_B);
-        let _ = expect(PID_B, 1600, Cause::UserCycled);
-        assert_eq!(classify(PID_B, 1600), Origin::Echo(Cause::UserCycled));
-        forget(PID_B);
+        forget(PID_B, UNIT_A);
+        let _ = expect(PID_B, UNIT_A, 1600, Cause::UserCycled);
+        assert_eq!(classify(PID_B, UNIT_A, 1600), Origin::Echo(Cause::UserCycled));
+        forget(PID_B, UNIT_A);
         assert_ne!(
-            classify(PID_B, 1600),
+            classify(PID_B, UNIT_A, 1600),
             Origin::Echo(Cause::UserCycled),
             "forget must actually drop the entry"
         );
+    }
+
+    #[test]
+    fn identical_devices_keep_independent_write_provenance() {
+        forget(PID_A, UNIT_A);
+        forget(PID_A, UNIT_B);
+        let _ = expect(PID_A, UNIT_A, 800, Cause::UserApplied);
+        assert_eq!(classify(PID_A, UNIT_A, 800), Origin::Echo(Cause::UserApplied));
+        assert_eq!(
+            classify(PID_A, UNIT_B, 800),
+            Origin::Unknown,
+            "a write to one same-PID unit must not account for another unit's announce"
+        );
+        forget(PID_A, UNIT_A);
+        forget(PID_A, UNIT_B);
     }
 }

@@ -12,12 +12,9 @@
 //! Two primitives, both built on raw atomics — no locks, no allocation on the hot path, safe
 //! to read from a crashing process:
 //!
-//! **The ring** — a fixed static ring of trace events. Each slot is a per-slot *seqlock*: a
-//! writer flips the slot's sequence odd, stores its fields with relaxed atomics, then flips it
-//! even; a reader snapshots the sequence around its reads and discards torn slots. Writers
-//! never wait (a slot collision under wrap just means the older event loses — it's a flight
-//! recorder, not a ledger). `trace()` costs a handful of relaxed atomic stores: cheap enough
-//! to narrate every lifecycle edge of the app, hot enough paths included.
+//! **The ring** — a fixed static ring of trace events. Each slot has a nonblocking exclusive
+//! claim shared by writers and snapshot readers. A collision skips that event or snapshot
+//! rather than waiting, so the hot path stays bounded and fields cannot interleave.
 //!
 //! **The pulses** — named heartbeat atomics that long-lived workers bump every tick. The UI
 //! timer reads their ages: a worker silent past its deadline is surfaced as a status warning
@@ -29,7 +26,7 @@
 //! last heartbeat, and the last ~1k events in order. The crash report stops being a mystery
 //! and becomes a narrative.
 
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::time::Instant;
 
@@ -54,13 +51,15 @@ fn tid() -> u32 {
     0
 }
 
-// ── the ring (per-slot seqlock over relaxed atomics) ─────────────────────────
+// ── the ring (per-slot nonblocking exclusive claim) ──────────────────────────
 
 const RING: usize = 1024; // power of two
 const MASK: usize = RING - 1;
 
 struct Slot {
-    /// Seqlock: odd while a writer is mid-flight; bumped by 2 per write. 0 = never written.
+    /// Exclusive nonblocking claim for either a writer or a snapshot reader.
+    busy: AtomicBool,
+    /// Odd while a writer is publishing; 0 = never written.
     seq: AtomicU32,
     t_ms: AtomicU32,
     tid: AtomicU32,
@@ -73,6 +72,7 @@ struct Slot {
 
 #[allow(clippy::declare_interior_mutable_const)] // the const is the array-init template
 const EMPTY: Slot = Slot {
+    busy: AtomicBool::new(false),
     seq: AtomicU32::new(0),
     t_ms: AtomicU32::new(0),
     tid: AtomicU32::new(0),
@@ -93,10 +93,13 @@ pub fn trace(cat: &'static str, msg: &'static str, arg: u64) {
     let t = now_ms() as u32;
     let i = CURSOR.fetch_add(1, Ordering::Relaxed) & MASK;
     let s = &SLOTS[i];
-    // enter the write (odd). Two writers landing on one slot after a full wrap can interleave;
-    // the seq check on the read side discards such a slot — recorder semantics, by design.
-    let seq = s.seq.load(Ordering::Relaxed) | 1;
-    s.seq.store(seq, Ordering::Release);
+    if s.busy
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    s.seq.store(1, Ordering::Relaxed);
     s.t_ms.store(t, Ordering::Relaxed);
     s.tid.store(tid(), Ordering::Relaxed);
     s.cat_ptr.store(cat.as_ptr() as usize, Ordering::Relaxed);
@@ -104,15 +107,19 @@ pub fn trace(cat: &'static str, msg: &'static str, arg: u64) {
     s.msg_ptr.store(msg.as_ptr() as usize, Ordering::Relaxed);
     s.msg_len.store(msg.len(), Ordering::Relaxed);
     s.arg.store(arg, Ordering::Relaxed);
-    s.seq.store(seq.wrapping_add(1), Ordering::Release); // even again
+    s.seq.store(2, Ordering::Release);
+    s.busy.store(false, Ordering::Release);
 }
 
-/// One stable snapshot of a slot, or None if unwritten/torn.
+/// One stable snapshot of a slot, or None if unwritten or currently claimed.
 fn read_slot(s: &Slot) -> Option<(u32, u32, &'static str, &'static str, u64)> {
-    let s1 = s.seq.load(Ordering::Acquire);
-    if s1 == 0 || s1 & 1 == 1 {
+    if s.busy
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
         return None;
     }
+    let seq = s.seq.load(Ordering::Relaxed);
     let t = s.t_ms.load(Ordering::Relaxed);
     let id = s.tid.load(Ordering::Relaxed);
     let cp = s.cat_ptr.load(Ordering::Relaxed);
@@ -120,12 +127,12 @@ fn read_slot(s: &Slot) -> Option<(u32, u32, &'static str, &'static str, u64)> {
     let mp = s.msg_ptr.load(Ordering::Relaxed);
     let ml = s.msg_len.load(Ordering::Relaxed);
     let arg = s.arg.load(Ordering::Relaxed);
-    let s2 = s.seq.load(Ordering::Acquire);
-    if s1 != s2 || cp == 0 || mp == 0 {
-        return None; // torn or empty — skip, never misread
+    s.busy.store(false, Ordering::Release);
+    if seq == 0 || seq & 1 == 1 || cp == 0 || mp == 0 {
+        return None;
     }
-    // Sound because the seqlock proved ptr+len were written together, the strings are
-    // 'static literals (immortal, valid UTF-8), and we never fabricate lengths.
+    // SAFETY: The exclusive claim kept each pointer paired with its length. `trace` accepts only
+    // immutable 'static strings, so releasing the slot cannot invalidate their storage or UTF-8.
     let cat =
         unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(cp as *const u8, cl)) };
     let msg =
@@ -331,29 +338,51 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_writers_never_tear_the_reader() {
+    fn concurrent_writers_never_mix_slot_fields() {
         let _guard = test_guard();
+        let categories = ["pair0", "pair1", "pair2", "pair3"];
+        let messages = ["message0", "message1", "message2", "message3"];
         let threads: Vec<_> = (0..4)
             .map(|n| {
+                let cat = categories[n];
+                let msg = messages[n];
                 std::thread::spawn(move || {
                     for i in 0..20_000u64 {
-                        trace("stress", "spin", n * 100_000 + i);
+                        trace(cat, msg, n as u64 * 1_000_000 + i);
                     }
                 })
             })
             .collect();
-        // read while they write — every slot must parse or be skipped, never panic/UB.
+        let check_snapshot = |bytes: &[u8]| {
+            let text = String::from_utf8_lossy(bytes);
+            for line in text.lines().filter(|line| line.contains("message")) {
+                let matched = (0..4).find(|&n| line.contains(messages[n]));
+                let Some(n) = matched else {
+                    panic!("unexpected event message: {line}");
+                };
+                assert!(line.contains(categories[n]), "mixed category/message: {line}");
+                let arg = line
+                    .rsplit_once('(')
+                    .and_then(|(_, rest)| rest.strip_suffix(')'))
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .expect("event argument is present");
+                assert_eq!(arg / 1_000_000, n as u64, "mixed event argument: {line}");
+            }
+            text.contains("message")
+        };
+        let mut saw_event = false;
         for _ in 0..200 {
-            let mut sink = std::io::sink();
-            dump(&mut sink);
+            let mut snapshot = Vec::new();
+            dump(&mut snapshot);
+            saw_event |= check_snapshot(&snapshot);
         }
         for t in threads {
             t.join().unwrap();
         }
         let mut buf = Vec::new();
         dump(&mut buf);
-        let s = String::from_utf8(buf).unwrap();
-        assert!(s.contains("stress"), "events survive the stampede");
+        saw_event |= check_snapshot(&buf);
+        assert!(saw_event, "events survive the stampede");
     }
 
     #[test]

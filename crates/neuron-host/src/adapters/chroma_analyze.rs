@@ -55,7 +55,7 @@ pub enum LightEvent {
     /// told us the cooldown; we timed it.
     Cooldown { led: usize, ts: u32, duration_ms: u32 },
     /// Brightness rising steadily (a fill / charge). `rate_per_s` is luma/second and
-    /// `eta_ms` predicts when it reaches the key's recent max (charge complete).
+    /// `eta_ms` predicts when perceptual luma reaches normalized full brightness (1.0).
     Ramp { led: usize, ts: u32, rate_per_s: f32, eta_ms: u32 },
     /// Periodic flashing (an alert / ready-pulse), at the estimated frequency.
     Pulse { led: usize, ts: u32, hz: f32 },
@@ -351,6 +351,30 @@ mod tests {
             ev.iter().any(|e| matches!(e, LightEvent::Ramp { .. })),
             "expected a ramp, got {ev:?}"
         );
+    }
+
+    #[test]
+    fn ramp_eta_extrapolates_to_normalized_full_brightness() {
+        let mut a = ChromaAnalyzer::new(1);
+        let series: Vec<_> = (0..=2000)
+            .step_by(100)
+            .map(|t| {
+                let v = (200.0 * (t as f32 / 2000.0)) as u8;
+                (t, (v, v, v))
+            })
+            .collect();
+        let events = feed(&mut a, &series);
+        let (ts, rate_per_s, eta_ms) = events
+            .iter()
+            .find_map(|event| match event {
+                LightEvent::Ramp { ts, rate_per_s, eta_ms, .. } => Some((*ts, *rate_per_s, *eta_ms)),
+                _ => None,
+            })
+            .expect("a partial brightness fill should produce a ramp");
+        let current_luma = luma(series.iter().find(|(sample_ts, _)| *sample_ts == ts).unwrap().1);
+        let expected = (((1.0 - current_luma) / rate_per_s) * 1000.0) as u32;
+        assert_eq!(eta_ms, expected, "ETA is measured to normalized luma 1.0");
+        assert!(eta_ms > 0, "the partial fill is below full brightness");
     }
 
     #[test]

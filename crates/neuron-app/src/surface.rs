@@ -30,7 +30,7 @@ mod imp {
     use windows_sys::Win32::Graphics::Gdi::{
         CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC,
         SelectObject, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
-        BLENDFUNCTION, DIB_RGB_COLORS, HBITMAP, HDC,
+        BLENDFUNCTION, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, UpdateLayeredWindow,
@@ -118,6 +118,7 @@ mod imp {
     pub struct Dib {
         pub dc: HDC,
         pub bmp: HBITMAP,
+        old: HGDIOBJ,
     }
 
     impl Dib {
@@ -141,11 +142,29 @@ mod imp {
                     0,
                 ) as HBITMAP;
                 if bmp.is_null() || bits.is_null() {
+                    if !bmp.is_null() {
+                        DeleteObject(bmp.cast());
+                    }
                     DeleteDC(dc);
                     return None;
                 }
-                SelectObject(dc, bmp.cast());
-                Some(Dib { dc, bmp })
+                let old = SelectObject(dc, bmp.cast());
+                if old.is_null() || old as isize == -1 {
+                    DeleteObject(bmp.cast());
+                    DeleteDC(dc);
+                    return None;
+                }
+                Some(Dib { dc, bmp, old })
+            }
+        }
+    }
+
+    impl Drop for Dib {
+        fn drop(&mut self) {
+            unsafe {
+                SelectObject(self.dc, self.old);
+                DeleteObject(self.bmp.cast());
+                DeleteDC(self.dc);
             }
         }
     }

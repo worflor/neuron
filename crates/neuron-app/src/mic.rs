@@ -29,11 +29,13 @@ fn render_endpoint() -> Option<(String, String)> {
 /// mute reading — through the one writer, not a second one here.
 pub fn refresh(app: &AppWindow) {
     let st = app.global::<State>();
+    st.set_mic_reading_valid(false);
     match endpoint() {
         Some((id, name)) => {
             if let Some(ctl) = VolumeCtl::open(&id) {
                 st.set_mic_name(name.into());
                 st.set_mic_gain((ctl.get_volume() * 100.0).round());
+                st.set_mic_reading_valid(true);
             } else {
                 st.set_mic_name(name.into());
             }
@@ -48,12 +50,14 @@ pub fn refresh(app: &AppWindow) {
 /// Refresh the output panel from the live render endpoint (the headset / sound-card volume + mute).
 pub fn refresh_output(app: &AppWindow) {
     let st = app.global::<State>();
+    st.set_out_reading_valid(false);
     match render_endpoint() {
         Some((id, name)) => {
             if let Some(ctl) = VolumeCtl::open(&id) {
                 st.set_out_name(name.into());
                 st.set_out_gain((ctl.get_volume() * 100.0).round());
                 st.set_out_muted(ctl.get_mute());
+                st.set_out_reading_valid(true);
                 return;
             }
             st.set_out_name(name.into());

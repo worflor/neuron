@@ -707,7 +707,7 @@ impl AppRuntime {
                         let onboard = cap::set_dpi(&d, dpi, dpi, cap::Store::Persist, neuron::dpi_origin::Cause::UserApplied);
                         // confirmation fires past the committed write — same as apply_polling /
                         // apply_brightness. Absolute set → no prior read, so no old→new.
-                        neuron::confirm::dpi(d.pid, u32::from(dpi), None);
+                        neuron::confirm::dpi_unit(d.pid, &d.dpi_unit, u32::from(dpi), None);
                         match onboard {
                             Ok(()) => format!("DPI -> {dpi} (saved to mouse)"),
                             Err(e) => format!("DPI -> {dpi} (onboard save unavailable: {e})"),
@@ -1758,8 +1758,7 @@ impl AppRuntime {
 
         // 7) macro runtime — the Python Macro Host's interpreter + host scripts resolve. Does NOT
         //    SPAWN the sidecar (that warms lazily on the first real macro); it DOES extract the
-        //    interpreter on the very first call, but startup warms it on a background thread, so by the
-        //    time diagnostics run it's resolved and cheap. "skip" honestly when no python is available.
+        //    interpreter on the very first call. "skip" honestly when no python is available.
         if neuron::macros::macro_host().available() {
             out.push(DiagProbe::pass(
                 "macro runtime",
@@ -2470,6 +2469,7 @@ mod tests {
     /// The runtime loads from disk (registry + config) without a device present.
     #[test]
     fn runtime_loads_headless() {
+        let _cwd = crate::testsupport::cwd_guard("runtime_loads_headless");
         let rt = AppRuntime::load();
         // a fresh runtime has no active profile; write authority lives in neuron-core::safety.
         assert_eq!(rt.active_profile, "—");

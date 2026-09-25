@@ -17,10 +17,11 @@
 #   ./neuron-update.sh --action apply
 #   ./neuron-update.sh --action rollback
 #
-# It never deletes anything in the install directory. It overwrites only the files a release
-# ships, and backs those up first.
+# An install overwrites only files a release ships, and backs those files up first. Rollback removes
+# only newly shipped paths recorded in its backup manifest, and preserves files changed afterward.
 
 set -u
+set -o pipefail
 
 REPO='worflor/neuron'
 BACKUP_ROOT='.neuron-update-backup'
@@ -128,15 +129,157 @@ is_source_build() {
     return 1
 }
 
-# Copies every file under $1 into $2, preserving relative paths and the executable bit.
+has_symlink_parent() {
+    local root="$1" rel="$2" parent component rest
+    parent="$root"
+    rest="$(dirname -- "$rel")"
+    [ "$rest" = '.' ] && return 1
+    while [ -n "$rest" ]; do
+        component="${rest%%/*}"
+        if [ "$rest" = "$component" ]; then rest=''; else rest="${rest#*/}"; fi
+        parent="$parent/$component"
+        [ -L "$parent" ] && return 0
+    done
+    return 1
+}
+
+# Copies every file and symlink under $1 into $2, preserving relative paths and metadata.
 copy_tree() {
-    local from="$1" to="$2" rel dest
-    ( cd "$from" && find . -type f -print ) | while IFS= read -r rel; do
+    local from="$1" to="$2" rel dest list failed=0
+    list="$(mktemp)" || return 1
+    if ! ( cd "$from" && find . \( -type f -o -type l \) -print0 > "$list" ); then
+        rm -f -- "$list"
+        return 1
+    fi
+    while IFS= read -r -d '' rel; do
         rel="${rel#./}"
         dest="$to/$rel"
-        mkdir -p "$(dirname "$dest")"
-        cp -p "$from/$rel" "$dest"
-    done
+        if has_symlink_parent "$to" "$rel" || ! mkdir -p -- "$(dirname "$dest")" \
+            || ! cp -Pp --remove-destination "$from/$rel" "$dest"; then
+            failed=1
+            break
+        fi
+    done < "$list"
+    rm -f -- "$list" || failed=1
+    return "$failed"
+}
+
+# Compare newly shipped files with the verified payload before removing them on rollback.
+fingerprint_path() {
+    local path="$1"
+    if [ -L "$path" ]; then
+        if command -v sha256sum >/dev/null 2>&1; then
+            readlink -- "$path" | sha256sum | cut -d' ' -f1
+        else
+            readlink -- "$path" | shasum -a 256 | cut -d' ' -f1
+        fi
+    elif [ -f "$path" ]; then
+        sha256_of "$path"
+    else
+        return 1
+    fi
+}
+
+# Back up paths the payload will replace and record the payload paths that did not exist before
+# installation. The sibling manifest is the only authority rollback uses to remove new files.
+make_backup() {
+    local payload="$1" install="$2" backup="$3" list manifest tmp rel old dest digest failed=0
+    list="$(mktemp)" || return 1
+    manifest="${backup}.created-files"
+    tmp="${manifest}.tmp.$$"
+    if ! mkdir -p -- "$backup" || ! : > "$tmp"; then
+        rm -f -- "$list" "$tmp"
+        return 1
+    fi
+    if ! ( cd "$payload" && find . \( -type f -o -type l \) -print0 > "$list" ); then
+        rm -f -- "$list" "$tmp"
+        rm -rf -- "$backup"
+        return 1
+    fi
+    while IFS= read -r -d '' rel; do
+        rel="${rel#./}"
+        case "$rel" in
+            "$BACKUP_ROOT" | "$BACKUP_ROOT"/*)
+                failed=1
+                break
+                ;;
+        esac
+        old="$install/$rel"
+        if has_symlink_parent "$install" "$rel"; then
+            failed=1
+            break
+        fi
+        if [ -e "$old" ] || [ -L "$old" ]; then
+            dest="$backup/$rel"
+            if ! mkdir -p -- "$(dirname "$dest")" || ! cp -Pp -- "$old" "$dest"; then
+                failed=1
+                break
+            fi
+        else
+            digest="$(fingerprint_path "$payload/$rel")" || { failed=1; break; }
+            if ! printf '%s\0%s\0' "$rel" "$digest" >> "$tmp"; then
+                failed=1
+                break
+            fi
+        fi
+    done < "$list"
+    if [ "$failed" -eq 0 ] && ! mv -- "$tmp" "$manifest"; then
+        failed=1
+    fi
+    rm -f -- "$list"
+    if [ "$failed" -ne 0 ]; then
+        rm -f -- "$tmp" "$manifest"
+        rm -rf -- "$backup"
+        return 1
+    fi
+    return 0
+}
+
+remove_created_files() {
+    local root="$1" manifest="$2" rel digest actual path parent component rest
+    PRESERVED_CREATED=0
+    [ -f "$manifest" ] || return 1
+    while IFS= read -r -d '' rel; do
+        IFS= read -r -d '' digest || return 1
+        case "$rel" in
+            '' | /* | . | .. | ../* | */.. | */../* | ./* | "$BACKUP_ROOT" | "$BACKUP_ROOT"/*)
+                return 1
+                ;;
+        esac
+        path="$root/$rel"
+        parent="$root"
+        rest="$(dirname -- "$rel")"
+        if [ "$rest" != '.' ]; then
+            while [ -n "$rest" ]; do
+                component="${rest%%/*}"
+                if [ "$rest" = "$component" ]; then rest=''; else rest="${rest#*/}"; fi
+                parent="$parent/$component"
+                if [ -L "$parent" ]; then
+                    PRESERVED_CREATED=1
+                    continue 2
+                fi
+            done
+        fi
+        if [ -e "$path" ] || [ -L "$path" ]; then
+            actual="$(fingerprint_path "$path" 2>/dev/null || true)"
+            if [ -z "$actual" ] || [ "$actual" != "$digest" ]; then
+                PRESERVED_CREATED=1
+                continue
+            fi
+        fi
+        if [ -L "$path" ] || [ -f "$path" ]; then
+            rm -f -- "$path" || return 1
+        elif [ -e "$path" ]; then
+            PRESERVED_CREATED=1
+        fi
+    done < "$manifest"
+    return 0
+}
+
+restore_backup() {
+    local backup="$1" install="$2" manifest="${1}.created-files"
+    copy_tree "$backup" "$install" || return 1
+    remove_created_files "$install" "$manifest"
 }
 
 cleanup() { [ -n "${work:-}" ] && [ -d "${work:-}" ] && rm -rf "$work"; }
@@ -180,18 +323,44 @@ fi
 
 if [ "$action" = 'rollback' ]; then
     bdir="$install_dir/$BACKUP_ROOT"
-    latest="$(ls -1 "$bdir" 2>/dev/null | sort | tail -n1)"
+    latest=''
+    latest_stamp=''
+    latest_seq=''
+    for candidate in "$bdir"/*; do
+        [ -d "$candidate" ] || continue
+        name="${candidate##*/}"
+        if [[ "$name" =~ -([0-9]{6})-([0-9]{8}-[0-9]{6})$ ]] && [ -f "${candidate}.created-files" ]; then
+            seq="${BASH_REMATCH[1]}"
+            stamp="${BASH_REMATCH[2]}"
+            if [[ "$stamp" > "$latest_stamp" ]] || { [ "$stamp" = "$latest_stamp" ] && [[ "$seq" > "$latest_seq" ]]; }; then
+                latest="$candidate"
+                latest_stamp="$stamp"
+                latest_seq="$seq"
+            fi
+        fi
+    done
     if [ -z "$latest" ]; then
-        flag 'NO_BACKUP' "nothing to roll back to in $bdir"
+        flag 'NO_BACKUP' "no complete timestamped backup with a created-files manifest in $bdir"
         finish 'blocked'
     fi
-    say 'restoring' "$bdir/$latest"
+    say 'restoring' "$latest"
     if [ ! -w "$install_dir" ]; then
         flag 'NOT_WRITABLE' "cannot write to $install_dir"
         finish 'needs-root'
     fi
-    copy_tree "$bdir/$latest" "$install_dir"
-    say 'installed_version' "$(installed_version_of "$install_dir" || echo unknown)"
+    install_root="$(cd "$install_dir" 2>/dev/null && pwd -P)" || {
+        flag 'NOT_WRITABLE' "cannot resolve install directory $install_dir"
+        finish 'needs-root'
+    }
+    if ! restore_backup "$latest" "$install_root"; then
+        flag 'ROLLBACK_FAILED' "could not fully restore $latest; existing files were restored where possible and unowned files were preserved"
+        finish 'error'
+    fi
+    say 'restored_from' "$latest"
+    if [ "$PRESERVED_CREATED" -ne 0 ]; then
+        flag 'ROLLBACK_PRESERVED' 'left a newly shipped path in place because it changed after installation or now contains a directory or symlinked parent'
+    fi
+    say 'installed_version' "$(installed_version_of "$install_root" || echo unknown)"
     finish 'rolled-back'
 fi
 
@@ -333,34 +502,57 @@ if command -v pgrep >/dev/null 2>&1 && pgrep -x neuron-app >/dev/null 2>&1; then
     finish 'blocked'
 fi
 
-mkdir -p "$install_dir" 2>/dev/null || true
+if ! mkdir -p -- "$install_dir"; then
+    flag 'NOT_WRITABLE' "cannot create $install_dir. Use a per-user directory such as $DEFAULT_DIR rather than running this with sudo."
+    finish 'needs-root'
+fi
 if [ ! -d "$install_dir" ] || [ ! -w "$install_dir" ]; then
     flag 'NOT_WRITABLE' "cannot write to $install_dir. Use a per-user directory such as $DEFAULT_DIR rather than running this with sudo."
     finish 'needs-root'
 fi
+install_dir="$(cd "$install_dir" 2>/dev/null && pwd -P)" || {
+    flag 'NOT_WRITABLE' "cannot resolve install directory $install_dir"
+    finish 'needs-root'
+}
 
-backup=''
-if [ $installed -eq 1 ]; then
-    stamp="${current:-unknown}-$(date +%Y%m%d-%H%M%S)"
-    backup="$install_dir/$BACKUP_ROOT/$stamp"
-    mkdir -p "$backup"
-    ( cd "$payload_dir" && find . -type f -print ) | while IFS= read -r rel; do
-        rel="${rel#./}"
-        if [ -f "$install_dir/$rel" ]; then
-            mkdir -p "$(dirname "$backup/$rel")"
-            cp -p "$install_dir/$rel" "$backup/$rel"
-        fi
-    done
-    say 'backup' "$backup"
-    n="$(ls -1 "$install_dir/$BACKUP_ROOT" 2>/dev/null | wc -l | tr -d ' ')"
-    if [ "$n" -gt 3 ]; then
-        flag 'OLD_BACKUPS' "$n update backups are kept in $BACKUP_ROOT. Older ones can be deleted if the user wants the space."
+backup_root="$install_dir/$BACKUP_ROOT"
+if ! mkdir -p -- "$backup_root"; then
+    flag 'BACKUP_FAILED' "could not create backup directory $backup_root"
+    finish 'error'
+fi
+stamp_time="$(date +%Y%m%d-%H%M%S)"
+seq=0
+while :; do
+    stamp="${current:-unknown}-$(printf '%06d' "$seq")-$stamp_time"
+    backup="$backup_root/$stamp"
+    if [ ! -e "$backup" ] && [ ! -e "${backup}.created-files" ]; then
+        break
     fi
+    seq=$((seq + 1))
+done
+if ! make_backup "$payload_dir" "$install_dir" "$backup"; then
+    flag 'BACKUP_FAILED' "could not completely back up the release files in $install_dir; installation was not started"
+    finish 'error'
+fi
+say 'backup' "$backup"
+n=0
+for candidate in "$backup_root"/*; do
+    if [ -d "$candidate" ] && [ -f "${candidate}.created-files" ]; then n=$((n + 1)); fi
+done
+if [ "$n" -gt 3 ]; then
+    flag 'OLD_BACKUPS' "$n update backups are kept in $BACKUP_ROOT. Older ones can be deleted if the user wants the space."
 fi
 
 if ! copy_tree "$payload_dir" "$install_dir"; then
     flag 'COPY_FAILED' "could not copy the release into $install_dir"
-    [ -n "$backup" ] && { copy_tree "$backup" "$install_dir"; say 'restored_from' "$backup"; }
+    if restore_backup "$backup" "$install_dir"; then
+        say 'restored_from' "$backup"
+        if [ "$PRESERVED_CREATED" -ne 0 ]; then
+            flag 'ROLLBACK_PRESERVED' 'left a newly shipped path in place because it changed or became user-owned during recovery'
+        fi
+    else
+        flag 'ROLLBACK_FAILED' "could not fully restore $backup after the copy failure"
+    fi
     finish 'error'
 fi
 chmod +x "$install_dir/neuron" 2>/dev/null || true
@@ -374,7 +566,14 @@ after="$(installed_version_of "$install_dir" || true)"
 say 'installed_version' "${after:-unknown}"
 if [ -n "$new_version" ] && [ "$after" != "$new_version" ]; then
     flag 'VERIFY_FAILED' "expected $new_version after install, found ${after:-unknown}"
-    [ -n "$backup" ] && { copy_tree "$backup" "$install_dir"; say 'restored_from' "$backup"; }
+    if restore_backup "$backup" "$install_dir"; then
+        say 'restored_from' "$backup"
+        if [ "$PRESERVED_CREATED" -ne 0 ]; then
+            flag 'ROLLBACK_PRESERVED' 'left a newly shipped path in place because it changed or became user-owned during recovery'
+        fi
+    else
+        flag 'ROLLBACK_FAILED' "could not fully restore $backup after verification failed"
+    fi
     finish 'error'
 fi
 

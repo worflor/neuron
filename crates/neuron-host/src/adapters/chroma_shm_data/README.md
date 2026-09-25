@@ -17,3 +17,14 @@ actually writes. Small and stable (a few captured frames + one lookup table).
 Captured live (Overwatch on SDK 3.37, 2026-07-03). Raw exploratory dumps from
 that reverse-engineering live under `docs/chroma-shm-capture/`, which is
 git-ignored — only the handful the codec/tests actually need were promoted here.
+
+The Windows `bridge` test `synthetic_mapping_snapshot_decodes_frame` seeds a
+uniquely named `Local\` mapping, writes the captured keyboard section as a
+synthetic game frame, opens it through a second mapping handle, and exercises
+the production volatile snapshot and decode path. Run it with:
+
+```powershell
+cargo test -p neuron-host --features bridge synthetic_mapping_snapshot_decodes_frame -- --nocapture
+```
+
+It never claims the `Global\` Chroma names or wears the live arbitration mask.

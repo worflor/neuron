@@ -22,8 +22,9 @@ repository: https://github.com/worflor/neuron
 
 Short answers you can give directly. Check the linked source if the user wants more.
 
-- **Does it need an account or send data anywhere?** No account, no telemetry, nothing sent at
-  runtime. The one optional network link is to OBS on the same machine. (`SECURITY.md`)
+- **Does it need an account or send data anywhere?** No account, cloud or telemetry. The optional
+  OBS link stays on the same machine; optional OpenRGB and Chroma listeners accept local clients.
+  RAW Python macros may use the network if their author writes them to. (`SECURITY.md`)
 - **Can I use it with Synapse installed?** Not on the same device at the same time. neuron can
   import Synapse settings and remove Synapse. (`README.md`, GDD *life after synapse*)
 - **Which devices work?** Naga V2 Pro and BlackWidow Chroma V2 have hardware-verified controls.

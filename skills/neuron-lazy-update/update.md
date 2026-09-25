@@ -65,7 +65,7 @@ Read the output as lines:
    | `updated` | say so, and mention any `FLAG` lines |
    | `blocked` | stop, show the `FLAG` lines, don't retry |
    | `needs-admin` | explain it, see **Admin rights** |
-   | `error` | show the lines; the script already restored the backup if it had made one |
+   | `error` | show the lines; recovery was attempted when a backup exists. If `ROLLBACK_FAILED` appears, recovery was incomplete. |
 
 ## Install (first time)
 
@@ -87,9 +87,12 @@ moves config to a second location.
 
 4. `RESULT: installed` means it's done. Tell the user how to start it: `neuron-app.exe` in that
    folder.
-5. **Autostart is optional and needs admin once.** To start neuron with Windows, the user runs
-   `neuron-app.exe` as administrator one time (right-click → Run as administrator), then turns on
-   "start with windows" on the SYSTEM page. Explain that; don't do it for them.
+5. **Autostart is optional.** The user can turn on "start with windows" on the SYSTEM page.
+   Neuron registers a task for that user at limited privilege; administrator launch is not needed.
+6. Native Chroma shared memory needs the separate protected broker. The current source package
+   carries its binary and installer script; [the setup steps](../../docs/PROTOCOL-HOST.md)
+   require a one-time administrator PowerShell under the same Windows account. REST and OpenRGB
+   work without that step.
 
 ### Linux
 
@@ -100,13 +103,16 @@ incomplete on `main`. The updater script remains for a future Linux package.
 ## Roll back
 
 If an update went wrong, confirm with the user, then run `-Action rollback` (`--action rollback`
-on Linux). It restores the files from the most recent backup in `.neuron-update-backup` inside the
-install folder. Only files a release ships were backed up and only those come back, so the user's
-config is not affected either way.
+on Linux). It restores the files from the newest timestamped backup in `.neuron-update-backup` inside
+the install folder. Files that existed before the update are restored; newly shipped paths are
+removed only when the backup manifest records them and their contents have not changed since install.
+User config and files edited after the update are preserved. Backups without a created-files manifest
+are not eligible for rollback because the updater cannot safely identify which new files it owns.
 
 `RESULT: rolled-back` means it's done — read the `installed_version` line above it back to the
-user, because that is the version they are now on. `RESULT: blocked` with `NO_BACKUP` means there
-was never an update to undo, which is the case on a fresh install.
+user, because that is the version they are now on. `ROLLBACK_PRESERVED` means a modified or
+user-owned new path was left in place. `RESULT: blocked` with `NO_BACKUP` means no complete supported
+backup is available. The current updater creates a manifest-backed backup on first install too.
 
 ## Admin rights
 
@@ -118,6 +124,12 @@ problem it is, and the answer is never to rerun the script elevated:
 - `NOT_WRITABLE`: the install folder needs privileges the user doesn't have. Suggest reinstalling
   to a per-user folder instead — `%LOCALAPPDATA%\Programs\neuron` on Windows,
   `~/.local/share/neuron` on Linux.
+- `UNSAFE_STARTUP_TASK` (Windows): an old `HighestAvailable` task still targets a user-writable
+  Neuron app. The updater stops before replacing any files. Replace that task with a Limited task
+  or remove it from an administrator PowerShell, then rerun the updater normally. If it was
+  removed, re-enable start-with-Windows in the new app if the user wants it.
+- `STARTUP_TASK_QUERY_FAILED` (Windows): the updater cannot verify the task's privilege level.
+  Resolve the task query before updating; do not assume a failed query means no task.
 
 The udev rule is the one thing that genuinely needs `sudo`, and the user runs it themselves. It is
 a separate, system-wide step, not part of installing.
@@ -133,12 +145,15 @@ repo instead: `git pull`, rebuild with `cargo build --release`, then restart neu
 Confirm each step with the user first. Don't delete anything they haven't agreed to lose.
 
 1. The user quits neuron from the tray.
-2. If they ever turned on autostart, remove its scheduled task. This needs an administrator
-   terminal:
+2. If they ever turned on autostart, remove its scheduled task from a terminal under the same
+   user account. The historical task name is retained for migration:
 
    ```powershell
    schtasks /delete /tn "Neuron (elevated tray)" /f
    ```
+
+   If an older administrator-created task denies removal, the user may need an administrator
+   terminal for this deletion only. Do not launch the app elevated to work around it.
 
 3. Delete the install folder. **This deletes their config too**, because it lives in the same
    folder. Ask whether they want to keep a copy of the `profiles` folder and `*.toml` files first.
@@ -160,6 +175,11 @@ from the build directory; ask before removing either.
 | `CANNOT_STOP` | neuron is running elevated | same as above |
 | `NOT_WRITABLE` | can't write to the install folder | see **Admin rights** |
 | `TASK_ELSEWHERE` | autostart points at a different neuron folder | ask which install they mean |
+| `UNSAFE_STARTUP_TASK` | an older task can start neuron elevated at sign-in; update stops before copying | see **Admin rights**, then rerun the updater |
+| `STARTUP_TASK_QUERY_FAILED` | the startup task's privilege level could not be read | resolve the task query before updating |
+| `CHROMA_BROKER_OUTDATED` | an installed protected broker differs from the packaged broker | rerun the broker setup in [the host guide](../../docs/PROTOCOL-HOST.md) under the same account |
+| `CHROMA_BROKER_CHECK_FAILED` | the installed broker could not be compared | check the broker installation before claiming native Chroma works |
+| `RELAUNCH_SKIPPED` | the updater is elevated, so relaunch would inherit administrator privileges | start neuron from a normal PowerShell after the update |
 | `SOURCE_BUILD` | developer build | see **Source builds** |
 | `NO_SOURCE_TXT` | not installed from a release zip | fine; version shown is best effort |
 | `ATTESTATION_UNAVAILABLE` | the locally built v0.1.0 and v0.1.1 assets have no provenance attestation | the checksum matched; tell the user build provenance was not verified |
@@ -167,9 +187,12 @@ from the build directory; ask before removing either.
 | `SAME_VERSION` | reinstalling the version already there | fine |
 | `CLI_VERSION_MISMATCH` | `neuron.exe` reports a different version than the release | report it; it may be a packaging mistake |
 | `OLD_BACKUPS` | more than three update backups kept | offer to delete the older ones |
+| `BACKUP_FAILED` | a complete backup could not be created | installation did not start; report the error |
+| `ROLLBACK_FAILED` | recovery could not finish | report it; don't claim the previous release was restored |
+| `ROLLBACK_PRESERVED` | rollback kept a modified or user-owned new path | tell the user which state the updater preserved |
 | `NO_RELEASE_INFO` | GitHub couldn't be reached | check internet; the repo may not be public yet |
 | `ASSETS_MISSING` / `BAD_ZIP` / `BAD_ARCHIVE` | the release is incomplete | report it on the issues page |
-| `COPY_FAILED` / `VERIFY_FAILED` | install went wrong partway; the backup was restored | show the lines |
+| `COPY_FAILED` / `VERIFY_FAILED` | install went wrong partway; recovery was attempted | show the lines and any `ROLLBACK_FAILED` or `ROLLBACK_PRESERVED` flag |
 | `NO_BACKUP` | nothing to roll back to | tell the user |
 | `NO_UDEV_RULE` (Linux) | `/dev/hidraw*` is still root-only | install finished fine, but `neuron list` will find nothing until the user runs the two `sudo` commands from `SOURCE.txt` and replugs the device |
 | `NOT_ON_PATH` (Linux) | the install folder isn't on `PATH` | they'd have to type the full path; offer the symlink line the flag prints |

@@ -146,6 +146,45 @@ function Test-Running($dir) {
     return ((Test-Locked (Join-Path $dir 'neuron-app.exe')) -or (Test-Locked (Join-Path $dir 'neuron.exe')))
 }
 
+function Test-CurrentProcessElevated {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+# An older release registered the user-writable tray executable at HighestAvailable. A normal
+# updater cannot reliably replace that task, so refuse the file update before stopping or copying
+# anything. Its next logon would otherwise launch the new app and RAW macros elevated.
+function Assert-SafeStartupTask {
+    try {
+        $taskDef = Get-ScheduledTask -TaskName $Task -ErrorAction Stop
+    } catch {
+        if ($_.CategoryInfo.Category -eq 'ObjectNotFound') { return }
+        Flag 'STARTUP_TASK_QUERY_FAILED' "cannot verify the Neuron startup task: $($_.Exception.Message)"
+        Finish 'blocked'
+    }
+    if ($taskDef.Principal.RunLevel -ne 'Limited') {
+        Flag 'UNSAFE_STARTUP_TASK' 'the old startup task can run Neuron elevated. Replace it with a Limited task or remove it from an administrator PowerShell before updating; then rerun this updater from a normal PowerShell.'
+        Finish 'needs-admin'
+    }
+}
+
+function Report-ChromaBrokerVersion($dir) {
+    $source = Join-Path $dir 'neuron-chroma-broker.exe'
+    $protected = Join-Path $env:ProgramFiles 'NeuronChromaBroker\neuron-chroma-broker.exe'
+    if (-not (Test-Path -LiteralPath $source -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $protected -PathType Leaf)) { return }
+    try {
+        $sourceHash = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash
+        $protectedHash = (Get-FileHash -LiteralPath $protected -Algorithm SHA256).Hash
+        if ($sourceHash -ine $protectedHash) {
+            Flag 'CHROMA_BROKER_OUTDATED' 'the protected Chroma broker differs from the packaged binary; rerun the one-time broker installer from an administrator PowerShell under the same account'
+        }
+    } catch {
+        Flag 'CHROMA_BROKER_CHECK_FAILED' "could not compare the protected Chroma broker: $($_.Exception.Message)"
+    }
+}
+
 # Stops neuron running from $dir. Returns 'stopped', 'not-running', 'needs-admin' or 'unknown'.
 function Stop-Neuron($dir, $taskDir) {
     $ErrorActionPreference = 'Continue'
@@ -167,14 +206,22 @@ function Stop-Neuron($dir, $taskDir) {
 }
 
 function Start-Neuron($dir, $taskDir) {
-    $ErrorActionPreference = 'Continue'
     if (Same-Dir $taskDir $dir) {
-        schtasks /run /tn $Task 2>$null | Out-Null
-        Say 'relaunched' "via the scheduled task ($Task)"
+        $taskDef = Get-ScheduledTask -TaskName $Task -ErrorAction SilentlyContinue
+        if ($taskDef -and $taskDef.Principal.RunLevel -ne 'Limited') {
+            Flag 'UNSAFE_STARTUP_TASK' 'the existing autostart task can launch Neuron elevated; replace it with a Limited task or remove it before the next sign-in'
+        }
+    }
+    if (Test-CurrentProcessElevated) {
+        Flag 'RELAUNCH_SKIPPED' 'the updater is elevated; start Neuron from a normal PowerShell so it does not inherit administrator privileges'
+        return
+    }
+    if (Same-Dir $taskDir $dir) {
+        Start-Process -FilePath (Join-Path $dir 'neuron-app.exe') -ArgumentList '--tray' -WorkingDirectory $dir
     } else {
         Start-Process -FilePath (Join-Path $dir 'neuron-app.exe') -WorkingDirectory $dir
-        Say 'relaunched' 'neuron-app.exe'
     }
+    Say 'relaunched' 'neuron-app.exe (limited token)'
 }
 
 function Get-Release($tag) {
@@ -232,19 +279,42 @@ if ($installed) {
     }
 }
 
+# The task check must precede rollback and apply: a warning after the files have been replaced
+# cannot prevent the old elevated task from starting the replacement at the next sign-in.
+if ($Action -ne 'check') { Assert-SafeStartupTask }
+
 # ---- rollback ------------------------------------------------------------------------------
 if ($Action -eq 'rollback') {
     $bdir = Join-Path $InstallDir $BackupRoot
-    $latest = Get-ChildItem -Path $bdir -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 1
-    if (-not $latest) { Flag 'NO_BACKUP' "nothing to roll back to in $bdir"; Finish 'blocked' }
-    Say 'restoring' $latest.FullName
+    $backups = @(Get-ChildItem -LiteralPath $bdir -Directory -Force -ErrorAction SilentlyContinue)
+    $datedBackups = foreach ($candidate in $backups) {
+        if ($candidate.Name -match '^.+-(?<stamp>\d{8}-\d{6})$') {
+            $stamp = $Matches['stamp']
+            $created = [datetime]::MinValue
+            $validStamp = [datetime]::TryParseExact(
+                $stamp,
+                'yyyyMMdd-HHmmss',
+                [Globalization.CultureInfo]::InvariantCulture,
+                [Globalization.DateTimeStyles]::None,
+                [ref]$created
+            )
+            if ($validStamp) {
+                [pscustomobject]@{ Path = $candidate.FullName; Timestamp = $created }
+            }
+        }
+    }
+    $latest = @($datedBackups | Sort-Object Timestamp -Descending | Select-Object -First 1)
+    if ($latest.Count -eq 0) { Flag 'NO_BACKUP' "no usable timestamped backup found in $bdir"; Finish 'blocked' }
+    $latest = $latest[0]
+    Say 'restoring' $latest.Path
     if (-not (Test-Writable $InstallDir)) { Flag 'NOT_WRITABLE' 'cannot write to the install folder'; Finish 'needs-admin' }
     $wasRunning = Test-Running $InstallDir
     $stop = Stop-Neuron $InstallDir $taskDir
     if ($stop -eq 'needs-admin') { Flag 'CANNOT_STOP' 'neuron is running and could not be stopped from this shell'; Finish 'needs-admin' }
     if ($stop -eq 'unknown') { Flag 'STOP_UNCONFIRMED' 'a neuron process is still running and its location cannot be read. Ask the user to quit neuron from the tray, then rerun.'; Finish 'blocked' }
-    Copy-Tree $latest.FullName $InstallDir
+    Copy-Tree $latest.Path $InstallDir
     Say 'installed_version' (Get-InstalledVersion $InstallDir)
+    Report-ChromaBrokerVersion $InstallDir
     if ($wasRunning -and -not $NoRelaunch) { Start-Neuron $InstallDir $taskDir }
     Finish 'rolled-back'
 }
@@ -341,7 +411,7 @@ if ($installed -and $current -and $newVersion) {
 
 # ---- install -------------------------------------------------------------------------------
 if (-not (Test-Writable $InstallDir)) {
-    Flag 'NOT_WRITABLE' "cannot write to $InstallDir. Use a per-user folder such as $DefaultDir, or run as administrator."
+    Flag 'NOT_WRITABLE' "cannot write to $InstallDir. Use a per-user folder such as $DefaultDir."
     Finish 'needs-admin'
 }
 
@@ -396,6 +466,7 @@ if ($newVersion -and (Parse-Version $cliOut) -ne (Parse-Version $newVersion)) {
     Flag 'CLI_VERSION_MISMATCH' "neuron.exe reports '$($cliOut.Trim())' but SOURCE.txt says $newVersion"
 }
 
+Report-ChromaBrokerVersion $InstallDir
 if ($wasRunning -and -not $NoRelaunch) { Start-Neuron $InstallDir $taskDir }
 Remove-Item -Path $work -Recurse -Force -ErrorAction SilentlyContinue
 Finish $(if ($installed) { 'updated' } else { 'installed' })

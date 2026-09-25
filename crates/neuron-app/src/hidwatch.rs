@@ -908,7 +908,8 @@ fn decode(
                 // costs a pointer store and puts the value in the flight recorder, so the next
                 // occurrence is evidence in `neuron-crash.log` rather than a bug report from memory.
                 crate::flight::trace("dpi", "device announced dpi", u64::from(dpi));
-                batch_push(pid, Push::Dpi(dpi));
+                let unit = neuron::transport::path_instance(&path.as_os_str().to_string_lossy());
+                batch_push_unit(pid, &unit, Push::Dpi(dpi));
                 // WAKE-RECONCILE, SECOND TRIGGER. The `05 0c` power poke is NOT emitted on every wake:
                 // dpi_trap.log 08:39 (resident app) caught a wake that restored DPI 16000 and announced
                 // it (`05 02 3e 80`) with NO `05 0c` — so the power-event trigger never fired and the
@@ -918,16 +919,16 @@ fn decode(
                 // ATTRIBUTED: the announce also fires for neuron's own writes and for the user's
                 // onboard DPI button, so `maybe_reconcile_announced` heals only a value that
                 // `neuron::dpi_origin` can account for to neither. The decision
-                // to admit this wake is made SYNCHRONOUSLY via the SAME 5s per-pid `reassert_due`
+                // to admit this wake is made SYNCHRONOUSLY via the SAME 5s per-unit `reassert_due`
                 // debounce the `05 0c` hook uses: whichever trigger sees a given wake FIRST stamps the
                 // window and the other bows out, so one wake never double-fires a reconcile. A trigger
                 // that then declines hands the window back (`reassert_release`). The work itself rides
                 // an off-thread worker — the classification reads host state, and a reconcile is
                 // control-pipe round-trips that must never block this reader.
-                if reassert_due(pid) {
+                if reassert_due(pid, &unit) {
                     let announced = dpi as u16;
                     crate::worker::spawn_detached("neuron-hidwatch-dpi", move || {
-                        maybe_reconcile_announced(pid, announced);
+                        maybe_reconcile_announced(pid, &unit, announced);
                     });
                 }
             }
@@ -936,7 +937,8 @@ fn decode(
         0x3a => {
             let stage = u32::from(buf[2]);
             if (1..=SCROLL_STAGE_MAX).contains(&stage) {
-                batch_push(pid, Push::Scroll(stage));
+                let unit = neuron::transport::path_instance(&path.as_os_str().to_string_lossy());
+                batch_push_unit(pid, &unit, Push::Scroll(stage));
             }
         }
         // Power/charge poke — STATELESS. Settle the charge state (poll until it latches) then observe
@@ -964,8 +966,9 @@ fn decode(
         // announce path judges the announced DPI alone, so the belt is what covers the 2026-07-23
         // factory-table shape.
         0x0c => {
-            note_wake(pid);
-            let reassert = reassert_due(pid);
+            let unit = neuron::transport::path_instance(&path.as_os_str().to_string_lossy());
+            note_wake(pid, &unit);
+            let reassert = reassert_due(pid, &unit);
             crate::worker::spawn_detached("neuron-hidwatch-charge", move || {
                 if let Some((b, c)) = settle_charge(pid) { neuron::vitals::observe(pid, b, c, true) } else {
                     neuron::vitals::mark_stale(pid);
@@ -974,7 +977,7 @@ fn decode(
                     }
                 }
                 if reassert {
-                    maybe_reassert(pid);
+                    maybe_reassert(pid, &unit);
                 }
             });
         }
@@ -992,7 +995,8 @@ fn decode(
             }
             // Only the SETTLED value reaches `confirm`, and only if the batch isn't a wake-sync burst —
             // the bounce + the burst are both absorbed in the batcher, keeping `confirm` pure.
-            batch_push(pid, Push::Plate(id, label));
+            let unit = neuron::transport::path_instance(&path.as_os_str().to_string_lossy());
+            batch_push_unit(pid, &unit, Push::Plate(id, label));
             // SEAM (next phase): a plate change could also drive a per-plate PROFILE auto-switch.
             // Wire it here, off this same de-dup'd edge, so a swap both cards AND switches in one place.
         }
@@ -1185,8 +1189,8 @@ struct BatchState {
 }
 
 /// The per-pid pending batches, lazily created (a `HashMap` can't initialize a `const` static).
-fn batches() -> &'static Mutex<HashMap<u16, BatchState>> {
-    static B: OnceLock<Mutex<HashMap<u16, BatchState>>> = OnceLock::new();
+fn batches() -> &'static Mutex<HashMap<(u16, String), BatchState>> {
+    static B: OnceLock<Mutex<HashMap<(u16, String), BatchState>>> = OnceLock::new();
     B.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -1201,20 +1205,31 @@ static PENDING_FLUSHES: AtomicUsize = AtomicUsize::new(0);
 /// VALUE but keep the FIRST-seen instant — so a seating bounce or a rapid DPI re-press stays one kind
 /// at one moment, never a fake "burst". Every push bumps THAT device's generation so only its final
 /// flush acts; a sibling device's batch and generation are untouched.
+#[cfg(test)]
 fn batch_push(pid: u16, ev: Push) {
     batch_push_at(pid, ev, Instant::now());
 }
 
-/// [`batch_push`] with the report's arrival instant passed in rather than read off the wall clock.
+fn batch_push_unit(pid: u16, unit: &str, ev: Push) {
+    batch_push_at_unit(pid, unit, ev, Instant::now());
+}
+
+/// The test seam takes the report's arrival instant rather than reading the wall clock.
 /// The instant is what the SYNC TEST in [`flush_batch`] measures, so taking it as a parameter is the
 /// seam that lets a test stamp a burst deterministically — a loaded test runner can preempt the
 /// pushing thread for longer than [`BURST_SPAN`] between calls, which would misfile a stamped-live
 /// burst as lone user actions.
+#[cfg(test)]
 fn batch_push_at(pid: u16, ev: Push, now: Instant) {
+    batch_push_at_unit(pid, "", ev, now);
+}
+
+fn batch_push_at_unit(pid: u16, unit: &str, ev: Push, now: Instant) {
     let my_gen = {
         let mut map = batches().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let key = (pid, unit.to_owned());
         let st = map
-            .entry(pid)
+            .entry(key)
             .or_insert_with(|| BatchState { batch: Batch::EMPTY, generation: 0 });
         match ev {
             Push::Dpi(v) => {
@@ -1234,6 +1249,7 @@ fn batch_push_at(pid: u16, ev: Push, now: Instant) {
         st.generation
     };
     PENDING_FLUSHES.fetch_add(1, Ordering::SeqCst);
+    let unit = unit.to_owned();
     crate::worker::spawn_detached("neuron-hidwatch-batch", move || {
         // decrement on EVERY exit path (bow-out, missing pid, panic) — a leaked count would wedge
         // the tests' quiescence wait forever.
@@ -1249,7 +1265,7 @@ fn batch_push_at(pid: u16, ev: Push, now: Instant) {
         // push for THIS pid bumped its generation, a later flush owns the batch — this one bows out.
         let batch = {
             let mut map = batches().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let Some(st) = map.get_mut(&pid) else {
+            let Some(st) = map.get_mut(&(pid, unit.clone())) else {
                 return;
             };
             if st.generation != my_gen {
@@ -1257,7 +1273,7 @@ fn batch_push_at(pid: u16, ev: Push, now: Instant) {
             }
             std::mem::replace(&mut st.batch, Batch::EMPTY)
         };
-        flush_batch(pid, batch);
+        flush_batch(pid, &unit, batch);
     });
 }
 
@@ -1266,7 +1282,7 @@ fn batch_push_at(pid: u16, ev: Push, now: Instant) {
 /// fast) → learn every value SILENTLY. Otherwise each present kind is a real user action → `observe_*`
 /// it (which still de-dups and cards on a genuine change). A DETACHED plate (id 0) is the "no plate"
 /// beat of a swap, never a state worth announcing, so it never counts toward the burst.
-fn flush_batch(pid: u16, b: Batch) {
+fn flush_batch(pid: u16, unit: &str, b: Batch) {
     let mut firsts: Vec<Instant> = Vec::new();
     if let Some((t, _)) = b.dpi {
         firsts.push(t);
@@ -1285,7 +1301,11 @@ fn flush_batch(pid: u16, b: Batch) {
 
     if is_sync {
         if let Some((_, v)) = b.dpi {
-            neuron::confirm::prime_dpi(pid, v);
+            if unit.is_empty() {
+                neuron::confirm::prime_dpi(pid, v);
+            } else {
+                neuron::confirm::prime_dpi_unit(pid, unit, v);
+            }
             // A wake sync is silent as a NOTIFICATION, never as a fact: the view must still show
             // what the device came back holding.
             crate::glue::post_observation(pid, crate::glue::Observed::Dpi(v));
@@ -1303,7 +1323,11 @@ fn flush_batch(pid: u16, b: Batch) {
         }
     } else {
         if let Some((_, v)) = b.dpi {
-            neuron::confirm::observe_dpi(pid, v);
+            if unit.is_empty() {
+                neuron::confirm::observe_dpi(pid, v);
+            } else {
+                neuron::confirm::observe_dpi_unit(pid, unit, v);
+            }
             crate::glue::post_observation(pid, crate::glue::Observed::Dpi(v));
         }
         if let Some((_, v)) = b.scroll {
@@ -1381,9 +1405,10 @@ pub fn startup_reassert() {
     crate::worker::spawn_detached("neuron-feel-reassert", || {
         let Some(reg) = registry() else { return };
         let Ok(infos) = neuron::transport::enumerate() else { return };
-        let mut seen: HashSet<u16> = HashSet::new();
+        let mut seen: HashSet<(u16, String)> = HashSet::new();
         for i in &infos {
-            if !seen.insert(i.pid) {
+            let unit = i.instance();
+            if !seen.insert((i.pid, unit.clone())) {
                 continue;
             }
             // only devices the user configured through neuron, and only the razer custody family
@@ -1398,10 +1423,10 @@ pub fn startup_reassert() {
             if !is_razer {
                 continue;
             }
-            if !reassert_due(i.pid) {
-                continue; // a wake burst already armed one for this pid
+            if !reassert_due(i.pid, &unit) {
+                continue; // a wake burst already armed one for this unit
             }
-            if let Some(d) = open_device(i.pid) {
+            if let Some(d) = open_device_for_unit(i.pid, &unit) {
                 reconcile_now(i.pid, &d);
             }
         }
@@ -1414,6 +1439,28 @@ fn open_device(pid: u16) -> Option<neuron::device::Device> {
     neuron::device::Device::open(def.clone(), pid).ok()
 }
 
+/// Open the control pipe belonging to one physical unit, even when another connected unit shares
+/// its VID/PID. Event-triggered reconciliation must act on the device that emitted the report.
+fn open_device_for_unit(pid: u16, unit: &str) -> Option<neuron::device::Device> {
+    let reg = registry()?;
+    let infos = neuron::transport::enumerate().ok()?;
+    for info in infos {
+        if info.pid != pid || info.instance() != unit {
+            continue;
+        }
+        // This worker only performs the Razer varstore reconcile. Filter by family before choosing
+        // a same-PID definition, then by that family's control-pipe predicate; enumeration order
+        // must not route a DPI event through a different protocol family.
+        if let Some(def) = reg
+            .defs_for_pid(info.vid, info.pid)
+            .find(|def| def.dialect == "razer" && def.matches_control(&info))
+        {
+            return neuron::device::Device::open_path(def.clone(), pid, &info.path).ok();
+        }
+    }
+    None
+}
+
 /// WAKE-RECONCILE debounce, SHARED across BOTH wake triggers. The `05 0c` power/wake family fires
 /// SEVERAL events per wake burst, and the `05 02` DPI-announce fires on the same wake too; without a
 /// shared window each would queue its own reconcile (redundant control-pipe traffic against a
@@ -1422,45 +1469,46 @@ fn open_device(pid: u16) -> Option<neuron::device::Device> {
 /// first.
 const REASSERT_DEBOUNCE: Duration = Duration::from_secs(5);
 
-/// Per-pid last-reassert stamps (lazily created — a `HashMap` can't init a `const` static).
-fn reassert_stamps() -> &'static Mutex<HashMap<u16, Instant>> {
-    static S: OnceLock<Mutex<HashMap<u16, Instant>>> = OnceLock::new();
+/// Per-unit last-reassert stamps (lazily created — a `HashMap` can't init a `const` static).
+fn reassert_stamps() -> &'static Mutex<HashMap<(u16, String), Instant>> {
+    static S: OnceLock<Mutex<HashMap<(u16, String), Instant>>> = OnceLock::new();
     S.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Should `pid` reassert now? True (and stamps the moment) only when the debounce window has elapsed
-/// since the last reassert — so a wake BURST arms exactly one. Decided synchronously on the listener
-/// thread so the burst is collapsed before any worker spawns.
-fn reassert_due(pid: u16) -> bool {
+/// Should this physical unit reassert now? True (and stamps the moment) only when the debounce
+/// window has elapsed since the last reassert — so a wake BURST arms exactly one. Decided
+/// synchronously on the listener thread so the burst is collapsed before any worker spawns.
+fn reassert_due(pid: u16, unit: &str) -> bool {
     let mut map = reassert_stamps().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let now = Instant::now();
-    match map.get(&pid) {
+    let key = (pid, unit.to_owned());
+    match map.get(&key) {
         Some(&last) if now.duration_since(last) < REASSERT_DEBOUNCE => false,
         _ => {
-            map.insert(pid, now);
+            map.insert(key, now);
             true
         }
     }
 }
 
-/// Per-pid moment of the last `05 0c` power poke — the one unambiguous "this device just woke"
+/// Per-unit moment of the last `05 0c` power poke — the one unambiguous "this device just woke"
 /// signal the firmware gives us.
-fn wake_stamps() -> &'static Mutex<HashMap<u16, Instant>> {
-    static W: OnceLock<Mutex<HashMap<u16, Instant>>> = OnceLock::new();
+fn wake_stamps() -> &'static Mutex<HashMap<(u16, String), Instant>> {
+    static W: OnceLock<Mutex<HashMap<(u16, String), Instant>>> = OnceLock::new();
     W.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Note that `pid` just announced a power event.
-fn note_wake(pid: u16) {
+fn note_wake(pid: u16, unit: &str) {
     let mut map = wake_stamps().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    map.insert(pid, Instant::now());
+    map.insert((pid, unit.to_owned()), Instant::now());
 }
 
 /// Did `pid` wake within the last [`WAKE_CONTEXT`]? Used only to decide whether an announce neuron
 /// cannot attribute is more likely the user's hand or the firmware reloading state.
-fn recent_wake(pid: u16) -> bool {
+fn recent_wake(pid: u16, unit: &str) -> bool {
     let map = wake_stamps().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    map.get(&pid).is_some_and(|t| t.elapsed() < WAKE_CONTEXT)
+    map.get(&(pid, unit.to_owned())).is_some_and(|t| t.elapsed() < WAKE_CONTEXT)
 }
 
 /// How long after a power poke an unattributable DPI announce is read as part of the wake rather
@@ -1477,9 +1525,9 @@ const WAKE_CONTEXT: Duration = Duration::from_secs(10);
 /// and until this existed a declining announce still burned the window — silencing the unconditional
 /// `05 0c` belt for the next five seconds. Whoever decides NOT to heal releases, so the claim tracks
 /// reconciles actually run rather than glances taken.
-fn reassert_release(pid: u16) {
+fn reassert_release(pid: u16, unit: &str) {
     let mut map = reassert_stamps().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    map.remove(&pid);
+    map.remove(&(pid, unit.to_owned()));
 }
 
 /// Reconcile `pid`'s volatile DPI plane with its persisted truth after a wake — the Synapse duty
@@ -1493,14 +1541,14 @@ fn reassert_release(pid: u16) {
 /// Logs the outcome (a rare, debounced device-integrity event earns a line even without
 /// `NEURON_HIDWATCH`; the read/verify inside the write is the safety net so a failure is honest, never a
 /// silent corruption).
-fn maybe_reassert(pid: u16) {
-    let Some(d) = open_device(pid) else {
+fn maybe_reassert(pid: u16, unit: &str) {
+    let Some(d) = open_device_for_unit(pid, unit) else {
         return;
     };
     // FAMILY GATE (still correct): the wake-reconcile duty is part of RAZER's custody contract — the
-    // varstore getters it reads are razer-framed (DPI class 0x04). `open_device` resolves ANY family's
-    // def by pid, so on a non-razer def those getters would emit a validly-framed HID++ message with
-    // garbage meaning at that hardware. Bail before any read on anything that isn't razer. (The old
+    // varstore getters it reads are razer-framed (DPI class 0x04). A non-razer def would send those
+    // getters as a validly-framed HID++ message with garbage meaning at that hardware. Bail before
+    // any read on anything that isn't razer. (The old
     // driver-mode gate that sat here is GONE — the trap proved a normal-mode wake corrupts volatile
     // state too, so the reconcile runs mode-independently and leans on its own disagreement gate.)
     if d.def.dialect != "razer" {
@@ -1527,28 +1575,28 @@ fn maybe_reassert(pid: u16) {
 ///     the DPI button does not.
 ///
 /// Same `dialect != "razer"` family gate as [`maybe_reassert`]: the varstore getters the reconcile
-/// reads are razer-framed, so bail before any read on a non-razer def `open_device` resolved by pid.
-fn maybe_reconcile_announced(pid: u16, announced: u16) {
+/// reads are razer-framed, so bail before any read on a non-razer def resolved for this unit.
+fn maybe_reconcile_announced(pid: u16, unit: &str, announced: u16) {
     use neuron::dpi_origin::Origin;
     // Classified BEFORE opening the device: the answer is host-side, and a device that has gone back
     // to sleep must not turn "this was our own write" into an open failure.
-    let origin = neuron::dpi_origin::classify(pid, announced);
+    let origin = neuron::dpi_origin::classify(pid, unit, announced);
     if origin != Origin::Foreign {
         // Release the window: this glance ran no reconcile, and the `05 0c` belt may still have a
         // real claim on the same wake.
-        reassert_release(pid);
+        reassert_release(pid, unit);
         crate::flight::trace("dpi", "announce accounted for; not healed", u64::from(announced));
         if verbose() {
             eprintln!("[hidwatch] pid={pid:04x}: DPI announce {announced} is {origin:?}; no reconcile");
         }
         return;
     }
-    let Some(d) = open_device(pid) else {
-        reassert_release(pid);
+    let Some(d) = open_device_for_unit(pid, unit) else {
+        reassert_release(pid, unit);
         return;
     };
     if d.def.dialect != "razer" {
-        reassert_release(pid);
+        reassert_release(pid, unit);
         return;
     }
     // THE CUSTODY GATE, and the reason provenance alone is not enough here. Attribution can only
@@ -1569,8 +1617,8 @@ fn maybe_reconcile_announced(pid: u16, announced: u16) {
     // triggered, so neither can be provoked by a press.
     let mode = neuron::writes::device_mode(&d);
     if mode != Some(0x03) {
-        reassert_release(pid);
-        adopt_unattributable(pid, announced);
+        reassert_release(pid, unit);
+        adopt_unattributable(pid, unit, announced);
         crate::flight::trace(
             "dpi",
             "announce foreign but the button is not ours to attribute",
@@ -1607,14 +1655,14 @@ fn maybe_reconcile_announced(pid: u16, announced: u16) {
 ///
 /// Records only the active DPI, never the stage table: the table is the user's configuration and a
 /// press does not edit it.
-fn adopt_unattributable(pid: u16, announced: u16) {
+fn adopt_unattributable(pid: u16, unit: &str, announced: u16) {
     let Some(intent) = neuron::feel_intent::get(pid) else {
         return; // nothing configured, so nothing to keep coherent
     };
     if !intent.stages.contains(&announced) {
         return;
     }
-    if recent_wake(pid) {
+    if recent_wake(pid, unit) {
         crate::flight::trace("dpi", "not adopted: arrived with a wake", u64::from(announced));
         return;
     }
@@ -1692,19 +1740,20 @@ mod tests {
     #[test]
     fn a_wake_is_only_recent_for_as_long_as_the_window_says() {
         const PID: u16 = 0xFE02; // a pid no other test drives
-        assert!(!recent_wake(PID), "a device that never woke must not look freshly woken");
-        note_wake(PID);
-        assert!(recent_wake(PID), "a poke just seen is wake context");
+        const UNIT: &str = "wake-test-unit";
+        assert!(!recent_wake(PID, UNIT), "a device that never woke must not look freshly woken");
+        note_wake(PID, UNIT);
+        assert!(recent_wake(PID, UNIT), "a poke just seen is wake context");
         // Stamp it far enough back that the window has certainly closed, without sleeping.
         {
             let mut map = wake_stamps().lock().unwrap();
-            map.insert(PID, neuron::timing::ago(WAKE_CONTEXT + Duration::from_secs(1)));
+            map.insert((PID, UNIT.into()), neuron::timing::ago(WAKE_CONTEXT + Duration::from_secs(1)));
         }
         assert!(
-            !recent_wake(PID),
+            !recent_wake(PID, UNIT),
             "past the window an unattributable announce is a person, not a restore"
         );
-        wake_stamps().lock().unwrap().remove(&PID);
+        wake_stamps().lock().unwrap().remove(&(PID, UNIT.into()));
     }
 
     /// A trigger that looks and declines must leave the window for one that would actually heal.
@@ -1712,19 +1761,72 @@ mod tests {
     fn releasing_the_debounce_hands_the_wake_back_to_the_other_triggers() {
         // A pid no other test drives, so the process-global stamp map can't be raced.
         const PID: u16 = 0xFE01;
-        reassert_release(PID);
-        assert!(reassert_due(PID), "a fresh pid's first claim must be admitted");
+        const UNIT: &str = "debounce-test-unit";
+        reassert_release(PID, UNIT);
+        assert!(reassert_due(PID, UNIT), "a fresh unit's first claim must be admitted");
         assert!(
-            !reassert_due(PID),
+            !reassert_due(PID, UNIT),
             "the debounce still has to collapse a burst into one claim"
         );
         // The announce path's decline: it glanced, healed nothing, and gives the window back.
-        reassert_release(PID);
+        reassert_release(PID, UNIT);
         assert!(
-            reassert_due(PID),
+            reassert_due(PID, UNIT),
             "after a release the 05 0c belt must still be able to claim this wake"
         );
-        reassert_release(PID);
+        reassert_release(PID, UNIT);
+    }
+
+    #[test]
+    fn same_pid_units_have_independent_wake_debounce() {
+        const PID: u16 = 0xFE03;
+        const UNIT_A: &str = "same-pid-unit-a";
+        const UNIT_B: &str = "same-pid-unit-b";
+        reassert_release(PID, UNIT_A);
+        reassert_release(PID, UNIT_B);
+        assert!(reassert_due(PID, UNIT_A));
+        assert!(!reassert_due(PID, UNIT_A), "a unit's burst is collapsed");
+        assert!(reassert_due(PID, UNIT_B), "another same-PID unit gets its own claim");
+        reassert_release(PID, UNIT_A);
+        reassert_release(PID, UNIT_B);
+    }
+
+    #[test]
+    fn event_reconcile_opens_the_matching_same_pid_unit() {
+        use neuron::transport::{install_backend, mock::{MockBackend, MockDevice}};
+
+        let _serial = neuron::transport::mock::test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _backend = neuron::transport::deny_hardware();
+        let mut backend = MockBackend::new();
+        let path_a = DevicePath::from_str_for_tests("\\\\?\\hid#vid_1532&pid_00a8&mi_02#unit-a");
+        let path_b = DevicePath::from_str_for_tests("\\\\?\\hid#vid_1532&pid_00a8&mi_02#unit-b");
+        let mut a = MockDevice::razer(NAGA_PID, "Naga A");
+        a.info.path = path_a.clone();
+        // The curated Naga control pipe is Generic Desktop / Mouse (1/2), not the generic vendor
+        // usage used by MockDevice::razer's default shape.
+        a.info.usage_page = 0x0001;
+        a.info.usage = 0x0002;
+        let mut b = MockDevice::razer(NAGA_PID, "Naga B");
+        b.info.path = path_b.clone();
+        b.info.usage_page = 0x0001;
+        b.info.usage = 0x0002;
+        backend.with(a);
+        backend.with(b);
+        let _installed = install_backend(Arc::new(backend));
+
+        let unit_b = neuron::transport::path_instance(&path_b.as_os_str().to_string_lossy());
+        let opened = open_device_for_unit(NAGA_PID, &unit_b)
+            .expect("the requested same-PID unit should resolve through its own control pipe");
+        assert_eq!(
+            opened.dpi_unit, unit_b,
+            "the event worker must not open the first enumerated same-PID device"
+        );
+        assert_ne!(
+            opened.dpi_unit,
+            neuron::transport::path_instance(&path_a.as_os_str().to_string_lossy())
+        );
     }
 
     /// Deferred-button classification: plate keys become bindable macro-page hits, the cycle
@@ -2100,7 +2202,7 @@ mod tests {
                         // "plug": the arm-time capability learn + a device-pushed settings report,
                         // alternating kind so DPI/scroll/plate each get real traffic across the run.
                         note_audio_capability(fam, &product);
-                        reassert_due(pid);
+                        reassert_due(pid, &format!("hotplug-unit-{t}"));
                         match i % 3 {
                             0 => batch_push(pid, Push::Dpi(800 + (i as u32 % 100))),
                             1 => batch_push(pid, Push::Scroll(1 + (i as u32 % SCROLL_STAGE_MAX))),
@@ -2130,7 +2232,7 @@ mod tests {
             for t in 0..THREADS {
                 let pid = if t % 2 == 0 { SHARED_PID } else { 0xE100 + t };
                 let st = map
-                    .get(&pid)
+                    .get(&(pid, String::new()))
                     .unwrap_or_else(|| panic!("pid {pid:#06x} lost its batch entry"));
                 assert!(
                     st.batch.dpi.is_none() && st.batch.scroll.is_none() && st.batch.plate.is_none(),
@@ -2147,10 +2249,9 @@ mod tests {
         // one (contention on the shared pid losing a write outright).
         {
             let map = reassert_stamps().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            assert!(map.contains_key(&SHARED_PID), "the shared pid must have a reassert stamp");
-            for t in (1..THREADS).step_by(2) {
-                let pid = 0xE100 + t;
-                assert!(map.contains_key(&pid), "distinct pid {pid:#06x} must have a reassert stamp");
+            for t in 0..THREADS {
+                let pid = if t % 2 == 0 { SHARED_PID } else { 0xE100 + t };
+                assert!(map.contains_key(&(pid, format!("hotplug-unit-{t}"))), "unit {pid:#06x}/{t} must have a reassert stamp");
             }
         }
 
@@ -2176,8 +2277,9 @@ mod tests {
         // behind corrupts or wedges a later, unrelated arm. Mirrors the existing single-threaded
         // `lone_plate_report_settles_and_reaches_confirm` expectation, computed the same way.
         const FRESH_PID: u16 = 0xE999;
+        const FRESH_UNIT: &str = "fresh-unit";
         assert!(
-            reassert_due(FRESH_PID),
+            reassert_due(FRESH_PID, FRESH_UNIT),
             "a pid never seen before (burst or not) must reassert on its first wake"
         );
         batch_push(FRESH_PID, Push::Plate(2, "clean-plate".into()));

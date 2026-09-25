@@ -119,7 +119,9 @@ impl Store {
 /// it also writes [`crate::feel_intent`], the record every wake reassert heals from. Both live here
 /// rather than at the call sites so that adding a new way to change DPI cannot skip either one —
 /// the reconcile's correctness depends on every writer declaring itself, which is the type system's
-/// job now rather than a convention six call sites had to remember.
+/// job now rather than a convention six call sites had to remember. The matching `dpi` getter is
+/// read from the same varstore plane after the SET; an ACK without matching bytes fails and rolls
+/// back the provisional provenance and durable intent.
 pub fn set_dpi(dev: &Device, x: u16, y: u16, store: Store, cause: crate::dpi_origin::Cause) -> Result<()> {
     // Both provenance channels are claimed BEFORE the write, and rolled back if it is refused.
     //
@@ -129,7 +131,7 @@ pub fn set_dpi(dev: &Device, x: u16, y: u16, store: Store, cause: crate::dpi_ori
     // hold across processes: a `neuron dpi 800` in a terminal is observed by the resident tray only
     // as a device announce, and the record is the sole thing that tells the tray a human asked for
     // it. Recorded after the write instead, the tray could read the old value and undo the command.
-    let prev_stamp = crate::dpi_origin::expect(dev.pid, x, cause);
+    let prev_stamp = crate::dpi_origin::expect(dev.pid, &dev.dpi_unit, x, cause);
     let prev_intent = cause.is_durable().then(|| {
         let snap = crate::feel_intent::snapshot(dev.pid);
         // A failed record is swallowed, never propagated as a failed write: the device half still
@@ -147,8 +149,33 @@ pub fn set_dpi(dev: &Device, x: u16, y: u16, store: Store, cause: crate::dpi_ori
         0x00,
         0x00,
     ];
-    if let Err(e) = dev.run_args("set_dpi", &args) {
-        crate::dpi_origin::rollback(dev.pid, prev_stamp);
+    let landed = (|| -> Result<()> {
+        dev.run_args("set_dpi", &args)?;
+        // `dpi` is store-aware; select the same plane this SET addressed. This is the same
+        // varstore argument used by the existing DPI reconcile read-back path.
+        let reply = dev.run_args("dpi", &[store.byte()])?;
+        if reply[0] != store.byte() {
+            anyhow::bail!(
+                "VERIFY FAILED on DPI: requested {:?} plane but device reports varstore {:#04x} — write NOT trusted",
+                store,
+                reply[0]
+            );
+        }
+        let got = (
+            (u16::from(reply[1]) << 8) | u16::from(reply[2]),
+            (u16::from(reply[3]) << 8) | u16::from(reply[4]),
+        );
+        if got != (x, y) {
+            anyhow::bail!(
+                "VERIFY FAILED on DPI: wrote {x} x {y} but device reports {} x {} — write NOT trusted",
+                got.0,
+                got.1
+            );
+        }
+        Ok(())
+    })();
+    if let Err(e) = landed {
+        crate::dpi_origin::rollback(dev.pid, &dev.dpi_unit, prev_stamp);
         if let Some(snap) = prev_intent {
             let _ = crate::feel_intent::restore(dev.pid, snap);
         }
@@ -164,7 +191,8 @@ pub fn polling_rate_hz(dev: &Device) -> Result<u32> {
     Ok(1000u32.checked_div(div).unwrap_or(0))
 }
 
-/// Set polling rate in Hz (snaps to the nearest supported 1000/500/250/125).
+/// Set polling rate in Hz (snaps to the nearest supported 1000/500/250/125) and verify the matching
+/// divisor getter before returning the selected rate.
 pub fn set_polling_hz(dev: &Device, hz: u32) -> Result<u32> {
     let div: u8 = match hz {
         h if h >= 1000 => 1,
@@ -173,7 +201,14 @@ pub fn set_polling_hz(dev: &Device, hz: u32) -> Result<u32> {
         _ => 8,
     };
     dev.run_args("set_polling", &[div])?;
-    Ok(1000 / u32::from(div))
+    let expected = 1000 / u32::from(div);
+    let got = polling_rate_hz(dev)?;
+    if got != expected {
+        anyhow::bail!(
+            "VERIFY FAILED on polling rate: wrote {expected} Hz but device reports {got} Hz — write NOT trusted"
+        );
+    }
+    Ok(expected)
 }
 
 /// Map a target Hz to the hi-res polling code (`OpenRazer` polling2: 0x01=8000 … 0x40=125Hz).
@@ -217,8 +252,19 @@ pub fn polling_rate_hz_hires(dev: &Device) -> Option<u32> {
 /// devices that have a `HyperPolling` path. Returns the Hz actually selected.
 pub fn set_polling_hz_hires(dev: &Device, hz: u32) -> Result<u32> {
     let code = polling2_code(hz);
-    dev.run_args("set_polling2", &[0x00, code])?;
-    Ok(polling2_code_to_hz(code))
+    // Keep the direct capability surface on the same explicitly gated, verified path used by the
+    // in-game polling writer; this opcode has not been hardware-confirmed on the shipped dongle.
+    crate::writes::set_in_game_polling(dev, hz, hz)?;
+    let expected = polling2_code_to_hz(code);
+    let got = polling_rate_hz_hires(dev).ok_or_else(|| {
+        anyhow::anyhow!("VERIFY FAILED on hi-res polling rate: matching getter is unavailable")
+    })?;
+    if got != expected {
+        anyhow::bail!(
+            "VERIFY FAILED on hi-res polling rate: wrote {expected} Hz but device reports {got} Hz — write NOT trusted"
+        );
+    }
+    Ok(expected)
 }
 
 /// Set lighting brightness as a 0..=100 percentage (visible LED region).
@@ -235,28 +281,52 @@ pub fn set_polling_hz_hires(dev: &Device, hz: u32) -> Result<u32> {
 /// layout, e.g. the `BlackWidow`'s `args = [0x01, 0x05]`); `store` is deliberately NOT spliced into
 /// that legacy prefix, because a volatile-varstore legacy brightness write is an unproven byte
 /// combination this write path refuses to invent (verify-gated culture: no unproven bytes on the
-/// wire).
+/// wire). The top-level path verifies the matching brightness getter on the same plane. Legacy
+/// devices without a getter stay gated behind `NEURON_BRIGHTNESS_WRITE=1`.
 pub fn set_brightness(dev: &Device, pct: u8, store: Store) -> Result<()> {
     let level = (u16::from(pct.min(100)) * 255 / 100) as u8;
+    // Legacy brightness specs have no paired getter. Keep that write explicitly opt-in until the
+    // device can verify its own bytes; an ACK alone is not evidence that the LED changed.
+    if !dev.def.has_command("brightness") && !brightness_write_enabled() {
+        anyhow::bail!(
+            "brightness write on '{}' has no read-back getter and is gated; set NEURON_BRIGHTNESS_WRITE=1 to opt in to the unverified legacy path",
+            dev.def.name
+        );
+    }
     if dev.def.has_command("set_brightness") {
         dev.run_args("set_brightness", &[store.byte(), 0x04, level])?;
-        return Ok(());
+    } else {
+        let Some(spec) = dev.def.lighting.as_ref().and_then(|l| l.brightness.as_ref()) else {
+            anyhow::bail!("device '{}' has no brightness write path", dev.def.name);
+        };
+        // The spec's args are the full dialect prefix; only the level is appended.
+        let mut args = spec.args.clone();
+        args.push(level);
+        dev.exec_dynamic_tx(
+            spec.transaction_id.unwrap_or(dev.def.transaction_id),
+            spec.class,
+            spec.id,
+            spec.size,
+            &args,
+        )?;
     }
-    let Some(spec) = dev.def.lighting.as_ref().and_then(|l| l.brightness.as_ref()) else {
-        anyhow::bail!("device '{}' has no brightness write path", dev.def.name);
-    };
-    // the spec's args are the full dialect prefix (e.g. legacy [0x01 varstore, 0x05 led]);
-    // only the level is appended — the registry data owns the layout, not this code.
-    let mut args = spec.args.clone();
-    args.push(level);
-    dev.exec_dynamic_tx(
-        spec.transaction_id.unwrap_or(dev.def.transaction_id),
-        spec.class,
-        spec.id,
-        spec.size,
-        &args,
-    )?;
+    if dev.def.has_command("brightness") {
+        let got = dev.run_args("brightness", &[store.byte(), 0x04])?;
+        if got[0] != store.byte() || got[1] != 0x04 || got[2] != level {
+            anyhow::bail!(
+                "VERIFY FAILED on brightness: wrote varstore {:#04x}, region 0x04, level {level} but device reports varstore {:#04x}, region {:#04x}, level {:#04x} — write NOT trusted",
+                store.byte(),
+                got[0],
+                got[1],
+                got[2]
+            );
+        }
+    }
     Ok(())
+}
+
+fn brightness_write_enabled() -> bool {
+    std::env::var("NEURON_BRIGHTNESS_WRITE").is_ok_and(|v| v == "1")
 }
 
 /// Lighting brightness as a percentage. Response arg[2] is raw 0..255 (Synapse shows %).
@@ -341,6 +411,108 @@ fn decode_idle_secs(reply: &[u8]) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn naga_device(pid: u16, phantom: crate::transport::mock::MockDevice) -> Device {
+        let def = toml::from_str(include_str!("../devices/razer-naga-v2-pro.toml"))
+            .expect("the curated Naga definition parses");
+        let phantom = std::sync::Arc::new(phantom);
+        Device::with_transport(def, pid, Box::new(phantom.handle()))
+    }
+
+    #[test]
+    fn dpi_polling_and_brightness_setters_verify_matching_getters() {
+        use crate::transport::mock::MockDevice;
+
+        let pid = 0xFDC1;
+        let phantom = MockDevice::razer(pid, "phantom naga")
+            .answering(0x04, 0x05, &[])
+            .answering(0x04, 0x85, &[0, 0x03, 0x20, 0x03, 0x20])
+            .answering(0x00, 0x05, &[])
+            .answering(0x00, 0x85, &[2])
+            .answering(0x0F, 0x04, &[])
+            .answering(0x0F, 0x84, &[1, 0x04, 127]);
+        let d = naga_device(pid, phantom);
+
+        set_dpi(&d, 800, 800, Store::Volatile, crate::dpi_origin::Cause::Momentary)
+            .expect("DPI must succeed only when the matching getter confirms it");
+        assert_eq!(set_polling_hz(&d, 500).unwrap(), 500);
+        set_brightness(&d, 50, Store::Persist)
+            .expect("brightness must succeed only when the matching getter confirms it");
+    }
+
+    #[test]
+    fn acknowledged_but_mismatched_writes_fail_verification() {
+        use crate::transport::mock::MockDevice;
+
+        let pid = 0xFDC2;
+        let phantom = MockDevice::razer(pid, "phantom naga")
+            .answering(0x04, 0x05, &[])
+            .answering(0x04, 0x85, &[0, 0x06, 0x40, 0x06, 0x40])
+            .answering(0x00, 0x05, &[])
+            .answering(0x00, 0x85, &[4])
+            .answering(0x0F, 0x04, &[])
+            .answering(0x0F, 0x84, &[1, 0x04, 0]);
+        let d = naga_device(pid, phantom);
+        let cause = crate::dpi_origin::Cause::Momentary;
+        let _ = crate::dpi_origin::expect(pid, &d.dpi_unit, 1600, cause);
+
+        let err = set_dpi(&d, 800, 800, Store::Volatile, cause)
+            .expect_err("an ACK without the requested DPI read-back must fail");
+        assert!(err.to_string().contains("VERIFY FAILED on DPI"));
+        assert_ne!(
+            crate::dpi_origin::classify(pid, &d.dpi_unit, 800),
+            crate::dpi_origin::Origin::Echo(cause),
+            "a mismatched write must not remain claimed as an echo"
+        );
+        assert!(set_polling_hz(&d, 500)
+            .expect_err("a polling ACK with a mismatched getter must fail")
+            .to_string()
+            .contains("VERIFY FAILED on polling rate"));
+        assert!(set_brightness(&d, 50, Store::Persist)
+            .expect_err("a brightness ACK with a mismatched getter must fail")
+            .to_string()
+            .contains("VERIFY FAILED on brightness"));
+        crate::dpi_origin::forget(pid, &d.dpi_unit);
+    }
+
+    #[test]
+    fn dpi_verifies_the_varstore_plane_that_was_written() {
+        use crate::transport::mock::MockDevice;
+
+        let pid = 0xFDC4;
+        let phantom = MockDevice::razer(pid, "phantom naga")
+            .answering(0x04, 0x05, &[])
+            .answering(0x04, 0x85, &[1, 0x03, 0x20, 0x03, 0x20]);
+        let d = naga_device(pid, phantom);
+        set_dpi(&d, 800, 800, Store::Persist, crate::dpi_origin::Cause::Momentary)
+            .expect("the persisted write must be read back from the persisted plane");
+        crate::dpi_origin::forget(pid, &d.dpi_unit);
+    }
+
+    #[test]
+    fn legacy_brightness_without_a_getter_is_gated_before_the_write() {
+        use crate::transport::mock::MockDevice;
+
+        let pid = 0xFDC3;
+        let def: crate::registry::DeviceDef = toml::from_str(include_str!("../devices/razer-blackwidow-chroma-v2.toml"))
+            .expect("the curated BlackWidow definition parses");
+        let phantom = std::sync::Arc::new(
+            MockDevice::razer(pid, "phantom BlackWidow").answering(0x03, 0x03, &[]),
+        );
+        let d = Device::with_transport(def, pid, Box::new(phantom.handle()));
+        assert!(!d.def.has_command("brightness"));
+
+        if brightness_write_enabled() {
+            set_brightness(&d, 50, Store::Persist)
+                .expect("the explicit opt-in permits the legacy ACK-only setter");
+            assert_eq!(phantom.asked(), vec![(0x03, 0x03)]);
+        } else {
+            let err = set_brightness(&d, 50, Store::Persist)
+                .expect_err("an ACK-only legacy setter must remain gated without a getter");
+            assert!(err.to_string().contains("has no read-back getter and is gated"));
+            assert!(phantom.asked().is_empty(), "the gate must run before any wire write");
+        }
+    }
 
     #[test]
     fn idle_secs_decode_inverts_the_write_payload() {

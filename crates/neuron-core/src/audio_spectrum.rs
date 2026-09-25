@@ -333,8 +333,11 @@ fn fft(re: &mut [f32], im: &mut [f32]) {
     // butterflies
     let mut len = 2;
     while len <= n {
-        let ang = -std::f32::consts::TAU / len as f32;
-        let (wr, wi) = (ang.cos(), ang.sin());
+        let stage = len.trailing_zeros() as usize - 1;
+        let (wr, wi) = fft_roots().get(stage).copied().unwrap_or_else(|| {
+            let ang = -std::f32::consts::TAU / len as f32;
+            (ang.cos(), ang.sin())
+        });
         let mut i = 0;
         while i < n {
             let (mut cr, mut ci) = (1.0f32, 0.0f32);
@@ -353,6 +356,30 @@ fn fft(re: &mut [f32], im: &mut [f32]) {
         }
         len <<= 1;
     }
+}
+
+fn fft_roots() -> &'static [(f32, f32); FFT_N.trailing_zeros() as usize] {
+    static ROOTS: OnceLock<[(f32, f32); FFT_N.trailing_zeros() as usize]> = OnceLock::new();
+    ROOTS.get_or_init(|| {
+        let mut roots = [(0.0, 0.0); FFT_N.trailing_zeros() as usize];
+        for (stage, root) in roots.iter_mut().enumerate() {
+            let len = 1usize << (stage + 1);
+            let ang = -std::f32::consts::TAU / len as f32;
+            *root = (ang.cos(), ang.sin());
+        }
+        roots
+    })
+}
+
+fn hann_window() -> &'static [f32; FFT_N] {
+    static WINDOW: OnceLock<[f32; FFT_N]> = OnceLock::new();
+    WINDOW.get_or_init(|| {
+        let mut window = [0.0; FFT_N];
+        for (i, value) in window.iter_mut().enumerate() {
+            *value = 0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / FFT_N as f32).cos();
+        }
+        window
+    })
 }
 
 /// The per-band bin ranges `[lo, hi)` for log-spaced band edges [`F_LO`]..[`F_HI`] at `rate`.
@@ -384,12 +411,14 @@ fn tilt_db(i: usize) -> f32 {
     TILT_DB_PER_OCT * (band_center_hz(i) / TILT_REF_HZ).log2()
 }
 
-/// Reusable FFT work buffers for [`tilted_band_dbs`] — `re`/`im`, both fixed at [`FFT_N`]. Owned by
-/// the per-thread [`Loudness`] state and rewritten in full every call, so hoisting them out of the
-/// ~60Hz hot path avoids two fresh `Vec<f32>` allocations (~16KB) per tick with no behavior change.
+/// Per-thread FFT sample buffers and the bin plan for the last observed sample rate.
+/// `re` and `im` are rewritten in full for each analysis pass.
 struct ScratchBufs {
     re: Vec<f32>,
     im: Vec<f32>,
+    rate: Option<u32>,
+    ranges: [(usize, usize); BANDS],
+    tilts: [f32; BANDS],
 }
 
 impl ScratchBufs {
@@ -397,6 +426,9 @@ impl ScratchBufs {
         ScratchBufs {
             re: vec![0.0f32; FFT_N],
             im: vec![0.0f32; FFT_N],
+            rate: None,
+            ranges: [(1, 2); BANDS],
+            tilts: [0.0; BANDS],
         }
     }
 }
@@ -414,17 +446,22 @@ fn tilted_band_dbs(ring: &[f32], rate: u32, scratch: &mut ScratchBufs) -> [f32; 
     let pad = FFT_N - n;
     for (k, &s) in ring[ring.len() - n..].iter().enumerate() {
         let i = pad + k;
-        let w = 0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / FFT_N as f32).cos();
-        re[i] = s * w;
+        re[i] = s * hann_window()[i];
     }
     fft(re, im);
-    let ranges = band_bin_ranges(rate);
+    if scratch.rate != Some(rate) {
+        scratch.rate = Some(rate);
+        scratch.ranges = band_bin_ranges(rate);
+        for (i, tilt) in scratch.tilts.iter_mut().enumerate() {
+            *tilt = tilt_db(i);
+        }
+    }
     let scale = 4.0 / FFT_N as f32; // Hann coherent gain 0.5 → sine peak bin ≈ N/4
     let mut out = [0.0f32; BANDS];
-    for (i, &(lo, hi)) in ranges.iter().enumerate() {
+    for (i, &(lo, hi)) in scratch.ranges.iter().enumerate() {
         let power: f32 = (lo..hi).map(|k| re[k] * re[k] + im[k] * im[k]).sum();
         let amp = power.sqrt() * scale;
-        out[i] = 20.0 * amp.max(1e-5).log10() + tilt_db(i);
+        out[i] = 20.0 * amp.max(1e-5).log10() + scratch.tilts[i];
     }
     out
 }
@@ -644,6 +681,125 @@ mod tests {
         (0..n)
             .map(|i| amp * (std::f32::consts::TAU * hz * i as f32 / rate as f32).sin())
             .collect()
+    }
+
+    fn reference_fft(re: &mut [f32], im: &mut [f32]) {
+        let n = re.len();
+        let mut j = 0usize;
+        for i in 0..n {
+            if i < j { re.swap(i, j); im.swap(i, j); }
+            let mut m = n >> 1;
+            while m >= 1 && j & m != 0 { j ^= m; m >>= 1; }
+            j |= m;
+        }
+        let mut len = 2;
+        while len <= n {
+            let ang = -std::f32::consts::TAU / len as f32;
+            let (wr, wi) = (ang.cos(), ang.sin());
+            let mut i = 0;
+            while i < n {
+                let (mut cr, mut ci) = (1.0f32, 0.0f32);
+                for k in 0..len / 2 {
+                    let (a, b) = (i + k, i + k + len / 2);
+                    let (tr, ti) = (re[b] * cr - im[b] * ci, re[b] * ci + im[b] * cr);
+                    re[b] = re[a] - tr; im[b] = im[a] - ti;
+                    re[a] += tr; im[a] += ti;
+                    let ncr = cr * wr - ci * wi;
+                    ci = cr * wi + ci * wr;
+                    cr = ncr;
+                }
+                i += len;
+            }
+            len <<= 1;
+        }
+    }
+
+    fn reference_tilted_band_dbs(ring: &[f32], rate: u32) -> [f32; BANDS] {
+        reference_tilted_band_dbs_with_scratch(ring, rate, &mut ScratchBufs::new())
+    }
+
+    fn reference_tilted_band_dbs_with_scratch(ring: &[f32], rate: u32, scratch: &mut ScratchBufs) -> [f32; BANDS] {
+        let re = &mut scratch.re;
+        let im = &mut scratch.im;
+        re.fill(0.0);
+        im.fill(0.0);
+        let n = ring.len().min(FFT_N);
+        let pad = FFT_N - n;
+        for (k, &s) in ring[ring.len() - n..].iter().enumerate() {
+            let i = pad + k;
+            let w = 0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / FFT_N as f32).cos();
+            re[i] = s * w;
+        }
+        reference_fft(re, im);
+        let ranges = band_bin_ranges(rate);
+        let scale = 4.0 / FFT_N as f32;
+        let mut out = [0.0; BANDS];
+        for (i, &(lo, hi)) in ranges.iter().enumerate() {
+            let power: f32 = (lo..hi).map(|k| re[k] * re[k] + im[k] * im[k]).sum();
+            let amp = power.sqrt() * scale;
+            out[i] = 20.0 * amp.max(1e-5).log10() + tilt_db(i);
+        }
+        out
+    }
+
+    fn assert_same_bits(a: &[f32; BANDS], b: &[f32; BANDS]) {
+        for (i, (left, right)) in a.iter().zip(b).enumerate() {
+            assert_eq!(left.to_bits(), right.to_bits(), "band {i}: {left} != {right}");
+        }
+    }
+
+    fn seeded_noise(seed: &mut u32, n: usize) -> Vec<f32> {
+        (0..n).map(|_| {
+            *seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((*seed >> 8) as f32 / 16_777_216.0) * 2.0 - 1.0
+        }).collect()
+    }
+
+    #[test]
+    fn cached_spectrum_plan_matches_uncached_reference_bit_for_bit() {
+        let mut scratch = ScratchBufs::new();
+        let mut seed = 0x6e65_7572;
+        for rate in [44_100, 48_000, 96_000, 192_000] {
+            for ring in [vec![0.0; FFT_N], sine(997.0, 0.73, rate, FFT_N), seeded_noise(&mut seed, FFT_N), seeded_noise(&mut seed, 731)] {
+                assert_same_bits(&reference_tilted_band_dbs(&ring, rate), &tilted_band_dbs(&ring, rate, &mut scratch));
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "deterministic audio spectrum microbenchmark; run manually with --ignored --nocapture"]
+    fn bench_spectrum_silence_sine_and_seeded_noise() {
+        let mut seed = 0x6e65_7572;
+        for rate in [44_100, 48_000, 96_000] {
+            let cases = [
+                ("silence", vec![0.0; FFT_N]),
+                ("sine", sine(997.0, 0.73, rate, FFT_N)),
+                ("seeded-noise", seeded_noise(&mut seed, FFT_N)),
+            ];
+            for (name, ring) in &cases {
+                let expected = reference_tilted_band_dbs(ring, rate);
+                let mut scratch = ScratchBufs::new();
+                let mut reference_scratch = ScratchBufs::new();
+                assert_same_bits(&expected, &tilted_band_dbs(ring, rate, &mut scratch));
+                let mut times = Vec::with_capacity(128);
+                let mut reference_times = Vec::with_capacity(128);
+                for _ in 0..128 {
+                    let start = Instant::now();
+                    let baseline = reference_tilted_band_dbs_with_scratch(ring, rate, &mut reference_scratch);
+                    reference_times.push(start.elapsed().as_nanos());
+                    assert_same_bits(&expected, &baseline);
+                    let start = Instant::now();
+                    let actual = tilted_band_dbs(ring, rate, &mut scratch);
+                    times.push(start.elapsed().as_nanos());
+                    assert_same_bits(&expected, &actual);
+                }
+                times.sort_unstable();
+                reference_times.sort_unstable();
+                let avg = times.iter().sum::<u128>() / times.len() as u128;
+                let reference_avg = reference_times.iter().sum::<u128>() / reference_times.len() as u128;
+                println!("spectrum {name} rate={rate}Hz baseline_avg={reference_avg}ns baseline_p50={}ns avg={avg}ns p50={}ns p95={}ns checksum={:.6}", reference_times[64], times[64], times[121], expected.iter().sum::<f32>());
+            }
+        }
     }
 
     #[test]

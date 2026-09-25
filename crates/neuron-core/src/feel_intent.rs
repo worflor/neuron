@@ -91,7 +91,11 @@ pub fn record_dpi(pid: u16, x: u16, y: u16) -> anyhow::Result<()> {
     e.dpi = Some((x, y));
     // an applied absolute DPI that IS a stage makes that stage active — keep the cycle coherent
     if let Some(i) = e.stages.iter().position(|&s| s == x) {
-        e.active = i as u8;
+        // `active` is a wire-sized index. A synthetic/edited table may be longer; never wrap a
+        // matching stage at 256 back to stage zero.
+        if let Ok(i) = u8::try_from(i) {
+            e.active = i;
+        }
     }
     save_file(&f)
 }
@@ -101,8 +105,7 @@ pub fn record_stages(pid: u16, stages: &[u16], active: u8) -> anyhow::Result<()>
     let mut f = load_file();
     let e = f.devices.entry(pid_key(pid)).or_default();
     e.stages = stages.to_vec();
-    // Clamp in usize and cast LAST. Casting the length first would wrap modulo 256 for a table
-    // longer than 256 entries (len 257 -> 0), silently pinning a valid active index to stage 0.
+    // `active` is already u8, so the clamped index cannot exceed 255 even for longer tables.
     e.active = usize::from(active).min(stages.len().saturating_sub(1)) as u8;
     // the active stage IS the active DPI once the table lands (firmware behavior) — mirror it
     if let Some(&x) = stages.get(e.active as usize) {

@@ -17,8 +17,9 @@
 //!     parser made of them.
 //!
 //! The descriptor bytes are the fixture, so [`tests::parser_agrees_with_windows_caps`] re-parses
-//! them on every platform, on every CI run, with no device attached. Capture is manual and needs
-//! the hardware; see the `#[ignore]`d tests in `windows_hid` and `hidraw`.
+//! them on every platform, on every CI run, with no device attached. At least one paired capture is
+//! required whenever Windows fixtures are present. Capture is manual and needs the hardware; see
+//! the `#[ignore]`d tests in `windows_hid` and `hidraw`.
 
 use super::hid_descriptor;
 use serde::{Deserialize, Serialize};
@@ -102,13 +103,23 @@ pub fn encode_hex(bytes: &[u8]) -> String {
 
 /// `None` on an odd length or a non-hex digit.
 pub fn decode_hex(hex: &str) -> Option<Vec<u8>> {
-    if !hex.len().is_multiple_of(2) {
+    let bytes = hex.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
         return None;
     }
-    (0..hex.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+    bytes
+        .chunks_exact(2)
+        .map(|pair| Some((hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?))
         .collect()
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -126,16 +137,20 @@ mod tests {
     /// kernel will ever enumerate them. Windows-only collections are printed, so the asymmetry
     /// stays visible rather than being asserted away.
     ///
-    /// With no fixtures captured yet this passes while saying so — the pair needs a physical
-    /// device on a machine running both platforms. Capturing one is the point of the `#[ignore]`d
-    /// capture tests.
+    /// A checkout with no Windows captures is reported as a skip. Once Windows captures exist, at
+    /// least one paired Linux capture must be compared so a fixture gap cannot look like a pass.
     #[test]
     fn parser_agrees_with_windows_caps() {
         let dir = Capture::dir();
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            println!("no HID parity fixtures in {} — nothing to cross-check", dir.display());
-            return;
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                println!("SKIP HID parity: fixture directory is absent ({})", dir.display());
+                return;
+            }
+            Err(e) => panic!("read fixture directory {}: {e}", dir.display()),
         };
+        let mut windows_halves = 0;
         let mut pairs = 0;
         for entry in entries.flatten() {
             let path = entry.path();
@@ -143,11 +158,16 @@ mod tests {
             if !name.ends_with("-windows.json") {
                 continue;
             }
+            windows_halves += 1;
             let win = Capture::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
             let linux_path = Capture::path(win.pid, "linux");
-            let Ok(linux) = Capture::read(&linux_path) else {
-                println!("{:04x}: windows half only, no linux half to compare", win.pid);
-                continue;
+            let linux = match Capture::read(&linux_path) {
+                Ok(linux) => linux,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    println!("{:04x}: windows half only, no linux half to compare", win.pid);
+                    continue;
+                }
+                Err(e) => panic!("read {}: {e}", linux_path.display()),
             };
             let parsed = linux
                 .reparse()
@@ -196,6 +216,11 @@ mod tests {
                 }
             }
         }
+        if windows_halves == 0 {
+            println!("SKIP HID parity: no Windows captures in {}", dir.display());
+            return;
+        }
+        assert!(pairs > 0, "Windows HID fixtures exist, but no Windows/Linux fixture pair was compared");
         println!("HID parity: {pairs} device(s) cross-checked against Windows HidP_GetCaps");
     }
 
@@ -206,5 +231,8 @@ mod tests {
         assert_eq!(decode_hex("0501a100ff").as_deref(), Some(&bytes[..]));
         assert_eq!(decode_hex("abc"), None, "odd length is not hex");
         assert_eq!(decode_hex("zz"), None, "non-hex digits are rejected");
+        assert_eq!(decode_hex("é0"), None, "non-ASCII input is rejected without slicing UTF-8");
+        assert_eq!(decode_hex("0é"), None, "a multibyte digit is rejected safely");
+        assert_eq!(decode_hex("Af"), Some(vec![0xAF]), "uppercase hex digits are accepted");
     }
 }

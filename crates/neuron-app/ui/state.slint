@@ -22,6 +22,7 @@ export global State {
     // ── global runtime status (mirrored in the header + tray) ────────────
     in-out property <bool> writes-paused: false;     // the device-write safety gate switch
     in-out property <bool> input-armed: false;       // SAFE-MODE gate: real SendInput is a no-op unless ARMED
+    in-out property <bool> input-arm-pending: false; // a second deliberate action confirms input authority
     // ARM STANCE — one selector over the two gates above (the header pills still read the bools live):
     // 0 OBSERVE (paused + safe) · 1 DEVICE (writes on, safe) · 2 INPUT (synth on, paused) · 3 LIVE (both).
     in-out property <int> arm-stance: 0;
@@ -29,6 +30,8 @@ export global State {
     in-out property <bool> hypershift-on: false;     // software hold-layer active
     in-out property <bool> runtime-active: false;    // the LIVE dispatch loop is running
     in-out property <string> active-profile: "—";
+    in-out property <int> profile-degraded-count: 0;
+    in-out property <string> profile-degraded-detail: "";
     // ABOUT nameplate — set once at startup by the runtime (version from CARGO_PKG_VERSION, run dir)
     in-out property <string> app-version: "";
     in-out property <string> run-dir: "";
@@ -459,12 +462,16 @@ export global State {
     callback cancel-edit-rule();                         // close the inline editor without saving
     // mic gain/mute are surfaced here as Actions (no longer a top-level Audio panel)
     in-out property <string> mic-name: "—";
+    // Gain and mute readings belong to the last opened endpoint only while this is true.
+    in-out property <bool> mic-reading-valid: false;
     in-out property <float> mic-gain: 100;
     in-out property <bool> mic-muted: false;
     callback refresh-mic();
     // OUTPUT (render) side — headphones / sound card / speakers volume + mute (Core Audio, generic).
     // The matching bindable Actions are out-gain / out-mute in the palette.
     in-out property <string> out-name: "—";
+    // Endpoint loss invalidates both readings before a replacement is opened.
+    in-out property <bool> out-reading-valid: false;
     in-out property <float> out-gain: 100;
     in-out property <bool> out-muted: false;
     callback refresh-out();

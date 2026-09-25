@@ -21,7 +21,7 @@
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -91,6 +91,35 @@ type OrgbRoster = Arc<Mutex<HashMap<u64, (crate::arbiter::SourceId, String)>>>;
 /// threads race toward exit concurrently with the accept thread, so this is NOT additive across
 /// however many clients are connected.
 const ORGB_SERVER_DROP_DEADLINE: Duration = Duration::from_secs(1);
+
+/// Caps per-socket workers and their buffers when local clients connect without speaking.
+const MAX_ADAPTER_CLIENTS: usize = 32;
+
+#[derive(Clone)]
+struct ClientSlots(Arc<AtomicUsize>);
+
+impl ClientSlots {
+    fn new() -> Self {
+        Self(Arc::new(AtomicUsize::new(0)))
+    }
+
+    fn reserve(&self) -> Option<ClientSlot> {
+        self.0
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < MAX_ADAPTER_CLIENTS).then_some(active + 1)
+            })
+            .ok()
+            .map(|_| ClientSlot(self.0.clone()))
+    }
+}
+
+struct ClientSlot(Arc<AtomicUsize>);
+
+impl Drop for ClientSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 /// A running `OpenRGB` TCP server. Dropping it stops the accept loop, joins
 /// every connection thread, and thereby releases every client's claims.
@@ -172,9 +201,14 @@ fn accept_loop(
 ) {
     let mut conns: Vec<thread::JoinHandle<()>> = Vec::new();
     let mut next_conn: u64 = 1;
+    let slots = ClientSlots::new();
     while !stop.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, _peer)) => {
+                let Some(slot) = slots.reserve() else {
+                    drop(stream);
+                    continue;
+                };
                 let handle = handle.clone();
                 let stop = stop.clone();
                 let roster = roster.clone();
@@ -182,6 +216,7 @@ fn accept_loop(
                 let conn_id = next_conn;
                 next_conn += 1;
                 if let Ok(t) = crate::worker::spawn_named("neuron-orgb-conn", move || {
+                    let _slot = slot;
                     serve_conn(stream, handle, stop, roster, conn_id, policy);
                 }) {
                     conns.push(t);
@@ -372,13 +407,19 @@ fn chroma_accept_loop(
     stop: Arc<AtomicBool>,
 ) {
     let mut conns: Vec<thread::JoinHandle<()>> = Vec::new();
+    let slots = ClientSlots::new();
     while !stop.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, _peer)) => {
+                let Some(slot) = slots.reserve() else {
+                    drop(stream);
+                    continue;
+                };
                 let handle = handle.clone();
                 let server = server.clone();
                 let stop = stop.clone();
                 if let Ok(t) = crate::worker::spawn_named("neuron-chroma-conn", move || {
+                    let _slot = slot;
                     serve_chroma_conn(stream, handle, server, stop);
                 }) {
                     conns.push(t);
@@ -791,6 +832,17 @@ fn sleep_interruptible(total: Duration, stop: &AtomicBool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adapter_client_slots_are_bounded_and_released() {
+        let slots = ClientSlots::new();
+        let mut held: Vec<_> = (0..MAX_ADAPTER_CLIENTS)
+            .map(|_| slots.reserve().expect("slot within limit"))
+            .collect();
+        assert!(slots.reserve().is_none(), "excess client must be rejected");
+        drop(held.pop());
+        assert!(slots.reserve().is_some(), "a disconnected client frees a slot");
+    }
     use crate::adapters::openrgb::{ids, packet, PROTOCOL_VERSION};
     use crate::api::{HostApi, LeaseSpec, SurfaceInfo, SurfaceKind};
     use crate::arbiter::{band, Content, Rgb};

@@ -96,8 +96,8 @@ impl Surface {
 }
 
 /// Per-pixel inputs to a material shader: the raw field here, its gradient, the dispersion taps
-/// (glass), where the pixel is, and WHEN (animation). The overlay/preview fills this once per pixel;
-/// each surface uses the parts its physics needs.
+/// (legacy glass only), where the pixel is, and WHEN (animation). The overlay/preview fills this
+/// once per pixel; each surface uses the parts its physics needs.
 #[derive(Clone, Copy)]
 pub struct Px {
     pub d: f32,  // field density here
@@ -111,6 +111,7 @@ pub struct Px {
     pub x: f32,       // pixel coords (procedural fields read these)
     pub y: f32,
     pub t: f32, // seconds — the material's animation clock
+    pub drift_phase: f32, // frame-wide prism drift; never read the wall clock per pixel
 }
 
 // ── THE FIELD-STACK — a generic, data-driven material engine ─────────────────────────────────
@@ -463,6 +464,12 @@ pub fn phase(hz: f32) -> f32 {
 pub fn seconds() -> f32 {
     // wrap at 4096s so the f32 keeps fractional precision indefinitely (the motions are periodic).
     (shimmer_epoch().elapsed().as_secs_f64() % 4096.0) as f32
+}
+
+/// Prism drift at a frame timestamp. Compute once before shading pixels so one frame uses one
+/// phase and fixed-time proofs stay deterministic.
+pub fn drift_phase_at(t: f32) -> f32 {
+    ((f64::from(t) * f64::from(tempo::DRIFT)).rem_euclid(1.0) * std::f64::consts::TAU) as f32
 }
 
 /// A 0..1 sine SWELL at `hz` on the shared clock — the common "breathe between two levels" need
@@ -933,7 +940,7 @@ fn prism(p: &Px, l: &Layer, m: &Material) -> (f32, f32, f32, f32) {
     let ca_dir = p.gx / gl;
     let ca = edge * l.scale; // strength
                              // refractive shimmer — the white body breathes like living glass (subtle, slow, stable).
-    let shimmer = 0.93 + 0.07 * vnoise(p.x * 0.05 + phase(tempo::DRIFT) * 1.4, p.y * 0.05);
+    let shimmer = 0.93 + 0.07 * vnoise(p.x * 0.05 + p.drift_phase * 1.4, p.y * 0.05);
     let white = sg * l.gain * shimmer; // the WHITE body
                                        // the white-hot CORE at the dense spine (the magic's heart). `sg` already makes the whole body white;
                                        // this just blazes the centre brighter.
@@ -985,8 +992,22 @@ fn water_caustic(x: f32, y: f32, t: f32) -> f32 {
 
 /// Evaluate ONE layer at this pixel → its (rgb, intensity-for-luminance). The generic per-primitive
 /// physics; a material is just a stack of these.
-fn eval_layer(l: &Layer, p: &Px, m: &Material) -> (f32, f32, f32, f32) {
-    let pres = shoulder(p.d, m.shoulder);
+#[inline]
+fn wisp_outside_trail(dx: f32, dy: f32, p0x: f32, p0y: f32,
+    ux: f32, uy: f32, rad_sway: f32, r0: f32) -> bool {
+    // Every tail sample lies at p0 + U·[0, 46] plus the elliptical sway. The widest
+    // sample has radius 1.55·r0; a pixel beyond this envelope cannot receive light.
+    let pad_x = rad_sway.abs() + r0 * 1.55 + 1.0;
+    let pad_y = rad_sway.abs() * 0.6 + r0 * 1.55 + 1.0;
+    dx < p0x + ux.min(0.0) * WISP_TRAIL_REACH - pad_x
+        || dx > p0x + ux.max(0.0) * WISP_TRAIL_REACH + pad_x
+        || dy < p0y + uy.min(0.0) * WISP_TRAIL_REACH - pad_y
+        || dy > p0y + uy.max(0.0) * WISP_TRAIL_REACH + pad_y
+}
+
+const WISP_TRAIL_REACH: f32 = 46.0;
+
+fn eval_layer(l: &Layer, p: &Px, m: &Material, pres: f32) -> (f32, f32, f32, f32) {
     let (t, x, y) = (p.t, p.x, p.y);
     match l.field {
         Field::Body => {
@@ -1356,13 +1377,16 @@ fn eval_layer(l: &Layer, p: &Px, m: &Material) -> (f32, f32, f32, f32) {
                     let om = l.speed * (0.9 + 1.4 * h2);
                     let ph = h * std::f32::consts::TAU;
                     let r0 = cell * (0.19 + 0.11 * h3) * if hero { 1.4 } else { 1.0 };
+                    if wisp_outside_trail(dx, dy, p0x, p0y, ux, uy, rad_sway, r0) {
+                        continue;
+                    }
                     // life BREATHES but never hits zero — a mote at full dark that re-lights in
                     // place reads as a pop; a 0.3 floor keeps every fade a shimmer, not a blink.
                     let life = 0.30
                         + 0.70 * (0.5 + 0.5 * (t * (0.15 + l.speed * 0.4) + ph).sin());
                     for k in 0..=NK {
                         let tk = t - k as f32 * STEP;
-                        let delta = (vel * k as f32 * STEP).min(46.0); // cap inside the search reach
+                        let delta = (vel * k as f32 * STEP).min(WISP_TRAIL_REACH); // cap inside the search reach
                         let ang = om * tk + ph;
                         let sx = p0x + ux * delta + rad_sway * ang.cos();
                         let sy = p0y + uy * delta + rad_sway * 0.6 * ang.sin();
@@ -1515,10 +1539,11 @@ pub fn shade_surface(p: &Px, m: &Material) -> (f32, f32, f32, f32) {
     if m.n_layers == 0 {
         return shade(p.d, p.dr, p.db, p.heat, p.grad, p.facet_u, m);
     }
+    let pres = shoulder(p.d, m.shoulder);
     let (mut r, mut g, mut b, mut lum) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
     for i in 0..m.n_layers as usize {
         let l = &m.layers[i];
-        let (lr, lg, lb, li) = eval_layer(l, p, m);
+        let (lr, lg, lb, li) = eval_layer(l, p, m, pres);
         match l.mix {
             Mix::Add => {
                 r += lr;
@@ -1845,6 +1870,22 @@ pub fn preset(surface: Surface) -> Material {
 /// material the SAME shape to shade, so the gallery is an honest side-by-side. The selected tile can
 /// pass the LIVE material so its swatch reflects the user's knob edits in real time.
 pub fn material_preview_rgba(m: &Material, w: usize, h: usize, t: f32) -> Vec<u8> {
+    let grid = preview_field_grid(w, h, t);
+    shade_preview_from_grid(m, w, h, t, drift_phase_at(t), &grid)
+}
+
+/// Render the gallery's materials against one shared moving field. The shape is identical in
+/// every card; only the material recipe differs.
+pub fn material_previews_rgba(mats: &[Material], w: usize, h: usize, t: f32) -> Vec<Vec<u8>> {
+    if mats.is_empty() {
+        return Vec::new();
+    }
+    let grid = preview_field_grid(w, h, t);
+    let drift_phase = drift_phase_at(t);
+    mats.iter().map(|m| shade_preview_from_grid(m, w, h, t, drift_phase, &grid)).collect()
+}
+
+fn preview_field_grid(w: usize, h: usize, t: f32) -> Vec<f32> {
     let (wf, hf, rf) = (w as f32, h as f32, w.min(h) as f32);
     let blobs = [
         (
@@ -1890,6 +1931,12 @@ pub fn material_preview_rgba(m: &Material, w: usize, h: usize, t: f32) -> Vec<u8
             grid[cy * gw + cx] = s;
         }
     }
+    grid
+}
+
+fn shade_preview_from_grid(m: &Material, w: usize, h: usize, t: f32, drift_phase: f32, grid: &[f32]) -> Vec<u8> {
+    let (gw, gh) = (w + 2, h + 2);
+    let glass_taps = m.n_layers == 0;
     // integer-lattice read at field coords (x, y) ∈ [-1, w] × [-1, h], clamped
     let at = |ix: i32, iy: i32| -> f32 {
         let cx = (ix + 1).clamp(0, gw as i32 - 1) as usize;
@@ -1916,15 +1963,21 @@ pub fn material_preview_rgba(m: &Material, w: usize, h: usize, t: f32) -> Vec<u8
             let gy = (at(ix, iy + 1) - at(ix, iy - 1)) * 0.5;
             let grad = (gx * gx + gy * gy).sqrt();
             let heat = (d - 1.0).max(0.0) * 1.4;
-            let (ux, uy, fu) = facet(gx, gy, m.facets);
-            let off = m.dispersion;
-            let (dr, db) = if grad > 0.004 {
-                (
-                    sample(x + ux * off, y + uy * off).min(1.6),
-                    sample(x - ux * off, y - uy * off).min(1.6),
-                )
+            let (dr, db, fu) = if glass_taps {
+                let (ux, uy, fu) = facet(gx, gy, m.facets);
+                let off = m.dispersion;
+                let (dr, db) = if grad > 0.004 {
+                    (
+                        sample(x + ux * off, y + uy * off).min(1.6),
+                        sample(x - ux * off, y - uy * off).min(1.6),
+                    )
+                } else {
+                    (d, d)
+                };
+                (dr, db, fu)
             } else {
-                (d, d)
+                // Layer recipes use the density and gradient, not the legacy glass colour taps.
+                (d, d, 0.0)
             };
             let px = Px {
                 d,
@@ -1938,6 +1991,7 @@ pub fn material_preview_rgba(m: &Material, w: usize, h: usize, t: f32) -> Vec<u8
                 x,
                 y,
                 t,
+                drift_phase,
             };
             let (mut r, mut g, mut b, lum) = shade_surface(&px, m);
             r = r.min(1.0).sqrt();
@@ -1968,6 +2022,8 @@ pub fn material_preview_rgba(m: &Material, w: usize, h: usize, t: f32) -> Vec<u8
 /// to cut to black on raise, and 0→1 to burst back on reveal.
 pub fn material_static_bgra(m: &Material, w: usize, h: usize, t: f32, intensity: f32) -> Vec<u8> {
     let mut out = vec![0u8; w * h * 4];
+    let drift_phase = drift_phase_at(t);
+    let glass_taps = m.n_layers == 0;
     // opaque alpha up front (BI_RGB ignores it, but keep the buffer honest)
     for px in out.chunks_mut(4) {
         px[3] = 255;
@@ -2010,7 +2066,7 @@ pub fn material_static_bgra(m: &Material, w: usize, h: usize, t: f32, intensity:
             let gy = (dens(xx, yy + 1) - dens(xx, yy - 1)) * 0.5;
             let grad = (gx * gx + gy * gy).sqrt();
             let heat = (d - 1.0).max(0.0) * 1.4;
-            let (_ux, _uy, fu) = facet(gx, gy, m.facets);
+            let fu = if glass_taps { facet(gx, gy, m.facets).2 } else { 0.0 };
             let px = Px {
                 d,
                 dr: d,
@@ -2023,6 +2079,7 @@ pub fn material_static_bgra(m: &Material, w: usize, h: usize, t: f32, intensity:
                 x: xx as f32,
                 y: yy as f32,
                 t,
+                drift_phase,
             };
             let (r, g, b, lum) = shade_surface(&px, m);
             // gamma, composite the ink over black (alpha = lum), and fade by how strongly the cell
@@ -2045,6 +2102,7 @@ pub fn material_static_bgra(m: &Material, w: usize, h: usize, t: f32, intensity:
 /// the INK they really are — across size AND weave-colour, all on one screen, at a glance. Px is built
 /// exactly the way `whiteboard.rs material_core` builds it from a stroke's signed-distance field.
 pub fn weave_proof_sheet(t: f32) -> (usize, usize, Vec<u8>) {
+    let drift_phase = drift_phase_at(t);
     // the weave colours shown across the columns (white = the un-tinted material)
     let palette: [(f32, f32, f32); 6] = [
         (0.92, 0.92, 0.97), // white
@@ -2107,6 +2165,7 @@ pub fn weave_proof_sheet(t: f32) -> (usize, usize, Vec<u8>) {
                         x: (ox + lx) as f32,
                         y: (oy + ly) as f32,
                         t,
+                        drift_phase,
                     };
                     let (cr, cg, cb, lum) = shade_surface(&pxs, &m);
                     let cov = (rad + 0.5 - d).clamp(0.0, 1.0);
@@ -2186,6 +2245,320 @@ pub fn write_proof_sheets() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "manual deterministic material-shading microbenchmark"]
+    fn bench_material_shading_cpu() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        fn percentile(sorted: &[u128], numerator: usize) -> u128 {
+            sorted[(sorted.len() - 1) * numerator / 100]
+        }
+
+        for side in [64usize, 256] {
+            let count = side * side;
+            let pixels: Vec<Px> = (0..count)
+                .map(|i| {
+                    let x = (i % side) as f32;
+                    let y = (i / side) as f32;
+                    let phase = (i as f32 * 0.017).sin();
+                    let gx = phase * 0.08;
+                    let gy = (i as f32 * 0.011).cos() * 0.08;
+                    let d = 0.15 + ((i * 37 % 1000) as f32 / 1000.0) * 1.2;
+                    Px {
+                        d,
+                        dr: (d + gx * 2.2).clamp(0.0, 1.6),
+                        db: (d - gy * 2.2).clamp(0.0, 1.6),
+                        gx,
+                        gy,
+                        grad: (gx * gx + gy * gy).sqrt(),
+                        facet_u: (i % 97) as f32 / 97.0,
+                        heat: (d - 0.8).max(0.0),
+                        x,
+                        y,
+                        t: 1.2345,
+                        drift_phase: drift_phase_at(1.2345),
+                    }
+                })
+                .collect();
+
+            for surface in Surface::ALL {
+                let material = preset(surface);
+                let repeats = if side == 64 { 8 } else { 2 };
+                for _ in 0..2 {
+                    let mut warm = 0.0f32;
+                    for px in &pixels {
+                        warm += shade_surface(px, &material).0;
+                    }
+                    black_box(warm);
+                }
+
+                let mut samples = Vec::with_capacity(11);
+                let mut checksum = 0.0f64;
+                for _ in 0..11 {
+                    let start = Instant::now();
+                    let mut sum = 0.0f64;
+                    for _ in 0..repeats {
+                        for px in &pixels {
+                            let (r, g, b, a) = shade_surface(px, &material);
+                            sum += f64::from(r + g * 3.0 + b * 5.0 + a * 7.0);
+                        }
+                    }
+                    let elapsed = start.elapsed().as_nanos();
+                    checksum += black_box(sum);
+                    samples.push(elapsed);
+                }
+                samples.sort_unstable();
+                let avg = samples.iter().sum::<u128>() / samples.len() as u128;
+                eprintln!(
+                    "weave-shade side={side} surface={} repeats={repeats} avg={avg}ns p50={}ns p95={}ns checksum={checksum:.6}",
+                    surface.slug(),
+                    percentile(&samples, 50),
+                    percentile(&samples, 95),
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "manual deterministic benchmark for the six-card System gallery workload"]
+    fn bench_material_gallery_cpu() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let materials: Vec<_> = Surface::ALL.into_iter().map(preset).collect();
+        for (w, h) in [(220, 132), (176, 106), (168, 100)] {
+            let mut samples = Vec::with_capacity(11);
+            let mut checksum = 0u64;
+            for _ in 0..2 {
+                for material in &materials {
+                    black_box(material_preview_rgba(material, w, h, 2.3));
+                }
+            }
+            for _ in 0..11 {
+                let start = Instant::now();
+                let mut sum = 0u64;
+                for material in &materials {
+                    let tile = material_preview_rgba(material, w, h, 2.3);
+                    sum = sum.wrapping_add(tile.iter().map(|&v| u64::from(v)).sum::<u64>());
+                }
+                samples.push(start.elapsed().as_nanos());
+                checksum = checksum.wrapping_add(black_box(sum));
+            }
+            samples.sort_unstable();
+            let avg = samples.iter().sum::<u128>() / samples.len() as u128;
+            eprintln!(
+                "weave-gallery cards={} tile={w}x{h} avg={avg}ns p50={}ns p95={}ns checksum={checksum}",
+                materials.len(),
+                samples[(samples.len() - 1) * 50 / 100],
+                samples[(samples.len() - 1) * 95 / 100],
+            );
+        }
+        let mut samples = Vec::with_capacity(11);
+        let mut checksum = 0u64;
+        for _ in 0..2 {
+            black_box(material_previews_rgba(&materials, 220, 132, 2.3));
+        }
+        for _ in 0..11 {
+            let start = Instant::now();
+            let tiles = material_previews_rgba(&materials, 220, 132, 2.3);
+            let sum = tiles.iter().flat_map(|tile| tile.iter()).map(|&v| u64::from(v)).sum::<u64>();
+            samples.push(start.elapsed().as_nanos());
+            checksum = checksum.wrapping_add(black_box(sum));
+        }
+        samples.sort_unstable();
+        eprintln!(
+            "weave-gallery-batch cards={} tile=220x132 p50={}ns p95={}ns checksum={checksum}",
+            materials.len(),
+            samples[(samples.len() - 1) * 50 / 100],
+            samples[(samples.len() - 1) * 95 / 100],
+        );
+    }
+
+    #[test]
+    fn gallery_batch_matches_individual_materials() {
+        let materials: Vec<_> = Surface::ALL.into_iter().map(preset).collect();
+        for (w, h, t) in [(1, 1, 0.0), (40, 24, 0.7), (97, 58, 2.3)] {
+            let batched = material_previews_rgba(&materials, w, h, t);
+            for (material, pixels) in materials.iter().zip(batched) {
+                let individual = material_preview_rgba(material, w, h, t);
+                let (changed, max) = pixels.iter().zip(&individual).fold((0usize, 0u8),
+                    |(changed, max), (a, b)| {
+                        let diff = a.abs_diff(*b);
+                        (changed + usize::from(diff != 0), max.max(diff))
+                    });
+                assert_eq!(changed, 0, "{} {w}x{h} at {t}: {changed} bytes differ, max {max}", material.surface.slug());
+            }
+        }
+    }
+
+    #[test]
+    fn layered_materials_ignore_legacy_glass_taps() {
+        for surface in Surface::ALL {
+            let material = preset(surface);
+            assert!(material.n_layers > 0);
+            for i in 0..64 {
+                let phase = i as f32 * 0.071;
+                let px = Px {
+                    d: i as f32 / 53.0,
+                    dr: 0.1,
+                    db: 0.9,
+                    gx: phase.sin() * 0.2,
+                    gy: phase.cos() * 0.2,
+                    grad: 0.2,
+                    facet_u: 0.1,
+                    heat: (i as f32 / 53.0 - 0.8).max(0.0),
+                    x: i as f32,
+                    y: i as f32 * 0.7,
+                    t: 2.3,
+                    drift_phase: drift_phase_at(2.3),
+                };
+                let altered = Px { dr: 1.4, db: 0.0, facet_u: 0.9, ..px };
+                assert_eq!(shade_surface(&px, &material), shade_surface(&altered, &material),
+                    "{} reads a legacy glass tap at pixel {i}", surface.slug());
+            }
+        }
+    }
+
+    #[test]
+    fn wisp_envelope_contains_every_trail_sample() {
+        let (ux, uy) = (0.928f32, -0.371f32);
+        for rad_sway in [0.0, 4.0, 15.0, 35.0] {
+            for r0 in [6.0, 12.0] {
+                for vel in [0.2, 1.0, 8.0] {
+                    for om in [0.1, 1.3] {
+                        for ph in [0.0, 1.0, 3.0] {
+                            for k in 0..=7 {
+                                let kf = k as f32;
+                                let delta = (vel * kf * 1.6).min(WISP_TRAIL_REACH);
+                                let ang = om * (2.3 - kf * 1.6) + ph;
+                                let (sx, sy) = (ux * delta + rad_sway * ang.cos(),
+                                    uy * delta + rad_sway * 0.6 * ang.sin());
+                                let radius = r0 * (1.0 + 0.55 * kf / 7.0) * 0.99;
+                                for (ox, oy) in [(0.0, 0.0), (radius, 0.0), (-radius, 0.0),
+                                    (0.0, radius), (0.0, -radius)] {
+                                    assert!(!wisp_outside_trail(sx + ox, sy + oy, 0.0, 0.0,
+                                        ux, uy, rad_sway, r0));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "manual gallery resolution comparison; writes target/gallery-resolution.png"]
+    fn compare_gallery_resolution() {
+        use image::{imageops, RgbaImage};
+        let (dw, dh) = (168u32, 100u32);
+        let mut sheet = RgbaImage::new(dw * 3, dh * Surface::ALL.len() as u32);
+        for (row, surface) in Surface::ALL.into_iter().enumerate() {
+            let material = preset(surface);
+            let mut reference = Vec::new();
+            for (col, (w, h)) in [(220, 132), (176, 106), (168, 100)].into_iter().enumerate() {
+                let rgba = material_preview_rgba(&material, w, h, 2.3);
+                let raw = RgbaImage::from_raw(w as u32, h as u32, rgba).unwrap();
+                let shown = imageops::resize(&raw, dw, dh, imageops::FilterType::Triangle);
+                if col == 0 {
+                    reference = shown.as_raw().clone();
+                } else {
+                    let (sum, max) = shown.as_raw().iter().zip(&reference)
+                        .enumerate()
+                        .filter(|(i, _)| i % 4 != 3)
+                        .fold((0u64, 0u8), |(sum, max), (_, (a, b))| {
+                            let diff = a.abs_diff(*b);
+                            (sum + u64::from(diff), max.max(diff))
+                        });
+                    eprintln!("gallery-resolution surface={} tile={w}x{h} mean={:.3} max={max}",
+                        surface.slug(), sum as f64 / f64::from(dw * dh * 3));
+                }
+                for y in 0..dh {
+                    for x in 0..dw {
+                        sheet.put_pixel(col as u32 * dw + x, row as u32 * dh + y, *shown.get_pixel(x, y));
+                    }
+                }
+            }
+        }
+        sheet.save(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/gallery-resolution.png")).unwrap();
+    }
+
+    #[test]
+    fn cached_layer_presence_preserves_preview_within_one_channel_step() {
+        fn previous_shade_surface(p: &Px, m: &Material) -> (f32, f32, f32, f32) {
+            if m.n_layers == 0 {
+                return shade(p.d, p.dr, p.db, p.heat, p.grad, p.facet_u, m);
+            }
+            let (mut r, mut g, mut b, mut lum) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+            for i in 0..m.n_layers as usize {
+                let l = &m.layers[i];
+                let (lr, lg, lb, li) = eval_layer(l, p, m, shoulder(p.d, m.shoulder));
+                match l.mix {
+                    Mix::Add => {
+                        r += lr;
+                        g += lg;
+                        b += lb;
+                    }
+                    Mix::Screen => {
+                        let screen = |u: f32, v: f32| {
+                            1.0 - (1.0 - u.min(1.0)) * (1.0 - v.min(1.0))
+                        };
+                        r = screen(r, lr);
+                        g = screen(g, lg);
+                        b = screen(b, lb);
+                    }
+                }
+                lum += li;
+            }
+            (r, g, b, lum.min(1.0))
+        }
+
+        for surface in Surface::ALL {
+            let material = preset(surface);
+            for i in 0..512 {
+                let phase = i as f32 * 0.017;
+                let d = (i % 161) as f32 / 100.0;
+                let px = Px {
+                    d,
+                    dr: (d + phase.sin() * 0.17).clamp(0.0, 1.6),
+                    db: (d - phase.cos() * 0.17).clamp(0.0, 1.6),
+                    gx: phase.sin() * 0.08,
+                    gy: phase.cos() * 0.08,
+                    grad: 0.08,
+                    facet_u: (i % 97) as f32 / 97.0,
+                    heat: (d - 0.8).max(0.0),
+                    x: (i % 32) as f32,
+                    y: (i / 32) as f32,
+                    t: 2.3,
+                    drift_phase: drift_phase_at(2.3),
+                };
+                let got = shade_surface(&px, &material);
+                let want = previous_shade_surface(&px, &material);
+                let preview_rgb = |rgba: (f32, f32, f32, f32)| {
+                    let (r, g, b, lum) = rgba;
+                    let (r, g, b) = (r.min(1.0).sqrt(), g.min(1.0).sqrt(), b.min(1.0).sqrt());
+                    let a = lum.clamp(0.0, 1.0);
+                    [r, g, b].map(|channel| {
+                        ((channel * a + (6.0 / 255.0) * (1.0 - a)) * 255.0) as u8
+                    })
+                };
+                let got = preview_rgb(got);
+                let want = preview_rgb(want);
+                for channel in 0..3 {
+                    assert!(
+                        got[channel].abs_diff(want[channel]) <= 1,
+                        "surface={} pixel={i} channel={channel}: got={} want={}",
+                        surface.slug(),
+                        got[channel],
+                        want[channel],
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn shoulder_is_monotonic_and_bounded() {

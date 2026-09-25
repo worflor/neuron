@@ -65,8 +65,9 @@ For non-root hidraw access, from this extracted directory run:
 Reconnect the device after installing the rule.
 
 This build has no GitHub Actions provenance attestation. Check SHA256SUMS.txt
-against the downloaded files and review the source commit above. The matching
+against the downloaded archive and review the source commit above. The matching
 source and license terms are in the repository.
 EOF
 tar -czf "$repo/dist/$name.tar.gz" -C "$repo/dist" "$name"
-echo "Packaged $repo/dist/$name.tar.gz ($floor)"
+(cd "$repo/dist" && sha256sum "$name.tar.gz" > SHA256SUMS.txt)
+echo "Packaged $repo/dist/$name.tar.gz and $repo/dist/SHA256SUMS.txt ($floor)"

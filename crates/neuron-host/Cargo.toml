@@ -61,6 +61,11 @@ required-features = ["bridge"]
 name = "chroma_paint"
 required-features = ["bridge"]
 
+[[bin]]
+name = "neuron-chroma-broker"
+path = "src/bin/chroma_broker.rs"
+required-features = ["bridge"]
+
 [dev-dependencies]
 proptest = "1"
 static_assertions = "1.1"

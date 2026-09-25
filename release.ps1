@@ -4,18 +4,14 @@
 
 # release.ps1 - build Neuron in release mode and make it the resident (startup) instance.
 #
-# Neuron runs as a tray-resident app launched at login by the Scheduled Task
-# "Neuron (elevated tray)" (RunLevel Highest). Elevation is load-bearing: the native Chroma
-# SHM server creates Global\ shared-memory objects, which need SeCreateGlobalPrivilege - an
-# unelevated instance silently degrades to REST-only. Never recreate the old HKCU "Run" key
-# launcher.
+# Neuron's historical task name is "Neuron (elevated tray)", but its run level is Limited.
+# The app and RAW macros must not start elevated from a user-writable build directory.
 #
-# The task already points at target\release\neuron-app.exe, so "release" = rebuild that file
-# and bounce the task. Stopping also goes through the task: an unelevated shell's
-# Stop-Process gets Access Denied against the elevated instance.
+# Rebuild target\release\neuron-app.exe, then use an enabled task or launch directly when
+# autostart is off. Never create an autostart task just to run a release build.
 #
 # Usage:
-#   .\release.ps1                 # build release, restart the elevated tray instance
+#   .\release.ps1                 # build release, restart the tray instance
 #   .\release.ps1 -SkipBuild      # just restart the tray from the existing release binary
 #   .\release.ps1 -NoRelaunch     # build, but leave the app closed
 
@@ -32,20 +28,62 @@ $TaskName = 'Neuron (elevated tray)'
 
 function Write-Step($msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
 
-# 1. Stop any running instance - the elevated one via its task (the only handle an
-#    unelevated shell has on it), then any stray debug/unelevated ones directly.
+function Test-EnabledLogonTask($task) {
+    if (-not $task -or -not $task.Settings.Enabled) { return $false }
+    return @($task.Triggers | Where-Object {
+        $_.CimClass.CimClassName -eq 'MSFT_TaskLogonTrigger' -and $_.Enabled
+    }).Count -gt 0
+}
+
+function Test-CurrentProcessElevated {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Test-LimitedStartupTask($task, $exe) {
+    if (-not (Test-EnabledLogonTask $task)) { return $false }
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = [string]$task.Principal.UserId
+    try {
+        $principalSid = if ($principal -match '^S-1-') { $principal } else {
+            ([Security.Principal.NTAccount]$principal).Translate([Security.Principal.SecurityIdentifier]).Value
+        }
+    } catch { return $false }
+    return @($task.Actions).Count -eq 1 -and
+        $task.Actions[0].Execute -ieq $exe -and
+        $task.Actions[0].Arguments -eq '--tray' -and
+        $task.Actions[0].WorkingDirectory -ieq (Split-Path -Parent $exe) -and
+        $task.Principal.RunLevel -eq 'Limited' -and
+        $task.Principal.LogonType -eq 'Interactive' -and
+        $principalSid -eq $identity.User.Value -and
+        $task.Settings.ExecutionTimeLimit -eq 'PT0S'
+}
+
+# Refuse before stopping the resident app: a direct launch from an administrator shell would
+# inherit that shell's elevated token even though the autostart task is absent or disabled.
+if (-not $NoRelaunch -and (Test-CurrentProcessElevated)) {
+    $preflightTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    if (-not (Test-EnabledLogonTask $preflightTask)) {
+        throw 'autostart is off; run release.ps1 from a normal PowerShell to relaunch Neuron without elevation'
+    }
+}
+
+# 1. Stop any running instance through its task when available, then any strays directly.
 #    The exe must be unlocked or the link step fails. Teardown is asynchronous, so poll
 #    for exit instead of guessing a sleep.
 Write-Step 'Stopping any running Neuron instances'
 if (Get-Process neuron-app, neuron -ErrorAction SilentlyContinue) {
-    schtasks /end /tn $TaskName | Out-Null
+    if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+        Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    }
     $deadline = (Get-Date).AddSeconds(5)
     while ((Get-Date) -lt $deadline -and (Get-Process neuron-app, neuron -ErrorAction SilentlyContinue)) {
         Start-Sleep -Milliseconds 250
     }
     $running = Get-Process neuron-app, neuron -ErrorAction SilentlyContinue
     if ($running) {
-        # not the task's instance (a debug/unelevated stray) - stop it directly
+        # Not the task's instance (a debug or manual launch) - stop it directly.
         try { $running | Stop-Process -Force -ErrorAction Stop } catch {
             throw "a Neuron instance (pid $($running.Id -join ', ')) won't die from this shell - close it manually, then re-run"
         }
@@ -75,102 +113,62 @@ if (-not $SkipBuild) {
 
 if (-not (Test-Path $AppExe)) { throw "release binary not found at $AppExe" }
 
-# 3. Relaunch the resident instance through the task so it comes back elevated.
-#    The task's target is verified on both sides of the launch: the app itself can re-register
-#    the task from its own exe path (the launch-mode selector), so a debug/dev instance may
-#    have re-pointed it. Command check before, executable-path check after; fail loud on both.
+# 3. Preserve the user's autostart setting. Repair an enabled task before using it, but launch
+#    directly when no enabled logon task exists. Never run a stale elevated task.
 if (-not $NoRelaunch) {
-    Write-Step "Launching via scheduled task '$TaskName'"
-    # no stderr redirect: under EAP=Stop, PS 5.1 wraps redirected native stderr into a
-    # terminating NativeCommandError, which would mask the honest handling below.
-    $taskXml = schtasks /query /tn $TaskName /xml | Out-String
-    $needsRepair = $true
-    $hadLogon = $true   # a missing task is recreated WITH autostart (the historic default)
-    if ($taskXml -match '<Command>([^<]+)</Command>') {
-        $target = [System.Net.WebUtility]::HtmlDecode($Matches[1]).Trim()
-        $hadLogon = $taskXml -match '<LogonTrigger>'
-        $needsRepair = ($target -ne $AppExe)
-        if ($needsRepair) { Write-Host "    task points at '$target' - repointing at the release build" }
+    $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    $useTask = Test-EnabledLogonTask $task
+    if ($useTask) {
+        $user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+        $dir = Split-Path -Parent $AppExe
+        if (-not (Test-LimitedStartupTask $task $AppExe)) {
+            Write-Step 'Repairing the limited startup task'
+            $action = New-ScheduledTaskAction -Execute $AppExe -Argument '--tray' -WorkingDirectory $dir
+            $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
+            $trigger.Delay = 'PT15S'
+            $limited = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
+            $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Seconds 0) -MultipleInstances IgnoreNew -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+            try {
+                Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $limited -Settings $settings -Force -ErrorAction Stop | Out-Null
+            } catch {
+                throw "could not replace the old startup task with a limited task: $_. Remove the old task with administrator permission, then retry."
+            }
+            $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+            if (-not (Test-LimitedStartupTask $task $AppExe)) {
+                throw 'startup task repair did not produce the expected limited task; refusing to launch it'
+            }
+        }
+        Write-Step "Launching via limited scheduled task '$TaskName'"
+        Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop
     } else {
-        Write-Host "    task missing - creating it for the release build"
-    }
-    if ($needsRepair) {
-        # Re-register at $AppExe, preserving the logon-trigger (autostart) state the task had.
-        Write-Step 'Repairing the startup task'
-        # XML-escape everything interpolated: Windows paths and account names can legally
-        # contain '&' and friends, which would corrupt the task definition.
-        $xUser = [System.Security.SecurityElement]::Escape("$env:USERDOMAIN\$env:USERNAME")
-        $xExe  = [System.Security.SecurityElement]::Escape($AppExe)
-        $xWork = [System.Security.SecurityElement]::Escape("$RepoRoot\target\release")
-        $trigger = if ($hadLogon) {
-            "  <Triggers>`n    <LogonTrigger>`n      <Delay>PT15S</Delay>`n      <UserId>$xUser</UserId>`n    </LogonTrigger>`n  </Triggers>"
-        } else { '  <Triggers />' }
-        $repairXml = @"
-<?xml version="1.0" encoding="UTF-16"?>
-<Task version="1.3" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <RegistrationInfo>
-    <URI>\$TaskName</URI>
-  </RegistrationInfo>
-  <Principals>
-    <Principal id="Author">
-      <UserId>$xUser</UserId>
-      <LogonType>InteractiveToken</LogonType>
-      <RunLevel>HighestAvailable</RunLevel>
-    </Principal>
-  </Principals>
-  <Settings>
-    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
-    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
-    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
-    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
-    <StartWhenAvailable>true</StartWhenAvailable>
-    <UseUnifiedSchedulingEngine>true</UseUnifiedSchedulingEngine>
-  </Settings>
-$trigger
-  <Actions Context="Author">
-    <Exec>
-      <Command>$xExe</Command>
-      <Arguments>--tray</Arguments>
-      <WorkingDirectory>$xWork</WorkingDirectory>
-    </Exec>
-  </Actions>
-</Task>
-"@
-        $xmlPath = Join-Path $env:TEMP 'neuron-release-task.xml'
-        $repairXml | Out-File $xmlPath -Encoding Unicode
-        schtasks /create /tn $TaskName /xml $xmlPath /f | Out-Null
-        if ($LASTEXITCODE -ne 0) {
-            # HighestAvailable registration can need admin - one consented UAC elevation.
-            Write-Host '    unelevated registration refused - requesting elevation (UAC)'
-            Start-Process schtasks -ArgumentList '/create', '/tn', "`"$TaskName`"", '/xml', "`"$xmlPath`"", '/f' -Verb RunAs -Wait
+        if (Test-CurrentProcessElevated) {
+            throw 'autostart is off; run release.ps1 from a normal PowerShell to relaunch Neuron without elevation'
         }
-        Remove-Item $xmlPath -Force -ErrorAction SilentlyContinue
-        $taskXml = schtasks /query /tn $TaskName /xml | Out-String
-        if (-not ($taskXml -match '<Command>([^<]+)</Command>') -or
-            ([System.Net.WebUtility]::HtmlDecode($Matches[1]).Trim() -ne $AppExe)) {
-            throw "could not repoint the startup task at the release build - fix it manually: schtasks /query /tn `"$TaskName`" /v"
+        if ($task) {
+            # Manual mode no longer needs a dormant task as an elevation vehicle.
+            try {
+                Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction Stop
+            } catch {
+                throw "could not remove the inactive legacy task: $_. Remove it with administrator permission, then retry."
+            }
         }
-        Write-Host '    task repaired'
+        Write-Step 'Launching directly (autostart is off)'
+        Start-Process -FilePath $AppExe -ArgumentList '--tray' -WorkingDirectory (Split-Path -Parent $AppExe)
     }
-    schtasks /run /tn $TaskName | Out-Null
-    # Poll for the spawn - task-scheduler latency varies. The resident-is-release invariant is
-    # proven by the chain, not by reading the elevated process's path (Get-Process .Path and
-    # WMI ExecutablePath both come back empty across the elevation boundary): every instance
-    # was stopped above, the task's <Command> was verified/repaired to $AppExe, and a process
-    # appeared after /run. Readable paths do exist for unelevated strays; those fail loud.
+    # The launch is unelevated, so its executable path must be readable and match the build.
     $deadline = (Get-Date).AddSeconds(15)
     do {
         Start-Sleep -Milliseconds 500
         $p = Get-CimInstance Win32_Process -Filter "Name='neuron-app.exe'" -ErrorAction SilentlyContinue
     } until ($p -or ((Get-Date) -gt $deadline))
     if (-not $p) {
-        throw "task ran but no neuron-app process appeared - check the task with: schtasks /query /tn `"$TaskName`" /v"
+        throw 'no neuron-app process appeared after launch'
     }
-    $foreign = @(@($p.ExecutablePath) | Where-Object { $_ -and ($_ -ne $AppExe) })
+    $foreign = @(@($p.ExecutablePath) | Where-Object { -not $_ -or $_ -ine $AppExe })
     if ($foreign.Count -gt 0) {
-        throw "another neuron-app is running from '$($foreign -join ', ')' beside the release build - kill it and re-run"
+        throw "could not verify the release process path: $($foreign -join ', ')"
     }
-    Write-Host "    running (pid $(($p.ProcessId) -join ', ')) via the verified task target"
+    Write-Host "    running (pid $(($p.ProcessId) -join ', ')) from the release build"
 } else {
     Write-Step 'Not relaunching (-NoRelaunch)'
 }

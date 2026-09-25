@@ -2178,6 +2178,7 @@ mod imp {
         {
             let rad = (s.width / 2.0).max(1.0);
             let mt = crate::weave::seconds();
+            let drift_phase = crate::weave::drift_phase_at(mt);
             // The spellweaving pen pours the LIVE material — a per-stroke clone of whatever surface/knobs
             // the user has chosen in settings, with its ACCENT overridden to the chosen swatch, fed by
             // THIS stroke's signed-distance field (the same kind of field the overlay's glow buffer is;
@@ -2229,6 +2230,7 @@ mod imp {
                                 xx as f32,
                                 yy as f32,
                                 mt,
+                                drift_phase,
                                 m,
                             )
                         }
@@ -2274,6 +2276,7 @@ mod imp {
         x: f32,
         y: f32,
         t: f32,
+        drift_phase: f32,
         m: &crate::weave::Material,
     ) -> (u32, u32) {
         let dens = |dd: f32| (1.0 - dd / rad).clamp(0.0, 1.0);
@@ -2306,6 +2309,7 @@ mod imp {
             x,
             y,
             t,
+            drift_phase,
         };
         let (cr, cg, cb, lum) = crate::weave::shade_surface(&px, m);
         let cov = (rad + 0.5 - d).clamp(0.0, 1.0); // 1px AA at the true rim
@@ -2471,12 +2475,13 @@ mod imp {
         xx: i32,
         side: f32,
         t: f32,
+        drift_phase: f32,
         m: &crate::weave::Material,
     ) -> (u32, u32) {
         let slope = 0.66 * (xx as f32 * 0.22).cos(); // d/dx of the preview spine
                                                      // x = the cell longitude, y = the signed offset off the spine — so the LIVE material's
                                                      // animated fields (the same surface the canvas pours) breathe in the dock swatch too.
-        material_core(d, rad, -slope * side, side, xx as f32, side * d, t, m)
+        material_core(d, rad, -slope * side, side, xx as f32, side * d, t, drift_phase, m)
     }
 
     /// Render a COMMITTED stroke (full repaints, shape-set replacements): carve every segment
@@ -2704,6 +2709,7 @@ mod imp {
         let y0 = (a.1.min(b.1).saturating_sub(r)).clamp(0, h - 1);
         let y1 = (a.1.max(b.1).saturating_add(r)).clamp(0, h - 1);
         let mt = crate::weave::seconds();
+        let drift_phase = crate::weave::drift_phase_at(mt);
         for yy in y0..=y1 {
             for xx in x0..=x1 {
                 let (d, t) = seg_proj((xx as f32, yy as f32), a, b);
@@ -2719,7 +2725,7 @@ mod imp {
                     let gl = (gx * gx + gy * gy).sqrt().max(1e-3);
                     gx /= gl;
                     gy /= gl;
-                    material_core(d, rad, gx, gy, xx as f32, yy as f32, mt, m)
+                    material_core(d, rad, gx, gy, xx as f32, yy as f32, mt, drift_phase, m)
                 } else {
                     // the pen's OWN brush — the laser is the same media, just fading. (arc = 0:
                     // the along-stroke streak doesn't vary on a transient pointer; the across/
@@ -2777,6 +2783,7 @@ mod imp {
         let xl = ((cx as f32 - rr - band - 1.0) as i32).max(0);
         let xh = ((cx as f32 + rr + band + 1.0) as i32).min(w - 1);
         let mt = crate::weave::seconds();
+        let drift_phase = crate::weave::drift_phase_at(mt);
         for yy in yl..=yh {
             for xx in xl..=xh {
                 let dxp = xx as f32 - cx as f32;
@@ -2787,7 +2794,7 @@ mod imp {
                     continue;
                 }
                 let inv = 1.0 / dist.max(1e-3);
-                let (col, al) = material_core(d, band, dxp * inv, dyp * inv, xx as f32, yy as f32, mt, m);
+                let (col, al) = material_core(d, band, dxp * inv, dyp * inv, xx as f32, yy as f32, mt, drift_phase, m);
                 let al = (al as f32 * amp.clamp(0.0, 1.0)) as u32;
                 if al == 0 {
                     continue;
@@ -4243,6 +4250,7 @@ mod palette {
                 // rendered by the same media shaders the canvas uses, in your current colour
                 // (the curve exists so each medium's EDGE character shows, not just its body) ──
                 let mt = crate::weave::seconds();
+                let drift_phase = crate::weave::drift_phase_at(mt);
                 for (r, it) in its {
                     if let Item::BrushK(i) = it {
                         let brush = BRUSHES[*i % BRUSHES.len()];
@@ -4273,7 +4281,7 @@ mod palette {
                                 let (c, a) = match &material_mat {
                                     Some(m) if d <= rad + 2.0 => {
                                         let side = if yy as f32 >= spine { 1.0 } else { -1.0 };
-                                        super::imp::material_preview_px(d, rad, xx, side, mt, m)
+                                        super::imp::material_preview_px(d, rad, xx, side, mt, drift_phase, m)
                                     }
                                     _ => (
                                         st.pen.color,

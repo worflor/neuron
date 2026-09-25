@@ -136,6 +136,9 @@ jobs:
       - name: build
         run: cargo build --release --workspace --locked
 
+      - name: build protected Chroma broker
+        run: cargo build --release -p neuron-host --features bridge --bin neuron-chroma-broker --locked
+
       # Stage the zip. The license bundle ships with the binary, not just in the repo: neuron
       # is GPL-3.0-or-later, so a binary release carries its terms and a pointer back to the
       # exact source it was built from.
@@ -147,9 +150,12 @@ jobs:
           mkdir -p "dist/$name"
           cp target/release/neuron-app.exe "dist/$name/"
           cp target/release/neuron.exe     "dist/$name/"
-          cp README.md LICENSE.md THIRD-PARTY-NOTICES.md SECURITY.md "dist/$name/"
+          cp target/release/neuron-chroma-broker.exe "dist/$name/"
+          cp packaging/windows/install-chroma-broker.ps1 "dist/$name/"
+          cp README.md CHANGELOG.md LICENSE.md THIRD-PARTY-NOTICES.md SECURITY.md "dist/$name/"
           cp -r LICENSES "dist/$name/"
           cp -r skills "dist/$name/"
+          cp -r docs "dist/$name/"
           cat > "dist/$name/SOURCE.txt" <<EOF
           neuron ${{ needs.preflight.outputs.version }} — windows x86_64
 

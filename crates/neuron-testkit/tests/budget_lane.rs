@@ -33,7 +33,7 @@ fn resident_footprint_stays_within_budget() {
     assert!(exe.exists(), "{} does not exist — build release first", exe.display());
 
     let mut app = Resident::launch(&exe, &["--tray"]).expect("launch in job");
-    // boot settle: registry load, device scan, host servers, sidecar warm.
+    // boot settle: registry load, device scan, host servers. Input and the Python sidecar stay cold.
     std::thread::sleep(Duration::from_secs(8));
 
     let budgets = Budgets::default();

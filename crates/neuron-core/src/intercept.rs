@@ -37,7 +37,8 @@
 //! layer (via a `dwExtraInfo` signature) before they ever reach [`on_hook`], so the shim never
 //! re-processes its own output.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
 /// What a matched keystroke should turn into.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,11 +83,12 @@ pub struct Inject {
 }
 
 /// One swallowed keystroke awaiting device attribution from Raw-Input.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Pending {
     scancode: u16,
     down: bool,
     at_us: u64,
+    remaps: Arc<[Remap]>,
 }
 
 /// The pure correlation core. Not `Send`-shared directly — the live layer wraps it in a mutex and
@@ -94,9 +96,17 @@ struct Pending {
 #[derive(Default)]
 pub struct Interceptor {
     /// scancode -> remaps that involve it (O(1) lookup for the hot hook path).
-    by_scancode: HashMap<u16, Vec<Remap>>,
+    by_scancode: HashMap<u16, Arc<[Remap]>>,
     /// swallowed-but-not-yet-attributed keystrokes, oldest first.
     pending: VecDeque<Pending>,
+    /// An UP already replayed fail-open, but still awaiting its device identity so the matching
+    /// mapped target can be released without touching another device's held target.
+    late_ups: VecDeque<Pending>,
+    /// Mapped DOWNs accepted from Raw Input. Their target UP must be sent even if interception
+    /// stops before the physical UP is attributed.
+    held_targets: HashMap<(u16, crate::registry::CanonicalPid), u16>,
+    /// A source whose device identity never arrived stands down until its next physical UP.
+    fail_open_sources: HashSet<u16>,
 }
 
 impl Interceptor {
@@ -105,32 +115,39 @@ impl Interceptor {
         Self::default()
     }
 
-    /// Rebuild the remap table (called when the engine's bindings change). Clears pending too —
-    /// a config swap must not resolve a stale keystroke against a new rule.
+    /// Rebuild the active remap table. Swallowed edges keep the rules they captured at hook time,
+    /// so a config swap cannot reroute or discard input already withheld from the desktop.
     pub fn set_remaps(&mut self, remaps: impl IntoIterator<Item = Remap>) {
-        self.by_scancode.clear();
-        self.pending.clear();
+        let mut by_scancode: HashMap<u16, Vec<Remap>> = HashMap::new();
         for r in remaps {
-            self.by_scancode.entry(r.from).or_default().push(r);
+            by_scancode.entry(r.from).or_default().push(r);
         }
+        self.by_scancode = by_scancode
+            .into_iter()
+            .map(|(key, remaps)| (key, Arc::from(remaps)))
+            .collect();
+        self.fail_open_sources.clear();
     }
 
     /// True if ANY device remap involves this scancode — the hook swallows it (device unknown yet).
     #[must_use]
     pub fn is_remapped_scancode(&self, scancode: u16) -> bool {
-        self.by_scancode.contains_key(&scancode)
+        !self.fail_open_sources.contains(&scancode) && self.by_scancode.contains_key(&scancode)
     }
 
     /// HOOK edge: record a swallowed keystroke as pending. Returns whether the hook should swallow
     /// (true iff the scancode is remapped for some device). Only call for NON-injected events.
     pub fn on_hook(&mut self, scancode: u16, down: bool, now_us: u64) -> bool {
-        if !self.by_scancode.contains_key(&scancode) {
+        if self.fail_open_sources.contains(&scancode) {
+            if !down { self.fail_open_sources.remove(&scancode); }
             return false;
         }
+        let Some(remaps) = self.by_scancode.get(&scancode).cloned() else { return false };
         self.pending.push_back(Pending {
             scancode,
             down,
             at_us: now_us,
+            remaps,
         });
         true
     }
@@ -145,15 +162,34 @@ impl Interceptor {
         down: bool,
         pid: crate::registry::CanonicalPid,
     ) -> Option<Inject> {
-        let pos = self
-            .pending
-            .iter()
-            .position(|p| p.scancode == scancode && p.down == down)?;
-        self.pending.remove(pos);
-        let remaps = self.by_scancode.get(&scancode)?;
-        match remaps.iter().find(|r| r.pid == pid) {
+        let (pending, already_replayed) = if !down {
+            if let Some(pos) = self.late_ups.iter().position(|p| p.scancode == scancode) {
+                (self.late_ups.remove(pos)?, true)
+            } else {
+                let pos = self.pending.iter().position(|p| p.scancode == scancode && !p.down)?;
+                (self.pending.remove(pos)?, false)
+            }
+        } else {
+            let pos = self.pending.iter().position(|p| p.scancode == scancode && p.down)?;
+            (self.pending.remove(pos)?, false)
+        };
+        let held_key = (scancode, pid);
+        if let Some(&target) = self.held_targets.get(&held_key) {
+            if !down {
+                self.held_targets.remove(&held_key);
+                self.clear_late_ups_without_held_source(scancode);
+            }
+            return Some(Inject { scancode: target, down });
+        }
+        if !down {
+            return (!already_replayed).then_some(Inject { scancode, down: false });
+        }
+        match pending.remaps.iter().find(|r| r.pid == pid) {
             Some(r) => match r.to {
-                KeyOut::Scancode(sc) => Some(Inject { scancode: sc, down }),
+                KeyOut::Scancode(sc) => {
+                    self.held_targets.insert(held_key, sc);
+                    Some(Inject { scancode: sc, down })
+                }
                 // Claimed by a host feature: the swallow IS the resolution — inject nothing.
                 KeyOut::Swallow => None,
             },
@@ -176,7 +212,66 @@ impl Interceptor {
                 scancode: p.scancode,
                 down: p.down,
             });
+            if !p.down {
+                let held = self.held_targets.keys().filter(|(source, _)| *source == p.scancode).count();
+                if held > 0 {
+                    // The hook has no device ID, even when just one mapped device is held: an
+                    // unrelated device could have sent this UP. Keep it for a late Raw Input
+                    // match rather than releasing a target that may still be physically held.
+                    let queued = self.late_ups.iter().filter(|edge| edge.scancode == p.scancode).count();
+                    if queued < held {
+                        self.late_ups.push_back(p);
+                    }
+                }
+            }
         }
+        const RESET_US: u64 = 100_000;
+        let mut reset = HashSet::new();
+        for edge in &self.late_ups {
+            if now_us.saturating_sub(edge.at_us) >= RESET_US {
+                reset.insert(edge.scancode);
+            }
+        }
+        for source in reset {
+            self.late_ups.retain(|edge| edge.scancode != source);
+            self.fail_open_sources.insert(source);
+            self.held_targets.retain(|(scancode, _), target| {
+                if *scancode == source {
+                    out.push(Inject { scancode: *target, down: false });
+                    false
+                } else {
+                    true
+                }
+            });
+            let mut kept = VecDeque::new();
+            while let Some(edge) = self.pending.pop_front() {
+                if edge.scancode == source {
+                    out.push(Inject { scancode: source, down: edge.down });
+                } else {
+                    kept.push_back(edge);
+                }
+            }
+            self.pending = kept;
+        }
+        out
+    }
+
+    fn clear_late_ups_without_held_source(&mut self, source: u16) {
+        if !self.held_targets.keys().any(|(scancode, _)| *scancode == source) {
+            self.late_ups.retain(|edge| edge.scancode != source);
+        }
+    }
+
+    /// Fail open unresolved originals and release every target whose mapped DOWN already landed.
+    /// Both halves matter when a physical UP is pending at the state transition.
+    fn drain_transition(&mut self) -> Vec<Inject> {
+        self.late_ups.clear();
+        self.fail_open_sources.clear();
+        let mut out: Vec<Inject> = self.pending.drain(..)
+            .map(|p| Inject { scancode: p.scancode, down: p.down })
+            .collect();
+        out.extend(self.held_targets.drain()
+            .map(|(_, target)| Inject { scancode: target, down: false }));
         out
     }
 
@@ -196,6 +291,7 @@ impl Interceptor {
     /// host-side handling of a trigger the shim already owns (avoids the double-send).
     #[must_use]
     pub fn has_remap(&self, physkey: u16, pid: crate::registry::CanonicalPid) -> bool {
+        if self.fail_open_sources.contains(&physkey) { return false; }
         self.by_scancode
             .get(&physkey)
             .is_some_and(|v| v.iter().any(|r| r.pid == pid))
@@ -205,6 +301,7 @@ impl Interceptor {
     /// don't count — the dispatcher must still fire their actions (see the module-level `owns`).
     #[must_use]
     pub fn has_key_remap(&self, physkey: u16, pid: crate::registry::CanonicalPid) -> bool {
+        if self.fail_open_sources.contains(&physkey) { return false; }
         self.by_scancode.get(&physkey).is_some_and(|v| {
             v.iter()
                 .any(|r| r.pid == pid && matches!(r.to, KeyOut::Scancode(_)))
@@ -257,7 +354,7 @@ impl Interceptor {
 //   ignores it.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::Instant;
 
 /// Signature stamped into `dwExtraInfo` on every keystroke WE inject — the hook recognizes its own
@@ -269,6 +366,30 @@ const INJECT_SIG: usize = 0x006e_726e;
 const EXPIRE_US: u64 = 8_000;
 
 static CORE: Mutex<Option<Interceptor>> = Mutex::new(None);
+struct EdgeState {
+    disarming: bool,
+    in_flight: usize,
+}
+/// The hook only holds this while recording an edge. OS injection runs after it is released, so
+/// SendInput can call back through the hook without waiting on a lock held by its own caller.
+static EDGE_TRANSITION: Mutex<EdgeState> = Mutex::new(EdgeState { disarming: false, in_flight: 0 });
+static EDGE_IDLE: Condvar = Condvar::new();
+/// State changes may wait for prior emissions, but the hook never takes this mutex.
+static STANDDOWN_TRANSITION: Mutex<()> = Mutex::new(());
+
+struct Emission;
+impl Drop for Emission {
+    fn drop(&mut self) {
+        let mut state = EDGE_TRANSITION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.in_flight -= 1;
+        EDGE_IDLE.notify_all();
+    }
+}
+
+fn reserve_emission(state: &mut EdgeState) -> Emission {
+    state.in_flight += 1;
+    Emission
+}
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Temporarily suspend the shim WITHOUT tearing down the hook — set while a press-to-bind capture
 /// is in flight, so pressing a control to BIND it isn't swallowed/remapped (the user is binding it,
@@ -276,10 +397,49 @@ static ACTIVE: AtomicBool = AtomicBool::new(false);
 static PAUSED: AtomicBool = AtomicBool::new(false);
 
 /// Suspend/resume the shim for the duration of a press-to-bind capture. While paused, keys pass
-/// through untouched (no swallow, no inject) so a captured control is read cleanly. Cheap; call
-/// `true` when a capture starts and `false` when it ends.
+/// through untouched so a captured control is read cleanly. Already-swallowed originals are
+/// replayed before the pause takes effect. Call `true` at capture start and `false` at its end.
 pub fn set_paused(on: bool) {
-    PAUSED.store(on, Ordering::SeqCst);
+    let _standdown = STANDDOWN_TRANSITION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (pending, _emission) = {
+        let mut state = EDGE_TRANSITION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        PAUSED.store(on, Ordering::SeqCst);
+        let pending = if on && !state.disarming { take_transition_edges() } else { Vec::new() };
+        let emission = (!pending.is_empty()).then(|| reserve_emission(&mut state));
+        if emission.is_some() {
+            while state.in_flight > 1 {
+                state = EDGE_IDLE.wait(state).unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        }
+        (pending, emission)
+    };
+    for edge in pending { emit(edge); }
+}
+
+fn take_transition_edges() -> Vec<Inject> {
+    CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_mut()
+        .map(Interceptor::drain_transition)
+        .unwrap_or_default()
+}
+
+/// Finish fail-open replay while the input gate is still armed, then close it before a new hook
+/// edge can enter. Called only by the process-wide safety setter.
+pub(crate) fn disarm_input_with(close_gate: impl FnOnce()) {
+    let _standdown = STANDDOWN_TRANSITION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let pending = {
+        let mut state = EDGE_TRANSITION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.disarming = true;
+        let pending = take_transition_edges();
+        while state.in_flight != 0 {
+            state = EDGE_IDLE.wait(state).unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        pending
+    };
+    for edge in pending { emit(edge); }
+    let mut state = EDGE_TRANSITION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    close_gate();
+    state.disarming = false;
 }
 
 /// Is the shim currently paused for a press-to-bind capture? Read-only witness for the capture
@@ -296,7 +456,20 @@ pub fn paused() -> bool {
 /// [`expire_tick`] deliberately does NOT consult it: a keystroke swallowed in the instant BEFORE the
 /// pause must still fail open and replay, or pausing would eat the key it was meant to protect.
 fn standing_down() -> bool {
-    !ACTIVE.load(Ordering::Relaxed) || PAUSED.load(Ordering::Relaxed)
+    standing_down_for(ACTIVE.load(Ordering::Relaxed), PAUSED.load(Ordering::Relaxed))
+}
+
+fn standing_down_for(active: bool, paused: bool) -> bool {
+    !active || paused
+}
+
+fn requested_hooks_installed(
+    want_kbd: bool,
+    want_mouse: bool,
+    kbd_installed: bool,
+    mouse_installed: bool,
+) -> bool {
+    (!want_kbd || kbd_installed) && (!want_mouse || mouse_installed)
 }
 
 fn epoch() -> Instant {
@@ -312,27 +485,48 @@ fn now_us() -> u64 {
 /// pays for a global mouse hook, and vice versa. A later empty config tears everything down.
 /// Idempotent.
 pub fn configure(remaps: Vec<Remap>) {
+    let _standdown = STANDDOWN_TRANSITION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let any = !remaps.is_empty();
     let want_mouse = remaps.iter().any(|r| r.from & MOUSE_PHYSKEY_BASE != 0);
     let want_kbd = remaps.iter().any(|r| r.from & MOUSE_PHYSKEY_BASE == 0);
-    {
+    // A config swap stands down the old remaps and releases their held outputs before the new
+    // rules can own an edge. No key already withheld from the desktop is discarded.
+    let (pending, _emission) = {
+        let mut state = EDGE_TRANSITION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        ACTIVE.store(false, Ordering::SeqCst);
+        let pending = if !state.disarming { take_transition_edges() } else { Vec::new() };
+        let emission = (!pending.is_empty()).then(|| reserve_emission(&mut state));
+        if emission.is_some() {
+            while state.in_flight > 1 {
+                state = EDGE_IDLE.wait(state).unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        }
         let mut g = CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         g.get_or_insert_with(Interceptor::new).set_remaps(remaps);
-    }
+        (pending, emission)
+    };
+    for edge in pending { emit(edge); }
+    drop(_emission);
     if any {
-        ACTIVE.store(true, Ordering::SeqCst);
-        if want_kbd {
-            sys::install();
+        let kbd_installed = if want_kbd {
+            sys::install()
         } else {
             sys::uninstall();
-        }
-        if want_mouse {
-            sys::install_mouse();
+            true
+        };
+        let mouse_installed = if want_mouse {
+            sys::install_mouse()
         } else {
             sys::uninstall_mouse();
-        }
+            true
+        };
+        ACTIVE.store(
+            requested_hooks_installed(want_kbd, want_mouse, kbd_installed, mouse_installed),
+            Ordering::SeqCst,
+        );
     } else {
-        deactivate();
+        sys::uninstall();
+        sys::uninstall_mouse();
     }
 }
 
@@ -468,7 +662,7 @@ pub fn owns(page: u16, usage: u16, pid: u16) -> bool {
     let pid = crate::registry::CanonicalPid::of(pid);
     // While paused the shim owns nothing, so the live dispatcher must NOT skip its own dispatch on
     // our behalf — otherwise the edge falls through the gap between the two of us.
-    if standing_down() {
+    if standing_down() || !crate::action::input_armed() {
         return false;
     }
     let physkey = match page {
@@ -485,12 +679,26 @@ pub fn owns(page: u16, usage: u16, pid: u16) -> bool {
 
 /// Disarm the shim and uninstall both hooks (the desktop returns to normal instantly).
 pub fn deactivate() {
-    ACTIVE.store(false, Ordering::SeqCst);
-    if let Ok(mut g) = CORE.lock() {
-        if let Some(c) = g.as_mut() {
-            c.set_remaps([]);
+    let _standdown = STANDDOWN_TRANSITION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (pending, _emission) = {
+        let mut state = EDGE_TRANSITION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        ACTIVE.store(false, Ordering::SeqCst);
+        let pending = if !state.disarming { take_transition_edges() } else { Vec::new() };
+        let emission = (!pending.is_empty()).then(|| reserve_emission(&mut state));
+        if emission.is_some() {
+            while state.in_flight > 1 {
+                state = EDGE_IDLE.wait(state).unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
         }
-    }
+        if let Ok(mut g) = CORE.lock() {
+            if let Some(c) = g.as_mut() {
+                c.set_remaps([]);
+            }
+        }
+        (pending, emission)
+    };
+    for edge in pending { emit(edge); }
+    drop(_emission);
     sys::uninstall();
     sys::uninstall_mouse();
 }
@@ -500,9 +708,10 @@ pub fn deactivate() {
 /// on the input-arm kill-switch — in safe mode we swallow nothing (pure pass-through, no remap).
 #[cfg_attr(not(windows), allow(dead_code))]
 fn hook_edge(physkey: u16, down: bool) -> bool {
+    let state = EDGE_TRANSITION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     // `standing_down` covers PAUSED too: swallowing a key mid-capture is exactly the bug the pause
     // exists to prevent (the user is BINDING this control, not using it).
-    if standing_down() || !crate::action::input_armed() {
+    if state.disarming || standing_down() || !crate::action::input_armed() {
         return false;
     }
     let mut g = CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -518,13 +727,14 @@ fn hook_edge(physkey: u16, down: bool) -> bool {
 /// have to know the rule.
 pub fn on_raw_keyboard(physkey: u16, down: bool, pid: u16) {
     let pid = crate::registry::CanonicalPid::of(pid);
-    // Paused means transparent in BOTH directions: no swallow above, no inject here.
-    if standing_down() {
-        return;
-    }
-    let inject = {
+    let (inject, _emission) = {
+        let mut state = EDGE_TRANSITION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A transition drains pending originals; do not race it by consuming an attributed edge.
+        if state.disarming || standing_down() { return; }
         let mut g = CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        g.as_mut().and_then(|c| c.on_rawinput(physkey, down, pid))
+        let inject = g.as_mut().and_then(|c| c.on_rawinput(physkey, down, pid));
+        let emission = inject.map(|_| reserve_emission(&mut state));
+        (inject, emission)
     };
     if let Some(i) = inject {
         emit(i);
@@ -542,14 +752,15 @@ pub fn on_raw_mouse(button: u16, down: bool, pid: u16) {
 /// Fail-open sweep — call on the dispatch tick. Replays any keystroke that was swallowed but never
 /// attributed (so a key is never lost if Raw-Input is delayed/dropped).
 pub fn expire_tick() {
-    if !ACTIVE.load(Ordering::Relaxed) {
-        return;
-    }
-    let replays = {
+    let (replays, _emission) = {
+        let mut state = EDGE_TRANSITION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.disarming { return; }
         let mut g = CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        g.as_mut()
+        let replays = g.as_mut()
             .map(|c| c.expire(now_us(), EXPIRE_US))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        let emission = (!replays.is_empty()).then(|| reserve_emission(&mut state));
+        (replays, emission)
     };
     for i in replays {
         emit(i);
@@ -581,7 +792,7 @@ mod sys {
     use windows_sys::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
     use windows_sys::Win32::System::Threading::GetCurrentThreadId;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
+        INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
         KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_MIDDLEDOWN,
         MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT,
     };
@@ -645,7 +856,7 @@ mod sys {
                 },
             },
         };
-        unsafe { SendInput(1, &raw const input, std::mem::size_of::<INPUT>() as i32) };
+        crate::action::send_win_input(std::slice::from_ref(&input));
     }
 
     unsafe extern "system" fn proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -741,14 +952,19 @@ mod sys {
         pump_tid: &'static AtomicU32,
         installed: &'static AtomicBool,
         body: fn(),
-    ) {
+    ) -> bool {
         let mut pump = pump.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if pump.is_some() {
-            return; // already pumping
+        if let Some(existing) = pump.take() {
+            if installed.load(Ordering::SeqCst) {
+                *pump = Some(existing);
+                return true; // already pumping
+            }
+            let _ = existing.join.join();
+            pump_tid.store(0, Ordering::SeqCst);
         }
         pump_tid.store(0, Ordering::SeqCst);
         let Ok(join) = crate::worker::spawn_named(name, body) else {
-            return;
+            return false;
         };
         let mut tid = 0u32;
         for _ in 0..1_000_000 {
@@ -761,9 +977,10 @@ mod sys {
         if tid == 0 || !installed.load(Ordering::SeqCst) {
             let _ = join.join();
             pump_tid.store(0, Ordering::SeqCst);
-            return;
+            return false;
         }
         *pump = Some(Pump { join, tid });
+        true
     }
 
     fn uninstall_for(pump: &Mutex<Option<Pump>>, pump_tid: &AtomicU32) {
@@ -776,20 +993,20 @@ mod sys {
         pump_tid.store(0, Ordering::SeqCst);
     }
 
-    pub fn install() {
+    pub fn install() -> bool {
         install_for("neuron-remap-hook", &PUMP, &PUMP_TID, &INSTALLED, || {
             pump_main_for(WH_KEYBOARD_LL, proc, &INSTALLED, &HANDLE, &PUMP_TID);
-        });
+        })
     }
 
     pub fn uninstall() {
         uninstall_for(&PUMP, &PUMP_TID);
     }
 
-    pub fn install_mouse() {
+    pub fn install_mouse() -> bool {
         install_for("neuron-remap-mhook", &M_PUMP, &M_PUMP_TID, &M_INSTALLED, || {
             pump_main_for(WH_MOUSE_LL, mouse_proc, &M_INSTALLED, &M_HANDLE, &M_PUMP_TID);
-        });
+        })
     }
 
     pub fn uninstall_mouse() {
@@ -825,7 +1042,7 @@ mod sys {
                 },
             },
         };
-        unsafe { SendInput(1, &raw const input, std::mem::size_of::<INPUT>() as i32) };
+        crate::action::send_win_input(std::slice::from_ref(&input));
     }
 }
 
@@ -855,15 +1072,17 @@ mod sys {
     }
     pub fn inject(_physkey: u16, _down: bool) {}
     pub fn inject_mouse(_button: u16, _down: bool) {}
-    pub fn install() {}
+    pub fn install() -> bool { false }
     pub fn uninstall() {}
-    pub fn install_mouse() {}
+    pub fn install_mouse() -> bool { false }
     pub fn uninstall_mouse() {}
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static LIVE_STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     const NAGA_RAW: u16 = 0x00a8;
     const KBD_RAW: u16 = 0x0221;
@@ -930,6 +1149,7 @@ mod tests {
     /// suspend. This exercises the gate itself so the flag can never go dead again.
     #[test]
     fn pausing_stands_the_shim_down() {
+        let _serial = LIVE_STATE_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // Process-global statics: restore both before returning so no later test inherits them.
         let was_active = ACTIVE.load(Ordering::SeqCst);
 
@@ -967,6 +1187,93 @@ mod tests {
             vec![Inject { scancode: 0x0D, down: true }]
         );
         assert_eq!(i.pending_len(), 0);
+    }
+
+    #[test]
+    fn stopping_interception_replays_pending_original_edges_in_order() {
+        let mut i = Interceptor::new();
+        i.set_remaps([eq_to_g()]);
+        assert!(i.on_hook(0x0D, true, 1000));
+        assert!(i.on_hook(0x0D, false, 1001));
+        i.set_remaps([]);
+        assert_eq!(i.drain_transition(), vec![
+            Inject { scancode: 0x0D, down: true },
+            Inject { scancode: 0x0D, down: false },
+        ]);
+        assert_eq!(i.pending_len(), 0);
+    }
+
+    #[test]
+    fn disarm_releases_a_mapped_target_even_when_its_physical_up_is_pending() {
+        let mut i = Interceptor::new();
+        i.set_remaps([eq_to_g()]);
+        assert!(i.on_hook(0x0D, true, 1000));
+        assert_eq!(i.on_rawinput(0x0D, true, naga()), Some(Inject { scancode: 0x22, down: true }));
+        assert!(i.on_hook(0x0D, false, 1001));
+        assert_eq!(i.drain_transition(), vec![
+            Inject { scancode: 0x0D, down: false },
+            Inject { scancode: 0x22, down: false },
+        ]);
+        assert!(i.drain_transition().is_empty(), "a second disarm cannot release the key twice");
+    }
+
+    #[test]
+    fn unattributed_up_waits_for_device_identity_before_releasing_a_target() {
+        let mut i = Interceptor::new();
+        i.set_remaps([eq_to_g()]);
+        assert!(i.on_hook(0x0D, true, 1000));
+        assert_eq!(i.on_rawinput(0x0D, true, naga()), Some(Inject { scancode: 0x22, down: true }));
+        assert!(i.on_hook(0x0D, false, 1001));
+        assert_eq!(i.expire(20_000, 8_000), vec![Inject { scancode: 0x0D, down: false }]);
+        assert_eq!(i.on_rawinput(0x0D, false, naga()), Some(Inject { scancode: 0x22, down: false }));
+        assert!(i.drain_transition().is_empty());
+    }
+
+    #[test]
+    fn missing_raw_up_releases_target_and_passes_through_until_next_up() {
+        let mut i = Interceptor::new();
+        i.set_remaps([eq_to_g()]);
+        assert!(i.on_hook(0x0D, true, 1000));
+        assert_eq!(i.on_rawinput(0x0D, true, naga()), Some(Inject { scancode: 0x22, down: true }));
+        assert!(i.on_hook(0x0D, false, 1001));
+        assert_eq!(i.expire(20_000, 8_000), vec![Inject { scancode: 0x0D, down: false }]);
+        assert_eq!(i.expire(101_001, 8_000), vec![Inject { scancode: 0x22, down: false }]);
+        assert!(!i.is_remapped_scancode(0x0D));
+        assert!(!i.on_hook(0x0D, true, 102_000));
+        assert!(!i.on_hook(0x0D, false, 103_000));
+        assert!(i.is_remapped_scancode(0x0D));
+        assert!(i.on_hook(0x0D, true, 104_000));
+    }
+
+    #[test]
+    fn unrelated_up_timeout_cannot_release_the_only_held_target() {
+        let mut i = Interceptor::new();
+        i.set_remaps([eq_to_g()]);
+        assert!(i.on_hook(0x0D, true, 1000));
+        assert_eq!(i.on_rawinput(0x0D, true, naga()), Some(Inject { scancode: 0x22, down: true }));
+        assert!(i.on_hook(0x0D, false, 1001));
+        assert_eq!(i.expire(20_000, 8_000), vec![Inject { scancode: 0x0D, down: false }]);
+        assert_eq!(i.on_rawinput(0x0D, false, kbd()), None, "the other device's UP was already replayed");
+        assert_eq!(i.drain_transition(), vec![Inject { scancode: 0x22, down: false }]);
+    }
+
+    #[test]
+    fn ambiguous_up_timeout_waits_for_device_attribution() {
+        let mut i = Interceptor::new();
+        i.set_remaps([
+            eq_to_g(),
+            Remap { pid: kbd(), from: 0x0D, to: KeyOut::Scancode(0x30) },
+        ]);
+        assert!(i.on_hook(0x0D, true, 1000));
+        assert_eq!(i.on_rawinput(0x0D, true, naga()), Some(Inject { scancode: 0x22, down: true }));
+        assert!(i.on_hook(0x0D, true, 1001));
+        assert_eq!(i.on_rawinput(0x0D, true, kbd()), Some(Inject { scancode: 0x30, down: true }));
+        assert!(i.on_hook(0x0D, false, 1002));
+        assert_eq!(i.expire(20_000, 8_000), vec![Inject { scancode: 0x0D, down: false }]);
+        assert_eq!(i.on_rawinput(0x0D, false, naga()), Some(Inject { scancode: 0x22, down: false }));
+        assert!(i.on_hook(0x0D, false, 20_001));
+        assert_eq!(i.on_rawinput(0x0D, false, kbd()), Some(Inject { scancode: 0x30, down: false }));
+        assert!(i.drain_transition().is_empty());
     }
 
     #[test]
@@ -1158,13 +1465,72 @@ mod tests {
     }
 
     #[test]
-    fn set_remaps_clears_stale_pending() {
+    fn set_remaps_preserves_pending_edges_with_their_original_claims() {
         let mut i = Interceptor::new();
         i.set_remaps([eq_to_g()]);
         i.on_hook(0x0D, true, 1000);
         assert_eq!(i.pending_len(), 1);
-        // Reloading the config drops in-flight keystrokes (they'd resolve against stale rules).
-        i.set_remaps([eq_to_g()]);
+        // The config changes before Raw-Input attributes the swallowed edge. It must retain the
+        // old rule snapshot, not be discarded or resolved using the replacement rule.
+        i.set_remaps([Remap { pid: naga(), from: 0x0D, to: KeyOut::Scancode(0x30) }]);
+        assert_eq!(i.pending_len(), 1);
+        assert_eq!(
+            i.on_rawinput(0x0D, true, naga()),
+            Some(Inject { scancode: 0x22, down: true }),
+            "an already-swallowed edge must resolve using its hook-time mapping"
+        );
         assert_eq!(i.pending_len(), 0);
+        i.on_hook(0x0D, false, 1500);
+        assert_eq!(i.on_rawinput(0x0D, false, naga()), Some(Inject { scancode: 0x22, down: false }));
+        i.on_hook(0x0D, true, 2000);
+        assert_eq!(
+            i.on_rawinput(0x0D, true, naga()),
+            Some(Inject { scancode: 0x30, down: true }),
+            "the new mapping applies to edges swallowed after reconfiguration"
+        );
+    }
+
+    #[test]
+    fn failed_requested_hook_install_never_activates_dispatch_ownership() {
+        // Keyboard install failed, even though an unrequested mouse hook is trivially satisfied.
+        let active = requested_hooks_installed(true, false, false, true);
+        assert!(!active);
+        assert!(standing_down_for(active, false));
+        // If only the mouse install fails, the shared dispatcher also stands down: a partial hook
+        // set must never make `owns` suppress a host action for a key the OS hook cannot replace.
+        let active = requested_hooks_installed(true, true, true, false);
+        assert!(!active);
+        assert!(standing_down_for(active, false));
+        assert!(requested_hooks_installed(true, false, true, false));
+        assert!(requested_hooks_installed(false, true, false, true));
+    }
+
+    #[test]
+    fn owns_stands_down_when_process_input_is_disarmed() {
+        let _serial = LIVE_STATE_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let was_active = ACTIVE.load(Ordering::SeqCst);
+        let was_paused = PAUSED.load(Ordering::SeqCst);
+        let previous = {
+            let mut core = CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let previous = core.take();
+            let mut test_core = Interceptor::new();
+            test_core.set_remaps([Remap { pid: naga(), from: 0x2E, to: KeyOut::Scancode(0x22) }]);
+            *core = Some(test_core);
+            previous
+        };
+        set_paused(false);
+
+        let active = requested_hooks_installed(true, false, true, true);
+        ACTIVE.store(active, Ordering::SeqCst);
+        assert!(CORE.lock().unwrap().as_ref().unwrap().has_key_remap(0x2E, naga()));
+        assert!(!owns(0xFF07, 0x2E, NAGA_RAW), "the process gate overrides a live hook claim");
+
+        let active = requested_hooks_installed(true, false, false, true);
+        ACTIVE.store(active, Ordering::SeqCst);
+        assert!(!owns(0xFF07, 0x2E, NAGA_RAW));
+
+        *CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = previous;
+        ACTIVE.store(was_active, Ordering::SeqCst);
+        PAUSED.store(was_paused, Ordering::SeqCst);
     }
 }

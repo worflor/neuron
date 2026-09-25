@@ -2,10 +2,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
 
-//! READ-ONLY R&D probe of the Razer Seiren V3 Mini's control pipe (pid 0x056a, usage 000c/0001).
+//! R&D probe of the Razer Seiren V3 Mini's control pipe (pid 0x056a, usage 000c/0001).
 //! The mic speaks the Razer command protocol in a 64-byte / report-id-0x07 envelope
-//! (CRC = XOR(buf[2..=61]) @ buf[62]); confirmed live. This tool NEVER sends a setter — only
-//! GETTERS (id with the 0x80 bit, read-only by Razer convention) — so it cannot change device state.
+//! (CRC = XOR(buf[2..=61]) @ buf[62]); confirmed live. The default `dump`, `sweep`, `input`,
+//! `readmap`, and `muteinfo` modes only read state. `manual`, `setter`, `trymute`, `sweepmute`, and
+//! `discover` send experimental writes; run those modes only when you explicitly intend to test
+//! setters. Unknown commands may change device state.
 //!
 //! Modes (`cargo run -p neuron --example seiren_probe -- <mode>`):
 //!   dump   (default) — feature-report sweep + a few known class-0x00 getters
@@ -269,15 +271,44 @@ fn manual(info: &transport::HidDeviceInfo) -> anyhow::Result<()> {
         ("0x08/0x00 [01,state]", 0x08, 0x00, 0x02, vec![0x01, flip]),
         ("0x08/0x0f [01,state]", 0x08, 0x0f, 0x02, vec![0x01, flip]),
     ];
+    let mut restore = MuteRestore { t, pending: None };
     for (i, (label, class, id, size, args)) in steps.iter().enumerate() {
         println!("[{}/{}] {label}  — firing now, watch ~2.5s...", i + 1, steps.len());
+        let mut restore_args = args.clone();
+        if let Some(state_index) = restore_args.iter().rposition(|&arg| arg == flip) {
+            restore_args[state_index] = cur;
+        }
+        restore.pending = Some((*class, *id, *size, restore_args));
         send_cmd(t, *class, *id, *size, args);
         std::thread::sleep(Duration::from_millis(2500));
-        println!("      getter now reads {:?}\n", read_mute(t));
+        let observed = read_mute(t);
+        restore.restore();
+        println!("      getter during candidate: {observed:?}; after restore: {:?}\n", read_mute(t));
     }
-    // leave it as we found it (best effort — the mirror write, if it worked, is undone by re-reading cur).
-    println!("done — tell me which step (if any) moved the LED. If NONE did, the register is sensor-owned over HID.");
+    println!("done — original mute state restored after each candidate where the setter permits it. Tell me which step (if any) moved the LED.");
     Ok(())
+}
+
+struct MuteRestore<'a> {
+    t: &'a dyn Transport,
+    pending: Option<(u8, u8, u8, Vec<u8>)>,
+}
+
+impl MuteRestore<'_> {
+    fn restore(&mut self) {
+        if let Some((class, id, size, args)) = self.pending.take() {
+            send_cmd(self.t, class, id, size, &args);
+            std::thread::sleep(Duration::from_millis(30));
+        }
+    }
+}
+
+impl Drop for MuteRestore<'_> {
+    fn drop(&mut self) {
+        if let Some((class, id, size, args)) = self.pending.take() {
+            send_cmd(self.t, class, id, size, &args);
+        }
+    }
 }
 
 /// Dump the mute register's STRUCTURE (read-only) to inform the setter shape: the full 0x08/0x88

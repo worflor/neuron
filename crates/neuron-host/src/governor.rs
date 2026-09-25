@@ -71,7 +71,8 @@ impl Config {
     /// unit circle): |G| < 1 and |K| < 1 + G.
     #[must_use]
     pub fn is_stable(&self) -> bool {
-        self.g.abs() < 1.0 && self.k.abs() < 1.0 + self.g
+        self.g.is_finite() && self.k.is_finite()
+            && self.g.abs() < 1.0 && self.k.abs() < 1.0 + self.g
     }
 }
 
@@ -128,6 +129,11 @@ impl Governor {
         if cfg.step.is_zero() {
             return Err("step must be non-zero");
         }
+        if !cfg.impulse.is_finite() || cfg.impulse < 0.0
+            || cfg.escalate_at.is_nan() || cfg.escalate_at <= 0.0
+        {
+            return Err("impulse must be finite and non-negative; escalation threshold positive and not NaN");
+        }
         Ok(Governor { cfg, z1: 0.0, z2: 0.0, last: None, ledger: Ledger::default() })
     }
 
@@ -140,6 +146,11 @@ impl Governor {
             / self.cfg.step.as_nanos().max(1)) as u64;
         for _ in 0..steps {
             let z = self.cfg.k * self.z1 - self.cfg.g * self.z2;
+            if !z.is_finite() {
+                self.z1 = self.cfg.escalate_at;
+                self.z2 = 0.0;
+                break;
+            }
             self.z2 = self.z1;
             self.z1 = z;
             if self.z1.abs() < FLOOR && self.z2.abs() < FLOOR {
@@ -161,13 +172,21 @@ impl Governor {
         }
         self.z1 += self.cfg.impulse;
         self.ledger.crashes += 1;
+        if !self.z1.is_finite() {
+            self.z1 = self.cfg.escalate_at;
+        }
         if self.z1 >= self.cfg.escalate_at {
             self.ledger.escalated += 1;
             return Verdict::Escalate;
         }
         self.ledger.absorbed += 1;
-        let extra = self.cfg.delay_per_unit.as_secs_f64() * self.z1;
-        let delay = (self.cfg.base_delay + Duration::from_secs_f64(extra)).min(self.cfg.max_delay);
+        let extra = self.cfg.delay_per_unit.as_secs_f64() * self.z1.max(0.0);
+        let room = self.cfg.max_delay.saturating_sub(self.cfg.base_delay);
+        let delay = if !extra.is_finite() || extra >= room.as_secs_f64() {
+            self.cfg.max_delay
+        } else {
+            self.cfg.base_delay.saturating_add(Duration::from_secs_f64(extra))
+        };
         Verdict::RestartAfter(delay)
     }
 
@@ -196,6 +215,35 @@ mod tests {
         assert!(Governor::new(c).is_err());
         // The default is fine.
         assert!(Config::critically_damped(0.8).is_stable());
+    }
+
+    #[test]
+    fn nonfinite_config_is_rejected_and_large_delay_is_capped() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut cfg = Config::critically_damped(0.8);
+            cfg.k = bad;
+            assert!(Governor::new(cfg).is_err());
+            cfg = Config::critically_damped(0.8);
+            cfg.g = bad;
+            assert!(Governor::new(cfg).is_err());
+            cfg = Config::critically_damped(0.8);
+            cfg.impulse = bad;
+            assert!(Governor::new(cfg).is_err());
+            cfg = Config::critically_damped(0.8);
+            cfg.escalate_at = bad;
+            if bad != f64::INFINITY {
+                assert!(Governor::new(cfg).is_err());
+            }
+        }
+        let mut cfg = Config::critically_damped(0.8);
+        cfg.impulse = -1.0;
+        assert!(Governor::new(cfg).is_err());
+
+        let mut cfg = Config::critically_damped(0.8);
+        cfg.delay_per_unit = Duration::from_secs(u64::MAX);
+        let max = cfg.max_delay;
+        let mut governor = Governor::new(cfg).unwrap();
+        assert_eq!(governor.on_crash(Instant::now()), Verdict::RestartAfter(max));
     }
 
     #[test]

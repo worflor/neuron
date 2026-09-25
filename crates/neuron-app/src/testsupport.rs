@@ -614,73 +614,48 @@ mod conventions {
 
     // ── convention regression: every synthesized input call is arm-gated ────────────────────────
     //
-    // `SendInput` fires REAL keyboard/mouse events into whatever has focus — every call site must
-    // be behind `input_armed()` (the app-wide kill switch macros/ghost-paste/teleport's foreground
-    // whisper all defer to). Scoped to the known low-level modules that legitimately touch
-    // `SendInput` (built from `action.rs`'s `win_key`/`win_mouse` and `teleport.rs`'s
-    // foreground-handoff whisper/chord helpers) rather than trusting a per-call comment, so a NEW
-    // file that starts synthesizing input trips this even if its author remembers to check
-    // `input_armed()` somewhere far from the call.
+    // All Windows synthesis, including intercept replay and teleport's foreground whisper,
+    // reaches one arm-gated sink in neuron-core. An extra raw call fails this audit.
     #[test]
     fn every_input_synth_call_is_arm_gated() {
         let root = workspace_root();
         let crates_dir = root.join("crates");
         let mut files = Vec::new();
-        for name in ["neuron-app", "neuron-core"] {
-            let src = crates_dir.join(name).join("src");
-            assert!(
-                src.is_dir(),
-                "expected crate src dir at {} — path resolution is broken",
-                src.display()
-            );
-            collect_rs_files(&src, &mut files);
+        for entry in std::fs::read_dir(&crates_dir).expect("workspace crates directory") {
+            let src = entry.expect("crate entry").path().join("src");
+            if src.is_dir() {
+                collect_rs_files(&src, &mut files);
+            }
         }
         assert!(
             files.len() > 20,
-            "the two-crate sweep under {} found only {} .rs file(s) — path resolution is broken",
+            "the workspace sweep under {} found only {} .rs file(s) — path resolution is broken",
             crates_dir.display(),
             files.len(),
         );
 
-        // The ONLY files permitted to call SendInput( directly. Each must ALSO reference
-        // input_armed( somewhere in its production region (checked below).
-        let allowlisted = [
-            crates_dir.join("neuron-core").join("src").join("action.rs"),
-            crates_dir.join("neuron-core").join("src").join("intercept.rs"),
-            crates_dir.join("neuron-app").join("src").join("teleport.rs"),
-        ];
-
-        let mut offenders = Vec::new();
+        let sink = crates_dir.join("neuron-core").join("src").join("action.rs");
+        let mut calls = Vec::new();
         for file in &files {
             let Ok(content) = std::fs::read_to_string(file) else {
                 continue;
             };
             let production = strip_test_region(&content);
-            if !production.contains("SendInput(") {
-                continue;
-            }
-            if !allowlisted.contains(file) {
-                offenders.push(format!(
-                    "{} calls SendInput( but is not on the input-synthesis allowlist — gate it \
-                     with input_armed() and add it to the allowlist in testsupport.rs",
-                    file.display()
-                ));
-                continue;
-            }
-            if !production.contains("input_armed(") {
-                offenders.push(format!(
-                    "{} calls SendInput( without referencing input_armed() anywhere in the file \
-                     — every synthesized input call must be arm-gated",
-                    file.display()
-                ));
+            for (offset, _) in production.match_indices("SendInput(") {
+                let line = &production[production[..offset].rfind('\n').map_or(0, |n| n + 1)..offset];
+                if line.trim_start().starts_with("//") { continue; }
+                calls.push(file.clone());
+                if file == &sink {
+                    let start = production.find("pub fn send_win_input(").expect("checked sink exists");
+                    let body = &production[start..production[start..].find("\n}").map(|n| start + n).expect("sink ends")];
+                    assert!(
+                        body.contains("if !input_armed() || inputs.is_empty()") && body.contains("SendInput("),
+                        "the only Win32 synthesis sink must check the arm gate before calling SendInput"
+                    );
+                }
             }
         }
-        assert!(
-            offenders.is_empty(),
-            "every SendInput call must be gated by input_armed() — a raw synthesis call outside \
-             the allowlisted low-level modules can fire real input unconditionally\n{}",
-            offenders.join("\n")
-        );
+        assert_eq!(calls, vec![sink], "exactly one raw SendInput call is allowed, in the checked core sink");
     }
 }
 

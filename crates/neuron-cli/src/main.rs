@@ -51,13 +51,13 @@ enum Cmd {
     /// Self-emergent capability discovery: probe ANY Razer `razer_report` device, no registry
     Discover {
         /// adopt unknown devices: synthesize a FULL device def per unknown device and write it
-        /// to devices/auto/ in the run folder (same as `neuron adopt`)
+        /// to devices/auto/ in the run root (same as `neuron adopt`)
         #[arg(long)]
         emit: bool,
     },
     /// Adopt unknown Razer devices: probe the getter space, synthesize a complete device def
     /// (commands + lighting dialect + measured link pacing) and write devices/auto/<pid>.toml
-    /// in the run folder (next to the neuron binaries).
+    /// in the resolved run root.
     /// From then on the file is plain per-device config — editable, never overwritten.
     Adopt {
         /// print the synthesized TOML instead of writing files, and include ALREADY-KNOWN
@@ -246,8 +246,8 @@ enum Cmd {
         #[arg(long)]
         apply: bool,
     },
-    /// Python macros — the power tier of the spine. Real `CPython` run by the warm Macro Host sidecar:
-    /// full unsandboxed power (ctypes/subprocess/anything), registered once, fired by name.
+    /// Python macros — bundled CPython starts on demand. New macros are BOUND to Neuron's
+    /// capabilities; `# neuron: raw` explicitly enables unrestricted Python for a file.
     Macro {
         #[command(subcommand)]
         action: MacroCmd,
@@ -919,7 +919,7 @@ fn main() -> Result<()> {
     // `runroot::adopt_legacy_run_root`). Both binaries do this because either one can be the first
     // to start after an upgrade, and they share one config universe — whoever gets there first
     // migrates, the other no-ops.
-    if let Some((from, to)) = neuron::runroot::adopt_legacy_run_root() {
+    if let Some((from, to)) = neuron::runroot::adopt_legacy_run_root()? {
         eprintln!("carried config forward: {} -> {}", from.display(), to.display());
     }
     let cli = Cli::parse();
@@ -1057,7 +1057,7 @@ fn pocket_cmd(name: Option<String>, list: bool, keep: bool, sigil: Option<String
 fn profile_cmd(reg: &Registry, action: ProfileCmd) -> Result<()> {
     match action {
         ProfileCmd::List => {
-            let names = neuron::profile::list();
+            let names = neuron::profile::try_list()?;
             if names.is_empty() {
                 println!("no profiles (create one: neuron profile save <name> --dpi 1600)");
             }
@@ -2446,6 +2446,7 @@ fn verify_cmd(file: &str) -> Result<()> {
             println!(
                 "      backup: {}",
                 c.before
+                    .unwrap_or("<new>")
                     .split_whitespace()
                     .take(16)
                     .collect::<Vec<_>>()
@@ -2594,7 +2595,8 @@ fn import_export_cmd(file: &str, apply: bool) -> Result<()> {
             rules: imported.rules.clone(),
         };
         std::fs::create_dir_all(neuron::profile::profiles_dir()).ok();
-        neuron::salvage::atomic_write(&path, toml::to_string_pretty(&doc)?.as_bytes())
+        neuron::profile::Profile::write_rules(&imported.profile.name, toml::to_string_pretty(&doc)?.as_bytes(), !imported.profile.is_empty())
+            .map_err(anyhow::Error::msg)
             .with_context(|| format!("writing {}", path.display()))?;
         println!(
             "wrote {} ({} spine rule(s))",
@@ -3103,7 +3105,7 @@ fn probe_cmd(pid: &str, class: Option<&str>, id: Option<&str>, scan: bool) -> Re
     if !any {
         match explicit {
             Some((c, i)) => {
-                println!("  {c:02X}/{i:02X} not supported on any interface of this device");
+                println!("  {c:02X}/{i:02X} gave no valid reply (unsupported, unavailable, or busy)");
             }
             None => println!("  (no getters responded)"),
         }

@@ -487,7 +487,8 @@ mod imp {
     use std::thread::JoinHandle;
     use std::time::Duration;
 
-    use windows_sys::Win32::Foundation::{POINT, SIZE};
+    use windows_sys::Win32::Foundation::{CloseHandle, POINT, SIZE, WAIT_FAILED};
+    use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent, INFINITE};
     use windows_sys::Win32::Graphics::Gdi::{
         CreateCompatibleDC, CreateDIBSection, CreateFontW, DeleteDC, DeleteObject,
         GetMonitorInfoW, GetTextExtentPoint32W, MonitorFromPoint, SelectObject,
@@ -496,7 +497,8 @@ mod imp {
         HBITMAP, MONITORINFO, MONITOR_DEFAULTTONEAREST, TRANSPARENT,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        DispatchMessageW, GetCursorPos, PeekMessageW, SetWindowPos, ShowWindow, TranslateMessage,
+        DispatchMessageW, GetCursorPos, MsgWaitForMultipleObjectsEx, PeekMessageW, SetWindowPos,
+        ShowWindow, TranslateMessage, MWMO_INPUTAVAILABLE, QS_ALLINPUT,
         HWND_NOTOPMOST, HWND_TOPMOST, MSG, PM_REMOVE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
         SW_HIDE, SW_SHOWNOACTIVATE, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
         WS_EX_TOPMOST, WS_EX_TRANSPARENT,
@@ -773,19 +775,30 @@ mod imp {
     pub struct SpellOverlay {
         tx: Sender<Cmd>,
         handle: Option<JoinHandle<()>>,
+        wake: usize,
     }
 
     impl SpellOverlay {
         pub fn spawn() -> Self {
             let (tx, rx) = channel::<Cmd>();
+            // The auto-reset event wakes a hidden window for commands without a 16ms idle poll.
+            // SAFETY: unnamed event with null security attributes; the handle stays open until
+            // the render thread has joined in Drop.
+            let wake = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) } as usize;
             // SpellOverlay owns this handle and joins it on Drop — routed through the
             // handle-returning primitive.
-            let handle = crate::worker::spawn_named("neuron-spell-overlay", move || render_thread(rx)).ok();
-            SpellOverlay { tx, handle }
+            let handle = crate::worker::spawn_named("neuron-spell-overlay", move || render_thread(rx, wake)).ok();
+            SpellOverlay { tx, handle, wake }
+        }
+        fn send(&self, cmd: Cmd) {
+            if self.tx.send(cmd).is_ok() && self.wake != 0 {
+                // SAFETY: the event is owned by this SpellOverlay and outlives every send.
+                unsafe { SetEvent(self.wake as _); }
+            }
         }
         /// Show the sigil for `mode`, anchored at the current cursor; resets the stroke.
         pub fn begin(&self, mode: WeaveMode) {
-            let _ = self.tx.send(Cmd::Begin(mode));
+            self.send(Cmd::Begin(mode));
         }
         /// Feed the accumulated stroke (points relative to the anchor, in mouse units), MOVING the
         /// already-owned `Vec` straight across the `Cmd` channel — ONE allocation per tick. Every
@@ -793,15 +806,15 @@ mod imp {
         /// `Vec` once and hands it over by value, so the old per-tick double allocation — build
         /// then `.to_vec()` inside here — is gone.
         pub fn push(&self, pts: Vec<(f32, f32)>) {
-            let _ = self.tx.send(Cmd::Push(pts));
+            self.send(Cmd::Push(pts));
         }
         /// Update the live next-glyph prediction (Glyph mode only) WITHOUT resetting the trail.
         pub fn hint(&self, hint: Option<GlyphHint>) {
-            let _ = self.tx.send(Cmd::Hint(hint));
+            self.send(Cmd::Hint(hint));
         }
         /// Flare on a recognized glyph / committed radial pick, or a soft fizzle on a miss.
         pub fn recognized(&self, hit: bool) {
-            let _ = self.tx.send(Cmd::Recognized(hit));
+            self.send(Cmd::Recognized(hit));
         }
         /// Push one engine FRAME of the notification stack: the live slots (each with its animation
         /// state already eased), the presentation `mode` (0 stack / 1 latest / 2 digest), the user's
@@ -817,19 +830,23 @@ mod imp {
             digest: DigestView,
             tail: u32,
         ) {
-            let _ = self.tx.send(Cmd::Stack(slots, mode, place, digest, tail));
+            self.send(Cmd::Stack(slots, mode, place, digest, tail));
         }
         /// Begin the fade-out, then hide.
         pub fn end(&self) {
-            let _ = self.tx.send(Cmd::End);
+            self.send(Cmd::End);
         }
     }
 
     impl Drop for SpellOverlay {
         fn drop(&mut self) {
-            let _ = self.tx.send(Cmd::Quit);
+            self.send(Cmd::Quit);
             if let Some(h) = self.handle.take() {
                 let _ = h.join();
+            }
+            if self.wake != 0 {
+                // SAFETY: no sender or render thread can use the event after join.
+                unsafe { CloseHandle(self.wake as _); }
             }
         }
     }
@@ -1240,7 +1257,7 @@ mod imp {
         }
     }
 
-    fn render_thread(rx: std::sync::mpsc::Receiver<Cmd>) {
+    fn render_thread(rx: std::sync::mpsc::Receiver<Cmd>, wake: usize) {
         unsafe {
             // the overlay's layered window + its W×H top-down BGRA DIB live in one LayeredSurface;
             // the bespoke render loop (dirty-tile compositing, the per-frame present, the
@@ -1342,7 +1359,7 @@ mod imp {
                 let mut dbg_cover = 0usize; // tiles composited this frame (slow-frame diagnostic)
                 let mut dbg_painted = 0usize; // pixels that hit the FULL material pipeline this frame
                 let mut msg: MSG = std::mem::zeroed();
-                while PeekMessageW(&raw mut msg, hwnd, 0, 0, PM_REMOVE) != 0 {
+                while PeekMessageW(&raw mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
                     TranslateMessage(&raw const msg);
                     DispatchMessageW(&raw const msg);
                 }
@@ -2753,6 +2770,7 @@ mod imp {
                     // never per-pixel, so a colour swap costs one struct copy and lands next frame.
                     let m = &crate::weave::live_material();
                     let mt = crate::weave::seconds(); // one animation clock for this whole frame
+                    let drift_phase = crate::weave::drift_phase_at(mt);
                                                       // composite over the union of this frame's processed tiles and last frame's, so a
                                                       // vacated tile is written transparent. Neighbour reads (gradient ±1, dispersion
                                                       // taps) land in the cleared moat or drawn content — never stale memory.
@@ -2858,6 +2876,7 @@ mod imp {
                                     x: xx as f32,
                                     y: yy as f32,
                                     t: mt,
+                                    drift_phase,
                                 };
                                 let (mut r, mut gg, mut b, mut lum) =
                                     crate::weave::shade_surface(&inp, m);
@@ -3009,8 +3028,19 @@ mod imp {
                         prof_n = 0;
                     }
                 }
-                let elapsed = dur.as_millis() as u64;
-                std::thread::sleep(Duration::from_millis(target.saturating_sub(elapsed)));
+                if !visible && wake != 0 {
+                    // SAFETY: this thread owns its window/message queue; the auto-reset event is
+                    // closed only after this thread joins. Commands signal it after enqueueing.
+                    let result = MsgWaitForMultipleObjectsEx(
+                        1, &(wake as _), INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE,
+                    );
+                    if result == WAIT_FAILED {
+                        std::thread::sleep(Duration::from_millis(16));
+                    }
+                } else {
+                    let elapsed = dur.as_millis() as u64;
+                    std::thread::sleep(Duration::from_millis(target.saturating_sub(elapsed)));
+                }
             }
 
             // surf's Drop restores the bitmap, deletes the DIB + mem DC, releases the screen DC,

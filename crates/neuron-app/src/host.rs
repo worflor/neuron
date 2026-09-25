@@ -84,6 +84,8 @@ struct HostState {
     /// (`Global\` objects need `SeCreateGlobalPrivilege`) vs "Razer's server already owns the
     /// objects". `None` = it came up, or was never asked to. Surfaced honestly in [`Status`].
     chroma_native_error: Option<String>,
+    /// Next low-rate attempt to attach to sections a broker may have created after tray start.
+    chroma_native_retry_at: Instant,
     /// The bus listener that pokes [`HOST_EVENTS_STAMP`] on every `host.*` signal (see
     /// [`HostEventsListener`]). Held only to keep the thread alive (underscore-named like
     /// `_host`/`_lock`); publishes nothing on teardown, so unlike the fields below its drop
@@ -287,7 +289,7 @@ fn follow(handle: HostHandle, control: ObsControl, stop: &AtomicBool) {
 fn hook_on_change<T: PartialEq>(hook: &str, prev: &mut Option<T>, now: T) {
     let changed = prev.as_ref().is_some_and(|p| *p != now);
     *prev = Some(now);
-    if changed && neuron::macros::macro_host::load_macro(hook).is_some() {
+    if changed && neuron::action::input_armed() && neuron::macros::macro_host::load_macro(hook).is_some() {
         let ctx = neuron::macros::Context::capture();
         let _ = neuron::macros::macro_host().fire_async(hook, &ctx);
     }
@@ -629,9 +631,10 @@ pub fn apply_protocol_prefs() {
     match (want_chroma, s.chroma_shm.is_some()) {
         (true, false) => {
             let mut h = s.handle.clone();
-            let (shm, err) = spawn_chroma_shm(&s.bridge, &mut h, Arc::clone(&s.chroma_policy));
+            let (shm, err) = spawn_chroma_shm(&s.bridge, &mut h, Arc::clone(&s.chroma_policy), true);
             s.chroma_shm = shm;
             s.chroma_native_error = err;
+            s.chroma_native_retry_at = Instant::now() + Duration::from_secs(5);
         }
         (false, true) => {
             if let Some(shm) = s.chroma_shm.take() {
@@ -904,7 +907,7 @@ const SHM_FADE_GRACE: Duration = Duration::from_millis(1200);
 /// Stand up the native Chroma SHM server and claim a self-fading game layer per bridged
 /// surface at `band::SESSION`, all under ONE source. CREATE-ONLY on purpose: we become
 /// the sole Chroma server or we stand down — we never read alongside a live Razer server,
-/// which would double-write the LEDs. Returns `None` silently when disabled, unelevated,
+/// which would double-write the LEDs. Returns `None` when the fixed sections are absent
 /// or Razer owns the objects; the layers lie dormant (alpha 0, the user's lighting
 /// untouched) until a game connects, then crossfade in. Windows-only; a stub elsewhere.
 ///
@@ -916,27 +919,26 @@ fn spawn_chroma_shm(
     bridge: &Bridge,
     h: &mut HostHandle,
     policy: Arc<PaintPolicy>,
+    log_error: bool,
 ) -> (Option<ChromaShm>, Option<String>) {
     use neuron_host::adapters::chroma_shm::server::{ChromaShmLayer, CreateError, ShmServer};
     use neuron_host::api::SurfaceKind;
     use std::sync::Arc;
 
-    // Capture WHY the native face didn't come up instead of swallowing it — the usual cause is an
-    // unelevated launch (`Global\` needs SeCreateGlobalPrivilege), which silently degraded to
-    // REST-only and read as "my work vanished after a reboot." Distinguish that from Razer's own
-    // server already owning the objects, so the card can point at the fix (the elevated tray task)
-    // rather than a generic error.
+    // Surface the underlying I/O error separately from another live server's mask claim.
     let server: ChromaShmHandle = match ShmServer::create() {
         Ok(s) => Arc::new(s),
         Err(e) => {
-            eprintln!("neuron-host: native Chroma (SHM) server not started — {e}");
+            if log_error {
+                eprintln!("neuron-host: native Chroma (SHM) server not started — {e}");
+            }
             let reason = match e {
                 CreateError::AlreadyServing => {
                     "another Chroma server (Razer Synapse) already owns the native connection".to_string()
                 }
-                CreateError::Io(_) => {
-                    "needs elevation — start via the elevated tray task".to_string()
-                }
+                CreateError::Io(err) => format!(
+                    "native Chroma unavailable ({err}); Global objects need a protected broker"
+                ),
             };
             return (None, Some(reason));
         }
@@ -997,6 +999,7 @@ fn spawn_chroma_shm(
     _bridge: &Bridge,
     _h: &mut HostHandle,
     _policy: Arc<PaintPolicy>,
+    _log_error: bool,
 ) -> (Option<ChromaShm>, Option<String>) {
     (None, None)
 }
@@ -1196,7 +1199,7 @@ fn bring_up(g: &mut Option<HostState>) -> bool {
     // same `host_chroma` switch as the REST face above. Capture why it declined (elevation vs
     // Razer already serving) for the honest SYSTEM readout.
     let (chroma_shm, chroma_native_error) = if crate::prefs::host_chroma() {
-        spawn_chroma_shm(&bridge, &mut h, Arc::clone(&chroma_policy))
+        spawn_chroma_shm(&bridge, &mut h, Arc::clone(&chroma_policy), true)
     } else {
         (None, None)
     };
@@ -1218,6 +1221,7 @@ fn bring_up(g: &mut Option<HostState>) -> bool {
         chroma_policy,
         openrgb_policy,
         chroma_native_error,
+        chroma_native_retry_at: Instant::now() + Duration::from_secs(5),
         _host_events: host_events,
         _host: host,
         orgb,
@@ -1809,6 +1813,21 @@ pub fn heartbeat() {
     let mut g = guard();
     let Some(s) = g.as_mut() else { return };
     let now = Instant::now();
+    #[cfg(windows)]
+    if crate::prefs::host_chroma()
+        && s.chroma_shm.is_none()
+        && now >= s.chroma_native_retry_at
+    {
+        s.chroma_native_retry_at = now + Duration::from_secs(5);
+        if neuron_host::adapters::chroma_shm::server::seeded_sections_present() {
+            let mut h = s.handle.clone();
+            let (shm, err) = spawn_chroma_shm(
+                &s.bridge, &mut h, Arc::clone(&s.chroma_policy), false,
+            );
+            s.chroma_shm = shm;
+            s.chroma_native_error = err;
+        }
+    }
     let mut h = s.handle.clone();
     // Base layers whose kernel claim no longer exists — swept by a rebirth.
     let dead: Vec<String> = s

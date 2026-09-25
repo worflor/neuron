@@ -258,7 +258,7 @@ fn parse_json(s: &str) -> Option<Json> {
     let mut i = 0;
     let v = parse_value(bytes, &mut i)?;
     skip_ws(bytes, &mut i);
-    Some(v) // trailing bytes tolerated — obs sends one frame per message
+    (i == bytes.len()).then_some(v)
 }
 
 fn skip_ws(b: &[u8], i: &mut usize) {
@@ -292,42 +292,44 @@ fn lit(b: &[u8], i: &mut usize, word: &str, val: Json) -> Option<Json> {
 fn parse_obj(b: &[u8], i: &mut usize) -> Option<Json> {
     *i += 1; // {
     let mut out = Vec::new();
+    let mut first = true;
     loop {
         skip_ws(b, i);
-        match b.get(*i)? {
-            b'}' => {
-                *i += 1;
-                return Some(Json::Obj(out));
-            }
-            b',' => *i += 1,
-            b'"' => {
-                let key = parse_str(b, i)?;
-                skip_ws(b, i);
-                if *b.get(*i)? != b':' {
-                    return None;
-                }
-                *i += 1;
-                let val = parse_value(b, i)?;
-                out.push((key, val));
-            }
-            _ => return None,
+        if b.get(*i) == Some(&b'}') {
+            *i += 1;
+            return Some(Json::Obj(out));
         }
+        if !first {
+            if b.get(*i) != Some(&b',') { return None; }
+            *i += 1;
+            skip_ws(b, i);
+        }
+        if b.get(*i) != Some(&b'"') { return None; }
+        let key = parse_str(b, i)?;
+        skip_ws(b, i);
+        if b.get(*i) != Some(&b':') { return None; }
+        *i += 1;
+        out.push((key, parse_value(b, i)?));
+        first = false;
     }
 }
 
 fn parse_arr(b: &[u8], i: &mut usize) -> Option<Json> {
     *i += 1; // [
     let mut out = Vec::new();
+    let mut first = true;
     loop {
         skip_ws(b, i);
-        match b.get(*i)? {
-            b']' => {
-                *i += 1;
-                return Some(Json::Arr(out));
-            }
-            b',' => *i += 1,
-            _ => out.push(parse_value(b, i)?),
+        if b.get(*i) == Some(&b']') {
+            *i += 1;
+            return Some(Json::Arr(out));
         }
+        if !first {
+            if b.get(*i) != Some(&b',') { return None; }
+            *i += 1;
+        }
+        out.push(parse_value(b, i)?);
+        first = false;
     }
 }
 
@@ -342,6 +344,7 @@ fn parse_str(b: &[u8], i: &mut usize) -> Option<String> {
         *i += 1;
         match c {
             b'"' => return Some(String::from_utf8_lossy(&s).into_owned()),
+            0..=0x1f => return None,
             b'\\' => {
                 let e = *b.get(*i)?;
                 *i += 1;
@@ -407,8 +410,24 @@ fn hex4(b: &[u8], i: &mut usize) -> Option<u32> {
 
 fn parse_num(b: &[u8], i: &mut usize) -> Option<Json> {
     let start = *i;
-    while *i < b.len() && matches!(b[*i], b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E') {
+    if b.get(*i) == Some(&b'-') { *i += 1; }
+    match b.get(*i)? {
+        b'0' => *i += 1,
+        b'1'..=b'9' => {
+            while matches!(b.get(*i), Some(b'0'..=b'9')) { *i += 1; }
+        }
+        _ => return None,
+    }
+    if b.get(*i) == Some(&b'.') {
         *i += 1;
+        if !matches!(b.get(*i), Some(b'0'..=b'9')) { return None; }
+        while matches!(b.get(*i), Some(b'0'..=b'9')) { *i += 1; }
+    }
+    if matches!(b.get(*i), Some(b'e' | b'E')) {
+        *i += 1;
+        if matches!(b.get(*i), Some(b'+' | b'-')) { *i += 1; }
+        if !matches!(b.get(*i), Some(b'0'..=b'9')) { return None; }
+        while matches!(b.get(*i), Some(b'0'..=b'9')) { *i += 1; }
     }
     std::str::from_utf8(&b[start..*i]).ok()?.parse().ok().map(Json::Num)
 }
@@ -462,6 +481,26 @@ fn json_string(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_frames_require_complete_syntax() {
+        for frame in [
+            r#"{"op":0} garbage"#,
+            r#"{"op":0}{"op":2}"#,
+            r#"{"op":0,}"#,
+            r#"{"op":0 "d":{}}"#,
+            r"[1,]",
+            r"[1 2]",
+            r#"{"op":01}"#,
+            r#"{"op":+1}"#,
+            r#"{"op":1.}"#,
+            "{\"op\":0,\"name\":\"raw\nnewline\"}",
+        ] {
+            assert!(parse_json(frame).is_none(), "accepted malformed JSON: {frame}");
+            assert_eq!(ObsClient::new("").on_message(frame), Step::default());
+        }
+        assert!(parse_json(" \t{\"op\":0}\r\n").is_some());
+    }
 
     #[test]
     fn passwordless_hello_identifies_without_auth() {

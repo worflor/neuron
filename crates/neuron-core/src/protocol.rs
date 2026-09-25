@@ -133,6 +133,16 @@ pub fn reply_status(b: &[u8], class: u8, id: u8) -> Option<Status> {
     (b[7] == class && b[8] == id).then(|| Status::from_u8(b[1]))
 }
 
+/// Validate a complete `razer_report` reply before its status or payload can affect the caller.
+/// Audio uses a different envelope and continues to use [`reply_status`].
+#[must_use]
+pub fn razer_reply_status(b: &[u8; BUF_LEN], transaction_id: u8, class: u8, id: u8) -> Option<Status> {
+    if b[0] != 0 || b[2] != transaction_id || b[6] > 80 || b[90] != 0 || b[89] != crc(b) {
+        return None;
+    }
+    reply_status(b, class, id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,6 +180,19 @@ mod tests {
         // guard that replaces the lost `&[u8; BUF_LEN]` compile-time length proof.
         assert_eq!(reply_status(&b[..8], 0x04, 0x85), None, "too short to hold offset 8");
         assert_eq!(reply_status(&[], 0x04, 0x85), None, "empty slice");
+    }
+
+    #[test]
+    fn razer_reply_rejects_wrong_transaction_or_damaged_frame() {
+        let mut b = Report::command(0x1F, 0x04, 0x85, 0x02).to_buf();
+        b[1] = 2;
+        assert_eq!(razer_reply_status(&b, 0x1F, 0x04, 0x85), Some(Status::Success));
+        assert_eq!(razer_reply_status(&b, 0x3F, 0x04, 0x85), None);
+        b[9] = 0x12;
+        assert_eq!(razer_reply_status(&b, 0x1F, 0x04, 0x85), None, "bad payload CRC");
+        b[89] = crc(&b);
+        b[90] = 1;
+        assert_eq!(razer_reply_status(&b, 0x1F, 0x04, 0x85), None, "reserved byte");
     }
 
     /// `to_buf`/`from_buf` must round-trip EVERY field losslessly — not just `class/id/data_size`

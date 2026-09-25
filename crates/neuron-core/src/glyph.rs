@@ -292,20 +292,30 @@ pub fn sig_distance(a: Sig, b: Sig, cfg: &GlyphConfig) -> f64 {
 /// Length-normalized DTW between two signature sequences (gesture words).
 #[must_use]
 pub fn dtw(a: &[Sig], b: &[Sig], cfg: &GlyphConfig) -> f64 {
+    dtw_with_scratch(a, b, cfg, &mut Vec::new())
+}
+
+/// Reuse one DP row across all templates in a vault lookup.
+pub(crate) fn dtw_with_scratch(a: &[Sig], b: &[Sig], cfg: &GlyphConfig, dp: &mut Vec<f64>) -> f64 {
     let (n, m) = (a.len(), b.len());
     if n == 0 || m == 0 {
         return f64::INFINITY;
     }
-    let at = |i: usize, j: usize| i * (m + 1) + j;
-    let mut dp = vec![f64::INFINITY; (n + 1) * (m + 1)];
-    dp[at(0, 0)] = 0.0;
+    // Each cell reads only the prior row, the current row's left neighbour, and the
+    // prior diagonal. Keep one row and carry the diagonal rather than allocating the
+    // whole n×m matrix for every template in a vault lookup.
+    dp.resize(m + 1, f64::INFINITY);
+    dp.fill(f64::INFINITY);
+    dp[0] = 0.0;
     for i in 1..=n {
+        let mut diagonal = dp[0];
+        dp[0] = f64::INFINITY;
         for j in 1..=m {
             let cost = sig_distance(a[i - 1], b[j - 1], cfg);
-            let best = dp[at(i - 1, j)]
-                .min(dp[at(i, j - 1)])
-                .min(dp[at(i - 1, j - 1)]);
-            dp[at(i, j)] = cost + best;
+            let above = dp[j];
+            let best = above.min(dp[j - 1]).min(diagonal);
+            dp[j] = cost + best;
+            diagonal = above;
         }
     }
     // Normalize by the QUERY length (first arg). For 1-NN this is constant across
@@ -314,7 +324,7 @@ pub fn dtw(a: &[Sig], b: &[Sig], cfg: &GlyphConfig) -> f64 {
     // query and pays full cost for the unmatched ones — it can't masquerade as a circle.
     // (A template-dependent divisor like (n+m) or max(n,m) would dilute that and make
     // the longest template a magnet.)
-    dp[at(n, m)] / n.max(1) as f64
+    dp[m] / n.max(1) as f64
 }
 
 // ── arc-length resampling (speed + size normalization) ──────────────────────
@@ -757,6 +767,15 @@ pub fn word_distance(q: &GestureWord, t: &GestureWord, cfg: &GlyphConfig) -> f64
     dtw(&q.sigs, &t.sigs, cfg) + cfg.w_invariant * invariant_distance(q.inv, t.inv)
 }
 
+pub(crate) fn word_distance_with_scratch(
+    q: &GestureWord,
+    t: &GestureWord,
+    cfg: &GlyphConfig,
+    dp: &mut Vec<f64>,
+) -> f64 {
+    dtw_with_scratch(&q.sigs, &t.sigs, cfg, dp) + cfg.w_invariant * invariant_distance(q.inv, t.inv)
+}
+
 /// A drawable EXEMPLAR of a raw stroke: smoothed + arc-length resampled (via [`prepare`]) then
 /// normalized to a centered unit box (the longer axis spans roughly -0.5..0.5, aspect preserved).
 /// Stored on a template so a live overlay can ghost "the ideal shape this is becoming", scaled to
@@ -903,9 +922,10 @@ pub fn capture_held_with(
 }
 
 /// The full-feel capture: wait for the activation RHYTHM (`phrase` — "hold", "tap tap hold",
-/// "tap tap" toggle, …), then capture sensor-true motion. Hold-ending phrases capture while the
-/// final press is held and keep a COYOTE TAIL of `cfg.coyote_ms` after release (letting go a hair
-/// early must not eat the stroke's end); all-tap phrases TOGGLE capture (the next tap ends it).
+/// "tap tap" toggle, …), then capture sensor-true motion. Hold-ending phrases activate on the final
+/// press-down, capture while it is held, and keep a COYOTE TAIL of `cfg.coyote_ms` after
+/// release (letting go a hair early must not eat the stroke's end); all-tap phrases activate on the
+/// final short release and TOGGLE capture (the next tap ends it).
 /// A broken rhythm resets silently and instantly — fidgeting costs nothing. ESC aborts.
 #[cfg(windows)]
 pub fn capture_phrase(
@@ -1147,16 +1167,21 @@ mod raw_input {
     use super::C;
     use std::ffi::c_void;
     use std::time::Duration;
-    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::Foundation::{HWND, WAIT_FAILED};
     use windows_sys::Win32::UI::Input::{
         GetRawInputData, RegisterRawInputDevices, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE,
         RAWINPUTHEADER, RIDEV_INPUTSINK, RID_INPUT, RIM_TYPEMOUSE,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, PeekMessageW,
-        RegisterClassW, TranslateMessage, MSG, PM_REMOVE, WM_INPUT, WNDCLASSW, WS_EX_NOACTIVATE,
-        WS_EX_TOOLWINDOW, WS_POPUP,
+        CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+        MsgWaitForMultipleObjectsEx, PeekMessageW, RegisterClassW, TranslateMessage,
+        MSG, MWMO_INPUTAVAILABLE, PM_REMOVE, QS_RAWINPUT, WM_INPUT, WNDCLASSW,
+        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
     };
+
+    // The capture owns only its Raw Input window. Thread messages belong to their senders;
+    // unlike QS_ALLINPUT, this mask cannot wake on a message drain(hwnd) must leave alone.
+    const CAPTURE_WAIT_MESSAGES: u32 = QS_RAWINPUT;
 
     unsafe fn setup() -> Option<HWND> {
         // A REAL (never-shown) top-level window, NOT a message-only one: Windows drops WM_INPUT
@@ -1279,7 +1304,10 @@ mod raw_input {
         let header = std::mem::size_of::<RAWINPUTHEADER>() as u32;
         let mut moved = false;
         let mut msg: MSG = std::mem::zeroed();
-        while PeekMessageW(&raw mut msg, hwnd, 0, 0, PM_REMOVE) != 0 {
+        // A high-report-rate mouse must not starve cancellation and key-state checks.
+        let mut message_budget = 256;
+        while message_budget > 0 && PeekMessageW(&raw mut msg, hwnd, 0, 0, PM_REMOVE) != 0 {
+            message_budget -= 1;
             if msg.message == WM_INPUT {
                 let mut size: u32 = 0;
                 GetRawInputData(
@@ -1340,6 +1368,32 @@ mod raw_input {
         moved
     }
 
+    #[cfg(test)]
+    #[test]
+    fn capture_wait_ignores_unrelated_thread_messages() {
+        use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
+        use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_APP};
+
+        // SAFETY: the hidden window and posted message belong to this test thread.
+        unsafe {
+            let cls: Vec<u16> = "Static\0".encode_utf16().collect();
+            let hwnd = CreateWindowExW(0, cls.as_ptr(), std::ptr::null(), 0, 0, 0, 0, 0,
+                std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null());
+            assert!(!hwnd.is_null());
+            let mut msg: MSG = std::mem::zeroed();
+            while PeekMessageW(&raw mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {}
+            let marker = WM_APP + 19;
+            assert_ne!(PostThreadMessageW(GetCurrentThreadId(), marker, 0, 0), 0);
+            assert_eq!(MsgWaitForMultipleObjectsEx(0, std::ptr::null(), 0,
+                CAPTURE_WAIT_MESSAGES, MWMO_INPUTAVAILABLE), WAIT_TIMEOUT);
+            let mut acc = (0.0, 0.0);
+            assert!(!drain(hwnd, &mut acc, &mut Vec::new(), &mut Vec::new(), false));
+            assert_ne!(PeekMessageW(&raw mut msg, std::ptr::null_mut(), marker, marker, PM_REMOVE), 0);
+            DestroyWindow(hwnd);
+        }
+    }
+
     /// The multi-slot dispatcher body (see [`super::capture_slots_until`]). Per-key tap-count
     /// state machines + global motion prebuffer; activation = the press that outlives `hold_ms`
     /// OR moves ≥8 counts while a slot matches the key's current tap count.
@@ -1366,6 +1420,7 @@ mod raw_input {
         }
         unsafe {
             let hwnd = setup()?;
+            let key_wake = crate::capture::subscribe_key_transitions();
             let t0 = Instant::now();
             let mut keys: Vec<KeyState> = Vec::new();
             for s in slots {
@@ -1452,7 +1507,34 @@ mod raw_input {
                         }
                     }
                 }
-                std::thread::sleep(Duration::from_millis(3));
+                // The resident Raw Input listener signals key_wake on each control edge.
+                // Mouse motion wakes this thread through its own HWND. Keep a bounded
+                // reconciliation timeout for cancellation and missed OS transitions; CLI
+                // one-shots without a resident listener retain their 3 ms poll cadence.
+                let mut timeout = if crate::controls::held_registry_live() && key_wake.is_some() {
+                    50u32
+                } else {
+                    3u32
+                };
+                for k in &keys {
+                    if k.down && !k.dead {
+                        let remaining = cfg.hold_ms.saturating_sub(
+                            now.duration_since(k.t_down).as_millis() as u64,
+                        );
+                        timeout = timeout.min(remaining.max(1).min(u32::MAX as u64) as u32);
+                    }
+                }
+                if let Some(wake) = key_wake.as_ref() {
+                    let handle = wake.handle();
+                    let result = MsgWaitForMultipleObjectsEx(
+                        1, &raw const handle, timeout, CAPTURE_WAIT_MESSAGES, MWMO_INPUTAVAILABLE,
+                    );
+                    if result == WAIT_FAILED {
+                        std::thread::sleep(Duration::from_millis(3));
+                    }
+                } else {
+                    std::thread::sleep(Duration::from_millis(timeout as u64));
+                }
             };
 
             let (id, mut pts) = activated;
@@ -1525,21 +1607,42 @@ mod raw_input {
             let hwnd = setup().ok_or(())?;
             let mut acc = (0.0, 0.0);
             let mut sink = Vec::new();
+            let mut activation_pts = Vec::new();
+            let mut activation_stamps = Vec::new();
+            let mut activation_acc = (0.0, 0.0);
+            let mut was_down = false;
 
-            // ── wait for the activation rhythm (drain & discard motion meanwhile) ──
+            // ── wait for the activation rhythm; retain only the current press's motion ──
             let t0 = Instant::now();
             let mut watcher = PhraseWatcher::new(phrase.clone(), cfg);
-            let toggle = loop {
-                drain(hwnd, &mut acc, &mut sink, &mut Vec::new(), false);
-                sink.clear();
+            let (toggle, mut pts) = loop {
                 if super::key_down(0x1B) || stop() {
                     // ESC (or an external cancel) aborts — quietly, instantly.
                     DestroyWindow(hwnd);
                     return Ok(Vec::new());
                 }
                 let now = t0.elapsed().as_millis() as u64;
-                match watcher.feed(now, super::control_down(trigger)) {
-                    Watch::Activated { toggle } => break toggle,
+                let down = super::control_down(trigger);
+                if down && !was_down {
+                    activation_acc = (0.0, 0.0);
+                    activation_pts.clear();
+                    activation_stamps.clear();
+                }
+                if down || was_down {
+                    drain(hwnd, &mut activation_acc, &mut activation_pts, &mut activation_stamps, want_stamps);
+                } else {
+                    drain(hwnd, &mut acc, &mut sink, &mut Vec::new(), false);
+                    sink.clear();
+                }
+                was_down = down;
+                match watcher.feed(now, down) {
+                    Watch::Activated { toggle } => {
+                        let points = if toggle { std::mem::take(&mut activation_pts) } else { Vec::new() };
+                        if toggle && want_stamps {
+                            stamps_out.extend(activation_stamps.iter().copied());
+                        }
+                        break (toggle, points);
+                    }
                     // a broken rhythm costs nothing — the watcher already re-armed itself.
                     Watch::Pending | Watch::Reset => {}
                 }
@@ -1551,26 +1654,23 @@ mod raw_input {
             // click. Released on drop when capture ends. (Cross-platform seam in `cursor_lock`.)
             let _cursor = super::cursor_lock::CursorLock::engage();
 
-            // ACTIVATION TICK: one empty-progress call the moment the rhythm lands (before any
-            // motion), so an overlay can materialize on the PRESS — not a beat later on the first
-            // mouse twitch. Existing callers see a zero-length stroke, which they already ignore.
+            // ACTIVATION TICK: one empty-progress call when the rhythm resolves (before captured
+            // motion), so an overlay can materialize immediately. Existing callers see a zero-length
+            // stroke, which they already ignore.
             on_progress(&[]);
 
-            let mut pts: Vec<C> = Vec::new();
-            acc = (0.0, 0.0);
+            if toggle {
+                acc = activation_acc;
+                if !pts.is_empty() {
+                    on_progress(&pts);
+                }
+            } else {
+                pts.clear();
+                acc = (0.0, 0.0);
+            }
 
             if toggle {
                 // ── toggle capture: runs until the NEXT tap of the trigger (or ESC) ──
-                // First let the activating press release (its motion already counts).
-                while super::control_down(trigger) {
-                    if drain(hwnd, &mut acc, &mut pts, stamps_out, want_stamps) {
-                        if pts.len() >= max_pts {
-                            compact(&mut pts);
-                        }
-                        on_progress(&pts);
-                    }
-                    std::thread::sleep(Duration::from_millis(2));
-                }
                 // capture until the closing tap's DOWN edge (responsive close) or ESC.
                 // SAFETY DEADMAN (mirrors the hold branch): a 60s cap so a closing tap that never
                 // registers — a flickered/missed key edge mid-stroke — can't strand this loop with the
@@ -1818,6 +1918,43 @@ mod tests {
         // a circle is nearer another circle than a line (query-normalized DTW)
         let circ2 = signature_sequence(&synth_circle(90, 250.0, TAU / 90.0), &cfg());
         assert!(dtw(&circ, &circ2, &cfg()) < dtw(&circ, &line, &cfg()));
+    }
+
+    #[test]
+    fn dtw_compact_row_matches_dense_recurrence_bit_for_bit() {
+        fn dense(a: &[Sig], b: &[Sig], cfg: &GlyphConfig) -> f64 {
+            let (n, m) = (a.len(), b.len());
+            if n == 0 || m == 0 {
+                return f64::INFINITY;
+            }
+            let at = |i: usize, j: usize| i * (m + 1) + j;
+            let mut dp = vec![f64::INFINITY; (n + 1) * (m + 1)];
+            dp[0] = 0.0;
+            for i in 1..=n {
+                for j in 1..=m {
+                    let cost = sig_distance(a[i - 1], b[j - 1], cfg);
+                    let best = dp[at(i - 1, j)]
+                        .min(dp[at(i, j - 1)])
+                        .min(dp[at(i - 1, j - 1)]);
+                    dp[at(i, j)] = cost + best;
+                }
+            }
+            dp[at(n, m)] / n as f64
+        }
+
+        let make = |len: usize, seed: f64| -> Vec<Sig> {
+            (0..len).map(|i| {
+                let x = i as f64 * 0.29 + seed;
+                Sig { mag: 0.8 + x.sin() * 0.1, rot: x.cos(), resid_norm: x.sin().abs() }
+            }).collect()
+        };
+        for n in [0, 1, 2, 7, 16, 33] {
+            for m in [0, 1, 3, 8, 24] {
+                let a = make(n, 0.1);
+                let b = make(m, 1.4);
+                assert_eq!(dtw(&a, &b, &cfg()).to_bits(), dense(&a, &b, &cfg()).to_bits(), "{n}×{m}");
+            }
+        }
     }
 
     #[test]

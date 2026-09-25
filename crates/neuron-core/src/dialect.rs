@@ -104,7 +104,7 @@ pub trait Dialect: Send + Sync {
         size: u8,
         args: &[u8],
         stream_wait_us: u64,
-    );
+    ) -> bool;
 
     /// Release the family's CUSTODY of a device back to firmware — the rest-state restore that
     /// runs at stream teardown and app exit (DIALECT-RND "Device-mode lifecycle"). Per-family
@@ -254,7 +254,7 @@ impl Dialect for RazerDialect {
             // like silence — keep polling, and time out honestly if nothing whole ever arrives.
             if t.get_feature(&mut b).is_ok_and(|n| n >= BUF_LEN) {
                 // accept only a reply that echoes our class/id (filters cross-talk)
-                if let Some(status) = reply_status(&b, cmd_class, cmd_id) {
+                if let Some(status) = crate::protocol::razer_reply_status(&b, transaction_id, cmd_class, cmd_id) {
                     match status {
                         Status::Success => return Ok(Report::from_buf(&b).args),
                         Status::Fail => {
@@ -284,7 +284,7 @@ impl Dialect for RazerDialect {
         size: u8,
         args: &[u8],
         stream_wait_us: u64,
-    ) {
+    ) -> bool {
         // Hold the pipe's wire lock for the WHOLE conversation (set → poll/drain [→ re-arm]):
         // pair-atomicity is the unit; between conversations other actors may interleave freely.
         let wire = t.wire_lock();
@@ -294,13 +294,13 @@ impl Dialect for RazerDialect {
         // the def calibrated one, then a single GetFeature drain (the razer_report protocol
         // requires the reply be read before the next write — skip it and the device freezes).
         let out = frame(transaction_id, class, id, size, args);
-        if t.set_feature(&out).is_ok() {
-            if stream_wait_us > 0 {
-                std::thread::sleep(Duration::from_micros(stream_wait_us));
-            }
-            let mut b = [0u8; BUF_LEN];
-            let _ = t.get_feature(&mut b); // drain the reply; don't busy-retry
+        if t.set_feature(&out).is_err() { return false; }
+        if stream_wait_us > 0 {
+            std::thread::sleep(Duration::from_micros(stream_wait_us));
         }
+        let mut b = [0u8; BUF_LEN];
+        t.get_feature(&mut b).is_ok_and(|n| n >= BUF_LEN)
+            && crate::protocol::razer_reply_status(&b, transaction_id, class, id) == Some(Status::Success)
     }
 
     /// Return the driver-mode LEASE: `device_mode` -> NORMAL (0x00), re-enabling the board's onboard
@@ -497,7 +497,7 @@ impl Dialect for RazerAudioDialect {
         size: u8,
         args: &[u8],
         stream_wait_us: u64,
-    ) {
+    ) -> bool {
         // Hold the pipe's wire lock for the WHOLE conversation (set → poll/drain [→ re-arm]):
         // pair-atomicity is the unit; between conversations other actors may interleave freely.
         let wire = t.wire_lock();
@@ -506,13 +506,13 @@ impl Dialect for RazerAudioDialect {
         // Mirrors RazerDialect::exec_fast: SetFeature, wait the calibrated round-trip, one drain —
         // never a busy-retry loop.
         let out = frame_audio(transaction_id, class, id, size, args);
-        if t.set_feature(&out).is_ok() {
-            if stream_wait_us > 0 {
-                std::thread::sleep(Duration::from_micros(stream_wait_us));
-            }
-            let mut b = [0u8; AUDIO_BUF_LEN];
-            let _ = t.get_feature(&mut b); // drain the reply; don't busy-retry
+        if t.set_feature(&out).is_err() { return false; }
+        if stream_wait_us > 0 {
+            std::thread::sleep(Duration::from_micros(stream_wait_us));
         }
+        let mut b = [0u8; AUDIO_BUF_LEN];
+        t.get_feature(&mut b).is_ok_and(|n| n >= AUDIO_BUF_LEN)
+            && reply_status(&b, class, id) == Some(Status::Success)
     }
 
     // NB: `release_custody` is INTENTIONALLY NOT overridden — the trait's default no-op is correct.
@@ -719,6 +719,19 @@ mod tests {
         reply[1] = 0x02;
         assert_eq!(reply_status(&reply, 0x04, 0x85), Some(Status::Success));
         assert_eq!(reply_status(&reply, 0x04, 0x86), None, "class/id mismatch → no status");
+    }
+
+    #[test]
+    fn razer_stream_drain_reports_short_or_corrupt_replies() {
+        use crate::transport::mock::{Fault, MockDevice};
+        for fault in [Fault::ShortRead(9), Fault::CrcCorrupt] {
+            let phantom = Arc::new(
+                MockDevice::razer(0x1234, "Stream")
+                    .answering(0x0F, 0x03, &[])
+                    .faulting(fault),
+            );
+            assert!(!RazerDialect.exec_fast(&phantom.handle(), 0x1F, 0x0F, 0x03, 2, &[], 0));
+        }
     }
 
     #[test]

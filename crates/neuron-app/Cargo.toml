@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
 
-# neuron-app — the resident GUI + tray app (Slint, GPU/femtovg renderer — draws only while
-# the window is shown; tray-hidden = no compute, just a held GL context). The one long-lived
-# process: tray icon, global hotkey loops, device-runtime daemon, lazily-created Slint window.
+# neuron-app — the resident GUI + tray app (Slint UI rendering stops while hidden; live
+# input, device, audio and host workers continue). The one long-lived
+# process: tray icon, global hotkey loops, device-runtime daemon, eagerly-created hidden Slint window.
 # Depends on neuron-core for all logic (in-process, no IPC).
 #
 # Dependencies are added here deliberately and sparingly: new code should not mean new deps.
@@ -43,10 +43,10 @@ serde.workspace = true
 serde_json = "1"
 toml.workspace = true
 anyhow.workspace = true
-# Both renderers compiled: femtovg (GPU) for the instant-feeling UI, renderer-software as
-# fallback so a VM / RDP / headless / bad-driver host (no usable GL context) can still open
-# the window. main.rs selects femtovg-first with a software fallback; winit also auto-falls-
-# back to software at window creation if GL init fails, but only if it's compiled in.
+# Both renderers compiled: FemtoVG/OpenGL for the UI and software for hosts with weak
+# graphics support. NEURON_RENDERER=software selects the latter explicitly. Slint's
+# selector can fall back during backend construction, but graphics initialization can
+# fail later when the window opens, so selection is not a driver compatibility test.
 slint = { version = "1.16", default-features = false, features = ["compat-1-2", "std", "backend-winit", "renderer-femtovg", "renderer-software"] }
 image = { version = "0.25", default-features = false, features = ["png", "gif"] }
 cpal.workspace = true
@@ -92,6 +92,11 @@ windows-sys = { version = "0.59", features = [
 
 [build-dependencies]
 slint-build = "1.16"
+
+[features]
+default = []
+# Opt-in experimental WGPU UI renderer; layered overlays and materials remain CPU paths.
+wgpu-renderer = ["slint/renderer-femtovg-wgpu", "slint/unstable-wgpu-28"]
 
 [dev-dependencies]
 proptest = "1"

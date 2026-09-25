@@ -219,10 +219,13 @@ if ($Mode -eq 'full') {
     # budget_lane.rs resident_footprint (launches the real exe, needs NEURON_BUDGET_EXE),
     # lighting_bench and runner.rs submitting_is_far_cheaper_than_spawning_a_thread (perf
     # micro-benches - a shared runner's contended CPU makes the number meaningless).
-    # One invocation per filter: libtest's positional filter is a single pattern, and passing
-    # two silently runs only the first on some toolchains.
-    Invoke-Gate 'ignored: python sidecar death-race' {
-        cargo test -p neuron @lock -- --ignored --nocapture death_race
+    # Each death-race gets a fresh process because both mutate the MacroHost singleton and
+    # intentionally kill its child. A shared process can carry a broken pipe into the next case.
+    Invoke-Gate 'ignored: python sidecar insert-after-clear' {
+        cargo test -p neuron --lib @lock -- --ignored --nocapture death_race_insert_after_clear
+    }
+    Invoke-Gate 'ignored: python sidecar clear-after-insert' {
+        cargo test -p neuron --lib @lock -- --ignored --nocapture death_race_clear_after_insert
     }
     $sampleDir = Join-Path ([IO.Path]::GetTempPath()) 'neuron-validate-gwyph'
     New-Item -ItemType Directory -Force -Path $sampleDir | Out-Null
@@ -230,7 +233,7 @@ if ($Mode -eq 'full') {
     try {
         $env:GWYPH_SAMPLE_DIR = $sampleDir
         Invoke-Gate 'ignored: gwyph reference emitter' {
-            cargo test -p neuron @lock -- --ignored --nocapture emit_sample_for_reference_reader
+            cargo test -p neuron --lib @lock -- --ignored --nocapture emit_sample_for_reference_reader
         }
     } finally {
         $env:GWYPH_SAMPLE_DIR = $previousSampleDir
