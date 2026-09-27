@@ -215,9 +215,11 @@ impl<'a> PixelView<'a> {
         let start = PIXEL_ARRAY_OFFSET.min(self.bytes.len());
         let end = (PIXEL_ARRAY_OFFSET + self.count * PIXEL_STRIDE).min(self.bytes.len());
         self.bytes[start..end]
-            .chunks_exact(PIXEL_STRIDE)
+            .as_chunks::<PIXEL_STRIDE>()
+            .0
+            .iter()
             .enumerate()
-            .map(|(i, c)| (PIXEL_ARRAY_OFFSET + i * PIXEL_STRIDE, [c[0], c[1], c[2], c[3]]))
+            .map(|(i, c)| (PIXEL_ARRAY_OFFSET + i * PIXEL_STRIDE, *c))
     }
 
     /// Pixels whose color bytes (b0..b2) are non-zero — the lit portion of the frame.

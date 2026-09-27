@@ -1121,7 +1121,7 @@ mod imp {
                 let a1 = rot + TAU * (i + 1) as f32 / n as f32;
                 let (px0, py0) = (cx + a0.cos() * ir, cy + a0.sin() * ir);
                 let (px1, py1) = (cx + a1.cos() * ir, cy + a1.sin() * ir);
-                let mid = ((px0 + px1) * 0.5, (py0 + py1) * 0.5);
+                let mid = (f32::midpoint(px0, px1), f32::midpoint(py0, py1));
                 splat_prism(buf, mid.0, mid.1, 1.6, bright * 0.22, rgb);
             }
         }
@@ -2435,7 +2435,7 @@ mod imp {
                                 blit_mask(&mut buf.white, t, CX, CY + 26.0, 0.22);
                             }
                         }
-                        WeaveMode::Control { ssid: _, .. } => {
+                        WeaveMode::Control { .. } => {
                             // the glance: three readout cards (net N / output W / bluetooth E),
                             // each the same live-instrument card the wheel uses, so the control
                             // center is made of the same mana. A flick lights the card it commits:
@@ -3833,7 +3833,7 @@ mod imp {
                 for j in 0..=steps {
                     let u = j as f32 / steps as f32;
                     let (sx, sy) = (CX + b.cos() * rad * u, CY + b.sin() * rad * u);
-                    let sb = 0.5 * (0.3 + u);
+                    let sb = f32::midpoint(0.3, u);
                     if is_accent {
                         splat_prism(buf, sx, sy, 4.5, sb, accent);
                     } else {
@@ -4747,7 +4747,7 @@ mod imp {
                     // angles 0..PI bulge below the hem line).
                     let mut i = 0;
                     while i + 1 < folds.len() {
-                        let midx = cx + (folds[i] + folds[i + 1]) * 0.5 * r;
+                        let midx = cx + f32::midpoint(folds[i], folds[i + 1]) * r;
                         let rr = ((folds[i + 1] - folds[i]) * 0.5 * r).abs();
                         varc(m, midx, hem_y, rr, 0.0, std::f32::consts::PI, sr, 0.85 * b);
                         i += 1;

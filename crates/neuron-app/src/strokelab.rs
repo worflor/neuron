@@ -174,7 +174,7 @@ fn arc_length(path: &[C]) -> f64 {
 /// small margin so the extremes don't clamp. Returns the normalized points and the (invertible)
 /// transform used.
 fn normalize_aspect(path: &[C], bb: [f64; 4]) -> (Vec<[f32; 2]>, Normalization) {
-    let (cx, cy) = ((bb[0] + bb[2]) * 0.5, (bb[1] + bb[3]) * 0.5);
+    let (cx, cy) = (f64::midpoint(bb[0], bb[2]), f64::midpoint(bb[1], bb[3]));
     let scale = (bb[2] - bb[0]).max(bb[3] - bb[1]).max(1e-6);
     let margin = 0.04_f64;
     let span = 1.0 - 2.0 * margin;

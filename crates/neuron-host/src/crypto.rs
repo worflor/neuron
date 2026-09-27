@@ -44,7 +44,7 @@ pub fn sha256(msg: &[u8]) -> [u8; 32] {
     data.extend_from_slice(&bit_len.to_be_bytes());
 
     let mut w = [0u32; 64];
-    for block in data.chunks_exact(64) {
+    for block in data.as_chunks::<64>().0 {
         for (i, word) in w.iter_mut().take(16).enumerate() {
             *word = u32::from_be_bytes([
                 block[i * 4],

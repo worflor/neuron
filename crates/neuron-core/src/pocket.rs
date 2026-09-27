@@ -466,8 +466,10 @@ fn plural(n: usize) -> &'static str {
 
 fn utf16_to_string(b: &[u8]) -> String {
     let units: Vec<u16> = b
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
         .collect();
     let end = units.iter().position(|&u| u == 0).unwrap_or(units.len());
     String::from_utf16_lossy(&units[..end])
@@ -523,8 +525,10 @@ fn parse_hdrop(b: &[u8]) -> Vec<String> {
     let mut out = Vec::new();
     if wide {
         let units: Vec<u16> = data
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
             .collect();
         let mut start = 0;
         for i in 0..units.len() {

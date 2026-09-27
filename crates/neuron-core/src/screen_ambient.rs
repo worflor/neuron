@@ -330,7 +330,9 @@ mod imp {
                 if got != 0 {
                     // 32bpp DIB scanlines are BGRX (little-endian) — channel 2 is red, 0 is blue.
                     let zones = buf
-                        .chunks_exact(4)
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
                         .map(|px| Rgb::new(px[2], px[1], px[0]))
                         .collect();
                     out = Some(zones);
