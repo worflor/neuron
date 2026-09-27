@@ -53,10 +53,21 @@ try {
     if (-not $SkipBuild) {
         $env:CARGO_TARGET_DIR = $target
         $env:RUSTFLAGS = '-C target-feature=+crt-static'
-        & cargo build --release -p neuron-app -p neuron-cli --locked
-        if ($LASTEXITCODE -ne 0) { throw 'Windows release build failed' }
         & cargo build --release -p neuron-host --features bridge --bin neuron-chroma-broker --locked
         if ($LASTEXITCODE -ne 0) { throw 'Chroma broker release build failed' }
+        $previousBrokerHash = $env:NEURON_BROKER_SHA256
+        $previousInstallerHash = $env:NEURON_BROKER_INSTALLER_SHA256
+        try {
+            $env:NEURON_BROKER_SHA256 = (Get-FileHash -LiteralPath (Join-Path $target 'release\neuron-chroma-broker.exe') -Algorithm SHA256).Hash
+            $env:NEURON_BROKER_INSTALLER_SHA256 = (Get-FileHash -LiteralPath (Join-Path $repo 'packaging/windows/install-chroma-broker.ps1') -Algorithm SHA256).Hash
+            & cargo build --release -p neuron-app -p neuron-cli --locked
+            if ($LASTEXITCODE -ne 0) { throw 'Windows release build failed' }
+        } finally {
+            if ($null -eq $previousBrokerHash) { Remove-Item Env:NEURON_BROKER_SHA256 -ErrorAction SilentlyContinue }
+            else { $env:NEURON_BROKER_SHA256 = $previousBrokerHash }
+            if ($null -eq $previousInstallerHash) { Remove-Item Env:NEURON_BROKER_INSTALLER_SHA256 -ErrorAction SilentlyContinue }
+            else { $env:NEURON_BROKER_INSTALLER_SHA256 = $previousInstallerHash }
+        }
     }
 
     $bin = Join-Path $target 'release'
@@ -65,6 +76,16 @@ try {
         if (-not (Test-Path -LiteralPath (Join-Path $bin $exe))) {
             throw "release binary missing: $exe"
         }
+    }
+    # `-SkipBuild` is useful for repackaging docs, but must not combine a stale app with a newer
+    # broker. The app carries this ASCII pin and refuses to elevate a broker that differs.
+    $brokerHash = (Get-FileHash -LiteralPath (Join-Path $bin 'neuron-chroma-broker.exe') -Algorithm SHA256).Hash
+    $installerHash = (Get-FileHash -LiteralPath (Join-Path $repo 'packaging/windows/install-chroma-broker.ps1') -Algorithm SHA256).Hash
+    $appImage = [Text.Encoding]::ASCII.GetString(
+        [IO.File]::ReadAllBytes((Join-Path $bin 'neuron-app.exe')))
+    if ($appImage.IndexOf($brokerHash, [StringComparison]::OrdinalIgnoreCase) -lt 0 -or
+        $appImage.IndexOf($installerHash, [StringComparison]::OrdinalIgnoreCase) -lt 0) {
+        throw 'release app does not contain the packaged Chroma broker and installer hashes; rebuild without -SkipBuild'
     }
     $cliVersion = (& (Join-Path $bin 'neuron.exe') --version).Trim()
     if ($LASTEXITCODE -ne 0 -or $cliVersion -ne "neuron $appVersion") {
@@ -75,7 +96,10 @@ try {
     if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
     New-Item -ItemType Directory -Path $stage | Out-Null
     Copy-Item -LiteralPath @($executables | ForEach-Object { Join-Path $bin $_ }) -Destination $stage
-    Copy-Item -LiteralPath (Join-Path $repo 'packaging/windows/install-chroma-broker.ps1') -Destination $stage
+    Copy-Item -LiteralPath @(
+        (Join-Path $repo 'packaging/windows/install-chroma-broker.ps1'),
+        (Join-Path $repo 'packaging/windows/uninstall-chroma-broker.ps1')
+    ) -Destination $stage
     foreach ($file in @('README.md', 'CHANGELOG.md', 'LICENSE.md', 'THIRD-PARTY-NOTICES.md', 'SECURITY.md')) {
         Copy-Item -LiteralPath (Join-Path $repo $file) -Destination $stage
     }
@@ -112,6 +136,9 @@ source commit above. The binary is not code signed. The matching source and
 license terms are in the repository.
 "@
     [IO.File]::WriteAllText((Join-Path $stage 'SOURCE.txt'), $source,
+        [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText((Join-Path $stage 'portable.flag'),
+        "This file keeps Neuron settings beside the portable executables.`n",
         [Text.UTF8Encoding]::new($false))
 
     Compress-Archive -Path $stage -DestinationPath $zip -Force

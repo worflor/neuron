@@ -276,29 +276,28 @@ pub fn set_polling_hz_hires(dev: &Device, hz: u32) -> Result<u32> {
 /// command '`set_brightness`'" even though the board CAN set brightness — a dialect leak, not a
 /// missing capability.
 ///
-/// The `store` parameter applies to the TOP-LEVEL-command dialect only. The lighting-block
-/// fallback uses the SPEC'S OWN baked varstore byte (the legacy dialect's single hardware-proven
-/// layout, e.g. the `BlackWidow`'s `args = [0x01, 0x05]`); `store` is deliberately NOT spliced into
-/// that legacy prefix, because a volatile-varstore legacy brightness write is an unproven byte
-/// combination this write path refuses to invent (verify-gated culture: no unproven bytes on the
-/// wire). The top-level path verifies the matching brightness getter on the same plane. Legacy
-/// devices without a getter stay gated behind `NEURON_BRIGHTNESS_WRITE=1`.
+/// The `store` parameter applies to the top-level dialect. A lighting-block command carries its
+/// own verified varstore and LED prefix. Both paths read back that exact prefix before succeeding.
 pub fn set_brightness(dev: &Device, pct: u8, store: Store) -> Result<()> {
     let level = (u16::from(pct.min(100)) * 255 / 100) as u8;
-    // Legacy brightness specs have no paired getter. Keep that write explicitly opt-in until the
-    // device can verify its own bytes; an ACK alone is not evidence that the LED changed.
-    if !dev.def.has_command("brightness") && !brightness_write_enabled() {
-        anyhow::bail!(
-            "brightness write on '{}' has no read-back getter and is gated; set NEURON_BRIGHTNESS_WRITE=1 to opt in to the unverified legacy path",
-            dev.def.name
-        );
-    }
-    if dev.def.has_command("set_brightness") {
-        dev.run_args("set_brightness", &[store.byte(), 0x04, level])?;
+    anyhow::ensure!(
+        dev.def.has_command("brightness"),
+        "brightness write on '{}' has no read-back getter",
+        dev.def.name
+    );
+    let prefix = if dev.def.has_command("set_brightness") {
+        let prefix = [store.byte(), 0x04];
+        dev.run_args("set_brightness", &[prefix[0], prefix[1], level])?;
+        prefix.to_vec()
     } else {
         let Some(spec) = dev.def.lighting.as_ref().and_then(|l| l.brightness.as_ref()) else {
             anyhow::bail!("device '{}' has no brightness write path", dev.def.name);
         };
+        anyhow::ensure!(
+            spec.args.len() == 2,
+            "brightness write on '{}' has an invalid verification prefix",
+            dev.def.name
+        );
         // The spec's args are the full dialect prefix; only the level is appended.
         let mut args = spec.args.clone();
         args.push(level);
@@ -309,24 +308,20 @@ pub fn set_brightness(dev: &Device, pct: u8, store: Store) -> Result<()> {
             spec.size,
             &args,
         )?;
-    }
-    if dev.def.has_command("brightness") {
-        let got = dev.run_args("brightness", &[store.byte(), 0x04])?;
-        if got[0] != store.byte() || got[1] != 0x04 || got[2] != level {
-            anyhow::bail!(
-                "VERIFY FAILED on brightness: wrote varstore {:#04x}, region 0x04, level {level} but device reports varstore {:#04x}, region {:#04x}, level {:#04x} — write NOT trusted",
-                store.byte(),
-                got[0],
-                got[1],
-                got[2]
-            );
-        }
+        spec.args.clone()
+    };
+    let got = dev.run_args("brightness", &prefix)?;
+    if got[0] != prefix[0] || got[1] != prefix[1] || got[2] != level {
+        anyhow::bail!(
+            "VERIFY FAILED on brightness: wrote varstore {:#04x}, region {:#04x}, level {level} but device reports varstore {:#04x}, region {:#04x}, level {:#04x} — write NOT trusted",
+            prefix[0],
+            prefix[1],
+            got[0],
+            got[1],
+            got[2]
+        );
     }
     Ok(())
-}
-
-fn brightness_write_enabled() -> bool {
-    std::env::var("NEURON_BRIGHTNESS_WRITE").is_ok_and(|v| v == "1")
 }
 
 /// Lighting brightness as a percentage. Response arg[2] is raw 0..255 (Synapse shows %).
@@ -490,28 +485,56 @@ mod tests {
     }
 
     #[test]
-    fn legacy_brightness_without_a_getter_is_gated_before_the_write() {
+    fn legacy_brightness_uses_its_own_prefix_and_verifies_the_getter() {
         use crate::transport::mock::MockDevice;
 
         let pid = 0xFDC3;
         let def: crate::registry::DeviceDef = toml::from_str(include_str!("../devices/razer-blackwidow-chroma-v2.toml"))
             .expect("the curated BlackWidow definition parses");
+        let phantom = std::sync::Arc::new(MockDevice::razer(pid, "phantom BlackWidow")
+            .answering(0x03, 0x03, &[])
+            .answering(0x03, 0x83, &[0x01, 0x05, 127]));
+        let d = Device::with_transport(def, pid, Box::new(phantom.handle()));
+        assert!(d.def.has_command("brightness"));
+        set_brightness(&d, 50, Store::Volatile)
+            .expect("legacy brightness must verify its baked persistent backlight prefix");
+        assert_eq!(phantom.asked(), vec![(0x03, 0x03), (0x03, 0x83)]);
+    }
+
+    #[test]
+    fn brightness_without_a_getter_puts_nothing_on_the_wire() {
+        use crate::transport::mock::MockDevice;
+
+        let pid = 0xFDC5;
+        let mut def: crate::registry::DeviceDef =
+            toml::from_str(include_str!("../devices/razer-blackwidow-chroma-v2.toml"))
+                .expect("the curated BlackWidow definition parses");
+        def.commands.remove("brightness");
         let phantom = std::sync::Arc::new(
             MockDevice::razer(pid, "phantom BlackWidow").answering(0x03, 0x03, &[]),
         );
         let d = Device::with_transport(def, pid, Box::new(phantom.handle()));
-        assert!(!d.def.has_command("brightness"));
+        let err = set_brightness(&d, 50, Store::Persist)
+            .expect_err("a write without a getter must stop before transport I/O");
+        assert!(err.to_string().contains("has no read-back getter"));
+        assert!(phantom.asked().is_empty());
+    }
 
-        if brightness_write_enabled() {
-            set_brightness(&d, 50, Store::Persist)
-                .expect("the explicit opt-in permits the legacy ACK-only setter");
-            assert_eq!(phantom.asked(), vec![(0x03, 0x03)]);
-        } else {
-            let err = set_brightness(&d, 50, Store::Persist)
-                .expect_err("an ACK-only legacy setter must remain gated without a getter");
-            assert!(err.to_string().contains("has no read-back getter and is gated"));
-            assert!(phantom.asked().is_empty(), "the gate must run before any wire write");
-        }
+    #[test]
+    fn legacy_brightness_with_an_invalid_prefix_puts_nothing_on_the_wire() {
+        use crate::transport::mock::MockDevice;
+
+        let pid = 0xFDC6;
+        let mut def: crate::registry::DeviceDef =
+            toml::from_str(include_str!("../devices/razer-blackwidow-chroma-v2.toml"))
+                .expect("the curated BlackWidow definition parses");
+        def.lighting.as_mut().unwrap().brightness.as_mut().unwrap().args = vec![0x01];
+        let phantom = std::sync::Arc::new(MockDevice::razer(pid, "malformed legacy brightness"));
+        let d = Device::with_transport(def, pid, Box::new(phantom.handle()));
+        let err = set_brightness(&d, 50, Store::Persist)
+            .expect_err("a malformed verification prefix must stop before transport I/O");
+        assert!(err.to_string().contains("invalid verification prefix"));
+        assert!(phantom.asked().is_empty());
     }
 
     #[test]

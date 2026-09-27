@@ -298,9 +298,8 @@ mod imp {
         resizing: bool,
         // ── the FRAME: hairline border + corner-bracket handle (one per tile) ──
         frame: windows_sys::Win32::Foundation::HWND,
-        /// the frame's kept memory DC + DIB (re-blended cheaply for proximity fades)
-        fdc: windows_sys::Win32::Graphics::Gdi::HDC,
-        fbmp: windows_sys::Win32::Graphics::Gdi::HBITMAP,
+        /// The frame's owned memory DC + DIB (re-blended cheaply for proximity fades).
+        frame_surface: Option<crate::surface::Dib>,
         fsize: (i32, i32),
         /// what the DIB currently shows: (collapsed, hover, possessed, count, fsize)
         painted: (bool, bool, bool, usize, (i32, i32)),
@@ -1142,8 +1141,7 @@ mod imp {
                 dragging: false,
                 resizing: false,
                 frame,
-                fdc: std::ptr::null_mut(),
-                fbmp: std::ptr::null_mut(),
+                frame_surface: None,
                 fsize: (0, 0),
                 painted: (false, false, false, 0, (0, 0)),
                 alpha: -1,
@@ -1352,7 +1350,6 @@ mod imp {
 
     unsafe fn destroy_tile(t: &Tile) {
         use windows_sys::Win32::Graphics::Dwm::DwmUnregisterThumbnail;
-        use windows_sys::Win32::Graphics::Gdi::{DeleteDC, DeleteObject};
         use windows_sys::Win32::UI::WindowsAndMessaging::{DestroyWindow, RemovePropW};
         unsafe {
             if t.thumb != 0 {
@@ -1363,12 +1360,6 @@ mod imp {
             DestroyWindow(t.win);
             if !t.frame.is_null() {
                 DestroyWindow(t.frame);
-            }
-            if !t.fbmp.is_null() {
-                DeleteObject(t.fbmp.cast());
-            }
-            if !t.fdc.is_null() {
-                DeleteDC(t.fdc);
             }
         }
     }
@@ -1487,34 +1478,25 @@ mod imp {
     /// glass + the corner bracket; collapsed = the bracket alone. The bracket's arm thickness encodes
     /// the constellation's window count; hover runs it white-hot.
     unsafe fn paint_frame(t: &mut Tile, count: usize, sz: (i32, i32)) {
-        use windows_sys::Win32::Graphics::Gdi::{DeleteDC, DeleteObject};
         unsafe {
-            if sz != t.fsize || t.fdc.is_null() {
-                if !t.fbmp.is_null() {
-                    DeleteObject(t.fbmp.cast());
-                    t.fbmp = std::ptr::null_mut();
-                }
-                if !t.fdc.is_null() {
-                    DeleteDC(t.fdc);
-                    t.fdc = std::ptr::null_mut();
-                }
+            if sz != t.fsize || t.frame_surface.is_none() {
                 // re-allocate the backing DIB at the new size via the shared seam (the ONE
                 // CreateDIBSection); the live pixel pointer is re-resolved below per paint.
                 let dib = match crate::surface::Dib::new(sz.0, sz.1) {
                     Some(d) => d,
                     None => return,
                 };
-                t.fdc = dib.dc;
-                t.fbmp = dib.bmp.cast();
+                t.frame_surface = Some(dib);
                 t.fsize = sz;
             }
+            let Some(surface) = t.frame_surface.as_ref() else { return };
             // resolve the live pixel pointer from the kept bitmap
             let mut bits: *mut u32 = std::ptr::null_mut();
             {
                 use windows_sys::Win32::Graphics::Gdi::{GetObjectW, BITMAP};
                 let mut bm: BITMAP = std::mem::zeroed();
                 if GetObjectW(
-                    t.fbmp.cast(),
+                    surface.bitmap().cast(),
                     std::mem::size_of::<BITMAP>() as i32,
                     (&raw mut bm).cast(),
                 ) != 0
@@ -1589,13 +1571,13 @@ mod imp {
         use windows_sys::Win32::Foundation::POINT;
         use windows_sys::Win32::Graphics::Gdi::{GetDC, ReleaseDC};
         unsafe {
-            if t.fdc.is_null() {
+            let Some(surface) = t.frame_surface.as_ref() else {
                 return;
-            }
+            };
             let screen = GetDC(std::ptr::null_mut());
             let dst = POINT { x: pos.0, y: pos.1 };
             let size = windows_sys::Win32::Foundation::SIZE { cx: sz.0, cy: sz.1 };
-            crate::surface::present_dc(t.frame, screen, t.fdc, Some(dst), size, alpha);
+            crate::surface::present_dc(t.frame, screen, surface.dc(), Some(dst), size, alpha);
             ReleaseDC(std::ptr::null_mut(), screen);
         }
     }

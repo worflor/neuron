@@ -37,23 +37,34 @@ _IS_WIN = sys.platform == "win32"
 _MODE = os.environ.get("NEURON_MACRO_MODE", "raw").strip().lower()
 _BOUND = _MODE == "bound"
 _armed = False
+_arm_generation = 0
 
 
-def _set_armed(on):
-    global _armed
+def _set_armed(on, generation=0):
+    global _armed, _arm_generation
+    generation = int(generation)
+    if generation < _arm_generation:
+        return _arm_generation
     _armed = bool(on)
+    _arm_generation = generation
+    return generation
 
 
 def armed():
     """Is real input synthesis currently armed? (SAFE mode = False.)"""
-    return _armed
+    return not _gated()
 
 
 def _gated():
     """Should an effectful helper SUPPRESS its action right now? True when input is disarmed (SAFE
     mode) OR this fire is a MOCK fire (a GUI 'test' run — see _set_mock). ask()/notify() never consult
     this: a mock fire raises the macro's REAL beacon, it just performs none of its real-world actions."""
-    return (not _armed) or getattr(_tls, "mock", False)
+    return (
+        (not _armed)
+        or getattr(_tls, "mock", False)
+        or not getattr(_tls, "authorized", False)
+        or getattr(_tls, "arm_generation", -1) != _arm_generation
+    )
 
 
 # ── the captured world (read-only snapshot at trigger time) ─────────────────────────────────────
@@ -81,9 +92,8 @@ _tls = threading.local()
 
 
 def _set_ctx(d):
-    # The per-fire ctx carries an `armed` flag for the macro to READ (ctx.armed), but it must NOT
-    # move the gate: the single source of truth for the input layer is the `armed` control frame
-    # routed through _set_armed(). Letting a fire's ctx flip _armed would race the control channel.
+    # ctx.armed is informational. The helper gate uses the host's control generation plus the
+    # per-fire authority token; letting context mutate either would race the control channel.
     _tls.ctx = Ctx(d)
 
 
@@ -102,6 +112,12 @@ def _set_mock(on):
     set, every effectful helper no-ops exactly as SAFE mode does — but ask()/notify() still reach the
     human, so the GUI 'test' button raises a macro's REAL beacon without performing its real actions."""
     _tls.mock = bool(on)
+
+
+def _set_authority(authorized, generation):
+    """Pin this worker to the arm generation accepted by the Rust host."""
+    _tls.authorized = bool(authorized)
+    _tls.arm_generation = int(generation)
 
 
 def _get_ctx():
@@ -317,6 +333,8 @@ def invoke(name, wait=True, **opts):
                 "ctx": _ctx_payload(),
                 "options": dict(opts),
                 "mock": getattr(_tls, "mock", False),
+                "authorized": getattr(_tls, "authorized", False),
+                "arm_generation": getattr(_tls, "arm_generation", 0),
             })
         return None
 
@@ -542,6 +560,8 @@ def _act(verb, arg=None, timeout=5.0, gated=True):
     _host_send({
         "t": "act", "rid": rid, "id": getattr(_tls, "mid", "?"),
         "verb": verb, "arg": arg, "mock": getattr(_tls, "mock", False),
+        "authorized": getattr(_tls, "authorized", False),
+        "arm_generation": getattr(_tls, "arm_generation", 0),
     })
     done = ev.wait(timeout)
     with _act_lock:

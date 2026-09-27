@@ -267,7 +267,7 @@ def _compile_candidate(mid, source):
     exec(compile(source, "<macro %s>" % mid, "exec"), g)
     fn = g.get("macro") or g.get("main")
     if not callable(fn):
-        raise ValueError("a macro must define \`def macro(ctx):\` (or \`def main(ctx):\`)")
+        raise ValueError("a macro must define `def macro(ctx):` (or `def main(ctx):`)")
     return fn, _read_options(g.get("NEURON_OPTIONS"))
 
 
@@ -748,11 +748,12 @@ _EPHEMERAL_MAX = 4
 _ephemeral_slots = threading.BoundedSemaphore(_EPHEMERAL_MAX)
 
 
-def _fire_callable(mid, fn, ctx, opts, mock=False):
+def _fire_callable(mid, fn, ctx, opts, mock=False, authorized=False, arm_generation=0):
     _nh._set_ctx(ctx)
     _nh._set_mid(mid)
     _nh._set_options(opts)
     _nh._set_mock(mock)   # set FRESH every fire so a real fire never inherits a prior test's mock
+    _nh._set_authority(authorized, arm_generation)
     cap = io.StringIO()
     _stdout_mux._local.target = cap
     try:
@@ -766,7 +767,7 @@ def _fire_callable(mid, fn, ctx, opts, mock=False):
         _stdout_mux._local.target = None
 
 
-def _fire(mid, generation, ctx, opts, mock=False):
+def _fire(mid, generation, ctx, opts, mock=False, authorized=False, arm_generation=0):
     fn = _macros.get(mid)
     if fn is None:
         return False, None, _errors.get(mid, "macro '%s' not registered" % mid)
@@ -776,7 +777,7 @@ def _fire(mid, generation, ctx, opts, mock=False):
             "macro '%s' fire was queued for generation %s; active generation is %s"
             % (mid, generation, active)
         )
-    return _fire_callable(mid, fn, ctx, opts, mock)
+    return _fire_callable(mid, fn, ctx, opts, mock, authorized, arm_generation)
 
 
 def _fire_worker(mid, q):
@@ -793,6 +794,8 @@ def _fire_worker(mid, q):
                     msg.get("ctx") or {},
                     msg.get("options") or {},
                     bool(msg.get("mock")),
+                    bool(msg.get("authorized")),
+                    int(msg.get("arm_generation") or 0),
                 )
                 _send({"t": "result", "rid": msg.get("rid"), "ok": ok,
                        "value": val, "error": (None if ok else log), "log": (log if ok else None)})
@@ -836,7 +839,7 @@ def _dispatch_fire(msg):
         q.put_nowait(msg)
     except queue.Full:
         _fire_slots.release()
-        sys.stderr.write("[neuron] macro '%s' fire queue full (%d) — dropped a fire\n"
+        sys.stderr.write("[neuron] macro '%s' fire queue full (%d) - dropped a fire\n"
                          % (mid, _FIRE_QUEUE_MAX))
 
 
@@ -868,6 +871,8 @@ def _fire_source(msg):
                 msg.get("ctx") or {},
                 msg.get("options") or {},
                 bool(msg.get("mock")),
+                bool(msg.get("authorized")),
+                int(msg.get("arm_generation") or 0),
             )
         except BaseException:
             ok, val, log = False, None, traceback.format_exc()
@@ -953,7 +958,8 @@ def main():
                    "header": res.get("header"), "suffix": res.get("suffix"),
                    "error": res.get("error")})
         elif t == "armed":
-            _nh._set_armed(bool(msg.get("on")))
+            applied = _nh._set_armed(bool(msg.get("on")), int(msg.get("generation") or 0))
+            _send({"t": "armed_ack", "generation": applied})
         elif t == "unregister":
             mid = msg.get("id")
             _macros.pop(mid, None)

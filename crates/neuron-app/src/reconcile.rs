@@ -450,8 +450,10 @@ mod tests {
         register(ReconcileUnit::new("t-panic-sibling", &[Readiness::DevicesScanned], move || {
             r.fetch_add(1, Ordering::SeqCst);
         }));
-        request_with_timeout(Scope::All, Duration::from_secs(2));
-        wait_for(|| ran.load(Ordering::SeqCst) == 1, Duration::from_millis(500));
+        // Exercise the worker's exact scheduler body synchronously. Waiting on the process-global
+        // queue here made this containment assertion depend on unrelated queued work and host load;
+        // the surrounding async tests cover request delivery separately.
+        run_scope(Scope::All, Duration::from_secs(2));
         std::panic::set_hook(prev);
         assert_eq!(ran.load(Ordering::SeqCst), 1, "the sibling still ran despite the panic");
     }

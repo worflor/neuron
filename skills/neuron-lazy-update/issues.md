@@ -13,7 +13,7 @@ Before saying anything about bugs, find out whether it's already known or intend
 2. **Is it expected behaviour?** Check the GDD for how the feature is meant to work, and
    `neuron.exe <command> --help` for the exact options.
 3. **Is it the user's setup?** Common causes: Synapse still running, the device unplugged, or a write
-   that's volatile and reset on power-cycle. Native Chroma shared memory needs the optional
+   that's volatile and reset on power-cycle. Native Chroma shared memory needs the packaged
    protected section broker; the limited tray retries attachment after it starts. Chroma REST
    remains available without the broker. If only
    the GUI fails to open on a VM, remote desktop or weak graphics driver, suggest a launch with

@@ -747,7 +747,7 @@ mod tests {
         // SetBrightness is satisfied by the LIGHTING BLOCK's brightness spec (the legacy
         // dialect) — the board has no top-level set_brightness command yet CAN set brightness.
         assert!(bw.supports(Capability::SetBrightness));
-        assert!(!bw.supports(Capability::Brightness), "no getter — the readout stays hidden");
+        assert!(bw.supports(Capability::Brightness));
         // FIRMWARE GAME MODE — the keyboard's FN+F10 Win-key kill. The BlackWidow builtin carries
         // both the getter (0x03/0x80) and setter (0x03/0x00), so BOTH directions are supported.
         assert!(bw.supports(Capability::GameMode));

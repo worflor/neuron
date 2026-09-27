@@ -2,12 +2,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
 
-//! Start-with-Windows uses a least-privilege scheduled task. The historical task name is kept
-//! while existing installs migrate, but its `RunLevel` must never be HighestAvailable: the app
-//! executable and RAW macros are user-writable. Manual mode deletes the task.
+//! Start-with-Windows uses a least-privilege scheduled task. The app executable and RAW macros
+//! are user-writable, so its `RunLevel` must never be HighestAvailable. The old task name is
+//! recognized only long enough to migrate it without losing the user's autostart choice.
 
 #[cfg(windows)]
-const TASK: &str = "Neuron (elevated tray)";
+const TASK: &str = "Neuron";
+#[cfg(windows)]
+const LEGACY_TASK: &str = "Neuron (elevated tray)";
 #[cfg(windows)]
 const LEGACY_RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 #[cfg(windows)]
@@ -25,7 +27,7 @@ $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
 $trigger.Delay = 'PT15S'
 $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
 $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Seconds 0) -MultipleInstances IgnoreNew -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-Register-ScheduledTask -TaskName 'Neuron (elevated tray)' -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
+Register-ScheduledTask -TaskName 'Neuron' -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
 ";
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let dir = exe.parent().ok_or("exe has no parent directory")?;
@@ -43,19 +45,20 @@ Register-ScheduledTask -TaskName 'Neuron (elevated tray)' -Action $action -Trigg
 }
 
 #[cfg(windows)]
-fn delete_task() -> Result<(), String> {
+fn delete_named_task(name: &str) -> Result<(), String> {
     const SCRIPT: &str = r"
 $ErrorActionPreference = 'Stop'
 try {
-    Get-ScheduledTask -TaskName 'Neuron (elevated tray)' -ErrorAction Stop | Out-Null
+    Get-ScheduledTask -TaskName $env:NEURON_TASK_NAME -ErrorAction Stop | Out-Null
 } catch {
     if ($_.CategoryInfo.Category -eq 'ObjectNotFound') { exit 0 }
     throw
 }
-Unregister-ScheduledTask -TaskName 'Neuron (elevated tray)' -Confirm:$false
+Unregister-ScheduledTask -TaskName $env:NEURON_TASK_NAME -Confirm:$false
 ";
     let output = std::process::Command::new("powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-Command", SCRIPT])
+        .env("NEURON_TASK_NAME", name)
         .output()
         .map_err(|e| e.to_string())?;
     if output.status.success() {
@@ -65,17 +68,23 @@ Unregister-ScheduledTask -TaskName 'Neuron (elevated tray)' -Confirm:$false
     }
 }
 
-/// Retire an already-installed HighestAvailable task while its current instance still has the
-/// rights to replace it. A disabled manual task is removed outright.
 #[cfg(windows)]
-pub fn retire_elevated_task() {
-    if !task_is_elevated() {
-        return;
-    }
-    let result = if is_enabled() { register_task() } else { delete_task() };
+fn delete_all_tasks() -> Result<(), String> {
+    delete_named_task(TASK)?;
+    delete_named_task(LEGACY_TASK)
+}
+
+/// Move the historical task to the current name while preserving whether autostart was enabled.
+/// An old HighestAvailable instance performs this while it still has the rights to delete itself;
+/// a Limited legacy task can migrate without elevation.
+#[cfg(windows)]
+pub fn migrate_legacy_task() {
+    let Some(xml) = query_task_xml_named(LEGACY_TASK) else { return };
+    let result = if task_xml_is_enabled(&xml) { register_task() } else { Ok(()) }
+        .and_then(|()| delete_named_task(LEGACY_TASK));
     match result {
-        Ok(()) => eprintln!("neuron: retired elevated autostart task"),
-        Err(err) => eprintln!("neuron: could not retire elevated autostart task: {err}"),
+        Ok(()) => eprintln!("neuron: migrated the legacy autostart task"),
+        Err(err) => eprintln!("neuron: could not migrate the legacy autostart task: {err}"),
     }
 }
 
@@ -146,7 +155,11 @@ pub fn migrate_legacy_run_key() {
 /// vehicle; boot mode registers the current executable with least privilege.
 #[cfg(windows)]
 pub fn set(enabled: bool) -> String {
-    let result = if enabled { register_task() } else { delete_task() };
+    let result = if enabled {
+        register_task().and_then(|()| delete_named_task(LEGACY_TASK))
+    } else {
+        delete_all_tasks()
+    };
     match result {
         Ok(()) => {
             // reap only AFTER the task holds the user's intent — deleting the legacy launcher
@@ -175,9 +188,9 @@ pub fn set(enabled: bool) -> String {
 /// The registered task's XML, decoded. schtasks emits UTF-16 on some hosts and codepage
 /// bytes on others; decode both ways and take whichever parsed.
 #[cfg(windows)]
-fn query_task_xml() -> Option<String> {
+fn query_task_xml_named(name: &str) -> Option<String> {
     let o = std::process::Command::new("schtasks")
-        .args(["/query", "/tn", TASK, "/xml"])
+        .args(["/query", "/tn", name, "/xml"])
         .output()
         .ok()?;
     if !o.status.success() {
@@ -197,11 +210,11 @@ fn query_task_xml() -> Option<String> {
 }
 
 #[cfg(windows)]
-fn task_is_elevated() -> bool {
-    query_task_xml().is_some_and(|xml| task_xml_is_elevated(&xml))
+fn query_task_xml() -> Option<String> {
+    query_task_xml_named(TASK)
 }
 
-fn current_user_sid() -> Option<String> {
+pub(crate) fn current_user_sid() -> Option<String> {
     const SCRIPT: &str = "[Security.Principal.WindowsIdentity]::GetCurrent().User.Value";
     let output = std::process::Command::new("powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-Command", SCRIPT])
@@ -273,7 +286,24 @@ fn xml_block<'a>(xml: &'a str, name: &str) -> Option<&'a str> {
 /// task XML (locale-stable — `/fo list` prints localized field names).
 #[cfg(windows)]
 pub fn is_enabled() -> bool {
-    query_task_xml().is_some_and(|xml| task_xml_is_enabled(&xml))
+    [TASK, LEGACY_TASK].iter().any(|name| {
+        query_task_xml_named(name).is_some_and(|xml| task_xml_is_enabled(&xml))
+    })
+}
+
+#[cfg(not(windows))]
+pub fn set(_enabled: bool) -> String {
+    "autostart: Windows-only".into()
+}
+
+#[cfg(not(windows))]
+pub fn is_enabled() -> bool {
+    false
+}
+
+#[cfg(not(windows))]
+pub fn reap_legacy_run_key() -> bool {
+    false
 }
 
 #[cfg(test)]
@@ -332,19 +362,4 @@ mod tests {
             SID
         ));
     }
-}
-
-#[cfg(not(windows))]
-pub fn set(_enabled: bool) -> String {
-    "autostart: Windows-only".into()
-}
-
-#[cfg(not(windows))]
-pub fn is_enabled() -> bool {
-    false
-}
-
-#[cfg(not(windows))]
-pub fn reap_legacy_run_key() -> bool {
-    false
 }

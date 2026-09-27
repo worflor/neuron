@@ -475,16 +475,9 @@ impl OsWireMutex {
         Self::open_named(&format!("Local\\neuron-wire-{h:016x}"))
     }
 
-    /// Create-or-open the named mutex with an EXPLICIT NULL DACL (everyone full access). This is
-    /// load-bearing, not laziness: with NULL security attributes the object inherits the creator
-    /// TOKEN's default DACL, and an elevated process's token owner is BUILTIN\Administrators — a
-    /// default-DACL mutex created by the elevated tray app would be unopenable by an unelevated
-    /// `neuron-cli` (whose filtered token lacks Administrators), silently killing the
-    /// cross-process guarantee in exactly the deployment it exists for (elevated tray + normal
-    /// shell). A world-accessible mutex is a safe object to leave open: the worst a hostile local
-    /// process can do is HOLD it, and the bounded wait in `WireLock::acquire` caps that at a 2s
-    /// delay before degrading to local-only — a nuisance, not a lockout. `None` on any create
-    /// failure → the caller runs process-local, never worse than the pre-kernel-layer behavior.
+    /// Create or open the named mutex with an explicit NULL DACL so local Neuron processes with
+    /// different tokens can share the transport lock. A hostile process can delay this public
+    /// mutex, so acquisition is bounded to two seconds before falling back to the process lock.
     pub(super) fn open_named(name: &str) -> Option<OsWireMutex> {
         unsafe {
             let mut sd: SECURITY_DESCRIPTOR = std::mem::zeroed();

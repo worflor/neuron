@@ -1,15 +1,14 @@
 # Changelog
 
-## v0.1.2 (unreleased)
+## v0.1.2
 
-- Reduced idle CPU work in dispatch, capture, tray handling, audio, gestures, and previews; Python workers now start on demand.
-- Added software and opt-in WGPU renderers. OpenGL remains the default after higher WGPU idle use in local profiling.
+- Reduced idle CPU work in dispatch, capture, tray handling, audio, gestures, and previews; Python workers start on demand without dropping the first action.
+- Improved renderer selection and fallback, and added an opt-in WGPU renderer. OpenGL remains the default after higher WGPU idle use in local profiling.
 - Hardened Razer replies, HID++ adoption, and device write verification; fixed intercepted-key release and sniper DPI restoration on the correct mouse.
 - Serialized profile updates and migration across processes; unresolved recovery errors now stop loading or startup.
-- Changed Windows autostart to run without administrator privileges.
+- Hardened the Windows lifecycle: autostart runs without administrator privileges, native Chroma setup is automatic and recoverable, installer updates retain their setup lifecycle, and v0.1.1 config migrates forward.
 - Safe mode now starts with input disarmed and device writes paused.
-- Added an optional Windows broker for native Chroma shared memory.
-- Bounded integration clients, validated OBS input, fixed Chroma RGB decoding, and preserved local edits during Linux updater rollback.
+- Bounded integration clients, validated OBS input, fixed Chroma RGB decoding, and made Linux rollback manifest-aware.
 
 ## v0.1.1
 

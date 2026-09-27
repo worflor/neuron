@@ -3834,13 +3834,16 @@ fn brightness_cmd(reg: &Registry, pct: Option<u8>) -> Result<()> {
     // brightness is DUAL-DIALECT (matrix top-level command vs legacy lighting-block spec), so resolve
     // it by CAPABILITY — the command-name path skipped legacy boards (the BlackWidow) that can only
     // write brightness through the lighting block.
-    let d = Device::open_with_capability(reg, neuron::registry::Capability::SetBrightness)
+    let capability = if pct.is_some() {
+        neuron::registry::Capability::SetBrightness
+    } else {
+        neuron::registry::Capability::Brightness
+    };
+    let d = Device::open_with_capability(reg, capability)
         // MISS: adopt brand-new hardware once, retry against the fresh registry (zero-cost when
         // the device already resolves).
         .or_else(|e| match adopt_and_reload() {
-            Some(reg2) => {
-                Device::open_with_capability(&reg2, neuron::registry::Capability::SetBrightness)
-            }
+            Some(reg2) => Device::open_with_capability(&reg2, capability),
             None => Err(e),
         })?;
     if let Some(p) = pct {
@@ -3852,11 +3855,8 @@ fn brightness_cmd(reg: &Registry, pct: Option<u8>) -> Result<()> {
         restore_custody_if_visitor(&d, prior);
         res?;
     }
-    // Read-back is BEST-EFFORT: the legacy dialect (the BlackWidow) can SET brightness but has
-    // no getter — a write there is honest-but-unverifiable, and saying so beats erroring after
-    // a write that landed. Devices with the getter keep the full verified/MISMATCH report.
-    match (pct, d.def.has_command("brightness")) {
-        (Some(p), true) => {
+    match pct {
+        Some(p) => {
             let got = cap::brightness_percent(&d)?;
             println!(
                 "brightness -> {got}%  [{}]",
@@ -3867,15 +3867,7 @@ fn brightness_cmd(reg: &Registry, pct: Option<u8>) -> Result<()> {
                 }
             );
         }
-        (Some(p), false) => println!(
-            "brightness -> {p}%  [sent — '{}' has no brightness getter to verify against]",
-            d.def.name
-        ),
-        (None, true) => println!("brightness: {}%", cap::brightness_percent(&d)?),
-        (None, false) => println!(
-            "brightness: unreadable — '{}' can set but not report it",
-            d.def.name
-        ),
+        None => println!("brightness: {}%", cap::brightness_percent(&d)?),
     }
     Ok(())
 }

@@ -474,18 +474,6 @@ pub(crate) fn arm_stance(paused: bool, armed: bool) -> i32 {
     }
 }
 
-/// Every GUI path into input authority uses the same two-click confirmation.
-fn confirm_input_arm(st: &State) -> bool {
-    if st.get_input_arm_pending() {
-        st.set_input_arm_pending(false);
-        true
-    } else {
-        st.set_input_arm_pending(true);
-        st.set_status_line("arm input & macros? confirm within 2.5s".into());
-        false
-    }
-}
-
 /// Derive the LAUNCH mode (0 Manual · 1 Boot-to-tray · 2 Boot-with-window) from the two real truths:
 /// the registry autostart entry + the start-minimized pref. The selector reads this, never a stored int.
 fn launch_mode_now() -> i32 {
@@ -1634,9 +1622,8 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 // snapshot the draft State the deck has been editing.
                 let can_dpi = st.get_sel_can_dpi();
                 let can_poll = st.get_sel_can_poll();
-                // the fader rides SetBrightness (the WRITE), NOT cap_light (a lighting block) — a
-                // synthesized legacy def carries a lighting block with no brightness spec, so gating
-                // the apply on can_light would fire a write into "no brightness write path".
+                // The fader rides SetBrightness (the WRITE), not cap_light (a lighting block).
+                // Synthesis only emits a brightness write after its matching getter answers.
                 let can_bright_set = st.get_sel_can_bright_set();
                 let can_store = st.get_sel_can_store();
                 let dpi = st.get_dpi() as u16;
@@ -4701,10 +4688,6 @@ pub fn install(app: &AppWindow) -> SharedRt {
                     return;
                 }
                 let armed = !neuron::action::input_armed();
-                if armed && !confirm_input_arm(&st) {
-                    return;
-                }
-                st.set_input_arm_pending(false);
                 neuron::action::arm_input(armed);
                 neuron::macros::macro_host().set_armed(armed); // mirror SAFE/arm into the macro sidecar
                 if armed {
@@ -4743,10 +4726,6 @@ pub fn install(app: &AppWindow) -> SharedRt {
                 let safety = mode.state();
                 let paused = safety.writes_paused;
                 let armed = safety.input_armed;
-                if armed && !neuron::action::input_armed() && !confirm_input_arm(&st) {
-                    return;
-                }
-                st.set_input_arm_pending(false);
                 let was_paused = neuron::writes::writes_paused(); // the gate BEFORE this stance move
                 let stopped_anim = {
                     let mut s = sh.borrow_mut();

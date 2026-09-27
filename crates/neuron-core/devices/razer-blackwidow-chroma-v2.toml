@@ -77,6 +77,14 @@ class = 0x03
 id = 0x89
 size = 0x07
 
+# Standard LED brightness getter. CONFIRMED live on this board: 03/83 with
+# [VARSTORE=0x01, BACKLIGHT_LED=0x05] returns the same prefix and level in arg[2].
+[commands.brightness]
+class = 0x03
+id = 0x83
+size = 0x03
+args = [0x01, 0x05]
+
 # --- Unified lighting: LEGACY dialect (class 0x03, the older era) ----------------------
 # Setter opcodes/effect-ids below are the standard legacy Chroma values and are PROVISIONAL
 # pending a gated round-trip verify; the getters above are confirmed. The dry-run preview
@@ -113,9 +121,9 @@ size = 0x46
 args = [0xFF]                 # frame-id prefix (confirmed via OpenRazer + live)
 transaction_id = 0x3F        # CHROMA_V2 lighting tx (OpenRazer); default 0xFF no-ops the write
 
-# Standard LED brightness (OpenRazer razer_chroma_standard_set_led_brightness): class 0x03 /
-# id 0x03, args [VARSTORE=0x01, BACKLIGHT_LED=0x05, level]. The V2 uses the device-default tx
-# (0xFF) for brightness — NOT the 0x3F lighting tx. (Was id 0x01: wrong opcode, silently no-op'd.)
+# Standard LED brightness: class 0x03 / id 0x03, args
+# [VARSTORE=0x01, BACKLIGHT_LED=0x05, level]. The V2 uses the device-default tx (0xFF) for
+# brightness, not the 0x3F lighting tx. Getter 0x83 above verifies the same region.
 [lighting.brightness]
 class = 0x03
 id = 0x03

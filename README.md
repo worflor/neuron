@@ -94,7 +94,7 @@ a thing that remaps your buttons and runs python on a keypress is, by definition
 
 if you'd rather not install the windows release by hand, point your AI agent at [`skills/neuron-lazy-update`](skills/neuron-lazy-update/SKILL.md). it's in the repo and the windows packages. the linux updater waits for a linux release asset.
 
-it can install or update neuron, roll back a bad update, run CLI commands for you, and answer questions from the docs. when something doesn't work, it looks into it first, and offers to draft a proper issue only if it turns out to be a real, unreported bug. it checks every download before installing and never touches your config. it's written to be followed step by step, so it doesn't need a frontier model.
+it can install or update neuron, restore a portable update, run CLI commands for you, and answer questions from the docs. installer-managed updates stay in Windows Setup so install and uninstall remain one coherent lifecycle. when something doesn't work, it looks into it first, and offers to draft a proper issue only if it turns out to be a real, unreported bug. it checks every download before installing and never overwrites your config. it's written to be followed step by step, so it doesn't need a frontier model.
 
 for something that looks broken, start with [troubleshooting and bug reports](skills/neuron-lazy-update/issues.md): known limits, setup checks, existing reports, then a useful issue if it is new. for writing Python macros, [macros in neuron](skills/neuron-macros/SKILL.md) covers the API, authority modes, beacons, and how to check a macro before running it.
 
@@ -112,10 +112,13 @@ gh attestation verify neuron-<version>-windows-x86_64.zip --repo worflor/neuron
 
 the installer places neuron in `%LOCALAPPDATA%\Programs\Neuron` and adds a Start menu shortcut. the zip stays portable: extract it anywhere writable and run `neuron-app.exe`.
 
-packages built from current source also carry an optional native Chroma broker. its
-[one-time protected setup](docs/PROTOCOL-HOST.md) needs an administrator PowerShell under the
-same Windows account; the tray and macros stay at limited privilege. Chroma REST and OpenRGB
-do not need that setup.
+windows packages include the native Chroma broker. Windows Setup provisions it before
+replacing app files after one elevation prompt; declining cancels without leaving a partial
+installer-managed update. the portable updater provisions it automatically after copying the
+app, and a manually extracted portable copy asks when Connections first needs it. the tray and
+macros stay at limited privilege. repeat installs do not prompt again while the protected broker
+already matches the package.
+Chroma REST and OpenRGB work without elevation.
 
 ```
 cargo build --release      # -> target/release/neuron.exe (CLI) + neuron-app.exe (GUI)
@@ -128,13 +131,13 @@ if the window cannot open on a VM, remote desktop, or an older graphics driver, 
 
 both binaries resolve every runtime path against one **run root**, so the tray app (autostarted from `System32`) and a CLI you type from anywhere read the same config. it is never the working directory. the same three rules decide it on both platforms:
 
-- **the binary's own folder**, for a normal install somewhere writable — the portable layout: copy the folder, keep your setup. this is what a release archive gives you, unpacked anywhere you like, on either platform.
-- **the per-user data dir** when the binary's folder isn't a home we may write to — `%LOCALAPPDATA%\neuron` on windows, `$XDG_DATA_HOME/neuron` (usually `~/.local/share/neuron`) on linux. that's what you get building from source, because the binary sits in `target/`, and config kept *there* is one `cargo clean` from gone, with the `backups/` folder going down with it. it moves out of the build tree so the build tree stays disposable.
+- **the binary's own folder** when the release archive carries `portable.flag`. this is the portable layout: copy the folder, keep your setup.
+- **the per-user data dir** for installer and source builds — `%LOCALAPPDATA%\neuron` on windows, `$XDG_DATA_HOME/neuron` (usually `~/.local/share/neuron`) on linux. config stays across installer upgrades and out of `target/`, where one `cargo clean` would destroy it.
 - **`NEURON_RUN_DIR`** whenever you set it, which wins over both. pin it if you want your config somewhere specific.
 
-a symlink on your `PATH` doesn't change any of this: the binary resolves its real location, so config stays in the install folder and `~/.local/bin/neuron` is safe.
+a symlink on your `PATH` doesn't change any of this: the binary resolves its real location, so a marked portable copy stays portable and `~/.local/bin/neuron` is safe.
 
-upgrading from a build that kept config in `target/release`? the first launch carries it forward and prints where it went. it copies rather than moves, so the old folder stays put as a backup until you clean it. if that copy fails, neuron reports the error and stops before using partial config; the next launch retries.
+upgrading from v0.1.1's Windows installer, or from a build that kept config in `target/release`? the first launch carries the old beside-the-executable config forward and prints where it went. it copies rather than moves, so the old folder stays put as a backup. if that copy fails, neuron reports the error and stops before using partial config; the next launch retries.
 
 the normal `--release` build is tuned for snappy runtime (ThinLTO, stripped). use `--profile release-size` if you want it small, `--profile release-fast` if you want it quick, and `RUSTFLAGS="-C target-cpu=native"` outside the repo for native codegen. we keep cargo's default `unwind` (not `abort`), deliberately (see the comment in `Cargo.toml`): cleanup still runs when something panics, so the app never leaves your gear in a state you didn't ask for. every panic gets logged.
 
@@ -207,7 +210,7 @@ every device write is sorted by how sure i am of it:
 |---|---|
 | reads: dpi, battery, polling, brightness, storage, lighting state | **proven** on hardware |
 | dpi · polling · lighting writes | **proven** on hardware; current setters require matching read-back |
-| brightness write | **verified** only on devices with a matching getter; legacy BlackWidow brightness has no paired getter and now requires `NEURON_BRIGHTNESS_WRITE=1` for an explicitly unverified write |
+| brightness write | **proven**: matrix and legacy setters read back the same varstore and LED region; live round-trip checked on the Naga V2 Pro and BlackWidow Chroma V2 |
 | dpi-stage table · scroll-stage select | **wire-confirmed** off synapse (USBPcap) + round-tripped |
 | symmetric lift-off distance | **proven**: reads back clean on the Naga |
 | asymmetric lift-off distance (split lift/landing) | **proven**: set/read round-trip on the Naga (the `0x0B/0x85` getter echoes mode=async + the lift/landing pair; the physical split confirmed by feel) |

@@ -21,25 +21,39 @@ details and current behavior.
 | [Signal bus](../crates/neuron-host/src/bus.rs) | Carries named, retained values to prefix subscribers. | Only implemented producers and consumers have live behavior. A signal name alone does not imply a game integration. |
 | [Host shell](../crates/neuron-host/src/shell.rs) | Runs the kernel on one thread, sweeps expired leases and restarts it after a contained fault. | Owners must reassert live content after a restart. There is no durable replay of live layers. |
 | [Device writer](../crates/neuron-host/src/writer.rs) | Serializes resolved lighting frames per surface, with frame deduplication and refresh. | Real device behavior still depends on the connected hardware and its transport. |
-| [Chroma REST](../crates/neuron-host/src/adapters/chroma.rs) | Serves local Chroma SDK requests on port 54235. | Richer interpretation and game-by-game compatibility need further checks. |
-| [Chroma shared memory](../crates/neuron-host/src/adapters/chroma_shm.rs) | Accepts the native shared-memory path used by some games on Windows. | The optional protected broker creates the fixed global sections; the limited tray adopts them. Game compatibility still needs live checks. The REST face remains available without the broker. |
+| [Chroma REST](../crates/neuron-host/src/adapters/chroma.rs) | Serves local Chroma SDK requests on port 54235. | Live sessions pass on the final Windows build; richer interpretation and game-by-game compatibility need further checks. |
+| [Chroma shared memory](../crates/neuron-host/src/adapters/chroma_shm.rs) | Accepts the native shared-memory path used by some games on Windows. | The packaged protected broker creates the fixed global sections; the limited tray adopts them. A live game passed on the final Windows build. The REST face remains available without the broker. |
 | [OpenRGB server](../crates/neuron-host/src/adapters/openrgb.rs) | Accepts OpenRGB SDK clients on port 6742. | Neuron does not yet act as an OpenRGB client for other devices. |
 | [OBS client](../crates/neuron-host/src/adapters/obs.rs) | Connects to local obs-websocket v5, sends requests and publishes OBS events. | Requires OBS's websocket server and its configured credentials. |
 
 The app exposes connection status on the SYSTEM page. The CONNECTIONS control
 can change the host state at runtime unless `NEURON_HOST` overrides it.
 
-The Windows packages built from current source include `neuron-chroma-broker.exe` and
-`install-chroma-broker.ps1`. Native Chroma shared memory requires a one-time protected
-broker install. From an administrator PowerShell elevated under the same Windows account
-that runs the tray, after verifying the package, run:
+Windows packages include the protected native Chroma broker. Install, repair, removal and stale
+transaction recovery share one protected machine-wide transaction lock; the broker directory is
+published with a same-volume no-replace rename. Before replacing app files,
+the installer and update helper set it up automatically after one UAC prompt. A portable
+copy requests the same prompt when Connections first needs the native global objects.
+The task runs as SYSTEM at startup; the regular tray and macros remain at Limited privilege.
+A standard Windows account can approve the prompt using a different administrator
+account. Declining it cancels an installer run before the per-user payload changes. A
+portable copy stays open and retains Chroma REST and OpenRGB without the native
+shared-memory face. Matching repeat installs reuse the verified broker without another
+prompt.
+
+The broker and startup task are machine-wide. One Windows user owns their installation;
+the installer, updater, and uninstaller refuse to replace or remove another user's copy.
+Separate per-user Neuron installations on the same machine are not supported yet.
+
+For source builds or manual recovery, the same protected setup can be run from a
+64-bit administrator PowerShell after verifying the package:
 
 ```powershell
 $package = 'C:\path\to\unpacked\neuron'
 $binary = Join-Path $package 'neuron-chroma-broker.exe'
 $hash = (Get-FileHash -LiteralPath $binary -Algorithm SHA256).Hash
-$sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-& (Join-Path $package 'install-chroma-broker.ps1') -BinaryPath $binary -ExpectedSha256 $hash -UserSid $sid
+$owner = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+& (Join-Path $package 'install-chroma-broker.ps1') -BinaryPath $binary -ExpectedSha256 $hash -OwnerSid $owner
 ```
 
 For a source build, run:
@@ -49,25 +63,16 @@ cargo build --release -p neuron-host --features bridge --bin neuron-chroma-broke
 ```
 
 Then use the install command above with the binary under `target/release` and the
-script under `packaging/windows`. The installer verifies the binary hash, protects the
-Program Files copy and the high-integrity scheduled task from limited-user edits, and
-starts the broker. Rerun it after an update when the packaged broker binary changes.
-The broker holds only the fixed section handles. Neuron's regular startup task stays
-Limited. The tray retries native attachment when the broker starts after it. A standard
-Windows account that elevates through a different administrator account cannot use this
-same-user broker task yet; REST remains available.
+script under `packaging/windows`. Setup verifies the binary hash, protects the Program
+Files copy and the SYSTEM startup task from limited-user edits, and starts the broker.
+The broker holds only the fixed section handles. The tray retries native attachment
+when the broker starts after it.
 
-Neuron’s tray and protocol processing run without administrator privileges. The optional
-Windows broker only creates and holds the fixed native Chroma sections; frame parsing,
+Neuron’s tray and protocol processing run without administrator privileges. The Windows
+broker only creates and holds the fixed native Chroma sections; frame parsing,
 lighting arbitration, and device access remain in the regular runtime. The broker must
 not load user configuration, execute macros, accept general commands, or become a shared
 privileged backend for other features.
-
-The current broker uses a protected executable and an elevated task tied to the installing
-account. This deployment requires administrator-managed updates and does not support
-standard accounts using another account’s administrator credentials. Live game
-compatibility and demand for those account configurations should guide whether to replace
-it with an installer-managed service using only the required privileges.
 
 ## Local Chroma lab
 
@@ -92,8 +97,8 @@ cargo test -p neuron-host --features bridge chroma_live_mask_worn -- --ignored -
 cargo test -p neuron-host --features bridge chroma_peek -- --ignored --nocapture
 ```
 
-These tests establish the local protocol boundaries. A real Chroma game remains the check for
-SDK client compatibility and visible device output.
+These tests establish the local protocol boundaries. The final installed Windows build also
+received native traffic from a live Chroma game; additional titles remain compatibility checks.
 
 ## Ownership and recovery
 

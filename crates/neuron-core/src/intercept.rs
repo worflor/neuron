@@ -102,9 +102,10 @@ pub struct Interceptor {
     /// An UP already replayed fail-open, but still awaiting its device identity so the matching
     /// mapped target can be released without touching another device's held target.
     late_ups: VecDeque<Pending>,
-    /// Mapped DOWNs accepted from Raw Input. Their target UP must be sent even if interception
-    /// stops before the physical UP is attributed.
-    held_targets: HashMap<(u16, crate::registry::CanonicalPid), u16>,
+    /// Claimed DOWNs accepted from Raw Input. A replacement's target UP must be sent even if
+    /// interception stops before the physical UP is attributed; a swallowed claim must suppress
+    /// its matching UP under the same lifetime rule.
+    held_targets: HashMap<(u16, crate::registry::CanonicalPid), KeyOut>,
     /// A source whose device identity never arrived stands down until its next physical UP.
     fail_open_sources: HashSet<u16>,
 }
@@ -179,7 +180,10 @@ impl Interceptor {
                 self.held_targets.remove(&held_key);
                 self.clear_late_ups_without_held_source(scancode);
             }
-            return Some(Inject { scancode: target, down });
+            return match target {
+                KeyOut::Scancode(scancode) => Some(Inject { scancode, down }),
+                KeyOut::Swallow => None,
+            };
         }
         if !down {
             return (!already_replayed).then_some(Inject { scancode, down: false });
@@ -187,11 +191,14 @@ impl Interceptor {
         match pending.remaps.iter().find(|r| r.pid == pid) {
             Some(r) => match r.to {
                 KeyOut::Scancode(sc) => {
-                    self.held_targets.insert(held_key, sc);
+                    self.held_targets.insert(held_key, r.to);
                     Some(Inject { scancode: sc, down })
                 }
                 // Claimed by a host feature: the swallow IS the resolution — inject nothing.
-                KeyOut::Swallow => None,
+                KeyOut::Swallow => {
+                    self.held_targets.insert(held_key, r.to);
+                    None
+                }
             },
             // Some OTHER device sent this scancode — replay it unchanged so the real key still works.
             None => Some(Inject { scancode, down }),
@@ -237,7 +244,9 @@ impl Interceptor {
             self.fail_open_sources.insert(source);
             self.held_targets.retain(|(scancode, _), target| {
                 if *scancode == source {
-                    out.push(Inject { scancode: *target, down: false });
+                    if let KeyOut::Scancode(scancode) = *target {
+                        out.push(Inject { scancode, down: false });
+                    }
                     false
                 } else {
                     true
@@ -270,8 +279,10 @@ impl Interceptor {
         let mut out: Vec<Inject> = self.pending.drain(..)
             .map(|p| Inject { scancode: p.scancode, down: p.down })
             .collect();
-        out.extend(self.held_targets.drain()
-            .map(|(_, target)| Inject { scancode: target, down: false }));
+        out.extend(self.held_targets.drain().filter_map(|(_, target)| match target {
+            KeyOut::Scancode(scancode) => Some(Inject { scancode, down: false }),
+            KeyOut::Swallow => None,
+        }));
         out
     }
 
@@ -1450,18 +1461,66 @@ mod tests {
         assert!(i.on_hook(0x02, true, 1000), "claimed scancode is swallowed at hook time");
         // Naga attribution -> nothing injected: the '1' never reaches the desktop.
         assert_eq!(i.on_rawinput(0x02, true, naga()), None);
+        assert!(i.on_hook(0x02, false, 1100), "claimed release is swallowed at hook time");
+        assert_eq!(
+            i.on_rawinput(0x02, false, naga()),
+            None,
+            "the release paired with a swallowed press must stay swallowed"
+        );
         // The real keyboard's '1' is swallowed then replayed unchanged.
         assert!(i.on_hook(0x02, true, 2000));
         assert_eq!(
             i.on_rawinput(0x02, true, kbd()),
             Some(Inject { scancode: 0x02, down: true })
         );
+        assert!(i.on_hook(0x02, false, 2100));
+        assert_eq!(
+            i.on_rawinput(0x02, false, kbd()),
+            Some(Inject { scancode: 0x02, down: false })
+        );
         // Grab-model path agrees.
         assert_eq!(i.resolve_direct(0x02, true, naga()), None);
+        assert_eq!(i.resolve_direct(0x02, false, naga()), None);
         assert_eq!(
             i.resolve_direct(0x02, true, kbd()),
             Some(Inject { scancode: 0x02, down: true })
         );
+        assert_eq!(
+            i.resolve_direct(0x02, false, kbd()),
+            Some(Inject { scancode: 0x02, down: false })
+        );
+    }
+
+    #[test]
+    fn swallow_and_replacement_holds_release_independently() {
+        let mut i = Interceptor::new();
+        i.set_remaps([
+            Remap { pid: naga(), from: 0x02, to: KeyOut::Swallow },
+            Remap { pid: kbd(), from: 0x02, to: KeyOut::Scancode(0x22) },
+        ]);
+        assert!(i.on_hook(0x02, true, 1000));
+        assert_eq!(i.on_rawinput(0x02, true, naga()), None);
+        assert!(i.on_hook(0x02, true, 1100));
+        assert_eq!(
+            i.on_rawinput(0x02, true, kbd()),
+            Some(Inject { scancode: 0x22, down: true })
+        );
+        assert!(i.on_hook(0x02, false, 1200));
+        assert_eq!(i.on_rawinput(0x02, false, naga()), None);
+        assert!(i.on_hook(0x02, false, 1300));
+        assert_eq!(
+            i.on_rawinput(0x02, false, kbd()),
+            Some(Inject { scancode: 0x22, down: false })
+        );
+    }
+
+    #[test]
+    fn state_transition_never_invents_a_release_for_swallowed_claim() {
+        let mut i = Interceptor::new();
+        i.set_remaps([Remap { pid: naga(), from: 0x02, to: KeyOut::Swallow }]);
+        assert!(i.on_hook(0x02, true, 1000));
+        assert_eq!(i.on_rawinput(0x02, true, naga()), None);
+        assert!(i.drain_transition().is_empty());
     }
 
     #[test]

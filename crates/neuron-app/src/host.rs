@@ -936,9 +936,12 @@ fn spawn_chroma_shm(
                 CreateError::AlreadyServing => {
                     "another Chroma server (Razer Synapse) already owns the native connection".to_string()
                 }
-                CreateError::Io(err) => format!(
-                    "native Chroma unavailable ({err}); Global objects need a protected broker"
-                ),
+                CreateError::Io(err) => {
+                    if err.raw_os_error() == Some(1314) {
+                        crate::chroma_setup::request();
+                    }
+                    format!("native Chroma unavailable ({err}); Global objects need a protected broker")
+                }
             };
             return (None, Some(reason));
         }

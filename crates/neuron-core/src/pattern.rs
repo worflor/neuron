@@ -1143,10 +1143,16 @@ fn scan_key_presses(
     presses
 }
 
-fn key_scan_due(last_generation: Option<u64>, generation: u64, since_scan: f32) -> bool {
+fn key_scan_due(
+    listener_live: bool,
+    last_generation: Option<u64>,
+    generation: u64,
+    since_scan: f32,
+) -> bool {
     // A transient capture can redirect Raw Input away from the resident listener; the fallback
-    // eventually reconciles the actual OS key state without polling every rendered frame.
-    last_generation != Some(generation) || since_scan >= 0.5
+    // eventually reconciles the actual OS key state. Standalone renderers have no edge source and
+    // retain frame-rate polling so a complete tap between reconciliation scans cannot disappear.
+    !listener_live || last_generation != Some(generation) || since_scan >= 0.5
 }
 
 // ───────────────────────────────────── Heat (the Fire shape) ──────────────────────────────────
@@ -2103,7 +2109,12 @@ impl Pattern for Thermal {
         // detect fresh key-downs: count ALL of them (the typing RATE) and record each pressed key's cell.
         let mut pending: Vec<(usize, usize)> = Vec::new();
         let generation = crate::capture::key_transition_generation();
-        let presses = if key_scan_due(self.last_key_generation, generation, t - self.last_key_scan_t) {
+        let presses = if key_scan_due(
+            crate::controls::held_registry_live(),
+            self.last_key_generation,
+            generation,
+            t - self.last_key_scan_t,
+        ) {
             self.last_key_generation = Some(generation);
             self.last_key_scan_t = t;
             scan_key_presses(&mut self.prev, r, c, true, |ry, cx| pending.push((ry, cx)))
@@ -4032,6 +4043,7 @@ mod tests {
 
     #[test]
     fn thermal_cold_frame_does_not_animate_without_typing() {
+        let _no_live_keys = crate::capture::suppress_key_reads();
         let mut thermal = Thermal::default();
         let first = scalar(thermal.field(6, 22, 0.0));
         let later = scalar(thermal.field(6, 22, 3.0));
@@ -4040,10 +4052,11 @@ mod tests {
 
     #[test]
     fn thermal_key_scan_wakes_on_edge_and_rechecks_after_lost_events() {
-        assert!(key_scan_due(None, 0, 0.0));
-        assert!(!key_scan_due(Some(4), 4, 0.49));
-        assert!(key_scan_due(Some(4), 5, 0.01));
-        assert!(key_scan_due(Some(4), 4, 0.5));
+        assert!(key_scan_due(true, None, 0, 0.0));
+        assert!(!key_scan_due(true, Some(4), 4, 0.49));
+        assert!(key_scan_due(true, Some(4), 5, 0.01));
+        assert!(key_scan_due(true, Some(4), 4, 0.5));
+        assert!(key_scan_due(false, Some(4), 4, 0.01));
     }
 
     // ── Meter (Audio Meter + Pulse) — the pure renderers ────────────────────────────────────────

@@ -63,6 +63,7 @@ cp "$cli" "$app" "$stage/"
 cp README.md LICENSE.md THIRD-PARTY-NOTICES.md SECURITY.md "$stage/"
 cp -R LICENSES skills "$stage/"
 cp packaging/linux/70-neuron.rules "$stage/"
+printf 'portable\n' > "$stage/portable.flag"
 cat > "$stage/SOURCE.txt" <<EOF
 Neuron $version — Linux x86_64 app and CLI
 Repository: https://github.com/worflor/neuron

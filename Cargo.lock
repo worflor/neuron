@@ -3607,6 +3607,7 @@ name = "neuron-app"
 version = "0.1.2"
 dependencies = [
  "anyhow",
+ "base64",
  "cpal",
  "ctor 0.2.9",
  "engram",
@@ -3618,6 +3619,7 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
+ "sha2",
  "slint",
  "slint-build",
  "toml 0.8.2",

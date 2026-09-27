@@ -17,7 +17,7 @@
 //!   `neuron_latency.log` every few seconds. Delete it and logging stops.
 //! * **`NEURON_LATENCY=1`** — the same thing via the environment, for a CLI or dev run.
 //!
-//! The file switch exists because of how this app actually runs: an elevated scheduled task starts it
+//! The file switch exists because of how this app actually runs: a logon task starts it
 //! at logon. There is no shell in that story to set a variable in, and Task Scheduler cannot carry
 //! one — so an env-only switch would mean editing a persistent user environment variable and
 //! restarting the app just to find out why a keypress felt slow. A file the user can create and

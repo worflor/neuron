@@ -116,8 +116,8 @@ mod imp {
     /// the live bit pointer per paint via `GetObjectW`). This is the ONE `CreateDIBSection` call that
     /// the resizable sites share; `LayeredSurface` (the create-once sites) uses the same call.
     pub struct Dib {
-        pub dc: HDC,
-        pub bmp: HBITMAP,
+        dc: HDC,
+        bmp: HBITMAP,
         old: HGDIOBJ,
     }
 
@@ -156,6 +156,18 @@ mod imp {
                 }
                 Some(Dib { dc, bmp, old })
             }
+        }
+
+        /// Borrow the memory DC while this DIB owns it.
+        #[inline]
+        pub fn dc(&self) -> HDC {
+            self.dc
+        }
+
+        /// Borrow the selected bitmap while this DIB owns it.
+        #[inline]
+        pub fn bitmap(&self) -> HBITMAP {
+            self.bmp
         }
     }
 
@@ -422,4 +434,35 @@ mod stub {
     /// # Safety
     /// Inert; takes no live handles off-Windows.
     pub unsafe fn present_dc() {}
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::Dib;
+    use windows_sys::Win32::Graphics::Gdi::{GetObjectW, BITMAP};
+
+    fn bitmap_bits(dib: &Dib) -> *mut core::ffi::c_void {
+        let mut bitmap: BITMAP = unsafe { std::mem::zeroed() };
+        let read = unsafe {
+            GetObjectW(
+                dib.bitmap().cast(),
+                std::mem::size_of::<BITMAP>() as i32,
+                (&raw mut bitmap).cast(),
+            )
+        };
+        assert_ne!(read, 0, "the owned bitmap must remain a live GDI object");
+        bitmap.bmBits
+    }
+
+    #[test]
+    fn resizable_dib_owner_keeps_the_selected_surface_live() {
+        let mut backing = Some(Dib::new(17, 19).expect("first DIB"));
+        assert!(!bitmap_bits(backing.as_ref().unwrap()).is_null());
+
+        backing = Some(Dib::new(31, 23).expect("replacement DIB"));
+        let live = backing.as_ref().unwrap();
+        assert!(!live.dc().is_null());
+        assert!(!bitmap_bits(live).is_null());
+        drop(backing);
+    }
 }

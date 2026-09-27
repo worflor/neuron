@@ -718,7 +718,7 @@ export component SettingsPanel inherits VerticalLayout {
                             toggled(v) => { State.toggle-writes-paused(); }
                         }
                         Toggle {
-                            caption: State.input-arm-pending ? "confirm input & macros" : "input & macros";
+                            caption: "input & macros";
                             checked: State.input-armed;
                             toggled(v) => { State.toggle-input-armed(); }
                         }

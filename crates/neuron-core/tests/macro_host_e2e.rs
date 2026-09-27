@@ -34,6 +34,16 @@ fn macro_host_warm_persists_and_isolates_errors() {
     // config resolves via the run root (NEURON_RUN_DIR, else the exe dir) — pin it to the same tmp
     let _run_pin = neuron::runroot::RunDirPin::to(&tmp);
 
+    // Seed the catalog without touching the host. The very first live dispatch must retain this
+    // action while the sidecar starts; requiring a second press is a user-visible lost trigger.
+    let scripts = tmp.join("macros").join("scripts");
+    std::fs::create_dir_all(&scripts).unwrap();
+    std::fs::write(
+        scripts.join("e2e_cold.py"),
+        "def macro(ctx):\n    print('cold-first:' + ctx.app)\n",
+    )
+    .unwrap();
+
     let host = macro_host();
     if !host.available() {
         eprintln!("skipping Macro Host e2e: bundled python runtime did not materialize");
@@ -42,6 +52,26 @@ fn macro_host_warm_persists_and_isolates_errors() {
         return;
     }
     host.set_armed(false); // read-only macros; no input synthesis needed for the proof
+
+    let cold_ctx = Context::synthetic(Some("first-press.exe".into()), None, None, None, None);
+    let cold_status = host.fire_async("e2e_cold", &cold_ctx);
+    assert!(cold_status.contains("queued"), "cold first fire was not retained: {cold_status}");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut cold_log = Vec::new();
+    while Instant::now() < deadline {
+        cold_log.extend(host.drain_log());
+        if cold_log.iter().any(|line| line.contains("cold-first:first-press.exe")) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    cold_log.extend(host.drain_log());
+    assert_eq!(
+        cold_log.iter().filter(|line| line.contains("cold-first:first-press.exe")).count(),
+        1,
+        "the first cold fire must execute exactly once: {cold_log:?}"
+    );
 
     // A macro that reports the SIDECAR's pid + reads the marshalled context.
     let ok_src =
@@ -186,6 +216,7 @@ fn macro_host_warm_persists_and_isolates_errors() {
     host.unregister("e2e_stable");
     host.unregister("e2e_ok");
     host.unregister("e2e_boom");
+    host.unregister("e2e_cold");
     std::env::set_current_dir(prev).ok();
     let _ = std::fs::remove_dir_all(&tmp);
 }

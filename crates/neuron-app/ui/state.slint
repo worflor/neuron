@@ -22,7 +22,6 @@ export global State {
     // ── global runtime status (mirrored in the header + tray) ────────────
     in-out property <bool> writes-paused: false;     // the device-write safety gate switch
     in-out property <bool> input-armed: false;       // SAFE-MODE gate: real SendInput is a no-op unless ARMED
-    in-out property <bool> input-arm-pending: false; // a second deliberate action confirms input authority
     // ARM STANCE — one selector over the two gates above (the header pills still read the bools live):
     // 0 OBSERVE (paused + safe) · 1 DEVICE (writes on, safe) · 2 INPUT (synth on, paused) · 3 LIVE (both).
     in-out property <int> arm-stance: 0;

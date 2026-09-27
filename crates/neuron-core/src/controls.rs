@@ -932,22 +932,36 @@ pub(crate) fn note_held(
     let mut set = hits.to_vec();
     normalize_hits(&mut set);
     let mut g = HELD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut changed = false;
     match g.iter_mut().position(|(s, _, _)| s == source) {
         Some(i) if set.is_empty() => {
             g.swap_remove(i);
+            changed = true;
         }
         _ if set.is_empty() => {}
         pos => {
             match pos {
                 Some(i) => {
-                    g[i].1 = pid;
-                    g[i].2 = set.clone();
+                    if g[i].1 != pid || g[i].2 != set {
+                        g[i].1 = pid;
+                        g[i].2 = set.clone();
+                        changed = true;
+                    }
                 }
-                None => g.push((source.to_string(), pid, set.clone())),
+                None => {
+                    g.push((source.to_string(), pid, set.clone()));
+                    changed = true;
+                }
             }
         }
     }
     drop(g);
+    // Publish the new held snapshot before waking capture workers. The event is an auto-reset
+    // notification, so waking first could let a worker consume it, read the old state, and sleep
+    // until its reconciliation timeout with no second wake coming.
+    if changed {
+        crate::capture::note_key_transition();
+    }
     publish_control_observation(pid, &set);
 }
 
@@ -1165,7 +1179,12 @@ mod control_ref_tests {
     fn held_registry_is_device_aware_and_snapshot_replacing() {
         // No live pump in tests → the public query reports "no registry"; drive the internals.
         assert_eq!(control_held(0x07, 0x1E, None), None);
+        let generation = crate::capture::key_transition_generation();
         note_held("test:naga-kbd", Some(crate::registry::CanonicalPid::of(0xa8)), &[(0x07, 0x1E)]);
+        assert!(
+            crate::capture::key_transition_generation() > generation,
+            "the held snapshot must publish before its transition notification returns"
+        );
         note_held("test:kbd", Some(crate::registry::CanonicalPid::of(0x221)), &[(0x07, 0x1E)]);
         {
             let g = HELD.lock().unwrap();
@@ -3119,7 +3138,6 @@ pub(crate) mod win {
                                                 false // auto-repeat: already down, no new edge
                                             };
                                             if changed {
-                                                crate::capture::note_key_transition();
                                                 let pid = super::source_pid(&pid_from_path(&path));
                                                 super::note_held(
                                                     &path,
@@ -3234,12 +3252,11 @@ pub(crate) mod win {
                         .map(|(path, _)| path.clone())
                         .collect();
                     down_sets.clear();
-                    if !stale.is_empty() {
-                        crate::capture::note_key_transition();
-                    }
                     for path in stale {
+                        let pid = super::source_pid(&pid_from_path(&path));
+                        super::note_held(&path, pid, &[]);
                         on_event(&ControlEvent {
-                            pid: super::source_pid(&pid_from_path(&path)),
+                            pid,
                             stream: super::Stream::RawInput,
                             hits: Vec::new(),
                             raw: Vec::new(),

@@ -348,35 +348,39 @@ mod tests {
             panic!("setup blew up"); // worker exits immediately; `_dead` lowers the alive flag
         })
         .expect("first spawn returns a sender");
-        // let the worker run + die so its liveness flag is lowered before the next lookup.
-        for _ in 0..2000 {
-            if spawns.load(Ordering::SeqCst) == 1 {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(1));
+        let dead_flag = SLOT
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .expect("the first worker is cached")
+            .1
+            .clone();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while dead_flag.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
         }
+        assert!(!dead_flag.load(Ordering::Acquire), "the failed worker publishes its death");
         let _ = tx_dead.send(99); // vanishes into the dead receiver — no panic, just lost
-        std::thread::sleep(std::time::Duration::from_millis(20)); // let the flag settle post-unwind
         std::panic::set_hook(prev);
 
         // 2nd lookup MUST detect the dead worker and re-spawn a fresh, healthy one.
         let seen = Arc::new(Mutex::new(Vec::new()));
         let sink = seen.clone();
         let s2 = spawns.clone();
+        let (delivered_tx, delivered_rx) = mpsc::channel();
         let tx_live = service_sender(&SLOT, "t-heal", move |rx: Receiver<u32>| {
             s2.fetch_add(1, Ordering::SeqCst);
             for v in rx {
                 sink.lock().unwrap().push(v);
+                let _ = delivered_tx.send(());
             }
         })
         .expect("re-spawn after death");
         tx_live.send(7).unwrap();
-        for _ in 0..2000 {
-            if seen.lock().unwrap().as_slice() == [7] {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
+        delivered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the re-spawned worker acknowledges delivery");
         assert_eq!(*seen.lock().unwrap(), vec![7], "the re-spawned worker delivers");
         assert_eq!(spawns.load(Ordering::SeqCst), 2, "exactly two workers ran (died, then healed)");
     }

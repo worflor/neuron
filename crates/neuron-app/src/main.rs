@@ -27,6 +27,8 @@
 mod autostart;
 mod beacon;
 mod capture;
+#[cfg(windows)]
+mod chroma_setup;
 mod control;
 mod dialweave;
 mod dispatch;
@@ -54,6 +56,7 @@ mod runtime;
 mod sound;
 mod strokelab;
 mod surface;
+mod shutdown;
 mod teleport;
 mod tray;
 // Slint expands this module from generated Rust outside our source lint policy.
@@ -96,18 +99,31 @@ fn initial_runtime_mode(safe: bool) -> neuron::safety::RuntimeMode {
     }
 }
 
-fn arm_live_dispatch(safe: bool, respawned: bool, input_supported: bool) -> bool {
-    input_supported && !safe && !respawned
+fn arm_live_dispatch(safe: bool, input_supported: bool) -> bool {
+    input_supported && !safe
 }
 
 fn main() {
+    if std::env::args().any(|a| a == "--shutdown-existing") {
+        std::process::exit(i32::from(!shutdown::signal_existing()));
+    }
+    #[cfg(windows)]
+    let shutdown_listener = match shutdown::Listener::new() {
+        Ok(listener) => Some(listener),
+        Err(err) => {
+            eprintln!("neuron-app: graceful shutdown listener unavailable: {err}");
+            None
+        }
+    };
+    #[cfg(not(windows))]
+    let shutdown_listener = Some(shutdown::Listener::new());
     let safe = std::env::args().any(|a| a == "--safe");
     let respawned = std::env::args().any(|a| a == "--respawned");
     let startup_mode = initial_runtime_mode(safe);
     neuron::safety::set_mode(startup_mode);
     // Config never depends on the process CWD: every Neuron runtime path resolves through
-    // `neuron::runroot::run_root()` (the exe's directory when that's a home we may keep data in,
-    // else %LOCALAPPDATA%\neuron, else NEURON_RUN_DIR), so an autostart from C:\Windows\System32
+    // `neuron::runroot::run_root()` (NEURON_RUN_DIR, a marked portable package, or per-user data),
+    // so an autostart from C:\Windows\System32
     // and a shell launch from anywhere read the SAME config. No cwd pin — the CWD stays the
     // user's, as any CLI-adjacent process should leave it.
 
@@ -211,7 +227,8 @@ fn main() {
     //   2. RegisterApplicationRestart asks WINDOWS ITSELF to relaunch us after a crash or hang
     //      (the same mechanism browsers/Office use). The OS enforces the anti-crash-loop rule
     //      (only fires after 60s of uptime), we pass `--tray --respawned` so the relaunch comes
-    //      back quietly and says what happened. Input remains disarmed after recovery.
+    //      back quietly and says what happened. A fault in a DLL we don't own becomes a blip:
+    //      the tray icon returns, configs reload, and live dispatch re-arms.
     #[cfg(windows)]
     unsafe {
         use windows_sys::Win32::System::Diagnostics::Debug::{
@@ -251,11 +268,11 @@ fn main() {
     }
     flight::trace("life", "app start", 0);
 
-    // Retire a previously installed elevated task, then carry a legacy Run-key autostart into
-    // the limited task. The task must never elevate this user-writable app and its RAW macros.
+    // Move the historical task name and Run-key launcher into the current Limited task. The task
+    // must never elevate this user-writable app and its RAW macros.
     #[cfg(windows)]
     {
-        autostart::retire_elevated_task();
+        autostart::migrate_legacy_task();
         autostart::migrate_legacy_run_key();
     }
 
@@ -379,10 +396,10 @@ fn main() {
     // ── START LIVE DISPATCH (the headline) ────────────────────────────────
     // The device-event runtime starts here, on the REAL app-run path only (never from a test —
     // tests construct State + glue but never reach main). A normal Windows launch arms input here
-    // so tray remaps work after logon. `--safe` and crash recovery stay disarmed. The loop installs the GamingMode
-    // hook, and posts last-trigger/active-layer back to the UI.
+    // so tray remaps work after logon and after Windows crash recovery. `--safe` stays disarmed. The
+    // loop installs the GamingMode hook and posts last-trigger/active-layer back to the UI.
     let input_supported = cfg!(windows);
-    let armed = arm_live_dispatch(safe, respawned, input_supported);
+    let armed = arm_live_dispatch(safe, input_supported);
     // Build the weak handle + set the view inside a SHORT borrow, then start the worker and store it
     // in a SEPARATE borrow (the worker must not be created while a borrow of `resident` is held).
     let weak = {
@@ -398,7 +415,7 @@ fn main() {
             if !input_supported {
                 "device settings and lighting are available; live remaps need a Linux input backend"
             } else if respawned {
-                "recovered from a crash — input safe; arm again when ready"
+                "recovered from a crash — live dispatch restored"
             } else if safe {
                 "SAFE MODE — input disarmed and device writes paused"
             } else if armed {
@@ -530,6 +547,13 @@ fn main() {
         slint::TimerMode::Repeated,
         Duration::from_millis(500),
         move || {
+            if shutdown_listener.as_ref().is_some_and(shutdown::Listener::requested) {
+                flight::trace("life", "graceful shutdown requested", 0);
+                if let Err(err) = slint::quit_event_loop() {
+                    eprintln!("neuron-app: failed to honor graceful shutdown: {err}");
+                }
+                return;
+            }
             // ── ARMORED TICK ── a panic in this closure would unwind into winit's FFI and take
             // the whole event loop with it. Contain it: the fault is logged (panic hook + flight
             // ring) and the NEXT tick runs anyway — the heartbeat of the app must not be the
@@ -1070,9 +1094,9 @@ mod startup_policy_tests {
         assert_eq!(initial_runtime_mode(false), neuron::safety::RuntimeMode::Device);
         assert_eq!(initial_runtime_mode(true), neuron::safety::RuntimeMode::Observe);
         assert!(!initial_runtime_mode(false).state().input_armed);
-        assert!(arm_live_dispatch(false, false, true), "normal Windows tray launch keeps remaps live");
-        assert!(!arm_live_dispatch(true, false, true), "safe mode disarms input");
-        assert!(!arm_live_dispatch(false, true, true), "crash recovery waits for a fresh arm");
-        assert!(!arm_live_dispatch(false, false, false), "unsupported input cannot arm");
+        assert!(arm_live_dispatch(false, true), "normal Windows tray launch keeps remaps live");
+        assert!(!arm_live_dispatch(true, true), "safe mode disarms input");
+        assert!(arm_live_dispatch(false, true), "crash recovery restores normal live dispatch");
+        assert!(!arm_live_dispatch(false, false), "unsupported input cannot arm");
     }
 }

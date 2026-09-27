@@ -440,9 +440,12 @@ fn pyruntime_sidecar_stress_e2e() {
                 let h = macro_host();
                 let c = cx(&id);
                 let deadline = Instant::now() + Duration::from_secs(15);
-                // retry under inner-lock contention until the warm dispatch actually goes out.
+                // One call is accepted either directly by the warm lane or by the bounded service
+                // queue when another caller holds the lane lock. Retrying an accepted queued fire
+                // would duplicate the user's action.
                 while Instant::now() < deadline {
-                    if h.fire_async(&id, &c).contains("dispatched") {
+                    let status = h.fire_async(&id, &c);
+                    if status.contains("dispatched") || status.contains("queued") {
                         break;
                     }
                     std::thread::sleep(Duration::from_millis(5));

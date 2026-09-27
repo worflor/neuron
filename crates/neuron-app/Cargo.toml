@@ -61,11 +61,15 @@ global-hotkey = "0.8"
 gtk = "0.18"
 
 [target.'cfg(windows)'.dependencies]
+sha2 = "0.10" # Pin the broker and embedded Chroma setup bytes before requesting elevation.
+base64 = "0.22" # Carry the embedded broker installer through UAC without reopening a writable script.
 # Lock the main thread's COM apartment to STA before winit/tray-icon/Core-Audio touch COM:
 # winit's OleInitialize needs STA, while tray-icon + neuron-core's audio request MTA.
 # Initializing STA first wins; their later MTA requests fail harmlessly (RPC_E_CHANGED_MODE).
 windows-sys = { version = "0.59", features = [
     "Win32_System_Com",
+    "Win32_System_SystemInformation", # Resolve 64-bit PowerShell without trusting environment variables.
+    "Win32_System_Registry",          # SHELLEXECUTEINFOW dependency in windows-sys.
     "Win32_System_Ole",
     "Win32_Foundation",
     "Win32_Graphics_Gdi",

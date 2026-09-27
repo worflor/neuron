@@ -50,7 +50,7 @@ Important non-code state:
 
 Startup flow:
 
-1. Set the disarmed startup stance, then resolve the run root from `NEURON_RUN_DIR`, a writable portable install directory, or per-user data. Config paths do not depend on the process current directory. A legacy build-tree migration holds a cross-process lock through marker creation, every no-clobber copy, and marker removal; an incomplete migration stops startup before config is read.
+1. Set the disarmed startup stance, then resolve the run root from `NEURON_RUN_DIR`, a portable package marked by `portable.flag`, or per-user data for an installed/build-tree binary. Config paths do not depend on the process current directory. A legacy v0.1.1 installer/build-tree migration holds a cross-process lock through marker creation, every no-clobber copy, and marker removal; an incomplete migration stops startup before config is read.
 2. Handle special one-shot paths: `--weave-proof` and, on Windows, `--purge-synapse`.
 3. Install panic logging and native-fault breadcrumbs into `neuron-crash.log`.
 4. On Windows, register application restart when Phoenix is enabled.
@@ -203,7 +203,7 @@ sequenceDiagram
     Glue->>Runtime: load registry, prefs, profiles, rules
     Main->>Tray: seed menu from resident Runtime
     Main->>Live: start(weak AppWindow, armed)
-    Main->>Macro: set disarmed state; leave sidecar cold
+    Main->>Macro: mirror live arm state; leave sidecar cold
     Main->>Beacon: start spellweaving/prompt service
     Main->>App: show window unless launch prefs request tray
     Main->>App: run Slint event loop
@@ -358,7 +358,7 @@ stateDiagram-v2
 Safety invariants:
 
 - Tests must not arm real input.
-- A normal Windows GUI launch arms input when live dispatch starts, after the process has initialized disarmed. Crash recovery waits for a fresh user arm.
+- A normal Windows GUI launch arms input when live dispatch starts, after the process has initialized disarmed. Windows crash recovery restores the same live stance.
 - `neuron-app --safe` sets Observe mode before host or window startup, disarming input and pausing device writes.
 - `neuron-cli run --safe` disarms input and pauses writes.
 - App/window intents are routed before the device write gate; device/profile intents are routed after it.
@@ -369,7 +369,7 @@ The current code is cleaner than the original shape, but these are still deliber
 
 - Tray and hotkey actions wake the UI event loop directly. A 500 ms timer handles aging status and background recovery.
 - Foreground app switching still polls the active app on the live worker. A platform event hook would be more elegant on Windows, with polling as fallback for cross-platform backends.
-- Macro Host stays cold at normal startup even though live dispatch arms input. A first macro, a later manual arm, or a macro editor action warms it on demand.
+- Macro Host sidecars stay cold at normal startup even though live dispatch arms input. The source index loads without starting Python. A bounded service queue retains the first macro and its context while the correct lane warms; each item pins its source generation, authority domain, and arm generation, so an edit or SAFE transition invalidates delayed effects rather than retargeting them.
 - Typing Heat samples OS key state after Raw Input transitions, with a 500 ms reconciliation scan when a transient capture redirects the listener. The lighting stream still renders at its selected frame rate while active.
 - `DeviceSession` caches by command, not by physical-device object. That is simple and avoids most repeated enumeration/handshake cost, but a per-physical-device cache would be tighter if multiple hot commands pound the same device.
 
@@ -505,6 +505,8 @@ Safety model:
 - BOUND and RAW never share an interpreter; each has its own warm session, breaker, queues and crash recovery.
 - BOUND receives curated imports/builtins and the public `neuron` capability proxy. Input, clipboard, focus, device/audio/OBS effects and persistent macro state are brokered through Rust.
 - Rust re-checks arm/mock state before effectful broker work. Python's helper-side check is ergonomic feedback, not the authority boundary.
+- Each fire carries the arm generation accepted at dispatch. Python helpers require that token to match the latest control generation, and Rust re-checks it for brokered effects. One bounded writer owns each sidecar pipe; data and arm changes share one coalesced readiness signal, the idle writer blocks indefinitely, and an arm change is written before the next fire with a bounded Python acknowledgement. The writer's 1,024-item data queue matches Python's process-wide fire budget, while Python retains a separate 256-item queue per macro. Queue saturation drops the newest fire without retiring a healthy sidecar; a disconnected pipe or missed control acknowledgement still terminates it. SAFE only updates the packed Rust gate and wakes that service, so the UI never waits on sidecar I/O.
+- Cold-start registration is control-plane work: each source is acknowledged before the lane is published. It cannot consume the bounded live-fire queue or silently omit the tail of a large catalog.
 - BOUND is policy containment, not a hostile-code security sandbox. RAW remains unrestricted CPython by design and may bypass Neuron's arm gate through ambient APIs.
 - `# neuron: raw` is source-owned policy; the GUI edits that exact directive. Existing pre-policy files are migrated to RAW once so upgrades preserve authority.
 - Cross-domain invocation is monotonic: BOUND → RAW is refused; RAW → BOUND executes the target in the BOUND process.

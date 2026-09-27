@@ -145,8 +145,14 @@ const CATALOG: &[CatalogEntry] = &[
         name: "game_mode", class: 0x03, id: 0x80, size: 0x03, args: &[0x00, 0x08],
         setters: &[Setter { name: "set_game_mode", class: 0x03, id: 0x00, size: 0x03 }], proves_lighting: false,
     },
-    // Legacy-era lighting getters (class 0x03). `lighting_state` intentionally reuses the
-    // matrix entry's name — first-answering dialect wins the slot (matrix is probed first).
+    // Legacy-era lighting getters (class 0x03). `brightness` and `lighting_state` intentionally
+    // reuse the matrix names; the first answering dialect wins each slot (matrix is probed first).
+    // The brightness write lives in the legacy lighting block because its fixed BACKLIGHT_LED
+    // prefix differs from the matrix setter's visible-region prefix.
+    CatalogEntry {
+        name: "brightness", class: 0x03, id: 0x83, size: 0x03, args: &[0x01, 0x05],
+        setters: &[], proves_lighting: true,
+    },
     CatalogEntry { name: "lighting_state", class: 0x03, id: 0x88, size: 0x06, args: &[], setters: &[], proves_lighting: true },
     CatalogEntry { name: "lighting_caps", class: 0x03, id: 0x89, size: 0x07, args: &[], setters: &[], proves_lighting: true },
 ];
@@ -385,8 +391,8 @@ fn matrix_lighting(rows: u8, cols: u8, brightness_proven: bool) -> LightingDef {
 
 /// The legacy (standard, class 0x03) lighting block — Chroma-V2-proven values, including the
 /// split-brain tx: getters ride the device default while EFFECT and CUSTOM-FRAME writes need
-/// 0x3F (at the default they ACK and silently no-op). No brightness — see the field comment.
-fn legacy_lighting(rows: u8, cols: u8) -> LightingDef {
+/// 0x3F (at the default they ACK and silently no-op).
+fn legacy_lighting(rows: u8, cols: u8, brightness_proven: bool) -> LightingDef {
     LightingDef {
         protocol: Protocol::Legacy,
         rows,
@@ -407,14 +413,9 @@ fn legacy_lighting(rows: u8, cols: u8) -> LightingDef {
         custom_id: 0x05,
         effect: cmd_tx(0x03, 0x0A, 0x08, &[], 0x3F),
         custom_frame: Some(cmd_tx(0x03, 0x0B, 0x46, &[0xFF], 0x3F)),
-        // No brightness: the legacy dialect has NO brightness getter to prove a setter against
-        // (the curated BlackWidow's 0x03/0x03 write was verified on that physical board —
-        // per-device evidence a blind probe cannot produce). Now that `lighting.brightness`
-        // GRANTS a write capability, baking the standard 0x03/0x03 spec here would put unproven
-        // bytes on the wire for every legacy board synthesis touches. A user who KNOWS their
-        // legacy board takes the standard write adds `[lighting.brightness]` to the auto file by
-        // hand — it is config.
-        brightness: None,
+        // The paired 0x03/0x83 getter proves the standard 0x03/0x03 setter and its persistent
+        // BACKLIGHT_LED prefix. If that getter does not answer, synthesis emits no write path.
+        brightness: brightness_proven.then(|| cmd(0x03, 0x03, 0x03, &[0x01, 0x05])),
     }
 }
 
@@ -494,11 +495,15 @@ pub fn synthesize(t: &dyn Transport, ctx: &SynthCtx) -> Option<Synthesis> {
     let has_dpi = commands.contains_key("dpi");
     let lighting = if matrix {
         let (rows, cols) = if has_dpi { (1, 2) } else { (6, 22) };
-        // "brightness" is the matrix getter's registry name — inserted above only when 0x0F/0x84
-        // answered — so it is the exact probe evidence the block's brightness write must ride.
-        Some(matrix_lighting(rows, cols, commands.contains_key("brightness")))
+        let brightness_proven = commands.get("brightness").is_some_and(|c| {
+            c.class == 0x0F && c.id == 0x84 && c.size == 0x03 && c.args == [0x00, 0x04]
+        });
+        Some(matrix_lighting(rows, cols, brightness_proven))
     } else if legacy {
-        Some(legacy_lighting(6, 22))
+        let brightness_proven = commands.get("brightness").is_some_and(|c| {
+            c.class == 0x03 && c.id == 0x83 && c.size == 0x03 && c.args == [0x01, 0x05]
+        });
+        Some(legacy_lighting(6, 22, brightness_proven))
     } else {
         None
     };
@@ -638,8 +643,8 @@ pub fn emit_toml(s: &Synthesis) -> String {
     // one Heuristic → one caveat line, in the original order. `tx` and `stream_wait` are ALWAYS
     // heuristic, so their lines always appear; `dims` exists (and can only mislead) only when
     // there's a lighting block; the brightness caveat rides the same lighting-block condition
-    // (whether a brightness WRITE was actually proven lives in `proven_commands`/`def.lighting.
-    // brightness` and gates the [lighting.brightness] TABLE below — this line documents the rule).
+    // (whether a brightness write was actually proven lives in `def.lighting.brightness` and
+    // gates the [lighting.brightness] table below).
     let mut heuristic_lines: Vec<String> = Vec::new();
     // tx: Heuristic<u8> — always present.
     heuristic_lines
@@ -651,9 +656,7 @@ pub fn emit_toml(s: &Synthesis) -> String {
     }
     if d.lighting.is_some() {
         heuristic_lines.push(
-            "#   - [lighting.brightness]: emitted ONLY when the probe proved its getter. Legacy-dialect\n\
-             #     defs omit it by design (no brightness getter exists to prove the write against) —\n\
-             #     add [lighting.brightness] by hand if the board is known to take the standard write.".into(),
+            "#   - [lighting.brightness]: emitted only when the matching dialect getter answered.".into(),
         );
     }
     // stream_wait: Heuristic<u64> — always present.
@@ -781,9 +784,7 @@ pub fn heal_auto_tx(dialect_id: &str, pid: u16, def: &DeviceDef, verified_tx: u8
         heuristic_lines
             .push("#   - [lighting] rows/cols: a GUESS — native effects don't need it, custom frames do.".into());
         heuristic_lines.push(
-            "#   - [lighting.brightness]: emitted ONLY when the probe proved its getter. Legacy-dialect\n\
-             #     defs omit it by design (no brightness getter exists to prove the write against) —\n\
-             #     add [lighting.brightness] by hand if the board is known to take the standard write.".into(),
+            "#   - [lighting.brightness]: emitted only when the matching dialect getter answered.".into(),
         );
     }
     heuristic_lines.push(
@@ -1145,8 +1146,9 @@ mod tests {
     fn mock_legacy_keyboard() -> MockDevice {
         MockDevice::new(&[
             (0x00, 0x81), (0x00, 0x82), (0x00, 0x84),
-            (0x03, 0x80), (0x03, 0x88), (0x03, 0x89),
+            (0x03, 0x80), (0x03, 0x83), (0x03, 0x88), (0x03, 0x89),
         ])
+        .with_args(0x03, 0x83, &[0x01, 0x05, 0x66])
     }
 
     #[test]
@@ -1208,20 +1210,12 @@ mod tests {
         assert_eq!(l.effects, bl.effects);
         assert_eq!(l.effect, bl.effect, "split-brain 0x3F lighting tx");
         assert_eq!(l.custom_frame, bl.custom_frame);
-        // The legacy dialect has NO brightness getter, so the probe can't prove a brightness
-        // write — the synthesized block omits it even though the CURATED def keeps Some (that
-        // 0x03/0x03 spec was verified on the physical board, per-device evidence a blind probe
-        // can't reproduce). Since `lighting.brightness` now grants SetBrightness, emitting it
-        // untested would put unproven bytes on the wire; without it the def honestly declines.
-        assert!(
-            l.brightness.is_none(),
-            "legacy synthesis has no getter to prove a brightness write against"
-        );
-        assert!(bl.brightness.is_some(), "curated BW keeps its board-verified brightness write");
-        assert!(
-            !d.supports(Capability::SetBrightness),
-            "no proven brightness getter -> no brightness write capability"
-        );
+        assert_eq!(l.brightness, bl.brightness, "legacy getter proves the paired setter");
+        let br = d.command("brightness").expect("legacy brightness getter was probed");
+        assert_eq!((br.class, br.id, br.size, &br.args[..]),
+            (0x03, 0x83, 0x03, &[0x01u8, 0x05][..]));
+        assert!(d.supports(Capability::Brightness));
+        assert!(d.supports(Capability::SetBrightness));
         // legacy lighting_state resolves to the class-0x03 getter (no matrix on this board)
         let st = d.command("lighting_state").unwrap();
         assert_eq!((st.class, st.id), (0x03, 0x88));
@@ -1264,6 +1258,25 @@ mod tests {
             !d.supports(Capability::SetBrightness),
             "no brightness write path anywhere -> supports(SetBrightness) is false"
         );
+    }
+
+    #[test]
+    fn matrix_dialect_does_not_treat_a_legacy_brightness_reply_as_matrix_evidence() {
+        use crate::registry::Capability;
+
+        let mock = MockDevice::new(&[(0x00, 0x81), (0x0F, 0x82), (0x03, 0x83)]);
+        let s = synthesize(&mock, &ctx(0x1234, "Razer mixed probe replies")).unwrap();
+        let d = &s.def;
+        let l = d.lighting.as_ref().expect("matrix lighting_state selects the matrix dialect");
+        assert_eq!(l.protocol, Protocol::Matrix);
+        let getter = d.command("brightness").expect("the answered legacy getter remains readable");
+        assert_eq!(
+            (getter.class, getter.id, &getter.args[..]),
+            (0x03, 0x83, &[0x01u8, 0x05][..])
+        );
+        assert!(d.command("set_brightness").is_none());
+        assert!(l.brightness.is_none(), "legacy evidence must not authorize a matrix write");
+        assert!(!d.supports(Capability::SetBrightness));
     }
 
     #[test]

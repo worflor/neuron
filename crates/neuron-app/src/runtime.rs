@@ -69,8 +69,8 @@ pub struct DeviceState {
     pub cap_dpi: bool,  // SetDpi — DPI fader, DPI stages, sniper, lift-off/debounce
     pub cap_poll: bool, // SetPolling — polling contacts + in-game polling
     pub cap_light: bool, // Lighting — the brightness fader
-    pub cap_bright: bool, // Brightness (the GETTER) — the LIGHT readout; a device that can set but
-    // never report brightness (the legacy BlackWidow) must not show a readout that reads "—" forever
+    pub cap_bright: bool, // Brightness (the GETTER) — the LIGHT readout; an incomplete custom
+    // definition with only a setter must not show a readout that reads "—" forever
     pub cap_bright_set: bool, // SetBrightness (the WRITE, either dialect) — the BRIGHTNESS fader + its slot in the one-gesture apply; distinct from cap_light (a lighting BLOCK ≠ a brightness write: synthesized defs only carry lighting.brightness when the probe proved it)
     pub cap_scroll: bool, // SetScrollStage — scroll-wheel stages
     pub cap_store: bool, // Storage — persist-to-onboard

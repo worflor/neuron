@@ -427,9 +427,8 @@ component DeviceLine inherits Rectangle {
                             }
                         }
                     }
-                    // LIGHT keys on the brightness GETTER, not the lighting block — a board that can
-                    // only SET brightness (the legacy BlackWidow) has no number to report, and a
-                    // readout that says "—" forever is a lie of layout.
+                    // LIGHT keys on the brightness GETTER, not the lighting block. An incomplete
+                    // custom definition must not leave a permanently unreadable value in the UI.
                     if root.d.cap-bright : Readout { key: "LIGHT"; value: root.d.brightness; }
                     if root.d.storage != "" : Readout { key: "ONBOARD"; value: root.d.storage; }
                     // SIDE PLATE — push-only readout under the mouse it belongs to (capability-gated,
@@ -1801,4 +1800,3 @@ export component DevicePanel inherits VerticalLayout {
         }
     }
 }
-

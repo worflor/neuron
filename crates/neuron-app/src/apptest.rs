@@ -71,6 +71,9 @@ fn gui_tests_in_fresh_processes() {
         eprintln!("GUI child tests skipped: no Linux display is available");
         return;
     }
+    // Child processes inherit cwd. Hold the process-wide cwd guard for the whole launch loop so
+    // a concurrent persistence test cannot remove its temporary cwd underneath a new child.
+    let _cwd = crate::testsupport::cwd_guard("apptest_children");
     let exe = std::env::current_exe().expect("current test executable");
     let listing = Command::new(&exe)
         .args(["--list", "--ignored", "apptest::"])

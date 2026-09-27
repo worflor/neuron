@@ -34,6 +34,8 @@
 use serde::de::DeserializeOwned;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(windows)]
+use std::time::Duration;
 
 /// Open `path` for writing CREATED RESTRICTIVE: on Unix the file is born 0o600 (owner-only), so
 /// secret-bearing bytes (app.toml carries `host_obs_password`) are never readable by other local
@@ -710,27 +712,67 @@ fn publish_replace_windows(tmp: &Path, dest: &Path) -> std::io::Result<()> {
     // SAFETY: both pointers are null-terminated UTF-16 buffers kept alive for the duration of the
     // call; `lpBackupFileName` is null (we don't want a `.bak` sibling) and `dwReplaceFlags` is 0
     // (no special flags needed for a plain config swap).
-    let ok = unsafe {
-        ReplaceFileW(
-            dest_w.as_ptr(),
-            tmp_w.as_ptr(),
-            std::ptr::null(),
-            0,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    const ERROR_UNABLE_TO_REMOVE_REPLACED: i32 = 1175;
+    const ERROR_UNABLE_TO_MOVE_REPLACEMENT: i32 = 1176;
+    const ERROR_UNABLE_TO_MOVE_REPLACEMENT_2: i32 = 1177;
+    const RETRIES: u64 = 40;
+    let transient = |raw: Option<i32>| {
+        matches!(raw, Some(
+            ERROR_ACCESS_DENIED
+                | ERROR_SHARING_VIOLATION
+                | ERROR_UNABLE_TO_REMOVE_REPLACED
+                | ERROR_UNABLE_TO_MOVE_REPLACEMENT
+                | ERROR_UNABLE_TO_MOVE_REPLACEMENT_2
+        ))
     };
-    if ok != 0 {
-        return Ok(());
+    for attempt in 0..RETRIES {
+        let ok = unsafe {
+            ReplaceFileW(
+                dest_w.as_ptr(),
+                tmp_w.as_ptr(),
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if ok != 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32) {
+            // destination vanished between the exists() check and here — nothing left to preserve,
+            // so a plain rename finishes the publish. ReplaceFileW can also leave this exact state
+            // after 1176/1177; retry transient filter-driver interference without deleting `tmp`.
+            match std::fs::rename(tmp, dest) {
+                Ok(()) => return Ok(()),
+                Err(rename_err) if transient(rename_err.raw_os_error()) && attempt + 1 < RETRIES => {
+                    std::thread::sleep(Duration::from_millis(25));
+                    continue;
+                }
+                Err(rename_err) => return Err(rename_err),
+            }
+        }
+        // Indexers and antivirus filters can briefly hold either directory entry after both of our
+        // handles close. Keep the complete temp and cover ReplaceFileW's full 1175..=1177 partial-
+        // progress family; the next iteration also repairs a destination removed by 1176/1177.
+        if transient(err.raw_os_error()) && attempt + 1 < RETRIES {
+            std::thread::sleep(Duration::from_millis(25));
+            continue;
+        }
+        // 1176/1177 may already have removed the destination. Preserve the complete replacement for
+        // manual recovery if the bounded repair budget somehow expires; deleting it would lose both.
+        if !matches!(
+            err.raw_os_error(),
+            Some(ERROR_UNABLE_TO_MOVE_REPLACEMENT | ERROR_UNABLE_TO_MOVE_REPLACEMENT_2)
+        ) {
+            let _ = std::fs::remove_file(tmp);
+        }
+        return Err(err);
     }
-    let err = std::io::Error::last_os_error();
-    if err.raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32) {
-        // destination vanished between the exists() check and here — nothing left to preserve, so a
-        // plain rename (create-or-replace) finishes the publish.
-        return std::fs::rename(tmp, dest);
-    }
-    let _ = std::fs::remove_file(tmp);
-    Err(err)
+    unreachable!("ReplaceFileW retry loop always returns")
 }
 
 /// `.../feel.toml` → `.../feel.toml.bad` (append, not replace — we keep the full original name).

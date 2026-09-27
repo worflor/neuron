@@ -31,12 +31,12 @@
 use crate::macros::node::{MacroDocument, MacroNode};
 use crate::macros::policy::{mode_from_source, MacroMode};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io::{BufReader, Read, Write};
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -137,10 +137,101 @@ const LOG_RING: usize = 400;
 const BREAKER_MAX: u32 = 4;
 const BREAKER_WINDOW: Duration = Duration::from_secs(30);
 const BREAKER_COOLDOWN: Duration = Duration::from_secs(20);
+/// Cold/control dispatches wait here while one service worker starts the Python lane. This bound
+/// matches the sidecar's own fire queue: an input storm cannot turn a slow spawn into unbounded RAM.
+const COLD_FIRE_QUEUE: usize = 256;
 
 /// The process-global `MacroHost`. Lazily created; the sidecar starts on first Python operation
 /// or explicit [`MacroHost::ensure_warm`].
 static MACRO_HOST: OnceLock<MacroHost> = OnceLock::new();
+static MACRO_FIRE_SERVICE: crate::worker::Service<QueuedFire> = crate::worker::Service::new();
+static ARM_SYNC_SERVICE: crate::worker::Service<()> = crate::worker::Service::new();
+static PENDING_MACRO_FIRES: AtomicUsize = AtomicUsize::new(0);
+
+struct QueueSlot;
+
+impl QueueSlot {
+    fn claim() -> Option<Self> {
+        PENDING_MACRO_FIRES
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < COLD_FIRE_QUEUE).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| QueueSlot)
+    }
+}
+
+impl Drop for QueueSlot {
+    fn drop(&mut self) {
+        PENDING_MACRO_FIRES.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct PendingMutation<'a> {
+    id: String,
+    pending: &'a Mutex<BTreeSet<String>>,
+}
+
+impl<'a> PendingMutation<'a> {
+    fn begin(pending: &'a Mutex<BTreeSet<String>>, id: &str) -> Self {
+        pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id.to_string());
+        Self { id: id.to_string(), pending }
+    }
+}
+
+impl Drop for PendingMutation<'_> {
+    fn drop(&mut self) {
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.id);
+    }
+}
+
+struct QueuedFire {
+    _slot: QueueSlot,
+    kind: QueuedFireKind,
+}
+
+enum QueuedFireKind {
+    Registered {
+        id: String,
+        ctx: crate::macros::context::Context,
+        mock: bool,
+        armed: bool,
+        arm_generation: u64,
+        expected_generation: u64,
+        mode: MacroMode,
+    },
+    Discover {
+        id: String,
+        ctx: crate::macros::context::Context,
+        mock: bool,
+        armed: bool,
+        arm_generation: u64,
+    },
+    Source {
+        id: String,
+        source: String,
+        ctx: crate::macros::context::Context,
+        mock: bool,
+        armed: bool,
+        arm_generation: u64,
+        mode: MacroMode,
+    },
+}
+
+fn queued_definition_is_current(
+    expected_mode: MacroMode,
+    expected_generation: u64,
+    active_mode: MacroMode,
+    active_generation: u64,
+) -> bool {
+    expected_mode == active_mode && expected_generation == active_generation
+}
 
 /// Reach the process-global `MacroHost`.
 pub fn macro_host() -> &'static MacroHost {
@@ -164,6 +255,7 @@ struct Shared {
 struct LinkState {
     warm: bool,
     dead: bool,
+    arm_ack_generation: Option<u64>,
 }
 
 impl Shared {
@@ -194,18 +286,268 @@ impl Shared {
         // reply. Bounded only by the request's own recv_timeout (see FIRE_BUDGET/WARM_TIMEOUT).
         crate::failpoint!("macro_host.mark_dead.after_clear");
     }
+
+    fn wait_for_arm_ack(&self, generation: u64, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !state.dead && state.arm_ack_generation.is_none_or(|ack| ack < generation) {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let (next, _) = self.cv.wait_timeout(state, deadline - now).unwrap();
+            state = next;
+        }
+        !state.dead && state.arm_ack_generation.is_some_and(|ack| ack >= generation)
+    }
 }
 
-/// One live sidecar process + its writer end and the threads draining it. `stdin` is shared
-/// (Arc<Mutex>) because TWO writers exist: the host's request paths (fire/register/…) and the
-/// reader thread's no-UI auto-answer for prompts. stdin is a LEAF lock — never held while taking
-/// another — so the two writers can't deadlock.
+// The Python sidecar accepts at most 1,024 live fires across its independent per-macro queues. Keep
+// the transport able to carry that whole semantic budget so its smaller per-macro limits, rather
+// than an unrelated pipe race, decide which fires survive a storm.
+const PIPE_QUEUE: usize = 1024;
+const ARM_ACK_TIMEOUT: Duration = Duration::from_millis(500);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FireSend {
+    Sent,
+    Full,
+    Dead,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PublishedDefinition {
+    Found(MacroMode, u64),
+    Missing,
+    Busy,
+}
+
+/// The child handle is shared only with the arm watchdog. That watchdog must be able to terminate a
+/// sidecar without touching its possibly-stuck stdin writer or the MacroHost registry lock.
+struct ProcessControl {
+    child: Mutex<Child>,
+}
+
+impl ProcessControl {
+    fn terminate(&self) {
+        let mut child = self.child.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !matches!(child.try_wait(), Ok(Some(_))) {
+            let _ = child.kill();
+        }
+    }
+}
+
+struct PipeQueue {
+    frames: Mutex<VecDeque<Value>>,
+    capacity: usize,
+}
+
+impl PipeQueue {
+    fn new(capacity: usize) -> Self {
+        Self { frames: Mutex::new(VecDeque::new()), capacity }
+    }
+
+    fn push(&self, frame: &Value) -> bool {
+        let mut frames = self.frames.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if frames.len() >= self.capacity {
+            return false;
+        }
+        frames.push_back(frame.clone());
+        true
+    }
+
+    fn pop(&self) -> Option<Value> {
+        self.frames
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop_front()
+    }
+}
+
+/// One bounded, single-owner writer for a sidecar pipe. Frames and arm changes coalesce onto one
+/// readiness signal, so an idle warm sidecar blocks indefinitely and arm state still precedes fire.
+struct PipeWriter {
+    frames: Arc<PipeQueue>,
+    wake: SyncSender<()>,
+    state: Arc<PipeWriterState>,
+}
+
+struct PipeWriterState {
+    /// Same packing as MacroHost::arm_state: bit 0 is armed, upper bits are the generation.
+    arm_state: AtomicU64,
+    arm_requested: AtomicBool,
+    alive: AtomicBool,
+    shared: Weak<Shared>,
+    process: Weak<ProcessControl>,
+}
+
+impl PipeWriterState {
+    fn fail(&self) {
+        if !self.alive.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(shared) = self.shared.upgrade() {
+            shared.mark_dead();
+        }
+        if let Some(process) = self.process.upgrade() {
+            let fallback = Arc::clone(&process);
+            if !crate::worker::spawn_detached("macro-host-abort", move || process.terminate()) {
+                fallback.terminate();
+            }
+        }
+    }
+}
+
+impl PipeWriter {
+    fn wake(&self) -> bool {
+        match self.wake.try_send(()) {
+            Ok(()) | Err(TrySendError::Full(())) => true,
+            Err(TrySendError::Disconnected(())) => {
+                self.state.fail();
+                false
+            }
+        }
+    }
+
+    fn send(&self, frame: &Value) -> bool {
+        if !self.state.alive.load(Ordering::Acquire) {
+            return false;
+        }
+        if !self.frames.push(frame) {
+            self.state.fail();
+            return false;
+        }
+        self.wake()
+    }
+
+    fn send_arm(&self, on: bool, generation: u64) -> bool {
+        if !self.state.alive.load(Ordering::Acquire) {
+            return false;
+        }
+        let next = (generation << 1) | u64::from(on);
+        let mut current = self.state.arm_state.load(Ordering::Acquire);
+        loop {
+            if current >> 1 > generation {
+                break; // a newer gate transition already owns the writer
+            }
+            if current == next {
+                break;
+            }
+            match self.state.arm_state.compare_exchange_weak(
+                current, next, Ordering::AcqRel, Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
+        self.state.arm_requested.store(true, Ordering::Release);
+        self.wake()
+    }
+
+    fn send_fire(&self, frame: &Value) -> FireSend {
+        if !self.state.alive.load(Ordering::Acquire) {
+            return FireSend::Dead;
+        }
+        // Fire traffic is explicitly drop-newest. Backpressure is not evidence that the child
+        // died, and restarting it here would discard every independent Python macro queue.
+        if !self.frames.push(frame) {
+            return FireSend::Full;
+        }
+        if self.wake() { FireSend::Sent } else { FireSend::Dead }
+    }
+}
+
+fn write_pending_arm(
+    stdin: &mut impl Write,
+    state: &PipeWriterState,
+    last_written: &mut Option<u64>,
+) -> Result<(), ()> {
+    if !state.arm_requested.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    loop {
+        let arm = state.arm_state.load(Ordering::Acquire);
+        if *last_written == Some(arm) {
+            return Ok(());
+        }
+        let generation = arm >> 1;
+        let on = arm & 1 != 0;
+        if !send_frame(stdin, &json!({
+            "t": "armed", "on": on, "generation": generation,
+        })) {
+            return Err(());
+        }
+        *last_written = Some(arm);
+        if state.arm_state.load(Ordering::Acquire) == arm {
+            return Ok(());
+        }
+    }
+}
+
+fn pipe_writer_loop(
+    mut stdin: impl Write,
+    state: Arc<PipeWriterState>,
+    frames: Arc<PipeQueue>,
+    wake: Receiver<()>,
+) {
+    let mut last_written_arm = None;
+    while wake.recv().is_ok() {
+        loop {
+            if write_pending_arm(&mut stdin, &state, &mut last_written_arm).is_err() {
+                state.fail();
+                return;
+            }
+            let Some(frame) = frames.pop() else { break };
+            // An arm change can race the frame enqueue. Recheck immediately before the ordered
+            // write so the generation accepted by the Rust gate is physically ahead of the fire.
+            if write_pending_arm(&mut stdin, &state, &mut last_written_arm).is_err()
+                || !send_frame(&mut stdin, &frame)
+            {
+                state.fail();
+                return;
+            }
+        }
+    }
+    state.alive.store(false, Ordering::Release);
+    if let Some(shared) = state.shared.upgrade() {
+        shared.mark_dead();
+    }
+}
+
+/// One live sidecar process plus the threads writing and draining its three pipes.
 struct Session {
-    child: Child,
-    stdin: Arc<Mutex<ChildStdin>>,
+    process: Arc<ProcessControl>,
+    writer: Option<Arc<PipeWriter>>,
     shared: Arc<Shared>,
+    writer_thread: Option<JoinHandle<()>>,
     reader: Option<JoinHandle<()>>,
     logger: Option<JoinHandle<()>>,
+}
+
+#[derive(Clone)]
+struct ArmLink {
+    writer: Weak<PipeWriter>,
+    shared: Weak<Shared>,
+    process: Weak<ProcessControl>,
+}
+
+#[derive(Default)]
+struct ArmLinks {
+    raw: Option<ArmLink>,
+    bound: Option<ArmLink>,
+}
+
+impl ArmLinks {
+    fn slot_mut(&mut self, mode: MacroMode) -> &mut Option<ArmLink> {
+        match mode {
+            MacroMode::Raw => &mut self.raw,
+            MacroMode::Bound => &mut self.bound,
+        }
+    }
+
+    fn snapshot(&self) -> Vec<ArmLink> {
+        [self.raw.clone(), self.bound.clone()].into_iter().flatten().collect()
+    }
 }
 
 /// Frame one JSON request onto a sidecar pipe. Returns false if the pipe is broken (sidecar gone).
@@ -218,10 +560,35 @@ fn send_frame(w: &mut impl Write, v: &Value) -> bool {
     w.write_all(&len).is_ok() && w.write_all(&body).is_ok() && w.flush().is_ok()
 }
 
+fn synchronize_arm(
+    writer: &PipeWriter,
+    shared: &Shared,
+    on: bool,
+    generation: u64,
+    timeout: Duration,
+    retire: impl FnOnce(),
+) -> bool {
+    if writer.send_arm(on, generation) && shared.wait_for_arm_ack(generation, timeout) {
+        return true;
+    }
+    retire();
+    shared.mark_dead();
+    false
+}
+
 impl Session {
-    /// Frame one request to the sidecar. Returns false if the pipe is broken (sidecar gone).
+    /// Enqueue one request without waiting on the OS pipe. False means the bounded writer is no
+    /// longer trustworthy; callers retire this session rather than accumulating latency.
     fn send(&mut self, v: &Value) -> bool {
-        send_frame(&mut *self.stdin.lock().unwrap_or_else(std::sync::PoisonError::into_inner), v)
+        self.writer.as_ref().is_some_and(|writer| writer.send(v))
+    }
+
+    fn send_fire(&mut self, v: &Value, arm_on: bool, arm_generation: u64) -> FireSend {
+        let Some(writer) = self.writer.as_ref() else { return FireSend::Dead };
+        if !writer.send_arm(arm_on, arm_generation) {
+            return FireSend::Dead;
+        }
+        writer.send_fire(v)
     }
 }
 
@@ -231,16 +598,24 @@ impl Drop for Session {
         let _ = self.send(&json!({"t": "shutdown"}));
         // bounded wait for a clean exit, then hard-kill — never the blind fixed sleep.
         let deadline = Instant::now() + Duration::from_millis(150);
+        let mut child = self.process.child.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         loop {
-            match self.child.try_wait() {
+            match child.try_wait() {
                 Ok(Some(_)) => break,
                 _ if Instant::now() >= deadline => {
-                    let _ = self.child.kill();
-                    let _ = self.child.wait();
+                    let _ = child.kill();
+                    let _ = child.wait();
                     break;
                 }
                 _ => std::thread::sleep(Duration::from_millis(5)),
             }
+        }
+        drop(child);
+        // Closing the final sender lets an idle writer exit. If it was inside write_all, child
+        // termination above closes the far end and releases it.
+        drop(self.writer.take());
+        if let Some(h) = self.writer_thread.take() {
+            let _ = h.join();
         }
         // The child's pipe write-ends are now closed, so the reader/logger threads hit EOF and
         // exit; join them so teardown is deterministic (no thread/handle pile-up across respawns).
@@ -367,18 +742,26 @@ fn lane_for_shared(g: &Inner, shared: &Arc<Shared>) -> Option<MacroMode> {
 /// The process-global macro runtime.
 pub struct MacroHost {
     inner: Mutex<Inner>,
+    /// A short-lived definition index for the non-blocking dispatch path. It never contains source;
+    /// queued work pins only the committed mode + generation and is rejected if either changes.
+    published: Mutex<BTreeMap<String, (MacroMode, u64)>>,
     /// Serialize durable macro mutations. Save/delete are cold control-plane operations; one lock
     /// makes their disk + manifest + sidecar publication order atomic from every caller's view.
     mutations: Mutex<()>,
+    /// Files remain invisible to opportunistic directory scans until their save/delete transaction
+    /// commits or finishes rollback. This covers every sync caller without taking `mutations` twice.
+    pending_mutations: Mutex<BTreeSet<String>>,
     /// Monotonic macro revision source. Zero is reserved for "not registered".
     next_generation: AtomicU64,
     /// The SAFE/arm gate, kept OUTSIDE the inner lock so `set_armed` (called on the UI thread) is
     /// always lock-free and instant — it can never stall behind a cold-spawn warm-wait. The spawn
     /// reads this for the initial + warm-handshake arm state, so a respawn always reflects current.
-    armed: AtomicBool,
-    /// At most one background warm thread per execution domain.
-    warm_in_flight: AtomicBool,
-    bound_warm_in_flight: AtomicBool,
+    /// Packed arm state: bit 0 is armed and the upper bits are a generation incremented on every
+    /// transition. One atomic word prevents readers pairing a new gate value with an old token.
+    arm_state: AtomicU64,
+    /// Sidecar control pipes live outside `inner`: SAFE transitions can always publish their new
+    /// generation without waiting behind a cold interpreter start.
+    arm_links: Mutex<ArmLinks>,
     /// The macro-log ring, owned here so it survives session respawns (each Session's `Shared.log`
     /// is a clone of this Arc).
     log: LogRing,
@@ -389,22 +772,40 @@ pub struct MacroHost {
 
 impl MacroHost {
     fn new() -> Self {
+        let mut manifest = BTreeMap::new();
+        let mut modes = BTreeMap::new();
+        let mut generations = BTreeMap::new();
+        let mut published = BTreeMap::new();
+        let mut next_generation = 1u64;
+        for (id, source) in scan_macro_dir() {
+            let Ok(mode) = mode_from_source(&source) else {
+                eprintln!("[macro] '{id}' has invalid execution policy; skipped until edited");
+                continue;
+            };
+            let generation = next_generation;
+            next_generation = next_generation.saturating_add(1);
+            manifest.insert(id.clone(), source);
+            modes.insert(id.clone(), mode);
+            generations.insert(id.clone(), generation);
+            published.insert(id, (mode, generation));
+        }
         MacroHost {
             inner: Mutex::new(Inner {
                 session: None,
                 bound_session: None,
-                manifest: BTreeMap::new(),
-                modes: BTreeMap::new(),
-                generations: BTreeMap::new(),
+                manifest,
+                modes,
+                generations,
                 options: BTreeMap::new(),
                 breaker: Breaker::default(),
                 bound_breaker: Breaker::default(),
             }),
+            published: Mutex::new(published),
             mutations: Mutex::new(()),
-            next_generation: AtomicU64::new(1),
-            armed: AtomicBool::new(false),
-            warm_in_flight: AtomicBool::new(false),
-            bound_warm_in_flight: AtomicBool::new(false),
+            pending_mutations: Mutex::new(BTreeSet::new()),
+            next_generation: AtomicU64::new(next_generation),
+            arm_state: AtomicU64::new(0),
+            arm_links: Mutex::new(ArmLinks::default()),
             log: Arc::new(Mutex::new(VecDeque::new())),
             beacon: Arc::new(Mutex::new(None)),
         }
@@ -432,19 +833,97 @@ impl MacroHost {
         }
     }
 
-    /// Mirror the live arm/SAFE state into the sidecar so the helper input layer honours it.
-    /// LOCK-FREE: the authoritative value is the atomic (read by the spawn + warm handshake), so a
-    /// SAFE toggle on the UI thread is instant and can never stall behind a cold-spawn warm-wait.
-    /// A frame is sent best-effort only if the lock is free; otherwise the next warm picks up the
-    /// current atomic. (Raw `ctypes` past the helpers is the user's own rope and is not gated.)
-    pub fn set_armed(&self, on: bool) {
-        self.armed.store(on, Ordering::SeqCst);
-        if let Ok(mut g) = self.inner.try_lock() {
-            for mode in [MacroMode::Raw, MacroMode::Bound] {
-                if let Some(s) = lane_session_mut(&mut g, mode) {
-                    let _ = s.send(&json!({"t": "armed", "on": on}));
-                }
+    /// Mirror the live arm/SAFE state into the sidecars so the helper input layer honours it.
+    /// Publication runs on one service worker and requires a bounded acknowledgement; the caller
+    /// only changes the Rust gate and enqueues a wake, so SAFE never waits on a Python pipe. (Raw
+    /// `ctypes` past the helpers is the user's own rope and is not gated.)
+    pub fn set_armed(&'static self, on: bool) {
+        let desired = u64::from(on);
+        let mut old = self.arm_state.load(Ordering::SeqCst);
+        while old & 1 != desired {
+            let next = (old & !1).wrapping_add(2) | desired;
+            match self.arm_state.compare_exchange_weak(
+                old, next, Ordering::SeqCst, Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(actual) => old = actual,
             }
+        }
+        let queued = crate::worker::service_sender(
+            &ARM_SYNC_SERVICE,
+            "macro-arm-sync",
+            |rx| crate::worker::drain(rx, "macro-arm-sync", |()| {
+                macro_host().sync_arm_links();
+            }),
+        ).is_some_and(|tx| tx.send(()).is_ok());
+        if !queued {
+            // Thread creation failure is exceptional. Closing the live sidecars is the only safe
+            // fallback because RAW helpers otherwise retain the last control state they observed.
+            self.retire_all_arm_links();
+        }
+    }
+
+    fn sync_arm_links(&self) {
+        let (on, generation) = self.arm_snapshot(false);
+        let links = self.arm_links
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .snapshot();
+        for link in links {
+            let (Some(writer), Some(shared), Some(process)) = (
+                link.writer.upgrade(), link.shared.upgrade(), link.process.upgrade(),
+            ) else { continue };
+            if synchronize_arm(&writer, &shared, on, generation, ARM_ACK_TIMEOUT, || {
+                process.terminate()
+            }) {
+                continue;
+            }
+        }
+    }
+
+    fn retire_all_arm_links(&self) {
+        let Ok(links) = self.arm_links.try_lock() else { return };
+        for link in links.snapshot() {
+            if let Some(process) = link.process.upgrade() {
+                process.terminate();
+            }
+            if let Some(shared) = link.shared.upgrade() {
+                shared.mark_dead();
+            }
+        }
+    }
+
+    fn arm_snapshot(&self, mock: bool) -> (bool, u64) {
+        let state = self.arm_state.load(Ordering::SeqCst);
+        (!mock && state & 1 != 0, state >> 1)
+    }
+
+    fn fire_authorized(&self, armed: bool, generation: u64) -> bool {
+        let state = self.arm_state.load(Ordering::SeqCst);
+        armed && state & 1 != 0 && state >> 1 == generation
+    }
+
+    fn send_fire(&self, session: &mut Session, frame: &Value) -> FireSend {
+        let (on, generation) = self.arm_snapshot(false);
+        session.send_fire(frame, on, generation)
+    }
+
+    fn published_definition(&self, id: &str) -> PublishedDefinition {
+        match self.published.try_lock() {
+            Ok(published) => published
+                .get(id)
+                .copied()
+                .map_or(PublishedDefinition::Missing, |(mode, generation)| {
+                    PublishedDefinition::Found(mode, generation)
+                }),
+            Err(std::sync::TryLockError::WouldBlock) => PublishedDefinition::Busy,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned
+                .into_inner()
+                .get(id)
+                .copied()
+                .map_or(PublishedDefinition::Missing, |(mode, generation)| {
+                    PublishedDefinition::Found(mode, generation)
+                }),
         }
     }
 
@@ -473,6 +952,7 @@ impl MacroHost {
             .mutations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _pending = PendingMutation::begin(&self.pending_mutations, id);
         let previous_source = load_macro(id);
         let old_mode = self
             .inner
@@ -524,6 +1004,10 @@ impl MacroHost {
                     let _ = s.send(&json!({"t": "unregister", "id": id}));
                 }
             }
+            self.published
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(id.to_string(), (mode, generation));
         }
 
         seed_option_defaults(id, &opts);
@@ -669,6 +1153,7 @@ impl MacroHost {
             .mutations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _pending = PendingMutation::begin(&self.pending_mutations, id);
         match std::fs::remove_file(macro_path(id)) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -691,6 +1176,10 @@ impl MacroHost {
         g.modes.remove(id);
         g.generations.remove(id);
         g.options.remove(id);
+        self.published
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(id);
         for mode in [MacroMode::Raw, MacroMode::Bound] {
             if let Some(s) = lane_session_mut(&mut g, mode) {
                 let _ = s.send(&json!({"t": "unregister", "id": id}));
@@ -830,7 +1319,7 @@ impl MacroHost {
             if let Err(e) = self.ensure_lane_locked(&mut g, mode) {
                 return format!("[{e}]");
             }
-            let armed = self.armed.load(Ordering::SeqCst);
+            let (armed, arm_generation) = self.arm_snapshot(false);
             let s = lane_session_mut(&mut g, mode).unwrap();
             let rid = s.shared.next_rid.fetch_add(1, Ordering::Relaxed);
             let (tx, rx) = channel();
@@ -841,7 +1330,7 @@ impl MacroHost {
             } else {
                 json!({})
             };
-            let sent = s.send(&json!({
+            let sent = self.send_fire(s, &json!({
                 "t": "fire_source",
                 "rid": rid,
                 "id": id,
@@ -849,13 +1338,22 @@ impl MacroHost {
                 "ctx": ctx_json(ctx, armed),
                 "options": options,
                 "mock": false,
+                "authorized": armed,
+                "arm_generation": arm_generation,
             }));
             (rx, shared, rid, sent)
         };
-        if !sent {
-            shared.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&rid);
-            self.retire_control_session(&shared);
-            return "[sidecar pipe broken]".into();
+        match sent {
+            FireSend::Sent => {}
+            FireSend::Full => {
+                shared.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&rid);
+                return "[sidecar fire queue full]".into();
+            }
+            FireSend::Dead => {
+                shared.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&rid);
+                self.retire_control_session(&shared);
+                return "[sidecar pipe broken]".into();
+            }
         }
         match rx.recv_timeout(budget) {
             Ok(v) if v.get("ok").and_then(Value::as_bool) == Some(true) => v
@@ -901,7 +1399,22 @@ impl MacroHost {
             Ok(mode) => mode,
             Err(e) => return format!("[macro policy error: {e}]"),
         };
-        let armed = !mock && self.armed.load(Ordering::SeqCst);
+        let (armed, arm_generation) = self.arm_snapshot(mock);
+        if PENDING_MACRO_FIRES.load(Ordering::Acquire) > 0 {
+            return if self.enqueue_queued_fire(QueuedFireKind::Source {
+                id: id.to_string(),
+                source: source.to_string(),
+                ctx: ctx.clone(),
+                mock,
+                armed,
+                arm_generation,
+                mode,
+            }) {
+                format!("macro '{id}' source queued")
+            } else {
+                format!("macro '{id}' source queue full")
+            };
+        }
         if let Ok(mut g) = self.inner.try_lock() {
             let warm = lane_session(&g, mode)
                 .map(|s| {
@@ -917,7 +1430,7 @@ impl MacroHost {
                 } else {
                     json!({})
                 };
-                if s.send(&json!({
+                match self.send_fire(s, &json!({
                     "t": "fire_source",
                     "rid": rid,
                     "id": id,
@@ -925,22 +1438,32 @@ impl MacroHost {
                     "ctx": ctx_json(ctx, armed),
                     "options": options,
                     "mock": mock,
+                    "authorized": armed,
+                    "arm_generation": arm_generation,
                 })) {
-                    return format!("macro '{id}' source dispatched");
+                    FireSend::Sent => return format!("macro '{id}' source dispatched"),
+                    FireSend::Full => return format!("macro '{id}' source queue full"),
+                    FireSend::Dead => {}
                 }
                 let doomed = lane_take(&mut g, mode);
                 drop(g);
                 drop(doomed);
-                self.spawn_background_warm(mode);
-                return format!("macro '{id}' source dropped (sidecar died — warming, press again)");
+                return format!("macro '{id}' source dropped (sidecar died)");
             }
             drop(g);
         }
-        self.spawn_background_warm(mode);
-        if !self.available() {
-            "[python runtime unavailable]".into()
+        if self.enqueue_queued_fire(QueuedFireKind::Source {
+            id: id.to_string(),
+            source: source.to_string(),
+            ctx: ctx.clone(),
+            mock,
+            armed,
+            arm_generation,
+            mode,
+        }) {
+            format!("macro '{id}' source queued")
         } else {
-            format!("macro '{id}' source — sidecar warming, press again")
+            format!("macro '{id}' source queue full")
         }
     }
 
@@ -970,7 +1493,18 @@ impl MacroHost {
         mock: bool,
     ) -> String {
         crate::prof::bump(&crate::prof::MACRO_FIRE);
-        let armed = !mock && self.armed.load(Ordering::SeqCst);
+        let (armed, arm_generation) = self.arm_snapshot(mock);
+        if PENDING_MACRO_FIRES.load(Ordering::Acquire) > 0 {
+            return match self.published_definition(id) {
+                PublishedDefinition::Found(mode, generation) => self.queue_registered(
+                    id, ctx, mock, (armed, arm_generation), generation, mode,
+                ),
+                PublishedDefinition::Missing => {
+                    self.queue_discovery(id, ctx, mock, (armed, arm_generation))
+                }
+                PublishedDefinition::Busy => format!("macro '{id}' dispatch busy; press again"),
+            };
+        }
         if let Ok(mut g) = self.inner.try_lock() {
             if let Some(mode) = g.modes.get(id).copied() {
                 let warm = lane_session(&g, mode)
@@ -983,34 +1517,240 @@ impl MacroHost {
                     let generation = g.generations.get(id).copied().unwrap_or(0);
                     let s = lane_session_mut(&mut g, mode).unwrap();
                     let rid = s.shared.next_rid.fetch_add(1, Ordering::Relaxed);
-                    if s.send(&json!({
+                    match self.send_fire(s, &json!({
                         "t": "fire", "rid": rid, "id": id, "generation": generation,
-                        "ctx": ctx_json(ctx, armed), "options": load_option_values(id), "mock": mock
+                        "ctx": ctx_json(ctx, armed), "options": load_option_values(id), "mock": mock,
+                        "authorized": armed, "arm_generation": arm_generation,
                     })) {
-                        return format!("macro '{id}' dispatched");
+                        FireSend::Sent => return format!("macro '{id}' dispatched"),
+                        FireSend::Full => return format!("macro '{id}' queue full"),
+                        FireSend::Dead => {}
                     }
                     let doomed = lane_take(&mut g, mode);
                     drop(g);
                     drop(doomed);
-                    self.spawn_background_warm(mode);
-                    return format!("macro '{id}' dropped (sidecar died — warming, press again)");
+                    return format!("macro '{id}' dropped (sidecar died)");
                 }
+                let expected_generation = g.generations.get(id).copied().unwrap_or(0);
                 drop(g);
-                self.spawn_background_warm(mode);
+                return self.queue_registered(
+                    id, ctx, mock, (armed, arm_generation), expected_generation, mode,
+                );
             } else {
                 drop(g);
-                self.spawn_background_warm(MacroMode::Raw);
-                self.spawn_background_warm(MacroMode::Bound);
+                return self.queue_discovery(id, ctx, mock, (armed, arm_generation));
             }
-        } else {
-            self.spawn_background_warm(MacroMode::Raw);
-            self.spawn_background_warm(MacroMode::Bound);
         }
-        if !self.available() {
-            "[python runtime unavailable]".into()
-        } else {
-            format!("macro '{id}' — sidecar warming, press again")
+        match self.published_definition(id) {
+            PublishedDefinition::Found(mode, generation) => {
+                self.queue_registered(id, ctx, mock, (armed, arm_generation), generation, mode)
+            }
+            PublishedDefinition::Missing => {
+                self.queue_discovery(id, ctx, mock, (armed, arm_generation))
+            }
+            PublishedDefinition::Busy => format!("macro '{id}' dispatch busy; press again"),
         }
+    }
+
+    fn queue_registered(
+        &self,
+        id: &str,
+        ctx: &crate::macros::context::Context,
+        mock: bool,
+        authority: (bool, u64),
+        expected_generation: u64,
+        mode: MacroMode,
+    ) -> String {
+        let (armed, arm_generation) = authority;
+        if self.enqueue_queued_fire(QueuedFireKind::Registered {
+            id: id.to_string(),
+            ctx: ctx.clone(),
+            mock,
+            armed,
+            arm_generation,
+            expected_generation,
+            mode,
+        }) {
+            format!("macro '{id}' queued")
+        } else {
+            format!("macro '{id}' queue full")
+        }
+    }
+
+    fn queue_discovery(
+        &self,
+        id: &str,
+        ctx: &crate::macros::context::Context,
+        mock: bool,
+        authority: (bool, u64),
+    ) -> String {
+        if validate_macro_id(id).is_err() {
+            return format!("macro '{id}' is not registered");
+        }
+        let (armed, arm_generation) = authority;
+        if self.enqueue_queued_fire(QueuedFireKind::Discover {
+            id: id.to_string(),
+            ctx: ctx.clone(),
+            mock,
+            armed,
+            arm_generation,
+        }) {
+            format!("macro '{id}' discovery queued")
+        } else {
+            format!("macro '{id}' queue full")
+        }
+    }
+
+    fn enqueue_queued_fire(&self, kind: QueuedFireKind) -> bool {
+        let Some(slot) = QueueSlot::claim() else { return false };
+        let item = QueuedFire { _slot: slot, kind };
+        let Some(tx) = crate::worker::service_sender(
+            &MACRO_FIRE_SERVICE,
+            "macro-fire-service",
+            |rx| crate::worker::drain(rx, "macro-fire-service", |item: QueuedFire| {
+                let QueuedFire { _slot, kind } = item;
+                macro_host().dispatch_queued_fire(kind);
+                drop(_slot);
+            }),
+        ) else { return false };
+        tx.send(item).is_ok()
+    }
+
+    fn push_log_line(&self, line: String) {
+        let mut log = self.log.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if log.len() >= LOG_RING {
+            log.pop_front();
+        }
+        log.push_back(line);
+    }
+
+    fn dispatch_queued_fire(&self, fire: QueuedFireKind) {
+        let (id, mode, frame, failure_prefix) = match fire {
+            QueuedFireKind::Registered {
+                id,
+                ctx,
+                mock,
+                armed,
+                arm_generation,
+                expected_generation,
+                mode,
+            } => {
+                let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                self.sync_manifest(&mut g);
+                let Some(active_mode) = g.modes.get(&id).copied() else {
+                    drop(g);
+                    self.push_log_line(format!("[macro] '{id}' is not registered"));
+                    return;
+                };
+                let generation = g.generations.get(&id).copied().unwrap_or(0);
+                if !queued_definition_is_current(
+                    mode, expected_generation, active_mode, generation,
+                ) {
+                    drop(g);
+                    self.push_log_line(format!(
+                        "[macro] '{id}' queued for generation {expected_generation} refused after revision {generation}"
+                    ));
+                    return;
+                }
+                let authorized = self.fire_authorized(armed, arm_generation);
+                let frame = json!({
+                    "t": "fire",
+                    "id": id,
+                    "generation": generation,
+                    "ctx": ctx_json(&ctx, authorized),
+                    "options": load_option_values(&id),
+                    "mock": mock,
+                    "authorized": authorized,
+                    "arm_generation": arm_generation,
+                });
+                (id, mode, frame, "queued fire")
+            }
+            QueuedFireKind::Discover {
+                id,
+                ctx,
+                mock,
+                armed,
+                arm_generation,
+            } => {
+                let _mutation = self
+                    .mutations
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                self.sync_manifest(&mut g);
+                let Some(mode) = g.modes.get(&id).copied() else {
+                    drop(g);
+                    self.push_log_line(format!("[macro] '{id}' is not registered"));
+                    return;
+                };
+                let generation = g.generations.get(&id).copied().unwrap_or(0);
+                let authorized = self.fire_authorized(armed, arm_generation);
+                let frame = json!({
+                    "t": "fire",
+                    "id": id,
+                    "generation": generation,
+                    "ctx": ctx_json(&ctx, authorized),
+                    "options": load_option_values(&id),
+                    "mock": mock,
+                    "authorized": authorized,
+                    "arm_generation": arm_generation,
+                });
+                (id, mode, frame, "discovered fire")
+            }
+            QueuedFireKind::Source {
+                id,
+                source,
+                ctx,
+                mock,
+                armed,
+                arm_generation,
+                mode,
+            } => {
+                let authorized = self.fire_authorized(armed, arm_generation);
+                let options = if validate_macro_id(&id).is_ok() {
+                    load_option_values(&id)
+                } else {
+                    json!({})
+                };
+                let frame = json!({
+                    "t": "fire_source",
+                    "id": id,
+                    "source": source,
+                    "ctx": ctx_json(&ctx, authorized),
+                    "options": options,
+                    "mock": mock,
+                    "authorized": authorized,
+                    "arm_generation": arm_generation,
+                });
+                (id, mode, frame, "queued source fire")
+            }
+        };
+
+        let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Err(e) = self.ensure_lane_locked(&mut g, mode) {
+            drop(g);
+            self.push_log_line(format!("[macro] '{id}' could not start: {e}"));
+            return;
+        }
+        let s = lane_session_mut(&mut g, mode).expect("ensured macro lane");
+        let rid = s.shared.next_rid.fetch_add(1, Ordering::Relaxed);
+        let mut frame = frame;
+        frame["rid"] = json!(rid);
+        match self.send_fire(s, &frame) {
+            FireSend::Sent => return,
+            FireSend::Full => {
+                drop(g);
+                self.push_log_line(format!(
+                    "[macro] '{id}' {failure_prefix} dropped: sidecar input queue full"
+                ));
+                return;
+            }
+            FireSend::Dead => {}
+        }
+        let doomed = lane_take(&mut g, mode);
+        drop(g);
+        drop(doomed);
+        self.push_log_line(format!("[macro] '{id}' {failure_prefix} dropped: sidecar died"));
     }
 
     /// Run a macro and WAIT for its result (bounded by [`FIRE_BUDGET`]) — the GUI "test run".
@@ -1035,7 +1775,7 @@ impl MacroHost {
             if let Err(e) = self.ensure_lane_locked(&mut g, mode) {
                 return format!("[{e}]");
             }
-            let armed = self.armed.load(Ordering::SeqCst);
+            let (armed, arm_generation) = self.arm_snapshot(false);
             let generation = g.generations.get(id).copied().unwrap_or(0);
             let s = lane_session_mut(&mut g, mode).unwrap();
             let rid = s.shared.next_rid.fetch_add(1, Ordering::Relaxed);
@@ -1046,12 +1786,23 @@ impl MacroHost {
             // freeze one side or the other of this exact window.
             crate::failpoint!("macro_host.pending_insert.before");
             shared.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(rid, tx);
-            let ok = s.send(&json!({"t": "fire", "rid": rid, "id": id, "generation": generation, "ctx": ctx_json(ctx, armed), "options": load_option_values(id)}));
+            let ok = self.send_fire(s, &json!({
+                "t": "fire", "rid": rid, "id": id, "generation": generation,
+                "ctx": ctx_json(ctx, armed), "options": load_option_values(id),
+                "authorized": armed, "arm_generation": arm_generation,
+            }));
             (rx, shared, rid, ok)
         };
-        if !sent {
-            shared.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&rid);
-            return "[sidecar pipe broken]".into();
+        match sent {
+            FireSend::Sent => {}
+            FireSend::Full => {
+                shared.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&rid);
+                return "[sidecar fire queue full]".into();
+            }
+            FireSend::Dead => {
+                shared.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&rid);
+                return "[sidecar pipe broken]".into();
+            }
         }
         match rx.recv_timeout(budget) {
             Ok(v) if v.get("ok").and_then(Value::as_bool) == Some(true) => v
@@ -1113,13 +1864,52 @@ impl MacroHost {
     }
 
     fn sync_manifest(&self, g: &mut Inner) {
-        for (id, src) in scan_macro_dir() {
+        // Skip the union across both sides of the filesystem scan. The first snapshot catches a
+        // rollback that restores/removes its temporary durable source during the scan; the second
+        // catches a save that publishes while the directory is being read. The caller holds
+        // `inner`, so a transaction that starts after the first snapshot cannot reach its disk write.
+        let pending_before = self
+            .pending_mutations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let scanned = scan_macro_dir();
+        let mut pending = self
+            .pending_mutations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        pending.extend(pending_before);
+        for (id, src) in scanned {
+            if pending.contains(&id) {
+                continue;
+            }
             if !g.manifest.contains_key(&id) {
                 let Ok(mode) = mode_from_source(&src) else {
                     eprintln!("[macro] '{id}' has invalid execution policy; skipped until edited");
                     continue;
                 };
                 let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+                let lane_is_live = lane_session(g, mode)
+                    .map(|s| {
+                        let state = s.shared.state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        state.warm && !state.dead
+                    })
+                    .unwrap_or(false);
+                if lane_is_live {
+                    match self.register_live_definition(g, &id, &src, generation, mode) {
+                        Ok(options) => {
+                            g.options.insert(id.clone(), options.clone());
+                            seed_option_defaults(&id, &options);
+                        }
+                        Err(e) => {
+                            self.push_log_line(format!("[macro] '{id}' did not load: {e}"));
+                            continue;
+                        }
+                    }
+                }
                 g.manifest.insert(id.clone(), src);
                 g.modes.insert(id.clone(), mode);
                 g.generations.insert(id, generation);
@@ -1135,6 +1925,71 @@ impl MacroHost {
                         }
                     }
                 }
+            }
+        }
+        let mut published = self.published
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (id, mode) in &g.modes {
+            if let Some(generation) = g.generations.get(id) {
+                published.insert(id.clone(), (*mode, *generation));
+            }
+        }
+    }
+
+    fn register_live_definition(
+        &self,
+        g: &mut Inner,
+        id: &str,
+        source: &str,
+        generation: u64,
+        mode: MacroMode,
+    ) -> Result<Value, String> {
+        let Some(s) = lane_session_mut(g, mode) else {
+            return Err(format!("{} macro sidecar is not running", mode.label()));
+        };
+        let rid = s.shared.next_rid.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = channel();
+        let shared = Arc::clone(&s.shared);
+        let writer = s.writer.clone();
+        shared
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(rid, tx);
+        if !s.send(&json!({
+            "t": "register",
+            "rid": rid,
+            "id": id,
+            "source": source,
+            "generation": generation,
+        })) {
+            shared
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&rid);
+            return Err("sidecar registration pipe failed".into());
+        }
+        match rx.recv_timeout(FIRE_BUDGET) {
+            Ok(reply) if reply.get("ok").and_then(Value::as_bool) == Some(true) => {
+                Ok(reply.get("options").cloned().unwrap_or_else(|| json!({})))
+            }
+            Ok(reply) => Err(reply
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown error")
+                .to_string()),
+            Err(_) => {
+                shared
+                    .pending
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&rid);
+                if let Some(writer) = writer {
+                    writer.state.fail();
+                }
+                Err("sidecar registration timed out".into())
             }
         }
     }
@@ -1159,12 +2014,7 @@ impl MacroHost {
                 mode.label()
             ));
         }
-        let session = match spawn_session(
-            mode,
-            self.armed.load(Ordering::SeqCst),
-            self.log.clone(),
-            self.beacon.clone(),
-        ) {
+        let session = match spawn_session(mode, self.log.clone(), self.beacon.clone()) {
             Ok(s) => s,
             Err(e) => {
                 lane_breaker_mut(g, mode).record_crash();
@@ -1174,49 +2024,77 @@ impl MacroHost {
         lane_breaker_mut(g, mode).reset();
 
         let mut sess = session;
-        for (id, src) in &g.manifest {
-            if g.modes.get(id).copied() != Some(mode) {
-                continue;
-            }
-            let generation = g.generations.get(id).copied().unwrap_or(0);
+        {
+            let mut links = self.arm_links
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *links.slot_mut(mode) = Some(ArmLink {
+                writer: Arc::downgrade(sess.writer.as_ref().expect("live writer")),
+                shared: Arc::downgrade(&sess.shared),
+                process: Arc::downgrade(&sess.process),
+            });
+        }
+        let (armed, generation) = self.arm_snapshot(false);
+        if !synchronize_arm(
+            sess.writer.as_ref().expect("live writer"),
+            &sess.shared,
+            armed,
+            generation,
+            ARM_ACK_TIMEOUT,
+            || sess.process.terminate(),
+        ) {
+            return Err(format!("{} macro sidecar arm sync failed", mode.label()));
+        }
+        let registrations: Vec<_> = g.manifest
+            .iter()
+            .filter(|(id, _)| g.modes.get(*id).copied() == Some(mode))
+            .map(|(id, src)| {
+                (id.clone(), src.clone(), g.generations.get(id).copied().unwrap_or(0))
+            })
+            .collect();
+        for (id, src, generation) in registrations {
             let rid = sess.shared.next_rid.fetch_add(1, Ordering::Relaxed);
-            let _ = sess.send(&json!({
+            let (tx, rx) = channel();
+            sess.shared.pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(rid, tx);
+            if !sess.send(&json!({
                 "t": "register", "rid": rid, "id": id, "source": src, "generation": generation,
-            }));
+            })) {
+                sess.shared.pending
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&rid);
+                return Err(format!("{} macro sidecar registration pipe failed", mode.label()));
+            }
+            match rx.recv_timeout(FIRE_BUDGET) {
+                Ok(reply) if reply.get("ok").and_then(Value::as_bool) == Some(true) => {
+                    let options = reply.get("options").cloned().unwrap_or_else(|| json!({}));
+                    g.options.insert(id.clone(), options.clone());
+                    seed_option_defaults(&id, &options);
+                }
+                Ok(reply) => {
+                    g.options.remove(&id);
+                    self.push_log_line(format!(
+                        "[macro] '{id}' did not load: {}",
+                        reply.get("error").and_then(Value::as_str).unwrap_or("unknown error")
+                    ));
+                }
+                Err(_) => {
+                    sess.shared.pending
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(&rid);
+                    sess.process.terminate();
+                    sess.shared.mark_dead();
+                    return Err(format!("{} macro sidecar registration timed out", mode.label()));
+                }
+            }
         }
         crate::failpoint!("macro_host.ensure_locked.before_replace");
         lane_set(g, mode, sess);
         Ok(())
-    }
-
-    fn warm_latch(&self, mode: MacroMode) -> &AtomicBool {
-        match mode {
-            MacroMode::Raw => &self.warm_in_flight,
-            MacroMode::Bound => &self.bound_warm_in_flight,
-        }
-    }
-
-    fn spawn_background_warm(&self, mode: MacroMode) {
-        let me: &'static MacroHost = macro_host();
-        if me
-            .warm_latch(mode)
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return;
-        }
-        let label = match mode {
-            MacroMode::Raw => "macro-host-warm-raw",
-            MacroMode::Bound => "macro-host-warm-bound",
-        };
-        crate::worker::spawn_guarded(
-            label,
-            move || me.warm_latch(mode).store(false, Ordering::Release),
-            move || {
-                let mut g = me.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                let _ = me.ensure_lane_locked(&mut g, mode);
-            },
-        );
     }
 
 }
@@ -1226,7 +2104,6 @@ impl MacroHost {
 /// `beacon` is the Macro Host-level prompt-listener slot the reader routes ask/notify frames to.
 fn spawn_session(
     mode: MacroMode,
-    armed: bool,
     log: LogRing,
     beacon: BeaconSlot,
 ) -> Result<Session, String> {
@@ -1254,7 +2131,7 @@ fn spawn_session(
         crate::prof::SIDECAR_PID.store(child.id(), std::sync::atomic::Ordering::Relaxed);
     }
 
-    let stdin = Arc::new(Mutex::new(child.stdin.take().ok_or("no child stdin")?));
+    let stdin = child.stdin.take().ok_or("no child stdin")?;
     let stdout = child.stdout.take().ok_or("no child stdout")?;
     let stderr = child.stderr.take().ok_or("no child stderr")?;
 
@@ -1266,20 +2143,48 @@ fn spawn_session(
         next_rid: AtomicU64::new(1),
     });
 
+    let process = Arc::new(ProcessControl { child: Mutex::new(child) });
+    let frames = Arc::new(PipeQueue::new(PIPE_QUEUE));
+    let (wake_tx, wake_rx) = sync_channel(1);
+    let writer_state = Arc::new(PipeWriterState {
+        arm_state: AtomicU64::new(0),
+        arm_requested: AtomicBool::new(false),
+        alive: AtomicBool::new(true),
+        shared: Arc::downgrade(&shared),
+        process: Arc::downgrade(&process),
+    });
+    let writer = Arc::new(PipeWriter {
+        frames: Arc::clone(&frames),
+        wake: wake_tx,
+        state: Arc::clone(&writer_state),
+    });
+    let writer_thread = {
+        let name = match mode {
+            MacroMode::Raw => "macro-host-writer-raw",
+            MacroMode::Bound => "macro-host-writer-bound",
+        };
+        crate::worker::spawn_named(name, move || {
+            pipe_writer_loop(stdin, writer_state, frames, wake_rx)
+        }).ok()
+    };
+    if writer_thread.is_none() {
+        process.terminate();
+        return Err("python sidecar writer thread could not start".into());
+    }
+
     // reader thread: protocol frames off child STDOUT. Keep its handle so Drop can join it. It
-    // holds the stdin WEAKLY so a dropped Session's pipe really closes (the reader must not keep
-    // the child's stdin alive past the session's death).
+    // holds the writer WEAKLY so a dropped Session really closes its input channel.
     // Session owns the reader/logger handles and joins them on Drop, so both route through the
     // handle-returning primitive.
     let reader = {
         let shared = shared.clone();
-        let stdin_weak = Arc::downgrade(&stdin);
+        let writer_weak = Arc::downgrade(&writer);
         let name = match mode {
             MacroMode::Raw => "macro-host-reader-raw",
             MacroMode::Bound => "macro-host-reader-bound",
         };
         crate::worker::spawn_named(name, move || {
-            reader_loop(stdout, shared, beacon, stdin_weak, mode)
+            reader_loop(stdout, shared, beacon, writer_weak, mode)
         })
         .ok()
     };
@@ -1314,6 +2219,15 @@ fn spawn_session(
             .ok()
     };
 
+    let sess = Session {
+        process,
+        writer: Some(writer),
+        shared: Arc::clone(&shared),
+        writer_thread,
+        reader,
+        logger,
+    };
+
     // wait for warm (the `ready` frame the reader sets), bounded.
     {
         let mut st = shared.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1328,21 +2242,10 @@ fn spawn_session(
         }
         if !st.warm {
             drop(st);
-            let _ = child.kill();
-            let _ = child.wait();
+            sess.process.terminate();
             return Err("python sidecar did not come ready".into());
         }
     }
-
-    let mut sess = Session {
-        child,
-        stdin,
-        shared,
-        reader,
-        logger,
-    };
-    // push the current arm state before any fire can be accepted.
-    let _ = sess.send(&json!({"t": "armed", "on": armed}));
     Ok(sess)
 }
 
@@ -1507,12 +2410,18 @@ fn run_cross_invoke(
     target: &str,
     arg: &Value,
     mock: bool,
+    accepted_authority: bool,
+    arm_generation: u64,
 ) -> (bool, String) {
     if validate_macro_id(target).is_err() {
         return (true, json!({"found": false}).to_string());
     }
     let wait = arg.get("wait").and_then(Value::as_bool).unwrap_or(true);
-    let ctx = arg.get("ctx").cloned().unwrap_or_else(|| json!({}));
+    let authorized = macro_host().fire_authorized(accepted_authority && !mock, arm_generation);
+    let mut ctx = arg.get("ctx").cloned().unwrap_or_else(|| json!({}));
+    if let Some(ctx) = ctx.as_object_mut() {
+        ctx.insert("armed".into(), json!(authorized));
+    }
     let options = arg.get("options").cloned().unwrap_or_else(|| json!({}));
 
     let host = macro_host();
@@ -1542,7 +2451,7 @@ fn run_cross_invoke(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .insert(rid, tx);
-            let sent = s.send(&json!({
+            let sent = host.send_fire(s, &json!({
                 "t": "fire",
                 "rid": rid,
                 "id": target,
@@ -1550,10 +2459,12 @@ fn run_cross_invoke(
                 "ctx": ctx,
                 "options": options,
                 "mock": mock,
+                "authorized": authorized,
+                "arm_generation": arm_generation,
             }));
             (Some(rx), shared, rid, sent)
         } else {
-            let sent = s.send(&json!({
+            let sent = host.send_fire(s, &json!({
                 "t": "fire",
                 "rid": Value::Null,
                 "id": target,
@@ -1561,13 +2472,15 @@ fn run_cross_invoke(
                 "ctx": ctx,
                 "options": options,
                 "mock": mock,
+                "authorized": authorized,
+                "arm_generation": arm_generation,
             }));
             (None, shared, rid, sent)
         }
     };
 
     let (rx, shared, rid, sent) = prepared;
-    if !sent {
+    if sent != FireSend::Sent {
         if rx.is_some() {
             shared
                 .pending
@@ -1575,11 +2488,15 @@ fn run_cross_invoke(
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .remove(&rid);
         }
-        host.retire_control_session(&shared);
-        return (
-            false,
-            json!({"found": true, "error": "target sidecar pipe broken"}).to_string(),
-        );
+        let error = match sent {
+            FireSend::Full => "target sidecar fire queue full",
+            FireSend::Dead => {
+                host.retire_control_session(&shared);
+                "target sidecar pipe broken"
+            }
+            FireSend::Sent => unreachable!(),
+        };
+        return (false, json!({"found": true, "error": error}).to_string());
     }
     let Some(rx) = rx else {
         return (true, json!({"found": true, "queued": true}).to_string());
@@ -1618,7 +2535,15 @@ fn run_cross_invoke(
     }
 }
 
-fn run_act(_mode: MacroMode, _macro_id: &str, verb: &str, arg: &Value, mock: bool) -> (bool, String) {
+fn run_act(
+    _mode: MacroMode,
+    _macro_id: &str,
+    verb: &str,
+    arg: &Value,
+    mock: bool,
+    accepted_authority: bool,
+    arm_generation: u64,
+) -> (bool, String) {
     use crate::action::{Direction, Intent};
     use crate::capability as cap;
 
@@ -1654,7 +2579,9 @@ fn run_act(_mode: MacroMode, _macro_id: &str, verb: &str, arg: &Value, mock: boo
         let Some(target) = arg.get("id").and_then(Value::as_str) else {
             return (false, json!({"found": false}).to_string());
         };
-        return run_cross_invoke(_mode, target, arg, mock);
+        return run_cross_invoke(
+            _mode, target, arg, mock, accepted_authority, arm_generation,
+        );
     }
 
     // The host is the authority boundary. Python's helper-side gate is useful fast feedback, but a
@@ -1664,7 +2591,11 @@ fn run_act(_mode: MacroMode, _macro_id: &str, verb: &str, arg: &Value, mock: boo
         verb,
         "active_profile" | "scroll_stage" | "battery" | "current_dpi" | "clipboard_get" | "obs_get" | "signal"
     );
-    if !read_only && (mock || !crate::action::input_armed()) {
+    if !read_only && (
+        mock
+        || !macro_host().fire_authorized(accepted_authority, arm_generation)
+        || !crate::action::input_armed()
+    ) {
         return (false, "[disarmed]".into());
     }
 
@@ -1848,13 +2779,13 @@ fn run_act(_mode: MacroMode, _macro_id: &str, verb: &str, arg: &Value, mock: boo
 }
 
 /// Read protocol frames off the sidecar's stdout and route them. On EOF/error -> mark the link
-/// dead (which wakes `ensure`'s warm-wait and fails every in-flight waiter). `stdin` is the weak
-/// write-end used ONLY for the no-UI prompt auto-answer (so an asking macro is never stranded).
+/// dead (which wakes `ensure`'s warm-wait and fails every in-flight waiter). `writer` is weak so
+/// protocol replies cannot prolong the session lifetime.
 fn reader_loop(
     stdout: std::process::ChildStdout,
     shared: Arc<Shared>,
     beacon: BeaconSlot,
-    stdin: Weak<Mutex<ChildStdin>>,
+    writer: Weak<PipeWriter>,
     mode: MacroMode,
 ) {
     let mut r = BufReader::new(stdout);
@@ -1895,6 +2826,17 @@ fn reader_loop(
                 st.warm = true;
                 st.dead = false;
                 shared.cv.notify_all();
+            }
+            Some("armed_ack") => {
+                if let Some(generation) = v.get("generation").and_then(Value::as_u64) {
+                    let mut state = shared.state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    state.arm_ack_generation = Some(
+                        state.arm_ack_generation.map_or(generation, |old| old.max(generation))
+                    );
+                    shared.cv.notify_all();
+                }
             }
             Some("result" | "checked" | "pong" | "registered" | "prepared" | "committed" | "parsed") => {
                 // Hand the frame to its waiter if one is registered. A `result` with NO waiter —
@@ -1976,9 +2918,8 @@ fn reader_loop(
                 if !taken {
                     // no UI listening: dismiss NOW so the macro's ask returns its default instead
                     // of hanging until timeout. The auto-answer goes straight down the pipe.
-                    if let Some(stdin) = stdin.upgrade() {
-                        let _ = send_frame(
-                            &mut *stdin.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+                    if let Some(writer) = writer.upgrade() {
+                        let _ = writer.send(
                             &json!({"t": "answer", "pid": pid, "choice": Value::Null}),
                         );
                     }
@@ -2021,23 +2962,36 @@ fn reader_loop(
                 let arg = v.get("arg").cloned().unwrap_or(Value::Null);
                 let macro_id = v.get("id").and_then(Value::as_str).unwrap_or("?").to_string();
                 let mock = v.get("mock").and_then(Value::as_bool).unwrap_or(false);
-                let stdin = stdin.clone();
+                let accepted_authority = v
+                    .get("authorized")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let arm_generation = v
+                    .get("arm_generation")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let writer = writer.clone();
                 // The `act_result` frame is MANDATORY — the macro blocks on it. The worker only
                 // RUNS the verb and returns its outcome; `done` sends the frame exactly once,
                 // whether the verb completed, panicked, or the thread was refused (synthesizing a
                 // failure result in the latter cases) — so the macro can never hang waiting.
                 crate::worker::spawn_notify(
                     "macro-host-act",
-                    move || run_act(mode, &macro_id, &verb, &arg, mock),
+                    move || run_act(
+                        mode,
+                        &macro_id,
+                        &verb,
+                        &arg,
+                        mock,
+                        accepted_authority,
+                        arm_generation,
+                    ),
                     move |outcome| {
                         let (ok, msg) = outcome.unwrap_or_else(|| {
                             (false, "act worker could not run (thread refused or panicked)".into())
                         });
-                        if let Some(stdin) = stdin.upgrade() {
-                            let _ = send_frame(
-                                &mut *stdin
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                        if let Some(writer) = writer.upgrade() {
+                            let _ = writer.send(
                                 &json!({"t": "act_result", "rid": rid, "ok": ok, "msg": msg}),
                             );
                         }
@@ -2584,9 +3538,268 @@ mod tests {
             "clipboard_set",
             &json!("must-not-land"),
             false,
+            false,
+            0,
         );
         assert!(!ok, "forged effect frame bypassed the host authority check");
         assert_eq!(msg, "[disarmed]");
+    }
+
+    #[test]
+    fn fire_authority_expires_permanently_at_the_next_gate_generation() {
+        let host = MacroHost::new();
+        host.arm_state.store(3, Ordering::SeqCst); // armed, generation 1
+        let accepted_generation = host.arm_snapshot(false).1;
+        assert!(host.fire_authorized(true, accepted_generation));
+
+        host.arm_state.store(4, Ordering::SeqCst); // disarmed, generation 2
+        assert!(
+            !host.fire_authorized(true, accepted_generation),
+            "an off/on transition must not revive previously accepted work"
+        );
+        assert!(!host.fire_authorized(false, host.arm_snapshot(false).1));
+    }
+
+    #[test]
+    fn blocked_pipe_cannot_block_safe_and_missing_ack_retires_authority() {
+        struct BlockingWrite {
+            entered: Sender<()>,
+            gate: Arc<(Mutex<bool>, Condvar)>,
+        }
+        impl Write for BlockingWrite {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                let _ = self.entered.send(());
+                let (lock, cv) = &*self.gate;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    released = cv.wait(released).unwrap();
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+
+        let shared = Arc::new(Shared {
+            pending: Mutex::new(HashMap::new()),
+            state: Mutex::new(LinkState::default()),
+            cv: Condvar::new(),
+            log: Arc::new(Mutex::new(VecDeque::new())),
+            next_rid: AtomicU64::new(1),
+        });
+        let frames = Arc::new(PipeQueue::new(1));
+        let (wake_tx, wake_rx) = sync_channel(1);
+        let state = Arc::new(PipeWriterState {
+            arm_state: AtomicU64::new(3), // armed, generation 1
+            arm_requested: AtomicBool::new(false),
+            alive: AtomicBool::new(true),
+            shared: Arc::downgrade(&shared),
+            process: Weak::new(),
+        });
+        let writer = Arc::new(PipeWriter {
+            frames: Arc::clone(&frames),
+            wake: wake_tx,
+            state: Arc::clone(&state),
+        });
+        let (entered_tx, entered_rx) = channel();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let thread = {
+            let state = Arc::clone(&state);
+            let gate = Arc::clone(&gate);
+            crate::worker::spawn_named("test-blocked-macro-writer", move || {
+                pipe_writer_loop(BlockingWrite { entered: entered_tx, gate }, state, frames, wake_rx)
+            }).unwrap()
+        };
+        assert!(writer.send(&json!({"t": "register", "source": "x"}))); // occupy write_all
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let retired = Arc::new(AtomicBool::new(false));
+        let retired_for_timeout = Arc::clone(&retired);
+        let started = Instant::now();
+        assert!(!synchronize_arm(
+            &writer,
+            &shared,
+            false,
+            2,
+            Duration::from_millis(20),
+            move || retired_for_timeout.store(true, Ordering::SeqCst),
+        ));
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert!(retired.load(Ordering::SeqCst));
+        assert!(shared.state.lock().unwrap().dead);
+
+        let (lock, cv) = &*gate;
+        *lock.lock().unwrap() = true;
+        cv.notify_all();
+        drop(writer);
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn fire_backpressure_drops_newest_without_retiring_the_sidecar() {
+        let shared = Arc::new(Shared {
+            pending: Mutex::new(HashMap::new()),
+            state: Mutex::new(LinkState::default()),
+            cv: Condvar::new(),
+            log: Arc::new(Mutex::new(VecDeque::new())),
+            next_rid: AtomicU64::new(1),
+        });
+        let frames = Arc::new(PipeQueue::new(1));
+        let (wake_tx, _wake_rx) = sync_channel(1);
+        let state = Arc::new(PipeWriterState {
+            arm_state: AtomicU64::new(0),
+            arm_requested: AtomicBool::new(false),
+            alive: AtomicBool::new(true),
+            shared: Arc::downgrade(&shared),
+            process: Weak::new(),
+        });
+        let writer = PipeWriter { frames, wake: wake_tx, state: Arc::clone(&state) };
+
+        assert_eq!(writer.send_fire(&json!({"t": "fire", "rid": 1})), FireSend::Sent);
+        assert_eq!(writer.send_fire(&json!({"t": "fire", "rid": 2})), FireSend::Full);
+        assert!(state.alive.load(Ordering::Acquire));
+        assert!(!shared.state.lock().unwrap().dead);
+    }
+
+    #[test]
+    fn arm_generation_is_written_before_the_next_fire() {
+        #[derive(Clone)]
+        struct CaptureWrite(Arc<Mutex<Vec<u8>>>);
+        impl Write for CaptureWrite {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+
+        let shared = Arc::new(Shared {
+            pending: Mutex::new(HashMap::new()),
+            state: Mutex::new(LinkState::default()),
+            cv: Condvar::new(),
+            log: Arc::new(Mutex::new(VecDeque::new())),
+            next_rid: AtomicU64::new(1),
+        });
+        let frames = Arc::new(PipeQueue::new(4));
+        let (wake_tx, wake_rx) = sync_channel(1);
+        let state = Arc::new(PipeWriterState {
+            arm_state: AtomicU64::new(0),
+            arm_requested: AtomicBool::new(false),
+            alive: AtomicBool::new(true),
+            shared: Arc::downgrade(&shared),
+            process: Weak::new(),
+        });
+        let writer = Arc::new(PipeWriter {
+            frames: Arc::clone(&frames),
+            wake: wake_tx,
+            state: Arc::clone(&state),
+        });
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let thread = {
+            let bytes = Arc::clone(&bytes);
+            crate::worker::spawn_named("test-arm-before-fire-writer", move || {
+                pipe_writer_loop(CaptureWrite(bytes), state, frames, wake_rx)
+            }).unwrap()
+        };
+
+        assert!(writer.send_arm(true, 1));
+        assert!(writer.send(&json!({"t": "fire", "arm_generation": 1})));
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let frames = loop {
+            let snapshot = bytes.lock().unwrap().clone();
+            let mut parsed = Vec::new();
+            let mut cursor = 0usize;
+            while cursor + 4 <= snapshot.len() {
+                let len = u32::from_le_bytes(snapshot[cursor..cursor + 4].try_into().unwrap()) as usize;
+                if cursor + 4 + len > snapshot.len() { break }
+                parsed.push(serde_json::from_slice::<Value>(
+                    &snapshot[cursor + 4..cursor + 4 + len]
+                ).unwrap());
+                cursor += 4 + len;
+            }
+            if parsed.len() >= 2 || Instant::now() >= deadline {
+                break parsed;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        assert_eq!(frames.first().and_then(|v| v.get("t")).and_then(Value::as_str), Some("armed"));
+        assert_eq!(frames.first().and_then(|v| v.get("generation")).and_then(Value::as_u64), Some(1));
+        assert_eq!(frames.get(1).and_then(|v| v.get("t")).and_then(Value::as_str), Some("fire"));
+
+        drop(writer);
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn queued_definition_requires_the_same_generation_and_authority_domain() {
+        assert!(queued_definition_is_current(
+            MacroMode::Bound, 7, MacroMode::Bound, 7,
+        ));
+        assert!(!queued_definition_is_current(
+            MacroMode::Bound, 7, MacroMode::Bound, 8,
+        ));
+        assert!(!queued_definition_is_current(
+            MacroMode::Bound, 7, MacroMode::Raw, 7,
+        ));
+    }
+
+    #[test]
+    fn published_lookup_never_mistakes_contention_for_a_missing_definition() {
+        let host = MacroHost::new();
+        assert_eq!(
+            host.published_definition("unit_published"),
+            PublishedDefinition::Missing,
+        );
+        host.published.lock().unwrap().insert(
+            "unit_published".into(),
+            (MacroMode::Bound, 11),
+        );
+        let held = host.published.lock().unwrap();
+        assert_eq!(
+            host.published_definition("unit_published"),
+            PublishedDefinition::Busy,
+        );
+        drop(held);
+        assert_eq!(
+            host.published_definition("unit_published"),
+            PublishedDefinition::Found(MacroMode::Bound, 11),
+        );
+    }
+
+    #[test]
+    fn pending_mutation_marker_clears_on_every_exit_path() {
+        let pending = Mutex::new(BTreeSet::new());
+        {
+            let _marker = PendingMutation::begin(&pending, "unit_pending");
+            assert!(pending.lock().unwrap().contains("unit_pending"));
+        }
+        assert!(!pending.lock().unwrap().contains("unit_pending"));
+    }
+
+    #[test]
+    fn queued_registered_fire_is_rejected_after_definition_replacement() {
+        let host = MacroHost::new();
+        let id = "unit_queued_revision";
+        {
+            let mut inner = host.inner.lock().unwrap();
+            inner.manifest.insert(id.into(), "def macro(ctx):\n    return 'new'\n".into());
+            inner.modes.insert(id.into(), MacroMode::Bound);
+            inner.generations.insert(id.into(), 8);
+        }
+        host.dispatch_queued_fire(QueuedFireKind::Registered {
+            id: id.into(),
+            ctx: crate::macros::context::Context::synthetic(None, None, None, None, None),
+            mock: false,
+            armed: false,
+            arm_generation: 0,
+            expected_generation: 7,
+            mode: MacroMode::Raw,
+        });
+        let log = host.drain_log();
+        assert!(
+            log.iter().any(|line| line.contains("refused after revision 8")),
+            "replacement must reject the old trigger before a sidecar starts: {log:?}"
+        );
     }
 
     #[test]
@@ -2675,7 +3888,15 @@ mod tests {
 
     fn death_race_pid(host: &MacroHost) -> u32 {
         let g = host.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        g.bound_session.as_ref().expect("BOUND macro session must be live").child.id()
+        let pid = g.bound_session
+            .as_ref()
+            .expect("BOUND macro session must be live")
+            .process
+            .child
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .id();
+        pid
     }
 
     #[cfg(windows)]

@@ -1,6 +1,6 @@
 ---
 name: neuron-lazy-update
-description: Install, update, roll back, or uninstall neuron (the no-account Razer control app with a Windows app and CLI release; Linux builds from source), drive its `neuron` CLI safely, and answer questions about it. Use when a user asks to install or update neuron, check which version they have, change a device setting through the CLI, fix a neuron problem, or asks how neuron works. A bundled script handles release updates and reports plain status lines.
+description: Install, update, restore a portable update, or uninstall neuron (the no-account Razer control app with a Windows app and CLI release; Linux builds from source), drive its `neuron` CLI safely, and answer questions about it. Use when a user asks to install or update neuron, check which version they have, change a device setting through the CLI, fix a neuron problem, or asks how neuron works. A bundled script handles release updates and reports plain status lines.
 ---
 
 # neuron: install and update
@@ -46,8 +46,9 @@ These are not judgement calls.
 1. **`RESULT: blocked`, or any `FLAG` marked `(STOP)`, means stop.** Show the user the lines. Never
    work around a checksum or attestation failure, and never retry with different flags to get past
    one.
-2. **Never delete the user's config.** Their profiles, bindings and settings sit next to the exes
-   or in `%LOCALAPPDATA%\neuron`. The script never deletes anything, and neither do you.
+2. **Never delete the user's config.** Portable profiles, bindings and settings sit next to the
+   executables; installer-managed config sits in `%LOCALAPPDATA%\neuron`. Update and rollback may
+   replace verified release payload files, but their ownership never extends to runtime config.
 3. **Never do these unless the user asks for that exact thing:** arm input, use `--persist`, run
    `neuron-app.exe --purge-synapse`, pass `-AllowDowngrade`, run a macro file, or file an issue.
    Filing is an offer you make once. Only file after the user has approved the exact text.

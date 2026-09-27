@@ -8,8 +8,8 @@
 //! (bindings.toml, cast.toml, gestures.json, profiles/, devices/auto/, …). The process CWD is
 //! the USER'S directory, not ours: the tray app can be autostarted from System32, and the CLI
 //! runs from whatever shell the user stands in — resolving config against the CWD split the two
-//! binaries into different (often stale or empty) config universes. The stable shared anchor is
-//! the directory containing the current executable, since both exes ship side by side.
+//! binaries into different (often stale or empty) config universes. Installed builds use the
+//! per-user data directory; a packaged portable build carries a marker and uses its own directory.
 //!
 //! `NEURON_RUN_DIR` overrides the anchor explicitly (tests isolate into a temp dir; power users
 //! can pin a config home), consistent with the app's other `NEURON_*` env switches.
@@ -81,17 +81,17 @@ const LIVE_MARKERS: &[&str] = &[
 
 const MIGRATION_MARKER: &str = ".neuron-legacy-migration";
 const MIGRATION_LOCK: &str = ".neuron-legacy-migration.lock";
+const PORTABLE_MARKER: &str = "portable.flag";
 
 /// The directory every runtime-config path is resolved against. User-supplied CLI path arguments
 /// (imports/exports) deliberately do NOT go through here — those stay relative to the user's CWD.
 ///
 /// Resolution order:
 ///   1. `NEURON_RUN_DIR` when set (read per call, so a test can retarget it).
-///   2. The exe's own directory, when that is a legitimate portable home — see
-///      [`portable_home_ok`]. This is the shipped-install case and keeps the tray app and the CLI
-///      (which sit side by side) in ONE config universe.
-///   3. The per-user data dir (`%LOCALAPPDATA%\neuron`), when the exe dir is not a home we may
-///      keep data in — a `Program Files` install we cannot write to, or a cargo build tree.
+///   2. The exe's own directory for a portable package carrying [`PORTABLE_MARKER`], or for a
+///      sandboxed test binary. This keeps a portable app and CLI in one self-contained universe.
+///   3. The per-user data dir (`%LOCALAPPDATA%\neuron` on Windows) for an installed build or a
+///      direct run from a cargo build tree.
 ///
 /// The CWD is never an anchor. It is the user's directory, not ours: the tray app can be
 /// autostarted from System32 and the CLI runs from whatever shell the user stands in, so
@@ -147,9 +147,10 @@ fn portable_home_ok(dir: &Path) -> bool {
     match build_tree_role(dir) {
         Some(BuildTreeRole::Deployed) => false,
         Some(BuildTreeRole::Sandbox) => true,
-        // A normal install. Portable only if we can actually write here — a `Program Files`
-        // install cannot, and silently failing every save is worse than relocating.
-        None => is_writable(dir),
+        // A normal install uses the stable per-user data root even when its binary directory is
+        // writable. Only the portable package opts into beside-the-exe state. This preserves
+        // settings across installer upgrades and keeps an extracted portable copy self-contained.
+        None => dir.join(PORTABLE_MARKER).is_file() && is_writable(dir),
     }
 }
 
@@ -160,6 +161,15 @@ fn portable_home_ok(dir: &Path) -> bool {
 /// cargo builds into — so a user directory that merely happens to be named "target" is not
 /// matched and keeps its portable home.
 fn build_tree_role(dir: &Path) -> Option<BuildTreeRole> {
+    // Cargo keeps test/example/build executables in these conventional leaves even when
+    // CARGO_TARGET_DIR points outside the repository. Recognize them before looking for a nearby
+    // manifest so a test in an external build cache can never fall through to real user config.
+    let leaf_is_scratch = dir
+        .file_name()
+        .is_some_and(|n| matches!(n.to_str(), Some("deps" | "examples" | "build" | "incremental")));
+    if leaf_is_scratch {
+        return Some(BuildTreeRole::Sandbox);
+    }
     let in_build_tree = dir.ancestors().any(|a| {
         a.file_name().is_some_and(|n| n == "target")
             && a.parent()
@@ -168,17 +178,9 @@ fn build_tree_role(dir: &Path) -> Option<BuildTreeRole> {
     if !in_build_tree {
         return None;
     }
-    // Cargo puts throwaway binaries in a named subdirectory of the profile dir; the profile dir
-    // itself holds the real ones. Keyed on the leaf name so cross-compiled layouts
+    // The profile directory itself holds deployed binaries. Cross-compiled layouts
     // (`target/<triple>/release`) classify the same as native ones.
-    let leaf_is_scratch = dir
-        .file_name()
-        .is_some_and(|n| matches!(n.to_str(), Some("deps" | "examples" | "build" | "incremental")));
-    Some(if leaf_is_scratch {
-        BuildTreeRole::Sandbox
-    } else {
-        BuildTreeRole::Deployed
-    })
+    Some(BuildTreeRole::Deployed)
 }
 
 /// Can we create files in `dir`? Probed for real rather than inferred from metadata: on Windows a
@@ -203,12 +205,12 @@ fn user_data_root() -> Option<PathBuf> {
     Some(root)
 }
 
-/// ONE-TIME MIGRATION off a build-tree run root.
+/// ONE-TIME MIGRATION off a legacy beside-the-executable or build-tree run root.
 ///
-/// Before the run root learned to reject cargo build directories, a self-built install kept every
-/// config entry in `target/release` — where a routine `cargo clean` silently destroys profiles,
-/// macros, gestures, and the `backups/` directory that was supposed to be the safety net. This
-/// carries that config forward to the resolved run root the first time the new build starts.
+/// Before v0.1.2, both the Windows installer and self-built binaries kept every config entry beside
+/// the executable. The former now uses the per-user data root; the latter could live under
+/// `target/release`, where `cargo clean` destroys it. This carries either known legacy layout into
+/// the resolved run root the first time the new build starts.
 ///
 /// COPIES rather than moves, deliberately: the old tree stays intact as a de-facto backup, and
 /// `cargo clean` reclaims it later at no cost. Runs only when the destination has NO config of its
@@ -226,8 +228,8 @@ pub fn adopt_legacy_run_root() -> io::Result<Option<(PathBuf, PathBuf)>> {
     if exe == root {
         return Ok(None); // still a portable home — nothing moved
     }
-    if !matches!(build_tree_role(&exe), Some(BuildTreeRole::Deployed)) {
-        return Ok(None); // only the build-tree case is a known-lossy home
+    if matches!(build_tree_role(&exe), Some(BuildTreeRole::Sandbox)) {
+        return Ok(None); // test/example binaries intentionally keep their isolated local state
     }
     let _lock = migration_lock(&root)?;
     let pending = root.join(MIGRATION_MARKER);
@@ -238,11 +240,23 @@ pub fn adopt_legacy_run_root() -> io::Result<Option<(PathBuf, PathBuf)>> {
         if LIVE_MARKERS.iter().any(|e| root.join(e).exists()) {
             return Ok(None); // the destination is already live — never clobber it
         }
-        let Some(legacy) = richest_legacy_home(&exe) else { return Ok(None) };
+        let legacy = match build_tree_role(&exe) {
+            Some(BuildTreeRole::Deployed) => richest_legacy_home(&exe),
+            Some(BuildTreeRole::Sandbox) => None,
+            None => legacy_executable_home(&exe),
+        };
+        let Some(legacy) = legacy else { return Ok(None) };
         legacy
     };
     let carried = migrate_legacy_entries_locked(&root, &legacy, copy_entry)?;
     Ok((carried > 0).then_some((legacy, root)))
+}
+
+fn legacy_executable_home(exe: &Path) -> Option<PathBuf> {
+    LIVE_MARKERS
+        .iter()
+        .any(|entry| exe.join(entry).exists())
+        .then(|| exe.to_path_buf())
 }
 
 fn migration_lock(root: &Path) -> io::Result<File> {
@@ -507,6 +521,11 @@ mod tests {
                 Some(BuildTreeRole::Sandbox),
                 "target/debug/{scratch} holds throwaway binaries — they keep a local sandbox"
             );
+            assert_eq!(
+                build_tree_role(&root.with_file_name("external-cargo-cache").join("debug").join(scratch)),
+                Some(BuildTreeRole::Sandbox),
+                "an external CARGO_TARGET_DIR still keeps its {scratch} binaries sandboxed"
+            );
         }
 
         let _ = std::fs::remove_dir_all(&root);
@@ -527,18 +546,59 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// An unwritable directory is not a portable home — a `Program Files` install must relocate
-    /// rather than silently fail every save.
+    /// A normal writable directory is still an installed-style home. The package marker is the
+    /// explicit portable contract, and the marked directory must also be writable.
     #[test]
-    fn portable_home_needs_a_writable_dir() {
+    fn portable_home_needs_the_package_marker_and_a_writable_dir() {
         let dir = std::env::temp_dir().join(format!("neuron_runroot_w_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        assert!(portable_home_ok(&dir), "a plain writable dir is a valid home");
+        assert!(!portable_home_ok(&dir), "an installed build uses the per-user data root");
+        std::fs::write(dir.join(PORTABLE_MARKER), "portable\n").unwrap();
+        assert!(portable_home_ok(&dir), "the packaged marker opts into beside-the-exe state");
         assert!(
             !portable_home_ok(&dir.join("does-not-exist")),
             "a directory we cannot create files in is never a home"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v011_installer_directory_is_a_legacy_config_home() {
+        let base = std::env::temp_dir().join(format!(
+            "neuron_runroot_v011_install_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("profiles")).unwrap();
+        std::fs::create_dir_all(base.join("macros").join("scripts")).unwrap();
+        std::fs::write(base.join("app.toml"), "profile = 'main'\n").unwrap();
+        std::fs::write(base.join("profiles").join("main.toml"), "name = 'main'\n").unwrap();
+        std::fs::write(
+            base.join("macros").join("scripts").join("daily.py"),
+            "def macro(ctx):\n    return 1\n",
+        )
+        .unwrap();
+
+        assert_eq!(legacy_executable_home(&base), Some(base.clone()));
+        let dest = base.with_file_name(format!(
+            "neuron_runroot_v012_data_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dest);
+        assert!(migrate_legacy_entries(&dest, &base, copy_entry).unwrap() >= 3);
+        assert_eq!(
+            std::fs::read_to_string(dest.join("app.toml")).unwrap(),
+            "profile = 'main'\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest.join("profiles").join("main.toml")).unwrap(),
+            "name = 'main'\n"
+        );
+        assert!(dest.join("macros").join("scripts").join("daily.py").is_file());
+        assert!(!base.join(PORTABLE_MARKER).exists(), "v0.1.1 had no portable marker");
+
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&dest);
     }
 
     /// The migration carries a nested config tree across, and is a NO-OP once the destination has

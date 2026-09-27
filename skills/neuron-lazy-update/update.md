@@ -69,16 +69,18 @@ Read the output as lines:
 
 ## Install (first time)
 
-Install into a per-user directory that is writable without elevation. Neuron keeps config
-beside the binaries there, so the folder remains portable. A protected install directory
-moves config to a second location.
+The Windows setup executable creates an installer-managed copy whose config lives in
+`%LOCALAPPDATA%\neuron`. The update script can also create a marked portable copy whose config
+stays beside its binaries. Both layouts use a per-user program directory by default.
 
 ### Windows
 
-1. Recommend this folder: `%LOCALAPPDATA%\Programs\neuron`. It's per-user and writable, and needs
-   no admin rights.
-2. Don't install under `C:\Program Files`. The user can't write there without admin, and config
-   would end up split across two folders.
+1. Recommend the release setup executable for a normal Windows installation. It uses
+   `%LOCALAPPDATA%\Programs\Neuron` and asks once for administrator approval to provision native
+   Chroma; the app itself remains limited.
+2. Use the update script when the user wants an agent-managed portable copy or already has Neuron.
+   It detects Windows Setup installations and runs the matching verified setup instead of copying
+   ZIP files across the installer's ownership boundary.
 3. Confirm with the user, then run:
 
    ```powershell
@@ -89,10 +91,11 @@ moves config to a second location.
    folder.
 5. **Autostart is optional.** The user can turn on "start with windows" on the SYSTEM page.
    Neuron registers a task for that user at limited privilege; administrator launch is not needed.
-6. Native Chroma shared memory needs the separate protected broker. The current source package
-   carries its binary and installer script; [the setup steps](../../docs/PROTOCOL-HOST.md)
-   require a one-time administrator PowerShell under the same Windows account. REST and OpenRGB
-   work without that step.
+6. Native Chroma shared memory uses a protected broker. Windows asks for administrator approval
+   while setup or the portable updater provisions it; the user does not run a separate command.
+   Setup cancels if approval is declined. A portable copy can continue with REST and OpenRGB. The
+   machine-wide broker belongs to the Windows user that installed it; update and uninstall it from
+   that account.
 
 ### Linux
 
@@ -102,17 +105,22 @@ incomplete on `main`. The updater script remains for a future Linux package.
 
 ## Roll back
 
-If an update went wrong, confirm with the user, then run `-Action rollback` (`--action rollback`
-on Linux). It restores the files from the newest timestamped backup in `.neuron-update-backup` inside
-the install folder. Files that existed before the update are restored; newly shipped paths are
-removed only when the backup manifest records them and their contents have not changed since install.
-User config and files edited after the update are preserved. Backups without a created-files manifest
-are not eligible for rollback because the updater cannot safely identify which new files it owns.
+Rollback depends on the installation kind:
 
-`RESULT: rolled-back` means it's done — read the `installed_version` line above it back to the
-user, because that is the version they are now on. `ROLLBACK_PRESERVED` means a modified or
-user-owned new path was left in place. `RESULT: blocked` with `NO_BACKUP` means no complete supported
-backup is available. The current updater creates a manifest-backed backup on first install too.
+- **Windows Setup:** reinstall the wanted release's setup executable. The updater reports
+  `INSTALLER_ROLLBACK_REQUIRED` instead of mixing ZIP files with Inno Setup's uninstaller and pinned
+  broker helper.
+- **Windows portable:** `-Action rollback` restores payload files that existed before the most recent
+  update from `.neuron-update-backup`. It does not delete paths introduced by that update, and it
+  cannot preserve edits made later to a payload file it restores. Runtime config is outside the
+  shipped payload list and is not in this backup.
+- **Linux portable:** `--action rollback` uses its manifest to remove newly introduced payload paths
+  only when their contents still match the update. It restores older payload files from backup;
+  later edits to those pre-existing payload files are overwritten.
+
+`RESULT: rolled-back` means the portable restore completed. Read the `installed_version` line back
+to the user. `ROLLBACK_PRESERVED` names a new path the Linux updater left in place because it changed.
+`RESULT: blocked` with `NO_BACKUP` means no supported portable backup is available.
 
 ## Admin rights
 
@@ -145,17 +153,9 @@ repo instead: `git pull`, rebuild with `cargo build --release`, then restart neu
 Confirm each step with the user first. Don't delete anything they haven't agreed to lose.
 
 1. The user quits neuron from the tray.
-2. If they ever turned on autostart, remove its scheduled task from a terminal under the same
-   user account. The historical task name is retained for migration:
-
-   ```powershell
-   schtasks /delete /tn "Neuron (elevated tray)" /f
-   ```
-
-   If an older administrator-created task denies removal, the user may need an administrator
-   terminal for this deletion only. Do not launch the app elevated to work around it.
-
-3. Delete the install folder. **This deletes their config too**, because it lives in the same
+2. Run the packaged uninstaller when available. It requests administrator approval to remove the
+   protected Chroma broker plus the current and historical autostart tasks.
+3. For a portable copy, delete the install folder. **This deletes their config too**, because it lives in the same
    folder. Ask whether they want to keep a copy of the `profiles` folder and `*.toml` files first.
 4. If `%LOCALAPPDATA%\neuron` exists, it holds config as well. Ask before deleting it.
 
@@ -177,8 +177,12 @@ from the build directory; ask before removing either.
 | `TASK_ELSEWHERE` | autostart points at a different neuron folder | ask which install they mean |
 | `UNSAFE_STARTUP_TASK` | an older task can start neuron elevated at sign-in; update stops before copying | see **Admin rights**, then rerun the updater |
 | `STARTUP_TASK_QUERY_FAILED` | the startup task's privilege level could not be read | resolve the task query before updating |
-| `CHROMA_BROKER_OUTDATED` | an installed protected broker differs from the packaged broker | rerun the broker setup in [the host guide](../../docs/PROTOCOL-HOST.md) under the same account |
-| `CHROMA_BROKER_CHECK_FAILED` | the installed broker could not be compared | check the broker installation before claiming native Chroma works |
+| `CHROMA_BROKER_SETUP_FAILED` | automatic protected broker setup was declined or failed | rerun the installer or updater to retry; REST still works |
+| `CHROMA_BROKER_OTHER_USER` | the machine-wide broker belongs to another Windows user | use the owning account to update or uninstall Neuron |
+| `CHROMA_BROKER_OWNER_UNKNOWN` | protected broker state exists without a valid owner receipt | repair or remove that state from an administrator PowerShell, then retry |
+| `INSTALLER_ROLLBACK_REQUIRED` | a Windows Setup install cannot be restored by copying a ZIP backup | reinstall the wanted setup version |
+| `SETUP_REQUIRED` / `SETUP_HASH_MISMATCH` | an installer-managed update lacks its matching verified setup | download the complete release assets and retry |
+| `LEGACY_INSTALLER_DOWNGRADE` | v0.1.1 predates the limited-tray broker boundary | use a portable copy for historical testing |
 | `RELAUNCH_SKIPPED` | the updater is elevated, so relaunch would inherit administrator privileges | start neuron from a normal PowerShell after the update |
 | `SOURCE_BUILD` | developer build | see **Source builds** |
 | `NO_SOURCE_TXT` | not installed from a release zip | fine; version shown is best effort |
@@ -204,7 +208,9 @@ from the build directory; ask before removing either.
 
 - `-Version v0.1.2` / `--version v0.1.2` installs that tag instead of the latest.
 - `-ZipPath <zip>` (Windows) or `--archive <tar.gz>` (Linux) installs an archive the user already
-  downloaded. `SHA256SUMS.txt` must sit next to it, or be passed with `-SumsPath` / `--sums`.
+  downloaded. `SHA256SUMS.txt` must sit next to it, or be passed with `-SumsPath` / `--sums`. An
+  installer-managed Windows copy also needs the matching `*-setup.exe` beside the ZIP; both hashes
+  are checked before setup runs.
 - `-NoRelaunch` (Windows) leaves neuron closed afterwards. Linux has nothing to relaunch.
 
 ## Linux: no device found

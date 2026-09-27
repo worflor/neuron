@@ -416,7 +416,7 @@ fn context_protocol_marshalling_via_sidecar() {
         let kicked = host.fire_mock("ctx_arm", &ctx);
         host.set_armed(false);
         assert!(
-            kicked.contains("dispatched") || kicked.contains("warming"),
+            kicked.contains("dispatched") || kicked.contains("queued"),
             "mock fire must dispatch: {kicked}"
         );
         let lines = wait_for_log_count(host, "CTXARM=", 1, Duration::from_secs(8));

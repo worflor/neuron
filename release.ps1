@@ -4,11 +4,12 @@
 
 # release.ps1 - build Neuron in release mode and make it the resident (startup) instance.
 #
-# Neuron's historical task name is "Neuron (elevated tray)", but its run level is Limited.
-# The app and RAW macros must not start elevated from a user-writable build directory.
+# The app and RAW macros must not start elevated from a user-writable build directory. The old
+# task name is recognized only so this script can migrate it to the current `Neuron` task.
 #
-# Rebuild target\release\neuron-app.exe, then use an enabled task or launch directly when
-# autostart is off. Never create an autostart task just to run a release build.
+# Rebuild the release binaries in Cargo's selected target directory, then use an enabled task
+# or launch directly when autostart is off. Never create an autostart task just to run a release
+# build.
 #
 # Usage:
 #   .\release.ps1                 # build release, restart the tray instance
@@ -23,10 +24,30 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $RepoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
-$AppExe   = Join-Path $RepoRoot 'target\release\neuron-app.exe'
-$TaskName = 'Neuron (elevated tray)'
+$TargetRoot = if ($env:CARGO_TARGET_DIR) {
+    if ([IO.Path]::IsPathRooted($env:CARGO_TARGET_DIR)) {
+        [IO.Path]::GetFullPath($env:CARGO_TARGET_DIR)
+    } else {
+        [IO.Path]::GetFullPath((Join-Path $RepoRoot $env:CARGO_TARGET_DIR))
+    }
+} else {
+    Join-Path $RepoRoot 'target'
+}
+$ReleaseDir = Join-Path $TargetRoot 'release'
+$AppExe   = Join-Path $ReleaseDir 'neuron-app.exe'
+$TaskName = 'Neuron'
+$LegacyTaskName = 'Neuron (elevated tray)'
 
 function Write-Step($msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
+
+function Get-StartupTask {
+    $current = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    $legacy = Get-ScheduledTask -TaskName $LegacyTaskName -ErrorAction SilentlyContinue
+    if (Test-EnabledLogonTask $current) { return $current }
+    if (Test-EnabledLogonTask $legacy) { return $legacy }
+    if ($current) { return $current }
+    return $legacy
+}
 
 function Test-EnabledLogonTask($task) {
     if (-not $task -or -not $task.Settings.Enabled) { return $false }
@@ -63,7 +84,7 @@ function Test-LimitedStartupTask($task, $exe) {
 # Refuse before stopping the resident app: a direct launch from an administrator shell would
 # inherit that shell's elevated token even though the autostart task is absent or disabled.
 if (-not $NoRelaunch -and (Test-CurrentProcessElevated)) {
-    $preflightTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    $preflightTask = Get-StartupTask
     if (-not (Test-EnabledLogonTask $preflightTask)) {
         throw 'autostart is off; run release.ps1 from a normal PowerShell to relaunch Neuron without elevation'
     }
@@ -74,8 +95,21 @@ if (-not $NoRelaunch -and (Test-CurrentProcessElevated)) {
 #    for exit instead of guessing a sleep.
 Write-Step 'Stopping any running Neuron instances'
 if (Get-Process neuron-app, neuron -ErrorAction SilentlyContinue) {
-    if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
-        Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    # Current builds quit through a same-session event so the ordinary teardown flushes settings
+    # and returns devices to firmware mode. Older builds simply do not own the event.
+    try {
+        $shutdown = [Threading.EventWaitHandle]::OpenExisting('Local\WofloLabs.Neuron.Shutdown')
+        $shutdown.Set() | Out-Null
+        $shutdown.Dispose()
+        $deadline = (Get-Date).AddSeconds(3)
+        while ((Get-Date) -lt $deadline -and (Get-Process neuron-app -ErrorAction SilentlyContinue)) {
+            Start-Sleep -Milliseconds 100
+        }
+    } catch { }
+    foreach ($name in @($TaskName, $LegacyTaskName)) {
+        if (Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue) {
+            Stop-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+        }
     }
     $deadline = (Get-Date).AddSeconds(5)
     while ((Get-Date) -lt $deadline -and (Get-Process neuron-app, neuron -ErrorAction SilentlyContinue)) {
@@ -99,12 +133,22 @@ if (Get-Process neuron-app, neuron -ErrorAction SilentlyContinue) {
 # 2. Build the optimized binaries. Both crates enable the verify-gated idle-power-write
 #    feature in their own manifests, so a plain per-package release build is complete.
 if (-not $SkipBuild) {
-    Write-Step 'Building release binaries (neuron-app + neuron cli)'
+    Write-Step 'Building release binaries (broker + app + CLI)'
     Push-Location $RepoRoot
     try {
+        & cargo build --release -p neuron-host --features bridge --bin neuron-chroma-broker
+        if ($LASTEXITCODE -ne 0) { throw "broker build failed (exit $LASTEXITCODE)" }
+        $previousBrokerHash = $env:NEURON_BROKER_SHA256
+        $previousInstallerHash = $env:NEURON_BROKER_INSTALLER_SHA256
+        $env:NEURON_BROKER_SHA256 = (Get-FileHash -LiteralPath (Join-Path $ReleaseDir 'neuron-chroma-broker.exe') -Algorithm SHA256).Hash
+        $env:NEURON_BROKER_INSTALLER_SHA256 = (Get-FileHash -LiteralPath (Join-Path $RepoRoot 'packaging\windows\install-chroma-broker.ps1') -Algorithm SHA256).Hash
         & cargo build --release -p neuron-app -p neuron-cli
         if ($LASTEXITCODE -ne 0) { throw "cargo build failed (exit $LASTEXITCODE)" }
     } finally {
+        if ($null -eq $previousBrokerHash) { Remove-Item Env:NEURON_BROKER_SHA256 -ErrorAction SilentlyContinue }
+        else { $env:NEURON_BROKER_SHA256 = $previousBrokerHash }
+        if ($null -eq $previousInstallerHash) { Remove-Item Env:NEURON_BROKER_INSTALLER_SHA256 -ErrorAction SilentlyContinue }
+        else { $env:NEURON_BROKER_INSTALLER_SHA256 = $previousInstallerHash }
         Pop-Location
     }
 } else {
@@ -116,12 +160,12 @@ if (-not (Test-Path $AppExe)) { throw "release binary not found at $AppExe" }
 # 3. Preserve the user's autostart setting. Repair an enabled task before using it, but launch
 #    directly when no enabled logon task exists. Never run a stale elevated task.
 if (-not $NoRelaunch) {
-    $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    $task = Get-StartupTask
     $useTask = Test-EnabledLogonTask $task
     if ($useTask) {
         $user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
         $dir = Split-Path -Parent $AppExe
-        if (-not (Test-LimitedStartupTask $task $AppExe)) {
+        if ($task.TaskName -ne $TaskName -or -not (Test-LimitedStartupTask $task $AppExe)) {
             Write-Step 'Repairing the limited startup task'
             $action = New-ScheduledTaskAction -Execute $AppExe -Argument '--tray' -WorkingDirectory $dir
             $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
@@ -138,18 +182,22 @@ if (-not $NoRelaunch) {
                 throw 'startup task repair did not produce the expected limited task; refusing to launch it'
             }
         }
+        if (Get-ScheduledTask -TaskName $LegacyTaskName -ErrorAction SilentlyContinue) {
+            Unregister-ScheduledTask -TaskName $LegacyTaskName -Confirm:$false -ErrorAction Stop
+        }
         Write-Step "Launching via limited scheduled task '$TaskName'"
         Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop
     } else {
         if (Test-CurrentProcessElevated) {
             throw 'autostart is off; run release.ps1 from a normal PowerShell to relaunch Neuron without elevation'
         }
-        if ($task) {
-            # Manual mode no longer needs a dormant task as an elevation vehicle.
-            try {
-                Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction Stop
-            } catch {
-                throw "could not remove the inactive legacy task: $_. Remove it with administrator permission, then retry."
+        foreach ($name in @($TaskName, $LegacyTaskName)) {
+            if (Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue) {
+                try {
+                    Unregister-ScheduledTask -TaskName $name -Confirm:$false -ErrorAction Stop
+                } catch {
+                    throw "could not remove the inactive task '$name': $_. Remove it with administrator permission, then retry."
+                }
             }
         }
         Write-Step 'Launching directly (autostart is off)'
