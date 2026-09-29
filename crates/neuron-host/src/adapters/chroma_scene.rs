@@ -986,8 +986,8 @@ mod tests {
             let t = u32::from_le_bytes([OW_SCENE[p], OW_SCENE[p + 1], OW_SCENE[p + 2], OW_SCENE[p + 3]]);
             let n = usize::from(u16::from_le_bytes([OW_SCENE[p + 4], OW_SCENE[p + 5]]));
             p += 6;
-            for q in OW_SCENE[p..p + 4 * n].chunks_exact(4) {
-                frame[usize::from(q[0])] = (q[1], q[2], q[3]);
+            for &[cell, r, g, b] in OW_SCENE[p..p + 4 * n].as_chunks::<4>().0 {
+                frame[usize::from(cell)] = (r, g, b);
             }
             p += 4 * n;
             out.push((u64::from(t), frame.clone()));
