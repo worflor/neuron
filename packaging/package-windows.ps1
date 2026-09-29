@@ -125,7 +125,7 @@ try {
         'This build has no GitHub Actions provenance attestation.'
     }
     $source = @"
-Neuron $Version — Windows x86_64
+Neuron $Version - Windows x86_64
 Repository: https://github.com/worflor/neuron
 Commit: $head
 Build: $buildMethod
