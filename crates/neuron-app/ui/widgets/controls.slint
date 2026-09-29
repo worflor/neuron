@@ -542,9 +542,14 @@ export component Slider inherits Rectangle {
                     * clamp((root.home - root.minimum) / max(0.0001, root.maximum - root.minimum), 0.0, 1.0);
                 background: Theme.text-faint;
             }
+            // with a home, the fill spans home → value: it shows how far the setting has moved off
+            // its default, and a bipolar range (hue ±180) reads empty at rest instead of half-on
             Rectangle {
-                x: 0;
-                width: parent.width * root.frac;
+                property <float> from: root.has-home
+                    ? clamp((root.home - root.minimum) / max(0.0001, root.maximum - root.minimum), 0.0, 1.0)
+                    : 0.0;
+                x: parent.width * min(self.from, root.frac);
+                width: parent.width * abs(root.frac - self.from);
                 height: 3px;
                 y: (parent.height - self.height) / 2;
                 // the travelled rail brightens under the cursor — the control feels "live" to touch.
@@ -1647,7 +1652,7 @@ export component InputHead inherits HorizontalLayout {
     VerticalLayout {
         horizontal-stretch: 0;
         alignment: center;
-        HorizontalLayout { spacing: 0px; @children }
+        HorizontalLayout { spacing: 10px; @children }
     }
     // DIRECT ⇄ WEAVE — the input spine, the LAST child so its right edge is pinned to the panel edge:
     // it lands at the SAME pixel in both depths and never moves when the per-depth extras come and go.

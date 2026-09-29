@@ -127,8 +127,10 @@ component MacroCardEl inherits Rectangle {
                 overflow: elide;
                 vertical-alignment: center;
             }
-            // the mode is a kind, not a state, so it stays an unlit label
-            Pill { text: root.c.mode; }
+            // BOUND is the default execution mode, so only the exceptions are labelled: RAW as a plain
+            // kind, INVALID (an unreadable mode header) as a failure
+            if root.c.mode == "RAW" : Pill { text: root.c.mode; }
+            if root.c.mode == "INVALID" : Pill { text: root.c.mode; signal: Signal.consequence; tint: Theme.danger; }
             // the binding(s) that fire it — dim when nothing does ("(unbound)"), accent when bound.
             Mono {
                 text: root.c.trigger;
