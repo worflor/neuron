@@ -646,9 +646,9 @@ export component Slider inherits Rectangle {
                         }
                     }
                     double-clicked => { if (root.has-home) { root.set-to(root.home); } }
-                    // a wheel notch only consumes the event when it ACTUALLY moves the value — at a rail
-                    // (min/max) or when wheel-nudge is off, it `reject`s so the PAGE scrolls instead of
-                    // the cursor getting stuck over a maxed fader (the old page-scroll trap).
+                    // a wheel notch consumes the event only when it moves the value; at a rail (min/max)
+                    // or with wheel-nudge off it `reject`s, so the page scrolls instead of sticking on
+                    // the fader.
                     function would-move(up: bool) -> bool {
                         return clamp(root.value + (up ? root.step : -root.step), root.minimum, root.maximum) != root.value;
                     }

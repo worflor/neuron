@@ -207,9 +207,9 @@ component CapHead inherits HorizontalLayout {
             overflow: elide;
         }
     }
-    // the honesty marker — the same provisional lamp as the card's "verify-gated" pill (one
-    // vocabulary), NOT a second pill (the card header already wears the legend). It just says "this
-    // row is a real, verify-gated hardware write" at a glance, without leaking the write-path name.
+    // marks a verify-gated hardware write with the same provisional lamp as the card's
+    // "verify-gated" pill; a lamp rather than a second pill, since the header already carries the
+    // legend.
     if root.gated : VerticalLayout {
         alignment: center;
         Lamp { signal: Signal.provisional; tint: Theme.warn.with-alpha(0.6); }
