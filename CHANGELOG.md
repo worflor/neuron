@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.1.3
+
+- Added a Chroma lab under LIGHTING → VISITORS that splits a game's lighting into ambient, held keys, animated keys and recurring effects, with per-game ids, names, replay, hiding and a colour lens.
+- Added game scenes with optional notifications when a flagged scene ends while the game is in the background, and feedback-only game-light rules (clip, OBS scene, profile, mute).
+- Added a Game Light layer that carries a Chroma game's colours to any device.
+- Rewrote native Chroma decoding against each device type's record layout; non-keyboard devices decode correctly, SDK preset effects are rendered, and suspended games are recognized. Lab captures also export as `.chroma`.
+- Unified UI signal colours and lamp shapes, and gave faders click-to-type values, reset, fine adjustment and page-scroll pass-through.
+
 ## v0.1.2
 
 - Reduced idle CPU work in dispatch, capture, tray handling, audio, gestures, and previews; Python workers start on demand without dropping the first action.
