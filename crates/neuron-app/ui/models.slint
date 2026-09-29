@@ -65,6 +65,81 @@ export struct ChromaStreamRow {
     third: color,
 }
 
+// ── Chroma lab (SYSTEM → connections → chroma → lab) ──
+// kind: 0 ambient, 1 key role, 2 animated key, 3 something playing over the rest layer.
+export struct ChromaLabCell {
+    color: color,
+    group: int,     // spotlight group: 0 ambient, 1.. a held colour, 100 animated, -1 an effect
+}
+
+export struct ChromaLabSwatch {
+    color: color,
+    text: string,
+    group: int,     // the cells it spotlights (see ChromaLabCell.group)
+}
+
+// Another device class the game paints (mouse, headset, pad, keypad, room), as its SDK grid.
+export struct ChromaLabStrip {
+    name: string,
+    effect: string,     // what the game wrote: "static", "custom", "breathing", …
+    cols: int,
+    cells: [color],
+}
+
+// A resting picture the game returns to (a menu, a hero's in-match look). `current` = the board
+// is in it now; `alert` = notify when it ends while the game isn't focused.
+export struct ChromaLabScene {
+    id: string,
+    num: int,
+    name: string,
+    ambient: color,
+    keys: [color],      // the colours its keys hold
+    count: int,
+    current: bool,
+    alert: bool,
+    selected: bool,
+    detail: string,
+    bound: string,
+    bound-kind: int,
+    bound-param: string,
+}
+
+// One signature histogram bin: share of the effect's deviation in that hue.
+export struct ChromaLabBar {
+    h: float,
+    c: color,
+}
+
+// A recurring effect the scene grouped. heat 1 = just played, decays to 0. `num` is the id as a
+// number for callbacks; `bound` describes the feedback action bound to it, if any.
+export struct ChromaLabTemplate {
+    id: string,
+    num: int,
+    name: string,
+    hidden: bool,
+    selected: bool,
+    replayable: bool,   // a recording of its last play exists this session
+    bound: string,
+    bound-kind: int,    // 0 nothing, 1 save clip, 2 obs scene, 3 profile, 4 mute sound
+    bound-param: string,
+    swatch: color,
+    count: int,
+    detail: string,
+    heat: float,
+    bars: [ChromaLabBar],
+}
+
+// A timeline mark over the last minute: x/w are fractions of the strip. A band is the ambient in
+// force; otherwise an effect's play (id >= 0).
+export struct ChromaLabMark {
+    x: float,
+    w: float,
+    color: color,
+    band: bool,
+    id: int,
+    text: string,
+}
+
 // A spine rule row (Bindings / HyperShift / Radial / Gesture editors all render these).
 export struct RuleRow {
     trigger: string,    // Trigger::describe()

@@ -20,6 +20,7 @@
 fn main() -> anyhow::Result<()> {
     use std::fmt::Write as _;
     use neuron_host::adapters::chroma_shm::server::{ChromaShmLayer, CreateError, ShmServer};
+    use neuron_host::adapters::chroma_shm::DeviceClass;
     use neuron_host::paint::PaintPolicy;
     use neuron_host::api::{HostApi, LeaseSpec, SurfaceKind};
     use neuron_host::arbiter::{band, Content, Rgb};
@@ -110,43 +111,25 @@ fn main() -> anyhow::Result<()> {
     use neuron_host::adapters::chroma_analyze::{ChromaAnalyzer, LightEvent};
     use std::collections::HashMap;
 
-    let device_name = |dt: u8| match dt {
-        0x01 => "keyboard",
-        0x02 => "mouse",
-        0x04 => "headset",
-        0x08 => "mousepad",
-        0x10 => "keypad",
-        _ => "device",
-    };
     // 6x22 keyboard grid → a rough label so events point at a place, not just an index.
     let cols = 22usize;
     let key_at = move |led: usize| format!("key r{} c{}", led / cols, led % cols);
 
-    let kbd_leds = bridged
-        .surfaces
-        .iter()
-        .find(|s| matches!(s.kind, SurfaceKind::Keyboard))
-        .map_or(132, |s| s.leds);
-    let mut analyzer = ChromaAnalyzer::new(kbd_leds);
-
-    let mut last_ts: HashMap<u8, u32> = HashMap::new();
+    let mut analyzer = ChromaAnalyzer::new(132);
+    let epoch = Instant::now();
+    let mut kbd_tick: Option<u64> = None;
+    let mut last_tick: HashMap<&'static str, u64> = HashMap::new();
     let mut last_summary = Instant::now();
     loop {
         std::thread::sleep(Duration::from_millis(30)); // ~33 Hz analysis
 
-        // Feed the analyzer the newest decoded keyboard frame + its own timestamp.
-        let kbd_ts = server
-            .device_activity()
-            .into_iter()
-            .find(|a| a.device_type == 0x01)
-            .map(|a| a.timestamp_ms);
-        let kbd_frame = server
-            .read_device_frames_decoded()
-            .into_iter()
-            .find(|(dt, _)| *dt == 0x01);
-        if let (Some(ts), Some((_, units))) = (kbd_ts, kbd_frame) {
-            // skip the leading pad unit, same as the painter, so led i == physical key i.
-            let frame: Vec<(u8, u8, u8)> = units.iter().skip(1).map(|u| u.rgb()).collect();
+        // Feed the analyzer each new keyboard frame, rendered at the time it was read.
+        let kbd = server.device_frame(DeviceClass::Keyboard).filter(|f| kbd_tick != Some(f.tick_ms));
+        if let Some(f) = kbd {
+            kbd_tick = Some(f.tick_ms);
+            let now = u32::try_from(epoch.elapsed().as_millis()).unwrap_or(u32::MAX);
+            let frame = f.cells_at(u64::from(now));
+            let ts = now;
             for ev in analyzer.ingest(ts, &frame) {
                 match ev {
                     LightEvent::Cooldown { led, duration_ms, .. } => println!(
@@ -170,22 +153,17 @@ fn main() -> anyhow::Result<()> {
         // Periodic device summary: what each device class is painting + live/idle.
         if last_summary.elapsed() >= Duration::from_secs(5) {
             last_summary = Instant::now();
-            let acts = server.device_activity();
-            if !acts.is_empty() {
+            let frames = server.frames();
+            if !frames.is_empty() {
                 let app = server
                     .registered_apps()
                     .into_iter()
                     .next().map_or_else(|| "(unregistered)".to_string(), |a| a.name);
                 let mut line = format!("· {app}  ");
-                for a in &acts {
-                    let live = last_ts.get(&a.device_type).is_none_or(|&p| a.timestamp_ms != p);
-                    last_ts.insert(a.device_type, a.timestamp_ms);
-                    let _ = write!(line,
-                        "{}={}{}  ",
-                        device_name(a.device_type),
-                        a.effect(),
-                        if live { "•" } else { "×idle" }
-                    );
+                for f in &frames {
+                    let live = last_tick.get(f.class.name()).is_none_or(|&p| f.tick_ms != p);
+                    last_tick.insert(f.class.name(), f.tick_ms);
+                    let _ = write!(line, "{}={}{}  ", f.class.name(), f.effect.name(), if live { "•" } else { "×idle" });
                 }
                 println!("{line}");
             }

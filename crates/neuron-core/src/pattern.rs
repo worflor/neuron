@@ -607,6 +607,19 @@ static REGISTRY: &[PatternDef] = &[
         readout: true,
     },
     PatternDef {
+        key: "gamelight",
+        label: "Game Light",
+        make: || Box::new(GameLightLayer::default()),
+        params: || vec![game_show_param(), game_level_param()],
+        // A Color pattern: it paints the game's own colours and ignores the spectrum.
+        default_spectrum: || Spectrum::solid(ACCENT),
+        tile: TileMeta {
+            live_input: true,
+        },
+        has_spectrum: false,
+        readout: true,
+    },
+    PatternDef {
         key: "signal",
         label: "Signal",
         make: || Box::new(SignalLight::default()),
@@ -905,6 +918,33 @@ fn held_param() -> Param {
         kind: ParamKind::Enum {
             options: &["hold layer", "sniper", "either"],
             default: 0,
+        },
+    }
+}
+
+/// Game Light's `show` — which part of the game's lighting this layer carries.
+fn game_show_param() -> Param {
+    Param {
+        key: "show",
+        label: "shows",
+        only_when: None,
+        kind: ParamKind::Enum {
+            options: &["ambient + effects", "ambient", "effects"],
+            default: 0,
+        },
+    }
+}
+
+/// Game Light's `level` — games often paint dim resting colours; `full` lifts the colour to full
+/// brightness while keeping its hue.
+fn game_level_param() -> Param {
+    Param {
+        key: "level",
+        label: "brightness",
+        only_when: None,
+        kind: ParamKind::Enum {
+            options: &["as painted", "full"],
+            default: 1,
         },
     }
 }
@@ -2775,6 +2815,68 @@ impl Pattern for ModeHeld {
     }
 }
 
+/// GAME LIGHT — a connected Chroma game's colour on any device. Reads the feed the Chroma lab
+/// publishes from the game's own frames ([`crate::lighting::publish_game_feed`]): the resting
+/// ambient, with the colour of an effect blended over it while one plays. No game, dark.
+#[derive(Default)]
+struct GameLightLayer {
+    /// 0 = ambient + effects, 1 = ambient only, 2 = effects only.
+    show: u8,
+    /// 0 = as painted, 1 = lifted to full brightness.
+    level: u8,
+    bounds: Option<Bounds>,
+}
+
+/// Lift a colour to full brightness keeping its hue and saturation.
+fn lift(c: Rgb) -> Rgb {
+    let m = c.r.max(c.g).max(c.b);
+    if m == 0 {
+        return c;
+    }
+    let k = 255.0 / f32::from(m);
+    let ch = |v: u8| (f32::from(v) * k).round().min(255.0) as u8;
+    Rgb::new(ch(c.r), ch(c.g), ch(c.b))
+}
+
+/// The Game Light colour for one feed snapshot, or black.
+fn game_light_color(f: Option<crate::lighting::GameFeed>, show: u8, level: u8) -> Rgb {
+    let Some(f) = f else { return Rgb::BLACK };
+    let base = if show == 2 { Rgb::BLACK } else { f.ambient.unwrap_or(Rgb::BLACK) };
+    let base = if level == 1 { lift(base) } else { base };
+    let Some((fx, k)) = f.effect.filter(|_| show != 1) else { return base };
+    let fx = if level == 1 { lift(fx) } else { fx };
+    let k = k.clamp(0.0, 1.0);
+    let mix = |a: u8, b: u8| (f32::from(a) * (1.0 - k) + f32::from(b) * k).round() as u8;
+    Rgb::new(mix(base.r, fx.r), mix(base.g, fx.g), mix(base.b, fx.b))
+}
+
+impl Pattern for GameLightLayer {
+    fn configure(&mut self, params: &Params) {
+        self.show = params.u8("show", 0);
+        self.level = params.u8("level", 1);
+    }
+
+    fn set_bounds(&mut self, b: Bounds) {
+        self.bounds = Some(b);
+    }
+
+    fn field(&mut self, rows: u8, cols: u8, _t: f32) -> Field {
+        let c = game_light_color(crate::lighting::latest_game_feed(), self.show, self.level);
+        let (br, bc) = (rows as usize, cols as usize);
+        let b = self.bounds.unwrap_or_else(|| Bounds::board(rows, cols));
+        let mut f = vec![Rgb::BLACK; br * bc];
+        for r in 0..b.rows as usize {
+            for col in 0..b.cols as usize {
+                let (rr, cc) = (b.row0 as usize + r, b.col0 as usize + col);
+                if rr < br && cc < bc {
+                    f[rr * bc + cc] = c;
+                }
+            }
+        }
+        Field::Color(f)
+    }
+}
+
 /// SIGNAL — a light your macros drive: renders one of the numbered
 /// [`crate::lighting::signal`] channels (`neuron.signal(2, 0.8)` sets channel 2 to 0.8). The
 /// emergence seam of the data tiles: neuron doesn't know what the light MEANS (CI status, a
@@ -2992,6 +3094,8 @@ pub fn presets() -> Vec<Preset> {
             blurb: "lights where you paint it while your mic is muted (or hot)", source: "mic" },
         Preset { slug: "modeheld", label: "Mode Held", pattern: "modeheld", params: pp_none, spectrum: sp_solid_accent,
             blurb: "lights while a hold layer or sniper is engaged", source: "modes" },
+        Preset { slug: "gamelight", label: "Game Light", pattern: "gamelight", params: pp_none, spectrum: sp_solid_accent,
+            blurb: "wears the colour a Chroma game is painting, effects and all", source: "game" },
         Preset { slug: "signal", label: "Signal", pattern: "signal", params: pp_none, spectrum: sp_pulse,
             blurb: "a light your macros drive: neuron.signal(n, v)", source: "macros" },
     ]
@@ -3234,6 +3338,21 @@ mod tests {
 
     /// The broadcast slot is process-global (like the vitals feed), so the onair tests serialize
     /// on the same lock the other global-poking tests use.
+    #[test]
+    fn game_light_wears_the_ambient_and_blends_effects_over_it() {
+        use crate::lighting::GameFeed;
+        assert_eq!(game_light_color(None, 0, 1), Rgb::BLACK, "no game, dark");
+        let feed = GameFeed { ambient: Some(Rgb::new(55, 30, 0)), effect: None };
+        assert_eq!(game_light_color(Some(feed), 0, 0), Rgb::new(55, 30, 0));
+        assert_eq!(game_light_color(Some(feed), 0, 1), Rgb::new(255, 139, 0), "lifted keeps the hue");
+        let playing = GameFeed { effect: Some((Rgb::new(0, 255, 255), 1.0)), ..feed };
+        assert_eq!(game_light_color(Some(playing), 0, 0), Rgb::new(0, 255, 255));
+        assert_eq!(game_light_color(Some(playing), 1, 0), Rgb::new(55, 30, 0), "ambient-only ignores effects");
+        assert_eq!(game_light_color(Some(feed), 2, 0), Rgb::BLACK, "effects-only is dark at rest");
+        let half = GameFeed { effect: Some((Rgb::new(0, 200, 0), 0.5)), ..feed };
+        assert_eq!(game_light_color(Some(half), 0, 0), Rgb::new(28, 115, 0));
+    }
+
     #[test]
     fn onair_lights_only_when_the_broadcast_says_live_and_never_goes_stale() {
         let _g = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -3584,12 +3703,12 @@ mod tests {
             assert!(keys.contains(&k), "registry is missing the '{k}' pattern");
         }
         // the thirteen procedural shapes + the `custom` static-frame layer + the DATA readouts
-        // (`vitals`, `onair`, `miclight`, `modeheld`, `signal`).
+        // (`vitals`, `onair`, `miclight`, `modeheld`, `gamelight`, `signal`).
         assert!(keys.contains(&"custom"), "registry is missing the 'custom' layer type");
-        for k in ["vitals", "onair", "miclight", "modeheld", "signal"] {
+        for k in ["vitals", "onair", "miclight", "modeheld", "gamelight", "signal"] {
             assert!(keys.contains(&k), "registry is missing the '{k}' readout");
         }
-        assert_eq!(keys.len(), 19, "the thirteen shapes + the custom frame layer + the five readouts");
+        assert_eq!(keys.len(), 20, "the thirteen shapes + the custom frame layer + the six readouts");
     }
 
     // ── presets are pure, valid data (the tile grid) ────────────────────────────────────────────
@@ -3656,6 +3775,7 @@ mod tests {
             ("onair", "data"),
             ("miclight", "data"),
             ("modeheld", "data"),
+            ("gamelight", "data"),
             ("signal", "data"),
         ];
         let ps = presets();

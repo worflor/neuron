@@ -1944,6 +1944,7 @@ fn trigger_kind(t: &Trigger) -> &'static str {
         Trigger::MicTap => "mic",
         Trigger::Hold { .. } => "hold",
         Trigger::Cast { .. } => "cast",
+        Trigger::GameLight { .. } => "game",
     }
 }
 

@@ -25,6 +25,8 @@
 //! view-as-slice) to [`server`], which opts back in explicitly.
 #![deny(unsafe_code)]
 
+use super::chroma_analyze::Rgb;
+
 /// Which side of the channel creates a named object. The creator's counterpart OPENS
 /// it — so to be the server we CREATE [`ServerCreated`] and OPEN [`ClientCreated`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -124,9 +126,9 @@ pub const OBJECTS: &[Obj] = &[
     Obj { guid: "821AA2A2-8215-4A16-BE9D-7CD8CEBDC398", kind: Kind::Section(84), origin: Origin::ServerCreated, note: "SessionInfo (small)" },
     // ── client-created: the game owns these; WE open them. (The per-app
     //    registration mutex `Global\\<exe>_rz` is dynamic — see rz_mutex_name.) ──
-    Obj { guid: "0F9297E6-E80C-47E4-9A8B-1237E50484B7", kind: Kind::Event, origin: Origin::ClientCreated, note: "client signal event" },
-    Obj { guid: "89811F96-91C2-4C19-8E0A-54469F491550", kind: Kind::Event, origin: Origin::ClientCreated, note: "client signal event" },
-    Obj { guid: "A84AF9C8-EFE0-430D-871C-10DA760C2CCD", kind: Kind::Event, origin: Origin::ClientCreated, note: "client signal event" },
+    Obj { guid: "0F9297E6-E80C-47E4-9A8B-1237E50484B7", kind: Kind::Event, origin: Origin::ClientCreated, note: "server offline: client revokes access, writes None" },
+    Obj { guid: "89811F96-91C2-4C19-8E0A-54469F491550", kind: Kind::Event, origin: Origin::ClientCreated, note: "client re-checks access" },
+    Obj { guid: "A84AF9C8-EFE0-430D-871C-10DA760C2CCD", kind: Kind::Event, origin: Origin::ClientCreated, note: "server online" },
     Obj { guid: "5CD8AF82-56E4-4C36-9144-6D04931A522B", kind: Kind::Mutex, origin: Origin::ClientCreated, note: "shared-region guard mutex" },
     // ── on-demand: brought up per live session/device; type unconfirmed ──
     Obj { guid: "1C68F494-B74D-46E5-9A2F-56F8C526A7C9", kind: Kind::Unknown, origin: Origin::OnDemand, note: "per session/device" },
@@ -139,41 +141,6 @@ pub const OBJECTS: &[Obj] = &[
     Obj { guid: "B8B918C0-9790-47F2-AC7A-F36B8414140C", kind: Kind::Unknown, origin: Origin::OnDemand, note: "client-internal wake event" },
     Obj { guid: "FFED75C2-17DC-4886-AA2C-DBAF1F662351", kind: Kind::Unknown, origin: Origin::OnDemand, note: "per session/device" },
 ];
-
-/// The record terminator / next-record marker seen between per-device records
-/// inside a section. The last byte is a stable `0x0c` delimiter; the preceding
-/// three bytes are the **per-session handle** (e.g. `bd c8 04` in Capture
-/// Session 1, `f6 b3 b7` / `95 33 a1` in the live-Overwatch capture), NOT a
-/// constant. So records are split on the `0x0c`-terminated word, and the handle
-/// ties a frame to its owning app session (see [`D41D8537` session table]).
-pub const RECORD_MARKER_DELIM: u8 = 0x0c;
-
-/// Kept for back-compat: the Capture-Session-1 marker instance. Prefer
-/// [`RECORD_MARKER_DELIM`] — the first three bytes vary per session.
-pub const RECORD_MARKER: [u8; 4] = [0xbd, 0xc8, 0x04, 0x0c];
-
-// ─────────────────────────── frame codec ───────────────────────────
-//
-// Decoded from real Overwatch frames captured live against SDK 3.37 (the fixtures
-// under `chroma_shm_data/`, verified by the tests below). A device
-// section begins with a record header, then a grid of 4-byte colour units:
-//
-//   +0x00  u32  sequence / frame counter
-//   +0x04  u32  reserved (0)
-//   +0x08  u16  magic = 0xffff
-//   +0x0a  u8   device-type byte (01=keyboard, 02/04/08/10/80 = other classes)
-//   +0x0b  u8   0x00
-//   +0x0c  u32  param (observed 0x10)
-//   +0x10 .. GRID_OFFSET  zero padding
-//   +0x50  [u8;4] * N     colour grid (one unit per LED)
-//   ...    `<u32 zero><3-byte session handle><0x0c>`  record delimiter, repeat
-//
-// KNOWN-GOOD here: header parse, magic/device-type, grid unit extraction — all
-// asserted against the captured bytes. STILL OPEN (needs a *non-uniform* known
-// input; Overwatch was showing a solid colour so every unit is identical):
-// (a) the exact per-record LED count / grid geometry, and (b) the RGB byte-order
-// inside a unit (the 4th byte varies with colour, so it is NOT a constant flag).
-// Those are deliberately NOT guessed — [`ColorUnit::raw`] exposes the bytes as-is.
 
 /// Read a NUL-terminated UTF-16LE string starting at `off` (used for the app
 /// registry exe name and the device-roster instance strings).
@@ -200,16 +167,15 @@ fn read_utf16z(buf: &[u8], off: usize) -> Option<String> {
 // live Overwatch session (fixtures + tests below). To BE the server, neuron
 // READS these to learn who is connected and WRITES them to grant a session.
 
-/// The active-session / priority table ([`D41D8537`]): tells the server which
-/// app is currently painting, and the session handle that tags its frames.
+/// The session table ([`D41D8537`]): a ring clients append `{pid, code (1 = init)}` plus a
+/// `GetTickCount64` to when they connect. This reads the head and the first slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SessionTable {
-    /// Active-session count at `+0x00` (0 = nobody painting).
+    /// The ring head at `+0x00` (0 = nobody has registered).
     pub active_count: u32,
-    /// Session id at `+0x08` — matches the app-registry record's id field.
+    /// The first slot's client PID at `+0x08`.
     pub session_id: u32,
-    /// Session handle at `+0x10` — the value that tags this app's frame records
-    /// (its last byte is the [`RECORD_MARKER_DELIM`]).
+    /// The low dword of a registration tick at `+0x10`.
     pub session_handle: u32,
 }
 
@@ -283,12 +249,9 @@ pub fn parse_roster(buf: &[u8]) -> Option<(u32, String)> {
 /// The session table ([`D41D8537`]) and app registry ([`D4E1A960`]) GUIDs.
 pub const SESSION_TABLE: &str = "D41D8537-2D95-4AD2-8A77-51DC00946366";
 pub const APP_REGISTRY: &str = "D4E1A960-872F-4BF8-B09A-9E54F646D7CE";
-/// The client→server and server→client notify events — the vendor's per-frame handshake pair.
-/// Neuron CREATES them (so a client's opens resolve to our own handles) but deliberately never
-/// pulses them: one-shot activation reaches continuous paint, and pulsing strobes (see the
-/// arbiter block's NO PULSE note). Kept as named consts for the object map + tests.
-pub const NOTIFY_CLIENT_TO_SERVER: &str = "0DB0CEFA-C51E-4255-87FB-2D36A0159896";
-pub const NOTIFY_SERVER_TO_CLIENT: &str = "DA5A60F0-A3C5-4335-A039-BCC6136C61A3";
+/// The event a client pulses after appending to the session table ([`SESSION_TABLE`]).
+/// Per-class frame events are [`DeviceClass::frame_event`].
+pub const SESSION_TABLE_EVENT: &str = "DA5A60F0-A3C5-4335-A039-BCC6136C61A3";
 
 /// The per-app registration mutex a connecting client creates and *owns* while
 /// connected: `Global\<exe>_rz` with the exe name lowercased (e.g.
@@ -320,393 +283,586 @@ pub fn device_section(device_type: u8) -> Option<&'static str> {
     DEVICE_SECTIONS.iter().find(|(t, _)| *t == device_type).map(|(_, g)| *g)
 }
 
-/// Byte offset where the colour grid starts inside a device section record.
-pub const GRID_OFFSET: usize = 0x50;
-/// Grid offset measured from the record's own `ff ff` tag (`GRID_OFFSET - REC0`).
-pub const GRID_IN_RECORD: usize = 0x48;
-/// Byte offset of the frame's `GetTickCount64` write-time, from the record tag.
-/// The low 7 bits of this timestamp are the per-frame XOR phase (see [`KEYSTREAM`]).
-pub const TIMESTAMP_IN_RECORD: usize = 0xb90;
-/// The `0xffff` magic at record `+0x08` that marks a valid device record.
-pub const RECORD_MAGIC: u16 = 0xffff;
+// ─────────────────────────── frame codec ───────────────────────────
+//
+// Every device section is `u32 head | u32 0 | 10 records | per-instance name strings`. `head`
+// is the slot the client writes next, so the newest complete record is `head - 1`. A record
+// starts with `devmask = (class << 16) | device-code` (0xFFFF = any device of the class), then
+// an effect code and a union of every effect's fields at fixed offsets, and ends with the
+// u64 `GetTickCount64` of the write. Colour fields are XOR-obfuscated with [`KEYSTREAM`]
+// keyed by that tick; effect parameters are plaintext.
+//
+// Offsets come from RzChromaSDK64 3.37's per-class builders and agree with the independent
+// RazerSdkReader layouts; the fixtures under `chroma_shm_data/` pin them to real Overwatch
+// bytes for every class Overwatch writes.
 
-/// The protocol's per-frame XOR keystream (512 bytes). A game writes a *stable* per-key
-/// state, then obfuscates each ring frame before committing it: every colour byte is
-/// `XORed` with `KEYSTREAM[phase + channel*0x81]`, where `phase = frame_timestamp & 0x7f`
-/// (clamped so `phase+0x183 < 512`). The key is uniform across keys and rotates with the
-/// millisecond clock, so the raw buffer *looks* like the whole board strobing through
-/// random colours while the true state sits still underneath. Un-XOR with the same
-/// keystream and phase and the stable image falls straight out — no averaging or
-/// smoothing needed. Byte order matches [`ColorUnit::rgb`] (channel 0 = R).
+/// A Chroma device class: the kind of device a section's records describe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DeviceClass {
+    Keyboard,
+    Mouse,
+    Headset,
+    Mousepad,
+    Keypad,
+    /// Razer's "room" channel: 5 virtual LEDs partner devices (and room lights) follow.
+    /// LED 0 is the base colour every partner LED takes; 1-4 are optional accents.
+    ChromaLink,
+}
+
+impl DeviceClass {
+    pub const ALL: [DeviceClass; 6] = [
+        DeviceClass::Keyboard,
+        DeviceClass::Mouse,
+        DeviceClass::Headset,
+        DeviceClass::Mousepad,
+        DeviceClass::Keypad,
+        DeviceClass::ChromaLink,
+    ];
+
+    /// The class bit neuron's `device_type` bytes use (and records carry in `devmask >> 16`).
+    #[must_use]
+    pub fn bit(self) -> u8 {
+        match self {
+            DeviceClass::Keyboard => 0x01,
+            DeviceClass::Mouse => 0x02,
+            DeviceClass::Headset => 0x04,
+            DeviceClass::Mousepad => 0x08,
+            DeviceClass::Keypad => 0x10,
+            DeviceClass::ChromaLink => 0x80,
+        }
+    }
+
+    #[must_use]
+    pub fn from_bit(bit: u8) -> Option<Self> {
+        Self::ALL.into_iter().find(|c| c.bit() == bit)
+    }
+
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            DeviceClass::Keyboard => "keyboard",
+            DeviceClass::Mouse => "mouse",
+            DeviceClass::Headset => "headset",
+            DeviceClass::Mousepad => "mousepad",
+            DeviceClass::Keypad => "keypad",
+            DeviceClass::ChromaLink => "room",
+        }
+    }
+
+    /// The shared section this class's frames live in.
+    #[must_use]
+    pub fn section(self) -> &'static str {
+        match self {
+            DeviceClass::Keyboard => "74164FAD-E73C-4FA1-A9AA-70813315ED9C",
+            DeviceClass::Mouse => "0DBE78AC-AC93-408F-A27E-8F61EA067B05",
+            DeviceClass::Headset => "CDB274E2-C50A-4425-8076-1E71550CBE8A",
+            DeviceClass::Mousepad => "17EFA16B-E476-4E43-A98A-3AA837681741",
+            DeviceClass::Keypad => "0FFE5A62-387E-4360-95A3-5D8D4075780D",
+            DeviceClass::ChromaLink => "8AE08F8C-BE3E-4248-AB01-0B595960EC3E",
+        }
+    }
+
+    /// The event the client pulses after committing a frame for this class.
+    #[must_use]
+    pub fn frame_event(self) -> &'static str {
+        match self {
+            DeviceClass::Keyboard => "45C97C2C-2D50-4F30-B50E-AFBB1CE22E93",
+            DeviceClass::Mouse => "0DB0CEFA-C51E-4255-87FB-2D36A0159896",
+            DeviceClass::Headset => "9FE422BE-A752-4F67-9EC6-11ED6135478E",
+            DeviceClass::Mousepad => "A966C3C0-231A-4BE5-9C90-5E0C80349891",
+            DeviceClass::Keypad => "5C49A446-0B97-46CA-BD60-EE5CAF8DDD59",
+            DeviceClass::ChromaLink => "4D006319-9569-4E38-B0DF-811AA2DF115F",
+        }
+    }
+
+    /// The record layout for this class.
+    #[must_use]
+    pub fn layout(self) -> &'static Layout {
+        match self {
+            DeviceClass::Keyboard => &KEYBOARD,
+            DeviceClass::Mouse => &MOUSE,
+            DeviceClass::Headset => &HEADSET,
+            DeviceClass::Mousepad => &MOUSEPAD,
+            DeviceClass::Keypad => &KEYPAD,
+            DeviceClass::ChromaLink => &CHROMA_LINK,
+        }
+    }
+}
+
+/// Where one device class keeps each field in its record (offsets from the record start).
+#[derive(Debug)]
+pub struct Layout {
+    /// Bytes per record.
+    pub stride: usize,
+    /// The u32 effect code.
+    pub effect: usize,
+    /// The u64 write tick.
+    pub tick: usize,
+    /// The XORed static colour.
+    pub static_colour: usize,
+    /// The XORed custom colour grid: offset, rows, cols.
+    pub grid: (usize, u8, u8),
+    /// The effect code that means "custom grid" for this class.
+    pub grid_code: u32,
+    /// Keyboard CUSTOM_KEY planes (colour, key-override), 6x22 each.
+    pub key_planes: Option<(usize, usize)>,
+    /// Plaintext effect parameters (see [`Effect`]).
+    pub params: Params,
+}
+
+/// Offsets of the plaintext parameters of the preset effects, where the class has them.
+#[derive(Debug, Default)]
+pub struct Params {
+    pub wave_dir: Option<usize>,
+    /// Breathing type (1 one colour, 2 two colours, 3 random).
+    pub breath_type: Option<usize>,
+    pub colour1: Option<usize>,
+    pub colour2: Option<usize>,
+    pub blink_colour: Option<usize>,
+    pub reactive_colour: Option<usize>,
+    pub reactive_duration: Option<usize>,
+}
+
+pub static KEYBOARD: Layout = Layout {
+    stride: 0xB98,
+    effect: 0x04,
+    tick: 0xB90,
+    static_colour: 0x48,
+    grid: (0x4C, 6, 22),
+    grid_code: 7,
+    key_planes: Some((0x25C, 0x46C)),
+    params: Params {
+        wave_dir: Some(0x0C),
+        breath_type: Some(0x18),
+        colour1: Some(0x1C),
+        colour2: Some(0x20),
+        blink_colour: None,
+        reactive_colour: Some(0x28),
+        reactive_duration: Some(0x2C),
+    },
+};
+
+pub static MOUSE: Layout = Layout {
+    stride: 0x1C0,
+    effect: 0x08,
+    tick: 0x1B8,
+    static_colour: 0x1A8,
+    grid: (0x9C, 9, 7),
+    grid_code: 8,
+    key_planes: None,
+    params: Params {
+        wave_dir: Some(0x1B0),
+        breath_type: Some(0x10),
+        colour1: Some(0x14),
+        colour2: Some(0x18),
+        blink_colour: Some(0x20),
+        reactive_colour: Some(0x19C),
+        reactive_duration: Some(0x1A0),
+    },
+};
+
+pub static HEADSET: Layout = Layout {
+    stride: 0x40,
+    effect: 0x04,
+    tick: 0x38,
+    static_colour: 0x30,
+    grid: (0x18, 1, 5),
+    grid_code: 7,
+    key_planes: None,
+    params: Params {
+        wave_dir: None,
+        breath_type: None,
+        colour1: Some(0x10),
+        colour2: None,
+        blink_colour: None,
+        reactive_colour: None,
+        reactive_duration: None,
+    },
+};
+
+pub static MOUSEPAD: Layout = Layout {
+    stride: 0xC0,
+    effect: 0x04,
+    tick: 0xB8,
+    static_colour: 0x28,
+    grid: (0x2C, 1, 15),
+    grid_code: 7,
+    key_planes: None,
+    params: Params {
+        wave_dir: Some(0x1C),
+        breath_type: Some(0x0C),
+        colour1: Some(0x10),
+        colour2: Some(0x14),
+        blink_colour: None,
+        reactive_colour: None,
+        reactive_duration: None,
+    },
+};
+
+pub static KEYPAD: Layout = Layout {
+    stride: 0x90,
+    effect: 0x04,
+    tick: 0x88,
+    static_colour: 0x78,
+    grid: (0x18, 4, 5),
+    grid_code: 7,
+    key_planes: None,
+    params: Params {
+        wave_dir: Some(0x80),
+        breath_type: Some(0x0C),
+        colour1: Some(0x10),
+        colour2: Some(0x14),
+        blink_colour: None,
+        reactive_colour: Some(0x6C),
+        reactive_duration: Some(0x70),
+    },
+};
+
+/// Chroma Link. The client copies 50 slots but the API defines 5; the rest is game memory.
+pub static CHROMA_LINK: Layout = Layout {
+    stride: 0xF0,
+    effect: 0x04,
+    tick: 0xE8,
+    static_colour: 0xE4,
+    grid: (0x18, 1, 5),
+    grid_code: 7,
+    key_planes: None,
+    params: Params {
+        wave_dir: None,
+        breath_type: None,
+        colour1: None,
+        colour2: None,
+        blink_colour: None,
+        reactive_colour: None,
+        reactive_duration: None,
+    },
+};
+
+/// Records in a device section's ring.
+pub const RING_DEPTH: usize = 10;
+/// Offset of record 0 in a device section.
+pub const RECORD0: usize = 8;
+
+/// The protocol's per-frame XOR keystream (512 bytes). Each colour byte `b` (0..=3) of a
+/// word is XORed with `KEYSTREAM[phase + b*0x81]`, where `phase = tick & 0x7f` (clamped so
+/// `phase + 3*0x81 < 512`). The key is the same for every colour in a record and rotates
+/// with the millisecond clock, so the raw buffer reads as the board strobing while the
+/// real, stable picture sits underneath. The table is four 128-byte Razer marketing strings
+/// with their nibbles swapped, which is how to find it again if the DLL ever changes it.
 ///
-/// INDEXING PROOF (every KEYSTREAM read site is in [`parse_frame_decoded`], 3 of them —
-/// `KEYSTREAM[phase]`, `KEYSTREAM[phase + KEYSTREAM_CHANNEL_STRIDE]`,
-/// `KEYSTREAM[phase + 2 * KEYSTREAM_CHANNEL_STRIDE]`): `phase` comes only from
-/// [`frame_phase`], which masks the attacker-controlled timestamp with `& 0x7f` (never
-/// exceeds 127) and then applies the CLAMP documented there (`phase -= 3` when
-/// `phase > 124`), capping it at 124. The channel multiplier is NOT attacker data — it is
-/// the fixed literal `0`/`1`/`2` at the three call sites, never a value read from shared
-/// memory — so the true worst case is `124 + 2*0x81 = 382 < 512`. In fact even the
-/// *unclamped* mask alone (`phase <= 127`) already gives `127 + 2*0x81 = 385 < 512`; the
-/// clamp's real job is protecting a hypothetical 4th channel (`3*0x81 + phase < 512`
-/// needs `phase <= 124`) that this decoder never reads. Either way no KEYSTREAM index
-/// derived from hostile SHM content can leave `[0, 512)`. See `keystream_phase_never_out_of_bounds_*`
-/// tests below for the exhaustive/boundary regression sweep.
+/// Indexing: `phase` comes only from [`frame_phase`], which masks the tick to `0..=127` and
+/// clamps the top three values down to `122..=124`; the channel multiplier is a literal
+/// `0..=3` at every read site ([`xor_colour`], and the key-plane flag byte in
+/// [`decode_device`]). The worst index is `124 + 3*0x81 = 511`, the table's last byte; the
+/// clamp exists for exactly that fourth byte.
 pub const KEYSTREAM: &[u8; 512] = include_bytes!("chroma_shm_data/keystream.bin");
-/// Per-channel stride into [`KEYSTREAM`] (R at `phase+0`, G at `+0x81`, B at `+0x102`).
 const KEYSTREAM_CHANNEL_STRIDE: usize = 0x81;
 
-/// One 4-byte colour unit as stored in the grid. Byte-order is retained verbatim
-/// ([`raw`](Self::raw)); a verified RGB decode awaits a known-input capture.
+/// `tick & 0x7f`, clamped the way the writer clamps it (`if 0x80 - phase < 4 { phase -= 3 }`).
+fn frame_phase(tick: u64) -> usize {
+    let mut phase = (tick & 0x7f) as usize;
+    if 0x80 - phase < 4 {
+        phase -= 3;
+    }
+    phase
+}
+
+fn u32_at(b: &[u8], off: usize) -> Option<u32> {
+    b.get(off..off + 4).map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+}
+
+fn u64_at(b: &[u8], off: usize) -> Option<u64> {
+    b.get(off..off + 8).map(|s| u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]))
+}
+
+/// A plaintext `COLORREF` (`0x00BBGGRR`) as `(r, g, b)`.
+fn colorref(b: &[u8], off: usize) -> Option<Rgb> {
+    b.get(off..off + 3).map(|s| (s[0], s[1], s[2]))
+}
+
+/// Decode one XORed colour word at `off`.
+fn xor_colour(b: &[u8], off: usize, phase: usize) -> Option<Rgb> {
+    let s = b.get(off..off + 3)?;
+    Some((
+        s[0] ^ KEYSTREAM[phase],
+        s[1] ^ KEYSTREAM[phase + KEYSTREAM_CHANNEL_STRIDE],
+        s[2] ^ KEYSTREAM[phase + 2 * KEYSTREAM_CHANNEL_STRIDE],
+    ))
+}
+
+/// What a record asks the device to show. Custom grids arrive as pixels; the preset effects
+/// arrive as parameters and are rendered by [`DeviceFrame::cells_at`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ColorUnit(pub [u8; 4]);
+pub enum Effect {
+    /// Lighting off (also what a client writes when it loses access).
+    None,
+    Static,
+    Custom,
+    /// Keyboard CUSTOM_KEY / CUSTOM2: a colour grid with per-key overrides.
+    CustomKey,
+    Wave { reverse: bool },
+    Spectrum,
+    Breathing { colours: Option<(Rgb, Rgb)> },
+    Blinking(Rgb),
+    Reactive(Rgb),
+    /// An effect code this decoder doesn't model (Init, Suspend, …), passed through.
+    Other(u32),
+}
 
-impl ColorUnit {
-    /// The raw 4 bytes exactly as they sit in shared memory.
+impl Effect {
+    /// A short lower-case name.
     #[must_use]
-    pub fn raw(self) -> [u8; 4] {
-        self.0
-    }
-    /// True if every byte is zero (an unlit LED / possible record padding).
-    #[must_use]
-    pub fn is_zero(self) -> bool {
-        self.0 == [0, 0, 0, 0]
-    }
-    /// Decode to `(R, G, B)`. The grid stores a `COLORREF` per key, so the unit's low
-    /// three bytes are `[R, G, B]` in the same channel order the REST adapter's `bgr()`
-    /// uses (R = low byte); byte 3 is a per-LED flag we don't consume. Both faces decode
-    /// colour identically.
-    #[must_use]
-    pub fn rgb(self) -> (u8, u8, u8) {
-        (self.0[0], self.0[1], self.0[2])
-    }
-}
-
-/// The parsed header of a device-section record.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RecordHeader {
-    /// Frame counter at `+0x00` (only meaningful on the first record of a section).
-    pub sequence: u32,
-    /// Device-class byte from the `ff ff NN 00` tag at `+0x0a`.
-    pub device_type: u8,
-    /// The `+0x0c` param dword (observed `0x10`).
-    pub param: u32,
-}
-
-/// Parse the record header at the start of `buf`. Returns `None` if `buf` is too
-/// short or the `0xffff` magic is absent (i.e. not a populated device record).
-#[must_use]
-pub fn parse_record_header(buf: &[u8]) -> Option<RecordHeader> {
-    if buf.len() < GRID_OFFSET {
-        return None;
-    }
-    let magic = u16::from_le_bytes([buf[8], buf[9]]);
-    if magic != RECORD_MAGIC {
-        return None;
-    }
-    Some(RecordHeader {
-        sequence: u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
-        device_type: buf[10],
-        param: u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]),
-    })
-}
-
-/// Read the colour grid of the first record: the 4-byte units from
-/// [`GRID_OFFSET`] up to the record delimiter (`<zero word><handle><0x0c>`) or
-/// the end of the buffer. Returns the header and the units. `None` if there is
-/// no valid populated record (e.g. an all-zero / offline section).
-#[must_use]
-pub fn parse_frame(section: &[u8]) -> Option<(RecordHeader, Vec<ColorUnit>)> {
-    // The section is a RING of frame records (each tagged `ff ff NN 00` at its
-    // start, `stride` bytes apart). `u32@0` is the WRITE HEAD — the slot the game
-    // is currently writing. The last COMPLETE frame is at `head-1`. Reading a fixed
-    // slot 0 catches half-written / stale frames mid-rotation = visible strobe on
-    // animated effects (a static effect doesn't rotate, so it looked fine). Read
-    // the completed head-1 record instead.
-    const REC0: usize = 0x08; // record 0's `ff ff` tag
-    const GRID_IN_REC: usize = 0x48; // grid offset within a record (REC0+0x48 == GRID_OFFSET)
-    if section.len() < REC0 + GRID_IN_REC + 4 {
-        return None;
-    }
-    if u16::from_le_bytes([section[REC0], section[REC0 + 1]]) != RECORD_MAGIC {
-        return None;
-    }
-    // Discover the ring stride from the next record's tag.
-    let mut stride = 0usize;
-    let mut i = REC0 + 4;
-    while i + 4 <= section.len() {
-        if section[i] == 0xff && section[i + 1] == 0xff && section[i + 3] == 0
-            && (section[i + 2] as usize) < 0x40
-        {
-            stride = i - REC0;
-            break;
-        }
-        i += 4;
-    }
-    // Pick the record to read: head-1 of the ring (or slot 0 if single-record).
-    let ff = if stride >= GRID_IN_REC + 4 {
-        // Ring depth = consecutive valid record tags from REC0, NOT
-        // `section_len / stride`. The section has ~12 KB of trailing scratch past
-        // the real ring (no record tags there), so the naive division overcounts
-        // (13 vs the true 10) and `(head-1) % 13` indexes into that scratch when
-        // head wraps — reading garbage = a visible strobe. Counting tags stops at
-        // the true depth.
-        let n = ring_depth(section, stride).max(1);
-        let head = u32::from_le_bytes([section[0], section[1], section[2], section[3]]) as usize;
-        let slot = (head + n - 1) % n;
-        let off = REC0 + slot * stride;
-        if off + GRID_IN_REC + 4 <= section.len()
-            && section[off] == 0xff
-            && section[off + 1] == 0xff
-        {
-            off
-        } else {
-            REC0
-        }
-    } else {
-        REC0
-    };
-    let header = RecordHeader {
-        sequence: u32::from_le_bytes([section[0], section[1], section[2], section[3]]),
-        device_type: section[ff + 2],
-        param: u32::from_le_bytes([section[ff + 4], section[ff + 5], section[ff + 6], section[ff + 7]]),
-    };
-    // The grid runs from `ff+0x48` up to the record's end (stride) or a delimiter.
-    let grid_start = ff + GRID_IN_REC;
-    let grid_end = if stride > GRID_IN_REC {
-        (ff + stride).min(section.len())
-    } else {
-        section.len()
-    };
-    let grid = &section[grid_start..grid_end];
-    let mut units = Vec::new();
-    let mut i = 0;
-    while i + 4 <= grid.len() {
-        let unit = [grid[i], grid[i + 1], grid[i + 2], grid[i + 3]];
-        if unit == [0, 0, 0, 0] {
-            let next = grid.get(i + 4..i + 8);
-            if let Some(n) = next {
-                if n[3] == RECORD_MARKER_DELIM && n != [0, 0, 0, 0] {
-                    break;
-                }
-            }
-            if grid[i..].iter().all(|&b| b == 0) {
-                break;
-            }
-        }
-        units.push(ColorUnit(unit));
-        i += 4;
-    }
-    if units.is_empty() {
-        return None;
-    }
-    Some((header, units))
-}
-
-/// Count the ring's real depth: consecutive records (stride apart from `REC0`) that
-/// still carry a valid `ff ff <same-device> 00` tag. Stops at the first slot without
-/// one — i.e. where the ring ends and the section's trailing scratch begins. The
-/// keyboard ring measures 10 this way; the naive `section_len / stride` would say 13.
-fn ring_depth(section: &[u8], stride: usize) -> usize {
-    const REC0: usize = 0x08;
-    const GRID_IN_REC: usize = 0x48;
-    if stride == 0 {
-        return 1;
-    }
-    let dt0 = section[REC0 + 2];
-    let mut n = 0usize;
-    while REC0 + n * stride + GRID_IN_REC + 4 <= section.len() {
-        let off = REC0 + n * stride;
-        if section[off] == 0xff
-            && section[off + 1] == 0xff
-            && section[off + 2] == dt0
-            && section[off + 3] == 0
-        {
-            n += 1;
-        } else {
-            break;
+    pub fn name(&self) -> &'static str {
+        match self {
+            Effect::None => "off",
+            Effect::Static => "static",
+            Effect::Custom => "custom",
+            Effect::CustomKey => "custom keys",
+            Effect::Wave { .. } => "wave",
+            Effect::Spectrum => "spectrum",
+            Effect::Breathing { .. } => "breathing",
+            Effect::Blinking(_) => "blinking",
+            Effect::Reactive(_) => "reactive",
+            Effect::Other(_) => "other",
         }
     }
-    n
 }
 
-/// Byte offset of the newest complete record (ring slot `head-1`) in a device section,
-/// from the write head at `section[0]` and the discovered stride + [`ring_depth`].
-/// `None` if the section holds no valid record.
-fn newest_slot_ff(section: &[u8]) -> Option<usize> {
-    const REC0: usize = 0x08;
-    if section.len() < REC0 + GRID_IN_RECORD + 4 {
-        return None;
-    }
-    if u16::from_le_bytes([section[REC0], section[REC0 + 1]]) != RECORD_MAGIC {
-        return None;
-    }
-    let mut stride = 0usize;
-    let mut i = REC0 + 4;
-    while i + 4 <= section.len() {
-        if section[i] == 0xff
-            && section[i + 1] == 0xff
-            && section[i + 3] == 0
-            && (section[i + 2] as usize) < 0x40
-        {
-            stride = i - REC0;
-            break;
-        }
-        i += 4;
-    }
-    if stride < GRID_IN_RECORD + 4 {
-        return Some(REC0);
-    }
-    let n = ring_depth(section, stride).max(1);
-    let head = u32::from_le_bytes([section[0], section[1], section[2], section[3]]) as usize;
-    Some(REC0 + ((head + n - 1) % n) * stride)
-}
-
-/// The internal effect-type code a device record carries at `+0x04`, as a readable
-/// name. These are the protocol's internal codes (remapped from the public effect enum
-/// before writing) — observed against live frames, where `7` = the per-key CUSTOM grid a
-/// game paints. Lets neuron see *what* the game is doing, not just the pixels.
+/// The internal effect code (shared by every class) as a readable name.
 #[must_use]
 pub fn effect_name(code: u32) -> &'static str {
     match code {
         0 => "None",
-        1 => "Static",
-        2 => "SpectrumCycling",
-        3 => "Wave",
-        5 => "Breathing",
-        6 => "Reactive",
+        1 => "Wave",
+        2 => "Spectrum",
+        3 => "Breathing",
+        4 => "Blinking",
+        5 => "Reactive",
+        6 => "Static",
         7 => "Custom",
         8 => "CustomKey",
-        0x11 => "CustomExtended",
+        9 => "Init",
+        10 => "Uninit",
+        11 => "Default",
+        12 => "Starlight",
+        13 => "Suspend",
+        14 => "Resume",
+        16 => "Active",
+        17 => "Visualizer",
         _ => "Unknown",
     }
 }
 
-/// A device class's live Chroma activity snapshot — see [`ShmServer::device_activity`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DeviceActivity {
-    /// Razer device-class bit (`0x01` keyboard, `0x02` mouse, `0x04` headset, …).
-    pub device_type: u8,
-    /// Internal effect-type code from the record's `+0x04` (see [`effect_name`]).
+/// One device class's newest frame.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceFrame {
+    pub class: DeviceClass,
+    pub effect: Effect,
+    /// The raw effect code.
     pub effect_code: u32,
-    /// The newest frame's `GetTickCount64` low 32 bits — milliseconds since boot.
-    pub timestamp_ms: u32,
+    /// `devmask & 0xFFFF`: 0xFFFF for "every device of the class", else a device id.
+    pub device: u16,
+    /// The write's `GetTickCount64`, milliseconds since boot.
+    pub tick_ms: u64,
+    pub rows: u8,
+    pub cols: u8,
+    /// Row-major colours for pixel effects (Custom, CustomKey, Static); empty for the preset
+    /// effects, which [`cells_at`](Self::cells_at) renders.
+    pub cells: Vec<Rgb>,
 }
 
-impl DeviceActivity {
-    /// Readable name for this device's current effect.
+impl DeviceFrame {
+    /// LEDs in the class grid.
     #[must_use]
-    pub fn effect(&self) -> &'static str {
-        effect_name(self.effect_code)
+    pub fn len(&self) -> usize {
+        usize::from(self.rows) * usize::from(self.cols)
     }
-}
 
-/// The record stride (byte gap between consecutive `ff ff` tags), discovered from the
-/// section. Records are a fixed size PER DEVICE — the keyboard's is 0xB98, a mouse's is far
-/// smaller (0x1C0) — so nothing about a record's tail is at a fixed absolute offset. `0`
-/// when a second tag isn't found (a single-record section).
-fn record_stride(section: &[u8]) -> usize {
-    const REC0: usize = 0x08;
-    let mut i = REC0 + 4;
-    while i + 4 <= section.len() {
-        if section[i] == 0xff && section[i + 1] == 0xff && section[i + 3] == 0
-            && (section[i + 2] as usize) < 0x40
-        {
-            return i - REC0;
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// True when every LED holds one colour (Static, or a solid Custom frame).
+    #[must_use]
+    pub fn uniform(&self) -> Option<Rgb> {
+        let first = *self.cells.first()?;
+        self.cells.iter().all(|&c| c == first).then_some(first)
+    }
+
+    /// The colours to show `t_ms` into a clock the caller keeps. Pixel effects return their
+    /// cells; preset effects are rendered: neuron is the server, so it draws what Razer's
+    /// service would. Reactive needs key presses the server doesn't see, so it shows dark.
+    #[must_use]
+    pub fn cells_at(&self, t_ms: u64) -> Vec<Rgb> {
+        if !self.cells.is_empty() {
+            return self.cells.clone();
         }
-        i += 4;
+        let n = self.len();
+        let t = t_ms as f32 / 1000.0;
+        match self.effect {
+            Effect::Spectrum => vec![hue_rgb(t / 6.0); n],
+            Effect::Wave { reverse } => {
+                let cols = f32::from(self.cols.max(1));
+                (0..n)
+                    .map(|i| {
+                        let col = (i % usize::from(self.cols.max(1))) as f32 / cols;
+                        let x = if reverse { 1.0 - col } else { col };
+                        hue_rgb(x - t / 2.0)
+                    })
+                    .collect()
+            }
+            Effect::Breathing { colours } => {
+                // Four seconds a breath; alternating colours breathe in turn.
+                let cycle = (t / 4.0).floor();
+                let level = 0.5 - 0.5 * (std::f32::consts::TAU * t / 4.0).cos();
+                let base = match colours {
+                    Some((a, b)) => {
+                        if (cycle as u64).is_multiple_of(2) {
+                            a
+                        } else {
+                            b
+                        }
+                    }
+                    None => hue_rgb(cycle * 0.37),
+                };
+                vec![scale(base, level); n]
+            }
+            Effect::Blinking(c) => vec![if (t_ms / 500).is_multiple_of(2) { c } else { (0, 0, 0) }; n],
+            _ => vec![(0, 0, 0); n],
+        }
     }
-    0
 }
 
-/// The frame timestamp's offset from a record's tag. The `GetTickCount64` write-time is the
-/// LAST 8 bytes of each record, i.e. `stride - 8` — which per device works out to the
-/// keyboard's `0xB90` but a mouse's `0x1B8`. A fixed offset (the old `TIMESTAMP_IN_RECORD`)
-/// only ever worked for the keyboard; every smaller device read `0` there → phase 0 →
-/// garbage colours. Falls back to the keyboard constant if the stride can't be found.
-fn ts_offset(section: &[u8]) -> usize {
-    match record_stride(section) {
-        s if s >= 12 => s - 8,
-        _ => TIMESTAMP_IN_RECORD,
-    }
+fn scale(c: Rgb, k: f32) -> Rgb {
+    let s = |v: u8| (f32::from(v) * k).round().clamp(0.0, 255.0) as u8;
+    (s(c.0), s(c.1), s(c.2))
 }
 
-/// The newest record's `(effect_code @+0x04, write_timestamp_ms)` for a device section —
-/// the raw telemetry behind [`ShmServer::device_activity`]. The timestamp is the frame's
-/// `GetTickCount64` low 32 bits (ms since boot), at [`ts_offset`] into the record, so
-/// successive reads give the game's real update cadence and tell live from idle.
-#[must_use]
-pub fn newest_record_meta(section: &[u8]) -> Option<(u32, u32)> {
-    let ff = newest_slot_ff(section)?;
-    let o = ff + ts_offset(section);
-    if o + 4 > section.len() {
-        return None;
-    }
-    let eff = u32::from_le_bytes([
-        section[ff + 4], section[ff + 5], section[ff + 6], section[ff + 7],
-    ]);
-    let ts = u32::from_le_bytes([section[o], section[o + 1], section[o + 2], section[o + 3]]);
-    Some((eff, ts))
-}
-
-/// The per-frame XOR phase from a record's timestamp: `timestamp & 0x7f`, clamped so
-/// `phase + 0x183` stays inside the 512-byte [`KEYSTREAM`] (the writer's
-/// `if (0x80 - phase < 4) phase -= 3`).
-///
-/// THIS is the clamp site referenced by [`KEYSTREAM`]'s indexing proof: `ts & 0x7f` bounds
-/// `phase` to `0..=127` first (so the subtraction below can never underflow — `0x80 - phase`
-/// is always `>= 1` in `usize`), then the `phase > 124` branch pulls the top 3 values down
-/// to `122..=124`. Callers only ever add fixed literal channel strides (`0`, `KEYSTREAM_CHANNEL_STRIDE`,
-/// `2 * KEYSTREAM_CHANNEL_STRIDE`) to the returned value, never attacker data.
-fn frame_phase(section: &[u8], ff: usize) -> Option<usize> {
-    let o = ff + ts_offset(section);
-    if o + 4 > section.len() {
-        return None;
-    }
-    let ts = u32::from_le_bytes([section[o], section[o + 1], section[o + 2], section[o + 3]]);
-    let mut phase = (ts & 0x7f) as usize;
-    if 0x80 - phase < 4 {
-        phase -= 3;
-    }
-    Some(phase)
-}
-
-/// Decode the connected game's real, stable per-key state out of the obfuscated ring.
-///
-/// The game writes a STATE, not an animation: a fixed per-key frame that only changes
-/// on real events (hero swap, ability cooldown, ult). But `RzChromaKeyboardData` XOR-
-/// obfuscates every committed ring frame with a keystream keyed by the frame's
-/// millisecond timestamp (see [`KEYSTREAM`]), so the raw buffer reads as the whole
-/// board strobing through random colours while the true state sits still underneath.
-///
-/// Reading the newest slot and un-XORing it with `KEYSTREAM[phase + channel*0x81]`
-/// recovers the exact state — verified against a live match: all 10 ring slots (10
-/// different timestamps/phases) decode to a byte-identical image (dark-blue board,
-/// amber WASD, teal ability keys). No averaging, no smoothing, zero lag — the strobe
-/// was never real, just the cipher.
-#[must_use]
-pub fn parse_frame_decoded(section: &[u8]) -> Option<(RecordHeader, Vec<ColorUnit>)> {
-    let (header, raw) = parse_frame(section)?;
-    // The newest slot's record tag — the same slot `parse_frame` read — so we key the
-    // XOR phase off that frame's own timestamp.
-    let ff = newest_slot_ff(section)?;
-
-    let Some(phase) = frame_phase(section, ff) else {
-        // No timestamp (an old-format or single capture) → hand back the raw grid.
-        return Some((header, raw));
+/// A fully saturated colour at hue `h` turns (any real; wraps).
+fn hue_rgb(h: f32) -> Rgb {
+    let h = h.rem_euclid(1.0) * 6.0;
+    let x = 1.0 - (h % 2.0 - 1.0).abs();
+    let (r, g, b) = match h as u32 {
+        0 => (1.0, x, 0.0),
+        1 => (x, 1.0, 0.0),
+        2 => (0.0, 1.0, x),
+        3 => (0.0, x, 1.0),
+        4 => (x, 0.0, 1.0),
+        _ => (1.0, 0.0, x),
     };
-    let k_r = KEYSTREAM[phase];
-    let k_g = KEYSTREAM[phase + KEYSTREAM_CHANNEL_STRIDE];
-    let k_b = KEYSTREAM[phase + 2 * KEYSTREAM_CHANNEL_STRIDE];
+    let to = |v: f32| (v * 255.0).round() as u8;
+    (to(r), to(g), to(b))
+}
 
-    let units = raw
-        .iter()
-        .map(|u| {
-            let [b0, b1, b2, _] = u.raw();
-            ColorUnit([b0 ^ k_r, b1 ^ k_g, b2 ^ k_b, 0])
-        })
-        .collect();
-    Some((header, units))
+/// Map a class frame onto a physical device with `leds` LEDs. The keyboard grid maps cell i
+/// to LED i (verified on a BlackWidow). Another class maps straight when the counts agree and
+/// fills with a solid colour when the frame is one; otherwise the frame's average colour
+/// fills the device, since which grid cell sits over which physical zone isn't known.
+#[must_use]
+pub fn fit_cells(class: DeviceClass, cells: &[Rgb], leds: usize) -> Vec<Rgb> {
+    if cells.is_empty() || leds == 0 {
+        return vec![(0, 0, 0); leds];
+    }
+    if class == DeviceClass::Keyboard || cells.len() == leds {
+        let mut out: Vec<Rgb> = cells.iter().copied().take(leds).collect();
+        out.resize(leds, (0, 0, 0));
+        return out;
+    }
+    let lit: Vec<&Rgb> = cells.iter().filter(|c| (c.0 | c.1 | c.2) != 0).collect();
+    if lit.is_empty() {
+        return vec![(0, 0, 0); leds];
+    }
+    let n = lit.len() as u32;
+    let sum = lit.iter().fold((0u32, 0u32, 0u32), |a, c| (a.0 + u32::from(c.0), a.1 + u32::from(c.1), a.2 + u32::from(c.2)));
+    let avg = ((sum.0 / n) as u8, (sum.1 / n) as u8, (sum.2 / n) as u8);
+    vec![avg; leds]
+}
+
+/// Byte offset of the newest complete record (`head - 1`), or `None` if the section is too
+/// short to hold the ring.
+#[must_use]
+pub fn newest_record(section: &[u8], class: DeviceClass) -> Option<usize> {
+    let stride = class.layout().stride;
+    if section.len() < RECORD0 + RING_DEPTH * stride {
+        return None;
+    }
+    let head = u32_at(section, 0)? as usize % RING_DEPTH;
+    Some(RECORD0 + ((head + RING_DEPTH - 1) % RING_DEPTH) * stride)
+}
+
+/// Decode the newest frame a section holds for `class`. `None` when the section is empty,
+/// torn, or its newest record belongs to another class.
+#[must_use]
+pub fn decode_device(section: &[u8], class: DeviceClass) -> Option<DeviceFrame> {
+    let l = class.layout();
+    let rec = &section[newest_record(section, class)?..][..l.stride];
+    let devmask = u32_at(rec, 0)?;
+    if (devmask >> 16) as u8 != class.bit() {
+        return None;
+    }
+    let effect_code = u32_at(rec, l.effect)?;
+    let tick_ms = u64_at(rec, l.tick)?;
+    let phase = frame_phase(tick_ms);
+    let (grid, rows, cols) = l.grid;
+    let n = usize::from(rows) * usize::from(cols);
+    let p = &l.params;
+    let param_colour = |off: Option<usize>| off.and_then(|o| colorref(rec, o));
+
+    let mut cells = Vec::new();
+    let effect = match effect_code {
+        0 => Effect::None,
+        6 => {
+            cells = vec![xor_colour(rec, l.static_colour, phase)?; n];
+            Effect::Static
+        }
+        c if c == l.grid_code => {
+            cells = (0..n).map(|i| xor_colour(rec, grid + 4 * i, phase)).collect::<Option<_>>()?;
+            Effect::Custom
+        }
+        8 if l.key_planes.is_some() => {
+            let (colour, key) = l.key_planes?;
+            cells = (0..n)
+                .map(|i| {
+                    let over = rec.get(key + 4 * i + 3).map(|b| b ^ KEYSTREAM[phase + 3 * KEYSTREAM_CHANNEL_STRIDE]);
+                    if over.is_some_and(|b| b & 0x01 != 0) {
+                        xor_colour(rec, key + 4 * i, phase)
+                    } else {
+                        xor_colour(rec, colour + 4 * i, phase)
+                    }
+                })
+                .collect::<Option<_>>()?;
+            Effect::CustomKey
+        }
+        1 => Effect::Wave { reverse: p.wave_dir.and_then(|o| u32_at(rec, o)).is_some_and(|d| d == 2 || d == 4) },
+        2 => Effect::Spectrum,
+        3 => {
+            let kind = p.breath_type.and_then(|o| u32_at(rec, o)).unwrap_or(1);
+            let c1 = param_colour(p.colour1);
+            let c2 = param_colour(p.colour2);
+            Effect::Breathing {
+                colours: match (kind, c1, c2) {
+                    (3, _, _) => None,
+                    (2, Some(a), Some(b)) => Some((a, b)),
+                    (_, Some(a), _) => Some((a, a)),
+                    _ => None,
+                },
+            }
+        }
+        4 => Effect::Blinking(param_colour(p.blink_colour).unwrap_or((255, 255, 255))),
+        5 => Effect::Reactive(param_colour(p.reactive_colour).unwrap_or((255, 255, 255))),
+        other => Effect::Other(other),
+    };
+    Some(DeviceFrame {
+        class,
+        effect,
+        effect_code,
+        device: (devmask & 0xFFFF) as u16,
+        tick_ms,
+        rows,
+        cols,
+        cells,
+    })
 }
 
 /// The objects WE must create to be the server (create with [`SECURITY_SDDL`]).
@@ -747,7 +903,7 @@ pub fn sections() -> Vec<(&'static str, usize)> {
 #[cfg(all(windows, feature = "bridge"))]
 #[allow(unsafe_code)]
 pub mod server {
-    use super::{SECURITY_SDDL, OBJECTS, Origin, Kind, APP_REGISTRY, device_section, ColorUnit, DEVICE_SECTIONS, parse_frame, parse_frame_decoded, DeviceActivity, newest_record_meta, effect_name, AppEntry, parse_app_registry, SessionTable, SESSION_TABLE, parse_session_table, rz_mutex_name, APP_REGISTRY_RECORD0, client_objects};
+    use super::{SECURITY_SDDL, OBJECTS, Origin, Kind, APP_REGISTRY, device_section, decode_device, fit_cells, DeviceClass, DeviceFrame, Effect, AppEntry, parse_app_registry, SessionTable, SESSION_TABLE, parse_session_table, rz_mutex_name, APP_REGISTRY_RECORD0, client_objects};
     use std::io;
     use windows_sys::Win32::Foundation::{
         CloseHandle, LocalFree, HANDLE, INVALID_HANDLE_VALUE,
@@ -948,6 +1104,10 @@ pub mod server {
         handles: Vec<SendHandle>, // events + mutexes we created (kept alive)
         _sa: Option<EveryoneSa>,
         mask: Option<MaskGuard>, // the arbitration mask (create-mode only)
+        /// Per device class, a frame to paint INSTEAD of the game's while it is set — the
+        /// Chroma lab's "hide this effect": it holds the at-rest picture over an effect the user
+        /// muted. Written by the lab tap, read by [`ChromaShmLayer::render`].
+        holds: std::sync::Mutex<Vec<(u8, Vec<(u8, u8, u8)>)>>,
     }
 
     impl ShmServer {
@@ -1029,7 +1189,7 @@ pub mod server {
             // identically: stand down rather than let two `chroma-arbiter` threads write the
             // same shared pages.
             let mask = wear_mask(&sa, appreg, sessinfo, keyboard)?;
-            Ok(ShmServer { sections, handles, _sa: Some(sa), mask: Some(mask) })
+            Ok(ShmServer { sections, handles, _sa: Some(sa), mask: Some(mask), holds: std::sync::Mutex::default() })
         }
 
         /// Attach to an ALREADY-RUNNING Chroma server's objects (Razer's real
@@ -1071,7 +1231,7 @@ pub mod server {
                     "no Chroma server objects to open — is Razer's Chroma server running?",
                 ));
             }
-            Ok(ShmServer { sections, handles: Vec::new(), _sa: None, mask: None })
+            Ok(ShmServer { sections, handles: Vec::new(), _sa: None, mask: None, holds: std::sync::Mutex::default() })
         }
 
         /// Snapshot a mapped section's current bytes into an OWNED buffer.
@@ -1105,104 +1265,75 @@ pub mod server {
             })
         }
 
-        /// Decode the current frame of every device section that a game has
-        /// written, as `(device_type, colour grid)`. Empty until a game paints.
+        /// The newest frame a game wrote for `class`, if any.
         #[must_use]
-        pub fn read_device_frames(&self) -> Vec<(u8, Vec<ColorUnit>)> {
-            DEVICE_SECTIONS
-                .iter()
-                .filter_map(|(dt, guid)| {
-                    let bytes = self.section_bytes(guid)?;
-                    let (h, units) = parse_frame(&bytes)?;
-                    Some((h.device_type.max(*dt), units))
-                })
-                .collect()
+        pub fn device_frame(&self, class: DeviceClass) -> Option<DeviceFrame> {
+            decode_device(&self.section_bytes(class.section())?, class)
         }
 
-        /// Like [`read_device_frames`](Self::read_device_frames) but un-XORs each
-        /// device's frame with the timestamp keystream (see [`parse_frame_decoded`]),
-        /// yielding the game's real, stable per-key state. This is what a live game's
-        /// frame must be PAINTED from — the raw single-slot read is obfuscated noise.
+        /// The newest frame of every class a game has written.
         #[must_use]
-        pub fn read_device_frames_decoded(&self) -> Vec<(u8, Vec<ColorUnit>)> {
-            DEVICE_SECTIONS
-                .iter()
-                .filter_map(|(dt, guid)| {
-                    let bytes = self.section_bytes(guid)?;
-                    let (h, units) = parse_frame_decoded(&bytes)?;
-                    Some((h.device_type.max(*dt), units))
-                })
-                .collect()
+        pub fn frames(&self) -> Vec<DeviceFrame> {
+            DeviceClass::ALL.into_iter().filter_map(|c| self.device_frame(c)).collect()
         }
 
-        /// Every painted device's current frame as decoded `(device_type, RGB
-        /// LEDs)` — the neutral format the arbiter consumes (same shape the REST
-        /// adapter produces from effect commands).
-        #[must_use]
-        pub fn frames(&self) -> Vec<(u8, Vec<(u8, u8, u8)>)> {
-            self.read_device_frames_decoded()
-                .into_iter()
-                .map(|(dt, units)| (dt, units.iter().map(|u| u.rgb()).collect()))
-                .collect()
-        }
-
-        /// Live introspection of what the connected game is doing per device class —
-        /// the effect kind it's painting (Custom/Static/Wave/…) and the millisecond
-        /// timestamp of its newest frame. Diff the timestamp across calls for the
-        /// game's real update rate; a stalled timestamp means idle. Free telemetry:
-        /// it's all in the record header we already read.
-        #[must_use]
-        pub fn device_activity(&self) -> Vec<DeviceActivity> {
-            DEVICE_SECTIONS
-                .iter()
-                .filter_map(|(dt, guid)| {
-                    let bytes = self.section_bytes(guid)?;
-                    let (effect_code, timestamp_ms) = newest_record_meta(&bytes)?;
-                    Some(DeviceActivity { device_type: *dt, effect_code, timestamp_ms })
-                })
-                .collect()
-        }
-
-        /// A terse readout of what the connected game is painting RIGHT NOW: how many
-        /// device classes currently show a lit (non-black) frame, and the effect kind
-        /// (the keyboard's if it's painting, else the first lit device's). `None` when
-        /// nothing is lit. Pure telemetry for the CONNECTIONS card — no allocation
-        /// beyond the decode it already does.
+        /// A terse readout of what the connected game is painting: how many classes show a
+        /// lit frame, and the effect (the keyboard's if it's lit, else the first lit class's).
         #[must_use]
         pub fn live_summary(&self) -> Option<(usize, &'static str)> {
-            let mut lit = 0usize;
-            let mut kbd_effect = None;
-            let mut any_effect = None;
-            for &(dt, guid) in DEVICE_SECTIONS {
-                let Some(bytes) = self.section_bytes(guid) else { continue };
-                let Some((effect_code, _)) = newest_record_meta(&bytes) else { continue };
-                let Some((_, units)) = parse_frame_decoded(&bytes) else { continue };
-                let is_lit = units
-                    .iter()
-                    .skip(chroma_grid_lead(dt))
-                    .any(|u| { let (r, g, b) = u.rgb(); (r | g | b) != 0 });
-                if is_lit {
-                    lit += 1;
-                    let e = effect_name(effect_code);
-                    any_effect.get_or_insert(e);
-                    if dt == 0x01 {
-                        kbd_effect = Some(e);
-                    }
-                }
-            }
-            (lit > 0).then(|| (lit, kbd_effect.or(any_effect).unwrap_or("custom")))
+            let lit: Vec<DeviceFrame> = self
+                .frames()
+                .into_iter()
+                .filter(|f| f.cells.iter().any(|&(r, g, b)| (r | g | b) != 0) || f.cells.is_empty() && f.effect != Effect::None)
+                .collect();
+            let effect = lit
+                .iter()
+                .find(|f| f.class == DeviceClass::Keyboard)
+                .or(lit.first())
+                .map(|f| f.effect.name())?;
+            Some((lit.len(), effect))
         }
 
-        /// One device's decoded frame plus its write timestamp (ms) — the pair a
-        /// fading layer needs: the pixels to paint and the clock to tell whether the
-        /// game is still actively driving this device.
+        /// A device section's ring write head (`u32` at offset 0). The game bumps it once per
+        /// committed frame, so a changed value is the cheap "new frame" signal: 4 bytes read
+        /// instead of a whole-section snapshot. `None` if the section isn't mapped.
         #[must_use]
-        pub fn decoded_frame_with_ts(&self, device_type: u8) -> Option<(u32, Vec<ColorUnit>)> {
+        pub fn frame_head(&self, device_type: u8) -> Option<u32> {
             let guid = device_section(device_type)?;
-            let bytes = self.section_bytes(guid)?;
-            let (_, ts) = newest_record_meta(&bytes)?;
-            let (_, units) = parse_frame_decoded(&bytes)?;
-            Some((ts, units))
+            let s = self.sections.iter().find(|s| s.guid == guid)?;
+            if s.size < 4 {
+                return None;
+            }
+            let mut b = [0u8; 4];
+            // SAFETY: `s.view` is a live `s.size`-byte mapping for `self`'s lifetime and 4 <= size.
+            // Volatile byte reads form no reference into the page (see `section_bytes`).
+            unsafe {
+                for (i, x) in b.iter_mut().enumerate() {
+                    *x = std::ptr::read_volatile(s.view.add(i));
+                }
+            }
+            Some(u32::from_le_bytes(b))
+        }
+
+        /// Paint `frame` (the class grid, row-major) for `device_type` in place of the game's own
+        /// frames until cleared with `None`.
+        pub fn set_hold(&self, device_type: u8, frame: Option<Vec<(u8, u8, u8)>>) {
+            let mut holds = self.holds.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            holds.retain(|(dt, _)| *dt != device_type);
+            if let Some(f) = frame {
+                holds.push((device_type, f));
+            }
+        }
+
+        /// The frame currently held for `device_type`, if any.
+        #[must_use]
+        pub fn hold(&self, device_type: u8) -> Option<Vec<(u8, u8, u8)>> {
+            self.holds
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .find(|(dt, _)| *dt == device_type)
+                .map(|(_, f)| f.clone())
         }
 
         /// The apps currently registered in the app registry (`D4E1A960`).
@@ -1265,20 +1396,19 @@ pub mod server {
 
     // ──────────────────────── the arbitration arbiter ────────────────────────
     //
-    // A shipping game connects to a bare server, but only STREAMS + paints real per-key
+    // A shipping game connects to a bare server, but only STREAMS + paints real
     // colour when it believes the vendor arbitration layer is fully alive AND its session
     // has been GRANTED + ACTIVATED. Neuron supplies all of it, with zero vendor software,
     // on one thread — two responsibilities, both STANDING (nothing on a per-frame timer):
     //   • MASK   — hold the arbitration mutexes (incl. a per-user one) and keep the
     //     arbiter-ready events SIGNALLED (manual-reset, set once), so the game doesn't
     //     self-mute to near-black. These are HELD for the server's life, never re-poked.
-    //   • GRANT + ACTIVATE (one-shot per client, see `activate_once`) — the game's session
-    //     worker parks on {B8B918C0}; we write the client PID into the app registry (+0x20c)
-    //     and SessionInfo slot0 {head=0, event-type=8, session-id} (see `write_grant`),
-    //     SetEvent {B8B918C0} to wake the worker, then after a short beat SetEvent the
-    //     per-key ACTIVATE event {A84AF9C8} — the signal that flips the board from a uniform
-    //     muted frame to real per-key colour. Once activated the game streams its own frames;
-    //     we do nothing further but a cheap liveness check on its PID.
+    //   • GRANT + ONLINE (one-shot per client, see `activate_once`) — the client's access check
+    //     is `server online && its PID == app registry +0x20C`. We write the client PID there
+    //     and a SessionInfo slot {event 8 = WTS unlock, session-id} (see `write_grant`), wake
+    //     the client's session worker ({B8B918C0}), then set the server-online event
+    //     ({A84AF9C8}). The client re-evaluates, gains access, and replays its stored effects;
+    //     from then on it streams frames and we only check its PID is alive.
     //
     // NO PULSE. An earlier design tapped the server→client notify + rendezvous events at
     // ~60Hz to "keep completing the handshake". That was a DEAD END: it re-drove the session
@@ -1305,11 +1435,10 @@ pub mod server {
     ];
     /// The client session worker's wake event — `SetEvent` to deliver the grant.
     const SESSION_WORKER_EVENT: &str = "{B8B918C0-9790-47F2-AC7A-F36B8414140C}";
-    /// The per-key ACTIVATION event — `SetEvent` ~60ms AFTER the grant. This is the signal
-    /// that flips the game from a uniform muted/black frame to painting its real per-key
-    /// colour. Without it the game registers and streams frames, but every key stays the
-    /// muted clear colour (the whole "connects but paints nothing" symptom).
-    const ACTIVATE_EVENT: &str = "{A84AF9C8-EFE0-430D-871C-10DA760C2CCD}";
+    /// "Server online": the client sets its online flag and re-evaluates access on it. Until
+    /// both online and the PID grant hold, every effect builder returns early, which is why a
+    /// granted-but-not-online game streamed only a muted frame.
+    const SERVER_ONLINE_EVENT: &str = "{A84AF9C8-EFE0-430D-871C-10DA760C2CCD}";
     /// The `SessionInfo` section the grant writes its {event-type, session-id} slots into.
     const SESSION_INFO: &str = "821AA2A2-8215-4A16-BE9D-7CD8CEBDC398";
     /// The Chroma client DLL a game loads — the marker we scan processes for.
@@ -1498,8 +1627,8 @@ pub mod server {
         }
     }
 
-    /// The arbiter: ACTIVATE the connected game ONCE — write its grant, then fire the
-    /// per-key activation event — and otherwise stay QUIET. It is deliberately NOT a
+    /// The arbiter: ACTIVATE the connected game ONCE — write its grant, then set the
+    /// server-online event — and otherwise stay QUIET. It is deliberately NOT a
     /// heartbeat. Once a game is activated it STAYS activated (its own frames flow), so the
     /// only ongoing work is a cheap liveness check on the known PID; we never re-poke the
     /// session. (An earlier "re-activate if the board looks uniform" recheck was removed: it
@@ -1544,8 +1673,8 @@ pub mod server {
 
     /// The decompile-exact ACTIVATION (mirrors the reference `activate2` sequence): register
     /// the client in the app registry, seed one session slot, wake the session worker, then
-    /// — after a short beat — fire the per-key [`ACTIVATE_EVENT`]. That last signal is what
-    /// flips the board from a uniform muted frame to the game's real per-key colour.
+    /// — after a short beat — set [`SERVER_ONLINE_EVENT`]. With the PID grant in place that
+    /// completes the client's access check, and it replays its effects.
     ///
     /// # Safety
     /// `appreg`/`sessinfo` must be the live mapped views of the app-registry / `SessionInfo`
@@ -1554,7 +1683,7 @@ pub mod server {
         write_grant(appreg, sessinfo, pid, sess);
         signal_event(SESSION_WORKER_EVENT);
         std::thread::sleep(std::time::Duration::from_millis(60));
-        signal_event(ACTIVATE_EVENT); // A84AF9C8 → per-key colour
+        signal_event(SERVER_ONLINE_EVENT);
     }
 
     /// The MEMORY half of activation: stamp the grant records into the mapped app-registry and
@@ -1879,8 +2008,8 @@ pub mod server {
     /// until a game connects and paints, then crossfades UP; when the game disconnects
     /// it crossfades back DOWN to the base — no claim/unclaim churn, no hard cut. The
     /// fade is driven by [`alpha`](LiveContent::alpha), which the arbiter blends over
-    /// the lower layers. `render` returns the decoded state; the leading grid pad cell
-    /// is skipped (`GRID_LEAD`) so unit *i* maps to LED *i*.
+    /// the lower layers. `render` returns the decoded frame fitted to the surface's LEDs
+    /// (see [`fit_cells`]).
     pub struct ChromaShmLayer {
         server: Arc<ShmServer>,
         key: String,
@@ -1899,25 +2028,14 @@ pub mod server {
         /// (`present OR fresh`) they make fade-in resilient — a live, decodable, advancing
         /// frame lights up even if the process check is wrong, and the board only fades
         /// out when BOTH say the game is gone.
-        last_ts: u32,
+        last_ts: u64,
         last_ts_change: Option<Instant>,
+        /// The clock preset effects (Wave, Breathing, …) animate on.
+        born: Instant,
         /// Shared game-lighting policy: blend, strength, fade, and device scope.
         policy: Arc<PaintPolicy>,
     }
 
-    /// How many leading decoded units to skip before physical LED 0, by device CLASS —
-    /// NOT a blind global. A keyboard's grid reserves one cell ahead of its key matrix,
-    /// so key 0 is decoded unit 1 (verified live on a `BlackWidow`). No other class shows
-    /// that pad, and the record is otherwise "one unit per LED", so every non-keyboard
-    /// class maps unit i → LED i straight. Unverified classes default to 0 so a
-    /// mouse/mousepad frame is never shifted a pixel; a real capture can promote it later.
-    #[must_use]
-    pub fn chroma_grid_lead(device_type: u8) -> usize {
-        match device_type {
-            0x01 => 1, // keyboard — the reserved leading cell, confirmed on hardware
-            _ => 0,    // mouse / mousepad / headset / keypad / generic — straight map
-        }
-    }
     /// Seconds for a full 0↔1 crossfade between base and game lighting.
     /// How often to re-check whether a game process is still alive (a syscall, throttled).
     const PRESENCE_POLL: std::time::Duration = std::time::Duration::from_millis(250);
@@ -1950,6 +2068,7 @@ pub mod server {
                 last_present_check: None,
                 last_ts: 0,
                 last_ts_change: None,
+                born: Instant::now(),
                 policy,
             }
         }
@@ -1957,24 +2076,24 @@ pub mod server {
 
     impl LiveContent for ChromaShmLayer {
         fn render(&mut self, now: Instant) -> Vec<Option<Rgb>> {
-            // Decode the newest frame for this device (stable state — no smoothing).
-            // The leading-unit skip is per device CLASS (keyboard reserves one; others
-            // map straight), so a non-keyboard frame is never shifted a pixel.
+            // The newest frame for this class: pixels for Custom/Static, rendered for presets.
             let mut has_frame = false;
-            let lead = chroma_grid_lead(self.device_type);
-            if let Some((ts, units)) = self.server.decoded_frame_with_ts(self.device_type) {
-                if units.len() > lead {
-                    let mut cells = vec![None; self.leds];
-                    for (i, u) in units.iter().skip(lead).take(self.leds).enumerate() {
-                        let (r, g, b) = u.rgb();
-                        cells[i] = Some(Rgb(r, g, b));
-                    }
+            let class = DeviceClass::from_bit(self.device_type);
+            if let Some(frame) = class.and_then(|c| self.server.device_frame(c)) {
+                if frame.effect != Effect::None {
+                    let t = u64::try_from(now.duration_since(self.born).as_millis()).unwrap_or(0);
+                    let source = self.server.hold(self.device_type).unwrap_or_else(|| frame.cells_at(t));
+                    let mut cells: Vec<Option<Rgb>> = fit_cells(frame.class, &source, self.leds)
+                        .into_iter()
+                        .map(|(r, g, b)| Some(Rgb(r, g, b)))
+                        .collect();
+                    self.policy.lens().apply_cells(&mut cells);
                     self.last = cells;
                     has_frame = true;
                 }
-                // Track frame freshness: a game actively painting advances the timestamp.
-                if ts != self.last_ts {
-                    self.last_ts = ts;
+                // A game actively painting advances the write tick.
+                if frame.tick_ms != self.last_ts {
+                    self.last_ts = frame.tick_ms;
                     self.last_ts_change = Some(now);
                 }
             }
@@ -2034,6 +2153,7 @@ pub mod server {
                 last_present_check: self.last_present_check,
                 last_ts: self.last_ts,
                 last_ts_change: self.last_ts_change,
+                born: self.born,
                 policy: Arc::clone(&self.policy),
             })
         }
@@ -2084,7 +2204,7 @@ pub mod server {
         #[test]
         fn synthetic_mapping_snapshot_decodes_frame() {
             let name = seed_test_name();
-            let bytes = include_bytes!("chroma_shm_data/overwatch-keyboard-section.bin");
+            let bytes = include_bytes!("chroma_shm_data/overwatch-live-keyboard.bin");
             let seed = SectionSeed::create_named([(name.clone(), bytes.len())])
                 .expect("create synthetic broker mapping");
             let wide_name = wide(&name);
@@ -2110,25 +2230,35 @@ pub mod server {
                 handles: Vec::new(),
                 _sa: None,
                 mask: None,
+                holds: std::sync::Mutex::default(),
             };
-            let raw_frames = server.read_device_frames();
-            assert_eq!(raw_frames.len(), 1);
-            assert_eq!(raw_frames[0].0, 0x01);
-            assert!(!raw_frames[0].1.is_empty());
-            assert!(raw_frames[0].1.iter().all(|u| u.raw() == [0x56, 0x57, 0xf6, 0x02]));
+            let frame = server.device_frame(DeviceClass::Keyboard).expect("keyboard frame through the mapping");
+            assert_eq!(frame, decode_device(bytes, DeviceClass::Keyboard).expect("fixture decodes"));
+            assert_eq!(frame.effect, Effect::Custom);
+            assert_eq!(server.frames().len(), 1, "only the keyboard section is mapped");
 
-            let decoded_frames = server.read_device_frames_decoded();
-            let fixture_decode = super::super::parse_frame_decoded(bytes).expect("decode captured frame");
-            assert_eq!(decoded_frames.len(), 1);
-            assert_eq!(decoded_frames[0], (0x01, fixture_decode.1));
-
-            let rgb_frames = server.frames();
-            assert_eq!(rgb_frames.len(), 1);
-            assert_eq!(rgb_frames[0].0, 0x01);
-            assert_eq!(
-                rgb_frames[0].1,
-                decoded_frames[0].1.iter().map(|u| u.rgb()).collect::<Vec<_>>(),
-            );
+            // The layer paints a hold instead of the game's frame, and paints everything
+            // through the policy's lens.
+            use crate::arbiter::{LiveContent, Rgb};
+            use crate::paint::{Lens, PaintPolicy};
+            let server = Arc::new(server);
+            let policy = PaintPolicy::opaque();
+            let mut layer = ChromaShmLayer::new(Arc::clone(&server), "kb".into(), 0x01, 4, Arc::clone(&policy), 1.0);
+            server.set_hold(0x01, Some(vec![(10, 20, 30); 4]));
+            let now = std::time::Instant::now();
+            assert_eq!(layer.render(now), vec![Some(Rgb(10, 20, 30)); 4], "a hold replaces the game's frame");
+            server.set_hold(0x01, None);
+            policy.set_lens(Lens { hue_shift: 180, ..Lens::default() });
+            let lens = policy.lens();
+            let want: Vec<Option<Rgb>> = frame
+                .cells
+                .iter()
+                .take(4)
+                .map(|&(r, g, b)| Some(lens.apply(Rgb(r, g, b))))
+                .collect();
+            assert_eq!(layer.render(now), want, "the game's frame, through the lens");
+            drop(layer);
+            let server = Arc::try_unwrap(server).unwrap_or_else(|_| panic!("the layer released the server"));
 
             drop(server);
             unsafe {
@@ -2210,21 +2340,16 @@ pub mod server {
                 None => println!("roster: unreadable"),
             }
 
-            for o in OBJECTS {
-                let Kind::Section(_) = o.kind else { continue };
-                if !o.note.starts_with("device buffer") {
-                    continue;
-                }
-                let Some(b) = srv.section_bytes(o.guid) else { continue };
-                match newest_record_meta(&b) {
-                    Some((id, ts)) => {
-                        let effect = parse_frame(&b).map_or_else(|| "unparsed".into(), |(h, units)| {
-                                let lit = units.iter().filter(|u| !u.is_zero()).count();
-                                format!("device_type={:#04x} ({} lit of {})", h.device_type, lit, units.len())
-                            });
-                        println!("{}: newest record id={id:#x} ts={ts} {effect}  [{}]", o.guid, o.note);
+            for class in DeviceClass::ALL {
+                match srv.device_frame(class) {
+                    Some(f) => {
+                        let lit = f.cells.iter().filter(|c| (c.0 | c.1 | c.2) != 0).count();
+                        println!(
+                            "{}: {} (code {}), device {:#06x}, tick {}, {lit} lit of {}",
+                            class.name(), f.effect.name(), f.effect_code, f.device, f.tick_ms, f.len()
+                        );
                     }
-                    None => println!("{}: idle (no records)  [{}]", o.guid, o.note),
+                    None => println!("{}: idle", class.name()),
                 }
             }
         }
@@ -2317,55 +2442,150 @@ mod tests {
         assert!(o.name().starts_with("Global\\{") && o.name().ends_with('}'));
     }
 
-    // ── frame codec, verified against REAL Overwatch frames captured live ──
-    // Fixtures are the exact section bytes a running Overwatch wrote through
-    // Razer's SDK 3.37 (see chroma_shm_data/, captured 2026-07-03).
+    // ── frame codec, pinned to REAL Overwatch sections ──
+    // `overwatch-live-*` are the newest ring of each class Overwatch wrote during a match
+    // (2026-09-28); `overwatch-*-section` is an older capture taken while the game had
+    // suspended its Chroma output.
 
-    /// The keyboard device section as Overwatch painted it.
-    const OW_KEYBOARD: &[u8] = include_bytes!("chroma_shm_data/overwatch-keyboard-section.bin");
-    /// A second device class (device-type 0x02) from the same frame.
-    const OW_DEVICE_02: &[u8] = include_bytes!("chroma_shm_data/overwatch-device02-section.bin");
+    const LIVE_KEYBOARD: &[u8] = include_bytes!("chroma_shm_data/overwatch-live-keyboard.bin");
+    const LIVE_MOUSE: &[u8] = include_bytes!("chroma_shm_data/overwatch-live-mouse.bin");
+    const LIVE_HEADSET: &[u8] = include_bytes!("chroma_shm_data/overwatch-live-headset.bin");
+    const LIVE_MOUSEPAD: &[u8] = include_bytes!("chroma_shm_data/overwatch-live-mousepad.bin");
+    const LIVE_LINK: &[u8] = include_bytes!("chroma_shm_data/overwatch-live-chroma-link.bin");
+    const SUSPENDED_KEYBOARD: &[u8] = include_bytes!("chroma_shm_data/overwatch-keyboard-section.bin");
+    const SUSPENDED_MOUSE: &[u8] = include_bytes!("chroma_shm_data/overwatch-device02-section.bin");
+
+    /// The match's resting colour: what Overwatch put on every non-keyboard class.
+    const MATCH_AMBIENT: Rgb = (121, 97, 78);
 
     #[test]
-    fn parses_real_overwatch_keyboard_header() {
-        let h = parse_record_header(OW_KEYBOARD).expect("valid keyboard record");
-        assert_eq!(h.sequence, 2, "frame counter at +0x00");
-        assert_eq!(h.device_type, 0x01, "keyboard device-type byte");
-        assert_eq!(h.param, 0x10, "param dword at +0x0c");
+    fn a_live_keyboard_frame_is_the_custom_grid() {
+        let f = decode_device(LIVE_KEYBOARD, DeviceClass::Keyboard).expect("keyboard frame");
+        assert_eq!(f.effect, Effect::Custom);
+        assert_eq!(f.device, 0xFFFF, "addressed to every keyboard");
+        assert_eq!((f.rows, f.cols, f.cells.len()), (6, 22, 132));
+        let at = |r: usize, c: usize| f.cells[r * 22 + c];
+        assert_eq!(at(2, 3), (222, 153, 0), "W wears the movement colour");
+        assert_eq!([at(3, 2), at(3, 3), at(3, 4)], [(222, 153, 0); 3], "A S D too");
+        assert_eq!(at(0, 0), (30, 24, 19), "the background");
     }
 
     #[test]
-    fn parses_real_overwatch_keyboard_grid() {
-        let (h, units) = parse_frame(OW_KEYBOARD).expect("populated keyboard frame");
-        assert_eq!(h.device_type, 0x01);
-        // Overwatch was showing a solid colour → every unit is identical.
-        assert_eq!(units[0].raw(), [0x56, 0x57, 0xf6, 0x02], "first LED unit");
-        assert!(
-            units.iter().all(|u| u.raw() == [0x56, 0x57, 0xf6, 0x02]),
-            "solid effect: all {} units equal",
-            units.len()
+    fn every_other_class_decodes_to_the_matchs_static_colour() {
+        for (bytes, class, device) in [
+            (LIVE_MOUSE, DeviceClass::Mouse, 0xFFFF),
+            (LIVE_HEADSET, DeviceClass::Headset, 0x0F19),
+            (LIVE_MOUSEPAD, DeviceClass::Mousepad, 0xFFFF),
+        ] {
+            let f = decode_device(bytes, class).unwrap_or_else(|| panic!("{class:?} frame"));
+            assert_eq!(f.effect, Effect::Static, "{class:?} code {} is Static", f.effect_code);
+            assert_eq!(f.device, device, "{class:?}");
+            assert_eq!(f.uniform(), Some(MATCH_AMBIENT), "{class:?}");
+        }
+        let (_, rows, cols) = MOUSE.grid;
+        assert_eq!((rows, cols), (9, 7));
+    }
+
+    #[test]
+    fn chroma_link_led_zero_carries_the_ambient() {
+        let f = decode_device(LIVE_LINK, DeviceClass::ChromaLink).expect("link frame");
+        assert_eq!(f.effect, Effect::Custom);
+        assert_eq!(f.cells.len(), 5, "the API's 5 LEDs, not the 50 slots the client copies");
+        assert_eq!(f.cells[0], MATCH_AMBIENT, "CL1 is the base colour every partner LED takes");
+    }
+
+    #[test]
+    fn a_suspended_game_is_read_as_suspended_not_as_colour() {
+        for (bytes, class) in [(SUSPENDED_KEYBOARD, DeviceClass::Keyboard), (SUSPENDED_MOUSE, DeviceClass::Mouse)] {
+            let f = decode_device(bytes, class).expect("record present");
+            assert_eq!(f.effect, Effect::Other(13));
+            assert_eq!(effect_name(f.effect_code), "Suspend");
+            assert!(f.cells.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_section_of_another_class_or_an_empty_one_is_rejected() {
+        assert!(decode_device(LIVE_KEYBOARD, DeviceClass::Mouse).is_none(), "wrong class");
+        assert!(decode_device(&vec![0u8; 40_000], DeviceClass::Keyboard).is_none(), "never written");
+        assert!(decode_device(&LIVE_HEADSET[..100], DeviceClass::Headset).is_none(), "shorter than the ring");
+    }
+
+    #[test]
+    fn the_effect_enum_names_the_verified_codes() {
+        assert_eq!(effect_name(6), "Static", "Overwatch's mouse/pad/headset code");
+        assert_eq!(effect_name(7), "Custom");
+        assert_eq!(effect_name(3), "Breathing");
+        assert_eq!(effect_name(1), "Wave");
+        assert_eq!(effect_name(0x2A), "Unknown");
+    }
+
+    /// A one-class section whose newest record carries `effect` and the given plaintext
+    /// parameter words, for exercising the preset effects no capture has shown.
+    fn synth(class: DeviceClass, effect: u32, words: &[(usize, u32)]) -> Vec<u8> {
+        let l = class.layout();
+        let mut b = vec![0u8; RECORD0 + RING_DEPTH * l.stride];
+        b[0..4].copy_from_slice(&1u32.to_le_bytes()); // head 1 → newest is slot 0
+        let rec = RECORD0;
+        b[rec..rec + 4].copy_from_slice(&((u32::from(class.bit()) << 16) | 0xFFFF).to_le_bytes());
+        b[rec + l.effect..rec + l.effect + 4].copy_from_slice(&effect.to_le_bytes());
+        for &(off, v) in words {
+            b[rec + off..rec + off + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        b
+    }
+
+    #[test]
+    fn preset_effects_arrive_as_parameters_and_are_rendered() {
+        let two = synth(DeviceClass::Keyboard, 3, &[(0x18, 2), (0x1C, 0x0000_00FF), (0x20, 0x00FF_0000)]);
+        let f = decode_device(&two, DeviceClass::Keyboard).expect("breathing");
+        assert_eq!(f.effect, Effect::Breathing { colours: Some(((255, 0, 0), (0, 0, 255))) });
+        assert!(f.cells.is_empty(), "no pixels in the record");
+        assert_eq!(f.cells_at(0), vec![(0, 0, 0); 132], "a breath starts dark");
+        assert_eq!(f.cells_at(2000)[0], (255, 0, 0), "peaks at the first colour");
+        assert_eq!(f.cells_at(6000)[0], (0, 0, 255), "the next breath takes the second");
+
+        let wave = decode_device(&synth(DeviceClass::Keyboard, 1, &[(0x0C, 2)]), DeviceClass::Keyboard).expect("wave");
+        assert_eq!(wave.effect, Effect::Wave { reverse: true });
+        let frame = wave.cells_at(0);
+        assert_ne!(frame[0], frame[11], "a wave varies across columns");
+        assert_eq!(frame[0], frame[22], "and not down a column");
+
+        let spectrum = decode_device(&synth(DeviceClass::Mousepad, 2, &[]), DeviceClass::Mousepad).expect("spectrum");
+        assert_eq!(spectrum.effect, Effect::Spectrum);
+        assert_ne!(spectrum.cells_at(0)[0], spectrum.cells_at(3000)[0], "it cycles");
+    }
+
+    #[test]
+    fn custom_key_overrides_win_over_the_colour_plane() {
+        let l = DeviceClass::Keyboard.layout();
+        let (colour, key) = l.key_planes.expect("keyboard has key planes");
+        // tick 0 → phase 0: XOR every colour byte with the keystream so it decodes to the value.
+        let enc = |rgb: [u8; 4]| -> u32 {
+            let k = |b: usize| KEYSTREAM[b * KEYSTREAM_CHANNEL_STRIDE];
+            u32::from_le_bytes([rgb[0] ^ k(0), rgb[1] ^ k(1), rgb[2] ^ k(2), rgb[3] ^ k(3)])
+        };
+        let b = synth(
+            DeviceClass::Keyboard,
+            8,
+            &[(colour, enc([10, 20, 30, 0])), (colour + 4, enc([10, 20, 30, 0])), (key + 4, enc([200, 0, 0, 1]))],
         );
-        // The grid must stop before the record delimiter, not run off the end.
-        assert!(units.len() * 4 + GRID_OFFSET < OW_KEYBOARD.len());
+        let f = decode_device(&b, DeviceClass::Keyboard).expect("custom key");
+        assert_eq!(f.effect, Effect::CustomKey);
+        assert_eq!(f.cells[0], (10, 20, 30), "no override: the colour plane");
+        assert_eq!(f.cells[1], (200, 0, 0), "flagged key: the override");
     }
 
     #[test]
-    fn device_type_byte_distinguishes_classes() {
-        // Same frame, different device section → different class byte.
-        let kb = parse_record_header(OW_KEYBOARD).unwrap();
-        let d2 = parse_record_header(OW_DEVICE_02).unwrap();
-        assert_eq!(kb.device_type, 0x01);
-        assert_eq!(d2.device_type, 0x02);
-    }
-
-    #[test]
-    fn offline_or_zero_section_yields_no_frame() {
-        // No 0xffff magic → not a populated record.
-        let zeros = vec![0u8; 4096];
-        assert!(parse_record_header(&zeros).is_none());
-        assert!(parse_frame(&zeros).is_none());
-        // Too short to hold a header.
-        assert!(parse_record_header(&[0xff, 0xff, 0x01, 0x00]).is_none());
+    fn fitting_a_class_frame_onto_physical_leds() {
+        let grid: Vec<Rgb> = (0..132).map(|i| (i as u8, 0, 0)).collect();
+        assert_eq!(fit_cells(DeviceClass::Keyboard, &grid, 4), vec![(0, 0, 0), (1, 0, 0), (2, 0, 0), (3, 0, 0)]);
+        assert_eq!(fit_cells(DeviceClass::Headset, &[(9, 9, 9); 5], 5), vec![(9, 9, 9); 5], "same count maps straight");
+        assert_eq!(fit_cells(DeviceClass::Mouse, &[MATCH_AMBIENT; 63], 3), vec![MATCH_AMBIENT; 3], "a solid frame fills");
+        let mut mixed = vec![(0, 0, 0); 63];
+        mixed[0] = (100, 0, 0);
+        mixed[1] = (0, 100, 0);
+        assert_eq!(fit_cells(DeviceClass::Mouse, &mixed, 2), vec![(50, 50, 0); 2], "else the lit cells' average");
     }
 
     // ── control-plane parsers, verified against the live Overwatch session ──
@@ -2379,10 +2599,8 @@ mod tests {
         let s = parse_session_table(OW_SESSION_TABLE).expect("active session");
         assert_eq!(s.active_count, 1, "one active app");
         assert_eq!(s.session_id, 0x1310, "session id");
-        // Handle bytes in memory are `f6 b3 b7 0c`; as LE u32 the 0x0c record
-        // delimiter is the high byte. This is the value that tags frame records.
+        // The low dword of the registration tick (`f6 b3 b7 0c` in memory).
         assert_eq!(s.session_handle, 0x0c_b7_b3_f6);
-        assert_eq!(s.session_handle >> 24, u32::from(RECORD_MARKER_DELIM));
         // An all-zero table = nobody painting.
         assert!(parse_session_table(&vec![0u8; 4096]).is_none());
     }
@@ -2430,130 +2648,66 @@ mod tests {
     }
 
     #[test]
-    fn color_unit_decodes_rgb_in_colorref_order() {
-        // Low three bytes are R,G,B (COLORREF order); the 4th is a flag we drop.
-        assert_eq!(ColorUnit([0xFF, 0x00, 0x00, 0x27]).rgb(), (0xFF, 0x00, 0x00));
-        assert_eq!(ColorUnit([0x12, 0x34, 0x56, 0x78]).rgb(), (0x12, 0x34, 0x56));
-        // The captured OW keyboard unit decodes without touching byte 3.
-        let (_, units) = parse_frame(OW_KEYBOARD).unwrap();
-        let (r, g, b) = units[0].rgb();
-        assert_eq!((r, g, b), (0x56, 0x57, 0xf6));
-    }
-
-    #[test]
-    fn device_type_maps_to_the_right_section() {
-        // Keyboard frames land in 74164FAD (matches the tested frame fixture).
-        assert_eq!(device_section(0x01), Some("74164FAD-E73C-4FA1-A9AA-70813315ED9C"));
-        assert_eq!(device_section(0x04), Some("CDB274E2-C50A-4425-8076-1E71550CBE8A"));
-        assert_eq!(device_section(0x00), None);
-        // Every device section GUID is a real server-created section in the map.
-        for (_, g) in DEVICE_SECTIONS {
-            let o = OBJECTS.iter().find(|o| o.guid == *g).expect("device section in map");
-            assert!(matches!(o.kind, Kind::Section(_)));
-            assert_eq!(o.origin, Origin::ServerCreated);
+    fn every_class_section_and_frame_event_is_in_the_object_map() {
+        for class in DeviceClass::ALL {
+            assert_eq!(device_section(class.bit()), Some(class.section()));
+            let sec = OBJECTS.iter().find(|o| o.guid == class.section()).expect("section in map");
+            assert!(matches!(sec.kind, Kind::Section(n) if n >= RECORD0 + RING_DEPTH * class.layout().stride), "{class:?}");
+            assert!(OBJECTS.iter().any(|o| o.guid == class.frame_event()), "{class:?} frame event in map");
         }
-        // And the keyboard section's decoded frame reports device-type 0x01.
-        let h = parse_record_header(OW_KEYBOARD).unwrap();
-        assert_eq!(device_section(h.device_type), Some("74164FAD-E73C-4FA1-A9AA-70813315ED9C"));
+        assert_eq!(device_section(0x00), None);
     }
 
     #[test]
     fn session_table_and_registry_guids_are_consistent() {
         assert!(OBJECTS.iter().any(|o| o.guid == SESSION_TABLE && matches!(o.kind, Kind::Section(168))));
         assert!(OBJECTS.iter().any(|o| o.guid == APP_REGISTRY && matches!(o.kind, Kind::Section(26932))));
-        // Notify events are server-created events in the map.
-        for g in [NOTIFY_CLIENT_TO_SERVER, NOTIFY_SERVER_TO_CLIENT] {
-            let o = OBJECTS.iter().find(|o| o.guid == g).unwrap();
-            assert_eq!(o.kind, Kind::Event);
-        }
+        let o = OBJECTS.iter().find(|o| o.guid == SESSION_TABLE_EVENT).expect("session-table event in map");
+        assert_eq!(o.kind, Kind::Event);
     }
 
-    // ── KEYSTREAM index safety (adversarial timestamp sweep) ──
+    // ── KEYSTREAM index safety ──
     //
-    // The proof lives on `KEYSTREAM`'s and `frame_phase`'s doc comments: `phase` is masked to
-    // `0..=127` by `ts & 0x7f` before the writer's clamp ever runs, and every KEYSTREAM read
-    // adds only a FIXED literal channel stride (0, 0x81, or 2*0x81) — never a value read from
-    // shared memory. So the only part of a hostile timestamp that can affect indexing is its
-    // low 7 bits: a fully enumerable, 128-value space. These tests exhaust that space directly
-    // and additionally pin the masking itself against full-`u32` boundary/bit-pattern inputs.
-
-    /// A minimal single-record device section (no second record tag, so `ts_offset` falls back
-    /// to the fixed [`TIMESTAMP_IN_RECORD`]) with `ts` stamped at that offset — just enough for
-    /// `parse_frame_decoded` to reach `frame_phase` and every KEYSTREAM read it drives.
-    fn synth_section_with_ts(ts: u32) -> Vec<u8> {
-        const REC0: usize = 0x08;
-        let ts_off = REC0 + TIMESTAMP_IN_RECORD;
-        let mut buf = vec![0u8; ts_off + 4];
-        buf[REC0] = 0xff;
-        buf[REC0 + 1] = 0xff;
-        buf[REC0 + 2] = 0x01; // device type (keyboard)
-        buf[REC0 + 3] = 0x00;
-        // Non-zero grid content so `parse_frame` doesn't see an empty (all-zero) grid.
-        for b in &mut buf[GRID_OFFSET..GRID_OFFSET + 32] {
-            *b = 0xAA;
-        }
-        buf[ts_off..ts_off + 4].copy_from_slice(&ts.to_le_bytes());
-        buf
-    }
+    // Only the low 7 bits of a (possibly hostile) tick reach the keystream index, clamped by
+    // `frame_phase`; the channel multiplier is a literal. Exhaust the domain and pin the mask.
 
     #[test]
-    fn keystream_phase_never_out_of_bounds_exhaustive_low7() {
-        // Exhaust the entire masked-phase domain: only the low 7 bits of `ts` matter.
-        for low7 in 0u32..128 {
-            let section = synth_section_with_ts(low7);
-            let phase = frame_phase(&section, 0x08).expect("ts present at the fallback offset");
-            assert!(phase < KEYSTREAM.len(), "low7={low7} phase={phase} out of range");
-            assert!(
-                phase + 2 * KEYSTREAM_CHANNEL_STRIDE < KEYSTREAM.len(),
-                "low7={low7} phase={phase} B-channel index out of range"
-            );
-            // The whole decode path must not panic either.
-            let _ = parse_frame_decoded(&section);
+    fn keystream_indices_stay_in_bounds_for_every_phase() {
+        for low7 in 0u64..128 {
+            let phase = frame_phase(low7);
+            assert!(phase + 3 * KEYSTREAM_CHANNEL_STRIDE < KEYSTREAM.len(), "low7={low7} phase={phase}");
+        }
+        for tick in [0, 0x7f, 0x80, 0xFFFF_FFFF, 0x8000_0000_0000_0000, u64::MAX, u64::MAX - 1] {
+            assert!(frame_phase(tick) <= 124, "tick={tick:#x}");
         }
     }
 
     #[test]
-    fn keystream_phase_never_out_of_bounds_u32_boundaries() {
-        // Full-u32 boundary and bit-pattern timestamps — pins that only `& 0x7f` matters.
-        let boundaries: &[u32] = &[
-            0,
-            1,
-            0x7f,
-            0x80,
-            0xff,
-            0x100,
-            0x7FFF_FFFF,
-            0x8000_0000,
-            0xAAAA_AAAA,
-            0x5555_5555,
-            0xFFFF_FF80,
-            u32::MAX,
-            u32::MAX - 1,
-        ];
-        for &ts in boundaries {
-            let section = synth_section_with_ts(ts);
-            let phase = frame_phase(&section, 0x08).expect("ts present at the fallback offset");
-            assert!(
-                phase + 2 * KEYSTREAM_CHANNEL_STRIDE < KEYSTREAM.len(),
-                "ts={ts:#010x} phase={phase} out of range"
-            );
-            // Must not panic decoding a full frame through this phase either.
-            let _ = parse_frame_decoded(&section);
+    fn every_tick_decodes_every_class_without_panicking() {
+        for class in DeviceClass::ALL {
+            for low7 in 0u32..128 {
+                let l = class.layout();
+                let mut b = vec![0xAAu8; RECORD0 + RING_DEPTH * l.stride];
+                b[0..4].copy_from_slice(&1u32.to_le_bytes());
+                b[RECORD0..RECORD0 + 4].copy_from_slice(&((u32::from(class.bit()) << 16) | 0xFFFF).to_le_bytes());
+                for effect in [0u32, 1, 2, 3, 4, 5, 6, 7, 8, 13] {
+                    b[RECORD0 + l.effect..RECORD0 + l.effect + 4].copy_from_slice(&effect.to_le_bytes());
+                    b[RECORD0 + l.tick..RECORD0 + l.tick + 8].copy_from_slice(&u64::from(low7).to_le_bytes());
+                    if let Some(f) = decode_device(&b, class) {
+                        let _ = f.cells_at(u64::from(low7) * 37);
+                    }
+                }
+            }
         }
     }
 
-    // ── torn-read tolerance (the safety invariant behind `unsafe impl Sync for ShmServer`) ──
+    // ── torn-read tolerance (the invariant behind `unsafe impl Sync for ShmServer`) ──
     //
-    // `section_bytes` volatile-copies live shared memory that another process (the game) is
-    // concurrently writing; a snapshot taken mid-write is a TORN frame. The module's safety
-    // argument is that the decoders TOLERATE that: the `0xffff` magic-word check in
-    // `parse_record_header`/`parse_frame`/`newest_slot_ff` rejects a record whose header didn't
-    // survive the tear, and the length-bounded grid scan (`while i + 4 <= grid.len()`) means a
-    // surviving-but-mangled body can only ever decode BOUNDED, in-range output — never an
-    // out-of-range index or a panic. These tests simulate tearing against the real captured
-    // Overwatch keyboard fixture and assert both properties hold.
+    // `section_bytes` copies memory the game is writing, so a snapshot can be torn. The
+    // decoder must reject or decode such bytes without panicking, and its output is always
+    // exactly one class grid: offsets are fixed and every read is bounds-checked.
 
-    /// A cheap seeded PRNG (SplitMix64) — deterministic across runs/platforms, no `rand` dep.
+    /// A seeded PRNG (SplitMix64): deterministic across runs, no `rand` dep.
     struct Lcg(u64);
     impl Lcg {
         fn next_u64(&mut self) -> u64 {
@@ -2563,100 +2717,51 @@ mod tests {
             z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
             z ^ (z >> 31)
         }
-        fn next_u8(&mut self) -> u8 {
-            (self.next_u64() >> 56) as u8
-        }
         fn next_below(&mut self, bound: usize) -> usize {
             (self.next_u64() % bound as u64) as usize
         }
     }
 
-    /// Asserts the shared "torn frame → rejected or bounded, never a panic / OOB decode"
-    /// property against one candidate torn buffer.
-    fn assert_never_panics_and_stays_bounded(section: &[u8]) {
-        // `parse_frame` must not panic; if it decodes something, the grid it read can never
-        // extend past the buffer it read it from (the structural bound the scan loop enforces).
-        if let Some((_, units)) = parse_frame(section) {
-            assert!(
-                units.len() * 4 <= section.len(),
-                "decoded {} units ({} bytes) from a {}-byte section",
-                units.len(),
-                units.len() * 4,
-                section.len()
-            );
-        }
-        // The XOR-decoded path adds the KEYSTREAM read on top; must not panic either, and is
-        // bounded the same way.
-        if let Some((_, units)) = parse_frame_decoded(section) {
-            assert!(units.len() * 4 <= section.len(), "decoded-path unit count exceeds the section");
+    fn assert_bounded(section: &[u8], class: DeviceClass) {
+        if let Some(f) = decode_device(section, class) {
+            assert!(f.cells.is_empty() || f.cells.len() == f.len(), "{class:?} decoded {} cells", f.cells.len());
+            assert_eq!(f.cells_at(1234).len(), f.len());
         }
     }
 
     #[test]
-    fn splice_at_every_64_byte_boundary_never_panics() {
-        let a = OW_KEYBOARD;
-        // A structurally different "next frame": every byte bit-flipped, so the header/magic
-        // at the splice point genuinely diverges from `a` instead of coincidentally matching it.
-        let b: Vec<u8> = a.iter().map(|&x| !x).collect();
-        let mut offset = 0usize;
-        while offset < a.len() {
-            let mut spliced = a.to_vec();
-            spliced[offset..].copy_from_slice(&b[offset..]);
-            assert_never_panics_and_stays_bounded(&spliced);
-            // Splicing before the magic word (`+0x08..+0x0a`) tears it — must be rejected, not
-            // silently misdecoded through a stale/garbage header.
-            if offset <= 0x08 {
-                assert!(
-                    parse_frame(&spliced).is_none(),
-                    "offset={offset} tore the magic word but parse_frame still returned Some"
-                );
+    fn splices_and_zeroed_tails_never_panic() {
+        for (bytes, class) in [(LIVE_KEYBOARD, DeviceClass::Keyboard), (LIVE_MOUSE, DeviceClass::Mouse), (LIVE_LINK, DeviceClass::ChromaLink)] {
+            let flipped: Vec<u8> = bytes.iter().map(|&x| !x).collect();
+            let mut offset = 0;
+            while offset < bytes.len() {
+                let mut spliced = bytes.to_vec();
+                spliced[offset..].copy_from_slice(&flipped[offset..]);
+                assert_bounded(&spliced, class);
+                let mut zeroed = bytes.to_vec();
+                zeroed[offset..].iter_mut().for_each(|b| *b = 0);
+                assert_bounded(&zeroed, class);
+                offset += 64;
             }
-            offset += 64;
         }
     }
 
     #[test]
-    fn zeroed_tail_from_every_64_byte_offset_never_panics() {
-        let a = OW_KEYBOARD;
-        let mut offset = 0usize;
-        while offset < a.len() {
-            let mut zeroed = a.to_vec();
-            for b in &mut zeroed[offset..] {
-                *b = 0;
+    fn random_corruption_never_panics() {
+        let mut rng = Lcg(0xC0FFEE);
+        for class in DeviceClass::ALL {
+            let len = RECORD0 + RING_DEPTH * class.layout().stride;
+            for _ in 0..60 {
+                let mut b = match class {
+                    DeviceClass::Keyboard => LIVE_KEYBOARD.to_vec(),
+                    _ => vec![0u8; len],
+                };
+                for _ in 0..=rng.next_below(32) {
+                    let pos = rng.next_below(b.len());
+                    b[pos] = (rng.next_u64() >> 56) as u8;
+                }
+                assert_bounded(&b, class);
             }
-            assert_never_panics_and_stays_bounded(&zeroed);
-            // Zeroing over the magic word itself must be rejected outright.
-            if offset <= 0x08 {
-                assert!(
-                    parse_frame(&zeroed).is_none(),
-                    "offset={offset} zeroed the magic word but parse_frame still returned Some"
-                );
-            }
-            offset += 64;
         }
-    }
-
-    #[test]
-    fn random_corruption_150_seeded_trials_never_panics() {
-        // Fixed seed — deterministic, no wall-clock/OS randomness.
-        let mut rng = Lcg(0xC0FFEE_u64);
-        for _ in 0..150 {
-            let mut buf = OW_KEYBOARD.to_vec();
-            let n_corrupt = 1 + rng.next_below(24);
-            for _ in 0..n_corrupt {
-                let pos = rng.next_below(buf.len());
-                buf[pos] = rng.next_u8();
-            }
-            assert_never_panics_and_stays_bounded(&buf);
-        }
-    }
-
-    #[test]
-    fn recorded_reality_fixtures_still_decode_byte_identical() {
-        // Pins that the torn-read tests above touch only synthesized/corrupted copies — the
-        // real captured fixtures used elsewhere in this file must decode exactly as before.
-        let (h, units) = parse_frame(OW_KEYBOARD).expect("populated keyboard frame");
-        assert_eq!(h.device_type, 0x01);
-        assert_eq!(units[0].raw(), [0x56, 0x57, 0xf6, 0x02]);
     }
 }

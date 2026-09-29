@@ -110,11 +110,11 @@ component ProfileMenuRow inherits Rectangle {
                 if root.p.lighting != "" : Mono { text: "light " + root.p.lighting; color: Theme.text-faint; font-size: Theme.fs-small; }
                 if root.p.idle != "" : Mono { text: "idle " + root.p.idle; color: Theme.text-faint; font-size: Theme.fs-small; }
                 if root.p.in-game != "" : Mono { text: "in-game " + root.p.in-game; color: Theme.text-faint; font-size: Theme.fs-small; }
-                if root.p.gaming : Mono { text: "gaming"; color: Theme.warn; font-size: Theme.fs-small; }
+                if root.p.gaming : Mono { text: "gaming"; color: Theme.text-mid; font-size: Theme.fs-small; }
                 // binds ride WITH the profile: `<name>.rules.toml` is live only while it's active.
                 // Without this badge a profile that carries an imported keymap looked identical to
                 // one that doesn't, and there was no way to tell what applying it would change.
-                if root.p.binds > 0 : Mono { text: root.p.binds + (root.p.binds == 1 ? " bind" : " binds"); color: Theme.accent-dim; font-size: Theme.fs-small; }
+                if root.p.binds > 0 : Mono { text: root.p.binds + (root.p.binds == 1 ? " bind" : " binds"); color: Theme.text-dim; font-size: Theme.fs-small; }
                 // every real field has its OWN badge above, so the summary fallback is now purely the
                 // "(empty)" guard: it shows only when the row is genuinely blank (no field, no gaming).
                 if !root.p.broken && root.p.dpi == "" && root.p.polling == "" && root.p.brightness == "" && root.p.lighting == "" && root.p.idle == "" && root.p.in-game == "" && !root.p.gaming && root.p.binds == 0 : Mono { text: root.p.summary; color: Theme.text-faint; font-size: Theme.fs-small; overflow: elide; }
@@ -244,7 +244,7 @@ export component ProfilesMenu inherits VerticalLayout {
         // replaces the subtree the click is still travelling through, and Slint panics on that.
         if root.renaming != "" : HorizontalLayout {
             spacing: 8px;
-            VerticalLayout { alignment: center; Mono { text: "rename to"; color: Theme.accent-dim; } }
+            VerticalLayout { alignment: center; Mono { text: "rename to"; color: Theme.text-dim; } }
             ren := Field {
                 field-width: 220px;
                 text: root.renaming;
@@ -278,7 +278,7 @@ export component ProfilesMenu inherits VerticalLayout {
                 VerticalLayout { alignment: center; Mono { text: round(State.polling-hz) + " Hz"; color: Theme.text-mid; } }
                 VerticalLayout { alignment: center; Mono { text: round(State.brightness) + "%"; color: Theme.text-mid; } }
                 if State.light-effect != "" : VerticalLayout { alignment: center; Mono { text: State.light-effect; color: Theme.text-mid; } }
-                if State.gaming-live : VerticalLayout { alignment: center; Mono { text: "gaming"; color: Theme.warn; font-size: Theme.fs-small; } }
+                if State.gaming-live : VerticalLayout { alignment: center; Mono { text: "gaming"; color: Theme.accent; font-size: Theme.fs-small; } }
                 Rectangle {}
             }
         }

@@ -13,6 +13,7 @@
 
 pub mod chroma;
 pub mod chroma_analyze;
+pub mod chroma_scene;
 pub mod chroma_shm;
 pub mod obs;
 pub mod openrgb;

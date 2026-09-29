@@ -17,10 +17,10 @@
 // Tray-resident: this window is created once and hidden on close; the event loop lives on regardless
 // (see the Rust runtime). One window, one process, direct typed calls into neuron-core.
 
-import { Theme } from "theme.slint";
+import { Theme, Signal } from "theme.slint";
 import { State } from "state.slint";
 import { GuideContent } from "guides.slint";
-import { Pill, Mono, CaptureOverlay, StatusLamp, IconButton, SectionTitle, Label } from "widgets/controls.slint";
+import { Pill, Mono, CaptureOverlay, StatusLamp, IconButton, SectionTitle, Label, Lamp } from "widgets/controls.slint";
 
 import { DevicePanel } from "panels/device.slint";
 import { LightingPanel } from "panels/lighting.slint";
@@ -179,12 +179,7 @@ export component AppWindow inherits Window {
                         alignment: center;
                         HorizontalLayout {
                             spacing: 8px;
-                            Rectangle {
-                                width: Theme.dot-lg; height: Theme.dot-lg; border-radius: 1px;
-                                y: (parent.height - self.height) / 2;
-                                background: State.runtime-active ? Theme.accent : Theme.text-faint;
-                                animate background { duration: Theme.settle; }
-                            }
+                            Lamp { lit: State.runtime-active; }
                             Text {
                                 text: "NEURON";
                                 color: Theme.text;
@@ -325,7 +320,10 @@ export component AppWindow inherits Window {
                     // for failures.
                     Text {
                         text: "›";
-                        color: State.status-kind == "err" ? Theme.danger : Theme.accent;
+                        color: State.status-kind == "err" ? Theme.danger
+                            : State.status-kind == "note" ? Theme.warn
+                            : State.status-kind == "listen" ? Theme.listen
+                            : Theme.text-dim;
                         font-size: Theme.fs-mono;
                         font-family: Theme.mono;
                         vertical-alignment: center;
@@ -336,6 +334,8 @@ export component AppWindow inherits Window {
                         // freshness is honest: an aged message dims instead of posing as current
                         color: State.status-stale ? Theme.text-faint
                             : State.status-kind == "err" ? Theme.danger
+                            : State.status-kind == "note" ? Theme.warn
+                            : State.status-kind == "listen" ? Theme.listen
                             : Theme.text-mid;
                         font-size: Theme.fs-mono;
                         overflow: elide;
@@ -367,18 +367,20 @@ export component AppWindow inherits Window {
                             StatusLamp {
                                 text: State.beacon-count > 1 ? "beacon ×" + State.beacon-count : "beacon";
                                 lit: true;
+                                signal: Signal.listening;   // a macro is waiting on the user's answer
                             }
                         }
 
                         // WRITES PAUSED: the global device-write kill-switch — click = go to its gate.
-                        // The lamp makes it read as a THROWN switch (a red kill-lamp), not inert text.
+                        // The lamp makes it read as a THROWN switch, not inert text. Provisional, not
+                        // consequence: it is paused on purpose and nothing is broken.
                         if State.writes-paused : HorizontalLayout {
                             spacing: 10px;
                             Rectangle { width: Theme.hair; height: 12px; y: (parent.height - self.height) / 2; background: Theme.line; }
                             StatusLamp {
                                 text: "writes paused";
                                 lit: true;
-                                tint: Theme.danger;
+                                signal: Signal.provisional;
                                 clickable: true;
                                 clicked => { State.page = 3; }
                             }
@@ -386,17 +388,17 @@ export component AppWindow inherits Window {
 
                         // THE GATE: armed/safe. SAFE -> ARMED takes a confirming second click (real
                         // keystrokes are consequential); ARMED -> SAFE disarms instantly. The lamp makes
-                        // the gate read as a physical switch, not inert text — accent=armed, warn=arm?,
+                        // the gate read as a physical switch, not inert text — live=armed, provisional=arm?,
                         // a dim dot=safe.
                         HorizontalLayout {
                             spacing: 10px;
                             Rectangle { width: Theme.hair; height: 12px; y: (parent.height - self.height) / 2; background: Theme.line; }
-                            // lit in either loud state — accent when ARMED, warn when ARM?; SAFE is the
+                            // lit in either loud state — live when ARMED, provisional when ARM?; SAFE is the
                             // unlit gutter (StatusLamp draws lamp-off + the text-dim ink, hover→text-mid).
                             StatusLamp {
                                 text: State.input-armed ? "armed" : root.arm-confirm ? "arm?" : "safe";
                                 lit: State.input-armed || root.arm-confirm;
-                                tint: State.input-armed ? Theme.accent : Theme.warn;
+                                signal: State.input-armed ? Signal.live : Signal.provisional;
                                 clickable: true;
                                 clicked => {
                                     if (State.input-armed || root.arm-confirm) {
@@ -659,11 +661,11 @@ export component AppWindow inherits Window {
                                 property <int> tab-idx: clamp(State.guide-active-tab, 0, g.tabs.length - 1);
                                 for s in g.tabs[activetab.tab-idx].sections : VerticalLayout {
                                     spacing: 8px;
-                                    // the section legend — SectionTitle in accent, kept at the guide's
-                                    // own body size + track-1 so the copy stays byte-identical.
+                                    // the section legend — SectionTitle in full ink (a heading, not a
+                                    // signal), kept at the guide's own body size + track-1.
                                     SectionTitle {
                                         text: s.head;
-                                        color: Theme.accent;
+                                        color: Theme.text;
                                         font-size: Theme.fs-body;
                                         letter-spacing: Theme.track-1;
                                         wrap: word-wrap;

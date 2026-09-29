@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
 
-import { Theme } from "../theme.slint";
-import { Card, SectionTitle, Label, Button, Field, Slider, ContactRow, Toggle, Pill, Mono, Divider, Readout, PanelHead, SplitButton, SplitToggle, LampRail, Disclosure, SelectTick } from "../widgets/controls.slint";
+import { Theme, Signal } from "../theme.slint";
+import { Card, SectionTitle, Label, Button, Field, Slider, ContactRow, Toggle, Pill, Mono, Divider, Readout, PanelHead, SplitButton, SplitToggle, LampRail, Disclosure, SelectTick, Lamp } from "../widgets/controls.slint";
 import { State } from "../state.slint";
 import { DeviceRow } from "../models.slint";
 
@@ -207,15 +207,12 @@ component CapHead inherits HorizontalLayout {
             overflow: elide;
         }
     }
-    // the honesty marker — a single quiet caution dot in the SAME warn hue as the card's "verify-gated"
-    // pill (one vocabulary), NOT a second pill (the card header already wears the legend). It just says
-    // "this row is a real, verify-gated hardware write" at a glance, without leaking the write-path name.
+    // the honesty marker — the same provisional lamp as the card's "verify-gated" pill (one
+    // vocabulary), NOT a second pill (the card header already wears the legend). It just says "this
+    // row is a real, verify-gated hardware write" at a glance, without leaking the write-path name.
     if root.gated : VerticalLayout {
         alignment: center;
-        Rectangle {
-            width: Theme.dot; height: Theme.dot; border-radius: 1px;
-            background: Theme.warn.with-alpha(0.6);
-        }
+        Lamp { signal: Signal.provisional; tint: Theme.warn.with-alpha(0.6); }
     }
 }
 
@@ -324,11 +321,7 @@ component DeviceLine inherits Rectangle {
                 spacing: 8px;
                 VerticalLayout {
                     alignment: center;
-                    Rectangle {
-                        width: Theme.dot; height: Theme.dot; border-radius: Theme.dot / 2;
-                        background: root.d.connected ? Theme.accent : Theme.lamp-off;
-                        animate background { duration: Theme.quick; }
-                    }
+                    Lamp { lit: root.d.connected; }
                 }
                 VerticalLayout {
                     alignment: center; spacing: 3px;
@@ -1065,7 +1058,7 @@ export component DevicePanel inherits VerticalLayout {
     PanelHead {
         label: "DEVICE";
         caption: "live device readout";
-        if State.writes-paused : VerticalLayout { alignment: center; Pill { text: "WRITES PAUSED"; tint: Theme.danger; } }
+        if State.writes-paused : VerticalLayout { alignment: center; Pill { text: "WRITES PAUSED"; signal: Signal.provisional; tint: Theme.warn; } }
         VerticalLayout { width: 8px; }
         // SCAN ⇄ APPLY as one joined control (the DIRECT/WEAVE split-button idiom). SCAN re-reads every
         // device (and so doubles as the FEEL deck's revert — it re-seeds the drafts from the hardware);
@@ -1241,7 +1234,7 @@ export component DevicePanel inherits VerticalLayout {
                             Pill {
                                 text: State.device-muted ? "MUTED" : "LIVE";
                                 live: State.device-muted;
-                                live-tint: Theme.danger;
+                                signal: Signal.provisional;   // muted on purpose, not a fault
                             }
                             Mono {
                                 text: "hardware mute \u{00b7} tap the mic (sensor-owned)";
@@ -1441,7 +1434,7 @@ export component DevicePanel inherits VerticalLayout {
                                     checked: State.persist-to-onboard;
                                     toggled(v) => { State.persist-to-onboard = v; State.set-persist(v); }
                                 }
-                                Mono { text: "saved to the mouse, so it holds with the app closed. needs onboard profiles."; color: Theme.text-faint; wrap: word-wrap; }
+                                Mono { text: "kept on the mouse · holds with neuron closed"; color: Theme.text-faint; wrap: word-wrap; }
                             }
                         }
                     }
@@ -1456,7 +1449,6 @@ export component DevicePanel inherits VerticalLayout {
                         padding: 12px;
                         spacing: 13px;
                         SectionTitle { text: "KEY GUARD"; }
-                        GateNote { text: "swallow OS chords mid-game so they can't yank you out (host-side, no device write)."; }
                         // the four chords are ONE multi-select LampRail (several can be swallowed at once),
                         // fused into a single hairline rail with 1px seams. Each cell wears a lamp dot so a
                         // MULTI-lit bank stays legible (an accent-fill alone can't show "two of four on" the
@@ -1473,8 +1465,7 @@ export component DevicePanel inherits VerticalLayout {
                                 State.apply-gaming-mode();
                             }
                         }
-                        // wrap (was clipped at "…reversible (lif") — a chord guard lifts on profile change.
-                        GateNote { text: "lit = swallowed while a gaming profile is active. reversible, it lifts when the profile changes."; }
+                        GateNote { text: "lit chords are swallowed while a gaming profile is active"; }
                         // THE HARDWARE SIBLING — the board's OWN firmware Win-key kill (FN+F10 / GAME_LED),
                         // surfaced beside the host chords because it eats the Win key device-side with zero
                         // software. Gated on the keyboard actually exposing it (SetGameMode capability).
@@ -1485,7 +1476,7 @@ export component DevicePanel inherits VerticalLayout {
                             toggled => { State.toggle-game-mode(); }
                         }
                         if State.sel-can-game-mode : GateNote {
-                            text: "the board's own FN+F10 Win-key kill, firmware-side and working with zero software. this is what ate your Win key.";
+                            text: "FN+F10 on the board · locks the Win key in firmware";
                         }
                     }
                 }
@@ -1538,9 +1529,9 @@ export component DevicePanel inherits VerticalLayout {
                         HorizontalLayout {
                             SectionTitle { text: "HARDWARE WRITES"; }
                             Rectangle {}
-                            Pill { text: "VERIFY-GATED"; tint: Theme.warn; }
+                            Pill { text: "VERIFY-GATED"; signal: Signal.provisional; tint: Theme.warn; }
                         }
-                        GateNote { text: "real device paths, ready but held until the command is confirmed on your hardware, so nothing fires blind."; }
+                        GateNote { text: "held until each command is confirmed on your hardware"; }
                         if State.perf-status != "" : Mono { text: State.perf-status; color: Theme.text-mid; wrap: word-wrap; }
 
                         // WHEEL MODE — HyperScroll stages (class 0x0B — hardware-verify pending).
@@ -1671,10 +1662,10 @@ export component DevicePanel inherits VerticalLayout {
                                 gated: State.sel-can-hyperpoll;
                             }
                             if !State.sel-can-hyperpoll : GateNote {
-                                text: "this mouse polls up to 1000 Hz · set it in REPORT RATE above. 2000–8000 Hz HyperPolling needs Razer's separate HyperPolling Wireless Dongle.";
+                                text: "2000–8000 Hz needs Razer's HyperPolling Wireless Dongle";
                             }
                             if State.sel-can-hyperpoll : GateNote {
-                                text: "the EXTENDED hi-res rate (>1000 Hz) for HyperPolling hardware, distinct from the live REPORT RATE above.";
+                                text: "separate from REPORT RATE above";
                             }
                             if State.sel-can-hyperpoll : ContactRow {
                                 options: [1000, 2000, 4000, 8000];

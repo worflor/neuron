@@ -20,6 +20,9 @@
 //!   so a face fades IN over the base when a source appears and OUT when it
 //!   leaves, at a rate the user set in wall-clock milliseconds regardless of
 //!   how often the layer happens to render.
+//! - [`Lens`] — the user's restyle of a family's paint (hue shift, saturation, brightness),
+//!   applied to the client's own cells before they blend, so a game's palette can be remixed
+//!   without touching what the game sends.
 //! - [`merge_cells`] — the mode-aware black rule (see the function docs): the
 //!   one correct answer to "the game painted this LED black" that keeps a
 //!   mostly-black `Multiply` frame from blacking out the whole board.
@@ -31,7 +34,7 @@
 //! ramp's state survives across frames instead of resetting on every paint.
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicI16, AtomicU8, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
@@ -61,6 +64,86 @@ pub struct PaintPolicy {
     /// `None` = every surface allowed; `Some(set)` = only these surface keys
     /// receive this family's paint (the per-device scope toggle).
     surfaces: RwLock<Option<HashSet<String>>>,
+    /// The [`Lens`], stored as its three fields so the resolve path reads it lock-free.
+    hue_shift: AtomicI16,
+    saturation: AtomicU8,
+    brightness: AtomicU8,
+}
+
+/// A restyle applied to a family's paint before it blends: rotate the hue, scale the
+/// saturation, scale the brightness. The identity lens changes nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Lens {
+    /// Hue rotation in degrees, `-180..=180`.
+    pub hue_shift: i16,
+    /// Saturation in percent, `0..=200` (100 = unchanged, 0 = grey).
+    pub saturation: u8,
+    /// Brightness in percent, `0..=200` (100 = unchanged).
+    pub brightness: u8,
+}
+
+impl Default for Lens {
+    fn default() -> Self {
+        Lens { hue_shift: 0, saturation: 100, brightness: 100 }
+    }
+}
+
+impl Lens {
+    /// True when applying this lens would change nothing.
+    #[must_use]
+    pub fn is_identity(&self) -> bool {
+        *self == Lens::default()
+    }
+
+    /// Restyle one colour. Hue and saturation are rotated/scaled in HSV so an untouched colour
+    /// round-trips exactly; brightness scales the value and clamps.
+    #[must_use]
+    pub fn apply(&self, c: Rgb) -> Rgb {
+        if self.is_identity() {
+            return c;
+        }
+        let (r, g, b) = (f32::from(c.0) / 255.0, f32::from(c.1) / 255.0, f32::from(c.2) / 255.0);
+        let max = r.max(g).max(b);
+        let min = r.min(g).min(b);
+        let d = max - min;
+        let mut h = if d <= 0.0 {
+            0.0
+        } else if r >= g && r >= b {
+            60.0 * ((g - b) / d).rem_euclid(6.0)
+        } else if g >= b {
+            60.0 * ((b - r) / d + 2.0)
+        } else {
+            60.0 * ((r - g) / d + 4.0)
+        };
+        let mut s = if max <= 0.0 { 0.0 } else { d / max };
+        let mut v = max;
+        h = (h + f32::from(self.hue_shift)).rem_euclid(360.0);
+        s = (s * f32::from(self.saturation) / 100.0).clamp(0.0, 1.0);
+        v = (v * f32::from(self.brightness) / 100.0).clamp(0.0, 1.0);
+        let c = v * s;
+        let x = c * (1.0 - ((h / 60.0).rem_euclid(2.0) - 1.0).abs());
+        let m = v - c;
+        let (r1, g1, b1) = match (h / 60.0) as u32 {
+            0 => (c, x, 0.0),
+            1 => (x, c, 0.0),
+            2 => (0.0, c, x),
+            3 => (0.0, x, c),
+            4 => (x, 0.0, c),
+            _ => (c, 0.0, x),
+        };
+        let to = |f: f32| ((f + m) * 255.0).round().clamp(0.0, 255.0) as u8;
+        Rgb(to(r1), to(g1), to(b1))
+    }
+
+    /// Restyle every painted cell in place (transparent cells stay transparent).
+    pub fn apply_cells(&self, cells: &mut [Option<Rgb>]) {
+        if self.is_identity() {
+            return;
+        }
+        for c in cells.iter_mut().flatten() {
+            *c = self.apply(*c);
+        }
+    }
 }
 
 impl Default for PaintPolicy {
@@ -70,6 +153,9 @@ impl Default for PaintPolicy {
             strength: AtomicU8::new(100),
             fade_ms: AtomicU32::new(450),
             surfaces: RwLock::new(None),
+            hue_shift: AtomicI16::new(0),
+            saturation: AtomicU8::new(100),
+            brightness: AtomicU8::new(100),
         }
     }
 }
@@ -93,6 +179,9 @@ impl PaintPolicy {
             strength: AtomicU8::new(100),
             fade_ms: AtomicU32::new(0),
             surfaces: RwLock::new(None),
+            hue_shift: AtomicI16::new(0),
+            saturation: AtomicU8::new(100),
+            brightness: AtomicU8::new(100),
         })
     }
 
@@ -109,6 +198,22 @@ impl PaintPolicy {
         self.strength.store(strength.clamp(0, 100), Ordering::Relaxed);
         self.fade_ms.store(fade_ms.clamp(0, 2500), Ordering::Relaxed);
         *self.surfaces.write().unwrap_or_else(std::sync::PoisonError::into_inner) = surfaces;
+    }
+
+    /// Set the restyle lens (clamped to its documented ranges).
+    pub fn set_lens(&self, lens: Lens) {
+        self.hue_shift.store(lens.hue_shift.clamp(-180, 180), Ordering::Relaxed);
+        self.saturation.store(lens.saturation.min(200), Ordering::Relaxed);
+        self.brightness.store(lens.brightness.min(200), Ordering::Relaxed);
+    }
+
+    /// The current restyle lens.
+    pub fn lens(&self) -> Lens {
+        Lens {
+            hue_shift: self.hue_shift.load(Ordering::Relaxed),
+            saturation: self.saturation.load(Ordering::Relaxed),
+            brightness: self.brightness.load(Ordering::Relaxed),
+        }
     }
 
     pub fn blend_mode(&self) -> BlendMode {
@@ -270,8 +375,9 @@ impl LiveContent for PolicyLayer {
         if self.level <= MIN_VISIBLE_ALPHA {
             return vec![None; self.leds];
         }
-        let buf = self.cells.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        merge_cells(self.policy.blend_mode(), &buf)
+        let mut cells = self.cells.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        self.policy.lens().apply_cells(&mut cells);
+        merge_cells(self.policy.blend_mode(), &cells)
     }
 
     fn alpha(&self) -> f32 {
@@ -301,6 +407,33 @@ mod tests {
 
     fn buf(cells: Vec<Option<Rgb>>) -> Arc<Mutex<Vec<Option<Rgb>>>> {
         Arc::new(Mutex::new(cells))
+    }
+
+    #[test]
+    fn the_identity_lens_round_trips_every_colour() {
+        let lens = Lens::default();
+        for c in [Rgb(0, 0, 0), Rgb(255, 255, 255), Rgb(222, 153, 0), Rgb(4, 141, 144), Rgb(1, 2, 3)] {
+            assert_eq!(lens.apply(c), c);
+        }
+    }
+
+    #[test]
+    fn a_lens_rotates_hue_greys_out_and_scales_brightness() {
+        let red = Rgb(255, 0, 0);
+        assert_eq!(Lens { hue_shift: 120, ..Lens::default() }.apply(red), Rgb(0, 255, 0));
+        assert_eq!(Lens { hue_shift: -120, ..Lens::default() }.apply(red), Rgb(0, 0, 255));
+        assert_eq!(Lens { saturation: 0, ..Lens::default() }.apply(red), Rgb(255, 255, 255));
+        assert_eq!(Lens { brightness: 50, ..Lens::default() }.apply(red), Rgb(128, 0, 0));
+        assert_eq!(Lens { brightness: 200, ..Lens::default() }.apply(Rgb(100, 0, 0)), Rgb(200, 0, 0));
+    }
+
+    #[test]
+    fn a_policy_layer_paints_through_its_lens() {
+        let policy = PaintPolicy::opaque();
+        policy.set_lens(Lens { hue_shift: 120, ..Lens::default() });
+        let mut layer = PolicyLayer::new("kb".into(), 2, buf(vec![Some(Rgb(255, 0, 0)), None]), policy, 1.0);
+        let out = layer.render(Instant::now());
+        assert_eq!(out, vec![Some(Rgb(0, 255, 0)), None]);
     }
 
     #[test]

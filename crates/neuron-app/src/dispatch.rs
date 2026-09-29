@@ -527,6 +527,7 @@ fn run_worker(weak: slint::Weak<AppWindow>, stop: Arc<AtomicBool>, live_rx: Rece
     );
     // Build the ONE unified spine (bindings.toml + cast.toml + profiles/*.rules.toml + apps.toml).
     let rt = controls::build_runtime();
+    crate::chroma_lab::set_rules_listen(rt.binds_game_light());
     let exec = DispatchExecutor::new();
     let reg = neuron::registry::Registry::load().unwrap_or(neuron::registry::Registry {
         devices: Vec::new(),
@@ -852,6 +853,7 @@ fn live_tick(ctx: &mut LiveCtx) -> Duration {
         key_remap_release_all(&ctx.held_keys); // nor a held remapped key
         sniper_release_all(&ctx.devices, &ctx.sniper); // nor a held sniper (restore the DPI)
         *ctx.rt.borrow_mut() = controls::build_runtime();
+        crate::chroma_lab::set_rules_listen(ctx.rt.borrow().binds_game_light());
         // Re-arm the remap shim from the rebuilt engine (a rebind/added binding takes effect
         // here) — including the cast trigger's held-bind claim.
         {
@@ -1346,8 +1348,11 @@ fn fire_trigger(
     *LAST_ACTION_DESC
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = exec.last_action_desc();
-    // a real trigger fired: one-shot layers are now spent (the arming press never counts).
-    rt.note_fired(trigger);
+    // a real trigger fired: one-shot layers are now spent (the arming press never counts). Game
+    // lighting isn't the user's input, so it leaves an armed layer for their next press.
+    if !matches!(trigger, Trigger::GameLight { .. }) {
+        rt.note_fired(trigger);
+    }
     {
         let mut s = status.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         s.last_trigger.clone_from(&outcome.trigger);

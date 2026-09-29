@@ -27,6 +27,7 @@
 mod autostart;
 mod beacon;
 mod capture;
+mod chroma_lab;
 #[cfg(windows)]
 mod chroma_setup;
 mod control;
@@ -96,6 +97,42 @@ fn initial_runtime_mode(safe: bool) -> neuron::safety::RuntimeMode {
     } else {
         // Keep input disarmed until the GUI is ready to start live dispatch.
         neuron::safety::RuntimeMode::Device
+    }
+}
+
+/// Classify a status line onto the signal grammar. This runs on every text change and is the
+/// only authority for `status-kind`: "err" (consequence: a real failure), "listen" (neuron is
+/// waiting on the user), "note" (provisional: paused, unsaved, a nudge), else "info".
+fn status_kind(text: &str) -> &'static str {
+    let t = text.to_lowercase();
+    let has = |needles: &[&str]| needles.iter().any(|n| t.contains(n));
+    if has(&[
+        "failed",
+        "invalid",
+        "error",
+        "internal stall",
+        "couldn't",
+        "declined",
+        "unknown effect",
+        "is gone",
+    ]) {
+        "err"
+    } else if has(&["a macro is asking", "hold your trigger"]) {
+        "listen"
+    } else if has(&[
+        "[gated]",
+        "a trigger first",
+        "writes paused",
+        "not saved",
+        "no device",
+        "no profile",
+        "required",
+        "already exists",
+        "recovered from a crash",
+    ]) {
+        "note"
+    } else {
+        "info"
     }
 }
 
@@ -616,7 +653,7 @@ fn main() {
                     st.set_status_line(
                         "recovered from a crash \u{2014} the story is in neuron-crash.log".into(),
                     );
-                    st.set_status_kind("err".into());
+                    st.set_status_kind("note".into());
                 }
 
                 // ORGAN WATCH: a worker thread that stopped beating is surfaced while the app lives —
@@ -739,23 +776,7 @@ fn main() {
                         }
                     } else {
                         *seen = (text.clone(), Instant::now());
-                        // classify once, centrally: failures get the alarm tint.
-                        let t = text.to_lowercase();
-                        let err = [
-                            "failed",
-                            "writes paused",
-                            "no device",
-                            "invalid",
-                            "error",
-                            "not saved",
-                            "required",
-                            "already exists",
-                            "no profile",
-                            "cancelled",
-                        ]
-                        .iter()
-                        .any(|n| t.contains(n));
-                        st.set_status_kind(if err { "err".into() } else { "info".into() });
+                        st.set_status_kind(status_kind(&text).into());
                         st.set_status_stale(false);
                     }
                 }
@@ -1098,5 +1119,21 @@ mod startup_policy_tests {
         assert!(!arm_live_dispatch(true, true), "safe mode disarms input");
         assert!(arm_live_dispatch(false, true), "crash recovery restores normal live dispatch");
         assert!(!arm_live_dispatch(false, false), "unsupported input cannot arm");
+    }
+
+    #[test]
+    fn status_lines_classify_onto_the_signal_grammar() {
+        assert_eq!(status_kind("DPI write failed: read-back mismatch"), "err");
+        assert_eq!(status_kind("\u{26a0} weave silent 12s \u{2014} internal stall (flight log armed)"), "err");
+        assert_eq!(status_kind("a macro is asking \u{2014} hold the cast trigger and flick"), "listen");
+        assert_eq!(status_kind("whiteboard opening \u{2014} hold your trigger to ink"), "listen");
+        assert_eq!(status_kind("SAFE MODE \u{2014} input disarmed and device writes paused"), "note");
+        assert_eq!(status_kind("recovered from a crash \u{2014} the story is in neuron-crash.log"), "note");
+        assert_eq!(status_kind("press-to-bind a trigger first"), "note");
+        assert_eq!(status_kind("couldn't save the binding: disk full"), "err");
+        assert_eq!(status_kind("UAC declined \u{2014} run Neuron as admin to purge Synapse"), "err");
+        assert_eq!(status_kind("python installed"), "info");
+        assert_eq!(status_kind("capture cancelled"), "info");
+        assert_eq!(status_kind("ready"), "info");
     }
 }

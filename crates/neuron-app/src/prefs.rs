@@ -140,6 +140,10 @@ pub struct Prefs {
     /// Default ON — a rare, deliberate hardware action you generally want confirmed.
     #[serde(default = "default_true")]
     pub notif_side_plate: bool,
+    /// Game scene alerts from the Chroma lab (a flagged scene, like a menu, ending). Default ON:
+    /// they only fire for scenes the user flagged.
+    #[serde(default = "default_true")]
+    pub notif_game: bool,
     /// Audio-cue master volume, 0..1. Default 0.7.
     #[serde(default = "default_notif_volume")]
     pub notif_volume: f32,
@@ -191,6 +195,15 @@ pub struct Prefs {
     /// Chroma crossfade time in milliseconds, 0..=2500.
     #[serde(default = "default_chroma_paint_fade_ms")]
     pub host_chroma_paint_fade_ms: u32,
+    /// Chroma lens: hue rotation in degrees, -180..=180.
+    #[serde(default)]
+    pub host_chroma_lens_hue: i16,
+    /// Chroma lens: saturation percent, 0..=200.
+    #[serde(default = "default_lens_percent")]
+    pub host_chroma_lens_saturation: u8,
+    /// Chroma lens: brightness percent, 0..=200.
+    #[serde(default = "default_lens_percent")]
+    pub host_chroma_lens_brightness: u8,
     /// OPENRGB (tools) paint lane — same domain as the Chroma lane, its own settings. Defaults to
     /// "replace" so `OpenRGB` config tools keep their classic hard-takeover feel (a set colour
     /// appears as-sent) until the user opts into blending.
@@ -261,6 +274,10 @@ fn default_paint_strength() -> u8 {
 
 fn default_chroma_paint_fade_ms() -> u32 {
     450
+}
+
+fn default_lens_percent() -> u8 {
+    100
 }
 
 /// Default audio-cue volume — comfortable, not loud.
@@ -364,6 +381,7 @@ impl Default for Prefs {
             notif_macro: true,
             notif_battery: true,
             notif_side_plate: true,
+            notif_game: true,
             notif_volume: default_notif_volume(),
             notif_sound: default_notif_sound(),
             notif_panel: true,
@@ -375,6 +393,9 @@ impl Default for Prefs {
             host_chroma_paint_mode: default_chroma_paint_mode(),
             host_chroma_paint_strength: default_paint_strength(),
             host_chroma_paint_fade_ms: default_chroma_paint_fade_ms(),
+            host_chroma_lens_hue: 0,
+            host_chroma_lens_saturation: default_lens_percent(),
+            host_chroma_lens_brightness: default_lens_percent(),
             host_openrgb_paint_mode: default_openrgb_paint_mode(),
             host_openrgb_paint_strength: default_paint_strength(),
             host_openrgb_paint_fade_ms: 0,
@@ -450,6 +471,7 @@ impl Prefs {
         salvage!("notif_macro", notif_macro);
         salvage!("notif_battery", notif_battery);
         salvage!("notif_side_plate", notif_side_plate);
+        salvage!("notif_game", notif_game);
         salvage!("notif_volume", notif_volume);
         salvage!("notif_sound", notif_sound);
         salvage!("notif_panel", notif_panel);
@@ -461,6 +483,9 @@ impl Prefs {
         salvage!("host_chroma_paint_mode", host_chroma_paint_mode);
         salvage!("host_chroma_paint_strength", host_chroma_paint_strength);
         salvage!("host_chroma_paint_fade_ms", host_chroma_paint_fade_ms);
+        salvage!("host_chroma_lens_hue", host_chroma_lens_hue);
+        salvage!("host_chroma_lens_saturation", host_chroma_lens_saturation);
+        salvage!("host_chroma_lens_brightness", host_chroma_lens_brightness);
         salvage!("host_openrgb_paint_mode", host_openrgb_paint_mode);
         salvage!("host_openrgb_paint_strength", host_openrgb_paint_strength);
         salvage!("host_openrgb_paint_fade_ms", host_openrgb_paint_fade_ms);
@@ -540,6 +565,7 @@ impl Prefs {
             Kind::Macro => self.notif_macro,
             Kind::Battery => self.notif_battery,
             Kind::SidePlate => self.notif_side_plate,
+            Kind::Game => self.notif_game,
         }
     }
 }
@@ -780,6 +806,7 @@ pub fn set_notif_event(slug: &str, v: bool) -> String {
         "macro" => p.notif_macro = v,
         "battery" => p.notif_battery = v,
         "side_plate" => p.notif_side_plate = v,
+        "game" => p.notif_game = v,
         _ => return format!("unknown notify event '{slug}'"),
     }
     match p.save() {
@@ -1011,6 +1038,30 @@ pub fn set_host_chroma_paint_fade_ms(v: u32) -> String {
     p.host_chroma_paint_fade_ms = v.clamp(0, 2500);
     match p.save() {
         Ok(()) => format!("chroma games fade: {} ms", p.host_chroma_paint_fade_ms),
+        Err(e) => format!("save failed: {e}"),
+    }
+}
+
+/// The Chroma lane's lens as `(hue degrees, saturation %, brightness %)`, clamped.
+pub fn host_chroma_lens() -> (i16, u8, u8) {
+    let p = Prefs::load();
+    (
+        p.host_chroma_lens_hue.clamp(-180, 180),
+        p.host_chroma_lens_saturation.min(200),
+        p.host_chroma_lens_brightness.min(200),
+    )
+}
+
+pub fn set_host_chroma_lens(hue: i16, saturation: u8, brightness: u8) -> String {
+    let mut p = Prefs::load();
+    p.host_chroma_lens_hue = hue.clamp(-180, 180);
+    p.host_chroma_lens_saturation = saturation.min(200);
+    p.host_chroma_lens_brightness = brightness.min(200);
+    match p.save() {
+        Ok(()) => format!(
+            "chroma games lens: hue {:+}°, saturation {}%, brightness {}%",
+            p.host_chroma_lens_hue, p.host_chroma_lens_saturation, p.host_chroma_lens_brightness
+        ),
         Err(e) => format!("save failed: {e}"),
     }
 }
@@ -1357,6 +1408,7 @@ mod tests {
             notif_macro: !d.notif_macro,
             notif_battery: !d.notif_battery,
             notif_side_plate: !d.notif_side_plate,
+            notif_game: !d.notif_game,
             notif_volume: 0.125,
             notif_sound: "test-sound".into(),
             notif_panel: !d.notif_panel,
@@ -1368,6 +1420,9 @@ mod tests {
             host_chroma_paint_mode: "boost".into(),
             host_chroma_paint_strength: 65,
             host_chroma_paint_fade_ms: 700,
+            host_chroma_lens_hue: -45,
+            host_chroma_lens_saturation: 150,
+            host_chroma_lens_brightness: 80,
             host_openrgb_paint_mode: "tint".into(),
             host_openrgb_paint_strength: 33,
             host_openrgb_paint_fade_ms: 250,

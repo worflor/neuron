@@ -1084,6 +1084,8 @@ fn kind_anchor(k: Kind) -> i32 {
         // a side-plate swap sits a step ABOVE the routine cluster (and well clear of the battery
         // alarm's deliberately-low register) so a hardware-piece change reads as its own bright event.
         Kind::SidePlate => 5,
+        // a game alert means "come back", so it takes the top of the register
+        Kind::Game => 6,
     }
 }
 
@@ -1159,6 +1161,7 @@ fn kind_glyph(k: Kind) -> crate::overlay::WedgeGlyph {
         Kind::Macro => G::Terminal,
         Kind::Battery => G::Battery,
         Kind::SidePlate => G::SidePlate,
+        Kind::Game => G::Screen,
     }
 }
 
@@ -1214,6 +1217,7 @@ fn emit_sample(kind: Kind) {
         Kind::Macro => confirm::macro_fired("test macro"),
         Kind::Battery => confirm::battery(20, "Battery low", Some(45)),
         Kind::SidePlate => confirm::side_plate("12-button"),
+        Kind::Game => confirm::game_scene("Overwatch", "left menu"),
     }
 }
 

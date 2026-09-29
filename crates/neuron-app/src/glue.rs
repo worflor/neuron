@@ -800,6 +800,7 @@ fn ping_copy(k: neuron::confirm::Kind) -> (&'static str, &'static str, &'static 
         Kind::Profile => ("profile", "profile", "active"),
         Kind::Layer => ("layer", "layer", "HyperShift"),
         Kind::Macro => ("beacon", "beacon", "macro notify"),
+        Kind::Game => ("game", "game", "scene alerts"),
     }
 }
 
@@ -824,6 +825,7 @@ fn ping_slot(k: neuron::confirm::Kind) -> (u8, u8) {
         Kind::Profile => (2, 0),
         Kind::Layer => (2, 1),
         Kind::Macro => (2, 2),
+        Kind::Game => (2, 3),
     }
 }
 
@@ -5007,6 +5009,7 @@ pub fn install(app: &AppWindow) -> SharedRt {
             }
         });
     });
+    crate::chroma_lab::install(app);
     bind(app, &shared, |app, _sh| {
         let w = app.as_weak();
         app.global::<State>().on_set_host_openrgb(move |v| {
@@ -8092,6 +8095,7 @@ fn trigger_kind_str(t: &neuron::engine::Trigger) -> &'static str {
         Trigger::MicTap => "mic",
         Trigger::Hold { .. } => "hold",
         Trigger::Cast { .. } => "cast",
+        Trigger::GameLight { .. } => "game",
     }
 }
 

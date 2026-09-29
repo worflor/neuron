@@ -12,10 +12,23 @@
 // Rules this file encodes:
 //   * TRUE VOID black but QUIET — no graphite gray, no giant kinetic headers. Content sits on void.
 //   * MONOSPACE-FORWARD — data is the hero. The default font is the mono; prose is the exception.
-//   * ONE restrained signal accent — a single phosphor hue, used ONLY for live/active/connected, like
-//     an instrument readout. Never decoration. Everything else is monochrome ink on black.
+//   * FOUR SIGNAL LAMPS, each answering one question about the thing it sits on; everything else is
+//     monochrome ink on black. See `Signal` below. Never decoration.
 //   * Motion MECHANICAL not bouncy — controls settle (short, linear-ish); nothing animates AT you.
 //   * Dense but breathing — hairlines and negative space do the structuring, not boxes.
+
+// The signal grammar. Each lamp answers one question and has its own shape, so it still reads in
+// greyscale, in a terminal, and for colour-blind users:
+//   idle         nothing to report                        unlit dot   grey ink
+//   live         is it on?                                solid dot   accent (user-chosen)
+//   listening    does neuron have my input?               aperture    listen
+//   provisional  is it settled yet? (unsaved, unverified,  half dot    warn
+//                buffered, running low, paused on purpose)
+//   consequence  can I take it back? (no) / it failed     square      danger
+// The set is closed: a new feature maps onto one of these or stays grey. Importance is carried by
+// weight (lamp → outlined key → filled), never by adding a hue. Data colours (LEDs, swatches, weave
+// ink) are never signals.
+export enum Signal { idle, live, listening, provisional, consequence }
 
 export global Theme {
     // ── ground / void ────────────────────────────────────────────────────
@@ -33,34 +46,39 @@ export global Theme {
     out property <color> text-dim:   #5d646f;  // labels / inactive selector entries
     out property <color> text-faint: #353b44;  // units / hints / dim chrome / grid ticks
 
-    // ── the ONE accent (phosphor) + minimal signal pair ──────────────────
+    // ── signal hues ──────────────────────────────────────────────────────
     // A cold green-cyan phosphor — the colour of a powered oscilloscope trace. Reads as "live".
     // The accent is the app's ONE user-tunable colour: it's `in-out` so the SYSTEM panel (and Rust at
     // startup, from the saved preference) can swap it live. Everything accent-tinted DERIVES from it —
     // change this one value and the whole instrument recolours coherently (no stale hardcoded siblings).
-    in-out property <color> accent:    #4af2b0;  // LIVE / active / connected — the only colour
+    in-out property <color> accent:    #4af2b0;  // LIVE — active / connected / the committing key
     out property <color> accent-dim:   root.accent.darker(0.4);     // a quieted accent (related-but-idle ticks)
     out property <color> accent-ink:   root.accent.darker(0.93);    // ink that sits ON an accent fill (near-black)
     out property <color> accent-glow:  root.accent.with-alpha(0.1); // a 10% accent wash for the active-cell ground
     out property <color> accent-line:  root.accent.with-alpha(0.27);// accent at hairline strength (active borders)
-    // Two restrained status hues — ONLY true alarm/caution states, never layout.
-    out property <color> warn:        #f2b34a;  // battery low / caution / gated-but-armed
-    out property <color> danger:      #f25a6b;  // paused / disarmed / fail / danger
-    // a middle "caution" amber-orange, sitting between warn and danger — for a graded scale that
-    // wants a third rung (e.g. the maturity-tier badge: warn → caution → danger as it drops).
-    out property <color> caution:     #d2733a;  // warmer/redder than warn, not yet alarm
+    out property <color> warn:        #f2b34a;  // PROVISIONAL — unsaved, unverified, low, paused on purpose
+    out property <color> danger:      #f25a6b;  // CONSEQUENCE — irreversible, or failed
+    // the midpoint of a provisional → consequence ramp (the maturity-tier badge); never a signal alone
+    out property <color> caution:     #d2733a;
     // the status hues at hairline / wash strength — frames + grounds for caution/alarm cells
     // (mirrors the accent-line / accent-glow pair, so a failed probe reads like a lit-but-bad station)
     out property <color> warn-line:   #f2b34a45;
     out property <color> danger-line: #f25a6b45;
     out property <color> warn-glow:   #f2b34a1a;
     out property <color> danger-glow: #f25a6b1a;
-    // CAPTURE — the research-capture signal (rich-stroke recording, spellweaving). A warmer amber
-    // than warn, deliberately: it marks a MODE IDENTITY ("this stroke is being kept"), not a caution.
-    // The fourth and LAST signal hue; anything else stays monochrome or accent.
-    out property <color> capture:      #e6a93c;
-    out property <color> capture-line: #e6a93c45;
-    out property <color> capture-glow: #e6a93c1a;
+    // LISTENING — neuron holds the user's input: press-to-bind, stroke/gesture capture. Royal purple,
+    // lifted enough to read as fs-small ink on the void.
+    out property <color> listen:      #a58bff;
+    out property <color> listen-line: #a58bff45;
+    out property <color> listen-glow: #a58bff1a;
+    // a signal's hue; `idle` resolves to the neutral ink
+    public pure function hue(s: Signal) -> color {
+        if (s == Signal.live) { return root.accent; }
+        if (s == Signal.listening) { return root.listen; }
+        if (s == Signal.provisional) { return root.warn; }
+        if (s == Signal.consequence) { return root.danger; }
+        return root.text-mid;
+    }
     // an UNLIT lamp — the visible "off" dot every lamp gutter shows so labels never slide when a
     // signal toggles (Pill's idiom, now named for the rails/strips that draw their own lamps)
     out property <color> lamp-off:     #353b4480;   // text-faint at half strength
@@ -125,6 +143,10 @@ export global Theme {
     out property <duration> settle: 110ms;
     out property <duration> quick:  80ms;
     out property <duration> press-throw: 60ms;      // a key's travel on press
+    // hover answers the pointer at once and lets go slowly, so sweeping across a row leaves a soft
+    // trail instead of flicker: animate with `has-hover ? hover-in : hover-out`
+    out property <duration> hover-in: 30ms;
+    out property <duration> hover-out: 180ms;
     out property <duration> sheen: 340ms;           // the device-glyph sheen band's sweep
     // the delete choreography: content fades over fade-out, the row collapses at fade-out-hold —
     // the 20ms stagger is deliberate (the fade must finish before the space closes under it)

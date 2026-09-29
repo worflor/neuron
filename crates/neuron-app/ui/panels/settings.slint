@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
 
-import { Theme } from "../theme.slint";
-import { Card, SectionTitle, Label, Button, Toggle, Pill, Mono, Divider, PanelHead, Slider, SplitToggle, SplitButton, Contact, SubLabel, ColorPicker, Palette, Field, ConfirmButton } from "../widgets/controls.slint";
+import { Theme, Signal } from "../theme.slint";
+import { Card, SectionTitle, Label, Button, Toggle, Pill, Mono, Divider, PanelHead, Slider, SplitToggle, SplitButton, Contact, SubLabel, ColorPicker, Palette, Field, ConfirmButton, Lamp } from "../widgets/controls.slint";
 import { State } from "../state.slint";
 import { ChromaStreamRow, DiagRow } from "../models.slint";
 
@@ -129,10 +129,12 @@ component ConnStatus inherits HorizontalLayout {
 // hover; same grammar as the Disclosure atom, sized to sit inside a status row.
 component MoreLink inherits Rectangle {
     in property <bool> open;
+    in property <string> closed-text: "▸ more";
+    in property <string> open-text: "▾ less";
     callback clicked();
     width: t.preferred-width;
     t := Text {
-        text: root.open ? "▾ less" : "▸ more";
+        text: root.open ? root.open-text : root.closed-text;
         height: 100%;
         vertical-alignment: center;
         font-family: Theme.mono;
@@ -562,6 +564,13 @@ component PingIcon inherits Rectangle {
         Rectangle { x: 6.75px; y: 5px; width: 2.5px; height: 2.5px; border-radius: 1.25px; background: root.ink; }
         Rectangle { x: 6.75px; y: 9px; width: 2.5px; height: 2.5px; border-radius: 1.25px; background: root.ink; }
     }
+    // GAME — a screen on a stand (the notification's own glyph): a scene changed in a game you
+    // aren't looking at
+    if root.slug == "game" : Rectangle {
+        Rectangle { x: 1px; y: 2px; width: 14px; height: 10px; border-radius: 1.5px; border-width: 1.5px; border-color: root.ink; }
+        Rectangle { x: 7.25px; y: 12px; width: 1.5px; height: 2px; background: root.ink; }
+        Rectangle { x: 4.5px; y: 13.5px; width: 7px; height: 1.5px; border-radius: 0.75px; background: root.ink; }
+    }
 }
 
 // One PING-kind card for the grid — a compact icon + label + what-it-is, lit when the kind earns a
@@ -769,13 +778,9 @@ export component SettingsPanel inherits VerticalLayout {
                             }
                         }
                     }
-                    // condensed: WHAT a beacon is + how you answer one. The old paragraph also described
-                    // an on/off "wait for fullscreen" option that has no control — dropped; the live
-                    // registry below is the real surface (a macro's beacon, visible the moment it exists).
+                    // how you answer an ask; the registry rows below show the real macros
                     Mono {
-                        // one clause; the code literal moved out of the prose (the registry rows
-                        // below show the real macros, which is the actual teaching surface).
-                        text: "a macro can pause and ask you something · hold its trigger, flick to answer:";
+                        text: "hold the trigger and flick to answer";
                         color: Theme.text-dim;
                         wrap: word-wrap;
                     }
@@ -798,13 +803,10 @@ export component SettingsPanel inherits VerticalLayout {
                         spacing: 8px;
                         VerticalLayout {
                             alignment: center;
-                            Rectangle {
-                                width: 6px; height: 6px; border-radius: 1px;
-                                background: Theme.accent;
-                                // ~0.3 = a soft always-on "this is a loaded/armed beacon macro" light;
-                                // 1.0 = its ask is on screen right now.
-                                opacity: (State.beacon-active && State.beacon-macro == m.name) ? 1.0 : 0.3;
-                                animate opacity { duration: Theme.quick; }
+                            // listening while its ask is on screen; an unlit lamp otherwise
+                            Lamp {
+                                signal: Signal.listening;
+                                lit: State.beacon-active && State.beacon-macro == m.name;
                             }
                         }
                         VerticalLayout {
@@ -989,7 +991,7 @@ export component SettingsPanel inherits VerticalLayout {
                     max-width: 880px;
                     spacing: 13px;
                     SectionTitle { text: "CONFIG & MIGRATION"; }
-                    Label { text: "every setting is plain, hand-editable TOML and JSON in the run folder: bindings.toml, cast.toml, apps.toml, gestures.json, plus profiles/ and backups/."; }
+                    Label { text: "every setting is plain, hand-editable TOML and JSON"; }
                     HorizontalLayout {
                         // the coupled config verbs fuse into one deck. stretch: 0 makes the trailing
                         // spacer actually work (a layout-bearing element defaults to stretch 1 and
@@ -1003,7 +1005,6 @@ export component SettingsPanel inherits VerticalLayout {
                         }
                         Rectangle { horizontal-stretch: 1; }
                     }
-                    Mono { text: "import is a one-time flow."; color: Theme.text-faint; wrap: word-wrap; }
 
                     // PURGE SYNAPSE — once you've migrated in, evict Razer's resident slopware. Demotes its
                     // respawning SYSTEM services to manual-start (gone from boot, but Synapse can still be
@@ -1264,6 +1265,11 @@ export component SettingsPanel inherits VerticalLayout {
                                     open: State.host-chroma-detail-open;
                                     clicked => { State.host-chroma-detail-open = !State.host-chroma-detail-open; }
                                 }
+                                if State.host-chroma-live : MoreLink {
+                                    open: false;
+                                    closed-text: "lab in LIGHTING ›";
+                                    clicked => { State.chroma-lab-open = true; State.page = 1; }
+                                }
                                 Rectangle {}
                             }
                             if State.host-chroma-detail-open && State.host-chroma-streams.length > 0 : VerticalLayout {
@@ -1358,13 +1364,9 @@ export component SettingsPanel inherits VerticalLayout {
                         spacing: 7px;
                         for o in State.organs : HorizontalLayout {
                             spacing: 10px;
-                            Rectangle {
-                                width: 6px; height: 6px; border-radius: 1px;
-                                y: (parent.height - self.height) / 2;
-                                background: o.state == "beat" ? Theme.accent
-                                    : o.state == "stall" ? Theme.danger
-                                    : Theme.text-faint;
-                                animate background { duration: Theme.quick; }
+                            Lamp {
+                                signal: o.state == "stall" ? Signal.consequence : Signal.live;
+                                lit: o.state == "beat" || o.state == "stall";
                             }
                             VerticalLayout {
                                 alignment: center;
@@ -1440,7 +1442,6 @@ export component SettingsPanel inherits VerticalLayout {
                             alignment: center;
                             Button {
                                 text: "run diagnostics";
-                                primary: true;
                                 busy: State.diag-running;
                                 clicked => { State.run-diagnostics(); }
                             }

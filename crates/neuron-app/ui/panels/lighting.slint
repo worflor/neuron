@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
 
-import { Theme } from "../theme.slint";
-import { Card, SectionTitle, SubLabel, Label, Button, Field, Mono, Divider, PanelHead, Contact, Pill, Slider, Toggle, SplitToggle, SplitButton, IconButton, ColorPicker, SwatchRow, Palette, SelectableRow, GuideButton } from "../widgets/controls.slint";
+import { Theme, Signal } from "../theme.slint";
+import { ChromaLab } from "chromalab.slint";
+import { Card, SectionTitle, SubLabel, Label, Button, Field, Mono, Divider, PanelHead, Contact, Pill, Slider, Toggle, SplitToggle, SplitButton, IconButton, ColorPicker, SwatchRow, Palette, SelectableRow, GuideButton, FaderRow, Lamp } from "../widgets/controls.slint";
 import { DeviceRender } from "../widgets/render.slint";
 import { State } from "../state.slint";
 import { EffectTile, EffectParam } from "../models.slint";
@@ -182,74 +183,30 @@ component VisitorLane inherits VerticalLayout {
         }
         Rectangle { horizontal-stretch: 1; }
     }
-    HorizontalLayout {
-        spacing: 8px;
-        VerticalLayout { width: 76px; alignment: center; Mono { text: "strength"; color: Theme.text-dim; } }
-        VerticalLayout {
-            alignment: center; horizontal-stretch: 1;
-            Slider {
-                compact: true; wheel: false;
-                minimum: 0; maximum: 100; step: 5;
-                value: root.strength;
-                changed(v) => { root.strength-changed(v); }
-            }
-        }
-        VerticalLayout {
-            alignment: center; width: 48px;
-            Mono { text: Math.round(root.strength) + "%"; color: Theme.text-mid; horizontal-alignment: right; }
-        }
+    FaderRow {
+        label: "strength"; unit: "%"; readout-w: 56px;
+        minimum: 0; maximum: 100; step: 5;
+        value: root.strength;
+        changed(v) => { root.strength-changed(v); }
     }
-    HorizontalLayout {
-        spacing: 8px;
-        VerticalLayout { width: 76px; alignment: center; Mono { text: "fade"; color: Theme.text-dim; } }
-        VerticalLayout {
-            alignment: center; horizontal-stretch: 1;
-            Slider {
-                compact: true; wheel: false;
-                minimum: 0; maximum: 2500; step: 50;
-                value: root.fade;
-                changed(v) => { root.fade-changed(v); }
-            }
-        }
-        VerticalLayout {
-            alignment: center; width: 48px;
-            Mono { text: Math.round(root.fade) + "ms"; color: Theme.text-mid; horizontal-alignment: right; }
-        }
+    FaderRow {
+        label: "fade"; unit: "ms"; readout-w: 56px;
+        minimum: 0; maximum: 2500; step: 50;
+        value: root.fade;
+        changed(v) => { root.fade-changed(v); }
     }
     Mono { text: root.blurb; color: Theme.text-faint; wrap: word-wrap; }
 }
 
-// One labelled compact slider row — the weave-knobs row shape (label · track · readout). THE single
-// slider instrument the editor uses everywhere: the SPECTRUM editor's continuous knobs (motion
-// speed/depth/chaos, frame hold/fade) AND the auto-rendered TUNE param ranges (via ParamControl). One
-// shape, not two that rhyme. `unit` is appended to the readout (""/"s"); `label-w` sizes the label cell
-// (wider for the longer TUNE param names); the change is live.
-component SpecSlider inherits HorizontalLayout {
-    in property <string> label;
-    in property <length> label-w: 66px;
-    in property <float> minimum;
-    in property <float> maximum;
-    in property <float> step: 0.02;
-    in property <float> value;
-    in property <string> unit: "";
-    callback changed(float);
+// The editor's fine-grained fader row: the SPECTRUM editor's continuous knobs (motion
+// speed/depth/chaos, frame hold/fade) AND the auto-rendered TUNE param ranges (via ParamControl).
+// `label-w` sizes the label cell (wider for the longer TUNE param names); the change is live.
+component SpecSlider inherits FaderRow {
+    label-w: 66px;
+    readout-w: 48px;
+    step: 0.02;
+    decimals: 2;
     spacing: 9px;
-    VerticalLayout { alignment: center; width: root.label-w; Mono { text: root.label; color: Theme.text-dim; overflow: elide; } }
-    VerticalLayout {
-        alignment: center; horizontal-stretch: 1;
-        Slider {
-            compact: true; wheel: false;
-            minimum: root.minimum; maximum: root.maximum; step: root.step; value: root.value;
-            changed(v) => { root.changed(v); }
-        }
-    }
-    VerticalLayout {
-        alignment: center; width: 42px;
-        Mono {
-            text: round(root.value * 100) / 100 + root.unit;
-            color: Theme.text-mid; horizontal-alignment: right;
-        }
-    }
 }
 
 // One auto-rendered PARAM control. The effect's schema declares the row's `kind`; this renders the
@@ -415,7 +372,7 @@ component SpectrumEditor inherits VerticalLayout {
         HorizontalLayout {
             spacing: 7px;
             SplitButton {
-                left-text: "− remove"; left-danger: true;
+                left-text: "− remove";
                 left-enabled: State.light-stops.length > 1;
                 right-text: "+ add";
                 left-clicked => { State.remove-stop(root.stop-idx); }
@@ -471,19 +428,19 @@ component SpectrumEditor inherits VerticalLayout {
         }
         // speed paces every motion but Hold (which has nothing to move) — hidden honestly for Hold.
         if State.light-motion != "hold" : SpecSlider {
-            label: "speed"; minimum: 0; maximum: 3; step: 0.02;
+            label: "speed"; minimum: 0; maximum: 3; step: 0.02; has-home: true; home: 1;
             value: State.light-motion-speed;
             changed(v) => { State.set-motion-speed(v); }
         }
         // depth only shapes the breathe dip
         if State.light-motion == "breathe" : SpecSlider {
-            label: "depth"; minimum: 0; maximum: 1; step: 0.02;
+            label: "depth"; minimum: 0; maximum: 1; step: 0.02; has-home: true; home: 0.5;
             value: State.light-motion-depth;
             changed(v) => { State.set-motion-depth(v); }
         }
         // chaos only shapes the flow octaves
         if State.light-motion == "flow" : SpecSlider {
-            label: "chaos"; minimum: 0; maximum: 1; step: 0.02;
+            label: "chaos"; minimum: 0; maximum: 1; step: 0.02; has-home: true; home: 0.5;
             value: State.light-motion-chaos;
             changed(v) => { State.set-motion-chaos(v); }
         }
@@ -560,10 +517,10 @@ component SpectrumEditor inherits VerticalLayout {
                 }
             }
             // add a keyframe (a clone of the active) / delete the active one — the coupled pair fused
-            // into one full-width deck: destructive DELETE (danger, left), constructive + keyframe (right).
+            // into one full-width deck: DELETE (left), constructive + keyframe (right).
             // The delete half goes visibly DEAD at the last frame (left-enabled), never a silent no-op.
             SplitButton {
-                left-text: "delete frame"; left-danger: true;
+                left-text: "delete frame";
                 left-enabled: State.light-seq.length > 1;
                 right-text: "+ keyframe";
                 left-clicked => { State.remove-frame(root.frame-idx); }
@@ -592,12 +549,12 @@ component SpectrumEditor inherits VerticalLayout {
                     }
                 }
                 SpecSlider {
-                    label: "hold"; minimum: 0; maximum: 10; step: 0.1; unit: "s";
+                    label: "hold"; minimum: 0; maximum: 10; step: 0.1; decimals: 1; unit: "s";
                     value: State.light-seq[root.frame-idx].hold;
                     changed(v) => { State.set-frame-hold(root.frame-idx, v); }
                 }
                 SpecSlider {
-                    label: "crossfade"; minimum: 0; maximum: 5; step: 0.1; unit: "s";
+                    label: "crossfade"; minimum: 0; maximum: 5; step: 0.1; decimals: 1; unit: "s";
                     value: State.light-seq[root.frame-idx].fade;
                     changed(v) => { State.set-frame-fade(root.frame-idx, v); }
                 }
@@ -670,7 +627,7 @@ export component LightingPanel inherits VerticalLayout {
         // no device-name caption: the status strip 36px below already opens with the device name
         // (plus its LED geometry) — printing it twice in one header block read as generated filler.
         caption: "paint it · or hand it to your games";
-        if State.writes-paused : VerticalLayout { alignment: center; Pill { text: "WRITES PAUSED"; tint: Theme.danger; } }
+        if State.writes-paused : VerticalLayout { alignment: center; Pill { text: "WRITES PAUSED"; signal: Signal.provisional; tint: Theme.warn; } }
     }
     Divider {}
     Rectangle { height: Theme.lead-in; }
@@ -726,9 +683,13 @@ export component LightingPanel inherits VerticalLayout {
                 }
                 // the live-truth slot: a visitor painting OUTRANKS "~ live on device" (it IS
                 // what's live on the device); suppressed rides beside it as a quiet fact.
-                if State.light-foreign : Mono {
-                    text: "\u{25cf} " + (State.light-foreign-app == "" ? "another app" : State.light-foreign-app) + " is painting";
-                    color: Theme.accent;
+                if State.light-foreign : HorizontalLayout {
+                    spacing: 6px;
+                    VerticalLayout { alignment: center; Lamp {} }
+                    Mono {
+                        text: (State.light-foreign-app == "" ? "another app" : State.light-foreign-app) + " is painting";
+                        color: Theme.accent;
+                    }
                 }
                 if State.light-suppressed && !State.light-foreign : Mono {
                     text: (State.light-foreign-app == "" ? "a visitor" : State.light-foreign-app) + " connected \u{00b7} suppressed \u{00b7} ";
@@ -736,12 +697,16 @@ export component LightingPanel inherits VerticalLayout {
                 }
                 // no "~" prefix: the app's leader glyphs are "›" and "·" — a stray tilde was a
                 // one-off ornament that read as a typo rather than a status.
-                if State.compositing && !State.light-foreign : Mono { text: "\u{25cf} live on device"; color: Theme.accent-dim; }
+                if State.compositing && !State.light-foreign : HorizontalLayout {
+                    spacing: 6px;
+                    VerticalLayout { alignment: center; Lamp {} }
+                    Mono { text: "live on device"; color: Theme.text-mid; }
+                }
                 if !State.compositing && !State.light-foreign && !State.light-brush-on && State.light-effect != "" : Mono {
                     text: "preview only"; color: Theme.text-faint;
                 }
-                if State.light-brush-on : Mono { text: "brush down · L paint · R erase · drag sweeps"; color: Theme.accent; }
-                if State.light-place-on : Mono { text: "place mode · drag a rectangle to set this layer's area"; color: Theme.accent; }
+                if State.light-brush-on : Mono { text: "brush down · L paint · R erase · drag sweeps"; color: Theme.listen; }
+                if State.light-place-on : Mono { text: "place mode · drag a rectangle to set this layer's area"; color: Theme.listen; }
             }
             // the render itself — capped to a comfortable subject width and centred on the void so it
             // reads as the page's calm subject instead of stretching edge-to-edge into a banner.
@@ -880,13 +845,13 @@ export component LightingPanel inherits VerticalLayout {
                 // a READOUT layer (vitals) is honest about being a live device gauge, not a tunable light
                 // show — it has a rate + a placement but no colour ramp or knobs, so point at what it IS.
                 if State.light-is-readout : Mono {
-                    text: "a live readout of battery and charge. place it anywhere on the render.";
+                    text: "battery and charge, live";
                     color: Theme.text-faint; wrap: word-wrap;
                 }
                 // a hand-painted `custom` frame owns its pixels directly — no ramp, no knobs. It's edited
                 // with the brush on the render, so the inspector just points there instead of faking knobs.
                 if State.light-effect == "custom" : Mono {
-                    text: "a hand-painted frame. pick up the brush on the render to edit its pixels.";
+                    text: "hand-painted · pick up the brush to edit";
                     color: Theme.text-faint; wrap: word-wrap;
                 }
 
@@ -962,7 +927,7 @@ export component LightingPanel inherits VerticalLayout {
                         Rectangle {}
                         Button {
                             text: State.light-brush-on ? "put brush down" : "pick up brush";
-                            primary: State.light-brush-on;
+                            signal: State.light-brush-on ? Signal.listening : Signal.idle;
                             clicked => { State.toggle-brush(); }
                         }
                     }
@@ -994,11 +959,11 @@ export component LightingPanel inherits VerticalLayout {
                         }
                         HorizontalLayout {
                             spacing: 7px;
-                            // the canvas couplet fused: destructive CLEAR (danger, left) + constructive FILL
+                            // the canvas couplet fused: CLEAR (left; a draft until pushed, so not danger) + FILL
                             // (right). PUSH FRAME stays a separate primary key beside it — it's the commit,
                             // distinct from the fill/clear pair.
                             SplitButton {
-                                left-text: "clear"; left-danger: true;
+                                left-text: "clear";
                                 right-text: "fill";
                                 left-clicked => { State.clear-grid(); }
                                 right-clicked => { State.fill-grid(); }
@@ -1031,19 +996,15 @@ export component LightingPanel inherits VerticalLayout {
                         spacing: 7px;
                         Button {
                             text: State.light-place-on ? "done placing" : "place on the render";
-                            primary: State.light-place-on;
+                            signal: State.light-place-on ? Signal.listening : Signal.idle;
                             clicked => { State.toggle-place(); }
                         }
                         Rectangle {}
                         Button {
-                            text: "reset placement"; danger: true;
+                            text: "reset placement";
                             enabled: State.light-layer-placed;
                             clicked => { State.reset-layer-region(); }
                         }
-                    }
-                    if State.light-place-on : Mono {
-                        text: "drag a rectangle on the render. the keys inside it become this layer's area.";
-                        color: Theme.text-faint; wrap: word-wrap;
                     }
                 }
                 // No APPLY transport: lighting AUTO-STREAMS. Every edit debounce-applies the current stack
@@ -1052,6 +1013,10 @@ export component LightingPanel inherits VerticalLayout {
                 // Settings) — a page-local stop would be undone by the very next edit, so it's gone.
             }
         }
+
+    }
+
+    Rectangle { height: Theme.section-gap; }
 
         // ── VISITORS — how EXTERNAL paint composes with your lighting. Games speak Chroma, tools
         // speak OpenRGB (both enabled in SYSTEM → CONNECTIONS); the arbiter blends them instead of
@@ -1126,7 +1091,7 @@ export component LightingPanel inherits VerticalLayout {
                         }
                     }
                     Mono {
-                        text: "toggle a device off to keep it yours. no visitor paints it, Chroma or OpenRGB.";
+                        text: "off = no visitor paints it";
                         color: Theme.text-faint; wrap: word-wrap;
                     }
                 }
@@ -1141,11 +1106,40 @@ export component LightingPanel inherits VerticalLayout {
                         toggled(v) => { State.set-host-base-always-wins(v); }
                     }
                     Mono {
-                        text: "when on, your lighting outranks every visitor. they keep painting underneath and show up as suppressed.";
+                        text: "visitors keep painting underneath, shown as suppressed";
                         color: Theme.text-faint; wrap: word-wrap;
                     }
                 }
             }
+            // CHROMA LAB — what the connected game paints, read as layers; hide, name, bind and
+            // restyle it right beside the lane that blends it.
+            VerticalLayout {
+                spacing: 8px;
+                HorizontalLayout {
+                    spacing: 9px;
+                    SubLabel { text: "CHROMA LAB"; }
+                    VerticalLayout {
+                        alignment: center;
+                        Mono { text: "what a chroma game is painting, as layers"; color: Theme.text-faint; font-size: Theme.fs-small; }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    Toggle {
+                        horizontal-stretch: 0;
+                        width: 96px;
+                        caption: "show";
+                        checked: State.chroma-lab-open;
+                        toggled(v) => { State.chroma-lab-open = v; }
+                    }
+                }
+                // fades in where it opens (it's the page's last block, so nothing below moves); the
+                // lab only ticks, and the tap only reads, while it's open
+                if State.chroma-lab-open : Rectangle {
+                    opacity: 0;
+                    init => { self.opacity = 1; }
+                    animate opacity { duration: 180ms; easing: ease-out; }
+                    VerticalLayout { ChromaLab { } }
+                }
+            }
+
         }
-    }
 }

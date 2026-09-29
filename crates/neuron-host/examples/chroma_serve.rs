@@ -35,7 +35,6 @@ fn main() {
     let mut last = String::new();
     for t in 0..240 {
         let apps: Vec<String> = srv.registered_apps().into_iter().map(|a| a.name).collect();
-        let frames = srv.read_device_frames();
         let session = srv.latest_session();
 
         let mut line = String::new();
@@ -45,15 +44,10 @@ fn main() {
         if let Some(s) = session {
             let _ = write!(line, "session(pid={} access={}) ", s.session_id, s.active_count);
         }
-        for (dt, leds) in &srv.frames() {
-            let class = match dt {
-                0x01 => "kbd", 0x02 => "mouse", 0x04 => "headset",
-                0x08 => "mousepad", 0x10 => "keypad", 0x80 => "chromalink", _ => "dev",
-            };
-            let (r, g, b) = leds.first().copied().unwrap_or((0, 0, 0));
-            let _ = write!(line, "[{class}: {} LEDs rgb({r},{g},{b})] ", leds.len());
+        for f in &srv.frames() {
+            let (r, g, b) = f.cells.first().copied().unwrap_or((0, 0, 0));
+            let _ = write!(line, "[{}: {} {} cells rgb({r},{g},{b})] ", f.class.name(), f.effect.name(), f.len());
         }
-        let _ = &frames;
         if !line.is_empty() && line != last {
             println!("t={:>3}s  {line}", t / 2);
             last = line;

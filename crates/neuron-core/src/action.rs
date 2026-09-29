@@ -724,6 +724,22 @@ fn toggle() -> String {
 }
 
 impl Action {
+    /// True for actions that only give FEEDBACK — OBS control, a profile switch, output volume
+    /// and mute — and never synthesize input or touch the game. The only actions a
+    /// [`Trigger::GameLight`](crate::engine::Trigger::GameLight) rule may run.
+    #[must_use]
+    pub fn is_feedback(&self) -> bool {
+        matches!(
+            self,
+            Action::Noop
+                | Action::Obs { .. }
+                | Action::ProfileSwitch { .. }
+                | Action::ProfileCycle { .. }
+                | Action::OutputMute { .. }
+                | Action::OutputGain { .. }
+        )
+    }
+
     /// A short human description (for `show`, logs, and a future GUI label).
     #[must_use]
     pub fn describe(&self) -> String {

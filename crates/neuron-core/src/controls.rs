@@ -1323,6 +1323,17 @@ impl Runtime {
         self.poll_needed
     }
 
+    /// Does the active engine bind a [`Trigger::GameLight`] anywhere (base or any layer)? Scans
+    /// the rule set, so call it when the runtime is rebuilt, not per tick.
+    #[must_use]
+    pub fn binds_game_light(&self) -> bool {
+        self.engine
+            .rules
+            .iter()
+            .chain(self.engine.layers.values().flatten())
+            .any(|r| matches!(r.trigger, Trigger::GameLight { .. }))
+    }
+
     /// Set the layer stance + timing from feel config (see [`crate::feel`]).
     pub fn set_feel(&mut self, feel: &crate::feel::FeelConfig) {
         self.layer_mode = feel.hypershift;

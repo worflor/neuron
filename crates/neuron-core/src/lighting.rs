@@ -1025,6 +1025,49 @@ pub(crate) fn clear_broadcast() {
     *broadcast_slot().lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
 }
 
+// ── the live GAME feed: the Chroma lab pushes, the `gamelight` pattern pulls ──────────────
+//
+// What a connected Chroma game is painting, reduced to what every other device can wear: the
+// game's ambient colour at rest, and the colour + strength of an effect while one plays. Pushed
+// by the app's Chroma lab from the game's own frames; cleared when the game leaves, so the layer
+// never shows a stale game.
+
+/// One snapshot of the game feed.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct GameFeed {
+    /// The game's resting colour, when it holds one.
+    pub ambient: Option<Rgb>,
+    /// The colour of the effect playing now and its strength in `[0, 1]` (fading after it ends).
+    pub effect: Option<(Rgb, f32)>,
+}
+
+fn game_slot() -> &'static Mutex<(Option<GameFeed>, Option<std::time::Instant>)> {
+    static G: OnceLock<Mutex<(Option<GameFeed>, Option<std::time::Instant>)>> = OnceLock::new();
+    G.get_or_init(|| Mutex::new((None, None)))
+}
+
+/// Publish the game feed (`None` = no game: the layer goes dark).
+pub fn publish_game_feed(f: Option<GameFeed>) {
+    game_slot().lock().unwrap_or_else(std::sync::PoisonError::into_inner).0 = f;
+}
+
+/// The latest game feed. Reading it marks the feed as wanted (see [`game_feed_wanted`]).
+pub(crate) fn latest_game_feed() -> Option<GameFeed> {
+    let mut g = game_slot().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    g.1 = Some(std::time::Instant::now());
+    g.0
+}
+
+/// True when a `gamelight` layer has rendered within the last two seconds, so the producer can
+/// idle when nothing on any board shows the game.
+pub fn game_feed_wanted() -> bool {
+    game_slot()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .1
+        .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(2))
+}
+
 // ── the live HOLD-STATE feed: the dispatch loop pushes, the `modeheld` pattern pulls ─────
 //
 // Edge-accurate input-mode truth: is a hold layer (HyperShift) engaged, is a sniper hold live?

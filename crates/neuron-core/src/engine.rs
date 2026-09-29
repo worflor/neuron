@@ -65,6 +65,11 @@ pub enum Trigger {
     /// `Action`, so "tap-then-hold opens teleport" is a real `Trigger -> Action` rule (remappable
     /// to any action), not a hard-wired instrument route in the capture state machine.
     Cast { taps: u8 },
+    /// A recurring lighting effect a Chroma game played, as the Chroma lab grouped it. `app` is
+    /// an exe-name needle (like [`Trigger::AppFocus`]); `effect` is the name the user gave the
+    /// effect, or its `#id`. Game lighting may only drive feedback: [`Engine::resolve`] drops
+    /// any rule on this trigger whose action is not [`Action::is_feedback`].
+    GameLight { app: String, effect: String },
 }
 
 impl Trigger {
@@ -90,6 +95,7 @@ impl Trigger {
             Trigger::MicTap => "mic tap".into(),
             Trigger::Hold { layer } => format!("hold layer '{layer}'"),
             Trigger::Cast { taps } => format!("cast {taps}-tap rhythm"),
+            Trigger::GameLight { app, effect } => format!("game light '{effect}' in '{app}'"),
         }
     }
 }
@@ -420,6 +426,10 @@ impl Engine {
             (Trigger::AppFocus { app: needle }, Trigger::AppFocus { app }) => {
                 app.to_lowercase().contains(&needle.to_lowercase())
             }
+            (
+                Trigger::GameLight { app: needle, effect: want },
+                Trigger::GameLight { app, effect },
+            ) => app.to_lowercase().contains(&needle.to_lowercase()) && want.eq_ignore_ascii_case(effect),
             (a, b) => a == b,
         }
     }
@@ -452,6 +462,12 @@ impl Engine {
                 .iter()
                 .filter(|r| Self::matches(&r.trigger, fired)),
         );
+        // Game lighting is read out of a game's own output; letting it synthesize input would
+        // turn a lighting feed into gameplay automation. Enforced here, the one resolve every
+        // dispatch path goes through, so no rule file can opt out.
+        if matches!(fired, Trigger::GameLight { .. }) {
+            out.retain(|r| r.action.is_feedback());
+        }
         out
     }
 
@@ -659,6 +675,10 @@ mod tests {
                 layer: "sniper".into(),
             },
             Trigger::Cast { taps: 1 },
+            Trigger::GameLight {
+                app: "overwatch".into(),
+                effect: "ult wave".into(),
+            },
         ];
         for t in variants {
             let s = serde_json::to_string(&t).unwrap();
@@ -708,6 +728,35 @@ mod tests {
                 app: "chrome.exe".into()
             }
         ));
+    }
+
+    #[test]
+    fn game_light_matches_app_needle_and_effect_name() {
+        let rule = Trigger::GameLight { app: "overwatch".into(), effect: "Ult Wave".into() };
+        let fired = |app: &str, effect: &str| Trigger::GameLight { app: app.into(), effect: effect.into() };
+        assert!(Engine::matches(&rule, &fired("Overwatch.exe", "ult wave")));
+        assert!(!Engine::matches(&rule, &fired("Overwatch.exe", "#3")));
+        assert!(!Engine::matches(&rule, &fired("valorant.exe", "ult wave")));
+    }
+
+    /// Game lighting may only drive feedback. A rule file that binds a keypress, a click, a
+    /// macro, or a shell command to a game-light trigger must never fire it.
+    #[test]
+    fn game_light_rules_never_resolve_to_input_or_scripts() {
+        use crate::action::{MouseButtonKind, ObsOp};
+        let t = || Trigger::GameLight { app: "overwatch".into(), effect: "ult".into() };
+        let engine = Engine::new(vec![
+            Rule::new(t(), Action::Key { key: "q".into() }),
+            Rule::new(t(), Action::MouseButton { button: MouseButtonKind::Left }),
+            Rule::new(t(), Action::Run { cmd: "calc".into() }),
+            Rule::new(t(), Action::Sequence { steps: Vec::new() }),
+            Rule::new(t(), Action::DpiSet { dpi: 400 }),
+            Rule::new(t(), Action::Obs { op: ObsOp::Replay, arg: String::new() }),
+        ]);
+        let fired = Trigger::GameLight { app: "Overwatch.exe".into(), effect: "ult".into() };
+        let resolved = engine.resolve(&fired);
+        assert_eq!(resolved.len(), 1, "only the OBS feedback rule survives: {resolved:?}");
+        assert!(matches!(resolved[0].action, Action::Obs { .. }));
     }
 
     #[test]

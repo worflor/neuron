@@ -15,7 +15,8 @@ import {
     DeviceRow, ChromaDeviceRow, ChromaStreamRow, RuleRow, ProfileRow, AppRuleRow, EffectRow, RadialSector, GlyphChip, ImportLine,
     DiagRow, ActionChoice, OrganRow, MaterialCard, KnobRow, PingKind,
     PocketCard, BeaconMacro, RhythmBindRow, MacroBlock, MacroCard, EffectTile, EffectParam,
-    SpectrumStop, SpectrumFrame
+    SpectrumStop, SpectrumFrame,
+    ChromaLabCell, ChromaLabSwatch, ChromaLabStrip, ChromaLabTemplate, ChromaLabMark, ChromaLabScene
 } from "models.slint";
 
 export global State {
@@ -35,7 +36,7 @@ export global State {
     in-out property <string> app-version: "";
     in-out property <string> run-dir: "";
     in-out property <string> status-line: "ready";   // the live status readout
-    in-out property <string> status-kind: "info";    // "info" | "err" — failures get the alarm tint
+    in-out property <string> status-kind: "info";    // "info" | "listen" | "note" (provisional) | "err" (consequence)
     in-out property <bool> status-stale: false;      // message has aged out (dim it — freshness is honest)
     in-out property <string> focused-app: "—";       // app-aware switch input
 
@@ -705,6 +706,43 @@ export global State {
     in-out property <bool> host-base-always-wins: false;   // your lighting outranks every visitor
     in-out property <bool> host-chroma-detail-open: false;
     in-out property <[ChromaStreamRow]> host-chroma-streams;
+    // Chroma lab: the connected game's own picture, split into scene layers (chroma_lab.rs).
+    in-out property <bool> chroma-lab-open: false;
+    in-out property <string> chroma-lab-status: "";       // why nothing shows; empty while a game paints
+    in-out property <string> chroma-lab-game: "";
+    in-out property <bool> chroma-lab-fresh: false;       // the game wrote within the last second
+    in-out property <int> chroma-lab-fps: 0;
+    in-out property <string> chroma-lab-now: "";          // "▶ ult wave" while an effect plays
+    in-out property <int> chroma-lab-cols: 22;
+    in-out property <[ChromaLabCell]> chroma-lab-cells;
+    in-out property <[ChromaLabSwatch]> chroma-lab-roles;
+    in-out property <[ChromaLabStrip]> chroma-lab-strips;
+    in-out property <[ChromaLabTemplate]> chroma-lab-templates;
+    in-out property <[ChromaLabMark]> chroma-lab-marks;
+    in-out property <string> chroma-lab-readout: "";      // the one line under the board
+    in-out property <int> chroma-lab-hover: -1;            // board cell under the pointer
+    in-out property <int> chroma-lab-spot: -2;             // spotlit cell group (-2 none)
+    in-out property <int> chroma-lab-replay: -1;           // effect id replaying while hovered
+    in-out property <bool> chroma-lab-compare: false;      // board held: show the game's own colours
+    in-out property <int> chroma-lab-selected: -1;         // effect id whose drawer is open
+    in-out property <string> chroma-lab-capture: "";       // "save 31s" once frames are held
+    in-out property <string> chroma-lab-scene: "";         // the scene the board last settled into
+    in-out property <string> chroma-lab-kb-effect: "";     // what the game wrote to the keyboard
+    in-out property <[ChromaLabScene]> chroma-lab-scenes;
+    in-out property <int> chroma-lab-scene-selected: -1;   // scene id whose drawer is open
+    in-out property <float> chroma-lens-hue: 0;
+    in-out property <float> chroma-lens-saturation: 100;
+    in-out property <float> chroma-lens-brightness: 100;
+    callback chroma-lab-tick();
+    callback chroma-lab-rename(int, string);
+    callback chroma-lab-hide(int, bool);
+    callback chroma-lab-bind(int, int, string);            // effect id, action kind, scene/profile
+    callback chroma-lab-scene-rename(int, string);
+    callback chroma-lab-scene-alert(int, bool);
+    callback chroma-lab-scene-bind(int, int, string);      // scene id, action kind, scene/profile
+    callback chroma-lab-save-capture();
+    callback chroma-lab-forget();
+    callback chroma-lab-set-lens(float, float, float);     // hue°, saturation %, brightness %
     in-out property <string> host-obs-password: "";        // obs-websocket Server Password (masked field)
     in-out property <string> host-chroma-status: "";       // honest per-protocol readout
     in-out property <string> host-openrgb-status: "";

@@ -11,8 +11,47 @@
 // a real popup action palette (the blind forward-only rotary is gone), busy/press states, and
 // validation feedback that lives ON the control instead of in a distant status line.
 
-import { Theme } from "../theme.slint";
+import { Theme, Signal } from "../theme.slint";
 import { State } from "../state.slint";
+
+// A SIGNAL LAMP — shaped by its signal so it reads without colour: live = solid dot, listening =
+// aperture (ring + pupil), provisional = half dot, consequence = square. Unlit, any signal draws the
+// plain lamp-off dot. `tint` overrides the hue (a dimmed or data-driven ink) and keeps the shape.
+// The root is a transparent cell a layout may stretch; the lamp centres itself inside it.
+export component Lamp inherits Rectangle {
+    in property <Signal> signal: Signal.live;
+    in property <bool> lit: true;
+    in property <color> tint: Theme.hue(root.signal);
+    // 6px, not the 5px dot: at 5px the aperture and half-dot collapse into a plain ring
+    in property <length> size: Theme.dot-lg;
+    property <bool> ringed: root.lit && (root.signal == Signal.listening || root.signal == Signal.provisional);
+    min-width: root.size;
+    max-width: root.size;
+    min-height: root.size;
+    body := Rectangle {
+        width: root.size;
+        height: root.size;
+        x: (root.width - self.width) / 2;
+        y: (root.height - self.height) / 2;
+        clip: true;
+        border-radius: (root.lit && root.signal == Signal.consequence) ? 1px : root.size / 2;
+        background: !root.lit ? Theme.lamp-off : root.ringed ? transparent : root.tint;
+        border-width: root.ringed ? 1px : 0px;
+        border-color: root.tint;
+        animate background, border-color { duration: Theme.quick; }
+        if root.lit && root.signal == Signal.listening : Rectangle {
+            width: 2px; height: 2px; border-radius: 1px;
+            x: (body.width - self.width) / 2;
+            y: (body.height - self.height) / 2;
+            background: root.tint;
+        }
+        if root.lit && root.signal == Signal.provisional : Rectangle {
+            x: 0; y: 0;
+            width: body.width / 2; height: body.height;
+            background: root.tint;
+        }
+    }
+}
 
 // A grouping surface — an instrument "bezel". Near-invisible: a hair above the void with a single
 // hairline border, no glow, no shadow. Organizes without shouting. When `active`, the bezel picks up
@@ -76,19 +115,21 @@ export component Contact inherits Rectangle {
     // when false: dimmed ink + inert TouchArea (mirrors SplitToggle's disabled state), so a gated
     // contact never has to be hand-rolled at the call site.
     in property <bool> enabled: true;
+    // the lit hue; a contact that starts a capture lights listening instead of live
+    in property <color> tint: Theme.accent;
     callback clicked();
     horizontal-stretch: root.fill ? 1 : 0;
     height: root.desc != "" ? 40px : 24px;
     clip: true;   // a long label elides within the contact rather than overrunning it
     border-radius: Theme.radius-sm;
     // pressed drops to well-hi (the quiet pressed tier every keyed control now shows); hover to well.
-    background: active ? Theme.accent-glow
+    background: active ? root.tint.with-alpha(0.1)
         : (root.enabled && cta.pressed) ? Theme.well-hi
         : (root.enabled && cta.has-hover) ? Theme.well
         : transparent;
     border-width: Theme.hair;
-    border-color: active ? Theme.accent-line : transparent;
-    animate background, border-color { duration: Theme.quick; }
+    border-color: active ? root.tint.with-alpha(0.27) : transparent;
+    animate background, border-color { duration: cta.has-hover ? Theme.hover-in : Theme.hover-out; }
     HorizontalLayout {
         padding-left: 10px;
         padding-right: 10px;
@@ -99,14 +140,14 @@ export component Contact inherits Rectangle {
                 text: root.label;
                 overflow: elide;
                 color: !root.enabled ? Theme.text-faint
-                    : root.active ? Theme.accent
+                    : root.active ? root.tint
                     : (cta.has-hover ? Theme.text-mid : Theme.text-dim);
                 font-size: Theme.fs-small;
                 font-family: Theme.mono;
                 font-weight: root.active ? 700 : 500;
                 letter-spacing: Theme.track-4;
                 vertical-alignment: center;
-                animate color { duration: Theme.quick; }
+                animate color { duration: cta.has-hover ? Theme.hover-in : Theme.hover-out; }
             }
             if root.desc != "" : Text {
                 text: root.desc;
@@ -135,10 +176,10 @@ export component Pill inherits Rectangle {
     in property <bool> selected: false;    // a CHOSEN CHIP — lights its whole body, never a reflowing dot
     in property <bool> clickable: false;   // when true, the pill is a button (reports `clicked`)
     in property <bool> enabled: true;      // when false: dimmed ink + inert (mirrors Button's disabled state)
-    // the LIT hue — phosphor accent by default; a signal pill that means something OTHER than "live"
-    // (the capture-amber RICH badge) recolours its whole lit state here, not by fighting `tint` (which
-    // only inks the UNLIT label/gutter). Existing pills change nothing.
-    in property <color> live-tint: Theme.accent;
+    // which lamp this pill wears: its shape, and the default lit hue. `tint` still inks the unlit
+    // label and gutter, so an unlit signalled pill (WRITES PAUSED) sets both.
+    in property <Signal> signal: Signal.live;
+    in property <color> live-tint: Theme.hue(root.signal);
     callback clicked();
     // "lit" = the phosphor state, from either a live signal OR a chosen-chip selection.
     property <bool> lit: root.live || root.selected;
@@ -147,16 +188,16 @@ export component Pill inherits Rectangle {
     // HUG THE LABEL — a pill is a badge, not a fill. Without this it balloons to share leftover row space
     // (a stretchy row hands extra width to whatever can expand), stranding the label left with dead space.
     // Cap the pill at its content: the label's glyph-measured preferred-width + the box's own chrome —
-    // 8px×2 padding, plus the 5px lamp + 5px gutter on a non-clickable status pill. min-width stays low
+    // 8px×2 padding, plus the lamp + 5px gutter on a non-clickable status pill. min-width stays low
     // (the label keeps min-width:0 + elide), so a genuinely tight row can still shrink and truncate it.
-    max-width: lbl.preferred-width + (root.clickable ? 16px : 26px);
+    max-width: lbl.preferred-width + (root.clickable ? 16px : 21px + Theme.dot-lg);
     border-radius: Theme.radius-sm;
     background: lit ? root.live-tint.with-alpha(0.1) : (root.clickable && pill-ta.has-hover ? Theme.well : transparent);
     border-width: Theme.hair;
     border-color: lit ? root.live-tint.with-alpha(0.27)
         : root.clickable ? (pill-ta.has-hover ? Theme.text-dim : Theme.text-faint)
         : Theme.line;
-    animate background, border-color { duration: Theme.quick; }
+    animate background, border-color { duration: pill-ta.has-hover ? Theme.hover-in : Theme.hover-out; }
     pill-ta := TouchArea {
         enabled: root.clickable && root.enabled;
         mouse-cursor: (root.clickable && root.enabled) ? MouseCursor.pointer : MouseCursor.default;
@@ -169,12 +210,11 @@ export component Pill inherits Rectangle {
         // The lamp gutter — a status pill (non-clickable) ALWAYS reserves the 5px dot so its label
         // never slides when the signal toggles (ONLINE↔ASLEEP): dark when off, phosphor when live. A
         // clickable chip has no lamp — its whole body lights when `selected`, so it never grows.
-        if !root.clickable : Rectangle {
-            width: 5px; height: 5px; border-radius: 3px;
-            y: (parent.height - self.height) / 2;
-            // lit = phosphor lamp; UNLIT = a dim dot in the pill's own ink — a visible "off" lamp, NOT
-            // transparent. A same-as-background dot reads as an empty gap and skews the label off-centre.
-            background: root.live ? root.live-tint : root.tint.with-alpha(0.5);
+        // UNLIT = the pill's own ink at half strength, still shaped — a visible "off" lamp, NOT
+        // transparent. A same-as-background dot reads as an empty gap and skews the label off-centre.
+        if !root.clickable : Lamp {
+            signal: root.signal;
+            tint: root.live ? root.live-tint : root.tint.with-alpha(0.5);
         }
         lbl := Text {
             text: root.text;
@@ -247,15 +287,19 @@ export component LoadingRim inherits Rectangle {
     }
 }
 
-// Push button — a labelled key. Flat, tight, mono. Primary = a quiet accent-outlined key that fills
-// faintly on hover (an armed contact); ghost = text on a hairline; danger = red ink. The label
-// travels 1px on press (a real key has throw), and `busy` swaps in a working lamp + disables.
+// Push button — a labelled key. Flat, tight, mono. `signal` says what pressing it does: idle = ink on
+// a hairline; any other signal = its hue outlined, filling faintly on hover. `primary` and `danger`
+// are shorthands for live and consequence. The label travels 1px on press (a real key has throw), and
+// `busy` swaps in a working lamp + disables.
 export component Button inherits Rectangle {
     in property <string> text;
     in property <bool> primary: false;
     in property <bool> enabled: true;
     in property <bool> danger: false;
+    in property <Signal> signal: root.primary ? Signal.live : root.danger ? Signal.consequence : Signal.idle;
     in property <bool> busy: false;        // an async op is in flight — lamp on, contact open
+    property <color> hue: Theme.hue(root.signal);
+    property <bool> signalled: root.signal != Signal.idle;
     callback clicked();
     height: Theme.row-h;
     clip: true;
@@ -272,15 +316,14 @@ export component Button inherits Rectangle {
     property <bool> usable: enabled && !busy;
     background: !usable ? transparent
         : touch.pressed ? Theme.well-hi
-        : (primary && touch.has-hover) ? Theme.accent-glow
+        : (signalled && touch.has-hover) ? root.hue.with-alpha(0.1)
         : touch.has-hover ? Theme.well
-        : (primary ? Theme.bg-2 : transparent);
+        : (root.signal == Signal.live ? Theme.bg-2 : transparent);
     border-width: Theme.hair;
     border-color: !usable ? Theme.line-soft
-        : danger ? Theme.danger.with-alpha(0.5)
-        : primary ? (touch.has-hover ? Theme.accent.with-alpha(0.7) : Theme.accent-line)
+        : signalled ? root.hue.with-alpha(touch.has-hover ? 0.7 : 0.27)
         : (touch.has-hover ? Theme.text-faint : Theme.line);
-    animate background, border-color { duration: Theme.quick; }
+    animate background, border-color { duration: touch.has-hover ? Theme.hover-in : Theme.hover-out; }
     // the working indicator — a comet chasing the button's own rim while the async op runs, OVERLAID
     // (absolute) so it never shoves the centred label sideways when work starts. Replaces the old
     // static in-button dot with actual motion — "something is happening", not a frozen mark.
@@ -301,14 +344,13 @@ export component Button inherits Rectangle {
             horizontal-alignment: center;
             font-size: Theme.fs-body;
             font-family: Theme.mono;
-            font-weight: root.primary ? 700 : 500;
+            font-weight: root.signal == Signal.live ? 700 : 500;
             letter-spacing: Theme.track-1;
             color: root.busy ? Theme.accent-dim
                 : !root.enabled ? Theme.text-faint
-                : root.danger ? Theme.danger
-                : root.primary ? Theme.accent
+                : signalled ? root.hue
                 : (touch.has-hover ? Theme.text : Theme.text-mid);
-            animate color { duration: Theme.quick; }
+            animate color { duration: touch.has-hover ? Theme.hover-in : Theme.hover-out; }
         }
     }
     touch := TouchArea {
@@ -318,11 +360,74 @@ export component Button inherits Rectangle {
     }
 }
 
+// A numeric readout that is also its own input: click it to type, Enter commits, Esc or clicking
+// away cancels. `typed` reports the parsed number unclamped; the owner clamps and quantizes.
+export component ValueReadout inherits Rectangle {
+    in property <float> value;
+    in property <int> decimals: 0;
+    in property <length> font-size: Theme.fs-body;
+    in property <int> font-weight: 400;
+    in property <color> ink: Theme.text-mid;
+    in property <bool> enabled: true;
+    in property <TextHorizontalAlignment> align: TextHorizontalAlignment.right;
+    callback typed(float);
+    // the edit closed by Enter or Esc; the owner takes focus back so keyboard shortcuts keep working
+    callback done();
+    property <bool> editing: false;
+    property <float> scale: root.decimals <= 0 ? 1 : (root.decimals == 1 ? 10 : 100);
+    property <string> shown: round(root.value * root.scale) / root.scale;
+    min-width: max(shown-txt.preferred-width, 3 * root.font-size * 0.6);
+    preferred-height: shown-txt.preferred-height;
+    shown-txt := Text {
+        width: 100%; height: 100%;
+        text: root.shown;
+        opacity: root.editing ? 0 : 1;
+        color: root.ink;
+        font-family: Theme.mono; font-size: root.font-size; font-weight: root.font-weight;
+        horizontal-alignment: root.align; vertical-alignment: center;
+    }
+    TouchArea {
+        enabled: root.enabled && !root.editing;
+        mouse-cursor: root.enabled ? MouseCursor.text : MouseCursor.default;
+        clicked => { root.editing = true; }
+    }
+    if root.editing : Rectangle {
+        x: -4px; width: parent.width + 8px;
+        background: Theme.well;
+        border-radius: Theme.radius-sm;
+        border-width: Theme.hair;
+        border-color: Theme.accent.with-alpha(0.6);
+        TextInput {
+            x: 4px; width: parent.width - 8px; height: 100%;
+            text: root.shown;
+            single-line: true;
+            color: Theme.text;
+            font-family: Theme.mono; font-size: root.font-size; font-weight: root.font-weight;
+            horizontal-alignment: root.align; vertical-alignment: center;
+            init => { self.focus(); self.select-all(); }
+            accepted => {
+                if (self.text.is-float()) { root.typed(self.text.to-float()); }
+                root.editing = false;
+                root.done();
+            }
+            key-pressed(e) => {
+                if (e.text == Key.Escape) { root.editing = false; root.done(); return accept; }
+                return reject;
+            }
+            changed has-focus => { if (!self.has-focus) { root.editing = false; } }
+        }
+    }
+}
+
 // A horizontal value slider — a fader on a hairline track, with the value set big in mono (the value
 // is the point, not the fader). Accent fill marks the live portion. Precision affordances:
-//   * `step` quantizes picks AND scroll-wheel nudges (a 100..30000 fader is unusable at 1px=89dpi);
+//   * `step` quantizes picks, wheel nudges, arrow keys and typed values;
 //   * `detents` draws tick marks on the rail (e.g. the configured DPI stages — data ON the control);
-//   * `released` fires once at pointer-up for commit-on-release consumers (config writes, applies).
+//   * `released` fires once at pointer-up for commit-on-release consumers (config writes, applies);
+//   * Shift-drag moves at a tenth of the speed, relative to the grab, so it never jumps;
+//   * `home` (with `has-home`) draws a faint tick; double-click or Delete returns to it;
+//   * once clicked it takes focus: arrows step, Shift+arrow steps ×10, Home/End go to the ends;
+//   * the non-compact readout is click-to-type.
 export component Slider inherits Rectangle {
     in property <string> caption;
     in property <float> minimum: 0;
@@ -340,8 +445,36 @@ export component Slider inherits Rectangle {
     // change writes the live device/config (mic/out gain, wedge count) so a stray page-scroll over
     // them can't mutate state — the wheel then bubbles to the page instead.
     in property <bool> wheel: true;
+    in property <bool> has-home: false;
+    in property <float> home: 0;
+    in property <int> decimals: 0;
+    out property <bool> dragging: ta.pressed;
     callback changed(float);
     callback released(float);
+    // the last value this control emitted during a gesture (the owner may not feed `value` back
+    // until release)
+    property <float> last: root.value;
+    property <bool> fine: false;
+    // the gesture moves relative to its anchor (a knob grab, or any Shift use) instead of
+    // following the pointer's absolute position
+    property <bool> relative: false;
+    property <length> anchor-x;
+    property <float> anchor-v;
+    pure function quant(v: float) -> float {
+        return clamp(root.minimum + round((v - root.minimum) / max(0.0001, root.step)) * root.step,
+            root.minimum, root.maximum);
+    }
+    function emit(v: float) {
+        root.last = root.quant(v);
+        root.changed(root.last);
+    }
+    function set-to(v: float) {
+        if (v != v) { return; }   // NaN from a typed "nan"
+        root.emit(v);
+        root.released(root.last);
+    }
+    /// Give the track keyboard focus (e.g. after its readout finishes an edit).
+    public function focus-track() { fs.focus(); }
     // the non-compact fader stacks a BIG readout row (the 26px hero number) over the 24px track with
     // 9px between — that's ~63px of content. The old 50px box let the track bleed ~13px past its own
     // bottom edge, colliding with whatever sat beneath it (the SPEED fader landing on the BLEND label).
@@ -366,13 +499,15 @@ export component Slider inherits Rectangle {
             HorizontalLayout {
                 spacing: 4px;
                 alignment: end;
-                Text {
-                    text: round(root.value);
-                    color: root.enabled ? Theme.text : Theme.text-faint;
+                ValueReadout {
+                    value: root.value;
+                    decimals: root.decimals;
+                    enabled: root.enabled;
+                    ink: root.enabled ? Theme.text : Theme.text-faint;
                     font-size: Theme.fs-readout;
                     font-weight: 600;
-                    font-family: Theme.mono;
-                    vertical-alignment: center;
+                    typed(v) => { root.set-to(v); }
+                    done => { root.focus-track(); }
                 }
                 if root.unit != "" : Text {
                     text: root.unit;
@@ -398,6 +533,14 @@ export component Slider inherits Rectangle {
                 x: (track.width - self.width)
                     * clamp((d - root.minimum) / max(0.0001, root.maximum - root.minimum), 0.0, 1.0);
                 background: Theme.accent-dim;
+            }
+            // the home tick — where double-click returns to
+            if root.has-home : Rectangle {
+                width: 1px; height: 13px;
+                y: (parent.height - self.height) / 2;
+                x: (track.width - self.width)
+                    * clamp((root.home - root.minimum) / max(0.0001, root.maximum - root.minimum), 0.0, 1.0);
+                background: Theme.text-faint;
             }
             Rectangle {
                 x: 0;
@@ -425,7 +568,7 @@ export component Slider inherits Rectangle {
                 animate halo, background { duration: Theme.quick; }
             }
             knob := Rectangle {
-                width: ta.pressed ? 6px : (ta.has-hover ? 5px : 3px);
+                width: ta.pressed ? 6px : ((ta.has-hover || fs.has-focus) ? 5px : 3px);
                 height: ta.pressed ? 18px : 16px;
                 border-radius: self.width / 2;
                 // dims with the fill when gated — a disabled knob reads as dead chrome, not a live handle
@@ -434,37 +577,151 @@ export component Slider inherits Rectangle {
                 y: (parent.height - self.height) / 2;
                 animate width, height { duration: Theme.quick; }
             }
-            ta := TouchArea {
+            fs := FocusScope {
                 enabled: root.enabled;
-                mouse-cursor: root.enabled ? MouseCursor.ew-resize : MouseCursor.default;
-                function val-at(px: length) -> float {
-                    return root.minimum
-                        + round(((root.maximum - root.minimum) * clamp(px / track.width, 0.0, 1.0))
-                            / max(0.0001, root.step)) * root.step;
-                }
-                pointer-event(ev) => {
-                    if (ev.kind == PointerEventKind.down) { root.changed(self.val-at(self.mouse-x)); }
-                    if (ev.kind == PointerEventKind.up || ev.kind == PointerEventKind.cancel) {
-                        root.released(self.val-at(self.mouse-x));
+                key-pressed(e) => {
+                    if (!root.enabled) { return reject; }
+                    if (e.text == Key.LeftArrow || e.text == Key.DownArrow) {
+                        root.set-to(root.value - root.step * (e.modifiers.shift ? 10 : 1));
+                        return accept;
                     }
-                }
-                moved => { if (self.pressed) { root.changed(self.val-at(self.mouse-x)); } }
-                // a wheel notch only consumes the event when it ACTUALLY moves the value — at a rail
-                // (min/max) or when wheel-nudge is off, it `reject`s so the PAGE scrolls instead of
-                // the cursor getting stuck over a maxed fader (the old page-scroll trap).
-                function would-move(up: bool) -> bool {
-                    return clamp(root.value + (up ? root.step : -root.step), root.minimum, root.maximum) != root.value;
-                }
-                scroll-event(e) => {
-                    if (!root.wheel || e.delta-y == 0 || !self.would-move(e.delta-y > 0)) {
-                        return reject;
+                    if (e.text == Key.RightArrow || e.text == Key.UpArrow) {
+                        root.set-to(root.value + root.step * (e.modifiers.shift ? 10 : 1));
+                        return accept;
                     }
-                    root.changed(clamp(root.value + (e.delta-y > 0 ? root.step : -root.step),
-                        root.minimum, root.maximum));
-                    root.released(root.value);
-                    return accept;
+                    if (e.text == Key.Home) { root.set-to(root.minimum); return accept; }
+                    if (e.text == Key.End) { root.set-to(root.maximum); return accept; }
+                    if (root.has-home && (e.text == Key.Delete || e.text == Key.Backspace)) {
+                        root.set-to(root.home);
+                        return accept;
+                    }
+                    return reject;
+                }
+                ta := TouchArea {
+                    enabled: root.enabled;
+                    mouse-cursor: root.enabled ? MouseCursor.ew-resize : MouseCursor.default;
+                    pure function at(px: length) -> float {
+                        return root.minimum + (root.maximum - root.minimum) * clamp(px / track.width, 0.0, 1.0);
+                    }
+                    // re-anchor at the current value, so toggling Shift mid-drag never jumps
+                    function anchor(fine: bool) {
+                        root.fine = fine;
+                        root.anchor-x = self.mouse-x;
+                        root.anchor-v = root.last;
+                    }
+                    property <bool> held: false;
+                    property <bool> moved-any: false;
+                    pointer-event(ev) => {
+                        if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.left) {
+                            fs.focus();
+                            self.held = true;
+                            self.moved-any = false;
+                            root.last = root.value;
+                            // grabbing the knob itself (or Shift) moves relative, so a plain click or
+                            // double-click on the knob writes nothing until it actually moves
+                            root.relative = ev.modifiers.shift
+                                || abs(self.mouse-x - track.width * root.frac) <= 6px;
+                            if (!root.relative) { root.emit(self.at(self.mouse-x)); }
+                            self.anchor(ev.modifiers.shift);
+                        }
+                        if (ev.kind == PointerEventKind.move && self.held) {
+                            if (ev.modifiers.shift != root.fine) {
+                                root.relative = true;
+                                self.anchor(ev.modifiers.shift);
+                            }
+                            if (root.relative) {
+                                if (self.mouse-x != root.anchor-x) {
+                                    self.moved-any = true;
+                                    root.emit(root.anchor-v + (self.mouse-x - root.anchor-x) / track.width
+                                        * (root.maximum - root.minimum) * (root.fine ? 0.1 : 1.0));
+                                }
+                            } else {
+                                root.emit(self.at(self.mouse-x));
+                            }
+                        }
+                        if (self.held && (ev.kind == PointerEventKind.cancel
+                                || (ev.kind == PointerEventKind.up && ev.button == PointerEventButton.left))) {
+                            self.held = false;
+                            if (self.moved-any || !root.relative) { root.released(root.last); }
+                        }
+                    }
+                    double-clicked => { if (root.has-home) { root.set-to(root.home); } }
+                    // a wheel notch only consumes the event when it ACTUALLY moves the value — at a rail
+                    // (min/max) or when wheel-nudge is off, it `reject`s so the PAGE scrolls instead of
+                    // the cursor getting stuck over a maxed fader (the old page-scroll trap).
+                    function would-move(up: bool) -> bool {
+                        return clamp(root.value + (up ? root.step : -root.step), root.minimum, root.maximum) != root.value;
+                    }
+                    scroll-event(e) => {
+                        if (!root.wheel || e.delta-y == 0 || !self.would-move(e.delta-y > 0)) {
+                            return reject;
+                        }
+                        root.set-to(root.value + (e.delta-y > 0 ? root.step : -root.step));
+                        return accept;
+                    }
                 }
             }
+        }
+    }
+}
+
+// One inline fader row: label · compact track · typeable readout. The readout brightens while the
+// track is dragged. Carries the Slider's precision affordances (see Slider).
+export component FaderRow inherits HorizontalLayout {
+    in property <string> label;
+    in property <length> label-w: 76px;
+    in property <length> readout-w: 48px;
+    in property <float> minimum: 0;
+    in property <float> maximum: 100;
+    in property <float> value;
+    in property <float> step: 1;
+    in property <int> decimals: 0;
+    in property <string> unit: "";
+    in property <bool> wheel: false;
+    in property <bool> enabled: true;
+    in property <bool> has-home: false;
+    in property <float> home: 0;
+    in property <[int]> detents: [];
+    callback changed(float);
+    callback released(float);
+    spacing: 8px;
+    VerticalLayout {
+        alignment: center; width: root.label-w;
+        Mono { text: root.label; color: root.enabled ? Theme.text-dim : Theme.text-faint; overflow: elide; }
+    }
+    VerticalLayout {
+        alignment: center; horizontal-stretch: 1;
+        fader := Slider {
+            compact: true;
+            minimum: root.minimum; maximum: root.maximum; step: root.step; value: root.value;
+            wheel: root.wheel; enabled: root.enabled; detents: root.detents;
+            has-home: root.has-home; home: root.home;
+            changed(v) => { root.changed(v); }
+            released(v) => { root.released(v); }
+        }
+    }
+    HorizontalLayout {
+        width: root.readout-w;
+        alignment: end;
+        spacing: 1px;
+        ValueReadout {
+            value: root.value;
+            decimals: root.decimals;
+            enabled: root.enabled;
+            ink: !root.enabled ? Theme.text-faint : fader.dragging ? Theme.text : Theme.text-mid;
+            typed(v) => {
+                if (v != v) { return; }   // NaN from a typed "nan"
+                // the same clamp + quantize the track applies
+                root.changed(clamp(root.minimum + round((v - root.minimum) / max(0.0001, root.step)) * root.step,
+                    root.minimum, root.maximum));
+                root.released(clamp(root.minimum + round((v - root.minimum) / max(0.0001, root.step)) * root.step,
+                    root.minimum, root.maximum));
+            }
+            done => { fader.focus-track(); }
+        }
+        if root.unit != "" : VerticalLayout {
+            alignment: center;
+            Mono { text: root.unit; color: Theme.text-faint; }
         }
     }
 }
@@ -520,7 +777,7 @@ export component ContactRow inherits Rectangle {
                 : (root.enabled && cta.pressed) ? Theme.well-hi
                 : (root.enabled && cta.has-hover) ? Theme.well
                 : transparent;
-            animate background { duration: Theme.quick; }
+            animate background { duration: cta.has-hover ? Theme.hover-in : Theme.hover-out; }
             // the split — a hairline at the seam (every cell but the first), no gap between contacts
             if i > 0 : Rectangle { x: 0; width: Theme.hair; background: Theme.line; }
             // the NEAR outline — a dim text-mid inner frame (never accent), so the confirming cell
@@ -568,7 +825,7 @@ export component Toggle inherits Rectangle {
     // the quiet pressed tier — the whole-row target flashes well-hi under the finger (parity with
     // the keyed controls). No fill at rest; sits on the void.
     background: (root.enabled && row-ta.pressed) ? Theme.well-hi : transparent;
-    animate background { duration: Theme.quick; }
+    animate background { duration: row-ta.has-hover ? Theme.hover-in : Theme.hover-out; }
     row-ta := TouchArea {
         enabled: root.enabled;
         mouse-cursor: root.enabled ? MouseCursor.pointer : MouseCursor.default;
@@ -596,7 +853,7 @@ export component Toggle inherits Rectangle {
             border-color: !root.enabled ? Theme.line-soft
                 : root.checked ? root.tint.with-alpha(0.7)
                 : (row-ta.has-hover ? Theme.text-faint : Theme.line);
-            animate background, border-color { duration: Theme.quick; }
+            animate background, border-color { duration: row-ta.has-hover ? Theme.hover-in : Theme.hover-out; }
             Rectangle {
                 width: 14px;
                 height: 14px;
@@ -753,7 +1010,7 @@ export component Picker inherits Rectangle {
     border-width: Theme.hair;
     border-color: !root.enabled ? Theme.line-soft
         : ta.has-hover ? Theme.text-faint : Theme.line;
-    animate background, border-color { duration: Theme.quick; }
+    animate background, border-color { duration: ta.has-hover ? Theme.hover-in : Theme.hover-out; }
     popup := PopupWindow {
         x: 0;
         y: root.height + 2px;
@@ -812,7 +1069,7 @@ export component Picker inherits Rectangle {
         }
         Text {
             text: "▾";
-            color: root.enabled ? Theme.accent : Theme.text-faint;
+            color: root.enabled ? Theme.text-dim : Theme.text-faint;
             font-size: Theme.fs-small;
             vertical-alignment: center;
         }
@@ -868,7 +1125,7 @@ export component ActionPicker inherits VerticalLayout {
         border-width: Theme.hair;
         border-color: !root.enabled ? Theme.line-soft
             : pa.has-hover ? Theme.text-faint : Theme.line;
-        animate background, border-color { duration: Theme.quick; }
+        animate background, border-color { duration: pa.has-hover ? Theme.hover-in : Theme.hover-out; }
         apopup := PopupWindow {
             x: 0;
             y: parent.height + 2px;
@@ -992,7 +1249,7 @@ export component ActionPicker inherits VerticalLayout {
             Rectangle {}
             Text {
                 text: "▾";
-                color: root.enabled ? Theme.accent : Theme.text-faint;
+                color: root.enabled ? Theme.text-dim : Theme.text-faint;
                 font-size: Theme.fs-small; vertical-alignment: center;
             }
         }
@@ -1027,9 +1284,9 @@ export component ActionPicker inherits VerticalLayout {
                     height: 22px;
                     border-radius: Theme.radius-sm;
                     border-width: Theme.hair;
-                    border-color: chip.has-hover ? Theme.accent-line : Theme.line;
+                    border-color: chip.has-hover ? Theme.text-faint : Theme.line;
                     background: chip.has-hover ? Theme.well : Theme.bg-2;
-                    animate border-color, background { duration: Theme.quick; }
+                    animate border-color, background { duration: chip.has-hover ? Theme.hover-in : Theme.hover-out; }
                     HorizontalLayout {
                         padding-left: 8px;
                         padding-right: 8px;
@@ -1066,6 +1323,7 @@ export component ActionPicker inherits VerticalLayout {
             Contact {
                 label: "CAPTURE";
                 active: State.capture-active;
+                tint: Theme.listen;
                 clicked => { State.capture-action-param(); }
             }
         }
@@ -1074,6 +1332,7 @@ export component ActionPicker inherits VerticalLayout {
             Contact {
                 label: State.recording-keys ? "STOP" : "REC";
                 active: State.recording-keys;
+                tint: Theme.listen;
                 clicked => { State.record-action-keys(); }
             }
         }
@@ -1094,19 +1353,16 @@ export component CaptureOverlay inherits Rectangle {
         background: Theme.bg-2;
         border-radius: Theme.radius;
         border-width: Theme.hair;
-        border-color: Theme.accent-line;
+        border-color: Theme.listen-line;
         TouchArea {}  // the card itself swallows clicks (only the void cancels)
         VerticalLayout {
             padding: 24px; spacing: 14px; alignment: center;
             HorizontalLayout {
                 spacing: 8px; alignment: center;
-                Rectangle {
-                    width: 8px; height: 8px; border-radius: 4px;
-                    background: Theme.accent;
-                }
+                Lamp { signal: Signal.listening; size: 8px; }
                 Text {
                     text: "PRESS-TO-BIND";
-                    color: Theme.accent; font-family: Theme.mono; font-weight: 700;
+                    color: Theme.listen; font-family: Theme.mono; font-weight: 700;
                     font-size: Theme.fs-panel; letter-spacing: 2px;
                     vertical-alignment: center;
                 }
@@ -1118,7 +1374,7 @@ export component CaptureOverlay inherits Rectangle {
             }
             HorizontalLayout {
                 alignment: center;
-                Button { text: "cancel"; danger: true; clicked => { State.cancel-capture(); } }
+                Button { text: "cancel"; clicked => { State.cancel-capture(); } }
             }
         }
     }
@@ -1214,7 +1470,7 @@ export component SplitToggle inherits Rectangle {
                 : (root.enabled && sta.pressed) ? Theme.well-hi
                 : (root.enabled && sta.has-hover) ? Theme.well
                 : transparent;
-            animate background { duration: Theme.quick; }
+            animate background { duration: sta.has-hover ? Theme.hover-in : Theme.hover-out; }
             // the split — a hairline at the seam (every half but the first)
             if i > 0 : Rectangle { x: 0; width: Theme.hair; background: Theme.line; }
             txt := Text {
@@ -1282,7 +1538,7 @@ export component SplitButton inherits Rectangle {
                 : lta.pressed ? Theme.well-hi
                 : lta.has-hover ? Theme.well
                 : transparent;
-            animate background { duration: Theme.quick; }
+            animate background { duration: lta.has-hover ? Theme.hover-in : Theme.hover-out; }
             HorizontalLayout {
                 padding-left: 13px; padding-right: 13px;
                 // the label travels 1px on press — a key has throw (parity with Button / the right half)
@@ -1296,7 +1552,7 @@ export component SplitButton inherits Rectangle {
                         : lta.has-hover ? Theme.text : Theme.text-mid;
                     font-size: Theme.fs-small; font-weight: 700; font-family: Theme.mono;
                     letter-spacing: Theme.track-2;
-                    animate color { duration: Theme.quick; }
+                    animate color { duration: lta.has-hover ? Theme.hover-in : Theme.hover-out; }
                 }
             }
             lta := TouchArea {
@@ -1316,7 +1572,7 @@ export component SplitButton inherits Rectangle {
                 : (root.right-primary && rta.has-hover) ? Theme.accent-glow
                 : rta.has-hover ? Theme.well
                 : (root.right-primary ? Theme.bg-2 : transparent);
-            animate background { duration: Theme.quick; }
+            animate background { duration: rta.has-hover ? Theme.hover-in : Theme.hover-out; }
             // the working indicator — a comet chasing the commit half's own rim while the async op
             // runs (absolute, so it never shoves the centred label). Mirrors Button's LoadingRim.
             if root.busy : LoadingRim {
@@ -1338,7 +1594,7 @@ export component SplitButton inherits Rectangle {
                         : (rta.has-hover ? Theme.text : Theme.text-mid);
                     font-size: Theme.fs-small; font-weight: 700; font-family: Theme.mono;
                     letter-spacing: Theme.track-2;
-                    animate color { duration: Theme.quick; }
+                    animate color { duration: rta.has-hover ? Theme.hover-in : Theme.hover-out; }
                 }
             }
             rta := TouchArea {
@@ -1416,15 +1672,16 @@ export component InputHead inherits HorizontalLayout {
 // (guides.slint) — adding help is data, never new chrome. It anchors the popup at its own bottom-left.
 export component GuideButton inherits Rectangle {
     in property <string> guide-id;
-    // lit while hovered OR while this exact guide is the one on screen
-    property <bool> lit: (State.guide-open && State.guide-active-id == root.guide-id) || gta.has-hover;
+    // lit (live) while this exact guide is the one on screen; hover only brightens the ink
+    property <bool> lit: State.guide-open && State.guide-active-id == root.guide-id;
+    property <color> ink: root.lit ? Theme.accent : gta.has-hover ? Theme.text-mid : Theme.text-dim;
     width: 18px;
     height: 18px;
     border-radius: Theme.radius-sm;
     border-width: Theme.hair;
-    background: root.lit ? Theme.accent-glow : transparent;
-    border-color: root.lit ? Theme.accent-line : Theme.line;
-    animate background, border-color { duration: Theme.quick; }
+    background: root.lit ? Theme.accent-glow : gta.has-hover ? Theme.well : transparent;
+    border-color: root.lit ? Theme.accent-line : gta.has-hover ? Theme.text-faint : Theme.line;
+    animate background, border-color { duration: gta.has-hover ? Theme.hover-in : Theme.hover-out; }
     // the book — cover + spine, hand-authored as SVG path commands (straight lines only, like the copy
     // glyph) so it tints with `lit` and stays crisp at 18px. Centred in the chip with a little air.
     Path {
@@ -1433,7 +1690,7 @@ export component GuideButton inherits Rectangle {
         viewbox-width: 24;
         viewbox-height: 24;
         fill: transparent;
-        stroke: root.lit ? Theme.accent : Theme.text-dim;
+        stroke: root.ink;
         stroke-width: 1.1px;
         commands: "M6 4 H18 V20 H6 Z M9 4 V20";
         animate stroke { duration: Theme.quick; }
@@ -1441,7 +1698,7 @@ export component GuideButton inherits Rectangle {
     // the "?" resting on the cover (right of the spine) — a crisp font glyph, small so it fits the leaf
     Text {
         text: "?";
-        color: root.lit ? Theme.accent : Theme.text-dim;
+        color: root.ink;
         font-family: Theme.mono;
         font-size: Theme.fs-small;
         font-weight: 700;
@@ -1631,7 +1888,7 @@ export component LampRail inherits Rectangle {
                 : (root.enabled && cta.pressed) ? Theme.well-hi
                 : (root.enabled && cta.has-hover) ? Theme.well
                 : transparent;
-            animate background { duration: Theme.quick; }
+            animate background { duration: cta.has-hover ? Theme.hover-in : Theme.hover-out; }
             // the split — a hairline at the seam (every cell but the first), no gap between contacts
             if i > 0 : Rectangle { x: 0; width: Theme.hair; background: Theme.line; }
             HorizontalLayout {
@@ -1676,7 +1933,7 @@ export component IconButton inherits Rectangle {
     width: 22px; height: 22px;
     border-radius: Theme.radius-sm;
     background: (root.enabled && ta.has-hover) ? Theme.well : transparent;
-    animate background { duration: Theme.quick; }
+    animate background { duration: ta.has-hover ? Theme.hover-in : Theme.hover-out; }
     Text {
         text: root.glyph;
         color: !root.enabled ? Theme.text-faint
@@ -1716,21 +1973,19 @@ export component SubLabel inherits Text {
 export component StatusLamp inherits Rectangle {
     in property <string> text;
     in property <bool> lit: false;
-    in property <color> tint: Theme.accent;
+    in property <Signal> signal: Signal.live;
+    in property <color> tint: Theme.hue(root.signal);
     in property <color> ink: Theme.text-dim;
     in property <bool> clickable: false;
     callback clicked();
     HorizontalLayout {
         spacing: 6px;
-        Rectangle {
-            width: Theme.dot; height: Theme.dot; border-radius: Theme.dot / 2;
-            y: (parent.height - self.height) / 2;
-            // chip-less by design, so a press has no fill to flash — the lamp itself gives the tactile
-            // click: an unlit clickable lamp half-lights under the finger, then settles back.
-            background: root.lit ? root.tint
-                : (root.clickable && lta.pressed) ? root.tint.with-alpha(0.5)
-                : Theme.lamp-off;
-            animate background { duration: Theme.quick; }
+        // chip-less by design, so a press has no fill to flash — the lamp itself gives the tactile
+        // click: an unlit clickable lamp half-lights under the finger, then settles back.
+        Lamp {
+            signal: root.signal;
+            lit: root.lit || (root.clickable && lta.pressed);
+            tint: root.lit ? root.tint : root.tint.with-alpha(0.5);
         }
         Text {
             text: root.text;
@@ -1799,7 +2054,7 @@ export component ConfirmButton inherits Rectangle {
         : root.armed ? Theme.danger
         : touch.has-hover ? Theme.danger.with-alpha(0.5)
         : Theme.line;
-    animate background, border-color { duration: Theme.quick; }
+    animate background, border-color { duration: touch.has-hover ? Theme.hover-in : Theme.hover-out; }
     // running follows `armed`; on fire it disarms (which stops the timer). A second click also disarms.
     Timer {
         interval: Theme.confirm-window;
@@ -1943,7 +2198,7 @@ export component SelectableRow inherits Rectangle {
     border-color: !root.enabled ? Theme.line-soft
         : root.selected ? root.tint.with-alpha(0.27)
         : (sr-ta.has-hover ? Theme.text-faint : Theme.line);
-    animate background, border-color { duration: Theme.quick; }
+    animate background, border-color { duration: sr-ta.has-hover ? Theme.hover-in : Theme.hover-out; }
     // the selection marker — the shared tick, tinted, inset with the row.
     SelectTick { active: root.selected; tint: root.tint; y: 6px; height: parent.height - 12px; }
     // row-wide pick target — declared BEFORE the content, so a trailing control (a ✕) sits above it.
@@ -2022,11 +2277,7 @@ export component TriggerWell inherits Rectangle {
     HorizontalLayout {
         padding-left: 11px; padding-right: 10px; spacing: 9px;
         // the lamp — accent when bound, a dim line gutter when empty (the hypershift/cast idiom).
-        if root.lamp : Rectangle {
-            width: Theme.dot-lg; height: Theme.dot-lg; border-radius: Theme.dot-lg / 2;
-            y: (parent.height - self.height) / 2;
-            background: root.live ? Theme.accent : Theme.line;
-        }
+        if root.lamp : Lamp { lit: root.live; }
         Text {
             horizontal-stretch: 1;
             text: root.live ? root.text : root.prompt;
@@ -2038,7 +2289,7 @@ export component TriggerWell inherits Rectangle {
         // the "you can change it" hint once a trigger is present (bindings well only)
         if root.live && root.hint != "" : Text {
             text: root.hint;
-            color: (root.clickable && wta.has-hover) ? Theme.accent : Theme.text-faint;
+            color: (root.clickable && wta.has-hover) ? Theme.text-mid : Theme.text-faint;
             font-family: Theme.mono; font-size: Theme.fs-small;
             font-weight: 700; letter-spacing: Theme.track-4;
             vertical-alignment: center;

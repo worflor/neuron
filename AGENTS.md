@@ -177,6 +177,29 @@ The test: a comment has to make sense to someone reading the code cold, with no 
 session that wrote it. If it only makes sense as part of that story, it goes in the commit
 message, not the code.
 
+## Designing UI
+
+A feature's interface stays inside that feature's space. Anything that explains, configures, or
+extends a feature lives next to it: an inline drawer, a line of text that changes, the surface
+around it reshaping. It never sends the user to another page, a modal, or a window to finish the
+thought. If a control belongs to two places, it lives where the thing it controls is, and the other
+place links to it.
+
+- **Show, don't tell.** Point at the thing itself: highlight the keys a colour covers, replay the
+  effect a row names, preview a setting on the live subject while it is dragged. A sentence is for
+  a fact the picture can't carry (a key name, a hex value, why something is unavailable).
+- **No yapping.** No instructional paragraphs, no filler captions, no labels that restate the
+  control. If the UI needs a paragraph to be understood, the design is wrong.
+- **Flow, never teleport.** Things that appear grow into place; things that go collapse out;
+  layout that must move, moves smoothly. Nothing jumps, flashes, or re-lays itself out under the
+  pointer. Motion settles quickly and never animates at the user (see `Theme` in `theme.slint`).
+- **Drive understanding.** Design for what a curious user will ask next and answer it where they
+  are looking. The goal is that using the feature teaches how it works.
+- **Useful, not gimmicky.** Every visual earns its place by answering a question. Decoration that
+  answers nothing is slop, and so is "juice" added for its own sake.
+- **Keep row identity stable.** Update live models in place; replacing a model on every tick
+  rebuilds its rows, which drops hover state and half-typed text.
+
 ## Verifying your work honestly
 
 This is the part agents get wrong most often, so it is stated plainly.

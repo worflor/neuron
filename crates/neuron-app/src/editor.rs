@@ -1028,6 +1028,17 @@ pub fn load_gui_rules() -> Vec<Rule> {
     }
 }
 
+/// Load the GUI rules for a read-modify-write. Unlike [`load_gui_rules`], a file that exists but
+/// won't read or parse is an error, so the caller never saves an empty set over it.
+pub fn try_load_gui_rules() -> Result<Vec<Rule>, String> {
+    let path = gui_rules_path();
+    match std::fs::read_to_string(&path) {
+        Ok(s) => toml::from_str::<RuleDoc>(&s).map(|d| d.rules).map_err(|e| format!("{}: {e}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
 /// Save the GUI-authored spine rules back to the sidecar. Atomic (temp file + rename) — every add
 /// / edit / delete on the Bindings panel writes here, so a torn write on this path is not a cold
 /// corner case.

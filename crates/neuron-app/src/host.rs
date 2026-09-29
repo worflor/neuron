@@ -42,7 +42,7 @@ use std::time::{Duration, Instant};
 
 use neuron_host::paint::PaintPolicy;
 #[cfg(windows)]
-use neuron_host::adapters::chroma_shm::{server::chroma_grid_lead, ColorUnit};
+use neuron_host::adapters::chroma_analyze::Rgb as ChromaRgb;
 use neuron_host::api::{HostApi, LeaseSpec};
 use neuron_host::arbiter::{band, BlendMode, Content, LayerId, SourceId};
 use neuron_host::bridge::{self, Bridge, CompositorContent};
@@ -583,6 +583,8 @@ fn refresh_paint_policies(
         crate::prefs::host_chroma_paint_fade_ms(),
         surfaces.clone(),
     );
+    let (hue_shift, saturation, brightness) = crate::prefs::host_chroma_lens();
+    chroma_policy.set_lens(neuron_host::paint::Lens { hue_shift, saturation, brightness });
     openrgb_policy.update(
         blend_from_mode_str(&crate::prefs::host_openrgb_paint_mode()),
         crate::prefs::host_openrgb_paint_strength(),
@@ -888,6 +890,9 @@ struct ChromaShm {
     /// within its priority band) seq, instead of forever holding the lowest seq it was born with
     /// at host bring-up. See the "seq fairness" note in `refresh_chroma_shm`.
     last_shm_game_pid: Option<u32>,
+    /// The Chroma lab's read-only scene tap over the same server; stopped and joined on drop.
+    #[cfg(windows)]
+    _lab: Option<crate::chroma_lab::Tap>,
 }
 
 /// The Heartbeat TTL on each game layer. This lease is refreshed ONLY by the app's UI-thread
@@ -984,6 +989,7 @@ fn spawn_chroma_shm(
             });
         }
     }
+    let lab = crate::chroma_lab::start(Arc::clone(&server));
     (
         Some(ChromaShm {
             handle: server,
@@ -992,6 +998,7 @@ fn spawn_chroma_shm(
             last_live: None,
             policy,
             last_shm_game_pid: None,
+            _lab: lab,
         }),
         None,
     )
@@ -1278,22 +1285,9 @@ fn native_chroma_status(
     base_owner: SourceId,
     now: Instant,
 ) -> (bool, Option<NativeChroma>) {
-    fn chroma_device_name(device_type: u8) -> &'static str {
-        match device_type {
-            0x01 => "keyboard",
-            0x02 => "mouse",
-            0x04 => "headset",
-            0x08 => "mousepad",
-            0x10 => "keypad",
-            0x20 => "chromalink",
-            _ => "device",
-        }
-    }
-
-    fn dominant_colors(device_type: u8, units: &[ColorUnit]) -> Vec<(u8, u8, u8)> {
+    fn dominant_colors(cells: &[ChromaRgb]) -> Vec<(u8, u8, u8)> {
         let mut counts: Vec<((u8, u8, u8), usize)> = Vec::new();
-        for unit in units.iter().skip(chroma_grid_lead(device_type)) {
-            let (r, g, b) = unit.rgb();
+        for &(r, g, b) in cells {
             if (r | g | b) == 0 {
                 continue;
             }
@@ -1322,26 +1316,19 @@ fn native_chroma_status(
                         .and_then(|a| crate::purge::process_name(a.id))
                         .unwrap_or_else(|| "a game".to_string());
                     let streams = server
-                        .device_activity()
+                        .frames()
                         .into_iter()
-                        .filter_map(|activity| {
-                            let (_, units) = server.decoded_frame_with_ts(activity.device_type)?;
-                            let lit = units
-                                .iter()
-                                .skip(chroma_grid_lead(activity.device_type))
-                                .filter(|u| {
-                                    let (r, g, b) = u.rgb();
-                                    (r | g | b) != 0
-                                })
-                                .count();
-                            Some(NativeChromaStream {
-                                device: chroma_device_name(activity.device_type).to_string(),
-                                effect: activity.effect().to_lowercase(),
-                                timestamp_ms: activity.timestamp_ms,
+                        .map(|frame| {
+                            let cells = frame.cells_at(0);
+                            let lit = cells.iter().filter(|&&(r, g, b)| (r | g | b) != 0).count();
+                            NativeChromaStream {
+                                device: frame.class.name().to_string(),
+                                effect: frame.effect.name().to_string(),
+                                timestamp_ms: u32::try_from(frame.tick_ms & u64::from(u32::MAX)).unwrap_or(0),
                                 lit,
-                                total: units.len().saturating_sub(chroma_grid_lead(activity.device_type)),
-                                colors: dominant_colors(activity.device_type, &units),
-                            })
+                                total: frame.len(),
+                                colors: dominant_colors(&cells),
+                            }
                         })
                         .filter(|stream| stream.lit > 0)
                         .collect();

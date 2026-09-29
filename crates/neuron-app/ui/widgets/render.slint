@@ -120,8 +120,9 @@ export component DeviceRender inherits Rectangle {
                 height: (self.r1 - self.r0) * (field.cell + field.gap) + field.cell + 6px;
                 border-radius: Theme.radius-sm;
                 border-width: Theme.hair-2;
-                border-color: Theme.accent;
-                background: Theme.accent-glow;
+                // listening while the drag is in progress; the committed area is live
+                border-color: self.live ? Theme.listen : Theme.accent;
+                background: self.live ? Theme.listen-glow : Theme.accent-glow;
             }
 
             brush := TouchArea {

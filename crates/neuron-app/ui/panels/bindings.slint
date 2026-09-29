@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
 
-import { Theme } from "../theme.slint";
-import { Card, SectionTitle, Label, Button, Field, CodeArea, Pill, Mono, Divider, Slider, Toggle, PanelHead, ActionPicker, InputHead, GuideButton, SplitToggle, SplitButton, TriggerWell } from "../widgets/controls.slint";
+import { Theme, Signal } from "../theme.slint";
+import { Card, SectionTitle, Label, Button, Field, CodeArea, Pill, Mono, Divider, Slider, Toggle, PanelHead, ActionPicker, InputHead, GuideButton, SplitToggle, SplitButton, TriggerWell, Lamp, FaderRow } from "../widgets/controls.slint";
 import { State } from "../state.slint";
 import { RuleRow, PocketCard, MacroBlock, MacroCard } from "../models.slint";
 
@@ -13,11 +13,9 @@ import { RuleRow, PocketCard, MacroBlock, MacroCard } from "../models.slint";
 // tints it from the weave palette so the type reads at a glance too.
 component PocketCardEl inherits Rectangle {
     in property <PocketCard> p;
-    // kind tints from the weave palette so the type reads at a glance AND recolours with the accent.
-    property <color> tint: p.kind == "image" ? Theme.warn
-        : p.kind == "files" ? Theme.accent
-        : p.kind == "other" ? Theme.text
-        : Theme.accent;
+    // pocket content is data, not a signal, so it inks in the weave colour rather than a signal hue;
+    // the summary line names the kind.
+    property <color> tint: p.kind == "other" ? Theme.text : State.weave-accent-col;
     width: 128px;
     height: 104px;
     border-radius: Theme.radius;
@@ -129,10 +127,8 @@ component MacroCardEl inherits Rectangle {
                 overflow: elide;
                 vertical-alignment: center;
             }
-            Pill {
-                text: root.c.mode;
-                live: root.c.mode == "RAW";
-            }
+            // the mode is a kind, not a state, so it stays an unlit label
+            Pill { text: root.c.mode; }
             // the binding(s) that fire it — dim when nothing does ("(unbound)"), accent when bound.
             Mono {
                 text: root.c.trigger;
@@ -225,11 +221,12 @@ component WireEditor inherits Card {
     VerticalLayout {
         padding: 13px;
         spacing: Theme.gap;
-        // header — a live accent lamp + which layer/mode this wire is, close at the edge
+        // header — a provisional lamp (the wire is a draft until saved) + which layer/mode this
+        // wire is, close at the edge
         HorizontalLayout {
             spacing: 8px;
-            VerticalLayout { alignment: center; Rectangle { width: Theme.dot; height: Theme.dot; border-radius: Theme.dot / 2; background: Theme.accent; } }
-            VerticalLayout { alignment: center; Mono { text: (root.editing ? "edit binding · on " : "bind a control · on ") + (root.hyper ? "HYPERSHIFT" : "BASE"); color: Theme.accent; } }
+            VerticalLayout { alignment: center; Lamp { signal: Signal.provisional; } }
+            VerticalLayout { alignment: center; Mono { text: (root.editing ? "edit binding · on " : "bind a control · on ") + (root.hyper ? "HYPERSHIFT" : "BASE"); color: Theme.text; } }
             Rectangle {}
             VerticalLayout { alignment: center; Button { text: "close"; clicked => { root.close(); } } }
         }
@@ -491,9 +488,9 @@ component RuleLine inherits Rectangle {
                 // ↑ dead on the first editable row, ↓ dead on the last — a boundary move reads gated.
                 VerticalLayout { alignment: center; RowGlyph { glyph: "\u{2191}"; enabled: root.can-up; clicked => { root.reorder(-1); } } }   // ↑
                 VerticalLayout { alignment: center; RowGlyph { glyph: "\u{2193}"; enabled: root.can-down; clicked => { root.reorder(1); } } }    // ↓
-                // delete — the one idiom: quiet faint ✕ brightening to danger on hover (RowGlyph danger),
-                // never the old permanent-danger key. Its TouchArea is always live (no invisible target).
-                VerticalLayout { alignment: center; RowGlyph { glyph: "\u{00d7}"; danger: true; clicked => { root.remove(); } } }
+                // delete — a quiet faint ✕. Not danger: the tree is a draft until "save".
+                // Its TouchArea is always live (no invisible target).
+                VerticalLayout { alignment: center; RowGlyph { glyph: "\u{00d7}"; clicked => { root.remove(); } } }
             }
             if !root.r.removable : HorizontalLayout {
                 alignment: end;
@@ -584,14 +581,14 @@ component AddChip inherits Rectangle {
     min-width: chip-lbl.preferred-width + 18px;
     max-width: chip-lbl.preferred-width + 18px;
     border-radius: Theme.radius-sm;
-    background: chip-ta.has-hover ? Theme.accent-glow : Theme.bg-2;
+    background: chip-ta.has-hover ? Theme.well : Theme.bg-2;
     border-width: Theme.hair;
-    border-color: chip-ta.has-hover ? Theme.accent-line : Theme.line;
+    border-color: chip-ta.has-hover ? Theme.text-faint : Theme.line;
     animate background, border-color { duration: Theme.quick; }
     chip-ta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.clicked(); } }
     chip-lbl := Text {
         text: root.label;
-        color: chip-ta.has-hover ? Theme.accent : Theme.text-mid;
+        color: chip-ta.has-hover ? Theme.text : Theme.text-mid;
         font-family: Theme.mono;
         font-size: Theme.fs-small;
         font-weight: 700;
@@ -807,7 +804,7 @@ component MacroBlockEl inherits Rectangle {
                     spacing: 2px;
                     mvup := RowGlyph { glyph: "\u{2191}"; enabled: !root.b.first; clicked => { State.move-step(root.b.path, -1); } }   // ↑
                     mvdn := RowGlyph { glyph: "\u{2193}"; enabled: !root.b.last; clicked => { State.move-step(root.b.path, 1); } }    // ↓
-                    mvdel := RowGlyph { glyph: "\u{00D7}"; danger: true; clicked => { State.delete-step(root.b.path); } } // ✕
+                    mvdel := RowGlyph { glyph: "\u{00D7}"; clicked => { State.delete-step(root.b.path); } } // ✕ — a draft edit, not danger
                 }
             }
         }
@@ -844,14 +841,14 @@ component MacroBlockEl inherits Rectangle {
             // collapsed invitation
             if !root.picker-open : Rectangle {
                 border-radius: Theme.radius-sm;
-                // the empty-state CTA gets a warm accent wash + frame (an inviting first action);
-                // a nested add stays a quiet dashed-feeling stub until hovered.
+                // the empty-state CTA is a raised well with full ink (an inviting first action, but
+                // not a signal); a nested add stays a quiet dashed-feeling stub until hovered.
                 background: root.empty-cta
-                    ? (add-ta.has-hover ? Theme.accent-glow : Theme.well)
+                    ? (add-ta.has-hover ? Theme.well-hi : Theme.well)
                     : (add-ta.has-hover ? Theme.well : transparent);
                 border-width: Theme.hair;
                 border-color: root.empty-cta
-                    ? (add-ta.has-hover ? Theme.accent : Theme.accent-line)
+                    ? (add-ta.has-hover ? Theme.text-dim : Theme.text-faint)
                     : (add-ta.has-hover ? Theme.text-faint : Theme.line-soft);
                 animate background, border-color { duration: Theme.quick; }
                 add-ta := TouchArea {
@@ -864,8 +861,8 @@ component MacroBlockEl inherits Rectangle {
                     spacing: 8px;
                     Text {
                         text: "+";
-                        color: root.empty-cta ? Theme.accent
-                            : (add-ta.has-hover ? Theme.accent : Theme.text-faint);
+                        color: root.empty-cta ? Theme.text
+                            : (add-ta.has-hover ? Theme.text-mid : Theme.text-faint);
                         font-family: Theme.mono;
                         font-size: root.empty-cta ? Theme.fs-data : Theme.fs-body;
                         font-weight: 700;
@@ -973,13 +970,13 @@ export component BindingsPanel inherits VerticalLayout {
                     clip: true;
                     border-radius: Theme.radius-sm;
                     border-width: Theme.hair;
-                    border-color: ctata.has-hover ? Theme.accent-line : Theme.line;
+                    border-color: ctata.has-hover ? Theme.text-faint : Theme.line;
                     background: ctata.has-hover ? Theme.well : transparent;
                     animate border-color, background { duration: Theme.quick; }
                     HorizontalLayout {
                         padding-left: 13px; padding-right: 13px; spacing: 8px;
                         VerticalLayout { alignment: center; Text { text: "HyperShift \u{00b7} a second layer, held"; color: ctata.has-hover ? Theme.text : Theme.text-mid; font-family: Theme.mono; font-size: Theme.fs-small; font-weight: 700; letter-spacing: Theme.track-3; vertical-alignment: center; animate color { duration: Theme.quick; } } }
-                        VerticalLayout { alignment: center; Text { text: "set up \u{25b8}"; color: ctata.has-hover ? Theme.accent : Theme.text-faint; font-family: Theme.mono; font-size: Theme.fs-small; vertical-alignment: center; animate color { duration: Theme.quick; } } }
+                        VerticalLayout { alignment: center; Text { text: "set up \u{25b8}"; color: ctata.has-hover ? Theme.text-mid : Theme.text-faint; font-family: Theme.mono; font-size: Theme.fs-small; vertical-alignment: center; animate color { duration: Theme.quick; } } }
                     }
                     // opening the editor also drops the config open — a fresh user lands straight on
                     // the hold-key row (the one thing they MUST set for the layer to ever trigger).
@@ -1059,7 +1056,9 @@ export component BindingsPanel inherits VerticalLayout {
                                     alignment: center;
                                     Text {
                                         text: cog.needs-key ? "set a hold key to reach this layer" : "configure";
-                                        color: cog.lit ? Theme.accent : (cogta.has-hover ? Theme.text-mid : Theme.text-dim);
+                                        color: cog.needs-key ? Theme.warn
+                                            : root.config-open ? Theme.accent
+                                            : (cogta.has-hover ? Theme.text-mid : Theme.text-dim);
                                         font-family: Theme.mono; font-size: Theme.fs-small; vertical-alignment: center;
                                         animate color { duration: Theme.quick; }
                                     }
@@ -1118,7 +1117,7 @@ export component BindingsPanel inherits VerticalLayout {
                         }
                         if !State.hypershift-hold-ready : VerticalLayout {
                             alignment: center;
-                            Button { text: "press-to-bind"; primary: true; clicked => { State.capture-hypershift-hold(); } }
+                            Button { text: "press-to-bind"; signal: Signal.listening; clicked => { State.capture-hypershift-hold(); } }
                         }
                     }
                     // BEHAVES AS — the stance, now contextual to the layer it tunes
@@ -1169,37 +1168,32 @@ export component BindingsPanel inherits VerticalLayout {
                         }
                         if root.feel-open : HorizontalLayout {
                             spacing: 16px;
+                            // homes = neuron-core feel.rs defaults (d_hold_ms / d_gap_ms / d_coyote_ms)
                             VerticalLayout {
                                 alignment: center; horizontal-stretch: 1;
-                                HorizontalLayout {
-                                    spacing: 7px;
-                                    VerticalLayout { alignment: center; Mono { text: "hold"; color: Theme.text-faint; } }
-                                    VerticalLayout { alignment: center; horizontal-stretch: 1;
-                                        Slider { compact: true; minimum: 80; maximum: 600; step: 10; value: State.feel-hold-ms; wheel: false; changed(v) => { State.set-feel-timing(v, State.feel-gap-ms, State.feel-coyote-ms); } }
-                                    }
-                                    VerticalLayout { alignment: center; min-width: 48px; Mono { text: State.feel-hold-ms + "ms"; color: Theme.text; horizontal-alignment: right; } }
+                                FaderRow {
+                                    label: "hold"; label-w: 32px; unit: "ms"; readout-w: 56px; spacing: 7px;
+                                    minimum: 80; maximum: 600; step: 10; has-home: true; home: 200;
+                                    value: State.feel-hold-ms;
+                                    changed(v) => { State.set-feel-timing(v, State.feel-gap-ms, State.feel-coyote-ms); }
                                 }
                             }
                             VerticalLayout {
                                 alignment: center; horizontal-stretch: 1;
-                                HorizontalLayout {
-                                    spacing: 7px;
-                                    VerticalLayout { alignment: center; Mono { text: "gap"; color: Theme.text-faint; } }
-                                    VerticalLayout { alignment: center; horizontal-stretch: 1;
-                                        Slider { compact: true; minimum: 40; maximum: 400; step: 10; value: State.feel-gap-ms; wheel: false; changed(v) => { State.set-feel-timing(State.feel-hold-ms, v, State.feel-coyote-ms); } }
-                                    }
-                                    VerticalLayout { alignment: center; min-width: 48px; Mono { text: State.feel-gap-ms + "ms"; color: Theme.text; horizontal-alignment: right; } }
+                                FaderRow {
+                                    label: "gap"; label-w: 24px; unit: "ms"; readout-w: 56px; spacing: 7px;
+                                    minimum: 40; maximum: 400; step: 10; has-home: true; home: 280;
+                                    value: State.feel-gap-ms;
+                                    changed(v) => { State.set-feel-timing(State.feel-hold-ms, v, State.feel-coyote-ms); }
                                 }
                             }
                             VerticalLayout {
                                 alignment: center; horizontal-stretch: 1;
-                                HorizontalLayout {
-                                    spacing: 7px;
-                                    VerticalLayout { alignment: center; Mono { text: "coyote"; color: Theme.text-faint; } }
-                                    VerticalLayout { alignment: center; horizontal-stretch: 1;
-                                        Slider { compact: true; minimum: 0; maximum: 200; step: 10; value: State.feel-coyote-ms; wheel: false; changed(v) => { State.set-feel-timing(State.feel-hold-ms, State.feel-gap-ms, v); } }
-                                    }
-                                    VerticalLayout { alignment: center; min-width: 48px; Mono { text: State.feel-coyote-ms + "ms"; color: Theme.text; horizontal-alignment: right; } }
+                                FaderRow {
+                                    label: "coyote"; label-w: 44px; unit: "ms"; readout-w: 56px; spacing: 7px;
+                                    minimum: 0; maximum: 200; step: 10; has-home: true; home: 120;
+                                    value: State.feel-coyote-ms;
+                                    changed(v) => { State.set-feel-timing(State.feel-hold-ms, State.feel-gap-ms, v); }
                                 }
                             }
                         }
@@ -1229,7 +1223,7 @@ export component BindingsPanel inherits VerticalLayout {
                     border-radius: Theme.radius-sm;
                     background: addta.has-hover ? Theme.well : Theme.bg-2;
                     border-width: Theme.hair;
-                    border-color: addta.has-hover ? Theme.accent-line : Theme.line;
+                    border-color: addta.has-hover ? Theme.text-faint : Theme.line;
                     animate background, border-color { duration: Theme.quick; }
                     addta := TouchArea {
                         mouse-cursor: MouseCursor.pointer;
@@ -1253,7 +1247,7 @@ export component BindingsPanel inherits VerticalLayout {
                     }
                     HorizontalLayout {
                         padding-left: 12px; padding-right: 12px; spacing: 8px;
-                        VerticalLayout { alignment: center; Text { text: "＋"; color: Theme.accent; font-family: Theme.mono; font-size: Theme.fs-body; font-weight: 700; } }
+                        VerticalLayout { alignment: center; Text { text: "+"; color: addta.has-hover ? Theme.text : Theme.text-mid; font-family: Theme.mono; font-size: Theme.fs-body; font-weight: 700; } }
                         VerticalLayout { alignment: center; Text { text: root.view-layer == 1 ? "bind a control to the HyperShift layer" : "bind a control"; color: addta.has-hover ? Theme.text-mid : Theme.text-faint; font-family: Theme.mono; font-size: Theme.fs-body; } }
                         Rectangle {}
                     }

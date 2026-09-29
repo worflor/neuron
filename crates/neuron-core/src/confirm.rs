@@ -43,13 +43,15 @@ pub enum Kind {
     /// A swappable SIDE PLATE was attached / detached (the device pushes its strap-code; there is no
     /// getter). A discrete hardware-piece confirmation, distinct from the power/battery family.
     SidePlate,
+    /// A Chroma game left a scene the user asked to hear about (e.g. its menu, so a match began).
+    Game,
 }
 
 impl Kind {
     /// Every kind, in declaration order — the canonical list to iterate (config gates, the test
     /// probe, …). Call sites derive from this instead of hardcoding a subset, so a new variant is
     /// picked up everywhere by adding one arm here (and to [`Kind::slug`]).
-    pub const ALL: [Kind; 10] = [
+    pub const ALL: [Kind; 11] = [
         Kind::Dpi,
         Kind::Sniper,
         Kind::Scroll,
@@ -60,6 +62,7 @@ impl Kind {
         Kind::Macro,
         Kind::Battery,
         Kind::SidePlate,
+        Kind::Game,
     ];
     /// Stable slug — the config key and the leitmotif identity seed.
     #[must_use]
@@ -75,6 +78,7 @@ impl Kind {
             Kind::Macro => "macro",
             Kind::Battery => "battery",
             Kind::SidePlate => "side_plate",
+            Kind::Game => "game",
         }
     }
 }
@@ -400,6 +404,20 @@ pub fn battery(pct: u32, title: &str, prev: Option<u32>) {
         title: title.into(),
         ident: "battery".into(),
         prev: prev.map(|p| p.to_string()),
+    });
+}
+
+/// Game `game` moved out of a scene the user flagged; `what` says what happened ("left menu").
+/// One ident per game, so a flurry of scene changes updates one card rather than stacking.
+pub fn game_scene(game: &str, what: &str) {
+    emit(Confirmation {
+        kind: Kind::Game,
+        shape: Shape::Discrete {
+            label: what.to_string(),
+        },
+        title: game.to_string(),
+        ident: format!("game:{}", game.to_lowercase()),
+        prev: None,
     });
 }
 

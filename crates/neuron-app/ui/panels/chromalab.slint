@@ -1,0 +1,570 @@
+// SPDX-FileCopyrightText: 2026 Woflo Labs
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
+// CHROMA LAB — a connected Chroma game's own lighting, taken apart in place (chroma_lab.rs).
+//
+// One live board is the subject; everything else points back at it. Hover an at-rest chip and
+// its keys stay lit while the rest recede. Hover an effect, as a row or a mark on the timeline,
+// and the board replays its last play. Drag the lens and the board previews it; hold the board
+// to see the game's own colours again. Rows open as drawers in place. Words only carry facts.
+
+import { Theme, Signal } from "../theme.slint";
+import { SubLabel, Button, ConfirmButton, Mono, FaderRow, SplitToggle, Field, Lamp } from "../widgets/controls.slint";
+import { State } from "../state.slint";
+import { ChromaLabCell, ChromaLabSwatch, ChromaLabTemplate, ChromaLabMark, ChromaLabScene, ChromaLabStrip } from "../models.slint";
+
+// the board's pitch: a 16px key on an 18px step
+component LabKey inherits Rectangle {
+    in property <ChromaLabCell> cell;
+    in property <int> index;
+    property <bool> receded: State.chroma-lab-spot != -2 && root.cell.group != State.chroma-lab-spot;
+    width: 16px;
+    height: 16px;
+    border-radius: 2px;
+    background: root.cell.color;
+    opacity: root.receded ? 0.12 : 1;
+    border-width: ta.has-hover ? Theme.hair-2 : Theme.hair;
+    border-color: ta.has-hover ? Theme.text : Theme.line-soft;
+    animate background { duration: 60ms; }
+    animate opacity { duration: Theme.settle; easing: ease-out; }
+    ta := TouchArea {
+        changed has-hover => {
+            if (self.has-hover) {
+                State.chroma-lab-hover = root.index;
+            } else if (State.chroma-lab-hover == root.index) {
+                State.chroma-lab-hover = -1;
+            }
+        }
+        changed pressed => { State.chroma-lab-compare = self.pressed; }
+    }
+}
+
+component LabSwatch inherits Rectangle {
+    in property <color> fill;
+    in property <bool> ring: false;
+    width: 10px;
+    height: 10px;
+    border-radius: 2px;
+    background: root.fill;
+    border-width: root.ring ? Theme.hair-2 : Theme.hair;
+    border-color: root.ring ? Theme.text-dim : Theme.line;
+}
+
+// An at-rest chip. Hovering it spotlights the keys it names on the board.
+component RestChip inherits Rectangle {
+    in property <ChromaLabSwatch> chip;
+    height: 20px;
+    border-radius: Theme.radius-sm;
+    background: ta.has-hover ? Theme.well-hi : transparent;
+    animate background { duration: ta.has-hover ? Theme.hover-in : Theme.hover-out; }
+    HorizontalLayout {
+        padding-left: 5px; padding-right: 7px; spacing: 7px;
+        VerticalLayout { alignment: center; LabSwatch { fill: root.chip.color; ring: root.chip.group == 100; } }
+        VerticalLayout {
+            alignment: center;
+            Mono {
+                text: root.chip.group == 100 ? root.chip.text + "  ~" : root.chip.text;
+                color: ta.has-hover ? Theme.text : Theme.text-mid;
+            }
+        }
+    }
+    ta := TouchArea {
+        changed has-hover => {
+            if (self.has-hover) {
+                State.chroma-lab-spot = root.chip.group;
+            } else if (State.chroma-lab-spot == root.chip.group) {
+                State.chroma-lab-spot = -2;
+            }
+        }
+    }
+}
+
+// One lens knob. Dragging previews on the board; release commits; double-click returns home.
+component LensRow inherits FaderRow {
+    label-w: 84px;
+    readout-w: 56px;
+    step: 5;
+    has-home: true;
+    spacing: 10px;
+}
+
+// A recurring effect. Hover replays its last play on the board; click opens its drawer in place.
+component EffectRow inherits VerticalLayout {
+    in property <ChromaLabTemplate> t;
+    // a scene/profile choice waiting for its name; -1 = none pending
+    property <int> pending: -1;
+    // the drawer's fixed height: animating toward a measured height would size it from itself
+    property <length> drawer-h: 172px;
+
+    Rectangle {
+        height: 24px;
+        border-radius: Theme.radius-sm;
+        background: root.t.selected ? Theme.well
+            : ta.has-hover ? Theme.well-hi
+            : Theme.accent.with-alpha(0.14 * root.t.heat);
+        animate background { duration: Theme.settle; }
+        HorizontalLayout {
+            padding-left: 6px; padding-right: 8px; spacing: 9px;
+            VerticalLayout { alignment: center; LabSwatch { fill: root.t.swatch; opacity: root.t.hidden ? 0.35 : 1; } }
+            VerticalLayout {
+                alignment: center; width: 116px;
+                Mono {
+                    text: root.t.name != "" ? root.t.name : root.t.id;
+                    color: root.t.hidden ? Theme.text-dim : Theme.text;
+                    overflow: elide;
+                }
+            }
+            // the signature: where its colour sat on the wheel
+            VerticalLayout {
+                alignment: center;
+                Rectangle {
+                    width: 14 * 4px;
+                    height: 12px;
+                    for b[i] in root.t.bars : Rectangle {
+                        x: i * 4px;
+                        width: 3px;
+                        height: max(1px, b.h * 12px);
+                        y: parent.height - self.height;
+                        background: b.c;
+                    }
+                }
+            }
+            VerticalLayout { alignment: center; width: 38px; Mono { text: "×" + root.t.count; color: Theme.text-mid; } }
+            VerticalLayout { alignment: center; width: 220px; Mono { text: root.t.detail; color: Theme.text-dim; overflow: elide; } }
+            if root.t.name != "" : VerticalLayout { alignment: center; Mono { text: root.t.id; color: Theme.text-faint; } }
+            if root.t.hidden : VerticalLayout { alignment: center; Mono { text: "hidden"; color: Theme.text-dim; } }
+            if root.t.bound != "" : VerticalLayout { alignment: center; Mono { text: "→ " + root.t.bound; color: Theme.text-mid; overflow: elide; } }
+            Rectangle { horizontal-stretch: 1; }
+        }
+        ta := TouchArea {
+            mouse-cursor: MouseCursor.pointer;
+            changed has-hover => {
+                if (self.has-hover) {
+                    State.chroma-lab-replay = root.t.num;
+                } else if (State.chroma-lab-replay == root.t.num) {
+                    State.chroma-lab-replay = -1;
+                }
+            }
+            clicked => {
+                root.pending = -1;
+                State.chroma-lab-selected = root.t.selected ? -1 : root.t.num;
+            }
+        }
+    }
+
+    // the drawer: grows open under its row, never jumps
+    Rectangle {
+        property <length> open-h: root.t.selected ? root.drawer-h : 0px;
+        animate open-h { duration: 160ms; easing: ease-out; }
+        clip: true;
+        min-height: self.open-h;
+        max-height: self.open-h;
+        VerticalLayout {
+            y: 0;
+            width: parent.width;
+            height: root.drawer-h;
+            alignment: start;
+            padding-top: 8px; padding-bottom: 10px; padding-left: 25px;
+            spacing: 7px;
+            HorizontalLayout {
+                spacing: 10px;
+                VerticalLayout { alignment: center; width: 96px; Mono { text: "name"; color: Theme.text-dim; } }
+                Field {
+                    placeholder: root.t.name != "" ? root.t.name : "ult wave, heal, …";
+                    field-width: 190px;
+                    accepted(v) => { State.chroma-lab-rename(root.t.num, v); }
+                }
+                Rectangle {}
+            }
+            HorizontalLayout {
+                spacing: 10px;
+                VerticalLayout { alignment: center; width: 96px; Mono { text: "on my keys"; color: Theme.text-dim; } }
+                SplitToggle {
+                    width: 150px;
+                    options: ["SHOW", "HIDE"];
+                    min-cell: 64px;
+                    index: root.t.hidden ? 1 : 0;
+                    picked(i) => { State.chroma-lab-hide(root.t.num, i == 1); }
+                }
+                if root.t.hidden : VerticalLayout {
+                    alignment: center;
+                    Mono { text: "your keys keep the at-rest picture, from ~0.25s in"; color: Theme.text-faint; }
+                }
+                Rectangle {}
+            }
+            HorizontalLayout {
+                spacing: 10px;
+                VerticalLayout { alignment: center; width: 96px; Mono { text: "when it plays"; color: Theme.text-dim; } }
+                SplitToggle {
+                    width: 460px;
+                    options: ["NOTHING", "SAVE CLIP", "OBS SCENE", "PROFILE", "MUTE"];
+                    min-cell: 66px;
+                    index: root.pending >= 0 ? root.pending : root.t.bound-kind;
+                    picked(i) => {
+                        if (i == 2 || i == 3) {
+                            root.pending = i;
+                        } else {
+                            root.pending = -1;
+                            State.chroma-lab-bind(root.t.num, i, "");
+                        }
+                    }
+                }
+                if root.pending >= 0 : Field {
+                    placeholder: root.pending == 2 ? "scene name ↵" : "profile name ↵";
+                    field-width: 150px;
+                    text: root.t.bound-kind == root.pending ? root.t.bound-param : "";
+                    accepted(v) => {
+                        State.chroma-lab-bind(root.t.num, root.pending, v);
+                        root.pending = -1;
+                    }
+                }
+                if root.pending < 0 && (root.t.bound-kind == 2 || root.t.bound-kind == 3) : VerticalLayout {
+                    alignment: center;
+                    Mono { text: root.t.bound-param; color: Theme.text-mid; }
+                }
+                Rectangle {}
+            }
+            Mono { text: "feedback only · game lighting never presses keys or clicks"; color: Theme.text-faint; }
+        }
+    }
+}
+
+// A scene the game rests in. The row shows its picture (ambient under the colours its keys hold);
+// click opens its drawer: a name, an alert for when it ends while you're elsewhere, and a
+// feedback action for when it starts.
+component SceneRow inherits VerticalLayout {
+    in property <ChromaLabScene> s;
+    property <int> pending: -1;
+    property <length> drawer-h: 116px;
+
+    Rectangle {
+        height: 24px;
+        border-radius: Theme.radius-sm;
+        background: root.s.selected ? Theme.well : ta.has-hover ? Theme.well-hi : transparent;
+        animate background { duration: Theme.settle; }
+        HorizontalLayout {
+            padding-left: 6px; padding-right: 8px; spacing: 9px;
+            // the scene's picture: its ambient with its held colours set into it
+            VerticalLayout {
+                alignment: center;
+                Rectangle {
+                    width: 46px; height: 12px;
+                    border-radius: 2px;
+                    background: root.s.ambient;
+                    border-width: Theme.hair;
+                    border-color: Theme.line;
+                    HorizontalLayout {
+                        padding: 3px; spacing: 2px; alignment: start;
+                        for k in root.s.keys : Rectangle { width: 6px; background: k; border-radius: 1px; }
+                    }
+                }
+            }
+            VerticalLayout {
+                alignment: center; width: 116px;
+                Mono {
+                    text: root.s.name != "" ? root.s.name : root.s.id;
+                    color: root.s.current ? Theme.text : Theme.text-mid;
+                    overflow: elide;
+                }
+            }
+            // the scene you're in now
+            VerticalLayout {
+                alignment: center; width: 14px;
+                if root.s.current : Lamp {}
+            }
+            VerticalLayout { alignment: center; width: 150px; Mono { text: root.s.detail; color: Theme.text-dim; overflow: elide; } }
+            if root.s.name != "" : VerticalLayout { alignment: center; Mono { text: root.s.id; color: Theme.text-faint; } }
+            if root.s.alert : VerticalLayout { alignment: center; Mono { text: "notifies"; color: Theme.text-mid; } }
+            if root.s.bound != "" : VerticalLayout { alignment: center; Mono { text: "→ " + root.s.bound; color: Theme.text-mid; overflow: elide; } }
+            Rectangle { horizontal-stretch: 1; }
+        }
+        ta := TouchArea {
+            mouse-cursor: MouseCursor.pointer;
+            clicked => {
+                root.pending = -1;
+                State.chroma-lab-scene-selected = root.s.selected ? -1 : root.s.num;
+            }
+        }
+    }
+
+    Rectangle {
+        property <length> open-h: root.s.selected ? root.drawer-h : 0px;
+        animate open-h { duration: 160ms; easing: ease-out; }
+        clip: true;
+        min-height: self.open-h;
+        max-height: self.open-h;
+        VerticalLayout {
+            y: 0;
+            width: parent.width;
+            height: root.drawer-h;
+            alignment: start;
+            padding-top: 8px; padding-bottom: 10px; padding-left: 25px;
+            spacing: 7px;
+            HorizontalLayout {
+                spacing: 10px;
+                VerticalLayout { alignment: center; width: 96px; Mono { text: "name"; color: Theme.text-dim; } }
+                Field {
+                    placeholder: root.s.name != "" ? root.s.name : "menu, queue, tracer, …";
+                    field-width: 190px;
+                    accepted(v) => { State.chroma-lab-scene-rename(root.s.num, v); }
+                }
+                Rectangle {}
+            }
+            HorizontalLayout {
+                spacing: 10px;
+                VerticalLayout { alignment: center; width: 96px; Mono { text: "when it ends"; color: Theme.text-dim; } }
+                SplitToggle {
+                    width: 150px;
+                    options: ["QUIET", "NOTIFY"];
+                    min-cell: 64px;
+                    index: root.s.alert ? 1 : 0;
+                    picked(i) => { State.chroma-lab-scene-alert(root.s.num, i == 1); }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Mono { text: "only while the game isn't the focused window"; color: Theme.text-faint; }
+                }
+                Rectangle {}
+            }
+            HorizontalLayout {
+                spacing: 10px;
+                VerticalLayout { alignment: center; width: 96px; Mono { text: "when it starts"; color: Theme.text-dim; } }
+                SplitToggle {
+                    width: 460px;
+                    options: ["NOTHING", "SAVE CLIP", "OBS SCENE", "PROFILE", "MUTE"];
+                    min-cell: 66px;
+                    index: root.pending >= 0 ? root.pending : root.s.bound-kind;
+                    picked(i) => {
+                        if (i == 2 || i == 3) {
+                            root.pending = i;
+                        } else {
+                            root.pending = -1;
+                            State.chroma-lab-scene-bind(root.s.num, i, "");
+                        }
+                    }
+                }
+                if root.pending >= 0 : Field {
+                    placeholder: root.pending == 2 ? "scene name ↵" : "profile name ↵";
+                    field-width: 150px;
+                    text: root.s.bound-kind == root.pending ? root.s.bound-param : "";
+                    accepted(v) => {
+                        State.chroma-lab-scene-bind(root.s.num, root.pending, v);
+                        root.pending = -1;
+                    }
+                }
+                if root.pending < 0 && (root.s.bound-kind == 2 || root.s.bound-kind == 3) : VerticalLayout {
+                    alignment: center;
+                    Mono { text: root.s.bound-param; color: Theme.text-mid; }
+                }
+                Rectangle {}
+            }
+        }
+    }
+}
+
+// Another device class the game paints, drawn as the grid the SDK gives it.
+component LabStrip inherits HorizontalLayout {
+    in property <ChromaLabStrip> s;
+    spacing: 10px;
+    VerticalLayout { alignment: center; width: 72px; Mono { text: root.s.name; color: Theme.text-dim; } }
+    VerticalLayout {
+        alignment: center;
+        grid := Rectangle {
+            property <int> cols: max(1, root.s.cols);
+            width: min(root.s.cells.length, self.cols) * 11px;
+            height: ceil(root.s.cells.length / self.cols) * 11px;
+            for c[i] in root.s.cells : Rectangle {
+                x: mod(i, grid.cols) * 11px;
+                y: floor(i / grid.cols) * 11px;
+                width: 10px; height: 10px;
+                border-radius: 2px;
+                background: c;
+                border-width: Theme.hair;
+                border-color: Theme.line-soft;
+                animate background { duration: 60ms; }
+            }
+        }
+    }
+    VerticalLayout { alignment: center; Mono { text: root.s.effect; color: Theme.text-faint; font-size: Theme.fs-small; } }
+    Rectangle {}
+}
+
+export component ChromaLab inherits VerticalLayout {
+    spacing: 12px;
+    // what a hovered timeline mark says; the board's readout stays with the board
+    property <string> mark-text: "";
+
+    Timer {
+        interval: 66ms;
+        running: State.chroma-lab-open && State.window-shown && State.page == 1;
+        triggered => { State.chroma-lab-tick(); }
+    }
+
+    // ── status: a live lamp and the facts, or why there's nothing yet ──
+    if State.chroma-lab-status != "" : Mono { text: State.chroma-lab-status; color: Theme.text-dim; }
+    if State.chroma-lab-status == "" : HorizontalLayout {
+        spacing: 9px;
+        VerticalLayout { alignment: center; Lamp { lit: State.chroma-lab-fresh; } }
+        Mono { text: State.chroma-lab-game; color: Theme.text; }
+        if State.chroma-lab-scene != "" : Mono { text: "in " + State.chroma-lab-scene; color: Theme.text-mid; }
+        Mono {
+            text: State.chroma-lab-fresh ? State.chroma-lab-fps + " fps" : "still";
+            color: Theme.text-dim;
+        }
+        Mono { text: State.chroma-lab-now; color: Theme.text; }
+        Rectangle { horizontal-stretch: 1; }
+    }
+
+    // ── the board, and what it holds at rest ──
+    if State.chroma-lab-cells.length > 0 : HorizontalLayout {
+        spacing: 22px;
+        VerticalLayout {
+            spacing: 6px;
+            board := Rectangle {
+                property <int> cols: max(1, State.chroma-lab-cols);
+                width: self.cols * 18px;
+                height: ceil(State.chroma-lab-cells.length / self.cols) * 18px;
+                for cell[i] in State.chroma-lab-cells : LabKey {
+                    x: mod(i, board.cols) * 18px;
+                    y: floor(i / board.cols) * 18px;
+                    cell: cell;
+                    index: i;
+                }
+            }
+            Rectangle {
+                height: 14px;
+                Mono {
+                    x: 0;
+                    // with nothing hovered, say how the game drives the board when it isn't a custom grid
+                    text: State.chroma-lab-readout != "" ? State.chroma-lab-readout
+                        : State.chroma-lab-kb-effect != "custom" ? State.chroma-lab-kb-effect : "";
+                    color: Theme.text-mid;
+                    font-size: Theme.fs-small;
+                }
+            }
+        }
+        VerticalLayout {
+            spacing: 2px;
+            alignment: start;
+            SubLabel { text: "AT REST"; }
+            for c in State.chroma-lab-roles : RestChip { chip: c; }
+        }
+        Rectangle {}
+    }
+
+    if State.chroma-lab-strips.length > 0 : VerticalLayout {
+        spacing: 6px;
+        for s in State.chroma-lab-strips : LabStrip { s: s; }
+    }
+
+    // ── the last minute: ambient under, effects over, newest on the right ──
+    if State.chroma-lab-game != "" : VerticalLayout {
+        spacing: 5px;
+        HorizontalLayout {
+            spacing: 10px;
+            SubLabel { text: "LAST MINUTE"; }
+            VerticalLayout { alignment: center; Mono { text: root.mark-text; color: Theme.text-mid; font-size: Theme.fs-small; } }
+            Rectangle { horizontal-stretch: 1; }
+            // held but not kept until pressed: provisional
+            if State.chroma-lab-capture != "" : Button {
+                text: State.chroma-lab-capture;
+                signal: Signal.provisional;
+                clicked => { State.chroma-lab-save-capture(); }
+            }
+        }
+        strip := Rectangle {
+            height: 22px;
+            border-radius: Theme.radius-sm;
+            background: Theme.well;
+            clip: true;
+            for m in State.chroma-lab-marks : Rectangle {
+                x: m.x * strip.width;
+                width: max(2px, m.w * strip.width);
+                y: m.band ? parent.height - 5px : 3px;
+                height: m.band ? 5px : parent.height - 11px;
+                border-radius: m.band ? 0px : 1px;
+                background: m.color;
+                opacity: m.band ? 0.9 : (mta.has-hover || State.chroma-lab-replay == m.id ? 1 : 0.75);
+                mta := TouchArea {
+                    changed has-hover => {
+                        if (self.has-hover) {
+                            root.mark-text = m.text;
+                            if (m.id >= 0) { State.chroma-lab-replay = m.id; }
+                        } else {
+                            root.mark-text = "";
+                            if (State.chroma-lab-replay == m.id) { State.chroma-lab-replay = -1; }
+                        }
+                    }
+                }
+            }
+        }
+        HorizontalLayout {
+            Mono { text: "60s"; color: Theme.text-faint; font-size: Theme.fs-small; }
+            Rectangle { horizontal-stretch: 1; }
+            Mono { text: "now"; color: Theme.text-faint; font-size: Theme.fs-small; }
+        }
+    }
+
+    // ── scenes: the resting pictures the game returns to, named once, kept per game ──
+    if State.chroma-lab-game != "" : VerticalLayout {
+        spacing: 2px;
+        SubLabel { text: "SCENES"; }
+        if State.chroma-lab-scenes.length == 0 : Mono {
+            text: "none yet · one appears each time the game settles into a new picture";
+            color: Theme.text-faint;
+            wrap: word-wrap;
+        }
+        for s in State.chroma-lab-scenes : SceneRow { s: s; }
+    }
+
+    // ── lens: restyle all game paint before it reaches your devices ──
+    VerticalLayout {
+        spacing: 3px;
+        HorizontalLayout {
+            SubLabel { text: "LENS"; }
+            Rectangle { horizontal-stretch: 1; }
+            if State.chroma-lens-hue != 0 || State.chroma-lens-saturation != 100 || State.chroma-lens-brightness != 100 : Button {
+                text: "reset";
+                clicked => { State.chroma-lab-set-lens(0, 100, 100); }
+            }
+        }
+        LensRow {
+            label: "hue"; unit: "°"; minimum: -180; maximum: 180; home: 0;
+            value: State.chroma-lens-hue;
+            changed(v) => { State.chroma-lens-hue = v; }
+            released(v) => { State.chroma-lab-set-lens(v, State.chroma-lens-saturation, State.chroma-lens-brightness); }
+        }
+        LensRow {
+            label: "saturation"; unit: "%"; minimum: 0; maximum: 200; home: 100;
+            value: State.chroma-lens-saturation;
+            changed(v) => { State.chroma-lens-saturation = v; }
+            released(v) => { State.chroma-lab-set-lens(State.chroma-lens-hue, v, State.chroma-lens-brightness); }
+        }
+        LensRow {
+            label: "brightness"; unit: "%"; minimum: 0; maximum: 200; home: 100;
+            value: State.chroma-lens-brightness;
+            changed(v) => { State.chroma-lens-brightness = v; }
+            released(v) => { State.chroma-lab-set-lens(State.chroma-lens-hue, State.chroma-lens-saturation, v); }
+        }
+    }
+
+    // ── recurring effects: named once, kept per game ──
+    VerticalLayout {
+        spacing: 2px;
+        HorizontalLayout {
+            SubLabel { text: "RECURRING EFFECTS"; }
+            Rectangle { horizontal-stretch: 1; }
+            if State.chroma-lab-templates.length > 0 : ConfirmButton {
+                text: "forget";
+                confirm-text: "forget all?";
+                confirmed => { State.chroma-lab-forget(); }
+            }
+        }
+        if State.chroma-lab-templates.length == 0 : Mono {
+            text: "none yet · one appears the first time an effect plays";
+            color: Theme.text-faint;
+        }
+        for t in State.chroma-lab-templates : EffectRow { t: t; }
+    }
+}
