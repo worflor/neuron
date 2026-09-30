@@ -6,6 +6,8 @@ one person, obsessed with research in my free time)
 
 two small executables, one shared core. no account, no cloud, no telemetry. no "please update razer central." it talks to your mouse and keyboard directly: the same `razer_report` HID bytes synapse sends, worked out from wire captures (USBPcap), the open-source [openrazer](https://github.com/openrazer/openrazer) driver, and a lot of live probing. it does exactly what you tell it then fricks off. no kernel driver, no vendor SDK 😳
 
+<p align="center"><img src="docs/media/hero-desktop.webp" alt="The neuron window on a desktop, with a spellweaving stroke mid-cast and three change confirmations in the corner" width="100%"></p>
+
 | | |
 |---|---|
 | **what** | a tray-resident app and a CLI built to replace razer synapse |
@@ -61,11 +63,26 @@ that isn't a description of the architecture, it's the reason the thing is worth
 
 **press-to-bind anything and everything**: don't like my setup? make it yours.
 
+<p align="center"><img src="docs/media/binds-direct.webp" alt="The input page: six binds, each a control on the left wired to an action on the right" width="100%"></p>
+
+<p align="center"><img src="docs/media/controllers-badges.webp" alt="Pad, mouse, keyboard and headset binds side by side, with the device badge drawer open on a gamepad" width="100%"></p>
+
+<table>
+<tr>
+<td width="50%"><img src="docs/media/radial-wheel.webp" alt="The radial wheel over the desktop, flicked toward the teleport wedge"></td>
+<td width="50%"><img src="docs/media/weave-glyph-loop.webp" alt="A loop glyph being drawn while the predicted action, teleport, locks in"></td>
+</tr>
+</table>
+
 [the full trigger and action tables →](docs/GDD.md#the-idea-trigger--action)
 
 ## what it does
 
 the short tour. each line links into [the feature doc](docs/GDD.md), which has the real depth.
+
+<p align="center"><img src="docs/media/lighting-aurora-loop.webp" alt="The lighting page: an aurora effect running on the keyboard render while every catalog tile plays its own preview" width="100%"></p>
+
+<p align="center"><img src="docs/media/device-feel.webp" alt="The device page: dpi with its stage table on the fader, the side plate readout, and the verify-gated shelf for unconfirmed writes" width="100%"></p>
 
 | | |
 |---|---|
@@ -78,11 +95,22 @@ the short tour. each line links into [the feature doc](docs/GDD.md), which has t
 | **[life after synapse](docs/GDD.md#life-after-synapse)** | import your synapse export (it's a zip of plaintext XML), purge synapse off the machine properly, and point `neuron discover` at hardware it's never seen to fingerprint it into a TOML. |
 | **[the app](docs/GDD.md#the-app)** | a tray-resident GUI in four sections — device, lighting, input, system — plus profiles as one object: its settings, its lighting, and its binds. |
 
+<p align="center"><img src="docs/media/macro-blocks.webp" alt="The macro workshop in blocks view: press, ask, then a yes branch and a no branch" width="100%"></p>
+
+<p align="center"><img src="docs/media/profiles-sheet.webp" alt="The profiles sheet: saved profiles with their dpi, polling, brightness and lighting, and auto-switch by app" width="55%"></p>
+
 ## won't surprise you
 
 this is a tool whose whole job is injecting input and writing to your hardware, so the safety has to be real. three mechanisms, always on:
 
-- **[the arm gate](docs/GDD.md#the-arm-gate).** every synthesised keystroke, click, and process-spawn goes through one process-wide switch that's **disarmed by default**. only the running daemon or GUI ever flips it, arming takes a deliberate confirm, and disarming is instant. tests can't arm it — there's a test whose only job is enforcing that. reads are always safe.
+<table>
+<tr>
+<td width="42%"><img src="docs/media/safety-gates.webp" alt="The safety gates: device writes on, input and macros off until armed"></td>
+<td width="58%"><img src="docs/media/toasts.webp" alt="Three confirmation cards in the corner of the desktop: profile, polling and dpi"></td>
+</tr>
+</table>
+
+- **[the arm gate](docs/GDD.md#the-arm-gate).** every synthesised keystroke, click, and process-spawn goes through one process-wide switch. it starts **disarmed**, and only the running app or daemon arms it: a normal launch does, so your binds work after logon, `--safe` doesn't, turning it off is one instant flip and turning it back on asks first. tests can't arm it — there's a test whose only job is enforcing that. reads are always safe.
 - **[writes that verify themselves](docs/GDD.md#writes-that-verify-themselves).** writes are volatile (`NOSTORE`) unless you ask for storage, with one exception: `scroll` stores the stage onboard by default, the way synapse does (`--volatile` opts out). every write then re-reads the matching getter and confirms the bytes it sent actually landed. a mismatch is a hard error, never a silent success. when there's no opcode it trusts, it refuses rather than guessing at your hardware.
 - **[confirmations](docs/GDD.md#confirmations).** nothing changes silently. every committed change pops a small card *after* it actually lands — and unlike the OSD this replaces, you can move it, batch it, or turn it off.
 
@@ -147,12 +175,12 @@ two binaries: `neuron` (the CLI) and `neuron-app` (the GUI). the stuff you'll ac
 
 ```
 neuron list                          recognized devices
-neuron dpi 1600                      set DPI (read-back verified)
-neuron dpi-stages 800 1600 3200      set the DPI cycle (the whole table)
+neuron feel dpi 1600                 set DPI (read-back verified)
+neuron feel stages 800 1600 3200     set the DPI cycle (the whole table)
 neuron lighting effect fire          dry-run the exact bytes per device
 neuron lighting mirror               paint one device's vitals onto another's LEDs
 neuron backup                        snapshot every device's full state
-neuron import-export prof.synapse3 --apply   eat a synapse export
+neuron import prof.synapse3 --apply  eat a synapse export
 neuron run                           the remap daemon (esc to stop; --safe = observe only)
 neuron macro add lift my.py          register a python macro
 neuron macro prelude                 the `neuron` module reference (ctx + helpers + ask/notify)
@@ -161,21 +189,17 @@ neuron macro prelude                 the `neuron` module reference (ctx + helper
 <details>
 <summary><b>the full command tree</b> (every subcommand takes <code>--help</code>)</summary>
 
-every name is a top-level command: `neuron dpi`, never `neuron device dpi`. the left column is just a grouping. a name followed by `( … )` takes a subcommand of its own, so it's `neuron profile apply`, `neuron lighting effect`.
+`neuron <noun> <verb>`, with `--json` on everything. the full reference is **[docs/CLI.md](docs/CLI.md)**; an agent driving it reads **[skills/neuron-cli](skills/neuron-cli/SKILL.md)**.
 
 ```
-device      list · info · battery · dpi · dpi-stages · polling · scroll · brightness ·
-            sniper · lod · storage · mode · game-mode · remap · backup · verify · watch · probe
-lighting    lighting (run · effect · mirror · keytest · cellsweep · cells)
-input       bind (list · init) · radial (map · pick) · cast (show · init · run) ·
-            gesture (selftest · record · match · list · tune) · run [--safe]
-macros      macro (list · add · run · check · prelude)
-audio       audio (list · monitor · mic · out)
-profiles    profile (list · show · save · apply · capture · rename · delete · autoswitch)
-migrate     import · import-export · discover [--emit] · adopt [--dry-run]
-instruments twin (demo · stats · sigil · stage) · pocket
-diagnostics prof (pump)
-gui         neuron-app  [--safe · --tray · --purge-synapse · --scan-synapse]
+devices   list · info · battery · adopt · storage · mode · backup · verify · badge · button
+feel      feel (show · timing · sniper · dpi · polling · stages · scroll · lod · brightness ·
+          game-mode · idle)
+input     bind · control · action · trigger · cast · gesture · radial · macro · pocket ·
+          run [--safe] · watch · pads · rumble · audio · twin
+lighting  lighting (catalog · stack · fps · apply · effect · …)
+setup     profile · config · dump · apply · reload · status · catalog · import
+gui       neuron-app  [--safe · --tray · --purge-synapse · --scan-synapse]
 ```
 
 </details>
@@ -215,9 +239,10 @@ every device write is sorted by how sure i am of it:
 | symmetric lift-off distance | **proven**: reads back clean on the Naga |
 | asymmetric lift-off distance (split lift/landing) | **proven**: set/read round-trip on the Naga (the `0x0B/0x85` getter echoes mode=async + the lift/landing pair; the physical split confirmed by feel) |
 | idle/sleep timer | **proven**: set/read round-trip on the naga (write echoes back on the getter); behind the `idle-power-write` feature, which both shipped binaries turn on (a bare `neuron-core` library build leaves it off) |
-| thumb-grid button remap (`neuron remap`) | **proven**: reverse-engineered live on the Naga V2 Pro (class `0x15`), every write round-trip verified against the `15/82` getter. device-side and **volatile**: it holds while neuron keeps the mouse in driver mode, and the mouse falls back to its onboard profile without a host |
+| thumb-grid binds in firmware (`02/0C`) | **proven** live on the Naga V2 Pro: read back through `02/8C`, and the pressed key emitted the bound one. volatile direct profile, **normal mode only**, re-applied by neuron on connect and wake (`neuron button plan` / `apply` from the CLI). `15/02` reads back but does not change what a key emits, so nothing uses it any more |
 | in-game hi-res polling · scroll *stage* table · snap-tap (SOCD) | **gated** behind `NEURON_*_WRITE` until a capture confirms; payloads unit-tested, still read-back-verified |
-| debounce · saving a button remap into onboard memory | **no known opcode**: bails with a "needs RE" note, never a blind write |
+| debounce | **no known opcode**: bails with a "needs RE" note, never a blind write |
+| saving binds into an onboard slot | **known, unused**: `02/0C` with profile 1-5 persists across power cycles per naga-companion; neuron keeps binds volatile |
 
 things it flat-out doesn't do, so you know before you install:
 

@@ -70,6 +70,7 @@ one).
 | The label taxonomy, if you're filing or picking up issues | [`.github/LABELS.md`](.github/LABELS.md) |
 | You're helping a *user* install, update, or run neuron, not changing its code | [`skills/neuron-lazy-update/SKILL.md`](skills/neuron-lazy-update/SKILL.md) |
 | You're writing a Python macro or using beacons | [`skills/neuron-macros/SKILL.md`](skills/neuron-macros/SKILL.md) |
+| You're setting up or changing a user's binds, lighting, profiles or whole setup through the CLI | [`skills/neuron-cli/SKILL.md`](skills/neuron-cli/SKILL.md), reference in [`docs/CLI.md`](docs/CLI.md) |
 
 **The code is the source of truth.** `docs/TDD.md` and `docs/PROTOCOL-HOST.md` both
 carry a banner saying an LLM wrote them while building neuron. That banner is
@@ -144,6 +145,14 @@ matching getter, and hard-error on a mismatch rather than reporting a silent
 success. A capability with no trusted opcode refuses rather than guessing. New writes
 stay behind a `NEURON_*_WRITE` feature gate until a wire capture confirms them. A
 an unverified guess must stay gated, and a read-back mismatch must fail loudly.
+
+**The protocol ledger.** Every wire fact neuron speaks has an entry in
+`crates/neuron-core/protocol/ledger.toml`: its grade (live / capture / agreed / single /
+derived), dated hardware evidence, and upstream citations pinned to a commit SHA (facts only,
+never copied code). `tests/protocol_ledger.rs` fails when an opcode in a device def or in
+neuron-core has no entry, when a grade outruns its evidence, or when a write below `capture`
+ships without a gate or declared `ungated_debt`. New opcode, new entry. Settling a conflict on
+hardware means updating its entry in the same change.
 
 **Honesty over polish.** When neuron doesn't know something about the hardware, it
 says so. The README's proven / gated / absent ledger and the grading in
