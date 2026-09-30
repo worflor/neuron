@@ -1962,6 +1962,11 @@ pub fn check_rule(r: &Rule, refs: &Refs) -> Vec<Issue> {
         Trigger::Input { page, usage, .. } if *page == 0 && *usage == 0 => {
             out.push(Issue::error("input trigger has page 0 / usage 0"));
         }
+        Trigger::Input { page, pid: None, .. } if *page == crate::controls::RAZER_MACRO_PAGE => {
+            out.push(Issue::warning(
+                "macro key with no device: it fires for every device that sends this code (a mouse side plate shares the keyboard's M-key codes); add @pid",
+            ));
+        }
         Trigger::Gesture { name } if name.trim().is_empty() => out.push(Issue::error("gesture trigger needs a name")),
         Trigger::AppFocus { app } if app.trim().is_empty() => out.push(Issue::error("app trigger needs an exe needle")),
         Trigger::Hold { layer } if layer.trim().is_empty() => out.push(Issue::error("hold trigger needs a layer name")),
@@ -3277,6 +3282,17 @@ mod tests {
             Action::Key { key: "f".into() },
         );
         assert!(has_errors(&check_rule(&bad_game_light, &refs)), "game light may only drive feedback");
+    }
+
+    #[test]
+    fn a_macro_key_with_no_device_is_warned_about_and_a_scoped_one_is_not() {
+        let refs = Refs::default();
+        let macro_key = |pid| Trigger::Input { page: crate::controls::RAZER_MACRO_PAGE, usage: 0x22, pid };
+        let anonymous = check_rule(&Rule::new(macro_key(None), Action::Echo), &refs);
+        assert!(anonymous.iter().any(|i| i.severity == Severity::Warning && i.message.contains("@pid")), "{anonymous:?}");
+        assert!(!has_errors(&anonymous), "a warning never blocks a write");
+        let scoped = crate::registry::CanonicalPid::of(0x0221);
+        assert!(check_rule(&Rule::new(macro_key(Some(scoped)), Action::Echo), &refs).is_empty());
     }
 
     #[test]

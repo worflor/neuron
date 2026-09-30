@@ -24,17 +24,32 @@ pub enum ButtonCmd {
         /// only this device (hex pid)
         #[arg(long)]
         pid: Option<String>,
+        /// plan for this seated side plate (`12-button`, `2-button`, ...); default counts every plate
+        #[arg(long)]
+        plate: Option<String>,
     },
     /// Read each button's current function from the device (read-only)
     Read {
         #[arg(long)]
         pid: Option<String>,
+        /// every physical button the firmware lists, not just the thumb grid (plates, clicks, tilt)
+        #[arg(long)]
+        all: bool,
+        /// profile to read: 0 is the live direct profile, 1..5 the onboard slots
+        #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=5))]
+        profile: u8,
+        /// read the HyperShift layer
+        #[arg(long)]
+        hypershift: bool,
     },
     /// Write the firmware-performed part of the plan, every write verified by read-back. Volatile:
     /// the device forgets it on replug or power loss.
     Apply {
         #[arg(long)]
         pid: Option<String>,
+        /// the side plate on the mouse now (`12-button`, `2-button`, ...); default counts every plate
+        #[arg(long)]
+        plate: Option<String>,
         /// consent to the buttons emitting their keys on their own (the device performs the bind
         /// with no software running) until the device resets or `button restore`
         #[arg(long)]
@@ -88,19 +103,21 @@ fn button_defs<'a>(reg: &'a Registry, pid: Option<&str>) -> Result<Vec<&'a Devic
 }
 
 /// The plan for `def` from the live spine, with the cast trigger as the held control.
-fn plan_for(def: &DeviceDef, rules: &[neuron::engine::Rule], held: ControlRef, taken: &mut std::collections::BTreeSet<u8>) -> Vec<ButtonPlan> {
-    buttons::plan(def, rules, Some(held), taken)
+fn plan_for(def: &DeviceDef, rules: &[neuron::engine::Rule], held: ControlRef, plate: Option<&str>, taken: &mut std::collections::BTreeSet<u8>) -> Vec<ButtonPlan> {
+    let layer = plate.map(neuron::engine::side_plate_layer);
+    let seat = layer.as_deref().map_or(buttons::Plate::Any, |l| buttons::Plate::Seated(Some(l)));
+    buttons::plan_for(def, rules, Some(held), seat, taken)
 }
 
 pub fn button(cmd: ButtonCmd, reg: &Registry) -> Result<()> {
     match cmd {
-        ButtonCmd::Plan { pid } => {
+        ButtonCmd::Plan { pid, plate } => {
             let rt = neuron::controls::build_runtime();
             let rules = rt.engine.to_rules();
             let mut taken = std::collections::BTreeSet::new();
             let mut devices = Vec::new();
             for def in button_defs(reg, pid.as_deref())? {
-                let plan = plan_for(def, &rules, rt.cast_trigger, &mut taken);
+                let plan = plan_for(def, &rules, rt.cast_trigger, plate.as_deref(), &mut taken);
                 devices.push(json!({
                     "device": def.name,
                     "pid": def.modes.first().map(|m| format!("{}", CanonicalPid::of(m.product_id))),
@@ -123,39 +140,53 @@ pub fn button(cmd: ButtonCmd, reg: &Registry) -> Result<()> {
                 }
             })
         }
-        ButtonCmd::Read { pid } => {
+        ButtonCmd::Read { pid, all, profile, hypershift } => {
             let mut devices = Vec::new();
             for d in open_button_devices(reg, pid.as_deref())? {
+                let ids: Vec<(u8, Option<u8>)> = if all {
+                    buttons::table(&d)?
+                        .into_iter()
+                        .map(|id| (id, d.def.buttons.iter().find(|b| b.id == id).map(|b| b.stock_usage)))
+                        .collect()
+                } else {
+                    d.def.buttons.iter().map(|b| (b.id, Some(b.stock_usage))).collect()
+                };
                 let mut rows = Vec::new();
-                for b in &d.def.buttons {
-                    rows.push(match buttons::read(&d, b.id) {
+                for (id, stock) in ids {
+                    let stock = stock.map(label_usage);
+                    rows.push(match buttons::read_in(&d, profile, id, hypershift) {
                         Ok(rec) => {
                             let kb = rec.as_keyboard();
                             json!({
-                                "id": b.id, "stock": label_usage(b.stock_usage),
+                                "id": id, "stock": stock,
                                 "record": hex_bytes(&rec.0),
+                                "category": rec.0[0],
                                 "emits": kb.map(|(_, u)| label_usage(u)),
                                 "modifiers": kb.map(|(m, _)| m),
                             })
                         }
-                        Err(e) => json!({ "id": b.id, "stock": label_usage(b.stock_usage), "error": e.to_string() }),
+                        Err(e) => json!({ "id": id, "stock": stock, "error": e.to_string() }),
                     });
                 }
-                devices.push(json!({ "device": d.def.name, "pid": format!("{:04x}", d.pid), "buttons": rows }));
+                devices.push(json!({ "device": d.def.name, "pid": format!("{:04x}", d.pid), "profile": profile, "hypershift": hypershift, "buttons": rows }));
             }
             out::emit(&json!({ "devices": devices }), || {
                 for d in &devices {
                     println!("{}", d["device"].as_str().unwrap_or("?"));
                     for b in d["buttons"].as_array().into_iter().flatten() {
+                        let stock = b["stock"].as_str().unwrap_or("-");
                         match b["error"].as_str() {
-                            Some(e) => println!("  {:>2}  {:<10} read failed: {e}", b["id"], b["stock"].as_str().unwrap_or("")),
-                            None => println!("  {:>2}  {:<10} emits {}", b["id"], b["stock"].as_str().unwrap_or(""), b["emits"].as_str().unwrap_or("(not a keyboard function)")),
+                            Some(e) => println!("  {:>3}  {stock:<10} read failed: {e}", b["id"]),
+                            None => match b["emits"].as_str() {
+                                Some(k) => println!("  {:>3}  {stock:<10} emits {k}", b["id"]),
+                                None => println!("  {:>3}  {stock:<10} record {} (category {:#04x}, not a keyboard function)", b["id"], b["record"].as_str().unwrap_or(""), b["category"].as_u64().unwrap_or(0)),
+                            },
                         }
                     }
                 }
             })
         }
-        ButtonCmd::Apply { pid, arm } => {
+        ButtonCmd::Apply { pid, plate, arm } => {
             let rt = neuron::controls::build_runtime();
             let rules = rt.engine.to_rules();
             let mut taken = std::collections::BTreeSet::new();
@@ -163,7 +194,7 @@ pub fn button(cmd: ButtonCmd, reg: &Registry) -> Result<()> {
             // Plan every device first so nothing is written when the request is refused.
             let mut jobs: Vec<(Device, Vec<ButtonPlan>, usize)> = Vec::new();
             for d in devices {
-                let full = plan_for(&d.def, &rules, rt.cast_trigger, &mut taken);
+                let full = plan_for(&d.def, &rules, rt.cast_trigger, plate.as_deref(), &mut taken);
                 let host = full.iter().filter(|p| matches!(p.role, Role::Private { .. })).count();
                 // A private key needs the app's interceptor to swallow it; without one the button
                 // would type F13-F24 into the desktop. Those buttons stay stock here.

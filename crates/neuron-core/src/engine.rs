@@ -209,7 +209,16 @@ pub const SLOT_SIDE_PLATE: &str = "side_plate";
 /// edit and a bind, never a code change.
 #[must_use]
 pub fn side_plate_layer(label: &str) -> String {
-    format!("plate:{label}")
+    format!("{PLATE_LAYER_PREFIX}{label}")
+}
+
+const PLATE_LAYER_PREFIX: &str = "plate:";
+
+/// Whether `layer` is a plate's layer: live because that plate is on the mouse, never because a
+/// key was pressed.
+#[must_use]
+pub fn is_plate_layer(layer: &str) -> bool {
+    layer.starts_with(PLATE_LAYER_PREFIX)
 }
 
 impl Engine {
@@ -465,13 +474,15 @@ impl Engine {
     /// Which named `HyperShift` layer(s) this trigger ACTIVATES — i.e. layers that contain a rule
     /// whose trigger matches `fired`. Unlike [`resolve`](Engine::resolve), this scans every layer
     /// UNCONDITIONALLY (held or not), because it answers "if this input is pressed, which layers
-    /// should become held?" — the daemon's `HyperShift` hold-edge question. Returns sorted, de-duped
-    /// layer names.
+    /// should become held?" — the daemon's `HyperShift` hold-edge question. A plate's layer is
+    /// never one: it follows the seated plate, so a bind on it is an ordinary bind. Returns sorted,
+    /// de-duped layer names.
     #[must_use]
     pub fn layers_activated_by(&self, fired: &Trigger) -> Vec<String> {
         let mut out: Vec<String> = self
             .layers
             .iter()
+            .filter(|(name, _)| !is_plate_layer(name))
             .filter(|(_, rules)| rules.iter().any(|r| Self::matches(&r.trigger, fired)))
             .map(|(name, _)| name.clone())
             .collect();
@@ -561,6 +572,18 @@ mod latched_context_tests {
     /// and seating a different plate displaces it — it does not stack. Before this, a plate swap
     /// changed nothing at all: binds for buttons that had physically left the mouse stayed in the
     /// map and silently did nothing.
+    /// A plate bind is an ordinary bind. Pressing its button used to HOLD every plate layer that
+    /// bound it, as if it were a HyperShift key: a "Layer on plate:…" card per press, and the other
+    /// plate's bind firing alongside the seated one's.
+    #[test]
+    fn pressing_a_plate_bind_holds_no_layer() {
+        let e = plate_engine();
+        let button = Trigger::Input { page: 0xFF1A, usage: 0x20, pid: None };
+        assert!(e.layers_activated_by(&button).is_empty(), "{:?}", e.layers_activated_by(&button));
+        assert!(is_plate_layer(&side_plate_layer("2-button")));
+        assert!(!is_plate_layer("hypershift"));
+    }
+
     #[test]
     fn a_seated_plate_scopes_its_binds_and_a_swap_displaces_them() {
         let mut e = plate_engine();

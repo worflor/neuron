@@ -31,6 +31,7 @@ use std::sync::Mutex;
 const CLASS_BUTTONS: u8 = 0x02;
 const ID_BUTTON_FN_SET: u8 = 0x0C;
 const ID_BUTTON_FN_GET: u8 = 0x8C;
+const ID_BUTTON_TABLE: u8 = 0x84;
 const BUTTON_FN_SIZE: u8 = 0x0A;
 /// The volatile "direct" profile; 1..5 are onboard slots.
 const DIRECT_PROFILE: u8 = 0x00;
@@ -67,13 +68,26 @@ impl Record {
 
 /// Read one button's function on the direct profile.
 pub fn read(d: &Device, button: u8) -> Result<Record> {
-    let a = d.exec_dynamic(CLASS_BUTTONS, ID_BUTTON_FN_GET, BUTTON_FN_SIZE, &[DIRECT_PROFILE, button, 0x00])?;
-    if a[0] != DIRECT_PROFILE || a[1] != button || a[2] != 0x00 {
+    read_in(d, DIRECT_PROFILE, button, false)
+}
+
+/// Read one button's function from `profile` (0 direct, 1..5 onboard), on the HyperShift layer or not.
+pub fn read_in(d: &Device, profile: u8, button: u8, hypershift: bool) -> Result<Record> {
+    let shift = u8::from(hypershift);
+    let a = d.exec_dynamic(CLASS_BUTTONS, ID_BUTTON_FN_GET, BUTTON_FN_SIZE, &[profile, button, shift])?;
+    if a[0] != profile || a[1] != button || a[2] != shift {
         bail!("button {button:#04x} read-back echoed {:02x?}, not the button asked for", &a[..3]);
     }
     let mut r = [0u8; 7];
     r.copy_from_slice(&a[3..10]);
     Ok(Record(r))
+}
+
+/// Every physical button id the firmware lists (`02/84`: `[count, id ...]`).
+pub fn table(d: &Device) -> Result<Vec<u8>> {
+    let a = d.exec_dynamic(CLASS_BUTTONS, ID_BUTTON_TABLE, 0x20, &[])?;
+    let n = usize::from(a[0]).min(a.len() - 1);
+    Ok(a[1..=n].to_vec())
 }
 
 /// Write one button's function on the direct profile and verify it against the `02/8C` read-back.
@@ -152,6 +166,32 @@ pub fn keyboard_function(key: &str) -> Option<(u8, u8)> {
 /// the pool empty stays stock and its bind is served by the input interceptor instead.
 #[must_use]
 pub fn plan(def: &DeviceDef, rules: &[Rule], held: Option<crate::controls::ControlRef>, taken: &mut std::collections::BTreeSet<u8>) -> Vec<ButtonPlan> {
+    plan_for(def, rules, held, Plate::Any, taken)
+}
+
+/// Which side plate's binds a plan counts. A plate changes which physical buttons exist, not what
+/// the firmware holds per id, so a button two plates bind differently is planned for the seated one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Plate<'a> {
+    /// Every plate's binds: a plan read for review, with no plate known.
+    Any,
+    /// The live mouse: this plate layer is seated, or `None` when no plate has been announced.
+    Seated(Option<&'a str>),
+}
+
+impl Plate<'_> {
+    fn counts(self, layer: Option<&str>) -> bool {
+        match (self, layer) {
+            (Plate::Seated(seated), Some(l)) if crate::engine::is_plate_layer(l) => seated == Some(l),
+            _ => true,
+        }
+    }
+}
+
+/// [`plan`] with a seated plate: a bind on another plate's layer can never fire, so it neither
+/// claims a button nor keeps the seated plate's bind out of firmware.
+#[must_use]
+pub fn plan_for(def: &DeviceDef, rules: &[Rule], held: Option<crate::controls::ControlRef>, plate: Plate<'_>, taken: &mut std::collections::BTreeSet<u8>) -> Vec<ButtonPlan> {
     let Some(first) = def.modes.first() else { return Vec::new() };
     let pid = CanonicalPid::of(first.product_id);
     let mut next_private = || {
@@ -167,6 +207,7 @@ pub fn plan(def: &DeviceDef, rules: &[Rule], held: Option<crate::controls::Contr
             };
             let binds: Vec<&Rule> = rules
                 .iter()
+                .filter(|r| plate.counts(r.layer.as_deref()))
                 .filter(|r| matches!(r.trigger, Trigger::Input { page, usage, pid: p } if on_button(page, usage, p)))
                 .collect();
             let is_held = held.is_some_and(|c| on_button(c.page, c.usage, c.pid));
@@ -174,7 +215,7 @@ pub fn plan(def: &DeviceDef, rules: &[Rule], held: Option<crate::controls::Contr
                 Role::Stock
             } else {
                 let firmware = match binds.as_slice() {
-                    [only] if !is_held && only.layer.as_deref().is_none_or(|l| l.starts_with("plate:")) => match &only.action {
+                    [only] if !is_held && only.layer.as_deref().is_none_or(crate::engine::is_plate_layer) => match &only.action {
                         Action::Key { key } => keyboard_function(key),
                         _ => None,
                     },
@@ -473,6 +514,20 @@ mod tests {
         let second = privates(&plan(&def, &rules, None, &mut taken));
         assert_eq!(first, vec![0x73, 0x72], "F24 first");
         assert!(second.iter().all(|u| !first.contains(u)), "{first:?} vs {second:?}");
+    }
+
+    #[test]
+    fn a_button_two_plates_bind_differently_is_planned_for_the_seated_plate() {
+        // `-` is the 12-button plate's Space and the 2-button plate's Back.
+        let rules = [
+            bind(0x2D, key("space"), Some("plate:12-button")),
+            bind(0x2D, Action::MouseButton { button: crate::action::MouseButtonKind::Back }, Some("plate:2-button")),
+        ];
+        let role = |plate| plan_for(&naga(), &rules, None, plate, &mut Default::default()).into_iter().find(|p| p.id == 0x4A).unwrap().role;
+        assert_eq!(role(Plate::Seated(Some("plate:12-button"))), Role::Performed { mods: 0, usage: 0x2C });
+        assert!(matches!(role(Plate::Seated(Some("plate:2-button"))), Role::Private { .. }), "a click is the host's");
+        assert_eq!(role(Plate::Seated(None)), Role::Stock, "no plate announced: neither plate's bind can fire");
+        assert!(matches!(role(Plate::Any), Role::Private { .. }), "a review plan counts both");
     }
 
     #[test]

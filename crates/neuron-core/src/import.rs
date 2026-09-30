@@ -136,7 +136,199 @@ impl Imported {
 pub fn import_export(path: &Path) -> Result<Imported> {
     let bytes = std::fs::read(path)
         .with_context(|| format!("reading Synapse export {}", path.display()))?;
+    if let Some(text) = mapping_log_text(&bytes) {
+        return Ok(import_mapping_log(&text));
+    }
     import_export_bytes(&bytes)
+}
+
+// ───────────────────────────────────── Synapse 3 service log ─────────────────────────────────
+
+/// A Synapse 3 mapping log (`Log\Mouse_<pid>_MappingV2.log`, `Keybd_<pid>_Mapping.log`) as text,
+/// or `None` for anything else. Synapse writes these as UTF-16LE with no BOM.
+fn mapping_log_text(bytes: &[u8]) -> Option<String> {
+    let body = bytes.strip_prefix(&[0xFF, 0xFE]).unwrap_or(bytes);
+    // Log text is ASCII, so every high byte is zero; a ZIP or UTF-8 file fails this at once.
+    if body.len() < 2 || body.iter().skip(1).step_by(2).take(64).any(|&b| b != 0) {
+        return None;
+    }
+    let units: Vec<u16> = body.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    let text = String::from_utf16_lossy(&units);
+    (text.contains("Mapping") && text.contains("(ModulePid=0x") && text.contains("INPUT: ")).then_some(text)
+}
+
+/// Import the layout a Synapse 3 session pushed to a device, from its mapping log.
+///
+/// Synapse 3 keeps profiles in an encrypted account cache, but its service logs every mapping it
+/// sets (`TConvertMapping` for mice, `TSetMapping` for keyboards):
+/// `INPUT: SC 0x05 EX 0x00  MOD: 0x00000000  MAP: MAPPING_SINGLEKEY Key: MC=0x2a ...`.
+/// `MOD 0` is the user's base layer and `MOD 0x80` Synapse's factory fill, so only base-layer rows
+/// that differ from their input become binds, and the last write of an input wins. Inputs are the
+/// device's stock scancode (`SC`) or mouse button (`MBTN`); `DKM` rows name buttons by an id the
+/// log does not resolve, so they are reported rather than guessed at.
+#[must_use]
+pub fn import_mapping_log(text: &str) -> Imported {
+    const PID_AT: &str = "Mapping (ModulePid=0x";
+    let mut out = Imported::default();
+    let mut rows: Vec<(String, Rule)> = Vec::new();
+    let (mut pid, mut other_layers, mut dkm, mut unhandled) = (None, 0usize, 0usize, 0usize);
+    for line in text.lines() {
+        let Some(at) = line.find(PID_AT) else { continue };
+        let Some(input_at) = line.find("INPUT: ") else { continue };
+        let row_pid = line[at + PID_AT.len()..].get(..4).and_then(|h| u16::from_str_radix(h, 16).ok());
+        pid = pid.or(row_pid);
+        let fields: Vec<&str> = line[input_at + 7..].split('\t').map(str::trim).collect();
+        let [input, modifier, map, ..] = fields.as_slice() else { continue };
+        if *modifier != "MOD: 0x00000000" {
+            other_layers += 1;
+            continue;
+        }
+        let dev = row_pid.map(crate::registry::CanonicalPid::of);
+        let trigger = if let Some(sc) = input.strip_prefix("SC ") {
+            let (sc, ext) = scan_pair(sc);
+            match sc.and_then(|sc| usage_for_scancode(sc, ext)) {
+                Some(usage) => Trigger::Input { page: 0x07, usage: u16::from(usage), pid: dev },
+                None => {
+                    unhandled += 1;
+                    continue;
+                }
+            }
+        } else if let Some(n) = input.strip_prefix("MBTN ").and_then(hex_u8) {
+            Trigger::Input { page: 0x09, usage: u16::from(n), pid: dev }
+        } else {
+            if input.starts_with("DKM ") {
+                dkm += 1;
+            }
+            continue;
+        };
+        let map = map.trim_start_matches("MAP: ");
+        if map.starts_with("<Clear Map>") || map.starts_with("MAPPING_DEFAULT") {
+            rows.retain(|(k, _)| k != input);
+            continue;
+        }
+        let Some(action) = log_action(map) else {
+            unhandled += 1;
+            continue;
+        };
+        rows.retain(|(k, _)| k != input);
+        if !is_factory(&trigger, &action) {
+            rows.push(((*input).to_string(), Rule::new(trigger, action)));
+        }
+    }
+    out.rules = rows.into_iter().map(|(_, r)| r).collect();
+    out.profile.name = pid.map_or_else(|| "synapse3".to_string(), |p| format!("synapse3-{p:04x}"));
+    if out.rules.is_empty() {
+        out.note("no base-layer remaps in this log, only factory mappings");
+    }
+    if dkm > 0 {
+        out.note(format!("{dkm} device-key (DKM) row(s) skipped: the log does not say which button a DKM id is"));
+    }
+    if other_layers > 0 {
+        out.note(format!("{other_layers} row(s) on other layers skipped (factory fill, HyperShift, device functions)"));
+    }
+    if unhandled > 0 {
+        out.note(format!("{unhandled} base-layer row(s) have no Neuron equivalent yet (macros, modifier chords, DPI, custom actions)"));
+    }
+    out.note("the log holds only what the last Synapse session wrote: check the layout on the device");
+    out
+}
+
+/// A logged `MAP:` output as an action: a plain key, or a mouse button by Synapse's `BtnActType`.
+fn log_action(map: &str) -> Option<Action> {
+    if let Some(key) = map.strip_prefix("MAPPING_SINGLEKEY Key: ") {
+        let field = |name: &str| key.split(name).nth(1).map(|v| v.split([',', ' ']).next().unwrap_or(""));
+        let mc = field("MC=").and_then(hex_u8)?;
+        let extended = field("EX=").and_then(hex_u8) == Some(0x02);
+        let mods = field("Mods=").and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok())?;
+        if mods != 0 {
+            return None;
+        }
+        return Some(Action::Key { key: key_name_for_usage(usage_for_scancode(mc, extended)?)? });
+    }
+    let button = match map.strip_prefix("MAPPING_BUTTON BtnActType: ")?.split_whitespace().next()? {
+        "1" => MouseButtonKind::Left,
+        "2" => MouseButtonKind::Right,
+        "3" => MouseButtonKind::Middle,
+        "4" => MouseButtonKind::Forward,
+        "5" => MouseButtonKind::Back,
+        _ => return None,
+    };
+    Some(Action::MouseButton { button })
+}
+
+/// Whether a mapping is the device's own factory behaviour (a key sending itself, a mouse button
+/// doing its stock job), which Synapse fills in and the user never chose.
+fn is_factory(trigger: &Trigger, action: &Action) -> bool {
+    match (trigger, action) {
+        (Trigger::Input { page: 0x07, usage, .. }, Action::Key { key }) => {
+            crate::action::hid_usage_for_key(key).map(u16::from) == Some(*usage)
+        }
+        (Trigger::Input { page: 0x09, usage, .. }, Action::MouseButton { button }) => matches!(
+            (usage, button),
+            (1, MouseButtonKind::Left)
+                | (2, MouseButtonKind::Right)
+                | (3, MouseButtonKind::Middle)
+                | (4, MouseButtonKind::Back)
+                | (5, MouseButtonKind::Forward)
+        ),
+        _ => false,
+    }
+}
+
+/// `"0x05 EX 0x00"` -> `(Some(0x05), false)`; `EX 0x02` marks an extended (E0) scancode.
+fn scan_pair(s: &str) -> (Option<u8>, bool) {
+    let mut it = s.split_whitespace();
+    let sc = it.next().and_then(hex_u8);
+    let extended = it.nth(1).and_then(hex_u8) == Some(0x02);
+    (sc, extended)
+}
+
+fn hex_u8(s: &str) -> Option<u8> {
+    u8::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()
+}
+
+/// A PS/2 set-1 scancode (with its E0 flag) -> the keyboard HID usage that sends it.
+fn usage_for_scancode(sc: u8, extended: bool) -> Option<u8> {
+    if extended {
+        return Some(match sc {
+            0x1C => 0x58,
+            0x1D => 0xE4,
+            0x35 => 0x54,
+            0x38 => 0xE6,
+            0x47 => 0x4A,
+            0x48 => 0x52,
+            0x49 => 0x4B,
+            0x4B => 0x50,
+            0x4D => 0x4F,
+            0x4F => 0x4D,
+            0x50 => 0x51,
+            0x51 => 0x4E,
+            0x52 => 0x49,
+            0x53 => 0x4C,
+            0x5B => 0xE3,
+            0x5C => 0xE7,
+            0x5D => 0x65,
+            _ => return None,
+        });
+    }
+    // The keypad shares scancodes with the navigation block (whose E0 forms are above), so an
+    // unprefixed scancode means the first usage in table order: the main-block key.
+    (0u8..=0xE7).find(|&u| hid_usage_default_scancode(u16::from(u)) == Some(u16::from(sc)))
+}
+
+/// A keyboard HID usage -> the key name [`Action::Key`] takes, if it has one.
+fn key_name_for_usage(usage: u8) -> Option<String> {
+    const NAMED: &[&str] = &[
+        "space", "enter", "esc", "backspace", "tab", "caps-lock", "up", "down", "left", "right", "insert",
+        "delete", "home", "end", "page-up", "page-down", "print-screen", "scroll-lock", "pause", "menu", "ctrl",
+        "shift", "alt", "win", "rctrl", "rshift", "ralt", "rwin",
+    ];
+    let singles = ('a'..='z').chain('0'..='9').chain("-=[]\\;'`,./".chars()).map(String::from);
+    let fkeys = (1..=24).map(|n| format!("f{n}"));
+    singles
+        .chain(fkeys)
+        .chain(NAMED.iter().map(|s| (*s).to_string()))
+        .find(|k| crate::action::hid_usage_for_key(k) == Some(usage))
 }
 
 /// Content-detecting import over raw bytes (so the GUI can hand us an in-memory upload). Both
@@ -1250,6 +1442,48 @@ fn split_blocks(xml: &str, tag: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Rows exactly as Synapse 3 logged them for a Naga V2 Pro (2026-07-03), factory fill included.
+    const NAGA_LOG: &str = "\
+[20260703 16:40:21.100] [ProcID7564:TID24324] CRSy3_MappingV2Feature::TConvertMapping (ModulePid=0x00a8, Feat=MappingV2): INFO: INPUT: SC 0x02 EX 0x00\tMOD: 0x00000000\tMAP: MAPPING_BUTTON BtnActType: 5 (pIRzCtl = 0x00000000)
+[20260703 16:40:21.100] [ProcID7564:TID24324] CRSy3_MappingV2Feature::TConvertMapping (ModulePid=0x00a8, Feat=MappingV2): INFO: INPUT: SC 0x05 EX 0x00\tMOD: 0x00000000\tMAP: MAPPING_SINGLEKEY Key: MC=0x2a, EX=0x00, Mods=0x00000000 (pIRzCtl = 0x00000000)
+[20260703 16:40:21.100] [ProcID7564:TID24324] CRSy3_MappingV2Feature::TConvertMapping (ModulePid=0x00a8, Feat=MappingV2): INFO: INPUT: SC 0x07 EX 0x00\tMOD: 0x00000000\tMAP: MAPPING_SINGLEKEY Key: MC=0x1d, EX=0x00, Mods=0x00000000 (pIRzCtl = 0x00000000)
+[20260703 16:40:21.100] [ProcID7564:TID24324] CRSy3_MappingV2Feature::TConvertMapping (ModulePid=0x00a8, Feat=MappingV2): INFO: INPUT: SC 0x0c EX 0x00\tMOD: 0x00000000\tMAP: MAPPING_SINGLEKEY Key: MC=0x39, EX=0x00, Mods=0x00000000 (pIRzCtl = 0x00000000)
+[20260703 16:40:21.100] [ProcID7564:TID24324] CRSy3_MappingV2Feature::TConvertMapping (ModulePid=0x00a8, Feat=MappingV2): INFO: INPUT: SC 0x0c EX 0x00\tMOD: 0x00000080\tMAP: MAPPING_SINGLEKEY Key: MC=0x0c, EX=0x00, Mods=0x00000000 (pIRzCtl = 0x00000000)
+[20260703 16:40:21.100] [ProcID7564:TID24324] CRSy3_MappingV2Feature::TConvertMapping (ModulePid=0x00a8, Feat=MappingV2): INFO: INPUT: MBTN 0x04\tMOD: 0x00000000\tMAP: MAPPING_BUTTON BtnActType: 5 (pIRzCtl = 0x00000000)
+[20260703 16:40:21.100] [ProcID7564:TID24324] CRSy3_MappingV2Feature::TConvertMapping (ModulePid=0x00a8, Feat=MappingV2): INFO: INPUT: DKM 0x03\tMOD: 0x00000000\tMAP: MAPPING_SINGLEKEY Key: MC=0x12, EX=0x00, Mods=0x00000000 (pIRzCtl = 0x00000000)
+[20260703 16:40:21.100] [ProcID7564:TID24324] CRSy3_MappingV2Feature::TConvertMapping (ModulePid=0x00a8, Feat=MappingV2): INFO: INPUT: SC 0x0d EX 0x00\tMOD: 0x00000000\tMAP: MAPPING_SINGLEKEY Key: MC=0x10, EX=0x00, Mods=0x00000000 (pIRzCtl = 0x00000000)
+[20260703 16:40:21.100] [ProcID7564:TID24324] CRSy3_MappingV2Feature::TConvertMapping (ModulePid=0x00a8, Feat=MappingV2): INFO: INPUT: SC 0x0d EX 0x00\tMOD: 0x00000000\tMAP: <Clear Map> (pIRzCtl = 0x00000000)
+";
+
+    #[test]
+    fn a_keyboard_mapping_log_reads_the_same_way() {
+        let log = "[20260703 16:39:49.315][ProcID7564:TID24324]CRSy3_Mapping::TSetMapping (ModulePid=0x0221, Feat=Mapping): INFO: INPUT: SC 0x1e EX 0x00\tMOD: 0x00000000\tMAP: MAPPING_SINGLEKEY Key: MC=0x30, EX=0x00, Mods=0x00000000 (pIRzCtl = 0x10441c10)\n";
+        let pid = Some(crate::registry::CanonicalPid::of(0x0221));
+        let a_to_b = Rule::new(Trigger::Input { page: 0x07, usage: 0x04, pid }, Action::Key { key: "b".into() });
+        assert_eq!(import_mapping_log(log).rules, vec![a_to_b]);
+    }
+
+    #[test]
+    fn a_synapse3_mapping_log_imports_the_users_layer_and_drops_factory_fill() {
+        let got = import_mapping_log(NAGA_LOG);
+        let pid = Some(crate::registry::CanonicalPid::of(0x00A8));
+        let key = |usage, k: &str| Rule::new(Trigger::Input { page: 0x07, usage, pid }, Action::Key { key: k.into() });
+        let back = Rule::new(Trigger::Input { page: 0x07, usage: 0x1E, pid }, Action::MouseButton { button: MouseButtonKind::Back });
+        // MC is a set-1 scancode: 0x2a is Left Shift (the HID usage 0x2A would be Backspace).
+        assert_eq!(got.rules, vec![back, key(0x21, "shift"), key(0x23, "ctrl"), key(0x2D, "space")]);
+        assert_eq!(got.profile.name, "synapse3-00a8");
+        assert!(got.notes.iter().any(|n| n.contains("DKM")), "{:?}", got.notes);
+    }
+
+    #[test]
+    fn a_mapping_log_is_recognized_as_utf16_with_or_without_a_bom() {
+        let utf16: Vec<u8> = NAGA_LOG.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        assert!(mapping_log_text(&utf16).is_some(), "Synapse writes no BOM");
+        assert!(mapping_log_text(&[&[0xFF, 0xFE][..], &utf16].concat()).is_some());
+        assert!(mapping_log_text(NAGA_LOG.as_bytes()).is_none(), "UTF-8 is not what Synapse writes");
+        assert!(mapping_log_text(b"PK\x03\x04 a zip").is_none());
+    }
 
     // Ground-truth tests against real decoded Synapse exports. Those are somebody's personal
     // config, so they are not in the repo: point NEURON_SYNAPSE_FIXTURES at a directory holding

@@ -92,9 +92,9 @@ app applies this plan whenever input is armed.
 
 | verb | |
 |---|---|
-| `button plan [--pid P]` | per button: `stock`, `firmware` or `host`, and the 7-byte record (no hardware touched) |
-| `button read [--pid P]` | what each button holds now (read-only) |
-| `button apply [--pid P] --arm` | write the firmware part, each write read back; host-performed binds stay stock (the CLI has no interceptor). Volatile: the device forgets on replug |
+| `button plan [--pid P] [--plate LABEL]` | per button: `stock`, `firmware` or `host`, and the 7-byte record (no hardware touched). `--plate 12-button` plans for that seated side plate; without it every plate's binds count |
+| `button read [--pid P] [--all] [--profile N] [--hypershift]` | what each button holds now (read-only). `--all` walks every button the firmware lists (`02/84`), not just the thumb grid: clicks, tilt, plates. `--profile` 0 is the live direct profile, 1..5 the onboard slots |
+| `button apply [--pid P] [--plate LABEL] --arm` | write the firmware part, each write read back; host-performed binds stay stock (the CLI has no interceptor). Volatile: the device forgets on replug |
 | `button restore [--pid P]` | factory functions, verified |
 
 `neuron remap` is retired: it wrote `15/02`, which never changed what a key emits. It now authors the bind
@@ -224,7 +224,7 @@ dump / apply              a setup document / {sections:[{section, status, detail
 | Feel: DPI, stages, polling, brightness, scroll stage, LOD, sleep timer, game mode, sniper | `feel ...` (and the top-level verbs) |
 | Timing windows, tap/hold, coyote | `feel timing` |
 | Settings: accents, notifications, connections, phoenix, launch to tray | `config app ...` |
-| Import wizard | `import` (survey), `import FILE [--apply]` (a Synapse export) |
+| Import wizard | `import` (survey, lists Synapse 3 mapping logs), `import FILE [--apply]` (a Synapse export, or a Synapse 3 `*Mapping*.log`) |
 | Onboard storage, backup, verify | `storage`, `backup`, `verify` |
 | Pockets, audio endpoints | `pocket`, `audio` |
 | Everything authored, at once | `dump`, `apply` |

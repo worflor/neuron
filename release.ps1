@@ -135,6 +135,11 @@ if (Get-Process neuron-app, neuron -ErrorAction SilentlyContinue) {
 if (-not $SkipBuild) {
     Write-Step 'Building release binaries (broker + app + CLI)'
     Push-Location $RepoRoot
+    # Cargo reports progress and warnings on stderr. Under 'Stop', Windows PowerShell turns each
+    # redirected stderr line into a terminating error, so a logged build died on its first warning;
+    # the exit code is the verdict.
+    $previousPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
     try {
         & cargo build --release -p neuron-host --features bridge --bin neuron-chroma-broker
         if ($LASTEXITCODE -ne 0) { throw "broker build failed (exit $LASTEXITCODE)" }
@@ -145,6 +150,7 @@ if (-not $SkipBuild) {
         & cargo build --release -p neuron-app -p neuron-cli
         if ($LASTEXITCODE -ne 0) { throw "cargo build failed (exit $LASTEXITCODE)" }
     } finally {
+        $ErrorActionPreference = $previousPreference
         if ($null -eq $previousBrokerHash) { Remove-Item Env:NEURON_BROKER_SHA256 -ErrorAction SilentlyContinue }
         else { $env:NEURON_BROKER_SHA256 = $previousBrokerHash }
         if ($null -eq $previousInstallerHash) { Remove-Item Env:NEURON_BROKER_INSTALLER_SHA256 -ErrorAction SilentlyContinue }

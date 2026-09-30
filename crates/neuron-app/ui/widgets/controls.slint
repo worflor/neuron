@@ -1123,6 +1123,8 @@ export component ActionPicker inherits VerticalLayout {
     // gates the palette TRIGGER chip: false → dimmed ink + inert (mirrors SplitToggle's disabled
     // state). The param field/chips keep their own state; this is the palette-open affordance's gate.
     in property <bool> enabled: true;
+    // the palette drawer is open under the field
+    property <bool> open: false;
     spacing: 8px;
     Rectangle {
         height: Theme.row-h;
@@ -1132,118 +1134,6 @@ export component ActionPicker inherits VerticalLayout {
         border-color: !root.enabled ? Theme.line-soft
             : pa.has-hover ? Theme.text-faint : Theme.line;
         animate background, border-color { duration: pa.has-hover ? Theme.hover-in : Theme.hover-out; }
-        apopup := PopupWindow {
-            x: 0;
-            y: parent.height + 2px;
-            width: max(parent.width, 400px);
-            // close only on OUTSIDE click — so clicking a section HEADER (a non-selectable title) no
-            // longer dismisses the whole palette; a real pick closes it explicitly below.
-            close-policy: PopupClosePolicy.close-on-click-outside;
-            Rectangle {
-                background: Theme.bg-2;
-                border-width: Theme.hair;
-                border-color: Theme.line;
-                border-radius: Theme.radius-sm;
-                height: 440px;
-                // the FULL spine, grouped — every action the engine can do, structured by what
-                // the user is trying to achieve. Scrolls (the palette must never be trimmed to
-                // fit a box; the engine's breadth IS the point).
-                Flickable {
-                    viewport-width: self.width;
-                    VerticalLayout {
-                        padding: 4px;
-                        for c[i] in State.action-choices : Rectangle {
-                            // a hint present -> the row is TALLER so the name + hint stack on two rows
-                            // (never cramped/elided); no hint -> the compact single row.
-                            height: c.header ? (i == 0 ? 24px : 30px) : (c.param-hint == "" ? 26px : 40px);
-                            border-radius: Theme.radius-sm;
-                            background: !c.header && cta.has-hover ? Theme.well : transparent;
-                            cta := TouchArea {
-                                enabled: !c.header;
-                                mouse-cursor: c.header ? MouseCursor.default : MouseCursor.pointer;
-                                clicked => {
-                                    if (State.action-choice != i) { State.action-param = ""; }
-                                    State.action-choice = i;
-                                    State.action-choice-changed();
-                                    apopup.close();
-                                }
-                            }
-                            // a header is structure: a small tracked-out title above its group
-                            if c.header : HorizontalLayout {
-                                padding-left: 9px;
-                                padding-right: 9px;
-                                alignment: start;
-                                VerticalLayout {
-                                    alignment: end;
-                                    padding-bottom: 3px;
-                                    HorizontalLayout {
-                                        spacing: 7px;
-                                        Text {
-                                            text: c.label;
-                                            color: Theme.text-dim;
-                                            font-family: Theme.mono;
-                                            font-size: Theme.fs-small;
-                                            font-weight: 700;
-                                            letter-spacing: Theme.track-4;
-                                        }
-                                    }
-                                }
-                            }
-            if !c.header : HorizontalLayout {
-                                padding-left: 9px;
-                                padding-right: 9px;
-                                spacing: 7px;
-                                Text {
-                                    text: i == State.action-choice ? "›" : " ";
-                                    color: Theme.accent;
-                                    font-family: Theme.mono;
-                                    font-size: Theme.fs-body;
-                                    vertical-alignment: center;
-                                }
-                                // MATURITY tier badge — quiet when done (5), warm→red as it drops to WIP/placeholder.
-                                Text {
-                                    text: c.tier;
-                                    width: 12px;
-                                    horizontal-alignment: center;
-                                    // warm→red as the tier drops: warn (WIP) → caution → danger (placeholder).
-                                    color: c.tier >= 5 ? Theme.text-faint
-                                        : c.tier >= 3 ? Theme.warn
-                                        : c.tier >= 1 ? Theme.caution
-                                        : Theme.danger;
-                                    font-family: Theme.mono;
-                                    font-size: Theme.fs-small;
-                                    font-weight: 700;
-                                    vertical-alignment: center;
-                                }
-                                // name on its own row; the (dark-grey) param hint drops to a SECOND
-                                // row so a long hint never crowds or elides the name. No hint = one row.
-                                VerticalLayout {
-                                    horizontal-stretch: 1;
-                                    alignment: center;
-                                    spacing: 1px;
-                                    Text {
-                                        text: c.label;
-                                        overflow: elide;
-                                        color: i == State.action-choice ? Theme.text : Theme.text-mid;
-                                        font-family: Theme.mono;
-                                        font-size: Theme.fs-body;
-                                        horizontal-alignment: left;
-                                    }
-                                    if c.param-hint != "" : Text {
-                                        text: c.param-hint;
-                                        overflow: elide;
-                                        color: Theme.text-faint;
-                                        font-family: Theme.mono;
-                                        font-size: Theme.fs-small;
-                                        horizontal-alignment: left;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
         HorizontalLayout {
             padding-left: 11px; padding-right: 9px; spacing: 8px;
             Text {
@@ -1262,7 +1152,114 @@ export component ActionPicker inherits VerticalLayout {
         pa := TouchArea {
             enabled: root.enabled;
             mouse-cursor: root.enabled ? MouseCursor.pointer : MouseCursor.default;
-            clicked => { apopup.show(); }
+            clicked => { root.open = !root.open; }
+        }
+    }
+    // The palette opens INLINE under its field and pushes the form down. A PopupWindow inside the
+    // page Flickable was placed as if the page were unscrolled, opening far below the field.
+    if root.open : Rectangle {
+        background: Theme.bg-2;
+        border-width: Theme.hair;
+        border-color: Theme.line;
+        border-radius: Theme.radius-sm;
+        height: 320px;
+        clip: true;
+        // the FULL spine, grouped — every action the engine can do, structured by what
+        // the user is trying to achieve. Scrolls (the palette must never be trimmed to
+        // fit a box; the engine's breadth IS the point).
+        Flickable {
+            viewport-width: self.width;
+            VerticalLayout {
+                padding: 4px;
+                for c[i] in State.action-choices : Rectangle {
+                    // a hint present -> the row is TALLER so the name + hint stack on two rows
+                    // (never cramped/elided); no hint -> the compact single row.
+                    height: c.header ? (i == 0 ? 24px : 30px) : (c.param-hint == "" ? 26px : 40px);
+                    border-radius: Theme.radius-sm;
+                    background: !c.header && cta.has-hover ? Theme.well : transparent;
+                    cta := TouchArea {
+                        enabled: !c.header;
+                        mouse-cursor: c.header ? MouseCursor.default : MouseCursor.pointer;
+                        clicked => {
+                            if (State.action-choice != i) { State.action-param = ""; }
+                            State.action-choice = i;
+                            State.action-choice-changed();
+                            root.open = false;
+                        }
+                    }
+                    // a header is structure: a small tracked-out title above its group
+                    if c.header : HorizontalLayout {
+                        padding-left: 9px;
+                        padding-right: 9px;
+                        alignment: start;
+                        VerticalLayout {
+                            alignment: end;
+                            padding-bottom: 3px;
+                            HorizontalLayout {
+                                spacing: 7px;
+                                Text {
+                                    text: c.label;
+                                    color: Theme.text-dim;
+                                    font-family: Theme.mono;
+                                    font-size: Theme.fs-small;
+                                    font-weight: 700;
+                                    letter-spacing: Theme.track-4;
+                                }
+                            }
+                        }
+                    }
+    if !c.header : HorizontalLayout {
+                        padding-left: 9px;
+                        padding-right: 9px;
+                        spacing: 7px;
+                        Text {
+                            text: i == State.action-choice ? "›" : " ";
+                            color: Theme.accent;
+                            font-family: Theme.mono;
+                            font-size: Theme.fs-body;
+                            vertical-alignment: center;
+                        }
+                        // MATURITY tier badge — quiet when done (5), warm→red as it drops to WIP/placeholder.
+                        Text {
+                            text: c.tier;
+                            width: 12px;
+                            horizontal-alignment: center;
+                            // warm→red as the tier drops: warn (WIP) → caution → danger (placeholder).
+                            color: c.tier >= 5 ? Theme.text-faint
+                                : c.tier >= 3 ? Theme.warn
+                                : c.tier >= 1 ? Theme.caution
+                                : Theme.danger;
+                            font-family: Theme.mono;
+                            font-size: Theme.fs-small;
+                            font-weight: 700;
+                            vertical-alignment: center;
+                        }
+                        // name on its own row; the (dark-grey) param hint drops to a SECOND
+                        // row so a long hint never crowds or elides the name. No hint = one row.
+                        VerticalLayout {
+                            horizontal-stretch: 1;
+                            alignment: center;
+                            spacing: 1px;
+                            Text {
+                                text: c.label;
+                                overflow: elide;
+                                color: i == State.action-choice ? Theme.text : Theme.text-mid;
+                                font-family: Theme.mono;
+                                font-size: Theme.fs-body;
+                                horizontal-alignment: left;
+                            }
+                            if c.param-hint != "" : Text {
+                                text: c.param-hint;
+                                overflow: elide;
+                                color: Theme.text-faint;
+                                font-family: Theme.mono;
+                                font-size: Theme.fs-small;
+                                horizontal-alignment: left;
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
     // suggestion CHIPS: live, clickable fills for the param — open windows for glance

@@ -533,14 +533,20 @@ pub fn prime_scroll(pid: u16, stage: u32) {
     with_baseline_observed(pid, |b| b.scroll = stage);
 }
 
-/// Learn device `pid`'s current side plate without carding (state sync): updates that device's de-dup
-/// baseline AND its GUI readout label (the plate has no getter), exactly like [`observe_side_plate`]'s
-/// readout path, but emits no card. See [`prime_dpi`].
+/// Learn device `pid`'s current side plate from a state burst: updates the de-dup baseline and the
+/// GUI readout like [`observe_side_plate`]. Unlike DPI, the plate cards here when it CHANGED from a
+/// plate already known: the Naga re-announces its whole state when a plate seats, so a swap arrives
+/// as a burst. The first plate learned since launch stays silent.
 pub fn prime_side_plate(pid: u16, id: u32, label: &str) {
-    with_baseline_observed(pid, |b| {
+    let prev = with_baseline_observed(pid, |b| {
+        let prev = b.plate;
         b.plate = id;
         b.plate_label = Some(label.to_string());
+        prev
     });
+    if prev != PLATE_UNKNOWN && prev != id && id != 0 {
+        side_plate(label);
+    }
 }
 
 /// The last side-plate label device `pid` pushed, if any has been observed since launch. Surfaced on
@@ -642,6 +648,19 @@ mod tests {
         let (fired, plate) = capture_side_plates(PID_A, || observe_side_plate(PID_A, 0, "detached"));
         assert!(fired.is_empty(), "a detach must not card");
         assert_eq!(plate.as_deref(), Some("detached"), "but the readout still updates");
+    }
+
+    #[test]
+    fn a_plate_learned_in_a_state_burst_cards_only_when_it_changed() {
+        // The Naga re-announces dpi + scroll + plate together when a plate seats, so a swap arrives
+        // as a burst. The first plate since launch is a sync; a different plate after it is a swap.
+        let (fired, plate) = capture_side_plates(PID_A, || {
+            prime_side_plate(PID_A, 1, "2-button"); // launch: silent
+            prime_side_plate(PID_A, 1, "2-button"); // wake with the same plate: silent
+            prime_side_plate(PID_A, 3, "12-button"); // swapped: cards
+        });
+        assert_eq!(fired.len(), 1, "{fired:?}");
+        assert_eq!(plate.as_deref(), Some("12-button"));
     }
 
     #[test]

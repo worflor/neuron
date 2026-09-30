@@ -217,6 +217,10 @@ enum Cmd {
         /// how long to listen, seconds
         #[arg(long, default_value_t = 20)]
         seconds: u64,
+        /// instead: what a Razer mouse pushes on its own (side-plate swaps, DPI and scroll-stage
+        /// changes, deferred buttons), raw bytes and decoded
+        #[arg(long)]
+        device: bool,
     },
     /// Glyph gestures: record, list, rename, delete, bind, tune
     Gesture {
@@ -398,7 +402,7 @@ enum Cmd {
     /// values). With a `*.synapse3` or `*.ChromaEffects` export, previews what would import;
     /// `--apply` writes the profile and rules.
     Import {
-        /// a Synapse export (`*.synapse3` / `*.ChromaEffects`); omit to survey this machine's config
+        /// a Synapse export (`*.synapse3` / `*.ChromaEffects`) or a Synapse 3 mapping log (`*Mapping*.log`); omit to survey this machine's config
         file: Option<String>,
         /// survey only: also extract and print sample values
         #[arg(long, conflicts_with = "file")]
@@ -1143,7 +1147,8 @@ fn run() -> Result<()> {
         Cmd::GameMode { state } => gamemode_cmd(&reg, state.as_deref())?,
         Cmd::Sniper(a) => setup_cmd::sniper(a)?,
         Cmd::Storage { raw } => storage_status(&reg, raw)?,
-        Cmd::Watch { seconds } => neuron::controls::watch(seconds),
+        Cmd::Watch { seconds, device: true } => watch_device_cmd(&reg, seconds)?,
+        Cmd::Watch { seconds, device: false } => neuron::controls::watch(seconds),
         Cmd::Pads { seconds, rumble } => neuron::controls::pads(seconds, rumble),
         Cmd::Rumble { low, high, left_trigger, right_trigger, ms, tour } => rumble_cmd(
             neuron::haptics::Rumble { low, high, left_trigger, right_trigger },
@@ -2389,6 +2394,13 @@ fn import_cmd(deep: bool) {
             "  (encrypted/account-synced profiles are skipped — Razer's lock-in, not readable)"
         );
     }
+    let logs = synapse_mapping_logs(&roots);
+    if !logs.is_empty() {
+        println!("\nSynapse 3 button layouts, as its service last logged them (preview with `neuron import FILE`):");
+        for l in &logs {
+            println!("  {}", l.display());
+        }
+    }
 
     if deep {
         println!("\nsample extracted values (the eatable surface):");
@@ -2412,8 +2424,86 @@ fn import_cmd(deep: bool) {
             }
         }
     } else {
-        println!("\n(run `neuron import --deep` to extract sample values. Writing into Neuron config = next.)");
+        println!("\n(`neuron import --deep` prints sample values; `neuron import FILE --apply` writes an export or a mapping log.)");
     }
+}
+
+/// Synapse 3's per-device mapping logs (`Synapse3\Log\*Mapping*.log`) under the vendor roots: the
+/// only readable record of a layout whose profile lives in the encrypted account cache.
+fn synapse_mapping_logs(roots: &[std::path::PathBuf]) -> Vec<std::path::PathBuf> {
+    let mut out: Vec<std::path::PathBuf> = roots
+        .iter()
+        .filter_map(|r| std::fs::read_dir(r.join("Synapse3").join("Log")).ok())
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| {
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            name.contains("Mapping") && name.ends_with(".log")
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// Print every settings report a Razer mouse pushes by itself, for `seconds`: the `05` family
+/// (`05 02` DPI, `05 0e` side plate by strap-code) and the `04` deferred buttons. The same
+/// collections the app's event reader listens on; read-only, and safe beside a running app.
+fn watch_device_cmd(reg: &Registry, seconds: u64) -> Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let infos = transport::enumerate()?;
+    let pipes: Vec<_> = infos
+        .into_iter()
+        .filter(|i| i.vid == neuron::synth::RAZER_VID)
+        .filter(|i| (i.usage_page == 0x0001 && i.usage == 0x0000) || i.usage_page >= 0xFF00)
+        .collect();
+    if pipes.is_empty() {
+        bail!("no Razer event collection to listen on");
+    }
+    println!("listening {seconds}s on {} collection(s); swap a plate or press DPI (Ctrl+C stops)", pipes.len());
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let mut threads = Vec::new();
+    for info in pipes {
+        let def = reg.devices.iter().find(|d| d.vendor_id == info.vid && d.product_ids().any(|p| p == info.pid)).cloned();
+        let stop = stop.clone();
+        threads.push(std::thread::spawn(move || {
+            let Ok(reader) = transport::open_reader(&info.path) else { return };
+            let mut buf = [0u8; 91];
+            while !stop.load(Ordering::Relaxed) {
+                match reader.read(&mut buf) {
+                    Ok(Some(n)) if n >= 2 => {
+                        let b = &buf[..n];
+                        // Windows hands the report without its id byte on these collections.
+                        let meaning = match (b[0], b[1]) {
+                            (0x05, 0x0e) => {
+                                let id = b.get(2).copied().unwrap_or(0);
+                                let label = if id == 0 {
+                                    "detached".to_string()
+                                } else {
+                                    def.as_ref().and_then(|d| d.side_plate_label(id)).map_or_else(|| "not in the device's [side_plates]".to_string(), str::to_string)
+                                };
+                                format!("side plate: strap-code {id} -> {label}")
+                            }
+                            (0x05, 0x02) if n >= 4 => format!("dpi {}", u16::from_be_bytes([b[2], b[3]])),
+                            (0x04, 0x00) => "deferred buttons released".to_string(),
+                            (0x04, c) => format!("deferred button {c:#04x}"),
+                            _ => String::new(),
+                        };
+                        let hex: Vec<String> = b.iter().take(8).map(|x| format!("{x:02x}")).collect();
+                        println!("  {:04x}  {:<24} {meaning}", info.pid, hex.join(" "));
+                    }
+                    Ok(_) => {}
+                    Err(_) => return,
+                }
+            }
+        }));
+    }
+    std::thread::sleep(std::time::Duration::from_secs(seconds));
+    stop.store(true, Ordering::Relaxed);
+    for t in threads {
+        let _ = t.join();
+    }
+    Ok(())
 }
 
 fn f_skipped(found: &[neuron::synapse::Found]) -> usize {
