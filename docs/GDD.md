@@ -65,7 +65,7 @@ first, how neuron reaches a protected device without installing a driver. razer'
 
 the bread and butter: DPI (a single value or the full stage cycle), polling rate, brightness, idle/sleep timer, scroll stage, lift-off distance, onboard-storage accounting, battery and charge state. reads decode the device's own bytes and match synapse byte-for-byte: DPI comes back as a big-endian X/Y pair, the onboard pool reports the same "% remaining" math synapse shows (`free = available + recycle`).
 
-the naga's thumb grid can be remapped **on the device itself**: `neuron remap --key 5 --to g` makes the physical button emit `g` at the source, one keystroke with no host injection and no double-send, which is exactly how synapse does it. every write is round-trip verified against the device's own readback. it's volatile, though: the remap holds while neuron keeps the mouse in driver mode, and the mouse falls back to its onboard profile when no host is present. saving a remap into onboard memory has no known opcode yet.
+a bind on the naga's thumb grid runs **in the mouse itself** whenever the mouse can express it. bind a thumb key to `g` or `ctrl+s` and neuron writes that into the mouse's own button table (`02/0C`), so the button emits the key at the source: no hook, no injection, no double-send. a bind the firmware can't express (a macro, an app action, anything on a hypershift layer) gets a private key only that button sends (`f13`-`f24`), which neuron swallows and runs. every write is read back through `02/8C`. the functions live in the mouse's volatile direct profile, which only runs in normal device mode, so neuron keeps the naga in normal mode, puts them back on connect and wake, and returns every button to factory when it exits or input is disarmed.
 
 some of it the device just *volunteers*. press the onboard DPI button, toggle the scroll stage, or snap a magnetic side-plate onto a Naga and the mouse pushes its own HID report saying so; neuron hears it on a separate read channel and turns it into a live readout, the same instant-OSD path synapse listens on without polling.
 
@@ -141,6 +141,18 @@ releasing one input drops only *its* layer, so two held layers don't stomp each 
 
 **the radial menu** is the simple end of spellweaving: hold, flick a direction, release, with a custom hand-motion engine tracking your hand in the air as you cast.
 
+### controllers and anything else with buttons
+
+a gamepad, a tartarus, a $20 pad from anywhere: if it's a HID device, neuron reads what it is from the device's own report descriptor, not from a table of known devices. buttons are buttons; every value field is watched until it's clear what it is. an axis that settles mid-range is a stick axis and becomes two bindable directions, one that settles at an end is a trigger, a hat is four cardinals. whether it rests in the middle or at an end is measured from where the value actually sits still, so a stick held at the edge when it's plugged in doesn't get misread for good, and a slider parked partway presses nothing until it has been seen at rest.
+
+on windows, pads GameInput knows (every xbox-protocol pad, and others it classes as a gamepad) come through it, the only path that hears them from the tray; everything else comes through raw input. devices whose descriptor doesn't match what they send (a switch pro in full mode fills its "button" bytes with a timer and motion data) are caught by the obvious tell, several buttons toggling many times a second, and ignored rather than firing phantom presses; a small layout file describes the real stream instead (the switch pro's comes from SDL's zlib-licensed driver). pads that arrive through GameInput or a layout share the standard pad's names, so a bind on the south button is the same bind on any of them; a raw input pad keeps its descriptor's own button numbers.
+
+every device wears a badge wherever a bind names it: an emblem (a mouse, a pad, a keypad, a headset…) and a name. both come from the device first, its product string and the kind of collections it declares (a short list of product words covers kinds a descriptor can't show, like a headset), and either can be changed in place from the device chip under a captured trigger. rules, trigger wells and the cast trigger all follow the change, so "Pad south · couch pad" replaces a pid nobody remembers.
+
+hold the cast trigger and push a stick: the stick aims the radial. a trigger on a pad is aimed by that pad's own sticks; a mouse or keyboard trigger by whichever stick you push. release fires the wedge the stick last pointed at firmly, so the spring back to centre never changes the choice, and a full push reaches a wedge's second tier.
+
+on a pad with motors the wheel is a knob you can feel. each wedge boundary is a detent: a ridge that builds as the stick nears it and a click as it crosses, sharper the faster you sweep, landing on the trigger motor on the side you're pointing. a stick parked on a boundary hums faintly, so you know you're between two wedges without looking. pushing out through a fan's rim taps twice; firing strikes, then settles. it's synthesised per frame from the stick's angle, reach and speed, not played from canned clips. PAD FEEL, beside the wedge count, sets how strong it is (off to 150%), and "feel it" plays the whole phrase on the pad in your hands.
+
 ### spellweaving
 
 hold a trigger, weave a stroke, release; it fires an action: **live, as a real keybind**. one engine across a continuum. at the simple end it's a **radial** flick (direction only, bucketed into N sectors); at the rich end a full **glyph** (any drawn shape).
@@ -200,9 +212,9 @@ this is a tool whose whole job is injecting input and writing to your hardware, 
 
 ### the arm gate
 
-every synthesised keystroke, click, and process-spawn (and every macro helper) goes through one process-wide switch that's **disarmed by default.** tests, the verify pass, anything that isn't the actual running app fires nothing. it's a single boolean that starts safe, and only the daemon or the GUI ever flips it on. (there's a test whose only job is making sure the test suite can never arm input.)
+every synthesised keystroke, click, and process-spawn (and every macro helper) goes through one process-wide switch that **starts disarmed.** tests, the verify pass, anything that isn't the actual running app fires nothing. only the daemon or the GUI ever flips it on, and a normal launch of either does, so binds work from logon; `--safe` never does. (there's a test whose only job is making sure the test suite can never arm input.)
 
-the running app hands the same switch to the Macro Host, so helpers obey it too. `neuron run --safe` is fully read-only: input disarmed, writes paused; `neuron-app --safe` boots the app the same way; and the GUI keeps a separate switch that just pauses device writes. arming takes a deliberate confirm; disarming is instant. reads are always safe.
+the running app hands the same switch to the Macro Host, so helpers obey it too. `neuron run --safe` is fully read-only: input disarmed, writes paused; `neuron-app --safe` boots the app the same way; and the GUI keeps a separate switch that just pauses device writes. re-arming by hand takes a deliberate confirm; disarming is instant. reads are always safe.
 
 a thing that remaps your buttons and runs python on a keypress is, by definition, an input hook, which is exactly why you get the full source. read it, build it yourself, throw the binary at virustotal. and a small unsigned binary will sometimes trip defender's smartscreen; that's the tax on indie exes.
 
@@ -230,7 +242,7 @@ getting your settings off synapse, getting synapse off your machine, and teachin
 synapse's export files (`.synapse3` / `.ChromaEffects`) are just zips of plaintext XML with a funny extension. no crypto. (its *cloud* cache is properly AES-encrypted, and we leave that alone, but the in-app Export is wide open.)
 
 ```
-neuron import-export your-profile.synapse3 --apply
+neuron import your-profile.synapse3 --apply
 ```
 
 neuron unzips it and reads each capability by its **feature-GUID** rather than its name, which happens to be stable across devices and synapse versions, so it doesn't care which synapse made the file, and anything it doesn't recognise gets logged and skipped instead of blowing up. it also throws out the **noise**: a synapse keymap exports ~100 keys, most of them still bound to their own default, so neuron diffs against the standard key table and keeps only the ones you actually changed. a handful of real rules instead of a hundred. DPI, stages, polling, brightness, idle-off, gaming-mode, your binds (base *and* hypershift, kept apart), lighting: it all comes over. animated lighting becomes live compositor layers, static frames are captured per-key. run it without `--apply` and it just shows you what it *would* import and what it dropped.

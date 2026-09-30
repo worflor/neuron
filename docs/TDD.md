@@ -527,7 +527,9 @@ Everything in §5.5 assumes a device is already *modeled*. This is how one gets 
 
 - `04 <code>` — Razer driver-mode deferred buttons. The firmware, once neuron takes driver-mode custody, hands neuron its onboard macro/DPI/scroll buttons as bare per-press events; neuron IS the implementer. Codes verified live on the BlackWidow: `0x01`=FN, `0x20..0x24`=M1..M5, `0x00`=release.
 - `05 02 <X_be><Y_be>` — DPI change, value carried big-endian per axis (verified live on the Naga: `05 02 03 20 03 20`=800, `05 02 75 30 75 30`=30000). Drives the wake-reconcile that heals a stale volatile plane.
-- `05 3a <stage> <?>` — scroll/sensitivity stage. Byte[2] is the stage (read); byte[3] (`0x82`/`0x85` observed) is an unread field, not yet decoded.
+- `05 3a <stage> <?>` — scroll/sensitivity stage. Byte[2] is the stage (read); byte[3] (`0x82`/`0x85` observed) is unread. The same two bytes trail the `15/87` getter (`[store, active, count, 82, 85]`), so they are likely per-stage codes; not yet decoded.
+
+The scroll stage is also pullable: `15/80 [store]` → `[store, stage]` and `15/81 [store]` → `[store, enabled count]` (Naga V2 Pro, live 2026-09-29; a `15/00` select past the count FAILs). `ScrollStageCycle` steps from those two reads and verifies the select against `15/80`, so the firmware moving the stage by itself in normal mode can never leave neuron cycling from a stale position.
 - `05 0c` — power/charge poke (also fires on wake); settles charge + reasserts config.
 - `05 0e <strap>` — side-plate strap code (push-only, no getter — this report *is* the detection), resolved to a label via `[side_plates]`.
 
