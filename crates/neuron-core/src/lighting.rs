@@ -1272,11 +1272,16 @@ impl<'a> Lights<'a> {
     /// firmware ACKs lighting writes and silently ignores them, so a path that forgot to take
     /// control "succeeded" with a dark board (the silent-no-op trap the stack audit found on the
     /// ACK'd paint/effect paths, which used to rely on callers remembering).
+    ///
+    /// A `Firmware`-custody device paints in normal mode (Naga V2 Pro, verified 2026-09-30: static
+    /// and custom-frame lighting on both zones), so it is never flipped to driver mode here.
     pub fn ensure_control(&self) -> anyhow::Result<()> {
         if self.controlled.get() {
             return Ok(());
         }
-        if self.dev.run("device_mode").map_or(0, |m| m[0]) != 0x03 {
+        if self.dev.def.custody == crate::registry::Custody::Firmware {
+            crate::writes::ensure_custody(self.dev);
+        } else if self.dev.run("device_mode").map_or(0, |m| m[0]) != 0x03 {
             crate::writes::set_device_mode(self.dev, 0x03)?;
         }
         self.controlled.set(true);

@@ -95,6 +95,7 @@ export component SpellweavingPanel inherits VerticalLayout {
                 lamp: true;
                 live: State.cast-trigger-label != "—";
                 text: State.cast-trigger-label;
+                emblem: State.cast-trigger-emblem;
                 prompt: "nothing bound yet";
             }
         }
@@ -246,7 +247,7 @@ export component SpellweavingPanel inherits VerticalLayout {
             spacing: Theme.gap;
             HorizontalLayout {
                 spacing: 8px;
-                SectionTitle { text: "GLYPH · the rich weave"; }
+                SectionTitle { text: "GLYPHS · draw a shape"; }
                 // the book button — opens the whole-engine spellweaving guide (rich, radial, the
                 // vault, assist, rhythms). Lives here, at the top of the weave, rather than tucked
                 // beside one slider further down — it's about the feature, not just ASSIST.
@@ -554,7 +555,7 @@ export component SpellweavingPanel inherits VerticalLayout {
             spacing: Theme.gap;
             alignment: start;   // pack from the top so the pinned wheel stays put; the wedge-detail Card
                                 // and status line grow into the slack BELOW, never displacing the wheel
-            SectionTitle { text: "RADIAL · the simple weave"; }
+            SectionTitle { text: "RADIAL · flick a direction"; }
             // wedge count — ONE tight row: label · fader · live readout. The cap stays COMPUTED,
             // not decreed (a wedge is only pickable if its arc at the commit radius beats the
             // hand's lateral jitter → max = 2π·reach / jitter), and the math stays on the panel.
@@ -581,6 +582,40 @@ export component SpellweavingPanel inherits VerticalLayout {
                     alignment: center;
                     min-width: 46px;   // stable width so the fader doesn't twitch at the 1→2 digit jump
                     Mono { text: State.radial-sectors + "/" + State.radial-max; color: Theme.text; horizontal-alignment: right; }
+                }
+            }
+            // PAD FEEL — how strongly a pad aiming the wheel feels its detents, clicks and fire; the
+            // button plays that phrase on the pad in hand, so the setting is judged by touch.
+            HorizontalLayout {
+                spacing: 9px;
+                VerticalLayout {
+                    alignment: center;
+                    Mono { text: "PAD FEEL"; color: Theme.text-dim; }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    horizontal-stretch: 1;
+                    Slider {
+                        compact: true;
+                        minimum: 0;
+                        maximum: 150;
+                        step: 5;
+                        value: State.pad-feel;
+                        has-home: true;
+                        home: 100;
+                        wheel: false;
+                        changed(v) => { State.pad-feel = v; }
+                        released(v) => { State.set-pad-feel(v); }
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    min-width: 46px;
+                    Mono { text: State.pad-feel == 0 ? "off" : State.pad-feel + "%"; color: Theme.text; horizontal-alignment: right; }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Button { text: "feel it"; enabled: State.pad-feel > 0; clicked => { State.feel-pad(); } }
                 }
             }
             // HYPERSHIFT RADIAL toggle + the live test button, side by side above the wheel. HyperShift

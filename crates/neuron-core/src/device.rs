@@ -78,7 +78,9 @@ impl Device {
     /// that could disagree on the gate). For a WRITE intent, pass the SETTER command name (e.g.
     /// `"set_dpi"`), not the reader, so the predicate matches the operation.
     pub fn open_with_command(reg: &crate::registry::Registry, cmd: &str) -> Result<Self> {
-        for i in &transport::enumerate()? {
+        let mut infos = transport::enumerate()?;
+        reg.prefer_live_links(&mut infos);
+        for i in &infos {
             // find_for_pipe (not find_by_pid): resolve the def that actually DRIVES this pipe, so on
             // a two-family pid each control pipe reaches the family that can frame it.
             if let Some(def) = reg.find_for_pipe(i) {
@@ -116,7 +118,9 @@ impl Device {
         reg: &crate::registry::Registry,
         cap: crate::registry::Capability,
     ) -> Result<Self> {
-        for i in &transport::enumerate()? {
+        let mut infos = transport::enumerate()?;
+        reg.prefer_live_links(&mut infos);
+        for i in &infos {
             // find_for_pipe (not find_by_pid): the def that DRIVES this pipe answers the capability
             // question, so a two-family pid resolves each pipe to its own frameable family.
             if let Some(def) = reg.find_for_pipe(i) {
@@ -369,7 +373,7 @@ impl<'a> DeviceSession<'a> {
         };
         if self.driver_ready.insert(dk) {
             let dev = self.open_for_key(key, &resolve)?;
-            crate::writes::ensure_driver(dev);
+            crate::writes::ensure_custody(dev);
         }
         self.open_for_key(key, &resolve)
     }
@@ -381,7 +385,7 @@ impl<'a> DeviceSession<'a> {
 
     /// Shared retry CORE behind [`with_writable`]: resolve-and-cache under `key` via `resolve`, run
     /// `op`; on failure, invalidate the cached handle (forcing a fresh `resolve` + a re-run
-    /// `ensure_driver` handshake through `writable_for_key`) and retry `op` once, wrapping a second
+    /// `ensure_custody` handshake through `writable_for_key`) and retry `op` once, wrapping a second
     /// failure with the first failure's text so neither is lost. `with_writable` below is the
     /// production convenience that supplies `cmd` as both the cache key and the `open_with_command`
     /// resolver — byte-identical behavior, just factored so the `(key, resolve)` pair is an explicit
@@ -602,7 +606,7 @@ mod tests {
     /// propagates the error before ever entering the poll loop). While alive it behaves like
     /// `dialect::tests::SharedPipe`: `get_feature` echoes whatever `(class, id)` was last `set_feature`d
     /// with a SUCCESS status. `device_mode_sets` counts how many times a device-mode SET (class
-    /// 0x00/id 0x04, `writes::ensure_driver`'s handshake write) actually landed while alive, so a test
+    /// 0x00/id 0x04, `writes::ensure_custody`'s handshake write) actually landed while alive, so a test
     /// can pin "the handshake re-ran on the reopened device" on a plain counter instead of guessing at
     /// call counts.
     #[derive(Clone)]
@@ -641,7 +645,7 @@ mod tests {
 
     /// Proves that `DeviceSession::with_writable` invalidates and retries a stale handle once.
     /// Drives the REAL retry code through the `with_writable_via` seam (no
-    /// `transport::enumerate()`, no real hardware): attempt 1 resolves a fresh `Device`, `ensure_driver`'s
+    /// `transport::enumerate()`, no real hardware): attempt 1 resolves a fresh `Device`, `ensure_custody`'s
     /// handshake succeeds (device is alive), then the write itself discovers the handle just went
     /// stale (models a wireless sleep landing between resolve and write) and fails. `with_writable`
     /// must invalidate, resolve a SECOND fresh handle, re-run the driver handshake on it, and retry the
@@ -706,7 +710,7 @@ mod tests {
         assert_eq!(
             device_mode_sets.load(Ordering::SeqCst),
             2,
-            "ensure_driver's device-mode handshake must re-run on the reopened device (once per \
+            "ensure_custody's device-mode handshake must re-run on the reopened device (once per \
              resolved handle), not be skipped on retry"
         );
     }

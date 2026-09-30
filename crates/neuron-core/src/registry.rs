@@ -7,7 +7,7 @@
 
 use anyhow::Result;
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// A single vendor command: class / id / requested data size, plus any fixed leading
 /// argument bytes (e.g. varstore + `led_id` for lighting).
@@ -140,6 +140,36 @@ pub struct DeviceDef {
     /// behaviour.
     #[serde(default)]
     pub events: Option<EventMap>,
+    /// Buttons whose function the firmware can reassign (`[[buttons]]`), with the key each emits
+    /// from the factory. See [`crate::buttons`].
+    #[serde(default)]
+    pub buttons: Vec<ButtonSpec>,
+    /// Which device mode neuron keeps the device in. See [`Custody`].
+    #[serde(default)]
+    pub custody: Custody,
+}
+
+/// Who owns a razer device while neuron runs, i.e. which `device_mode` host writes happen in.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Custody {
+    /// Driver mode (`0x03`): the device only honours host writes there, and defers its onboard
+    /// buttons to the host. The keyboard's macro keys need it.
+    #[default]
+    Driver,
+    /// Normal mode (`0x00`): every host write neuron makes lands without driver mode, so the device
+    /// stays in it: its onboard buttons keep working and firmware button functions stay live
+    /// (they are ignored in driver mode).
+    Firmware,
+}
+
+/// One firmware-assignable button: its on-device id and the keyboard usage it emits stock.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ButtonSpec {
+    pub id: u8,
+    /// HID keyboard usage the button emits with factory settings — the identity binds use.
+    pub stock_usage: u8,
 }
 
 impl DeviceDef {
@@ -299,7 +329,8 @@ pub enum Capability {
     Polling2,
     /// Hi-res (`HyperPolling`) write up to 8000Hz (0x00/0x40).
     SetPolling2,
-    /// Select the active scroll-wheel stage (wire-confirmed 0x15/0x00).
+    /// Select the active scroll-wheel stage (wire-confirmed 0x15/0x00), read-back verified via
+    /// 0x15/0x80 and bounded by the enabled count at 0x15/0x81.
     SetScrollStage,
     /// Read lighting brightness.
     Brightness,
@@ -315,11 +346,13 @@ pub enum Capability {
     GameMode,
     /// Write the keyboard's firmware game mode (the Win-key kill) — the getter verifies the write.
     SetGameMode,
+    /// Reassign what a button emits in firmware (0x02/0x0C), read-back verified via 0x02/0x8C.
+    ButtonFunction,
 }
 
 impl Capability {
     /// All capabilities, for enumeration ([`DeviceDef::capabilities`]).
-    pub const ALL: [Capability; 16] = [
+    pub const ALL: [Capability; 17] = [
         Capability::Dpi,
         Capability::SetDpi,
         Capability::DpiStages,
@@ -336,6 +369,7 @@ impl Capability {
         Capability::Lighting,
         Capability::GameMode,
         Capability::SetGameMode,
+        Capability::ButtonFunction,
     ];
 
     /// The registry command name(s) this capability needs (all must be present). The single source
@@ -351,7 +385,9 @@ impl Capability {
             Capability::SetPolling => &["set_polling"],
             Capability::Polling2 => &["polling2"],
             Capability::SetPolling2 => &["set_polling2"],
-            Capability::SetScrollStage => &["set_scroll_stage"],
+            // The getters are required: a stage select is read-back verified, and a cycle steps
+            // from the device's own stage over its own enabled count.
+            Capability::SetScrollStage => &["set_scroll_stage", "scroll_stage", "scroll_stage_count"],
             Capability::Brightness => &["brightness"],
             Capability::SetBrightness => &["set_brightness"],
             Capability::Battery => &["battery_level"],
@@ -359,6 +395,7 @@ impl Capability {
             Capability::Lighting => &[],
             Capability::GameMode => &["game_mode"],
             Capability::SetGameMode => &["set_game_mode"],
+            Capability::ButtonFunction => &["set_button_function", "button_function"],
         }
     }
 
@@ -389,6 +426,7 @@ impl Capability {
             Capability::Lighting => "lighting",
             Capability::GameMode => "game mode (read)",
             Capability::SetGameMode => "game mode (set)",
+            Capability::ButtonFunction => "button functions (set)",
         }
     }
 }
@@ -689,6 +727,76 @@ impl Registry {
             .find(|d| d.matches_control(info))
     }
 
+    /// Reorder `infos` so each multi-link device's control pipes come in its declared mode order
+    /// (wired first). Pipes of other devices keep their positions, so first-match resolution still
+    /// picks between DEVICES by enumeration order but between one device's LINKS by preference.
+    ///
+    /// Why: a HyperSpeed dongle enumerates whether or not the mouse is on the other end, so with
+    /// the mouse on its cable the dongle pipe is present but dead (every request times out). An
+    /// enumerated wired pid is a live data link to the device itself, so it wins.
+    pub fn prefer_live_links(&self, infos: &mut Vec<crate::transport::HidDeviceInfo>) {
+        let rank = |i: &crate::transport::HidDeviceInfo| -> Option<(u16, usize)> {
+            let def = self.find_for_pipe(i)?;
+            if def.modes.len() < 2 {
+                return None;
+            }
+            let idx = def.modes.iter().position(|m| m.product_id == i.pid)?;
+            Some((def.modes[0].product_id, idx))
+        };
+        let mut groups: BTreeMap<u16, Vec<usize>> = BTreeMap::new();
+        for (slot, i) in infos.iter().enumerate() {
+            if let Some((group, _)) = rank(i) {
+                groups.entry(group).or_default().push(slot);
+            }
+        }
+        let mut order: Vec<usize> = (0..infos.len()).collect();
+        for slots in groups.values().filter(|s| s.len() > 1) {
+            let mut sorted = slots.clone();
+            sorted.sort_by_key(|&s| rank(&infos[s]).map_or(usize::MAX, |(_, idx)| idx));
+            for (&slot, &src) in slots.iter().zip(&sorted) {
+                order[slot] = src;
+            }
+        }
+        let mut taken: Vec<Option<crate::transport::HidDeviceInfo>> =
+            std::mem::take(infos).into_iter().map(Some).collect();
+        *infos = order.into_iter().filter_map(|s| taken[s].take()).collect();
+    }
+
+    /// The pipe that should stand in for `info` when `info` is a lower-preference link of a device
+    /// whose better link is also enumerated (the mouse on its cable with its dongle still plugged).
+    /// `None` when `info` is already the best link, or when the pairing is ambiguous: with two units
+    /// of the same device, a dongle can't be matched to a cable without a serial read, so nothing
+    /// is collapsed.
+    #[must_use]
+    pub fn preferred_link_for<'a>(
+        &self,
+        info: &crate::transport::HidDeviceInfo,
+        infos: &'a [crate::transport::HidDeviceInfo],
+    ) -> Option<&'a crate::transport::HidDeviceInfo> {
+        let def = self.find_for_pipe(info)?;
+        if def.modes.len() < 2 {
+            return None;
+        }
+        let rank_of = |pid: u16| def.modes.iter().position(|m| m.product_id == pid);
+        let mine = rank_of(info.pid)?;
+        let mut links: BTreeMap<u16, BTreeSet<String>> = BTreeMap::new();
+        for i in infos {
+            if rank_of(i.pid).is_some() && self.find_for_pipe(i).is_some_and(|d| d.name == def.name) {
+                links.entry(i.pid).or_default().insert(i.instance());
+            }
+        }
+        if links.values().any(|units| units.len() > 1) {
+            return None;
+        }
+        let best = links.keys().copied().min_by_key(|&pid| rank_of(pid))?;
+        if rank_of(best)? >= mine {
+            return None;
+        }
+        infos
+            .iter()
+            .find(|i| i.pid == best && self.find_for_pipe(i).is_some_and(|d| d.name == def.name))
+    }
+
     /// Is the FAMILY that claims a pipe on (vid, pid) already covered by a loaded def? Family-scoped,
     /// not pid-scoped: `defs_for_pid(vid, pid).any(|def| def.dialect == dialect_id)`. This fixes the
     /// review-blocking adoption SUPPRESSION — the old `find_by_pid(...).is_some()` already-known gate
@@ -708,6 +816,51 @@ mod tests {
 
     /// Parse just the two embedded builtins (no `devices/` dir, no I/O) so capability tests are
     /// hermetic and deterministic regardless of the working directory.
+    fn control_pipe(pid: u16, path: &str) -> crate::transport::HidDeviceInfo {
+        crate::transport::HidDeviceInfo {
+            vid: 0x1532,
+            pid,
+            usage_page: 1,
+            usage: 2,
+            feature_len: 91,
+            input_len: 0,
+            output_len: 0,
+            path: crate::transport::DevicePath::from_str_for_tests(path),
+            product: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_mouse_on_its_cable_is_reached_through_the_cable_not_its_idle_dongle() {
+        let (naga, bw) = builtins();
+        let reg = Registry { devices: vec![naga, bw] };
+        // Enumeration order observed live 2026-09-29: keyboard, dongle (dead link), cable.
+        let mut infos = vec![
+            control_pipe(0x0221, r"\\?\hid#vid_1532&pid_0221#kbd"),
+            control_pipe(0x00A8, r"\\?\hid#vid_1532&pid_00a8#dongle"),
+            control_pipe(0x00A7, r"\\?\hid#vid_1532&pid_00a7#cable"),
+        ];
+        assert_eq!(reg.preferred_link_for(&infos[1], &infos).map(|i| i.pid), Some(0x00A7));
+        assert!(reg.preferred_link_for(&infos[2], &infos).is_none(), "the cable is already best");
+        assert!(reg.preferred_link_for(&infos[0], &infos).is_none(), "single-link devices untouched");
+        reg.prefer_live_links(&mut infos);
+        let order: Vec<u16> = infos.iter().map(|i| i.pid).collect();
+        assert_eq!(order, [0x0221, 0x00A7, 0x00A8], "other devices keep their slots");
+    }
+
+    #[test]
+    fn two_identical_mice_are_never_paired_by_guesswork() {
+        let (naga, _) = builtins();
+        let reg = Registry { devices: vec![naga] };
+        let infos = vec![
+            control_pipe(0x00A8, r"\\?\hid#vid_1532&pid_00a8#dongle-a"),
+            control_pipe(0x00A8, r"\\?\hid#vid_1532&pid_00a8#dongle-b"),
+            control_pipe(0x00A7, r"\\?\hid#vid_1532&pid_00a7#cable"),
+        ];
+        assert!(reg.preferred_link_for(&infos[0], &infos).is_none());
+        assert!(reg.preferred_link_for(&infos[1], &infos).is_none());
+    }
+
     fn builtins() -> (DeviceDef, DeviceDef) {
         let naga: DeviceDef =
             toml::from_str(include_str!("../devices/razer-naga-v2-pro.toml")).unwrap();

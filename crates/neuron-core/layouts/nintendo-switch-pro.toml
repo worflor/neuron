@@ -1,0 +1,137 @@
+# SPDX-FileCopyrightText: 2026 Woflo Labs
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
+# Nintendo Switch Pro Controller, full input report 0x30 (the mode Steam and SDL put it in).
+# Its HID descriptor declares report 0x30 as 16-bit axes; the stream is Nintendo's packed layout,
+# so the descriptor can't be used for it. Layout per SDL src/joystick/hidapi/SDL_hidapi_switch.c
+# (zlib) at 11b6a629, checked against live reports on 2026-09-30 (resting sticks unpacked to
+# X 2094 / Y 2039 and X 1977 / Y 1983 of 0..4095).
+#
+# Buttons map by POSITION onto the standard pad: Nintendo's A is on the east face, B south.
+
+name = "Nintendo Switch Pro Controller"
+vendor_id = 0x057E
+product_ids = [0x2009]
+report_id = 0x30
+
+[[buttons]]
+byte = 3
+mask = 0x01
+pad = "west"            # Y
+[[buttons]]
+byte = 3
+mask = 0x02
+pad = "north"           # X
+[[buttons]]
+byte = 3
+mask = 0x04
+pad = "south"           # B
+[[buttons]]
+byte = 3
+mask = 0x08
+pad = "east"            # A
+[[buttons]]
+byte = 3
+mask = 0x40
+pad = "right_shoulder"  # R
+[[buttons]]
+byte = 3
+mask = 0x80
+pad = "right_trigger"   # ZR (digital)
+[[buttons]]
+byte = 4
+mask = 0x01
+pad = "back"            # minus
+[[buttons]]
+byte = 4
+mask = 0x02
+pad = "start"           # plus
+[[buttons]]
+byte = 4
+mask = 0x04
+pad = "right_stick"
+[[buttons]]
+byte = 4
+mask = 0x08
+pad = "left_stick"
+[[buttons]]
+byte = 4
+mask = 0x10
+pad = "home"
+[[buttons]]
+byte = 4
+mask = 0x20
+pad = "capture"
+[[buttons]]
+byte = 5
+mask = 0x01
+pad = "dpad_down"
+[[buttons]]
+byte = 5
+mask = 0x02
+pad = "dpad_up"
+[[buttons]]
+byte = 5
+mask = 0x04
+pad = "dpad_right"
+[[buttons]]
+byte = 5
+mask = 0x08
+pad = "dpad_left"
+[[buttons]]
+byte = 5
+mask = 0x40
+pad = "left_shoulder"   # L
+[[buttons]]
+byte = 5
+mask = 0x80
+pad = "left_trigger"    # ZL (digital)
+
+# Sticks: 12-bit little-endian bit fields, bytes 6-8 (left) and 9-11 (right). Raw Y grows upward,
+# the standard pad's grows downward, hence `invert`.
+[[axes]]
+pad = "left_x"
+bit = 48
+bits = 12
+max = 4095
+[[axes]]
+pad = "left_y"
+bit = 60
+bits = 12
+max = 4095
+invert = true
+[[axes]]
+pad = "right_x"
+bit = 72
+bits = 12
+max = 4095
+[[axes]]
+pad = "right_y"
+bit = 84
+bits = 12
+max = 4095
+invert = true
+
+# USB start-up, for a pad no other app is driving (SDL_hidapi_switch.c at 11b6a629). Through
+# neuron on 2026-09-30 every step was answered, but the stream it should start was not seen, so it
+# stays gated (NEURON_PAD_INIT): handshake (the one step that must answer: silence means Bluetooth),
+# 3 Mbit baud, handshake again, force USB (no Bluetooth timeout), full report mode (output report
+# 0x01: packet counter, neutral rumble, subcommand 0x03 = 0x30), then force USB again, which is
+# what starts the stream.
+[[init]]
+out = [0x80, 0x02]
+reply = [0x81, 0x02]
+[[init]]
+out = [0x80, 0x03]
+wait_ms = 100
+[[init]]
+out = [0x80, 0x02]
+wait_ms = 100
+[[init]]
+out = [0x80, 0x04]
+[[init]]
+out = [0x01, 0x00, 0x00, 0x01, 0x40, 0x40, 0x00, 0x01, 0x40, 0x40, 0x03, 0x30]
+wait_ms = 50
+[[init]]
+out = [0x80, 0x04]

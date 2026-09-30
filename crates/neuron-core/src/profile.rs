@@ -141,6 +141,13 @@ const WINDOWS_DEVICE_NAMES: &[&str] = &[
     "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
 ];
 
+/// Is `stem` a name Windows reserves for a device (`CON`, `COM1`, …), which no file can have,
+/// with or without an extension?
+#[must_use]
+pub fn is_windows_device_name(stem: &str) -> bool {
+    WINDOWS_DEVICE_NAMES.contains(&stem.to_ascii_lowercase().as_str())
+}
+
 /// Why this name can't be a profile, in words a status line can show — or `None` if it's fine.
 ///
 /// One check for every naming entry point (GUI capture, GUI rename, CLI save, CLI rename, import
@@ -162,7 +169,7 @@ pub fn name_conflict(name: &str) -> Option<String> {
             "'{GUI_RULES_STEM}' is the name of the binds you author in the app · pick another"
         ));
     }
-    if WINDOWS_DEVICE_NAMES.contains(&stem.as_str()) {
+    if is_windows_device_name(&stem) {
         return Some(format!("windows won't let a file be called '{trimmed}'"));
     }
     // the sanitized stem becomes a filename; leave room for the ".rules.toml" sidecar suffix too.
@@ -777,6 +784,10 @@ fn lit_devices(reg: &Registry) -> Vec<(DeviceDef, u16, transport::DevicePath)> {
     let mut seen = std::collections::BTreeSet::new();
     if let Ok(infos) = transport::enumerate() {
         for i in &infos {
+            // A dongle whose mouse is on its cable is a dead link: paint the cable instead.
+            if reg.preferred_link_for(i, &infos).is_some() {
+                continue;
+            }
             // find_for_pipe: the def that DRIVES this pipe (its family's control-pipe rule), so a
             // two-family pid resolves each pipe to the family that can actually paint it.
             if let Some(def) = reg.find_for_pipe(i) {
@@ -820,12 +831,14 @@ fn open_selected_device(reg: &Registry, pid: u16, unit: &str, dialect: &str) -> 
     };
     if !unit.is_empty() {
         if let Some(i) = infos.iter().find(|i| matches(i) && i.instance() == unit) {
+            let i = reg.preferred_link_for(i, &infos).unwrap_or(i);
             let def = reg.find_for_pipe(i)?.clone();
             return Device::open_path(def, i.pid, &i.path).ok();
         }
         // named unit not enumerated — heal to pid-level below.
     }
     let i = infos.iter().find(|i| matches(i))?;
+    let i = reg.preferred_link_for(i, &infos).unwrap_or(i);
     let def = reg.find_for_pipe(i)?.clone();
     Device::open_path(def, i.pid, &i.path).ok()
 }

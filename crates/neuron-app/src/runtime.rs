@@ -1160,7 +1160,7 @@ impl AppRuntime {
                                 })
                                 .map_err(|e| format!("animate: {e}"));
                             // CUSTODY RELEASE (the DPI-16000 trap): streaming lighting holds this board
-                            // in driver mode (every write flips it via ensure_driver), which defers its
+                            // in driver mode (every write flips it via ensure_custody), which defers its
                             // onboard buttons/FN to software AND orphans the wake-reassert duty. Driver
                             // mode is a LEASE for the stream's duration, not a permanent state — now that
                             // THIS board's (only) stream is ending and no host writer holds the device,
@@ -1400,14 +1400,13 @@ impl AppRuntime {
     }
 
     pub fn delete_profile(&mut self, name: &str) -> String {
-        // A profile is BOTH files: `<name>.toml` and the `<name>.rules.toml` binds paired with it.
-        // Deleting only the first left the binds live forever (every sidecar folds into the spine)
-        // with no UI able to remove them, and the orphan reserved the filename so re-importing the
-        // same profile landed at " (2)". `Profile::delete` owns both.
-        let r = Profile::delete(name);
+        // The files, the binds sidecar and a fallback that named it are core's
+        // (`manage::delete_profile`); what's left here is the app's own view of the cursor.
+        let r = neuron::manage::delete_profile(name);
         self.reload_profiles();
+        self.app_rules = AppRules::load();
         match r {
-            Ok(()) => {
+            Ok(report) => {
                 // a deleted profile can't stay "active" — the header pill must drop to none.
                 // Compare against the PROCESS-WIDE cursor too, not just our display copy: an
                 // async apply updates the cell on its worker before this copy catches up, and
@@ -1422,34 +1421,11 @@ impl AppRuntime {
                     self.gaming_mode = neuron::writes::GamingMode::default();
                     crate::dispatch::set_gaming_policy(self.gaming_mode);
                 }
-                // The FALLBACK is different from a rule: a rule that goes dangling still shows in
-                // the list where you can see and remove it, but a dangling fallback would fire on
-                // every unmatched focus change and fail, while the picker (which resolves by name)
-                // quietly displayed "stay put". Clear it rather than keep a hidden broken setting.
-                // Same rule as everywhere else here: a write that didn't happen is not a success.
-                // A dangling fallback left on disk resumes switching to a deleted profile.
-                let cleared_fallback = if self.app_rules.default.as_deref() == Some(name) {
-                    self.app_rules.default = None;
-                    match self.save_app_rules() {
-                        Ok(()) => Some(String::new()),
-                        // memory back in step with disk: the fallback is still there, still
-                        // pointing at the profile just deleted, and the panel must say so rather
-                        // than show a clean state the next launch will contradict.
-                        Err(e) => {
-                            self.app_rules = AppRules::load();
-                            Some(format!(" (but apps.toml did not save: {e})"))
-                        }
-                    }
-                } else {
-                    None
-                };
+                let cleared_fallback = report.was_fallback.then(|| {
+                    report.fallback_save_error.as_ref().map_or_else(String::new, |e| format!(" (but apps.toml did not save: {e})"))
+                });
                 // dangling app rules would fail forever at focus-switch time; say so now.
-                let refs = self
-                    .app_rules
-                    .rules
-                    .iter()
-                    .filter(|r| r.profile == name)
-                    .count();
+                let refs = report.dangling_routes.len();
                 let mut msg = format!("deleted '{name}'");
                 if refs > 0 {
                     use std::fmt::Write as _;
@@ -1481,49 +1457,22 @@ impl AppRuntime {
         // display copy would never be updated (and a stale copy would never be healed).
         let was_active = Profile::file_key(&self.active_profile) == Profile::file_key(from)
             || Profile::file_key(&neuron::profile::active()) == Profile::file_key(from);
-        match Profile::rename(from, to) {
-            Ok(landed) => {
-                // Synced FIRST, before anything that can fail, so the early-return path below can't
-                // leave the header naming a profile that no longer exists under that name. (Core
-                // already moved the process cursor; this is the app's copy of it.)
+        // The files, the binds sidecar and every route or fallback that named it are core's
+        // (`manage::rename_profile`, which rolls the rename back if the routes can't follow).
+        let r = neuron::manage::rename_profile(from, to);
+        self.app_rules = AppRules::load();
+        self.reload_profiles();
+        match r {
+            Ok(report) => {
                 if was_active {
-                    self.active_profile.clone_from(&landed);
-                    neuron::profile::set_active(&landed);
+                    self.active_profile.clone_from(&report.landed);
+                    neuron::profile::set_active(&report.landed);
                 }
-                let mut retargeted = 0;
-                for r in self.app_rules.rules.iter_mut().filter(|r| r.profile == from) {
-                    r.profile.clone_from(&landed);
-                    retargeted += 1;
-                }
-                if self.app_rules.default.as_deref() == Some(from) {
-                    self.app_rules.default = Some(landed.clone());
-                    retargeted += 1;
-                }
-                // ONE write for both edits, and its failure is REPORTED. Discarding it reported a
-                // clean rename while apps.toml on disk still named the old profile — correct-looking
-                // until the next launch, when auto-switch silently stopped working. Nothing here can
-                // roll the rename back safely, so the honest outcome is to say what didn't persist.
-                if retargeted > 0 {
-                    if let Err(e) = self.save_app_rules() {
-                        // Put the in-memory rules BACK. The panel refreshes from this copy, so
-                        // leaving the retarget applied would show routes pointing at the new name
-                        // while the disk — and therefore the live dispatcher — still held the old:
-                        // the UI quietly disagreeing with what actually routes.
-                        self.app_rules = AppRules::load();
-                        self.reload_profiles();
-                        crate::dispatch::request_reload();
-                        return format!(
-                            "renamed '{from}' to '{landed}', but apps.toml did not save ({e}) \
-                             · its auto-switch routes still name '{from}' and now dangle"
-                        );
-                    }
-                }
-                self.reload_profiles();
                 // the binds sidecar moved with it, so the live spine must re-read from the new stem.
                 crate::dispatch::request_reload();
-                match retargeted {
-                    0 => format!("renamed '{from}' to '{landed}'"),
-                    n => format!("renamed '{from}' to '{landed}' · {n} app rule(s) followed"),
+                match report.routes_followed {
+                    0 => format!("renamed '{from}' to '{}'", report.landed),
+                    n => format!("renamed '{from}' to '{}' · {n} app rule(s) followed", report.landed),
                 }
             }
             Err(e) => format!("rename failed: {e}"),
@@ -1921,6 +1870,7 @@ fn publish_source_vitals(forced: bool) {
 /// A flat rule row for the view (kept here so the glue maps it 1:1 to the Slint struct).
 pub struct RuleView {
     pub trigger: String,
+    pub source: Trigger,
     pub action: String,
     pub layer: String,
     pub kind: &'static str,
@@ -1929,6 +1879,7 @@ pub struct RuleView {
 fn rule_view(r: &Rule) -> RuleView {
     RuleView {
         trigger: r.trigger.describe(),
+        source: r.trigger.clone(),
         action: r.action.describe(),
         layer: r.layer.clone().unwrap_or_else(|| "base".into()),
         kind: trigger_kind(&r.trigger),
@@ -2061,6 +2012,12 @@ fn resolve_plane<'a>(
             if !(dialect.is_empty() || def.dialect == dialect) {
                 continue;
             }
+            // A selection made on the dongle follows the mouse onto its cable (and back).
+            if let Some(better) = reg.preferred_link_for(i, infos) {
+                if let Some(better_def) = reg.find_for_pipe(better) {
+                    return Some((better_def, better));
+                }
+            }
             return Some((def, i));
         }
     }
@@ -2191,6 +2148,10 @@ fn scan_units(registry: &Registry, infos: &[transport::HidDeviceInfo]) -> Vec<De
         // grow a row: nothing here is operable, and the device's user-facing face is its
         // Core-Audio endpoint row. A second knob-less HID row would double-list the hardware.
         if !def.is_operable() {
+            continue;
+        }
+        // One row per physical device: a dongle whose mouse is on its cable is not a second device.
+        if registry.preferred_link_for(i, infos).is_some() {
             continue;
         }
         let instance = i.instance();
@@ -2676,6 +2637,7 @@ mod tests {
             app: "game".into(),
             profile: name.clone(),
         });
+        rt.save_app_rules().unwrap();
         let msg = rt.delete_profile(&name);
         assert!(msg.contains("deleted"), "unexpected: {msg}");
         assert!(

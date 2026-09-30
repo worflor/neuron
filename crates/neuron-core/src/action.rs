@@ -93,9 +93,8 @@ pub enum Action {
     /// **Daemon intent** — set the mouse DPI to an absolute value. Daemon-handled like
     /// [`Action::DpiCycle`] (no device handle at the `Action` layer).
     DpiSet { dpi: u16 },
-    /// **Daemon intent** — request a `HyperScroll` scroll-wheel stage cycle. The confirmed device
-    /// command is currently set-only (`writes::set_scroll_stage`); there is no active-stage getter,
-    /// so resident runtimes must keep an explicit cursor before this can be a true cycle.
+    /// **Daemon intent** — cycle the `HyperScroll` scroll-wheel stage from the device's current
+    /// stage over its enabled count (`writes::cycle_device_scroll_stage`).
     ScrollStageCycle { dir: Direction },
     /// **Daemon intent** — switch to a named Neuron profile. Daemon-handled: the run-daemon loads
     /// the [`crate::profile::Profile`] and applies it. `run()` reports the intent.
@@ -626,10 +625,6 @@ impl Direction {
 /// profiles forever instead of advancing next/previous from wherever the user is. The direction is
 /// a *delta on the current cursor*, not an absolute slot. (`DpiSet`/`ProfileSwitch` are absolute and
 /// carry their full target, so they need no current read.)
-///
-/// [`ScrollStageCycle`](Intent::ScrollStageCycle) is intentionally still an intent, but it is not
-/// fully applied by the resident runtimes yet: the confirmed `HyperScroll` command is set-only and
-/// the device exposes no active-stage getter, so a correct cycle needs a resident cursor/list first.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Intent {
     /// Cycle the DPI stage list up/down, **from the current DPI** (see the cycle contract on
@@ -637,8 +632,8 @@ pub enum Intent {
     DpiCycle(Direction),
     /// Set DPI to an absolute value (no current read needed — the value is carried).
     DpiSet(u16),
-    /// Request `HyperScroll` stage cycling. The confirmed write is set-only today, so live runtimes
-    /// report this as pending until they own a trustworthy active-stage cursor/list.
+    /// Cycle the `HyperScroll` stage **from the device's current stage** (read at `0x15/0x80`),
+    /// wrapping over its enabled count (`0x15/0x81`).
     ScrollStageCycle(Direction),
     /// Switch to the named profile (absolute — the target name is carried).
     ProfileSwitch(String),

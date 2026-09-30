@@ -50,7 +50,7 @@ thread_local! {
 }
 
 /// A captured HID control: the semantic `(page, usage, pid)` of the device control the user pressed.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct CapturedControl {
     pub page: u16,
     pub usage: u16,
@@ -73,6 +73,7 @@ pub static CAPTURE_ACTIVE: AtomicBool = AtomicBool::new(false);
 fn end_capture_without_window() {
     CAPTURE_ACTIVE.store(false, Ordering::Relaxed);
     neuron::intercept::set_paused(false);
+    crate::buttonfw::capture_ended();
     RECORDING.store(false, Ordering::Relaxed);
     // the stop flag belongs to the worker that just finished — drop it with everything else so no
     // stale cell survives into the next capture.
@@ -87,6 +88,7 @@ fn end_capture_without_window() {
 pub fn cancel() {
     CAPTURE_ACTIVE.store(false, Ordering::Relaxed);
     neuron::intercept::set_paused(false);
+    crate::buttonfw::capture_ended();
     CANCEL.with(|c| {
         if let Some(flag) = c.borrow().as_ref() {
             flag.store(true, Ordering::Relaxed);
@@ -204,8 +206,9 @@ pub fn begin_control(
     st.set_capture_active(true);
     CAPTURE_ACTIVE.store(true, Ordering::Relaxed);
     neuron::intercept::set_paused(true);
+    crate::buttonfw::capture_started();
     st.set_capture_prompt(
-        "press the device control (knob / mute / media / macro key / mic-tap) — ESC to cancel".into(),
+        "press the control: a key, a mouse or pad button, a stick direction, a knob — ESC to cancel".into(),
     );
 
     // Same "done clears the latch on every path" contract as `begin` above.
@@ -235,6 +238,7 @@ fn finish_ctl(gen: u64, pkt: Option<(u16, u16, Option<neuron::registry::Canonica
     st.set_capture_active(false);
     CAPTURE_ACTIVE.store(false, Ordering::Relaxed);
     neuron::intercept::set_paused(false);
+    crate::buttonfw::capture_ended();
     st.set_capture_prompt("".into());
     let captured = pkt.map(|(page, usage, pid)| CapturedControl { page, usage, pid });
     let handler = CTL_HANDLER.with(|h| h.borrow_mut().take());
@@ -254,15 +258,22 @@ const TWIN_SETTLE: std::time::Duration = std::time::Duration::from_millis(80);
 #[derive(Default)]
 struct ControlCaptureState {
     macro_candidate: Option<(CapturedControl, std::time::Instant)>,
+    /// Each device's last snapshot, so the capture takes the control just pressed, not one that
+    /// was already held.
+    seen: std::collections::HashMap<Option<neuron::registry::CanonicalPid>, Vec<(u16, u16)>>,
 }
 
 #[cfg(windows)]
 impl ControlCaptureState {
     fn observe(&mut self, ev: &neuron::controls::ControlEvent) -> Option<CapturedControl> {
-        let &(page, usage) = ev.hits.first()?;
-        // Left mouse operates the capture dialog itself. Side buttons (2-5), keyboard, consumer,
-        // telephony and macro controls remain bindable.
-        if (page, usage) == (0x09, 1) {
+        let before = self.seen.insert(ev.pid, ev.hits.clone()).unwrap_or_default();
+        let fresh: Vec<(u16, u16)> = ev.hits.iter().filter(|h| !before.contains(h)).copied().collect();
+        // A button pressed while a stick sits past its threshold is the button the user means.
+        let analog = |p: u16| matches!(p, neuron::analog::AXIS_POS_PAGE | neuron::analog::AXIS_NEG_PAGE | neuron::analog::HAT_PAGE);
+        let &(page, usage) = fresh.iter().find(|h| !analog(h.0)).or_else(|| fresh.first())?;
+        // Left mouse operates the capture dialog itself. Only the pointer's: a pad's Button 1 stays
+        // bindable, as do side buttons (2-5), keyboard, consumer, telephony and macro controls.
+        if (page, usage) == (0x09, 1) && ev.stream == neuron::controls::Stream::Pointer {
             return None;
         }
         // Every source — resident observer, injected deferred-button report, standalone fallback —
@@ -599,7 +610,7 @@ mod tests {
             state
                 .observe(&neuron::controls::ControlEvent {
                     pid: Some(neuron::registry::CanonicalPid::of(0x00a7)),
-                    stream: neuron::controls::Stream::RawInput,
+                    stream: neuron::controls::Stream::Pointer,
                     hits: vec![(0x09, 1)],
                     raw: Vec::new(),
                 })
@@ -615,6 +626,58 @@ mod tests {
             })
             .expect("a side button is a bindable control");
         assert_eq!((control.page, control.usage, control.pid), (0x09, 4, Some(neuron::registry::CanonicalPid::of(0x00A7))));
+    }
+
+    #[cfg(windows)]
+    proptest::proptest! {
+        /// Any interleaving of devices and snapshots: what capture takes was just pressed on the
+        /// device that reported it, and is never the pointer's left button.
+        #[test]
+        fn capture_only_takes_a_fresh_press_and_never_the_pointers_left_button(
+            events in proptest::collection::vec(
+                (0u16..3, 0usize..5, proptest::collection::vec((0u16..3, 0u16..4), 0..4)),
+                1..40,
+            ),
+        ) {
+            use neuron::controls::Stream;
+            let streams = [Stream::Pointer, Stream::Keyboard, Stream::Pad, Stream::Collection(7), Stream::Deferred];
+            let pages = [0x09u16, 0x07, neuron::analog::AXIS_POS_PAGE];
+            let mut state = ControlCaptureState::default();
+            let mut last: std::collections::HashMap<Option<neuron::registry::CanonicalPid>, Vec<(u16, u16)>> = Default::default();
+            for (dev, stream, hits) in events {
+                let pid = Some(neuron::registry::CanonicalPid::of(0x100 + dev));
+                let hits: Vec<(u16, u16)> = hits.into_iter().map(|(p, u)| (pages[usize::from(p)], u + 1)).collect();
+                let ev = neuron::controls::ControlEvent { pid, stream: streams[stream], hits: hits.clone(), raw: Vec::new() };
+                let before = last.insert(pid, hits.clone()).unwrap_or_default();
+                if let Some(c) = state.observe(&ev) {
+                    proptest::prop_assert!(!(c.page == 0x09 && c.usage == 1 && streams[stream] == Stream::Pointer));
+                    if c.page != neuron::controls::RAZER_MACRO_PAGE {
+                        proptest::prop_assert!(hits.contains(&(c.page, c.usage)) && !before.contains(&(c.page, c.usage)), "{c:?} from {hits:?} after {before:?}");
+                        proptest::prop_assert_eq!(c.pid, pid);
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resident_capture_takes_the_fresh_button_over_a_held_stick_and_a_pads_button_one() {
+        let pad = Some(neuron::registry::CanonicalPid::of(0x543a));
+        let mut state = ControlCaptureState::default();
+        let ev = |hits: Vec<(u16, u16)>| neuron::controls::ControlEvent {
+            pid: pad,
+            stream: neuron::controls::Stream::RawInput,
+            hits,
+            raw: vec![0x01, 0x02],
+        };
+        let stick = (neuron::analog::AXIS_POS_PAGE, 0x0130);
+        let c = state.observe(&ev(vec![(0x09, 1), stick])).expect("a pad's Button 1 is bindable");
+        assert_eq!((c.page, c.usage), (0x09, 1), "the button, not the stick already past its threshold");
+        let mut state = ControlCaptureState::default();
+        state.observe(&ev(vec![stick]));
+        let c = state.observe(&ev(vec![(0x09, 3), stick])).expect("a fresh press");
+        assert_eq!((c.page, c.usage), (0x09, 3), "the held stick isn't what was just pressed");
     }
 
     #[cfg(windows)]
@@ -659,6 +722,7 @@ mod tests {
                 },
                 neuron::timing::ago(TWIN_SETTLE),
             )),
+            seen: Default::default(),
         };
         let control = state.settled().expect("expired candidate commits");
         assert_eq!(

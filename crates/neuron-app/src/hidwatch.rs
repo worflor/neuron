@@ -73,8 +73,6 @@ const BATCH_SETTLE: Duration = Duration::from_millis(220);
 /// it silently. Kept well under the ~250ms+ a genuine two-button sequence takes, so it can NEVER
 /// false-trigger on real actions; a lone change (one kind) always cards.
 const BURST_SPAN: Duration = Duration::from_millis(150);
-/// Scroll-stage track length — the canonical source is `intent::SCROLL_STAGE_COUNT` (no magic dupe).
-const SCROLL_STAGE_MAX: u32 = neuron::intent::SCROLL_STAGE_COUNT as u32;
 /// How often the hotplug monitor re-enumerates to catch a dongle replug / hub glitch / sleep-wake.
 const HOTPLUG_POLL: Duration = Duration::from_secs(20);
 
@@ -484,6 +482,14 @@ fn arm_new(
     if verbose() && spawned > 0 {
         eprintln!("[hidwatch] armed {spawned} collection(s)");
     }
+    // A (re)connected device came up with its factory button functions: bring the binds back.
+    if spawned > 0 {
+        crate::buttonfw::reapply();
+    }
+    // A pad that needs a start-up sequence to stream (gated; see `layout::wake_silent_pads`).
+    if neuron::layout::pad_init_enabled() {
+        crate::worker::spawn_detached("neuron-pad-wake", neuron::layout::wake_silent_pads);
+    }
     Some(audio_seeds)
 }
 
@@ -623,6 +629,10 @@ fn spawn_reader(
                         if verbose() {
                             eprintln!("[hidwatch] {tag}: closed");
                         }
+                        // Its volatile button functions are gone with it; re-apply covers a link
+                        // (cable or dongle) that is still connected.
+                        neuron::buttons::forget(pid);
+                        crate::buttonfw::reapply();
                         return;
                     }
                 }
@@ -933,10 +943,11 @@ fn decode(
                 }
             }
         }
-        // Scroll / sensitivity stage changed: stage index in byte[2], bounded by the real stage count.
+        // Scroll / sensitivity stage changed: 1-based stage in byte[2]. The enabled count is read
+        // from the device when the batch flushes (off this reader thread).
         0x3a => {
             let stage = u32::from(buf[2]);
-            if (1..=SCROLL_STAGE_MAX).contains(&stage) {
+            if stage >= 1 {
                 let unit = neuron::transport::path_instance(&path.as_os_str().to_string_lossy());
                 batch_push_unit(pid, &unit, Push::Scroll(stage));
             }
@@ -979,6 +990,7 @@ fn decode(
                 if reassert {
                     maybe_reassert(pid, &unit);
                 }
+                crate::buttonfw::reapply();
             });
         }
         // SIDE PLATE attached/detached: the swappable plate's hardware strap-code rides in byte[2].
@@ -1117,13 +1129,18 @@ fn button_worker() -> Option<std::sync::mpsc::Sender<(u16, neuron::action::Inten
 /// and goes, so a cached mode would either drop presses (stale "normal") or double-apply (stale
 /// "driver"); the getter round-trip is cheap next to the write it guards. Past the gate, the request
 /// rides the SAME shared cycle policy the CLI/GUI dispatch use (`run_shared_intent`: stage lookup,
-/// volatile writes, resident scroll cursor, confirmation cards) so there is one implementation.
+/// read-back-verified volatile writes, confirmation cards) so there is one implementation.
+///
+/// Every exit leaves a flight breadcrumb: a press that does nothing is otherwise invisible.
 fn fulfill_button(pid: u16, intent: neuron::action::Intent) {
     let Some(d) = open_device(pid) else {
+        crate::flight::trace("button", "deferred press dropped: device did not open", u64::from(pid));
         return;
     };
-    if neuron::writes::device_mode(&d) != Some(0x03) {
+    let mode = neuron::writes::device_mode(&d);
+    if !neuron::writes::mode_is_driver(mode) {
         // normal mode (firmware owns the button) or an unanswered getter (asleep link) — not ours.
+        crate::flight::trace("button", "deferred press declined: not driver mode", u64::from(mode.unwrap_or(0xFF)));
         if verbose() {
             eprintln!("[hidwatch] pid={pid:04x}: 04-family button ignored (not in driver mode)");
         }
@@ -1141,7 +1158,13 @@ fn fulfill_button(pid: u16, intent: neuron::action::Intent) {
         &intent,
         neuron::dpi_origin::Cause::UserCycled,
     ) {
-        if verbose() {
+        let failed = msg.contains("skipped") || msg.contains("failed");
+        crate::flight::trace(
+            "button",
+            if failed { "deferred press failed" } else { "deferred press fulfilled" },
+            u64::from(pid),
+        );
+        if failed || verbose() {
             eprintln!("[hidwatch] pid={pid:04x}: 04-family button -> {msg}");
         }
     }
@@ -1331,7 +1354,11 @@ fn flush_batch(pid: u16, unit: &str, b: Batch) {
             crate::glue::post_observation(pid, crate::glue::Observed::Dpi(v));
         }
         if let Some((_, v)) = b.scroll {
-            neuron::confirm::observe_scroll(pid, v, SCROLL_STAGE_MAX);
+            // An unreadable count (asleep link) still cards the stage, on a track that ends at it.
+            let count = scroll_stage_count(pid).unwrap_or(v);
+            if v <= count {
+                neuron::confirm::observe_scroll(pid, v, count);
+            }
         }
         if let Some((_, id, label)) = b.plate {
             neuron::confirm::observe_side_plate(pid, u32::from(id), &label);
@@ -1339,6 +1366,16 @@ fn flush_batch(pid: u16, unit: &str, b: Batch) {
             latch_plate_layer(id, &label);
         }
     }
+}
+
+/// The device's enabled scroll-stage count (`0x15/0x81`), or `None` when it has no such getter or
+/// does not answer.
+fn scroll_stage_count(pid: u16) -> Option<u32> {
+    let d = open_device(pid)?;
+    if !d.def.supports(neuron::registry::Capability::SetScrollStage) {
+        return None;
+    }
+    neuron::writes::scroll_stage_count(&d, neuron::capability::Store::Volatile).ok().map(u32::from)
 }
 
 /// Make the seated plate the engine's latched context, so a plate-scoped bind is live exactly
@@ -1608,15 +1645,14 @@ fn maybe_reconcile_announced(pid: u16, unit: &str, announced: u16) {
     // nothing distinguishes it from a stale restore at this point. Healing it would fight them.
     //
     // An UNREADABLE mode is treated as "not ours" for the same reason, and it is not hypothetical:
-    // the Naga V2 Pro dongle does not support the `00/84` getter at all (probed 2026-09-16), so on
-    // that device this path never heals — and neither does [`fulfill_button`], which declines on the
-    // same `Some(0x03)` test, so its DPI button is firmware-owned end to end.
+    // the Naga V2 Pro over its dongle answers `00/84` while awake (0x03, 2026-09-29) but not while
+    // the link sleeps, so a press that races the wake declines here and in [`fulfill_button`].
     //
     // Declining here does not leave such a device unprotected: the `05 0c` power poke and
     // `startup_reassert` still reconcile it, and both are WAKE-triggered rather than button-
     // triggered, so neither can be provoked by a press.
     let mode = neuron::writes::device_mode(&d);
-    if mode != Some(0x03) {
+    if !neuron::writes::mode_is_driver(mode) {
         reassert_release(pid, unit);
         adopt_unattributable(pid, unit, announced);
         crate::flight::trace(
@@ -2205,7 +2241,7 @@ mod tests {
                         reassert_due(pid, &format!("hotplug-unit-{t}"));
                         match i % 3 {
                             0 => batch_push(pid, Push::Dpi(800 + (i as u32 % 100))),
-                            1 => batch_push(pid, Push::Scroll(1 + (i as u32 % SCROLL_STAGE_MAX))),
+                            1 => batch_push(pid, Push::Scroll(1 + (i as u32 % 3))),
                             _ => batch_push(pid, Push::Plate((i % 5) as u8, format!("plate-{i}"))),
                         }
                     }

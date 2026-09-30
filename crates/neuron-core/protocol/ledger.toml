@@ -1,0 +1,2842 @@
+# SPDX-FileCopyrightText: 2026 Woflo Labs
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Additional permission: Neuron-Woflo exception; see repository-root LICENSE.md.
+
+# PROTOCOL LEDGER — the evidence behind every wire fact neuron speaks.
+#
+# One [[fact]] per opcode, push report, framing rule, transaction-id assignment, mode or value
+# table. `tests/protocol_ledger.rs` enforces it: every opcode in a builtin device def or sent by
+# neuron-core needs a fact; a grade must be backed by the evidence it claims; a write graded below
+# `capture` needs a `gate` (a NEURON_*_WRITE env var or cargo feature) or a declared `ungated_debt`.
+#
+# Grades, strongest first:
+#   live     observed by neuron on real hardware (evidence kind "live", dated)
+#   capture  seen on the wire in a capture of Razer's own software (evidence kind "capture")
+#   agreed   two or more INDEPENDENT sources say so (a source's `derived_from` chain collapses copies)
+#   single   one source says so
+#   derived  structural reconstruction or guess
+#
+# Upstream sources are cited as facts only: `at` is `path#Lnn` in the pinned `sha`, or a URL.
+# No upstream code is copied here.
+#
+# Fact fields:
+#   key       "<dialect>/<class>/<id>" (hex, lowercase) for get/set, optionally "#variant";
+#             "<dialect>/<topic>/<name>" otherwise (e.g. "razer/push/05-3a", "razer/frame/crc")
+#   dialect   "razer" | "razer-audio" | "hidpp"
+#   kind      get | set | push | frame | tx | mode | enum
+#   class, id opcode bytes (get/set only)
+#   layout    byte layout, e.g. "[varstore] -> [varstore, stage]"
+#   meaning   what it does
+#   devices   pids neuron uses it on, e.g. ["00a8", "0221"]
+#   grade     see above
+#   gate / ungated_debt   (set facts below `capture` only)
+#   evidence  [{ kind = "live"|"capture"|"source", src, at, date, what }]
+#   conflicts where a source disagrees and how (or whether) it was settled
+#   unused    true = known upstream but neuron does not send it (a candidate, exempt from gating)
+#
+# Dating live evidence: `date` is the day of the observation where neuron recorded one. Where the
+# owner's notes give only a month ("2026-06"), `date` is the commit that first recorded the claim
+# (an upper bound) or, failing that, the last day of the month; the `what` text says which.
+# Openrazer path shorthands used below are full repo paths (driver/razercommon.c etc.).
+
+# ------------------------------------------------------------------------------------------------
+# Sources
+# ------------------------------------------------------------------------------------------------
+
+[sources.openrazer]
+url = "https://github.com/openrazer/openrazer"
+license = "GPL-2.0-or-later"
+sha = "6820f9da169d354bc7e6e93a0aa8683a6bb75792"
+note = "Kernel driver (driver/). The common ancestor most other Razer projects copy; per-device tx ids are a table of what worked, never validated on replies."
+
+[sources.openrazer-wiki]
+url = "https://github.com/openrazer/openrazer.wiki.git"
+license = "NOASSERTION"
+sha = "35eb5ed6c4a0cb1fad08f8cdc477ee042c3eae88"
+derived_from = "openrazer"
+note = "Unknown-commands and Using-the-mouse-driver pages. Contributor capture notes; collapsed into openrazer conservatively (same project). The 0x15 rows date from 2023-01-15, before the TimurSl fork."
+
+[sources.openrazer-issues]
+url = "https://github.com/openrazer/openrazer/issues"
+license = "NOASSERTION"
+sha = "6820f9da169d354bc7e6e93a0aa8683a6bb75792"
+derived_from = "openrazer"
+note = "Issue threads read 2026-09-29 (text has no commit); pinned to the driver HEAD read the same day. Cited by URL."
+
+[sources.openrazer-pr2807]
+url = "https://github.com/openrazer/openrazer/pull/2807"
+license = "GPL-2.0-or-later"
+sha = "ccc769e6a5ec38751f4394931cb9ba80360e3143"
+derived_from = "openrazer"
+note = "Closed, superseded. Mouse Dock Pro pairing from the author's own captures."
+
+[sources.openrazer-pr2817]
+url = "https://github.com/openrazer/openrazer/pull/2817"
+license = "GPL-2.0-or-later"
+sha = "d4b66a15679455cf6d694079b71585c7f8281bda"
+derived_from = "openrazer"
+note = "Open. Mouse Dock Pro scan/pair/heartbeat; parts marked TODO by its author."
+
+[sources.openrazer-pr2904]
+url = "https://github.com/openrazer/openrazer/pull/2904"
+license = "GPL-2.0-or-later"
+sha = "7a6d39784cfc22c07205a8e43f5f64cf03399710"
+derived_from = "openrazer"
+note = "Open. Naga V3 Pro support, tested only by its authors."
+
+[sources.openrazer-pr2741]
+url = "https://github.com/openrazer/openrazer/pull/2741"
+license = "GPL-2.0-or-later"
+sha = "f237dc7e9715c512b17dc9ff89ffe2f3694987d6"
+derived_from = "openrazer"
+note = "Closed unmerged. AI-authored HyperScroll guess on class 0x02; contradicted by the pcap-derived fork."
+
+[sources.openrgb]
+url = "https://gitlab.com/CalcProgrammer1/OpenRGB"
+license = "GPL-2.0-or-later"
+sha = "af36b81a7927d94872f647e2056c0fedb9fc52ec"
+derived_from = "openrazer"
+note = "Report struct, CRC, tx bitfield and PID list self-labelled as taken from OpenRazer; its per-device table grew from user reports."
+
+[sources.uchroma]
+url = "https://github.com/hyperb1iss/uchroma"
+license = "LGPL-3.0-or-later"
+sha = "ab05c7fe4a4027157deaa1f143fbe8d0aa677d33"
+derived_from = "openrazer"
+note = "2026 rewrite; lists OpenRazer and its wiki as sources. Its CRC range and some device rows disagree with everyone."
+
+[sources.librazermacos]
+url = "https://github.com/1kc/librazermacos"
+license = "GPL-2.0"
+sha = "556f186b43e88a764571103688c7a9894f6ea471"
+derived_from = "openrazer"
+note = "Direct macOS port of the openrazer drivers."
+
+[sources.razermouse]
+url = "https://github.com/JamesLinYJ/RazerMouse"
+license = "GPL-2.0-or-later"
+sha = "5a8e742f4ea39a1ca8533367d8cd0577f2dbb02a"
+derived_from = "openrazer"
+note = "Mechanical port of openrazer 6820f9d."
+
+[sources.opsrzr]
+url = "https://github.com/atv57/opsrzr"
+license = "GPL-2.0"
+sha = "f4e9eabca19f721cf1bcb6ee8097d0748367cfe7"
+derived_from = "openrazer"
+
+[sources.websynapse]
+url = "https://github.com/CheekyEntity/WebSynapse"
+license = "MIT"
+sha = "40ccd593e68de7694f41ad95865eccd8309d5bbc"
+derived_from = "openrazer"
+note = "Credits OpenRazer; labels 00A7/00A8 backwards."
+
+[sources.timursl]
+url = "https://github.com/TimurSl/openrazer-nagav2pro"
+license = "GPL-2.0"
+sha = "b3b31955d2758e2e8aab3fb4ad706b797c401ecd"
+note = "Fork of openrazer, but its class 0x15 builders come from the author's own Synapse 4 Wireshark captures (github.com/TimurSl/razer-naga-v2-pro-wireshark-scrollprofiles-dumps): independent for class 0x15. Fork HEAD d7d093157f8db48742e99b02add2551e1f71cb05 changes the custom-curve tx."
+
+[sources.razerqdhid]
+url = "https://github.com/geezmolycos/razerqdhid"
+license = "MIT"
+sha = "4363a8836ab970c712fa8f2a9dd530a7e7bc5011"
+note = "Basilisk V3 protocol from the author's own Wireshark captures of Synapse."
+
+[sources.naga-companion]
+url = "https://github.com/Bmwascher/razer-naga-companion"
+license = "MIT"
+sha = "abe5858a1872ef50ad6d6b95428e12580ab6ef3e"
+note = "Naga V2 Pro / V3 Pro tray app with dated hardware probes of its own."
+
+[sources.naga-web-setup]
+url = "https://github.com/demoriaan/razer_naga_v2_pro_web_setup"
+license = "NOASSERTION"
+sha = "30d03e1feff7780277850120ff5003808c4aeb14"
+note = "WebHID Naga V2 Pro button-binding tool validated on the author's hardware. No licence file."
+
+[sources.opensnek]
+url = "https://github.com/gh123man/opensnek"
+license = "Apache-2.0"
+sha = "02de724def6fc25178758bd859b7075594800b79"
+note = "Own USB + BLE captures and contributor-validated Basilisk/Naga Pro devices."
+
+[sources.razerlite]
+url = "https://github.com/zeugmass/RazerLite"
+license = "NOASSERTION"
+sha = "97de9b76a687031e95afd2c33b18f5137e67c914"
+note = "Own measurements on the HyperPolling dongle 00B3. No licence file."
+
+[sources.naga-tray]
+url = "https://github.com/Maelstromeous/razer-naga-tray"
+license = "MIT"
+sha = "e5313cdc78df528d906ee1deee3efaf6e2068ea4"
+note = "Naga V2 Pro hidraw tray app; own observations of pushed reports on the receiver."
+
+[sources.sdl]
+url = "https://github.com/libsdl-org/SDL"
+license = "Zlib"
+sha = "11b6a629dad33193cdbac2c6dac3c99854535388"
+note = "src/joystick/hidapi/SDL_hidapi_switch.c: Switch Pro USB start-up and report layouts."
+
+[sources.linux-hid-nintendo]
+url = "https://github.com/torvalds/linux"
+license = "GPL-2.0-or-later"
+sha = "551c722f40809618230001baccf219193e22fc5a"
+note = "drivers/hid/hid-nintendo.c; facts only."
+
+[sources.neuron]
+url = "https://github.com/worflor/neuron"
+license = "GPL-3.0-or-later"
+sha = "48c17934a6a1313ee6efc1e68175c39f29565a13"
+note = "neuron's own code (cites are to the working tree on top of this commit). Cited only on derived facts, to point at where neuron states its own reconstruction; never used to raise a grade."
+
+# ------------------------------------------------------------------------------------------------
+# razer_report framing, transport, timing
+# ------------------------------------------------------------------------------------------------
+
+[[fact]]
+key = "razer/frame/report"
+dialect = "razer"
+kind = "frame"
+layout = "HID feature report, 91-byte buffer = report id 0x00 + 90-byte razer_report"
+meaning = "The control-pipe unit: every razer command and reply is one 91-byte feature report (REPORT_LEN 90, BUF_LEN 91)."
+devices = ["00a7", "00a8", "0221"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-09-24", what = "BW 0221 00/81 and awake Naga 00a8 00/81, battery and DPI replies passed the full-frame validator (docs/STATUS.md receive-path entry)" },
+  { kind = "source", src = "openrazer", at = "driver/razercommon.h#L124-L136", what = "90-byte razer_report struct" },
+  { kind = "source", src = "openrgb", at = "Controllers/RazerController/RazerController/RazerController.h#L192-L205", what = "91 bytes including the leading report id" },
+  { kind = "source", src = "naga-companion", at = "docs/architecture.md#L101-L103", what = "control collection is the one with max feature report length 91" },
+]
+
+[[fact]]
+key = "razer/frame/header"
+dialect = "razer"
+kind = "frame"
+layout = "buf[0]=0x00 id; [1] status; [2] tx; [3..=4] remaining_packets; [5] protocol_type 0; [6] data_size; [7] class; [8] id; [9..=88] 80 args; [89] crc; [90] reserved 0"
+meaning = "Header byte positions (report[n] = buf[n+1])."
+devices = ["00a7", "00a8", "0221"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-09-24", what = "replies from both owned devices parse and validate at these offsets" },
+  { kind = "source", src = "openrazer", at = "driver/razercommon.h#L124-L136", what = "same field order" },
+  { kind = "source", src = "uchroma", at = "rust/hid/report.rs#L3-L13", what = "same field order" },
+]
+conflicts = [
+  "uchroma writes remaining_packets little-endian (rust/hid/report.rs#L157) while openrazer/librazermacos say big-endian; moot for neuron, which always sends 0.",
+]
+
+[[fact]]
+key = "razer/frame/crc"
+dialect = "razer"
+kind = "frame"
+layout = "crc = XOR of report bytes [2..=87] (buf[3..=88]), stored at report[88] (buf[89])"
+meaning = "Checksum. Excludes status and tx."
+devices = ["00a7", "00a8", "0221"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-09-24", what = "replies from BW 0221 and Naga 00a8 pass neuron's CRC check at this range" },
+  { kind = "source", src = "openrazer", at = "driver/razercommon.c#L111-L124", what = "XOR i=2..87" },
+  { kind = "source", src = "openrgb", at = "Controllers/RazerController/RazerController/RazerController.cpp#L581-L602", what = "same range shifted by the report id" },
+  { kind = "source", src = "librazermacos", at = "src/lib/razercommon.c#L124-L138", what = "same range" },
+  { kind = "source", src = "naga-companion", at = "src/NagaBatteryTray/Hid/RazerProtocol.cs#L301-L311", what = "CRC over buffer[3..88] compared to buffer[89], on Naga V2 Pro" },
+]
+conflicts = [
+  "uchroma XORs bytes 1..=86 (includes tx, excludes arg byte 79; rust/crc.rs#L25) and its own tests/docs disagree. Settled for replies by neuron's live validator; whether firmware checks the host CRC at all is unknown.",
+]
+
+[[fact]]
+key = "razer/frame/status"
+dialect = "razer"
+kind = "frame"
+layout = "status byte: 0 new, 1 busy, 2 success, 3 fail, 4 timeout, 5 unsupported"
+meaning = "Reply status codes."
+devices = ["00a7", "00a8", "0221"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-09-29", what = "Naga 15/00 [00,3] answered FAIL (3); 15/80 answered SUCCESS (2)" },
+  { kind = "live", date = "2026-07-06", what = "Naga answered UNSUPPORTED (5) to 00/C0" },
+  { kind = "source", src = "openrazer", at = "driver/razercommon.h#L79-L83", what = "same constants" },
+  { kind = "source", src = "razerqdhid", at = "public/py/qdrazer/protocol.py#L24-L30", what = "same table" },
+]
+
+[[fact]]
+key = "razer/frame/reply-validation"
+dialect = "razer"
+kind = "frame"
+layout = "accept only if len >= 91, buf[0]==0, buf[2]==request tx, buf[6]<=80, buf[90]==0, crc ok, class and id echo"
+meaning = "neuron's ACK'd exec rejects any reply that does not echo tx, class and id with a valid CRC."
+devices = ["00a7", "00a8", "0221"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-09-24", what = "validator shipped; BW getter and awake Naga getters passed; asleep Naga timed out as silence" },
+  { kind = "source", src = "opensnek", at = "OpenSnek/Sources/OpenSnekHardware/USBHIDControlSession.swift#L183-L215", what = "validates tx, class and id" },
+  { kind = "source", src = "razermouse", at = "crates/razer-core/src/engine.rs#L7-L32", what = "validates CRC and echo" },
+]
+conflicts = [
+  "openrazer never compares tx or CRC on replies and treats BUSY as success (driver/razermouse_driver.c#L116-L163); a device that rewrote tx in replies would time out under neuron.",
+  "Inside neuron: synth timed_exec and the razer-audio dialect only echo-filter class/id (no tx/CRC check), unlike the ACK'd exec. Unsettled design inconsistency.",
+]
+
+[[fact]]
+key = "razer/frame/exec-poll"
+dialect = "razer"
+kind = "frame"
+layout = "SET, then up to 60 polls x 10 ms; re-send SET when i%12==11; Busy/Timeout/New keep polling; Fail/Unsupported terminal"
+meaning = "ACK'd command discipline (about 600 ms budget)."
+devices = ["00a7", "00a8", "0221"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-09-29", what = "15/00 writes acknowledged through this loop over the Naga dongle and confirmed by 15/80" },
+  { kind = "source", src = "razerlite", at = "src/Protocol.cs#L82-L136", what = "on the HyperPolling dongle a BUSY reply only clears by re-sending, not re-reading" },
+]
+conflicts = [
+  "openrazer retries 5x at 10 ms and accepts BUSY as success (driver/razermouse_driver.c#L116-L163); neuron treats BUSY as pending. Not contradicted on owned hardware.",
+]
+
+[[fact]]
+key = "razer/frame/stream-drain"
+dialect = "razer"
+kind = "frame"
+layout = "SET, sleep stream_wait_us, ONE GET drain; success iff valid Success; no retry"
+meaning = "Fire-and-drain lighting stream write; skipping the drain freezes the device."
+devices = ["00a8", "0221"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-07-02", what = "live_stream_strategy_probe: 90 frames at 30 fps on BW 0221, 0 failures, device alive after (memory legacy-6fps-was-folklore)" },
+]
+
+[[fact]]
+key = "razer/frame/stream-fps"
+dialect = "razer"
+kind = "frame"
+layout = "MAX_STREAM_FPS = 30; about 1 ms per fire-and-drain report on BW; 7-report frame < 10 ms"
+meaning = "Lighting stream ceiling; the earlier 6 fps legacy cap was folklore."
+devices = ["0221", "00a8"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-07-02", what = "BW held 30.3 fps under four wire disciplines; set_feature 0.35-0.8 ms, get_feature about 0.5 ms" },
+]
+
+[[fact]]
+key = "razer/frame/stream-wait"
+dialect = "razer"
+kind = "frame"
+layout = "stream_wait_us = 31000 on the Naga (wireless); 0 on BW"
+meaning = "Pause between a streamed SET and its drain so the 2.4 GHz round-trip is not overrun."
+devices = ["00a7", "00a8"]
+grade = "single"
+evidence = [
+  { kind = "source", src = "openrazer", at = "driver/razermouse_driver.c#L60-L80", what = "Naga V2 Pro wired+wireless use RAZER_NEW_MOUSE_RECEIVER_WAIT_US" },
+  { kind = "source", src = "openrazer", at = "driver/razermouse_driver.h#L131", what = "31000 us" },
+  { kind = "source", src = "librazermacos", at = "src/include/razermouse_driver.h#L101-L102", what = "same constants (port)" },
+]
+conflicts = [
+  "The TOML's flicker rationale (drops frames without the wait) has no dated neuron observation; the Naga dongle ACKs getters in about 6 ms (memory device-auto-synthesis).",
+]
+
+[[fact]]
+key = "razer/frame/synth-stream-wait"
+dialect = "razer"
+kind = "frame"
+layout = "auto defs: stream_wait_us = 31000 if the measured round-trip >= 15 ms OR the def has battery_level, else 0"
+meaning = "Pacing guess for synthesized defs; latency alone under-detects wireless (the Naga dongle ACKs getters in about 6 ms)."
+grade = "derived"
+evidence = [
+  { kind = "source", src = "neuron", at = "crates/neuron-core/src/synth.rs#L160-L182", what = "neuron's heuristic" },
+]
+
+[[fact]]
+key = "razer/frame/discover-poll"
+dialect = "razer"
+kind = "frame"
+layout = "fingerprint exec: 40 polls x 8 ms, re-arm at i%12==11; Fail/Unsupported -> none"
+meaning = "Read-only discovery poll grain."
+grade = "derived"
+evidence = [
+  { kind = "source", src = "neuron", at = "crates/neuron-core/src/discover.rs#L17-L55", what = "neuron's own choice of grain" },
+]
+
+[[fact]]
+key = "razer/frame/synth-probe"
+dialect = "razer"
+kind = "frame"
+layout = "timed_exec: 2 ms grain, PROBE_POLLS 160 (about 320 ms), QUALIFY_POLLS 1000 (about 2 s, first command wakes a radio), re-arm at i%48==47, tx 0x1F"
+meaning = "Auto-synthesis probe exec; measured round-trip feeds stream_wait_us."
+grade = "derived"
+evidence = [
+  { kind = "source", src = "neuron", at = "crates/neuron-core/src/synth.rs#L190-L244", what = "neuron's own probe timing" },
+]
+conflicts = [
+  "Uses reply_status (class/id echo only) where the ACK'd exec uses razer_reply_status (tx + CRC); see razer/frame/reply-validation.",
+]
+
+[[fact]]
+key = "razer/frame/parrot-canary"
+dialect = "razer"
+kind = "frame"
+layout = "class 0xFE id 0xFE, size 0x02, no args, tx 0x1F"
+meaning = "A header no device implements; a Success reply means the pipe rubber-stamps everything and synthesis returns nothing."
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-07-08", what = "Seiren V3 Mini answered Success with zero args to about 485 of 512 unknown headers, which motivated the canary" },
+]
+
+[[fact]]
+key = "razer/frame/control-interface"
+dialect = "razer"
+kind = "frame"
+layout = "usage_page 0x0001, usage 0x0002, feature_report_len 91; family claim = VID 0x1532 + a 91-byte feature report"
+meaning = "Which HID collection is the control pipe."
+devices = ["00a7", "00a8", "0221"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-09-24", what = "getters answered on this collection on both owned devices" },
+  { kind = "source", src = "openrgb", at = "Controllers/RazerController/RazerControllerDetect.cpp#L367-L368", what = "Naga V2 Pro: interface 0, page 0x01, usage 0x02" },
+  { kind = "source", src = "naga-companion", at = "docs/architecture.md#L101-L103", what = "MI_00 on V2 Pro, pick by 91-byte feature length" },
+]
+conflicts = [
+  "uchroma routes all mice to USB interface 1 (device_manager.py#L170-L191); neither neuron nor OpenRGB/naga-companion find the Naga pipe there.",
+]
+
+[[fact]]
+key = "razer/frame/transport"
+dialect = "razer"
+kind = "frame"
+layout = "Windows HidD_SetFeature/HidD_GetFeature on the full 91-byte buffer; Linux hidraw HIDIOCSFEATURE/HIDIOCGFEATURE, first byte = report id"
+meaning = "Host transports for the feature pipe."
+devices = ["00a7", "00a8", "0221"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-09-24", what = "Windows path: all owned-device getters in the receive-path check" },
+  { kind = "source", src = "openrazer", at = "driver/razercommon.c#L26-L35", what = "SET_REPORT 0x21/0x09 wValue 0x0300, the kernel-side equivalent" },
+]
+conflicts = [
+  "Linux hidraw path is not verified on hardware for razer_report beyond an ignored checkpoint test (transport/hidraw.rs); the live grade covers Windows only.",
+]
+
+[[fact]]
+key = "razer/frame/event-collection"
+dialect = "razer"
+kind = "frame"
+layout = "mouse pushes on generic-desktop usage_page 0x0001 usage 0x0000, or any vendor page >= 0xFF00 of a DPI-mouse pid; keyboards via the same rule in macrokeys"
+meaning = "Which HID input collection carries 05/04 pushes."
+devices = ["00a8", "0529", "0221"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-07-07", what = "05 02 / 05 0c / 04 5x reports read off this collection on the Naga dongle (dpi_trap)" },
+  { kind = "source", src = "opensnek", at = "docs/protocol/USB_PROTOCOL.md#L392-L420", what = "Basilisk V3 line pushes report 0x05 on an auxiliary usage 0x01:0x06 interface" },
+]
+
+[[fact]]
+key = "razer/mode/wireless-sleep"
+dialect = "razer"
+kind = "mode"
+layout = "asleep: every dongle getter times out; first command to a parked radio can take seconds; only user input wakes it"
+meaning = "Wireless sleep behaviour behind QUALIFY_POLLS and honest dashes in the UI."
+devices = ["00a8"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-07-10", what = "asleep Naga: battery/dpi/polling getters all timed out until a physical wiggle" },
+  { kind = "source", src = "openrazer-issues", at = "https://github.com/openrazer/openrazer/issues/2454", what = "writes fail while asleep and land once the mouse moves" },
+  { kind = "source", src = "razerlite", at = "src/Protocol.cs#L82-L136", what = "BUSY/TIMEOUT while moving or asleep on the HyperPolling dongle" },
+]
+
+# ------------------------------------------------------------------------------------------------
+# Transaction ids
+# ------------------------------------------------------------------------------------------------
+
+[[fact]]
+key = "razer/tx/naga"
+dialect = "razer"
+kind = "tx"
+layout = "transaction_id 0x1F for every command"
+meaning = "Naga V2 Pro device-wide tx."
+devices = ["00a7", "00a8"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-09-29", what = "15/00, 15/80, 15/81, 15/87 all answered at 0x1F over the dongle" },
+  { kind = "live", date = "2026-06-21", what = "TOML header: verified over the dongle against Synapse's own logged values (recorded in the repo's first commit; observation month 2026-06)" },
+  { kind = "source", src = "openrazer", at = "driver/razermouse_driver.c#L822-L837", what = "Naga V2 Pro wired+wireless firmware getter at 0x1F; same for every other Naga command" },
+  { kind = "source", src = "naga-companion", at = "src/NagaBatteryTray/Hid/RazerProtocol.cs#L88-L89", what = "tx auto-probe converges on 0x1F" },
+  { kind = "source", src = "timursl", at = "driver/razermouse_driver.c#L2955-L2998", what = "class 0x15 at 0x1F" },
+  { kind = "source", src = "openrgb", at = "Controllers/RazerController/RazerDevices.cpp#L7185-L7191", what = "Naga V2 Pro entry tx 0x1F" },
+]
+conflicts = [
+  "WebSynapse sends 0xFF for every non-0x0F class on this mouse (app.js#L109-L118); every other source and neuron's live traffic use 0x1F. Settled for 0x1F.",
+  "openrazer sends Naga V2 Pro matrix_effect_none as class 0x03/0x0A at 0xFF with a 'TODO: this is probably wrong?' (driver/razermouse_driver.c#L970-L980); neuron never sends that.",
+]
+
+[[fact]]
+key = "razer/tx/bw-default"
+dialect = "razer"
+kind = "tx"
+layout = "transaction_id 0xFF for getters, device mode, brightness 03/03 + 03/83, game LED 03/00 + 03/80"
+meaning = "BlackWidow Chroma V2 default tx (the non-lighting half of its split tx)."
+devices = ["0221"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-07-07", what = "game mode 03/00 [00 08 00] ACKed at 0xFF, read back via 03/80, LED went dark" },
+  { kind = "live", date = "2026-09-26", what = "03/03 brightness write 41% verified and restored to 40% at 0xFF" },
+  { kind = "source", src = "openrazer", at = "driver/razerkbd_driver.c#L583-L647", what = "device mode at 0xFF on BW Chroma V2" },
+  { kind = "source", src = "openrazer", at = "driver/razerkbd_driver.c#L4043-L4092", what = "brightness at 0xFF" },
+]
+conflicts = [
+  "OpenRGB gives 0221 one tx, 0x3F, for everything (Controllers/RazerController/RazerDevices.cpp#L1438-L1444). Getters appear to ignore tx, so both work for reads.",
+]
+
+[[fact]]
+key = "razer/tx/bw-lighting"
+dialect = "razer"
+kind = "tx"
+layout = "transaction_id 0x3F on 03/0A (effects, custom display) and 03/0B (custom rows)"
+meaning = "BlackWidow Chroma V2 lighting tx; the old global 0x1F silently no-op'd lighting writes."
+devices = ["0221"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-07-02", what = "BW streamed custom frames at 0x3F at 30 fps with 0 failures while the owner watched the audio meter on the board" },
+  { kind = "source", src = "openrazer", at = "driver/razerkbd_driver.c#L2273-L2275", what = "matrix effect none at 0x3F on BW Chroma V2 (same for wave/spectrum/reactive/static/starlight/breathing)" },
+  { kind = "source", src = "openrazer", at = "driver/razerkbd_driver.c#L4456-L4461", what = "custom-frame rows at 0x3F" },
+  { kind = "source", src = "openrazer", at = "driver/razerkbd_driver.c#L3798-L3801", what = "custom-frame display at 0x3F" },
+  { kind = "source", src = "openrgb", at = "Controllers/RazerController/RazerDevices.cpp#L1438-L1444", what = "0221 at 0x3F" },
+]
+conflicts = [
+  "uchroma gives 0221 no tx quirk, so 0xFF for lighting too (uchroma/server/data/keyboard.yaml#L182-L185).",
+  "librazermacos sends 0221 custom rows and none/spectrum at 0xFF, only static/starlight at 0x3F (src/lib/razerkbd_driver.c#L371-L385, #L1701-L1702).",
+  "neuron's own BW TOML still calls the 0x3F lighting path PROVISIONAL, not confirmed on this board; the 2026-07-02 stream and the memory lighting-engine-plan Phase 1/2 record it rendering. The TOML comment is stale.",
+]
+
+[[fact]]
+key = "razer/tx/auto-cohorts"
+dialect = "razer"
+kind = "tx"
+layout = "first_light_heal tries [0x1F, 0x3F, 0xFF, 0x9F]: write a custom frame + display, read lighting_state, first that lands wins and is written into the auto TOML"
+meaning = "Self-healing tx for synthesized defs."
+grade = "derived"
+evidence = [
+  { kind = "source", src = "neuron", at = "crates/neuron-core/src/writes.rs#L1392-L1422", what = "neuron's candidate list" },
+  { kind = "source", src = "openrgb", at = "Controllers/RazerController/RazerDevices.cpp#L1716", what = "0x9F exists as a tx on newer wireless keyboards" },
+]
+conflicts = [
+  "0x9F has no neuron hardware observation; naga-companion probes 9F but only ever saw 1F/FF answer.",
+  "OpenSnek's rule: a status 03 is a firmware rejection and must not be retried with another tx (docs/protocol/USB_PROTOCOL.md#L962-L970); neuron's heal retries across cohorts by design.",
+]
+
+[[fact]]
+key = "razer/tx/era-heuristic"
+dialect = "razer"
+kind = "tx"
+layout = "matrix-era or no lighting -> 0x1F; legacy-only lighting -> 0xFF with 0x3F baked into the lighting block"
+meaning = "Synthesized-def tx guess, flagged HEURISTIC in the emitted file."
+grade = "derived"
+evidence = [
+  { kind = "source", src = "neuron", at = "crates/neuron-core/src/synth.rs#L511-L515", what = "neuron's heuristic" },
+]
+
+[[fact]]
+key = "razer/tx/bitfield"
+dialect = "razer"
+kind = "tx"
+layout = "tx byte = {device: low 3 bits, id: high 5 bits}; 0x1F = dev 7 id 3, 0x3F = dev 7 id 7, 0x9F = dev 7 id 19, 0xFF = dev 7 id 31"
+meaning = "How upstream types the tx byte. neuron treats tx as an opaque byte."
+grade = "single"
+unused = true
+evidence = [
+  { kind = "source", src = "openrazer", at = "driver/razercommon.h#L91-L97", what = "transaction_id_union" },
+  { kind = "source", src = "openrgb", at = "Controllers/RazerController/RazerController/RazerController.h#L172-L180", what = "same union (copied)" },
+]
+
+# ------------------------------------------------------------------------------------------------
+# Device mode and custody
+# ------------------------------------------------------------------------------------------------
+
+[[fact]]
+key = "razer/00/84"
+dialect = "razer"
+kind = "get"
+class = 0x00
+id = 0x84
+layout = "size 0x02 -> [mode, param]; 0x00 normal, 0x03 driver"
+meaning = "Read device mode. A normal-mode reply is all zeros, which `neuron probe` hides as 'no valid reply' (it drops empty replies): read the mode through writes::device_mode, not the probe verb."
+devices = ["00a7", "00a8", "0221"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-09-30", what = "Naga 00a7 (cable): writes::device_mode read Some(0) in normal mode and 03 in driver mode; `neuron probe 00a7 00 84` printed 'no valid reply' for the same normal-mode state (its classify() drops all-zero replies)" },
+  { kind = "live", date = "2026-09-29", what = "Naga dongle answered 0x03 while awake with the tray holding driver mode" },
+  { kind = "live", date = "2026-09-16", what = "Naga answers 03 with the tray running; with the tray stopped it reads not supported, because the mouse leaves driver mode when the lease drops (memory dpi-wander-membership-gate)" },
+  { kind = "live", date = "2026-06-21", what = "BW reads device mode 0x03 (TOML header; recorded in the first commit)" },
+  { kind = "source", src = "openrazer", at = "driver/razerchromacommon.c#L51-L54", what = "get_device_mode" },
+  { kind = "source", src = "naga-companion", at = "src/NagaBatteryTray/Hid/RazerProtocol.cs#L72-L77", what = "Naga V2 Pro device mode get/set" },
+  { kind = "source", src = "razerqdhid", at = "public/py/qdrazer/device.py#L43-L46", what = "mode 0 normal, 1 bootloader, 2 test, 3 driver" },
+]
+conflicts = [
+  "SETTLED: the 2026-09-16 'dongle does not support 00/84' note was a normal-mode mouse read through `neuron probe`, which hides the all-zero normal-mode reply. The getter answers in both modes.",
+  "openrazer reads the Naga V2 HyperSpeed receiver (00B4) mode at 0xFF (driver/razermouse_driver.c#L4078-L4138); neuron's Naga reads at 0x1F. Different pid.",
+]
+
+[[fact]]
+key = "razer/00/04"
+dialect = "razer"
+kind = "set"
+class = 0x00
+id = 0x04
+layout = "size 0x02, [mode, 0x00]; 0x03 driver, 0x00 normal"
+meaning = "Device-mode switch."
+devices = ["00a7", "00a8", "0221"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-07-07", what = "dpi_trap caught mode 0x03 <-> 0x00 transitions driven by ensure_driver writes on the Naga" },
+  { kind = "live", date = "2026-06-21", what = "'mode driver' flips 00/04 = [03,00] (writes.rs doc, recorded in the first commit)" },
+  { kind = "source", src = "openrazer", at = "driver/razerchromacommon.c#L25-L38", what = "mode forced to 0x00 or 0x03; 0x02 blocked as a factory test mode" },
+  { kind = "source", src = "naga-companion", at = "src/NagaBatteryTray/Hid/RazerProtocol.cs#L72-L77", what = "same pair on Naga V2 Pro" },
+  { kind = "source", src = "opensnek", at = "docs/protocol/USB_PROTOCOL.md#L148-L156", what = "00 00 normal, 03 00 driver; never write 3 on Tartarus Pro" },
+]
+conflicts = [
+  "razerqdhid documents mode 1 = enter bootloader and 2 = test; neuron only ever sends 0 or 3.",
+]
+
+[[fact]]
+key = "razer/mode/driver-required"
+dialect = "razer"
+kind = "mode"
+layout = "00/04 [0x03,0x00] before host lighting and DPI writes"
+meaning = "Driver mode before host writes: needed on the BlackWidow (custody = driver). NOT needed on the Naga V2 Pro (custody = firmware): lighting and DPI land in normal mode."
+devices = ["0221"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-09-30", what = "Naga 00a7 held in normal mode (00/84 read 0x00 before and after): 0F/02 static red rendered on led 0x04 (logo) and 0x05 (side); a 0F/03 row + 0F/02 [00,00,08] custom frame rendered logo green / side blue; 04/05 DPI write read back." },
+  { kind = "live", date = "2026-06-21", what = "Naga TOML: driver mode REQUIRED for host effects to render (recorded in the first commit; observation month 2026-06). Contradicted on the Naga by the 2026-09-30 run above." },
+]
+conflicts = [
+  "SETTLED 2026-09-30 for the Naga in OpenRGB's and uchroma's favour: lighting paints in normal mode. The 2026-06 note was wrong for this mouse; the BlackWidow keeps driver custody for its macro keys.",
+  "naga-companion applies 02/0C button bindings in normal mode and warns that driver mode (a Synapse leftover) may stop onboard bindings firing (docs/superpowers/plans/2026-07-10-naga-button-remap-stage1-spike.md#L594-L613); the requirement is not universal across command classes.",
+]
+
+[[fact]]
+key = "razer/mode/button-functions-normal-only"
+dialect = "razer"
+kind = "mode"
+layout = "02/0C profile 0 records are live in device mode 0x00 only"
+meaning = "In driver mode the firmware emits the active onboard slot's button table and ignores the direct profile; the direct profile's functions take effect only in normal mode. Why the Naga's custody is firmware."
+devices = ["00a7"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-09-30", what = "Naga 00a7, direct profile holding 0x4B -> 'g', 0x4A -> F13 (read back): in driver mode 0x03 the keys emitted stock '=' / '-' (raw input watch), even after a fresh re-write; after 00/04 [00,00] the same keys emitted 'g' and F13." },
+  { kind = "source", src = "naga-companion", at = "docs/superpowers/specs/2026-06-21-naga-button-remap-design.md#L355-L365", what = "all volatile-apply tests ran in normal mode 0x00; instant apply" },
+]
+
+[[fact]]
+key = "razer/mode/driver-lease"
+dialect = "razer"
+kind = "mode"
+layout = "hold 00/04 [03,00] while streaming; send 00/04 [00,00] on teardown/exit"
+meaning = "Driver mode is a lease: releasing it re-enables onboard buttons, FN combos and firmware wake-restore."
+devices = ["00a8", "0221"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-07-07", what = "unowned driver-mode wake restored stale defaults; normal-mode wake loaded persisted config (memory razer-protocol-deep-tea)" },
+]
+
+[[fact]]
+key = "razer/mode/driver-deferral"
+dialect = "razer"
+kind = "mode"
+layout = "driver mode: onboard DPI/scroll/profile buttons stop acting and arrive as 04 xx input reports"
+meaning = "Software owns the onboard buttons while it holds driver mode."
+devices = ["00a8"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-07-07", what = "04 52 / 04 57 / 04 50 captured on pid 00a8 in driver mode" },
+  { kind = "source", src = "openrazer-wiki", at = "Using-the-mouse-driver.md#L24", what = "in driver mode the DPI buttons do nothing; Synapse changes DPI" },
+  { kind = "source", src = "razerqdhid", at = "docs/basic-en.md#L56-L62", what = "pushed reports only in driver mode" },
+]
+conflicts = [
+  "OpenSnek saw the 05 02 DPI push with the mouse in normal mode (docs/protocol/USB_PROTOCOL.md#L392-L420), contradicting razerqdhid's driver-mode-only claim; neuron has not tested normal-mode pushes.",
+]
+
+[[fact]]
+key = "razer/mode/fn-normal-only"
+dialect = "razer"
+kind = "mode"
+layout = "FN+F10 firmware game-mode toggle works only in device mode 0x00"
+meaning = "In driver mode the keyboard defers FN combos to software."
+devices = ["0221"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-07-07", what = "game-mode incident on BW 0221 (memory razer-protocol-deep-tea)" },
+  { kind = "source", src = "openrazer-issues", at = "https://github.com/openrazer/openrazer/issues/1174", what = "FN keys don't work while the daemon runs" },
+]
+
+[[fact]]
+key = "razer/mode/macro-keys"
+dialect = "razer"
+kind = "mode"
+layout = "keyboard M-keys emit the 04 report only in driver mode; macrokeys re-asserts 00/04 [03,00] every 20 s"
+meaning = "Macro-key arming on non-DPI razer devices with device_mode; a replug reverts to normal mode."
+devices = ["0221"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-07-01", what = "BW macro keys captured live (recorded in the commit that added macrokeys)" },
+  { kind = "source", src = "openrazer", at = "driver/razerkbd_driver.c#L4925-L4965", what = "04 report codes decoded by the keyboard raw_event" },
+]
+
+[[fact]]
+key = "razer/mode/wake-restore"
+dialect = "razer"
+kind = "mode"
+layout = "after sleep/wake in unowned driver mode the Naga reloads a stale/factory stage table into volatile (once both) planes and announces it with 05 02"
+meaning = "Wake-restore trap; neuron reasserts from host feel-intent."
+devices = ["00a8"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-07-07", what = "dpi_trap logs: volatile table reverted to factory [800,16000,...] active 2 and 16000 announced" },
+  { kind = "live", date = "2026-07-23", what = "factory table [400,800,1600,3200,6400] landed in both planes (memory feel-intent-authority)" },
+]
+conflicts = [
+  "neuron's notes attribute the source to an unmapped class-0x05 profile store; the 2026-07-07 flash recon found class 0x05 is bookkeeping only and the 16000 value may be derived by the dongle. UNSETTLED.",
+]
+
+[[fact]]
+key = "razer/mode/idle-revert"
+dialect = "razer"
+kind = "mode"
+layout = "device_mode 03 00 -> 00 00 when the idle timer expires, on power cycle, RF toggle or suspend"
+meaning = "Firmware drops driver mode on its own; driver mode must be reasserted after wake."
+devices = ["00a8"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-09-16", what = "Naga leaves driver mode when the tray's lease drops (00/84 then reads not supported)" },
+  { kind = "source", src = "openrazer-issues", at = "https://github.com/openrazer/openrazer/issues/2454", what = "Basilisk V3 X HyperSpeed loses driver mode after its idle time" },
+  { kind = "source", src = "openrazer-pr2904", at = "https://github.com/openrazer/openrazer/pull/2904", what = "Naga V3 Pro reverts 03 00 -> 00 00 after a 60 s idle" },
+]
+conflicts = [
+  "neuron's own 2026-07-22 note says driver mode WAS held and the mouse does not auto-revert (earlier 0x00 reads were spurious Busy). UNSETTLED: read 00/84 once a minute across an idle timeout with the tray stopped.",
+]
+
+# ------------------------------------------------------------------------------------------------
+# Class 0x00 info and polling
+# ------------------------------------------------------------------------------------------------
+
+[[fact]]
+key = "razer/00/81"
+dialect = "razer"
+kind = "get"
+class = 0x00
+id = 0x81
+layout = "size 0x02 -> [major, minor]"
+meaning = "Firmware version; also the synth qualify/latency ping."
+devices = ["00a8", "0221"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-09-24", what = "BW and awake Naga returned valid 00/81 replies" },
+  { kind = "source", src = "openrazer", at = "driver/razerchromacommon.c#L67-L70", what = "args[0].args[1]" },
+  { kind = "source", src = "openrgb", at = "Controllers/RazerController/RazerController/RazerController.cpp#L1073-L1087", what = "same decode" },
+]
+conflicts = [
+  "razerqdhid reads a 4-byte version (fw 1.2.0.0 as 01 02 00 00) on the Basilisk V3 (docs/cmd_basic-en.md#L20-L27); neuron and openrazer read two bytes.",
+]
+
+[[fact]]
+key = "razer/00/82"
+dialect = "razer"
+kind = "get"
+class = 0x00
+id = 0x82
+layout = "size 0x16 -> ASCII serial"
+meaning = "Serial number."
+devices = ["00a8", "0221"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-06-21", what = "BW serial IO1735F09002641 (recorded in the first commit)" },
+  { kind = "source", src = "openrazer", at = "driver/razerchromacommon.c#L59-L62", what = "size 0x16" },
+  { kind = "source", src = "razerqdhid", at = "public/py/qdrazer/device.py#L49", what = "serial, reads 16 bytes" },
+]
+
+[[fact]]
+key = "razer/00/85"
+dialect = "razer"
+kind = "get"
+class = 0x00
+id = 0x85
+layout = "size 0x01 -> [divisor]; 1=1000, 2=500, 4=250, 8=125 Hz"
+meaning = "Polling rate."
+devices = ["00a8"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-07-10", what = "awake Naga answered polling reads in the live E2E pass" },
+  { kind = "source", src = "openrazer", at = "driver/razerchromacommon.c#L1092-L1095", what = "01/02/08 codes" },
+  { kind = "source", src = "opensnek", at = "docs/protocol/USB_PROTOCOL.md#L128-L146", what = "01 1000, 02 500, 08 125" },
+  { kind = "source", src = "razerlite", at = "src/Protocol.cs#L21-L31", what = "classic codes (its comment cites OpenRazer as the source)" },
+  { kind = "source", src = "naga-tray", at = "razer_naga.py#L170-L172", what = "read on Naga V2 Pro" },
+]
+conflicts = [
+  "neuron decodes divisor 0x04 = 250 Hz; no upstream code table lists 0x04 (openrazer maps unknown codes to 500).",
+]
+
+[[fact]]
+key = "razer/00/05"
+dialect = "razer"
+kind = "set"
+class = 0x00
+id = 0x05
+layout = "size 0x01, [divisor]"
+meaning = "Set polling rate up to 1000 Hz; read back via 00/85."
+devices = ["00a8"]
+grade = "agreed"
+ungated_debt = "Shipping ungated with read-back against 00/85 on every call; README grades it proven but no dated neuron write is recorded, and the 0x04 (250 Hz) divisor is in no upstream table."
+evidence = [
+  { kind = "source", src = "openrazer", at = "driver/razerchromacommon.c#L1104-L1123", what = "set_polling_rate, codes 01/02/08" },
+  { kind = "source", src = "openrazer", at = "driver/razermouse_driver.c#L2126-L2127", what = "Naga V2 Pro at 0x1F" },
+  { kind = "source", src = "opensnek", at = "docs/protocol/USB_PROTOCOL.md#L128-L146", what = "same command and codes" },
+  { kind = "source", src = "razerlite", at = "src/Protocol.cs#L21-L31", what = "classic codes (its comment cites OpenRazer as the source; not counted as independent here)" },
+]
+conflicts = [
+  "razerqdhid's Basilisk V3 uses a profile-scoped 00/0E [profile, interval_ms] instead (docs/cmd_basic-en.md#L115-L132); a different firmware generation.",
+]
+
+[[fact]]
+key = "razer/00/c0"
+dialect = "razer"
+kind = "get"
+class = 0x00
+id = 0xC0
+layout = "size 0x01 -> rate code; 01 8000, 02 4000, 04 2000, 08 1000, 10 500, 20 250, 40 125"
+meaning = "HyperPolling rate read."
+devices = ["00b3"]
+grade = "agreed"
+evidence = [
+  { kind = "live", date = "2026-07-06", what = "Naga dongle 00a8 answered UNSUPPORTED (memory device-auto-synthesis)" },
+  { kind = "source", src = "openrazer", at = "driver/razerchromacommon.c#L1127-L1141", what = "polling_rate2 get" },
+  { kind = "source", src = "openrazer", at = "driver/razermouse_driver.c#L1944-L1950", what = "decodes the code at args[1]" },
+  { kind = "source", src = "razerlite", at = "src/Protocol.cs#L138-L155", what = "reply code at args[1]; NOT_SUPPORTED means classic polling" },
+]
+conflicts = [
+  "neuron verifies/decodes the code at args[0] (capability.rs polling_rate_hz_hires, writes.rs verify_getter index 0); openrazer, RazerLite and RazerMouse read args[1], opsrzr args[0]. UNSETTLED: no 00B3 dongle to read.",
+  "The Naga TOML declares polling2 although its dongle answered UNSUPPORTED on 2026-07-06.",
+]
+
+[[fact]]
+key = "razer/00/40"
+dialect = "razer"
+kind = "set"
+class = 0x00
+id = 0x40
+layout = "size 0x02, [0x00, code]"
+meaning = "HyperPolling rate write (>1000 Hz path); allowlisted to pid 00B3."
+devices = ["00b3"]
+grade = "agreed"
+gate = "NEURON_INGAME_POLL_WRITE"
+evidence = [
+  { kind = "source", src = "openrazer", at = "driver/razerchromacommon.c#L1153-L1185", what = "set_polling_rate2, doubled send on some models" },
+  { kind = "source", src = "razerlite", at = "src/Protocol.cs#L225-L262", what = "two steps on 00B3: [00,code] tx 1F then [01,code] tx FF; TIMEOUT means the dongle re-enumerated" },
+]
+conflicts = [
+  "neuron sends one [0x00, code] at the device tx; RazerLite and openrazer send a second [0x01, code] at 0xFF to the 00B3 dongle itself. UNSETTLED until a 00B3 puck is on the desk.",
+  "The old neuron opcode 0x00/0x06 timed out (nonexistent); neuron-core Cargo.toml's ingame-poll-write comment still names 0x00/0x06.",
+]
+
+[[fact]]
+key = "razer/mode/hyperpolling-dongle-two-step"
+dialect = "razer"
+kind = "mode"
+layout = "00/40 [00,code] tx 0x1F (mouse), then 00/40 [01,code] tx 0xFF (dongle); expect TIMEOUT, wait 250 ms, reopen HID, read back"
+meaning = "How the HyperPolling dongle 00B3 takes a rate change."
+devices = ["00b3"]
+grade = "agreed"
+unused = true
+evidence = [
+  { kind = "source", src = "razerlite", at = "src/Protocol.cs#L225-L262", what = "measured on 00B3" },
+  { kind = "source", src = "openrazer", at = "driver/razerchromacommon.c#L1153-L1185", what = "second send arg0=0x01, 0xFF on the HyperPolling dongle" },
+]
+
+[[fact]]
+key = "razer/00/bf"
+dialect = "razer"
+kind = "get"
+class = 0x00
+id = 0xBF
+layout = "-> [slots, dev1 flag, dev1 pid_hi, dev1 pid_lo, dev2 flag, dev2 pid (FFFF = empty)]"
+meaning = "Receiver paired-devices list."
+devices = ["00a8"]
+grade = "single"
+unused = true
+evidence = [
+  { kind = "live", date = "2026-06-30", what = "month-only date (2026-06), month end used: Naga dongle answered 02 00 00 A8 00 FF FF (2 slots, Naga in slot 1)" },
+  { kind = "source", src = "openrazer-wiki", at = "Unknown-commands.md#L17", what = "data size 31; slot count, per-slot flag and pid, FFFF if none" },
+  { kind = "source", src = "openrazer-pr2817", at = "https://github.com/openrazer/openrazer/pull/2817", what = "Dock Pro heartbeat at size 0x50, paired flag at args[1], pid offset marked TODO" },
+]
+conflicts = [
+  "Size: wiki says 31, PR 2817 sends 0x50.",
+]
+
+[[fact]]
+key = "razer/00/46"
+dialect = "razer"
+kind = "set"
+class = 0x00
+id = 0x46
+layout = "size 0x01, [0x01]"
+meaning = "Receiver pairing step 1 / start RF scan."
+devices = ["00b3"]
+grade = "single"
+unused = true
+evidence = [
+  { kind = "source", src = "openrazer", at = "driver/razerchromacommon.c#L1574-L1585", what = "HyperPolling dongle pair step 1, tx 0x1F" },
+  { kind = "source", src = "openrazer-pr2807", at = "https://github.com/openrazer/openrazer/pull/2807", what = "sent twice before 00/41 on the Dock Pro" },
+  { kind = "source", src = "openrazer-wiki", at = "Unknown-commands.md#L9", what = "args 01, something with pairing" },
+]
+
+[[fact]]
+key = "razer/00/41"
+dialect = "razer"
+kind = "set"
+class = 0x00
+id = 0x41
+layout = "size 0x03, [0x01, pid_hi, pid_lo]"
+meaning = "Receiver pairing step 2: pair with a pid."
+devices = ["00b3"]
+grade = "single"
+unused = true
+evidence = [
+  { kind = "source", src = "openrazer", at = "driver/razerchromacommon.c#L1587-L1600", what = "pair step 2" },
+  { kind = "source", src = "openrazer-wiki", at = "Unknown-commands.md#L7", what = "args 010296, pair device 0296?" },
+]
+conflicts = [
+  "Whether the owner's HyperSpeed receiver 0529 takes the same sequence is unknown; every source is on 00B3 or the Dock Pro.",
+]
+
+# ------------------------------------------------------------------------------------------------
+# Class 0x04 DPI
+# ------------------------------------------------------------------------------------------------
+
+[[fact]]
+key = "razer/04/85"
+dialect = "razer"
+kind = "get"
+class = 0x04
+id = 0x85
+layout = "size 0x07, [varstore] -> [vs, X_hi, X_lo, Y_hi, Y_lo, 0, 0]"
+meaning = "Active DPI of the plane named by arg[0] (0x00 volatile, 0x01 persisted)."
+devices = ["00a8"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-09-24", what = "awake Naga read 800 x 800" },
+  { kind = "live", date = "2026-07-07", what = "dpi_forensics read both planes separately" },
+  { kind = "source", src = "openrazer", at = "driver/razerchromacommon.c#L1236-L1241", what = "get DPI, big-endian X/Y" },
+  { kind = "source", src = "opensnek", at = "docs/protocol/USB_PROTOCOL.md#L323-L354", what = "storage 0/1 or profile 0..5 banks" },
+  { kind = "source", src = "naga-companion", at = "src/NagaBatteryTray/Hid/RazerProtocol.cs#L53-L58", what = "Naga V2 Pro DPI get" },
+]
+
+[[fact]]
+key = "razer/04/05"
+dialect = "razer"
+kind = "set"
+class = 0x04
+id = 0x05
+layout = "size 0x07, [varstore, X_hi, X_lo, Y_hi, Y_lo, 0, 0]"
+meaning = "Set DPI on one plane; verified against 04/85 on the same plane."
+devices = ["00a8"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-07-10", what = "verified DPI write round-trip through the live stream" },
+  { kind = "live", date = "2026-07-22", what = "no-op 04/05 [00 03 20 03 20 00 00] accepted, 04/85 unchanged at 800" },
+  { kind = "source", src = "openrazer", at = "driver/razerchromacommon.c#L1211-L1229", what = "set_dpi_xy, clamp 100..45000" },
+  { kind = "source", src = "naga-companion", at = "src/NagaBatteryTray/Hid/RazerProtocol.cs#L53-L58", what = "set [01 VARSTORE, X, Y, 0, 0] on Naga V2 Pro" },
+  { kind = "source", src = "razerlite", at = "src/Protocol.cs#L276-L308", what = "read-after-write verify" },
+]
+conflicts = [
+  "openrazer overwrites arg[0] with VARSTORE 0x01 regardless of its parameter (driver/razerchromacommon.c#L1219) and naga-companion writes 0x01; neuron writes the plane it is asked for (volatile by default). Settled for neuron's plane-matched write by the 2026-07-10 round-trip.",
+]
+
+[[fact]]
+key = "razer/04/83"
+dialect = "razer"
+kind = "get"
+class = 0x04
+id = 0x83
+layout = "size 0x26, [varstore] -> [vs, active, count, {stage_id, X_hi, X_lo, Y_hi, Y_lo, 0, 0} * count]"
+meaning = "The Naga's full 5-slot stage table (factory template), not the user's configured cycle."
+devices = ["00a8"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-07-07", what = "read 800/16000/1600/3200/6400; seeding from it wrote the factory slots as the user's cycle (incident)" },
+]
+conflicts = [
+  "No upstream source documents 04/83. Varstore 0x05 on 04/83 and 04/86 returns a distinct factory template [400,800,1600,3200,6400] (flash recon 2026-07-07), so which plane 04/83 reflects by default is still loose.",
+]
+
+[[fact]]
+key = "razer/04/86"
+dialect = "razer"
+kind = "get"
+class = 0x04
+id = 0x86
+layout = "size 0x26, [varstore] -> [vs, active(1-based), count, {stage_id(1-based), X_hi, X_lo, Y_hi, Y_lo, 0, 0} * count]"
+meaning = "The user's configured DPI stage list for one plane."
+devices = ["00a8"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-07-06", what = "getter echoes 1-based active and stage ids" },
+  { kind = "source", src = "openrazer", at = "driver/razerchromacommon.c#L1317-L1323", what = "get_dpi_stages" },
+  { kind = "source", src = "opensnek", at = "docs/protocol/USB_PROTOCOL.md#L356-L390", what = "active is a stage-id token" },
+  { kind = "source", src = "razerlite", at = "src/Protocol.cs#L344-L452", what = "1-based index validation" },
+]
+conflicts = [
+  "razerqdhid and RazerMouse number stage ids from 0 in their writes; hardware reads on Naga, V3 X and V3 Pro show 1-based.",
+]
+
+[[fact]]
+key = "razer/04/06"
+dialect = "razer"
+kind = "set"
+class = 0x04
+id = 0x06
+layout = "size 0x26, [store, active(1-based), count, {stage_id(1-based), X_hi, X_lo, Y_hi, Y_lo, 0, 0} * count], zero-padded, max 5"
+meaning = "Write the DPI stage list; verified against 04/86 on the written plane."
+devices = ["00a8"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-07-06", what = "active byte 0 is rejected with FAIL; nonzero writes accepted and read back" },
+  { kind = "live", date = "2026-06-21", what = "3-stage [400/800/1600] and [800/30000] written and read back (HARDWARE-PROVEN 2026-06, recorded in the first commit)" },
+  { kind = "source", src = "openrazer", at = "driver/razerchromacommon.c#L1268-L1312", what = "set_dpi_stages, 7-byte records, always VARSTORE" },
+  { kind = "source", src = "opensnek", at = "docs/protocol/USB_PROTOCOL.md#L356-L390", what = "same layout" },
+  { kind = "source", src = "razerlite", at = "src/Protocol.cs#L344-L452", what = "set args[0]=01, size 3+7n" },
+]
+conflicts = [
+  "WebSynapse builds records without the stage-id byte and with a 0-based active (app.js#L536-L551); contradicted by every validated source.",
+  "Size: neuron always sends 0x26 zero-padded; RazerLite sends 3+7n. OpenSnek: V3 Pro stored-slot writes reject a reduced count even when padded.",
+]
+
+[[fact]]
+key = "razer/mode/stage-write-sets-live-dpi"
+dialect = "razer"
+kind = "mode"
+layout = "04/06 moves live DPI to the active stage and emits 05 02; DpiCycle via 04/05 does not move the stage marker"
+meaning = "Side effects neuron's DPI provenance relies on."
+devices = ["00a8"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-09-16", what = "set_dpi_stages dragged live DPI to its active stage; a 04/05 cycle left the marker alone (memory dpi-wander-membership-gate)" },
+]
+
+[[fact]]
+key = "razer/mode/varstore-planes"
+dialect = "razer"
+kind = "mode"
+layout = "arg[0] of 04/85, 04/86, 04/83, 15/80, 15/81 selects the plane: 0x00 volatile (acts now), 0x01 persisted; 0x05 = factory template on the DPI getters"
+meaning = "Dual-plane device state; neuron's write-reads are plane-matched."
+devices = ["00a8"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-07-07", what = "flash recon: planes read independently; 0x02-0x04 alias the live stores, 0x05 a factory template" },
+  { kind = "live", date = "2026-09-29", what = "15/80 [00] -> [00 02], 15/80 [01] -> [01 02]" },
+  { kind = "source", src = "opensnek", at = "docs/protocol/USB_PROTOCOL.md#L323-L354", what = "0 live only, 1 persistent and mirrors into 0; profile banks readable" },
+  { kind = "source", src = "razerqdhid", at = "docs/cmd_basic-en.md#L128-L151", what = "first byte is a profile, 0 = direct/volatile" },
+]
+conflicts = [
+  "Upstream reads arg[0] as a profile slot (0 direct, 1..5 onboard) where neuron reads it as a storage plane; on the Naga 0x02-0x04 alias the live store, which fits neither model cleanly.",
+]
+
+# ------------------------------------------------------------------------------------------------
+# Class 0x07 power
+# ------------------------------------------------------------------------------------------------
+
+[[fact]]
+key = "razer/07/80"
+dialect = "razer"
+kind = "get"
+class = 0x07
+id = 0x80
+layout = "size 0x02 -> [0, level 0..255]"
+meaning = "Battery level."
+devices = ["00a8"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-09-24", what = "awake Naga battery read passed the validator" },
+  { kind = "source", src = "openrazer", at = "driver/razerchromacommon.c#L1057-L1060", what = "level in args[1]" },
+  { kind = "source", src = "naga-companion", at = "src/NagaBatteryTray/Hid/RazerProtocol.cs#L48-L51", what = "args[1] on Naga V2 Pro" },
+  { kind = "source", src = "naga-tray", at = "razer_naga.py#L148-L156", what = "args[1]" },
+]
+conflicts = [
+  "OpenSnek's doc says args[0] = charging, args[1] = level (docs/protocol/USB_PROTOCOL.md#L444-L451); every other source reads charging from 07/84. Doc likely wrong.",
+]
+
+[[fact]]
+key = "razer/07/84"
+dialect = "razer"
+kind = "get"
+class = 0x07
+id = 0x84
+layout = "size 0x02 -> [00, charging flag]"
+meaning = "Charging status."
+devices = ["00a7", "00a8"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-09-29", what = "Naga 00a7 on its cable replied 00 01; 00a8 on battery replied 00 00 — the flag is byte[1]" },
+  { kind = "live", date = "2026-07-10", what = "answered on the awake Naga in the live E2E pass (which byte carries the flag was not isolated)" },
+  { kind = "source", src = "openrazer", at = "driver/razerchromacommon.c#L1067-L1070", what = "charging bool in args[1]" },
+  { kind = "source", src = "naga-companion", at = "src/NagaBatteryTray/Hid/RazerProtocol.cs#L48-L51", what = "value = args[1]" },
+  { kind = "source", src = "naga-tray", at = "razer_naga.py#L148-L156", what = "charging = args[1]" },
+]
+conflicts = [
+  "SETTLED 2026-09-29 for upstream: neuron read the flag at args[0] (always 0, so charging never registered); openrazer, naga-companion and naga-tray read args[1], which live bytes confirm. capability.rs fixed.",
+]
+
+[[fact]]
+key = "razer/07/83"
+dialect = "razer"
+kind = "get"
+class = 0x07
+id = 0x83
+layout = "size 0x02 -> BE u16 seconds"
+meaning = "Sleep/idle timeout."
+devices = ["00a8"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-07-02", what = "read 300 s stock, echoed 0x0078 after a 120 s write" },
+  { kind = "source", src = "openrazer", at = "driver/razerchromacommon.c#L1329-L1332", what = "get_idle_time" },
+  { kind = "source", src = "naga-tray", at = "razer_naga.py#L158-L165", what = "Naga V2 Pro" },
+]
+
+[[fact]]
+key = "razer/07/03"
+dialect = "razer"
+kind = "set"
+class = 0x07
+id = 0x03
+layout = "size 0x02, [sec_hi, sec_lo]"
+meaning = "Sleep/idle timeout write; verified via 07/83. Feature idle-power-write is on in app and CLI."
+devices = ["00a8"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-07-02", what = "wrote 120 s, 07/83 echoed 0x0078, restored 300 s (memory sleep-timer-write-verified)" },
+  { kind = "source", src = "openrazer", at = "driver/razerchromacommon.c#L1337-L1352", what = "set_idle_time, clamp 60..900" },
+  { kind = "source", src = "naga-tray", at = "razer_naga.py#L158-L165", what = "clamp 60..900" },
+  { kind = "source", src = "opensnek", at = "docs/protocol/USB_PROTOCOL.md#L453-L475", what = "60..900" },
+]
+conflicts = [
+  "Every source clamps 60..900 s; neuron clamps only to 65535 and its decoder treats 0 as never sleep. Values outside 60..900 are untested on hardware.",
+]
+
+[[fact]]
+key = "razer/07/81"
+dialect = "razer"
+kind = "get"
+class = 0x07
+id = 0x81
+layout = "size 0x01 -> raw threshold (0x0C 5%, 0x26 15%, 0x3F 25%)"
+meaning = "Low-battery warning threshold."
+devices = ["00a8"]
+grade = "agreed"
+unused = true
+evidence = [
+  { kind = "live", date = "2026-06-30", what = "month-only date (2026-06), month end used: Naga answered 0x26" },
+  { kind = "source", src = "openrazer", at = "driver/razerchromacommon.c#L1357-L1360", what = "get threshold" },
+  { kind = "source", src = "naga-tray", at = "razer_naga.py#L167-L168", what = "read on Naga V2 Pro" },
+  { kind = "source", src = "opensnek", at = "docs/protocol/USB_PROTOCOL.md#L453-L475", what = "raw 0x0C..0x3F" },
+]
+
+[[fact]]
+key = "razer/07/01"
+dialect = "razer"
+kind = "set"
+class = 0x07
+id = 0x01
+layout = "size 0x01, [threshold 0x0C..0x3F]"
+meaning = "Set the low-battery warning threshold."
+devices = ["00a8"]
+grade = "agreed"
+unused = true
+evidence = [
+  { kind = "source", src = "openrazer", at = "driver/razerchromacommon.c#L1369-L1378", what = "clamp 0x0C..0x3F; Naga V2 Pro at 0x1F" },
+  { kind = "source", src = "opensnek", at = "docs/protocol/USB_PROTOCOL.md#L453-L475", what = "raw 0x0C..0x3F" },
+]
+conflicts = [
+  "uchroma has two encodings in one repo (scaled vs raw percent); RazerMouse saw a DA V4 Pro value 77, outside 12..63.",
+]
+
+# ------------------------------------------------------------------------------------------------
+# Class 0x06 storage
+# ------------------------------------------------------------------------------------------------
+
+[[fact]]
+key = "razer/06/8e"
+dialect = "razer"
+kind = "get"
+class = 0x06
+id = 0x8E
+layout = "size 0x20 -> [vs, max_macros, max_bytes u32 BE, avail u32 BE, recycle u32 BE]"
+meaning = "Onboard storage pool accounting."
+devices = ["00a8"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-07-10", what = "neuron storage read on the Naga in the live E2E pass" },
+  { kind = "source", src = "razerqdhid", at = "docs/cmd_basic-en.md#L46-L56", what = "[u16 0x0064, u32 total, u32 free, u32 recycled], size 14" },
+  { kind = "source", src = "openrazer-wiki", at = "Unknown-commands.md#L65", what = "Synapse calls 06 8e before a profile move" },
+]
+conflicts = [
+  "razerqdhid reads bytes 0..1 as one u16 (0x0064); neuron splits them into varstore and max_macros. The u32 fields agree.",
+]
+
+[[fact]]
+key = "razer/06/80"
+dialect = "razer"
+kind = "get"
+class = 0x06
+id = 0x80
+layout = "size 0x20 -> count"
+meaning = "Macro count."
+devices = ["00a8"]
+grade = "single"
+evidence = [
+  { kind = "source", src = "razerqdhid", at = "public/py/qdrazer/device.py#L134", what = "macro count (size 2)" },
+  { kind = "live", date = "2026-07-07", what = "answers on the Naga with small values (flash recon)" },
+]
+conflicts = [
+  "neuron decodes [macros, profiles] best-effort; the profiles byte has no source. The wiki saw 06 80 return 0000/0001/0002 after a profile switch.",
+]
+
+[[fact]]
+key = "razer/06/8d"
+dialect = "razer"
+kind = "get"
+class = 0x06
+id = 0x8D
+layout = "size 0x20; with args [00, 41] returns firmware memory"
+meaning = "Declared 'storage_directory' in the Naga TOML; content undecoded, and with an address arg it reads ARM Thumb code (a memory peek)."
+devices = ["00a8"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-07-22", what = "returned a populated table; 06/8D [00,41] returned ARM Thumb code (memory naga-side-plate-binding)" },
+]
+conflicts = [
+  "The TOML name storage_directory is unsupported by any evidence. Never blind-write class 0x06 setters (brick risk).",
+]
+
+# ------------------------------------------------------------------------------------------------
+# Class 0x0F extended-matrix lighting (Naga)
+# ------------------------------------------------------------------------------------------------
+
+[[fact]]
+key = "razer/0f/84"
+dialect = "razer"
+kind = "get"
+class = 0x0F
+id = 0x84
+layout = "size 0x03, [varstore 0x00, led 0x04] -> [vs, led, level]"
+meaning = "Matrix brightness of the visible region; must read the region that was written."
+devices = ["00a8"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-06-21", what = "reading region 0x05 gave a stale slider; region 0x04 tracks writes (commit f3ba55a)" },
+  { kind = "source", src = "openrazer", at = "driver/razerchromacommon.c#L731-L739", what = "extended get brightness" },
+  { kind = "source", src = "opensnek", at = "docs/protocol/USB_PROTOCOL.md#L498-L526", what = "zone brightness per led id" },
+]
+
+[[fact]]
+key = "razer/0f/04"
+dialect = "razer"
+kind = "set"
+class = 0x0F
+id = 0x04
+layout = "size 0x03, [varstore, led 0x04, level 0..255]"
+meaning = "Matrix brightness write; verified against 0F/84."
+devices = ["00a8"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-06-21", what = "write + 0F/84 read-back on the same region (commit f3ba55a)" },
+  { kind = "source", src = "openrazer", at = "driver/razerchromacommon.c#L714-L723", what = "extended brightness" },
+  { kind = "source", src = "openrazer", at = "driver/razermouse_driver.c#L2275-L2282", what = "Naga V2 Pro uses VARSTORE + ZERO_LED 0x00" },
+  { kind = "source", src = "naga-tray", at = "razer_naga.py#L192-L193", what = "Naga V2 Pro brightness per led" },
+]
+conflicts = [
+  "led id: neuron 0x04 (visible region, live) vs openrazer and OpenRGB 0x00 (ZERO, all LEDs; Controllers/RazerController/RazerController/RazerController.cpp#L79-L136). Both may be valid.",
+]
+
+[[fact]]
+key = "razer/0f/82"
+dialect = "razer"
+kind = "get"
+class = 0x0F
+id = 0x82
+layout = "size 0x20, -> [varstore, led, effect_id, param, brightness, ...]"
+meaning = "Current matrix lighting state; arg[2] echoes the effect id written. Used by first-light heal and CLI verify."
+devices = ["00a8"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-06-27", what = "returns the effect id neuron wrote (recorded in commit 5d8e5d8)" },
+  { kind = "source", src = "naga-tray", at = "razer_naga.py#L201-L207", what = "reads the stored effect on Naga V2 Pro and re-applies it live" },
+  { kind = "source", src = "opensnek", at = "docs/protocol/USB_PROTOCOL.md#L528-L550", what = "readback 00 led 01 00 00 01 R G B" },
+  { kind = "source", src = "razerqdhid", at = "public/py/qdrazer/device.py#L224-L226", what = "per-profile zone effect read" },
+]
+
+[[fact]]
+key = "razer/0f/02"
+dialect = "razer"
+kind = "set"
+class = 0x0F
+id = 0x02
+layout = "[varstore, led 0x04, effect_id] (+ [0x00, 0x00, 0x01, R, G, B] for colour effects); data_size = args.len(); custom display = [0x00, 0x04, 0x08]"
+meaning = "Extended-matrix native effect and custom-frame display."
+devices = ["00a8"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-06-21", what = "static red rendered on the Naga (lighting.rs, recorded in the first commit)" },
+  { kind = "source", src = "openrazer", at = "driver/razerchromacommon.c#L481-L706", what = "extended matrix effects with fixed sizes (NONE 6, STATIC 9, custom 0x0C)" },
+  { kind = "source", src = "naga-tray", at = "razer_naga.py#L180-L199", what = "Naga V2 Pro static size 9 [.., 00 00 01 RGB], spectrum size 6" },
+  { kind = "source", src = "opensnek", at = "docs/protocol/USB_PROTOCOL.md#L528-L550", what = "same effect layout" },
+]
+conflicts = [
+  "data_size: neuron sends args.len(), openrazer and naga-tray send fixed sizes per effect.",
+  "openrazer paints Naga V2 Pro static as a 0F/02 [0,0,08,0,0,0] mode switch followed by 0F/03 size 0x0E [0,0,0,0,02,RGB x3] (driver/razermouse_driver.c#L1106-L1130); OpenRGB sends the custom display with led 0x00.",
+]
+
+[[fact]]
+key = "razer/enum/matrix-effect-ids"
+dialect = "razer"
+kind = "enum"
+layout = "0F/02 arg[2]: off 0x00, static 0x01, breathing 0x02, wave 0x03, spectrum 0x04, reactive 0x05, custom-frame display 0x08"
+meaning = "neuron's extended-matrix effect table (Naga TOML)."
+devices = ["00a8"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-06-21", what = "static red and 'wave' rendered; 0x05 streamed as display flickered (reactive), fixed by 0x08 (recorded in the first commit)" },
+  { kind = "source", src = "openrazer", at = "driver/razerchromacommon.c#L481-L706", what = "SPECTRUM 0x03, WAVE 0x04, REACTIVE 0x05, STARLIGHT 0x07, CUSTOM 0x08" },
+  { kind = "source", src = "opensnek", at = "docs/protocol/USB_PROTOCOL.md#L528-L550", what = "03 spectrum, 04 wave" },
+  { kind = "source", src = "razerqdhid", at = "docs/cmd_led-en.md#L9-L67", what = "3 spectrum, 4 wave, 8 custom" },
+]
+conflicts = [
+  "neuron labels 0x03 wave and 0x04 spectrum; openrazer, OpenRGB, uchroma, OpenSnek and razerqdhid all say 0x03 spectrum, 0x04 wave. UNSETTLED: on a 2-LED mouse a spectrum cycle can look like a gradient. Write 0x04 with a direction byte and watch whether the two zones differ in hue.",
+]
+
+[[fact]]
+key = "razer/0f/03"
+dialect = "razer"
+kind = "set"
+class = 0x0F
+id = 0x03
+layout = "[varstore 0x00, led 0x04, row, start_col, stop_col, RGB * n]; data_size = args.len()"
+meaning = "Extended-matrix custom-frame row paint (Naga rows=1, cols=2, count TBD)."
+devices = ["00a8"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-06-21", what = "custom rows + 0x08 display paint without flicker on the Naga (recorded in the first commit)" },
+  { kind = "source", src = "openrazer", at = "driver/razerchromacommon.c#L746-L776", what = "[0, 0, row, start, stop, RGB]; size row_len+5 for Naga V2 Pro" },
+  { kind = "source", src = "openrazer", at = "driver/razermouse_driver.c#L3824-L3829", what = "Naga V2 Pro in the row_len+5 group" },
+  { kind = "source", src = "opensnek", at = "docs/protocol/USB_PROTOCOL.md#L750-L800", what = "[storage, row, start, end, pad 0x00, RGB] with a mandatory pad byte (V3 Pro)" },
+]
+conflicts = [
+  "arg[1]: neuron sends led 0x04; openrazer and OpenRGB send 0x00 there. Both render per neuron and OpenRGB users.",
+  "OpenSnek's V3 Pro needs a pad byte after stop_col or colours shift; neuron sends none. Device-specific; not seen on the Naga.",
+  "OpenRGB models the Naga V2 Pro as 1x2 (logo, numpad), matching neuron's rows=1 cols=2 guess.",
+]
+
+[[fact]]
+key = "razer/enum/matrix-led-ids"
+dialect = "razer"
+kind = "enum"
+layout = "varstore 0x00 NOSTORE, 0x01 VARSTORE; Naga led 0x04 = logo, 0x05 = side (thumb-grid) backlight"
+meaning = "Storage and LED selectors neuron uses on the Naga."
+devices = ["00a8"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-09-30", what = "Naga 00a7, normal mode: static red on 0x04 lit the logo, on 0x05 the side grid backlight" },
+  { kind = "live", date = "2026-06-21", what = "CONFIRMED LIVE: visible region 0x04, 0x05 non-visible (Naga TOML, first commit); 0x05 half contradicted 2026-09-30" },
+  { kind = "source", src = "openrazer", at = "driver/razercommon.h#L32-L57", what = "NOSTORE/VARSTORE; LOGO 0x04, BACKLIGHT 0x05, ZERO 0x00" },
+  { kind = "source", src = "naga-tray", at = "razer_naga.py#L17-L19", what = "Naga V2 Pro: 0x04 logo, 0x05 backlight (thumb grid); 0x01/0x10/0x11 FAIL" },
+]
+conflicts = [
+  "SETTLED 2026-09-30 in naga-tray's favour: 0F/02 static red on led 0x05 lit the side (thumb-grid) backlight. neuron's 'non-visible' note was wrong; neuron only paints 0x04 today.",
+]
+
+[[fact]]
+key = "razer/frame/animate-order"
+dialect = "razer"
+kind = "frame"
+layout = "send changed rows fire-and-drain, then ONE display report if any row went out; any failure -> full resend next frame; unchanged rows deduped"
+meaning = "Streaming protocol for custom frames (0F/03 + 0F/02 [..,08]; 03/0B + 03/0A [05, vs])."
+devices = ["00a8", "0221"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-07-02", what = "30 fps streaming on BW with this order" },
+  { kind = "source", src = "openrazer", at = "driver/razerkbd_driver.c#L3798-L3801", what = "rows then custom-frame display on BW Chroma V2" },
+  { kind = "source", src = "openrgb", at = "Controllers/RazerController/RazerController/RazerController.cpp#L910-L929", what = "rows then apply-custom, re-sent every update" },
+]
+
+# ------------------------------------------------------------------------------------------------
+# Class 0x03 legacy lighting and LEDs (BlackWidow Chroma V2)
+# ------------------------------------------------------------------------------------------------
+
+[[fact]]
+key = "razer/03/80"
+dialect = "razer"
+kind = "get"
+class = 0x03
+id = 0x80
+layout = "size 0x03, [varstore 0x00, GAME_LED 0x08] -> [vs, led, state]"
+meaning = "Firmware game mode (Win-key kill) state."
+devices = ["0221"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-07-07", what = "getter echoed [00 08 01] with the LED lit" },
+  { kind = "source", src = "openrazer", at = "driver/razerchromacommon.c#L107-L113", what = "get_led_state" },
+  { kind = "source", src = "openrazer", at = "driver/razerkbd_driver.c#L1006-L1053", what = "BW Chroma V2 game LED get with VARSTORE at 0xFF" },
+]
+conflicts = [
+  "openrazer sends VARSTORE 0x01 as arg[0]; neuron sends 0x00. Both answer; neuron's 0x00 is live-verified.",
+]
+
+[[fact]]
+key = "razer/03/00"
+dialect = "razer"
+kind = "set"
+class = 0x03
+id = 0x00
+layout = "size 0x03, [varstore 0x00, GAME_LED 0x08, state]"
+meaning = "Firmware game mode write; verified via 03/80."
+devices = ["0221"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-07-07", what = "[00 08 00] ACKed, read back, LED went dark" },
+  { kind = "source", src = "openrazer", at = "driver/razerchromacommon.c#L83-L90", what = "set_led_state" },
+  { kind = "source", src = "openrazer", at = "driver/razerkbd_driver.c#L907-L954", what = "BW Chroma V2 game LED at 0xFF" },
+]
+conflicts = [
+  "Same varstore difference as 03/80 (openrazer 0x01, neuron 0x00); settled for 0x00 by the live write.",
+]
+
+[[fact]]
+key = "razer/03/88"
+dialect = "razer"
+kind = "get"
+class = 0x03
+id = 0x88
+layout = "size 0x06"
+meaning = "Answers on the BW but the bytes are not a usable effect echo (00 00 A5 81 95 85 seen)."
+devices = ["0221"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-06-21", what = "answered with high-bit junk (memory razer-protocol-deep-tea live probe, month 2026-06; recorded in the first commit)" },
+]
+conflicts = [
+  "The BW TOML calls it a CONFIRMED live lighting-state getter; the CLI and lighting notes say it returns junk after a 03/0A write, so legacy lighting is only ACK-confirmed. No upstream documents 03/88.",
+]
+
+[[fact]]
+key = "razer/03/89"
+dialect = "razer"
+kind = "get"
+class = 0x03
+id = 0x89
+layout = "size 0x07"
+meaning = "Answers on the BW; named lighting capabilities, decode unknown."
+devices = ["0221"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-06-21", what = "answers (BW TOML, recorded in the first commit)" },
+]
+
+[[fact]]
+key = "razer/03/83"
+dialect = "razer"
+kind = "get"
+class = 0x03
+id = 0x83
+layout = "size 0x03, [VARSTORE 0x01, BACKLIGHT 0x05] -> [vs, led, level]"
+meaning = "Legacy backlight brightness."
+devices = ["0221"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-09-26", what = "read 40% on the BW (docs/STATUS.md)" },
+  { kind = "source", src = "openrazer", at = "driver/razerchromacommon.c#L195-L201", what = "get_led_brightness" },
+  { kind = "source", src = "openrazer", at = "driver/razerkbd_driver.c#L4211-L4265", what = "BW Chroma V2 at 0xFF, VARSTORE, BACKLIGHT_LED" },
+]
+
+[[fact]]
+key = "razer/03/03"
+dialect = "razer"
+kind = "set"
+class = 0x03
+id = 0x03
+layout = "size 0x03, [VARSTORE 0x01, BACKLIGHT 0x05, level]"
+meaning = "Legacy backlight brightness write; verified via 03/83."
+devices = ["0221"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-09-26", what = "wrote and verified 41%, restored and verified 40% (docs/STATUS.md)" },
+  { kind = "source", src = "openrazer", at = "driver/razerchromacommon.c#L179-L186", what = "set_led_brightness" },
+  { kind = "source", src = "openrazer", at = "driver/razerkbd_driver.c#L4043-L4092", what = "BW Chroma V2: VARSTORE, BACKLIGHT_LED, 0xFF" },
+]
+conflicts = [
+  "OpenRGB writes varstore 0x00 (NOSTORE) here (Controllers/RazerController/RazerController/RazerController.cpp#L709-L718); neuron writes 0x01, which persists, against the volatile-first default in AGENTS.md. Whether 0x00 works on this board is untested.",
+]
+
+[[fact]]
+key = "razer/03/0a"
+dialect = "razer"
+kind = "set"
+class = 0x03
+id = 0x0A
+layout = "[effect_id, sub-args] at FIXED size per effect: off/spectrum [id] 1; static [06,R,G,B] 4; wave [01,dir] 2; reactive [02,speed,R,G,B] 5; breathing [03,type,RGB..] 8; custom display [05, varstore] 2; tx 0x3F"
+meaning = "Standard-matrix effect and custom-frame display on the BW."
+devices = ["0221"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-07-02", what = "custom display [05, 00] at 0x3F rendered streamed frames on the BW" },
+  { kind = "source", src = "openrazer", at = "driver/razerchromacommon.c#L208-L395", what = "standard matrix effects and sizes" },
+  { kind = "source", src = "openrgb", at = "Controllers/RazerController/RazerController/RazerController.cpp#L921-L1021", what = "same effects, custom [05, NOSTORE]" },
+]
+conflicts = [
+  "Only the custom display id (0x05) has dated neuron hardware evidence; the native effect ids ride on openrazer (see razer/enum/legacy-effect-ids).",
+  "Starlight: neuron and openrazer both declare data_size 0x01 over a 9-byte payload (driver/razerchromacommon.c#L290-L341); neuron's inventory flagged it as a bug, but it matches upstream. Unreachable on the BW today.",
+]
+
+[[fact]]
+key = "razer/enum/legacy-effect-ids"
+dialect = "razer"
+kind = "enum"
+layout = "03/0A arg[0]: off 0x00, wave 0x01, reactive 0x02, breathing 0x03, spectrum 0x04, custom 0x05, static 0x06, starlight 0x19"
+meaning = "Standard-matrix effect table."
+devices = ["0221"]
+grade = "single"
+evidence = [
+  { kind = "source", src = "openrazer", at = "driver/razercommon.h#L67-L76", what = "razer_matrix_effect_id" },
+  { kind = "source", src = "openrgb", at = "Controllers/RazerController/RazerController/RazerController.cpp#L942-L1021", what = "same ids (copied lineage)" },
+  { kind = "live", date = "2026-07-02", what = "custom 0x05 renders on the BW; the other ids have no dated neuron observation" },
+]
+
+[[fact]]
+key = "razer/03/0b"
+dialect = "razer"
+kind = "set"
+class = 0x03
+id = 0x0B
+layout = "size FIXED 0x46, [0xFF frame id, row, start_col, stop_col, RGB * n], tx 0x3F; 6 rows x 22 cols"
+meaning = "Standard-matrix custom row paint; short rows at a smaller size are ACKed and ignored."
+devices = ["0221"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-07-02", what = "rows at size 0x46 and tx 0x3F streamed and rendered" },
+  { kind = "source", src = "openrazer", at = "driver/razerchromacommon.c#L450-L472", what = "size 0x46, frame id 0xFF" },
+  { kind = "source", src = "openrazer", at = "driver/razerkbd_driver.c#L4456-L4461", what = "BW Chroma V2 at 0x3F" },
+]
+conflicts = [
+  "OpenRGB (Controllers/RazerController/RazerController/RazerController.cpp#L791-L809) and uchroma send size 4+3*width; neuron's 2026-06 no-paint bug was fixed by the fixed 0x46. Settled for 0x46 on this board.",
+]
+
+[[fact]]
+key = "razer/enum/bw-key-matrix"
+dialect = "razer"
+kind = "enum"
+layout = "6 rows x 22 cols; number row is matrix row 1; logo at (0,20); space bar and Fn have no LED"
+meaning = "Key -> (row, col) for the BW Chroma V2."
+devices = ["0221"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-06-27", what = "vitals mirror lit keys 1,2,3 red and F1/F2 as expected (memory lighting-engine-plan Phase 2; recorded in commit 5d8e5d8)" },
+  { kind = "source", src = "openrazer", at = "driver/razerchromacommon.c#L403-L449", what = "BW Chroma row map" },
+]
+
+[[fact]]
+key = "razer/enum/bw-lighting-storage"
+dialect = "razer"
+kind = "enum"
+layout = "BW [lighting] varstore 0x00, led_id 0x00"
+meaning = "BW has no onboard storage; lighting writes are volatile."
+devices = ["0221"]
+grade = "derived"
+evidence = [
+  { kind = "source", src = "neuron", at = "crates/neuron-core/devices/razer-blackwidow-chroma-v2.toml#L95-L100", what = "neuron's choice" },
+]
+conflicts = [
+  "The BW brightness write uses a 0x01 VARSTORE prefix (razer/03/03), so the device is not purely volatile in neuron's own traffic.",
+]
+
+[[fact]]
+key = "razer/03/0d"
+dialect = "razer"
+kind = "set"
+class = 0x03
+id = 0x0D
+layout = "[varstore, led_id, effect, ...]: none 3; static(06) 6; spectrum(04) 3; reactive(02) 7; breathing(03) 0x0A"
+meaning = "Mouse extended-matrix effects openrazer uses on the Naga V2 Pro backlight (led 0x05, VARSTORE)."
+devices = ["00a8"]
+grade = "single"
+unused = true
+evidence = [
+  { kind = "source", src = "openrazer", at = "driver/razerchromacommon.c#L784-L895", what = "mouse extended effect builders" },
+  { kind = "source", src = "openrazer", at = "driver/razermouse_driver.c#L1236-L1350", what = "Naga V2 Pro spectrum/reactive/breathing at 0x1F" },
+]
+
+# ------------------------------------------------------------------------------------------------
+# Class 0x15 (Naga Synapse-4 family: scroll stages, button function buffer)
+# ------------------------------------------------------------------------------------------------
+
+[[fact]]
+key = "razer/15/00"
+dialect = "razer"
+kind = "set"
+class = 0x15
+id = 0x00
+layout = "size 0x02, [store, stage(1-based)]"
+meaning = "Select the active scroll-wheel stage; FAILs above the enabled count. Verified via 15/80."
+devices = ["00a8"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-09-29", what = "15/80 tracked 2 -> 1 -> 2 across volatile 15/00 writes; [00, 3] answered FAIL with count 2" },
+  { kind = "capture", what = "neuron's own USBPcap of Synapse (2026-06): Synapse sent [01, stage]" },
+  { kind = "source", src = "timursl", at = "driver/razerchromacommon.c#L1569-L1577", what = "[0x01, profile], size 2" },
+  { kind = "source", src = "timursl", at = "driver/razermouse_driver.c#L2979-L2998", what = "accepts profile 1..6 at 0x1F" },
+  { kind = "source", src = "openrazer-wiki", at = "Unknown-commands.md#L47", what = "0x15/0x00 args 0102" },
+]
+conflicts = [
+  "SETTLED 2026-09-29 (volatile plane): the value is a 1-based POSITION in the enabled list, not the HyperScroll profile id the TimurSl fork assumes. With 15/87 listing ids 0x82/0x85 (profiles 2 and 5), 15/00 [00, 05] answered FAIL, [00, 01] and [00, 02] were accepted, [00, 03] FAILed. The persist plane Synapse writes was not tested.",
+  "PR 2741 put HyperScroll on 02/18 (closed guess); contradicted by the fork and by neuron's capture.",
+  "Synapse writes store 0x01 (persist); neuron's cycle writes 0x00 (volatile).",
+]
+
+[[fact]]
+key = "razer/15/80"
+dialect = "razer"
+kind = "get"
+class = 0x15
+id = 0x80
+layout = "size 0x02, [store] -> [store, stage(1-based)]"
+meaning = "Active scroll stage."
+devices = ["00a8"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-09-29", what = "15/80 [00] -> [00 02], [01] -> [01 02]; tracked 15/00 writes" },
+  { kind = "source", src = "timursl", at = "driver/razerchromacommon.c#L1557-L1564", what = "[0x01], size 2" },
+  { kind = "source", src = "timursl", at = "driver/razermouse_driver.c#L2955-L2975", what = "expects args[0]=0x01, args[1]=1..6" },
+]
+conflicts = [
+  "Same position-vs-profile-id question as razer/15/00.",
+]
+
+[[fact]]
+key = "razer/15/81"
+dialect = "razer"
+kind = "get"
+class = 0x15
+id = 0x81
+layout = "size 0x02, [store] -> [store, enabled_count]"
+meaning = "Number of enabled scroll stages."
+devices = ["00a8"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-09-29", what = "reads 2 with two stages enabled" },
+]
+
+[[fact]]
+key = "razer/15/87"
+dialect = "razer"
+kind = "get"
+class = 0x15
+id = 0x87
+layout = "[store] -> [store, active, count, 0x80|id ...]"
+meaning = "Enabled HyperScroll set; trailing bytes are profile ids with bit 7 set per the fork. Sent only by examples/scroll_planes.rs."
+devices = ["00a8"]
+grade = "live"
+unused = true
+evidence = [
+  { kind = "live", date = "2026-09-29", what = "[store, active, count, 82, 85]; 82/85 match byte[3] of the 05 3a push" },
+  { kind = "source", src = "timursl", at = "driver/razerchromacommon.c#L1582-L1590", what = "[0x01, profile], size 9" },
+  { kind = "source", src = "timursl", at = "driver/razermouse_driver.c#L3054-L3067", what = "reply ids must have bit 7 set, id 1..6" },
+]
+conflicts = [
+  "neuron's note calls 82/85 undecoded per-stage codes; under the fork they are profiles 2 and 5. Consistent with each other; the fork's reading is the stronger explanation.",
+]
+
+[[fact]]
+key = "razer/15/07"
+dialect = "razer"
+kind = "set"
+class = 0x15
+id = 0x07
+layout = "size 0x09, [0x01, profile, count, (0x80|id) * count]"
+meaning = "Set which HyperScroll profiles (ids 1..6) are enabled."
+devices = ["00a8"]
+grade = "single"
+unused = true
+evidence = [
+  { kind = "source", src = "timursl", at = "driver/razerchromacommon.c#L1595-L1612", what = "builder" },
+  { kind = "source", src = "openrazer-wiki", at = "Unknown-commands.md#L48", what = "0x15/0x07 bunch of args" },
+  { kind = "live", date = "2026-07-22", what = "exists on the Naga (size-0 write answered FAIL)" },
+]
+
+[[fact]]
+key = "razer/15/04"
+dialect = "razer"
+kind = "set"
+class = 0x15
+id = 0x04
+layout = "size 0x50 blocks; selectors [01 06 01 00 00], [01 06 01 00 08], [01 06 02 00 00], [01 06 02 00 08], [01 06 03 00 00]; getter 15/84 with the same selector"
+meaning = "Custom HyperScroll curve blocks 3-7 of a 7-block save (15/09, 15/03, 15/04 x5)."
+devices = ["00a8"]
+grade = "single"
+unused = true
+evidence = [
+  { kind = "source", src = "timursl", at = "driver/razermouse_driver.c#L3129-L3142", what = "selectors from captured 0x04 packets" },
+  { kind = "source", src = "timursl", at = "driver/razermouse_driver.c#L3169-L3199", what = "save sends 09, 03, 04 x5 at tx 0x1F" },
+  { kind = "source", src = "openrazer-wiki", at = "Unknown-commands.md#L50", what = "0x15/0x04 lots and lots of args" },
+]
+conflicts = [
+  "Fork HEAD d7d093157f switches the save to tx 0x14+index ('one seven-report transaction'; https://github.com/TimurSl/openrazer-nagav2pro/commit/d7d093157f8db48742e99b02add2551e1f71cb05) vs 0x1F at b3b3195. Author reports custom profiles do not fully work. UNSETTLED.",
+]
+
+[[fact]]
+key = "razer/15/03"
+dialect = "razer"
+kind = "set"
+class = 0x15
+id = 0x03
+layout = "size 0x50, selector [01 06 01]"
+meaning = "Custom HyperScroll curve block 2 of 7."
+devices = ["00a8"]
+grade = "single"
+unused = true
+evidence = [
+  { kind = "source", src = "timursl", at = "driver/razermouse_driver.c#L3129-L3142", what = "selector table" },
+  { kind = "source", src = "openrazer-wiki", at = "Unknown-commands.md#L49", what = "0x15/0x03 lots and lots of args" },
+]
+
+[[fact]]
+key = "razer/15/09"
+dialect = "razer"
+kind = "set"
+class = 0x15
+id = 0x09
+layout = "size 0x50, selector [01]"
+meaning = "Custom HyperScroll curve block 1 of 7."
+devices = ["00a8"]
+grade = "single"
+unused = true
+evidence = [
+  { kind = "source", src = "timursl", at = "driver/razermouse_driver.c#L3129-L3142", what = "selector table" },
+  { kind = "source", src = "openrazer-wiki", at = "Unknown-commands.md#L51", what = "0x15/0x09 lots and lots of args" },
+]
+
+[[fact]]
+key = "razer/15/85"
+dialect = "razer"
+kind = "get"
+class = 0x15
+id = 0x85
+layout = "-> 00 50 00 50 00 50"
+meaning = "Undecoded; answers on the Naga."
+devices = ["00a8"]
+grade = "live"
+unused = true
+evidence = [
+  { kind = "live", date = "2026-09-29", what = "returned 00 50 00 50 00 50" },
+  { kind = "source", src = "openrazer-wiki", at = "Unknown-commands.md#L52", what = "0x15/0x85 args 005000500050, the same bytes" },
+]
+
+[[fact]]
+key = "razer/15/86"
+dialect = "razer"
+kind = "get"
+class = 0x15
+id = 0x86
+layout = "-> 03 5b"
+meaning = "Undecoded; answers on the Naga."
+devices = ["00a8"]
+grade = "live"
+unused = true
+evidence = [
+  { kind = "live", date = "2026-09-29", what = "returned 03 5b" },
+]
+
+[[fact]]
+key = "razer/15/88"
+dialect = "razer"
+kind = "get"
+class = 0x15
+id = 0x88
+meaning = "Undecoded; answers on the Naga."
+devices = ["00a8"]
+grade = "live"
+unused = true
+evidence = [
+  { kind = "live", date = "2026-07-22", what = "class 0x15 getter sweep: 80, 81, 85, 86, 87, 88, 8B respond" },
+]
+
+[[fact]]
+key = "razer/15/8b"
+dialect = "razer"
+kind = "get"
+class = 0x15
+id = 0x8B
+layout = "size 0x20 -> fixed bytes, invariant to args"
+meaning = "Presence probe for class 0x15 (supports_button_remap); only success/failure is used."
+devices = ["00a8"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-07-22", what = "answers with a fixed 10 x 0xFF for every button-id arg; later note calls it the serial" },
+]
+
+[[fact]]
+key = "razer/15/02"
+dialect = "razer"
+kind = "set"
+class = 0x15
+id = 0x02
+layout = "[button_id, type, param_len, param...]; type 0x01 mouse (param = 1-based button), 0x02 keyboard (param = HID usage); 0x00/0xFF rejected; thumb ids 0x40..0x4B"
+meaning = "Per-button function buffer; accepted and read back via 15/82. Whether it changes what the button emits is contested."
+devices = ["00a8"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-07-22", what = "writes ACKed and read back via 15/82; type 0x00/0xFF FAIL; but '=' (0x4B) set to 'g' still emitted 0x2E on a clean capture (memory naga-side-plate-binding)" },
+]
+conflicts = [
+  "neuron's own notes disagree: 2026-07-22 early entries say remapped keys typed at the source; the later root-cause entry says 15/02 is a buffer Razer's RzDev kernel filter reads and does not change emission. writes.rs doc says no read-back while the code verifies via 15/82. The `neuron remap` verb should not present it as a working remap until settled.",
+  "naga-companion (hardware run 2026-07-11, F13 emitted) and naga-web-setup remap the same thumb ids 0x40..0x4B on-device with 02/0C, contradicting the 2026-07-22 conclusion that on-device thumb remap does not exist. See razer/02/0c.",
+]
+
+[[fact]]
+key = "razer/15/82"
+dialect = "razer"
+kind = "get"
+class = 0x15
+id = 0x82
+layout = "size 0x20, [button_id, type] -> [button_id, type, param_len, param...]"
+meaning = "Read-back oracle for the 15/02 buffer."
+devices = ["00a8"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-07-22", what = "echoed written entries (0x4B -> 0x0A)" },
+]
+
+# ------------------------------------------------------------------------------------------------
+# Class 0x02 buttons, Snap Tap
+# ------------------------------------------------------------------------------------------------
+
+[[fact]]
+key = "razer/02/84"
+dialect = "razer"
+kind = "get"
+class = 0x02
+id = 0x84
+layout = "-> [count 0x1E, button ids ...]; thumb grid 0x40..0x4B"
+meaning = "Physical button-id table (30 entries). Neuron reads it only in probes."
+devices = ["00a8"]
+grade = "live"
+unused = true
+evidence = [
+  { kind = "live", date = "2026-07-22", what = "30-entry table; side buttons 0x40..0x4B" },
+]
+
+[[fact]]
+key = "razer/02/0c"
+dialect = "razer"
+kind = "set"
+class = 0x02
+id = 0x0C
+layout = "size 0x0A, [profile, button, hypershift, category, len, data x5]; profile 0 direct/volatile, 1..5 onboard; category 00 off, 01 mouse, 02 keyboard [mod, usage], 06 DPI, 07 profile, 0A consumer, 0C hypershift, 12 scroll-mode"
+meaning = "On-device button function. Naga V2 Pro thumb ids 0x40..0x4B (12), 0x50..0x55 (6), 0x04/0x05 (2)."
+devices = ["00a7", "00a8"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-09-29", what = "Naga 00a7 (cable), 12-button plate: [00, 4B, 00, 02, 02, 00, 0A, 00, 00, 00] accepted, 02/8C read it back, and the physical '=' thumb key typed 'g' (firmware emission, no host hook); the neighbouring key stayed stock. Survived a side-plate swap. Restored with the original record [00 4B 00 02 01 00 2E ...], read back exact." },
+  { kind = "source", src = "naga-companion", at = "src/NagaBatteryTray/Hid/RazerProtocol.cs#L60-L64", what = "Naga V2 Pro set/get ids, size 0x0A, profile 0 direct" },
+  { kind = "source", src = "naga-companion", at = "docs/superpowers/specs/2026-06-21-naga-button-remap-design.md#L4-L5", what = "spike run 2026-07-11 PASS: grid ids 0x40..0x4B, volatile profile-0 writes apply instantly" },
+  { kind = "source", src = "naga-web-setup", at = "apps/naga-configurator/naga-webhid.js#L458-L487", what = "Naga V2 Pro write, profile 1, read-back verified" },
+  { kind = "source", src = "razerqdhid", at = "docs/cmd_button-en.md#L7-L18", what = "Basilisk V3, same 10-byte frame" },
+  { kind = "source", src = "opensnek", at = "docs/protocol/USB_PROTOCOL.md#L191-L203", what = "same frame; Naga Pro slots 40..4B, 50..55" },
+  { kind = "live", date = "2026-07-22", what = "exists on the Naga: size-0 write answered FAIL" },
+]
+conflicts = [
+  "SETTLED 2026-09-29: neuron's 2026-07-22 conclusion that the Naga has no on-device thumb remap was wrong; it tested the 15/02 buffer, never 02/0C. A volatile profile-0 02/0C write changed what the key physically emits.",
+  "OPEN: stock records read back as [.., 02, 01, 00, usage] (len byte 01 with two data bytes) while both Naga sources write keyboard records as [.., 02, 02, mod, usage]; the firmware accepts both forms.",
+]
+
+[[fact]]
+key = "razer/02/8c"
+dialect = "razer"
+kind = "get"
+class = 0x02
+id = 0x8C
+layout = "size 0x0A, [profile, button, hypershift] -> [profile, button, hypershift, category, len, data...]"
+meaning = "Read one on-device button binding; the echo of the first three bytes must be checked."
+devices = ["00a8"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-09-29", what = "Naga 00a8, profiles 0 and 1: [p, 40, 00] -> [p, 40, 00, 02, 01, 00, 1e]; 0x41 -> usage 1f; 0x4B -> usage 2e. Keyboard category, the stock digits the thumb grid physically emits." },
+  { kind = "source", src = "naga-companion", at = "src/NagaBatteryTray/Hid/RazerProtocol.cs#L153-L179", what = "Naga V2 Pro read" },
+  { kind = "source", src = "naga-web-setup", at = "apps/naga-configurator/naga-webhid.js#L493-L505", what = "Naga V2 Pro read" },
+  { kind = "source", src = "opensnek", at = "docs/protocol/USB_PROTOCOL.md#L191-L203", what = "V3 Pro/35K reply offset differs" },
+]
+
+[[fact]]
+key = "razer/02/27"
+dialect = "razer"
+kind = "set"
+class = 0x02
+id = 0x27
+layout = "neuron: size 0x0F, [enable, count, {key_a, key_b} * n, pad]"
+meaning = "Snap Tap (SOCD) pairs on V4-class keyboards (allowlisted pids); not the BW Chroma V2."
+devices = ["0287", "02a5", "028b", "02a6", "02a7", "02a8"]
+grade = "single"
+gate = "NEURON_SNAP_TAP_WRITE"
+evidence = [
+  { kind = "source", src = "openrazer-issues", at = "https://github.com/openrazer/openrazer/issues/2754", what = "Snap Tap RE on a BW V4 TKL HyperSpeed: set 02/27 size 0x0F" },
+]
+conflicts = [
+  "Layout disagrees with its own cited source: issue 2754 sends [profile 0x01, reserved 0x00, enabled, {key1, key2, 0x00} * n] (3-byte pairs), neuron sends [enable, count, {a, b} * n]. The gate holds; fix the builder before any hardware test.",
+]
+
+[[fact]]
+key = "razer/02/a7"
+dialect = "razer"
+kind = "get"
+class = 0x02
+id = 0xA7
+layout = "size 0x0F, [0x01] -> [varstore, reserved, enabled, {key1, key2, 0} * 4]"
+meaning = "Snap Tap read-back."
+devices = ["0287", "02a5", "028b", "02a6", "02a7", "02a8"]
+grade = "single"
+evidence = [
+  { kind = "source", src = "openrazer-issues", at = "https://github.com/openrazer/openrazer/issues/2754", what = "get 02/A7 with a profile-slot arg" },
+]
+conflicts = [
+  "neuron verifies against its own payload layout, which differs from the issue's reply layout (see razer/02/27).",
+]
+
+# ------------------------------------------------------------------------------------------------
+# Class 0x0B sensor (lift-off)
+# ------------------------------------------------------------------------------------------------
+
+[[fact]]
+key = "razer/0b/0b#symmetric"
+dialect = "razer"
+kind = "set"
+class = 0x0B
+id = 0x0B
+layout = "size 0x04, [0x00, 0x04, 0x01, level 0..2]"
+meaning = "Symmetric lift-off distance (low/med/high); verified via 0B/85."
+devices = ["00a8"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-06-27", what = "low and high written and echoed (HARDWARE-CONFIRMED 2026-06, recorded in commit 5d8e5d8)" },
+  { kind = "source", src = "razerqdhid", at = "docs/cmd_sensor-en.md#L46-L66", what = "0x0B0B [0x0004, u16]: 0x0100/0x0101/0x0102 = symmetric 1/2/3 mm" },
+  { kind = "source", src = "openrazer-wiki", at = "Unknown-commands.md#L41", what = "0x0b/0x0b e.g. 00040300" },
+]
+
+[[fact]]
+key = "razer/0b/0b#async"
+dialect = "razer"
+kind = "set"
+class = 0x0B
+id = 0x0B
+layout = "size 0x04, [0x00, 0x04, 0x04, 0x00]"
+meaning = "Asymmetric lift-off, step 2 of 0B/03 -> 0B/0B -> 0B/05."
+devices = ["00a8"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-07-04", what = "lift 12 / landing 3 set, getter echoed async mode and the pair, felt on the pad" },
+  { kind = "source", src = "razerqdhid", at = "docs/cmd_sensor-en.md#L46-L66", what = "0x0400 = asymmetric Razer calibration" },
+]
+
+[[fact]]
+key = "razer/0b/03"
+dialect = "razer"
+kind = "set"
+class = 0x0B
+id = 0x03
+layout = "size 0x03, [0x00, 0x04, 0x01]"
+meaning = "Asymmetric lift-off step 1 (neuron: enable)."
+devices = ["00a8"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-07-04", what = "part of the verified async handshake" },
+  { kind = "source", src = "razerqdhid", at = "docs/cmd_sensor-en.md#L12-L19", what = "0x0B03 [0x0004, state]: 0 fixed lift-off, 1 use pad calibration" },
+  { kind = "source", src = "openrazer-wiki", at = "Unknown-commands.md#L38", what = "args 000400/000401/000500/000501" },
+]
+conflicts = [
+  "razerqdhid names it the calibration-in-use flag rather than an async enable; same bytes, different model. A documented disable [00,04,00] (neuron comment says [00,04,40]) is never sent.",
+]
+
+[[fact]]
+key = "razer/0b/05"
+dialect = "razer"
+kind = "set"
+class = 0x0B
+id = 0x05
+layout = "size 0x04, [0x00, 0x04, lift-1, landing-1]; lift 2..26, landing 1..25"
+meaning = "Asymmetric lift/landing levels."
+devices = ["00a8"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-07-04", what = "read back via 0B/85 bytes [4],[5]" },
+]
+conflicts = [
+  "razerqdhid's Basilisk V3 0x0B05 writes an 8-byte computed calibration value (docs/cmd_sensor-en.md#L68-L76); the Naga takes two level bytes. Different firmware.",
+]
+
+[[fact]]
+key = "razer/0b/85"
+dialect = "razer"
+kind = "get"
+class = 0x0B
+id = 0x85
+layout = "size 0x01 -> a[2] mode (0x01 symmetric, 0x04 async), a[3] level, a[4] lift-1, a[5] landing-1"
+meaning = "Lift-off read for both modes."
+devices = ["00a8"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-07-04", what = "echoed async mode and the written pair" },
+  { kind = "source", src = "razerqdhid", at = "docs/cmd_sensor-en.md#L68-L76", what = "on the Basilisk V3 the read returns raw calibration data" },
+]
+conflicts = [
+  "On the Basilisk V3 the lift mode is read from 0B/8B, which the Naga answers Unsupported; the Naga folds mode into 0B/85.",
+]
+
+[[fact]]
+key = "razer/0b/02"
+dialect = "razer"
+kind = "set"
+class = 0x0B
+id = 0x02
+layout = "size 0x10, [store, active, count, {stage_id, mode} * n]"
+meaning = "Class-0x0B 'HyperScroll' stage table: a structural reconstruction neuron's own comments call wrong."
+devices = ["00a8"]
+grade = "derived"
+gate = "NEURON_HYPERSCROLL_WRITE"
+evidence = [
+  { kind = "source", src = "neuron", at = "crates/neuron-core/src/writes.rs#L707-L793", what = "reconstruction, superseded by 15/00" },
+]
+conflicts = [
+  "Real scroll-stage select is 15/00 (captured); the fork and wiki put HyperScroll in class 0x15. Dead code still shipped behind its gate.",
+]
+
+[[fact]]
+key = "razer/0b/83"
+dialect = "razer"
+kind = "get"
+class = 0x0B
+id = 0x83
+layout = "size 0x10"
+meaning = "neuron's verify getter for 0B/02; the Naga answers it Unsupported, so that write can never verify."
+devices = ["00a8"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-06-30", what = "month-only date (2026-06), month end used: targeted probe found 0B/83 absent on 00a8" },
+  { kind = "source", src = "razerqdhid", at = "docs/cmd_sensor-en.md#L12-L19", what = "on the Basilisk V3 it is the calibration-in-use read" },
+]
+
+[[fact]]
+key = "razer/0b/8b"
+dialect = "razer"
+kind = "get"
+class = 0x0B
+id = 0x8B
+layout = "[0x0004] -> u16 lift mode"
+meaning = "Basilisk V3 lift-off mode read; absent on the Naga."
+devices = ["00a8"]
+grade = "single"
+unused = true
+evidence = [
+  { kind = "source", src = "razerqdhid", at = "docs/cmd_sensor-en.md#L46-L66", what = "get_sensor_lift" },
+  { kind = "live", date = "2026-06-30", what = "month-only date (2026-06), month end used: answered not supported on 00a8" },
+]
+
+[[fact]]
+key = "razer/0b/09"
+dialect = "razer"
+kind = "set"
+class = 0x0B
+id = 0x09
+layout = "[0x0004, u16 0 start / 1 stop]; result pushed as 05 0a xx"
+meaning = "Enter/exit self-calibration (Basilisk V3; needs driver mode)."
+grade = "single"
+unused = true
+evidence = [
+  { kind = "source", src = "razerqdhid", at = "docs/cmd_sensor-en.md#L21-L41", what = "set_sensor_calibration" },
+  { kind = "source", src = "openrazer-wiki", at = "Unknown-commands.md#L40", what = "args 00040000 or 00050100" },
+]
+
+[[fact]]
+key = "razer/0b/80"
+dialect = "razer"
+kind = "get"
+class = 0x0B
+id = 0x80
+layout = "-> 01 04"
+meaning = "Undecoded sensor getter on the Naga (Motion Sync / angle-snap candidate)."
+devices = ["00a8"]
+grade = "live"
+unused = true
+evidence = [
+  { kind = "live", date = "2026-06-30", what = "month-only date (2026-06), month end used: returned 01 04" },
+]
+
+[[fact]]
+key = "razer/0b/8e"
+dialect = "razer"
+kind = "get"
+class = 0x0B
+id = 0x8E
+layout = "-> 04 00 00 00 08 12"
+meaning = "Undecoded sensor getter on the Naga."
+devices = ["00a8"]
+grade = "live"
+unused = true
+evidence = [
+  { kind = "live", date = "2026-06-30", what = "month-only date (2026-06), month end used: returned 04 00 00 00 08 12" },
+]
+
+# ------------------------------------------------------------------------------------------------
+# Class 0x05 onboard profiles (not sent by neuron)
+# ------------------------------------------------------------------------------------------------
+
+[[fact]]
+key = "razer/05/84"
+dialect = "razer"
+kind = "get"
+class = 0x05
+id = 0x84
+layout = "size 0x00 or 0x06 -> args[0] = active slot 1..5 (some firmwares report data_size 0 yet carry it)"
+meaning = "Active onboard profile."
+devices = ["00a8"]
+grade = "agreed"
+unused = true
+evidence = [
+  { kind = "source", src = "naga-companion", at = "src/NagaBatteryTray/Hid/RazerProtocol.cs#L227-L250", what = "Naga V2 Pro 00a8, hardware-verified 2026-07-18, LED-confirmed" },
+  { kind = "source", src = "opensnek", at = "docs/protocol/USB_PROTOCOL.md#L584-L594", what = "Basilisk V3 Pro, tracks the profile button" },
+  { kind = "live", date = "2026-07-07", what = "answers 01 on the owner's Naga (flash recon)" },
+]
+
+[[fact]]
+key = "razer/05/04"
+dialect = "razer"
+kind = "set"
+class = 0x05
+id = 0x04
+layout = "size 0x01, [slot]"
+meaning = "Select the active onboard profile; persists across power cycle; FAIL for unassigned slots. Slot 0 = direct/volatile layer, 1 = hardware default backing store, 2..5 isolated storage."
+devices = ["00a8"]
+grade = "agreed"
+unused = true
+evidence = [
+  { kind = "source", src = "naga-companion", at = "src/NagaBatteryTray/Hid/RazerProtocol.cs#L252-L274", what = "Naga V2 Pro, LED white -> red, persisted" },
+  { kind = "source", src = "opensnek", at = "docs/protocol/USB_PROTOCOL.md#L596-L610", what = "Basilisk V3 Pro; status 03 for unassigned slots" },
+]
+
+[[fact]]
+key = "razer/05/81"
+dialect = "razer"
+kind = "get"
+class = 0x05
+id = 0x81
+layout = "-> [capacity 5, assigned slot ids...]"
+meaning = "Onboard profile inventory."
+devices = ["00a8"]
+grade = "agreed"
+unused = true
+evidence = [
+  { kind = "live", date = "2026-07-07", what = "answered 05 01 on the Naga" },
+  { kind = "source", src = "naga-companion", at = "src/NagaBatteryTray/Hid/RazerProtocol.cs#L79-L86", what = "capacity + slot list; V2 Pro read [01 02] then [01 02 03]" },
+  { kind = "source", src = "opensnek", at = "docs/protocol/USB_PROTOCOL.md#L612-L626", what = "[max id, assigned ids]" },
+  { kind = "source", src = "razerqdhid", at = "docs/cmd_profile-en.md#L22-L28", what = "list of enabled profiles" },
+]
+
+[[fact]]
+key = "razer/05/80"
+dialect = "razer"
+kind = "get"
+class = 0x05
+id = 0x80
+layout = "size 0x01 -> count"
+meaning = "Number of assigned (enabled) onboard profiles."
+devices = ["00a8"]
+grade = "agreed"
+unused = true
+evidence = [
+  { kind = "live", date = "2026-07-07", what = "answered 01 on the Naga" },
+  { kind = "source", src = "razerqdhid", at = "docs/cmd_profile-en.md#L14-L20", what = "available count" },
+  { kind = "source", src = "opensnek", at = "docs/protocol/USB_PROTOCOL.md#L612-L626", what = "assigned count" },
+]
+conflicts = [
+  "neuron's flash-recon note reads 05/80 as the active slot; upstream says count (05/84 is the active slot).",
+]
+
+[[fact]]
+key = "razer/05/8a"
+dialect = "razer"
+kind = "get"
+class = 0x05
+id = 0x8A
+layout = "size 0x01 -> total slots (5)"
+meaning = "Onboard profile capacity."
+devices = ["00a8"]
+grade = "agreed"
+unused = true
+evidence = [
+  { kind = "live", date = "2026-07-07", what = "answered 05 on the Naga" },
+  { kind = "source", src = "razerqdhid", at = "docs/cmd_profile-en.md#L6-L12", what = "total count" },
+  { kind = "source", src = "opensnek", at = "docs/protocol/USB_PROTOCOL.md#L612-L626", what = "max bank hint 05" },
+]
+
+[[fact]]
+key = "razer/05/02"
+dialect = "razer"
+kind = "set"
+class = 0x05
+id = 0x02
+layout = "size 0x01, [slot]"
+meaning = "Create/assign an onboard profile slot (new slots read empty; seed every setting)."
+devices = ["00a8"]
+grade = "agreed"
+unused = true
+evidence = [
+  { kind = "source", src = "razerqdhid", at = "docs/cmd_profile-en.md#L30-L37", what = "new_profile" },
+  { kind = "source", src = "naga-companion", at = "src/NagaBatteryTray/Hid/RazerProtocol.cs#L276-L281", what = "Naga V2 Pro slot 3 created and deleted" },
+  { kind = "source", src = "opensnek", at = "docs/protocol/USB_PROTOCOL.md#L696-L709", what = "create disturbed that slot's DPI/brightness" },
+]
+conflicts = [
+  "The wiki guesses 'set current onboard profile' (Unknown-commands.md#L26), and neuron's 2026-07-22 session sent 05/02 [01] as a profile reselect; three independent sources say it creates a slot.",
+]
+
+[[fact]]
+key = "razer/05/03"
+dialect = "razer"
+kind = "set"
+class = 0x05
+id = 0x03
+layout = "size 0x01, [slot]"
+meaning = "Delete/unassign an onboard profile slot (removes it from the cycle ring; bank stays readable)."
+devices = ["00a8"]
+grade = "agreed"
+unused = true
+evidence = [
+  { kind = "source", src = "naga-companion", at = "src/NagaBatteryTray/Hid/RazerProtocol.cs#L283-L288", what = "Naga V2 Pro" },
+  { kind = "source", src = "opensnek", at = "docs/protocol/USB_PROTOCOL.md#L696-L709", what = "unassign" },
+  { kind = "source", src = "razerqdhid", at = "public/py/qdrazer/device.py#L116", what = "0x0503 in code (its doc table shows 0502 by mistake)" },
+]
+
+[[fact]]
+key = "razer/05/08"
+dialect = "razer"
+kind = "set"
+class = 0x05
+id = 0x08
+layout = "size 0x50, [slot, off_hi, off_lo, total_hi, total_lo (0x00FA), 75-byte chunk]; offsets 0x0000, 0x004B, 0x0096, 0x00E1"
+meaning = "Onboard profile metadata object (GUID, name, owner hash), written right after create; not button or DPI content."
+devices = ["00a8"]
+grade = "agreed"
+unused = true
+evidence = [
+  { kind = "source", src = "opensnek", at = "docs/protocol/USB_PROTOCOL.md#L628-L694", what = "layout and partial-write hazard" },
+  { kind = "source", src = "razerqdhid", at = "docs/cmd_profile-en.md#L47-L57", what = "profile info blob, chunked" },
+]
+conflicts = [
+  "neuron's 2026-07-22 notes treat 05/08 as the binary onboard profile save (the path to device-side remap); upstream says it is metadata only.",
+]
+
+# ------------------------------------------------------------------------------------------------
+# Device-pushed input reports
+# ------------------------------------------------------------------------------------------------
+
+[[fact]]
+key = "razer/push/05-02"
+dialect = "razer"
+kind = "push"
+layout = "05 02 <dpiX u16be> <dpiY u16be> ...; accepted if 100 <= dpi <= 30000"
+meaning = "DPI changed (user button, neuron's own write, or wake-restore)."
+devices = ["00a8"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-07-07", what = "captured on the Naga's 0001/0000 collection during dpi_trap" },
+  { kind = "source", src = "razerqdhid", at = "docs/basic-en.md#L56-L60", what = "report 05: [02, X, Y]" },
+  { kind = "source", src = "opensnek", at = "docs/protocol/USB_PROTOCOL.md#L392-L420", what = "05 02 on the auxiliary interface" },
+]
+
+[[fact]]
+key = "razer/push/05-3a"
+dialect = "razer"
+kind = "push"
+layout = "05 3a <stage u8, 1-based> <0x80|id> ..."
+meaning = "Scroll/sensitivity stage changed; byte[3] (0x82/0x85 seen) matches the 15/87 enabled ids."
+devices = ["00a8"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-09-29", what = "byte[3] 82/85 matched 15/87's trailing bytes" },
+]
+
+[[fact]]
+key = "razer/push/05-0c"
+dialect = "razer"
+kind = "push"
+layout = "05 0c 00 ... (neuron: stateless; same bytes for plug and unplug; some wakes)"
+meaning = "Power/charge poke; neuron settles charge state and reasserts on wake."
+devices = ["00a8"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-07-07", what = "fires on plug, unplug and some wakes; skipped on others (round 3.5)" },
+  { kind = "source", src = "naga-tray", at = "razer_naga.py#L24-L29", what = "05 0C <1|0> when the mouse lands on or leaves the dock" },
+]
+conflicts = [
+  "naga-tray sees a state byte (1 on / 0 off) on the dock; neuron sees 00 for both on cable. Dock vs cable; not a contradiction on the same link.",
+]
+
+[[fact]]
+key = "razer/push/05-0e"
+dialect = "razer"
+kind = "push"
+layout = "05 0e <strap_id>; 0 detached, 1 = 2-button, 3 = 12-button, 4 = 6-button"
+meaning = "Side plate attached/detached; no getter exists."
+devices = ["00a8"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-06-27", what = "strap codes read off the wire with NEURON_HIDWATCH=1 (recorded in commit 5d8e5d8)" },
+]
+conflicts = [
+  "naga-web-setup says no plate-detection report is known (README); a gap, not a contradiction.",
+]
+
+[[fact]]
+key = "razer/push/05-09"
+dialect = "razer"
+kind = "push"
+layout = "05 09 02 = entering sleep, 05 09 03 = waking"
+meaning = "Sleep/wake bracket. neuron sees it but does not decode it."
+devices = ["00a8"]
+grade = "live"
+unused = true
+evidence = [
+  { kind = "live", date = "2026-07-07", what = "true sleeps bracketed by 05 09 02 / 05 09 03 in the flash-recon trap logs" },
+  { kind = "source", src = "naga-tray", at = "razer_naga.py#L24-L29", what = "05 09 <02|03> as the mouse falls asleep / wakes" },
+]
+
+[[fact]]
+key = "razer/push/05-39"
+dialect = "razer"
+kind = "push"
+layout = "05 39 xx"
+meaning = "Scroll-mode toggled (razerqdhid) or profile-cycle hint (OpenSnek) on the Basilisk V3 line."
+grade = "agreed"
+unused = true
+evidence = [
+  { kind = "source", src = "razerqdhid", at = "docs/basic-en.md#L61", what = "39 = scroll mode, 01 free / 00 tactile" },
+  { kind = "source", src = "opensnek", at = "docs/protocol/USB_PROTOCOL.md#L422-L438", what = "04 00 then 05 39 00 per profile-button press" },
+]
+conflicts = [
+  "The two sources disagree on meaning; not observed on the Naga.",
+]
+
+[[fact]]
+key = "razer/push/05-3b"
+dialect = "razer"
+kind = "push"
+layout = "05 3b 01 / 05 3b 00"
+meaning = "Mouse placed on / removed from the Mouse Dock Pro (charging link)."
+grade = "agreed"
+unused = true
+evidence = [
+  { kind = "source", src = "naga-tray", at = "razer_naga.py#L24-L29", what = "about 2.5 s after landing on the dock" },
+  { kind = "source", src = "openrazer-issues", at = "https://github.com/openrazer/openrazer/issues/2755", what = "05 3B 01 inserted, 00 removed" },
+]
+
+[[fact]]
+key = "razer/push/05-37"
+dialect = "razer"
+kind = "push"
+layout = "05 37 <flags> <count> <pid_hi pid_lo> ..."
+meaning = "Dock scan result listing nearby mice (after 00/46 [01])."
+grade = "single"
+unused = true
+evidence = [
+  { kind = "source", src = "openrazer-pr2817", at = "https://github.com/openrazer/openrazer/pull/2817", what = "razer_dock_pro_update_nearby" },
+]
+
+[[fact]]
+key = "razer/push/04-keys"
+dialect = "razer"
+kind = "push"
+layout = "report id 0x04, 16 bytes: held codes, 0x00 = released; 0x01 FN, 0x20..0x25 M-keys; 0x20..0x5F M-keys / side plate / cycle buttons"
+meaning = "Keyboard macro keys and driver-mode deferred buttons."
+devices = ["0221", "00a8"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-07-01", what = "captured from the BW (recorded in the macrokeys commit)" },
+  { kind = "source", src = "openrazer", at = "driver/razerkbd_driver.c#L4925-L4965", what = "0x01 FN, 0x20..0x24 M1..M5, 0x25 BW V4 M6" },
+]
+conflicts = [
+  "openrazer labels 0x25 as the BlackWidow V4 M6; neuron maps it to M6 on the Chroma V2.",
+  "Inside neuron: macrokeys accepts any nonzero code, hidwatch only 0x01 or 0x20..0x5F minus cycle codes.",
+]
+
+[[fact]]
+key = "razer/push/04-52"
+dialect = "razer"
+kind = "push"
+layout = "04 52 ..."
+meaning = "Deferred DPI-stage button (no index or direction)."
+devices = ["00a8"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-07-07", what = "captured on pid 00a8 in driver mode" },
+  { kind = "source", src = "openrazer", at = "driver/razermouse_driver.c#L5857-L5864", what = "REP4_DPI_CYCLE 0x52" },
+]
+
+[[fact]]
+key = "razer/push/04-57"
+dialect = "razer"
+kind = "push"
+layout = "04 57 ..."
+meaning = "Deferred scroll-sensitivity button."
+devices = ["00a8"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-07-07", what = "captured on pid 00a8 in driver mode" },
+]
+conflicts = [
+  "openrazer's REP4 table names 0x54 as the scroll button (driver/razermouse_driver.c#L5864); the Naga sends 0x57.",
+]
+
+[[fact]]
+key = "razer/push/04-50"
+dialect = "razer"
+kind = "push"
+layout = "04 50 ..."
+meaning = "Deferred profile button."
+devices = ["00a8"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-07-07", what = "captured on pid 00a8 in driver mode" },
+  { kind = "source", src = "openrazer", at = "driver/razermouse_driver.c#L5857-L5864", what = "REP4_PROFILE 0x50" },
+]
+
+[[fact]]
+key = "razer/push/04-00"
+dialect = "razer"
+kind = "push"
+layout = "04 00 ..."
+meaning = "Any button released."
+devices = ["00a8"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-07-07", what = "captured on pid 00a8" },
+]
+
+[[fact]]
+key = "razer/push/receiver-sideband"
+dialect = "razer"
+kind = "push"
+layout = "event_alias_pids = [0x0529]; only 04 reports honoured from alias pids"
+meaning = "The HyperSpeed receiver's own collections echo driver-mode 04 events under pid 0529."
+devices = ["0529"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-08-08", what = "receiver echoed plate presses as 04 reports (memory naga-side-plate-binding)" },
+]
+
+# ------------------------------------------------------------------------------------------------
+# Auto-synthesis
+# ------------------------------------------------------------------------------------------------
+
+[[fact]]
+key = "razer/frame/fingerprint-sweep"
+dialect = "razer"
+kind = "frame"
+layout = "classes 0x00..=0x0F x ids 0x80..=0x8F, size 0x20, no args, tx 0x1F"
+meaning = "Read-only getter sweep for fingerprint and backup snapshots."
+grade = "derived"
+evidence = [
+  { kind = "source", src = "neuron", at = "crates/neuron-core/src/discover.rs#L105-L121", what = "neuron's sweep" },
+]
+conflicts = [
+  "The Seiren parrots Success for unknown headers and class 0x06 exposes a memory peek; a size-0x20 no-arg sweep is safe only because it never writes.",
+]
+
+[[fact]]
+key = "razer/enum/synth-lighting-blocks"
+dialect = "razer"
+kind = "enum"
+layout = "matrix: effect 0F/02 size 0x0C [0,4] + custom 0F/03 size 0x40 [0,4], custom_id 0x08; legacy: effect 03/0A size 8 tx 0x3F + custom 03/0B size 0x46 [0xFF] tx 0x3F, custom_id 0x05"
+meaning = "Lighting setters baked into auto defs from curated ones; only getter presence is probed."
+grade = "derived"
+evidence = [
+  { kind = "source", src = "neuron", at = "crates/neuron-core/src/synth.rs#L361-L420", what = "unprobed setters, corrected after the fact by first_light_heal" },
+]
+conflicts = [
+  "These setters reach unknown hardware ungated; the kind is enum, so the gating test does not see them.",
+]
+
+# ------------------------------------------------------------------------------------------------
+# razer-audio (Seiren V3 Mini 056a)
+# ------------------------------------------------------------------------------------------------
+
+[[fact]]
+key = "razer-audio/frame/envelope"
+dialect = "razer-audio"
+kind = "frame"
+layout = "64-byte feature report, id 0x07 at buf[0]; status buf[1], tx buf[2], size buf[6], class buf[7], id buf[8]; 53-byte body buf[9..62]; CRC = XOR(buf[2..=61]) at buf[62]; pipe usage 000C/0001"
+meaning = "Second Razer wire family; same razer_report fields in a different envelope."
+devices = ["056a"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-07-08", what = "seiren_probe: 00/82 and 00/84 returned Success with class/id echo" },
+  { kind = "source", src = "openrgb", at = "Controllers/RazerController/RazerController/RazerController.cpp#L47-L58", what = "report id 0x07 for the Leviathan V2 audio devices" },
+]
+conflicts = [
+  "Replies are only echo-filtered (no CRC or tx check), unlike the 91-byte razer exec.",
+]
+
+[[fact]]
+key = "razer-audio/frame/parrot"
+dialect = "razer-audio"
+kind = "frame"
+layout = "about 485 of 512 unknown headers answer Success + echo with zero args"
+meaning = "Getter sweeps are meaningless on this pipe; the audio probe synthesizes no commands."
+devices = ["056a"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-07-08", what = "class 0x00..0x1F x id 0x80..0x8F sweep" },
+]
+
+[[fact]]
+key = "razer-audio/frame/stall"
+dialect = "razer-audio"
+kind = "frame"
+layout = "Linux HIDIOCGFEATURE -> EPIPE"
+meaning = "A stall is a refused request, not a missing device."
+devices = ["056a"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-09-16", what = "Seiren answered EPIPE while plugged in (commit 721d84d hardware checkpoint)" },
+]
+
+[[fact]]
+key = "razer-audio/tx/seiren"
+dialect = "razer-audio"
+kind = "tx"
+layout = "transaction_id 0x1F"
+meaning = "Seiren tx."
+devices = ["056a"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-07-08", what = "the one tx this family's live session saw ACK a getter" },
+]
+
+[[fact]]
+key = "razer-audio/08/88"
+dialect = "razer-audio"
+kind = "get"
+class = 0x08
+id = 0x88
+layout = "size 0x02 -> [0x01 selector, state 0/1]"
+meaning = "Authoritative hardware tap-mute state."
+devices = ["056a"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-07-08", what = "two-state readmap diff: the only getter whose bytes changed with the tap" },
+]
+
+[[fact]]
+key = "razer-audio/00/82"
+dialect = "razer-audio"
+kind = "get"
+class = 0x00
+id = 0x82
+meaning = "Serial on the Seiren envelope."
+devices = ["056a"]
+grade = "live"
+unused = true
+evidence = [
+  { kind = "live", date = "2026-07-08", what = "Success with echo in seiren_probe (00/81 answered Unsupported)" },
+]
+
+[[fact]]
+key = "razer-audio/00/84"
+dialect = "razer-audio"
+kind = "get"
+class = 0x00
+id = 0x84
+meaning = "Device mode on the Seiren envelope; reads 0x00."
+devices = ["056a"]
+grade = "live"
+unused = true
+evidence = [
+  { kind = "live", date = "2026-07-08", what = "Success, mode 0x00" },
+]
+
+[[fact]]
+key = "razer-audio/push/05-11"
+dialect = "razer-audio"
+kind = "push"
+layout = "05 11 <state>; 0 live/green, 1 muted/red"
+meaning = "Capacitive tap-mute toggled; read via ReadFile on 000C/0001 (Raw Input drops it)."
+devices = ["056a"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-07-08", what = "14 taps, clean 00/01 alternation" },
+]
+
+[[fact]]
+key = "razer-audio/mode/mute-read-only"
+dialect = "razer-audio"
+kind = "mode"
+layout = "no setter: all classes 0x00..0x3F x ids 0x00..0x7F (class 0x08 fully) tried with 08/88 as oracle"
+meaning = "The tap-mute is sensor-owned and read-only over HID; audio_mute_writable = false."
+devices = ["056a"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-07-09", what = "exhaustive oracle sweep plus LED watch found nothing that writes it" },
+]
+
+# ------------------------------------------------------------------------------------------------
+# HID++ (Logitech) — experimental, read-only, never observed on a wire. neuron attributes these to
+# cpg-docs / Solaar / libratbag, which this ledger has not pinned, so every row is derived.
+# Feature calls are kind "enum": HID++ has no razer class/id byte pair to key a get on.
+# ------------------------------------------------------------------------------------------------
+
+[[fact]]
+key = "hidpp/frame/reports"
+dialect = "hidpp"
+kind = "frame"
+layout = "0x10 SHORT (7 bytes) / 0x11 LONG (20 bytes): [report id, device index, feature index, (fn<<4)|swId, params]; neuron emits LONG only"
+meaning = "HID++ 2.0 framing."
+grade = "derived"
+evidence = [
+  { kind = "source", src = "neuron", at = "crates/neuron-core/src/hidpp.rs#L38-L52", what = "transcribed from cpg-docs hidpp20/README.rst (unpinned here)" },
+]
+
+[[fact]]
+key = "hidpp/frame/device-index"
+dialect = "hidpp"
+kind = "frame"
+layout = "device index 0xFF = direct-attached; receiver slots 1..6 not implemented"
+meaning = "Addressing."
+grade = "derived"
+evidence = [
+  { kind = "source", src = "neuron", at = "crates/neuron-core/src/hidpp.rs#L108-L116", what = "neuron transcription" },
+]
+
+[[fact]]
+key = "hidpp/frame/reply-validation"
+dialect = "hidpp"
+kind = "frame"
+layout = "swId 0x0A; accept if byte0 in {0x10,0x11}, byte1 0xFF, byte2 = feature index, byte3 = (fn<<4)|0x0A; no CRC"
+meaning = "Reply matching."
+grade = "derived"
+evidence = [
+  { kind = "source", src = "neuron", at = "crates/neuron-core/src/hidpp.rs#L202-L209", what = "neuron transcription" },
+]
+
+[[fact]]
+key = "hidpp/frame/errors"
+dialect = "hidpp"
+kind = "frame"
+layout = "error report: byte2 0x8F (1.0) or 0xFF (2.0) with byte1 0xFF, code at byte 5; 0x01 Unknown .. 0x09 Unsupported"
+meaning = "Error detection and names."
+grade = "derived"
+evidence = [
+  { kind = "source", src = "neuron", at = "crates/neuron-core/src/hidpp.rs#L173-L199", what = "neuron transcription from Linux hid-logitech-hidpp.c (unpinned)" },
+]
+
+[[fact]]
+key = "hidpp/frame/timing"
+dialect = "hidpp"
+kind = "frame"
+layout = "write output report, then up to 10 x read_input(100 ms); mismatches skipped; Busy (0x08) surfaced as an error"
+meaning = "Exchange discipline."
+grade = "derived"
+evidence = [
+  { kind = "source", src = "neuron", at = "crates/neuron-core/src/hidpp.rs#L214-L232", what = "neuron's own choice" },
+]
+
+[[fact]]
+key = "hidpp/frame/transport"
+dialect = "hidpp"
+kind = "frame"
+layout = "OUTPUT report via WriteFile, INPUT replies via ReadFile; claim VID 0x046D, not a receiver pid, output_len 20, input_len >= 7"
+meaning = "Control-pipe claim."
+grade = "derived"
+evidence = [
+  { kind = "source", src = "neuron", at = "crates/neuron-core/src/hidpp.rs#L293-L301", what = "neuron's own choice" },
+]
+
+[[fact]]
+key = "hidpp/enum/receiver-pids"
+dialect = "hidpp"
+kind = "enum"
+layout = "C517, C518, C51A, C51B, C521, C525, C526, C52E, C52F, C531, C534, C535, C537, 6042, C52B, C532, C548, C539, C53A, C53D, C53F, C541, C545, C547, C54D"
+meaning = "Receivers recognised and left unclaimed."
+grade = "derived"
+evidence = [
+  { kind = "source", src = "neuron", at = "crates/neuron-core/src/hidpp.rs#L87-L100", what = "transcribed from Solaar base_usb.py (unpinned)" },
+]
+
+[[fact]]
+key = "hidpp/enum/root-getfeature"
+dialect = "hidpp"
+kind = "enum"
+layout = "IRoot 0x0000 fn0 [id_hi, id_lo] -> [feature index] (0 = absent)"
+meaning = "Feature discovery."
+grade = "derived"
+evidence = [
+  { kind = "source", src = "neuron", at = "crates/neuron-core/src/hidpp.rs#L563-L580", what = "neuron transcription" },
+]
+
+[[fact]]
+key = "hidpp/enum/root-protocol-version"
+dialect = "hidpp"
+kind = "enum"
+layout = "IRoot fn1 [0x00, 0x00, 0x5A] -> [major, minor, 0x5A echo]; require major >= 2"
+meaning = "Probe and HID++ 1.0 rejection."
+grade = "derived"
+evidence = [
+  { kind = "source", src = "neuron", at = "crates/neuron-core/src/hidpp.rs#L537-L560", what = "neuron transcription" },
+]
+
+[[fact]]
+key = "hidpp/enum/battery-1000"
+dialect = "hidpp"
+kind = "enum"
+layout = "0x1000 BatteryLevelStatus fn0 -> [level 0..100, ...]; reshaped to 0..255 at args[1]"
+meaning = "Battery."
+grade = "derived"
+evidence = [
+  { kind = "source", src = "neuron", at = "crates/neuron-core/src/hidpp.rs#L235-L250", what = "neuron transcription" },
+]
+
+[[fact]]
+key = "hidpp/enum/dpi-2201"
+dialect = "hidpp"
+kind = "enum"
+layout = "0x2201 AdjustableDPI fn2 getSensorDpi -> [sensor, dpi_hi, dpi_lo, ...]; mirrored to X and Y"
+meaning = "DPI (single axis)."
+grade = "derived"
+evidence = [
+  { kind = "source", src = "neuron", at = "crates/neuron-core/src/hidpp.rs#L235-L262", what = "neuron transcription" },
+]
+
+[[fact]]
+key = "hidpp/enum/reshape-tags"
+dialect = "hidpp"
+kind = "enum"
+layout = "spec args[0]: 0x00 NONE, 0x01 BATTERY, 0x02 DPI (stripped before the wire)"
+meaning = "Dialect-private reply reshaping."
+grade = "derived"
+evidence = [
+  { kind = "source", src = "neuron", at = "crates/neuron-core/src/hidpp.rs#L137-L140", what = "neuron's own tags" },
+]
+
+[[fact]]
+key = "hidpp/mode/no-setters"
+dialect = "hidpp"
+kind = "mode"
+layout = "no HID++ setters are synthesized"
+meaning = "HID++ writes are absent: no unproven bytes."
+grade = "derived"
+evidence = [
+  { kind = "source", src = "neuron", at = "crates/neuron-core/src/hidpp.rs#L317-L334", what = "neuron's policy" },
+]
+
+# ------------------------------------------------------------------------------------------------
+# Controllers
+# ------------------------------------------------------------------------------------------------
+
+[[fact]]
+key = "nintendo/frame/report-0x30"
+dialect = "nintendo"
+kind = "frame"
+layout = "0x30, timer, battery, buttons[3] (bytes 3-5), left stick bytes 6-8 and right 9-11 as 12-bit LE pairs, IMU 13-48"
+meaning = "Switch Pro full-mode input report; decoded by layouts/nintendo-switch-pro.toml."
+devices = ["057e:2009"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-09-30", what = "live resting report 30 A8 91 00 80 00 2E 78 7F B9 F7 7B unpacks to sticks (2094, 2039) and (1977, 1983) of 0..4095 with no button held; byte 4 bit 0x80 is the charging-grip flag" },
+  { kind = "source", src = "sdl", at = "src/joystick/hidapi/SDL_hidapi_switch.c", what = "SwitchStatePacket layout and 12-bit stick unpacking" },
+  { kind = "source", src = "linux-hid-nintendo", at = "drivers/hid/hid-nintendo.c", what = "same byte and bit positions" },
+]
+
+[[fact]]
+key = "nintendo/frame/descriptor-mismatch"
+dialect = "nintendo"
+kind = "frame"
+layout = "descriptor: report 0x30 = 18 buttons + X/Y/Z/Rz 16-bit + hat; stream: the packed layout above"
+meaning = "The Switch Pro's HID descriptor does not describe its full-mode stream; descriptor-decoded, it fires dozens of phantom presses per second."
+devices = ["057e:2009"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-09-30", what = "HidP value caps show 16-bit X/Y/Z/Rz in report 0x30; the descriptor-decoded stream (Steam holding it in full mode) toggled buttons 1-17 and Y on nearly every report" },
+]
+
+[[fact]]
+key = "nintendo/mode/usb-start-up"
+dialect = "nintendo"
+kind = "mode"
+layout = "output 80 02 (reply 81 02), 80 03, 80 02 (reply 81 02), 80 04, then 01 <pkt> <8 rumble> 03 30"
+meaning = "USB start-up for a Switch Pro no other app is driving: handshake, baud, force USB, full report mode. Sent only to a silent pad, and gated behind NEURON_PAD_INIT: through neuron every step answered (2026-09-30) but the full-mode stream was not seen start."
+devices = ["057e:2009"]
+grade = "agreed"
+evidence = [
+  { kind = "source", src = "sdl", at = "src/joystick/hidapi/SDL_hidapi_switch.c", what = "USB init sequence and SetInputReportMode(0x30)" },
+  { kind = "source", src = "linux-hid-nintendo", at = "drivers/hid/hid-nintendo.c", what = "joycon_send_usb handshake sequence" },
+]
+
+[[fact]]
+key = "gameinput/mode/background-gamepad"
+dialect = "gameinput"
+kind = "mode"
+layout = "GameInputCreate; RegisterDeviceCallback(kind 0x40000); GetCurrentReading + GetGamepadState per device"
+meaning = "Xbox-protocol (GIP) pads reach a background process through GameInput's gamepad reading, under the default focus policy, when neither Raw Input nor XInput delivers them."
+devices = ["24c6:543a"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-09-30", what = "PowerA 24c6:543a: background Raw Input saw 0 HID reports and XInput 0 connected slots while the pad was used; GameInput's gamepad reading returned buttons, both sticks and both triggers from a windowless process" },
+]
+
+[[fact]]
+key = "hid/mode/pid-rumble"
+dialect = "hid"
+kind = "mode"
+layout = "output report from the descriptor's Physical Interface Device usages: 0x97 actuator enable, 0x70 magnitude xN (logical 0..max), 0x50 duration, 0xA7 delay, 0x7C loop"
+meaning = "Rumble the XInput-HID shadow (the one Game Pad descriptor Windows gives every Xbox-protocol pad), built through the OS report builder from its declared PID usages (hid_haptics.rs); its four magnitudes are ordered left trigger, right trigger, low, high. Other Game Pad collections declaring PID magnitudes carry no motor roles and are written only with NEURON_HAPTICS_WRITE; joystick and wheel collections never, their PID outputs are force feedback."
+devices = ["045e:02ff"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-09-30", what = "PowerA's XInput-HID shadow 045e:02ff declares page 0x0F usages 0x97 (4 bits), 0x70 (x4, 0..100), 0x50, 0xA7, 0x7C; the built report [00 0f 50 50 50 50 ff 00 00] vibrated the pad, and a tour at 25/50/100% on each magnitude slot in turn moved the low, high, left-trigger and right-trigger motors separately at three felt strengths" },
+  { kind = "source", src = "sdl", at = "src/joystick/hidapi/SDL_hidapi_xboxone.c", what = "the same four-magnitude order in the Xbox HID rumble report" },
+]
+
+[[fact]]
+key = "gameinput/mode/rumble-unreliable"
+dialect = "gameinput"
+kind = "mode"
+layout = "IGameInputDevice::SetRumbleState (slot 10) on a GIP pad"
+meaning = "GameInput accepts rumble for the PowerA (status 0x7 output enabled, rumble motors 0xF) and moves nothing; neuron drives both backends for every pad, so the HID PID path carries it."
+devices = ["24c6:543a"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-09-30", what = "20 press-triggered SetRumbleState calls and a 1 s full-strength call from a background process produced no vibration; the same pad vibrated through its HID shadow's PID report moments later" },
+]
+
+[[fact]]
+key = "hid/mode/xinput-shadow-link"
+dialect = "hid"
+kind = "mode"
+layout = "shadow interface path -> instance id -> CM_Get_Parent -> serial suffix -> present USB device with that serial -> its vid:pid"
+meaning = "An XInput-HID shadow (&IG_) and the GIP pad it shadows share a USB serial in the device tree, which is how the pad's GameInput identity finds its motors. Identical pads (same vid:pid) cannot be told apart by it."
+devices = ["045e:02ff", "24c6:543a"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-09-30", what = "USB\\VID_045E&PID_02FF&IG_00\\00&00&00008BC8152EA60A (shadow parent) and USB\\VID_24C6&PID_543A\\00008BC8152EA60A (the pad) share serial 00008BC8152EA60A; press-triggered rumble routed through the link reached the motors 44 of 44 times" },
+]
+
+[[fact]]
+key = "gameinput/frame/abi"
+dialect = "gameinput"
+kind = "frame"
+layout = "IGameInput slots 4 GetCurrentReading, 9 RegisterDeviceCallback; IGameInputDevice 3 GetDeviceInfo, 5 GetBatteryState, 10 SetRumbleState; IGameInputReading 19 GetMotionState, 22 GetGamepadState; GameInputDeviceInfo vid u16 @4, pid u16 @6, deviceId 32 bytes @32, supportedInput u32 @104"
+meaning = "The hand-written COM bindings gameinput.rs calls, from the Windows SDK 10.0.26100 GameInput.h (a header, so no repository pin). A different GameInput ABI would read wrong offsets; GameInputCreate succeeding is the only version check."
+devices = ["24c6:543a"]
+grade = "live"
+evidence = [
+  { kind = "live", date = "2026-09-30", what = "PowerA 24c6:543a through these slots: device callback, info (vid 24c6, pid 543a), gamepad state (buttons, both sticks, both triggers), battery state; rumble slot accepted without moving motors (gameinput/mode/rumble-unreliable)" },
+]

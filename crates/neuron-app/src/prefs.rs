@@ -626,7 +626,7 @@ pub fn set_start_minimized(v: bool) -> String {
             "start-minimized {} (saved to app.toml)",
             if v { "enabled" } else { "disabled" }
         ),
-        Err(e) => format!("save failed: {e}"),
+        Err(e) => format!("start-minimized setting not saved: {e}"),
     }
 }
 
@@ -654,7 +654,7 @@ pub fn set_ui_accent(hex: &str) -> String {
     p.ui_accent.clone_from(&v);
     match p.save() {
         Ok(()) => format!("interface accent → #{v} (saved to app.toml)"),
-        Err(e) => format!("save failed: {e}"),
+        Err(e) => format!("interface accent not saved: {e}"),
     }
 }
 
@@ -670,7 +670,7 @@ pub fn set_weave_accent(hex: &str) -> String {
     p.weave_accent.clone_from(&v);
     match p.save() {
         Ok(()) => format!("weave accent → #{v} (saved to app.toml)"),
-        Err(e) => format!("save failed: {e}"),
+        Err(e) => format!("weave accent not saved: {e}"),
     }
 }
 
@@ -685,7 +685,7 @@ pub fn set_weave_material(slug: &str) -> String {
     p.weave_material = slug.to_string();
     match p.save() {
         Ok(()) => format!("spellweaving material → {slug} (saved to app.toml)"),
-        Err(e) => format!("save failed: {e}"),
+        Err(e) => format!("weave material not saved: {e}"),
     }
 }
 
@@ -703,7 +703,7 @@ pub fn set_phoenix(v: bool) -> String {
             "crash auto-restart {} (applies next launch)",
             if v { "armed" } else { "disarmed" }
         ),
-        Err(e) => format!("save failed: {e}"),
+        Err(e) => format!("crash-restart setting not saved: {e}"),
     }
 }
 

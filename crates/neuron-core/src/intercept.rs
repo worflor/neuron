@@ -4,12 +4,14 @@
 
 //! Device-scoped input claims — the user-mode "input shim", keyboard AND mouse.
 //!
-//! Some devices (the Razer Naga thumb grid) are hardware keyboards with FIXED key usages; they
-//! can't be remapped in firmware (proven live — see the `naga-side-plate-binding` notes). Razer
-//! itself remaps them host-side with a kernel HID filter (`RzDev_*.sys`). This module is the SAME
-//! mechanism in user mode, no driver: swallow the device's emission and (for plain key remaps)
-//! inject a replacement, device-scoped so the SAME physical control on another device is
-//! untouched.
+//! A device that can reassign its buttons in firmware (see [`crate::buttons`]) performs its binds
+//! itself; this module then only swallows the private keys it hands to the host, which name their
+//! device by themselves. For everything else it is the host-side fallback: swallow the device's
+//! emission and (for plain key remaps) inject a replacement, device-scoped so the SAME physical
+//! control on another device is untouched.
+//!
+//! A hook swallow also withholds the keystroke from Raw Input (observed live 2026-09-29), so the
+//! correlation below can only attribute an edge whose Raw-Input twin still arrives.
 //!
 //! THE OWNERSHIP PRINCIPLE, device-agnostic: a pid-scoped BOUND control owns its input. A
 //! keyboard key bound to a plain `Key` is REPLACED (swallow + inject the target); a keyboard key
@@ -470,6 +472,13 @@ fn standing_down() -> bool {
     standing_down_for(ACTIVE.load(Ordering::Relaxed), PAUSED.load(Ordering::Relaxed))
 }
 
+/// Is the hook swallowing firmware-assigned private keys right now? When it isn't (a capture is
+/// binding, or input is disarmed), a private key reaches Raw Input and is read as its button.
+#[must_use]
+pub fn takes_private_keys() -> bool {
+    !standing_down() && crate::action::input_armed()
+}
+
 fn standing_down_for(active: bool, paused: bool) -> bool {
     !active || paused
 }
@@ -636,11 +645,25 @@ fn compose_remaps(
     let mut remaps: Vec<Remap> = engine
         .rules
         .iter()
+        // A button the firmware plan manages no longer emits its stock key, so a claim on that key
+        // would only swallow (and delay) the same key typed on every other keyboard.
+        .filter(|r| !firmware_managed(r))
         .filter_map(claim_for_rule)
         .filter(|r| claim.is_none_or(|c| (r.pid, r.from) != (c.pid, c.from)))
         .collect();
     remaps.extend(claim);
+    // A host-performed button emits a private key only its device can send: swallowing it is exact.
+    remaps.extend(crate::buttons::private_keys().into_iter().filter_map(|(pid, usage)| {
+        Some(Remap { pid, from: sys::physkey_for_usage(u16::from(usage))?, to: KeyOut::Swallow })
+    }));
     remaps
+}
+
+fn firmware_managed(rule: &crate::engine::Rule) -> bool {
+    matches!(
+        rule.trigger,
+        crate::engine::Trigger::Input { page: 0x07, usage, pid: Some(pid) } if crate::buttons::covers(pid, usage)
+    )
 }
 
 /// The swallow-only [`Remap`] for a held-bind control, when the shim can express it: pid-scoped
@@ -718,12 +741,18 @@ pub fn deactivate() {
 /// with the physkey (`scancode | 0x100 if extended`). Records it as pending when swallowed. Gated
 /// on the input-arm kill-switch — in safe mode we swallow nothing (pure pass-through, no remap).
 #[cfg_attr(not(windows), allow(dead_code))]
-fn hook_edge(physkey: u16, down: bool) -> bool {
+fn hook_edge(physkey: u16, down: bool, injected: bool) -> bool {
     let state = EDGE_TRANSITION.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     // `standing_down` covers PAUSED too: swallowing a key mid-capture is exactly the bug the pause
     // exists to prevent (the user is BINDING this control, not using it).
     if state.disarming || standing_down() || !crate::action::input_armed() {
         return false;
+    }
+    // A firmware-assigned private key names its device by itself: resolved here, no Raw-Input
+    // correlation (a swallowed keystroke never reaches Raw Input anyway). A software-injected one
+    // (a hotkey tool sending the same F-key) is never ours.
+    if !injected && sys::usage_for_physkey(physkey).is_some_and(|u| crate::buttons::deliver_private(u, down)) {
+        return true;
     }
     let mut g = CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     match g.as_mut() {
@@ -815,6 +844,7 @@ mod sys {
     };
 
     const LLKHF_EXTENDED: u32 = 0x01;
+    const LLKHF_INJECTED: u32 = 0x10;
     const XBUTTON1: u16 = 0x0001;
     const XBUTTON2: u16 = 0x0002;
 
@@ -839,6 +869,11 @@ mod sys {
     /// OS-specific mapping the shared arming code needs; delegates to the one forward table.
     pub fn physkey_for_usage(usage: u16) -> Option<u16> {
         crate::controls::win::usage_to_physkey(usage)
+    }
+
+    /// Platform key-id (`scancode | 0x100 if E0`) → HID keyboard usage.
+    pub fn usage_for_physkey(physkey: u16) -> Option<u16> {
+        crate::controls::win::scancode_to_usage(physkey & 0xFF, physkey & 0x100 != 0)
     }
 
     /// `SendInput` one keyboard event BY SCANCODE, stamped with our signature so the hook passes it.
@@ -881,7 +916,7 @@ mod sys {
                 if down || up {
                     let extended = (kb.flags & LLKHF_EXTENDED) != 0;
                     let physkey = (kb.scanCode as u16 & 0xFF) | if extended { 0x100 } else { 0 };
-                    if hook_edge(physkey, down) {
+                    if hook_edge(physkey, down, kb.flags & LLKHF_INJECTED != 0) {
                         return 1; // swallow: the legacy WM_KEYDOWN/CHAR path is suppressed.
                     }
                 }
@@ -909,7 +944,7 @@ mod sys {
                     _ => None,
                 };
                 if let Some((button, down)) = button_edge {
-                    if hook_edge(super::mouse_physkey(button), down) {
+                    if hook_edge(super::mouse_physkey(button), down, false) {
                         return 1; // swallow: the click never reaches the app underneath.
                     }
                 }
@@ -1081,6 +1116,9 @@ mod sys {
     pub fn physkey_for_usage(_usage: u16) -> Option<u16> {
         None
     }
+    pub fn usage_for_physkey(_physkey: u16) -> Option<u16> {
+        None
+    }
     pub fn inject(_physkey: u16, _down: bool) {}
     pub fn inject_mouse(_button: u16, _down: bool) {}
     pub fn install() -> bool { false }
@@ -1174,7 +1212,7 @@ mod tests {
             "set_paused(true) must be OBSERVED by the per-edge gate, not just stored"
         );
         assert!(
-            !hook_edge(0x0D, true),
+            !hook_edge(0x0D, true, false),
             "a paused shim must never swallow the key being bound"
         );
 
