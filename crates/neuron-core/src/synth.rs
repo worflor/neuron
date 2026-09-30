@@ -557,6 +557,7 @@ pub fn synthesize(t: &dyn Transport, ctx: &SynthCtx) -> Option<Synthesis> {
         commands,
         lighting,
         side_plates: None,
+        side_plate_binds: std::collections::BTreeMap::new(),
         // Synthesis never probes push-only report vocabularies (no HID reader in this pass) —
         // an auto def carries no `[events]` block; hidwatch's collection-shape arming is unaffected.
         events: None,

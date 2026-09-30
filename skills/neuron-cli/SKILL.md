@@ -111,7 +111,41 @@ neuron apply setup.toml                       # the real thing (dump backup.toml
 removes profiles, macros, badges and preference keys the document omits. Add `--strict` to make a macro
 or profile name that does not exist an error instead of a warning.
 
+**Bring a Synapse 3 layout across.** Synapse 3 keeps profiles in an encrypted account cache, but its
+service logs every mapping it pushed to a device. `neuron import` (no file) lists those logs; importing one
+previews the user's layer as binds.
+
+```powershell
+neuron import                                                          # lists Synapse3\Log\*Mapping*.log
+neuron import C:\ProgramData\Razer\Synapse3\Log\Mouse_00a8_MappingV2.log # preview: the user's binds
+```
+
+Author what it prints with `bind add` rather than `--apply`: `--apply` writes a profile whose binds are
+live only while that profile is active. The log holds only what the last Synapse session wrote, so tell the
+user where the layout came from and have them try it on the hardware.
+
+**Side plates.** A plate's binds are ordinary binds, live while that plate is on. The 2-button plate
+comes as Mouse 4 / Mouse 5 (the device file's `side_plate_binds`); a bind of the user's own on either
+button replaces that. Plates reuse thumb-grid ids (the 2-button plate's buttons are the grid's `-` and
+`=`, `input:0x07/0x2d@00a7` and `0x2e`), and every matching bind fires, so when two plates want different
+things from one button, give each its own layer (`--layer plate:2-button`, `--layer plate:12-button`)
+rather than base plus layer. `button plan --plate 12-button` shows what the firmware holds with that plate
+on; `neuron watch --device` shows which plate the mouse reports.
+
+**Learn what a button holds without pressing it.** `neuron button read --all` reads every button the
+firmware lists. A keyboard key is category 0x02, a mouse click 0x01, and the wheel-tilt buttons hold 0x0e
+at stock (Synapse's turbo scroll).
+`neuron control capture` needs a human press and returns `no control was pressed` when nobody is there; do
+not loop on it.
+
 ## Things that go wrong
+
+- **Scope a macro key to its device.** `macro:M3` alone matches every device that sends that code, and a
+  Naga side plate shares the keyboard's M-key codes, so a debug bind on it fires from the mouse too. Write
+  `macro:M3@0221`. `bind check` warns about the bare form.
+- **`summon` matches title or exe by substring** and cycles when several windows match. A terminal's title
+  changes constantly, so name its exe (`WindowsTerminal`). `neuron.focus(title)` inside a macro is an exact
+  title match and cannot do that.
 
 - `no macro 'x'` / `no profile 'x'`: create it first, or pass `--allow-missing-refs` if the order is
   intentional. `macro rm` tells you which binds still name the macro.

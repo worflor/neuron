@@ -21,6 +21,19 @@ struct Want {
 
 static WANT: Mutex<Option<Want>> = Mutex::new(None);
 
+/// The seated side plate's layer (`plate:12-button`), as the mouse announced it.
+static PLATE: Mutex<Option<String>> = Mutex::new(None);
+
+/// A plate was seated or removed: a button two plates bind differently needs re-planning.
+pub fn set_plate(layer: Option<String>) {
+    let mut p = PLATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if *p != layer {
+        *p = layer;
+        drop(p);
+        reapply();
+    }
+}
+
 fn want() -> std::sync::MutexGuard<'static, Option<Want>> {
     WANT.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
@@ -118,12 +131,13 @@ fn sync() {
         return;
     };
     let live = !capturing && neuron::action::input_armed();
+    let plate = PLATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
     let mut taken = std::collections::BTreeSet::new();
     for d in devices() {
         // A firmware-custody device only runs its button functions in normal mode.
         neuron::writes::ensure_custody(&d);
         let plan = if live {
-            neuron::buttons::plan(&d.def, &rules, held, &mut taken)
+            neuron::buttons::plan_for(&d.def, &rules, held, neuron::buttons::Plate::Seated(plate.as_deref()), &mut taken)
         } else {
             neuron::buttons::plan(&d.def, &[], None, &mut taken)
         };

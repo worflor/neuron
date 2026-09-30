@@ -135,6 +135,11 @@ pub struct DeviceDef {
     /// appear here. Devices without swappable plates simply omit the table.
     #[serde(default)]
     pub side_plates: Option<BTreeMap<String, String>>,
+    /// What a plate's buttons do until the user binds them, per plate label:
+    /// `[side_plate_binds."2-button"]` maps a button's stock keyboard usage (`"0x2d"`) to an action
+    /// spec (`"mouse:back"`). A plate reuses thumb-grid ids, so its factory keys are grid keys.
+    #[serde(default)]
+    pub side_plate_binds: BTreeMap<String, BTreeMap<String, String>>,
     /// Optional device-PUSHED event vocabulary (an `[events]` table). Devices that push no such
     /// reports simply omit the table (`None`) — no every-device tax for a Naga-only or Seiren-only
     /// behaviour.

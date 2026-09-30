@@ -1385,6 +1385,7 @@ fn scroll_stage_count(pid: u16) -> Option<u32> {
 /// The layer NAME comes from the registry label, so adding a plate is a TOML edit plus a bind.
 fn latch_plate_layer(id: u8, label: &str) {
     let layer = (id != 0).then(|| neuron::engine::side_plate_layer(label));
+    crate::buttonfw::set_plate(layer.clone());
     crate::dispatch::latch_context(neuron::engine::SLOT_SIDE_PLATE, layer);
 }
 
@@ -1984,6 +1985,9 @@ mod tests {
         let _g = BATCH_TEST_LOCK.lock().unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         neuron::confirm::set_sink(Some(tx));
+        // A wake re-announces the plate that is already on; a different plate in a burst is a swap
+        // (`a_plate_swap_burst_cards_the_new_plate`). Seat plate 4 first, drained below.
+        neuron::confirm::prime_side_plate(NAGA_PID, 4, &plate_label(NAGA_PID, 4));
         // Drain to QUIESCENCE before the actual test. The confirm sink is process-global, so a
         // straggler worker from a PRIOR test (observed as spurious "got N cards" failures only
         // under load) must be flushed out first. `settle()` waits for PENDING_FLUSHES to hit zero
@@ -2023,6 +2027,27 @@ mod tests {
         assert_eq!(neuron::confirm::last_plate(NAGA_PID).as_deref(), Some("6-button"));
     }
 
+
+    #[test]
+    fn a_plate_swap_burst_cards_the_new_plate() {
+        // The Naga announces a new plate only inside a full state burst (dpi + scroll + plate), so a
+        // burst whose plate differs from the seated one is a swap and cards that plate once.
+        let _g = BATCH_TEST_LOCK.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        neuron::confirm::set_sink(Some(tx));
+        neuron::confirm::prime_side_plate(NAGA_PID, 1, &plate_label(NAGA_PID, 1));
+        settle();
+        let _ = rx.try_iter().count();
+        let t0 = Instant::now();
+        batch_push_at(NAGA_PID, Push::Dpi(800), t0);
+        batch_push_at(NAGA_PID, Push::Scroll(1), t0);
+        batch_push_at(NAGA_PID, Push::Plate(3, plate_label(NAGA_PID, 3)), t0);
+        settle();
+        let plates: Vec<_> = rx.try_iter().filter(|c| c.kind == neuron::confirm::Kind::SidePlate).collect();
+        neuron::confirm::set_sink(None);
+        assert_eq!(plates.len(), 1, "{plates:?}");
+        assert!(matches!(&plates[0].shape, neuron::confirm::Shape::Discrete { label } if label == "12-button"));
+    }
     #[test]
     fn a_lone_change_outside_any_burst_still_cards() {
         // the other half of foolproof: a single change is a USER action and must still card. Establish

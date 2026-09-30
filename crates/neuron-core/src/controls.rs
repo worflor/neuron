@@ -1679,9 +1679,47 @@ pub fn build_runtime() -> Runtime {
     let _ = crate::profile::restore_active_once();
     let app_rules = AppRules::load();
     let mut rt = build_runtime_from(&bindings, &cast, &app_rules, &load_rule_sidecars());
+    if let Ok(reg) = crate::registry::Registry::load() {
+        let mut rules = rt.engine.to_rules();
+        let defaults = plate_default_rules(&reg.devices, &rules);
+        if !defaults.is_empty() {
+            rules.extend(defaults);
+            rt.engine = Engine::from_rules(rules);
+        }
+    }
     // the layer stance + timing windows come from feel.toml (defaults when absent).
     rt.set_feel(&crate::feel::FeelConfig::load());
     rt
+}
+
+/// The binds each device's plates come with (`side_plate_binds`), as plate-layer rules, minus any
+/// button the user has bound on that plate's layer or on the base layer (either would fire too).
+#[must_use]
+pub fn plate_default_rules(defs: &[crate::registry::DeviceDef], user: &[Rule]) -> Vec<Rule> {
+    let mut out = Vec::new();
+    for def in defs {
+        let Some(first) = def.modes.first() else { continue };
+        let pid = Some(crate::registry::CanonicalPid::of(first.product_id));
+        for (label, binds) in &def.side_plate_binds {
+            let layer = crate::engine::side_plate_layer(label);
+            for (usage, spec) in binds {
+                let (Some(usage), Ok(action)) = (
+                    u16::from_str_radix(usage.trim_start_matches("0x"), 16).ok(),
+                    crate::authoring::parse_action(spec),
+                ) else {
+                    continue;
+                };
+                let trigger = Trigger::Input { page: 0x07, usage, pid };
+                let taken = user.iter().any(|r| {
+                    r.trigger == trigger && r.layer.as_deref().is_none_or(|l| l == layer)
+                });
+                if !taken {
+                    out.push(Rule::on_layer(layer.clone(), trigger, action));
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Testable core of [`build_runtime`]: assemble the [`Runtime`] from already-loaded configs. Keeps
@@ -1914,6 +1952,22 @@ fn load_rule_sidecars_with(include: impl Fn(&str) -> bool) -> Vec<Rule> {
 #[cfg(test)]
 mod spine_tests {
     use super::*;
+
+    #[test]
+    fn a_plate_comes_with_its_binds_until_the_user_binds_that_button() {
+        let naga: crate::registry::DeviceDef =
+            toml::from_str(include_str!("../devices/razer-naga-v2-pro.toml")).unwrap();
+        let back = |r: &Rule| r.action == Action::MouseButton { button: crate::action::MouseButtonKind::Back };
+        let defaults = plate_default_rules(std::slice::from_ref(&naga), &[]);
+        assert_eq!(defaults.len(), 2, "the 2-button plate is back/forward: {defaults:?}");
+        assert!(defaults.iter().all(|r| r.layer.as_deref() == Some("plate:2-button")));
+        assert!(defaults.iter().any(back));
+        let pid = Some(crate::registry::CanonicalPid::of(0x00A7));
+        let mine = Rule::on_layer("plate:2-button", Trigger::Input { page: 0x07, usage: 0x2D, pid }, Action::Echo);
+        let left = plate_default_rules(std::slice::from_ref(&naga), &[mine]);
+        assert_eq!(left.len(), 1, "the user's own bind on that button replaces the default");
+        assert!(!left.iter().any(back));
+    }
     use crate::action::{Action, Direction};
     use crate::bindings::Binding;
     use crate::cast::CastConfig;

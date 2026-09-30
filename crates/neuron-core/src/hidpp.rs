@@ -417,6 +417,7 @@ impl Dialect for HidppDialect {
             // No lighting: HID++ lighting (feature 0x8070/…) is unspecified this wave.
             lighting: None,
             side_plates: None,
+            side_plate_binds: std::collections::BTreeMap::new(),
             // No push-report vocabulary probed this wave — an auto HID++ def carries none.
             events: None,
             buttons: Vec::new(),

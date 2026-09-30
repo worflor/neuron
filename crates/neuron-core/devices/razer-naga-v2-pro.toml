@@ -183,6 +183,12 @@ args = [0x00, 0x04]
 3 = "12-button"
 4 = "6-button"
 
+# The 2-button plate's buttons are the grid's last two ids (factory keys `-` and `=`, captured live
+# 2026-09-30: top press arrived as `-`). It is a back/forward plate, as Synapse ships it.
+[side_plate_binds."2-button"]
+"0x2d" = "mouse:back"
+"0x2e" = "mouse:forward"
+
 [commands.battery_level]
 class = 0x07
 id = 0x80

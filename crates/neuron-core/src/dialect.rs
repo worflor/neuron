@@ -423,6 +423,7 @@ impl Dialect for RazerAudioDialect {
             commands: BTreeMap::new(),
             lighting: None,
             side_plates: None,
+            side_plate_binds: std::collections::BTreeMap::new(),
             // No push-report vocabulary probed here — the FAMILY vocabulary is on this dialect
             // itself (`default_event_for`), so an empty def still arms correctly via
             // `event_dialect_for`; a per-device `[events]` override is a config addition later.
